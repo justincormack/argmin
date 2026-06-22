@@ -8070,6 +8070,29 @@ Metadata PG migration and backfill design notes:
   transfer source epochs before persisting the transfer marker, and the command
   no longer refetches an arbitrary later control-plane map between install and
   import.
+- Added a focused whole-lifetime UAT smoke for metadata PG migration. The new
+  `metadata-pg-migration` smoke starts a four-node control-plane topology,
+  places PGs initially on nodes `0:1`, creates bucket and object metadata on a
+  selected PG while keeping payload data on a different PG, transfers that
+  metadata PG to the non-overlapping acting set `2:3` through the retained-log
+  transfer admin path, and verifies old reads plus new metadata writes after
+  the transfer. This keeps metadata transfer coverage separate from the
+  existing `pg-backfill-migration` smoke, which continues to isolate payload
+  shard backfill.
+- Tightened the fenced metadata-transfer source proof path for repeated
+  migrations. A fenced `Peering` source may now authorize transfer with an
+  epoch-local proof produced by writes after a prior transfer, while ordinary
+  unfenced `Peering` still requires the strict stored floor. Active PG records
+  also persist whether their active proof came from a metadata-transfer import,
+  so lower-index destination-epoch proof acceptance remains scoped to
+  transferred Active PGs; ordinary Active primary observations still use strict
+  rollback/fork detection. An attempted round-trip UAT (`0:1 -> 2:3 -> 0:1`)
+  exposed the next unsupported case: destination nodes can hold a compatible
+  older materialized PG state rather than being empty or already at the
+  imported proof. The current retained-log import correctly fails closed there.
+  General repeated reshuffle support needs an artifact/checkpoint shape that
+  proves the destination base state, or a transactional scratch validation
+  path, before replaying suffix commands over non-empty older destinations.
 
 Exit criteria:
 

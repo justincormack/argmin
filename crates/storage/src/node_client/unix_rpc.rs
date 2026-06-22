@@ -1644,11 +1644,17 @@ impl UnixStorageNodeClient {
             })
     }
 
-    pub(crate) fn pending_metadata_command_envelope(
+    pub(crate) fn pending_metadata_command_envelope_at_epoch(
         &self,
         pg_id: PgId,
+        cluster_epoch: ClusterEpoch,
     ) -> Result<Option<MetadataCommandEnvelope>, StoreError> {
-        let payload = self.encode_metadata_command_state_request(pg_id);
+        let request = StorageRpcMetadataCommandStateRequest {
+            node_id: self.node_id,
+            cluster_epoch,
+            pg_id,
+        };
+        let payload = encode_metadata_command_state_request(&request);
         let response = self.rpc_request(
             StorageRpcMessageKind::MetadataCommandPendingEnvelope,
             payload,
@@ -1661,7 +1667,7 @@ impl UnixStorageNodeClient {
                 )
             })?;
         if let Some(command) = response.command.as_ref() {
-            if command.id().cluster_epoch() != self.cluster_epoch || command.id().pg_id() != pg_id {
+            if command.id().cluster_epoch() != cluster_epoch || command.id().pg_id() != pg_id {
                 return Err(self.rpc_payload_error(
                     "decode metadata command pending envelope response",
                     "metadata command pending envelope route mismatch".to_string(),
@@ -2527,14 +2533,11 @@ impl MetadataCommandNodeClient for UnixStorageNodeClient {
         pg_id: PgId,
         cluster_epoch: ClusterEpoch,
     ) -> Result<Option<MetadataCommandEnvelope>, StoreError> {
-        if cluster_epoch != self.cluster_epoch {
-            return Err(StoreError::StalePayloadOperation {
-                pg_id: pg_id.get(),
-                operation_epoch: cluster_epoch,
-                current_epoch: self.cluster_epoch,
-            });
-        }
-        UnixStorageNodeClient::pending_metadata_command_envelope(self, pg_id)
+        UnixStorageNodeClient::pending_metadata_command_envelope_at_epoch(
+            self,
+            pg_id,
+            cluster_epoch,
+        )
     }
 
     fn try_insert_pending_metadata_command_slot(

@@ -10,7 +10,7 @@ use storage::{BucketName, GenerationId, ObjectKey, PgTopology};
 
 fn usage() -> ! {
     eprintln!(
-        "usage: uat_pg_backfill_smoke create-put <bucket-file> <key> <body-file> | create-put-distinct-data-pg <bucket-file> <key-file> <data-pg-file> <key-prefix> <body-file> [target-data-pg] [excluded-metadata-pg-csv] | put-for-data-pg <bucket-file> <key-file> <key-prefix> <body-file> <data-pg> [excluded-metadata-pg-csv] | put <bucket-file> <key> <body-file> | get <bucket-file> <key> <body-file> | cleanup <bucket-file> <key>..."
+        "usage: uat_pg_backfill_smoke create-put <bucket-file> <key> <body-file> | create-put-distinct-data-pg <bucket-file> <key-file> <data-pg-file> <key-prefix> <body-file> [target-data-pg] [excluded-metadata-pg-csv] | create-put-metadata-pg <bucket-file> <key-file> <metadata-pg-file> <key-prefix> <body-file> <target-metadata-pg> | put-for-data-pg <bucket-file> <key-file> <key-prefix> <body-file> <data-pg> [excluded-metadata-pg-csv] | put-for-metadata-pg <bucket-file> <key-file> <key-prefix> <body-file> <target-metadata-pg> | put <bucket-file> <key> <body-file> | get <bucket-file> <key> <body-file> | cleanup <bucket-file> <key>..."
     );
     std::process::exit(2);
 }
@@ -161,6 +161,73 @@ fn choose_key_with_distinct_data_pg(
     panic!("could not find UAT key with distinct bucket/object metadata PG and data PG");
 }
 
+fn key_with_metadata_pg_and_distinct_data_pg(
+    topology: &PgTopology,
+    bucket: &str,
+    key_prefix: &str,
+    target_metadata_pg: u32,
+) -> Option<(String, u32)> {
+    let bucket_name = BucketName::try_from(bucket.to_string()).expect("UAT bucket must be valid");
+    let generation_id = GenerationId::new(1).expect("first object generation id is valid");
+    for suffix in 0..10_000u32 {
+        let key = format!("{key_prefix}-{suffix:04}");
+        let object_key = ObjectKey::try_from(key.clone()).expect("UAT key must be valid");
+        let object_pg = topology
+            .object_metadata_pg_for(&bucket_name, &object_key)
+            .get();
+        let data_pg = topology
+            .object_generation_segment_data_pg(&bucket_name, &object_key, generation_id, 0)
+            .get();
+        if object_pg == target_metadata_pg && data_pg != target_metadata_pg {
+            return Some((key, data_pg));
+        }
+    }
+    None
+}
+
+fn choose_bucket_key_with_metadata_pg_and_distinct_data_pg(
+    key_prefix: &str,
+    target_metadata_pg: u32,
+) -> (String, String, u32) {
+    let topology = pg_topology_from_env();
+    for _ in 0..10_000u32 {
+        let bucket = unique_bucket();
+        let bucket_name = BucketName::try_from(bucket.clone()).expect("UAT bucket must be valid");
+        if topology.bucket_metadata_pg_for(&bucket_name).get() != target_metadata_pg {
+            continue;
+        }
+        if let Some((key, data_pg)) = key_with_metadata_pg_and_distinct_data_pg(
+            &topology,
+            &bucket,
+            key_prefix,
+            target_metadata_pg,
+        ) {
+            return (bucket, key, data_pg);
+        }
+    }
+    panic!("could not find UAT bucket/key with bucket and object metadata PG {target_metadata_pg}");
+}
+
+fn choose_existing_bucket_key_with_metadata_pg_and_distinct_data_pg(
+    bucket: &str,
+    key_prefix: &str,
+    target_metadata_pg: u32,
+) -> (String, u32) {
+    let topology = pg_topology_from_env();
+    let bucket_name = BucketName::try_from(bucket.to_string()).expect("UAT bucket must be valid");
+    let bucket_pg = topology.bucket_metadata_pg_for(&bucket_name).get();
+    assert_eq!(
+        bucket_pg, target_metadata_pg,
+        "bucket metadata PG must match requested metadata PG"
+    );
+    key_with_metadata_pg_and_distinct_data_pg(&topology, bucket, key_prefix, target_metadata_pg)
+        .unwrap_or_else(|| {
+            panic!(
+                "could not find UAT key with object metadata PG {target_metadata_pg} in bucket {bucket}"
+            )
+        })
+}
+
 fn main() {
     let mut args = std::env::args_os().skip(1);
     let Some(command) = args.next().and_then(|arg| arg.into_string().ok()) else {
@@ -264,6 +331,57 @@ fn main() {
                 });
             });
         }
+        "create-put-metadata-pg" => {
+            let Some(bucket_file) = args.next() else {
+                usage();
+            };
+            let Some(key_file) = args.next() else {
+                usage();
+            };
+            let Some(metadata_pg_file) = args.next() else {
+                usage();
+            };
+            let Some(key_prefix) = args.next().and_then(|arg| arg.into_string().ok()) else {
+                usage();
+            };
+            let Some(body_file) = args.next() else {
+                usage();
+            };
+            let Some(target_metadata_pg) = args
+                .next()
+                .and_then(|arg| arg.into_string().ok())
+                .and_then(|value| value.parse::<u32>().ok())
+            else {
+                usage();
+            };
+            if args.next().is_some() {
+                usage();
+            }
+            run(async {
+                let client = client_from_env();
+                let (bucket, key, data_pg) =
+                    choose_bucket_key_with_metadata_pg_and_distinct_data_pg(
+                        &key_prefix,
+                        target_metadata_pg,
+                    );
+                create_bucket(&client, &bucket).await;
+                let body = read_body(Path::new(&body_file));
+                put_object(&client, &bucket, &key, body).await;
+                std::fs::write(&bucket_file, format!("{bucket}\n")).unwrap_or_else(|error| {
+                    panic!("write bucket file {:?}: {error}", bucket_file);
+                });
+                std::fs::write(&key_file, format!("{key}\n")).unwrap_or_else(|error| {
+                    panic!("write key file {:?}: {error}", key_file);
+                });
+                std::fs::write(&metadata_pg_file, format!("{target_metadata_pg}\n"))
+                    .unwrap_or_else(|error| {
+                        panic!("write metadata PG file {:?}: {error}", metadata_pg_file);
+                    });
+                eprintln!(
+                    "selected bucket/object metadata PG {target_metadata_pg} with payload data PG {data_pg}"
+                );
+            });
+        }
         "put-for-data-pg" => {
             let Some(bucket_file) = args.next() else {
                 usage();
@@ -304,6 +422,48 @@ fn main() {
                 std::fs::write(&key_file, format!("{key}\n")).unwrap_or_else(|error| {
                     panic!("write key file {:?}: {error}", key_file);
                 });
+            });
+        }
+        "put-for-metadata-pg" => {
+            let Some(bucket_file) = args.next() else {
+                usage();
+            };
+            let Some(key_file) = args.next() else {
+                usage();
+            };
+            let Some(key_prefix) = args.next().and_then(|arg| arg.into_string().ok()) else {
+                usage();
+            };
+            let Some(body_file) = args.next() else {
+                usage();
+            };
+            let Some(target_metadata_pg) = args
+                .next()
+                .and_then(|arg| arg.into_string().ok())
+                .and_then(|value| value.parse::<u32>().ok())
+            else {
+                usage();
+            };
+            if args.next().is_some() {
+                usage();
+            }
+            run(async {
+                let client = client_from_env();
+                let bucket = read_bucket(Path::new(&bucket_file));
+                let (key, data_pg) =
+                    choose_existing_bucket_key_with_metadata_pg_and_distinct_data_pg(
+                        &bucket,
+                        &key_prefix,
+                        target_metadata_pg,
+                    );
+                let body = read_body(Path::new(&body_file));
+                put_object(&client, &bucket, &key, body).await;
+                std::fs::write(&key_file, format!("{key}\n")).unwrap_or_else(|error| {
+                    panic!("write key file {:?}: {error}", key_file);
+                });
+                eprintln!(
+                    "selected object metadata PG {target_metadata_pg} with payload data PG {data_pg}"
+                );
             });
         }
         "put" => {

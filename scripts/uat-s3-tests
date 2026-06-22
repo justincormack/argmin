@@ -23,7 +23,7 @@ Options:
   --smoke NAME           Run a focused smoke instead of the full suite:
                          storage-node-restart, storage-node-kill-fails-closed,
                          control-plane-runtime-map, shard-repair,
-                         pg-backfill-migration
+                         pg-backfill-migration, metadata-pg-migration
   --binary PATH          Run an already-built argmin-s3-compatible binary
   --release              Use a release argmin-s3 binary
   --no-cleanup           Keep the temporary data directory after the run
@@ -134,10 +134,10 @@ case "$topology" in
         ;;
 esac
 case "$smoke" in
-    ""|storage-node-restart|storage-node-kill-fails-closed|control-plane-runtime-map|shard-repair|pg-backfill-migration)
+    ""|storage-node-restart|storage-node-kill-fails-closed|control-plane-runtime-map|shard-repair|pg-backfill-migration|metadata-pg-migration)
         ;;
     *)
-        die "--smoke must be storage-node-restart, storage-node-kill-fails-closed, control-plane-runtime-map, shard-repair, or pg-backfill-migration"
+        die "--smoke must be storage-node-restart, storage-node-kill-fails-closed, control-plane-runtime-map, shard-repair, pg-backfill-migration, or metadata-pg-migration"
         ;;
 esac
 if [[ -n "$smoke" && "$topology" != "multihost" ]]; then
@@ -204,6 +204,20 @@ if [[ "$smoke" == "pg-backfill-migration" ]]; then
         echo "${pg_backfill_target_pgs[*]}"
     )"
     export ARGMIN_PG_BACKFILL_TARGET_PGS
+fi
+if [[ "$smoke" == "metadata-pg-migration" ]]; then
+    export ARGMIN_EC_K=1
+    export ARGMIN_EC_M=1
+    export ARGMIN_LOCAL_NODE_COUNT=4
+    metadata_migration_default_pg_count="$repeat_count"
+    ((metadata_migration_default_pg_count >= 16)) || metadata_migration_default_pg_count=16
+    export ARGMIN_PG_COUNT="${ARGMIN_PG_COUNT:-$metadata_migration_default_pg_count}"
+    export ARGMIN_CONTROL_PLANE_REFRESH_MS="${ARGMIN_CONTROL_PLANE_REFRESH_MS:-100}"
+    export ARGMIN_CONTROL_PLANE_LEASE_SCAN_MS="${ARGMIN_CONTROL_PLANE_LEASE_SCAN_MS:-100}"
+    export ARGMIN_CONTROL_PLANE_HEARTBEAT_LEASE_MS="${ARGMIN_CONTROL_PLANE_HEARTBEAT_LEASE_MS:-10000}"
+    if ((repeat_count > ARGMIN_PG_COUNT)); then
+        die "metadata-pg-migration --repeat requires ARGMIN_PG_COUNT >= repeat count"
+    fi
 fi
 if [[ "$smoke" == "storage-node-kill-fails-closed" ]]; then
     export ARGMIN_ABORT_ON_500=0
@@ -449,6 +463,16 @@ set_pg_acting_set() {
     "${server_cmd[@]}" control-plane-set-pg-acting-set-live "$control_plane_socket_path" "$pg_id" "$@"
 }
 
+transfer_pg_metadata() {
+    local label="$1"
+    local pg_id="$2"
+    shift
+    shift
+    echo "== argmin-s3 UAT transfer PG $pg_id metadata: $label =="
+    print_command "${server_cmd[@]}" control-plane-transfer-pg-metadata-live "$control_plane_socket_path" "$pg_id" "$@"
+    "${server_cmd[@]}" control-plane-transfer-pg-metadata-live "$control_plane_socket_path" "$pg_id" "$@"
+}
+
 set_all_pg_acting_sets() {
     local label="$1"
     shift
@@ -484,18 +508,20 @@ wait_for_control_plane_pg_active() {
 
 wait_for_control_plane_node_epochs_aligned() {
     local deadline_seconds="$1"
+    local min_epoch="${2:-1}"
     local start
     start="$(date +%s)"
     while true; do
         local aligned_epoch
         aligned_epoch="$(control_plane_node_aligned_epoch)"
-        if [[ -n "$aligned_epoch" ]]; then
+        if [[ -n "$aligned_epoch" ]] && ((aligned_epoch >= min_epoch)); then
             echo "== argmin-s3 UAT storage nodes aligned at runtime epoch $aligned_epoch =="
+            control_plane_aligned_epoch="$aligned_epoch"
             return 0
         fi
         if (($(date +%s) - start >= deadline_seconds)); then
             tail -n 80 "$control_plane_state_path" >&2 || true
-            die "timed out waiting for storage-node runtime-map epochs to align"
+            die "timed out waiting for storage-node runtime-map epochs to align at or after $min_epoch"
         fi
         sleep 0.1
     done
@@ -540,6 +566,7 @@ wait_for_control_plane_runtime_map_ready() {
             if [[ "$runtime_epoch" =~ ^[0-9]+$ && "$pg_routes" =~ ^[0-9]+$ && "$active_serving_pg_routes" =~ ^[0-9]+$ ]] \
                 && ((runtime_epoch >= min_epoch && pg_routes == ARGMIN_PG_COUNT && active_serving_pg_routes == ARGMIN_PG_COUNT)); then
                 echo "== argmin-s3 UAT control-plane runtime map ready at epoch $runtime_epoch with $active_serving_pg_routes/$pg_routes serving PG routes =="
+                control_plane_runtime_map_ready_epoch="$runtime_epoch"
                 return 0
             fi
         fi
@@ -573,6 +600,17 @@ wait_for_frontend_storage_epoch_at_least() {
         fi
         sleep 0.1
     done
+}
+
+wait_for_serving_runtime_installed() {
+    local deadline_seconds="$1"
+    local metrics_path="$2"
+    sample_frontend_metrics "$metrics_path" || true
+    local frontend_epoch
+    frontend_epoch="$(latest_metric_sample_value "$metrics_path" frontend_storage_cluster_epoch)"
+    wait_for_control_plane_runtime_map_ready "$deadline_seconds" "$frontend_epoch"
+    wait_for_control_plane_node_epochs_aligned "$deadline_seconds" "$control_plane_runtime_map_ready_epoch"
+    wait_for_frontend_storage_epoch_at_least "$control_plane_aligned_epoch" "$deadline_seconds" "$metrics_path"
 }
 
 latest_metric_sample_value() {
@@ -1174,8 +1212,8 @@ if [[ "$smoke" == "shard-repair" ]]; then
     print_command cargo build -p s3-tests --bin uat_shard_repair_smoke
     cargo build -p s3-tests --bin uat_shard_repair_smoke
     shard_repair_smoke_cmd=("$ROOT/target/debug/uat_shard_repair_smoke")
-elif [[ "$smoke" == "pg-backfill-migration" ]]; then
-    echo "== argmin-s3 UAT PG backfill smoke helper build =="
+elif [[ "$smoke" == "pg-backfill-migration" || "$smoke" == "metadata-pg-migration" ]]; then
+    echo "== argmin-s3 UAT PG smoke helper build =="
     print_command cargo build -p s3-tests --bin uat_pg_backfill_smoke
     cargo build -p s3-tests --bin uat_pg_backfill_smoke
     pg_backfill_smoke_cmd=("$ROOT/target/debug/uat_pg_backfill_smoke")
@@ -1205,10 +1243,10 @@ else
         echo "${socket_entries[*]}"
     )"
 
-    if [[ "$smoke" == "control-plane-runtime-map" || "$smoke" == "pg-backfill-migration" ]]; then
+    if [[ "$smoke" == "control-plane-runtime-map" || "$smoke" == "pg-backfill-migration" || "$smoke" == "metadata-pg-migration" ]]; then
         start_control_plane
         wait_for_control_plane_socket
-        if [[ "$smoke" == "pg-backfill-migration" ]]; then
+        if [[ "$smoke" == "pg-backfill-migration" || "$smoke" == "metadata-pg-migration" ]]; then
             set_all_pg_acting_sets "initial old placement nodes 0,1" 0 1
         fi
     fi
@@ -1221,13 +1259,13 @@ else
         wait_for_storage_node_socket "$node_id"
     done
 
-    if [[ "$smoke" == "pg-backfill-migration" ]]; then
-        wait_for_control_plane_node_epochs_aligned 10
-        wait_for_control_plane_runtime_map_ready 10 "$(control_plane_node_aligned_epoch)"
+    if [[ "$smoke" == "pg-backfill-migration" || "$smoke" == "metadata-pg-migration" ]]; then
+        wait_for_control_plane_runtime_map_ready 10
+        wait_for_control_plane_node_epochs_aligned 10 "$control_plane_runtime_map_ready_epoch"
     fi
 
     frontend_log="$logs_dir/frontend.log"
-    if [[ "$smoke" == "control-plane-runtime-map" || "$smoke" == "pg-backfill-migration" ]]; then
+    if [[ "$smoke" == "control-plane-runtime-map" || "$smoke" == "pg-backfill-migration" || "$smoke" == "metadata-pg-migration" ]]; then
         start_process "frontend" "$frontend_log" env \
             -u ARGMIN_STORAGE_NODE_ID \
             -u ARGMIN_STORAGE_NODE_DATA_DIR \
@@ -1432,9 +1470,7 @@ run_pg_backfill_migration_smoke() {
 
     set_pg_acting_set "old placement nodes 0,1 for PG backfill iteration $iteration" "$target_data_pg" 0 1
     wait_for_control_plane_pg_active "$target_data_pg" 10 "0:1"
-    wait_for_control_plane_node_epochs_aligned 10
-    wait_for_control_plane_runtime_map_ready 10 "$(control_plane_node_aligned_epoch)"
-    wait_for_frontend_storage_epoch_at_least "$(control_plane_node_aligned_epoch)" 10 "$metrics_path"
+    wait_for_serving_runtime_installed 10 "$metrics_path"
     sample_frontend_metrics "$metrics_path"
     local reset_min_scan_total
     local reset_min_enqueued
@@ -1510,9 +1546,7 @@ run_pg_backfill_migration_smoke() {
 
     set_pg_acting_set "desired placement nodes 0,2" "$data_pg" 0 2
     wait_for_control_plane_pg_active "$data_pg" 10 "0:2"
-    wait_for_control_plane_node_epochs_aligned 10
-    wait_for_control_plane_runtime_map_ready 10 "$(control_plane_node_aligned_epoch)"
-    wait_for_frontend_storage_epoch_at_least "$(control_plane_node_aligned_epoch)" 10 "$metrics_path"
+    wait_for_serving_runtime_installed 10 "$metrics_path"
     max_candidate_failed="$(latest_metric_sample_value "$metrics_path" shard_backfill_candidate_failed_total)"
     max_scan_error="$(latest_metric_sample_value "$metrics_path" shard_backfill_candidate_scan_error_total)"
     max_complete_failed="$(latest_metric_family_label_sum "$metrics_path" shard_backfill_event_by_pg_total event complete_failed)"
@@ -1560,6 +1594,65 @@ run_pg_backfill_migration_smoke() {
     echo "PASS: PG backfill migration UAT smoke migrated an old-placement object after an acting-set change"
 }
 
+run_metadata_pg_migration_smoke() {
+    local iteration="${1:-1}"
+    local smoke_dir="$data_dir/metadata-pg-migration-smoke/iteration-$iteration"
+    local bucket_file="$smoke_dir/bucket"
+    local old_key_file="$smoke_dir/old-key"
+    local new_key_file="$smoke_dir/new-key"
+    local metadata_pg_file="$smoke_dir/metadata-pg"
+    local old_body_file="$smoke_dir/old-body.bin"
+    local new_body_file="$smoke_dir/new-body.bin"
+    local metrics_path="$smoke_dir/metrics.prom"
+    local target_metadata_pg=$((iteration - 1))
+    mkdir -p "$smoke_dir"
+    printf 'argmin metadata PG migration old-placement payload\n%.0s' {1..128} >"$old_body_file"
+    printf 'argmin metadata PG migration new-placement payload\n%.0s' {1..128} >"$new_body_file"
+
+    if ((repeat_count > 1)); then
+        echo "== argmin-s3 UAT metadata PG migration iteration $iteration/$repeat_count =="
+    fi
+
+    wait_for_serving_runtime_installed 20 "$metrics_path"
+
+    echo "== argmin-s3 UAT metadata PG migration old-placement put =="
+    print_command "${pg_backfill_smoke_cmd[@]}" create-put-metadata-pg "$bucket_file" "$old_key_file" "$metadata_pg_file" "uat-metadata-pg-old-object-$iteration" "$old_body_file" "$target_metadata_pg"
+    "${pg_backfill_smoke_cmd[@]}" create-put-metadata-pg "$bucket_file" "$old_key_file" "$metadata_pg_file" "uat-metadata-pg-old-object-$iteration" "$old_body_file" "$target_metadata_pg"
+    local old_key
+    local metadata_pg
+    old_key="$(tr -d '[:space:]' <"$old_key_file")"
+    metadata_pg="$(tr -d '[:space:]' <"$metadata_pg_file")"
+    if ((metadata_pg != target_metadata_pg)); then
+        die "metadata PG helper selected PG $metadata_pg, expected $target_metadata_pg"
+    fi
+
+    echo "== argmin-s3 UAT metadata PG migration old-placement read =="
+    print_command "${pg_backfill_smoke_cmd[@]}" get "$bucket_file" "$old_key" "$old_body_file"
+    "${pg_backfill_smoke_cmd[@]}" get "$bucket_file" "$old_key" "$old_body_file"
+
+    transfer_pg_metadata "non-overlap destination nodes 2,3" "$target_metadata_pg" 2 3
+    wait_for_control_plane_pg_active "$target_metadata_pg" 20 "2:3"
+    wait_for_serving_runtime_installed 20 "$metrics_path"
+
+    echo "== argmin-s3 UAT metadata PG migration post-transfer read =="
+    print_command "${pg_backfill_smoke_cmd[@]}" get "$bucket_file" "$old_key" "$old_body_file"
+    "${pg_backfill_smoke_cmd[@]}" get "$bucket_file" "$old_key" "$old_body_file"
+
+    echo "== argmin-s3 UAT metadata PG migration post-transfer write =="
+    print_command "${pg_backfill_smoke_cmd[@]}" put-for-metadata-pg "$bucket_file" "$new_key_file" "uat-metadata-pg-new-object-$iteration" "$new_body_file" "$target_metadata_pg"
+    "${pg_backfill_smoke_cmd[@]}" put-for-metadata-pg "$bucket_file" "$new_key_file" "uat-metadata-pg-new-object-$iteration" "$new_body_file" "$target_metadata_pg"
+    local new_key
+    new_key="$(tr -d '[:space:]' <"$new_key_file")"
+
+    echo "== argmin-s3 UAT metadata PG migration post-transfer reads =="
+    print_command "${pg_backfill_smoke_cmd[@]}" get "$bucket_file" "$old_key" "$old_body_file"
+    "${pg_backfill_smoke_cmd[@]}" get "$bucket_file" "$old_key" "$old_body_file"
+    print_command "${pg_backfill_smoke_cmd[@]}" get "$bucket_file" "$new_key" "$new_body_file"
+    "${pg_backfill_smoke_cmd[@]}" get "$bucket_file" "$new_key" "$new_body_file"
+
+    echo "PASS: metadata PG migration UAT smoke transferred PG $target_metadata_pg from nodes 0,1 to nodes 2,3"
+}
+
 cleanup_pg_backfill_migration_smoke() {
     local iteration="$1"
     local smoke_dir="$data_dir/pg-backfill-migration-smoke/iteration-$iteration"
@@ -1574,6 +1667,24 @@ cleanup_pg_backfill_migration_smoke() {
     new_key="$(tr -d '[:space:]' <"$new_key_file")"
 
     echo "== argmin-s3 UAT PG backfill cleanup iteration $iteration =="
+    print_command "${pg_backfill_smoke_cmd[@]}" cleanup "$bucket_file" "$old_key" "$new_key"
+    "${pg_backfill_smoke_cmd[@]}" cleanup "$bucket_file" "$old_key" "$new_key"
+}
+
+cleanup_metadata_pg_migration_smoke() {
+    local iteration="$1"
+    local smoke_dir="$data_dir/metadata-pg-migration-smoke/iteration-$iteration"
+    local bucket_file="$smoke_dir/bucket"
+    local old_key_file="$smoke_dir/old-key"
+    local new_key_file="$smoke_dir/new-key"
+    [[ -s "$bucket_file" && -s "$old_key_file" && -s "$new_key_file" ]] || return 0
+
+    local old_key
+    local new_key
+    old_key="$(tr -d '[:space:]' <"$old_key_file")"
+    new_key="$(tr -d '[:space:]' <"$new_key_file")"
+
+    echo "== argmin-s3 UAT metadata PG migration cleanup iteration $iteration =="
     print_command "${pg_backfill_smoke_cmd[@]}" cleanup "$bucket_file" "$old_key" "$new_key"
     "${pg_backfill_smoke_cmd[@]}" cleanup "$bucket_file" "$old_key" "$new_key"
 }
@@ -1649,6 +1760,13 @@ elif [[ "$smoke" == "pg-backfill-migration" ]]; then
         "$pg_backfill_initial_complete_failed" \
         "$pg_backfill_initial_failed" \
         "$pg_backfill_initial_record_error_failed"
+elif [[ "$smoke" == "metadata-pg-migration" ]]; then
+    for ((iteration = 1; iteration <= repeat_count; iteration++)); do
+        run_metadata_pg_migration_smoke "$iteration"
+    done
+    for ((iteration = 1; iteration <= repeat_count; iteration++)); do
+        cleanup_metadata_pg_migration_smoke "$iteration"
+    done
 else
     run_nextest "s3-tests" "${cargo_args[@]}"
 fi

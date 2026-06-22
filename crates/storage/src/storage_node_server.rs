@@ -2961,9 +2961,11 @@ impl StorageNodeConnectionHandler {
         &self,
         request: StorageRpcBucketWriteReservationProofRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
-        if let Err(error) =
-            self.validate_pg_route(request.node_id, request.cluster_epoch, request.pg_id)
-        {
+        if let Err(error) = self.validate_pg_route_for_peering_inspection(
+            request.node_id,
+            request.cluster_epoch,
+            request.pg_id,
+        ) {
             return encode_storage_rpc_error_response(&error);
         }
         if let Err(error) = self.validate_primary_pg_for_bucket(
@@ -7123,7 +7125,7 @@ impl StorageNodeConnectionHandler {
         session: &StorageNodeSession<'_>,
         request: StorageRpcMetadataCommandLogHashRangeRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
-        if let Err(error) = self.validate_pg_route_for_peering_inspection(
+        if let Err(error) = self.validate_pg_route_for_metadata_log_read(
             request.node_id,
             request.cluster_epoch,
             request.pg_id,
@@ -7177,7 +7179,7 @@ impl StorageNodeConnectionHandler {
         session: &StorageNodeSession<'_>,
         request: StorageRpcMetadataCommandLogHashRangeRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
-        if let Err(error) = self.validate_pg_route_for_peering_inspection(
+        if let Err(error) = self.validate_pg_route_for_metadata_log_read(
             request.node_id,
             request.cluster_epoch,
             request.pg_id,
@@ -7328,7 +7330,7 @@ impl StorageNodeConnectionHandler {
         session: &StorageNodeSession<'_>,
         request: StorageRpcMetadataCommandStateRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
-        if let Err(error) = self.validate_pg_route_for_peering_inspection(
+        if let Err(error) = self.validate_pg_route_for_metadata_log_read(
             request.node_id,
             request.cluster_epoch,
             request.pg_id,
@@ -7359,9 +7361,11 @@ impl StorageNodeConnectionHandler {
         request: StorageRpcMetadataCommandStateRequest,
         preserve_pending_slot: bool,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
-        if let Err(error) =
-            self.validate_pg_route(request.node_id, request.cluster_epoch, request.pg_id)
-        {
+        if let Err(error) = self.validate_pg_route_for_peering_inspection(
+            request.node_id,
+            request.cluster_epoch,
+            request.pg_id,
+        ) {
             return encode_storage_rpc_error_response(&error);
         }
         let _pg_guard = self.metadata_command_pg_guard(session, request.pg_id);
@@ -7394,9 +7398,11 @@ impl StorageNodeConnectionHandler {
         session: &StorageNodeSession<'_>,
         request: StorageRpcMetadataCommandStateRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
-        if let Err(error) =
-            self.validate_pg_route(request.node_id, request.cluster_epoch, request.pg_id)
-        {
+        if let Err(error) = self.validate_pg_route_for_peering_inspection(
+            request.node_id,
+            request.cluster_epoch,
+            request.pg_id,
+        ) {
             return encode_storage_rpc_error_response(&error);
         }
         let _pg_guard = self.metadata_command_pg_guard(session, request.pg_id);
@@ -7422,9 +7428,11 @@ impl StorageNodeConnectionHandler {
         session: &StorageNodeSession<'_>,
         request: StorageRpcMetadataCommandTransferAdoptRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
-        if let Err(error) =
-            self.validate_pg_route(request.node_id, request.cluster_epoch, request.pg_id)
-        {
+        if let Err(error) = self.validate_pg_route_for_peering_inspection(
+            request.node_id,
+            request.cluster_epoch,
+            request.pg_id,
+        ) {
             return encode_storage_rpc_error_response(&error);
         }
         let _pg_guard = self.metadata_command_pg_guard(session, request.pg_id);
@@ -8325,12 +8333,163 @@ impl StorageNodeConnectionHandler {
         cluster_epoch: ClusterEpoch,
         pg_id: PgId,
     ) -> Result<(), StorageRpcErrorResponse> {
+        if cluster_epoch < self.config.cluster_epoch {
+            return self.validate_historical_pg_route_for_peering_inspection(
+                node_id,
+                cluster_epoch,
+                pg_id,
+            );
+        }
         self.validate_pg_route_with_allowed_states(
             node_id,
             cluster_epoch,
             pg_id,
             &[PgState::Active, PgState::Peering],
         )
+    }
+
+    fn validate_historical_pg_route_for_peering_inspection(
+        &self,
+        node_id: NodeId,
+        cluster_epoch: ClusterEpoch,
+        pg_id: PgId,
+    ) -> Result<(), StorageRpcErrorResponse> {
+        if node_id != self.config.node_id {
+            return Err(StorageRpcErrorResponse {
+                code: StorageRpcErrorCode::UnknownNode,
+                message: format!(
+                    "request targets node {}, but this storage node is {}",
+                    node_id.as_u32(),
+                    self.config.node_id.as_u32()
+                ),
+            });
+        }
+        let raw_pg_id = pg_id.get();
+        let Some(route) = self
+            .config
+            .pg_routes
+            .iter()
+            .find(|route| route.pg_id == raw_pg_id)
+        else {
+            return Err(StorageRpcErrorResponse {
+                code: StorageRpcErrorCode::UnknownPg,
+                message: format!("PG {raw_pg_id} is not configured on this storage node"),
+            });
+        };
+        if route.cluster_epoch != self.config.cluster_epoch {
+            return Err(StorageRpcErrorResponse {
+                code: StorageRpcErrorCode::WrongClusterEpoch,
+                message: format!(
+                    "PG {raw_pg_id} route epoch {} does not match storage-node epoch {}",
+                    route.cluster_epoch.get(),
+                    self.config.cluster_epoch.get()
+                ),
+            });
+        }
+        if route.state != PgState::Peering {
+            return Err(StorageRpcErrorResponse {
+                code: StorageRpcErrorCode::InactivePgRoute,
+                message: format!(
+                    "historical peering inspection for PG {raw_pg_id} at epoch {} requires Peering route, got {}",
+                    cluster_epoch.get(),
+                    route.state
+                ),
+            });
+        }
+        if !route.acting_set.contains(&self.config.node_id) {
+            return Err(StorageRpcErrorResponse {
+                code: StorageRpcErrorCode::NonActingSetAccess,
+                message: format!(
+                    "storage node {} is not in acting set for PG {raw_pg_id}",
+                    self.config.node_id.as_u32()
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    fn validate_pg_route_for_metadata_log_read(
+        &self,
+        node_id: NodeId,
+        cluster_epoch: ClusterEpoch,
+        pg_id: PgId,
+    ) -> Result<(), StorageRpcErrorResponse> {
+        if cluster_epoch == self.config.cluster_epoch {
+            return self.validate_pg_route_for_peering_inspection(node_id, cluster_epoch, pg_id);
+        }
+        if cluster_epoch > self.config.cluster_epoch {
+            return Err(StorageRpcErrorResponse {
+                code: StorageRpcErrorCode::StaleShardLocation,
+                message: format!(
+                    "request route epoch {} is newer than storage-node epoch {}",
+                    cluster_epoch.get(),
+                    self.config.cluster_epoch.get()
+                ),
+            });
+        }
+        if node_id != self.config.node_id {
+            return Err(StorageRpcErrorResponse {
+                code: StorageRpcErrorCode::UnknownNode,
+                message: format!(
+                    "request targets node {}, but this storage node is {}",
+                    node_id.as_u32(),
+                    self.config.node_id.as_u32()
+                ),
+            });
+        }
+        let now_ms = crate::clock::current_time_millis();
+        if let Some(valid_until_ms) = self.config.route_map_valid_until_ms {
+            if valid_until_ms <= now_ms {
+                return Err(StorageRpcErrorResponse {
+                    code: StorageRpcErrorCode::StaleShardLocation,
+                    message: format!(
+                        "storage-node route map for cluster epoch {} expired at {valid_until_ms}ms, now {now_ms}ms",
+                        self.config.cluster_epoch.get()
+                    ),
+                });
+            }
+        }
+        let raw_pg_id = pg_id.get();
+        let Some(route) = self
+            .config
+            .pg_routes
+            .iter()
+            .find(|route| route.pg_id == raw_pg_id)
+        else {
+            return Err(StorageRpcErrorResponse {
+                code: StorageRpcErrorCode::UnknownPg,
+                message: format!("PG {raw_pg_id} is not configured on this storage node"),
+            });
+        };
+        if route.cluster_epoch != self.config.cluster_epoch {
+            return Err(StorageRpcErrorResponse {
+                code: StorageRpcErrorCode::WrongClusterEpoch,
+                message: format!(
+                    "PG {raw_pg_id} route epoch {} does not match storage-node epoch {}",
+                    route.cluster_epoch.get(),
+                    self.config.cluster_epoch.get()
+                ),
+            });
+        }
+        if route.state != PgState::Peering {
+            return Err(StorageRpcErrorResponse {
+                code: StorageRpcErrorCode::InactivePgRoute,
+                message: format!(
+                    "historical metadata log read for PG {raw_pg_id} requires Peering route, got {}",
+                    route.state
+                ),
+            });
+        }
+        if !route.acting_set.contains(&self.config.node_id) {
+            return Err(StorageRpcErrorResponse {
+                code: StorageRpcErrorCode::NonActingSetAccess,
+                message: format!(
+                    "storage node {} is not in acting set for PG {raw_pg_id}",
+                    self.config.node_id.as_u32()
+                ),
+            });
+        }
+        Ok(())
     }
 
     fn validate_pg_route_with_allowed_states(
@@ -9635,10 +9794,11 @@ mod tests {
         encode_bucket_pg_request, encode_metadata_command_log_hash_range_request,
         encode_metadata_command_matching_applied_request, encode_metadata_command_next_id_request,
         encode_metadata_command_pending_slot_request, encode_metadata_command_request,
-        encode_metadata_command_state_request, encode_read_handle_acquire_request,
-        encode_read_handle_release_request, encode_scavenger_list_files_request,
-        encode_scavenger_observation_key_request, encode_scavenger_observation_record_request,
-        encode_shard_ack_batch_request, encode_shard_ack_item_request, encode_shard_delete_request,
+        encode_metadata_command_state_request, encode_metadata_command_transfer_adopt_request,
+        encode_read_handle_acquire_request, encode_read_handle_release_request,
+        encode_scavenger_list_files_request, encode_scavenger_observation_key_request,
+        encode_scavenger_observation_record_request, encode_shard_ack_batch_request,
+        encode_shard_ack_item_request, encode_shard_delete_request,
         encode_shard_read_range_request, encode_shard_read_request, encode_shard_write_request,
         encode_storage_rpc_frame, read_storage_rpc_frame_from, write_storage_rpc_frame_to,
         StorageRpcBucketMarkDeletingCommandBuildOutcome,
@@ -9649,11 +9809,12 @@ mod tests {
         StorageRpcMetadataCommandPendingSlotInsertOutcome,
         StorageRpcMetadataCommandPendingSlotRequest, StorageRpcMetadataCommandRequest,
         StorageRpcMetadataCommandStateOutcome, StorageRpcMetadataCommandStateRequest,
-        StorageRpcReadHandleAcquireRequest, StorageRpcReadHandleReleaseRequest,
-        StorageRpcScavengerListFilesRequest, StorageRpcScavengerObservationKeyRequest,
-        StorageRpcScavengerObservationRecordRequest, StorageRpcShardAckBatchRequest,
-        StorageRpcShardAckItem, StorageRpcShardAckItemRequest, StorageRpcShardDeleteRequest,
-        StorageRpcShardReadRangeRequest, StorageRpcShardReadRequest, StorageRpcShardWriteRequest,
+        StorageRpcMetadataCommandTransferAdoptRequest, StorageRpcReadHandleAcquireRequest,
+        StorageRpcReadHandleReleaseRequest, StorageRpcScavengerListFilesRequest,
+        StorageRpcScavengerObservationKeyRequest, StorageRpcScavengerObservationRecordRequest,
+        StorageRpcShardAckBatchRequest, StorageRpcShardAckItem, StorageRpcShardAckItemRequest,
+        StorageRpcShardDeleteRequest, StorageRpcShardReadRangeRequest, StorageRpcShardReadRequest,
+        StorageRpcShardWriteRequest,
     };
     use crate::traits::{PgMetadataStore, ShardStore};
     use crate::types::{
@@ -12558,6 +12719,181 @@ mod tests {
                 }
             )
         ));
+    }
+
+    #[test]
+    fn storage_node_server_allows_peering_metadata_transfer_destination_checks() {
+        let tmp = test_util::tempdir();
+        let mut config = test_config(&tmp);
+        config.pg_routes[0].state = PgState::Peering;
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let server = StorageNodeServer::bind(config.clone()).unwrap();
+        let socket_path = config.socket_path.clone();
+        let join = thread::spawn(move || server.accept_one().unwrap());
+        let request = StorageRpcMetadataCommandStateRequest {
+            node_id: NodeId::new(7),
+            cluster_epoch: ClusterEpoch::new(1).unwrap(),
+            pg_id: PgId::new(0),
+        };
+
+        let mut client = UnixStream::connect(socket_path).unwrap();
+        let response = send_frame(
+            &mut client,
+            1,
+            StorageRpcMessageKind::MetadataCommandReplicaStateCanInitialize,
+            encode_metadata_command_state_request(&request),
+        );
+        drop(client);
+        join.join().unwrap();
+
+        let payload = decode_storage_rpc_response_payload(&response.payload)
+            .unwrap()
+            .unwrap();
+        let decoded = crate::storage_rpc::decode_metadata_command_bool_response(&payload).unwrap();
+        assert!(decoded.value);
+    }
+
+    #[test]
+    fn storage_node_server_allows_peering_metadata_transfer_adopt_and_validate() {
+        let tmp = test_util::tempdir();
+        let mut config = test_config(&tmp);
+        let destination_epoch = ClusterEpoch::new(2).unwrap();
+        config.cluster_epoch = destination_epoch;
+        config.pg_routes[0].cluster_epoch = destination_epoch;
+        config.pg_routes[0].state = PgState::Peering;
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let command = test_metadata_command(0, 1);
+        let expected_state_digest;
+        let server = StorageNodeServer::bind(config.clone()).unwrap();
+        {
+            let pg = server._node.get_pg(0).unwrap();
+            pg.apply_metadata_command_and_record(7, &command).unwrap();
+            expected_state_digest = pg.metadata_command_replica_state().unwrap().state_digest;
+        }
+        let rebased = MetadataCommandEnvelope::new(
+            MetadataCommandId::new(
+                destination_epoch,
+                PgId::new(0),
+                MetadataCommandLogIndex::new(1).unwrap(),
+            ),
+            command.payload().clone(),
+        );
+        let socket_path = config.socket_path.clone();
+        let join = thread::spawn(move || server.accept_one().unwrap());
+
+        let mut client = UnixStream::connect(socket_path).unwrap();
+        let adopt_response = send_frame(
+            &mut client,
+            1,
+            StorageRpcMessageKind::MetadataCommandTransferStateAdopt,
+            encode_metadata_command_transfer_adopt_request(
+                &StorageRpcMetadataCommandTransferAdoptRequest {
+                    node_id: NodeId::new(7),
+                    cluster_epoch: destination_epoch,
+                    pg_id: PgId::new(0),
+                    expected_state_digest,
+                    commands: vec![rebased],
+                },
+            )
+            .unwrap(),
+        );
+        let validate_response = send_frame(
+            &mut client,
+            2,
+            StorageRpcMessageKind::MetadataCommandValidateReplayStatePreservingPending,
+            encode_metadata_command_state_request(&StorageRpcMetadataCommandStateRequest {
+                node_id: NodeId::new(7),
+                cluster_epoch: destination_epoch,
+                pg_id: PgId::new(0),
+            }),
+        );
+        drop(client);
+        join.join().unwrap();
+
+        let adopt_payload = decode_storage_rpc_response_payload(&adopt_response.payload)
+            .unwrap()
+            .unwrap();
+        let adopted = decode_metadata_command_state_response(&adopt_payload).unwrap();
+        assert_eq!(adopted.state.state_digest, expected_state_digest);
+
+        let validate_payload = decode_storage_rpc_response_payload(&validate_response.payload)
+            .unwrap()
+            .unwrap();
+        let validated = decode_metadata_command_state_response(&validate_payload).unwrap();
+        assert_eq!(validated.state.state_digest, expected_state_digest);
+    }
+
+    #[test]
+    fn storage_node_server_allows_historical_peering_metadata_transfer_adopt_and_validate() {
+        let tmp = test_util::tempdir();
+        let mut config = test_config(&tmp);
+        let destination_epoch = ClusterEpoch::new(2).unwrap();
+        let current_epoch = ClusterEpoch::new(4).unwrap();
+        config.cluster_epoch = current_epoch;
+        config.pg_routes[0].cluster_epoch = current_epoch;
+        config.pg_routes[0].state = PgState::Peering;
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let command = test_metadata_command(0, 1);
+        let expected_state_digest;
+        let server = StorageNodeServer::bind(config.clone()).unwrap();
+        {
+            let pg = server._node.get_pg(0).unwrap();
+            pg.apply_metadata_command_and_record(7, &command).unwrap();
+            expected_state_digest = pg.metadata_command_replica_state().unwrap().state_digest;
+        }
+        let rebased = MetadataCommandEnvelope::new(
+            MetadataCommandId::new(
+                destination_epoch,
+                PgId::new(0),
+                MetadataCommandLogIndex::new(1).unwrap(),
+            ),
+            command.payload().clone(),
+        );
+        let socket_path = config.socket_path.clone();
+        let join = thread::spawn(move || server.accept_one().unwrap());
+
+        let mut client = UnixStream::connect(socket_path).unwrap();
+        let adopt_response = send_frame(
+            &mut client,
+            1,
+            StorageRpcMessageKind::MetadataCommandTransferStateAdopt,
+            encode_metadata_command_transfer_adopt_request(
+                &StorageRpcMetadataCommandTransferAdoptRequest {
+                    node_id: NodeId::new(7),
+                    cluster_epoch: destination_epoch,
+                    pg_id: PgId::new(0),
+                    expected_state_digest,
+                    commands: vec![rebased],
+                },
+            )
+            .unwrap(),
+        );
+        let validate_response = send_frame(
+            &mut client,
+            2,
+            StorageRpcMessageKind::MetadataCommandValidateReplayStatePreservingPending,
+            encode_metadata_command_state_request(&StorageRpcMetadataCommandStateRequest {
+                node_id: NodeId::new(7),
+                cluster_epoch: destination_epoch,
+                pg_id: PgId::new(0),
+            }),
+        );
+        drop(client);
+        join.join().unwrap();
+
+        let adopt_payload = decode_storage_rpc_response_payload(&adopt_response.payload)
+            .unwrap()
+            .unwrap();
+        let adopted = decode_metadata_command_state_response(&adopt_payload).unwrap();
+        assert_eq!(adopted.state.cluster_epoch, destination_epoch);
+        assert_eq!(adopted.state.state_digest, expected_state_digest);
+
+        let validate_payload = decode_storage_rpc_response_payload(&validate_response.payload)
+            .unwrap()
+            .unwrap();
+        let validated = decode_metadata_command_state_response(&validate_payload).unwrap();
+        assert_eq!(validated.state.cluster_epoch, destination_epoch);
+        assert_eq!(validated.state.state_digest, expected_state_digest);
     }
 
     #[test]

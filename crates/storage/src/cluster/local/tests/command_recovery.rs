@@ -1981,6 +1981,70 @@ fn metadata_transfer_export_packages_authoritative_retained_log() {
 }
 
 #[test]
+fn metadata_transfer_export_uses_source_log_epoch_under_fenced_route() {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[1], ec_shape).unwrap();
+    let topology = map
+        .node(NodeId::new(0))
+        .unwrap()
+        .storage_node()
+        .pg_topology();
+    let first_bucket = bucket_for_pg(topology, 1, "metadata-transfer-fenced-first-");
+    let second_bucket = bucket_for_pg(topology, 1, "metadata-transfer-fenced-second-");
+    set_route_primary(&mut map, 1, NodeId::new(0));
+    set_route_state(&mut map, 1, PgState::Peering);
+    let pg_id = PgId::new(1);
+    let first = create_bucket_metadata_command(pg_id, 1, first_bucket);
+    let second = create_bucket_metadata_command(pg_id, 2, second_bucket);
+    let source_pg = map
+        .node(NodeId::new(0))
+        .unwrap()
+        .storage_node()
+        .get_pg(1)
+        .unwrap();
+    source_pg
+        .apply_metadata_command_and_record(0, &first)
+        .unwrap();
+    source_pg
+        .apply_metadata_command_and_record(0, &second)
+        .unwrap();
+    let source_state = source_pg.metadata_command_replica_state().unwrap();
+    drop(source_pg);
+
+    let fenced_epoch = ClusterEpoch::new(2).unwrap();
+    map.epoch = fenced_epoch;
+    for route in map.pg_routes.values_mut() {
+        route.cluster_epoch = fenced_epoch;
+    }
+    let cluster = crate::StorageCluster::from_local_map(Arc::new(map)).unwrap();
+
+    let artifact = cluster
+        .export_pg_metadata_transfer_from_retained_log(pg_id, NodeId::new(0))
+        .unwrap();
+
+    assert_eq!(cluster.operation_epoch(), fenced_epoch);
+    assert_eq!(source_state.cluster_epoch, ClusterEpoch::INITIAL);
+    assert_eq!(artifact.cluster_epoch, fenced_epoch);
+    assert_eq!(
+        artifact.proof.applied_log_index,
+        source_state.applied_log_index
+    );
+    assert_eq!(artifact.proof.state_digest, source_state.state_digest);
+    assert_ne!(
+        artifact.proof.applied_log_hash,
+        source_state.applied_log_hash
+    );
+    assert_eq!(artifact.retained_log_entries.len(), 2);
+    assert!(artifact.retained_log_entries.iter().all(|entry| matches!(
+        &entry.kind,
+        crate::metadata_command::MetadataCommandLogRangeEntryKind::Applied(command)
+            if command.id().cluster_epoch() == fenced_epoch
+    )));
+}
+
+#[test]
 fn metadata_transfer_export_rejects_active_route_without_fence() {
     let tmp = test_util::tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];

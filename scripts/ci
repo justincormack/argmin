@@ -23,6 +23,7 @@ Run the standard local CI checks:
   10. ./scripts/uat-s3-tests --smoke control-plane-runtime-map
   11. ./scripts/uat-s3-tests --smoke shard-repair
   12. ./scripts/uat-s3-tests --smoke pg-backfill-migration
+  13. ./scripts/uat-s3-tests --smoke metadata-pg-migration
 
 Arguments after `--` are appended to `cargo nextest run --workspace`.
 
@@ -78,3 +79,4 @@ run_cmd "multihost UAT storage-node kill smoke" ./scripts/uat-s3-tests --smoke s
 run_cmd "multihost UAT control-plane runtime-map smoke" ./scripts/uat-s3-tests --smoke control-plane-runtime-map
 run_cmd "multihost UAT shard repair smoke" ./scripts/uat-s3-tests --smoke shard-repair
 run_cmd "multihost UAT PG backfill migration smoke" ./scripts/uat-s3-tests --smoke pg-backfill-migration
+run_cmd "multihost UAT metadata PG migration smoke" ./scripts/uat-s3-tests --smoke metadata-pg-migration

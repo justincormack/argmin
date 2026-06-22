@@ -31,8 +31,9 @@ use crate::metadata_command::{
     metadata_command_log_hash, AbortStreamUploadCommand, AppendStreamSegmentCommand,
     BucketWriteReservationProof, CreateMultipartUploadCommand, CreateStreamUploadCommand,
     DeleteObjectVersionTarget, MetadataCommandEnvelope, MetadataCommandId, MetadataCommandLogIndex,
-    MetadataCommandPayload, MetadataCommandReplicaState, ObjectPayloadReclaimCommand,
-    ReleaseObjectGenerationCommand, ReserveObjectGenerationCommand, ReserveObjectVersionCommand,
+    MetadataCommandLogRangeEntry, MetadataCommandLogRangeEntryKind, MetadataCommandPayload,
+    MetadataCommandReplicaState, ObjectPayloadReclaimCommand, ReleaseObjectGenerationCommand,
+    ReserveObjectGenerationCommand, ReserveObjectVersionCommand,
 };
 #[cfg(any(test, feature = "test-hooks"))]
 use crate::node::SharedStorageNode;
@@ -2372,8 +2373,16 @@ impl StorageCluster {
             })?;
         let metadata_client = source_node.metadata_command_client();
         let state = metadata_client.metadata_command_replica_state(pg_id)?;
+        if state.cluster_epoch > self.operation_epoch() {
+            return Err(PgPeeringReconstructionError::StaleReplicaEpoch {
+                node_id: source_node_id,
+                replica_epoch: state.cluster_epoch,
+                cluster_epoch: self.operation_epoch(),
+            }
+            .into());
+        }
         let has_pending_metadata_command = metadata_client
-            .pending_metadata_command_envelope(pg_id, self.operation_epoch())?
+            .pending_metadata_command_envelope(pg_id, state.cluster_epoch)?
             .is_some();
 
         let mut retained_log_entries = Vec::new();
@@ -2388,23 +2397,67 @@ impl StorageCluster {
                 .expect("metadata transfer retained entry range ends after zero");
             retained_log_entries.extend(metadata_client.retained_metadata_command_log_entries(
                 pg_id,
-                self.operation_epoch(),
+                state.cluster_epoch,
                 first_log_index,
                 last_log_index,
             )?);
             batch_start = batch_end + 1;
         }
 
-        Ok(
+        let source_artifact = build_pg_metadata_transfer_artifact_from_retained_log_entries(
+            state.cluster_epoch,
+            pg_id,
+            source_node_id,
+            state,
+            has_pending_metadata_command,
+            retained_log_entries,
+        )?;
+        let source_artifact = if state.cluster_epoch == self.operation_epoch() {
+            source_artifact
+        } else {
+            let rebased_commands = rebase_pg_metadata_transfer_artifact_commands(
+                &source_artifact,
+                self.operation_epoch(),
+            )?;
+            let rebased_proof = metadata_transfer_destination_proof(
+                &source_artifact,
+                &rebased_commands,
+                self.operation_epoch(),
+            );
+            let mut previous_log_hash = 0;
+            let mut rebased_entries = Vec::with_capacity(rebased_commands.len());
+            for command in rebased_commands {
+                let log_hash = metadata_command_log_hash(
+                    self.operation_epoch(),
+                    pg_id,
+                    command.id().log_index(),
+                    previous_log_hash,
+                    command.checksum_crc64(),
+                );
+                rebased_entries.push(MetadataCommandLogRangeEntry {
+                    log_index: command.id().log_index().get(),
+                    previous_log_hash,
+                    log_hash,
+                    kind: MetadataCommandLogRangeEntryKind::Applied(Box::new(command)),
+                });
+                previous_log_hash = log_hash;
+            }
             build_pg_metadata_transfer_artifact_from_retained_log_entries(
                 self.operation_epoch(),
                 pg_id,
                 source_node_id,
-                state,
-                has_pending_metadata_command,
-                retained_log_entries,
-            )?,
-        )
+                MetadataCommandReplicaState {
+                    cluster_epoch: self.operation_epoch(),
+                    applied_log_index: rebased_proof.applied_log_index,
+                    applied_log_hash: rebased_proof.applied_log_hash,
+                    state_digest: rebased_proof.state_digest,
+                },
+                false,
+                rebased_entries,
+            )?
+        };
+
+        Ok(source_artifact)
     }
 
     pub fn export_pg_metadata_transfer_artifact_from_retained_log(

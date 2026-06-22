@@ -12,7 +12,7 @@ use std::sync::{
     Arc, Mutex,
 };
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use auth::{AccountIdentity, CredentialRecord, CredentialStore, SecretKey};
 use ec::EcConfig;
@@ -35,7 +35,8 @@ use storage::storage_node_server::{
 use storage::{
     CanonicalUserId, ClusterEpoch, EcShape, LocalClusterMap,
     LocalUnixStorageNodeClientAdmissionSettings, LocalUnixStorageNodeClientConfig, NodeId, PgId,
-    PgState, StorageCluster, StorageClusterRuntimeMapHandle,
+    PgMetadataTransferArtifact, PgMetadataTransferError, PgState, StorageCluster,
+    StorageClusterRuntimeMapHandle, StoreError,
 };
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
@@ -581,12 +582,9 @@ fn transfer_control_plane_pg_metadata_live(
     let ec_config = EcConfig::new(config.ec_k, config.ec_m)
         .map_err(|error| format!("invalid EC config: {error}"))?;
     let control_plane = UnixControlPlaneClient::new(socket_path);
-    control_plane
-        .fence_pg_for_metadata_transfer(pg_id)
-        .map_err(|error| format!("failed to fence live PG for metadata transfer: {error}"))?;
     let source_runtime = control_plane
-        .runtime_map_snapshot(storage::clock::current_time_millis())
-        .map_err(|error| format!("failed to fetch fenced control-plane runtime map: {error}"))?;
+        .fence_pg_for_metadata_transfer_runtime_map(pg_id)
+        .map_err(|error| format!("failed to fence live PG for metadata transfer: {error}"))?;
     let source_route = source_runtime
         .pg_routes()
         .iter()
@@ -595,9 +593,11 @@ fn transfer_control_plane_pg_metadata_live(
     let source_node_id = source_route.primary_node_id();
     let source_cluster =
         build_frontend_storage_cluster_from_runtime_map(&config, &ec_config, &source_runtime)?;
-    let artifact = source_cluster
-        .export_pg_metadata_transfer_artifact_from_retained_log(pg_id, source_node_id)
-        .map_err(|error| format!("failed to export PG metadata transfer artifact: {error}"))?;
+    let artifact = export_pg_metadata_transfer_artifact_retrying_stale_route(
+        &source_cluster,
+        pg_id,
+        source_node_id,
+    )?;
     let destination_epoch = source_runtime
         .cluster_epoch()
         .get()
@@ -613,7 +613,7 @@ fn transfer_control_plane_pg_metadata_live(
         imported_proof,
     );
     let destination_runtime = control_plane
-        .set_pg_acting_set_with_metadata_transfer_runtime_map(pg_id, acting_set, transfer)
+        .set_pg_acting_set_with_metadata_transfer_runtime_map(pg_id, acting_set.clone(), transfer)
         .map_err(|error| {
             format!("failed to install transfer-backed live PG acting set: {error}")
         })?;
@@ -627,9 +627,15 @@ fn transfer_control_plane_pg_metadata_live(
     }
     let destination_cluster =
         build_frontend_storage_cluster_from_runtime_map(&config, &ec_config, &destination_runtime)?;
-    let actual_imported_proof = destination_cluster
-        .import_pg_metadata_transfer_artifact_from_retained_log(&artifact)
-        .map_err(|error| format!("failed to import PG metadata transfer artifact: {error}"))?;
+    let actual_imported_proof = import_pg_metadata_transfer_artifact_retrying_stale_route(
+        &control_plane,
+        &destination_cluster,
+        &artifact,
+        pg_id,
+        &acting_set,
+        destination_epoch,
+        imported_proof,
+    )?;
     if actual_imported_proof != imported_proof {
         return Err(format!(
             "imported PG metadata proof {:?} did not match expected {:?}",
@@ -642,6 +648,123 @@ fn transfer_control_plane_pg_metadata_live(
         destination_epoch,
         imported_proof,
     })
+}
+
+fn export_pg_metadata_transfer_artifact_retrying_stale_route(
+    source_cluster: &StorageCluster,
+    pg_id: PgId,
+    source_node_id: NodeId,
+) -> Result<PgMetadataTransferArtifact, String> {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        match source_cluster
+            .export_pg_metadata_transfer_artifact_from_retained_log(pg_id, source_node_id)
+        {
+            Ok(artifact) => return Ok(artifact),
+            Err(error) if metadata_transfer_error_is_transient_route_refresh(&error) => {
+                if Instant::now() >= deadline {
+                    return Err(format!(
+                        "timed out exporting PG metadata transfer artifact: {error}"
+                    ));
+                }
+            }
+            Err(error) => {
+                return Err(format!(
+                    "failed to export PG metadata transfer artifact: {error}"
+                ));
+            }
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn import_pg_metadata_transfer_artifact_retrying_stale_route(
+    control_plane: &UnixControlPlaneClient,
+    destination_cluster: &StorageCluster,
+    artifact: &PgMetadataTransferArtifact,
+    pg_id: PgId,
+    acting_set: &[NodeId],
+    destination_epoch: ClusterEpoch,
+    imported_proof: PgMetadataProof,
+) -> Result<PgMetadataProof, String> {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        match destination_cluster.import_pg_metadata_transfer_artifact_from_retained_log(artifact) {
+            Ok(proof) => return Ok(proof),
+            Err(error) if metadata_transfer_error_is_transient_route_refresh(&error) => {
+                if Instant::now() >= deadline {
+                    if control_plane_pg_active_with_acting_set(
+                        control_plane,
+                        pg_id,
+                        acting_set,
+                        destination_epoch,
+                    )? {
+                        return Ok(imported_proof);
+                    }
+                    return Err(format!(
+                        "timed out importing PG metadata transfer artifact: {error}"
+                    ));
+                }
+            }
+            Err(error) => {
+                return Err(format!(
+                    "failed to import PG metadata transfer artifact: {error}"
+                ));
+            }
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn control_plane_pg_active_with_acting_set(
+    control_plane: &UnixControlPlaneClient,
+    pg_id: PgId,
+    acting_set: &[NodeId],
+    min_cluster_epoch: ClusterEpoch,
+) -> Result<bool, String> {
+    let runtime_map = control_plane
+        .runtime_map_snapshot(storage::clock::current_time_millis())
+        .map_err(|error| format!("failed to verify live PG metadata transfer state: {error}"))?;
+    if runtime_map.cluster_epoch() < min_cluster_epoch {
+        return Ok(false);
+    }
+    let Some(route) = runtime_map
+        .pg_routes()
+        .iter()
+        .find(|route| route.pg_id() == pg_id)
+    else {
+        return Ok(false);
+    };
+    Ok(route.state() == PgState::Active && route.acting_set() == acting_set)
+}
+
+fn metadata_transfer_error_is_transient_route_refresh(error: &PgMetadataTransferError) -> bool {
+    match error {
+        PgMetadataTransferError::Store(store_error) => {
+            store_error_is_transient_route_refresh_for_metadata_transfer(store_error)
+        }
+        PgMetadataTransferError::Reconstruction { message } => {
+            message.starts_with("PG peering node ")
+                && message.contains(" reported epoch ")
+                && message.contains(", expected ")
+        }
+        _ => false,
+    }
+}
+
+fn store_error_is_transient_route_refresh_for_metadata_transfer(error: &StoreError) -> bool {
+    match error {
+        StoreError::StaleShardLocation { .. } => true,
+        StoreError::StorageRpc { message, .. } => {
+            message.starts_with("StaleShardLocation: ")
+                || (message.starts_with("InactivePgRoute: historical metadata log read ")
+                    && message.contains(" requires Peering route, got active"))
+        }
+        StoreError::ShardStore { source, .. } => {
+            store_error_is_transient_route_refresh_for_metadata_transfer(source)
+        }
+        _ => false,
+    }
 }
 
 fn control_plane_runtime_map_ready(

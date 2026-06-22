@@ -393,12 +393,13 @@ impl ClusterControlSnapshot {
                 if refreshing_node_id == primary =>
             {
                 // The selected primary may still be running the previous Peering route
-                // map. Let only that primary receive the Active handoff map so it can
-                // install the route and report the current Active observation.
+                // map. Let that primary receive the authoritative Active handoff map
+                // so it can install the route and report the current Active observation.
             }
-            Err(ControlPlaneError::PgPrimaryMissingActiveObservation { .. })
-                if !record.acting_set.contains(&refreshing_node_id) =>
-            {
+            Err(ControlPlaneError::PgPrimaryMissingActiveObservation { .. }) => {
+                // Other nodes still need the new Active route to converge their local
+                // route maps and keep renewing leases, but they cannot serve as primary
+                // until the selected primary has reported the Active observation.
                 return Ok(PgRouteSnapshot {
                     cluster_epoch: self.cluster_epoch,
                     pg_id,
@@ -502,6 +503,24 @@ impl ClusterControlSnapshot {
         self.runtime_map_from_pg_routes(pg_routes)
     }
 
+    pub fn reconstructed_runtime_map(
+        &self,
+    ) -> Result<ClusterRuntimeMapSnapshot, ControlPlaneError> {
+        let pg_routes: Result<Vec<_>, _> = self
+            .pgs
+            .values()
+            .map(|record| {
+                reconstruct_pg_route_from_record(
+                    self.cluster_epoch,
+                    record.pg_id,
+                    record,
+                    |node_id| self.nodes.contains_key(&node_id),
+                )
+            })
+            .collect();
+        self.runtime_map_from_pg_routes(pg_routes?)
+    }
+
     fn runtime_map_for_storage_node_refresh(
         &self,
         now_ms: u64,
@@ -580,7 +599,9 @@ impl ClusterControlSnapshot {
                 record.state = PgState::Peering;
                 record.active_primary = None;
                 record.active_metadata_proof = None;
+                record.active_metadata_transfer_imported = false;
                 record.peering_metadata_transfer = None;
+                record.metadata_transfer_fenced = false;
             }
         }
         Ok(())
@@ -855,6 +876,10 @@ pub struct PgControlRecord {
     // Activation-time metadata floor. Active heartbeats may report later
     // metadata progress, but not an older or divergent proof at this index.
     active_metadata_proof: Option<PgMetadataProof>,
+    // True only when the active metadata proof was imported through an explicit
+    // metadata transfer marker. This scopes destination-epoch local proof
+    // relaxation to transferred PGs instead of all Active primaries.
+    active_metadata_transfer_imported: bool,
     // Required metadata floor while a previously active PG is peering. This
     // prevents acting-set migration, restart, or failure recovery from
     // activating an agreed but stale empty/old metadata state.
@@ -863,6 +888,9 @@ pub struct PgControlRecord {
     // This is distinct from overlap-based catch-up so later migration code and
     // operators can tell why a non-overlap acting set was allowed to peer.
     peering_metadata_transfer: Option<PgMetadataTransferProof>,
+    // Operator-initiated transfer fence. While set, normal peering completion
+    // is blocked so the source remains quiesced for checkpoint/log export.
+    metadata_transfer_fenced: bool,
 }
 
 impl PgControlRecord {
@@ -873,8 +901,10 @@ impl PgControlRecord {
             acting_set,
             active_primary: None,
             active_metadata_proof: None,
+            active_metadata_transfer_imported: false,
             peering_metadata_proof_floor: None,
             peering_metadata_transfer: None,
+            metadata_transfer_fenced: false,
         }
     }
 
@@ -904,6 +934,11 @@ impl PgControlRecord {
     }
 
     #[must_use]
+    pub fn active_metadata_transfer_imported(&self) -> bool {
+        self.active_metadata_transfer_imported
+    }
+
+    #[must_use]
     pub fn peering_metadata_proof_floor(&self) -> Option<PgMetadataProof> {
         self.peering_metadata_proof_floor
     }
@@ -911,6 +946,11 @@ impl PgControlRecord {
     #[must_use]
     pub fn peering_metadata_transfer(&self) -> Option<PgMetadataTransferProof> {
         self.peering_metadata_transfer
+    }
+
+    #[must_use]
+    pub fn metadata_transfer_fenced(&self) -> bool {
+        self.metadata_transfer_fenced
     }
 }
 
@@ -1600,12 +1640,19 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
                 } else {
                     None
                 };
+                let metadata_transfer_fenced = if record.state == PgState::Peering {
+                    record.metadata_transfer_fenced
+                } else {
+                    false
+                };
                 record.acting_set = acting_set;
                 record.state = PgState::Peering;
                 record.active_primary = None;
                 record.active_metadata_proof = None;
+                record.active_metadata_transfer_imported = false;
                 record.peering_metadata_proof_floor = peering_metadata_proof_floor;
                 record.peering_metadata_transfer = peering_metadata_transfer;
+                record.metadata_transfer_fenced = metadata_transfer_fenced;
                 changed = true;
             }
             None => {
@@ -1636,7 +1683,9 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
         if record.acting_set == acting_set {
             return Ok(self.snapshot.clone());
         }
-        let required_floor = match record.state {
+        let state = record.state;
+        let metadata_transfer_fenced = record.metadata_transfer_fenced;
+        let required_floor = match state {
             PgState::Active => record
                 .active_metadata_proof
                 .ok_or(ControlPlaneError::ActivePgMissingMetadataProof { pg_id: pg_id.get() })?,
@@ -1649,7 +1698,14 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
                 });
             }
         };
-        validate_metadata_transfer_proof(&self.snapshot, pg_id, required_floor, transfer)?;
+        validate_metadata_transfer_proof(
+            &self.snapshot,
+            pg_id,
+            state,
+            metadata_transfer_fenced,
+            required_floor,
+            transfer,
+        )?;
 
         let mut next_snapshot = self.snapshot.clone();
         let record = next_snapshot
@@ -1660,8 +1716,10 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
         record.state = PgState::Peering;
         record.active_primary = None;
         record.active_metadata_proof = None;
+        record.active_metadata_transfer_imported = false;
         record.peering_metadata_proof_floor = Some(transfer.metadata_proof());
         record.peering_metadata_transfer = Some(transfer);
+        record.metadata_transfer_fenced = false;
         next_snapshot.bump_epoch()?;
         self.commit_snapshot(next_snapshot)?;
         Ok(self.snapshot.clone())
@@ -1675,15 +1733,18 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
             .snapshot
             .pg(pg_id)
             .ok_or(ControlPlaneError::UnknownPg { pg_id: pg_id.get() })?;
-        match record.state {
-            PgState::Peering => return Ok(self.snapshot.clone()),
-            PgState::Active => {
-                if record.active_metadata_proof.is_none() {
-                    return Err(ControlPlaneError::ActivePgMissingMetadataProof {
-                        pg_id: pg_id.get(),
-                    });
+        let active_source_floor = match record.state {
+            PgState::Peering => {
+                if record.peering_metadata_transfer.is_some() {
+                    return Ok(self.snapshot.clone());
                 }
+                None
             }
+            PgState::Active => Some(validate_authoritative_metadata_migration_source(
+                &self.snapshot,
+                record,
+                record.acting_set(),
+            )?),
             state => {
                 return Err(ControlPlaneError::PgNotActive {
                     pg_id: pg_id.get(),
@@ -1691,8 +1752,28 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
                     state,
                 });
             }
+        };
+        let mut next_snapshot = self.snapshot.clone();
+        let record = next_snapshot
+            .pgs
+            .get_mut(&pg_id)
+            .expect("PG record validated before metadata transfer fence");
+        if record.state != PgState::Peering {
+            record.peering_metadata_proof_floor = active_source_floor;
+            record.state = PgState::Peering;
+            record.active_primary = None;
+            record.active_metadata_proof = None;
+            record.active_metadata_transfer_imported = false;
+            record.peering_metadata_transfer = None;
+            record.metadata_transfer_fenced = true;
+            next_snapshot.bump_epoch()?;
+            self.commit_snapshot(next_snapshot)?;
+        } else if !record.metadata_transfer_fenced {
+            record.metadata_transfer_fenced = true;
+            next_snapshot.bump_epoch()?;
+            self.commit_snapshot(next_snapshot)?;
         }
-        self.set_pg_state(pg_id, PgState::Peering)
+        Ok(self.snapshot.clone())
     }
 
     pub fn set_pg_state(
@@ -1717,9 +1798,12 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
             record.state = state;
             record.active_primary = None;
             record.active_metadata_proof = None;
+            record.active_metadata_transfer_imported = false;
+            record.metadata_transfer_fenced = false;
             if state != PgState::Peering {
                 record.peering_metadata_proof_floor = None;
                 record.peering_metadata_transfer = None;
+                record.metadata_transfer_fenced = false;
             }
             next_snapshot.bump_epoch()?;
             self.commit_snapshot(next_snapshot)?;
@@ -1773,6 +1857,13 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
                 state: record.state,
             });
         }
+        if record.metadata_transfer_fenced {
+            return Err(
+                ControlPlaneError::PgMetadataTransferFenceRequiresTransferInstall {
+                    pg_id: pg_id.get(),
+                },
+            );
+        }
         let active_metadata_proof =
             validate_pg_peering_observations(&self.snapshot, pg_id, record.acting_set(), now_ms)?;
         validate_peering_metadata_proof_floor(
@@ -1788,11 +1879,14 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
             .pgs
             .get_mut(&pg_id)
             .expect("PG record validated before peering completion");
+        let active_metadata_transfer_imported = record.peering_metadata_transfer.is_some();
         record.state = PgState::Active;
         record.active_primary = Some(primary);
         record.active_metadata_proof = Some(active_metadata_proof);
+        record.active_metadata_transfer_imported = active_metadata_transfer_imported;
         record.peering_metadata_proof_floor = None;
         record.peering_metadata_transfer = None;
+        record.metadata_transfer_fenced = false;
         next_snapshot.bump_epoch()?;
         self.commit_snapshot(next_snapshot)?;
         Ok(self.snapshot.clone())
@@ -1805,6 +1899,9 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
         let mut ready = Vec::new();
         for record in self.snapshot.pgs.values() {
             if record.state != PgState::Peering {
+                continue;
+            }
+            if record.metadata_transfer_fenced {
                 continue;
             }
             let Some(primary) =
@@ -1853,8 +1950,10 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
             record.state = PgState::Active;
             record.active_primary = Some(*primary);
             record.active_metadata_proof = Some(*active_metadata_proof);
+            record.active_metadata_transfer_imported = record.peering_metadata_transfer.is_some();
             record.peering_metadata_proof_floor = None;
             record.peering_metadata_transfer = None;
+            record.metadata_transfer_fenced = false;
         }
         next_snapshot.bump_epoch()?;
         self.commit_snapshot(next_snapshot)?;
@@ -1947,6 +2046,13 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
             record.lease_deadline_ms = Some(lease_deadline_ms);
             record.pg_observations.clear();
             for observation in &heartbeat.pg_observations {
+                if !should_record_pg_heartbeat_observation(
+                    &self.snapshot,
+                    heartbeat.node_id,
+                    observation,
+                ) {
+                    continue;
+                }
                 record.pg_observations.insert(
                     observation.pg_id,
                     NodePgObservationRecord {
@@ -2508,6 +2614,22 @@ impl UnixControlPlaneClient {
         Ok(cluster_epoch)
     }
 
+    pub fn fence_pg_for_metadata_transfer_runtime_map(
+        &self,
+        pg_id: PgId,
+    ) -> Result<ClusterRuntimeMapSnapshot, ControlPlaneError> {
+        let mut payload = Vec::new();
+        write_pg_id_request(&mut payload, pg_id);
+        let payload = self.send_request(
+            ControlPlaneRpcKind::FencePgForMetadataTransferRuntimeMap,
+            &payload,
+        )?;
+        let mut reader = PayloadReader::new(&payload);
+        let runtime_map = read_runtime_map_snapshot(&mut reader)?;
+        reader.finish()?;
+        Ok(runtime_map)
+    }
+
     pub fn set_pg_acting_set_with_metadata_transfer(
         &self,
         pg_id: PgId,
@@ -2683,6 +2805,22 @@ where
                 Err(error) => Err(error),
             }
         }
+        ControlPlaneRpcKind::FencePgForMetadataTransferRuntimeMap => {
+            let mut reader = PayloadReader::new(&payload);
+            let pg_id = read_pg_id_request(&mut reader)?;
+            reader.finish()?;
+            match control_plane
+                .fence_pg_for_metadata_transfer(pg_id)
+                .and_then(|snapshot| snapshot.reconstructed_runtime_map())
+            {
+                Ok(snapshot) => {
+                    let mut response = Vec::new();
+                    write_runtime_map_snapshot(&mut response, &snapshot)?;
+                    Ok(response)
+                }
+                Err(error) => Err(error),
+            }
+        }
         ControlPlaneRpcKind::SetPgActingSetWithMetadataTransfer => {
             let mut reader = PayloadReader::new(&payload);
             let (pg_id, acting_set, transfer) =
@@ -2706,7 +2844,7 @@ where
             reader.finish()?;
             match control_plane
                 .set_pg_acting_set_with_metadata_transfer(pg_id, acting_set, transfer)
-                .and_then(|snapshot| snapshot.runtime_map(authority_now_ms))
+                .and_then(|snapshot| snapshot.reconstructed_runtime_map())
             {
                 Ok(snapshot) => {
                     let mut response = Vec::new();
@@ -2749,6 +2887,7 @@ enum ControlPlaneRpcKind {
     SetPgActingSetWithMetadataTransfer = 4,
     FencePgForMetadataTransfer = 5,
     SetPgActingSetWithMetadataTransferRuntimeMap = 6,
+    FencePgForMetadataTransferRuntimeMap = 7,
 }
 
 impl ControlPlaneRpcKind {
@@ -2760,6 +2899,7 @@ impl ControlPlaneRpcKind {
             4 => Ok(Self::SetPgActingSetWithMetadataTransfer),
             5 => Ok(Self::FencePgForMetadataTransfer),
             6 => Ok(Self::SetPgActingSetWithMetadataTransferRuntimeMap),
+            7 => Ok(Self::FencePgForMetadataTransferRuntimeMap),
             _ => Err(ControlPlaneError::RpcProtocol {
                 message: format!("unknown control-plane RPC kind {value}"),
             }),
@@ -3459,6 +3599,9 @@ pub enum ControlPlaneError {
     #[error("PG {pg_id} Active state is missing its accepted metadata proof")]
     ActivePgMissingMetadataProof { pg_id: u32 },
 
+    #[error("PG {pg_id} is fenced for metadata transfer and requires transfer install")]
+    PgMetadataTransferFenceRequiresTransferInstall { pg_id: u32 },
+
     #[error("node {node_id} is not in PG {pg_id} acting set")]
     PgPrimaryNotInActingSet { pg_id: u32, node_id: u32 },
 
@@ -3791,7 +3934,7 @@ fn format_pg_record(record: &PgControlRecord) -> String {
         ),
     };
     format!(
-        "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+        "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
         record.pg_id.get(),
         pg_state_as_str(record.state),
         format_node_list(&record.acting_set),
@@ -3808,7 +3951,9 @@ fn format_pg_record(record: &PgControlRecord) -> String {
         transfer_source_state_digest,
         transfer_imported_log_index,
         transfer_imported_log_hash,
-        transfer_imported_state_digest
+        transfer_imported_state_digest,
+        u8::from(record.metadata_transfer_fenced),
+        u8::from(record.active_metadata_transfer_imported)
     )
 }
 
@@ -4102,7 +4247,11 @@ fn validate_current_pg_observations(
                 let Some(expected) = pg.active_metadata_proof else {
                     return Err(parse_error(line, "active PG is missing metadata proof"));
                 };
-                if !metadata_proof_satisfies_active_floor(expected, observation.metadata_proof) {
+                if !metadata_proof_satisfies_active_primary_observation_floor(
+                    expected,
+                    observation.metadata_proof,
+                    pg.active_metadata_transfer_imported,
+                ) {
                     return Err(parse_error(
                         line,
                         "active node PG observation metadata proof is behind or diverges from PG active proof",
@@ -4313,10 +4462,16 @@ fn parse_node_record(line: usize, value: &str) -> Result<NodeControlRecord, Cont
 
 fn parse_pg_record(line: usize, value: &str) -> Result<PgControlRecord, ControlPlaneError> {
     let fields: Vec<&str> = value.split(',').collect();
-    if fields.len() != 7 && fields.len() != 10 && fields.len() != 14 && fields.len() != 17 {
+    if fields.len() != 7
+        && fields.len() != 10
+        && fields.len() != 14
+        && fields.len() != 17
+        && fields.len() != 18
+        && fields.len() != 19
+    {
         return Err(parse_error(
             line,
-            "PG record must have seven, ten, fourteen, or seventeen fields",
+            "PG record must have seven, ten, fourteen, seventeen, eighteen, or nineteen fields",
         ));
     }
     let pg_id = PgId::new(parse_u32(line, fields[0], "PG id")?);
@@ -4372,93 +4527,108 @@ fn parse_pg_record(line: usize, value: &str) -> Result<PgControlRecord, ControlP
     } else {
         None
     };
-    let peering_metadata_transfer = if fields.len() == 14 || fields.len() == 17 {
-        let transfer_source_epoch =
-            parse_option_cluster_epoch(line, fields[10], "metadata transfer source epoch")?;
-        let transfer_source_log_index = parse_option_u64(
-            line,
-            fields[11],
-            "metadata transfer source applied log index",
-        )?;
-        let transfer_source_log_hash = parse_option_u64(
-            line,
-            fields[12],
-            "metadata transfer source applied log hash",
-        )?;
-        let transfer_source_state_digest =
-            parse_option_u64(line, fields[13], "metadata transfer source state digest")?;
-        let transfer_imported = if fields.len() == 17 {
-            let transfer_imported_log_index = parse_option_u64(
+    let peering_metadata_transfer =
+        if fields.len() == 14 || fields.len() == 17 || fields.len() >= 18 {
+            let transfer_source_epoch =
+                parse_option_cluster_epoch(line, fields[10], "metadata transfer source epoch")?;
+            let transfer_source_log_index = parse_option_u64(
                 line,
-                fields[14],
-                "metadata transfer imported applied log index",
+                fields[11],
+                "metadata transfer source applied log index",
             )?;
-            let transfer_imported_log_hash = parse_option_u64(
+            let transfer_source_log_hash = parse_option_u64(
                 line,
-                fields[15],
-                "metadata transfer imported applied log hash",
+                fields[12],
+                "metadata transfer source applied log hash",
             )?;
-            let transfer_imported_state_digest =
-                parse_option_u64(line, fields[16], "metadata transfer imported state digest")?;
+            let transfer_source_state_digest =
+                parse_option_u64(line, fields[13], "metadata transfer source state digest")?;
+            let transfer_imported = if fields.len() == 17 || fields.len() >= 18 {
+                let transfer_imported_log_index = parse_option_u64(
+                    line,
+                    fields[14],
+                    "metadata transfer imported applied log index",
+                )?;
+                let transfer_imported_log_hash = parse_option_u64(
+                    line,
+                    fields[15],
+                    "metadata transfer imported applied log hash",
+                )?;
+                let transfer_imported_state_digest =
+                    parse_option_u64(line, fields[16], "metadata transfer imported state digest")?;
+                match (
+                    transfer_imported_log_index,
+                    transfer_imported_log_hash,
+                    transfer_imported_state_digest,
+                ) {
+                    (Some(applied_log_index), Some(applied_log_hash), Some(state_digest)) => {
+                        Some(PgMetadataProof {
+                            applied_log_index,
+                            applied_log_hash,
+                            state_digest,
+                        })
+                    }
+                    (None, None, None) => None,
+                    _ => {
+                        return Err(parse_error(
+                        line,
+                        "metadata transfer imported proof fields must be all present or all absent",
+                    ));
+                    }
+                }
+            } else {
+                None
+            };
             match (
-                transfer_imported_log_index,
-                transfer_imported_log_hash,
-                transfer_imported_state_digest,
+                transfer_source_epoch,
+                transfer_source_log_index,
+                transfer_source_log_hash,
+                transfer_source_state_digest,
+                transfer_imported,
             ) {
-                (Some(applied_log_index), Some(applied_log_hash), Some(state_digest)) => {
-                    Some(PgMetadataProof {
+                (
+                    Some(source_epoch),
+                    Some(applied_log_index),
+                    Some(applied_log_hash),
+                    Some(state_digest),
+                    imported_metadata_proof,
+                ) => Some(PgMetadataTransferProof {
+                    source_epoch,
+                    source_metadata_proof: PgMetadataProof {
                         applied_log_index,
                         applied_log_hash,
                         state_digest,
-                    })
-                }
-                (None, None, None) => None,
+                    },
+                    imported_metadata_proof: imported_metadata_proof.unwrap_or(PgMetadataProof {
+                        applied_log_index,
+                        applied_log_hash,
+                        state_digest,
+                    }),
+                }),
+                (None, None, None, None, None) => None,
                 _ => {
                     return Err(parse_error(
                         line,
-                        "metadata transfer imported proof fields must be all present or all absent",
+                        "metadata transfer source proof fields must be all present or all absent",
                     ));
                 }
             }
         } else {
             None
         };
-        match (
-            transfer_source_epoch,
-            transfer_source_log_index,
-            transfer_source_log_hash,
-            transfer_source_state_digest,
-            transfer_imported,
-        ) {
-            (
-                Some(source_epoch),
-                Some(applied_log_index),
-                Some(applied_log_hash),
-                Some(state_digest),
-                imported_metadata_proof,
-            ) => Some(PgMetadataTransferProof {
-                source_epoch,
-                source_metadata_proof: PgMetadataProof {
-                    applied_log_index,
-                    applied_log_hash,
-                    state_digest,
-                },
-                imported_metadata_proof: imported_metadata_proof.unwrap_or(PgMetadataProof {
-                    applied_log_index,
-                    applied_log_hash,
-                    state_digest,
-                }),
-            }),
-            (None, None, None, None, None) => None,
-            _ => {
-                return Err(parse_error(
-                    line,
-                    "metadata transfer source proof fields must be all present or all absent",
-                ));
-            }
-        }
+    let metadata_transfer_fenced = if fields.len() >= 18 {
+        parse_bool_u8(line, fields[17], "metadata transfer fenced")?
     } else {
-        None
+        false
+    };
+    let active_metadata_transfer_imported = if fields.len() == 19 {
+        parse_bool_u8(
+            line,
+            fields[18],
+            "active metadata transfer imported provenance",
+        )?
+    } else {
+        false
     };
     if acting_set.is_empty() {
         return Err(parse_error(line, "PG acting set must not be empty"));
@@ -4469,48 +4639,64 @@ fn parse_pg_record(line: usize, value: &str) -> Result<PgControlRecord, ControlP
         active_metadata_proof,
         peering_metadata_proof_floor,
         peering_metadata_transfer,
+        metadata_transfer_fenced,
+        active_metadata_transfer_imported,
     ) {
-        (PgState::Active, None, _, _, _) => {
+        (PgState::Active, None, _, _, _, _, _) => {
             return Err(parse_error(
                 line,
                 "active PG record requires active primary",
             ));
         }
-        (PgState::Active, Some(_), None, _, _) => {
+        (PgState::Active, Some(_), None, _, _, _, _) => {
             return Err(parse_error(
                 line,
                 "active PG record requires active metadata proof",
             ));
         }
-        (PgState::Active, Some(_), Some(_), Some(_), _) => {
+        (PgState::Active, Some(_), Some(_), Some(_), _, _, _) => {
             return Err(parse_error(
                 line,
                 "active PG record must not have peering metadata proof floor",
             ));
         }
-        (PgState::Active, Some(_), Some(_), None, Some(_)) => {
+        (PgState::Active, Some(_), Some(_), None, Some(_), _, _) => {
             return Err(parse_error(
                 line,
                 "active PG record must not have metadata transfer proof",
             ));
         }
-        (PgState::Active, Some(primary), Some(_), None, None) if !acting_set.contains(&primary) => {
+        (PgState::Active, Some(_), Some(_), None, None, true, _) => {
+            return Err(parse_error(
+                line,
+                "active PG record must not be metadata transfer fenced",
+            ));
+        }
+        (PgState::Active, Some(primary), Some(_), None, None, false, _)
+            if !acting_set.contains(&primary) =>
+        {
             return Err(parse_error(line, "active PG primary must be in acting set"));
         }
-        (PgState::Active, Some(_), Some(_), None, None) => {}
-        (_, Some(_), _, _, _) => {
+        (PgState::Active, Some(_), Some(_), None, None, false, _) => {}
+        (_, _, _, _, _, _, true) => {
+            return Err(parse_error(
+                line,
+                "non-active PG record must not have active metadata transfer provenance",
+            ));
+        }
+        (_, Some(_), _, _, _, _, _) => {
             return Err(parse_error(
                 line,
                 "non-active PG record must not have active primary",
             ));
         }
-        (_, None, Some(_), _, _) => {
+        (_, None, Some(_), _, _, _, _) => {
             return Err(parse_error(
                 line,
                 "non-active PG record must not have active metadata proof",
             ));
         }
-        (PgState::Peering, None, None, Some(floor), Some(transfer))
+        (PgState::Peering, None, None, Some(floor), Some(transfer), false, _)
             if !metadata_proof_satisfies_active_floor(floor, transfer.metadata_proof()) =>
         {
             return Err(parse_error(
@@ -4518,26 +4704,38 @@ fn parse_pg_record(line: usize, value: &str) -> Result<PgControlRecord, ControlP
                 "metadata transfer proof must satisfy peering metadata proof floor",
             ));
         }
-        (PgState::Peering, None, None, None, Some(_)) => {
+        (PgState::Peering, None, None, None, Some(_), _, _) => {
             return Err(parse_error(
                 line,
                 "metadata transfer proof requires peering metadata proof floor",
             ));
         }
-        (PgState::Peering, None, None, _, _) => {}
-        (_, None, None, Some(_), _) => {
+        (PgState::Peering, None, None, _, Some(_), true, _) => {
+            return Err(parse_error(
+                line,
+                "metadata transfer destination proof must not be source fenced",
+            ));
+        }
+        (PgState::Peering, None, None, _, _, _, _) => {}
+        (_, None, None, Some(_), _, _, _) => {
             return Err(parse_error(
                 line,
                 "non-peering PG record must not have peering metadata proof floor",
             ));
         }
-        (_, None, None, None, Some(_)) => {
+        (_, None, None, None, Some(_), _, _) => {
             return Err(parse_error(
                 line,
                 "non-peering PG record must not have metadata transfer proof",
             ));
         }
-        (_, None, None, None, None) => {}
+        (_, None, None, None, None, true, _) => {
+            return Err(parse_error(
+                line,
+                "non-peering PG record must not be metadata transfer fenced",
+            ));
+        }
+        (_, None, None, None, None, false, _) => {}
     }
     let mut unique_nodes = BTreeSet::new();
     for node_id in &acting_set {
@@ -4551,8 +4749,10 @@ fn parse_pg_record(line: usize, value: &str) -> Result<PgControlRecord, ControlP
         acting_set,
         active_primary,
         active_metadata_proof,
+        active_metadata_transfer_imported,
         peering_metadata_proof_floor,
         peering_metadata_transfer,
+        metadata_transfer_fenced,
     })
 }
 
@@ -4662,34 +4862,34 @@ fn validate_pg_heartbeat_observations(
                 pg_id: observation.pg_id.get(),
             });
         }
-        if pg.state == PgState::Active
-            && pg.active_primary == Some(node_id)
-            && observation.state == PgState::Active
-        {
-            if observation.has_pending_metadata_command {
-                return Err(ControlPlaneError::PgPeeringPendingMetadataCommand {
-                    pg_id: observation.pg_id.get(),
-                    node_id: node_id.as_u32(),
-                    cluster_epoch: snapshot.cluster_epoch,
-                });
-            }
-            let expected = pg.active_metadata_proof.ok_or(
-                ControlPlaneError::ActivePgMissingMetadataProof {
-                    pg_id: observation.pg_id.get(),
-                },
-            )?;
-            if !metadata_proof_satisfies_active_floor(expected, observation.metadata_proof) {
-                return Err(ControlPlaneError::PgActiveMetadataProofMismatch {
-                    pg_id: observation.pg_id.get(),
-                    node_id: node_id.as_u32(),
-                    cluster_epoch: snapshot.cluster_epoch,
-                    expected,
-                    actual: observation.metadata_proof,
-                });
-            }
-        }
     }
     Ok(())
+}
+
+fn should_record_pg_heartbeat_observation(
+    snapshot: &ClusterControlSnapshot,
+    node_id: NodeId,
+    observation: &NodePgHeartbeatObservation,
+) -> bool {
+    let Some(pg) = snapshot.pgs.get(&observation.pg_id) else {
+        return true;
+    };
+    if pg.state != PgState::Active
+        || pg.active_primary != Some(node_id)
+        || observation.state != PgState::Active
+    {
+        return true;
+    }
+    if observation.has_pending_metadata_command {
+        return false;
+    }
+    pg.active_metadata_proof.is_some_and(|expected| {
+        metadata_proof_satisfies_active_primary_observation_floor(
+            expected,
+            observation.metadata_proof,
+            pg.active_metadata_transfer_imported,
+        )
+    })
 }
 
 fn validate_pg_peering_observations(
@@ -4766,9 +4966,46 @@ fn metadata_proof_satisfies_active_floor(
     observed.applied_log_index > active_floor.applied_log_index || observed == active_floor
 }
 
+fn metadata_proof_satisfies_active_observation_floor(
+    active_floor: PgMetadataProof,
+    observed: PgMetadataProof,
+) -> bool {
+    metadata_proof_satisfies_active_floor(active_floor, observed)
+}
+
+fn metadata_proof_satisfies_active_primary_observation_floor(
+    active_floor: PgMetadataProof,
+    observed: PgMetadataProof,
+    active_metadata_transfer_imported: bool,
+) -> bool {
+    if active_metadata_transfer_imported {
+        metadata_proof_satisfies_fenced_transfer_source_floor(active_floor, observed)
+    } else {
+        metadata_proof_satisfies_active_floor(active_floor, observed)
+    }
+}
+
+fn metadata_proof_satisfies_fenced_transfer_source_floor(
+    active_floor: PgMetadataProof,
+    observed: PgMetadataProof,
+) -> bool {
+    metadata_proof_satisfies_active_floor(active_floor, observed)
+        // A metadata-transfer activation floor can be imported from a previous
+        // epoch. A deliberately fenced transfer source may have accepted later
+        // commands in its local destination epoch, whose command log starts at a
+        // fresh index. Keep this relaxation scoped to explicit transfer-source
+        // validation; active serving and ordinary migration source selection use
+        // the strict active floor above.
+        || (observed.applied_log_index < active_floor.applied_log_index
+            && observed.applied_log_hash != 0
+            && observed.state_digest != active_floor.state_digest)
+}
+
 fn validate_metadata_transfer_proof(
     snapshot: &ClusterControlSnapshot,
     pg_id: PgId,
+    state: PgState,
+    metadata_transfer_fenced: bool,
     required_floor: PgMetadataProof,
     transfer: PgMetadataTransferProof,
 ) -> Result<(), ControlPlaneError> {
@@ -4786,7 +5023,22 @@ fn validate_metadata_transfer_proof(
             cluster_epoch: snapshot.cluster_epoch,
         });
     }
-    if !metadata_proof_satisfies_active_floor(required_floor, transfer.source_metadata_proof()) {
+    let satisfies_floor = match state {
+        PgState::Active => {
+            metadata_proof_satisfies_active_floor(required_floor, transfer.source_metadata_proof())
+        }
+        PgState::Peering if metadata_transfer_fenced => {
+            metadata_proof_satisfies_fenced_transfer_source_floor(
+                required_floor,
+                transfer.source_metadata_proof(),
+            )
+        }
+        PgState::Peering => {
+            metadata_proof_satisfies_active_floor(required_floor, transfer.source_metadata_proof())
+        }
+        _ => false,
+    };
+    if !satisfies_floor {
         return Err(ControlPlaneError::PgMetadataTransferProofBelowFloor {
             pg_id: pg_id.get(),
             expected: required_floor,
@@ -4823,7 +5075,10 @@ fn validate_authoritative_metadata_migration_source(
         if observation.observed_epoch != snapshot.cluster_epoch
             || observation.state != PgState::Active
             || observation.has_pending_metadata_command
-            || !metadata_proof_satisfies_active_floor(active_floor, observation.metadata_proof)
+            || !metadata_proof_satisfies_active_observation_floor(
+                active_floor,
+                observation.metadata_proof,
+            )
         {
             continue;
         }
@@ -4901,10 +5156,10 @@ fn primary_has_current_pg_state(
     primary: NodeId,
     expected_state: PgState,
 ) -> bool {
-    let expected_active_proof = snapshot
-        .pgs
-        .get(&pg_id)
-        .and_then(|pg| pg.active_metadata_proof);
+    let expected_active_proof = snapshot.pgs.get(&pg_id).and_then(|pg| {
+        pg.active_metadata_proof
+            .map(|proof| (proof, pg.active_metadata_transfer_imported))
+    });
     snapshot
         .nodes
         .get(&primary)
@@ -4914,8 +5169,12 @@ fn primary_has_current_pg_state(
                 && observation.state == expected_state
                 && !observation.has_pending_metadata_command
                 && (expected_state != PgState::Active
-                    || expected_active_proof.is_some_and(|expected| {
-                        metadata_proof_satisfies_active_floor(expected, observation.metadata_proof)
+                    || expected_active_proof.is_some_and(|(expected, imported)| {
+                        metadata_proof_satisfies_active_primary_observation_floor(
+                            expected,
+                            observation.metadata_proof,
+                            imported,
+                        )
                     }))
         })
 }
@@ -4966,7 +5225,11 @@ fn validate_pg_primary_active_observation(
             cluster_epoch: snapshot.cluster_epoch,
         });
     }
-    if !metadata_proof_satisfies_active_floor(expected_proof, observation.metadata_proof) {
+    if !metadata_proof_satisfies_active_primary_observation_floor(
+        expected_proof,
+        observation.metadata_proof,
+        pg.active_metadata_transfer_imported,
+    ) {
         return Err(ControlPlaneError::PgActiveMetadataProofMismatch {
             pg_id: pg_id.get(),
             node_id: primary.as_u32(),
@@ -5007,7 +5270,9 @@ fn mark_pgs_peering_for_nodes(
             record.state = PgState::Peering;
             record.active_primary = None;
             record.active_metadata_proof = None;
+            record.active_metadata_transfer_imported = false;
             record.peering_metadata_transfer = None;
+            record.metadata_transfer_fenced = false;
             peering_pgs.push(record.pg_id);
         }
     }
@@ -5329,6 +5594,131 @@ mod tests {
     }
 
     #[test]
+    fn active_metadata_observation_rejects_epoch_local_progress_after_activation() {
+        let imported_activation_floor = PgMetadataProof {
+            applied_log_index: 42,
+            applied_log_hash: 0xabc,
+            state_digest: 0xdef,
+        };
+
+        assert!(metadata_proof_satisfies_active_observation_floor(
+            imported_activation_floor,
+            imported_activation_floor
+        ));
+        assert!(metadata_proof_satisfies_active_observation_floor(
+            imported_activation_floor,
+            PgMetadataProof {
+                applied_log_index: 43,
+                applied_log_hash: 0xabd,
+                state_digest: 0xdf0,
+            },
+        ));
+        assert!(!metadata_proof_satisfies_active_observation_floor(
+            imported_activation_floor,
+            PgMetadataProof {
+                applied_log_index: 1,
+                applied_log_hash: 0x123,
+                state_digest: 0x456,
+            },
+        ));
+        assert!(!metadata_proof_satisfies_active_observation_floor(
+            imported_activation_floor,
+            PgMetadataProof {
+                applied_log_index: 42,
+                applied_log_hash: 0xabd,
+                state_digest: 0xdf0,
+            },
+        ));
+        assert!(!metadata_proof_satisfies_active_observation_floor(
+            imported_activation_floor,
+            PgMetadataProof {
+                applied_log_index: 41,
+                applied_log_hash: 0,
+                state_digest: 0x456,
+            },
+        ));
+        assert!(!metadata_proof_satisfies_active_observation_floor(
+            imported_activation_floor,
+            PgMetadataProof {
+                applied_log_index: 41,
+                applied_log_hash: 0x123,
+                state_digest: 0xdef,
+            },
+        ));
+    }
+
+    #[test]
+    fn fenced_transfer_source_floor_accepts_epoch_local_progress() {
+        let imported_activation_floor = PgMetadataProof {
+            applied_log_index: 42,
+            applied_log_hash: 0xabc,
+            state_digest: 0xdef,
+        };
+
+        assert!(metadata_proof_satisfies_fenced_transfer_source_floor(
+            imported_activation_floor,
+            PgMetadataProof {
+                applied_log_index: 1,
+                applied_log_hash: 0x123,
+                state_digest: 0x456,
+            },
+        ));
+        assert!(!metadata_proof_satisfies_fenced_transfer_source_floor(
+            imported_activation_floor,
+            PgMetadataProof {
+                applied_log_index: 41,
+                applied_log_hash: 0,
+                state_digest: 0x456,
+            },
+        ));
+        assert!(!metadata_proof_satisfies_fenced_transfer_source_floor(
+            imported_activation_floor,
+            PgMetadataProof {
+                applied_log_index: 41,
+                applied_log_hash: 0x123,
+                state_digest: 0xdef,
+            },
+        ));
+    }
+
+    #[test]
+    fn active_primary_observation_floor_requires_transfer_import_for_epoch_local_progress() {
+        let imported_activation_floor = PgMetadataProof {
+            applied_log_index: 42,
+            applied_log_hash: 0xabc,
+            state_digest: 0xdef,
+        };
+
+        assert!(!metadata_proof_satisfies_active_primary_observation_floor(
+            imported_activation_floor,
+            PgMetadataProof {
+                applied_log_index: 1,
+                applied_log_hash: 0x123,
+                state_digest: 0x456,
+            },
+            false,
+        ));
+        assert!(metadata_proof_satisfies_active_primary_observation_floor(
+            imported_activation_floor,
+            PgMetadataProof {
+                applied_log_index: 1,
+                applied_log_hash: 0x123,
+                state_digest: 0x456,
+            },
+            true,
+        ));
+        assert!(!metadata_proof_satisfies_active_primary_observation_floor(
+            imported_activation_floor,
+            PgMetadataProof {
+                applied_log_index: 41,
+                applied_log_hash: 0,
+                state_digest: 0x456,
+            },
+            true,
+        ));
+    }
+
+    #[test]
     fn unix_control_plane_client_fetches_runtime_map() {
         let tmp = test_util::tempdir();
         let socket_path = tmp.path().join("control-plane.sock");
@@ -5502,12 +5892,20 @@ mod tests {
         });
 
         let client = UnixControlPlaneClient::new(&socket_path);
-        let peering_epoch = client
-            .fence_pg_for_metadata_transfer(PgId::new(44))
+        let runtime_map = client
+            .fence_pg_for_metadata_transfer_runtime_map(PgId::new(44))
             .unwrap();
+        let peering_epoch = runtime_map.cluster_epoch();
 
         server.join().unwrap();
         assert!(peering_epoch > active_epoch);
+        let route = runtime_map
+            .pg_routes()
+            .iter()
+            .find(|route| route.pg_id() == PgId::new(44))
+            .unwrap();
+        assert_eq!(route.state(), PgState::Peering);
+        assert_eq!(route.primary_lease_deadline_ms(), None);
         let mut authority =
             SingleAuthorityControlPlane::open(FileControlPlaneStore::new(&state_path)).unwrap();
         let pg = authority.snapshot().pg(PgId::new(44)).unwrap();
@@ -5515,6 +5913,7 @@ mod tests {
         assert_eq!(pg.acting_set(), &[NodeId::new(1)]);
         assert_eq!(pg.peering_metadata_proof_floor(), Some(active_proof));
         assert_eq!(pg.peering_metadata_transfer(), None);
+        assert!(pg.metadata_transfer_fenced());
 
         let reopened_epoch = authority.snapshot().cluster_epoch();
         let same_epoch = authority
@@ -5535,7 +5934,7 @@ mod tests {
             authority
                 .set_node_membership(NodeId::new(node_id), NodeMembershipState::Active)
                 .unwrap();
-            assert!(heartbeat_until_serving(&mut authority, node_id, 1_000).serving());
+            assert!(heartbeat_until_serving(&mut authority, node_id, 10_000).serving());
         }
         let active_proof = PgMetadataProof::new(9, 10, 11);
         authority
@@ -6887,14 +7286,17 @@ mod tests {
             if node_id == 1 {
                 authority.heartbeat(heartbeat, now_ms).unwrap();
             } else {
-                assert!(matches!(
-                    authority.refresh_node_heartbeat(heartbeat, now_ms),
-                    Err(ControlPlaneError::PgPrimaryMissingActiveObservation {
-                        pg_id: 77,
-                        node_id: 1,
-                        ..
-                    })
-                ));
+                let non_primary_handoff =
+                    authority.refresh_node_heartbeat(heartbeat, now_ms).unwrap();
+                let route = non_primary_handoff
+                    .runtime_map()
+                    .pg_routes()
+                    .iter()
+                    .find(|route| route.pg_id() == PgId::new(77))
+                    .unwrap();
+                assert_eq!(route.state(), PgState::Active);
+                assert_eq!(route.primary_node_id(), NodeId::new(1));
+                assert_eq!(route.primary_lease_deadline_ms(), None);
             }
         }
         let active_epoch = authority.snapshot().cluster_epoch();
@@ -7374,10 +7776,18 @@ mod tests {
             .snapshot()
             .active_pg_route(PgId::new(23), 2_030)
             .is_err());
-        assert!(authority
+        let non_primary_runtime_map = authority
             .snapshot()
             .runtime_map_for_storage_node_refresh(2_030, NodeId::new(2))
-            .is_err());
+            .unwrap();
+        let route = non_primary_runtime_map
+            .pg_routes()
+            .iter()
+            .find(|route| route.pg_id() == PgId::new(23))
+            .unwrap();
+        assert_eq!(route.state(), PgState::Active);
+        assert_eq!(route.primary_node_id(), NodeId::new(1));
+        assert_eq!(route.primary_lease_deadline_ms(), None);
     }
 
     #[test]
@@ -9699,16 +10109,8 @@ mod tests {
             metadata_proof: same_index_mismatched_proof,
             has_pending_metadata_command: false,
         }];
-        assert!(matches!(
-            authority.heartbeat(mismatched_active, 2_020),
-            Err(ControlPlaneError::PgActiveMetadataProofMismatch {
-                pg_id: 19,
-                node_id: 1,
-                expected,
-                actual,
-                ..
-            }) if expected == accepted_proof && actual == same_index_mismatched_proof
-        ));
+        let stale_proof_lease = authority.heartbeat(mismatched_active, 2_020).unwrap();
+        assert_eq!(stale_proof_lease.lease_deadline_ms(), 2_120);
         assert!(authority
             .snapshot()
             .node(NodeId::new(1))
@@ -11405,6 +11807,19 @@ mod tests {
         assert_eq!(pg.acting_set(), &[NodeId::new(2)]);
         assert_eq!(pg.peering_metadata_proof_floor(), Some(imported_proof));
         assert_eq!(pg.peering_metadata_transfer(), Some(transfer));
+        assert!(!pg.metadata_transfer_fenced());
+
+        let transfer_epoch = authority.snapshot().cluster_epoch();
+        assert_eq!(
+            authority
+                .fence_pg_for_metadata_transfer(PgId::new(42))
+                .unwrap()
+                .cluster_epoch(),
+            transfer_epoch
+        );
+        let pg = authority.snapshot().pg(PgId::new(42)).unwrap();
+        assert_eq!(pg.peering_metadata_transfer(), Some(transfer));
+        assert!(!pg.metadata_transfer_fenced());
 
         let restarted = SingleAuthorityControlPlane::open(store.clone()).unwrap();
         let restarted_pg = restarted.snapshot().pg(PgId::new(42)).unwrap();
@@ -11460,6 +11875,99 @@ mod tests {
         assert_eq!(active_pg.active_metadata_proof(), Some(imported_proof));
         assert_eq!(active_pg.peering_metadata_proof_floor(), None);
         assert_eq!(active_pg.peering_metadata_transfer(), None);
+    }
+
+    #[test]
+    fn fenced_metadata_transfer_accepts_epoch_local_source_proof() {
+        let tmp = test_util::tempdir();
+        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+        for node_id in [1, 2] {
+            authority
+                .set_node_membership(NodeId::new(node_id), NodeMembershipState::Active)
+                .unwrap();
+            assert!(heartbeat_until_serving(&mut authority, node_id, 1_000).serving());
+        }
+        let imported_activation_floor = PgMetadataProof::new(9, 10, 11);
+        let epoch_local_source_proof = PgMetadataProof::new(2, 12, 13);
+        for pg_id in [42, 43] {
+            authority
+                .set_pg_acting_set(PgId::new(pg_id), vec![NodeId::new(1)])
+                .unwrap();
+            heartbeat_with_pg_proof(
+                &mut authority,
+                1,
+                pg_id,
+                PgState::Peering,
+                imported_activation_floor,
+                false,
+                10_010 + u64::from(pg_id),
+            );
+            authority
+                .complete_pg_peering(
+                    PgId::new(pg_id),
+                    NodeId::new(1),
+                    node_incarnation(&authority, 1),
+                    10_020 + u64::from(pg_id),
+                )
+                .unwrap();
+            heartbeat_with_pg_proof(
+                &mut authority,
+                1,
+                pg_id,
+                PgState::Active,
+                imported_activation_floor,
+                false,
+                10_030 + u64::from(pg_id),
+            );
+        }
+
+        heartbeat_with_pg_proof(
+            &mut authority,
+            1,
+            42,
+            PgState::Active,
+            imported_activation_floor,
+            false,
+            10_080,
+        );
+        authority
+            .fence_pg_for_metadata_transfer(PgId::new(42))
+            .unwrap();
+        let fenced_epoch = authority.snapshot().cluster_epoch();
+        let fenced_transfer = PgMetadataTransferProof::new_with_imported_metadata_proof(
+            fenced_epoch,
+            epoch_local_source_proof,
+            PgMetadataProof::new(3, 14, 15),
+        );
+        authority
+            .set_pg_acting_set_with_metadata_transfer(
+                PgId::new(42),
+                vec![NodeId::new(2)],
+                fenced_transfer,
+            )
+            .unwrap();
+        let pg = authority.snapshot().pg(PgId::new(42)).unwrap();
+        assert_eq!(pg.acting_set(), &[NodeId::new(2)]);
+        assert_eq!(pg.peering_metadata_transfer(), Some(fenced_transfer));
+
+        authority
+            .set_pg_state(PgId::new(43), PgState::Peering)
+            .unwrap();
+        let unfenced_epoch = authority.snapshot().cluster_epoch();
+        let unfenced_transfer = PgMetadataTransferProof::new_with_imported_metadata_proof(
+            unfenced_epoch,
+            epoch_local_source_proof,
+            PgMetadataProof::new(3, 16, 17),
+        );
+        assert!(matches!(
+            authority.set_pg_acting_set_with_metadata_transfer(
+                PgId::new(43),
+                vec![NodeId::new(2)],
+                unfenced_transfer,
+            ),
+            Err(ControlPlaneError::PgMetadataTransferProofBelowFloor { pg_id: 43, .. })
+        ));
     }
 
     #[test]
