@@ -639,6 +639,62 @@ fn force_insert_pending_metadata_command_for_test(
             .unwrap();
 }
 
+fn force_insert_pending_metadata_command_for_node_for_test(
+    map: &LocalClusterMap,
+    node_id: NodeId,
+    pg_id: PgId,
+    bucket: &BucketName,
+    command: &MetadataCommandEnvelope,
+) {
+    let pg = map
+        .node(node_id)
+        .unwrap()
+        .storage_node()
+        .get_pg(pg_id.get())
+        .unwrap();
+    let command_bytes = command.command_bytes();
+    pg.connection()
+        .execute(
+            "INSERT INTO metadata_command_pending_slot \
+             (singleton, cluster_epoch, pg_id, log_index, command_checksum, command_bytes, scope_bucket) \
+             VALUES (0, ?1, ?2, ?3, ?4, ?5, ?6) \
+             ON CONFLICT(singleton) DO UPDATE SET \
+               cluster_epoch = excluded.cluster_epoch, \
+               pg_id = excluded.pg_id, \
+               log_index = excluded.log_index, \
+               command_checksum = excluded.command_checksum, \
+               command_bytes = excluded.command_bytes, \
+               scope_bucket = excluded.scope_bucket",
+            rusqlite::params![
+                command.id().cluster_epoch().get() as i64,
+                command.id().pg_id().get() as i64,
+                command.id().log_index().get() as i64,
+                command.checksum_crc64() as i64,
+                command_bytes,
+                Some(bucket.as_str()),
+            ],
+        )
+        .unwrap();
+}
+
+fn clear_pending_metadata_command_for_node_for_test(
+    map: &LocalClusterMap,
+    node_id: NodeId,
+    pg_id: PgId,
+) {
+    let pg = map
+        .node(node_id)
+        .unwrap()
+        .storage_node()
+        .get_pg(pg_id.get())
+        .unwrap();
+    let removed = pg
+        .connection()
+        .execute("DELETE FROM metadata_command_pending_slot", [])
+        .unwrap();
+    assert_eq!(removed, 1);
+}
+
 fn force_insert_terminal_pending_metadata_command_for_test(
     map: &LocalClusterMap,
     pg_id: PgId,
