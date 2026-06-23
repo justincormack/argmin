@@ -51,6 +51,7 @@ use crate::peering::{
     PgPeeringReconstructionDecision, PgPeeringReconstructionError, PgPeeringReconstructionFailure,
     PgPeeringReplicaReconstructionInput,
 };
+use crate::pg_store::MetadataCommandCheckpoint;
 use crate::storage_rpc::STORAGE_RPC_MAX_METADATA_COMMAND_LOG_ENTRY_RANGE_ENTRIES;
 #[cfg(test)]
 use crate::traits::PgMetadataStore;
@@ -2739,12 +2740,71 @@ impl StorageCluster {
             .map_err(Into::into)
     }
 
+    fn metadata_transfer_source_state(
+        &self,
+        pg_id: PgId,
+        source_node_id: NodeId,
+    ) -> Result<MetadataCommandReplicaState, PgPeeringReconstructionFailure> {
+        let route = self
+            .local_pg_route(pg_id)
+            .ok_or(StoreError::ClusterPgNotFound {
+                pg_id: pg_id.get(),
+                cluster_epoch: self.operation_epoch(),
+            })?;
+        if route.cluster_epoch() != self.operation_epoch() {
+            return Err(StoreError::StaleMetadataRoute {
+                pg_id: pg_id.get(),
+                route_epoch: route.cluster_epoch(),
+                current_epoch: self.operation_epoch(),
+            }
+            .into());
+        }
+        if route.state() != PgState::Peering {
+            return Err(PgPeeringReconstructionError::TransferSourceNotQuiesced {
+                pg_id,
+                cluster_epoch: self.operation_epoch(),
+                state: route.state(),
+            }
+            .into());
+        }
+        if route.primary_node_id() != source_node_id {
+            return Err(PgPeeringReconstructionError::TransferSourceNotPrimary {
+                pg_id,
+                cluster_epoch: self.operation_epoch(),
+                source_node: source_node_id,
+                primary: route.primary_node_id(),
+            }
+            .into());
+        }
+        let nodes = self
+            .local_map
+            .metadata_pg_acting_nodes_for_peering_inspection(self.operation_epoch(), pg_id)?;
+        let source_node = nodes
+            .iter()
+            .find(|node| node.node_id() == source_node_id)
+            .ok_or(PgPeeringReconstructionError::PrimaryMissing {
+                primary: source_node_id,
+            })?;
+        let state = source_node
+            .metadata_command_client()
+            .metadata_command_replica_state(pg_id)?;
+        if state.cluster_epoch > self.operation_epoch() {
+            return Err(PgPeeringReconstructionError::StaleReplicaEpoch {
+                node_id: source_node_id,
+                replica_epoch: state.cluster_epoch,
+                cluster_epoch: self.operation_epoch(),
+            }
+            .into());
+        }
+        Ok(state)
+    }
+
     #[allow(dead_code)]
     pub(crate) fn export_pg_metadata_transfer_from_checkpoint_and_retained_suffix(
         &self,
         pg_id: PgId,
         source_node_id: NodeId,
-        checkpoint: crate::pg_store::MetadataCommandCheckpoint,
+        checkpoint: MetadataCommandCheckpoint,
     ) -> Result<PgMetadataTransferArtifact, PgPeeringReconstructionFailure> {
         let route = self
             .local_pg_route(pg_id)
@@ -2894,7 +2954,7 @@ impl StorageCluster {
         &self,
         pg_id: PgId,
         source_node_id: NodeId,
-        checkpoint: crate::pg_store::MetadataCommandCheckpoint,
+        checkpoint: MetadataCommandCheckpoint,
     ) -> Result<PgMetadataTransferArtifact, PgMetadataTransferError> {
         self.export_pg_metadata_transfer_from_checkpoint_and_retained_suffix(
             pg_id,
@@ -2904,18 +2964,65 @@ impl StorageCluster {
         .map_err(Into::into)
     }
 
+    #[allow(dead_code)]
+    pub(crate) fn export_pg_metadata_transfer_artifact_for_live_transfer_with_checkpoints(
+        &self,
+        pg_id: PgId,
+        source_node_id: NodeId,
+        checkpoints: impl IntoIterator<Item = MetadataCommandCheckpoint>,
+    ) -> Result<PgMetadataTransferArtifact, PgMetadataTransferError> {
+        match self.export_pg_metadata_transfer_from_retained_log(pg_id, source_node_id) {
+            Ok(artifact) => return Ok(artifact),
+            Err(error) if retained_log_export_failure_allows_checkpoint_fallback(&error) => {}
+            Err(error) => return Err(error.into()),
+        }
+
+        let source_state = self
+            .metadata_transfer_source_state(pg_id, source_node_id)
+            .map_err(PgMetadataTransferError::from)?;
+        let mut candidates: Vec<_> = checkpoints.into_iter().collect();
+        candidates.sort_by(|left, right| {
+            right
+                .applied_log_index
+                .cmp(&left.applied_log_index)
+                .then_with(|| right.applied_log_hash.cmp(&left.applied_log_hash))
+        });
+
+        for checkpoint in candidates {
+            if checkpoint.pg_id != pg_id
+                || checkpoint.cluster_epoch != source_state.cluster_epoch
+                || checkpoint.applied_log_index > source_state.applied_log_index
+            {
+                continue;
+            }
+            if checkpoint.verify().is_err() {
+                continue;
+            }
+            match self.export_pg_metadata_transfer_from_checkpoint_and_retained_suffix(
+                pg_id,
+                source_node_id,
+                checkpoint,
+            ) {
+                Ok(artifact) => return Ok(artifact),
+                Err(PgPeeringReconstructionFailure::Reconstruction(_)) => continue,
+                Err(error) => return Err(error.into()),
+            }
+        }
+
+        self.export_pg_metadata_transfer_from_checkpoint(pg_id, source_node_id)
+            .map_err(Into::into)
+    }
+
     pub fn export_pg_metadata_transfer_artifact_for_live_transfer(
         &self,
         pg_id: PgId,
         source_node_id: NodeId,
     ) -> Result<PgMetadataTransferArtifact, PgMetadataTransferError> {
-        match self.export_pg_metadata_transfer_from_retained_log(pg_id, source_node_id) {
-            Ok(artifact) => Ok(artifact),
-            Err(error) if retained_log_export_failure_allows_checkpoint_fallback(&error) => self
-                .export_pg_metadata_transfer_from_checkpoint(pg_id, source_node_id)
-                .map_err(Into::into),
-            Err(error) => Err(error.into()),
-        }
+        self.export_pg_metadata_transfer_artifact_for_live_transfer_with_checkpoints(
+            pg_id,
+            source_node_id,
+            std::iter::empty(),
+        )
     }
 
     #[allow(dead_code)]

@@ -8270,6 +8270,15 @@ Metadata PG migration and backfill design notes:
   destination proof from the wrong source epoch. Durable historical checkpoint
   storage and selection remain the next step before live transfer can prefer a
   smaller checkpoint-plus-retained-suffix artifact over a full checkpoint.
+- Added the first checkpoint-candidate selection boundary for live metadata
+  transfer. The live export selector can now consume verified historical
+  checkpoint candidates for the fenced source replica, prefer the newest
+  checkpoint-plus-retained-suffix artifact when the full retained prefix is not
+  replayable, skip candidate-local corrupt or unusable checkpoint entries, and
+  fall back to a full checkpoint only when no candidate applies. The default
+  admin path still has no durable checkpoint catalogue to pass in, so
+  persisting/selecting retained historical checkpoints remains the next storage
+  piece.
 
 Exit criteria:
 
