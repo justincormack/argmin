@@ -3,7 +3,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use aws_sdk_s3::Client;
 use ring::{digest, hmac};
-use s3_tests::{build_client_with_ca, build_test_agent, unique_bucket, TestServer, CTX};
+use s3_tests::{
+    assert_s3_err_code, build_client_with_ca, build_test_agent, unique_bucket, TestServer, CTX,
+};
 
 // ── Helpers ─────────────────────────────────────────────────────────────
 
@@ -34,6 +36,17 @@ fn assert_error_code(body: &str, code: &str) {
         expected,
         body
     );
+}
+
+async fn assert_object_not_committed(bucket: &str, key: &str) {
+    let result = CTX
+        .client()
+        .get_object()
+        .bucket(bucket)
+        .key(key)
+        .send()
+        .await;
+    assert_s3_err_code(&result, "NoSuchKey");
 }
 
 // ── Crypto helpers ──────────────────────────────────────────────────────
@@ -518,6 +531,29 @@ fn build_unsigned_chunked_body_with_trailer(data: &[u8], trailer: &str) -> Vec<u
     wire
 }
 
+fn build_signed_chunked_body_with_bad_terminal_signature(
+    sign: &SignResult,
+    data: &[u8],
+) -> Vec<u8> {
+    let chunk_sig = chunk_signature(
+        &sign.signing_key,
+        &sign.timestamp,
+        &sign.scope,
+        &sign.seed_signature,
+        data,
+    );
+    let bad_terminal_sig = "0".repeat(64);
+
+    let mut wire = Vec::new();
+    wire.extend_from_slice(
+        format!("{:x};chunk-signature={}\r\n", data.len(), chunk_sig).as_bytes(),
+    );
+    wire.extend_from_slice(data);
+    wire.extend_from_slice(b"\r\n");
+    wire.extend_from_slice(format!("0;chunk-signature={}\r\n\r\n", bad_terminal_sig).as_bytes());
+    wire
+}
+
 /// Compute a chunk signature.
 fn chunk_signature(
     signing_key: &[u8],
@@ -988,6 +1024,40 @@ fn test_signed_chunked_bad_signature() {
         assert_eq!(status, 403, "expected 403, got {}: {}", status, body_str);
         assert_error_code(&body_str, "SignatureDoesNotMatch");
 
+        assert_object_not_committed(&bucket, "bad-sig").await;
+        cleanup(&bucket, &[]).await;
+    });
+}
+
+#[test]
+fn test_signed_chunked_bad_terminal_signature_not_committed() {
+    s3_tests::run(async {
+        let bucket = setup_bucket().await;
+        let key = "bad-terminal-sig";
+        let data = b"payload accepted before terminal signature fails";
+        let path = format!("/{bucket}/{key}");
+        let content_sha256 = "STREAMING-AWS4-HMAC-SHA256-PAYLOAD";
+
+        let sign = sign_streaming_request("PUT", &path, content_sha256, data.len(), &[]);
+        let wire = build_signed_chunked_body_with_bad_terminal_signature(&sign, data);
+
+        let url = format!("{}{}", CTX.endpoint(), path);
+        let mut resp = agent()
+            .put(&url)
+            .header("Authorization", &sign.authorization)
+            .header("x-amz-date", &sign.amz_date)
+            .header("x-amz-content-sha256", content_sha256)
+            .header("content-encoding", "aws-chunked")
+            .header("x-amz-decoded-content-length", data.len().to_string())
+            .header("content-length", wire.len().to_string())
+            .send(&wire[..])
+            .expect("transport error");
+        let status = resp.status().as_u16();
+        let body_str = resp.body_mut().read_to_string().unwrap_or_default();
+        assert_eq!(status, 403, "expected 403, got {}: {}", status, body_str);
+        assert_error_code(&body_str, "SignatureDoesNotMatch");
+
+        assert_object_not_committed(&bucket, key).await;
         cleanup(&bucket, &[]).await;
     });
 }
@@ -1085,6 +1155,7 @@ fn test_chunked_decoded_content_length_mismatch() {
         let status = resp.status().as_u16();
         assert_eq!(status, 400, "expected 400, got {}", status);
 
+        assert_object_not_committed(&bucket, "len-mismatch").await;
         cleanup(&bucket, &[]).await;
     });
 }
@@ -1747,6 +1818,7 @@ fn test_signed_chunked_small_non_final_chunk_rejected() {
         assert_eq!(status, 403, "expected 403, got {}: {}", status, body_str);
         assert_error_code(&body_str, "InvalidChunkSizeError");
 
+        assert_object_not_committed(&bucket, "small-chunk").await;
         cleanup(&bucket, &[]).await;
     });
 }
@@ -1809,6 +1881,7 @@ fn test_signed_multi_chunk_bad_middle_signature() {
         assert_eq!(status, 403, "expected 403, got {}: {}", status, body_str);
         assert_error_code(&body_str, "SignatureDoesNotMatch");
 
+        assert_object_not_committed(&bucket, "bad-middle-sig").await;
         cleanup(&bucket, &[]).await;
     });
 }
@@ -2732,6 +2805,82 @@ fn test_streaming_upload_part_with_inline_checksum() {
         assert_eq!(parts.len(), 1);
         assert_eq!(parts[0].part_number(), Some(1));
         assert_eq!(parts[0].checksum_crc32(), Some(expected_crc.as_str()));
+
+        client
+            .abort_multipart_upload()
+            .bucket(&bucket)
+            .key(key)
+            .upload_id(&upload_id)
+            .send()
+            .await
+            .unwrap();
+        cleanup(&bucket, &[]).await;
+    });
+}
+
+#[test]
+fn test_signed_chunked_upload_part_bad_terminal_signature_not_staged() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+        let key = "streaming-upload-part-bad-terminal-sig";
+
+        let create = client
+            .create_multipart_upload()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap();
+        let upload_id = create.upload_id().unwrap().to_string();
+
+        let data = b"part payload accepted before terminal signature fails";
+        let path = format!("/{bucket}/{key}");
+        let encoded_upload_id: String =
+            url::form_urlencoded::byte_serialize(upload_id.as_bytes()).collect();
+        let query = format!("partNumber=1&uploadId={encoded_upload_id}");
+        let request_uri = format!("{path}?{query}");
+        let content_sha256 = "STREAMING-AWS4-HMAC-SHA256-PAYLOAD";
+
+        let sign = sign_streaming_request_custom_with_query(
+            "PUT",
+            &request_uri,
+            content_sha256,
+            data.len(),
+            &[],
+            false,
+            false,
+        );
+        let wire = build_signed_chunked_body_with_bad_terminal_signature(&sign, data);
+
+        let url = format!("{}{}?{}", CTX.endpoint(), path, query);
+        let mut resp = agent()
+            .put(&url)
+            .header("Authorization", &sign.authorization)
+            .header("x-amz-date", &sign.amz_date)
+            .header("x-amz-content-sha256", content_sha256)
+            .header("content-encoding", "aws-chunked")
+            .header("x-amz-decoded-content-length", data.len().to_string())
+            .header("content-length", wire.len().to_string())
+            .send(&wire[..])
+            .expect("transport error");
+        let status = resp.status().as_u16();
+        let body_str = resp.body_mut().read_to_string().unwrap_or_default();
+        assert_eq!(status, 403, "expected 403, got {}: {}", status, body_str);
+        assert_error_code(&body_str, "SignatureDoesNotMatch");
+
+        let listed = client
+            .list_parts()
+            .bucket(&bucket)
+            .key(key)
+            .upload_id(&upload_id)
+            .send()
+            .await
+            .unwrap();
+        assert!(
+            listed.parts().is_empty(),
+            "bad terminal signature must not stage an upload part"
+        );
 
         client
             .abort_multipart_upload()

@@ -33,6 +33,7 @@ const TRACE_TARGET: &str = "server_http";
 const MAX_STREAMING_POST_PART_HEADER_BYTES: usize = 8 * 1024;
 const MAX_STREAMING_POST_NON_FILE_FORM_BYTES: usize = MAX_BUFFERED_CONTROL_BODY_SIZE;
 const REQUEST_ADMISSION_WAIT_EVENT_THRESHOLD_US: u128 = 10_000;
+const CHUNKED_DECODER_FEED_BYTES: usize = 64 * 1024;
 #[cfg(not(test))]
 const STREAMING_PUT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 #[cfg(test)]
@@ -1486,6 +1487,12 @@ fn parse_chunked_mode(req: &S3Request) -> Result<ChunkedMode, ServerError> {
                     .map_err(|_| ServerError::InvalidRequest {
                         reason: format!("invalid x-amz-decoded-content-length: {expected_len_str}"),
                     })?;
+            if expected_len > MAX_OBJECT_SIZE {
+                return Err(ServerError::ObjectTooLarge {
+                    size: expected_len,
+                    max: MAX_OBJECT_SIZE,
+                });
+            }
 
             match content_sha256 {
                 "STREAMING-AWS4-HMAC-SHA256-PAYLOAD" => Ok(ChunkedMode::Signed { expected_len }),
@@ -2577,33 +2584,36 @@ async fn handle_streaming_put(
                 if let Some(wire_data) = frame.data_ref() {
                     body_timing.data_frames += 1;
                     if let Some(ref mut dec) = decoder {
-                        let decode_start = Instant::now();
-                        let payload = dec.feed(wire_data);
-                        body_timing.decode_us += elapsed_micros(decode_start);
-                        let payload = match payload {
-                            Ok(p) => p,
-                            Err(err) => {
-                                abort_streaming(&state, &ctx, session_id.clone()).await;
-                                return error_response(&err);
+                        for wire_chunk in wire_data.chunks(CHUNKED_DECODER_FEED_BYTES) {
+                            let decode_start = Instant::now();
+                            let payload = dec.feed(wire_chunk);
+                            body_timing.decode_us += elapsed_micros(decode_start);
+                            let payload = match payload {
+                                Ok(p) => p,
+                                Err(err) => {
+                                    abort_streaming(&state, &ctx, session_id.clone()).await;
+                                    return error_response(&err);
+                                }
+                            };
+                            let mut ingest = StreamingPutIngestState {
+                                hasher: &mut hasher,
+                                payload_sha256_hasher: &mut payload_sha256_hasher,
+                                content_md5_hasher: &mut content_md5_hasher,
+                                trailing_hasher: &mut trailing_hasher,
+                                total_size: &mut total_size,
+                                buf: &mut buf,
+                                session_id: &mut session_id,
+                                segment_index: &mut segment_index,
+                                body_started_emitted: &mut body_started_emitted,
+                                timing: &mut body_timing,
+                                abort_guard: &abort_guard,
+                            };
+                            if let Err(resp) =
+                                ingest_streaming_put_payload(&state, &ctx, &payload, &mut ingest)
+                                    .await
+                            {
+                                return resp;
                             }
-                        };
-                        let mut ingest = StreamingPutIngestState {
-                            hasher: &mut hasher,
-                            payload_sha256_hasher: &mut payload_sha256_hasher,
-                            content_md5_hasher: &mut content_md5_hasher,
-                            trailing_hasher: &mut trailing_hasher,
-                            total_size: &mut total_size,
-                            buf: &mut buf,
-                            session_id: &mut session_id,
-                            segment_index: &mut segment_index,
-                            body_started_emitted: &mut body_started_emitted,
-                            timing: &mut body_timing,
-                            abort_guard: &abort_guard,
-                        };
-                        if let Err(resp) =
-                            ingest_streaming_put_payload(&state, &ctx, &payload, &mut ingest).await
-                        {
-                            return resp;
                         }
                     } else {
                         let mut ingest = StreamingPutIngestState {
@@ -3439,32 +3449,35 @@ async fn handle_streaming_part(
                 if let Some(wire_data) = frame.data_ref() {
                     body_timing.data_frames += 1;
                     if let Some(ref mut dec) = decoder {
-                        let decode_start = Instant::now();
-                        let payload = dec.feed(wire_data);
-                        body_timing.decode_us += elapsed_micros(decode_start);
-                        let payload = match payload {
-                            Ok(p) => p,
-                            Err(err) => {
-                                abort_streaming_part_ctx(&state, &ctx).await;
-                                return error_response(&err);
+                        for wire_chunk in wire_data.chunks(CHUNKED_DECODER_FEED_BYTES) {
+                            let decode_start = Instant::now();
+                            let payload = dec.feed(wire_chunk);
+                            body_timing.decode_us += elapsed_micros(decode_start);
+                            let payload = match payload {
+                                Ok(p) => p,
+                                Err(err) => {
+                                    abort_streaming_part_ctx(&state, &ctx).await;
+                                    return error_response(&err);
+                                }
+                            };
+                            let mut ingest = StreamingPartIngestState {
+                                hasher: &mut hasher,
+                                payload_sha256_hasher: &mut payload_sha256_hasher,
+                                content_md5_hasher: &mut content_md5_hasher,
+                                trailing_hasher: &mut trailing_hasher,
+                                total_size: &mut total_size,
+                                buf: &mut buf,
+                                segment_index: &mut segment_index,
+                                body_started_emitted: &mut body_started_emitted,
+                                timing: &mut body_timing,
+                                abort_guard: &abort_guard,
+                            };
+                            if let Err(resp) =
+                                ingest_streaming_part_payload(&state, &ctx, &payload, &mut ingest)
+                                    .await
+                            {
+                                return resp;
                             }
-                        };
-                        let mut ingest = StreamingPartIngestState {
-                            hasher: &mut hasher,
-                            payload_sha256_hasher: &mut payload_sha256_hasher,
-                            content_md5_hasher: &mut content_md5_hasher,
-                            trailing_hasher: &mut trailing_hasher,
-                            total_size: &mut total_size,
-                            buf: &mut buf,
-                            segment_index: &mut segment_index,
-                            body_started_emitted: &mut body_started_emitted,
-                            timing: &mut body_timing,
-                            abort_guard: &abort_guard,
-                        };
-                        if let Err(resp) =
-                            ingest_streaming_part_payload(&state, &ctx, &payload, &mut ingest).await
-                        {
-                            return resp;
                         }
                     } else {
                         let mut ingest = StreamingPartIngestState {
@@ -4298,17 +4311,27 @@ fn make_chunked_decoder(
 ) -> Option<super::chunked::IncrementalChunkedDecoder> {
     match mode {
         ChunkedMode::None => None,
-        ChunkedMode::Signed { .. } => Some(super::chunked::IncrementalChunkedDecoder::new(
-            streaming_ctx.cloned(),
-            false,
-        )),
-        ChunkedMode::SignedTrailer { .. } => Some(super::chunked::IncrementalChunkedDecoder::new(
-            streaming_ctx.cloned(),
-            true,
-        )),
-        ChunkedMode::UnsignedTrailer { .. } => {
-            Some(super::chunked::IncrementalChunkedDecoder::new(None, true))
-        }
+        ChunkedMode::Signed { expected_len } => Some(
+            super::chunked::IncrementalChunkedDecoder::new_with_expected_len(
+                streaming_ctx.cloned(),
+                false,
+                Some(*expected_len),
+            ),
+        ),
+        ChunkedMode::SignedTrailer { expected_len } => Some(
+            super::chunked::IncrementalChunkedDecoder::new_with_expected_len(
+                streaming_ctx.cloned(),
+                true,
+                Some(*expected_len),
+            ),
+        ),
+        ChunkedMode::UnsignedTrailer { expected_len } => Some(
+            super::chunked::IncrementalChunkedDecoder::new_with_expected_len(
+                None,
+                true,
+                Some(*expected_len),
+            ),
+        ),
     }
 }
 
@@ -5271,6 +5294,22 @@ mod tests {
         );
         let err = parse_chunked_mode(&req).unwrap_err();
         assert!(matches!(err, ServerError::MissingContentLength));
+    }
+
+    #[test]
+    fn parse_chunked_mode_decoded_length_over_object_limit_rejected() {
+        let too_large = (MAX_OBJECT_SIZE + 1).to_string();
+        let req = make_s3req(
+            "PUT",
+            "/mybucket/mykey",
+            &[
+                ("x-amz-content-sha256", "STREAMING-AWS4-HMAC-SHA256-PAYLOAD"),
+                ("content-encoding", "aws-chunked"),
+                ("x-amz-decoded-content-length", too_large.as_str()),
+            ],
+        );
+        let err = parse_chunked_mode(&req).unwrap_err();
+        assert!(matches!(err, ServerError::ObjectTooLarge { .. }));
     }
 
     #[test]

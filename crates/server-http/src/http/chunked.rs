@@ -10,7 +10,7 @@
 /// \r\n
 /// ```
 use auth::StreamingSigningContext;
-use ring::hmac;
+use ring::{digest, hmac};
 
 use crate::error::ServerError;
 
@@ -25,6 +25,9 @@ pub struct DecodedBody {
 
 /// Minimum chunk size for non-final chunks (matches AWS S3 behavior).
 const MIN_CHUNK_SIZE: usize = 8192;
+const MAX_CHUNKED_LINE_BYTES: usize = 16 * 1024;
+const MAX_CHUNKED_TRAILER_BYTES: usize = 64 * 1024;
+const MAX_CHUNKED_TRAILER_COUNT: usize = 128;
 
 /// Decode an aws-chunked body, optionally verifying per-chunk signatures.
 ///
@@ -146,6 +149,73 @@ fn find_crlf(data: &[u8], start: usize) -> Option<usize> {
     None
 }
 
+fn chunked_line_too_long() -> ServerError {
+    ServerError::MalformedChunkedBody {
+        reason: format!("chunked line exceeds {MAX_CHUNKED_LINE_BYTES} bytes"),
+    }
+}
+
+fn chunked_trailers_too_large() -> ServerError {
+    ServerError::MalformedChunkedBody {
+        reason: "chunked trailer section exceeds limit".to_string(),
+    }
+}
+
+/// Read one CRLF-terminated line from `pending` plus `wire`.
+///
+/// Returns `None` when more wire bytes are needed. `pending` is only for
+/// header/trailer line fragments; chunk payload bytes are not stored there.
+fn read_crlf_line(pending: &mut Vec<u8>, wire: &mut &[u8]) -> Result<Option<Vec<u8>>, ServerError> {
+    if pending.is_empty() {
+        if let Some(crlf_pos) = find_crlf(wire, 0) {
+            if crlf_pos > MAX_CHUNKED_LINE_BYTES {
+                return Err(chunked_line_too_long());
+            }
+            let line = wire[..crlf_pos].to_vec();
+            *wire = &wire[crlf_pos + 2..];
+            return Ok(Some(line));
+        }
+        if wire.len() > MAX_CHUNKED_LINE_BYTES {
+            return Err(chunked_line_too_long());
+        }
+        pending.extend_from_slice(wire);
+        *wire = &[];
+        return Ok(None);
+    }
+
+    if pending.last() == Some(&b'\r') && wire.first() == Some(&b'\n') {
+        let line = pending[..pending.len() - 1].to_vec();
+        if line.len() > MAX_CHUNKED_LINE_BYTES {
+            return Err(chunked_line_too_long());
+        }
+        pending.clear();
+        *wire = &wire[1..];
+        return Ok(Some(line));
+    }
+
+    if let Some(crlf_pos) = find_crlf(wire, 0) {
+        if pending.len() + crlf_pos > MAX_CHUNKED_LINE_BYTES {
+            return Err(chunked_line_too_long());
+        }
+        pending.extend_from_slice(&wire[..crlf_pos + 2]);
+        *wire = &wire[crlf_pos + 2..];
+    } else {
+        if pending.len() + wire.len() > MAX_CHUNKED_LINE_BYTES {
+            return Err(chunked_line_too_long());
+        }
+        pending.extend_from_slice(wire);
+        *wire = &[];
+    }
+
+    if let Some(crlf_pos) = find_crlf(pending, 0) {
+        let line = pending[..crlf_pos].to_vec();
+        pending.drain(..crlf_pos + 2);
+        Ok(Some(line))
+    } else {
+        Ok(None)
+    }
+}
+
 /// Parse a chunk header line into (size, optional signature hex).
 fn parse_chunk_header(line: &[u8]) -> Result<(usize, Option<String>), ServerError> {
     let line_str = std::str::from_utf8(line).map_err(|_| ServerError::MalformedChunkedBody {
@@ -222,9 +292,17 @@ fn verify_chunk_signature(
     chunk_data: &[u8],
     claimed_sig: &str,
 ) -> Result<(), ServerError> {
-    let empty_hash = auth::canonical::sha256_hex(b"");
     let chunk_hash = auth::canonical::sha256_hex(chunk_data);
+    verify_chunk_signature_hash(ctx, prev_sig, &chunk_hash, claimed_sig)
+}
 
+fn verify_chunk_signature_hash(
+    ctx: &StreamingSigningContext,
+    prev_sig: &str,
+    chunk_hash: &str,
+    claimed_sig: &str,
+) -> Result<(), ServerError> {
+    let empty_hash = auth::canonical::sha256_hex(b"");
     let string_to_sign = format!(
         "AWS4-HMAC-SHA256-PAYLOAD\n{}\n{}\n{}\n{}\n{}",
         ctx.timestamp, ctx.scope, prev_sig, empty_hash, chunk_hash
@@ -319,9 +397,13 @@ pub struct IncrementalChunkedDecoder {
     prev_sig: Option<String>,
     chunk_number: usize,
     prev_chunk_size: Option<usize>,
+    expected_decoded_remaining: Option<u64>,
+    current_chunk_hash: Option<digest::Context>,
     buf: Vec<u8>,
     state: ChunkedDecoderState,
     trailers: Vec<(String, String)>,
+    trailer_bytes: usize,
+    trailer_count: usize,
     done: bool,
 }
 
@@ -331,11 +413,12 @@ enum ChunkedDecoderState {
     ReadingHeader,
     /// Reading chunk data bytes. `remaining` bytes left to read in current chunk.
     ReadingData {
+        chunk_size: usize,
         remaining: usize,
         sig: Option<String>,
     },
     /// Consumed chunk data, expecting \r\n after it.
-    ExpectingDataCrlf,
+    ExpectingDataCrlf { seen_cr: bool },
     /// Reading trailers after terminal chunk.
     ReadingTrailers,
     /// Decoding complete.
@@ -345,6 +428,15 @@ enum ChunkedDecoderState {
 impl IncrementalChunkedDecoder {
     #[must_use]
     pub fn new(streaming: Option<StreamingSigningContext>, trailer_mode: bool) -> Self {
+        Self::new_with_expected_len(streaming, trailer_mode, None)
+    }
+
+    #[must_use]
+    pub fn new_with_expected_len(
+        streaming: Option<StreamingSigningContext>,
+        trailer_mode: bool,
+        expected_decoded_len: Option<u64>,
+    ) -> Self {
         let prev_sig = streaming.as_ref().map(|s| s.seed_signature.clone());
         Self {
             streaming,
@@ -352,9 +444,13 @@ impl IncrementalChunkedDecoder {
             prev_sig,
             chunk_number: 0,
             prev_chunk_size: None,
+            expected_decoded_remaining: expected_decoded_len,
+            current_chunk_hash: None,
             buf: Vec::new(),
             state: ChunkedDecoderState::ReadingHeader,
             trailers: Vec::new(),
+            trailer_bytes: 0,
+            trailer_count: 0,
             done: false,
         }
     }
@@ -363,25 +459,24 @@ impl IncrementalChunkedDecoder {
     ///
     /// Returns decoded payload bytes extracted from this batch. May return
     /// an empty vec if the wire data doesn't complete any payload chunks.
-    pub fn feed(&mut self, wire: &[u8]) -> Result<Vec<u8>, ServerError> {
+    ///
+    /// Production callers should feed bounded wire slices. The decoder does not
+    /// retain chunk payload bytes between calls, but the returned payload is
+    /// owned so async callers never hold a decoder borrow across `.await`.
+    pub fn feed(&mut self, mut wire: &[u8]) -> Result<Vec<u8>, ServerError> {
         if self.done {
             return Err(ServerError::MalformedChunkedBody {
                 reason: "data after chunked body complete".to_string(),
             });
         }
-        self.buf.extend_from_slice(wire);
         let mut payload = Vec::new();
 
         loop {
             match self.state {
                 ChunkedDecoderState::ReadingHeader => {
-                    // Try to find a complete header line.
-                    let Some(crlf_pos) = find_crlf(&self.buf, 0) else {
+                    let Some(line) = read_crlf_line(&mut self.buf, &mut wire)? else {
                         break;
                     };
-                    let line = self.buf[..crlf_pos].to_vec();
-                    self.buf.drain(..crlf_pos + 2);
-
                     let (chunk_size, chunk_sig) = parse_chunk_header(&line)?;
 
                     // Signed mode requires chunk-signature on every chunk.
@@ -392,6 +487,15 @@ impl IncrementalChunkedDecoder {
                     }
 
                     if chunk_size == 0 {
+                        if let Some(remaining) = self.expected_decoded_remaining {
+                            if remaining != 0 {
+                                return Err(ServerError::MalformedChunkedBody {
+                                    reason: format!(
+                                        "decoded content length mismatch: {remaining} bytes remaining"
+                                    ),
+                                });
+                            }
+                        }
                         // Terminal chunk.
                         if let Some(ref ctx) = self.streaming {
                             let sig = chunk_sig.as_deref().unwrap();
@@ -418,65 +522,108 @@ impl IncrementalChunkedDecoder {
                         }
                     }
 
+                    if let Some(remaining) = self.expected_decoded_remaining {
+                        let chunk_size_u64 =
+                            u64::try_from(chunk_size).map_err(|_| ServerError::ObjectTooLarge {
+                                size: u64::MAX,
+                                max: remaining,
+                            })?;
+                        if chunk_size_u64 > remaining {
+                            return Err(ServerError::MalformedChunkedBody {
+                                reason: format!(
+                                    "chunk size {chunk_size_u64} exceeds remaining decoded content length {remaining}"
+                                ),
+                            });
+                        }
+                    }
+
+                    self.current_chunk_hash = self
+                        .streaming
+                        .as_ref()
+                        .map(|_| digest::Context::new(&digest::SHA256));
                     self.state = ChunkedDecoderState::ReadingData {
+                        chunk_size,
                         remaining: chunk_size,
                         sig: chunk_sig,
                     };
                 }
                 ChunkedDecoderState::ReadingData {
+                    chunk_size,
                     ref mut remaining,
                     ref sig,
                 } => {
-                    if self.buf.len() < *remaining {
-                        // Not enough data yet. Drain what we can for payload
-                        // but we need to verify the complete chunk signature,
-                        // so we must buffer the full chunk before yielding.
+                    if wire.is_empty() {
                         break;
                     }
-                    let chunk_data: Vec<u8> = self.buf.drain(..*remaining).collect();
-                    let sig = sig.clone();
-                    *remaining = 0;
+                    let take = (*remaining).min(wire.len());
+                    let chunk_data = &wire[..take];
+                    if let Some(ref mut ctx) = self.current_chunk_hash {
+                        ctx.update(chunk_data);
+                    }
+                    if let Some(ref mut decoded_remaining) = self.expected_decoded_remaining {
+                        *decoded_remaining -= u64::try_from(take).expect("usize fits in u64");
+                    }
+                    payload.extend_from_slice(chunk_data);
+                    wire = &wire[take..];
+                    *remaining -= take;
+                    if *remaining != 0 {
+                        break;
+                    }
 
                     // Verify chunk signature.
                     if let Some(ref ctx) = self.streaming {
                         let s = sig.as_deref().unwrap();
-                        verify_chunk_signature(
+                        let chunk_hash = self
+                            .current_chunk_hash
+                            .take()
+                            .expect("signed chunks must have hash context")
+                            .finish();
+                        let chunk_hash_hex = hex_encode(chunk_hash.as_ref());
+                        verify_chunk_signature_hash(
                             ctx,
                             self.prev_sig.as_deref().unwrap(),
-                            &chunk_data,
+                            &chunk_hash_hex,
                             s,
                         )?;
                         self.prev_sig = Some(s.to_string());
                     }
 
-                    self.prev_chunk_size = Some(chunk_data.len());
+                    self.prev_chunk_size = Some(chunk_size);
                     self.chunk_number += 1;
-                    payload.extend_from_slice(&chunk_data);
 
-                    self.state = ChunkedDecoderState::ExpectingDataCrlf;
+                    self.state = ChunkedDecoderState::ExpectingDataCrlf { seen_cr: false };
                 }
-                ChunkedDecoderState::ExpectingDataCrlf => {
-                    if self.buf.len() < 2 {
-                        break;
+                ChunkedDecoderState::ExpectingDataCrlf { ref mut seen_cr } => {
+                    if !*seen_cr {
+                        let Some((&b, rest)) = wire.split_first() else {
+                            break;
+                        };
+                        if b != b'\r' {
+                            return Err(ServerError::MalformedChunkedBody {
+                                reason: "missing CRLF after chunk data".to_string(),
+                            });
+                        }
+                        wire = rest;
+                        *seen_cr = true;
                     }
-                    if self.buf[0] != b'\r' || self.buf[1] != b'\n' {
+                    let Some((&b, rest)) = wire.split_first() else {
+                        break;
+                    };
+                    if b != b'\n' {
                         return Err(ServerError::MalformedChunkedBody {
                             reason: "missing CRLF after chunk data".to_string(),
                         });
                     }
-                    self.buf.drain(..2);
+                    wire = rest;
                     self.state = ChunkedDecoderState::ReadingHeader;
                 }
                 ChunkedDecoderState::ReadingTrailers => {
                     // Try to parse trailer lines until empty line.
                     loop {
-                        if self.buf.is_empty() {
+                        let Some(line) = read_crlf_line(&mut self.buf, &mut wire)? else {
                             return Ok(payload); // Need more data
-                        }
-                        // Empty line marks end of trailers.
-                        if self.buf.len() >= 2 && self.buf[0] == b'\r' && self.buf[1] == b'\n' {
-                            self.buf.drain(..2);
-
+                        };
+                        if line.is_empty() {
                             // Verify trailer signature if needed.
                             if self.trailer_mode {
                                 if let Some(ref ctx) = self.streaming {
@@ -496,12 +643,14 @@ impl IncrementalChunkedDecoder {
                             self.done = true;
                             break;
                         }
-                        // Try to find a complete trailer line.
-                        let Some(crlf_pos) = find_crlf(&self.buf, 0) else {
-                            return Ok(payload); // Need more data
-                        };
-                        let line = self.buf[..crlf_pos].to_vec();
-                        self.buf.drain(..crlf_pos + 2);
+
+                        self.trailer_count += 1;
+                        self.trailer_bytes += line.len() + 2;
+                        if self.trailer_count > MAX_CHUNKED_TRAILER_COUNT
+                            || self.trailer_bytes > MAX_CHUNKED_TRAILER_BYTES
+                        {
+                            return Err(chunked_trailers_too_large());
+                        }
 
                         let line_str = std::str::from_utf8(&line).map_err(|_| {
                             ServerError::MalformedChunkedBody {
@@ -879,10 +1028,10 @@ mod tests {
         let mut dec = IncrementalChunkedDecoder::new(None, false);
         // Feed header + partial data
         let payload1 = dec.feed(b"5\r\nhel").unwrap();
-        assert!(payload1.is_empty()); // Not enough data yet
-                                      // Feed rest of data + terminal
+        assert_eq!(payload1, b"hel");
+        // Feed rest of data + terminal
         let payload2 = dec.feed(b"lo\r\n0\r\n\r\n").unwrap();
-        assert_eq!(payload2, b"hello");
+        assert_eq!(payload2, b"lo");
         assert!(dec.is_done());
     }
 
@@ -909,6 +1058,75 @@ mod tests {
         let wire = b"5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n";
         let err = dec.feed(wire).unwrap_err();
         assert!(matches!(err, ServerError::InvalidChunkSize { .. }));
+    }
+
+    #[test]
+    fn incremental_chunk_larger_than_remaining_decoded_length_rejected() {
+        let mut dec = IncrementalChunkedDecoder::new_with_expected_len(None, false, Some(4));
+        let err = dec.feed(b"5\r\n").unwrap_err();
+        assert!(matches!(err, ServerError::MalformedChunkedBody { .. }));
+    }
+
+    #[test]
+    fn incremental_chunk_header_line_too_long_rejected() {
+        let mut dec = IncrementalChunkedDecoder::new(None, false);
+        let line = vec![b'a'; MAX_CHUNKED_LINE_BYTES + 1];
+        let err = dec.feed(&line).unwrap_err();
+        assert!(matches!(err, ServerError::MalformedChunkedBody { .. }));
+    }
+
+    #[test]
+    fn incremental_trailer_line_too_long_rejected() {
+        let mut dec = IncrementalChunkedDecoder::new(None, true);
+        assert!(dec.feed(b"0\r\n").unwrap().is_empty());
+        let line = vec![b'a'; MAX_CHUNKED_LINE_BYTES + 1];
+        let err = dec.feed(&line).unwrap_err();
+        assert!(matches!(err, ServerError::MalformedChunkedBody { .. }));
+    }
+
+    #[test]
+    fn incremental_too_many_complete_trailers_rejected() {
+        let mut dec = IncrementalChunkedDecoder::new(None, true);
+        assert!(dec.feed(b"0\r\n").unwrap().is_empty());
+
+        let mut trailers = Vec::new();
+        for index in 0..=MAX_CHUNKED_TRAILER_COUNT {
+            trailers.extend_from_slice(format!("x-test-{index}: value\r\n").as_bytes());
+        }
+        let err = dec.feed(&trailers).unwrap_err();
+        assert!(matches!(err, ServerError::MalformedChunkedBody { .. }));
+    }
+
+    #[test]
+    fn incremental_total_trailer_bytes_too_large_rejected() {
+        let mut dec = IncrementalChunkedDecoder::new(None, true);
+        assert!(dec.feed(b"0\r\n").unwrap().is_empty());
+
+        let value = "a".repeat(1024);
+        let mut trailers = Vec::new();
+        for index in 0..MAX_CHUNKED_TRAILER_COUNT {
+            trailers.extend_from_slice(format!("x-test-{index}: {value}\r\n").as_bytes());
+            if trailers.len() > MAX_CHUNKED_TRAILER_BYTES {
+                break;
+            }
+        }
+        let err = dec.feed(&trailers).unwrap_err();
+        assert!(matches!(err, ServerError::MalformedChunkedBody { .. }));
+    }
+
+    #[test]
+    fn incremental_terminal_before_expected_decoded_length_rejected() {
+        let mut dec = IncrementalChunkedDecoder::new_with_expected_len(None, false, Some(5));
+        let err = dec.feed(b"0\r\n\r\n").unwrap_err();
+        assert!(matches!(err, ServerError::MalformedChunkedBody { .. }));
+    }
+
+    #[test]
+    fn incremental_expected_decoded_length_allows_exact_body() {
+        let mut dec = IncrementalChunkedDecoder::new_with_expected_len(None, false, Some(5));
+        let payload = dec.feed(b"5\r\nhello\r\n0\r\n\r\n").unwrap();
+        assert_eq!(payload, b"hello");
+        assert!(dec.is_done());
     }
 
     #[test]
