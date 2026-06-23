@@ -572,6 +572,62 @@ struct MetadataTransferLiveSummary {
     imported_proof: PgMetadataProof,
 }
 
+fn metadata_transfer_peering_source_node_id(
+    runtime_map: &ClusterRuntimeMapSnapshot,
+    pg_id: PgId,
+) -> Result<NodeId, String> {
+    let route = runtime_map
+        .pg_routes()
+        .iter()
+        .find(|route| route.pg_id() == pg_id)
+        .ok_or_else(|| format!("control-plane runtime map has no PG {}", pg_id.get()))?;
+    if route.state() != PgState::Peering {
+        return Err(format!(
+            "PG {} must be Peering after live metadata transfer fence, got {:?}",
+            pg_id.get(),
+            route.state()
+        ));
+    }
+    Ok(route.primary_node_id())
+}
+
+fn metadata_transfer_peering_source_route_matches(
+    runtime_map: &ClusterRuntimeMapSnapshot,
+    pg_id: PgId,
+    source_node_id: NodeId,
+) -> Result<(), String> {
+    let actual_source_node_id = metadata_transfer_peering_source_node_id(runtime_map, pg_id)?;
+    if actual_source_node_id == source_node_id {
+        return Ok(());
+    }
+    Err(format!(
+        "PG {} fenced source node changed from {} to {}",
+        pg_id.get(),
+        source_node_id.as_u32(),
+        actual_source_node_id.as_u32()
+    ))
+}
+
+fn metadata_transfer_source_lease_wait_duration(
+    now_ms: u64,
+    lease_deadline_ms: u64,
+) -> Option<Duration> {
+    if now_ms >= lease_deadline_ms {
+        return None;
+    }
+    let remaining_ms = lease_deadline_ms - now_ms;
+    Some(Duration::from_millis(remaining_ms.clamp(1, 100)))
+}
+
+fn wait_for_metadata_transfer_source_lease_to_expire(lease_deadline_ms: u64) {
+    while let Some(duration) = metadata_transfer_source_lease_wait_duration(
+        storage::clock::current_time_millis(),
+        lease_deadline_ms,
+    ) {
+        thread::sleep(duration);
+    }
+}
+
 fn transfer_control_plane_pg_metadata_live(
     socket_path: &Path,
     pg_id: PgId,
@@ -582,15 +638,18 @@ fn transfer_control_plane_pg_metadata_live(
     let ec_config = EcConfig::new(config.ec_k, config.ec_m)
         .map_err(|error| format!("invalid EC config: {error}"))?;
     let control_plane = UnixControlPlaneClient::new(socket_path);
+    let fenced = control_plane
+        .fence_pg_for_metadata_transfer_runtime_map_with_source_lease(pg_id)
+        .map_err(|error| format!("failed to fence live PG for metadata transfer: {error}"))?;
+    let (fenced_runtime, source_lease_deadline_ms) = fenced.into_parts();
+    let source_node_id = metadata_transfer_peering_source_node_id(&fenced_runtime, pg_id)?;
+    if let Some(source_lease_deadline_ms) = source_lease_deadline_ms {
+        wait_for_metadata_transfer_source_lease_to_expire(source_lease_deadline_ms);
+    }
     let source_runtime = control_plane
         .fence_pg_for_metadata_transfer_runtime_map(pg_id)
-        .map_err(|error| format!("failed to fence live PG for metadata transfer: {error}"))?;
-    let source_route = source_runtime
-        .pg_routes()
-        .iter()
-        .find(|route| route.pg_id() == pg_id)
-        .ok_or_else(|| format!("control-plane runtime map has no PG {}", pg_id.get()))?;
-    let source_node_id = source_route.primary_node_id();
+        .map_err(|error| format!("failed to refresh fenced PG metadata transfer map: {error}"))?;
+    metadata_transfer_peering_source_route_matches(&source_runtime, pg_id, source_node_id)?;
     let source_cluster =
         build_frontend_storage_cluster_from_runtime_map(&config, &ec_config, &source_runtime)?;
     let artifact = export_pg_metadata_transfer_artifact_retrying_stale_route(
@@ -1680,6 +1739,26 @@ mod tests {
         assert!(!control_plane_runtime_map_not_ready_for_metadata_transfer(
             "control-plane RPC remote error: unknown PG 99"
         ));
+    }
+
+    #[test]
+    fn metadata_transfer_source_lease_wait_duration_waits_until_deadline() {
+        assert_eq!(
+            metadata_transfer_source_lease_wait_duration(1_000, 1_250),
+            Some(Duration::from_millis(100))
+        );
+        assert_eq!(
+            metadata_transfer_source_lease_wait_duration(1_200, 1_250),
+            Some(Duration::from_millis(50))
+        );
+        assert_eq!(
+            metadata_transfer_source_lease_wait_duration(1_250, 1_250),
+            None
+        );
+        assert_eq!(
+            metadata_transfer_source_lease_wait_duration(1_251, 1_250),
+            None
+        );
     }
 
     #[test]

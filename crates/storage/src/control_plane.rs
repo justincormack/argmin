@@ -602,6 +602,7 @@ impl ClusterControlSnapshot {
                 record.active_metadata_transfer_imported = false;
                 record.peering_metadata_transfer = None;
                 record.metadata_transfer_fenced = false;
+                record.metadata_transfer_fence_source_lease_deadline_ms = None;
             }
         }
         Ok(())
@@ -891,6 +892,10 @@ pub struct PgControlRecord {
     // Operator-initiated transfer fence. While set, normal peering completion
     // is blocked so the source remains quiesced for checkpoint/log export.
     metadata_transfer_fenced: bool,
+    // Primary lease deadline captured by the authority when an Active PG is
+    // fenced for metadata transfer. Retried live transfers must wait for this
+    // original stale-route window before exporting retained metadata.
+    metadata_transfer_fence_source_lease_deadline_ms: Option<u64>,
 }
 
 impl PgControlRecord {
@@ -905,6 +910,7 @@ impl PgControlRecord {
             peering_metadata_proof_floor: None,
             peering_metadata_transfer: None,
             metadata_transfer_fenced: false,
+            metadata_transfer_fence_source_lease_deadline_ms: None,
         }
     }
 
@@ -951,6 +957,11 @@ impl PgControlRecord {
     #[must_use]
     pub fn metadata_transfer_fenced(&self) -> bool {
         self.metadata_transfer_fenced
+    }
+
+    #[must_use]
+    pub fn metadata_transfer_fence_source_lease_deadline_ms(&self) -> Option<u64> {
+        self.metadata_transfer_fence_source_lease_deadline_ms
     }
 }
 
@@ -1197,6 +1208,40 @@ pub trait ControlPlaneRuntimeMapSource {
     ) -> Result<ClusterRuntimeMapSnapshot, ControlPlaneError>;
 }
 
+#[derive(Debug, Clone)]
+pub struct FencedPgMetadataTransferSnapshot {
+    snapshot: ClusterControlSnapshot,
+    source_primary_lease_deadline_ms: Option<u64>,
+}
+
+impl FencedPgMetadataTransferSnapshot {
+    #[must_use]
+    pub fn new(
+        snapshot: ClusterControlSnapshot,
+        source_primary_lease_deadline_ms: Option<u64>,
+    ) -> Self {
+        Self {
+            snapshot,
+            source_primary_lease_deadline_ms,
+        }
+    }
+
+    #[must_use]
+    pub fn snapshot(&self) -> &ClusterControlSnapshot {
+        &self.snapshot
+    }
+
+    #[must_use]
+    pub fn source_primary_lease_deadline_ms(&self) -> Option<u64> {
+        self.source_primary_lease_deadline_ms
+    }
+
+    #[must_use]
+    pub fn into_parts(self) -> (ClusterControlSnapshot, Option<u64>) {
+        (self.snapshot, self.source_primary_lease_deadline_ms)
+    }
+}
+
 pub trait ControlPlaneAdmin {
     fn set_pg_acting_set(
         &mut self,
@@ -1208,6 +1253,11 @@ pub trait ControlPlaneAdmin {
         &mut self,
         pg_id: PgId,
     ) -> Result<ClusterControlSnapshot, ControlPlaneError>;
+
+    fn fence_pg_for_metadata_transfer_with_source_lease(
+        &mut self,
+        pg_id: PgId,
+    ) -> Result<FencedPgMetadataTransferSnapshot, ControlPlaneError>;
 
     fn set_pg_acting_set_with_metadata_transfer(
         &mut self,
@@ -1645,6 +1695,12 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
                 } else {
                     false
                 };
+                let metadata_transfer_fence_source_lease_deadline_ms =
+                    if record.state == PgState::Peering && record.metadata_transfer_fenced {
+                        record.metadata_transfer_fence_source_lease_deadline_ms
+                    } else {
+                        None
+                    };
                 record.acting_set = acting_set;
                 record.state = PgState::Peering;
                 record.active_primary = None;
@@ -1653,6 +1709,8 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
                 record.peering_metadata_proof_floor = peering_metadata_proof_floor;
                 record.peering_metadata_transfer = peering_metadata_transfer;
                 record.metadata_transfer_fenced = metadata_transfer_fenced;
+                record.metadata_transfer_fence_source_lease_deadline_ms =
+                    metadata_transfer_fence_source_lease_deadline_ms;
                 changed = true;
             }
             None => {
@@ -1720,6 +1778,7 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
         record.peering_metadata_proof_floor = Some(transfer.metadata_proof());
         record.peering_metadata_transfer = Some(transfer);
         record.metadata_transfer_fenced = false;
+        record.metadata_transfer_fence_source_lease_deadline_ms = None;
         next_snapshot.bump_epoch()?;
         self.commit_snapshot(next_snapshot)?;
         Ok(self.snapshot.clone())
@@ -1729,14 +1788,65 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
         &mut self,
         pg_id: PgId,
     ) -> Result<ClusterControlSnapshot, ControlPlaneError> {
+        Ok(self
+            .fence_pg_for_metadata_transfer_with_source_lease(pg_id)?
+            .into_parts()
+            .0)
+    }
+
+    pub fn fence_pg_for_metadata_transfer_with_source_lease(
+        &mut self,
+        pg_id: PgId,
+    ) -> Result<FencedPgMetadataTransferSnapshot, ControlPlaneError> {
         let record = self
             .snapshot
             .pg(pg_id)
             .ok_or(ControlPlaneError::UnknownPg { pg_id: pg_id.get() })?;
+        let source_primary_lease_deadline_ms = if record.state == PgState::Active {
+            let primary = record
+                .active_primary
+                .filter(|primary| record.acting_set.contains(primary))
+                .ok_or(ControlPlaneError::PgHasNoServingPrimary {
+                    pg_id: pg_id.get(),
+                    cluster_epoch: self.snapshot.cluster_epoch(),
+                })?;
+            let primary_record =
+                self.snapshot
+                    .node(primary)
+                    .ok_or(ControlPlaneError::UnknownActingSetNode {
+                        pg_id: pg_id.get(),
+                        node_id: primary.as_u32(),
+                    })?;
+            Some(primary_record.lease_deadline_ms.ok_or(
+                ControlPlaneError::PgHasNoServingPrimary {
+                    pg_id: pg_id.get(),
+                    cluster_epoch: self.snapshot.cluster_epoch(),
+                },
+            )?)
+        } else if record.state == PgState::Peering && record.metadata_transfer_fenced {
+            record
+                .metadata_transfer_fence_source_lease_deadline_ms
+                .or_else(|| {
+                    record
+                        .acting_set
+                        .iter()
+                        .filter_map(|node_id| {
+                            self.snapshot
+                                .node(*node_id)
+                                .and_then(|node| node.lease_deadline_ms)
+                        })
+                        .max()
+                })
+        } else {
+            None
+        };
         let active_source_floor = match record.state {
             PgState::Peering => {
                 if record.peering_metadata_transfer.is_some() {
-                    return Ok(self.snapshot.clone());
+                    return Ok(FencedPgMetadataTransferSnapshot::new(
+                        self.snapshot.clone(),
+                        None,
+                    ));
                 }
                 None
             }
@@ -1766,14 +1876,26 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
             record.active_metadata_transfer_imported = false;
             record.peering_metadata_transfer = None;
             record.metadata_transfer_fenced = true;
+            record.metadata_transfer_fence_source_lease_deadline_ms =
+                source_primary_lease_deadline_ms;
             next_snapshot.bump_epoch()?;
             self.commit_snapshot(next_snapshot)?;
         } else if !record.metadata_transfer_fenced {
             record.metadata_transfer_fenced = true;
+            record.metadata_transfer_fence_source_lease_deadline_ms =
+                source_primary_lease_deadline_ms;
             next_snapshot.bump_epoch()?;
             self.commit_snapshot(next_snapshot)?;
         }
-        Ok(self.snapshot.clone())
+        let source_primary_lease_deadline_ms = self
+            .snapshot
+            .pg(pg_id)
+            .and_then(PgControlRecord::metadata_transfer_fence_source_lease_deadline_ms)
+            .or(source_primary_lease_deadline_ms);
+        Ok(FencedPgMetadataTransferSnapshot::new(
+            self.snapshot.clone(),
+            source_primary_lease_deadline_ms,
+        ))
     }
 
     pub fn set_pg_state(
@@ -1800,10 +1922,12 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
             record.active_metadata_proof = None;
             record.active_metadata_transfer_imported = false;
             record.metadata_transfer_fenced = false;
+            record.metadata_transfer_fence_source_lease_deadline_ms = None;
             if state != PgState::Peering {
                 record.peering_metadata_proof_floor = None;
                 record.peering_metadata_transfer = None;
                 record.metadata_transfer_fenced = false;
+                record.metadata_transfer_fence_source_lease_deadline_ms = None;
             }
             next_snapshot.bump_epoch()?;
             self.commit_snapshot(next_snapshot)?;
@@ -1887,6 +2011,7 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
         record.peering_metadata_proof_floor = None;
         record.peering_metadata_transfer = None;
         record.metadata_transfer_fenced = false;
+        record.metadata_transfer_fence_source_lease_deadline_ms = None;
         next_snapshot.bump_epoch()?;
         self.commit_snapshot(next_snapshot)?;
         Ok(self.snapshot.clone())
@@ -1954,6 +2079,7 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
             record.peering_metadata_proof_floor = None;
             record.peering_metadata_transfer = None;
             record.metadata_transfer_fenced = false;
+            record.metadata_transfer_fence_source_lease_deadline_ms = None;
         }
         next_snapshot.bump_epoch()?;
         self.commit_snapshot(next_snapshot)?;
@@ -2513,6 +2639,13 @@ impl<S: ControlPlaneStore> ControlPlaneAdmin for SingleAuthorityControlPlane<S> 
         SingleAuthorityControlPlane::fence_pg_for_metadata_transfer(self, pg_id)
     }
 
+    fn fence_pg_for_metadata_transfer_with_source_lease(
+        &mut self,
+        pg_id: PgId,
+    ) -> Result<FencedPgMetadataTransferSnapshot, ControlPlaneError> {
+        SingleAuthorityControlPlane::fence_pg_for_metadata_transfer_with_source_lease(self, pg_id)
+    }
+
     fn set_pg_acting_set_with_metadata_transfer(
         &mut self,
         pg_id: PgId,
@@ -2528,6 +2661,40 @@ impl<S: ControlPlaneStore> ControlPlaneAdmin for SingleAuthorityControlPlane<S> 
 #[derive(Debug, Clone)]
 pub struct UnixControlPlaneClient {
     socket_path: PathBuf,
+}
+
+#[derive(Debug, Clone)]
+pub struct FencedPgMetadataTransferRuntimeMap {
+    runtime_map: ClusterRuntimeMapSnapshot,
+    source_primary_lease_deadline_ms: Option<u64>,
+}
+
+impl FencedPgMetadataTransferRuntimeMap {
+    #[must_use]
+    pub fn new(
+        runtime_map: ClusterRuntimeMapSnapshot,
+        source_primary_lease_deadline_ms: Option<u64>,
+    ) -> Self {
+        Self {
+            runtime_map,
+            source_primary_lease_deadline_ms,
+        }
+    }
+
+    #[must_use]
+    pub fn runtime_map(&self) -> &ClusterRuntimeMapSnapshot {
+        &self.runtime_map
+    }
+
+    #[must_use]
+    pub fn source_primary_lease_deadline_ms(&self) -> Option<u64> {
+        self.source_primary_lease_deadline_ms
+    }
+
+    #[must_use]
+    pub fn into_parts(self) -> (ClusterRuntimeMapSnapshot, Option<u64>) {
+        (self.runtime_map, self.source_primary_lease_deadline_ms)
+    }
 }
 
 impl UnixControlPlaneClient {
@@ -2618,6 +2785,16 @@ impl UnixControlPlaneClient {
         &self,
         pg_id: PgId,
     ) -> Result<ClusterRuntimeMapSnapshot, ControlPlaneError> {
+        Ok(self
+            .fence_pg_for_metadata_transfer_runtime_map_with_source_lease(pg_id)?
+            .into_parts()
+            .0)
+    }
+
+    pub fn fence_pg_for_metadata_transfer_runtime_map_with_source_lease(
+        &self,
+        pg_id: PgId,
+    ) -> Result<FencedPgMetadataTransferRuntimeMap, ControlPlaneError> {
         let mut payload = Vec::new();
         write_pg_id_request(&mut payload, pg_id);
         let payload = self.send_request(
@@ -2626,8 +2803,12 @@ impl UnixControlPlaneClient {
         )?;
         let mut reader = PayloadReader::new(&payload);
         let runtime_map = read_runtime_map_snapshot(&mut reader)?;
+        let source_primary_lease_deadline_ms = reader.read_option_u64()?;
         reader.finish()?;
-        Ok(runtime_map)
+        Ok(FencedPgMetadataTransferRuntimeMap::new(
+            runtime_map,
+            source_primary_lease_deadline_ms,
+        ))
     }
 
     pub fn set_pg_acting_set_with_metadata_transfer(
@@ -2810,12 +2991,17 @@ where
             let pg_id = read_pg_id_request(&mut reader)?;
             reader.finish()?;
             match control_plane
-                .fence_pg_for_metadata_transfer(pg_id)
-                .and_then(|snapshot| snapshot.reconstructed_runtime_map())
-            {
-                Ok(snapshot) => {
+                .fence_pg_for_metadata_transfer_with_source_lease(pg_id)
+                .and_then(|fenced| {
+                    let (snapshot, source_primary_lease_deadline_ms) = fenced.into_parts();
+                    snapshot
+                        .reconstructed_runtime_map()
+                        .map(|runtime_map| (runtime_map, source_primary_lease_deadline_ms))
+                }) {
+                Ok((snapshot, source_primary_lease_deadline_ms)) => {
                     let mut response = Vec::new();
                     write_runtime_map_snapshot(&mut response, &snapshot)?;
+                    write_option_u64(&mut response, source_primary_lease_deadline_ms);
                     Ok(response)
                 }
                 Err(error) => Err(error),
@@ -3823,7 +4009,7 @@ fn next_epoch(epoch: ClusterEpoch) -> Result<ClusterEpoch, ControlPlaneError> {
 
 fn format_snapshot(snapshot: &ClusterControlSnapshot) -> String {
     let mut out = String::new();
-    out.push_str("version=9\n");
+    out.push_str("version=10\n");
     out.push_str(&format!(
         "authority_incarnation={}\n",
         snapshot.authority_incarnation.get()
@@ -3934,7 +4120,7 @@ fn format_pg_record(record: &PgControlRecord) -> String {
         ),
     };
     format!(
-        "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+        "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
         record.pg_id.get(),
         pg_state_as_str(record.state),
         format_node_list(&record.acting_set),
@@ -3953,7 +4139,8 @@ fn format_pg_record(record: &PgControlRecord) -> String {
         transfer_imported_log_hash,
         transfer_imported_state_digest,
         u8::from(record.metadata_transfer_fenced),
-        u8::from(record.active_metadata_transfer_imported)
+        u8::from(record.active_metadata_transfer_imported),
+        option_u64(record.metadata_transfer_fence_source_lease_deadline_ms)
     )
 }
 
@@ -4144,7 +4331,7 @@ fn parse_snapshot(contents: &str) -> Result<ClusterControlSnapshot, ControlPlane
 
     let version = version
         .ok_or_else(|| parse_error(0, "missing or unsupported control-plane state version"))?;
-    if !(8..=9).contains(&version) {
+    if !(8..=10).contains(&version) {
         return Err(parse_error(
             0,
             "missing or unsupported control-plane state version",
@@ -4468,10 +4655,11 @@ fn parse_pg_record(line: usize, value: &str) -> Result<PgControlRecord, ControlP
         && fields.len() != 17
         && fields.len() != 18
         && fields.len() != 19
+        && fields.len() != 20
     {
         return Err(parse_error(
             line,
-            "PG record must have seven, ten, fourteen, seventeen, eighteen, or nineteen fields",
+            "PG record must have seven, ten, fourteen, seventeen, eighteen, nineteen, or twenty fields",
         ));
     }
     let pg_id = PgId::new(parse_u32(line, fields[0], "PG id")?);
@@ -4621,7 +4809,7 @@ fn parse_pg_record(line: usize, value: &str) -> Result<PgControlRecord, ControlP
     } else {
         false
     };
-    let active_metadata_transfer_imported = if fields.len() == 19 {
+    let active_metadata_transfer_imported = if fields.len() >= 19 {
         parse_bool_u8(
             line,
             fields[18],
@@ -4629,6 +4817,15 @@ fn parse_pg_record(line: usize, value: &str) -> Result<PgControlRecord, ControlP
         )?
     } else {
         false
+    };
+    let metadata_transfer_fence_source_lease_deadline_ms = if fields.len() >= 20 {
+        parse_option_u64(
+            line,
+            fields[19],
+            "metadata transfer fence source lease deadline",
+        )?
+    } else {
+        None
     };
     if acting_set.is_empty() {
         return Err(parse_error(line, "PG acting set must not be empty"));
@@ -4737,6 +4934,14 @@ fn parse_pg_record(line: usize, value: &str) -> Result<PgControlRecord, ControlP
         }
         (_, None, None, None, None, false, _) => {}
     }
+    if metadata_transfer_fence_source_lease_deadline_ms.is_some()
+        && !(state == PgState::Peering && metadata_transfer_fenced)
+    {
+        return Err(parse_error(
+            line,
+            "metadata transfer fence source lease deadline requires a fenced peering PG",
+        ));
+    }
     let mut unique_nodes = BTreeSet::new();
     for node_id in &acting_set {
         if !unique_nodes.insert(*node_id) {
@@ -4753,6 +4958,7 @@ fn parse_pg_record(line: usize, value: &str) -> Result<PgControlRecord, ControlP
         peering_metadata_proof_floor,
         peering_metadata_transfer,
         metadata_transfer_fenced,
+        metadata_transfer_fence_source_lease_deadline_ms,
     })
 }
 
@@ -5282,6 +5488,7 @@ fn mark_pgs_peering_for_nodes(
             record.active_metadata_transfer_imported = false;
             record.peering_metadata_transfer = None;
             record.metadata_transfer_fenced = false;
+            record.metadata_transfer_fence_source_lease_deadline_ms = None;
             peering_pgs.push(record.pg_id);
         }
     }
@@ -5901,13 +6108,16 @@ mod tests {
         });
 
         let client = UnixControlPlaneClient::new(&socket_path);
-        let runtime_map = client
-            .fence_pg_for_metadata_transfer_runtime_map(PgId::new(44))
+        let fenced = client
+            .fence_pg_for_metadata_transfer_runtime_map_with_source_lease(PgId::new(44))
             .unwrap();
+        let source_primary_lease_deadline_ms = fenced.source_primary_lease_deadline_ms();
+        let runtime_map = fenced.runtime_map().clone();
         let peering_epoch = runtime_map.cluster_epoch();
 
         server.join().unwrap();
         assert!(peering_epoch > active_epoch);
+        assert_eq!(source_primary_lease_deadline_ms, Some(2_102));
         let route = runtime_map
             .pg_routes()
             .iter()
@@ -5923,13 +6133,19 @@ mod tests {
         assert_eq!(pg.peering_metadata_proof_floor(), Some(active_proof));
         assert_eq!(pg.peering_metadata_transfer(), None);
         assert!(pg.metadata_transfer_fenced());
+        assert_eq!(
+            pg.metadata_transfer_fence_source_lease_deadline_ms(),
+            Some(2_102)
+        );
 
         let reopened_epoch = authority.snapshot().cluster_epoch();
-        let same_epoch = authority
-            .fence_pg_for_metadata_transfer(PgId::new(44))
-            .unwrap()
-            .cluster_epoch();
+        let retry_fence = authority
+            .fence_pg_for_metadata_transfer_with_source_lease(PgId::new(44))
+            .unwrap();
+        let (retry_snapshot, retry_source_lease_deadline_ms) = retry_fence.into_parts();
+        let same_epoch = retry_snapshot.cluster_epoch();
         assert_eq!(same_epoch, reopened_epoch);
+        assert_eq!(retry_source_lease_deadline_ms, Some(2_102));
     }
 
     #[test]
@@ -11909,6 +12125,84 @@ mod tests {
             fenced_pg.peering_metadata_proof_floor(),
             Some(epoch_local_source_proof)
         );
+    }
+
+    #[test]
+    fn fenced_metadata_transfer_retry_without_stored_deadline_uses_max_source_lease() {
+        let tmp = test_util::tempdir();
+        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+        for node_id in [1, 2] {
+            authority
+                .set_node_membership(NodeId::new(node_id), NodeMembershipState::Active)
+                .unwrap();
+            assert!(heartbeat_until_serving(&mut authority, node_id, 1_000).serving());
+        }
+        let active_proof = PgMetadataProof::new(9, 10, 11);
+        authority
+            .set_pg_acting_set(PgId::new(50), vec![NodeId::new(1), NodeId::new(2)])
+            .unwrap();
+        heartbeat_with_pg_proof(
+            &mut authority,
+            1,
+            50,
+            PgState::Peering,
+            active_proof,
+            false,
+            2_000,
+        );
+        heartbeat_with_pg_proof(
+            &mut authority,
+            2,
+            50,
+            PgState::Peering,
+            active_proof,
+            false,
+            2_001,
+        );
+        authority
+            .complete_pg_peering(
+                PgId::new(50),
+                NodeId::new(1),
+                node_incarnation(&authority, 1),
+                2_002,
+            )
+            .unwrap();
+        heartbeat_with_pg_proof(
+            &mut authority,
+            1,
+            50,
+            PgState::Active,
+            active_proof,
+            false,
+            2_003,
+        );
+        heartbeat_with_pg_proof(
+            &mut authority,
+            2,
+            50,
+            PgState::Active,
+            active_proof,
+            false,
+            2_020,
+        );
+
+        authority
+            .fence_pg_for_metadata_transfer_with_source_lease(PgId::new(50))
+            .unwrap();
+        let record = authority
+            .snapshot
+            .pgs
+            .get_mut(&PgId::new(50))
+            .expect("test PG should exist");
+        assert!(record.metadata_transfer_fenced);
+        record.metadata_transfer_fence_source_lease_deadline_ms = None;
+
+        let retry = authority
+            .fence_pg_for_metadata_transfer_with_source_lease(PgId::new(50))
+            .unwrap();
+
+        assert_eq!(retry.source_primary_lease_deadline_ms(), Some(2_120));
     }
 
     #[test]
