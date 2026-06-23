@@ -8176,6 +8176,16 @@ Metadata PG migration and backfill design notes:
   checkpoint slice must carry materialized row blocks, verify them against the
   summary, and add the storage-node install/validation RPC before checkpoint
   base artifacts can import instead of failing closed.
+- Added materialized row blocks to the checked metadata checkpoint payload.
+  Each table block now carries the canonical table identity, ordered row values,
+  per-row digests, table digest statistics, and the table digest itself. The
+  checkpoint verifier recomputes row digests, table summaries, the full PG
+  state digest, and the checkpoint CRC from the payload, so corrupted or
+  mismatched row contents are rejected before any future install path can trust
+  them. This is still export/verification only: installing checkpoint contents
+  into a destination PG remains deferred until the storage-node install RPC can
+  validate an empty or explicitly replaceable destination and apply the row
+  blocks atomically.
 
 Exit criteria:
 

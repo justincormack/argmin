@@ -60,8 +60,9 @@ mod shards;
 #[cfg(test)]
 use command_log::{digest_len_prefixed_bytes, MetadataDigestFilter, METADATA_DIGEST_TABLES};
 pub use command_log::{
-    MetadataCheckpointTableDigest, MetadataCommandCheckpoint, MetadataCommandLogCompactionStatus,
-    MetadataCommandLogStats,
+    MetadataCheckpointRow, MetadataCheckpointTableBlock, MetadataCheckpointTableDigest,
+    MetadataCheckpointValue, MetadataCommandCheckpoint, MetadataCommandCheckpointValidationError,
+    MetadataCommandLogCompactionStatus, MetadataCommandLogStats,
 };
 use command_log::{ObjectGenerationReservationConstraint, ObjectGenerationReservationIdentity};
 pub(crate) use scavenger::{ScavengerShardFile, ScavengerShardFileScan, ScavengerShardRow};

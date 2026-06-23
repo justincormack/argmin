@@ -73,8 +73,9 @@ pub use node::{
     SharedStorageNode,
 };
 pub use pg_store::{
-    MetadataCheckpointTableDigest, MetadataCommandCheckpoint, MetadataCommandLogCompactionStatus,
-    MetadataCommandLogStats, PgStore,
+    MetadataCheckpointRow, MetadataCheckpointTableBlock, MetadataCheckpointTableDigest,
+    MetadataCheckpointValue, MetadataCommandCheckpoint, MetadataCommandCheckpointValidationError,
+    MetadataCommandLogCompactionStatus, MetadataCommandLogStats, PgStore,
 };
 pub use pg_topology::PgTopology;
 pub use placement::NodeId;

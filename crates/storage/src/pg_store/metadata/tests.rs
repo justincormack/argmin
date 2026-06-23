@@ -2402,7 +2402,9 @@ fn metadata_command_checkpoint_exports_checked_table_digest_summary() {
     assert_eq!(checkpoint.state_digest, state.state_digest);
     assert_eq!(checkpoint.canonical_state_encoding_version, 1);
     assert_eq!(checkpoint.table_digests.len(), METADATA_DIGEST_TABLES.len());
+    assert_eq!(checkpoint.table_blocks.len(), METADATA_DIGEST_TABLES.len());
     assert_ne!(checkpoint.checkpoint_crc64, 0);
+    checkpoint.verify().unwrap();
     assert_eq!(
         checkpoint
             .table_digests
@@ -2418,6 +2420,22 @@ fn metadata_command_checkpoint_exports_checked_table_digest_summary() {
         .table_digests
         .iter()
         .any(|table| table.table_name == "buckets" && table.row_count == 1));
+    let bucket_block = checkpoint
+        .table_blocks
+        .iter()
+        .find(|table| table.table_name == "buckets")
+        .unwrap();
+    assert_eq!(bucket_block.row_count, 1);
+    assert_eq!(bucket_block.rows.len(), 1);
+    assert_eq!(
+        bucket_block.table_digest,
+        checkpoint
+            .table_digests
+            .iter()
+            .find(|table| table.table_name == "buckets")
+            .unwrap()
+            .table_digest
+    );
 
     let second_bucket = trusted_bucket_name("metadata-checkpoint-second");
     let second_command = create_bucket_probe_command(1, 2, second_bucket, 2);
@@ -2433,6 +2451,89 @@ fn metadata_command_checkpoint_exports_checked_table_digest_summary() {
         .table_digests
         .iter()
         .any(|table| table.table_name == "buckets" && table.row_count == 2));
+    updated.verify().unwrap();
+}
+
+#[test]
+fn metadata_command_checkpoint_verification_rejects_tampered_row_payload() {
+    let tmp = test_util::tempdir();
+    let store = PgStore::open(tmp.path(), 1).unwrap();
+    let bucket = trusted_bucket_name("metadata-checkpoint-tamper");
+    let command = create_bucket_probe_command(1, 1, bucket, 1);
+    store
+        .apply_metadata_command_and_record(0, &command)
+        .unwrap();
+
+    let mut checkpoint = store
+        .metadata_command_checkpoint(0, ClusterEpoch::INITIAL)
+        .unwrap();
+    let bucket_block = checkpoint
+        .table_blocks
+        .iter_mut()
+        .find(|table| table.table_name == "buckets")
+        .unwrap();
+    match &mut bucket_block.rows[0].values[0] {
+        MetadataCheckpointValue::Text(value) => value.extend_from_slice(b"-tampered"),
+        value => panic!("expected bucket name text value, got {value:?}"),
+    }
+
+    let err = checkpoint.verify().unwrap_err();
+    assert!(matches!(
+        err,
+        MetadataCommandCheckpointValidationError::RowDigestMismatch {
+            table_name,
+            row_index: 0,
+            ..
+        } if table_name == "buckets"
+    ));
+}
+
+#[test]
+fn metadata_command_checkpoint_exports_blob_backed_metadata_rows() {
+    let tmp = test_util::tempdir();
+    let store = PgStore::open(tmp.path(), 1).unwrap();
+    let bucket = trusted_bucket_name("metadata-checkpoint-blob");
+    let key = trusted_object_key("object");
+    let okh = [7_u8; 16];
+    store
+        .conn
+        .execute(
+            "INSERT INTO object_segments \
+             (bucket, key, version_id, segment_index, size, segment_crc64, \
+              segment_okh, segment_vid, data_pg_id, placement_cluster_epoch, ec_k, ec_m) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            params![
+                bucket.as_str(),
+                key.as_str(),
+                1_i64,
+                0_i64,
+                32_i64,
+                99_i64,
+                okh.as_slice(),
+                1_i64,
+                1_i64,
+                1_i64,
+                4_i64,
+                2_i64,
+            ],
+        )
+        .unwrap();
+    store.refresh_metadata_command_state_digest().unwrap();
+
+    let checkpoint = store
+        .metadata_command_checkpoint(0, ClusterEpoch::INITIAL)
+        .unwrap();
+    checkpoint.verify().unwrap();
+    let segment_block = checkpoint
+        .table_blocks
+        .iter()
+        .find(|table| table.table_name == "object_segments")
+        .unwrap();
+    assert_eq!(segment_block.row_count, 1);
+    assert!(segment_block.rows[0]
+        .values
+        .iter()
+        .any(|value| matches!(value, MetadataCheckpointValue::Blob(bytes) if bytes == &okh)));
 }
 
 #[test]

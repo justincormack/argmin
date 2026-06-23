@@ -53,10 +53,42 @@ pub struct MetadataCheckpointTableDigest {
     pub table_digest: u64,
 }
 
+/// Owned SQLite value in the canonical metadata checkpoint encoding.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MetadataCheckpointValue {
+    Null,
+    Integer(i64),
+    RealBits(u64),
+    Text(Vec<u8>),
+    Blob(Vec<u8>),
+}
+
+/// One ordered materialized metadata row in a checkpoint table block.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MetadataCheckpointRow {
+    pub values: Vec<MetadataCheckpointValue>,
+    pub row_digest: u64,
+}
+
+/// Materialized rows for one metadata table, in canonical checkpoint order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MetadataCheckpointTableBlock {
+    pub table_name: String,
+    pub columns: Vec<String>,
+    pub order_columns: Vec<String>,
+    pub filter: String,
+    pub rows: Vec<MetadataCheckpointRow>,
+    pub row_count: u64,
+    pub row_hash_xor: u64,
+    pub row_hash_sum: u64,
+    pub table_digest: u64,
+}
+
 /// Checked summary of a PG metadata replica state.
 ///
-/// This is not yet a restorable checkpoint payload. It is the proof envelope
-/// that later materialized row blocks must satisfy before they can be imported.
+/// This is not yet an installable checkpoint. It carries the materialized row
+/// payload and proof envelope, but import still needs storage-node install
+/// validation before checkpoint-base metadata transfer can trust it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MetadataCommandCheckpoint {
     pub cluster_epoch: ClusterEpoch,
@@ -66,7 +98,206 @@ pub struct MetadataCommandCheckpoint {
     pub state_digest: u64,
     pub canonical_state_encoding_version: u8,
     pub table_digests: Vec<MetadataCheckpointTableDigest>,
+    pub table_blocks: Vec<MetadataCheckpointTableBlock>,
     pub checkpoint_crc64: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MetadataCommandCheckpointValidationError {
+    UnsupportedCheckpointEncoding {
+        actual: u8,
+    },
+    UnsupportedStateEncoding {
+        actual: u8,
+    },
+    TableSummaryCountMismatch {
+        expected: usize,
+        actual: usize,
+    },
+    TableBlockCountMismatch {
+        expected: usize,
+        actual: usize,
+    },
+    TableNameMismatch {
+        expected: String,
+        actual: String,
+    },
+    TableColumnsMismatch {
+        table_name: String,
+    },
+    TableOrderColumnsMismatch {
+        table_name: String,
+    },
+    TableFilterMismatch {
+        table_name: String,
+    },
+    RowDigestMismatch {
+        table_name: String,
+        row_index: usize,
+        expected_digest: u64,
+        actual_digest: u64,
+    },
+    TableDigestMismatch {
+        table_name: String,
+        expected_digest: u64,
+        actual_digest: u64,
+    },
+    StateDigestMismatch {
+        expected_digest: u64,
+        actual_digest: u64,
+    },
+    CheckpointCrcMismatch {
+        expected_crc64: u64,
+        actual_crc64: u64,
+    },
+}
+
+impl MetadataCommandCheckpoint {
+    pub fn verify(&self) -> Result<(), MetadataCommandCheckpointValidationError> {
+        if self.canonical_state_encoding_version != METADATA_CANONICAL_STATE_ENCODING_VERSION {
+            return Err(
+                MetadataCommandCheckpointValidationError::UnsupportedStateEncoding {
+                    actual: self.canonical_state_encoding_version,
+                },
+            );
+        }
+        if self.table_digests.len() != METADATA_DIGEST_TABLES.len() {
+            return Err(
+                MetadataCommandCheckpointValidationError::TableSummaryCountMismatch {
+                    expected: METADATA_DIGEST_TABLES.len(),
+                    actual: self.table_digests.len(),
+                },
+            );
+        }
+        if self.table_blocks.len() != METADATA_DIGEST_TABLES.len() {
+            return Err(
+                MetadataCommandCheckpointValidationError::TableBlockCountMismatch {
+                    expected: METADATA_DIGEST_TABLES.len(),
+                    actual: self.table_blocks.len(),
+                },
+            );
+        }
+
+        let mut state_hasher = checksum::crc64::Hasher::new();
+        PgStore::digest_canonical_pg_state_header(&mut state_hasher);
+        for ((table, summary), block) in METADATA_DIGEST_TABLES
+            .iter()
+            .zip(&self.table_digests)
+            .zip(&self.table_blocks)
+        {
+            Self::verify_table_identity(table, &summary.table_name)?;
+            Self::verify_table_identity(table, &block.table_name)?;
+            if block
+                .columns
+                .iter()
+                .map(String::as_str)
+                .ne(table.columns.iter().copied())
+            {
+                return Err(
+                    MetadataCommandCheckpointValidationError::TableColumnsMismatch {
+                        table_name: table.name.to_owned(),
+                    },
+                );
+            }
+            if block
+                .order_columns
+                .iter()
+                .map(String::as_str)
+                .ne(table.order_columns.iter().copied())
+            {
+                return Err(
+                    MetadataCommandCheckpointValidationError::TableOrderColumnsMismatch {
+                        table_name: table.name.to_owned(),
+                    },
+                );
+            }
+            if block.filter != table.filter.canonical_name() {
+                return Err(
+                    MetadataCommandCheckpointValidationError::TableFilterMismatch {
+                        table_name: table.name.to_owned(),
+                    },
+                );
+            }
+
+            let mut stats = MetadataTableDigestStats {
+                row_count: 0,
+                row_hash_xor: 0,
+                row_hash_sum: 0,
+            };
+            for (row_index, row) in block.rows.iter().enumerate() {
+                let row_digest = PgStore::metadata_checkpoint_row_digest(table, &row.values);
+                if row_digest != row.row_digest {
+                    return Err(
+                        MetadataCommandCheckpointValidationError::RowDigestMismatch {
+                            table_name: table.name.to_owned(),
+                            row_index,
+                            expected_digest: row.row_digest,
+                            actual_digest: row_digest,
+                        },
+                    );
+                }
+                stats.row_count += 1;
+                stats.row_hash_xor ^= row_digest;
+                stats.row_hash_sum = stats.row_hash_sum.wrapping_add(row_digest);
+            }
+            let table_digest = metadata_table_digest_from_stats(table, stats);
+            if table_digest != summary.table_digest
+                || stats.row_count != summary.row_count
+                || stats.row_hash_xor != summary.row_hash_xor
+                || stats.row_hash_sum != summary.row_hash_sum
+                || table_digest != block.table_digest
+                || stats.row_count != block.row_count
+                || stats.row_hash_xor != block.row_hash_xor
+                || stats.row_hash_sum != block.row_hash_sum
+            {
+                return Err(
+                    MetadataCommandCheckpointValidationError::TableDigestMismatch {
+                        table_name: table.name.to_owned(),
+                        expected_digest: summary.table_digest,
+                        actual_digest: table_digest,
+                    },
+                );
+            }
+            PgStore::digest_metadata_table_digest_entry(&mut state_hasher, table, table_digest);
+        }
+
+        let state_digest = state_hasher.finalize();
+        if state_digest != self.state_digest {
+            return Err(
+                MetadataCommandCheckpointValidationError::StateDigestMismatch {
+                    expected_digest: self.state_digest,
+                    actual_digest: state_digest,
+                },
+            );
+        }
+
+        let expected_crc64 = PgStore::metadata_command_checkpoint_crc64(self);
+        if expected_crc64 != self.checkpoint_crc64 {
+            return Err(
+                MetadataCommandCheckpointValidationError::CheckpointCrcMismatch {
+                    expected_crc64,
+                    actual_crc64: self.checkpoint_crc64,
+                },
+            );
+        }
+        Ok(())
+    }
+
+    fn verify_table_identity(
+        table: &MetadataDigestTable,
+        actual: &str,
+    ) -> Result<(), MetadataCommandCheckpointValidationError> {
+        if actual == table.name {
+            Ok(())
+        } else {
+            Err(
+                MetadataCommandCheckpointValidationError::TableNameMismatch {
+                    expected: table.name.to_owned(),
+                    actual: actual.to_owned(),
+                },
+            )
+        }
+    }
 }
 
 fn decode_nonnegative_u64(context: &'static str, raw: i64) -> Result<u64, StoreError> {
@@ -2010,7 +2241,17 @@ impl PgStore {
     ) -> Result<MetadataCommandCheckpoint, StoreError> {
         let state =
             self.validate_metadata_command_checkpoint_state_read_only(node_id, cluster_epoch)?;
-        let table_digests = self.metadata_checkpoint_table_digests()?;
+        let table_blocks = self.metadata_checkpoint_table_blocks()?;
+        let table_digests = table_blocks
+            .iter()
+            .map(|block| MetadataCheckpointTableDigest {
+                table_name: block.table_name.clone(),
+                row_count: block.row_count,
+                row_hash_xor: block.row_hash_xor,
+                row_hash_sum: block.row_hash_sum,
+                table_digest: block.table_digest,
+            })
+            .collect::<Vec<_>>();
         let state_digest = self.metadata_state_digest_from_checkpoint_tables(&table_digests);
         if state_digest != state.state_digest {
             return Err(StoreError::MetadataStateDigestMismatch {
@@ -2030,9 +2271,11 @@ impl PgStore {
             state_digest,
             canonical_state_encoding_version: METADATA_CANONICAL_STATE_ENCODING_VERSION,
             table_digests,
+            table_blocks,
             checkpoint_crc64: 0,
         };
         checkpoint.checkpoint_crc64 = Self::metadata_command_checkpoint_crc64(&checkpoint);
+        debug_assert!(checkpoint.verify().is_ok());
         Ok(checkpoint)
     }
 
@@ -3449,21 +3692,88 @@ impl PgStore {
         hasher.finalize()
     }
 
-    fn metadata_checkpoint_table_digests(
+    fn metadata_checkpoint_table_blocks(
         &self,
-    ) -> Result<Vec<MetadataCheckpointTableDigest>, StoreError> {
-        let mut table_digests = Vec::with_capacity(METADATA_DIGEST_TABLES.len());
+    ) -> Result<Vec<MetadataCheckpointTableBlock>, StoreError> {
+        let mut blocks = Vec::with_capacity(METADATA_DIGEST_TABLES.len());
         for table in METADATA_DIGEST_TABLES {
-            let stats = self.metadata_table_digest_stats(table)?;
-            table_digests.push(MetadataCheckpointTableDigest {
-                table_name: table.name.to_owned(),
-                row_count: stats.row_count,
-                row_hash_xor: stats.row_hash_xor,
-                row_hash_sum: stats.row_hash_sum,
-                table_digest: metadata_table_digest_from_stats(table, stats),
-            });
+            blocks.push(self.metadata_checkpoint_table_block(table)?);
         }
-        Ok(table_digests)
+        Ok(blocks)
+    }
+
+    fn metadata_checkpoint_table_block(
+        &self,
+        table: &MetadataDigestTable,
+    ) -> Result<MetadataCheckpointTableBlock, StoreError> {
+        let where_clause = Self::metadata_digest_where_clause(table.filter);
+        let table_sql = quote_sql_identifier(table.name);
+        let quoted_columns: Vec<String> = table
+            .columns
+            .iter()
+            .map(|column| quote_sql_identifier(column))
+            .collect();
+        let select_values = quoted_columns.join(", ");
+        let quoted_order_columns: Vec<String> = table
+            .order_columns
+            .iter()
+            .map(|column| quote_sql_identifier(column))
+            .collect();
+        let order_by = quoted_order_columns.join(", ");
+        let sql =
+            format!("SELECT {select_values} FROM {table_sql}{where_clause} ORDER BY {order_by}");
+        let mut stmt = self.conn.prepare_cached(&sql).map_err(|e| StoreError::Db {
+            context: "prepare canonical metadata checkpoint table block scan",
+            source: e,
+        })?;
+        let mut rows = stmt.query([]).map_err(|e| StoreError::Db {
+            context: "scan canonical metadata checkpoint table block rows",
+            source: e,
+        })?;
+        let mut checkpoint_rows = Vec::new();
+        let mut stats = MetadataTableDigestStats {
+            row_count: 0,
+            row_hash_xor: 0,
+            row_hash_sum: 0,
+        };
+        while let Some(row) = rows.next().map_err(|e| StoreError::Db {
+            context: "scan canonical metadata checkpoint table block row",
+            source: e,
+        })? {
+            let mut values = Vec::with_capacity(table.columns.len());
+            for index in 0..table.columns.len() {
+                let value = row.get_ref(index).map_err(|e| StoreError::Db {
+                    context: "read canonical metadata checkpoint row value",
+                    source: e,
+                })?;
+                values.push(Self::metadata_checkpoint_value_from_sql(value));
+            }
+            let row_digest = Self::metadata_checkpoint_row_digest(table, &values);
+            stats.row_count += 1;
+            stats.row_hash_xor ^= row_digest;
+            stats.row_hash_sum = stats.row_hash_sum.wrapping_add(row_digest);
+            checkpoint_rows.push(MetadataCheckpointRow { values, row_digest });
+        }
+        let table_digest = metadata_table_digest_from_stats(table, stats);
+        Ok(MetadataCheckpointTableBlock {
+            table_name: table.name.to_owned(),
+            columns: table
+                .columns
+                .iter()
+                .map(|column| (*column).to_owned())
+                .collect(),
+            order_columns: table
+                .order_columns
+                .iter()
+                .map(|column| (*column).to_owned())
+                .collect(),
+            filter: table.filter.canonical_name().to_owned(),
+            rows: checkpoint_rows,
+            row_count: stats.row_count,
+            row_hash_xor: stats.row_hash_xor,
+            row_hash_sum: stats.row_hash_sum,
+            table_digest,
+        })
     }
 
     fn metadata_command_checkpoint_crc64(checkpoint: &MetadataCommandCheckpoint) -> u64 {
@@ -3484,6 +3794,31 @@ impl PgStore {
             digest_u64(&mut hasher, table.row_hash_sum);
             digest_u64(&mut hasher, table.table_digest);
         }
+        digest_u64(&mut hasher, checkpoint.table_blocks.len() as u64);
+        for block in &checkpoint.table_blocks {
+            digest_len_prefixed_bytes(&mut hasher, block.table_name.as_bytes());
+            digest_u64(&mut hasher, block.columns.len() as u64);
+            for column in &block.columns {
+                digest_len_prefixed_bytes(&mut hasher, column.as_bytes());
+            }
+            digest_u64(&mut hasher, block.order_columns.len() as u64);
+            for column in &block.order_columns {
+                digest_len_prefixed_bytes(&mut hasher, column.as_bytes());
+            }
+            digest_len_prefixed_bytes(&mut hasher, block.filter.as_bytes());
+            digest_u64(&mut hasher, block.row_count);
+            digest_u64(&mut hasher, block.row_hash_xor);
+            digest_u64(&mut hasher, block.row_hash_sum);
+            digest_u64(&mut hasher, block.table_digest);
+            digest_u64(&mut hasher, block.rows.len() as u64);
+            for row in &block.rows {
+                digest_u64(&mut hasher, row.row_digest);
+                digest_u64(&mut hasher, row.values.len() as u64);
+                for value in &row.values {
+                    Self::digest_metadata_checkpoint_value(&mut hasher, value);
+                }
+            }
+        }
         hasher.finalize()
     }
 
@@ -3501,6 +3836,57 @@ impl PgStore {
         digest_u8(hasher, 0x12);
         digest_len_prefixed_bytes(hasher, table.name.as_bytes());
         digest_u64(hasher, table_digest);
+    }
+
+    fn metadata_checkpoint_row_digest(
+        table: &MetadataDigestTable,
+        values: &[MetadataCheckpointValue],
+    ) -> u64 {
+        let mut hasher = checksum::crc64::Hasher::new();
+        digest_u8(&mut hasher, 0x20);
+        digest_len_prefixed_bytes(&mut hasher, table.name.as_bytes());
+        digest_u64(&mut hasher, values.len() as u64);
+        for value in values {
+            Self::digest_metadata_checkpoint_value(&mut hasher, value);
+        }
+        hasher.finalize()
+    }
+
+    fn metadata_checkpoint_value_from_sql(value: ValueRef<'_>) -> MetadataCheckpointValue {
+        match value {
+            ValueRef::Null => MetadataCheckpointValue::Null,
+            ValueRef::Integer(value) => MetadataCheckpointValue::Integer(value),
+            ValueRef::Real(value) => MetadataCheckpointValue::RealBits(value.to_bits()),
+            ValueRef::Text(value) => MetadataCheckpointValue::Text(value.to_vec()),
+            ValueRef::Blob(value) => MetadataCheckpointValue::Blob(value.to_vec()),
+        }
+    }
+
+    fn digest_metadata_checkpoint_value(
+        hasher: &mut checksum::crc64::Hasher,
+        value: &MetadataCheckpointValue,
+    ) {
+        match value {
+            MetadataCheckpointValue::Null => {
+                digest_u8(hasher, 0x00);
+            }
+            MetadataCheckpointValue::Integer(value) => {
+                digest_u8(hasher, 0x01);
+                digest_i64(hasher, *value);
+            }
+            MetadataCheckpointValue::RealBits(value) => {
+                digest_u8(hasher, 0x02);
+                digest_u64(hasher, *value);
+            }
+            MetadataCheckpointValue::Text(value) => {
+                digest_u8(hasher, 0x03);
+                digest_len_prefixed_bytes(hasher, value);
+            }
+            MetadataCheckpointValue::Blob(value) => {
+                digest_u8(hasher, 0x04);
+                digest_len_prefixed_bytes_crc64(hasher, value);
+            }
+        }
     }
 
     fn metadata_table_digest(&self, table: &MetadataDigestTable) -> Result<u64, StoreError> {
