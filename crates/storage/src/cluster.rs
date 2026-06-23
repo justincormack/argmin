@@ -1377,7 +1377,7 @@ fn metadata_transfer_destination_proof(
 ) -> PgMetadataProof {
     metadata_transfer_destination_proof_for_commands(
         artifact.pg_id,
-        artifact.proof.applied_log_index,
+        commands.len() as u64,
         artifact.proof.state_digest,
         commands,
         destination_cluster_epoch,
@@ -1509,15 +1509,15 @@ fn classify_metadata_transfer_import_destination(
     if state.state_digest != expected_import_proof.state_digest {
         if let Some(first_command) = commands.first() {
             if state.state_digest == first_command.pre_state_digest {
+                let actual_proof = PgMetadataProof::new(
+                    state.applied_log_index,
+                    state.applied_log_hash,
+                    state.state_digest,
+                );
                 if base_import_proof.applied_log_index == 0
                     && base_import_proof.applied_log_hash == 0
                     && base_import_proof.state_digest == first_command.pre_state_digest
                 {
-                    let actual_proof = PgMetadataProof::new(
-                        state.applied_log_index,
-                        state.applied_log_hash,
-                        state.state_digest,
-                    );
                     let validated = metadata_client
                         .validate_metadata_command_replay_state_preserving_pending_slot(
                             pg_id,
@@ -1529,6 +1529,20 @@ fn classify_metadata_transfer_import_destination(
                         validated.state_digest,
                     );
                     if validated_proof == actual_proof {
+                        return Ok(MetadataTransferImportDestination::AdoptBase);
+                    }
+                } else if actual_proof == base_import_proof {
+                    let validated = metadata_client
+                        .validate_metadata_command_replay_state_preserving_pending_slot(
+                            pg_id,
+                            state.cluster_epoch,
+                        )?;
+                    let validated_proof = PgMetadataProof::new(
+                        validated.applied_log_index,
+                        validated.applied_log_hash,
+                        validated.state_digest,
+                    );
+                    if validated_proof == base_import_proof {
                         return Ok(MetadataTransferImportDestination::AdoptBase);
                     }
                 }
@@ -2629,8 +2643,8 @@ impl StorageCluster {
                     metadata_client.initialize_metadata_transfer_matching_state(
                         pg_id,
                         self.operation_epoch(),
-                        base_import_proof.applied_log_index,
-                        base_import_proof.applied_log_hash,
+                        0,
+                        0,
                         base_import_proof.state_digest,
                     )?;
                     let mut state = metadata_client.metadata_command_replica_state(pg_id)?;

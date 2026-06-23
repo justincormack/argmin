@@ -402,10 +402,58 @@ pub(crate) fn build_pg_metadata_transfer_artifact_from_retained_log_entries(
     };
     validate_epoch_and_pending(&source, cluster_epoch)?;
 
-    let mut expected_previous_log_hash = 0;
-    let mut expected_pre_state_digest = None;
-    let mut base_proof = None;
-    for log_index in 1..=state.applied_log_index {
+    let Some(first_retained_log_index) = retained_log_entries
+        .iter()
+        .map(|entry| entry.log_index)
+        .min()
+    else {
+        if state.applied_log_index == 0 {
+            return Ok(PgMetadataTransferArtifact {
+                pg_id,
+                source_node_id,
+                cluster_epoch,
+                base_proof: proof_from_replica_state(state),
+                proof: proof_from_replica_state(state),
+                retained_log_entries,
+            });
+        }
+        return Err(
+            PgPeeringReconstructionError::MissingRetainedCommandLogEntry {
+                node_id: source_node_id,
+                log_index: state.applied_log_index,
+            },
+        );
+    };
+    if first_retained_log_index == 0 || first_retained_log_index > state.applied_log_index {
+        return Err(
+            PgPeeringReconstructionError::MissingRetainedCommandLogEntry {
+                node_id: source_node_id,
+                log_index: state.applied_log_index,
+            },
+        );
+    }
+
+    let first_retained = retained_log_entries
+        .iter()
+        .find(|entry| entry.log_index == first_retained_log_index)
+        .expect("minimum retained log index should select an entry");
+    let Some(base_state_digest) = first_retained.pre_state_digest else {
+        return Err(
+            PgPeeringReconstructionError::MissingRetainedCommandStateProof {
+                node_id: source_node_id,
+                pg_id,
+                log_index: first_retained_log_index,
+            },
+        );
+    };
+    let mut expected_previous_log_hash = first_retained.previous_log_hash;
+    let mut expected_pre_state_digest = Some(base_state_digest);
+    let base_proof = PgMetadataProof::new(
+        first_retained_log_index - 1,
+        first_retained.previous_log_hash,
+        base_state_digest,
+    );
+    for log_index in first_retained_log_index..=state.applied_log_index {
         let retained = retained_log_entries
             .iter()
             .find(|entry| entry.log_index == log_index)
@@ -452,14 +500,8 @@ pub(crate) fn build_pg_metadata_transfer_artifact_from_retained_log_entries(
                 },
             );
         };
-        if base_proof.is_none() {
-            base_proof = Some(PgMetadataProof::new(
-                log_index - 1,
-                retained.previous_log_hash,
-                pre_state_digest,
-            ));
-        }
-        let expected = expected_pre_state_digest.unwrap_or(pre_state_digest);
+        let expected = expected_pre_state_digest
+            .expect("metadata transfer retained suffix should have a base state digest");
         if pre_state_digest != expected {
             return Err(
                 PgPeeringReconstructionError::RetainedCommandStateDigestFork {
@@ -502,7 +544,7 @@ pub(crate) fn build_pg_metadata_transfer_artifact_from_retained_log_entries(
         pg_id,
         source_node_id,
         cluster_epoch,
-        base_proof: base_proof.unwrap_or_else(|| proof_from_replica_state(state)),
+        base_proof,
         proof: proof_from_replica_state(state),
         retained_log_entries,
     })
@@ -541,7 +583,8 @@ pub(crate) fn rebase_pg_metadata_transfer_artifact_commands(
     }
 
     let mut commands = Vec::new();
-    for log_index in 1..=artifact.proof.applied_log_index {
+    for log_index in (artifact.base_proof.applied_log_index + 1)..=artifact.proof.applied_log_index
+    {
         let retained = artifact
             .retained_log_entries
             .iter()
@@ -578,7 +621,10 @@ pub(crate) fn rebase_pg_metadata_transfer_artifact_commands(
                 },
             );
         };
-        let log_index = MetadataCommandLogIndex::new(log_index)
+        let destination_log_index = log_index
+            .checked_sub(artifact.base_proof.applied_log_index)
+            .expect("retained metadata transfer suffix starts after the base proof");
+        let log_index = MetadataCommandLogIndex::new(destination_log_index)
             .expect("metadata transfer import log index is non-zero");
         commands.push(MetadataTransferCommand {
             command: MetadataCommandEnvelope::new(

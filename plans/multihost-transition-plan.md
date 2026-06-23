@@ -8134,6 +8134,16 @@ Metadata PG migration and backfill design notes:
   This covers the current return-transfer UAT shape while keeping general
   non-zero checkpoint/base adoption fail-closed until artifacts can carry a
   durable checkpoint proof for that base.
+- Retained-log transfer artifacts can now represent a true suffix instead of
+  requiring the full command-log prefix. The first retained command anchors a
+  source base proof from its previous log hash and pre-state digest, and import
+  rebases the suffix as a fresh destination-epoch log starting at index 1. A
+  destination may replay that suffix over a non-zero historical base only when
+  its existing replica proof exactly matches the artifact's source base proof
+  and replay-state validation confirms that proof before any mutation. The
+  destination is then checkpoint-initialized at `(0, 0, base_digest)` for the
+  new epoch and the retained suffix is replayed from there. Digest-only base
+  matches and forged non-zero destination proof tuples remain fail-closed.
 
 Exit criteria:
 
