@@ -2172,13 +2172,6 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
             record.lease_deadline_ms = Some(lease_deadline_ms);
             record.pg_observations.clear();
             for observation in &heartbeat.pg_observations {
-                if !should_record_pg_heartbeat_observation(
-                    &self.snapshot,
-                    heartbeat.node_id,
-                    observation,
-                ) {
-                    continue;
-                }
                 record.pg_observations.insert(
                     observation.pg_id,
                     NodePgObservationRecord {
@@ -5068,34 +5061,38 @@ fn validate_pg_heartbeat_observations(
                 pg_id: observation.pg_id.get(),
             });
         }
+        if pg.state == PgState::Active
+            && pg.active_primary == Some(node_id)
+            && observation.state == PgState::Active
+        {
+            if observation.has_pending_metadata_command {
+                return Err(ControlPlaneError::PgPeeringPendingMetadataCommand {
+                    pg_id: observation.pg_id.get(),
+                    node_id: node_id.as_u32(),
+                    cluster_epoch: snapshot.cluster_epoch,
+                });
+            }
+            let expected = pg.active_metadata_proof.ok_or(
+                ControlPlaneError::ActivePgMissingMetadataProof {
+                    pg_id: observation.pg_id.get(),
+                },
+            )?;
+            if !metadata_proof_satisfies_active_primary_observation_floor(
+                expected,
+                observation.metadata_proof,
+                pg.active_metadata_transfer_imported,
+            ) {
+                return Err(ControlPlaneError::PgActiveMetadataProofMismatch {
+                    pg_id: observation.pg_id.get(),
+                    node_id: node_id.as_u32(),
+                    cluster_epoch: snapshot.cluster_epoch,
+                    expected,
+                    actual: observation.metadata_proof,
+                });
+            }
+        }
     }
     Ok(())
-}
-
-fn should_record_pg_heartbeat_observation(
-    snapshot: &ClusterControlSnapshot,
-    node_id: NodeId,
-    observation: &NodePgHeartbeatObservation,
-) -> bool {
-    let Some(pg) = snapshot.pgs.get(&observation.pg_id) else {
-        return true;
-    };
-    if pg.state != PgState::Active
-        || pg.active_primary != Some(node_id)
-        || observation.state != PgState::Active
-    {
-        return true;
-    }
-    if observation.has_pending_metadata_command {
-        return false;
-    }
-    pg.active_metadata_proof.is_some_and(|expected| {
-        metadata_proof_satisfies_active_primary_observation_floor(
-            expected,
-            observation.metadata_proof,
-            pg.active_metadata_transfer_imported,
-        )
-    })
 }
 
 fn validate_pg_peering_observations(
@@ -10335,8 +10332,24 @@ mod tests {
             metadata_proof: same_index_mismatched_proof,
             has_pending_metadata_command: false,
         }];
-        let stale_proof_lease = authority.heartbeat(mismatched_active, 2_020).unwrap();
-        assert_eq!(stale_proof_lease.lease_deadline_ms(), 2_120);
+        assert!(matches!(
+            authority.refresh_node_heartbeat(mismatched_active, 2_020),
+            Err(ControlPlaneError::PgActiveMetadataProofMismatch {
+                pg_id: 19,
+                node_id: 1,
+                expected,
+                actual,
+                ..
+            }) if expected == accepted_proof && actual == same_index_mismatched_proof
+        ));
+        assert_eq!(
+            authority
+                .snapshot()
+                .node(NodeId::new(1))
+                .unwrap()
+                .lease_deadline_ms(),
+            Some(pre_progress_deadline)
+        );
         assert!(authority
             .snapshot()
             .node(NodeId::new(1))
