@@ -8157,6 +8157,15 @@ Metadata PG migration and backfill design notes:
   writes on the original acting set, transfers to `[2,3]`, writes there,
   returns to `[0,1]`, writes again, transfers to `[2,3]` a second time, verifies
   all objects, and finally returns the PG to `[0,1]` before cleanup.
+- Started the explicit checkpoint/base-proof artifact shape. Metadata transfer
+  artifacts now classify their base as an empty base, a retained-log prefix
+  base, or a checkpoint base instead of relying only on a bare base proof.
+  Empty destination bootstrap is valid only for empty-base artifacts, retained
+  suffix replay still requires the destination to prove the retained prefix
+  before mutation, and checkpoint-base artifacts fail closed until the next
+  slice adds materialized checkpoint contents plus an install/validation RPC.
+  This keeps the current retained-log transfer path safe while giving the
+  checkpoint import work a concrete artifact boundary.
 
 Exit criteria:
 

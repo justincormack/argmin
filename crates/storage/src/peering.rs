@@ -36,9 +36,17 @@ pub struct PgMetadataTransferArtifact {
     pub(crate) pg_id: PgId,
     pub(crate) source_node_id: NodeId,
     pub(crate) cluster_epoch: ClusterEpoch,
+    pub(crate) base_kind: PgMetadataTransferBaseKind,
     pub(crate) base_proof: PgMetadataProof,
     pub(crate) proof: PgMetadataProof,
     pub(crate) retained_log_entries: Vec<MetadataCommandLogRangeEntry>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PgMetadataTransferBaseKind {
+    Empty,
+    RetainedLogPrefix,
+    Checkpoint,
 }
 
 impl PgMetadataTransferArtifact {
@@ -65,6 +73,11 @@ impl PgMetadataTransferArtifact {
     #[must_use]
     pub fn source_base_metadata_proof(&self) -> PgMetadataProof {
         self.base_proof
+    }
+
+    #[must_use]
+    pub fn source_base_kind(&self) -> PgMetadataTransferBaseKind {
+        self.base_kind
     }
 }
 
@@ -118,6 +131,14 @@ pub(crate) enum PgPeeringReconstructionError {
         expected_pre_state_digest: u64,
         actual_pre_state_digest: u64,
         post_state_digest: u64,
+    },
+    #[error(
+        "PG metadata transfer artifact for PG {pg_id} from source {node_id:?} uses unsupported checkpoint base proof {proof:?}"
+    )]
+    UnsupportedMetadataTransferCheckpointBase {
+        node_id: NodeId,
+        pg_id: PgId,
+        proof: PgMetadataProof,
     },
     #[error(
         "PG metadata transfer destination node {node_id:?} for PG {pg_id} in cluster epoch {cluster_epoch} is not empty and does not contain the expected imported proof {expected:?}: found log index {applied_log_index}, log hash {applied_log_hash:#018X}, digest {state_digest:#018X}"
@@ -412,6 +433,7 @@ pub(crate) fn build_pg_metadata_transfer_artifact_from_retained_log_entries(
                 pg_id,
                 source_node_id,
                 cluster_epoch,
+                base_kind: PgMetadataTransferBaseKind::Empty,
                 base_proof: proof_from_replica_state(state),
                 proof: proof_from_replica_state(state),
                 retained_log_entries,
@@ -453,6 +475,11 @@ pub(crate) fn build_pg_metadata_transfer_artifact_from_retained_log_entries(
         first_retained.previous_log_hash,
         base_state_digest,
     );
+    let base_kind = if base_proof.applied_log_index == 0 && base_proof.applied_log_hash == 0 {
+        PgMetadataTransferBaseKind::Empty
+    } else {
+        PgMetadataTransferBaseKind::RetainedLogPrefix
+    };
     for log_index in first_retained_log_index..=state.applied_log_index {
         let retained = retained_log_entries
             .iter()
@@ -544,6 +571,7 @@ pub(crate) fn build_pg_metadata_transfer_artifact_from_retained_log_entries(
         pg_id,
         source_node_id,
         cluster_epoch,
+        base_kind,
         base_proof,
         proof: proof_from_replica_state(state),
         retained_log_entries,
@@ -578,6 +606,18 @@ pub(crate) fn rebase_pg_metadata_transfer_artifact_commands(
                 expected_pre_state_digest: artifact.base_proof.state_digest,
                 actual_pre_state_digest: validated_artifact.base_proof.state_digest,
                 post_state_digest: validated_artifact.base_proof.state_digest,
+            },
+        );
+    }
+    if validated_artifact.base_kind != artifact.base_kind {
+        return Err(
+            PgPeeringReconstructionError::RetainedCommandStateDigestFork {
+                node_id: artifact.source_node_id,
+                pg_id: artifact.pg_id,
+                log_index: artifact.base_proof.applied_log_index + 1,
+                expected_pre_state_digest: validated_artifact.base_proof.state_digest,
+                actual_pre_state_digest: artifact.base_proof.state_digest,
+                post_state_digest: artifact.base_proof.state_digest,
             },
         );
     }

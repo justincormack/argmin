@@ -2184,6 +2184,10 @@ fn metadata_transfer_export_packages_retained_suffix_with_base_proof() {
     let artifact = cluster
         .export_pg_metadata_transfer_from_retained_log(pg_id, NodeId::new(0))
         .unwrap();
+    assert_eq!(
+        artifact.source_base_kind(),
+        crate::peering::PgMetadataTransferBaseKind::RetainedLogPrefix
+    );
     assert_eq!(artifact.base_proof.applied_log_index, 1);
     assert_eq!(
         artifact.base_proof.applied_log_hash,
@@ -2241,6 +2245,10 @@ fn metadata_transfer_import_rejects_suffix_into_empty_destination_without_mutati
     let artifact = cluster
         .export_pg_metadata_transfer_from_retained_log(pg_id, NodeId::new(0))
         .unwrap();
+    assert_eq!(
+        artifact.source_base_kind(),
+        crate::peering::PgMetadataTransferBaseKind::RetainedLogPrefix
+    );
     assert_eq!(artifact.base_proof.applied_log_index, 1);
     drop(cluster);
 
@@ -2794,6 +2802,10 @@ fn metadata_transfer_import_adopts_matching_existing_destination_state() {
     let artifact = cluster
         .export_pg_metadata_transfer_from_retained_log(pg_id, NodeId::new(0))
         .unwrap();
+    assert_eq!(
+        artifact.source_base_kind(),
+        crate::peering::PgMetadataTransferBaseKind::Empty
+    );
     drop(cluster);
 
     let destination_epoch = ClusterEpoch::new(2).unwrap();
@@ -2942,6 +2954,7 @@ fn metadata_transfer_import_replays_retained_suffix_over_exact_source_base_proof
     let mut artifact = cluster
         .export_pg_metadata_transfer_from_retained_log(pg_id, NodeId::new(0))
         .unwrap();
+    artifact.base_kind = crate::peering::PgMetadataTransferBaseKind::RetainedLogPrefix;
     artifact.base_proof = crate::control_plane::PgMetadataProof::new(
         base_state.applied_log_index,
         base_state.applied_log_hash,
@@ -3063,6 +3076,69 @@ fn metadata_transfer_import_rejects_older_prefix_with_unproven_log_hash() {
         assert_eq!(state.applied_log_index, 1);
         crate::PgMetadataStore::head_bucket(&*pg, &first_bucket).unwrap();
         assert!(crate::PgMetadataStore::head_bucket(&*pg, &second_bucket).is_err());
+    }
+}
+
+#[test]
+fn metadata_transfer_import_rejects_checkpoint_base_without_materialized_checkpoint() {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[1], ec_shape).unwrap();
+    let topology = map
+        .node(NodeId::new(0))
+        .unwrap()
+        .storage_node()
+        .pg_topology();
+    let bucket = bucket_for_pg(topology, 1, "metadata-transfer-checkpoint-base-");
+    set_route_primary(&mut map, 1, NodeId::new(0));
+    set_route_state(&mut map, 1, PgState::Peering);
+    let mut map = Arc::new(map);
+    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let pg_id = PgId::new(1);
+    let command = create_bucket_metadata_command(pg_id, 1, bucket.clone());
+    map.node(NodeId::new(0))
+        .unwrap()
+        .storage_node()
+        .get_pg(1)
+        .unwrap()
+        .apply_metadata_command_and_record(0, &command)
+        .unwrap();
+    let mut artifact = cluster
+        .export_pg_metadata_transfer_from_retained_log(pg_id, NodeId::new(0))
+        .unwrap();
+    artifact.base_kind = crate::peering::PgMetadataTransferBaseKind::Checkpoint;
+    drop(cluster);
+
+    let destination_epoch = ClusterEpoch::new(2).unwrap();
+    let map_mut = Arc::get_mut(&mut map).unwrap();
+    map_mut.epoch = destination_epoch;
+    let route = map_mut.pg_routes.get_mut(&pg_id).unwrap();
+    route.cluster_epoch = destination_epoch;
+    route.primary_node_id = NodeId::new(1);
+    route.acting_set = Arc::from([NodeId::new(1), NodeId::new(2)]);
+    route.state = PgState::Peering;
+    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+
+    let err = cluster
+        .import_pg_metadata_transfer_from_retained_log(&artifact)
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            crate::peering::PgPeeringReconstructionFailure::Reconstruction(
+                crate::peering::PgPeeringReconstructionError::UnsupportedMetadataTransferCheckpointBase { .. }
+            )
+        ),
+        "unexpected error: {err:?}"
+    );
+
+    for node_id in [NodeId::new(1), NodeId::new(2)] {
+        let pg = map.node(node_id).unwrap().storage_node().get_pg(1).unwrap();
+        let state = pg.metadata_command_replica_state().unwrap();
+        assert_eq!(state.cluster_epoch, ClusterEpoch::INITIAL);
+        assert_eq!(state.applied_log_index, 0);
+        assert!(crate::PgMetadataStore::head_bucket(&*pg, &bucket).is_err());
     }
 }
 

@@ -47,8 +47,8 @@ use crate::peering::{
     build_pg_metadata_transfer_artifact_from_retained_log_entries,
     build_pg_peering_replay_plan_from_retained_log_entries,
     rebase_pg_metadata_transfer_artifact_commands,
-    reconstruct_pg_peering_from_primary_retained_log, PgPeeringReconstructionDecision,
-    PgPeeringReconstructionError, PgPeeringReconstructionFailure,
+    reconstruct_pg_peering_from_primary_retained_log, PgMetadataTransferBaseKind,
+    PgPeeringReconstructionDecision, PgPeeringReconstructionError, PgPeeringReconstructionFailure,
     PgPeeringReplicaReconstructionInput,
 };
 use crate::storage_rpc::STORAGE_RPC_MAX_METADATA_COMMAND_LOG_ENTRY_RANGE_ENTRIES;
@@ -2620,6 +2620,16 @@ impl StorageCluster {
         artifact: &PgMetadataTransferArtifact,
     ) -> Result<PgMetadataProof, PgPeeringReconstructionFailure> {
         let pg_id = artifact.pg_id;
+        if artifact.source_base_kind() == PgMetadataTransferBaseKind::Checkpoint {
+            return Err(
+                PgPeeringReconstructionError::UnsupportedMetadataTransferCheckpointBase {
+                    node_id: artifact.source_node_id,
+                    pg_id,
+                    proof: artifact.source_base_metadata_proof(),
+                }
+                .into(),
+            );
+        }
         let commands =
             rebase_pg_metadata_transfer_artifact_commands(artifact, self.operation_epoch())?;
         let expected_import_proof =
