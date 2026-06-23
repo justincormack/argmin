@@ -503,6 +503,7 @@ pub(crate) fn storage_rpc_admission_class(
         | StorageRpcMessageKind::MetadataCommandTransferStateAdopt
         | StorageRpcMessageKind::MetadataCommandTransferEmptyStateInitialize
         | StorageRpcMessageKind::MetadataCommandTransferMatchingStateInitialize
+        | StorageRpcMessageKind::MetadataCommandTransferCheckpointBaseInstall
         | StorageRpcMessageKind::MetadataCommandAppliedLogHashes
         | StorageRpcMessageKind::MetadataCommandRetainedLogHashes
         | StorageRpcMessageKind::MetadataCommandRetainedLogEntries

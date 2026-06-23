@@ -1202,6 +1202,14 @@ pub(crate) trait MetadataCommandNodeClient: Send + Sync {
         expected_state_digest: u64,
     ) -> Result<MetadataCommandReplicaState, StoreError>;
 
+    #[allow(dead_code)]
+    fn install_metadata_transfer_checkpoint_base(
+        &self,
+        pg_id: PgId,
+        cluster_epoch: ClusterEpoch,
+        checkpoint: &MetadataCommandCheckpoint,
+    ) -> Result<MetadataCommandReplicaState, StoreError>;
+
     fn metadata_command_acceptance(
         &self,
         pg_id: PgId,

@@ -25,7 +25,7 @@ use crate::metadata_command::{
     PutObjectMetadataCommand, PutObjectMetadataMutation,
 };
 use crate::node::SharedStorageNode;
-use crate::pg_store::{ScavengerShardFileScan, ScavengerShardRow};
+use crate::pg_store::{MetadataCommandCheckpoint, ScavengerShardFileScan, ScavengerShardRow};
 use crate::pg_topology::PgTopology;
 use crate::storage_rpc::{
     decode_abort_multipart_cleanup_response,
@@ -108,6 +108,7 @@ use crate::storage_rpc::{
     encode_metadata_command_pending_slot_replace_request,
     encode_metadata_command_pending_slot_request, encode_metadata_command_request,
     encode_metadata_command_state_request, encode_metadata_command_transfer_adopt_request,
+    encode_metadata_command_transfer_checkpoint_base_request,
     encode_metadata_command_transfer_empty_state_request,
     encode_metadata_command_transfer_matching_state_request,
     encode_multipart_completion_preflight_request, encode_multipart_completion_snapshot_request,
@@ -180,6 +181,7 @@ use crate::storage_rpc::{
     StorageRpcMetadataCommandPendingSlotRequest, StorageRpcMetadataCommandRequest,
     StorageRpcMetadataCommandStateOutcome, StorageRpcMetadataCommandStateRequest,
     StorageRpcMetadataCommandTransferAdoptRequest,
+    StorageRpcMetadataCommandTransferCheckpointBaseRequest,
     StorageRpcMetadataCommandTransferEmptyStateRequest,
     StorageRpcMetadataCommandTransferMatchingStateRequest,
     StorageRpcMultipartCompletionPreflightOutcome, StorageRpcMultipartCompletionPreflightRequest,

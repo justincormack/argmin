@@ -4013,6 +4013,20 @@ impl MetadataCommandNodeClient for LocalStorageNodeClient {
         )
     }
 
+    fn install_metadata_transfer_checkpoint_base(
+        &self,
+        pg_id: PgId,
+        cluster_epoch: ClusterEpoch,
+        checkpoint: &MetadataCommandCheckpoint,
+    ) -> Result<MetadataCommandReplicaState, StoreError> {
+        let pg = self.storage_node.get_pg(pg_id.get())?;
+        pg.install_metadata_transfer_checkpoint_base(
+            self.node_id.as_u32(),
+            cluster_epoch,
+            checkpoint,
+        )
+    }
+
     fn metadata_command_acceptance(
         &self,
         pg_id: PgId,

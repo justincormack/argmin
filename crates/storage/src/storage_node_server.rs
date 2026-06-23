@@ -65,6 +65,7 @@ use crate::storage_rpc::{
     decode_metadata_command_pending_slot_replace_request,
     decode_metadata_command_pending_slot_request, decode_metadata_command_request,
     decode_metadata_command_state_request, decode_metadata_command_transfer_adopt_request,
+    decode_metadata_command_transfer_checkpoint_base_request,
     decode_metadata_command_transfer_empty_state_request,
     decode_metadata_command_transfer_matching_state_request,
     decode_multipart_completion_preflight_request, decode_multipart_completion_snapshot_request,
@@ -211,6 +212,7 @@ use crate::storage_rpc::{
     StorageRpcMetadataCommandStateOutcome, StorageRpcMetadataCommandStateOutcomeResponse,
     StorageRpcMetadataCommandStateRequest, StorageRpcMetadataCommandStateResponse,
     StorageRpcMetadataCommandTransferAdoptRequest,
+    StorageRpcMetadataCommandTransferCheckpointBaseRequest,
     StorageRpcMetadataCommandTransferEmptyStateRequest,
     StorageRpcMetadataCommandTransferMatchingStateRequest,
     StorageRpcMultipartCompletionPreflightOutcome, StorageRpcMultipartCompletionPreflightRequest,
@@ -2613,6 +2615,17 @@ impl StorageNodeConnectionHandler {
                     }),
                 }
             }
+            StorageRpcMessageKind::MetadataCommandTransferCheckpointBaseInstall => {
+                match decode_metadata_command_transfer_checkpoint_base_request(&frame.payload) {
+                    Ok(request) => self.metadata_command_transfer_checkpoint_base_install_response(
+                        session, request,
+                    ),
+                    Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
+                        code: StorageRpcErrorCode::PayloadDecode,
+                        message: error.to_string(),
+                    }),
+                }
+            }
             StorageRpcMessageKind::MetadataCommandAppliedLogHashes => {
                 match decode_metadata_command_request(&frame.payload) {
                     Ok(request) => self.metadata_command_applied_hashes_response(session, request),
@@ -2988,11 +3001,9 @@ impl StorageNodeConnectionHandler {
         &self,
         request: StorageRpcBucketWriteReservationProofRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
-        if let Err(error) = self.validate_pg_route_for_peering_inspection(
-            request.node_id,
-            request.cluster_epoch,
-            request.pg_id,
-        ) {
+        if let Err(error) =
+            self.validate_pg_route(request.node_id, request.cluster_epoch, request.pg_id)
+        {
             return encode_storage_rpc_error_response(&error);
         }
         if let Err(error) = self.validate_primary_pg_for_bucket(
@@ -7546,6 +7557,38 @@ impl StorageNodeConnectionHandler {
         Ok(response)
     }
 
+    fn metadata_command_transfer_checkpoint_base_install_response(
+        &self,
+        session: &StorageNodeSession<'_>,
+        request: StorageRpcMetadataCommandTransferCheckpointBaseRequest,
+    ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
+        if let Err(error) = self.validate_pg_route_with_allowed_states(
+            request.node_id,
+            request.cluster_epoch,
+            request.pg_id,
+            &[PgState::Peering],
+        ) {
+            return encode_storage_rpc_error_response(&error);
+        }
+        let _pg_guard = self.metadata_command_pg_guard(session, request.pg_id);
+        let response = match self.node.get_pg(request.pg_id.get()).and_then(|pg| {
+            pg.install_metadata_transfer_checkpoint_base(
+                request.node_id.as_u32(),
+                request.cluster_epoch,
+                &request.checkpoint,
+            )
+        }) {
+            Ok(state) => {
+                let payload = encode_metadata_command_state_response(
+                    &StorageRpcMetadataCommandStateResponse { state },
+                );
+                encode_storage_rpc_success_response(&payload)
+            }
+            Err(error) => encode_storage_rpc_error_response(&store_error_response(error))?,
+        };
+        Ok(response)
+    }
+
     fn metadata_command_applied_hashes_response(
         &self,
         session: &StorageNodeSession<'_>,
@@ -9857,6 +9900,8 @@ mod tests {
     use std::thread;
     use std::time::{Duration, Instant};
 
+    use s3_types::{AclGrants, BucketObjectLockConfig, BucketVersioningState};
+
     use crate::control_plane::{
         FileControlPlaneStore, NodeHeartbeat, NodeMembershipState, SingleAuthorityControlPlane,
     };
@@ -9886,6 +9931,7 @@ mod tests {
         encode_metadata_command_matching_applied_request, encode_metadata_command_next_id_request,
         encode_metadata_command_pending_slot_request, encode_metadata_command_request,
         encode_metadata_command_state_request, encode_metadata_command_transfer_adopt_request,
+        encode_metadata_command_transfer_checkpoint_base_request,
         encode_metadata_command_transfer_empty_state_request,
         encode_metadata_command_transfer_matching_state_request,
         encode_read_handle_acquire_request, encode_read_handle_release_request,
@@ -9903,6 +9949,7 @@ mod tests {
         StorageRpcMetadataCommandPendingSlotRequest, StorageRpcMetadataCommandRequest,
         StorageRpcMetadataCommandStateOutcome, StorageRpcMetadataCommandStateRequest,
         StorageRpcMetadataCommandTransferAdoptRequest,
+        StorageRpcMetadataCommandTransferCheckpointBaseRequest,
         StorageRpcMetadataCommandTransferEmptyStateRequest,
         StorageRpcMetadataCommandTransferMatchingStateRequest, StorageRpcReadHandleAcquireRequest,
         StorageRpcReadHandleReleaseRequest, StorageRpcScavengerListFilesRequest,
@@ -9913,10 +9960,11 @@ mod tests {
     };
     use crate::traits::{PgMetadataStore, ShardStore};
     use crate::types::{
-        DataPgId, GenerationId, PgId, PlacedSegmentShardBackfillClaimRecord,
+        BucketName, BucketSubresourceAux, BucketSubresourceKind, CreateBucketConfig, DataPgId,
+        GenerationId, PgId, PlacedSegmentShardBackfillClaimRecord,
         PlacedSegmentShardBackfillWorkItem, PlacedSegmentShardRepairClaimRecord,
-        PlacedSegmentShardRepairWorkItem, SegmentStoredBytesRequest, ShardIndex, ShardKey,
-        ShardScavengerObservationKey, ShardScavengerObservationReason,
+        PlacedSegmentShardRepairWorkItem, PutBucketSubresource, SegmentStoredBytesRequest,
+        ShardIndex, ShardKey, ShardScavengerObservationKey, ShardScavengerObservationReason,
         ShardScavengerObservationRecord, VersionId,
     };
 
@@ -11283,6 +11331,56 @@ mod tests {
                 123,
             )),
         )
+    }
+
+    fn create_probe_bucket_direct(store: &crate::PgStore, bucket: &BucketName) {
+        let owner = crate::OwnerIdentity::from_principal("owner");
+        store
+            .create_bucket_with_config(&CreateBucketConfig {
+                name: bucket.as_str(),
+                owner_principal: &owner.principal,
+                owner_canonical_id: &owner.canonical_id,
+                acl_grants: &AclGrants::default(),
+                public_read: false,
+                public_write: false,
+                versioning: BucketVersioningState::Disabled,
+                object_lock: BucketObjectLockConfig::default(),
+                ownership_controls: crate::BucketOwnershipControls {
+                    object_ownership: crate::BucketObjectOwnership::ObjectWriter,
+                },
+            })
+            .unwrap();
+    }
+
+    fn put_probe_lifecycle_direct(store: &crate::PgStore, bucket: &BucketName) {
+        store
+            .put_bucket_subresource(
+                bucket,
+                PutBucketSubresource {
+                    kind: BucketSubresourceKind::Lifecycle,
+                    body: "<LifecycleConfiguration/>",
+                    aux: BucketSubresourceAux::None,
+                },
+            )
+            .unwrap();
+    }
+
+    fn test_metadata_checkpoint_with_bucket(
+        bucket_name: &str,
+    ) -> (BucketName, crate::pg_store::MetadataCommandCheckpoint) {
+        let source_tmp = test_util::tempdir();
+        let source_node = crate::node::SharedStorageNode::open(source_tmp.path(), &[0]).unwrap();
+        let bucket = crate::tests::bucket_name(bucket_name);
+        let checkpoint = {
+            let source_pg = source_node.get_pg(0).unwrap();
+            create_probe_bucket_direct(&source_pg, &bucket);
+            put_probe_lifecycle_direct(&source_pg, &bucket);
+            source_pg.refresh_metadata_command_state_digest().unwrap();
+            source_pg
+                .metadata_command_checkpoint(11, ClusterEpoch::INITIAL)
+                .unwrap()
+        };
+        (bucket, checkpoint)
     }
 
     fn test_bucket_write_reservation_proof(
@@ -12942,6 +13040,98 @@ mod tests {
         assert_eq!(decoded.state.applied_log_index, 0);
         assert_eq!(decoded.state.applied_log_hash, 0);
         assert_eq!(decoded.state.state_digest, expected_state_digest);
+    }
+
+    #[test]
+    fn storage_node_server_allows_peering_metadata_transfer_checkpoint_base_install() {
+        let (bucket, checkpoint) = test_metadata_checkpoint_with_bucket("metadata-rpc-checkpoint");
+
+        let tmp = test_util::tempdir();
+        let mut config = test_config(&tmp);
+        let destination_epoch = ClusterEpoch::new(2).unwrap();
+        config.cluster_epoch = destination_epoch;
+        config.pg_routes[0].cluster_epoch = destination_epoch;
+        config.pg_routes[0].state = PgState::Peering;
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let server = StorageNodeServer::bind(config.clone()).unwrap();
+        let socket_path = config.socket_path.clone();
+        let join = thread::spawn(move || server.accept_one().unwrap());
+
+        let mut client = UnixStream::connect(socket_path).unwrap();
+        let response = send_frame(
+            &mut client,
+            1,
+            StorageRpcMessageKind::MetadataCommandTransferCheckpointBaseInstall,
+            encode_metadata_command_transfer_checkpoint_base_request(
+                &StorageRpcMetadataCommandTransferCheckpointBaseRequest {
+                    node_id: NodeId::new(7),
+                    cluster_epoch: destination_epoch,
+                    pg_id: PgId::new(0),
+                    checkpoint,
+                },
+            )
+            .unwrap(),
+        );
+        drop(client);
+        join.join().unwrap();
+
+        let payload = decode_storage_rpc_response_payload(&response.payload)
+            .unwrap()
+            .unwrap();
+        let decoded = decode_metadata_command_state_response(&payload).unwrap();
+        assert_eq!(decoded.state.cluster_epoch, destination_epoch);
+        assert_eq!(decoded.state.applied_log_index, 0);
+        assert_ne!(decoded.state.state_digest, 0);
+
+        let destination_node =
+            crate::node::SharedStorageNode::open(&config.data_dir, &config.pg_ids).unwrap();
+        let destination_pg = destination_node.get_pg(0).unwrap();
+        let loaded = destination_pg.head_bucket(&bucket).unwrap();
+        assert_eq!(loaded.name, bucket);
+        let lifecycle = destination_pg
+            .get_bucket_subresource(&bucket, BucketSubresourceKind::Lifecycle)
+            .unwrap()
+            .unwrap();
+        assert_eq!(lifecycle.body, "<LifecycleConfiguration/>");
+    }
+
+    #[test]
+    fn storage_node_server_rejects_active_metadata_transfer_checkpoint_base_install() {
+        let (_bucket, checkpoint) =
+            test_metadata_checkpoint_with_bucket("metadata-rpc-checkpoint-active");
+        let tmp = test_util::tempdir();
+        let config = test_config(&tmp);
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let server = StorageNodeServer::bind(config.clone()).unwrap();
+        let socket_path = config.socket_path.clone();
+        let join = thread::spawn(move || server.accept_one().unwrap());
+
+        let mut client = UnixStream::connect(socket_path).unwrap();
+        let response = send_frame(
+            &mut client,
+            1,
+            StorageRpcMessageKind::MetadataCommandTransferCheckpointBaseInstall,
+            encode_metadata_command_transfer_checkpoint_base_request(
+                &StorageRpcMetadataCommandTransferCheckpointBaseRequest {
+                    node_id: NodeId::new(7),
+                    cluster_epoch: config.cluster_epoch,
+                    pg_id: PgId::new(0),
+                    checkpoint,
+                },
+            )
+            .unwrap(),
+        );
+        drop(client);
+        join.join().unwrap();
+
+        let error = decode_storage_rpc_response_payload(&response.payload)
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(error.code, StorageRpcErrorCode::InactivePgRoute);
+        assert!(
+            error.message.contains("route is active"),
+            "unexpected error: {error:?}"
+        );
     }
 
     #[test]

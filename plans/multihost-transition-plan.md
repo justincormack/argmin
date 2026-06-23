@@ -8196,6 +8196,17 @@ Metadata PG migration and backfill design notes:
   materialized base. This deliberately does not claim retained-log coverage or
   wire live metadata transfer yet. The next slice is the storage-node/RPC
   boundary for this install primitive and then checkpoint-base import wiring.
+- Added the storage-node/RPC boundary for metadata checkpoint base install.
+  The Unix storage-node protocol now carries a bounded checkpoint-base install
+  request, validates that the destination route is a `Peering` inspection route,
+  and calls the local PgStore installer under the per-PG metadata command guard.
+  Local and Unix metadata-node clients expose the same staged method so later
+  cluster import code can install checkpoint bases without caring whether the
+  destination is same-process or a storage-node process. Focused codec and
+  storage-node boundary tests cover checkpoint payload roundtrip and restoring
+  parent/child metadata rows through the RPC. Checkpoint-base transfer artifacts
+  still fail closed until the artifact/import path carries checkpoint contents
+  and selects this install path before retained suffix replay.
 
 Exit criteria:
 

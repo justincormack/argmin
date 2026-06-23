@@ -8,7 +8,11 @@ use crate::{
         MetadataCommandReplicaState, MetadataTransferCommand, ObjectPayloadReclaimCommand,
         PutObjectMetadataMutation,
     },
-    pg_store::{ScavengerShardFile, ScavengerShardFileScan, ScavengerShardRow},
+    pg_store::{
+        MetadataCheckpointRow, MetadataCheckpointTableBlock, MetadataCheckpointTableDigest,
+        MetadataCheckpointValue, MetadataCommandCheckpoint, ScavengerShardFile,
+        ScavengerShardFileScan, ScavengerShardRow,
+    },
     types::{
         AbortMultipartUploadCleanup, BucketDeleteFinalizeClaimRecord, BucketDeleteFinalizeRoot,
         BucketEncryptionConfig, BucketFastPathIdentity, BucketInfo, BucketObjectOwnership,
@@ -218,6 +222,11 @@ const STORAGE_RPC_MAX_METADATA_COMMAND_LOG_HASH_RANGE_PAYLOAD_LEN: usize =
 // frame cap after success-response wrapping.
 pub(crate) const STORAGE_RPC_MAX_METADATA_COMMAND_LOG_ENTRY_RANGE_ENTRIES: u64 = 31;
 const STORAGE_RPC_MAX_METADATA_COMMAND_BYTES_LEN: usize = 2 * 1024 * 1024;
+const STORAGE_RPC_MAX_METADATA_CHECKPOINT_TABLES: usize = 128;
+const STORAGE_RPC_MAX_METADATA_CHECKPOINT_COLUMNS: usize = 256;
+const STORAGE_RPC_MAX_METADATA_CHECKPOINT_ROWS: usize = 100_000;
+const STORAGE_RPC_MAX_METADATA_CHECKPOINT_ROW_VALUES: usize = 256;
+const STORAGE_RPC_MAX_METADATA_CHECKPOINT_VALUE_BYTES_LEN: usize = 2 * 1024 * 1024;
 const STORAGE_RPC_MAX_METADATA_COMMAND_ITEM_PAYLOAD_LEN: usize =
     8 + 4 + STORAGE_RPC_MAX_METADATA_COMMAND_BYTES_LEN;
 const STORAGE_RPC_MAX_METADATA_COMMAND_REQUEST_PAYLOAD_LEN: usize =
@@ -554,6 +563,7 @@ pub(crate) enum StorageRpcMessageKind {
     MetadataCommandTransferStateAdopt = 146,
     MetadataCommandTransferEmptyStateInitialize = 147,
     MetadataCommandTransferMatchingStateInitialize = 148,
+    MetadataCommandTransferCheckpointBaseInstall = 149,
     MetadataCommandAppliedLogHashes = 25,
     MetadataCommandMatchingAppliedLog = 26,
     MetadataCommandAbandoned = 27,
@@ -774,6 +784,9 @@ impl StorageRpcMessageKind {
             Self::MetadataCommandTransferMatchingStateInitialize => {
                 "metadata command transfer matching state initialize"
             }
+            Self::MetadataCommandTransferCheckpointBaseInstall => {
+                "metadata command transfer checkpoint base install"
+            }
             Self::MetadataCommandAppliedLogHashes => "metadata command applied log hashes",
             Self::MetadataCommandMatchingAppliedLog => "metadata command matching applied log",
             Self::MetadataCommandRetainedLogHashes => "metadata command retained log hashes",
@@ -945,6 +958,7 @@ impl StorageRpcMessageKind {
             146 => Ok(Self::MetadataCommandTransferStateAdopt),
             147 => Ok(Self::MetadataCommandTransferEmptyStateInitialize),
             148 => Ok(Self::MetadataCommandTransferMatchingStateInitialize),
+            149 => Ok(Self::MetadataCommandTransferCheckpointBaseInstall),
             25 => Ok(Self::MetadataCommandAppliedLogHashes),
             26 => Ok(Self::MetadataCommandMatchingAppliedLog),
             27 => Ok(Self::MetadataCommandAbandoned),
@@ -2698,6 +2712,14 @@ pub(crate) struct StorageRpcMetadataCommandTransferMatchingStateRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StorageRpcMetadataCommandTransferCheckpointBaseRequest {
+    pub(crate) node_id: NodeId,
+    pub(crate) cluster_epoch: ClusterEpoch,
+    pub(crate) pg_id: PgId,
+    pub(crate) checkpoint: MetadataCommandCheckpoint,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StorageRpcMetadataCommandLogHashRangeRequest {
     pub(crate) node_id: NodeId,
     pub(crate) cluster_epoch: ClusterEpoch,
@@ -3371,6 +3393,9 @@ fn message_kind_request_max_payload_len(
         }
         StorageRpcMessageKind::MetadataCommandTransferMatchingStateInitialize => {
             STORAGE_RPC_MAX_METADATA_COMMAND_STATE_PAYLOAD_LEN + 8 + 8 + 8
+        }
+        StorageRpcMessageKind::MetadataCommandTransferCheckpointBaseInstall => {
+            STORAGE_RPC_MAX_PAYLOAD_LEN
         }
         StorageRpcMessageKind::MetadataCommandTransferStateAdopt => STORAGE_RPC_MAX_PAYLOAD_LEN,
         StorageRpcMessageKind::MetadataCommandNextId => {
@@ -8675,6 +8700,236 @@ pub(crate) fn decode_metadata_command_transfer_matching_state_request(
     })
 }
 
+pub(crate) fn encode_metadata_command_transfer_checkpoint_base_request(
+    request: &StorageRpcMetadataCommandTransferCheckpointBaseRequest,
+) -> Result<Vec<u8>, StorageRpcPayloadError> {
+    let mut out = encode_metadata_command_state_request(&StorageRpcMetadataCommandStateRequest {
+        node_id: request.node_id,
+        cluster_epoch: request.cluster_epoch,
+        pg_id: request.pg_id,
+    });
+    encode_metadata_command_checkpoint(&mut out, &request.checkpoint)?;
+    Ok(out)
+}
+
+pub(crate) fn decode_metadata_command_transfer_checkpoint_base_request(
+    bytes: &[u8],
+) -> Result<StorageRpcMetadataCommandTransferCheckpointBaseRequest, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let node_id = NodeId::new(decoder.read_u32()?);
+    let cluster_epoch = decoder.read_cluster_epoch()?;
+    let pg_id = PgId::new(decoder.read_u32()?);
+    let checkpoint = decode_metadata_command_checkpoint(&mut decoder)?;
+    decoder.finish()?;
+    Ok(StorageRpcMetadataCommandTransferCheckpointBaseRequest {
+        node_id,
+        cluster_epoch,
+        pg_id,
+        checkpoint,
+    })
+}
+
+fn encode_metadata_command_checkpoint(
+    out: &mut Vec<u8>,
+    checkpoint: &MetadataCommandCheckpoint,
+) -> Result<(), StorageRpcPayloadError> {
+    put_u64(out, checkpoint.cluster_epoch.get());
+    put_u32(out, checkpoint.pg_id.get());
+    put_u64(out, checkpoint.applied_log_index);
+    put_u64(out, checkpoint.applied_log_hash);
+    put_u64(out, checkpoint.state_digest);
+    put_u8(out, checkpoint.canonical_state_encoding_version);
+    put_u32(out, checked_u32_len(checkpoint.table_digests.len())?);
+    for digest in &checkpoint.table_digests {
+        put_string(out, &digest.table_name);
+        put_u64(out, digest.row_count);
+        put_u64(out, digest.row_hash_xor);
+        put_u64(out, digest.row_hash_sum);
+        put_u64(out, digest.table_digest);
+    }
+    put_u32(out, checked_u32_len(checkpoint.table_blocks.len())?);
+    for block in &checkpoint.table_blocks {
+        encode_metadata_checkpoint_table_block(out, block)?;
+    }
+    put_u64(out, checkpoint.checkpoint_crc64);
+    Ok(())
+}
+
+fn decode_metadata_command_checkpoint(
+    decoder: &mut StorageRpcDecoder<'_>,
+) -> Result<MetadataCommandCheckpoint, StorageRpcPayloadError> {
+    let cluster_epoch = decoder.read_cluster_epoch()?;
+    let pg_id = PgId::new(decoder.read_u32()?);
+    let applied_log_index = decoder.read_u64()?;
+    let applied_log_hash = decoder.read_u64()?;
+    let state_digest = decoder.read_u64()?;
+    let canonical_state_encoding_version = decoder.read_u8()?;
+    let table_digest_count =
+        decoder.read_count_with_limit(STORAGE_RPC_MAX_METADATA_CHECKPOINT_TABLES)?;
+    let mut table_digests = Vec::with_capacity(table_digest_count);
+    for _ in 0..table_digest_count {
+        table_digests.push(MetadataCheckpointTableDigest {
+            table_name: decoder.read_string()?,
+            row_count: decoder.read_u64()?,
+            row_hash_xor: decoder.read_u64()?,
+            row_hash_sum: decoder.read_u64()?,
+            table_digest: decoder.read_u64()?,
+        });
+    }
+    let table_block_count =
+        decoder.read_count_with_limit(STORAGE_RPC_MAX_METADATA_CHECKPOINT_TABLES)?;
+    let mut table_blocks = Vec::with_capacity(table_block_count);
+    for _ in 0..table_block_count {
+        table_blocks.push(decode_metadata_checkpoint_table_block(decoder)?);
+    }
+    let checkpoint_crc64 = decoder.read_u64()?;
+    Ok(MetadataCommandCheckpoint {
+        cluster_epoch,
+        pg_id,
+        applied_log_index,
+        applied_log_hash,
+        state_digest,
+        canonical_state_encoding_version,
+        table_digests,
+        table_blocks,
+        checkpoint_crc64,
+    })
+}
+
+fn encode_metadata_checkpoint_table_block(
+    out: &mut Vec<u8>,
+    block: &MetadataCheckpointTableBlock,
+) -> Result<(), StorageRpcPayloadError> {
+    put_string(out, &block.table_name);
+    put_string_vec(out, &block.columns)?;
+    put_string_vec(out, &block.order_columns)?;
+    put_string(out, &block.filter);
+    put_u32(out, checked_u32_len(block.rows.len())?);
+    for row in &block.rows {
+        encode_metadata_checkpoint_row(out, row)?;
+    }
+    put_u64(out, block.row_count);
+    put_u64(out, block.row_hash_xor);
+    put_u64(out, block.row_hash_sum);
+    put_u64(out, block.table_digest);
+    Ok(())
+}
+
+fn decode_metadata_checkpoint_table_block(
+    decoder: &mut StorageRpcDecoder<'_>,
+) -> Result<MetadataCheckpointTableBlock, StorageRpcPayloadError> {
+    let table_name = decoder.read_string()?;
+    let columns =
+        decoder.read_string_vec_with_limit(STORAGE_RPC_MAX_METADATA_CHECKPOINT_COLUMNS)?;
+    let order_columns =
+        decoder.read_string_vec_with_limit(STORAGE_RPC_MAX_METADATA_CHECKPOINT_COLUMNS)?;
+    let filter = decoder.read_string()?;
+    let row_count = decoder.read_count_with_limit(STORAGE_RPC_MAX_METADATA_CHECKPOINT_ROWS)?;
+    let mut rows = Vec::with_capacity(row_count);
+    for _ in 0..row_count {
+        rows.push(decode_metadata_checkpoint_row(decoder)?);
+    }
+    Ok(MetadataCheckpointTableBlock {
+        table_name,
+        columns,
+        order_columns,
+        filter,
+        rows,
+        row_count: decoder.read_u64()?,
+        row_hash_xor: decoder.read_u64()?,
+        row_hash_sum: decoder.read_u64()?,
+        table_digest: decoder.read_u64()?,
+    })
+}
+
+fn encode_metadata_checkpoint_row(
+    out: &mut Vec<u8>,
+    row: &MetadataCheckpointRow,
+) -> Result<(), StorageRpcPayloadError> {
+    put_u32(out, checked_u32_len(row.values.len())?);
+    for value in &row.values {
+        encode_metadata_checkpoint_value(out, value)?;
+    }
+    put_u64(out, row.row_digest);
+    Ok(())
+}
+
+fn decode_metadata_checkpoint_row(
+    decoder: &mut StorageRpcDecoder<'_>,
+) -> Result<MetadataCheckpointRow, StorageRpcPayloadError> {
+    let value_count =
+        decoder.read_count_with_limit(STORAGE_RPC_MAX_METADATA_CHECKPOINT_ROW_VALUES)?;
+    let mut values = Vec::with_capacity(value_count);
+    for _ in 0..value_count {
+        values.push(decode_metadata_checkpoint_value(decoder)?);
+    }
+    Ok(MetadataCheckpointRow {
+        values,
+        row_digest: decoder.read_u64()?,
+    })
+}
+
+fn encode_metadata_checkpoint_value(
+    out: &mut Vec<u8>,
+    value: &MetadataCheckpointValue,
+) -> Result<(), StorageRpcPayloadError> {
+    match value {
+        MetadataCheckpointValue::Null => put_u8(out, 0),
+        MetadataCheckpointValue::Integer(value) => {
+            put_u8(out, 1);
+            put_u64(out, *value as u64);
+        }
+        MetadataCheckpointValue::RealBits(value) => {
+            put_u8(out, 2);
+            put_u64(out, *value);
+        }
+        MetadataCheckpointValue::Text(value) => {
+            put_u8(out, 3);
+            if value.len() > STORAGE_RPC_MAX_METADATA_CHECKPOINT_VALUE_BYTES_LEN {
+                return Err(StorageRpcPayloadError::PayloadTooLarge {
+                    len: value.len(),
+                    limit: STORAGE_RPC_MAX_METADATA_CHECKPOINT_VALUE_BYTES_LEN,
+                });
+            }
+            put_bytes(out, value);
+        }
+        MetadataCheckpointValue::Blob(value) => {
+            put_u8(out, 4);
+            if value.len() > STORAGE_RPC_MAX_METADATA_CHECKPOINT_VALUE_BYTES_LEN {
+                return Err(StorageRpcPayloadError::PayloadTooLarge {
+                    len: value.len(),
+                    limit: STORAGE_RPC_MAX_METADATA_CHECKPOINT_VALUE_BYTES_LEN,
+                });
+            }
+            put_bytes(out, value);
+        }
+    }
+    Ok(())
+}
+
+fn decode_metadata_checkpoint_value(
+    decoder: &mut StorageRpcDecoder<'_>,
+) -> Result<MetadataCheckpointValue, StorageRpcPayloadError> {
+    match decoder.read_u8()? {
+        0 => Ok(MetadataCheckpointValue::Null),
+        1 => Ok(MetadataCheckpointValue::Integer(decoder.read_u64()? as i64)),
+        2 => Ok(MetadataCheckpointValue::RealBits(decoder.read_u64()?)),
+        3 => Ok(MetadataCheckpointValue::Text(
+            decoder
+                .read_bytes_with_payload_limit(STORAGE_RPC_MAX_METADATA_CHECKPOINT_VALUE_BYTES_LEN)?
+                .to_vec(),
+        )),
+        4 => Ok(MetadataCheckpointValue::Blob(
+            decoder
+                .read_bytes_with_payload_limit(STORAGE_RPC_MAX_METADATA_CHECKPOINT_VALUE_BYTES_LEN)?
+                .to_vec(),
+        )),
+        _ => Err(StorageRpcPayloadError::InvalidResponseEnvelope(
+            "invalid metadata checkpoint value tag",
+        )),
+    }
+}
+
 pub(crate) fn encode_metadata_command_state_response(
     response: &StorageRpcMetadataCommandStateResponse,
 ) -> Vec<u8> {
@@ -11546,6 +11801,26 @@ impl<'a> StorageRpcDecoder<'a> {
             .map_err(|_| StorageRpcPayloadError::InvalidUtf8)
     }
 
+    fn read_count_with_limit(&mut self, limit: usize) -> Result<usize, StorageRpcPayloadError> {
+        let len = self.read_u32()? as usize;
+        if len > limit {
+            return Err(StorageRpcPayloadError::PayloadTooLarge { len, limit });
+        }
+        Ok(len)
+    }
+
+    fn read_string_vec_with_limit(
+        &mut self,
+        limit: usize,
+    ) -> Result<Vec<String>, StorageRpcPayloadError> {
+        let count = self.read_count_with_limit(limit)?;
+        let mut values = Vec::with_capacity(count);
+        for _ in 0..count {
+            values.push(self.read_string()?);
+        }
+        Ok(values)
+    }
+
     fn read_bucket_name(&mut self) -> Result<BucketName, StorageRpcPayloadError> {
         BucketName::try_from(self.read_string_with_limit(
             STORAGE_RPC_MAX_BUCKET_NAME_LEN,
@@ -14166,6 +14441,21 @@ fn put_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
     out.extend_from_slice(bytes);
 }
 
+fn checked_u32_len(len: usize) -> Result<u32, StorageRpcPayloadError> {
+    u32::try_from(len).map_err(|_| StorageRpcPayloadError::PayloadTooLarge {
+        len,
+        limit: u32::MAX as usize,
+    })
+}
+
+fn put_string_vec(out: &mut Vec<u8>, values: &[String]) -> Result<(), StorageRpcPayloadError> {
+    put_u32(out, checked_u32_len(values.len())?);
+    for value in values {
+        put_string(out, value);
+    }
+    Ok(())
+}
+
 fn put_string(out: &mut Vec<u8>, value: &str) {
     put_bytes(out, value.as_bytes());
 }
@@ -16313,6 +16603,63 @@ mod tests {
 
         let bytes = encode_metadata_command_transfer_matching_state_request(&request);
         let decoded = decode_metadata_command_transfer_matching_state_request(&bytes).unwrap();
+
+        assert_eq!(decoded, request);
+    }
+
+    #[test]
+    fn metadata_command_transfer_checkpoint_base_request_round_trips() {
+        let checkpoint = MetadataCommandCheckpoint {
+            cluster_epoch: ClusterEpoch::new(3).unwrap(),
+            pg_id: PgId::new(11),
+            applied_log_index: 7,
+            applied_log_hash: 0x1234,
+            state_digest: 0x5678,
+            canonical_state_encoding_version: 1,
+            table_digests: vec![MetadataCheckpointTableDigest {
+                table_name: "buckets".to_string(),
+                row_count: 1,
+                row_hash_xor: 0x11,
+                row_hash_sum: 0x11,
+                table_digest: 0x22,
+            }],
+            table_blocks: vec![MetadataCheckpointTableBlock {
+                table_name: "buckets".to_string(),
+                columns: vec![
+                    "name".to_string(),
+                    "created_at".to_string(),
+                    "ratio".to_string(),
+                    "body".to_string(),
+                    "missing".to_string(),
+                ],
+                order_columns: vec!["name".to_string()],
+                filter: "all_rows".to_string(),
+                rows: vec![MetadataCheckpointRow {
+                    values: vec![
+                        MetadataCheckpointValue::Text(b"bucket".to_vec()),
+                        MetadataCheckpointValue::Integer(-7),
+                        MetadataCheckpointValue::RealBits(1.25f64.to_bits()),
+                        MetadataCheckpointValue::Blob(vec![1, 2, 3]),
+                        MetadataCheckpointValue::Null,
+                    ],
+                    row_digest: 0x33,
+                }],
+                row_count: 1,
+                row_hash_xor: 0x33,
+                row_hash_sum: 0x33,
+                table_digest: 0x44,
+            }],
+            checkpoint_crc64: 0x99,
+        };
+        let request = StorageRpcMetadataCommandTransferCheckpointBaseRequest {
+            node_id: NodeId::new(7),
+            cluster_epoch: ClusterEpoch::new(4).unwrap(),
+            pg_id: PgId::new(11),
+            checkpoint,
+        };
+
+        let bytes = encode_metadata_command_transfer_checkpoint_base_request(&request).unwrap();
+        let decoded = decode_metadata_command_transfer_checkpoint_base_request(&bytes).unwrap();
 
         assert_eq!(decoded, request);
     }
