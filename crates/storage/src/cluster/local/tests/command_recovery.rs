@@ -3176,6 +3176,205 @@ fn metadata_transfer_import_installs_checkpoint_base() {
 }
 
 #[test]
+fn metadata_transfer_import_replays_retained_suffix_over_checkpoint_base() {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[1], ec_shape).unwrap();
+    let topology = map
+        .node(NodeId::new(0))
+        .unwrap()
+        .storage_node()
+        .pg_topology();
+    let first_bucket = bucket_for_pg(topology, 1, "metadata-transfer-checkpoint-suffix-first-");
+    let second_bucket = bucket_for_pg(topology, 1, "metadata-transfer-checkpoint-suffix-second-");
+    let third_bucket = bucket_for_pg(topology, 1, "metadata-transfer-checkpoint-suffix-third-");
+    set_route_primary(&mut map, 1, NodeId::new(0));
+    set_route_state(&mut map, 1, PgState::Peering);
+    let mut map = Arc::new(map);
+    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let pg_id = PgId::new(1);
+    let first = create_bucket_metadata_command(pg_id, 1, first_bucket.clone());
+    let second = create_bucket_metadata_command(pg_id, 2, second_bucket.clone());
+    let third = create_bucket_metadata_command(pg_id, 3, third_bucket.clone());
+    let source_pg = map
+        .node(NodeId::new(0))
+        .unwrap()
+        .storage_node()
+        .get_pg(1)
+        .unwrap();
+    source_pg
+        .apply_metadata_command_and_record(0, &first)
+        .unwrap();
+    let checkpoint = source_pg
+        .metadata_command_checkpoint(0, ClusterEpoch::INITIAL)
+        .unwrap();
+    let checkpoint_proof = crate::control_plane::PgMetadataProof::new(
+        checkpoint.applied_log_index,
+        checkpoint.applied_log_hash,
+        checkpoint.state_digest,
+    );
+    source_pg
+        .apply_metadata_command_and_record(0, &second)
+        .unwrap();
+    source_pg
+        .apply_metadata_command_and_record(0, &third)
+        .unwrap();
+    let source_state = source_pg.metadata_command_replica_state().unwrap();
+    let retained_log_entries = source_pg
+        .retained_metadata_command_log_entries(
+            0,
+            ClusterEpoch::INITIAL,
+            crate::metadata_command::MetadataCommandLogIndex::new(2).unwrap(),
+            crate::metadata_command::MetadataCommandLogIndex::new(3).unwrap(),
+        )
+        .unwrap();
+    drop(source_pg);
+    let artifact = crate::peering::PgMetadataTransferArtifact {
+        pg_id,
+        source_node_id: NodeId::new(0),
+        cluster_epoch: ClusterEpoch::INITIAL,
+        base_kind: crate::peering::PgMetadataTransferBaseKind::Checkpoint,
+        base_proof: checkpoint_proof,
+        checkpoint_base: Some(checkpoint.clone()),
+        proof: crate::control_plane::PgMetadataProof::new(
+            source_state.applied_log_index,
+            source_state.applied_log_hash,
+            source_state.state_digest,
+        ),
+        retained_log_entries,
+    };
+    drop(cluster);
+
+    let destination_epoch = ClusterEpoch::new(2).unwrap();
+    let map_mut = Arc::get_mut(&mut map).unwrap();
+    map_mut.epoch = destination_epoch;
+    let route = map_mut.pg_routes.get_mut(&pg_id).unwrap();
+    route.cluster_epoch = destination_epoch;
+    route.primary_node_id = NodeId::new(1);
+    route.acting_set = Arc::from([NodeId::new(1), NodeId::new(2)]);
+    route.state = PgState::Peering;
+    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let expected_proof = crate::StorageCluster::metadata_transfer_imported_proof_at_epoch(
+        &artifact,
+        destination_epoch,
+    )
+    .unwrap();
+    let rebased_commands =
+        crate::peering::rebase_pg_metadata_transfer_artifact_commands(&artifact, destination_epoch)
+            .unwrap();
+    let partial_client = map
+        .node(NodeId::new(1))
+        .unwrap()
+        .metadata_command_client()
+        .clone();
+    partial_client
+        .install_metadata_transfer_checkpoint_base(pg_id, destination_epoch, &checkpoint)
+        .unwrap();
+    partial_client
+        .replay_metadata_command_for_peering(pg_id, &rebased_commands[0].command)
+        .unwrap();
+
+    let proof = cluster
+        .import_pg_metadata_transfer_from_retained_log(&artifact)
+        .unwrap();
+    let retry_proof = cluster
+        .import_pg_metadata_transfer_from_retained_log(&artifact)
+        .unwrap();
+
+    assert_eq!(proof, expected_proof);
+    assert_eq!(retry_proof, expected_proof);
+    for node_id in [NodeId::new(1), NodeId::new(2)] {
+        let pg = map.node(node_id).unwrap().storage_node().get_pg(1).unwrap();
+        let state = pg.metadata_command_replica_state().unwrap();
+        assert_eq!(state.cluster_epoch, destination_epoch);
+        assert_eq!(state.applied_log_index, expected_proof.applied_log_index);
+        assert_eq!(state.applied_log_hash, expected_proof.applied_log_hash);
+        assert_eq!(state.state_digest, expected_proof.state_digest);
+        crate::PgMetadataStore::head_bucket(&*pg, &first_bucket).unwrap();
+        crate::PgMetadataStore::head_bucket(&*pg, &second_bucket).unwrap();
+        crate::PgMetadataStore::head_bucket(&*pg, &third_bucket).unwrap();
+    }
+}
+
+#[test]
+fn metadata_transfer_checkpoint_import_rejects_stale_nonempty_destination() {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[1], ec_shape).unwrap();
+    let topology = map
+        .node(NodeId::new(0))
+        .unwrap()
+        .storage_node()
+        .pg_topology();
+    let source_bucket = bucket_for_pg(topology, 1, "metadata-transfer-stale-checkpoint-source-");
+    let stale_bucket = bucket_for_pg(topology, 1, "metadata-transfer-stale-checkpoint-dirty-");
+    set_route_primary(&mut map, 1, NodeId::new(0));
+    set_route_state(&mut map, 1, PgState::Peering);
+    let mut map = Arc::new(map);
+    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let pg_id = PgId::new(1);
+    let source_command = create_bucket_metadata_command(pg_id, 1, source_bucket);
+    map.node(NodeId::new(0))
+        .unwrap()
+        .storage_node()
+        .get_pg(1)
+        .unwrap()
+        .apply_metadata_command_and_record(0, &source_command)
+        .unwrap();
+    let artifact = cluster
+        .export_pg_metadata_transfer_from_checkpoint(pg_id, NodeId::new(0))
+        .unwrap();
+    drop(cluster);
+
+    let stale_command = create_bucket_metadata_command(pg_id, 1, stale_bucket);
+    let stale_pg = map
+        .node(NodeId::new(1))
+        .unwrap()
+        .storage_node()
+        .get_pg(1)
+        .unwrap();
+    stale_pg
+        .apply_metadata_command_and_record(1, &stale_command)
+        .unwrap();
+    let stale_state = stale_pg.metadata_command_replica_state().unwrap();
+    drop(stale_pg);
+
+    let destination_epoch = ClusterEpoch::new(2).unwrap();
+    let map_mut = Arc::get_mut(&mut map).unwrap();
+    map_mut.epoch = destination_epoch;
+    let route = map_mut.pg_routes.get_mut(&pg_id).unwrap();
+    route.cluster_epoch = destination_epoch;
+    route.primary_node_id = NodeId::new(1);
+    route.acting_set = Arc::from([NodeId::new(1), NodeId::new(2)]);
+    route.state = PgState::Peering;
+    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+
+    let err = cluster
+        .import_pg_metadata_transfer_from_retained_log(&artifact)
+        .unwrap_err();
+
+    assert!(matches!(
+        err,
+        crate::peering::PgPeeringReconstructionFailure::Reconstruction(
+            crate::peering::PgPeeringReconstructionError::DirtyMetadataTransferDestination {
+                node_id,
+                pg_id: err_pg_id,
+                applied_log_index,
+                applied_log_hash,
+                state_digest,
+                ..
+            }
+        ) if node_id == NodeId::new(1)
+            && err_pg_id == pg_id
+            && applied_log_index == stale_state.applied_log_index
+            && applied_log_hash == stale_state.applied_log_hash
+            && state_digest == stale_state.state_digest
+    ));
+}
+
+#[test]
 fn metadata_transfer_live_export_falls_back_to_checkpoint_without_retained_state_proof() {
     let tmp = test_util::tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];

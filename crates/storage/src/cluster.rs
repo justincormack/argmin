@@ -1467,6 +1467,36 @@ enum MetadataTransferImportDestination {
     AdoptPrefix { prefix_len: usize },
 }
 
+fn checkpoint_import_resume_prefix_len(
+    pg_id: PgId,
+    checkpoint_destination_base_proof: PgMetadataProof,
+    expected_import_proof: PgMetadataProof,
+    current_proof: PgMetadataProof,
+    commands: &[MetadataTransferCommand],
+    cluster_epoch: ClusterEpoch,
+) -> Option<usize> {
+    if current_proof == checkpoint_destination_base_proof {
+        return Some(0);
+    }
+    if current_proof == expected_import_proof {
+        return Some(commands.len());
+    }
+    for (index, command) in commands.iter().enumerate() {
+        let prefix_len = index + 1;
+        let prefix_proof = metadata_transfer_destination_proof_for_commands(
+            pg_id,
+            prefix_len as u64,
+            command.post_state_digest,
+            &commands[..prefix_len],
+            cluster_epoch,
+        );
+        if current_proof == prefix_proof {
+            return Some(prefix_len);
+        }
+    }
+    None
+}
+
 fn classify_metadata_transfer_import_destination(
     metadata_client: &dyn MetadataCommandNodeClient,
     node_id: NodeId,
@@ -2727,6 +2757,8 @@ impl StorageCluster {
             metadata_transfer_destination_proof(artifact, &commands, self.operation_epoch());
         let base_import_proof = artifact.source_base_metadata_proof();
         let checkpoint_base = artifact.checkpoint_base();
+        let checkpoint_destination_base_proof =
+            checkpoint_base.map(|checkpoint| PgMetadataProof::new(0, 0, checkpoint.state_digest));
         let nodes = self
             .local_map
             .metadata_pg_acting_nodes_for_peering_replay(self.operation_epoch(), pg_id)?;
@@ -2760,36 +2792,112 @@ impl StorageCluster {
                     current.applied_log_hash,
                     current.state_digest,
                 );
-                if current.cluster_epoch == self.operation_epoch()
-                    && current_proof == expected_import_proof
-                {
-                    let validated = metadata_client
-                        .validate_metadata_command_replay_state_preserving_pending_slot(
+                if current.cluster_epoch == self.operation_epoch() {
+                    if let Some(prefix_len) = checkpoint_import_resume_prefix_len(
+                        pg_id,
+                        checkpoint_destination_base_proof.expect("checkpoint proof exists"),
+                        expected_import_proof,
+                        current_proof,
+                        &commands,
+                        self.operation_epoch(),
+                    ) {
+                        let validated = metadata_client
+                            .validate_metadata_command_replay_state_preserving_pending_slot(
+                                pg_id,
+                                self.operation_epoch(),
+                            )?;
+                        let validated_proof = PgMetadataProof::new(
+                            validated.applied_log_index,
+                            validated.applied_log_hash,
+                            validated.state_digest,
+                        );
+                        let Some(validated_prefix_len) = checkpoint_import_resume_prefix_len(
+                            pg_id,
+                            checkpoint_destination_base_proof.expect("checkpoint proof exists"),
+                            expected_import_proof,
+                            validated_proof,
+                            &commands,
+                            self.operation_epoch(),
+                        ) else {
+                            return Err(PgPeeringReconstructionError::MetadataFork {
+                                node_id: node.node_id(),
+                                reference_node_id: node.node_id(),
+                                replica: validated_proof,
+                                reference: expected_import_proof,
+                            }
+                            .into());
+                        };
+                        if validated_prefix_len != prefix_len {
+                            return Err(PgPeeringReconstructionError::MetadataFork {
+                                node_id: node.node_id(),
+                                reference_node_id: node.node_id(),
+                                replica: validated_proof,
+                                reference: current_proof,
+                            }
+                            .into());
+                        }
+                        let mut state = validated;
+                        for command in &commands[prefix_len..] {
+                            state = metadata_client
+                                .replay_metadata_command_for_peering(pg_id, &command.command)?;
+                        }
+                        state
+                    } else if metadata_client.metadata_command_replica_state_can_initialize(
+                        pg_id,
+                        self.operation_epoch(),
+                    )? {
+                        let mut state = metadata_client.install_metadata_transfer_checkpoint_base(
                             pg_id,
                             self.operation_epoch(),
+                            checkpoint,
                         )?;
-                    let validated_proof = PgMetadataProof::new(
-                        validated.applied_log_index,
-                        validated.applied_log_hash,
-                        validated.state_digest,
-                    );
-                    if validated_proof == expected_import_proof {
-                        validated
-                    } else {
-                        return Err(PgPeeringReconstructionError::MetadataFork {
-                            node_id: node.node_id(),
-                            reference_node_id: node.node_id(),
-                            replica: validated_proof,
-                            reference: expected_import_proof,
+                        for command in &commands {
+                            state = metadata_client
+                                .replay_metadata_command_for_peering(pg_id, &command.command)?;
                         }
-                        .into());
+                        state
+                    } else {
+                        return Err(
+                            PgPeeringReconstructionError::DirtyMetadataTransferDestination {
+                                node_id: node.node_id(),
+                                pg_id,
+                                cluster_epoch: self.operation_epoch(),
+                                applied_log_index: current.applied_log_index,
+                                applied_log_hash: current.applied_log_hash,
+                                state_digest: current.state_digest,
+                                expected: expected_import_proof,
+                            }
+                            .into(),
+                        );
                     }
                 } else {
-                    metadata_client.install_metadata_transfer_checkpoint_base(
+                    if !metadata_client.metadata_command_replica_state_can_initialize(
+                        pg_id,
+                        self.operation_epoch(),
+                    )? {
+                        return Err(
+                            PgPeeringReconstructionError::DirtyMetadataTransferDestination {
+                                node_id: node.node_id(),
+                                pg_id,
+                                cluster_epoch: self.operation_epoch(),
+                                applied_log_index: current.applied_log_index,
+                                applied_log_hash: current.applied_log_hash,
+                                state_digest: current.state_digest,
+                                expected: expected_import_proof,
+                            }
+                            .into(),
+                        );
+                    }
+                    let mut state = metadata_client.install_metadata_transfer_checkpoint_base(
                         pg_id,
                         self.operation_epoch(),
                         checkpoint,
-                    )?
+                    )?;
+                    for command in &commands {
+                        state = metadata_client
+                            .replay_metadata_command_for_peering(pg_id, &command.command)?;
+                    }
+                    state
                 }
             } else {
                 match classify_metadata_transfer_import_destination(

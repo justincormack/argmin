@@ -639,8 +639,6 @@ pub(crate) fn rebase_pg_metadata_transfer_artifact_commands(
         if checkpoint.cluster_epoch != artifact.cluster_epoch
             || checkpoint.pg_id != artifact.pg_id
             || checkpoint_proof != artifact.base_proof
-            || artifact.base_proof != artifact.proof
-            || !artifact.retained_log_entries.is_empty()
         {
             return Err(
                 PgPeeringReconstructionError::MetadataTransferCheckpointProofMismatch {
@@ -651,55 +649,96 @@ pub(crate) fn rebase_pg_metadata_transfer_artifact_commands(
                 },
             );
         }
-        return Ok(Vec::new());
-    }
-    if artifact.checkpoint_base().is_some() {
-        return Err(
-            PgPeeringReconstructionError::UnexpectedMetadataTransferCheckpointBase {
-                node_id: artifact.source_node_id,
-                pg_id: artifact.pg_id,
-                base_kind: artifact.base_kind,
-            },
-        );
-    }
+        if artifact.retained_log_entries.is_empty() {
+            if artifact.base_proof != artifact.proof {
+                return Err(
+                    PgPeeringReconstructionError::MetadataTransferCheckpointProofMismatch {
+                        node_id: artifact.source_node_id,
+                        pg_id: artifact.pg_id,
+                        checkpoint: checkpoint_proof,
+                        expected: artifact.proof,
+                    },
+                );
+            }
+            return Ok(Vec::new());
+        }
+        let source_state = MetadataCommandReplicaState {
+            cluster_epoch: artifact.cluster_epoch,
+            applied_log_index: artifact.proof.applied_log_index,
+            applied_log_hash: artifact.proof.applied_log_hash,
+            state_digest: artifact.proof.state_digest,
+        };
+        let validated_artifact = build_pg_metadata_transfer_artifact_from_retained_log_entries(
+            artifact.cluster_epoch,
+            artifact.pg_id,
+            artifact.source_node_id,
+            source_state,
+            false,
+            artifact.retained_log_entries.clone(),
+        )?;
+        if validated_artifact.base_proof != artifact.base_proof
+            || validated_artifact.proof != artifact.proof
+        {
+            return Err(
+                PgPeeringReconstructionError::RetainedCommandStateDigestFork {
+                    node_id: artifact.source_node_id,
+                    pg_id: artifact.pg_id,
+                    log_index: artifact.base_proof.applied_log_index + 1,
+                    expected_pre_state_digest: artifact.base_proof.state_digest,
+                    actual_pre_state_digest: validated_artifact.base_proof.state_digest,
+                    post_state_digest: artifact.proof.state_digest,
+                },
+            );
+        }
+    } else {
+        if artifact.checkpoint_base().is_some() {
+            return Err(
+                PgPeeringReconstructionError::UnexpectedMetadataTransferCheckpointBase {
+                    node_id: artifact.source_node_id,
+                    pg_id: artifact.pg_id,
+                    base_kind: artifact.base_kind,
+                },
+            );
+        }
 
-    let source_state = MetadataCommandReplicaState {
-        cluster_epoch: artifact.cluster_epoch,
-        applied_log_index: artifact.proof.applied_log_index,
-        applied_log_hash: artifact.proof.applied_log_hash,
-        state_digest: artifact.proof.state_digest,
-    };
-    let validated_artifact = build_pg_metadata_transfer_artifact_from_retained_log_entries(
-        artifact.cluster_epoch,
-        artifact.pg_id,
-        artifact.source_node_id,
-        source_state,
-        false,
-        artifact.retained_log_entries.clone(),
-    )?;
-    if validated_artifact.base_proof != artifact.base_proof {
-        return Err(
-            PgPeeringReconstructionError::RetainedCommandStateDigestFork {
-                node_id: artifact.source_node_id,
-                pg_id: artifact.pg_id,
-                log_index: artifact.base_proof.applied_log_index + 1,
-                expected_pre_state_digest: artifact.base_proof.state_digest,
-                actual_pre_state_digest: validated_artifact.base_proof.state_digest,
-                post_state_digest: validated_artifact.base_proof.state_digest,
-            },
-        );
-    }
-    if validated_artifact.base_kind != artifact.base_kind {
-        return Err(
-            PgPeeringReconstructionError::RetainedCommandStateDigestFork {
-                node_id: artifact.source_node_id,
-                pg_id: artifact.pg_id,
-                log_index: artifact.base_proof.applied_log_index + 1,
-                expected_pre_state_digest: validated_artifact.base_proof.state_digest,
-                actual_pre_state_digest: artifact.base_proof.state_digest,
-                post_state_digest: artifact.base_proof.state_digest,
-            },
-        );
+        let source_state = MetadataCommandReplicaState {
+            cluster_epoch: artifact.cluster_epoch,
+            applied_log_index: artifact.proof.applied_log_index,
+            applied_log_hash: artifact.proof.applied_log_hash,
+            state_digest: artifact.proof.state_digest,
+        };
+        let validated_artifact = build_pg_metadata_transfer_artifact_from_retained_log_entries(
+            artifact.cluster_epoch,
+            artifact.pg_id,
+            artifact.source_node_id,
+            source_state,
+            false,
+            artifact.retained_log_entries.clone(),
+        )?;
+        if validated_artifact.base_proof != artifact.base_proof {
+            return Err(
+                PgPeeringReconstructionError::RetainedCommandStateDigestFork {
+                    node_id: artifact.source_node_id,
+                    pg_id: artifact.pg_id,
+                    log_index: artifact.base_proof.applied_log_index + 1,
+                    expected_pre_state_digest: artifact.base_proof.state_digest,
+                    actual_pre_state_digest: validated_artifact.base_proof.state_digest,
+                    post_state_digest: validated_artifact.base_proof.state_digest,
+                },
+            );
+        }
+        if validated_artifact.base_kind != artifact.base_kind {
+            return Err(
+                PgPeeringReconstructionError::RetainedCommandStateDigestFork {
+                    node_id: artifact.source_node_id,
+                    pg_id: artifact.pg_id,
+                    log_index: artifact.base_proof.applied_log_index + 1,
+                    expected_pre_state_digest: validated_artifact.base_proof.state_digest,
+                    actual_pre_state_digest: artifact.base_proof.state_digest,
+                    post_state_digest: artifact.base_proof.state_digest,
+                },
+            );
+        }
     }
 
     let mut commands = Vec::new();

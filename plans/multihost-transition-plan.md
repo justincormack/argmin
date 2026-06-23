@@ -8243,6 +8243,17 @@ Metadata PG migration and backfill design notes:
   Recovering from true command-log compaction therefore still requires an
   explicit checkpoint/base-proof compaction model rather than this selector
   alone.
+- Checkpoint-base artifacts can now carry a retained suffix after the
+  checkpoint proof. Import validates the checkpoint payload, validates the
+  retained suffix continuity from that checkpoint proof to the advertised final
+  source proof, installs the checkpoint as the destination `(0, 0,
+  checkpoint_digest)` base, and replays the rebased suffix from there. This
+  gives the import side the needed checkpoint-plus-retained-suffix shape. Retry
+  recognizes the checkpoint-only base, any already replayed destination-epoch
+  suffix prefix, and the final imported proof, so an interrupted import can
+  resume instead of trying to reinstall the checkpoint over a non-empty command
+  log. Exporting such artifacts from a stored historical checkpoint, and
+  selecting them to avoid full checkpoint transfer, remain later work.
 
 Exit criteria:
 
