@@ -8755,6 +8755,23 @@ pub(crate) fn decode_metadata_command_checkpoint_response(
     Ok(StorageRpcMetadataCommandCheckpointResponse { checkpoint })
 }
 
+pub(crate) fn encode_metadata_command_checkpoint_payload(
+    checkpoint: &MetadataCommandCheckpoint,
+) -> Result<Vec<u8>, StorageRpcPayloadError> {
+    let mut out = Vec::new();
+    encode_metadata_command_checkpoint(&mut out, checkpoint)?;
+    Ok(out)
+}
+
+pub(crate) fn decode_metadata_command_checkpoint_payload(
+    bytes: &[u8],
+) -> Result<MetadataCommandCheckpoint, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let checkpoint = decode_metadata_command_checkpoint(&mut decoder)?;
+    decoder.finish()?;
+    Ok(checkpoint)
+}
+
 fn encode_metadata_command_checkpoint(
     out: &mut Vec<u8>,
     checkpoint: &MetadataCommandCheckpoint,
@@ -16690,12 +16707,17 @@ mod tests {
         assert_eq!(decoded, request);
 
         let response = StorageRpcMetadataCommandCheckpointResponse {
-            checkpoint: request.checkpoint,
+            checkpoint: request.checkpoint.clone(),
         };
         let bytes = encode_metadata_command_checkpoint_response(&response).unwrap();
         let decoded = decode_metadata_command_checkpoint_response(&bytes).unwrap();
 
         assert_eq!(decoded, response);
+
+        let bytes = encode_metadata_command_checkpoint_payload(&request.checkpoint).unwrap();
+        let decoded = decode_metadata_command_checkpoint_payload(&bytes).unwrap();
+
+        assert_eq!(decoded, request.checkpoint);
     }
 
     #[test]

@@ -1,5 +1,8 @@
 use super::*;
 use crate::metadata_command::MetadataTransferCommand;
+use crate::storage_rpc::{
+    decode_metadata_command_checkpoint_payload, encode_metadata_command_checkpoint_payload,
+};
 
 const METADATA_CANONICAL_STATE_ENCODING_VERSION: u8 = 1;
 const METADATA_CANONICAL_PG_STATE_DOMAIN: &[u8] = b"argmin.metadata.pg-state";
@@ -2382,6 +2385,156 @@ impl PgStore {
         checkpoint.checkpoint_crc64 = Self::metadata_command_checkpoint_crc64(&checkpoint);
         debug_assert!(checkpoint.verify().is_ok());
         Ok(checkpoint)
+    }
+
+    pub fn record_current_metadata_command_checkpoint(
+        &self,
+        node_id: u32,
+        cluster_epoch: ClusterEpoch,
+    ) -> Result<MetadataCommandCheckpoint, StoreError> {
+        let checkpoint = self.metadata_command_checkpoint(node_id, cluster_epoch)?;
+        self.record_metadata_command_checkpoint(&checkpoint)?;
+        Ok(checkpoint)
+    }
+
+    pub fn record_metadata_command_checkpoint(
+        &self,
+        checkpoint: &MetadataCommandCheckpoint,
+    ) -> Result<(), StoreError> {
+        if checkpoint.pg_id != PgId::new(self.pg_id) {
+            return Err(StoreError::MetadataCheckpointInvalid {
+                node_id: 0,
+                pg_id: self.pg_id,
+                cluster_epoch: checkpoint.cluster_epoch,
+                reason: format!(
+                    "checkpoint PG {} does not match store PG {}",
+                    checkpoint.pg_id.get(),
+                    self.pg_id
+                ),
+            });
+        }
+        checkpoint
+            .verify()
+            .map_err(|error| StoreError::MetadataCheckpointInvalid {
+                node_id: 0,
+                pg_id: self.pg_id,
+                cluster_epoch: checkpoint.cluster_epoch,
+                reason: format!("{error:?}"),
+            })?;
+        let checkpoint_bytes =
+            encode_metadata_command_checkpoint_payload(checkpoint).map_err(|error| {
+                StoreError::MetadataCheckpointInvalid {
+                    node_id: 0,
+                    pg_id: self.pg_id,
+                    cluster_epoch: checkpoint.cluster_epoch,
+                    reason: error.to_string(),
+                }
+            })?;
+        self.conn
+            .execute(
+                "INSERT INTO metadata_command_checkpoints \
+                 (cluster_epoch, pg_id, applied_log_index, applied_log_hash, state_digest, checkpoint_crc64, checkpoint_bytes) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
+                 ON CONFLICT(cluster_epoch, pg_id, applied_log_index, applied_log_hash, state_digest) \
+                 DO UPDATE SET checkpoint_crc64 = excluded.checkpoint_crc64, checkpoint_bytes = excluded.checkpoint_bytes",
+                rusqlite::params![
+                    checkpoint.cluster_epoch.get() as i64,
+                    checkpoint.pg_id.get() as i64,
+                    checkpoint.applied_log_index as i64,
+                    checkpoint.applied_log_hash as i64,
+                    checkpoint.state_digest as i64,
+                    checkpoint.checkpoint_crc64 as i64,
+                    checkpoint_bytes,
+                ],
+            )
+            .map_err(|source| StoreError::Db {
+                context: "record metadata command checkpoint",
+                source,
+            })?;
+        Ok(())
+    }
+
+    pub fn metadata_command_checkpoint_candidates(
+        &self,
+        cluster_epoch: ClusterEpoch,
+        max_applied_log_index: u64,
+        limit: usize,
+    ) -> Result<Vec<MetadataCommandCheckpoint>, StoreError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let max_applied_log_index_sql = i64::try_from(max_applied_log_index).unwrap_or(i64::MAX);
+        let mut checkpoints = Vec::new();
+        let mut stmt = self
+            .conn
+            .prepare_cached(
+                "SELECT applied_log_index, applied_log_hash, state_digest, checkpoint_crc64, checkpoint_bytes \
+                 FROM metadata_command_checkpoints \
+                 WHERE cluster_epoch = ?1 AND pg_id = ?2 AND applied_log_index <= ?3 \
+                 ORDER BY applied_log_index DESC, applied_log_hash DESC, state_digest DESC",
+            )
+            .map_err(|source| StoreError::Db {
+                context: "prepare metadata command checkpoint candidate scan",
+                source,
+            })?;
+        let rows = stmt
+            .query_map(
+                rusqlite::params![
+                    cluster_epoch.get() as i64,
+                    self.pg_id as i64,
+                    max_applied_log_index_sql,
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, Vec<u8>>(4)?,
+                    ))
+                },
+            )
+            .map_err(|source| StoreError::Db {
+                context: "scan metadata command checkpoint candidates",
+                source,
+            })?;
+        for row in rows {
+            let (
+                raw_applied_log_index,
+                raw_applied_log_hash,
+                raw_state_digest,
+                raw_checkpoint_crc64,
+                checkpoint_bytes,
+            ) = row.map_err(|source| StoreError::Db {
+                context: "decode metadata command checkpoint candidate row",
+                source,
+            })?;
+            let Ok(applied_log_index) = decode_nonnegative_u64(
+                "decode metadata command checkpoint candidate log index",
+                raw_applied_log_index,
+            ) else {
+                continue;
+            };
+            let checkpoint = match decode_metadata_command_checkpoint_payload(&checkpoint_bytes) {
+                Ok(checkpoint) => checkpoint,
+                Err(_) => continue,
+            };
+            if checkpoint.cluster_epoch != cluster_epoch
+                || checkpoint.pg_id != PgId::new(self.pg_id)
+                || checkpoint.applied_log_index != applied_log_index
+                || checkpoint.applied_log_hash != raw_applied_log_hash as u64
+                || checkpoint.state_digest != raw_state_digest as u64
+                || checkpoint.checkpoint_crc64 != raw_checkpoint_crc64 as u64
+                || checkpoint.verify().is_err()
+            {
+                continue;
+            }
+            checkpoints.push(checkpoint);
+            if checkpoints.len() == limit {
+                break;
+            }
+        }
+        Ok(checkpoints)
     }
 
     fn validate_metadata_command_checkpoint_state_read_only(

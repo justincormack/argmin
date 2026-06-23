@@ -2455,6 +2455,70 @@ fn metadata_command_checkpoint_exports_checked_table_digest_summary() {
 }
 
 #[test]
+fn metadata_command_checkpoint_catalogue_persists_and_lists_newest_valid_candidates() {
+    let tmp = test_util::tempdir();
+    let store = PgStore::open(tmp.path(), 1).unwrap();
+    let first_bucket = trusted_bucket_name("metadata-checkpoint-catalogue-first");
+    let second_bucket = trusted_bucket_name("metadata-checkpoint-catalogue-second");
+    let first_command = create_bucket_probe_command(1, 1, first_bucket, 1);
+    store
+        .apply_metadata_command_and_record(0, &first_command)
+        .unwrap();
+    let first_checkpoint = store
+        .record_current_metadata_command_checkpoint(0, ClusterEpoch::INITIAL)
+        .unwrap();
+    let second_command = create_bucket_probe_command(1, 2, second_bucket, 2);
+    store
+        .apply_metadata_command_and_record(0, &second_command)
+        .unwrap();
+    let second_checkpoint = store
+        .record_current_metadata_command_checkpoint(0, ClusterEpoch::INITIAL)
+        .unwrap();
+
+    let candidates = store
+        .metadata_command_checkpoint_candidates(ClusterEpoch::INITIAL, u64::MAX, 8)
+        .unwrap();
+    assert_eq!(
+        candidates
+            .iter()
+            .map(|checkpoint| checkpoint.applied_log_index)
+            .collect::<Vec<_>>(),
+        vec![
+            second_checkpoint.applied_log_index,
+            first_checkpoint.applied_log_index
+        ]
+    );
+    drop(store);
+
+    let store = PgStore::open(tmp.path(), 1).unwrap();
+    let bounded_candidates = store
+        .metadata_command_checkpoint_candidates(
+            ClusterEpoch::INITIAL,
+            second_checkpoint.applied_log_index - 1,
+            8,
+        )
+        .unwrap();
+    assert_eq!(bounded_candidates, vec![first_checkpoint.clone()]);
+
+    store
+        .connection()
+        .execute(
+            "UPDATE metadata_command_checkpoints SET checkpoint_bytes = X'00' \
+             WHERE cluster_epoch = ?1 AND pg_id = ?2 AND applied_log_index = ?3",
+            rusqlite::params![
+                ClusterEpoch::INITIAL.get() as i64,
+                1_i64,
+                second_checkpoint.applied_log_index as i64,
+            ],
+        )
+        .unwrap();
+    let candidates = store
+        .metadata_command_checkpoint_candidates(ClusterEpoch::INITIAL, u64::MAX, 8)
+        .unwrap();
+    assert_eq!(candidates, vec![first_checkpoint]);
+}
+
+#[test]
 fn metadata_command_checkpoint_verification_rejects_tampered_row_payload() {
     let tmp = test_util::tempdir();
     let store = PgStore::open(tmp.path(), 1).unwrap();

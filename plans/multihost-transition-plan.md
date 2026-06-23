@@ -8279,6 +8279,14 @@ Metadata PG migration and backfill design notes:
   admin path still has no durable checkpoint catalogue to pass in, so
   persisting/selecting retained historical checkpoints remains the next storage
   piece.
+- Added the first local durable metadata-checkpoint catalogue. Each PG store
+  can persist verified checkpoint payloads keyed by source epoch, PG, log
+  index/hash, and state digest, then list newest valid candidates bounded by a
+  source log index. Corrupt or identity-mismatched catalogue rows are skipped
+  as candidate-local failures so an older valid checkpoint can still be used.
+  The next step is to expose this catalogue through the storage-node boundary
+  and feed it into the live transfer selector instead of passing in-memory test
+  candidates.
 
 Exit criteria:
 

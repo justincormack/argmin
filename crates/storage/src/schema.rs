@@ -678,6 +678,25 @@ CREATE TABLE IF NOT EXISTS metadata_command_replica_state (
     state_digest      INTEGER NOT NULL DEFAULT 0
 )";
 
+/// Durable verified metadata checkpoint candidates for future transfer and
+/// compaction paths. The payload is a self-verifying canonical checkpoint
+/// encoding; identity columns allow cheap selection without decoding every row.
+const CREATE_METADATA_COMMAND_CHECKPOINTS_TABLE: &str = "\
+CREATE TABLE IF NOT EXISTS metadata_command_checkpoints (
+    cluster_epoch     INTEGER NOT NULL CHECK (cluster_epoch > 0),
+    pg_id             INTEGER NOT NULL CHECK (pg_id >= 0),
+    applied_log_index INTEGER NOT NULL CHECK (applied_log_index >= 0),
+    applied_log_hash  INTEGER NOT NULL,
+    state_digest      INTEGER NOT NULL,
+    checkpoint_crc64  INTEGER NOT NULL,
+    checkpoint_bytes  BLOB NOT NULL,
+    PRIMARY KEY (cluster_epoch, pg_id, applied_log_index, applied_log_hash, state_digest)
+)";
+
+const CREATE_METADATA_COMMAND_CHECKPOINTS_SELECT_INDEX: &str = "\
+CREATE INDEX IF NOT EXISTS idx_metadata_command_checkpoints_select \
+ON metadata_command_checkpoints (cluster_epoch, pg_id, applied_log_index DESC)";
+
 /// Per-table canonical digest cache used to update replica state cheaply after
 /// command apply. Restart validation recomputes the materialized digest from
 /// the command-owned tables and does not trust this cache.
@@ -778,6 +797,8 @@ pub fn init_pg_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
     conn.execute(CREATE_METADATA_COMMAND_LOG_TABLE, [])?;
     conn.execute(CREATE_METADATA_COMMAND_PENDING_SLOT_TABLE, [])?;
     conn.execute(CREATE_METADATA_COMMAND_REPLICA_STATE_TABLE, [])?;
+    conn.execute(CREATE_METADATA_COMMAND_CHECKPOINTS_TABLE, [])?;
+    conn.execute(CREATE_METADATA_COMMAND_CHECKPOINTS_SELECT_INDEX, [])?;
     conn.execute(CREATE_METADATA_TABLE_DIGESTS_TABLE, [])?;
     conn.execute(CREATE_METADATA_DIGEST_REVISION_TABLE, [])?;
     conn.execute(CREATE_METADATA_DIGEST_BOOTSTRAP_STATE_TABLE, [])?;
