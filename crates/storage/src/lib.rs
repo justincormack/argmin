@@ -72,7 +72,10 @@ pub use node::{
     BucketCreateAttemptOutcome, BucketDeleteFinalizeOutcome, LocalStorageNode, ReclaimWorkItem,
     SharedStorageNode,
 };
-pub use pg_store::{MetadataCommandLogCompactionStatus, MetadataCommandLogStats, PgStore};
+pub use pg_store::{
+    MetadataCheckpointTableDigest, MetadataCommandCheckpoint, MetadataCommandLogCompactionStatus,
+    MetadataCommandLogStats, PgStore,
+};
 pub use pg_topology::PgTopology;
 pub use placement::NodeId;
 pub use s3_types::lifecycle::*;

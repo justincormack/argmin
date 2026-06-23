@@ -3,6 +3,8 @@ use crate::metadata_command::MetadataTransferCommand;
 
 const METADATA_CANONICAL_STATE_ENCODING_VERSION: u8 = 1;
 const METADATA_CANONICAL_PG_STATE_DOMAIN: &[u8] = b"argmin.metadata.pg-state";
+const METADATA_COMMAND_CHECKPOINT_ENCODING_VERSION: u8 = 1;
+const METADATA_COMMAND_CHECKPOINT_DOMAIN: &[u8] = b"argmin.metadata.command-checkpoint";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum MetadataDigestFilter {
@@ -39,6 +41,32 @@ pub struct MetadataCommandLogStats {
 pub enum MetadataCommandLogCompactionStatus {
     /// Compaction is disabled until checkpoint-backed equivalence exists.
     UnsupportedUntilCheckpoint { retained_entries: u64 },
+}
+
+/// Per-table materialized-state digest covered by a metadata checkpoint.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MetadataCheckpointTableDigest {
+    pub table_name: String,
+    pub row_count: u64,
+    pub row_hash_xor: u64,
+    pub row_hash_sum: u64,
+    pub table_digest: u64,
+}
+
+/// Checked summary of a PG metadata replica state.
+///
+/// This is not yet a restorable checkpoint payload. It is the proof envelope
+/// that later materialized row blocks must satisfy before they can be imported.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MetadataCommandCheckpoint {
+    pub cluster_epoch: ClusterEpoch,
+    pub pg_id: PgId,
+    pub applied_log_index: u64,
+    pub applied_log_hash: u64,
+    pub state_digest: u64,
+    pub canonical_state_encoding_version: u8,
+    pub table_digests: Vec<MetadataCheckpointTableDigest>,
+    pub checkpoint_crc64: u64,
 }
 
 fn decode_nonnegative_u64(context: &'static str, raw: i64) -> Result<u64, StoreError> {
@@ -1975,6 +2003,148 @@ impl PgStore {
         Ok(state)
     }
 
+    pub fn metadata_command_checkpoint(
+        &self,
+        node_id: u32,
+        cluster_epoch: ClusterEpoch,
+    ) -> Result<MetadataCommandCheckpoint, StoreError> {
+        let state =
+            self.validate_metadata_command_checkpoint_state_read_only(node_id, cluster_epoch)?;
+        let table_digests = self.metadata_checkpoint_table_digests()?;
+        let state_digest = self.metadata_state_digest_from_checkpoint_tables(&table_digests);
+        if state_digest != state.state_digest {
+            return Err(StoreError::MetadataStateDigestMismatch {
+                node_id,
+                pg_id: self.pg_id,
+                cluster_epoch,
+                expected_digest: state.state_digest,
+                actual_digest: state_digest,
+            });
+        }
+
+        let mut checkpoint = MetadataCommandCheckpoint {
+            cluster_epoch,
+            pg_id: PgId::new(self.pg_id),
+            applied_log_index: state.applied_log_index,
+            applied_log_hash: state.applied_log_hash,
+            state_digest,
+            canonical_state_encoding_version: METADATA_CANONICAL_STATE_ENCODING_VERSION,
+            table_digests,
+            checkpoint_crc64: 0,
+        };
+        checkpoint.checkpoint_crc64 = Self::metadata_command_checkpoint_crc64(&checkpoint);
+        Ok(checkpoint)
+    }
+
+    fn validate_metadata_command_checkpoint_state_read_only(
+        &self,
+        node_id: u32,
+        cluster_epoch: ClusterEpoch,
+    ) -> Result<MetadataCommandReplicaState, StoreError> {
+        let state = self.metadata_command_replica_state()?;
+        let pg_id = PgId::new(self.pg_id);
+        if state.cluster_epoch != cluster_epoch {
+            return Err(StoreError::StaleMetadataCommand {
+                node_id,
+                pg_id: self.pg_id,
+                command_epoch: state.cluster_epoch,
+                current_epoch: cluster_epoch,
+            });
+        }
+        if self
+            .pending_metadata_command_slot(node_id, cluster_epoch)?
+            .is_some()
+        {
+            return Err(StoreError::MetadataCommandContention {
+                context: "export metadata command checkpoint with pending command",
+            });
+        }
+
+        let mut applied_log_hash = 0_u64;
+        for raw_log_index in 1..=state.applied_log_index {
+            let log_index = MetadataCommandLogIndex::new(raw_log_index)
+                .expect("applied metadata command log index is non-zero");
+            let Some(entry) = self.load_metadata_command_log_entry(
+                "load metadata command log entry for checkpoint validation",
+                cluster_epoch,
+                pg_id,
+                log_index,
+            )?
+            else {
+                return Err(StoreError::MetadataCommandLogConflict {
+                    node_id,
+                    pg_id: self.pg_id,
+                    cluster_epoch,
+                    log_index: raw_log_index,
+                });
+            };
+            self.verify_metadata_command_log_entry(
+                node_id,
+                cluster_epoch,
+                pg_id,
+                log_index,
+                &entry,
+            )?;
+            let expected_log_hash = metadata_command_log_hash(
+                cluster_epoch,
+                pg_id,
+                log_index,
+                applied_log_hash,
+                entry.command_checksum,
+            );
+            match (entry.previous_log_hash, entry.log_hash) {
+                (Some(previous_log_hash), Some(log_hash))
+                    if previous_log_hash == applied_log_hash && log_hash == expected_log_hash => {}
+                (previous_log_hash, log_hash) => {
+                    return Err(StoreError::MetadataCommandLogHashMismatch {
+                        node_id,
+                        pg_id: self.pg_id,
+                        cluster_epoch,
+                        log_index: raw_log_index,
+                        expected_previous_log_hash: applied_log_hash,
+                        actual_previous_log_hash: previous_log_hash.unwrap_or_default(),
+                        expected_log_hash,
+                        actual_log_hash: log_hash.unwrap_or_default(),
+                    });
+                }
+            }
+            applied_log_hash = expected_log_hash;
+        }
+        if applied_log_hash != state.applied_log_hash {
+            return Err(StoreError::MetadataCommandLogHashMismatch {
+                node_id,
+                pg_id: self.pg_id,
+                cluster_epoch,
+                log_index: state.applied_log_index,
+                expected_previous_log_hash: applied_log_hash,
+                actual_previous_log_hash: state.applied_log_hash,
+                expected_log_hash: applied_log_hash,
+                actual_log_hash: state.applied_log_hash,
+            });
+        }
+        if let Some(tail_log_index) =
+            self.metadata_command_log_min_tail_after(cluster_epoch, state.applied_log_index)?
+        {
+            return Err(StoreError::MetadataCommandLogConflict {
+                node_id,
+                pg_id: self.pg_id,
+                cluster_epoch,
+                log_index: tail_log_index,
+            });
+        }
+        let actual_digest = self.metadata_state_digest()?;
+        if state.state_digest != actual_digest {
+            return Err(StoreError::MetadataStateDigestMismatch {
+                node_id,
+                pg_id: self.pg_id,
+                cluster_epoch: state.cluster_epoch,
+                expected_digest: state.state_digest,
+                actual_digest,
+            });
+        }
+        Ok(state)
+    }
+
     fn validate_metadata_command_replay_state_with_pending_cleanup(
         &self,
         node_id: u32,
@@ -3232,6 +3402,26 @@ impl PgStore {
         .map(|value| value.is_some())
     }
 
+    fn metadata_command_log_min_tail_after(
+        &self,
+        cluster_epoch: ClusterEpoch,
+        applied_log_index: u64,
+    ) -> Result<Option<u64>, StoreError> {
+        self.query_row_cached(
+            "SELECT min(log_index) FROM metadata_command_log \
+             WHERE cluster_epoch = ?1 AND pg_id = ?2 AND log_index > ?3",
+            params![
+                cluster_epoch.get() as i64,
+                self.pg_id as i64,
+                applied_log_index as i64,
+            ],
+            "load first metadata command log tail index",
+            |row| row.get::<_, Option<i64>>(0),
+        )?
+        .map(|raw| decode_nonnegative_u64("decode metadata command log tail index", raw))
+        .transpose()
+    }
+
     pub(super) fn metadata_state_digest(&self) -> Result<u64, StoreError> {
         let mut hasher = checksum::crc64::Hasher::new();
         Self::digest_canonical_pg_state_header(&mut hasher);
@@ -3240,6 +3430,61 @@ impl PgStore {
             Self::digest_metadata_table_digest_entry(&mut hasher, table, table_digest);
         }
         Ok(hasher.finalize())
+    }
+
+    fn metadata_state_digest_from_checkpoint_tables(
+        &self,
+        table_digests: &[MetadataCheckpointTableDigest],
+    ) -> u64 {
+        let mut hasher = checksum::crc64::Hasher::new();
+        Self::digest_canonical_pg_state_header(&mut hasher);
+        for (table, checkpoint_table) in METADATA_DIGEST_TABLES.iter().zip(table_digests) {
+            debug_assert_eq!(table.name, checkpoint_table.table_name);
+            Self::digest_metadata_table_digest_entry(
+                &mut hasher,
+                table,
+                checkpoint_table.table_digest,
+            );
+        }
+        hasher.finalize()
+    }
+
+    fn metadata_checkpoint_table_digests(
+        &self,
+    ) -> Result<Vec<MetadataCheckpointTableDigest>, StoreError> {
+        let mut table_digests = Vec::with_capacity(METADATA_DIGEST_TABLES.len());
+        for table in METADATA_DIGEST_TABLES {
+            let stats = self.metadata_table_digest_stats(table)?;
+            table_digests.push(MetadataCheckpointTableDigest {
+                table_name: table.name.to_owned(),
+                row_count: stats.row_count,
+                row_hash_xor: stats.row_hash_xor,
+                row_hash_sum: stats.row_hash_sum,
+                table_digest: metadata_table_digest_from_stats(table, stats),
+            });
+        }
+        Ok(table_digests)
+    }
+
+    fn metadata_command_checkpoint_crc64(checkpoint: &MetadataCommandCheckpoint) -> u64 {
+        let mut hasher = checksum::crc64::Hasher::new();
+        digest_len_prefixed_bytes(&mut hasher, METADATA_COMMAND_CHECKPOINT_DOMAIN);
+        digest_u8(&mut hasher, METADATA_COMMAND_CHECKPOINT_ENCODING_VERSION);
+        digest_u64(&mut hasher, checkpoint.cluster_epoch.get());
+        digest_u64(&mut hasher, checkpoint.pg_id.get() as u64);
+        digest_u64(&mut hasher, checkpoint.applied_log_index);
+        digest_u64(&mut hasher, checkpoint.applied_log_hash);
+        digest_u64(&mut hasher, checkpoint.state_digest);
+        digest_u8(&mut hasher, checkpoint.canonical_state_encoding_version);
+        digest_u64(&mut hasher, checkpoint.table_digests.len() as u64);
+        for table in &checkpoint.table_digests {
+            digest_len_prefixed_bytes(&mut hasher, table.table_name.as_bytes());
+            digest_u64(&mut hasher, table.row_count);
+            digest_u64(&mut hasher, table.row_hash_xor);
+            digest_u64(&mut hasher, table.row_hash_sum);
+            digest_u64(&mut hasher, table.table_digest);
+        }
+        hasher.finalize()
     }
 
     fn digest_canonical_pg_state_header(hasher: &mut checksum::crc64::Hasher) {

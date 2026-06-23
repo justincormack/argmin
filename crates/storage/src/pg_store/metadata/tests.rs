@@ -2383,6 +2383,154 @@ fn initialize_metadata_transfer_matching_state_rejects_unproven_log_tuple() {
 }
 
 #[test]
+fn metadata_command_checkpoint_exports_checked_table_digest_summary() {
+    let tmp = test_util::tempdir();
+    let store = PgStore::open(tmp.path(), 1).unwrap();
+    let first_bucket = trusted_bucket_name("metadata-checkpoint-first");
+    let first_command = create_bucket_probe_command(1, 1, first_bucket, 1);
+    store
+        .apply_metadata_command_and_record(0, &first_command)
+        .unwrap();
+
+    let checkpoint = store
+        .metadata_command_checkpoint(0, ClusterEpoch::INITIAL)
+        .unwrap();
+    let state = store.metadata_command_replica_state().unwrap();
+    assert_eq!(checkpoint.cluster_epoch, state.cluster_epoch);
+    assert_eq!(checkpoint.applied_log_index, state.applied_log_index);
+    assert_eq!(checkpoint.applied_log_hash, state.applied_log_hash);
+    assert_eq!(checkpoint.state_digest, state.state_digest);
+    assert_eq!(checkpoint.canonical_state_encoding_version, 1);
+    assert_eq!(checkpoint.table_digests.len(), METADATA_DIGEST_TABLES.len());
+    assert_ne!(checkpoint.checkpoint_crc64, 0);
+    assert_eq!(
+        checkpoint
+            .table_digests
+            .iter()
+            .map(|table| table.table_name.as_str())
+            .collect::<Vec<_>>(),
+        METADATA_DIGEST_TABLES
+            .iter()
+            .map(|table| table.name)
+            .collect::<Vec<_>>()
+    );
+    assert!(checkpoint
+        .table_digests
+        .iter()
+        .any(|table| table.table_name == "buckets" && table.row_count == 1));
+
+    let second_bucket = trusted_bucket_name("metadata-checkpoint-second");
+    let second_command = create_bucket_probe_command(1, 2, second_bucket, 2);
+    store
+        .apply_metadata_command_and_record(0, &second_command)
+        .unwrap();
+    let updated = store
+        .metadata_command_checkpoint(0, ClusterEpoch::INITIAL)
+        .unwrap();
+    assert_ne!(updated.state_digest, checkpoint.state_digest);
+    assert_ne!(updated.checkpoint_crc64, checkpoint.checkpoint_crc64);
+    assert!(updated
+        .table_digests
+        .iter()
+        .any(|table| table.table_name == "buckets" && table.row_count == 2));
+}
+
+#[test]
+fn metadata_command_checkpoint_rejects_pending_command() {
+    let tmp = test_util::tempdir();
+    let store = PgStore::open(tmp.path(), 1).unwrap();
+    let bucket = trusted_bucket_name("metadata-checkpoint-pending");
+    let command = create_bucket_probe_command(1, 1, bucket.clone(), 1);
+    store
+        .try_insert_pending_metadata_command_slot(0, &command, Some(&bucket))
+        .unwrap();
+
+    let err = store
+        .metadata_command_checkpoint(0, ClusterEpoch::INITIAL)
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        StoreError::MetadataCommandContention {
+            context: "export metadata command checkpoint with pending command"
+        }
+    ));
+}
+
+#[test]
+fn metadata_command_checkpoint_rejects_stale_epoch() {
+    let tmp = test_util::tempdir();
+    let store = PgStore::open(tmp.path(), 1).unwrap();
+    let stale_epoch = ClusterEpoch::new(17).unwrap();
+
+    let err = store
+        .metadata_command_checkpoint(0, stale_epoch)
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        StoreError::StaleMetadataCommand {
+            pg_id: 1,
+            command_epoch: ClusterEpoch::INITIAL,
+            current_epoch,
+            ..
+        } if current_epoch == stale_epoch
+    ));
+}
+
+#[test]
+fn metadata_command_checkpoint_rejects_abandoned_tail_without_recovery_side_effects() {
+    let tmp = test_util::tempdir();
+    let store = PgStore::open(tmp.path(), 1).unwrap();
+    let command =
+        create_bucket_probe_command(1, 1, trusted_bucket_name("checkpoint-abandoned-tail"), 1);
+    store
+        .conn
+        .execute(
+            "INSERT INTO metadata_command_log \
+             (cluster_epoch, pg_id, log_index, command_checksum, command_bytes, abandoned, previous_log_hash, log_hash) \
+             VALUES (?1, ?2, ?3, ?4, ?5, 1, NULL, NULL)",
+            params![
+                ClusterEpoch::INITIAL.get() as i64,
+                1_i64,
+                1_i64,
+                command.abandoned_log_checksum_crc64() as i64,
+                command.abandoned_log_bytes(),
+            ],
+        )
+        .unwrap();
+
+    let before = store.metadata_command_replica_state().unwrap();
+    let err = store
+        .metadata_command_checkpoint(0, ClusterEpoch::INITIAL)
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        StoreError::MetadataCommandLogConflict {
+            pg_id: 1,
+            cluster_epoch: ClusterEpoch::INITIAL,
+            log_index: 1,
+            ..
+        }
+    ));
+    assert_eq!(
+        store.metadata_command_replica_state().unwrap(),
+        before,
+        "checkpoint export must not advance abandoned tails"
+    );
+    let (previous_log_hash, log_hash): (Option<i64>, Option<i64>) = store
+        .conn
+        .query_row(
+            "SELECT previous_log_hash, log_hash \
+             FROM metadata_command_log \
+             WHERE cluster_epoch = ?1 AND pg_id = ?2 AND log_index = ?3",
+            params![ClusterEpoch::INITIAL.get() as i64, 1_i64, 1_i64],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(previous_log_hash, None);
+    assert_eq!(log_hash, None);
+}
+
+#[test]
 fn adopt_metadata_transfer_state_rejects_pending_command() {
     let tmp = test_util::tempdir();
     let store = PgStore::open(tmp.path(), 1).unwrap();

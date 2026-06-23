@@ -5153,9 +5153,9 @@ fn validate_pg_peering_observations(
         };
         if !node.membership.can_serve_primary()
             || node.availability != NodeAvailabilityState::Healthy
-            || !node
+            || node
                 .lease_deadline_ms
-                .is_some_and(|lease_deadline_ms| lease_deadline_ms > now_ms)
+                .is_none_or(|lease_deadline_ms| lease_deadline_ms <= now_ms)
         {
             continue;
         }

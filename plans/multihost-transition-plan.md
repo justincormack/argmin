@@ -8166,6 +8166,16 @@ Metadata PG migration and backfill design notes:
   slice adds materialized checkpoint contents plus an install/validation RPC.
   This keeps the current retained-log transfer path safe while giving the
   checkpoint import work a concrete artifact boundary.
+- Added the first checked metadata checkpoint summary. A PG store can now
+  export a read-only checkpoint envelope that covers the current replica proof,
+  canonical metadata-state encoding version, per-table canonical digest
+  statistics, and a checkpoint CRC. Export fails closed if the replica has a
+  pending metadata command, if replay validation does not match the requested
+  epoch, or if the recomputed table digest summary does not match the stored
+  replica state digest. This still is not a restorable row payload: the next
+  checkpoint slice must carry materialized row blocks, verify them against the
+  summary, and add the storage-node install/validation RPC before checkpoint
+  base artifacts can import instead of failing closed.
 
 Exit criteria:
 
