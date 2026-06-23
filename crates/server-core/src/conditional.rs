@@ -159,8 +159,11 @@ pub enum DeleteCondition {
     /// No condition — unconditional delete.
     #[default]
     None,
-    /// `If-Match: <etag-or-wildcard>` — only delete if the ETag matches.
+    /// HTTP `If-Match: <etag-or-wildcard>` — only delete if the ETag matches.
     IfMatch(EtagMatchList),
+    /// DeleteObjects XML `<ETag>` object identifier — a single exact ETag value,
+    /// not HTTP conditional header syntax.
+    IfMatchObjectEtag(String),
 }
 
 /// Compare a single `ETag` value against an object's etag for equality.
@@ -305,6 +308,13 @@ pub fn check_delete_conditions(cond: &DeleteCondition, etag: &str) -> Result<(),
                 Err(ServerError::PreconditionFailed)
             }
         }
+        DeleteCondition::IfMatchObjectEtag(required_etag) => {
+            if etag_matches_one(required_etag, etag) {
+                Ok(())
+            } else {
+                Err(ServerError::PreconditionFailed)
+            }
+        }
     }
 }
 
@@ -373,6 +383,20 @@ impl WriteCondition {
 }
 
 impl DeleteCondition {
+    /// Construct a condition from the DeleteObjects XML ObjectIdentifier
+    /// `<ETag>` field.
+    ///
+    /// AWS accepts `*` as a wildcard for this field, but does not apply the
+    /// full HTTP `If-Match` comma-list grammar to other values.
+    #[must_use]
+    pub fn from_delete_objects_etag(value: &str) -> Self {
+        if value.trim() == "*" {
+            Self::IfMatch(EtagMatchList::from_header_value(value))
+        } else {
+            Self::IfMatchObjectEtag(value.to_string())
+        }
+    }
+
     #[must_use]
     pub fn is_empty(&self) -> bool {
         matches!(self, Self::None)
@@ -581,6 +605,28 @@ mod tests {
     #[test]
     fn delete_if_match_wildcard_passes() {
         let cond = DeleteCondition::IfMatch("*".into());
+        assert!(check_delete_conditions(&cond, &test_etag()).is_ok());
+    }
+
+    #[test]
+    fn delete_objects_xml_etag_wildcard_matches_any_existing_object() {
+        let cond = DeleteCondition::from_delete_objects_etag("*");
+        assert!(check_delete_conditions(&cond, &test_etag()).is_ok());
+    }
+
+    #[test]
+    fn delete_objects_xml_etag_comma_list_is_specific_not_header_list() {
+        let cond = DeleteCondition::from_delete_objects_etag(&format!(
+            "\"0000000000000000\", {}",
+            test_etag()
+        ));
+        let err = check_delete_conditions(&cond, &test_etag()).unwrap_err();
+        assert!(matches!(err, ServerError::PreconditionFailed));
+    }
+
+    #[test]
+    fn delete_objects_xml_etag_exact_match_passes() {
+        let cond = DeleteCondition::from_delete_objects_etag(&test_etag());
         assert!(check_delete_conditions(&cond, &test_etag()).is_ok());
     }
 

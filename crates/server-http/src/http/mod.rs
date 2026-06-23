@@ -2014,9 +2014,9 @@ impl HttpFrontend {
                     }
 
                     let cond = match e.etag.as_deref() {
-                        Some(etag) => crate::conditional::DeleteCondition::IfMatch(
-                            crate::conditional::EtagMatchList::from_header_value(etag),
-                        ),
+                        Some(etag) => {
+                            crate::conditional::DeleteCondition::from_delete_objects_etag(etag)
+                        }
                         None => crate::conditional::DeleteCondition::None,
                     };
                     entries.push(crate::coordinator::DeleteEntry {

@@ -556,6 +556,72 @@ fn test_multi_object_delete_per_object_if_match() {
 }
 
 #[test]
+fn test_multi_object_delete_etag_wildcard_matches_any_existing_object() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
+        put_object(client, &bucket, "obj", b"body").await;
+
+        let delete = Delete::builder()
+            .set_objects(Some(vec![make_object_id_with_etag("obj", "*")]))
+            .quiet(false)
+            .build()
+            .unwrap();
+        let resp =
+            s3_tests::delete_objects_retrying_operation_aborted(client, &bucket, delete).await;
+
+        assert_eq!(resp.deleted().len(), 1);
+        assert_eq!(resp.deleted()[0].key(), Some("obj"));
+        assert!(resp.errors().is_empty());
+
+        let head = client
+            .head_object()
+            .bucket(&bucket)
+            .key("obj")
+            .send_retrying_operation_aborted("head object after wildcard-etag multi-delete")
+            .await;
+        assert_eq!(err_status(&head), 404);
+
+        s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
+    });
+}
+
+#[test]
+fn test_multi_object_delete_etag_comma_list_is_not_if_match_list() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
+        let put = put_object(client, &bucket, "obj", b"body").await;
+        let etag_list = format!("\"0000000000000000\", {}", put.e_tag().unwrap());
+
+        let delete = Delete::builder()
+            .set_objects(Some(vec![make_object_id_with_etag("obj", &etag_list)]))
+            .quiet(false)
+            .build()
+            .unwrap();
+        let resp =
+            s3_tests::delete_objects_retrying_operation_aborted(client, &bucket, delete).await;
+
+        assert!(resp.deleted().is_empty());
+        assert_eq!(resp.errors().len(), 1);
+        assert_eq!(resp.errors()[0].key(), Some("obj"));
+        assert_eq!(resp.errors()[0].code(), Some("PreconditionFailed"));
+
+        client
+            .head_object()
+            .bucket(&bucket)
+            .key("obj")
+            .send_retrying_operation_aborted("head object after comma-etag multi-delete")
+            .await
+            .unwrap();
+
+        delete_all_and_bucket(client, &bucket, &["obj".to_string()]).await;
+    });
+}
+
+#[test]
 fn test_multi_object_delete_key_limit() {
     s3_tests::run(async {
         let client = CTX.client();
