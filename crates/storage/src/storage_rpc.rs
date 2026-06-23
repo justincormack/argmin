@@ -221,6 +221,7 @@ const STORAGE_RPC_MAX_METADATA_COMMAND_LOG_HASH_RANGE_PAYLOAD_LEN: usize =
 // Keep the worst-case all-applied retained-entry response within the 64 MiB
 // frame cap after success-response wrapping.
 pub(crate) const STORAGE_RPC_MAX_METADATA_COMMAND_LOG_ENTRY_RANGE_ENTRIES: u64 = 31;
+pub(crate) const STORAGE_RPC_MAX_METADATA_COMMAND_CHECKPOINT_CANDIDATES: usize = 4;
 const STORAGE_RPC_MAX_METADATA_COMMAND_BYTES_LEN: usize = 2 * 1024 * 1024;
 const STORAGE_RPC_MAX_METADATA_CHECKPOINT_TABLES: usize = 128;
 const STORAGE_RPC_MAX_METADATA_CHECKPOINT_COLUMNS: usize = 256;
@@ -565,6 +566,7 @@ pub(crate) enum StorageRpcMessageKind {
     MetadataCommandTransferMatchingStateInitialize = 148,
     MetadataCommandTransferCheckpointBaseInstall = 149,
     MetadataCommandCheckpointExport = 150,
+    MetadataCommandCheckpointCandidates = 151,
     MetadataCommandAppliedLogHashes = 25,
     MetadataCommandMatchingAppliedLog = 26,
     MetadataCommandAbandoned = 27,
@@ -789,6 +791,7 @@ impl StorageRpcMessageKind {
                 "metadata command transfer checkpoint base install"
             }
             Self::MetadataCommandCheckpointExport => "metadata command checkpoint export",
+            Self::MetadataCommandCheckpointCandidates => "metadata command checkpoint candidates",
             Self::MetadataCommandAppliedLogHashes => "metadata command applied log hashes",
             Self::MetadataCommandMatchingAppliedLog => "metadata command matching applied log",
             Self::MetadataCommandRetainedLogHashes => "metadata command retained log hashes",
@@ -962,6 +965,7 @@ impl StorageRpcMessageKind {
             148 => Ok(Self::MetadataCommandTransferMatchingStateInitialize),
             149 => Ok(Self::MetadataCommandTransferCheckpointBaseInstall),
             150 => Ok(Self::MetadataCommandCheckpointExport),
+            151 => Ok(Self::MetadataCommandCheckpointCandidates),
             25 => Ok(Self::MetadataCommandAppliedLogHashes),
             26 => Ok(Self::MetadataCommandMatchingAppliedLog),
             27 => Ok(Self::MetadataCommandAbandoned),
@@ -1175,6 +1179,12 @@ pub(crate) enum StorageRpcPayloadError {
     InvalidChecksumMetadata(&'static str),
     #[error("invalid response envelope: {0}")]
     InvalidResponseEnvelope(&'static str),
+    #[error("invalid {field}: count {count} exceeds maximum {max}")]
+    InvalidCount {
+        field: &'static str,
+        count: u64,
+        max: u64,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2728,6 +2738,20 @@ pub(crate) struct StorageRpcMetadataCommandCheckpointResponse {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StorageRpcMetadataCommandCheckpointCandidatesRequest {
+    pub(crate) node_id: NodeId,
+    pub(crate) cluster_epoch: ClusterEpoch,
+    pub(crate) pg_id: PgId,
+    pub(crate) max_applied_log_index: u64,
+    pub(crate) limit: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StorageRpcMetadataCommandCheckpointCandidatesResponse {
+    pub(crate) checkpoints: Vec<MetadataCommandCheckpoint>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StorageRpcMetadataCommandLogHashRangeRequest {
     pub(crate) node_id: NodeId,
     pub(crate) cluster_epoch: ClusterEpoch,
@@ -3396,6 +3420,9 @@ fn message_kind_request_max_payload_len(
         | StorageRpcMessageKind::MetadataCommandReplicaStateCanInitialize
         | StorageRpcMessageKind::MetadataCommandCheckpointExport => {
             STORAGE_RPC_MAX_METADATA_COMMAND_STATE_PAYLOAD_LEN
+        }
+        StorageRpcMessageKind::MetadataCommandCheckpointCandidates => {
+            STORAGE_RPC_MAX_METADATA_COMMAND_STATE_PAYLOAD_LEN + 8 + 4
         }
         StorageRpcMessageKind::MetadataCommandTransferEmptyStateInitialize => {
             STORAGE_RPC_MAX_METADATA_COMMAND_STATE_PAYLOAD_LEN + 8
@@ -8753,6 +8780,89 @@ pub(crate) fn decode_metadata_command_checkpoint_response(
     let checkpoint = decode_metadata_command_checkpoint(&mut decoder)?;
     decoder.finish()?;
     Ok(StorageRpcMetadataCommandCheckpointResponse { checkpoint })
+}
+
+pub(crate) fn encode_metadata_command_checkpoint_candidates_request(
+    request: &StorageRpcMetadataCommandCheckpointCandidatesRequest,
+) -> Vec<u8> {
+    let mut out = encode_metadata_command_state_request(&StorageRpcMetadataCommandStateRequest {
+        node_id: request.node_id,
+        cluster_epoch: request.cluster_epoch,
+        pg_id: request.pg_id,
+    });
+    put_u64(&mut out, request.max_applied_log_index);
+    put_u32(&mut out, request.limit);
+    out
+}
+
+pub(crate) fn decode_metadata_command_checkpoint_candidates_request(
+    bytes: &[u8],
+) -> Result<StorageRpcMetadataCommandCheckpointCandidatesRequest, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let node_id = NodeId::new(decoder.read_u32()?);
+    let cluster_epoch = decoder.read_cluster_epoch()?;
+    let pg_id = PgId::new(decoder.read_u32()?);
+    let max_applied_log_index = decoder.read_u64()?;
+    let limit = decoder.read_u32()?;
+    if usize::try_from(limit)
+        .map(|limit| limit > STORAGE_RPC_MAX_METADATA_COMMAND_CHECKPOINT_CANDIDATES)
+        .unwrap_or(true)
+    {
+        return Err(StorageRpcPayloadError::InvalidCount {
+            field: "metadata command checkpoint candidate limit",
+            count: u64::from(limit),
+            max: STORAGE_RPC_MAX_METADATA_COMMAND_CHECKPOINT_CANDIDATES as u64,
+        });
+    }
+    decoder.finish()?;
+    Ok(StorageRpcMetadataCommandCheckpointCandidatesRequest {
+        node_id,
+        cluster_epoch,
+        pg_id,
+        max_applied_log_index,
+        limit,
+    })
+}
+
+pub(crate) fn encode_metadata_command_checkpoint_candidates_response(
+    response: &StorageRpcMetadataCommandCheckpointCandidatesResponse,
+) -> Result<Vec<u8>, StorageRpcPayloadError> {
+    if response.checkpoints.len() > STORAGE_RPC_MAX_METADATA_COMMAND_CHECKPOINT_CANDIDATES {
+        return Err(StorageRpcPayloadError::InvalidCount {
+            field: "metadata command checkpoint candidate count",
+            count: response.checkpoints.len() as u64,
+            max: STORAGE_RPC_MAX_METADATA_COMMAND_CHECKPOINT_CANDIDATES as u64,
+        });
+    }
+    let mut out = Vec::new();
+    put_u32(&mut out, checked_u32_len(response.checkpoints.len())?);
+    for checkpoint in &response.checkpoints {
+        encode_metadata_command_checkpoint(&mut out, checkpoint)?;
+    }
+    Ok(out)
+}
+
+pub(crate) fn decode_metadata_command_checkpoint_candidates_response(
+    bytes: &[u8],
+) -> Result<StorageRpcMetadataCommandCheckpointCandidatesResponse, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let count = decoder.read_u32()?;
+    if usize::try_from(count)
+        .map(|count| count > STORAGE_RPC_MAX_METADATA_COMMAND_CHECKPOINT_CANDIDATES)
+        .unwrap_or(true)
+    {
+        return Err(StorageRpcPayloadError::InvalidCount {
+            field: "metadata command checkpoint candidate count",
+            count: u64::from(count),
+            max: STORAGE_RPC_MAX_METADATA_COMMAND_CHECKPOINT_CANDIDATES as u64,
+        });
+    }
+    let mut checkpoints = Vec::with_capacity(count as usize);
+    for _ in 0..count {
+        checkpoints.push(decode_metadata_command_checkpoint(&mut decoder)?);
+    }
+    decoder.finish()?;
+    Ok(StorageRpcMetadataCommandCheckpointCandidatesResponse { checkpoints })
 }
 
 pub(crate) fn encode_metadata_command_checkpoint_payload(
@@ -16718,6 +16828,27 @@ mod tests {
         let decoded = decode_metadata_command_checkpoint_payload(&bytes).unwrap();
 
         assert_eq!(decoded, request.checkpoint);
+
+        let candidates_request = StorageRpcMetadataCommandCheckpointCandidatesRequest {
+            node_id: NodeId::new(7),
+            cluster_epoch: ClusterEpoch::new(3).unwrap(),
+            pg_id: PgId::new(11),
+            max_applied_log_index: 99,
+            limit: STORAGE_RPC_MAX_METADATA_COMMAND_CHECKPOINT_CANDIDATES as u32,
+        };
+        let bytes = encode_metadata_command_checkpoint_candidates_request(&candidates_request);
+        let decoded = decode_metadata_command_checkpoint_candidates_request(&bytes).unwrap();
+
+        assert_eq!(decoded, candidates_request);
+
+        let candidates_response = StorageRpcMetadataCommandCheckpointCandidatesResponse {
+            checkpoints: vec![request.checkpoint],
+        };
+        let bytes =
+            encode_metadata_command_checkpoint_candidates_response(&candidates_response).unwrap();
+        let decoded = decode_metadata_command_checkpoint_candidates_response(&bytes).unwrap();
+
+        assert_eq!(decoded, candidates_response);
     }
 
     #[test]

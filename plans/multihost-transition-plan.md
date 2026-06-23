@@ -8284,9 +8284,14 @@ Metadata PG migration and backfill design notes:
   index/hash, and state digest, then list newest valid candidates bounded by a
   source log index. Corrupt or identity-mismatched catalogue rows are skipped
   as candidate-local failures so an older valid checkpoint can still be used.
-  The next step is to expose this catalogue through the storage-node boundary
-  and feed it into the live transfer selector instead of passing in-memory test
-  candidates.
+- Exposed durable metadata-checkpoint candidates through the storage-node Unix
+  RPC boundary and wired live metadata transfer export to fetch the source
+  replica's newest bounded candidates after retained-log export falls into a
+  checkpoint-compatible failure. The selector now uses durable checkpoint-plus-
+  suffix artifacts when available and keeps the full-checkpoint fallback for
+  sources with no usable catalogue entry. The remaining storage piece is
+  deciding where routine checkpoint creation is scheduled so long-lived PGs
+  naturally accumulate useful transfer bases before reshuffles.
 
 Exit criteria:
 

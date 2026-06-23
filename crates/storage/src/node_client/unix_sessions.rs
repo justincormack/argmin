@@ -810,6 +810,48 @@ impl MetadataCommandNodeClient for UnixStorageNodeMetadataCommandSession {
             })
     }
 
+    fn metadata_command_checkpoint_candidates(
+        &self,
+        pg_id: PgId,
+        cluster_epoch: ClusterEpoch,
+        max_applied_log_index: u64,
+        limit: usize,
+    ) -> Result<Vec<MetadataCommandCheckpoint>, StoreError> {
+        if cluster_epoch > self.cluster_epoch {
+            return Err(StoreError::StalePayloadOperation {
+                pg_id: pg_id.get(),
+                operation_epoch: cluster_epoch,
+                current_epoch: self.cluster_epoch,
+            });
+        }
+        let limit = u32::try_from(limit).map_err(|_| StoreError::StorageRpc {
+            operation: "metadata command checkpoint candidates",
+            node_id: self.node_id.as_u32(),
+            message: format!("checkpoint candidate limit {limit} exceeds u32::MAX"),
+        })?;
+        let payload = encode_metadata_command_checkpoint_candidates_request(
+            &StorageRpcMetadataCommandCheckpointCandidatesRequest {
+                node_id: self.node_id,
+                cluster_epoch,
+                pg_id,
+                max_applied_log_index,
+                limit,
+            },
+        );
+        let response = self.rpc_request(
+            StorageRpcMessageKind::MetadataCommandCheckpointCandidates,
+            payload,
+        )?;
+        decode_metadata_command_checkpoint_candidates_response(&response)
+            .map(|response| response.checkpoints)
+            .map_err(|error| {
+                self.rpc_payload_error(
+                    "decode metadata command checkpoint candidates response",
+                    error.to_string(),
+                )
+            })
+    }
+
     fn validate_metadata_command_replay_state(
         &self,
         pg_id: PgId,

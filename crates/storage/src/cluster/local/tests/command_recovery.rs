@@ -3744,6 +3744,78 @@ fn metadata_transfer_live_export_prefers_checkpoint_suffix_candidate() {
 }
 
 #[test]
+fn metadata_transfer_live_export_uses_durable_checkpoint_candidate() {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[1], ec_shape).unwrap();
+    let topology = map
+        .node(NodeId::new(0))
+        .unwrap()
+        .storage_node()
+        .pg_topology();
+    let first_bucket = bucket_for_pg(topology, 1, "metadata-transfer-durable-first-");
+    let second_bucket = bucket_for_pg(topology, 1, "metadata-transfer-durable-second-");
+    set_route_primary(&mut map, 1, NodeId::new(0));
+    set_route_state(&mut map, 1, PgState::Peering);
+    let pg_id = PgId::new(1);
+    let source_pg = map
+        .node(NodeId::new(0))
+        .unwrap()
+        .storage_node()
+        .get_pg(1)
+        .unwrap();
+    let first = create_bucket_metadata_command(pg_id, 1, first_bucket);
+    source_pg
+        .apply_metadata_command_and_record(0, &first)
+        .unwrap();
+    let checkpoint = source_pg
+        .record_current_metadata_command_checkpoint(0, ClusterEpoch::INITIAL)
+        .unwrap();
+    let second = create_bucket_metadata_command(pg_id, 2, second_bucket);
+    source_pg
+        .apply_metadata_command_and_record(0, &second)
+        .unwrap();
+    let source_state = source_pg.metadata_command_replica_state().unwrap();
+    source_pg
+        .connection()
+        .execute(
+            "UPDATE metadata_command_log SET post_state_digest = NULL WHERE cluster_epoch = ?1 AND pg_id = ?2 AND log_index = ?3",
+            rusqlite::params![ClusterEpoch::INITIAL.get() as i64, pg_id.get() as i64, 1_i64],
+        )
+        .unwrap();
+    drop(source_pg);
+
+    let cluster = crate::StorageCluster::from_local_map(Arc::new(map)).unwrap();
+    let artifact = cluster
+        .export_pg_metadata_transfer_artifact_for_live_transfer(pg_id, NodeId::new(0))
+        .unwrap();
+
+    assert_eq!(
+        artifact.source_base_kind(),
+        crate::peering::PgMetadataTransferBaseKind::Checkpoint
+    );
+    assert_eq!(
+        artifact.source_base_metadata_proof(),
+        crate::control_plane::PgMetadataProof::new(
+            checkpoint.applied_log_index,
+            checkpoint.applied_log_hash,
+            checkpoint.state_digest,
+        )
+    );
+    assert_eq!(artifact.retained_log_entries.len(), 1);
+    assert_eq!(artifact.retained_log_entries[0].log_index, 2);
+    assert_eq!(
+        artifact.source_metadata_proof(),
+        crate::control_plane::PgMetadataProof::new(
+            source_state.applied_log_index,
+            source_state.applied_log_hash,
+            source_state.state_digest,
+        )
+    );
+}
+
+#[test]
 fn metadata_transfer_live_export_checkpoint_candidates_do_not_mask_hard_source_error() {
     let tmp = test_util::tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];

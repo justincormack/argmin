@@ -59,6 +59,7 @@ use crate::storage_rpc::{
     decode_lifecycle_sweep_claim_heartbeat_request, decode_lifecycle_sweep_claim_record_request,
     decode_lifecycle_sweep_roots_request, decode_list_multipart_uploads_request,
     decode_list_object_versions_request, decode_list_objects_request,
+    decode_metadata_command_checkpoint_candidates_request,
     decode_metadata_command_log_entry_range_request,
     decode_metadata_command_log_hash_range_request,
     decode_metadata_command_matching_applied_request, decode_metadata_command_next_id_request,
@@ -117,8 +118,8 @@ use crate::storage_rpc::{
     encode_list_multipart_uploads_response, encode_list_object_versions_response,
     encode_list_objects_response, encode_metadata_command_acceptance_response,
     encode_metadata_command_applied_hashes_response, encode_metadata_command_bool_outcome_response,
-    encode_metadata_command_bool_response, encode_metadata_command_checkpoint_response,
-    encode_metadata_command_log_entry_range_response,
+    encode_metadata_command_bool_response, encode_metadata_command_checkpoint_candidates_response,
+    encode_metadata_command_checkpoint_response, encode_metadata_command_log_entry_range_response,
     encode_metadata_command_log_hash_range_response,
     encode_metadata_command_max_log_index_response, encode_metadata_command_next_id_response,
     encode_metadata_command_pending_envelope_response,
@@ -200,12 +201,13 @@ use crate::storage_rpc::{
     StorageRpcMetadataCommandAcceptanceOutcome, StorageRpcMetadataCommandAcceptanceResponse,
     StorageRpcMetadataCommandAppliedHashesOutcome, StorageRpcMetadataCommandAppliedHashesResponse,
     StorageRpcMetadataCommandBoolOutcome, StorageRpcMetadataCommandBoolOutcomeResponse,
-    StorageRpcMetadataCommandBoolResponse, StorageRpcMetadataCommandCheckpointResponse,
-    StorageRpcMetadataCommandLogEntryRangeResponse, StorageRpcMetadataCommandLogHashRangeRequest,
-    StorageRpcMetadataCommandLogHashRangeResponse, StorageRpcMetadataCommandMatchingAppliedRequest,
-    StorageRpcMetadataCommandMaxLogIndexResponse, StorageRpcMetadataCommandNextIdOutcome,
-    StorageRpcMetadataCommandNextIdRequest, StorageRpcMetadataCommandNextIdResponse,
-    StorageRpcMetadataCommandPendingEnvelopeResponse,
+    StorageRpcMetadataCommandBoolResponse, StorageRpcMetadataCommandCheckpointCandidatesRequest,
+    StorageRpcMetadataCommandCheckpointCandidatesResponse,
+    StorageRpcMetadataCommandCheckpointResponse, StorageRpcMetadataCommandLogEntryRangeResponse,
+    StorageRpcMetadataCommandLogHashRangeRequest, StorageRpcMetadataCommandLogHashRangeResponse,
+    StorageRpcMetadataCommandMatchingAppliedRequest, StorageRpcMetadataCommandMaxLogIndexResponse,
+    StorageRpcMetadataCommandNextIdOutcome, StorageRpcMetadataCommandNextIdRequest,
+    StorageRpcMetadataCommandNextIdResponse, StorageRpcMetadataCommandPendingEnvelopeResponse,
     StorageRpcMetadataCommandPendingSlotInsertOutcome,
     StorageRpcMetadataCommandPendingSlotInsertResponse,
     StorageRpcMetadataCommandPendingSlotRemoveResponse,
@@ -871,6 +873,7 @@ impl Drop for StorageNodeControlPlaneRefreshLoop {
 }
 
 fn encode_metadata_command_checkpoint_success_response(
+    operation: &'static str,
     payload: &[u8],
     max_payload_len: usize,
 ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
@@ -881,7 +884,7 @@ fn encode_metadata_command_checkpoint_success_response(
     encode_storage_rpc_error_response(&StorageRpcErrorResponse {
         code: StorageRpcErrorCode::ResourceExhausted,
         message: format!(
-            "metadata command checkpoint export response is too large: {} bytes exceeds storage RPC payload limit {} bytes",
+            "{operation} response is too large: {} bytes exceeds storage RPC payload limit {} bytes",
             response.len(),
             max_payload_len
         ),
@@ -2650,6 +2653,17 @@ impl StorageNodeConnectionHandler {
             StorageRpcMessageKind::MetadataCommandCheckpointExport => {
                 match decode_metadata_command_state_request(&frame.payload) {
                     Ok(request) => self.metadata_command_checkpoint_response(session, request),
+                    Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
+                        code: StorageRpcErrorCode::PayloadDecode,
+                        message: error.to_string(),
+                    }),
+                }
+            }
+            StorageRpcMessageKind::MetadataCommandCheckpointCandidates => {
+                match decode_metadata_command_checkpoint_candidates_request(&frame.payload) {
+                    Ok(request) => {
+                        self.metadata_command_checkpoint_candidates_response(session, request)
+                    }
                     Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
                         code: StorageRpcErrorCode::PayloadDecode,
                         message: error.to_string(),
@@ -7513,6 +7527,42 @@ impl StorageNodeConnectionHandler {
                     &StorageRpcMetadataCommandCheckpointResponse { checkpoint },
                 )?;
                 encode_metadata_command_checkpoint_success_response(
+                    "metadata command checkpoint export",
+                    &payload,
+                    STORAGE_RPC_MAX_PAYLOAD_LEN,
+                )?
+            }
+            Err(error) => encode_storage_rpc_error_response(&store_error_response(error))?,
+        };
+        Ok(response)
+    }
+
+    fn metadata_command_checkpoint_candidates_response(
+        &self,
+        session: &StorageNodeSession<'_>,
+        request: StorageRpcMetadataCommandCheckpointCandidatesRequest,
+    ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
+        if let Err(error) = self.validate_pg_route_for_metadata_log_read(
+            request.node_id,
+            request.cluster_epoch,
+            request.pg_id,
+        ) {
+            return encode_storage_rpc_error_response(&error);
+        }
+        let _pg_guard = self.metadata_command_pg_guard(session, request.pg_id);
+        let response = match self.node.get_pg(request.pg_id.get()).and_then(|pg| {
+            pg.metadata_command_checkpoint_candidates(
+                request.cluster_epoch,
+                request.max_applied_log_index,
+                request.limit as usize,
+            )
+        }) {
+            Ok(checkpoints) => {
+                let payload = encode_metadata_command_checkpoint_candidates_response(
+                    &StorageRpcMetadataCommandCheckpointCandidatesResponse { checkpoints },
+                )?;
+                encode_metadata_command_checkpoint_success_response(
+                    "metadata command checkpoint candidates",
                     &payload,
                     STORAGE_RPC_MAX_PAYLOAD_LEN,
                 )?
@@ -11471,15 +11521,24 @@ mod tests {
 
     #[test]
     fn metadata_checkpoint_success_response_returns_structured_error_when_frame_too_large() {
-        let success = encode_metadata_command_checkpoint_success_response(b"ok", 256).unwrap();
+        let success = encode_metadata_command_checkpoint_success_response(
+            "metadata command checkpoint export",
+            b"ok",
+            256,
+        )
+        .unwrap();
         assert_eq!(
             decode_storage_rpc_response_payload(&success).unwrap(),
             Ok(b"ok".to_vec())
         );
 
         let oversized_payload = vec![42; 300];
-        let response =
-            encode_metadata_command_checkpoint_success_response(&oversized_payload, 256).unwrap();
+        let response = encode_metadata_command_checkpoint_success_response(
+            "metadata command checkpoint export",
+            &oversized_payload,
+            256,
+        )
+        .unwrap();
         let error = decode_storage_rpc_response_payload(&response)
             .unwrap()
             .unwrap_err();
@@ -11491,6 +11550,21 @@ mod tests {
         assert!(error
             .message
             .contains("exceeds storage RPC payload limit 256 bytes"));
+
+        let response = encode_metadata_command_checkpoint_success_response(
+            "metadata command checkpoint candidates",
+            &oversized_payload,
+            256,
+        )
+        .unwrap();
+        let error = decode_storage_rpc_response_payload(&response)
+            .unwrap()
+            .unwrap_err();
+
+        assert_eq!(error.code, StorageRpcErrorCode::ResourceExhausted);
+        assert!(error
+            .message
+            .contains("metadata command checkpoint candidates response is too large"));
     }
 
     fn send_frame(
