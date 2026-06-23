@@ -1,0 +1,215 @@
+Invalid active-primary metadata proofs are silently accepted
+Link: https://chatgpt.com/codex/cloud/security/findings/58dd38b38f808191940211f4bc789ddd?sev=&repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin
+Criticality: low (attack path: low)
+Status: fixed
+
+# Resolution
+Fixed in commit [`ceadc0a3`](https://github.com/justincormack/argmin/commit/ceadc0a30ecf07209dd13e12ae3043a714c70dc6) (`Reject invalid active primary heartbeat proofs`).
+
+The finding was valid for the reported commit `9123ccc`: invalid Active observations from the current PG primary were filtered out by `should_record_pg_heartbeat_observation`, which let the heartbeat continue, renew the node lease, and potentially receive a lease-bearing Active handoff route on refresh.
+
+The fix moved active-primary metadata safety checks into `validate_pg_heartbeat_observations`, before heartbeat mutation. When the reporting node is the Active primary for the PG, a pending metadata command now hard-fails the heartbeat, and a below-floor/divergent metadata proof returns `PgActiveMetadataProofMismatch`. The old boolean drop/filter helper was removed, so accepted observations are recorded directly and invalid active-primary state cannot silently renew a serving lease.
+
+Regression coverage was updated in `active_heartbeat_accepts_metadata_progress_after_peering`: the mismatched Active primary heartbeat now fails through `refresh_node_heartbeat`, leaves the previous lease deadline unchanged, and still allows a later valid progressed proof to renew service. Verification for the resolution:
+- `cargo test -p storage control_plane -- --nocapture`
+- `cargo nextest run` passed 5590 tests.
+
+# Metadata
+Repo: justincormack/argmin
+Commit: 9123ccc
+Fixed Commit: ceadc0a3
+Author: justin@specialbusservice.com
+Created: 22/06/2026, 22:18:32
+Assignee: Unassigned
+Signals: Security, Validated, Attack-path
+
+# Summary
+Introduced bug: invalid active-primary heartbeat observations are downgraded from hard errors to silently skipped observations, while the lease/serving decision remains node-wide and the missing-observation handoff path can still return an Active serving route to that same primary.
+Active PG primaries are supposed to prove that their metadata state is at least the accepted active metadata proof and has no pending metadata command before they continue serving. This commit removes that enforcement from validate_pg_heartbeat_observations and moves it into should_record_pg_heartbeat_observation, where failures merely return false. The heartbeat path then skips recording the bad PG observation, but still commits the heartbeat, renews the node lease, and returns serving=true based only on node-level health. During storage-node runtime-map refresh, a missing active-primary observation for the refreshing primary is treated as an activation handoff case and the control plane returns an Active route with the primary lease deadline. As a result, a primary that reports an invalid Active metadata proof can repeatedly renew its lease and continue serving the PG instead of being rejected or forced out of service. This weakens the metadata-integrity guard and can allow stale or divergent metadata state to keep accepting operations, risking lost updates or metadata corruption.
+
+# Validation
+## Rubric
+- [x] Confirm heartbeat validation no longer hard-errors on Active-primary metadata proof/pending-command violations.
+- [x] Confirm should_record_pg_heartbeat_observation downgrades those violations to a boolean false.
+- [x] Dynamically trigger an Active PG primary heartbeat with a metadata proof below the accepted active proof.
+- [x] Verify the invalid PG observation is not recorded while the heartbeat returns serving=true.
+- [x] Verify storage-node refresh for that same primary returns an Active PG route with a primary lease deadline despite the missing observation.
+- [x] Attempt crash-style validation via a failing regression test, attempt valgrind/ASan availability, and capture a debugger trace of the route handoff path.
+## Report
+Validated the finding against commit 9123ccc647a9e524e6e7304732018fc5b6ac6764 with a targeted Rust unit-test PoC in crates/storage/src/control_plane.rs. Code review confirmed the vulnerable chain: validate_pg_heartbeat_observations at crates/storage/src/control_plane.rs:4840-4867 only rejects duplicate/unknown/out-of-acting-set PG observations; should_record_pg_heartbeat_observation at :4869-4893 returns false for an Active primary observation with pending metadata command or a metadata proof below the active floor; heartbeat processing at :2047-2055 silently continues instead of returning an error, then commits the heartbeat and computes HeartbeatLease.serving from node-level state at :2075-2085; active_pg_route_for_storage_node_refresh at :390-420 treats a missing Active observation from the refreshing primary as handoff and returns an Active route with Some(primary_lease_deadline_ms). The passing PoC establishes PG 910 Active with accepted proof index 42, sends an Active primary heartbeat with bad proof index 41, and observed: `POC: lease_serving=true observation_recorded=false route_state=Active route_primary=1 route_deadline=Some(2120)`. This proves the bad observation was dropped, the node lease was renewed as serving, and refresh returned an Active route with a serving deadline to the same primary. A regression-style crash/assertion PoC expecting the safe invariant fails with `BUG: invalid active-primary heartbeat renewed a serving node lease`. Valgrind was attempted but unavailable (`bash: command not found: valgrind`). LLDB was used non-interactively and stopped at crates/storage/src/control_plane.rs:414 in active_pg_route_for_storage_node_refresh, with a backtrace through refresh_node_heartbeat -> runtime_map_for_storage_node_refresh -> pg_routes_for_storage_node_refresh -> active_pg_route_for_storage_node_refresh, confirming the Active route return path during the PoC.
+
+# Evidence
+crates/storage/src/control_plane.rs (L2047 to 2055)
+  Note: When should_record_pg_heartbeat_observation returns false, the heartbeat loop silently continues, dropping the invalid observation while allowing the heartbeat to proceed.
+```
+            record.pg_observations.clear();
+            for observation in &heartbeat.pg_observations {
+                if !should_record_pg_heartbeat_observation(
+                    &self.snapshot,
+                    heartbeat.node_id,
+                    observation,
+                ) {
+                    continue;
+                }
+```
+
+crates/storage/src/control_plane.rs (L2075 to 2085)
+  Note: After dropping the invalid observation, the heartbeat is still committed and serving is computed only from node-level lease/health state, so the node can receive a serving lease.
+```
+        self.commit_snapshot(next_snapshot)?;
+        let serving = self.snapshot.node(heartbeat.node_id).is_some_and(|record| {
+            record.can_serve_primary(self.snapshot.cluster_epoch, authority_now_ms)
+        });
+        Ok(HeartbeatLease {
+            authority_incarnation: self.snapshot.authority_incarnation,
+            cluster_epoch: self.snapshot.cluster_epoch,
+            node_id: heartbeat.node_id,
+            lease_deadline_ms,
+            serving,
+            snapshot: self.snapshot.clone(),
+```
+
+crates/storage/src/control_plane.rs (L390 to 420)
+  Note: A missing active-primary observation is treated as a handoff case for the refreshing primary and returns an Active route with a lease deadline. Dropping invalid observations therefore lets the bad primary keep receiving an Active serving route.
+```
+        match validate_pg_primary_active_observation(self, pg_id, primary) {
+            Ok(()) => {}
+            Err(ControlPlaneError::PgPrimaryMissingActiveObservation { .. })
+                if refreshing_node_id == primary =>
+            {
+                // The selected primary may still be running the previous Peering route
+                // map. Let that primary receive the authoritative Active handoff map
+                // so it can install the route and report the current Active observation.
+            }
+            Err(ControlPlaneError::PgPrimaryMissingActiveObservation { .. }) => {
+                // Other nodes still need the new Active route to converge their local
+                // route maps and keep renewing leases, but they cannot serve as primary
+                // until the selected primary has reported the Active observation.
+                return Ok(PgRouteSnapshot {
+                    cluster_epoch: self.cluster_epoch,
+                    pg_id,
+                    primary_node_id: primary,
+                    acting_set: record.acting_set.clone(),
+                    state: PgState::Active,
+                    primary_lease_deadline_ms: None,
+                });
+            }
+            Err(error) => return Err(error),
+        }
+        Ok(PgRouteSnapshot {
+            cluster_epoch: self.cluster_epoch,
+            pg_id,
+            primary_node_id: primary,
+            acting_set: record.acting_set.clone(),
+            state: PgState::Active,
+            primary_lease_deadline_ms: Some(primary_lease_deadline_ms),
+```
+
+crates/storage/src/control_plane.rs (L4840 to 4867)
+  Note: Heartbeat validation now only checks duplicate/unknown/out-of-acting-set observations; it no longer rejects active-primary observations with pending metadata commands or invalid metadata proofs.
+```
+fn validate_pg_heartbeat_observations(
+    snapshot: &ClusterControlSnapshot,
+    node_id: NodeId,
+    observations: &[NodePgHeartbeatObservation],
+) -> Result<(), ControlPlaneError> {
+    let mut observed_pgs = BTreeSet::new();
+    for observation in observations {
+        if !observed_pgs.insert(observation.pg_id) {
+            return Err(ControlPlaneError::DuplicatePgObservation {
+                node_id: node_id.as_u32(),
+                pg_id: observation.pg_id.get(),
+            });
+        }
+        let pg = snapshot
+            .pgs
+            .get(&observation.pg_id)
+            .ok_or(ControlPlaneError::UnknownPg {
+                pg_id: observation.pg_id.get(),
+            })?;
+        if !pg.acting_set.contains(&node_id) {
+            return Err(ControlPlaneError::PgObservationNotInActingSet {
+                node_id: node_id.as_u32(),
+                pg_id: observation.pg_id.get(),
+            });
+        }
+    }
+    Ok(())
+}
+```
+
+crates/storage/src/control_plane.rs (L4869 to 4893)
+  Note: The active-primary proof check was moved into a boolean filter. Invalid active-primary observations return false instead of producing an error.
+```
+fn should_record_pg_heartbeat_observation(
+    snapshot: &ClusterControlSnapshot,
+    node_id: NodeId,
+    observation: &NodePgHeartbeatObservation,
+) -> bool {
+    let Some(pg) = snapshot.pgs.get(&observation.pg_id) else {
+        return true;
+    };
+    if pg.state != PgState::Active
+        || pg.active_primary != Some(node_id)
+        || observation.state != PgState::Active
+    {
+        return true;
+    }
+    if observation.has_pending_metadata_command {
+        return false;
+    }
+    pg.active_metadata_proof.is_some_and(|expected| {
+        metadata_proof_satisfies_active_primary_observation_floor(
+            expected,
+            observation.metadata_proof,
+            pg.active_metadata_transfer_imported,
+        )
+    })
+}
+```
+
+# Attack-path analysis
+Final: low | Decider: model_decided | Matrix severity: ignore | Policy adjusted: ignore
+## Rationale
+Adjusted down from medium to low for threat-model reachability. The vulnerable logic is real and validated: invalid active-primary PG observations are skipped, the node heartbeat can still renew serving=true, and runtime-map refresh can return an Active route with a lease deadline. But the entry point is an internal control-plane/storage-node Unix-socket heartbeat path, not the public S3 HTTP API; the socket directory is required to be private and same-user owned; and normal external attackers cannot craft the heartbeat fields. The security impact is meaningful metadata integrity/availability risk only under internal compromised-node or faulty-transfer conditions, so likelihood is low while impact remains medium for affected PGs.
+## Likelihood
+low - External S3 clients do not directly control NodeHeartbeat or the control-plane Unix RPC. The control-plane socket is local and protected by private directory permissions. Exploitation requires a compromised/misbehaving storage-node process, local same-user socket access, or a naturally occurring stale metadata state during transfer/backfill. This makes attacker-driven exploitation unlikely under the provided threat model.
+## Impact
+medium - If the internal preconditions are met, the bug can let an active primary with stale/divergent metadata proof or pending metadata command keep a serving lease and Active route. That can affect integrity and availability of metadata/object operations for the affected PG, with possible lost updates or metadata corruption. The impact is bounded by the PGs served by the bad primary and requires internal control-plane/storage-node conditions.
+## Assumptions
+- Analysis is limited to repository artifacts in /workspace/argmin and supplied validation evidence; no cloud APIs or live deployment inspection were used.
+- The earlier threat model treats the S3 HTTP API as the primary attacker-facing surface and treats local OS/filesystem access and internal storage metadata paths as trusted or internal.
+- The vulnerable control-plane heartbeat path is relevant only when the control-plane/storage-node process roles are used, not for a purely legacy-local single-process deployment without dynamic control-plane heartbeats.
+- control-plane/storage-node runtime mode using ARGMIN_CONTROL_PLANE_SOCKET_PATH
+- a storage node able to send or naturally produce an Active PG heartbeat observation with a pending metadata command or metadata proof below the active floor
+- an active PG state in which the same node is selected as active_primary and has a valid node-level lease/health state
+- access to the internal control-plane Unix socket or control over the trusted storage-node process/state
+## Path
+Storage node refresh -> Unix control-plane RPC -> heartbeat() -> drop bad PG observation -> renew serving lease / Active route -> PG metadata integrity risk
+## Path evidence
+- `crates/storage/src/control_plane.rs:4840-4867` - Heartbeat validation only checks duplicate PG observations, unknown PGs, and acting-set membership; it does not reject invalid active-primary metadata proof or pending metadata command.
+- `crates/storage/src/control_plane.rs:4869-4893` - The active-primary metadata proof and pending-command checks are implemented as a boolean recording filter; invalid observations return false rather than an error.
+- `crates/storage/src/control_plane.rs:2047-2055` - Heartbeat processing silently continues when should_record_pg_heartbeat_observation returns false, dropping the invalid PG observation.
+- `crates/storage/src/control_plane.rs:2075-2085` - After dropping the invalid observation, the snapshot is committed and HeartbeatLease.serving is computed from node-level can_serve_primary state.
+- `crates/storage/src/control_plane.rs:390-420` - During storage-node refresh, a missing active-primary observation from the refreshing primary is treated as an Active handoff and can return primary_lease_deadline_ms=Some(...).
+- `crates/storage/src/control_plane.rs:2768-2777` - Control-plane Unix RPC kind RefreshNodeHeartbeat deserializes a NodeHeartbeat and returns both heartbeat lease and runtime map.
+- `crates/storage/src/node.rs:1152-1174` - Storage node heartbeat observations are derived from PG metadata state and include metadata_proof and has_pending_metadata_command.
+- `crates/storage/src/storage_node_server.rs:948-959` - Storage node runtime-map refresh calls refresh_node_heartbeat with the generated heartbeat, demonstrating this is a normal internal runtime path.
+- `crates/argmin-s3/src/main.rs:794-834` - Control-plane process binds and accepts RPCs on a configured Unix socket path.
+- `crates/argmin-s3/src/main.rs:966-1038` - Control-plane socket path must be absolute and the parent directory is created/validated as private and owned by the current user, limiting exposure to local/internal access.
+- `crates/argmin-s3/src/config.rs:101-119` - Configuration documents the default S3 listen address and the control-plane socket/state environment variables.
+- `crates/argmin-s3/src/main.rs:1438-1456` - The externally visible frontend is a TCP listener, separate from the affected Unix-socket control-plane heartbeat path.
+## Narrative
+The finding is real in the control-plane code path: the current heartbeat validator only rejects duplicate, unknown, and out-of-acting-set PG observations. Invalid active-primary metadata state is moved to a boolean recording filter, and heartbeat processing continues when that filter returns false. The heartbeat then commits the node lease and computes serving from node-level health/lease state. Runtime-map refresh can treat the missing active-primary observation from the refreshing primary as a handoff and return an Active route with a lease deadline. Supplied validation evidence executed a targeted Rust PoC showing lease_serving=true, observation_recorded=false, and an Active route deadline for a stale proof. However, reachability is internal: normal external S3 clients do not control NodeHeartbeat fields, and the control-plane RPC is exposed via a private Unix socket rather than a public listener. This supports a real integrity bug with low exploitation likelihood from the stated threat model, below a strong medium security rating for broadly attacker-reachable surfaces.
+## Controls
+- Control-plane RPC is on a Unix-domain socket, not a public TCP listener.
+- Control-plane socket parent directory is required to be private and owned by the process user.
+- Storage-node socket directories are also required to be private.
+- Heartbeat path validates known node, node membership, node incarnation, observed epoch, lease duration, duplicate PG observations, unknown PGs, and acting-set membership.
+- HTTP S3 frontend uses configured credentials/SigV4, but that authn path does not guard the internal control-plane heartbeat RPC.
+- Control-plane worker limits and RPC IO timeouts reduce resource-exhaustion exposure but do not address the metadata-proof validation bypass.
+## Blindspots
+- No deployment manifests were present to confirm whether control-plane/storage-node mode is used in production or whether sockets are ever exposed through containers/volumes to less-trusted principals.
+- Static analysis did not prove an external S3 request sequence that can force a storage node to emit the invalid heartbeat state.
+- The supplied PoC validates the internal Rust/control-plane path, but not a full end-to-end multi-process deployment with real client writes.
+- No cloud, host, or runtime inspection was performed, so actual socket filesystem permissions and process isolation in deployments are unknown.
