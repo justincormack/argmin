@@ -1,0 +1,153 @@
+Suffix metadata transfer mutates empty destinations
+Link: https://chatgpt.com/codex/cloud/security/findings/64d7ae25c06481918b26c8dc5e147a53?sev=&repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin
+Criticality: medium
+Status: fixed
+
+# Resolution
+Fixed in commit [`c72fd88c`](https://github.com/justincormack/argmin/commit/c72fd88c06b0fbc83710ceb8581dee5a0faeab4f) (`Reject metadata transfer suffixes on empty destinations`).
+
+The finding was valid for the reported commit `0c4a217`: the retained-log metadata transfer import path classified an initializable zero-log destination as `Empty` before checking whether the artifact was a true suffix with a non-zero base proof. The `Empty` branch could then replay suffix commands against an empty materialized metadata store and detect the proof mismatch only after mutation, leaving the destination dirty.
+
+The fix makes empty-destination classification prove that the destination's current zero-log proof exactly matches the artifact base proof before returning `MetadataTransferImportDestination::Empty`. Complete-prefix and empty-state imports still work because their base proof is the canonical zero-log destination proof, but true suffix artifacts now require an existing proven base/prefix or fail closed before any replay. A new regression, `metadata_transfer_import_rejects_suffix_into_empty_destination_without_mutation`, constructs a real retained suffix artifact by dropping the first retained log entry, attempts import into empty destination replicas, and verifies both replicas remain at log index/hash `0` with no suffix bucket after rejection.
+
+Verification for the resolution:
+- `cargo test -p storage metadata_transfer -- --nocapture`
+- `bash -n scripts/uat-s3-tests`
+- `cargo nextest run` passed 5601 tests.
+
+# Metadata
+Repo: justincormack/argmin
+Commit: 0c4a217
+Fixed Commit: c72fd88c
+Author: justin@specialbusservice.com
+Created: 23/06/2026, 13:41:02
+Assignee: Unassigned
+Signals: Security, Validated
+
+# Summary
+Introduced. Before this commit, metadata-transfer artifacts required the full retained prefix, so replaying commands into an empty destination was consistent with the artifact base. The commit introduced true suffix artifacts but did not add a guard preventing `Empty` adoption unless the artifact base is actually empty or matches the destination pre-state.
+Retained-suffix artifacts now carry a non-zero base proof derived from the first retained command and rebase only commands after that base to destination log indexes starting at 1. However, destination classification still returns `Empty` for any empty/initializable replica before checking whether the artifact's base proof is the empty proof or whether the first suffix command's pre-state digest matches the destination. In the `Empty` import branch, non-empty command lists are replayed directly against the empty metadata store. For a true suffix artifact, those commands assume prior base metadata exists; some commands, such as creating a new bucket, can still apply successfully to an empty store but produce a different final digest. The final proof mismatch is detected only after replay, so the destination node has already been committed into a partial/dirty metadata state and subsequent retries will fail closed.
+
+# Validation
+## Rubric
+- [x] Confirm the commit can produce retained-suffix artifacts with a non-zero base proof derived from the first retained command.
+- [x] Confirm import rebases only suffix commands to destination log indexes starting at 1 while preserving the source final state digest as the expected imported proof.
+- [x] Confirm empty destination classification accepts zero-log initializable replicas before validating artifact.base_proof or first suffix pre_state_digest compatibility.
+- [x] Confirm the Empty import branch replays non-empty suffix commands before final proof comparison, allowing persistent mutation.
+- [x] Dynamically reproduce a true suffix artifact imported into empty destinations where replay succeeds, final proof mismatch is detected after mutation, and retry fails closed on dirty metadata.
+## Report
+Validated the finding on commit 0c4a217b00832b8c9042e5fe7e37eb71c0e7ce7d. Code inspection confirmed the new suffix artifact path builds a non-empty base proof from the first retained command at crates/storage/src/peering.rs:451-455, then rebases only entries after artifact.base_proof.applied_log_index to destination log indexes starting at 1 at crates/storage/src/peering.rs:585-635. The destination classifier accepts an empty/initializable replica as MetadataTransferImportDestination::Empty solely from zero applied_log_index/hash at crates/storage/src/cluster.rs:1502-1507, before checking whether the suffix base proof is empty or compatible. The Empty import branch replays non-empty commands directly at crates/storage/src/cluster.rs:2626-2639, while expected proof comparison happens only afterward at crates/storage/src/cluster.rs:2720-2731.
+
+I added targeted PoC unit tests to crates/storage/src/cluster/local/tests/command_recovery.rs. The passing PoC constructs source node 0 with two bucket-create metadata commands, deletes retained log index 1 to force a true suffix artifact with base_proof.applied_log_index == 1 and retained entry log_index == 2, then imports into empty destination nodes 1 and 2 at epoch 2. Command: cargo test -p storage poc_metadata_transfer_suffix_import_to_empty_destination_leaves_dirty_state -- --nocapture. Output showed import returned MetadataFork only after replay, while both destination nodes were dirty: applied_log_index: 1, same rebased applied_log_hash, state_digest different from expected, first bucket absent, second suffix bucket present. The retry result was Err(Reconstruction(DirtyMetadataTransferDestination ...)), confirming fail-closed dirty state.
+
+I also ran an invariant/crash PoC expecting safe behavior: RUST_BACKTRACE=1 cargo test -p storage poc_safe_empty_suffix_import_rejected_without_mutation -- --nocapture. It panicked because node 1 was already mutated: assertion left == right failed; left: 1, right: 0; state MetadataCommandReplicaState { cluster_epoch: ClusterEpoch(2), applied_log_index: 1, ... }. This is a test harness panic proving the expected pre-replay rejection/rollback invariant is violated, not a production memory crash.
+
+Valgrind was attempted but unavailable in the container; ASan was attempted but Rust stable rejected -Z sanitizer=address. gdb was unavailable, so I used LLDB non-interactively. LLDB stopped at the failing assertion and frame variable state showed cluster_epoch = 2 and applied_log_index = 1 before the assertion, confirming the mutation path dynamically.
+
+# Evidence
+crates/storage/src/cluster.rs (L1502 to 1507)
+  Note: An empty destination is accepted solely based on zero log state and initializability, without checking that the artifact base proof is empty or that the first suffix pre-state digest matches the destination.
+```
+    if state.applied_log_index == 0
+        && state.applied_log_hash == 0
+        && metadata_client.metadata_command_replica_state_can_initialize(pg_id, cluster_epoch)?
+    {
+        return Ok(MetadataTransferImportDestination::Empty);
+    }
+```
+
+crates/storage/src/cluster.rs (L2628 to 2638)
+  Note: For an `Empty` destination with non-empty commands, the importer directly replays the rebased suffix commands, mutating the metadata store before proving the result is valid.
+```
+                        metadata_client.initialize_metadata_transfer_empty_state(
+                            pg_id,
+                            self.operation_epoch(),
+                            artifact.proof.state_digest,
+                        )?
+                    } else {
+                        let mut state = metadata_client.metadata_command_replica_state(pg_id)?;
+                        for command in &commands {
+                            state = metadata_client
+                                .replay_metadata_command_for_peering(pg_id, &command.command)?;
+                        }
+```
+
+crates/storage/src/cluster.rs (L2720 to 2731)
+  Note: The expected imported proof is checked only after all destination nodes have been processed, so a mismatch is detected after partial mutations have already been committed.
+```
+        let (_reference_node_id, proof) =
+            reference.ok_or(PgPeeringReconstructionError::PrimaryMissing {
+                primary: artifact.source_node_id,
+            })?;
+        if proof != expected_import_proof {
+            return Err(PgPeeringReconstructionError::MetadataFork {
+                node_id: artifact.source_node_id,
+                reference_node_id: artifact.source_node_id,
+                replica: proof,
+                reference: expected_import_proof,
+            }
+            .into());
+```
+
+crates/storage/src/peering.rs (L451 to 455)
+  Note: The new suffix artifact base proof can represent a non-zero source prefix, meaning retained commands may depend on metadata that is not present on an empty destination.
+```
+    let base_proof = PgMetadataProof::new(
+        first_retained_log_index - 1,
+        first_retained.previous_log_hash,
+        base_state_digest,
+    );
+```
+
+crates/storage/src/peering.rs (L585 to 632)
+  Note: Import rebases only commands after `base_proof.applied_log_index`; a true suffix is replayed as fresh destination log entries starting at index 1 rather than including the missing base commands.
+```
+    let mut commands = Vec::new();
+    for log_index in (artifact.base_proof.applied_log_index + 1)..=artifact.proof.applied_log_index
+    {
+        let retained = artifact
+            .retained_log_entries
+            .iter()
+            .find(|entry| entry.log_index == log_index)
+            .ok_or(
+                PgPeeringReconstructionError::MissingRetainedCommandLogEntry {
+                    node_id: artifact.source_node_id,
+                    log_index,
+                },
+            )?;
+        let MetadataCommandLogRangeEntryKind::Applied(command) = &retained.kind else {
+            return Err(
+                PgPeeringReconstructionError::UnreplayableAbandonedCommandLogEntry {
+                    node_id: artifact.source_node_id,
+                    log_index,
+                },
+            );
+        };
+        let Some(pre_state_digest) = retained.pre_state_digest else {
+            return Err(
+                PgPeeringReconstructionError::MissingRetainedCommandStateProof {
+                    node_id: artifact.source_node_id,
+                    pg_id: artifact.pg_id,
+                    log_index,
+                },
+            );
+        };
+        let Some(post_state_digest) = retained.post_state_digest else {
+            return Err(
+                PgPeeringReconstructionError::MissingRetainedCommandStateProof {
+                    node_id: artifact.source_node_id,
+                    pg_id: artifact.pg_id,
+                    log_index,
+                },
+            );
+        };
+        let destination_log_index = log_index
+            .checked_sub(artifact.base_proof.applied_log_index)
+            .expect("retained metadata transfer suffix starts after the base proof");
+        let log_index = MetadataCommandLogIndex::new(destination_log_index)
+            .expect("metadata transfer import log index is non-zero");
+        commands.push(MetadataTransferCommand {
+            command: MetadataCommandEnvelope::new(
+                MetadataCommandId::new(destination_cluster_epoch, artifact.pg_id, log_index),
+                command.payload().clone(),
+```
