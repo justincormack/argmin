@@ -3080,7 +3080,7 @@ fn metadata_transfer_import_rejects_older_prefix_with_unproven_log_hash() {
 }
 
 #[test]
-fn metadata_transfer_import_rejects_checkpoint_base_without_materialized_checkpoint() {
+fn metadata_transfer_import_installs_checkpoint_base() {
     let tmp = test_util::tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
     let ec_shape = EcShape { k: 2, m: 1 };
@@ -3091,6 +3091,7 @@ fn metadata_transfer_import_rejects_checkpoint_base_without_materialized_checkpo
         .storage_node()
         .pg_topology();
     let bucket = bucket_for_pg(topology, 1, "metadata-transfer-checkpoint-base-");
+    let pending_bucket = bucket_for_pg(topology, 1, "metadata-transfer-checkpoint-base-pending-");
     set_route_primary(&mut map, 1, NodeId::new(0));
     set_route_state(&mut map, 1, PgState::Peering);
     let mut map = Arc::new(map);
@@ -3104,10 +3105,32 @@ fn metadata_transfer_import_rejects_checkpoint_base_without_materialized_checkpo
         .unwrap()
         .apply_metadata_command_and_record(0, &command)
         .unwrap();
-    let mut artifact = cluster
-        .export_pg_metadata_transfer_from_retained_log(pg_id, NodeId::new(0))
-        .unwrap();
-    artifact.base_kind = crate::peering::PgMetadataTransferBaseKind::Checkpoint;
+    let checkpoint = {
+        let source_pg = map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .get_pg(1)
+            .unwrap();
+        source_pg
+            .metadata_command_checkpoint(0, ClusterEpoch::INITIAL)
+            .unwrap()
+    };
+    let source_proof = crate::control_plane::PgMetadataProof::new(
+        checkpoint.applied_log_index,
+        checkpoint.applied_log_hash,
+        checkpoint.state_digest,
+    );
+    let artifact = crate::peering::PgMetadataTransferArtifact {
+        pg_id,
+        source_node_id: NodeId::new(0),
+        cluster_epoch: ClusterEpoch::INITIAL,
+        base_kind: crate::peering::PgMetadataTransferBaseKind::Checkpoint,
+        base_proof: source_proof,
+        checkpoint_base: Some(checkpoint),
+        proof: source_proof,
+        retained_log_entries: Vec::new(),
+    };
     drop(cluster);
 
     let destination_epoch = ClusterEpoch::new(2).unwrap();
@@ -3120,26 +3143,82 @@ fn metadata_transfer_import_rejects_checkpoint_base_without_materialized_checkpo
     route.state = PgState::Peering;
     let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
 
+    let proof = cluster
+        .import_pg_metadata_transfer_from_retained_log(&artifact)
+        .unwrap();
+    let expected_proof = crate::StorageCluster::metadata_transfer_imported_proof_at_epoch(
+        &artifact,
+        destination_epoch,
+    )
+    .unwrap();
+    assert_eq!(proof, expected_proof);
+
+    let pending = create_bucket_metadata_command_at_epoch(
+        destination_epoch,
+        pg_id,
+        99,
+        pending_bucket.clone(),
+    );
+    force_insert_pending_metadata_command_for_node_for_test(
+        &map,
+        NodeId::new(2),
+        pg_id,
+        &pending_bucket,
+        &pending,
+    );
     let err = cluster
         .import_pg_metadata_transfer_from_retained_log(&artifact)
         .unwrap_err();
-    assert!(
-        matches!(
-            err,
-            crate::peering::PgPeeringReconstructionFailure::Reconstruction(
-                crate::peering::PgPeeringReconstructionError::UnsupportedMetadataTransferCheckpointBase { .. }
-            )
-        ),
-        "unexpected error: {err:?}"
-    );
+    assert!(matches!(
+        err,
+        crate::peering::PgPeeringReconstructionFailure::Reconstruction(
+            crate::peering::PgPeeringReconstructionError::PendingMetadataCommand { node_id }
+        ) if node_id == NodeId::new(2)
+    ));
+
+    clear_pending_metadata_command_for_node_for_test(&map, NodeId::new(2), pg_id);
+    let retry_proof = cluster
+        .import_pg_metadata_transfer_from_retained_log(&artifact)
+        .unwrap();
+    assert_eq!(retry_proof, expected_proof);
 
     for node_id in [NodeId::new(1), NodeId::new(2)] {
         let pg = map.node(node_id).unwrap().storage_node().get_pg(1).unwrap();
         let state = pg.metadata_command_replica_state().unwrap();
-        assert_eq!(state.cluster_epoch, ClusterEpoch::INITIAL);
+        assert_eq!(state.cluster_epoch, destination_epoch);
         assert_eq!(state.applied_log_index, 0);
-        assert!(crate::PgMetadataStore::head_bucket(&*pg, &bucket).is_err());
+        assert_eq!(state.applied_log_hash, 0);
+        assert_eq!(state.state_digest, expected_proof.state_digest);
+        crate::PgMetadataStore::head_bucket(&*pg, &bucket).unwrap();
     }
+}
+
+#[test]
+fn metadata_transfer_import_rejects_checkpoint_base_without_payload() {
+    let artifact = crate::peering::PgMetadataTransferArtifact {
+        pg_id: PgId::new(1),
+        source_node_id: NodeId::new(0),
+        cluster_epoch: ClusterEpoch::INITIAL,
+        base_kind: crate::peering::PgMetadataTransferBaseKind::Checkpoint,
+        base_proof: crate::control_plane::PgMetadataProof::new(1, 2, 3),
+        checkpoint_base: None,
+        proof: crate::control_plane::PgMetadataProof::new(1, 2, 3),
+        retained_log_entries: Vec::new(),
+    };
+
+    let err = crate::StorageCluster::metadata_transfer_imported_proof_at_epoch(
+        &artifact,
+        ClusterEpoch::new(2).unwrap(),
+    )
+    .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            crate::error::PgMetadataTransferError::Reconstruction { ref message }
+                if message.contains("missing checkpoint base payload")
+        ),
+        "unexpected error: {err:?}"
+    );
 }
 
 #[test]

@@ -8207,6 +8207,15 @@ Metadata PG migration and backfill design notes:
   parent/child metadata rows through the RPC. Checkpoint-base transfer artifacts
   still fail closed until the artifact/import path carries checkpoint contents
   and selects this install path before retained suffix replay.
+- Wired checkpoint-base transfer artifacts into the storage import path. A
+  checkpoint-base artifact now must carry the materialized checkpoint payload;
+  import verifies the checkpoint proof, installs the checkpoint as a `(0, 0,
+  state_digest)` destination-epoch base through the metadata node client, and
+  keeps the existing cross-replica proof convergence check. Missing checkpoint
+  payloads and mismatched proofs fail closed before mutation. This covers
+  full-checkpoint metadata transfer into an empty Peering destination; exporting
+  checkpoint-plus-retained-suffix artifacts from live storage-node processes is
+  still a later slice.
 
 Exit criteria:
 

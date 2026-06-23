@@ -47,8 +47,8 @@ use crate::peering::{
     build_pg_metadata_transfer_artifact_from_retained_log_entries,
     build_pg_peering_replay_plan_from_retained_log_entries,
     rebase_pg_metadata_transfer_artifact_commands,
-    reconstruct_pg_peering_from_primary_retained_log, PgMetadataTransferBaseKind,
-    PgPeeringReconstructionDecision, PgPeeringReconstructionError, PgPeeringReconstructionFailure,
+    reconstruct_pg_peering_from_primary_retained_log, PgPeeringReconstructionDecision,
+    PgPeeringReconstructionError, PgPeeringReconstructionFailure,
     PgPeeringReplicaReconstructionInput,
 };
 use crate::storage_rpc::STORAGE_RPC_MAX_METADATA_COMMAND_LOG_ENTRY_RANGE_ENTRIES;
@@ -2620,21 +2620,12 @@ impl StorageCluster {
         artifact: &PgMetadataTransferArtifact,
     ) -> Result<PgMetadataProof, PgPeeringReconstructionFailure> {
         let pg_id = artifact.pg_id;
-        if artifact.source_base_kind() == PgMetadataTransferBaseKind::Checkpoint {
-            return Err(
-                PgPeeringReconstructionError::UnsupportedMetadataTransferCheckpointBase {
-                    node_id: artifact.source_node_id,
-                    pg_id,
-                    proof: artifact.source_base_metadata_proof(),
-                }
-                .into(),
-            );
-        }
         let commands =
             rebase_pg_metadata_transfer_artifact_commands(artifact, self.operation_epoch())?;
         let expected_import_proof =
             metadata_transfer_destination_proof(artifact, &commands, self.operation_epoch());
         let base_import_proof = artifact.source_base_metadata_proof();
+        let checkpoint_base = artifact.checkpoint_base();
         let nodes = self
             .local_map
             .metadata_pg_acting_nodes_for_peering_replay(self.operation_epoch(), pg_id)?;
@@ -2642,24 +2633,99 @@ impl StorageCluster {
         let mut reference: Option<(NodeId, PgMetadataProof)> = None;
         for node in nodes {
             let metadata_client = node.metadata_command_client();
-            let state = match classify_metadata_transfer_import_destination(
-                metadata_client.as_ref(),
-                node.node_id(),
-                pg_id,
-                self.operation_epoch(),
-                base_import_proof,
-                expected_import_proof,
-                &commands,
-            )? {
-                MetadataTransferImportDestination::AlreadyImported(state) => state,
-                MetadataTransferImportDestination::Empty => {
-                    if commands.is_empty() {
-                        metadata_client.initialize_metadata_transfer_empty_state(
+            let state = if let Some(checkpoint) = checkpoint_base {
+                if metadata_client
+                    .pending_metadata_command_envelope(pg_id, self.operation_epoch())?
+                    .is_some()
+                {
+                    return Err(PgPeeringReconstructionError::PendingMetadataCommand {
+                        node_id: node.node_id(),
+                    }
+                    .into());
+                }
+                let current = metadata_client.metadata_command_replica_state(pg_id)?;
+                if current.cluster_epoch != self.operation_epoch()
+                    && metadata_client
+                        .pending_metadata_command_envelope(pg_id, current.cluster_epoch)?
+                        .is_some()
+                {
+                    return Err(PgPeeringReconstructionError::PendingMetadataCommand {
+                        node_id: node.node_id(),
+                    }
+                    .into());
+                }
+                let current_proof = PgMetadataProof::new(
+                    current.applied_log_index,
+                    current.applied_log_hash,
+                    current.state_digest,
+                );
+                if current.cluster_epoch == self.operation_epoch()
+                    && current_proof == expected_import_proof
+                {
+                    let validated = metadata_client
+                        .validate_metadata_command_replay_state_preserving_pending_slot(
                             pg_id,
                             self.operation_epoch(),
-                            artifact.proof.state_digest,
-                        )?
+                        )?;
+                    let validated_proof = PgMetadataProof::new(
+                        validated.applied_log_index,
+                        validated.applied_log_hash,
+                        validated.state_digest,
+                    );
+                    if validated_proof == expected_import_proof {
+                        validated
                     } else {
+                        return Err(PgPeeringReconstructionError::MetadataFork {
+                            node_id: node.node_id(),
+                            reference_node_id: node.node_id(),
+                            replica: validated_proof,
+                            reference: expected_import_proof,
+                        }
+                        .into());
+                    }
+                } else {
+                    metadata_client.install_metadata_transfer_checkpoint_base(
+                        pg_id,
+                        self.operation_epoch(),
+                        checkpoint,
+                    )?
+                }
+            } else {
+                match classify_metadata_transfer_import_destination(
+                    metadata_client.as_ref(),
+                    node.node_id(),
+                    pg_id,
+                    self.operation_epoch(),
+                    base_import_proof,
+                    expected_import_proof,
+                    &commands,
+                )? {
+                    MetadataTransferImportDestination::AlreadyImported(state) => state,
+                    MetadataTransferImportDestination::Empty => {
+                        if commands.is_empty() {
+                            metadata_client.initialize_metadata_transfer_empty_state(
+                                pg_id,
+                                self.operation_epoch(),
+                                artifact.proof.state_digest,
+                            )?
+                        } else {
+                            let mut state =
+                                metadata_client.metadata_command_replica_state(pg_id)?;
+                            for command in &commands {
+                                state = metadata_client
+                                    .replay_metadata_command_for_peering(pg_id, &command.command)?;
+                            }
+                            state
+                        }
+                    }
+                    MetadataTransferImportDestination::AdoptBase => {
+                        metadata_client.initialize_metadata_transfer_matching_state(
+                            pg_id,
+                            self.operation_epoch(),
+                            0,
+                            0,
+                            base_import_proof.state_digest,
+                        )?;
                         let mut state = metadata_client.metadata_command_replica_state(pg_id)?;
                         for command in &commands {
                             state = metadata_client
@@ -2667,55 +2733,40 @@ impl StorageCluster {
                         }
                         state
                     }
-                }
-                MetadataTransferImportDestination::AdoptBase => {
-                    metadata_client.initialize_metadata_transfer_matching_state(
-                        pg_id,
-                        self.operation_epoch(),
-                        0,
-                        0,
-                        base_import_proof.state_digest,
-                    )?;
-                    let mut state = metadata_client.metadata_command_replica_state(pg_id)?;
-                    for command in &commands {
-                        state = metadata_client
-                            .replay_metadata_command_for_peering(pg_id, &command.command)?;
+                    MetadataTransferImportDestination::AdoptExisting => {
+                        if commands.is_empty() {
+                            metadata_client.initialize_metadata_transfer_matching_state(
+                                pg_id,
+                                self.operation_epoch(),
+                                expected_import_proof.applied_log_index,
+                                expected_import_proof.applied_log_hash,
+                                expected_import_proof.state_digest,
+                            )?
+                        } else {
+                            metadata_client.adopt_metadata_transfer_state_from_rebased_commands(
+                                pg_id,
+                                self.operation_epoch(),
+                                &commands,
+                                artifact.proof.state_digest,
+                            )?
+                        }
                     }
-                    state
-                }
-                MetadataTransferImportDestination::AdoptExisting => {
-                    if commands.is_empty() {
-                        metadata_client.initialize_metadata_transfer_matching_state(
-                            pg_id,
-                            self.operation_epoch(),
-                            expected_import_proof.applied_log_index,
-                            expected_import_proof.applied_log_hash,
-                            expected_import_proof.state_digest,
-                        )?
-                    } else {
-                        metadata_client.adopt_metadata_transfer_state_from_rebased_commands(
-                            pg_id,
-                            self.operation_epoch(),
-                            &commands,
-                            artifact.proof.state_digest,
-                        )?
+                    MetadataTransferImportDestination::AdoptPrefix { prefix_len } => {
+                        if prefix_len > 0 {
+                            metadata_client.adopt_metadata_transfer_state_from_rebased_commands(
+                                pg_id,
+                                self.operation_epoch(),
+                                &commands[..prefix_len],
+                                commands[prefix_len - 1].post_state_digest,
+                            )?;
+                        }
+                        let mut state = metadata_client.metadata_command_replica_state(pg_id)?;
+                        for command in &commands[prefix_len..] {
+                            state = metadata_client
+                                .replay_metadata_command_for_peering(pg_id, &command.command)?;
+                        }
+                        state
                     }
-                }
-                MetadataTransferImportDestination::AdoptPrefix { prefix_len } => {
-                    if prefix_len > 0 {
-                        metadata_client.adopt_metadata_transfer_state_from_rebased_commands(
-                            pg_id,
-                            self.operation_epoch(),
-                            &commands[..prefix_len],
-                            commands[prefix_len - 1].post_state_digest,
-                        )?;
-                    }
-                    let mut state = metadata_client.metadata_command_replica_state(pg_id)?;
-                    for command in &commands[prefix_len..] {
-                        state = metadata_client
-                            .replay_metadata_command_for_peering(pg_id, &command.command)?;
-                    }
-                    state
                 }
             };
             if state.cluster_epoch != self.operation_epoch() {

@@ -5,6 +5,7 @@ use crate::metadata_command::{
     MetadataCommandLogIndex, MetadataCommandLogRangeEntry, MetadataCommandLogRangeEntryKind,
     MetadataCommandReplicaState, MetadataTransferCommand,
 };
+use crate::pg_store::MetadataCommandCheckpoint;
 use crate::types::{ClusterEpoch, PgId, PgState};
 use placement::NodeId;
 
@@ -38,6 +39,7 @@ pub struct PgMetadataTransferArtifact {
     pub(crate) cluster_epoch: ClusterEpoch,
     pub(crate) base_kind: PgMetadataTransferBaseKind,
     pub(crate) base_proof: PgMetadataProof,
+    pub(crate) checkpoint_base: Option<MetadataCommandCheckpoint>,
     pub(crate) proof: PgMetadataProof,
     pub(crate) retained_log_entries: Vec<MetadataCommandLogRangeEntry>,
 }
@@ -78,6 +80,11 @@ impl PgMetadataTransferArtifact {
     #[must_use]
     pub fn source_base_kind(&self) -> PgMetadataTransferBaseKind {
         self.base_kind
+    }
+
+    #[must_use]
+    pub fn checkpoint_base(&self) -> Option<&MetadataCommandCheckpoint> {
+        self.checkpoint_base.as_ref()
     }
 }
 
@@ -133,12 +140,29 @@ pub(crate) enum PgPeeringReconstructionError {
         post_state_digest: u64,
     },
     #[error(
-        "PG metadata transfer artifact for PG {pg_id} from source {node_id:?} uses unsupported checkpoint base proof {proof:?}"
+        "PG metadata transfer artifact for PG {pg_id} from source {node_id:?} is missing checkpoint base payload for proof {proof:?}"
     )]
-    UnsupportedMetadataTransferCheckpointBase {
+    MissingMetadataTransferCheckpointBase {
         node_id: NodeId,
         pg_id: PgId,
         proof: PgMetadataProof,
+    },
+    #[error(
+        "PG metadata transfer artifact for PG {pg_id} from source {node_id:?} has checkpoint proof {checkpoint:?}, expected {expected:?}"
+    )]
+    MetadataTransferCheckpointProofMismatch {
+        node_id: NodeId,
+        pg_id: PgId,
+        checkpoint: PgMetadataProof,
+        expected: PgMetadataProof,
+    },
+    #[error(
+        "PG metadata transfer artifact for PG {pg_id} from source {node_id:?} carries a checkpoint payload with non-checkpoint base kind {base_kind:?}"
+    )]
+    UnexpectedMetadataTransferCheckpointBase {
+        node_id: NodeId,
+        pg_id: PgId,
+        base_kind: PgMetadataTransferBaseKind,
     },
     #[error(
         "PG metadata transfer destination node {node_id:?} for PG {pg_id} in cluster epoch {cluster_epoch} is not empty and does not contain the expected imported proof {expected:?}: found log index {applied_log_index}, log hash {applied_log_hash:#018X}, digest {state_digest:#018X}"
@@ -435,6 +459,7 @@ pub(crate) fn build_pg_metadata_transfer_artifact_from_retained_log_entries(
                 cluster_epoch,
                 base_kind: PgMetadataTransferBaseKind::Empty,
                 base_proof: proof_from_replica_state(state),
+                checkpoint_base: None,
                 proof: proof_from_replica_state(state),
                 retained_log_entries,
             });
@@ -573,6 +598,7 @@ pub(crate) fn build_pg_metadata_transfer_artifact_from_retained_log_entries(
         cluster_epoch,
         base_kind,
         base_proof,
+        checkpoint_base: None,
         proof: proof_from_replica_state(state),
         retained_log_entries,
     })
@@ -583,6 +609,60 @@ pub(crate) fn rebase_pg_metadata_transfer_artifact_commands(
     artifact: &PgMetadataTransferArtifact,
     destination_cluster_epoch: ClusterEpoch,
 ) -> Result<Vec<MetadataTransferCommand>, PgPeeringReconstructionError> {
+    if artifact.base_kind == PgMetadataTransferBaseKind::Checkpoint {
+        let Some(checkpoint) = artifact.checkpoint_base() else {
+            return Err(
+                PgPeeringReconstructionError::MissingMetadataTransferCheckpointBase {
+                    node_id: artifact.source_node_id,
+                    pg_id: artifact.pg_id,
+                    proof: artifact.base_proof,
+                },
+            );
+        };
+        checkpoint.verify().map_err(|_| {
+            PgPeeringReconstructionError::MetadataTransferCheckpointProofMismatch {
+                node_id: artifact.source_node_id,
+                pg_id: artifact.pg_id,
+                checkpoint: PgMetadataProof::new(
+                    checkpoint.applied_log_index,
+                    checkpoint.applied_log_hash,
+                    checkpoint.state_digest,
+                ),
+                expected: artifact.base_proof,
+            }
+        })?;
+        let checkpoint_proof = PgMetadataProof::new(
+            checkpoint.applied_log_index,
+            checkpoint.applied_log_hash,
+            checkpoint.state_digest,
+        );
+        if checkpoint.cluster_epoch != artifact.cluster_epoch
+            || checkpoint.pg_id != artifact.pg_id
+            || checkpoint_proof != artifact.base_proof
+            || artifact.base_proof != artifact.proof
+            || !artifact.retained_log_entries.is_empty()
+        {
+            return Err(
+                PgPeeringReconstructionError::MetadataTransferCheckpointProofMismatch {
+                    node_id: artifact.source_node_id,
+                    pg_id: artifact.pg_id,
+                    checkpoint: checkpoint_proof,
+                    expected: artifact.base_proof,
+                },
+            );
+        }
+        return Ok(Vec::new());
+    }
+    if artifact.checkpoint_base().is_some() {
+        return Err(
+            PgPeeringReconstructionError::UnexpectedMetadataTransferCheckpointBase {
+                node_id: artifact.source_node_id,
+                pg_id: artifact.pg_id,
+                base_kind: artifact.base_kind,
+            },
+        );
+    }
+
     let source_state = MetadataCommandReplicaState {
         cluster_epoch: artifact.cluster_epoch,
         applied_log_index: artifact.proof.applied_log_index,
