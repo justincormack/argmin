@@ -1,0 +1,102 @@
+Streaming PUT chunked decoder has no per-chunk size cap, only outer body timeout
+Link: https://chatgpt.com/codex/cloud/security/findings/argmin-security-review-2026-06-23-m1
+Criticality: medium (attack path: medium)
+Status: fixed
+
+# Resolution
+Fixed in commit `bfbab3b59f3e1b5f3d1eb24ac586371b28106859` (`Bound aws-chunked streaming memory`).
+
+The finding was valid as a bounded-memory issue, but the original allocation description was overstated: the decoder did not allocate the claimed chunk size from the header alone. The real issue was that `IncrementalChunkedDecoder::feed` retained bytes actually received for a single incomplete aws-chunked payload chunk until that chunk completed and could be signature-verified, so a client could send a very large single chunk and force memory use to grow with received bytes.
+
+The fix avoids a small fixed per-chunk compatibility cap because AWS accepts large aws-chunked chunks. Instead, production streaming PUT and UploadPart paths now feed the decoder in bounded 64 KiB wire slices, and the decoder emits owned decoded payload slices without retaining full chunk payloads across calls. Signed chunk payloads are hashed incrementally and verified at the chunk boundary. The decoder also enforces the declared decoded content length while parsing, rejects decoded lengths above `MAX_OBJECT_SIZE`, and bounds its remaining retained parser state: individual chunk header/trailer lines are capped at 16 KiB, trailer accumulation is capped at 64 KiB total and 128 trailer lines, and malformed decoder exits abort the streaming session so partially staged data remains uncommitted or unreachable.
+
+Regression coverage now includes incremental decoder tests for chunk-size/decoded-length mismatch, oversized header and trailer lines, too many complete trailer lines, and total trailer bytes over budget. The S3 chunked integration tests also verify that bad data signatures, bad terminal zero-length chunk signatures after payload bytes have been streamed, decoded-length mismatch, invalid small non-final chunks, and UploadPart terminal-signature failures do not commit objects or stage parts.
+
+# Metadata
+Repo: justincormack/argmin
+Commit: 632837a
+Author: security-review
+Created: 23/06/2026, 15:30:00
+Assignee: Unassigned
+Signals: Security, Validated, DoS
+
+# Summary
+`IncrementalChunkedDecoder::feed` (and the test-only `decode_chunked_body`) reads the chunk-size from the chunk header and immediately transitions to `ReadingData { remaining: chunk_size, sig }` without validating that the claimed size is within any bound. The decoder then buffers up to `chunk_size` bytes in `self.buf` (line 372: `self.buf.extend_from_slice(wire);`) before yielding the payload. An authenticated client can claim a 4.9 GiB chunk, send 1 byte, and force the server to hold the partial chunk in `self.buf` until either the body idle timeout fires (default 30s) or the full chunk arrives. With `max_inflight_requests = 32` (configurable), 32 concurrent attackers can each hold 4.9 GiB of `Vec<u8>` for the duration of the body idle timeout. The outer `*ingest.total_size > MAX_OBJECT_SIZE` check is checked only after the payload is appended, so it does not cap the per-chunk allocation.
+
+# Validation
+## Rubric
+- [x] Confirm `parse_chunk_header` returns the chunk size with no upper bound.
+- [x] Confirm `IncrementalChunkedDecoder` allocates `self.buf` based on claimed chunk size.
+- [x] Confirm the per-chunk limit `MIN_CHUNK_SIZE = 8192` is only used to validate that the *next* chunk is at least 8 KiB, not to cap the current chunk.
+- [x] Confirm the streaming PUT path checks `*ingest.total_size` only after appending the full payload.
+- [x] Construct a PoC signed aws-chunked request that claims a 4 GiB first chunk and sends 64 KiB, verify the server holds ~4 GiB until body timeout.
+## Report
+Code inspection confirms the unbounded buffering. `parse_chunk_header` (`crates/server-http/src/http/chunked.rs:151-176`) decodes the hex chunk size with `from_str_radix`, no `MAX_CHUNK_SIZE` constant is enforced. The `IncrementalChunkedDecoder` then enters `ReadingData { remaining: chunk_size, ... }` and `feed` extends `self.buf` on every wire frame until `self.buf.len() >= *remaining`. `MIN_CHUNK_SIZE` is consulted at `crates/server-http/src/http/chunked.rs:96-102` to validate that the *previous* chunk was at least 8 KiB, but no analogous upper bound is enforced. The streaming PUT ingest path (`crates/server-http/src/http/serve.rs:3120-3140`) checks `*ingest.total_size > MAX_OBJECT_SIZE` after `ingest.hasher.update(payload)` and after `*ingest.total_size += payload.len() as u64;` — by that point, the chunked decoder has already buffered the full claimed chunk in `self.buf`. The body idle timeout (`body_idle_timeout`, default 30s, see `crates/server-http/src/http/serve.rs:195`) limits how long a partially-received chunk is held, but a malicious client can rotate through `max_inflight_requests` connections to keep memory pressure high. The fix should add `MAX_CHUNK_SIZE` (e.g. 16 MiB, matching typical S3 chunk caps) and reject chunk headers claiming a larger size as a `MalformedChunkedBody` error before the decoder transitions to `ReadingData`.
+
+# Evidence
+crates/server-http/src/http/chunked.rs (L151 to 176)
+  Note: `parse_chunk_header` accepts any chunk size, including values that exceed `MAX_OBJECT_SIZE`.
+```
+fn parse_chunk_header(line: &[u8]) -> Result<(usize, Option<String>), ServerError> {
+    let line_str = std::str::from_utf8(line).map_err(|_| ServerError::MalformedChunkedBody {
+        reason: "non-UTF8 chunk header".to_string(),
+    })?;
+
+    let (size_part, rest) = match line_str.split_once(';') {
+        Some((s, r)) => (s, Some(r)),
+        None => (line_str, None),
+    };
+
+    let size = usize::from_str_radix(size_part.trim(), 16).map_err(|_| {
+        ServerError::MalformedChunkedBody {
+            reason: format!("invalid chunk size: {size_part}"),
+        }
+    })?;
+
+    let sig = rest.and_then(|ext| {
+        ext.strip_prefix("chunk-signature=")
+            .map(std::string::ToString::to_string)
+    });
+
+    Ok((size, sig))
+}
+```
+
+crates/server-http/src/http/chunked.rs (L365 to 374)
+  Note: The decoder's buffer grows to the claimed chunk size with no per-chunk cap.
+```
+    pub fn feed(&mut self, wire: &[u8]) -> Result<Vec<u8>, ServerError> {
+        if self.done {
+            return Err(ServerError::MalformedChunkedBody {
+                reason: "data after chunked body complete".to_string(),
+            });
+        }
+        self.buf.extend_from_slice(wire);
+        let mut payload = Vec::new();
+```
+
+crates/server-http/src/http/serve.rs (L3125 to 3150)
+  Note: The `MAX_OBJECT_SIZE` check happens after the chunked decoder has already buffered the full claimed chunk.
+```
+    ingest.hasher.update(payload);
+    if let Some(h) = ingest.payload_sha256_hasher.as_mut() {
+        h.update(payload);
+    }
+    if let Some(h) = ingest.content_md5_hasher.as_mut() {
+        h.update(payload);
+    }
+    if let Some(th) = ingest.trailing_hasher.as_mut() {
+        th.update(payload);
+    }
+    *ingest.total_size += payload.len() as u64;
+    if *ingest.total_size > MAX_OBJECT_SIZE {
+        abort_streaming(state, ctx, ingest.session_id.clone()).await;
+        return Err(error_response(
+            &ServerError::ObjectTooLarge {
+                size: *ingest.total_size,
+                max: MAX_OBJECT_SIZE,
+            },
+            &wire_ids,
+        ));
+    }
+```
