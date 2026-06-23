@@ -1503,7 +1503,26 @@ fn classify_metadata_transfer_import_destination(
         && state.applied_log_hash == 0
         && metadata_client.metadata_command_replica_state_can_initialize(pg_id, cluster_epoch)?
     {
-        return Ok(MetadataTransferImportDestination::Empty);
+        let actual_proof = PgMetadataProof::new(
+            state.applied_log_index,
+            state.applied_log_hash,
+            state.state_digest,
+        );
+        if actual_proof == base_import_proof {
+            return Ok(MetadataTransferImportDestination::Empty);
+        }
+        return Err(
+            PgPeeringReconstructionError::DirtyMetadataTransferDestination {
+                node_id,
+                pg_id,
+                cluster_epoch,
+                applied_log_index: state.applied_log_index,
+                applied_log_hash: state.applied_log_hash,
+                state_digest: state.state_digest,
+                expected: base_import_proof,
+            }
+            .into(),
+        );
     }
 
     if state.state_digest != expected_import_proof.state_digest {

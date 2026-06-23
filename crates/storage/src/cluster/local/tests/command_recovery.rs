@@ -2198,6 +2198,86 @@ fn metadata_transfer_export_packages_retained_suffix_with_base_proof() {
 }
 
 #[test]
+fn metadata_transfer_import_rejects_suffix_into_empty_destination_without_mutation() {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[1], ec_shape).unwrap();
+    let topology = map
+        .node(NodeId::new(0))
+        .unwrap()
+        .storage_node()
+        .pg_topology();
+    let first_bucket = bucket_for_pg(topology, 1, "metadata-transfer-empty-suffix-first-");
+    let second_bucket = bucket_for_pg(topology, 1, "metadata-transfer-empty-suffix-second-");
+    set_route_primary(&mut map, 1, NodeId::new(0));
+    set_route_state(&mut map, 1, PgState::Peering);
+    let mut map = Arc::new(map);
+    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let pg_id = PgId::new(1);
+    let first = create_bucket_metadata_command(pg_id, 1, first_bucket);
+    let second = create_bucket_metadata_command(pg_id, 2, second_bucket.clone());
+    let source_pg = map
+        .node(NodeId::new(0))
+        .unwrap()
+        .storage_node()
+        .get_pg(1)
+        .unwrap();
+    source_pg
+        .apply_metadata_command_and_record(0, &first)
+        .unwrap();
+    source_pg
+        .apply_metadata_command_and_record(0, &second)
+        .unwrap();
+    source_pg
+        .connection()
+        .execute(
+            "DELETE FROM metadata_command_log WHERE cluster_epoch = ?1 AND pg_id = ?2 AND log_index = ?3",
+            rusqlite::params![ClusterEpoch::INITIAL.get() as i64, pg_id.get() as i64, 1_i64],
+        )
+        .unwrap();
+    drop(source_pg);
+
+    let artifact = cluster
+        .export_pg_metadata_transfer_from_retained_log(pg_id, NodeId::new(0))
+        .unwrap();
+    assert_eq!(artifact.base_proof.applied_log_index, 1);
+    drop(cluster);
+
+    let destination_epoch = ClusterEpoch::new(2).unwrap();
+    let map_mut = Arc::get_mut(&mut map).unwrap();
+    map_mut.epoch = destination_epoch;
+    let route = map_mut.pg_routes.get_mut(&pg_id).unwrap();
+    route.cluster_epoch = destination_epoch;
+    route.primary_node_id = NodeId::new(1);
+    route.acting_set = Arc::from([NodeId::new(1), NodeId::new(2)]);
+    route.state = PgState::Peering;
+    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+
+    let err = cluster
+        .import_pg_metadata_transfer_from_retained_log(&artifact)
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            crate::peering::PgPeeringReconstructionFailure::Reconstruction(
+                crate::peering::PgPeeringReconstructionError::DirtyMetadataTransferDestination { .. }
+            )
+        ),
+        "unexpected error: {err:?}"
+    );
+
+    for node_id in [NodeId::new(1), NodeId::new(2)] {
+        let pg = map.node(node_id).unwrap().storage_node().get_pg(1).unwrap();
+        let state = pg.metadata_command_replica_state().unwrap();
+        assert_eq!(state.cluster_epoch, ClusterEpoch::INITIAL);
+        assert_eq!(state.applied_log_index, 0);
+        assert_eq!(state.applied_log_hash, 0);
+        assert!(crate::PgMetadataStore::head_bucket(&*pg, &second_bucket).is_err());
+    }
+}
+
+#[test]
 fn metadata_transfer_export_fails_closed_when_retained_state_digest_chain_is_broken() {
     let tmp = test_util::tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
