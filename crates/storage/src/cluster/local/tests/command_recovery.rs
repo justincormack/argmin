@@ -3105,32 +3105,14 @@ fn metadata_transfer_import_installs_checkpoint_base() {
         .unwrap()
         .apply_metadata_command_and_record(0, &command)
         .unwrap();
-    let checkpoint = {
-        let source_pg = map
-            .node(NodeId::new(0))
-            .unwrap()
-            .storage_node()
-            .get_pg(1)
-            .unwrap();
-        source_pg
-            .metadata_command_checkpoint(0, ClusterEpoch::INITIAL)
-            .unwrap()
-    };
-    let source_proof = crate::control_plane::PgMetadataProof::new(
-        checkpoint.applied_log_index,
-        checkpoint.applied_log_hash,
-        checkpoint.state_digest,
+    let artifact = cluster
+        .export_pg_metadata_transfer_from_checkpoint(pg_id, NodeId::new(0))
+        .unwrap();
+    assert_eq!(
+        artifact.source_base_kind(),
+        crate::peering::PgMetadataTransferBaseKind::Checkpoint
     );
-    let artifact = crate::peering::PgMetadataTransferArtifact {
-        pg_id,
-        source_node_id: NodeId::new(0),
-        cluster_epoch: ClusterEpoch::INITIAL,
-        base_kind: crate::peering::PgMetadataTransferBaseKind::Checkpoint,
-        base_proof: source_proof,
-        checkpoint_base: Some(checkpoint),
-        proof: source_proof,
-        retained_log_entries: Vec::new(),
-    };
+    assert!(artifact.checkpoint_base().is_some());
     drop(cluster);
 
     let destination_epoch = ClusterEpoch::new(2).unwrap();

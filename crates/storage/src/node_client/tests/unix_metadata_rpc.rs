@@ -277,6 +277,94 @@ fn test_metadata_checkpoint_with_bucket(
 }
 
 #[test]
+fn unix_storage_node_client_exports_metadata_command_checkpoint() {
+    let tmp = test_util::tempdir();
+    let mut config = test_config(&tmp);
+    private_socket_dir(config.socket_path.parent().unwrap());
+    config.pg_routes[0].state = crate::PgState::Peering;
+    let bucket = crate::tests::bucket_name("unix-metadata-checkpoint-export");
+    let expected_checkpoint = {
+        let node = SharedStorageNode::open_with_default_ec_shape(
+            &config.data_dir,
+            &config.pg_ids,
+            config.default_ec_shape,
+        )
+        .unwrap();
+        let pg = node.get_pg(0).unwrap();
+        let owner = OwnerIdentity::from_principal("owner");
+        pg.create_bucket_with_config(&CreateBucketConfig {
+            name: bucket.as_str(),
+            owner_principal: &owner.principal,
+            owner_canonical_id: &owner.canonical_id,
+            acl_grants: &s3_types::AclGrants::default(),
+            public_read: false,
+            public_write: false,
+            versioning: s3_types::BucketVersioningState::Disabled,
+            object_lock: s3_types::BucketObjectLockConfig::default(),
+            ownership_controls: crate::BucketOwnershipControls {
+                object_ownership: crate::BucketObjectOwnership::ObjectWriter,
+            },
+        })
+        .unwrap();
+        pg.refresh_metadata_command_state_digest().unwrap();
+        pg.metadata_command_checkpoint(7, ClusterEpoch::INITIAL)
+            .unwrap()
+    };
+    let server = StorageNodeServer::bind(config.clone()).unwrap();
+    let server_thread = thread::spawn(move || {
+        server.accept_one().unwrap();
+    });
+    let client = UnixStorageNodeClient::new(
+        config.node_id,
+        config.cluster_epoch,
+        config.socket_path.clone(),
+    );
+
+    let checkpoint = MetadataCommandNodeClient::metadata_command_checkpoint(
+        &client,
+        PgId::new(0),
+        ClusterEpoch::INITIAL,
+    )
+    .unwrap();
+    server_thread.join().unwrap();
+
+    assert_eq!(checkpoint, expected_checkpoint);
+}
+
+#[test]
+fn unix_storage_node_client_rejects_active_metadata_command_checkpoint_export() {
+    let tmp = test_util::tempdir();
+    let config = test_config(&tmp);
+    private_socket_dir(config.socket_path.parent().unwrap());
+    let server = StorageNodeServer::bind(config.clone()).unwrap();
+    let server_thread = thread::spawn(move || {
+        server.accept_one().unwrap();
+    });
+    let client = UnixStorageNodeClient::new(
+        config.node_id,
+        config.cluster_epoch,
+        config.socket_path.clone(),
+    );
+
+    let err = MetadataCommandNodeClient::metadata_command_checkpoint(
+        &client,
+        PgId::new(0),
+        ClusterEpoch::INITIAL,
+    )
+    .unwrap_err();
+    server_thread.join().unwrap();
+
+    assert!(matches!(
+        err,
+        StoreError::StorageRpc {
+            operation: "metadata command checkpoint export",
+            message,
+            ..
+        } if message.contains("route is active")
+    ));
+}
+
+#[test]
 fn unix_storage_node_client_installs_metadata_transfer_checkpoint_base() {
     let (bucket, checkpoint) = test_metadata_checkpoint_with_bucket("unix-metadata-checkpoint");
 

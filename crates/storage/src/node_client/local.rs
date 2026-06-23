@@ -3935,6 +3935,15 @@ impl MetadataCommandNodeClient for LocalStorageNodeClient {
         pg.metadata_command_replica_state()
     }
 
+    fn metadata_command_checkpoint(
+        &self,
+        pg_id: PgId,
+        cluster_epoch: ClusterEpoch,
+    ) -> Result<MetadataCommandCheckpoint, StoreError> {
+        let pg = self.storage_node.get_pg(pg_id.get())?;
+        pg.metadata_command_checkpoint(self.node_id.as_u32(), cluster_epoch)
+    }
+
     fn validate_metadata_command_replay_state(
         &self,
         pg_id: PgId,

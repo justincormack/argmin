@@ -47,8 +47,8 @@ use crate::peering::{
     build_pg_metadata_transfer_artifact_from_retained_log_entries,
     build_pg_peering_replay_plan_from_retained_log_entries,
     rebase_pg_metadata_transfer_artifact_commands,
-    reconstruct_pg_peering_from_primary_retained_log, PgPeeringReconstructionDecision,
-    PgPeeringReconstructionError, PgPeeringReconstructionFailure,
+    reconstruct_pg_peering_from_primary_retained_log, PgMetadataTransferBaseKind,
+    PgPeeringReconstructionDecision, PgPeeringReconstructionError, PgPeeringReconstructionFailure,
     PgPeeringReplicaReconstructionInput,
 };
 use crate::storage_rpc::STORAGE_RPC_MAX_METADATA_COMMAND_LOG_ENTRY_RANGE_ENTRIES;
@@ -2611,6 +2611,81 @@ impl StorageCluster {
         source_node_id: NodeId,
     ) -> Result<PgMetadataTransferArtifact, PgMetadataTransferError> {
         self.export_pg_metadata_transfer_from_retained_log(pg_id, source_node_id)
+            .map_err(Into::into)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn export_pg_metadata_transfer_from_checkpoint(
+        &self,
+        pg_id: PgId,
+        source_node_id: NodeId,
+    ) -> Result<PgMetadataTransferArtifact, PgPeeringReconstructionFailure> {
+        let route = self
+            .local_pg_route(pg_id)
+            .ok_or(StoreError::ClusterPgNotFound {
+                pg_id: pg_id.get(),
+                cluster_epoch: self.operation_epoch(),
+            })?;
+        if route.cluster_epoch() != self.operation_epoch() {
+            return Err(StoreError::StaleMetadataRoute {
+                pg_id: pg_id.get(),
+                route_epoch: route.cluster_epoch(),
+                current_epoch: self.operation_epoch(),
+            }
+            .into());
+        }
+        if route.state() != PgState::Peering {
+            return Err(PgPeeringReconstructionError::TransferSourceNotQuiesced {
+                pg_id,
+                cluster_epoch: self.operation_epoch(),
+                state: route.state(),
+            }
+            .into());
+        }
+        if route.primary_node_id() != source_node_id {
+            return Err(PgPeeringReconstructionError::TransferSourceNotPrimary {
+                pg_id,
+                cluster_epoch: self.operation_epoch(),
+                source_node: source_node_id,
+                primary: route.primary_node_id(),
+            }
+            .into());
+        }
+        let nodes = self
+            .local_map
+            .metadata_pg_acting_nodes_for_peering_inspection(self.operation_epoch(), pg_id)?;
+        let source_node = nodes
+            .iter()
+            .find(|node| node.node_id() == source_node_id)
+            .ok_or(PgPeeringReconstructionError::PrimaryMissing {
+                primary: source_node_id,
+            })?;
+        let checkpoint = source_node
+            .metadata_command_client()
+            .metadata_command_checkpoint(pg_id, self.operation_epoch())?;
+        let proof = PgMetadataProof::new(
+            checkpoint.applied_log_index,
+            checkpoint.applied_log_hash,
+            checkpoint.state_digest,
+        );
+        Ok(PgMetadataTransferArtifact {
+            pg_id,
+            source_node_id,
+            cluster_epoch: self.operation_epoch(),
+            base_kind: PgMetadataTransferBaseKind::Checkpoint,
+            base_proof: proof,
+            checkpoint_base: Some(checkpoint),
+            proof,
+            retained_log_entries: Vec::new(),
+        })
+    }
+
+    pub fn export_pg_metadata_transfer_artifact_from_checkpoint(
+        &self,
+        pg_id: PgId,
+        source_node_id: NodeId,
+    ) -> Result<PgMetadataTransferArtifact, PgMetadataTransferError> {
+        self.export_pg_metadata_transfer_from_checkpoint(pg_id, source_node_id)
             .map_err(Into::into)
     }
 

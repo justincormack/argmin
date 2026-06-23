@@ -1160,6 +1160,12 @@ pub(crate) trait MetadataCommandNodeClient: Send + Sync {
         pg_id: PgId,
     ) -> Result<MetadataCommandReplicaState, StoreError>;
 
+    fn metadata_command_checkpoint(
+        &self,
+        pg_id: PgId,
+        cluster_epoch: ClusterEpoch,
+    ) -> Result<MetadataCommandCheckpoint, StoreError>;
+
     fn validate_metadata_command_replay_state(
         &self,
         pg_id: PgId,

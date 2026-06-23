@@ -564,6 +564,7 @@ pub(crate) enum StorageRpcMessageKind {
     MetadataCommandTransferEmptyStateInitialize = 147,
     MetadataCommandTransferMatchingStateInitialize = 148,
     MetadataCommandTransferCheckpointBaseInstall = 149,
+    MetadataCommandCheckpointExport = 150,
     MetadataCommandAppliedLogHashes = 25,
     MetadataCommandMatchingAppliedLog = 26,
     MetadataCommandAbandoned = 27,
@@ -787,6 +788,7 @@ impl StorageRpcMessageKind {
             Self::MetadataCommandTransferCheckpointBaseInstall => {
                 "metadata command transfer checkpoint base install"
             }
+            Self::MetadataCommandCheckpointExport => "metadata command checkpoint export",
             Self::MetadataCommandAppliedLogHashes => "metadata command applied log hashes",
             Self::MetadataCommandMatchingAppliedLog => "metadata command matching applied log",
             Self::MetadataCommandRetainedLogHashes => "metadata command retained log hashes",
@@ -959,6 +961,7 @@ impl StorageRpcMessageKind {
             147 => Ok(Self::MetadataCommandTransferEmptyStateInitialize),
             148 => Ok(Self::MetadataCommandTransferMatchingStateInitialize),
             149 => Ok(Self::MetadataCommandTransferCheckpointBaseInstall),
+            150 => Ok(Self::MetadataCommandCheckpointExport),
             25 => Ok(Self::MetadataCommandAppliedLogHashes),
             26 => Ok(Self::MetadataCommandMatchingAppliedLog),
             27 => Ok(Self::MetadataCommandAbandoned),
@@ -2720,6 +2723,11 @@ pub(crate) struct StorageRpcMetadataCommandTransferCheckpointBaseRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StorageRpcMetadataCommandCheckpointResponse {
+    pub(crate) checkpoint: MetadataCommandCheckpoint,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StorageRpcMetadataCommandLogHashRangeRequest {
     pub(crate) node_id: NodeId,
     pub(crate) cluster_epoch: ClusterEpoch,
@@ -3385,7 +3393,8 @@ fn message_kind_request_max_payload_len(
         | StorageRpcMessageKind::MetadataCommandPendingEnvelope
         | StorageRpcMessageKind::MetadataCommandValidateReplayState
         | StorageRpcMessageKind::MetadataCommandValidateReplayStatePreservingPending
-        | StorageRpcMessageKind::MetadataCommandReplicaStateCanInitialize => {
+        | StorageRpcMessageKind::MetadataCommandReplicaStateCanInitialize
+        | StorageRpcMessageKind::MetadataCommandCheckpointExport => {
             STORAGE_RPC_MAX_METADATA_COMMAND_STATE_PAYLOAD_LEN
         }
         StorageRpcMessageKind::MetadataCommandTransferEmptyStateInitialize => {
@@ -8727,6 +8736,23 @@ pub(crate) fn decode_metadata_command_transfer_checkpoint_base_request(
         pg_id,
         checkpoint,
     })
+}
+
+pub(crate) fn encode_metadata_command_checkpoint_response(
+    response: &StorageRpcMetadataCommandCheckpointResponse,
+) -> Result<Vec<u8>, StorageRpcPayloadError> {
+    let mut out = Vec::new();
+    encode_metadata_command_checkpoint(&mut out, &response.checkpoint)?;
+    Ok(out)
+}
+
+pub(crate) fn decode_metadata_command_checkpoint_response(
+    bytes: &[u8],
+) -> Result<StorageRpcMetadataCommandCheckpointResponse, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let checkpoint = decode_metadata_command_checkpoint(&mut decoder)?;
+    decoder.finish()?;
+    Ok(StorageRpcMetadataCommandCheckpointResponse { checkpoint })
 }
 
 fn encode_metadata_command_checkpoint(
@@ -16662,6 +16688,14 @@ mod tests {
         let decoded = decode_metadata_command_transfer_checkpoint_base_request(&bytes).unwrap();
 
         assert_eq!(decoded, request);
+
+        let response = StorageRpcMetadataCommandCheckpointResponse {
+            checkpoint: request.checkpoint,
+        };
+        let bytes = encode_metadata_command_checkpoint_response(&response).unwrap();
+        let decoded = decode_metadata_command_checkpoint_response(&bytes).unwrap();
+
+        assert_eq!(decoded, response);
     }
 
     #[test]

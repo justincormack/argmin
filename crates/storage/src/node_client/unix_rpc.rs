@@ -1570,6 +1570,31 @@ impl UnixStorageNodeClient {
             })
     }
 
+    pub(crate) fn metadata_command_checkpoint(
+        &self,
+        pg_id: PgId,
+        cluster_epoch: ClusterEpoch,
+    ) -> Result<MetadataCommandCheckpoint, StoreError> {
+        let request = StorageRpcMetadataCommandStateRequest {
+            node_id: self.node_id,
+            cluster_epoch,
+            pg_id,
+        };
+        let payload = encode_metadata_command_state_request(&request);
+        let response = self.rpc_request(
+            StorageRpcMessageKind::MetadataCommandCheckpointExport,
+            payload,
+        )?;
+        decode_metadata_command_checkpoint_response(&response)
+            .map(|response| response.checkpoint)
+            .map_err(|error| {
+                self.rpc_payload_error(
+                    "decode metadata command checkpoint response",
+                    error.to_string(),
+                )
+            })
+    }
+
     pub(crate) fn max_metadata_command_log_index(&self, pg_id: PgId) -> Result<u64, StoreError> {
         let payload = self.encode_metadata_command_state_request(pg_id);
         let response =
@@ -2687,6 +2712,14 @@ impl MetadataCommandNodeClient for UnixStorageNodeClient {
         pg_id: PgId,
     ) -> Result<MetadataCommandReplicaState, StoreError> {
         UnixStorageNodeClient::metadata_command_replica_state(self, pg_id)
+    }
+
+    fn metadata_command_checkpoint(
+        &self,
+        pg_id: PgId,
+        cluster_epoch: ClusterEpoch,
+    ) -> Result<MetadataCommandCheckpoint, StoreError> {
+        UnixStorageNodeClient::metadata_command_checkpoint(self, pg_id, cluster_epoch)
     }
 
     fn validate_metadata_command_replay_state(

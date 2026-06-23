@@ -8216,6 +8216,23 @@ Metadata PG migration and backfill design notes:
   full-checkpoint metadata transfer into an empty Peering destination; exporting
   checkpoint-plus-retained-suffix artifacts from live storage-node processes is
   still a later slice.
+- Added storage-node/RPC checkpoint export for metadata transfer. Metadata node
+  clients can now request a verified `MetadataCommandCheckpoint` from a
+  quiesced Peering route, and the cluster export helper can package that
+  checkpoint as a full checkpoint-base transfer artifact for import. The
+  storage-node endpoint rejects serving `Active` routes, so checkpoint export
+  remains behind the existing metadata-transfer fence. Exports that would
+  exceed the storage-RPC frame cap now fail as structured `ResourceExhausted`
+  responses rather than surfacing as connection/write failures.
+  Checkpoint-plus-retained suffix artifacts and live admin selection between
+  retained-log and checkpoint export remain later work.
+- Future metadata migration work must add a recovery path for
+  `ResourceExhausted` checkpoint exports. The current behavior is fail-closed:
+  no destination mutation occurs, but the migration cannot complete with the
+  full-checkpoint primitive. Large metadata PGs need either chunked checkpoint
+  export/import with a manifest and end-to-end digest verification, or a
+  selection policy that can use retained-log transfer / checkpoint-plus-retained
+  suffix transfer when that avoids a frame-sized checkpoint.
 
 Exit criteria:
 
