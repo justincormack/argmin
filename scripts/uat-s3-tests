@@ -1600,14 +1600,17 @@ run_metadata_pg_migration_smoke() {
     local bucket_file="$smoke_dir/bucket"
     local old_key_file="$smoke_dir/old-key"
     local new_key_file="$smoke_dir/new-key"
+    local final_key_file="$smoke_dir/final-key"
     local metadata_pg_file="$smoke_dir/metadata-pg"
     local old_body_file="$smoke_dir/old-body.bin"
     local new_body_file="$smoke_dir/new-body.bin"
+    local final_body_file="$smoke_dir/final-body.bin"
     local metrics_path="$smoke_dir/metrics.prom"
     local target_metadata_pg=$((iteration - 1))
     mkdir -p "$smoke_dir"
     printf 'argmin metadata PG migration old-placement payload\n%.0s' {1..128} >"$old_body_file"
     printf 'argmin metadata PG migration new-placement payload\n%.0s' {1..128} >"$new_body_file"
+    printf 'argmin metadata PG migration final-placement payload\n%.0s' {1..128} >"$final_body_file"
 
     if ((repeat_count > 1)); then
         echo "== argmin-s3 UAT metadata PG migration iteration $iteration/$repeat_count =="
@@ -1660,6 +1663,38 @@ run_metadata_pg_migration_smoke() {
     print_command "${pg_backfill_smoke_cmd[@]}" get "$bucket_file" "$new_key" "$new_body_file"
     "${pg_backfill_smoke_cmd[@]}" get "$bucket_file" "$new_key" "$new_body_file"
 
+    echo "== argmin-s3 UAT metadata PG migration transfer-back write =="
+    print_command "${pg_backfill_smoke_cmd[@]}" put-for-metadata-pg "$bucket_file" "$final_key_file" "uat-metadata-pg-final-object-$iteration" "$final_body_file" "$target_metadata_pg"
+    "${pg_backfill_smoke_cmd[@]}" put-for-metadata-pg "$bucket_file" "$final_key_file" "uat-metadata-pg-final-object-$iteration" "$final_body_file" "$target_metadata_pg"
+    local final_key
+    final_key="$(tr -d '[:space:]' <"$final_key_file")"
+
+    echo "== argmin-s3 UAT metadata PG migration repeated outbound transfer =="
+    transfer_pg_metadata "second non-overlap destination nodes 2,3 with suffix replay" "$target_metadata_pg" 2 3
+    wait_for_control_plane_pg_active "$target_metadata_pg" 20 "2:3"
+    wait_for_serving_runtime_installed 20 "$metrics_path"
+
+    echo "== argmin-s3 UAT metadata PG migration repeated-transfer reads =="
+    print_command "${pg_backfill_smoke_cmd[@]}" get "$bucket_file" "$old_key" "$old_body_file"
+    "${pg_backfill_smoke_cmd[@]}" get "$bucket_file" "$old_key" "$old_body_file"
+    print_command "${pg_backfill_smoke_cmd[@]}" get "$bucket_file" "$new_key" "$new_body_file"
+    "${pg_backfill_smoke_cmd[@]}" get "$bucket_file" "$new_key" "$new_body_file"
+    print_command "${pg_backfill_smoke_cmd[@]}" get "$bucket_file" "$final_key" "$final_body_file"
+    "${pg_backfill_smoke_cmd[@]}" get "$bucket_file" "$final_key" "$final_body_file"
+
+    echo "== argmin-s3 UAT metadata PG migration final return transfer =="
+    transfer_pg_metadata "final return to original nodes 0,1" "$target_metadata_pg" 0 1
+    wait_for_control_plane_pg_active "$target_metadata_pg" 20 "0:1"
+    wait_for_serving_runtime_installed 20 "$metrics_path"
+
+    echo "== argmin-s3 UAT metadata PG migration final reads =="
+    print_command "${pg_backfill_smoke_cmd[@]}" get "$bucket_file" "$old_key" "$old_body_file"
+    "${pg_backfill_smoke_cmd[@]}" get "$bucket_file" "$old_key" "$old_body_file"
+    print_command "${pg_backfill_smoke_cmd[@]}" get "$bucket_file" "$new_key" "$new_body_file"
+    "${pg_backfill_smoke_cmd[@]}" get "$bucket_file" "$new_key" "$new_body_file"
+    print_command "${pg_backfill_smoke_cmd[@]}" get "$bucket_file" "$final_key" "$final_body_file"
+    "${pg_backfill_smoke_cmd[@]}" get "$bucket_file" "$final_key" "$final_body_file"
+
     echo "PASS: metadata PG migration UAT smoke transferred PG $target_metadata_pg from nodes 0,1 to nodes 2,3 and back"
 }
 
@@ -1687,16 +1722,27 @@ cleanup_metadata_pg_migration_smoke() {
     local bucket_file="$smoke_dir/bucket"
     local old_key_file="$smoke_dir/old-key"
     local new_key_file="$smoke_dir/new-key"
+    local final_key_file="$smoke_dir/final-key"
     [[ -s "$bucket_file" && -s "$old_key_file" && -s "$new_key_file" ]] || return 0
 
     local old_key
     local new_key
+    local final_key
     old_key="$(tr -d '[:space:]' <"$old_key_file")"
     new_key="$(tr -d '[:space:]' <"$new_key_file")"
+    final_key=""
+    if [[ -s "$final_key_file" ]]; then
+        final_key="$(tr -d '[:space:]' <"$final_key_file")"
+    fi
 
     echo "== argmin-s3 UAT metadata PG migration cleanup iteration $iteration =="
-    print_command "${pg_backfill_smoke_cmd[@]}" cleanup "$bucket_file" "$old_key" "$new_key"
-    "${pg_backfill_smoke_cmd[@]}" cleanup "$bucket_file" "$old_key" "$new_key"
+    if [[ -n "$final_key" ]]; then
+        print_command "${pg_backfill_smoke_cmd[@]}" cleanup "$bucket_file" "$old_key" "$new_key" "$final_key"
+        "${pg_backfill_smoke_cmd[@]}" cleanup "$bucket_file" "$old_key" "$new_key" "$final_key"
+    else
+        print_command "${pg_backfill_smoke_cmd[@]}" cleanup "$bucket_file" "$old_key" "$new_key"
+        "${pg_backfill_smoke_cmd[@]}" cleanup "$bucket_file" "$old_key" "$new_key"
+    fi
 }
 
 assert_pg_backfill_migration_final_clean() {

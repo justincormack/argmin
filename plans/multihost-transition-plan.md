@@ -8152,6 +8152,11 @@ Metadata PG migration and backfill design notes:
   prefix and replay the retained suffix for later writes, matching the
   long-lived cluster case where a PG moves several times before checkpoint
   artifacts exist.
+- Extended the `metadata-pg-migration` UAT smoke to cover the same repeated
+  reshuffle shape in a live multihost process lifetime. Each iteration now
+  writes on the original acting set, transfers to `[2,3]`, writes there,
+  returns to `[0,1]`, writes again, transfers to `[2,3]` a second time, verifies
+  all objects, and finally returns the PG to `[0,1]` before cleanup.
 
 Exit criteria:
 
