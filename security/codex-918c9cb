@@ -1,0 +1,211 @@
+Live metadata transfer can race in-flight writes
+Link: https://chatgpt.com/codex/cloud/security/findings/a598d0273ea881919344a677f03c9628?sev=&repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin
+Criticality: medium (attack path: medium)
+Status: fixed
+
+# Resolution
+Fixed in commit [`efec86dd`](https://github.com/justincormack/argmin/commit/efec86ddda12d27f63270d764a193f5d8855a6ef) (`Drain source leases before live metadata transfer export`).
+
+The finding was valid for the reported commit `918c9cb`: the live metadata-transfer command fenced the source PG and immediately exported/imported metadata without waiting for previously issued Active route leases to expire. A stale frontend or storage-node view could therefore still commit a metadata command on the old source after the export snapshot had been taken.
+
+The fix makes the live transfer fence return and persist the source active primary lease deadline. The admin command now waits for that deadline before exporting, refreshes the fenced Peering runtime map after the wait, and verifies the source route still matches the fenced source node. Retry/interruption handling is also fail-closed: already-fenced PGs reuse the persisted deadline, and older fenced records without a stored deadline wait conservatively for the maximum unexpired source acting-set lease instead of guessing from the first acting-set member.
+
+Regression coverage includes the exact retry fallback case `fenced_metadata_transfer_retry_without_stored_deadline_uses_max_source_lease`, the live-command wait helper test `metadata_transfer_source_lease_wait_duration_waits_until_deadline`, and the existing metadata-transfer/control-plane suites. Verification for the resolution:
+- `cargo test -p storage fenced_metadata_transfer_retry_without_stored_deadline_uses_max_source_lease -- --nocapture`
+- `cargo test -p storage metadata_transfer -- --nocapture`
+- `cargo test -p storage control_plane -- --nocapture`
+- `cargo test -p argmin-s3 metadata_transfer -- --nocapture`
+- `./scripts/uat-s3-tests --smoke metadata-pg-migration`
+- `cargo nextest run` passed 5590 tests.
+
+# Metadata
+Repo: justincormack/argmin
+Commit: 918c9cb
+Fixed Commit: efec86dd
+Author: justin@specialbusservice.com
+Created: 22/06/2026, 22:25:29
+Assignee: Unassigned
+Signals: Security, Validated, Attack-path
+
+# Summary
+Introduced bug: the new live transfer flow lacks a real drain/lease-expiry/in-flight-operation barrier between fencing and exporting source metadata. This can lead to metadata rollback or loss for writes racing with an operator-triggered live non-overlap PG migration.
+The new `control-plane-transfer-pg-metadata-live` path treats `fence_pg_for_metadata_transfer` as a complete quiescence barrier. However, the fence only changes the control-plane PG state to `Peering`; it does not wait for storage nodes/frontends that still have the previous active runtime map or already-open/in-flight RPCs to stop issuing old-epoch metadata commands. The transfer command then immediately snapshots the source retained log, computes a destination proof, switches the acting set, and imports that artifact. A write that races after the exported source state is read but before all old active-route operations are rejected can be acknowledged on the old source but be absent from the transferred artifact, causing the destination PG to activate with metadata that omits the write. The export code also reads replica state, pending slot state, and retained log entries as separate operations without a migration-wide barrier that prevents a concurrent command from being installed after the snapshot point.
+
+# Validation
+## Rubric
+- [x] Confirm the live migration command fences and immediately exports/imports without an explicit drain, lease-expiry wait, or in-flight barrier.
+- [x] Confirm `fence_pg_for_metadata_transfer` only changes control-plane PG state to Peering and does not revoke already-issued Active runtime maps.
+- [x] Confirm stale Active route maps remain locally valid until their validity deadline and can still authorize/apply metadata commands.
+- [x] Demonstrate an export snapshot can be taken at log index N while a stale Active route later commits log index N+1 on the old source.
+- [x] Demonstrate destination import accepts the artifact at log index N and lacks the post-export source metadata write.
+## Report
+Validated the finding as a semantic data-loss race, not a memory-safety crash. Crash/Valgrind validation was not applicable/available: `valgrind` and `gdb` were absent in the container, but I built the Rust test target with debug info and used LLDB non-interactively.
+
+Key code evidence: `crates/argmin-s3/src/main.rs:583-600` fences the PG and immediately builds a source cluster/export artifact; `main.rs:615-632` then installs the destination acting set and imports that previously exported artifact. `crates/storage/src/control_plane.rs:1670-1695` shows `fence_pg_for_metadata_transfer` only transitions Active to Peering via `set_pg_state`; it does not wait for frontend/storage-node route-map expiry or in-flight metadata commands. Runtime-map validity is lease based (`control_plane.rs:546-552`) and local stale maps only reject after validity expiry (`cluster/local.rs:1718-1730`). The export path reads state/pending/log entries and builds the artifact from that snapshot (`cluster.rs:2373-2407`).
+
+Dynamic PoC: I added a focused unit test `live_metadata_transfer_without_drain_can_omit_stale_frontend_write_poc` in `crates/storage/src/cluster/local/tests/command_recovery.rs`. It creates three views over the same local stores: (1) an old Active source route with unexpired validity for node 0, (2) a fenced Peering source route used for export, and (3) a non-overlapping Peering destination route on nodes 1 and 2. The test writes command/log index 1, exports the artifact, then writes command/log index 2 through the still-valid stale Active route. Importing the artifact into the destination succeeds with applied_log_index 1; the second bucket exists on the old source at applied_log_index 2 but is absent from destination nodes, demonstrating acknowledged metadata loss/rollback.
+
+Reproduction output: `cargo test -p storage live_metadata_transfer_without_drain_can_omit_stale_frontend_write_poc -- --nocapture` produced `test ... ok` with `1 passed`. LLDB was run with a breakpoint at the post-export stale write line (`command_recovery.rs:1993`), and the trace shows the test stopped exactly at the stale Active write after artifact export, then continued and passed.
+
+# Evidence
+crates/argmin-s3/src/main.rs (L583 to 600)
+  Note: The live transfer command fences the PG and immediately fetches a runtime map and exports source metadata; there is no wait for old active-route leases, frontend maps, or in-flight storage-node RPCs to drain.
+```
+    let control_plane = UnixControlPlaneClient::new(socket_path);
+    control_plane
+        .fence_pg_for_metadata_transfer(pg_id)
+        .map_err(|error| format!("failed to fence live PG for metadata transfer: {error}"))?;
+    let source_runtime = control_plane
+        .runtime_map_snapshot(storage::clock::current_time_millis())
+        .map_err(|error| format!("failed to fetch fenced control-plane runtime map: {error}"))?;
+    let source_route = source_runtime
+        .pg_routes()
+        .iter()
+        .find(|route| route.pg_id() == pg_id)
+        .ok_or_else(|| format!("control-plane runtime map has no PG {}", pg_id.get()))?;
+    let source_node_id = source_route.primary_node_id();
+    let source_cluster =
+        build_frontend_storage_cluster_from_runtime_map(&config, &ec_config, &source_runtime)?;
+    let artifact = source_cluster
+        .export_pg_metadata_transfer_artifact_from_retained_log(pg_id, source_node_id)
+        .map_err(|error| format!("failed to export PG metadata transfer artifact: {error}"))?;
+```
+
+crates/argmin-s3/src/main.rs (L615 to 632)
+  Note: The command installs the destination acting set and imports the previously exported artifact, so any metadata command that races after the export snapshot is not included in the destination proof.
+```
+    let destination_runtime = control_plane
+        .set_pg_acting_set_with_metadata_transfer_runtime_map(pg_id, acting_set, transfer)
+        .map_err(|error| {
+            format!("failed to install transfer-backed live PG acting set: {error}")
+        })?;
+    let actual_destination_epoch = destination_runtime.cluster_epoch();
+    if actual_destination_epoch != destination_epoch {
+        return Err(format!(
+            "control-plane installed transfer at epoch {}, expected {}",
+            actual_destination_epoch.get(),
+            destination_epoch.get()
+        ));
+    }
+    let destination_cluster =
+        build_frontend_storage_cluster_from_runtime_map(&config, &ec_config, &destination_runtime)?;
+    let actual_imported_proof = destination_cluster
+        .import_pg_metadata_transfer_artifact_from_retained_log(&artifact)
+        .map_err(|error| format!("failed to import PG metadata transfer artifact: {error}"))?;
+```
+
+crates/storage/src/cluster.rs (L2373 to 2407)
+  Note: The export reads replica state, pending-command state, and retained log entries separately, then builds the artifact from that state. A command installed after these reads can be omitted from the artifact.
+```
+        let metadata_client = source_node.metadata_command_client();
+        let state = metadata_client.metadata_command_replica_state(pg_id)?;
+        let has_pending_metadata_command = metadata_client
+            .pending_metadata_command_envelope(pg_id, self.operation_epoch())?
+            .is_some();
+
+        let mut retained_log_entries = Vec::new();
+        let mut batch_start = 1;
+        while batch_start <= state.applied_log_index {
+            let batch_end = state
+                .applied_log_index
+                .min(batch_start + STORAGE_RPC_MAX_METADATA_COMMAND_LOG_ENTRY_RANGE_ENTRIES - 1);
+            let first_log_index = MetadataCommandLogIndex::new(batch_start)
+                .expect("metadata transfer retained entry range starts after zero");
+            let last_log_index = MetadataCommandLogIndex::new(batch_end)
+                .expect("metadata transfer retained entry range ends after zero");
+            retained_log_entries.extend(metadata_client.retained_metadata_command_log_entries(
+                pg_id,
+                self.operation_epoch(),
+                first_log_index,
+                last_log_index,
+            )?);
+            batch_start = batch_end + 1;
+        }
+
+        Ok(
+            build_pg_metadata_transfer_artifact_from_retained_log_entries(
+                self.operation_epoch(),
+                pg_id,
+                source_node_id,
+                state,
+                has_pending_metadata_command,
+                retained_log_entries,
+            )?,
+        )
+```
+
+crates/storage/src/control_plane.rs (L1670 to 1695)
+  Note: The fence operation only validates the current state and changes the PG to Peering; it does not revoke or wait out previously issued active routes/leases or coordinate with in-flight writers.
+```
+    pub fn fence_pg_for_metadata_transfer(
+        &mut self,
+        pg_id: PgId,
+    ) -> Result<ClusterControlSnapshot, ControlPlaneError> {
+        let record = self
+            .snapshot
+            .pg(pg_id)
+            .ok_or(ControlPlaneError::UnknownPg { pg_id: pg_id.get() })?;
+        match record.state {
+            PgState::Peering => return Ok(self.snapshot.clone()),
+            PgState::Active => {
+                if record.active_metadata_proof.is_none() {
+                    return Err(ControlPlaneError::ActivePgMissingMetadataProof {
+                        pg_id: pg_id.get(),
+                    });
+                }
+            }
+            state => {
+                return Err(ControlPlaneError::PgNotActive {
+                    pg_id: pg_id.get(),
+                    cluster_epoch: self.snapshot.cluster_epoch(),
+                    state,
+                });
+            }
+        }
+        self.set_pg_state(pg_id, PgState::Peering)
+```
+
+# Attack-path analysis
+Final: medium | Decider: model_decided | Matrix severity: ignore | Policy adjusted: ignore
+## Rationale
+Kept at medium. The code evidence and validation PoC support a real race in in-scope product code with concrete metadata integrity/availability impact. However, it is not high/critical because the attacker cannot normally initiate the migration remotely, must already have write authorization, and must win a narrow race against an operational live PG transfer. Existing SigV4/authz and private control-plane socket controls materially reduce likelihood, while the missing drain/lease-expiry barrier keeps the integrity impact security-relevant.
+## Likelihood
+low - Exploitation requires valid write authorization, precise timing, and an operator or automation running the live metadata transfer. The control-plane trigger itself is local/admin-only and protected by a private Unix socket directory.
+## Impact
+medium - A successful race can lose or roll back acknowledged metadata operations for the affected placement group during migration. This affects data integrity and potentially availability, but it does not provide code execution, credential theft, authentication bypass, or direct unauthorized access to arbitrary objects.
+## Assumptions
+- The deployment uses the multihost/control-plane role and the new live PG metadata transfer command.
+- An authenticated S3 client can continue issuing metadata-changing requests through a frontend/storage route map that was obtained before the PG was fenced.
+- The operator-initiated live migration is a legitimate in-scope operational action, but the attacker cannot normally initiate it remotely.
+- valid S3 credentials or otherwise authorized write access
+- operator or automation starts `control-plane-transfer-pg-metadata-live` for the affected PG
+- old active route map or in-flight metadata RPC remains usable after the fence
+- attacker write races after export snapshot and before stale-route rejection or lease expiry
+## Path
+Authenticated writer -> stale frontend route -> old source write
+Operator transfer -> fence(Peering) -> export artifact -> install destination -> import artifact
+Race result: destination PG omits the acknowledged old-source write
+## Path evidence
+- `crates/argmin-s3/src/main.rs:356-371` - Main binary exposes the `control-plane-transfer-pg-metadata-live` command that invokes the vulnerable live transfer path.
+- `crates/argmin-s3/src/main.rs:583-600` - Live transfer fences the PG, immediately fetches a runtime map, builds a source cluster, and exports the metadata artifact without a drain or lease-expiry wait.
+- `crates/argmin-s3/src/main.rs:615-632` - The destination acting set is installed and imports the previously exported artifact, so post-export source writes are not included.
+- `crates/storage/src/control_plane.rs:1670-1695` - The fence operation only validates state and transitions the PG to Peering via `set_pg_state`; it does not coordinate with clients or in-flight storage commands.
+- `crates/storage/src/control_plane.rs:546-552` - Runtime-map validity is derived from primary lease deadlines, leaving a window where old maps can remain valid.
+- `crates/storage/src/cluster/local.rs:1718-1730` - Local route maps are considered valid until `valid_until_ms`; they are rejected only after expiry.
+- `crates/storage/src/cluster.rs:2373-2407` - Export reads replica state, pending command state, and retained log entries as separate operations before building the transfer artifact.
+- `crates/argmin-s3/src/main.rs:869-907` - Control-plane socket directory is made and validated private, reducing exposure of migration control to local/admin scope.
+- `crates/auth/src/request.rs:178-261` - S3 requests pass through SigV4/presigned authentication handling; remote exploitation requires authorized write capability unless a bucket is intentionally public-write.
+- `crates/argmin-s3/src/config.rs:101-105` - Configuration documents required credentials and the default listen address `127.0.0.1:9000`, supporting local/internal default exposure.
+## Narrative
+The finding is valid as a product data-integrity race, but not a high/critical remotely triggerable compromise. The live transfer CLI is present in the main binary and calls `fence_pg_for_metadata_transfer`, then immediately obtains a runtime map and exports source metadata. The fence implementation only changes the PG state to Peering; it does not wait for old runtime-map leases or in-flight metadata RPCs. Runtime maps remain valid until their lease deadline, and stale local maps are rejected only after expiry. The export path separately reads replica state, pending-command state, and retained log entries, then the destination imports that earlier artifact. A validated PoC demonstrated a stale active route accepting a second metadata command after export, while the destination imported only log index 1. Exploitability is constrained because the attacker needs valid write authorization and must race an operator-initiated live migration, so medium is appropriate.
+## Controls
+- SigV4 request authentication and presigned URL validation for S3 APIs
+- bucket/object authorization in server-core before metadata-changing operations
+- control-plane management is over a Unix socket rather than a public HTTP endpoint
+- control-plane socket parent directory is required to be private and owner-controlled
+- runtime maps have lease expiry, but expiry is not currently waited out by live transfer
+## Blindspots
+- Static review did not prove which exact S3 operations map to affected metadata PG commands in all deployments.
+- No deployment manifests or ingress definitions were present to confirm whether the S3 port is exposed publicly or only internally.
+- Cross-tenant impact was not verified; the demonstrated impact is metadata loss/inconsistency for the affected PG during migration.
+- The live migration feature may be rarely used in default single-node deployments.
