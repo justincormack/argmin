@@ -8261,6 +8261,15 @@ Metadata PG migration and backfill design notes:
   suffix, and validate the combined artifact before returning it. This still
   needs a durable historical-checkpoint store and selection policy before live
   migration can use checkpoint-plus-suffix to avoid full checkpoint transfer.
+- Fixed the full-checkpoint live-transfer fallback to preserve the fenced
+  source replica epoch. The fallback now reads the selected Peering source
+  replica state first, requests the checkpoint at that replica epoch, and emits
+  the artifact with the source/checkpoint epoch rather than the current fenced
+  route epoch. This matches retained-log and checkpoint-plus-suffix export
+  semantics and keeps interrupted live metadata transfer from constructing a
+  destination proof from the wrong source epoch. Durable historical checkpoint
+  storage and selection remain the next step before live transfer can prefer a
+  smaller checkpoint-plus-retained-suffix artifact over a full checkpoint.
 
 Exit criteria:
 

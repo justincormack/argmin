@@ -2702,9 +2702,17 @@ impl StorageCluster {
             .ok_or(PgPeeringReconstructionError::PrimaryMissing {
                 primary: source_node_id,
             })?;
-        let checkpoint = source_node
-            .metadata_command_client()
-            .metadata_command_checkpoint(pg_id, self.operation_epoch())?;
+        let metadata_client = source_node.metadata_command_client();
+        let state = metadata_client.metadata_command_replica_state(pg_id)?;
+        if state.cluster_epoch > self.operation_epoch() {
+            return Err(PgPeeringReconstructionError::StaleReplicaEpoch {
+                node_id: source_node_id,
+                replica_epoch: state.cluster_epoch,
+                cluster_epoch: self.operation_epoch(),
+            }
+            .into());
+        }
+        let checkpoint = metadata_client.metadata_command_checkpoint(pg_id, state.cluster_epoch)?;
         let proof = PgMetadataProof::new(
             checkpoint.applied_log_index,
             checkpoint.applied_log_hash,
@@ -2713,7 +2721,7 @@ impl StorageCluster {
         Ok(PgMetadataTransferArtifact {
             pg_id,
             source_node_id,
-            cluster_epoch: self.operation_epoch(),
+            cluster_epoch: checkpoint.cluster_epoch,
             base_kind: PgMetadataTransferBaseKind::Checkpoint,
             base_proof: proof,
             checkpoint_base: Some(checkpoint),

@@ -2066,6 +2066,16 @@ fn metadata_transfer_export_preserves_source_log_epoch_under_fenced_route() {
             crate::metadata_command::MetadataCommandLogRangeEntryKind::Applied(command)
                 if command.id().cluster_epoch() == source_state.cluster_epoch
         )));
+
+    let checkpoint_artifact = cluster
+        .export_pg_metadata_transfer_from_checkpoint(pg_id, NodeId::new(0))
+        .unwrap();
+    assert_eq!(
+        checkpoint_artifact.cluster_epoch,
+        source_state.cluster_epoch
+    );
+    assert!(checkpoint_artifact.retained_log_entries.is_empty());
+    assert_eq!(checkpoint_artifact.source_metadata_proof(), artifact.proof);
 }
 
 #[test]
@@ -3559,6 +3569,81 @@ fn metadata_transfer_live_export_falls_back_to_checkpoint_without_retained_state
             checkpoint.applied_log_index,
             checkpoint.applied_log_hash,
             checkpoint.state_digest
+        )
+    );
+}
+
+#[test]
+fn metadata_transfer_live_checkpoint_fallback_preserves_source_epoch_under_fenced_route() {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[1], ec_shape).unwrap();
+    let topology = map
+        .node(NodeId::new(0))
+        .unwrap()
+        .storage_node()
+        .pg_topology();
+    let bucket = bucket_for_pg(topology, 1, "metadata-transfer-fenced-checkpoint-fallback-");
+    set_route_primary(&mut map, 1, NodeId::new(0));
+    set_route_state(&mut map, 1, PgState::Peering);
+    let pg_id = PgId::new(1);
+    let command = create_bucket_metadata_command(pg_id, 1, bucket);
+    let source_pg = map
+        .node(NodeId::new(0))
+        .unwrap()
+        .storage_node()
+        .get_pg(1)
+        .unwrap();
+    source_pg
+        .apply_metadata_command_and_record(0, &command)
+        .unwrap();
+    let source_state = source_pg.metadata_command_replica_state().unwrap();
+    source_pg
+        .connection()
+        .execute(
+            "UPDATE metadata_command_log SET post_state_digest = NULL WHERE cluster_epoch = ?1 AND pg_id = ?2 AND log_index = ?3",
+            rusqlite::params![ClusterEpoch::INITIAL.get() as i64, pg_id.get() as i64, 1_i64],
+        )
+        .unwrap();
+    drop(source_pg);
+
+    let fenced_epoch = ClusterEpoch::new(2).unwrap();
+    map.epoch = fenced_epoch;
+    for route in map.pg_routes.values_mut() {
+        route.cluster_epoch = fenced_epoch;
+    }
+    let cluster = crate::StorageCluster::from_local_map(Arc::new(map)).unwrap();
+
+    let retained_log_err = cluster
+        .export_pg_metadata_transfer_from_retained_log(pg_id, NodeId::new(0))
+        .unwrap_err();
+    assert!(matches!(
+        retained_log_err,
+        crate::peering::PgPeeringReconstructionFailure::Reconstruction(
+            crate::peering::PgPeeringReconstructionError::MissingRetainedCommandStateProof {
+                node_id,
+                log_index: 1,
+                ..
+            }
+        ) if node_id == NodeId::new(0)
+    ));
+
+    let artifact = cluster
+        .export_pg_metadata_transfer_artifact_for_live_transfer(pg_id, NodeId::new(0))
+        .unwrap();
+
+    assert_eq!(
+        artifact.source_base_kind(),
+        crate::peering::PgMetadataTransferBaseKind::Checkpoint
+    );
+    assert_eq!(artifact.cluster_epoch, source_state.cluster_epoch);
+    assert_eq!(
+        artifact.source_metadata_proof(),
+        crate::control_plane::PgMetadataProof::new(
+            source_state.applied_log_index,
+            source_state.applied_log_hash,
+            source_state.state_digest,
         )
     );
 }
