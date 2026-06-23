@@ -587,6 +587,9 @@ fn store_error_diagnostic_cause_label(error: &StoreError) -> &'static str {
         StoreError::MetadataCommandPendingConflict { .. } => "metadata_command_pending_conflict",
         StoreError::MetadataCommandContention { .. } => "metadata_command_contention",
         StoreError::MetadataTransferEmpty { .. } => "metadata_transfer_empty",
+        StoreError::MetadataTransferUnsupportedProof { .. } => {
+            "metadata_transfer_unsupported_proof"
+        }
         StoreError::MetadataCommandPendingOnNonPrimary { .. } => {
             "metadata_command_pending_on_non_primary"
         }

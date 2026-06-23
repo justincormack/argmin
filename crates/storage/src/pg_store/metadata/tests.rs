@@ -2234,6 +2234,155 @@ fn adopt_metadata_transfer_state_rejects_empty_command_list() {
 }
 
 #[test]
+fn initialize_metadata_transfer_empty_state_moves_canonical_empty_replica() {
+    let tmp = test_util::tempdir();
+    let store = PgStore::open(tmp.path(), 1).unwrap();
+    let source_state = store.metadata_command_replica_state().unwrap();
+    assert_eq!(source_state.applied_log_index, 0);
+    assert_eq!(source_state.applied_log_hash, 0);
+
+    let destination_epoch = ClusterEpoch::new(11).unwrap();
+    let initialized = store
+        .initialize_metadata_transfer_empty_state(0, destination_epoch, source_state.state_digest)
+        .unwrap();
+    assert_eq!(initialized.cluster_epoch, destination_epoch);
+    assert_eq!(initialized.applied_log_index, 0);
+    assert_eq!(initialized.applied_log_hash, 0);
+    assert_eq!(initialized.state_digest, source_state.state_digest);
+    assert_eq!(store.metadata_command_replica_state().unwrap(), initialized);
+}
+
+#[test]
+fn initialize_metadata_transfer_empty_state_rejects_nonempty_destination() {
+    let tmp = test_util::tempdir();
+    let store = PgStore::open(tmp.path(), 1).unwrap();
+    let bucket = trusted_bucket_name("initialize-empty-transfer-dirty");
+    let command = create_bucket_probe_command(1, 1, bucket, 1);
+    store
+        .apply_metadata_command_and_record(0, &command)
+        .unwrap();
+    let before = store.metadata_command_replica_state().unwrap();
+    let destination_epoch = ClusterEpoch::new(12).unwrap();
+
+    let err = store
+        .initialize_metadata_transfer_empty_state(0, destination_epoch, before.state_digest)
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        StoreError::MetadataCommandReplicaStateMissing { pg_id: 1 }
+    ));
+    assert_eq!(
+        store.metadata_command_replica_state().unwrap(),
+        before,
+        "failed empty-state initialization must not move a non-empty replica"
+    );
+}
+
+#[test]
+fn initialize_metadata_transfer_matching_state_moves_matching_nonempty_replica() {
+    let tmp = test_util::tempdir();
+    let store = PgStore::open(tmp.path(), 1).unwrap();
+    let bucket = trusted_bucket_name("initialize-matching-transfer");
+    let command = create_bucket_probe_command(1, 1, bucket, 1);
+    store
+        .apply_metadata_command_and_record(0, &command)
+        .unwrap();
+    let source_state = store.metadata_command_replica_state().unwrap();
+    let destination_epoch = ClusterEpoch::new(13).unwrap();
+
+    let initialized = store
+        .initialize_metadata_transfer_matching_state(
+            0,
+            destination_epoch,
+            0,
+            0,
+            source_state.state_digest,
+        )
+        .unwrap();
+    assert_eq!(initialized.cluster_epoch, destination_epoch);
+    assert_eq!(initialized.applied_log_index, 0);
+    assert_eq!(initialized.applied_log_hash, 0);
+    assert_eq!(initialized.state_digest, source_state.state_digest);
+    assert_eq!(store.metadata_command_replica_state().unwrap(), initialized);
+    assert_eq!(
+        store
+            .head_bucket_raw(&trusted_bucket_name("initialize-matching-transfer"))
+            .unwrap()
+            .name,
+        trusted_bucket_name("initialize-matching-transfer")
+    );
+}
+
+#[test]
+fn initialize_metadata_transfer_matching_state_rejects_dirty_digest() {
+    let tmp = test_util::tempdir();
+    let store = PgStore::open(tmp.path(), 1).unwrap();
+    let bucket = trusted_bucket_name("initialize-matching-transfer-dirty");
+    let command = create_bucket_probe_command(1, 1, bucket, 1);
+    store
+        .apply_metadata_command_and_record(0, &command)
+        .unwrap();
+    let before = store.metadata_command_replica_state().unwrap();
+    let destination_epoch = ClusterEpoch::new(14).unwrap();
+
+    let err = store
+        .initialize_metadata_transfer_matching_state(
+            0,
+            destination_epoch,
+            0,
+            0,
+            before.state_digest.wrapping_add(1),
+        )
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        StoreError::MetadataStateDigestMismatch { pg_id: 1, .. }
+    ));
+    assert_eq!(
+        store.metadata_command_replica_state().unwrap(),
+        before,
+        "failed matching-state initialization must not move the replica"
+    );
+}
+
+#[test]
+fn initialize_metadata_transfer_matching_state_rejects_unproven_log_tuple() {
+    let tmp = test_util::tempdir();
+    let store = PgStore::open(tmp.path(), 1).unwrap();
+    let bucket = trusted_bucket_name("initialize-matching-transfer-forged-proof");
+    let command = create_bucket_probe_command(1, 1, bucket, 1);
+    store
+        .apply_metadata_command_and_record(0, &command)
+        .unwrap();
+    let before = store.metadata_command_replica_state().unwrap();
+    let destination_epoch = ClusterEpoch::new(15).unwrap();
+
+    let err = store
+        .initialize_metadata_transfer_matching_state(
+            0,
+            destination_epoch,
+            7,
+            0x1234,
+            before.state_digest,
+        )
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        StoreError::MetadataTransferUnsupportedProof {
+            pg_id: 1,
+            applied_log_index: 7,
+            applied_log_hash: 0x1234,
+            ..
+        }
+    ));
+    assert_eq!(
+        store.metadata_command_replica_state().unwrap(),
+        before,
+        "failed matching-state initialization must not forge a proof tuple"
+    );
+}
+
+#[test]
 fn adopt_metadata_transfer_state_rejects_pending_command() {
     let tmp = test_util::tempdir();
     let store = PgStore::open(tmp.path(), 1).unwrap();

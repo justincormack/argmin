@@ -501,6 +501,8 @@ pub(crate) fn storage_rpc_admission_class(
         | StorageRpcMessageKind::MetadataCommandValidateReplayStatePreservingPending
         | StorageRpcMessageKind::MetadataCommandReplicaStateCanInitialize
         | StorageRpcMessageKind::MetadataCommandTransferStateAdopt
+        | StorageRpcMessageKind::MetadataCommandTransferEmptyStateInitialize
+        | StorageRpcMessageKind::MetadataCommandTransferMatchingStateInitialize
         | StorageRpcMessageKind::MetadataCommandAppliedLogHashes
         | StorageRpcMessageKind::MetadataCommandRetainedLogHashes
         | StorageRpcMessageKind::MetadataCommandRetainedLogEntries

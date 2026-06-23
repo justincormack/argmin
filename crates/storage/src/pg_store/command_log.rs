@@ -891,6 +891,156 @@ impl PgStore {
         Ok(true)
     }
 
+    pub(crate) fn initialize_metadata_transfer_empty_state(
+        &self,
+        node_id: u32,
+        cluster_epoch: ClusterEpoch,
+        expected_state_digest: u64,
+    ) -> Result<MetadataCommandReplicaState, StoreError> {
+        self.conn
+            .execute_batch("BEGIN IMMEDIATE")
+            .map_err(|e| StoreError::Db {
+                context: "begin metadata transfer empty state initialization",
+                source: e,
+            })?;
+
+        let result = (|| {
+            if self
+                .query_row_cached_optional(
+                    "SELECT 1 FROM metadata_command_pending_slot WHERE singleton = 0",
+                    [],
+                    "check metadata transfer empty destination pending slot",
+                    |_| Ok(()),
+                )?
+                .is_some()
+            {
+                return Err(StoreError::MetadataCommandContention {
+                    context: "initialize metadata transfer empty state with pending command",
+                });
+            }
+
+            if !self.metadata_command_replica_state_can_initialize()? {
+                return Err(StoreError::MetadataCommandReplicaStateMissing { pg_id: self.pg_id });
+            }
+
+            let actual_digest = self.metadata_state_digest()?;
+            if actual_digest != expected_state_digest {
+                return Err(StoreError::MetadataStateDigestMismatch {
+                    node_id,
+                    pg_id: self.pg_id,
+                    cluster_epoch,
+                    expected_digest: expected_state_digest,
+                    actual_digest,
+                });
+            }
+
+            self.update_metadata_command_replica_state_preserving_digest(
+                cluster_epoch,
+                0,
+                0,
+                expected_state_digest,
+            )
+            .map(|record| record.state)
+        })();
+
+        match result {
+            Ok(state) => {
+                self.conn.execute_batch("COMMIT").map_err(|e| {
+                    let _ = self.conn.execute_batch("ROLLBACK");
+                    StoreError::Db {
+                        context: "commit metadata transfer empty state initialization",
+                        source: e,
+                    }
+                })?;
+                self.mark_metadata_state_digest_clean()?;
+                Ok(state)
+            }
+            Err(error) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                Err(error)
+            }
+        }
+    }
+
+    pub(crate) fn initialize_metadata_transfer_matching_state(
+        &self,
+        node_id: u32,
+        cluster_epoch: ClusterEpoch,
+        applied_log_index: u64,
+        applied_log_hash: u64,
+        expected_state_digest: u64,
+    ) -> Result<MetadataCommandReplicaState, StoreError> {
+        if applied_log_index != 0 || applied_log_hash != 0 {
+            return Err(StoreError::MetadataTransferUnsupportedProof {
+                node_id,
+                pg_id: self.pg_id,
+                cluster_epoch,
+                applied_log_index,
+                applied_log_hash,
+            });
+        }
+
+        self.conn
+            .execute_batch("BEGIN IMMEDIATE")
+            .map_err(|e| StoreError::Db {
+                context: "begin metadata transfer matching state initialization",
+                source: e,
+            })?;
+
+        let result = (|| {
+            if self
+                .query_row_cached_optional(
+                    "SELECT 1 FROM metadata_command_pending_slot WHERE singleton = 0",
+                    [],
+                    "check metadata transfer matching destination pending slot",
+                    |_| Ok(()),
+                )?
+                .is_some()
+            {
+                return Err(StoreError::MetadataCommandContention {
+                    context: "initialize metadata transfer matching state with pending command",
+                });
+            }
+
+            let actual_digest = self.metadata_state_digest()?;
+            if actual_digest != expected_state_digest {
+                return Err(StoreError::MetadataStateDigestMismatch {
+                    node_id,
+                    pg_id: self.pg_id,
+                    cluster_epoch,
+                    expected_digest: expected_state_digest,
+                    actual_digest,
+                });
+            }
+
+            self.update_metadata_command_replica_state_preserving_digest(
+                cluster_epoch,
+                applied_log_index,
+                applied_log_hash,
+                expected_state_digest,
+            )
+            .map(|record| record.state)
+        })();
+
+        match result {
+            Ok(state) => {
+                self.conn.execute_batch("COMMIT").map_err(|e| {
+                    let _ = self.conn.execute_batch("ROLLBACK");
+                    StoreError::Db {
+                        context: "commit metadata transfer matching state initialization",
+                        source: e,
+                    }
+                })?;
+                self.mark_metadata_state_digest_clean()?;
+                Ok(state)
+            }
+            Err(error) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                Err(error)
+            }
+        }
+    }
+
     pub(crate) fn adopt_metadata_transfer_state_from_rebased_commands(
         &self,
         node_id: u32,

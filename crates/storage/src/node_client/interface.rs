@@ -1178,6 +1178,22 @@ pub(crate) trait MetadataCommandNodeClient: Send + Sync {
         cluster_epoch: ClusterEpoch,
     ) -> Result<bool, StoreError>;
 
+    fn initialize_metadata_transfer_empty_state(
+        &self,
+        pg_id: PgId,
+        cluster_epoch: ClusterEpoch,
+        expected_state_digest: u64,
+    ) -> Result<MetadataCommandReplicaState, StoreError>;
+
+    fn initialize_metadata_transfer_matching_state(
+        &self,
+        pg_id: PgId,
+        cluster_epoch: ClusterEpoch,
+        applied_log_index: u64,
+        applied_log_hash: u64,
+        expected_state_digest: u64,
+    ) -> Result<MetadataCommandReplicaState, StoreError>;
+
     fn adopt_metadata_transfer_state_from_rebased_commands(
         &self,
         pg_id: PgId,

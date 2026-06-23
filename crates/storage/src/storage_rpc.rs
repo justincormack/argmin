@@ -552,6 +552,8 @@ pub(crate) enum StorageRpcMessageKind {
     MetadataCommandValidateReplayStatePreservingPending = 24,
     MetadataCommandReplicaStateCanInitialize = 145,
     MetadataCommandTransferStateAdopt = 146,
+    MetadataCommandTransferEmptyStateInitialize = 147,
+    MetadataCommandTransferMatchingStateInitialize = 148,
     MetadataCommandAppliedLogHashes = 25,
     MetadataCommandMatchingAppliedLog = 26,
     MetadataCommandAbandoned = 27,
@@ -766,6 +768,12 @@ impl StorageRpcMessageKind {
                 "metadata command replica state can initialize"
             }
             Self::MetadataCommandTransferStateAdopt => "metadata command transfer state adopt",
+            Self::MetadataCommandTransferEmptyStateInitialize => {
+                "metadata command transfer empty state initialize"
+            }
+            Self::MetadataCommandTransferMatchingStateInitialize => {
+                "metadata command transfer matching state initialize"
+            }
             Self::MetadataCommandAppliedLogHashes => "metadata command applied log hashes",
             Self::MetadataCommandMatchingAppliedLog => "metadata command matching applied log",
             Self::MetadataCommandRetainedLogHashes => "metadata command retained log hashes",
@@ -935,6 +943,8 @@ impl StorageRpcMessageKind {
             24 => Ok(Self::MetadataCommandValidateReplayStatePreservingPending),
             145 => Ok(Self::MetadataCommandReplicaStateCanInitialize),
             146 => Ok(Self::MetadataCommandTransferStateAdopt),
+            147 => Ok(Self::MetadataCommandTransferEmptyStateInitialize),
+            148 => Ok(Self::MetadataCommandTransferMatchingStateInitialize),
             25 => Ok(Self::MetadataCommandAppliedLogHashes),
             26 => Ok(Self::MetadataCommandMatchingAppliedLog),
             27 => Ok(Self::MetadataCommandAbandoned),
@@ -2670,6 +2680,24 @@ pub(crate) struct StorageRpcMetadataCommandTransferAdoptRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StorageRpcMetadataCommandTransferEmptyStateRequest {
+    pub(crate) node_id: NodeId,
+    pub(crate) cluster_epoch: ClusterEpoch,
+    pub(crate) pg_id: PgId,
+    pub(crate) expected_state_digest: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StorageRpcMetadataCommandTransferMatchingStateRequest {
+    pub(crate) node_id: NodeId,
+    pub(crate) cluster_epoch: ClusterEpoch,
+    pub(crate) pg_id: PgId,
+    pub(crate) applied_log_index: u64,
+    pub(crate) applied_log_hash: u64,
+    pub(crate) expected_state_digest: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StorageRpcMetadataCommandLogHashRangeRequest {
     pub(crate) node_id: NodeId,
     pub(crate) cluster_epoch: ClusterEpoch,
@@ -3337,6 +3365,12 @@ fn message_kind_request_max_payload_len(
         | StorageRpcMessageKind::MetadataCommandValidateReplayStatePreservingPending
         | StorageRpcMessageKind::MetadataCommandReplicaStateCanInitialize => {
             STORAGE_RPC_MAX_METADATA_COMMAND_STATE_PAYLOAD_LEN
+        }
+        StorageRpcMessageKind::MetadataCommandTransferEmptyStateInitialize => {
+            STORAGE_RPC_MAX_METADATA_COMMAND_STATE_PAYLOAD_LEN + 8
+        }
+        StorageRpcMessageKind::MetadataCommandTransferMatchingStateInitialize => {
+            STORAGE_RPC_MAX_METADATA_COMMAND_STATE_PAYLOAD_LEN + 8 + 8 + 8
         }
         StorageRpcMessageKind::MetadataCommandTransferStateAdopt => STORAGE_RPC_MAX_PAYLOAD_LEN,
         StorageRpcMessageKind::MetadataCommandNextId => {
@@ -8574,6 +8608,70 @@ pub(crate) fn decode_metadata_command_transfer_adopt_request(
         pg_id,
         expected_state_digest,
         commands,
+    })
+}
+
+pub(crate) fn encode_metadata_command_transfer_empty_state_request(
+    request: &StorageRpcMetadataCommandTransferEmptyStateRequest,
+) -> Vec<u8> {
+    let mut out = encode_metadata_command_state_request(&StorageRpcMetadataCommandStateRequest {
+        node_id: request.node_id,
+        cluster_epoch: request.cluster_epoch,
+        pg_id: request.pg_id,
+    });
+    put_u64(&mut out, request.expected_state_digest);
+    out
+}
+
+pub(crate) fn decode_metadata_command_transfer_empty_state_request(
+    bytes: &[u8],
+) -> Result<StorageRpcMetadataCommandTransferEmptyStateRequest, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let node_id = NodeId::new(decoder.read_u32()?);
+    let cluster_epoch = decoder.read_cluster_epoch()?;
+    let pg_id = PgId::new(decoder.read_u32()?);
+    let expected_state_digest = decoder.read_u64()?;
+    decoder.finish()?;
+    Ok(StorageRpcMetadataCommandTransferEmptyStateRequest {
+        node_id,
+        cluster_epoch,
+        pg_id,
+        expected_state_digest,
+    })
+}
+
+pub(crate) fn encode_metadata_command_transfer_matching_state_request(
+    request: &StorageRpcMetadataCommandTransferMatchingStateRequest,
+) -> Vec<u8> {
+    let mut out = encode_metadata_command_state_request(&StorageRpcMetadataCommandStateRequest {
+        node_id: request.node_id,
+        cluster_epoch: request.cluster_epoch,
+        pg_id: request.pg_id,
+    });
+    put_u64(&mut out, request.applied_log_index);
+    put_u64(&mut out, request.applied_log_hash);
+    put_u64(&mut out, request.expected_state_digest);
+    out
+}
+
+pub(crate) fn decode_metadata_command_transfer_matching_state_request(
+    bytes: &[u8],
+) -> Result<StorageRpcMetadataCommandTransferMatchingStateRequest, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let node_id = NodeId::new(decoder.read_u32()?);
+    let cluster_epoch = decoder.read_cluster_epoch()?;
+    let pg_id = PgId::new(decoder.read_u32()?);
+    let applied_log_index = decoder.read_u64()?;
+    let applied_log_hash = decoder.read_u64()?;
+    let expected_state_digest = decoder.read_u64()?;
+    decoder.finish()?;
+    Ok(StorageRpcMetadataCommandTransferMatchingStateRequest {
+        node_id,
+        cluster_epoch,
+        pg_id,
+        applied_log_index,
+        applied_log_hash,
+        expected_state_digest,
     })
 }
 
@@ -16185,6 +16283,38 @@ mod tests {
         );
         assert_eq!(decoded.commands[0].pre_state_digest, 4321);
         assert_eq!(decoded.commands[0].post_state_digest, 1234);
+    }
+
+    #[test]
+    fn metadata_command_transfer_empty_state_request_round_trips() {
+        let request = StorageRpcMetadataCommandTransferEmptyStateRequest {
+            node_id: NodeId::new(7),
+            cluster_epoch: ClusterEpoch::new(3).unwrap(),
+            pg_id: PgId::new(11),
+            expected_state_digest: 1234,
+        };
+
+        let bytes = encode_metadata_command_transfer_empty_state_request(&request);
+        let decoded = decode_metadata_command_transfer_empty_state_request(&bytes).unwrap();
+
+        assert_eq!(decoded, request);
+    }
+
+    #[test]
+    fn metadata_command_transfer_matching_state_request_round_trips() {
+        let request = StorageRpcMetadataCommandTransferMatchingStateRequest {
+            node_id: NodeId::new(7),
+            cluster_epoch: ClusterEpoch::new(3).unwrap(),
+            pg_id: PgId::new(11),
+            applied_log_index: 4,
+            applied_log_hash: 5678,
+            expected_state_digest: 1234,
+        };
+
+        let bytes = encode_metadata_command_transfer_matching_state_request(&request);
+        let decoded = decode_metadata_command_transfer_matching_state_request(&bytes).unwrap();
+
+        assert_eq!(decoded, request);
     }
 
     #[test]

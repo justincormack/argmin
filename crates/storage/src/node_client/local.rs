@@ -3965,6 +3965,38 @@ impl MetadataCommandNodeClient for LocalStorageNodeClient {
         pg.metadata_command_replica_state_can_initialize()
     }
 
+    fn initialize_metadata_transfer_empty_state(
+        &self,
+        pg_id: PgId,
+        cluster_epoch: ClusterEpoch,
+        expected_state_digest: u64,
+    ) -> Result<MetadataCommandReplicaState, StoreError> {
+        let pg = self.storage_node.get_pg(pg_id.get())?;
+        pg.initialize_metadata_transfer_empty_state(
+            self.node_id.as_u32(),
+            cluster_epoch,
+            expected_state_digest,
+        )
+    }
+
+    fn initialize_metadata_transfer_matching_state(
+        &self,
+        pg_id: PgId,
+        cluster_epoch: ClusterEpoch,
+        applied_log_index: u64,
+        applied_log_hash: u64,
+        expected_state_digest: u64,
+    ) -> Result<MetadataCommandReplicaState, StoreError> {
+        let pg = self.storage_node.get_pg(pg_id.get())?;
+        pg.initialize_metadata_transfer_matching_state(
+            self.node_id.as_u32(),
+            cluster_epoch,
+            applied_log_index,
+            applied_log_hash,
+            expected_state_digest,
+        )
+    }
+
     fn adopt_metadata_transfer_state_from_rebased_commands(
         &self,
         pg_id: PgId,

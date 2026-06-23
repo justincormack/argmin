@@ -266,6 +266,17 @@ pub enum StoreError {
     },
 
     #[error(
+        "metadata transfer for local node {node_id} PG {pg_id} epoch {cluster_epoch} supplied unsupported unproven proof tuple log index {applied_log_index}, log hash {applied_log_hash:#018X}"
+    )]
+    MetadataTransferUnsupportedProof {
+        node_id: u32,
+        pg_id: u32,
+        cluster_epoch: ClusterEpoch,
+        applied_log_index: u64,
+        applied_log_hash: u64,
+    },
+
+    #[error(
         "shard operation for local node {node_id} PG {pg_id} has epoch {operation_epoch}, current cluster epoch is {current_epoch}"
     )]
     StaleShardOperation {

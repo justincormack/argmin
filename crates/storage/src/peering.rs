@@ -95,10 +95,6 @@ pub(crate) enum PgPeeringReconstructionError {
         state: PgState,
     },
     #[error(
-        "PG metadata transfer artifact for PG {pg_id} has no retained commands; empty metadata import requires checkpoint/state bootstrap"
-    )]
-    EmptyTransferArtifact { pg_id: PgId },
-    #[error(
         "PG metadata transfer source {node_id:?} retained command log entry {log_index} for PG {pg_id} is missing its post-state digest proof"
     )]
     MissingRetainedCommandStateProof {
@@ -502,11 +498,6 @@ pub(crate) fn rebase_pg_metadata_transfer_artifact_commands(
     artifact: &PgMetadataTransferArtifact,
     destination_cluster_epoch: ClusterEpoch,
 ) -> Result<Vec<MetadataTransferCommand>, PgPeeringReconstructionError> {
-    if artifact.proof.applied_log_index == 0 {
-        return Err(PgPeeringReconstructionError::EmptyTransferArtifact {
-            pg_id: artifact.pg_id,
-        });
-    }
     let source_state = MetadataCommandReplicaState {
         cluster_epoch: artifact.cluster_epoch,
         applied_log_index: artifact.proof.applied_log_index,

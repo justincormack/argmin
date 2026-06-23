@@ -783,14 +783,19 @@ impl MetadataCommandNodeClient for UnixStorageNodeMetadataCommandSession {
         pg_id: PgId,
         cluster_epoch: ClusterEpoch,
     ) -> Result<MetadataCommandReplicaState, StoreError> {
-        if cluster_epoch != self.cluster_epoch {
+        if cluster_epoch > self.cluster_epoch {
             return Err(StoreError::StalePayloadOperation {
                 pg_id: pg_id.get(),
                 operation_epoch: cluster_epoch,
                 current_epoch: self.cluster_epoch,
             });
         }
-        let payload = self.encode_metadata_command_state_request(pg_id);
+        let payload =
+            encode_metadata_command_state_request(&StorageRpcMetadataCommandStateRequest {
+                node_id: self.node_id,
+                cluster_epoch,
+                pg_id,
+            });
         let response = self.rpc_request(
             StorageRpcMessageKind::MetadataCommandValidateReplayState,
             payload,
@@ -810,14 +815,19 @@ impl MetadataCommandNodeClient for UnixStorageNodeMetadataCommandSession {
         pg_id: PgId,
         cluster_epoch: ClusterEpoch,
     ) -> Result<MetadataCommandReplicaState, StoreError> {
-        if cluster_epoch != self.cluster_epoch {
+        if cluster_epoch > self.cluster_epoch {
             return Err(StoreError::StalePayloadOperation {
                 pg_id: pg_id.get(),
                 operation_epoch: cluster_epoch,
                 current_epoch: self.cluster_epoch,
             });
         }
-        let payload = self.encode_metadata_command_state_request(pg_id);
+        let payload =
+            encode_metadata_command_state_request(&StorageRpcMetadataCommandStateRequest {
+                node_id: self.node_id,
+                cluster_epoch,
+                pg_id,
+            });
         let response = self.rpc_request(
             StorageRpcMessageKind::MetadataCommandValidateReplayStatePreservingPending,
             payload,
@@ -854,6 +864,78 @@ impl MetadataCommandNodeClient for UnixStorageNodeMetadataCommandSession {
             .map_err(|error| {
                 self.rpc_payload_error(
                     "decode metadata command replica state can initialize response",
+                    error.to_string(),
+                )
+            })
+    }
+
+    fn initialize_metadata_transfer_empty_state(
+        &self,
+        pg_id: PgId,
+        cluster_epoch: ClusterEpoch,
+        expected_state_digest: u64,
+    ) -> Result<MetadataCommandReplicaState, StoreError> {
+        if cluster_epoch != self.cluster_epoch {
+            return Err(StoreError::StalePayloadOperation {
+                pg_id: pg_id.get(),
+                operation_epoch: cluster_epoch,
+                current_epoch: self.cluster_epoch,
+            });
+        }
+        let request = StorageRpcMetadataCommandTransferEmptyStateRequest {
+            node_id: self.node_id,
+            cluster_epoch,
+            pg_id,
+            expected_state_digest,
+        };
+        let payload = encode_metadata_command_transfer_empty_state_request(&request);
+        let response = self.rpc_request(
+            StorageRpcMessageKind::MetadataCommandTransferEmptyStateInitialize,
+            payload,
+        )?;
+        decode_metadata_command_state_response(&response)
+            .map(|response| response.state)
+            .map_err(|error| {
+                self.rpc_payload_error(
+                    "decode metadata command transfer empty state response",
+                    error.to_string(),
+                )
+            })
+    }
+
+    fn initialize_metadata_transfer_matching_state(
+        &self,
+        pg_id: PgId,
+        cluster_epoch: ClusterEpoch,
+        applied_log_index: u64,
+        applied_log_hash: u64,
+        expected_state_digest: u64,
+    ) -> Result<MetadataCommandReplicaState, StoreError> {
+        if cluster_epoch != self.cluster_epoch {
+            return Err(StoreError::StalePayloadOperation {
+                pg_id: pg_id.get(),
+                operation_epoch: cluster_epoch,
+                current_epoch: self.cluster_epoch,
+            });
+        }
+        let request = StorageRpcMetadataCommandTransferMatchingStateRequest {
+            node_id: self.node_id,
+            cluster_epoch,
+            pg_id,
+            applied_log_index,
+            applied_log_hash,
+            expected_state_digest,
+        };
+        let payload = encode_metadata_command_transfer_matching_state_request(&request);
+        let response = self.rpc_request(
+            StorageRpcMessageKind::MetadataCommandTransferMatchingStateInitialize,
+            payload,
+        )?;
+        decode_metadata_command_state_response(&response)
+            .map(|response| response.state)
+            .map_err(|error| {
+                self.rpc_payload_error(
+                    "decode metadata command transfer matching state response",
                     error.to_string(),
                 )
             })

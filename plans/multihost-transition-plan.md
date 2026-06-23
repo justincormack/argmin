@@ -8099,6 +8099,37 @@ Metadata PG migration and backfill design notes:
   round-trip shape needs an explicit base proof, checkpoint, or state bootstrap
   primitive. This keeps dirty or forked destination state fail-closed. Empty PG
   transfer still needs the same explicit state/checkpoint bootstrap primitive.
+- Added the explicit empty metadata-transfer bootstrap primitive. A retained-log
+  artifact with no commands can now initialize a canonical empty destination PG
+  by verifying the destination has no pending metadata command, has initialize-
+  eligible materialized state, and its materialized digest equals the exported
+  empty proof. This avoids abusing command replay for empty PG migration while
+  keeping the lower-level command adoption RPC non-empty.
+- Extended retained-log import for repeated reshuffles where a destination
+  already has a proven older prefix. Older-prefix adoption is allowed only when
+  the destination's old cluster epoch, applied log index, applied log hash, and
+  materialized digest exactly match the retained prefix proof reconstructed at
+  that old epoch, and replay-state validation confirms the same proof before
+  any suffix command is applied. Digest-only base matches, digest-only
+  post-command prefix matches, and invented new-epoch suffixes over an imported
+  materialized base still fail closed. The remaining general path is an
+  explicit checkpoint/base-proof artifact that can prove a non-empty base state
+  before replaying a retained suffix.
+- Added a matching-state bootstrap primitive for state-only metadata transfer
+  imports. When the retained-log artifact contains no commands and a
+  destination PG already has the exact materialized digest named by the imported
+  proof, the destination can install the imported proof tuple after validating
+  there is no pending metadata command. This covers empty or already-equivalent
+  state transfer without reopening the lower-level command-adoption path to
+  empty command lists.
+- The metadata migration UAT now reaches the harder return-transfer case:
+  after `[0,1] -> [2,3]`, a write on the new acting set can require returning a
+  retained suffix to `[0,1]` where those nodes still hold a non-empty historical
+  base from the old epoch. The current artifact carries the base state digest
+  but not enough proof to show that this old-epoch base is the same logical
+  prefix as the source's retained suffix. That path remains fail-closed until
+  the artifact includes an explicit base proof/checkpoint or the transfer path
+  can import a full materialized checkpoint before replaying the suffix.
 
 Exit criteria:
 

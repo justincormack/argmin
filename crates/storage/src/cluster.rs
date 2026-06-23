@@ -1405,6 +1405,31 @@ fn metadata_transfer_destination_proof_for_commands(
     PgMetadataProof::new(applied_log_index, applied_log_hash, state_digest)
 }
 
+fn metadata_transfer_prefix_proof_at_epoch(
+    pg_id: PgId,
+    state_digest: u64,
+    commands: &[MetadataTransferCommand],
+    destination_cluster_epoch: ClusterEpoch,
+) -> PgMetadataProof {
+    let mut applied_log_hash = 0;
+    for (index, transfer_command) in commands.iter().enumerate() {
+        let log_index = MetadataCommandLogIndex::new((index + 1) as u64)
+            .expect("metadata transfer prefix log indexes are non-zero");
+        let command = MetadataCommandEnvelope::new(
+            MetadataCommandId::new(destination_cluster_epoch, pg_id, log_index),
+            transfer_command.command.payload().clone(),
+        );
+        applied_log_hash = metadata_command_log_hash(
+            destination_cluster_epoch,
+            pg_id,
+            log_index,
+            applied_log_hash,
+            command.checksum_crc64(),
+        );
+    }
+    PgMetadataProof::new(commands.len() as u64, applied_log_hash, state_digest)
+}
+
 impl StorageCluster {
     pub fn metadata_transfer_imported_proof_at_epoch(
         artifact: &PgMetadataTransferArtifact,
@@ -1483,30 +1508,6 @@ fn classify_metadata_transfer_import_destination(
         if let Some(first_command) = commands.first() {
             if state.state_digest == first_command.pre_state_digest {
                 let base_proof = PgMetadataProof::new(0, 0, first_command.pre_state_digest);
-                let actual_proof = PgMetadataProof::new(
-                    state.applied_log_index,
-                    state.applied_log_hash,
-                    state.state_digest,
-                );
-                if state.cluster_epoch == cluster_epoch {
-                    if actual_proof == base_proof {
-                        return Ok(MetadataTransferImportDestination::AdoptPrefix {
-                            prefix_len: 0,
-                        });
-                    }
-                    return Err(
-                        PgPeeringReconstructionError::DirtyMetadataTransferDestination {
-                            node_id,
-                            pg_id,
-                            cluster_epoch,
-                            applied_log_index: state.applied_log_index,
-                            applied_log_hash: state.applied_log_hash,
-                            state_digest: state.state_digest,
-                            expected: base_proof,
-                        }
-                        .into(),
-                    );
-                }
                 return Err(
                     PgPeeringReconstructionError::DirtyMetadataTransferDestination {
                         node_id,
@@ -1555,6 +1556,27 @@ fn classify_metadata_transfer_import_destination(
                     .into(),
                 );
             }
+            let historical_prefix_proof = metadata_transfer_prefix_proof_at_epoch(
+                pg_id,
+                command.post_state_digest,
+                &commands[..prefix_len],
+                state.cluster_epoch,
+            );
+            if actual_proof == historical_prefix_proof {
+                let validated = metadata_client
+                    .validate_metadata_command_replay_state_preserving_pending_slot(
+                        pg_id,
+                        state.cluster_epoch,
+                    )?;
+                let validated_proof = PgMetadataProof::new(
+                    validated.applied_log_index,
+                    validated.applied_log_hash,
+                    validated.state_digest,
+                );
+                if validated_proof == historical_prefix_proof {
+                    return Ok(MetadataTransferImportDestination::AdoptPrefix { prefix_len });
+                }
+            }
             return Err(
                 PgPeeringReconstructionError::DirtyMetadataTransferDestination {
                     node_id,
@@ -1563,7 +1585,7 @@ fn classify_metadata_transfer_import_destination(
                     applied_log_index: state.applied_log_index,
                     applied_log_hash: state.applied_log_hash,
                     state_digest: state.state_digest,
-                    expected: prefix_proof,
+                    expected: historical_prefix_proof,
                 }
                 .into(),
             );
@@ -2562,20 +2584,39 @@ impl StorageCluster {
             )? {
                 MetadataTransferImportDestination::AlreadyImported(state) => state,
                 MetadataTransferImportDestination::Empty => {
-                    let mut state = metadata_client.metadata_command_replica_state(pg_id)?;
-                    for command in &commands {
-                        state = metadata_client
-                            .replay_metadata_command_for_peering(pg_id, &command.command)?;
+                    if commands.is_empty() {
+                        metadata_client.initialize_metadata_transfer_empty_state(
+                            pg_id,
+                            self.operation_epoch(),
+                            artifact.proof.state_digest,
+                        )?
+                    } else {
+                        let mut state = metadata_client.metadata_command_replica_state(pg_id)?;
+                        for command in &commands {
+                            state = metadata_client
+                                .replay_metadata_command_for_peering(pg_id, &command.command)?;
+                        }
+                        state
                     }
-                    state
                 }
-                MetadataTransferImportDestination::AdoptExisting => metadata_client
-                    .adopt_metadata_transfer_state_from_rebased_commands(
-                        pg_id,
-                        self.operation_epoch(),
-                        &commands,
-                        artifact.proof.state_digest,
-                    )?,
+                MetadataTransferImportDestination::AdoptExisting => {
+                    if commands.is_empty() {
+                        metadata_client.initialize_metadata_transfer_matching_state(
+                            pg_id,
+                            self.operation_epoch(),
+                            expected_import_proof.applied_log_index,
+                            expected_import_proof.applied_log_hash,
+                            expected_import_proof.state_digest,
+                        )?
+                    } else {
+                        metadata_client.adopt_metadata_transfer_state_from_rebased_commands(
+                            pg_id,
+                            self.operation_epoch(),
+                            &commands,
+                            artifact.proof.state_digest,
+                        )?
+                    }
+                }
                 MetadataTransferImportDestination::AdoptPrefix { prefix_len } => {
                     if prefix_len > 0 {
                         metadata_client.adopt_metadata_transfer_state_from_rebased_commands(
