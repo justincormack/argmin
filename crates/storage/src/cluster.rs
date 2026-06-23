@@ -1450,6 +1450,7 @@ impl StorageCluster {
 enum MetadataTransferImportDestination {
     AlreadyImported(MetadataCommandReplicaState),
     Empty,
+    AdoptBase,
     AdoptExisting,
     AdoptPrefix { prefix_len: usize },
 }
@@ -1459,6 +1460,7 @@ fn classify_metadata_transfer_import_destination(
     node_id: NodeId,
     pg_id: PgId,
     cluster_epoch: ClusterEpoch,
+    base_import_proof: PgMetadataProof,
     expected_import_proof: PgMetadataProof,
     commands: &[MetadataTransferCommand],
 ) -> Result<MetadataTransferImportDestination, PgPeeringReconstructionFailure> {
@@ -1507,7 +1509,29 @@ fn classify_metadata_transfer_import_destination(
     if state.state_digest != expected_import_proof.state_digest {
         if let Some(first_command) = commands.first() {
             if state.state_digest == first_command.pre_state_digest {
-                let base_proof = PgMetadataProof::new(0, 0, first_command.pre_state_digest);
+                if base_import_proof.applied_log_index == 0
+                    && base_import_proof.applied_log_hash == 0
+                    && base_import_proof.state_digest == first_command.pre_state_digest
+                {
+                    let actual_proof = PgMetadataProof::new(
+                        state.applied_log_index,
+                        state.applied_log_hash,
+                        state.state_digest,
+                    );
+                    let validated = metadata_client
+                        .validate_metadata_command_replay_state_preserving_pending_slot(
+                            pg_id,
+                            state.cluster_epoch,
+                        )?;
+                    let validated_proof = PgMetadataProof::new(
+                        validated.applied_log_index,
+                        validated.applied_log_hash,
+                        validated.state_digest,
+                    );
+                    if validated_proof == actual_proof {
+                        return Ok(MetadataTransferImportDestination::AdoptBase);
+                    }
+                }
                 return Err(
                     PgPeeringReconstructionError::DirtyMetadataTransferDestination {
                         node_id,
@@ -1516,7 +1540,7 @@ fn classify_metadata_transfer_import_destination(
                         applied_log_index: state.applied_log_index,
                         applied_log_hash: state.applied_log_hash,
                         state_digest: state.state_digest,
-                        expected: base_proof,
+                        expected: base_import_proof,
                     }
                     .into(),
                 );
@@ -2567,6 +2591,7 @@ impl StorageCluster {
             rebase_pg_metadata_transfer_artifact_commands(artifact, self.operation_epoch())?;
         let expected_import_proof =
             metadata_transfer_destination_proof(artifact, &commands, self.operation_epoch());
+        let base_import_proof = artifact.source_base_metadata_proof();
         let nodes = self
             .local_map
             .metadata_pg_acting_nodes_for_peering_replay(self.operation_epoch(), pg_id)?;
@@ -2579,6 +2604,7 @@ impl StorageCluster {
                 node.node_id(),
                 pg_id,
                 self.operation_epoch(),
+                base_import_proof,
                 expected_import_proof,
                 &commands,
             )? {
@@ -2598,6 +2624,21 @@ impl StorageCluster {
                         }
                         state
                     }
+                }
+                MetadataTransferImportDestination::AdoptBase => {
+                    metadata_client.initialize_metadata_transfer_matching_state(
+                        pg_id,
+                        self.operation_epoch(),
+                        base_import_proof.applied_log_index,
+                        base_import_proof.applied_log_hash,
+                        base_import_proof.state_digest,
+                    )?;
+                    let mut state = metadata_client.metadata_command_replica_state(pg_id)?;
+                    for command in &commands {
+                        state = metadata_client
+                            .replay_metadata_command_for_peering(pg_id, &command.command)?;
+                    }
+                    state
                 }
                 MetadataTransferImportDestination::AdoptExisting => {
                     if commands.is_empty() {

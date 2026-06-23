@@ -8124,12 +8124,16 @@ Metadata PG migration and backfill design notes:
   empty command lists.
 - The metadata migration UAT now reaches the harder return-transfer case:
   after `[0,1] -> [2,3]`, a write on the new acting set can require returning a
-  retained suffix to `[0,1]` where those nodes still hold a non-empty historical
-  base from the old epoch. The current artifact carries the base state digest
-  but not enough proof to show that this old-epoch base is the same logical
-  prefix as the source's retained suffix. That path remains fail-closed until
-  the artifact includes an explicit base proof/checkpoint or the transfer path
-  can import a full materialized checkpoint before replaying the suffix.
+  retained suffix to `[0,1]` where those nodes still hold a non-empty
+  historical base from the old epoch. Retained-log artifacts now carry the
+  source base proof immediately before the transferred suffix. Import may
+  bootstrap a matching destination materialized base to the destination epoch
+  only when that base proof is the canonical zero-log proof `(0, 0, digest)`,
+  the destination has no pending metadata command, and replay-state validation
+  confirms the destination's existing old-epoch proof before any suffix replay.
+  This covers the current return-transfer UAT shape while keeping general
+  non-zero checkpoint/base adoption fail-closed until artifacts can carry a
+  durable checkpoint proof for that base.
 
 Exit criteria:
 

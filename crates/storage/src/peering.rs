@@ -36,6 +36,7 @@ pub struct PgMetadataTransferArtifact {
     pub(crate) pg_id: PgId,
     pub(crate) source_node_id: NodeId,
     pub(crate) cluster_epoch: ClusterEpoch,
+    pub(crate) base_proof: PgMetadataProof,
     pub(crate) proof: PgMetadataProof,
     pub(crate) retained_log_entries: Vec<MetadataCommandLogRangeEntry>,
 }
@@ -59,6 +60,11 @@ impl PgMetadataTransferArtifact {
     #[must_use]
     pub fn source_metadata_proof(&self) -> PgMetadataProof {
         self.proof
+    }
+
+    #[must_use]
+    pub fn source_base_metadata_proof(&self) -> PgMetadataProof {
+        self.base_proof
     }
 }
 
@@ -398,6 +404,7 @@ pub(crate) fn build_pg_metadata_transfer_artifact_from_retained_log_entries(
 
     let mut expected_previous_log_hash = 0;
     let mut expected_pre_state_digest = None;
+    let mut base_proof = None;
     for log_index in 1..=state.applied_log_index {
         let retained = retained_log_entries
             .iter()
@@ -445,6 +452,13 @@ pub(crate) fn build_pg_metadata_transfer_artifact_from_retained_log_entries(
                 },
             );
         };
+        if base_proof.is_none() {
+            base_proof = Some(PgMetadataProof::new(
+                log_index - 1,
+                retained.previous_log_hash,
+                pre_state_digest,
+            ));
+        }
         let expected = expected_pre_state_digest.unwrap_or(pre_state_digest);
         if pre_state_digest != expected {
             return Err(
@@ -488,6 +502,7 @@ pub(crate) fn build_pg_metadata_transfer_artifact_from_retained_log_entries(
         pg_id,
         source_node_id,
         cluster_epoch,
+        base_proof: base_proof.unwrap_or_else(|| proof_from_replica_state(state)),
         proof: proof_from_replica_state(state),
         retained_log_entries,
     })
@@ -504,7 +519,7 @@ pub(crate) fn rebase_pg_metadata_transfer_artifact_commands(
         applied_log_hash: artifact.proof.applied_log_hash,
         state_digest: artifact.proof.state_digest,
     };
-    build_pg_metadata_transfer_artifact_from_retained_log_entries(
+    let validated_artifact = build_pg_metadata_transfer_artifact_from_retained_log_entries(
         artifact.cluster_epoch,
         artifact.pg_id,
         artifact.source_node_id,
@@ -512,6 +527,18 @@ pub(crate) fn rebase_pg_metadata_transfer_artifact_commands(
         false,
         artifact.retained_log_entries.clone(),
     )?;
+    if validated_artifact.base_proof != artifact.base_proof {
+        return Err(
+            PgPeeringReconstructionError::RetainedCommandStateDigestFork {
+                node_id: artifact.source_node_id,
+                pg_id: artifact.pg_id,
+                log_index: artifact.base_proof.applied_log_index + 1,
+                expected_pre_state_digest: artifact.base_proof.state_digest,
+                actual_pre_state_digest: validated_artifact.base_proof.state_digest,
+                post_state_digest: validated_artifact.base_proof.state_digest,
+            },
+        );
+    }
 
     let mut commands = Vec::new();
     for log_index in 1..=artifact.proof.applied_log_index {
