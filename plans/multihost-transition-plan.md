@@ -8233,6 +8233,16 @@ Metadata PG migration and backfill design notes:
   export/import with a manifest and end-to-end digest verification, or a
   selection policy that can use retained-log transfer / checkpoint-plus-retained
   suffix transfer when that avoids a frame-sized checkpoint.
+- The live metadata-transfer admin path now selects between retained-log and
+  checkpoint export. It still prefers retained-log artifacts, but if the
+  retained log is structurally present and cannot be used because the retained
+  entries lack state-proof material or contain unreplayable abandoned entries,
+  it falls back to a full checkpoint-base artifact. Missing or corrupt command
+  log rows remain fail-closed because today's checkpoint exporter still proves
+  the full command-log hash chain before trusting a materialized checkpoint.
+  Recovering from true command-log compaction therefore still requires an
+  explicit checkpoint/base-proof compaction model rather than this selector
+  alone.
 
 Exit criteria:
 

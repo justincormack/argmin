@@ -3176,6 +3176,122 @@ fn metadata_transfer_import_installs_checkpoint_base() {
 }
 
 #[test]
+fn metadata_transfer_live_export_falls_back_to_checkpoint_without_retained_state_proof() {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[1], ec_shape).unwrap();
+    let topology = map
+        .node(NodeId::new(0))
+        .unwrap()
+        .storage_node()
+        .pg_topology();
+    let bucket = bucket_for_pg(topology, 1, "metadata-transfer-checkpoint-fallback-");
+    set_route_primary(&mut map, 1, NodeId::new(0));
+    set_route_state(&mut map, 1, PgState::Peering);
+    let map = Arc::new(map);
+    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let pg_id = PgId::new(1);
+    let command = create_bucket_metadata_command(pg_id, 1, bucket);
+    let source_pg = map
+        .node(NodeId::new(0))
+        .unwrap()
+        .storage_node()
+        .get_pg(1)
+        .unwrap();
+    source_pg
+        .apply_metadata_command_and_record(0, &command)
+        .unwrap();
+    source_pg
+        .connection()
+        .execute(
+            "UPDATE metadata_command_log SET post_state_digest = NULL WHERE cluster_epoch = ?1 AND pg_id = ?2 AND log_index = ?3",
+            rusqlite::params![ClusterEpoch::INITIAL.get() as i64, pg_id.get() as i64, 1_i64],
+        )
+        .unwrap();
+    drop(source_pg);
+
+    let artifact = cluster
+        .export_pg_metadata_transfer_artifact_for_live_transfer(pg_id, NodeId::new(0))
+        .unwrap();
+
+    assert_eq!(
+        artifact.source_base_kind(),
+        crate::peering::PgMetadataTransferBaseKind::Checkpoint
+    );
+    let checkpoint = artifact.checkpoint_base().unwrap();
+    assert_eq!(checkpoint.pg_id, pg_id);
+    assert_eq!(checkpoint.applied_log_index, 1);
+    assert_eq!(
+        artifact.source_metadata_proof(),
+        crate::control_plane::PgMetadataProof::new(
+            checkpoint.applied_log_index,
+            checkpoint.applied_log_hash,
+            checkpoint.state_digest
+        )
+    );
+}
+
+#[test]
+fn metadata_transfer_live_export_falls_back_to_checkpoint_for_abandoned_retained_entry() {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[1], ec_shape).unwrap();
+    let topology = map
+        .node(NodeId::new(0))
+        .unwrap()
+        .storage_node()
+        .pg_topology();
+    let bucket = bucket_for_pg(topology, 1, "metadata-transfer-checkpoint-abandoned-");
+    set_route_primary(&mut map, 1, NodeId::new(0));
+    set_route_state(&mut map, 1, PgState::Peering);
+    let map = Arc::new(map);
+    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let pg_id = PgId::new(1);
+    let command = create_bucket_metadata_command(pg_id, 1, bucket);
+    map.node(NodeId::new(0))
+        .unwrap()
+        .storage_node()
+        .get_pg(1)
+        .unwrap()
+        .record_metadata_command_abandoned(0, &command)
+        .unwrap();
+
+    let retained_log_err = cluster
+        .export_pg_metadata_transfer_from_retained_log(pg_id, NodeId::new(0))
+        .unwrap_err();
+    assert!(matches!(
+        retained_log_err,
+        crate::peering::PgPeeringReconstructionFailure::Reconstruction(
+            crate::peering::PgPeeringReconstructionError::UnreplayableAbandonedCommandLogEntry {
+                node_id,
+                log_index: 1,
+            }
+        ) if node_id == NodeId::new(0)
+    ));
+
+    let artifact = cluster
+        .export_pg_metadata_transfer_artifact_for_live_transfer(pg_id, NodeId::new(0))
+        .unwrap();
+
+    assert_eq!(
+        artifact.source_base_kind(),
+        crate::peering::PgMetadataTransferBaseKind::Checkpoint
+    );
+    let checkpoint = artifact.checkpoint_base().unwrap();
+    assert_eq!(checkpoint.pg_id, pg_id);
+    assert_eq!(
+        artifact.source_metadata_proof(),
+        crate::control_plane::PgMetadataProof::new(
+            checkpoint.applied_log_index,
+            checkpoint.applied_log_hash,
+            checkpoint.state_digest
+        )
+    );
+}
+
+#[test]
 fn metadata_transfer_import_rejects_checkpoint_base_without_payload() {
     let artifact = crate::peering::PgMetadataTransferArtifact {
         pg_id: PgId::new(1),

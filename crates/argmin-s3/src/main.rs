@@ -717,7 +717,7 @@ fn export_pg_metadata_transfer_artifact_retrying_stale_route(
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {
         match source_cluster
-            .export_pg_metadata_transfer_artifact_from_retained_log(pg_id, source_node_id)
+            .export_pg_metadata_transfer_artifact_for_live_transfer(pg_id, source_node_id)
         {
             Ok(artifact) => return Ok(artifact),
             Err(error) if metadata_transfer_error_is_transient_route_refresh(&error) => {

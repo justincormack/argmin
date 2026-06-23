@@ -1405,6 +1405,18 @@ fn metadata_transfer_destination_proof_for_commands(
     PgMetadataProof::new(applied_log_index, applied_log_hash, state_digest)
 }
 
+fn retained_log_export_failure_allows_checkpoint_fallback(
+    error: &PgPeeringReconstructionFailure,
+) -> bool {
+    matches!(
+        error,
+        PgPeeringReconstructionFailure::Reconstruction(
+            PgPeeringReconstructionError::MissingRetainedCommandStateProof { .. }
+                | PgPeeringReconstructionError::UnreplayableAbandonedCommandLogEntry { .. }
+        )
+    )
+}
+
 fn metadata_transfer_prefix_proof_at_epoch(
     pg_id: PgId,
     state_digest: u64,
@@ -2687,6 +2699,20 @@ impl StorageCluster {
     ) -> Result<PgMetadataTransferArtifact, PgMetadataTransferError> {
         self.export_pg_metadata_transfer_from_checkpoint(pg_id, source_node_id)
             .map_err(Into::into)
+    }
+
+    pub fn export_pg_metadata_transfer_artifact_for_live_transfer(
+        &self,
+        pg_id: PgId,
+        source_node_id: NodeId,
+    ) -> Result<PgMetadataTransferArtifact, PgMetadataTransferError> {
+        match self.export_pg_metadata_transfer_from_retained_log(pg_id, source_node_id) {
+            Ok(artifact) => Ok(artifact),
+            Err(error) if retained_log_export_failure_allows_checkpoint_fallback(&error) => self
+                .export_pg_metadata_transfer_from_checkpoint(pg_id, source_node_id)
+                .map_err(Into::into),
+            Err(error) => Err(error.into()),
+        }
     }
 
     #[allow(dead_code)]
