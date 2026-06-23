@@ -8254,6 +8254,13 @@ Metadata PG migration and backfill design notes:
   resume instead of trying to reinstall the checkpoint over a non-empty command
   log. Exporting such artifacts from a stored historical checkpoint, and
   selecting them to avoid full checkpoint transfer, remain later work.
+- Added the export primitive for supplied-checkpoint plus retained-suffix
+  metadata transfer artifacts. Given a verified checkpoint for the source PG,
+  the storage cluster can now fetch retained entries from the checkpoint proof
+  to the source's current proof, build a checkpoint-base artifact carrying that
+  suffix, and validate the combined artifact before returning it. This still
+  needs a durable historical-checkpoint store and selection policy before live
+  migration can use checkpoint-plus-suffix to avoid full checkpoint transfer.
 
 Exit criteria:
 
