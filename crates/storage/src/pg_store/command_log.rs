@@ -1300,6 +1300,111 @@ impl PgStore {
         }
     }
 
+    #[allow(dead_code)]
+    pub(crate) fn install_metadata_transfer_checkpoint_base(
+        &self,
+        node_id: u32,
+        cluster_epoch: ClusterEpoch,
+        checkpoint: &MetadataCommandCheckpoint,
+    ) -> Result<MetadataCommandReplicaState, StoreError> {
+        if checkpoint.pg_id != PgId::new(self.pg_id) {
+            return Err(StoreError::MetadataCheckpointInvalid {
+                node_id,
+                pg_id: self.pg_id,
+                cluster_epoch,
+                reason: format!(
+                    "checkpoint PG {} does not match destination PG {}",
+                    checkpoint.pg_id.get(),
+                    self.pg_id
+                ),
+            });
+        }
+        checkpoint
+            .verify()
+            .map_err(|error| StoreError::MetadataCheckpointInvalid {
+                node_id,
+                pg_id: self.pg_id,
+                cluster_epoch,
+                reason: format!("{error:?}"),
+            })?;
+
+        self.conn
+            .execute_batch("BEGIN IMMEDIATE")
+            .map_err(|e| StoreError::Db {
+                context: "begin metadata transfer checkpoint install",
+                source: e,
+            })?;
+        self.conn
+            .execute_batch("PRAGMA defer_foreign_keys = ON")
+            .map_err(|e| {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                StoreError::Db {
+                    context: "defer metadata transfer checkpoint foreign keys",
+                    source: e,
+                }
+            })?;
+
+        let result = (|| {
+            if self
+                .query_row_cached_optional(
+                    "SELECT 1 FROM metadata_command_pending_slot WHERE singleton = 0",
+                    [],
+                    "check metadata transfer checkpoint destination pending slot",
+                    |_| Ok(()),
+                )?
+                .is_some()
+            {
+                return Err(StoreError::MetadataCommandContention {
+                    context: "install metadata transfer checkpoint with pending command",
+                });
+            }
+
+            if !self.metadata_command_replica_state_can_initialize()? {
+                return Err(StoreError::MetadataCommandReplicaStateMissing { pg_id: self.pg_id });
+            }
+
+            self.clear_metadata_checkpoint_tables()?;
+            self.insert_metadata_checkpoint_table_blocks(&checkpoint.table_blocks)?;
+            self.refresh_all_metadata_table_digests()?;
+            let actual_digest = self.cached_metadata_state_digest()?;
+            if actual_digest != checkpoint.state_digest {
+                return Err(StoreError::MetadataStateDigestMismatch {
+                    node_id,
+                    pg_id: self.pg_id,
+                    cluster_epoch,
+                    expected_digest: checkpoint.state_digest,
+                    actual_digest,
+                });
+            }
+
+            self.update_metadata_command_replica_state_preserving_digest(
+                cluster_epoch,
+                0,
+                0,
+                checkpoint.state_digest,
+            )
+            .map(|record| record.state)
+        })();
+
+        match result {
+            Ok(state) => {
+                self.conn.execute_batch("COMMIT").map_err(|e| {
+                    let _ = self.conn.execute_batch("ROLLBACK");
+                    StoreError::Db {
+                        context: "commit metadata transfer checkpoint install",
+                        source: e,
+                    }
+                })?;
+                self.mark_metadata_state_digest_clean()?;
+                Ok(state)
+            }
+            Err(error) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                Err(error)
+            }
+        }
+    }
+
     pub(crate) fn adopt_metadata_transfer_state_from_rebased_commands(
         &self,
         node_id: u32,
@@ -3690,6 +3795,87 @@ impl PgStore {
             );
         }
         hasher.finalize()
+    }
+
+    fn clear_metadata_checkpoint_tables(&self) -> Result<(), StoreError> {
+        for table in METADATA_DIGEST_TABLES.iter().rev() {
+            let table_sql = quote_sql_identifier(table.name);
+            self.execute_cached(
+                &format!("DELETE FROM {table_sql}"),
+                [],
+                "clear metadata checkpoint destination table",
+            )?;
+        }
+        Ok(())
+    }
+
+    fn insert_metadata_checkpoint_table_blocks(
+        &self,
+        blocks: &[MetadataCheckpointTableBlock],
+    ) -> Result<(), StoreError> {
+        for (table, block) in METADATA_DIGEST_TABLES.iter().zip(blocks) {
+            self.insert_metadata_checkpoint_table_block(table, block)?;
+        }
+        Ok(())
+    }
+
+    fn insert_metadata_checkpoint_table_block(
+        &self,
+        table: &MetadataDigestTable,
+        block: &MetadataCheckpointTableBlock,
+    ) -> Result<(), StoreError> {
+        if block.rows.is_empty() {
+            return Ok(());
+        }
+        let table_sql = quote_sql_identifier(table.name);
+        let columns = table
+            .columns
+            .iter()
+            .map(|column| quote_sql_identifier(column))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let placeholders = (1..=table.columns.len())
+            .map(|index| format!("?{index}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!("INSERT INTO {table_sql} ({columns}) VALUES ({placeholders})");
+        let mut stmt = self.conn.prepare_cached(&sql).map_err(|e| StoreError::Db {
+            context: "prepare metadata checkpoint row insert",
+            source: e,
+        })?;
+        for row in &block.rows {
+            let values = row
+                .values
+                .iter()
+                .map(Self::metadata_checkpoint_value_to_sql)
+                .collect::<Result<Vec<_>, _>>()?;
+            stmt.execute(params_from_iter(values))
+                .map_err(|e| StoreError::Db {
+                    context: "insert metadata checkpoint row",
+                    source: e,
+                })?;
+        }
+        Ok(())
+    }
+
+    fn metadata_checkpoint_value_to_sql(
+        value: &MetadataCheckpointValue,
+    ) -> Result<rusqlite::types::Value, StoreError> {
+        Ok(match value {
+            MetadataCheckpointValue::Null => rusqlite::types::Value::Null,
+            MetadataCheckpointValue::Integer(value) => rusqlite::types::Value::Integer(*value),
+            MetadataCheckpointValue::RealBits(value) => {
+                rusqlite::types::Value::Real(f64::from_bits(*value))
+            }
+            MetadataCheckpointValue::Text(value) => {
+                let text = String::from_utf8(value.clone()).map_err(|error| StoreError::Db {
+                    context: "encode metadata checkpoint text value",
+                    source: rusqlite::Error::ToSqlConversionFailure(Box::new(error)),
+                })?;
+                rusqlite::types::Value::Text(text)
+            }
+            MetadataCheckpointValue::Blob(value) => rusqlite::types::Value::Blob(value.clone()),
+        })
     }
 
     fn metadata_checkpoint_table_blocks(

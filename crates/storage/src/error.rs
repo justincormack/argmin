@@ -276,6 +276,14 @@ pub enum StoreError {
         applied_log_hash: u64,
     },
 
+    #[error("metadata checkpoint for local node {node_id} PG {pg_id} epoch {cluster_epoch} is invalid: {reason}")]
+    MetadataCheckpointInvalid {
+        node_id: u32,
+        pg_id: u32,
+        cluster_epoch: ClusterEpoch,
+        reason: String,
+    },
+
     #[error(
         "shard operation for local node {node_id} PG {pg_id} has epoch {operation_epoch}, current cluster epoch is {current_epoch}"
     )]

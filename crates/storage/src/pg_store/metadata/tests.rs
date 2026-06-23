@@ -2537,6 +2537,160 @@ fn metadata_command_checkpoint_exports_blob_backed_metadata_rows() {
 }
 
 #[test]
+fn install_metadata_transfer_checkpoint_base_restores_materialized_rows() {
+    let source_tmp = test_util::tempdir();
+    let source = PgStore::open(source_tmp.path(), 1).unwrap();
+    let bucket = trusted_bucket_name("metadata-checkpoint-install");
+    let key = trusted_object_key("object");
+    let okh = [9_u8; 16];
+    source
+        .conn
+        .execute(
+            "INSERT INTO object_segments \
+             (bucket, key, version_id, segment_index, size, segment_crc64, \
+              segment_okh, segment_vid, data_pg_id, placement_cluster_epoch, ec_k, ec_m) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            params![
+                bucket.as_str(),
+                key.as_str(),
+                1_i64,
+                0_i64,
+                32_i64,
+                99_i64,
+                okh.as_slice(),
+                1_i64,
+                1_i64,
+                1_i64,
+                4_i64,
+                2_i64,
+            ],
+        )
+        .unwrap();
+    source.refresh_metadata_command_state_digest().unwrap();
+    let checkpoint = source
+        .metadata_command_checkpoint(0, ClusterEpoch::INITIAL)
+        .unwrap();
+
+    let destination_tmp = test_util::tempdir();
+    let destination = PgStore::open(destination_tmp.path(), 1).unwrap();
+    let destination_epoch = ClusterEpoch::new(19).unwrap();
+    let state = destination
+        .install_metadata_transfer_checkpoint_base(2, destination_epoch, &checkpoint)
+        .unwrap();
+    assert_eq!(state.cluster_epoch, destination_epoch);
+    assert_eq!(state.applied_log_index, 0);
+    assert_eq!(state.applied_log_hash, 0);
+    assert_eq!(state.state_digest, checkpoint.state_digest);
+
+    let restored = destination
+        .metadata_command_checkpoint(2, destination_epoch)
+        .unwrap();
+    assert_eq!(restored.state_digest, checkpoint.state_digest);
+    restored.verify().unwrap();
+    let segment_block = restored
+        .table_blocks
+        .iter()
+        .find(|table| table.table_name == "object_segments")
+        .unwrap();
+    assert_eq!(segment_block.row_count, 1);
+    assert!(segment_block.rows[0]
+        .values
+        .iter()
+        .any(|value| matches!(value, MetadataCheckpointValue::Blob(bytes) if bytes == &okh)));
+}
+
+#[test]
+fn install_metadata_transfer_checkpoint_base_defers_foreign_keys_until_full_restore() {
+    let source_tmp = test_util::tempdir();
+    let source = PgStore::open(source_tmp.path(), 1).unwrap();
+    let bucket = trusted_bucket_name("metadata-checkpoint-install-fk");
+    create_probe_bucket_direct(&source, &bucket);
+    put_probe_lifecycle_direct(&source, &bucket);
+    source.refresh_metadata_command_state_digest().unwrap();
+    let checkpoint = source
+        .metadata_command_checkpoint(0, ClusterEpoch::INITIAL)
+        .unwrap();
+    let subresource_block = checkpoint
+        .table_blocks
+        .iter()
+        .find(|table| table.table_name == "bucket_subresources")
+        .unwrap();
+    let buckets_block = checkpoint
+        .table_blocks
+        .iter()
+        .find(|table| table.table_name == "buckets")
+        .unwrap();
+    assert_eq!(subresource_block.row_count, 1);
+    assert_eq!(buckets_block.row_count, 1);
+
+    let destination_tmp = test_util::tempdir();
+    let destination = PgStore::open(destination_tmp.path(), 1).unwrap();
+    let destination_epoch = ClusterEpoch::new(29).unwrap();
+    destination
+        .install_metadata_transfer_checkpoint_base(2, destination_epoch, &checkpoint)
+        .unwrap();
+
+    assert_eq!(destination.head_bucket_raw(&bucket).unwrap().name, bucket);
+    let lifecycle = PgMetadataStore::get_bucket_subresource(
+        &destination,
+        &bucket,
+        BucketSubresourceKind::Lifecycle,
+    )
+    .unwrap()
+    .expect("lifecycle subresource should restore after parent bucket");
+    assert_eq!(lifecycle.body, "<LifecycleConfiguration/>");
+}
+
+#[test]
+fn install_metadata_transfer_checkpoint_base_rejects_tampered_checkpoint_without_mutation() {
+    let source_tmp = test_util::tempdir();
+    let source = PgStore::open(source_tmp.path(), 1).unwrap();
+    let bucket = trusted_bucket_name("metadata-checkpoint-install-tamper");
+    let command = create_bucket_probe_command(1, 1, bucket, 1);
+    source
+        .apply_metadata_command_and_record(0, &command)
+        .unwrap();
+    let mut checkpoint = source
+        .metadata_command_checkpoint(0, ClusterEpoch::INITIAL)
+        .unwrap();
+    let bucket_block = checkpoint
+        .table_blocks
+        .iter_mut()
+        .find(|table| table.table_name == "buckets")
+        .unwrap();
+    match &mut bucket_block.rows[0].values[0] {
+        MetadataCheckpointValue::Text(value) => value.extend_from_slice(b"-tampered"),
+        value => panic!("expected bucket name text value, got {value:?}"),
+    }
+
+    let destination_tmp = test_util::tempdir();
+    let destination = PgStore::open(destination_tmp.path(), 1).unwrap();
+    let before = destination.metadata_command_replica_state().unwrap();
+    let destination_epoch = ClusterEpoch::new(23).unwrap();
+    let err = destination
+        .install_metadata_transfer_checkpoint_base(2, destination_epoch, &checkpoint)
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        StoreError::MetadataCheckpointInvalid {
+            pg_id: 1,
+            cluster_epoch,
+            ..
+        } if cluster_epoch == destination_epoch
+    ));
+    assert_eq!(
+        destination.metadata_command_replica_state().unwrap(),
+        before
+    );
+    assert!(
+        destination
+            .metadata_command_replica_state_can_initialize()
+            .unwrap(),
+        "failed checkpoint install must leave destination empty"
+    );
+}
+
+#[test]
 fn metadata_command_checkpoint_rejects_pending_command() {
     let tmp = test_util::tempdir();
     let store = PgStore::open(tmp.path(), 1).unwrap();

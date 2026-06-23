@@ -8186,6 +8186,16 @@ Metadata PG migration and backfill design notes:
   into a destination PG remains deferred until the storage-node install RPC can
   validate an empty or explicitly replaceable destination and apply the row
   blocks atomically.
+- Added the first local metadata checkpoint install primitive. `PgStore` can
+  now install a verified checkpoint into an empty destination PG inside one
+  immediate transaction: it rejects pending commands, non-empty destinations,
+  PG mismatches, and tampered checkpoint payloads before mutation; then it
+  clears command-owned metadata tables, inserts the materialized row blocks,
+  refreshes table digests, verifies the restored full-PG digest, and moves the
+  destination replica to the requested epoch as a `(0, 0, state_digest)`
+  materialized base. This deliberately does not claim retained-log coverage or
+  wire live metadata transfer yet. The next slice is the storage-node/RPC
+  boundary for this install primitive and then checkpoint-base import wiring.
 
 Exit criteria:
 

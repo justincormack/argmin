@@ -590,6 +590,7 @@ fn store_error_diagnostic_cause_label(error: &StoreError) -> &'static str {
         StoreError::MetadataTransferUnsupportedProof { .. } => {
             "metadata_transfer_unsupported_proof"
         }
+        StoreError::MetadataCheckpointInvalid { .. } => "metadata_checkpoint_invalid",
         StoreError::MetadataCommandPendingOnNonPrimary { .. } => {
             "metadata_command_pending_on_non_primary"
         }
