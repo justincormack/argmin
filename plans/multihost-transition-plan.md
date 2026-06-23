@@ -8144,6 +8144,14 @@ Metadata PG migration and backfill design notes:
   destination is then checkpoint-initialized at `(0, 0, base_digest)` for the
   new epoch and the retained suffix is replayed from there. Digest-only base
   matches and forged non-zero destination proof tuples remain fail-closed.
+- Added focused repeated-reshuffle coverage for retained-log metadata transfer.
+  The local-cluster regression now moves one metadata PG from `[0,1]` to
+  `[2,3]`, writes on the new acting set, moves it back to `[0,1]`, writes
+  again, and transfers it to `[2,3]` a second time. The final leg proves that
+  destination replicas with a historical prefix can adopt only the proven
+  prefix and replay the retained suffix for later writes, matching the
+  long-lived cluster case where a PG moves several times before checkpoint
+  artifacts exist.
 
 Exit criteria:
 
