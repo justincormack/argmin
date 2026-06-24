@@ -8315,6 +8315,15 @@ Metadata PG migration and backfill design notes:
   before full-checkpoint export would become `ResourceExhausted`, while the
   durable checkpoint catalogue remains bounded to the newest candidates needed
   for checkpoint-plus-retained-suffix transfer.
+- Added the first local checkpoint-backed metadata command-log compaction
+  primitive. A PG store now treats the newest verified checkpoint as the replay
+  validation base, reports an exclusive `compactable_before` bound from that
+  checkpoint, and can delete retained command-log rows covered by the checkpoint
+  when there is no pending command or retained tail. Replay validation and
+  checkpoint export continue from the checkpoint proof plus retained suffix
+  after compaction. This is intentionally still a local primitive; background
+  scheduling, RPC exposure, and retention policy for when to compact remain the
+  next pieces before long-running clusters get automatic log pruning.
 
 Exit criteria:
 

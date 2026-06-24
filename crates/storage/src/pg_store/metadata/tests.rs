@@ -3553,7 +3553,7 @@ fn metadata_command_log_stats_include_retained_prefix_and_tail() {
 }
 
 #[test]
-fn metadata_command_log_compaction_without_checkpoint_is_explicit_noop() {
+fn metadata_command_log_compaction_without_checkpoint_is_noop() {
     let tmp = test_util::tempdir();
     let store = PgStore::open(tmp.path(), 1).unwrap();
     let first = create_bucket_probe_command(1, 1, trusted_bucket_name("retain-first"), 1);
@@ -3568,11 +3568,11 @@ fn metadata_command_log_compaction_without_checkpoint_is_explicit_noop() {
     assert_eq!(before.retained_entries, 2);
 
     let status = store
-        .compact_metadata_command_log_without_checkpoint(ClusterEpoch::INITIAL)
+        .compact_metadata_command_log(ClusterEpoch::INITIAL)
         .unwrap();
     assert_eq!(
         status,
-        MetadataCommandLogCompactionStatus::UnsupportedUntilCheckpoint {
+        MetadataCommandLogCompactionStatus::NoCheckpoint {
             retained_entries: 2
         }
     );
@@ -3581,6 +3581,141 @@ fn metadata_command_log_compaction_without_checkpoint_is_explicit_noop() {
         .metadata_command_log_stats(ClusterEpoch::INITIAL)
         .unwrap();
     assert_eq!(after, before);
+}
+
+#[test]
+fn metadata_command_log_compaction_deletes_checkpoint_covered_prefix() {
+    let tmp = test_util::tempdir();
+    let store = PgStore::open(tmp.path(), 1).unwrap();
+    let first = create_bucket_probe_command(1, 1, trusted_bucket_name("compact-first"), 1);
+    let second = create_bucket_probe_command(1, 2, trusted_bucket_name("compact-second"), 2);
+    let third = create_bucket_probe_command(1, 3, trusted_bucket_name("compact-third"), 3);
+
+    store.record_metadata_command_applied(0, &first).unwrap();
+    store.record_metadata_command_applied(0, &second).unwrap();
+    let checkpoint = store
+        .record_current_metadata_command_checkpoint(0, ClusterEpoch::INITIAL)
+        .unwrap();
+    assert_eq!(checkpoint.applied_log_index, 2);
+    store.record_metadata_command_applied(0, &third).unwrap();
+
+    let before = store
+        .metadata_command_log_stats(ClusterEpoch::INITIAL)
+        .unwrap();
+    assert_eq!(before.retained_entries, 3);
+    assert_eq!(before.pending_tail_entries, 0);
+    assert_eq!(before.missing_applied_prefix_entries, 0);
+    assert_eq!(before.compactable_before, Some(3));
+
+    let status = store
+        .compact_metadata_command_log(ClusterEpoch::INITIAL)
+        .unwrap();
+    assert_eq!(
+        status,
+        MetadataCommandLogCompactionStatus::Compacted {
+            deleted_entries: 2,
+            compacted_before: 3,
+        }
+    );
+
+    let after = store
+        .metadata_command_log_stats(ClusterEpoch::INITIAL)
+        .unwrap();
+    assert_eq!(after.min_log_index, Some(3));
+    assert_eq!(after.max_log_index, Some(3));
+    assert_eq!(after.retained_entries, 1);
+    assert_eq!(after.pending_tail_entries, 0);
+    assert_eq!(after.missing_applied_prefix_entries, 0);
+    assert_eq!(after.compactable_before, Some(3));
+
+    store
+        .validate_metadata_command_replay_state(0, ClusterEpoch::INITIAL)
+        .unwrap();
+    let next_checkpoint = store
+        .metadata_command_checkpoint(0, ClusterEpoch::INITIAL)
+        .unwrap();
+    assert_eq!(next_checkpoint.applied_log_index, 3);
+}
+
+#[test]
+fn metadata_command_log_compaction_preserves_next_index_when_checkpoint_is_current() {
+    let tmp = test_util::tempdir();
+    let store = PgStore::open(tmp.path(), 1).unwrap();
+    let first = create_bucket_probe_command(1, 1, trusted_bucket_name("compact-current-first"), 1);
+    let second =
+        create_bucket_probe_command(1, 2, trusted_bucket_name("compact-current-second"), 2);
+
+    store.record_metadata_command_applied(0, &first).unwrap();
+    store.record_metadata_command_applied(0, &second).unwrap();
+    store
+        .record_current_metadata_command_checkpoint(0, ClusterEpoch::INITIAL)
+        .unwrap();
+
+    let status = store
+        .compact_metadata_command_log(ClusterEpoch::INITIAL)
+        .unwrap();
+    assert_eq!(
+        status,
+        MetadataCommandLogCompactionStatus::Compacted {
+            deleted_entries: 2,
+            compacted_before: 3,
+        }
+    );
+
+    let after = store
+        .metadata_command_log_stats(ClusterEpoch::INITIAL)
+        .unwrap();
+    assert_eq!(after.min_log_index, None);
+    assert_eq!(after.max_log_index, None);
+    assert_eq!(after.retained_entries, 0);
+    assert_eq!(after.missing_applied_prefix_entries, 0);
+    assert_eq!(after.compactable_before, Some(3));
+    assert_eq!(
+        store
+            .max_metadata_command_log_index(ClusterEpoch::INITIAL)
+            .unwrap(),
+        2
+    );
+
+    let third = create_bucket_probe_command(1, 3, trusted_bucket_name("compact-current-third"), 3);
+    store.record_metadata_command_applied(0, &third).unwrap();
+    let final_state = store
+        .validate_metadata_command_replay_state(0, ClusterEpoch::INITIAL)
+        .unwrap();
+    assert_eq!(final_state.applied_log_index, 3);
+}
+
+#[test]
+fn metadata_command_log_compaction_rejects_pending_command() {
+    let tmp = test_util::tempdir();
+    let store = PgStore::open(tmp.path(), 1).unwrap();
+    let first = create_bucket_probe_command(1, 1, trusted_bucket_name("compact-pending-base"), 1);
+    let pending_bucket = trusted_bucket_name("compact-pending-next");
+    let pending = create_bucket_probe_command(1, 2, pending_bucket.clone(), 2);
+
+    store.record_metadata_command_applied(0, &first).unwrap();
+    store
+        .record_current_metadata_command_checkpoint(0, ClusterEpoch::INITIAL)
+        .unwrap();
+    store
+        .try_insert_pending_metadata_command_slot(0, &pending, Some(&pending_bucket))
+        .unwrap();
+
+    let status = store
+        .compact_metadata_command_log(ClusterEpoch::INITIAL)
+        .unwrap();
+    assert_eq!(
+        status,
+        MetadataCommandLogCompactionStatus::PendingCommand {
+            retained_entries: 1
+        }
+    );
+
+    let after = store
+        .metadata_command_log_stats(ClusterEpoch::INITIAL)
+        .unwrap();
+    assert_eq!(after.retained_entries, 1);
+    assert_eq!(after.compactable_before, Some(2));
 }
 
 #[test]
@@ -3599,9 +3734,7 @@ fn metadata_command_log_stats_reject_stale_epoch() {
         } if operation_epoch == stale_epoch
     ));
 
-    let err = store
-        .compact_metadata_command_log_without_checkpoint(stale_epoch)
-        .unwrap_err();
+    let err = store.compact_metadata_command_log(stale_epoch).unwrap_err();
     assert!(matches!(
         err,
         StoreError::StaleMetadataOperation {
