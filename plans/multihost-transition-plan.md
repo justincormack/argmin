@@ -8358,6 +8358,20 @@ Metadata PG migration and backfill design notes:
   the next non-overlap metadata transfer. This makes the checkpoint-backed
   transfer path prove durable checkpoint/catalogue reload rather than only
   continuous in-process state.
+- Hardened live metadata-transfer retry after interrupted operator commands.
+  Peering transfer markers now persist the quiesced source route epoch and
+  source node id, and retrying the live transfer command against the same
+  destination acting set re-exports from that retained source route instead of
+  guessing from the current Peering route. Storage-node process configs carry
+  retained historical PG routes so old source nodes can serve read-only
+  metadata-transfer inspection/log export calls after they have left the
+  current acting set, while transfer/import mutation RPCs remain current
+  Peering-only. Retrying a live transfer whose destination acting set is
+  already Active is treated as an idempotent success before fencing, with a
+  bounded wait for the serving runtime map to catch up after import. The
+  `metadata-pg-migration-failover` UAT smoke injects failures after fencing,
+  after transfer-marker install, and after import, then proves the same live
+  migration can resume and complete without re-fencing an already-migrated PG.
 
 Exit criteria:
 

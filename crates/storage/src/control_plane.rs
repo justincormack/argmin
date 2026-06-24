@@ -19,7 +19,7 @@ const CONTROL_PLANE_RPC_MAX_PAYLOAD_LEN: usize = 8 * 1024 * 1024;
 const CONTROL_PLANE_RPC_IO_TIMEOUT: Duration = Duration::from_secs(1);
 const CONTROL_PLANE_RPC_HEARTBEAT_OBSERVATION_MIN_LEN: usize = 4 + 1 + 8 + 8 + 8 + 1;
 const CONTROL_PLANE_RPC_RUNTIME_NODE_MIN_LEN: usize = 4 + 8 + 4;
-const CONTROL_PLANE_RPC_PG_ROUTE_MIN_LEN: usize = 8 + 4 + 4 + 1 + 1 + 4;
+const CONTROL_PLANE_RPC_PG_ROUTE_MIN_LEN: usize = 8 + 4 + 4 + 1 + 1 + 4 + 1;
 const CONTROL_PLANE_RPC_ACTING_SET_NODE_MIN_LEN: usize = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -335,6 +335,9 @@ impl ClusterControlSnapshot {
             acting_set: record.acting_set.clone(),
             state: PgState::Active,
             primary_lease_deadline_ms: Some(primary_lease_deadline_ms),
+            peering_metadata_transfer: None,
+            peering_metadata_transfer_source_route_epoch: None,
+            peering_metadata_transfer_source_node_id: None,
         })
     }
 
@@ -407,6 +410,9 @@ impl ClusterControlSnapshot {
                     acting_set: record.acting_set.clone(),
                     state: PgState::Active,
                     primary_lease_deadline_ms: None,
+                    peering_metadata_transfer: None,
+                    peering_metadata_transfer_source_route_epoch: None,
+                    peering_metadata_transfer_source_node_id: None,
                 });
             }
             Err(error) => return Err(error),
@@ -418,6 +424,9 @@ impl ClusterControlSnapshot {
             acting_set: record.acting_set.clone(),
             state: PgState::Active,
             primary_lease_deadline_ms: Some(primary_lease_deadline_ms),
+            peering_metadata_transfer: None,
+            peering_metadata_transfer_source_route_epoch: None,
+            peering_metadata_transfer_source_node_id: None,
         })
     }
 
@@ -456,6 +465,11 @@ impl ClusterControlSnapshot {
             acting_set: record.acting_set.clone(),
             state: record.state,
             primary_lease_deadline_ms: None,
+            peering_metadata_transfer: record.peering_metadata_transfer,
+            peering_metadata_transfer_source_route_epoch: record
+                .peering_metadata_transfer_source_route_epoch,
+            peering_metadata_transfer_source_node_id: record
+                .peering_metadata_transfer_source_node_id,
         })
     }
 
@@ -601,6 +615,8 @@ impl ClusterControlSnapshot {
                 record.active_metadata_proof = None;
                 record.active_metadata_transfer_imported = false;
                 record.peering_metadata_transfer = None;
+                record.peering_metadata_transfer_source_route_epoch = None;
+                record.peering_metadata_transfer_source_node_id = None;
                 record.metadata_transfer_fenced = false;
                 record.metadata_transfer_fence_source_lease_deadline_ms = None;
                 record.metadata_transfer_fence_source_imported = false;
@@ -637,6 +653,9 @@ pub struct PgRouteSnapshot {
     acting_set: Vec<NodeId>,
     state: PgState,
     primary_lease_deadline_ms: Option<u64>,
+    peering_metadata_transfer: Option<PgMetadataTransferProof>,
+    peering_metadata_transfer_source_route_epoch: Option<ClusterEpoch>,
+    peering_metadata_transfer_source_node_id: Option<NodeId>,
 }
 
 impl PgRouteSnapshot {
@@ -654,6 +673,9 @@ impl PgRouteSnapshot {
             acting_set,
             state,
             primary_lease_deadline_ms: None,
+            peering_metadata_transfer: None,
+            peering_metadata_transfer_source_route_epoch: None,
+            peering_metadata_transfer_source_node_id: None,
         }
     }
 
@@ -685,6 +707,21 @@ impl PgRouteSnapshot {
     #[must_use]
     pub fn primary_lease_deadline_ms(&self) -> Option<u64> {
         self.primary_lease_deadline_ms
+    }
+
+    #[must_use]
+    pub fn peering_metadata_transfer(&self) -> Option<PgMetadataTransferProof> {
+        self.peering_metadata_transfer
+    }
+
+    #[must_use]
+    pub fn peering_metadata_transfer_source_route_epoch(&self) -> Option<ClusterEpoch> {
+        self.peering_metadata_transfer_source_route_epoch
+    }
+
+    #[must_use]
+    pub fn peering_metadata_transfer_source_node_id(&self) -> Option<NodeId> {
+        self.peering_metadata_transfer_source_node_id
     }
 
     #[must_use]
@@ -772,6 +809,31 @@ impl ClusterRuntimeMapSnapshot {
             .find(|route| route.cluster_epoch == cluster_epoch && route.pg_id == pg_id)
             .cloned()
             .ok_or(ControlPlaneError::UnknownClusterMapEpoch { cluster_epoch })
+    }
+
+    pub fn runtime_map_at_epoch(
+        &self,
+        cluster_epoch: ClusterEpoch,
+    ) -> Result<Self, ControlPlaneError> {
+        if cluster_epoch == self.cluster_epoch {
+            return Ok(self.clone());
+        }
+        let pg_routes: Vec<_> = self
+            .historical_pg_routes
+            .iter()
+            .filter(|route| route.cluster_epoch == cluster_epoch)
+            .cloned()
+            .collect();
+        if pg_routes.is_empty() {
+            return Err(ControlPlaneError::UnknownClusterMapEpoch { cluster_epoch });
+        }
+        Ok(Self {
+            cluster_epoch,
+            valid_until_ms: None,
+            nodes: self.nodes.clone(),
+            pg_routes,
+            historical_pg_routes: self.historical_pg_routes.clone(),
+        })
     }
 }
 
@@ -866,6 +928,10 @@ fn reconstruct_pg_route_from_record(
         acting_set: record.acting_set.clone(),
         state: record.state,
         primary_lease_deadline_ms: None,
+        peering_metadata_transfer: record.peering_metadata_transfer,
+        peering_metadata_transfer_source_route_epoch: record
+            .peering_metadata_transfer_source_route_epoch,
+        peering_metadata_transfer_source_node_id: record.peering_metadata_transfer_source_node_id,
     })
 }
 
@@ -890,6 +956,11 @@ pub struct PgControlRecord {
     // This is distinct from overlap-based catch-up so later migration code and
     // operators can tell why a non-overlap acting set was allowed to peer.
     peering_metadata_transfer: Option<PgMetadataTransferProof>,
+    // Quiesced source route captured when the transfer marker was installed.
+    // Retried live transfers need this because the source replica state epoch
+    // can be older than the fenced control-plane route epoch.
+    peering_metadata_transfer_source_route_epoch: Option<ClusterEpoch>,
+    peering_metadata_transfer_source_node_id: Option<NodeId>,
     // Operator-initiated transfer fence. While set, normal peering completion
     // is blocked so the source remains quiesced for checkpoint/log export.
     metadata_transfer_fenced: bool,
@@ -914,6 +985,8 @@ impl PgControlRecord {
             active_metadata_transfer_imported: false,
             peering_metadata_proof_floor: None,
             peering_metadata_transfer: None,
+            peering_metadata_transfer_source_route_epoch: None,
+            peering_metadata_transfer_source_node_id: None,
             metadata_transfer_fenced: false,
             metadata_transfer_fence_source_lease_deadline_ms: None,
             metadata_transfer_fence_source_imported: false,
@@ -958,6 +1031,16 @@ impl PgControlRecord {
     #[must_use]
     pub fn peering_metadata_transfer(&self) -> Option<PgMetadataTransferProof> {
         self.peering_metadata_transfer
+    }
+
+    #[must_use]
+    pub fn peering_metadata_transfer_source_route_epoch(&self) -> Option<ClusterEpoch> {
+        self.peering_metadata_transfer_source_route_epoch
+    }
+
+    #[must_use]
+    pub fn peering_metadata_transfer_source_node_id(&self) -> Option<NodeId> {
+        self.peering_metadata_transfer_source_node_id
     }
 
     #[must_use]
@@ -1717,6 +1800,8 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
                 record.active_metadata_transfer_imported = false;
                 record.peering_metadata_proof_floor = peering_metadata_proof_floor;
                 record.peering_metadata_transfer = peering_metadata_transfer;
+                record.peering_metadata_transfer_source_route_epoch = None;
+                record.peering_metadata_transfer_source_node_id = None;
                 record.metadata_transfer_fenced = metadata_transfer_fenced;
                 record.metadata_transfer_fence_source_lease_deadline_ms =
                     metadata_transfer_fence_source_lease_deadline_ms;
@@ -1750,6 +1835,15 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
             .pg(pg_id)
             .ok_or(ControlPlaneError::UnknownPg { pg_id: pg_id.get() })?;
         if record.acting_set == acting_set {
+            if let Some(existing_transfer) = record.peering_metadata_transfer {
+                if existing_transfer != transfer {
+                    return Err(ControlPlaneError::PgMetadataTransferProofMismatch {
+                        pg_id: pg_id.get(),
+                        expected: existing_transfer,
+                        actual: transfer,
+                    });
+                }
+            }
             return Ok(self.snapshot.clone());
         }
         let state = record.state;
@@ -1778,6 +1872,27 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
             required_floor,
             transfer,
         )?;
+        let source_route_epoch = self.snapshot.cluster_epoch;
+        let source_node_id = match state {
+            PgState::Active => {
+                record
+                    .active_primary
+                    .ok_or(ControlPlaneError::PgHasNoServingPrimary {
+                        pg_id: pg_id.get(),
+                        cluster_epoch: self.snapshot.cluster_epoch,
+                    })?
+            }
+            PgState::Peering => record
+                .acting_set
+                .first()
+                .copied()
+                .ok_or(ControlPlaneError::EmptyActingSet { pg_id: pg_id.get() })?,
+            _ => {
+                return Err(ControlPlaneError::PgMetadataMigrationRequiresTransfer {
+                    pg_id: pg_id.get(),
+                });
+            }
+        };
 
         let mut next_snapshot = self.snapshot.clone();
         let record = next_snapshot
@@ -1791,6 +1906,8 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
         record.active_metadata_transfer_imported = false;
         record.peering_metadata_proof_floor = Some(transfer.metadata_proof());
         record.peering_metadata_transfer = Some(transfer);
+        record.peering_metadata_transfer_source_route_epoch = Some(source_route_epoch);
+        record.peering_metadata_transfer_source_node_id = Some(source_node_id);
         record.metadata_transfer_fenced = false;
         record.metadata_transfer_fence_source_lease_deadline_ms = None;
         record.metadata_transfer_fence_source_imported = false;
@@ -1891,6 +2008,8 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
             record.active_metadata_proof = None;
             record.active_metadata_transfer_imported = false;
             record.peering_metadata_transfer = None;
+            record.peering_metadata_transfer_source_route_epoch = None;
+            record.peering_metadata_transfer_source_node_id = None;
             record.metadata_transfer_fenced = true;
             record.metadata_transfer_fence_source_lease_deadline_ms =
                 source_primary_lease_deadline_ms;
@@ -1945,6 +2064,8 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
             if state != PgState::Peering {
                 record.peering_metadata_proof_floor = None;
                 record.peering_metadata_transfer = None;
+                record.peering_metadata_transfer_source_route_epoch = None;
+                record.peering_metadata_transfer_source_node_id = None;
                 record.metadata_transfer_fenced = false;
                 record.metadata_transfer_fence_source_lease_deadline_ms = None;
                 record.metadata_transfer_fence_source_imported = false;
@@ -2031,6 +2152,8 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
         record.active_metadata_transfer_imported = active_metadata_transfer_imported;
         record.peering_metadata_proof_floor = None;
         record.peering_metadata_transfer = None;
+        record.peering_metadata_transfer_source_route_epoch = None;
+        record.peering_metadata_transfer_source_node_id = None;
         record.metadata_transfer_fenced = false;
         record.metadata_transfer_fence_source_lease_deadline_ms = None;
         record.metadata_transfer_fence_source_imported = false;
@@ -2101,6 +2224,8 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
             record.active_metadata_transfer_imported = record.peering_metadata_transfer.is_some();
             record.peering_metadata_proof_floor = None;
             record.peering_metadata_transfer = None;
+            record.peering_metadata_transfer_source_route_epoch = None;
+            record.peering_metadata_transfer_source_node_id = None;
             record.metadata_transfer_fenced = false;
             record.metadata_transfer_fence_source_lease_deadline_ms = None;
             record.metadata_transfer_fence_source_imported = false;
@@ -3457,6 +3582,27 @@ fn write_pg_route_snapshots(
         write_u32(out, route.primary_node_id().as_u32());
         write_pg_state(out, route.state());
         write_option_u64(out, route.primary_lease_deadline_ms());
+        match route.peering_metadata_transfer() {
+            Some(transfer) => {
+                write_u8(out, 1);
+                write_u64(out, transfer.source_epoch().get());
+                write_pg_metadata_proof(out, transfer.source_metadata_proof());
+                write_pg_metadata_proof(out, transfer.metadata_proof());
+                write_option_u64(
+                    out,
+                    route
+                        .peering_metadata_transfer_source_route_epoch()
+                        .map(ClusterEpoch::get),
+                );
+                write_option_u32(
+                    out,
+                    route
+                        .peering_metadata_transfer_source_node_id()
+                        .map(NodeId::as_u32),
+                );
+            }
+            None => write_u8(out, 0),
+        }
         write_u32(out, len_as_u32(route.acting_set().len(), "acting set")?);
         for node_id in route.acting_set() {
             write_u32(out, node_id.as_u32());
@@ -3503,6 +3649,42 @@ fn read_pg_route_snapshots(
         let primary_node_id = NodeId::new(reader.read_u32()?);
         let state = read_pg_state(reader)?;
         let primary_lease_deadline_ms = reader.read_option_u64()?;
+        let (
+            peering_metadata_transfer,
+            peering_metadata_transfer_source_route_epoch,
+            peering_metadata_transfer_source_node_id,
+        ) = match reader.read_u8()? {
+            0 => (None, None, None),
+            1 => {
+                let source_epoch = read_cluster_epoch(reader, "metadata transfer source epoch")?;
+                let source_metadata_proof = read_pg_metadata_proof(reader)?;
+                let imported_metadata_proof = read_pg_metadata_proof(reader)?;
+                let source_route_epoch = reader
+                    .read_option_u64()?
+                    .map(|epoch| {
+                        ClusterEpoch::new(epoch).ok_or_else(|| ControlPlaneError::RpcProtocol {
+                            message: "metadata transfer source route epoch must be nonzero"
+                                .to_owned(),
+                        })
+                    })
+                    .transpose()?;
+                let source_node_id = reader.read_option_u32()?.map(NodeId::new);
+                (
+                    Some(PgMetadataTransferProof::new_with_imported_metadata_proof(
+                        source_epoch,
+                        source_metadata_proof,
+                        imported_metadata_proof,
+                    )),
+                    source_route_epoch,
+                    source_node_id,
+                )
+            }
+            tag => {
+                return Err(ControlPlaneError::RpcProtocol {
+                    message: format!("invalid PG route metadata transfer tag {tag}"),
+                });
+            }
+        };
         let acting_set_len = reader.read_collection_len(
             "PG route acting set",
             CONTROL_PLANE_RPC_ACTING_SET_NODE_MIN_LEN,
@@ -3518,6 +3700,9 @@ fn read_pg_route_snapshots(
             acting_set,
             state,
             primary_lease_deadline_ms,
+            peering_metadata_transfer,
+            peering_metadata_transfer_source_route_epoch,
+            peering_metadata_transfer_source_node_id,
         });
     }
     Ok(routes)
@@ -3579,6 +3764,16 @@ fn write_option_u64(out: &mut Vec<u8>, value: Option<u64>) {
         Some(value) => {
             write_u8(out, 1);
             write_u64(out, value);
+        }
+        None => write_u8(out, 0),
+    }
+}
+
+fn write_option_u32(out: &mut Vec<u8>, value: Option<u32>) {
+    match value {
+        Some(value) => {
+            write_u8(out, 1);
+            write_u32(out, value);
         }
         None => write_u8(out, 0),
     }
@@ -3697,6 +3892,16 @@ impl<'a> PayloadReader<'a> {
         }
     }
 
+    fn read_option_u32(&mut self) -> Result<Option<u32>, ControlPlaneError> {
+        match self.read_u8()? {
+            0 => Ok(None),
+            1 => Ok(Some(self.read_u32()?)),
+            value => Err(ControlPlaneError::RpcProtocol {
+                message: format!("invalid optional u32 tag {value}"),
+            }),
+        }
+    }
+
     fn read_len(&mut self, field: &'static str) -> Result<usize, ControlPlaneError> {
         usize::try_from(self.read_u32()?).map_err(|_| ControlPlaneError::RpcProtocol {
             message: format!("{field} length does not fit usize"),
@@ -3806,6 +4011,15 @@ pub enum ControlPlaneError {
         pg_id: u32,
         expected: PgMetadataProof,
         actual: PgMetadataProof,
+    },
+
+    #[error(
+        "PG {pg_id} metadata transfer proof {actual:?} does not match existing marker {expected:?}"
+    )]
+    PgMetadataTransferProofMismatch {
+        pg_id: u32,
+        expected: PgMetadataTransferProof,
+        actual: PgMetadataTransferProof,
     },
 
     #[error("control-plane bootstrap repeats PG {pg_id}")]
@@ -4050,7 +4264,7 @@ fn next_epoch(epoch: ClusterEpoch) -> Result<ClusterEpoch, ControlPlaneError> {
 
 fn format_snapshot(snapshot: &ClusterControlSnapshot) -> String {
     let mut out = String::new();
-    out.push_str("version=10\n");
+    out.push_str("version=11\n");
     out.push_str(&format!(
         "authority_incarnation={}\n",
         snapshot.authority_incarnation.get()
@@ -4140,6 +4354,8 @@ fn format_pg_record(record: &PgControlRecord) -> String {
         transfer_imported_log_index,
         transfer_imported_log_hash,
         transfer_imported_state_digest,
+        transfer_source_route_epoch,
+        transfer_source_node_id,
     ) = match record.peering_metadata_transfer {
         Some(transfer) => (
             option_u64(Some(transfer.source_epoch().get())),
@@ -4149,6 +4365,16 @@ fn format_pg_record(record: &PgControlRecord) -> String {
             option_u64(Some(transfer.metadata_proof().applied_log_index)),
             option_u64(Some(transfer.metadata_proof().applied_log_hash)),
             option_u64(Some(transfer.metadata_proof().state_digest)),
+            option_u64(
+                record
+                    .peering_metadata_transfer_source_route_epoch
+                    .map(ClusterEpoch::get),
+            ),
+            option_u32(
+                record
+                    .peering_metadata_transfer_source_node_id
+                    .map(NodeId::as_u32),
+            ),
         ),
         None => (
             option_u64(None),
@@ -4158,10 +4384,12 @@ fn format_pg_record(record: &PgControlRecord) -> String {
             option_u64(None),
             option_u64(None),
             option_u64(None),
+            option_u64(None),
+            option_u32(None),
         ),
     };
     format!(
-        "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+        "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
         record.pg_id.get(),
         pg_state_as_str(record.state),
         format_node_list(&record.acting_set),
@@ -4179,6 +4407,8 @@ fn format_pg_record(record: &PgControlRecord) -> String {
         transfer_imported_log_index,
         transfer_imported_log_hash,
         transfer_imported_state_digest,
+        transfer_source_route_epoch,
+        transfer_source_node_id,
         u8::from(record.metadata_transfer_fenced),
         u8::from(record.active_metadata_transfer_imported),
         option_u64(record.metadata_transfer_fence_source_lease_deadline_ms),
@@ -4373,7 +4603,7 @@ fn parse_snapshot(contents: &str) -> Result<ClusterControlSnapshot, ControlPlane
 
     let version = version
         .ok_or_else(|| parse_error(0, "missing or unsupported control-plane state version"))?;
-    if !(8..=10).contains(&version) {
+    if !(8..=11).contains(&version) {
         return Err(parse_error(
             0,
             "missing or unsupported control-plane state version",
@@ -4564,6 +4794,14 @@ fn validate_persisted_metadata_transfer_epoch(
                 "metadata transfer source epoch must not be newer than PG record epoch",
             ));
         }
+        if let Some(source_route_epoch) = pg.peering_metadata_transfer_source_route_epoch {
+            if source_route_epoch > record_epoch {
+                return Err(parse_error(
+                    line,
+                    "metadata transfer source route epoch must not be newer than PG record epoch",
+                ));
+            }
+        }
     }
     Ok(())
 }
@@ -4699,10 +4937,11 @@ fn parse_pg_record(line: usize, value: &str) -> Result<PgControlRecord, ControlP
         && fields.len() != 19
         && fields.len() != 20
         && fields.len() != 21
+        && fields.len() != 23
     {
         return Err(parse_error(
             line,
-            "PG record must have seven, ten, fourteen, seventeen, eighteen, nineteen, twenty, or twenty-one fields",
+            "PG record must have seven, ten, fourteen, seventeen, eighteen, nineteen, twenty, twenty-one, or twenty-three fields",
         ));
     }
     let pg_id = PgId::new(parse_u32(line, fields[0], "PG id")?);
@@ -4847,38 +5086,57 @@ fn parse_pg_record(line: usize, value: &str) -> Result<PgControlRecord, ControlP
         } else {
             None
         };
-    let metadata_transfer_fenced = if fields.len() >= 18 {
-        parse_bool_u8(line, fields[17], "metadata transfer fenced")?
+    let (
+        peering_metadata_transfer_source_route_epoch,
+        peering_metadata_transfer_source_node_id,
+        metadata_transfer_field_offset,
+    ) = if fields.len() >= 23 {
+        (
+            parse_option_cluster_epoch(line, fields[17], "metadata transfer source route epoch")?,
+            parse_option_u32(line, fields[18], "metadata transfer source node")?.map(NodeId::new),
+            19,
+        )
+    } else {
+        (None, None, 17)
+    };
+    let metadata_transfer_fenced = if fields.len() > metadata_transfer_field_offset {
+        parse_bool_u8(
+            line,
+            fields[metadata_transfer_field_offset],
+            "metadata transfer fenced",
+        )?
     } else {
         false
     };
-    let active_metadata_transfer_imported = if fields.len() >= 19 {
+    let active_metadata_transfer_imported = if fields.len() > metadata_transfer_field_offset + 1 {
         parse_bool_u8(
             line,
-            fields[18],
+            fields[metadata_transfer_field_offset + 1],
             "active metadata transfer imported provenance",
         )?
     } else {
         false
     };
-    let metadata_transfer_fence_source_lease_deadline_ms = if fields.len() >= 20 {
-        parse_option_u64(
-            line,
-            fields[19],
-            "metadata transfer fence source lease deadline",
-        )?
-    } else {
-        None
-    };
-    let metadata_transfer_fence_source_imported = if fields.len() >= 21 {
-        parse_bool_u8(
-            line,
-            fields[20],
-            "metadata transfer fence source imported provenance",
-        )?
-    } else {
-        false
-    };
+    let metadata_transfer_fence_source_lease_deadline_ms =
+        if fields.len() > metadata_transfer_field_offset + 2 {
+            parse_option_u64(
+                line,
+                fields[metadata_transfer_field_offset + 2],
+                "metadata transfer fence source lease deadline",
+            )?
+        } else {
+            None
+        };
+    let metadata_transfer_fence_source_imported =
+        if fields.len() > metadata_transfer_field_offset + 3 {
+            parse_bool_u8(
+                line,
+                fields[metadata_transfer_field_offset + 3],
+                "metadata transfer fence source imported provenance",
+            )?
+        } else {
+            false
+        };
     if acting_set.is_empty() {
         return Err(parse_error(line, "PG acting set must not be empty"));
     }
@@ -5002,6 +5260,25 @@ fn parse_pg_record(line: usize, value: &str) -> Result<PgControlRecord, ControlP
             "metadata transfer fence source imported provenance requires a fenced peering PG",
         ));
     }
+    if peering_metadata_transfer.is_some()
+        && (peering_metadata_transfer_source_route_epoch.is_none()
+            || peering_metadata_transfer_source_node_id.is_none())
+        && fields.len() >= 23
+    {
+        return Err(parse_error(
+            line,
+            "metadata transfer source route fields require a complete transfer marker",
+        ));
+    }
+    if peering_metadata_transfer.is_none()
+        && (peering_metadata_transfer_source_route_epoch.is_some()
+            || peering_metadata_transfer_source_node_id.is_some())
+    {
+        return Err(parse_error(
+            line,
+            "metadata transfer source route fields require a transfer marker",
+        ));
+    }
     let mut unique_nodes = BTreeSet::new();
     for node_id in &acting_set {
         if !unique_nodes.insert(*node_id) {
@@ -5017,6 +5294,8 @@ fn parse_pg_record(line: usize, value: &str) -> Result<PgControlRecord, ControlP
         active_metadata_transfer_imported,
         peering_metadata_proof_floor,
         peering_metadata_transfer,
+        peering_metadata_transfer_source_route_epoch,
+        peering_metadata_transfer_source_node_id,
         metadata_transfer_fenced,
         metadata_transfer_fence_source_lease_deadline_ms,
         metadata_transfer_fence_source_imported,
@@ -5578,6 +5857,8 @@ fn mark_pgs_peering_for_nodes(
             record.active_metadata_proof = None;
             record.active_metadata_transfer_imported = false;
             record.peering_metadata_transfer = None;
+            record.peering_metadata_transfer_source_route_epoch = None;
+            record.peering_metadata_transfer_source_node_id = None;
             record.metadata_transfer_fenced = false;
             record.metadata_transfer_fence_source_lease_deadline_ms = None;
             record.metadata_transfer_fence_source_imported = false;
@@ -12408,7 +12689,37 @@ mod tests {
         assert_eq!(pg.acting_set(), &[NodeId::new(2)]);
         assert_eq!(pg.peering_metadata_proof_floor(), Some(imported_proof));
         assert_eq!(pg.peering_metadata_transfer(), Some(transfer));
+        assert_eq!(
+            pg.peering_metadata_transfer_source_route_epoch(),
+            Some(active_epoch)
+        );
+        assert_eq!(
+            pg.peering_metadata_transfer_source_node_id(),
+            Some(NodeId::new(1))
+        );
         assert!(!pg.metadata_transfer_fenced());
+        let mismatched_same_acting_set = PgMetadataTransferProof::new_with_imported_metadata_proof(
+            active_epoch,
+            active_proof,
+            PgMetadataProof::new(
+                imported_proof.applied_log_index,
+                imported_proof.applied_log_hash + 1,
+                imported_proof.state_digest,
+            ),
+        );
+        assert!(matches!(
+            authority.set_pg_acting_set_with_metadata_transfer(
+                PgId::new(42),
+                vec![NodeId::new(2)],
+                mismatched_same_acting_set,
+            ),
+            Err(ControlPlaneError::PgMetadataTransferProofMismatch { pg_id: 42, .. })
+        ));
+        assert_eq!(authority.snapshot().cluster_epoch(), peering_epoch);
+        authority
+            .set_pg_acting_set_with_metadata_transfer(PgId::new(42), vec![NodeId::new(2)], transfer)
+            .unwrap();
+        assert_eq!(authority.snapshot().cluster_epoch(), peering_epoch);
 
         let transfer_epoch = authority.snapshot().cluster_epoch();
         assert_eq!(

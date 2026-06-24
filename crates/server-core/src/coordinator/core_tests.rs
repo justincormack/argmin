@@ -420,6 +420,7 @@ fn shard_backfill_worker_executes_remote_storage_node_work() {
             pg_ids: vec![pg_id.get()],
             socket_path: socket_path.clone(),
             pg_routes: vec![StorageNodePgRoute::from(&desired_route)],
+            historical_pg_routes: Vec::new(),
         };
         let server = Arc::new(StorageNodeServer::bind(server_config).unwrap());
         for _ in 0..4 {
@@ -8982,9 +8983,9 @@ fn delete_object_eventually_reclaims_simple_shards() {
 }
 
 #[test]
-fn shard_scavenger_worker_records_audit_observations() {
+fn shard_scavenger_audit_records_file_without_row_observations() {
     let tmp = test_util::tempdir();
-    let coord = setup_coordinator_without_lifecycle_sweeper(tmp.path());
+    let coord = setup_coordinator_with_pg_count_without_background_sweepers(tmp.path(), 1);
 
     coord
         .create_bucket_for_owner("default-owner", "bucket", false)
@@ -9008,28 +9009,25 @@ fn shard_scavenger_worker_records_audit_observations() {
         )
         .unwrap();
 
-    let start = std::time::Instant::now();
-    loop {
-        let observations = coord
-            .storage_node()
-            .test_list_shard_scavenger_observations(written.data_pg_id)
-            .unwrap();
-        if written.written_shards.iter().all(|shard| {
+    coord
+        .storage_node()
+        .audit_shard_storage_for_scavenger()
+        .unwrap();
+    let observations = coord
+        .storage_node()
+        .test_list_shard_scavenger_observations(written.data_pg_id)
+        .unwrap();
+    assert!(
+        written.written_shards.iter().all(|shard| {
             observations.iter().any(|observation| {
                 observation.reason == ShardScavengerObservationReason::FileWithoutShardRow
                     && observation.resolved_at.is_none()
                     && observation.key.data_pg_id == written.data_pg_id
                     && observation.key.shard_key == shard.key
             })
-        }) {
-            return;
-        }
-        assert!(
-            start.elapsed() < TEST_EVENT_TIMEOUT,
-            "shard scavenger worker did not record file-without-row observations; observations={observations:?}"
-        );
-        std::thread::sleep(Duration::from_millis(20));
-    }
+        }),
+        "shard scavenger audit did not record file-without-row observations; observations={observations:?}"
+    );
 }
 
 #[test]

@@ -514,6 +514,8 @@ fn unix_shard_clients_route_payload_io_and_ack_rows_to_storage_node() {
             primary_node_id: NodeId::new(1),
             acting_set: node_ids.to_vec(),
         }],
+
+        historical_pg_routes: Vec::new(),
     };
     let server = Arc::new(StorageNodeServer::bind(server_config.clone()).unwrap());
     let server_threads: Vec<_> = (0..15)
@@ -704,6 +706,8 @@ fn frontend_unix_shard_mode_uses_storage_node_owned_data_dir() {
             primary_node_id: NodeId::new(1),
             acting_set: node_ids.to_vec(),
         }],
+
+        historical_pg_routes: Vec::new(),
     };
     let server = StorageNodeServer::bind(server_config.clone()).unwrap();
     assert!(remote_data_dir.join(".argmin-storage-node.lock").is_file());
@@ -771,6 +775,8 @@ fn frontend_unix_metadata_command_mode_uses_storage_node_owned_data_dir() {
             primary_node_id: node_id,
             acting_set: vec![node_id],
         }],
+
+        historical_pg_routes: Vec::new(),
     };
     let server = Arc::new(StorageNodeServer::bind(server_config.clone()).unwrap());
     assert!(remote_data_dir.join(".argmin-storage-node.lock").is_file());
@@ -875,6 +881,8 @@ fn peering_replay_catches_up_replicas_through_unix_storage_clients() {
                 primary_node_id: NodeId::new(0),
                 acting_set: node_ids.to_vec(),
             }],
+
+            historical_pg_routes: Vec::new(),
         });
         client_configs.push(LocalUnixStorageNodeClientConfig::new(node_id, socket_path));
     }
@@ -944,6 +952,8 @@ fn frontend_unix_bucket_metadata_mode_creates_bucket_on_storage_node() {
             primary_node_id: node_id,
             acting_set: vec![node_id],
         }],
+
+        historical_pg_routes: Vec::new(),
     };
     let server = StorageNodeServer::bind(server_config.clone()).unwrap();
     assert!(remote_data_dir.join(".argmin-storage-node.lock").is_file());
@@ -1036,6 +1046,8 @@ fn frontend_unix_reclaim_and_bucket_finalize_resume_from_storage_node_owned_rows
             primary_node_id: node_id,
             acting_set: vec![node_id],
         }],
+
+        historical_pg_routes: Vec::new(),
     };
     let server = StorageNodeServer::bind(server_config).unwrap();
     assert!(remote_data_dir.join(".argmin-storage-node.lock").is_file());
@@ -1175,6 +1187,8 @@ fn frontend_unix_lifecycle_claims_resume_from_storage_node_owned_rows() {
             primary_node_id: node_id,
             acting_set: vec![node_id],
         }],
+
+        historical_pg_routes: Vec::new(),
     };
     let server = StorageNodeServer::bind(server_config).unwrap();
     assert!(remote_data_dir.join(".argmin-storage-node.lock").is_file());
@@ -1307,6 +1321,8 @@ fn frontend_unix_stream_session_scavenger_lists_storage_node_owned_rows() {
             primary_node_id: node_id,
             acting_set: vec![node_id],
         }],
+
+        historical_pg_routes: Vec::new(),
     };
     let bucket = crate::tests::bucket_name("remote-stream-scavenge");
     let key = crate::ObjectKey::try_from("key".to_string()).unwrap();
@@ -1428,6 +1444,8 @@ fn frontend_unix_stream_session_scavenger_rejects_wrong_pg_rows() {
                 acting_set: vec![node_id],
             },
         ],
+
+        historical_pg_routes: Vec::new(),
     };
     let topology = crate::PgTopology::new(&server_config.pg_ids).unwrap();
     let bucket = crate::tests::bucket_name("remote-stream-wrong-pg");
@@ -1510,6 +1528,8 @@ fn frontend_unix_bucket_metadata_mode_reads_bucket_batches_from_storage_node() {
             primary_node_id: node_id,
             acting_set: vec![node_id],
         }],
+
+        historical_pg_routes: Vec::new(),
     };
     let bucket = crate::tests::bucket_name("remote-bucket-metadata-read");
     let filtered_bucket = crate::tests::bucket_name("remote-bucket-metadata-other-owner");
@@ -1698,6 +1718,8 @@ fn frontend_unix_object_generation_mode_reserves_on_storage_node() {
             primary_node_id: node_id,
             acting_set: vec![node_id],
         }],
+
+        historical_pg_routes: Vec::new(),
     };
     let server = StorageNodeServer::bind(server_config.clone()).unwrap();
     assert!(remote_data_dir.join(".argmin-storage-node.lock").is_file());
@@ -1792,6 +1814,8 @@ fn frontend_unix_object_version_mode_reserves_on_storage_node() {
             primary_node_id: node_id,
             acting_set: vec![node_id],
         }],
+
+        historical_pg_routes: Vec::new(),
     };
     let server = StorageNodeServer::bind(server_config.clone()).unwrap();
     assert!(remote_data_dir.join(".argmin-storage-node.lock").is_file());
@@ -1875,6 +1899,8 @@ fn frontend_unix_bucket_write_reservation_mode_uses_storage_node() {
             primary_node_id: node_id,
             acting_set: vec![node_id],
         }],
+
+        historical_pg_routes: Vec::new(),
     };
     let bucket = crate::tests::bucket_name("remote-bucket-write-reservation");
     let owner = crate::CanonicalUserId::from_principal("owner");
@@ -2051,6 +2077,8 @@ fn frontend_unix_bucket_snapshot_pair_mode_uses_storage_node() {
             primary_node_id: node_id,
             acting_set: vec![node_id],
         }],
+
+        historical_pg_routes: Vec::new(),
     };
     let source_bucket = crate::tests::bucket_name("remote-pair-source");
     let destination_bucket = crate::tests::bucket_name("remote-pair-destination");
@@ -2205,6 +2233,8 @@ fn frontend_unix_object_mutation_stream_append_reads_route_to_storage_node() {
             primary_node_id: node_id,
             acting_set: vec![node_id],
         }],
+
+        historical_pg_routes: Vec::new(),
     };
     let server = StorageNodeServer::bind(server_config).unwrap();
     let _server_thread = thread::spawn(move || server.serve_forever().unwrap());
@@ -2297,6 +2327,8 @@ fn frontend_unix_object_generation_loser_retries_stale_generation() {
             primary_node_id: node_id,
             acting_set: vec![node_id],
         }],
+
+        historical_pg_routes: Vec::new(),
     };
     let server = StorageNodeServer::bind(server_config.clone()).unwrap();
     let _server_thread = thread::spawn(move || server.serve_forever().unwrap());
@@ -2427,6 +2459,8 @@ fn frontend_unix_object_generation_loser_retries_rpc_reservation_conflict() {
             primary_node_id: node_id,
             acting_set: vec![node_id],
         }],
+
+        historical_pg_routes: Vec::new(),
     };
     let server = StorageNodeServer::bind(server_config.clone()).unwrap();
     let _server_thread = thread::spawn(move || server.serve_forever().unwrap());
@@ -2968,6 +3002,8 @@ fn direct_put_publishes_after_remote_shard_io_and_ack_validation() {
                 primary_node_id: NodeId::new(0),
                 acting_set: node_ids.to_vec(),
             }],
+
+            historical_pg_routes: Vec::new(),
         });
         shard_client_configs.push(LocalUnixShardNodeClientConfig::new(node_id, socket_path));
     }
@@ -3093,6 +3129,8 @@ fn historical_payload_shard_inspection_can_route_to_unix_storage_node_client() {
                 primary_node_id: NodeId::new(0),
                 acting_set: node_ids.to_vec(),
             }],
+
+            historical_pg_routes: Vec::new(),
         })
         .unwrap(),
     );
@@ -3173,6 +3211,8 @@ fn remote_shard_files_without_ack_rows_are_not_publishable() {
                 primary_node_id: NodeId::new(0),
                 acting_set: node_ids.to_vec(),
             }],
+
+            historical_pg_routes: Vec::new(),
         });
         shard_client_configs.push(LocalUnixShardNodeClientConfig::new(node_id, socket_path));
     }
@@ -3318,6 +3358,8 @@ fn remote_shard_ack_rows_on_wrong_node_are_not_publishable() {
                 primary_node_id: NodeId::new(0),
                 acting_set: node_ids.to_vec(),
             }],
+
+            historical_pg_routes: Vec::new(),
         });
         shard_client_configs.push(LocalUnixShardNodeClientConfig::new(node_id, socket_path));
     }

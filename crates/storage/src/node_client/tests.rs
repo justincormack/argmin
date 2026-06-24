@@ -38,6 +38,7 @@ fn test_config(tmp: &test_util::TempDir) -> StorageNodeProcessConfig {
             primary_node_id: NodeId::new(7),
             acting_set: vec![NodeId::new(7)],
         }],
+        historical_pg_routes: Vec::new(),
     }
 }
 
