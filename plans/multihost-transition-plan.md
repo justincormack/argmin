@@ -8373,6 +8373,16 @@ Metadata PG migration and backfill design notes:
   after transfer-marker install, and after import, then proves the same live
   migration can resume and complete without re-fencing an already-migrated PG.
 - Added the metadata PG migration failover smoke to the standard local CI
+  script.
+- Started cluster-map history retention floors. The control plane now treats
+  a Peering metadata-transfer marker's persisted source route epoch as a
+  protected history reference: fixed-window pruning may discard older
+  unprotected maps, but it must retain any map still needed to retry or inspect
+  the transfer source route. Reload also fails closed if a persisted transfer
+  marker names an old source route epoch whose map is missing. This covers the
+  first control-plane-owned floor; storage metadata floors from object/segment
+  placement epochs and durable backfill rows still need a storage-side
+  reference scan/count path before history pruning can be fully data-aware.
   script alongside the regular metadata PG migration smoke. The retry/failpoint
   path is now part of the same UAT gate as the steady-state transfer path,
   instead of relying on an explicit one-off smoke invocation.

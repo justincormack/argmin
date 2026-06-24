@@ -641,7 +641,8 @@ impl ClusterControlSnapshot {
             .retain(|record| record.cluster_epoch != previous.cluster_epoch);
         self.history
             .push(ClusterMapHistoryRecord::from_snapshot(previous));
-        prune_cluster_map_history(&mut self.history);
+        let protected_epochs = required_cluster_map_history_epochs(self.pgs.values());
+        prune_cluster_map_history(&mut self.history, &protected_epochs);
     }
 }
 
@@ -4615,7 +4616,9 @@ fn parse_snapshot(contents: &str) -> Result<ClusterControlSnapshot, ControlPlane
     validate_parsed_history(&history, cluster_epoch)?;
     let mut history: Vec<ClusterMapHistoryRecord> =
         history.into_values().map(|record| record.record).collect();
-    prune_cluster_map_history(&mut history);
+    let protected_epochs = required_cluster_map_history_epochs(pgs.values());
+    prune_cluster_map_history(&mut history, &protected_epochs);
+    validate_required_cluster_map_history(&history, &pgs, cluster_epoch)?;
     Ok(ClusterControlSnapshot {
         authority_incarnation: authority_incarnation
             .ok_or_else(|| parse_error(0, "missing authority incarnation"))?,
@@ -4777,6 +4780,32 @@ fn validate_parsed_history(
                     ));
                 }
             }
+        }
+    }
+    Ok(())
+}
+
+fn validate_required_cluster_map_history(
+    history: &[ClusterMapHistoryRecord],
+    pgs: &BTreeMap<PgId, PgControlRecord>,
+    current_epoch: ClusterEpoch,
+) -> Result<(), ControlPlaneError> {
+    let retained_epochs: BTreeSet<_> = history
+        .iter()
+        .map(ClusterMapHistoryRecord::cluster_epoch)
+        .collect();
+    for pg in pgs.values() {
+        let Some(source_route_epoch) = pg.peering_metadata_transfer_source_route_epoch else {
+            continue;
+        };
+        if source_route_epoch >= current_epoch {
+            continue;
+        }
+        if !retained_epochs.contains(&source_route_epoch) {
+            return Err(parse_error(
+                0,
+                "metadata transfer source route epoch is not retained in cluster-map history",
+            ));
         }
     }
     Ok(())
@@ -5826,11 +5855,27 @@ fn validate_pg_primary_active_observation(
     Ok(())
 }
 
-fn prune_cluster_map_history(history: &mut Vec<ClusterMapHistoryRecord>) {
+fn required_cluster_map_history_epochs<'a>(
+    pgs: impl IntoIterator<Item = &'a PgControlRecord>,
+) -> BTreeSet<ClusterEpoch> {
+    pgs.into_iter()
+        .filter_map(PgControlRecord::peering_metadata_transfer_source_route_epoch)
+        .collect()
+}
+
+fn prune_cluster_map_history(
+    history: &mut Vec<ClusterMapHistoryRecord>,
+    protected_epochs: &BTreeSet<ClusterEpoch>,
+) {
     history.sort_by_key(ClusterMapHistoryRecord::cluster_epoch);
-    let excess = history.len().saturating_sub(CLUSTER_MAP_HISTORY_LIMIT);
-    if excess > 0 {
-        history.drain(..excess);
+    while history.len() > CLUSTER_MAP_HISTORY_LIMIT {
+        let Some(index) = history
+            .iter()
+            .position(|record| !protected_epochs.contains(&record.cluster_epoch()))
+        else {
+            break;
+        };
+        history.remove(index);
     }
 }
 
@@ -7048,6 +7093,173 @@ mod tests {
             CLUSTER_MAP_HISTORY_LIMIT
         );
         assert!(persisted.cluster_map_at_epoch(initial_epoch).is_none());
+    }
+
+    #[test]
+    fn cluster_map_history_pruning_preserves_metadata_transfer_source_route_epoch() {
+        let tmp = test_util::tempdir();
+        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store.clone()).unwrap();
+        for node_id in [1, 2] {
+            authority
+                .set_node_membership(NodeId::new(node_id), NodeMembershipState::Active)
+                .unwrap();
+            assert!(heartbeat_until_serving(&mut authority, node_id, 10_000).serving());
+        }
+        let active_proof = PgMetadataProof::new(9, 10, 11);
+        authority
+            .set_pg_acting_set(PgId::new(42), vec![NodeId::new(1)])
+            .unwrap();
+        heartbeat_with_pg_proof(
+            &mut authority,
+            1,
+            42,
+            PgState::Peering,
+            active_proof,
+            false,
+            20_000,
+        );
+        authority
+            .complete_pg_peering(
+                PgId::new(42),
+                NodeId::new(1),
+                node_incarnation(&authority, 1),
+                20_001,
+            )
+            .unwrap();
+        heartbeat_with_pg_proof(
+            &mut authority,
+            1,
+            42,
+            PgState::Active,
+            active_proof,
+            false,
+            20_002,
+        );
+        let initial_epoch = ClusterEpoch::INITIAL;
+        let source_epoch = authority.snapshot().cluster_epoch();
+        let transfer = PgMetadataTransferProof::new_with_imported_metadata_proof(
+            source_epoch,
+            active_proof,
+            PgMetadataProof::new(9, 12, 11),
+        );
+        authority
+            .set_pg_acting_set_with_metadata_transfer(PgId::new(42), vec![NodeId::new(2)], transfer)
+            .unwrap();
+
+        for node_id in 10..(10 + CLUSTER_MAP_HISTORY_LIMIT as u32 + 8) {
+            authority
+                .set_node_membership(NodeId::new(node_id), NodeMembershipState::Active)
+                .unwrap();
+        }
+
+        let history = authority.snapshot().cluster_map_history();
+        assert_eq!(history.len(), CLUSTER_MAP_HISTORY_LIMIT);
+        assert!(authority
+            .snapshot()
+            .cluster_map_at_epoch(source_epoch)
+            .is_some());
+        assert!(authority
+            .snapshot()
+            .cluster_map_at_epoch(initial_epoch)
+            .is_none());
+
+        let persisted = store.load().unwrap().unwrap();
+        assert!(persisted.cluster_map_at_epoch(source_epoch).is_some());
+        assert_eq!(
+            persisted
+                .pg(PgId::new(42))
+                .unwrap()
+                .peering_metadata_transfer_source_route_epoch(),
+            Some(source_epoch)
+        );
+    }
+
+    #[test]
+    fn control_plane_reload_rejects_transfer_marker_without_source_route_history() {
+        let tmp = test_util::tempdir();
+        let state_path = tmp.path().join("control-plane.state");
+        let store = FileControlPlaneStore::new(&state_path);
+        let mut authority = SingleAuthorityControlPlane::open(store.clone()).unwrap();
+        for node_id in [1, 2] {
+            authority
+                .set_node_membership(NodeId::new(node_id), NodeMembershipState::Active)
+                .unwrap();
+            assert!(heartbeat_until_serving(&mut authority, node_id, 10_000).serving());
+        }
+        let active_proof = PgMetadataProof::new(9, 10, 11);
+        authority
+            .set_pg_acting_set(PgId::new(42), vec![NodeId::new(1)])
+            .unwrap();
+        heartbeat_with_pg_proof(
+            &mut authority,
+            1,
+            42,
+            PgState::Peering,
+            active_proof,
+            false,
+            20_000,
+        );
+        authority
+            .complete_pg_peering(
+                PgId::new(42),
+                NodeId::new(1),
+                node_incarnation(&authority, 1),
+                20_001,
+            )
+            .unwrap();
+        heartbeat_with_pg_proof(
+            &mut authority,
+            1,
+            42,
+            PgState::Active,
+            active_proof,
+            false,
+            20_002,
+        );
+        let source_epoch = authority.snapshot().cluster_epoch();
+        let transfer = PgMetadataTransferProof::new_with_imported_metadata_proof(
+            source_epoch,
+            active_proof,
+            PgMetadataProof::new(9, 12, 11),
+        );
+        authority
+            .set_pg_acting_set_with_metadata_transfer(PgId::new(42), vec![NodeId::new(2)], transfer)
+            .unwrap();
+        assert!(store
+            .load()
+            .unwrap()
+            .unwrap()
+            .cluster_map_at_epoch(source_epoch)
+            .is_some());
+
+        let source_history_prefixes = [
+            format!("history={},", source_epoch.get()),
+            format!("history_node={},", source_epoch.get()),
+            format!("history_node_pg={},", source_epoch.get()),
+            format!("history_pg={},", source_epoch.get()),
+        ];
+        let state = std::fs::read_to_string(&state_path).unwrap();
+        let filtered = state
+            .lines()
+            .filter(|line| {
+                !source_history_prefixes
+                    .iter()
+                    .any(|prefix| line.starts_with(prefix))
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        std::fs::write(&state_path, filtered).unwrap();
+
+        let err = store.load().unwrap_err();
+        assert!(matches!(
+            err,
+            ControlPlaneError::Parse { message, .. }
+                if message.contains(
+                    "metadata transfer source route epoch is not retained in cluster-map history"
+                )
+        ));
     }
 
     #[test]
