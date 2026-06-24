@@ -8463,6 +8463,16 @@ Metadata PG migration and backfill design notes:
       view or fail closed without externally visible partial listings.
     - later expand to multipart complete and tag/ACL/legal-hold/retention
       metadata mutations.
+- Started the deterministic epoch-change fault-injection harness. Coordinator
+  tests now have a token-scoped deterministic fault gate that lets a test wait
+  for a specific operation to reach a named boundary, mutate runtime-map state,
+  and then release only that operation. The first regression covers direct PUT
+  at the boundary after payload shards are written/validated and before the
+  direct-put metadata command is applied: it installs a newer runtime-map epoch
+  while the operation is paused, resumes the request, and verifies the object is
+  committed once and readable through the newer map using retained historical
+  placement routes. This pins the local in-process/pinned-route behavior before
+  adding stricter stale-primary and remote storage-node fault-injection cases.
 
 Exit criteria:
 

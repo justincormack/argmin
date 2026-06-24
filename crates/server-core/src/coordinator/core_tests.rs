@@ -1106,6 +1106,141 @@ fn put_object_pins_runtime_map_after_bucket_write_reservation() {
 }
 
 #[test]
+fn put_object_epoch_change_before_metadata_apply_commits_once_on_pinned_route() {
+    const TOKEN: DeterministicFaultToken =
+        DeterministicFaultToken::new("put-object-before-metadata-apply");
+
+    let bucket = "direct-put-epoch-change-bucket";
+    let key = "key";
+    let tmp = test_util::tempdir();
+    let initial = open_test_storage_cluster(tmp.path(), &[0, 1]);
+    let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&initial));
+    let coord = Arc::new(
+        Coordinator::new_with_managed_key_provider_for_storage_cluster_runtime_map_handle_with_background_worker_mode(
+            handle.clone(),
+            "us-east-1".to_string(),
+            None,
+            test_sse_s3_provider(),
+            BackgroundWorkerMode::none(),
+        )
+        .unwrap(),
+    );
+    coord
+        .create_bucket_for_owner("default-owner", bucket, false)
+        .unwrap();
+
+    let gate = DeterministicFaultGate::new(TOKEN);
+    let hook_bucket = trusted_bucket_name(bucket);
+    let hook_key = trusted_object_key(key);
+    let gate_for_hook = Arc::clone(&gate);
+    let _hook_guard =
+        initial.test_install_before_metadata_command_apply_context_hook(Arc::new(move |context| {
+            if context.kind == MetadataCommandApplyTestKind::CommitDirectPutObject
+                && context.bucket.as_ref() == Some(&hook_bucket)
+                && context.key.as_ref() == Some(&hook_key)
+            {
+                gate_for_hook.wait_at(TOKEN);
+            }
+            Ok(())
+        }));
+
+    let put_coord = Arc::clone(&coord);
+    let put_thread = thread::spawn(move || {
+        let metadata = MetadataBlob::new();
+        test_helpers::put_object(
+            &put_coord,
+            &PutObjectRequest {
+                encryption: WriteEncryptionRequest::none(),
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
+                object: object_request_with_expected_owner(bucket, key, test_requester(), None),
+                data: b"direct-put-crosses-epoch-change",
+                metadata: &metadata,
+                system_metadata: &SystemMetadata::EMPTY,
+                tags: None,
+                cond: NO_WRITE,
+                acl: NO_PUT_OBJECT_ACL.into(),
+            },
+        )
+    });
+
+    gate.wait_until_arrived(TEST_EVENT_TIMEOUT);
+
+    let node_count = u32::from(initial.default_payload_ec_shape().k)
+        + u32::from(initial.default_payload_ec_shape().m);
+    let configs = (0..node_count)
+        .map(|node_id| {
+            LocalNodeStoreConfig::new(
+                NodeId::new(node_id),
+                tmp.path().join(format!("node-{node_id:04}")),
+            )
+        })
+        .collect::<Vec<_>>();
+    let next_epoch = ClusterEpoch::new(initial.cluster_epoch().get() + 1).unwrap();
+    let acting_set = (0..node_count).map(NodeId::new).collect::<Vec<_>>();
+    let routes = initial
+        .test_pg_ids()
+        .iter()
+        .map(|pg_id| {
+            let route = storage::control_plane::PgRouteSnapshot::reconstructed(
+                next_epoch,
+                PgId::new(*pg_id),
+                NodeId::new(0),
+                acting_set.clone(),
+                PgState::Active,
+            );
+            LocalPgRoute::from(&route)
+        })
+        .collect::<Vec<_>>();
+    let historical_routes = initial
+        .local_pg_routes()
+        .map(|route| {
+            storage::control_plane::PgRouteSnapshot::reconstructed(
+                route.cluster_epoch(),
+                route.pg_id(),
+                route.primary_node_id(),
+                route.acting_set().to_vec(),
+                route.state(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut candidate_map = LocalClusterMap::open_frontend_with_configs_and_pg_routes(
+        NodeId::new(0),
+        configs,
+        initial.test_pg_ids(),
+        initial.default_payload_ec_shape(),
+        next_epoch,
+        routes,
+    )
+    .unwrap();
+    candidate_map.test_install_historical_pg_routes(historical_routes);
+    let candidate = StorageCluster::from_local_map(Arc::new(candidate_map)).unwrap();
+    handle.install(candidate).unwrap();
+
+    gate.release();
+    let put_result = put_thread.join().unwrap().unwrap();
+    assert_eq!(put_result.version_id, VersionId::Null);
+
+    let result = coord
+        .get_object(&GetObjectRequest {
+            sse_customer: None,
+            object: object_version_request_with_expected_owner(
+                bucket,
+                key,
+                None,
+                test_requester(),
+                None,
+            ),
+            cond: NO_READ,
+        })
+        .unwrap();
+    assert_eq!(
+        result.body.read_all().unwrap(),
+        b"direct-put-crosses-epoch-change"
+    );
+}
+
+#[test]
 fn large_put_object_pins_runtime_map_after_stream_session_create() {
     let bucket = "large-put-pinned-bucket";
     let tmp = test_util::tempdir();

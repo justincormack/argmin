@@ -1,4 +1,5 @@
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::time::Duration;
 
 use storage::SessionId;
 
@@ -23,6 +24,69 @@ pub(super) struct ReclamationTestHooks {
 pub(super) static RECLAMATION_TEST_HOOKS: OnceLock<Mutex<ReclamationTestHooks>> = OnceLock::new();
 pub(super) static RECLAMATION_TEST_SERIAL: OnceLock<Mutex<()>> = OnceLock::new();
 pub(super) static STORAGE_TEST_HOOK_SERIAL: OnceLock<Mutex<()>> = OnceLock::new();
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct DeterministicFaultToken(&'static str);
+
+impl DeterministicFaultToken {
+    pub(super) const fn new(name: &'static str) -> Self {
+        Self(name)
+    }
+}
+
+#[derive(Debug, Default)]
+struct DeterministicFaultGateState {
+    arrived: bool,
+    released: bool,
+}
+
+#[derive(Debug)]
+pub(super) struct DeterministicFaultGate {
+    token: DeterministicFaultToken,
+    state: Mutex<DeterministicFaultGateState>,
+    changed: Condvar,
+}
+
+impl DeterministicFaultGate {
+    pub(super) fn new(token: DeterministicFaultToken) -> Arc<Self> {
+        Arc::new(Self {
+            token,
+            state: Mutex::new(DeterministicFaultGateState::default()),
+            changed: Condvar::new(),
+        })
+    }
+
+    pub(super) fn wait_at(&self, token: DeterministicFaultToken) {
+        if token != self.token {
+            return;
+        }
+        let mut state = self.state.lock().unwrap();
+        state.arrived = true;
+        self.changed.notify_all();
+        while !state.released {
+            state = self.changed.wait(state).unwrap();
+        }
+    }
+
+    pub(super) fn wait_until_arrived(&self, timeout: Duration) {
+        let state = self.state.lock().unwrap();
+        let (state, _) = self
+            .changed
+            .wait_timeout_while(state, timeout, |state| !state.arrived)
+            .unwrap();
+        assert!(
+            state.arrived,
+            "timed out waiting for deterministic fault gate {:?}",
+            self.token
+        );
+    }
+
+    pub(super) fn release(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.released = true;
+        self.changed.notify_all();
+    }
+}
 
 #[derive(Default, Clone)]
 pub(super) struct BucketPolicyLoadTestHooks {
