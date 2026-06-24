@@ -9,6 +9,7 @@ const METADATA_CANONICAL_PG_STATE_DOMAIN: &[u8] = b"argmin.metadata.pg-state";
 const METADATA_COMMAND_CHECKPOINT_ENCODING_VERSION: u8 = 1;
 const METADATA_COMMAND_CHECKPOINT_DOMAIN: &[u8] = b"argmin.metadata.command-checkpoint";
 const METADATA_COMMAND_CHECKPOINT_RETAIN_PER_EPOCH: usize = 8;
+const METADATA_COMMAND_CHECKPOINT_RETAIN_EPOCHS: usize = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum MetadataDigestFilter {
@@ -2477,6 +2478,7 @@ impl PgStore {
             checkpoint.cluster_epoch,
             METADATA_COMMAND_CHECKPOINT_RETAIN_PER_EPOCH,
         )?;
+        self.prune_metadata_command_checkpoint_epochs(METADATA_COMMAND_CHECKPOINT_RETAIN_EPOCHS)?;
         Ok(())
     }
 
@@ -2504,6 +2506,33 @@ impl PgStore {
             )
             .map_err(|source| StoreError::Db {
                 context: "prune metadata command checkpoints",
+                source,
+            })?;
+        Ok(())
+    }
+
+    fn prune_metadata_command_checkpoint_epochs(
+        &self,
+        retain_epochs: usize,
+    ) -> Result<(), StoreError> {
+        let retain_epochs = i64::try_from(retain_epochs).unwrap_or(i64::MAX);
+        self.conn
+            .execute(
+                "DELETE FROM metadata_command_checkpoints \
+                 WHERE pg_id = ?1 \
+                   AND cluster_epoch NOT IN ( \
+                     SELECT cluster_epoch FROM ( \
+                       SELECT DISTINCT cluster_epoch \
+                       FROM metadata_command_checkpoints \
+                       WHERE pg_id = ?1 \
+                       ORDER BY cluster_epoch DESC \
+                       LIMIT ?2 \
+                     ) \
+                   )",
+                rusqlite::params![self.pg_id as i64, retain_epochs],
+            )
+            .map_err(|source| StoreError::Db {
+                context: "prune metadata command checkpoint epochs",
                 source,
             })?;
         Ok(())

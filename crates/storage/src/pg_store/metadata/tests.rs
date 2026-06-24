@@ -2519,6 +2519,44 @@ fn metadata_command_checkpoint_catalogue_persists_and_lists_newest_valid_candida
 }
 
 #[test]
+fn metadata_command_checkpoint_catalogue_prunes_old_epochs() {
+    let tmp = test_util::tempdir();
+    let store = PgStore::open(tmp.path(), 1).unwrap();
+
+    let initial_state = store.metadata_command_replica_state().unwrap();
+    let state_digest = initial_state.state_digest;
+    for epoch_value in 1..=6 {
+        let cluster_epoch = ClusterEpoch::new(epoch_value).unwrap();
+        if cluster_epoch != initial_state.cluster_epoch {
+            store
+                .initialize_metadata_transfer_matching_state(0, cluster_epoch, 0, 0, state_digest)
+                .unwrap();
+        }
+        store
+            .record_current_metadata_command_checkpoint(0, cluster_epoch)
+            .unwrap();
+    }
+
+    let retained_epochs = (3..=6).collect::<Vec<_>>();
+    let mut observed_retained_epochs = Vec::new();
+    for epoch_value in 1..=6 {
+        let cluster_epoch = ClusterEpoch::new(epoch_value).unwrap();
+        let candidates = store
+            .metadata_command_checkpoint_candidates(cluster_epoch, u64::MAX, 8)
+            .unwrap();
+        if candidates.is_empty() {
+            assert!(epoch_value < 3, "newer epoch {epoch_value} was pruned");
+        } else {
+            assert_eq!(candidates.len(), 1);
+            assert_eq!(candidates[0].cluster_epoch, cluster_epoch);
+            observed_retained_epochs.push(epoch_value);
+        }
+    }
+
+    assert_eq!(observed_retained_epochs, retained_epochs);
+}
+
+#[test]
 fn metadata_command_checkpoint_verification_rejects_tampered_row_payload() {
     let tmp = test_util::tempdir();
     let store = PgStore::open(tmp.path(), 1).unwrap();

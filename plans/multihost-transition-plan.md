@@ -8324,9 +8324,15 @@ Metadata PG migration and backfill design notes:
   compaction after recording a checkpoint and when an existing checkpoint is
   current or cadence-limited, with the same mutation budget used for checkpoint
   records. Replay validation and checkpoint export continue from the checkpoint
-  proof plus retained suffix after compaction. Remaining retention work is to
-  tune when to keep extra retained-log suffixes or historical checkpoint
-  candidates for operational rollback/diagnostics rather than immediate pruning.
+  proof plus retained suffix after compaction.
+- Added the first cross-epoch checkpoint retention bound. Each PG checkpoint
+  catalogue now keeps only the newest checkpoint candidates within an epoch and
+  the newest recent epochs for that PG. This keeps checkpoint scheduling from
+  growing without bound across repeated metadata migrations while still leaving
+  recent checkpoint-plus-suffix bases available for transfer retry and near-term
+  reshuffles. Remaining retention work is to tune when to keep extra retained-
+  log suffixes or longer-lived historical checkpoint candidates for operational
+  rollback/diagnostics rather than immediate pruning.
 
 Exit criteria:
 
