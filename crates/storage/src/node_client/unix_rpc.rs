@@ -1520,6 +1520,16 @@ impl UnixStorageNodeClient {
                     claim_id: error.message,
                 })
             }
+            StorageRpcErrorCode::BucketWriteReservationConflict => {
+                BucketSnapshotLoadError::Metadata(MetadataError::BucketWriteReservationConflict {
+                    reservation_id: error.message,
+                })
+            }
+            StorageRpcErrorCode::BucketWriteReservationNotFound => {
+                BucketSnapshotLoadError::Metadata(MetadataError::BucketWriteReservationNotFound {
+                    reservation_id: error.message,
+                })
+            }
             _ => BucketSnapshotLoadError::Store(self.rpc_response_error(kind, error)),
         }
     }

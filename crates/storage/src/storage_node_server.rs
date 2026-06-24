@@ -9735,6 +9735,18 @@ fn bucket_snapshot_error_response(error: BucketSnapshotLoadError) -> StorageRpcE
                 message: claim_id,
             }
         }
+        BucketSnapshotLoadError::Metadata(MetadataError::BucketWriteReservationConflict {
+            reservation_id,
+        }) => StorageRpcErrorResponse {
+            code: StorageRpcErrorCode::BucketWriteReservationConflict,
+            message: reservation_id,
+        },
+        BucketSnapshotLoadError::Metadata(MetadataError::BucketWriteReservationNotFound {
+            reservation_id,
+        }) => StorageRpcErrorResponse {
+            code: StorageRpcErrorCode::BucketWriteReservationNotFound,
+            message: reservation_id,
+        },
         error => StorageRpcErrorResponse {
             code: StorageRpcErrorCode::Internal,
             message: error.to_string(),

@@ -984,7 +984,7 @@ fn unix_bucket_write_reservation_client_acquires_validates_and_releases() {
     }
     private_socket_dir(config.socket_path.parent().unwrap());
     let server = Arc::new(StorageNodeServer::bind(config.clone()).unwrap());
-    let server_threads: Vec<_> = (0..4)
+    let server_threads: Vec<_> = (0..5)
         .map(|_| {
             let server = Arc::clone(&server);
             thread::spawn(move || server.accept_one().unwrap())
@@ -1019,6 +1019,20 @@ fn unix_bucket_write_reservation_client_acquires_validates_and_releases() {
         &BucketWriteReservationProof::from(&record),
     )
     .unwrap();
+    let mut conflicting_proof = BucketWriteReservationProof::from(&record);
+    conflicting_proof.owner_token = "wrong-owner-token".to_string();
+    let conflict = BucketWriteReservationNodeClient::validate_bucket_write_reservation_proof(
+        &client,
+        PgId::new(0),
+        &conflicting_proof,
+    )
+    .unwrap_err();
+    assert!(matches!(
+        conflict,
+        BucketSnapshotLoadError::Metadata(MetadataError::BucketWriteReservationConflict {
+            reservation_id
+        }) if reservation_id == record.reservation_id
+    ));
     let renewed_deadline = lease_deadline.saturating_add(60_000);
     let renewed = BucketWriteReservationNodeClient::heartbeat_durable_bucket_write_reservation(
         &client,
@@ -1947,6 +1961,79 @@ fn unix_bucket_metadata_client_releases_bucket_write_proof() {
         PgMetadataStore::durable_bucket_write_reservation(&*pg, &bucket, "reservation-1")
             .unwrap()
             .is_none()
+    );
+}
+
+#[test]
+fn unix_bucket_metadata_client_preserves_proof_release_conflict() {
+    let tmp = test_util::tempdir();
+    let config = test_config(&tmp);
+    let bucket = crate::tests::bucket_name("proof-release-conflict-bucket");
+    let owner = crate::CanonicalUserId::from_principal("owner");
+    let reservation = {
+        let node = SharedStorageNode::open_with_default_ec_shape(
+            &config.data_dir,
+            &config.pg_ids,
+            config.default_ec_shape,
+        )
+        .unwrap();
+        let pg = node.get_pg(0).unwrap();
+        PgMetadataStore::create_bucket(
+            &*pg,
+            &bucket,
+            "owner",
+            &owner,
+            &crate::AclGrants::default(),
+            false,
+            false,
+        )
+        .unwrap();
+        PgMetadataStore::acquire_durable_bucket_write_reservation(
+            &*pg,
+            &bucket,
+            "reservation-1",
+            "owner-token-1",
+            ClusterEpoch::new(1).unwrap(),
+            "put-object",
+            10,
+            Some(20),
+            Some("key=a"),
+        )
+        .unwrap()
+    };
+    private_socket_dir(config.socket_path.parent().unwrap());
+    let server = StorageNodeServer::bind(config.clone()).unwrap();
+    let server_thread = thread::spawn(move || server.accept_one().unwrap());
+    let client = UnixStorageNodeClient::new(
+        NodeId::new(7),
+        ClusterEpoch::new(1).unwrap(),
+        config.socket_path.clone(),
+    );
+
+    let mut proof = BucketWriteReservationProof::from(&reservation);
+    proof.owner_token = "wrong-owner-token".to_string();
+    let err = client
+        .release_metadata_command_bucket_write_reservation(PgId::new(0), &proof)
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        BucketSnapshotLoadError::Metadata(MetadataError::BucketWriteReservationConflict {
+            reservation_id
+        }) if reservation_id == "reservation-1"
+    ));
+    server_thread.join().unwrap();
+
+    let node = SharedStorageNode::open_with_default_ec_shape(
+        &config.data_dir,
+        &config.pg_ids,
+        config.default_ec_shape,
+    )
+    .unwrap();
+    let pg = node.get_pg(0).unwrap();
+    assert!(
+        PgMetadataStore::durable_bucket_write_reservation(&*pg, &bucket, "reservation-1")
+            .unwrap()
+            .is_some()
     );
 }
 

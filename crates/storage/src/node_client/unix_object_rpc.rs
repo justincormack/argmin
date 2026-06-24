@@ -433,12 +433,10 @@ impl BucketWriteReservationNodeClient for UnixStorageNodeClient {
                 error.to_string(),
             ))
         })?;
-        let response = self
-            .rpc_request(
-                StorageRpcMessageKind::BucketWriteReservationValidate,
-                payload,
-            )
-            .map_err(BucketSnapshotLoadError::Store)?;
+        let response = self.rpc_request_bucket_snapshot(
+            StorageRpcMessageKind::BucketWriteReservationValidate,
+            payload,
+        )?;
         self.validate_empty_bucket_write_reservation_response(
             "decode bucket write reservation validate response",
             &response,
@@ -465,12 +463,14 @@ impl BucketWriteReservationNodeClient for UnixStorageNodeClient {
                     error.to_string(),
                 ))
             })?;
-        let response = self
-            .rpc_request(
-                StorageRpcMessageKind::BucketWriteReservationHeartbeat,
-                payload,
-            )
-            .map_err(BucketSnapshotLoadError::Store)?;
+        let kind = StorageRpcMessageKind::BucketWriteReservationHeartbeat;
+        let response = match self
+            .rpc_request_result(kind, payload)
+            .map_err(BucketSnapshotLoadError::Store)?
+        {
+            Ok(response) => response,
+            Err(error) => return Err(self.bucket_snapshot_rpc_response_error(kind, error)),
+        };
         let response =
             decode_bucket_write_reservation_record_response(&response).map_err(|error| {
                 BucketSnapshotLoadError::Store(self.rpc_payload_error(
@@ -515,12 +515,10 @@ impl BucketWriteReservationNodeClient for UnixStorageNodeClient {
                     error.to_string(),
                 ))
             })?;
-        let response = self
-            .rpc_request(
-                StorageRpcMessageKind::BucketWriteReservationRelease,
-                payload,
-            )
-            .map_err(BucketSnapshotLoadError::Store)?;
+        let response = self.rpc_request_bucket_snapshot(
+            StorageRpcMessageKind::BucketWriteReservationRelease,
+            payload,
+        )?;
         self.validate_empty_bucket_write_reservation_response(
             "decode bucket write reservation release response",
             &response,
@@ -543,9 +541,8 @@ impl BucketWriteReservationNodeClient for UnixStorageNodeClient {
                 self.rpc_payload_error("encode proof release request", error.to_string()),
             )
         })?;
-        let response = self
-            .rpc_request(StorageRpcMessageKind::ProofRelease, payload)
-            .map_err(BucketSnapshotLoadError::Store)?;
+        let response =
+            self.rpc_request_bucket_snapshot(StorageRpcMessageKind::ProofRelease, payload)?;
         self.validate_proof_release_response(&response)?;
         Ok(())
     }
