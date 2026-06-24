@@ -974,6 +974,16 @@ mod tests {
     }
 
     #[test]
+    fn display_redacts_unexpected_security_token() {
+        let err = ServerError::Auth(auth::AuthError::UnexpectedSecurityToken {
+            token: "tok\nen".to_string(),
+        });
+        let display = err.to_string();
+        assert_eq!(display, "auth error: unexpected security token");
+        assert!(!display.contains("tok\nen"));
+    }
+
+    #[test]
     fn s3_error_code_auth_expired_token() {
         let err = ServerError::Auth(auth::AuthError::ExpiredToken);
         assert_eq!(err.s3_error_code(), "ExpiredToken");

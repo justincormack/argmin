@@ -23,7 +23,7 @@ pub enum AuthError {
     SignatureMismatch,
     #[error("invalid session token")]
     InvalidToken,
-    #[error("unexpected security token: {token}")]
+    #[error("unexpected security token")]
     UnexpectedSecurityToken { token: String },
     #[error("token expired")]
     ExpiredToken,
@@ -93,6 +93,16 @@ mod tests {
         let debug = format!("{err:?}");
         assert!(debug.contains("<redacted:security_token>"));
         assert!(!debug.contains("tok\nen"));
+    }
+
+    #[test]
+    fn unexpected_security_token_display_is_redacted() {
+        let err = AuthError::UnexpectedSecurityToken {
+            token: "tok\nen".to_string(),
+        };
+        let display = err.to_string();
+        assert_eq!(display, "unexpected security token");
+        assert!(!display.contains("tok\nen"));
     }
 
     #[test]
