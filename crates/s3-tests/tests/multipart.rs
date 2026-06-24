@@ -1605,6 +1605,30 @@ fn test_list_multipart_uploads_pagination_and_markers() {
 }
 
 #[test]
+fn test_list_multipart_uploads_max_uploads_above_aws_limit_is_clamped() {
+    s3_tests::run(async {
+        let bucket = setup_bucket().await;
+
+        let url = format!("{}/{bucket}?uploads&max-uploads=5000", CTX.endpoint());
+        let response = send_signed_request("GET", &url, b"", std::iter::empty::<(&str, &str)>());
+
+        assert_eq!(response.status, 200, "unexpected body: {}", response.body);
+        assert!(
+            response.body.contains("<MaxUploads>1000</MaxUploads>"),
+            "unexpected body: {}",
+            response.body
+        );
+        assert!(
+            !response.body.contains("<MaxUploads>5000</MaxUploads>"),
+            "unexpected body: {}",
+            response.body
+        );
+
+        cleanup(&bucket, &[]).await;
+    });
+}
+
+#[test]
 fn test_list_multipart_uploads_invalid_present_upload_id_marker_rejected() {
     s3_tests::run(async {
         let client = CTX.client();
@@ -2015,6 +2039,53 @@ fn test_list_parts() {
             .bucket(&bucket)
             .key(key)
             .upload_id(upload_id)
+            .send_retrying_operation_aborted("S3 operation during multipart test")
+            .await
+            .unwrap();
+        cleanup(&bucket, &[]).await;
+    });
+}
+
+#[test]
+fn test_list_parts_max_parts_above_aws_limit_is_clamped() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+        let key = "list-parts-max-clamp";
+
+        let create = client
+            .create_multipart_upload()
+            .bucket(&bucket)
+            .key(key)
+            .send_retrying_operation_aborted("S3 operation during multipart test")
+            .await
+            .unwrap();
+        let upload_id = create.upload_id().unwrap().to_string();
+        let encoded_upload_id = query_encode_value(&upload_id);
+
+        let url = format!(
+            "{}/{bucket}/{key}?uploadId={encoded_upload_id}&max-parts=5000",
+            CTX.endpoint()
+        );
+        let response = send_signed_request("GET", &url, b"", std::iter::empty::<(&str, &str)>());
+
+        assert_eq!(response.status, 200, "unexpected body: {}", response.body);
+        assert!(
+            response.body.contains("<MaxParts>1000</MaxParts>"),
+            "unexpected body: {}",
+            response.body
+        );
+        assert!(
+            !response.body.contains("<MaxParts>5000</MaxParts>"),
+            "unexpected body: {}",
+            response.body
+        );
+
+        client
+            .abort_multipart_upload()
+            .bucket(&bucket)
+            .key(key)
+            .upload_id(&upload_id)
             .send_retrying_operation_aborted("S3 operation during multipart test")
             .await
             .unwrap();

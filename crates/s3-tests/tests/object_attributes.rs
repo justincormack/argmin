@@ -4,8 +4,8 @@ use aws_sdk_s3::types::{
     ObjectAttributes, StorageClass, VersioningConfiguration,
 };
 use s3_tests::{
-    assert_s3_err_code, err_status, sse_c_header_values, test_sse_c_key, unique_bucket,
-    SendRetryingOperationAborted, CTX,
+    assert_s3_err_code, err_status, send_signed_request, sse_c_header_values, test_sse_c_key,
+    unique_bucket, SendRetryingOperationAborted, CTX,
 };
 
 const PART_SIZE: usize = 5 * 1024 * 1024; // 5 MB minimum part size
@@ -681,6 +681,85 @@ fn test_get_paginated_multipart_object_attributes() {
         assert_eq!(p3.parts().len(), 1);
         assert_eq!(p3.parts()[0].part_number(), Some(3));
         assert!(p3.next_part_number_marker().is_some());
+
+        cleanup(&bucket, &[key]).await;
+    });
+}
+
+#[test]
+fn test_get_object_attributes_max_parts_above_list_limit_is_preserved() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
+
+        let key = "mpu-max-parts-clamp";
+        let parts_data = [vec![b'a'; PART_SIZE], vec![b'b'; 1024]];
+
+        let create = client
+            .create_multipart_upload()
+            .bucket(&bucket)
+            .key(key)
+            .checksum_algorithm(ChecksumAlgorithm::Crc32)
+            .send()
+            .await
+            .unwrap();
+        let upload_id = create.upload_id().unwrap();
+
+        let mut completed_parts = Vec::new();
+        for (i, data) in parts_data.iter().enumerate() {
+            let part_number = (i + 1) as i32;
+            let resp = client
+                .upload_part()
+                .bucket(&bucket)
+                .key(key)
+                .upload_id(upload_id)
+                .part_number(part_number)
+                .body(ByteStream::from(data.clone()))
+                .checksum_algorithm(ChecksumAlgorithm::Crc32)
+                .send()
+                .await
+                .unwrap();
+            completed_parts.push(
+                CompletedPart::builder()
+                    .e_tag(resp.e_tag().unwrap())
+                    .checksum_crc32(resp.checksum_crc32().unwrap())
+                    .part_number(part_number)
+                    .build(),
+            );
+        }
+
+        client
+            .complete_multipart_upload()
+            .bucket(&bucket)
+            .key(key)
+            .upload_id(upload_id)
+            .multipart_upload(
+                CompletedMultipartUpload::builder()
+                    .set_parts(Some(completed_parts))
+                    .build(),
+            )
+            .send()
+            .await
+            .unwrap();
+
+        let url = format!("{}/{bucket}/{key}?attributes", CTX.endpoint());
+        let response = send_signed_request(
+            "GET",
+            &url,
+            b"",
+            [
+                ("x-amz-object-attributes", "ObjectParts"),
+                ("x-amz-max-parts", "5000"),
+            ],
+        );
+
+        assert_eq!(response.status, 200, "unexpected body: {}", response.body);
+        assert!(
+            response.body.contains("<MaxParts>5000</MaxParts>"),
+            "unexpected body: {}",
+            response.body
+        );
 
         cleanup(&bucket, &[key]).await;
     });

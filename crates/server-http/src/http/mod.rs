@@ -2947,9 +2947,8 @@ impl HttpFrontend {
                 let parsed_upload_id_marker =
                     parse_optional_upload_id_marker(upload_id_marker.as_deref())?;
                 let encoding_type = req.query_param_lossy("encoding-type");
-                let max_uploads = parse_u32_or_default(
+                let max_uploads = parse_s3_list_limit(
                     req.query_param_lossy("max-uploads"),
-                    1000,
                     "invalid max-uploads",
                 )?;
                 let requester = Self::requester_from_auth(auth);
@@ -2980,11 +2979,8 @@ impl HttpFrontend {
                     req.query_param_lossy("part-number-marker"),
                     "part-number-marker must be an integer",
                 )?;
-                let max_parts = parse_u32_or_default(
-                    req.query_param_lossy("max-parts"),
-                    1000,
-                    "invalid max-parts",
-                )?;
+                let max_parts =
+                    parse_s3_list_limit(req.query_param_lossy("max-parts"), "invalid max-parts")?;
                 let requester = Self::requester_from_auth(auth);
                 let result =
                     self.coordinator
@@ -4904,6 +4900,13 @@ pub fn s3_response_to_hyper(
 
 fn parse_max_keys<S: AsRef<str>>(raw: Option<S>) -> Result<u32, ServerError> {
     Ok(parse_u32_or_default(raw, 1000, "invalid max-keys")?.min(S3_MAX_LIST_KEYS))
+}
+
+fn parse_s3_list_limit<S: AsRef<str>>(
+    raw: Option<S>,
+    invalid_reason: &str,
+) -> Result<u32, ServerError> {
+    Ok(parse_u32_or_default(raw, 1000, invalid_reason)?.min(S3_MAX_LIST_KEYS))
 }
 
 fn parse_requested_max_keys<S: AsRef<str>>(raw: Option<S>) -> Result<u32, ServerError> {
@@ -10290,6 +10293,31 @@ mod tests {
     }
 
     #[test]
+    fn list_parts_clamps_max_parts_to_s3_limit() {
+        let tmp = test_util::tempdir();
+        let fe = setup_frontend(tmp.path());
+        create_test_bucket(&fe.coordinator, "mybucket");
+        let upload_id = create_upload_with_checksum(&fe, "mybucket", "mykey", None);
+
+        let req = make_req(&format!("uploadId={upload_id}&max-parts=4294967295"));
+        let op = S3Operation::ListParts {
+            bucket: test_bucket_name("mybucket"),
+            key: "mykey".to_string(),
+        };
+        let resp = fe.dispatch_routed(&req, &test_auth(), op).unwrap();
+        assert_eq!(resp.status_code, 200);
+        let body = String::from_utf8(response_body(resp)).unwrap();
+        assert!(
+            body.contains("<MaxParts>1000</MaxParts>"),
+            "unexpected ListParts body: {body}"
+        );
+        assert!(
+            !body.contains("<MaxParts>4294967295</MaxParts>"),
+            "unexpected ListParts body: {body}"
+        );
+    }
+
+    #[test]
     fn list_parts_invalid_upload_id_returns_no_such_upload() {
         let tmp = test_util::tempdir();
         let fe = setup_frontend(tmp.path());
@@ -10367,6 +10395,40 @@ mod tests {
             Err(e) => panic!("expected InvalidArgument, got {e:?}"),
             Ok(_) => panic!("expected error, got Ok"),
         }
+    }
+
+    #[test]
+    fn get_object_attributes_preserves_max_parts_above_s3_list_limit() {
+        let tmp = test_util::tempdir();
+        let fe = setup_frontend(tmp.path());
+        create_test_bucket(&fe.coordinator, "mybucket");
+        let parts = [(1, vec![b'a'; 5 * 1024 * 1024]), (2, b"tail".to_vec())];
+        do_multipart_upload(&fe, "mybucket", "mykey", &parts, Some("CRC32"));
+
+        let req = new_req(
+            http::Method::GET,
+            "",
+            "",
+            vec![
+                (
+                    "x-amz-object-attributes".to_string(),
+                    "ObjectParts".to_string(),
+                ),
+                ("x-amz-max-parts".to_string(), "4294967295".to_string()),
+            ],
+            vec![],
+        );
+        let op = S3Operation::GetObjectAttributes {
+            bucket: test_bucket_name("mybucket"),
+            key: "mykey".to_string(),
+        };
+        let resp = fe.dispatch_routed(&req, &test_auth(), op).unwrap();
+        assert_eq!(resp.status_code, 200);
+        let body = String::from_utf8(response_body(resp)).unwrap();
+        assert!(
+            body.contains("<MaxParts>4294967295</MaxParts>"),
+            "unexpected GetObjectAttributes body: {body}"
+        );
     }
 
     // ── End-to-end multipart upload flow ────────────────────────────
@@ -10449,6 +10511,29 @@ mod tests {
             Err(e) => panic!("expected InvalidArgument, got {e:?}"),
             Ok(_) => panic!("expected error, got Ok"),
         }
+    }
+
+    #[test]
+    fn list_multipart_uploads_clamps_max_uploads_to_s3_limit() {
+        let tmp = test_util::tempdir();
+        let fe = setup_frontend(tmp.path());
+        create_test_bucket(&fe.coordinator, "mybucket");
+
+        let req = make_req("uploads&max-uploads=4294967295");
+        let op = S3Operation::ListMultipartUploads {
+            bucket: test_bucket_name("mybucket"),
+        };
+        let resp = fe.dispatch_routed(&req, &test_auth(), op).unwrap();
+        assert_eq!(resp.status_code, 200);
+        let body = String::from_utf8(response_body(resp)).unwrap();
+        assert!(
+            body.contains("<MaxUploads>1000</MaxUploads>"),
+            "unexpected ListMultipartUploads body: {body}"
+        );
+        assert!(
+            !body.contains("<MaxUploads>4294967295</MaxUploads>"),
+            "unexpected ListMultipartUploads body: {body}"
+        );
     }
 
     #[test]
