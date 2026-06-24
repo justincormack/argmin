@@ -584,9 +584,9 @@ struct MetadataTransferLiveSummary {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum MetadataTransferLiveFailpoint {
-    AfterFence,
-    AfterTransferInstall,
-    AfterImport,
+    Fence,
+    TransferInstall,
+    Import,
 }
 
 impl MetadataTransferLiveFailpoint {
@@ -596,9 +596,9 @@ impl MetadataTransferLiveFailpoint {
         };
         match value.as_str() {
             "" => Ok(None),
-            "after-fence" => Ok(Some(Self::AfterFence)),
-            "after-transfer-install" => Ok(Some(Self::AfterTransferInstall)),
-            "after-import" => Ok(Some(Self::AfterImport)),
+            "after-fence" => Ok(Some(Self::Fence)),
+            "after-transfer-install" => Ok(Some(Self::TransferInstall)),
+            "after-import" => Ok(Some(Self::Import)),
             _ => Err(format!(
                 "ARGMIN_METADATA_TRANSFER_FAILPOINT must be after-fence, after-transfer-install, or after-import, got {value:?}"
             )),
@@ -607,9 +607,9 @@ impl MetadataTransferLiveFailpoint {
 
     fn label(self) -> &'static str {
         match self {
-            Self::AfterFence => "after-fence",
-            Self::AfterTransferInstall => "after-transfer-install",
-            Self::AfterImport => "after-import",
+            Self::Fence => "after-fence",
+            Self::TransferInstall => "after-transfer-install",
+            Self::Import => "after-import",
         }
     }
 }
@@ -718,7 +718,7 @@ fn transfer_control_plane_pg_metadata_live(
         .fence_pg_for_metadata_transfer_runtime_map(pg_id)
         .map_err(|error| format!("failed to refresh fenced PG metadata transfer map: {error}"))?;
     metadata_transfer_peering_source_route_matches(&source_runtime, pg_id, source_node_id)?;
-    maybe_fail_metadata_transfer_live(failpoint, MetadataTransferLiveFailpoint::AfterFence)?;
+    maybe_fail_metadata_transfer_live(failpoint, MetadataTransferLiveFailpoint::Fence)?;
     let source_route = metadata_transfer_peering_route(&source_runtime, pg_id)?;
     let (artifact, destination_runtime, import_epoch, imported_proof, source_node_id) =
         if let Some(existing_transfer) = source_route.peering_metadata_transfer() {
@@ -860,10 +860,7 @@ fn transfer_control_plane_pg_metadata_live(
                 source_node_id,
             )
         };
-    maybe_fail_metadata_transfer_live(
-        failpoint,
-        MetadataTransferLiveFailpoint::AfterTransferInstall,
-    )?;
+    maybe_fail_metadata_transfer_live(failpoint, MetadataTransferLiveFailpoint::TransferInstall)?;
     let destination_cluster =
         build_frontend_storage_cluster_from_runtime_map(&config, &ec_config, &destination_runtime)?;
     let actual_imported_proof = import_pg_metadata_transfer_artifact_retrying_stale_route(
@@ -881,7 +878,7 @@ fn transfer_control_plane_pg_metadata_live(
             actual_imported_proof, imported_proof
         ));
     }
-    maybe_fail_metadata_transfer_live(failpoint, MetadataTransferLiveFailpoint::AfterImport)?;
+    maybe_fail_metadata_transfer_live(failpoint, MetadataTransferLiveFailpoint::Import)?;
     Ok(MetadataTransferLiveSummary {
         source_node_id,
         source_epoch: artifact.cluster_epoch(),
