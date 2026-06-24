@@ -8392,6 +8392,11 @@ Metadata PG migration and backfill design notes:
   per-PG summaries by oldest epoch, giving the next slice a storage-owned floor
   to expose over the storage-node RPC boundary and feed into control-plane
   history pruning.
+- Exposed that storage-side history reference summary over the storage-node
+  Unix RPC/client boundary. Local cluster maps now merge summaries through the
+  node-client surface rather than reaching directly into in-process storage
+  nodes, so remote Unix storage nodes can contribute storage-owned history
+  floors before retained cluster-map pruning is made data-aware.
 
 Exit criteria:
 

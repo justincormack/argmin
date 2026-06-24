@@ -1410,6 +1410,120 @@ fn frontend_unix_stream_session_scavenger_lists_storage_node_owned_rows() {
 }
 
 #[test]
+fn frontend_unix_cluster_map_history_reference_summary_reads_storage_node_owned_rows() {
+    let tmp = test_util::tempdir();
+    let node_id = NodeId::new(1);
+    let ec_shape = EcShape { k: 1, m: 0 };
+    let remote_data_dir = tmp.path().join("remote-history-summary-node-1");
+    let socket_path = tmp
+        .path()
+        .join("sockets")
+        .join("history-summary-node-1.sock");
+    private_socket_dir(socket_path.parent().unwrap());
+    let server_config = StorageNodeProcessConfig {
+        node_id,
+        cluster_epoch: ClusterEpoch::INITIAL,
+        route_map_valid_until_ms: None,
+        data_dir: remote_data_dir.clone(),
+        default_ec_shape: ec_shape,
+        pg_ids: vec![0],
+        socket_path: socket_path.clone(),
+        pg_routes: vec![StorageNodePgRoute {
+            pg_id: 0,
+            cluster_epoch: ClusterEpoch::INITIAL,
+            state: PgState::Active,
+            primary_node_id: node_id,
+            acting_set: vec![node_id],
+        }],
+
+        historical_pg_routes: Vec::new(),
+    };
+    {
+        let remote = SharedStorageNode::open_with_default_ec_shape(
+            &server_config.data_dir,
+            &server_config.pg_ids,
+            server_config.default_ec_shape,
+        )
+        .unwrap();
+        let pg = remote.get_pg(0).unwrap();
+        pg.connection()
+            .execute(
+                "INSERT INTO object_segments \
+                 (bucket, key, version_id, segment_index, size, segment_crc64, segment_okh, \
+                  segment_vid, data_pg_id, placement_cluster_epoch, ec_k, ec_m) \
+                 VALUES (?1, ?2, 1, 0, 1024, ?3, ?4, 10, 0, ?5, 1, 0)",
+                rusqlite::params![
+                    "remote-history-summary-bucket",
+                    "object",
+                    0x1234_i64,
+                    [0x11_u8; 16].as_slice(),
+                    8_i64,
+                ],
+            )
+            .unwrap();
+        let backfill = crate::PlacedSegmentShardBackfillWorkItem {
+            request: crate::SegmentStoredBytesRequest {
+                data_pg_id: 0,
+                segment_okh: [0x44; 16],
+                segment_vid: GenerationId::new(12).unwrap(),
+                stored_size: 4096,
+                segment_crc64: 0x9abc,
+                ec: ec_shape,
+            },
+            source_cluster_epoch: ClusterEpoch::new(4).unwrap(),
+            desired_cluster_epoch: ClusterEpoch::new(11).unwrap(),
+        };
+        pg.record_placed_segment_shard_backfill(&backfill, backfill.request.ec.m, None)
+            .unwrap();
+    }
+    let server = StorageNodeServer::bind(server_config).unwrap();
+    assert!(remote_data_dir.join(".argmin-storage-node.lock").is_file());
+    let server_thread = thread::spawn(move || server.accept_one().unwrap());
+
+    let mut map = LocalClusterMap::open_frontend_placeholder_with_configs_and_epoch(
+        node_id,
+        [LocalNodeStoreConfig::new(
+            node_id,
+            tmp.path()
+                .join("frontend-history-summary")
+                .join("node-0001"),
+        )],
+        &[0],
+        ec_shape,
+        ClusterEpoch::INITIAL,
+    )
+    .unwrap();
+    map.install_unix_storage_node_clients([LocalUnixStorageNodeClientConfig::new(
+        node_id,
+        socket_path,
+    )])
+    .unwrap();
+
+    let frontend_summary = map
+        .node(node_id)
+        .unwrap()
+        .storage_node()
+        .cluster_map_history_reference_summary()
+        .unwrap();
+    assert_eq!(frontend_summary.oldest_required_epoch(), None);
+
+    let summary = map.cluster_map_history_reference_summary().unwrap();
+    assert_eq!(
+        summary.oldest_live_placement_epoch,
+        Some(ClusterEpoch::new(8).unwrap())
+    );
+    assert_eq!(
+        summary.oldest_durable_backfill_epoch,
+        Some(ClusterEpoch::new(4).unwrap())
+    );
+    assert_eq!(
+        summary.oldest_required_epoch(),
+        Some(ClusterEpoch::new(4).unwrap())
+    );
+    server_thread.join().unwrap();
+}
+
+#[test]
 fn frontend_unix_stream_session_scavenger_rejects_wrong_pg_rows() {
     let tmp = test_util::tempdir();
     let node_id = NodeId::new(1);

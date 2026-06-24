@@ -1810,7 +1810,7 @@ impl LocalClusterMap {
         let mut summary = PgClusterMapHistoryReferenceSummary::default();
         for node in self.nodes.values() {
             summary.merge(
-                node.storage_node()
+                node.shard_scavenger_client()
                     .cluster_map_history_reference_summary()?,
             );
         }

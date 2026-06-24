@@ -1062,6 +1062,10 @@ pub(crate) trait ShardAckNodeClient: Send + Sync {
 }
 
 pub(crate) trait ShardScavengerNodeClient: Send + Sync {
+    fn cluster_map_history_reference_summary(
+        &self,
+    ) -> Result<crate::PgClusterMapHistoryReferenceSummary, StoreError>;
+
     fn list_scavenger_shard_files(
         &self,
         data_pg_id: DataPgId,

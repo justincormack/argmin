@@ -49,6 +49,73 @@ fn unix_storage_node_client_writes_deletes_and_validates_ack_rows() {
 }
 
 #[test]
+fn unix_storage_node_client_reads_cluster_map_history_reference_summary() {
+    let tmp = test_util::tempdir();
+    let config = test_config(&tmp);
+    private_socket_dir(config.socket_path.parent().unwrap());
+    {
+        let node = SharedStorageNode::open_with_default_ec_shape(
+            &config.data_dir,
+            &config.pg_ids,
+            config.default_ec_shape,
+        )
+        .unwrap();
+        let pg = node.get_pg(0).unwrap();
+        pg.connection()
+            .execute(
+                "INSERT INTO object_segments \
+                 (bucket, key, version_id, segment_index, size, segment_crc64, segment_okh, \
+                  segment_vid, data_pg_id, placement_cluster_epoch, ec_k, ec_m) \
+                 VALUES (?1, ?2, 1, 0, 1024, ?3, ?4, 10, 0, ?5, 4, 2)",
+                rusqlite::params![
+                    "unix-history-floor-bucket",
+                    "segment-object",
+                    0x1234_i64,
+                    [0x11_u8; 16].as_slice(),
+                    6_i64,
+                ],
+            )
+            .unwrap();
+        let backfill = crate::PlacedSegmentShardBackfillWorkItem {
+            request: crate::SegmentStoredBytesRequest {
+                data_pg_id: 0,
+                segment_okh: [0x44; 16],
+                segment_vid: GenerationId::new(12).unwrap(),
+                stored_size: 4096,
+                segment_crc64: 0x9abc,
+                ec: EcShape { k: 4, m: 2 },
+            },
+            source_cluster_epoch: ClusterEpoch::new(3).unwrap(),
+            desired_cluster_epoch: ClusterEpoch::new(9).unwrap(),
+        };
+        pg.record_placed_segment_shard_backfill(&backfill, backfill.request.ec.m, None)
+            .unwrap();
+    }
+    let server = StorageNodeServer::bind(config.clone()).unwrap();
+    let server_thread = thread::spawn(move || server.accept_one().unwrap());
+    let client = UnixStorageNodeClient::new(
+        config.node_id,
+        config.cluster_epoch,
+        config.socket_path.clone(),
+    );
+
+    let summary = client.cluster_map_history_reference_summary().unwrap();
+    assert_eq!(
+        summary.oldest_live_placement_epoch,
+        Some(ClusterEpoch::new(6).unwrap())
+    );
+    assert_eq!(
+        summary.oldest_durable_backfill_epoch,
+        Some(ClusterEpoch::new(3).unwrap())
+    );
+    assert_eq!(
+        summary.oldest_required_epoch(),
+        Some(ClusterEpoch::new(3).unwrap())
+    );
+    server_thread.join().unwrap();
+}
+
+#[test]
 fn unix_storage_node_client_reads_metadata_command_state_and_acceptance() {
     let tmp = test_util::tempdir();
     let config = test_config(&tmp);

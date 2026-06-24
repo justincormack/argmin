@@ -48,6 +48,7 @@ use crate::storage_rpc::{
     decode_bucket_write_drain_record_request, decode_bucket_write_reservation_acquire_request,
     decode_bucket_write_reservation_heartbeat_request,
     decode_bucket_write_reservation_proof_request, decode_bucket_write_reservation_record_request,
+    decode_cluster_map_history_reference_summary_request,
     decode_complete_multipart_command_build_request,
     decode_completed_multipart_order_command_build_request,
     decode_completed_multipart_uploads_list_request, decode_create_bucket_command_build_request,
@@ -110,6 +111,7 @@ use crate::storage_rpc::{
     encode_bucket_write_drain_begin_response, encode_bucket_write_drain_optional_record_response,
     encode_bucket_write_reservation_record_response,
     encode_bucket_write_reservations_list_response,
+    encode_cluster_map_history_reference_summary_response,
     encode_completed_multipart_order_command_build_response,
     encode_completed_multipart_uploads_list_response, encode_create_bucket_command_build_response,
     encode_direct_put_command_build_response, encode_direct_put_commit_snapshot_response,
@@ -178,7 +180,10 @@ use crate::storage_rpc::{
     StorageRpcBucketWriteReservationAcquireOutcome, StorageRpcBucketWriteReservationAcquireRequest,
     StorageRpcBucketWriteReservationHeartbeatRequest, StorageRpcBucketWriteReservationProofRequest,
     StorageRpcBucketWriteReservationRecordRequest, StorageRpcBucketWriteReservationRecordResponse,
-    StorageRpcBucketWriteReservationsListResponse, StorageRpcCompleteMultipartCommandBuildRequest,
+    StorageRpcBucketWriteReservationsListResponse,
+    StorageRpcClusterMapHistoryReferenceSummaryRequest,
+    StorageRpcClusterMapHistoryReferenceSummaryResponse,
+    StorageRpcCompleteMultipartCommandBuildRequest,
     StorageRpcCompletedMultipartOrderCommandBuildRequest,
     StorageRpcCompletedMultipartOrderCommandBuildResponse,
     StorageRpcCompletedMultipartUploadsListRequest,
@@ -1581,6 +1586,15 @@ impl StorageNodeConnectionHandler {
                         code: StorageRpcErrorCode::PayloadDecode,
                         message: "health request payload must be empty".to_string(),
                     })
+                }
+            }
+            StorageRpcMessageKind::ClusterMapHistoryReferenceSummary => {
+                match decode_cluster_map_history_reference_summary_request(&frame.payload) {
+                    Ok(request) => self.cluster_map_history_reference_summary_response(request),
+                    Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
+                        code: StorageRpcErrorCode::PayloadDecode,
+                        message: error.to_string(),
+                    }),
                 }
             }
             StorageRpcMessageKind::ReadHandlesAcquire => {
@@ -8562,6 +8576,52 @@ impl StorageNodeConnectionHandler {
             Err(error) => encode_storage_rpc_error_response(&store_error_response(error))?,
         };
         Ok(response)
+    }
+
+    fn cluster_map_history_reference_summary_response(
+        &self,
+        request: StorageRpcClusterMapHistoryReferenceSummaryRequest,
+    ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
+        if let Err(error) = self.validate_node_epoch(request.node_id, request.cluster_epoch) {
+            return encode_storage_rpc_error_response(&error);
+        }
+        let response = match self.node.cluster_map_history_reference_summary() {
+            Ok(summary) => {
+                let payload = encode_cluster_map_history_reference_summary_response(
+                    &StorageRpcClusterMapHistoryReferenceSummaryResponse { summary },
+                );
+                encode_storage_rpc_success_response(&payload)
+            }
+            Err(error) => encode_storage_rpc_error_response(&store_error_response(error))?,
+        };
+        Ok(response)
+    }
+
+    fn validate_node_epoch(
+        &self,
+        node_id: NodeId,
+        cluster_epoch: ClusterEpoch,
+    ) -> Result<(), StorageRpcErrorResponse> {
+        if node_id != self.config.node_id {
+            return Err(StorageRpcErrorResponse {
+                code: StorageRpcErrorCode::UnknownNode,
+                message: format!(
+                    "request targets node {}, but this storage node is {}",
+                    node_id.as_u32(),
+                    self.config.node_id.as_u32()
+                ),
+            });
+        }
+        if cluster_epoch != self.config.cluster_epoch {
+            return Err(StorageRpcErrorResponse {
+                code: StorageRpcErrorCode::InactivePgRoute,
+                message: format!(
+                    "request cluster epoch {cluster_epoch} does not match storage node cluster epoch {}",
+                    self.config.cluster_epoch
+                ),
+            });
+        }
+        Ok(())
     }
 
     fn metadata_command_pending_slot_replace_response(

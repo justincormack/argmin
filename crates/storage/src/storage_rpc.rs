@@ -11,7 +11,8 @@ use crate::{
     pg_store::{
         MetadataCheckpointRow, MetadataCheckpointTableBlock, MetadataCheckpointTableDigest,
         MetadataCheckpointValue, MetadataCommandCheckpoint, MetadataCommandLogCompactionStatus,
-        ScavengerShardFile, ScavengerShardFileScan, ScavengerShardRow,
+        PgClusterMapHistoryReferenceSummary, ScavengerShardFile, ScavengerShardFileScan,
+        ScavengerShardRow,
     },
     types::{
         AbortMultipartUploadCleanup, BucketDeleteFinalizeClaimRecord, BucketDeleteFinalizeRoot,
@@ -569,6 +570,7 @@ pub(crate) enum StorageRpcMessageKind {
     MetadataCommandCheckpointCandidates = 151,
     MetadataCommandCheckpointRecordCurrent = 152,
     MetadataCommandLogCompact = 153,
+    ClusterMapHistoryReferenceSummary = 154,
     MetadataCommandAppliedLogHashes = 25,
     MetadataCommandMatchingAppliedLog = 26,
     MetadataCommandAbandoned = 27,
@@ -802,6 +804,7 @@ impl StorageRpcMessageKind {
                 "metadata command checkpoint record current"
             }
             Self::MetadataCommandLogCompact => "metadata command log compact",
+            Self::ClusterMapHistoryReferenceSummary => "cluster map history reference summary",
             Self::MetadataCommandAppliedLogHashes => "metadata command applied log hashes",
             Self::MetadataCommandMatchingAppliedLog => "metadata command matching applied log",
             Self::MetadataCommandRetainedLogHashes => "metadata command retained log hashes",
@@ -978,6 +981,7 @@ impl StorageRpcMessageKind {
             151 => Ok(Self::MetadataCommandCheckpointCandidates),
             152 => Ok(Self::MetadataCommandCheckpointRecordCurrent),
             153 => Ok(Self::MetadataCommandLogCompact),
+            154 => Ok(Self::ClusterMapHistoryReferenceSummary),
             25 => Ok(Self::MetadataCommandAppliedLogHashes),
             26 => Ok(Self::MetadataCommandMatchingAppliedLog),
             27 => Ok(Self::MetadataCommandAbandoned),
@@ -2771,6 +2775,17 @@ pub(crate) struct StorageRpcMetadataCommandLogCompactResponse {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StorageRpcClusterMapHistoryReferenceSummaryRequest {
+    pub(crate) node_id: NodeId,
+    pub(crate) cluster_epoch: ClusterEpoch,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StorageRpcClusterMapHistoryReferenceSummaryResponse {
+    pub(crate) summary: PgClusterMapHistoryReferenceSummary,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StorageRpcMetadataCommandLogHashRangeRequest {
     pub(crate) node_id: NodeId,
     pub(crate) cluster_epoch: ClusterEpoch,
@@ -3442,6 +3457,7 @@ fn message_kind_request_max_payload_len(
         | StorageRpcMessageKind::MetadataCommandLogCompact => {
             STORAGE_RPC_MAX_METADATA_COMMAND_STATE_PAYLOAD_LEN
         }
+        StorageRpcMessageKind::ClusterMapHistoryReferenceSummary => 4 + 8,
         StorageRpcMessageKind::MetadataCommandCheckpointCandidates => {
             STORAGE_RPC_MAX_METADATA_COMMAND_STATE_PAYLOAD_LEN + 8 + 4
         }
@@ -8931,6 +8947,77 @@ pub(crate) fn decode_metadata_command_log_compact_response(
     };
     decoder.finish()?;
     Ok(StorageRpcMetadataCommandLogCompactResponse { status })
+}
+
+pub(crate) fn encode_cluster_map_history_reference_summary_request(
+    request: &StorageRpcClusterMapHistoryReferenceSummaryRequest,
+) -> Vec<u8> {
+    let mut out = Vec::new();
+    put_u32(&mut out, request.node_id.as_u32());
+    put_u64(&mut out, request.cluster_epoch.get());
+    out
+}
+
+pub(crate) fn decode_cluster_map_history_reference_summary_request(
+    bytes: &[u8],
+) -> Result<StorageRpcClusterMapHistoryReferenceSummaryRequest, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let node_id = NodeId::new(decoder.read_u32()?);
+    let cluster_epoch = decoder.read_cluster_epoch()?;
+    decoder.finish()?;
+    Ok(StorageRpcClusterMapHistoryReferenceSummaryRequest {
+        node_id,
+        cluster_epoch,
+    })
+}
+
+pub(crate) fn encode_cluster_map_history_reference_summary_response(
+    response: &StorageRpcClusterMapHistoryReferenceSummaryResponse,
+) -> Vec<u8> {
+    let mut out = Vec::new();
+    put_optional_u64(
+        &mut out,
+        response
+            .summary
+            .oldest_live_placement_epoch
+            .map(ClusterEpoch::get),
+    );
+    put_optional_u64(
+        &mut out,
+        response
+            .summary
+            .oldest_durable_backfill_epoch
+            .map(ClusterEpoch::get),
+    );
+    out
+}
+
+pub(crate) fn decode_cluster_map_history_reference_summary_response(
+    bytes: &[u8],
+) -> Result<StorageRpcClusterMapHistoryReferenceSummaryResponse, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let oldest_live_placement_epoch = decode_optional_cluster_epoch(decoder.read_optional_u64()?)?;
+    let oldest_durable_backfill_epoch =
+        decode_optional_cluster_epoch(decoder.read_optional_u64()?)?;
+    decoder.finish()?;
+    Ok(StorageRpcClusterMapHistoryReferenceSummaryResponse {
+        summary: PgClusterMapHistoryReferenceSummary {
+            oldest_live_placement_epoch,
+            oldest_durable_backfill_epoch,
+        },
+    })
+}
+
+fn decode_optional_cluster_epoch(
+    value: Option<u64>,
+) -> Result<Option<ClusterEpoch>, StorageRpcPayloadError> {
+    value
+        .map(|value| {
+            ClusterEpoch::new(value).ok_or(StorageRpcPayloadError::InvalidDurableClaimToken(
+                "cluster epoch must not be zero",
+            ))
+        })
+        .transpose()
 }
 
 pub(crate) fn encode_metadata_command_checkpoint_payload(
@@ -16937,6 +17024,31 @@ mod tests {
             assert_eq!(decoded, response);
         }
 
+        let history_request = StorageRpcClusterMapHistoryReferenceSummaryRequest {
+            node_id: NodeId::new(7),
+            cluster_epoch: ClusterEpoch::new(3).unwrap(),
+        };
+        let bytes = encode_cluster_map_history_reference_summary_request(&history_request);
+        let decoded = decode_cluster_map_history_reference_summary_request(&bytes).unwrap();
+        assert_eq!(decoded, history_request);
+
+        let history_response = StorageRpcClusterMapHistoryReferenceSummaryResponse {
+            summary: PgClusterMapHistoryReferenceSummary {
+                oldest_live_placement_epoch: Some(ClusterEpoch::new(2).unwrap()),
+                oldest_durable_backfill_epoch: Some(ClusterEpoch::new(5).unwrap()),
+            },
+        };
+        let bytes = encode_cluster_map_history_reference_summary_response(&history_response);
+        let decoded = decode_cluster_map_history_reference_summary_response(&bytes).unwrap();
+        assert_eq!(decoded, history_response);
+
+        let empty_history_response = StorageRpcClusterMapHistoryReferenceSummaryResponse {
+            summary: PgClusterMapHistoryReferenceSummary::default(),
+        };
+        let bytes = encode_cluster_map_history_reference_summary_response(&empty_history_response);
+        let decoded = decode_cluster_map_history_reference_summary_response(&bytes).unwrap();
+        assert_eq!(decoded, empty_history_response);
+
         assert!(matches!(
             decode_metadata_command_log_compact_response(&[99]),
             Err(StorageRpcPayloadError::InvalidMetadataCommandLogCompactionStatus(99))
@@ -18259,6 +18371,11 @@ mod tests {
                 StorageRpcMessageKind::Health,
                 STORAGE_RPC_EMPTY_REQUEST_PAYLOAD_LEN + 1,
                 STORAGE_RPC_EMPTY_REQUEST_PAYLOAD_LEN,
+            ),
+            (
+                StorageRpcMessageKind::ClusterMapHistoryReferenceSummary,
+                4 + 8 + 1,
+                4 + 8,
             ),
             (
                 StorageRpcMessageKind::MetadataCommand,

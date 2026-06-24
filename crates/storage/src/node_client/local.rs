@@ -397,6 +397,12 @@ fn validate_placed_segment_shard_backfill_claim_epoch(
 }
 
 impl ShardScavengerNodeClient for LocalStorageNodeClient {
+    fn cluster_map_history_reference_summary(
+        &self,
+    ) -> Result<crate::PgClusterMapHistoryReferenceSummary, StoreError> {
+        self.storage_node.cluster_map_history_reference_summary()
+    }
+
     fn list_scavenger_shard_files(
         &self,
         data_pg_id: DataPgId,
