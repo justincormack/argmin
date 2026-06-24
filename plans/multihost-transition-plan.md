@@ -8345,6 +8345,12 @@ Metadata PG migration and backfill design notes:
   command-log compaction after metadata mutations, and only then performs a
   further non-overlap transfer. This keeps the whole-lifetime metadata migration
   smoke from only proving the retained-log path.
+- Added focused restart coverage for checkpoint-backed command-log retention.
+  A local-cluster regression now records a current checkpoint on every replica,
+  compacts away all covered metadata command-log rows, reopens the cluster from
+  disk, and performs another metadata write. The reopened cluster must validate
+  from the durable checkpoint base and allocate the next command index after
+  the checkpoint instead of reusing a deleted log index.
 
 Exit criteria:
 

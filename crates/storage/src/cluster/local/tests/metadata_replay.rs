@@ -2283,6 +2283,75 @@ fn metadata_command_log_index_allocator_seeds_from_reopened_log() {
 }
 
 #[test]
+fn metadata_command_log_index_allocator_seeds_from_reopened_checkpoint_after_compaction() {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let (first_bucket, second_bucket, third_bucket) = {
+        let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1], ec_shape).unwrap();
+        let topology = map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        let first_bucket = bucket_for_pg(topology, 1, "reopen-compact-first-");
+        let second_bucket = bucket_for_pg(topology, 1, "reopen-compact-second-");
+        let third_bucket = bucket_for_pg(topology, 1, "reopen-compact-third-");
+        set_route_primary(&mut map, 1, NodeId::new(1));
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        create_test_bucket(&cluster, &first_bucket);
+        create_test_bucket(&cluster, &second_bucket);
+
+        for node_id in node_ids {
+            let pg = map.node(node_id).unwrap().storage_node().get_pg(1).unwrap();
+            pg.record_current_metadata_command_checkpoint(node_id.as_u32(), ClusterEpoch::INITIAL)
+                .unwrap();
+            assert_eq!(
+                pg.compact_metadata_command_log(ClusterEpoch::INITIAL)
+                    .unwrap(),
+                crate::pg_store::MetadataCommandLogCompactionStatus::Compacted {
+                    deleted_entries: 2,
+                    compacted_before: 3,
+                }
+            );
+            let stats = pg
+                .metadata_command_log_stats(ClusterEpoch::INITIAL)
+                .unwrap();
+            assert_eq!(stats.retained_entries, 0);
+            assert_eq!(stats.missing_applied_prefix_entries, 0);
+        }
+
+        (first_bucket, second_bucket, third_bucket)
+    };
+
+    let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1], ec_shape).unwrap();
+    set_route_primary(&mut map, 1, NodeId::new(1));
+    let map = Arc::new(map);
+    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    create_test_bucket(&cluster, &third_bucket);
+
+    for node_id in node_ids {
+        let pg = map.node(node_id).unwrap().storage_node().get_pg(1).unwrap();
+        let state = pg.metadata_command_replica_state().unwrap();
+        assert_eq!(state.applied_log_index, 3);
+        let stats = pg
+            .metadata_command_log_stats(ClusterEpoch::INITIAL)
+            .unwrap();
+        assert_eq!(stats.min_log_index, Some(3));
+        assert_eq!(stats.max_log_index, Some(3));
+        assert_eq!(stats.retained_entries, 1);
+        assert_eq!(stats.missing_applied_prefix_entries, 0);
+        let first = crate::PgMetadataStore::head_bucket(&*pg, &first_bucket).unwrap();
+        assert_eq!(first.name, first_bucket);
+        let second = crate::PgMetadataStore::head_bucket(&*pg, &second_bucket).unwrap();
+        assert_eq!(second.name, second_bucket);
+        let third = crate::PgMetadataStore::head_bucket(&*pg, &third_bucket).unwrap();
+        assert_eq!(third.name, third_bucket);
+    }
+}
+
+#[test]
 fn metadata_command_log_index_allocator_reads_durable_log_from_already_open_handle() {
     let tmp = test_util::tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
