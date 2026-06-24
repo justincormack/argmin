@@ -8410,6 +8410,11 @@ Metadata PG migration and backfill design notes:
   floor, and the `control-plane-runtime-map-diagnostics` admin command reports
   aggregate and per-node floor epochs without changing the existing
   `control-plane-runtime-map-ready` output consumed by UAT readiness checks.
+- Wired the runtime-map diagnostics into UAT failure reporting before process
+  teardown. Migration and backfill smoke failures now include the control-plane
+  runtime epoch, route counts, active serving counts, retained-history floor,
+  and per-node storage history floors so long-running transition failures can
+  be debugged without rerunning with extra instrumentation.
 
 Exit criteria:
 

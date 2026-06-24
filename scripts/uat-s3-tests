@@ -593,6 +593,14 @@ wait_for_control_plane_runtime_map_ready() {
     done
 }
 
+print_control_plane_runtime_map_diagnostics() {
+    if [[ -z "$control_plane_socket_path" || ! -S "$control_plane_socket_path" || ${#server_cmd[@]} -eq 0 ]]; then
+        return 0
+    fi
+    echo "== argmin-s3 UAT control-plane runtime-map diagnostics ==" >&2
+    "${server_cmd[@]}" control-plane-runtime-map-diagnostics "$control_plane_socket_path" >&2 || true
+}
+
 wait_for_frontend_storage_epoch_at_least() {
     local expected_epoch="$1"
     local deadline_seconds="$2"
@@ -1217,6 +1225,9 @@ cleanup_server() {
         if ! curl -k -sS -X POST "$endpoint/__argmin/debug/flight-recorder/dump" >/dev/null 2>&1; then
             echo "frontend flight recorder dump request failed" >&2
         fi
+    fi
+    if ((status != 0)); then
+        print_control_plane_runtime_map_diagnostics
     fi
     for pid in "${server_pids[@]}"; do
         if kill -0 "$pid" 2>/dev/null; then
