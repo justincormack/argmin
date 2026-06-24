@@ -32,6 +32,7 @@ use crate::node_client::{
     ObjectReadMetadataNodeClient, ObjectVersionMetadataNodeClient, ShardAckNodeClient,
     ShardScavengerNodeClient,
 };
+use crate::pg_store::{MetadataCommandCheckpoint, PgStore};
 use crate::storage_rpc::{
     decode_abort_multipart_cleanup_request, decode_abort_multipart_command_build_request,
     decode_authorized_abort_multipart_command_build_request, decode_bucket_batch_request,
@@ -271,7 +272,7 @@ use crate::storage_rpc::{
     StorageRpcStreamUploadSessionRequest, StorageRpcStreamUploadSessionResponse,
     StorageRpcStreamUploadsListRequest, StorageRpcStreamUploadsListResponse,
     StorageRpcStreamUploadsPgListRequest, STORAGE_RPC_FRAME_ENCODING_VERSION,
-    STORAGE_RPC_MAX_PAYLOAD_LEN,
+    STORAGE_RPC_MAX_METADATA_COMMAND_CHECKPOINT_CANDIDATES, STORAGE_RPC_MAX_PAYLOAD_LEN,
 };
 use crate::traits::ShardStore;
 use crate::types::{BucketState, ClusterEpoch, GenerationId, PgId, PgState, SessionId, WriteAck};
@@ -889,6 +890,54 @@ fn encode_metadata_command_checkpoint_success_response(
             max_payload_len
         ),
     })
+}
+
+fn metadata_command_checkpoint_candidates_for_frame(
+    pg: &PgStore,
+    cluster_epoch: ClusterEpoch,
+    mut max_applied_log_index: u64,
+    limit: usize,
+    max_payload_len: usize,
+) -> Result<Vec<MetadataCommandCheckpoint>, StoreError> {
+    let mut checkpoints = Vec::new();
+    while checkpoints.len() < limit {
+        let candidates = pg.metadata_command_checkpoint_candidates(
+            cluster_epoch,
+            max_applied_log_index,
+            STORAGE_RPC_MAX_METADATA_COMMAND_CHECKPOINT_CANDIDATES,
+        )?;
+        let Some(last_candidate) = candidates.last() else {
+            break;
+        };
+        let next_max_applied_log_index = last_candidate.applied_log_index.checked_sub(1);
+        for candidate in candidates {
+            let mut next_checkpoints = checkpoints.clone();
+            next_checkpoints.push(candidate.clone());
+            let payload = match encode_metadata_command_checkpoint_candidates_response(
+                &StorageRpcMetadataCommandCheckpointCandidatesResponse {
+                    checkpoints: next_checkpoints,
+                },
+            ) {
+                Ok(payload) => payload,
+                Err(_) => continue,
+            };
+            if encode_storage_rpc_success_response(&payload).len() <= max_payload_len {
+                checkpoints.push(candidate);
+                if checkpoints.len() == limit {
+                    return Ok(checkpoints);
+                }
+            } else if checkpoints.is_empty() {
+                continue;
+            } else {
+                return Ok(checkpoints);
+            }
+        }
+        let Some(next_max_applied_log_index) = next_max_applied_log_index else {
+            break;
+        };
+        max_applied_log_index = next_max_applied_log_index;
+    }
+    Ok(checkpoints)
 }
 
 impl StorageNodeServer {
@@ -7602,11 +7651,14 @@ impl StorageNodeConnectionHandler {
         }
         let _pg_guard = self.metadata_command_pg_guard(session, request.pg_id);
         let response = match self.node.get_pg(request.pg_id.get()).and_then(|pg| {
-            pg.metadata_command_checkpoint_candidates(
+            let checkpoints = metadata_command_checkpoint_candidates_for_frame(
+                &pg,
                 request.cluster_epoch,
                 request.max_applied_log_index,
                 request.limit as usize,
-            )
+                STORAGE_RPC_MAX_PAYLOAD_LEN,
+            )?;
+            Ok(checkpoints)
         }) {
             Ok(checkpoints) => {
                 let payload = encode_metadata_command_checkpoint_candidates_response(
@@ -11616,6 +11668,64 @@ mod tests {
         assert!(error
             .message
             .contains("metadata command checkpoint candidates response is too large"));
+    }
+
+    #[test]
+    fn metadata_checkpoint_candidates_for_frame_skips_oversized_newest_candidate() {
+        let tmp = test_util::tempdir();
+        let node = crate::node::SharedStorageNode::open(tmp.path(), &[0]).unwrap();
+        let pg = node.get_pg(0).unwrap();
+        let bucket = crate::tests::bucket_name("metadata-checkpoint-frame-candidate");
+        create_probe_bucket_direct(&pg, &bucket);
+        pg.refresh_metadata_command_state_digest().unwrap();
+        let small = pg
+            .record_current_metadata_command_checkpoint(7, ClusterEpoch::INITIAL)
+            .unwrap();
+
+        let large_body = format!(
+            "<LifecycleConfiguration>{}</LifecycleConfiguration>",
+            "x".repeat(4096)
+        );
+        pg.put_bucket_subresource(
+            &bucket,
+            PutBucketSubresource {
+                kind: BucketSubresourceKind::Lifecycle,
+                body: &large_body,
+                aux: BucketSubresourceAux::None,
+            },
+        )
+        .unwrap();
+        pg.refresh_metadata_command_state_digest().unwrap();
+        let large = pg
+            .record_current_metadata_command_checkpoint(7, ClusterEpoch::INITIAL)
+            .unwrap();
+
+        let small_payload = encode_metadata_command_checkpoint_candidates_response(
+            &StorageRpcMetadataCommandCheckpointCandidatesResponse {
+                checkpoints: vec![small.clone()],
+            },
+        )
+        .unwrap();
+        let large_payload = encode_metadata_command_checkpoint_candidates_response(
+            &StorageRpcMetadataCommandCheckpointCandidatesResponse {
+                checkpoints: vec![large],
+            },
+        )
+        .unwrap();
+        let small_response_len = encode_storage_rpc_success_response(&small_payload).len();
+        let large_response_len = encode_storage_rpc_success_response(&large_payload).len();
+        assert!(large_response_len > small_response_len);
+
+        let candidates = metadata_command_checkpoint_candidates_for_frame(
+            &pg,
+            ClusterEpoch::INITIAL,
+            u64::MAX,
+            1,
+            small_response_len,
+        )
+        .unwrap();
+
+        assert_eq!(candidates, vec![small]);
     }
 
     fn send_frame(

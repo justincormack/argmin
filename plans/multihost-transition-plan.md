@@ -8304,9 +8304,17 @@ Metadata PG migration and backfill design notes:
 - Added checkpoint-recording observability for the routine scheduler. The
   debug metrics endpoint and UAT summaries now expose checkpoint record scan
   attempts, PGs scanned, newly recorded candidates, already-current skips,
-  inactive skips, record failures, scan errors, and limit hits, alongside the
-  `routine_metadata_checkpoint` background-work admission class. Later tuning
-  still needs an explicit checkpoint cadence/retention policy.
+  cadence skips, inactive skips, record failures, scan errors, and limit hits,
+  alongside the `routine_metadata_checkpoint` background-work admission class.
+- Added the first checkpoint cadence/retention policy. Routine checkpointing
+  records when no retained checkpoint exists, when the log has advanced far
+  enough from the newest retained checkpoint, or when the newest retained
+  checkpoint approaches the storage-RPC frame-risk threshold. Otherwise it
+  skips the PG as cadence-limited. This connects directly to large-checkpoint
+  recovery: long-running metadata PGs should acquire usable transfer bases
+  before full-checkpoint export would become `ResourceExhausted`, while the
+  durable checkpoint catalogue remains bounded to the newest candidates needed
+  for checkpoint-plus-retained-suffix transfer.
 
 Exit criteria:
 

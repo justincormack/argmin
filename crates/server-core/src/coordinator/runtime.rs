@@ -868,6 +868,7 @@ impl ShardScavengerSweeper {
                                             scanned: summary.scanned,
                                             recorded: summary.recorded,
                                             already_current: summary.already_current,
+                                            skipped_cadence: summary.skipped_cadence,
                                             skipped_inactive: summary.skipped_inactive,
                                             failed: summary.failed,
                                             limit_reached: summary.limit_reached,

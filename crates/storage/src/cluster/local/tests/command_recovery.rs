@@ -3830,6 +3830,7 @@ fn routine_metadata_checkpoint_records_current_primary_candidate_once() {
         .storage_node()
         .pg_topology();
     let bucket = bucket_for_pg(topology, 1, "routine-metadata-checkpoint-");
+    let second_bucket = bucket_for_pg(topology, 1, "routine-metadata-checkpoint-second-");
     set_route_primary(&mut map, 1, NodeId::new(0));
     let pg_id = PgId::new(1);
     let source_pg = map
@@ -3880,6 +3881,92 @@ fn routine_metadata_checkpoint_records_current_primary_candidate_once() {
     assert_eq!(summary.recorded, 0);
     assert_eq!(summary.already_current, 1);
     assert_eq!(summary.failed, 0);
+
+    let primary_pg = map
+        .node(NodeId::new(0))
+        .unwrap()
+        .storage_node()
+        .get_pg(pg_id.get())
+        .unwrap();
+    let second = create_bucket_metadata_command(pg_id, 2, second_bucket);
+    primary_pg
+        .apply_metadata_command_and_record(0, &second)
+        .unwrap();
+    let next_state = primary_pg.metadata_command_replica_state().unwrap();
+    assert_eq!(
+        crate::cluster::metadata_command_checkpoint_record_decision(
+            &next_state,
+            candidates.first(),
+            1,
+            usize::MAX,
+        )
+        .unwrap(),
+        crate::cluster::MetadataCommandCheckpointRecordDecision::Record
+    );
+    assert_eq!(
+        crate::cluster::metadata_command_checkpoint_record_decision(
+            &next_state,
+            candidates.first(),
+            crate::cluster::METADATA_COMMAND_CHECKPOINT_MIN_LOG_DISTANCE,
+            1,
+        )
+        .unwrap(),
+        crate::cluster::MetadataCommandCheckpointRecordDecision::Record
+    );
+    drop(primary_pg);
+
+    let summary = cluster
+        .record_routine_metadata_command_checkpoints()
+        .unwrap();
+
+    assert_eq!(summary.scanned, 1);
+    assert_eq!(summary.recorded, 0);
+    assert_eq!(summary.already_current, 0);
+    assert_eq!(summary.skipped_cadence, 1);
+    assert_eq!(summary.failed, 0);
+}
+
+#[test]
+fn metadata_command_checkpoint_catalogue_retains_newest_candidates_per_epoch() {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[1], ec_shape).unwrap();
+    set_route_primary(&mut map, 1, NodeId::new(0));
+    let topology = map
+        .node(NodeId::new(0))
+        .unwrap()
+        .storage_node()
+        .pg_topology();
+    let pg_id = PgId::new(1);
+    let source_pg = map
+        .node(NodeId::new(0))
+        .unwrap()
+        .storage_node()
+        .get_pg(1)
+        .unwrap();
+
+    for log_index in 1..=10 {
+        let bucket = bucket_for_pg(
+            topology,
+            1,
+            &format!("metadata-checkpoint-retention-{log_index}-"),
+        );
+        let command = create_bucket_metadata_command(pg_id, log_index, bucket);
+        source_pg
+            .apply_metadata_command_and_record(0, &command)
+            .unwrap();
+        source_pg
+            .record_current_metadata_command_checkpoint(0, ClusterEpoch::INITIAL)
+            .unwrap();
+    }
+
+    let candidates = source_pg
+        .metadata_command_checkpoint_candidates(ClusterEpoch::INITIAL, u64::MAX, 16)
+        .unwrap();
+    assert_eq!(candidates.len(), 8);
+    assert_eq!(candidates.first().unwrap().applied_log_index, 10);
+    assert_eq!(candidates.last().unwrap().applied_log_index, 3);
 }
 
 #[test]

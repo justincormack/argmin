@@ -1115,6 +1115,7 @@ fn local_debug_metrics_body(state: &Arc<ServerState>) -> String {
             "metadata_command_checkpoint_record_scanned_total {}\n",
             "metadata_command_checkpoint_record_recorded_total {}\n",
             "metadata_command_checkpoint_record_already_current_total {}\n",
+            "metadata_command_checkpoint_record_skipped_cadence_total {}\n",
             "metadata_command_checkpoint_record_skipped_inactive_total {}\n",
             "metadata_command_checkpoint_record_failed_total {}\n",
             "metadata_command_checkpoint_record_limit_reached_total {}\n",
@@ -1209,6 +1210,7 @@ fn local_debug_metrics_body(state: &Arc<ServerState>) -> String {
         snapshot.metadata_command_checkpoint_record_scanned_total,
         snapshot.metadata_command_checkpoint_record_recorded_total,
         snapshot.metadata_command_checkpoint_record_already_current_total,
+        snapshot.metadata_command_checkpoint_record_skipped_cadence_total,
         snapshot.metadata_command_checkpoint_record_skipped_inactive_total,
         snapshot.metadata_command_checkpoint_record_failed_total,
         snapshot.metadata_command_checkpoint_record_limit_reached_total,
@@ -4715,6 +4717,7 @@ mod tests {
         assert!(response.contains("metadata_command_checkpoint_record_scanned_total "));
         assert!(response.contains("metadata_command_checkpoint_record_recorded_total "));
         assert!(response.contains("metadata_command_checkpoint_record_already_current_total "));
+        assert!(response.contains("metadata_command_checkpoint_record_skipped_cadence_total "));
         assert!(response.contains("metadata_command_checkpoint_record_skipped_inactive_total "));
         assert!(response.contains("metadata_command_checkpoint_record_failed_total "));
         assert!(response.contains("metadata_command_checkpoint_record_limit_reached_total "));

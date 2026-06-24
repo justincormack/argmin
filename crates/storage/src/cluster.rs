@@ -54,7 +54,7 @@ use crate::peering::{
 use crate::pg_store::MetadataCommandCheckpoint;
 use crate::storage_rpc::{
     STORAGE_RPC_MAX_METADATA_COMMAND_CHECKPOINT_CANDIDATES,
-    STORAGE_RPC_MAX_METADATA_COMMAND_LOG_ENTRY_RANGE_ENTRIES,
+    STORAGE_RPC_MAX_METADATA_COMMAND_LOG_ENTRY_RANGE_ENTRIES, STORAGE_RPC_MAX_PAYLOAD_LEN,
 };
 #[cfg(test)]
 use crate::traits::PgMetadataStore;
@@ -99,6 +99,8 @@ const METADATA_CONTENTION_BACKOFF_INITIAL: Duration = Duration::from_millis(1);
 const METADATA_CONTENTION_BACKOFF_MAX: Duration = Duration::from_millis(25);
 const PLACED_SEGMENT_SHARD_BACKFILL_CANDIDATE_SCAN_LIMIT: usize = 256;
 const METADATA_COMMAND_CHECKPOINT_RECORD_LIMIT: usize = 4;
+const METADATA_COMMAND_CHECKPOINT_MIN_LOG_DISTANCE: u64 = 64;
+const METADATA_COMMAND_CHECKPOINT_FRAME_RISK_BYTES: usize = STORAGE_RPC_MAX_PAYLOAD_LEN * 3 / 4;
 
 #[derive(Debug)]
 pub(super) struct RequestWorkBudget {
@@ -122,9 +124,17 @@ pub struct MetadataCommandCheckpointRecordSummary {
     pub scanned: usize,
     pub recorded: usize,
     pub already_current: usize,
+    pub skipped_cadence: usize,
     pub skipped_inactive: usize,
     pub failed: usize,
     pub limit_reached: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MetadataCommandCheckpointRecordDecision {
+    Record,
+    AlreadyCurrent,
+    SkipCadence,
 }
 
 impl RequestWorkBudget {
@@ -2818,6 +2828,8 @@ impl StorageCluster {
         pg_id: PgId,
         source_node_id: NodeId,
         source_state: &MetadataCommandReplicaState,
+        max_applied_log_index: u64,
+        limit: usize,
     ) -> Result<Vec<MetadataCommandCheckpoint>, PgPeeringReconstructionFailure> {
         let nodes = self
             .local_map
@@ -2833,8 +2845,8 @@ impl StorageCluster {
             .metadata_command_checkpoint_candidates(
                 pg_id,
                 source_state.cluster_epoch,
-                source_state.applied_log_index,
-                STORAGE_RPC_MAX_METADATA_COMMAND_CHECKPOINT_CANDIDATES,
+                max_applied_log_index,
+                limit,
             )?)
     }
 
@@ -3043,26 +3055,87 @@ impl StorageCluster {
         });
 
         for checkpoint in candidates {
-            if checkpoint.pg_id != pg_id
-                || checkpoint.cluster_epoch != source_state.cluster_epoch
-                || checkpoint.applied_log_index > source_state.applied_log_index
+            if let Some(artifact) = self
+                .try_export_pg_metadata_transfer_artifact_from_checkpoint_candidate(
+                    pg_id,
+                    source_node_id,
+                    source_state,
+                    checkpoint,
+                )?
             {
-                continue;
-            }
-            if checkpoint.verify().is_err() {
-                continue;
-            }
-            match self.export_pg_metadata_transfer_from_checkpoint_and_retained_suffix(
-                pg_id,
-                source_node_id,
-                checkpoint,
-            ) {
-                Ok(artifact) => return Ok(artifact),
-                Err(PgPeeringReconstructionFailure::Reconstruction(_)) => continue,
-                Err(error) => return Err(error.into()),
+                return Ok(artifact);
             }
         }
 
+        self.export_pg_metadata_transfer_from_checkpoint(pg_id, source_node_id)
+            .map_err(Into::into)
+    }
+
+    fn try_export_pg_metadata_transfer_artifact_from_checkpoint_candidate(
+        &self,
+        pg_id: PgId,
+        source_node_id: NodeId,
+        source_state: &MetadataCommandReplicaState,
+        checkpoint: MetadataCommandCheckpoint,
+    ) -> Result<Option<PgMetadataTransferArtifact>, PgMetadataTransferError> {
+        if checkpoint.pg_id != pg_id
+            || checkpoint.cluster_epoch != source_state.cluster_epoch
+            || checkpoint.applied_log_index > source_state.applied_log_index
+        {
+            return Ok(None);
+        }
+        if checkpoint.verify().is_err() {
+            return Ok(None);
+        }
+        match self.export_pg_metadata_transfer_from_checkpoint_and_retained_suffix(
+            pg_id,
+            source_node_id,
+            checkpoint,
+        ) {
+            Ok(artifact) => Ok(Some(artifact)),
+            Err(PgPeeringReconstructionFailure::Reconstruction(_)) => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    fn export_pg_metadata_transfer_artifact_from_paged_checkpoint_candidates(
+        &self,
+        pg_id: PgId,
+        source_node_id: NodeId,
+        source_state: &MetadataCommandReplicaState,
+    ) -> Result<PgMetadataTransferArtifact, PgMetadataTransferError> {
+        let mut max_applied_log_index = source_state.applied_log_index;
+        for _ in 0..STORAGE_RPC_MAX_METADATA_COMMAND_CHECKPOINT_CANDIDATES {
+            let Some(checkpoint) = self
+                .metadata_transfer_source_checkpoint_candidates(
+                    pg_id,
+                    source_node_id,
+                    source_state,
+                    max_applied_log_index,
+                    1,
+                )
+                .map_err(PgMetadataTransferError::from)?
+                .into_iter()
+                .next()
+            else {
+                break;
+            };
+            let next_max_applied_log_index = checkpoint.applied_log_index.checked_sub(1);
+            if let Some(artifact) = self
+                .try_export_pg_metadata_transfer_artifact_from_checkpoint_candidate(
+                    pg_id,
+                    source_node_id,
+                    source_state,
+                    checkpoint,
+                )?
+            {
+                return Ok(artifact);
+            }
+            let Some(next_max_applied_log_index) = next_max_applied_log_index else {
+                break;
+            };
+            max_applied_log_index = next_max_applied_log_index;
+        }
         self.export_pg_metadata_transfer_from_checkpoint(pg_id, source_node_id)
             .map_err(Into::into)
     }
@@ -3081,14 +3154,10 @@ impl StorageCluster {
         let source_state = self
             .metadata_transfer_source_state(pg_id, source_node_id)
             .map_err(PgMetadataTransferError::from)?;
-        let checkpoints = self
-            .metadata_transfer_source_checkpoint_candidates(pg_id, source_node_id, &source_state)
-            .map_err(PgMetadataTransferError::from)?;
-        self.export_pg_metadata_transfer_artifact_from_checkpoint_candidates(
+        self.export_pg_metadata_transfer_artifact_from_paged_checkpoint_candidates(
             pg_id,
             source_node_id,
             &source_state,
-            checkpoints,
         )
     }
 
@@ -4169,23 +4238,34 @@ impl StorageCluster {
                 summary.failed += 1;
                 continue;
             }
-            match metadata_client.metadata_command_checkpoint_candidates(
+            let latest_checkpoint = match metadata_client.metadata_command_checkpoint_candidates(
                 route.pg_id(),
                 state.cluster_epoch,
                 state.applied_log_index,
                 1,
             ) {
-                Ok(candidates)
-                    if candidates.first().is_some_and(|checkpoint| {
-                        checkpoint.applied_log_index == state.applied_log_index
-                            && checkpoint.applied_log_hash == state.applied_log_hash
-                            && checkpoint.state_digest == state.state_digest
-                    }) =>
-                {
+                Ok(mut candidates) => candidates.pop(),
+                Err(error) => {
+                    note_metadata_command_checkpoint_record_error(route.pg_id(), &error);
+                    summary.failed += 1;
+                    continue;
+                }
+            };
+            match metadata_command_checkpoint_record_decision(
+                &state,
+                latest_checkpoint.as_ref(),
+                METADATA_COMMAND_CHECKPOINT_MIN_LOG_DISTANCE,
+                METADATA_COMMAND_CHECKPOINT_FRAME_RISK_BYTES,
+            ) {
+                Ok(MetadataCommandCheckpointRecordDecision::Record) => {}
+                Ok(MetadataCommandCheckpointRecordDecision::AlreadyCurrent) => {
                     summary.already_current += 1;
                     continue;
                 }
-                Ok(_) => {}
+                Ok(MetadataCommandCheckpointRecordDecision::SkipCadence) => {
+                    summary.skipped_cadence += 1;
+                    continue;
+                }
                 Err(error) => {
                     note_metadata_command_checkpoint_record_error(route.pg_id(), &error);
                     summary.failed += 1;
@@ -10374,6 +10454,46 @@ fn note_metadata_command_checkpoint_record_error(pg_id: PgId, error: &StoreError
         "metadata_command_checkpoint_record_error",
         Some(format_args!("pg_id={} error={error}", pg_id.get())),
     );
+}
+
+fn metadata_command_checkpoint_record_decision(
+    state: &MetadataCommandReplicaState,
+    latest_checkpoint: Option<&MetadataCommandCheckpoint>,
+    min_log_distance: u64,
+    frame_risk_bytes: usize,
+) -> Result<MetadataCommandCheckpointRecordDecision, StoreError> {
+    let Some(checkpoint) = latest_checkpoint else {
+        return Ok(MetadataCommandCheckpointRecordDecision::Record);
+    };
+    if checkpoint.cluster_epoch == state.cluster_epoch
+        && checkpoint.applied_log_index == state.applied_log_index
+        && checkpoint.applied_log_hash == state.applied_log_hash
+        && checkpoint.state_digest == state.state_digest
+    {
+        return Ok(MetadataCommandCheckpointRecordDecision::AlreadyCurrent);
+    }
+
+    let log_distance = state
+        .applied_log_index
+        .saturating_sub(checkpoint.applied_log_index);
+    if log_distance >= min_log_distance {
+        return Ok(MetadataCommandCheckpointRecordDecision::Record);
+    }
+
+    let checkpoint_bytes = crate::storage_rpc::encode_metadata_command_checkpoint_payload(
+        checkpoint,
+    )
+    .map_err(|error| StoreError::MetadataCheckpointInvalid {
+        node_id: 0,
+        pg_id: checkpoint.pg_id.get(),
+        cluster_epoch: checkpoint.cluster_epoch,
+        reason: error.to_string(),
+    })?;
+    if checkpoint_bytes.len() >= frame_risk_bytes {
+        return Ok(MetadataCommandCheckpointRecordDecision::Record);
+    }
+
+    Ok(MetadataCommandCheckpointRecordDecision::SkipCadence)
 }
 
 fn shard_backfill_candidate_error_is_deferred(error: &StoreError) -> bool {

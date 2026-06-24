@@ -155,6 +155,7 @@ static METADATA_COMMAND_CHECKPOINT_RECORD_SCAN_TOTAL: AtomicU64 = AtomicU64::new
 static METADATA_COMMAND_CHECKPOINT_RECORD_SCANNED_TOTAL: AtomicU64 = AtomicU64::new(0);
 static METADATA_COMMAND_CHECKPOINT_RECORD_RECORDED_TOTAL: AtomicU64 = AtomicU64::new(0);
 static METADATA_COMMAND_CHECKPOINT_RECORD_ALREADY_CURRENT_TOTAL: AtomicU64 = AtomicU64::new(0);
+static METADATA_COMMAND_CHECKPOINT_RECORD_SKIPPED_CADENCE_TOTAL: AtomicU64 = AtomicU64::new(0);
 static METADATA_COMMAND_CHECKPOINT_RECORD_SKIPPED_INACTIVE_TOTAL: AtomicU64 = AtomicU64::new(0);
 static METADATA_COMMAND_CHECKPOINT_RECORD_FAILED_TOTAL: AtomicU64 = AtomicU64::new(0);
 static METADATA_COMMAND_CHECKPOINT_RECORD_LIMIT_REACHED_TOTAL: AtomicU64 = AtomicU64::new(0);
@@ -1367,6 +1368,7 @@ pub struct MetadataCommandCheckpointRecordSummary {
     pub scanned: usize,
     pub recorded: usize,
     pub already_current: usize,
+    pub skipped_cadence: usize,
     pub skipped_inactive: usize,
     pub failed: usize,
     pub limit_reached: bool,
@@ -1490,6 +1492,7 @@ pub struct MetricsSnapshot {
     pub metadata_command_checkpoint_record_scanned_total: u64,
     pub metadata_command_checkpoint_record_recorded_total: u64,
     pub metadata_command_checkpoint_record_already_current_total: u64,
+    pub metadata_command_checkpoint_record_skipped_cadence_total: u64,
     pub metadata_command_checkpoint_record_skipped_inactive_total: u64,
     pub metadata_command_checkpoint_record_failed_total: u64,
     pub metadata_command_checkpoint_record_limit_reached_total: u64,
@@ -1787,6 +1790,8 @@ pub fn metrics_snapshot() -> MetricsSnapshot {
             METADATA_COMMAND_CHECKPOINT_RECORD_RECORDED_TOTAL.load(Ordering::Relaxed),
         metadata_command_checkpoint_record_already_current_total:
             METADATA_COMMAND_CHECKPOINT_RECORD_ALREADY_CURRENT_TOTAL.load(Ordering::Relaxed),
+        metadata_command_checkpoint_record_skipped_cadence_total:
+            METADATA_COMMAND_CHECKPOINT_RECORD_SKIPPED_CADENCE_TOTAL.load(Ordering::Relaxed),
         metadata_command_checkpoint_record_skipped_inactive_total:
             METADATA_COMMAND_CHECKPOINT_RECORD_SKIPPED_INACTIVE_TOTAL.load(Ordering::Relaxed),
         metadata_command_checkpoint_record_failed_total:
@@ -2842,6 +2847,8 @@ pub fn emit_metadata_command_checkpoint_record_scan(
         .fetch_add(summary.recorded as u64, Ordering::Relaxed);
     METADATA_COMMAND_CHECKPOINT_RECORD_ALREADY_CURRENT_TOTAL
         .fetch_add(summary.already_current as u64, Ordering::Relaxed);
+    METADATA_COMMAND_CHECKPOINT_RECORD_SKIPPED_CADENCE_TOTAL
+        .fetch_add(summary.skipped_cadence as u64, Ordering::Relaxed);
     METADATA_COMMAND_CHECKPOINT_RECORD_SKIPPED_INACTIVE_TOTAL
         .fetch_add(summary.skipped_inactive as u64, Ordering::Relaxed);
     METADATA_COMMAND_CHECKPOINT_RECORD_FAILED_TOTAL
@@ -2853,10 +2860,11 @@ pub fn emit_metadata_command_checkpoint_record_scan(
         return false;
     };
     let detail = format!(
-        "scanned={} recorded={} already_current={} skipped_inactive={} failed={} limit_reached={}",
+        "scanned={} recorded={} already_current={} skipped_cadence={} skipped_inactive={} failed={} limit_reached={}",
         summary.scanned,
         summary.recorded,
         summary.already_current,
+        summary.skipped_cadence,
         summary.skipped_inactive,
         summary.failed,
         summary.limit_reached,
@@ -3685,6 +3693,7 @@ mod tests {
                 scanned: 11,
                 recorded: 3,
                 already_current: 4,
+                skipped_cadence: 5,
                 skipped_inactive: 2,
                 failed: 1,
                 limit_reached: true,
@@ -4062,6 +4071,10 @@ mod tests {
         assert_eq!(
             after.metadata_command_checkpoint_record_already_current_total,
             before.metadata_command_checkpoint_record_already_current_total + 4
+        );
+        assert_eq!(
+            after.metadata_command_checkpoint_record_skipped_cadence_total,
+            before.metadata_command_checkpoint_record_skipped_cadence_total + 5
         );
         assert_eq!(
             after.metadata_command_checkpoint_record_skipped_inactive_total,
