@@ -8351,6 +8351,13 @@ Metadata PG migration and backfill design notes:
   disk, and performs another metadata write. The reopened cluster must validate
   from the durable checkpoint base and allocate the next command index after
   the checkpoint instead of reusing a deleted log index.
+- Strengthened the metadata PG migration UAT smoke with a process-restart
+  boundary after checkpoint recording and compaction. The smoke now restarts
+  the current source storage nodes, waits for the PG and runtime map to become
+  serving again, verifies all objects remain readable, and only then performs
+  the next non-overlap metadata transfer. This makes the checkpoint-backed
+  transfer path prove durable checkpoint/catalogue reload rather than only
+  continuous in-process state.
 
 Exit criteria:
 

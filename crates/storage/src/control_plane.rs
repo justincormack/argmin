@@ -2015,6 +2015,7 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
             pg_id,
             primary,
             record.peering_metadata_proof_floor,
+            record.peering_metadata_transfer,
             active_metadata_proof,
         )?;
 
@@ -2067,6 +2068,7 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
                         record.pg_id,
                         primary,
                         record.peering_metadata_proof_floor,
+                        record.peering_metadata_transfer,
                         active_metadata_proof,
                     )
                     .is_ok() =>
@@ -2205,6 +2207,30 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
                         has_pending_metadata_command: observation.has_pending_metadata_command,
                     },
                 );
+            }
+        }
+        for observation in &heartbeat.pg_observations {
+            let Some(pg) = next_snapshot.pgs.get_mut(&observation.pg_id) else {
+                continue;
+            };
+            if pg.state != PgState::Active
+                || pg.active_primary != Some(heartbeat.node_id)
+                || observation.state != PgState::Active
+                || observation.has_pending_metadata_command
+            {
+                continue;
+            }
+            let Some(current_proof) = pg.active_metadata_proof else {
+                continue;
+            };
+            if metadata_proof_satisfies_active_primary_observation_floor(
+                current_proof,
+                observation.metadata_proof,
+                pg.active_metadata_transfer_imported,
+            ) && observation.metadata_proof != current_proof
+            {
+                pg.active_metadata_proof = Some(observation.metadata_proof);
+                pg.active_metadata_transfer_imported = false;
             }
         }
         if epoch_changed {
@@ -5346,7 +5372,7 @@ fn validate_authoritative_metadata_migration_source(
         {
             continue;
         }
-        if record.active_metadata_transfer_imported && record.active_primary == Some(node_id) {
+        if record.active_primary == Some(node_id) {
             return Ok(observation.metadata_proof);
         }
         source_floor = Some(match source_floor {
@@ -5399,8 +5425,21 @@ fn validate_peering_metadata_proof_floor(
     pg_id: PgId,
     node_id: NodeId,
     floor: Option<PgMetadataProof>,
+    transfer: Option<PgMetadataTransferProof>,
     actual: PgMetadataProof,
 ) -> Result<(), ControlPlaneError> {
+    if let Some(expected_transfer) = transfer.map(PgMetadataTransferProof::metadata_proof) {
+        if actual == expected_transfer {
+            return Ok(());
+        }
+        return Err(ControlPlaneError::PgPeeringMetadataProofBelowFloor {
+            pg_id: pg_id.get(),
+            node_id: node_id.as_u32(),
+            cluster_epoch,
+            expected: expected_transfer,
+            actual,
+        });
+    }
     let Some(expected) = floor else {
         return Ok(());
     };
@@ -12097,6 +12136,11 @@ mod tests {
             false,
             2_022,
         );
+        {
+            let pg = authority.snapshot().pg(PgId::new(45)).unwrap();
+            assert_eq!(pg.active_metadata_proof(), Some(epoch_local_progress));
+            assert!(!pg.active_metadata_transfer_imported);
+        }
         authority
             .set_pg_acting_set(PgId::new(45), vec![NodeId::new(1), NodeId::new(3)])
             .unwrap();
@@ -12154,6 +12198,14 @@ mod tests {
             false,
             3_021,
         );
+        {
+            let pg = authority.snapshot().pg(PgId::new(46)).unwrap();
+            assert_eq!(
+                pg.active_metadata_proof(),
+                Some(primary_destination_progress)
+            );
+            assert!(!pg.active_metadata_transfer_imported);
+        }
         authority
             .set_pg_acting_set(
                 PgId::new(46),
@@ -12399,6 +12451,38 @@ mod tests {
                 cluster_epoch,
                 ..
             }) if cluster_epoch == peering_epoch
+        ));
+
+        let stale_source_above_imported = PgMetadataProof::new(
+            imported_proof.applied_log_index + 10,
+            imported_proof.applied_log_hash + 10,
+            imported_proof.state_digest + 10,
+        );
+        heartbeat_with_pg_proof(
+            &mut authority,
+            2,
+            42,
+            PgState::Peering,
+            stale_source_above_imported,
+            false,
+            2_004,
+        );
+        assert!(matches!(
+            authority.complete_pg_peering(
+                PgId::new(42),
+                NodeId::new(2),
+                node_incarnation(&authority, 2),
+                2_004,
+            ),
+            Err(ControlPlaneError::PgPeeringMetadataProofBelowFloor {
+                pg_id: 42,
+                cluster_epoch,
+                expected,
+                actual,
+                ..
+            }) if cluster_epoch == peering_epoch
+                && expected == imported_proof
+                && actual == stale_source_above_imported
         ));
 
         heartbeat_with_pg_proof(

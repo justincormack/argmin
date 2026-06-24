@@ -1349,6 +1349,7 @@ else
     if [[ "$smoke" == "pg-backfill-migration" || "$smoke" == "metadata-pg-migration" ]]; then
         wait_for_control_plane_runtime_map_ready 10
         wait_for_control_plane_node_epochs_aligned 10 "$control_plane_runtime_map_ready_epoch"
+        wait_for_control_plane_runtime_map_ready 10 "$control_plane_aligned_epoch"
     fi
 
     frontend_log="$logs_dir/frontend.log"
@@ -1780,10 +1781,27 @@ run_metadata_pg_migration_smoke() {
         "$max_checkpoint_scan_error" \
         "$max_checkpoint_compaction_failed"
 
+    echo "== argmin-s3 UAT metadata PG migration restart checkpoint source nodes =="
+    restart_storage_node 0
+    restart_storage_node 1
+    wait_for_control_plane_runtime_map_ready 60
+    wait_for_control_plane_node_epochs_aligned 60 "$control_plane_runtime_map_ready_epoch"
+    wait_for_control_plane_runtime_map_ready 60 "$control_plane_aligned_epoch"
+    wait_for_control_plane_pg_active "$target_metadata_pg" 60 "0:1"
+    wait_for_serving_runtime_installed 60 "$metrics_path"
+
+    echo "== argmin-s3 UAT metadata PG migration post-restart reads =="
+    print_command "${pg_backfill_smoke_cmd[@]}" get "$bucket_file" "$old_key" "$old_body_file"
+    "${pg_backfill_smoke_cmd[@]}" get "$bucket_file" "$old_key" "$old_body_file"
+    print_command "${pg_backfill_smoke_cmd[@]}" get "$bucket_file" "$new_key" "$new_body_file"
+    "${pg_backfill_smoke_cmd[@]}" get "$bucket_file" "$new_key" "$new_body_file"
+    print_command "${pg_backfill_smoke_cmd[@]}" get "$bucket_file" "$final_key" "$final_body_file"
+    "${pg_backfill_smoke_cmd[@]}" get "$bucket_file" "$final_key" "$final_body_file"
+
     echo "== argmin-s3 UAT metadata PG migration repeated outbound transfer =="
     transfer_pg_metadata "second non-overlap destination nodes 2,3 with suffix replay" "$target_metadata_pg" 2 3
-    wait_for_control_plane_pg_active "$target_metadata_pg" 20 "2:3"
-    wait_for_serving_runtime_installed 20 "$metrics_path"
+    wait_for_control_plane_pg_active "$target_metadata_pg" 60 "2:3"
+    wait_for_serving_runtime_installed 60 "$metrics_path"
 
     echo "== argmin-s3 UAT metadata PG migration repeated-transfer reads =="
     print_command "${pg_backfill_smoke_cmd[@]}" get "$bucket_file" "$old_key" "$old_body_file"
@@ -1795,8 +1813,8 @@ run_metadata_pg_migration_smoke() {
 
     echo "== argmin-s3 UAT metadata PG migration final return transfer =="
     transfer_pg_metadata "final return to original nodes 0,1" "$target_metadata_pg" 0 1
-    wait_for_control_plane_pg_active "$target_metadata_pg" 20 "0:1"
-    wait_for_serving_runtime_installed 20 "$metrics_path"
+    wait_for_control_plane_pg_active "$target_metadata_pg" 60 "0:1"
+    wait_for_serving_runtime_installed 60 "$metrics_path"
 
     echo "== argmin-s3 UAT metadata PG migration final reads =="
     print_command "${pg_backfill_smoke_cmd[@]}" get "$bucket_file" "$old_key" "$old_body_file"

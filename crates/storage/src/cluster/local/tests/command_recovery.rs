@@ -3908,6 +3908,88 @@ fn metadata_transfer_live_export_uses_checkpoint_candidate_after_compaction() {
 }
 
 #[test]
+fn metadata_transfer_live_export_uses_checkpoint_when_retained_log_has_compacted_prefix() {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[1], ec_shape).unwrap();
+    let topology = map
+        .node(NodeId::new(0))
+        .unwrap()
+        .storage_node()
+        .pg_topology();
+    let first_bucket = bucket_for_pg(topology, 1, "metadata-transfer-prefix-first-");
+    let second_bucket = bucket_for_pg(topology, 1, "metadata-transfer-prefix-second-");
+    set_route_primary(&mut map, 1, NodeId::new(0));
+    set_route_state(&mut map, 1, PgState::Peering);
+    let pg_id = PgId::new(1);
+    let source_pg = map
+        .node(NodeId::new(0))
+        .unwrap()
+        .storage_node()
+        .get_pg(1)
+        .unwrap();
+    let first = create_bucket_metadata_command(pg_id, 1, first_bucket);
+    source_pg
+        .apply_metadata_command_and_record(0, &first)
+        .unwrap();
+    let checkpoint = source_pg
+        .record_current_metadata_command_checkpoint(0, ClusterEpoch::INITIAL)
+        .unwrap();
+    assert!(matches!(
+        source_pg
+            .compact_metadata_command_log(ClusterEpoch::INITIAL)
+            .unwrap(),
+        crate::pg_store::MetadataCommandLogCompactionStatus::Compacted {
+            deleted_entries: 1,
+            ..
+        }
+    ));
+    let second = create_bucket_metadata_command(pg_id, 2, second_bucket);
+    source_pg
+        .apply_metadata_command_and_record(0, &second)
+        .unwrap();
+    let source_state = source_pg.metadata_command_replica_state().unwrap();
+    drop(source_pg);
+
+    let cluster = crate::StorageCluster::from_local_map(Arc::new(map)).unwrap();
+    let retained_artifact = cluster
+        .export_pg_metadata_transfer_from_retained_log(pg_id, NodeId::new(0))
+        .unwrap();
+    assert_eq!(
+        retained_artifact.source_base_kind(),
+        crate::peering::PgMetadataTransferBaseKind::RetainedLogPrefix
+    );
+
+    let artifact = cluster
+        .export_pg_metadata_transfer_artifact_for_live_transfer(pg_id, NodeId::new(0))
+        .unwrap();
+
+    assert_eq!(
+        artifact.source_base_kind(),
+        crate::peering::PgMetadataTransferBaseKind::Checkpoint
+    );
+    assert_eq!(
+        artifact.source_base_metadata_proof(),
+        crate::control_plane::PgMetadataProof::new(
+            checkpoint.applied_log_index,
+            checkpoint.applied_log_hash,
+            checkpoint.state_digest,
+        )
+    );
+    assert_eq!(artifact.retained_log_entries.len(), 1);
+    assert_eq!(artifact.retained_log_entries[0].log_index, 2);
+    assert_eq!(
+        artifact.source_metadata_proof(),
+        crate::control_plane::PgMetadataProof::new(
+            source_state.applied_log_index,
+            source_state.applied_log_hash,
+            source_state.state_digest,
+        )
+    );
+}
+
+#[test]
 fn routine_metadata_checkpoint_records_current_primary_candidate_once() {
     let tmp = test_util::tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
@@ -4216,7 +4298,7 @@ fn metadata_transfer_import_replays_suffix_over_round_trip_base_state() {
         NodeId::new(2),
         NodeId::new(3),
     ];
-    let ec_shape = EcShape { k: 2, m: 1 };
+    let ec_shape = EcShape { k: 1, m: 1 };
     let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[1], ec_shape).unwrap();
     let topology = map
         .node(NodeId::new(0))
@@ -4296,6 +4378,7 @@ fn metadata_transfer_import_replays_suffix_over_round_trip_base_state() {
     .unwrap();
     assert_eq!(proof, expected_proof);
 
+    let mut pre_reopen_states = BTreeMap::new();
     for node_id in [NodeId::new(0), NodeId::new(1)] {
         let pg = map.node(node_id).unwrap().storage_node().get_pg(1).unwrap();
         let state = pg.metadata_command_replica_state().unwrap();
@@ -4303,6 +4386,54 @@ fn metadata_transfer_import_replays_suffix_over_round_trip_base_state() {
         assert_eq!(state.applied_log_index, 2);
         assert_eq!(state.applied_log_hash, proof.applied_log_hash);
         assert_eq!(state.state_digest, proof.state_digest);
+        crate::PgMetadataStore::head_bucket(&*pg, &first_bucket).unwrap();
+        crate::PgMetadataStore::head_bucket(&*pg, &second_bucket).unwrap();
+        pre_reopen_states.insert(node_id, state);
+        pg.record_current_metadata_command_checkpoint(node_id.as_u32(), return_epoch)
+            .unwrap();
+        assert!(matches!(
+            pg.compact_metadata_command_log(return_epoch).unwrap(),
+            crate::pg_store::MetadataCommandLogCompactionStatus::Compacted {
+                deleted_entries: 2,
+                ..
+            }
+        ));
+    }
+    drop(cluster);
+    drop(map);
+
+    let reopened_node_ids = [NodeId::new(0), NodeId::new(1)];
+    let reopened_configs = reopened_node_ids.iter().map(|&node_id| {
+        LocalNodeStoreConfig::new(
+            node_id,
+            tmp.path().join(format!("node-{:04}", node_id.as_u32())),
+        )
+    });
+    let mut reopened_map = LocalClusterMap::open_with_configs_and_epoch(
+        NodeId::new(0),
+        reopened_configs,
+        &[1],
+        ec_shape,
+        return_epoch,
+    )
+    .unwrap();
+    set_route_primary(&mut reopened_map, 1, NodeId::new(0));
+    reopened_map.pg_routes.get_mut(&pg_id).unwrap().acting_set =
+        Arc::from([NodeId::new(0), NodeId::new(1)]);
+    let reopened_map = Arc::new(reopened_map);
+    for node_id in reopened_node_ids {
+        let pg = reopened_map
+            .node(node_id)
+            .unwrap()
+            .storage_node()
+            .get_pg(1)
+            .unwrap();
+        let reopened_state = pg.metadata_command_replica_state().unwrap();
+        assert_eq!(
+            reopened_state,
+            *pre_reopen_states.get(&node_id).unwrap(),
+            "checkpointed returned transfer proof must survive reopen for node {node_id:?}"
+        );
         crate::PgMetadataStore::head_bucket(&*pg, &first_bucket).unwrap();
         crate::PgMetadataStore::head_bucket(&*pg, &second_bucket).unwrap();
     }

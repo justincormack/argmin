@@ -2287,7 +2287,7 @@ fn metadata_command_log_index_allocator_seeds_from_reopened_checkpoint_after_com
     let tmp = test_util::tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
     let ec_shape = EcShape { k: 2, m: 1 };
-    let (first_bucket, second_bucket, third_bucket) = {
+    let (first_bucket, second_bucket, third_bucket, pre_reopen_states) = {
         let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1], ec_shape).unwrap();
         let topology = map
             .node(NodeId::new(0))
@@ -2303,8 +2303,12 @@ fn metadata_command_log_index_allocator_seeds_from_reopened_checkpoint_after_com
         create_test_bucket(&cluster, &first_bucket);
         create_test_bucket(&cluster, &second_bucket);
 
+        let mut pre_reopen_states = BTreeMap::new();
         for node_id in node_ids {
             let pg = map.node(node_id).unwrap().storage_node().get_pg(1).unwrap();
+            let state = pg.metadata_command_replica_state().unwrap();
+            assert_eq!(state.applied_log_index, 2);
+            pre_reopen_states.insert(node_id, state);
             pg.record_current_metadata_command_checkpoint(node_id.as_u32(), ClusterEpoch::INITIAL)
                 .unwrap();
             assert_eq!(
@@ -2322,12 +2326,23 @@ fn metadata_command_log_index_allocator_seeds_from_reopened_checkpoint_after_com
             assert_eq!(stats.missing_applied_prefix_entries, 0);
         }
 
-        (first_bucket, second_bucket, third_bucket)
+        (first_bucket, second_bucket, third_bucket, pre_reopen_states)
     };
 
     let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1], ec_shape).unwrap();
     set_route_primary(&mut map, 1, NodeId::new(1));
     let map = Arc::new(map);
+
+    for node_id in node_ids {
+        let pg = map.node(node_id).unwrap().storage_node().get_pg(1).unwrap();
+        let reopened_state = pg.metadata_command_replica_state().unwrap();
+        assert_eq!(
+            reopened_state,
+            *pre_reopen_states.get(&node_id).unwrap(),
+            "checkpoint compaction and reopen must preserve the exact active proof for node {node_id:?}"
+        );
+    }
+
     let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&cluster, &third_bucket);
 

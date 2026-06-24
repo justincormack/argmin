@@ -3161,7 +3161,12 @@ impl StorageCluster {
         source_node_id: NodeId,
     ) -> Result<PgMetadataTransferArtifact, PgMetadataTransferError> {
         match self.export_pg_metadata_transfer_from_retained_log(pg_id, source_node_id) {
-            Ok(artifact) => return Ok(artifact),
+            Ok(artifact)
+                if artifact.source_base_kind() != PgMetadataTransferBaseKind::RetainedLogPrefix =>
+            {
+                return Ok(artifact);
+            }
+            Ok(_) => {}
             Err(error) if retained_log_export_failure_allows_checkpoint_fallback(&error) => {}
             Err(error) => return Err(error.into()),
         }
