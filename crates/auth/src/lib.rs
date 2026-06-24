@@ -40,7 +40,7 @@ pub(crate) const SIGNATURE_HEX_LEN: usize = 64;
 /// Returns `true` if both slices have equal length and contents.
 /// Runs in time proportional to the length of the slices, regardless
 /// of where (or whether) they differ.
-pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
     }
@@ -72,3 +72,15 @@ pub use request::{
     authenticate_request, AuthContext, AuthMode, HeaderSource, StreamingSigningContext,
 };
 pub use sigv4::{parse_auth_header, verify_request, SigV4Auth};
+
+#[cfg(test)]
+mod tests {
+    use super::constant_time_eq;
+
+    #[test]
+    fn constant_time_eq_checks_length_and_contents() {
+        assert!(constant_time_eq(b"same", b"same"));
+        assert!(!constant_time_eq(b"same", b"diff"));
+        assert!(!constant_time_eq(b"same", b"same-longer"));
+    }
+}

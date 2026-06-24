@@ -312,7 +312,7 @@ fn verify_chunk_signature_hash(
     let expected = hmac::sign(&key, string_to_sign.as_bytes());
     let expected_hex = hex_encode(expected.as_ref());
 
-    if expected_hex != claimed_sig {
+    if !auth::constant_time_eq(expected_hex.as_bytes(), claimed_sig.as_bytes()) {
         return Err(ServerError::Auth(auth::AuthError::SignatureMismatch));
     }
     Ok(())
@@ -371,7 +371,7 @@ fn verify_trailer_signature(
     let expected = hmac::sign(&key, string_to_sign.as_bytes());
     let expected_hex = hex_encode(expected.as_ref());
 
-    if expected_hex != claimed_sig {
+    if !auth::constant_time_eq(expected_hex.as_bytes(), claimed_sig.as_bytes()) {
         return Err(ServerError::Auth(auth::AuthError::SignatureMismatch));
     }
     Ok(())
