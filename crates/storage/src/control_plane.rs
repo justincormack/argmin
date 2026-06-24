@@ -18,7 +18,7 @@ const CONTROL_PLANE_RPC_MAGIC: &[u8] = b"argmin-control-plane-rpc";
 const CONTROL_PLANE_RPC_MAX_PAYLOAD_LEN: usize = 8 * 1024 * 1024;
 const CONTROL_PLANE_RPC_IO_TIMEOUT: Duration = Duration::from_secs(1);
 const CONTROL_PLANE_RPC_HEARTBEAT_OBSERVATION_MIN_LEN: usize = 4 + 1 + 8 + 8 + 8 + 1;
-const CONTROL_PLANE_RPC_RUNTIME_NODE_MIN_LEN: usize = 4 + 8 + 4;
+const CONTROL_PLANE_RPC_RUNTIME_NODE_MIN_LEN: usize = 4 + 8 + 4 + 1;
 const CONTROL_PLANE_RPC_PG_ROUTE_MIN_LEN: usize = 8 + 4 + 4 + 1 + 1 + 4 + 1;
 const CONTROL_PLANE_RPC_ACTING_SET_NODE_MIN_LEN: usize = 4;
 
@@ -581,6 +581,7 @@ impl ClusterControlSnapshot {
                 node_id,
                 node_incarnation: node.node_incarnation,
                 endpoint: node.endpoint.clone(),
+                cluster_map_history_floor_epoch: node.cluster_map_history_floor_epoch(),
             });
         }
         let valid_until_ms = pg_routes
@@ -746,6 +747,7 @@ pub struct NodeRouteSnapshot {
     node_id: NodeId,
     node_incarnation: u64,
     endpoint: String,
+    cluster_map_history_floor_epoch: Option<ClusterEpoch>,
 }
 
 impl NodeRouteSnapshot {
@@ -762,6 +764,11 @@ impl NodeRouteSnapshot {
     #[must_use]
     pub fn endpoint(&self) -> &str {
         &self.endpoint
+    }
+
+    #[must_use]
+    pub fn cluster_map_history_floor_epoch(&self) -> Option<ClusterEpoch> {
+        self.cluster_map_history_floor_epoch
     }
 }
 
@@ -3613,6 +3620,11 @@ fn write_runtime_map_snapshot(
         write_u32(out, node.node_id().as_u32());
         write_u64(out, node.node_incarnation());
         write_string(out, node.endpoint())?;
+        write_option_u64(
+            out,
+            node.cluster_map_history_floor_epoch()
+                .map(ClusterEpoch::get),
+        );
     }
     write_pg_route_snapshots(out, "PG routes", snapshot.pg_routes())?;
     write_pg_route_snapshots(out, "historical PG routes", snapshot.historical_pg_routes())?;
@@ -3673,6 +3685,10 @@ fn read_runtime_map_snapshot(
             node_id: NodeId::new(reader.read_u32()?),
             node_incarnation: reader.read_u64()?,
             endpoint: reader.read_string()?.to_owned(),
+            cluster_map_history_floor_epoch: read_option_cluster_epoch(
+                reader,
+                "runtime node cluster-map history floor epoch",
+            )?,
         });
     }
     let pg_routes = read_pg_route_snapshots(reader, "PG routes")?;
@@ -6596,8 +6612,10 @@ mod tests {
                     endpoint: "/tmp/argmin-node-1.sock".to_owned(),
                     observed_epoch: heartbeat_epoch,
                     requested_lease_duration_ms: 100,
-                    cluster_map_history_reference_summary:
-                        PgClusterMapHistoryReferenceSummary::default(),
+                    cluster_map_history_reference_summary: PgClusterMapHistoryReferenceSummary {
+                        oldest_live_placement_epoch: Some(heartbeat_epoch),
+                        oldest_durable_backfill_epoch: None,
+                    },
                     pg_observations: Vec::new(),
                 },
                 0,
@@ -6616,6 +6634,10 @@ mod tests {
         assert_eq!(
             refresh.runtime_map().nodes()[0].endpoint(),
             "/tmp/argmin-node-1.sock"
+        );
+        assert_eq!(
+            refresh.runtime_map().nodes()[0].cluster_map_history_floor_epoch(),
+            Some(heartbeat_epoch)
         );
     }
 
@@ -7335,6 +7357,9 @@ mod tests {
         authority
             .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
             .unwrap();
+        authority
+            .set_pg_acting_set(PgId::new(1), vec![NodeId::new(1)])
+            .unwrap();
         assert!(heartbeat_until_serving(&mut authority, 1, 10_000).serving());
         let protected_epoch = authority.snapshot().cluster_epoch();
         let mut floor_heartbeat = heartbeat_from_record(&authority, 1, protected_epoch, 10_100);
@@ -7376,6 +7401,11 @@ mod tests {
                 .snapshot()
                 .node(NodeId::new(1))
                 .unwrap()
+                .cluster_map_history_floor_epoch(),
+            Some(protected_epoch)
+        );
+        assert_eq!(
+            persisted.snapshot().runtime_map(20_000).unwrap().nodes()[0]
                 .cluster_map_history_floor_epoch(),
             Some(protected_epoch)
         );

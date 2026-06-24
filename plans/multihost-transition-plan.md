@@ -8405,6 +8405,11 @@ Metadata PG migration and backfill design notes:
   durable backfill source/desired epochs can keep the route history they need
   across repeated epoch changes and control-plane restarts, alongside the
   existing metadata-transfer source-route floor.
+- Surfaced storage-owned cluster-map history floors in runtime-map diagnostics.
+  Runtime-map node snapshots now carry each node's persisted storage history
+  floor, and the `control-plane-runtime-map-diagnostics` admin command reports
+  aggregate and per-node floor epochs without changing the existing
+  `control-plane-runtime-map-ready` output consumed by UAT readiness checks.
 
 Exit criteria:
 

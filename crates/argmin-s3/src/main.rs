@@ -278,6 +278,33 @@ fn maybe_run_control_plane_admin_command() -> Option<i32> {
         };
     }
 
+    if command == "control-plane-runtime-map-diagnostics" {
+        let Some(path) = args.next() else {
+            eprintln!(
+                "usage: argmin-s3 {} <socket-path>",
+                command.to_string_lossy()
+            );
+            return Some(2);
+        };
+        if args.next().is_some() {
+            eprintln!(
+                "usage: argmin-s3 {} <socket-path>",
+                command.to_string_lossy()
+            );
+            return Some(2);
+        }
+        return match control_plane_runtime_map_diagnostics(Path::new(&path)) {
+            Ok(diagnostics) => {
+                println!("{diagnostics}");
+                Some(0)
+            }
+            Err(error) => {
+                eprintln!("{error}");
+                Some(1)
+            }
+        };
+    }
+
     if command == "control-plane-set-pg-acting-set-with-metadata-transfer-live" {
         let Some(path) = args.next() else {
             eprintln!(
@@ -1090,6 +1117,60 @@ fn control_plane_runtime_map_ready(
     ))
 }
 
+fn control_plane_runtime_map_diagnostics(socket_path: &Path) -> Result<String, String> {
+    let runtime_map = UnixControlPlaneClient::new(socket_path)
+        .runtime_map_snapshot(storage::clock::current_time_millis())
+        .map_err(|error| format!("control-plane runtime map is not ready: {error}"))?;
+    Ok(format_control_plane_runtime_map_diagnostics(&runtime_map))
+}
+
+fn format_control_plane_runtime_map_diagnostics(runtime_map: &ClusterRuntimeMapSnapshot) -> String {
+    let active_serving_pg_routes = runtime_map
+        .pg_routes()
+        .iter()
+        .filter(|route| {
+            route.state() == PgState::Active && route.primary_lease_deadline_ms().is_some()
+        })
+        .count();
+    let floor_nodes = runtime_map
+        .nodes()
+        .iter()
+        .filter(|node| node.cluster_map_history_floor_epoch().is_some())
+        .count();
+    let oldest_floor = runtime_map
+        .nodes()
+        .iter()
+        .filter_map(|node| node.cluster_map_history_floor_epoch())
+        .min();
+    let mut diagnostics = format!(
+        "epoch={} nodes={} pg_routes={} active_serving_pg_routes={} historical_pg_routes={} storage_history_floor_nodes={} oldest_storage_history_floor_epoch={}",
+        runtime_map.cluster_epoch().get(),
+        runtime_map.nodes().len(),
+        runtime_map.pg_routes().len(),
+        active_serving_pg_routes,
+        runtime_map.historical_pg_routes().len(),
+        floor_nodes,
+        format_optional_epoch(oldest_floor),
+    );
+    for node in runtime_map.nodes() {
+        diagnostics.push('\n');
+        diagnostics.push_str(&format!(
+            "node_id={} incarnation={} endpoint={} storage_history_floor_epoch={}",
+            node.node_id().as_u32(),
+            node.node_incarnation(),
+            node.endpoint(),
+            format_optional_epoch(node.cluster_map_history_floor_epoch()),
+        ));
+    }
+    diagnostics
+}
+
+fn format_optional_epoch(epoch: Option<ClusterEpoch>) -> String {
+    epoch
+        .map(|epoch| epoch.get().to_string())
+        .unwrap_or_else(|| "-".to_owned())
+}
+
 fn run_control_plane_process(config: &ServerConfig) -> ! {
     let state_path = config
         .control_plane_state_path
@@ -1858,7 +1939,8 @@ mod tests {
     use auth::SecretKey;
     use config::SecretConfigValue;
     use storage::control_plane::{
-        NodeMembershipState, NodePgHeartbeatObservation, PgMetadataProof,
+        ControlPlaneHeartbeatSink, NodeHeartbeat, NodeMembershipState, NodePgHeartbeatObservation,
+        PgMetadataProof,
     };
 
     fn short_unix_socket_test_dir(name: &str) -> PathBuf {
@@ -1986,6 +2068,62 @@ mod tests {
             metadata_transfer_source_lease_wait_duration(1_251, 1_250),
             None
         );
+    }
+
+    #[test]
+    fn runtime_map_diagnostics_include_storage_history_floors() {
+        let tmp = std::env::temp_dir().join(format!(
+            "argmin-runtime-map-diagnostics-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let store = FileControlPlaneStore::new(tmp.join("control-plane.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+        authority
+            .set_node_membership(NodeId::new(2), NodeMembershipState::Active)
+            .unwrap();
+        authority
+            .set_pg_acting_set(PgId::new(3), vec![NodeId::new(2)])
+            .unwrap();
+        let floor_epoch = authority.snapshot().cluster_epoch();
+        authority
+            .submit_node_heartbeat(
+                NodeHeartbeat {
+                    node_id: NodeId::new(2),
+                    node_incarnation: 7,
+                    endpoint: "node-2.sock".to_owned(),
+                    observed_epoch: floor_epoch,
+                    requested_lease_duration_ms: 1_000,
+                    cluster_map_history_reference_summary:
+                        storage::PgClusterMapHistoryReferenceSummary {
+                            oldest_live_placement_epoch: Some(floor_epoch),
+                            oldest_durable_backfill_epoch: None,
+                        },
+                    pg_observations: Vec::new(),
+                },
+                1_000,
+            )
+            .unwrap();
+        let runtime_map = authority.snapshot().runtime_map(1_000).unwrap();
+
+        let diagnostics = format_control_plane_runtime_map_diagnostics(&runtime_map);
+
+        assert!(diagnostics.contains("nodes=1"), "{diagnostics}");
+        assert!(
+            diagnostics.contains(&format!(
+                "oldest_storage_history_floor_epoch={}",
+                floor_epoch.get()
+            )),
+            "{diagnostics}"
+        );
+        assert!(
+            diagnostics.contains(&format!(
+                "node_id=2 incarnation=7 endpoint=node-2.sock storage_history_floor_epoch={}",
+                floor_epoch.get()
+            )),
+            "{diagnostics}"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
