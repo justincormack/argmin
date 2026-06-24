@@ -1775,10 +1775,21 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
                     }
                     _ => None,
                 };
-                let peering_metadata_transfer = if record.state == PgState::Peering {
-                    record.peering_metadata_transfer
+                let (
+                    peering_metadata_transfer,
+                    peering_metadata_transfer_source_route_epoch,
+                    peering_metadata_transfer_source_node_id,
+                ) = if record.state == PgState::Peering {
+                    match record.peering_metadata_transfer {
+                        Some(transfer) => (
+                            Some(transfer),
+                            record.peering_metadata_transfer_source_route_epoch,
+                            record.peering_metadata_transfer_source_node_id,
+                        ),
+                        None => (None, None, None),
+                    }
                 } else {
-                    None
+                    (None, None, None)
                 };
                 let metadata_transfer_fenced = if record.state == PgState::Peering {
                     record.metadata_transfer_fenced
@@ -1801,8 +1812,10 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
                 record.active_metadata_transfer_imported = false;
                 record.peering_metadata_proof_floor = peering_metadata_proof_floor;
                 record.peering_metadata_transfer = peering_metadata_transfer;
-                record.peering_metadata_transfer_source_route_epoch = None;
-                record.peering_metadata_transfer_source_node_id = None;
+                record.peering_metadata_transfer_source_route_epoch =
+                    peering_metadata_transfer_source_route_epoch;
+                record.peering_metadata_transfer_source_node_id =
+                    peering_metadata_transfer_source_node_id;
                 record.metadata_transfer_fenced = metadata_transfer_fenced;
                 record.metadata_transfer_fence_source_lease_deadline_ms =
                     metadata_transfer_fence_source_lease_deadline_ms;
@@ -7172,6 +7185,84 @@ mod tests {
                 .unwrap()
                 .peering_metadata_transfer_source_route_epoch(),
             Some(source_epoch)
+        );
+    }
+
+    #[test]
+    fn peering_acting_set_update_preserves_metadata_transfer_source_route_fields() {
+        let tmp = test_util::tempdir();
+        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store.clone()).unwrap();
+        for node_id in [1, 2, 3] {
+            authority
+                .set_node_membership(NodeId::new(node_id), NodeMembershipState::Active)
+                .unwrap();
+            assert!(heartbeat_until_serving(&mut authority, node_id, 10_000).serving());
+        }
+        let active_proof = PgMetadataProof::new(9, 10, 11);
+        authority
+            .set_pg_acting_set(PgId::new(42), vec![NodeId::new(1)])
+            .unwrap();
+        heartbeat_with_pg_proof(
+            &mut authority,
+            1,
+            42,
+            PgState::Peering,
+            active_proof,
+            false,
+            20_000,
+        );
+        authority
+            .complete_pg_peering(
+                PgId::new(42),
+                NodeId::new(1),
+                node_incarnation(&authority, 1),
+                20_001,
+            )
+            .unwrap();
+        heartbeat_with_pg_proof(
+            &mut authority,
+            1,
+            42,
+            PgState::Active,
+            active_proof,
+            false,
+            20_002,
+        );
+        let source_epoch = authority.snapshot().cluster_epoch();
+        let transfer = PgMetadataTransferProof::new_with_imported_metadata_proof(
+            source_epoch,
+            active_proof,
+            PgMetadataProof::new(9, 12, 11),
+        );
+        authority
+            .set_pg_acting_set_with_metadata_transfer(PgId::new(42), vec![NodeId::new(2)], transfer)
+            .unwrap();
+        heartbeat_with_pg_proof(
+            &mut authority,
+            2,
+            42,
+            PgState::Peering,
+            transfer.metadata_proof(),
+            false,
+            20_003,
+        );
+
+        authority
+            .set_pg_acting_set(PgId::new(42), vec![NodeId::new(2), NodeId::new(3)])
+            .unwrap();
+
+        let persisted = SingleAuthorityControlPlane::open(store).unwrap();
+        let pg = persisted.snapshot().pg(PgId::new(42)).unwrap();
+        assert_eq!(pg.state(), PgState::Peering);
+        assert_eq!(pg.peering_metadata_transfer(), Some(transfer));
+        assert_eq!(
+            pg.peering_metadata_transfer_source_route_epoch(),
+            Some(source_epoch)
+        );
+        assert_eq!(
+            pg.peering_metadata_transfer_source_node_id(),
+            Some(NodeId::new(1))
         );
     }
 
