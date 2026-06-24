@@ -8289,9 +8289,20 @@ Metadata PG migration and backfill design notes:
   replica's newest bounded candidates after retained-log export falls into a
   checkpoint-compatible failure. The selector now uses durable checkpoint-plus-
   suffix artifacts when available and keeps the full-checkpoint fallback for
-  sources with no usable catalogue entry. The remaining storage piece is
-  deciding where routine checkpoint creation is scheduled so long-lived PGs
-  naturally accumulate useful transfer bases before reshuffles.
+  sources with no usable catalogue entry.
+- Added the first routine metadata-checkpoint scheduler. The shard scavenger's
+  quiet-window pass now has a low-priority `routine_metadata_checkpoint`
+  admission class that backs off under foreground pressure or durable
+  repair/backfill backlog. Each admitted pass scans active metadata PG
+  primaries, skips PGs whose current proof is already represented by the
+  newest durable checkpoint candidate, and records a small bounded number of
+  verified current checkpoint candidates through the storage-node RPC boundary.
+  The record-current RPC returns only the checkpoint proof/state identity, not
+  the full checkpoint payload, so a large checkpoint can be durably recorded
+  without a post-mutation `ResourceExhausted` response failure. This gives
+  long-lived PGs natural transfer bases before reshuffles. Later tuning still
+  needs an explicit checkpoint cadence/retention policy and UAT signal for
+  checkpoint creation volume.
 
 Exit criteria:
 

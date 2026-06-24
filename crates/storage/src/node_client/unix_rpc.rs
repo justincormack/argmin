@@ -1595,6 +1595,31 @@ impl UnixStorageNodeClient {
             })
     }
 
+    pub(crate) fn record_current_metadata_command_checkpoint(
+        &self,
+        pg_id: PgId,
+        cluster_epoch: ClusterEpoch,
+    ) -> Result<MetadataCommandReplicaState, StoreError> {
+        let request = StorageRpcMetadataCommandStateRequest {
+            node_id: self.node_id,
+            cluster_epoch,
+            pg_id,
+        };
+        let payload = encode_metadata_command_state_request(&request);
+        let response = self.rpc_request(
+            StorageRpcMessageKind::MetadataCommandCheckpointRecordCurrent,
+            payload,
+        )?;
+        decode_metadata_command_state_response(&response)
+            .map(|response| response.state)
+            .map_err(|error| {
+                self.rpc_payload_error(
+                    "decode metadata command checkpoint record current response",
+                    error.to_string(),
+                )
+            })
+    }
+
     pub(crate) fn metadata_command_checkpoint_candidates(
         &self,
         pg_id: PgId,
@@ -2754,6 +2779,18 @@ impl MetadataCommandNodeClient for UnixStorageNodeClient {
         cluster_epoch: ClusterEpoch,
     ) -> Result<MetadataCommandCheckpoint, StoreError> {
         UnixStorageNodeClient::metadata_command_checkpoint(self, pg_id, cluster_epoch)
+    }
+
+    fn record_current_metadata_command_checkpoint(
+        &self,
+        pg_id: PgId,
+        cluster_epoch: ClusterEpoch,
+    ) -> Result<MetadataCommandReplicaState, StoreError> {
+        UnixStorageNodeClient::record_current_metadata_command_checkpoint(
+            self,
+            pg_id,
+            cluster_epoch,
+        )
     }
 
     fn metadata_command_checkpoint_candidates(

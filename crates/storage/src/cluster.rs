@@ -98,6 +98,7 @@ const PUT_OBJECT_STREAM_CREATE_RETRY_BUDGET: Duration = Duration::from_secs(10);
 const METADATA_CONTENTION_BACKOFF_INITIAL: Duration = Duration::from_millis(1);
 const METADATA_CONTENTION_BACKOFF_MAX: Duration = Duration::from_millis(25);
 const PLACED_SEGMENT_SHARD_BACKFILL_CANDIDATE_SCAN_LIMIT: usize = 256;
+const METADATA_COMMAND_CHECKPOINT_RECORD_LIMIT: usize = 4;
 
 #[derive(Debug)]
 pub(super) struct RequestWorkBudget {
@@ -114,6 +115,16 @@ pub(super) struct RequestWorkBudget {
 pub struct DurablePlacedSegmentShardRepairEnqueueSummary {
     pub scanned: usize,
     pub enqueued: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MetadataCommandCheckpointRecordSummary {
+    pub scanned: usize,
+    pub recorded: usize,
+    pub already_current: usize,
+    pub skipped_inactive: usize,
+    pub failed: usize,
+    pub limit_reached: bool,
 }
 
 impl RequestWorkBudget {
@@ -4104,6 +4115,95 @@ impl StorageCluster {
             .local_map
             .metadata_pg_primary_node(self.operation_epoch(), pg_id)?;
         Ok(node.shard_ack_client())
+    }
+
+    pub fn record_routine_metadata_command_checkpoints(
+        &self,
+    ) -> Result<MetadataCommandCheckpointRecordSummary, StoreError> {
+        self.record_routine_metadata_command_checkpoints_with_limit(
+            METADATA_COMMAND_CHECKPOINT_RECORD_LIMIT,
+        )
+    }
+
+    fn record_routine_metadata_command_checkpoints_with_limit(
+        &self,
+        limit: usize,
+    ) -> Result<MetadataCommandCheckpointRecordSummary, StoreError> {
+        let mut summary = MetadataCommandCheckpointRecordSummary::default();
+        if limit == 0 {
+            return Ok(summary);
+        }
+
+        for route in self.local_pg_routes() {
+            if summary.recorded >= limit {
+                summary.limit_reached = true;
+                break;
+            }
+            summary.scanned += 1;
+            if route.state() != PgState::Active {
+                summary.skipped_inactive += 1;
+                continue;
+            }
+            let primary_node = self
+                .local_map
+                .metadata_pg_primary_node(self.operation_epoch(), route.pg_id())?;
+            let metadata_client = primary_node.metadata_command_client();
+            let state = match metadata_client.metadata_command_replica_state(route.pg_id()) {
+                Ok(state) => state,
+                Err(error) => {
+                    note_metadata_command_checkpoint_record_error(route.pg_id(), &error);
+                    summary.failed += 1;
+                    continue;
+                }
+            };
+            if state.cluster_epoch != route.cluster_epoch() {
+                note_metadata_command_checkpoint_record_error(
+                    route.pg_id(),
+                    &StoreError::StaleMetadataCommand {
+                        node_id: primary_node.node_id().as_u32(),
+                        pg_id: route.pg_id().get(),
+                        command_epoch: state.cluster_epoch,
+                        current_epoch: route.cluster_epoch(),
+                    },
+                );
+                summary.failed += 1;
+                continue;
+            }
+            match metadata_client.metadata_command_checkpoint_candidates(
+                route.pg_id(),
+                state.cluster_epoch,
+                state.applied_log_index,
+                1,
+            ) {
+                Ok(candidates)
+                    if candidates.first().is_some_and(|checkpoint| {
+                        checkpoint.applied_log_index == state.applied_log_index
+                            && checkpoint.applied_log_hash == state.applied_log_hash
+                            && checkpoint.state_digest == state.state_digest
+                    }) =>
+                {
+                    summary.already_current += 1;
+                    continue;
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    note_metadata_command_checkpoint_record_error(route.pg_id(), &error);
+                    summary.failed += 1;
+                    continue;
+                }
+            }
+            match metadata_client
+                .record_current_metadata_command_checkpoint(route.pg_id(), state.cluster_epoch)
+            {
+                Ok(_) => summary.recorded += 1,
+                Err(error) => {
+                    note_metadata_command_checkpoint_record_error(route.pg_id(), &error);
+                    summary.failed += 1;
+                }
+            }
+        }
+
+        Ok(summary)
     }
 
     fn metadata_pg_primary_object_listing_client(
@@ -10266,6 +10366,14 @@ fn note_shard_backfill_candidate_error(
     } else {
         summary.failed += 1;
     }
+}
+
+fn note_metadata_command_checkpoint_record_error(pg_id: PgId, error: &StoreError) {
+    let _ = observability::event(
+        TRACE_TARGET,
+        "metadata_command_checkpoint_record_error",
+        Some(format_args!("pg_id={} error={error}", pg_id.get())),
+    );
 }
 
 fn shard_backfill_candidate_error_is_deferred(error: &StoreError) -> bool {

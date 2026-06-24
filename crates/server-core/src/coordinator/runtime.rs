@@ -61,6 +61,7 @@ const BACKGROUND_RECLAIM_CLEANUP_LIMIT: usize = 1;
 const BACKGROUND_LIFECYCLE_CLEANUP_LIMIT: usize = 1;
 const BACKGROUND_STREAM_SESSION_CLEANUP_LIMIT: usize = 1;
 const BACKGROUND_OPPORTUNISTIC_SCAN_LIMIT: usize = 1;
+const BACKGROUND_ROUTINE_METADATA_CHECKPOINT_LIMIT: usize = 1;
 const BACKGROUND_FOREGROUND_PRESSURE_HOLD: Duration = Duration::from_millis(1_000);
 const BACKGROUND_FOREGROUND_PRESSURE_SAMPLE_INTERVAL: Duration = Duration::from_millis(250);
 const BACKGROUND_FOREGROUND_PRESSURE_MAX_SAMPLE_GAP: Duration = Duration::from_millis(1_250);
@@ -76,6 +77,7 @@ enum BackgroundWorkClass {
     LifecycleCleanup,
     StreamSessionCleanup,
     OpportunisticScan,
+    RoutineMetadataCheckpoint,
 }
 
 impl BackgroundWorkClass {
@@ -88,6 +90,7 @@ impl BackgroundWorkClass {
             Self::LifecycleCleanup => "lifecycle_cleanup",
             Self::StreamSessionCleanup => "stream_session_cleanup",
             Self::OpportunisticScan => "opportunistic_scan",
+            Self::RoutineMetadataCheckpoint => "routine_metadata_checkpoint",
         }
     }
 }
@@ -101,6 +104,7 @@ struct BackgroundWorkAdmissionLimits {
     lifecycle_cleanup: usize,
     stream_session_cleanup: usize,
     opportunistic_scan: usize,
+    routine_metadata_checkpoint: usize,
 }
 
 impl Default for BackgroundWorkAdmissionLimits {
@@ -113,6 +117,7 @@ impl Default for BackgroundWorkAdmissionLimits {
             lifecycle_cleanup: BACKGROUND_LIFECYCLE_CLEANUP_LIMIT,
             stream_session_cleanup: BACKGROUND_STREAM_SESSION_CLEANUP_LIMIT,
             opportunistic_scan: BACKGROUND_OPPORTUNISTIC_SCAN_LIMIT,
+            routine_metadata_checkpoint: BACKGROUND_ROUTINE_METADATA_CHECKPOINT_LIMIT,
         }
     }
 }
@@ -128,6 +133,7 @@ struct BackgroundWorkAdmission {
     lifecycle_cleanup_active: AtomicUsize,
     stream_session_cleanup_active: AtomicUsize,
     opportunistic_scan_active: AtomicUsize,
+    routine_metadata_checkpoint_active: AtomicUsize,
 }
 
 #[derive(Debug, Default)]
@@ -166,6 +172,7 @@ impl BackgroundWorkAdmission {
             lifecycle_cleanup_active: AtomicUsize::new(0),
             stream_session_cleanup_active: AtomicUsize::new(0),
             opportunistic_scan_active: AtomicUsize::new(0),
+            routine_metadata_checkpoint_active: AtomicUsize::new(0),
         }
     }
 
@@ -217,7 +224,8 @@ impl BackgroundWorkAdmission {
                     None
                 }
             }
-            BackgroundWorkClass::OpportunisticScan => {
+            BackgroundWorkClass::OpportunisticScan
+            | BackgroundWorkClass::RoutineMetadataCheckpoint => {
                 let pressure = self.observe_pressure();
                 if pressure.foreground {
                     Some("denied_foreground_pressure")
@@ -244,6 +252,9 @@ impl BackgroundWorkAdmission {
             BackgroundWorkClass::LifecycleCleanup => &self.lifecycle_cleanup_active,
             BackgroundWorkClass::StreamSessionCleanup => &self.stream_session_cleanup_active,
             BackgroundWorkClass::OpportunisticScan => &self.opportunistic_scan_active,
+            BackgroundWorkClass::RoutineMetadataCheckpoint => {
+                &self.routine_metadata_checkpoint_active
+            }
         }
     }
 
@@ -256,6 +267,9 @@ impl BackgroundWorkAdmission {
             BackgroundWorkClass::LifecycleCleanup => self.limits.lifecycle_cleanup,
             BackgroundWorkClass::StreamSessionCleanup => self.limits.stream_session_cleanup,
             BackgroundWorkClass::OpportunisticScan => self.limits.opportunistic_scan,
+            BackgroundWorkClass::RoutineMetadataCheckpoint => {
+                self.limits.routine_metadata_checkpoint
+            }
         }
     }
 
@@ -267,6 +281,9 @@ impl BackgroundWorkAdmission {
             + self.lifecycle_cleanup_active.load(Ordering::Acquire)
             + self.stream_session_cleanup_active.load(Ordering::Acquire)
             + self.opportunistic_scan_active.load(Ordering::Acquire)
+            + self
+                .routine_metadata_checkpoint_active
+                .load(Ordering::Acquire)
     }
 
     fn emit(&self, class: BackgroundWorkClass, event: &'static str, elapsed_us: Option<u64>) {
@@ -836,6 +853,34 @@ impl ShardScavengerSweeper {
                                     let _ = observability::emit_shard_backfill_candidate_scan_error(
                                         TRACE_TARGET,
                                         &error,
+                                    );
+                                }
+                            }
+                        }
+                        if let Some(_permit) =
+                            admission.try_acquire(BackgroundWorkClass::RoutineMetadataCheckpoint)
+                        {
+                            match storage_cluster.record_routine_metadata_command_checkpoints() {
+                                Ok(summary) => {
+                                    let _ = observability::event(
+                                        TRACE_TARGET,
+                                        "metadata_command_checkpoint_record_summary",
+                                        Some(format_args!(
+                                            "scanned={} recorded={} already_current={} skipped_inactive={} failed={} limit_reached={}",
+                                            summary.scanned,
+                                            summary.recorded,
+                                            summary.already_current,
+                                            summary.skipped_inactive,
+                                            summary.failed,
+                                            summary.limit_reached
+                                        )),
+                                    );
+                                }
+                                Err(error) => {
+                                    let _ = observability::event(
+                                        TRACE_TARGET,
+                                        "metadata_command_checkpoint_record_scan_error",
+                                        Some(format_args!("error={error}")),
                                     );
                                 }
                             }
@@ -2598,6 +2643,7 @@ mod tests {
                 lifecycle_cleanup: 1,
                 stream_session_cleanup: 1,
                 opportunistic_scan: 0,
+                routine_metadata_checkpoint: 1,
             },
         ));
 
@@ -2638,6 +2684,18 @@ mod tests {
                 .is_none(),
             "second stream session cleanup permit should be denied at limit"
         );
+        assert_eq!(admission.active_total(), 4);
+        let checkpoint_permit = admission
+            .try_acquire(BackgroundWorkClass::RoutineMetadataCheckpoint)
+            .expect("routine metadata checkpoint should have its own class limit");
+        assert!(
+            admission
+                .try_acquire(BackgroundWorkClass::RoutineMetadataCheckpoint)
+                .is_none(),
+            "second routine metadata checkpoint should be denied at limit"
+        );
+        assert_eq!(admission.active_total(), 5);
+        drop(checkpoint_permit);
         assert_eq!(admission.active_total(), 4);
         assert!(
             admission
@@ -2691,6 +2749,7 @@ mod tests {
                 lifecycle_cleanup: 0,
                 stream_session_cleanup: 0,
                 opportunistic_scan: 0,
+                routine_metadata_checkpoint: 1,
             },
         ));
 

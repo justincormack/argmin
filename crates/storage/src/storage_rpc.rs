@@ -567,6 +567,7 @@ pub(crate) enum StorageRpcMessageKind {
     MetadataCommandTransferCheckpointBaseInstall = 149,
     MetadataCommandCheckpointExport = 150,
     MetadataCommandCheckpointCandidates = 151,
+    MetadataCommandCheckpointRecordCurrent = 152,
     MetadataCommandAppliedLogHashes = 25,
     MetadataCommandMatchingAppliedLog = 26,
     MetadataCommandAbandoned = 27,
@@ -792,6 +793,9 @@ impl StorageRpcMessageKind {
             }
             Self::MetadataCommandCheckpointExport => "metadata command checkpoint export",
             Self::MetadataCommandCheckpointCandidates => "metadata command checkpoint candidates",
+            Self::MetadataCommandCheckpointRecordCurrent => {
+                "metadata command checkpoint record current"
+            }
             Self::MetadataCommandAppliedLogHashes => "metadata command applied log hashes",
             Self::MetadataCommandMatchingAppliedLog => "metadata command matching applied log",
             Self::MetadataCommandRetainedLogHashes => "metadata command retained log hashes",
@@ -966,6 +970,7 @@ impl StorageRpcMessageKind {
             149 => Ok(Self::MetadataCommandTransferCheckpointBaseInstall),
             150 => Ok(Self::MetadataCommandCheckpointExport),
             151 => Ok(Self::MetadataCommandCheckpointCandidates),
+            152 => Ok(Self::MetadataCommandCheckpointRecordCurrent),
             25 => Ok(Self::MetadataCommandAppliedLogHashes),
             26 => Ok(Self::MetadataCommandMatchingAppliedLog),
             27 => Ok(Self::MetadataCommandAbandoned),
@@ -3418,7 +3423,8 @@ fn message_kind_request_max_payload_len(
         | StorageRpcMessageKind::MetadataCommandValidateReplayState
         | StorageRpcMessageKind::MetadataCommandValidateReplayStatePreservingPending
         | StorageRpcMessageKind::MetadataCommandReplicaStateCanInitialize
-        | StorageRpcMessageKind::MetadataCommandCheckpointExport => {
+        | StorageRpcMessageKind::MetadataCommandCheckpointExport
+        | StorageRpcMessageKind::MetadataCommandCheckpointRecordCurrent => {
             STORAGE_RPC_MAX_METADATA_COMMAND_STATE_PAYLOAD_LEN
         }
         StorageRpcMessageKind::MetadataCommandCheckpointCandidates => {

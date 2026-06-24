@@ -332,6 +332,81 @@ fn unix_storage_node_client_exports_metadata_command_checkpoint() {
 }
 
 #[test]
+fn unix_storage_node_client_records_current_metadata_command_checkpoint() {
+    let tmp = test_util::tempdir();
+    let config = test_config(&tmp);
+    private_socket_dir(config.socket_path.parent().unwrap());
+    let bucket = crate::tests::bucket_name("unix-metadata-checkpoint-record-current");
+    let expected_state = {
+        let node = SharedStorageNode::open_with_default_ec_shape(
+            &config.data_dir,
+            &config.pg_ids,
+            config.default_ec_shape,
+        )
+        .unwrap();
+        let pg = node.get_pg(0).unwrap();
+        let owner = OwnerIdentity::from_principal("owner");
+        pg.create_bucket_with_config(&CreateBucketConfig {
+            name: bucket.as_str(),
+            owner_principal: &owner.principal,
+            owner_canonical_id: &owner.canonical_id,
+            acl_grants: &s3_types::AclGrants::default(),
+            public_read: false,
+            public_write: false,
+            versioning: s3_types::BucketVersioningState::Disabled,
+            object_lock: s3_types::BucketObjectLockConfig::default(),
+            ownership_controls: crate::BucketOwnershipControls {
+                object_ownership: crate::BucketObjectOwnership::ObjectWriter,
+            },
+        })
+        .unwrap();
+        pg.refresh_metadata_command_state_digest().unwrap();
+        pg.metadata_command_replica_state().unwrap()
+    };
+    let server = StorageNodeServer::bind(config.clone()).unwrap();
+    let server_thread = thread::spawn(move || {
+        server.accept_one().unwrap();
+    });
+    let client = UnixStorageNodeClient::new(
+        config.node_id,
+        config.cluster_epoch,
+        config.socket_path.clone(),
+    );
+
+    let recorded_state = MetadataCommandNodeClient::record_current_metadata_command_checkpoint(
+        &client,
+        PgId::new(0),
+        ClusterEpoch::INITIAL,
+    )
+    .unwrap();
+    server_thread.join().unwrap();
+
+    assert_eq!(recorded_state, expected_state);
+
+    let reopened = SharedStorageNode::open_with_default_ec_shape(
+        &config.data_dir,
+        &config.pg_ids,
+        config.default_ec_shape,
+    )
+    .unwrap();
+    let candidates = reopened
+        .get_pg(0)
+        .unwrap()
+        .metadata_command_checkpoint_candidates(ClusterEpoch::INITIAL, u64::MAX, 1)
+        .unwrap();
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(
+        candidates[0].applied_log_index,
+        expected_state.applied_log_index
+    );
+    assert_eq!(
+        candidates[0].applied_log_hash,
+        expected_state.applied_log_hash
+    );
+    assert_eq!(candidates[0].state_digest, expected_state.state_digest);
+}
+
+#[test]
 fn unix_storage_node_client_lists_metadata_command_checkpoint_candidates() {
     let tmp = test_util::tempdir();
     let config = test_config(&tmp);

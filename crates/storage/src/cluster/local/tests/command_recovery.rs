@@ -2021,7 +2021,8 @@ fn metadata_transfer_export_preserves_source_log_epoch_under_fenced_route() {
     for route in map.pg_routes.values_mut() {
         route.cluster_epoch = fenced_epoch;
     }
-    let cluster = crate::StorageCluster::from_local_map(Arc::new(map)).unwrap();
+    let map = Arc::new(map);
+    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
 
     let artifact = cluster
         .export_pg_metadata_transfer_from_retained_log(pg_id, NodeId::new(0))
@@ -3613,7 +3614,8 @@ fn metadata_transfer_live_checkpoint_fallback_preserves_source_epoch_under_fence
     for route in map.pg_routes.values_mut() {
         route.cluster_epoch = fenced_epoch;
     }
-    let cluster = crate::StorageCluster::from_local_map(Arc::new(map)).unwrap();
+    let map = Arc::new(map);
+    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
 
     let retained_log_err = cluster
         .export_pg_metadata_transfer_from_retained_log(pg_id, NodeId::new(0))
@@ -3695,7 +3697,8 @@ fn metadata_transfer_live_export_prefers_checkpoint_suffix_candidate() {
         .unwrap();
     drop(source_pg);
 
-    let cluster = crate::StorageCluster::from_local_map(Arc::new(map)).unwrap();
+    let map = Arc::new(map);
+    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
     let retained_log_err = cluster
         .export_pg_metadata_transfer_from_retained_log(pg_id, NodeId::new(0))
         .unwrap_err();
@@ -3813,6 +3816,70 @@ fn metadata_transfer_live_export_uses_durable_checkpoint_candidate() {
             source_state.state_digest,
         )
     );
+}
+
+#[test]
+fn routine_metadata_checkpoint_records_current_primary_candidate_once() {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[1], ec_shape).unwrap();
+    let topology = map
+        .node(NodeId::new(0))
+        .unwrap()
+        .storage_node()
+        .pg_topology();
+    let bucket = bucket_for_pg(topology, 1, "routine-metadata-checkpoint-");
+    set_route_primary(&mut map, 1, NodeId::new(0));
+    let pg_id = PgId::new(1);
+    let source_pg = map
+        .node(NodeId::new(0))
+        .unwrap()
+        .storage_node()
+        .get_pg(1)
+        .unwrap();
+    let command = create_bucket_metadata_command(pg_id, 1, bucket);
+    source_pg
+        .apply_metadata_command_and_record(0, &command)
+        .unwrap();
+    let state = source_pg.metadata_command_replica_state().unwrap();
+    drop(source_pg);
+
+    let map = Arc::new(map);
+    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let summary = cluster
+        .record_routine_metadata_command_checkpoints()
+        .unwrap();
+
+    assert_eq!(summary.scanned, 1);
+    assert_eq!(summary.recorded, 1);
+    assert_eq!(summary.already_current, 0);
+    assert_eq!(summary.failed, 0);
+
+    let primary_pg = cluster
+        .local_pg_route(pg_id)
+        .and_then(|route| map.node(route.primary_node_id()))
+        .unwrap()
+        .storage_node()
+        .get_pg(pg_id.get())
+        .unwrap();
+    let candidates = primary_pg
+        .metadata_command_checkpoint_candidates(ClusterEpoch::INITIAL, u64::MAX, 4)
+        .unwrap();
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(candidates[0].applied_log_index, state.applied_log_index);
+    assert_eq!(candidates[0].applied_log_hash, state.applied_log_hash);
+    assert_eq!(candidates[0].state_digest, state.state_digest);
+    drop(primary_pg);
+
+    let summary = cluster
+        .record_routine_metadata_command_checkpoints()
+        .unwrap();
+
+    assert_eq!(summary.scanned, 1);
+    assert_eq!(summary.recorded, 0);
+    assert_eq!(summary.already_current, 1);
+    assert_eq!(summary.failed, 0);
 }
 
 #[test]
