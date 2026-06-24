@@ -8372,6 +8372,10 @@ Metadata PG migration and backfill design notes:
   `metadata-pg-migration-failover` UAT smoke injects failures after fencing,
   after transfer-marker install, and after import, then proves the same live
   migration can resume and complete without re-fencing an already-migrated PG.
+- Added the metadata PG migration failover smoke to the standard local CI
+  script alongside the regular metadata PG migration smoke. The retry/failpoint
+  path is now part of the same UAT gate as the steady-state transfer path,
+  instead of relying on an explicit one-off smoke invocation.
 
 Exit criteria:
 
