@@ -129,6 +129,7 @@ pub struct MetadataCommandCheckpointRecordSummary {
     pub skipped_empty: usize,
     pub skipped_stale_epoch: usize,
     pub compacted: usize,
+    pub compaction_deleted_entries: u64,
     pub compaction_noop: usize,
     pub compaction_no_checkpoint: usize,
     pub compaction_pending: usize,
@@ -10514,8 +10515,13 @@ fn compact_metadata_command_log_for_checkpoint_record(
         }) => {
             summary.compaction_noop += 1;
         }
-        Ok(MetadataCommandLogCompactionStatus::Compacted { .. }) => {
+        Ok(MetadataCommandLogCompactionStatus::Compacted {
+            deleted_entries, ..
+        }) => {
             summary.compacted += 1;
+            summary.compaction_deleted_entries = summary
+                .compaction_deleted_entries
+                .saturating_add(deleted_entries);
         }
         Err(error) => {
             if metadata_command_checkpoint_record_error_is_stale(&error) {

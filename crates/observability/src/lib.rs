@@ -160,6 +160,8 @@ static METADATA_COMMAND_CHECKPOINT_RECORD_SKIPPED_INACTIVE_TOTAL: AtomicU64 = At
 static METADATA_COMMAND_CHECKPOINT_RECORD_SKIPPED_EMPTY_TOTAL: AtomicU64 = AtomicU64::new(0);
 static METADATA_COMMAND_CHECKPOINT_RECORD_SKIPPED_STALE_EPOCH_TOTAL: AtomicU64 = AtomicU64::new(0);
 static METADATA_COMMAND_CHECKPOINT_RECORD_COMPACTED_TOTAL: AtomicU64 = AtomicU64::new(0);
+static METADATA_COMMAND_CHECKPOINT_RECORD_COMPACTION_DELETED_ENTRIES_TOTAL: AtomicU64 =
+    AtomicU64::new(0);
 static METADATA_COMMAND_CHECKPOINT_RECORD_COMPACTION_NOOP_TOTAL: AtomicU64 = AtomicU64::new(0);
 static METADATA_COMMAND_CHECKPOINT_RECORD_COMPACTION_NO_CHECKPOINT_TOTAL: AtomicU64 =
     AtomicU64::new(0);
@@ -1381,6 +1383,7 @@ pub struct MetadataCommandCheckpointRecordSummary {
     pub skipped_empty: usize,
     pub skipped_stale_epoch: usize,
     pub compacted: usize,
+    pub compaction_deleted_entries: u64,
     pub compaction_noop: usize,
     pub compaction_no_checkpoint: usize,
     pub compaction_pending: usize,
@@ -1512,6 +1515,7 @@ pub struct MetricsSnapshot {
     pub metadata_command_checkpoint_record_skipped_empty_total: u64,
     pub metadata_command_checkpoint_record_skipped_stale_epoch_total: u64,
     pub metadata_command_checkpoint_record_compacted_total: u64,
+    pub metadata_command_checkpoint_record_compaction_deleted_entries_total: u64,
     pub metadata_command_checkpoint_record_compaction_noop_total: u64,
     pub metadata_command_checkpoint_record_compaction_no_checkpoint_total: u64,
     pub metadata_command_checkpoint_record_compaction_pending_total: u64,
@@ -1822,6 +1826,9 @@ pub fn metrics_snapshot() -> MetricsSnapshot {
             METADATA_COMMAND_CHECKPOINT_RECORD_SKIPPED_STALE_EPOCH_TOTAL.load(Ordering::Relaxed),
         metadata_command_checkpoint_record_compacted_total:
             METADATA_COMMAND_CHECKPOINT_RECORD_COMPACTED_TOTAL.load(Ordering::Relaxed),
+        metadata_command_checkpoint_record_compaction_deleted_entries_total:
+            METADATA_COMMAND_CHECKPOINT_RECORD_COMPACTION_DELETED_ENTRIES_TOTAL
+                .load(Ordering::Relaxed),
         metadata_command_checkpoint_record_compaction_noop_total:
             METADATA_COMMAND_CHECKPOINT_RECORD_COMPACTION_NOOP_TOTAL.load(Ordering::Relaxed),
         metadata_command_checkpoint_record_compaction_no_checkpoint_total:
@@ -2894,6 +2901,8 @@ pub fn emit_metadata_command_checkpoint_record_scan(
         .fetch_add(summary.skipped_stale_epoch as u64, Ordering::Relaxed);
     METADATA_COMMAND_CHECKPOINT_RECORD_COMPACTED_TOTAL
         .fetch_add(summary.compacted as u64, Ordering::Relaxed);
+    METADATA_COMMAND_CHECKPOINT_RECORD_COMPACTION_DELETED_ENTRIES_TOTAL
+        .fetch_add(summary.compaction_deleted_entries, Ordering::Relaxed);
     METADATA_COMMAND_CHECKPOINT_RECORD_COMPACTION_NOOP_TOTAL
         .fetch_add(summary.compaction_noop as u64, Ordering::Relaxed);
     METADATA_COMMAND_CHECKPOINT_RECORD_COMPACTION_NO_CHECKPOINT_TOTAL
@@ -2911,7 +2920,7 @@ pub fn emit_metadata_command_checkpoint_record_scan(
         return false;
     };
     let detail = format!(
-        "scanned={} recorded={} already_current={} skipped_cadence={} skipped_inactive={} skipped_empty={} skipped_stale_epoch={} compacted={} compaction_noop={} compaction_no_checkpoint={} compaction_pending={} compaction_failed={} failed={} limit_reached={}",
+        "scanned={} recorded={} already_current={} skipped_cadence={} skipped_inactive={} skipped_empty={} skipped_stale_epoch={} compacted={} compaction_deleted_entries={} compaction_noop={} compaction_no_checkpoint={} compaction_pending={} compaction_failed={} failed={} limit_reached={}",
         summary.scanned,
         summary.recorded,
         summary.already_current,
@@ -2920,6 +2929,7 @@ pub fn emit_metadata_command_checkpoint_record_scan(
         summary.skipped_empty,
         summary.skipped_stale_epoch,
         summary.compacted,
+        summary.compaction_deleted_entries,
         summary.compaction_noop,
         summary.compaction_no_checkpoint,
         summary.compaction_pending,
@@ -3756,6 +3766,7 @@ mod tests {
                 skipped_empty: 12,
                 skipped_stale_epoch: 11,
                 compacted: 6,
+                compaction_deleted_entries: 13,
                 compaction_noop: 7,
                 compaction_no_checkpoint: 8,
                 compaction_pending: 9,
@@ -4156,6 +4167,10 @@ mod tests {
         assert_eq!(
             after.metadata_command_checkpoint_record_compacted_total,
             before.metadata_command_checkpoint_record_compacted_total + 6
+        );
+        assert_eq!(
+            after.metadata_command_checkpoint_record_compaction_deleted_entries_total,
+            before.metadata_command_checkpoint_record_compaction_deleted_entries_total + 13
         );
         assert_eq!(
             after.metadata_command_checkpoint_record_compaction_noop_total,

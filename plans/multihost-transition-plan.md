@@ -8333,6 +8333,12 @@ Metadata PG migration and backfill design notes:
   reshuffles. Remaining retention work is to tune when to keep extra retained-
   log suffixes or longer-lived historical checkpoint candidates for operational
   rollback/diagnostics rather than immediate pruning.
+- Added compaction-volume observability for metadata command-log retention.
+  Routine checkpoint/compaction scans now report both the number of successful
+  compaction operations and the total retained command-log entries deleted by
+  those operations. The debug metrics endpoint and UAT summaries expose this as
+  a separate counter so retention cadence can be judged by actual log shrinkage,
+  not just by whether a compaction path ran.
 
 Exit criteria:
 

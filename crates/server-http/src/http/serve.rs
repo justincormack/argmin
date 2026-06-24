@@ -1120,6 +1120,7 @@ fn local_debug_metrics_body(state: &Arc<ServerState>) -> String {
             "metadata_command_checkpoint_record_skipped_empty_total {}\n",
             "metadata_command_checkpoint_record_skipped_stale_epoch_total {}\n",
             "metadata_command_checkpoint_record_compacted_total {}\n",
+            "metadata_command_checkpoint_record_compaction_deleted_entries_total {}\n",
             "metadata_command_checkpoint_record_compaction_noop_total {}\n",
             "metadata_command_checkpoint_record_compaction_no_checkpoint_total {}\n",
             "metadata_command_checkpoint_record_compaction_pending_total {}\n",
@@ -1222,6 +1223,7 @@ fn local_debug_metrics_body(state: &Arc<ServerState>) -> String {
         snapshot.metadata_command_checkpoint_record_skipped_empty_total,
         snapshot.metadata_command_checkpoint_record_skipped_stale_epoch_total,
         snapshot.metadata_command_checkpoint_record_compacted_total,
+        snapshot.metadata_command_checkpoint_record_compaction_deleted_entries_total,
         snapshot.metadata_command_checkpoint_record_compaction_noop_total,
         snapshot.metadata_command_checkpoint_record_compaction_no_checkpoint_total,
         snapshot.metadata_command_checkpoint_record_compaction_pending_total,
@@ -4736,6 +4738,8 @@ mod tests {
         assert!(response.contains("metadata_command_checkpoint_record_skipped_empty_total "));
         assert!(response.contains("metadata_command_checkpoint_record_skipped_stale_epoch_total "));
         assert!(response.contains("metadata_command_checkpoint_record_compacted_total "));
+        assert!(response
+            .contains("metadata_command_checkpoint_record_compaction_deleted_entries_total "));
         assert!(response.contains("metadata_command_checkpoint_record_compaction_noop_total "));
         assert!(
             response.contains("metadata_command_checkpoint_record_compaction_no_checkpoint_total ")

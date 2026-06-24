@@ -873,6 +873,8 @@ impl ShardScavengerSweeper {
                                             skipped_empty: summary.skipped_empty,
                                             skipped_stale_epoch: summary.skipped_stale_epoch,
                                             compacted: summary.compacted,
+                                            compaction_deleted_entries: summary
+                                                .compaction_deleted_entries,
                                             compaction_noop: summary.compaction_noop,
                                             compaction_no_checkpoint: summary
                                                 .compaction_no_checkpoint,

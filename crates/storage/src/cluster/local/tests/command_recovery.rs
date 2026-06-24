@@ -3856,6 +3856,7 @@ fn routine_metadata_checkpoint_records_current_primary_candidate_once() {
     assert_eq!(summary.recorded, 1);
     assert_eq!(summary.already_current, 0);
     assert_eq!(summary.compacted, 1);
+    assert_eq!(summary.compaction_deleted_entries, 1);
     assert_eq!(summary.failed, 0);
 
     let primary_pg = cluster
@@ -3892,6 +3893,7 @@ fn routine_metadata_checkpoint_records_current_primary_candidate_once() {
     assert_eq!(summary.recorded, 0);
     assert_eq!(summary.already_current, 1);
     assert_eq!(summary.compaction_noop, 1);
+    assert_eq!(summary.compaction_deleted_entries, 0);
     assert_eq!(summary.failed, 0);
 
     let primary_pg = map
@@ -3937,6 +3939,7 @@ fn routine_metadata_checkpoint_records_current_primary_candidate_once() {
     assert_eq!(summary.already_current, 0);
     assert_eq!(summary.skipped_cadence, 1);
     assert_eq!(summary.compaction_noop, 1);
+    assert_eq!(summary.compaction_deleted_entries, 0);
     assert_eq!(summary.failed, 0);
 }
 
