@@ -862,26 +862,24 @@ impl ShardScavengerSweeper {
                         {
                             match storage_cluster.record_routine_metadata_command_checkpoints() {
                                 Ok(summary) => {
-                                    let _ = observability::event(
+                                    let _ = observability::emit_metadata_command_checkpoint_record_scan(
                                         TRACE_TARGET,
-                                        "metadata_command_checkpoint_record_summary",
-                                        Some(format_args!(
-                                            "scanned={} recorded={} already_current={} skipped_inactive={} failed={} limit_reached={}",
-                                            summary.scanned,
-                                            summary.recorded,
-                                            summary.already_current,
-                                            summary.skipped_inactive,
-                                            summary.failed,
-                                            summary.limit_reached
-                                        )),
+                                        observability::MetadataCommandCheckpointRecordSummary {
+                                            scanned: summary.scanned,
+                                            recorded: summary.recorded,
+                                            already_current: summary.already_current,
+                                            skipped_inactive: summary.skipped_inactive,
+                                            failed: summary.failed,
+                                            limit_reached: summary.limit_reached,
+                                        },
                                     );
                                 }
                                 Err(error) => {
-                                    let _ = observability::event(
-                                        TRACE_TARGET,
-                                        "metadata_command_checkpoint_record_scan_error",
-                                        Some(format_args!("error={error}")),
-                                    );
+                                    let _ =
+                                        observability::emit_metadata_command_checkpoint_record_scan_error(
+                                            TRACE_TARGET,
+                                            &error,
+                                        );
                                 }
                             }
                         }

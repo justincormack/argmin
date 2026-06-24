@@ -151,6 +151,14 @@ static SHARD_BACKFILL_CANDIDATE_DEFERRED_TOTAL: AtomicU64 = AtomicU64::new(0);
 static SHARD_BACKFILL_CANDIDATE_FAILED_TOTAL: AtomicU64 = AtomicU64::new(0);
 static SHARD_BACKFILL_CANDIDATE_LIMIT_REACHED_TOTAL: AtomicU64 = AtomicU64::new(0);
 static SHARD_BACKFILL_CANDIDATE_SCAN_ERROR_TOTAL: AtomicU64 = AtomicU64::new(0);
+static METADATA_COMMAND_CHECKPOINT_RECORD_SCAN_TOTAL: AtomicU64 = AtomicU64::new(0);
+static METADATA_COMMAND_CHECKPOINT_RECORD_SCANNED_TOTAL: AtomicU64 = AtomicU64::new(0);
+static METADATA_COMMAND_CHECKPOINT_RECORD_RECORDED_TOTAL: AtomicU64 = AtomicU64::new(0);
+static METADATA_COMMAND_CHECKPOINT_RECORD_ALREADY_CURRENT_TOTAL: AtomicU64 = AtomicU64::new(0);
+static METADATA_COMMAND_CHECKPOINT_RECORD_SKIPPED_INACTIVE_TOTAL: AtomicU64 = AtomicU64::new(0);
+static METADATA_COMMAND_CHECKPOINT_RECORD_FAILED_TOTAL: AtomicU64 = AtomicU64::new(0);
+static METADATA_COMMAND_CHECKPOINT_RECORD_LIMIT_REACHED_TOTAL: AtomicU64 = AtomicU64::new(0);
+static METADATA_COMMAND_CHECKPOINT_RECORD_SCAN_ERROR_TOTAL: AtomicU64 = AtomicU64::new(0);
 static BACKGROUND_WORK_ADMISSION_EVENT_TOTAL: AtomicU64 = AtomicU64::new(0);
 static BACKGROUND_WORK_ACTIVE_TOTAL: AtomicU64 = AtomicU64::new(0);
 static BACKGROUND_WORK_FINISHED_TOTAL: AtomicU64 = AtomicU64::new(0);
@@ -1355,6 +1363,16 @@ pub struct ShardBackfillCandidateScanSummary {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MetadataCommandCheckpointRecordSummary {
+    pub scanned: usize,
+    pub recorded: usize,
+    pub already_current: usize,
+    pub skipped_inactive: usize,
+    pub failed: usize,
+    pub limit_reached: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BackgroundWorkAdmissionSummary {
     pub class: &'static str,
     pub event: &'static str,
@@ -1468,6 +1486,14 @@ pub struct MetricsSnapshot {
     pub shard_backfill_candidate_failed_total: u64,
     pub shard_backfill_candidate_limit_reached_total: u64,
     pub shard_backfill_candidate_scan_error_total: u64,
+    pub metadata_command_checkpoint_record_scan_total: u64,
+    pub metadata_command_checkpoint_record_scanned_total: u64,
+    pub metadata_command_checkpoint_record_recorded_total: u64,
+    pub metadata_command_checkpoint_record_already_current_total: u64,
+    pub metadata_command_checkpoint_record_skipped_inactive_total: u64,
+    pub metadata_command_checkpoint_record_failed_total: u64,
+    pub metadata_command_checkpoint_record_limit_reached_total: u64,
+    pub metadata_command_checkpoint_record_scan_error_total: u64,
     pub background_work_admission_event_total: u64,
     pub background_work_active_total: u64,
     pub background_work_finished_total: u64,
@@ -1753,6 +1779,22 @@ pub fn metrics_snapshot() -> MetricsSnapshot {
             .load(Ordering::Relaxed),
         shard_backfill_candidate_scan_error_total: SHARD_BACKFILL_CANDIDATE_SCAN_ERROR_TOTAL
             .load(Ordering::Relaxed),
+        metadata_command_checkpoint_record_scan_total:
+            METADATA_COMMAND_CHECKPOINT_RECORD_SCAN_TOTAL.load(Ordering::Relaxed),
+        metadata_command_checkpoint_record_scanned_total:
+            METADATA_COMMAND_CHECKPOINT_RECORD_SCANNED_TOTAL.load(Ordering::Relaxed),
+        metadata_command_checkpoint_record_recorded_total:
+            METADATA_COMMAND_CHECKPOINT_RECORD_RECORDED_TOTAL.load(Ordering::Relaxed),
+        metadata_command_checkpoint_record_already_current_total:
+            METADATA_COMMAND_CHECKPOINT_RECORD_ALREADY_CURRENT_TOTAL.load(Ordering::Relaxed),
+        metadata_command_checkpoint_record_skipped_inactive_total:
+            METADATA_COMMAND_CHECKPOINT_RECORD_SKIPPED_INACTIVE_TOTAL.load(Ordering::Relaxed),
+        metadata_command_checkpoint_record_failed_total:
+            METADATA_COMMAND_CHECKPOINT_RECORD_FAILED_TOTAL.load(Ordering::Relaxed),
+        metadata_command_checkpoint_record_limit_reached_total:
+            METADATA_COMMAND_CHECKPOINT_RECORD_LIMIT_REACHED_TOTAL.load(Ordering::Relaxed),
+        metadata_command_checkpoint_record_scan_error_total:
+            METADATA_COMMAND_CHECKPOINT_RECORD_SCAN_ERROR_TOTAL.load(Ordering::Relaxed),
         background_work_admission_event_total: BACKGROUND_WORK_ADMISSION_EVENT_TOTAL
             .load(Ordering::Relaxed),
         background_work_active_total: BACKGROUND_WORK_ACTIVE_TOTAL.load(Ordering::Relaxed),
@@ -2789,6 +2831,74 @@ pub fn emit_shard_backfill_candidate_scan_error(
     )
 }
 
+pub fn emit_metadata_command_checkpoint_record_scan(
+    target: &'static str,
+    summary: MetadataCommandCheckpointRecordSummary,
+) -> bool {
+    METADATA_COMMAND_CHECKPOINT_RECORD_SCAN_TOTAL.fetch_add(1, Ordering::Relaxed);
+    METADATA_COMMAND_CHECKPOINT_RECORD_SCANNED_TOTAL
+        .fetch_add(summary.scanned as u64, Ordering::Relaxed);
+    METADATA_COMMAND_CHECKPOINT_RECORD_RECORDED_TOTAL
+        .fetch_add(summary.recorded as u64, Ordering::Relaxed);
+    METADATA_COMMAND_CHECKPOINT_RECORD_ALREADY_CURRENT_TOTAL
+        .fetch_add(summary.already_current as u64, Ordering::Relaxed);
+    METADATA_COMMAND_CHECKPOINT_RECORD_SKIPPED_INACTIVE_TOTAL
+        .fetch_add(summary.skipped_inactive as u64, Ordering::Relaxed);
+    METADATA_COMMAND_CHECKPOINT_RECORD_FAILED_TOTAL
+        .fetch_add(summary.failed as u64, Ordering::Relaxed);
+    if summary.limit_reached {
+        METADATA_COMMAND_CHECKPOINT_RECORD_LIMIT_REACHED_TOTAL.fetch_add(1, Ordering::Relaxed);
+    }
+    let Some(context) = current_context() else {
+        return false;
+    };
+    let detail = format!(
+        "scanned={} recorded={} already_current={} skipped_inactive={} failed={} limit_reached={}",
+        summary.scanned,
+        summary.recorded,
+        summary.already_current,
+        summary.skipped_inactive,
+        summary.failed,
+        summary.limit_reached,
+    );
+    record_flight_event(
+        &context,
+        target,
+        "metadata_command_checkpoint_record_scan",
+        detail.clone(),
+    );
+    event_in_context(
+        &context,
+        target,
+        "metadata_command_checkpoint_record_scan",
+        Some(format_args!("{detail}")),
+    )
+}
+
+pub fn emit_metadata_command_checkpoint_record_scan_error(
+    target: &'static str,
+    error: &impl fmt::Display,
+) -> bool {
+    METADATA_COMMAND_CHECKPOINT_RECORD_SCAN_TOTAL.fetch_add(1, Ordering::Relaxed);
+    METADATA_COMMAND_CHECKPOINT_RECORD_SCAN_ERROR_TOTAL.fetch_add(1, Ordering::Relaxed);
+    let Some(context) = current_context() else {
+        return false;
+    };
+    let detail = truncate_detail(format!("error={error}"));
+    record_flight_event(
+        &context,
+        target,
+        "metadata_command_checkpoint_record_scan_error",
+        detail.clone(),
+    );
+    event_in_context(
+        &context,
+        target,
+        "metadata_command_checkpoint_record_scan_error",
+        Some(format_args!("{detail}")),
+    )
+}
+
 pub fn emit_background_work_admission_event(
     target: &'static str,
     summary: BackgroundWorkAdmissionSummary,
@@ -3569,6 +3679,18 @@ mod tests {
             },
         );
         emit_shard_backfill_candidate_scan_error("storage", &"scanner unavailable");
+        emit_metadata_command_checkpoint_record_scan(
+            "storage",
+            MetadataCommandCheckpointRecordSummary {
+                scanned: 11,
+                recorded: 3,
+                already_current: 4,
+                skipped_inactive: 2,
+                failed: 1,
+                limit_reached: true,
+            },
+        );
+        emit_metadata_command_checkpoint_record_scan_error("storage", &"checkpoint unavailable");
         emit_background_work_admission_event(
             "storage",
             BackgroundWorkAdmissionSummary {
@@ -3924,6 +4046,38 @@ mod tests {
         assert_eq!(
             after.shard_backfill_candidate_scan_error_total,
             before.shard_backfill_candidate_scan_error_total + 1
+        );
+        assert_eq!(
+            after.metadata_command_checkpoint_record_scan_total,
+            before.metadata_command_checkpoint_record_scan_total + 2
+        );
+        assert_eq!(
+            after.metadata_command_checkpoint_record_scanned_total,
+            before.metadata_command_checkpoint_record_scanned_total + 11
+        );
+        assert_eq!(
+            after.metadata_command_checkpoint_record_recorded_total,
+            before.metadata_command_checkpoint_record_recorded_total + 3
+        );
+        assert_eq!(
+            after.metadata_command_checkpoint_record_already_current_total,
+            before.metadata_command_checkpoint_record_already_current_total + 4
+        );
+        assert_eq!(
+            after.metadata_command_checkpoint_record_skipped_inactive_total,
+            before.metadata_command_checkpoint_record_skipped_inactive_total + 2
+        );
+        assert_eq!(
+            after.metadata_command_checkpoint_record_failed_total,
+            before.metadata_command_checkpoint_record_failed_total + 1
+        );
+        assert_eq!(
+            after.metadata_command_checkpoint_record_limit_reached_total,
+            before.metadata_command_checkpoint_record_limit_reached_total + 1
+        );
+        assert_eq!(
+            after.metadata_command_checkpoint_record_scan_error_total,
+            before.metadata_command_checkpoint_record_scan_error_total + 1
         );
         assert_eq!(
             after.background_work_admission_event_total,

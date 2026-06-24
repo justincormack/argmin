@@ -8300,9 +8300,13 @@ Metadata PG migration and backfill design notes:
   The record-current RPC returns only the checkpoint proof/state identity, not
   the full checkpoint payload, so a large checkpoint can be durably recorded
   without a post-mutation `ResourceExhausted` response failure. This gives
-  long-lived PGs natural transfer bases before reshuffles. Later tuning still
-  needs an explicit checkpoint cadence/retention policy and UAT signal for
-  checkpoint creation volume.
+  long-lived PGs natural transfer bases before reshuffles.
+- Added checkpoint-recording observability for the routine scheduler. The
+  debug metrics endpoint and UAT summaries now expose checkpoint record scan
+  attempts, PGs scanned, newly recorded candidates, already-current skips,
+  inactive skips, record failures, scan errors, and limit hits, alongside the
+  `routine_metadata_checkpoint` background-work admission class. Later tuning
+  still needs an explicit checkpoint cadence/retention policy.
 
 Exit criteria:
 

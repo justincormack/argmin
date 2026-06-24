@@ -1111,6 +1111,14 @@ fn local_debug_metrics_body(state: &Arc<ServerState>) -> String {
             "shard_backfill_candidate_failed_total {}\n",
             "shard_backfill_candidate_limit_reached_total {}\n",
             "shard_backfill_candidate_scan_error_total {}\n",
+            "metadata_command_checkpoint_record_scan_total {}\n",
+            "metadata_command_checkpoint_record_scanned_total {}\n",
+            "metadata_command_checkpoint_record_recorded_total {}\n",
+            "metadata_command_checkpoint_record_already_current_total {}\n",
+            "metadata_command_checkpoint_record_skipped_inactive_total {}\n",
+            "metadata_command_checkpoint_record_failed_total {}\n",
+            "metadata_command_checkpoint_record_limit_reached_total {}\n",
+            "metadata_command_checkpoint_record_scan_error_total {}\n",
             "background_work_admission_event_total {}\n",
             "background_work_active_total {}\n",
             "background_work_finished_total {}\n",
@@ -1197,6 +1205,14 @@ fn local_debug_metrics_body(state: &Arc<ServerState>) -> String {
         snapshot.shard_backfill_candidate_failed_total,
         snapshot.shard_backfill_candidate_limit_reached_total,
         snapshot.shard_backfill_candidate_scan_error_total,
+        snapshot.metadata_command_checkpoint_record_scan_total,
+        snapshot.metadata_command_checkpoint_record_scanned_total,
+        snapshot.metadata_command_checkpoint_record_recorded_total,
+        snapshot.metadata_command_checkpoint_record_already_current_total,
+        snapshot.metadata_command_checkpoint_record_skipped_inactive_total,
+        snapshot.metadata_command_checkpoint_record_failed_total,
+        snapshot.metadata_command_checkpoint_record_limit_reached_total,
+        snapshot.metadata_command_checkpoint_record_scan_error_total,
         snapshot.background_work_admission_event_total,
         snapshot.background_work_active_total,
         snapshot.background_work_finished_total,
@@ -4695,6 +4711,14 @@ mod tests {
         assert!(response.contains("shard_backfill_candidate_failed_total "));
         assert!(response.contains("shard_backfill_candidate_limit_reached_total "));
         assert!(response.contains("shard_backfill_candidate_scan_error_total "));
+        assert!(response.contains("metadata_command_checkpoint_record_scan_total "));
+        assert!(response.contains("metadata_command_checkpoint_record_scanned_total "));
+        assert!(response.contains("metadata_command_checkpoint_record_recorded_total "));
+        assert!(response.contains("metadata_command_checkpoint_record_already_current_total "));
+        assert!(response.contains("metadata_command_checkpoint_record_skipped_inactive_total "));
+        assert!(response.contains("metadata_command_checkpoint_record_failed_total "));
+        assert!(response.contains("metadata_command_checkpoint_record_limit_reached_total "));
+        assert!(response.contains("metadata_command_checkpoint_record_scan_error_total "));
         assert!(response.contains("request_admission_wait_total "));
         assert!(response.contains("request_admission_timeout_total "));
         assert!(!response.contains("bucket_lock_wait_exceeded_total "));
