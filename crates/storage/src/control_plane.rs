@@ -7518,6 +7518,63 @@ mod tests {
     }
 
     #[test]
+    fn cluster_map_history_pruning_preserves_durable_backfill_reference_floor() {
+        let tmp = test_util::tempdir();
+        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store.clone()).unwrap();
+        authority
+            .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
+            .unwrap();
+        authority
+            .set_pg_acting_set(PgId::new(1), vec![NodeId::new(1)])
+            .unwrap();
+        assert!(heartbeat_until_serving(&mut authority, 1, 10_000).serving());
+        let protected_epoch = authority.snapshot().cluster_epoch();
+        let mut floor_heartbeat = heartbeat_from_record(&authority, 1, protected_epoch, 10_100);
+        floor_heartbeat.cluster_map_history_reference_summary =
+            PgClusterMapHistoryReferenceSummary {
+                oldest_live_placement_epoch: None,
+                oldest_durable_backfill_epoch: Some(protected_epoch),
+            };
+        assert!(authority
+            .heartbeat(floor_heartbeat, 10_100)
+            .unwrap()
+            .serving());
+
+        for node_id in 10..(10 + CLUSTER_MAP_HISTORY_LIMIT as u32 + 8) {
+            authority
+                .set_node_membership(NodeId::new(node_id), NodeMembershipState::Active)
+                .unwrap();
+        }
+
+        assert!(authority
+            .snapshot()
+            .cluster_map_at_epoch(protected_epoch)
+            .is_some());
+        assert_eq!(
+            authority
+                .snapshot()
+                .node(NodeId::new(1))
+                .unwrap()
+                .cluster_map_history_floor_epoch(),
+            Some(protected_epoch)
+        );
+        let persisted = SingleAuthorityControlPlane::open(store).unwrap();
+        assert!(persisted
+            .snapshot()
+            .cluster_map_at_epoch(protected_epoch)
+            .is_some());
+        assert_eq!(
+            persisted
+                .snapshot()
+                .node(NodeId::new(1))
+                .unwrap()
+                .cluster_map_history_floor_epoch(),
+            Some(protected_epoch)
+        );
+    }
+
+    #[test]
     fn heartbeat_rejects_unretained_storage_history_floor_before_persisting() {
         let tmp = test_util::tempdir();
         let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));

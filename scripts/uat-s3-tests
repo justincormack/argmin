@@ -455,6 +455,13 @@ kill_control_plane() {
     done
 }
 
+restart_control_plane() {
+    echo "== argmin-s3 UAT restart control-plane =="
+    kill_control_plane
+    start_control_plane
+    wait_for_control_plane_socket
+}
+
 set_pg_acting_set() {
     local label="$1"
     local pg_id="$2"
@@ -1741,6 +1748,13 @@ run_pg_backfill_migration_smoke() {
         wait_for_control_plane_storage_history_floor_nodes 20 "$old_placement_floor_max_epoch" "${old_floor_nodes_needing_signal[@]}"
     else
         echo "== argmin-s3 UAT control-plane storage history floors: old acting nodes already retained epoch <= $old_placement_floor_max_epoch before current object =="
+    fi
+    if ((iteration == 1)); then
+        restart_control_plane
+        wait_for_control_plane_runtime_map_ready 10
+        wait_for_control_plane_node_epochs_aligned 10 "$control_plane_runtime_map_ready_epoch"
+        wait_for_target_pg_runtime_installed "$data_pg" "0:2" 10 "$metrics_path"
+        wait_for_control_plane_storage_history_floor_nodes 20 "$old_placement_floor_max_epoch" 0 1
     fi
     max_candidate_failed="$(latest_metric_sample_value "$metrics_path" shard_backfill_candidate_failed_total)"
     max_scan_error="$(latest_metric_sample_value "$metrics_path" shard_backfill_candidate_scan_error_total)"

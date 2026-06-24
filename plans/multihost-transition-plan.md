@@ -8424,7 +8424,10 @@ Metadata PG migration and backfill design notes:
   iterations snapshot the pre-object floor and only require a new floor signal
   for old acting-set nodes that were not already retaining a sufficiently old
   epoch; current-iteration backfill is still pinned separately by per-data-PG
-  completion metrics.
+  completion metrics. The first iteration also restarts the control-plane
+  manager after the floor is reported, waits for the target PG/runtime map to
+  become serving again, and re-checks the per-node floors before historical
+  reads so the smoke proves the persisted floor survives control-plane reload.
 
 Exit criteria:
 
