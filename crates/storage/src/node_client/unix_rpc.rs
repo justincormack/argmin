@@ -1654,6 +1654,29 @@ impl UnixStorageNodeClient {
             })
     }
 
+    pub(crate) fn compact_metadata_command_log(
+        &self,
+        pg_id: PgId,
+        cluster_epoch: ClusterEpoch,
+    ) -> Result<MetadataCommandLogCompactionStatus, StoreError> {
+        let request = StorageRpcMetadataCommandStateRequest {
+            node_id: self.node_id,
+            cluster_epoch,
+            pg_id,
+        };
+        let payload = encode_metadata_command_state_request(&request);
+        let response =
+            self.rpc_request(StorageRpcMessageKind::MetadataCommandLogCompact, payload)?;
+        decode_metadata_command_log_compact_response(&response)
+            .map(|response| response.status)
+            .map_err(|error| {
+                self.rpc_payload_error(
+                    "decode metadata command log compact response",
+                    error.to_string(),
+                )
+            })
+    }
+
     pub(crate) fn max_metadata_command_log_index(&self, pg_id: PgId) -> Result<u64, StoreError> {
         let payload = self.encode_metadata_command_state_request(pg_id);
         let response =
@@ -2807,6 +2830,14 @@ impl MetadataCommandNodeClient for UnixStorageNodeClient {
             max_applied_log_index,
             limit,
         )
+    }
+
+    fn compact_metadata_command_log(
+        &self,
+        pg_id: PgId,
+        cluster_epoch: ClusterEpoch,
+    ) -> Result<MetadataCommandLogCompactionStatus, StoreError> {
+        UnixStorageNodeClient::compact_metadata_command_log(self, pg_id, cluster_epoch)
     }
 
     fn validate_metadata_command_replay_state(

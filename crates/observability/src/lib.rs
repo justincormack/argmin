@@ -157,6 +157,14 @@ static METADATA_COMMAND_CHECKPOINT_RECORD_RECORDED_TOTAL: AtomicU64 = AtomicU64:
 static METADATA_COMMAND_CHECKPOINT_RECORD_ALREADY_CURRENT_TOTAL: AtomicU64 = AtomicU64::new(0);
 static METADATA_COMMAND_CHECKPOINT_RECORD_SKIPPED_CADENCE_TOTAL: AtomicU64 = AtomicU64::new(0);
 static METADATA_COMMAND_CHECKPOINT_RECORD_SKIPPED_INACTIVE_TOTAL: AtomicU64 = AtomicU64::new(0);
+static METADATA_COMMAND_CHECKPOINT_RECORD_SKIPPED_EMPTY_TOTAL: AtomicU64 = AtomicU64::new(0);
+static METADATA_COMMAND_CHECKPOINT_RECORD_SKIPPED_STALE_EPOCH_TOTAL: AtomicU64 = AtomicU64::new(0);
+static METADATA_COMMAND_CHECKPOINT_RECORD_COMPACTED_TOTAL: AtomicU64 = AtomicU64::new(0);
+static METADATA_COMMAND_CHECKPOINT_RECORD_COMPACTION_NOOP_TOTAL: AtomicU64 = AtomicU64::new(0);
+static METADATA_COMMAND_CHECKPOINT_RECORD_COMPACTION_NO_CHECKPOINT_TOTAL: AtomicU64 =
+    AtomicU64::new(0);
+static METADATA_COMMAND_CHECKPOINT_RECORD_COMPACTION_PENDING_TOTAL: AtomicU64 = AtomicU64::new(0);
+static METADATA_COMMAND_CHECKPOINT_RECORD_COMPACTION_FAILED_TOTAL: AtomicU64 = AtomicU64::new(0);
 static METADATA_COMMAND_CHECKPOINT_RECORD_FAILED_TOTAL: AtomicU64 = AtomicU64::new(0);
 static METADATA_COMMAND_CHECKPOINT_RECORD_LIMIT_REACHED_TOTAL: AtomicU64 = AtomicU64::new(0);
 static METADATA_COMMAND_CHECKPOINT_RECORD_SCAN_ERROR_TOTAL: AtomicU64 = AtomicU64::new(0);
@@ -1370,6 +1378,13 @@ pub struct MetadataCommandCheckpointRecordSummary {
     pub already_current: usize,
     pub skipped_cadence: usize,
     pub skipped_inactive: usize,
+    pub skipped_empty: usize,
+    pub skipped_stale_epoch: usize,
+    pub compacted: usize,
+    pub compaction_noop: usize,
+    pub compaction_no_checkpoint: usize,
+    pub compaction_pending: usize,
+    pub compaction_failed: usize,
     pub failed: usize,
     pub limit_reached: bool,
 }
@@ -1494,6 +1509,13 @@ pub struct MetricsSnapshot {
     pub metadata_command_checkpoint_record_already_current_total: u64,
     pub metadata_command_checkpoint_record_skipped_cadence_total: u64,
     pub metadata_command_checkpoint_record_skipped_inactive_total: u64,
+    pub metadata_command_checkpoint_record_skipped_empty_total: u64,
+    pub metadata_command_checkpoint_record_skipped_stale_epoch_total: u64,
+    pub metadata_command_checkpoint_record_compacted_total: u64,
+    pub metadata_command_checkpoint_record_compaction_noop_total: u64,
+    pub metadata_command_checkpoint_record_compaction_no_checkpoint_total: u64,
+    pub metadata_command_checkpoint_record_compaction_pending_total: u64,
+    pub metadata_command_checkpoint_record_compaction_failed_total: u64,
     pub metadata_command_checkpoint_record_failed_total: u64,
     pub metadata_command_checkpoint_record_limit_reached_total: u64,
     pub metadata_command_checkpoint_record_scan_error_total: u64,
@@ -1794,6 +1816,21 @@ pub fn metrics_snapshot() -> MetricsSnapshot {
             METADATA_COMMAND_CHECKPOINT_RECORD_SKIPPED_CADENCE_TOTAL.load(Ordering::Relaxed),
         metadata_command_checkpoint_record_skipped_inactive_total:
             METADATA_COMMAND_CHECKPOINT_RECORD_SKIPPED_INACTIVE_TOTAL.load(Ordering::Relaxed),
+        metadata_command_checkpoint_record_skipped_empty_total:
+            METADATA_COMMAND_CHECKPOINT_RECORD_SKIPPED_EMPTY_TOTAL.load(Ordering::Relaxed),
+        metadata_command_checkpoint_record_skipped_stale_epoch_total:
+            METADATA_COMMAND_CHECKPOINT_RECORD_SKIPPED_STALE_EPOCH_TOTAL.load(Ordering::Relaxed),
+        metadata_command_checkpoint_record_compacted_total:
+            METADATA_COMMAND_CHECKPOINT_RECORD_COMPACTED_TOTAL.load(Ordering::Relaxed),
+        metadata_command_checkpoint_record_compaction_noop_total:
+            METADATA_COMMAND_CHECKPOINT_RECORD_COMPACTION_NOOP_TOTAL.load(Ordering::Relaxed),
+        metadata_command_checkpoint_record_compaction_no_checkpoint_total:
+            METADATA_COMMAND_CHECKPOINT_RECORD_COMPACTION_NO_CHECKPOINT_TOTAL
+                .load(Ordering::Relaxed),
+        metadata_command_checkpoint_record_compaction_pending_total:
+            METADATA_COMMAND_CHECKPOINT_RECORD_COMPACTION_PENDING_TOTAL.load(Ordering::Relaxed),
+        metadata_command_checkpoint_record_compaction_failed_total:
+            METADATA_COMMAND_CHECKPOINT_RECORD_COMPACTION_FAILED_TOTAL.load(Ordering::Relaxed),
         metadata_command_checkpoint_record_failed_total:
             METADATA_COMMAND_CHECKPOINT_RECORD_FAILED_TOTAL.load(Ordering::Relaxed),
         metadata_command_checkpoint_record_limit_reached_total:
@@ -2851,6 +2888,20 @@ pub fn emit_metadata_command_checkpoint_record_scan(
         .fetch_add(summary.skipped_cadence as u64, Ordering::Relaxed);
     METADATA_COMMAND_CHECKPOINT_RECORD_SKIPPED_INACTIVE_TOTAL
         .fetch_add(summary.skipped_inactive as u64, Ordering::Relaxed);
+    METADATA_COMMAND_CHECKPOINT_RECORD_SKIPPED_EMPTY_TOTAL
+        .fetch_add(summary.skipped_empty as u64, Ordering::Relaxed);
+    METADATA_COMMAND_CHECKPOINT_RECORD_SKIPPED_STALE_EPOCH_TOTAL
+        .fetch_add(summary.skipped_stale_epoch as u64, Ordering::Relaxed);
+    METADATA_COMMAND_CHECKPOINT_RECORD_COMPACTED_TOTAL
+        .fetch_add(summary.compacted as u64, Ordering::Relaxed);
+    METADATA_COMMAND_CHECKPOINT_RECORD_COMPACTION_NOOP_TOTAL
+        .fetch_add(summary.compaction_noop as u64, Ordering::Relaxed);
+    METADATA_COMMAND_CHECKPOINT_RECORD_COMPACTION_NO_CHECKPOINT_TOTAL
+        .fetch_add(summary.compaction_no_checkpoint as u64, Ordering::Relaxed);
+    METADATA_COMMAND_CHECKPOINT_RECORD_COMPACTION_PENDING_TOTAL
+        .fetch_add(summary.compaction_pending as u64, Ordering::Relaxed);
+    METADATA_COMMAND_CHECKPOINT_RECORD_COMPACTION_FAILED_TOTAL
+        .fetch_add(summary.compaction_failed as u64, Ordering::Relaxed);
     METADATA_COMMAND_CHECKPOINT_RECORD_FAILED_TOTAL
         .fetch_add(summary.failed as u64, Ordering::Relaxed);
     if summary.limit_reached {
@@ -2860,12 +2911,19 @@ pub fn emit_metadata_command_checkpoint_record_scan(
         return false;
     };
     let detail = format!(
-        "scanned={} recorded={} already_current={} skipped_cadence={} skipped_inactive={} failed={} limit_reached={}",
+        "scanned={} recorded={} already_current={} skipped_cadence={} skipped_inactive={} skipped_empty={} skipped_stale_epoch={} compacted={} compaction_noop={} compaction_no_checkpoint={} compaction_pending={} compaction_failed={} failed={} limit_reached={}",
         summary.scanned,
         summary.recorded,
         summary.already_current,
         summary.skipped_cadence,
         summary.skipped_inactive,
+        summary.skipped_empty,
+        summary.skipped_stale_epoch,
+        summary.compacted,
+        summary.compaction_noop,
+        summary.compaction_no_checkpoint,
+        summary.compaction_pending,
+        summary.compaction_failed,
         summary.failed,
         summary.limit_reached,
     );
@@ -3695,6 +3753,13 @@ mod tests {
                 already_current: 4,
                 skipped_cadence: 5,
                 skipped_inactive: 2,
+                skipped_empty: 12,
+                skipped_stale_epoch: 11,
+                compacted: 6,
+                compaction_noop: 7,
+                compaction_no_checkpoint: 8,
+                compaction_pending: 9,
+                compaction_failed: 10,
                 failed: 1,
                 limit_reached: true,
             },
@@ -4079,6 +4144,34 @@ mod tests {
         assert_eq!(
             after.metadata_command_checkpoint_record_skipped_inactive_total,
             before.metadata_command_checkpoint_record_skipped_inactive_total + 2
+        );
+        assert_eq!(
+            after.metadata_command_checkpoint_record_skipped_empty_total,
+            before.metadata_command_checkpoint_record_skipped_empty_total + 12
+        );
+        assert_eq!(
+            after.metadata_command_checkpoint_record_skipped_stale_epoch_total,
+            before.metadata_command_checkpoint_record_skipped_stale_epoch_total + 11
+        );
+        assert_eq!(
+            after.metadata_command_checkpoint_record_compacted_total,
+            before.metadata_command_checkpoint_record_compacted_total + 6
+        );
+        assert_eq!(
+            after.metadata_command_checkpoint_record_compaction_noop_total,
+            before.metadata_command_checkpoint_record_compaction_noop_total + 7
+        );
+        assert_eq!(
+            after.metadata_command_checkpoint_record_compaction_no_checkpoint_total,
+            before.metadata_command_checkpoint_record_compaction_no_checkpoint_total + 8
+        );
+        assert_eq!(
+            after.metadata_command_checkpoint_record_compaction_pending_total,
+            before.metadata_command_checkpoint_record_compaction_pending_total + 9
+        );
+        assert_eq!(
+            after.metadata_command_checkpoint_record_compaction_failed_total,
+            before.metadata_command_checkpoint_record_compaction_failed_total + 10
         );
         assert_eq!(
             after.metadata_command_checkpoint_record_failed_total,

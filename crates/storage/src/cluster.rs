@@ -51,7 +51,7 @@ use crate::peering::{
     PgPeeringReconstructionDecision, PgPeeringReconstructionError, PgPeeringReconstructionFailure,
     PgPeeringReplicaReconstructionInput,
 };
-use crate::pg_store::MetadataCommandCheckpoint;
+use crate::pg_store::{MetadataCommandCheckpoint, MetadataCommandLogCompactionStatus};
 use crate::storage_rpc::{
     STORAGE_RPC_MAX_METADATA_COMMAND_CHECKPOINT_CANDIDATES,
     STORAGE_RPC_MAX_METADATA_COMMAND_LOG_ENTRY_RANGE_ENTRIES, STORAGE_RPC_MAX_PAYLOAD_LEN,
@@ -126,8 +126,21 @@ pub struct MetadataCommandCheckpointRecordSummary {
     pub already_current: usize,
     pub skipped_cadence: usize,
     pub skipped_inactive: usize,
+    pub skipped_empty: usize,
+    pub skipped_stale_epoch: usize,
+    pub compacted: usize,
+    pub compaction_noop: usize,
+    pub compaction_no_checkpoint: usize,
+    pub compaction_pending: usize,
+    pub compaction_failed: usize,
     pub failed: usize,
     pub limit_reached: bool,
+}
+
+impl MetadataCommandCheckpointRecordSummary {
+    fn mutations(&self) -> usize {
+        self.recorded + self.compacted
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -4204,7 +4217,7 @@ impl StorageCluster {
         }
 
         for route in self.local_pg_routes() {
-            if summary.recorded >= limit {
+            if summary.mutations() >= limit {
                 summary.limit_reached = true;
                 break;
             }
@@ -4220,22 +4233,21 @@ impl StorageCluster {
             let state = match metadata_client.metadata_command_replica_state(route.pg_id()) {
                 Ok(state) => state,
                 Err(error) => {
-                    note_metadata_command_checkpoint_record_error(route.pg_id(), &error);
-                    summary.failed += 1;
+                    if metadata_command_checkpoint_record_error_is_stale(&error) {
+                        summary.skipped_stale_epoch += 1;
+                    } else {
+                        note_metadata_command_checkpoint_record_error(route.pg_id(), &error);
+                        summary.failed += 1;
+                    }
                     continue;
                 }
             };
             if state.cluster_epoch != route.cluster_epoch() {
-                note_metadata_command_checkpoint_record_error(
-                    route.pg_id(),
-                    &StoreError::StaleMetadataCommand {
-                        node_id: primary_node.node_id().as_u32(),
-                        pg_id: route.pg_id().get(),
-                        command_epoch: state.cluster_epoch,
-                        current_epoch: route.cluster_epoch(),
-                    },
-                );
-                summary.failed += 1;
+                summary.skipped_stale_epoch += 1;
+                continue;
+            }
+            if state.applied_log_index == 0 && state.applied_log_hash == 0 {
+                summary.skipped_empty += 1;
                 continue;
             }
             let latest_checkpoint = match metadata_client.metadata_command_checkpoint_candidates(
@@ -4246,8 +4258,12 @@ impl StorageCluster {
             ) {
                 Ok(mut candidates) => candidates.pop(),
                 Err(error) => {
-                    note_metadata_command_checkpoint_record_error(route.pg_id(), &error);
-                    summary.failed += 1;
+                    if metadata_command_checkpoint_record_error_is_stale(&error) {
+                        summary.skipped_stale_epoch += 1;
+                    } else {
+                        note_metadata_command_checkpoint_record_error(route.pg_id(), &error);
+                        summary.failed += 1;
+                    }
                     continue;
                 }
             };
@@ -4260,10 +4276,22 @@ impl StorageCluster {
                 Ok(MetadataCommandCheckpointRecordDecision::Record) => {}
                 Ok(MetadataCommandCheckpointRecordDecision::AlreadyCurrent) => {
                     summary.already_current += 1;
+                    compact_metadata_command_log_for_checkpoint_record(
+                        metadata_client.as_ref(),
+                        route.pg_id(),
+                        state.cluster_epoch,
+                        &mut summary,
+                    );
                     continue;
                 }
                 Ok(MetadataCommandCheckpointRecordDecision::SkipCadence) => {
                     summary.skipped_cadence += 1;
+                    compact_metadata_command_log_for_checkpoint_record(
+                        metadata_client.as_ref(),
+                        route.pg_id(),
+                        state.cluster_epoch,
+                        &mut summary,
+                    );
                     continue;
                 }
                 Err(error) => {
@@ -4275,10 +4303,22 @@ impl StorageCluster {
             match metadata_client
                 .record_current_metadata_command_checkpoint(route.pg_id(), state.cluster_epoch)
             {
-                Ok(_) => summary.recorded += 1,
+                Ok(_) => {
+                    summary.recorded += 1;
+                    compact_metadata_command_log_for_checkpoint_record(
+                        metadata_client.as_ref(),
+                        route.pg_id(),
+                        state.cluster_epoch,
+                        &mut summary,
+                    );
+                }
                 Err(error) => {
-                    note_metadata_command_checkpoint_record_error(route.pg_id(), &error);
-                    summary.failed += 1;
+                    if metadata_command_checkpoint_record_error_is_stale(&error) {
+                        summary.skipped_stale_epoch += 1;
+                    } else {
+                        note_metadata_command_checkpoint_record_error(route.pg_id(), &error);
+                        summary.failed += 1;
+                    }
                 }
             }
         }
@@ -10454,6 +10494,56 @@ fn note_metadata_command_checkpoint_record_error(pg_id: PgId, error: &StoreError
         "metadata_command_checkpoint_record_error",
         Some(format_args!("pg_id={} error={error}", pg_id.get())),
     );
+}
+
+fn compact_metadata_command_log_for_checkpoint_record(
+    metadata_client: &dyn MetadataCommandNodeClient,
+    pg_id: PgId,
+    cluster_epoch: ClusterEpoch,
+    summary: &mut MetadataCommandCheckpointRecordSummary,
+) {
+    match metadata_client.compact_metadata_command_log(pg_id, cluster_epoch) {
+        Ok(MetadataCommandLogCompactionStatus::NoCheckpoint { .. }) => {
+            summary.compaction_no_checkpoint += 1;
+        }
+        Ok(MetadataCommandLogCompactionStatus::PendingCommand { .. }) => {
+            summary.compaction_pending += 1;
+        }
+        Ok(MetadataCommandLogCompactionStatus::Compacted {
+            deleted_entries: 0, ..
+        }) => {
+            summary.compaction_noop += 1;
+        }
+        Ok(MetadataCommandLogCompactionStatus::Compacted { .. }) => {
+            summary.compacted += 1;
+        }
+        Err(error) => {
+            if metadata_command_checkpoint_record_error_is_stale(&error) {
+                summary.skipped_stale_epoch += 1;
+            } else {
+                note_metadata_command_checkpoint_record_error(pg_id, &error);
+                summary.compaction_failed += 1;
+            }
+        }
+    }
+}
+
+fn metadata_command_checkpoint_record_error_is_stale(error: &StoreError) -> bool {
+    match error {
+        StoreError::StalePayloadOperation { .. }
+        | StoreError::StaleMetadataCommand { .. }
+        | StoreError::StaleMetadataPrimaryBridge { .. }
+        | StoreError::StaleMetadataOperation { .. }
+        | StoreError::StaleMetadataRoute { .. }
+        | StoreError::RouteMapExpired { .. }
+        | StoreError::StaleShardOperation { .. }
+        | StoreError::StaleShardLocation { .. }
+        | StoreError::PgNotActive { .. } => true,
+        StoreError::StorageRpc { message, .. } => {
+            is_retryable_remote_pg_route_error(message.as_str())
+        }
+        _ => false,
+    }
 }
 
 fn metadata_command_checkpoint_record_decision(

@@ -1180,6 +1180,12 @@ pub(crate) trait MetadataCommandNodeClient: Send + Sync {
         limit: usize,
     ) -> Result<Vec<MetadataCommandCheckpoint>, StoreError>;
 
+    fn compact_metadata_command_log(
+        &self,
+        pg_id: PgId,
+        cluster_epoch: ClusterEpoch,
+    ) -> Result<MetadataCommandLogCompactionStatus, StoreError>;
+
     fn validate_metadata_command_replay_state(
         &self,
         pg_id: PgId,

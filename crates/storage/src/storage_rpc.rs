@@ -10,8 +10,8 @@ use crate::{
     },
     pg_store::{
         MetadataCheckpointRow, MetadataCheckpointTableBlock, MetadataCheckpointTableDigest,
-        MetadataCheckpointValue, MetadataCommandCheckpoint, ScavengerShardFile,
-        ScavengerShardFileScan, ScavengerShardRow,
+        MetadataCheckpointValue, MetadataCommandCheckpoint, MetadataCommandLogCompactionStatus,
+        ScavengerShardFile, ScavengerShardFileScan, ScavengerShardRow,
     },
     types::{
         AbortMultipartUploadCleanup, BucketDeleteFinalizeClaimRecord, BucketDeleteFinalizeRoot,
@@ -568,6 +568,7 @@ pub(crate) enum StorageRpcMessageKind {
     MetadataCommandCheckpointExport = 150,
     MetadataCommandCheckpointCandidates = 151,
     MetadataCommandCheckpointRecordCurrent = 152,
+    MetadataCommandLogCompact = 153,
     MetadataCommandAppliedLogHashes = 25,
     MetadataCommandMatchingAppliedLog = 26,
     MetadataCommandAbandoned = 27,
@@ -796,6 +797,7 @@ impl StorageRpcMessageKind {
             Self::MetadataCommandCheckpointRecordCurrent => {
                 "metadata command checkpoint record current"
             }
+            Self::MetadataCommandLogCompact => "metadata command log compact",
             Self::MetadataCommandAppliedLogHashes => "metadata command applied log hashes",
             Self::MetadataCommandMatchingAppliedLog => "metadata command matching applied log",
             Self::MetadataCommandRetainedLogHashes => "metadata command retained log hashes",
@@ -971,6 +973,7 @@ impl StorageRpcMessageKind {
             150 => Ok(Self::MetadataCommandCheckpointExport),
             151 => Ok(Self::MetadataCommandCheckpointCandidates),
             152 => Ok(Self::MetadataCommandCheckpointRecordCurrent),
+            153 => Ok(Self::MetadataCommandLogCompact),
             25 => Ok(Self::MetadataCommandAppliedLogHashes),
             26 => Ok(Self::MetadataCommandMatchingAppliedLog),
             27 => Ok(Self::MetadataCommandAbandoned),
@@ -1158,6 +1161,8 @@ pub(crate) enum StorageRpcPayloadError {
     MetadataCommandRouteMismatch(&'static str),
     #[error("invalid metadata command pending slot request: {0}")]
     InvalidMetadataCommandPendingSlotRequest(&'static str),
+    #[error("invalid metadata command log compaction status {0}")]
+    InvalidMetadataCommandLogCompactionStatus(u8),
     #[error("invalid bucket metadata request: {0}")]
     InvalidBucketMetadataRequest(&'static str),
     #[error("invalid object metadata request: {0}")]
@@ -2757,6 +2762,11 @@ pub(crate) struct StorageRpcMetadataCommandCheckpointCandidatesResponse {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StorageRpcMetadataCommandLogCompactResponse {
+    pub(crate) status: MetadataCommandLogCompactionStatus,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StorageRpcMetadataCommandLogHashRangeRequest {
     pub(crate) node_id: NodeId,
     pub(crate) cluster_epoch: ClusterEpoch,
@@ -3424,7 +3434,8 @@ fn message_kind_request_max_payload_len(
         | StorageRpcMessageKind::MetadataCommandValidateReplayStatePreservingPending
         | StorageRpcMessageKind::MetadataCommandReplicaStateCanInitialize
         | StorageRpcMessageKind::MetadataCommandCheckpointExport
-        | StorageRpcMessageKind::MetadataCommandCheckpointRecordCurrent => {
+        | StorageRpcMessageKind::MetadataCommandCheckpointRecordCurrent
+        | StorageRpcMessageKind::MetadataCommandLogCompact => {
             STORAGE_RPC_MAX_METADATA_COMMAND_STATE_PAYLOAD_LEN
         }
         StorageRpcMessageKind::MetadataCommandCheckpointCandidates => {
@@ -8869,6 +8880,53 @@ pub(crate) fn decode_metadata_command_checkpoint_candidates_response(
     }
     decoder.finish()?;
     Ok(StorageRpcMetadataCommandCheckpointCandidatesResponse { checkpoints })
+}
+
+pub(crate) fn encode_metadata_command_log_compact_response(
+    response: &StorageRpcMetadataCommandLogCompactResponse,
+) -> Vec<u8> {
+    let mut out = Vec::new();
+    match response.status {
+        MetadataCommandLogCompactionStatus::NoCheckpoint { retained_entries } => {
+            out.push(0);
+            put_u64(&mut out, retained_entries);
+        }
+        MetadataCommandLogCompactionStatus::PendingCommand { retained_entries } => {
+            out.push(1);
+            put_u64(&mut out, retained_entries);
+        }
+        MetadataCommandLogCompactionStatus::Compacted {
+            deleted_entries,
+            compacted_before,
+        } => {
+            out.push(2);
+            put_u64(&mut out, deleted_entries);
+            put_u64(&mut out, compacted_before);
+        }
+    }
+    out
+}
+
+pub(crate) fn decode_metadata_command_log_compact_response(
+    bytes: &[u8],
+) -> Result<StorageRpcMetadataCommandLogCompactResponse, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let tag = decoder.read_u8()?;
+    let status = match tag {
+        0 => MetadataCommandLogCompactionStatus::NoCheckpoint {
+            retained_entries: decoder.read_u64()?,
+        },
+        1 => MetadataCommandLogCompactionStatus::PendingCommand {
+            retained_entries: decoder.read_u64()?,
+        },
+        2 => MetadataCommandLogCompactionStatus::Compacted {
+            deleted_entries: decoder.read_u64()?,
+            compacted_before: decoder.read_u64()?,
+        },
+        _ => return Err(StorageRpcPayloadError::InvalidMetadataCommandLogCompactionStatus(tag)),
+    };
+    decoder.finish()?;
+    Ok(StorageRpcMetadataCommandLogCompactResponse { status })
 }
 
 pub(crate) fn encode_metadata_command_checkpoint_payload(
@@ -16855,6 +16913,30 @@ mod tests {
         let decoded = decode_metadata_command_checkpoint_candidates_response(&bytes).unwrap();
 
         assert_eq!(decoded, candidates_response);
+
+        for status in [
+            MetadataCommandLogCompactionStatus::NoCheckpoint {
+                retained_entries: 3,
+            },
+            MetadataCommandLogCompactionStatus::PendingCommand {
+                retained_entries: 4,
+            },
+            MetadataCommandLogCompactionStatus::Compacted {
+                deleted_entries: 5,
+                compacted_before: 6,
+            },
+        ] {
+            let response = StorageRpcMetadataCommandLogCompactResponse { status };
+            let bytes = encode_metadata_command_log_compact_response(&response);
+            let decoded = decode_metadata_command_log_compact_response(&bytes).unwrap();
+
+            assert_eq!(decoded, response);
+        }
+
+        assert!(matches!(
+            decode_metadata_command_log_compact_response(&[99]),
+            Err(StorageRpcPayloadError::InvalidMetadataCommandLogCompactionStatus(99))
+        ));
     }
 
     #[test]

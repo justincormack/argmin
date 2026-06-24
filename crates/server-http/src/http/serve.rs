@@ -1117,6 +1117,13 @@ fn local_debug_metrics_body(state: &Arc<ServerState>) -> String {
             "metadata_command_checkpoint_record_already_current_total {}\n",
             "metadata_command_checkpoint_record_skipped_cadence_total {}\n",
             "metadata_command_checkpoint_record_skipped_inactive_total {}\n",
+            "metadata_command_checkpoint_record_skipped_empty_total {}\n",
+            "metadata_command_checkpoint_record_skipped_stale_epoch_total {}\n",
+            "metadata_command_checkpoint_record_compacted_total {}\n",
+            "metadata_command_checkpoint_record_compaction_noop_total {}\n",
+            "metadata_command_checkpoint_record_compaction_no_checkpoint_total {}\n",
+            "metadata_command_checkpoint_record_compaction_pending_total {}\n",
+            "metadata_command_checkpoint_record_compaction_failed_total {}\n",
             "metadata_command_checkpoint_record_failed_total {}\n",
             "metadata_command_checkpoint_record_limit_reached_total {}\n",
             "metadata_command_checkpoint_record_scan_error_total {}\n",
@@ -1212,6 +1219,13 @@ fn local_debug_metrics_body(state: &Arc<ServerState>) -> String {
         snapshot.metadata_command_checkpoint_record_already_current_total,
         snapshot.metadata_command_checkpoint_record_skipped_cadence_total,
         snapshot.metadata_command_checkpoint_record_skipped_inactive_total,
+        snapshot.metadata_command_checkpoint_record_skipped_empty_total,
+        snapshot.metadata_command_checkpoint_record_skipped_stale_epoch_total,
+        snapshot.metadata_command_checkpoint_record_compacted_total,
+        snapshot.metadata_command_checkpoint_record_compaction_noop_total,
+        snapshot.metadata_command_checkpoint_record_compaction_no_checkpoint_total,
+        snapshot.metadata_command_checkpoint_record_compaction_pending_total,
+        snapshot.metadata_command_checkpoint_record_compaction_failed_total,
         snapshot.metadata_command_checkpoint_record_failed_total,
         snapshot.metadata_command_checkpoint_record_limit_reached_total,
         snapshot.metadata_command_checkpoint_record_scan_error_total,
@@ -4719,6 +4733,15 @@ mod tests {
         assert!(response.contains("metadata_command_checkpoint_record_already_current_total "));
         assert!(response.contains("metadata_command_checkpoint_record_skipped_cadence_total "));
         assert!(response.contains("metadata_command_checkpoint_record_skipped_inactive_total "));
+        assert!(response.contains("metadata_command_checkpoint_record_skipped_empty_total "));
+        assert!(response.contains("metadata_command_checkpoint_record_skipped_stale_epoch_total "));
+        assert!(response.contains("metadata_command_checkpoint_record_compacted_total "));
+        assert!(response.contains("metadata_command_checkpoint_record_compaction_noop_total "));
+        assert!(
+            response.contains("metadata_command_checkpoint_record_compaction_no_checkpoint_total ")
+        );
+        assert!(response.contains("metadata_command_checkpoint_record_compaction_pending_total "));
+        assert!(response.contains("metadata_command_checkpoint_record_compaction_failed_total "));
         assert!(response.contains("metadata_command_checkpoint_record_failed_total "));
         assert!(response.contains("metadata_command_checkpoint_record_limit_reached_total "));
         assert!(response.contains("metadata_command_checkpoint_record_scan_error_total "));

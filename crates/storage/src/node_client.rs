@@ -25,6 +25,7 @@ use crate::metadata_command::{
     PutObjectMetadataCommand, PutObjectMetadataMutation,
 };
 use crate::node::SharedStorageNode;
+use crate::pg_store::MetadataCommandLogCompactionStatus;
 use crate::pg_store::{MetadataCommandCheckpoint, ScavengerShardFileScan, ScavengerShardRow};
 use crate::pg_topology::PgTopology;
 use crate::storage_rpc::{
@@ -47,7 +48,8 @@ use crate::storage_rpc::{
     decode_list_objects_response, decode_metadata_command_acceptance_response,
     decode_metadata_command_applied_hashes_response, decode_metadata_command_bool_outcome_response,
     decode_metadata_command_bool_response, decode_metadata_command_checkpoint_candidates_response,
-    decode_metadata_command_checkpoint_response, decode_metadata_command_log_entry_range_response,
+    decode_metadata_command_checkpoint_response, decode_metadata_command_log_compact_response,
+    decode_metadata_command_log_entry_range_response,
     decode_metadata_command_log_hash_range_response,
     decode_metadata_command_max_log_index_response, decode_metadata_command_next_id_response,
     decode_metadata_command_pending_envelope_response,

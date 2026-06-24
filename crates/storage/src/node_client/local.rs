@@ -3971,6 +3971,15 @@ impl MetadataCommandNodeClient for LocalStorageNodeClient {
         pg.metadata_command_checkpoint_candidates(cluster_epoch, max_applied_log_index, limit)
     }
 
+    fn compact_metadata_command_log(
+        &self,
+        pg_id: PgId,
+        cluster_epoch: ClusterEpoch,
+    ) -> Result<MetadataCommandLogCompactionStatus, StoreError> {
+        let pg = self.storage_node.get_pg(pg_id.get())?;
+        pg.compact_metadata_command_log(cluster_epoch)
+    }
+
     fn validate_metadata_command_replay_state(
         &self,
         pg_id: PgId,
