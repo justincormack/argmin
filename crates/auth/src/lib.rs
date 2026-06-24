@@ -65,7 +65,8 @@ pub use credential::{
 pub use error::AuthError;
 pub use post::{
     authenticate_post_sigv4, prepare_post_policy, validate_post_policy,
-    validate_prepared_post_policy_size, PostPolicyError, PreparedPostPolicy,
+    validate_prepared_post_policy_size, ExpectedCredentialScope, PostPolicyError,
+    PreparedPostPolicy,
 };
 pub use request::{
     authenticate_request, AuthContext, AuthMode, HeaderSource, StreamingSigningContext,

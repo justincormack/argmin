@@ -3443,6 +3443,7 @@ impl HttpFrontend {
                     reason: "missing x-amz-signature".to_string(),
                 })?,
                 &self.credentials,
+                auth::ExpectedCredentialScope::new(None, "s3"),
             )
             .map_err(ServerError::Auth)?
         } else {

@@ -61,7 +61,17 @@ fn hex_encode(bytes: &[u8]) -> String {
 
 /// Compute a SigV4 hex signature of a base64 policy string.
 fn sign_policy_v4(policy_b64: &str, secret: &str, date: &str, region: &str) -> String {
-    let signing_key = derive_signing_key(secret, date, region, "s3");
+    sign_policy_v4_with_service(policy_b64, secret, date, region, "s3")
+}
+
+fn sign_policy_v4_with_service(
+    policy_b64: &str,
+    secret: &str,
+    date: &str,
+    region: &str,
+    service: &str,
+) -> String {
+    let signing_key = derive_signing_key(secret, date, region, service);
     let sig = hmac_sha256(signing_key.as_ref(), policy_b64.as_bytes());
     hex_encode(sig.as_ref())
 }
@@ -233,9 +243,29 @@ fn sigv4_fields_for_credentials(
     key: &str,
     extra_conditions: &[serde_json::Value],
 ) -> Vec<(String, String)> {
+    sigv4_fields_for_credentials_and_service(
+        access_key,
+        secret,
+        region,
+        "s3",
+        bucket,
+        key,
+        extra_conditions,
+    )
+}
+
+fn sigv4_fields_for_credentials_and_service(
+    access_key: &str,
+    secret: &str,
+    region: &str,
+    service: &str,
+    bucket: &str,
+    key: &str,
+    extra_conditions: &[serde_json::Value],
+) -> Vec<(String, String)> {
     let (short_date, full_date) = current_dates();
 
-    let credential = format!("{}/{}/{}/s3/aws4_request", access_key, short_date, region);
+    let credential = format!("{access_key}/{short_date}/{region}/{service}/aws4_request");
 
     // AWS requires ALL form fields to have matching policy conditions.
     // The SigV4 fields must be included in the policy.
@@ -247,7 +277,7 @@ fn sigv4_fields_for_credentials(
     all_conditions.extend_from_slice(extra_conditions);
 
     let policy_b64 = make_policy(bucket, key, 3600, &all_conditions);
-    let signature = sign_policy_v4(&policy_b64, secret, &short_date, region);
+    let signature = sign_policy_v4_with_service(&policy_b64, secret, &short_date, region, service);
 
     vec![
         ("key".to_string(), key.to_string()),
@@ -426,6 +456,34 @@ fn test_post_object_authenticated_request() {
             .send()
             .await
             .unwrap();
+        s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
+    });
+}
+
+#[test]
+fn test_post_object_sigv4_credential_service_must_be_s3() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+        let key = "post-wrong-service";
+        let fields = sigv4_fields_for_credentials_and_service(
+            CTX.access_key(),
+            CTX.secret_key(),
+            CTX.region(),
+            "execute-api",
+            &bucket,
+            key,
+            &[],
+        );
+        let field_refs: Vec<(&str, &str)> = fields
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+
+        let (status, body) = post_object(&bucket, &field_refs, b"wrong service", "test.txt");
+        assert_eq!(status, 400, "expected 400, got {status} body={body}");
+        assert_error_code(&body, "InvalidArgument");
+
         s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
     });
 }

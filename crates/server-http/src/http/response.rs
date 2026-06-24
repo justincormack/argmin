@@ -202,6 +202,9 @@ fn client_error_message(err: &ServerError) -> String {
         ServerError::Auth(auth::AuthError::InvalidQueryParam { param }) => {
             format!("invalid query auth parameter: {param}")
         }
+        ServerError::Auth(auth::AuthError::InvalidCredentialScope { param }) => {
+            format!("invalid credential scope: {param}")
+        }
         ServerError::Auth(auth::AuthError::UnknownAccessKey) => {
             "unknown access key id".to_string()
         }

@@ -379,7 +379,10 @@ impl ServerError {
             Self::Auth(auth::AuthError::MalformedAuth) | Self::WrongRegion { .. } => {
                 "AuthorizationHeaderMalformed"
             }
-            Self::Auth(auth::AuthError::UnsupportedAuthType) => "InvalidArgument",
+            Self::Auth(
+                auth::AuthError::UnsupportedAuthType
+                | auth::AuthError::InvalidCredentialScope { .. },
+            ) => "InvalidArgument",
             Self::Auth(auth::AuthError::UnknownAccessKey) => "InvalidAccessKeyId",
             Self::Auth(auth::AuthError::DuplicateAuthorizationHeader) => "NotImplemented",
             Self::Auth(auth::AuthError::SignatureMismatch) => "SignatureDoesNotMatch",
@@ -490,6 +493,7 @@ impl ServerError {
             | Self::Auth(
                 auth::AuthError::MalformedAuth
                 | auth::AuthError::UnsupportedAuthType
+                | auth::AuthError::InvalidCredentialScope { .. }
                 | auth::AuthError::InvalidQueryParam { .. }
                 | auth::AuthError::MissingQueryParam { .. },
             ) => 400,

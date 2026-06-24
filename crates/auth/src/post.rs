@@ -23,6 +23,19 @@ pub struct PreparedPostPolicy {
     conditions: Vec<PostPolicyCondition>,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct ExpectedCredentialScope<'a> {
+    region: Option<&'a str>,
+    service: &'a str,
+}
+
+impl<'a> ExpectedCredentialScope<'a> {
+    #[must_use]
+    pub fn new(region: Option<&'a str>, service: &'a str) -> Self {
+        Self { region, service }
+    }
+}
+
 impl PreparedPostPolicy {
     #[must_use]
     pub fn max_content_length(&self) -> Option<u64> {
@@ -47,6 +60,7 @@ pub fn authenticate_post_sigv4(
     policy_b64: &str,
     signature_hex: &str,
     store: &CredentialStore,
+    expected_scope: ExpectedCredentialScope<'_>,
 ) -> Result<AuthContext, AuthError> {
     observability::trace_scope!(
         TRACE_TARGET,
@@ -61,6 +75,15 @@ pub fn authenticate_post_sigv4(
     }
 
     let credential = parse_credential_scope_ref(credential).ok_or(AuthError::MalformedAuth)?;
+    if expected_scope
+        .region
+        .is_some_and(|region| credential.region != region)
+        || credential.service != expected_scope.service
+    {
+        return Err(AuthError::InvalidCredentialScope {
+            param: "X-Amz-Credential",
+        });
+    }
 
     if !crate::canonical::amz_date_matches_date_stamp(date, credential.date) {
         return Err(AuthError::MalformedAuth);
@@ -506,6 +529,7 @@ mod tests {
             policy_b64,
             &sig_hex,
             &store,
+            ExpectedCredentialScope::new(None, "s3"),
         )
         .unwrap();
         assert_eq!(ctx.access_key_id.as_deref(), Some("testAccessKey123"));
@@ -521,6 +545,7 @@ mod tests {
             "policy",
             "sig",
             &store,
+            ExpectedCredentialScope::new(None, "s3"),
         )
         .unwrap_err();
         assert!(matches!(err, AuthError::MalformedAuth));
@@ -536,6 +561,7 @@ mod tests {
             "policy",
             "sig",
             &store,
+            ExpectedCredentialScope::new(None, "s3"),
         )
         .unwrap_err();
         assert!(matches!(err, AuthError::MalformedAuth));
@@ -551,6 +577,7 @@ mod tests {
             "policy",
             "sig",
             &store,
+            ExpectedCredentialScope::new(None, "s3"),
         )
         .unwrap_err();
         assert!(matches!(err, AuthError::MalformedAuth));
@@ -566,6 +593,7 @@ mod tests {
             "policy",
             "sig",
             &store,
+            ExpectedCredentialScope::new(None, "s3"),
         )
         .unwrap_err();
         assert!(matches!(err, AuthError::UnknownAccessKey));
@@ -581,9 +609,72 @@ mod tests {
             "policy",
             "0000000000000000000000000000000000000000000000000000000000000000",
             &store,
+            ExpectedCredentialScope::new(None, "s3"),
         )
         .unwrap_err();
         assert!(matches!(err, AuthError::SignatureMismatch));
+    }
+
+    #[test]
+    fn sigv4_post_wrong_service_scope_rejected() {
+        let store = test_store();
+        let policy_b64 = "eyJleHBpcmF0aW9uIjoiMjAzMC0wMS0wMVQwMDowMDowMFoiLCJjb25kaXRpb25zIjpbXX0=";
+        let signing_key = crate::sigv4::derive_signing_key(
+            &SecretKey::new("testSecretKey456".to_string()),
+            "20250101",
+            "us-east-1",
+            "execute-api",
+        );
+        let sig = crate::sigv4::hmac_sha256(signing_key.as_ref(), policy_b64.as_bytes());
+        let sig_hex = crate::sigv4::hex_encode(sig.as_ref());
+
+        let err = authenticate_post_sigv4(
+            "AWS4-HMAC-SHA256",
+            "testAccessKey123/20250101/us-east-1/execute-api/aws4_request",
+            "20250101T000000Z",
+            policy_b64,
+            &sig_hex,
+            &store,
+            ExpectedCredentialScope::new(None, "s3"),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            AuthError::InvalidCredentialScope {
+                param: "X-Amz-Credential"
+            }
+        ));
+    }
+
+    #[test]
+    fn sigv4_post_wrong_expected_region_rejected() {
+        let store = test_store();
+        let policy_b64 = "eyJleHBpcmF0aW9uIjoiMjAzMC0wMS0wMVQwMDowMDowMFoiLCJjb25kaXRpb25zIjpbXX0=";
+        let signing_key = crate::sigv4::derive_signing_key(
+            &SecretKey::new("testSecretKey456".to_string()),
+            "20250101",
+            "us-west-2",
+            "s3",
+        );
+        let sig = crate::sigv4::hmac_sha256(signing_key.as_ref(), policy_b64.as_bytes());
+        let sig_hex = crate::sigv4::hex_encode(sig.as_ref());
+
+        let err = authenticate_post_sigv4(
+            "AWS4-HMAC-SHA256",
+            "testAccessKey123/20250101/us-west-2/s3/aws4_request",
+            "20250101T000000Z",
+            policy_b64,
+            &sig_hex,
+            &store,
+            ExpectedCredentialScope::new(Some("us-east-1"), "s3"),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            AuthError::InvalidCredentialScope {
+                param: "X-Amz-Credential"
+            }
+        ));
     }
 
     fn future_policy_b64(conditions: &[serde_json::Value]) -> String {
@@ -1145,6 +1236,7 @@ mod tests {
             "policy",
             "sig",
             &store,
+            ExpectedCredentialScope::new(None, "s3"),
         )
         .unwrap_err();
         assert!(matches!(err, AuthError::MalformedAuth));
@@ -1160,6 +1252,7 @@ mod tests {
             "policy",
             "sig",
             &store,
+            ExpectedCredentialScope::new(None, "s3"),
         )
         .unwrap_err();
         assert!(matches!(err, AuthError::MalformedAuth));
@@ -1177,6 +1270,7 @@ mod tests {
             "policy",
             "sig",
             &store,
+            ExpectedCredentialScope::new(None, "s3"),
         )
         .unwrap_err();
         assert!(matches!(err, AuthError::MalformedAuth));
@@ -1192,6 +1286,7 @@ mod tests {
             "policy",
             "sig",
             &store,
+            ExpectedCredentialScope::new(None, "s3"),
         )
         .unwrap_err();
         assert!(matches!(err, AuthError::MalformedAuth));
@@ -1207,6 +1302,7 @@ mod tests {
             "policy",
             "sig",
             &store,
+            ExpectedCredentialScope::new(None, "s3"),
         )
         .unwrap_err();
         assert!(matches!(err, AuthError::MalformedAuth));
@@ -1231,6 +1327,7 @@ mod tests {
             "policy",
             "sig",
             &store,
+            ExpectedCredentialScope::new(None, "s3"),
         )
         .unwrap_err();
         assert!(matches!(err, AuthError::UnknownAccessKey));

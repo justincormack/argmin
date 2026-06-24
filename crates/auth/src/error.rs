@@ -11,6 +11,8 @@ pub enum AuthError {
     MissingQueryParam { param: &'static str },
     #[error("invalid query auth parameter: {param}")]
     InvalidQueryParam { param: &'static str },
+    #[error("invalid credential scope: {param}")]
+    InvalidCredentialScope { param: &'static str },
     #[error("unknown access key id")]
     UnknownAccessKey,
     #[error("duplicate Authorization header")]
@@ -45,6 +47,10 @@ impl std::fmt::Debug for AuthError {
                 .finish(),
             Self::InvalidQueryParam { param } => f
                 .debug_struct("InvalidQueryParam")
+                .field("param", &param)
+                .finish(),
+            Self::InvalidCredentialScope { param } => f
+                .debug_struct("InvalidCredentialScope")
                 .field("param", &param)
                 .finish(),
             Self::UnknownAccessKey => f.write_str("UnknownAccessKey"),
