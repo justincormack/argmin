@@ -8339,6 +8339,12 @@ Metadata PG migration and backfill design notes:
   those operations. The debug metrics endpoint and UAT summaries expose this as
   a separate counter so retention cadence can be judged by actual log shrinkage,
   not just by whether a compaction path ran.
+- Hardened the metadata PG migration UAT smoke to exercise checkpoint-backed
+  transfer after retention has actually run. The smoke now shortens the
+  checkpoint scheduler cadence, waits for a fresh checkpoint record and nonzero
+  command-log compaction after metadata mutations, and only then performs a
+  further non-overlap transfer. This keeps the whole-lifetime metadata migration
+  smoke from only proving the retained-log path.
 
 Exit criteria:
 

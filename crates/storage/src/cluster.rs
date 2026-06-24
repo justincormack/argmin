@@ -1450,7 +1450,8 @@ fn retained_log_export_failure_allows_checkpoint_fallback(
     matches!(
         error,
         PgPeeringReconstructionFailure::Reconstruction(
-            PgPeeringReconstructionError::MissingRetainedCommandStateProof { .. }
+            PgPeeringReconstructionError::MissingRetainedCommandLogEntry { .. }
+                | PgPeeringReconstructionError::MissingRetainedCommandStateProof { .. }
                 | PgPeeringReconstructionError::UnreplayableAbandonedCommandLogEntry { .. }
         )
     )
@@ -3301,23 +3302,6 @@ impl StorageCluster {
                         );
                     }
                 } else {
-                    if !metadata_client.metadata_command_replica_state_can_initialize(
-                        pg_id,
-                        self.operation_epoch(),
-                    )? {
-                        return Err(
-                            PgPeeringReconstructionError::DirtyMetadataTransferDestination {
-                                node_id: node.node_id(),
-                                pg_id,
-                                cluster_epoch: self.operation_epoch(),
-                                applied_log_index: current.applied_log_index,
-                                applied_log_hash: current.applied_log_hash,
-                                state_digest: current.state_digest,
-                                expected: expected_import_proof,
-                            }
-                            .into(),
-                        );
-                    }
                     let mut state = metadata_client.install_metadata_transfer_checkpoint_base(
                         pg_id,
                         self.operation_epoch(),

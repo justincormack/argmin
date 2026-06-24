@@ -2793,6 +2793,49 @@ fn install_metadata_transfer_checkpoint_base_rejects_tampered_checkpoint_without
 }
 
 #[test]
+fn install_metadata_transfer_checkpoint_base_rejects_current_epoch_dirty_zero_log_destination() {
+    let source_tmp = test_util::tempdir();
+    let source = PgStore::open(source_tmp.path(), 1).unwrap();
+    let source_bucket = trusted_bucket_name("metadata-checkpoint-install-source-current-dirty");
+    create_probe_bucket_direct(&source, &source_bucket);
+    source.refresh_metadata_command_state_digest().unwrap();
+    let checkpoint = source
+        .metadata_command_checkpoint(0, ClusterEpoch::INITIAL)
+        .unwrap();
+
+    let destination_tmp = test_util::tempdir();
+    let destination = PgStore::open(destination_tmp.path(), 1).unwrap();
+    let dirty_bucket = trusted_bucket_name("metadata-checkpoint-install-dirty-current");
+    destination.metadata_command_replica_state().unwrap();
+    create_probe_bucket_direct(&destination, &dirty_bucket);
+    destination.refresh_metadata_command_state_digest().unwrap();
+    let before = destination.metadata_command_replica_state().unwrap();
+    assert_eq!(before.cluster_epoch, ClusterEpoch::INITIAL);
+    assert_eq!(before.applied_log_index, 0);
+    assert_eq!(before.applied_log_hash, 0);
+    assert!(!destination
+        .metadata_command_replica_state_can_initialize()
+        .unwrap());
+
+    let err = destination
+        .install_metadata_transfer_checkpoint_base(2, ClusterEpoch::INITIAL, &checkpoint)
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        StoreError::MetadataCommandReplicaStateMissing { pg_id: 1 }
+    ));
+    assert_eq!(
+        destination.metadata_command_replica_state().unwrap(),
+        before
+    );
+    assert_eq!(
+        destination.head_bucket_raw(&dirty_bucket).unwrap().name,
+        dirty_bucket
+    );
+    assert!(destination.head_bucket_raw(&source_bucket).is_err());
+}
+
+#[test]
 fn metadata_command_checkpoint_rejects_pending_command() {
     let tmp = test_util::tempdir();
     let store = PgStore::open(tmp.path(), 1).unwrap();

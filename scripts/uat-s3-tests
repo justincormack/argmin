@@ -215,6 +215,7 @@ if [[ "$smoke" == "metadata-pg-migration" ]]; then
     export ARGMIN_CONTROL_PLANE_REFRESH_MS="${ARGMIN_CONTROL_PLANE_REFRESH_MS:-100}"
     export ARGMIN_CONTROL_PLANE_LEASE_SCAN_MS="${ARGMIN_CONTROL_PLANE_LEASE_SCAN_MS:-100}"
     export ARGMIN_CONTROL_PLANE_HEARTBEAT_LEASE_MS="${ARGMIN_CONTROL_PLANE_HEARTBEAT_LEASE_MS:-10000}"
+    export ARGMIN_SHARD_SCAVENGER_SWEEP_INTERVAL_MS="${ARGMIN_SHARD_SCAVENGER_SWEEP_INTERVAL_MS:-200}"
     if ((repeat_count > ARGMIN_PG_COUNT)); then
         die "metadata-pg-migration --repeat requires ARGMIN_PG_COUNT >= repeat count"
     fi
@@ -802,6 +803,47 @@ wait_for_shard_backfill_completion_metrics() {
         if (($(date +%s) - start >= deadline_seconds)); then
             cat "$metrics_path" >&2 || true
             die "timed out waiting for shard backfill completion metrics"
+        fi
+        sleep 0.2
+    done
+}
+
+wait_for_metadata_checkpoint_compaction_metrics() {
+    local metrics_path="$1"
+    local deadline_seconds="$2"
+    local min_recorded="$3"
+    local min_compacted="$4"
+    local min_deleted_entries="$5"
+    local max_record_failed="$6"
+    local max_scan_error="$7"
+    local max_compaction_failed="$8"
+    local start
+    start="$(date +%s)"
+    while true; do
+        sample_frontend_metrics "$metrics_path"
+        local recorded
+        local compacted
+        local deleted_entries
+        local record_failed
+        local scan_error
+        local compaction_failed
+        recorded="$(latest_metric_sample_value "$metrics_path" metadata_command_checkpoint_record_recorded_total)"
+        compacted="$(latest_metric_sample_value "$metrics_path" metadata_command_checkpoint_record_compacted_total)"
+        deleted_entries="$(latest_metric_sample_value "$metrics_path" metadata_command_checkpoint_record_compaction_deleted_entries_total)"
+        record_failed="$(latest_metric_sample_value "$metrics_path" metadata_command_checkpoint_record_failed_total)"
+        scan_error="$(latest_metric_sample_value "$metrics_path" metadata_command_checkpoint_record_scan_error_total)"
+        compaction_failed="$(latest_metric_sample_value "$metrics_path" metadata_command_checkpoint_record_compaction_failed_total)"
+        if ((record_failed > max_record_failed || scan_error > max_scan_error || compaction_failed > max_compaction_failed)); then
+            cat "$metrics_path" >&2 || true
+            die "metadata checkpoint smoke saw hard failure: record_failed=$record_failed scan_error=$scan_error compaction_failed=$compaction_failed"
+        fi
+        if ((recorded >= min_recorded && compacted >= min_compacted && deleted_entries >= min_deleted_entries)); then
+            echo "== argmin-s3 UAT metadata checkpoint metrics: recorded=$recorded compacted=$compacted compaction_deleted_entries=$deleted_entries =="
+            return 0
+        fi
+        if (($(date +%s) - start >= deadline_seconds)); then
+            cat "$metrics_path" >&2 || true
+            die "timed out waiting for metadata checkpoint compaction metrics"
         fi
         sleep 0.2
     done
@@ -1708,11 +1750,35 @@ run_metadata_pg_migration_smoke() {
     print_command "${pg_backfill_smoke_cmd[@]}" get "$bucket_file" "$new_key" "$new_body_file"
     "${pg_backfill_smoke_cmd[@]}" get "$bucket_file" "$new_key" "$new_body_file"
 
+    sample_frontend_metrics "$metrics_path"
+    local min_checkpoint_recorded
+    local min_checkpoint_compacted
+    local min_checkpoint_deleted_entries
+    local max_checkpoint_record_failed
+    local max_checkpoint_scan_error
+    local max_checkpoint_compaction_failed
+    min_checkpoint_recorded="$(($(latest_metric_sample_value "$metrics_path" metadata_command_checkpoint_record_recorded_total) + 1))"
+    min_checkpoint_compacted="$(($(latest_metric_sample_value "$metrics_path" metadata_command_checkpoint_record_compacted_total) + 1))"
+    min_checkpoint_deleted_entries="$(($(latest_metric_sample_value "$metrics_path" metadata_command_checkpoint_record_compaction_deleted_entries_total) + 1))"
+    max_checkpoint_record_failed="$(latest_metric_sample_value "$metrics_path" metadata_command_checkpoint_record_failed_total)"
+    max_checkpoint_scan_error="$(latest_metric_sample_value "$metrics_path" metadata_command_checkpoint_record_scan_error_total)"
+    max_checkpoint_compaction_failed="$(latest_metric_sample_value "$metrics_path" metadata_command_checkpoint_record_compaction_failed_total)"
+
     echo "== argmin-s3 UAT metadata PG migration transfer-back write =="
     print_command "${pg_backfill_smoke_cmd[@]}" put-for-metadata-pg "$bucket_file" "$final_key_file" "uat-metadata-pg-final-object-$iteration" "$final_body_file" "$target_metadata_pg"
     "${pg_backfill_smoke_cmd[@]}" put-for-metadata-pg "$bucket_file" "$final_key_file" "uat-metadata-pg-final-object-$iteration" "$final_body_file" "$target_metadata_pg"
     local final_key
     final_key="$(tr -d '[:space:]' <"$final_key_file")"
+
+    wait_for_metadata_checkpoint_compaction_metrics \
+        "$metrics_path" \
+        30 \
+        "$min_checkpoint_recorded" \
+        "$min_checkpoint_compacted" \
+        "$min_checkpoint_deleted_entries" \
+        "$max_checkpoint_record_failed" \
+        "$max_checkpoint_scan_error" \
+        "$max_checkpoint_compaction_failed"
 
     echo "== argmin-s3 UAT metadata PG migration repeated outbound transfer =="
     transfer_pg_metadata "second non-overlap destination nodes 2,3 with suffix replay" "$target_metadata_pg" 2 3

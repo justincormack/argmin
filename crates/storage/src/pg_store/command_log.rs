@@ -1379,7 +1379,13 @@ impl PgStore {
             }
 
             if !self.metadata_command_replica_state_can_initialize()? {
-                return Err(StoreError::MetadataCommandReplicaStateMissing { pg_id: self.pg_id });
+                let current = self.metadata_command_replica_state()?;
+                if current.cluster_epoch >= cluster_epoch {
+                    return Err(StoreError::MetadataCommandReplicaStateMissing {
+                        pg_id: self.pg_id,
+                    });
+                }
+                self.clear_metadata_transfer_checkpoint_destination_state()?;
             }
 
             self.clear_metadata_checkpoint_tables()?;
@@ -4081,6 +4087,21 @@ impl PgStore {
                 "clear metadata checkpoint destination table",
             )?;
         }
+        Ok(())
+    }
+
+    fn clear_metadata_transfer_checkpoint_destination_state(&self) -> Result<(), StoreError> {
+        self.clear_metadata_checkpoint_tables()?;
+        self.execute_cached(
+            "DELETE FROM metadata_command_log",
+            [],
+            "clear stale metadata transfer command log",
+        )?;
+        self.execute_cached(
+            "DELETE FROM metadata_command_checkpoints",
+            [],
+            "clear stale metadata transfer checkpoints",
+        )?;
         Ok(())
     }
 
