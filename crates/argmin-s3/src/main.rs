@@ -14,7 +14,7 @@ use std::sync::{
 use std::thread;
 use std::time::{Duration, Instant};
 
-use auth::{AccountIdentity, CredentialRecord, CredentialStore, SecretKey};
+use auth::{AccountIdentity, CredentialRecord, CredentialStore};
 use ec::EcConfig;
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
@@ -98,7 +98,7 @@ fn authorization_profile(profile: ConfiguredCredentialProfile) -> auth::Authoriz
 fn add_configured_credential(credentials: &mut CredentialStore, credential: &ConfiguredCredential) {
     credentials.add_record(CredentialRecord {
         access_key_id: credential.access_key_id.clone(),
-        secret_key: SecretKey::new(credential.secret_access_key.clone()),
+        secret_key: credential.secret_access_key.clone(),
         account: AccountIdentity::new(
             credential.principal.clone(),
             CanonicalUserId::from_principal(&credential.account_id),
@@ -120,7 +120,7 @@ fn build_credential_store(config: &ServerConfig) -> CredentialStore {
     );
     credentials.add_record(CredentialRecord {
         access_key_id: config.access_key_id.clone(),
-        secret_key: SecretKey::new(config.secret_access_key.clone()),
+        secret_key: config.secret_access_key.clone(),
         account,
         authorization_profile: auth::AuthorizationProfile::OwnerAccountAdmin,
         session_token: None,
@@ -1695,15 +1695,15 @@ async fn run_frontend_server(
 ) {
     let sse_c_validator = config
         .sse_c_validator_key_b64
-        .as_deref()
-        .map(|key| SseCustomerValidatorConfig::from_base64(1, key))
+        .as_ref()
+        .map(|key| SseCustomerValidatorConfig::from_base64(1, key.as_str()))
         .transpose()
         .unwrap_or_else(|e| {
             eprintln!("invalid SSE-C validator key: {e}");
             std::process::exit(1);
         });
     let managed_key_provider =
-        ManagedWrappingKeyConfig::from_base64(1, &config.sse_s3_wrapping_key_b64)
+        ManagedWrappingKeyConfig::from_base64(1, config.sse_s3_wrapping_key_b64.as_str())
             .map(StaticManagedKeyProvider::single)
             .unwrap_or_else(|e| {
                 eprintln!("invalid SSE-S3 wrapping key: {e}");
@@ -1855,6 +1855,8 @@ fn maybe_spawn_frontend_control_plane_refresh_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use auth::SecretKey;
+    use config::SecretConfigValue;
     use storage::control_plane::{
         NodeMembershipState, NodePgHeartbeatObservation, PgMetadataProof,
     };
@@ -1893,11 +1895,11 @@ mod tests {
             ec_m: 2,
             account_id: String::new(),
             access_key_id: String::new(),
-            secret_access_key: String::new(),
+            secret_access_key: SecretKey::new(String::new()),
             uat_credentials: Vec::new(),
             host_id: None,
             sse_c_validator_key_b64: None,
-            sse_s3_wrapping_key_b64: String::new(),
+            sse_s3_wrapping_key_b64: SecretConfigValue::new(String::new()),
             region: "us-east-1".to_string(),
             workers: 4,
             max_connections: 512,

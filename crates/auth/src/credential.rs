@@ -13,8 +13,9 @@ pub enum AuthorizationProfile {
     OwnerAccountAdmin,
 }
 
-/// A secret access key. Deliberately does not implement Debug to avoid leaking secrets.
+/// A secret access key. Debug deliberately redacts the value to avoid leaking secrets.
 /// Field is private — use [`SecretKey::as_str()`] to access the value.
+#[derive(Clone)]
 pub struct SecretKey(String);
 
 impl SecretKey {

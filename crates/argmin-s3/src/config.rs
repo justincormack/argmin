@@ -1,5 +1,7 @@
+use auth::SecretKey;
 use ec::EcConfig;
 use std::collections::{HashMap, HashSet};
+use std::fmt;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -44,11 +46,30 @@ pub(crate) enum ConfiguredCredentialProfile {
 #[derive(Debug, Clone)]
 pub(crate) struct ConfiguredCredential {
     pub(crate) access_key_id: String,
-    pub(crate) secret_access_key: String,
+    pub(crate) secret_access_key: SecretKey,
     pub(crate) account_id: String,
     pub(crate) principal: String,
     pub(crate) display_name: String,
     pub(crate) authorization_profile: ConfiguredCredentialProfile,
+}
+
+#[derive(Clone)]
+pub(crate) struct SecretConfigValue(String);
+
+impl SecretConfigValue {
+    pub(crate) fn new(value: String) -> Self {
+        Self(value)
+    }
+
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for SecretConfigValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(&observability::redacted("config_secret"), f)
+    }
 }
 
 /// Server configuration, loaded from environment variables.
@@ -80,11 +101,11 @@ pub(crate) struct ServerConfig {
     pub(crate) ec_m: u8,
     pub(crate) account_id: String,
     pub(crate) access_key_id: String,
-    pub(crate) secret_access_key: String,
+    pub(crate) secret_access_key: SecretKey,
     pub(crate) uat_credentials: Vec<ConfiguredCredential>,
     pub(crate) host_id: Option<String>,
-    pub(crate) sse_c_validator_key_b64: Option<String>,
-    pub(crate) sse_s3_wrapping_key_b64: String,
+    pub(crate) sse_c_validator_key_b64: Option<SecretConfigValue>,
+    pub(crate) sse_s3_wrapping_key_b64: SecretConfigValue,
     pub(crate) region: String,
     pub(crate) workers: u32,
     pub(crate) max_connections: u32,
@@ -172,21 +193,21 @@ impl ServerConfig {
             (
                 account_id,
                 access_key_id,
-                secret_access_key,
+                SecretKey::new(secret_access_key),
                 uat_credentials,
-                sse_s3_wrapping_key_b64,
+                SecretConfigValue::new(sse_s3_wrapping_key_b64),
             )
         } else {
             (
                 String::new(),
                 String::new(),
-                String::new(),
+                SecretKey::new(String::new()),
                 Vec::new(),
-                String::new(),
+                SecretConfigValue::new(String::new()),
             )
         };
         let host_id = get("ARGMIN_HOST_ID");
-        let sse_c_validator_key_b64 = get("ARGMIN_SSE_C_VALIDATOR_KEY");
+        let sse_c_validator_key_b64 = get("ARGMIN_SSE_C_VALIDATOR_KEY").map(SecretConfigValue::new);
         let listen_addr = get("ARGMIN_LISTEN_ADDR").unwrap_or_else(|| "127.0.0.1:9000".to_string());
         let tls_cert_path = get("ARGMIN_TLS_CERT_PATH");
         let tls_key_path = get("ARGMIN_TLS_KEY_PATH");
@@ -702,7 +723,7 @@ fn read_uat_credentials<F: Fn(&str) -> Option<String>>(
             }
             credentials.push(ConfiguredCredential {
                 access_key_id,
-                secret_access_key,
+                secret_access_key: SecretKey::new(secret_access_key),
                 account_id: account_id.clone(),
                 principal: account_id.clone(),
                 display_name: "argmin-uat-alt-account".to_string(),
@@ -724,7 +745,7 @@ fn read_uat_credentials<F: Fn(&str) -> Option<String>>(
     )? {
         credentials.push(ConfiguredCredential {
             access_key_id,
-            secret_access_key,
+            secret_access_key: SecretKey::new(secret_access_key),
             account_id: primary_account_id.to_string(),
             principal: format!("arn:aws:iam::{primary_account_id}:user/limited"),
             display_name: "argmin-uat-second-user".to_string(),
@@ -739,7 +760,7 @@ fn read_uat_credentials<F: Fn(&str) -> Option<String>>(
     )? {
         credentials.push(ConfiguredCredential {
             access_key_id,
-            secret_access_key,
+            secret_access_key: SecretKey::new(secret_access_key),
             account_id: primary_account_id.to_string(),
             principal: format!("arn:aws:iam::{primary_account_id}:root"),
             display_name: "argmin-uat-owner-root".to_string(),
@@ -906,11 +927,11 @@ mod tests {
         assert!(!cfg.panic_on_500);
         assert!(!cfg.abort_on_500);
         assert_eq!(cfg.access_key_id, "AKID");
-        assert_eq!(cfg.secret_access_key, "SECRET");
+        assert_eq!(cfg.secret_access_key.as_str(), "SECRET");
         assert_eq!(cfg.host_id, None);
-        assert_eq!(cfg.sse_c_validator_key_b64, None);
+        assert!(cfg.sse_c_validator_key_b64.is_none());
         assert_eq!(
-            cfg.sse_s3_wrapping_key_b64,
+            cfg.sse_s3_wrapping_key_b64.as_str(),
             "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY="
         );
     }
@@ -995,10 +1016,45 @@ mod tests {
             server_core::coordinator::INTERNAL_SEGMENT_SIZE
         );
         assert_eq!(cfg.access_key_id, "mykey");
-        assert_eq!(cfg.secret_access_key, "mysecret");
+        assert_eq!(cfg.secret_access_key.as_str(), "mysecret");
         assert_eq!(cfg.host_id.as_deref(), Some("custom-host-id"));
-        assert_eq!(cfg.sse_c_validator_key_b64, Some("Zm9v".to_string()));
-        assert_eq!(cfg.sse_s3_wrapping_key_b64, "YmFy");
+        assert_eq!(
+            cfg.sse_c_validator_key_b64
+                .as_ref()
+                .map(SecretConfigValue::as_str),
+            Some("Zm9v")
+        );
+        assert_eq!(cfg.sse_s3_wrapping_key_b64.as_str(), "YmFy");
+    }
+
+    #[test]
+    fn debug_redacts_secret_config_values() {
+        let cfg = ServerConfig::from_lookup(make_required_env(&[
+            ("ARGMIN_SECRET_ACCESS_KEY", "primary-secret"),
+            ("ARGMIN_SSE_C_VALIDATOR_KEY", "validator-secret"),
+            ("ARGMIN_SSE_S3_WRAPPING_KEY", "wrapping-secret"),
+            ("ARGMIN_UAT_ALT_ACCOUNT_ID", "444455556666"),
+            ("ARGMIN_UAT_ALT_ACCESS_KEY_ID", "alt-key"),
+            ("ARGMIN_UAT_ALT_SECRET_ACCESS_KEY", "alt-secret"),
+        ]))
+        .unwrap();
+
+        let debug = format!("{cfg:?}");
+        for secret in [
+            "primary-secret",
+            "validator-secret",
+            "wrapping-secret",
+            "alt-secret",
+        ] {
+            assert!(
+                !debug.contains(secret),
+                "ServerConfig Debug leaked {secret:?}: {debug}"
+            );
+        }
+        assert!(
+            debug.contains("secret_key") && debug.contains("config_secret"),
+            "ServerConfig Debug should include redaction labels: {debug}"
+        );
     }
 
     #[test]
@@ -1141,9 +1197,9 @@ mod tests {
         assert_eq!(cfg.process_role, ProcessRole::StorageNode);
         assert_eq!(cfg.account_id, "");
         assert_eq!(cfg.access_key_id, "");
-        assert_eq!(cfg.secret_access_key, "");
+        assert_eq!(cfg.secret_access_key.as_str(), "");
         assert!(cfg.uat_credentials.is_empty());
-        assert_eq!(cfg.sse_s3_wrapping_key_b64, "");
+        assert_eq!(cfg.sse_s3_wrapping_key_b64.as_str(), "");
     }
 
     #[test]
@@ -1401,7 +1457,10 @@ mod tests {
 
         assert_eq!(cfg.uat_credentials.len(), 3);
         assert_eq!(cfg.uat_credentials[0].access_key_id, "alt");
-        assert_eq!(cfg.uat_credentials[0].secret_access_key, "alt-secret");
+        assert_eq!(
+            cfg.uat_credentials[0].secret_access_key.as_str(),
+            "alt-secret"
+        );
         assert_eq!(cfg.uat_credentials[0].account_id, "444455556666");
         assert_eq!(cfg.uat_credentials[0].principal, "444455556666");
         assert_eq!(
