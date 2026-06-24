@@ -1,0 +1,74 @@
+Aws-chunked per-chunk signature comparison uses non-constant-time equality
+Link: https://chatgpt.com/codex/cloud/security/findings/argmin-security-review-2026-06-23-m2
+Criticality: low/informational (attack path: low)
+Status: fixed
+
+# Resolution
+Fixed in 53db5320f313748428ec60e66d35cf2cf3987601.
+
+The fix made the shared `auth::constant_time_eq` helper public and changed both aws-chunked streaming signature checks in `crates/server-http/src/http/chunked.rs` to compare the expected and claimed hex signatures with that helper instead of Rust string inequality. This covers both per-chunk signatures and signed trailer signatures.
+
+The issue was downgraded from medium to low/informational during review. A valid seed signature is required before the chunk/trailer verifiers are reached, so practical exploitability is very low; the fix is still useful defense-in-depth and keeps all SigV4 signature comparisons on the same constant-time policy.
+
+# Metadata
+Repo: justincormack/argmin
+Commit: 632837a
+Author: security-review
+Created: 23/06/2026, 15:30:00
+Assignee: Unassigned
+Signals: Security, Validated, Timing
+
+# Summary
+The streaming PUT/PART path verifies the per-chunk and trailer aws-chunked signatures using byte-by-byte `==` / `!=` on the hex-encoded HMAC string. The comparison short-circuits on the first differing byte, leaking the number of leading matching bytes via response timing. This is inconsistent with the main `sigv4::verify_request_record` and `auth::request::validate_record_token_and_expiry` paths, both of which use `crate::constant_time_eq` (a thin wrapper around `subtle::ConstantTimeEq`) for exactly this comparison. The information leaked is the position of the first differing byte of a chunk's HMAC-SHA256 tag, not the secret key; practical exploitability is low (HMAC-SHA256 is a PRF, the secret key is 32 bytes derived per request, and the timing channel is at the per-byte granularity of an HMAC), but the inconsistency is a hardening miss and a known class of vulnerability that becomes easier to weaponize as the rest of the system is hardened.
+
+# Validation
+## Rubric
+- [x] Confirm `verify_chunk_signature` uses `expected_hex != claimed_sig`.
+- [x] Confirm `verify_trailer_signature` uses `expected_hex != claimed_sig`.
+- [x] Confirm the main `sigv4::verify_request_record` and `validate_record_token_and_expiry` use `crate::constant_time_eq` for the same kind of comparison.
+- [x] Add a regression that constructs a chunk with a known signature and asserts the comparison matches the constant-time helper's output for both matching and mismatching inputs.
+## Report
+Grep for `constant_time_eq` in `crates/` originally showed it was used in `crates/auth/src/lib.rs`, `crates/auth/src/sigv4.rs` (main signature), `crates/auth/src/post.rs` (POST signature), and `crates/auth/src/request.rs` (session tokens). The two streaming chunk/trailer signature verifiers in `crates/server-http/src/http/chunked.rs` used plain string inequality instead.
+
+After 53db5320f313748428ec60e66d35cf2cf3987601, `auth::constant_time_eq` is public and both chunked verifiers call it. Existing bad chunk signature and bad trailer signature tests continue to assert that mismatches are rejected with `SignatureMismatch`.
+
+# Evidence
+crates/server-http/src/http/chunked.rs (L230 to 238)
+  Note: Per-chunk signature comparison uses non-constant-time `!=`.
+```
+    let key = hmac::Key::new(hmac::HMAC_SHA256, &ctx.signing_key);
+    let expected = hmac::sign(&key, string_to_sign.as_bytes());
+    let expected_hex = hex_encode(expected.as_ref());
+
+    if expected_hex != claimed_sig {
+        return Err(ServerError::Auth(auth::AuthError::SignatureMismatch));
+    }
+    Ok(())
+}
+```
+
+crates/server-http/src/http/chunked.rs (L280 to 287)
+  Note: Per-trailer signature comparison uses non-constant-time `!=`.
+```
+    let key = hmac::Key::new(hmac::HMAC_SHA256, &ctx.signing_key);
+    let expected = hmac::sign(&key, string_to_sign.as_bytes());
+    let expected_hex = hex_encode(expected.as_ref());
+
+    if expected_hex != claimed_sig {
+        return Err(ServerError::Auth(auth::AuthError::SignatureMismatch));
+    }
+    Ok(())
+}
+```
+
+crates/auth/src/sigv4.rs (L228 to 236)
+  Note: The main SigV4 signature verification uses `constant_time_eq` for the same kind of comparison.
+```
+    let expected_sig = hmac_sha256(signing_key.as_ref(), sts.as_bytes());
+    let expected_hex = hex_encode(expected_sig.as_ref());
+
+    // Constant-time comparison to prevent timing attacks on signature values.
+    if !crate::constant_time_eq(expected_hex.as_bytes(), auth.signature.as_bytes()) {
+        return Err(AuthError::SignatureMismatch);
+    }
+```
