@@ -480,7 +480,7 @@ fn unix_storage_node_client_lists_metadata_command_checkpoint_candidates() {
 }
 
 #[test]
-fn unix_storage_node_client_rejects_active_metadata_command_checkpoint_export() {
+fn unix_storage_node_client_exports_active_metadata_command_checkpoint() {
     let tmp = test_util::tempdir();
     let config = test_config(&tmp);
     private_socket_dir(config.socket_path.parent().unwrap());
@@ -494,22 +494,19 @@ fn unix_storage_node_client_rejects_active_metadata_command_checkpoint_export() 
         config.socket_path.clone(),
     );
 
-    let err = MetadataCommandNodeClient::metadata_command_checkpoint(
+    let checkpoint = MetadataCommandNodeClient::metadata_command_checkpoint(
         &client,
         PgId::new(0),
         ClusterEpoch::INITIAL,
     )
-    .unwrap_err();
+    .unwrap();
     server_thread.join().unwrap();
 
-    assert!(matches!(
-        err,
-        StoreError::StorageRpc {
-            operation: "metadata command checkpoint export",
-            message,
-            ..
-        } if message.contains("route is active")
-    ));
+    assert_eq!(checkpoint.cluster_epoch, ClusterEpoch::INITIAL);
+    assert_eq!(checkpoint.pg_id, PgId::new(0));
+    assert_eq!(checkpoint.applied_log_index, 0);
+    assert_eq!(checkpoint.applied_log_hash, 0);
+    checkpoint.verify().unwrap();
 }
 
 #[test]
