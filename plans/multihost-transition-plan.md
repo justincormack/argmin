@@ -8397,6 +8397,14 @@ Metadata PG migration and backfill design notes:
   node-client surface rather than reaching directly into in-process storage
   nodes, so remote Unix storage nodes can contribute storage-owned history
   floors before retained cluster-map pruning is made data-aware.
+- Fed storage-owned cluster-map history floors into control-plane pruning.
+  Storage-node heartbeats now carry the merged history reference summary from
+  the node's local PG stores; the single-authority control plane persists the
+  oldest required epoch per node and protects those epochs during fixed-window
+  cluster-map history pruning. This means live payload placement epochs and
+  durable backfill source/desired epochs can keep the route history they need
+  across repeated epoch changes and control-plane restarts, alongside the
+  existing metadata-transfer source-route floor.
 
 Exit criteria:
 

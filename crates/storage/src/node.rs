@@ -1204,6 +1204,7 @@ impl SharedStorageNode {
             endpoint: endpoint.into(),
             observed_epoch,
             requested_lease_duration_ms,
+            cluster_map_history_reference_summary: self.cluster_map_history_reference_summary()?,
             pg_observations,
         })
     }
@@ -2021,6 +2022,10 @@ mod tests {
         assert_eq!(heartbeat.endpoint, "node-7.sock");
         assert_eq!(heartbeat.observed_epoch, ClusterEpoch::new(3).unwrap());
         assert_eq!(heartbeat.requested_lease_duration_ms, 1_000);
+        assert_eq!(
+            heartbeat.cluster_map_history_reference_summary,
+            node.cluster_map_history_reference_summary().unwrap()
+        );
         assert_eq!(heartbeat.pg_observations.len(), 2);
         assert_eq!(heartbeat.pg_observations[0].pg_id, PgId::new(0));
         assert_eq!(heartbeat.pg_observations[0].state, PgState::Peering);

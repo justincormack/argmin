@@ -8,7 +8,7 @@ use std::time::Duration;
 use placement::NodeId;
 use thiserror::Error;
 
-use crate::{ClusterEpoch, PgId, PgState};
+use crate::{ClusterEpoch, PgClusterMapHistoryReferenceSummary, PgId, PgState};
 
 // PG backfill can lag a burst of placement changes; retain enough recent
 // snapshots that scanner references can still reconstruct historical routes.
@@ -132,6 +132,7 @@ pub struct NodeControlRecord {
     last_observed_epoch: Option<ClusterEpoch>,
     last_heartbeat_ms: Option<u64>,
     lease_deadline_ms: Option<u64>,
+    cluster_map_history_floor_epoch: Option<ClusterEpoch>,
     pg_observations: BTreeMap<PgId, NodePgObservationRecord>,
 }
 
@@ -151,6 +152,7 @@ impl NodeControlRecord {
             last_observed_epoch: None,
             last_heartbeat_ms: None,
             lease_deadline_ms: None,
+            cluster_map_history_floor_epoch: None,
             pg_observations: BTreeMap::new(),
         }
     }
@@ -201,6 +203,11 @@ impl NodeControlRecord {
 
     pub fn pg_observations(&self) -> impl Iterator<Item = &NodePgObservationRecord> {
         self.pg_observations.values()
+    }
+
+    #[must_use]
+    pub fn cluster_map_history_floor_epoch(&self) -> Option<ClusterEpoch> {
+        self.cluster_map_history_floor_epoch
     }
 
     fn can_serve_primary(&self, cluster_epoch: ClusterEpoch, now_ms: u64) -> bool {
@@ -641,7 +648,8 @@ impl ClusterControlSnapshot {
             .retain(|record| record.cluster_epoch != previous.cluster_epoch);
         self.history
             .push(ClusterMapHistoryRecord::from_snapshot(previous));
-        let protected_epochs = required_cluster_map_history_epochs(self.pgs.values());
+        let protected_epochs =
+            required_cluster_map_history_epochs(self.pgs.values(), self.nodes.values());
         prune_cluster_map_history(&mut self.history, &protected_epochs);
     }
 }
@@ -1177,6 +1185,7 @@ pub struct NodeHeartbeat {
     pub endpoint: String,
     pub observed_epoch: ClusterEpoch,
     pub requested_lease_duration_ms: u64,
+    pub cluster_map_history_reference_summary: PgClusterMapHistoryReferenceSummary,
     pub pg_observations: Vec<NodePgHeartbeatObservation>,
 }
 
@@ -2301,6 +2310,7 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
                 snapshot: self.snapshot.clone(),
             });
         }
+        validate_storage_cluster_map_history_floor(&self.snapshot, &heartbeat)?;
         validate_pg_heartbeat_observations(
             &self.snapshot,
             heartbeat.node_id,
@@ -2333,6 +2343,9 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
             record.last_observed_epoch = Some(heartbeat.observed_epoch);
             record.last_heartbeat_ms = Some(authority_now_ms);
             record.lease_deadline_ms = Some(lease_deadline_ms);
+            record.cluster_map_history_floor_epoch = heartbeat
+                .cluster_map_history_reference_summary
+                .oldest_required_epoch();
             record.pg_observations.clear();
             for observation in &heartbeat.pg_observations {
                 record.pg_observations.insert(
@@ -3425,6 +3438,20 @@ fn write_node_heartbeat(
     write_string(out, &heartbeat.endpoint)?;
     write_u64(out, heartbeat.observed_epoch.get());
     write_u64(out, heartbeat.requested_lease_duration_ms);
+    write_option_u64(
+        out,
+        heartbeat
+            .cluster_map_history_reference_summary
+            .oldest_live_placement_epoch
+            .map(ClusterEpoch::get),
+    );
+    write_option_u64(
+        out,
+        heartbeat
+            .cluster_map_history_reference_summary
+            .oldest_durable_backfill_epoch
+            .map(ClusterEpoch::get),
+    );
     write_u32(
         out,
         len_as_u32(heartbeat.pg_observations.len(), "PG observations")?,
@@ -3444,6 +3471,10 @@ fn read_node_heartbeat(reader: &mut PayloadReader<'_>) -> Result<NodeHeartbeat, 
     let endpoint = reader.read_string()?.to_owned();
     let observed_epoch = read_cluster_epoch(reader, "heartbeat observed epoch")?;
     let requested_lease_duration_ms = reader.read_u64()?;
+    let oldest_live_placement_epoch =
+        read_option_cluster_epoch(reader, "heartbeat oldest live placement epoch")?;
+    let oldest_durable_backfill_epoch =
+        read_option_cluster_epoch(reader, "heartbeat oldest durable backfill epoch")?;
     let observation_count = reader.read_collection_len(
         "PG observations",
         CONTROL_PLANE_RPC_HEARTBEAT_OBSERVATION_MIN_LEN,
@@ -3463,6 +3494,10 @@ fn read_node_heartbeat(reader: &mut PayloadReader<'_>) -> Result<NodeHeartbeat, 
         endpoint,
         observed_epoch,
         requested_lease_duration_ms,
+        cluster_map_history_reference_summary: PgClusterMapHistoryReferenceSummary {
+            oldest_live_placement_epoch,
+            oldest_durable_backfill_epoch,
+        },
         pg_observations,
     })
 }
@@ -3773,6 +3808,20 @@ fn read_cluster_epoch(
     })
 }
 
+fn read_option_cluster_epoch(
+    reader: &mut PayloadReader<'_>,
+    field: &'static str,
+) -> Result<Option<ClusterEpoch>, ControlPlaneError> {
+    reader
+        .read_option_u64()?
+        .map(|epoch| {
+            ClusterEpoch::new(epoch).ok_or_else(|| ControlPlaneError::RpcProtocol {
+                message: format!("{field} must be nonzero"),
+            })
+        })
+        .transpose()
+}
+
 fn write_option_u64(out: &mut Vec<u8>, value: Option<u64>) {
     match value {
         Some(value) => {
@@ -3985,6 +4034,24 @@ pub enum ControlPlaneError {
 
     #[error("cluster epoch {cluster_epoch} is not retained in cluster-map history")]
     UnknownClusterMapEpoch { cluster_epoch: ClusterEpoch },
+
+    #[error(
+        "node {node_id} reported storage cluster-map history floor epoch {floor_epoch} that is not retained at current epoch {cluster_epoch}"
+    )]
+    StorageClusterMapHistoryFloorNotRetained {
+        node_id: u32,
+        floor_epoch: ClusterEpoch,
+        cluster_epoch: ClusterEpoch,
+    },
+
+    #[error(
+        "node {node_id} reported storage cluster-map history floor epoch {floor_epoch} newer than observed epoch {observed_epoch}"
+    )]
+    StorageClusterMapHistoryFloorInFuture {
+        node_id: u32,
+        floor_epoch: ClusterEpoch,
+        observed_epoch: ClusterEpoch,
+    },
 
     #[error("PG {pg_id} acting set must not be empty")]
     EmptyActingSet { pg_id: u32 },
@@ -4329,7 +4396,7 @@ fn format_snapshot(snapshot: &ClusterControlSnapshot) -> String {
 
 fn format_node_record(record: &NodeControlRecord) -> String {
     format!(
-        "{},{},{},{},{},{},{},{}",
+        "{},{},{},{},{},{},{},{},{}",
         record.node_id.as_u32(),
         record.membership.as_str(),
         record.availability.as_str(),
@@ -4337,6 +4404,11 @@ fn format_node_record(record: &NodeControlRecord) -> String {
         option_u64(record.last_observed_epoch.map(ClusterEpoch::get)),
         option_u64(record.last_heartbeat_ms),
         option_u64(record.lease_deadline_ms),
+        option_u64(
+            record
+                .cluster_map_history_floor_epoch
+                .map(ClusterEpoch::get)
+        ),
         hex_encode(record.endpoint.as_bytes())
     )
 }
@@ -4629,9 +4701,9 @@ fn parse_snapshot(contents: &str) -> Result<ClusterControlSnapshot, ControlPlane
     validate_parsed_history(&history, cluster_epoch)?;
     let mut history: Vec<ClusterMapHistoryRecord> =
         history.into_values().map(|record| record.record).collect();
-    let protected_epochs = required_cluster_map_history_epochs(pgs.values());
+    let protected_epochs = required_cluster_map_history_epochs(pgs.values(), nodes.values());
     prune_cluster_map_history(&mut history, &protected_epochs);
-    validate_required_cluster_map_history(&history, &pgs, cluster_epoch)?;
+    validate_required_cluster_map_history(&history, &pgs, &nodes, cluster_epoch)?;
     Ok(ClusterControlSnapshot {
         authority_incarnation: authority_incarnation
             .ok_or_else(|| parse_error(0, "missing authority incarnation"))?,
@@ -4801,6 +4873,7 @@ fn validate_parsed_history(
 fn validate_required_cluster_map_history(
     history: &[ClusterMapHistoryRecord],
     pgs: &BTreeMap<PgId, PgControlRecord>,
+    nodes: &BTreeMap<NodeId, NodeControlRecord>,
     current_epoch: ClusterEpoch,
 ) -> Result<(), ControlPlaneError> {
     let retained_epochs: BTreeSet<_> = history
@@ -4818,6 +4891,20 @@ fn validate_required_cluster_map_history(
             return Err(parse_error(
                 0,
                 "metadata transfer source route epoch is not retained in cluster-map history",
+            ));
+        }
+    }
+    for node in nodes.values() {
+        let Some(floor_epoch) = node.cluster_map_history_floor_epoch else {
+            continue;
+        };
+        if floor_epoch >= current_epoch {
+            continue;
+        }
+        if !retained_epochs.contains(&floor_epoch) {
+            return Err(parse_error(
+                0,
+                "storage cluster-map history floor epoch is not retained in cluster-map history",
             ));
         }
     }
@@ -4944,8 +5031,8 @@ fn parse_node_pg_record(
 
 fn parse_node_record(line: usize, value: &str) -> Result<NodeControlRecord, ControlPlaneError> {
     let fields: Vec<&str> = value.split(',').collect();
-    if fields.len() != 8 {
-        return Err(parse_error(line, "node record must have eight fields"));
+    if fields.len() != 9 {
+        return Err(parse_error(line, "node record must have nine fields"));
     }
     let node_id = NodeId::new(parse_u32(line, fields[0], "node id")?);
     let membership = NodeMembershipState::from_str(fields[1])?;
@@ -4954,7 +5041,9 @@ fn parse_node_record(line: usize, value: &str) -> Result<NodeControlRecord, Cont
     let last_observed_epoch = parse_option_cluster_epoch(line, fields[4], "last observed epoch")?;
     let last_heartbeat_ms = parse_option_u64(line, fields[5], "last heartbeat")?;
     let lease_deadline_ms = parse_option_u64(line, fields[6], "lease deadline")?;
-    let endpoint = String::from_utf8(hex_decode(line, fields[7])?)
+    let cluster_map_history_floor_epoch =
+        parse_option_cluster_epoch(line, fields[7], "cluster map history floor epoch")?;
+    let endpoint = String::from_utf8(hex_decode(line, fields[8])?)
         .map_err(|_| parse_error(line, "node endpoint must be valid UTF-8 after hex decoding"))?;
     Ok(NodeControlRecord {
         node_id,
@@ -4965,6 +5054,7 @@ fn parse_node_record(line: usize, value: &str) -> Result<NodeControlRecord, Cont
         last_observed_epoch,
         last_heartbeat_ms,
         lease_deadline_ms,
+        cluster_map_history_floor_epoch,
         pg_observations: BTreeMap::new(),
     })
 }
@@ -5484,6 +5574,38 @@ fn validate_pg_heartbeat_observations(
     Ok(())
 }
 
+fn validate_storage_cluster_map_history_floor(
+    snapshot: &ClusterControlSnapshot,
+    heartbeat: &NodeHeartbeat,
+) -> Result<(), ControlPlaneError> {
+    let Some(floor_epoch) = heartbeat
+        .cluster_map_history_reference_summary
+        .oldest_required_epoch()
+    else {
+        return Ok(());
+    };
+    if floor_epoch > heartbeat.observed_epoch {
+        return Err(ControlPlaneError::StorageClusterMapHistoryFloorInFuture {
+            node_id: heartbeat.node_id.as_u32(),
+            floor_epoch,
+            observed_epoch: heartbeat.observed_epoch,
+        });
+    }
+    if floor_epoch >= snapshot.cluster_epoch {
+        return Ok(());
+    }
+    if snapshot.cluster_map_at_epoch(floor_epoch).is_some() {
+        return Ok(());
+    }
+    Err(
+        ControlPlaneError::StorageClusterMapHistoryFloorNotRetained {
+            node_id: heartbeat.node_id.as_u32(),
+            floor_epoch,
+            cluster_epoch: snapshot.cluster_epoch,
+        },
+    )
+}
+
 fn validate_pg_peering_observations(
     snapshot: &ClusterControlSnapshot,
     pg_id: PgId,
@@ -5868,12 +5990,20 @@ fn validate_pg_primary_active_observation(
     Ok(())
 }
 
-fn required_cluster_map_history_epochs<'a>(
+fn required_cluster_map_history_epochs<'a, 'b>(
     pgs: impl IntoIterator<Item = &'a PgControlRecord>,
+    nodes: impl IntoIterator<Item = &'b NodeControlRecord>,
 ) -> BTreeSet<ClusterEpoch> {
-    pgs.into_iter()
+    let mut epochs: BTreeSet<_> = pgs
+        .into_iter()
         .filter_map(PgControlRecord::peering_metadata_transfer_source_route_epoch)
-        .collect()
+        .collect();
+    epochs.extend(
+        nodes
+            .into_iter()
+            .filter_map(NodeControlRecord::cluster_map_history_floor_epoch),
+    );
+    epochs
 }
 
 fn prune_cluster_map_history(
@@ -6077,6 +6207,7 @@ mod tests {
             endpoint: format!("node-{node_id}.sock"),
             observed_epoch,
             requested_lease_duration_ms: 100,
+            cluster_map_history_reference_summary: PgClusterMapHistoryReferenceSummary::default(),
             pg_observations: Vec::new(),
         }
     }
@@ -6465,6 +6596,8 @@ mod tests {
                     endpoint: "/tmp/argmin-node-1.sock".to_owned(),
                     observed_epoch: heartbeat_epoch,
                     requested_lease_duration_ms: 100,
+                    cluster_map_history_reference_summary:
+                        PgClusterMapHistoryReferenceSummary::default(),
                     pg_observations: Vec::new(),
                 },
                 0,
@@ -6787,6 +6920,8 @@ mod tests {
                     endpoint: "/tmp/argmin-node-99.sock".to_owned(),
                     observed_epoch: ClusterEpoch::INITIAL,
                     requested_lease_duration_ms: 100,
+                    cluster_map_history_reference_summary:
+                        PgClusterMapHistoryReferenceSummary::default(),
                     pg_observations: Vec::new(),
                 },
                 0,
@@ -6887,6 +7022,8 @@ mod tests {
         write_string(&mut payload, "/tmp/argmin-node-1.sock").unwrap();
         write_u64(&mut payload, ClusterEpoch::INITIAL.get());
         write_u64(&mut payload, 100);
+        write_option_u64(&mut payload, None);
+        write_option_u64(&mut payload, None);
         write_u32(&mut payload, u32::MAX);
 
         let mut reader = PayloadReader::new(&payload);
@@ -6907,6 +7044,8 @@ mod tests {
         write_string(&mut payload, "/tmp/argmin-node-1.sock").unwrap();
         write_u64(&mut payload, ClusterEpoch::INITIAL.get());
         write_u64(&mut payload, 100);
+        write_option_u64(&mut payload, None);
+        write_option_u64(&mut payload, None);
         write_u32(&mut payload, 1);
         write_u32(&mut payload, 7);
         write_pg_state(&mut payload, PgState::Peering);
@@ -7044,7 +7183,7 @@ mod tests {
         let path = tmp.path().join("control-plane.state");
         std::fs::write(
             &path,
-            "version=2\nauthority_incarnation=1\ncluster_epoch=1\nnode=1,active,healthy,11,1,100,200,6e6f64652d312e736f636b\n",
+            "version=2\nauthority_incarnation=1\ncluster_epoch=1\nnode=1,active,healthy,11,1,100,200,-,6e6f64652d312e736f636b\n",
         )
         .unwrap();
         let store = FileControlPlaneStore::new(path);
@@ -7186,6 +7325,150 @@ mod tests {
                 .peering_metadata_transfer_source_route_epoch(),
             Some(source_epoch)
         );
+    }
+
+    #[test]
+    fn cluster_map_history_pruning_preserves_storage_node_reference_floor() {
+        let tmp = test_util::tempdir();
+        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store.clone()).unwrap();
+        authority
+            .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
+            .unwrap();
+        assert!(heartbeat_until_serving(&mut authority, 1, 10_000).serving());
+        let protected_epoch = authority.snapshot().cluster_epoch();
+        let mut floor_heartbeat = heartbeat_from_record(&authority, 1, protected_epoch, 10_100);
+        floor_heartbeat.cluster_map_history_reference_summary =
+            PgClusterMapHistoryReferenceSummary {
+                oldest_live_placement_epoch: Some(protected_epoch),
+                oldest_durable_backfill_epoch: None,
+            };
+        assert!(authority
+            .heartbeat(floor_heartbeat, 10_100)
+            .unwrap()
+            .serving());
+
+        for node_id in 10..(10 + CLUSTER_MAP_HISTORY_LIMIT as u32 + 8) {
+            authority
+                .set_node_membership(NodeId::new(node_id), NodeMembershipState::Active)
+                .unwrap();
+        }
+
+        assert!(authority
+            .snapshot()
+            .cluster_map_at_epoch(protected_epoch)
+            .is_some());
+        assert_eq!(
+            authority
+                .snapshot()
+                .node(NodeId::new(1))
+                .unwrap()
+                .cluster_map_history_floor_epoch(),
+            Some(protected_epoch)
+        );
+        let persisted = SingleAuthorityControlPlane::open(store).unwrap();
+        assert!(persisted
+            .snapshot()
+            .cluster_map_at_epoch(protected_epoch)
+            .is_some());
+        assert_eq!(
+            persisted
+                .snapshot()
+                .node(NodeId::new(1))
+                .unwrap()
+                .cluster_map_history_floor_epoch(),
+            Some(protected_epoch)
+        );
+    }
+
+    #[test]
+    fn heartbeat_rejects_unretained_storage_history_floor_before_persisting() {
+        let tmp = test_util::tempdir();
+        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store.clone()).unwrap();
+        authority
+            .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
+            .unwrap();
+        let first_epoch = authority.snapshot().cluster_epoch();
+        assert!(heartbeat_until_serving(&mut authority, 1, 10_000).serving());
+
+        for node_id in 10..(10 + CLUSTER_MAP_HISTORY_LIMIT as u32 + 8) {
+            authority
+                .set_node_membership(NodeId::new(node_id), NodeMembershipState::Active)
+                .unwrap();
+        }
+        assert!(authority
+            .snapshot()
+            .cluster_map_at_epoch(first_epoch)
+            .is_none());
+
+        let current_epoch = authority.snapshot().cluster_epoch();
+        let mut stale_floor_heartbeat = heartbeat_from_record(&authority, 1, current_epoch, 20_000);
+        stale_floor_heartbeat.cluster_map_history_reference_summary =
+            PgClusterMapHistoryReferenceSummary {
+                oldest_live_placement_epoch: Some(first_epoch),
+                oldest_durable_backfill_epoch: None,
+            };
+        let error = authority
+            .heartbeat(stale_floor_heartbeat, 20_000)
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ControlPlaneError::StorageClusterMapHistoryFloorNotRetained {
+                node_id: 1,
+                floor_epoch,
+                cluster_epoch,
+            } if floor_epoch == first_epoch && cluster_epoch == current_epoch
+        ));
+        assert_eq!(
+            authority
+                .snapshot()
+                .node(NodeId::new(1))
+                .unwrap()
+                .cluster_map_history_floor_epoch(),
+            None
+        );
+        assert!(SingleAuthorityControlPlane::open(store).is_ok());
+    }
+
+    #[test]
+    fn heartbeat_rejects_future_storage_history_floor_before_persisting() {
+        let tmp = test_util::tempdir();
+        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store.clone()).unwrap();
+        authority
+            .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
+            .unwrap();
+        assert!(heartbeat_until_serving(&mut authority, 1, 10_000).serving());
+        let current_epoch = authority.snapshot().cluster_epoch();
+        let future_epoch = ClusterEpoch::new(current_epoch.get() + 1).unwrap();
+        let mut future_floor_heartbeat =
+            heartbeat_from_record(&authority, 1, current_epoch, 20_000);
+        future_floor_heartbeat.cluster_map_history_reference_summary =
+            PgClusterMapHistoryReferenceSummary {
+                oldest_live_placement_epoch: None,
+                oldest_durable_backfill_epoch: Some(future_epoch),
+            };
+        let error = authority
+            .heartbeat(future_floor_heartbeat, 20_000)
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ControlPlaneError::StorageClusterMapHistoryFloorInFuture {
+                node_id: 1,
+                floor_epoch,
+                observed_epoch,
+            } if floor_epoch == future_epoch && observed_epoch == current_epoch
+        ));
+        assert_eq!(
+            authority
+                .snapshot()
+                .node(NodeId::new(1))
+                .unwrap()
+                .cluster_map_history_floor_epoch(),
+            None
+        );
+        assert!(SingleAuthorityControlPlane::open(store).is_ok());
     }
 
     #[test]
@@ -7403,7 +7686,7 @@ mod tests {
         let path = tmp.path().join("control-plane.state");
         std::fs::write(
             &path,
-            "version=8\nauthority_incarnation=1\ncluster_epoch=1\npg=7,peering,1:1,-,-,-,-\n",
+            "version=11\nauthority_incarnation=1\ncluster_epoch=1\npg=7,peering,1:1,-,-,-,-\n",
         )
         .unwrap();
         let store = FileControlPlaneStore::new(path);
@@ -7421,10 +7704,10 @@ mod tests {
         std::fs::write(
             &path,
             concat!(
-                "version=8\n",
+                "version=11\n",
                 "authority_incarnation=1\n",
                 "cluster_epoch=2\n",
-                "node=1,active,healthy,11,2,100,200,6e6f64652d312e736f636b\n",
+                "node=1,active,healthy,11,2,100,200,-,6e6f64652d312e736f636b\n",
                 "pg=7,active,1:99,1,1,2,3\n",
             ),
         )
@@ -7444,10 +7727,10 @@ mod tests {
         std::fs::write(
             &path,
             concat!(
-                "version=9\n",
+                "version=11\n",
                 "authority_incarnation=1\n",
                 "cluster_epoch=2\n",
-                "node=1,active,healthy,11,2,100,200,6e6f64652d312e736f636b\n",
+                "node=1,active,healthy,11,2,100,200,-,6e6f64652d312e736f636b\n",
                 "pg=7,peering,1,-,-,-,-,9,10,11,3,9,10,11\n",
             ),
         )
@@ -7484,7 +7767,7 @@ mod tests {
         let path = tmp.path().join("control-plane.state");
         std::fs::write(
             &path,
-            "version=8\nauthority_incarnation=1\ncluster_epoch=2\nhistory=2,1\n",
+            "version=11\nauthority_incarnation=1\ncluster_epoch=2\nhistory=2,1\n",
         )
         .unwrap();
         let store = FileControlPlaneStore::new(path);
@@ -7502,11 +7785,11 @@ mod tests {
         std::fs::write(
             &path,
             concat!(
-                "version=8\n",
+                "version=11\n",
                 "authority_incarnation=1\n",
                 "cluster_epoch=3\n",
                 "history=2,1\n",
-                "history_node=2,1,active,healthy,11,2,100,200,6e6f64652d312e736f636b\n",
+                "history_node=2,1,active,healthy,11,2,100,200,-,6e6f64652d312e736f636b\n",
                 "history_pg=2,7,peering,1:2,-,-,-,-\n",
             ),
         )
@@ -7526,13 +7809,13 @@ mod tests {
         std::fs::write(
             &path,
             concat!(
-                "version=9\n",
+                "version=11\n",
                 "authority_incarnation=1\n",
                 "cluster_epoch=4\n",
                 "history=2,1\n",
-                "history_node=2,1,active,healthy,11,2,100,200,6e6f64652d312e736f636b\n",
+                "history_node=2,1,active,healthy,11,2,100,200,-,6e6f64652d312e736f636b\n",
                 "history_pg=2,7,peering,1,-,-,-,-,9,10,11,3,9,10,11\n",
-                "node=1,active,healthy,11,4,100,200,6e6f64652d312e736f636b\n",
+                "node=1,active,healthy,11,4,100,200,-,6e6f64652d312e736f636b\n",
             ),
         )
         .unwrap();
@@ -7555,7 +7838,7 @@ mod tests {
                 "version=5\n",
                 "authority_incarnation=1\n",
                 "cluster_epoch=2\n",
-                "node=1,active,healthy,11,2,100,200,6e6f64652d312e736f636b\n",
+                "node=1,active,healthy,11,2,100,200,-,6e6f64652d312e736f636b\n",
                 "node_pg=1,7,peering,2,100,0,0,0,0\n",
                 "pg=7,peering,1,-,-,-,-\n",
             ),
@@ -7576,11 +7859,11 @@ mod tests {
         std::fs::write(
             &path,
             concat!(
-                "version=8\n",
+                "version=11\n",
                 "authority_incarnation=1\n",
                 "cluster_epoch=2\n",
-                "node=1,active,healthy,11,2,100,200,6e6f64652d312e736f636b\n",
-                "node=2,active,healthy,12,2,100,200,6e6f64652d322e736f636b\n",
+                "node=1,active,healthy,11,2,100,200,-,6e6f64652d312e736f636b\n",
+                "node=2,active,healthy,12,2,100,200,-,6e6f64652d322e736f636b\n",
                 "node_pg=2,7,peering,2,100,0,0,0,0\n",
                 "pg=7,peering,1,-,-,-,-\n",
             ),
@@ -7601,10 +7884,10 @@ mod tests {
         std::fs::write(
             &path,
             concat!(
-                "version=8\n",
+                "version=11\n",
                 "authority_incarnation=1\n",
                 "cluster_epoch=3\n",
-                "node=1,active,healthy,11,3,100,200,6e6f64652d312e736f636b\n",
+                "node=1,active,healthy,11,3,100,200,-,6e6f64652d312e736f636b\n",
                 "node_pg=1,7,peering,2,100,0,0,0,0\n",
                 "pg=7,peering,1,-,-,-,-\n",
             ),
@@ -7625,10 +7908,10 @@ mod tests {
         std::fs::write(
             &path,
             concat!(
-                "version=8\n",
+                "version=11\n",
                 "authority_incarnation=1\n",
                 "cluster_epoch=2\n",
-                "node=1,active,healthy,11,2,100,200,6e6f64652d312e736f636b\n",
+                "node=1,active,healthy,11,2,100,200,-,6e6f64652d312e736f636b\n",
                 "node_pg=1,7,active,2,100,9,10,12,0\n",
                 "pg=7,active,1,1,9,10,11\n",
             ),
@@ -7650,10 +7933,10 @@ mod tests {
         std::fs::write(
             &path,
             concat!(
-                "version=8\n",
+                "version=11\n",
                 "authority_incarnation=1\n",
                 "cluster_epoch=2\n",
-                "node=1,active,healthy,11,2,100,200,6e6f64652d312e736f636b\n",
+                "node=1,active,healthy,11,2,100,200,-,6e6f64652d312e736f636b\n",
                 "node_pg=1,7,active,2,100,10,20,30,0\n",
                 "pg=7,active,1,1,9,10,11\n",
             ),
@@ -7689,10 +7972,10 @@ mod tests {
         std::fs::write(
             &path,
             concat!(
-                "version=8\n",
+                "version=11\n",
                 "authority_incarnation=1\n",
                 "cluster_epoch=2\n",
-                "node=1,active,healthy,11,2,100,200,6e6f64652d312e736f636b\n",
+                "node=1,active,healthy,11,2,100,200,-,6e6f64652d312e736f636b\n",
                 "node_pg=1,7,active,2,100,9,10,11,1\n",
                 "pg=7,active,1,1,9,10,11\n",
             ),

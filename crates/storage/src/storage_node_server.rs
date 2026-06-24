@@ -10868,6 +10868,10 @@ mod tests {
         assert_eq!(heartbeat.endpoint, config.socket_path.to_str().unwrap());
         assert_eq!(heartbeat.observed_epoch, config.cluster_epoch);
         assert_eq!(heartbeat.requested_lease_duration_ms, 2_000);
+        assert_eq!(
+            heartbeat.cluster_map_history_reference_summary,
+            node.cluster_map_history_reference_summary().unwrap()
+        );
         assert_eq!(heartbeat.pg_observations.len(), 2);
         assert_eq!(heartbeat.pg_observations[0].pg_id, PgId::new(0));
         assert_eq!(heartbeat.pg_observations[0].state, PgState::Peering);
@@ -10943,6 +10947,13 @@ mod tests {
         assert_eq!(heartbeat.endpoint, config.socket_path.to_str().unwrap());
         assert_eq!(heartbeat.observed_epoch, config.cluster_epoch);
         assert_eq!(heartbeat.requested_lease_duration_ms, 2_000);
+        assert_eq!(
+            heartbeat.cluster_map_history_reference_summary,
+            server
+                ._node
+                .cluster_map_history_reference_summary()
+                .unwrap()
+        );
         assert_eq!(heartbeat.pg_observations.len(), 1);
         assert_eq!(heartbeat.pg_observations[0].pg_id, PgId::new(0));
         assert_eq!(heartbeat.pg_observations[0].state, PgState::Active);
@@ -10994,6 +11005,8 @@ mod tests {
                         endpoint: heartbeat_socket_path.to_str().unwrap().to_owned(),
                         observed_epoch: authority.snapshot().cluster_epoch(),
                         requested_lease_duration_ms: 1_000,
+                        cluster_map_history_reference_summary:
+                            crate::PgClusterMapHistoryReferenceSummary::default(),
                         pg_observations: Vec::new(),
                     },
                     1_000,
@@ -11007,6 +11020,8 @@ mod tests {
                         endpoint: heartbeat_socket_path.to_str().unwrap().to_owned(),
                         observed_epoch: first.cluster_epoch(),
                         requested_lease_duration_ms: 1_000,
+                        cluster_map_history_reference_summary:
+                            crate::PgClusterMapHistoryReferenceSummary::default(),
                         pg_observations: Vec::new(),
                     },
                     1_001,
@@ -11033,6 +11048,8 @@ mod tests {
                         endpoint: heartbeat_socket_path.to_str().unwrap().to_owned(),
                         observed_epoch,
                         requested_lease_duration_ms: 1_000,
+                        cluster_map_history_reference_summary:
+                            crate::PgClusterMapHistoryReferenceSummary::default(),
                         pg_observations: Vec::new(),
                     },
                     1_002,
@@ -11099,6 +11116,8 @@ mod tests {
                     endpoint: socket_path.to_str().unwrap().to_owned(),
                     observed_epoch: authority.snapshot().cluster_epoch(),
                     requested_lease_duration_ms: 1_000,
+                    cluster_map_history_reference_summary:
+                        crate::PgClusterMapHistoryReferenceSummary::default(),
                     pg_observations: Vec::new(),
                 },
                 1_000,
@@ -11112,6 +11131,8 @@ mod tests {
                     endpoint: socket_path.to_str().unwrap().to_owned(),
                     observed_epoch: first.cluster_epoch(),
                     requested_lease_duration_ms: 1_000,
+                    cluster_map_history_reference_summary:
+                        crate::PgClusterMapHistoryReferenceSummary::default(),
                     pg_observations: Vec::new(),
                 },
                 1_001,
@@ -11177,6 +11198,8 @@ mod tests {
                     endpoint: socket_path.to_str().unwrap().to_owned(),
                     observed_epoch: authority.snapshot().cluster_epoch(),
                     requested_lease_duration_ms: 1_000,
+                    cluster_map_history_reference_summary:
+                        crate::PgClusterMapHistoryReferenceSummary::default(),
                     pg_observations: Vec::new(),
                 },
                 1_000,
@@ -11190,6 +11213,8 @@ mod tests {
                     endpoint: socket_path.to_str().unwrap().to_owned(),
                     observed_epoch: first.cluster_epoch(),
                     requested_lease_duration_ms: 1_000,
+                    cluster_map_history_reference_summary:
+                        crate::PgClusterMapHistoryReferenceSummary::default(),
                     pg_observations: Vec::new(),
                 },
                 1_001,
@@ -11297,6 +11322,8 @@ mod tests {
                     endpoint: socket_path.to_str().unwrap().to_owned(),
                     observed_epoch: authority.snapshot().cluster_epoch(),
                     requested_lease_duration_ms: 1_000,
+                    cluster_map_history_reference_summary:
+                        crate::PgClusterMapHistoryReferenceSummary::default(),
                     pg_observations: Vec::new(),
                 },
                 1_000,
@@ -11310,6 +11337,8 @@ mod tests {
                     endpoint: socket_path.to_str().unwrap().to_owned(),
                     observed_epoch: first.cluster_epoch(),
                     requested_lease_duration_ms: 1_000,
+                    cluster_map_history_reference_summary:
+                        crate::PgClusterMapHistoryReferenceSummary::default(),
                     pg_observations: Vec::new(),
                 },
                 1_001,

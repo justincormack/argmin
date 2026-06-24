@@ -2229,6 +2229,8 @@ mod tests {
                             endpoint: endpoint.clone(),
                             observed_epoch,
                             requested_lease_duration_ms: 1_000,
+                            cluster_map_history_reference_summary:
+                                storage::PgClusterMapHistoryReferenceSummary::default(),
                             pg_observations: Vec::new(),
                         },
                         now_ms,
@@ -2282,6 +2284,8 @@ mod tests {
                             endpoint: endpoint.clone(),
                             observed_epoch,
                             requested_lease_duration_ms: 1_000,
+                            cluster_map_history_reference_summary:
+                                storage::PgClusterMapHistoryReferenceSummary::default(),
                             pg_observations: vec![peering_observation],
                         },
                         now_ms,
@@ -2307,6 +2311,8 @@ mod tests {
                         endpoint,
                         observed_epoch: authority.snapshot().cluster_epoch(),
                         requested_lease_duration_ms: 1_000,
+                        cluster_map_history_reference_summary:
+                            storage::PgClusterMapHistoryReferenceSummary::default(),
                         pg_observations: vec![NodePgHeartbeatObservation {
                             pg_id: PgId::new(0),
                             state: PgState::Active,
