@@ -492,6 +492,33 @@ fn test_cors_preflight_basic() {
 }
 
 #[test]
+fn test_cors_preflight_ignores_non_empty_body() {
+    s3_tests::run(async {
+        let rule = simple_rule("http://example.com", &["GET"]);
+        let bucket = setup_cors_bucket(vec![rule]).await;
+        let url = format!("{}/{}", CTX.endpoint(), bucket);
+
+        let mut resp = agent()
+            .options(&url)
+            .header("Origin", "http://example.com")
+            .header("Access-Control-Request-Method", "GET")
+            .send("this body should not affect preflight evaluation")
+            .expect("transport error");
+        let body = resp.body_mut().read_to_string().unwrap();
+
+        assert_eq!(resp.status().as_u16(), 200, "unexpected body: {body}");
+        assert_eq!(
+            resp.headers()
+                .get("Access-Control-Allow-Origin")
+                .map(|h| h.to_str().unwrap()),
+            Some("http://example.com")
+        );
+
+        cleanup(&bucket, &[]).await;
+    });
+}
+
+#[test]
 fn test_cors_preflight_no_match() {
     s3_tests::run(async {
         let rule = simple_rule("http://example.com", &["GET"]);

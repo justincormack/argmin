@@ -911,6 +911,38 @@ async fn handle(
         ));
     }
 
+    if parts.method == http::Method::OPTIONS {
+        let s3req = match S3Request::from_hyper_headers(parts, transport_security) {
+            Ok(req) => req,
+            Err(err) => {
+                return Ok(s3_response_to_hyper(
+                    S3Response::error_with_ids(&err, "", &wire_ids),
+                    Some(req_permit),
+                    state.config.stream_read_chunk_size,
+                    state.config.panic_on_500,
+                    state.config.abort_on_500,
+                    response_trace,
+                ));
+            }
+        };
+        let state_ref = Arc::clone(&state);
+        let wire_ids_for_blocking = wire_ids.clone();
+        let resp = spawn_blocking_with_trace(trace, move || {
+            let frontend = acquire_frontend(&state_ref);
+            frontend.handle_s3_request(&s3req, &wire_ids_for_blocking)
+        })
+        .await
+        .unwrap_or_else(|_| internal_error_response(&wire_ids));
+        return Ok(s3_response_to_hyper(
+            resp,
+            Some(req_permit),
+            state.config.stream_read_chunk_size,
+            state.config.panic_on_500,
+            state.config.abort_on_500,
+            response_trace,
+        ));
+    }
+
     // Non-streaming path: collect the full body for buffered control-plane
     // style requests (mostly XML payloads).
     let body_limit = buffered_body_limit_for_request_parts(&parts);
@@ -4921,6 +4953,49 @@ mod tests {
         (response, bytes_sent.load(Ordering::Relaxed))
     }
 
+    fn response_before_request_body_sent(
+        addr: &str,
+        request_head: String,
+        total_body_bytes: usize,
+    ) -> (String, usize) {
+        const WRITE_CHUNK_BYTES: usize = 1024;
+        const WRITE_CHUNK_DELAY: Duration = Duration::from_millis(20);
+        const RESPONSE_TIMEOUT: Duration = Duration::from_secs(3);
+
+        let mut stream = StdTcpStream::connect(addr).unwrap();
+        stream.set_nodelay(true).unwrap();
+
+        let mut writer = stream.try_clone().unwrap();
+        writer.set_nodelay(true).unwrap();
+
+        let bytes_sent = Arc::new(AtomicUsize::new(0));
+        let bytes_sent_writer = Arc::clone(&bytes_sent);
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop_writer = Arc::clone(&stop);
+        let body_chunk = vec![b'x'; WRITE_CHUNK_BYTES];
+        let writer_handle = std::thread::spawn(move || {
+            writer.write_all(request_head.as_bytes()).unwrap();
+            let chunk_count = total_body_bytes / WRITE_CHUNK_BYTES;
+            for _ in 0..chunk_count {
+                if stop_writer.load(Ordering::Relaxed) {
+                    break;
+                }
+                match writer.write_all(&body_chunk) {
+                    Ok(()) => {
+                        bytes_sent_writer.fetch_add(WRITE_CHUNK_BYTES, Ordering::Relaxed);
+                        std::thread::sleep(WRITE_CHUNK_DELAY);
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let response = read_http_response(&mut stream, RESPONSE_TIMEOUT);
+        stop.store(true, Ordering::Relaxed);
+        writer_handle.join().unwrap();
+        (response, bytes_sent.load(Ordering::Relaxed))
+    }
+
     fn denied_streaming_multipart_request_response(
         addr: &str,
         request_head: String,
@@ -6402,6 +6477,41 @@ Connection: keep-alive\r\n\r\n"
         assert!(
             bytes_sent < TOTAL_BODY_BYTES,
             "server read the full denied UploadPart body before responding: sent {bytes_sent} bytes"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn options_preflight_responds_before_full_body_is_sent() {
+        const TOTAL_BODY_BYTES: usize = 256 * 1024;
+
+        let tmp = test_util::tempdir();
+        let frontend = setup_frontend(tmp.path());
+        create_test_bucket(&frontend, "mybucket");
+        let (addr, _guard) = start_test_server(Arc::clone(&frontend)).await;
+
+        let request = format!(
+            "OPTIONS /mybucket HTTP/1.1\r\n\
+Host: {addr}\r\n\
+Origin: http://example.com\r\n\
+Access-Control-Request-Method: GET\r\n\
+Content-Length: {TOTAL_BODY_BYTES}\r\n\
+Connection: keep-alive\r\n\r\n"
+        );
+        let (response, bytes_sent) =
+            response_before_request_body_sent(&addr, request, TOTAL_BODY_BYTES);
+
+        assert!(
+            response.starts_with("HTTP/1.1 403"),
+            "expected 403 status, got: {}",
+            response.lines().next().unwrap_or("")
+        );
+        assert!(
+            !response.contains("MaxMessageLengthExceeded"),
+            "OPTIONS preflight should not reject based on ignored body size: {response}"
+        );
+        assert!(
+            bytes_sent < TOTAL_BODY_BYTES,
+            "server read the full OPTIONS body before responding: sent {bytes_sent} bytes"
         );
     }
 
