@@ -8428,6 +8428,12 @@ Metadata PG migration and backfill design notes:
   manager after the floor is reported, waits for the target PG/runtime map to
   become serving again, and re-checks the per-node floors before historical
   reads so the smoke proves the persisted floor survives control-plane reload.
+- Added the release-side retained-history regression for storage-owned floors.
+  Once a storage node heartbeat no longer reports any live-placement or durable
+  backfill epoch reference, the control plane clears that node's persisted
+  history floor; later unrelated epoch churn can then prune the formerly
+  protected old cluster map, and reload preserves the cleared floor. This keeps
+  the new data-aware retention model from becoming an unbounded one-way pin.
 
 Exit criteria:
 
