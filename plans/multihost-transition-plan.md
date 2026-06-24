@@ -8434,6 +8434,35 @@ Metadata PG migration and backfill design notes:
   history floor; later unrelated epoch churn can then prune the formerly
   protected old cluster map, and reload preserves the cleared floor. This keeps
   the new data-aware retention model from becoming an unbounded one-way pin.
+- Next deterministic epoch-change fault-injection direction:
+  - build scoped, named failpoints at existing command/RPC boundaries rather
+    than sleeps or random chaos. Each hook must carry an operation/test token so
+    parallel cargo tests, background workers, or unrelated requests cannot
+    satisfy the wrong gate.
+  - tests drive epoch changes explicitly: start an operation, wait until it
+    reaches a precise failpoint, mutate the PG acting set or cluster epoch,
+    release the operation, then assert it either commits exactly once, retries
+    through the correct route/history, or fails closed with no visible partial
+    state.
+  - start with local/in-process tests for precision, then add only a small UAT
+    subset for whole-process/RPC confidence. UAT hooks need an inert-by-default
+    dev/test-hook surface; pure cargo tests can use `cfg(test)` hooks.
+  - first operation matrix should cover normal S3 paths with the highest
+    partial-state risk:
+    - PUT object with an epoch change after payload shard writes but before
+      metadata publish.
+    - PUT overwrite with an epoch change after generation reservation/proof but
+      before publish.
+    - DELETE object with an epoch change after metadata command allocation or
+      reservation.
+    - GET/HEAD with an epoch change between metadata resolution and payload
+      read, proving recorded placement/history is used or the operation fails
+      closed rather than reading the wrong current placement.
+    - LIST with an epoch change during metadata pagination or route refresh,
+      proving results are either from a coherent command-log/materialized-state
+      view or fail closed without externally visible partial listings.
+    - later expand to multipart complete and tag/ACL/legal-hold/retention
+      metadata mutations.
 
 Exit criteria:
 
