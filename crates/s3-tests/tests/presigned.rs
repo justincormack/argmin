@@ -2,8 +2,10 @@ use std::time::Duration;
 
 use aws_sdk_s3::primitives::ByteStream;
 use s3_tests::{
-    create_public_bucket, object_url, presign_url_with_credentials, sse_c_header_values,
-    test_sse_c_key, unique_bucket, PresignedRequest, SignedRequestCredentials, CTX,
+    create_public_bucket, object_url, presign_url_with_credentials,
+    presign_url_without_host_signed_header, send_signed_request_with_unsigned_headers,
+    send_signed_request_without_host_signed_header, sse_c_header_values, test_sse_c_key,
+    unique_bucket, PresignedRequest, SignedRequestCredentials, CTX,
 };
 
 const NO_HEADERS: [(&str, &str); 0] = [];
@@ -98,6 +100,29 @@ where
     )
 }
 
+fn presign_object_without_host_signed_header<K, V, I>(
+    method: &str,
+    bucket: &str,
+    key: &str,
+    expires: Duration,
+    extra_headers: I,
+    payload_hash: Option<&str>,
+) -> PresignedRequest
+where
+    K: AsRef<str>,
+    V: AsRef<str>,
+    I: IntoIterator<Item = (K, V)>,
+{
+    presign_url_without_host_signed_header(
+        method,
+        &object_url(CTX.endpoint(), bucket, key, None),
+        expires,
+        extra_headers,
+        payload_hash,
+        primary_credentials(),
+    )
+}
+
 fn presign_object<K, V, I>(
     method: &str,
     bucket: &str,
@@ -133,6 +158,163 @@ async fn cleanup_with_client(client: &aws_sdk_s3::Client, bucket: &str, keys: &[
 
 async fn cleanup(bucket: &str, keys: &[&str]) {
     cleanup_with_client(CTX.client(), bucket, keys).await;
+}
+
+fn assert_headers_not_signed_error(status: u16, body: &str, expected_headers: &str) {
+    assert_eq!(status, 403, "expected 403, got {status}: {body}");
+    assert!(
+        body.contains("<Code>AccessDenied</Code>"),
+        "expected AccessDenied response, got: {body}"
+    );
+    assert!(
+        body.contains(&format!(
+            "<HeadersNotSigned>{expected_headers}</HeadersNotSigned>"
+        )),
+        "expected {expected_headers} in HeadersNotSigned, got: {body}"
+    );
+}
+
+fn assert_signature_does_not_match(status: u16, body: &str) {
+    assert_eq!(status, 403, "expected 403, got {status}: {body}");
+    assert!(
+        body.contains("<Code>SignatureDoesNotMatch</Code>"),
+        "expected SignatureDoesNotMatch response, got: {body}"
+    );
+}
+
+#[test]
+fn test_header_sigv4_requires_host_signed_header() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+        let body = b"header sigv4 missing signed host";
+
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key("host-header-auth")
+            .body(ByteStream::from_static(body))
+            .send()
+            .await
+            .unwrap();
+
+        let response = send_signed_request_without_host_signed_header(
+            "GET",
+            &object_url(CTX.endpoint(), &bucket, "host-header-auth", None),
+            b"",
+            NO_HEADERS,
+            primary_credentials(),
+        );
+        assert_headers_not_signed_error(response.status, &response.body, "host");
+
+        cleanup(&bucket, &["host-header-auth"]).await;
+    });
+}
+
+#[test]
+fn test_presigned_sigv4_requires_host_signed_header() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+        let body = b"presigned sigv4 missing signed host";
+
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key("host-presigned-auth")
+            .body(ByteStream::from_static(body))
+            .send()
+            .await
+            .unwrap();
+
+        let payload_hash = sha256_hex(b"");
+        let presigned = presign_object_without_host_signed_header(
+            "GET",
+            &bucket,
+            "host-presigned-auth",
+            Duration::from_secs(900),
+            NO_HEADERS,
+            Some(&payload_hash),
+        );
+
+        let mut response = with_presigned_headers!(agent().get(presigned.uri()), presigned)
+            .call()
+            .expect("transport error");
+        let status = response.status().as_u16();
+        let body = response.body_mut().read_to_string().unwrap_or_default();
+        assert_headers_not_signed_error(status, &body, "host");
+
+        cleanup(&bucket, &["host-presigned-auth"]).await;
+    });
+}
+
+#[test]
+fn test_header_sigv4_unsigned_amz_header_reports_headers_not_signed() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+        let body = b"header sigv4 unsigned amz header";
+
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key("unsigned-amz-header-auth")
+            .body(ByteStream::from_static(body))
+            .send()
+            .await
+            .unwrap();
+
+        let response = send_signed_request_with_unsigned_headers(
+            "GET",
+            &object_url(CTX.endpoint(), &bucket, "unsigned-amz-header-auth", None),
+            b"",
+            NO_HEADERS,
+            &[("x-amz-meta-unsigned", "value")],
+            primary_credentials(),
+        );
+        assert_headers_not_signed_error(response.status, &response.body, "x-amz-meta-unsigned");
+
+        cleanup(&bucket, &["unsigned-amz-header-auth"]).await;
+    });
+}
+
+#[test]
+fn test_presigned_sigv4_unsigned_amz_content_sha256_mismatches_signature() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+        let body = b"presigned sigv4 unsigned amz header";
+
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key("unsigned-amz-presigned-auth")
+            .body(ByteStream::from_static(body))
+            .send()
+            .await
+            .unwrap();
+
+        let payload_hash = sha256_hex(b"");
+        let presigned = presign_object(
+            "GET",
+            &bucket,
+            "unsigned-amz-presigned-auth",
+            None,
+            Duration::from_secs(900),
+            NO_HEADERS,
+            None,
+        );
+
+        let mut response = with_presigned_headers!(agent().get(presigned.uri()), presigned)
+            .header("x-amz-content-sha256", &payload_hash)
+            .call()
+            .expect("transport error");
+        let status = response.status().as_u16();
+        let body = response.body_mut().read_to_string().unwrap_or_default();
+        assert_signature_does_not_match(status, &body);
+
+        cleanup(&bucket, &["unsigned-amz-presigned-auth"]).await;
+    });
 }
 
 // ── Presigned GET ───────────────────────────────────────────────────────

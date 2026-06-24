@@ -98,6 +98,32 @@ pub fn parse_auth_header(value: &str) -> Result<SigV4Auth, AuthError> {
     })
 }
 
+pub(crate) fn unsigned_required_headers<H, S>(signed_headers: &[S], headers: &H) -> Vec<String>
+where
+    H: HeaderSource + ?Sized,
+    S: AsRef<str>,
+{
+    let mut unsigned_headers: Vec<String> = Vec::new();
+    if headers.first_value("host").is_some()
+        && !signed_headers
+            .iter()
+            .any(|signed_header| signed_header.as_ref() == "host")
+    {
+        unsigned_headers.push("host".to_string());
+    }
+    headers.visit(|name, _| {
+        if name.starts_with("x-amz-")
+            && !signed_headers
+                .iter()
+                .any(|signed_header| signed_header.as_ref() == name)
+            && !unsigned_headers.iter().any(|header| header == name)
+        {
+            unsigned_headers.push(name.to_string());
+        }
+    });
+    unsigned_headers
+}
+
 /// Derive the SigV4 signing key.
 ///
 /// SigningKey = HMAC-SHA256(HMAC-SHA256(HMAC-SHA256(HMAC-SHA256(
@@ -179,17 +205,9 @@ pub(crate) fn verify_request_record<'a, H: HeaderSource + ?Sized>(
         }
     }
 
-    // AWS requires all x-amz-* headers to be signed (security: prevents injection
-    // of unsigned x-amz-* headers).
-    let mut unsigned_headers: Vec<String> = Vec::new();
-    headers.visit(|name, _| {
-        if name.starts_with("x-amz-")
-            && !auth.signed_headers.iter().any(|sh| sh == name)
-            && !unsigned_headers.iter().any(|h| h == name)
-        {
-            unsigned_headers.push(name.to_string());
-        }
-    });
+    // AWS requires Host and all x-amz-* headers to be signed (security:
+    // prevents injection of request-routing and S3 control headers).
+    let unsigned_headers = unsigned_required_headers(&auth.signed_headers, headers);
     if !unsigned_headers.is_empty() {
         return Err(AuthError::UnsignedHeaders {
             headers: unsigned_headers,
@@ -723,6 +741,37 @@ mod tests {
             &store,
         );
         assert!(matches!(result, Err(AuthError::UnsignedHeaders { .. })));
+    }
+
+    #[test]
+    fn verify_request_unsigned_host_header() {
+        let store = example_store();
+        let auth_header = "AWS4-HMAC-SHA256 \
+            Credential=AKIAIOSFODNN7EXAMPLE/20130524/us-east-1/s3/aws4_request, \
+            SignedHeaders=x-amz-content-sha256;x-amz-date, \
+            Signature=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let auth = parse_auth_header(auth_header).unwrap();
+        let headers = [
+            ("host", "example.com"),
+            (
+                "x-amz-content-sha256",
+                "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            ),
+            ("x-amz-date", "20130524T000000Z"),
+        ];
+        let result = verify_request(
+            "GET",
+            "/",
+            "",
+            &headers,
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            &auth,
+            &store,
+        );
+        assert!(matches!(
+            result,
+            Err(AuthError::UnsignedHeaders { headers }) if headers == ["host"]
+        ));
     }
 
     #[test]

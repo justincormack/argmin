@@ -1155,6 +1155,55 @@ where
     V: AsRef<str>,
     I: IntoIterator<Item = (K, V)>,
 {
+    presign_url_with_credentials_inner(
+        method,
+        url_str,
+        expires,
+        extra_headers,
+        payload_hash,
+        credentials,
+        true,
+    )
+}
+
+pub fn presign_url_without_host_signed_header<K, V, I>(
+    method: &str,
+    url_str: &str,
+    expires: Duration,
+    extra_headers: I,
+    payload_hash: Option<&str>,
+    credentials: SignedRequestCredentials<'_>,
+) -> PresignedRequest
+where
+    K: AsRef<str>,
+    V: AsRef<str>,
+    I: IntoIterator<Item = (K, V)>,
+{
+    presign_url_with_credentials_inner(
+        method,
+        url_str,
+        expires,
+        extra_headers,
+        payload_hash,
+        credentials,
+        false,
+    )
+}
+
+fn presign_url_with_credentials_inner<K, V, I>(
+    method: &str,
+    url_str: &str,
+    expires: Duration,
+    extra_headers: I,
+    payload_hash: Option<&str>,
+    credentials: SignedRequestCredentials<'_>,
+    include_host_signed_header: bool,
+) -> PresignedRequest
+where
+    K: AsRef<str>,
+    V: AsRef<str>,
+    I: IntoIterator<Item = (K, V)>,
+{
     let parsed = url::Url::parse(url_str).expect("parse URL");
     let path = parsed.path();
     let base_query = parsed.query().unwrap_or("");
@@ -1176,7 +1225,10 @@ where
         .expect("URL host");
 
     let payload_hash = payload_hash.unwrap_or("UNSIGNED-PAYLOAD").to_string();
-    let mut request_headers = vec![("host".to_string(), host)];
+    let mut request_headers = Vec::new();
+    if include_host_signed_header {
+        request_headers.push(("host".to_string(), host));
+    }
     if payload_hash != "UNSIGNED-PAYLOAD" {
         request_headers.push(("x-amz-content-sha256".to_string(), payload_hash.clone()));
     }
@@ -1289,6 +1341,8 @@ where
             tls_ca_pem: CTX.tls_ca_pem(),
         },
         true,
+        Vec::new(),
+        true,
     )
 }
 
@@ -1312,6 +1366,67 @@ where
         extra_headers,
         "s3",
         credentials,
+    )
+}
+
+/// Send a raw signed request whose SigV4 `SignedHeaders` intentionally omits
+/// `host`, while still sending the normal HTTP Host header on the wire.
+pub fn send_signed_request_without_host_signed_header<K, V, I>(
+    method: &str,
+    url_str: &str,
+    body: &[u8],
+    extra_headers: I,
+    credentials: SignedRequestCredentials<'_>,
+) -> RawResponse
+where
+    K: AsRef<str>,
+    V: AsRef<str>,
+    I: IntoIterator<Item = (K, V)>,
+{
+    send_signed_request_to_endpoint_for_service_with_credentials_inner(
+        method,
+        url_str,
+        url_str,
+        body,
+        extra_headers,
+        "s3",
+        credentials,
+        false,
+        Vec::new(),
+        false,
+    )
+}
+
+/// Send a raw signed request with additional headers present on the wire but
+/// intentionally excluded from SigV4 `SignedHeaders`.
+pub fn send_signed_request_with_unsigned_headers<K, V, I>(
+    method: &str,
+    url_str: &str,
+    body: &[u8],
+    extra_headers: I,
+    unsigned_headers: &[(&str, &str)],
+    credentials: SignedRequestCredentials<'_>,
+) -> RawResponse
+where
+    K: AsRef<str>,
+    V: AsRef<str>,
+    I: IntoIterator<Item = (K, V)>,
+{
+    let unsigned_headers = unsigned_headers
+        .iter()
+        .map(|(name, value)| (name.to_lowercase(), (*value).to_string()))
+        .collect();
+    send_signed_request_to_endpoint_for_service_with_credentials_inner(
+        method,
+        url_str,
+        url_str,
+        body,
+        extra_headers,
+        "s3",
+        credentials,
+        false,
+        unsigned_headers,
+        true,
     )
 }
 
@@ -1365,6 +1480,8 @@ where
         service,
         credentials,
         false,
+        Vec::new(),
+        true,
     )
 }
 
@@ -1378,6 +1495,8 @@ fn send_signed_request_to_endpoint_for_service_with_credentials_inner<K, V, I>(
     service: &str,
     credentials: SignedRequestCredentials<'_>,
     allow_response_body_error: bool,
+    unsigned_headers: Vec<(String, String)>,
+    include_host_signed_header: bool,
 ) -> RawResponse
 where
     K: AsRef<str>,
@@ -1416,10 +1535,12 @@ where
     let payload_hash = sha256_hex(body);
 
     let mut request_headers: Vec<(String, String)> = vec![
-        ("host".to_string(), host),
         ("x-amz-content-sha256".to_string(), payload_hash.clone()),
         ("x-amz-date".to_string(), amz_date.clone()),
     ];
+    if include_host_signed_header {
+        request_headers.push(("host".to_string(), host));
+    }
     for (name, value) in extra_headers {
         request_headers.push((name.as_ref().to_lowercase(), value.as_ref().to_string()));
     }
@@ -1475,6 +1596,9 @@ where
                 }
                 request = request.header(name, value);
             }
+            for (name, value) in &unsigned_headers {
+                request = request.header(name, value);
+            }
             request.call()
         } else if method == "GET" {
             let mut request = agent
@@ -1489,6 +1613,9 @@ where
                 }
                 request = request.header(name, value);
             }
+            for (name, value) in &unsigned_headers {
+                request = request.header(name, value);
+            }
             request.call()
         } else if method == "DELETE" {
             let mut request = agent
@@ -1501,6 +1628,9 @@ where
                 if name == "host" || name == "x-amz-content-sha256" || name == "x-amz-date" {
                     continue;
                 }
+                request = request.header(name, value);
+            }
+            for (name, value) in &unsigned_headers {
                 request = request.header(name, value);
             }
             request.call()
@@ -1518,6 +1648,9 @@ where
                 if name == "host" || name == "x-amz-content-sha256" || name == "x-amz-date" {
                     continue;
                 }
+                request = request.header(name, value);
+            }
+            for (name, value) in &unsigned_headers {
                 request = request.header(name, value);
             }
             if allow_response_body_error {

@@ -458,6 +458,12 @@ fn authenticate_presigned<H: HeaderSource + ?Sized>(
     });
     validate_record_token_and_expiry(record, token.as_deref(), now_epoch_secs)?;
 
+    if headers.first_value("host").is_some() && !signed_headers.contains(&"host") {
+        return Err(AuthError::UnsignedHeaders {
+            headers: vec!["host".to_string()],
+        });
+    }
+
     let signed_header_pairs = collect_signed_headers(&signed_headers, headers)?;
     let canonical_hdrs = canonical_headers(&signed_header_pairs);
     let signed_headers_joined = signed_headers.join(";");
@@ -1960,6 +1966,35 @@ mod tests {
         assert!(matches!(
             err,
             AuthError::MissingSignedHeader { header } if header == "host"
+        ));
+    }
+
+    #[test]
+    fn presigned_unsigned_host_header_rejected() {
+        let store = example_store();
+        let query = "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIAIOSFODNN7EXAMPLE%2F20240201%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Date=20240201T120000Z&X-Amz-Expires=900&X-Amz-SignedHeaders=x-amz-content-sha256&X-Amz-Signature=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let headers = [
+            ("host", "example.com"),
+            (
+                "x-amz-content-sha256",
+                "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            ),
+        ];
+        let err = authenticate_request(
+            "GET",
+            "/",
+            query,
+            &headers,
+            b"",
+            &store,
+            Some("us-east-1"),
+            "s3",
+            0,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            AuthError::UnsignedHeaders { headers } if headers == ["host"]
         ));
     }
 
