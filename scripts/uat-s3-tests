@@ -520,6 +520,10 @@ wait_for_control_plane_pg_active() {
     done
 }
 
+control_plane_cluster_epoch() {
+    awk -F= '$1 == "cluster_epoch" { print $2; exit }' "$control_plane_state_path"
+}
+
 wait_for_control_plane_node_epochs_aligned() {
     local deadline_seconds="$1"
     local min_epoch="${2:-1}"
@@ -601,6 +605,58 @@ print_control_plane_runtime_map_diagnostics() {
     "${server_cmd[@]}" control-plane-runtime-map-diagnostics "$control_plane_socket_path" >&2 || true
 }
 
+runtime_map_node_storage_history_floor() {
+    local diagnostics="$1"
+    local node_id="$2"
+    awk -v wanted_node_id="$node_id" '
+        $1 == ("node_id=" wanted_node_id) {
+            for (i = 1; i <= NF; i++) {
+                split($i, fields, "=")
+                if (fields[1] == "storage_history_floor_epoch") {
+                    print fields[2]
+                    exit
+                }
+            }
+        }
+    ' <<<"$diagnostics"
+}
+
+wait_for_control_plane_storage_history_floor_nodes() {
+    local deadline_seconds="$1"
+    local max_floor_epoch="$2"
+    shift 2
+    local expected_node_ids=("$@")
+    local start
+    start="$(date +%s)"
+    local diagnostics=""
+    while true; do
+        if diagnostics="$("${server_cmd[@]}" control-plane-runtime-map-diagnostics "$control_plane_socket_path" 2>/dev/null)"; then
+            local matched_nodes=0
+            local node_id
+            for node_id in "${expected_node_ids[@]}"; do
+                local node_floor
+                node_floor="$(runtime_map_node_storage_history_floor "$diagnostics" "$node_id")"
+                if [[ "$node_floor" =~ ^[0-9]+$ ]] && ((node_floor <= max_floor_epoch)); then
+                    matched_nodes=$((matched_nodes + 1))
+                fi
+            done
+            if ((matched_nodes == ${#expected_node_ids[@]})); then
+                echo "== argmin-s3 UAT control-plane storage history floors: nodes=${expected_node_ids[*]} max_expected_epoch=$max_floor_epoch =="
+                return 0
+            fi
+        fi
+        if (($(date +%s) - start >= deadline_seconds)); then
+            if [[ -n "$diagnostics" ]]; then
+                printf '%s\n' "$diagnostics" >&2
+            else
+                print_control_plane_runtime_map_diagnostics
+            fi
+            die "timed out waiting for control-plane storage history floors on nodes ${expected_node_ids[*]} at or before epoch $max_floor_epoch"
+        fi
+        sleep 0.2
+    done
+}
+
 wait_for_frontend_storage_epoch_at_least() {
     local expected_epoch="$1"
     local deadline_seconds="$2"
@@ -633,6 +689,17 @@ wait_for_serving_runtime_installed() {
     wait_for_control_plane_runtime_map_ready "$deadline_seconds" "$frontend_epoch"
     wait_for_control_plane_node_epochs_aligned "$deadline_seconds" "$control_plane_runtime_map_ready_epoch"
     wait_for_frontend_storage_epoch_at_least "$control_plane_aligned_epoch" "$deadline_seconds" "$metrics_path"
+}
+
+wait_for_target_pg_runtime_installed() {
+    local pg_id="$1"
+    local expected_acting_set="$2"
+    local deadline_seconds="$3"
+    local metrics_path="$4"
+    wait_for_control_plane_pg_active "$pg_id" "$deadline_seconds" "$expected_acting_set"
+    local target_epoch
+    target_epoch="$(control_plane_cluster_epoch)"
+    wait_for_frontend_storage_epoch_at_least "$target_epoch" "$deadline_seconds" "$metrics_path"
 }
 
 latest_metric_sample_value() {
@@ -1581,8 +1648,9 @@ run_pg_backfill_migration_smoke() {
     fi
 
     set_pg_acting_set "old placement nodes 0,1 for PG backfill iteration $iteration" "$target_data_pg" 0 1
-    wait_for_control_plane_pg_active "$target_data_pg" 10 "0:1"
-    wait_for_serving_runtime_installed 10 "$metrics_path"
+    wait_for_target_pg_runtime_installed "$target_data_pg" "0:1" 10 "$metrics_path"
+    local old_floor_before_object_diagnostics=""
+    old_floor_before_object_diagnostics="$("${server_cmd[@]}" control-plane-runtime-map-diagnostics "$control_plane_socket_path" 2>/dev/null || true)"
     sample_frontend_metrics "$metrics_path"
     local reset_min_scan_total
     local reset_min_enqueued
@@ -1647,6 +1715,17 @@ run_pg_backfill_migration_smoke() {
     local max_record_error_failed
     local min_pg_backfilled
     local min_pg_completed
+    local old_placement_floor_max_epoch
+    old_placement_floor_max_epoch="$(latest_metric_sample_value "$metrics_path" frontend_storage_cluster_epoch)"
+    local old_floor_nodes_needing_signal=()
+    local old_floor_node_id
+    for old_floor_node_id in 0 1; do
+        local old_floor_before_object
+        old_floor_before_object="$(runtime_map_node_storage_history_floor "$old_floor_before_object_diagnostics" "$old_floor_node_id")"
+        if ! [[ "$old_floor_before_object" =~ ^[0-9]+$ ]] || ((old_floor_before_object > old_placement_floor_max_epoch)); then
+            old_floor_nodes_needing_signal+=("$old_floor_node_id")
+        fi
+    done
     min_scan_total="$(latest_metric_sample_value "$metrics_path" shard_backfill_candidate_scan_total)"
     min_enqueued="$(($(latest_metric_sample_value "$metrics_path" shard_backfill_candidate_enqueued_total) + 1))"
     min_written="$(($(latest_metric_sample_value "$metrics_path" shard_backfill_shards_written_total) + 1))"
@@ -1657,8 +1736,12 @@ run_pg_backfill_migration_smoke() {
     min_pg_completed="$(($(latest_metric_family_label_sum "$metrics_path" shard_backfill_event_by_pg_total pg_id "$data_pg" event complete_succeeded) + 1))"
 
     set_pg_acting_set "desired placement nodes 0,2" "$data_pg" 0 2
-    wait_for_control_plane_pg_active "$data_pg" 10 "0:2"
-    wait_for_serving_runtime_installed 10 "$metrics_path"
+    wait_for_target_pg_runtime_installed "$data_pg" "0:2" 10 "$metrics_path"
+    if ((${#old_floor_nodes_needing_signal[@]})); then
+        wait_for_control_plane_storage_history_floor_nodes 20 "$old_placement_floor_max_epoch" "${old_floor_nodes_needing_signal[@]}"
+    else
+        echo "== argmin-s3 UAT control-plane storage history floors: old acting nodes already retained epoch <= $old_placement_floor_max_epoch before current object =="
+    fi
     max_candidate_failed="$(latest_metric_sample_value "$metrics_path" shard_backfill_candidate_failed_total)"
     max_scan_error="$(latest_metric_sample_value "$metrics_path" shard_backfill_candidate_scan_error_total)"
     max_complete_failed="$(latest_metric_family_label_sum "$metrics_path" shard_backfill_event_by_pg_total event complete_failed)"

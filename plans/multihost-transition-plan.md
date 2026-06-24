@@ -8415,6 +8415,16 @@ Metadata PG migration and backfill design notes:
   runtime epoch, route counts, active serving counts, retained-history floor,
   and per-node storage history floors so long-running transition failures can
   be debugged without rerunning with extra instrumentation.
+- Added positive PG-backfill UAT coverage for storage-owned cluster-map history
+  floors. The smoke now writes and reads an old-placement object, moves the data
+  PG, and waits until control-plane runtime-map diagnostics report per-node
+  storage history floors on the old acting-set nodes at or before the old
+  placement epoch before relying on historical reads/backfill. In repeat runs
+  the floor is a per-node minimum across all retained objects, so later
+  iterations snapshot the pre-object floor and only require a new floor signal
+  for old acting-set nodes that were not already retaining a sufficiently old
+  epoch; current-iteration backfill is still pinned separately by per-data-PG
+  completion metrics.
 
 Exit criteria:
 

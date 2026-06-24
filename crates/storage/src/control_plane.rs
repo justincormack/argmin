@@ -621,6 +621,7 @@ impl ClusterControlSnapshot {
                 record.state = PgState::Peering;
                 record.active_primary = None;
                 record.active_metadata_proof = None;
+                record.active_metadata_proof_epoch = None;
                 record.active_metadata_transfer_imported = false;
                 record.peering_metadata_transfer = None;
                 record.peering_metadata_transfer_source_route_epoch = None;
@@ -960,6 +961,10 @@ pub struct PgControlRecord {
     // Activation-time metadata floor. Active heartbeats may report later
     // metadata progress, but not an older or divergent proof at this index.
     active_metadata_proof: Option<PgMetadataProof>,
+    // Cluster epoch in which active_metadata_proof was observed. Metadata
+    // command logs are epoch-local, so active primary progress in a later epoch
+    // is not ordered by the bare log tuple alone.
+    active_metadata_proof_epoch: Option<ClusterEpoch>,
     // True only when the active metadata proof was imported through an explicit
     // metadata transfer marker. This scopes destination-epoch local proof
     // relaxation to transferred PGs instead of all Active primaries.
@@ -998,6 +1003,7 @@ impl PgControlRecord {
             acting_set,
             active_primary: None,
             active_metadata_proof: None,
+            active_metadata_proof_epoch: None,
             active_metadata_transfer_imported: false,
             peering_metadata_proof_floor: None,
             peering_metadata_transfer: None,
@@ -1032,6 +1038,11 @@ impl PgControlRecord {
     #[must_use]
     pub fn active_metadata_proof(&self) -> Option<PgMetadataProof> {
         self.active_metadata_proof
+    }
+
+    #[must_use]
+    pub fn active_metadata_proof_epoch(&self) -> Option<ClusterEpoch> {
+        self.active_metadata_proof_epoch
     }
 
     #[must_use]
@@ -1825,6 +1836,7 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
                 record.state = PgState::Peering;
                 record.active_primary = None;
                 record.active_metadata_proof = None;
+                record.active_metadata_proof_epoch = None;
                 record.active_metadata_transfer_imported = false;
                 record.peering_metadata_proof_floor = peering_metadata_proof_floor;
                 record.peering_metadata_transfer = peering_metadata_transfer;
@@ -1933,6 +1945,7 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
         record.state = PgState::Peering;
         record.active_primary = None;
         record.active_metadata_proof = None;
+        record.active_metadata_proof_epoch = None;
         record.active_metadata_transfer_imported = false;
         record.peering_metadata_proof_floor = Some(transfer.metadata_proof());
         record.peering_metadata_transfer = Some(transfer);
@@ -2036,6 +2049,7 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
             record.state = PgState::Peering;
             record.active_primary = None;
             record.active_metadata_proof = None;
+            record.active_metadata_proof_epoch = None;
             record.active_metadata_transfer_imported = false;
             record.peering_metadata_transfer = None;
             record.peering_metadata_transfer_source_route_epoch = None;
@@ -2087,6 +2101,7 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
             record.state = state;
             record.active_primary = None;
             record.active_metadata_proof = None;
+            record.active_metadata_proof_epoch = None;
             record.active_metadata_transfer_imported = false;
             record.metadata_transfer_fenced = false;
             record.metadata_transfer_fence_source_lease_deadline_ms = None;
@@ -2188,6 +2203,12 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
         record.metadata_transfer_fence_source_lease_deadline_ms = None;
         record.metadata_transfer_fence_source_imported = false;
         next_snapshot.bump_epoch()?;
+        let active_epoch = next_snapshot.cluster_epoch;
+        next_snapshot
+            .pgs
+            .get_mut(&pg_id)
+            .expect("PG record activated before epoch bump")
+            .active_metadata_proof_epoch = Some(active_epoch);
         self.commit_snapshot(next_snapshot)?;
         Ok(self.snapshot.clone())
     }
@@ -2261,6 +2282,14 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
             record.metadata_transfer_fence_source_imported = false;
         }
         next_snapshot.bump_epoch()?;
+        let active_epoch = next_snapshot.cluster_epoch;
+        for (pg_id, _, _) in &ready {
+            next_snapshot
+                .pgs
+                .get_mut(pg_id)
+                .expect("ready PG activated before epoch bump")
+                .active_metadata_proof_epoch = Some(active_epoch);
+        }
         self.commit_snapshot(next_snapshot)?;
         Ok(ready.into_iter().map(|(pg_id, _, _)| pg_id).collect())
     }
@@ -2382,13 +2411,20 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
             let Some(current_proof) = pg.active_metadata_proof else {
                 continue;
             };
+            if observation.metadata_proof == current_proof {
+                pg.active_metadata_proof_epoch = Some(heartbeat.observed_epoch);
+                continue;
+            }
             if metadata_proof_satisfies_active_primary_observation_floor(
                 current_proof,
                 observation.metadata_proof,
                 pg.active_metadata_transfer_imported,
+                pg.active_metadata_proof_epoch,
+                heartbeat.observed_epoch,
             ) && observation.metadata_proof != current_proof
             {
                 pg.active_metadata_proof = Some(observation.metadata_proof);
+                pg.active_metadata_proof_epoch = Some(heartbeat.observed_epoch);
                 pg.active_metadata_transfer_imported = false;
             }
         }
@@ -4491,7 +4527,7 @@ fn format_pg_record(record: &PgControlRecord) -> String {
         ),
     };
     format!(
-        "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+        "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
         record.pg_id.get(),
         pg_state_as_str(record.state),
         format_node_list(&record.acting_set),
@@ -4514,7 +4550,8 @@ fn format_pg_record(record: &PgControlRecord) -> String {
         u8::from(record.metadata_transfer_fenced),
         u8::from(record.active_metadata_transfer_imported),
         option_u64(record.metadata_transfer_fence_source_lease_deadline_ms),
-        u8::from(record.metadata_transfer_fence_source_imported)
+        u8::from(record.metadata_transfer_fence_source_imported),
+        option_u64(record.active_metadata_proof_epoch.map(ClusterEpoch::get))
     )
 }
 
@@ -4814,6 +4851,8 @@ fn validate_current_pg_observations(
                     expected,
                     observation.metadata_proof,
                     pg.active_metadata_transfer_imported,
+                    pg.active_metadata_proof_epoch,
+                    observation.observed_epoch,
                 ) {
                     return Err(parse_error(
                         line,
@@ -5086,10 +5125,11 @@ fn parse_pg_record(line: usize, value: &str) -> Result<PgControlRecord, ControlP
         && fields.len() != 20
         && fields.len() != 21
         && fields.len() != 23
+        && fields.len() != 24
     {
         return Err(parse_error(
             line,
-            "PG record must have seven, ten, fourteen, seventeen, eighteen, nineteen, twenty, twenty-one, or twenty-three fields",
+            "PG record must have seven, ten, fourteen, seventeen, eighteen, nineteen, twenty, twenty-one, twenty-three, or twenty-four fields",
         ));
     }
     let pg_id = PgId::new(parse_u32(line, fields[0], "PG id")?);
@@ -5285,6 +5325,15 @@ fn parse_pg_record(line: usize, value: &str) -> Result<PgControlRecord, ControlP
         } else {
             false
         };
+    let active_metadata_proof_epoch = if fields.len() > metadata_transfer_field_offset + 4 {
+        parse_option_cluster_epoch(
+            line,
+            fields[metadata_transfer_field_offset + 4],
+            "active metadata proof epoch",
+        )?
+    } else {
+        None
+    };
     if acting_set.is_empty() {
         return Err(parse_error(line, "PG acting set must not be empty"));
     }
@@ -5408,6 +5457,18 @@ fn parse_pg_record(line: usize, value: &str) -> Result<PgControlRecord, ControlP
             "metadata transfer fence source imported provenance requires a fenced peering PG",
         ));
     }
+    if active_metadata_proof_epoch.is_some() && active_metadata_proof.is_none() {
+        return Err(parse_error(
+            line,
+            "active metadata proof epoch requires active metadata proof",
+        ));
+    }
+    if active_metadata_proof_epoch.is_some() && state != PgState::Active {
+        return Err(parse_error(
+            line,
+            "active metadata proof epoch requires an active PG",
+        ));
+    }
     if peering_metadata_transfer.is_some()
         && (peering_metadata_transfer_source_route_epoch.is_none()
             || peering_metadata_transfer_source_node_id.is_none())
@@ -5439,6 +5500,7 @@ fn parse_pg_record(line: usize, value: &str) -> Result<PgControlRecord, ControlP
         acting_set,
         active_primary,
         active_metadata_proof,
+        active_metadata_proof_epoch,
         active_metadata_transfer_imported,
         peering_metadata_proof_floor,
         peering_metadata_transfer,
@@ -5576,6 +5638,8 @@ fn validate_pg_heartbeat_observations(
                 expected,
                 observation.metadata_proof,
                 pg.active_metadata_transfer_imported,
+                pg.active_metadata_proof_epoch,
+                snapshot.cluster_epoch,
             ) {
                 return Err(ControlPlaneError::PgActiveMetadataProofMismatch {
                     pg_id: observation.pg_id.get(),
@@ -5713,11 +5777,21 @@ fn metadata_proof_satisfies_active_primary_observation_floor(
     active_floor: PgMetadataProof,
     observed: PgMetadataProof,
     active_metadata_transfer_imported: bool,
+    active_floor_epoch: Option<ClusterEpoch>,
+    observed_epoch: ClusterEpoch,
 ) -> bool {
-    if active_metadata_transfer_imported {
-        metadata_proof_satisfies_fenced_transfer_source_floor(active_floor, observed)
+    if metadata_proof_satisfies_active_floor(active_floor, observed) {
+        return true;
+    }
+    if let Some(active_floor_epoch) = active_floor_epoch {
+        active_floor_epoch < observed_epoch
+            && observed != active_floor
+            && observed.applied_log_hash != 0
+            && observed.state_digest != active_floor.state_digest
+            && (!active_metadata_transfer_imported
+                || metadata_proof_satisfies_fenced_transfer_source_floor(active_floor, observed))
     } else {
-        metadata_proof_satisfies_active_floor(active_floor, observed)
+        false
     }
 }
 
@@ -5820,6 +5894,8 @@ fn validate_authoritative_metadata_migration_source(
                 active_floor,
                 observation.metadata_proof,
                 record.active_metadata_transfer_imported,
+                Some(observation.observed_epoch),
+                observation.observed_epoch,
             )
         } else {
             metadata_proof_satisfies_active_floor(active_floor, observation.metadata_proof)
@@ -5922,8 +5998,13 @@ fn primary_has_current_pg_state(
     expected_state: PgState,
 ) -> bool {
     let expected_active_proof = snapshot.pgs.get(&pg_id).and_then(|pg| {
-        pg.active_metadata_proof
-            .map(|proof| (proof, pg.active_metadata_transfer_imported))
+        pg.active_metadata_proof.map(|proof| {
+            (
+                proof,
+                pg.active_metadata_transfer_imported,
+                pg.active_metadata_proof_epoch,
+            )
+        })
     });
     snapshot
         .nodes
@@ -5934,11 +6015,13 @@ fn primary_has_current_pg_state(
                 && observation.state == expected_state
                 && !observation.has_pending_metadata_command
                 && (expected_state != PgState::Active
-                    || expected_active_proof.is_some_and(|(expected, imported)| {
+                    || expected_active_proof.is_some_and(|(expected, imported, expected_epoch)| {
                         metadata_proof_satisfies_active_primary_observation_floor(
                             expected,
                             observation.metadata_proof,
                             imported,
+                            expected_epoch,
+                            observation.observed_epoch,
                         )
                     }))
         })
@@ -5994,6 +6077,8 @@ fn validate_pg_primary_active_observation(
         expected_proof,
         observation.metadata_proof,
         pg.active_metadata_transfer_imported,
+        pg.active_metadata_proof_epoch,
+        observation.observed_epoch,
     ) {
         return Err(ControlPlaneError::PgActiveMetadataProofMismatch {
             pg_id: pg_id.get(),
@@ -6059,6 +6144,7 @@ fn mark_pgs_peering_for_nodes(
             record.state = PgState::Peering;
             record.active_primary = None;
             record.active_metadata_proof = None;
+            record.active_metadata_proof_epoch = None;
             record.active_metadata_transfer_imported = false;
             record.peering_metadata_transfer = None;
             record.peering_metadata_transfer_source_route_epoch = None;
@@ -6492,57 +6578,77 @@ mod tests {
     }
 
     #[test]
-    fn active_primary_observation_floor_requires_transfer_import_for_epoch_local_progress() {
+    fn active_primary_observation_floor_scopes_epoch_local_progress() {
         let imported_activation_floor = PgMetadataProof {
             applied_log_index: 42,
             applied_log_hash: 0xabc,
             state_digest: 0xdef,
         };
 
+        let lower_epoch_local_proof = PgMetadataProof {
+            applied_log_index: 1,
+            applied_log_hash: 0x123,
+            state_digest: 0x456,
+        };
+        let same_index_epoch_local_proof = PgMetadataProof {
+            applied_log_index: 42,
+            applied_log_hash: 0x123,
+            state_digest: 0x456,
+        };
+        let malformed_epoch_local_proof = PgMetadataProof {
+            applied_log_index: 41,
+            applied_log_hash: 0,
+            state_digest: 0x456,
+        };
+
         assert!(!metadata_proof_satisfies_active_primary_observation_floor(
             imported_activation_floor,
-            PgMetadataProof {
-                applied_log_index: 1,
-                applied_log_hash: 0x123,
-                state_digest: 0x456,
-            },
+            lower_epoch_local_proof,
             false,
+            Some(ClusterEpoch::new(7).unwrap()),
+            ClusterEpoch::new(7).unwrap(),
+        ));
+        assert!(!metadata_proof_satisfies_active_primary_observation_floor(
+            imported_activation_floor,
+            lower_epoch_local_proof,
+            true,
+            Some(ClusterEpoch::new(7).unwrap()),
+            ClusterEpoch::new(7).unwrap(),
         ));
         assert!(metadata_proof_satisfies_active_primary_observation_floor(
             imported_activation_floor,
-            PgMetadataProof {
-                applied_log_index: 1,
-                applied_log_hash: 0x123,
-                state_digest: 0x456,
-            },
+            lower_epoch_local_proof,
             true,
+            Some(ClusterEpoch::new(7).unwrap()),
+            ClusterEpoch::new(8).unwrap(),
         ));
         assert!(!metadata_proof_satisfies_active_primary_observation_floor(
             imported_activation_floor,
-            PgMetadataProof {
-                applied_log_index: 42,
-                applied_log_hash: 0x123,
-                state_digest: 0x456,
-            },
+            same_index_epoch_local_proof,
             false,
+            Some(ClusterEpoch::new(7).unwrap()),
+            ClusterEpoch::new(7).unwrap(),
         ));
         assert!(metadata_proof_satisfies_active_primary_observation_floor(
             imported_activation_floor,
-            PgMetadataProof {
-                applied_log_index: 42,
-                applied_log_hash: 0x123,
-                state_digest: 0x456,
-            },
-            true,
+            same_index_epoch_local_proof,
+            false,
+            Some(ClusterEpoch::new(7).unwrap()),
+            ClusterEpoch::new(8).unwrap(),
         ));
         assert!(!metadata_proof_satisfies_active_primary_observation_floor(
             imported_activation_floor,
-            PgMetadataProof {
-                applied_log_index: 41,
-                applied_log_hash: 0,
-                state_digest: 0x456,
-            },
+            same_index_epoch_local_proof,
             true,
+            Some(ClusterEpoch::new(7).unwrap()),
+            ClusterEpoch::new(7).unwrap(),
+        ));
+        assert!(!metadata_proof_satisfies_active_primary_observation_floor(
+            imported_activation_floor,
+            malformed_epoch_local_proof,
+            true,
+            Some(ClusterEpoch::new(7).unwrap()),
+            ClusterEpoch::new(7).unwrap(),
         ));
     }
 
@@ -11421,6 +11527,27 @@ mod tests {
             authority.snapshot().pg(PgId::new(19)).unwrap().state(),
             PgState::Active
         );
+
+        authority
+            .set_pg_acting_set(PgId::new(20), vec![NodeId::new(1)])
+            .unwrap();
+        let later_epoch = authority.snapshot().cluster_epoch();
+        let epoch_local_progress = PgMetadataProof {
+            applied_log_index: 1,
+            applied_log_hash: 0x1234,
+            state_digest: 0x5678,
+        };
+        let mut later_epoch_active = heartbeat_from_record(&authority, 1, later_epoch, 2_040);
+        later_epoch_active.pg_observations = vec![NodePgHeartbeatObservation {
+            pg_id: PgId::new(19),
+            state: PgState::Active,
+            metadata_proof: epoch_local_progress,
+            has_pending_metadata_command: false,
+        }];
+        authority.heartbeat(later_epoch_active, 2_040).unwrap();
+        let pg = authority.snapshot().pg(PgId::new(19)).unwrap();
+        assert_eq!(pg.active_metadata_proof(), Some(epoch_local_progress));
+        assert_eq!(pg.active_metadata_proof_epoch(), Some(later_epoch));
     }
 
     #[test]
@@ -13002,6 +13129,9 @@ mod tests {
             false,
             2_020,
         );
+        authority
+            .set_pg_acting_set(PgId::new(47), vec![NodeId::new(1)])
+            .unwrap();
 
         let epoch_local_progress = PgMetadataProof::new(
             imported_floor.applied_log_index,
@@ -13087,6 +13217,9 @@ mod tests {
             false,
             3_020,
         );
+        authority
+            .set_pg_acting_set(PgId::new(48), vec![NodeId::new(1)])
+            .unwrap();
         heartbeat_with_pg_proof(
             &mut authority,
             1,
