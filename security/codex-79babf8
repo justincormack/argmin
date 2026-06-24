@@ -1,0 +1,201 @@
+Metadata transfer retry can persist invalid control-plane state
+Link: https://chatgpt.com/codex/cloud/security/findings/a8eecbced6048191be181b55850e145f?sev=&repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin
+Criticality: informational (attack path: ignore)
+Status: fixed
+
+# Metadata
+Repo: justincormack/argmin
+Commit: 79babf8
+Author: justin@specialbusservice.com
+Created: 24/06/2026, 16:10:17
+Assignee: Unassigned
+Signals: Validated, Attack-path
+
+# Summary
+Introduced bug: the patch added required persisted source-route fields for metadata-transfer markers but missed preserving them in the existing set_pg_acting_set Peering path. That path can now write internally inconsistent state which the same code refuses to parse.
+The new version-11 control-plane state format requires a Peering PG with a metadata transfer marker to also have both peering_metadata_transfer_source_route_epoch and peering_metadata_transfer_source_node_id. set_pg_acting_set_with_metadata_transfer correctly populates those fields. However, the regular set_pg_acting_set path can operate on a PG that is already Peering with peering_metadata_transfer set, preserves that transfer marker, and then explicitly clears the new source-route fields. format_pg_record will serialize the transfer marker with '-' for the new source fields, while parse_pg_record rejects version-11 records where a transfer marker is present but either source-route field is missing. This can make the control-plane state file unopenable after restart following an acting-set change during an in-progress metadata transfer, causing persistent availability impact until manual state repair.
+
+# Resolution
+Fixed by commit https://github.com/justincormack/argmin/commit/7d4951c7 (`7d4951c7 Preserve metadata transfer source route fields`).
+
+The fix keeps the metadata-transfer marker and its source-route provenance fields as a single invariant in the ordinary `set_pg_acting_set` Peering path. When an in-progress Peering metadata transfer is preserved across an acting-set update, `peering_metadata_transfer_source_route_epoch` and `peering_metadata_transfer_source_node_id` are now preserved with `peering_metadata_transfer` instead of being cleared. If there is no transfer marker, the source-route fields remain absent.
+
+The commit also adds `peering_acting_set_update_preserves_metadata_transfer_source_route_fields`, which installs a metadata-transfer marker, performs an ordinary Peering acting-set update, reloads the persisted control-plane state, and verifies that the transfer marker and complete source-route fields survived the update.
+
+Verified with:
+- `cargo test -p storage peering_acting_set_update_preserves_metadata_transfer_source_route_fields -- --nocapture`
+- `cargo test -p storage control_plane -- --nocapture`
+- `cargo clippy -p storage --all-targets --all-features -- -D warnings`
+- `git diff --check`
+
+# Validation
+## Rubric
+- [x] Confirm the new version-11 invariant exists: metadata-transfer records require complete source-route epoch and node fields during parsing.
+- [x] Confirm set_pg_acting_set_with_metadata_transfer establishes the invariant by writing transfer marker plus source-route fields.
+- [x] Confirm the regular set_pg_acting_set Peering path can preserve peering_metadata_transfer while clearing the source-route fields.
+- [x] Dynamically reproduce a persisted state record with transfer proof fields but '-' for both source-route fields.
+- [x] Demonstrate restart/open failure or crash from that persisted state using the real FileControlPlaneStore and SingleAuthorityControlPlane::open path.
+## Report
+Validated the finding dynamically against commit 79babf8d115352ee7295831d70ac5956cd7ca644. Code inspection confirmed the invariant mismatch: crates/storage/src/control_plane.rs:1777-1804 preserves an existing peering_metadata_transfer marker in set_pg_acting_set but clears peering_metadata_transfer_source_route_epoch and peering_metadata_transfer_source_node_id at lines 1803-1804. The dedicated transfer path sets all three fields together at crates/storage/src/control_plane.rs:1907-1910. Serialization at crates/storage/src/control_plane.rs:4360-4377 writes the transfer proof plus the source-route fields, using '-' for None, and parsing rejects version-11 records with a transfer marker but incomplete source-route fields at crates/storage/src/control_plane.rs:5263-5271.
+
+I added a bounded PoC example at crates/storage/examples/metadata_transfer_route_poc.rs. It creates an Active PG on node 1, installs a metadata-transfer marker while moving it to node 2, sends a valid Peering observation from node 2, then calls the ordinary set_pg_acting_set to expand the acting set to [2,3]. The PoC lines 103-115 verify set_pg_acting_set_with_metadata_transfer initially populated the source-route fields; lines 119-127 exercise the regular acting-set path; lines 129-145 show the marker is preserved, source-route fields are None, and restart fails/panics when unwrapped.
+
+Non-panic reproduction command output: `cargo run -p storage --example metadata_transfer_route_poc` printed `transfer marker preserved: Some(...)`, `source-route fields after regular acting-set change: epoch=None, node=None`, `serialized current PG line: pg=42,peering,2:3,-,-,-,-,9,110,11,9,9,10,11,9,110,11,-,-,0,0,-,0`, and `restart parse error: control-plane state parse error at line 44: metadata transfer source route fields require a complete transfer marker`.
+
+Crash-style reproduction command output: `RUST_BACKTRACE=1 cargo run -p storage --example metadata_transfer_route_poc -- --panic-on-restart` exited 101 and panicked at `crates/storage/examples/metadata_transfer_route_poc.rs:145:17` with `called Result::unwrap() on an Err value: Parse { line: 44, message: "metadata transfer source route fields require a complete transfer marker" }`. This demonstrates that the code can persist a state file that the same control-plane startup path refuses to parse. Valgrind was attempted but is not installed in the container. A debugger attempt using lldb stopped at the unwrap immediately after the bad state was written and showed frame #0 at metadata_transfer_route_poc.rs:145.
+
+# Evidence
+crates/storage/src/control_plane.rs (L1777 to 1804)
+  Note: This path preserves an existing peering_metadata_transfer marker when changing the acting set, but clears the newly introduced source route epoch and source node id, creating an inconsistent PG record.
+```
+                let peering_metadata_transfer = if record.state == PgState::Peering {
+                    record.peering_metadata_transfer
+                } else {
+                    None
+                };
+                let metadata_transfer_fenced = if record.state == PgState::Peering {
+                    record.metadata_transfer_fenced
+                } else {
+                    false
+                };
+                let metadata_transfer_fence_source_lease_deadline_ms =
+                    if record.state == PgState::Peering && record.metadata_transfer_fenced {
+                        record.metadata_transfer_fence_source_lease_deadline_ms
+                    } else {
+                        None
+                    };
+                let metadata_transfer_fence_source_imported = record.state == PgState::Peering
+                    && record.metadata_transfer_fenced
+                    && record.metadata_transfer_fence_source_imported;
+                record.acting_set = acting_set;
+                record.state = PgState::Peering;
+                record.active_primary = None;
+                record.active_metadata_proof = None;
+                record.active_metadata_transfer_imported = false;
+                record.peering_metadata_proof_floor = peering_metadata_proof_floor;
+                record.peering_metadata_transfer = peering_metadata_transfer;
+                record.peering_metadata_transfer_source_route_epoch = None;
+                record.peering_metadata_transfer_source_node_id = None;
+```
+
+crates/storage/src/control_plane.rs (L1907 to 1910)
+  Note: The metadata-transfer installation path shows the intended invariant: a transfer marker should be accompanied by source route epoch and source node id.
+```
+        record.peering_metadata_proof_floor = Some(transfer.metadata_proof());
+        record.peering_metadata_transfer = Some(transfer);
+        record.peering_metadata_transfer_source_route_epoch = Some(source_route_epoch);
+        record.peering_metadata_transfer_source_node_id = Some(source_node_id);
+```
+
+crates/storage/src/control_plane.rs (L4360 to 4411)
+  Note: The serializer writes version-11 PG records including the new source-route fields; if the fields were cleared while a transfer marker remains, they are serialized as missing values.
+```
+        Some(transfer) => (
+            option_u64(Some(transfer.source_epoch().get())),
+            option_u64(Some(transfer.source_metadata_proof().applied_log_index)),
+            option_u64(Some(transfer.source_metadata_proof().applied_log_hash)),
+            option_u64(Some(transfer.source_metadata_proof().state_digest)),
+            option_u64(Some(transfer.metadata_proof().applied_log_index)),
+            option_u64(Some(transfer.metadata_proof().applied_log_hash)),
+            option_u64(Some(transfer.metadata_proof().state_digest)),
+            option_u64(
+                record
+                    .peering_metadata_transfer_source_route_epoch
+                    .map(ClusterEpoch::get),
+            ),
+            option_u32(
+                record
+                    .peering_metadata_transfer_source_node_id
+                    .map(NodeId::as_u32),
+            ),
+        ),
+        None => (
+            option_u64(None),
+            option_u64(None),
+            option_u64(None),
+            option_u64(None),
+            option_u64(None),
+            option_u64(None),
+            option_u64(None),
+            option_u64(None),
+            option_u32(None),
+        ),
+    };
+    format!(
+        "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+        record.pg_id.get(),
+        pg_state_as_str(record.state),
+        format_node_list(&record.acting_set),
+        option_u32(record.active_primary.map(NodeId::as_u32)),
+        active_log_index,
+        active_log_hash,
+        active_state_digest,
+        peering_floor_log_index,
+        peering_floor_log_hash,
+        peering_floor_state_digest,
+        transfer_source_epoch,
+        transfer_source_log_index,
+        transfer_source_log_hash,
+        transfer_source_state_digest,
+        transfer_imported_log_index,
+        transfer_imported_log_hash,
+        transfer_imported_state_digest,
+        transfer_source_route_epoch,
+        transfer_source_node_id,
+```
+
+crates/storage/src/control_plane.rs (L5263 to 5271)
+  Note: The parser rejects records where a metadata-transfer marker exists but either newly added source-route field is absent, so the state written by the acting-set path can fail to load after restart.
+```
+    if peering_metadata_transfer.is_some()
+        && (peering_metadata_transfer_source_route_epoch.is_none()
+            || peering_metadata_transfer_source_node_id.is_none())
+        && fields.len() >= 23
+    {
+        return Err(parse_error(
+            line,
+            "metadata transfer source route fields require a complete transfer marker",
+        ));
+```
+
+# Attack-path analysis
+Final: ignore | Decider: model_decided | Matrix severity: ignore | Policy adjusted: ignore
+## Rationale
+Although the invariant mismatch is real and was dynamically reproduced, it is not a meaningful security vulnerability in the project threat model. The only realistic trigger is a privileged control-plane administrator or same-UID local actor using a private Unix socket/offline state command to perform PG acting-set changes. That actor already has authority to disrupt or reconfigure the control plane. The demonstrated effect is persistent availability failure of the control-plane process after restart, with no confidentiality loss, no identity compromise, no auth bypass, no RCE, and no attacker-reachable network path from normal S3 clients. Therefore the scanner's medium operational severity should not be treated as a security finding.
+## Likelihood
+low - Exploitation by an in-scope external attacker is unlikely because the vulnerable operation is not reachable over the S3 HTTP listener and requires local/admin control-plane access plus a narrow in-progress metadata-transfer state and restart/reopen.
+## Impact
+low - A valid sequence can persist state that prevents the control-plane manager from reopening after restart, causing availability impact until manual state repair. The impact is operational and admin-scoped; it does not expose object data, bypass auth, execute code, or cross an authorization boundary.
+## Assumptions
+- No external deployment manifests were used; exposure is inferred from repository code and configuration defaults.
+- The in-scope attacker for the main product is an S3 HTTP client or similarly external actor, while local control-plane administrators and same-UID users with access to the private control-plane Unix socket are trusted or admin-equivalent.
+- The demonstrated impact is control-plane availability after restart/reopen, not confidentiality, identity compromise, remote code execution, or direct object data corruption.
+- deployment using the control-plane process and version-11 control-plane state
+- a PG already in Peering state with peering_metadata_transfer set
+- the metadata-transfer path has already populated peering_metadata_transfer_source_route_epoch and peering_metadata_transfer_source_node_id
+- a subsequent ordinary set_pg_acting_set call changes the same PG acting set before the transfer marker is cleared
+- control-plane state is persisted and then reopened or the control-plane process restarts
+## Path
+admin/local caller -> metadata-transfer acting-set update -> ordinary acting-set update -> inconsistent state file -> restart/open -> parse error -> control-plane unavailable
+## Path evidence
+- `crates/storage/src/control_plane.rs:1777-1804` - ordinary set_pg_acting_set preserves an existing peering_metadata_transfer for Peering PGs but explicitly clears both source-route fields
+- `crates/storage/src/control_plane.rs:1907-1910` - metadata-transfer acting-set path establishes the intended invariant by setting transfer marker, source route epoch, and source node id together
+- `crates/storage/src/control_plane.rs:4360-4378` - serializer emits transfer proof fields and serializes source-route fields from the record; cleared fields become missing values
+- `crates/storage/src/control_plane.rs:5263-5271` - parser rejects version-11 PG records with a metadata transfer marker but missing route epoch or node id
+- `crates/storage/src/control_plane.rs:1528-1600` - control-plane state is persisted to disk and parsed during SingleAuthorityControlPlane::open, making the bad state persistent across restart
+- `crates/argmin-s3/src/main.rs:1114-1118` - control-plane process exits if SingleAuthorityControlPlane::open cannot parse the state file
+- `crates/argmin-s3/src/main.rs:1271-1345` - live control-plane exposure is a Unix socket whose parent directory must be absolute, private, and owned by the current UID
+- `crates/storage/src/control_plane.rs:3129-3136` - live control-plane RPC exposes SetPgActingSet only through the control-plane RPC path, not the S3 HTTP request path
+## Narrative
+The finding is a real code defect: the dedicated metadata-transfer path writes a transfer marker together with source-route fields, while the ordinary acting-set path can preserve the marker and clear those fields. The serializer then writes missing source-route values, and the parser rejects version-11 records with a transfer marker but incomplete source-route fields. The validation PoC demonstrated a restart parse error. However, the path is reachable through local/admin control-plane operations over a private Unix socket or direct state manipulation, not through the public S3 HTTP API. It does not bypass authentication, expose secrets, cross tenants, or grant new privileges. Security severity should therefore be downgraded/ignored even though the operational availability bug should be fixed.
+## Controls
+- S3 HTTP API uses SigV4 authentication but is not the vulnerable entrypoint
+- control-plane RPC is exposed on a Unix domain socket rather than a TCP port
+- control-plane socket parent directory must be private and owned by the process UID
+- control-plane RPC workers have a worker limit and read/write timeouts
+- offline state modification obtains a control-plane state lock
+## Blindspots
+- Static review did not inspect external deployment manifests that might weaken Unix socket directory permissions.
+- No cloud APIs were called, so no runtime IAM, host, or network ACL posture was verified.
+- The validation PoC was provided as prior evidence rather than re-run during this static-only attack-path pass.
+- If an operator intentionally exposes the control-plane socket to untrusted local users, the availability risk increases, but that would be a deployment/security-boundary decision outside the repository evidence.
