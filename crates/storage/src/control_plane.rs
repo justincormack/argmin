@@ -6912,6 +6912,7 @@ mod tests {
         write_u32(&mut payload, 1);
         write_pg_state(&mut payload, PgState::Active);
         write_option_u64(&mut payload, None);
+        write_u8(&mut payload, 0);
         write_u32(&mut payload, u32::MAX);
 
         let mut reader = PayloadReader::new(&payload);
