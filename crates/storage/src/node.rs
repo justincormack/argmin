@@ -28,7 +28,7 @@ use crate::metadata_command::{
     CreateBucketCommand, MetadataCommandEnvelope, MetadataCommandId, MetadataCommandLogIndex,
     MetadataCommandPayload,
 };
-use crate::pg_store::{PgStore, ScavengerShardFileScan};
+use crate::pg_store::{PgClusterMapHistoryReferenceSummary, PgStore, ScavengerShardFileScan};
 use crate::pg_topology::PgTopology;
 use crate::traits::{PgMetadataStore, ShardStore, StorageNode};
 #[cfg(test)]
@@ -544,6 +544,17 @@ impl SharedStorageNode {
 
     pub fn pg_topology(&self) -> &PgTopology {
         &self.pg_topology
+    }
+
+    pub fn cluster_map_history_reference_summary(
+        &self,
+    ) -> Result<PgClusterMapHistoryReferenceSummary, StoreError> {
+        let mut summary = PgClusterMapHistoryReferenceSummary::default();
+        for pg in self.stores.values() {
+            let pg = pg.lock().unwrap_or_else(|e| e.into_inner());
+            summary.merge(pg.cluster_map_history_reference_summary()?);
+        }
+        Ok(summary)
     }
 
     pub fn bucket_pg_id_for(&self, bucket: &BucketName) -> u32 {

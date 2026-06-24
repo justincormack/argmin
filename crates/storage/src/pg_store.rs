@@ -98,6 +98,74 @@ SELECT session_id, bucket, key, op_kind, upload_id, part_number, state, created_
        bucket_write_incarnation_generation, bucket_write_operation_kind, bucket_write_created_at, bucket_write_lease_deadline, bucket_write_target_context \
 FROM stream_uploads";
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PgClusterMapHistoryReferenceSummary {
+    pub oldest_live_placement_epoch: Option<ClusterEpoch>,
+    pub oldest_durable_backfill_epoch: Option<ClusterEpoch>,
+}
+
+impl PgClusterMapHistoryReferenceSummary {
+    #[must_use]
+    pub fn oldest_required_epoch(&self) -> Option<ClusterEpoch> {
+        [
+            self.oldest_live_placement_epoch,
+            self.oldest_durable_backfill_epoch,
+        ]
+        .into_iter()
+        .flatten()
+        .min()
+    }
+
+    pub fn merge(&mut self, other: Self) {
+        self.oldest_live_placement_epoch = min_optional_epoch(
+            self.oldest_live_placement_epoch,
+            other.oldest_live_placement_epoch,
+        );
+        self.oldest_durable_backfill_epoch = min_optional_epoch(
+            self.oldest_durable_backfill_epoch,
+            other.oldest_durable_backfill_epoch,
+        );
+    }
+}
+
+fn min_optional_epoch(
+    left: Option<ClusterEpoch>,
+    right: Option<ClusterEpoch>,
+) -> Option<ClusterEpoch> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(left.min(right)),
+        (Some(left), None) => Some(left),
+        (None, Some(right)) => Some(right),
+        (None, None) => None,
+    }
+}
+
+fn parse_optional_cluster_epoch(
+    raw_epoch: Option<i64>,
+    context: &'static str,
+) -> Result<Option<ClusterEpoch>, StoreError> {
+    raw_epoch
+        .map(|raw| {
+            let epoch = u64::try_from(raw).map_err(|_| StoreError::Db {
+                context,
+                source: rusqlite::Error::FromSqlConversionFailure(
+                    0,
+                    rusqlite::types::Type::Integer,
+                    Box::from("negative cluster epoch"),
+                ),
+            })?;
+            ClusterEpoch::new(epoch).ok_or_else(|| StoreError::Db {
+                context,
+                source: rusqlite::Error::FromSqlConversionFailure(
+                    0,
+                    rusqlite::types::Type::Integer,
+                    Box::from("zero cluster epoch"),
+                ),
+            })
+        })
+        .transpose()
+}
+
 fn parse_stream_upload_record(row: &Row<'_>) -> rusqlite::Result<StreamUploadRecord> {
     let op_kind_raw: u8 = row.get(3)?;
     let state_raw: u8 = row.get(6)?;
@@ -405,6 +473,44 @@ impl PgStore {
     /// Return a reference to the underlying SQLite connection.
     pub fn connection(&self) -> &Connection {
         &self.conn
+    }
+
+    pub fn cluster_map_history_reference_summary(
+        &self,
+    ) -> Result<PgClusterMapHistoryReferenceSummary, StoreError> {
+        Ok(PgClusterMapHistoryReferenceSummary {
+            oldest_live_placement_epoch: self.oldest_live_payload_placement_epoch()?,
+            oldest_durable_backfill_epoch: self.oldest_durable_backfill_epoch()?,
+        })
+    }
+
+    fn oldest_live_payload_placement_epoch(&self) -> Result<Option<ClusterEpoch>, StoreError> {
+        let raw_epoch = self.query_row_cached(
+            "SELECT MIN(placement_cluster_epoch) FROM ( \
+                 SELECT placement_cluster_epoch FROM object_segments \
+                 UNION ALL SELECT placement_cluster_epoch FROM object_parts \
+                 UNION ALL SELECT placement_cluster_epoch FROM multipart_parts \
+                 UNION ALL SELECT placement_cluster_epoch FROM multipart_part_segments \
+                 UNION ALL SELECT placement_cluster_epoch FROM stream_upload_segments \
+             )",
+            [],
+            "compute oldest live payload placement epoch",
+            |row| row.get::<_, Option<i64>>(0),
+        )?;
+        parse_optional_cluster_epoch(raw_epoch, "oldest live payload placement epoch")
+    }
+
+    fn oldest_durable_backfill_epoch(&self) -> Result<Option<ClusterEpoch>, StoreError> {
+        let raw_epoch = self.query_row_cached(
+            "SELECT MIN(cluster_epoch) FROM ( \
+                 SELECT source_cluster_epoch AS cluster_epoch FROM placed_segment_shard_backfills \
+                 UNION ALL SELECT desired_cluster_epoch FROM placed_segment_shard_backfills \
+             )",
+            [],
+            "compute oldest durable backfill epoch",
+            |row| row.get::<_, Option<i64>>(0),
+        )?;
+        parse_optional_cluster_epoch(raw_epoch, "oldest durable backfill epoch")
     }
 
     fn query_row_cached<T, P, F>(

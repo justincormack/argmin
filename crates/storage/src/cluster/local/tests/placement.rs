@@ -2609,6 +2609,98 @@ fn placed_segment_payload_backfill_work_item_targets_current_pg_route() {
 }
 
 #[test]
+fn local_cluster_map_history_reference_summary_merges_node_pg_references() {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let map =
+        LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1], EcShape { k: 1, m: 1 }).unwrap();
+
+    {
+        let pg = map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .get_pg(0)
+            .unwrap();
+        pg.connection()
+            .execute(
+                "INSERT INTO object_segments \
+                 (bucket, key, version_id, segment_index, size, segment_crc64, segment_okh, \
+                  segment_vid, data_pg_id, placement_cluster_epoch, ec_k, ec_m) \
+                 VALUES (?1, ?2, 1, 0, 1024, ?3, ?4, 10, 0, ?5, 1, 1)",
+                rusqlite::params![
+                    "history-floor-bucket",
+                    "node-zero-object",
+                    0x1234_i64,
+                    [0x11_u8; 16].as_slice(),
+                    6_i64,
+                ],
+            )
+            .unwrap();
+    }
+
+    {
+        let pg = map
+            .node(NodeId::new(1))
+            .unwrap()
+            .storage_node()
+            .get_pg(1)
+            .unwrap();
+        let backfill = crate::PlacedSegmentShardBackfillWorkItem {
+            request: crate::SegmentStoredBytesRequest {
+                data_pg_id: 1,
+                segment_okh: [0x44; 16],
+                segment_vid: GenerationId::new(12).unwrap(),
+                stored_size: 4096,
+                segment_crc64: 0x9abc,
+                ec: EcShape { k: 1, m: 1 },
+            },
+            source_cluster_epoch: ClusterEpoch::new(3).unwrap(),
+            desired_cluster_epoch: ClusterEpoch::new(9).unwrap(),
+        };
+        pg.record_placed_segment_shard_backfill(&backfill, backfill.request.ec.m, None)
+            .unwrap();
+    }
+
+    let summary = map.cluster_map_history_reference_summary().unwrap();
+    assert_eq!(
+        summary.oldest_live_placement_epoch,
+        Some(ClusterEpoch::new(6).unwrap())
+    );
+    assert_eq!(
+        summary.oldest_durable_backfill_epoch,
+        Some(ClusterEpoch::new(3).unwrap())
+    );
+    assert_eq!(
+        summary.oldest_required_epoch(),
+        Some(ClusterEpoch::new(3).unwrap())
+    );
+
+    let cluster = crate::StorageCluster::from_local_map(Arc::new(map)).unwrap();
+    assert_eq!(
+        cluster.cluster_map_history_reference_summary().unwrap(),
+        summary
+    );
+}
+
+#[test]
+fn topology_only_cluster_map_history_reference_summary_is_empty() {
+    let map = LocalClusterMap::open_frontend_topology_only_with_epoch(
+        NodeId::new(0),
+        [NodeId::new(0), NodeId::new(1), NodeId::new(2)],
+        &[0, 1],
+        EcShape { k: 1, m: 1 },
+        ClusterEpoch::INITIAL,
+    )
+    .unwrap();
+
+    assert_eq!(
+        map.cluster_map_history_reference_summary().unwrap(),
+        crate::PgClusterMapHistoryReferenceSummary::default()
+    );
+}
+
+#[test]
 fn placed_segment_payload_direct_copy_backfill_rejects_reconstruction_targets() {
     let fixture = backfill_route_fixture(b"phase-eleven-backfill-reconstruction");
     let plan = fixture

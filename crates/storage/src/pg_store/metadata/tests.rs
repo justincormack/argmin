@@ -2557,6 +2557,80 @@ fn metadata_command_checkpoint_catalogue_prunes_old_epochs() {
 }
 
 #[test]
+fn cluster_map_history_reference_summary_reports_live_payload_and_backfill_epochs() {
+    let tmp = test_util::tempdir();
+    let store = PgStore::open(tmp.path(), 7).unwrap();
+    assert_eq!(
+        store.cluster_map_history_reference_summary().unwrap(),
+        PgClusterMapHistoryReferenceSummary::default()
+    );
+
+    store
+        .connection()
+        .execute(
+            "INSERT INTO object_segments \
+             (bucket, key, version_id, segment_index, size, segment_crc64, segment_okh, \
+              segment_vid, data_pg_id, placement_cluster_epoch, ec_k, ec_m) \
+             VALUES (?1, ?2, 1, 0, 1024, ?3, ?4, 10, 7, ?5, 4, 2)",
+            rusqlite::params![
+                "history-floor-bucket",
+                "segment-object",
+                0x1234_i64,
+                [0x11_u8; 16].as_slice(),
+                6_i64,
+            ],
+        )
+        .unwrap();
+    store
+        .connection()
+        .execute(
+            "INSERT INTO object_parts \
+             (bucket, key, version_id, part_number, object_offset_start, size, payload_crc64, \
+              etag, etag_kind, part_okh, part_vid, placement_cluster_epoch, ec_k, ec_m, data_pg_id) \
+             VALUES (?1, ?2, 1, 1, 0, 2048, ?3, ?4, 0, ?5, 11, ?6, 4, 2, 7)",
+            rusqlite::params![
+                "history-floor-bucket",
+                "multipart-object",
+                0x5678_i64,
+                [0x22_u8; 16].as_slice(),
+                [0x33_u8; 16].as_slice(),
+                4_i64,
+            ],
+        )
+        .unwrap();
+
+    let backfill = PlacedSegmentShardBackfillWorkItem {
+        request: SegmentStoredBytesRequest {
+            data_pg_id: 7,
+            segment_okh: [0x44; 16],
+            segment_vid: GenerationId::new(12).unwrap(),
+            stored_size: 4096,
+            segment_crc64: 0x9abc,
+            ec: EcShape { k: 4, m: 2 },
+        },
+        source_cluster_epoch: ClusterEpoch::new(3).unwrap(),
+        desired_cluster_epoch: ClusterEpoch::new(9).unwrap(),
+    };
+    store
+        .record_placed_segment_shard_backfill(&backfill, backfill.request.ec.m, None)
+        .unwrap();
+
+    let summary = store.cluster_map_history_reference_summary().unwrap();
+    assert_eq!(
+        summary.oldest_live_placement_epoch,
+        Some(ClusterEpoch::new(4).unwrap())
+    );
+    assert_eq!(
+        summary.oldest_durable_backfill_epoch,
+        Some(ClusterEpoch::new(3).unwrap())
+    );
+    assert_eq!(
+        summary.oldest_required_epoch(),
+        Some(ClusterEpoch::new(3).unwrap())
+    );
+}
+
+#[test]
 fn metadata_command_checkpoint_verification_rejects_tampered_row_payload() {
     let tmp = test_util::tempdir();
     let store = PgStore::open(tmp.path(), 1).unwrap();

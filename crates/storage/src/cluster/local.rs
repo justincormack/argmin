@@ -25,6 +25,7 @@ use crate::node_client::{
     UNIX_STORAGE_NODE_DEFAULT_RPC_ADMISSION_WAIT_TIMEOUT,
     UNIX_STORAGE_NODE_MIN_RPC_ADMISSION_LIMIT,
 };
+use crate::pg_store::PgClusterMapHistoryReferenceSummary;
 use crate::pg_topology::PgTopology;
 use crate::{
     BucketName, ClusterEpoch, DataPgId, EcShape, GenerationId, MetadataError, ObjectKey, PgId,
@@ -1801,6 +1802,19 @@ impl LocalClusterMap {
 
     pub fn node(&self, node_id: NodeId) -> Option<&LocalNodeStore> {
         self.nodes.get(&node_id)
+    }
+
+    pub fn cluster_map_history_reference_summary(
+        &self,
+    ) -> Result<PgClusterMapHistoryReferenceSummary, StoreError> {
+        let mut summary = PgClusterMapHistoryReferenceSummary::default();
+        for node in self.nodes.values() {
+            summary.merge(
+                node.storage_node()
+                    .cluster_map_history_reference_summary()?,
+            );
+        }
+        Ok(summary)
     }
 
     pub fn install_unix_shard_clients(

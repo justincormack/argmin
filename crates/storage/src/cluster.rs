@@ -51,7 +51,10 @@ use crate::peering::{
     PgPeeringReconstructionDecision, PgPeeringReconstructionError, PgPeeringReconstructionFailure,
     PgPeeringReplicaReconstructionInput,
 };
-use crate::pg_store::{MetadataCommandCheckpoint, MetadataCommandLogCompactionStatus};
+use crate::pg_store::{
+    MetadataCommandCheckpoint, MetadataCommandLogCompactionStatus,
+    PgClusterMapHistoryReferenceSummary,
+};
 use crate::storage_rpc::{
     STORAGE_RPC_MAX_METADATA_COMMAND_CHECKPOINT_CANDIDATES,
     STORAGE_RPC_MAX_METADATA_COMMAND_LOG_ENTRY_RANGE_ENTRIES, STORAGE_RPC_MAX_PAYLOAD_LEN,
@@ -4134,6 +4137,12 @@ impl StorageCluster {
 
     pub fn local_node_ids(&self) -> impl Iterator<Item = NodeId> + '_ {
         self.local_map.node_ids()
+    }
+
+    pub fn cluster_map_history_reference_summary(
+        &self,
+    ) -> Result<PgClusterMapHistoryReferenceSummary, StoreError> {
+        self.local_map.cluster_map_history_reference_summary()
     }
 
     pub fn local_pg_route(&self, pg_id: PgId) -> Option<&LocalPgRoute> {

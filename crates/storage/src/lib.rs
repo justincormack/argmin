@@ -75,7 +75,8 @@ pub use node::{
 pub use pg_store::{
     MetadataCheckpointRow, MetadataCheckpointTableBlock, MetadataCheckpointTableDigest,
     MetadataCheckpointValue, MetadataCommandCheckpoint, MetadataCommandCheckpointValidationError,
-    MetadataCommandLogCompactionStatus, MetadataCommandLogStats, PgStore,
+    MetadataCommandLogCompactionStatus, MetadataCommandLogStats,
+    PgClusterMapHistoryReferenceSummary, PgStore,
 };
 pub use pg_topology::PgTopology;
 pub use placement::NodeId;
