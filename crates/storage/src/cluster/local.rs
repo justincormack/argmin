@@ -2857,6 +2857,49 @@ impl LocalClusterMap {
         })
     }
 
+    pub(crate) fn metadata_pg_primary_node_at_retained_epoch(
+        &self,
+        operation_epoch: ClusterEpoch,
+        pg_id: PgId,
+    ) -> Result<&LocalNodeStore, StoreError> {
+        self.require_route_map_valid_now()?;
+        let route = self
+            .reconstructed_pg_route_at_epoch(pg_id, operation_epoch)
+            .ok_or(StoreError::StaleMetadataOperation {
+                pg_id: pg_id.get(),
+                operation_epoch,
+                current_epoch: self.epoch,
+            })?;
+        if route.cluster_epoch() != operation_epoch {
+            return Err(StoreError::StaleMetadataRoute {
+                pg_id: pg_id.get(),
+                route_epoch: route.cluster_epoch(),
+                current_epoch: self.epoch,
+            });
+        }
+        if route.state() != PgState::Active {
+            return Err(StoreError::PgNotActive {
+                pg_id: pg_id.get(),
+                cluster_epoch: route.cluster_epoch(),
+                state: route.state(),
+            });
+        }
+        let node_id = route.primary_node_id();
+        if !route.acting_set().contains(&node_id) {
+            return Err(StoreError::NodeNotInActingSet {
+                node_id: node_id.as_u32(),
+                pg_id: pg_id.get(),
+                cluster_epoch: route.cluster_epoch(),
+            });
+        }
+
+        self.nodes.get(&node_id).ok_or(StoreError::NodeNotFound {
+            node_id: node_id.as_u32(),
+            pg_id: pg_id.get(),
+            cluster_epoch: route.cluster_epoch(),
+        })
+    }
+
     pub(crate) fn metadata_pg_acting_nodes(
         &self,
         operation_epoch: ClusterEpoch,
@@ -3239,6 +3282,47 @@ impl LocalClusterMap {
                 key_shard_index: key.shard_index().get(),
             });
         }
+        let route = self
+            .reconstructed_pg_route_at_epoch(
+                location.data_pg_id().pg_id(),
+                location.cluster_epoch(),
+            )
+            .ok_or_else(|| ShardIoError::Store {
+                node_id: location.node_id().as_u32(),
+                pg_id: location.data_pg_id().get(),
+                cluster_epoch: location.cluster_epoch(),
+                source: StoreError::PayloadShardSetMismatch {
+                    reason: format!(
+                        "PG {} route for cluster epoch {} is not retained",
+                        location.data_pg_id().get(),
+                        location.cluster_epoch().get()
+                    ),
+                },
+            })?;
+        if route.state() != PgState::Active {
+            return Err(ShardIoError::Store {
+                node_id: location.node_id().as_u32(),
+                pg_id: location.data_pg_id().get(),
+                cluster_epoch: location.cluster_epoch(),
+                source: StoreError::PgNotActive {
+                    pg_id: location.data_pg_id().get(),
+                    cluster_epoch: route.cluster_epoch(),
+                    state: route.state(),
+                },
+            });
+        }
+        if !route.acting_set().contains(&location.node_id()) {
+            return Err(ShardIoError::Store {
+                node_id: location.node_id().as_u32(),
+                pg_id: location.data_pg_id().get(),
+                cluster_epoch: location.cluster_epoch(),
+                source: StoreError::NodeNotInActingSet {
+                    node_id: location.node_id().as_u32(),
+                    pg_id: location.data_pg_id().get(),
+                    cluster_epoch: route.cluster_epoch(),
+                },
+            });
+        }
         let node = self
             .nodes
             .get(&location.node_id())
@@ -3359,6 +3443,38 @@ impl LocalClusterMap {
     ) -> Result<(), ShardIoError> {
         self.shard_node_client(operation_epoch, location, key)?
             .delete_shard(key)
+    }
+
+    pub(crate) fn delete_payload_shard_for_historical_cleanup(
+        &self,
+        location: ShardLocation,
+        key: &ShardKey,
+    ) -> Result<(), ShardIoError> {
+        if location.shard_index() != key.shard_index() {
+            return Err(ShardIoError::ShardIndexMismatch {
+                node_id: location.node_id().as_u32(),
+                pg_id: location.data_pg_id().get(),
+                cluster_epoch: location.cluster_epoch(),
+                location_shard_index: location.shard_index().get(),
+                key_shard_index: key.shard_index().get(),
+            });
+        }
+        let node = self
+            .nodes
+            .get(&location.node_id())
+            .ok_or(ShardIoError::NodeNotFound {
+                node_id: location.node_id().as_u32(),
+                pg_id: location.data_pg_id().get(),
+                cluster_epoch: location.cluster_epoch(),
+            })?;
+        node.shard_client()
+            .delete_placed_shard(location.data_pg_id(), key)
+            .map_err(|source| ShardIoError::Store {
+                node_id: location.node_id().as_u32(),
+                pg_id: location.data_pg_id().get(),
+                cluster_epoch: location.cluster_epoch(),
+                source,
+            })
     }
 
     fn shard_node_client(

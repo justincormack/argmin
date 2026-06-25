@@ -2130,6 +2130,13 @@ fn placed_segment_payload_shard_health_uses_reconstructed_pg_route_snapshot() {
         .reconstructed_pg_route_at_epoch(PgId::new(0), authority.snapshot().cluster_epoch())
         .unwrap();
     assert_eq!(route.primary_lease_deadline_ms(), None);
+    let route = crate::control_plane::PgRouteSnapshot::reconstructed(
+        route.cluster_epoch(),
+        route.pg_id(),
+        route.primary_node_id(),
+        route.acting_set().to_vec(),
+        PgState::Active,
+    );
 
     let configs: Vec<_> = node_ids
         .iter()
@@ -2163,16 +2170,16 @@ fn placed_segment_payload_shard_health_uses_reconstructed_pg_route_snapshot() {
         ec: segment.written.ec,
     };
     let current_epoch = ClusterEpoch::new(route.cluster_epoch().get() + 1).unwrap();
-    let current_map = Arc::new(
-        LocalClusterMap::open_frontend_placeholder_with_configs_and_epoch(
-            NodeId::new(0),
-            configs,
-            &[0],
-            ec_shape,
-            current_epoch,
-        )
-        .unwrap(),
-    );
+    let mut current_map = LocalClusterMap::open_frontend_placeholder_with_configs_and_epoch(
+        NodeId::new(0),
+        configs,
+        &[0],
+        ec_shape,
+        current_epoch,
+    )
+    .unwrap();
+    current_map.test_install_historical_pg_routes([route.clone()]);
+    let current_map = Arc::new(current_map);
     let cluster = crate::StorageCluster::from_local_map(Arc::clone(&current_map)).unwrap();
     assert_ne!(route.cluster_epoch(), cluster.cluster_epoch());
 

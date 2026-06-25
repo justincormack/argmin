@@ -722,6 +722,314 @@ fn non_current_epoch_direct_put_commit_fails_closed_and_cleans_unowned_state() {
 }
 
 #[test]
+fn control_plane_peering_direct_put_old_primary_fails_closed_and_cleans_unowned_state() {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let pg_ids = [0, 1, 2, 3];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let mut authority = crate::control_plane::SingleAuthorityControlPlane::open(
+        crate::control_plane::FileControlPlaneStore::new(tmp.path().join("control-plane.state")),
+    )
+    .unwrap();
+    authority
+        .bootstrap_initial_cluster_map(
+            node_ids
+                .iter()
+                .map(|node_id| {
+                    (
+                        *node_id,
+                        tmp.path()
+                            .join("sockets")
+                            .join(format!("node-{}.sock", node_id.as_u32()))
+                            .to_string_lossy()
+                            .into_owned(),
+                    )
+                })
+                .collect(),
+            pg_ids.iter().copied().map(PgId::new).collect(),
+        )
+        .unwrap();
+    let source_epoch = authority.snapshot().cluster_epoch();
+    let source_routes = pg_ids
+        .iter()
+        .map(|pg_id| {
+            let route = authority
+                .snapshot()
+                .reconstructed_pg_route_at_epoch(PgId::new(*pg_id), source_epoch)
+                .unwrap();
+            crate::control_plane::PgRouteSnapshot::reconstructed(
+                route.cluster_epoch(),
+                route.pg_id(),
+                route.primary_node_id(),
+                route.acting_set().to_vec(),
+                PgState::Active,
+            )
+        })
+        .collect::<Vec<_>>();
+    let configs = node_ids
+        .iter()
+        .map(|node_id| {
+            LocalNodeStoreConfig::new(
+                *node_id,
+                tmp.path()
+                    .join("storage")
+                    .join(format!("node-{:04}", node_id.as_u32())),
+            )
+        })
+        .collect::<Vec<_>>();
+    let source_map = Arc::new(
+        LocalClusterMap::open_frontend_with_configs_and_pg_routes(
+            NodeId::new(0),
+            configs.clone(),
+            &pg_ids,
+            ec_shape,
+            source_epoch,
+            source_routes.iter().map(LocalPgRoute::from),
+        )
+        .unwrap(),
+    );
+    let (bucket, key, object_pg, _data_pg) = {
+        let topology = source_map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        bucket_key_with_distinct_object_and_data_pg(topology)
+    };
+    let source_cluster = crate::StorageCluster::from_local_map(Arc::clone(&source_map)).unwrap();
+    create_test_bucket(&source_cluster, &bucket);
+
+    let reservation_id =
+        crate::SessionId::try_from("67676767676767676767676767676767".to_string()).unwrap();
+    let generation_id = source_cluster
+        .reserve_put_object_generation(&bucket, &key, &reservation_id)
+        .unwrap();
+    let before_object_pg_proof = source_cluster
+        .test_object_pg_metadata_proof(&bucket, &key)
+        .unwrap();
+    let payload = b"control-plane peering stale direct put";
+    let segment_okh = [0xc7; 16];
+    let written = source_cluster
+        .write_direct_put_segment_payload_shards(
+            &bucket,
+            &key,
+            generation_id,
+            0,
+            &segment_okh,
+            payload,
+        )
+        .unwrap();
+    source_cluster
+        .test_register_payload_shard_acks(written.data_pg_id, &written.written_shards)
+        .unwrap();
+    {
+        let source_data_pg_primary = source_map
+            .node(
+                source_map
+                    .pg_route(PgId::new(written.data_pg_id))
+                    .unwrap()
+                    .primary_node_id(),
+            )
+            .unwrap()
+            .storage_node()
+            .get_pg(written.data_pg_id)
+            .unwrap();
+        for written_shard in &written.written_shards {
+            source_data_pg_primary
+                .validate_written_shard_ack(&written_shard.key, written_shard.ack)
+                .unwrap();
+        }
+    }
+    let bucket_write_reservation = source_cluster
+        .acquire_durable_bucket_write_reservation(
+            &bucket,
+            "control-plane-peering-stale-direct-put",
+            Some(key.as_str()),
+        )
+        .unwrap();
+    let commit_req = direct_put_commit_req_with_bucket_write_proof(
+        DirectPutCommitReqFixture {
+            bucket: &bucket,
+            key: &key,
+            reservation_id,
+            generation_id,
+            payload,
+            segment_okh,
+            written: &written,
+        },
+        crate::metadata_command::BucketWriteReservationProof::from(
+            &bucket_write_reservation.record,
+        ),
+    );
+    drop(source_cluster);
+    drop(source_map);
+
+    authority
+        .set_pg_acting_set(PgId::new(object_pg), vec![NodeId::new(1), NodeId::new(2)])
+        .unwrap();
+    let current_epoch = authority.snapshot().cluster_epoch();
+    let current_routes = pg_ids
+        .iter()
+        .map(|pg_id| {
+            let route = authority
+                .snapshot()
+                .reconstructed_pg_route_at_epoch(PgId::new(*pg_id), current_epoch)
+                .unwrap();
+            let state = if *pg_id == object_pg {
+                PgState::Peering
+            } else {
+                PgState::Active
+            };
+            crate::control_plane::PgRouteSnapshot::reconstructed(
+                route.cluster_epoch(),
+                route.pg_id(),
+                route.primary_node_id(),
+                route.acting_set().to_vec(),
+                state,
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut current_map = LocalClusterMap::open_frontend_with_configs_and_pg_routes(
+        NodeId::new(0),
+        configs,
+        &pg_ids,
+        ec_shape,
+        current_epoch,
+        current_routes.iter().map(LocalPgRoute::from),
+    )
+    .unwrap();
+    current_map.test_install_historical_pg_routes(source_routes);
+    let current_map = Arc::new(current_map);
+    assert_eq!(
+        current_map.pg_route(PgId::new(object_pg)).unwrap().state(),
+        PgState::Peering,
+        "control-plane acting-set change should put the object PG into Peering"
+    );
+    assert!(
+        !current_map
+            .pg_route(PgId::new(object_pg))
+            .unwrap()
+            .acting_set()
+            .contains(&NodeId::new(0)),
+        "the old source primary should no longer be in the current acting set"
+    );
+    let old_primary_cluster = crate::StorageCluster::test_from_local_map_with_epoch(
+        Arc::clone(&current_map),
+        source_epoch,
+    )
+    .unwrap();
+
+    let err = old_primary_cluster
+        .commit_direct_put_object_from_payload_shards(&commit_req, &written.written_shards, |_| {
+            Ok::<(), ()>(())
+        })
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            crate::ObjectPgActionError::Store(StoreError::StaleMetadataOperation {
+                pg_id,
+                operation_epoch,
+                current_epoch: observed_current_epoch,
+            }) if pg_id == object_pg
+                && operation_epoch == source_epoch
+                && observed_current_epoch == current_epoch
+        ),
+        "old-primary direct PUT commit should fail closed after control-plane Peering transition, got {err:?}"
+    );
+
+    for node_id in node_ids {
+        let pg = current_map
+            .node(node_id)
+            .unwrap()
+            .storage_node()
+            .get_pg(object_pg)
+            .unwrap();
+        let state = pg.metadata_command_replica_state().unwrap();
+        let proof = crate::control_plane::PgMetadataProof::new(
+            state.applied_log_index,
+            state.applied_log_hash,
+            state.state_digest,
+        );
+        assert_eq!(
+            proof, before_object_pg_proof,
+            "old-primary direct PUT must not append an object-PG command on node {node_id:?}"
+        );
+        assert!(
+            matches!(
+                crate::PgMetadataStore::get_object_meta(&*pg, &bucket, &key),
+                Err(crate::MetadataError::ObjectNotFound)
+            ),
+            "old-primary direct PUT must not publish object metadata on node {node_id:?}"
+        );
+        assert!(
+            pg.pending_metadata_command_envelope(node_id.as_u32(), source_epoch)
+                .unwrap()
+                .is_none(),
+            "old-primary direct PUT must not leave a source-epoch pending command on node {node_id:?}"
+        );
+        assert!(
+            pg.pending_metadata_command_envelope(node_id.as_u32(), current_epoch)
+                .unwrap()
+                .is_none(),
+            "old-primary direct PUT must not leave a current-epoch pending command on node {node_id:?}"
+        );
+    }
+    let bucket_pg = current_map
+        .node(NodeId::new(0))
+        .unwrap()
+        .storage_node()
+        .pg_topology()
+        .bucket_pg_for(&bucket);
+    for node_id in node_ids {
+        let pg = current_map
+            .node(node_id)
+            .unwrap()
+            .storage_node()
+            .get_pg(bucket_pg)
+            .unwrap();
+        assert!(
+            crate::PgMetadataStore::durable_bucket_write_reservations(&*pg, &bucket)
+                .unwrap()
+                .is_empty(),
+            "old-primary direct PUT must release bucket write reservations on node {node_id:?}"
+        );
+    }
+    let current_cluster = crate::StorageCluster::from_local_map(Arc::clone(&current_map)).unwrap();
+    for shard_index in 0..written.ec.k + written.ec.m {
+        assert!(!current_cluster
+            .test_payload_shard_file_exists(
+                written.data_pg_id,
+                written.ec,
+                &segment_okh,
+                generation_id,
+                shard_index,
+            )
+            .unwrap());
+    }
+    let source_data_pg_route = current_map
+        .reconstructed_pg_route_at_epoch(PgId::new(written.data_pg_id), source_epoch)
+        .unwrap();
+    let source_data_pg_primary = current_map
+        .node(source_data_pg_route.primary_node_id())
+        .unwrap()
+        .storage_node()
+        .get_pg(written.data_pg_id)
+        .unwrap();
+    for written_shard in &written.written_shards {
+        assert!(
+            matches!(
+                source_data_pg_primary
+                    .validate_written_shard_ack(&written_shard.key, written_shard.ack),
+                Err(StoreError::NotFound)
+            ),
+            "old-primary direct PUT must delete retained data-PG ack row for shard {}",
+            written_shard.key
+        );
+    }
+}
+
+#[test]
 fn direct_put_publish_validation_fails_closed_when_acknowledged_shard_file_is_missing() {
     let _serial = lock_metadata_command_apply_hook_test();
     let tmp = test_util::tempdir();

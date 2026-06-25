@@ -8565,7 +8565,18 @@ Metadata PG migration and backfill design notes:
   in the next epoch, and storage-node access is installed through Unix clients.
   GET reads the old payload shards through the segment's recorded placement
   epoch; HEAD and LIST remain available from metadata after the data-PG move
-  without claiming payload-route coverage.
+  without claiming payload-route coverage. Started the stronger
+  control-plane-driven stale-primary slice. Direct PUT now has a storage
+  regression where a real `SingleAuthorityControlPlane` acting-set change
+  removes the old object-PG primary and moves the PG into Peering. The
+  in-flight old-primary publish keeps the source epoch while the local runtime
+  map has advanced to the Peering epoch; it must fail closed with
+  `StaleMetadataOperation`, append no object-PG command, publish no object
+  metadata, leave no pending source/current command, release the old
+  bucket-write proof, and delete the staged payload shard files. This shook out
+  two retained-cleanup requirements: bucket-write proof release must resolve
+  the proof's retained metadata route, and best-effort payload cleanup must use
+  retained placement/ack routes instead of the caller's current route.
 - Started the later multipart expansion for deterministic epoch-transition
   faults. CompleteMultipartUpload now has the same local pre-metadata-apply
   gate as direct PUT and DELETE: the test pauses after the multipart completion

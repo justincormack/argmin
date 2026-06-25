@@ -4810,6 +4810,14 @@ fn historical_payload_shard_inspection_can_route_to_unix_storage_node_client() {
     let remote_data_dir = tmp.path().join("historical-remote-node-1");
     let data_pg_id = DataPgId::new(PgId::new(0));
     let historical_epoch = ClusterEpoch::new(7).unwrap();
+    let historical_route = crate::control_plane::PgRouteSnapshot::reconstructed(
+        historical_epoch,
+        data_pg_id.pg_id(),
+        NodeId::new(0),
+        node_ids.to_vec(),
+        PgState::Active,
+    );
+    map.test_install_historical_pg_routes([historical_route.clone()]);
     let location = ShardLocation::new(
         historical_epoch,
         data_pg_id,
@@ -4845,7 +4853,13 @@ fn historical_payload_shard_inspection_can_route_to_unix_storage_node_client() {
                 acting_set: node_ids.to_vec(),
             }],
 
-            historical_pg_routes: Vec::new(),
+            historical_pg_routes: vec![StorageNodePgRoute {
+                pg_id: historical_route.pg_id().get(),
+                cluster_epoch: historical_route.cluster_epoch(),
+                state: historical_route.state(),
+                primary_node_id: historical_route.primary_node_id(),
+                acting_set: historical_route.acting_set().to_vec(),
+            }],
         })
         .unwrap(),
     );

@@ -4226,6 +4226,17 @@ impl StorageCluster {
         Ok(node.shard_ack_client())
     }
 
+    fn metadata_pg_primary_shard_ack_client_at_retained_epoch(
+        &self,
+        operation_epoch: ClusterEpoch,
+        pg_id: PgId,
+    ) -> Result<&Arc<dyn ShardAckNodeClient>, StoreError> {
+        let node = self
+            .local_map
+            .metadata_pg_primary_node_at_retained_epoch(operation_epoch, pg_id)?;
+        Ok(node.shard_ack_client())
+    }
+
     pub fn record_routine_metadata_command_checkpoints(
         &self,
     ) -> Result<MetadataCommandCheckpointRecordSummary, StoreError> {
@@ -4492,7 +4503,7 @@ impl StorageCluster {
         let pg_id = self.bucket_metadata_pg_id(&proof.bucket);
         let node = self
             .local_map
-            .metadata_pg_primary_node(proof.cluster_epoch, PgId::new(pg_id))?;
+            .metadata_pg_primary_node_at_retained_epoch(proof.cluster_epoch, PgId::new(pg_id))?;
         node.bucket_write_reservation_client()
             .release_metadata_command_bucket_write_reservation(PgId::new(pg_id), proof)?;
         Ok(())
@@ -10177,11 +10188,42 @@ impl StorageCluster {
         shard_keys: &[ShardKey],
     ) {
         let placement_key = segment_payload_placement_key(okh, generation_id);
-        let locations = match self.local_map.place_payload_shards(
+        let route = match self
+            .local_map
+            .reconstructed_pg_route_at_epoch(data_pg_id.pg_id(), operation_epoch)
+        {
+            Some(route) => route,
+            None => {
+                self.emit_best_effort_payload_cleanup_error(
+                    "resolve retained payload placement route",
+                    &StoreError::PayloadShardSetMismatch {
+                        reason: format!(
+                            "PG {} route for cluster epoch {} is not retained",
+                            data_pg_id.get(),
+                            operation_epoch.get()
+                        ),
+                    },
+                );
+                return;
+            }
+        };
+        if route.state() != PgState::Active {
+            self.emit_best_effort_payload_cleanup_error(
+                "resolve retained payload placement route",
+                &StoreError::PgNotActive {
+                    pg_id: data_pg_id.get(),
+                    cluster_epoch: route.cluster_epoch(),
+                    state: route.state(),
+                },
+            );
+            return;
+        }
+        let locations = match LocalClusterMap::place_payload_shards_for_pg_route(
             operation_epoch,
             data_pg_id,
             ec,
             &placement_key,
+            route.acting_set(),
         ) {
             Ok(locations) => locations,
             Err(error) => {
@@ -10203,9 +10245,9 @@ impl StorageCluster {
                         );
                         continue;
                     }
-                    if let Err(error) =
-                        self.local_map
-                            .delete_payload_shard(operation_epoch, location, shard_key)
+                    if let Err(error) = self
+                        .local_map
+                        .delete_payload_shard_for_historical_cleanup(location, shard_key)
                     {
                         let error = shard_io_error_to_store(error);
                         self.emit_best_effort_payload_cleanup_error(
@@ -10246,17 +10288,18 @@ impl StorageCluster {
         shard_keys: &[ShardKey],
     ) {
         let pg_id = PgId::new(data_pg_id);
-        let shard_ack_client =
-            match self.metadata_pg_primary_shard_ack_client_at_epoch(operation_epoch, pg_id) {
-                Ok(shard_ack_client) => shard_ack_client,
-                Err(error) => {
-                    self.emit_best_effort_payload_cleanup_error(
-                        "resolve payload ack metadata PG primary",
-                        &error,
-                    );
-                    return;
-                }
-            };
+        let shard_ack_client = match self
+            .metadata_pg_primary_shard_ack_client_at_retained_epoch(operation_epoch, pg_id)
+        {
+            Ok(shard_ack_client) => shard_ack_client,
+            Err(error) => {
+                self.emit_best_effort_payload_cleanup_error(
+                    "resolve payload ack metadata PG primary",
+                    &error,
+                );
+                return;
+            }
+        };
         for shard_key in shard_keys {
             if let Err(error) =
                 self.maybe_run_before_metadata_primary_payload_ack_delete_hook(shard_key)
