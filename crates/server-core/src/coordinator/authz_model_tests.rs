@@ -1978,7 +1978,7 @@ mod harness {
     pub(super) fn setup_same_process_coordinator_with_storage_cluster(
         storage_cluster: Arc<storage::StorageCluster>,
     ) -> Coordinator {
-        Coordinator::new_with_managed_key_provider_for_storage_cluster(
+        Coordinator::new_with_managed_key_provider_for_storage_cluster_without_background_sweepers(
             storage_cluster,
             "us-east-1".to_string(),
             None,
@@ -11733,6 +11733,8 @@ mod phase14_model {
 
 mod phase14_harness {
     use std::cell::Cell;
+    use std::thread;
+    use std::time::Duration;
 
     use super::harness::{setup_coordinator, IdentityFixtures};
     use super::model::Outcome;
@@ -11799,18 +11801,20 @@ mod phase14_harness {
         pub(super) fn apply_mutation(&self, bucket: &str, mutation: Phase14Mutation) {
             match mutation {
                 Phase14Mutation::SetVersioning(state) => {
-                    self.coord
-                        .put_bucket_versioning(&PutBucketVersioningRequest {
-                            bucket: BucketRequest::new(
-                                trusted_bucket_name(bucket),
-                                Requester::authenticated(self.fixtures.owner_user.clone()),
-                                None,
-                            ),
-                            state,
-                        })
-                        .unwrap_or_else(|err| {
-                            panic!("failed to set phase 14 bucket versioning to {state:?}: {err:?}")
-                        });
+                    retry_phase14_setup_operation(
+                        format!("failed to set phase 14 bucket versioning to {state:?}"),
+                        || {
+                            self.coord
+                                .put_bucket_versioning(&PutBucketVersioningRequest {
+                                    bucket: BucketRequest::new(
+                                        trusted_bucket_name(bucket),
+                                        Requester::authenticated(self.fixtures.owner_user.clone()),
+                                        None,
+                                    ),
+                                    state,
+                                })
+                        },
+                    );
                 }
                 Phase14Mutation::ReadPolicy(state) => {
                     self.read_policy.set(state);
@@ -11821,44 +11825,46 @@ mod phase14_harness {
                     self.apply_bucket_policy(bucket);
                 }
                 Phase14Mutation::OwnerPutCurrent => {
-                    test_helpers::put_object(
-                        &self.coord,
-                        &PutObjectRequest {
-                            encryption: WriteEncryptionRequest::none(),
-                            policy_context: PutObjectPolicyContext::default(),
-                            object_lock: ObjectLockState::default(),
-                            object: ObjectRequest::new(
-                                trusted_bucket_name(bucket),
-                                trusted_object_key(PHASE14_KEY),
-                                Requester::authenticated(self.fixtures.owner_user.clone()),
-                                None,
-                            ),
-                            data: b"phase14",
-                            metadata: &MetadataBlob::new(),
-                            system_metadata: &SystemMetadata::EMPTY,
-                            tags: None,
-                            cond: NO_WRITE,
-                            acl: NO_PUT_OBJECT_ACL.into(),
-                        },
-                    )
-                    .unwrap_or_else(|err| panic!("failed to owner-put phase 14 object: {err:?}"));
+                    retry_phase14_setup_operation("failed to owner-put phase 14 object", || {
+                        test_helpers::put_object(
+                            &self.coord,
+                            &PutObjectRequest {
+                                encryption: WriteEncryptionRequest::none(),
+                                policy_context: PutObjectPolicyContext::default(),
+                                object_lock: ObjectLockState::default(),
+                                object: ObjectRequest::new(
+                                    trusted_bucket_name(bucket),
+                                    trusted_object_key(PHASE14_KEY),
+                                    Requester::authenticated(self.fixtures.owner_user.clone()),
+                                    None,
+                                ),
+                                data: b"phase14",
+                                metadata: &MetadataBlob::new(),
+                                system_metadata: &SystemMetadata::EMPTY,
+                                tags: None,
+                                cond: NO_WRITE,
+                                acl: NO_PUT_OBJECT_ACL.into(),
+                            },
+                        )
+                    });
                 }
                 Phase14Mutation::OwnerDelete => {
-                    self.coord
-                        .delete_object(&DeleteObjectRequest {
-                            object: ObjectVersionRequest::new(
-                                trusted_bucket_name(bucket),
-                                trusted_object_key(PHASE14_KEY),
-                                None,
-                                Requester::authenticated(self.fixtures.owner_user.clone()),
-                                None,
-                            ),
-                            bypass_governance: false,
-                            cond: NO_DELETE,
-                        })
-                        .unwrap_or_else(|err| {
-                            panic!("failed to owner-delete current object for phase 14: {err:?}")
-                        });
+                    retry_phase14_setup_operation(
+                        "failed to owner-delete current object for phase 14",
+                        || {
+                            self.coord.delete_object(&DeleteObjectRequest {
+                                object: ObjectVersionRequest::new(
+                                    trusted_bucket_name(bucket),
+                                    trusted_object_key(PHASE14_KEY),
+                                    None,
+                                    Requester::authenticated(self.fixtures.owner_user.clone()),
+                                    None,
+                                ),
+                                bypass_governance: false,
+                                cond: NO_DELETE,
+                            })
+                        },
+                    );
                 }
             }
         }
@@ -11970,19 +11976,17 @@ mod phase14_harness {
                 self.read_policy.get(),
                 self.delete_policy.get(),
             ) else {
-                self.coord
-                    .delete_bucket_policy(&BucketRequest::new(
+                retry_phase14_setup_operation("failed to delete phase 14 bucket policy", || {
+                    self.coord.delete_bucket_policy(&BucketRequest::new(
                         trusted_bucket_name(bucket),
                         Requester::authenticated(self.fixtures.owner_user.clone()),
                         None,
                     ))
-                    .unwrap_or_else(|err| {
-                        panic!("failed to delete phase 14 bucket policy: {err:?}")
-                    });
+                });
                 return;
             };
-            self.coord
-                .put_bucket_policy(&PutBucketPolicyRequest {
+            retry_phase14_setup_operation("failed to put phase 14 bucket policy", || {
+                self.coord.put_bucket_policy(&PutBucketPolicyRequest {
                     bucket: BucketRequest::new(
                         trusted_bucket_name(bucket),
                         Requester::authenticated(self.fixtures.owner_user.clone()),
@@ -11991,8 +11995,26 @@ mod phase14_harness {
                     config: &document,
                     confirm_remove_self_bucket_access: false,
                 })
-                .unwrap_or_else(|err| panic!("failed to put phase 14 bucket policy: {err:?}"));
+            });
         }
+    }
+
+    fn retry_phase14_setup_operation<T>(
+        context: impl AsRef<str>,
+        mut operation: impl FnMut() -> Result<T, ServerError>,
+    ) -> T {
+        const MAX_ATTEMPTS: usize = 20;
+
+        for attempt in 0..MAX_ATTEMPTS {
+            match operation() {
+                Ok(result) => return result,
+                Err(ServerError::OperationAborted) if attempt + 1 < MAX_ATTEMPTS => {
+                    thread::sleep(Duration::from_millis(1));
+                }
+                Err(err) => panic!("{}: {err:?}", context.as_ref()),
+            }
+        }
+        unreachable!("retry loop must return on final attempt")
     }
 
     pub(super) fn to_phase14_outcome(result: ClassifiedPhase14Result) -> Outcome {
