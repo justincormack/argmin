@@ -8533,7 +8533,13 @@ Metadata PG migration and backfill design notes:
   reservation behind. The same multipart completion stale-epoch boundary is now
   covered through installed Unix storage-node clients, proving the remote
   object PG remains unmutated and the remote bucket PG has no leaked write
-  reservation.
+  reservation. UploadPart stream-session creation now has the matching Unix
+  coverage: a direct storage-node RPC regression proves the command-build path
+  rejects stale route epochs before building an UploadPart stream command,
+  while the cluster-level installed-Unix regression proves the stale session
+  create appends no object-PG command, preserves the in-progress multipart
+  upload, and leaves no remote stream session, segment rows, pending command,
+  or bucket write reservation behind.
 
 Exit criteria:
 

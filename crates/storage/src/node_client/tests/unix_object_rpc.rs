@@ -740,6 +740,65 @@ fn unix_object_mutation_metadata_client_loads_snapshots_and_builds_commands() {
 }
 
 #[test]
+fn unix_object_mutation_client_rejects_stale_upload_part_stream_command_epoch() {
+    let tmp = test_util::tempdir();
+    let config = test_config(&tmp);
+    private_socket_dir(config.socket_path.parent().unwrap());
+    let server = StorageNodeServer::bind(config.clone()).unwrap();
+    let server_thread = thread::spawn(move || server.accept_one().unwrap());
+    let stale_epoch = ClusterEpoch::new(config.cluster_epoch.get() + 1).unwrap();
+    let client = UnixStorageNodeClient::new(NodeId::new(7), stale_epoch, config.socket_path);
+    let bucket = crate::tests::bucket_name("stale-upload-part-rpc-bucket");
+    let key = crate::tests::object_key("stale-upload-part-rpc-key");
+    let upload_id = crate::tests::multipart_upload_id("stale-upload-part-rpc-upload");
+    let upload = test_multipart_upload_record(
+        bucket.clone(),
+        key.clone(),
+        upload_id.clone(),
+        UploadState::InProgress,
+    );
+    let request = CreateStreamUploadReq {
+        session_id: crate::tests::stream_session_id("stale-part-rpc"),
+        bucket: bucket.clone(),
+        key: key.clone(),
+        target: StreamUploadTarget::UploadPart {
+            upload_id,
+            part_number: 1,
+        },
+        encryption: ObjectEncryption::None,
+    };
+
+    let err = ObjectMutationMetadataNodeClient::build_create_stream_upload_command(
+        &client,
+        BuildCreateStreamUploadCommandReq {
+            pg_id: PgId::new(0),
+            cluster_epoch: stale_epoch,
+            request: &request,
+            precondition: CreateStreamUploadPrecondition::UploadPart {
+                expected_upload: &upload,
+            },
+            bucket_write_reservation: &test_bucket_write_reservation_proof(bucket, &key),
+        },
+    )
+    .unwrap_err();
+
+    assert!(
+        matches!(
+            err,
+            ObjectPgActionError::Store(StoreError::StorageRpc {
+                operation: "object stream upload command build",
+                ref message,
+                ..
+            }) if message.starts_with("StaleShardLocation: ")
+                && message.contains(&format!("request route epoch {stale_epoch}"))
+                && message.contains(&format!("storage-node epoch {}", config.cluster_epoch))
+        ),
+        "stale UploadPart stream command-build RPC should fail route validation, got {err:?}"
+    );
+    server_thread.join().unwrap();
+}
+
+#[test]
 fn unix_stream_uploads_list_requires_pg_primary() {
     let tmp = test_util::tempdir();
     let mut config = test_config(&tmp);

@@ -3588,6 +3588,193 @@ fn non_current_epoch_unix_stream_append_commit_fails_closed_and_cleans_remote_st
 }
 
 #[test]
+fn non_current_epoch_unix_upload_part_stream_session_create_fails_closed_without_remote_mutation() {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let pg_ids = [0, 1, 2, 3];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let current_epoch = ClusterEpoch::INITIAL;
+    let stale_epoch = ClusterEpoch::new(current_epoch.get() + 1).unwrap();
+    let mut map = LocalClusterMap::open(
+        &tmp.path().join("frontend-upload-part-session-stale"),
+        &node_ids,
+        &pg_ids,
+        ec_shape,
+    )
+    .unwrap();
+    for pg_id in pg_ids {
+        set_route_primary(&mut map, pg_id, NodeId::new(0));
+    }
+    let (bucket, key, object_pg, _data_pg) = {
+        let topology = map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        bucket_key_with_distinct_object_and_data_pg(topology)
+    };
+
+    let mut server_configs = Vec::new();
+    let mut client_configs = Vec::new();
+    for node_id in node_ids {
+        let socket_path = tmp.path().join("sockets").join(format!(
+            "stale-upload-part-session-node-{}.sock",
+            node_id.as_u32()
+        ));
+        private_socket_dir(socket_path.parent().unwrap());
+        let pg_routes = pg_ids
+            .iter()
+            .map(|pg_id| StorageNodePgRoute {
+                pg_id: *pg_id,
+                cluster_epoch: current_epoch,
+                state: PgState::Active,
+                primary_node_id: NodeId::new(0),
+                acting_set: node_ids.to_vec(),
+            })
+            .collect();
+        server_configs.push(StorageNodeProcessConfig {
+            node_id,
+            cluster_epoch: current_epoch,
+            route_map_valid_until_ms: None,
+            data_dir: tmp.path().join(format!(
+                "remote-stale-upload-part-session-{}",
+                node_id.as_u32()
+            )),
+            default_ec_shape: ec_shape,
+            pg_ids: pg_ids.to_vec(),
+            socket_path: socket_path.clone(),
+            pg_routes,
+            historical_pg_routes: Vec::new(),
+        });
+        client_configs.push(LocalUnixStorageNodeClientConfig::new(node_id, socket_path));
+    }
+    for config in server_configs.iter().cloned() {
+        let server = StorageNodeServer::bind(config).unwrap();
+        let _server_thread = thread::spawn(move || server.serve_forever().unwrap());
+    }
+    map.install_unix_storage_node_clients(client_configs)
+        .unwrap();
+    let map = Arc::new(map);
+    let current_cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    create_test_bucket(&current_cluster, &bucket);
+    let upload_id = upload_id_from_label("unixstaleuppart");
+    let create = crate::CreateMultipartUploadReq {
+        upload_id: upload_id.clone(),
+        bucket: bucket.clone(),
+        key: key.clone(),
+        tags: None,
+        metadata_blob: crate::SerializedMetadataBlob::default(),
+        system_metadata_blob: crate::SerializedSystemMetadataBlob::default(),
+        initiator: Some(crate::OwnerIdentity::from_principal("initiator")),
+        owner: crate::OwnerIdentity::from_principal("owner"),
+        acl_grants: crate::AclGrants::default(),
+        public_read: false,
+        object_lock: crate::ObjectLockState::default(),
+        checksum: None,
+        encryption: crate::ObjectEncryption::None,
+    };
+    current_cluster
+        .create_multipart_upload(
+            &bucket,
+            &key,
+            crate::BucketSnapshotRequest::default(),
+            |_snapshot, existing_object| {
+                assert!(existing_object.is_none());
+                Ok::<_, ()>(((), create.clone()))
+            },
+        )
+        .unwrap()
+        .unwrap();
+    let upload = current_cluster
+        .load_in_progress_multipart_upload(&bucket, &key, &upload_id)
+        .unwrap();
+    let before_object_pg_proof = current_cluster
+        .test_object_pg_metadata_proof(&bucket, &key)
+        .unwrap();
+    let stale_cluster =
+        crate::StorageCluster::test_from_local_map_with_epoch(Arc::clone(&map), stale_epoch)
+            .unwrap();
+    let session_id = crate::tests::stream_session_id("unixstaleuppart");
+
+    let err = stale_cluster
+        .create_upload_part_stream_session(
+            &crate::AuthorizedMultipartUploadRecord::assume_authorized(upload),
+            1,
+            &session_id,
+        )
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            crate::ObjectPgActionError::Store(StoreError::StaleMetadataOperation {
+                pg_id,
+                operation_epoch,
+                current_epoch: observed_current_epoch,
+            }) if pg_id == object_pg
+                && operation_epoch == stale_epoch
+                && observed_current_epoch == current_epoch
+        ),
+        "stale Unix UploadPart session create should fail closed before command build, got {err:?}"
+    );
+
+    let after_object_pg_proof = current_cluster
+        .test_object_pg_metadata_proof(&bucket, &key)
+        .unwrap();
+    assert_eq!(
+        after_object_pg_proof, before_object_pg_proof,
+        "stale Unix UploadPart session create must not append an object-PG command"
+    );
+    current_cluster
+        .load_in_progress_multipart_upload(&bucket, &key, &upload_id)
+        .unwrap();
+
+    let remote_primary_config = server_configs
+        .iter()
+        .find(|config| config.node_id == NodeId::new(0))
+        .unwrap();
+    let remote_primary = SharedStorageNode::open_with_default_ec_shape(
+        &remote_primary_config.data_dir,
+        &remote_primary_config.pg_ids,
+        remote_primary_config.default_ec_shape,
+    )
+    .unwrap();
+    let remote_object_pg = remote_primary.get_pg(object_pg).unwrap();
+    assert!(
+        remote_object_pg
+            .pending_metadata_command_slot(NodeId::new(0).as_u32(), current_epoch)
+            .unwrap()
+            .is_none(),
+        "stale Unix UploadPart session create must not leave a remote pending command"
+    );
+    assert!(
+        crate::PgMetadataStore::get_multipart_upload(&*remote_object_pg, &upload_id).is_ok(),
+        "stale Unix UploadPart session create must preserve the in-progress upload"
+    );
+    assert!(
+        matches!(
+            crate::PgMetadataStore::get_stream_upload(&*remote_object_pg, &session_id),
+            Err(crate::MetadataError::StreamSessionNotFound { .. })
+        ),
+        "stale Unix UploadPart session create must not publish a stream session"
+    );
+    assert!(
+        crate::PgMetadataStore::list_stream_segments(&*remote_object_pg, &session_id)
+            .unwrap()
+            .is_empty(),
+        "stale Unix UploadPart session create must not publish segment rows"
+    );
+    let remote_bucket_pg = remote_primary
+        .get_pg(current_cluster.test_bucket_pg_id_for(&bucket))
+        .unwrap();
+    assert!(
+        crate::PgMetadataStore::durable_bucket_write_reservations(&*remote_bucket_pg, &bucket)
+            .unwrap()
+            .is_empty(),
+        "stale Unix UploadPart session create must not leave bucket write reservations"
+    );
+}
+
+#[test]
 fn non_current_epoch_unix_multipart_completion_fails_closed_without_remote_mutation() {
     let tmp = test_util::tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
