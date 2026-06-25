@@ -8650,7 +8650,11 @@ Metadata PG migration and backfill design notes:
   has built the multipart commit but before any object-PG command is applied,
   installs a newer runtime-map epoch, releases the gate, and verifies exactly
   one multipart commit command is appended and the completed object is readable
-  through the newer map. CopyObject now also has local pre-destination-commit
+  through the newer map. UploadPart stream finalization now has matching local
+  pre-metadata-apply coverage at the `CommitStreamPart` boundary: the part
+  commit pauses before object-PG apply, the runtime map advances, and the part
+  finalizes exactly once before being completed into a readable object.
+  CopyObject now also has local pre-destination-commit
   coverage: the test copies from an existing source object, pauses before the
   destination `CommitDirectPutObject`, advances the runtime-map epoch, then
   verifies the copied destination is committed once and remains readable through

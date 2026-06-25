@@ -1893,6 +1893,156 @@ fn complete_multipart_epoch_change_before_metadata_apply_commits_once_on_pinned_
 }
 
 #[test]
+fn upload_part_finalize_epoch_change_before_metadata_apply_commits_once_on_pinned_route() {
+    const TOKEN: DeterministicFaultToken =
+        DeterministicFaultToken::new("upload-part-finalize-before-metadata-apply");
+
+    let bucket = "upload-part-finalize-epoch-change-bucket";
+    let key = "key";
+    let tmp = test_util::tempdir();
+    let initial = open_test_storage_cluster(tmp.path(), &[0, 1]);
+    let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&initial));
+    let coord = Arc::new(
+        Coordinator::new_with_managed_key_provider_for_storage_cluster_runtime_map_handle_with_background_worker_mode(
+            handle.clone(),
+            "us-east-1".to_string(),
+            None,
+            test_sse_s3_provider(),
+            BackgroundWorkerMode::none(),
+        )
+        .unwrap(),
+    );
+    coord
+        .create_bucket_for_owner("default-owner", bucket, false)
+        .unwrap();
+    let upload = coord
+        .create_multipart_upload(&CreateMultipartUploadRequest {
+            object: object_request_with_expected_owner(bucket, key, test_requester(), None),
+            metadata: &MetadataBlob::new(),
+            system_metadata: &SystemMetadata::EMPTY,
+            tags: None,
+            checksum: None,
+            acl: NO_PUT_OBJECT_ACL.into(),
+            encryption: WriteEncryptionRequest::none(),
+            object_lock: ObjectLockState::default(),
+            policy_context: PutObjectPolicyContext::default(),
+        })
+        .unwrap();
+    let session = begin_stream_part_test(&coord, bucket, key, &upload.upload_id, 1).unwrap();
+    let data = b"upload-part-finalize-crosses-epoch-change";
+    coord
+        .append_plaintext_stream_segment_for_test(bucket, key, &session.session_id, 0, data)
+        .unwrap();
+
+    let bucket_name = trusted_bucket_name(bucket);
+    let object_key = trusted_object_key(key);
+    let before_object_pg_proof = initial
+        .test_object_pg_metadata_proof(&bucket_name, &object_key)
+        .unwrap();
+
+    let gate = DeterministicFaultGate::new(TOKEN);
+    let hook_bucket = bucket_name.clone();
+    let hook_key = object_key.clone();
+    let gate_for_hook = Arc::clone(&gate);
+    let _hook_guard =
+        initial.test_install_before_metadata_command_apply_context_hook(Arc::new(move |context| {
+            if context.kind == MetadataCommandApplyTestKind::CommitStreamPart
+                && context.bucket.as_ref() == Some(&hook_bucket)
+                && context.key.as_ref() == Some(&hook_key)
+            {
+                gate_for_hook.wait_at(TOKEN);
+            }
+            Ok(())
+        }));
+
+    let finalize_coord = Arc::clone(&coord);
+    let upload_id = upload.upload_id.clone();
+    let session_id = session.session_id.clone();
+    let finalize_thread = thread::spawn(move || {
+        finalize_coord.finalize_stream_part(FinalizeStreamPartRequest {
+            upload: multipart_object_request_with_expected_owner(
+                bucket,
+                key,
+                &upload_id,
+                test_requester(),
+                None,
+            ),
+            session_id: &session_id,
+            part_number: 1,
+            crc64: checksum::crc64::checksum(data),
+            total_size: data.len() as u64,
+            claimed_checksum: None,
+            computed_checksum: None,
+        })
+    });
+
+    gate.wait_until_arrived(TEST_EVENT_TIMEOUT);
+    let paused_object_pg_proof = initial
+        .test_object_pg_metadata_proof(&bucket_name, &object_key)
+        .unwrap();
+    assert_eq!(
+        paused_object_pg_proof.applied_log_index, before_object_pg_proof.applied_log_index,
+        "UploadPart finalization should not apply an object-PG command before the pre-commit gate"
+    );
+
+    install_next_epoch_runtime_map_with_historical_routes(&handle, &initial, tmp.path());
+
+    gate.release();
+    let part = finalize_thread.join().unwrap().unwrap();
+    let after_object_pg_proof = initial
+        .test_object_pg_metadata_proof(&bucket_name, &object_key)
+        .unwrap();
+    assert_eq!(
+        after_object_pg_proof.applied_log_index,
+        paused_object_pg_proof.applied_log_index + 1,
+        "UploadPart finalization crossing an epoch change should append exactly one part commit after the gate"
+    );
+    assert_ne!(
+        after_object_pg_proof.applied_log_hash, before_object_pg_proof.applied_log_hash,
+        "UploadPart finalization command should change the object-PG command-log hash"
+    );
+    assert_ne!(
+        after_object_pg_proof.state_digest, before_object_pg_proof.state_digest,
+        "UploadPart finalization command should change the object-PG materialized state digest"
+    );
+
+    coord
+        .complete_multipart_upload(&CompleteMultipartUploadRequest {
+            upload: multipart_object_request_with_expected_owner(
+                bucket,
+                key,
+                &upload.upload_id,
+                test_requester(),
+                None,
+            ),
+            parts: &[CompletePart {
+                part_number: 1,
+                etag: part.etag,
+                checksum: None,
+            }],
+            claimed_checksum: None,
+            expected_object_size: None,
+            cond: &WriteCondition::default(),
+            sse_customer: None,
+        })
+        .unwrap();
+    let result = coord
+        .get_object(&GetObjectRequest {
+            sse_customer: None,
+            object: object_version_request_with_expected_owner(
+                bucket,
+                key,
+                None,
+                test_requester(),
+                None,
+            ),
+            cond: NO_READ,
+        })
+        .unwrap();
+    assert_eq!(result.body.read_all().unwrap(), data);
+}
+
+#[test]
 fn put_object_tags_epoch_change_before_metadata_apply_commits_once_on_pinned_route() {
     const TOKEN: DeterministicFaultToken =
         DeterministicFaultToken::new("put-object-tags-before-metadata-apply");
