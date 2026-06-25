@@ -8575,8 +8575,10 @@ Metadata PG migration and backfill design notes:
   command and returns the updated tags. Legal-hold updates now cover the same
   boundary with an object-lock-enabled bucket and version-specific object
   metadata mutation, proving the object-lock side path also commits exactly
-  once across the epoch change. ACL and retention remain follow-on variants of
-  the same shared mutation path.
+  once across the epoch change. Retention updates now cover the governance
+  retention side of the same object-lock metadata path. ACL uses the same
+  storage metadata command shape, so it remains a lower-priority serialization
+  variant rather than separate storage-level fault-injection coverage.
 
 Exit criteria:
 

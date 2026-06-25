@@ -1908,6 +1908,133 @@ fn put_object_legal_hold_epoch_change_before_metadata_apply_commits_once_on_pinn
 }
 
 #[test]
+fn put_object_retention_epoch_change_before_metadata_apply_commits_once_on_pinned_route() {
+    const TOKEN: DeterministicFaultToken =
+        DeterministicFaultToken::new("put-object-retention-before-metadata-apply");
+
+    let bucket = "put-retention-epoch-change-bucket";
+    let key = "key";
+    let tmp = test_util::tempdir();
+    let initial = open_test_storage_cluster(tmp.path(), &[0, 1]);
+    let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&initial));
+    let coord = Arc::new(
+        Coordinator::new_with_managed_key_provider_for_storage_cluster_runtime_map_handle_with_background_worker_mode(
+            handle.clone(),
+            "us-east-1".to_string(),
+            None,
+            test_sse_s3_provider(),
+            BackgroundWorkerMode::none(),
+        )
+        .unwrap(),
+    );
+    coord
+        .create_bucket(&CreateBucketRequest {
+            name: trusted_bucket_name(bucket),
+            requester: test_requester(),
+            namespace: BucketNamespace::Global,
+            acl: CreateBucketAcl::DefaultPrivate,
+            ownership: BucketObjectOwnership::ObjectWriter,
+            object_lock_enabled: true,
+        })
+        .unwrap();
+    let put = test_helpers::put_object(
+        &coord,
+        &PutObjectRequest {
+            encryption: WriteEncryptionRequest::none(),
+            policy_context: PutObjectPolicyContext::default(),
+            object_lock: ObjectLockState::default(),
+            object: object_request_with_expected_owner(bucket, key, test_requester(), None),
+            data: b"retention-across-epoch",
+            metadata: &MetadataBlob::new(),
+            system_metadata: &SystemMetadata::EMPTY,
+            tags: None,
+            cond: NO_WRITE,
+            acl: NO_PUT_OBJECT_ACL.into(),
+        },
+    )
+    .unwrap();
+
+    let bucket_name = trusted_bucket_name(bucket);
+    let object_key = trusted_object_key(key);
+    let object_pg = initial.test_object_pg_id_for(&bucket_name, &object_key);
+    let primary_node = initial
+        .local_pg_route(PgId::new(object_pg))
+        .unwrap()
+        .primary_node_id();
+    let before_object_pg_proof = initial
+        .test_object_pg_metadata_proof(&bucket_name, &object_key)
+        .unwrap();
+
+    let gate = DeterministicFaultGate::new(TOKEN);
+    let hook_bucket = bucket_name.clone();
+    let hook_key = object_key.clone();
+    let gate_for_hook = Arc::clone(&gate);
+    let _hook_guard =
+        initial.test_install_before_metadata_command_apply_context_hook(Arc::new(move |context| {
+            if context.kind == MetadataCommandApplyTestKind::PutObjectMetadata
+                && context.bucket.as_ref() == Some(&hook_bucket)
+                && context.key.as_ref() == Some(&hook_key)
+                && context.node_id == primary_node
+            {
+                gate_for_hook.wait_at(TOKEN);
+            }
+            Ok(())
+        }));
+
+    let retention = ObjectRetention {
+        mode: ObjectLockMode::Governance,
+        retain_until_unix_seconds: Coordinator::current_unix_seconds().unwrap() + 3600,
+    };
+    let retention_coord = Arc::clone(&coord);
+    let retention_thread = thread::spawn(move || {
+        put_object_retention_test(
+            &retention_coord,
+            bucket,
+            key,
+            Some(put.version_id),
+            retention,
+            false,
+            test_requester(),
+        )
+    });
+
+    gate.wait_until_arrived(TEST_EVENT_TIMEOUT);
+    let paused_object_pg_proof = initial
+        .test_object_pg_metadata_proof(&bucket_name, &object_key)
+        .unwrap();
+    assert_eq!(
+        paused_object_pg_proof.applied_log_index, before_object_pg_proof.applied_log_index,
+        "retention update should not apply the object-PG metadata command before the pre-apply gate"
+    );
+
+    install_next_epoch_runtime_map_with_historical_routes(&handle, &initial, tmp.path());
+
+    gate.release();
+    retention_thread.join().unwrap().unwrap();
+    let after_object_pg_proof = initial
+        .test_object_pg_metadata_proof(&bucket_name, &object_key)
+        .unwrap();
+    assert_eq!(
+        after_object_pg_proof.applied_log_index,
+        paused_object_pg_proof.applied_log_index + 1,
+        "retention update crossing an epoch change should append exactly one object metadata command after the gate"
+    );
+    assert_ne!(
+        after_object_pg_proof.applied_log_hash, before_object_pg_proof.applied_log_hash,
+        "retention update command should change the object-PG command-log hash"
+    );
+    assert_ne!(
+        after_object_pg_proof.state_digest, before_object_pg_proof.state_digest,
+        "retention update command should change the object-PG materialized state digest"
+    );
+
+    let fetched =
+        get_object_retention_test(&coord, bucket, key, Some(put.version_id), test_requester())
+            .unwrap();
+    assert_eq!(fetched, Some(retention));
+}
+
+#[test]
 fn get_object_epoch_change_after_read_snapshot_uses_pinned_route() {
     let bucket = "get-epoch-change-bucket";
     let key = "key";
