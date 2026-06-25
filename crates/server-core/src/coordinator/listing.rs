@@ -1,5 +1,7 @@
 use storage::ObjectKey;
 
+#[cfg(test)]
+use super::maybe_run_list_objects_before_storage_hook;
 use super::{
     optional_list_object_key, AuthorizedListObjectVersions, AuthorizedListObjectsV2, Coordinator,
     ListEntry, ListObjectVersionsRequest, ListObjectVersionsResult, ListObjectsResult,
@@ -24,7 +26,9 @@ impl Coordinator {
         let delimiter = req.delimiter;
         let continuation_token = req.continuation_token;
         let max_keys = req.max_keys.min(S3_MAX_LIST_KEYS);
-        let AuthorizedListObjectsV2 { bucket_info } = self.authorize_list_objects_v2(req)?;
+        let storage_node = self.storage_node();
+        let AuthorizedListObjectsV2 { bucket_info } =
+            self.authorize_list_objects_v2_with_storage_node(&storage_node, req)?;
         let owner_principal = bucket_info.owner_principal.clone();
         let owner_canonical_id = bucket_info.owner_canonical_id.clone();
 
@@ -42,8 +46,10 @@ impl Coordinator {
         let list_prefix = optional_list_object_key(prefix)?;
         let list_start_after = optional_list_object_key(continuation_token)?;
 
-        let listed = self
-            .storage_node()
+        #[cfg(test)]
+        maybe_run_list_objects_before_storage_hook(bucket.as_str());
+
+        let listed = storage_node
             .list_objects_for_bucket(
                 bucket,
                 list_prefix.as_ref(),

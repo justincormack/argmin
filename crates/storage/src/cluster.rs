@@ -4169,6 +4169,26 @@ impl StorageCluster {
             })
     }
 
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_object_pg_metadata_proof(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+    ) -> Result<PgMetadataProof, StoreError> {
+        let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
+        let primary = self
+            .local_map
+            .metadata_pg_primary_node(self.operation_epoch(), pg_id)?;
+        let state = primary
+            .metadata_command_client()
+            .metadata_command_replica_state(pg_id)?;
+        Ok(PgMetadataProof::new(
+            state.applied_log_index,
+            state.applied_log_hash,
+            state.state_digest,
+        ))
+    }
+
     /// Temporary process-local registry key for shared coordinator workers.
     ///
     /// Multiple `StorageCluster` handles backed by the same local node keep

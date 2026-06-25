@@ -1105,74 +1105,18 @@ fn put_object_pins_runtime_map_after_bucket_write_reservation() {
     );
 }
 
-#[test]
-fn put_object_epoch_change_before_metadata_apply_commits_once_on_pinned_route() {
-    const TOKEN: DeterministicFaultToken =
-        DeterministicFaultToken::new("put-object-before-metadata-apply");
-
-    let bucket = "direct-put-epoch-change-bucket";
-    let key = "key";
-    let tmp = test_util::tempdir();
-    let initial = open_test_storage_cluster(tmp.path(), &[0, 1]);
-    let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&initial));
-    let coord = Arc::new(
-        Coordinator::new_with_managed_key_provider_for_storage_cluster_runtime_map_handle_with_background_worker_mode(
-            handle.clone(),
-            "us-east-1".to_string(),
-            None,
-            test_sse_s3_provider(),
-            BackgroundWorkerMode::none(),
-        )
-        .unwrap(),
-    );
-    coord
-        .create_bucket_for_owner("default-owner", bucket, false)
-        .unwrap();
-
-    let gate = DeterministicFaultGate::new(TOKEN);
-    let hook_bucket = trusted_bucket_name(bucket);
-    let hook_key = trusted_object_key(key);
-    let gate_for_hook = Arc::clone(&gate);
-    let _hook_guard =
-        initial.test_install_before_metadata_command_apply_context_hook(Arc::new(move |context| {
-            if context.kind == MetadataCommandApplyTestKind::CommitDirectPutObject
-                && context.bucket.as_ref() == Some(&hook_bucket)
-                && context.key.as_ref() == Some(&hook_key)
-            {
-                gate_for_hook.wait_at(TOKEN);
-            }
-            Ok(())
-        }));
-
-    let put_coord = Arc::clone(&coord);
-    let put_thread = thread::spawn(move || {
-        let metadata = MetadataBlob::new();
-        test_helpers::put_object(
-            &put_coord,
-            &PutObjectRequest {
-                encryption: WriteEncryptionRequest::none(),
-                policy_context: PutObjectPolicyContext::default(),
-                object_lock: ObjectLockState::default(),
-                object: object_request_with_expected_owner(bucket, key, test_requester(), None),
-                data: b"direct-put-crosses-epoch-change",
-                metadata: &metadata,
-                system_metadata: &SystemMetadata::EMPTY,
-                tags: None,
-                cond: NO_WRITE,
-                acl: NO_PUT_OBJECT_ACL.into(),
-            },
-        )
-    });
-
-    gate.wait_until_arrived(TEST_EVENT_TIMEOUT);
-
+fn install_next_epoch_runtime_map_with_historical_routes(
+    handle: &StorageClusterRuntimeMapHandle,
+    initial: &Arc<StorageCluster>,
+    node_root: &std::path::Path,
+) {
     let node_count = u32::from(initial.default_payload_ec_shape().k)
         + u32::from(initial.default_payload_ec_shape().m);
     let configs = (0..node_count)
         .map(|node_id| {
             LocalNodeStoreConfig::new(
                 NodeId::new(node_id),
-                tmp.path().join(format!("node-{node_id:04}")),
+                node_root.join(format!("node-{node_id:04}")),
             )
         })
         .collect::<Vec<_>>();
@@ -1216,10 +1160,103 @@ fn put_object_epoch_change_before_metadata_apply_commits_once_on_pinned_route() 
     candidate_map.test_install_historical_pg_routes(historical_routes);
     let candidate = StorageCluster::from_local_map(Arc::new(candidate_map)).unwrap();
     handle.install(candidate).unwrap();
+}
+
+#[test]
+fn put_object_epoch_change_before_metadata_apply_commits_once_on_pinned_route() {
+    const TOKEN: DeterministicFaultToken =
+        DeterministicFaultToken::new("put-object-before-metadata-apply");
+
+    let bucket = "direct-put-epoch-change-bucket";
+    let key = "key";
+    let tmp = test_util::tempdir();
+    let initial = open_test_storage_cluster(tmp.path(), &[0, 1]);
+    let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&initial));
+    let coord = Arc::new(
+        Coordinator::new_with_managed_key_provider_for_storage_cluster_runtime_map_handle_with_background_worker_mode(
+            handle.clone(),
+            "us-east-1".to_string(),
+            None,
+            test_sse_s3_provider(),
+            BackgroundWorkerMode::none(),
+        )
+        .unwrap(),
+    );
+    coord
+        .create_bucket_for_owner("default-owner", bucket, false)
+        .unwrap();
+    let bucket_name = trusted_bucket_name(bucket);
+    let object_key = trusted_object_key(key);
+    let before_object_pg_proof = initial
+        .test_object_pg_metadata_proof(&bucket_name, &object_key)
+        .unwrap();
+
+    let gate = DeterministicFaultGate::new(TOKEN);
+    let hook_bucket = bucket_name.clone();
+    let hook_key = object_key.clone();
+    let gate_for_hook = Arc::clone(&gate);
+    let _hook_guard =
+        initial.test_install_before_metadata_command_apply_context_hook(Arc::new(move |context| {
+            if context.kind == MetadataCommandApplyTestKind::CommitDirectPutObject
+                && context.bucket.as_ref() == Some(&hook_bucket)
+                && context.key.as_ref() == Some(&hook_key)
+            {
+                gate_for_hook.wait_at(TOKEN);
+            }
+            Ok(())
+        }));
+
+    let put_coord = Arc::clone(&coord);
+    let put_thread = thread::spawn(move || {
+        let metadata = MetadataBlob::new();
+        test_helpers::put_object(
+            &put_coord,
+            &PutObjectRequest {
+                encryption: WriteEncryptionRequest::none(),
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
+                object: object_request_with_expected_owner(bucket, key, test_requester(), None),
+                data: b"direct-put-crosses-epoch-change",
+                metadata: &metadata,
+                system_metadata: &SystemMetadata::EMPTY,
+                tags: None,
+                cond: NO_WRITE,
+                acl: NO_PUT_OBJECT_ACL.into(),
+            },
+        )
+    });
+
+    gate.wait_until_arrived(TEST_EVENT_TIMEOUT);
+    let paused_object_pg_proof = initial
+        .test_object_pg_metadata_proof(&bucket_name, &object_key)
+        .unwrap();
+    assert_eq!(
+        paused_object_pg_proof.applied_log_index,
+        before_object_pg_proof.applied_log_index + 1,
+        "direct PUT should have applied only the generation-reservation command before the pre-commit gate"
+    );
+
+    install_next_epoch_runtime_map_with_historical_routes(&handle, &initial, tmp.path());
 
     gate.release();
     let put_result = put_thread.join().unwrap().unwrap();
     assert_eq!(put_result.version_id, VersionId::Null);
+    let after_object_pg_proof = initial
+        .test_object_pg_metadata_proof(&bucket_name, &object_key)
+        .unwrap();
+    assert_eq!(
+        after_object_pg_proof.applied_log_index,
+        paused_object_pg_proof.applied_log_index + 1,
+        "direct PUT crossing an epoch change should append exactly one commit command after the gate"
+    );
+    assert_ne!(
+        after_object_pg_proof.applied_log_hash, before_object_pg_proof.applied_log_hash,
+        "direct PUT command should change the object-PG command-log hash"
+    );
+    assert_ne!(
+        after_object_pg_proof.state_digest, before_object_pg_proof.state_digest,
+        "direct PUT command should change the object-PG materialized state digest"
+    );
 
     let result = coord
         .get_object(&GetObjectRequest {
@@ -1238,6 +1275,405 @@ fn put_object_epoch_change_before_metadata_apply_commits_once_on_pinned_route() 
         result.body.read_all().unwrap(),
         b"direct-put-crosses-epoch-change"
     );
+}
+
+#[test]
+fn overwrite_object_epoch_change_before_metadata_apply_commits_once_on_pinned_route() {
+    const TOKEN: DeterministicFaultToken =
+        DeterministicFaultToken::new("overwrite-object-before-metadata-apply");
+
+    let bucket = "overwrite-epoch-change-bucket";
+    let key = "key";
+    let tmp = test_util::tempdir();
+    let initial = open_test_storage_cluster(tmp.path(), &[0, 1]);
+    let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&initial));
+    let coord = Arc::new(
+        Coordinator::new_with_managed_key_provider_for_storage_cluster_runtime_map_handle_with_background_worker_mode(
+            handle.clone(),
+            "us-east-1".to_string(),
+            None,
+            test_sse_s3_provider(),
+            BackgroundWorkerMode::none(),
+        )
+        .unwrap(),
+    );
+    coord
+        .create_bucket_for_owner("default-owner", bucket, false)
+        .unwrap();
+    let metadata = MetadataBlob::new();
+    test_helpers::put_object(
+        &coord,
+        &PutObjectRequest {
+            encryption: WriteEncryptionRequest::none(),
+            policy_context: PutObjectPolicyContext::default(),
+            object_lock: ObjectLockState::default(),
+            object: object_request_with_expected_owner(bucket, key, test_requester(), None),
+            data: b"old-body",
+            metadata: &metadata,
+            system_metadata: &SystemMetadata::EMPTY,
+            tags: None,
+            cond: NO_WRITE,
+            acl: NO_PUT_OBJECT_ACL.into(),
+        },
+    )
+    .unwrap();
+
+    let bucket_name = trusted_bucket_name(bucket);
+    let object_key = trusted_object_key(key);
+    let before_object_pg_proof = initial
+        .test_object_pg_metadata_proof(&bucket_name, &object_key)
+        .unwrap();
+
+    let gate = DeterministicFaultGate::new(TOKEN);
+    let hook_bucket = bucket_name.clone();
+    let hook_key = object_key.clone();
+    let gate_for_hook = Arc::clone(&gate);
+    let _hook_guard =
+        initial.test_install_before_metadata_command_apply_context_hook(Arc::new(move |context| {
+            if context.kind == MetadataCommandApplyTestKind::CommitDirectPutObject
+                && context.bucket.as_ref() == Some(&hook_bucket)
+                && context.key.as_ref() == Some(&hook_key)
+            {
+                gate_for_hook.wait_at(TOKEN);
+            }
+            Ok(())
+        }));
+
+    let put_coord = Arc::clone(&coord);
+    let put_thread = thread::spawn(move || {
+        let metadata = MetadataBlob::new();
+        test_helpers::put_object(
+            &put_coord,
+            &PutObjectRequest {
+                encryption: WriteEncryptionRequest::none(),
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
+                object: object_request_with_expected_owner(bucket, key, test_requester(), None),
+                data: b"new-body",
+                metadata: &metadata,
+                system_metadata: &SystemMetadata::EMPTY,
+                tags: None,
+                cond: NO_WRITE,
+                acl: NO_PUT_OBJECT_ACL.into(),
+            },
+        )
+    });
+
+    gate.wait_until_arrived(TEST_EVENT_TIMEOUT);
+    let paused_object_pg_proof = initial
+        .test_object_pg_metadata_proof(&bucket_name, &object_key)
+        .unwrap();
+    assert_eq!(
+        paused_object_pg_proof.applied_log_index,
+        before_object_pg_proof.applied_log_index + 1,
+        "overwrite should have applied only the generation-reservation command before the pre-commit gate"
+    );
+
+    install_next_epoch_runtime_map_with_historical_routes(&handle, &initial, tmp.path());
+
+    gate.release();
+    let put_result = put_thread.join().unwrap().unwrap();
+    assert_eq!(put_result.version_id, VersionId::Null);
+    let after_object_pg_proof = initial
+        .test_object_pg_metadata_proof(&bucket_name, &object_key)
+        .unwrap();
+    assert_eq!(
+        after_object_pg_proof.applied_log_index,
+        paused_object_pg_proof.applied_log_index + 1,
+        "overwrite crossing an epoch change should append exactly one commit command after the gate"
+    );
+    assert_ne!(
+        after_object_pg_proof.applied_log_hash, before_object_pg_proof.applied_log_hash,
+        "overwrite command should change the object-PG command-log hash"
+    );
+    assert_ne!(
+        after_object_pg_proof.state_digest, before_object_pg_proof.state_digest,
+        "overwrite command should change the object-PG materialized state digest"
+    );
+
+    let result = coord
+        .get_object(&GetObjectRequest {
+            sse_customer: None,
+            object: object_version_request_with_expected_owner(
+                bucket,
+                key,
+                None,
+                test_requester(),
+                None,
+            ),
+            cond: NO_READ,
+        })
+        .unwrap();
+    assert_eq!(result.body.read_all().unwrap(), b"new-body");
+}
+
+#[test]
+fn delete_object_epoch_change_before_metadata_apply_commits_once_on_pinned_route() {
+    const TOKEN: DeterministicFaultToken =
+        DeterministicFaultToken::new("delete-object-before-metadata-apply");
+
+    let bucket = "delete-epoch-change-bucket";
+    let key = "key";
+    let tmp = test_util::tempdir();
+    let initial = open_test_storage_cluster(tmp.path(), &[0, 1]);
+    let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&initial));
+    let coord = Arc::new(
+        Coordinator::new_with_managed_key_provider_for_storage_cluster_runtime_map_handle_with_background_worker_mode(
+            handle.clone(),
+            "us-east-1".to_string(),
+            None,
+            test_sse_s3_provider(),
+            BackgroundWorkerMode::none(),
+        )
+        .unwrap(),
+    );
+    coord
+        .create_bucket_for_owner("default-owner", bucket, false)
+        .unwrap();
+    let metadata = MetadataBlob::new();
+    test_helpers::put_object(
+        &coord,
+        &PutObjectRequest {
+            encryption: WriteEncryptionRequest::none(),
+            policy_context: PutObjectPolicyContext::default(),
+            object_lock: ObjectLockState::default(),
+            object: object_request_with_expected_owner(bucket, key, test_requester(), None),
+            data: b"delete-me",
+            metadata: &metadata,
+            system_metadata: &SystemMetadata::EMPTY,
+            tags: None,
+            cond: NO_WRITE,
+            acl: NO_PUT_OBJECT_ACL.into(),
+        },
+    )
+    .unwrap();
+
+    let bucket_name = trusted_bucket_name(bucket);
+    let object_key = trusted_object_key(key);
+    let before_object_pg_proof = initial
+        .test_object_pg_metadata_proof(&bucket_name, &object_key)
+        .unwrap();
+
+    let gate = DeterministicFaultGate::new(TOKEN);
+    let hook_bucket = bucket_name.clone();
+    let hook_key = object_key.clone();
+    let gate_for_hook = Arc::clone(&gate);
+    let _hook_guard =
+        initial.test_install_before_metadata_command_apply_context_hook(Arc::new(move |context| {
+            if context.kind == MetadataCommandApplyTestKind::DeleteObjectVersion
+                && context.bucket.as_ref() == Some(&hook_bucket)
+                && context.key.as_ref() == Some(&hook_key)
+            {
+                gate_for_hook.wait_at(TOKEN);
+            }
+            Ok(())
+        }));
+
+    let delete_coord = Arc::clone(&coord);
+    let delete_thread = thread::spawn(move || {
+        delete_coord.delete_object(&delete_object_request(
+            bucket,
+            key,
+            None,
+            test_requester(),
+            false,
+            NO_DELETE,
+        ))
+    });
+
+    gate.wait_until_arrived(TEST_EVENT_TIMEOUT);
+    let paused_object_pg_proof = initial
+        .test_object_pg_metadata_proof(&bucket_name, &object_key)
+        .unwrap();
+    assert_eq!(
+        paused_object_pg_proof.applied_log_index, before_object_pg_proof.applied_log_index,
+        "delete should not apply the object-PG command before the pre-apply gate"
+    );
+
+    install_next_epoch_runtime_map_with_historical_routes(&handle, &initial, tmp.path());
+
+    gate.release();
+    delete_thread.join().unwrap().unwrap();
+    let after_object_pg_proof = initial
+        .test_object_pg_metadata_proof(&bucket_name, &object_key)
+        .unwrap();
+    assert_eq!(
+        after_object_pg_proof.applied_log_index,
+        before_object_pg_proof.applied_log_index + 1,
+        "delete crossing an epoch change should append exactly one delete command after the gate"
+    );
+    assert_ne!(
+        after_object_pg_proof.applied_log_hash, before_object_pg_proof.applied_log_hash,
+        "delete command should change the object-PG command-log hash"
+    );
+    assert_ne!(
+        after_object_pg_proof.state_digest, before_object_pg_proof.state_digest,
+        "delete command should change the object-PG materialized state digest"
+    );
+
+    let err = coord
+        .get_object(&GetObjectRequest {
+            sse_customer: None,
+            object: object_version_request_with_expected_owner(
+                bucket,
+                key,
+                None,
+                test_requester(),
+                None,
+            ),
+            cond: NO_READ,
+        })
+        .unwrap_err();
+    assert!(matches!(err, ServerError::ObjectNotFound { .. }));
+}
+
+#[test]
+fn get_object_epoch_change_after_read_snapshot_uses_pinned_route() {
+    let bucket = "get-epoch-change-bucket";
+    let key = "key";
+    let tmp = test_util::tempdir();
+    let initial = open_test_storage_cluster(tmp.path(), &[0, 1]);
+    let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&initial));
+    let coord =
+        Coordinator::new_with_managed_key_provider_for_storage_cluster_runtime_map_handle_with_background_worker_mode(
+            handle.clone(),
+            "us-east-1".to_string(),
+            None,
+            test_sse_s3_provider(),
+            BackgroundWorkerMode::none(),
+        )
+        .unwrap();
+    coord
+        .create_bucket_for_owner("default-owner", bucket, false)
+        .unwrap();
+
+    let metadata = MetadataBlob::new();
+    test_helpers::put_object(
+        &coord,
+        &PutObjectRequest {
+            encryption: WriteEncryptionRequest::none(),
+            policy_context: PutObjectPolicyContext::default(),
+            object_lock: ObjectLockState::default(),
+            object: object_request_with_expected_owner(bucket, key, test_requester(), None),
+            data: b"get-crosses-epoch-change",
+            metadata: &metadata,
+            system_metadata: &SystemMetadata::EMPTY,
+            tags: None,
+            cond: NO_WRITE,
+            acl: NO_PUT_OBJECT_ACL.into(),
+        },
+    )
+    .unwrap();
+
+    let hook_handle = handle.clone();
+    let hook_initial = Arc::clone(&initial);
+    let hook_node_root = tmp.path().to_path_buf();
+    let _serial = RECLAMATION_TEST_SERIAL
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap();
+    let _hook_guard = install_reclamation_test_hooks(ReclamationTestHooks {
+        target: Some((bucket.to_string(), key.to_string())),
+        after_object_read_snapshot: Some(Arc::new(move || {
+            install_next_epoch_runtime_map_with_historical_routes(
+                &hook_handle,
+                &hook_initial,
+                &hook_node_root,
+            );
+        })),
+        ..ReclamationTestHooks::default()
+    });
+
+    let result = coord
+        .get_object(&GetObjectRequest {
+            sse_customer: None,
+            object: object_version_request_with_expected_owner(
+                bucket,
+                key,
+                None,
+                test_requester(),
+                None,
+            ),
+            cond: NO_READ,
+        })
+        .unwrap();
+    assert_eq!(result.body.read_all().unwrap(), b"get-crosses-epoch-change");
+}
+
+#[test]
+fn list_objects_epoch_change_before_storage_list_uses_pinned_route() {
+    let bucket = "list-epoch-change-bucket";
+    let tmp = test_util::tempdir();
+    let initial = open_test_storage_cluster(tmp.path(), &[0, 1]);
+    let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&initial));
+    let coord =
+        Coordinator::new_with_managed_key_provider_for_storage_cluster_runtime_map_handle_with_background_worker_mode(
+            handle.clone(),
+            "us-east-1".to_string(),
+            None,
+            test_sse_s3_provider(),
+            BackgroundWorkerMode::none(),
+        )
+        .unwrap();
+    coord
+        .create_bucket_for_owner("default-owner", bucket, false)
+        .unwrap();
+
+    for (key, data) in [("a/1", b"1".as_slice()), ("a/2", b"2"), ("b/1", b"3")] {
+        test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
+                encryption: WriteEncryptionRequest::none(),
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
+                object: object_request_with_expected_owner(bucket, key, test_requester(), None),
+                data,
+                metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
+                tags: None,
+                cond: NO_WRITE,
+                acl: NO_PUT_OBJECT_ACL.into(),
+            },
+        )
+        .unwrap();
+    }
+
+    let candidate_tmp = test_util::tempdir();
+    let hook_handle = handle.clone();
+    let hook_initial = Arc::clone(&initial);
+    let hook_node_root = candidate_tmp.path().to_path_buf();
+    let _serial = LIST_OBJECTS_TEST_SERIAL
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap();
+    let _hook_guard = install_list_objects_test_hooks(ListObjectsTestHooks {
+        bucket: Some(bucket.to_string()),
+        before_storage_list: Some(Arc::new(move || {
+            install_next_epoch_runtime_map_with_historical_routes(
+                &hook_handle,
+                &hook_initial,
+                &hook_node_root,
+            );
+        })),
+    });
+
+    let result = coord
+        .list_objects_v2(&ListObjectsV2Request {
+            bucket: bucket_request_with_expected_owner(bucket, test_requester(), None),
+            prefix: None,
+            delimiter: None,
+            continuation_token: None,
+            max_keys: 1000,
+            requested_max_keys: Some(1000),
+        })
+        .unwrap();
+    let keys = result
+        .objects
+        .iter()
+        .map(|object| object.key.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(keys, ["a/1", "a/2", "b/1"]);
+    assert!(!result.is_truncated);
 }
 
 #[test]

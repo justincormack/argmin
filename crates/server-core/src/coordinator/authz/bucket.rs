@@ -874,11 +874,23 @@ impl Coordinator {
         Ok(AuthorizedGetBucketLocation)
     }
 
+    #[cfg(test)]
     pub(in crate::coordinator) fn authorize_list_objects_v2(
         &self,
         req: &ListObjectsV2Request<'_>,
     ) -> Result<AuthorizedListObjectsV2, ServerError> {
-        let bucket = self.load_bucket_handle_for_bucket_policy_read(&req.bucket)?;
+        self.authorize_list_objects_v2_with_storage_node(&self.storage_node(), req)
+    }
+
+    pub(in crate::coordinator) fn authorize_list_objects_v2_with_storage_node(
+        &self,
+        storage_node: &Arc<StorageCluster>,
+        req: &ListObjectsV2Request<'_>,
+    ) -> Result<AuthorizedListObjectsV2, ServerError> {
+        let bucket = self.load_bucket_handle_for_bucket_policy_read_with_storage_node(
+            storage_node,
+            &req.bucket,
+        )?;
         let bucket_policy = self.cached_bucket_policy_for_loaded_handle(&bucket)?;
         let policy_decision = self.bucket_policy_decision_for_loaded_handle_with_context(
             &req.bucket.requester,

@@ -8471,8 +8471,20 @@ Metadata PG migration and backfill design notes:
   direct-put metadata command is applied: it installs a newer runtime-map epoch
   while the operation is paused, resumes the request, and verifies the object is
   committed once and readable through the newer map using retained historical
-  placement routes. This pins the local in-process/pinned-route behavior before
-  adding stricter stale-primary and remote storage-node fault-injection cases.
+  placement routes. The regression also checks the object PG metadata proof:
+  the generation-reservation command is the only object-PG command applied
+  before the gate, and exactly one direct-put commit command is applied after
+  release. The same local pinned-route fault shape now covers overwrite and
+  verifies the newer body is visible after the epoch transition, and covers
+  unversioned DELETE by proving no object-PG command is applied before the gate
+  and exactly one delete command is applied after release. GET now also has a
+  local after-read-snapshot epoch-change regression proving the selected payload
+  route remains pinned through body construction. LIST now captures one storage
+  map for authorization and object listing, with a regression that swaps the
+  current handle to an empty next-epoch map immediately before the storage-list
+  call and still expects a complete sorted page. This pins the local
+  in-process/pinned-route behavior before adding HEAD, stricter stale-primary,
+  and remote storage-node fault-injection cases.
 
 Exit criteria:
 

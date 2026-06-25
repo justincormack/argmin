@@ -123,6 +123,15 @@ pub(super) static BUCKET_WRITE_HANDLE_TEST_HOOKS: OnceLock<Mutex<BucketWriteHand
 pub(super) static BUCKET_WRITE_HANDLE_TEST_SERIAL: OnceLock<Mutex<()>> = OnceLock::new();
 
 #[derive(Default, Clone)]
+pub(super) struct ListObjectsTestHooks {
+    pub(super) bucket: Option<String>,
+    pub(super) before_storage_list: Option<Arc<dyn Fn() + Send + Sync>>,
+}
+
+pub(super) static LIST_OBJECTS_TEST_HOOKS: OnceLock<Mutex<ListObjectsTestHooks>> = OnceLock::new();
+pub(super) static LIST_OBJECTS_TEST_SERIAL: OnceLock<Mutex<()>> = OnceLock::new();
+
+#[derive(Default, Clone)]
 pub(super) struct StreamAppendTestHooks {
     pub(super) target: Option<(String, u32)>,
     pub(super) after_prepare: Option<Arc<dyn Fn() + Send + Sync>>,
@@ -160,6 +169,8 @@ pub(super) struct BucketFastPathIdentityLoadErrorTestHookGuard;
 
 pub(super) struct BucketWriteHandleTestHookGuard;
 
+pub(super) struct ListObjectsTestHookGuard;
+
 pub(super) struct ShardRepairWorkerTestHookGuard;
 
 impl Drop for StreamAppendTestHookGuard {
@@ -181,6 +192,14 @@ impl Drop for BucketWriteHandleTestHookGuard {
         let hooks = BUCKET_WRITE_HANDLE_TEST_HOOKS
             .get_or_init(|| Mutex::new(BucketWriteHandleTestHooks::default()));
         *hooks.lock().unwrap() = BucketWriteHandleTestHooks::default();
+    }
+}
+
+impl Drop for ListObjectsTestHookGuard {
+    fn drop(&mut self) {
+        let hooks =
+            LIST_OBJECTS_TEST_HOOKS.get_or_init(|| Mutex::new(ListObjectsTestHooks::default()));
+        *hooks.lock().unwrap() = ListObjectsTestHooks::default();
     }
 }
 
@@ -244,6 +263,14 @@ pub(super) fn install_bucket_write_handle_test_hooks(
         .get_or_init(|| Mutex::new(BucketWriteHandleTestHooks::default()));
     *slot.lock().unwrap() = hooks;
     BucketWriteHandleTestHookGuard
+}
+
+pub(super) fn install_list_objects_test_hooks(
+    hooks: ListObjectsTestHooks,
+) -> ListObjectsTestHookGuard {
+    let slot = LIST_OBJECTS_TEST_HOOKS.get_or_init(|| Mutex::new(ListObjectsTestHooks::default()));
+    *slot.lock().unwrap() = hooks;
+    ListObjectsTestHookGuard
 }
 
 pub(super) fn install_shard_repair_worker_test_hooks(
@@ -535,6 +562,19 @@ pub(super) fn maybe_run_object_metadata_policy_context_hook(bucket: &str) {
         .clone();
     if hooks.bucket.as_ref().is_some_and(|target| target == bucket) {
         if let Some(hook) = hooks.after_object_metadata_policy_context {
+            hook();
+        }
+    }
+}
+
+pub(super) fn maybe_run_list_objects_before_storage_hook(bucket: &str) {
+    let hooks = LIST_OBJECTS_TEST_HOOKS
+        .get_or_init(|| Mutex::new(ListObjectsTestHooks::default()))
+        .lock()
+        .unwrap()
+        .clone();
+    if hooks.bucket.as_ref().is_some_and(|target| target == bucket) {
+        if let Some(hook) = hooks.before_storage_list {
             hook();
         }
     }

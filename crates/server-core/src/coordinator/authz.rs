@@ -1532,7 +1532,23 @@ impl Coordinator {
         &self,
         req: &BucketRequest<'_>,
     ) -> Result<LoadedBucketHandle, ServerError> {
-        self.load_bucket_handle_for_bucket_read(req, BucketHandleRequest::new())
+        self.load_bucket_handle_for_bucket_policy_read_with_storage_node(&self.storage_node(), req)
+    }
+
+    pub(super) fn load_bucket_handle_for_bucket_policy_read_with_storage_node(
+        &self,
+        storage_node: &Arc<StorageCluster>,
+        req: &BucketRequest<'_>,
+    ) -> Result<LoadedBucketHandle, ServerError> {
+        let request = BucketHandleRequest::new()
+            .requiring_policy_view()
+            .requiring_bucket_tags_if_abac_enabled();
+        self.bucket_handle_loader().load_bucket_with_storage_node(
+            storage_node,
+            req.name_typed(),
+            req.expected_bucket_owner(),
+            request,
+        )
     }
 
     pub(super) fn load_bucket_handle_for_object_policy_read_with_storage_node(
