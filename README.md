@@ -21,6 +21,10 @@ test harness dependency set. The binary is at `target/release/argmin-s3`.
 
 ## Run
 
+`argmin-s3` must run as a dedicated non-root user. The binary exits at startup
+if its effective uid is `0`; configure the service manager or container image
+to set an ordinary service user before launching the process.
+
 The server is configured via environment variables:
 
 | Variable | Default | Description |

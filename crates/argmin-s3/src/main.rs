@@ -53,6 +53,24 @@ const CONTROL_PLANE_RPC_IO_TIMEOUT: Duration = Duration::from_secs(1);
 extern "C" {
     fn flock(fd: i32, operation: i32) -> i32;
     fn getuid() -> u32;
+    fn geteuid() -> u32;
+}
+
+const ROOT_PROCESS_ERROR: &str =
+    "argmin-s3 must not be run as root; configure a dedicated non-root service user";
+
+fn reject_root_process(effective_uid: u32) -> Result<(), &'static str> {
+    if effective_uid == 0 {
+        Err(ROOT_PROCESS_ERROR)
+    } else {
+        Ok(())
+    }
+}
+
+fn reject_current_root_process() -> Result<(), &'static str> {
+    // SAFETY: geteuid has no preconditions and does not mutate memory.
+    let effective_uid = unsafe { geteuid() };
+    reject_root_process(effective_uid)
 }
 
 fn load_certs(path: &str) -> Result<Vec<CertificateDer<'static>>, String> {
@@ -198,12 +216,26 @@ fn control_plane_state_lock_path(state_path: &Path) -> Result<PathBuf, String> {
     Ok(lock_path)
 }
 
-#[tokio::main]
-async fn main() {
+fn main() {
+    if let Err(error) = reject_current_root_process() {
+        eprintln!("{error}");
+        std::process::exit(1);
+    }
     let _ = rustls::crypto::ring::default_provider().install_default();
     if let Some(exit_code) = maybe_run_control_plane_admin_command() {
         std::process::exit(exit_code);
     }
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap_or_else(|error| {
+            eprintln!("failed to initialize Tokio runtime: {error}");
+            std::process::exit(1);
+        });
+    runtime.block_on(async_main());
+}
+
+async fn async_main() {
     let config = match ServerConfig::from_env() {
         Ok(c) => c,
         Err(e) => {
@@ -1991,6 +2023,16 @@ mod tests {
             abort_on_500: false,
             local_debug_endpoint: false,
         }
+    }
+
+    #[test]
+    fn root_process_check_rejects_effective_uid_zero() {
+        assert_eq!(reject_root_process(0), Err(ROOT_PROCESS_ERROR));
+    }
+
+    #[test]
+    fn root_process_check_accepts_non_root_effective_uid() {
+        assert_eq!(reject_root_process(1_000), Ok(()));
     }
 
     #[test]
