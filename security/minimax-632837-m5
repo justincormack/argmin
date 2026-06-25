@@ -1,0 +1,66 @@
+Storage-node socket directory validation has a TOCTOU window and does not check setuid/setgid/sticky bits
+Link: https://chatgpt.com/codex/cloud/security/findings/argmin-security-review-2026-06-23-m5
+Criticality: medium (attack path: medium)
+Status: fixed
+
+# Resolution
+Fixed in 203a0162.
+
+The valid part of the finding was the special-bit gap: `validate_socket_directory` masked the parent mode to `0o777` and then checked only `mode & 0o077 == 0`, so setuid, setgid, and sticky bits were ignored. The fix now checks the full permission mode with `mode & 0o7777` and requires it to be exactly `0o700`. A regression verifies a socket directory with setgid set (`0o2700`) is rejected.
+
+The TOCTOU and symlink portions of the original report were overstated for the intended deployment model. The storage-node process is not intended to run as root, and a non-root process cannot write into a `0700` socket directory owned by another uid. A different unprivileged local user also cannot swap entries inside that directory. Existing symlinks at the socket path were already rejected by `cleanup_stale_socket_path`, which uses `symlink_metadata` and refuses non-socket file types before stale cleanup.
+
+An owner-uid check could still improve diagnostics and align with the control-plane socket validator, but it is not required to close the reported attack path for non-root operation. Root refusal is a broader top-level process policy decision and was not added in this fix.
+
+# Metadata
+Repo: justincormack/argmin
+Commit: 632837a
+Author: security-review
+Created: 23/06/2026, 15:30:00
+Assignee: Unassigned
+Signals: Security, Validated, TOCTOU, Hardening
+
+# Summary
+`StorageNodeServer::bind` calls `validate_socket_directory` (`crates/storage/src/storage_node_server.rs:9713-9737`) and then `UnixListener::bind` with a TOCTOU window in between. The validation checks only that the parent directory exists, is a directory, and has no group/other permission bits (`mode & 0o077 == 0`). It does not (1) check setuid, setgid, or sticky bits (`mode & 0o7000`), (2) require the parent to be owned by the running process, (3) require the resolved path's components to be free of symlinks, or (4) check that the parent directory's group is the running process's primary or supplementary group. `cleanup_stale_socket_path` (`crates/storage/src/storage_node_server.rs:9763-9801`) checks that the file is a socket before removing it, but the symlink check is `metadata.file_type().is_socket()` on a `symlink_metadata` (which is correct), and a symlink would fail the check — so the symlink case is covered for stale-path cleanup. The TOCTOU between `validate_socket_directory` and `UnixListener::bind` allows a local attacker with write access to the parent directory to swap a benign file for a symlink to a privileged location after the validation passes and before the bind completes. With the default permissions requirement, write access to the parent requires the attacker to be in the same uid as the storage-node process, but the check does not enforce that the parent is owned by the running uid, only that it has restrictive mode bits.
+
+# Validation
+## Rubric
+- [x] Confirm `validate_socket_directory` only checks `mode & 0o077`.
+- [x] Confirm the storage-node bind path performs no additional fstat between validation and `UnixListener::bind`.
+- [x] Confirm `cleanup_stale_socket_path` uses `symlink_metadata` to refuse symlinks.
+- [x] Add a regression that places a symlink at the socket path and verifies the bind fails, and another that places a setgid bit on the parent and verifies the bind fails.
+## Report
+Direct inspection of `validate_socket_directory` (`crates/storage/src/storage_node_server.rs:9713-9737`) and `cleanup_stale_socket_path` (`crates/storage/src/storage_node_server.rs:9763-9801`) confirms the gap. The fix is to use `openat` with `O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC` on the resolved parent directory and `fstat` the resulting fd rather than `fs::metadata`, and to tighten the mode check to `mode & 0o7777 != 0o700` (i.e. require exactly 0o700, no setuid/setgid/sticky). The `set_permissions` enforcement should also be applied to the parent directory when the storage node creates it, mirroring the data-dir fix in `minimax-632837-m4`.
+
+# Evidence
+crates/storage/src/storage_node_server.rs (L9713 to 9737)
+  Note: The directory mode check ignores setuid/setgid/sticky bits and does not require owner match.
+```
+fn validate_socket_directory(socket_path: &Path) -> Result<(), StorageNodeServerError> {
+    validate_absolute_socket_path(socket_path)?;
+    let parent =
+        socket_path
+            .parent()
+            .ok_or_else(|| StorageNodeServerError::SocketPathMissingParent {
+                path: socket_path.to_path_buf(),
+            })?;
+    socket_path
+        .file_name()
+        .ok_or_else(|| StorageNodeServerError::SocketPathMissingFileName {
+            path: socket_path.to_path_buf(),
+        })?;
+    let metadata = fs::metadata(parent).map_err(|source| StorageNodeServerError::Io {
+        context: "stat storage-node socket directory",
+        path: parent.to_path_buf(),
+        source,
+    })?;
+    let mode = metadata.permissions().mode() & 0o777;
+    if !metadata.is_dir() || mode & 0o077 != 0 {
+        return Err(StorageNodeServerError::SocketDirectoryNotPrivate {
+            path: parent.to_path_buf(),
+            mode,
+        });
+    }
+    Ok(())
+}
+```
