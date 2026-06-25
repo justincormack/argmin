@@ -1,0 +1,66 @@
+Data directory creation relies on umask for permissions rather than an explicit chmod
+Link: https://chatgpt.com/codex/cloud/security/findings/argmin-security-review-2026-06-23-m4
+Criticality: medium (attack path: medium)
+Status: fixed
+
+# Resolution
+Fixed in 63423a0a.
+
+The fix added a shared storage data-directory preparation helper in `crates/storage/src/data_dir.rs`. Missing data directories are created with mode `0700`; existing non-world-writable directories such as `0755` or `0775` are tightened to `0700`; existing world-writable directories such as `0777` fail closed before startup continues.
+
+The helper is now used by the standalone storage-node data-dir lock path, embedded local-cluster node directory preparation, `LocalStorageNode::open`, and `SharedStorageNode::open_with_default_ec_shape`. This covers both standalone storage-node startup and the local frontend path that creates `ARGMIN_DATA_DIR/node-000N` directories.
+
+Regression coverage was added for the helper itself, storage-node bind behavior, and embedded local-cluster behavior. The tests cover creation as `0700`, tightening existing readable directories to `0700`, and rejecting existing world-writable data directories.
+
+# Metadata
+Repo: justincormack/argmin
+Commit: 632837a
+Author: security-review
+Created: 23/06/2026, 15:30:00
+Assignee: Unassigned
+Signals: Security, Validated, Hardening
+
+# Summary
+Both `StorageNodeDataDirLock::acquire` (`crates/storage/src/storage_node_server.rs:9600-9612`) and the frontend `argmin-s3` data-dir creation rely on `fs::create_dir_all` to create the data directory, which honours the process umask. With a permissive umask (e.g. `umask 0o022`, the Debian/Ubuntu default for login shells, or `umask 0o000` in some container entrypoints), the resulting directory is created with mode 0o755 or 0o777. The threat model assumes "unprivileged local users cannot modify `ARGMIN_DATA_DIR` contents" (`guides/threat_model.md`), which depends on the directory being private. The unit tests set 0o700 explicitly (`crates/storage/src/storage_node_server.rs:11230`, `11492`), demonstrating the intent, but the production startup path does not enforce it. A misconfigured deployment will create a world-readable data directory containing shard files and SQLite databases — including SSE-S3 wrapped DEKs and SSE-C validator state — without any warning.
+
+# Validation
+## Rubric
+- [x] Confirm `StorageNodeDataDirLock::acquire` calls `fs::create_dir_all` with no `set_permissions`.
+- [x] Confirm the frontend startup path similarly relies on `create_dir_all` for the data dir.
+- [x] Confirm the test fixtures explicitly call `fs::set_permissions(.., 0o700)`.
+- [x] Confirm the threat model assumes the data dir is private but the runtime does not enforce it.
+- [x] Add a regression that sets `umask 0o022`, runs the bind path, and verifies the data dir is 0o700 (or the bind fails closed).
+## Report
+The test fixtures at `crates/storage/src/storage_node_server.rs:11230` and `crates/storage/src/storage_node_server.rs:11492` set 0o700 explicitly because the test process is launched under the developer shell's umask. The production bind path at `crates/storage/src/storage_node_server.rs:9600-9612` did not. The same pattern applied to embedded local-node data dirs created under `ARGMIN_DATA_DIR`.
+
+After 63423a0a, storage data-root creation and validation is centralized through the shared helper. The risk was operational rather than remote: a misconfigured deployment could previously get a world-readable data directory silently.
+
+# Evidence
+crates/storage/src/storage_node_server.rs (L9600 to 9612)
+  Note: The data directory is created with whatever mode the process umask allows; no explicit chmod is performed.
+```
+    fn acquire(data_dir: &Path) -> Result<Self, StorageNodeServerError> {
+        fs::create_dir_all(data_dir).map_err(|source| StorageNodeServerError::Io {
+            context: "create storage-node data directory",
+            path: data_dir.to_path_buf(),
+            source,
+        })?;
+        let path = data_dir.join(DATA_DIR_LOCK_FILE);
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .map_err(|source| StorageNodeServerError::Io {
+                context: "open storage-node data-dir lock",
+                path: path.clone(),
+                source,
+            })?;
+```
+
+crates/storage/src/storage_node_server.rs (L11230)
+  Note: The test path explicitly sets 0o700, demonstrating the intended mode.
+```
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+```
