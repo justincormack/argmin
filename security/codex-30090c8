@@ -1,0 +1,222 @@
+PG proof epoch stamping can reject valid writes after epoch bump
+Link: https://chatgpt.com/codex/cloud/security/findings/0805b628fee88191b199e5ffd0ae84c0?sev=&repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin
+Criticality: medium (attack path: medium)
+Status: fixed
+
+# Metadata
+Repo: justincormack/argmin
+Commit: 30090c8
+Fixed Commit: 14e0961f
+Author: justin@specialbusservice.com
+Created: 24/06/2026, 22:20:32
+Assignee: Unassigned
+Signals: Security, Validated, Attack-path
+
+# Summary
+Introduced a control-plane availability bug. The epoch stored for active_metadata_proof does not reliably represent the epoch in which that proof was actually produced/observed, but the new floor check treats it as authoritative and rejects otherwise valid epoch-local command-log progress.
+The new active_metadata_proof_epoch is used to decide whether an active primary's observed metadata proof may be accepted when the metadata command log index is not monotonically comparable to the stored floor. However, complete_pg_peering and complete_ready_pg_peerings set active_metadata_proof_epoch after bump_epoch(), even though active_metadata_proof was obtained from peering observations in the previous cluster epoch. Additionally, heartbeat handling updates active_metadata_proof_epoch whenever the proof tuple is equal, but the proof tuple itself does not carry the metadata command epoch; an equal proof reported in a later cluster epoch may still represent the prior epoch's state. The validator then requires active_floor_epoch < observed_epoch before accepting epoch-local progress with a reset/lower log index. As a result, after activation or after an epoch bump followed by an equal-proof heartbeat, the first legitimate metadata command in the current epoch can produce a lower-index proof that is rejected as PgActiveMetadataProofMismatch. Rejected heartbeats can prevent lease renewal and make the PG unavailable. An authenticated S3 client can trigger the failure by issuing metadata-changing operations after an administrative/recovery epoch transition where the stored floor has a higher prior-epoch log index.
+
+# Resolution
+Fixed by commit https://github.com/justincormack/argmin/commit/14e0961f (`14e0961f Fix active metadata proof epoch stamping`).
+
+The fix records active metadata proof provenance using the epoch in which the proof was actually observed. `complete_pg_peering` and `complete_ready_pg_peerings` now capture the peering epoch before the activation epoch bump and store that as `active_metadata_proof_epoch`. Equal-proof active heartbeats no longer restamp the proof epoch, because the proof tuple does not itself identify the metadata command epoch. Only real metadata proof progress updates the stored proof and epoch.
+
+The commit adds regressions for direct peering completion, batch peering completion, equal-proof heartbeat preservation, and accepting the first legitimate current-epoch lower-index metadata progress after activation.
+
+Verified with:
+- `cargo test -p storage active_heartbeat_accepts_metadata_progress_after_peering`
+- `cargo test -p storage complete_ready_pg_peerings_stamps_active_proofs_with_peering_epoch`
+- `cargo test -p storage active_primary_service_requires_current_observation_metadata_proof`
+- `cargo test -p storage control_plane`
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings`
+- `git diff --check`
+
+# Validation
+## Rubric
+- [x] Identify the activation and heartbeat paths touched by the commit and confirm where active_metadata_proof_epoch is written and consumed.
+- [x] Reproduce a real control-plane sequence where a proof observed in a peering epoch is stamped with the later active epoch.
+- [x] Demonstrate the validator would accept the lower current-epoch proof if the stored epoch represented the true observation epoch, but rejects it with the post-bump epoch.
+- [x] Exercise the actual heartbeat validation path and observe PgActiveMetadataProofMismatch/failed lease renewal for the lower current-epoch proof.
+- [x] Attempt compiled-stack validation methods: direct failing PoC/test panic succeeded; valgrind and ASan were unavailable; lldb debugger trace captured the rejecting call chain and variables.
+## Report
+Validated the finding with a targeted Rust unit-test PoC against the checked-out commit. The relevant code matches the suspected bug: complete_pg_peering collects active_metadata_proof before bump_epoch(), then stores active_metadata_proof_epoch as the post-bump active epoch at crates/storage/src/control_plane.rs:2177-2211; complete_ready_pg_peerings has the same pattern at 2267-2291; heartbeat validation calls metadata_proof_satisfies_active_primary_observation_floor and returns PgActiveMetadataProofMismatch at 5637-5644; the floor helper only permits non-monotonic epoch-local progress when active_floor_epoch < observed_epoch at 5776-5792. I added a failing PoC test, poc_expected_current_epoch_progress_is_rejected, that uses the real SingleAuthorityControlPlane flow: bootstrap a PG, heartbeat a Peering proof with index 42 in ClusterEpoch(3), complete peering which bumps to ClusterEpoch(4), observe that active_metadata_proof_epoch is incorrectly stamped Some(ClusterEpoch(4)), then send an Active heartbeat in epoch 4 with a legitimate lower epoch-local proof index 1. The PoC prints that the same lower proof would be accepted if the proof epoch were the true peering epoch, but is rejected with the stored post-bump epoch. Command output: peering_epoch=ClusterEpoch(3) active_epoch=ClusterEpoch(4) stamped_epoch=Some(ClusterEpoch(4)); with true proof epoch ClusterEpoch(3), lower proof accepted by floor check: true; with stored proof epoch Some(ClusterEpoch(4)), lower proof accepted by floor check: false; then the test panics because heartbeat returned PgActiveMetadataProofMismatch { pg_id: 7, node_id: 1, cluster_epoch: ClusterEpoch(4), expected: PgMetadataProof { applied_log_index: 42, applied_log_hash: 2748, state_digest: 3567 }, actual: PgMetadataProof { applied_log_index: 1, applied_log_hash: 291, state_digest: 1110 } }. This reproduces the control-plane availability failure: the heartbeat carrying current-epoch metadata progress is rejected instead of renewing. I also attempted memory/debug validation per compiled-stack guidance: valgrind is not installed; ASan via RUSTFLAGS='-Z sanitizer=address' is unavailable on the stable toolchain; gdb is not installed; lldb is available and a non-interactive trace stopped at validate_pg_heartbeat_observations line 5637, showing expected proof index 42, observed proof index 1, snapshot cluster_epoch 4, and the stack through SingleAuthorityControlPlane::heartbeat into the PoC test.
+
+# Evidence
+crates/storage/src/control_plane.rs (L2177 to 2211)
+  Note: active_metadata_proof is collected before bump_epoch(), but active_metadata_proof_epoch is set to the post-bump active_epoch, so the stored epoch can be newer than the epoch that produced the proof.
+```
+        let active_metadata_proof =
+            validate_pg_peering_observations(&self.snapshot, pg_id, record.acting_set(), now_ms)?;
+        validate_peering_metadata_proof_floor(
+            self.snapshot.cluster_epoch,
+            pg_id,
+            primary,
+            record.peering_metadata_proof_floor,
+            record.peering_metadata_transfer,
+            active_metadata_proof,
+        )?;
+
+        let mut next_snapshot = self.snapshot.clone();
+        let record = next_snapshot
+            .pgs
+            .get_mut(&pg_id)
+            .expect("PG record validated before peering completion");
+        let active_metadata_transfer_imported = record.peering_metadata_transfer.is_some();
+        record.state = PgState::Active;
+        record.active_primary = Some(primary);
+        record.active_metadata_proof = Some(active_metadata_proof);
+        record.active_metadata_transfer_imported = active_metadata_transfer_imported;
+        record.peering_metadata_proof_floor = None;
+        record.peering_metadata_transfer = None;
+        record.peering_metadata_transfer_source_route_epoch = None;
+        record.peering_metadata_transfer_source_node_id = None;
+        record.metadata_transfer_fenced = false;
+        record.metadata_transfer_fence_source_lease_deadline_ms = None;
+        record.metadata_transfer_fence_source_imported = false;
+        next_snapshot.bump_epoch()?;
+        let active_epoch = next_snapshot.cluster_epoch;
+        next_snapshot
+            .pgs
+            .get_mut(&pg_id)
+            .expect("PG record activated before epoch bump")
+            .active_metadata_proof_epoch = Some(active_epoch);
+```
+
+crates/storage/src/control_plane.rs (L2267 to 2291)
+  Note: The batch peering completion path has the same post-bump stamping issue for every ready PG.
+```
+        for (pg_id, primary, active_metadata_proof) in &ready {
+            let record = next_snapshot
+                .pgs
+                .get_mut(pg_id)
+                .expect("ready PG must exist in cloned snapshot");
+            record.state = PgState::Active;
+            record.active_primary = Some(*primary);
+            record.active_metadata_proof = Some(*active_metadata_proof);
+            record.active_metadata_transfer_imported = record.peering_metadata_transfer.is_some();
+            record.peering_metadata_proof_floor = None;
+            record.peering_metadata_transfer = None;
+            record.peering_metadata_transfer_source_route_epoch = None;
+            record.peering_metadata_transfer_source_node_id = None;
+            record.metadata_transfer_fenced = false;
+            record.metadata_transfer_fence_source_lease_deadline_ms = None;
+            record.metadata_transfer_fence_source_imported = false;
+        }
+        next_snapshot.bump_epoch()?;
+        let active_epoch = next_snapshot.cluster_epoch;
+        for (pg_id, _, _) in &ready {
+            next_snapshot
+                .pgs
+                .get_mut(pg_id)
+                .expect("ready PG activated before epoch bump")
+                .active_metadata_proof_epoch = Some(active_epoch);
+```
+
+crates/storage/src/control_plane.rs (L2414 to 2428)
+  Note: An equal proof heartbeat advances active_metadata_proof_epoch to the heartbeat epoch even though the proof tuple has no epoch component; this can erase the older floor epoch needed to accept the next epoch-local lower-index proof.
+```
+            if observation.metadata_proof == current_proof {
+                pg.active_metadata_proof_epoch = Some(heartbeat.observed_epoch);
+                continue;
+            }
+            if metadata_proof_satisfies_active_primary_observation_floor(
+                current_proof,
+                observation.metadata_proof,
+                pg.active_metadata_transfer_imported,
+                pg.active_metadata_proof_epoch,
+                heartbeat.observed_epoch,
+            ) && observation.metadata_proof != current_proof
+            {
+                pg.active_metadata_proof = Some(observation.metadata_proof);
+                pg.active_metadata_proof_epoch = Some(heartbeat.observed_epoch);
+                pg.active_metadata_transfer_imported = false;
+```
+
+crates/storage/src/control_plane.rs (L5637 to 5644)
+  Note: Heartbeat validation applies the epoch-sensitive proof floor check and returns PgActiveMetadataProofMismatch when the valid lower-index current-epoch proof is rejected.
+```
+            if !metadata_proof_satisfies_active_primary_observation_floor(
+                expected,
+                observation.metadata_proof,
+                pg.active_metadata_transfer_imported,
+                pg.active_metadata_proof_epoch,
+                snapshot.cluster_epoch,
+            ) {
+                return Err(ControlPlaneError::PgActiveMetadataProofMismatch {
+```
+
+crates/storage/src/control_plane.rs (L5776 to 5792)
+  Note: The new validation only accepts non-monotonic epoch-local progress when active_floor_epoch is strictly older than observed_epoch, so the incorrectly advanced epoch causes legitimate progress to be rejected.
+```
+fn metadata_proof_satisfies_active_primary_observation_floor(
+    active_floor: PgMetadataProof,
+    observed: PgMetadataProof,
+    active_metadata_transfer_imported: bool,
+    active_floor_epoch: Option<ClusterEpoch>,
+    observed_epoch: ClusterEpoch,
+) -> bool {
+    if metadata_proof_satisfies_active_floor(active_floor, observed) {
+        return true;
+    }
+    if let Some(active_floor_epoch) = active_floor_epoch {
+        active_floor_epoch < observed_epoch
+            && observed != active_floor
+            && observed.applied_log_hash != 0
+            && observed.state_digest != active_floor.state_digest
+            && (!active_metadata_transfer_imported
+                || metadata_proof_satisfies_fenced_transfer_source_floor(active_floor, observed))
+```
+
+# Attack-path analysis
+Final: medium | Decider: model_decided | Matrix severity: medium | Policy adjusted: medium
+## Rationale
+Kept at medium. The issue is validated and in production control-plane code, with an executable unit-test PoC showing PgActiveMetadataProofMismatch for legitimate current-epoch metadata progress. It is reachable from an authenticated S3 write path in deployments using the control-plane/storage-node roles because storage-node heartbeats derive PgMetadataProof from metadata command state and submit it to the vulnerable validator. However, high/critical is not justified: exploitation requires valid write credentials plus an operational epoch transition, the default listen address is localhost with no public IaC exposure in the repo, and the proven impact is availability of affected PGs only, with no auth bypass, data exfiltration, persistent corruption, RCE, or cross-tenant compromise shown.
+## Likelihood
+high - Exploitation requires a non-default control-plane deployment and a peering/recovery/reconfiguration epoch transition with a suitable prior proof. After that condition, a normal authenticated S3 metadata-changing operation can trigger the bad proof path. Default repository configuration listens only on localhost and no public ingress manifests were found, reducing broad opportunistic likelihood. | Remote network vector
+## Impact
+medium - The demonstrated effect is rejection of valid storage-node heartbeats and possible lease renewal failure, making one or more placement groups unavailable. This can deny reads/writes for data mapped to affected PGs, but does not show data loss, confidentiality breach, integrity tampering, privilege escalation, or code execution.
+## Assumptions
+- The affected control-plane/storage-node roles are deployed, not only the default legacy-local single-process mode.
+- The attacker has valid S3 credentials and write permission for at least one bucket/object whose placement group is affected.
+- A peering, recovery, restart, reconfiguration, or similar control-plane epoch transition occurs before the attacker-triggered metadata-changing operation.
+- No repository deployment manifests prove a public internet exposure; exposure is inferred from the production TCP listener and environment-configurable listen address.
+- argmin-s3 frontend/storage-node/control-plane or combined deployment using SingleAuthorityControlPlane
+- valid SigV4-authenticated S3 write-capable requester
+- PG activation or epoch bump after peering/recovery/reconfiguration
+- first current-epoch metadata progress has lower epoch-local log index than stored prior proof
+## Path
+Authenticated S3 client
+  -> HTTP frontend/auth
+  -> Coordinator metadata-changing write
+  -> Storage node heartbeat with PgMetadataProof
+  -> Control-plane epoch-floor validation
+  -> PgActiveMetadataProofMismatch / lease renewal failure / PG unavailable
+## Path evidence
+- `crates/storage/src/control_plane.rs:2177-2211` - complete_pg_peering obtains active_metadata_proof before bump_epoch(), then sets active_metadata_proof_epoch to the post-bump active_epoch.
+- `crates/storage/src/control_plane.rs:2267-2292` - Batch peering completion repeats the same post-bump epoch stamping for all ready PGs.
+- `crates/storage/src/control_plane.rs:2414-2428` - Equal-proof heartbeat advances active_metadata_proof_epoch to heartbeat.observed_epoch even though the proof tuple has no epoch component.
+- `crates/storage/src/control_plane.rs:5637-5645` - Heartbeat validation rejects observations that do not satisfy the epoch-sensitive active primary proof floor, returning PgActiveMetadataProofMismatch.
+- `crates/storage/src/control_plane.rs:5776-5792` - The floor helper only permits non-monotonic epoch-local progress when active_floor_epoch is strictly older than observed_epoch.
+- `crates/storage/src/node.rs:1163-1209` - Storage nodes build heartbeat PG observations from local metadata command replica state and include PgMetadataProof values sent to the control plane.
+- `crates/storage/src/storage_node_server.rs:1041-1052` - The storage-node refresh path submits the generated heartbeat to refresh_node_heartbeat, reaching the vulnerable control-plane validation.
+- `crates/server-http/src/http/mod.rs:859-905` - HTTP frontend routes S3 requests, authenticates them, and dispatches authenticated operations.
+- `crates/server-http/src/http/mod.rs:3094-3118` - SigV4 authentication is applied using the configured credential store and service/region scope.
+- `crates/server-core/src/coordinator/put.rs:24-55` - PutObject is a normal authenticated S3 metadata-changing operation that enters coordinator/storage write paths.
+- `crates/argmin-s3/src/main.rs:234-246` - The argmin-s3 production binary supports control-plane, storage-node, combined, frontend, and legacy-local roles.
+- `crates/argmin-s3/src/main.rs:1823-1835` - The frontend binds a TCP listener on the configured listen address for S3 traffic.
+- `crates/argmin-s3/src/config.rs:122-147` - Configuration shows required credentials, default listen address 127.0.0.1:9000, and control-plane/socket configuration knobs.
+## Narrative
+The finding is a real availability bug in the production control-plane path. complete_pg_peering and complete_ready_pg_peerings collect active_metadata_proof before bump_epoch(), but then store active_metadata_proof_epoch as the post-bump cluster epoch. Equal-proof heartbeats can also advance the stored epoch without proving that the tuple was produced in that epoch. Later heartbeat validation accepts non-monotonic epoch-local progress only when active_floor_epoch < observed_epoch, so a legitimate first current-epoch lower-index proof can be rejected as PgActiveMetadataProofMismatch. Static reachability exists from authenticated S3 writes through the HTTP frontend and coordinator into storage metadata state, which storage-node heartbeats report to the control plane. The validation PoC exercised the real SingleAuthorityControlPlane flow and showed the lower current-epoch proof is rejected with the incorrectly stamped epoch. Impact is availability of affected PGs; no confidentiality, integrity, auth bypass, RCE, or secret exposure is evidenced.
+## Controls
+- AWS SigV4 authentication for normal S3 requests
+- bucket/object authorization before writes
+- default frontend listen address is loopback 127.0.0.1:9000
+- control-plane RPC uses Unix sockets rather than a public TCP port
+- control-plane socket directory is required to be private/owner-controlled
+- max TCP connections and max in-flight request limits are configurable
+## Blindspots
+- Static-only repository review cannot prove how operators expose ARGMIN_LISTEN_ADDR in real deployments.
+- No Kubernetes, Terraform, Docker, or load-balancer manifests were found to confirm public ingress or fleet-wide blast radius.
+- The validation PoC exercised SingleAuthorityControlPlane directly rather than a full end-to-end HTTP S3 request through a live multi-process cluster.
+- Exact PG blast radius depends on deployment topology, acting sets, and how lease loss is surfaced to clients.
+- README text still describes some multihost/control-plane work as transitional, so production adoption level is uncertain from repository artifacts alone.
