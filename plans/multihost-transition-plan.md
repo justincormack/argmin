@@ -8581,6 +8581,12 @@ Metadata PG migration and backfill design notes:
   two retained-cleanup requirements: bucket-write proof release must resolve
   the proof's retained metadata route, and best-effort payload cleanup must use
   retained placement/ack routes instead of the caller's current route.
+  The same direct PUT stale-primary shape is now covered through installed Unix
+  storage-node clients: after the real control-plane acting-set change moves
+  the object PG into Peering, the old-primary frontend fails closed, appends no
+  remote object-PG command, publishes no object metadata, releases the retained
+  bucket-write proof, and deletes the remote payload shard files plus
+  data-PG ack rows using the source epoch routes.
   Unversioned DELETE now has the same control-plane-driven Peering shape: after
   a real acting-set change removes the old object-PG primary, the old-primary
   delete must fail closed at the stale metadata-operation boundary, append no

@@ -3468,7 +3468,7 @@ impl LocalClusterMap {
                 cluster_epoch: location.cluster_epoch(),
             })?;
         node.shard_client()
-            .delete_placed_shard(location.data_pg_id(), key)
+            .delete_placed_shard_for_historical_cleanup(location, key)
             .map_err(|source| ShardIoError::Store {
                 node_id: location.node_id().as_u32(),
                 pg_id: location.data_pg_id().get(),

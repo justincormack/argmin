@@ -2993,19 +2993,11 @@ impl StorageNodeConnectionHandler {
         &self,
         request: StorageRpcProofReleaseRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
-        if let Err(error) = self.validate_pg_route_for_cleanup(
-            request.node_id,
-            request.cluster_epoch,
-            request.pg_id,
-        ) {
-            return encode_storage_rpc_error_response(&error);
-        }
-        let route = self
-            .config
-            .pg_routes
-            .iter()
-            .find(|route| route.pg_id == request.pg_id.get())
-            .expect("validated proof-release PG route must exist");
+        let route =
+            match self.cleanup_pg_route(request.node_id, request.cluster_epoch, request.pg_id) {
+                Ok(route) => route,
+                Err(error) => return encode_storage_rpc_error_response(&error),
+            };
         if route.primary_node_id != self.config.node_id {
             return encode_storage_rpc_error_response(&StorageRpcErrorResponse {
                 code: StorageRpcErrorCode::NonActingSetAccess,
@@ -6476,7 +6468,7 @@ impl StorageNodeConnectionHandler {
         &self,
         request: StorageRpcShardDeleteRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
-        if let Err(error) = self.validate_shard_location(request.location) {
+        if let Err(error) = self.validate_shard_location_for_cleanup(request.location) {
             return encode_storage_rpc_error_response(&error);
         }
         let _delete_fence = match self.try_begin_shard_delete(request.location, &request.shard_key)
@@ -6616,13 +6608,20 @@ impl StorageNodeConnectionHandler {
         &self,
         request: StorageRpcShardAckItemRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
-        if let Err(error) =
-            self.validate_pg_route(request.node_id, request.cluster_epoch, request.pg_id)
-        {
-            return encode_storage_rpc_error_response(&error);
-        }
-        if let Err(error) = self.validate_primary_pg(request.pg_id, "shard ack delete") {
-            return encode_storage_rpc_error_response(&error);
+        let route =
+            match self.cleanup_pg_route(request.node_id, request.cluster_epoch, request.pg_id) {
+                Ok(route) => route,
+                Err(error) => return encode_storage_rpc_error_response(&error),
+            };
+        if route.primary_node_id != self.config.node_id {
+            return encode_storage_rpc_error_response(&StorageRpcErrorResponse {
+                code: StorageRpcErrorCode::NonActingSetAccess,
+                message: format!(
+                    "storage node {} is not primary for shard ack delete on PG {}",
+                    self.config.node_id.as_u32(),
+                    request.pg_id.get()
+                ),
+            });
         }
         let response = match self
             .node
@@ -8746,6 +8745,17 @@ impl StorageNodeConnectionHandler {
         )
     }
 
+    fn validate_shard_location_for_cleanup(
+        &self,
+        location: ShardLocation,
+    ) -> Result<(), StorageRpcErrorResponse> {
+        self.validate_pg_route_for_cleanup(
+            location.node_id(),
+            location.cluster_epoch(),
+            PgId::new(location.data_pg_id().get()),
+        )
+    }
+
     fn validate_shard_location_for_historical_inspection(
         &self,
         location: ShardLocation,
@@ -9040,6 +9050,16 @@ impl StorageNodeConnectionHandler {
         cluster_epoch: ClusterEpoch,
         pg_id: PgId,
     ) -> Result<(), StorageRpcErrorResponse> {
+        self.cleanup_pg_route(node_id, cluster_epoch, pg_id)
+            .map(|_| ())
+    }
+
+    fn cleanup_pg_route(
+        &self,
+        node_id: NodeId,
+        cluster_epoch: ClusterEpoch,
+        pg_id: PgId,
+    ) -> Result<&StorageNodePgRoute, StorageRpcErrorResponse> {
         if node_id != self.config.node_id {
             return Err(StorageRpcErrorResponse {
                 code: StorageRpcErrorCode::UnknownNode,
@@ -9050,38 +9070,63 @@ impl StorageNodeConnectionHandler {
                 ),
             });
         }
-        if cluster_epoch != self.config.cluster_epoch {
+        let raw_pg_id = pg_id.get();
+        if !self.config.pg_ids.contains(&raw_pg_id) {
+            return Err(StorageRpcErrorResponse {
+                code: StorageRpcErrorCode::UnknownPg,
+                message: format!("PG {raw_pg_id} is not configured on this storage node"),
+            });
+        }
+        if cluster_epoch > self.config.cluster_epoch {
             return Err(StorageRpcErrorResponse {
                 code: StorageRpcErrorCode::StaleShardLocation,
                 message: format!(
-                    "request route epoch {} does not match storage-node epoch {}",
+                    "request route epoch {} is newer than storage-node epoch {}",
                     cluster_epoch.get(),
                     self.config.cluster_epoch.get()
                 ),
             });
         }
-        let raw_pg_id = pg_id.get();
-        let Some(route) = self
-            .config
-            .pg_routes
-            .iter()
-            .find(|route| route.pg_id == raw_pg_id)
-        else {
-            return Err(StorageRpcErrorResponse {
-                code: StorageRpcErrorCode::UnknownPg,
-                message: format!("PG {raw_pg_id} is not configured on this storage node"),
-            });
+        let route = if cluster_epoch == self.config.cluster_epoch {
+            let Some(route) = self
+                .config
+                .pg_routes
+                .iter()
+                .find(|route| route.pg_id == raw_pg_id)
+            else {
+                return Err(StorageRpcErrorResponse {
+                    code: StorageRpcErrorCode::UnknownPg,
+                    message: format!("PG {raw_pg_id} is not configured on this storage node"),
+                });
+            };
+            if route.cluster_epoch != self.config.cluster_epoch {
+                return Err(StorageRpcErrorResponse {
+                    code: StorageRpcErrorCode::WrongClusterEpoch,
+                    message: format!(
+                        "PG {raw_pg_id} route epoch {} does not match storage-node epoch {}",
+                        route.cluster_epoch.get(),
+                        self.config.cluster_epoch.get()
+                    ),
+                });
+            }
+            route
+        } else {
+            let Some(route) = self
+                .config
+                .historical_pg_routes
+                .iter()
+                .find(|route| route.pg_id == raw_pg_id && route.cluster_epoch == cluster_epoch)
+            else {
+                return Err(StorageRpcErrorResponse {
+                    code: StorageRpcErrorCode::StaleShardLocation,
+                    message: format!(
+                        "PG {raw_pg_id} route for cleanup epoch {} is not retained",
+                        cluster_epoch.get()
+                    ),
+                });
+            };
+            route
         };
-        if route.cluster_epoch != self.config.cluster_epoch {
-            return Err(StorageRpcErrorResponse {
-                code: StorageRpcErrorCode::WrongClusterEpoch,
-                message: format!(
-                    "PG {raw_pg_id} route epoch {} does not match storage-node epoch {}",
-                    route.cluster_epoch.get(),
-                    self.config.cluster_epoch.get()
-                ),
-            });
-        }
         if !route.acting_set.contains(&self.config.node_id) {
             return Err(StorageRpcErrorResponse {
                 code: StorageRpcErrorCode::NonActingSetAccess,
@@ -9091,7 +9136,7 @@ impl StorageNodeConnectionHandler {
                 ),
             });
         }
-        Ok(())
+        Ok(route)
     }
 
     fn validate_primary_pg_for_object(

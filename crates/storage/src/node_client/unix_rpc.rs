@@ -119,8 +119,16 @@ impl UnixStorageNodeClient {
         data_pg_id: DataPgId,
         key: &ShardKey,
     ) -> Result<(), StoreError> {
+        self.delete_placed_shard_at_location(self.shard_location(data_pg_id, key), key)
+    }
+
+    pub(crate) fn delete_placed_shard_at_location(
+        &self,
+        location: crate::cluster::ShardLocation,
+        key: &ShardKey,
+    ) -> Result<(), StoreError> {
         let request = StorageRpcShardDeleteRequest {
-            location: self.shard_location(data_pg_id, key),
+            location,
             shard_key: key.clone(),
         };
         let payload = encode_shard_delete_request(&request).map_err(|error| {
@@ -196,7 +204,21 @@ impl UnixStorageNodeClient {
         pg_id: PgId,
         key: &ShardKey,
     ) -> Result<(), StoreError> {
-        let payload = self.encode_shard_ack_item(pg_id, key);
+        self.delete_written_shard_ack_at_epoch(self.cluster_epoch, pg_id, key)
+    }
+
+    pub(crate) fn delete_written_shard_ack_at_epoch(
+        &self,
+        cluster_epoch: ClusterEpoch,
+        pg_id: PgId,
+        key: &ShardKey,
+    ) -> Result<(), StoreError> {
+        let payload = encode_shard_ack_item_request(&StorageRpcShardAckItemRequest {
+            node_id: self.node_id,
+            cluster_epoch,
+            pg_id,
+            shard_key: key.clone(),
+        });
         let response = self.rpc_request(StorageRpcMessageKind::ShardAckDelete, payload)?;
         if response.is_empty() {
             Ok(())
@@ -913,6 +935,14 @@ impl PlacedShardNodeClient for UnixStorageNodeClient {
     fn delete_placed_shard(&self, data_pg_id: DataPgId, key: &ShardKey) -> Result<(), StoreError> {
         UnixStorageNodeClient::delete_placed_shard(self, data_pg_id, key)
     }
+
+    fn delete_placed_shard_for_historical_cleanup(
+        &self,
+        location: crate::cluster::ShardLocation,
+        key: &ShardKey,
+    ) -> Result<(), StoreError> {
+        UnixStorageNodeClient::delete_placed_shard_at_location(self, location, key)
+    }
 }
 
 impl ShardAckNodeClient for UnixStorageNodeClient {
@@ -947,6 +977,15 @@ impl ShardAckNodeClient for UnixStorageNodeClient {
 
     fn delete_written_shard_ack(&self, pg_id: PgId, key: &ShardKey) -> Result<(), StoreError> {
         UnixStorageNodeClient::delete_written_shard_ack(self, pg_id, key)
+    }
+
+    fn delete_written_shard_ack_at_retained_epoch(
+        &self,
+        cluster_epoch: ClusterEpoch,
+        pg_id: PgId,
+        key: &ShardKey,
+    ) -> Result<(), StoreError> {
+        UnixStorageNodeClient::delete_written_shard_ack_at_epoch(self, cluster_epoch, pg_id, key)
     }
 
     fn record_placed_segment_shard_repair(

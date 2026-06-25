@@ -933,6 +933,14 @@ pub(crate) trait PlacedShardNodeClient: Send + Sync {
     ) -> Result<(), StoreError>;
 
     fn delete_placed_shard(&self, data_pg_id: DataPgId, key: &ShardKey) -> Result<(), StoreError>;
+
+    fn delete_placed_shard_for_historical_cleanup(
+        &self,
+        location: crate::cluster::ShardLocation,
+        key: &ShardKey,
+    ) -> Result<(), StoreError> {
+        self.delete_placed_shard(location.data_pg_id(), key)
+    }
 }
 
 pub(crate) trait ShardReadHandleLease: Send {
@@ -970,6 +978,15 @@ pub(crate) trait ShardAckNodeClient: Send + Sync {
     ) -> Result<WriteAck, StoreError>;
 
     fn delete_written_shard_ack(&self, pg_id: PgId, key: &ShardKey) -> Result<(), StoreError>;
+
+    fn delete_written_shard_ack_at_retained_epoch(
+        &self,
+        _cluster_epoch: ClusterEpoch,
+        pg_id: PgId,
+        key: &ShardKey,
+    ) -> Result<(), StoreError> {
+        self.delete_written_shard_ack(pg_id, key)
+    }
 
     fn record_placed_segment_shard_repair(
         &self,

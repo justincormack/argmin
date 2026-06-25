@@ -532,7 +532,7 @@ impl BucketWriteReservationNodeClient for UnixStorageNodeClient {
     ) -> Result<(), BucketSnapshotLoadError> {
         let request = StorageRpcProofReleaseRequest {
             node_id: self.node_id,
-            cluster_epoch: self.cluster_epoch,
+            cluster_epoch: proof.cluster_epoch,
             pg_id,
             proof: proof.clone(),
         };

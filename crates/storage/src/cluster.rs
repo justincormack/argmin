@@ -10364,7 +10364,11 @@ impl StorageCluster {
                 self.emit_best_effort_payload_cleanup_error("delete payload ack", &error);
                 continue;
             }
-            if let Err(error) = shard_ack_client.delete_written_shard_ack(pg_id, shard_key) {
+            if let Err(error) = shard_ack_client.delete_written_shard_ack_at_retained_epoch(
+                operation_epoch,
+                pg_id,
+                shard_key,
+            ) {
                 self.emit_best_effort_payload_cleanup_error("delete payload ack", &error);
             }
         }
