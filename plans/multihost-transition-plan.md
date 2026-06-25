@@ -8628,6 +8628,13 @@ Metadata PG migration and backfill design notes:
   append a remote object-PG command, publish object or completed-upload state,
   lose selected multipart staging rows, leave source/current pending commands,
   or leak bucket-write reservations.
+  UploadPart stream-session creation now has the same installed Unix
+  storage-node Peering coverage: an in-progress multipart upload remains
+  durable in the source-epoch remote stores, storage-node servers refresh to
+  the current Peering epoch, and the old-primary UploadPart session create
+  fails closed without appending an object-PG command, publishing a stream
+  session or segment rows, leaving pending commands, or leaking bucket-write
+  reservations.
 - Started the later multipart expansion for deterministic epoch-transition
   faults. CompleteMultipartUpload now has the same local pre-metadata-apply
   gate as direct PUT and DELETE: the test pauses after the multipart completion
