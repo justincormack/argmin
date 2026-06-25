@@ -4212,9 +4212,17 @@ impl StorageCluster {
         &self,
         pg_id: PgId,
     ) -> Result<&Arc<dyn ShardAckNodeClient>, StoreError> {
+        self.metadata_pg_primary_shard_ack_client_at_epoch(self.operation_epoch(), pg_id)
+    }
+
+    fn metadata_pg_primary_shard_ack_client_at_epoch(
+        &self,
+        operation_epoch: ClusterEpoch,
+        pg_id: PgId,
+    ) -> Result<&Arc<dyn ShardAckNodeClient>, StoreError> {
         let node = self
             .local_map
-            .metadata_pg_primary_node(self.operation_epoch(), pg_id)?;
+            .metadata_pg_primary_node(operation_epoch, pg_id)?;
         Ok(node.shard_ack_client())
     }
 
@@ -4484,7 +4492,7 @@ impl StorageCluster {
         let pg_id = self.bucket_metadata_pg_id(&proof.bucket);
         let node = self
             .local_map
-            .metadata_pg_primary_node(self.operation_epoch(), PgId::new(pg_id))?;
+            .metadata_pg_primary_node(proof.cluster_epoch, PgId::new(pg_id))?;
         node.bucket_write_reservation_client()
             .release_metadata_command_bucket_write_reservation(PgId::new(pg_id), proof)?;
         Ok(())
@@ -6631,7 +6639,8 @@ impl StorageCluster {
                     &req.key,
                     &req.generation_reservation_id,
                 );
-                self.delete_direct_put_segment_payload_shards(
+                self.delete_direct_put_segment_payload_shards_at_epoch(
+                    effective_bucket_write_reservation.cluster_epoch,
                     req.data_pg_id,
                     req.ec,
                     &req.segment_okh,
@@ -7381,6 +7390,25 @@ impl StorageCluster {
         written_shards: &[WrittenShardAck],
     ) {
         self.delete_payload_shard_keys_best_effort(
+            data_pg_id,
+            ec,
+            segment_okh,
+            segment_vid,
+            written_shards.iter().map(|written| written.key.clone()),
+        );
+    }
+
+    fn delete_direct_put_segment_payload_shards_at_epoch(
+        &self,
+        operation_epoch: ClusterEpoch,
+        data_pg_id: u32,
+        ec: EcShape,
+        segment_okh: &[u8; 16],
+        segment_vid: GenerationId,
+        written_shards: &[WrittenShardAck],
+    ) {
+        self.delete_payload_shard_keys_best_effort_at_epoch(
+            operation_epoch,
             data_pg_id,
             ec,
             segment_okh,
@@ -10166,15 +10194,39 @@ impl StorageCluster {
         generation_id: GenerationId,
         shard_keys: impl IntoIterator<Item = ShardKey>,
     ) {
+        self.delete_payload_shard_keys_best_effort_at_epoch(
+            self.operation_epoch(),
+            data_pg_id,
+            ec,
+            okh,
+            generation_id,
+            shard_keys,
+        );
+    }
+
+    fn delete_payload_shard_keys_best_effort_at_epoch(
+        &self,
+        operation_epoch: ClusterEpoch,
+        data_pg_id: u32,
+        ec: EcShape,
+        okh: &[u8; 16],
+        generation_id: GenerationId,
+        shard_keys: impl IntoIterator<Item = ShardKey>,
+    ) {
         let shard_keys: Vec<ShardKey> = shard_keys.into_iter().collect();
-        self.delete_placed_payload_shard_keys_best_effort(
+        self.delete_placed_payload_shard_keys_best_effort_at_epoch(
+            operation_epoch,
             DataPgId::new(PgId::new(data_pg_id)),
             ec,
             okh,
             generation_id,
             &shard_keys,
         );
-        self.delete_metadata_primary_payload_shard_keys_best_effort(data_pg_id, &shard_keys);
+        self.delete_metadata_primary_payload_shard_keys_best_effort_at_epoch(
+            operation_epoch,
+            data_pg_id,
+            &shard_keys,
+        );
     }
 
     fn delete_placed_payload_shard_keys(
@@ -10201,8 +10253,9 @@ impl StorageCluster {
         Ok(())
     }
 
-    fn delete_placed_payload_shard_keys_best_effort(
+    fn delete_placed_payload_shard_keys_best_effort_at_epoch(
         &self,
+        operation_epoch: ClusterEpoch,
         data_pg_id: DataPgId,
         ec: EcShape,
         okh: &[u8; 16],
@@ -10210,7 +10263,12 @@ impl StorageCluster {
         shard_keys: &[ShardKey],
     ) {
         let placement_key = segment_payload_placement_key(okh, generation_id);
-        let locations = match self.place_payload_shards(data_pg_id, ec, &placement_key) {
+        let locations = match self.local_map.place_payload_shards(
+            operation_epoch,
+            data_pg_id,
+            ec,
+            &placement_key,
+        ) {
             Ok(locations) => locations,
             Err(error) => {
                 let error = cluster_build_error_to_store(error);
@@ -10231,7 +10289,10 @@ impl StorageCluster {
                         );
                         continue;
                     }
-                    if let Err(error) = self.delete_payload_shard(location, shard_key) {
+                    if let Err(error) =
+                        self.local_map
+                            .delete_payload_shard(operation_epoch, location, shard_key)
+                    {
                         let error = shard_io_error_to_store(error);
                         self.emit_best_effort_payload_cleanup_error(
                             "delete placed payload shard",
@@ -10264,22 +10325,24 @@ impl StorageCluster {
         Ok(())
     }
 
-    fn delete_metadata_primary_payload_shard_keys_best_effort(
+    fn delete_metadata_primary_payload_shard_keys_best_effort_at_epoch(
         &self,
+        operation_epoch: ClusterEpoch,
         data_pg_id: u32,
         shard_keys: &[ShardKey],
     ) {
         let pg_id = PgId::new(data_pg_id);
-        let shard_ack_client = match self.metadata_pg_primary_shard_ack_client(pg_id) {
-            Ok(shard_ack_client) => shard_ack_client,
-            Err(error) => {
-                self.emit_best_effort_payload_cleanup_error(
-                    "resolve payload ack metadata PG primary",
-                    &error,
-                );
-                return;
-            }
-        };
+        let shard_ack_client =
+            match self.metadata_pg_primary_shard_ack_client_at_epoch(operation_epoch, pg_id) {
+                Ok(shard_ack_client) => shard_ack_client,
+                Err(error) => {
+                    self.emit_best_effort_payload_cleanup_error(
+                        "resolve payload ack metadata PG primary",
+                        &error,
+                    );
+                    return;
+                }
+            };
         for shard_key in shard_keys {
             if let Err(error) =
                 self.maybe_run_before_metadata_primary_payload_ack_delete_hook(shard_key)

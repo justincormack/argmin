@@ -8487,6 +8487,15 @@ Metadata PG migration and backfill design notes:
   authorized object snapshot across a current-map swap. This pins the local
   in-process/pinned-route behavior before adding stricter stale-primary and
   remote storage-node fault-injection cases.
+- Started the stale-primary/fail-closed slice with direct PUT publish. A local
+  storage regression now writes payload shards through the current epoch, then
+  attempts to publish object metadata through a non-current operation-epoch
+  handle backed by the same current map. The publish must fail at the
+  metadata-primary epoch boundary, append no object-PG command, expose no object
+  metadata on any acting node, release the caller-owned bucket write proof, and
+  clean the unowned payload shards. This pins the cleanup and fail-closed
+  behavior needed by stale-primary handling before the full older-epoch peering
+  transition is modeled through control-plane/runtime-map machinery.
 
 Exit criteria:
 
