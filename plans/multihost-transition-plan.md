@@ -8662,7 +8662,14 @@ Metadata PG migration and backfill design notes:
   coverage: the test copies from an existing source object, pauses before the
   destination `CommitDirectPutObject`, advances the runtime-map epoch, then
   verifies the copied destination is committed once and remains readable through
-  the newer map. Object tag updates now have the same local pre-metadata-apply
+  the newer map. The stronger control-plane-driven Peering matrix now covers
+  the CopyObject destination commit boundary as well: a live source object is
+  copied into destination payload shards, a real acting-set change removes the
+  old destination object-PG primary, and the old-primary destination commit
+  must fail closed without appending destination metadata, mutating the source,
+  leaking bucket-write reservations, or leaving copied shard files/ack rows,
+  including through installed Unix storage-node clients. Object tag updates now
+  have the same local pre-metadata-apply
   gate over the shared `PutObjectMetadata` command path: PutObjectTagging pauses
   before the object-PG metadata command is applied, crosses to a newer
   runtime-map epoch, then applies exactly one metadata command and returns the

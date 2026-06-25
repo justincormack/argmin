@@ -3766,6 +3766,429 @@ fn control_plane_peering_unix_direct_put_old_primary_fails_closed_and_cleans_rem
 }
 
 #[test]
+fn control_plane_peering_unix_copy_object_destination_old_primary_cleans_remote_staging() {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let pg_ids = [0, 1, 2, 3];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let mut authority = crate::control_plane::SingleAuthorityControlPlane::open(
+        crate::control_plane::FileControlPlaneStore::new(tmp.path().join("control-plane.state")),
+    )
+    .unwrap();
+    authority
+        .bootstrap_initial_cluster_map(
+            node_ids
+                .iter()
+                .map(|node_id| {
+                    (
+                        *node_id,
+                        tmp.path()
+                            .join("control-plane-sockets")
+                            .join(format!("copy-node-{}.sock", node_id.as_u32()))
+                            .to_string_lossy()
+                            .into_owned(),
+                    )
+                })
+                .collect(),
+            pg_ids.iter().copied().map(PgId::new).collect(),
+        )
+        .unwrap();
+    let source_epoch = authority.snapshot().cluster_epoch();
+    let source_routes = pg_ids
+        .iter()
+        .map(|pg_id| {
+            let route = authority
+                .snapshot()
+                .reconstructed_pg_route_at_epoch(PgId::new(*pg_id), source_epoch)
+                .unwrap();
+            crate::control_plane::PgRouteSnapshot::reconstructed(
+                route.cluster_epoch(),
+                route.pg_id(),
+                route.primary_node_id(),
+                route.acting_set().to_vec(),
+                PgState::Active,
+            )
+        })
+        .collect::<Vec<_>>();
+
+    let source_storage_configs = node_ids
+        .iter()
+        .map(|node_id| {
+            LocalNodeStoreConfig::new(
+                *node_id,
+                tmp.path()
+                    .join("remote-peering-stale-copy-object")
+                    .join(format!("node-{:04}", node_id.as_u32())),
+            )
+        })
+        .collect::<Vec<_>>();
+
+    let source_map = Arc::new(
+        LocalClusterMap::open_frontend_with_configs_and_pg_routes(
+            NodeId::new(0),
+            source_storage_configs.clone(),
+            &pg_ids,
+            ec_shape,
+            source_epoch,
+            source_routes.iter().map(LocalPgRoute::from),
+        )
+        .unwrap(),
+    );
+    let (bucket, dst_key, dst_object_pg, _dst_data_pg) = {
+        let topology = source_map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        bucket_key_with_distinct_object_and_data_pg(topology)
+    };
+    let source_key = {
+        let topology = source_map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        let source_pg = pg_ids
+            .iter()
+            .copied()
+            .find(|pg_id| *pg_id != dst_object_pg)
+            .unwrap();
+        key_for_object_pg(topology, &bucket, source_pg, "copy-source-")
+    };
+    let source_cluster = crate::StorageCluster::from_local_map(Arc::clone(&source_map)).unwrap();
+    create_test_bucket(&source_cluster, &bucket);
+    let source_payload = b"control-plane peering stale unix copy source payload";
+    let source_segment = write_committed_direct_segment_for_with_okh(
+        &source_cluster,
+        &bucket,
+        &source_key,
+        [0xcb; 16],
+        source_payload,
+    );
+
+    let reservation_id =
+        crate::SessionId::try_from("70707070707070707070707070707070".to_string()).unwrap();
+    let generation_id = source_cluster
+        .reserve_put_object_generation(&bucket, &dst_key, &reservation_id)
+        .unwrap();
+    let before_dst_object_pg_proof = source_cluster
+        .test_object_pg_metadata_proof(&bucket, &dst_key)
+        .unwrap();
+    let dst_segment_okh = [0xcc; 16];
+    let written = source_cluster
+        .write_direct_put_segment_payload_shards(
+            &bucket,
+            &dst_key,
+            generation_id,
+            0,
+            &dst_segment_okh,
+            &source_segment.payload,
+        )
+        .unwrap();
+    source_cluster
+        .test_register_payload_shard_acks(written.data_pg_id, &written.written_shards)
+        .unwrap();
+    let source_data_pg_primary = source_routes
+        .iter()
+        .find(|route| route.pg_id() == PgId::new(written.data_pg_id))
+        .unwrap()
+        .primary_node_id();
+    let bucket_write_reservation = source_cluster
+        .acquire_durable_bucket_write_reservation(
+            &bucket,
+            "control-plane-peering-stale-unix-copy-object",
+            Some(dst_key.as_str()),
+        )
+        .unwrap();
+    let commit_req = direct_put_commit_req_with_bucket_write_proof(
+        DirectPutCommitReqFixture {
+            bucket: &bucket,
+            key: &dst_key,
+            reservation_id,
+            generation_id,
+            payload: &source_segment.payload,
+            segment_okh: dst_segment_okh,
+            written: &written,
+        },
+        crate::metadata_command::BucketWriteReservationProof::from(
+            &bucket_write_reservation.record,
+        ),
+    );
+    drop(source_cluster);
+    drop(source_map);
+
+    authority
+        .set_pg_acting_set(
+            PgId::new(dst_object_pg),
+            vec![NodeId::new(1), NodeId::new(2)],
+        )
+        .unwrap();
+    let current_epoch = authority.snapshot().cluster_epoch();
+    let current_routes = pg_ids
+        .iter()
+        .map(|pg_id| {
+            let route = authority
+                .snapshot()
+                .reconstructed_pg_route_at_epoch(PgId::new(*pg_id), current_epoch)
+                .unwrap();
+            let state = if *pg_id == dst_object_pg {
+                PgState::Peering
+            } else {
+                PgState::Active
+            };
+            crate::control_plane::PgRouteSnapshot::reconstructed(
+                route.cluster_epoch(),
+                route.pg_id(),
+                route.primary_node_id(),
+                route.acting_set().to_vec(),
+                state,
+            )
+        })
+        .collect::<Vec<_>>();
+    let historical_pg_routes = source_routes
+        .iter()
+        .map(|route| StorageNodePgRoute {
+            pg_id: route.pg_id().get(),
+            cluster_epoch: route.cluster_epoch(),
+            state: route.state(),
+            primary_node_id: route.primary_node_id(),
+            acting_set: route.acting_set().to_vec(),
+        })
+        .collect::<Vec<_>>();
+    let current_pg_routes = current_routes
+        .iter()
+        .map(|route| StorageNodePgRoute {
+            pg_id: route.pg_id().get(),
+            cluster_epoch: route.cluster_epoch(),
+            state: route.state(),
+            primary_node_id: route.primary_node_id(),
+            acting_set: route.acting_set().to_vec(),
+        })
+        .collect::<Vec<_>>();
+    let mut server_configs = Vec::new();
+    let mut client_configs = Vec::new();
+    for node_config in &source_storage_configs {
+        let socket_path = tmp.path().join("sockets").join(format!(
+            "peering-stale-copy-object-node-{}.sock",
+            node_config.node_id.as_u32()
+        ));
+        private_socket_dir(socket_path.parent().unwrap());
+        server_configs.push(StorageNodeProcessConfig {
+            node_id: node_config.node_id,
+            cluster_epoch: current_epoch,
+            route_map_valid_until_ms: None,
+            data_dir: node_config.data_dir.clone(),
+            default_ec_shape: ec_shape,
+            pg_ids: pg_ids.to_vec(),
+            socket_path: socket_path.clone(),
+            pg_routes: current_pg_routes.clone(),
+            historical_pg_routes: historical_pg_routes.clone(),
+        });
+        client_configs.push(LocalUnixStorageNodeClientConfig::new(
+            node_config.node_id,
+            socket_path,
+        ));
+    }
+    for config in server_configs.iter().cloned() {
+        let server = StorageNodeServer::bind(config).unwrap();
+        let _server_thread = thread::spawn(move || server.serve_forever().unwrap());
+    }
+
+    let frontend_configs = node_ids
+        .iter()
+        .map(|node_id| {
+            LocalNodeStoreConfig::new(
+                *node_id,
+                tmp.path()
+                    .join("frontend-peering-stale-copy-object")
+                    .join(format!("node-{:04}", node_id.as_u32())),
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut current_map = LocalClusterMap::open_frontend_with_configs_and_pg_routes(
+        NodeId::new(0),
+        frontend_configs,
+        &pg_ids,
+        ec_shape,
+        current_epoch,
+        current_routes.iter().map(LocalPgRoute::from),
+    )
+    .unwrap();
+    current_map.test_install_historical_pg_routes(source_routes.clone());
+    current_map
+        .install_unix_storage_node_clients(client_configs)
+        .unwrap();
+    let current_map = Arc::new(current_map);
+    assert_eq!(
+        current_map
+            .pg_route(PgId::new(dst_object_pg))
+            .unwrap()
+            .state(),
+        PgState::Peering,
+        "control-plane acting-set change should put the destination object PG into Peering"
+    );
+    assert!(
+        !current_map
+            .pg_route(PgId::new(dst_object_pg))
+            .unwrap()
+            .acting_set()
+            .contains(&NodeId::new(0)),
+        "the old source primary should no longer be in the destination acting set"
+    );
+    let old_primary_cluster = crate::StorageCluster::test_from_local_map_with_epoch(
+        Arc::clone(&current_map),
+        source_epoch,
+    )
+    .unwrap();
+
+    let err = old_primary_cluster
+        .commit_direct_put_object_from_payload_shards(&commit_req, &written.written_shards, |_| {
+            Ok::<(), ()>(())
+        })
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            crate::ObjectPgActionError::Store(StoreError::StaleMetadataOperation {
+                pg_id,
+                operation_epoch,
+                current_epoch: observed_current_epoch,
+            }) if pg_id == dst_object_pg
+                && operation_epoch == source_epoch
+                && observed_current_epoch == current_epoch
+        ),
+        "old-primary Unix CopyObject destination commit should fail closed after control-plane Peering transition, got {err:?}"
+    );
+
+    let bucket_pg = current_map
+        .node(NodeId::new(0))
+        .unwrap()
+        .storage_node()
+        .pg_topology()
+        .bucket_pg_for(&bucket);
+    let source_object_pg = current_map
+        .node(NodeId::new(0))
+        .unwrap()
+        .storage_node()
+        .pg_topology()
+        .object_pg_for(&bucket, &source_key);
+    for config in &server_configs {
+        let remote_dst = SharedStorageNode::open_with_default_ec_shape(
+            &config.data_dir,
+            &[dst_object_pg],
+            config.default_ec_shape,
+        )
+        .unwrap();
+        let dst_pg = remote_dst.get_pg(dst_object_pg).unwrap();
+        let state = dst_pg.metadata_command_replica_state().unwrap();
+        let proof = crate::control_plane::PgMetadataProof::new(
+            state.applied_log_index,
+            state.applied_log_hash,
+            state.state_digest,
+        );
+        assert_eq!(
+            proof, before_dst_object_pg_proof,
+            "old-primary Unix CopyObject destination must not append an object-PG command on node {:?}",
+            config.node_id
+        );
+        assert!(
+            matches!(
+                crate::PgMetadataStore::get_object_meta(&*dst_pg, &bucket, &dst_key),
+                Err(crate::MetadataError::ObjectNotFound)
+            ),
+            "old-primary Unix CopyObject destination must not publish destination metadata on node {:?}",
+            config.node_id
+        );
+        assert!(
+            dst_pg
+                .pending_metadata_command_envelope(config.node_id.as_u32(), source_epoch)
+                .unwrap()
+                .is_none(),
+            "old-primary Unix CopyObject destination must not leave a source-epoch pending command on node {:?}",
+            config.node_id
+        );
+        assert!(
+            dst_pg
+                .pending_metadata_command_envelope(config.node_id.as_u32(), current_epoch)
+                .unwrap()
+                .is_none(),
+            "old-primary Unix CopyObject destination must not leave a current-epoch pending command on node {:?}",
+            config.node_id
+        );
+        let remote_source = SharedStorageNode::open_with_default_ec_shape(
+            &config.data_dir,
+            &[source_object_pg],
+            config.default_ec_shape,
+        )
+        .unwrap();
+        let source_pg = remote_source.get_pg(source_object_pg).unwrap();
+        let stored =
+            crate::PgMetadataStore::get_object_meta(&*source_pg, &bucket, &source_key).unwrap();
+        let live = stored.as_live().unwrap();
+        assert_eq!(
+            live.generation_id, source_segment.generation_id,
+            "failed Unix CopyObject destination commit must preserve source object on node {:?}",
+            config.node_id
+        );
+        let remote_bucket = SharedStorageNode::open_with_default_ec_shape(
+            &config.data_dir,
+            &[bucket_pg],
+            config.default_ec_shape,
+        )
+        .unwrap();
+        let bucket_pg_store = remote_bucket.get_pg(bucket_pg).unwrap();
+        assert!(
+            crate::PgMetadataStore::durable_bucket_write_reservations(
+                &*bucket_pg_store,
+                &bucket,
+            )
+            .unwrap()
+            .is_empty(),
+            "old-primary Unix CopyObject destination must release bucket write reservations on node {:?}",
+            config.node_id
+        );
+        let remote = SharedStorageNode::open_with_default_ec_shape(
+            &config.data_dir,
+            &[written.data_pg_id],
+            config.default_ec_shape,
+        )
+        .unwrap();
+        for written_shard in &written.written_shards {
+            assert!(
+                matches!(
+                    remote.read_shard_file(written.data_pg_id, &written_shard.key),
+                    Err(StoreError::NotFound)
+                ),
+                "old-primary Unix CopyObject destination must delete copied shard {} from node {:?}",
+                written_shard.key,
+                config.node_id
+            );
+        }
+    }
+    let source_primary_config = server_configs
+        .iter()
+        .find(|config| config.node_id == source_data_pg_primary)
+        .unwrap();
+    let remote_primary = SharedStorageNode::open_with_default_ec_shape(
+        &source_primary_config.data_dir,
+        &[written.data_pg_id],
+        source_primary_config.default_ec_shape,
+    )
+    .unwrap();
+    let remote_data_pg = remote_primary.get_pg(written.data_pg_id).unwrap();
+    for written_shard in &written.written_shards {
+        assert!(
+            matches!(
+                remote_data_pg.validate_written_shard_ack(&written_shard.key, written_shard.ack),
+                Err(StoreError::NotFound)
+            ),
+            "old-primary Unix CopyObject destination must delete retained data-PG ack row for shard {}",
+            written_shard.key
+        );
+    }
+}
+
+#[test]
 fn control_plane_peering_unix_object_delete_old_primary_fails_closed_without_remote_mutation() {
     let tmp = test_util::tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
