@@ -9,6 +9,9 @@ authentication, per-PG SQLite metadata, and CRC64-NVME integrity checking.
 ## Prerequisites
 
 - **Rust** toolchain (2021 edition)
+- **Unix/Linux** runtime platform. The server uses Unix domain sockets, POSIX
+  file permissions, and Unix process ownership checks. Windows support would be
+  a separate port with dedicated CI coverage.
 
 ## Build
 
