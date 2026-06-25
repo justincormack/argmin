@@ -1162,6 +1162,63 @@ fn install_next_epoch_runtime_map_with_historical_routes(
     handle.install(candidate).unwrap();
 }
 
+fn install_same_store_next_epoch_runtime_map(
+    handle: &StorageClusterRuntimeMapHandle,
+    initial: &Arc<StorageCluster>,
+    node_root: &std::path::Path,
+) {
+    let node_count = u32::from(initial.default_payload_ec_shape().k)
+        + u32::from(initial.default_payload_ec_shape().m);
+    let configs = (0..node_count)
+        .map(|node_id| {
+            LocalNodeStoreConfig::new(
+                NodeId::new(node_id),
+                node_root.join(format!("node-{node_id:04}")),
+            )
+        })
+        .collect::<Vec<_>>();
+    let next_epoch = ClusterEpoch::new(initial.cluster_epoch().get() + 1).unwrap();
+    let acting_set = (0..node_count).map(NodeId::new).collect::<Vec<_>>();
+    let routes = initial
+        .test_pg_ids()
+        .iter()
+        .map(|pg_id| {
+            let route = storage::control_plane::PgRouteSnapshot::reconstructed(
+                next_epoch,
+                PgId::new(*pg_id),
+                NodeId::new(0),
+                acting_set.clone(),
+                PgState::Active,
+            );
+            LocalPgRoute::from(&route)
+        })
+        .collect::<Vec<_>>();
+    let historical_routes = initial
+        .local_pg_routes()
+        .map(|route| {
+            storage::control_plane::PgRouteSnapshot::reconstructed(
+                route.cluster_epoch(),
+                route.pg_id(),
+                route.primary_node_id(),
+                route.acting_set().to_vec(),
+                route.state(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut candidate_map = LocalClusterMap::open_frontend_with_configs_and_pg_routes(
+        NodeId::new(0),
+        configs,
+        initial.test_pg_ids(),
+        initial.default_payload_ec_shape(),
+        next_epoch,
+        routes,
+    )
+    .unwrap();
+    candidate_map.test_install_historical_pg_routes(historical_routes);
+    let candidate = StorageCluster::from_local_map(Arc::new(candidate_map)).unwrap();
+    handle.install(candidate).unwrap();
+}
+
 fn find_bucket_key_for_metadata_and_data_pg(
     storage_cluster: &StorageCluster,
     metadata_pg_id: u32,
@@ -2464,6 +2521,85 @@ fn list_objects_epoch_change_before_storage_list_uses_pinned_route() {
         .collect::<Vec<_>>();
     assert_eq!(keys, ["a/1", "a/2", "b/1"]);
     assert!(!result.is_truncated);
+}
+
+#[test]
+fn list_objects_continuation_survives_epoch_change_between_pages() {
+    let bucket = "list-continuation-epoch-change-bucket";
+    let tmp = test_util::tempdir();
+    let initial = open_test_storage_cluster(tmp.path(), &[0, 1]);
+    let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&initial));
+    let coord =
+        Coordinator::new_with_managed_key_provider_for_storage_cluster_runtime_map_handle_with_background_worker_mode(
+            handle.clone(),
+            "us-east-1".to_string(),
+            None,
+            test_sse_s3_provider(),
+            BackgroundWorkerMode::none(),
+        )
+        .unwrap();
+    coord
+        .create_bucket_for_owner("default-owner", bucket, false)
+        .unwrap();
+
+    for key in ["a/1", "a/2", "a/3", "a/4"] {
+        test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
+                encryption: WriteEncryptionRequest::none(),
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
+                object: object_request_with_expected_owner(bucket, key, test_requester(), None),
+                data: key.as_bytes(),
+                metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
+                tags: None,
+                cond: NO_WRITE,
+                acl: NO_PUT_OBJECT_ACL.into(),
+            },
+        )
+        .unwrap();
+    }
+
+    let first = coord
+        .list_objects_v2(&ListObjectsV2Request {
+            bucket: bucket_request_with_expected_owner(bucket, test_requester(), None),
+            prefix: Some("a/"),
+            delimiter: None,
+            continuation_token: None,
+            max_keys: 2,
+            requested_max_keys: Some(2),
+        })
+        .unwrap();
+    let first_keys = first
+        .objects
+        .iter()
+        .map(|object| object.key.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(first_keys, ["a/1", "a/2"]);
+    assert!(first.is_truncated);
+    assert_eq!(first.next_continuation_token.as_deref(), Some("a/2"));
+
+    install_same_store_next_epoch_runtime_map(&handle, &initial, tmp.path());
+
+    let second = coord
+        .list_objects_v2(&ListObjectsV2Request {
+            bucket: bucket_request_with_expected_owner(bucket, test_requester(), None),
+            prefix: Some("a/"),
+            delimiter: None,
+            continuation_token: first.next_continuation_token.as_deref(),
+            max_keys: 2,
+            requested_max_keys: Some(2),
+        })
+        .unwrap();
+    let second_keys = second
+        .objects
+        .iter()
+        .map(|object| object.key.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(second_keys, ["a/3", "a/4"]);
+    assert!(!second.is_truncated);
+    assert_eq!(second.next_continuation_token, None);
 }
 
 #[test]
