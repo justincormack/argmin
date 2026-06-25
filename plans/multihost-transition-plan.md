@@ -8572,17 +8572,21 @@ Metadata PG migration and backfill design notes:
   has built the multipart commit but before any object-PG command is applied,
   installs a newer runtime-map epoch, releases the gate, and verifies exactly
   one multipart commit command is appended and the completed object is readable
-  through the newer map. Object tag updates now have the same local
-  pre-metadata-apply gate over the shared `PutObjectMetadata` command path:
-  PutObjectTagging pauses before the object-PG metadata command is applied,
-  crosses to a newer runtime-map epoch, then applies exactly one metadata
-  command and returns the updated tags. Legal-hold updates now cover the same
-  boundary with an object-lock-enabled bucket and version-specific object
-  metadata mutation, proving the object-lock side path also commits exactly
-  once across the epoch change. Retention updates now cover the governance
-  retention side of the same object-lock metadata path. ACL uses the same
-  storage metadata command shape, so it remains a lower-priority serialization
-  variant rather than separate storage-level fault-injection coverage.
+  through the newer map. CopyObject now also has local pre-destination-commit
+  coverage: the test copies from an existing source object, pauses before the
+  destination `CommitDirectPutObject`, advances the runtime-map epoch, then
+  verifies the copied destination is committed once and remains readable through
+  the newer map. Object tag updates now have the same local pre-metadata-apply
+  gate over the shared `PutObjectMetadata` command path: PutObjectTagging pauses
+  before the object-PG metadata command is applied, crosses to a newer
+  runtime-map epoch, then applies exactly one metadata command and returns the
+  updated tags. Legal-hold updates now cover the same boundary with an
+  object-lock-enabled bucket and version-specific object metadata mutation,
+  proving the object-lock side path also commits exactly once across the epoch
+  change. Retention updates now cover the governance retention side of the same
+  object-lock metadata path. ACL uses the same storage metadata command shape,
+  so it remains a lower-priority serialization variant rather than separate
+  storage-level fault-injection coverage.
 
 Exit criteria:
 
