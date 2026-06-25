@@ -1246,6 +1246,23 @@ fn find_bucket_key_for_metadata_and_data_pg(
     );
 }
 
+fn find_key_for_object_metadata_pg_with_prefix(
+    storage_cluster: &StorageCluster,
+    bucket: &str,
+    metadata_pg_id: u32,
+    key_prefix: &str,
+) -> String {
+    let bucket_name = trusted_bucket_name(bucket);
+    for key_suffix in 0..10_000 {
+        let key = format!("{key_prefix}{key_suffix:04}");
+        let object_key = trusted_object_key(&key);
+        if storage_cluster.test_object_pg_id_for(&bucket_name, &object_key) == metadata_pg_id {
+            return key;
+        }
+    }
+    panic!("failed to find key with prefix {key_prefix:?} on object metadata PG {metadata_pg_id}");
+}
+
 #[test]
 fn put_object_epoch_change_before_metadata_apply_commits_once_on_pinned_route() {
     const TOKEN: DeterministicFaultToken =
@@ -2750,6 +2767,93 @@ fn list_objects_continuation_survives_epoch_change_between_pages() {
         .map(|object| object.key.as_str())
         .collect::<Vec<_>>();
     assert_eq!(second_keys, ["a/3", "a/4"]);
+    assert!(!second.is_truncated);
+    assert_eq!(second.next_continuation_token, None);
+}
+
+#[test]
+fn list_objects_delimiter_continuation_survives_epoch_change_between_pages() {
+    let bucket = "list-delimiter-continuation-epoch-change-bucket";
+    let tmp = test_util::tempdir();
+    let initial = open_test_storage_cluster(tmp.path(), &[0, 1]);
+    let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&initial));
+    let coord =
+        Coordinator::new_with_managed_key_provider_for_storage_cluster_runtime_map_handle_with_background_worker_mode(
+            handle.clone(),
+            "us-east-1".to_string(),
+            None,
+            test_sse_s3_provider(),
+            BackgroundWorkerMode::none(),
+        )
+        .unwrap();
+    coord
+        .create_bucket_for_owner("default-owner", bucket, false)
+        .unwrap();
+
+    let pg_ids = initial.test_pg_ids();
+    assert!(
+        pg_ids.len() >= 2,
+        "test requires at least two object metadata PGs"
+    );
+    let key_a = find_key_for_object_metadata_pg_with_prefix(&initial, bucket, pg_ids[0], "a/");
+    let key_b = find_key_for_object_metadata_pg_with_prefix(&initial, bucket, pg_ids[1], "b/");
+    let key_c = find_key_for_object_metadata_pg_with_prefix(&initial, bucket, pg_ids[0], "c/");
+    let root_key =
+        find_key_for_object_metadata_pg_with_prefix(&initial, bucket, pg_ids[1], "z-root-");
+
+    for key in [&key_a, &key_b, &key_c, &root_key] {
+        test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
+                encryption: WriteEncryptionRequest::none(),
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
+                object: object_request_with_expected_owner(bucket, key, test_requester(), None),
+                data: key.as_bytes(),
+                metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
+                tags: None,
+                cond: NO_WRITE,
+                acl: NO_PUT_OBJECT_ACL.into(),
+            },
+        )
+        .unwrap();
+    }
+
+    let first = coord
+        .list_objects_v2(&ListObjectsV2Request {
+            bucket: bucket_request_with_expected_owner(bucket, test_requester(), None),
+            prefix: None,
+            delimiter: Some("/"),
+            continuation_token: None,
+            max_keys: 2,
+            requested_max_keys: Some(2),
+        })
+        .unwrap();
+    assert!(first.objects.is_empty());
+    assert_eq!(first.common_prefixes, ["a/".to_string(), "b/".to_string()]);
+    assert!(first.is_truncated);
+    assert_eq!(first.next_continuation_token.as_deref(), Some("b/"));
+
+    install_same_store_next_epoch_runtime_map(&handle, &initial, tmp.path());
+
+    let second = coord
+        .list_objects_v2(&ListObjectsV2Request {
+            bucket: bucket_request_with_expected_owner(bucket, test_requester(), None),
+            prefix: None,
+            delimiter: Some("/"),
+            continuation_token: first.next_continuation_token.as_deref(),
+            max_keys: 2,
+            requested_max_keys: Some(2),
+        })
+        .unwrap();
+    let second_keys = second
+        .objects
+        .iter()
+        .map(|object| object.key.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(second.common_prefixes, ["c/".to_string()]);
+    assert_eq!(second_keys, [root_key.as_str()]);
     assert!(!second.is_truncated);
     assert_eq!(second.next_continuation_token, None);
 }

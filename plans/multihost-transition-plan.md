@@ -8565,8 +8565,12 @@ Metadata PG migration and backfill design notes:
   in the next epoch, and storage-node access is installed through Unix clients.
   GET reads the old payload shards through the segment's recorded placement
   epoch; HEAD and LIST remain available from metadata after the data-PG move
-  without claiming payload-route coverage. Started the stronger
-  control-plane-driven stale-primary slice. Direct PUT now has a storage
+  without claiming payload-route coverage. LIST now also has delimiter
+  continuation coverage across a runtime-map epoch change: objects are spread
+  across object metadata PGs, the first page returns common prefixes with a
+  continuation token, the map advances, and the next page must return the
+  remaining prefix plus root object rather than a partial result. Started the
+  stronger control-plane-driven stale-primary slice. Direct PUT now has a storage
   regression where a real `SingleAuthorityControlPlane` acting-set change
   removes the old object-PG primary and moves the PG into Peering. The
   in-flight old-primary publish keeps the source epoch while the local runtime
