@@ -8501,23 +8501,39 @@ Metadata PG migration and backfill design notes:
   proof release, and payload cleanup all route through Unix clients. The stale
   operation is rejected by local route validation before the command-build RPC,
   and the regression verifies that no remote object metadata, proof, shard file,
-  or ack row is left behind. The stale-primary/fail-closed slice now also covers
-  unversioned DELETE through a non-current operation-epoch handle: the delete
-  must fail at the metadata-primary epoch boundary, append no object-PG command,
-  leave the live object and reclaim metadata unchanged on every acting node, and
-  leave no pending command or bucket-write reservation behind. The shared
-  object metadata mutation path now has the same stale-epoch coverage using
+  or ack row is left behind. Streamed PUT segment append now has the same
+  remote Unix cleanup shape: after payload shards are written, a stale commit is
+  rejected before command build, the in-progress stream session remains, no
+  staged segment metadata or pending command is published, and the remote shard
+  files plus ack rows are removed. Staged stream and multipart cleanup helpers
+  now route shard-file and ack cleanup through the segment records' retained
+  placement epochs rather than the caller's current operation epoch, so abort,
+  completion, and abandoned pending-command cleanup can still remove shard sets
+  after route refresh. The stale-primary/fail-closed slice now also covers
+  unversioned DELETE through a non-current operation-epoch handle: the
+  delete must fail at the metadata-primary epoch boundary, append no object-PG
+  command, leave the live object and reclaim metadata unchanged on every acting
+  node, and leave no pending command or bucket-write reservation behind. The
+  same DELETE stale-epoch boundary is now covered through installed Unix
+  storage-node clients, proving the remote object PG keeps the live object, does
+  not publish reclaim metadata, and has no pending command or leaked bucket
+  write reservation. The shared object metadata mutation path now has the same
+  stale-epoch coverage using
   object tags as the representative tag/ACL/legal-hold/retention operation:
   non-current handles fail at route resolution, append no object-PG command,
   preserve the live object's metadata, and leave no pending command or
-  bucket-write reservation behind. Multipart completion now has the same local
-  stale-epoch fail-closed coverage: a non-current handle cannot start the
-  completion command, does not publish object metadata or completed-upload
-  state, preserves the in-progress upload and selected part staging rows, and
-  leaves no pending command or bucket-write reservation behind. The same
-  multipart completion stale-epoch boundary is now covered through installed
-  Unix storage-node clients, proving the remote object PG remains unmutated and
-  the remote bucket PG has no leaked write reservation.
+  bucket-write reservation behind. The tag-style metadata mutation stale-epoch
+  boundary is now covered through installed Unix storage-node clients as well,
+  proving the remote object PG keeps the original live metadata without tag
+  rows, pending commands, or leaked bucket write reservations. Multipart
+  completion now has the same local stale-epoch fail-closed coverage: a
+  non-current handle cannot start the completion command, does not publish
+  object metadata or completed-upload state, preserves the in-progress upload
+  and selected part staging rows, and leaves no pending command or bucket-write
+  reservation behind. The same multipart completion stale-epoch boundary is now
+  covered through installed Unix storage-node clients, proving the remote
+  object PG remains unmutated and the remote bucket PG has no leaked write
+  reservation.
 
 Exit criteria:
 

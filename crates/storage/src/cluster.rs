@@ -65,7 +65,7 @@ use crate::types::{
     BucketName, BucketWriteDrainRecord, BucketWriteReservationRecord, ClusterEpoch,
     CommitDirectPutObjectReq, CreateStreamUploadReq, DataPgId, DirectPutCommitSnapshot,
     DirectPutWrittenSegment, EcShape, FinalizeDirectPutObjectOutcome, GenerationId,
-    MultipartUploadRecord, ObjectEncryption, ObjectKey, PgId, PgState,
+    MultipartUploadRecord, ObjectEncryption, ObjectKey, ObjectSegmentRecord, PgId, PgState,
     PlacedSegmentShardBackfillClaimAcquire, PlacedSegmentShardBackfillClaimRecord,
     PlacedSegmentShardBackfillRecord, PlacedSegmentShardBackfillWorkItem,
     PlacedSegmentShardRepairClaimAcquire, PlacedSegmentShardRepairClaimRecord,
@@ -79,7 +79,7 @@ use crate::types::{
 };
 #[cfg(test)]
 use crate::types::{
-    MultipartReclaimRecord, ObjectLayout, ObjectSegmentRecord, ObjectSegmentsReclaimRecord,
+    MultipartReclaimRecord, ObjectLayout, ObjectSegmentsReclaimRecord,
     ObjectSegmentsReclaimSegmentRecord, PutLiveObjectReq,
 };
 #[cfg(test)]
@@ -5806,28 +5806,12 @@ impl StorageCluster {
                     &commit.generation_reservation_id,
                 );
                 for segment in &commit.segments {
-                    self.delete_payload_shard_set_best_effort(
-                        segment.data_pg_id,
-                        EcShape {
-                            k: segment.ec_k,
-                            m: segment.ec_m,
-                        },
-                        &segment.segment_okh,
-                        segment.segment_vid,
-                    );
+                    self.delete_object_segment_payload_shards_best_effort(segment);
                 }
                 release_result?;
             }
             MetadataCommandPayload::AppendStreamSegment(append) => {
-                self.delete_payload_shard_set_best_effort(
-                    append.segment.data_pg_id,
-                    EcShape {
-                        k: append.segment.ec_k,
-                        m: append.segment.ec_m,
-                    },
-                    &append.segment.segment_okh,
-                    append.segment.segment_vid,
-                );
+                self.delete_stream_segment_payload_shards_best_effort(&append.segment);
             }
             MetadataCommandPayload::CreateStreamUpload(create)
                 if create.session.target == StreamUploadTarget::PutObject =>
@@ -6340,14 +6324,8 @@ impl StorageCluster {
                             })?;
                         self.remove_pending_metadata_command_for_bucket(pg_id, bucket, &command)
                             .map_err(ObjectPgActionError::from)?;
-                        self.delete_payload_shard_keys_best_effort(
-                            segment_record.data_pg_id,
-                            EcShape {
-                                k: segment_record.ec_k,
-                                m: segment_record.ec_m,
-                            },
-                            &segment_record.segment_okh,
-                            segment_record.segment_vid,
+                        self.delete_stream_segment_payload_shard_keys_best_effort(
+                            segment_record,
                             shard_batch.iter().map(|(key, _)| (*key).clone()),
                         );
                     }
@@ -7628,19 +7606,22 @@ impl StorageCluster {
         shard_batch: &[(&ShardKey, WriteAck)],
     ) -> Result<(), ObjectPgActionError> {
         let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
+        let ec = EcShape {
+            k: segment_record.ec_k,
+            m: segment_record.ec_m,
+        };
+        macro_rules! cleanup_stream_append_payload {
+            () => {
+                self.delete_stream_segment_payload_shard_keys_best_effort(
+                    segment_record,
+                    shard_batch.iter().map(|(key, _)| (*key).clone()),
+                )
+            };
+        }
         let mutation_client = match self.object_mutation_metadata_primary_client(bucket, key) {
             Ok(client) => client,
             Err(error) => {
-                self.delete_payload_shard_keys_best_effort(
-                    segment_record.data_pg_id,
-                    EcShape {
-                        k: segment_record.ec_k,
-                        m: segment_record.ec_m,
-                    },
-                    &segment_record.segment_okh,
-                    segment_record.segment_vid,
-                    shard_batch.iter().map(|(key, _)| (*key).clone()),
-                );
+                cleanup_stream_append_payload!();
                 return Err(error.into());
             }
         };
@@ -7649,16 +7630,7 @@ impl StorageCluster {
             if let Err(error) =
                 self.drain_pending_object_metadata_commands_for_exact_bucket(pg_id, bucket)
             {
-                self.delete_payload_shard_keys_best_effort(
-                    segment_record.data_pg_id,
-                    EcShape {
-                        k: segment_record.ec_k,
-                        m: segment_record.ec_m,
-                    },
-                    &segment_record.segment_okh,
-                    segment_record.segment_vid,
-                    shard_batch.iter().map(|(key, _)| (*key).clone()),
-                );
+                cleanup_stream_append_payload!();
                 return Err(error);
             }
             let existing_stream_segment =
@@ -7667,32 +7639,14 @@ impl StorageCluster {
                         .into_iter()
                         .find(|segment| segment.segment_index == segment_index),
                     Err(error) => {
-                        self.delete_payload_shard_keys_best_effort(
-                            segment_record.data_pg_id,
-                            EcShape {
-                                k: segment_record.ec_k,
-                                m: segment_record.ec_m,
-                            },
-                            &segment_record.segment_okh,
-                            segment_record.segment_vid,
-                            shard_batch.iter().map(|(key, _)| (*key).clone()),
-                        );
+                        cleanup_stream_append_payload!();
                         return Err(error);
                     }
                 };
             match existing_stream_segment {
                 Some(existing) if existing == *segment_record => return Ok(()),
                 Some(_) => {
-                    self.delete_payload_shard_keys_best_effort(
-                        segment_record.data_pg_id,
-                        EcShape {
-                            k: segment_record.ec_k,
-                            m: segment_record.ec_m,
-                        },
-                        &segment_record.segment_okh,
-                        segment_record.segment_vid,
-                        shard_batch.iter().map(|(key, _)| (*key).clone()),
-                    );
+                    cleanup_stream_append_payload!();
                     return Err(ObjectPgActionError::InvalidRequest {
                         reason: format!("duplicate segment_index {segment_index}"),
                     });
@@ -7704,38 +7658,17 @@ impl StorageCluster {
             if let Err(error) =
                 self.register_payload_shard_acks(segment_record.data_pg_id, shard_batch)
             {
-                self.delete_payload_shard_keys_best_effort(
-                    segment_record.data_pg_id,
-                    EcShape {
-                        k: segment_record.ec_k,
-                        m: segment_record.ec_m,
-                    },
-                    &segment_record.segment_okh,
-                    segment_record.segment_vid,
-                    shard_batch.iter().map(|(key, _)| (*key).clone()),
-                );
+                cleanup_stream_append_payload!();
                 return Err(error);
             }
             if let Err(error) = self.validate_payload_shard_acks(
                 segment_record.data_pg_id,
-                EcShape {
-                    k: segment_record.ec_k,
-                    m: segment_record.ec_m,
-                },
+                ec,
                 &segment_record.segment_okh,
                 segment_record.segment_vid,
                 shard_batch,
             ) {
-                self.delete_payload_shard_keys_best_effort(
-                    segment_record.data_pg_id,
-                    EcShape {
-                        k: segment_record.ec_k,
-                        m: segment_record.ec_m,
-                    },
-                    &segment_record.segment_okh,
-                    segment_record.segment_vid,
-                    shard_batch.iter().map(|(key, _)| (*key).clone()),
-                );
+                cleanup_stream_append_payload!();
                 return Err(error);
             }
 
@@ -7761,16 +7694,7 @@ impl StorageCluster {
                 Ok(ObjectPgPendingCommandInstall::Pending(command)) => {
                     if let Err(error) = self.drain_pending_object_metadata_command(pg_id, &command)
                     {
-                        self.delete_payload_shard_keys_best_effort(
-                            segment_record.data_pg_id,
-                            EcShape {
-                                k: segment_record.ec_k,
-                                m: segment_record.ec_m,
-                            },
-                            &segment_record.segment_okh,
-                            segment_record.segment_vid,
-                            shard_batch.iter().map(|(key, _)| (*key).clone()),
-                        );
+                        cleanup_stream_append_payload!();
                         return Err(error);
                     }
                     continue;
@@ -7783,31 +7707,13 @@ impl StorageCluster {
                         &mut empty_log_conflicts,
                         "stream append command log conflict without pending progress",
                     ) {
-                        self.delete_payload_shard_keys_best_effort(
-                            segment_record.data_pg_id,
-                            EcShape {
-                                k: segment_record.ec_k,
-                                m: segment_record.ec_m,
-                            },
-                            &segment_record.segment_okh,
-                            segment_record.segment_vid,
-                            shard_batch.iter().map(|(key, _)| (*key).clone()),
-                        );
+                        cleanup_stream_append_payload!();
                         return Err(error);
                     }
                     continue;
                 }
                 Err(error) => {
-                    self.delete_payload_shard_keys_best_effort(
-                        segment_record.data_pg_id,
-                        EcShape {
-                            k: segment_record.ec_k,
-                            m: segment_record.ec_m,
-                        },
-                        &segment_record.segment_okh,
-                        segment_record.segment_vid,
-                        shard_batch.iter().map(|(key, _)| (*key).clone()),
-                    );
+                    cleanup_stream_append_payload!();
                     return Err(error);
                 }
             };
@@ -10175,15 +10081,23 @@ impl StorageCluster {
         self.delete_metadata_primary_payload_shard_keys(data_pg_id, &shard_keys)
     }
 
-    fn delete_payload_shard_set_best_effort(
+    fn delete_payload_shard_set_best_effort_at_epoch(
         &self,
+        operation_epoch: ClusterEpoch,
         data_pg_id: u32,
         ec: EcShape,
         okh: &[u8; 16],
         generation_id: GenerationId,
     ) {
         let shard_keys = Self::payload_shard_set_keys(okh, generation_id, ec);
-        self.delete_payload_shard_keys_best_effort(data_pg_id, ec, okh, generation_id, shard_keys);
+        self.delete_payload_shard_keys_best_effort_at_epoch(
+            operation_epoch,
+            data_pg_id,
+            ec,
+            okh,
+            generation_id,
+            shard_keys,
+        );
     }
 
     fn delete_payload_shard_keys_best_effort(
@@ -10388,17 +10302,55 @@ impl StorageCluster {
         segments: &[StreamUploadSegmentRecord],
     ) {
         for segment in segments {
-            let ec = EcShape {
+            self.delete_stream_segment_payload_shards_best_effort(segment);
+        }
+    }
+
+    fn delete_object_segment_payload_shards_best_effort(&self, segment: &ObjectSegmentRecord) {
+        self.delete_payload_shard_set_best_effort_at_epoch(
+            segment.placement_cluster_epoch,
+            segment.data_pg_id,
+            EcShape {
                 k: segment.ec_k,
                 m: segment.ec_m,
-            };
-            self.delete_payload_shard_set_best_effort(
-                segment.data_pg_id,
-                ec,
-                &segment.segment_okh,
-                segment.segment_vid,
-            );
-        }
+            },
+            &segment.segment_okh,
+            segment.segment_vid,
+        );
+    }
+
+    fn delete_stream_segment_payload_shards_best_effort(
+        &self,
+        segment: &StreamUploadSegmentRecord,
+    ) {
+        self.delete_payload_shard_set_best_effort_at_epoch(
+            segment.placement_cluster_epoch,
+            segment.data_pg_id,
+            EcShape {
+                k: segment.ec_k,
+                m: segment.ec_m,
+            },
+            &segment.segment_okh,
+            segment.segment_vid,
+        );
+    }
+
+    fn delete_stream_segment_payload_shard_keys_best_effort(
+        &self,
+        segment: &StreamUploadSegmentRecord,
+        shard_keys: impl IntoIterator<Item = ShardKey>,
+    ) {
+        self.delete_payload_shard_keys_best_effort_at_epoch(
+            segment.placement_cluster_epoch,
+            segment.data_pg_id,
+            EcShape {
+                k: segment.ec_k,
+                m: segment.ec_m,
+            },
+            &segment.segment_okh,
+            segment.segment_vid,
+            shard_keys,
+        );
     }
 
     #[cfg(any(test, feature = "test-hooks"))]

@@ -8346,6 +8346,7 @@ impl super::StorageCluster {
                 )
                 .get();
             self.delete_multipart_shard_set_best_effort(
+                part.placement_cluster_epoch,
                 data_pg_id,
                 &part.part_okh,
                 part.part_vid,
@@ -8380,6 +8381,7 @@ impl super::StorageCluster {
                 )
                 .get();
             self.delete_multipart_shard_set_best_effort(
+                part.placement_cluster_epoch,
                 data_pg_id,
                 &part.part_okh,
                 part.part_vid,
@@ -8410,6 +8412,7 @@ impl super::StorageCluster {
                 )
                 .get();
             self.delete_multipart_shard_set_best_effort(
+                part.placement_cluster_epoch,
                 data_pg_id,
                 &part.part_okh,
                 part.part_vid,
@@ -8428,6 +8431,7 @@ impl super::StorageCluster {
     fn delete_multipart_part_segments_best_effort(&self, segments: &[MultipartPartSegmentRecord]) {
         for segment in segments {
             self.delete_multipart_shard_set_best_effort(
+                segment.placement_cluster_epoch,
                 segment.data_pg_id,
                 &segment.segment_okh,
                 segment.segment_vid,
@@ -8441,12 +8445,19 @@ impl super::StorageCluster {
 
     fn delete_multipart_shard_set_best_effort(
         &self,
+        operation_epoch: ClusterEpoch,
         data_pg_id: u32,
         okh: &[u8; 16],
         generation_id: GenerationId,
         ec: EcShape,
     ) {
-        self.delete_payload_shard_set_best_effort(data_pg_id, ec, okh, generation_id);
+        self.delete_payload_shard_set_best_effort_at_epoch(
+            operation_epoch,
+            data_pg_id,
+            ec,
+            okh,
+            generation_id,
+        );
     }
 
     pub fn create_put_object_stream_session<T, E>(
