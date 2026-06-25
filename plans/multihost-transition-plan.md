@@ -8597,7 +8597,15 @@ Metadata PG migration and backfill design notes:
   injects a stale-operation failure immediately after DELETE has acquired its
   bucket-write reservation. That test proves the proof was actually durable
   before the failure and is then released without appending an object-PG
-  command or publishing reclaim metadata. Object metadata mutation now has a
+  command or publishing reclaim metadata.
+  The DELETE shape now also has Unix storage-node coverage for the
+  control-plane-driven Peering boundary: source-epoch object metadata is written
+  into remote storage-node directories, the storage-node servers refresh to the
+  current Peering epoch with historical routes retained, and the old-primary
+  frontend fails closed without appending a remote object-PG command, deleting
+  the live object, publishing reclaim metadata, leaving pending source/current
+  commands, or leaking bucket-write reservations.
+  Object metadata mutation now has a
   matching control-plane-driven Peering stale-primary regression using tags as
   the representative shared metadata command shape: the old primary fails
   closed, appends no object-PG command, preserves the live object, publishes no
