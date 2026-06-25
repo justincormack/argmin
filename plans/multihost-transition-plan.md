@@ -8568,7 +8568,15 @@ Metadata PG migration and backfill design notes:
   has built the multipart commit but before any object-PG command is applied,
   installs a newer runtime-map epoch, releases the gate, and verifies exactly
   one multipart commit command is appended and the completed object is readable
-  through the newer map.
+  through the newer map. Object tag updates now have the same local
+  pre-metadata-apply gate over the shared `PutObjectMetadata` command path:
+  PutObjectTagging pauses before the object-PG metadata command is applied,
+  crosses to a newer runtime-map epoch, then applies exactly one metadata
+  command and returns the updated tags. Legal-hold updates now cover the same
+  boundary with an object-lock-enabled bucket and version-specific object
+  metadata mutation, proving the object-lock side path also commits exactly
+  once across the epoch change. ACL and retention remain follow-on variants of
+  the same shared mutation path.
 
 Exit criteria:
 
