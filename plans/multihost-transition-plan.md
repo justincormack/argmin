@@ -8654,6 +8654,10 @@ Metadata PG migration and backfill design notes:
   pre-metadata-apply coverage at the `CommitStreamPart` boundary: the part
   commit pauses before object-PG apply, the runtime map advances, and the part
   finalizes exactly once before being completed into a readable object.
+  UploadPartCopy now has the same deterministic `CommitStreamPart` coverage:
+  copied source data is staged into the destination stream, the part commit is
+  paused across a runtime-map epoch change, and the copied part commits exactly
+  once before multipart completion reads back the copied payload.
   CopyObject now also has local pre-destination-commit
   coverage: the test copies from an existing source object, pauses before the
   destination `CommitDirectPutObject`, advances the runtime-map epoch, then
