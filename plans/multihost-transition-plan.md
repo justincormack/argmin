@@ -8549,7 +8549,13 @@ Metadata PG migration and backfill design notes:
   represented as multiple UploadPart stream segments, and a stale finalization
   preserves every copied staged segment row, shard file, and shard
   acknowledgement without publishing the part or leaking a bucket write
-  reservation.
+  reservation. Started the remote read-path slice with a storage-level
+  installed-Unix segment read regression: payload shards are written under an
+  old acting set, the frontend advances to a disjoint next-epoch acting set
+  while retaining the old route, and the read succeeds only when supplied with
+  the stored placement epoch. A current-route read is shown to fail closed, so
+  the positive read proves retained-route historical shard inspection rather
+  than accidental overlap with the new placement.
 
 Exit criteria:
 

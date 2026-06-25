@@ -4875,6 +4875,152 @@ fn historical_payload_shard_inspection_can_route_to_unix_storage_node_client() {
 }
 
 #[test]
+fn cross_epoch_segment_read_uses_retained_route_over_unix_storage_nodes() {
+    let tmp = test_util::tempdir();
+    let node_ids = [
+        NodeId::new(0),
+        NodeId::new(1),
+        NodeId::new(2),
+        NodeId::new(3),
+        NodeId::new(4),
+        NodeId::new(5),
+    ];
+    let old_acting_set = vec![NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let new_acting_set = vec![NodeId::new(3), NodeId::new(4), NodeId::new(5)];
+    let pg_ids = [0];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let current_epoch = ClusterEpoch::INITIAL;
+    let next_epoch = ClusterEpoch::new(current_epoch.get() + 1).unwrap();
+    let old_route = PgRouteSnapshot::reconstructed(
+        current_epoch,
+        PgId::new(0),
+        NodeId::new(0),
+        old_acting_set,
+        PgState::Active,
+    );
+    let new_route = PgRouteSnapshot::reconstructed(
+        next_epoch,
+        PgId::new(0),
+        NodeId::new(3),
+        new_acting_set,
+        PgState::Active,
+    );
+    let mut current_map = LocalClusterMap::open(
+        &tmp.path().join("frontend-current-read"),
+        &node_ids,
+        &pg_ids,
+        ec_shape,
+    )
+    .unwrap();
+    current_map.test_install_pg_routes([old_route.clone()]);
+
+    let mut server_configs = Vec::new();
+    let mut shard_client_configs = Vec::new();
+    for node_id in node_ids {
+        let socket_path = tmp
+            .path()
+            .join("sockets")
+            .join(format!("cross-epoch-read-node-{}.sock", node_id.as_u32()));
+        private_socket_dir(socket_path.parent().unwrap());
+        server_configs.push(StorageNodeProcessConfig {
+            node_id,
+            cluster_epoch: current_epoch,
+            route_map_valid_until_ms: None,
+            data_dir: tmp
+                .path()
+                .join(format!("cross-epoch-read-remote-{}", node_id.as_u32())),
+            default_ec_shape: ec_shape,
+            pg_ids: pg_ids.to_vec(),
+            socket_path: socket_path.clone(),
+            pg_routes: vec![StorageNodePgRoute::from(&old_route)],
+            historical_pg_routes: Vec::new(),
+        });
+        shard_client_configs.push(LocalUnixShardNodeClientConfig::new(node_id, socket_path));
+    }
+    for config in server_configs.iter().cloned() {
+        let server = StorageNodeServer::bind(config).unwrap();
+        let _server_thread = thread::spawn(move || server.serve_forever().unwrap());
+    }
+    current_map
+        .install_unix_shard_clients(shard_client_configs.clone())
+        .unwrap();
+    let current_cluster = crate::StorageCluster::from_local_map(Arc::new(current_map)).unwrap();
+    let committed =
+        write_committed_direct_segment(&current_cluster, b"cross epoch historical unix read");
+    let request = crate::SegmentStoredBytesRequest {
+        data_pg_id: committed.written.data_pg_id,
+        segment_okh: committed.segment_okh,
+        segment_vid: committed.generation_id,
+        stored_size: committed.payload.len(),
+        segment_crc64: checksum::crc64::checksum(&committed.payload),
+        ec: committed.written.ec,
+    };
+
+    let mut next_map = LocalClusterMap::open_frontend_topology_only_with_pg_routes(
+        NodeId::new(3),
+        node_ids,
+        &pg_ids,
+        ec_shape,
+        next_epoch,
+        [LocalPgRoute::from(&new_route)],
+    )
+    .unwrap();
+    next_map.test_install_historical_pg_routes([old_route]);
+    next_map
+        .install_unix_shard_clients(shard_client_configs)
+        .unwrap();
+    let next_cluster = crate::StorageCluster::from_local_map(Arc::new(next_map)).unwrap();
+
+    let mut current_route_read = Vec::new();
+    let current_route_error = next_cluster
+        .read_segment_payload_stored_bytes_into(request, &mut current_route_read)
+        .unwrap_err();
+    assert!(
+        matches!(
+            current_route_error,
+            StoreError::NotFound | StoreError::StorageRpc { .. }
+        ),
+        "current next-epoch route should fail before reading old placed bytes: {current_route_error:?}"
+    );
+
+    let mut historical_read = Vec::new();
+    next_cluster
+        .read_segment_payload_stored_bytes_at_placement_epoch_into(
+            current_epoch,
+            request,
+            &mut historical_read,
+        )
+        .unwrap();
+    assert_eq!(historical_read, committed.payload);
+
+    for written in &committed.written.written_shards {
+        let location = committed
+            .locations
+            .iter()
+            .copied()
+            .find(|location| location.shard_index() == written.key.shard_index())
+            .unwrap();
+        let config = server_configs
+            .iter()
+            .find(|config| config.node_id == location.node_id())
+            .unwrap();
+        let remote = SharedStorageNode::open_with_default_ec_shape(
+            &config.data_dir,
+            &config.pg_ids,
+            config.default_ec_shape,
+        )
+        .unwrap();
+        assert_eq!(
+            remote
+                .read_shard_file(committed.written.data_pg_id, &written.key)
+                .unwrap()
+                .len() as u64,
+            written.ack.stored_size
+        );
+    }
+}
+
+#[test]
 fn remote_shard_files_without_ack_rows_are_not_publishable() {
     let tmp = test_util::tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
