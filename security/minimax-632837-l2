@@ -1,0 +1,63 @@
+ServerError::InvalidRequest { reason } fields are passed through to client error responses
+Link: https://chatgpt.com/codex/cloud/security/findings/argmin-security-review-2026-06-23-l2
+Criticality: low (attack path: low)
+Status: invalid
+
+# Resolution
+Reviewed and marked invalid.
+
+The factual observation is true: several `ServerError` variants clone their `reason` into the client-facing S3 error `Message`, and malformed `Content-Length` is one request-controlled example. That does not make the finding a security issue. Reflecting malformed request details back to the same caller is normal S3-style error behavior, the values are bounded by HTTP/header/body parser limits, and the response XML escapes markup characters, so this is not XML or body injection.
+
+The report's own example is also not an information disclosure: the client already supplied the `Content-Length` value. The code should continue to avoid putting server-internal details or secrets in client-facing `reason` strings, but this finding does not identify such a reachable path.
+
+One adjacent hardening observation remains: the generic XML escaper escapes markup but does not normalize XML-illegal control characters. A direct unit/property test with arbitrary internal `reason` strings could demonstrate invalid XML, but that would be an artificial internal input rather than the reported reachable attack. If a real request path is found that can reflect XML-illegal characters into an error message, the fix should be central XML serialization hardening rather than treating all dynamic S3 error messages as leaks.
+
+# Metadata
+Repo: justincormack/argmin
+Commit: 632837a
+Author: security-review
+Created: 23/06/2026, 15:30:00
+Assignee: Unassigned
+Signals: Security, Hardening, Information-disclosure
+
+# Summary
+`client_error_message` (`crates/server-http/src/http/response.rs:159-310`) maps `ServerError::InvalidRequest { reason }` and several related variants directly to the `Message` field of the S3 error XML, which is sent to the client. The body is then run through `xml::xml_escape` (`crates/server-http/src/http/xml.rs:2594-2605`), so the response is well-formed XML, but the `reason` string can contain attacker-controlled data (bucket name, key name, upload ID, copy-source header value) before it reaches a validator. Most call sites do validate the inputs first, but a few do not — for example, `ServerError::InvalidURI { reason: "Couldn't parse the specified URI.".to_string() }` is constructed in `percent_decode_strict` (`crates/server-http/src/http/request.rs:368-370`) with a static string, but `ServerError::InvalidRequest { reason: format!("invalid Content-Length: {value}") }` (`crates/server-http/src/http/request.rs:34-39`) interpolates the raw `Content-Length` header value. A `Content-Length: <weird>` value is sent back to the client in the error body. This is not a vulnerability per se (the value is bounded, the response is well-formed XML, the client already sent the value), but it leaks the raw header back to the caller, which can be used to confirm a request reached the parser, and it is a regression vector for future code that builds a `reason` from a less-validated source. A similar concern applies to `ServerError::InvalidRequest { reason: "POST form missing 'key' field" }` and friends — these are static and safe, but the pattern is mixed and a future change could leak more.
+
+# Validation
+## Rubric
+- [x] Confirm `client_error_message` passes `reason` through to the error XML body.
+- [x] Confirm the body is XML-escaped via `xml::xml_escape` (no header/body injection).
+- [x] Confirm at least one site interpolates a request-controlled value into `reason` (`Content-Length`).
+- [x] Add a property test asserting the rendered XML `Message` field never contains control characters or unescaped `<`/`>`.
+## Report
+Grep for `ServerError::InvalidRequest { reason: format!` and `ServerError::InvalidArgument { reason: format!` in `crates/server-http/src/http/` and `crates/server-core/src/coordinator/` shows a mix of static strings (safe) and interpolated request values (mostly bounded to validated inputs). The most exposed site is `validate_content_length` at `crates/server-http/src/http/request.rs:34-39`, which echoes the raw `Content-Length` value into the error. The fix is to either (a) normalise the echoed value (e.g. truncate to 64 bytes, strip non-printable characters) before passing it into the error, or (b) replace the dynamic `reason` with a static message ("invalid Content-Length header") and rely on the request_id/host_id for diagnostics. The same audit should be performed on `InvalidURI`, `InvalidRedirectLocation`, `MalformedPolicy`, `MalformedXML`, `MalformedPOSTRequest`, `MalformedChunkedBody`, `MalformedTrailerError`, and `InvalidTag` — all of which currently clone the `reason` into the response.
+
+# Evidence
+crates/server-http/src/http/response.rs (L234 to 250)
+  Note: `InvalidRequest { reason }` and related variants are passed through to the client error XML.
+```
+        ServerError::InvalidRequest { reason }
+        | ServerError::BadRequest { reason }
+        | ServerError::InvalidArgument { reason }
+        | ServerError::InvalidRedirectLocation { reason }
+        | ServerError::InvalidURI { reason }
+        | ServerError::InvalidBucketName { reason }
+        | ServerError::MalformedPolicy { reason }
+        | ServerError::MalformedXML { reason }
+        | ServerError::MalformedPOSTRequest { reason }
+        | ServerError::MalformedChunkedBody { reason }
+        | ServerError::MalformedTrailerError { reason }
+        | ServerError::InvalidTag { reason } => reason.clone(),
+```
+
+crates/server-http/src/http/request.rs (L32 to 39)
+  Note: The raw `Content-Length` header value is echoed back to the client in the error.
+```
+fn validate_content_length(value: &str) -> Result<u64, ServerError> {
+    value
+        .parse::<u64>()
+        .map_err(|_| ServerError::InvalidRequest {
+            reason: format!("invalid Content-Length: {value}"),
+        })
+}
+```
