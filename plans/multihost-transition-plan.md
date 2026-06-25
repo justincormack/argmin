@@ -8577,6 +8577,15 @@ Metadata PG migration and backfill design notes:
   two retained-cleanup requirements: bucket-write proof release must resolve
   the proof's retained metadata route, and best-effort payload cleanup must use
   retained placement/ack routes instead of the caller's current route.
+  Unversioned DELETE now has the same control-plane-driven Peering shape: after
+  a real acting-set change removes the old object-PG primary, the old-primary
+  delete must fail closed at the stale metadata-operation boundary, append no
+  object-PG command, preserve the live object, publish no reclaim metadata,
+  leave no pending source/current command, and leave no bucket-write
+  reservation behind. This boundary fails before the DELETE path can acquire a
+  reservation; a later hook-driven case should cover transition after
+  reservation acquisition if that specific release path needs a
+  control-plane-driven regression.
 - Started the later multipart expansion for deterministic epoch-transition
   faults. CompleteMultipartUpload now has the same local pre-metadata-apply
   gate as direct PUT and DELETE: the test pauses after the multipart completion
