@@ -8510,7 +8510,14 @@ Metadata PG migration and backfill design notes:
   object tags as the representative tag/ACL/legal-hold/retention operation:
   non-current handles fail at route resolution, append no object-PG command,
   preserve the live object's metadata, and leave no pending command or
-  bucket-write reservation behind.
+  bucket-write reservation behind. Multipart completion now has the same local
+  stale-epoch fail-closed coverage: a non-current handle cannot start the
+  completion command, does not publish object metadata or completed-upload
+  state, preserves the in-progress upload and selected part staging rows, and
+  leaves no pending command or bucket-write reservation behind. The same
+  multipart completion stale-epoch boundary is now covered through installed
+  Unix storage-node clients, proving the remote object PG remains unmutated and
+  the remote bucket PG has no leaked write reservation.
 
 Exit criteria:
 

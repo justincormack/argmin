@@ -3387,6 +3387,166 @@ fn non_current_epoch_unix_direct_put_commit_fails_closed_and_cleans_remote_state
 }
 
 #[test]
+fn non_current_epoch_unix_multipart_completion_fails_closed_without_remote_mutation() {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let pg_ids = [0, 1, 2, 3];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let current_epoch = ClusterEpoch::INITIAL;
+    let stale_epoch = ClusterEpoch::new(current_epoch.get() + 1).unwrap();
+    let mut map = LocalClusterMap::open(
+        &tmp.path().join("frontend-multipart-completion"),
+        &node_ids,
+        &pg_ids,
+        ec_shape,
+    )
+    .unwrap();
+    for pg_id in pg_ids {
+        set_route_primary(&mut map, pg_id, NodeId::new(0));
+    }
+    let (bucket, key, object_pg, _data_pg) = {
+        let topology = map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        bucket_key_with_distinct_object_and_data_pg(topology)
+    };
+
+    let mut server_configs = Vec::new();
+    let mut client_configs = Vec::new();
+    for node_id in node_ids {
+        let socket_path = tmp.path().join("sockets").join(format!(
+            "stale-multipart-completion-node-{}.sock",
+            node_id.as_u32()
+        ));
+        private_socket_dir(socket_path.parent().unwrap());
+        let pg_routes = pg_ids
+            .iter()
+            .map(|pg_id| StorageNodePgRoute {
+                pg_id: *pg_id,
+                cluster_epoch: current_epoch,
+                state: PgState::Active,
+                primary_node_id: NodeId::new(0),
+                acting_set: node_ids.to_vec(),
+            })
+            .collect();
+        server_configs.push(StorageNodeProcessConfig {
+            node_id,
+            cluster_epoch: current_epoch,
+            route_map_valid_until_ms: None,
+            data_dir: tmp.path().join(format!(
+                "remote-stale-multipart-completion-{}",
+                node_id.as_u32()
+            )),
+            default_ec_shape: ec_shape,
+            pg_ids: pg_ids.to_vec(),
+            socket_path: socket_path.clone(),
+            pg_routes,
+            historical_pg_routes: Vec::new(),
+        });
+        client_configs.push(LocalUnixStorageNodeClientConfig::new(node_id, socket_path));
+    }
+    for config in server_configs.iter().cloned() {
+        let server = StorageNodeServer::bind(config).unwrap();
+        let _server_thread = thread::spawn(move || server.serve_forever().unwrap());
+    }
+    map.install_unix_storage_node_clients(client_configs)
+        .unwrap();
+    let map = Arc::new(map);
+    let current_cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    create_test_bucket(&current_cluster, &bucket);
+    let (req, _) =
+        seed_streamed_multipart_completion(&current_cluster, &bucket, &key, "unixstalecomplete");
+    let before_object_pg_proof = current_cluster
+        .test_object_pg_metadata_proof(&bucket, &key)
+        .unwrap();
+    let stale_cluster =
+        crate::StorageCluster::test_from_local_map_with_epoch(Arc::clone(&map), stale_epoch)
+            .unwrap();
+
+    let err = stale_cluster
+        .complete_multipart_upload_commit_serialized(req.clone(), 16)
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            crate::ObjectPgActionError::Store(StoreError::StaleMetadataOperation {
+                pg_id,
+                operation_epoch,
+                current_epoch: observed_current_epoch,
+            }) if pg_id == object_pg
+                && operation_epoch == stale_epoch
+                && observed_current_epoch == current_epoch
+        ),
+        "stale Unix multipart completion should fail closed before command build, got {err:?}"
+    );
+
+    let after_object_pg_proof = current_cluster
+        .test_object_pg_metadata_proof(&bucket, &key)
+        .unwrap();
+    assert_eq!(
+        after_object_pg_proof, before_object_pg_proof,
+        "stale Unix multipart completion must not append an object-PG command"
+    );
+    assert!(
+        pending_metadata_command_for_test(&map, PgId::new(object_pg), &bucket).is_none(),
+        "stale Unix multipart completion must not leave a pending command"
+    );
+
+    let remote_primary_config = server_configs
+        .iter()
+        .find(|config| config.node_id == NodeId::new(0))
+        .unwrap();
+    let remote_primary = SharedStorageNode::open_with_default_ec_shape(
+        &remote_primary_config.data_dir,
+        &remote_primary_config.pg_ids,
+        remote_primary_config.default_ec_shape,
+    )
+    .unwrap();
+    let remote_object_pg = remote_primary.get_pg(object_pg).unwrap();
+    assert!(
+        matches!(
+            crate::PgMetadataStore::get_object_meta(&*remote_object_pg, &bucket, &key),
+            Err(crate::MetadataError::ObjectNotFound)
+        ),
+        "stale Unix multipart completion must not publish object metadata"
+    );
+    assert!(
+        crate::PgMetadataStore::get_multipart_upload(&*remote_object_pg, &req.upload_id).is_ok(),
+        "stale Unix multipart completion must leave upload in progress"
+    );
+    assert_eq!(
+        crate::PgMetadataStore::get_multipart_part(
+            &*remote_object_pg,
+            &req.upload_id,
+            req.part_records[0].part_number
+        )
+        .unwrap(),
+        req.part_records[0],
+        "stale Unix multipart completion must preserve selected part row"
+    );
+    assert_eq!(
+        crate::PgMetadataStore::get_all_multipart_part_segments_for_upload(
+            &*remote_object_pg,
+            &req.upload_id
+        )
+        .unwrap(),
+        req.selected_streaming_segments,
+        "stale Unix multipart completion must preserve staged segment rows"
+    );
+    let remote_bucket_pg = remote_primary
+        .get_pg(current_cluster.test_bucket_pg_id_for(&bucket))
+        .unwrap();
+    assert!(
+        crate::PgMetadataStore::durable_bucket_write_reservations(&*remote_bucket_pg, &bucket)
+            .unwrap()
+            .is_empty(),
+        "stale Unix multipart completion must not leave bucket write reservations"
+    );
+}
+
+#[test]
 fn historical_payload_shard_inspection_can_route_to_unix_storage_node_client() {
     let tmp = test_util::tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
