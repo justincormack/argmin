@@ -8634,7 +8634,13 @@ Metadata PG migration and backfill design notes:
   the current Peering epoch, and the old-primary UploadPart session create
   fails closed without appending an object-PG command, publishing a stream
   session or segment rows, leaving pending commands, or leaking bucket-write
-  reservations.
+  reservations. UploadPart stream finalization now has the matching installed
+  Unix Peering coverage: a source-epoch active stream session and staged
+  segment stay durable after the storage-node servers refresh to the current
+  Peering epoch, and the old-primary finalize attempt cannot append an
+  object-PG command, publish part metadata, remove staged segment rows, delete
+  staged shard files or ack rows, leave pending commands, or leak a
+  bucket-write reservation.
 - Started the later multipart expansion for deterministic epoch-transition
   faults. CompleteMultipartUpload now has the same local pre-metadata-apply
   gate as direct PUT and DELETE: the test pauses after the multipart completion
