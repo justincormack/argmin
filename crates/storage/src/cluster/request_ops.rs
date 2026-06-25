@@ -6753,6 +6753,12 @@ impl super::StorageCluster {
                 Some(proof) => proof,
                 None => continue,
             };
+            if let Err(error) = self.maybe_run_after_object_metadata_reservation_acquired_hook() {
+                self.release_bucket_write_proof_for_object_metadata_command(
+                    &bucket_write_reservation,
+                )?;
+                return Err(error);
+            }
             let snapshot =
                 match storage_client.load_current_object_delete_snapshot(pg_id, bucket, key) {
                     Ok(snapshot) => snapshot,

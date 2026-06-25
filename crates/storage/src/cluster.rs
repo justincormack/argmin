@@ -582,6 +582,10 @@ type ObjectGenerationCommandIdHook = Arc<dyn Fn() + Send + Sync>;
 type StreamAppendCommandIdHook = Arc<dyn Fn() + Send + Sync>;
 
 #[cfg(any(test, feature = "test-hooks"))]
+type ObjectMetadataReservationAcquiredHook =
+    Arc<dyn Fn() -> Result<(), ObjectPgActionError> + Send + Sync>;
+
+#[cfg(any(test, feature = "test-hooks"))]
 pub type PayloadShardCleanupTestHook =
     Arc<dyn Fn(&ShardKey) -> Result<(), StoreError> + Send + Sync>;
 
@@ -600,6 +604,7 @@ struct StorageClusterTestHooks {
     before_direct_put_command_id: Option<DirectPutCommandIdHook>,
     before_object_generation_command_id: Option<ObjectGenerationCommandIdHook>,
     before_stream_append_command_id: Option<StreamAppendCommandIdHook>,
+    after_object_metadata_reservation_acquired: Option<ObjectMetadataReservationAcquiredHook>,
     before_placed_payload_shard_read: Option<PayloadShardReadTestHook>,
     before_placed_payload_shard_delete: Option<PayloadShardCleanupTestHook>,
     before_metadata_primary_payload_ack_delete: Option<PayloadShardCleanupTestHook>,
@@ -628,6 +633,11 @@ pub struct ObjectGenerationCommandIdHookGuard {
 
 #[cfg(any(test, feature = "test-hooks"))]
 pub struct StreamAppendCommandIdHookGuard {
+    hooks: Arc<Mutex<StorageClusterTestHooks>>,
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+pub struct ObjectMetadataReservationAcquiredHookGuard {
     hooks: Arc<Mutex<StorageClusterTestHooks>>,
 }
 
@@ -687,6 +697,16 @@ impl Drop for ObjectGenerationCommandIdHookGuard {
 impl Drop for StreamAppendCommandIdHookGuard {
     fn drop(&mut self) {
         self.hooks.lock().unwrap().before_stream_append_command_id = None;
+    }
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+impl Drop for ObjectMetadataReservationAcquiredHookGuard {
+    fn drop(&mut self) {
+        self.hooks
+            .lock()
+            .unwrap()
+            .after_object_metadata_reservation_acquired = None;
     }
 }
 
@@ -3526,6 +3546,29 @@ impl StorageCluster {
     #[cfg(not(any(test, feature = "test-hooks")))]
     fn maybe_run_before_stream_append_command_id_hook(&self) {}
 
+    #[cfg(any(test, feature = "test-hooks"))]
+    fn maybe_run_after_object_metadata_reservation_acquired_hook(
+        &self,
+    ) -> Result<(), ObjectPgActionError> {
+        let hook = self
+            .test_hooks
+            .lock()
+            .unwrap()
+            .after_object_metadata_reservation_acquired
+            .clone();
+        if let Some(hook) = hook {
+            hook()?;
+        }
+        Ok(())
+    }
+
+    #[cfg(not(any(test, feature = "test-hooks")))]
+    fn maybe_run_after_object_metadata_reservation_acquired_hook(
+        &self,
+    ) -> Result<(), ObjectPgActionError> {
+        Ok(())
+    }
+
     #[cfg(not(any(test, feature = "test-hooks")))]
     fn maybe_run_before_metadata_command_pending_install_hook(&self) {}
 
@@ -4688,6 +4731,20 @@ impl StorageCluster {
             .unwrap()
             .before_stream_append_command_id = Some(hook);
         StreamAppendCommandIdHookGuard {
+            hooks: Arc::clone(&self.test_hooks),
+        }
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_install_after_object_metadata_reservation_acquired_hook(
+        &self,
+        hook: Arc<dyn Fn() -> Result<(), ObjectPgActionError> + Send + Sync>,
+    ) -> ObjectMetadataReservationAcquiredHookGuard {
+        self.test_hooks
+            .lock()
+            .unwrap()
+            .after_object_metadata_reservation_acquired = Some(hook);
+        ObjectMetadataReservationAcquiredHookGuard {
             hooks: Arc::clone(&self.test_hooks),
         }
     }

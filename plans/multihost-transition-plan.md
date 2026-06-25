@@ -8583,9 +8583,15 @@ Metadata PG migration and backfill design notes:
   object-PG command, preserve the live object, publish no reclaim metadata,
   leave no pending source/current command, and leave no bucket-write
   reservation behind. This boundary fails before the DELETE path can acquire a
-  reservation; a later hook-driven case should cover transition after
-  reservation acquisition if that specific release path needs a
-  control-plane-driven regression.
+  reservation, so there is also a focused deterministic hook regression that
+  injects a stale-operation failure immediately after DELETE has acquired its
+  bucket-write reservation. That test proves the proof was actually durable
+  before the failure and is then released without appending an object-PG
+  command or publishing reclaim metadata. Object metadata mutation now has a
+  matching control-plane-driven Peering stale-primary regression using tags as
+  the representative shared metadata command shape: the old primary fails
+  closed, appends no object-PG command, preserves the live object, publishes no
+  tags, leaves no source/current pending command, and leaks no reservation.
 - Started the later multipart expansion for deterministic epoch-transition
   faults. CompleteMultipartUpload now has the same local pre-metadata-apply
   gate as direct PUT and DELETE: the test pauses after the multipart completion
