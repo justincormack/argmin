@@ -8,6 +8,7 @@ use placement::{NodeId, PlacementConstraint, PlacementError, TopologyKey};
 
 use super::ShardLocation;
 use crate::control_plane::{ClusterRuntimeMapSnapshot, NodeRouteSnapshot, PgRouteSnapshot};
+use crate::data_dir::prepare_private_data_dir;
 use crate::error::{ClusterBuildError, ShardIoError, StoreError};
 #[cfg(test)]
 use crate::metadata_command::MetadataCommandLogIndex;
@@ -4227,10 +4228,10 @@ fn prepare_local_node_data_dir(
     node_id: NodeId,
     data_dir: &Path,
 ) -> Result<PathBuf, ClusterBuildError> {
-    std::fs::create_dir_all(data_dir).map_err(|source| ClusterBuildError::OpenLocalNode {
+    prepare_private_data_dir(data_dir).map_err(|source| ClusterBuildError::OpenLocalNode {
         node_id: node_id.as_u32(),
         source: StoreError::Io {
-            context: "create local node data dir",
+            context: "prepare private local node data dir",
             source,
         },
     })?;

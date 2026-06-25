@@ -65,6 +65,61 @@ fn placed_segment_shard_repair_work_item(index: usize) -> PlacedSegmentShardRepa
 }
 
 #[test]
+fn local_cluster_tightens_existing_readable_node_data_dir() {
+    let tmp = test_util::tempdir();
+    let root = tmp.path().join("cluster");
+    let node_dir = root.join("node-0000");
+    std::fs::create_dir_all(&node_dir).unwrap();
+    std::fs::set_permissions(&node_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let node_ids = [
+        NodeId::new(0),
+        NodeId::new(1),
+        NodeId::new(2),
+        NodeId::new(3),
+        NodeId::new(4),
+        NodeId::new(5),
+    ];
+    let _map = LocalClusterMap::open(&root, &node_ids, &[0], EcShape { k: 4, m: 2 }).unwrap();
+
+    let mode = std::fs::metadata(&node_dir).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o700);
+}
+
+#[test]
+fn local_cluster_rejects_existing_writable_node_data_dir() {
+    let tmp = test_util::tempdir();
+    let root = tmp.path().join("cluster");
+    let node_dir = root.join("node-0000");
+    std::fs::create_dir_all(&node_dir).unwrap();
+    std::fs::set_permissions(&node_dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+
+    let node_ids = [
+        NodeId::new(0),
+        NodeId::new(1),
+        NodeId::new(2),
+        NodeId::new(3),
+        NodeId::new(4),
+        NodeId::new(5),
+    ];
+    let err = LocalClusterMap::open(&root, &node_ids, &[0], EcShape { k: 4, m: 2 })
+        .expect_err("world-writable node dir must fail");
+
+    assert!(matches!(
+        err,
+        ClusterBuildError::OpenLocalNode {
+            source:
+                StoreError::Io {
+                    source,
+                    ..
+                },
+            ..
+        } if source.kind() == std::io::ErrorKind::PermissionDenied
+    ));
+    let _ = std::fs::set_permissions(&node_dir, std::fs::Permissions::from_mode(0o700));
+}
+
+#[test]
 fn placed_segment_shard_repair_hint_queue_is_bounded() {
     let state = LocalClusterRuntimeState::new();
     for index in 0..LOCAL_PLACED_SEGMENT_SHARD_REPAIR_HINT_QUEUE_LIMIT {

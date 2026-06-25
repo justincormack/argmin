@@ -14,6 +14,7 @@ use crate::control_plane::{
     ClusterRuntimeMapSnapshot, ControlPlaneError, ControlPlaneHeartbeatRuntimeMapSource,
     ControlPlaneHeartbeatSink, HeartbeatLease, NodeHeartbeat, PgRouteSnapshot,
 };
+use crate::data_dir::prepare_private_data_dir;
 use crate::error::{BucketSnapshotLoadError, MetadataError, StoreError};
 use crate::metadata_command::{MetadataCommandId, MetadataCommandLogIndex, MetadataCommandPayload};
 use crate::node::SharedStorageNode;
@@ -9979,8 +9980,8 @@ struct StorageNodeDataDirLock {
 
 impl StorageNodeDataDirLock {
     fn acquire(data_dir: &Path) -> Result<Self, StorageNodeServerError> {
-        fs::create_dir_all(data_dir).map_err(|source| StorageNodeServerError::Io {
-            context: "create storage-node data directory",
+        prepare_private_data_dir(data_dir).map_err(|source| StorageNodeServerError::Io {
+            context: "prepare private storage-node data directory",
             path: data_dir.to_path_buf(),
             source,
         })?;
@@ -12077,6 +12078,50 @@ mod tests {
             err,
             StorageNodeServerError::SocketDirectoryNotPrivate { .. }
         ));
+    }
+
+    #[test]
+    fn storage_node_server_creates_private_data_directory() {
+        let tmp = test_util::tempdir();
+        let config = test_config(&tmp);
+        private_socket_dir(config.socket_path.parent().unwrap());
+
+        let _server = StorageNodeServer::bind(config.clone()).unwrap();
+
+        let mode = fs::metadata(&config.data_dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700);
+    }
+
+    #[test]
+    fn storage_node_server_tightens_existing_readable_data_directory() {
+        let tmp = test_util::tempdir();
+        let config = test_config(&tmp);
+        private_socket_dir(config.socket_path.parent().unwrap());
+        fs::create_dir_all(&config.data_dir).unwrap();
+        fs::set_permissions(&config.data_dir, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let _server = StorageNodeServer::bind(config.clone()).unwrap();
+
+        let mode = fs::metadata(&config.data_dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700);
+    }
+
+    #[test]
+    fn storage_node_server_rejects_writable_data_directory() {
+        let tmp = test_util::tempdir();
+        let config = test_config(&tmp);
+        private_socket_dir(config.socket_path.parent().unwrap());
+        fs::create_dir_all(&config.data_dir).unwrap();
+        fs::set_permissions(&config.data_dir, fs::Permissions::from_mode(0o777)).unwrap();
+
+        let err = bind_error(config.clone());
+
+        assert!(matches!(
+            err,
+            StorageNodeServerError::Io { source, .. }
+                if source.kind() == io::ErrorKind::PermissionDenied
+        ));
+        let _ = fs::set_permissions(&config.data_dir, fs::Permissions::from_mode(0o700));
     }
 
     #[test]

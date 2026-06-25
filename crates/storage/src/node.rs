@@ -20,6 +20,7 @@ use s3_types::VersionId;
 use s3_types::{AclGrants, BucketObjectLockConfig, BucketVersioningState, CanonicalUserId};
 
 use crate::control_plane::{NodeHeartbeat, NodePgHeartbeatObservation, PgMetadataProof};
+use crate::data_dir::prepare_private_data_dir;
 #[cfg(test)]
 use crate::error::BucketWriteDrainError;
 use crate::error::{BucketSnapshotLoadError, ObjectPgActionError, StoreError};
@@ -293,8 +294,8 @@ pub struct LocalStorageNode {
 impl LocalStorageNode {
     /// Open a storage node, creating PG directories as needed.
     pub fn open(data_dir: &Path, pg_ids: &[u32]) -> Result<Self, StoreError> {
-        std::fs::create_dir_all(data_dir).map_err(|e| StoreError::Io {
-            context: "create data dir",
+        prepare_private_data_dir(data_dir).map_err(|e| StoreError::Io {
+            context: "prepare private data dir",
             source: e,
         })?;
 
@@ -473,8 +474,8 @@ impl SharedStorageNode {
                 reason: error.to_string(),
             }
         })?;
-        std::fs::create_dir_all(data_dir).map_err(|e| StoreError::Io {
-            context: "create data dir",
+        prepare_private_data_dir(data_dir).map_err(|e| StoreError::Io {
+            context: "prepare private data dir",
             source: e,
         })?;
 
