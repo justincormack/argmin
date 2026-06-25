@@ -8596,6 +8596,11 @@ Metadata PG migration and backfill design notes:
   the representative shared metadata command shape: the old primary fails
   closed, appends no object-PG command, preserves the live object, publishes no
   tags, leaves no source/current pending command, and leaks no reservation.
+  Multipart completion now has the same control-plane-driven Peering shape: a
+  staged multipart upload survives the old-primary completion attempt without
+  publishing object metadata or completed-upload state, without mutating the
+  object-PG command log, without losing the selected part/segment rows, and
+  without leaking pending commands or bucket-write reservations.
 - Started the later multipart expansion for deterministic epoch-transition
   faults. CompleteMultipartUpload now has the same local pre-metadata-apply
   gate as direct PUT and DELETE: the test pauses after the multipart completion
