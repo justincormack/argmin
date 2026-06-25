@@ -8668,7 +8668,11 @@ Metadata PG migration and backfill design notes:
   old destination object-PG primary, and the old-primary destination commit
   must fail closed without appending destination metadata, mutating the source,
   leaking bucket-write reservations, or leaving copied shard files/ack rows,
-  including through installed Unix storage-node clients. Object tag updates now
+  including through installed Unix storage-node clients. Serving read/list paths
+  now also have explicit Peering fail-closed coverage: with the bucket PG still
+  Active and only the object metadata PG Peering, GET, HEAD, and LIST must return
+  the Peering `PgNotActive` error rather than stale object data or a partial
+  listing. Object tag updates now
   have the same local pre-metadata-apply
   gate over the shared `PutObjectMetadata` command path: PutObjectTagging pauses
   before the object-PG metadata command is applied, crosses to a newer

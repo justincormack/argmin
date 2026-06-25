@@ -1219,6 +1219,70 @@ fn install_same_store_next_epoch_runtime_map(
     handle.install(candidate).unwrap();
 }
 
+fn install_same_store_next_epoch_runtime_map_with_peering_pg(
+    handle: &StorageClusterRuntimeMapHandle,
+    initial: &Arc<StorageCluster>,
+    node_root: &std::path::Path,
+    peering_pg: u32,
+) -> ClusterEpoch {
+    let node_count = u32::from(initial.default_payload_ec_shape().k)
+        + u32::from(initial.default_payload_ec_shape().m);
+    let configs = (0..node_count)
+        .map(|node_id| {
+            LocalNodeStoreConfig::new(
+                NodeId::new(node_id),
+                node_root.join(format!("node-{node_id:04}")),
+            )
+        })
+        .collect::<Vec<_>>();
+    let next_epoch = ClusterEpoch::new(initial.cluster_epoch().get() + 1).unwrap();
+    let acting_set = (0..node_count).map(NodeId::new).collect::<Vec<_>>();
+    let routes = initial
+        .test_pg_ids()
+        .iter()
+        .map(|pg_id| {
+            let state = if *pg_id == peering_pg {
+                PgState::Peering
+            } else {
+                PgState::Active
+            };
+            let route = storage::control_plane::PgRouteSnapshot::reconstructed(
+                next_epoch,
+                PgId::new(*pg_id),
+                NodeId::new(0),
+                acting_set.clone(),
+                state,
+            );
+            LocalPgRoute::from(&route)
+        })
+        .collect::<Vec<_>>();
+    let historical_routes = initial
+        .local_pg_routes()
+        .map(|route| {
+            storage::control_plane::PgRouteSnapshot::reconstructed(
+                route.cluster_epoch(),
+                route.pg_id(),
+                route.primary_node_id(),
+                route.acting_set().to_vec(),
+                route.state(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut candidate_map = LocalClusterMap::open_frontend_with_configs_and_pg_routes(
+        NodeId::new(0),
+        configs,
+        initial.test_pg_ids(),
+        initial.default_payload_ec_shape(),
+        next_epoch,
+        routes,
+    )
+    .unwrap();
+    candidate_map.test_install_historical_pg_routes(historical_routes);
+    let candidate = StorageCluster::from_local_map(Arc::new(candidate_map)).unwrap();
+    handle.install(candidate).unwrap();
+    next_epoch
+}
+
 fn find_bucket_key_for_metadata_and_data_pg(
     storage_cluster: &StorageCluster,
     metadata_pg_id: u32,
@@ -3185,6 +3249,121 @@ fn list_objects_delimiter_continuation_survives_epoch_change_between_pages() {
     assert_eq!(second_keys, [root_key.as_str()]);
     assert!(!second.is_truncated);
     assert_eq!(second.next_continuation_token, None);
+}
+
+#[test]
+fn read_and_list_fail_closed_while_object_metadata_pg_is_peering() {
+    let bucket = "object-peering-read-bucket";
+    let tmp = test_util::tempdir();
+    let initial = open_test_storage_cluster(tmp.path(), &[0, 1]);
+    let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&initial));
+    let coord =
+        Coordinator::new_with_managed_key_provider_for_storage_cluster_runtime_map_handle_with_background_worker_mode(
+            handle.clone(),
+            "us-east-1".to_string(),
+            None,
+            test_sse_s3_provider(),
+            BackgroundWorkerMode::none(),
+        )
+        .unwrap();
+    coord
+        .create_bucket_for_owner("default-owner", bucket, false)
+        .unwrap();
+    let key = find_key_with_object_pg_ne_bucket_pg(&coord, bucket, "peering-key");
+    let peering_pg = object_pg_id(&coord, bucket, &key);
+    let bucket_pg = bucket_pg_id(&coord, bucket);
+    assert_ne!(
+        peering_pg, bucket_pg,
+        "test must keep the bucket PG active while the object metadata PG peers"
+    );
+
+    test_helpers::put_object(
+        &coord,
+        &PutObjectRequest {
+            encryption: WriteEncryptionRequest::none(),
+            policy_context: PutObjectPolicyContext::default(),
+            object_lock: ObjectLockState::default(),
+            object: object_request_with_expected_owner(bucket, &key, test_requester(), None),
+            data: b"must-not-be-served-from-peering-pg",
+            metadata: &MetadataBlob::new(),
+            system_metadata: &SystemMetadata::EMPTY,
+            tags: None,
+            cond: NO_WRITE,
+            acl: NO_PUT_OBJECT_ACL.into(),
+        },
+    )
+    .unwrap();
+
+    let current_epoch = install_same_store_next_epoch_runtime_map_with_peering_pg(
+        &handle,
+        &initial,
+        tmp.path(),
+        peering_pg,
+    );
+    assert_eq!(
+        handle
+            .current()
+            .local_pg_route(PgId::new(peering_pg))
+            .unwrap()
+            .state(),
+        PgState::Peering
+    );
+
+    let assert_pg_not_active = |operation: &str, error: ServerError| {
+        assert!(
+            matches!(
+                error,
+                ServerError::Store(storage::StoreError::PgNotActive {
+                    pg_id,
+                    cluster_epoch,
+                    state: PgState::Peering,
+                }) if pg_id == peering_pg && cluster_epoch == current_epoch
+            ),
+            "{operation} should fail closed on the Peering object metadata PG, got {error:?}"
+        );
+    };
+
+    let get_error = coord
+        .get_object(&GetObjectRequest {
+            sse_customer: None,
+            object: object_version_request_with_expected_owner(
+                bucket,
+                &key,
+                None,
+                test_requester(),
+                None,
+            ),
+            cond: NO_READ,
+        })
+        .unwrap_err();
+    assert_pg_not_active("GET", get_error);
+
+    let head_error = coord
+        .head_object(&GetObjectRequest {
+            sse_customer: None,
+            object: object_version_request_with_expected_owner(
+                bucket,
+                &key,
+                None,
+                test_requester(),
+                None,
+            ),
+            cond: NO_READ,
+        })
+        .unwrap_err();
+    assert_pg_not_active("HEAD", head_error);
+
+    let list_error = coord
+        .list_objects_v2(&ListObjectsV2Request {
+            bucket: bucket_request_with_expected_owner(bucket, test_requester(), None),
+            prefix: None,
+            delimiter: None,
+            continuation_token: None,
+            max_keys: 1000,
+            requested_max_keys: Some(1000),
+        })
+        .unwrap_err();
+    assert_pg_not_active("LIST", list_error);
 }
 
 #[test]
