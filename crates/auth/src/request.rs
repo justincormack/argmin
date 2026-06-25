@@ -280,6 +280,12 @@ fn authenticate_header<H: HeaderSource + ?Sized>(
     {
         return Err(AuthError::MalformedAuth);
     }
+    let request_epoch_secs = headers.first_value("x-amz-date").and_then(parse_amz_date);
+    if request_epoch_secs.is_some_and(|request_epoch| {
+        now_epoch_secs.abs_diff(request_epoch) > crate::SIGV4_CLOCK_SKEW_SECS
+    }) {
+        return Err(AuthError::RequestExpired);
+    }
     let body_hash = match headers.first_value("x-amz-content-sha256") {
         Some("UNSIGNED-PAYLOAD") => Cow::Borrowed("UNSIGNED-PAYLOAD"),
         Some(hash) => Cow::Borrowed(hash),
@@ -301,7 +307,6 @@ fn authenticate_header<H: HeaderSource + ?Sized>(
         now_epoch_secs,
     )?;
 
-    let request_epoch_secs = headers.first_value("x-amz-date").and_then(parse_amz_date);
     let crate::sigv4::SigV4Auth {
         credential,
         signed_headers: _,
@@ -666,17 +671,66 @@ mod tests {
         store
     }
 
-    #[test]
-    fn authenticate_header_sigv4_success() {
-        let store = example_store();
-        let headers = [
+    fn aws_example_time() -> u64 {
+        parse_amz_date("20130524T000000Z").unwrap()
+    }
+
+    fn aws_example_signed_headers() -> [(&'static str, &'static str); 5] {
+        [
             ("authorization", "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20130524/us-east-1/s3/aws4_request, SignedHeaders=host;range;x-amz-content-sha256;x-amz-date, Signature=f0e8bdb87c964420e857bd35b5d6ed310bd44f0170aba48dd91039c6036bdb41"),
             ("host", "examplebucket.s3.amazonaws.com"),
             ("range", "bytes=0-9"),
             ("x-amz-content-sha256", "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"),
             ("x-amz-date", "20130524T000000Z"),
-        ];
+        ]
+    }
+
+    #[test]
+    fn authenticate_header_sigv4_success() {
+        let store = example_store();
+        let headers = aws_example_signed_headers();
         let ctx = authenticate_request(
+            "GET",
+            "/test.txt",
+            "",
+            &headers,
+            b"",
+            &store,
+            Some("us-east-1"),
+            "s3",
+            aws_example_time(),
+        )
+        .unwrap();
+        assert_eq!(ctx.mode, AuthMode::HeaderSigV4);
+        assert_eq!(ctx.access_key_id.as_deref(), Some("AKIAIOSFODNN7EXAMPLE"));
+        assert_eq!(ctx.principal(), Some("AKIAIOSFODNN7EXAMPLE"));
+        assert_eq!(ctx.request_epoch_secs, Some(1_369_353_600));
+    }
+
+    #[test]
+    fn authenticate_header_sigv4_rejects_past_skew() {
+        let store = example_store();
+        let headers = aws_example_signed_headers();
+        let err = authenticate_request(
+            "GET",
+            "/test.txt",
+            "",
+            &headers,
+            b"",
+            &store,
+            Some("us-east-1"),
+            "s3",
+            aws_example_time() + crate::SIGV4_CLOCK_SKEW_SECS + 1,
+        )
+        .unwrap_err();
+        assert!(matches!(err, AuthError::RequestExpired));
+    }
+
+    #[test]
+    fn authenticate_header_sigv4_rejects_zero_now_skew() {
+        let store = example_store();
+        let headers = aws_example_signed_headers();
+        let err = authenticate_request(
             "GET",
             "/test.txt",
             "",
@@ -687,11 +741,45 @@ mod tests {
             "s3",
             0,
         )
+        .unwrap_err();
+        assert!(matches!(err, AuthError::RequestExpired));
+    }
+
+    #[test]
+    fn authenticate_header_sigv4_rejects_future_skew() {
+        let store = example_store();
+        let headers = aws_example_signed_headers();
+        let err = authenticate_request(
+            "GET",
+            "/test.txt",
+            "",
+            &headers,
+            b"",
+            &store,
+            Some("us-east-1"),
+            "s3",
+            aws_example_time() - crate::SIGV4_CLOCK_SKEW_SECS - 1,
+        )
+        .unwrap_err();
+        assert!(matches!(err, AuthError::RequestExpired));
+    }
+
+    #[test]
+    fn authenticate_header_sigv4_accepts_max_skew() {
+        let store = example_store();
+        let headers = aws_example_signed_headers();
+        authenticate_request(
+            "GET",
+            "/test.txt",
+            "",
+            &headers,
+            b"",
+            &store,
+            Some("us-east-1"),
+            "s3",
+            aws_example_time() + crate::SIGV4_CLOCK_SKEW_SECS,
+        )
         .unwrap();
-        assert_eq!(ctx.mode, AuthMode::HeaderSigV4);
-        assert_eq!(ctx.access_key_id.as_deref(), Some("AKIAIOSFODNN7EXAMPLE"));
-        assert_eq!(ctx.principal(), Some("AKIAIOSFODNN7EXAMPLE"));
-        assert_eq!(ctx.request_epoch_secs, Some(1_369_353_600));
     }
 
     #[test]
@@ -707,7 +795,7 @@ mod tests {
             &store,
             Some("us-east-1"),
             "s3",
-            0,
+            aws_example_time(),
         )
         .unwrap_err();
         assert!(matches!(err, AuthError::MissingAuth));
@@ -729,7 +817,7 @@ mod tests {
             &store,
             Some("us-east-1"),
             "s3",
-            0,
+            aws_example_time(),
         )
         .unwrap_err();
         assert!(matches!(err, AuthError::AccessDenied));
@@ -897,7 +985,7 @@ mod tests {
             &store,
             Some("us-east-1"),
             "s3",
-            0,
+            aws_example_time(),
         )
         .unwrap_err();
         assert!(matches!(
@@ -958,7 +1046,7 @@ mod tests {
             &store,
             Some("us-east-1"),
             "s3",
-            0,
+            aws_example_time(),
         )
         .unwrap_err();
         assert!(matches!(err, AuthError::UnsignedHeaders { .. }));
@@ -992,7 +1080,7 @@ mod tests {
             &store,
             Some("us-east-1"),
             "s3",
-            10,
+            aws_example_time(),
         )
         .unwrap_err();
         assert!(matches!(err, AuthError::ExpiredToken));
@@ -1013,7 +1101,7 @@ mod tests {
             &store,
             Some("us-east-1"),
             "s3",
-            0,
+            aws_example_time(),
         )
         .unwrap_err();
         assert!(matches!(err, AuthError::AccessDenied));
@@ -1035,7 +1123,7 @@ mod tests {
             &store,
             Some("us-east-1"),
             "s3",
-            0,
+            aws_example_time(),
         )
         .unwrap_err();
         assert!(matches!(
@@ -1751,7 +1839,7 @@ mod tests {
             &store,
             Some("us-east-1"),
             "s3",
-            0,
+            aws_example_time(),
         )
         .unwrap();
         assert!(ctx.streaming.is_some());
@@ -1817,7 +1905,7 @@ mod tests {
             &store,
             Some("us-east-1"),
             "s3",
-            0,
+            aws_example_time(),
         )
         .unwrap();
         assert!(ctx.streaming.is_none());

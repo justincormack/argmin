@@ -34,6 +34,7 @@ pub(crate) const MAX_CREDENTIAL_LEN: usize = 2048;
 pub(crate) const MAX_SIGNED_HEADERS_LEN: usize = 2048;
 pub(crate) const MAX_SIGNED_HEADER_COUNT: usize = 128;
 pub(crate) const SIGNATURE_HEX_LEN: usize = 64;
+pub const SIGV4_CLOCK_SKEW_SECS: u64 = 15 * 60;
 
 /// Constant-time byte slice comparison to prevent timing attacks.
 ///

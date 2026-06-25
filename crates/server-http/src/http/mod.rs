@@ -328,7 +328,7 @@ pub(crate) fn enforce_sigv4_time_skew(req: &S3Request, now: u64) -> Result<(), S
     if let Some(date_str) = req.header("x-amz-date") {
         if let Some(epoch) = auth::parse_amz_date(date_str) {
             let skew = now.abs_diff(epoch);
-            if skew > 15 * 60 {
+            if skew > auth::SIGV4_CLOCK_SKEW_SECS {
                 return Err(ServerError::Auth(auth::AuthError::RequestExpired));
             }
         }
