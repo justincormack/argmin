@@ -8556,12 +8556,19 @@ Metadata PG migration and backfill design notes:
   the stored placement epoch. A current-route read is shown to fail closed, so
   the positive read proves retained-route historical shard inspection rather
   than accidental overlap with the new placement. The next remote read-path
-  regression lifts this to the coordinator GET/HEAD path: object metadata stays
-  on its serving PG, the payload data PG moves to a disjoint acting set in the
-  next epoch, and storage-node access is installed through Unix clients. GET
-  reads the old payload shards through the segment's recorded placement epoch;
-  HEAD remains available from metadata after the data-PG move without claiming
-  payload-route coverage.
+  regression lifts this to the coordinator GET/HEAD/LIST path: object metadata
+  stays on its serving PG, the payload data PG moves to a disjoint acting set
+  in the next epoch, and storage-node access is installed through Unix clients.
+  GET reads the old payload shards through the segment's recorded placement
+  epoch; HEAD and LIST remain available from metadata after the data-PG move
+  without claiming payload-route coverage.
+- Started the later multipart expansion for deterministic epoch-transition
+  faults. CompleteMultipartUpload now has the same local pre-metadata-apply
+  gate as direct PUT and DELETE: the test pauses after the multipart completion
+  has built the multipart commit but before any object-PG command is applied,
+  installs a newer runtime-map epoch, releases the gate, and verifies exactly
+  one multipart commit command is appended and the completed object is readable
+  through the newer map.
 
 Exit criteria:
 

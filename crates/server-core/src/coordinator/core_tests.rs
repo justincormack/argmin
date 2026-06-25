@@ -1555,6 +1555,118 @@ fn delete_object_epoch_change_before_metadata_apply_commits_once_on_pinned_route
 }
 
 #[test]
+fn complete_multipart_epoch_change_before_metadata_apply_commits_once_on_pinned_route() {
+    const TOKEN: DeterministicFaultToken =
+        DeterministicFaultToken::new("complete-multipart-before-metadata-apply");
+
+    let bucket = "complete-multipart-epoch-change-bucket";
+    let key = "key";
+    let tmp = test_util::tempdir();
+    let initial = open_test_storage_cluster(tmp.path(), &[0, 1]);
+    let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&initial));
+    let coord = Arc::new(
+        Coordinator::new_with_managed_key_provider_for_storage_cluster_runtime_map_handle_with_background_worker_mode(
+            handle.clone(),
+            "us-east-1".to_string(),
+            None,
+            test_sse_s3_provider(),
+            BackgroundWorkerMode::none(),
+        )
+        .unwrap(),
+    );
+    coord
+        .create_bucket_for_owner("default-owner", bucket, false)
+        .unwrap();
+    let (upload_id, parts) =
+        create_upload_with_parts(&coord, bucket, key, &[(1, b"multipart-crosses-epoch")]);
+
+    let bucket_name = trusted_bucket_name(bucket);
+    let object_key = trusted_object_key(key);
+    let before_object_pg_proof = initial
+        .test_object_pg_metadata_proof(&bucket_name, &object_key)
+        .unwrap();
+
+    let gate = DeterministicFaultGate::new(TOKEN);
+    let hook_bucket = bucket_name.clone();
+    let hook_key = object_key.clone();
+    let gate_for_hook = Arc::clone(&gate);
+    let _hook_guard =
+        initial.test_install_before_metadata_command_apply_context_hook(Arc::new(move |context| {
+            if context.kind == MetadataCommandApplyTestKind::CommitMultipartObject
+                && context.bucket.as_ref() == Some(&hook_bucket)
+                && context.key.as_ref() == Some(&hook_key)
+            {
+                gate_for_hook.wait_at(TOKEN);
+            }
+            Ok(())
+        }));
+
+    let complete_coord = Arc::clone(&coord);
+    let complete_thread = thread::spawn(move || {
+        complete_coord.complete_multipart_upload(&CompleteMultipartUploadRequest {
+            upload: multipart_object_request_with_expected_owner(
+                bucket,
+                key,
+                &upload_id,
+                test_requester(),
+                None,
+            ),
+            parts: &parts,
+            claimed_checksum: None,
+            expected_object_size: None,
+            cond: &WriteCondition::default(),
+            sse_customer: None,
+        })
+    });
+
+    gate.wait_until_arrived(TEST_EVENT_TIMEOUT);
+    let paused_object_pg_proof = initial
+        .test_object_pg_metadata_proof(&bucket_name, &object_key)
+        .unwrap();
+    assert_eq!(
+        paused_object_pg_proof.applied_log_index, before_object_pg_proof.applied_log_index,
+        "multipart completion should not apply an object-PG command before the pre-commit gate"
+    );
+
+    install_next_epoch_runtime_map_with_historical_routes(&handle, &initial, tmp.path());
+
+    gate.release();
+    let complete_result = complete_thread.join().unwrap().unwrap();
+    assert_eq!(complete_result.version_id, VersionId::Null);
+    let after_object_pg_proof = initial
+        .test_object_pg_metadata_proof(&bucket_name, &object_key)
+        .unwrap();
+    assert_eq!(
+        after_object_pg_proof.applied_log_index,
+        paused_object_pg_proof.applied_log_index + 1,
+        "multipart completion crossing an epoch change should append exactly one commit command after the gate"
+    );
+    assert_ne!(
+        after_object_pg_proof.applied_log_hash, before_object_pg_proof.applied_log_hash,
+        "multipart completion command should change the object-PG command-log hash"
+    );
+    assert_ne!(
+        after_object_pg_proof.state_digest, before_object_pg_proof.state_digest,
+        "multipart completion command should change the object-PG materialized state digest"
+    );
+
+    let result = coord
+        .get_object(&GetObjectRequest {
+            sse_customer: None,
+            object: object_version_request_with_expected_owner(
+                bucket,
+                key,
+                None,
+                test_requester(),
+                None,
+            ),
+            cond: NO_READ,
+        })
+        .unwrap();
+    assert_eq!(result.body.read_all().unwrap(), b"multipart-crosses-epoch");
+}
+
+#[test]
 fn get_object_epoch_change_after_read_snapshot_uses_pinned_route() {
     let bucket = "get-epoch-change-bucket";
     let key = "key";
@@ -1702,7 +1814,8 @@ fn head_object_epoch_change_after_read_snapshot_uses_pinned_route() {
 }
 
 #[test]
-fn get_uses_retained_payload_route_over_unix_after_data_pg_move_and_head_stays_available() {
+fn get_uses_retained_payload_route_over_unix_after_data_pg_move_and_metadata_reads_stay_available()
+{
     let tmp = test_util::tempdir();
     let old_acting_set = vec![NodeId::new(0), NodeId::new(1), NodeId::new(2)];
     let moved_acting_set = vec![NodeId::new(3), NodeId::new(4), NodeId::new(5)];
@@ -1888,6 +2001,23 @@ fn get_uses_retained_payload_route_over_unix_after_data_pg_move_and_head_stays_a
         })
         .unwrap();
     assert_eq!(head.size, payload.len() as u64);
+    let listed = coord
+        .list_objects_v2(&ListObjectsV2Request {
+            bucket: bucket_request_with_expected_owner(&bucket, test_requester(), None),
+            prefix: None,
+            delimiter: None,
+            continuation_token: None,
+            max_keys: 1000,
+            requested_max_keys: Some(1000),
+        })
+        .unwrap();
+    let listed_keys = listed
+        .objects
+        .iter()
+        .map(|object| object.key.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(listed_keys, [key.as_str()]);
+    assert!(!listed.is_truncated);
 
     stop_storage_node_server_loops(stop, &wake_socket_paths, server_threads);
 }
