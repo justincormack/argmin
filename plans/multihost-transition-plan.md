@@ -8482,9 +8482,11 @@ Metadata PG migration and backfill design notes:
   route remains pinned through body construction. LIST now captures one storage
   map for authorization and object listing, with a regression that swaps the
   current handle to an empty next-epoch map immediately before the storage-list
-  call and still expects a complete sorted page. This pins the local
-  in-process/pinned-route behavior before adding HEAD, stricter stale-primary,
-  and remote storage-node fault-injection cases.
+  call and still expects a complete sorted page. HEAD now uses the same
+  after-read-snapshot gate as GET, proving metadata-only reads keep the
+  authorized object snapshot across a current-map swap. This pins the local
+  in-process/pinned-route behavior before adding stricter stale-primary and
+  remote storage-node fault-injection cases.
 
 Exit criteria:
 

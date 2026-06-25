@@ -1601,6 +1601,80 @@ fn get_object_epoch_change_after_read_snapshot_uses_pinned_route() {
 }
 
 #[test]
+fn head_object_epoch_change_after_read_snapshot_uses_pinned_route() {
+    let bucket = "head-epoch-change-bucket";
+    let key = "key";
+    let tmp = test_util::tempdir();
+    let initial = open_test_storage_cluster(tmp.path(), &[0, 1]);
+    let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&initial));
+    let coord =
+        Coordinator::new_with_managed_key_provider_for_storage_cluster_runtime_map_handle_with_background_worker_mode(
+            handle.clone(),
+            "us-east-1".to_string(),
+            None,
+            test_sse_s3_provider(),
+            BackgroundWorkerMode::none(),
+        )
+        .unwrap();
+    coord
+        .create_bucket_for_owner("default-owner", bucket, false)
+        .unwrap();
+
+    let metadata = MetadataBlob::new();
+    test_helpers::put_object(
+        &coord,
+        &PutObjectRequest {
+            encryption: WriteEncryptionRequest::none(),
+            policy_context: PutObjectPolicyContext::default(),
+            object_lock: ObjectLockState::default(),
+            object: object_request_with_expected_owner(bucket, key, test_requester(), None),
+            data: b"head-crosses-epoch-change",
+            metadata: &metadata,
+            system_metadata: &SystemMetadata::EMPTY,
+            tags: None,
+            cond: NO_WRITE,
+            acl: NO_PUT_OBJECT_ACL.into(),
+        },
+    )
+    .unwrap();
+
+    let hook_handle = handle.clone();
+    let hook_initial = Arc::clone(&initial);
+    let hook_node_root = tmp.path().to_path_buf();
+    let _serial = RECLAMATION_TEST_SERIAL
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap();
+    let _hook_guard = install_reclamation_test_hooks(ReclamationTestHooks {
+        target: Some((bucket.to_string(), key.to_string())),
+        after_object_read_snapshot: Some(Arc::new(move || {
+            install_next_epoch_runtime_map_with_historical_routes(
+                &hook_handle,
+                &hook_initial,
+                &hook_node_root,
+            );
+        })),
+        ..ReclamationTestHooks::default()
+    });
+
+    let result = coord
+        .head_object(&GetObjectRequest {
+            sse_customer: None,
+            object: object_version_request_with_expected_owner(
+                bucket,
+                key,
+                None,
+                test_requester(),
+                None,
+            ),
+            cond: NO_READ,
+        })
+        .unwrap();
+    assert_eq!(result.size, b"head-crosses-epoch-change".len() as u64);
+    assert_eq!(result.version_id, VersionId::Null);
+}
+
+#[test]
 fn list_objects_epoch_change_before_storage_list_uses_pinned_route() {
     let bucket = "list-epoch-change-bucket";
     let tmp = test_util::tempdir();

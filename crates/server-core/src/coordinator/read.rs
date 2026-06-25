@@ -594,6 +594,8 @@ impl Coordinator {
             multipart_parts: _,
             multipart_part_segments: _,
         } = snapshot;
+        #[cfg(test)]
+        maybe_run_object_read_snapshot_hook(bucket, key);
 
         let record = match stored {
             StoredObject::Live(r) => r,
