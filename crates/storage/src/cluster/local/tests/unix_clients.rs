@@ -3197,6 +3197,196 @@ fn direct_put_publishes_after_remote_shard_io_and_ack_validation() {
 }
 
 #[test]
+fn non_current_epoch_unix_direct_put_commit_fails_closed_and_cleans_remote_state() {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let pg_ids = [0, 1, 2, 3];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let current_epoch = ClusterEpoch::INITIAL;
+    let stale_epoch = ClusterEpoch::new(current_epoch.get() + 1).unwrap();
+    let mut map =
+        LocalClusterMap::open(&tmp.path().join("frontend"), &node_ids, &pg_ids, ec_shape).unwrap();
+    for pg_id in pg_ids {
+        set_route_primary(&mut map, pg_id, NodeId::new(0));
+    }
+    let (bucket, key, object_pg, _data_pg) = {
+        let topology = map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        bucket_key_with_distinct_object_and_data_pg(topology)
+    };
+
+    let mut server_configs = Vec::new();
+    let mut client_configs = Vec::new();
+    for node_id in node_ids {
+        let socket_path = tmp
+            .path()
+            .join("sockets")
+            .join(format!("stale-direct-put-node-{}.sock", node_id.as_u32()));
+        private_socket_dir(socket_path.parent().unwrap());
+        let pg_routes = pg_ids
+            .iter()
+            .map(|pg_id| StorageNodePgRoute {
+                pg_id: *pg_id,
+                cluster_epoch: current_epoch,
+                state: PgState::Active,
+                primary_node_id: NodeId::new(0),
+                acting_set: node_ids.to_vec(),
+            })
+            .collect();
+        server_configs.push(StorageNodeProcessConfig {
+            node_id,
+            cluster_epoch: current_epoch,
+            route_map_valid_until_ms: None,
+            data_dir: tmp
+                .path()
+                .join(format!("remote-stale-direct-put-{}", node_id.as_u32())),
+            default_ec_shape: ec_shape,
+            pg_ids: pg_ids.to_vec(),
+            socket_path: socket_path.clone(),
+            pg_routes,
+            historical_pg_routes: Vec::new(),
+        });
+        client_configs.push(LocalUnixStorageNodeClientConfig::new(node_id, socket_path));
+    }
+    for config in server_configs.iter().cloned() {
+        let server = StorageNodeServer::bind(config).unwrap();
+        let _server_thread = thread::spawn(move || server.serve_forever().unwrap());
+    }
+    map.install_unix_storage_node_clients(client_configs)
+        .unwrap();
+    let map = Arc::new(map);
+    let current_cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    create_test_bucket(&current_cluster, &bucket);
+
+    let reservation_id =
+        crate::SessionId::try_from("56565656565656565656565656565656".to_string()).unwrap();
+    let generation_id = current_cluster
+        .reserve_put_object_generation(&bucket, &key, &reservation_id)
+        .unwrap();
+    let before_object_pg_proof = current_cluster
+        .test_object_pg_metadata_proof(&bucket, &key)
+        .unwrap();
+    let payload = b"stale epoch remote direct put";
+    let segment_okh = [0xc4; 16];
+    let written = current_cluster
+        .write_direct_put_segment_payload_shards(
+            &bucket,
+            &key,
+            generation_id,
+            0,
+            &segment_okh,
+            payload,
+        )
+        .unwrap();
+    let commit_req = direct_put_commit_req(
+        &current_cluster,
+        DirectPutCommitReqFixture {
+            bucket: &bucket,
+            key: &key,
+            reservation_id,
+            generation_id,
+            payload,
+            segment_okh,
+            written: &written,
+        },
+    );
+    let stale_cluster =
+        crate::StorageCluster::test_from_local_map_with_epoch(Arc::clone(&map), stale_epoch)
+            .unwrap();
+
+    let err = stale_cluster
+        .commit_direct_put_object_from_payload_shards(&commit_req, &written.written_shards, |_| {
+            Ok::<(), ()>(())
+        })
+        .unwrap_err();
+    // The stale operation epoch is rejected by local route validation before
+    // the direct-put command-build RPC. The remote assertions below prove that
+    // cleanup still uses the proof/current placement epoch through Unix clients.
+    assert!(
+        matches!(
+            err,
+            crate::ObjectPgActionError::Store(StoreError::StaleMetadataOperation {
+                pg_id,
+                operation_epoch,
+                current_epoch: observed_current_epoch,
+            }) if pg_id == object_pg
+                && operation_epoch == stale_epoch
+                && observed_current_epoch == current_epoch
+        ),
+        "stale Unix direct PUT commit should fail closed before command build, got {err:?}"
+    );
+
+    let after_object_pg_proof = current_cluster
+        .test_object_pg_metadata_proof(&bucket, &key)
+        .unwrap();
+    assert_eq!(
+        after_object_pg_proof, before_object_pg_proof,
+        "stale Unix direct PUT commit must not append an object-PG command"
+    );
+    let remote_primary_config = server_configs
+        .iter()
+        .find(|config| config.node_id == NodeId::new(0))
+        .unwrap();
+    let remote_primary = SharedStorageNode::open_with_default_ec_shape(
+        &remote_primary_config.data_dir,
+        &remote_primary_config.pg_ids,
+        remote_primary_config.default_ec_shape,
+    )
+    .unwrap();
+    let remote_object_pg = remote_primary.get_pg(object_pg).unwrap();
+    assert!(
+        matches!(
+            crate::PgMetadataStore::get_object_meta(&*remote_object_pg, &bucket, &key),
+            Err(crate::MetadataError::ObjectNotFound)
+        ),
+        "stale Unix direct PUT must not publish object metadata"
+    );
+    let remote_bucket_pg = remote_primary
+        .get_pg(current_cluster.test_bucket_pg_id_for(&bucket))
+        .unwrap();
+    assert!(
+        crate::PgMetadataStore::durable_bucket_write_reservations(&*remote_bucket_pg, &bucket)
+            .unwrap()
+            .is_empty(),
+        "stale Unix direct PUT cleanup must release caller-owned bucket write proof"
+    );
+
+    for written_shard in &written.written_shards {
+        for config in &server_configs {
+            let remote = SharedStorageNode::open_with_default_ec_shape(
+                &config.data_dir,
+                &config.pg_ids,
+                config.default_ec_shape,
+            )
+            .unwrap();
+            assert!(
+                matches!(
+                    remote.read_shard_file(written.data_pg_id, &written_shard.key),
+                    Err(StoreError::NotFound)
+                ),
+                "stale Unix direct PUT cleanup must delete shard {} from node {}",
+                written_shard.key,
+                config.node_id.as_u32()
+            );
+        }
+    }
+    let remote_data_pg = remote_primary.get_pg(written.data_pg_id).unwrap();
+    for written_shard in &written.written_shards {
+        assert!(
+            matches!(
+                remote_data_pg.validate_written_shard_ack(&written_shard.key, written_shard.ack),
+                Err(StoreError::NotFound)
+            ),
+            "stale Unix direct PUT cleanup must delete remote ack for shard {}",
+            written_shard.key
+        );
+    }
+}
+
+#[test]
 fn historical_payload_shard_inspection_can_route_to_unix_storage_node_client() {
     let tmp = test_util::tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];

@@ -8495,7 +8495,13 @@ Metadata PG migration and backfill design notes:
   metadata on any acting node, release the caller-owned bucket write proof, and
   clean the unowned payload shards. This pins the cleanup and fail-closed
   behavior needed by stale-primary handling before the full older-epoch peering
-  transition is modeled through control-plane/runtime-map machinery.
+  transition is modeled through control-plane/runtime-map machinery. The same
+  direct PUT stale-epoch publish shape now has a remote Unix storage-node
+  cleanup regression: payload writes, shard acknowledgements, bucket-write
+  proof release, and payload cleanup all route through Unix clients. The stale
+  operation is rejected by local route validation before the command-build RPC,
+  and the regression verifies that no remote object metadata, proof, shard file,
+  or ack row is left behind.
 
 Exit criteria:
 
