@@ -1,0 +1,75 @@
+Header-signed SigV4 requests do not validate the request timestamp against server time
+Link: https://chatgpt.com/codex/cloud/security/findings/argmin-security-review-2026-06-23-m3
+Criticality: medium (attack path: low)
+Status: fixed
+
+# Resolution
+Fixed in 27b63113ab8f9031a0918be904478a8b9d0c1988.
+
+The fix moved the header-signed SigV4 clock-skew invariant into the auth layer. `authenticate_header` now parses `x-amz-date` and rejects requests whose timestamp is more than `auth::SIGV4_CLOCK_SKEW_SECS` from `now_epoch_secs`, returning `AuthError::RequestExpired`. The HTTP-layer `enforce_sigv4_time_skew` check remains as an early rejection path and now uses the same shared skew constant.
+
+Regression coverage was added for past skew, future skew, exact boundary acceptance, and the important case that `now_epoch_secs == 0` is not accepted as a test-only bypass for header SigV4 request skew. Existing HTTP-facing date-skew tests continue to validate the S3 response behavior.
+
+# Metadata
+Repo: justincormack/argmin
+Commit: 632837a
+Author: security-review
+Created: 23/06/2026, 15:30:00
+Assignee: Unassigned
+Signals: Security, Validated, Auth-bypass-adjacent
+
+# Summary
+`authenticate_header` (`crates/auth/src/request.rs:267-307`) parses `x-amz-date` into `request_epoch_secs` and stores it on the `AuthContext`, but never compares it against `now_epoch_secs`. The only time-bound check for the request is the credential's own `expires_at_epoch_secs` (if any), enforced by `validate_record_token_and_expiry` (`crates/auth/src/request.rs:541-578`). In contrast, `authenticate_presigned` (`crates/auth/src/request.rs:437-439`) enforces `now_epoch_secs > request_epoch + expires`. The asymmetry means a header-signed request with a forged `x-amz-date` days or years in the past is accepted as long as the underlying IAM credential is still valid. The signing key is per-date (the SigV4 `k_date` HMAC step), so the attacker would need a matching date in the credential scope; this is feasible because the credential scope is part of the wire format and the attacker's `x-amz-date` matches the credential's `date` component (enforced by `amz_date_matches_date_stamp`). The window of validity is therefore bounded by the credential's `expires_at_epoch_secs`, not by the request time. AWS itself rejects requests outside ±5 minutes (sometimes ±15 minutes) of server time. The lack of an analogous check is a defence-in-depth miss and an interop deviation: S3 SDKs may sign requests with `x-amz-date` matching local time, and a local clock drift that the server cannot detect would cause replay-style issues during credential rotation.
+
+# Validation
+## Rubric
+- [x] Confirm `authenticate_header` computes `request_epoch_secs` and never compares it against `now_epoch_secs`.
+- [x] Confirm `authenticate_presigned` enforces `now_epoch_secs > request_epoch + expires`.
+- [x] Confirm AWS S3 rejects header-signed requests outside the documented clock-skew window.
+- [x] Add a regression that signs a request with `x-amz-date` 24 hours in the past and verifies the server rejects it.
+## Report
+Tracing `authenticate_request` -> `authenticate_header` -> `verify_request_record` -> back to `authenticate_header` -> `validate_record_token_and_expiry` confirmed the request time was parsed but not validated. The presigned path at `crates/auth/src/request.rs:421-439` already did the comparison; the header path at `crates/auth/src/request.rs:281-307` did not.
+
+After 27b63113ab8f9031a0918be904478a8b9d0c1988, the header path performs the skew comparison before signature verification and rejects stale or future-dated header-signed SigV4 requests with `AuthError::RequestExpired`.
+
+# Evidence
+crates/auth/src/request.rs (L281 to 308)
+  Note: `request_epoch_secs` is parsed from `x-amz-date` and stored, but never compared against `now_epoch_secs`.
+```
+    let body_hash = match headers.first_value("x-amz-content-sha256") {
+        Some("UNSIGNED-PAYLOAD") => Cow::Borrowed("UNSIGNED-PAYLOAD"),
+        Some(hash) => Cow::Borrowed(hash),
+        None => Cow::Owned(sha256_hex(body)),
+    };
+    let record = verify_request_record(
+        method,
+        path,
+        query_string,
+        headers,
+        body_hash.as_ref(),
+        &parsed,
+        store,
+    )?;
+
+    validate_record_token_and_expiry(
+        record,
+        headers.first_value("x-amz-security-token"),
+        now_epoch_secs,
+    )?;
+
+    let request_epoch_secs = headers.first_value("x-amz-date").and_then(parse_amz_date);
+    let crate::sigv4::SigV4Auth {
+```
+
+crates/auth/src/request.rs (L430 to 440)
+  Note: The presigned path validates the request timestamp against `now_epoch_secs + expires`.
+```
+    if expires > 604_800 {
+        return Err(AuthError::InvalidQueryParam {
+            param: "X-Amz-Expires",
+        });
+    }
+    if expires == 0 || now_epoch_secs > request_epoch.saturating_add(expires) {
+        return Err(AuthError::RequestExpired);
+    }
+```
