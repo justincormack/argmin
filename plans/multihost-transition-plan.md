@@ -8610,6 +8610,12 @@ Metadata PG migration and backfill design notes:
   the representative shared metadata command shape: the old primary fails
   closed, appends no object-PG command, preserves the live object, publishes no
   tags, leaves no source/current pending command, and leaks no reservation.
+  The tag-style metadata mutation shape now also has Unix storage-node coverage
+  after a real control-plane Peering transition: remote source-epoch object
+  metadata remains unchanged after the storage-node servers refresh to the
+  current Peering epoch with historical routes retained, and the old-primary
+  frontend cannot append a remote object-PG command, publish tags, leave
+  pending source/current commands, or leak bucket-write reservations.
   Multipart completion now has the same control-plane-driven Peering shape: a
   staged multipart upload survives the old-primary completion attempt without
   publishing object metadata or completed-upload state, without mutating the

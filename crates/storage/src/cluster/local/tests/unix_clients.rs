@@ -4062,6 +4062,307 @@ fn control_plane_peering_unix_object_delete_old_primary_fails_closed_without_rem
 }
 
 #[test]
+fn control_plane_peering_unix_object_metadata_old_primary_fails_closed_without_remote_mutation() {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let pg_ids = [0, 1, 2, 3];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let mut authority = crate::control_plane::SingleAuthorityControlPlane::open(
+        crate::control_plane::FileControlPlaneStore::new(tmp.path().join("control-plane.state")),
+    )
+    .unwrap();
+    authority
+        .bootstrap_initial_cluster_map(
+            node_ids
+                .iter()
+                .map(|node_id| {
+                    (
+                        *node_id,
+                        tmp.path()
+                            .join("control-plane-sockets")
+                            .join(format!("metadata-node-{}.sock", node_id.as_u32()))
+                            .to_string_lossy()
+                            .into_owned(),
+                    )
+                })
+                .collect(),
+            pg_ids.iter().copied().map(PgId::new).collect(),
+        )
+        .unwrap();
+    let source_epoch = authority.snapshot().cluster_epoch();
+    let source_routes = pg_ids
+        .iter()
+        .map(|pg_id| {
+            let route = authority
+                .snapshot()
+                .reconstructed_pg_route_at_epoch(PgId::new(*pg_id), source_epoch)
+                .unwrap();
+            crate::control_plane::PgRouteSnapshot::reconstructed(
+                route.cluster_epoch(),
+                route.pg_id(),
+                route.primary_node_id(),
+                route.acting_set().to_vec(),
+                PgState::Active,
+            )
+        })
+        .collect::<Vec<_>>();
+
+    let source_storage_configs = node_ids
+        .iter()
+        .map(|node_id| {
+            LocalNodeStoreConfig::new(
+                *node_id,
+                tmp.path()
+                    .join("remote-peering-stale-metadata")
+                    .join(format!("node-{:04}", node_id.as_u32())),
+            )
+        })
+        .collect::<Vec<_>>();
+    let source_map = Arc::new(
+        LocalClusterMap::open_frontend_with_configs_and_pg_routes(
+            NodeId::new(0),
+            source_storage_configs.clone(),
+            &pg_ids,
+            ec_shape,
+            source_epoch,
+            source_routes.iter().map(LocalPgRoute::from),
+        )
+        .unwrap(),
+    );
+    let (bucket, key, object_pg, _data_pg) = {
+        let topology = source_map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        bucket_key_with_distinct_object_and_data_pg(topology)
+    };
+    let source_cluster = crate::StorageCluster::from_local_map(Arc::clone(&source_map)).unwrap();
+    let committed = write_committed_direct_segment_for(
+        &source_cluster,
+        &bucket,
+        &key,
+        b"control-plane peering stale unix metadata",
+    );
+    let before_object_pg_proof = source_cluster
+        .test_object_pg_metadata_proof(&bucket, &key)
+        .unwrap();
+    drop(source_cluster);
+    drop(source_map);
+
+    authority
+        .set_pg_acting_set(PgId::new(object_pg), vec![NodeId::new(1), NodeId::new(2)])
+        .unwrap();
+    let current_epoch = authority.snapshot().cluster_epoch();
+    let current_routes = pg_ids
+        .iter()
+        .map(|pg_id| {
+            let route = authority
+                .snapshot()
+                .reconstructed_pg_route_at_epoch(PgId::new(*pg_id), current_epoch)
+                .unwrap();
+            let state = if *pg_id == object_pg {
+                PgState::Peering
+            } else {
+                PgState::Active
+            };
+            crate::control_plane::PgRouteSnapshot::reconstructed(
+                route.cluster_epoch(),
+                route.pg_id(),
+                route.primary_node_id(),
+                route.acting_set().to_vec(),
+                state,
+            )
+        })
+        .collect::<Vec<_>>();
+    let historical_pg_routes = source_routes
+        .iter()
+        .map(|route| StorageNodePgRoute {
+            pg_id: route.pg_id().get(),
+            cluster_epoch: route.cluster_epoch(),
+            state: route.state(),
+            primary_node_id: route.primary_node_id(),
+            acting_set: route.acting_set().to_vec(),
+        })
+        .collect::<Vec<_>>();
+    let current_pg_routes = current_routes
+        .iter()
+        .map(|route| StorageNodePgRoute {
+            pg_id: route.pg_id().get(),
+            cluster_epoch: route.cluster_epoch(),
+            state: route.state(),
+            primary_node_id: route.primary_node_id(),
+            acting_set: route.acting_set().to_vec(),
+        })
+        .collect::<Vec<_>>();
+    let mut server_configs = Vec::new();
+    let mut client_configs = Vec::new();
+    for node_config in &source_storage_configs {
+        let socket_path = tmp.path().join("sockets").join(format!(
+            "peering-stale-metadata-node-{}.sock",
+            node_config.node_id.as_u32()
+        ));
+        private_socket_dir(socket_path.parent().unwrap());
+        server_configs.push(StorageNodeProcessConfig {
+            node_id: node_config.node_id,
+            cluster_epoch: current_epoch,
+            route_map_valid_until_ms: None,
+            data_dir: node_config.data_dir.clone(),
+            default_ec_shape: ec_shape,
+            pg_ids: pg_ids.to_vec(),
+            socket_path: socket_path.clone(),
+            pg_routes: current_pg_routes.clone(),
+            historical_pg_routes: historical_pg_routes.clone(),
+        });
+        client_configs.push(LocalUnixStorageNodeClientConfig::new(
+            node_config.node_id,
+            socket_path,
+        ));
+    }
+    for config in server_configs.iter().cloned() {
+        let server = StorageNodeServer::bind(config).unwrap();
+        let _server_thread = thread::spawn(move || server.serve_forever().unwrap());
+    }
+
+    let frontend_configs = node_ids
+        .iter()
+        .map(|node_id| {
+            LocalNodeStoreConfig::new(
+                *node_id,
+                tmp.path()
+                    .join("frontend-peering-stale-metadata")
+                    .join(format!("node-{:04}", node_id.as_u32())),
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut current_map = LocalClusterMap::open_frontend_with_configs_and_pg_routes(
+        NodeId::new(0),
+        frontend_configs,
+        &pg_ids,
+        ec_shape,
+        current_epoch,
+        current_routes.iter().map(LocalPgRoute::from),
+    )
+    .unwrap();
+    current_map.test_install_historical_pg_routes(source_routes);
+    current_map
+        .install_unix_storage_node_clients(client_configs)
+        .unwrap();
+    let current_map = Arc::new(current_map);
+    assert_eq!(
+        current_map.pg_route(PgId::new(object_pg)).unwrap().state(),
+        PgState::Peering,
+        "control-plane acting-set change should put the object PG into Peering"
+    );
+    assert!(
+        !current_map
+            .pg_route(PgId::new(object_pg))
+            .unwrap()
+            .acting_set()
+            .contains(&NodeId::new(0)),
+        "the old source primary should no longer be in the current acting set"
+    );
+
+    let old_primary_cluster = crate::StorageCluster::test_from_local_map_with_epoch(
+        Arc::clone(&current_map),
+        source_epoch,
+    )
+    .unwrap();
+    let tags =
+        "<Tagging><TagSet><Tag><Key>stale</Key><Value>ignored</Value></Tag></TagSet></Tagging>";
+    let err = old_primary_cluster
+        .put_object_tags_if(&bucket, &key, None, tags, |stored| {
+            Ok::<_, ()>(stored.version_id())
+        })
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            crate::ObjectPgActionError::Store(StoreError::StaleMetadataOperation {
+                pg_id,
+                operation_epoch,
+                current_epoch: observed_current_epoch,
+            }) if pg_id == object_pg
+                && operation_epoch == source_epoch
+                && observed_current_epoch == current_epoch
+        ),
+        "old-primary Unix object metadata update should fail closed after control-plane Peering transition, got {err:?}"
+    );
+
+    let bucket_pg = current_map
+        .node(NodeId::new(0))
+        .unwrap()
+        .storage_node()
+        .pg_topology()
+        .bucket_pg_for(&bucket);
+    for config in &server_configs {
+        let remote = SharedStorageNode::open_with_default_ec_shape(
+            &config.data_dir,
+            &config.pg_ids,
+            config.default_ec_shape,
+        )
+        .unwrap();
+        let object_pg_store = remote.get_pg(object_pg).unwrap();
+        let state = object_pg_store.metadata_command_replica_state().unwrap();
+        let proof = crate::control_plane::PgMetadataProof::new(
+            state.applied_log_index,
+            state.applied_log_hash,
+            state.state_digest,
+        );
+        assert_eq!(
+            proof, before_object_pg_proof,
+            "old-primary Unix object metadata update must not append an object-PG command on node {:?}",
+            config.node_id
+        );
+        let stored = crate::PgMetadataStore::get_object_meta(&*object_pg_store, &bucket, &key)
+            .unwrap()
+            .into_live()
+            .unwrap();
+        assert_eq!(
+            stored.generation_id, committed.generation_id,
+            "old-primary Unix object metadata update must preserve the live object on node {:?}",
+            config.node_id
+        );
+        assert_eq!(
+            crate::PgMetadataStore::get_object_tags(
+                &*object_pg_store,
+                &bucket,
+                &key,
+                crate::VersionId::Null,
+            )
+            .unwrap(),
+            None,
+            "old-primary Unix object metadata update must not publish tags on node {:?}",
+            config.node_id
+        );
+        assert!(
+            object_pg_store
+                .pending_metadata_command_envelope(config.node_id.as_u32(), source_epoch)
+                .unwrap()
+                .is_none(),
+            "old-primary Unix object metadata update must not leave a source-epoch pending command on node {:?}",
+            config.node_id
+        );
+        assert!(
+            object_pg_store
+                .pending_metadata_command_envelope(config.node_id.as_u32(), current_epoch)
+                .unwrap()
+                .is_none(),
+            "old-primary Unix object metadata update must not leave a current-epoch pending command on node {:?}",
+            config.node_id
+        );
+        let bucket_pg_store = remote.get_pg(bucket_pg).unwrap();
+        assert!(
+            crate::PgMetadataStore::durable_bucket_write_reservations(&*bucket_pg_store, &bucket,)
+                .unwrap()
+                .is_empty(),
+            "old-primary Unix object metadata update must leave no bucket-write reservation on node {:?}",
+            config.node_id
+        );
+    }
+}
+
+#[test]
 fn non_current_epoch_unix_stream_append_commit_fails_closed_and_cleans_remote_state() {
     let tmp = test_util::tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
