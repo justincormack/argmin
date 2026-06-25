@@ -8501,7 +8501,11 @@ Metadata PG migration and backfill design notes:
   proof release, and payload cleanup all route through Unix clients. The stale
   operation is rejected by local route validation before the command-build RPC,
   and the regression verifies that no remote object metadata, proof, shard file,
-  or ack row is left behind.
+  or ack row is left behind. The stale-primary/fail-closed slice now also covers
+  unversioned DELETE through a non-current operation-epoch handle: the delete
+  must fail at the metadata-primary epoch boundary, append no object-PG command,
+  leave the live object and reclaim metadata unchanged on every acting node, and
+  leave no pending command or bucket-write reservation behind.
 
 Exit criteria:
 

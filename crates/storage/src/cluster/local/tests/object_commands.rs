@@ -60,6 +60,85 @@ fn object_delete_metadata_command_applies_to_all_acting_object_pg_nodes() {
 }
 
 #[test]
+fn non_current_epoch_object_delete_fails_closed_without_mutation() {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let pg_ids = [0, 1, 2, 3];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let current_epoch = ClusterEpoch::INITIAL;
+    let stale_epoch = ClusterEpoch::new(current_epoch.get() + 1).unwrap();
+    let mut local_map = LocalClusterMap::open(tmp.path(), &node_ids, &pg_ids, ec_shape).unwrap();
+    let (bucket, key, object_pg, data_pg) = {
+        let topology = local_map
+            .nodes
+            .get(&NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        bucket_key_with_distinct_object_and_data_pg(topology)
+    };
+    set_route_primary(&mut local_map, object_pg, NodeId::new(1));
+    set_route_primary(&mut local_map, data_pg, NodeId::new(2));
+
+    let map = Arc::new(local_map);
+    let current_cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let committed =
+        write_committed_direct_segment_for(&current_cluster, &bucket, &key, b"stale delete");
+    let before_object_pg_proof = current_cluster
+        .test_object_pg_metadata_proof(&bucket, &key)
+        .unwrap();
+    let stale_cluster =
+        crate::StorageCluster::test_from_local_map_with_epoch(Arc::clone(&map), stale_epoch)
+            .unwrap();
+
+    let err = stale_cluster
+        .delete_current_object_if(&bucket, &key, |_| Ok::<(), ()>(()))
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            crate::ObjectPgActionError::Store(StoreError::StaleMetadataOperation {
+                pg_id,
+                operation_epoch,
+                current_epoch: observed_current_epoch,
+            }) if pg_id == object_pg
+                && operation_epoch == stale_epoch
+                && observed_current_epoch == current_epoch
+        ),
+        "stale object delete should fail closed at the metadata-primary boundary, got {err:?}"
+    );
+
+    let after_object_pg_proof = current_cluster
+        .test_object_pg_metadata_proof(&bucket, &key)
+        .unwrap();
+    assert_eq!(
+        after_object_pg_proof, before_object_pg_proof,
+        "stale object delete must not append an object-PG command"
+    );
+    assert!(pending_metadata_command_for_test(&map, PgId::new(object_pg), &bucket).is_none());
+    for node_id in node_ids {
+        let node = map.node(node_id).unwrap().storage_node();
+        let pg = node.get_pg(object_pg).unwrap();
+        let stored = crate::PgMetadataStore::get_object_meta(&*pg, &bucket, &key)
+            .unwrap()
+            .into_live()
+            .unwrap();
+        assert_eq!(stored.generation_id, committed.generation_id);
+        assert!(
+            !crate::PgMetadataStore::payload_reclaim_exists(
+                &*pg,
+                &bucket,
+                &key,
+                committed.generation_id
+            )
+            .unwrap(),
+            "stale object delete must not publish reclaim metadata on node {node_id:?}"
+        );
+    }
+    assert_bucket_write_reservations_released(&map, &bucket);
+}
+
+#[test]
 fn object_delete_metadata_command_retry_reuses_pending_partial_replica_command() {
     let tmp = test_util::tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
