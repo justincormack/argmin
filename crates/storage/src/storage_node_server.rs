@@ -10112,8 +10112,8 @@ fn validate_socket_directory(socket_path: &Path) -> Result<(), StorageNodeServer
         path: parent.to_path_buf(),
         source,
     })?;
-    let mode = metadata.permissions().mode() & 0o777;
-    if !metadata.is_dir() || mode & 0o077 != 0 {
+    let mode = metadata.permissions().mode() & 0o7777;
+    if !metadata.is_dir() || mode != 0o700 {
         return Err(StorageNodeServerError::SocketDirectoryNotPrivate {
             path: parent.to_path_buf(),
             mode,
@@ -12078,6 +12078,29 @@ mod tests {
             err,
             StorageNodeServerError::SocketDirectoryNotPrivate { .. }
         ));
+    }
+
+    #[test]
+    fn storage_node_server_rejects_special_mode_socket_directory() {
+        let tmp = test_util::tempdir();
+        let config = test_config(&tmp);
+        fs::create_dir_all(config.socket_path.parent().unwrap()).unwrap();
+        fs::set_permissions(
+            config.socket_path.parent().unwrap(),
+            fs::Permissions::from_mode(0o2700),
+        )
+        .unwrap();
+
+        let err = bind_error(config.clone());
+
+        assert!(matches!(
+            err,
+            StorageNodeServerError::SocketDirectoryNotPrivate { mode: 0o2700, .. }
+        ));
+        let _ = fs::set_permissions(
+            config.socket_path.parent().unwrap(),
+            fs::Permissions::from_mode(0o700),
+        );
     }
 
     #[test]
