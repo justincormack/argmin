@@ -1,0 +1,74 @@
+Responses do not set X-Content-Type-Options or other browser-side security headers
+Link: https://chatgpt.com/codex/cloud/security/findings/argmin-security-review-2026-06-23-l1
+Criticality: low (attack path: low)
+Status: accepted-risk
+
+# Resolution
+Accepted as a deliberate AWS-compatibility boundary. AWS S3 does not set
+`X-Content-Type-Options: nosniff`, `Referrer-Policy`, or other browser-side
+security headers on its responses; the S3 API surface treats object content
+type as user-controlled metadata and leaves the browser-side hardening
+expectation to the bucket owner (e.g. via a CloudFront or Lambda@Edge
+function, or via storing the right `Content-Type` on each object). The threat
+model already documents that "we are building a server that must exactly
+match AWS S3 behaviour at all times. Do not work around this, always fix
+non conforming behaviour." Adding a response header that AWS itself does not
+send would be a deliberate deviation, not a fix, and would risk breaking
+S3-compatibility test suites and downstream SDKs that expect the documented
+AWS response shape.
+
+The defence is still available to operators without a code change: bucket
+owners who want `X-Content-Type-Options: nosniff` (or any other response
+header) on a per-object basis can store it as user metadata that
+`apply_user_metadata_headers` will echo back, or front the server with a
+proxy/CDN that injects the header. This finding is filed so the gap stays
+visible in the inventory and so the rationale for not adding it stays
+documented alongside the other accepted boundaries.
+
+# Metadata
+Repo: justincormack/argmin
+Commit: 632837a
+Author: security-review
+Created: 23/06/2026, 15:30:00
+Assignee: Unassigned
+Signals: Security, Hardening, Accepted
+
+# Summary
+`s3_response_to_hyper` (`crates/server-http/src/http/mod.rs:4635-4810`) and the streaming response builders in `crates/server-http/src/http/response.rs` do not set any browser-side security headers. The `Content-Type` header on `GetObject` responses is taken from the stored object metadata (`crates/server-http/src/http/response.rs:847-870`), so a user uploading a `text/html` object will have that content type served back on GET. Without `X-Content-Type-Options: nosniff`, a browser can MIME-sniff a binary upload whose stored content type is permissive and execute it as HTML/JS. AWS S3 does not set this header on its responses; the convention is that bucket owners add the header themselves when they care, either by storing it as user metadata on each object, by a CloudFront/Lambda@Edge function, or by an external proxy. Adding the header at the server would deviate from the documented AWS response shape and conflict with the project's threat model requirement to match AWS S3 behaviour exactly.
+
+# Validation
+## Rubric
+- [x] Confirm `s3_response_to_hyper` does not set `X-Content-Type-Options`.
+- [x] Confirm the streaming response builder does not set `X-Content-Type-Options`.
+- [x] Confirm `Content-Type` on `GetObject` is taken from stored object metadata.
+- [x] Confirm AWS S3 does not set `X-Content-Type-Options: nosniff` on its responses.
+- [x] Confirm `guides/threat_model.md` and `AGENTS.md` require matching AWS S3 behaviour exactly.
+- [x] Confirm the gap can be closed operationally (per-object user metadata, CloudFront, or proxy) without changing the server.
+## Report
+Grep for `X-Content-Type-Options`, `nosniff`, `X-Frame-Options`, and `Content-Security-Policy` in `crates/server-http/src/` returns no matches. The S3 XML error responses and streaming PUT/GET responses are both unaffected. AWS S3 does not set `X-Content-Type-Options: nosniff` on its responses — verified by reading the public S3 response documentation and matching it against the server's current response shape. `AGENTS.md` explicitly says "we are building a server that must exactly match AWS S3 behaviour at all times. Do not work around this, always fix non conforming behaviour" and `guides/threat_model.md` says the server must match AWS S3 API behaviour. Closing the gap operationally: a bucket owner can store the header as `x-amz-meta-x-content-type-options: nosniff` on a specific object (the user metadata echo in `apply_user_metadata_headers` will replay it), or front the server with a CloudFront distribution or a reverse proxy that injects the header. The threat-model text now notes the accepted boundary in the same style as the other accepted risks.
+
+# Evidence
+crates/server-http/src/http/mod.rs (L4762 to 4810)
+  Note: `s3_response_to_hyper` does not set `X-Content-Type-Options` or any browser-side security headers.
+```
+        for (name, value) in resp.headers {
+            if let (Ok(name), Ok(value)) = (
+                http::header::HeaderName::from_bytes(name.as_bytes()),
+                http::header::HeaderValue::from_str(&value),
+            ) {
+                response.headers_mut().insert(name, value);
+            }
+        }
+        response.headers_mut().insert(
+            http::header::HeaderName::from_static("x-amz-request-id"),
+            http::header::HeaderValue::from_str(wire_ids.request_id())
+                .expect("request id is a valid header value"),
+        );
+        response.headers_mut().insert(
+            http::header::HeaderName::from_static("x-amz-id-2"),
+            http::header::HeaderValue::from_str(wire_ids.host_id())
+                .expect("host id is a valid header value"),
+        );
+        response
+    }
+```
