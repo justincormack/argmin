@@ -8539,7 +8539,17 @@ Metadata PG migration and backfill design notes:
   while the cluster-level installed-Unix regression proves the stale session
   create appends no object-PG command, preserves the in-progress multipart
   upload, and leaves no remote stream session, segment rows, pending command,
-  or bucket write reservation behind.
+  or bucket write reservation behind. UploadPart stream finalization now has
+  the same direct-RPC stale route rejection coverage and installed-Unix
+  fail-closed coverage: a stale finalization leaves the active stream session,
+  staged segment rows, placed shard files, and shard acknowledgements intact,
+  publishes no multipart part metadata, appends no object-PG command, and leaks
+  no bucket write reservation. The same installed-Unix finalization boundary is
+  now covered for UploadPartCopy-shaped staging as well: copied source bytes are
+  represented as multiple UploadPart stream segments, and a stale finalization
+  preserves every copied staged segment row, shard file, and shard
+  acknowledgement without publishing the part or leaking a bucket write
+  reservation.
 
 Exit criteria:
 

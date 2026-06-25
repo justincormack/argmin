@@ -2026,6 +2026,116 @@ fn unix_object_mutation_client_rejects_malformed_stream_part_commit_response() {
 }
 
 #[test]
+fn unix_object_mutation_client_rejects_stale_stream_part_commit_command_epoch() {
+    let tmp = test_util::tempdir();
+    let config = test_config(&tmp);
+    private_socket_dir(config.socket_path.parent().unwrap());
+    let server = StorageNodeServer::bind(config.clone()).unwrap();
+    let server_thread = thread::spawn(move || server.accept_one().unwrap());
+    let stale_epoch = ClusterEpoch::new(config.cluster_epoch.get() + 1).unwrap();
+    let client = UnixStorageNodeClient::new(NodeId::new(7), stale_epoch, config.socket_path);
+    let bucket = crate::tests::bucket_name("stale-stream-part-rpc-bucket");
+    let key = crate::tests::object_key("stale-stream-part-rpc-key");
+    let proof = test_bucket_write_reservation_proof(bucket.clone(), &key);
+    let upload_id = crate::tests::multipart_upload_id("stale-stream-part-rpc-upload");
+    let session_id = crate::tests::stream_session_id("staleprtcmit");
+    let upload = test_multipart_upload_record(
+        bucket.clone(),
+        key.clone(),
+        upload_id.clone(),
+        UploadState::InProgress,
+    );
+    let snapshot = StreamUploadPartStorageSnapshot {
+        auth_snapshot: StreamUploadPartSnapshot {
+            session: StreamUploadRecord {
+                session_id: session_id.clone(),
+                bucket: bucket.clone(),
+                key: key.clone(),
+                target: StreamUploadTarget::UploadPart {
+                    upload_id: upload_id.clone(),
+                    part_number: 1,
+                },
+                state: StreamUploadState::InProgress,
+                created_at: 1,
+                encryption: ObjectEncryption::None,
+                next_segment_vid: GenerationId::new(31).unwrap(),
+                bucket_write_reservation: None,
+            },
+            upload: upload.clone(),
+            existing_part_generation: None,
+            staging_segments: Vec::new(),
+        },
+        existing_part: None,
+        displaced_segments: Vec::new(),
+    };
+    let part = MultipartPartRecord {
+        upload_id: upload_id.clone(),
+        part_number: 1,
+        generation: 0,
+        size: 12,
+        payload_crc64: 100,
+        etag: vec![0x51; 8],
+        etag_kind: EtagKind::Crc64,
+        part_okh: [0x51; 16],
+        part_vid: GenerationId::new(40).unwrap(),
+        placement_cluster_epoch: ClusterEpoch::INITIAL,
+        ec_k: 4,
+        ec_m: 2,
+        last_modified: 10,
+        checksum: None,
+    };
+    let segments = vec![MultipartPartSegmentRecord {
+        bucket: bucket.clone(),
+        key: key.clone(),
+        upload_id: upload_id.clone(),
+        version_id: crate::MULTIPART_PART_SEGMENT_STAGING_VERSION_ID.to_u64(),
+        part_number: 1,
+        segment_index: 0,
+        size: 12,
+        segment_crc64: 100,
+        segment_okh: [0x52; 16],
+        segment_vid: GenerationId::new(41).unwrap(),
+        data_pg_id: 0,
+        placement_cluster_epoch: ClusterEpoch::INITIAL,
+        ec_k: 4,
+        ec_m: 2,
+    }];
+
+    let err = ObjectMutationMetadataNodeClient::build_stream_part_commit_command(
+        &client,
+        BuildStreamPartCommitCommandReq {
+            pg_id: PgId::new(0),
+            cluster_epoch: stale_epoch,
+            bucket: &bucket,
+            key: &key,
+            upload_id: &upload_id,
+            session_id: &session_id,
+            part_number: 1,
+            expected_snapshot: &snapshot,
+            part: &part,
+            segments: &segments,
+            bucket_write_reservation: &proof,
+        },
+    )
+    .unwrap_err();
+
+    assert!(
+        matches!(
+            err,
+            ObjectPgActionError::Store(StoreError::StorageRpc {
+                operation: "object stream part commit command build",
+                ref message,
+                ..
+            }) if message.starts_with("StaleShardLocation: ")
+                && message.contains(&format!("request route epoch {stale_epoch}"))
+                && message.contains(&format!("storage-node epoch {}", config.cluster_epoch))
+        ),
+        "stale stream-part commit command-build RPC should fail route validation, got {err:?}"
+    );
+    server_thread.join().unwrap();
+}
+
+#[test]
 fn unix_object_mutation_client_rejects_malformed_complete_multipart_response() {
     let tmp = test_util::tempdir();
     let client = UnixStorageNodeClient::new(
