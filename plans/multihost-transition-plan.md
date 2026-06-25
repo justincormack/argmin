@@ -8640,7 +8640,10 @@ Metadata PG migration and backfill design notes:
   Peering epoch, and the old-primary finalize attempt cannot append an
   object-PG command, publish part metadata, remove staged segment rows, delete
   staged shard files or ack rows, leave pending commands, or leak a
-  bucket-write reservation.
+  bucket-write reservation. The same Peering coverage now includes the
+  UploadPartCopy-shaped finalization case, where copied source bytes are staged
+  as multiple stream segments and must remain intact when the old-primary
+  finalize attempt fails closed after the storage-node refresh.
 - Started the later multipart expansion for deterministic epoch-transition
   faults. CompleteMultipartUpload now has the same local pre-metadata-apply
   gate as direct PUT and DELETE: the test pauses after the multipart completion
