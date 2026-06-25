@@ -8555,7 +8555,13 @@ Metadata PG migration and backfill design notes:
   while retaining the old route, and the read succeeds only when supplied with
   the stored placement epoch. A current-route read is shown to fail closed, so
   the positive read proves retained-route historical shard inspection rather
-  than accidental overlap with the new placement.
+  than accidental overlap with the new placement. The next remote read-path
+  regression lifts this to the coordinator GET/HEAD path: object metadata stays
+  on its serving PG, the payload data PG moves to a disjoint acting set in the
+  next epoch, and storage-node access is installed through Unix clients. GET
+  reads the old payload shards through the segment's recorded placement epoch;
+  HEAD remains available from metadata after the data-PG move without claiming
+  payload-route coverage.
 
 Exit criteria:
 

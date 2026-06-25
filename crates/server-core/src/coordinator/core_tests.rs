@@ -1162,6 +1162,33 @@ fn install_next_epoch_runtime_map_with_historical_routes(
     handle.install(candidate).unwrap();
 }
 
+fn find_bucket_key_for_metadata_and_data_pg(
+    storage_cluster: &StorageCluster,
+    metadata_pg_id: u32,
+    data_pg_id: u32,
+) -> (String, String) {
+    for bucket_suffix in 0..1024 {
+        let bucket = format!("remote-read-epoch-bucket-{bucket_suffix}");
+        let bucket_name = trusted_bucket_name(&bucket);
+        if storage_cluster.test_bucket_pg_id_for(&bucket_name) != metadata_pg_id {
+            continue;
+        }
+        for key_suffix in 0..10_000 {
+            let key = format!("key-{key_suffix:04}");
+            let object_key = trusted_object_key(&key);
+            if storage_cluster.test_object_pg_id_for(&bucket_name, &object_key) == metadata_pg_id
+                && storage_cluster.test_data_pg_id_for(&bucket_name, &object_key, GenerationId::MIN)
+                    == data_pg_id
+            {
+                return (bucket, key);
+            }
+        }
+    }
+    panic!(
+        "failed to find bucket/key with bucket and object PG {metadata_pg_id} and data PG {data_pg_id}"
+    );
+}
+
 #[test]
 fn put_object_epoch_change_before_metadata_apply_commits_once_on_pinned_route() {
     const TOKEN: DeterministicFaultToken =
@@ -1672,6 +1699,197 @@ fn head_object_epoch_change_after_read_snapshot_uses_pinned_route() {
         .unwrap();
     assert_eq!(result.size, b"head-crosses-epoch-change".len() as u64);
     assert_eq!(result.version_id, VersionId::Null);
+}
+
+#[test]
+fn get_uses_retained_payload_route_over_unix_after_data_pg_move_and_head_stays_available() {
+    let tmp = test_util::tempdir();
+    let old_acting_set = vec![NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let moved_acting_set = vec![NodeId::new(3), NodeId::new(4), NodeId::new(5)];
+    let node_ids = (0..6).map(NodeId::new).collect::<Vec<_>>();
+    let pg_ids = vec![0, 1];
+    let metadata_pg_id = 0;
+    let moved_data_pg_id = 1;
+    let ec_shape = storage::EcShape { k: 2, m: 1 };
+    let current_epoch = ClusterEpoch::INITIAL;
+    let next_epoch = ClusterEpoch::new(current_epoch.get() + 1).unwrap();
+    let configs = node_ids
+        .iter()
+        .map(|node_id| {
+            LocalNodeStoreConfig::new(
+                *node_id,
+                tmp.path()
+                    .join(format!("remote-read-node-{:04}", node_id.as_u32())),
+            )
+        })
+        .collect::<Vec<_>>();
+    let current_routes = pg_ids
+        .iter()
+        .map(|pg_id| {
+            storage::control_plane::PgRouteSnapshot::reconstructed(
+                current_epoch,
+                PgId::new(*pg_id),
+                NodeId::new(0),
+                old_acting_set.clone(),
+                PgState::Active,
+            )
+        })
+        .collect::<Vec<_>>();
+    let current_map = LocalClusterMap::open_frontend_with_configs_and_pg_routes(
+        NodeId::new(0),
+        configs.clone(),
+        &pg_ids,
+        ec_shape,
+        current_epoch,
+        current_routes.iter().map(LocalPgRoute::from),
+    )
+    .unwrap();
+    let current_cluster = StorageCluster::from_local_map(Arc::new(current_map)).unwrap();
+    let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&current_cluster));
+    let coord =
+        Coordinator::new_with_managed_key_provider_for_storage_cluster_runtime_map_handle_with_background_worker_mode(
+            handle.clone(),
+            "us-east-1".to_string(),
+            None,
+            test_sse_s3_provider(),
+            BackgroundWorkerMode::none(),
+        )
+        .unwrap();
+
+    let (bucket, key) = find_bucket_key_for_metadata_and_data_pg(
+        &current_cluster,
+        metadata_pg_id,
+        moved_data_pg_id,
+    );
+    coord
+        .create_bucket_for_owner("default-owner", &bucket, false)
+        .unwrap();
+    let payload = b"coordinator remote unix read uses retained placement epoch";
+    let put = test_helpers::put_object(
+        &coord,
+        &PutObjectRequest {
+            encryption: WriteEncryptionRequest::none(),
+            policy_context: PutObjectPolicyContext::default(),
+            object_lock: ObjectLockState::default(),
+            object: object_request_with_expected_owner(&bucket, &key, test_requester(), None),
+            data: payload,
+            metadata: &MetadataBlob::new(),
+            system_metadata: &SystemMetadata::EMPTY,
+            tags: None,
+            cond: NO_WRITE,
+            acl: NO_PUT_OBJECT_ACL.into(),
+        },
+    )
+    .unwrap();
+    let bucket_name = trusted_bucket_name(&bucket);
+    let object_key = trusted_object_key(&key);
+    let segment = current_cluster
+        .test_get_object_segments(&bucket_name, &object_key, put.version_id)
+        .unwrap()
+        .pop()
+        .expect("direct PUT should record one segment");
+    assert_eq!(segment.data_pg_id, moved_data_pg_id);
+    assert_eq!(segment.placement_cluster_epoch, current_epoch);
+
+    let next_routes = pg_ids
+        .iter()
+        .map(|pg_id| {
+            let (primary, acting_set) = if *pg_id == moved_data_pg_id {
+                (NodeId::new(3), moved_acting_set.clone())
+            } else {
+                (NodeId::new(0), old_acting_set.clone())
+            };
+            storage::control_plane::PgRouteSnapshot::reconstructed(
+                next_epoch,
+                PgId::new(*pg_id),
+                primary,
+                acting_set,
+                PgState::Active,
+            )
+        })
+        .collect::<Vec<_>>();
+    let socket_dir = tmp.path().join("remote-read-sockets");
+    make_private_socket_dir(&socket_dir);
+    let stop = Arc::new(AtomicBool::new(false));
+    let mut server_threads = Vec::new();
+    let mut wake_socket_paths = Vec::new();
+    let mut client_configs = Vec::new();
+    for config in &configs {
+        let socket_path = socket_dir.join(format!("node-{}.sock", config.node_id().as_u32()));
+        let server_config = StorageNodeProcessConfig {
+            node_id: config.node_id(),
+            cluster_epoch: next_epoch,
+            route_map_valid_until_ms: None,
+            data_dir: config.data_dir().to_path_buf(),
+            default_ec_shape: ec_shape,
+            pg_ids: pg_ids.clone(),
+            socket_path: socket_path.clone(),
+            pg_routes: next_routes.iter().map(StorageNodePgRoute::from).collect(),
+            historical_pg_routes: current_routes
+                .iter()
+                .map(StorageNodePgRoute::from)
+                .collect(),
+        };
+        let server = Arc::new(StorageNodeServer::bind(server_config).unwrap());
+        for _ in 0..4 {
+            server_threads.push(spawn_storage_node_server_loop(
+                Arc::clone(&server),
+                Arc::clone(&stop),
+            ));
+            wake_socket_paths.push(socket_path.clone());
+        }
+        client_configs.push(LocalUnixStorageNodeClientConfig::new(
+            config.node_id(),
+            socket_path,
+        ));
+    }
+
+    let mut next_map = LocalClusterMap::open_frontend_with_configs_and_pg_routes(
+        NodeId::new(0),
+        configs,
+        &pg_ids,
+        ec_shape,
+        next_epoch,
+        next_routes.iter().map(LocalPgRoute::from),
+    )
+    .unwrap();
+    next_map.test_install_historical_pg_routes(current_routes);
+    next_map
+        .install_unix_storage_node_clients(client_configs)
+        .unwrap();
+    let next_cluster = StorageCluster::from_local_map(Arc::new(next_map)).unwrap();
+    handle.install(next_cluster).unwrap();
+
+    let read = coord
+        .get_object(&GetObjectRequest {
+            sse_customer: None,
+            object: object_version_request_with_expected_owner(
+                &bucket,
+                &key,
+                None,
+                test_requester(),
+                None,
+            ),
+            cond: NO_READ,
+        })
+        .unwrap();
+    assert_eq!(read.body.read_all().unwrap(), payload);
+    let head = coord
+        .head_object(&GetObjectRequest {
+            sse_customer: None,
+            object: object_version_request_with_expected_owner(
+                &bucket,
+                &key,
+                None,
+                test_requester(),
+                None,
+            ),
+            cond: NO_READ,
+        })
+        .unwrap();
+    assert_eq!(head.size, payload.len() as u64);
+
+    stop_storage_node_server_loops(stop, &wake_socket_paths, server_threads);
 }
 
 #[test]
