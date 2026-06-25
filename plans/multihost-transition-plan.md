@@ -8505,7 +8505,12 @@ Metadata PG migration and backfill design notes:
   unversioned DELETE through a non-current operation-epoch handle: the delete
   must fail at the metadata-primary epoch boundary, append no object-PG command,
   leave the live object and reclaim metadata unchanged on every acting node, and
-  leave no pending command or bucket-write reservation behind.
+  leave no pending command or bucket-write reservation behind. The shared
+  object metadata mutation path now has the same stale-epoch coverage using
+  object tags as the representative tag/ACL/legal-hold/retention operation:
+  non-current handles fail at route resolution, append no object-PG command,
+  preserve the live object's metadata, and leave no pending command or
+  bucket-write reservation behind.
 
 Exit criteria:
 

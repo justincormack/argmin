@@ -459,6 +459,9 @@ async fn cleanup(bucket: &str, keys: &[&str]) {
             Ok(_) => return,
             Err(err) => {
                 let raw = format!("{err:?}");
+                if raw.contains("NoSuchBucket") {
+                    return;
+                }
                 if raw.contains("OperationAborted") || raw.contains("BucketNotEmpty") {
                     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
                     continue;
@@ -474,8 +477,12 @@ async fn cleanup(bucket: &str, keys: &[&str]) {
         .send_retrying_operation_aborted("final delete bucket during multipart cleanup")
         .await;
     if let Err(err) = result {
+        let raw = format!("{err:?}");
+        if raw.contains("NoSuchBucket") {
+            return;
+        }
         panic!(
-            "delete_bucket did not converge: {err:?}; last cleanup error: {}",
+            "delete_bucket did not converge: {raw}; last cleanup error: {}",
             last_cleanup_error.as_deref().unwrap_or("none")
         );
     }
