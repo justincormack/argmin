@@ -8842,6 +8842,15 @@ Metadata PG migration and backfill design notes:
   applied prefix, keeps `max_metadata_command_log_index()` at the durable proof
   floor even when no log rows remain, and allocates the next command after the
   compacted proof rather than reusing an old log index.
+- Added checkpoint-plus-suffix metadata transfer retry property coverage:
+  `prop_metadata_transfer_checkpoint_suffix_retry_resumes_every_prefix`
+  generates a source command log, captures a checkpoint at a generated prefix,
+  exports a checkpoint-base plus retained-suffix artifact, partially imports
+  every generated prefix length on one destination replica, and then retries the
+  full import twice. It asserts the retry resumes from checkpoint-only,
+  partially replayed, and fully replayed destination states, converges both
+  destination replicas to the expected imported proof, and preserves all
+  checkpoint and suffix metadata rows.
 
 Exit criteria:
 

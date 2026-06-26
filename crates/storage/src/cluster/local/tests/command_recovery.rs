@@ -3322,6 +3322,133 @@ fn metadata_transfer_import_replays_retained_suffix_over_checkpoint_base() {
     }
 }
 
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(16))]
+
+    #[test]
+    fn prop_metadata_transfer_checkpoint_suffix_retry_resumes_every_prefix(
+        total_commands in 2_usize..7,
+        checkpoint_offset in 0_usize..6,
+        partial_prefix_offset in 0_usize..7,
+    ) {
+        let checkpoint_after = 1 + checkpoint_offset % (total_commands - 1);
+        let suffix_len = total_commands - checkpoint_after;
+        let partial_prefix_len = partial_prefix_offset % (suffix_len + 1);
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[1], ec_shape).unwrap();
+        let topology = map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        let buckets = (1..=total_commands)
+            .map(|log_index| {
+                let prefix = format!(
+                    "prop-transfer-checkpoint-suffix-{total_commands}-{checkpoint_after}-{partial_prefix_len}-{log_index}-"
+                );
+                bucket_for_pg(topology, 1, &prefix)
+            })
+            .collect::<Vec<_>>();
+        set_route_primary(&mut map, 1, NodeId::new(0));
+        set_route_state(&mut map, 1, PgState::Peering);
+        let mut map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        let pg_id = PgId::new(1);
+        let source_pg = map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .get_pg(1)
+            .unwrap();
+        let mut checkpoint = None;
+        for (offset, bucket) in buckets.iter().enumerate() {
+            let log_index = (offset + 1) as u64;
+            let command = create_bucket_metadata_command(pg_id, log_index, bucket.clone());
+            source_pg
+                .apply_metadata_command_and_record(0, &command)
+                .unwrap();
+            if offset + 1 == checkpoint_after {
+                checkpoint = Some(
+                    source_pg
+                        .metadata_command_checkpoint(0, ClusterEpoch::INITIAL)
+                        .unwrap(),
+                );
+            }
+        }
+        drop(source_pg);
+
+        let checkpoint = checkpoint.expect("generated checkpoint position is in range");
+        let artifact = cluster
+            .export_pg_metadata_transfer_from_checkpoint_and_retained_suffix(
+                pg_id,
+                NodeId::new(0),
+                checkpoint.clone(),
+            )
+            .unwrap();
+        prop_assert_eq!(artifact.retained_log_entries.len(), suffix_len);
+        drop(cluster);
+
+        let destination_epoch = ClusterEpoch::new(2).unwrap();
+        let map_mut = Arc::get_mut(&mut map).unwrap();
+        map_mut.epoch = destination_epoch;
+        let route = map_mut.pg_routes.get_mut(&pg_id).unwrap();
+        route.cluster_epoch = destination_epoch;
+        route.primary_node_id = NodeId::new(1);
+        route.acting_set = Arc::from([NodeId::new(1), NodeId::new(2)]);
+        route.state = PgState::Peering;
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        let expected_proof = crate::StorageCluster::metadata_transfer_imported_proof_at_epoch(
+            &artifact,
+            destination_epoch,
+        )
+        .unwrap();
+        let rebased_commands =
+            crate::peering::rebase_pg_metadata_transfer_artifact_commands(
+                &artifact,
+                destination_epoch,
+            )
+            .unwrap();
+        prop_assert_eq!(rebased_commands.len(), suffix_len);
+
+        let partial_client = map
+            .node(NodeId::new(1))
+            .unwrap()
+            .metadata_command_client()
+            .clone();
+        partial_client
+            .install_metadata_transfer_checkpoint_base(pg_id, destination_epoch, &checkpoint)
+            .unwrap();
+        for command in &rebased_commands[..partial_prefix_len] {
+            partial_client
+                .replay_metadata_command_for_peering(pg_id, &command.command)
+                .unwrap();
+        }
+
+        let proof = cluster
+            .import_pg_metadata_transfer_from_retained_log(&artifact)
+            .unwrap();
+        let retry_proof = cluster
+            .import_pg_metadata_transfer_from_retained_log(&artifact)
+            .unwrap();
+
+        prop_assert_eq!(proof, expected_proof);
+        prop_assert_eq!(retry_proof, expected_proof);
+        for node_id in [NodeId::new(1), NodeId::new(2)] {
+            let pg = map.node(node_id).unwrap().storage_node().get_pg(1).unwrap();
+            let state = pg.metadata_command_replica_state().unwrap();
+            prop_assert_eq!(state.cluster_epoch, destination_epoch);
+            prop_assert_eq!(state.applied_log_index, expected_proof.applied_log_index);
+            prop_assert_eq!(state.applied_log_hash, expected_proof.applied_log_hash);
+            prop_assert_eq!(state.state_digest, expected_proof.state_digest);
+            for bucket in &buckets {
+                crate::PgMetadataStore::head_bucket(&*pg, bucket).unwrap();
+            }
+        }
+    }
+}
+
 #[test]
 fn metadata_transfer_checkpoint_suffix_export_rejects_wrong_pg_checkpoint() {
     let tmp = test_util::tempdir();
