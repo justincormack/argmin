@@ -8823,6 +8823,16 @@ Metadata PG migration and backfill design notes:
   payload through the recorded historical placement epoch. This composes the
   retained-route read invariant with the existing randomized stale operation,
   restart, lease, repair, and command-reissue trace operations.
+- Added retained-log metadata transfer artifact property coverage:
+  `prop_metadata_transfer_retained_log_artifact_preserves_valid_chain` generates
+  synthetic applied command-log chains with pre/post state digests and asserts
+  that the artifact base proof, final proof, base kind, retained entries, and
+  rebased destination command ids/digests are internally consistent.
+  `prop_metadata_transfer_retained_log_artifact_rejects_corrupt_chain` mutates
+  those chains by removing state proofs, forking intermediate or final digests,
+  forking retained log hashes, removing retained entries, or replacing applied
+  commands with abandoned tombstones, and asserts that artifact construction
+  fails closed before any import path can mutate destination metadata state.
 
 Exit criteria:
 

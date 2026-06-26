@@ -811,6 +811,7 @@ mod tests {
     use crate::metadata_command::{
         CreateBucketCommand, MetadataCommandId, MetadataCommandLogIndex, MetadataCommandPayload,
     };
+    use proptest::prelude::*;
 
     fn state(log_index: u64, log_hash: u64, state_digest: u64) -> MetadataCommandReplicaState {
         MetadataCommandReplicaState {
@@ -902,6 +903,246 @@ mod tests {
             pre_state_digest: None,
             post_state_digest: None,
             kind,
+        }
+    }
+
+    fn retained_transfer_entry(
+        log_index: u64,
+        previous_log_hash: u64,
+        log_hash: u64,
+        pre_state_digest: u64,
+        post_state_digest: u64,
+    ) -> MetadataCommandLogRangeEntry {
+        MetadataCommandLogRangeEntry {
+            log_index,
+            previous_log_hash,
+            log_hash,
+            pre_state_digest: Some(pre_state_digest),
+            post_state_digest: Some(post_state_digest),
+            kind: MetadataCommandLogRangeEntryKind::Applied(Box::new(command(log_index))),
+        }
+    }
+
+    fn derived_transfer_value(seed: u64, ordinal: u64, salt: u64) -> u64 {
+        seed.wrapping_add(ordinal.wrapping_mul(0x9E37_79B9_7F4A_7C15))
+            .rotate_left((ordinal as u32 % 31) + 1)
+            ^ salt
+    }
+
+    fn different_transfer_value(value: u64) -> u64 {
+        value ^ 0xA5A5_5A5A_D3C3_B4B4
+    }
+
+    fn retained_transfer_chain(
+        first_log_index: u64,
+        len: usize,
+        base_log_hash: u64,
+        base_state_digest: u64,
+        seed: u64,
+    ) -> (
+        MetadataCommandReplicaState,
+        Vec<MetadataCommandLogRangeEntry>,
+    ) {
+        let mut previous_log_hash = base_log_hash;
+        let mut pre_state_digest = base_state_digest;
+        let mut retained_entries = Vec::with_capacity(len);
+
+        for offset in 0..len {
+            let log_index = first_log_index + offset as u64;
+            let log_hash = derived_transfer_value(seed, log_index, 0x4841_5348);
+            let post_state_digest = derived_transfer_value(seed, log_index, 0x5354_4154_45);
+            retained_entries.push(retained_transfer_entry(
+                log_index,
+                previous_log_hash,
+                log_hash,
+                pre_state_digest,
+                post_state_digest,
+            ));
+            previous_log_hash = log_hash;
+            pre_state_digest = post_state_digest;
+        }
+
+        (
+            state_at_epoch(
+                ClusterEpoch::INITIAL,
+                first_log_index + len as u64 - 1,
+                previous_log_hash,
+                pre_state_digest,
+            ),
+            retained_entries,
+        )
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum RetainedTransferCorruption {
+        MissingPreStateDigest,
+        MissingPostStateDigest,
+        PreStateDigestForkAfterBase,
+        PreviousLogHashForkAfterBase,
+        FinalStateDigestFork,
+        FinalLogHashFork,
+        MissingRetainedEntry,
+        AbandonedRetainedEntry,
+    }
+
+    proptest! {
+        #[test]
+        fn prop_metadata_transfer_retained_log_artifact_preserves_valid_chain(
+            first_log_index in 1_u64..6,
+            len in 1_usize..8,
+            base_log_hash in any::<u64>(),
+            base_state_digest in any::<u64>(),
+            seed in any::<u64>(),
+        ) {
+            let pg_id = PgId::new(7);
+            let source_node_id = NodeId::new(1);
+            let destination_epoch = ClusterEpoch::new(5).unwrap();
+            let (source_state, retained_entries) = retained_transfer_chain(
+                first_log_index,
+                len,
+                base_log_hash,
+                base_state_digest,
+                seed,
+            );
+
+            let artifact = build_pg_metadata_transfer_artifact_from_retained_log_entries(
+                ClusterEpoch::INITIAL,
+                pg_id,
+                source_node_id,
+                source_state,
+                false,
+                retained_entries.clone(),
+            )
+            .unwrap();
+
+            prop_assert_eq!(artifact.pg_id, pg_id);
+            prop_assert_eq!(artifact.source_node_id, source_node_id);
+            prop_assert_eq!(artifact.cluster_epoch, ClusterEpoch::INITIAL);
+            prop_assert_eq!(
+                artifact.base_proof,
+                PgMetadataProof::new(
+                    first_log_index - 1,
+                    retained_entries[0].previous_log_hash,
+                    retained_entries[0].pre_state_digest.unwrap(),
+                )
+            );
+            prop_assert_eq!(artifact.proof, proof_from_replica_state(source_state));
+            prop_assert_eq!(&artifact.retained_log_entries, &retained_entries);
+            prop_assert_eq!(
+                artifact.base_kind,
+                if first_log_index == 1 && retained_entries[0].previous_log_hash == 0 {
+                    PgMetadataTransferBaseKind::Empty
+                } else {
+                    PgMetadataTransferBaseKind::RetainedLogPrefix
+                }
+            );
+
+            let rebased =
+                rebase_pg_metadata_transfer_artifact_commands(&artifact, destination_epoch)
+                    .unwrap();
+            prop_assert_eq!(rebased.len(), len);
+            for (rebased, retained) in rebased.iter().zip(&artifact.retained_log_entries) {
+                prop_assert_eq!(rebased.command.id().cluster_epoch(), destination_epoch);
+                prop_assert_eq!(rebased.command.id().pg_id(), pg_id);
+                prop_assert_eq!(
+                    rebased.command.id().log_index().get(),
+                    retained.log_index - artifact.base_proof.applied_log_index
+                );
+                prop_assert_eq!(rebased.pre_state_digest, retained.pre_state_digest.unwrap());
+                prop_assert_eq!(rebased.post_state_digest, retained.post_state_digest.unwrap());
+            }
+        }
+
+        #[test]
+        fn prop_metadata_transfer_retained_log_artifact_rejects_corrupt_chain(
+            first_log_index in 1_u64..6,
+            len in 1_usize..8,
+            base_log_hash in any::<u64>(),
+            base_state_digest in any::<u64>(),
+            seed in any::<u64>(),
+            target_offset in any::<usize>(),
+            corruption in prop_oneof![
+                Just(RetainedTransferCorruption::MissingPreStateDigest),
+                Just(RetainedTransferCorruption::MissingPostStateDigest),
+                Just(RetainedTransferCorruption::PreStateDigestForkAfterBase),
+                Just(RetainedTransferCorruption::PreviousLogHashForkAfterBase),
+                Just(RetainedTransferCorruption::FinalStateDigestFork),
+                Just(RetainedTransferCorruption::FinalLogHashFork),
+                Just(RetainedTransferCorruption::MissingRetainedEntry),
+                Just(RetainedTransferCorruption::AbandonedRetainedEntry),
+            ],
+        ) {
+            let pg_id = PgId::new(7);
+            let source_node_id = NodeId::new(1);
+            let (mut source_state, mut retained_entries) = retained_transfer_chain(
+                first_log_index,
+                len,
+                base_log_hash,
+                base_state_digest,
+                seed,
+            );
+            let target = target_offset % retained_entries.len();
+
+            match corruption {
+                RetainedTransferCorruption::MissingPreStateDigest => {
+                    retained_entries[target].pre_state_digest = None;
+                }
+                RetainedTransferCorruption::MissingPostStateDigest => {
+                    retained_entries[target].post_state_digest = None;
+                }
+                RetainedTransferCorruption::PreStateDigestForkAfterBase => {
+                    if retained_entries.len() == 1 {
+                        source_state.state_digest =
+                            different_transfer_value(source_state.state_digest);
+                    } else {
+                        let target = 1 + target_offset % (retained_entries.len() - 1);
+                        let current = retained_entries[target].pre_state_digest.unwrap();
+                        retained_entries[target].pre_state_digest =
+                            Some(different_transfer_value(current));
+                    }
+                }
+                RetainedTransferCorruption::PreviousLogHashForkAfterBase => {
+                    if retained_entries.len() == 1 {
+                        source_state.applied_log_hash =
+                            different_transfer_value(source_state.applied_log_hash);
+                    } else {
+                        let target = 1 + target_offset % (retained_entries.len() - 1);
+                        retained_entries[target].previous_log_hash =
+                            different_transfer_value(retained_entries[target].previous_log_hash);
+                    }
+                }
+                RetainedTransferCorruption::FinalStateDigestFork => {
+                    source_state.state_digest = different_transfer_value(source_state.state_digest);
+                }
+                RetainedTransferCorruption::FinalLogHashFork => {
+                    source_state.applied_log_hash =
+                        different_transfer_value(source_state.applied_log_hash);
+                }
+                RetainedTransferCorruption::MissingRetainedEntry => {
+                    if retained_entries.len() == 1 {
+                        retained_entries.remove(target);
+                    } else {
+                        let target = 1 + target_offset % (retained_entries.len() - 1);
+                        retained_entries.remove(target);
+                    }
+                }
+                RetainedTransferCorruption::AbandonedRetainedEntry => {
+                    retained_entries[target].kind =
+                        MetadataCommandLogRangeEntryKind::Abandoned {
+                            original_command_checksum: 0x1234,
+                        };
+                }
+            }
+
+            let result = build_pg_metadata_transfer_artifact_from_retained_log_entries(
+                ClusterEpoch::INITIAL,
+                pg_id,
+                source_node_id,
+                source_state,
+                false,
+                retained_entries,
+            );
+            prop_assert!(result.is_err());
         }
     }
 
