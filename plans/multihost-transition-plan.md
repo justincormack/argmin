@@ -8814,11 +8814,11 @@ Metadata PG migration and backfill design notes:
   at current or retained epochs, current observations are epoch-scoped and in
   the acting set, and Active PGs always carry an accepted metadata proof.
 - Extended the local cluster trace property with retained-route historical read
-  coverage. The trace can now write a committed segment under one data-PG route,
-  advance the PG to a new epoch with an Active route that replaces one source
-  acting-set node with a spare node while retaining the old route, assert the
-  old and current route placements move at least one shard to a different node,
-  and then assert
+  coverage. The trace can now write staged segment payload shards plus durable
+  ack rows under one data-PG route, advance the PG to a new epoch with an
+  Active route that replaces one source acting-set node with a spare node while
+  retaining the old route, assert the old and current route placements move at
+  least one shard to a different node, and then assert
   `read_segment_payload_stored_bytes_at_placement_epoch_into` recovers the
   payload through the recorded historical placement epoch. This composes the
   retained-route read invariant with the existing randomized stale operation,
@@ -8832,13 +8832,22 @@ Metadata PG migration and backfill design notes:
   operation, retained-route, restart, repair, lease, and command-reissue trace
   operations.
 - Extended the local cluster trace property with durable repair queue coverage.
-  The trace can now corrupt a committed segment shard, read the segment twice
-  through EC recovery, assert that the observed corrupt shard is recorded once
-  durably with coalesced observations, and assert that durable repair scans
-  enqueue the row once while subsequent scans dedupe against the in-memory
-  queue. This composes repair observation/dedupe with the randomized
+  The trace can now corrupt a staged segment shard with durable ack rows, read
+  the segment twice through EC recovery, assert that the observed corrupt shard
+  is recorded once durably with coalesced observations, and assert that durable
+  repair scans enqueue the row once while subsequent scans dedupe against the
+  in-memory queue. This composes repair observation/dedupe with the randomized
   epoch/state, retained-route, checkpoint, restart, lease, and command-reissue
   trace operations.
+- Extended the local cluster trace property with durable backfill claim
+  coverage. The trace can now write staged segment payload shards plus durable
+  ack rows under one data-PG route, advance to a retained historical route plus
+  a new Active route that moves at least one shard to a spare node, record the
+  corresponding durable backfill row, acquire a finite-lease claim, assert a
+  second worker cannot claim the row while the lease is active, and complete
+  the claim. This composes backfill row ownership with randomized epoch/state,
+  retained-route, checkpoint, restart, repair, lease, and command-reissue trace
+  operations.
 - Added retained-log metadata transfer artifact property coverage:
   `prop_metadata_transfer_retained_log_artifact_preserves_valid_chain` generates
   synthetic applied command-log chains with pre/post state digests and asserts

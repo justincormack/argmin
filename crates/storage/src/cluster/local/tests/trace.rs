@@ -18,6 +18,7 @@ enum LocalClusterTraceOp {
     RecoverAfterPhysicalShardLoss(u8),
     DurableRepairQueueAfterShardCorruption(u8),
     RetainedRouteHistoricalRead(u8),
+    DurableBackfillClaimAfterRouteChange(u8),
     RoutineMetadataCheckpointTick,
     DrainPendingCreateBucketFromSecondHandle(u8),
     RestartAndValidate,
@@ -31,6 +32,13 @@ struct TraceWrittenShard {
     key: ShardKey,
     ack: WriteAck,
     data: Vec<u8>,
+}
+
+struct TracePlacedSegment {
+    generation_id: crate::GenerationId,
+    segment_okh: [u8; 16],
+    payload: Vec<u8>,
+    written: crate::DirectPutWrittenSegment,
 }
 
 fn local_cluster_trace_strategy() -> impl Strategy<Value = Vec<LocalClusterTraceOp>> {
@@ -52,6 +60,7 @@ fn local_cluster_trace_strategy() -> impl Strategy<Value = Vec<LocalClusterTrace
             1 => any::<u8>().prop_map(LocalClusterTraceOp::RecoverAfterPhysicalShardLoss),
             1 => any::<u8>().prop_map(LocalClusterTraceOp::DurableRepairQueueAfterShardCorruption),
             1 => any::<u8>().prop_map(LocalClusterTraceOp::RetainedRouteHistoricalRead),
+            1 => any::<u8>().prop_map(LocalClusterTraceOp::DurableBackfillClaimAfterRouteChange),
             1 => Just(LocalClusterTraceOp::RoutineMetadataCheckpointTick),
             1 => any::<u8>().prop_map(LocalClusterTraceOp::DrainPendingCreateBucketFromSecondHandle),
             1 => Just(LocalClusterTraceOp::RestartAndValidate),
@@ -157,6 +166,10 @@ fn trace_generation(seed: u8) -> crate::GenerationId {
     crate::GenerationId::new(u64::from(seed) + 1).unwrap()
 }
 
+fn trace_segment_generation(step: usize, seed: u8) -> crate::GenerationId {
+    crate::GenerationId::new(10_000 + step as u64 * 257 + u64::from(seed)).unwrap()
+}
+
 fn trace_shard_key(step: usize, seed: u8) -> ShardKey {
     ShardKey::new(&[seed.wrapping_add(1); 16], 10_000 + step as u64, 0)
 }
@@ -186,6 +199,48 @@ fn trace_segment_payload_placement_key(
     key[..16].copy_from_slice(segment_okh);
     key[16..].copy_from_slice(&segment_vid.get().to_be_bytes());
     key
+}
+
+fn write_trace_placed_segment(
+    cluster: &crate::StorageCluster,
+    bucket: &crate::BucketName,
+    key: &crate::ObjectKey,
+    generation_id: crate::GenerationId,
+    segment_okh: [u8; 16],
+    payload: &[u8],
+) -> Result<TracePlacedSegment, TestCaseError> {
+    let written = cluster
+        .write_direct_put_segment_payload_shards(
+            bucket,
+            key,
+            generation_id,
+            0,
+            &segment_okh,
+            payload,
+        )
+        .map_err(|err| TestCaseError::fail(format!("{err:?}")))?;
+    cluster
+        .test_register_payload_shard_acks(written.data_pg_id, &written.written_shards)
+        .map_err(|err| TestCaseError::fail(format!("{err:?}")))?;
+    Ok(TracePlacedSegment {
+        generation_id,
+        segment_okh,
+        payload: payload.to_vec(),
+        written,
+    })
+}
+
+fn trace_segment_stored_bytes_request(
+    segment: &TracePlacedSegment,
+) -> crate::SegmentStoredBytesRequest {
+    crate::SegmentStoredBytesRequest {
+        data_pg_id: segment.written.data_pg_id,
+        segment_okh: segment.segment_okh,
+        segment_vid: segment.generation_id,
+        stored_size: segment.payload.len(),
+        segment_crc64: checksum::crc64::checksum(&segment.payload),
+        ec: segment.written.ec,
+    }
 }
 
 fn current_trace_location(
@@ -582,13 +637,14 @@ fn run_local_cluster_trace(ops: &[LocalClusterTraceOp]) -> TestCaseResult {
                 let payload = format!("recoverable-physical-shard-loss-{step}-{seed}");
                 let bucket = trace_bucket(seed.wrapping_add(step as u8));
                 let key = trace_key(seed.wrapping_add(step as u8));
-                let segment = write_committed_direct_segment_for_with_okh(
+                let segment = write_trace_placed_segment(
                     &cluster,
                     &bucket,
                     &key,
+                    trace_segment_generation(step, *seed),
                     [seed.wrapping_add(step as u8); 16],
                     payload.as_bytes(),
-                );
+                )?;
                 let shard_path = cluster
                     .test_payload_shard_file_path(
                         segment.written.data_pg_id,
@@ -601,18 +657,9 @@ fn run_local_cluster_trace(ops: &[LocalClusterTraceOp]) -> TestCaseResult {
                 std::fs::remove_file(shard_path).unwrap();
 
                 let mut recovered = Vec::new();
+                let req = trace_segment_stored_bytes_request(&segment);
                 cluster
-                    .read_segment_payload_stored_bytes_into(
-                        crate::SegmentStoredBytesRequest {
-                            data_pg_id: segment.written.data_pg_id,
-                            segment_okh: segment.segment_okh,
-                            segment_vid: segment.generation_id,
-                            stored_size: segment.payload.len(),
-                            segment_crc64: checksum::crc64::checksum(&segment.payload),
-                            ec: segment.written.ec,
-                        },
-                        &mut recovered,
-                    )
+                    .read_segment_payload_stored_bytes_into(req, &mut recovered)
                     .unwrap();
                 prop_assert_eq!(recovered, segment.payload);
             }
@@ -628,37 +675,29 @@ fn run_local_cluster_trace(ops: &[LocalClusterTraceOp]) -> TestCaseResult {
                 let payload = format!("trace-durable-repair-queue-{step}-{seed}");
                 let bucket = trace_bucket(seed.wrapping_add(step as u8));
                 let key = trace_key(seed.wrapping_add(step as u8));
-                let segment = write_committed_direct_segment_for_with_okh(
+                let segment = write_trace_placed_segment(
                     &cluster,
                     &bucket,
                     &key,
+                    trace_segment_generation(step, *seed),
                     [seed.wrapping_add(step as u8).wrapping_add(23); 16],
                     payload.as_bytes(),
-                );
+                )?;
                 let shard_index = ShardIndex::new(0);
                 let shard_size = segment
                     .payload
                     .len()
                     .div_ceil(usize::from(segment.written.ec.k));
-                let shard_path = cluster
-                    .test_payload_shard_file_path(
-                        segment.written.data_pg_id,
-                        segment.written.ec,
-                        &segment.segment_okh,
-                        segment.generation_id,
-                        shard_index.get(),
-                    )
-                    .map_err(|err| TestCaseError::fail(format!("{err:?}")))?;
+                let shard_path = cluster.test_payload_shard_file_path(
+                    segment.written.data_pg_id,
+                    segment.written.ec,
+                    &segment.segment_okh,
+                    segment.generation_id,
+                    shard_index.get(),
+                )?;
                 std::fs::write(shard_path, vec![0xAB; shard_size])
                     .map_err(|err| TestCaseError::fail(format!("{err:?}")))?;
-                let req = crate::SegmentStoredBytesRequest {
-                    data_pg_id: segment.written.data_pg_id,
-                    segment_okh: segment.segment_okh,
-                    segment_vid: segment.generation_id,
-                    stored_size: segment.payload.len(),
-                    segment_crc64: checksum::crc64::checksum(&segment.payload),
-                    ec: segment.written.ec,
-                };
+                let req = trace_segment_stored_bytes_request(&segment);
 
                 for _ in 0..2 {
                     let mut recovered = Vec::new();
@@ -732,21 +771,15 @@ fn run_local_cluster_trace(ops: &[LocalClusterTraceOp]) -> TestCaseResult {
                     let payload = format!("trace-retained-route-{step}-{seed}");
                     let bucket = trace_bucket(seed.wrapping_add(step as u8));
                     let key = trace_key(seed.wrapping_add(step as u8));
-                    let segment = write_committed_direct_segment_for_with_okh(
+                    let segment = write_trace_placed_segment(
                         &cluster,
                         &bucket,
                         &key,
+                        trace_segment_generation(step, *seed),
                         [seed.wrapping_add(step as u8).wrapping_add(41); 16],
                         payload.as_bytes(),
-                    );
-                    let req = crate::SegmentStoredBytesRequest {
-                        data_pg_id: segment.written.data_pg_id,
-                        segment_okh: segment.segment_okh,
-                        segment_vid: segment.generation_id,
-                        stored_size: segment.payload.len(),
-                        segment_crc64: checksum::crc64::checksum(&segment.payload),
-                        ec: segment.written.ec,
-                    };
+                    )?;
+                    let req = trace_segment_stored_bytes_request(&segment);
                     (segment, req)
                 };
 
@@ -808,6 +841,163 @@ fn run_local_cluster_trace(ops: &[LocalClusterTraceOp]) -> TestCaseResult {
                     .unwrap();
                 prop_assert_eq!(recovered, segment.payload);
                 prop_assert_ne!(cluster.cluster_epoch(), source_route.cluster_epoch());
+            }
+            LocalClusterTraceOp::DurableBackfillClaimAfterRouteChange(seed) => {
+                if pg_state != PgState::Active {
+                    continue;
+                }
+                let source_acting_set = trace_historical_source_acting_set();
+                let source_route = PgRouteSnapshot::reconstructed(
+                    current_epoch,
+                    PgId::new(0),
+                    source_acting_set[0],
+                    source_acting_set,
+                    PgState::Active,
+                );
+                {
+                    let map = Arc::get_mut(&mut map)
+                        .expect("trace must not retain StorageCluster handles");
+                    map.test_install_pg_routes([source_route.clone()]);
+                    map.epoch = current_epoch;
+                }
+                let (segment, req) = {
+                    let cluster = current_cluster(&map);
+                    let payload = format!("trace-durable-backfill-claim-{step}-{seed}");
+                    let bucket = trace_bucket(seed.wrapping_add(step as u8));
+                    let key = trace_key(seed.wrapping_add(step as u8));
+                    let segment = write_trace_placed_segment(
+                        &cluster,
+                        &bucket,
+                        &key,
+                        trace_segment_generation(step, *seed),
+                        [seed.wrapping_add(step as u8).wrapping_add(59); 16],
+                        payload.as_bytes(),
+                    )?;
+                    let req = trace_segment_stored_bytes_request(&segment);
+                    (segment, req)
+                };
+
+                current_epoch = ClusterEpoch::new(current_epoch.get() + 1).unwrap();
+                visited_epochs.insert(current_epoch);
+                let acting_set = trace_historical_current_acting_set(*seed);
+                let desired_route = PgRouteSnapshot::reconstructed(
+                    current_epoch,
+                    PgId::new(0),
+                    acting_set[0],
+                    acting_set,
+                    PgState::Active,
+                );
+                {
+                    let map = Arc::get_mut(&mut map)
+                        .expect("trace must not retain StorageCluster handles");
+                    map.test_install_pg_routes([desired_route.clone()]);
+                    map.test_install_historical_pg_routes([source_route.clone()]);
+                    map.epoch = current_epoch;
+                }
+                pg_state = PgState::Active;
+                written = None;
+
+                let cluster = current_cluster(&map);
+                let placement_key = trace_segment_payload_placement_key(
+                    &segment.segment_okh,
+                    segment.generation_id,
+                );
+                let historical_locations = cluster
+                    .place_payload_shards_for_pg_route_snapshot(
+                        &source_route,
+                        DataPgId::new(PgId::new(req.data_pg_id)),
+                        req.ec,
+                        &placement_key,
+                    )
+                    .unwrap();
+                let desired_locations = cluster
+                    .place_payload_shards_for_pg_route_snapshot(
+                        &desired_route,
+                        DataPgId::new(PgId::new(req.data_pg_id)),
+                        req.ec,
+                        &placement_key,
+                    )
+                    .unwrap();
+                prop_assert!(
+                    historical_locations
+                        .iter()
+                        .zip(&desired_locations)
+                        .any(|(historical, desired)| historical.node_id() != desired.node_id()),
+                    "backfill trace must move at least one shard to a different node"
+                );
+
+                for row in cluster
+                    .list_placed_segment_shard_backfills(req.data_pg_id)
+                    .map_err(|err| TestCaseError::fail(format!("{err:?}")))?
+                {
+                    cluster
+                        .resolve_placed_segment_shard_backfill(&row.work_item)
+                        .map_err(|err| TestCaseError::fail(format!("{err:?}")))?;
+                }
+
+                let plan = cluster
+                    .record_placed_segment_shard_backfill_for_plan(
+                        &source_route,
+                        &desired_route,
+                        req,
+                        None,
+                    )
+                    .map_err(|err| TestCaseError::fail(format!("{err:?}")))?;
+                prop_assert!(!plan.is_complete());
+                prop_assert!(
+                    !plan.copy_targets.is_empty() || !plan.reconstruction_targets.is_empty()
+                );
+
+                let work_item = crate::PlacedSegmentShardBackfillWorkItem {
+                    request: req,
+                    source_cluster_epoch: source_route.cluster_epoch(),
+                    desired_cluster_epoch: desired_route.cluster_epoch(),
+                };
+                let rows = cluster
+                    .list_placed_segment_shard_backfills(req.data_pg_id)
+                    .map_err(|err| TestCaseError::fail(format!("{err:?}")))?;
+                prop_assert_eq!(
+                    rows.iter().filter(|row| row.work_item == work_item).count(),
+                    1
+                );
+
+                let now = 100_000 + step as u64;
+                let claim = cluster
+                    .acquire_next_placed_segment_shard_backfill_claim(
+                        &format!("trace-backfill-claim-{step}"),
+                        &format!("trace-backfill-owner-{step}"),
+                        now,
+                        now + 60,
+                        now,
+                    )
+                    .map_err(|err| TestCaseError::fail(format!("{err:?}")))?
+                    .ok_or_else(|| {
+                        TestCaseError::fail("new durable backfill row should be claimable")
+                    })?;
+                prop_assert_eq!(claim.work_item, work_item);
+                prop_assert_eq!(claim.remaining_tolerance, plan.source_remaining_tolerance());
+                prop_assert_eq!(claim.cluster_epoch, current_epoch);
+                prop_assert_eq!(claim.attempt_count, 1);
+
+                let busy = cluster
+                    .acquire_next_placed_segment_shard_backfill_claim(
+                        &format!("trace-backfill-claim-busy-{step}"),
+                        &format!("trace-backfill-owner-busy-{step}"),
+                        now + 1,
+                        now + 61,
+                        now + 1,
+                    )
+                    .map_err(|err| TestCaseError::fail(format!("{err:?}")))?;
+                prop_assert!(busy.is_none());
+
+                let completed = cluster
+                    .complete_placed_segment_shard_backfill_claim(&claim)
+                    .map_err(|err| TestCaseError::fail(format!("{err:?}")))?;
+                prop_assert!(completed);
+                let remaining_rows = cluster
+                    .list_placed_segment_shard_backfills(req.data_pg_id)
+                    .map_err(|err| TestCaseError::fail(format!("{err:?}")))?;
+                prop_assert!(remaining_rows.iter().all(|row| row.work_item != work_item));
             }
             LocalClusterTraceOp::RoutineMetadataCheckpointTick => {
                 let cluster = current_cluster(&map);
@@ -992,6 +1182,19 @@ fn run_local_cluster_trace(ops: &[LocalClusterTraceOp]) -> TestCaseResult {
         assert_clean_metadata_command_stream(&map, &[0]);
     }
     Ok(())
+}
+
+#[test]
+fn local_cluster_trace_retained_route_after_epoch_advances_uses_placed_segment_rows() {
+    let mut ops = vec![LocalClusterTraceOp::RetainedRouteHistoricalRead(151)];
+    ops.extend(std::iter::repeat(LocalClusterTraceOp::AdvanceEpoch).take(22));
+    ops.extend([
+        LocalClusterTraceOp::WriteCurrent(0),
+        LocalClusterTraceOp::WriteCurrent(0),
+        LocalClusterTraceOp::DurableRepairQueueAfterShardCorruption(126),
+    ]);
+
+    run_local_cluster_trace(&ops).unwrap();
 }
 
 proptest! {
