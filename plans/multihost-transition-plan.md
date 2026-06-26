@@ -8833,6 +8833,15 @@ Metadata PG migration and backfill design notes:
   forking retained log hashes, removing retained entries, or replacing applied
   commands with abandoned tombstones, and asserts that artifact construction
   fails closed before any import path can mutate destination metadata state.
+- Added command-log compaction property coverage:
+  `prop_metadata_command_log_compaction_preserves_next_index` generates bounded
+  metadata command prefixes, records a checkpoint at a generated prefix, may
+  continue with a retained suffix, compacts through the checkpoint, optionally
+  reopens the local cluster map, and then issues one more metadata command. It
+  asserts that compaction leaves the applied proof intact, reports no missing
+  applied prefix, keeps `max_metadata_command_log_index()` at the durable proof
+  floor even when no log rows remain, and allocates the next command after the
+  compacted proof rather than reusing an old log index.
 
 Exit criteria:
 
