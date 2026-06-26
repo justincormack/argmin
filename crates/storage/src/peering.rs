@@ -950,7 +950,7 @@ mod tests {
         for offset in 0..len {
             let log_index = first_log_index + offset as u64;
             let log_hash = derived_transfer_value(seed, log_index, 0x4841_5348);
-            let post_state_digest = derived_transfer_value(seed, log_index, 0x5354_4154_45);
+            let post_state_digest = derived_transfer_value(seed, log_index, 0x0053_5441_5445);
             retained_entries.push(retained_transfer_entry(
                 log_index,
                 previous_log_hash,

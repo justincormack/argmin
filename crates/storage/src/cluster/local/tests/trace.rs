@@ -1330,7 +1330,7 @@ fn run_local_cluster_trace(ops: &[LocalClusterTraceOp]) -> TestCaseResult {
 #[test]
 fn local_cluster_trace_retained_route_after_epoch_advances_uses_placed_segment_rows() {
     let mut ops = vec![LocalClusterTraceOp::RetainedRouteHistoricalRead(151)];
-    ops.extend(std::iter::repeat(LocalClusterTraceOp::AdvanceEpoch).take(22));
+    ops.extend(std::iter::repeat_n(LocalClusterTraceOp::AdvanceEpoch, 22));
     ops.extend([
         LocalClusterTraceOp::WriteCurrent(0),
         LocalClusterTraceOp::WriteCurrent(0),
