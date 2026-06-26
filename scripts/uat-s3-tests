@@ -14,7 +14,7 @@ multi-process `multihost`; use `--topology local` for the older single-process
 local server.
 
 Options:
-  --listen ADDR          Server listen address (default: 127.0.0.1:19000)
+  --listen ADDR          Server listen address (default: auto-selected 127.0.0.1 port)
   --data-dir PATH        Server data directory (default: temporary directory)
   --bucket-prefix PREFIX Bucket prefix for s3-tests (default: argmin-s3-)
   --timeout-secs SECS    S3 client timeout (default: 30)
@@ -46,7 +46,7 @@ die() {
     exit 2
 }
 
-listen_addr="${ARGMIN_UAT_LISTEN_ADDR:-127.0.0.1:19000}"
+listen_addr="${ARGMIN_UAT_LISTEN_ADDR:-}"
 data_dir="${ARGMIN_UAT_DATA_DIR:-}"
 bucket_prefix="${S3_TEST_BUCKET_PREFIX:-argmin-s3-}"
 timeout_secs="${S3_TEST_TIMEOUT_SECS:-30}"
@@ -166,6 +166,30 @@ if [[ -z "$data_dir" ]]; then
     if ((keep_temp_data_dir == 0)); then
         cleanup=1
     fi
+fi
+
+port_is_listening() {
+    local candidate_host="$1"
+    local candidate_port="$2"
+    (echo >"/dev/tcp/$candidate_host/$candidate_port") >/dev/null 2>&1
+}
+
+choose_listen_addr() {
+    local candidate_host="127.0.0.1"
+    local candidate_port
+    for ((attempt = 0; attempt < 100; attempt++)); do
+        candidate_port=$((20000 + ((RANDOM << 15 | RANDOM) + $$ + attempt) % 40000))
+        if ! port_is_listening "$candidate_host" "$candidate_port"; then
+            printf '%s:%s\n' "$candidate_host" "$candidate_port"
+            return 0
+        fi
+    done
+    die "could not find an unused localhost listen port"
+}
+
+if [[ -z "$listen_addr" ]]; then
+    listen_addr="$(choose_listen_addr)"
+    echo "== argmin-s3 UAT selected listen address: $listen_addr =="
 fi
 
 if [[ "$smoke" == "storage-node-restart" || "$smoke" == "storage-node-kill-fails-closed" ]]; then
@@ -346,6 +370,29 @@ print_command() {
     printf '+'
     printf ' %q' "$@"
     printf '\n'
+}
+
+print_final_result() {
+    local status="$1"
+    local test_label
+    if [[ -n "$smoke" ]]; then
+        test_label="$smoke smoke"
+    else
+        test_label="$topology s3-tests"
+    fi
+    if ((status == 0)); then
+        if [[ -t 2 ]]; then
+            printf '\033[32mOK\033[0m: argmin-s3 UAT %s passed\n' "$test_label" >&2
+        else
+            echo "OK: argmin-s3 UAT $test_label passed" >&2
+        fi
+    else
+        if [[ -t 2 ]]; then
+            printf '\033[31mFAIL\033[0m: argmin-s3 UAT %s failed with status %s\n' "$test_label" "$status" >&2
+        else
+            echo "FAIL: argmin-s3 UAT $test_label failed with status $status" >&2
+        fi
+    fi
 }
 
 server_cmd=()
@@ -1441,6 +1488,7 @@ cleanup_server() {
         echo "UAT data directory kept at $data_dir" >&2
         echo "UAT server logs kept at $logs_dir" >&2
     fi
+    print_final_result "$status"
     exit "$status"
 }
 trap cleanup_server EXIT INT TERM
