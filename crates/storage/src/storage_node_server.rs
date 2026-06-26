@@ -9929,7 +9929,7 @@ impl Drop for StorageNodeServer {
     }
 }
 
-fn advance_storage_node_incarnation(data_dir: &Path) -> Result<u64, StorageNodeServerError> {
+pub fn advance_storage_node_incarnation(data_dir: &Path) -> Result<u64, StorageNodeServerError> {
     fs::create_dir_all(data_dir).map_err(|source| StorageNodeServerError::Io {
         context: "create storage-node data directory for incarnation",
         path: data_dir.to_path_buf(),

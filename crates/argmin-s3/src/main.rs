@@ -24,19 +24,20 @@ use server_core::sse::{
 };
 use storage::control_plane::{
     build_control_plane_unix_response, read_control_plane_unix_request,
-    write_control_plane_unix_response, ClusterRuntimeMapSnapshot, ControlPlaneRuntimeMapSource,
-    FileControlPlaneStore, PgMetadataProof, PgMetadataTransferProof, PgRouteSnapshot,
-    SingleAuthorityControlPlane, UnixControlPlaneClient,
+    write_control_plane_unix_response, ClusterRuntimeMapSnapshot,
+    ControlPlaneHeartbeatRuntimeMapSource, ControlPlaneRuntimeMapSource, FileControlPlaneStore,
+    PgMetadataProof, PgMetadataTransferProof, PgRouteSnapshot, SingleAuthorityControlPlane,
+    UnixControlPlaneClient,
 };
 use storage::storage_node_server::{
-    StorageNodeControlPlaneRefreshLoop, StorageNodePgRoute, StorageNodeProcessConfig,
-    StorageNodeServer,
+    advance_storage_node_incarnation, StorageNodeControlPlaneRefreshLoop, StorageNodePgRoute,
+    StorageNodeProcessConfig, StorageNodeServer,
 };
 use storage::{
     CanonicalUserId, ClusterEpoch, EcShape, LocalClusterMap,
     LocalUnixStorageNodeClientAdmissionSettings, LocalUnixStorageNodeClientConfig, NodeId, PgId,
-    PgMetadataTransferArtifact, PgMetadataTransferError, PgState, StorageCluster,
-    StorageClusterRuntimeMapHandle, StoreError,
+    PgMetadataTransferArtifact, PgMetadataTransferError, PgState, SharedStorageNode,
+    StorageCluster, StorageClusterRuntimeMapHandle, StoreError,
 };
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
@@ -959,7 +960,7 @@ fn completed_metadata_transfer_live_summary(
                 Ok(runtime_map) => runtime_map,
                 Err(error) => {
                     let message = error.to_string();
-                    if control_plane_runtime_map_not_ready_for_metadata_transfer(&message) {
+                    if control_plane_runtime_map_not_ready_for_serving(&message) {
                         if Instant::now() >= deadline {
                             return Ok(None);
                         }
@@ -1068,7 +1069,7 @@ fn control_plane_pg_active_with_acting_set(
             Ok(runtime_map) => runtime_map,
             Err(error) => {
                 let message = error.to_string();
-                if control_plane_runtime_map_not_ready_for_metadata_transfer(&message) {
+                if control_plane_runtime_map_not_ready_for_serving(&message) {
                     return Ok(false);
                 }
                 return Err(format!(
@@ -1089,7 +1090,7 @@ fn control_plane_pg_active_with_acting_set(
     Ok(route.state() == PgState::Active && route.acting_set() == acting_set)
 }
 
-fn control_plane_runtime_map_not_ready_for_metadata_transfer(message: &str) -> bool {
+fn control_plane_runtime_map_not_ready_for_serving(message: &str) -> bool {
     message.contains(" has no serving primary in cluster epoch ")
         || (message.contains(" primary node ")
             && message.contains(" has not reported active state in cluster epoch "))
@@ -1498,9 +1499,14 @@ fn cleanup_stale_control_plane_socket(socket_path: &Path) -> Result<(), String> 
 }
 
 fn run_storage_node_process(config: &ServerConfig, ec_config: &EcConfig) -> ! {
-    let server = Arc::new(bind_storage_node_process(config, ec_config));
-    let _control_plane_refresh_loop =
-        maybe_spawn_storage_node_control_plane_refresh_loop(Arc::clone(&server), config);
+    let bound = bind_storage_node_process(config, ec_config);
+    let control_plane_node_incarnation = bound.control_plane_node_incarnation;
+    let server = Arc::new(bound.server);
+    let _control_plane_refresh_loop = maybe_spawn_storage_node_control_plane_refresh_loop(
+        Arc::clone(&server),
+        config,
+        control_plane_node_incarnation,
+    );
     if let Err(error) = server.serve_forever() {
         eprintln!("storage-node server failed: {error}");
         std::process::exit(1);
@@ -1512,9 +1518,14 @@ fn start_storage_node_process(
     config: &ServerConfig,
     ec_config: &EcConfig,
 ) -> std::thread::JoinHandle<()> {
-    let server = Arc::new(bind_storage_node_process(config, ec_config));
-    let control_plane_refresh_loop =
-        maybe_spawn_storage_node_control_plane_refresh_loop(Arc::clone(&server), config);
+    let bound = bind_storage_node_process(config, ec_config);
+    let control_plane_node_incarnation = bound.control_plane_node_incarnation;
+    let server = Arc::new(bound.server);
+    let control_plane_refresh_loop = maybe_spawn_storage_node_control_plane_refresh_loop(
+        Arc::clone(&server),
+        config,
+        control_plane_node_incarnation,
+    );
     std::thread::spawn(move || {
         let _control_plane_refresh_loop = control_plane_refresh_loop;
         if let Err(error) = server.serve_forever() {
@@ -1524,11 +1535,20 @@ fn start_storage_node_process(
     })
 }
 
-fn bind_storage_node_process(config: &ServerConfig, ec_config: &EcConfig) -> StorageNodeServer {
-    let storage_config = build_storage_node_process_config(config, ec_config).unwrap_or_else(|e| {
-        eprintln!("storage-node configuration error: {e}");
-        std::process::exit(1);
-    });
+struct BoundStorageNodeProcess {
+    server: StorageNodeServer,
+    control_plane_node_incarnation: Option<u64>,
+}
+
+fn bind_storage_node_process(
+    config: &ServerConfig,
+    ec_config: &EcConfig,
+) -> BoundStorageNodeProcess {
+    let (storage_config, control_plane_node_incarnation) =
+        build_storage_node_process_config(config, ec_config).unwrap_or_else(|e| {
+            eprintln!("storage-node configuration error: {e}");
+            std::process::exit(1);
+        });
     let node_id = storage_config.node_id;
     let socket_path = storage_config.socket_path.clone();
     let server = StorageNodeServer::bind(storage_config).unwrap_or_else(|e| {
@@ -1540,20 +1560,27 @@ fn bind_storage_node_process(config: &ServerConfig, ec_config: &EcConfig) -> Sto
         node_id.as_u32(),
         socket_path.display()
     );
-    server
+    BoundStorageNodeProcess {
+        server,
+        control_plane_node_incarnation,
+    }
 }
 
 fn maybe_spawn_storage_node_control_plane_refresh_loop(
     server: Arc<StorageNodeServer>,
     config: &ServerConfig,
+    initial_node_incarnation: Option<u64>,
 ) -> Option<StorageNodeControlPlaneRefreshLoop> {
     let socket_path = config.control_plane_socket_path.as_deref()?;
-    let node_incarnation = server
-        .advance_control_plane_node_incarnation()
-        .unwrap_or_else(|error| {
-            eprintln!("failed to advance storage-node control-plane incarnation: {error}");
-            std::process::exit(1);
-        });
+    let node_incarnation = match initial_node_incarnation {
+        Some(node_incarnation) => node_incarnation,
+        None => server
+            .advance_control_plane_node_incarnation()
+            .unwrap_or_else(|error| {
+                eprintln!("failed to advance storage-node control-plane incarnation: {error}");
+                std::process::exit(1);
+            }),
+    };
     let lease_ms = u64::try_from(config.control_plane_heartbeat_lease_duration.as_millis())
         .unwrap_or_else(|_| {
             eprintln!("ARGMIN_CONTROL_PLANE_HEARTBEAT_LEASE_MS is too large");
@@ -1584,7 +1611,7 @@ fn maybe_spawn_storage_node_control_plane_refresh_loop(
 fn build_storage_node_process_config(
     config: &ServerConfig,
     ec_config: &EcConfig,
-) -> Result<StorageNodeProcessConfig, String> {
+) -> Result<(StorageNodeProcessConfig, Option<u64>), String> {
     if let Some(socket_path) = config.control_plane_socket_path.as_deref() {
         return build_control_plane_storage_node_process_config(config, ec_config, socket_path);
     }
@@ -1614,28 +1641,31 @@ fn build_storage_node_process_config(
             acting_set: acting_set.clone(),
         })
         .collect();
-    Ok(StorageNodeProcessConfig {
-        node_id,
-        cluster_epoch,
-        route_map_valid_until_ms: None,
-        data_dir: Path::new(&node_data_dir).to_path_buf(),
-        default_ec_shape: EcShape {
-            k: ec_config.data_shards,
-            m: ec_config.parity_shards,
-        },
-        pg_ids,
-        socket_path: Path::new(&socket_path).to_path_buf(),
-        pg_routes,
+    Ok((
+        StorageNodeProcessConfig {
+            node_id,
+            cluster_epoch,
+            route_map_valid_until_ms: None,
+            data_dir: Path::new(&node_data_dir).to_path_buf(),
+            default_ec_shape: EcShape {
+                k: ec_config.data_shards,
+                m: ec_config.parity_shards,
+            },
+            pg_ids,
+            socket_path: Path::new(&socket_path).to_path_buf(),
+            pg_routes,
 
-        historical_pg_routes: Vec::new(),
-    })
+            historical_pg_routes: Vec::new(),
+        },
+        None,
+    ))
 }
 
 fn build_control_plane_storage_node_process_config(
     config: &ServerConfig,
     ec_config: &EcConfig,
     control_plane_socket_path: &str,
-) -> Result<StorageNodeProcessConfig, String> {
+) -> Result<(StorageNodeProcessConfig, Option<u64>), String> {
     let node_id = NodeId::new(
         config
             .storage_node_id
@@ -1645,27 +1675,53 @@ fn build_control_plane_storage_node_process_config(
         .storage_node_data_dir
         .clone()
         .unwrap_or_else(|| format!("{}/node-{:04}", config.data_dir, node_id.as_u32()));
-    let runtime_map =
-        UnixControlPlaneClient::new(control_plane_socket_path)
-            .runtime_map_snapshot(storage::clock::current_time_millis())
-            .map_err(|error| {
-                format!(
-                    "failed to fetch control-plane runtime map from {control_plane_socket_path}: {error}"
-                )
-            })?;
-    let node_config = StorageNodeProcessConfig::from_runtime_map(
-        node_id,
-        Path::new(&node_data_dir).to_path_buf(),
-        EcShape {
-            k: ec_config.data_shards,
-            m: ec_config.parity_shards,
-        },
-        &runtime_map,
-    )
-    .map_err(|error| error.to_string())?;
     let configured_socket_path = config.storage_node_socket_path.as_deref().ok_or_else(|| {
         "ARGMIN_STORAGE_NODE_SOCKET_PATH is required for storage roles".to_string()
     })?;
+    let node_data_dir_path = Path::new(&node_data_dir);
+    let node_incarnation =
+        advance_storage_node_incarnation(node_data_dir_path).map_err(|error| {
+            format!("failed to advance storage-node control-plane incarnation: {error}")
+        })?;
+    let default_ec_shape = EcShape {
+        k: ec_config.data_shards,
+        m: ec_config.parity_shards,
+    };
+    let node = SharedStorageNode::open_with_default_ec_shape(
+        node_data_dir_path,
+        &config.storage_pg_ids,
+        default_ec_shape,
+    )
+    .map_err(|error| format!("failed to open storage node for startup heartbeat: {error}"))?;
+    let observed_epoch = ClusterEpoch::new(config.storage_cluster_epoch)
+        .ok_or_else(|| "ARGMIN_STORAGE_CLUSTER_EPOCH must be > 0".to_string())?;
+    let lease_ms = u64::try_from(config.control_plane_heartbeat_lease_duration.as_millis())
+        .map_err(|_| "ARGMIN_CONTROL_PLANE_HEARTBEAT_LEASE_MS is too large".to_string())?;
+    let heartbeat = node
+        .control_plane_heartbeat(
+            node_id,
+            node_incarnation,
+            configured_socket_path,
+            observed_epoch,
+            lease_ms,
+            std::iter::empty(),
+        )
+        .map_err(|error| format!("failed to build storage-node startup heartbeat: {error}"))?;
+    let refresh = UnixControlPlaneClient::new(control_plane_socket_path)
+        .refresh_node_heartbeat(heartbeat, storage::clock::current_time_millis())
+        .map_err(|error| {
+            format!(
+                "failed to refresh control-plane runtime map from {control_plane_socket_path}: {error}"
+            )
+        })?;
+    let (_lease, runtime_map) = refresh.into_parts();
+    let node_config = StorageNodeProcessConfig::from_runtime_map(
+        node_id,
+        node_data_dir_path.to_path_buf(),
+        default_ec_shape,
+        &runtime_map,
+    )
+    .map_err(|error| error.to_string())?;
     if node_config.socket_path != Path::new(configured_socket_path) {
         return Err(format!(
             "ARGMIN_STORAGE_NODE_SOCKET_PATH {} must match control-plane endpoint {} for node {}",
@@ -1674,7 +1730,7 @@ fn build_control_plane_storage_node_process_config(
             node_id.as_u32()
         ));
     }
-    Ok(node_config)
+    Ok((node_config, Some(node_incarnation)))
 }
 
 async fn run_legacy_local_frontend(config: ServerConfig, host_id: String, ec_config: EcConfig) {
@@ -2078,16 +2134,16 @@ mod tests {
 
     #[test]
     fn metadata_transfer_active_check_treats_incomplete_runtime_map_as_retryable() {
-        assert!(control_plane_runtime_map_not_ready_for_metadata_transfer(
+        assert!(control_plane_runtime_map_not_ready_for_serving(
             "control-plane RPC remote error: PG 1 has no serving primary in cluster epoch 26"
         ));
-        assert!(control_plane_runtime_map_not_ready_for_metadata_transfer(
+        assert!(control_plane_runtime_map_not_ready_for_serving(
             "control-plane RPC remote error: PG 0 primary node 2 has not reported active state in cluster epoch 31"
         ));
-        assert!(control_plane_runtime_map_not_ready_for_metadata_transfer(
+        assert!(control_plane_runtime_map_not_ready_for_serving(
             "control-plane RPC remote error: node 1 reported unresolved pending metadata command for PG 27 in cluster epoch 83"
         ));
-        assert!(!control_plane_runtime_map_not_ready_for_metadata_transfer(
+        assert!(!control_plane_runtime_map_not_ready_for_serving(
             "control-plane RPC remote error: unknown PG 99"
         ));
     }
@@ -2315,8 +2371,10 @@ mod tests {
         let ec_config = EcConfig::new(4, 2).unwrap();
         let config = test_server_config();
 
-        let storage_config = build_storage_node_process_config(&config, &ec_config).unwrap();
+        let (storage_config, control_plane_node_incarnation) =
+            build_storage_node_process_config(&config, &ec_config).unwrap();
 
+        assert_eq!(control_plane_node_incarnation, None);
         assert_eq!(storage_config.node_id, NodeId::new(2));
         assert_eq!(storage_config.cluster_epoch, ClusterEpoch::new(9).unwrap());
         assert_eq!(storage_config.pg_ids, vec![1, 3, 5]);
@@ -2669,9 +2727,11 @@ mod tests {
         config.storage_node_socket_path = Some(endpoint.display().to_string());
         config.control_plane_socket_path = Some(socket_path.display().to_string());
 
-        let node_config = build_storage_node_process_config(&config, &ec_config).unwrap();
+        let (node_config, control_plane_node_incarnation) =
+            build_storage_node_process_config(&config, &ec_config).unwrap();
 
         server.join().unwrap();
+        assert_eq!(control_plane_node_incarnation, Some(1));
         assert_eq!(node_config.node_id, NodeId::new(0));
         assert_eq!(node_config.socket_path, endpoint);
         assert_eq!(node_config.pg_ids, vec![0]);

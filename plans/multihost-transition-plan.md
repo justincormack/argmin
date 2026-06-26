@@ -8700,6 +8700,14 @@ Metadata PG migration and backfill design notes:
   reads plus new writes under the new placement. This is intentionally a small
   whole-process/RPC confidence check; the precise stale-primary and
   crossing-boundary assertions remain in the cargo failpoint tests.
+- Added a restart-focused variant of the route-change UAT smoke:
+  `./scripts/uat-s3-tests --smoke route-change-restart` performs the same
+  data-PG acting-set move, then restarts every storage-node process after the
+  new route is serving and before retained historical reads. The smoke then
+  rechecks old-object `GET`, `HEAD`, object listing, and version listing before
+  writing a new object under the moved placement. This pins the storage-node
+  reload side of retained historical route installation without expanding the
+  precise cargo failpoint matrix.
 
 Exit criteria:
 

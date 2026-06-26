@@ -10994,10 +10994,10 @@ fn complete_multipart_upload_does_not_deadlock_when_bucket_policy_shares_pg() {
     let bucket = "bucket-complete-same-pg";
     let pg_ids: Vec<u32> = (0..METADATA_FANOUT_TEST_PG_COUNT).collect();
     let storage_cluster = open_test_storage_cluster(tmp.path(), &pg_ids);
-    let admin = setup_same_process_coordinator_with_storage_cluster_without_lifecycle_sweeper(
+    let admin = setup_same_process_coordinator_with_storage_cluster_without_background_sweepers(
         Arc::clone(&storage_cluster),
     );
-    let completer = setup_same_process_coordinator_with_storage_cluster_without_lifecycle_sweeper(
+    let completer = setup_same_process_coordinator_with_storage_cluster_without_background_sweepers(
         Arc::clone(&storage_cluster),
     );
 
