@@ -4115,6 +4115,26 @@ fn routine_metadata_checkpoint_records_current_primary_candidate_once() {
 }
 
 #[test]
+fn routine_metadata_checkpoint_skips_active_empty_pg() {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[1], ec_shape).unwrap();
+    set_route_primary(&mut map, 1, NodeId::new(0));
+
+    let cluster = crate::StorageCluster::from_local_map(Arc::new(map)).unwrap();
+    let summary = cluster
+        .record_routine_metadata_command_checkpoints()
+        .unwrap();
+
+    assert_eq!(summary.scanned, 1);
+    assert_eq!(summary.skipped_empty, 1);
+    assert_eq!(summary.recorded, 0);
+    assert_eq!(summary.compacted, 0);
+    assert_eq!(summary.failed, 0);
+}
+
+#[test]
 fn metadata_command_checkpoint_catalogue_retains_newest_candidates_per_epoch() {
     let tmp = test_util::tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];

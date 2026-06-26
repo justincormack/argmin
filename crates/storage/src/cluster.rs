@@ -4313,6 +4313,10 @@ impl StorageCluster {
             let metadata_client = primary_node.metadata_command_client();
             let state = match metadata_client.metadata_command_replica_state(route.pg_id()) {
                 Ok(state) => state,
+                Err(StoreError::MetadataCommandReplicaStateMissing { .. }) => {
+                    summary.skipped_empty += 1;
+                    continue;
+                }
                 Err(error) => {
                     if metadata_command_checkpoint_record_error_is_stale(&error) {
                         summary.skipped_stale_epoch += 1;
@@ -10681,11 +10685,48 @@ fn metadata_command_checkpoint_record_error_is_stale(error: &StoreError) -> bool
         | StoreError::RouteMapExpired { .. }
         | StoreError::StaleShardOperation { .. }
         | StoreError::StaleShardLocation { .. }
-        | StoreError::PgNotActive { .. } => true,
+        | StoreError::PgNotActive { .. }
+        | StoreError::MetadataCommandContention { .. } => true,
+        StoreError::Io {
+            context: "connect storage-node RPC socket",
+            ..
+        } => true,
         StoreError::StorageRpc { message, .. } => {
             is_retryable_remote_pg_route_error(message.as_str())
+                || message.contains("metadata command contention during")
         }
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod metadata_command_checkpoint_record_error_tests {
+    use super::*;
+
+    #[test]
+    fn metadata_checkpoint_record_treats_restart_and_contention_as_transient() {
+        assert!(metadata_command_checkpoint_record_error_is_stale(
+            &StoreError::Io {
+                context: "connect storage-node RPC socket",
+                source: std::io::Error::new(std::io::ErrorKind::NotFound, "node socket missing"),
+            },
+        ));
+        assert!(metadata_command_checkpoint_record_error_is_stale(
+            &StoreError::StorageRpc {
+                node_id: 0,
+                operation: "metadata command checkpoint record current",
+                message:
+                    "Internal: metadata command contention during export metadata command checkpoint"
+                        .to_string(),
+            },
+        ));
+        assert!(!metadata_command_checkpoint_record_error_is_stale(
+            &StoreError::StorageRpc {
+                node_id: 0,
+                operation: "metadata command checkpoint record current",
+                message: "Internal: metadata state digest mismatch".to_string(),
+            },
+        ));
     }
 }
 

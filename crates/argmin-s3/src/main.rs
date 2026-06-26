@@ -1693,8 +1693,10 @@ fn build_control_plane_storage_node_process_config(
         default_ec_shape,
     )
     .map_err(|error| format!("failed to open storage node for startup heartbeat: {error}"))?;
-    let observed_epoch = ClusterEpoch::new(config.storage_cluster_epoch)
-        .ok_or_else(|| "ARGMIN_STORAGE_CLUSTER_EPOCH must be > 0".to_string())?;
+    // Control-plane managed storage nodes learn their current runtime map from
+    // this startup heartbeat; the static ARGMIN_STORAGE_CLUSTER_EPOCH belongs
+    // only to the legacy no-control-plane path.
+    let observed_epoch = ClusterEpoch::INITIAL;
     let lease_ms = u64::try_from(config.control_plane_heartbeat_lease_duration.as_millis())
         .map_err(|_| "ARGMIN_CONTROL_PLANE_HEARTBEAT_LEASE_MS is too large".to_string())?;
     let heartbeat = node
