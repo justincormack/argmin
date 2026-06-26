@@ -8708,6 +8708,14 @@ Metadata PG migration and backfill design notes:
   writing a new object under the moved placement. This pins the storage-node
   reload side of retained historical route installation without expanding the
   precise cargo failpoint matrix.
+- Added a converging-route storage-node restart variant:
+  `./scripts/uat-s3-tests --smoke route-change-node-restart` performs the same
+  data-PG acting-set move, then restarts the newly added storage node before the
+  target PG has finished installing the new serving route. After convergence it
+  runs the same retained old-object `GET`/`HEAD`/listing checks and
+  new-placement write/read checks. This covers startup ordering during route
+  convergence, distinct from the existing all-node restart-after-convergence
+  smoke.
 - Added the frontend-restart companion smoke:
   `./scripts/uat-s3-tests --smoke route-change-frontend-restart` performs the
   same data-PG acting-set move, then restarts the frontend before retained
