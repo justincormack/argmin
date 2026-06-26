@@ -8851,6 +8851,14 @@ Metadata PG migration and backfill design notes:
   partially replayed, and fully replayed destination states, converges both
   destination replicas to the expected imported proof, and preserves all
   checkpoint and suffix metadata rows.
+- Added checkpoint candidate-selection property coverage:
+  `prop_metadata_transfer_checkpoint_candidate_selection_picks_newest_usable`
+  generates multiple source checkpoints, corrupts every candidate newer than a
+  generated valid checkpoint, adds wrong-PG and ahead-of-source candidates, and
+  forces retained-log export to fall back to checkpoint selection. It asserts the
+  selector skips invalid newer candidates, chooses the newest usable checkpoint,
+  exports the retained suffix from that checkpoint, and preserves the final
+  source metadata proof.
 
 Exit criteria:
 

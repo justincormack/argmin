@@ -3881,6 +3881,132 @@ fn metadata_transfer_live_export_prefers_checkpoint_suffix_candidate() {
     );
 }
 
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(24))]
+
+    #[test]
+    fn prop_metadata_transfer_checkpoint_candidate_selection_picks_newest_usable(
+        total_commands in 2_usize..7,
+        valid_checkpoint_offset in 0_usize..6,
+    ) {
+        let valid_after = 1 + valid_checkpoint_offset % (total_commands - 1);
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[1], ec_shape).unwrap();
+        let topology = map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        let buckets = (1..=total_commands)
+            .map(|log_index| {
+                let prefix = format!(
+                    "prop-transfer-candidate-{total_commands}-{valid_after}-{log_index}-"
+                );
+                bucket_for_pg(topology, 1, &prefix)
+            })
+            .collect::<Vec<_>>();
+        set_route_primary(&mut map, 1, NodeId::new(0));
+        set_route_state(&mut map, 1, PgState::Peering);
+        let pg_id = PgId::new(1);
+        let source_pg = map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .get_pg(1)
+            .unwrap();
+        let mut checkpoints = Vec::with_capacity(total_commands);
+        for (offset, bucket) in buckets.iter().enumerate() {
+            let log_index = (offset + 1) as u64;
+            let command = create_bucket_metadata_command(pg_id, log_index, bucket.clone());
+            source_pg
+                .apply_metadata_command_and_record(0, &command)
+                .unwrap();
+            checkpoints.push(
+                source_pg
+                    .metadata_command_checkpoint(0, ClusterEpoch::INITIAL)
+                    .unwrap(),
+            );
+        }
+        let source_state = source_pg.metadata_command_replica_state().unwrap();
+        source_pg
+            .connection()
+            .execute(
+                "UPDATE metadata_command_log SET post_state_digest = NULL WHERE cluster_epoch = ?1 AND pg_id = ?2 AND log_index = ?3",
+                rusqlite::params![ClusterEpoch::INITIAL.get() as i64, pg_id.get() as i64, 1_i64],
+            )
+            .unwrap();
+        drop(source_pg);
+
+        let valid_checkpoint = checkpoints[valid_after - 1].clone();
+        let mut candidates = Vec::new();
+        for checkpoint in checkpoints.iter().rev() {
+            let mut candidate = checkpoint.clone();
+            if candidate.applied_log_index > valid_after as u64 {
+                candidate.checkpoint_crc64 ^= 1;
+            }
+            candidates.push(candidate);
+        }
+        let mut wrong_pg_candidate = valid_checkpoint.clone();
+        wrong_pg_candidate.pg_id = PgId::new(0);
+        candidates.insert(0, wrong_pg_candidate);
+        let mut ahead_candidate = valid_checkpoint.clone();
+        ahead_candidate.applied_log_index = source_state.applied_log_index + 1;
+        candidates.push(ahead_candidate);
+
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        let retained_log_err = cluster
+            .export_pg_metadata_transfer_from_retained_log(pg_id, NodeId::new(0))
+            .unwrap_err();
+        let retained_log_fallback_allowed = matches!(
+            retained_log_err,
+            crate::peering::PgPeeringReconstructionFailure::Reconstruction(
+                crate::peering::PgPeeringReconstructionError::MissingRetainedCommandStateProof {
+                    node_id,
+                    log_index: 1,
+                    ..
+                }
+            ) if node_id == NodeId::new(0)
+        );
+        prop_assert!(retained_log_fallback_allowed);
+
+        let artifact = cluster
+            .export_pg_metadata_transfer_artifact_for_live_transfer_with_checkpoints(
+                pg_id,
+                NodeId::new(0),
+                candidates,
+            )
+            .unwrap();
+
+        prop_assert_eq!(
+            artifact.source_base_kind(),
+            crate::peering::PgMetadataTransferBaseKind::Checkpoint
+        );
+        prop_assert_eq!(
+            artifact.source_base_metadata_proof(),
+            crate::control_plane::PgMetadataProof::new(
+                valid_checkpoint.applied_log_index,
+                valid_checkpoint.applied_log_hash,
+                valid_checkpoint.state_digest,
+            )
+        );
+        prop_assert_eq!(artifact.retained_log_entries.len(), total_commands - valid_after);
+        if let Some(first_retained) = artifact.retained_log_entries.first() {
+            prop_assert_eq!(first_retained.log_index, valid_after as u64 + 1);
+        }
+        prop_assert_eq!(
+            artifact.source_metadata_proof(),
+            crate::control_plane::PgMetadataProof::new(
+                source_state.applied_log_index,
+                source_state.applied_log_hash,
+                source_state.state_digest,
+            )
+        );
+    }
+}
+
 #[test]
 fn metadata_transfer_live_export_uses_durable_checkpoint_candidate() {
     let tmp = test_util::tempdir();
