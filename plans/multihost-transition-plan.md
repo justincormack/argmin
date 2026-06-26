@@ -8708,6 +8708,13 @@ Metadata PG migration and backfill design notes:
   writing a new object under the moved placement. This pins the storage-node
   reload side of retained historical route installation without expanding the
   precise cargo failpoint matrix.
+- Added the frontend-restart companion smoke:
+  `./scripts/uat-s3-tests --smoke route-change-frontend-restart` performs the
+  same data-PG acting-set move, then restarts the frontend before retained
+  reads/listing and the new-placement write. This pins fresh frontend startup
+  against the control-plane runtime-map path after route history has already
+  become necessary, complementing the storage-node restart smoke without
+  duplicating the full precise failpoint matrix.
 
 Exit criteria:
 
