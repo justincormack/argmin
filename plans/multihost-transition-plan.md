@@ -8797,6 +8797,12 @@ Metadata PG migration and backfill design notes:
   only use valid same-index source shards, reconstruction targets require enough
   valid source shards, priority/remaining-tolerance is monotonic with risk, and
   already healthy desired shards are not targeted.
+- Added the first Phase 11 close-out property test:
+  `prop_backfill_plan_classifies_targets_and_priority` generates EC shapes plus
+  source/desired shard-health masks and pins the pure planner classification
+  rules. It verifies exact target partitioning for already-present, direct-copy,
+  reconstruction, and unrecoverable shards, and verifies that durable scheduling
+  tolerance is derived from source risk rather than a default.
 
 Exit criteria:
 

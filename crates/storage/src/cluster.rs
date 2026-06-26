@@ -11006,12 +11006,14 @@ fn is_recoverable_physical_shard_io_error(context: &'static str, kind: std::io::
 #[cfg(test)]
 mod backfill_plan_tests {
     use super::*;
+    use proptest::prelude::*;
+    use std::collections::HashSet;
 
     fn backfill_plan_test_health(
         risk: PlacedSegmentShardSetRisk,
         valid_indexes: &[u8],
     ) -> PlacedSegmentShardSetHealth {
-        let valid_indexes: std::collections::HashSet<u8> = valid_indexes.iter().copied().collect();
+        let valid_indexes: HashSet<u8> = valid_indexes.iter().copied().collect();
         let shards = (0..6)
             .map(|shard_index| {
                 let shard_index = ShardIndex::new(shard_index);
@@ -11036,6 +11038,52 @@ mod backfill_plan_tests {
             total_shards: 6,
             required_shards: 4,
             valid_shards: valid_indexes.len(),
+            risk,
+            shards,
+        }
+    }
+
+    fn generated_backfill_plan_test_health(
+        required_shards: usize,
+        total_shards: usize,
+        valid_mask: u16,
+        data_pg_id: DataPgId,
+        node_offset: u32,
+    ) -> PlacedSegmentShardSetHealth {
+        let valid_shards = (0..total_shards)
+            .filter(|index| (valid_mask & (1_u16 << index)) != 0)
+            .count();
+        let risk = match valid_shards {
+            valid if valid == total_shards => PlacedSegmentShardSetRisk::Healthy,
+            valid if valid >= required_shards => PlacedSegmentShardSetRisk::Degraded {
+                tolerance_remaining: valid - required_shards,
+            },
+            _ => PlacedSegmentShardSetRisk::Unrecoverable,
+        };
+        let shards = (0..total_shards)
+            .map(|index| {
+                let shard_index = ShardIndex::new(u8::try_from(index).unwrap());
+                PlacedSegmentShardHealth {
+                    shard_index,
+                    shard_key: ShardKey::new(&[7; 16], 1, shard_index.get()),
+                    location: ShardLocation::new(
+                        ClusterEpoch::INITIAL,
+                        data_pg_id,
+                        shard_index,
+                        NodeId::new(node_offset + u32::from(shard_index.get())),
+                    ),
+                    validation: if (valid_mask & (1_u16 << index)) != 0 {
+                        PlacedSegmentShardValidation::Valid
+                    } else {
+                        PlacedSegmentShardValidation::MissingAck
+                    },
+                }
+            })
+            .collect();
+        PlacedSegmentShardSetHealth {
+            total_shards,
+            required_shards,
+            valid_shards,
             risk,
             shards,
         }
@@ -11099,6 +11147,114 @@ mod backfill_plan_tests {
         assert_eq!(plan.copy_targets, Vec::new());
         assert_eq!(plan.reconstruction_targets, Vec::new());
         assert_eq!(plan.unrecoverable_targets, vec![ShardIndex::new(5)]);
+    }
+
+    proptest! {
+        #[test]
+        fn prop_backfill_plan_classifies_targets_and_priority(
+            required_shards in 1_usize..=6,
+            parity_shards in 0_usize..=4,
+            source_mask in any::<u16>(),
+            desired_mask in any::<u16>(),
+        ) {
+            let total_shards = required_shards + parity_shards;
+            prop_assume!(total_shards <= 10);
+            let shard_mask = (1_u16 << total_shards) - 1;
+            let source_mask = source_mask & shard_mask;
+            let desired_mask = desired_mask & shard_mask;
+            let source_valid_count = usize::try_from(source_mask.count_ones()).unwrap();
+            let source_recoverable = source_valid_count >= required_shards;
+
+            let source_health = generated_backfill_plan_test_health(
+                required_shards,
+                total_shards,
+                source_mask,
+                DataPgId::new(PgId::new(0)),
+                10,
+            );
+            let desired_health = generated_backfill_plan_test_health(
+                required_shards,
+                total_shards,
+                desired_mask,
+                DataPgId::new(PgId::new(1)),
+                100,
+            );
+
+            let plan = build_placed_segment_shard_backfill_plan(
+                source_health.clone(),
+                desired_health.clone(),
+            )
+            .unwrap();
+
+            let expected_tolerance = source_valid_count.saturating_sub(required_shards);
+            prop_assert_eq!(
+                usize::from(plan.source_remaining_tolerance()),
+                expected_tolerance
+            );
+            prop_assert_eq!(plan.source_health.valid_shards, source_valid_count);
+            prop_assert_eq!(
+                plan.source_health.risk,
+                if source_valid_count == total_shards {
+                    PlacedSegmentShardSetRisk::Healthy
+                } else if source_recoverable {
+                    PlacedSegmentShardSetRisk::Degraded {
+                        tolerance_remaining: expected_tolerance,
+                    }
+                } else {
+                    PlacedSegmentShardSetRisk::Unrecoverable
+                }
+            );
+
+            for index in 0..total_shards {
+                let shard_index = ShardIndex::new(u8::try_from(index).unwrap());
+                let desired_valid = (desired_mask & (1_u16 << index)) != 0;
+                let source_valid = (source_mask & (1_u16 << index)) != 0;
+                let is_already_present = plan.already_present.contains(&shard_index);
+                let copy_target = plan
+                    .copy_targets
+                    .iter()
+                    .find(|target| target.shard_index == shard_index);
+                let is_reconstruction_target =
+                    plan.reconstruction_targets.contains(&shard_index);
+                let is_unrecoverable_target =
+                    plan.unrecoverable_targets.contains(&shard_index);
+                let target_count = usize::from(is_already_present)
+                    + usize::from(copy_target.is_some())
+                    + usize::from(is_reconstruction_target)
+                    + usize::from(is_unrecoverable_target);
+
+                prop_assert_eq!(
+                    target_count,
+                    1,
+                    "shard {} must be classified exactly once",
+                    index
+                );
+
+                if desired_valid {
+                    prop_assert!(is_already_present);
+                    prop_assert!(copy_target.is_none());
+                    prop_assert!(!is_reconstruction_target);
+                    prop_assert!(!is_unrecoverable_target);
+                } else if source_valid {
+                    let target = copy_target.expect("valid source shard must produce a copy target");
+                    prop_assert_eq!(target.source.shard_index(), shard_index);
+                    prop_assert_eq!(target.destination.shard_index(), shard_index);
+                    prop_assert!(!is_already_present);
+                    prop_assert!(!is_reconstruction_target);
+                    prop_assert!(!is_unrecoverable_target);
+                } else if source_recoverable {
+                    prop_assert!(is_reconstruction_target);
+                    prop_assert!(!is_already_present);
+                    prop_assert!(copy_target.is_none());
+                    prop_assert!(!is_unrecoverable_target);
+                } else {
+                    prop_assert!(is_unrecoverable_target);
+                    prop_assert!(!is_already_present);
+                    prop_assert!(copy_target.is_none());
+                    prop_assert!(!is_reconstruction_target);
+                }
+            }
+        }
     }
 }
 
