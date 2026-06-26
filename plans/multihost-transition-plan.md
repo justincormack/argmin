@@ -6089,6 +6089,14 @@ Status:
   remains readable/listable from the surviving shard, and then verifies a new
   `PutObject` fails closed while the cluster is below the write placement
   requirement.
+- Added the companion primary-loss smoke:
+  `./scripts/uat-s3-tests --smoke storage-node-primary-kill-fails-closed`.
+  It uses the same 1+1 topology, writes and verifies an object before failure,
+  kills the primary storage node, and requires old-object `GET`, object
+  listing, and a new `PutObject` to fail closed with coded S3 service errors
+  rather than transport failures or stale success. `HEAD` is also checked for a
+  service-level failure response, but the SDK does not expose a parsed S3 error
+  code for the empty-body HEAD 500 response.
 - Audited current guides and observability notes for stale bucket-lock
   authority language. The metadata model, threat model, and production
   observability plan now describe durable metadata command serialization,

@@ -22,6 +22,7 @@ Options:
   --repeat N            Repeat the selected s3-tests command N times (default: 1)
   --smoke NAME           Run a focused smoke instead of the full suite:
                          storage-node-restart, storage-node-kill-fails-closed,
+                         storage-node-primary-kill-fails-closed,
                          control-plane-runtime-map, shard-repair,
                          route-change, route-change-node-restart,
                          route-change-restart,
@@ -139,10 +140,10 @@ case "$topology" in
         ;;
 esac
 case "$smoke" in
-    ""|storage-node-restart|storage-node-kill-fails-closed|control-plane-runtime-map|shard-repair|route-change|route-change-node-restart|route-change-restart|route-change-control-plane-restart|route-change-frontend-restart|route-change-full-restart|pg-backfill-migration|metadata-pg-migration|metadata-pg-migration-failover)
+    ""|storage-node-restart|storage-node-kill-fails-closed|storage-node-primary-kill-fails-closed|control-plane-runtime-map|shard-repair|route-change|route-change-node-restart|route-change-restart|route-change-control-plane-restart|route-change-frontend-restart|route-change-full-restart|pg-backfill-migration|metadata-pg-migration|metadata-pg-migration-failover)
         ;;
     *)
-        die "--smoke must be storage-node-restart, storage-node-kill-fails-closed, control-plane-runtime-map, shard-repair, route-change, route-change-node-restart, route-change-restart, route-change-control-plane-restart, route-change-frontend-restart, route-change-full-restart, pg-backfill-migration, metadata-pg-migration, or metadata-pg-migration-failover"
+        die "--smoke must be storage-node-restart, storage-node-kill-fails-closed, storage-node-primary-kill-fails-closed, control-plane-runtime-map, shard-repair, route-change, route-change-node-restart, route-change-restart, route-change-control-plane-restart, route-change-frontend-restart, route-change-full-restart, pg-backfill-migration, metadata-pg-migration, or metadata-pg-migration-failover"
         ;;
 esac
 if [[ -n "$smoke" && "$topology" != "multihost" ]]; then
@@ -199,7 +200,7 @@ if [[ "$smoke" == "storage-node-restart" ]]; then
     export ARGMIN_LOCAL_NODE_COUNT=1
     export ARGMIN_PG_COUNT=1
 fi
-if [[ "$smoke" == "storage-node-kill-fails-closed" ]]; then
+if [[ "$smoke" == "storage-node-kill-fails-closed" || "$smoke" == "storage-node-primary-kill-fails-closed" ]]; then
     export ARGMIN_EC_K=1
     export ARGMIN_EC_M=1
     export ARGMIN_LOCAL_NODE_COUNT=2
@@ -280,7 +281,7 @@ if [[ "$smoke" == "metadata-pg-migration" || "$smoke" == "metadata-pg-migration-
         die "$smoke --repeat requires ARGMIN_PG_COUNT >= repeat count"
     fi
 fi
-if [[ "$smoke" == "storage-node-kill-fails-closed" ]]; then
+if [[ "$smoke" == "storage-node-kill-fails-closed" || "$smoke" == "storage-node-primary-kill-fails-closed" ]]; then
     export ARGMIN_ABORT_ON_500=0
 fi
 
@@ -1533,7 +1534,7 @@ if [[ "$smoke" == "shard-repair" ]]; then
     print_command cargo build -p s3-tests --bin uat_shard_repair_smoke
     cargo build -p s3-tests --bin uat_shard_repair_smoke
     shard_repair_smoke_cmd=("$ROOT/target/debug/uat_shard_repair_smoke")
-elif [[ "$smoke" == "storage-node-kill-fails-closed" || "$smoke" == "route-change" || "$smoke" == "route-change-node-restart" || "$smoke" == "route-change-restart" || "$smoke" == "route-change-control-plane-restart" || "$smoke" == "route-change-frontend-restart" || "$smoke" == "route-change-full-restart" || "$smoke" == "pg-backfill-migration" || "$smoke" == "metadata-pg-migration" || "$smoke" == "metadata-pg-migration-failover" ]]; then
+elif [[ "$smoke" == "storage-node-kill-fails-closed" || "$smoke" == "storage-node-primary-kill-fails-closed" || "$smoke" == "route-change" || "$smoke" == "route-change-node-restart" || "$smoke" == "route-change-restart" || "$smoke" == "route-change-control-plane-restart" || "$smoke" == "route-change-frontend-restart" || "$smoke" == "route-change-full-restart" || "$smoke" == "pg-backfill-migration" || "$smoke" == "metadata-pg-migration" || "$smoke" == "metadata-pg-migration-failover" ]]; then
     echo "== argmin-s3 UAT PG smoke helper build =="
     print_command cargo build -p s3-tests --bin uat_pg_backfill_smoke
     cargo build -p s3-tests --bin uat_pg_backfill_smoke
@@ -1784,6 +1785,46 @@ run_storage_node_kill_fails_closed_smoke() {
     "${pg_backfill_smoke_cmd[@]}" put-expect-failure "$bucket_file" "$new_key" "$new_body_file"
 
     echo "PASS: storage-node kill UAT smoke preserved readable data and failed new writes closed"
+}
+
+run_storage_node_primary_kill_fails_closed_smoke() {
+    local smoke_dir="$data_dir/storage-node-primary-kill-fails-closed-smoke"
+    local bucket_file="$smoke_dir/bucket"
+    local old_body_file="$smoke_dir/old-body.bin"
+    local new_body_file="$smoke_dir/new-body.bin"
+    local old_key="uat-storage-node-primary-loss-old-object"
+    local new_key="uat-storage-node-primary-loss-new-object"
+    mkdir -p "$smoke_dir"
+    printf 'argmin storage-node primary loss payload\n%.0s' {1..128} >"$old_body_file"
+    printf 'argmin storage-node primary loss failed-write payload\n%.0s' {1..128} >"$new_body_file"
+
+    echo "== argmin-s3 UAT storage-node primary loss pre-kill put =="
+    print_command "${pg_backfill_smoke_cmd[@]}" create-put "$bucket_file" "$old_key" "$old_body_file"
+    "${pg_backfill_smoke_cmd[@]}" create-put "$bucket_file" "$old_key" "$old_body_file"
+
+    echo "== argmin-s3 UAT storage-node primary loss pre-kill read/list =="
+    print_command "${pg_backfill_smoke_cmd[@]}" get "$bucket_file" "$old_key" "$old_body_file"
+    "${pg_backfill_smoke_cmd[@]}" get "$bucket_file" "$old_key" "$old_body_file"
+    print_command "${pg_backfill_smoke_cmd[@]}" head "$bucket_file" "$old_key" "$old_body_file"
+    "${pg_backfill_smoke_cmd[@]}" head "$bucket_file" "$old_key" "$old_body_file"
+    print_command "${pg_backfill_smoke_cmd[@]}" list-contains "$bucket_file" "$old_key"
+    "${pg_backfill_smoke_cmd[@]}" list-contains "$bucket_file" "$old_key"
+
+    kill_storage_node 0
+
+    echo "== argmin-s3 UAT storage-node primary loss post-kill reads fail closed =="
+    print_command "${pg_backfill_smoke_cmd[@]}" get-expect-failure "$bucket_file" "$old_key"
+    "${pg_backfill_smoke_cmd[@]}" get-expect-failure "$bucket_file" "$old_key"
+    print_command "${pg_backfill_smoke_cmd[@]}" head-expect-failure "$bucket_file" "$old_key"
+    "${pg_backfill_smoke_cmd[@]}" head-expect-failure "$bucket_file" "$old_key"
+    print_command "${pg_backfill_smoke_cmd[@]}" list-expect-failure "$bucket_file"
+    "${pg_backfill_smoke_cmd[@]}" list-expect-failure "$bucket_file"
+
+    echo "== argmin-s3 UAT storage-node primary loss post-kill write fails closed =="
+    print_command "${pg_backfill_smoke_cmd[@]}" put-expect-failure "$bucket_file" "$new_key" "$new_body_file"
+    "${pg_backfill_smoke_cmd[@]}" put-expect-failure "$bucket_file" "$new_key" "$new_body_file"
+
+    echo "PASS: storage-node primary kill UAT smoke failed reads and writes closed with S3 service responses"
 }
 
 run_route_change_smoke() {
@@ -2298,6 +2339,8 @@ if [[ "$smoke" == "storage-node-restart" ]]; then
     run_nextest "post-restart s3-tests smoke" test_object_read_not_exist
 elif [[ "$smoke" == "storage-node-kill-fails-closed" ]]; then
     run_storage_node_kill_fails_closed_smoke
+elif [[ "$smoke" == "storage-node-primary-kill-fails-closed" ]]; then
+    run_storage_node_primary_kill_fails_closed_smoke
 elif [[ "$smoke" == "control-plane-runtime-map" ]]; then
     sleep 1
     run_nextest "control-plane runtime-map pre-restart s3-tests smoke" test_object_default_content_type

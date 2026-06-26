@@ -2,7 +2,7 @@ use std::{collections::BTreeSet, path::Path};
 
 use s3_tests::{
     aws_sdk_s3::{
-        error::ProvideErrorMetadata,
+        error::{ProvideErrorMetadata, SdkError},
         primitives::ByteStream,
         types::{BucketVersioningStatus, VersioningConfiguration},
     },
@@ -15,7 +15,7 @@ use storage::{BucketName, GenerationId, ObjectKey, PgTopology};
 
 fn usage() -> ! {
     eprintln!(
-        "usage: uat_pg_backfill_smoke create-put <bucket-file> <key> <body-file> | create-versioned-put-distinct-data-pg <bucket-file> <key-file> <data-pg-file> <key-prefix> <body-file> [target-data-pg] [excluded-metadata-pg-csv] | create-put-distinct-data-pg <bucket-file> <key-file> <data-pg-file> <key-prefix> <body-file> [target-data-pg] [excluded-metadata-pg-csv] | create-put-metadata-pg <bucket-file> <key-file> <metadata-pg-file> <key-prefix> <body-file> <target-metadata-pg> | put-for-data-pg <bucket-file> <key-file> <key-prefix> <body-file> <data-pg> [excluded-metadata-pg-csv] | put-for-metadata-pg <bucket-file> <key-file> <key-prefix> <body-file> <target-metadata-pg> | put <bucket-file> <key> <body-file> | put-expect-failure <bucket-file> <key> <body-file> | get <bucket-file> <key> <body-file> | head <bucket-file> <key> <body-file> | list-contains <bucket-file> <key>... | list-versions-contains <bucket-file> <key>... | cleanup <bucket-file> <key>... | cleanup-versioned <bucket-file>"
+        "usage: uat_pg_backfill_smoke create-put <bucket-file> <key> <body-file> | create-versioned-put-distinct-data-pg <bucket-file> <key-file> <data-pg-file> <key-prefix> <body-file> [target-data-pg] [excluded-metadata-pg-csv] | create-put-distinct-data-pg <bucket-file> <key-file> <data-pg-file> <key-prefix> <body-file> [target-data-pg] [excluded-metadata-pg-csv] | create-put-metadata-pg <bucket-file> <key-file> <metadata-pg-file> <key-prefix> <body-file> <target-metadata-pg> | put-for-data-pg <bucket-file> <key-file> <key-prefix> <body-file> <data-pg> [excluded-metadata-pg-csv] | put-for-metadata-pg <bucket-file> <key-file> <key-prefix> <body-file> <target-metadata-pg> | put <bucket-file> <key> <body-file> | put-expect-failure <bucket-file> <key> <body-file> | get <bucket-file> <key> <body-file> | get-expect-failure <bucket-file> <key> | head <bucket-file> <key> <body-file> | head-expect-failure <bucket-file> <key> | list-contains <bucket-file> <key>... | list-expect-failure <bucket-file> | list-versions-contains <bucket-file> <key>... | cleanup <bucket-file> <key>... | cleanup-versioned <bucket-file>"
     );
     std::process::exit(2);
 }
@@ -33,6 +33,20 @@ fn read_body(path: &Path) -> Vec<u8> {
 
 fn run<F: std::future::Future>(future: F) -> F::Output {
     RT.block_on(future)
+}
+
+fn expect_s3_service_error<E>(context: &str, error: &SdkError<E>, require_code: bool)
+where
+    E: ProvideErrorMetadata + std::fmt::Debug,
+{
+    let Some(service_error) = error.as_service_error() else {
+        panic!("{context} failed below S3 API layer: {error:?}");
+    };
+    if require_code && service_error.code().is_none() {
+        panic!("{context} returned S3 service error without code: {error:?}");
+    }
+    let code = service_error.code().unwrap_or("<none>");
+    eprintln!("expected S3 failure for {context}: code={code} error={error:?}");
 }
 
 fn client_from_env() -> s3_tests::aws_sdk_s3::Client {
@@ -608,21 +622,11 @@ fn main() {
                     .await
                 {
                     Ok(_) => panic!("put UAT object {bucket}/{key} unexpectedly succeeded"),
-                    Err(error) => {
-                        let Some(service_error) = error.as_service_error() else {
-                            panic!(
-                                "put UAT object {bucket}/{key} failed below S3 API layer: {error:?}"
-                            );
-                        };
-                        let Some(code) = service_error.code() else {
-                            panic!(
-                                "put UAT object {bucket}/{key} returned S3 service error without code: {error:?}"
-                            );
-                        };
-                        eprintln!(
-                            "expected S3 put failure for {bucket}/{key}: code={code} error={error:?}"
-                        );
-                    }
+                    Err(error) => expect_s3_service_error(
+                        &format!("put UAT object {bucket}/{key}"),
+                        &error,
+                        true,
+                    ),
                 }
             });
         }
@@ -647,6 +651,29 @@ fn main() {
                 assert_eq!(actual, expected, "object body mismatch for {key}");
             });
         }
+        "get-expect-failure" => {
+            let Some(bucket_file) = args.next() else {
+                usage();
+            };
+            let Some(key) = args.next().and_then(|arg| arg.into_string().ok()) else {
+                usage();
+            };
+            if args.next().is_some() {
+                usage();
+            }
+            run(async {
+                let client = client_from_env();
+                let bucket = read_bucket(Path::new(&bucket_file));
+                match client.get_object().bucket(&bucket).key(&key).send().await {
+                    Ok(_) => panic!("get UAT object {bucket}/{key} unexpectedly succeeded"),
+                    Err(error) => expect_s3_service_error(
+                        &format!("get UAT object {bucket}/{key}"),
+                        &error,
+                        true,
+                    ),
+                }
+            });
+        }
         "head" => {
             let Some(bucket_file) = args.next() else {
                 usage();
@@ -667,6 +694,29 @@ fn main() {
                 head_object_matches_len(&client, &bucket, &key, expected.len()).await;
             });
         }
+        "head-expect-failure" => {
+            let Some(bucket_file) = args.next() else {
+                usage();
+            };
+            let Some(key) = args.next().and_then(|arg| arg.into_string().ok()) else {
+                usage();
+            };
+            if args.next().is_some() {
+                usage();
+            }
+            run(async {
+                let client = client_from_env();
+                let bucket = read_bucket(Path::new(&bucket_file));
+                match client.head_object().bucket(&bucket).key(&key).send().await {
+                    Ok(_) => panic!("head UAT object {bucket}/{key} unexpectedly succeeded"),
+                    Err(error) => expect_s3_service_error(
+                        &format!("head UAT object {bucket}/{key}"),
+                        &error,
+                        false,
+                    ),
+                }
+            });
+        }
         "list-contains" => {
             let Some(bucket_file) = args.next() else {
                 usage();
@@ -681,6 +731,26 @@ fn main() {
                 let client = client_from_env();
                 let bucket = read_bucket(Path::new(&bucket_file));
                 list_contains_keys(&client, &bucket, &keys).await;
+            });
+        }
+        "list-expect-failure" => {
+            let Some(bucket_file) = args.next() else {
+                usage();
+            };
+            if args.next().is_some() {
+                usage();
+            }
+            run(async {
+                let client = client_from_env();
+                let bucket = read_bucket(Path::new(&bucket_file));
+                match client.list_objects_v2().bucket(&bucket).send().await {
+                    Ok(_) => panic!("list UAT objects in {bucket} unexpectedly succeeded"),
+                    Err(error) => expect_s3_service_error(
+                        &format!("list UAT objects in {bucket}"),
+                        &error,
+                        true,
+                    ),
+                }
             });
         }
         "list-versions-contains" => {
