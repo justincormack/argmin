@@ -1,0 +1,171 @@
+Mismatched heartbeat epochs can poison node liveness
+Link: https://chatgpt.com/codex/cloud/security/findings/173f172d49e8819181b055f5a0d391af?sev=&repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin
+Criticality: low (attack path: low)
+Status: fixed
+
+# Metadata
+Repo: justincormack/argmin
+Commit: 09407f8
+Author: justin@specialbusservice.com
+Created: 26/06/2026, 12:24:47
+Assignee: Unassigned
+Signals: Security, Validated, Attack-path
+
+# Resolution
+Fixed in commit [`4ec9a4df`](https://github.com/justincormack/argmin/commit/4ec9a4df) (`Reject future epoch heartbeats`), which made the control plane reject heartbeats whose `observed_epoch` is greater than the current control-plane epoch before mutating node liveness, lease state, PG observations, or PG peering state. The fix preserves the intended stale-epoch heartbeat behavior for restarted or lagging storage nodes while making future-epoch reports fail closed.
+
+Follow-up commit [`746bbb8c`](https://github.com/justincormack/argmin/commit/746bbb8c7ff26ff2a86c37d0122cfe8f1e6700be) (`Harden metadata checkpoint startup races`) adjusted control-plane-managed storage-node startup so bootstrap heartbeats no longer reuse the static `ARGMIN_STORAGE_CLUSTER_EPOCH` value from the legacy no-control-plane path. Startup now reports `ClusterEpoch::INITIAL` and learns the authoritative epoch from the returned runtime map, avoiding accidental future-epoch bootstrap heartbeats under the stricter guard.
+
+# Summary
+Introduced bug: mismatched-epoch heartbeats now persist attacker-controlled/stale/future liveness fields and clear PG observations instead of being side-effect-free. This enables a local/control-plane-adjacent actor able to submit a storage-node heartbeat to force affected PGs out of service or trigger repeering.
+In SingleAuthorityControlPlane::heartbeat, the new mismatched-epoch branch handles all `heartbeat.observed_epoch != current_epoch` cases the same way. It updates `last_observed_epoch` to the heartbeat-provided epoch, refreshes the lease deadline, clears PG observations, and may mark all PGs involving the node as peering when incarnation or endpoint changes. There is no check that the observed epoch is less than or equal to the control-plane epoch, so a future observed epoch is accepted. Since `NodeControlRecord::can_serve_primary` requires `last_observed_epoch == current_epoch`, and active PG serving also depends on current PG observations, one malformed heartbeat can make an otherwise healthy active primary stop being considered serving. Before this commit, mismatched-epoch heartbeats returned a non-serving lease without mutating the control-plane snapshot.
+
+# Validation
+## Rubric
+- [x] Identify the serving gate and confirm serving requires NodeControlRecord.last_observed_epoch == current cluster_epoch.
+- [x] Identify whether the mismatched-epoch heartbeat branch rejects future observed_epoch values or mutates state for all != current cases.
+- [x] Create a realistic precondition: healthy active node, active PG, stored current PG observation, and deterministic primary selection succeeds before the malformed heartbeat.
+- [x] Submit a future-epoch heartbeat through the real heartbeat API and verify it is accepted rather than rejected.
+- [x] Verify persistent availability-impacting side effects: future/stale liveness fields stored, PG observations cleared, endpoint/incarnation persisted, PG moved to Peering on endpoint/incarnation change, and primary serving selection becomes None. Also attempt crash, valgrind, and debugger-based validation before finalizing.
+## Report
+Validated the finding against commit 09407f81a026d462789589951f866e6aaaee47fb. Code evidence: crates/storage/src/control_plane.rs:213-219 requires last_observed_epoch == current cluster_epoch for serving eligibility. The mismatched-epoch heartbeat branch at control_plane.rs:2344 handles any observed_epoch != current_epoch without rejecting future epochs; at 2368-2374 it stores heartbeat.observed_epoch, refreshes heartbeat/lease fields, and clears pg_observations; at 2376-2380 it marks PGs peering when endpoint/incarnation changes; at 2388 it returns serving=false. The helper at 5715-5727 only checks cluster-map-history floor, and with an empty/default summary returns Ok without comparing heartbeat.observed_epoch to the current epoch. I added a targeted integration PoC at crates/storage/tests/future_epoch_heartbeat_poc.rs. The PoC first creates an active node/PG with a stored active PG observation and deterministic primary Some(node 1), then submits a forged heartbeat with future_epoch = before_epoch + 100 plus attacker-controlled endpoint/incarnation. The heartbeat is accepted via unwrap at PoC line 112. Assertions at lines 114-127 confirm the side effects: non-serving lease, epoch bump, persisted endpoint, persisted future last_observed_epoch, refreshed lease deadline, cleared PG observation, active PG moved to Peering, and deterministic primary becomes None. Command output: `cargo test -p storage --test future_epoch_heartbeat_poc -- --nocapture` completed with `test future_epoch_heartbeat_persists_liveness_clears_observations_and_repeers ... ok`. Crash attempt: the PoC does not crash because this is a logic/availability bug, but it dynamically reproduces the vulnerable state transition. Valgrind attempt was made but unavailable in the container: `bash: command not found: valgrind`. Debugger validation: LLDB breakpoint at control_plane.rs:2368 stopped in SingleAuthorityControlPlane::heartbeat for the forged heartbeat with `heartbeat.observed_epoch = 105`, `current_epoch = 5`, `lease_deadline_ms = 4000`, and the stack showed the call from future_epoch_heartbeat_poc.rs:112; continuing completed the test successfully.
+
+# Evidence
+crates/storage/src/control_plane.rs (L213 to 219)
+  Note: Serving eligibility requires the stored last_observed_epoch to equal the current cluster epoch, so writing a future or stale observed epoch makes the node non-serving.
+```
+    fn can_serve_primary(&self, cluster_epoch: ClusterEpoch, now_ms: u64) -> bool {
+        self.membership.can_serve_primary()
+            && self.availability == NodeAvailabilityState::Healthy
+            && self.last_observed_epoch == Some(cluster_epoch)
+            && self
+                .lease_deadline_ms
+                .is_some_and(|lease_deadline_ms| lease_deadline_ms > now_ms)
+```
+
+crates/storage/src/control_plane.rs (L2344 to 2390)
+  Note: The new mismatched-epoch branch mutates the node record for any observed_epoch not equal to current_epoch, including future epochs, updates the lease, clears PG observations, and may mark PGs peering before returning a non-serving lease.
+```
+        if heartbeat.observed_epoch != current_epoch {
+            validate_storage_cluster_map_history_floor_at_epoch(
+                &self.snapshot,
+                &heartbeat,
+                current_epoch,
+            )?;
+            let mut next_snapshot = self.snapshot.clone();
+            let mut epoch_changed = false;
+            let mut affected_node = None;
+            {
+                let record = next_snapshot
+                    .nodes
+                    .get_mut(&heartbeat.node_id)
+                    .expect("node record validated before heartbeat mutation");
+                if heartbeat.node_incarnation > record.node_incarnation {
+                    record.node_incarnation = heartbeat.node_incarnation;
+                    epoch_changed = true;
+                    affected_node = Some(heartbeat.node_id);
+                }
+                if record.endpoint != heartbeat.endpoint {
+                    record.endpoint = heartbeat.endpoint;
+                    epoch_changed = true;
+                    affected_node = Some(heartbeat.node_id);
+                }
+                record.last_observed_epoch = Some(heartbeat.observed_epoch);
+                record.last_heartbeat_ms = Some(authority_now_ms);
+                record.lease_deadline_ms = Some(lease_deadline_ms);
+                record.cluster_map_history_floor_epoch = heartbeat
+                    .cluster_map_history_reference_summary
+                    .oldest_required_epoch();
+                record.pg_observations.clear();
+            }
+            if epoch_changed {
+                if let Some(node_id) = affected_node {
+                    mark_pgs_peering_for_nodes(&mut next_snapshot, [node_id]);
+                }
+                next_snapshot.bump_epoch()?;
+            }
+            self.commit_snapshot(next_snapshot)?;
+            return Ok(HeartbeatLease {
+                authority_incarnation: self.snapshot.authority_incarnation,
+                cluster_epoch: self.snapshot.cluster_epoch,
+                node_id: heartbeat.node_id,
+                lease_deadline_ms,
+                serving: false,
+                snapshot: self.snapshot.clone(),
+            });
+```
+
+crates/storage/src/control_plane.rs (L2392 to 2397)
+  Note: The normal current-epoch path validates PG observations, but the mismatched-epoch mutation path skips this validation while still clearing the stored observations.
+```
+        validate_storage_cluster_map_history_floor(&self.snapshot, &heartbeat)?;
+        validate_pg_heartbeat_observations(
+            &self.snapshot,
+            heartbeat.node_id,
+            &heartbeat.pg_observations,
+        )?;
+```
+
+crates/storage/src/control_plane.rs (L5710 to 5727)
+  Note: The helper used by the mismatched-epoch branch only bounds the history floor against the supplied max epoch and does not reject a heartbeat whose observed_epoch itself is in the future.
+```
+fn validate_storage_cluster_map_history_floor_at_epoch(
+    snapshot: &ClusterControlSnapshot,
+    heartbeat: &NodeHeartbeat,
+    max_floor_epoch: ClusterEpoch,
+) -> Result<(), ControlPlaneError> {
+    let Some(floor_epoch) = heartbeat
+        .cluster_map_history_reference_summary
+        .oldest_required_epoch()
+    else {
+        return Ok(());
+    };
+    if floor_epoch > max_floor_epoch {
+        return Err(ControlPlaneError::StorageClusterMapHistoryFloorInFuture {
+            node_id: heartbeat.node_id.as_u32(),
+            floor_epoch,
+            observed_epoch: max_floor_epoch,
+        });
+    }
+```
+
+# Attack-path analysis
+Final: low | Decider: model_decided | Matrix severity: ignore | Policy adjusted: ignore
+## Rationale
+The state-transition bug and availability impact are well evidenced by code and validation, but the assigned medium severity overstates threat-model reachability for the provided project context. The vulnerable input is a local Unix-domain control-plane heartbeat RPC, while the principal externally exposed surface is the S3 HTTP listener. The socket is protected by private directory ownership checks, and the normal storage-node heartbeat construction uses the configured current epoch rather than attacker-supplied future epochs. Because exploitation requires a local/internal or compromised storage-node-adjacent actor and yields availability degradation rather than confidentiality/integrity compromise, probability × impact supports low severity.
+## Likelihood
+low - Exploitation requires local/internal access to the private control-plane Unix socket or compromise of a storage-node-adjacent process. No evidence shows reachability from the public S3 HTTP listener or from unauthenticated network clients.
+## Impact
+medium - A successful crafted heartbeat can make affected PGs non-serving or force repeering, causing availability loss for affected storage placements. It does not provide code execution, credential disclosure, S3 authentication bypass, or direct data exfiltration.
+## Assumptions
+- The attacker does not already control the host OS/root account.
+- The primary externally reachable product surface is the S3 HTTP listener; the control-plane heartbeat surface is a local Unix-domain RPC socket.
+- No deployment manifests were present to prove the control-plane socket is shared across trust boundaries or exposed over the network.
+- Ability to connect to ARGMIN_CONTROL_PLANE_SOCKET_PATH or otherwise invoke ControlPlaneRpcKind::RefreshNodeHeartbeat
+- A configured control-plane role with storage nodes and active PGs
+- A crafted NodeHeartbeat whose observed_epoch differs from the current epoch, including a future epoch
+## Path
+local/internal socket actor -> control-plane RefreshNodeHeartbeat -> mismatched-epoch mutation -> poisoned liveness/cleared PG observations -> PG not serving / repeering
+## Path evidence
+- `crates/storage/src/control_plane.rs:213-219` - Serving eligibility requires last_observed_epoch to equal the current cluster epoch and a valid lease deadline.
+- `crates/storage/src/control_plane.rs:2344-2390` - The mismatched-epoch heartbeat branch mutates state for any observed_epoch != current_epoch, stores the heartbeat-provided epoch, refreshes lease fields, clears PG observations, and returns serving=false.
+- `crates/storage/src/control_plane.rs:2392-2397` - The current-epoch path validates PG heartbeat observations, but the mismatched-epoch mutation path skips that validation while clearing stored observations.
+- `crates/storage/src/control_plane.rs:5710-5728` - The helper used by the mismatched-epoch branch checks the cluster-map-history floor, not whether heartbeat.observed_epoch is in the future.
+- `crates/storage/src/control_plane.rs:3207-3240` - The Unix control-plane RPC handler deserializes RefreshNodeHeartbeat and calls refresh_node_heartbeat.
+- `crates/argmin-s3/src/main.rs:1319-1358` - The control-plane worker reads a Unix-socket request and dispatches it to build_control_plane_unix_response; no protocol-level authentication is visible on this path.
+- `crates/argmin-s3/src/main.rs:1382-1456` - Control-plane exposure is a Unix-domain socket whose parent directory must be private and owned by the process UID, limiting reachability to local/internal actors.
+- `crates/storage/src/storage_node_server.rs:456-482` - The normal storage-node heartbeat builder uses the configured cluster epoch as observed_epoch and rejects route epoch mismatches.
+## Narrative
+The bug is real: the control plane requires last_observed_epoch to equal the current cluster epoch before a node can serve as primary, but the mismatched-epoch heartbeat path accepts any observed_epoch != current_epoch, persists the supplied epoch, refreshes heartbeat/lease fields, clears PG observations, and can mark PGs peering. Validation demonstrated a future-epoch heartbeat causing non-serving/repeering behavior. However, the route is a local Unix-domain control-plane RPC, not the public S3 HTTP surface. The normal storage-node heartbeat builder uses its configured cluster_epoch and rejects route/config epoch mismatches, so an external S3 client cannot directly trigger this. Severity is therefore reduced from medium to low: availability impact is credible, but realistic exploitation requires local/internal control-plane socket access or compromise of a storage-node-adjacent process.
+## Controls
+- Control-plane RPC uses a Unix-domain socket, not a TCP listener.
+- Control-plane socket path must be absolute.
+- Control-plane socket parent directory is created 0700 if missing.
+- Control-plane socket parent directory must not be group/world accessible and must be owned by the process UID.
+- RPC worker limit and read/write timeouts exist for the control-plane socket.
+- Public S3 HTTP requests require separate SigV4 authentication and do not directly expose the heartbeat RPC.
+## Blindspots
+- No deployment manifests or service files were present to prove OS user separation between frontend, storage-node, and control-plane processes.
+- Static review cannot confirm whether operators place the control-plane socket in a directory accessible to less-trusted same-host processes.
+- The provided threat model may not fully cover newer multi-host/control-plane roles added by the repository.
+- No live cluster was inspected; impact breadth depends on PG placement and whether an actor can forge heartbeats for multiple node IDs.
