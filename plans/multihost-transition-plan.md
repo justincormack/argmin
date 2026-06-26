@@ -8831,6 +8831,14 @@ Metadata PG migration and backfill design notes:
   This composes checkpoint cadence/compaction with the same randomized stale
   operation, retained-route, restart, repair, lease, and command-reissue trace
   operations.
+- Extended the local cluster trace property with durable repair queue coverage.
+  The trace can now corrupt a committed segment shard, read the segment twice
+  through EC recovery, assert that the observed corrupt shard is recorded once
+  durably with coalesced observations, and assert that durable repair scans
+  enqueue the row once while subsequent scans dedupe against the in-memory
+  queue. This composes repair observation/dedupe with the randomized
+  epoch/state, retained-route, checkpoint, restart, lease, and command-reissue
+  trace operations.
 - Added retained-log metadata transfer artifact property coverage:
   `prop_metadata_transfer_retained_log_artifact_preserves_valid_chain` generates
   synthetic applied command-log chains with pre/post state digests and asserts

@@ -16,6 +16,7 @@ enum LocalClusterTraceOp {
     QueueStale(u8),
     LeaseReleaseAcrossEpoch(u8),
     RecoverAfterPhysicalShardLoss(u8),
+    DurableRepairQueueAfterShardCorruption(u8),
     RetainedRouteHistoricalRead(u8),
     RoutineMetadataCheckpointTick,
     DrainPendingCreateBucketFromSecondHandle(u8),
@@ -49,6 +50,7 @@ fn local_cluster_trace_strategy() -> impl Strategy<Value = Vec<LocalClusterTrace
             2 => any::<u8>().prop_map(LocalClusterTraceOp::QueueStale),
             2 => any::<u8>().prop_map(LocalClusterTraceOp::LeaseReleaseAcrossEpoch),
             1 => any::<u8>().prop_map(LocalClusterTraceOp::RecoverAfterPhysicalShardLoss),
+            1 => any::<u8>().prop_map(LocalClusterTraceOp::DurableRepairQueueAfterShardCorruption),
             1 => any::<u8>().prop_map(LocalClusterTraceOp::RetainedRouteHistoricalRead),
             1 => Just(LocalClusterTraceOp::RoutineMetadataCheckpointTick),
             1 => any::<u8>().prop_map(LocalClusterTraceOp::DrainPendingCreateBucketFromSecondHandle),
@@ -613,6 +615,99 @@ fn run_local_cluster_trace(ops: &[LocalClusterTraceOp]) -> TestCaseResult {
                     )
                     .unwrap();
                 prop_assert_eq!(recovered, segment.payload);
+            }
+            LocalClusterTraceOp::DurableRepairQueueAfterShardCorruption(seed) => {
+                if pg_state != PgState::Active {
+                    continue;
+                }
+                let cluster = current_cluster(&map);
+                while cluster
+                    .try_take_placed_segment_shard_repair_work()
+                    .is_some()
+                {}
+                let payload = format!("trace-durable-repair-queue-{step}-{seed}");
+                let bucket = trace_bucket(seed.wrapping_add(step as u8));
+                let key = trace_key(seed.wrapping_add(step as u8));
+                let segment = write_committed_direct_segment_for_with_okh(
+                    &cluster,
+                    &bucket,
+                    &key,
+                    [seed.wrapping_add(step as u8).wrapping_add(23); 16],
+                    payload.as_bytes(),
+                );
+                let shard_index = ShardIndex::new(0);
+                let shard_size = segment
+                    .payload
+                    .len()
+                    .div_ceil(usize::from(segment.written.ec.k));
+                let shard_path = cluster
+                    .test_payload_shard_file_path(
+                        segment.written.data_pg_id,
+                        segment.written.ec,
+                        &segment.segment_okh,
+                        segment.generation_id,
+                        shard_index.get(),
+                    )
+                    .map_err(|err| TestCaseError::fail(format!("{err:?}")))?;
+                std::fs::write(shard_path, vec![0xAB; shard_size])
+                    .map_err(|err| TestCaseError::fail(format!("{err:?}")))?;
+                let req = crate::SegmentStoredBytesRequest {
+                    data_pg_id: segment.written.data_pg_id,
+                    segment_okh: segment.segment_okh,
+                    segment_vid: segment.generation_id,
+                    stored_size: segment.payload.len(),
+                    segment_crc64: checksum::crc64::checksum(&segment.payload),
+                    ec: segment.written.ec,
+                };
+
+                for _ in 0..2 {
+                    let mut recovered = Vec::new();
+                    cluster
+                        .read_segment_payload_stored_bytes_into(req, &mut recovered)
+                        .map_err(|err| TestCaseError::fail(format!("{err:?}")))?;
+                    prop_assert_eq!(&recovered, &segment.payload);
+                }
+
+                let work = cluster
+                    .try_take_placed_segment_shard_repair_work()
+                    .ok_or_else(|| {
+                        TestCaseError::fail(
+                            "successful read recovery should enqueue corrupt shard repair",
+                        )
+                    })?;
+                prop_assert_eq!(work.request, req);
+                prop_assert_eq!(work.shard_index, shard_index);
+                prop_assert!(cluster
+                    .try_take_placed_segment_shard_repair_work()
+                    .is_none());
+
+                let durable_repairs = cluster
+                    .list_placed_segment_shard_repairs(req.data_pg_id)
+                    .map_err(|err| TestCaseError::fail(format!("{err:?}")))?;
+                let matching_repair = durable_repairs
+                    .iter()
+                    .find(|repair| repair.work_item == work)
+                    .ok_or_else(|| TestCaseError::fail("durable repair row missing"))?;
+                prop_assert!(matching_repair.observation_count >= 2);
+
+                let first_scan = cluster
+                    .enqueue_durable_placed_segment_shard_repair_work()
+                    .map_err(|err| TestCaseError::fail(format!("{err:?}")))?;
+                prop_assert!(first_scan.scanned >= 1);
+                prop_assert!(first_scan.enqueued >= 1);
+                let second_scan = cluster
+                    .enqueue_durable_placed_segment_shard_repair_work()
+                    .map_err(|err| TestCaseError::fail(format!("{err:?}")))?;
+                prop_assert!(second_scan.scanned >= 1);
+                prop_assert_eq!(second_scan.enqueued, 0);
+                let mut queued_repair_work = Vec::new();
+                while let Some(queued) = cluster.try_take_placed_segment_shard_repair_work() {
+                    queued_repair_work.push(queued);
+                }
+                prop_assert!(
+                    queued_repair_work.iter().any(|queued| queued == &work),
+                    "durable repair scan did not enqueue observed repair row: {queued_repair_work:?}"
+                );
             }
             LocalClusterTraceOp::RetainedRouteHistoricalRead(seed) => {
                 if pg_state != PgState::Active {
