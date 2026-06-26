@@ -24,10 +24,11 @@ Run the standard local CI checks:
   11. ./scripts/uat-s3-tests --smoke shard-repair
   12. ./scripts/uat-s3-tests --smoke route-change
   13. ./scripts/uat-s3-tests --smoke route-change-restart
-  14. ./scripts/uat-s3-tests --smoke route-change-frontend-restart
-  15. ./scripts/uat-s3-tests --smoke pg-backfill-migration
-  16. ./scripts/uat-s3-tests --smoke metadata-pg-migration
-  17. ./scripts/uat-s3-tests --smoke metadata-pg-migration-failover
+  14. ./scripts/uat-s3-tests --smoke route-change-control-plane-restart
+  15. ./scripts/uat-s3-tests --smoke route-change-frontend-restart
+  16. ./scripts/uat-s3-tests --smoke pg-backfill-migration
+  17. ./scripts/uat-s3-tests --smoke metadata-pg-migration
+  18. ./scripts/uat-s3-tests --smoke metadata-pg-migration-failover
 
 Arguments after `--` are appended to `cargo nextest run --workspace`.
 
@@ -84,6 +85,7 @@ run_cmd "multihost UAT control-plane runtime-map smoke" ./scripts/uat-s3-tests -
 run_cmd "multihost UAT shard repair smoke" ./scripts/uat-s3-tests --smoke shard-repair
 run_cmd "multihost UAT route-change smoke" ./scripts/uat-s3-tests --smoke route-change
 run_cmd "multihost UAT route-change restart smoke" ./scripts/uat-s3-tests --smoke route-change-restart
+run_cmd "multihost UAT route-change control-plane restart smoke" ./scripts/uat-s3-tests --smoke route-change-control-plane-restart
 run_cmd "multihost UAT route-change frontend restart smoke" ./scripts/uat-s3-tests --smoke route-change-frontend-restart
 run_cmd "multihost UAT PG backfill migration smoke" ./scripts/uat-s3-tests --smoke pg-backfill-migration
 run_cmd "multihost UAT metadata PG migration smoke" ./scripts/uat-s3-tests --smoke metadata-pg-migration

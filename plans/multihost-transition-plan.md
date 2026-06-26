@@ -8715,6 +8715,12 @@ Metadata PG migration and backfill design notes:
   against the control-plane runtime-map path after route history has already
   become necessary, complementing the storage-node restart smoke without
   duplicating the full precise failpoint matrix.
+- Added the control-plane-restart companion smoke:
+  `./scripts/uat-s3-tests --smoke route-change-control-plane-restart` performs
+  the same data-PG acting-set move, then restarts the control-plane process
+  before retained reads/listing and the new-placement write. This pins
+  persisted control-plane route history and runtime-map reconstruction after a
+  route change that already requires historical placement.
 
 Exit criteria:
 
