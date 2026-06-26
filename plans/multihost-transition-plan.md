@@ -8751,6 +8751,13 @@ Metadata PG migration and backfill design notes:
   This pins the combined persisted route-history path across a whole
   process-group restart without duplicating the precise cargo failpoint
   assertions.
+- Added a separate whole-process correctness soak wrapper:
+  `./scripts/uat-correctness-soak` composes the route-change, restart,
+  PG-backfill, metadata-PG migration, storage-node loss, and shard-repair
+  restart smokes with a repeat count. This is deliberately separate from
+  `./scripts/uat-forced-overload`: the correctness soak is for long-lived
+  multihost route-history and restart behavior without intentionally creating
+  admission pressure or host-local disk contention.
 
 Exit criteria:
 

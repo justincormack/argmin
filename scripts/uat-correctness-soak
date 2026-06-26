@@ -1,0 +1,126 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$ROOT"
+
+usage() {
+    cat <<'EOF'
+Usage: ./scripts/uat-correctness-soak [options]
+
+Run the multihost correctness soak. This is separate from
+./scripts/uat-forced-overload: it repeats route changes, restarts, metadata
+migration, backfill, and storage-node loss without intentionally creating
+single-host overload pressure.
+
+Options:
+  --repeat N           Repeat long-running transition smokes (default: 3)
+  --timeout-secs SECS  S3 client timeout passed to uat-s3-tests
+  --bucket-prefix PFX  Bucket prefix passed to uat-s3-tests
+  --binary PATH        Run an already-built argmin-s3-compatible binary
+  --release            Use a release argmin-s3 binary
+  --no-cleanup         Keep generated UAT data directories after passing runs
+  -h, --help           Show this help
+EOF
+}
+
+die() {
+    echo "error: $*" >&2
+    exit 2
+}
+
+run_step() {
+    local label="$1"
+    shift
+
+    echo
+    echo "== argmin-s3 correctness soak: $label =="
+    printf '+'
+    printf ' %q' "$@"
+    printf '\n'
+    "$@"
+}
+
+repeat_count="${ARGMIN_UAT_CORRECTNESS_SOAK_REPEAT:-3}"
+uat_options=()
+
+while (($# > 0)); do
+    case "$1" in
+        --repeat)
+            [[ $# -ge 2 ]] || die "--repeat requires a value"
+            repeat_count="$2"
+            shift 2
+            ;;
+        --timeout-secs)
+            [[ $# -ge 2 ]] || die "--timeout-secs requires a value"
+            uat_options+=("--timeout-secs" "$2")
+            shift 2
+            ;;
+        --bucket-prefix)
+            [[ $# -ge 2 ]] || die "--bucket-prefix requires a value"
+            uat_options+=("--bucket-prefix" "$2")
+            shift 2
+            ;;
+        --binary)
+            [[ $# -ge 2 ]] || die "--binary requires a value"
+            uat_options+=("--binary" "$2")
+            shift 2
+            ;;
+        --release)
+            uat_options+=("--release")
+            shift
+            ;;
+        --no-cleanup)
+            uat_options+=("--no-cleanup")
+            shift
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        *)
+            echo "unknown option: $1" >&2
+            usage >&2
+            exit 2
+            ;;
+    esac
+done
+
+if ! [[ "$repeat_count" =~ ^[1-9][0-9]*$ ]]; then
+    die "--repeat must be a positive integer"
+fi
+
+echo "== argmin-s3 correctness soak =="
+echo "repeat=$repeat_count"
+
+run_step "route-change repeated transitions" \
+    ./scripts/uat-s3-tests "${uat_options[@]}" --smoke route-change --repeat "$repeat_count"
+run_step "route-change storage-node restart during convergence" \
+    ./scripts/uat-s3-tests "${uat_options[@]}" --smoke route-change-node-restart --repeat "$repeat_count"
+run_step "route-change storage-node restart after convergence" \
+    ./scripts/uat-s3-tests "${uat_options[@]}" --smoke route-change-restart --repeat "$repeat_count"
+run_step "route-change control-plane restart" \
+    ./scripts/uat-s3-tests "${uat_options[@]}" --smoke route-change-control-plane-restart --repeat "$repeat_count"
+run_step "route-change frontend restart" \
+    ./scripts/uat-s3-tests "${uat_options[@]}" --smoke route-change-frontend-restart --repeat "$repeat_count"
+run_step "route-change full process restart" \
+    ./scripts/uat-s3-tests "${uat_options[@]}" --smoke route-change-full-restart --repeat "$repeat_count"
+run_step "PG backfill migration repeated transitions" \
+    ./scripts/uat-s3-tests "${uat_options[@]}" --smoke pg-backfill-migration --repeat "$repeat_count"
+run_step "metadata PG migration repeated transitions" \
+    ./scripts/uat-s3-tests "${uat_options[@]}" --smoke metadata-pg-migration --repeat "$repeat_count"
+run_step "metadata PG migration failover repeated transitions" \
+    ./scripts/uat-s3-tests "${uat_options[@]}" --smoke metadata-pg-migration-failover --repeat "$repeat_count"
+run_step "storage-node replica loss fails closed" \
+    ./scripts/uat-s3-tests "${uat_options[@]}" --smoke storage-node-kill-fails-closed
+run_step "storage-node primary loss fails closed" \
+    ./scripts/uat-s3-tests "${uat_options[@]}" --smoke storage-node-primary-kill-fails-closed
+run_step "shard repair survives storage-node and frontend restart" \
+    ./scripts/uat-s3-tests "${uat_options[@]}" --smoke shard-repair-restart --repeat "$repeat_count"
+
+if [[ -t 1 ]]; then
+    printf '\033[32mOK\033[0m: argmin-s3 correctness soak passed\n'
+else
+    echo "OK: argmin-s3 correctness soak passed"
+fi
