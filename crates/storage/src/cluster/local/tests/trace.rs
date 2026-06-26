@@ -19,6 +19,7 @@ enum LocalClusterTraceOp {
     DurableRepairQueueAfterShardCorruption(u8),
     RetainedRouteHistoricalRead(u8),
     DurableBackfillClaimAfterRouteChange(u8),
+    StaleDirectPutCleanupAfterRouteChange(u8),
     RoutineMetadataCheckpointTick,
     DrainPendingCreateBucketFromSecondHandle(u8),
     RestartAndValidate,
@@ -61,6 +62,7 @@ fn local_cluster_trace_strategy() -> impl Strategy<Value = Vec<LocalClusterTrace
             1 => any::<u8>().prop_map(LocalClusterTraceOp::DurableRepairQueueAfterShardCorruption),
             1 => any::<u8>().prop_map(LocalClusterTraceOp::RetainedRouteHistoricalRead),
             1 => any::<u8>().prop_map(LocalClusterTraceOp::DurableBackfillClaimAfterRouteChange),
+            1 => any::<u8>().prop_map(LocalClusterTraceOp::StaleDirectPutCleanupAfterRouteChange),
             1 => Just(LocalClusterTraceOp::RoutineMetadataCheckpointTick),
             1 => any::<u8>().prop_map(LocalClusterTraceOp::DrainPendingCreateBucketFromSecondHandle),
             1 => Just(LocalClusterTraceOp::RestartAndValidate),
@@ -160,6 +162,14 @@ fn trace_key(seed: u8) -> crate::ObjectKey {
 
 pub(super) fn trace_session(seed: u8) -> crate::SessionId {
     crate::SessionId::try_from(format!("{:032x}", u128::from(seed) + 1)).unwrap()
+}
+
+fn trace_session_for_step(step: usize, seed: u8) -> crate::SessionId {
+    crate::SessionId::try_from(format!(
+        "{:032x}",
+        ((step as u128) << 8) | (u128::from(seed) + 1)
+    ))
+    .unwrap()
 }
 
 fn trace_generation(seed: u8) -> crate::GenerationId {
@@ -999,6 +1009,139 @@ fn run_local_cluster_trace(ops: &[LocalClusterTraceOp]) -> TestCaseResult {
                     .map_err(|err| TestCaseError::fail(format!("{err:?}")))?;
                 prop_assert!(remaining_rows.iter().all(|row| row.work_item != work_item));
             }
+            LocalClusterTraceOp::StaleDirectPutCleanupAfterRouteChange(seed) => {
+                if pg_state != PgState::Active || current_epoch != ClusterEpoch::INITIAL {
+                    continue;
+                }
+                let source_epoch = current_epoch;
+                let source_route = PgRouteSnapshot::reconstructed(
+                    source_epoch,
+                    PgId::new(0),
+                    NodeId::new(0),
+                    trace_historical_source_acting_set(),
+                    PgState::Active,
+                );
+                {
+                    let map = Arc::get_mut(&mut map)
+                        .expect("trace must not retain StorageCluster handles");
+                    map.test_install_pg_routes([source_route.clone()]);
+                    map.epoch = source_epoch;
+                }
+                let source_cluster = current_cluster(&map);
+                let bucket =
+                    crate::BucketName::try_from(format!("trace-stale-cleanup-{step}-{seed}"))
+                        .unwrap();
+                let key =
+                    crate::ObjectKey::try_from(format!("trace-stale-cleanup-key-{step}-{seed}"))
+                        .unwrap();
+                ensure_test_bucket(&source_cluster, &bucket);
+
+                let reservation_id = trace_session_for_step(step, *seed);
+                let generation_id = source_cluster
+                    .reserve_put_object_generation(&bucket, &key, &reservation_id)
+                    .map_err(|err| TestCaseError::fail(format!("{err:?}")))?;
+                let payload = format!("trace-stale-direct-put-cleanup-{step}-{seed}");
+                let segment_okh = [seed.wrapping_add(step as u8).wrapping_add(79); 16];
+                let staged_written = source_cluster
+                    .write_direct_put_segment_payload_shards(
+                        &bucket,
+                        &key,
+                        generation_id,
+                        0,
+                        &segment_okh,
+                        payload.as_bytes(),
+                    )
+                    .map_err(|err| TestCaseError::fail(format!("{err:?}")))?;
+                source_cluster
+                    .test_register_payload_shard_acks(
+                        staged_written.data_pg_id,
+                        &staged_written.written_shards,
+                    )
+                    .map_err(|err| TestCaseError::fail(format!("{err:?}")))?;
+
+                let source_data_pg_primary = map
+                    .node(source_route.primary_node_id())
+                    .unwrap()
+                    .storage_node()
+                    .get_pg(staged_written.data_pg_id)
+                    .unwrap();
+                for written_shard in &staged_written.written_shards {
+                    source_data_pg_primary
+                        .validate_written_shard_ack(&written_shard.key, written_shard.ack)
+                        .map_err(|err| TestCaseError::fail(format!("{err:?}")))?;
+                    prop_assert!(shard_file_present_on_any_trace_node(
+                        &map,
+                        &written_shard.key
+                    ));
+                }
+                drop(source_data_pg_primary);
+
+                let commit_req = direct_put_commit_req(
+                    &source_cluster,
+                    DirectPutCommitReqFixture {
+                        bucket: &bucket,
+                        key: &key,
+                        reservation_id,
+                        generation_id,
+                        payload: payload.as_bytes(),
+                        segment_okh,
+                        written: &staged_written,
+                    },
+                );
+                drop(source_cluster);
+
+                current_epoch = ClusterEpoch::new(current_epoch.get() + 1).unwrap();
+                visited_epochs.insert(current_epoch);
+                let acting_set = trace_historical_current_acting_set(*seed);
+                let current_route = PgRouteSnapshot::reconstructed(
+                    current_epoch,
+                    PgId::new(0),
+                    acting_set[0],
+                    acting_set,
+                    PgState::Active,
+                );
+                {
+                    let map = Arc::get_mut(&mut map)
+                        .expect("trace must not retain StorageCluster handles");
+                    map.test_install_pg_routes([current_route]);
+                    map.test_install_historical_pg_routes([source_route.clone()]);
+                    map.epoch = current_epoch;
+                }
+                pg_state = PgState::Active;
+                written = None;
+
+                let stale_cluster = stale_cluster(&map, current_epoch);
+                let err = stale_cluster
+                    .commit_direct_put_object_from_payload_shards(
+                        &commit_req,
+                        &staged_written.written_shards,
+                        |_| Ok::<(), ()>(()),
+                    )
+                    .unwrap_err();
+                assert_stale_metadata_operation_error(err, current_epoch)?;
+                drop(stale_cluster);
+
+                let source_data_pg_primary = map
+                    .node(source_route.primary_node_id())
+                    .unwrap()
+                    .storage_node()
+                    .get_pg(commit_req.data_pg_id)
+                    .unwrap();
+                for written_shard in &staged_written.written_shards {
+                    prop_assert!(
+                        !shard_file_present_on_any_trace_node(&map, &written_shard.key),
+                        "stale direct PUT cleanup left shard file {}",
+                        written_shard.key
+                    );
+                    let ack_result = source_data_pg_primary
+                        .validate_written_shard_ack(&written_shard.key, written_shard.ack);
+                    prop_assert!(
+                        matches!(ack_result, Err(StoreError::NotFound)),
+                        "stale direct PUT cleanup left ack row for {}: {ack_result:?}",
+                        written_shard.key
+                    );
+                }
+            }
             LocalClusterTraceOp::RoutineMetadataCheckpointTick => {
                 let cluster = current_cluster(&map);
                 let summary = cluster
@@ -1195,6 +1338,16 @@ fn local_cluster_trace_retained_route_after_epoch_advances_uses_placed_segment_r
     ]);
 
     run_local_cluster_trace(&ops).unwrap();
+}
+
+#[test]
+fn local_cluster_trace_stale_direct_put_cleanup_uses_retained_route() {
+    run_local_cluster_trace(
+        &[LocalClusterTraceOp::StaleDirectPutCleanupAfterRouteChange(
+            37,
+        )],
+    )
+    .unwrap();
 }
 
 proptest! {

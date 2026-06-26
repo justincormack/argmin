@@ -8848,6 +8848,14 @@ Metadata PG migration and backfill design notes:
   the claim. This composes backfill row ownership with randomized epoch/state,
   retained-route, checkpoint, restart, repair, lease, and command-reissue trace
   operations.
+- Extended the local cluster trace property with stale direct-PUT cleanup under
+  retained route history. The trace can now stage direct-PUT payload shards,
+  register data-PG ack rows, advance to a new Active route while retaining the
+  source route, attempt the commit through a stale source-epoch handle, and
+  assert the failed commit deletes both the staged shard files and retained
+  data-PG ack rows. This composes failed publish cleanup with randomized
+  epoch/state, retained-route, checkpoint, repair, lease, and command-reissue
+  trace operations.
 - Added retained-log metadata transfer artifact property coverage:
   `prop_metadata_transfer_retained_log_artifact_preserves_valid_chain` generates
   synthetic applied command-log chains with pre/post state digests and asserts
