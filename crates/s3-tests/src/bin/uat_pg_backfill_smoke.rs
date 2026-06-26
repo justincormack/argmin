@@ -1,16 +1,20 @@
 use std::{collections::BTreeSet, path::Path};
 
 use s3_tests::{
-    aws_sdk_s3::error::ProvideErrorMetadata, build_client_with_ca,
-    delete_bucket_retrying_operation_aborted, delete_object_retrying_operation_aborted,
-    get_object_body_retrying_operation_aborted, put_object_retrying_operation_aborted,
-    retrying_operation_aborted_result, unique_bucket, RT,
+    aws_sdk_s3::{
+        error::ProvideErrorMetadata,
+        types::{BucketVersioningStatus, VersioningConfiguration},
+    },
+    build_client_with_ca, cleanup_versioned_bucket, delete_bucket_retrying_operation_aborted,
+    delete_object_retrying_operation_aborted, get_object_body_retrying_operation_aborted,
+    put_object_retrying_operation_aborted, retrying_operation_aborted_result, unique_bucket,
+    SendRetryingOperationAborted, RT,
 };
 use storage::{BucketName, GenerationId, ObjectKey, PgTopology};
 
 fn usage() -> ! {
     eprintln!(
-        "usage: uat_pg_backfill_smoke create-put <bucket-file> <key> <body-file> | create-put-distinct-data-pg <bucket-file> <key-file> <data-pg-file> <key-prefix> <body-file> [target-data-pg] [excluded-metadata-pg-csv] | create-put-metadata-pg <bucket-file> <key-file> <metadata-pg-file> <key-prefix> <body-file> <target-metadata-pg> | put-for-data-pg <bucket-file> <key-file> <key-prefix> <body-file> <data-pg> [excluded-metadata-pg-csv] | put-for-metadata-pg <bucket-file> <key-file> <key-prefix> <body-file> <target-metadata-pg> | put <bucket-file> <key> <body-file> | get <bucket-file> <key> <body-file> | cleanup <bucket-file> <key>..."
+        "usage: uat_pg_backfill_smoke create-put <bucket-file> <key> <body-file> | create-versioned-put-distinct-data-pg <bucket-file> <key-file> <data-pg-file> <key-prefix> <body-file> [target-data-pg] [excluded-metadata-pg-csv] | create-put-distinct-data-pg <bucket-file> <key-file> <data-pg-file> <key-prefix> <body-file> [target-data-pg] [excluded-metadata-pg-csv] | create-put-metadata-pg <bucket-file> <key-file> <metadata-pg-file> <key-prefix> <body-file> <target-metadata-pg> | put-for-data-pg <bucket-file> <key-file> <key-prefix> <body-file> <data-pg> [excluded-metadata-pg-csv] | put-for-metadata-pg <bucket-file> <key-file> <key-prefix> <body-file> <target-metadata-pg> | put <bucket-file> <key> <body-file> | get <bucket-file> <key> <body-file> | head <bucket-file> <key> <body-file> | list-contains <bucket-file> <key>... | list-versions-contains <bucket-file> <key>... | cleanup <bucket-file> <key>... | cleanup-versioned <bucket-file>"
     );
     std::process::exit(2);
 }
@@ -58,6 +62,20 @@ async fn create_bucket(client: &s3_tests::aws_sdk_s3::Client, bucket: &str) {
     .unwrap_or_else(|error| panic!("create UAT bucket {bucket}: {error:?}"));
 }
 
+async fn enable_bucket_versioning(client: &s3_tests::aws_sdk_s3::Client, bucket: &str) {
+    client
+        .put_bucket_versioning()
+        .bucket(bucket)
+        .versioning_configuration(
+            VersioningConfiguration::builder()
+                .status(BucketVersioningStatus::Enabled)
+                .build(),
+        )
+        .send_retrying_operation_aborted("enable UAT bucket versioning")
+        .await
+        .unwrap_or_else(|error| panic!("enable UAT bucket versioning {bucket}: {error:?}"));
+}
+
 async fn put_object(client: &s3_tests::aws_sdk_s3::Client, bucket: &str, key: &str, body: Vec<u8>) {
     put_object_retrying_operation_aborted(client, bucket, key, body).await;
 }
@@ -86,6 +104,76 @@ async fn cleanup_bucket(client: &s3_tests::aws_sdk_s3::Client, bucket: &str, key
         }
     }
     delete_bucket_retrying_operation_aborted(client, bucket).await;
+}
+
+async fn head_object_matches_len(
+    client: &s3_tests::aws_sdk_s3::Client,
+    bucket: &str,
+    key: &str,
+    expected_len: usize,
+) {
+    let response = client
+        .head_object()
+        .bucket(bucket)
+        .key(key)
+        .send_retrying_operation_aborted("head UAT object")
+        .await
+        .unwrap_or_else(|error| panic!("head UAT object {bucket}/{key}: {error:?}"));
+    assert_eq!(
+        response.content_length().unwrap_or_default(),
+        expected_len as i64,
+        "object content length mismatch for {key}",
+    );
+}
+
+async fn list_contains_keys(client: &s3_tests::aws_sdk_s3::Client, bucket: &str, keys: &[String]) {
+    let response = client
+        .list_objects_v2()
+        .bucket(bucket)
+        .send_retrying_operation_aborted("list UAT objects")
+        .await
+        .unwrap_or_else(|error| panic!("list UAT objects in {bucket}: {error:?}"));
+    let listed: BTreeSet<&str> = response
+        .contents()
+        .iter()
+        .filter_map(|object| object.key())
+        .collect();
+    for key in keys {
+        assert!(
+            listed.contains(key.as_str()),
+            "list_objects_v2 did not contain {key}; listed={listed:?}",
+        );
+    }
+}
+
+async fn list_versions_contains_keys(
+    client: &s3_tests::aws_sdk_s3::Client,
+    bucket: &str,
+    keys: &[String],
+) {
+    let response = client
+        .list_object_versions()
+        .bucket(bucket)
+        .send_retrying_operation_aborted("list UAT object versions")
+        .await
+        .unwrap_or_else(|error| panic!("list UAT object versions in {bucket}: {error:?}"));
+    let listed: BTreeSet<&str> = response
+        .versions()
+        .iter()
+        .filter_map(|object| object.key())
+        .chain(
+            response
+                .delete_markers()
+                .iter()
+                .filter_map(|marker| marker.key()),
+        )
+        .collect();
+    for key in keys {
+        assert!(
+            listed.contains(key.as_str()),
+            "list_object_versions did not contain {key}; listed={listed:?}",
+        );
+    }
 }
 
 fn pg_topology_from_env() -> PgTopology {
@@ -259,7 +347,7 @@ fn main() {
                 });
             });
         }
-        "create-put-distinct-data-pg" => {
+        "create-put-distinct-data-pg" | "create-versioned-put-distinct-data-pg" => {
             let Some(bucket_file) = args.next() else {
                 usage();
             };
@@ -288,6 +376,7 @@ fn main() {
             }
             run(async {
                 let client = client_from_env();
+                let versioned = command == "create-versioned-put-distinct-data-pg";
                 let (bucket, key, data_pg) = if target_data_pg.is_some() {
                     let (bucket, key, data_pg) = (0..100)
                         .find_map(|_| {
@@ -306,10 +395,16 @@ fn main() {
                             )
                         });
                     create_bucket(&client, &bucket).await;
+                    if versioned {
+                        enable_bucket_versioning(&client, &bucket).await;
+                    }
                     (bucket, key, data_pg)
                 } else {
                     let bucket = unique_bucket();
                     create_bucket(&client, &bucket).await;
+                    if versioned {
+                        enable_bucket_versioning(&client, &bucket).await;
+                    }
                     let (key, data_pg) = choose_key_with_distinct_data_pg(
                         &bucket,
                         &key_prefix,
@@ -507,6 +602,58 @@ fn main() {
                 assert_eq!(actual, expected, "object body mismatch for {key}");
             });
         }
+        "head" => {
+            let Some(bucket_file) = args.next() else {
+                usage();
+            };
+            let Some(key) = args.next().and_then(|arg| arg.into_string().ok()) else {
+                usage();
+            };
+            let Some(body_file) = args.next() else {
+                usage();
+            };
+            if args.next().is_some() {
+                usage();
+            }
+            run(async {
+                let client = client_from_env();
+                let bucket = read_bucket(Path::new(&bucket_file));
+                let expected = read_body(Path::new(&body_file));
+                head_object_matches_len(&client, &bucket, &key, expected.len()).await;
+            });
+        }
+        "list-contains" => {
+            let Some(bucket_file) = args.next() else {
+                usage();
+            };
+            let keys: Vec<String> = args
+                .map(|arg| arg.into_string().unwrap_or_else(|_| usage()))
+                .collect();
+            if keys.is_empty() {
+                usage();
+            }
+            run(async {
+                let client = client_from_env();
+                let bucket = read_bucket(Path::new(&bucket_file));
+                list_contains_keys(&client, &bucket, &keys).await;
+            });
+        }
+        "list-versions-contains" => {
+            let Some(bucket_file) = args.next() else {
+                usage();
+            };
+            let keys: Vec<String> = args
+                .map(|arg| arg.into_string().unwrap_or_else(|_| usage()))
+                .collect();
+            if keys.is_empty() {
+                usage();
+            }
+            run(async {
+                let client = client_from_env();
+                let bucket = read_bucket(Path::new(&bucket_file));
+                list_versions_contains_keys(&client, &bucket, &keys).await;
+            });
+        }
         "cleanup" => {
             let Some(bucket_file) = args.next() else {
                 usage();
@@ -521,6 +668,19 @@ fn main() {
                 let client = client_from_env();
                 let bucket = read_bucket(Path::new(&bucket_file));
                 cleanup_bucket(&client, &bucket, &keys).await;
+            });
+        }
+        "cleanup-versioned" => {
+            let Some(bucket_file) = args.next() else {
+                usage();
+            };
+            if args.next().is_some() {
+                usage();
+            }
+            run(async {
+                let client = client_from_env();
+                let bucket = read_bucket(Path::new(&bucket_file));
+                cleanup_versioned_bucket(&client, &bucket).await;
             });
         }
         _ => usage(),

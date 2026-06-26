@@ -8688,6 +8688,18 @@ Metadata PG migration and backfill design notes:
   object-lock metadata path. ACL uses the same storage metadata command shape,
   so it remains a lower-priority serialization variant rather than separate
   storage-level fault-injection coverage.
+- Started the whole-process UAT route-change slice for ordinary S3 behavior.
+  The new `./scripts/uat-s3-tests --smoke route-change` smoke runs the
+  control-plane/frontend/storage-node topology, writes a versioned object whose
+  payload lands on a selected data PG, changes that data PG's acting set through
+  the live control-plane command, waits for serving runtime maps on the
+  frontend and storage nodes, then verifies `GET`, `HEAD`, `ListObjectsV2`, and
+  `ListObjectVersions` still expose the old object without partial external
+  results. It also writes and reads a second object whose payload lands on the
+  moved data PG after the route change, so the smoke covers retained historical
+  reads plus new writes under the new placement. This is intentionally a small
+  whole-process/RPC confidence check; the precise stale-primary and
+  crossing-boundary assertions remain in the cargo failpoint tests.
 
 Exit criteria:
 

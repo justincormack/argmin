@@ -22,9 +22,10 @@ Run the standard local CI checks:
   9. ./scripts/uat-s3-tests --smoke storage-node-kill-fails-closed
   10. ./scripts/uat-s3-tests --smoke control-plane-runtime-map
   11. ./scripts/uat-s3-tests --smoke shard-repair
-  12. ./scripts/uat-s3-tests --smoke pg-backfill-migration
-  13. ./scripts/uat-s3-tests --smoke metadata-pg-migration
-  14. ./scripts/uat-s3-tests --smoke metadata-pg-migration-failover
+  12. ./scripts/uat-s3-tests --smoke route-change
+  13. ./scripts/uat-s3-tests --smoke pg-backfill-migration
+  14. ./scripts/uat-s3-tests --smoke metadata-pg-migration
+  15. ./scripts/uat-s3-tests --smoke metadata-pg-migration-failover
 
 Arguments after `--` are appended to `cargo nextest run --workspace`.
 
@@ -79,6 +80,7 @@ run_cmd "multihost UAT storage-node restart smoke" ./scripts/uat-s3-tests --smok
 run_cmd "multihost UAT storage-node kill smoke" ./scripts/uat-s3-tests --smoke storage-node-kill-fails-closed
 run_cmd "multihost UAT control-plane runtime-map smoke" ./scripts/uat-s3-tests --smoke control-plane-runtime-map
 run_cmd "multihost UAT shard repair smoke" ./scripts/uat-s3-tests --smoke shard-repair
+run_cmd "multihost UAT route-change smoke" ./scripts/uat-s3-tests --smoke route-change
 run_cmd "multihost UAT PG backfill migration smoke" ./scripts/uat-s3-tests --smoke pg-backfill-migration
 run_cmd "multihost UAT metadata PG migration smoke" ./scripts/uat-s3-tests --smoke metadata-pg-migration
 run_cmd "multihost UAT metadata PG migration failover smoke" ./scripts/uat-s3-tests --smoke metadata-pg-migration-failover
