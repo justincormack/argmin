@@ -8670,9 +8670,11 @@ Metadata PG migration and backfill design notes:
   leaking bucket-write reservations, or leaving copied shard files/ack rows,
   including through installed Unix storage-node clients. Serving read/list paths
   now also have explicit Peering fail-closed coverage: with the bucket PG still
-  Active and only the object metadata PG Peering, GET, HEAD, and LIST must return
-  the Peering `PgNotActive` error rather than stale object data or a partial
-  listing. Object tag updates now
+  Active and only the object metadata PG Peering, GET, HEAD, object LIST, and
+  version LIST must return the Peering `PgNotActive` error rather than stale
+  object data or a partial listing. Version-list pagination now also has a
+  retained-route continuation test across a runtime-map epoch change, matching
+  the object-list pagination coverage. Object tag updates now
   have the same local pre-metadata-apply
   gate over the shared `PutObjectMetadata` command path: PutObjectTagging pauses
   before the object-PG metadata command is applied, crosses to a newer

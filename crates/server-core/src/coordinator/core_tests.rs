@@ -3364,6 +3364,19 @@ fn read_and_list_fail_closed_while_object_metadata_pg_is_peering() {
         })
         .unwrap_err();
     assert_pg_not_active("LIST", list_error);
+
+    let version_list_error = coord
+        .list_object_versions(&ListObjectVersionsRequest {
+            bucket: bucket_request_with_expected_owner(bucket, test_requester(), None),
+            prefix: None,
+            delimiter: None,
+            key_marker: None,
+            version_id_marker: None,
+            max_keys: 1000,
+            requested_max_keys: Some(1000),
+        })
+        .unwrap_err();
+    assert_pg_not_active("LIST versions", version_list_error);
 }
 
 #[test]
@@ -7521,6 +7534,135 @@ fn list_object_versions_paginates_across_pgs() {
     assert_eq!(second_page.versions[1].key, key_c);
     assert_eq!(second_page.versions[1].version_id, VersionId::from_u64(1));
     assert!(second_page.versions[1].is_latest);
+    assert!(!second_page.is_truncated);
+    assert_eq!(second_page.next_key_marker, None);
+    assert_eq!(second_page.next_version_id_marker, None);
+}
+
+#[test]
+fn list_object_versions_continuation_survives_epoch_change_between_pages() {
+    let bucket = "version-continuation-epoch-change-bucket";
+    let tmp = test_util::tempdir();
+    let initial = open_test_storage_cluster(tmp.path(), &[0, 1]);
+    let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&initial));
+    let coord =
+        Coordinator::new_with_managed_key_provider_for_storage_cluster_runtime_map_handle_with_background_worker_mode(
+            handle.clone(),
+            "us-east-1".to_string(),
+            None,
+            test_sse_s3_provider(),
+            BackgroundWorkerMode::none(),
+        )
+        .unwrap();
+    let metadata = MetadataBlob::new();
+    let system_metadata = SystemMetadata::EMPTY;
+
+    coord
+        .create_bucket_for_owner("default-owner", bucket, false)
+        .unwrap();
+    put_bucket_versioning_test(
+        &coord,
+        bucket,
+        BucketVersioningState::Enabled,
+        test_requester(),
+        None,
+    )
+    .unwrap();
+
+    let pg_ids = initial.test_pg_ids();
+    assert!(
+        pg_ids.len() >= 2,
+        "test requires at least two object metadata PGs"
+    );
+    let key_a = find_key_for_object_metadata_pg_with_prefix(&initial, bucket, pg_ids[0], "a/");
+    let key_b = find_key_for_object_metadata_pg_with_prefix(&initial, bucket, pg_ids[1], "b/");
+
+    let older_a = test_helpers::put_object(
+        &coord,
+        &PutObjectRequest {
+            encryption: WriteEncryptionRequest::none(),
+            policy_context: PutObjectPolicyContext::default(),
+            object_lock: ObjectLockState::default(),
+            object: object_request_with_expected_owner(bucket, &key_a, test_requester(), None),
+            data: b"older-a",
+            metadata: &metadata,
+            system_metadata: &system_metadata,
+            tags: None,
+            cond: NO_WRITE,
+            acl: NO_PUT_OBJECT_ACL.into(),
+        },
+    )
+    .unwrap();
+    let newer_a = test_helpers::put_object(
+        &coord,
+        &PutObjectRequest {
+            encryption: WriteEncryptionRequest::none(),
+            policy_context: PutObjectPolicyContext::default(),
+            object_lock: ObjectLockState::default(),
+            object: object_request_with_expected_owner(bucket, &key_a, test_requester(), None),
+            data: b"newer-a",
+            metadata: &metadata,
+            system_metadata: &system_metadata,
+            tags: None,
+            cond: NO_WRITE,
+            acl: NO_PUT_OBJECT_ACL.into(),
+        },
+    )
+    .unwrap();
+    test_helpers::put_object(
+        &coord,
+        &PutObjectRequest {
+            encryption: WriteEncryptionRequest::none(),
+            policy_context: PutObjectPolicyContext::default(),
+            object_lock: ObjectLockState::default(),
+            object: object_request_with_expected_owner(bucket, &key_b, test_requester(), None),
+            data: b"value-b",
+            metadata: &metadata,
+            system_metadata: &system_metadata,
+            tags: None,
+            cond: NO_WRITE,
+            acl: NO_PUT_OBJECT_ACL.into(),
+        },
+    )
+    .unwrap();
+
+    let first_page = coord
+        .list_object_versions(&ListObjectVersionsRequest {
+            bucket: bucket_request_with_expected_owner(bucket, test_requester(), None),
+            prefix: None,
+            delimiter: None,
+            key_marker: None,
+            version_id_marker: None,
+            max_keys: 2,
+            requested_max_keys: Some(2),
+        })
+        .unwrap();
+    assert_eq!(first_page.versions.len(), 2);
+    assert_eq!(first_page.versions[0].key, key_a);
+    assert_eq!(first_page.versions[0].version_id, newer_a.version_id);
+    assert_eq!(first_page.versions[1].key, key_a);
+    assert_eq!(first_page.versions[1].version_id, older_a.version_id);
+    assert!(first_page.is_truncated);
+    assert_eq!(first_page.next_key_marker.as_deref(), Some(key_a.as_str()));
+    assert_eq!(first_page.next_version_id_marker, Some(older_a.version_id));
+
+    install_same_store_next_epoch_runtime_map(&handle, &initial, tmp.path());
+
+    let second_page = coord
+        .list_object_versions(&ListObjectVersionsRequest {
+            bucket: bucket_request_with_expected_owner(bucket, test_requester(), None),
+            prefix: None,
+            delimiter: None,
+            key_marker: first_page.next_key_marker.as_deref(),
+            version_id_marker: first_page.next_version_id_marker,
+            max_keys: 2,
+            requested_max_keys: Some(2),
+        })
+        .unwrap();
+    assert_eq!(second_page.versions.len(), 1);
+    assert_eq!(second_page.versions[0].key, key_b);
+    assert_eq!(second_page.versions[0].version_id, VersionId::from_u64(1));
+    assert!(second_page.versions[0].is_latest);
     assert!(!second_page.is_truncated);
     assert_eq!(second_page.next_key_marker, None);
     assert_eq!(second_page.next_version_id_marker, None);
