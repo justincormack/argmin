@@ -1585,7 +1585,7 @@ else
         wait_for_storage_node_socket "$node_id"
     done
 
-    if [[ "$smoke" == "route-change" || "$smoke" == "route-change-node-restart" || "$smoke" == "route-change-restart" || "$smoke" == "route-change-control-plane-restart" || "$smoke" == "route-change-frontend-restart" || "$smoke" == "route-change-full-restart" || "$smoke" == "pg-backfill-migration" || "$smoke" == "metadata-pg-migration" || "$smoke" == "metadata-pg-migration-failover" ]]; then
+    if [[ "$smoke" == "control-plane-runtime-map" || "$smoke" == "route-change" || "$smoke" == "route-change-node-restart" || "$smoke" == "route-change-restart" || "$smoke" == "route-change-control-plane-restart" || "$smoke" == "route-change-frontend-restart" || "$smoke" == "route-change-full-restart" || "$smoke" == "pg-backfill-migration" || "$smoke" == "metadata-pg-migration" || "$smoke" == "metadata-pg-migration-failover" ]]; then
         wait_for_control_plane_runtime_map_ready 10
         wait_for_control_plane_node_epochs_aligned 10 "$control_plane_runtime_map_ready_epoch"
         wait_for_control_plane_runtime_map_ready 10 "$control_plane_aligned_epoch"
@@ -2353,13 +2353,14 @@ elif [[ "$smoke" == "storage-node-kill-fails-closed" ]]; then
 elif [[ "$smoke" == "storage-node-primary-kill-fails-closed" ]]; then
     run_storage_node_primary_kill_fails_closed_smoke
 elif [[ "$smoke" == "control-plane-runtime-map" ]]; then
-    sleep 1
+    control_plane_runtime_metrics_log="$logs_dir/frontend-metrics-samples.log"
+    wait_for_serving_runtime_installed 20 "$control_plane_runtime_metrics_log"
     run_nextest "control-plane runtime-map pre-restart s3-tests smoke" test_object_default_content_type
     run_nextest "control-plane runtime-map metadata-progress s3-tests smoke" test_object_write_read_update_read_delete
-    sleep 2
+    wait_for_serving_runtime_installed 20 "$control_plane_runtime_metrics_log"
     run_nextest "control-plane runtime-map post-metadata-refresh s3-tests smoke" test_object_read_not_exist
     restart_storage_node 0
-    sleep 1
+    wait_for_serving_runtime_installed 20 "$control_plane_runtime_metrics_log"
     run_nextest "control-plane runtime-map post-restart s3-tests smoke" test_object_read_not_exist
 elif [[ "$smoke" == "shard-repair" || "$smoke" == "shard-repair-restart" ]]; then
     for ((iteration = 1; iteration <= repeat_count; iteration++)); do

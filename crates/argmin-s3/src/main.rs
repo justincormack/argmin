@@ -1091,7 +1091,8 @@ fn control_plane_pg_active_with_acting_set(
 }
 
 fn control_plane_runtime_map_not_ready_for_serving(message: &str) -> bool {
-    message.contains(" has no serving primary in cluster epoch ")
+    message.contains("control-plane runtime map has no routed PGs")
+        || message.contains(" has no serving primary in cluster epoch ")
         || (message.contains(" primary node ")
             && message.contains(" has not reported active state in cluster epoch "))
         || (message.contains(" reported unresolved pending metadata command for PG ")
@@ -1888,7 +1889,26 @@ fn build_control_plane_frontend_storage_cluster(
                     "failed to fetch control-plane runtime map from {control_plane_socket_path}: {error}"
                 )
             })?;
+    ensure_frontend_startup_runtime_map_is_serving(&runtime_map)?;
     build_frontend_storage_cluster_from_runtime_map(config, ec_config, &runtime_map)
+}
+
+fn ensure_frontend_startup_runtime_map_is_serving(
+    runtime_map: &ClusterRuntimeMapSnapshot,
+) -> Result<(), String> {
+    if runtime_map.pg_routes().is_empty() {
+        return Err("control-plane runtime map has no routed PGs".to_string());
+    }
+    for route in runtime_map.pg_routes() {
+        if route.state() != PgState::Active || route.primary_lease_deadline_ms().is_none() {
+            return Err(format!(
+                "PG {} has no serving primary in cluster epoch {}",
+                route.pg_id().get(),
+                runtime_map.cluster_epoch().get()
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn build_frontend_storage_cluster_from_runtime_map(
@@ -2210,6 +2230,9 @@ mod tests {
         assert!(control_plane_runtime_map_not_ready_for_serving(
             "control-plane RPC remote error: node 1 reported unresolved pending metadata command for PG 27 in cluster epoch 83"
         ));
+        assert!(control_plane_runtime_map_not_ready_for_serving(
+            "control-plane runtime map has no routed PGs"
+        ));
         assert!(!control_plane_runtime_map_not_ready_for_serving(
             "control-plane RPC remote error: unknown PG 99"
         ));
@@ -2225,6 +2248,9 @@ mod tests {
         ));
         assert!(frontend_control_plane_startup_error_is_retryable(
             "control-plane runtime map has no routed nodes"
+        ));
+        assert!(frontend_control_plane_startup_error_is_retryable(
+            "control-plane runtime map has no routed PGs"
         ));
         assert!(!frontend_control_plane_startup_error_is_retryable(
             "ARGMIN_STORAGE_CLUSTER_EPOCH must be > 0"
@@ -2523,6 +2549,33 @@ mod tests {
         node_id: NodeId,
         endpoint: String,
     ) -> std::thread::JoinHandle<()> {
+        serve_one_control_plane_runtime_map_with_serving_pg_routes(
+            socket_path,
+            node_id,
+            endpoint,
+            false,
+        )
+    }
+
+    fn serve_one_active_control_plane_runtime_map(
+        socket_path: PathBuf,
+        node_id: NodeId,
+        endpoint: String,
+    ) -> std::thread::JoinHandle<()> {
+        serve_one_control_plane_runtime_map_with_serving_pg_routes(
+            socket_path,
+            node_id,
+            endpoint,
+            true,
+        )
+    }
+
+    fn serve_one_control_plane_runtime_map_with_serving_pg_routes(
+        socket_path: PathBuf,
+        node_id: NodeId,
+        endpoint: String,
+        serving_pg_routes: bool,
+    ) -> std::thread::JoinHandle<()> {
         let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
         std::thread::spawn(move || {
             use storage::control_plane::{
@@ -2540,6 +2593,16 @@ mod tests {
             authority
                 .set_pg_acting_set(PgId::new(0), vec![node_id])
                 .unwrap();
+            let pg_observations = if serving_pg_routes {
+                vec![NodePgHeartbeatObservation {
+                    pg_id: PgId::new(0),
+                    state: PgState::Peering,
+                    metadata_proof: PgMetadataProof::empty(),
+                    has_pending_metadata_command: false,
+                }]
+            } else {
+                Vec::new()
+            };
             for now_ms in 1_000..1_004 {
                 let observed_epoch = authority.snapshot().cluster_epoch();
                 let lease = authority
@@ -2552,7 +2615,7 @@ mod tests {
                             requested_lease_duration_ms: 1_000,
                             cluster_map_history_reference_summary:
                                 storage::PgClusterMapHistoryReferenceSummary::default(),
-                            pg_observations: Vec::new(),
+                            pg_observations: pg_observations.clone(),
                         },
                         now_ms,
                     )
@@ -2562,8 +2625,33 @@ mod tests {
                 }
                 assert!(now_ms < 1_003, "authority did not grant serving lease");
             }
+            if serving_pg_routes {
+                authority
+                    .complete_pg_peering(PgId::new(0), node_id, 1, 1_004)
+                    .unwrap();
+                authority
+                    .submit_node_heartbeat(
+                        NodeHeartbeat {
+                            node_id,
+                            node_incarnation: 1,
+                            endpoint: endpoint.clone(),
+                            observed_epoch: authority.snapshot().cluster_epoch(),
+                            requested_lease_duration_ms: 1_000,
+                            cluster_map_history_reference_summary:
+                                storage::PgClusterMapHistoryReferenceSummary::default(),
+                            pg_observations: vec![NodePgHeartbeatObservation {
+                                pg_id: PgId::new(0),
+                                state: PgState::Active,
+                                metadata_proof: PgMetadataProof::empty(),
+                                has_pending_metadata_command: false,
+                            }],
+                        },
+                        1_005,
+                    )
+                    .unwrap();
+            }
             let (mut stream, _addr) = listener.accept().unwrap();
-            handle_control_plane_unix_stream(&mut authority, &mut stream, 1_001).unwrap();
+            handle_control_plane_unix_stream(&mut authority, &mut stream, 1_006).unwrap();
         })
     }
 
@@ -2659,9 +2747,6 @@ mod tests {
                 assert!(now_ms < 1_003, "authority did not grant serving lease");
             }
 
-            let (mut stream, _addr) = listener.accept().unwrap();
-            handle_control_plane_unix_stream(&mut authority, &mut stream, 1_001).unwrap();
-
             authority
                 .complete_pg_peering(PgId::new(0), node_id, 1, 1_002)
                 .unwrap();
@@ -2688,6 +2773,9 @@ mod tests {
 
             let (mut stream, _addr) = listener.accept().unwrap();
             handle_control_plane_unix_stream(&mut authority, &mut stream, 1_004).unwrap();
+
+            let (mut stream, _addr) = listener.accept().unwrap();
+            handle_control_plane_unix_stream(&mut authority, &mut stream, 1_005).unwrap();
         })
     }
 
@@ -2698,7 +2786,7 @@ mod tests {
         std::fs::create_dir_all(&tmp).unwrap();
         let socket_path = tmp.join("cp.sock");
         let endpoint = tmp.join("n0.sock");
-        let server = serve_one_control_plane_runtime_map(
+        let server = serve_one_active_control_plane_runtime_map(
             socket_path.clone(),
             NodeId::new(0),
             endpoint.display().to_string(),
@@ -2723,7 +2811,7 @@ mod tests {
                 .local_pg_route(storage::PgId::new(0))
                 .unwrap()
                 .state(),
-            PgState::Peering
+            PgState::Active
         );
         let _ = std::fs::remove_dir_all(&tmp);
     }
@@ -2735,7 +2823,7 @@ mod tests {
         std::fs::create_dir_all(&tmp).unwrap();
         let socket_path = tmp.join("cp.sock");
         let endpoint = tmp.join("n3.sock");
-        let server = serve_one_control_plane_runtime_map(
+        let server = serve_one_active_control_plane_runtime_map(
             socket_path.clone(),
             NodeId::new(3),
             endpoint.display().to_string(),
@@ -2795,7 +2883,7 @@ mod tests {
                 .local_pg_route(storage::PgId::new(0))
                 .unwrap()
                 .state(),
-            PgState::Peering
+            PgState::Active
         );
 
         let handle = StorageClusterRuntimeMapHandle::new(cluster);
