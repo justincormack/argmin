@@ -8803,6 +8803,16 @@ Metadata PG migration and backfill design notes:
   rules. It verifies exact target partitioning for already-present, direct-copy,
   reconstruction, and unrecoverable shards, and verifies that durable scheduling
   tolerance is derived from source risk rather than a default.
+- Added the control-plane epoch/heartbeat close-out property test:
+  `prop_control_plane_epoch_heartbeat_model_preserves_invariants` runs bounded
+  randomized sequences of membership-ready heartbeats, current/stale/future
+  observed epochs, acting-set changes, peering completion, lease expiry, and
+  storage-history floor reports against the real single-authority control
+  plane. It asserts future observed epochs and rejected acting-set changes do
+  not mutate in-memory or durable state, stale heartbeats can update liveness
+  but cannot install current PG observations, persisted node floors only point
+  at current or retained epochs, current observations are epoch-scoped and in
+  the acting set, and Active PGs always carry an accepted metadata proof.
 
 Exit criteria:
 
