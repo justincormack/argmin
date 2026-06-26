@@ -6082,13 +6082,13 @@ Status:
   storage node against the same data directory and Unix socket path, waits for
   the restarted process to bind, and runs a second focused S3 probe through the
   unchanged frontend. The initial smoke run passed both probes.
-- Added a targeted `./scripts/uat-s3-tests --smoke
-  storage-node-kill-fails-closed` mode for process-kill evidence. The smoke
-  uses the same one-storage-node, one-PG topology, runs a focused S3 probe,
-  kills storage-node 0 without restarting it, then requires the next S3 probe
-  through the still-running frontend to fail with an explicit S3/client error
-  instead of passing against stale local state or hanging. The initial smoke run
-  returned a normal S3 `InternalError` 500 in under a second.
+- Strengthened `./scripts/uat-s3-tests --smoke
+  storage-node-kill-fails-closed` from a generic post-kill setup-probe failure
+  into a 1+1 two-node loss smoke. The smoke writes an object while both shards
+  are present, kills the non-primary storage node, verifies the old object
+  remains readable/listable from the surviving shard, and then verifies a new
+  `PutObject` fails closed while the cluster is below the write placement
+  requirement.
 - Audited current guides and observability notes for stale bucket-lock
   authority language. The metadata model, threat model, and production
   observability plan now describe durable metadata command serialization,

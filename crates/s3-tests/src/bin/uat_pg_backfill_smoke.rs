@@ -3,6 +3,7 @@ use std::{collections::BTreeSet, path::Path};
 use s3_tests::{
     aws_sdk_s3::{
         error::ProvideErrorMetadata,
+        primitives::ByteStream,
         types::{BucketVersioningStatus, VersioningConfiguration},
     },
     build_client_with_ca, cleanup_versioned_bucket, delete_bucket_retrying_operation_aborted,
@@ -14,7 +15,7 @@ use storage::{BucketName, GenerationId, ObjectKey, PgTopology};
 
 fn usage() -> ! {
     eprintln!(
-        "usage: uat_pg_backfill_smoke create-put <bucket-file> <key> <body-file> | create-versioned-put-distinct-data-pg <bucket-file> <key-file> <data-pg-file> <key-prefix> <body-file> [target-data-pg] [excluded-metadata-pg-csv] | create-put-distinct-data-pg <bucket-file> <key-file> <data-pg-file> <key-prefix> <body-file> [target-data-pg] [excluded-metadata-pg-csv] | create-put-metadata-pg <bucket-file> <key-file> <metadata-pg-file> <key-prefix> <body-file> <target-metadata-pg> | put-for-data-pg <bucket-file> <key-file> <key-prefix> <body-file> <data-pg> [excluded-metadata-pg-csv] | put-for-metadata-pg <bucket-file> <key-file> <key-prefix> <body-file> <target-metadata-pg> | put <bucket-file> <key> <body-file> | get <bucket-file> <key> <body-file> | head <bucket-file> <key> <body-file> | list-contains <bucket-file> <key>... | list-versions-contains <bucket-file> <key>... | cleanup <bucket-file> <key>... | cleanup-versioned <bucket-file>"
+        "usage: uat_pg_backfill_smoke create-put <bucket-file> <key> <body-file> | create-versioned-put-distinct-data-pg <bucket-file> <key-file> <data-pg-file> <key-prefix> <body-file> [target-data-pg] [excluded-metadata-pg-csv] | create-put-distinct-data-pg <bucket-file> <key-file> <data-pg-file> <key-prefix> <body-file> [target-data-pg] [excluded-metadata-pg-csv] | create-put-metadata-pg <bucket-file> <key-file> <metadata-pg-file> <key-prefix> <body-file> <target-metadata-pg> | put-for-data-pg <bucket-file> <key-file> <key-prefix> <body-file> <data-pg> [excluded-metadata-pg-csv] | put-for-metadata-pg <bucket-file> <key-file> <key-prefix> <body-file> <target-metadata-pg> | put <bucket-file> <key> <body-file> | put-expect-failure <bucket-file> <key> <body-file> | get <bucket-file> <key> <body-file> | head <bucket-file> <key> <body-file> | list-contains <bucket-file> <key>... | list-versions-contains <bucket-file> <key>... | cleanup <bucket-file> <key>... | cleanup-versioned <bucket-file>"
     );
     std::process::exit(2);
 }
@@ -579,6 +580,50 @@ fn main() {
                 let bucket = read_bucket(Path::new(&bucket_file));
                 let body = read_body(Path::new(&body_file));
                 put_object(&client, &bucket, &key, body).await;
+            });
+        }
+        "put-expect-failure" => {
+            let Some(bucket_file) = args.next() else {
+                usage();
+            };
+            let Some(key) = args.next().and_then(|arg| arg.into_string().ok()) else {
+                usage();
+            };
+            let Some(body_file) = args.next() else {
+                usage();
+            };
+            if args.next().is_some() {
+                usage();
+            }
+            run(async {
+                let client = client_from_env();
+                let bucket = read_bucket(Path::new(&bucket_file));
+                let body = read_body(Path::new(&body_file));
+                match client
+                    .put_object()
+                    .bucket(&bucket)
+                    .key(&key)
+                    .body(ByteStream::from(body))
+                    .send()
+                    .await
+                {
+                    Ok(_) => panic!("put UAT object {bucket}/{key} unexpectedly succeeded"),
+                    Err(error) => {
+                        let Some(service_error) = error.as_service_error() else {
+                            panic!(
+                                "put UAT object {bucket}/{key} failed below S3 API layer: {error:?}"
+                            );
+                        };
+                        let Some(code) = service_error.code() else {
+                            panic!(
+                                "put UAT object {bucket}/{key} returned S3 service error without code: {error:?}"
+                            );
+                        };
+                        eprintln!(
+                            "expected S3 put failure for {bucket}/{key}: code={code} error={error:?}"
+                        );
+                    }
+                }
             });
         }
         "get" => {
