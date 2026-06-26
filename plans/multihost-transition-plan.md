@@ -7034,6 +7034,12 @@ Work items:
     changes, and controlled failure injection. Treat the former as evidence
     about request bounding and retry quality; treat the latter as evidence
     about distributed correctness.
+13. before closing Phase 11, add targeted property/model tests for the main
+    invariants that the soak tests sample but cannot exhaustively cover:
+    control-plane epoch/heartbeat state transitions, metadata
+    transfer/checkpoint/log import and retry, retained-route cleanup/history
+    behavior in the local cluster trace model, and pure backfill planner
+    classification/priority.
 
 Status:
 
@@ -8758,6 +8764,39 @@ Metadata PG migration and backfill design notes:
   `./scripts/uat-forced-overload`: the correctness soak is for long-lived
   multihost route-history and restart behavior without intentionally creating
   admission pressure or host-local disk contention.
+- Planned final Phase 11 property-test close-out before moving on to Phase 12:
+  add a control-plane epoch/heartbeat model that generates membership changes,
+  acting-set changes, stale/current/future heartbeats, endpoint/incarnation
+  changes, lease expiry, and peering completion, and asserts that future
+  observed epochs are rejected without mutation, stale heartbeats can update
+  non-serving liveness but cannot install active PG observations, serving routes
+  require current observed epoch plus accepted proof and no pending command,
+  active PGs always have an accepted metadata proof, and retained storage
+  history floors are never persisted unless the referenced epoch is still
+  retained.
+- Planned metadata-transfer property coverage: generate command logs,
+  checkpoints, compaction points, transfer export/import artifacts, and partial
+  retry points; assert that invalid transfer/checkpoint artifacts never mutate
+  the destination, final imported proof equals the expected proof,
+  checkpoint-plus-suffix retry is idempotent after every prefix length,
+  compaction never regresses the next log index, candidate selection skips
+  corrupt or oversized candidates while preserving hard failures, and
+  non-overlap metadata transfer either imports safely or fails closed.
+- Planned retained-route/local-cluster trace property coverage: extend
+  `prop_local_cluster_trace_preserves_epoch_route_and_cleanup_invariants` with
+  route changes that retain historical routes, storage-node restart/refresh,
+  retained-epoch cleanup, repair/backfill enqueue and claim, and metadata
+  checkpoint ticks; assert that stale/current operations fail closed in the
+  right places, cleanup uses the recorded placement epoch, failed publish and
+  cleanup paths do not leak shard files or ack rows, historical reads resolve
+  through retained placement, and foreground operations do not perform inline
+  repair or backfill work.
+- Planned pure backfill planner property coverage: generate source and desired
+  shard-health vectors for `(k, m)` and assert that unrecoverable plans are
+  emitted exactly when valid source shards are below `k`, direct-copy targets
+  only use valid same-index source shards, reconstruction targets require enough
+  valid source shards, priority/remaining-tolerance is monotonic with risk, and
+  already healthy desired shards are not targeted.
 
 Exit criteria:
 
@@ -8775,6 +8814,10 @@ Exit criteria:
 8. a real-multihost correctness soak runs separately from the single-host
    overload soak and exercises restarts, route changes, and injected RPC/storage
    failures without relying on host-local disk contention to find bugs
+9. targeted Phase 11 property/model tests cover control-plane epoch/heartbeat
+   invariants, metadata transfer/checkpoint/log retry and compaction
+   invariants, retained-route cleanup/history invariants, and backfill planner
+   classification/priority invariants
 
 ## Phase 12: Replicated Control Plane
 
