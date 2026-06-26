@@ -12201,15 +12201,33 @@ mod tests {
             authority.deterministic_pg_primary(PgId::new(1), &[NodeId::new(7)], 100),
             Some(NodeId::new(7))
         );
+        authority
+            .set_pg_acting_set(PgId::new(1), vec![NodeId::new(7)])
+            .unwrap();
+        let route_epoch = authority.snapshot().cluster_epoch();
 
         let before = authority.snapshot().node(NodeId::new(7)).unwrap().clone();
-        let stale_epoch = ClusterEpoch::new(serving.cluster_epoch().get() - 1).unwrap();
+        let stale_epoch = ClusterEpoch::new(route_epoch.get() - 1).unwrap();
         let mut stale = heartbeat(7, stale_epoch, 200);
         stale.node_incarnation = before.node_incarnation() + 1;
         stale.endpoint = "stale-node-7.sock".to_owned();
-        let stale_response = authority.heartbeat(stale, 200).unwrap();
-        assert!(!stale_response.serving());
-        assert!(stale_response.cluster_epoch() > serving.cluster_epoch());
+        let stale_response = authority.refresh_node_heartbeat(stale, 200).unwrap();
+        let stale_lease = stale_response.lease();
+        assert!(!stale_lease.serving());
+        assert!(stale_lease.cluster_epoch() > serving.cluster_epoch());
+        assert_eq!(
+            stale_response.runtime_map().cluster_epoch(),
+            stale_lease.cluster_epoch()
+        );
+        let stale_route = stale_response
+            .runtime_map()
+            .pg_routes()
+            .iter()
+            .find(|route| route.pg_id() == PgId::new(1))
+            .unwrap();
+        assert_eq!(stale_route.state(), PgState::Peering);
+        assert_eq!(stale_route.primary_node_id(), NodeId::new(7));
+        assert_eq!(stale_route.primary_lease_deadline_ms(), None);
 
         let after = authority.snapshot().node(NodeId::new(7)).unwrap();
         assert_eq!(after.node_incarnation(), before.node_incarnation() + 1);

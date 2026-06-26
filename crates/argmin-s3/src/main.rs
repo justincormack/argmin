@@ -2484,6 +2484,47 @@ mod tests {
         })
     }
 
+    fn serve_control_plane_storage_node_startup_refreshes(
+        socket_path: PathBuf,
+        node_id: NodeId,
+        request_count: usize,
+    ) -> std::thread::JoinHandle<Vec<u64>> {
+        let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+        std::thread::spawn(move || {
+            use storage::control_plane::{handle_control_plane_unix_stream, NodeMembershipState};
+            use storage::PgId;
+
+            let state_path = socket_path.with_extension("state");
+            let store = FileControlPlaneStore::new(state_path);
+            let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+            authority
+                .set_node_membership(node_id, NodeMembershipState::Active)
+                .unwrap();
+            authority
+                .set_pg_acting_set(PgId::new(0), vec![node_id])
+                .unwrap();
+
+            let mut observed_incarnations = Vec::with_capacity(request_count);
+            for request_index in 0..request_count {
+                let (mut stream, _addr) = listener.accept().unwrap();
+                handle_control_plane_unix_stream(
+                    &mut authority,
+                    &mut stream,
+                    1_000 + u64::try_from(request_index).unwrap(),
+                )
+                .unwrap();
+                observed_incarnations.push(
+                    authority
+                        .snapshot()
+                        .node(node_id)
+                        .unwrap()
+                        .node_incarnation(),
+                );
+            }
+            observed_incarnations
+        })
+    }
+
     fn serve_frontend_control_plane_runtime_map_refresh(
         socket_path: PathBuf,
         node_id: NodeId,
@@ -2736,6 +2777,47 @@ mod tests {
         assert_eq!(node_config.socket_path, endpoint);
         assert_eq!(node_config.pg_ids, vec![0]);
         assert_eq!(node_config.pg_routes[0].state, PgState::Peering);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn storage_node_control_plane_startup_advances_incarnation_once_per_start() {
+        let tmp = short_unix_socket_test_dir("sbi");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let socket_path = tmp.join("cp.sock");
+        let endpoint = tmp.join("n0.sock");
+        let server = serve_control_plane_storage_node_startup_refreshes(
+            socket_path.clone(),
+            NodeId::new(0),
+            2,
+        );
+        let ec_config = EcConfig::new(1, 0).unwrap();
+        let mut config = test_server_config();
+        config.process_role = ProcessRole::StorageNode;
+        config.local_node_count = 1;
+        config.pg_count = 1;
+        config.storage_pg_ids = vec![0];
+        config.storage_node_id = Some(0);
+        config.storage_node_data_dir = Some(tmp.join("node-0-data").display().to_string());
+        config.storage_node_socket_path = Some(endpoint.display().to_string());
+        config.control_plane_socket_path = Some(socket_path.display().to_string());
+
+        let (first_config, first_incarnation) =
+            build_storage_node_process_config(&config, &ec_config).unwrap();
+        let (second_config, second_incarnation) =
+            build_storage_node_process_config(&config, &ec_config).unwrap();
+
+        let observed_incarnations = server.join().unwrap();
+        assert_eq!(first_incarnation, Some(1));
+        assert_eq!(second_incarnation, Some(2));
+        assert_eq!(observed_incarnations, vec![1, 2]);
+        for node_config in [first_config, second_config] {
+            assert_eq!(node_config.node_id, NodeId::new(0));
+            assert_eq!(node_config.socket_path, endpoint);
+            assert_eq!(node_config.pg_ids, vec![0]);
+            assert_eq!(node_config.pg_routes[0].state, PgState::Peering);
+        }
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }
