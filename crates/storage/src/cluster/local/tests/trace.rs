@@ -16,6 +16,7 @@ enum LocalClusterTraceOp {
     QueueStale(u8),
     LeaseReleaseAcrossEpoch(u8),
     RecoverAfterPhysicalShardLoss(u8),
+    RetainedRouteHistoricalRead(u8),
     DrainPendingCreateBucketFromSecondHandle(u8),
     RestartAndValidate,
     ReissueDuplicateCreateBucketIndex(u8),
@@ -47,6 +48,7 @@ fn local_cluster_trace_strategy() -> impl Strategy<Value = Vec<LocalClusterTrace
             2 => any::<u8>().prop_map(LocalClusterTraceOp::QueueStale),
             2 => any::<u8>().prop_map(LocalClusterTraceOp::LeaseReleaseAcrossEpoch),
             1 => any::<u8>().prop_map(LocalClusterTraceOp::RecoverAfterPhysicalShardLoss),
+            1 => any::<u8>().prop_map(LocalClusterTraceOp::RetainedRouteHistoricalRead),
             1 => any::<u8>().prop_map(LocalClusterTraceOp::DrainPendingCreateBucketFromSecondHandle),
             1 => Just(LocalClusterTraceOp::RestartAndValidate),
             1 => any::<u8>().prop_map(LocalClusterTraceOp::ReissueDuplicateCreateBucketIndex),
@@ -73,6 +75,18 @@ pub(super) fn trace_node_ids() -> [NodeId; 6] {
         NodeId::new(3),
         NodeId::new(4),
         NodeId::new(5),
+    ]
+}
+
+fn trace_node_ids_with_spare() -> [NodeId; 7] {
+    [
+        NodeId::new(0),
+        NodeId::new(1),
+        NodeId::new(2),
+        NodeId::new(3),
+        NodeId::new(4),
+        NodeId::new(5),
+        NodeId::new(6),
     ]
 }
 
@@ -112,6 +126,17 @@ fn set_trace_pg_state(map: &mut Arc<LocalClusterMap>, state: PgState) {
     map.pg_routes.get_mut(&PgId::new(0)).unwrap().state = state;
 }
 
+fn trace_historical_source_acting_set() -> Vec<NodeId> {
+    trace_node_ids().to_vec()
+}
+
+fn trace_historical_current_acting_set(seed: u8) -> Vec<NodeId> {
+    let mut acting_set = trace_node_ids_with_spare().to_vec();
+    let removed_index = usize::from(seed) % trace_node_ids().len();
+    acting_set.remove(removed_index);
+    acting_set
+}
+
 fn trace_bucket(seed: u8) -> crate::BucketName {
     crate::BucketName::try_from(format!("trace-bucket-{seed}")).unwrap()
 }
@@ -147,6 +172,16 @@ fn trace_bucket_for_pg(
 
 fn trace_placement_key(step: usize, seed: u8) -> Vec<u8> {
     format!("trace-placement-{step}-{seed}").into_bytes()
+}
+
+fn trace_segment_payload_placement_key(
+    segment_okh: &[u8; 16],
+    segment_vid: crate::GenerationId,
+) -> [u8; 24] {
+    let mut key = [0u8; 24];
+    key[..16].copy_from_slice(segment_okh);
+    key[16..].copy_from_slice(&segment_vid.get().to_be_bytes());
+    key
 }
 
 fn current_trace_location(
@@ -185,7 +220,7 @@ fn arbitrary_current_location(current_epoch: ClusterEpoch) -> ShardLocation {
 }
 
 fn shard_file_present_on_any_trace_node(map: &LocalClusterMap, key: &ShardKey) -> bool {
-    trace_node_ids().into_iter().any(|node_id| {
+    trace_node_ids_with_spare().into_iter().any(|node_id| {
         map.node(node_id)
             .unwrap()
             .storage_node()
@@ -222,7 +257,7 @@ fn assert_stale_metadata_operation_error(
 fn run_local_cluster_trace(ops: &[LocalClusterTraceOp]) -> TestCaseResult {
     let tmp = test_util::tempdir();
     let ec_shape = SharedStorageNode::DEFAULT_EC_SHAPE;
-    let node_ids = trace_node_ids();
+    let node_ids = trace_node_ids_with_spare();
     let mut map = Arc::new(LocalClusterMap::open(tmp.path(), &node_ids, &[0], ec_shape).unwrap());
     let mut current_epoch = ClusterEpoch::INITIAL;
     let mut visited_epochs = BTreeSet::from([current_epoch]);
@@ -541,7 +576,15 @@ fn run_local_cluster_trace(ops: &[LocalClusterTraceOp]) -> TestCaseResult {
                 }
                 let cluster = current_cluster(&map);
                 let payload = format!("recoverable-physical-shard-loss-{step}-{seed}");
-                let segment = write_committed_direct_segment(&cluster, payload.as_bytes());
+                let bucket = trace_bucket(seed.wrapping_add(step as u8));
+                let key = trace_key(seed.wrapping_add(step as u8));
+                let segment = write_committed_direct_segment_for_with_okh(
+                    &cluster,
+                    &bucket,
+                    &key,
+                    [seed.wrapping_add(step as u8); 16],
+                    payload.as_bytes(),
+                );
                 let shard_path = cluster
                     .test_payload_shard_file_path(
                         segment.written.data_pg_id,
@@ -568,6 +611,106 @@ fn run_local_cluster_trace(ops: &[LocalClusterTraceOp]) -> TestCaseResult {
                     )
                     .unwrap();
                 prop_assert_eq!(recovered, segment.payload);
+            }
+            LocalClusterTraceOp::RetainedRouteHistoricalRead(seed) => {
+                if pg_state != PgState::Active {
+                    continue;
+                }
+                let source_acting_set = trace_historical_source_acting_set();
+                let source_route = PgRouteSnapshot::reconstructed(
+                    current_epoch,
+                    PgId::new(0),
+                    source_acting_set[0],
+                    source_acting_set,
+                    PgState::Active,
+                );
+                {
+                    let map = Arc::get_mut(&mut map)
+                        .expect("trace must not retain StorageCluster handles");
+                    map.test_install_pg_routes([source_route.clone()]);
+                    map.epoch = current_epoch;
+                }
+                let (segment, req) = {
+                    let cluster = current_cluster(&map);
+                    let payload = format!("trace-retained-route-{step}-{seed}");
+                    let bucket = trace_bucket(seed.wrapping_add(step as u8));
+                    let key = trace_key(seed.wrapping_add(step as u8));
+                    let segment = write_committed_direct_segment_for_with_okh(
+                        &cluster,
+                        &bucket,
+                        &key,
+                        [seed.wrapping_add(step as u8).wrapping_add(41); 16],
+                        payload.as_bytes(),
+                    );
+                    let req = crate::SegmentStoredBytesRequest {
+                        data_pg_id: segment.written.data_pg_id,
+                        segment_okh: segment.segment_okh,
+                        segment_vid: segment.generation_id,
+                        stored_size: segment.payload.len(),
+                        segment_crc64: checksum::crc64::checksum(&segment.payload),
+                        ec: segment.written.ec,
+                    };
+                    (segment, req)
+                };
+
+                current_epoch = ClusterEpoch::new(current_epoch.get() + 1).unwrap();
+                visited_epochs.insert(current_epoch);
+                let acting_set = trace_historical_current_acting_set(*seed);
+                let next_route = PgRouteSnapshot::reconstructed(
+                    current_epoch,
+                    PgId::new(0),
+                    acting_set[0],
+                    acting_set,
+                    PgState::Active,
+                );
+                {
+                    let map = Arc::get_mut(&mut map)
+                        .expect("trace must not retain StorageCluster handles");
+                    map.test_install_pg_routes([next_route]);
+                    map.test_install_historical_pg_routes([source_route.clone()]);
+                    map.epoch = current_epoch;
+                }
+                pg_state = PgState::Active;
+                written = None;
+
+                let cluster = current_cluster(&map);
+                let placement_key = trace_segment_payload_placement_key(
+                    &segment.segment_okh,
+                    segment.generation_id,
+                );
+                let historical_locations = cluster
+                    .place_payload_shards_for_pg_route_snapshot(
+                        &source_route,
+                        DataPgId::new(PgId::new(req.data_pg_id)),
+                        req.ec,
+                        &placement_key,
+                    )
+                    .unwrap();
+                let current_locations = cluster
+                    .place_payload_shards(
+                        DataPgId::new(PgId::new(req.data_pg_id)),
+                        req.ec,
+                        &placement_key,
+                    )
+                    .unwrap();
+                prop_assert!(
+                    historical_locations
+                        .iter()
+                        .zip(&current_locations)
+                        .any(|(historical, current)| historical.node_id() != current.node_id()),
+                    "retained-route trace must move at least one shard to a different node"
+                );
+
+                let mut recovered = Vec::new();
+                cluster
+                    .read_segment_payload_stored_bytes_at_placement_epoch_into(
+                        source_route.cluster_epoch(),
+                        req,
+                        &mut recovered,
+                    )
+                    .unwrap();
+                prop_assert_eq!(recovered, segment.payload);
+                prop_assert_ne!(cluster.cluster_epoch(), source_route.cluster_epoch());
             }
             LocalClusterTraceOp::DrainPendingCreateBucketFromSecondHandle(seed) => {
                 if pg_state != PgState::Active || current_epoch != ClusterEpoch::INITIAL {
