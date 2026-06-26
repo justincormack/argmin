@@ -209,13 +209,21 @@ impl BackgroundWorkAdmission {
     }
 
     fn policy_denial_event(&self, class: BackgroundWorkClass) -> Option<&'static str> {
+        let pressure = self.observe_pressure();
+        self.policy_denial_event_for_pressure(class, pressure)
+    }
+
+    fn policy_denial_event_for_pressure(
+        &self,
+        class: BackgroundWorkClass,
+        pressure: BackgroundWorkPressure,
+    ) -> Option<&'static str> {
         match class {
             BackgroundWorkClass::KnownDamageRepair
             | BackgroundWorkClass::ReclaimCleanup
             | BackgroundWorkClass::LifecycleCleanup
             | BackgroundWorkClass::StreamSessionCleanup => None,
             BackgroundWorkClass::BackfillCandidateScan | BackgroundWorkClass::RoutineBackfill => {
-                let pressure = self.observe_pressure();
                 if pressure.foreground {
                     Some("denied_foreground_pressure")
                 } else if self.known_damage_repair_active.load(Ordering::Acquire) > 0 {
@@ -224,13 +232,18 @@ impl BackgroundWorkAdmission {
                     None
                 }
             }
-            BackgroundWorkClass::OpportunisticScan
-            | BackgroundWorkClass::RoutineMetadataCheckpoint => {
-                let pressure = self.observe_pressure();
+            BackgroundWorkClass::OpportunisticScan => {
                 if pressure.foreground {
                     Some("denied_foreground_pressure")
                 } else if pressure.durable_backlog {
                     Some("denied_backlog_pressure")
+                } else {
+                    None
+                }
+            }
+            BackgroundWorkClass::RoutineMetadataCheckpoint => {
+                if pressure.foreground {
+                    Some("denied_foreground_pressure")
                 } else {
                     None
                 }
@@ -2786,6 +2799,58 @@ mod tests {
             .try_acquire(BackgroundWorkClass::RoutineBackfill)
             .expect("routine backfill should run once known-damage work is idle");
         drop(routine_permit);
+    }
+
+    #[test]
+    fn background_work_admission_keeps_checkpoints_available_under_backlog() {
+        let admission = Arc::new(BackgroundWorkAdmission::with_limits(
+            BackgroundWorkAdmissionLimits {
+                known_damage_repair: 1,
+                backfill_candidate_scan: 1,
+                routine_backfill: 1,
+                reclaim_cleanup: 1,
+                lifecycle_cleanup: 1,
+                stream_session_cleanup: 1,
+                opportunistic_scan: 1,
+                routine_metadata_checkpoint: 1,
+            },
+        ));
+        let backlog = BackgroundWorkPressure {
+            foreground: false,
+            durable_backlog: true,
+        };
+
+        assert_eq!(
+            admission
+                .policy_denial_event_for_pressure(BackgroundWorkClass::OpportunisticScan, backlog),
+            Some("denied_backlog_pressure"),
+            "opportunistic scans should still wait behind durable cleanup/backfill backlog"
+        );
+        assert_eq!(
+            admission.policy_denial_event_for_pressure(
+                BackgroundWorkClass::RoutineMetadataCheckpoint,
+                backlog,
+            ),
+            None,
+            "checkpoint cadence must continue under durable backlog to bound command-log growth"
+        );
+    }
+
+    #[test]
+    fn background_work_admission_keeps_checkpoints_foreground_sensitive() {
+        let admission = Arc::new(BackgroundWorkAdmission::new());
+        let foreground = BackgroundWorkPressure {
+            foreground: true,
+            durable_backlog: false,
+        };
+
+        assert_eq!(
+            admission.policy_denial_event_for_pressure(
+                BackgroundWorkClass::RoutineMetadataCheckpoint,
+                foreground,
+            ),
+            Some("denied_foreground_pressure")
+        );
     }
 
     #[test]
