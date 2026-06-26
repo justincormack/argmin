@@ -17,6 +17,7 @@ enum LocalClusterTraceOp {
     LeaseReleaseAcrossEpoch(u8),
     RecoverAfterPhysicalShardLoss(u8),
     RetainedRouteHistoricalRead(u8),
+    RoutineMetadataCheckpointTick,
     DrainPendingCreateBucketFromSecondHandle(u8),
     RestartAndValidate,
     ReissueDuplicateCreateBucketIndex(u8),
@@ -49,6 +50,7 @@ fn local_cluster_trace_strategy() -> impl Strategy<Value = Vec<LocalClusterTrace
             2 => any::<u8>().prop_map(LocalClusterTraceOp::LeaseReleaseAcrossEpoch),
             1 => any::<u8>().prop_map(LocalClusterTraceOp::RecoverAfterPhysicalShardLoss),
             1 => any::<u8>().prop_map(LocalClusterTraceOp::RetainedRouteHistoricalRead),
+            1 => Just(LocalClusterTraceOp::RoutineMetadataCheckpointTick),
             1 => any::<u8>().prop_map(LocalClusterTraceOp::DrainPendingCreateBucketFromSecondHandle),
             1 => Just(LocalClusterTraceOp::RestartAndValidate),
             1 => any::<u8>().prop_map(LocalClusterTraceOp::ReissueDuplicateCreateBucketIndex),
@@ -711,6 +713,19 @@ fn run_local_cluster_trace(ops: &[LocalClusterTraceOp]) -> TestCaseResult {
                     .unwrap();
                 prop_assert_eq!(recovered, segment.payload);
                 prop_assert_ne!(cluster.cluster_epoch(), source_route.cluster_epoch());
+            }
+            LocalClusterTraceOp::RoutineMetadataCheckpointTick => {
+                let cluster = current_cluster(&map);
+                let summary = cluster
+                    .record_routine_metadata_command_checkpoints()
+                    .map_err(|err| TestCaseError::fail(format!("{err:?}")))?;
+                prop_assert_eq!(summary.failed, 0);
+                prop_assert_eq!(summary.compaction_failed, 0);
+                assert_no_pending_metadata_command_slots_at_epoch(
+                    &map,
+                    &[PgId::new(0)],
+                    current_epoch,
+                );
             }
             LocalClusterTraceOp::DrainPendingCreateBucketFromSecondHandle(seed) => {
                 if pg_state != PgState::Active || current_epoch != ClusterEpoch::INITIAL {

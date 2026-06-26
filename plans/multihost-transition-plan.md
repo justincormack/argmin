@@ -8823,6 +8823,14 @@ Metadata PG migration and backfill design notes:
   payload through the recorded historical placement epoch. This composes the
   retained-route read invariant with the existing randomized stale operation,
   restart, lease, repair, and command-reissue trace operations.
+- Extended the local cluster trace property with routine metadata checkpoint
+  ticks. The trace now runs the real
+  `record_routine_metadata_command_checkpoints()` background path at randomized
+  points and asserts that checkpoint recording/compaction reports no failures
+  and leaves no unresolved pending metadata command slots at the current epoch.
+  This composes checkpoint cadence/compaction with the same randomized stale
+  operation, retained-route, restart, repair, lease, and command-reissue trace
+  operations.
 - Added retained-log metadata transfer artifact property coverage:
   `prop_metadata_transfer_retained_log_artifact_preserves_valid_chain` generates
   synthetic applied command-log chains with pre/post state digests and asserts
