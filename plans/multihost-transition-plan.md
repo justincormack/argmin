@@ -7704,6 +7704,13 @@ Shard repair design:
   again after repair. This complements the focused cargo tests with
   whole-process lifetime coverage using the same server group that UAT workloads
   exercise.
+- Added a restart-shaped shard-repair UAT variant:
+  `./scripts/uat-s3-tests --smoke shard-repair-restart` corrupts a shard, then
+  restarts every storage-node process and the frontend before the recovery read.
+  The smoke still requires the foreground read to reconstruct the object and the
+  background worker to rewrite the corrupted shard, proving repair survives the
+  process boundary and reopened storage-node state rather than relying only on
+  the original in-memory process lifetime.
 - Current repair writes replace the damaged file at the logical shard path via
   repair-specific storage-node write plumbing; normal shard writes keep their
   no-overwrite/idempotent retry behavior. A future storage-layout slice may

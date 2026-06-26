@@ -24,6 +24,7 @@ Options:
                          storage-node-restart, storage-node-kill-fails-closed,
                          storage-node-primary-kill-fails-closed,
                          control-plane-runtime-map, shard-repair,
+                         shard-repair-restart,
                          route-change, route-change-node-restart,
                          route-change-restart,
                          route-change-control-plane-restart,
@@ -140,10 +141,10 @@ case "$topology" in
         ;;
 esac
 case "$smoke" in
-    ""|storage-node-restart|storage-node-kill-fails-closed|storage-node-primary-kill-fails-closed|control-plane-runtime-map|shard-repair|route-change|route-change-node-restart|route-change-restart|route-change-control-plane-restart|route-change-frontend-restart|route-change-full-restart|pg-backfill-migration|metadata-pg-migration|metadata-pg-migration-failover)
+    ""|storage-node-restart|storage-node-kill-fails-closed|storage-node-primary-kill-fails-closed|control-plane-runtime-map|shard-repair|shard-repair-restart|route-change|route-change-node-restart|route-change-restart|route-change-control-plane-restart|route-change-frontend-restart|route-change-full-restart|pg-backfill-migration|metadata-pg-migration|metadata-pg-migration-failover)
         ;;
     *)
-        die "--smoke must be storage-node-restart, storage-node-kill-fails-closed, storage-node-primary-kill-fails-closed, control-plane-runtime-map, shard-repair, route-change, route-change-node-restart, route-change-restart, route-change-control-plane-restart, route-change-frontend-restart, route-change-full-restart, pg-backfill-migration, metadata-pg-migration, or metadata-pg-migration-failover"
+        die "--smoke must be storage-node-restart, storage-node-kill-fails-closed, storage-node-primary-kill-fails-closed, control-plane-runtime-map, shard-repair, shard-repair-restart, route-change, route-change-node-restart, route-change-restart, route-change-control-plane-restart, route-change-frontend-restart, route-change-full-restart, pg-backfill-migration, metadata-pg-migration, or metadata-pg-migration-failover"
         ;;
 esac
 if [[ -n "$smoke" && "$topology" != "multihost" ]]; then
@@ -1529,7 +1530,7 @@ else
     server_cmd+=(--)
 fi
 
-if [[ "$smoke" == "shard-repair" ]]; then
+if [[ "$smoke" == "shard-repair" || "$smoke" == "shard-repair-restart" ]]; then
     echo "== argmin-s3 UAT shard repair smoke helper build =="
     print_command cargo build -p s3-tests --bin uat_shard_repair_smoke
     cargo build -p s3-tests --bin uat_shard_repair_smoke
@@ -1722,6 +1723,12 @@ run_shard_repair_smoke() {
     corrupt_storage_data_shard_file "$corrupted_path_file" "$shard_marker"
     cp "$(cat "$corrupted_path_file")" "$corrupted_copy"
 
+    if [[ "$smoke" == "shard-repair-restart" ]]; then
+        echo "== argmin-s3 UAT shard repair restart processes after corruption =="
+        restart_all_storage_nodes
+        restart_frontend
+    fi
+
     echo "== argmin-s3 UAT shard repair foreground recovery read =="
     printf '+'
     printf ' %q' "${shard_repair_smoke_cmd[@]}" get "$bucket_file" "$key" "$body_file"
@@ -1744,7 +1751,11 @@ run_shard_repair_smoke() {
     printf ' %q' "${shard_repair_smoke_cmd[@]}" cleanup "$bucket_file" "$key"
     printf '\n'
     "${shard_repair_smoke_cmd[@]}" cleanup "$bucket_file" "$key"
-    echo "PASS: shard repair UAT smoke repaired a read-discovered corrupt shard"
+    if [[ "$smoke" == "shard-repair-restart" ]]; then
+        echo "PASS: shard repair restart UAT smoke repaired a corrupt shard after process restart"
+    else
+        echo "PASS: shard repair UAT smoke repaired a read-discovered corrupt shard"
+    fi
 }
 
 run_storage_node_kill_fails_closed_smoke() {
@@ -2350,7 +2361,7 @@ elif [[ "$smoke" == "control-plane-runtime-map" ]]; then
     restart_storage_node 0
     sleep 1
     run_nextest "control-plane runtime-map post-restart s3-tests smoke" test_object_read_not_exist
-elif [[ "$smoke" == "shard-repair" ]]; then
+elif [[ "$smoke" == "shard-repair" || "$smoke" == "shard-repair-restart" ]]; then
     for ((iteration = 1; iteration <= repeat_count; iteration++)); do
         if ((repeat_count > 1)); then
             echo "== argmin-s3 UAT shard repair iteration $iteration/$repeat_count =="
