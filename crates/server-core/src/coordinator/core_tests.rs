@@ -3005,6 +3005,24 @@ fn get_uses_retained_payload_route_over_unix_after_data_pg_move_and_metadata_rea
         .collect::<Vec<_>>();
     assert_eq!(listed_keys, [key.as_str()]);
     assert!(!listed.is_truncated);
+    let versions = coord
+        .list_object_versions(&ListObjectVersionsRequest {
+            bucket: bucket_request_with_expected_owner(&bucket, test_requester(), None),
+            prefix: None,
+            delimiter: None,
+            key_marker: None,
+            version_id_marker: None,
+            max_keys: 1000,
+            requested_max_keys: Some(1000),
+        })
+        .unwrap();
+    let version_keys = versions
+        .versions
+        .iter()
+        .map(|version| version.key.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(version_keys, [key.as_str()]);
+    assert!(!versions.is_truncated);
 
     stop_storage_node_server_loops(stop, &wake_socket_paths, server_threads);
 }
@@ -7784,6 +7802,93 @@ fn list_object_versions_delimiter_paginates_common_prefixes() {
     let second_page = coord
         .list_object_versions(&ListObjectVersionsRequest {
             bucket: bucket_request_with_expected_owner("bucket", test_requester(), None),
+            prefix: None,
+            delimiter: Some("/"),
+            key_marker: first_page.next_key_marker.as_deref(),
+            version_id_marker: first_page.next_version_id_marker,
+            max_keys: 1,
+            requested_max_keys: Some(1),
+        })
+        .unwrap();
+    assert!(second_page.common_prefixes.is_empty());
+    assert_eq!(second_page.versions.len(), 1);
+    assert_eq!(second_page.versions[0].key, "z.txt");
+    assert!(!second_page.is_truncated);
+    assert_eq!(second_page.next_key_marker, None);
+    assert_eq!(second_page.next_version_id_marker, None);
+}
+
+#[test]
+fn list_object_versions_delimiter_continuation_survives_epoch_change_between_pages() {
+    let bucket = "version-delimiter-continuation-epoch-change-bucket";
+    let tmp = test_util::tempdir();
+    let initial = open_test_storage_cluster(tmp.path(), &[0, 1]);
+    let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&initial));
+    let coord =
+        Coordinator::new_with_managed_key_provider_for_storage_cluster_runtime_map_handle_with_background_worker_mode(
+            handle.clone(),
+            "us-east-1".to_string(),
+            None,
+            test_sse_s3_provider(),
+            BackgroundWorkerMode::none(),
+        )
+        .unwrap();
+    let metadata = MetadataBlob::new();
+    let system_metadata = SystemMetadata::EMPTY;
+
+    coord
+        .create_bucket_for_owner("default-owner", bucket, false)
+        .unwrap();
+    put_bucket_versioning_test(
+        &coord,
+        bucket,
+        BucketVersioningState::Enabled,
+        test_requester(),
+        None,
+    )
+    .unwrap();
+
+    for key in ["dir/a", "dir/b", "z.txt"] {
+        test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
+                encryption: WriteEncryptionRequest::none(),
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
+                object: object_request_with_expected_owner(bucket, key, test_requester(), None),
+                data: b"value",
+                metadata: &metadata,
+                system_metadata: &system_metadata,
+                tags: None,
+                cond: NO_WRITE,
+                acl: NO_PUT_OBJECT_ACL.into(),
+            },
+        )
+        .unwrap();
+    }
+
+    let first_page = coord
+        .list_object_versions(&ListObjectVersionsRequest {
+            bucket: bucket_request_with_expected_owner(bucket, test_requester(), None),
+            prefix: None,
+            delimiter: Some("/"),
+            key_marker: None,
+            version_id_marker: None,
+            max_keys: 1,
+            requested_max_keys: Some(1),
+        })
+        .unwrap();
+    assert!(first_page.versions.is_empty());
+    assert_eq!(first_page.common_prefixes, vec!["dir/".to_string()]);
+    assert!(first_page.is_truncated);
+    assert_eq!(first_page.next_key_marker.as_deref(), Some("dir/"));
+    assert_eq!(first_page.next_version_id_marker, None);
+
+    install_same_store_next_epoch_runtime_map(&handle, &initial, tmp.path());
+
+    let second_page = coord
+        .list_object_versions(&ListObjectVersionsRequest {
+            bucket: bucket_request_with_expected_owner(bucket, test_requester(), None),
             prefix: None,
             delimiter: Some("/"),
             key_marker: first_page.next_key_marker.as_deref(),

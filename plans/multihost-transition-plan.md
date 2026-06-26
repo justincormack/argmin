@@ -8564,12 +8564,13 @@ Metadata PG migration and backfill design notes:
   stays on its serving PG, the payload data PG moves to a disjoint acting set
   in the next epoch, and storage-node access is installed through Unix clients.
   GET reads the old payload shards through the segment's recorded placement
-  epoch; HEAD and LIST remain available from metadata after the data-PG move
-  without claiming payload-route coverage. LIST now also has delimiter
-  continuation coverage across a runtime-map epoch change: objects are spread
-  across object metadata PGs, the first page returns common prefixes with a
-  continuation token, the map advances, and the next page must return the
-  remaining prefix plus root object rather than a partial result. Started the
+  epoch; HEAD, object LIST, and version LIST remain available from metadata
+  after the data-PG move without claiming payload-route coverage. LIST now also
+  has delimiter continuation coverage across a runtime-map epoch change:
+  objects are spread across object metadata PGs, the first page returns common
+  prefixes with a continuation token, the map advances, and the next page must
+  return the remaining prefix plus root object rather than a partial result.
+  Started the
   stronger control-plane-driven stale-primary slice. Direct PUT now has a storage
   regression where a real `SingleAuthorityControlPlane` acting-set change
   removes the old object-PG primary and moves the PG into Peering. The
@@ -8672,9 +8673,10 @@ Metadata PG migration and backfill design notes:
   now also have explicit Peering fail-closed coverage: with the bucket PG still
   Active and only the object metadata PG Peering, GET, HEAD, object LIST, and
   version LIST must return the Peering `PgNotActive` error rather than stale
-  object data or a partial listing. Version-list pagination now also has a
-  retained-route continuation test across a runtime-map epoch change, matching
-  the object-list pagination coverage. Object tag updates now
+  object data or a partial listing. Version-list pagination, including
+  delimiter/common-prefix continuation, now also has retained-route coverage
+  across a runtime-map epoch change, matching the object-list pagination
+  coverage. Object tag updates now
   have the same local pre-metadata-apply
   gate over the shared `PutObjectMetadata` command path: PutObjectTagging pauses
   before the object-PG metadata command is applied, crosses to a newer
