@@ -1758,11 +1758,13 @@ async fn run_legacy_local_frontend(config: ServerConfig, host_id: String, ec_con
 }
 
 async fn run_remote_frontend(config: ServerConfig, host_id: String, ec_config: EcConfig) {
-    let storage_cluster = build_remote_frontend_storage_cluster(&config, &ec_config)
-        .unwrap_or_else(|e| {
-            eprintln!("failed to open remote frontend storage cluster: {e}");
-            std::process::exit(1);
-        });
+    let storage_cluster =
+        build_remote_frontend_storage_cluster_retrying_startup(&config, &ec_config)
+            .await
+            .unwrap_or_else(|e| {
+                eprintln!("failed to open remote frontend storage cluster: {e}");
+                std::process::exit(1);
+            });
     run_frontend_server(
         config,
         host_id,
@@ -1770,6 +1772,69 @@ async fn run_remote_frontend(config: ServerConfig, host_id: String, ec_config: E
         server_core::coordinator::BackgroundWorkerMode::remote_frontend_phase_10_6(),
     )
     .await;
+}
+
+async fn build_remote_frontend_storage_cluster_retrying_startup(
+    config: &ServerConfig,
+    ec_config: &EcConfig,
+) -> Result<Arc<StorageCluster>, String> {
+    if config.control_plane_socket_path.is_none() {
+        return build_remote_frontend_storage_cluster(config, ec_config);
+    }
+
+    let retry_deadline = frontend_control_plane_startup_retry_deadline(config);
+    let retry_delay = frontend_control_plane_startup_retry_delay(config);
+    let started_at = Instant::now();
+    let mut attempts = 0_u32;
+    loop {
+        attempts = attempts.saturating_add(1);
+        match build_remote_frontend_storage_cluster(config, ec_config) {
+            Ok(storage_cluster) => {
+                if attempts > 1 {
+                    eprintln!(
+                        "argmin-s3 frontend control-plane runtime map became ready after {} attempts",
+                        attempts
+                    );
+                }
+                return Ok(storage_cluster);
+            }
+            Err(error)
+                if frontend_control_plane_startup_error_is_retryable(&error)
+                    && started_at.elapsed() < retry_deadline =>
+            {
+                if attempts == 1 || attempts.is_multiple_of(10) {
+                    eprintln!(
+                        "argmin-s3 frontend waiting for control-plane runtime map during startup: {error}"
+                    );
+                }
+                tokio::time::sleep(retry_delay).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn frontend_control_plane_startup_retry_deadline(config: &ServerConfig) -> Duration {
+    let refresh_budget = config.control_plane_refresh_interval.saturating_mul(20);
+    let lease_budget = config
+        .control_plane_heartbeat_lease_duration
+        .saturating_mul(2);
+    Duration::from_secs(30)
+        .max(refresh_budget)
+        .max(lease_budget)
+}
+
+fn frontend_control_plane_startup_retry_delay(config: &ServerConfig) -> Duration {
+    config
+        .control_plane_refresh_interval
+        .max(Duration::from_millis(50))
+        .min(Duration::from_secs(1))
+}
+
+fn frontend_control_plane_startup_error_is_retryable(error: &str) -> bool {
+    error.starts_with("failed to fetch control-plane runtime map from ")
+        || control_plane_runtime_map_not_ready_for_serving(error)
+        || error == "control-plane runtime map has no routed nodes"
 }
 
 fn build_remote_frontend_storage_cluster(
@@ -2145,6 +2210,22 @@ mod tests {
         ));
         assert!(!control_plane_runtime_map_not_ready_for_serving(
             "control-plane RPC remote error: unknown PG 99"
+        ));
+    }
+
+    #[test]
+    fn frontend_startup_retries_transient_control_plane_runtime_map_errors() {
+        assert!(frontend_control_plane_startup_error_is_retryable(
+            "failed to fetch control-plane runtime map from /tmp/control-plane.sock: control-plane RPC remote error: PG 1 has no serving primary in cluster epoch 35"
+        ));
+        assert!(frontend_control_plane_startup_error_is_retryable(
+            "failed to fetch control-plane runtime map from /tmp/control-plane.sock: No such file or directory"
+        ));
+        assert!(frontend_control_plane_startup_error_is_retryable(
+            "control-plane runtime map has no routed nodes"
+        ));
+        assert!(!frontend_control_plane_startup_error_is_retryable(
+            "ARGMIN_STORAGE_CLUSTER_EPOCH must be > 0"
         ));
     }
 

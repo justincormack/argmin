@@ -26,9 +26,10 @@ Run the standard local CI checks:
   13. ./scripts/uat-s3-tests --smoke route-change-restart
   14. ./scripts/uat-s3-tests --smoke route-change-control-plane-restart
   15. ./scripts/uat-s3-tests --smoke route-change-frontend-restart
-  16. ./scripts/uat-s3-tests --smoke pg-backfill-migration
-  17. ./scripts/uat-s3-tests --smoke metadata-pg-migration
-  18. ./scripts/uat-s3-tests --smoke metadata-pg-migration-failover
+  16. ./scripts/uat-s3-tests --smoke route-change-full-restart
+  17. ./scripts/uat-s3-tests --smoke pg-backfill-migration
+  18. ./scripts/uat-s3-tests --smoke metadata-pg-migration
+  19. ./scripts/uat-s3-tests --smoke metadata-pg-migration-failover
 
 Arguments after `--` are appended to `cargo nextest run --workspace`.
 
@@ -87,6 +88,7 @@ run_cmd "multihost UAT route-change smoke" ./scripts/uat-s3-tests --smoke route-
 run_cmd "multihost UAT route-change restart smoke" ./scripts/uat-s3-tests --smoke route-change-restart
 run_cmd "multihost UAT route-change control-plane restart smoke" ./scripts/uat-s3-tests --smoke route-change-control-plane-restart
 run_cmd "multihost UAT route-change frontend restart smoke" ./scripts/uat-s3-tests --smoke route-change-frontend-restart
+run_cmd "multihost UAT route-change full restart smoke" ./scripts/uat-s3-tests --smoke route-change-full-restart
 run_cmd "multihost UAT PG backfill migration smoke" ./scripts/uat-s3-tests --smoke pg-backfill-migration
 run_cmd "multihost UAT metadata PG migration smoke" ./scripts/uat-s3-tests --smoke metadata-pg-migration
 run_cmd "multihost UAT metadata PG migration failover smoke" ./scripts/uat-s3-tests --smoke metadata-pg-migration-failover

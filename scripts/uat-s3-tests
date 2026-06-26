@@ -25,7 +25,8 @@ Options:
                          control-plane-runtime-map, shard-repair,
                          route-change, route-change-restart,
                          route-change-control-plane-restart,
-                         route-change-frontend-restart, pg-backfill-migration,
+                         route-change-frontend-restart,
+                         route-change-full-restart, pg-backfill-migration,
                          metadata-pg-migration, metadata-pg-migration-failover
   --binary PATH          Run an already-built argmin-s3-compatible binary
   --release              Use a release argmin-s3 binary
@@ -137,10 +138,10 @@ case "$topology" in
         ;;
 esac
 case "$smoke" in
-    ""|storage-node-restart|storage-node-kill-fails-closed|control-plane-runtime-map|shard-repair|route-change|route-change-restart|route-change-control-plane-restart|route-change-frontend-restart|pg-backfill-migration|metadata-pg-migration|metadata-pg-migration-failover)
+    ""|storage-node-restart|storage-node-kill-fails-closed|control-plane-runtime-map|shard-repair|route-change|route-change-restart|route-change-control-plane-restart|route-change-frontend-restart|route-change-full-restart|pg-backfill-migration|metadata-pg-migration|metadata-pg-migration-failover)
         ;;
     *)
-        die "--smoke must be storage-node-restart, storage-node-kill-fails-closed, control-plane-runtime-map, shard-repair, route-change, route-change-restart, route-change-control-plane-restart, route-change-frontend-restart, pg-backfill-migration, metadata-pg-migration, or metadata-pg-migration-failover"
+        die "--smoke must be storage-node-restart, storage-node-kill-fails-closed, control-plane-runtime-map, shard-repair, route-change, route-change-restart, route-change-control-plane-restart, route-change-frontend-restart, route-change-full-restart, pg-backfill-migration, metadata-pg-migration, or metadata-pg-migration-failover"
         ;;
 esac
 if [[ -n "$smoke" && "$topology" != "multihost" ]]; then
@@ -182,7 +183,7 @@ if [[ "$smoke" == "control-plane-runtime-map" ]]; then
     export ARGMIN_CONTROL_PLANE_LEASE_SCAN_MS="${ARGMIN_CONTROL_PLANE_LEASE_SCAN_MS:-100}"
     export ARGMIN_CONTROL_PLANE_HEARTBEAT_LEASE_MS="${ARGMIN_CONTROL_PLANE_HEARTBEAT_LEASE_MS:-1000}"
 fi
-if [[ "$smoke" == "route-change" || "$smoke" == "route-change-restart" || "$smoke" == "route-change-control-plane-restart" || "$smoke" == "route-change-frontend-restart" ]]; then
+if [[ "$smoke" == "route-change" || "$smoke" == "route-change-restart" || "$smoke" == "route-change-control-plane-restart" || "$smoke" == "route-change-frontend-restart" || "$smoke" == "route-change-full-restart" ]]; then
     export ARGMIN_EC_K=1
     export ARGMIN_EC_M=1
     export ARGMIN_LOCAL_NODE_COUNT=3
@@ -405,7 +406,7 @@ start_control_plane() {
 
 start_frontend() {
     frontend_log="$logs_dir/frontend.log"
-    if [[ "$smoke" == "control-plane-runtime-map" || "$smoke" == "route-change" || "$smoke" == "route-change-restart" || "$smoke" == "route-change-control-plane-restart" || "$smoke" == "route-change-frontend-restart" || "$smoke" == "pg-backfill-migration" || "$smoke" == "metadata-pg-migration" || "$smoke" == "metadata-pg-migration-failover" ]]; then
+    if [[ "$smoke" == "control-plane-runtime-map" || "$smoke" == "route-change" || "$smoke" == "route-change-restart" || "$smoke" == "route-change-control-plane-restart" || "$smoke" == "route-change-frontend-restart" || "$smoke" == "route-change-full-restart" || "$smoke" == "pg-backfill-migration" || "$smoke" == "metadata-pg-migration" || "$smoke" == "metadata-pg-migration-failover" ]]; then
         start_process "frontend" "$frontend_log" env \
             -u ARGMIN_STORAGE_NODE_ID \
             -u ARGMIN_STORAGE_NODE_DATA_DIR \
@@ -1477,7 +1478,7 @@ if [[ "$smoke" == "shard-repair" ]]; then
     print_command cargo build -p s3-tests --bin uat_shard_repair_smoke
     cargo build -p s3-tests --bin uat_shard_repair_smoke
     shard_repair_smoke_cmd=("$ROOT/target/debug/uat_shard_repair_smoke")
-elif [[ "$smoke" == "route-change" || "$smoke" == "route-change-restart" || "$smoke" == "route-change-control-plane-restart" || "$smoke" == "route-change-frontend-restart" || "$smoke" == "pg-backfill-migration" || "$smoke" == "metadata-pg-migration" || "$smoke" == "metadata-pg-migration-failover" ]]; then
+elif [[ "$smoke" == "route-change" || "$smoke" == "route-change-restart" || "$smoke" == "route-change-control-plane-restart" || "$smoke" == "route-change-frontend-restart" || "$smoke" == "route-change-full-restart" || "$smoke" == "pg-backfill-migration" || "$smoke" == "metadata-pg-migration" || "$smoke" == "metadata-pg-migration-failover" ]]; then
     echo "== argmin-s3 UAT PG smoke helper build =="
     print_command cargo build -p s3-tests --bin uat_pg_backfill_smoke
     cargo build -p s3-tests --bin uat_pg_backfill_smoke
@@ -1511,10 +1512,10 @@ else
         echo "${socket_entries[*]}"
     )"
 
-    if [[ "$smoke" == "control-plane-runtime-map" || "$smoke" == "route-change" || "$smoke" == "route-change-restart" || "$smoke" == "route-change-control-plane-restart" || "$smoke" == "route-change-frontend-restart" || "$smoke" == "pg-backfill-migration" || "$smoke" == "metadata-pg-migration" || "$smoke" == "metadata-pg-migration-failover" ]]; then
+    if [[ "$smoke" == "control-plane-runtime-map" || "$smoke" == "route-change" || "$smoke" == "route-change-restart" || "$smoke" == "route-change-control-plane-restart" || "$smoke" == "route-change-frontend-restart" || "$smoke" == "route-change-full-restart" || "$smoke" == "pg-backfill-migration" || "$smoke" == "metadata-pg-migration" || "$smoke" == "metadata-pg-migration-failover" ]]; then
         start_control_plane
         wait_for_control_plane_socket
-        if [[ "$smoke" == "route-change" || "$smoke" == "route-change-restart" || "$smoke" == "route-change-control-plane-restart" || "$smoke" == "route-change-frontend-restart" || "$smoke" == "pg-backfill-migration" || "$smoke" == "metadata-pg-migration" || "$smoke" == "metadata-pg-migration-failover" ]]; then
+        if [[ "$smoke" == "route-change" || "$smoke" == "route-change-restart" || "$smoke" == "route-change-control-plane-restart" || "$smoke" == "route-change-frontend-restart" || "$smoke" == "route-change-full-restart" || "$smoke" == "pg-backfill-migration" || "$smoke" == "metadata-pg-migration" || "$smoke" == "metadata-pg-migration-failover" ]]; then
             set_all_pg_acting_sets "initial old placement nodes 0,1" 0 1
         fi
     fi
@@ -1527,7 +1528,7 @@ else
         wait_for_storage_node_socket "$node_id"
     done
 
-    if [[ "$smoke" == "route-change" || "$smoke" == "route-change-restart" || "$smoke" == "route-change-control-plane-restart" || "$smoke" == "route-change-frontend-restart" || "$smoke" == "pg-backfill-migration" || "$smoke" == "metadata-pg-migration" || "$smoke" == "metadata-pg-migration-failover" ]]; then
+    if [[ "$smoke" == "route-change" || "$smoke" == "route-change-restart" || "$smoke" == "route-change-control-plane-restart" || "$smoke" == "route-change-frontend-restart" || "$smoke" == "route-change-full-restart" || "$smoke" == "pg-backfill-migration" || "$smoke" == "metadata-pg-migration" || "$smoke" == "metadata-pg-migration-failover" ]]; then
         wait_for_control_plane_runtime_map_ready 10
         wait_for_control_plane_node_epochs_aligned 10 "$control_plane_runtime_map_ready_epoch"
         wait_for_control_plane_runtime_map_ready 10 "$control_plane_aligned_epoch"
@@ -1746,6 +1747,12 @@ run_route_change_smoke() {
         wait_for_target_pg_runtime_installed "$data_pg" "0:2" 30 "$metrics_path"
     elif [[ "$smoke" == "route-change-frontend-restart" ]]; then
         echo "== argmin-s3 UAT route-change restart frontend after data-PG move =="
+        restart_frontend
+        wait_for_target_pg_runtime_installed "$data_pg" "0:2" 30 "$metrics_path"
+    elif [[ "$smoke" == "route-change-full-restart" ]]; then
+        echo "== argmin-s3 UAT route-change restart control-plane, storage nodes, and frontend after data-PG move =="
+        restart_control_plane
+        restart_all_storage_nodes
         restart_frontend
         wait_for_target_pg_runtime_installed "$data_pg" "0:2" 30 "$metrics_path"
     fi
@@ -2210,7 +2217,7 @@ elif [[ "$smoke" == "shard-repair" ]]; then
         fi
         run_shard_repair_smoke
     done
-elif [[ "$smoke" == "route-change" || "$smoke" == "route-change-restart" || "$smoke" == "route-change-control-plane-restart" || "$smoke" == "route-change-frontend-restart" ]]; then
+elif [[ "$smoke" == "route-change" || "$smoke" == "route-change-restart" || "$smoke" == "route-change-control-plane-restart" || "$smoke" == "route-change-frontend-restart" || "$smoke" == "route-change-full-restart" ]]; then
     for ((iteration = 1; iteration <= repeat_count; iteration++)); do
         run_route_change_smoke "$iteration"
     done

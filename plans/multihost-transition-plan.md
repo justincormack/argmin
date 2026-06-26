@@ -8721,6 +8721,13 @@ Metadata PG migration and backfill design notes:
   before retained reads/listing and the new-placement write. This pins
   persisted control-plane route history and runtime-map reconstruction after a
   route change that already requires historical placement.
+- Added the full-restart route-change companion smoke:
+  `./scripts/uat-s3-tests --smoke route-change-full-restart` performs the same
+  data-PG acting-set move, then restarts the control-plane, every storage-node,
+  and the frontend before retained reads/listing and the new-placement write.
+  This pins the combined persisted route-history path across a whole
+  process-group restart without duplicating the precise cargo failpoint
+  assertions.
 
 Exit criteria:
 
