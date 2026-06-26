@@ -2341,6 +2341,13 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
                 current_incarnation: record.node_incarnation,
             });
         }
+        if heartbeat.observed_epoch > current_epoch {
+            return Err(ControlPlaneError::FutureNodeObservedEpoch {
+                node_id: heartbeat.node_id.as_u32(),
+                observed_epoch: heartbeat.observed_epoch,
+                current_epoch,
+            });
+        }
         if heartbeat.observed_epoch != current_epoch {
             validate_storage_cluster_map_history_floor_at_epoch(
                 &self.snapshot,
@@ -4235,6 +4242,13 @@ pub enum ControlPlaneError {
 
     #[error("node {node_id} observed epoch {observed_epoch}, current epoch is {current_epoch}")]
     StaleNodeObservedEpoch {
+        node_id: u32,
+        observed_epoch: ClusterEpoch,
+        current_epoch: ClusterEpoch,
+    },
+
+    #[error("node {node_id} reported future observed epoch {observed_epoch}, current epoch is {current_epoch}")]
+    FutureNodeObservedEpoch {
         node_id: u32,
         observed_epoch: ClusterEpoch,
         current_epoch: ClusterEpoch,
@@ -12239,6 +12253,75 @@ mod tests {
         assert_eq!(
             authority.deterministic_pg_primary(PgId::new(1), &[NodeId::new(7)], 200),
             None
+        );
+    }
+
+    #[test]
+    fn future_observed_epoch_heartbeat_rejected_without_mutation() {
+        let tmp = test_util::tempdir();
+        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store.clone()).unwrap();
+        authority
+            .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
+            .unwrap();
+        assert!(heartbeat_until_serving(&mut authority, 1, 1_000).serving());
+        authority
+            .set_pg_acting_set(PgId::new(1), vec![NodeId::new(1)])
+            .unwrap();
+
+        let proof = PgMetadataProof::new(7, 8, 9);
+        heartbeat_with_pg_proof(&mut authority, 1, 1, PgState::Peering, proof, false, 2_000);
+        authority
+            .complete_pg_peering(
+                PgId::new(1),
+                NodeId::new(1),
+                node_incarnation(&authority, 1),
+                2_010,
+            )
+            .unwrap();
+        let active_epoch = authority.snapshot().cluster_epoch();
+        let mut active_heartbeat = heartbeat_from_record(&authority, 1, active_epoch, 2_020);
+        active_heartbeat.pg_observations = vec![NodePgHeartbeatObservation {
+            pg_id: PgId::new(1),
+            state: PgState::Active,
+            metadata_proof: proof,
+            has_pending_metadata_command: false,
+        }];
+        assert!(authority
+            .heartbeat(active_heartbeat, 2_020)
+            .unwrap()
+            .serving());
+        assert_eq!(
+            authority.serving_pg_primary(PgId::new(1), 2_021),
+            Some(NodeId::new(1))
+        );
+
+        let before = authority.snapshot().clone();
+        let before_node = before.node(NodeId::new(1)).unwrap();
+        let future_epoch = ClusterEpoch::new(before.cluster_epoch().get() + 100).unwrap();
+        let mut future = heartbeat_from_record(&authority, 1, future_epoch, 2_030);
+        future.node_incarnation = before_node.node_incarnation() + 1;
+        future.endpoint = "future-node-1.sock".to_owned();
+        future.pg_observations = vec![NodePgHeartbeatObservation {
+            pg_id: PgId::new(1),
+            state: PgState::Active,
+            metadata_proof: proof,
+            has_pending_metadata_command: false,
+        }];
+
+        assert!(matches!(
+            authority.refresh_node_heartbeat(future, 2_030),
+            Err(ControlPlaneError::FutureNodeObservedEpoch {
+                node_id: 1,
+                observed_epoch,
+                current_epoch,
+            }) if observed_epoch == future_epoch && current_epoch == before.cluster_epoch()
+        ));
+        assert_eq!(authority.snapshot(), &before);
+        assert_eq!(store.load().unwrap().unwrap(), before);
+        assert_eq!(
+            authority.serving_pg_primary(PgId::new(1), 2_031),
+            Some(NodeId::new(1))
         );
     }
 
