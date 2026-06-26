@@ -8892,6 +8892,18 @@ Metadata PG migration and backfill design notes:
   selector skips invalid newer candidates, chooses the newest usable checkpoint,
   exports the retained suffix from that checkpoint, and preserves the final
   source metadata proof.
+- Closed the Phase 11 property-test close-out. The targeted property/model set
+  now covers the control-plane epoch/heartbeat invariants, metadata transfer
+  artifact/checkpoint retry/candidate-selection and command-log compaction
+  invariants, retained-route historical read/cleanup/repair/backfill invariants
+  in the local-cluster trace, and backfill planner classification/priority
+  invariants. A `PROPTEST_CASES=512` run of the local-cluster trace passed
+  after adding stale direct-PUT cleanup coverage. Restart/refresh after retained
+  route installation is intentionally covered by the persisted route-change UAT
+  smokes above rather than folded into the local-cluster trace property: that
+  trace mutates route state through test-only in-memory installs, so restart
+  there would mostly validate the harness rather than a production persisted
+  refresh path. No further Phase 11 property-test gaps are currently tracked.
 
 Exit criteria:
 
