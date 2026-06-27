@@ -1,0 +1,141 @@
+Upgrade path can persist unparsable peering PG state
+Link: https://chatgpt.com/codex/cloud/security/findings/0e00f946064481919137f785f7ab6d8a?sev=&repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin
+Criticality: informational (attack path: ignore)
+Status: fixed
+
+# Metadata
+Repo: justincormack/argmin
+Commit: 79ac4af
+Author: justin@specialbusservice.com
+Created: 27/06/2026, 15:35:11
+Assignee: Unassigned
+Signals: Validated, Attack-path
+
+# Resolution
+Fixed by commit 6f9d16052631c3ecd9f33766cd1316d112a84a77
+(`Reject active imported provenance without epoch`).
+
+We are not supporting persisted-state upgrade compatibility here, so the fix
+tightens the current parser instead: active metadata transfer imported
+provenance is now rejected unless the active metadata proof epoch is present.
+That removes the lenient state shape that could be transformed into an
+unparsable peering floor record on restart.
+
+# Summary
+Introduced non-security availability/correctness bug. The patch preserves peering floor provenance but does not account for older accepted state records where active transfer provenance exists without an active proof epoch. The new parser invariant for peering provenance is stricter than the values the new transition code can persist from such older records.
+The new peering metadata floor provenance fields require `peering_metadata_proof_floor_imported` to have a corresponding `peering_metadata_proof_floor_epoch`. However, backward-compatible parsing still allows older active PG records to have `active_metadata_transfer_imported = true` while `active_metadata_proof_epoch` is absent. On startup, `SingleAuthorityControlPlane::open` calls `bump_authority_after_restart`, which transitions active PGs to peering and now copies both `active_metadata_proof_epoch` and `active_metadata_transfer_imported` directly into the peering floor fields. For an older active imported record with no active proof epoch, this produces an in-memory peering record with `peering_metadata_proof_floor_epoch = None` and `peering_metadata_proof_floor_imported = true`. The formatter then writes that invalid combination to disk, while the parser rejects it on the next load. This can make the service fail to restart after an upgrade/restart sequence for affected persisted state.
+
+# Validation
+## Rubric
+- [x] Verify the parser remains backward-compatible with legacy active PG records where active_metadata_transfer_imported=true but active_metadata_proof_epoch is absent.
+- [x] Verify SingleAuthorityControlPlane::open always applies restart bump and saves when existing state is loaded.
+- [x] Verify restart bump copies active proof epoch/imported provenance directly into peering floor epoch/imported fields.
+- [x] Verify formatting can persist the invalid peering combination floor_epoch=None and imported=true.
+- [x] Verify a subsequent load rejects the persisted state with the stricter peering provenance invariant.
+## Report
+Validated the finding with a targeted Rust PoC against the real storage crate API. Relevant code confirms the transition mismatch: parse_pg_record accepts legacy 21-field PG records (crates/storage/src/control_plane.rs:5692-5702), parses active_metadata_transfer_imported when present (5873-5881), and defaults absent active_metadata_proof_epoch to None (5902-5910). SingleAuthorityControlPlane::open loads existing state, calls bump_authority_after_restart, then saves (2759-2768). The restart bump copies active_metadata_proof_epoch and active_metadata_transfer_imported directly into peering_metadata_proof_floor_epoch/imported (623-628). The formatter then writes peering floor epoch and imported as separate fields (5116-5122), but the parser rejects imported=true with no floor epoch (6077-6081). The PoC seeds a valid legacy active PG line: pg=7,active,1,1,9,10,11,-,-,-,-,-,-,-,-,-,-,0,1,-,0. First open succeeds and persists a peering record: pg=7,peering,1,-,-,-,-,9,10,11,-,-,-,-,-,-,-,-,-,0,0,-,0,-,-,1. The last fields show peering_metadata_proof_floor_epoch='-' and peering_metadata_proof_floor_imported='1'. The second open fails with Parse { line: 8, message: "peering metadata proof floor imported provenance requires a floor epoch" }, and the PoC panics on unwrap, reproducing an availability failure on restart. Built and ran in Rust debug profile. Valgrind was attempted but is not installed in the container. LLDB was attempted non-interactively; it ran the program and observed exit status 101, but did not stop for a backtrace after the Rust panic.
+
+# Evidence
+crates/storage/src/control_plane.rs (L2759 to 2768)
+  Note: Opening existing state always calls bump_authority_after_restart and then saves the resulting snapshot, so the invalid peering record can be persisted during startup.
+```
+    pub fn open(store: S) -> Result<Self, ControlPlaneError> {
+        let loaded = store.load()?;
+        let loaded_existing_state = loaded.is_some();
+        let mut snapshot = loaded.unwrap_or_else(ClusterControlSnapshot::empty);
+        if loaded_existing_state {
+            let previous_snapshot = snapshot.clone();
+            snapshot.bump_authority_after_restart()?;
+            snapshot.record_history_from(&previous_snapshot);
+        }
+        store.save(&snapshot)?;
+```
+
+crates/storage/src/control_plane.rs (L5117 to 5122)
+  Note: The formatter writes the peering floor epoch and imported flag as separate fields, so an invalid combination of '-' and '1' can be saved and later rejected by parse_pg_record.
+```
+        option_u64(
+            record
+                .peering_metadata_proof_floor_epoch
+                .map(ClusterEpoch::get)
+        ),
+        u8::from(record.peering_metadata_proof_floor_imported)
+```
+
+crates/storage/src/control_plane.rs (L5902 to 5910)
+  Note: Backward-compatible parsing defaults active_metadata_proof_epoch to None when older PG records do not contain the field.
+```
+    let active_metadata_proof_epoch = if fields.len() > metadata_transfer_field_offset + 4 {
+        parse_option_cluster_epoch(
+            line,
+            fields[metadata_transfer_field_offset + 4],
+            "active metadata proof epoch",
+        )?
+    } else {
+        None
+    };
+```
+
+crates/storage/src/control_plane.rs (L6077 to 6081)
+  Note: The new parser rejects peering floor imported provenance unless a floor epoch is present, which conflicts with the invalid state that can be persisted from older active records.
+```
+    if peering_metadata_proof_floor_imported && peering_metadata_proof_floor_epoch.is_none() {
+        return Err(parse_error(
+            line,
+            "peering metadata proof floor imported provenance requires a floor epoch",
+        ));
+```
+
+crates/storage/src/control_plane.rs (L623 to 628)
+  Note: On authority restart, active PGs are transitioned to peering and the active proof epoch and imported flag are copied directly. If an older active record has imported=true but no active epoch, this creates invalid peering provenance.
+```
+        for record in self.pgs.values_mut() {
+            if record.state == PgState::Active {
+                record.peering_metadata_proof_floor = record.active_metadata_proof;
+                record.peering_metadata_proof_floor_epoch = record.active_metadata_proof_epoch;
+                record.peering_metadata_proof_floor_imported =
+                    record.active_metadata_transfer_imported;
+```
+
+# Attack-path analysis
+Final: ignore | Decider: model_decided | Matrix severity: ignore | Policy adjusted: ignore
+## Rationale
+Adjusted from medium to ignore for security criticality. The code defect is validated and can cause a restart/startup availability failure, but the reachable path is local persisted legacy control-plane state loaded during upgrade/restart, not an attacker-controlled network input. The threat model treats local filesystem permissions as trusted, and no repository evidence shows S3 HTTP users can set active_metadata_transfer_imported without active_metadata_proof_epoch in control-plane state. The impact is operational availability for a single service, not a security boundary violation.
+## Likelihood
+ignore - The trigger requires a specific legacy persisted state and an upgrade/restart sequence. Repository evidence and the threat model do not show remote clients can create or modify that local control-plane state condition. Exploitation by an external attacker is therefore unlikely; the realistic scenario is an operator encountering a compatibility bug.
+## Impact
+low - For affected deployments, an upgrade/restart sequence can persist an unparsable control-plane state and later prevent service startup, causing availability loss until manual repair or migration. There is no demonstrated data exfiltration, auth bypass, privilege escalation, RCE, or attacker-controlled corruption path.
+## Assumptions
+- Assessment is limited to repository artifacts in /workspace/argmin; no cloud APIs or live deployment inspection were used.
+- The relevant threat model is the S3-compatible server with remote HTTP clients and trusted local filesystem permissions.
+- Existing control-plane state files are assumed to be operator-managed local artifacts, not directly writable by remote S3 clients.
+- An existing legacy control-plane state file containing an active PG with active_metadata_transfer_imported=true and no active_metadata_proof_epoch field
+- A service upgrade/restart that loads this legacy state with the affected code
+- A subsequent restart or open of the newly saved state
+## Path
+legacy local state -> open() -> restart bump copies None/true -> save invalid peering record -> next open parse error / startup failure
+## Path evidence
+- `crates/storage/src/control_plane.rs:617-628` - On restart, active PG records are transitioned and active_metadata_proof_epoch plus active_metadata_transfer_imported are copied into peering floor epoch/imported fields without enforcing the new invariant.
+- `crates/storage/src/control_plane.rs:2759-2768` - Opening existing state always applies the restart bump and then saves the resulting snapshot, making the invalid combination persistent.
+- `crates/storage/src/control_plane.rs:5108-5122` - The formatter writes active and peering provenance fields independently, allowing floor_epoch='-' and imported='1' to be serialized.
+- `crates/storage/src/control_plane.rs:5873-5910` - Backward-compatible parsing accepts active_metadata_transfer_imported while defaulting absent active_metadata_proof_epoch to None for older records.
+- `crates/storage/src/control_plane.rs:6077-6081` - The parser rejects peering_metadata_proof_floor_imported=true when peering_metadata_proof_floor_epoch is None, causing the later load failure.
+- `crates/argmin-s3/src/main.rs:1208-1230` - The control-plane process opens FileControlPlaneStore at startup and exits on open failure, so the parse error can prevent service startup.
+- `crates/argmin-s3/src/config.rs:126-137` - Runtime exposure/configuration is environment-driven; default listen address is documented as 127.0.0.1:9000 and control-plane state/socket paths are local configuration.
+- `crates/argmin-s3/src/main.rs:221-224` - The binary rejects root execution, indicating intended deployment with a dedicated non-root local service user rather than elevated local privileges.
+- `crates/server-http/src/http/mod.rs:3095-3112` - The remote HTTP/S3 path uses SigV4 authentication, but no evidence connects this network surface to attacker control of the persisted control-plane state condition.
+## Narrative
+The finding is a real product availability bug: legacy state accepted by the parser can be transformed on restart into a peering record that the same parser rejects later. The validation PoC demonstrates first open/save succeeds and second open fails. Static evidence matches that path: open() loads existing state, calls bump_authority_after_restart(), and saves; the bump copies active proof epoch and imported flag directly; formatting writes the fields independently; parsing later rejects imported=true with no floor epoch. This does not appear to be a security vulnerability under the stated threat model because remote S3 clients do not control the local control-plane state file, and local filesystem tampering is assumed out of scope. Impact is service availability on affected upgrades, not confidentiality, integrity bypass, privilege escalation, or remote attacker-triggered DoS.
+## Controls
+- SigV4 authentication for S3 HTTP requests
+- Configurable TLS support via ARGMIN_TLS_CERT_PATH and ARGMIN_TLS_KEY_PATH
+- Default ARGMIN_LISTEN_ADDR is loopback 127.0.0.1:9000
+- Control-plane uses local Unix socket and local state file
+- Control-plane state file lock
+- Process refuses to run as root
+- HTTP connection and in-flight request semaphores/timeouts
+## Blindspots
+- Static-only review could not inspect actual deployment exposure, filesystem permissions, service manager configuration, or upgrade history.
+- No Kubernetes, Terraform, Docker Compose, or load-balancer manifests were found in the shallow artifact search, so exposure is inferred from code defaults rather than deployment IaC.
+- A future or external admin API not present in the inspected repository could change reachability of control-plane state mutations.
+- The validation PoC proves the crash/open failure but does not establish an attacker-controlled entrypoint.
