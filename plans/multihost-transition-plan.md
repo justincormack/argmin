@@ -9091,6 +9091,18 @@ Phase 12.1 progress:
   installed snapshot's last log id. This wrapper is still test-only integration
   scaffolding; it does not yet implement OpenRaft's async `RaftStateMachine`
   trait or serve any production control-plane path.
+- Added an OpenRaft `RaftSnapshotBuilder` adapter for the in-memory wrapper.
+  Snapshot builder creation captures a point-in-time snapshot view, so later
+  committed entries do not change the snapshot returned by the builder. The
+  next trait step is `RaftStateMachine::apply`, which requires naming
+  `futures_util::Stream` in the implementation signature; adding `futures-util`
+  as a direct storage dependency should be an explicit follow-up dependency
+  decision rather than hidden inside this snapshot-builder slice. That slice
+  must also handle the actual OpenRaft application shape deliberately: drain a
+  stream of `EntryResponder<ControlPlaneRaftTypeConfig>` values, apply each
+  entry through the existing wrapper, send each per-entry response through the
+  optional responder, and define the `ControlPlaneError` to `std::io::Error`
+  mapping used by OpenRaft trait methods.
 
 1. define the replicated control-plane state machine:
    - state includes cluster epoch, PG count, PG state, PG acting sets, node

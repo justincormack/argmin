@@ -9,6 +9,7 @@ use openraft::storage::SnapshotMeta;
 use openraft::type_config::alias::{LogIdOf, SnapshotMetaOf, SnapshotOf, StoredMembershipOf};
 use openraft::EntryPayload;
 use openraft::LogId;
+use openraft::RaftSnapshotBuilder;
 use openraft::RaftTypeConfig;
 use openraft::StoredMembership;
 use placement::NodeId;
@@ -81,6 +82,26 @@ pub fn raft_log_id_from_control_plane(
 pub fn assert_openraft_type_config() {
     fn assert_config<C: RaftTypeConfig>() {}
     assert_config::<ControlPlaneRaftTypeConfig>();
+}
+
+#[derive(Debug, Clone)]
+pub struct ControlPlaneRaftSnapshotBuilder {
+    snapshot: SnapshotOf<ControlPlaneRaftTypeConfig>,
+}
+
+impl ControlPlaneRaftSnapshotBuilder {
+    #[must_use]
+    pub fn new(snapshot: SnapshotOf<ControlPlaneRaftTypeConfig>) -> Self {
+        Self { snapshot }
+    }
+}
+
+impl RaftSnapshotBuilder<ControlPlaneRaftTypeConfig> for ControlPlaneRaftSnapshotBuilder {
+    async fn build_snapshot(
+        &mut self,
+    ) -> Result<SnapshotOf<ControlPlaneRaftTypeConfig>, std::io::Error> {
+        Ok(self.snapshot.clone())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -200,6 +221,12 @@ impl ControlPlaneRaftStateMachine {
         };
         self.current_snapshot = Some(snapshot.clone());
         Ok(snapshot)
+    }
+
+    pub fn create_snapshot_builder(
+        &mut self,
+    ) -> Result<ControlPlaneRaftSnapshotBuilder, ControlPlaneError> {
+        Ok(ControlPlaneRaftSnapshotBuilder::new(self.build_snapshot()?))
     }
 
     pub fn install_snapshot(
@@ -393,6 +420,7 @@ mod tests {
     use std::collections::BTreeSet;
 
     use super::*;
+    use openraft::type_config::TypeConfigExt;
     use openraft::Membership;
 
     use crate::control_plane::NodeAvailabilityState;
@@ -533,6 +561,27 @@ mod tests {
                 .last_applied()
                 .map(|log_id| (log_id.term(), log_id.index())),
             Some((2, 1))
+        );
+    }
+
+    #[test]
+    fn control_plane_raft_snapshot_builder_returns_stable_snapshot_view() {
+        let mut state_machine = ControlPlaneRaftStateMachine::empty();
+        state_machine.apply_entry(blank_entry(2, 7, 1)).unwrap();
+
+        let mut builder = state_machine.create_snapshot_builder().unwrap();
+        state_machine.apply_entry(blank_entry(2, 7, 2)).unwrap();
+
+        let snapshot = ControlPlaneRaftTypeConfig::run(builder.build_snapshot()).unwrap();
+
+        assert_eq!(snapshot.meta.last_log_id, Some(raft_log_id(2, 7, 1)));
+        assert_eq!(snapshot.meta.snapshot_id, "control-plane-1");
+        assert_eq!(state_machine.last_applied(), Some(raft_log_id(2, 7, 2)));
+        assert_eq!(
+            state_machine
+                .current_snapshot()
+                .map(|snapshot| snapshot.meta.last_log_id),
+            Some(Some(raft_log_id(2, 7, 1)))
         );
     }
 
