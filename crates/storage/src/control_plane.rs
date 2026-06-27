@@ -6238,6 +6238,12 @@ fn parse_pg_record(line: usize, value: &str) -> Result<PgControlRecord, ControlP
             "active metadata proof epoch requires an active PG",
         ));
     }
+    if active_metadata_transfer_imported && active_metadata_proof_epoch.is_none() {
+        return Err(parse_error(
+            line,
+            "active metadata transfer imported provenance requires an active metadata proof epoch",
+        ));
+    }
     if peering_metadata_proof_floor_epoch.is_some() && peering_metadata_proof_floor.is_none() {
         return Err(parse_error(
             line,
@@ -9473,6 +9479,31 @@ mod tests {
             Err(ControlPlaneError::Parse { message, .. })
                 if message
                     == "metadata transfer source epoch must not be newer than PG record epoch"
+        ));
+    }
+
+    #[test]
+    fn file_backed_authority_rejects_active_imported_provenance_without_epoch() {
+        let tmp = test_util::tempdir();
+        let path = tmp.path().join("control-plane.state");
+        std::fs::write(
+            &path,
+            concat!(
+                "version=11\n",
+                "authority_incarnation=1\n",
+                "cluster_epoch=2\n",
+                "node=1,active,healthy,11,2,100,200,-,6e6f64652d312e736f636b\n",
+                "pg=7,active,1,1,9,10,11,-,-,-,-,-,-,-,-,-,-,-,-,0,1,-,0,-,-,0\n",
+            ),
+        )
+        .unwrap();
+        let store = FileControlPlaneStore::new(path);
+
+        assert!(matches!(
+            SingleAuthorityControlPlane::open(store),
+            Err(ControlPlaneError::Parse { message, .. })
+                if message
+                    == "active metadata transfer imported provenance requires an active metadata proof epoch"
         ));
     }
 
