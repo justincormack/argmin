@@ -1,14 +1,17 @@
-use std::io::Cursor;
+use std::io::{self, Cursor};
 
+use futures_util::{Stream, StreamExt};
 use openraft::impls::leader_id_adv::LeaderId;
 use openraft::impls::BasicNode;
 use openraft::impls::Entry;
 use openraft::impls::Vote;
 use openraft::storage::Snapshot;
 use openraft::storage::SnapshotMeta;
+use openraft::storage::{EntryResponder, RaftStateMachine};
 use openraft::type_config::alias::{LogIdOf, SnapshotMetaOf, SnapshotOf, StoredMembershipOf};
 use openraft::EntryPayload;
 use openraft::LogId;
+use openraft::OptionalSend;
 use openraft::RaftSnapshotBuilder;
 use openraft::RaftTypeConfig;
 use openraft::StoredMembership;
@@ -84,23 +87,41 @@ pub fn assert_openraft_type_config() {
     assert_config::<ControlPlaneRaftTypeConfig>();
 }
 
+fn control_plane_error_to_io_error(context: &'static str, error: ControlPlaneError) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, format!("{context}: {error}"))
+}
+
 #[derive(Debug, Clone)]
 pub struct ControlPlaneRaftSnapshotBuilder {
-    snapshot: SnapshotOf<ControlPlaneRaftTypeConfig>,
+    snapshot: Result<SnapshotOf<ControlPlaneRaftTypeConfig>, String>,
 }
 
 impl ControlPlaneRaftSnapshotBuilder {
     #[must_use]
     pub fn new(snapshot: SnapshotOf<ControlPlaneRaftTypeConfig>) -> Self {
-        Self { snapshot }
+        Self {
+            snapshot: Ok(snapshot),
+        }
+    }
+
+    #[must_use]
+    pub fn from_error(error: ControlPlaneError) -> Self {
+        Self {
+            snapshot: Err(error.to_string()),
+        }
     }
 }
 
 impl RaftSnapshotBuilder<ControlPlaneRaftTypeConfig> for ControlPlaneRaftSnapshotBuilder {
     async fn build_snapshot(
         &mut self,
-    ) -> Result<SnapshotOf<ControlPlaneRaftTypeConfig>, std::io::Error> {
-        Ok(self.snapshot.clone())
+    ) -> Result<SnapshotOf<ControlPlaneRaftTypeConfig>, io::Error> {
+        self.snapshot.clone().map_err(|message| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("control-plane OpenRaft snapshot build failed: {message}"),
+            )
+        })
     }
 }
 
@@ -415,11 +436,76 @@ impl ControlPlaneRaftStateMachine {
     }
 }
 
+impl RaftStateMachine<ControlPlaneRaftTypeConfig> for ControlPlaneRaftStateMachine {
+    type SnapshotBuilder = ControlPlaneRaftSnapshotBuilder;
+
+    async fn applied_state(
+        &mut self,
+    ) -> Result<
+        (
+            Option<LogIdOf<ControlPlaneRaftTypeConfig>>,
+            StoredMembershipOf<ControlPlaneRaftTypeConfig>,
+        ),
+        io::Error,
+    > {
+        Ok(ControlPlaneRaftStateMachine::applied_state(self))
+    }
+
+    async fn apply<Strm>(&mut self, mut entries: Strm) -> Result<(), io::Error>
+    where
+        Strm: Stream<Item = Result<EntryResponder<ControlPlaneRaftTypeConfig>, io::Error>>
+            + Unpin
+            + OptionalSend,
+    {
+        while let Some(entry) = entries.next().await {
+            let (entry, responder) = entry?;
+            let response = self
+                .apply_entry(entry)
+                .map_err(|error| control_plane_error_to_io_error("OpenRaft apply", error))?;
+            if let Some(responder) = responder {
+                responder.send(response);
+            }
+        }
+        Ok(())
+    }
+
+    async fn try_create_snapshot_builder(&mut self, _force: bool) -> Option<Self::SnapshotBuilder> {
+        Some(self.get_snapshot_builder().await)
+    }
+
+    async fn get_snapshot_builder(&mut self) -> Self::SnapshotBuilder {
+        match self.create_snapshot_builder() {
+            Ok(builder) => builder,
+            Err(error) => ControlPlaneRaftSnapshotBuilder::from_error(error),
+        }
+    }
+
+    async fn begin_receiving_snapshot(&mut self) -> Result<Cursor<Vec<u8>>, io::Error> {
+        Ok(Cursor::new(Vec::new()))
+    }
+
+    async fn install_snapshot(
+        &mut self,
+        meta: &SnapshotMetaOf<ControlPlaneRaftTypeConfig>,
+        snapshot: Cursor<Vec<u8>>,
+    ) -> Result<(), io::Error> {
+        ControlPlaneRaftStateMachine::install_snapshot(self, meta, snapshot)
+            .map_err(|error| control_plane_error_to_io_error("OpenRaft install snapshot", error))
+    }
+
+    async fn get_current_snapshot(
+        &mut self,
+    ) -> Result<Option<SnapshotOf<ControlPlaneRaftTypeConfig>>, io::Error> {
+        Ok(self.current_snapshot.clone())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
 
     use super::*;
+    use futures_util::stream;
     use openraft::type_config::TypeConfigExt;
     use openraft::Membership;
 
@@ -688,6 +774,50 @@ mod tests {
                 .last_applied()
                 .map(|log_id| (log_id.term(), log_id.index())),
             Some((1, 2))
+        );
+    }
+
+    #[test]
+    fn control_plane_raft_state_machine_trait_apply_drains_entry_responder_stream() {
+        let mut state_machine = ControlPlaneRaftStateMachine::empty();
+        let entries = stream::iter(vec![
+            Ok((blank_entry(1, 1, 1), None)),
+            Ok((
+                normal_entry(
+                    1,
+                    1,
+                    2,
+                    ControlPlaneCommand::BootstrapInitialClusterMap {
+                        nodes: vec![(NodeId::new(1), "node-1".to_string())],
+                        pg_ids: vec![PgId::new(0)],
+                    },
+                ),
+                None,
+            )),
+            Ok((
+                normal_entry(
+                    1,
+                    1,
+                    3,
+                    ControlPlaneCommand::MarkNodeAvailability {
+                        node_id: NodeId::new(99),
+                        availability: NodeAvailabilityState::Healthy,
+                    },
+                ),
+                None,
+            )),
+        ]);
+
+        ControlPlaneRaftTypeConfig::run(RaftStateMachine::apply(&mut state_machine, entries))
+            .unwrap();
+
+        assert_eq!(state_machine.last_applied(), Some(raft_log_id(1, 1, 3)));
+        assert_eq!(
+            state_machine
+                .inner()
+                .last_applied()
+                .map(|log_id| (log_id.term(), log_id.index())),
+            Some((1, 3))
         );
     }
 }

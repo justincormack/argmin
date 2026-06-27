@@ -9088,21 +9088,21 @@ Phase 12.1 progress:
   leader node id. Snapshot install validates rollback and same-position
   conflicts against the full OpenRaft log id before mutating state, and rejects
   snapshot membership metadata that is invalid, future, or not included in the
-  installed snapshot's last log id. This wrapper is still test-only integration
-  scaffolding; it does not yet implement OpenRaft's async `RaftStateMachine`
-  trait or serve any production control-plane path.
+  installed snapshot's last log id. This wrapper is still integration
+  scaffolding and does not serve any production control-plane path.
 - Added an OpenRaft `RaftSnapshotBuilder` adapter for the in-memory wrapper.
   Snapshot builder creation captures a point-in-time snapshot view, so later
-  committed entries do not change the snapshot returned by the builder. The
-  next trait step is `RaftStateMachine::apply`, which requires naming
-  `futures_util::Stream` in the implementation signature; adding `futures-util`
-  as a direct storage dependency should be an explicit follow-up dependency
-  decision rather than hidden inside this snapshot-builder slice. That slice
-  must also handle the actual OpenRaft application shape deliberately: drain a
-  stream of `EntryResponder<ControlPlaneRaftTypeConfig>` values, apply each
-  entry through the existing wrapper, send each per-entry response through the
-  optional responder, and define the `ControlPlaneError` to `std::io::Error`
-  mapping used by OpenRaft trait methods.
+  committed entries do not change the snapshot returned by the builder.
+- Implemented OpenRaft's async `RaftStateMachine` trait for the in-memory
+  wrapper. `apply` drains OpenRaft's stream of
+  `EntryResponder<ControlPlaneRaftTypeConfig>` values, applies each committed
+  entry through the deterministic wrapper, sends each per-entry response
+  through the optional responder, and returns stream/protocol failures as
+  `std::io::Error`. Deterministic semantic command rejection remains an
+  application response, so a committed rejected command still advances
+  `last_applied` rather than stalling replay. This required adding
+  `futures-util` as a direct storage dependency because OpenRaft's trait
+  signature exposes `futures_util::Stream`.
 
 1. define the replicated control-plane state machine:
    - state includes cluster epoch, PG count, PG state, PG acting sets, node

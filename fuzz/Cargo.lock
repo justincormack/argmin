@@ -1145,6 +1145,7 @@ version = "0.1.0"
 dependencies = [
  "checksum",
  "ec",
+ "futures-util",
  "observability",
  "openraft",
  "placement",
