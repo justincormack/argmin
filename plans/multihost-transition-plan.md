@@ -8984,6 +8984,18 @@ Phase 12.1 starting slice:
   linearized runtime-map reads, and not-leader redirect/error behavior before
   replacing production control-plane paths.
 
+Phase 12.1 progress:
+
+- Added an explicit versioned byte codec for `ControlPlaneCommand` inside the
+  storage crate. The codec covers the current durable command variants,
+  appends and verifies a per-command CRC64, rejects unknown magic/version/tags,
+  enforces bounded collection lengths before allocation, rejects trailing bytes,
+  reports decode failures separately from RPC framing failures, and has
+  round-trip, degenerate-value, malformed, semantic-decode-error, and corrupted
+  payload tests. This gives the OpenRaft spike a concrete command-log payload
+  without adding a new production serialization dependency or relying solely on
+  consensus-log integrity checks.
+
 1. define the replicated control-plane state machine:
    - state includes cluster epoch, PG count, PG state, PG acting sets, node
      membership, node incarnation/endpoint/liveness metadata, retained

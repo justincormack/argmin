@@ -4604,6 +4604,9 @@ pub enum ControlPlaneError {
     #[error("control-plane RPC protocol error: {message}")]
     RpcProtocol { message: String },
 
+    #[error("control-plane command decode error: {message}")]
+    CommandDecode { message: String },
+
     #[error("control-plane RPC remote error: {message}")]
     RpcRemote { message: String },
 
@@ -9830,7 +9833,11 @@ mod tests {
 
         let mut replayed = ClusterControlSnapshot::empty();
         for command in commands.clone() {
-            let applied = replayed.apply_control_plane_command(command).unwrap();
+            let encoded =
+                crate::control_plane_command::encode_control_plane_command(&command).unwrap();
+            let decoded =
+                crate::control_plane_command::decode_control_plane_command(&encoded).unwrap();
+            let applied = replayed.apply_control_plane_command(decoded).unwrap();
             assert!(applied.changed());
             replayed = applied.into_snapshot();
         }
