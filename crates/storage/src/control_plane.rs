@@ -623,6 +623,9 @@ impl ClusterControlSnapshot {
         for record in self.pgs.values_mut() {
             if record.state == PgState::Active {
                 record.peering_metadata_proof_floor = record.active_metadata_proof;
+                record.peering_metadata_proof_floor_epoch = record.active_metadata_proof_epoch;
+                record.peering_metadata_proof_floor_imported =
+                    record.active_metadata_transfer_imported;
                 record.state = PgState::Peering;
                 record.active_primary = None;
                 record.active_metadata_proof = None;
@@ -1058,14 +1061,20 @@ impl ControlPlaneCommandStateMachine for ClusterControlSnapshot {
                 match next_snapshot.pgs.get_mut(&pg_id) {
                     Some(record) if record.acting_set == acting_set => {}
                     Some(record) => {
-                        let peering_metadata_proof_floor = match record.state {
-                            PgState::Active => {
+                        let (
+                            peering_metadata_proof_floor,
+                            peering_metadata_proof_floor_epoch,
+                            peering_metadata_proof_floor_imported,
+                        ) = match record.state {
+                            PgState::Active => (
                                 Some(validate_authoritative_metadata_migration_source(
                                     self,
                                     record,
                                     &acting_set,
-                                )?)
-                            }
+                                )?),
+                                record.active_metadata_proof_epoch,
+                                record.active_metadata_transfer_imported,
+                            ),
                             PgState::Peering => {
                                 if let Some(floor) = record.peering_metadata_proof_floor {
                                     validate_peering_metadata_migration_source(
@@ -1074,12 +1083,16 @@ impl ControlPlaneCommandStateMachine for ClusterControlSnapshot {
                                         &acting_set,
                                         floor,
                                     )?;
-                                    Some(floor)
+                                    (
+                                        Some(floor),
+                                        record.peering_metadata_proof_floor_epoch,
+                                        record.peering_metadata_proof_floor_imported,
+                                    )
                                 } else {
-                                    None
+                                    (None, None, false)
                                 }
                             }
-                            _ => None,
+                            _ => (None, None, false),
                         };
                         let (
                             peering_metadata_transfer,
@@ -1121,6 +1134,10 @@ impl ControlPlaneCommandStateMachine for ClusterControlSnapshot {
                         record.active_metadata_proof_epoch = None;
                         record.active_metadata_transfer_imported = false;
                         record.peering_metadata_proof_floor = peering_metadata_proof_floor;
+                        record.peering_metadata_proof_floor_epoch =
+                            peering_metadata_proof_floor_epoch;
+                        record.peering_metadata_proof_floor_imported =
+                            peering_metadata_proof_floor_imported;
                         record.peering_metadata_transfer = peering_metadata_transfer;
                         record.peering_metadata_transfer_source_route_epoch =
                             peering_metadata_transfer_source_route_epoch;
@@ -1237,6 +1254,8 @@ impl ControlPlaneCommandStateMachine for ClusterControlSnapshot {
                 record.active_metadata_proof_epoch = None;
                 record.active_metadata_transfer_imported = false;
                 record.peering_metadata_proof_floor = Some(transfer.metadata_proof());
+                record.peering_metadata_proof_floor_epoch = Some(self.cluster_epoch);
+                record.peering_metadata_proof_floor_imported = true;
                 record.peering_metadata_transfer = Some(transfer);
                 record.peering_metadata_transfer_source_route_epoch = Some(source_route_epoch);
                 record.peering_metadata_transfer_source_node_id = Some(source_node_id);
@@ -1326,7 +1345,11 @@ impl ControlPlaneCommandStateMachine for ClusterControlSnapshot {
                 if record.state != PgState::Peering {
                     let active_metadata_transfer_imported =
                         record.active_metadata_transfer_imported;
+                    let active_metadata_proof_epoch = record.active_metadata_proof_epoch;
                     record.peering_metadata_proof_floor = active_source_floor;
+                    record.peering_metadata_proof_floor_epoch = active_metadata_proof_epoch;
+                    record.peering_metadata_proof_floor_imported =
+                        active_metadata_transfer_imported;
                     record.state = PgState::Peering;
                     record.active_primary = None;
                     record.active_metadata_proof = None;
@@ -1378,11 +1401,21 @@ impl ControlPlaneCommandStateMachine for ClusterControlSnapshot {
                     .ok_or(ControlPlaneError::UnknownPg { pg_id: pg_id.get() })?;
                 let changed = record.state != state;
                 if changed {
+                    let peering_metadata_proof_floor_epoch = if record.state == PgState::Active {
+                        record.active_metadata_proof_epoch
+                    } else {
+                        None
+                    };
+                    let peering_metadata_proof_floor_imported =
+                        record.state == PgState::Active && record.active_metadata_transfer_imported;
                     record.peering_metadata_proof_floor = if record.state == PgState::Active {
                         record.active_metadata_proof
                     } else {
                         None
                     };
+                    record.peering_metadata_proof_floor_epoch = peering_metadata_proof_floor_epoch;
+                    record.peering_metadata_proof_floor_imported =
+                        peering_metadata_proof_floor_imported;
                     record.state = state;
                     record.active_primary = None;
                     record.active_metadata_proof = None;
@@ -1393,6 +1426,8 @@ impl ControlPlaneCommandStateMachine for ClusterControlSnapshot {
                     record.metadata_transfer_fence_source_imported = false;
                     if state != PgState::Peering {
                         record.peering_metadata_proof_floor = None;
+                        record.peering_metadata_proof_floor_epoch = None;
+                        record.peering_metadata_proof_floor_imported = false;
                         record.peering_metadata_transfer = None;
                         record.peering_metadata_transfer_source_route_epoch = None;
                         record.peering_metadata_transfer_source_node_id = None;
@@ -1478,7 +1513,7 @@ impl ControlPlaneCommandStateMachine for ClusterControlSnapshot {
                     self.cluster_epoch,
                     pg_id,
                     primary,
-                    record.peering_metadata_proof_floor,
+                    record.peering_metadata_proof_floor_context(),
                     record.peering_metadata_transfer,
                     active_metadata_proof,
                 )?;
@@ -1495,6 +1530,8 @@ impl ControlPlaneCommandStateMachine for ClusterControlSnapshot {
                 record.active_metadata_proof = Some(active_metadata_proof);
                 record.active_metadata_transfer_imported = active_metadata_transfer_imported;
                 record.peering_metadata_proof_floor = None;
+                record.peering_metadata_proof_floor_epoch = None;
+                record.peering_metadata_proof_floor_imported = false;
                 record.peering_metadata_transfer = None;
                 record.peering_metadata_transfer_source_route_epoch = None;
                 record.peering_metadata_transfer_source_node_id = None;
@@ -1590,7 +1627,7 @@ impl ControlPlaneCommandStateMachine for ClusterControlSnapshot {
                         self.cluster_epoch,
                         completion.pg_id,
                         completion.primary,
-                        record.peering_metadata_proof_floor,
+                        record.peering_metadata_proof_floor_context(),
                         record.peering_metadata_transfer,
                         completion.active_metadata_proof,
                     )?;
@@ -1608,6 +1645,8 @@ impl ControlPlaneCommandStateMachine for ClusterControlSnapshot {
                     record.active_metadata_transfer_imported =
                         record.peering_metadata_transfer.is_some();
                     record.peering_metadata_proof_floor = None;
+                    record.peering_metadata_proof_floor_epoch = None;
+                    record.peering_metadata_proof_floor_imported = false;
                     record.peering_metadata_transfer = None;
                     record.peering_metadata_transfer_source_route_epoch = None;
                     record.peering_metadata_transfer_source_node_id = None;
@@ -2042,6 +2081,11 @@ pub struct PgControlRecord {
     // prevents acting-set migration, restart, or failure recovery from
     // activating an agreed but stale empty/old metadata state.
     peering_metadata_proof_floor: Option<PgMetadataProof>,
+    // Epoch/provenance for peering_metadata_proof_floor. Metadata command logs
+    // are epoch-local, so a later peering observation may be valid progress
+    // even when its bare log tuple is not ordered against an imported floor.
+    peering_metadata_proof_floor_epoch: Option<ClusterEpoch>,
+    peering_metadata_proof_floor_imported: bool,
     // Explicit metadata transfer proof imported into a peering destination.
     // This is distinct from overlap-based catch-up so later migration code and
     // operators can tell why a non-overlap acting set was allowed to peer.
@@ -2064,6 +2108,13 @@ pub struct PgControlRecord {
     metadata_transfer_fence_source_imported: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PeeringMetadataProofFloor {
+    proof: PgMetadataProof,
+    epoch: Option<ClusterEpoch>,
+    imported: bool,
+}
+
 impl PgControlRecord {
     fn new(pg_id: PgId, acting_set: Vec<NodeId>) -> Self {
         Self {
@@ -2075,6 +2126,8 @@ impl PgControlRecord {
             active_metadata_proof_epoch: None,
             active_metadata_transfer_imported: false,
             peering_metadata_proof_floor: None,
+            peering_metadata_proof_floor_epoch: None,
+            peering_metadata_proof_floor_imported: false,
             peering_metadata_transfer: None,
             peering_metadata_transfer_source_route_epoch: None,
             peering_metadata_transfer_source_node_id: None,
@@ -2122,6 +2175,25 @@ impl PgControlRecord {
     #[must_use]
     pub fn peering_metadata_proof_floor(&self) -> Option<PgMetadataProof> {
         self.peering_metadata_proof_floor
+    }
+
+    #[must_use]
+    pub fn peering_metadata_proof_floor_epoch(&self) -> Option<ClusterEpoch> {
+        self.peering_metadata_proof_floor_epoch
+    }
+
+    #[must_use]
+    pub fn peering_metadata_proof_floor_imported(&self) -> bool {
+        self.peering_metadata_proof_floor_imported
+    }
+
+    fn peering_metadata_proof_floor_context(&self) -> Option<PeeringMetadataProofFloor> {
+        self.peering_metadata_proof_floor
+            .map(|proof| PeeringMetadataProofFloor {
+                proof,
+                epoch: self.peering_metadata_proof_floor_epoch,
+                imported: self.peering_metadata_proof_floor_imported,
+            })
     }
 
     #[must_use]
@@ -2853,7 +2925,7 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
                         self.snapshot.cluster_epoch,
                         record.pg_id,
                         primary,
-                        record.peering_metadata_proof_floor,
+                        record.peering_metadata_proof_floor_context(),
                         record.peering_metadata_transfer,
                         active_metadata_proof,
                     )
@@ -5017,7 +5089,7 @@ fn format_pg_record(record: &PgControlRecord) -> String {
         ),
     };
     format!(
-        "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+        "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
         record.pg_id.get(),
         pg_state_as_str(record.state),
         format_node_list(&record.acting_set),
@@ -5041,7 +5113,13 @@ fn format_pg_record(record: &PgControlRecord) -> String {
         u8::from(record.active_metadata_transfer_imported),
         option_u64(record.metadata_transfer_fence_source_lease_deadline_ms),
         u8::from(record.metadata_transfer_fence_source_imported),
-        option_u64(record.active_metadata_proof_epoch.map(ClusterEpoch::get))
+        option_u64(record.active_metadata_proof_epoch.map(ClusterEpoch::get)),
+        option_u64(
+            record
+                .peering_metadata_proof_floor_epoch
+                .map(ClusterEpoch::get)
+        ),
+        u8::from(record.peering_metadata_proof_floor_imported)
     )
 }
 
@@ -5621,10 +5699,11 @@ fn parse_pg_record(line: usize, value: &str) -> Result<PgControlRecord, ControlP
         && fields.len() != 21
         && fields.len() != 23
         && fields.len() != 24
+        && fields.len() != 26
     {
         return Err(parse_error(
             line,
-            "PG record must have seven, ten, fourteen, seventeen, eighteen, nineteen, twenty, twenty-one, twenty-three, or twenty-four fields",
+            "PG record must have seven, ten, fourteen, seventeen, eighteen, nineteen, twenty, twenty-one, twenty-three, twenty-four, or twenty-six fields",
         ));
     }
     let pg_id = PgId::new(parse_u32(line, fields[0], "PG id")?);
@@ -5829,6 +5908,25 @@ fn parse_pg_record(line: usize, value: &str) -> Result<PgControlRecord, ControlP
     } else {
         None
     };
+    let peering_metadata_proof_floor_epoch = if fields.len() > metadata_transfer_field_offset + 5 {
+        parse_option_cluster_epoch(
+            line,
+            fields[metadata_transfer_field_offset + 5],
+            "peering metadata proof floor epoch",
+        )?
+    } else {
+        None
+    };
+    let peering_metadata_proof_floor_imported = if fields.len() > metadata_transfer_field_offset + 6
+    {
+        parse_bool_u8(
+            line,
+            fields[metadata_transfer_field_offset + 6],
+            "peering metadata proof floor imported provenance",
+        )?
+    } else {
+        false
+    };
     if acting_set.is_empty() {
         return Err(parse_error(line, "PG acting set must not be empty"));
     }
@@ -5964,6 +6062,24 @@ fn parse_pg_record(line: usize, value: &str) -> Result<PgControlRecord, ControlP
             "active metadata proof epoch requires an active PG",
         ));
     }
+    if peering_metadata_proof_floor_epoch.is_some() && peering_metadata_proof_floor.is_none() {
+        return Err(parse_error(
+            line,
+            "peering metadata proof floor epoch requires a peering metadata proof floor",
+        ));
+    }
+    if peering_metadata_proof_floor_epoch.is_some() && state != PgState::Peering {
+        return Err(parse_error(
+            line,
+            "peering metadata proof floor epoch requires a peering PG",
+        ));
+    }
+    if peering_metadata_proof_floor_imported && peering_metadata_proof_floor_epoch.is_none() {
+        return Err(parse_error(
+            line,
+            "peering metadata proof floor imported provenance requires a floor epoch",
+        ));
+    }
     if peering_metadata_transfer.is_some()
         && (peering_metadata_transfer_source_route_epoch.is_none()
             || peering_metadata_transfer_source_node_id.is_none())
@@ -5998,6 +6114,8 @@ fn parse_pg_record(line: usize, value: &str) -> Result<PgControlRecord, ControlP
         active_metadata_proof_epoch,
         active_metadata_transfer_imported,
         peering_metadata_proof_floor,
+        peering_metadata_proof_floor_epoch,
+        peering_metadata_proof_floor_imported,
         peering_metadata_transfer,
         peering_metadata_transfer_source_route_epoch,
         peering_metadata_transfer_source_node_id,
@@ -6471,7 +6589,7 @@ fn validate_peering_metadata_proof_floor(
     cluster_epoch: ClusterEpoch,
     pg_id: PgId,
     node_id: NodeId,
-    floor: Option<PgMetadataProof>,
+    floor: Option<PeeringMetadataProofFloor>,
     transfer: Option<PgMetadataTransferProof>,
     actual: PgMetadataProof,
 ) -> Result<(), ControlPlaneError> {
@@ -6487,10 +6605,21 @@ fn validate_peering_metadata_proof_floor(
             actual,
         });
     }
-    let Some(expected) = floor else {
+    let Some(floor) = floor else {
         return Ok(());
     };
-    if metadata_proof_satisfies_active_floor(expected, actual) {
+    let expected = floor.proof;
+    if metadata_proof_satisfies_active_floor(expected, actual)
+        || floor.epoch.is_some_and(|floor_epoch| {
+            metadata_proof_satisfies_active_primary_observation_floor(
+                expected,
+                actual,
+                floor.imported,
+                Some(floor_epoch),
+                cluster_epoch,
+            )
+        })
+    {
         Ok(())
     } else {
         Err(ControlPlaneError::PgPeeringMetadataProofBelowFloor {
@@ -6666,11 +6795,20 @@ fn mark_pgs_peering_for_nodes(
                 .iter()
                 .any(|node_id| affected_nodes.contains(node_id))
         {
+            let peering_metadata_proof_floor_epoch = if record.state == PgState::Active {
+                record.active_metadata_proof_epoch
+            } else {
+                None
+            };
+            let peering_metadata_proof_floor_imported =
+                record.state == PgState::Active && record.active_metadata_transfer_imported;
             record.peering_metadata_proof_floor = if record.state == PgState::Active {
                 record.active_metadata_proof
             } else {
                 None
             };
+            record.peering_metadata_proof_floor_epoch = peering_metadata_proof_floor_epoch;
+            record.peering_metadata_proof_floor_imported = peering_metadata_proof_floor_imported;
             record.state = PgState::Peering;
             record.active_primary = None;
             record.active_metadata_proof = None;
@@ -15644,6 +15782,91 @@ mod tests {
             )
             .unwrap();
         let pg = authority.snapshot().pg(PgId::new(49)).unwrap();
+        assert_eq!(pg.state(), PgState::Active);
+        assert_eq!(pg.active_metadata_proof(), Some(epoch_local_proof));
+        assert!(!pg.active_metadata_transfer_imported());
+    }
+
+    #[test]
+    fn imported_active_restart_without_initial_observation_accepts_later_epoch_local_peering_proof()
+    {
+        let tmp = test_util::tempdir();
+        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+        authority
+            .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
+            .unwrap();
+        assert!(heartbeat_until_serving(&mut authority, 1, 1_000).serving());
+
+        let imported_proof = PgMetadataProof::new(42, 100, 200);
+        authority
+            .set_pg_acting_set(PgId::new(50), vec![NodeId::new(1)])
+            .unwrap();
+        heartbeat_with_pg_proof(
+            &mut authority,
+            1,
+            50,
+            PgState::Peering,
+            imported_proof,
+            false,
+            2_000,
+        );
+        authority
+            .complete_pg_peering(
+                PgId::new(50),
+                NodeId::new(1),
+                node_incarnation(&authority, 1),
+                2_001,
+            )
+            .unwrap();
+        {
+            let pg = authority.snapshot.pgs.get_mut(&PgId::new(50)).unwrap();
+            pg.active_metadata_transfer_imported = true;
+        }
+
+        let epoch_local_proof = PgMetadataProof::new(
+            imported_proof.applied_log_index,
+            imported_proof.applied_log_hash + 1,
+            imported_proof.state_digest + 1,
+        );
+        let active_proof_epoch = authority
+            .snapshot()
+            .pg(PgId::new(50))
+            .unwrap()
+            .active_metadata_proof_epoch()
+            .unwrap();
+        let active_route_epoch = authority.snapshot().cluster_epoch();
+        let mut restarting_primary =
+            heartbeat_from_record(&authority, 1, active_route_epoch, 2_002);
+        restarting_primary.node_incarnation += 1;
+        authority.heartbeat(restarting_primary, 2_002).unwrap();
+        let peering_epoch = authority.snapshot().cluster_epoch();
+        let pg = authority.snapshot().pg(PgId::new(50)).unwrap();
+        assert_eq!(pg.state(), PgState::Peering);
+        assert_eq!(pg.peering_metadata_proof_floor(), Some(imported_proof));
+        assert_eq!(
+            pg.peering_metadata_proof_floor_epoch(),
+            Some(active_proof_epoch)
+        );
+        assert!(pg.peering_metadata_proof_floor_imported());
+
+        let mut current_peering = heartbeat_from_record(&authority, 1, peering_epoch, 2_003);
+        current_peering.pg_observations = vec![NodePgHeartbeatObservation {
+            pg_id: PgId::new(50),
+            state: PgState::Peering,
+            metadata_proof: epoch_local_proof,
+            has_pending_metadata_command: false,
+        }];
+        authority.heartbeat(current_peering, 2_003).unwrap();
+        authority
+            .complete_pg_peering(
+                PgId::new(50),
+                NodeId::new(1),
+                node_incarnation(&authority, 1),
+                2_004,
+            )
+            .unwrap();
+        let pg = authority.snapshot().pg(PgId::new(50)).unwrap();
         assert_eq!(pg.state(), PgState::Active);
         assert_eq!(pg.active_metadata_proof(), Some(epoch_local_proof));
         assert!(!pg.active_metadata_transfer_imported());
