@@ -8976,7 +8976,17 @@ Detailed work items:
    - use a small Raft-style replicated log for a 3-5 node control-plane group;
    - make the replicated log contain logical control-plane commands, not SQLite
      or filesystem bytes;
-   - decide the production dependency deliberately before adding it;
+   - preliminary dependency decision: spike OpenRaft first. It appears to match
+     the desired shape best because Argmin can provide application-defined
+     control-plane commands, storage, state-machine application, snapshots, and
+     network/auth integration while leaving Raft mechanics to the library. Pin a
+     specific OpenRaft release for the spike, track the 0.10/1.0 stabilization
+     path before committing long-term on-disk formats, and keep the
+     authority-interface split above as the fallback boundary if the integration
+     becomes too opinionated;
+   - keep `raft-rs` as the fallback candidate if OpenRaft cannot preserve the
+     Argmin-owned command encoding, snapshot, diagnostic, or stale-map
+     invalidation model without awkward workarounds;
    - if the dependency owns term/vote/log metadata, membership configuration,
      committed/applied index, snapshots, and joint consensus/reconfiguration
      state, document that contract and test it through the integration harness;
