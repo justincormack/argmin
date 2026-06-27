@@ -9049,6 +9049,25 @@ Phase 12.1 progress:
   captured read-index round id that the state machine may have already applied
   past. `ControlPlaneLogId` now rejects zero term as well as zero index so
   Raft-shaped proof points cannot encode reserved values.
+- Inspected the current OpenRaft 0.10 API for the first integration spike
+  without adding it as a production dependency yet. The concrete version
+  inspected was `openraft 0.10.0-alpha.26`; the spike should pin that exact
+  release, use `default-features = false` to avoid pulling in `clap`, and add
+  only the runtime feature needed by the integration, most likely `tokio-rt`.
+  OpenRaft's split maps cleanly onto the boundary already introduced here:
+  `RaftLogStorage` owns durable vote, log, committed index, append/truncate/
+  purge, and reader visibility; `RaftStateMachine` owns committed-entry apply,
+  applied membership, snapshot build/install, and current snapshot exposure.
+  The state-machine adapter should wrap deterministic semantic rejections in
+  the application response rather than returning them as `apply()` errors, so
+  OpenRaft can advance `last_applied` for rejected committed commands. Linear
+  runtime-map reads should use OpenRaft `ReadPolicy::ReadIndex` first and stamp
+  the returned map with the state machine's actual applied log id after waiting,
+  preserving the exact-proof contract above. The spike must also implement
+  OpenRaft's optional `save_committed`/`read_committed` path or an equivalent
+  startup gate, because OpenRaft documents that a transient state machine can
+  otherwise restart behind a previously observed committed read until recovery
+  catches up.
 
 1. define the replicated control-plane state machine:
    - state includes cluster epoch, PG count, PG state, PG acting sets, node
@@ -9085,6 +9104,32 @@ Phase 12.1 progress:
      path before committing long-term on-disk formats, and keep the
      authority-interface split above as the fallback boundary if the integration
      becomes too opinionated;
+   - initial OpenRaft spike target: `openraft 0.10.0-alpha.26`, pinned exactly,
+     with default features disabled and only the required async runtime feature
+     enabled. Adding this dependency still needs an explicit production
+     dependency decision before changing `Cargo.toml`;
+   - use OpenRaft's application-data hooks for `ControlPlaneCommand` and an
+     application response that can represent both applied and deterministic
+     rejected command outcomes. Do not propagate deterministic command rejection
+     as a storage/apply error, because that would stall replay of a committed
+     log entry;
+   - use OpenRaft's state-machine snapshot hooks with the existing
+     CRC-protected `ClusterControlSnapshot` artifact, while treating OpenRaft
+     snapshot metadata as the authority for the snapshot's last-included log id.
+     Argmin's snapshot install guard still rejects rollback relative to the
+     current applied position, but mutual consistency between a transferred
+     payload and OpenRaft's `last_log_id` metadata is part of the consensus
+     storage contract;
+   - start with OpenRaft `ReadPolicy::ReadIndex` for serving runtime maps. The
+     read path must wait until the state machine has applied the read barrier,
+     then publish a `RuntimeMapFreshnessProof::ReadIndex` for the actual
+     reflected `last_applied` id, not merely the barrier captured at read
+     arrival. Lease reads remain deferred until Phase 12's monotonic-clock,
+     skew, and restart-sleep contract is specified;
+   - persist or gate recovery around OpenRaft's committed-index contract.
+     OpenRaft exposes `save_committed`/`read_committed` specifically to avoid
+     serving reads from a restarted transient state machine before it catches up
+     to a commit previously observed by clients;
    - keep `raft-rs` as the fallback candidate if OpenRaft cannot preserve the
      Argmin-owned command encoding, snapshot, diagnostic, or stale-map
      invalidation model without awkward workarounds;
