@@ -651,9 +651,9 @@ impl ClusterControlSnapshot {
             .retain(|record| record.cluster_epoch != previous.cluster_epoch);
         self.history
             .push(ClusterMapHistoryRecord::from_snapshot(previous));
-        let protected_epochs =
-            required_cluster_map_history_epochs(self.pgs.values(), self.nodes.values());
-        prune_cluster_map_history(&mut self.history, &protected_epochs);
+        let protection =
+            required_cluster_map_history_protection(self.pgs.values(), self.nodes.values());
+        prune_cluster_map_history(&mut self.history, &protection);
     }
 }
 
@@ -4810,8 +4810,8 @@ fn parse_snapshot(contents: &str) -> Result<ClusterControlSnapshot, ControlPlane
     validate_parsed_history(&history, cluster_epoch)?;
     let mut history: Vec<ClusterMapHistoryRecord> =
         history.into_values().map(|record| record.record).collect();
-    let protected_epochs = required_cluster_map_history_epochs(pgs.values(), nodes.values());
-    prune_cluster_map_history(&mut history, &protected_epochs);
+    let protection = required_cluster_map_history_protection(pgs.values(), nodes.values());
+    prune_cluster_map_history(&mut history, &protection);
     validate_required_cluster_map_history(&history, &pgs, &nodes, cluster_epoch)?;
     Ok(ClusterControlSnapshot {
         authority_incarnation: authority_incarnation
@@ -5012,7 +5012,12 @@ fn validate_required_cluster_map_history(
         if floor_epoch >= current_epoch {
             continue;
         }
-        if !retained_epochs.contains(&floor_epoch) {
+        for raw_epoch in floor_epoch.get()..current_epoch.get() {
+            let required_epoch =
+                ClusterEpoch::new(raw_epoch).expect("retained history epoch is non-zero");
+            if retained_epochs.contains(&required_epoch) {
+                continue;
+            }
             return Err(parse_error(
                 0,
                 "storage cluster-map history floor epoch is not retained in cluster-map history",
@@ -5742,16 +5747,21 @@ fn validate_storage_cluster_map_history_floor_at_epoch(
     if floor_epoch >= snapshot.cluster_epoch {
         return Ok(());
     }
-    if snapshot.cluster_map_at_epoch(floor_epoch).is_some() {
-        return Ok(());
+    for raw_epoch in floor_epoch.get()..snapshot.cluster_epoch.get() {
+        let required_epoch =
+            ClusterEpoch::new(raw_epoch).expect("retained history epoch is non-zero");
+        if snapshot.cluster_map_at_epoch(required_epoch).is_some() {
+            continue;
+        }
+        return Err(
+            ControlPlaneError::StorageClusterMapHistoryFloorNotRetained {
+                node_id: heartbeat.node_id.as_u32(),
+                floor_epoch,
+                cluster_epoch: snapshot.cluster_epoch,
+            },
+        );
     }
-    Err(
-        ControlPlaneError::StorageClusterMapHistoryFloorNotRetained {
-            node_id: heartbeat.node_id.as_u32(),
-            floor_epoch,
-            cluster_epoch: snapshot.cluster_epoch,
-        },
-    )
+    Ok(())
 }
 
 fn validate_pg_peering_observations(
@@ -6159,36 +6169,54 @@ fn validate_pg_primary_active_observation(
     Ok(())
 }
 
-fn required_cluster_map_history_epochs<'a, 'b>(
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ClusterMapHistoryProtection {
+    exact_epochs: BTreeSet<ClusterEpoch>,
+    retain_from_epoch: Option<ClusterEpoch>,
+}
+
+fn required_cluster_map_history_protection<'a, 'b>(
     pgs: impl IntoIterator<Item = &'a PgControlRecord>,
     nodes: impl IntoIterator<Item = &'b NodeControlRecord>,
-) -> BTreeSet<ClusterEpoch> {
-    let mut epochs: BTreeSet<_> = pgs
+) -> ClusterMapHistoryProtection {
+    let exact_epochs: BTreeSet<_> = pgs
         .into_iter()
         .filter_map(PgControlRecord::peering_metadata_transfer_source_route_epoch)
         .collect();
-    epochs.extend(
-        nodes
-            .into_iter()
-            .filter_map(NodeControlRecord::cluster_map_history_floor_epoch),
-    );
-    epochs
+    let retain_from_epoch = nodes
+        .into_iter()
+        .filter_map(NodeControlRecord::cluster_map_history_floor_epoch)
+        .min();
+    ClusterMapHistoryProtection {
+        exact_epochs,
+        retain_from_epoch,
+    }
 }
 
 fn prune_cluster_map_history(
     history: &mut Vec<ClusterMapHistoryRecord>,
-    protected_epochs: &BTreeSet<ClusterEpoch>,
+    protection: &ClusterMapHistoryProtection,
 ) {
     history.sort_by_key(ClusterMapHistoryRecord::cluster_epoch);
     while history.len() > CLUSTER_MAP_HISTORY_LIMIT {
         let Some(index) = history
             .iter()
-            .position(|record| !protected_epochs.contains(&record.cluster_epoch()))
+            .position(|record| !cluster_map_history_record_is_protected(record, protection))
         else {
             break;
         };
         history.remove(index);
     }
+}
+
+fn cluster_map_history_record_is_protected(
+    record: &ClusterMapHistoryRecord,
+    protection: &ClusterMapHistoryProtection,
+) -> bool {
+    protection.exact_epochs.contains(&record.cluster_epoch())
+        || protection
+            .retain_from_epoch
+            .is_some_and(|floor| record.cluster_epoch() >= floor)
 }
 
 fn mark_pgs_peering_for_nodes(
@@ -6709,12 +6737,16 @@ mod tests {
                     snapshot.cluster_epoch()
                 );
                 if floor_epoch < snapshot.cluster_epoch() {
-                    prop_assert!(
-                        snapshot.cluster_map_at_epoch(floor_epoch).is_some(),
-                        "node {} persisted unretained storage history floor {}",
-                        node.node_id().as_u32(),
-                        floor_epoch
-                    );
+                    for raw_epoch in floor_epoch.get()..snapshot.cluster_epoch().get() {
+                        let required_epoch = ClusterEpoch::new(raw_epoch).unwrap();
+                        prop_assert!(
+                            snapshot.cluster_map_at_epoch(required_epoch).is_some(),
+                            "node {} persisted unretained storage history epoch {} from floor {}",
+                            node.node_id().as_u32(),
+                            required_epoch,
+                            floor_epoch
+                        );
+                    }
                 }
             }
             for observation in node.pg_observations() {
@@ -7841,6 +7873,11 @@ mod tests {
             .snapshot()
             .cluster_map_at_epoch(protected_epoch)
             .is_some());
+        let advanced_floor = ClusterEpoch::new(protected_epoch.get() + 1).unwrap();
+        assert!(authority
+            .snapshot()
+            .cluster_map_at_epoch(advanced_floor)
+            .is_some());
         assert_eq!(
             authority
                 .snapshot()
@@ -7849,10 +7886,30 @@ mod tests {
                 .cluster_map_history_floor_epoch(),
             Some(protected_epoch)
         );
+        let current_epoch = authority.snapshot().cluster_epoch();
+        let mut advanced_floor_heartbeat =
+            heartbeat_from_record(&authority, 1, current_epoch, 20_000);
+        advanced_floor_heartbeat.cluster_map_history_reference_summary =
+            PgClusterMapHistoryReferenceSummary {
+                oldest_live_placement_epoch: Some(advanced_floor),
+                oldest_durable_backfill_epoch: None,
+            };
+        assert!(authority
+            .heartbeat(advanced_floor_heartbeat, 20_000)
+            .unwrap()
+            .serving());
+        assert_eq!(
+            authority
+                .snapshot()
+                .node(NodeId::new(1))
+                .unwrap()
+                .cluster_map_history_floor_epoch(),
+            Some(advanced_floor)
+        );
         let persisted = SingleAuthorityControlPlane::open(store).unwrap();
         assert!(persisted
             .snapshot()
-            .cluster_map_at_epoch(protected_epoch)
+            .cluster_map_at_epoch(advanced_floor)
             .is_some());
         assert_eq!(
             persisted
@@ -7860,12 +7917,12 @@ mod tests {
                 .node(NodeId::new(1))
                 .unwrap()
                 .cluster_map_history_floor_epoch(),
-            Some(protected_epoch)
+            Some(advanced_floor)
         );
         assert_eq!(
             persisted.snapshot().runtime_map(20_000).unwrap().nodes()[0]
                 .cluster_map_history_floor_epoch(),
-            Some(protected_epoch)
+            Some(advanced_floor)
         );
     }
 
@@ -8037,6 +8094,101 @@ mod tests {
                 floor_epoch,
                 cluster_epoch,
             } if floor_epoch == first_epoch && cluster_epoch == current_epoch
+        ));
+        assert_eq!(
+            authority
+                .snapshot()
+                .node(NodeId::new(1))
+                .unwrap()
+                .cluster_map_history_floor_epoch(),
+            None
+        );
+        assert!(SingleAuthorityControlPlane::open(store).is_ok());
+    }
+
+    #[test]
+    fn heartbeat_rejects_storage_history_floor_with_unretained_intermediate_epoch() {
+        let tmp = test_util::tempdir();
+        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store.clone()).unwrap();
+        for node_id in [1, 2] {
+            authority
+                .set_node_membership(NodeId::new(node_id), NodeMembershipState::Active)
+                .unwrap();
+            assert!(heartbeat_until_serving(&mut authority, node_id, 10_000).serving());
+        }
+        let active_proof = PgMetadataProof::new(9, 10, 11);
+        authority
+            .set_pg_acting_set(PgId::new(42), vec![NodeId::new(1)])
+            .unwrap();
+        heartbeat_with_pg_proof(
+            &mut authority,
+            1,
+            42,
+            PgState::Peering,
+            active_proof,
+            false,
+            20_000,
+        );
+        authority
+            .complete_pg_peering(
+                PgId::new(42),
+                NodeId::new(1),
+                node_incarnation(&authority, 1),
+                20_001,
+            )
+            .unwrap();
+        heartbeat_with_pg_proof(
+            &mut authority,
+            1,
+            42,
+            PgState::Active,
+            active_proof,
+            false,
+            20_002,
+        );
+        let source_epoch = authority.snapshot().cluster_epoch();
+        let transfer = PgMetadataTransferProof::new_with_imported_metadata_proof(
+            source_epoch,
+            active_proof,
+            PgMetadataProof::new(9, 12, 11),
+        );
+        authority
+            .set_pg_acting_set_with_metadata_transfer(PgId::new(42), vec![NodeId::new(2)], transfer)
+            .unwrap();
+
+        for node_id in 10..(10 + CLUSTER_MAP_HISTORY_LIMIT as u32 + 8) {
+            authority
+                .set_node_membership(NodeId::new(node_id), NodeMembershipState::Active)
+                .unwrap();
+        }
+
+        let missing_intermediate_epoch = ClusterEpoch::new(source_epoch.get() + 1).unwrap();
+        assert!(authority
+            .snapshot()
+            .cluster_map_at_epoch(source_epoch)
+            .is_some());
+        assert!(authority
+            .snapshot()
+            .cluster_map_at_epoch(missing_intermediate_epoch)
+            .is_none());
+        let current_epoch = authority.snapshot().cluster_epoch();
+        let mut stale_range_heartbeat = heartbeat_from_record(&authority, 1, current_epoch, 20_000);
+        stale_range_heartbeat.cluster_map_history_reference_summary =
+            PgClusterMapHistoryReferenceSummary {
+                oldest_live_placement_epoch: Some(source_epoch),
+                oldest_durable_backfill_epoch: None,
+            };
+        let error = authority
+            .heartbeat(stale_range_heartbeat, 20_000)
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ControlPlaneError::StorageClusterMapHistoryFloorNotRetained {
+                node_id: 1,
+                floor_epoch,
+                cluster_epoch,
+            } if floor_epoch == source_epoch && cluster_epoch == current_epoch
         ));
         assert_eq!(
             authority
