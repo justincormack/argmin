@@ -2820,9 +2820,15 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
             let Some(pg) = next_snapshot.pgs.get_mut(&observation.pg_id) else {
                 continue;
             };
+            // Preserve durable primary progress before this heartbeat fences the
+            // primary into Peering; otherwise an imported transfer floor can
+            // mask a later epoch-local proof after restart.
+            let primary_restart_peering_observation = epoch_changed
+                && affected_node == Some(heartbeat.node_id)
+                && observation.state == PgState::Peering;
             if pg.state != PgState::Active
                 || pg.active_primary != Some(heartbeat.node_id)
-                || observation.state != PgState::Active
+                || (observation.state != PgState::Active && !primary_restart_peering_observation)
                 || observation.has_pending_metadata_command
             {
                 continue;
@@ -14878,6 +14884,84 @@ mod tests {
             pg.peering_metadata_proof_floor(),
             Some(primary_destination_progress)
         );
+    }
+
+    #[test]
+    fn imported_active_primary_restart_preserves_epoch_local_peering_floor() {
+        let tmp = test_util::tempdir();
+        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+        authority
+            .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
+            .unwrap();
+        assert!(heartbeat_until_serving(&mut authority, 1, 1_000).serving());
+
+        let imported_proof = PgMetadataProof::new(42, 100, 200);
+        authority
+            .set_pg_acting_set(PgId::new(49), vec![NodeId::new(1)])
+            .unwrap();
+        heartbeat_with_pg_proof(
+            &mut authority,
+            1,
+            49,
+            PgState::Peering,
+            imported_proof,
+            false,
+            2_000,
+        );
+        authority
+            .complete_pg_peering(
+                PgId::new(49),
+                NodeId::new(1),
+                node_incarnation(&authority, 1),
+                2_001,
+            )
+            .unwrap();
+        {
+            let pg = authority.snapshot.pgs.get_mut(&PgId::new(49)).unwrap();
+            pg.active_metadata_transfer_imported = true;
+        }
+
+        let epoch_local_proof = PgMetadataProof::new(
+            imported_proof.applied_log_index,
+            imported_proof.applied_log_hash + 1,
+            imported_proof.state_digest + 1,
+        );
+        let active_epoch = authority.snapshot().cluster_epoch();
+        let mut restarting_primary = heartbeat_from_record(&authority, 1, active_epoch, 2_002);
+        restarting_primary.node_incarnation += 1;
+        restarting_primary.pg_observations = vec![NodePgHeartbeatObservation {
+            pg_id: PgId::new(49),
+            state: PgState::Peering,
+            metadata_proof: epoch_local_proof,
+            has_pending_metadata_command: false,
+        }];
+        authority.heartbeat(restarting_primary, 2_002).unwrap();
+        let peering_epoch = authority.snapshot().cluster_epoch();
+        let pg = authority.snapshot().pg(PgId::new(49)).unwrap();
+        assert_eq!(pg.state(), PgState::Peering);
+        assert_eq!(pg.peering_metadata_proof_floor(), Some(epoch_local_proof));
+
+        let mut current_peering = heartbeat_from_record(&authority, 1, peering_epoch, 2_003);
+        current_peering.pg_observations = vec![NodePgHeartbeatObservation {
+            pg_id: PgId::new(49),
+            state: PgState::Peering,
+            metadata_proof: epoch_local_proof,
+            has_pending_metadata_command: false,
+        }];
+        authority.heartbeat(current_peering, 2_003).unwrap();
+        authority
+            .complete_pg_peering(
+                PgId::new(49),
+                NodeId::new(1),
+                node_incarnation(&authority, 1),
+                2_004,
+            )
+            .unwrap();
+        let pg = authority.snapshot().pg(PgId::new(49)).unwrap();
+        assert_eq!(pg.state(), PgState::Active);
+        assert_eq!(pg.active_metadata_proof(), Some(epoch_local_proof));
+        assert!(!pg.active_metadata_transfer_imported());
     }
 
     #[test]
