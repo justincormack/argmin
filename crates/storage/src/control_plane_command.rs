@@ -1,7 +1,8 @@
 use crate::control_plane::{
     ClusterControlSnapshot, ControlPlaneError, NodeAvailabilityState, NodeMembershipState,
+    PgMetadataTransferProof,
 };
-use crate::types::PgId;
+use crate::types::{PgId, PgState};
 use placement::NodeId;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -22,6 +23,18 @@ pub enum ControlPlaneCommand {
         pg_id: PgId,
         acting_set: Vec<NodeId>,
     },
+    SetPgActingSetWithMetadataTransfer {
+        pg_id: PgId,
+        acting_set: Vec<NodeId>,
+        transfer: PgMetadataTransferProof,
+    },
+    FencePgForMetadataTransfer {
+        pg_id: PgId,
+    },
+    SetPgState {
+        pg_id: PgId,
+        state: PgState,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -30,6 +43,11 @@ pub enum ControlPlaneCommandResponse {
     SetNodeMembership,
     MarkNodeAvailability,
     SetPgActingSet,
+    SetPgActingSetWithMetadataTransfer,
+    FencePgForMetadataTransfer {
+        source_primary_lease_deadline_ms: Option<u64>,
+    },
+    SetPgState,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

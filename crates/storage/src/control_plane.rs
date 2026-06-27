@@ -906,6 +906,265 @@ impl ControlPlaneCommandStateMachine for ClusterControlSnapshot {
                     changed,
                 ))
             }
+            ControlPlaneCommand::SetPgActingSetWithMetadataTransfer {
+                pg_id,
+                acting_set,
+                transfer,
+            } => {
+                validate_acting_set(self, pg_id, &acting_set)?;
+                let record = self
+                    .pg(pg_id)
+                    .ok_or(ControlPlaneError::UnknownPg { pg_id: pg_id.get() })?;
+                if record.acting_set == acting_set {
+                    if let Some(existing_transfer) = record.peering_metadata_transfer {
+                        if existing_transfer != transfer {
+                            return Err(ControlPlaneError::PgMetadataTransferProofMismatch {
+                                pg_id: pg_id.get(),
+                                expected: existing_transfer,
+                                actual: transfer,
+                            });
+                        }
+                    }
+                    return Ok(applied_control_plane_command(
+                        self,
+                        self.clone(),
+                        ControlPlaneCommandResponse::SetPgActingSetWithMetadataTransfer,
+                        false,
+                    ));
+                }
+                let state = record.state;
+                let metadata_transfer_fenced = record.metadata_transfer_fenced;
+                let metadata_transfer_fence_source_imported =
+                    record.metadata_transfer_fence_source_imported;
+                let required_floor = match state {
+                    PgState::Active => record.active_metadata_proof.ok_or(
+                        ControlPlaneError::ActivePgMissingMetadataProof { pg_id: pg_id.get() },
+                    )?,
+                    PgState::Peering => record.peering_metadata_proof_floor.ok_or(
+                        ControlPlaneError::PgMetadataMigrationRequiresTransfer {
+                            pg_id: pg_id.get(),
+                        },
+                    )?,
+                    _ => {
+                        return Err(ControlPlaneError::PgMetadataMigrationRequiresTransfer {
+                            pg_id: pg_id.get(),
+                        });
+                    }
+                };
+                validate_metadata_transfer_proof(
+                    self,
+                    pg_id,
+                    state,
+                    metadata_transfer_fenced,
+                    metadata_transfer_fence_source_imported,
+                    required_floor,
+                    transfer,
+                )?;
+                let source_route_epoch = self.cluster_epoch;
+                let source_node_id =
+                    match state {
+                        PgState::Active => record.active_primary.ok_or(
+                            ControlPlaneError::PgHasNoServingPrimary {
+                                pg_id: pg_id.get(),
+                                cluster_epoch: self.cluster_epoch,
+                            },
+                        )?,
+                        PgState::Peering => record
+                            .acting_set
+                            .first()
+                            .copied()
+                            .ok_or(ControlPlaneError::EmptyActingSet { pg_id: pg_id.get() })?,
+                        _ => {
+                            return Err(ControlPlaneError::PgMetadataMigrationRequiresTransfer {
+                                pg_id: pg_id.get(),
+                            });
+                        }
+                    };
+
+                let mut next_snapshot = self.clone();
+                let record = next_snapshot
+                    .pgs
+                    .get_mut(&pg_id)
+                    .expect("PG record validated before metadata transfer");
+                record.acting_set = acting_set;
+                record.state = PgState::Peering;
+                record.active_primary = None;
+                record.active_metadata_proof = None;
+                record.active_metadata_proof_epoch = None;
+                record.active_metadata_transfer_imported = false;
+                record.peering_metadata_proof_floor = Some(transfer.metadata_proof());
+                record.peering_metadata_transfer = Some(transfer);
+                record.peering_metadata_transfer_source_route_epoch = Some(source_route_epoch);
+                record.peering_metadata_transfer_source_node_id = Some(source_node_id);
+                record.metadata_transfer_fenced = false;
+                record.metadata_transfer_fence_source_lease_deadline_ms = None;
+                record.metadata_transfer_fence_source_imported = false;
+                next_snapshot.bump_epoch()?;
+                Ok(applied_control_plane_command(
+                    self,
+                    next_snapshot,
+                    ControlPlaneCommandResponse::SetPgActingSetWithMetadataTransfer,
+                    true,
+                ))
+            }
+            ControlPlaneCommand::FencePgForMetadataTransfer { pg_id } => {
+                let record = self
+                    .pg(pg_id)
+                    .ok_or(ControlPlaneError::UnknownPg { pg_id: pg_id.get() })?;
+                let source_primary_lease_deadline_ms = if record.state == PgState::Active {
+                    let primary = record
+                        .active_primary
+                        .filter(|primary| record.acting_set.contains(primary))
+                        .ok_or(ControlPlaneError::PgHasNoServingPrimary {
+                            pg_id: pg_id.get(),
+                            cluster_epoch: self.cluster_epoch(),
+                        })?;
+                    let primary_record =
+                        self.node(primary)
+                            .ok_or(ControlPlaneError::UnknownActingSetNode {
+                                pg_id: pg_id.get(),
+                                node_id: primary.as_u32(),
+                            })?;
+                    Some(primary_record.lease_deadline_ms.ok_or(
+                        ControlPlaneError::PgHasNoServingPrimary {
+                            pg_id: pg_id.get(),
+                            cluster_epoch: self.cluster_epoch(),
+                        },
+                    )?)
+                } else if record.state == PgState::Peering && record.metadata_transfer_fenced {
+                    record
+                        .metadata_transfer_fence_source_lease_deadline_ms
+                        .or_else(|| {
+                            record
+                                .acting_set
+                                .iter()
+                                .filter_map(|node_id| {
+                                    self.node(*node_id).and_then(|node| node.lease_deadline_ms)
+                                })
+                                .max()
+                        })
+                } else {
+                    None
+                };
+                let active_source_floor = match record.state {
+                    PgState::Peering => {
+                        if record.peering_metadata_transfer.is_some() {
+                            return Ok(applied_control_plane_command(
+                                self,
+                                self.clone(),
+                                ControlPlaneCommandResponse::FencePgForMetadataTransfer {
+                                    source_primary_lease_deadline_ms: None,
+                                },
+                                false,
+                            ));
+                        }
+                        None
+                    }
+                    PgState::Active => Some(validate_authoritative_metadata_migration_source(
+                        self,
+                        record,
+                        record.acting_set(),
+                    )?),
+                    state => {
+                        return Err(ControlPlaneError::PgNotActive {
+                            pg_id: pg_id.get(),
+                            cluster_epoch: self.cluster_epoch(),
+                            state,
+                        });
+                    }
+                };
+                let mut next_snapshot = self.clone();
+                let mut changed = false;
+                let record = next_snapshot
+                    .pgs
+                    .get_mut(&pg_id)
+                    .expect("PG record validated before metadata transfer fence");
+                if record.state != PgState::Peering {
+                    let active_metadata_transfer_imported =
+                        record.active_metadata_transfer_imported;
+                    record.peering_metadata_proof_floor = active_source_floor;
+                    record.state = PgState::Peering;
+                    record.active_primary = None;
+                    record.active_metadata_proof = None;
+                    record.active_metadata_proof_epoch = None;
+                    record.active_metadata_transfer_imported = false;
+                    record.peering_metadata_transfer = None;
+                    record.peering_metadata_transfer_source_route_epoch = None;
+                    record.peering_metadata_transfer_source_node_id = None;
+                    record.metadata_transfer_fenced = true;
+                    record.metadata_transfer_fence_source_lease_deadline_ms =
+                        source_primary_lease_deadline_ms;
+                    record.metadata_transfer_fence_source_imported =
+                        active_metadata_transfer_imported;
+                    changed = true;
+                } else if !record.metadata_transfer_fenced {
+                    record.metadata_transfer_fenced = true;
+                    record.metadata_transfer_fence_source_lease_deadline_ms =
+                        source_primary_lease_deadline_ms;
+                    record.metadata_transfer_fence_source_imported = false;
+                    changed = true;
+                }
+                if changed {
+                    next_snapshot.bump_epoch()?;
+                }
+                let response_snapshot = if changed { &next_snapshot } else { self };
+                let source_primary_lease_deadline_ms = response_snapshot
+                    .pg(pg_id)
+                    .and_then(PgControlRecord::metadata_transfer_fence_source_lease_deadline_ms)
+                    .or(source_primary_lease_deadline_ms);
+                Ok(applied_control_plane_command(
+                    self,
+                    next_snapshot,
+                    ControlPlaneCommandResponse::FencePgForMetadataTransfer {
+                        source_primary_lease_deadline_ms,
+                    },
+                    changed,
+                ))
+            }
+            ControlPlaneCommand::SetPgState { pg_id, state } => {
+                if state == PgState::Active {
+                    return Err(ControlPlaneError::ActivePgRequiresPeeringComplete {
+                        pg_id: pg_id.get(),
+                    });
+                }
+                let mut next_snapshot = self.clone();
+                let record = next_snapshot
+                    .pgs
+                    .get_mut(&pg_id)
+                    .ok_or(ControlPlaneError::UnknownPg { pg_id: pg_id.get() })?;
+                let changed = record.state != state;
+                if changed {
+                    record.peering_metadata_proof_floor = if record.state == PgState::Active {
+                        record.active_metadata_proof
+                    } else {
+                        None
+                    };
+                    record.state = state;
+                    record.active_primary = None;
+                    record.active_metadata_proof = None;
+                    record.active_metadata_proof_epoch = None;
+                    record.active_metadata_transfer_imported = false;
+                    record.metadata_transfer_fenced = false;
+                    record.metadata_transfer_fence_source_lease_deadline_ms = None;
+                    record.metadata_transfer_fence_source_imported = false;
+                    if state != PgState::Peering {
+                        record.peering_metadata_proof_floor = None;
+                        record.peering_metadata_transfer = None;
+                        record.peering_metadata_transfer_source_route_epoch = None;
+                        record.peering_metadata_transfer_source_node_id = None;
+                        record.metadata_transfer_fenced = false;
+                        record.metadata_transfer_fence_source_lease_deadline_ms = None;
+                        record.metadata_transfer_fence_source_imported = false;
+                    }
+                    next_snapshot.bump_epoch()?;
+                }
+                Ok(applied_control_plane_command(
+                    self,
+                    next_snapshot,
+                    ControlPlaneCommandResponse::SetPgState,
+                    changed,
+                ))
+            }
         }
     }
 }
@@ -1973,91 +2232,14 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
         acting_set: Vec<NodeId>,
         transfer: PgMetadataTransferProof,
     ) -> Result<ClusterControlSnapshot, ControlPlaneError> {
-        validate_acting_set(&self.snapshot, pg_id, &acting_set)?;
-        let record = self
-            .snapshot
-            .pg(pg_id)
-            .ok_or(ControlPlaneError::UnknownPg { pg_id: pg_id.get() })?;
-        if record.acting_set == acting_set {
-            if let Some(existing_transfer) = record.peering_metadata_transfer {
-                if existing_transfer != transfer {
-                    return Err(ControlPlaneError::PgMetadataTransferProofMismatch {
-                        pg_id: pg_id.get(),
-                        expected: existing_transfer,
-                        actual: transfer,
-                    });
-                }
-            }
-            return Ok(self.snapshot.clone());
-        }
-        let state = record.state;
-        let metadata_transfer_fenced = record.metadata_transfer_fenced;
-        let metadata_transfer_fence_source_imported =
-            record.metadata_transfer_fence_source_imported;
-        let required_floor = match state {
-            PgState::Active => record
-                .active_metadata_proof
-                .ok_or(ControlPlaneError::ActivePgMissingMetadataProof { pg_id: pg_id.get() })?,
-            PgState::Peering => record.peering_metadata_proof_floor.ok_or(
-                ControlPlaneError::PgMetadataMigrationRequiresTransfer { pg_id: pg_id.get() },
-            )?,
-            _ => {
-                return Err(ControlPlaneError::PgMetadataMigrationRequiresTransfer {
-                    pg_id: pg_id.get(),
-                });
-            }
-        };
-        validate_metadata_transfer_proof(
-            &self.snapshot,
-            pg_id,
-            state,
-            metadata_transfer_fenced,
-            metadata_transfer_fence_source_imported,
-            required_floor,
-            transfer,
+        self.apply_and_commit_command(
+            ControlPlaneCommand::SetPgActingSetWithMetadataTransfer {
+                pg_id,
+                acting_set,
+                transfer,
+            },
+            0,
         )?;
-        let source_route_epoch = self.snapshot.cluster_epoch;
-        let source_node_id = match state {
-            PgState::Active => {
-                record
-                    .active_primary
-                    .ok_or(ControlPlaneError::PgHasNoServingPrimary {
-                        pg_id: pg_id.get(),
-                        cluster_epoch: self.snapshot.cluster_epoch,
-                    })?
-            }
-            PgState::Peering => record
-                .acting_set
-                .first()
-                .copied()
-                .ok_or(ControlPlaneError::EmptyActingSet { pg_id: pg_id.get() })?,
-            _ => {
-                return Err(ControlPlaneError::PgMetadataMigrationRequiresTransfer {
-                    pg_id: pg_id.get(),
-                });
-            }
-        };
-
-        let mut next_snapshot = self.snapshot.clone();
-        let record = next_snapshot
-            .pgs
-            .get_mut(&pg_id)
-            .expect("PG record validated before metadata transfer");
-        record.acting_set = acting_set;
-        record.state = PgState::Peering;
-        record.active_primary = None;
-        record.active_metadata_proof = None;
-        record.active_metadata_proof_epoch = None;
-        record.active_metadata_transfer_imported = false;
-        record.peering_metadata_proof_floor = Some(transfer.metadata_proof());
-        record.peering_metadata_transfer = Some(transfer);
-        record.peering_metadata_transfer_source_route_epoch = Some(source_route_epoch);
-        record.peering_metadata_transfer_source_node_id = Some(source_node_id);
-        record.metadata_transfer_fenced = false;
-        record.metadata_transfer_fence_source_lease_deadline_ms = None;
-        record.metadata_transfer_fence_source_imported = false;
-        next_snapshot.bump_epoch()?;
-        self.commit_snapshot(next_snapshot)?;
         Ok(self.snapshot.clone())
     }
 
@@ -2075,106 +2257,16 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
         &mut self,
         pg_id: PgId,
     ) -> Result<FencedPgMetadataTransferSnapshot, ControlPlaneError> {
-        let record = self
-            .snapshot
-            .pg(pg_id)
-            .ok_or(ControlPlaneError::UnknownPg { pg_id: pg_id.get() })?;
-        let source_primary_lease_deadline_ms = if record.state == PgState::Active {
-            let primary = record
-                .active_primary
-                .filter(|primary| record.acting_set.contains(primary))
-                .ok_or(ControlPlaneError::PgHasNoServingPrimary {
-                    pg_id: pg_id.get(),
-                    cluster_epoch: self.snapshot.cluster_epoch(),
-                })?;
-            let primary_record =
-                self.snapshot
-                    .node(primary)
-                    .ok_or(ControlPlaneError::UnknownActingSetNode {
-                        pg_id: pg_id.get(),
-                        node_id: primary.as_u32(),
-                    })?;
-            Some(primary_record.lease_deadline_ms.ok_or(
-                ControlPlaneError::PgHasNoServingPrimary {
-                    pg_id: pg_id.get(),
-                    cluster_epoch: self.snapshot.cluster_epoch(),
-                },
-            )?)
-        } else if record.state == PgState::Peering && record.metadata_transfer_fenced {
-            record
-                .metadata_transfer_fence_source_lease_deadline_ms
-                .or_else(|| {
-                    record
-                        .acting_set
-                        .iter()
-                        .filter_map(|node_id| {
-                            self.snapshot
-                                .node(*node_id)
-                                .and_then(|node| node.lease_deadline_ms)
-                        })
-                        .max()
-                })
-        } else {
-            None
+        let applied = self.apply_and_commit_command(
+            ControlPlaneCommand::FencePgForMetadataTransfer { pg_id },
+            0,
+        )?;
+        let ControlPlaneCommandResponse::FencePgForMetadataTransfer {
+            source_primary_lease_deadline_ms,
+        } = applied.response()
+        else {
+            unreachable!("metadata transfer fence command returned the wrong response");
         };
-        let active_source_floor = match record.state {
-            PgState::Peering => {
-                if record.peering_metadata_transfer.is_some() {
-                    return Ok(FencedPgMetadataTransferSnapshot::new(
-                        self.snapshot.clone(),
-                        None,
-                    ));
-                }
-                None
-            }
-            PgState::Active => Some(validate_authoritative_metadata_migration_source(
-                &self.snapshot,
-                record,
-                record.acting_set(),
-            )?),
-            state => {
-                return Err(ControlPlaneError::PgNotActive {
-                    pg_id: pg_id.get(),
-                    cluster_epoch: self.snapshot.cluster_epoch(),
-                    state,
-                });
-            }
-        };
-        let mut next_snapshot = self.snapshot.clone();
-        let record = next_snapshot
-            .pgs
-            .get_mut(&pg_id)
-            .expect("PG record validated before metadata transfer fence");
-        if record.state != PgState::Peering {
-            let active_metadata_transfer_imported = record.active_metadata_transfer_imported;
-            record.peering_metadata_proof_floor = active_source_floor;
-            record.state = PgState::Peering;
-            record.active_primary = None;
-            record.active_metadata_proof = None;
-            record.active_metadata_proof_epoch = None;
-            record.active_metadata_transfer_imported = false;
-            record.peering_metadata_transfer = None;
-            record.peering_metadata_transfer_source_route_epoch = None;
-            record.peering_metadata_transfer_source_node_id = None;
-            record.metadata_transfer_fenced = true;
-            record.metadata_transfer_fence_source_lease_deadline_ms =
-                source_primary_lease_deadline_ms;
-            record.metadata_transfer_fence_source_imported = active_metadata_transfer_imported;
-            next_snapshot.bump_epoch()?;
-            self.commit_snapshot(next_snapshot)?;
-        } else if !record.metadata_transfer_fenced {
-            record.metadata_transfer_fenced = true;
-            record.metadata_transfer_fence_source_lease_deadline_ms =
-                source_primary_lease_deadline_ms;
-            record.metadata_transfer_fence_source_imported = false;
-            next_snapshot.bump_epoch()?;
-            self.commit_snapshot(next_snapshot)?;
-        }
-        let source_primary_lease_deadline_ms = self
-            .snapshot
-            .pg(pg_id)
-            .and_then(PgControlRecord::metadata_transfer_fence_source_lease_deadline_ms)
-            .or(source_primary_lease_deadline_ms);
         Ok(FencedPgMetadataTransferSnapshot::new(
             self.snapshot.clone(),
             source_primary_lease_deadline_ms,
@@ -2186,40 +2278,7 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
         pg_id: PgId,
         state: PgState,
     ) -> Result<ClusterControlSnapshot, ControlPlaneError> {
-        if state == PgState::Active {
-            return Err(ControlPlaneError::ActivePgRequiresPeeringComplete { pg_id: pg_id.get() });
-        }
-        let mut next_snapshot = self.snapshot.clone();
-        let record = next_snapshot
-            .pgs
-            .get_mut(&pg_id)
-            .ok_or(ControlPlaneError::UnknownPg { pg_id: pg_id.get() })?;
-        if record.state != state {
-            record.peering_metadata_proof_floor = if record.state == PgState::Active {
-                record.active_metadata_proof
-            } else {
-                None
-            };
-            record.state = state;
-            record.active_primary = None;
-            record.active_metadata_proof = None;
-            record.active_metadata_proof_epoch = None;
-            record.active_metadata_transfer_imported = false;
-            record.metadata_transfer_fenced = false;
-            record.metadata_transfer_fence_source_lease_deadline_ms = None;
-            record.metadata_transfer_fence_source_imported = false;
-            if state != PgState::Peering {
-                record.peering_metadata_proof_floor = None;
-                record.peering_metadata_transfer = None;
-                record.peering_metadata_transfer_source_route_epoch = None;
-                record.peering_metadata_transfer_source_node_id = None;
-                record.metadata_transfer_fenced = false;
-                record.metadata_transfer_fence_source_lease_deadline_ms = None;
-                record.metadata_transfer_fence_source_imported = false;
-            }
-            next_snapshot.bump_epoch()?;
-            self.commit_snapshot(next_snapshot)?;
-        }
+        self.apply_and_commit_command(ControlPlaneCommand::SetPgState { pg_id, state }, 0)?;
         Ok(self.snapshot.clone())
     }
 
@@ -9208,6 +9267,10 @@ mod tests {
                 pg_id: PgId::new(7),
                 acting_set: vec![NodeId::new(1)],
             },
+            ControlPlaneCommand::SetPgState {
+                pg_id: PgId::new(7),
+                state: PgState::Backfilling,
+            },
             ControlPlaneCommand::SetNodeMembership {
                 node_id: NodeId::new(2),
                 membership: NodeMembershipState::Draining,
@@ -9237,9 +9300,9 @@ mod tests {
         assert_eq!(&replayed, authority.snapshot());
         assert_eq!(
             replayed.cluster_epoch(),
-            ClusterEpoch::new(ClusterEpoch::INITIAL.get() + 4).unwrap()
+            ClusterEpoch::new(ClusterEpoch::INITIAL.get() + 5).unwrap()
         );
-        assert_eq!(replayed.cluster_map_history().len(), 4);
+        assert_eq!(replayed.cluster_map_history().len(), 5);
     }
 
     #[test]
