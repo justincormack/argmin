@@ -665,7 +665,6 @@ impl ControlPlaneCommandStateMachine for ClusterControlSnapshot {
     fn apply_control_plane_command(
         &self,
         command: ControlPlaneCommand,
-        authority_now_ms: u64,
     ) -> Result<AppliedControlPlaneCommand, ControlPlaneError> {
         match command {
             ControlPlaneCommand::BootstrapInitialClusterMap { nodes, pg_ids } => {
@@ -1011,6 +1010,45 @@ impl ControlPlaneCommandStateMachine for ClusterControlSnapshot {
                     next_snapshot,
                     ControlPlaneCommandResponse::RecordNodeHeartbeat,
                     true,
+                ))
+            }
+            ControlPlaneCommand::ExpireHeartbeatLeases { expire_at_ms } => {
+                let mut next_snapshot = self.clone();
+                let mut expired_nodes = Vec::new();
+                for record in next_snapshot.nodes.values_mut() {
+                    if matches!(
+                        record.membership,
+                        NodeMembershipState::Out | NodeMembershipState::Removed
+                    ) || record.availability == NodeAvailabilityState::Unavailable
+                    {
+                        continue;
+                    }
+                    if record
+                        .lease_deadline_ms
+                        .is_some_and(|lease_deadline_ms| lease_deadline_ms <= expire_at_ms)
+                    {
+                        record.availability = NodeAvailabilityState::Unavailable;
+                        record.lease_deadline_ms = None;
+                        expired_nodes.push(record.node_id);
+                    }
+                }
+                let peering_pgs = if expired_nodes.is_empty() {
+                    Vec::new()
+                } else {
+                    let peering_pgs =
+                        mark_pgs_peering_for_nodes(&mut next_snapshot, expired_nodes.clone());
+                    next_snapshot.bump_epoch()?;
+                    peering_pgs
+                };
+                let changed = !expired_nodes.is_empty();
+                Ok(applied_control_plane_command(
+                    self,
+                    next_snapshot,
+                    ControlPlaneCommandResponse::ExpireHeartbeatLeases {
+                        expired_nodes,
+                        peering_pgs,
+                    },
+                    changed,
                 ))
             }
             ControlPlaneCommand::SetPgActingSet { pg_id, acting_set } => {
@@ -1375,6 +1413,7 @@ impl ControlPlaneCommandStateMachine for ClusterControlSnapshot {
                 pg_id,
                 primary,
                 node_incarnation,
+                complete_at_ms,
             } => {
                 let record = self
                     .pg(pg_id)
@@ -1390,7 +1429,7 @@ impl ControlPlaneCommandStateMachine for ClusterControlSnapshot {
                     primary,
                     node_incarnation,
                     self.cluster_epoch,
-                    authority_now_ms,
+                    complete_at_ms,
                 )?;
                 if record.state == PgState::Active {
                     if record.active_primary == Some(primary) {
@@ -1407,11 +1446,8 @@ impl ControlPlaneCommandStateMachine for ClusterControlSnapshot {
                         state: record.state,
                     });
                 }
-                if deterministic_pg_primary_for_snapshot(
-                    self,
-                    record.acting_set(),
-                    authority_now_ms,
-                ) != Some(primary)
+                if deterministic_pg_primary_for_snapshot(self, record.acting_set(), complete_at_ms)
+                    != Some(primary)
                 {
                     return Err(ControlPlaneError::PgPrimaryNotServingCurrentEpoch {
                         pg_id: pg_id.get(),
@@ -1436,7 +1472,7 @@ impl ControlPlaneCommandStateMachine for ClusterControlSnapshot {
                     self,
                     pg_id,
                     record.acting_set(),
-                    authority_now_ms,
+                    complete_at_ms,
                 )?;
                 validate_peering_metadata_proof_floor(
                     self.cluster_epoch,
@@ -2669,11 +2705,8 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
     fn apply_and_commit_command(
         &mut self,
         command: ControlPlaneCommand,
-        authority_now_ms: u64,
     ) -> Result<AppliedControlPlaneCommand, ControlPlaneError> {
-        let applied = self
-            .snapshot
-            .apply_control_plane_command(command, authority_now_ms)?;
+        let applied = self.snapshot.apply_control_plane_command(command)?;
         if applied.changed() {
             self.commit_snapshot(applied.snapshot().clone())?;
         }
@@ -2685,13 +2718,10 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
         node_id: NodeId,
         membership: NodeMembershipState,
     ) -> Result<ClusterControlSnapshot, ControlPlaneError> {
-        self.apply_and_commit_command(
-            ControlPlaneCommand::SetNodeMembership {
-                node_id,
-                membership,
-            },
-            0,
-        )?;
+        self.apply_and_commit_command(ControlPlaneCommand::SetNodeMembership {
+            node_id,
+            membership,
+        })?;
         Ok(self.snapshot.clone())
     }
 
@@ -2700,13 +2730,10 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
         node_id: NodeId,
         availability: NodeAvailabilityState,
     ) -> Result<ClusterControlSnapshot, ControlPlaneError> {
-        self.apply_and_commit_command(
-            ControlPlaneCommand::MarkNodeAvailability {
-                node_id,
-                availability,
-            },
-            0,
-        )?;
+        self.apply_and_commit_command(ControlPlaneCommand::MarkNodeAvailability {
+            node_id,
+            availability,
+        })?;
         Ok(self.snapshot.clone())
     }
 
@@ -2715,10 +2742,10 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
         nodes: Vec<(NodeId, String)>,
         pg_ids: Vec<PgId>,
     ) -> Result<ClusterControlSnapshot, ControlPlaneError> {
-        self.apply_and_commit_command(
-            ControlPlaneCommand::BootstrapInitialClusterMap { nodes, pg_ids },
-            0,
-        )?;
+        self.apply_and_commit_command(ControlPlaneCommand::BootstrapInitialClusterMap {
+            nodes,
+            pg_ids,
+        })?;
         Ok(self.snapshot.clone())
     }
 
@@ -2727,10 +2754,7 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
         pg_id: PgId,
         acting_set: Vec<NodeId>,
     ) -> Result<ClusterControlSnapshot, ControlPlaneError> {
-        self.apply_and_commit_command(
-            ControlPlaneCommand::SetPgActingSet { pg_id, acting_set },
-            0,
-        )?;
+        self.apply_and_commit_command(ControlPlaneCommand::SetPgActingSet { pg_id, acting_set })?;
         Ok(self.snapshot.clone())
     }
 
@@ -2740,14 +2764,11 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
         acting_set: Vec<NodeId>,
         transfer: PgMetadataTransferProof,
     ) -> Result<ClusterControlSnapshot, ControlPlaneError> {
-        self.apply_and_commit_command(
-            ControlPlaneCommand::SetPgActingSetWithMetadataTransfer {
-                pg_id,
-                acting_set,
-                transfer,
-            },
-            0,
-        )?;
+        self.apply_and_commit_command(ControlPlaneCommand::SetPgActingSetWithMetadataTransfer {
+            pg_id,
+            acting_set,
+            transfer,
+        })?;
         Ok(self.snapshot.clone())
     }
 
@@ -2765,15 +2786,13 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
         &mut self,
         pg_id: PgId,
     ) -> Result<FencedPgMetadataTransferSnapshot, ControlPlaneError> {
-        let applied = self.apply_and_commit_command(
-            ControlPlaneCommand::FencePgForMetadataTransfer { pg_id },
-            0,
-        )?;
-        let ControlPlaneCommandResponse::FencePgForMetadataTransfer {
-            source_primary_lease_deadline_ms,
-        } = applied.response()
-        else {
-            unreachable!("metadata transfer fence command returned the wrong response");
+        let applied = self
+            .apply_and_commit_command(ControlPlaneCommand::FencePgForMetadataTransfer { pg_id })?;
+        let source_primary_lease_deadline_ms = match applied.response() {
+            ControlPlaneCommandResponse::FencePgForMetadataTransfer {
+                source_primary_lease_deadline_ms,
+            } => *source_primary_lease_deadline_ms,
+            _ => unreachable!("metadata transfer fence command returned the wrong response"),
         };
         Ok(FencedPgMetadataTransferSnapshot::new(
             self.snapshot.clone(),
@@ -2786,7 +2805,7 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
         pg_id: PgId,
         state: PgState,
     ) -> Result<ClusterControlSnapshot, ControlPlaneError> {
-        self.apply_and_commit_command(ControlPlaneCommand::SetPgState { pg_id, state }, 0)?;
+        self.apply_and_commit_command(ControlPlaneCommand::SetPgState { pg_id, state })?;
         Ok(self.snapshot.clone())
     }
 
@@ -2797,14 +2816,12 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
         node_incarnation: u64,
         now_ms: u64,
     ) -> Result<ClusterControlSnapshot, ControlPlaneError> {
-        self.apply_and_commit_command(
-            ControlPlaneCommand::CompletePgPeering {
-                pg_id,
-                primary,
-                node_incarnation,
-            },
-            now_ms,
-        )?;
+        self.apply_and_commit_command(ControlPlaneCommand::CompletePgPeering {
+            pg_id,
+            primary,
+            node_incarnation,
+            complete_at_ms: now_ms,
+        })?;
         Ok(self.snapshot.clone())
     }
 
@@ -2864,13 +2881,10 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
         }
 
         let pg_ids = ready.iter().map(|completion| completion.pg_id).collect();
-        self.apply_and_commit_command(
-            ControlPlaneCommand::CompleteReadyPgPeerings {
-                ready_at_ms: now_ms,
-                ready,
-            },
-            now_ms,
-        )?;
+        self.apply_and_commit_command(ControlPlaneCommand::CompleteReadyPgPeerings {
+            ready_at_ms: now_ms,
+            ready,
+        })?;
         Ok(pg_ids)
     }
 
@@ -2894,14 +2908,11 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
         let observed_epoch = heartbeat.observed_epoch;
         let current_epoch = self.snapshot.cluster_epoch;
         let node_id = heartbeat.node_id;
-        self.apply_and_commit_command(
-            ControlPlaneCommand::RecordNodeHeartbeat {
-                heartbeat,
-                heartbeat_at_ms: authority_now_ms,
-                lease_deadline_ms,
-            },
-            authority_now_ms,
-        )?;
+        self.apply_and_commit_command(ControlPlaneCommand::RecordNodeHeartbeat {
+            heartbeat,
+            heartbeat_at_ms: authority_now_ms,
+            lease_deadline_ms,
+        })?;
         let serving = self.snapshot.node(node_id).is_some_and(|record| {
             observed_epoch == current_epoch
                 && record.can_serve_primary(self.snapshot.cluster_epoch, authority_now_ms)
@@ -2941,40 +2952,21 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
         &mut self,
         now_ms: u64,
     ) -> Result<HeartbeatLeaseExpiry, ControlPlaneError> {
-        let mut next_snapshot = self.snapshot.clone();
-        let mut expired_nodes = Vec::new();
-        for record in next_snapshot.nodes.values_mut() {
-            if matches!(
-                record.membership,
-                NodeMembershipState::Out | NodeMembershipState::Removed
-            ) || record.availability == NodeAvailabilityState::Unavailable
-            {
-                continue;
-            }
-            if record
-                .lease_deadline_ms
-                .is_some_and(|lease_deadline_ms| lease_deadline_ms <= now_ms)
-            {
-                record.availability = NodeAvailabilityState::Unavailable;
-                record.lease_deadline_ms = None;
-                expired_nodes.push(record.node_id);
-            }
-        }
-        if !expired_nodes.is_empty() {
-            let peering_pgs = mark_pgs_peering_for_nodes(&mut next_snapshot, expired_nodes.clone());
-            next_snapshot.bump_epoch()?;
-            self.commit_snapshot(next_snapshot)?;
-            return Ok(HeartbeatLeaseExpiry {
-                cluster_epoch: self.snapshot.cluster_epoch,
-                expired_nodes,
-                peering_pgs,
-                snapshot: self.snapshot.clone(),
-            });
-        }
+        let applied =
+            self.apply_and_commit_command(ControlPlaneCommand::ExpireHeartbeatLeases {
+                expire_at_ms: now_ms,
+            })?;
+        let ControlPlaneCommandResponse::ExpireHeartbeatLeases {
+            expired_nodes,
+            peering_pgs,
+        } = applied.response()
+        else {
+            unreachable!("heartbeat lease expiry command returned the wrong response");
+        };
         Ok(HeartbeatLeaseExpiry {
             cluster_epoch: self.snapshot.cluster_epoch,
-            expired_nodes,
-            peering_pgs: Vec::new(),
+            expired_nodes: expired_nodes.clone(),
+            peering_pgs: peering_pgs.clone(),
             snapshot: self.snapshot.clone(),
         })
     }
@@ -9677,6 +9669,9 @@ mod tests {
                 heartbeat_at_ms: 1_100,
                 lease_deadline_ms: 1_200,
             },
+            ControlPlaneCommand::ExpireHeartbeatLeases {
+                expire_at_ms: 1_200,
+            },
             ControlPlaneCommand::SetPgActingSet {
                 pg_id: PgId::new(7),
                 acting_set: vec![NodeId::new(1)],
@@ -9697,9 +9692,7 @@ mod tests {
 
         let mut replayed = ClusterControlSnapshot::empty();
         for command in commands.clone() {
-            let applied = replayed
-                .apply_control_plane_command(command, 1_000)
-                .unwrap();
+            let applied = replayed.apply_control_plane_command(command).unwrap();
             assert!(applied.changed());
             replayed = applied.into_snapshot();
         }
@@ -9708,15 +9701,15 @@ mod tests {
         let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
         let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
         for command in commands {
-            authority.apply_and_commit_command(command, 1_000).unwrap();
+            authority.apply_and_commit_command(command).unwrap();
         }
 
         assert_eq!(&replayed, authority.snapshot());
         assert_eq!(
             replayed.cluster_epoch(),
-            ClusterEpoch::new(ClusterEpoch::INITIAL.get() + 6).unwrap()
+            ClusterEpoch::new(ClusterEpoch::INITIAL.get() + 7).unwrap()
         );
-        assert_eq!(replayed.cluster_map_history().len(), 6);
+        assert_eq!(replayed.cluster_map_history().len(), 7);
     }
 
     #[test]
@@ -9743,20 +9736,17 @@ mod tests {
         }];
         let before = authority.snapshot().clone();
         let applied = before
-            .apply_control_plane_command(
-                ControlPlaneCommand::RecordNodeHeartbeat {
-                    heartbeat,
-                    heartbeat_at_ms: 2_000,
-                    lease_deadline_ms: 2_100,
-                },
-                9_999,
-            )
+            .apply_control_plane_command(ControlPlaneCommand::RecordNodeHeartbeat {
+                heartbeat,
+                heartbeat_at_ms: 2_000,
+                lease_deadline_ms: 2_100,
+            })
             .unwrap();
 
         assert!(applied.changed());
         assert_eq!(
             applied.response(),
-            ControlPlaneCommandResponse::RecordNodeHeartbeat
+            &ControlPlaneCommandResponse::RecordNodeHeartbeat
         );
         let snapshot = applied.snapshot();
         assert_eq!(snapshot.cluster_epoch(), before.cluster_epoch());
@@ -9796,14 +9786,11 @@ mod tests {
         }];
         let before = authority.snapshot().clone();
         let applied = before
-            .apply_control_plane_command(
-                ControlPlaneCommand::RecordNodeHeartbeat {
-                    heartbeat,
-                    heartbeat_at_ms: 2_000,
-                    lease_deadline_ms: 2_100,
-                },
-                9_999,
-            )
+            .apply_control_plane_command(ControlPlaneCommand::RecordNodeHeartbeat {
+                heartbeat,
+                heartbeat_at_ms: 2_000,
+                lease_deadline_ms: 2_100,
+            })
             .unwrap();
 
         let snapshot = applied.snapshot();
@@ -9835,14 +9822,11 @@ mod tests {
         };
         let before = authority.snapshot().clone();
         let error = before
-            .apply_control_plane_command(
-                ControlPlaneCommand::RecordNodeHeartbeat {
-                    heartbeat,
-                    heartbeat_at_ms: 2_000,
-                    lease_deadline_ms: 2_100,
-                },
-                9_999,
-            )
+            .apply_control_plane_command(ControlPlaneCommand::RecordNodeHeartbeat {
+                heartbeat,
+                heartbeat_at_ms: 2_000,
+                lease_deadline_ms: 2_100,
+            })
             .unwrap_err();
 
         assert!(matches!(
@@ -9878,14 +9862,11 @@ mod tests {
         let mut zero_duration = heartbeat_from_record(&authority, 1, current_epoch, 2_000);
         zero_duration.requested_lease_duration_ms = 0;
         assert!(matches!(
-            before.apply_control_plane_command(
-                ControlPlaneCommand::RecordNodeHeartbeat {
-                    heartbeat: zero_duration,
-                    heartbeat_at_ms: 2_000,
-                    lease_deadline_ms: 2_000,
-                },
-                9_999,
-            ),
+            before.apply_control_plane_command(ControlPlaneCommand::RecordNodeHeartbeat {
+                heartbeat: zero_duration,
+                heartbeat_at_ms: 2_000,
+                lease_deadline_ms: 2_000,
+            },),
             Err(ControlPlaneError::InvalidLeaseDuration)
         ));
 
@@ -9898,7 +9879,6 @@ mod tests {
                     heartbeat_at_ms: 2_001,
                     lease_deadline_ms: 2_001 + MAX_HEARTBEAT_LEASE_MS + 1,
                 },
-                9_999,
             ),
             Err(ControlPlaneError::LeaseDurationTooLong {
                 requested_ms,
@@ -9909,14 +9889,11 @@ mod tests {
 
         let heartbeat = heartbeat_from_record(&authority, 1, current_epoch, 2_002);
         assert!(matches!(
-            before.apply_control_plane_command(
-                ControlPlaneCommand::RecordNodeHeartbeat {
-                    heartbeat,
-                    heartbeat_at_ms: 2_002,
-                    lease_deadline_ms: 2_200,
-                },
-                9_999,
-            ),
+            before.apply_control_plane_command(ControlPlaneCommand::RecordNodeHeartbeat {
+                heartbeat,
+                heartbeat_at_ms: 2_002,
+                lease_deadline_ms: 2_200,
+            },),
             Err(ControlPlaneError::LeaseDeadlineMismatch {
                 node_id: 1,
                 heartbeat_at_ms: 2_002,
@@ -9925,6 +9902,134 @@ mod tests {
                 actual_deadline_ms: 2_200,
             })
         ));
+    }
+
+    #[test]
+    fn expire_heartbeat_leases_command_replays_with_committed_expiry_time() {
+        let tmp = test_util::tempdir();
+        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+        authority
+            .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
+            .unwrap();
+        authority
+            .set_node_membership(NodeId::new(2), NodeMembershipState::Active)
+            .unwrap();
+        assert!(heartbeat_until_serving(&mut authority, 1, 1_000).serving());
+        assert!(heartbeat_until_serving(&mut authority, 2, 1_000).serving());
+        authority
+            .set_pg_acting_set(PgId::new(9), vec![NodeId::new(1), NodeId::new(2)])
+            .unwrap();
+        for node_id in [1, 2] {
+            heartbeat_with_pg_observation(
+                &mut authority,
+                node_id,
+                9,
+                PgState::Peering,
+                1_010 + u64::from(node_id),
+            );
+        }
+        authority
+            .complete_pg_peering(
+                PgId::new(9),
+                NodeId::new(1),
+                node_incarnation(&authority, 1),
+                1_020,
+            )
+            .unwrap();
+        heartbeat_with_pg_observation(&mut authority, 1, 9, PgState::Active, 1_030);
+
+        let before = authority.snapshot().clone();
+        let not_yet_expired = before
+            .apply_control_plane_command(ControlPlaneCommand::ExpireHeartbeatLeases {
+                expire_at_ms: 1_099,
+            })
+            .unwrap();
+        assert!(!not_yet_expired.changed());
+        assert_eq!(
+            not_yet_expired.response(),
+            &ControlPlaneCommandResponse::ExpireHeartbeatLeases {
+                expired_nodes: Vec::new(),
+                peering_pgs: Vec::new(),
+            }
+        );
+        assert_eq!(not_yet_expired.snapshot(), &before);
+
+        let applied = before
+            .apply_control_plane_command(ControlPlaneCommand::ExpireHeartbeatLeases {
+                expire_at_ms: 1_130,
+            })
+            .unwrap();
+        assert!(applied.changed());
+        assert_eq!(
+            applied.response(),
+            &ControlPlaneCommandResponse::ExpireHeartbeatLeases {
+                expired_nodes: vec![NodeId::new(1), NodeId::new(2)],
+                peering_pgs: vec![PgId::new(9)],
+            }
+        );
+        assert_eq!(
+            applied
+                .snapshot()
+                .node(NodeId::new(1))
+                .unwrap()
+                .availability(),
+            NodeAvailabilityState::Unavailable
+        );
+        assert_eq!(
+            applied
+                .snapshot()
+                .node(NodeId::new(1))
+                .unwrap()
+                .lease_deadline_ms(),
+            None
+        );
+        assert_eq!(
+            applied.snapshot().pg(PgId::new(9)).unwrap().state(),
+            PgState::Peering
+        );
+        assert_eq!(
+            applied.snapshot().cluster_epoch(),
+            ClusterEpoch::new(before.cluster_epoch().get() + 1).unwrap()
+        );
+    }
+
+    #[test]
+    fn complete_pg_peering_command_replays_with_committed_completion_time() {
+        let tmp = test_util::tempdir();
+        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+        authority
+            .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
+            .unwrap();
+        assert!(heartbeat_until_serving(&mut authority, 1, 1_000).serving());
+        authority
+            .set_pg_acting_set(PgId::new(8), vec![NodeId::new(1)])
+            .unwrap();
+        heartbeat_with_pg_observation(&mut authority, 1, 8, PgState::Peering, 1_010);
+
+        let before = authority.snapshot().clone();
+        let applied = before
+            .apply_control_plane_command(ControlPlaneCommand::CompletePgPeering {
+                pg_id: PgId::new(8),
+                primary: NodeId::new(1),
+                node_incarnation: node_incarnation(&authority, 1),
+                complete_at_ms: 1_011,
+            })
+            .unwrap();
+
+        assert!(applied.changed());
+        assert_eq!(
+            applied.response(),
+            &ControlPlaneCommandResponse::CompletePgPeering
+        );
+        let pg = applied.snapshot().pg(PgId::new(8)).unwrap();
+        assert_eq!(pg.state(), PgState::Active);
+        assert_eq!(pg.active_primary(), Some(NodeId::new(1)));
+        assert_eq!(
+            applied.snapshot().cluster_epoch(),
+            ClusterEpoch::new(before.cluster_epoch().get() + 1).unwrap()
+        );
     }
 
     #[test]
@@ -13079,7 +13184,6 @@ mod tests {
                         active_metadata_proof_epoch: peering_epoch,
                     }],
                 },
-                2_010,
             ),
             Err(ControlPlaneError::PgPeeringMetadataProofMismatch {
                 pg_id: 23,
@@ -13127,7 +13231,6 @@ mod tests {
                         active_metadata_proof_epoch: forged_epoch,
                     }],
                 },
-                2_010,
             ),
             Err(ControlPlaneError::PgPeeringMetadataProofEpochMismatch {
                 pg_id: 24,
@@ -13163,18 +13266,15 @@ mod tests {
 
         let applied = authority
             .snapshot()
-            .apply_control_plane_command(
-                ControlPlaneCommand::CompleteReadyPgPeerings {
-                    ready_at_ms: 2_010,
-                    ready: vec![ReadyPgPeeringCompletion {
-                        pg_id: PgId::new(25),
-                        primary: NodeId::new(1),
-                        active_metadata_proof: observed_proof,
-                        active_metadata_proof_epoch: peering_epoch,
-                    }],
-                },
-                10_000,
-            )
+            .apply_control_plane_command(ControlPlaneCommand::CompleteReadyPgPeerings {
+                ready_at_ms: 2_010,
+                ready: vec![ReadyPgPeeringCompletion {
+                    pg_id: PgId::new(25),
+                    primary: NodeId::new(1),
+                    active_metadata_proof: observed_proof,
+                    active_metadata_proof_epoch: peering_epoch,
+                }],
+            })
             .unwrap();
         let pg = applied.snapshot().pg(PgId::new(25)).unwrap();
         assert_eq!(pg.state(), PgState::Active);
@@ -13223,7 +13323,6 @@ mod tests {
                         active_metadata_proof_epoch: peering_epoch,
                     }],
                 },
-                2_010,
             ),
             Err(ControlPlaneError::PgPrimaryNotServingCurrentEpoch {
                 pg_id: 26,
@@ -13292,7 +13391,6 @@ mod tests {
                     ready_at_ms: 2_030,
                     ready: vec![completion, completion],
                 },
-                2_030,
             ),
             Err(ControlPlaneError::DuplicateReadyPgPeeringCompletion { pg_id: 27 })
         ));
@@ -14009,7 +14107,6 @@ mod tests {
                         heartbeat_at_ms: now_ms,
                         lease_deadline_ms,
                     },
-                    now_ms.saturating_add(1_000_000),
                 );
                 let authority_result = authority.heartbeat(heartbeat, now_ms);
 

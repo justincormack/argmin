@@ -25,6 +25,9 @@ pub enum ControlPlaneCommand {
         heartbeat_at_ms: u64,
         lease_deadline_ms: u64,
     },
+    ExpireHeartbeatLeases {
+        expire_at_ms: u64,
+    },
     SetPgActingSet {
         pg_id: PgId,
         acting_set: Vec<NodeId>,
@@ -45,6 +48,7 @@ pub enum ControlPlaneCommand {
         pg_id: PgId,
         primary: NodeId,
         node_incarnation: u64,
+        complete_at_ms: u64,
     },
     CompleteReadyPgPeerings {
         ready_at_ms: u64,
@@ -60,12 +64,16 @@ pub struct ReadyPgPeeringCompletion {
     pub active_metadata_proof_epoch: ClusterEpoch,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ControlPlaneCommandResponse {
     BootstrapInitialClusterMap,
     SetNodeMembership,
     MarkNodeAvailability,
     RecordNodeHeartbeat,
+    ExpireHeartbeatLeases {
+        expired_nodes: Vec<NodeId>,
+        peering_pgs: Vec<PgId>,
+    },
     SetPgActingSet,
     SetPgActingSetWithMetadataTransfer,
     FencePgForMetadataTransfer {
@@ -103,8 +111,8 @@ impl AppliedControlPlaneCommand {
     }
 
     #[must_use]
-    pub fn response(&self) -> ControlPlaneCommandResponse {
-        self.response
+    pub fn response(&self) -> &ControlPlaneCommandResponse {
+        &self.response
     }
 
     #[must_use]
@@ -122,6 +130,5 @@ pub trait ControlPlaneCommandStateMachine {
     fn apply_control_plane_command(
         &self,
         command: ControlPlaneCommand,
-        authority_now_ms: u64,
     ) -> Result<AppliedControlPlaneCommand, ControlPlaneError>;
 }

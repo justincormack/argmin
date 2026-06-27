@@ -8965,9 +8965,10 @@ Phase 12.1 starting slice:
   heartbeat lease renewal remains separate until its leader-local/read-index
   semantics are designed.
 - introduce a deterministic command-apply boundary whose inputs are a
-  `ClusterControlSnapshot`, a `ControlPlaneCommand`, and a monotonic `now_ms`,
-  and whose output is a new snapshot plus a typed response. The apply layer must
-  not perform file I/O, Raft I/O, or RPC.
+  `ClusterControlSnapshot` and a `ControlPlaneCommand`, and whose output is a
+  new snapshot plus a typed response. Any timestamp that can affect persisted
+  state must be committed in the command itself. The apply layer must not
+  perform file I/O, Raft I/O, RPC, or apply-time clock reads.
 - adapt `SingleAuthorityControlPlane` to call the command-apply boundary while
   preserving the Phase 11 API and file-backed test harness. This keeps the
   single-authority implementation as the compatibility oracle for the later
@@ -9084,9 +9085,12 @@ Phase 12.1 starting slice:
      must state their clock-skew assumptions and restart behavior explicitly;
    - `RecordNodeHeartbeat` currently commits `heartbeat_at_ms` and
      `lease_deadline_ms` for deterministic replay and validates their internal
-     relationship. Phase 12 must still define how a replicated leader chooses
-     and bounds `heartbeat_at_ms` across leader changes, restarts, clock jumps,
-     and stale lease-read/read-index publication;
+     relationship. `ExpireHeartbeatLeases` commits the expiry timestamp used
+     to decide which leases become unavailable, and single-PG peering
+     completion commits the timestamp used for lease/proof validation. Phase 12
+     must still define how a replicated leader chooses and bounds these
+     timestamps across leader changes, restarts, clock jumps, and stale
+     lease-read/read-index publication;
    - after control-plane restart or leader change, any leader-local lease state
      that is not committed must be treated as expired until re-established
      through the consensus protocol;
