@@ -8,6 +8,10 @@ use std::time::Duration;
 use placement::NodeId;
 use thiserror::Error;
 
+use crate::control_plane_command::{
+    AppliedControlPlaneCommand, ControlPlaneCommand, ControlPlaneCommandResponse,
+    ControlPlaneCommandStateMachine,
+};
 use crate::{ClusterEpoch, PgClusterMapHistoryReferenceSummary, PgId, PgState};
 
 // PG backfill can lag a burst of placement changes; retain enough recent
@@ -655,6 +659,267 @@ impl ClusterControlSnapshot {
             required_cluster_map_history_protection(self.pgs.values(), self.nodes.values());
         prune_cluster_map_history(&mut self.history, &protection);
     }
+}
+
+impl ControlPlaneCommandStateMachine for ClusterControlSnapshot {
+    fn apply_control_plane_command(
+        &self,
+        command: ControlPlaneCommand,
+        _authority_now_ms: u64,
+    ) -> Result<AppliedControlPlaneCommand, ControlPlaneError> {
+        match command {
+            ControlPlaneCommand::BootstrapInitialClusterMap { nodes, pg_ids } => {
+                if self.nodes().next().is_some() || self.pgs().next().is_some() {
+                    return Err(ControlPlaneError::BootstrapRequiresEmptyState);
+                }
+                if nodes.is_empty() {
+                    return Err(ControlPlaneError::EmptyActingSet { pg_id: 0 });
+                }
+
+                let mut unique_nodes = BTreeSet::new();
+                let mut node_ids = Vec::with_capacity(nodes.len());
+                for (node_id, endpoint) in &nodes {
+                    if !unique_nodes.insert(*node_id) {
+                        return Err(ControlPlaneError::DuplicateActingSetNode {
+                            pg_id: 0,
+                            node_id: node_id.as_u32(),
+                        });
+                    }
+                    if endpoint.is_empty() {
+                        return Err(ControlPlaneError::NodeEndpointMissing {
+                            node_id: node_id.as_u32(),
+                            cluster_epoch: self.cluster_epoch(),
+                        });
+                    }
+                    node_ids.push(*node_id);
+                }
+
+                let mut unique_pgs = BTreeSet::new();
+                for pg_id in &pg_ids {
+                    if !unique_pgs.insert(*pg_id) {
+                        return Err(ControlPlaneError::DuplicateBootstrapPg { pg_id: pg_id.get() });
+                    }
+                }
+
+                let mut next_snapshot = self.clone();
+                for (node_id, endpoint) in nodes {
+                    let mut record = NodeControlRecord::new(node_id, NodeMembershipState::Active);
+                    record.endpoint = endpoint;
+                    next_snapshot.nodes.insert(node_id, record);
+                }
+                for pg_id in pg_ids {
+                    next_snapshot
+                        .pgs
+                        .insert(pg_id, PgControlRecord::new(pg_id, node_ids.clone()));
+                }
+                next_snapshot.bump_epoch()?;
+                Ok(applied_control_plane_command(
+                    self,
+                    next_snapshot,
+                    ControlPlaneCommandResponse::BootstrapInitialClusterMap,
+                    true,
+                ))
+            }
+            ControlPlaneCommand::SetNodeMembership {
+                node_id,
+                membership,
+            } => {
+                let mut next_snapshot = self.clone();
+                let mut changed = false;
+                let mut affected_node = None;
+                match next_snapshot.nodes.get_mut(&node_id) {
+                    Some(record) if record.membership == membership => {}
+                    Some(record) if record.membership == NodeMembershipState::Removed => {
+                        return Err(ControlPlaneError::RemovedNodeCannotRejoin {
+                            node_id: node_id.as_u32(),
+                        });
+                    }
+                    Some(record) => {
+                        record.membership = membership;
+                        affected_node = Some(node_id);
+                        if matches!(
+                            membership,
+                            NodeMembershipState::Out | NodeMembershipState::Removed
+                        ) {
+                            record.availability = NodeAvailabilityState::Unavailable;
+                            record.lease_deadline_ms = None;
+                        }
+                        changed = true;
+                    }
+                    None => {
+                        next_snapshot
+                            .nodes
+                            .insert(node_id, NodeControlRecord::new(node_id, membership));
+                        changed = true;
+                    }
+                }
+                if changed {
+                    if let Some(node_id) = affected_node {
+                        mark_pgs_peering_for_nodes(&mut next_snapshot, [node_id]);
+                    }
+                    next_snapshot.bump_epoch()?;
+                }
+                Ok(applied_control_plane_command(
+                    self,
+                    next_snapshot,
+                    ControlPlaneCommandResponse::SetNodeMembership,
+                    changed,
+                ))
+            }
+            ControlPlaneCommand::MarkNodeAvailability {
+                node_id,
+                availability,
+            } => {
+                let mut next_snapshot = self.clone();
+                let record = next_snapshot.nodes.get_mut(&node_id).ok_or(
+                    ControlPlaneError::UnknownNode {
+                        node_id: node_id.as_u32(),
+                    },
+                )?;
+                if availability == NodeAvailabilityState::Healthy
+                    && matches!(
+                        record.membership,
+                        NodeMembershipState::Out | NodeMembershipState::Removed
+                    )
+                {
+                    return Err(ControlPlaneError::NodeCannotReceiveLease {
+                        node_id: node_id.as_u32(),
+                        membership: record.membership,
+                    });
+                }
+                let changed = record.availability != availability;
+                if changed {
+                    record.availability = availability;
+                    let mut affected_node = None;
+                    if availability != NodeAvailabilityState::Healthy {
+                        record.lease_deadline_ms = None;
+                        affected_node = Some(node_id);
+                    }
+                    if let Some(node_id) = affected_node {
+                        mark_pgs_peering_for_nodes(&mut next_snapshot, [node_id]);
+                    }
+                    next_snapshot.bump_epoch()?;
+                }
+                Ok(applied_control_plane_command(
+                    self,
+                    next_snapshot,
+                    ControlPlaneCommandResponse::MarkNodeAvailability,
+                    changed,
+                ))
+            }
+            ControlPlaneCommand::SetPgActingSet { pg_id, acting_set } => {
+                validate_acting_set(self, pg_id, &acting_set)?;
+                let mut next_snapshot = self.clone();
+                let mut changed = false;
+                match next_snapshot.pgs.get_mut(&pg_id) {
+                    Some(record) if record.acting_set == acting_set => {}
+                    Some(record) => {
+                        let peering_metadata_proof_floor = match record.state {
+                            PgState::Active => {
+                                Some(validate_authoritative_metadata_migration_source(
+                                    self,
+                                    record,
+                                    &acting_set,
+                                )?)
+                            }
+                            PgState::Peering => {
+                                if let Some(floor) = record.peering_metadata_proof_floor {
+                                    validate_peering_metadata_migration_source(
+                                        self,
+                                        record,
+                                        &acting_set,
+                                        floor,
+                                    )?;
+                                    Some(floor)
+                                } else {
+                                    None
+                                }
+                            }
+                            _ => None,
+                        };
+                        let (
+                            peering_metadata_transfer,
+                            peering_metadata_transfer_source_route_epoch,
+                            peering_metadata_transfer_source_node_id,
+                        ) = if record.state == PgState::Peering {
+                            match record.peering_metadata_transfer {
+                                Some(transfer) => (
+                                    Some(transfer),
+                                    record.peering_metadata_transfer_source_route_epoch,
+                                    record.peering_metadata_transfer_source_node_id,
+                                ),
+                                None => (None, None, None),
+                            }
+                        } else {
+                            (None, None, None)
+                        };
+                        let metadata_transfer_fenced = if record.state == PgState::Peering {
+                            record.metadata_transfer_fenced
+                        } else {
+                            false
+                        };
+                        let metadata_transfer_fence_source_lease_deadline_ms = if record.state
+                            == PgState::Peering
+                            && record.metadata_transfer_fenced
+                        {
+                            record.metadata_transfer_fence_source_lease_deadline_ms
+                        } else {
+                            None
+                        };
+                        let metadata_transfer_fence_source_imported = record.state
+                            == PgState::Peering
+                            && record.metadata_transfer_fenced
+                            && record.metadata_transfer_fence_source_imported;
+                        record.acting_set = acting_set;
+                        record.state = PgState::Peering;
+                        record.active_primary = None;
+                        record.active_metadata_proof = None;
+                        record.active_metadata_proof_epoch = None;
+                        record.active_metadata_transfer_imported = false;
+                        record.peering_metadata_proof_floor = peering_metadata_proof_floor;
+                        record.peering_metadata_transfer = peering_metadata_transfer;
+                        record.peering_metadata_transfer_source_route_epoch =
+                            peering_metadata_transfer_source_route_epoch;
+                        record.peering_metadata_transfer_source_node_id =
+                            peering_metadata_transfer_source_node_id;
+                        record.metadata_transfer_fenced = metadata_transfer_fenced;
+                        record.metadata_transfer_fence_source_lease_deadline_ms =
+                            metadata_transfer_fence_source_lease_deadline_ms;
+                        record.metadata_transfer_fence_source_imported =
+                            metadata_transfer_fence_source_imported;
+                        changed = true;
+                    }
+                    None => {
+                        next_snapshot
+                            .pgs
+                            .insert(pg_id, PgControlRecord::new(pg_id, acting_set));
+                        changed = true;
+                    }
+                }
+                if changed {
+                    next_snapshot.bump_epoch()?;
+                }
+                Ok(applied_control_plane_command(
+                    self,
+                    next_snapshot,
+                    ControlPlaneCommandResponse::SetPgActingSet,
+                    changed,
+                ))
+            }
+        }
+    }
+}
+
+fn applied_control_plane_command(
+    previous_snapshot: &ClusterControlSnapshot,
+    mut next_snapshot: ClusterControlSnapshot,
+    response: ControlPlaneCommandResponse,
+    changed: bool,
+) -> AppliedControlPlaneCommand {
+    if changed {
+        next_snapshot.record_history_from(previous_snapshot);
+    }
+    AppliedControlPlaneCommand::new(next_snapshot, response, changed)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1634,47 +1899,32 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
         &self.snapshot
     }
 
+    fn apply_and_commit_command(
+        &mut self,
+        command: ControlPlaneCommand,
+        authority_now_ms: u64,
+    ) -> Result<AppliedControlPlaneCommand, ControlPlaneError> {
+        let applied = self
+            .snapshot
+            .apply_control_plane_command(command, authority_now_ms)?;
+        if applied.changed() {
+            self.commit_snapshot(applied.snapshot().clone())?;
+        }
+        Ok(applied)
+    }
+
     pub fn set_node_membership(
         &mut self,
         node_id: NodeId,
         membership: NodeMembershipState,
     ) -> Result<ClusterControlSnapshot, ControlPlaneError> {
-        let mut next_snapshot = self.snapshot.clone();
-        let mut changed = false;
-        let mut affected_node = None;
-        match next_snapshot.nodes.get_mut(&node_id) {
-            Some(record) if record.membership == membership => {}
-            Some(record) if record.membership == NodeMembershipState::Removed => {
-                return Err(ControlPlaneError::RemovedNodeCannotRejoin {
-                    node_id: node_id.as_u32(),
-                });
-            }
-            Some(record) => {
-                record.membership = membership;
-                affected_node = Some(node_id);
-                if matches!(
-                    membership,
-                    NodeMembershipState::Out | NodeMembershipState::Removed
-                ) {
-                    record.availability = NodeAvailabilityState::Unavailable;
-                    record.lease_deadline_ms = None;
-                }
-                changed = true;
-            }
-            None => {
-                next_snapshot
-                    .nodes
-                    .insert(node_id, NodeControlRecord::new(node_id, membership));
-                changed = true;
-            }
-        }
-        if changed {
-            if let Some(node_id) = affected_node {
-                mark_pgs_peering_for_nodes(&mut next_snapshot, [node_id]);
-            }
-            next_snapshot.bump_epoch()?;
-            self.commit_snapshot(next_snapshot)?;
-        }
+        self.apply_and_commit_command(
+            ControlPlaneCommand::SetNodeMembership {
+                node_id,
+                membership,
+            },
+            0,
+        )?;
         Ok(self.snapshot.clone())
     }
 
@@ -1683,38 +1933,13 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
         node_id: NodeId,
         availability: NodeAvailabilityState,
     ) -> Result<ClusterControlSnapshot, ControlPlaneError> {
-        let mut next_snapshot = self.snapshot.clone();
-        let record =
-            next_snapshot
-                .nodes
-                .get_mut(&node_id)
-                .ok_or(ControlPlaneError::UnknownNode {
-                    node_id: node_id.as_u32(),
-                })?;
-        if availability == NodeAvailabilityState::Healthy
-            && matches!(
-                record.membership,
-                NodeMembershipState::Out | NodeMembershipState::Removed
-            )
-        {
-            return Err(ControlPlaneError::NodeCannotReceiveLease {
-                node_id: node_id.as_u32(),
-                membership: record.membership,
-            });
-        }
-        if record.availability != availability {
-            record.availability = availability;
-            let mut affected_node = None;
-            if availability != NodeAvailabilityState::Healthy {
-                record.lease_deadline_ms = None;
-                affected_node = Some(node_id);
-            }
-            if let Some(node_id) = affected_node {
-                mark_pgs_peering_for_nodes(&mut next_snapshot, [node_id]);
-            }
-            next_snapshot.bump_epoch()?;
-            self.commit_snapshot(next_snapshot)?;
-        }
+        self.apply_and_commit_command(
+            ControlPlaneCommand::MarkNodeAvailability {
+                node_id,
+                availability,
+            },
+            0,
+        )?;
         Ok(self.snapshot.clone())
     }
 
@@ -1723,51 +1948,10 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
         nodes: Vec<(NodeId, String)>,
         pg_ids: Vec<PgId>,
     ) -> Result<ClusterControlSnapshot, ControlPlaneError> {
-        if self.snapshot.nodes().next().is_some() || self.snapshot.pgs().next().is_some() {
-            return Err(ControlPlaneError::BootstrapRequiresEmptyState);
-        }
-        if nodes.is_empty() {
-            return Err(ControlPlaneError::EmptyActingSet { pg_id: 0 });
-        }
-
-        let mut unique_nodes = BTreeSet::new();
-        let mut node_ids = Vec::with_capacity(nodes.len());
-        for (node_id, endpoint) in &nodes {
-            if !unique_nodes.insert(*node_id) {
-                return Err(ControlPlaneError::DuplicateActingSetNode {
-                    pg_id: 0,
-                    node_id: node_id.as_u32(),
-                });
-            }
-            if endpoint.is_empty() {
-                return Err(ControlPlaneError::NodeEndpointMissing {
-                    node_id: node_id.as_u32(),
-                    cluster_epoch: self.snapshot.cluster_epoch(),
-                });
-            }
-            node_ids.push(*node_id);
-        }
-
-        let mut unique_pgs = BTreeSet::new();
-        for pg_id in &pg_ids {
-            if !unique_pgs.insert(*pg_id) {
-                return Err(ControlPlaneError::DuplicateBootstrapPg { pg_id: pg_id.get() });
-            }
-        }
-
-        let mut next_snapshot = self.snapshot.clone();
-        for (node_id, endpoint) in nodes {
-            let mut record = NodeControlRecord::new(node_id, NodeMembershipState::Active);
-            record.endpoint = endpoint;
-            next_snapshot.nodes.insert(node_id, record);
-        }
-        for pg_id in pg_ids {
-            next_snapshot
-                .pgs
-                .insert(pg_id, PgControlRecord::new(pg_id, node_ids.clone()));
-        }
-        next_snapshot.bump_epoch()?;
-        self.commit_snapshot(next_snapshot)?;
+        self.apply_and_commit_command(
+            ControlPlaneCommand::BootstrapInitialClusterMap { nodes, pg_ids },
+            0,
+        )?;
         Ok(self.snapshot.clone())
     }
 
@@ -1776,93 +1960,10 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
         pg_id: PgId,
         acting_set: Vec<NodeId>,
     ) -> Result<ClusterControlSnapshot, ControlPlaneError> {
-        validate_acting_set(&self.snapshot, pg_id, &acting_set)?;
-        let mut next_snapshot = self.snapshot.clone();
-        let mut changed = false;
-        match next_snapshot.pgs.get_mut(&pg_id) {
-            Some(record) if record.acting_set == acting_set => {}
-            Some(record) => {
-                let peering_metadata_proof_floor = match record.state {
-                    PgState::Active => Some(validate_authoritative_metadata_migration_source(
-                        &self.snapshot,
-                        record,
-                        &acting_set,
-                    )?),
-                    PgState::Peering => {
-                        if let Some(floor) = record.peering_metadata_proof_floor {
-                            validate_peering_metadata_migration_source(
-                                &self.snapshot,
-                                record,
-                                &acting_set,
-                                floor,
-                            )?;
-                            Some(floor)
-                        } else {
-                            None
-                        }
-                    }
-                    _ => None,
-                };
-                let (
-                    peering_metadata_transfer,
-                    peering_metadata_transfer_source_route_epoch,
-                    peering_metadata_transfer_source_node_id,
-                ) = if record.state == PgState::Peering {
-                    match record.peering_metadata_transfer {
-                        Some(transfer) => (
-                            Some(transfer),
-                            record.peering_metadata_transfer_source_route_epoch,
-                            record.peering_metadata_transfer_source_node_id,
-                        ),
-                        None => (None, None, None),
-                    }
-                } else {
-                    (None, None, None)
-                };
-                let metadata_transfer_fenced = if record.state == PgState::Peering {
-                    record.metadata_transfer_fenced
-                } else {
-                    false
-                };
-                let metadata_transfer_fence_source_lease_deadline_ms =
-                    if record.state == PgState::Peering && record.metadata_transfer_fenced {
-                        record.metadata_transfer_fence_source_lease_deadline_ms
-                    } else {
-                        None
-                    };
-                let metadata_transfer_fence_source_imported = record.state == PgState::Peering
-                    && record.metadata_transfer_fenced
-                    && record.metadata_transfer_fence_source_imported;
-                record.acting_set = acting_set;
-                record.state = PgState::Peering;
-                record.active_primary = None;
-                record.active_metadata_proof = None;
-                record.active_metadata_proof_epoch = None;
-                record.active_metadata_transfer_imported = false;
-                record.peering_metadata_proof_floor = peering_metadata_proof_floor;
-                record.peering_metadata_transfer = peering_metadata_transfer;
-                record.peering_metadata_transfer_source_route_epoch =
-                    peering_metadata_transfer_source_route_epoch;
-                record.peering_metadata_transfer_source_node_id =
-                    peering_metadata_transfer_source_node_id;
-                record.metadata_transfer_fenced = metadata_transfer_fenced;
-                record.metadata_transfer_fence_source_lease_deadline_ms =
-                    metadata_transfer_fence_source_lease_deadline_ms;
-                record.metadata_transfer_fence_source_imported =
-                    metadata_transfer_fence_source_imported;
-                changed = true;
-            }
-            None => {
-                next_snapshot
-                    .pgs
-                    .insert(pg_id, PgControlRecord::new(pg_id, acting_set));
-                changed = true;
-            }
-        }
-        if changed {
-            next_snapshot.bump_epoch()?;
-            self.commit_snapshot(next_snapshot)?;
-        }
+        self.apply_and_commit_command(
+            ControlPlaneCommand::SetPgActingSet { pg_id, acting_set },
+            0,
+        )?;
         Ok(self.snapshot.clone())
     }
 
@@ -9091,6 +9192,54 @@ mod tests {
             ),
             Err(ControlPlaneError::BootstrapRequiresEmptyState)
         ));
+    }
+
+    #[test]
+    fn control_plane_command_replay_matches_single_authority_snapshot() {
+        let commands = vec![
+            ControlPlaneCommand::BootstrapInitialClusterMap {
+                nodes: vec![
+                    (NodeId::new(1), "/tmp/node-1.sock".to_owned()),
+                    (NodeId::new(2), "/tmp/node-2.sock".to_owned()),
+                ],
+                pg_ids: vec![PgId::new(7)],
+            },
+            ControlPlaneCommand::SetPgActingSet {
+                pg_id: PgId::new(7),
+                acting_set: vec![NodeId::new(1)],
+            },
+            ControlPlaneCommand::SetNodeMembership {
+                node_id: NodeId::new(2),
+                membership: NodeMembershipState::Draining,
+            },
+            ControlPlaneCommand::MarkNodeAvailability {
+                node_id: NodeId::new(2),
+                availability: NodeAvailabilityState::Unavailable,
+            },
+        ];
+
+        let mut replayed = ClusterControlSnapshot::empty();
+        for command in commands.clone() {
+            let applied = replayed
+                .apply_control_plane_command(command, 1_000)
+                .unwrap();
+            assert!(applied.changed());
+            replayed = applied.into_snapshot();
+        }
+
+        let tmp = test_util::tempdir();
+        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+        for command in commands {
+            authority.apply_and_commit_command(command, 1_000).unwrap();
+        }
+
+        assert_eq!(&replayed, authority.snapshot());
+        assert_eq!(
+            replayed.cluster_epoch(),
+            ClusterEpoch::new(ClusterEpoch::INITIAL.get() + 4).unwrap()
+        );
+        assert_eq!(replayed.cluster_map_history().len(), 4);
     }
 
     #[test]

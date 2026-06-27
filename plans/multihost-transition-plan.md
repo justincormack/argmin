@@ -8949,6 +8949,40 @@ separate design decision to reverse the bucket-metadata-sharding model.
 
 Detailed work items:
 
+Phase 12.1 starting slice:
+
+- keep the initial command/state-machine split inside the `storage` crate,
+  using a new module/file rather than a new crate. The boundary still depends
+  directly on `ClusterControlSnapshot`, PG/node ids, metadata-transfer proofs,
+  heartbeat records, and control-plane errors, so a crate split would create
+  churn before the command model is stable. Revisit a crate split only after
+  the command encoding, replay, and OpenRaft integration points have settled.
+- introduce explicit `ControlPlaneCommand` values for the durable, linearized
+  state changes. The initial set should cover bootstrap/admin membership
+  changes, PG acting-set changes, peering completion, metadata-transfer
+  fence/install, and durable heartbeat state such as node incarnation,
+  endpoint, PG observations, and storage history floors. High-frequency
+  heartbeat lease renewal remains separate until its leader-local/read-index
+  semantics are designed.
+- introduce a deterministic command-apply boundary whose inputs are a
+  `ClusterControlSnapshot`, a `ControlPlaneCommand`, and a monotonic `now_ms`,
+  and whose output is a new snapshot plus a typed response. The apply layer must
+  not perform file I/O, Raft I/O, or RPC.
+- adapt `SingleAuthorityControlPlane` to call the command-apply boundary while
+  preserving the Phase 11 API and file-backed test harness. This keeps the
+  single-authority implementation as the compatibility oracle for the later
+  replicated implementation.
+- add replay/snapshot tests at this boundary before wiring OpenRaft: command
+  sequence replay equals the final snapshot, corrupt/incompatible command
+  decode fails closed, retained-history floors and metadata-transfer fences
+  survive replay, and cluster epochs remain monotonic and derived only from
+  applied commands.
+- after this boundary is in place, run the OpenRaft spike against the command
+  enum and snapshot type. The spike should prove append/apply, snapshot
+  install, restart with durable term/vote/index metadata, leader-only
+  linearized runtime-map reads, and not-leader redirect/error behavior before
+  replacing production control-plane paths.
+
 1. define the replicated control-plane state machine:
    - state includes cluster epoch, PG count, PG state, PG acting sets, node
      membership, node incarnation/endpoint/liveness metadata, retained
