@@ -9035,6 +9035,11 @@ Phase 12.1 progress:
   freshness. The current single-authority implementation satisfies both traits
   and has focused tests for command persistence and freshness-proof reads,
   while existing Phase 11 operation-level traits remain unchanged.
+- Extended the runtime-map freshness proof with a dependency-free
+  read-index-shaped variant carrying authority incarnation, committed
+  control-plane log id, and issue timestamp. The Unix RPC codec round-trips
+  this variant and rejects zero read-index values, so the OpenRaft spike can
+  populate a stable proof shape without changing the runtime-map frame again.
 
 1. define the replicated control-plane state machine:
    - state includes cluster epoch, PG count, PG state, PG acting sets, node

@@ -10,7 +10,7 @@ use thiserror::Error;
 
 use crate::control_plane_command::{
     AppliedControlPlaneCommand, ControlPlaneCommand, ControlPlaneCommandResponse,
-    ControlPlaneCommandStateMachine, ReadyPgPeeringCompletion,
+    ControlPlaneCommandStateMachine, ControlPlaneLogId, ReadyPgPeeringCompletion,
 };
 use crate::{ClusterEpoch, PgClusterMapHistoryReferenceSummary, PgId, PgState};
 
@@ -27,6 +27,7 @@ const CONTROL_PLANE_RPC_PG_ROUTE_MIN_LEN: usize = 8 + 4 + 4 + 1 + 1 + 4 + 1;
 const CONTROL_PLANE_RPC_ACTING_SET_NODE_MIN_LEN: usize = 4;
 const CONTROL_PLANE_RPC_RUNTIME_MAP_PROOF_SINGLE_AUTHORITY: u8 = 1;
 const CONTROL_PLANE_RPC_RUNTIME_MAP_PROOF_RECONSTRUCTED: u8 = 2;
+const CONTROL_PLANE_RPC_RUNTIME_MAP_PROOF_READ_INDEX: u8 = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct AuthorityIncarnation(NonZeroU64);
@@ -1905,10 +1906,16 @@ impl NodeRouteSnapshot {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RuntimeMapFreshnessProof {
     // Phase 11 single-authority freshness proof. The replicated control-plane
-    // path must add a sibling Raft/read-index proof variant rather than
-    // overloading this one.
+    // path must use a sibling proof variant rather than overloading this one.
     SingleAuthority {
         authority_incarnation: AuthorityIncarnation,
+        // Informational until Phase 12 defines monotonic-clock lease-read
+        // comparison, skew, and restart semantics.
+        issued_at_ms: u64,
+    },
+    ReadIndex {
+        authority_incarnation: AuthorityIncarnation,
+        read_index: ControlPlaneLogId,
         // Informational until Phase 12 defines monotonic-clock lease-read
         // comparison, skew, and restart semantics.
         issued_at_ms: u64,
@@ -1926,6 +1933,10 @@ impl RuntimeMapFreshnessProof {
                 authority_incarnation,
                 ..
             }
+            | Self::ReadIndex {
+                authority_incarnation,
+                ..
+            }
             | Self::Reconstructed {
                 authority_incarnation,
             } => *authority_incarnation,
@@ -1935,14 +1946,24 @@ impl RuntimeMapFreshnessProof {
     #[must_use]
     pub fn issued_at_ms(&self) -> Option<u64> {
         match self {
-            Self::SingleAuthority { issued_at_ms, .. } => Some(*issued_at_ms),
+            Self::SingleAuthority { issued_at_ms, .. } | Self::ReadIndex { issued_at_ms, .. } => {
+                Some(*issued_at_ms)
+            }
             Self::Reconstructed { .. } => None,
         }
     }
 
     #[must_use]
+    pub fn read_index(&self) -> Option<ControlPlaneLogId> {
+        match self {
+            Self::ReadIndex { read_index, .. } => Some(*read_index),
+            Self::SingleAuthority { .. } | Self::Reconstructed { .. } => None,
+        }
+    }
+
+    #[must_use]
     pub fn is_serving_authority_read(&self) -> bool {
-        matches!(self, Self::SingleAuthority { .. })
+        matches!(self, Self::SingleAuthority { .. } | Self::ReadIndex { .. })
     }
 }
 
@@ -4327,6 +4348,17 @@ fn write_runtime_map_freshness_proof(out: &mut Vec<u8>, proof: &RuntimeMapFreshn
             write_u64(out, authority_incarnation.get());
             write_u64(out, *issued_at_ms);
         }
+        RuntimeMapFreshnessProof::ReadIndex {
+            authority_incarnation,
+            read_index,
+            issued_at_ms,
+        } => {
+            write_u8(out, CONTROL_PLANE_RPC_RUNTIME_MAP_PROOF_READ_INDEX);
+            write_u64(out, authority_incarnation.get());
+            write_u64(out, read_index.term());
+            write_u64(out, read_index.index());
+            write_u64(out, *issued_at_ms);
+        }
         RuntimeMapFreshnessProof::Reconstructed {
             authority_incarnation,
         } => {
@@ -4427,6 +4459,14 @@ fn read_runtime_map_freshness_proof(
                 authority_incarnation,
             })
         }
+        CONTROL_PLANE_RPC_RUNTIME_MAP_PROOF_READ_INDEX => {
+            let authority_incarnation = read_runtime_map_proof_authority_incarnation(reader)?;
+            Ok(RuntimeMapFreshnessProof::ReadIndex {
+                authority_incarnation,
+                read_index: read_runtime_map_proof_log_id(reader)?,
+                issued_at_ms: reader.read_u64()?,
+            })
+        }
         other => Err(ControlPlaneError::RpcProtocol {
             message: format!("invalid runtime map freshness proof tag {other}"),
         }),
@@ -4438,6 +4478,21 @@ fn read_runtime_map_proof_authority_incarnation(
 ) -> Result<AuthorityIncarnation, ControlPlaneError> {
     AuthorityIncarnation::new(reader.read_u64()?).ok_or_else(|| ControlPlaneError::RpcProtocol {
         message: "runtime map freshness proof authority incarnation must be nonzero".to_owned(),
+    })
+}
+
+fn read_runtime_map_proof_log_id(
+    reader: &mut PayloadReader<'_>,
+) -> Result<ControlPlaneLogId, ControlPlaneError> {
+    let term = reader.read_u64()?;
+    let index = reader.read_u64()?;
+    if term == 0 {
+        return Err(ControlPlaneError::RpcProtocol {
+            message: "runtime map freshness proof read-index term must be nonzero".to_owned(),
+        });
+    }
+    ControlPlaneLogId::new(term, index).ok_or_else(|| ControlPlaneError::RpcProtocol {
+        message: "runtime map freshness proof read-index index must be nonzero".to_owned(),
     })
 }
 
@@ -8583,6 +8638,46 @@ mod tests {
     }
 
     #[test]
+    fn control_plane_rpc_rejects_zero_runtime_map_read_index_proof_index() {
+        let mut payload = Vec::new();
+        write_u64(&mut payload, ClusterEpoch::INITIAL.get());
+        write_option_u64(&mut payload, None);
+        write_u8(&mut payload, CONTROL_PLANE_RPC_RUNTIME_MAP_PROOF_READ_INDEX);
+        write_u64(&mut payload, AuthorityIncarnation::INITIAL.get());
+        write_u64(&mut payload, 7);
+        write_u64(&mut payload, 0);
+
+        let mut reader = PayloadReader::new(&payload);
+        let error = read_runtime_map_snapshot(&mut reader).unwrap_err();
+
+        assert!(matches!(
+            error,
+            ControlPlaneError::RpcProtocol { message }
+                if message.contains("runtime map freshness proof read-index index must be nonzero")
+        ));
+    }
+
+    #[test]
+    fn control_plane_rpc_rejects_zero_runtime_map_read_index_proof_term() {
+        let mut payload = Vec::new();
+        write_u64(&mut payload, ClusterEpoch::INITIAL.get());
+        write_option_u64(&mut payload, None);
+        write_u8(&mut payload, CONTROL_PLANE_RPC_RUNTIME_MAP_PROOF_READ_INDEX);
+        write_u64(&mut payload, AuthorityIncarnation::INITIAL.get());
+        write_u64(&mut payload, 0);
+        write_u64(&mut payload, 42);
+
+        let mut reader = PayloadReader::new(&payload);
+        let error = read_runtime_map_snapshot(&mut reader).unwrap_err();
+
+        assert!(matches!(
+            error,
+            ControlPlaneError::RpcProtocol { message }
+                if message.contains("runtime map freshness proof read-index term must be nonzero")
+        ));
+    }
+
+    #[test]
     fn control_plane_rpc_round_trips_single_authority_runtime_map_freshness_proof() {
         let snapshot = runtime_map_test_snapshot(RuntimeMapFreshnessProof::SingleAuthority {
             authority_incarnation: AuthorityIncarnation::INITIAL,
@@ -8603,6 +8698,34 @@ mod tests {
                 issued_at_ms: 12_345,
             }
         );
+    }
+
+    #[test]
+    fn control_plane_rpc_round_trips_read_index_runtime_map_freshness_proof() {
+        let read_index = ControlPlaneLogId::new(7, 42).unwrap();
+        let snapshot = runtime_map_test_snapshot(RuntimeMapFreshnessProof::ReadIndex {
+            authority_incarnation: AuthorityIncarnation::INITIAL,
+            read_index,
+            issued_at_ms: 12_345,
+        });
+        let mut payload = Vec::new();
+        write_runtime_map_snapshot(&mut payload, &snapshot).unwrap();
+
+        let mut reader = PayloadReader::new(&payload);
+        let decoded = read_runtime_map_snapshot(&mut reader).unwrap();
+        reader.finish().unwrap();
+
+        assert_eq!(decoded, snapshot);
+        assert_eq!(
+            decoded.freshness_proof(),
+            &RuntimeMapFreshnessProof::ReadIndex {
+                authority_incarnation: AuthorityIncarnation::INITIAL,
+                read_index,
+                issued_at_ms: 12_345,
+            }
+        );
+        assert_eq!(decoded.freshness_proof().read_index(), Some(read_index));
+        assert!(decoded.freshness_proof().is_serving_authority_read());
     }
 
     #[test]
