@@ -4610,6 +4610,48 @@ pub enum ControlPlaneError {
     #[error("control-plane snapshot decode error: {message}")]
     SnapshotDecode { message: String },
 
+    #[error(
+        "control-plane committed log index mismatch: expected {expected_index}, got {actual_index}"
+    )]
+    ControlPlaneLogIndexMismatch {
+        expected_index: u64,
+        actual_index: u64,
+    },
+
+    #[error("control-plane committed log index overflow after {index}")]
+    ControlPlaneLogIndexOverflow { index: u64 },
+
+    #[error(
+        "control-plane snapshot has no last-applied log id but current state is applied through index {current_index}"
+    )]
+    ControlPlaneSnapshotMissingLogId { current_index: u64 },
+
+    #[error(
+        "control-plane snapshot last-applied index {artifact_index} is older than current applied index {current_index}"
+    )]
+    ControlPlaneSnapshotLogIndexRegression {
+        current_index: u64,
+        artifact_index: u64,
+    },
+
+    #[error(
+        "control-plane snapshot last-applied term {artifact_term} does not match current term {current_term} at index {index}"
+    )]
+    ControlPlaneSnapshotLogTermMismatch {
+        index: u64,
+        current_term: u64,
+        artifact_term: u64,
+    },
+
+    #[error(
+        "control-plane committed log term regressed from {previous_term} to {actual_term} at index {index}"
+    )]
+    ControlPlaneLogTermRegression {
+        previous_term: u64,
+        actual_term: u64,
+        index: u64,
+    },
+
     #[error("control-plane RPC remote error: {message}")]
     RpcRemote { message: String },
 

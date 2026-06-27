@@ -9000,6 +9000,22 @@ Phase 12.1 progress:
   control-plane state text and parser for invariant validation, rejects corrupt
   or incompatible snapshot frames before parsing, and tests that a decoded
   snapshot can continue applying commands identically to the original state.
+- Added a dependency-free replicated state-machine adapter around the command
+  boundary. It tracks committed log term/index metadata outside the canonical
+  state payload, rejects non-contiguous indexes or term regressions before
+  mutating state, builds snapshot artifacts with the last-applied log id, and
+  installs CRC-checked snapshot artifacts without changing state on corrupt
+  input. This gives the OpenRaft spike a small append/apply/snapshot contract
+  before introducing the dependency.
+- Tightened snapshot artifact install so a valid but stale artifact cannot roll
+  back an already-applied state machine. The adapter rejects missing, lower, or
+  term-incompatible last-applied log ids before decoding the payload, and has
+  tests for both same-position reinstall and forward snapshot catch-up. The
+  remaining trust boundary is intentionally left with the consensus layer:
+  OpenRaft must supply a snapshot payload whose internal state matches its
+  claimed last-included log id. The OpenRaft spike must also decide how a
+  committed command rejected by deterministic apply is surfaced so Raft does
+  not silently stall with `last_applied` unchanged.
 
 1. define the replicated control-plane state machine:
    - state includes cluster epoch, PG count, PG state, PG acting sets, node

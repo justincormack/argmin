@@ -461,6 +461,237 @@ pub trait ControlPlaneCommandStateMachine {
     ) -> Result<AppliedControlPlaneCommand, ControlPlaneError>;
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ControlPlaneLogId {
+    term: u64,
+    index: u64,
+}
+
+impl ControlPlaneLogId {
+    #[must_use]
+    pub fn new(term: u64, index: u64) -> Option<Self> {
+        if index == 0 {
+            return None;
+        }
+        Some(Self { term, index })
+    }
+
+    #[must_use]
+    pub fn term(self) -> u64 {
+        self.term
+    }
+
+    #[must_use]
+    pub fn index(self) -> u64 {
+        self.index
+    }
+
+    fn next_index(self) -> Result<u64, ControlPlaneError> {
+        self.index
+            .checked_add(1)
+            .ok_or(ControlPlaneError::ControlPlaneLogIndexOverflow { index: self.index })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppliedControlPlaneLogCommand {
+    log_id: ControlPlaneLogId,
+    applied: AppliedControlPlaneCommand,
+}
+
+impl AppliedControlPlaneLogCommand {
+    #[must_use]
+    pub fn new(log_id: ControlPlaneLogId, applied: AppliedControlPlaneCommand) -> Self {
+        Self { log_id, applied }
+    }
+
+    #[must_use]
+    pub fn log_id(&self) -> ControlPlaneLogId {
+        self.log_id
+    }
+
+    #[must_use]
+    pub fn applied(&self) -> &AppliedControlPlaneCommand {
+        &self.applied
+    }
+
+    #[must_use]
+    pub fn into_applied(self) -> AppliedControlPlaneCommand {
+        self.applied
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ControlPlaneSnapshotArtifact {
+    last_applied: Option<ControlPlaneLogId>,
+    payload: Vec<u8>,
+}
+
+impl ControlPlaneSnapshotArtifact {
+    #[must_use]
+    pub fn new(last_applied: Option<ControlPlaneLogId>, payload: Vec<u8>) -> Self {
+        Self {
+            last_applied,
+            payload,
+        }
+    }
+
+    #[must_use]
+    pub fn last_applied(&self) -> Option<ControlPlaneLogId> {
+        self.last_applied
+    }
+
+    #[must_use]
+    pub fn payload(&self) -> &[u8] {
+        &self.payload
+    }
+
+    #[must_use]
+    pub fn into_payload(self) -> Vec<u8> {
+        self.payload
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplicatedControlPlaneStateMachine {
+    snapshot: ClusterControlSnapshot,
+    last_applied: Option<ControlPlaneLogId>,
+    snapshot_last_applied: Option<ControlPlaneLogId>,
+}
+
+impl ReplicatedControlPlaneStateMachine {
+    #[must_use]
+    pub fn empty() -> Self {
+        Self::new(ClusterControlSnapshot::empty(), None)
+    }
+
+    #[must_use]
+    pub fn new(snapshot: ClusterControlSnapshot, last_applied: Option<ControlPlaneLogId>) -> Self {
+        Self {
+            snapshot,
+            last_applied,
+            snapshot_last_applied: None,
+        }
+    }
+
+    #[must_use]
+    pub fn snapshot(&self) -> &ClusterControlSnapshot {
+        &self.snapshot
+    }
+
+    #[must_use]
+    pub fn last_applied(&self) -> Option<ControlPlaneLogId> {
+        self.last_applied
+    }
+
+    #[must_use]
+    pub fn snapshot_last_applied(&self) -> Option<ControlPlaneLogId> {
+        self.snapshot_last_applied
+    }
+
+    pub fn apply_committed_command(
+        &mut self,
+        log_id: ControlPlaneLogId,
+        command: ControlPlaneCommand,
+    ) -> Result<AppliedControlPlaneLogCommand, ControlPlaneError> {
+        self.validate_next_log_id(log_id)?;
+        let applied = self.snapshot.apply_control_plane_command(command)?;
+        self.snapshot = applied.snapshot().clone();
+        self.last_applied = Some(log_id);
+        Ok(AppliedControlPlaneLogCommand::new(log_id, applied))
+    }
+
+    pub fn build_snapshot_artifact(
+        &mut self,
+    ) -> Result<ControlPlaneSnapshotArtifact, ControlPlaneError> {
+        let payload = encode_control_plane_snapshot(&self.snapshot)?;
+        self.snapshot_last_applied = self.last_applied;
+        Ok(ControlPlaneSnapshotArtifact::new(
+            self.last_applied,
+            payload,
+        ))
+    }
+
+    pub fn install_snapshot_artifact(
+        &mut self,
+        artifact: ControlPlaneSnapshotArtifact,
+    ) -> Result<(), ControlPlaneError> {
+        self.validate_snapshot_artifact_log_id(artifact.last_applied())?;
+        // The consensus layer must supply a mutually consistent
+        // (payload, last_applied) pair. This adapter guards only against
+        // rollback relative to the current applied position.
+        let snapshot = decode_control_plane_snapshot(artifact.payload())?;
+        self.snapshot = snapshot;
+        self.last_applied = artifact.last_applied();
+        self.snapshot_last_applied = artifact.last_applied();
+        Ok(())
+    }
+
+    fn validate_next_log_id(&self, log_id: ControlPlaneLogId) -> Result<(), ControlPlaneError> {
+        let Some(last_applied) = self.last_applied else {
+            if log_id.index() != 1 {
+                return Err(ControlPlaneError::ControlPlaneLogIndexMismatch {
+                    expected_index: 1,
+                    actual_index: log_id.index(),
+                });
+            }
+            return Ok(());
+        };
+        let expected_index = last_applied.next_index()?;
+        if log_id.index() != expected_index {
+            return Err(ControlPlaneError::ControlPlaneLogIndexMismatch {
+                expected_index,
+                actual_index: log_id.index(),
+            });
+        }
+        if log_id.term() < last_applied.term() {
+            return Err(ControlPlaneError::ControlPlaneLogTermRegression {
+                previous_term: last_applied.term(),
+                actual_term: log_id.term(),
+                index: log_id.index(),
+            });
+        }
+        Ok(())
+    }
+
+    fn validate_snapshot_artifact_log_id(
+        &self,
+        artifact_last_applied: Option<ControlPlaneLogId>,
+    ) -> Result<(), ControlPlaneError> {
+        let Some(current_last_applied) = self.last_applied else {
+            return Ok(());
+        };
+        let Some(artifact_last_applied) = artifact_last_applied else {
+            return Err(ControlPlaneError::ControlPlaneSnapshotMissingLogId {
+                current_index: current_last_applied.index(),
+            });
+        };
+        if artifact_last_applied.index() < current_last_applied.index() {
+            return Err(ControlPlaneError::ControlPlaneSnapshotLogIndexRegression {
+                current_index: current_last_applied.index(),
+                artifact_index: artifact_last_applied.index(),
+            });
+        }
+        if artifact_last_applied.index() == current_last_applied.index()
+            && artifact_last_applied.term() != current_last_applied.term()
+        {
+            return Err(ControlPlaneError::ControlPlaneSnapshotLogTermMismatch {
+                index: current_last_applied.index(),
+                current_term: current_last_applied.term(),
+                artifact_term: artifact_last_applied.term(),
+            });
+        }
+        if artifact_last_applied.term() < current_last_applied.term() {
+            return Err(ControlPlaneError::ControlPlaneLogTermRegression {
+                previous_term: current_last_applied.term(),
+                actual_term: artifact_last_applied.term(),
+                index: artifact_last_applied.index(),
+            });
+        }
+        Ok(())
+    }
+}
+
 fn append_control_plane_command_checksum(out: &mut Vec<u8>) {
     let checksum = control_plane_command_checksum(out);
     write_u64(out, checksum);
@@ -1027,7 +1258,17 @@ mod tests {
 
     fn sample_snapshot() -> ClusterControlSnapshot {
         let mut snapshot = ClusterControlSnapshot::empty();
-        let commands = vec![
+        for command in sample_snapshot_commands() {
+            snapshot = snapshot
+                .apply_control_plane_command(command)
+                .unwrap()
+                .into_snapshot();
+        }
+        snapshot
+    }
+
+    fn sample_snapshot_commands() -> Vec<ControlPlaneCommand> {
+        vec![
             ControlPlaneCommand::BootstrapInitialClusterMap {
                 nodes: vec![
                     (NodeId::new(1), "/tmp/node-1.sock".to_owned()),
@@ -1053,8 +1294,33 @@ mod tests {
                 node_id: NodeId::new(2),
                 membership: NodeMembershipState::Draining,
             },
-        ];
-        for command in commands {
+        ]
+    }
+
+    fn follow_up_command() -> ControlPlaneCommand {
+        ControlPlaneCommand::MarkNodeAvailability {
+            node_id: NodeId::new(1),
+            availability: NodeAvailabilityState::Unavailable,
+        }
+    }
+
+    fn log_id(term: u64, index: u64) -> ControlPlaneLogId {
+        ControlPlaneLogId::new(term, index).unwrap()
+    }
+
+    fn replay_sample_state_machine() -> ReplicatedControlPlaneStateMachine {
+        let mut state_machine = ReplicatedControlPlaneStateMachine::empty();
+        for (offset, command) in sample_snapshot_commands().into_iter().enumerate() {
+            state_machine
+                .apply_committed_command(log_id(1, u64::try_from(offset).unwrap() + 1), command)
+                .unwrap();
+        }
+        state_machine
+    }
+
+    fn replay_sample_directly() -> ClusterControlSnapshot {
+        let mut snapshot = ClusterControlSnapshot::empty();
+        for command in sample_snapshot_commands() {
             snapshot = snapshot
                 .apply_control_plane_command(command)
                 .unwrap()
@@ -1253,6 +1519,210 @@ mod tests {
             decode_control_plane_snapshot(&encoded),
             Err(ControlPlaneError::Parse { .. })
         ));
+    }
+
+    #[test]
+    fn replicated_control_plane_state_machine_replay_matches_direct_apply() {
+        let state_machine = replay_sample_state_machine();
+        assert_eq!(state_machine.snapshot(), &replay_sample_directly());
+        assert_eq!(state_machine.last_applied(), Some(log_id(1, 3)));
+        assert_eq!(state_machine.snapshot_last_applied(), None);
+    }
+
+    #[test]
+    fn replicated_control_plane_state_machine_rejects_non_contiguous_log_before_mutation() {
+        let mut state_machine = ReplicatedControlPlaneStateMachine::empty();
+        let before = state_machine.clone();
+
+        assert!(matches!(
+            state_machine
+                .apply_committed_command(log_id(1, 2), sample_snapshot_commands()[0].clone()),
+            Err(ControlPlaneError::ControlPlaneLogIndexMismatch {
+                expected_index: 1,
+                actual_index: 2,
+            })
+        ));
+        assert_eq!(state_machine, before);
+
+        state_machine
+            .apply_committed_command(log_id(1, 1), sample_snapshot_commands()[0].clone())
+            .unwrap();
+        let before = state_machine.clone();
+        assert!(matches!(
+            state_machine
+                .apply_committed_command(log_id(1, 1), sample_snapshot_commands()[1].clone()),
+            Err(ControlPlaneError::ControlPlaneLogIndexMismatch {
+                expected_index: 2,
+                actual_index: 1,
+            })
+        ));
+        assert_eq!(state_machine, before);
+    }
+
+    #[test]
+    fn replicated_control_plane_state_machine_rejects_term_regression_before_mutation() {
+        let mut state_machine = ReplicatedControlPlaneStateMachine::empty();
+        state_machine
+            .apply_committed_command(log_id(2, 1), sample_snapshot_commands()[0].clone())
+            .unwrap();
+        let before = state_machine.clone();
+
+        assert!(matches!(
+            state_machine
+                .apply_committed_command(log_id(1, 2), sample_snapshot_commands()[1].clone()),
+            Err(ControlPlaneError::ControlPlaneLogTermRegression {
+                previous_term: 2,
+                actual_term: 1,
+                index: 2,
+            })
+        ));
+        assert_eq!(state_machine, before);
+    }
+
+    #[test]
+    fn replicated_control_plane_state_machine_rejects_log_index_overflow_before_mutation() {
+        let mut state_machine =
+            ReplicatedControlPlaneStateMachine::new(sample_snapshot(), Some(log_id(1, u64::MAX)));
+        let before = state_machine.clone();
+
+        assert!(matches!(
+            state_machine.apply_committed_command(log_id(1, u64::MAX), follow_up_command()),
+            Err(ControlPlaneError::ControlPlaneLogIndexOverflow { index: u64::MAX })
+        ));
+        assert_eq!(state_machine, before);
+    }
+
+    #[test]
+    fn replicated_control_plane_state_machine_snapshot_install_continues_replay() {
+        let mut source = replay_sample_state_machine();
+        let artifact = source.build_snapshot_artifact().unwrap();
+        assert_eq!(artifact.last_applied(), Some(log_id(1, 3)));
+        assert_eq!(source.snapshot_last_applied(), Some(log_id(1, 3)));
+
+        let mut installed = ReplicatedControlPlaneStateMachine::empty();
+        installed.install_snapshot_artifact(artifact).unwrap();
+        assert_eq!(installed.snapshot(), source.snapshot());
+        assert_eq!(installed.last_applied(), Some(log_id(1, 3)));
+        assert_eq!(installed.snapshot_last_applied(), Some(log_id(1, 3)));
+
+        let command = follow_up_command();
+        let expected = source
+            .apply_committed_command(log_id(2, 4), command.clone())
+            .unwrap()
+            .into_applied()
+            .into_snapshot();
+        let actual = installed
+            .apply_committed_command(log_id(2, 4), command)
+            .unwrap()
+            .into_applied()
+            .into_snapshot();
+        assert_eq!(actual, expected);
+        assert_eq!(installed.last_applied(), Some(log_id(2, 4)));
+        assert_eq!(installed.snapshot_last_applied(), Some(log_id(1, 3)));
+    }
+
+    #[test]
+    fn replicated_control_plane_state_machine_accepts_current_and_forward_snapshot_install() {
+        let mut source = replay_sample_state_machine();
+        let artifact = source.build_snapshot_artifact().unwrap();
+
+        let mut installed = replay_sample_state_machine();
+        installed.install_snapshot_artifact(artifact).unwrap();
+        assert_eq!(installed.snapshot(), source.snapshot());
+        assert_eq!(installed.last_applied(), Some(log_id(1, 3)));
+        assert_eq!(installed.snapshot_last_applied(), Some(log_id(1, 3)));
+
+        source
+            .apply_committed_command(log_id(2, 4), follow_up_command())
+            .unwrap();
+        let artifact = source.build_snapshot_artifact().unwrap();
+        installed.install_snapshot_artifact(artifact).unwrap();
+        assert_eq!(installed.snapshot(), source.snapshot());
+        assert_eq!(installed.last_applied(), Some(log_id(2, 4)));
+        assert_eq!(installed.snapshot_last_applied(), Some(log_id(2, 4)));
+    }
+
+    #[test]
+    fn replicated_control_plane_state_machine_rejects_corrupt_snapshot_install_before_mutation() {
+        let mut source = replay_sample_state_machine();
+        let mut artifact = source.build_snapshot_artifact().unwrap();
+        let content_offset = CONTROL_PLANE_SNAPSHOT_MAGIC.len()
+            + std::mem::size_of::<u16>()
+            + std::mem::size_of::<u32>();
+        artifact.payload[content_offset] ^= 1;
+
+        let mut installed = replay_sample_state_machine();
+        let before = installed.clone();
+        assert!(matches!(
+            installed.install_snapshot_artifact(artifact),
+            Err(ControlPlaneError::SnapshotDecode { message })
+                if message.contains("control-plane snapshot checksum mismatch")
+        ));
+        assert_eq!(installed, before);
+    }
+
+    #[test]
+    fn replicated_control_plane_state_machine_rejects_stale_valid_snapshot_install_before_mutation()
+    {
+        let snapshot = sample_snapshot();
+        let payload = encode_control_plane_snapshot(&snapshot).unwrap();
+
+        let mut current = replay_sample_state_machine();
+        current
+            .apply_committed_command(log_id(2, 4), follow_up_command())
+            .unwrap();
+        let before = current.clone();
+        assert!(matches!(
+            current.install_snapshot_artifact(ControlPlaneSnapshotArtifact::new(
+                None,
+                payload.clone()
+            )),
+            Err(ControlPlaneError::ControlPlaneSnapshotMissingLogId { current_index: 4 })
+        ));
+        assert_eq!(current, before);
+
+        let before = current.clone();
+        assert!(matches!(
+            current.install_snapshot_artifact(ControlPlaneSnapshotArtifact::new(
+                Some(log_id(1, 3)),
+                payload.clone(),
+            )),
+            Err(ControlPlaneError::ControlPlaneSnapshotLogIndexRegression {
+                current_index: 4,
+                artifact_index: 3,
+            })
+        ));
+        assert_eq!(current, before);
+
+        let mut current =
+            ReplicatedControlPlaneStateMachine::new(snapshot.clone(), Some(log_id(2, 3)));
+        let before = current.clone();
+        assert!(matches!(
+            current.install_snapshot_artifact(ControlPlaneSnapshotArtifact::new(
+                Some(log_id(1, 3)),
+                payload.clone(),
+            )),
+            Err(ControlPlaneError::ControlPlaneSnapshotLogTermMismatch {
+                index: 3,
+                current_term: 2,
+                artifact_term: 1,
+            })
+        ));
+        assert_eq!(current, before);
+
+        let before = current.clone();
+        assert!(matches!(
+            current.install_snapshot_artifact(ControlPlaneSnapshotArtifact::new(
+                Some(log_id(1, 4)),
+                payload,
+            )),
+            Err(ControlPlaneError::ControlPlaneLogTermRegression {
+                previous_term: 2,
+                actual_term: 1,
+                index: 4,
+            })
+        ));
+        assert_eq!(current, before);
     }
 
     fn write_minimal_heartbeat_prefix(out: &mut Vec<u8>) {
