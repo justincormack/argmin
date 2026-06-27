@@ -807,6 +807,212 @@ impl ControlPlaneCommandStateMachine for ClusterControlSnapshot {
                     changed,
                 ))
             }
+            ControlPlaneCommand::RecordNodeHeartbeat {
+                heartbeat,
+                heartbeat_at_ms,
+                lease_deadline_ms,
+            } => {
+                if heartbeat.requested_lease_duration_ms == 0 {
+                    return Err(ControlPlaneError::InvalidLeaseDuration);
+                }
+                if heartbeat.requested_lease_duration_ms > MAX_HEARTBEAT_LEASE_MS {
+                    return Err(ControlPlaneError::LeaseDurationTooLong {
+                        requested_ms: heartbeat.requested_lease_duration_ms,
+                        max_ms: MAX_HEARTBEAT_LEASE_MS,
+                    });
+                }
+                // Commit heartbeat_at_ms so command replay is deterministic;
+                // replicated monotonic-clock authority is tracked in the
+                // Phase 12 plan.
+                let expected_lease_deadline_ms = heartbeat_at_ms
+                    .checked_add(heartbeat.requested_lease_duration_ms)
+                    .ok_or(ControlPlaneError::LeaseDeadlineOverflow)?;
+                if lease_deadline_ms != expected_lease_deadline_ms {
+                    return Err(ControlPlaneError::LeaseDeadlineMismatch {
+                        node_id: heartbeat.node_id.as_u32(),
+                        heartbeat_at_ms,
+                        requested_ms: heartbeat.requested_lease_duration_ms,
+                        expected_deadline_ms: expected_lease_deadline_ms,
+                        actual_deadline_ms: lease_deadline_ms,
+                    });
+                }
+                let current_epoch = self.cluster_epoch;
+                let record =
+                    self.nodes
+                        .get(&heartbeat.node_id)
+                        .ok_or(ControlPlaneError::UnknownNode {
+                            node_id: heartbeat.node_id.as_u32(),
+                        })?;
+                if matches!(
+                    record.membership,
+                    NodeMembershipState::Out | NodeMembershipState::Removed
+                ) {
+                    return Err(ControlPlaneError::NodeCannotReceiveLease {
+                        node_id: heartbeat.node_id.as_u32(),
+                        membership: record.membership,
+                    });
+                }
+                if heartbeat.node_incarnation < record.node_incarnation {
+                    return Err(ControlPlaneError::StaleNodeIncarnation {
+                        node_id: heartbeat.node_id.as_u32(),
+                        heartbeat_incarnation: heartbeat.node_incarnation,
+                        current_incarnation: record.node_incarnation,
+                    });
+                }
+                if heartbeat.observed_epoch > current_epoch {
+                    return Err(ControlPlaneError::FutureNodeObservedEpoch {
+                        node_id: heartbeat.node_id.as_u32(),
+                        observed_epoch: heartbeat.observed_epoch,
+                        current_epoch,
+                    });
+                }
+                if heartbeat.observed_epoch != current_epoch {
+                    validate_storage_cluster_map_history_floor_at_epoch(
+                        self,
+                        &heartbeat,
+                        current_epoch,
+                    )?;
+                    let mut next_snapshot = self.clone();
+                    let mut epoch_changed = false;
+                    let mut affected_node = None;
+                    {
+                        let record = next_snapshot
+                            .nodes
+                            .get_mut(&heartbeat.node_id)
+                            .expect("node record validated before heartbeat mutation");
+                        if heartbeat.node_incarnation > record.node_incarnation {
+                            record.node_incarnation = heartbeat.node_incarnation;
+                            epoch_changed = true;
+                            affected_node = Some(heartbeat.node_id);
+                        }
+                        if record.endpoint != heartbeat.endpoint {
+                            record.endpoint = heartbeat.endpoint;
+                            epoch_changed = true;
+                            affected_node = Some(heartbeat.node_id);
+                        }
+                        record.last_observed_epoch = Some(heartbeat.observed_epoch);
+                        record.last_heartbeat_ms = Some(heartbeat_at_ms);
+                        record.lease_deadline_ms = Some(lease_deadline_ms);
+                        record.cluster_map_history_floor_epoch = heartbeat
+                            .cluster_map_history_reference_summary
+                            .oldest_required_epoch();
+                        record.pg_observations.clear();
+                    }
+                    if epoch_changed {
+                        if let Some(node_id) = affected_node {
+                            mark_pgs_peering_for_nodes(&mut next_snapshot, [node_id]);
+                        }
+                        next_snapshot.bump_epoch()?;
+                    }
+                    return Ok(applied_control_plane_command(
+                        self,
+                        next_snapshot,
+                        ControlPlaneCommandResponse::RecordNodeHeartbeat,
+                        true,
+                    ));
+                }
+                validate_storage_cluster_map_history_floor(self, &heartbeat)?;
+                validate_pg_heartbeat_observations(
+                    self,
+                    heartbeat.node_id,
+                    &heartbeat.pg_observations,
+                )?;
+
+                let mut epoch_changed = false;
+                let mut affected_node = None;
+                let mut next_snapshot = self.clone();
+                {
+                    let record = next_snapshot
+                        .nodes
+                        .get_mut(&heartbeat.node_id)
+                        .expect("node record validated before heartbeat mutation");
+                    if heartbeat.node_incarnation > record.node_incarnation {
+                        record.node_incarnation = heartbeat.node_incarnation;
+                        epoch_changed = true;
+                        affected_node = Some(heartbeat.node_id);
+                    }
+                    if record.endpoint != heartbeat.endpoint {
+                        record.endpoint = heartbeat.endpoint;
+                        epoch_changed = true;
+                        affected_node = Some(heartbeat.node_id);
+                    }
+                    if record.availability != NodeAvailabilityState::Healthy {
+                        record.availability = NodeAvailabilityState::Healthy;
+                        epoch_changed = true;
+                        affected_node = Some(heartbeat.node_id);
+                    }
+                    record.last_observed_epoch = Some(heartbeat.observed_epoch);
+                    record.last_heartbeat_ms = Some(heartbeat_at_ms);
+                    record.lease_deadline_ms = Some(lease_deadline_ms);
+                    record.cluster_map_history_floor_epoch = heartbeat
+                        .cluster_map_history_reference_summary
+                        .oldest_required_epoch();
+                    record.pg_observations.clear();
+                    for observation in &heartbeat.pg_observations {
+                        record.pg_observations.insert(
+                            observation.pg_id,
+                            NodePgObservationRecord {
+                                pg_id: observation.pg_id,
+                                state: observation.state,
+                                observed_epoch: heartbeat.observed_epoch,
+                                observed_at_ms: heartbeat_at_ms,
+                                metadata_proof: observation.metadata_proof,
+                                has_pending_metadata_command: observation
+                                    .has_pending_metadata_command,
+                            },
+                        );
+                    }
+                }
+                for observation in &heartbeat.pg_observations {
+                    let Some(pg) = next_snapshot.pgs.get_mut(&observation.pg_id) else {
+                        continue;
+                    };
+                    // Preserve durable primary progress before this heartbeat fences the
+                    // primary into Peering; otherwise an imported transfer floor can
+                    // mask a later epoch-local proof after restart.
+                    let primary_restart_peering_observation = epoch_changed
+                        && affected_node == Some(heartbeat.node_id)
+                        && observation.state == PgState::Peering;
+                    if pg.state != PgState::Active
+                        || pg.active_primary != Some(heartbeat.node_id)
+                        || (observation.state != PgState::Active
+                            && !primary_restart_peering_observation)
+                        || observation.has_pending_metadata_command
+                    {
+                        continue;
+                    }
+                    let Some(current_proof) = pg.active_metadata_proof else {
+                        continue;
+                    };
+                    if observation.metadata_proof == current_proof {
+                        continue;
+                    }
+                    if metadata_proof_satisfies_active_primary_observation_floor(
+                        current_proof,
+                        observation.metadata_proof,
+                        pg.active_metadata_transfer_imported,
+                        pg.active_metadata_proof_epoch,
+                        heartbeat.observed_epoch,
+                    ) && observation.metadata_proof != current_proof
+                    {
+                        pg.active_metadata_proof = Some(observation.metadata_proof);
+                        pg.active_metadata_proof_epoch = Some(heartbeat.observed_epoch);
+                        pg.active_metadata_transfer_imported = false;
+                    }
+                }
+                if epoch_changed {
+                    if let Some(node_id) = affected_node {
+                        mark_pgs_peering_for_nodes(&mut next_snapshot, [node_id]);
+                    }
+                    next_snapshot.bump_epoch()?;
+                }
+                Ok(applied_control_plane_command(
+                    self,
+                    next_snapshot,
+                    ControlPlaneCommandResponse::RecordNodeHeartbeat,
+                    true,
+                ))
+            }
             ControlPlaneCommand::SetPgActingSet { pg_id, acting_set } => {
                 validate_acting_set(self, pg_id, &acting_set)?;
                 let mut next_snapshot = self.clone();
@@ -2685,187 +2891,25 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
         let lease_deadline_ms = authority_now_ms
             .checked_add(heartbeat.requested_lease_duration_ms)
             .ok_or(ControlPlaneError::LeaseDeadlineOverflow)?;
+        let observed_epoch = heartbeat.observed_epoch;
         let current_epoch = self.snapshot.cluster_epoch;
-
-        let record =
-            self.snapshot
-                .nodes
-                .get(&heartbeat.node_id)
-                .ok_or(ControlPlaneError::UnknownNode {
-                    node_id: heartbeat.node_id.as_u32(),
-                })?;
-        if matches!(
-            record.membership,
-            NodeMembershipState::Out | NodeMembershipState::Removed
-        ) {
-            return Err(ControlPlaneError::NodeCannotReceiveLease {
-                node_id: heartbeat.node_id.as_u32(),
-                membership: record.membership,
-            });
-        }
-        if heartbeat.node_incarnation < record.node_incarnation {
-            return Err(ControlPlaneError::StaleNodeIncarnation {
-                node_id: heartbeat.node_id.as_u32(),
-                heartbeat_incarnation: heartbeat.node_incarnation,
-                current_incarnation: record.node_incarnation,
-            });
-        }
-        if heartbeat.observed_epoch > current_epoch {
-            return Err(ControlPlaneError::FutureNodeObservedEpoch {
-                node_id: heartbeat.node_id.as_u32(),
-                observed_epoch: heartbeat.observed_epoch,
-                current_epoch,
-            });
-        }
-        if heartbeat.observed_epoch != current_epoch {
-            validate_storage_cluster_map_history_floor_at_epoch(
-                &self.snapshot,
-                &heartbeat,
-                current_epoch,
-            )?;
-            let mut next_snapshot = self.snapshot.clone();
-            let mut epoch_changed = false;
-            let mut affected_node = None;
-            {
-                let record = next_snapshot
-                    .nodes
-                    .get_mut(&heartbeat.node_id)
-                    .expect("node record validated before heartbeat mutation");
-                if heartbeat.node_incarnation > record.node_incarnation {
-                    record.node_incarnation = heartbeat.node_incarnation;
-                    epoch_changed = true;
-                    affected_node = Some(heartbeat.node_id);
-                }
-                if record.endpoint != heartbeat.endpoint {
-                    record.endpoint = heartbeat.endpoint;
-                    epoch_changed = true;
-                    affected_node = Some(heartbeat.node_id);
-                }
-                record.last_observed_epoch = Some(heartbeat.observed_epoch);
-                record.last_heartbeat_ms = Some(authority_now_ms);
-                record.lease_deadline_ms = Some(lease_deadline_ms);
-                record.cluster_map_history_floor_epoch = heartbeat
-                    .cluster_map_history_reference_summary
-                    .oldest_required_epoch();
-                record.pg_observations.clear();
-            }
-            if epoch_changed {
-                if let Some(node_id) = affected_node {
-                    mark_pgs_peering_for_nodes(&mut next_snapshot, [node_id]);
-                }
-                next_snapshot.bump_epoch()?;
-            }
-            self.commit_snapshot(next_snapshot)?;
-            return Ok(HeartbeatLease {
-                authority_incarnation: self.snapshot.authority_incarnation,
-                cluster_epoch: self.snapshot.cluster_epoch,
-                node_id: heartbeat.node_id,
+        let node_id = heartbeat.node_id;
+        self.apply_and_commit_command(
+            ControlPlaneCommand::RecordNodeHeartbeat {
+                heartbeat,
+                heartbeat_at_ms: authority_now_ms,
                 lease_deadline_ms,
-                serving: false,
-                snapshot: self.snapshot.clone(),
-            });
-        }
-        validate_storage_cluster_map_history_floor(&self.snapshot, &heartbeat)?;
-        validate_pg_heartbeat_observations(
-            &self.snapshot,
-            heartbeat.node_id,
-            &heartbeat.pg_observations,
+            },
+            authority_now_ms,
         )?;
-
-        let mut epoch_changed = false;
-        let mut affected_node = None;
-        let mut next_snapshot = self.snapshot.clone();
-        {
-            let record = next_snapshot
-                .nodes
-                .get_mut(&heartbeat.node_id)
-                .expect("node record validated before heartbeat mutation");
-            if heartbeat.node_incarnation > record.node_incarnation {
-                record.node_incarnation = heartbeat.node_incarnation;
-                epoch_changed = true;
-                affected_node = Some(heartbeat.node_id);
-            }
-            if record.endpoint != heartbeat.endpoint {
-                record.endpoint = heartbeat.endpoint;
-                epoch_changed = true;
-                affected_node = Some(heartbeat.node_id);
-            }
-            if record.availability != NodeAvailabilityState::Healthy {
-                record.availability = NodeAvailabilityState::Healthy;
-                epoch_changed = true;
-                affected_node = Some(heartbeat.node_id);
-            }
-            record.last_observed_epoch = Some(heartbeat.observed_epoch);
-            record.last_heartbeat_ms = Some(authority_now_ms);
-            record.lease_deadline_ms = Some(lease_deadline_ms);
-            record.cluster_map_history_floor_epoch = heartbeat
-                .cluster_map_history_reference_summary
-                .oldest_required_epoch();
-            record.pg_observations.clear();
-            for observation in &heartbeat.pg_observations {
-                record.pg_observations.insert(
-                    observation.pg_id,
-                    NodePgObservationRecord {
-                        pg_id: observation.pg_id,
-                        state: observation.state,
-                        observed_epoch: heartbeat.observed_epoch,
-                        observed_at_ms: authority_now_ms,
-                        metadata_proof: observation.metadata_proof,
-                        has_pending_metadata_command: observation.has_pending_metadata_command,
-                    },
-                );
-            }
-        }
-        for observation in &heartbeat.pg_observations {
-            let Some(pg) = next_snapshot.pgs.get_mut(&observation.pg_id) else {
-                continue;
-            };
-            // Preserve durable primary progress before this heartbeat fences the
-            // primary into Peering; otherwise an imported transfer floor can
-            // mask a later epoch-local proof after restart.
-            let primary_restart_peering_observation = epoch_changed
-                && affected_node == Some(heartbeat.node_id)
-                && observation.state == PgState::Peering;
-            if pg.state != PgState::Active
-                || pg.active_primary != Some(heartbeat.node_id)
-                || (observation.state != PgState::Active && !primary_restart_peering_observation)
-                || observation.has_pending_metadata_command
-            {
-                continue;
-            }
-            let Some(current_proof) = pg.active_metadata_proof else {
-                continue;
-            };
-            if observation.metadata_proof == current_proof {
-                continue;
-            }
-            if metadata_proof_satisfies_active_primary_observation_floor(
-                current_proof,
-                observation.metadata_proof,
-                pg.active_metadata_transfer_imported,
-                pg.active_metadata_proof_epoch,
-                heartbeat.observed_epoch,
-            ) && observation.metadata_proof != current_proof
-            {
-                pg.active_metadata_proof = Some(observation.metadata_proof);
-                pg.active_metadata_proof_epoch = Some(heartbeat.observed_epoch);
-                pg.active_metadata_transfer_imported = false;
-            }
-        }
-        if epoch_changed {
-            if let Some(node_id) = affected_node {
-                mark_pgs_peering_for_nodes(&mut next_snapshot, [node_id]);
-            }
-            next_snapshot.bump_epoch()?;
-        }
-        self.commit_snapshot(next_snapshot)?;
-        let serving = self.snapshot.node(heartbeat.node_id).is_some_and(|record| {
-            record.can_serve_primary(self.snapshot.cluster_epoch, authority_now_ms)
+        let serving = self.snapshot.node(node_id).is_some_and(|record| {
+            observed_epoch == current_epoch
+                && record.can_serve_primary(self.snapshot.cluster_epoch, authority_now_ms)
         });
         Ok(HeartbeatLease {
             authority_incarnation: self.snapshot.authority_incarnation,
             cluster_epoch: self.snapshot.cluster_epoch,
-            node_id: heartbeat.node_id,
+            node_id,
             lease_deadline_ms,
             serving,
             snapshot: self.snapshot.clone(),
@@ -4820,6 +4864,17 @@ pub enum ControlPlaneError {
 
     #[error("heartbeat lease deadline overflow")]
     LeaseDeadlineOverflow,
+
+    #[error(
+        "node {node_id} heartbeat lease deadline {actual_deadline_ms} does not match heartbeat time {heartbeat_at_ms} plus requested duration {requested_ms}ms; expected {expected_deadline_ms}"
+    )]
+    LeaseDeadlineMismatch {
+        node_id: u32,
+        heartbeat_at_ms: u64,
+        requested_ms: u64,
+        expected_deadline_ms: u64,
+        actual_deadline_ms: u64,
+    },
 
     #[error("cluster epoch overflow")]
     ClusterEpochOverflow,
@@ -6848,7 +6903,16 @@ mod tests {
         observed_epoch: ClusterEpoch,
         _now_ms: u64,
     ) -> NodeHeartbeat {
-        let record = authority.snapshot().node(NodeId::new(node_id)).unwrap();
+        heartbeat_from_snapshot(authority.snapshot(), node_id, observed_epoch, _now_ms)
+    }
+
+    fn heartbeat_from_snapshot(
+        snapshot: &ClusterControlSnapshot,
+        node_id: u32,
+        observed_epoch: ClusterEpoch,
+        _now_ms: u64,
+    ) -> NodeHeartbeat {
+        let record = snapshot.node(NodeId::new(node_id)).unwrap();
         let mut heartbeat = heartbeat(node_id, observed_epoch, _now_ms);
         heartbeat.node_incarnation = record.node_incarnation();
         heartbeat.endpoint = record.endpoint().to_owned();
@@ -6941,6 +7005,31 @@ mod tests {
         },
     }
 
+    #[derive(Debug, Clone, Copy)]
+    enum ControlPlaneHeartbeatCommandBoundaryOp {
+        Current {
+            node_slot: u8,
+            observation_kind: u8,
+            floor_kind: u8,
+            bump_incarnation: bool,
+            change_endpoint: bool,
+        },
+        Stale {
+            node_slot: u8,
+            stale_delta: u8,
+            bump_incarnation: bool,
+            change_endpoint: bool,
+            include_observation: bool,
+        },
+        Future {
+            node_slot: u8,
+            future_delta: u8,
+            bump_incarnation: bool,
+            change_endpoint: bool,
+            include_observation: bool,
+        },
+    }
+
     fn control_plane_heartbeat_model_op_strategy(
     ) -> impl Strategy<Value = ControlPlaneHeartbeatModelOp> {
         prop_oneof![
@@ -6984,6 +7073,69 @@ mod tests {
             2 => Just(ControlPlaneHeartbeatModelOp::CompleteReadyPeerings),
             2 => (1_u16..250).prop_map(
                 |advance_ms| ControlPlaneHeartbeatModelOp::ExpireLeases { advance_ms }
+            ),
+        ]
+    }
+
+    fn control_plane_heartbeat_command_boundary_op_strategy(
+    ) -> impl Strategy<Value = ControlPlaneHeartbeatCommandBoundaryOp> {
+        prop_oneof![
+            8 => (
+                0_u8..3,
+                0_u8..5,
+                0_u8..4,
+                any::<bool>(),
+                any::<bool>(),
+            ).prop_map(
+                |(
+                    node_slot,
+                    observation_kind,
+                    floor_kind,
+                    bump_incarnation,
+                    change_endpoint,
+                )| {
+                    ControlPlaneHeartbeatCommandBoundaryOp::Current {
+                        node_slot,
+                        observation_kind,
+                        floor_kind,
+                        bump_incarnation,
+                        change_endpoint,
+                    }
+                }
+            ),
+            3 => (0_u8..3, 1_u8..8, any::<bool>(), any::<bool>(), any::<bool>()).prop_map(
+                |(
+                    node_slot,
+                    stale_delta,
+                    bump_incarnation,
+                    change_endpoint,
+                    include_observation,
+                )| {
+                    ControlPlaneHeartbeatCommandBoundaryOp::Stale {
+                        node_slot,
+                        stale_delta,
+                        bump_incarnation,
+                        change_endpoint,
+                        include_observation,
+                    }
+                }
+            ),
+            2 => (0_u8..3, 1_u8..16, any::<bool>(), any::<bool>(), any::<bool>()).prop_map(
+                |(
+                    node_slot,
+                    future_delta,
+                    bump_incarnation,
+                    change_endpoint,
+                    include_observation,
+                )| {
+                    ControlPlaneHeartbeatCommandBoundaryOp::Future {
+                        node_slot,
+                        future_delta,
+                        bump_incarnation,
+                        change_endpoint,
+                        include_observation,
+                    }
+                }
             ),
         ]
     }
@@ -9482,6 +9634,8 @@ mod tests {
 
     #[test]
     fn control_plane_command_replay_matches_single_authority_snapshot() {
+        let bootstrap_epoch = ClusterEpoch::new(ClusterEpoch::INITIAL.get() + 1).unwrap();
+        let first_heartbeat_epoch = ClusterEpoch::new(ClusterEpoch::INITIAL.get() + 2).unwrap();
         let commands = vec![
             ControlPlaneCommand::BootstrapInitialClusterMap {
                 nodes: vec![
@@ -9489,6 +9643,39 @@ mod tests {
                     (NodeId::new(2), "/tmp/node-2.sock".to_owned()),
                 ],
                 pg_ids: vec![PgId::new(7)],
+            },
+            ControlPlaneCommand::RecordNodeHeartbeat {
+                heartbeat: NodeHeartbeat {
+                    node_id: NodeId::new(1),
+                    node_incarnation: 0,
+                    endpoint: "/tmp/node-1.sock".to_owned(),
+                    observed_epoch: bootstrap_epoch,
+                    requested_lease_duration_ms: 100,
+                    cluster_map_history_reference_summary:
+                        PgClusterMapHistoryReferenceSummary::default(),
+                    pg_observations: Vec::new(),
+                },
+                heartbeat_at_ms: 1_000,
+                lease_deadline_ms: 1_100,
+            },
+            ControlPlaneCommand::RecordNodeHeartbeat {
+                heartbeat: NodeHeartbeat {
+                    node_id: NodeId::new(1),
+                    node_incarnation: 0,
+                    endpoint: "/tmp/node-1.sock".to_owned(),
+                    observed_epoch: first_heartbeat_epoch,
+                    requested_lease_duration_ms: 100,
+                    cluster_map_history_reference_summary:
+                        PgClusterMapHistoryReferenceSummary::default(),
+                    pg_observations: vec![NodePgHeartbeatObservation {
+                        pg_id: PgId::new(7),
+                        state: PgState::Peering,
+                        metadata_proof: PgMetadataProof::empty(),
+                        has_pending_metadata_command: false,
+                    }],
+                },
+                heartbeat_at_ms: 1_100,
+                lease_deadline_ms: 1_200,
             },
             ControlPlaneCommand::SetPgActingSet {
                 pg_id: PgId::new(7),
@@ -9527,9 +9714,217 @@ mod tests {
         assert_eq!(&replayed, authority.snapshot());
         assert_eq!(
             replayed.cluster_epoch(),
-            ClusterEpoch::new(ClusterEpoch::INITIAL.get() + 5).unwrap()
+            ClusterEpoch::new(ClusterEpoch::INITIAL.get() + 6).unwrap()
         );
-        assert_eq!(replayed.cluster_map_history().len(), 5);
+        assert_eq!(replayed.cluster_map_history().len(), 6);
+    }
+
+    #[test]
+    fn record_node_heartbeat_command_records_current_epoch_pg_observation() {
+        let tmp = test_util::tempdir();
+        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+        authority
+            .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
+            .unwrap();
+        assert!(heartbeat_until_serving(&mut authority, 1, 1_000).serving());
+        authority
+            .set_pg_acting_set(PgId::new(7), vec![NodeId::new(1)])
+            .unwrap();
+
+        let observed_epoch = authority.snapshot().cluster_epoch();
+        let metadata_proof = PgMetadataProof::new(7, 8, 9);
+        let mut heartbeat = heartbeat_from_record(&authority, 1, observed_epoch, 2_000);
+        heartbeat.pg_observations = vec![NodePgHeartbeatObservation {
+            pg_id: PgId::new(7),
+            state: PgState::Peering,
+            metadata_proof,
+            has_pending_metadata_command: false,
+        }];
+        let before = authority.snapshot().clone();
+        let applied = before
+            .apply_control_plane_command(
+                ControlPlaneCommand::RecordNodeHeartbeat {
+                    heartbeat,
+                    heartbeat_at_ms: 2_000,
+                    lease_deadline_ms: 2_100,
+                },
+                9_999,
+            )
+            .unwrap();
+
+        assert!(applied.changed());
+        assert_eq!(
+            applied.response(),
+            ControlPlaneCommandResponse::RecordNodeHeartbeat
+        );
+        let snapshot = applied.snapshot();
+        assert_eq!(snapshot.cluster_epoch(), before.cluster_epoch());
+        let record = snapshot.node(NodeId::new(1)).unwrap();
+        assert_eq!(record.last_observed_epoch(), Some(observed_epoch));
+        assert_eq!(record.last_heartbeat_ms(), Some(2_000));
+        assert_eq!(record.lease_deadline_ms(), Some(2_100));
+        let observation = record.pg_observation(PgId::new(7)).unwrap();
+        assert_eq!(observation.state(), PgState::Peering);
+        assert_eq!(observation.observed_epoch(), observed_epoch);
+        assert_eq!(observation.observed_at_ms(), 2_000);
+        assert_eq!(observation.metadata_proof(), metadata_proof);
+        assert!(!observation.has_pending_metadata_command());
+    }
+
+    #[test]
+    fn record_node_heartbeat_command_stale_epoch_clears_pg_observations() {
+        let tmp = test_util::tempdir();
+        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+        authority
+            .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
+            .unwrap();
+        assert!(heartbeat_until_serving(&mut authority, 1, 1_000).serving());
+        authority
+            .set_pg_acting_set(PgId::new(8), vec![NodeId::new(1)])
+            .unwrap();
+
+        let current_epoch = authority.snapshot().cluster_epoch();
+        let stale_epoch = ClusterEpoch::new(current_epoch.get() - 1).unwrap();
+        let mut heartbeat = heartbeat_from_record(&authority, 1, stale_epoch, 2_000);
+        heartbeat.pg_observations = vec![NodePgHeartbeatObservation {
+            pg_id: PgId::new(8),
+            state: PgState::Active,
+            metadata_proof: PgMetadataProof::empty(),
+            has_pending_metadata_command: false,
+        }];
+        let before = authority.snapshot().clone();
+        let applied = before
+            .apply_control_plane_command(
+                ControlPlaneCommand::RecordNodeHeartbeat {
+                    heartbeat,
+                    heartbeat_at_ms: 2_000,
+                    lease_deadline_ms: 2_100,
+                },
+                9_999,
+            )
+            .unwrap();
+
+        let snapshot = applied.snapshot();
+        assert!(applied.changed());
+        assert_eq!(snapshot.cluster_epoch(), before.cluster_epoch());
+        let record = snapshot.node(NodeId::new(1)).unwrap();
+        assert_eq!(record.last_observed_epoch(), Some(stale_epoch));
+        assert_eq!(record.last_heartbeat_ms(), Some(2_000));
+        assert_eq!(record.lease_deadline_ms(), Some(2_100));
+        assert!(record.pg_observation(PgId::new(8)).is_none());
+    }
+
+    #[test]
+    fn record_node_heartbeat_command_rejects_invalid_storage_floor_without_mutation() {
+        let tmp = test_util::tempdir();
+        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+        authority
+            .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
+            .unwrap();
+        assert!(heartbeat_until_serving(&mut authority, 1, 1_000).serving());
+
+        let current_epoch = authority.snapshot().cluster_epoch();
+        let future_epoch = ClusterEpoch::new(current_epoch.get() + 1).unwrap();
+        let mut heartbeat = heartbeat_from_record(&authority, 1, current_epoch, 2_000);
+        heartbeat.cluster_map_history_reference_summary = PgClusterMapHistoryReferenceSummary {
+            oldest_live_placement_epoch: Some(future_epoch),
+            oldest_durable_backfill_epoch: None,
+        };
+        let before = authority.snapshot().clone();
+        let error = before
+            .apply_control_plane_command(
+                ControlPlaneCommand::RecordNodeHeartbeat {
+                    heartbeat,
+                    heartbeat_at_ms: 2_000,
+                    lease_deadline_ms: 2_100,
+                },
+                9_999,
+            )
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ControlPlaneError::StorageClusterMapHistoryFloorInFuture {
+                node_id: 1,
+                floor_epoch,
+                observed_epoch,
+            } if floor_epoch == future_epoch && observed_epoch == current_epoch
+        ));
+        assert_eq!(
+            before
+                .node(NodeId::new(1))
+                .unwrap()
+                .cluster_map_history_floor_epoch(),
+            None
+        );
+        assert_eq!(before.cluster_epoch(), current_epoch);
+    }
+
+    #[test]
+    fn record_node_heartbeat_command_validates_committed_lease_deadline() {
+        let tmp = test_util::tempdir();
+        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+        authority
+            .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
+            .unwrap();
+        assert!(heartbeat_until_serving(&mut authority, 1, 1_000).serving());
+
+        let current_epoch = authority.snapshot().cluster_epoch();
+        let before = authority.snapshot().clone();
+        let mut zero_duration = heartbeat_from_record(&authority, 1, current_epoch, 2_000);
+        zero_duration.requested_lease_duration_ms = 0;
+        assert!(matches!(
+            before.apply_control_plane_command(
+                ControlPlaneCommand::RecordNodeHeartbeat {
+                    heartbeat: zero_duration,
+                    heartbeat_at_ms: 2_000,
+                    lease_deadline_ms: 2_000,
+                },
+                9_999,
+            ),
+            Err(ControlPlaneError::InvalidLeaseDuration)
+        ));
+
+        let mut overlong_duration = heartbeat_from_record(&authority, 1, current_epoch, 2_001);
+        overlong_duration.requested_lease_duration_ms = MAX_HEARTBEAT_LEASE_MS + 1;
+        assert!(matches!(
+            before.apply_control_plane_command(
+                ControlPlaneCommand::RecordNodeHeartbeat {
+                    heartbeat: overlong_duration,
+                    heartbeat_at_ms: 2_001,
+                    lease_deadline_ms: 2_001 + MAX_HEARTBEAT_LEASE_MS + 1,
+                },
+                9_999,
+            ),
+            Err(ControlPlaneError::LeaseDurationTooLong {
+                requested_ms,
+                max_ms,
+            }) if requested_ms == MAX_HEARTBEAT_LEASE_MS + 1
+                && max_ms == MAX_HEARTBEAT_LEASE_MS
+        ));
+
+        let heartbeat = heartbeat_from_record(&authority, 1, current_epoch, 2_002);
+        assert!(matches!(
+            before.apply_control_plane_command(
+                ControlPlaneCommand::RecordNodeHeartbeat {
+                    heartbeat,
+                    heartbeat_at_ms: 2_002,
+                    lease_deadline_ms: 2_200,
+                },
+                9_999,
+            ),
+            Err(ControlPlaneError::LeaseDeadlineMismatch {
+                node_id: 1,
+                heartbeat_at_ms: 2_002,
+                requested_ms: 100,
+                expected_deadline_ms: 2_102,
+                actual_deadline_ms: 2_200,
+            })
+        ));
     }
 
     #[test]
@@ -13461,6 +13856,199 @@ mod tests {
             max_shrink_iters: 256,
             ..ProptestConfig::default()
         })]
+
+        #[test]
+        fn prop_record_node_heartbeat_command_matches_single_authority(
+            ops in proptest::collection::vec(
+                control_plane_heartbeat_command_boundary_op_strategy(),
+                1..48,
+            ),
+        ) {
+            let tmp = test_util::tempdir();
+            let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+            let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+            for node_id in [1, 2, 3] {
+                authority
+                    .set_node_membership(NodeId::new(node_id), NodeMembershipState::Active)
+                    .unwrap();
+                assert!(heartbeat_until_serving(&mut authority, node_id, 1_000 + u64::from(node_id)).serving());
+            }
+            authority
+                .set_pg_acting_set(heartbeat_model_pg_id(), vec![NodeId::new(1), NodeId::new(2)])
+                .unwrap();
+            let initial_proof = heartbeat_model_proof(9);
+            heartbeat_with_pg_proof(
+                &mut authority,
+                1,
+                heartbeat_model_pg_id().get(),
+                PgState::Peering,
+                initial_proof,
+                false,
+                2_000,
+            );
+            heartbeat_with_pg_proof(
+                &mut authority,
+                2,
+                heartbeat_model_pg_id().get(),
+                PgState::Peering,
+                initial_proof,
+                false,
+                2_001,
+            );
+            authority.complete_ready_pg_peerings(2_002).unwrap();
+            let active_epoch = authority.snapshot().cluster_epoch();
+            let mut active_primary_heartbeat =
+                heartbeat_from_record(&authority, 1, active_epoch, 2_003);
+            active_primary_heartbeat.pg_observations = vec![NodePgHeartbeatObservation {
+                pg_id: heartbeat_model_pg_id(),
+                state: PgState::Active,
+                metadata_proof: initial_proof,
+                has_pending_metadata_command: false,
+            }];
+            authority.heartbeat(active_primary_heartbeat, 2_003).unwrap();
+
+            let mut replayed = authority.snapshot().clone();
+            let mut now_ms = 3_000_u64;
+
+            for op in ops {
+                now_ms = now_ms.saturating_add(10);
+                let heartbeat = match op {
+                    ControlPlaneHeartbeatCommandBoundaryOp::Current {
+                        node_slot,
+                        observation_kind,
+                        floor_kind,
+                        bump_incarnation,
+                        change_endpoint,
+                    } => {
+                        let node_id = heartbeat_model_node_id(node_slot);
+                        let mut heartbeat = heartbeat_from_snapshot(
+                            &replayed,
+                            node_id,
+                            replayed.cluster_epoch(),
+                            now_ms,
+                        );
+                        if bump_incarnation {
+                            heartbeat.node_incarnation =
+                                heartbeat.node_incarnation.saturating_add(1);
+                        }
+                        if change_endpoint {
+                            heartbeat.endpoint =
+                                format!("boundary-current-node-{node_id}-{now_ms}.sock");
+                        }
+                        heartbeat.pg_observations =
+                            heartbeat_model_observation(&replayed, node_id, observation_kind);
+                        heartbeat.cluster_map_history_reference_summary =
+                            heartbeat_model_floor_summary(&replayed, floor_kind);
+                        heartbeat
+                    }
+                    ControlPlaneHeartbeatCommandBoundaryOp::Stale {
+                        node_slot,
+                        stale_delta,
+                        bump_incarnation,
+                        change_endpoint,
+                        include_observation,
+                    } => {
+                        let node_id = heartbeat_model_node_id(node_slot);
+                        let current_raw_epoch = replayed.cluster_epoch().get();
+                        let stale_raw_epoch = current_raw_epoch
+                            .saturating_sub(u64::from(stale_delta))
+                            .max(ClusterEpoch::INITIAL.get());
+                        let stale_epoch = ClusterEpoch::new(stale_raw_epoch).unwrap();
+                        let mut heartbeat =
+                            heartbeat_from_snapshot(&replayed, node_id, stale_epoch, now_ms);
+                        if bump_incarnation {
+                            heartbeat.node_incarnation =
+                                heartbeat.node_incarnation.saturating_add(1);
+                        }
+                        if change_endpoint {
+                            heartbeat.endpoint =
+                                format!("boundary-stale-node-{node_id}-{now_ms}.sock");
+                        }
+                        if include_observation {
+                            heartbeat.pg_observations =
+                                heartbeat_model_observation(&replayed, node_id, 3);
+                        }
+                        heartbeat
+                    }
+                    ControlPlaneHeartbeatCommandBoundaryOp::Future {
+                        node_slot,
+                        future_delta,
+                        bump_incarnation,
+                        change_endpoint,
+                        include_observation,
+                    } => {
+                        let node_id = heartbeat_model_node_id(node_slot);
+                        let future_epoch = ClusterEpoch::new(
+                            replayed.cluster_epoch().get() + u64::from(future_delta),
+                        )
+                        .unwrap();
+                        let mut heartbeat =
+                            heartbeat_from_snapshot(&replayed, node_id, future_epoch, now_ms);
+                        if bump_incarnation {
+                            heartbeat.node_incarnation =
+                                heartbeat.node_incarnation.saturating_add(1);
+                        }
+                        if change_endpoint {
+                            heartbeat.endpoint =
+                                format!("boundary-future-node-{node_id}-{now_ms}.sock");
+                        }
+                        if include_observation {
+                            heartbeat.pg_observations =
+                                heartbeat_model_observation(&replayed, node_id, 4);
+                        }
+                        heartbeat
+                    }
+                };
+
+                let lease_deadline_ms = now_ms + heartbeat.requested_lease_duration_ms;
+                let before_replayed = replayed.clone();
+                let before_authority = authority.snapshot().clone();
+                let replay_result = replayed.apply_control_plane_command(
+                    ControlPlaneCommand::RecordNodeHeartbeat {
+                        heartbeat: heartbeat.clone(),
+                        heartbeat_at_ms: now_ms,
+                        lease_deadline_ms,
+                    },
+                    now_ms.saturating_add(1_000_000),
+                );
+                let authority_result = authority.heartbeat(heartbeat, now_ms);
+
+                match (replay_result, authority_result) {
+                    (Ok(applied), Ok(_lease)) => {
+                        replayed = applied.into_snapshot();
+                        prop_assert_eq!(
+                            &replayed,
+                            authority.snapshot(),
+                            "direct heartbeat command replay must match single-authority heartbeat"
+                        );
+                    }
+                    (Err(_), Err(_)) => {
+                        prop_assert_eq!(
+                            &replayed,
+                            &before_replayed,
+                            "rejected direct heartbeat command must not mutate replay snapshot"
+                        );
+                        prop_assert_eq!(
+                            authority.snapshot(),
+                            &before_authority,
+                            "rejected single-authority heartbeat must not mutate snapshot"
+                        );
+                    }
+                    (Ok(_), Err(error)) => {
+                        prop_assert!(
+                            false,
+                            "direct heartbeat command accepted but single-authority rejected: {error:?}"
+                        );
+                    }
+                    (Err(error), Ok(_)) => {
+                        prop_assert!(
+                            false,
+                            "single-authority heartbeat accepted but direct command rejected: {error:?}"
+                        );
+                    }
+                }
+            }
+        }
 
         #[test]
         fn prop_control_plane_epoch_heartbeat_model_preserves_invariants(

@@ -9082,6 +9082,11 @@ Phase 12.1 starting slice:
    - lease-read/read-index freshness, storage-node heartbeat lease deadlines,
      frontend runtime-map freshness, and metadata-transfer source lease waits
      must state their clock-skew assumptions and restart behavior explicitly;
+   - `RecordNodeHeartbeat` currently commits `heartbeat_at_ms` and
+     `lease_deadline_ms` for deterministic replay and validates their internal
+     relationship. Phase 12 must still define how a replicated leader chooses
+     and bounds `heartbeat_at_ms` across leader changes, restarts, clock jumps,
+     and stale lease-read/read-index publication;
    - after control-plane restart or leader change, any leader-local lease state
      that is not committed must be treated as expired until re-established
      through the consensus protocol;

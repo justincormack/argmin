@@ -1,6 +1,6 @@
 use crate::control_plane::{
-    ClusterControlSnapshot, ControlPlaneError, NodeAvailabilityState, NodeMembershipState,
-    PgMetadataProof, PgMetadataTransferProof,
+    ClusterControlSnapshot, ControlPlaneError, NodeAvailabilityState, NodeHeartbeat,
+    NodeMembershipState, PgMetadataProof, PgMetadataTransferProof,
 };
 use crate::types::{PgId, PgState};
 use crate::ClusterEpoch;
@@ -19,6 +19,11 @@ pub enum ControlPlaneCommand {
     MarkNodeAvailability {
         node_id: NodeId,
         availability: NodeAvailabilityState,
+    },
+    RecordNodeHeartbeat {
+        heartbeat: NodeHeartbeat,
+        heartbeat_at_ms: u64,
+        lease_deadline_ms: u64,
     },
     SetPgActingSet {
         pg_id: PgId,
@@ -60,6 +65,7 @@ pub enum ControlPlaneCommandResponse {
     BootstrapInitialClusterMap,
     SetNodeMembership,
     MarkNodeAvailability,
+    RecordNodeHeartbeat,
     SetPgActingSet,
     SetPgActingSetWithMetadataTransfer,
     FencePgForMetadataTransfer {
