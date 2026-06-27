@@ -2540,6 +2540,20 @@ pub trait ControlPlaneRuntimeMapSource {
     ) -> Result<ClusterRuntimeMapSnapshot, ControlPlaneError>;
 }
 
+pub trait ControlPlaneLinearizedCommandSink {
+    fn submit_control_plane_command(
+        &mut self,
+        command: ControlPlaneCommand,
+    ) -> Result<AppliedControlPlaneCommand, ControlPlaneError>;
+}
+
+pub trait ControlPlaneLinearizedRuntimeMapSource {
+    fn linearized_runtime_map_snapshot(
+        &self,
+        authority_now_ms: u64,
+    ) -> Result<ClusterRuntimeMapSnapshot, ControlPlaneError>;
+}
+
 #[derive(Debug, Clone)]
 pub struct FencedPgMetadataTransferSnapshot {
     snapshot: ClusterControlSnapshot,
@@ -3465,6 +3479,26 @@ impl<S: ControlPlaneStore> ControlPlaneRuntimeMapSource for SingleAuthorityContr
     }
 }
 
+impl<S: ControlPlaneStore> ControlPlaneLinearizedCommandSink for SingleAuthorityControlPlane<S> {
+    fn submit_control_plane_command(
+        &mut self,
+        command: ControlPlaneCommand,
+    ) -> Result<AppliedControlPlaneCommand, ControlPlaneError> {
+        self.apply_and_commit_command(command)
+    }
+}
+
+impl<S: ControlPlaneStore> ControlPlaneLinearizedRuntimeMapSource
+    for SingleAuthorityControlPlane<S>
+{
+    fn linearized_runtime_map_snapshot(
+        &self,
+        authority_now_ms: u64,
+    ) -> Result<ClusterRuntimeMapSnapshot, ControlPlaneError> {
+        self.runtime_map_snapshot(authority_now_ms)
+    }
+}
+
 impl<S: ControlPlaneStore> ControlPlaneAdmin for SingleAuthorityControlPlane<S> {
     fn set_pg_acting_set(
         &mut self,
@@ -3714,6 +3748,15 @@ impl ControlPlaneRuntimeMapSource for UnixControlPlaneClient {
         let runtime_map = read_runtime_map_snapshot(&mut reader)?;
         reader.finish()?;
         Ok(runtime_map)
+    }
+}
+
+impl ControlPlaneLinearizedRuntimeMapSource for UnixControlPlaneClient {
+    fn linearized_runtime_map_snapshot(
+        &self,
+        authority_now_ms: u64,
+    ) -> Result<ClusterRuntimeMapSnapshot, ControlPlaneError> {
+        self.runtime_map_snapshot(authority_now_ms)
     }
 }
 
@@ -10176,6 +10219,60 @@ mod tests {
             ClusterEpoch::new(ClusterEpoch::INITIAL.get() + 7).unwrap()
         );
         assert_eq!(replayed.cluster_map_history().len(), 7);
+    }
+
+    #[test]
+    fn single_authority_linearized_command_sink_persists_submitted_command() {
+        let tmp = test_util::tempdir();
+        let state_path = tmp.path().join("control-plane.state");
+        let store = FileControlPlaneStore::new(state_path.clone());
+        let mut authority = SingleAuthorityControlPlane::open(store.clone()).unwrap();
+
+        let applied = ControlPlaneLinearizedCommandSink::submit_control_plane_command(
+            &mut authority,
+            ControlPlaneCommand::SetNodeMembership {
+                node_id: NodeId::new(1),
+                membership: NodeMembershipState::Active,
+            },
+        )
+        .unwrap();
+
+        assert!(applied.changed());
+        assert_eq!(
+            applied.response(),
+            &ControlPlaneCommandResponse::SetNodeMembership
+        );
+        assert_eq!(applied.snapshot(), authority.snapshot());
+        assert_eq!(
+            authority
+                .snapshot()
+                .node(NodeId::new(1))
+                .unwrap()
+                .membership(),
+            NodeMembershipState::Active
+        );
+        assert_eq!(store.load().unwrap().unwrap(), *authority.snapshot());
+        assert!(std::fs::metadata(state_path).unwrap().is_file());
+    }
+
+    #[test]
+    fn single_authority_linearized_runtime_map_read_carries_freshness_proof() {
+        let tmp = test_util::tempdir();
+        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let authority = SingleAuthorityControlPlane::open(store).unwrap();
+
+        let runtime_map = ControlPlaneLinearizedRuntimeMapSource::linearized_runtime_map_snapshot(
+            &authority, 12_345,
+        )
+        .unwrap();
+
+        assert_eq!(
+            runtime_map.freshness_proof(),
+            &RuntimeMapFreshnessProof::SingleAuthority {
+                authority_incarnation: authority.snapshot().authority_incarnation(),
+                issued_at_ms: 12_345,
+            }
+        );
     }
 
     #[test]

@@ -9027,6 +9027,14 @@ Phase 12.1 progress:
   Phase 11 runtime-map path working while giving the OpenRaft read-index or
   lease-read integration a concrete field to populate with term/index/freshness
   semantics later.
+- Added a low-level linearized authority interface split for the next
+  integration layer. `ControlPlaneLinearizedCommandSink` submits already-built
+  durable `ControlPlaneCommand` values and
+  `ControlPlaneLinearizedRuntimeMapSource` names the serving runtime-map read
+  path that must later be backed by OpenRaft read-index or lease-read
+  freshness. The current single-authority implementation satisfies both traits
+  and has focused tests for command persistence and freshness-proof reads,
+  while existing Phase 11 operation-level traits remain unchanged.
 
 1. define the replicated control-plane state machine:
    - state includes cluster epoch, PG count, PG state, PG acting sets, node
