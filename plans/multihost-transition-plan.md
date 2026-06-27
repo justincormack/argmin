@@ -9076,6 +9076,21 @@ Phase 12.1 progress:
   between OpenRaft log ids and `ControlPlaneLogId`, including rejection of
   reserved zero term/index values. This is intentionally type/log-id wiring
   only; no production control-plane path is served through OpenRaft yet.
+- Added the first in-memory OpenRaft state-machine wrapper around the
+  dependency-free replicated adapter. It applies OpenRaft blank and membership
+  entries as committed no-ops that advance `last_applied`, applies normal
+  `ControlPlaneCommand` entries through the deterministic command boundary,
+  maps semantic rejections into the application response instead of an apply
+  error, and builds/installs cursor-backed snapshots while preserving the full
+  OpenRaft log id and membership metadata. Snapshot metadata generation fails
+  closed if the CRC-protected artifact's `ControlPlaneLogId` cannot be matched
+  to the wrapper's full OpenRaft `(term,node_id,index)` log id, avoiding a fake
+  leader node id. Snapshot install validates rollback and same-position
+  conflicts against the full OpenRaft log id before mutating state, and rejects
+  snapshot membership metadata that is invalid, future, or not included in the
+  installed snapshot's last log id. This wrapper is still test-only integration
+  scaffolding; it does not yet implement OpenRaft's async `RaftStateMachine`
+  trait or serve any production control-plane path.
 
 1. define the replicated control-plane state machine:
    - state includes cluster epoch, PG count, PG state, PG acting sets, node
@@ -9114,8 +9129,9 @@ Phase 12.1 progress:
      becomes too opinionated;
    - initial OpenRaft spike target: `openraft 0.10.0-alpha.26`, pinned exactly,
      with default features disabled and only the required async runtime feature
-     enabled. Adding this dependency still needs an explicit production
-     dependency decision before changing `Cargo.toml`;
+     enabled. The dependency has been added to the storage crate for the Phase
+     12 spike after an explicit production-dependency decision, but no on-disk
+     OpenRaft storage format is committed yet;
    - use OpenRaft's application-data hooks for `ControlPlaneCommand` and an
      application response that can represent both applied and deterministic
      rejected command outcomes. Do not propagate deterministic command rejection

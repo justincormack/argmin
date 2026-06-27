@@ -752,6 +752,15 @@ impl ReplicatedControlPlaneStateMachine {
         }
     }
 
+    pub fn apply_committed_noop(
+        &mut self,
+        log_id: ControlPlaneLogId,
+    ) -> Result<(), ControlPlaneError> {
+        self.validate_next_log_id(log_id)?;
+        self.last_applied = Some(log_id);
+        Ok(())
+    }
+
     pub fn build_snapshot_artifact(
         &mut self,
     ) -> Result<ControlPlaneSnapshotArtifact, ControlPlaneError> {
