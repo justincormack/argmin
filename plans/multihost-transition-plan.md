@@ -9068,6 +9068,14 @@ Phase 12.1 progress:
   startup gate, because OpenRaft documents that a transient state machine can
   otherwise restart behind a previously observed committed read until recovery
   catches up.
+- Added the first compile-time OpenRaft bridge in the storage crate. The bridge
+  declares the control-plane Raft type config using `ControlPlaneCommand` as
+  application data, a response type that can represent applied or deterministic
+  rejected outcomes, OpenRaft's `BasicNode`, advanced `(term,node_id)` leader
+  ids, and cursor-backed snapshot data. It also pins explicit conversions
+  between OpenRaft log ids and `ControlPlaneLogId`, including rejection of
+  reserved zero term/index values. This is intentionally type/log-id wiring
+  only; no production control-plane path is served through OpenRaft yet.
 
 1. define the replicated control-plane state machine:
    - state includes cluster epoch, PG count, PG state, PG acting sets, node

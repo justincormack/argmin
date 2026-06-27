@@ -69,6 +69,93 @@ pub enum ControlPlaneCommand {
     },
 }
 
+impl std::fmt::Display for ControlPlaneCommand {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ControlPlaneCommand::BootstrapInitialClusterMap { nodes, pg_ids } => write!(
+                f,
+                "bootstrap-initial-cluster-map(nodes={},pgs={})",
+                nodes.len(),
+                pg_ids.len()
+            ),
+            ControlPlaneCommand::SetNodeMembership {
+                node_id,
+                membership,
+            } => write!(
+                f,
+                "set-node-membership(node={},membership={:?})",
+                node_id.as_u32(),
+                membership
+            ),
+            ControlPlaneCommand::MarkNodeAvailability {
+                node_id,
+                availability,
+            } => write!(
+                f,
+                "mark-node-availability(node={},availability={:?})",
+                node_id.as_u32(),
+                availability
+            ),
+            ControlPlaneCommand::RecordNodeHeartbeat {
+                heartbeat,
+                heartbeat_at_ms,
+                lease_deadline_ms,
+            } => write!(
+                f,
+                "record-node-heartbeat(node={},heartbeat_at_ms={},lease_deadline_ms={})",
+                heartbeat.node_id.as_u32(),
+                heartbeat_at_ms,
+                lease_deadline_ms
+            ),
+            ControlPlaneCommand::ExpireHeartbeatLeases { expire_at_ms } => {
+                write!(f, "expire-heartbeat-leases(expire_at_ms={expire_at_ms})")
+            }
+            ControlPlaneCommand::SetPgActingSet { pg_id, acting_set } => write!(
+                f,
+                "set-pg-acting-set(pg={},nodes={})",
+                pg_id.get(),
+                acting_set.len()
+            ),
+            ControlPlaneCommand::SetPgActingSetWithMetadataTransfer {
+                pg_id,
+                acting_set,
+                transfer,
+            } => write!(
+                f,
+                "set-pg-acting-set-with-metadata-transfer(pg={},nodes={},source_epoch={})",
+                pg_id.get(),
+                acting_set.len(),
+                transfer.source_epoch().get()
+            ),
+            ControlPlaneCommand::FencePgForMetadataTransfer { pg_id } => {
+                write!(f, "fence-pg-for-metadata-transfer(pg={})", pg_id.get())
+            }
+            ControlPlaneCommand::SetPgState { pg_id, state } => {
+                write!(f, "set-pg-state(pg={},state={state:?})", pg_id.get())
+            }
+            ControlPlaneCommand::CompletePgPeering {
+                pg_id,
+                primary,
+                node_incarnation,
+                complete_at_ms,
+            } => write!(
+                f,
+                "complete-pg-peering(pg={},primary={},incarnation={},complete_at_ms={})",
+                pg_id.get(),
+                primary.as_u32(),
+                node_incarnation,
+                complete_at_ms
+            ),
+            ControlPlaneCommand::CompleteReadyPgPeerings { ready_at_ms, ready } => write!(
+                f,
+                "complete-ready-pg-peerings(ready_at_ms={},pgs={})",
+                ready_at_ms,
+                ready.len()
+            ),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReadyPgPeeringCompletion {
     pub pg_id: PgId,
