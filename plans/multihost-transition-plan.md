@@ -8928,10 +8928,14 @@ Exit criteria:
 
 ## Phase 12: Replicated Control Plane
 
-Replace the static in-memory control plane with a real replicated control plane.
+Replace the Phase 11 single-authority, file-backed control-plane manager with a
+real replicated control plane. Phase 11 already established the state shape,
+fencing rules, runtime-map publication path, retained history, metadata-transfer
+markers, and storage-node heartbeat contract. Phase 12 should preserve those
+semantics while making the authority itself replicated and linearizable.
 
 Because bucket metadata is now PG-sharded, this control plane should remain
-small. Its initial scope should be:
+small. Its initial authoritative scope should be:
 
 1. cluster map
 2. node membership
@@ -8943,13 +8947,180 @@ small. Its initial scope should be:
 Bucket rows should not move back into the global service unless there is a
 separate design decision to reverse the bucket-metadata-sharding model.
 
+Detailed work items:
+
+1. define the replicated control-plane state machine:
+   - state includes cluster epoch, PG count, PG state, PG acting sets, node
+     membership, node incarnation/endpoint/liveness metadata, retained
+     cluster-map history, storage-owned history floors, metadata-transfer
+     markers/fences, and source lease deadlines;
+   - commands include node membership changes, acting-set changes, peering
+     completion, metadata-transfer fence/install, history pruning, and
+     bootstrap/admin operations;
+   - heartbeat/liveness updates should not automatically become full replicated
+     log entries for every refresh. The first design should make durable
+     membership, incarnation, endpoint, and PG proof/floor changes linearized
+     state-machine updates, while allowing high-frequency lease renewal to be
+     leader-local derived state only when it is bounded by a committed term,
+     read-index/lease proof, monotonic-clock assumptions, and explicit
+     fail-closed restart behavior;
+   - bucket and object metadata remain in PG-sharded metadata stores.
+2. split the authority interface from implementation:
+   - keep the Phase 11 single-authority API semantics as the contract;
+   - introduce a linearized command/read trait boundary that the existing
+     single-authority implementation and the new replicated implementation can
+     both satisfy;
+   - keep the file-backed single-authority implementation for focused tests and
+     local debugging until the replicated path fully replaces it.
+3. select and integrate the consensus mechanism:
+   - use a small Raft-style replicated log for a 3-5 node control-plane group;
+   - make the replicated log contain logical control-plane commands, not SQLite
+     or filesystem bytes;
+   - decide the production dependency deliberately before adding it;
+   - if the dependency owns term/vote/log metadata, membership configuration,
+     committed/applied index, snapshots, and joint consensus/reconfiguration
+     state, document that contract and test it through the integration harness;
+     otherwise Phase 12 must persist and validate those fields explicitly.
+4. define command-log and snapshot formats:
+   - stable command encoding with versioning/checksums;
+   - durable snapshots that include current state, retained cluster-map history,
+     storage floors, transfer/fence state, and any active source lease
+     deadlines;
+   - consensus metadata required for safety after restart, including current
+     term, voted-for state, committed/applied index, log membership
+     configuration, and any joint-reconfiguration state, is durable either in
+     the chosen consensus library's storage or in Argmin's own control-plane
+     store;
+   - replay must reject corrupt, truncated, reordered, or incompatible state
+     fail-closed;
+   - cluster epochs are derived only from committed state-machine transitions.
+5. define linearized read semantics:
+   - runtime-map reads used by frontends and storage nodes must be leader
+     linearized or use a consensus read-index/lease-read equivalent;
+   - stale followers must not publish runtime maps as current serving
+     authority;
+   - an all-Active runtime map is serving only while its control-plane freshness
+     proof remains valid. When a newer committed epoch has any Peering or
+     non-serving PG, frontends with an older all-Active map must stop accepting
+     mutating work once their map/read lease expires or a refresh observes the
+     newer epoch; storage-node stale-epoch rejection remains the last line of
+     defense, not the primary invalidation mechanism;
+   - diagnostic reads may be explicitly stale, but their output must include
+     leader/term/index/freshness information.
+6. implement leader, follower, and control-plane membership behavior:
+   - bootstrap a control-plane quorum with persistent control-plane node
+     identity;
+   - leader loss and follower restart must not regress cluster epoch, node
+     incarnation, transfer fences, or retained-history floors;
+   - control-plane membership changes are separate from storage-node membership
+     changes and must themselves be committed before taking effect.
+7. preserve the storage-node heartbeat contract:
+   - heartbeats become replicated commands or leader-linearized updates;
+   - future observed epochs still reject before any mutation;
+   - stale observed epochs may update non-serving liveness/incarnation/endpoint
+     only under the Phase 11 rules;
+   - current PG observations remain epoch-scoped, acting-set-scoped, and proof
+     checked before they can contribute to serving authority;
+   - storage-reported cluster-map history floors are validated before
+     persistence.
+8. publish runtime maps only from committed state:
+   - every epoch change is a committed state-machine transition;
+   - storage nodes reject stale control-plane state by epoch/incarnation;
+   - frontends only start or refresh onto maps where every PG route is Active
+     with a serving lease, and they must stop mutating work when that lease or
+     read-index freshness expires before a replacement all-Active map is
+     installed;
+   - storage-node refresh may still receive non-serving maps for convergence,
+     but those maps must not be exported as frontend-serving authority.
+9. define clock and lease semantics:
+   - all control-plane lease deadlines use a monotonic clock source, never wall
+     clock time;
+   - lease-read/read-index freshness, storage-node heartbeat lease deadlines,
+     frontend runtime-map freshness, and metadata-transfer source lease waits
+     must state their clock-skew assumptions and restart behavior explicitly;
+   - after control-plane restart or leader change, any leader-local lease state
+     that is not committed must be treated as expired until re-established
+     through the consensus protocol;
+   - tests must cover clock jumps, delayed lease publication, stale lease
+     reads, and restart while leases or source-deadline waits are active.
+10. add real internal identity and transport authentication:
+    - Phase 10 intentionally deferred real internal identity here. Phase 12 must
+      give control-plane peers, storage nodes, and frontends authenticated
+      identities on internal RPCs;
+    - membership changes bind node identity to allowed roles and endpoints, not
+      just numeric ids supplied by the peer;
+    - admin commands, heartbeat RPCs, runtime-map reads, and storage-node
+      control-plane refresh paths must reject unauthenticated or wrong-role
+      callers before applying or returning authority-bearing state.
+11. preserve peering and metadata-transfer safety:
+    - peering proof floors, transfer fences, imported-proof provenance,
+      source-route epochs, source node ids, and source lease deadlines are
+      replicated state;
+    - retry after leader failover resumes from committed markers rather than
+      recomputing from volatile route state;
+    - non-overlap metadata migration still fails closed unless the committed
+      transfer/checkpoint artifact path proves safety.
+12. make retained-history pruning replicated and deterministic:
+    - pruning considers metadata-transfer source epochs, storage-node
+      history-floor reports, durable backfill source/desired epochs, and live
+      payload placement epochs;
+    - pruning is either an explicit committed command or a deterministic
+      state-machine side effect that all replicas apply identically.
+13. update control-plane RPC/admin tooling:
+    - existing Unix admin commands target the replicated leader;
+    - followers return leader redirection or a typed not-leader error;
+    - runtime-map diagnostics include leader id, term, committed index, applied
+      index, snapshot index, current epoch, runtime-map freshness deadline,
+      lease/read-index basis, and retained-history/storage-floor state;
+    - UAT failure diagnostics print those fields before teardown.
+14. add replicated-control-plane test coverage:
+    - state-machine unit/model tests for command application, replay, snapshot
+      install, corrupt-log rejection, stale/future heartbeat rejection, epoch
+      monotonicity, and history-floor validation;
+    - consensus integration tests for leader restart, follower restart, leader
+      loss, stale leader rejection, snapshot catch-up, persisted term/vote
+      handling, and safe membership reconfiguration;
+    - lease/freshness tests for clock jumps, leader restart, stale read-index or
+      lease publication, old all-Active frontend maps during a newer Peering
+      epoch, and source-deadline waits across retry;
+    - identity tests for unauthenticated, wrong-role, stale-node-incarnation,
+      and wrong-endpoint callers;
+    - UAT smokes that kill or restart a control-plane node during storage-node
+      startup, frontend startup, route change, metadata-transfer fence/install,
+      checkpoint-backed metadata transfer, shard backfill discovery, and repair;
+    - correctness soak variants that run the Phase 11 route-change,
+      metadata-migration, PG-backfill, loss, and shard-repair smokes through the
+      replicated control-plane path.
+
 Exit criteria:
 
-1. control-plane state survives node restart
-2. epoch changes are linearized
-3. storage nodes reject stale control-plane state
-4. local multi-process tests no longer depend on static startup-only cluster
+1. committed control-plane state survives leader and follower restart
+2. leader failover cannot lose, reorder, or duplicate epoch changes
+3. durable consensus metadata, including term/vote, committed/applied index,
+   snapshot index, and membership/reconfiguration state, survives restart and
+   rejects stale leaders
+4. runtime-map reads used by frontends/storage nodes are linearized or otherwise
+   proven current by the consensus protocol, with explicit monotonic-clock and
+   restart semantics for any lease-read/read-index freshness
+5. stale followers and stale leaders cannot publish serving maps as
+   authoritative
+6. old all-Active frontend maps are invalidated before accepting new mutating
+   work once a newer committed epoch has Peering/non-serving PGs; storage-node
+   stale-epoch rejection is a backstop, not the only safety mechanism
+7. storage nodes reject stale control-plane state and stale sender writes after
+   epoch changes
+8. control-plane peers, storage nodes, frontends, and admin clients use
+   authenticated internal identities with role/endpoint checks before authority
+   state is mutated or returned
+9. peering, metadata-transfer fences, source lease deadlines, and retained
+   history floors survive leader failover and snapshot/replay
+10. route changes, metadata transfer, repair/backfill, and restart UAT smokes
+   pass with at least one control-plane node killed or restarted mid-operation
+11. local multi-process tests no longer depend on static startup-only cluster
    membership
+12. replicated-control-plane diagnostics expose enough
+   leader/index/epoch/lease/history state to debug UAT failures without
+   inspecting private process memory
 
 ## Testing Strategy
 
