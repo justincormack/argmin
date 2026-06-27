@@ -1187,6 +1187,101 @@ fn delete_finalized_bucket_clears_finalizer_claim() {
 }
 
 #[test]
+fn delete_finalized_bucket_refreshes_metadata_command_state_digest() {
+    let tmp = test_util::tempdir();
+    let store = PgStore::open(tmp.path(), 11).unwrap();
+    let bucket = trusted_bucket_name("finalize-digest-refresh");
+    let create = create_bucket_probe_command(11, 1, bucket.clone(), 1);
+    store.apply_metadata_command_and_record(0, &create).unwrap();
+
+    let current = store.head_bucket_record_raw(&bucket).unwrap();
+    let deleting_generation = store.next_bucket_execution_generation_candidate().unwrap();
+    let mark = MetadataCommandEnvelope::new(
+        MetadataCommandId::new(
+            ClusterEpoch::INITIAL,
+            PgId::new(11),
+            MetadataCommandLogIndex::new(2).unwrap(),
+        ),
+        MetadataCommandPayload::MarkBucketDeleting(MarkBucketDeletingCommand::from_bucket(
+            current.with_execution_generation(deleting_generation),
+        )),
+    );
+    store.apply_metadata_command_and_record(0, &mark).unwrap();
+
+    let before_delete = store.metadata_command_replica_state().unwrap();
+    store.delete_finalized_bucket(&bucket).unwrap();
+    let after_delete = store.metadata_command_replica_state().unwrap();
+    assert_eq!(
+        after_delete.applied_log_index,
+        before_delete.applied_log_index
+    );
+    assert_eq!(
+        after_delete.applied_log_hash,
+        before_delete.applied_log_hash
+    );
+    assert_eq!(
+        after_delete.state_digest,
+        store.cached_metadata_state_digest().unwrap()
+    );
+    assert_eq!(
+        after_delete.state_digest,
+        store.metadata_state_digest().unwrap()
+    );
+
+    let next = create_bucket_probe_command(11, 3, trusted_bucket_name("finalize-digest-next"), 3);
+    assert_eq!(
+        store.metadata_command_acceptance(0, &next).unwrap(),
+        MetadataCommandAcceptance::Apply
+    );
+}
+
+#[test]
+fn delete_finalized_bucket_commit_failure_invalidates_clean_digest_revision() {
+    let tmp = test_util::tempdir();
+    let store = PgStore::open(tmp.path(), 11).unwrap();
+    let bucket = trusted_bucket_name("finalize-digest-rollback");
+    let create = create_bucket_probe_command(11, 1, bucket.clone(), 1);
+    store.apply_metadata_command_and_record(0, &create).unwrap();
+
+    let current = store.head_bucket_record_raw(&bucket).unwrap();
+    let deleting_generation = store.next_bucket_execution_generation_candidate().unwrap();
+    let mark = MetadataCommandEnvelope::new(
+        MetadataCommandId::new(
+            ClusterEpoch::INITIAL,
+            PgId::new(11),
+            MetadataCommandLogIndex::new(2).unwrap(),
+        ),
+        MetadataCommandPayload::MarkBucketDeleting(MarkBucketDeletingCommand::from_bucket(
+            current.with_execution_generation(deleting_generation),
+        )),
+    );
+    store.apply_metadata_command_and_record(0, &mark).unwrap();
+    store.refresh_metadata_command_state_digest().unwrap();
+    assert_ne!(
+        store.clean_metadata_digest_revision.load(Ordering::Relaxed),
+        UNCLEAN_METADATA_DIGEST_REVISION
+    );
+
+    store.fail_next_delete_finalized_bucket_commit();
+    let err = store.delete_finalized_bucket(&bucket).unwrap_err();
+    assert!(matches!(
+        err,
+        MetadataError::Db {
+            context: "delete finalized bucket (commit txn)",
+            ..
+        }
+    ));
+    assert_eq!(
+        store.clean_metadata_digest_revision.load(Ordering::Relaxed),
+        UNCLEAN_METADATA_DIGEST_REVISION
+    );
+    assert_eq!(
+        store.head_bucket_record_raw(&bucket).unwrap().state,
+        BucketState::Deleting
+    );
+}
+
+#[test]
 fn get_bucket_delete_finalize_roots_returns_deleting_buckets_in_order() {
     let tmp = test_util::tempdir();
     let store = PgStore::open(tmp.path(), 11).unwrap();

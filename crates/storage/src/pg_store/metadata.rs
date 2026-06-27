@@ -9,6 +9,24 @@ fn combined_stream_segment_payload_crc64(segments: &[StreamUploadSegmentRecord])
 }
 
 impl PgStore {
+    #[cfg(test)]
+    fn fail_next_delete_finalized_bucket_commit(&self) {
+        self.fail_next_delete_finalized_bucket_commit
+            .store(true, Ordering::Relaxed);
+    }
+
+    fn store_error_as_metadata_db(context: &'static str, error: StoreError) -> MetadataError {
+        match error {
+            StoreError::Db { source, .. } => MetadataError::Db { context, source },
+            other => MetadataError::Db {
+                context,
+                source: rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::other(
+                    other.to_string(),
+                ))),
+            },
+        }
+    }
+
     pub(super) fn with_immediate_txn<T>(
         &self,
         begin_context: &'static str,
@@ -5015,17 +5033,39 @@ impl PgMetadataStore for PgStore {
                         context: "delete finalized bucket (delete write counters)",
                         source,
                     })?;
+                self.refresh_metadata_command_state_digest()
+                    .map_err(|error| {
+                        Self::store_error_as_metadata_db(
+                            "delete finalized bucket (refresh metadata command digest)",
+                            error,
+                        )
+                    })?;
             }
             Ok(deleted)
         })();
         let deleted = match result {
             Ok(deleted) => {
-                self.conn
-                    .execute_batch("COMMIT")
-                    .map_err(|e| MetadataError::Db {
+                #[cfg(test)]
+                if self
+                    .fail_next_delete_finalized_bucket_commit
+                    .swap(false, Ordering::Relaxed)
+                {
+                    let _ = self.conn.execute_batch("ROLLBACK");
+                    self.invalidate_clean_metadata_digest_revision();
+                    return Err(MetadataError::Db {
                         context: "delete finalized bucket (commit txn)",
-                        source: e,
-                    })?;
+                        source: rusqlite::Error::InvalidQuery,
+                    });
+                }
+
+                if let Err(source) = self.conn.execute_batch("COMMIT") {
+                    let _ = self.conn.execute_batch("ROLLBACK");
+                    self.invalidate_clean_metadata_digest_revision();
+                    return Err(MetadataError::Db {
+                        context: "delete finalized bucket (commit txn)",
+                        source,
+                    });
+                }
                 deleted
             }
             Err(error) => {
