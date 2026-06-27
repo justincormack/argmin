@@ -6706,7 +6706,51 @@ fn metadata_proof_satisfies_active_primary_observation_floor(
     active_floor_epoch: Option<ClusterEpoch>,
     observed_epoch: ClusterEpoch,
 ) -> bool {
+    metadata_proof_satisfies_active_primary_observation_floor_impl(
+        active_floor,
+        observed,
+        active_metadata_transfer_imported,
+        active_floor_epoch,
+        observed_epoch,
+        true,
+    )
+}
+
+fn metadata_proof_satisfies_peering_proof_floor(
+    active_floor: PgMetadataProof,
+    observed: PgMetadataProof,
+    active_metadata_transfer_imported: bool,
+    active_floor_epoch: Option<ClusterEpoch>,
+    observed_epoch: ClusterEpoch,
+) -> bool {
+    metadata_proof_satisfies_active_primary_observation_floor_impl(
+        active_floor,
+        observed,
+        active_metadata_transfer_imported,
+        active_floor_epoch,
+        observed_epoch,
+        false,
+    )
+}
+
+fn metadata_proof_satisfies_active_primary_observation_floor_impl(
+    active_floor: PgMetadataProof,
+    observed: PgMetadataProof,
+    active_metadata_transfer_imported: bool,
+    active_floor_epoch: Option<ClusterEpoch>,
+    observed_epoch: ClusterEpoch,
+    allow_same_epoch_digest_only_progress: bool,
+) -> bool {
     if metadata_proof_satisfies_active_floor(active_floor, observed) {
+        return true;
+    }
+    if allow_same_epoch_digest_only_progress
+        && active_floor_epoch == Some(observed_epoch)
+        && observed.applied_log_index == active_floor.applied_log_index
+        && observed.applied_log_hash == active_floor.applied_log_hash
+        && observed.applied_log_hash != 0
+        && observed.state_digest != active_floor.state_digest
+    {
         return true;
     }
     if let Some(active_floor_epoch) = active_floor_epoch {
@@ -6907,7 +6951,7 @@ fn validate_peering_metadata_proof_floor(
     let expected = floor.proof;
     if metadata_proof_satisfies_active_floor(expected, actual)
         || floor.epoch.is_some_and(|floor_epoch| {
-            metadata_proof_satisfies_active_primary_observation_floor(
+            metadata_proof_satisfies_peering_proof_floor(
                 expected,
                 actual,
                 floor.imported,
@@ -7998,6 +8042,99 @@ mod tests {
             true,
             Some(ClusterEpoch::new(7).unwrap()),
             ClusterEpoch::new(7).unwrap(),
+        ));
+    }
+
+    #[test]
+    fn active_primary_observation_floor_accepts_same_epoch_digest_only_progress() {
+        let active_floor = PgMetadataProof {
+            applied_log_index: 42,
+            applied_log_hash: 0xabc,
+            state_digest: 0xdef,
+        };
+        let digest_only_progress = PgMetadataProof {
+            applied_log_index: 42,
+            applied_log_hash: 0xabc,
+            state_digest: 0xdf0,
+        };
+        let divergent_log_hash = PgMetadataProof {
+            applied_log_index: 42,
+            applied_log_hash: 0xabd,
+            state_digest: 0xdf0,
+        };
+        let zero_hash_digest_only_progress = PgMetadataProof {
+            applied_log_index: 42,
+            applied_log_hash: 0,
+            state_digest: 0xdf0,
+        };
+
+        assert!(metadata_proof_satisfies_active_primary_observation_floor(
+            active_floor,
+            digest_only_progress,
+            false,
+            Some(ClusterEpoch::new(7).unwrap()),
+            ClusterEpoch::new(7).unwrap(),
+        ));
+        assert!(!metadata_proof_satisfies_active_primary_observation_floor(
+            active_floor,
+            digest_only_progress,
+            false,
+            None,
+            ClusterEpoch::new(7).unwrap(),
+        ));
+        assert!(!metadata_proof_satisfies_active_primary_observation_floor(
+            active_floor,
+            divergent_log_hash,
+            false,
+            Some(ClusterEpoch::new(7).unwrap()),
+            ClusterEpoch::new(7).unwrap(),
+        ));
+        assert!(!metadata_proof_satisfies_active_primary_observation_floor(
+            PgMetadataProof {
+                applied_log_index: 42,
+                applied_log_hash: 0,
+                state_digest: 0xdef,
+            },
+            zero_hash_digest_only_progress,
+            false,
+            Some(ClusterEpoch::new(7).unwrap()),
+            ClusterEpoch::new(7).unwrap(),
+        ));
+    }
+
+    #[test]
+    fn peering_proof_floor_rejects_uncommitted_digest_only_progress() {
+        let active_floor = PgMetadataProof {
+            applied_log_index: 42,
+            applied_log_hash: 0xabc,
+            state_digest: 0xdef,
+        };
+        let digest_only_progress = PgMetadataProof {
+            applied_log_index: 42,
+            applied_log_hash: 0xabc,
+            state_digest: 0xdf0,
+        };
+
+        assert!(matches!(
+            validate_peering_metadata_proof_floor(
+                ClusterEpoch::new(7).unwrap(),
+                PgId::new(22),
+                NodeId::new(1),
+                Some(PeeringMetadataProofFloor {
+                    proof: active_floor,
+                    epoch: Some(ClusterEpoch::new(7).unwrap()),
+                    imported: false,
+                }),
+                None,
+                digest_only_progress,
+            ),
+            Err(ControlPlaneError::PgPeeringMetadataProofBelowFloor {
+                pg_id: 22,
+                node_id: 1,
+                expected,
+                actual,
+                ..
+            }) if expected == active_floor && actual == digest_only_progress
         ));
     }
 
@@ -11339,6 +11476,79 @@ mod tests {
                 ..
             }) if expected == progressed_proof && actual == mismatched_proof
         ));
+    }
+
+    #[test]
+    fn active_primary_heartbeat_accepts_digest_only_cleanup_progress() {
+        let tmp = test_util::tempdir();
+        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+        authority
+            .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
+            .unwrap();
+        assert!(heartbeat_until_serving(&mut authority, 1, 1_000).serving());
+        authority
+            .set_pg_acting_set(PgId::new(22), vec![NodeId::new(1)])
+            .unwrap();
+
+        let accepted_proof = PgMetadataProof {
+            applied_log_index: 42,
+            applied_log_hash: 0xabc,
+            state_digest: 0xdef,
+        };
+        let mut peering_heartbeat =
+            heartbeat_from_record(&authority, 1, authority.snapshot().cluster_epoch(), 2_000);
+        peering_heartbeat.pg_observations = vec![NodePgHeartbeatObservation {
+            pg_id: PgId::new(22),
+            state: PgState::Peering,
+            metadata_proof: accepted_proof,
+            has_pending_metadata_command: false,
+        }];
+        authority.heartbeat(peering_heartbeat, 2_000).unwrap();
+        authority
+            .complete_pg_peering(
+                PgId::new(22),
+                NodeId::new(1),
+                node_incarnation(&authority, 1),
+                2_010,
+            )
+            .unwrap();
+
+        let mut active_heartbeat =
+            heartbeat_from_record(&authority, 1, authority.snapshot().cluster_epoch(), 2_020);
+        active_heartbeat.pg_observations = vec![NodePgHeartbeatObservation {
+            pg_id: PgId::new(22),
+            state: PgState::Active,
+            metadata_proof: accepted_proof,
+            has_pending_metadata_command: false,
+        }];
+        authority.heartbeat(active_heartbeat, 2_020).unwrap();
+
+        let cleanup_proof = PgMetadataProof {
+            applied_log_index: accepted_proof.applied_log_index,
+            applied_log_hash: accepted_proof.applied_log_hash,
+            state_digest: 0xdf0,
+        };
+        let mut cleanup_heartbeat =
+            heartbeat_from_record(&authority, 1, authority.snapshot().cluster_epoch(), 2_030);
+        cleanup_heartbeat.pg_observations = vec![NodePgHeartbeatObservation {
+            pg_id: PgId::new(22),
+            state: PgState::Active,
+            metadata_proof: cleanup_proof,
+            has_pending_metadata_command: false,
+        }];
+        authority.heartbeat(cleanup_heartbeat, 2_030).unwrap();
+
+        let pg = authority.snapshot().pg(PgId::new(22)).unwrap();
+        assert_eq!(pg.active_metadata_proof(), Some(cleanup_proof));
+        assert_eq!(
+            pg.active_metadata_proof_epoch(),
+            Some(authority.snapshot().cluster_epoch())
+        );
+        assert!(authority
+            .snapshot()
+            .runtime_map_for_storage_node_refresh(2_031, NodeId::new(1))
+            .is_ok());
     }
 
     #[test]
