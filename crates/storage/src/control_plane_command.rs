@@ -35,6 +35,11 @@ pub enum ControlPlaneCommand {
         pg_id: PgId,
         state: PgState,
     },
+    CompletePgPeering {
+        pg_id: PgId,
+        primary: NodeId,
+        node_incarnation: u64,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -48,6 +53,7 @@ pub enum ControlPlaneCommandResponse {
         source_primary_lease_deadline_ms: Option<u64>,
     },
     SetPgState,
+    CompletePgPeering,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
