@@ -1,8 +1,9 @@
 use crate::control_plane::{
     ClusterControlSnapshot, ControlPlaneError, NodeAvailabilityState, NodeMembershipState,
-    PgMetadataTransferProof,
+    PgMetadataProof, PgMetadataTransferProof,
 };
 use crate::types::{PgId, PgState};
+use crate::ClusterEpoch;
 use placement::NodeId;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -40,6 +41,18 @@ pub enum ControlPlaneCommand {
         primary: NodeId,
         node_incarnation: u64,
     },
+    CompleteReadyPgPeerings {
+        ready_at_ms: u64,
+        ready: Vec<ReadyPgPeeringCompletion>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReadyPgPeeringCompletion {
+    pub pg_id: PgId,
+    pub primary: NodeId,
+    pub active_metadata_proof: PgMetadataProof,
+    pub active_metadata_proof_epoch: ClusterEpoch,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -54,6 +67,7 @@ pub enum ControlPlaneCommandResponse {
     },
     SetPgState,
     CompletePgPeering,
+    CompleteReadyPgPeerings,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
