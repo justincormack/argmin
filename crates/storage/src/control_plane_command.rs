@@ -695,10 +695,7 @@ impl ReplicatedControlPlaneStateMachine {
         &self,
         read_index: ControlPlaneLogId,
     ) -> Result<(), ControlPlaneError> {
-        if self
-            .last_applied
-            .is_some_and(|last_applied| last_applied >= read_index)
-        {
+        if self.last_applied == Some(read_index) {
             return Ok(());
         }
         Err(ControlPlaneError::ControlPlaneReadIndexNotApplied {
@@ -1389,10 +1386,16 @@ mod tests {
     }
 
     fn replay_sample_state_machine() -> ReplicatedControlPlaneStateMachine {
+        replay_sample_state_machine_with_log_ids([log_id(1, 1), log_id(1, 2), log_id(1, 3)])
+    }
+
+    fn replay_sample_state_machine_with_log_ids(
+        log_ids: [ControlPlaneLogId; 3],
+    ) -> ReplicatedControlPlaneStateMachine {
         let mut state_machine = ReplicatedControlPlaneStateMachine::empty();
-        for (offset, command) in sample_snapshot_commands().into_iter().enumerate() {
+        for (log_id, command) in log_ids.into_iter().zip(sample_snapshot_commands()) {
             state_machine
-                .apply_committed_command(log_id(1, u64::try_from(offset).unwrap() + 1), command)
+                .apply_committed_command(log_id, command)
                 .unwrap();
         }
         state_machine
@@ -1668,6 +1671,30 @@ mod tests {
                 read_index,
                 last_applied: Some(last_applied),
             }) if read_index == log_id(2, 2) && last_applied == log_id(1, 3)
+        ));
+
+        let state_machine =
+            replay_sample_state_machine_with_log_ids([log_id(1, 1), log_id(2, 2), log_id(2, 3)]);
+        assert!(matches!(
+            state_machine.runtime_map_for_read_index(log_id(1, 4), 12_345),
+            Err(ControlPlaneError::ControlPlaneReadIndexNotApplied {
+                read_index,
+                last_applied: Some(last_applied),
+            }) if read_index == log_id(1, 4) && last_applied == log_id(2, 3)
+        ));
+        assert!(matches!(
+            state_machine.runtime_map_for_read_index(log_id(1, 3), 12_345),
+            Err(ControlPlaneError::ControlPlaneReadIndexNotApplied {
+                read_index,
+                last_applied: Some(last_applied),
+            }) if read_index == log_id(1, 3) && last_applied == log_id(2, 3)
+        ));
+        assert!(matches!(
+            state_machine.runtime_map_for_read_index(log_id(1, 2), 12_345),
+            Err(ControlPlaneError::ControlPlaneReadIndexNotApplied {
+                read_index,
+                last_applied: Some(last_applied),
+            }) if read_index == log_id(1, 2) && last_applied == log_id(2, 3)
         ));
     }
 

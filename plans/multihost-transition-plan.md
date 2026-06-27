@@ -9042,10 +9042,13 @@ Phase 12.1 progress:
   populate a stable proof shape without changing the runtime-map frame again.
 - Connected the dependency-free replicated state-machine adapter to that proof
   shape. It can now build a runtime map with a read-index freshness proof only
-  when the requested control-plane log id has already applied, and rejects
-  unapplied or future-term reads with a typed error. `ControlPlaneLogId` now
-  rejects zero term as well as zero index so Raft-shaped proof points cannot
-  encode reserved values.
+  when the requested control-plane log id exactly equals the state machine's
+  current `last_applied` id, and rejects unapplied, future-term, or historical
+  read ids with a typed error. The OpenRaft spike must therefore stamp runtime
+  map proofs with the actual reflected `last_applied` id at serve time, not a
+  captured read-index round id that the state machine may have already applied
+  past. `ControlPlaneLogId` now rejects zero term as well as zero index so
+  Raft-shaped proof points cannot encode reserved values.
 
 1. define the replicated control-plane state machine:
    - state includes cluster epoch, PG count, PG state, PG acting sets, node
