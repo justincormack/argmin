@@ -9020,6 +9020,13 @@ Phase 12.1 progress:
   rejected committed command now records a rejected log outcome, leaves the
   snapshot unchanged, and advances `last_applied` so replay and the later
   OpenRaft adapter cannot silently stall.
+- Added an explicit runtime-map freshness proof to `ClusterRuntimeMapSnapshot`
+  and the Unix control-plane RPC format. Single-authority live reads now carry
+  the authority incarnation and issue timestamp, reconstructed/diagnostic maps
+  are marked separately, and malformed proof tags fail closed. This keeps the
+  Phase 11 runtime-map path working while giving the OpenRaft read-index or
+  lease-read integration a concrete field to populate with term/index/freshness
+  semantics later.
 
 1. define the replicated control-plane state machine:
    - state includes cluster epoch, PG count, PG state, PG acting sets, node

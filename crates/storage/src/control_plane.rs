@@ -25,6 +25,8 @@ const CONTROL_PLANE_RPC_HEARTBEAT_OBSERVATION_MIN_LEN: usize = 4 + 1 + 8 + 8 + 8
 const CONTROL_PLANE_RPC_RUNTIME_NODE_MIN_LEN: usize = 4 + 8 + 4 + 1;
 const CONTROL_PLANE_RPC_PG_ROUTE_MIN_LEN: usize = 8 + 4 + 4 + 1 + 1 + 4 + 1;
 const CONTROL_PLANE_RPC_ACTING_SET_NODE_MIN_LEN: usize = 4;
+const CONTROL_PLANE_RPC_RUNTIME_MAP_PROOF_SINGLE_AUTHORITY: u8 = 1;
+const CONTROL_PLANE_RPC_RUNTIME_MAP_PROOF_RECONSTRUCTED: u8 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct AuthorityIncarnation(NonZeroU64);
@@ -526,7 +528,13 @@ impl ClusterControlSnapshot {
 
     pub fn runtime_map(&self, now_ms: u64) -> Result<ClusterRuntimeMapSnapshot, ControlPlaneError> {
         let pg_routes = self.pg_routes(now_ms)?;
-        self.runtime_map_from_pg_routes(pg_routes)
+        self.runtime_map_from_pg_routes(
+            pg_routes,
+            RuntimeMapFreshnessProof::SingleAuthority {
+                authority_incarnation: self.authority_incarnation,
+                issued_at_ms: now_ms,
+            },
+        )
     }
 
     pub fn reconstructed_runtime_map(
@@ -544,7 +552,12 @@ impl ClusterControlSnapshot {
                 )
             })
             .collect();
-        self.runtime_map_from_pg_routes(pg_routes?)
+        self.runtime_map_from_pg_routes(
+            pg_routes?,
+            RuntimeMapFreshnessProof::Reconstructed {
+                authority_incarnation: self.authority_incarnation,
+            },
+        )
     }
 
     fn runtime_map_for_storage_node_refresh(
@@ -553,12 +566,19 @@ impl ClusterControlSnapshot {
         refreshing_node_id: NodeId,
     ) -> Result<ClusterRuntimeMapSnapshot, ControlPlaneError> {
         let pg_routes = self.pg_routes_for_storage_node_refresh(now_ms, refreshing_node_id)?;
-        self.runtime_map_from_pg_routes(pg_routes)
+        self.runtime_map_from_pg_routes(
+            pg_routes,
+            RuntimeMapFreshnessProof::SingleAuthority {
+                authority_incarnation: self.authority_incarnation,
+                issued_at_ms: now_ms,
+            },
+        )
     }
 
     fn runtime_map_from_pg_routes(
         &self,
         pg_routes: Vec<PgRouteSnapshot>,
+        freshness_proof: RuntimeMapFreshnessProof,
     ) -> Result<ClusterRuntimeMapSnapshot, ControlPlaneError> {
         let historical_pg_routes = self.historical_pg_routes_for_runtime_map()?;
         let mut routed_node_ids = BTreeSet::new();
@@ -596,6 +616,7 @@ impl ClusterControlSnapshot {
         Ok(ClusterRuntimeMapSnapshot {
             cluster_epoch: self.cluster_epoch,
             valid_until_ms,
+            freshness_proof,
             nodes,
             pg_routes,
             historical_pg_routes,
@@ -1882,9 +1903,54 @@ impl NodeRouteSnapshot {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RuntimeMapFreshnessProof {
+    // Phase 11 single-authority freshness proof. The replicated control-plane
+    // path must add a sibling Raft/read-index proof variant rather than
+    // overloading this one.
+    SingleAuthority {
+        authority_incarnation: AuthorityIncarnation,
+        // Informational until Phase 12 defines monotonic-clock lease-read
+        // comparison, skew, and restart semantics.
+        issued_at_ms: u64,
+    },
+    Reconstructed {
+        authority_incarnation: AuthorityIncarnation,
+    },
+}
+
+impl RuntimeMapFreshnessProof {
+    #[must_use]
+    pub fn authority_incarnation(&self) -> AuthorityIncarnation {
+        match self {
+            Self::SingleAuthority {
+                authority_incarnation,
+                ..
+            }
+            | Self::Reconstructed {
+                authority_incarnation,
+            } => *authority_incarnation,
+        }
+    }
+
+    #[must_use]
+    pub fn issued_at_ms(&self) -> Option<u64> {
+        match self {
+            Self::SingleAuthority { issued_at_ms, .. } => Some(*issued_at_ms),
+            Self::Reconstructed { .. } => None,
+        }
+    }
+
+    #[must_use]
+    pub fn is_serving_authority_read(&self) -> bool {
+        matches!(self, Self::SingleAuthority { .. })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClusterRuntimeMapSnapshot {
     cluster_epoch: ClusterEpoch,
     valid_until_ms: Option<u64>,
+    freshness_proof: RuntimeMapFreshnessProof,
     nodes: Vec<NodeRouteSnapshot>,
     pg_routes: Vec<PgRouteSnapshot>,
     historical_pg_routes: Vec<PgRouteSnapshot>,
@@ -1899,6 +1965,11 @@ impl ClusterRuntimeMapSnapshot {
     #[must_use]
     pub fn valid_until_ms(&self) -> Option<u64> {
         self.valid_until_ms
+    }
+
+    #[must_use]
+    pub fn freshness_proof(&self) -> &RuntimeMapFreshnessProof {
+        &self.freshness_proof
     }
 
     #[must_use]
@@ -1955,6 +2026,9 @@ impl ClusterRuntimeMapSnapshot {
         Ok(Self {
             cluster_epoch,
             valid_until_ms: None,
+            freshness_proof: RuntimeMapFreshnessProof::Reconstructed {
+                authority_incarnation: self.freshness_proof.authority_incarnation(),
+            },
             nodes: self.nodes.clone(),
             pg_routes,
             historical_pg_routes: self.historical_pg_routes.clone(),
@@ -4183,6 +4257,7 @@ fn write_runtime_map_snapshot(
 ) -> Result<(), ControlPlaneError> {
     write_u64(out, snapshot.cluster_epoch().get());
     write_option_u64(out, snapshot.valid_until_ms());
+    write_runtime_map_freshness_proof(out, snapshot.freshness_proof());
     write_u32(out, len_as_u32(snapshot.nodes().len(), "runtime nodes")?);
     for node in snapshot.nodes() {
         write_u32(out, node.node_id().as_u32());
@@ -4197,6 +4272,25 @@ fn write_runtime_map_snapshot(
     write_pg_route_snapshots(out, "PG routes", snapshot.pg_routes())?;
     write_pg_route_snapshots(out, "historical PG routes", snapshot.historical_pg_routes())?;
     Ok(())
+}
+
+fn write_runtime_map_freshness_proof(out: &mut Vec<u8>, proof: &RuntimeMapFreshnessProof) {
+    match proof {
+        RuntimeMapFreshnessProof::SingleAuthority {
+            authority_incarnation,
+            issued_at_ms,
+        } => {
+            write_u8(out, CONTROL_PLANE_RPC_RUNTIME_MAP_PROOF_SINGLE_AUTHORITY);
+            write_u64(out, authority_incarnation.get());
+            write_u64(out, *issued_at_ms);
+        }
+        RuntimeMapFreshnessProof::Reconstructed {
+            authority_incarnation,
+        } => {
+            write_u8(out, CONTROL_PLANE_RPC_RUNTIME_MAP_PROOF_RECONSTRUCTED);
+            write_u64(out, authority_incarnation.get());
+        }
+    }
 }
 
 fn write_pg_route_snapshots(
@@ -4245,6 +4339,7 @@ fn read_runtime_map_snapshot(
 ) -> Result<ClusterRuntimeMapSnapshot, ControlPlaneError> {
     let cluster_epoch = read_cluster_epoch(reader, "runtime map cluster epoch")?;
     let valid_until_ms = reader.read_option_u64()?;
+    let freshness_proof = read_runtime_map_freshness_proof(reader)?;
     let node_count =
         reader.read_collection_len("runtime nodes", CONTROL_PLANE_RPC_RUNTIME_NODE_MIN_LEN)?;
     let mut nodes = Vec::with_capacity(node_count);
@@ -4264,9 +4359,42 @@ fn read_runtime_map_snapshot(
     Ok(ClusterRuntimeMapSnapshot {
         cluster_epoch,
         valid_until_ms,
+        freshness_proof,
         nodes,
         pg_routes,
         historical_pg_routes,
+    })
+}
+
+fn read_runtime_map_freshness_proof(
+    reader: &mut PayloadReader<'_>,
+) -> Result<RuntimeMapFreshnessProof, ControlPlaneError> {
+    let tag = reader.read_u8()?;
+    match tag {
+        CONTROL_PLANE_RPC_RUNTIME_MAP_PROOF_SINGLE_AUTHORITY => {
+            let authority_incarnation = read_runtime_map_proof_authority_incarnation(reader)?;
+            Ok(RuntimeMapFreshnessProof::SingleAuthority {
+                authority_incarnation,
+                issued_at_ms: reader.read_u64()?,
+            })
+        }
+        CONTROL_PLANE_RPC_RUNTIME_MAP_PROOF_RECONSTRUCTED => {
+            let authority_incarnation = read_runtime_map_proof_authority_incarnation(reader)?;
+            Ok(RuntimeMapFreshnessProof::Reconstructed {
+                authority_incarnation,
+            })
+        }
+        other => Err(ControlPlaneError::RpcProtocol {
+            message: format!("invalid runtime map freshness proof tag {other}"),
+        }),
+    }
+}
+
+fn read_runtime_map_proof_authority_incarnation(
+    reader: &mut PayloadReader<'_>,
+) -> Result<AuthorityIncarnation, ControlPlaneError> {
+    AuthorityIncarnation::new(reader.read_u64()?).ok_or_else(|| ControlPlaneError::RpcProtocol {
+        message: "runtime map freshness proof authority incarnation must be nonzero".to_owned(),
     })
 }
 
@@ -7789,6 +7917,13 @@ mod tests {
         assert_eq!(runtime_map.pg_routes().len(), 1);
         assert_eq!(runtime_map.pg_routes()[0].pg_id(), PgId::new(7));
         assert_eq!(runtime_map.pg_routes()[0].state(), PgState::Peering);
+        assert_eq!(
+            runtime_map.freshness_proof(),
+            &RuntimeMapFreshnessProof::SingleAuthority {
+                authority_incarnation: AuthorityIncarnation::INITIAL,
+                issued_at_ms: 1_001,
+            }
+        );
     }
 
     #[test]
@@ -8120,6 +8255,12 @@ mod tests {
         assert_eq!(route.cluster_epoch(), runtime_map.cluster_epoch());
         assert_eq!(route.state(), PgState::Peering);
         assert_eq!(route.acting_set(), &[NodeId::new(2)]);
+        assert!(matches!(
+            runtime_map.freshness_proof(),
+            RuntimeMapFreshnessProof::Reconstructed {
+                authority_incarnation: AuthorityIncarnation::INITIAL,
+            }
+        ));
 
         let authority =
             SingleAuthorityControlPlane::open(FileControlPlaneStore::new(&state_path)).unwrap();
@@ -8296,6 +8437,7 @@ mod tests {
         let mut payload = Vec::new();
         write_u64(&mut payload, ClusterEpoch::INITIAL.get());
         write_option_u64(&mut payload, None);
+        write_runtime_map_test_single_authority_proof(&mut payload);
         write_u32(&mut payload, u32::MAX);
 
         let mut reader = PayloadReader::new(&payload);
@@ -8313,6 +8455,7 @@ mod tests {
         let mut payload = Vec::new();
         write_u64(&mut payload, ClusterEpoch::INITIAL.get());
         write_option_u64(&mut payload, None);
+        write_runtime_map_test_single_authority_proof(&mut payload);
         write_u32(&mut payload, 0);
         write_u32(&mut payload, u32::MAX);
 
@@ -8331,6 +8474,7 @@ mod tests {
         let mut payload = Vec::new();
         write_u64(&mut payload, ClusterEpoch::INITIAL.get());
         write_option_u64(&mut payload, None);
+        write_runtime_map_test_single_authority_proof(&mut payload);
         write_u32(&mut payload, 0);
         write_u32(&mut payload, 1);
         write_u64(&mut payload, ClusterEpoch::INITIAL.get());
@@ -8351,6 +8495,88 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn control_plane_rpc_rejects_invalid_runtime_map_freshness_proof() {
+        let mut payload = Vec::new();
+        write_u64(&mut payload, ClusterEpoch::INITIAL.get());
+        write_option_u64(&mut payload, None);
+        write_u8(&mut payload, 99);
+
+        let mut reader = PayloadReader::new(&payload);
+        let error = read_runtime_map_snapshot(&mut reader).unwrap_err();
+
+        assert!(matches!(
+            error,
+            ControlPlaneError::RpcProtocol { message }
+                if message.contains("invalid runtime map freshness proof tag 99")
+        ));
+    }
+
+    #[test]
+    fn control_plane_rpc_rejects_zero_runtime_map_freshness_proof_incarnation() {
+        let mut payload = Vec::new();
+        write_u64(&mut payload, ClusterEpoch::INITIAL.get());
+        write_option_u64(&mut payload, None);
+        write_u8(
+            &mut payload,
+            CONTROL_PLANE_RPC_RUNTIME_MAP_PROOF_SINGLE_AUTHORITY,
+        );
+        write_u64(&mut payload, 0);
+
+        let mut reader = PayloadReader::new(&payload);
+        let error = read_runtime_map_snapshot(&mut reader).unwrap_err();
+
+        assert!(matches!(
+            error,
+            ControlPlaneError::RpcProtocol { message }
+                if message.contains("runtime map freshness proof authority incarnation must be nonzero")
+        ));
+    }
+
+    #[test]
+    fn control_plane_rpc_round_trips_single_authority_runtime_map_freshness_proof() {
+        let snapshot = runtime_map_test_snapshot(RuntimeMapFreshnessProof::SingleAuthority {
+            authority_incarnation: AuthorityIncarnation::INITIAL,
+            issued_at_ms: 12_345,
+        });
+        let mut payload = Vec::new();
+        write_runtime_map_snapshot(&mut payload, &snapshot).unwrap();
+
+        let mut reader = PayloadReader::new(&payload);
+        let decoded = read_runtime_map_snapshot(&mut reader).unwrap();
+        reader.finish().unwrap();
+
+        assert_eq!(decoded, snapshot);
+        assert_eq!(
+            decoded.freshness_proof(),
+            &RuntimeMapFreshnessProof::SingleAuthority {
+                authority_incarnation: AuthorityIncarnation::INITIAL,
+                issued_at_ms: 12_345,
+            }
+        );
+    }
+
+    #[test]
+    fn control_plane_rpc_round_trips_reconstructed_runtime_map_freshness_proof() {
+        let snapshot = runtime_map_test_snapshot(RuntimeMapFreshnessProof::Reconstructed {
+            authority_incarnation: AuthorityIncarnation::INITIAL,
+        });
+        let mut payload = Vec::new();
+        write_runtime_map_snapshot(&mut payload, &snapshot).unwrap();
+
+        let mut reader = PayloadReader::new(&payload);
+        let decoded = read_runtime_map_snapshot(&mut reader).unwrap();
+        reader.finish().unwrap();
+
+        assert_eq!(decoded, snapshot);
+        assert_eq!(
+            decoded.freshness_proof(),
+            &RuntimeMapFreshnessProof::Reconstructed {
+                authority_incarnation: AuthorityIncarnation::INITIAL,
+            }
+        );
+    }
+
     fn write_u16_to_stream(stream: &mut UnixStream, value: u16) {
         stream.write_all(&value.to_be_bytes()).unwrap();
     }
@@ -8361,6 +8587,25 @@ mod tests {
 
     fn write_u64_to_stream(stream: &mut UnixStream, value: u64) {
         stream.write_all(&value.to_be_bytes()).unwrap();
+    }
+
+    fn write_runtime_map_test_single_authority_proof(out: &mut Vec<u8>) {
+        write_u8(out, CONTROL_PLANE_RPC_RUNTIME_MAP_PROOF_SINGLE_AUTHORITY);
+        write_u64(out, AuthorityIncarnation::INITIAL.get());
+        write_u64(out, 1_000);
+    }
+
+    fn runtime_map_test_snapshot(
+        freshness_proof: RuntimeMapFreshnessProof,
+    ) -> ClusterRuntimeMapSnapshot {
+        ClusterRuntimeMapSnapshot {
+            cluster_epoch: ClusterEpoch::INITIAL,
+            valid_until_ms: None,
+            freshness_proof,
+            nodes: Vec::new(),
+            pg_routes: Vec::new(),
+            historical_pg_routes: Vec::new(),
+        }
     }
 
     #[test]
