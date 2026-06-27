@@ -1,7 +1,7 @@
 use crate::control_plane::{
-    format_snapshot, parse_snapshot, ClusterControlSnapshot, ControlPlaneError,
-    NodeAvailabilityState, NodeHeartbeat, NodeMembershipState, NodePgHeartbeatObservation,
-    PgMetadataProof, PgMetadataTransferProof,
+    format_snapshot, parse_snapshot, ClusterControlSnapshot, ClusterRuntimeMapSnapshot,
+    ControlPlaneError, NodeAvailabilityState, NodeHeartbeat, NodeMembershipState,
+    NodePgHeartbeatObservation, PgMetadataProof, PgMetadataTransferProof, RuntimeMapFreshnessProof,
 };
 use crate::types::{PgId, PgState};
 use crate::{ClusterEpoch, PgClusterMapHistoryReferenceSummary};
@@ -470,7 +470,7 @@ pub struct ControlPlaneLogId {
 impl ControlPlaneLogId {
     #[must_use]
     pub fn new(term: u64, index: u64) -> Option<Self> {
-        if index == 0 {
+        if term == 0 || index == 0 {
             return None;
         }
         Some(Self { term, index })
@@ -633,6 +633,22 @@ impl ReplicatedControlPlaneStateMachine {
         self.snapshot_last_applied
     }
 
+    pub fn runtime_map_for_read_index(
+        &self,
+        read_index: ControlPlaneLogId,
+        issued_at_ms: u64,
+    ) -> Result<ClusterRuntimeMapSnapshot, ControlPlaneError> {
+        self.validate_read_index_applied(read_index)?;
+        self.snapshot.runtime_map_with_freshness_proof(
+            issued_at_ms,
+            RuntimeMapFreshnessProof::ReadIndex {
+                authority_incarnation: self.snapshot.authority_incarnation(),
+                read_index,
+                issued_at_ms,
+            },
+        )
+    }
+
     pub fn apply_committed_command(
         &mut self,
         log_id: ControlPlaneLogId,
@@ -673,6 +689,22 @@ impl ReplicatedControlPlaneStateMachine {
         self.last_applied = artifact.last_applied();
         self.snapshot_last_applied = artifact.last_applied();
         Ok(())
+    }
+
+    fn validate_read_index_applied(
+        &self,
+        read_index: ControlPlaneLogId,
+    ) -> Result<(), ControlPlaneError> {
+        if self
+            .last_applied
+            .is_some_and(|last_applied| last_applied >= read_index)
+        {
+            return Ok(());
+        }
+        Err(ControlPlaneError::ControlPlaneReadIndexNotApplied {
+            read_index,
+            last_applied: self.last_applied,
+        })
     }
 
     fn validate_next_log_id(&self, log_id: ControlPlaneLogId) -> Result<(), ControlPlaneError> {
@@ -1575,6 +1607,68 @@ mod tests {
         assert_eq!(state_machine.snapshot(), &replay_sample_directly());
         assert_eq!(state_machine.last_applied(), Some(log_id(1, 3)));
         assert_eq!(state_machine.snapshot_last_applied(), None);
+    }
+
+    #[test]
+    fn control_plane_log_id_rejects_zero_term_or_index() {
+        assert_eq!(ControlPlaneLogId::new(0, 1), None);
+        assert_eq!(ControlPlaneLogId::new(1, 0), None);
+        assert_eq!(ControlPlaneLogId::new(1, 1), Some(log_id(1, 1)));
+    }
+
+    #[test]
+    fn replicated_control_plane_state_machine_builds_read_index_runtime_map() {
+        let state_machine = replay_sample_state_machine();
+        let read_index = log_id(1, 3);
+        let runtime_map = state_machine
+            .runtime_map_for_read_index(read_index, 12_345)
+            .unwrap();
+
+        assert_eq!(
+            runtime_map.freshness_proof(),
+            &RuntimeMapFreshnessProof::ReadIndex {
+                authority_incarnation: state_machine.snapshot().authority_incarnation(),
+                read_index,
+                issued_at_ms: 12_345,
+            }
+        );
+        assert_eq!(runtime_map.freshness_proof().read_index(), Some(read_index));
+        assert!(runtime_map.freshness_proof().is_serving_authority_read());
+    }
+
+    #[test]
+    fn replicated_control_plane_state_machine_rejects_unapplied_read_index() {
+        let state_machine = ReplicatedControlPlaneStateMachine::empty();
+        assert!(matches!(
+            state_machine.runtime_map_for_read_index(log_id(1, 1), 12_345),
+            Err(ControlPlaneError::ControlPlaneReadIndexNotApplied {
+                read_index,
+                last_applied: None,
+            }) if read_index == log_id(1, 1)
+        ));
+
+        let state_machine = replay_sample_state_machine();
+        assert!(matches!(
+            state_machine.runtime_map_for_read_index(log_id(1, 4), 12_345),
+            Err(ControlPlaneError::ControlPlaneReadIndexNotApplied {
+                read_index,
+                last_applied: Some(last_applied),
+            }) if read_index == log_id(1, 4) && last_applied == log_id(1, 3)
+        ));
+        assert!(matches!(
+            state_machine.runtime_map_for_read_index(log_id(2, 3), 12_345),
+            Err(ControlPlaneError::ControlPlaneReadIndexNotApplied {
+                read_index,
+                last_applied: Some(last_applied),
+            }) if read_index == log_id(2, 3) && last_applied == log_id(1, 3)
+        ));
+        assert!(matches!(
+            state_machine.runtime_map_for_read_index(log_id(2, 2), 12_345),
+            Err(ControlPlaneError::ControlPlaneReadIndexNotApplied {
+                read_index,
+                last_applied: Some(last_applied),
+            }) if read_index == log_id(2, 2) && last_applied == log_id(1, 3)
+        ));
     }
 
     #[test]

@@ -528,14 +528,22 @@ impl ClusterControlSnapshot {
     }
 
     pub fn runtime_map(&self, now_ms: u64) -> Result<ClusterRuntimeMapSnapshot, ControlPlaneError> {
-        let pg_routes = self.pg_routes(now_ms)?;
-        self.runtime_map_from_pg_routes(
-            pg_routes,
+        self.runtime_map_with_freshness_proof(
+            now_ms,
             RuntimeMapFreshnessProof::SingleAuthority {
                 authority_incarnation: self.authority_incarnation,
                 issued_at_ms: now_ms,
             },
         )
+    }
+
+    pub(crate) fn runtime_map_with_freshness_proof(
+        &self,
+        now_ms: u64,
+        freshness_proof: RuntimeMapFreshnessProof,
+    ) -> Result<ClusterRuntimeMapSnapshot, ControlPlaneError> {
+        let pg_routes = self.pg_routes(now_ms)?;
+        self.runtime_map_from_pg_routes(pg_routes, freshness_proof)
     }
 
     pub fn reconstructed_runtime_map(
@@ -4876,6 +4884,14 @@ pub enum ControlPlaneError {
         previous_term: u64,
         actual_term: u64,
         index: u64,
+    },
+
+    #[error(
+        "control-plane read index {read_index:?} is not applied; last applied is {last_applied:?}"
+    )]
+    ControlPlaneReadIndexNotApplied {
+        read_index: ControlPlaneLogId,
+        last_applied: Option<ControlPlaneLogId>,
     },
 
     #[error("control-plane RPC remote error: {message}")]

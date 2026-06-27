@@ -9040,6 +9040,12 @@ Phase 12.1 progress:
   control-plane log id, and issue timestamp. The Unix RPC codec round-trips
   this variant and rejects zero read-index values, so the OpenRaft spike can
   populate a stable proof shape without changing the runtime-map frame again.
+- Connected the dependency-free replicated state-machine adapter to that proof
+  shape. It can now build a runtime map with a read-index freshness proof only
+  when the requested control-plane log id has already applied, and rejects
+  unapplied or future-term reads with a typed error. `ControlPlaneLogId` now
+  rejects zero term as well as zero index so Raft-shaped proof points cannot
+  encode reserved values.
 
 1. define the replicated control-plane state machine:
    - state includes cluster epoch, PG count, PG state, PG acting sets, node
