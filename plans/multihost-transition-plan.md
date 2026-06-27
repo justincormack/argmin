@@ -9013,9 +9013,13 @@ Phase 12.1 progress:
   tests for both same-position reinstall and forward snapshot catch-up. The
   remaining trust boundary is intentionally left with the consensus layer:
   OpenRaft must supply a snapshot payload whose internal state matches its
-  claimed last-included log id. The OpenRaft spike must also decide how a
-  committed command rejected by deterministic apply is surfaced so Raft does
-  not silently stall with `last_applied` unchanged.
+  claimed last-included log id.
+- Made committed deterministic command rejection an explicit replicated
+  state-machine outcome. Consensus/storage log-position errors still fail
+  before mutation and do not advance `last_applied`, but a semantically
+  rejected committed command now records a rejected log outcome, leaves the
+  snapshot unchanged, and advances `last_applied` so replay and the later
+  OpenRaft adapter cannot silently stall.
 
 1. define the replicated control-plane state machine:
    - state includes cluster epoch, PG count, PG state, PG acting sets, node

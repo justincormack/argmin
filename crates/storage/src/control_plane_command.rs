@@ -493,16 +493,33 @@ impl ControlPlaneLogId {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AppliedControlPlaneLogCommand {
-    log_id: ControlPlaneLogId,
-    applied: AppliedControlPlaneCommand,
+#[derive(Debug)]
+pub enum CommittedControlPlaneCommandOutcome {
+    Applied(AppliedControlPlaneCommand),
+    Rejected(ControlPlaneError),
 }
 
-impl AppliedControlPlaneLogCommand {
+#[derive(Debug)]
+pub struct CommittedControlPlaneLogCommand {
+    log_id: ControlPlaneLogId,
+    outcome: CommittedControlPlaneCommandOutcome,
+}
+
+impl CommittedControlPlaneLogCommand {
     #[must_use]
-    pub fn new(log_id: ControlPlaneLogId, applied: AppliedControlPlaneCommand) -> Self {
-        Self { log_id, applied }
+    pub fn applied(log_id: ControlPlaneLogId, applied: AppliedControlPlaneCommand) -> Self {
+        Self {
+            log_id,
+            outcome: CommittedControlPlaneCommandOutcome::Applied(applied),
+        }
+    }
+
+    #[must_use]
+    pub fn rejected(log_id: ControlPlaneLogId, error: ControlPlaneError) -> Self {
+        Self {
+            log_id,
+            outcome: CommittedControlPlaneCommandOutcome::Rejected(error),
+        }
     }
 
     #[must_use]
@@ -511,13 +528,40 @@ impl AppliedControlPlaneLogCommand {
     }
 
     #[must_use]
-    pub fn applied(&self) -> &AppliedControlPlaneCommand {
-        &self.applied
+    pub fn outcome(&self) -> &CommittedControlPlaneCommandOutcome {
+        &self.outcome
     }
 
     #[must_use]
-    pub fn into_applied(self) -> AppliedControlPlaneCommand {
-        self.applied
+    pub fn applied_command(&self) -> Option<&AppliedControlPlaneCommand> {
+        match &self.outcome {
+            CommittedControlPlaneCommandOutcome::Applied(applied) => Some(applied),
+            CommittedControlPlaneCommandOutcome::Rejected(_) => None,
+        }
+    }
+
+    #[must_use]
+    pub fn rejection(&self) -> Option<&ControlPlaneError> {
+        match &self.outcome {
+            CommittedControlPlaneCommandOutcome::Applied(_) => None,
+            CommittedControlPlaneCommandOutcome::Rejected(error) => Some(error),
+        }
+    }
+
+    #[must_use]
+    pub fn into_outcome(self) -> CommittedControlPlaneCommandOutcome {
+        self.outcome
+    }
+
+    /// Convenience for callers that have already established that this
+    /// committed entry applied. Consensus wiring must handle `Rejected`
+    /// explicitly through `outcome` or `rejection` so deterministic command
+    /// rejection is not re-propagated as log-application failure.
+    pub fn into_applied_command(self) -> Result<AppliedControlPlaneCommand, ControlPlaneError> {
+        match self.outcome {
+            CommittedControlPlaneCommandOutcome::Applied(applied) => Ok(applied),
+            CommittedControlPlaneCommandOutcome::Rejected(error) => Err(error),
+        }
     }
 }
 
@@ -593,12 +637,16 @@ impl ReplicatedControlPlaneStateMachine {
         &mut self,
         log_id: ControlPlaneLogId,
         command: ControlPlaneCommand,
-    ) -> Result<AppliedControlPlaneLogCommand, ControlPlaneError> {
+    ) -> Result<CommittedControlPlaneLogCommand, ControlPlaneError> {
         self.validate_next_log_id(log_id)?;
-        let applied = self.snapshot.apply_control_plane_command(command)?;
-        self.snapshot = applied.snapshot().clone();
         self.last_applied = Some(log_id);
-        Ok(AppliedControlPlaneLogCommand::new(log_id, applied))
+        match self.snapshot.apply_control_plane_command(command) {
+            Ok(applied) => {
+                self.snapshot = applied.snapshot().clone();
+                Ok(CommittedControlPlaneLogCommand::applied(log_id, applied))
+            }
+            Err(error) => Ok(CommittedControlPlaneLogCommand::rejected(log_id, error)),
+        }
     }
 
     pub fn build_snapshot_artifact(
@@ -1586,10 +1634,86 @@ mod tests {
         let before = state_machine.clone();
 
         assert!(matches!(
-            state_machine.apply_committed_command(log_id(1, u64::MAX), follow_up_command()),
+            state_machine.apply_committed_command(log_id(1, 1), follow_up_command()),
             Err(ControlPlaneError::ControlPlaneLogIndexOverflow { index: u64::MAX })
         ));
         assert_eq!(state_machine, before);
+    }
+
+    #[test]
+    fn replicated_control_plane_state_machine_commits_deterministic_command_rejection() {
+        let mut state_machine = ReplicatedControlPlaneStateMachine::empty();
+        let before = state_machine.snapshot().clone();
+        let rejected = state_machine
+            .apply_committed_command(
+                log_id(1, 1),
+                ControlPlaneCommand::MarkNodeAvailability {
+                    node_id: NodeId::new(99),
+                    availability: NodeAvailabilityState::Unavailable,
+                },
+            )
+            .unwrap();
+
+        assert_eq!(rejected.log_id(), log_id(1, 1));
+        assert!(matches!(
+            rejected.outcome(),
+            CommittedControlPlaneCommandOutcome::Rejected(ControlPlaneError::UnknownNode {
+                node_id: 99,
+            })
+        ));
+        assert_eq!(state_machine.snapshot(), &before);
+        assert_eq!(state_machine.last_applied(), Some(log_id(1, 1)));
+
+        let applied = state_machine
+            .apply_committed_command(log_id(1, 2), sample_snapshot_commands()[0].clone())
+            .unwrap();
+        assert!(matches!(
+            applied.outcome(),
+            CommittedControlPlaneCommandOutcome::Applied(_)
+        ));
+        assert_eq!(state_machine.last_applied(), Some(log_id(1, 2)));
+    }
+
+    #[test]
+    fn replicated_control_plane_state_machine_snapshots_after_committed_rejection() {
+        let mut source = ReplicatedControlPlaneStateMachine::empty();
+        source
+            .apply_committed_command(log_id(1, 1), sample_snapshot_commands()[0].clone())
+            .unwrap();
+        source
+            .apply_committed_command(
+                log_id(1, 2),
+                ControlPlaneCommand::MarkNodeAvailability {
+                    node_id: NodeId::new(99),
+                    availability: NodeAvailabilityState::Unavailable,
+                },
+            )
+            .unwrap();
+        assert_eq!(source.last_applied(), Some(log_id(1, 2)));
+
+        let artifact = source.build_snapshot_artifact().unwrap();
+        assert_eq!(artifact.last_applied(), Some(log_id(1, 2)));
+
+        let mut installed = ReplicatedControlPlaneStateMachine::empty();
+        installed.install_snapshot_artifact(artifact).unwrap();
+        assert_eq!(installed.snapshot(), source.snapshot());
+        assert_eq!(installed.last_applied(), Some(log_id(1, 2)));
+        assert_eq!(installed.snapshot_last_applied(), Some(log_id(1, 2)));
+
+        let command = sample_snapshot_commands()[1].clone();
+        let expected = source
+            .apply_committed_command(log_id(1, 3), command.clone())
+            .unwrap()
+            .into_applied_command()
+            .expect("post-rejection follow-up should apply")
+            .into_snapshot();
+        let actual = installed
+            .apply_committed_command(log_id(1, 3), command)
+            .unwrap()
+            .into_applied_command()
+            .expect("post-rejection follow-up should apply after snapshot install")
+            .into_snapshot();
+        assert_eq!(actual, expected);
     }
 
     #[test]
@@ -1609,12 +1733,14 @@ mod tests {
         let expected = source
             .apply_committed_command(log_id(2, 4), command.clone())
             .unwrap()
-            .into_applied()
+            .into_applied_command()
+            .expect("follow-up should apply")
             .into_snapshot();
         let actual = installed
             .apply_committed_command(log_id(2, 4), command)
             .unwrap()
-            .into_applied()
+            .into_applied_command()
+            .expect("follow-up should apply after snapshot install")
             .into_snapshot();
         assert_eq!(actual, expected);
         assert_eq!(installed.last_applied(), Some(log_id(2, 4)));
