@@ -8995,6 +8995,11 @@ Phase 12.1 progress:
   payload tests. This gives the OpenRaft spike a concrete command-log payload
   without adding a new production serialization dependency or relying solely on
   consensus-log integrity checks.
+- Added the matching versioned, CRC64-protected `ClusterControlSnapshot` byte
+  wrapper for snapshot install/restart. It reuses the existing canonical
+  control-plane state text and parser for invariant validation, rejects corrupt
+  or incompatible snapshot frames before parsing, and tests that a decoded
+  snapshot can continue applying commands identically to the original state.
 
 1. define the replicated control-plane state machine:
    - state includes cluster epoch, PG count, PG state, PG acting sets, node

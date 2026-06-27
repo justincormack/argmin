@@ -234,7 +234,7 @@ pub struct ClusterControlSnapshot {
 }
 
 impl ClusterControlSnapshot {
-    fn empty() -> Self {
+    pub(crate) fn empty() -> Self {
         Self {
             authority_incarnation: AuthorityIncarnation::INITIAL,
             cluster_epoch: ClusterEpoch::INITIAL,
@@ -4607,6 +4607,9 @@ pub enum ControlPlaneError {
     #[error("control-plane command decode error: {message}")]
     CommandDecode { message: String },
 
+    #[error("control-plane snapshot decode error: {message}")]
+    SnapshotDecode { message: String },
+
     #[error("control-plane RPC remote error: {message}")]
     RpcRemote { message: String },
 
@@ -4960,7 +4963,7 @@ fn next_epoch(epoch: ClusterEpoch) -> Result<ClusterEpoch, ControlPlaneError> {
     .ok_or(ControlPlaneError::ClusterEpochOverflow)
 }
 
-fn format_snapshot(snapshot: &ClusterControlSnapshot) -> String {
+pub(crate) fn format_snapshot(snapshot: &ClusterControlSnapshot) -> String {
     let mut out = String::new();
     out.push_str("version=11\n");
     out.push_str(&format!(
@@ -5141,7 +5144,7 @@ fn format_node_pg_record(node_id: NodeId, record: &NodePgObservationRecord) -> S
     )
 }
 
-fn parse_snapshot(contents: &str) -> Result<ClusterControlSnapshot, ControlPlaneError> {
+pub(crate) fn parse_snapshot(contents: &str) -> Result<ClusterControlSnapshot, ControlPlaneError> {
     let mut version = None;
     let mut authority_incarnation = None;
     let mut cluster_epoch = None;
