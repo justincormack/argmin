@@ -698,6 +698,11 @@ impl ReplicatedControlPlaneStateMachine {
 
     #[must_use]
     pub fn new(snapshot: ClusterControlSnapshot, last_applied: Option<ControlPlaneLogId>) -> Self {
+        #[cfg(any(test, debug_assertions))]
+        assert_snapshot_invariants(
+            &snapshot,
+            "attempted to create replicated state machine from invalid control-plane snapshot",
+        );
         Self {
             snapshot,
             last_applied,
@@ -781,6 +786,11 @@ impl ReplicatedControlPlaneStateMachine {
         // (payload, last_applied) pair. This adapter guards only against
         // rollback relative to the current applied position.
         let snapshot = decode_control_plane_snapshot(artifact.payload())?;
+        #[cfg(any(test, debug_assertions))]
+        assert_snapshot_invariants(
+            &snapshot,
+            "attempted to install invalid replicated control-plane snapshot",
+        );
         self.snapshot = snapshot;
         self.last_applied = artifact.last_applied();
         self.snapshot_last_applied = artifact.last_applied();
@@ -862,6 +872,13 @@ impl ReplicatedControlPlaneStateMachine {
             });
         }
         Ok(())
+    }
+}
+
+#[cfg(any(test, debug_assertions))]
+fn assert_snapshot_invariants(snapshot: &ClusterControlSnapshot, context: &str) {
+    if let Err(error) = snapshot.validate_invariants() {
+        panic!("{context}: {error}");
     }
 }
 

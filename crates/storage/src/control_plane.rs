@@ -681,7 +681,7 @@ impl ClusterControlSnapshot {
     }
 
     #[cfg(any(test, debug_assertions))]
-    fn validate_invariants(&self) -> Result<(), String> {
+    pub(crate) fn validate_invariants(&self) -> Result<(), String> {
         validate_required_cluster_map_history(
             &self.history,
             &self.pgs,
@@ -7595,6 +7595,27 @@ mod tests {
         }
     }
 
+    fn active_snapshot_without_metadata_proof_epoch(pg_id: PgId) -> ClusterControlSnapshot {
+        let mut snapshot = ClusterControlSnapshot::empty();
+        snapshot.nodes.insert(
+            NodeId::new(1),
+            NodeControlRecord::new(NodeId::new(1), NodeMembershipState::Active),
+        );
+        snapshot.pgs.insert(
+            pg_id,
+            PgControlRecord {
+                pg_id,
+                state: PgState::Active,
+                acting_set: vec![NodeId::new(1)],
+                active_primary: Some(NodeId::new(1)),
+                active_metadata_proof: Some(PgMetadataProof::empty()),
+                active_metadata_proof_epoch: None,
+                ..PgControlRecord::new(pg_id, vec![NodeId::new(1)])
+            },
+        );
+        snapshot
+    }
+
     fn heartbeat(node_id: u32, observed_epoch: ClusterEpoch, _now_ms: u64) -> NodeHeartbeat {
         NodeHeartbeat {
             node_id: NodeId::new(node_id),
@@ -8689,6 +8710,33 @@ mod tests {
 
         let store = FailingStore::new(snapshot);
         let _ = SingleAuthorityControlPlane::open(store);
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "attempted to create replicated state machine from invalid control-plane snapshot"
+    )]
+    fn replicated_state_machine_constructor_validates_control_plane_invariants() {
+        let snapshot = active_snapshot_without_metadata_proof_epoch(PgId::new(28));
+        let _ = crate::control_plane_command::ReplicatedControlPlaneStateMachine::new(
+            snapshot,
+            crate::control_plane_command::ControlPlaneLogId::new(1, 1),
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "attempted to install invalid replicated control-plane snapshot")]
+    fn replicated_snapshot_install_validates_control_plane_invariants_before_mutation() {
+        let invalid_snapshot = active_snapshot_without_metadata_proof_epoch(PgId::new(29));
+        let payload =
+            crate::control_plane_command::encode_control_plane_snapshot(&invalid_snapshot).unwrap();
+        let mut state_machine =
+            crate::control_plane_command::ReplicatedControlPlaneStateMachine::empty();
+        state_machine
+            .install_snapshot_artifact(
+                crate::control_plane_command::ControlPlaneSnapshotArtifact::new(None, payload),
+            )
+            .unwrap();
     }
 
     #[test]
