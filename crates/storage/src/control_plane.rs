@@ -4723,14 +4723,257 @@ fn read_runtime_map_snapshot(
     }
     let pg_routes = read_pg_route_snapshots(reader, "PG routes")?;
     let historical_pg_routes = read_pg_route_snapshots(reader, "historical PG routes")?;
-    Ok(ClusterRuntimeMapSnapshot {
+    let snapshot = ClusterRuntimeMapSnapshot {
         cluster_epoch,
         valid_until_ms,
         freshness_proof,
         nodes,
         pg_routes,
         historical_pg_routes,
-    })
+    };
+    validate_runtime_map_snapshot(&snapshot)?;
+    Ok(snapshot)
+}
+
+fn validate_runtime_map_snapshot(
+    snapshot: &ClusterRuntimeMapSnapshot,
+) -> Result<(), ControlPlaneError> {
+    let mut node_ids = BTreeSet::new();
+    for node in snapshot.nodes() {
+        if !node_ids.insert(node.node_id()) {
+            return Err(ControlPlaneError::RpcProtocol {
+                message: format!(
+                    "runtime map contains duplicate node {}",
+                    node.node_id().as_u32()
+                ),
+            });
+        }
+        if node.endpoint().is_empty() {
+            return Err(ControlPlaneError::RpcProtocol {
+                message: format!(
+                    "runtime map node {} has an empty endpoint",
+                    node.node_id().as_u32()
+                ),
+            });
+        }
+    }
+
+    validate_runtime_map_routes(
+        snapshot.cluster_epoch(),
+        &node_ids,
+        "runtime map",
+        true,
+        snapshot.pg_routes(),
+    )?;
+    validate_runtime_map_routes(
+        snapshot.cluster_epoch(),
+        &node_ids,
+        "runtime map historical",
+        false,
+        snapshot.historical_pg_routes(),
+    )?;
+    validate_runtime_map_transfer_sources(snapshot)
+}
+
+fn validate_runtime_map_transfer_sources(
+    snapshot: &ClusterRuntimeMapSnapshot,
+) -> Result<(), ControlPlaneError> {
+    for route in snapshot
+        .pg_routes()
+        .iter()
+        .chain(snapshot.historical_pg_routes())
+    {
+        let Some(source_route_epoch) = route.peering_metadata_transfer_source_route_epoch() else {
+            continue;
+        };
+        let source_node_id = route
+            .peering_metadata_transfer_source_node_id()
+            .expect("metadata transfer source route fields validated as complete");
+        if source_route_epoch >= route.cluster_epoch() {
+            return Err(ControlPlaneError::RpcProtocol {
+                message: format!(
+                    "runtime map route for PG {} metadata transfer source route epoch {} must be older than transfer route epoch {}",
+                    route.pg_id().get(),
+                    source_route_epoch.get(),
+                    route.cluster_epoch().get()
+                ),
+            });
+        }
+        let source_route = runtime_map_route_at_epoch(snapshot, route.pg_id(), source_route_epoch)
+            .ok_or_else(|| ControlPlaneError::RpcProtocol {
+                message: format!(
+                    "runtime map route for PG {} references missing metadata transfer source route epoch {}",
+                    route.pg_id().get(),
+                    source_route_epoch.get()
+                ),
+            })?;
+        if source_route.primary_node_id() != source_node_id {
+            return Err(ControlPlaneError::RpcProtocol {
+                message: format!(
+                    "runtime map route for PG {} metadata transfer source node {} does not match source route primary {} at epoch {}",
+                    route.pg_id().get(),
+                    source_node_id.as_u32(),
+                    source_route.primary_node_id().as_u32(),
+                    source_route_epoch.get()
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn runtime_map_route_at_epoch(
+    snapshot: &ClusterRuntimeMapSnapshot,
+    pg_id: PgId,
+    cluster_epoch: ClusterEpoch,
+) -> Option<&PgRouteSnapshot> {
+    if cluster_epoch == snapshot.cluster_epoch() {
+        snapshot
+            .pg_routes()
+            .iter()
+            .find(|route| route.pg_id() == pg_id)
+    } else {
+        snapshot
+            .historical_pg_routes()
+            .iter()
+            .find(|route| route.cluster_epoch() == cluster_epoch && route.pg_id() == pg_id)
+    }
+}
+
+fn validate_runtime_map_routes(
+    current_cluster_epoch: ClusterEpoch,
+    node_ids: &BTreeSet<NodeId>,
+    label: &'static str,
+    is_current_route_set: bool,
+    routes: &[PgRouteSnapshot],
+) -> Result<(), ControlPlaneError> {
+    let mut seen_routes = BTreeSet::new();
+    for route in routes {
+        let route_key = (route.cluster_epoch(), route.pg_id());
+        if !seen_routes.insert(route_key) {
+            return Err(ControlPlaneError::RpcProtocol {
+                message: format!(
+                    "{label} contains duplicate route for PG {} at epoch {}",
+                    route.pg_id().get(),
+                    route.cluster_epoch().get()
+                ),
+            });
+        }
+        if is_current_route_set && route.cluster_epoch() != current_cluster_epoch {
+            return Err(ControlPlaneError::RpcProtocol {
+                message: format!(
+                    "runtime map route for PG {} has epoch {}, expected {}",
+                    route.pg_id().get(),
+                    route.cluster_epoch().get(),
+                    current_cluster_epoch.get()
+                ),
+            });
+        }
+        if !is_current_route_set && route.cluster_epoch() >= current_cluster_epoch {
+            return Err(ControlPlaneError::RpcProtocol {
+                message: format!(
+                    "{label} route for PG {} has epoch {}, expected an epoch older than {}",
+                    route.pg_id().get(),
+                    route.cluster_epoch().get(),
+                    current_cluster_epoch.get()
+                ),
+            });
+        }
+        if route.acting_set().is_empty() {
+            return Err(ControlPlaneError::RpcProtocol {
+                message: format!(
+                    "{label} route for PG {} has an empty acting set",
+                    route.pg_id().get()
+                ),
+            });
+        }
+        let mut acting_set = BTreeSet::new();
+        for &node_id in route.acting_set() {
+            if !acting_set.insert(node_id) {
+                return Err(ControlPlaneError::RpcProtocol {
+                    message: format!(
+                        "{label} route for PG {} repeats acting-set node {}",
+                        route.pg_id().get(),
+                        node_id.as_u32()
+                    ),
+                });
+            }
+            if !node_ids.contains(&node_id) {
+                return Err(ControlPlaneError::RpcProtocol {
+                    message: format!(
+                        "{label} route for PG {} references unknown acting-set node {}",
+                        route.pg_id().get(),
+                        node_id.as_u32()
+                    ),
+                });
+            }
+        }
+        if !acting_set.contains(&route.primary_node_id()) {
+            return Err(ControlPlaneError::RpcProtocol {
+                message: format!(
+                    "{label} route for PG {} primary {} is outside the acting set",
+                    route.pg_id().get(),
+                    route.primary_node_id().as_u32()
+                ),
+            });
+        }
+        if route.primary_lease_deadline_ms().is_some() && route.state() != PgState::Active {
+            return Err(ControlPlaneError::RpcProtocol {
+                message: format!(
+                    "{label} route for PG {} has serving authority but is {:?}",
+                    route.pg_id().get(),
+                    route.state()
+                ),
+            });
+        }
+        if route.peering_metadata_transfer().is_some()
+            && (route
+                .peering_metadata_transfer_source_route_epoch()
+                .is_none()
+                || route.peering_metadata_transfer_source_node_id().is_none())
+        {
+            return Err(ControlPlaneError::RpcProtocol {
+                message: format!(
+                    "{label} route for PG {} has incomplete metadata transfer source route",
+                    route.pg_id().get()
+                ),
+            });
+        }
+        if let Some(source_node_id) = route.peering_metadata_transfer_source_node_id() {
+            if !node_ids.contains(&source_node_id) {
+                return Err(ControlPlaneError::RpcProtocol {
+                    message: format!(
+                        "{label} route for PG {} references unknown metadata transfer source node {}",
+                        route.pg_id().get(),
+                        source_node_id.as_u32()
+                    ),
+                });
+            }
+        }
+        if route.peering_metadata_transfer().is_some() && route.state() != PgState::Peering {
+            return Err(ControlPlaneError::RpcProtocol {
+                message: format!(
+                    "{label} route for PG {} has metadata transfer state but is {:?}",
+                    route.pg_id().get(),
+                    route.state()
+                ),
+            });
+        }
+        if route.peering_metadata_transfer().is_none()
+            && (route
+                .peering_metadata_transfer_source_route_epoch()
+                .is_some()
+                || route.peering_metadata_transfer_source_node_id().is_some())
+        {
+            return Err(ControlPlaneError::RpcProtocol {
+                message: format!(
+                    "{label} route for PG {} has source route fields without metadata transfer",
+                    route.pg_id().get()
+                ),
+            });
+        }
+    }
+    Ok(())
 }
 
 fn read_runtime_map_freshness_proof(
@@ -9468,6 +9711,200 @@ mod tests {
     }
 
     #[test]
+    fn control_plane_rpc_rejects_duplicate_runtime_map_nodes() {
+        let mut snapshot = runtime_map_test_snapshot_with_active_route();
+        snapshot.nodes.push(snapshot.nodes[0].clone());
+        let error = decode_runtime_map_test_snapshot(snapshot).unwrap_err();
+
+        assert!(matches!(
+            error,
+            ControlPlaneError::RpcProtocol { message }
+                if message.contains("runtime map contains duplicate node 1")
+        ));
+    }
+
+    #[test]
+    fn control_plane_rpc_rejects_runtime_map_route_unknown_node() {
+        let mut snapshot = runtime_map_test_snapshot_with_active_route();
+        snapshot.pg_routes[0].acting_set.push(NodeId::new(99));
+        let error = decode_runtime_map_test_snapshot(snapshot).unwrap_err();
+
+        assert!(matches!(
+            error,
+            ControlPlaneError::RpcProtocol { message }
+                if message.contains("runtime map route for PG 7 references unknown acting-set node 99")
+        ));
+    }
+
+    #[test]
+    fn control_plane_rpc_rejects_duplicate_runtime_map_pg_routes() {
+        let mut snapshot = runtime_map_test_snapshot_with_active_route();
+        snapshot.pg_routes.push(snapshot.pg_routes[0].clone());
+        let error = decode_runtime_map_test_snapshot(snapshot).unwrap_err();
+
+        assert!(matches!(
+            error,
+            ControlPlaneError::RpcProtocol { message }
+                if message.contains("runtime map contains duplicate route for PG 7")
+        ));
+    }
+
+    #[test]
+    fn control_plane_rpc_rejects_runtime_map_transfer_without_source_route() {
+        let mut snapshot = runtime_map_test_snapshot_with_active_route();
+        let route = &mut snapshot.pg_routes[0];
+        route.state = PgState::Peering;
+        route.primary_lease_deadline_ms = None;
+        route.peering_metadata_transfer = Some(PgMetadataTransferProof::new(
+            ClusterEpoch::INITIAL,
+            PgMetadataProof::new(1, 2, 3),
+        ));
+        let error = decode_runtime_map_test_snapshot(snapshot).unwrap_err();
+
+        assert!(matches!(
+            error,
+            ControlPlaneError::RpcProtocol { message }
+                if message.contains("runtime map route for PG 7 has incomplete metadata transfer source route")
+        ));
+    }
+
+    #[test]
+    fn control_plane_rpc_rejects_historical_runtime_route_at_current_epoch() {
+        let mut snapshot = runtime_map_test_snapshot_with_active_route();
+        snapshot
+            .historical_pg_routes
+            .push(snapshot.pg_routes[0].without_serving_authority());
+        let error = decode_runtime_map_test_snapshot(snapshot).unwrap_err();
+
+        assert!(matches!(
+            error,
+            ControlPlaneError::RpcProtocol { message }
+                if message.contains("runtime map historical route for PG 7 has epoch")
+                    && message.contains("expected an epoch older than")
+        ));
+    }
+
+    #[test]
+    fn control_plane_rpc_rejects_historical_runtime_route_from_future_epoch() {
+        let mut snapshot = runtime_map_test_snapshot_with_active_route();
+        let mut future_route = snapshot.pg_routes[0].without_serving_authority();
+        future_route.cluster_epoch = ClusterEpoch::new(snapshot.cluster_epoch().get() + 1).unwrap();
+        snapshot.historical_pg_routes.push(future_route);
+        let error = decode_runtime_map_test_snapshot(snapshot).unwrap_err();
+
+        assert!(matches!(
+            error,
+            ControlPlaneError::RpcProtocol { message }
+                if message.contains("runtime map historical route for PG 7 has epoch")
+                    && message.contains("expected an epoch older than")
+        ));
+    }
+
+    #[test]
+    fn control_plane_rpc_rejects_runtime_map_transfer_unknown_source_node() {
+        let mut snapshot = runtime_map_test_snapshot_with_active_route();
+        let route = &mut snapshot.pg_routes[0];
+        route.state = PgState::Peering;
+        route.primary_lease_deadline_ms = None;
+        route.peering_metadata_transfer = Some(PgMetadataTransferProof::new(
+            ClusterEpoch::INITIAL,
+            PgMetadataProof::new(1, 2, 3),
+        ));
+        route.peering_metadata_transfer_source_route_epoch = Some(ClusterEpoch::INITIAL);
+        route.peering_metadata_transfer_source_node_id = Some(NodeId::new(99));
+        let error = decode_runtime_map_test_snapshot(snapshot).unwrap_err();
+
+        assert!(matches!(
+            error,
+            ControlPlaneError::RpcProtocol { message }
+                if message.contains("runtime map route for PG 7 references unknown metadata transfer source node 99")
+        ));
+    }
+
+    #[test]
+    fn control_plane_rpc_rejects_runtime_map_transfer_missing_source_route_epoch() {
+        let snapshot = runtime_map_test_snapshot_with_transfer_route(false);
+        let error = decode_runtime_map_test_snapshot(snapshot).unwrap_err();
+
+        assert!(matches!(
+            error,
+            ControlPlaneError::RpcProtocol { message }
+                if message.contains("runtime map route for PG 7 references missing metadata transfer source route epoch")
+        ));
+    }
+
+    #[test]
+    fn control_plane_rpc_rejects_runtime_map_transfer_source_primary_mismatch() {
+        let mut snapshot = runtime_map_test_snapshot_with_transfer_route(true);
+        snapshot.nodes.push(NodeRouteSnapshot {
+            node_id: NodeId::new(2),
+            node_incarnation: 12,
+            endpoint: "/tmp/argmin-node-2.sock".to_owned(),
+            cluster_map_history_floor_epoch: None,
+        });
+        let historical = &mut snapshot.historical_pg_routes[0];
+        historical.primary_node_id = NodeId::new(2);
+        historical.acting_set = vec![NodeId::new(2)];
+        let error = decode_runtime_map_test_snapshot(snapshot).unwrap_err();
+
+        assert!(matches!(
+            error,
+            ControlPlaneError::RpcProtocol { message }
+                if message.contains("metadata transfer source node 1 does not match source route primary 2")
+        ));
+    }
+
+    #[test]
+    fn control_plane_rpc_rejects_runtime_map_transfer_source_route_self_reference() {
+        let mut snapshot = runtime_map_test_snapshot_with_transfer_route(true);
+        let destination_epoch = snapshot.cluster_epoch;
+        snapshot.historical_pg_routes.clear();
+        let route = &mut snapshot.pg_routes[0];
+        route.peering_metadata_transfer_source_route_epoch = Some(destination_epoch);
+        let error = decode_runtime_map_test_snapshot(snapshot).unwrap_err();
+
+        assert!(matches!(
+            error,
+            ControlPlaneError::RpcProtocol { message }
+                if message.contains("metadata transfer source route epoch")
+                    && message.contains("must be older than transfer route epoch")
+        ));
+    }
+
+    #[test]
+    fn control_plane_rpc_rejects_historical_runtime_map_transfer_source_route_forward_reference() {
+        let mut snapshot = runtime_map_test_snapshot_with_transfer_route(true);
+        let mut transfer_route = snapshot.pg_routes[0].clone();
+        let transfer_epoch = ClusterEpoch::new(snapshot.cluster_epoch().get() - 1).unwrap();
+        transfer_route.cluster_epoch = transfer_epoch;
+        transfer_route.peering_metadata_transfer_source_route_epoch =
+            Some(snapshot.cluster_epoch());
+        transfer_route.peering_metadata_transfer_source_node_id = Some(NodeId::new(1));
+        snapshot.pg_routes[0].peering_metadata_transfer = None;
+        snapshot.pg_routes[0].peering_metadata_transfer_source_route_epoch = None;
+        snapshot.pg_routes[0].peering_metadata_transfer_source_node_id = None;
+        snapshot.historical_pg_routes.clear();
+        snapshot.historical_pg_routes.push(transfer_route);
+        let error = decode_runtime_map_test_snapshot(snapshot).unwrap_err();
+
+        assert!(matches!(
+            error,
+            ControlPlaneError::RpcProtocol { message }
+                if message.contains("metadata transfer source route epoch")
+                    && message.contains("must be older than transfer route epoch")
+        ));
+    }
+
+    #[test]
+    fn control_plane_rpc_round_trips_runtime_map_transfer_source_route_reference() {
+        let snapshot = runtime_map_test_snapshot_with_transfer_route(true);
+        assert_eq!(
+            decode_runtime_map_test_snapshot(snapshot.clone()).unwrap(),
+            snapshot
+        );
+    }
+
+    #[test]
     fn control_plane_rpc_round_trips_single_authority_runtime_map_freshness_proof() {
         let snapshot = runtime_map_test_snapshot(RuntimeMapFreshnessProof::SingleAuthority {
             authority_incarnation: AuthorityIncarnation::INITIAL,
@@ -9557,6 +9994,17 @@ mod tests {
         write_u64(out, 1_000);
     }
 
+    fn decode_runtime_map_test_snapshot(
+        snapshot: ClusterRuntimeMapSnapshot,
+    ) -> Result<ClusterRuntimeMapSnapshot, ControlPlaneError> {
+        let mut payload = Vec::new();
+        write_runtime_map_snapshot(&mut payload, &snapshot).unwrap();
+        let mut reader = PayloadReader::new(&payload);
+        let decoded = read_runtime_map_snapshot(&mut reader)?;
+        reader.finish()?;
+        Ok(decoded)
+    }
+
     fn runtime_map_test_snapshot(
         freshness_proof: RuntimeMapFreshnessProof,
     ) -> ClusterRuntimeMapSnapshot {
@@ -9568,6 +10016,66 @@ mod tests {
             pg_routes: Vec::new(),
             historical_pg_routes: Vec::new(),
         }
+    }
+
+    fn runtime_map_test_snapshot_with_active_route() -> ClusterRuntimeMapSnapshot {
+        ClusterRuntimeMapSnapshot {
+            cluster_epoch: ClusterEpoch::INITIAL,
+            valid_until_ms: Some(12_345),
+            freshness_proof: RuntimeMapFreshnessProof::SingleAuthority {
+                authority_incarnation: AuthorityIncarnation::INITIAL,
+                issued_at_ms: 12_000,
+            },
+            nodes: vec![NodeRouteSnapshot {
+                node_id: NodeId::new(1),
+                node_incarnation: 11,
+                endpoint: "/tmp/argmin-node-1.sock".to_owned(),
+                cluster_map_history_floor_epoch: None,
+            }],
+            pg_routes: vec![PgRouteSnapshot {
+                cluster_epoch: ClusterEpoch::INITIAL,
+                pg_id: PgId::new(7),
+                primary_node_id: NodeId::new(1),
+                acting_set: vec![NodeId::new(1)],
+                state: PgState::Active,
+                primary_lease_deadline_ms: Some(12_345),
+                peering_metadata_transfer: None,
+                peering_metadata_transfer_source_route_epoch: None,
+                peering_metadata_transfer_source_node_id: None,
+            }],
+            historical_pg_routes: Vec::new(),
+        }
+    }
+
+    fn runtime_map_test_snapshot_with_transfer_route(
+        include_source_route: bool,
+    ) -> ClusterRuntimeMapSnapshot {
+        let mut snapshot = runtime_map_test_snapshot_with_active_route();
+        let source_epoch = snapshot.cluster_epoch;
+        let destination_epoch = ClusterEpoch::new(source_epoch.get() + 1).unwrap();
+        let source_route = snapshot.pg_routes[0].without_serving_authority();
+        snapshot.cluster_epoch = destination_epoch;
+        snapshot.valid_until_ms = None;
+        snapshot.freshness_proof = RuntimeMapFreshnessProof::SingleAuthority {
+            authority_incarnation: AuthorityIncarnation::INITIAL,
+            issued_at_ms: 12_001,
+        };
+        {
+            let route = &mut snapshot.pg_routes[0];
+            route.cluster_epoch = destination_epoch;
+            route.state = PgState::Peering;
+            route.primary_lease_deadline_ms = None;
+            route.peering_metadata_transfer = Some(PgMetadataTransferProof::new(
+                source_epoch,
+                PgMetadataProof::new(1, 2, 3),
+            ));
+            route.peering_metadata_transfer_source_route_epoch = Some(source_epoch);
+            route.peering_metadata_transfer_source_node_id = Some(NodeId::new(1));
+        }
+        if include_source_route {
+            snapshot.historical_pg_routes.push(source_route);
+        }
+        snapshot
     }
 
     #[test]
