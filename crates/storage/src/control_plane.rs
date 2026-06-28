@@ -789,6 +789,18 @@ impl ClusterControlSnapshot {
                             pg.pg_id.get()
                         ));
                     }
+                    if let (Some(floor), Some(transfer)) = (
+                        pg.peering_metadata_proof_floor,
+                        pg.peering_metadata_transfer,
+                    ) {
+                        if !metadata_proof_satisfies_active_floor(floor, transfer.metadata_proof())
+                        {
+                            return Err(format!(
+                                "peering PG {} metadata transfer proof is below the proof floor",
+                                pg.pg_id.get()
+                            ));
+                        }
+                    }
                     if pg.peering_metadata_transfer.is_some() && pg.metadata_transfer_fenced {
                         return Err(format!(
                             "peering PG {} has destination metadata transfer state and source transfer fence",
@@ -8552,6 +8564,71 @@ mod tests {
         let error = snapshot.validate_invariants().unwrap_err();
         assert!(
             error.contains("destination metadata transfer state and source transfer fence"),
+            "unexpected invariant error: {error}"
+        );
+    }
+
+    #[test]
+    fn control_snapshot_invariants_reject_transfer_proof_below_floor() {
+        let tmp = test_util::tempdir();
+        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+        for node_id in [1, 2] {
+            authority
+                .set_node_membership(NodeId::new(node_id), NodeMembershipState::Active)
+                .unwrap();
+            assert!(heartbeat_until_serving(&mut authority, node_id, 1_000).serving());
+        }
+        let pg_id = PgId::new(25);
+        let source_proof = PgMetadataProof::new(7, 8, 9);
+        authority
+            .set_pg_acting_set(pg_id, vec![NodeId::new(1)])
+            .unwrap();
+        heartbeat_with_pg_proof(
+            &mut authority,
+            1,
+            pg_id.get(),
+            PgState::Peering,
+            source_proof,
+            false,
+            2_000,
+        );
+        authority
+            .complete_pg_peering(
+                pg_id,
+                NodeId::new(1),
+                node_incarnation(&authority, 1),
+                2_010,
+            )
+            .unwrap();
+        heartbeat_with_pg_proof(
+            &mut authority,
+            1,
+            pg_id.get(),
+            PgState::Active,
+            source_proof,
+            false,
+            2_020,
+        );
+
+        let imported_proof = PgMetadataProof::new(8, 9, 10);
+        let transfer = PgMetadataTransferProof::new_with_imported_metadata_proof(
+            authority.snapshot().cluster_epoch(),
+            source_proof,
+            imported_proof,
+        );
+        authority
+            .set_pg_acting_set_with_metadata_transfer(pg_id, vec![NodeId::new(2)], transfer)
+            .unwrap();
+        let mut snapshot = authority.snapshot().clone();
+        snapshot
+            .pgs
+            .get_mut(&pg_id)
+            .unwrap()
+            .peering_metadata_proof_floor = Some(PgMetadataProof::new(9, 10, 11));
+        let error = snapshot.validate_invariants().unwrap_err();
+        assert!(
+            error.contains("metadata transfer proof is below the proof floor"),
             "unexpected invariant error: {error}"
         );
     }
