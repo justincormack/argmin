@@ -2509,6 +2509,11 @@ impl LocalClusterMap {
             .collect();
     }
 
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_set_route_map_valid_until_ms(&mut self, valid_until_ms: Option<u64>) {
+        self.route_map_valid_until_ms = valid_until_ms;
+    }
+
     pub fn process_local_registry_key(&self) -> usize {
         self.process_local_registry_key
     }

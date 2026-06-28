@@ -79,7 +79,7 @@ fn lock_mutex_unpoisoned<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 pub(super) fn map_store_error(error: storage::StoreError) -> ServerError {
-    if store_error_is_command_contention(&error) {
+    if store_error_is_retryable_contention(&error) {
         ServerError::OperationAborted
     } else if store_error_is_resource_exhausted(&error) {
         ServerError::SlowDown
@@ -122,13 +122,35 @@ pub(super) fn metadata_error_is_command_contention(error: &storage::MetadataErro
     )
 }
 
-fn store_error_is_command_contention(error: &storage::StoreError) -> bool {
+fn store_error_is_retryable_contention(error: &storage::StoreError) -> bool {
     match error {
         storage::StoreError::MetadataCommandContention { .. }
-        | storage::StoreError::RouteMapExpired { .. } => true,
-        storage::StoreError::ShardStore { source, .. } => store_error_is_command_contention(source),
+        | storage::StoreError::StalePayloadOperation { .. }
+        | storage::StoreError::StaleMetadataCommand { .. }
+        | storage::StoreError::StaleMetadataPrimaryBridge { .. }
+        | storage::StoreError::StaleMetadataOperation { .. }
+        | storage::StoreError::StaleMetadataRoute { .. }
+        | storage::StoreError::RouteMapExpired { .. }
+        | storage::StoreError::StaleShardOperation { .. }
+        | storage::StoreError::StaleShardLocation { .. }
+        | storage::StoreError::PgNotActive { .. }
+        | storage::StoreError::ShardPgNotActive { .. } => true,
+        storage::StoreError::StorageRpc { message, .. } => {
+            storage_rpc_message_is_retryable_route_state(message)
+        }
+        storage::StoreError::ShardStore { source, .. } => {
+            store_error_is_retryable_contention(source)
+        }
         _ => false,
     }
+}
+
+fn storage_rpc_message_is_retryable_route_state(message: &str) -> bool {
+    message.starts_with("StaleShardLocation: ")
+        || message.starts_with("InactivePgRoute: ")
+        || message.starts_with("NonActingSetAccess: ")
+        || message.starts_with("WrongClusterEpoch: ")
+        || message.contains("metadata command contention during")
 }
 
 fn store_error_is_resource_exhausted(error: &storage::StoreError) -> bool {

@@ -3064,13 +3064,6 @@ mod tests {
             .read_checked_segment_payload(&segment, None, None)
             .unwrap_err();
 
-        assert!(matches!(
-            err,
-            ServerError::Store(StoreError::StalePayloadOperation {
-                pg_id: 0,
-                operation_epoch,
-                current_epoch: ClusterEpoch::INITIAL,
-            }) if operation_epoch == ClusterEpoch::new(2).unwrap()
-        ));
+        assert!(matches!(err, ServerError::OperationAborted), "{err:?}");
     }
 }

@@ -2075,7 +2075,10 @@ mod lifecycle_prop_tests {
         ) {
             let trace = render_trace(&ops);
             let tmp = test_util::tempdir();
-            let coord = setup_coordinator_without_lifecycle_sweeper(tmp.path());
+            let coord = setup_coordinator_with_pg_count_without_background_sweepers(
+                tmp.path(),
+                DEFAULT_TEST_PG_COUNT,
+            );
             coord
                 .create_bucket_for_owner("default-owner", PROP_BUCKET, false)
                 .unwrap();

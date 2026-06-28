@@ -8974,7 +8974,24 @@ soak-clean:
     optimization should remain secondary to correctness: `DeleteBucket` must not
     return success while visible object/MPU state can still appear, but it should
     avoid long foreground waits when a safe `BucketNotEmpty` or retryable
-    response is already knowable.
+    response is already knowable;
+12. replace stringified remote `StorageRpc` retry classification with typed
+    storage RPC error-code propagation through `StoreError`, so server-core can
+    classify stale route/epoch/PG-state and command-contention responses without
+    parsing display text.
+
+Status update:
+
+- The first error-mapping pass now treats stale route/epoch/PG-state failures,
+  route-map expiry, remote storage-node route-state errors, and remote metadata
+  command contention as retryable `OperationAborted` at the server-core storage
+  boundary. Storage-node overload remains `SlowDown`.
+- Added coordinator-level regressions for `DeleteBucket` using an already
+  expired route map and for bucket-delete finalization using an expired route
+  map. The finalizer command-contention regression remains in place.
+- Remaining close-out work is concentrated in deterministic interleaving tests,
+  cleanup stress/diagnostics, and checking whether any foreground loops still
+  need an earlier retry boundary before route-map validity expires.
 
 Exit criteria:
 

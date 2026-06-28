@@ -1219,6 +1219,47 @@ fn install_same_store_next_epoch_runtime_map(
     handle.install(candidate).unwrap();
 }
 
+fn same_store_cluster_with_route_map_validity(
+    initial: &Arc<StorageCluster>,
+    node_root: &std::path::Path,
+    route_map_valid_until_ms: Option<u64>,
+) -> Arc<StorageCluster> {
+    let node_count = u32::from(initial.default_payload_ec_shape().k)
+        + u32::from(initial.default_payload_ec_shape().m);
+    let configs = (0..node_count)
+        .map(|node_id| {
+            LocalNodeStoreConfig::new(
+                NodeId::new(node_id),
+                node_root.join(format!("node-{node_id:04}")),
+            )
+        })
+        .collect::<Vec<_>>();
+    let routes = initial
+        .local_pg_routes()
+        .map(|route| {
+            let route = storage::control_plane::PgRouteSnapshot::reconstructed(
+                route.cluster_epoch(),
+                route.pg_id(),
+                route.primary_node_id(),
+                route.acting_set().to_vec(),
+                route.state(),
+            );
+            LocalPgRoute::from(&route)
+        })
+        .collect::<Vec<_>>();
+    let mut local_map = LocalClusterMap::open_frontend_with_configs_and_pg_routes(
+        NodeId::new(0),
+        configs,
+        initial.test_pg_ids(),
+        initial.default_payload_ec_shape(),
+        initial.cluster_epoch(),
+        routes,
+    )
+    .unwrap();
+    local_map.test_set_route_map_valid_until_ms(route_map_valid_until_ms);
+    StorageCluster::from_local_map(Arc::new(local_map)).unwrap()
+}
+
 fn install_same_store_next_epoch_runtime_map_with_peering_pg(
     handle: &StorageClusterRuntimeMapHandle,
     initial: &Arc<StorageCluster>,
@@ -3329,15 +3370,8 @@ fn read_and_list_fail_closed_while_object_metadata_pg_is_peering() {
 
     let assert_pg_not_active = |operation: &str, error: ServerError| {
         assert!(
-            matches!(
-                error,
-                ServerError::Store(storage::StoreError::PgNotActive {
-                    pg_id,
-                    cluster_epoch,
-                    state: PgState::Peering,
-                }) if pg_id == peering_pg && cluster_epoch == current_epoch
-            ),
-            "{operation} should fail closed on the Peering object metadata PG, got {error:?}"
+            matches!(error, ServerError::OperationAborted),
+            "{operation} should fail closed with a retryable response on Peering object metadata PG {peering_pg} at epoch {current_epoch:?}, got {error:?}"
         );
     };
 
@@ -4207,6 +4241,13 @@ fn storage_rpc_resource_exhaustion_maps_to_slow_down() {
         }
     }
 
+    fn assert_maps_to_operation_aborted(error: storage::StoreError) {
+        assert!(
+            matches!(super::map_store_error(error), ServerError::OperationAborted),
+            "expected stale/retryable storage error to map to OperationAborted"
+        );
+    }
+
     assert!(matches!(
         super::map_store_error(nested_resource_exhausted()),
         ServerError::SlowDown
@@ -4222,38 +4263,88 @@ fn storage_rpc_resource_exhaustion_maps_to_slow_down() {
         }),
         ServerError::OperationAborted
     ));
-    assert!(matches!(
-        super::map_store_error(storage::StoreError::RouteMapExpired {
+    assert_maps_to_operation_aborted(storage::StoreError::StalePayloadOperation {
+        pg_id: 2,
+        operation_epoch: storage::ClusterEpoch::INITIAL,
+        current_epoch: storage::ClusterEpoch::new(2).unwrap(),
+    });
+    assert_maps_to_operation_aborted(storage::StoreError::StaleMetadataPrimaryBridge {
+        metadata_node_id: 1,
+        operation_epoch: storage::ClusterEpoch::INITIAL,
+        current_epoch: storage::ClusterEpoch::new(2).unwrap(),
+    });
+    assert_maps_to_operation_aborted(storage::StoreError::StaleMetadataOperation {
+        pg_id: 2,
+        operation_epoch: storage::ClusterEpoch::INITIAL,
+        current_epoch: storage::ClusterEpoch::new(2).unwrap(),
+    });
+    assert_maps_to_operation_aborted(storage::StoreError::StaleMetadataRoute {
+        pg_id: 2,
+        route_epoch: storage::ClusterEpoch::INITIAL,
+        current_epoch: storage::ClusterEpoch::new(2).unwrap(),
+    });
+    assert_maps_to_operation_aborted(storage::StoreError::RouteMapExpired {
+        cluster_epoch: storage::ClusterEpoch::INITIAL,
+        valid_until_ms: 1_000,
+        now_ms: 1_001,
+    });
+    assert_maps_to_operation_aborted(storage::StoreError::StaleMetadataCommand {
+        node_id: 1,
+        pg_id: 2,
+        command_epoch: storage::ClusterEpoch::INITIAL,
+        current_epoch: storage::ClusterEpoch::new(2).unwrap(),
+    });
+    assert_maps_to_operation_aborted(storage::StoreError::StaleShardOperation {
+        node_id: 1,
+        pg_id: 2,
+        operation_epoch: storage::ClusterEpoch::INITIAL,
+        current_epoch: storage::ClusterEpoch::new(2).unwrap(),
+    });
+    assert_maps_to_operation_aborted(storage::StoreError::StaleShardLocation {
+        node_id: 1,
+        pg_id: 2,
+        location_epoch: storage::ClusterEpoch::INITIAL,
+        current_epoch: storage::ClusterEpoch::new(2).unwrap(),
+    });
+    assert_maps_to_operation_aborted(storage::StoreError::PgNotActive {
+        pg_id: 2,
+        cluster_epoch: storage::ClusterEpoch::INITIAL,
+        state: PgState::Peering,
+    });
+    assert_maps_to_operation_aborted(storage::StoreError::ShardPgNotActive {
+        node_id: 1,
+        pg_id: 2,
+        cluster_epoch: storage::ClusterEpoch::INITIAL,
+        state: PgState::Peering,
+    });
+    assert_maps_to_operation_aborted(storage::StoreError::StorageRpc {
+        node_id: 1,
+        operation: "test operation",
+        message: "InactivePgRoute: PG 2 is Peering".to_string(),
+    });
+    assert_maps_to_operation_aborted(storage::StoreError::StorageRpc {
+        node_id: 1,
+        operation: "test operation",
+        message: "Internal: metadata command contention during bucket delete begin".to_string(),
+    });
+    assert_maps_to_operation_aborted(storage::StoreError::ShardStore {
+        node_id: 1,
+        pg_id: 2,
+        cluster_epoch: storage::ClusterEpoch::INITIAL,
+        source: Box::new(storage::StoreError::MetadataCommandContention {
+            context: "pending command displaced during cleanup",
+        }),
+    });
+    assert_maps_to_operation_aborted(storage::StoreError::ShardStore {
+        node_id: 1,
+        pg_id: 2,
+        cluster_epoch: storage::ClusterEpoch::INITIAL,
+        source: Box::new(storage::StoreError::RouteMapExpired {
             cluster_epoch: storage::ClusterEpoch::INITIAL,
             valid_until_ms: 1_000,
             now_ms: 1_001,
         }),
-        ServerError::OperationAborted
-    ));
-    assert!(matches!(
-        super::map_store_error(storage::StoreError::ShardStore {
-            node_id: 1,
-            pg_id: 2,
-            cluster_epoch: storage::ClusterEpoch::INITIAL,
-            source: Box::new(storage::StoreError::MetadataCommandContention {
-                context: "pending command displaced during cleanup",
-            }),
-        }),
-        ServerError::OperationAborted
-    ));
-    assert!(matches!(
-        super::map_store_error(storage::StoreError::ShardStore {
-            node_id: 1,
-            pg_id: 2,
-            cluster_epoch: storage::ClusterEpoch::INITIAL,
-            source: Box::new(storage::StoreError::RouteMapExpired {
-                cluster_epoch: storage::ClusterEpoch::INITIAL,
-                valid_until_ms: 1_000,
-                now_ms: 1_001,
-            }),
-        }),
-        ServerError::OperationAborted
-    ));
+    });
     assert!(matches!(
         Coordinator::map_object_pg_action_error(storage::ObjectPgActionError::Store(
             resource_exhausted(),
@@ -6479,6 +6570,63 @@ fn bucket_delete_finalizer_request_maps_command_log_conflict_to_operation_aborte
 }
 
 #[test]
+fn bucket_delete_finalizer_expired_route_map_maps_to_operation_aborted() {
+    let tmp = test_util::tempdir();
+    let storage_cluster = open_test_storage_cluster(tmp.path(), &[0]);
+    let coord = setup_same_process_coordinator_with_storage_cluster_without_background_sweepers(
+        Arc::clone(&storage_cluster),
+    );
+    coord
+        .create_bucket_for_owner("default-owner", "bucket", false)
+        .unwrap();
+
+    let (upload_id, parts) = create_upload_with_parts(&coord, "bucket", "key", &[(1, b"part1")]);
+    coord
+        .complete_multipart_upload(&CompleteMultipartUploadRequest {
+            upload: multipart_object_request_with_expected_owner(
+                "bucket",
+                "key",
+                &upload_id,
+                test_requester(),
+                None,
+            ),
+            parts: &parts,
+            claimed_checksum: None,
+            expected_object_size: None,
+            cond: &WriteCondition::default(),
+            sse_customer: None,
+        })
+        .unwrap();
+    coord
+        .delete_object(&delete_object_request(
+            "bucket",
+            "key",
+            None,
+            test_requester(),
+            false,
+            NO_DELETE,
+        ))
+        .unwrap();
+    delete_bucket_test(&coord, "bucket").unwrap();
+
+    let bucket = trusted_bucket_name("bucket");
+    let expired_cluster =
+        same_store_cluster_with_route_map_validity(&storage_cluster, tmp.path(), Some(1));
+    let expired_coord =
+        setup_same_process_coordinator_with_storage_cluster_without_background_sweepers(
+            expired_cluster,
+        );
+    let err = expired_coord
+        .read_runtime()
+        .try_finalize_bucket_delete_for(&bucket)
+        .unwrap_err();
+    assert!(
+        matches!(err, ServerError::OperationAborted),
+        "expected bucket delete finalizer route-map expiry to map to OperationAborted, got {err:?}"
+    );
+}
+
+#[test]
 fn lifecycle_current_expiry_maps_command_log_conflict_to_operation_aborted() {
     let tmp = test_util::tempdir();
     let storage_cluster = open_test_storage_cluster(tmp.path(), &[0]);
@@ -8388,6 +8536,23 @@ fn delete_bucket_authorizes_idempotent_retry_while_deleting() {
 
     delete_bucket_test(&coord, bucket)
         .expect("idempotent DeleteBucket retry should authorize while bucket delete drain exists");
+}
+
+#[test]
+fn delete_bucket_expired_route_map_maps_to_operation_aborted() {
+    let tmp = test_util::tempdir();
+    let bucket = "bucket-delete-expired-route-map";
+    let storage_cluster = open_test_storage_cluster(tmp.path(), &[0]);
+    let coord = setup_direct_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
+    coord
+        .create_bucket_for_owner("default-owner", bucket, false)
+        .unwrap();
+
+    let expired_cluster =
+        same_store_cluster_with_route_map_validity(&storage_cluster, tmp.path(), Some(1));
+    let expired_coord = setup_direct_coordinator_with_storage_cluster(expired_cluster);
+    let err = delete_bucket_test(&expired_coord, bucket).unwrap_err();
+    assert!(matches!(err, ServerError::OperationAborted), "{err:?}");
 }
 
 #[test]
