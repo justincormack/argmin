@@ -9419,6 +9419,10 @@ Phase 12.1 progress:
   `ControlPlaneRaftAuthority::linearized_runtime_map_snapshot`, and the test
   verifies the freshness proof is stamped with the leader state machine's
   actual applied tip.
+- Added a two-node OpenRaft semantic-rejection smoke. A deterministic
+  `UnknownNode` command now returns as a rejected client-write outcome, still
+  advances the replicated applied cursor on the follower, and leaves the
+  follower's control-plane state unmutated.
 - Isolated the public OpenRaft smokes with distinct cluster names so the normal
   parallel `control_plane_raft` test group cannot share OpenRaft test identity
   while still exercising the real client-write and read-index paths.

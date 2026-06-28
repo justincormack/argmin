@@ -3311,6 +3311,76 @@ mod tests {
     }
 
     #[test]
+    fn control_plane_openraft_two_node_rejected_command_replicates_without_mutation() {
+        ControlPlaneRaftTypeConfig::run(async {
+            let (authority1, authority2) = initialized_two_node_authorities(
+                "control-plane-raft-two-node-rejected-command-test",
+                401,
+                402,
+            )
+            .await;
+
+            let bootstrap = authority1
+                .submit_control_plane_command(ControlPlaneCommand::BootstrapInitialClusterMap {
+                    nodes: vec![
+                        (NodeId::new(401), "node-401".to_string()),
+                        (NodeId::new(402), "node-402".to_string()),
+                    ],
+                    pg_ids: vec![PgId::new(0)],
+                })
+                .await
+                .unwrap();
+            assert!(matches!(
+                bootstrap.outcome(),
+                ControlPlaneRaftCommandOutcome::Applied(
+                    ControlPlaneCommandResponse::BootstrapInitialClusterMap
+                )
+            ));
+
+            let rejected = authority1
+                .submit_control_plane_command(ControlPlaneCommand::MarkNodeAvailability {
+                    node_id: NodeId::new(499),
+                    availability: NodeAvailabilityState::Healthy,
+                })
+                .await
+                .unwrap();
+            assert_eq!(rejected.log_id().index(), bootstrap.log_id().index() + 1);
+            assert!(matches!(
+                rejected.outcome(),
+                ControlPlaneRaftCommandOutcome::Rejected(ControlPlaneError::UnknownNode {
+                    node_id
+                }) if *node_id == 499
+            ));
+
+            authority2
+                .raft()
+                .wait(Some(Duration::from_secs(1)))
+                .applied_index_at_least(
+                    Some(rejected.log_id().index()),
+                    "two-node follower applied rejected command",
+                )
+                .await
+                .unwrap();
+            let follower_state = authority2
+                .raft()
+                .with_state_machine(|state_machine| {
+                    let last_applied = state_machine.last_applied();
+                    let snapshot = state_machine.inner().snapshot().clone();
+                    Box::pin(async move { (last_applied, snapshot) })
+                })
+                .await
+                .unwrap();
+            assert_eq!(follower_state.0, Some(rejected.log_id()));
+            assert!(follower_state.1.node(NodeId::new(401)).is_some());
+            assert!(follower_state.1.node(NodeId::new(402)).is_some());
+            assert!(follower_state.1.node(NodeId::new(499)).is_none());
+
+            authority1.shutdown().await.unwrap();
+            authority2.shutdown().await.unwrap();
+        });
+    }
+
+    #[test]
     fn control_plane_openraft_two_node_read_index_runtime_map_uses_quorum_applied_tip() {
         ControlPlaneRaftTypeConfig::run(async {
             let (authority1, authority2) = initialized_two_node_authorities(
