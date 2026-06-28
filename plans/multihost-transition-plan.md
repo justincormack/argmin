@@ -9371,6 +9371,10 @@ Phase 12.1 progress:
   submission and read-index runtime-map publication. The wrapper still uses
   the in-memory OpenRaft stores and test network, but callers no longer need
   to assemble the submit/read helper sequence directly.
+- Added an authority status snapshot on the OpenRaft wrapper that reports the
+  local node id, learned leader, last log id, committed id, and state-machine
+  applied id. The single-node public smoke now verifies those fields after an
+  applied command followed by a deterministic semantic rejection.
 - Isolated the public OpenRaft smokes with distinct cluster names so the normal
   parallel `control_plane_raft` test group cannot share OpenRaft test identity
   while still exercising the real client-write and read-index paths.

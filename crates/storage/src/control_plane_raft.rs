@@ -79,6 +79,42 @@ pub struct ControlPlaneRaftAuthority {
     raft: Raft<ControlPlaneRaftTypeConfig, ControlPlaneRaftStateMachine>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ControlPlaneRaftAuthorityStatus {
+    node_id: ControlPlaneRaftNodeId,
+    current_leader: Option<ControlPlaneRaftNodeId>,
+    last_log_id: Option<LogIdOf<ControlPlaneRaftTypeConfig>>,
+    committed: Option<LogIdOf<ControlPlaneRaftTypeConfig>>,
+    applied: Option<LogIdOf<ControlPlaneRaftTypeConfig>>,
+}
+
+impl ControlPlaneRaftAuthorityStatus {
+    #[must_use]
+    pub fn node_id(&self) -> ControlPlaneRaftNodeId {
+        self.node_id
+    }
+
+    #[must_use]
+    pub fn current_leader(&self) -> Option<ControlPlaneRaftNodeId> {
+        self.current_leader
+    }
+
+    #[must_use]
+    pub fn last_log_id(&self) -> Option<LogIdOf<ControlPlaneRaftTypeConfig>> {
+        self.last_log_id
+    }
+
+    #[must_use]
+    pub fn committed(&self) -> Option<LogIdOf<ControlPlaneRaftTypeConfig>> {
+        self.committed
+    }
+
+    #[must_use]
+    pub fn applied(&self) -> Option<LogIdOf<ControlPlaneRaftTypeConfig>> {
+        self.applied
+    }
+}
+
 impl ControlPlaneRaftAuthority {
     #[must_use]
     pub fn new(raft: Raft<ControlPlaneRaftTypeConfig, ControlPlaneRaftStateMachine>) -> Self {
@@ -102,6 +138,36 @@ impl ControlPlaneRaftAuthority {
         issued_at_ms: u64,
     ) -> Result<ClusterRuntimeMapSnapshot, ControlPlaneError> {
         runtime_map_via_openraft_read_index(&self.raft, issued_at_ms).await
+    }
+
+    pub async fn status(&self) -> Result<ControlPlaneRaftAuthorityStatus, ControlPlaneError> {
+        let node_id = *self.raft.node_id();
+        let current_leader = self.raft.current_leader().await;
+        let (last_log_id, committed) = self
+            .raft
+            .with_raft_state(|state| {
+                (
+                    state.log_ids.last().cloned(),
+                    state.local_committed().cloned(),
+                )
+            })
+            .await
+            .map_err(|error| openraft_remote_error("status raft-state read", error))?;
+        let applied = self
+            .raft
+            .with_state_machine(|state_machine| {
+                let last_applied = state_machine.last_applied();
+                Box::pin(async move { last_applied })
+            })
+            .await
+            .map_err(|error| openraft_remote_error("status state-machine read", error))?;
+        Ok(ControlPlaneRaftAuthorityStatus {
+            node_id,
+            current_leader,
+            last_log_id,
+            committed,
+            applied,
+        })
     }
 }
 
@@ -2709,6 +2775,13 @@ mod tests {
             assert!(applied_state.0.node(NodeId::new(99)).is_none());
             assert_eq!(applied_state.1 .0, Some(rejected_log_id));
 
+            let status = authority.status().await.unwrap();
+            assert_eq!(status.node_id(), 1);
+            assert_eq!(status.current_leader(), Some(1));
+            assert_eq!(status.last_log_id(), Some(rejected_log_id));
+            assert_eq!(status.committed(), Some(rejected_log_id));
+            assert_eq!(status.applied(), Some(rejected_log_id));
+
             authority.raft().shutdown().await.unwrap();
         });
     }
@@ -2753,15 +2826,11 @@ mod tests {
                 .await
                 .unwrap();
             let applied_log_id = authority
-                .raft()
-                .with_state_machine(|state_machine| {
-                    let applied_log_id = state_machine
-                        .last_applied()
-                        .expect("read-index should have an applied tip");
-                    Box::pin(async move { applied_log_id })
-                })
+                .status()
                 .await
-                .unwrap();
+                .unwrap()
+                .applied()
+                .expect("read-index should have an applied tip");
             let expected_control_plane_read_index = control_plane_log_id_from_raft(applied_log_id)
                 .expect("read-index should be non-bootstrap");
 
