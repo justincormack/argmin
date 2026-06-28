@@ -3381,6 +3381,85 @@ mod tests {
     }
 
     #[test]
+    fn control_plane_openraft_two_node_membership_change_updates_state_machine() {
+        ControlPlaneRaftTypeConfig::run(async {
+            let (authority1, authority2) = initialized_two_node_authorities(
+                "control-plane-raft-two-node-membership-change-test",
+                501,
+                502,
+            )
+            .await;
+
+            let bootstrap = authority1
+                .submit_control_plane_command(ControlPlaneCommand::BootstrapInitialClusterMap {
+                    nodes: vec![
+                        (NodeId::new(501), "node-501".to_string()),
+                        (NodeId::new(502), "node-502".to_string()),
+                    ],
+                    pg_ids: vec![PgId::new(0)],
+                })
+                .await
+                .unwrap();
+            assert!(matches!(
+                bootstrap.outcome(),
+                ControlPlaneRaftCommandOutcome::Applied(
+                    ControlPlaneCommandResponse::BootstrapInitialClusterMap
+                )
+            ));
+
+            let response = authority1
+                .raft()
+                .change_membership(BTreeSet::from([501]), false)
+                .await
+                .unwrap();
+            authority1
+                .raft()
+                .wait(Some(Duration::from_secs(1)))
+                .applied_index_at_least(
+                    Some(response.log_id.index()),
+                    "two-node leader applied membership change",
+                )
+                .await
+                .unwrap();
+            let raft_membership = authority1
+                .raft()
+                .with_raft_state(|state| {
+                    let log_id = *state.membership_state.effective().log_id();
+                    let voters = state
+                        .membership_state
+                        .effective()
+                        .membership()
+                        .voter_ids()
+                        .collect::<BTreeSet<_>>();
+                    (log_id, voters)
+                })
+                .await
+                .unwrap();
+            assert_eq!(raft_membership.0, Some(response.log_id));
+            assert_eq!(raft_membership.1, BTreeSet::from([501]));
+
+            let state_machine_membership = authority1
+                .raft()
+                .with_state_machine(|state_machine| {
+                    let log_id = *state_machine.last_membership().log_id();
+                    let voters = state_machine
+                        .last_membership()
+                        .membership()
+                        .voter_ids()
+                        .collect::<BTreeSet<_>>();
+                    Box::pin(async move { (log_id, voters) })
+                })
+                .await
+                .unwrap();
+            assert_eq!(state_machine_membership.0, Some(response.log_id));
+            assert_eq!(state_machine_membership.1, BTreeSet::from([501]));
+
+            authority1.shutdown().await.unwrap();
+            authority2.shutdown().await.unwrap();
+        });
+    }
+
+    #[test]
     fn control_plane_openraft_two_node_read_index_runtime_map_uses_quorum_applied_tip() {
         ControlPlaneRaftTypeConfig::run(async {
             let (authority1, authority2) = initialized_two_node_authorities(
