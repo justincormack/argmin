@@ -1023,11 +1023,20 @@ impl ControlPlaneRaftStateMachine {
         Ok(SnapshotMeta {
             last_log_id,
             last_membership: self.last_membership.clone(),
-            snapshot_id: format!(
-                "control-plane-{}",
-                last_log_id.map(|log_id| log_id.index()).unwrap_or(0)
-            ),
+            snapshot_id: Self::snapshot_id_for_log_id(last_log_id),
         })
+    }
+
+    fn snapshot_id_for_log_id(log_id: Option<LogIdOf<ControlPlaneRaftTypeConfig>>) -> String {
+        match log_id {
+            Some(log_id) => format!(
+                "control-plane-T{}-N{}-I{}",
+                log_id.committed_leader_id().term,
+                log_id.committed_leader_id().node_id,
+                log_id.index()
+            ),
+            None => "control-plane-empty".to_string(),
+        }
     }
 
     fn validate_snapshot_meta(
@@ -1041,6 +1050,15 @@ impl ControlPlaneRaftStateMachine {
         };
         self.validate_snapshot_install_position(meta.last_log_id)?;
         Self::validate_snapshot_membership_position(meta.last_log_id, &meta.last_membership)?;
+        let expected_snapshot_id = Self::snapshot_id_for_log_id(meta.last_log_id);
+        if meta.snapshot_id != expected_snapshot_id {
+            return Err(ControlPlaneError::SnapshotDecode {
+                message: format!(
+                    "OpenRaft snapshot id {} does not match expected {} for last_log_id {:?}",
+                    meta.snapshot_id, expected_snapshot_id, meta.last_log_id
+                ),
+            });
+        }
         Ok(snapshot_log_id)
     }
 
@@ -1503,6 +1521,11 @@ mod tests {
 
     #[test]
     fn control_plane_raft_state_machine_applies_openraft_bootstrap_membership() {
+        let mut empty_state_machine = ControlPlaneRaftStateMachine::empty();
+        let empty_snapshot = empty_state_machine.build_snapshot().unwrap();
+        assert_eq!(empty_snapshot.meta.last_log_id, None);
+        assert_eq!(empty_snapshot.meta.snapshot_id, "control-plane-empty");
+
         let mut state_machine = ControlPlaneRaftStateMachine::empty();
 
         assert!(matches!(
@@ -1520,6 +1543,8 @@ mod tests {
 
         let snapshot = state_machine.build_snapshot().unwrap();
         assert_eq!(snapshot.meta.last_log_id, Some(raft_log_id(0, 7, 0)));
+        assert_eq!(snapshot.meta.snapshot_id, "control-plane-T0-N7-I0");
+        assert_ne!(snapshot.meta.snapshot_id, empty_snapshot.meta.snapshot_id);
         assert_eq!(
             snapshot.meta.last_membership.log_id(),
             &Some(raft_log_id(0, 7, 0))
@@ -1791,7 +1816,7 @@ mod tests {
         let snapshot = source.build_snapshot().unwrap();
 
         assert_eq!(snapshot.meta.last_log_id, Some(raft_log_id(2, 7, 1)));
-        assert_eq!(snapshot.meta.snapshot_id, "control-plane-1");
+        assert_eq!(snapshot.meta.snapshot_id, "control-plane-T2-N7-I1");
 
         let mut target = ControlPlaneRaftStateMachine::empty();
         target
@@ -1819,7 +1844,7 @@ mod tests {
         let snapshot = ControlPlaneRaftTypeConfig::run(builder.build_snapshot()).unwrap();
 
         assert_eq!(snapshot.meta.last_log_id, Some(raft_log_id(2, 7, 1)));
-        assert_eq!(snapshot.meta.snapshot_id, "control-plane-1");
+        assert_eq!(snapshot.meta.snapshot_id, "control-plane-T2-N7-I1");
         assert_eq!(state_machine.last_applied(), Some(raft_log_id(2, 7, 2)));
         assert_eq!(
             state_machine
@@ -1850,6 +1875,24 @@ mod tests {
 
         assert!(matches!(err, ControlPlaneError::SnapshotDecode { .. }));
         assert_eq!(target.last_applied(), Some(raft_log_id(2, 7, 1)));
+    }
+
+    #[test]
+    fn control_plane_raft_snapshot_install_rejects_mismatched_snapshot_id() {
+        let mut source = ControlPlaneRaftStateMachine::empty();
+        source.apply_entry(blank_entry(2, 7, 1)).unwrap();
+        let snapshot = source.build_snapshot().unwrap();
+        let mut bad_meta = snapshot.meta.clone();
+        bad_meta.snapshot_id = "control-plane-1".to_string();
+
+        let mut target = ControlPlaneRaftStateMachine::empty();
+        let err = target
+            .install_snapshot(&bad_meta, snapshot.snapshot)
+            .unwrap_err();
+
+        assert!(matches!(err, ControlPlaneError::SnapshotDecode { .. }));
+        assert_eq!(target.last_applied(), None);
+        assert!(target.current_snapshot().is_none());
     }
 
     #[test]

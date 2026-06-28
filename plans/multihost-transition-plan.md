@@ -9323,6 +9323,11 @@ Phase 12.1 progress:
   cached current snapshot, then verifies OpenRaft installs that snapshot before
   serving state-machine reads and reflects the committed watermark and
   bootstrap membership without replaying the retained prefix.
+- Tightened OpenRaft snapshot metadata identity. Generated and installed
+  snapshot IDs now must match the full OpenRaft last log id
+  `(term,node,index)`, with a distinct empty-state ID, so empty snapshots,
+  bootstrap membership snapshots, and same-index snapshots from different
+  leader ids cannot collide in adapter metadata.
 - Added a public OpenRaft read-index smoke for the non-leader path. With
   elections disabled and no learned leader, an initialized two-node membership rejects
   `ensure_linearizable(ReadPolicy::ReadIndex)` with `ForwardToLeader` instead
