@@ -188,6 +188,78 @@ impl ControlPlaneRaftLogStore {
     fn before_range_end(index: u64, end_exclusive: Option<u64>) -> bool {
         end_exclusive.is_none_or(|end_exclusive| index < end_exclusive)
     }
+
+    fn validate_known_log_id(
+        inner: &ControlPlaneRaftLogStoreInner,
+        context: &'static str,
+        log_id: LogIdOf<ControlPlaneRaftTypeConfig>,
+    ) -> Result<(), io::Error> {
+        let Some(current_last_log_id) = inner.last_log_id() else {
+            return Err(raft_log_store_error(format!(
+                "cannot {context} {log_id}; control-plane OpenRaft log is empty"
+            )));
+        };
+        if log_id.index() > current_last_log_id.index() {
+            return Err(raft_log_store_error(format!(
+                "cannot {context} {log_id}; current last log id is {current_last_log_id}"
+            )));
+        }
+        if let Some(last_purged_log_id) = inner.last_purged_log_id {
+            if log_id.index() < last_purged_log_id.index() {
+                return Err(raft_log_store_error(format!(
+                    "cannot {context} {log_id}; it is before purged boundary {last_purged_log_id}"
+                )));
+            }
+            if log_id.index() == last_purged_log_id.index() {
+                if log_id == last_purged_log_id {
+                    return Ok(());
+                }
+                return Err(raft_log_store_error(format!(
+                    "cannot {context} mismatched purged log id {log_id}; purged boundary is {last_purged_log_id}"
+                )));
+            }
+        }
+        let Some(entry) = inner.entries.get(&log_id.index()) else {
+            return Err(raft_log_store_error(format!(
+                "cannot {context} {log_id}; control-plane OpenRaft log has no entry at that index"
+            )));
+        };
+        if entry.log_id != log_id {
+            return Err(raft_log_store_error(format!(
+                "cannot {context} mismatched log id {log_id}; stored {}",
+                entry.log_id
+            )));
+        }
+        Ok(())
+    }
+
+    fn validate_committed_update(
+        inner: &ControlPlaneRaftLogStoreInner,
+        committed: Option<LogIdOf<ControlPlaneRaftTypeConfig>>,
+    ) -> Result<(), io::Error> {
+        let Some(committed) = committed else {
+            if inner.committed.is_some() {
+                return Err(raft_log_store_error(
+                    "cannot clear control-plane OpenRaft committed log id",
+                ));
+            }
+            return Ok(());
+        };
+        if let Some(previous_committed) = inner.committed {
+            if committed.index() < previous_committed.index() {
+                return Err(raft_log_store_error(format!(
+                    "cannot regress control-plane OpenRaft committed log id from {previous_committed} to {committed}"
+                )));
+            }
+            if committed.index() == previous_committed.index() && committed != previous_committed {
+                return Err(raft_log_store_error(format!(
+                    "cannot change control-plane OpenRaft committed log id at index {} from {previous_committed} to {committed}",
+                    committed.index()
+                )));
+            }
+        }
+        Self::validate_known_log_id(inner, "commit", committed)
+    }
 }
 
 impl ControlPlaneRaftLogStoreInner {
@@ -272,7 +344,9 @@ impl RaftLogStorage<ControlPlaneRaftTypeConfig> for ControlPlaneRaftLogStore {
         &mut self,
         committed: Option<LogIdOf<ControlPlaneRaftTypeConfig>>,
     ) -> Result<(), io::Error> {
-        self.lock()?.committed = committed;
+        let mut inner = self.lock()?;
+        Self::validate_committed_update(&inner, committed)?;
+        inner.committed = committed;
         Ok(())
     }
 
@@ -312,27 +386,27 @@ impl RaftLogStorage<ControlPlaneRaftTypeConfig> for ControlPlaneRaftLogStore {
         last_log_id: Option<LogIdOf<ControlPlaneRaftTypeConfig>>,
     ) -> Result<(), io::Error> {
         let mut inner = self.lock()?;
+        if let Some(committed) = inner.committed {
+            match last_log_id {
+                Some(last_log_id) if last_log_id.index() >= committed.index() => {}
+                Some(last_log_id) => {
+                    return Err(raft_log_store_error(format!(
+                        "cannot truncate control-plane OpenRaft log after {last_log_id}; committed log id is {committed}"
+                    )));
+                }
+                None => {
+                    return Err(raft_log_store_error(format!(
+                        "cannot clear control-plane OpenRaft log; committed log id is {committed}"
+                    )));
+                }
+            }
+        }
         let Some(last_log_id) = last_log_id else {
             inner.entries.clear();
             return Ok(());
         };
 
-        if inner
-            .last_purged_log_id
-            .is_some_and(|purged| last_log_id.index() < purged.index())
-        {
-            return Err(raft_log_store_error(format!(
-                "cannot truncate control-plane OpenRaft log after purged boundary {last_log_id}"
-            )));
-        }
-        if let Some(existing) = inner.entries.get(&last_log_id.index()) {
-            if existing.log_id != last_log_id {
-                return Err(raft_log_store_error(format!(
-                    "cannot truncate control-plane OpenRaft log after mismatched log id {last_log_id}; stored {}",
-                    existing.log_id
-                )));
-            }
-        }
+        Self::validate_known_log_id(&inner, "truncate after", last_log_id)?;
         inner
             .entries
             .retain(|index, _| *index <= last_log_id.index());
@@ -354,24 +428,14 @@ impl RaftLogStorage<ControlPlaneRaftTypeConfig> for ControlPlaneRaftLogStore {
                 )));
             }
         }
-        let Some(current_last_log_id) = inner.last_log_id() else {
-            return Err(raft_log_store_error(format!(
-                "cannot purge empty control-plane OpenRaft log to {log_id}"
-            )));
-        };
-        if log_id.index() > current_last_log_id.index() {
-            return Err(raft_log_store_error(format!(
-                "cannot purge control-plane OpenRaft log to {log_id}; current last log id is {current_last_log_id}"
-            )));
-        }
-        if let Some(entry) = inner.entries.get(&log_id.index()) {
-            if entry.log_id != log_id {
+        if let Some(committed) = inner.committed {
+            if log_id.index() > committed.index() {
                 return Err(raft_log_store_error(format!(
-                    "cannot purge control-plane OpenRaft log to mismatched log id {log_id}; stored {}",
-                    entry.log_id
+                    "cannot purge control-plane OpenRaft log to {log_id}; committed log id is {committed}"
                 )));
             }
         }
+        Self::validate_known_log_id(&inner, "purge to", log_id)?;
         inner.entries.retain(|index, _| *index > log_id.index());
         inner.last_purged_log_id = Some(log_id);
         Ok(())
@@ -1350,6 +1414,179 @@ mod tests {
             let log_state = RaftLogStorage::get_log_state(&mut store).await.unwrap();
             assert_eq!(log_state.last_purged_log_id, None);
             assert_eq!(log_state.last_log_id, Some(raft_log_id(3, 1, 3)));
+        });
+    }
+
+    #[test]
+    fn control_plane_raft_log_store_rejects_invalid_committed_watermarks() {
+        ControlPlaneRaftTypeConfig::run(async {
+            let mut store = ControlPlaneRaftLogStore::empty();
+
+            let err = RaftLogStorage::save_committed(&mut store, Some(raft_log_id(3, 1, 1)))
+                .await
+                .unwrap_err();
+            assert!(err.to_string().contains("log is empty"));
+            assert_eq!(
+                RaftLogStorage::read_committed(&mut store).await.unwrap(),
+                None
+            );
+
+            RaftLogStorage::append(
+                &mut store,
+                vec![
+                    bootstrap_membership_entry(1),
+                    blank_entry(3, 1, 1),
+                    blank_entry(3, 1, 2),
+                ],
+                IOFlushed::noop(),
+            )
+            .await
+            .unwrap();
+            RaftLogStorage::save_committed(&mut store, Some(raft_log_id(3, 1, 2)))
+                .await
+                .unwrap();
+
+            let err = RaftLogStorage::save_committed(&mut store, Some(raft_log_id(3, 1, 1)))
+                .await
+                .unwrap_err();
+            assert!(err.to_string().contains("regress"));
+
+            let err = RaftLogStorage::save_committed(&mut store, Some(raft_log_id(4, 1, 2)))
+                .await
+                .unwrap_err();
+            assert!(err.to_string().contains("cannot change"));
+
+            let err = RaftLogStorage::save_committed(&mut store, Some(raft_log_id(3, 1, 3)))
+                .await
+                .unwrap_err();
+            assert!(err.to_string().contains("current last log id"));
+
+            let err = RaftLogStorage::save_committed(&mut store, None)
+                .await
+                .unwrap_err();
+            assert!(err.to_string().contains("cannot clear"));
+
+            assert_eq!(
+                RaftLogStorage::read_committed(&mut store).await.unwrap(),
+                Some(raft_log_id(3, 1, 2))
+            );
+        });
+    }
+
+    #[test]
+    fn control_plane_raft_log_store_rejects_truncating_committed_entries() {
+        ControlPlaneRaftTypeConfig::run(async {
+            let mut store = ControlPlaneRaftLogStore::empty();
+            RaftLogStorage::append(
+                &mut store,
+                vec![
+                    bootstrap_membership_entry(1),
+                    blank_entry(3, 1, 1),
+                    blank_entry(3, 1, 2),
+                    blank_entry(3, 1, 3),
+                ],
+                IOFlushed::noop(),
+            )
+            .await
+            .unwrap();
+            RaftLogStorage::save_committed(&mut store, Some(raft_log_id(3, 1, 2)))
+                .await
+                .unwrap();
+
+            let err = RaftLogStorage::truncate_after(&mut store, Some(raft_log_id(3, 1, 1)))
+                .await
+                .unwrap_err();
+            assert!(err.to_string().contains("committed log id"));
+
+            let err = RaftLogStorage::truncate_after(&mut store, None)
+                .await
+                .unwrap_err();
+            assert!(err.to_string().contains("committed log id"));
+
+            RaftLogStorage::truncate_after(&mut store, Some(raft_log_id(3, 1, 2)))
+                .await
+                .unwrap();
+            let log_state = RaftLogStorage::get_log_state(&mut store).await.unwrap();
+            assert_eq!(log_state.last_log_id, Some(raft_log_id(3, 1, 2)));
+            assert_eq!(
+                RaftLogStorage::read_committed(&mut store).await.unwrap(),
+                Some(raft_log_id(3, 1, 2))
+            );
+        });
+    }
+
+    #[test]
+    fn control_plane_raft_log_store_rejects_unknown_truncate_boundaries() {
+        ControlPlaneRaftTypeConfig::run(async {
+            let mut store = ControlPlaneRaftLogStore::empty();
+            RaftLogStorage::append(
+                &mut store,
+                vec![bootstrap_membership_entry(1), blank_entry(3, 1, 1)],
+                IOFlushed::noop(),
+            )
+            .await
+            .unwrap();
+
+            let err = RaftLogStorage::truncate_after(&mut store, Some(raft_log_id(3, 1, 2)))
+                .await
+                .unwrap_err();
+            assert!(err.to_string().contains("current last log id"));
+
+            let err = RaftLogStorage::truncate_after(&mut store, Some(raft_log_id(4, 1, 1)))
+                .await
+                .unwrap_err();
+            assert!(err.to_string().contains("mismatched log id"));
+
+            RaftLogStorage::purge(&mut store, raft_log_id(3, 1, 1))
+                .await
+                .unwrap();
+            let err = RaftLogStorage::truncate_after(&mut store, Some(raft_log_id(4, 1, 1)))
+                .await
+                .unwrap_err();
+            assert!(err.to_string().contains("mismatched purged log id"));
+
+            RaftLogStorage::truncate_after(&mut store, Some(raft_log_id(3, 1, 1)))
+                .await
+                .unwrap();
+            let log_state = RaftLogStorage::get_log_state(&mut store).await.unwrap();
+            assert_eq!(log_state.last_log_id, Some(raft_log_id(3, 1, 1)));
+        });
+    }
+
+    #[test]
+    fn control_plane_raft_log_store_rejects_purging_past_committed_watermark() {
+        ControlPlaneRaftTypeConfig::run(async {
+            let mut store = ControlPlaneRaftLogStore::empty();
+            RaftLogStorage::append(
+                &mut store,
+                vec![
+                    bootstrap_membership_entry(1),
+                    blank_entry(3, 1, 1),
+                    blank_entry(3, 1, 2),
+                    blank_entry(3, 1, 3),
+                ],
+                IOFlushed::noop(),
+            )
+            .await
+            .unwrap();
+            RaftLogStorage::save_committed(&mut store, Some(raft_log_id(3, 1, 2)))
+                .await
+                .unwrap();
+
+            let err = RaftLogStorage::purge(&mut store, raft_log_id(3, 1, 3))
+                .await
+                .unwrap_err();
+            assert!(err.to_string().contains("committed log id"));
+
+            RaftLogStorage::purge(&mut store, raft_log_id(3, 1, 2))
+                .await
+                .unwrap();
+            let log_state = RaftLogStorage::get_log_state(&mut store).await.unwrap();
+            assert_eq!(log_state.last_purged_log_id, Some(raft_log_id(3, 1, 2)));
+            assert_eq!(
+                RaftLogStorage::read_committed(&mut store).await.unwrap(),
+                Some(raft_log_id(3, 1, 2))
+            );
         });
     }
 

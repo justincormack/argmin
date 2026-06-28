@@ -9115,6 +9115,16 @@ Phase 12.1 progress:
   zero a valid durable control-plane command index. This is intentionally
   scaffolding only: it does not choose the production durable Raft-log format
   or its fsync/batching policy.
+- Tightened the in-memory OpenRaft log store's committed-index boundary. The
+  `save_committed` path now rejects committed watermarks that point at a
+  missing, future, mismatched, regressing, or cleared log id, and
+  `truncate_after` and `purge` reject unknown targets or movement past the
+  committed point. This keeps the restart gate from recording a committed read
+  watermark that the local log cannot actually prove. This is intentionally
+  stricter than OpenRaft's generic log-store conformance baseline, which permits
+  operations such as `truncate_after(None)` in cases where Argmin has already
+  recorded a committed restart gate; the current spike does not run
+  `openraft::testing::log::suite` against this guarded in-memory store.
 - Added a single-node OpenRaft initialization smoke over the in-memory log
   store and state-machine wrapper. The test uses a deliberately unreachable
   network factory, constructs an actual `Raft` instance, calls
