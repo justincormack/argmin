@@ -9360,6 +9360,11 @@ Phase 12.1 progress:
   OpenRaft log id, while OpenRaft API failures remain transport/consensus
   errors. The public OpenRaft smokes now exercise applied, rejected, and
   not-leader submit paths through this helper.
+- Added a thin `ControlPlaneRaftAuthority` wrapper around the OpenRaft handle
+  so the spike has a single authority-shaped object for linearized command
+  submission and read-index runtime-map publication. The wrapper still uses
+  the in-memory OpenRaft stores and test network, but callers no longer need
+  to assemble the submit/read helper sequence directly.
 - Isolated the public OpenRaft smokes with distinct cluster names so the normal
   parallel `control_plane_raft` test group cannot share OpenRaft test identity
   while still exercising the real client-write and read-index paths.
