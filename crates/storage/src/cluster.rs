@@ -3797,11 +3797,13 @@ impl StorageCluster {
         authority_now_ms: u64,
     ) -> Result<Arc<Self>, StorageClusterRuntimeMapRefreshError> {
         let runtime_map = control_plane.runtime_map_snapshot(authority_now_ms)?;
-        Ok(Self::from_runtime_map(
+        let mut local_map = LocalClusterMap::open_frontend_topology_only_with_runtime_map(
             self.metadata_node_id(),
             &runtime_map,
             self.default_payload_ec_shape(),
-        )?)
+        )?;
+        local_map.inherit_process_local_state_from(&self.local_map);
+        Ok(Self::from_local_map(Arc::new(local_map))?)
     }
 
     pub fn refresh_from_control_plane_runtime_map_with_unix_storage_node_clients(
@@ -3811,14 +3813,18 @@ impl StorageCluster {
         admission_settings: LocalUnixStorageNodeClientAdmissionSettings,
     ) -> Result<Arc<Self>, StorageClusterRuntimeMapRefreshError> {
         let runtime_map = control_plane.runtime_map_snapshot(authority_now_ms)?;
-        Ok(
-            Self::from_runtime_map_with_unix_storage_node_client_admission_settings(
-                self.metadata_node_id(),
-                &runtime_map,
-                self.default_payload_ec_shape(),
-                admission_settings,
-            )?,
-        )
+        let mut local_map = LocalClusterMap::open_frontend_topology_only_with_runtime_map(
+            self.metadata_node_id(),
+            &runtime_map,
+            self.default_payload_ec_shape(),
+        )?;
+        local_map.inherit_process_local_state_from(&self.local_map);
+        let storage_node_configs = Self::unix_storage_node_client_configs_from_runtime_map(
+            &runtime_map,
+            admission_settings,
+        );
+        local_map.install_unix_storage_node_clients(storage_node_configs)?;
+        Ok(Self::from_local_map(Arc::new(local_map))?)
     }
 
     #[cfg(any(test, feature = "test-hooks"))]

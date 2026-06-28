@@ -1633,6 +1633,11 @@ impl LocalClusterMap {
         Ok(local_map)
     }
 
+    pub(crate) fn inherit_process_local_state_from(&mut self, previous: &Self) {
+        self.runtime_state = Arc::clone(&previous.runtime_state);
+        self.process_local_registry_key = previous.process_local_registry_key;
+    }
+
     fn open_with_configs_inner(
         metadata_primary_node_id: NodeId,
         configs: impl IntoIterator<Item = LocalNodeStoreConfig>,

@@ -13294,6 +13294,51 @@ mod tests {
     }
 
     #[test]
+    fn storage_cluster_refresh_preserves_process_local_reclaim_queue() {
+        let tmp = test_util::tempdir();
+        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+        authority
+            .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
+            .unwrap();
+        assert!(heartbeat_until_serving(&mut authority, 1, 1_000).serving());
+        authority
+            .set_pg_acting_set(PgId::new(31), vec![NodeId::new(1)])
+            .unwrap();
+        heartbeat_with_pg_observation(&mut authority, 1, 31, PgState::Peering, 2_000);
+
+        let peering_map = authority.snapshot().runtime_map(2_001).unwrap();
+        let cluster = crate::StorageCluster::from_runtime_map(
+            NodeId::new(1),
+            &peering_map,
+            crate::EcShape { k: 1, m: 0 },
+        )
+        .unwrap();
+        let bucket = crate::BucketName::try_from("refresh-queue-bucket").unwrap();
+        cluster.enqueue_bucket_delete_finalize(&bucket);
+
+        authority
+            .complete_pg_peering(
+                PgId::new(31),
+                NodeId::new(1),
+                node_incarnation(&authority, 1),
+                2_002,
+            )
+            .unwrap();
+        heartbeat_with_pg_observation(&mut authority, 1, 31, PgState::Active, 2_003);
+
+        let refreshed = cluster
+            .refresh_from_control_plane_runtime_map(&authority, 2_004)
+            .unwrap();
+        assert_eq!(
+            refreshed.try_take_reclaim_work(),
+            Some(crate::ReclaimWorkItem::BucketDelete(bucket.clone()))
+        );
+        refreshed.finish_bucket_delete_finalize_work(&bucket);
+        assert!(refreshed.try_take_reclaim_work().is_none());
+    }
+
+    #[test]
     fn storage_cluster_runtime_map_handle_refresh_installs_current_map() {
         let tmp = test_util::tempdir();
         let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
