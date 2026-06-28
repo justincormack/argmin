@@ -10725,7 +10725,17 @@ fn metadata_command_checkpoint_record_error_is_stale(error: &StoreError) -> bool
             context: "connect storage-node RPC socket",
             ..
         } => true,
-        StoreError::StorageRpc { code, .. } => storage_rpc_code_is_retryable_pg_route_error(*code),
+        StoreError::StorageRpc { code, .. } => {
+            storage_rpc_code_is_retryable_pg_route_error(*code)
+                // Background checkpoint scans can observe intermediate route-map states
+                // while PG metadata transfer is moving between Peering and Active routes.
+                // A later scan will retry from a refreshed map.
+                || matches!(
+                    *code,
+                    StorageRpcErrorCode::UnknownPg
+                        | StorageRpcErrorCode::MetadataTransferHistoricalRouteActive
+                )
+        }
         _ => false,
     }
 }
@@ -10749,6 +10759,22 @@ mod metadata_command_checkpoint_record_error_tests {
                 code: StorageRpcErrorCode::MetadataCommandContention,
                 message: "metadata command contention during export metadata command checkpoint"
                     .to_string(),
+            },
+        ));
+        assert!(metadata_command_checkpoint_record_error_is_stale(
+            &StoreError::StorageRpc {
+                node_id: 0,
+                operation: "metadata command checkpoint record current",
+                code: StorageRpcErrorCode::UnknownPg,
+                message: "PG 7 is not configured on this storage node".to_string(),
+            },
+        ));
+        assert!(metadata_command_checkpoint_record_error_is_stale(
+            &StoreError::StorageRpc {
+                node_id: 0,
+                operation: "metadata command replica state",
+                code: StorageRpcErrorCode::MetadataTransferHistoricalRouteActive,
+                message: "historical peering inspection for PG 7 at epoch 42 requires Peering route, got active".to_string(),
             },
         ));
         assert!(!metadata_command_checkpoint_record_error_is_stale(
