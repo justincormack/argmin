@@ -2568,6 +2568,81 @@ mod tests {
     }
 
     #[test]
+    fn control_plane_openraft_read_index_runtime_map_uses_applied_tip() {
+        ControlPlaneRaftTypeConfig::run(async {
+            let log_store = ControlPlaneRaftLogStore::empty();
+            let state_machine = ControlPlaneRaftStateMachine::empty();
+            let raft = Raft::<ControlPlaneRaftTypeConfig, ControlPlaneRaftStateMachine>::new(
+                1,
+                test_raft_config(),
+                UnreachableRaftNetworkFactory,
+                log_store,
+                state_machine,
+            )
+            .await
+            .unwrap();
+
+            raft.initialize(BTreeMap::from([(1, BasicNode::new("node-1"))]))
+                .await
+                .unwrap();
+            raft.trigger().elect(false).await.unwrap();
+            raft.wait(Some(Duration::from_secs(1)))
+                .state(ServerState::Leader, "triggered single-node leadership")
+                .await
+                .unwrap();
+
+            let write = raft
+                .client_write(ControlPlaneCommand::BootstrapInitialClusterMap {
+                    nodes: vec![(NodeId::new(1), "node-1".to_string())],
+                    pg_ids: vec![PgId::new(0)],
+                })
+                .await
+                .unwrap();
+            assert!(matches!(
+                write.data,
+                ControlPlaneRaftApplyResponse::Applied(
+                    ControlPlaneCommandResponse::BootstrapInitialClusterMap
+                )
+            ));
+
+            let read_log_id = raft
+                .ensure_linearizable(ReadPolicy::ReadIndex)
+                .await
+                .unwrap()
+                .expect("leader read-index should return an applied log id");
+            let expected_control_plane_read_index = control_plane_log_id_from_raft(read_log_id)
+                .expect("read-index should be non-bootstrap");
+
+            let (runtime_map, applied_log_id) = raft
+                .with_state_machine(|state_machine| {
+                    let runtime_map = state_machine
+                        .runtime_map_for_current_applied_read_index(44_000)
+                        .unwrap();
+                    let applied_log_id = state_machine
+                        .last_applied()
+                        .expect("read-index should have an applied tip");
+                    Box::pin(async move { (runtime_map, applied_log_id) })
+                })
+                .await
+                .unwrap();
+
+            assert_eq!(applied_log_id, read_log_id);
+            assert_eq!(
+                runtime_map.freshness_proof().read_index(),
+                Some(expected_control_plane_read_index)
+            );
+            assert_eq!(runtime_map.freshness_proof().issued_at_ms(), Some(44_000));
+            assert!(runtime_map.freshness_proof().is_serving_authority_read());
+            assert!(runtime_map
+                .nodes()
+                .iter()
+                .any(|node| node.node_id() == NodeId::new(1)));
+
+            raft.shutdown().await.unwrap();
+        });
+    }
+
+    #[test]
     fn control_plane_openraft_read_index_requires_leader() {
         ControlPlaneRaftTypeConfig::run(async {
             let log_store = ControlPlaneRaftLogStore::empty();

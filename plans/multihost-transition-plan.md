@@ -9333,6 +9333,12 @@ Phase 12.1 progress:
   `ensure_linearizable(ReadPolicy::ReadIndex)` with `ForwardToLeader` instead
   of permitting a local runtime-map read. This pins the fail-closed read
   boundary until the production adapter wires leader-side read-index serving.
+- Added the matching public OpenRaft read-index leader smoke for the
+  single-node deterministic authority. The test manually triggers leadership,
+  applies a bootstrap command, confirms `ensure_linearizable(ReadPolicy::ReadIndex)`
+  returns the state machine's applied tip, and verifies the runtime-map
+  freshness proof is stamped with that applied log id rather than an earlier
+  captured round id.
 - Added a deterministic public OpenRaft `client_write` smoke for a single-node
   authority by disabling timer-driven elections, manually triggering election,
   and waiting on the metrics `Leader` state rather than sleeping or relying on
