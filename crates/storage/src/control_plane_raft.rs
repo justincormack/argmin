@@ -304,7 +304,8 @@ impl ControlPlaneRaftLogStore {
                 )));
             }
         }
-        Self::validate_known_log_id(inner, "commit", committed)
+        Self::validate_known_log_id(inner, "commit", committed)?;
+        Self::validate_vote_covers_committed(inner.vote, committed)
     }
 
     fn validate_vote_update(
@@ -322,6 +323,24 @@ impl ControlPlaneRaftLogStore {
         }
         Err(raft_log_store_error(format!(
             "cannot regress control-plane OpenRaft vote from {previous_vote} to {vote}"
+        )))
+    }
+
+    fn validate_vote_covers_committed(
+        vote: Option<VoteOf<ControlPlaneRaftTypeConfig>>,
+        committed: LogIdOf<ControlPlaneRaftTypeConfig>,
+    ) -> Result<(), io::Error> {
+        let Some(vote) = vote else {
+            return Err(raft_log_store_error(format!(
+                "control-plane OpenRaft log store is missing vote state for committed log id {committed}"
+            )));
+        };
+        let committed_term = committed.committed_leader_id().term;
+        if vote.leader_id.term >= committed_term {
+            return Ok(());
+        }
+        Err(raft_log_store_error(format!(
+            "control-plane OpenRaft log store vote {vote} is older than committed log id {committed}"
         )))
     }
 }
@@ -2199,6 +2218,13 @@ mod tests {
             )
             .await
             .unwrap();
+            let err = RaftLogStorage::save_committed(&mut store, Some(raft_log_id(3, 1, 2)))
+                .await
+                .unwrap_err();
+            assert!(err.to_string().contains("missing vote state"));
+
+            let vote = Vote::<ControlPlaneRaftLeaderId>::new_committed(3, 1);
+            RaftLogStorage::save_vote(&mut store, &vote).await.unwrap();
             RaftLogStorage::save_committed(&mut store, Some(raft_log_id(3, 1, 2)))
                 .await
                 .unwrap();
@@ -2246,6 +2272,8 @@ mod tests {
             )
             .await
             .unwrap();
+            let vote = Vote::<ControlPlaneRaftLeaderId>::new_committed(3, 1);
+            RaftLogStorage::save_vote(&mut store, &vote).await.unwrap();
             RaftLogStorage::save_committed(&mut store, Some(raft_log_id(3, 1, 2)))
                 .await
                 .unwrap();
@@ -2326,6 +2354,8 @@ mod tests {
             )
             .await
             .unwrap();
+            let vote = Vote::<ControlPlaneRaftLeaderId>::new_committed(3, 1);
+            RaftLogStorage::save_vote(&mut store, &vote).await.unwrap();
             RaftLogStorage::save_committed(&mut store, Some(raft_log_id(3, 1, 2)))
                 .await
                 .unwrap();
@@ -2435,6 +2465,10 @@ mod tests {
             )
             .await
             .unwrap();
+            let vote = Vote::<ControlPlaneRaftLeaderId>::new_committed(3, 1);
+            RaftLogStorage::save_vote(&mut log_store, &vote)
+                .await
+                .unwrap();
             RaftLogStorage::save_committed(&mut log_store, Some(raft_log_id(3, 1, 3)))
                 .await
                 .unwrap();
@@ -2528,6 +2562,10 @@ mod tests {
             )
             .await
             .unwrap();
+            let vote = Vote::<ControlPlaneRaftLeaderId>::new_committed(3, 1);
+            RaftLogStorage::save_vote(&mut log_store, &vote)
+                .await
+                .unwrap();
             RaftLogStorage::save_committed(&mut log_store, Some(raft_log_id(3, 1, 2)))
                 .await
                 .unwrap();
@@ -2595,6 +2633,10 @@ mod tests {
             )
             .await
             .unwrap();
+            let vote = Vote::<ControlPlaneRaftLeaderId>::new_committed(3, 1);
+            RaftLogStorage::save_vote(&mut log_store, &vote)
+                .await
+                .unwrap();
             RaftLogStorage::save_committed(&mut log_store, Some(raft_log_id(3, 1, 2)))
                 .await
                 .unwrap();
@@ -2869,6 +2911,10 @@ mod tests {
             )
             .await
             .unwrap();
+            let vote = Vote::<ControlPlaneRaftLeaderId>::new_committed(3, 1);
+            RaftLogStorage::save_vote(&mut log_store, &vote)
+                .await
+                .unwrap();
             RaftLogStorage::save_committed(&mut log_store, Some(raft_log_id(3, 1, 3)))
                 .await
                 .unwrap();
@@ -2907,6 +2953,7 @@ mod tests {
     #[test]
     fn control_plane_raft_combined_restart_rejects_inconsistent_artifacts() {
         let log_committed_through_two = ControlPlaneRaftLogStoreRestartArtifact {
+            vote: Some(Vote::<ControlPlaneRaftLeaderId>::new_committed(3, 1)),
             committed: Some(raft_log_id(3, 1, 2)),
             entries: vec![
                 bootstrap_membership_entry(1),
@@ -2935,6 +2982,7 @@ mod tests {
 
         let applied_unknown_to_log = ControlPlaneRaftRestartArtifact {
             log_store: ControlPlaneRaftLogStoreRestartArtifact {
+                vote: Some(Vote::<ControlPlaneRaftLeaderId>::new_committed(3, 1)),
                 committed: Some(raft_log_id(3, 1, 2)),
                 entries: vec![
                     bootstrap_membership_entry(1),
@@ -2952,10 +3000,10 @@ mod tests {
 
         let state_behind_purged_boundary = ControlPlaneRaftRestartArtifact {
             log_store: ControlPlaneRaftLogStoreRestartArtifact {
+                vote: Some(Vote::<ControlPlaneRaftLeaderId>::new_committed(3, 1)),
                 committed: Some(raft_log_id(3, 1, 2)),
                 last_purged_log_id: Some(raft_log_id(3, 1, 2)),
                 entries: Vec::new(),
-                ..Default::default()
             },
             state_machine: state_machine_restart_artifact_with_noops(3, 1, 1),
         };
@@ -3024,5 +3072,32 @@ mod tests {
             ControlPlaneRaftLogStore::from_restart_artifact(artifact_with_committed_before_purge)
                 .unwrap_err();
         assert!(err.to_string().contains("before purged boundary"));
+
+        let artifact_with_missing_vote = ControlPlaneRaftLogStoreRestartArtifact {
+            committed: Some(raft_log_id(3, 1, 2)),
+            entries: vec![
+                bootstrap_membership_entry(1),
+                blank_entry(3, 1, 1),
+                blank_entry(3, 1, 2),
+            ],
+            ..Default::default()
+        };
+        let err = ControlPlaneRaftLogStore::from_restart_artifact(artifact_with_missing_vote)
+            .unwrap_err();
+        assert!(err.to_string().contains("missing vote state"));
+
+        let artifact_with_stale_vote = ControlPlaneRaftLogStoreRestartArtifact {
+            vote: Some(Vote::<ControlPlaneRaftLeaderId>::new(2, 99)),
+            committed: Some(raft_log_id(3, 1, 2)),
+            entries: vec![
+                bootstrap_membership_entry(1),
+                blank_entry(3, 1, 1),
+                blank_entry(3, 1, 2),
+            ],
+            ..Default::default()
+        };
+        let err =
+            ControlPlaneRaftLogStore::from_restart_artifact(artifact_with_stale_vote).unwrap_err();
+        assert!(err.to_string().contains("older than committed"));
     }
 }

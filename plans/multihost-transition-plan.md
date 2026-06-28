@@ -9227,9 +9227,12 @@ Phase 12.1 progress:
   tests cover continuing appends after restoring a purged committed log, and
   reject malformed artifacts with entries at the purged boundary, log holes,
   future committed watermarks, mismatched committed log ids, or committed
-  points before the purged boundary. This is still not a production durable
-  Raft-log format; it pins the restart invariants the durable implementation
-  must preserve.
+  points before the purged boundary. The committed-watermark path also requires
+  restored or live vote metadata whenever a committed watermark is present, and
+  rejects a vote term older than the committed log term, so durable restart
+  state cannot lose or roll current-term/vote metadata behind an already
+  committed entry. This is still not a production durable Raft-log format; it
+  pins the restart invariants the durable implementation must preserve.
 - Tightened in-memory OpenRaft state-machine restart construction. The wrapper
   constructor now rejects restart state where the dependency-free command state
   and the full OpenRaft applied log id disagree on term/index, where the
