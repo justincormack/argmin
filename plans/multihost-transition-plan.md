@@ -9258,6 +9258,12 @@ Phase 12.1 progress:
   same-term/index leader-node mismatches. This keeps the eventual OpenRaft read
   adapter from accidentally publishing a freshness proof for a log point that
   is only partially represented by the inner `ControlPlaneLogId`.
+- Added an adapter-facing runtime-map helper that always stamps the proof with
+  the wrapper's current applied OpenRaft log id. A regression covers the
+  standard read-index race where a read arrives at an earlier committed round
+  but the state machine has applied further by serve time: the stale captured
+  id is rejected, while the current reflected tip is accepted and published as
+  the proof point.
 - Added a single-node OpenRaft initialization smoke over the in-memory log
   store and state-machine wrapper. The test uses a deliberately unreachable
   network factory, constructs an actual `Raft` instance, calls

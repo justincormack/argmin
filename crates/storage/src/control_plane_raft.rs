@@ -782,6 +782,19 @@ impl ControlPlaneRaftStateMachine {
             .runtime_map_for_read_index(control_plane_read_index, issued_at_ms)
     }
 
+    pub fn runtime_map_for_current_applied_read_index(
+        &self,
+        issued_at_ms: u64,
+    ) -> Result<ClusterRuntimeMapSnapshot, ControlPlaneError> {
+        let last_applied = self
+            .last_applied
+            .ok_or_else(|| ControlPlaneError::CommandDecode {
+                message: "cannot build OpenRaft read-index runtime map before any log is applied"
+                    .to_string(),
+            })?;
+        self.runtime_map_for_applied_read_index(last_applied, issued_at_ms)
+    }
+
     pub fn apply_entry(
         &mut self,
         entry: ControlPlaneRaftEntry,
@@ -1905,6 +1918,43 @@ mod tests {
             Some(ControlPlaneLogId::new(2, 1).unwrap())
         );
         assert!(runtime_map.freshness_proof().is_serving_authority_read());
+    }
+
+    #[test]
+    fn control_plane_raft_state_machine_runtime_map_current_read_index_uses_tip() {
+        let mut state_machine = ControlPlaneRaftStateMachine::empty();
+        state_machine
+            .apply_entry(normal_entry(
+                2,
+                7,
+                1,
+                ControlPlaneCommand::BootstrapInitialClusterMap {
+                    nodes: vec![(NodeId::new(1), "node-1".to_string())],
+                    pg_ids: vec![PgId::new(0)],
+                },
+            ))
+            .unwrap();
+        state_machine.apply_entry(blank_entry(2, 7, 2)).unwrap();
+
+        let stale_captured_read_index = state_machine
+            .runtime_map_for_applied_read_index(raft_log_id(2, 7, 1), 12_345)
+            .unwrap_err();
+        assert!(matches!(
+            stale_captured_read_index,
+            ControlPlaneError::ControlPlaneReadIndexNotApplied { .. }
+        ));
+
+        let runtime_map = state_machine
+            .runtime_map_for_current_applied_read_index(12_346)
+            .unwrap();
+        assert_eq!(
+            runtime_map.freshness_proof(),
+            &RuntimeMapFreshnessProof::ReadIndex {
+                authority_incarnation: runtime_map.freshness_proof().authority_incarnation(),
+                read_index: ControlPlaneLogId::new(2, 2).unwrap(),
+                issued_at_ms: 12_346,
+            }
+        );
     }
 
     #[test]
