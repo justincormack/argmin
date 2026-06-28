@@ -8666,6 +8666,33 @@ fn delete_bucket_expired_route_map_maps_to_operation_aborted() {
 }
 
 #[test]
+fn delete_bucket_stale_metadata_route_maps_to_operation_aborted() {
+    let tmp = test_util::tempdir();
+    let bucket = "bucket-delete-stale-route";
+    let storage_cluster = open_test_storage_cluster(tmp.path(), &[0]);
+    let coord = setup_direct_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
+    coord
+        .create_bucket_for_owner("default-owner", bucket, false)
+        .unwrap();
+
+    let bucket_name = trusted_bucket_name(bucket);
+    let stale_cluster =
+        same_epoch_cluster_with_stale_current_pg_routes(&storage_cluster, tmp.path());
+    let storage_err = stale_cluster.begin_bucket_delete(&bucket_name).unwrap_err();
+    assert!(
+        matches!(
+            storage_err,
+            storage::BucketWriteDrainError::Store(storage::StoreError::StaleMetadataRoute { .. })
+        ),
+        "fixture should exercise StaleMetadataRoute, got {storage_err:?}"
+    );
+
+    let stale_coord = setup_direct_coordinator_with_storage_cluster(stale_cluster);
+    let err = delete_bucket_test(&stale_coord, bucket).unwrap_err();
+    assert!(matches!(err, ServerError::OperationAborted), "{err:?}");
+}
+
+#[test]
 fn delete_bucket_route_map_expiry_after_drain_maps_to_operation_aborted() {
     let tmp = test_util::tempdir();
     let bucket = "bucket-delete-mid-expired-route-map";

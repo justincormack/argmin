@@ -8987,10 +8987,11 @@ Status update:
   command contention as retryable `OperationAborted` at the server-core storage
   boundary. Storage-node overload remains `SlowDown`.
 - Added coordinator-level regressions for `DeleteBucket` using an already
-  expired route map, for `DeleteBucket` begin crossing route-map expiry after
-  durable drain acquisition, for bucket-delete finalization using an expired
-  route map, and for bucket-delete finalization using a stale metadata route.
-  The finalizer command-contention regression remains in place.
+  expired route map, for `DeleteBucket` begin using a stale metadata route, for
+  `DeleteBucket` begin crossing route-map expiry after durable drain
+  acquisition, for bucket-delete finalization using an expired route map, and
+  for bucket-delete finalization using a stale metadata route. The finalizer
+  command-contention regression remains in place.
 - `DeleteBucket` begin/finalize foreground loops now explicitly check the pinned
   route map validity deadline at their loop gates, so a route map that expires
   while cleanup is in progress returns a typed retryable route-map expiry
