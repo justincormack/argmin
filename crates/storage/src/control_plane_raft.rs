@@ -2307,6 +2307,84 @@ mod tests {
     }
 
     #[test]
+    fn control_plane_openraft_restart_replays_committed_entries() {
+        ControlPlaneRaftTypeConfig::run(async {
+            let mut log_store = ControlPlaneRaftLogStore::empty();
+            RaftLogStorage::append(
+                &mut log_store,
+                vec![
+                    bootstrap_membership_entry(1),
+                    blank_entry(3, 1, 1),
+                    membership_entry(3, 1, 2),
+                    blank_entry(3, 1, 3),
+                ],
+                IOFlushed::noop(),
+            )
+            .await
+            .unwrap();
+            RaftLogStorage::save_committed(&mut log_store, Some(raft_log_id(3, 1, 3)))
+                .await
+                .unwrap();
+
+            let mut state_machine = ControlPlaneRaftStateMachine::empty();
+            state_machine
+                .apply_entry(bootstrap_membership_entry(1))
+                .unwrap();
+            state_machine.apply_entry(blank_entry(3, 1, 1)).unwrap();
+
+            let artifact =
+                ControlPlaneRaftRestartArtifact::capture(&log_store, &state_machine).unwrap();
+            let (mut restored_log_store, restored_state_machine) = artifact.restore().unwrap();
+            assert_eq!(
+                restored_state_machine.last_applied(),
+                Some(raft_log_id(3, 1, 1))
+            );
+
+            let raft = Raft::<ControlPlaneRaftTypeConfig, ControlPlaneRaftStateMachine>::new(
+                1,
+                test_raft_config(),
+                UnreachableRaftNetworkFactory,
+                restored_log_store.clone(),
+                restored_state_machine,
+            )
+            .await
+            .unwrap();
+
+            assert!(raft.is_initialized().await.unwrap());
+            let raft_state = raft
+                .with_raft_state(|state| {
+                    (
+                        state.log_ids.last().cloned(),
+                        state.local_committed().cloned(),
+                        *state.membership_state.effective().log_id(),
+                    )
+                })
+                .await
+                .unwrap();
+            assert_eq!(raft_state.0, Some(raft_log_id(3, 1, 3)));
+            assert_eq!(raft_state.1, Some(raft_log_id(3, 1, 3)));
+            assert_eq!(raft_state.2, Some(raft_log_id(3, 1, 2)));
+            let applied_state = raft
+                .with_state_machine(|state_machine| {
+                    let applied_state = ControlPlaneRaftStateMachine::applied_state(state_machine);
+                    Box::pin(async move { applied_state })
+                })
+                .await
+                .unwrap();
+            assert_eq!(applied_state.0, Some(raft_log_id(3, 1, 3)));
+            assert_eq!(applied_state.1.log_id(), &Some(raft_log_id(3, 1, 2)));
+            assert_eq!(
+                RaftLogStorage::read_committed(&mut restored_log_store)
+                    .await
+                    .unwrap(),
+                Some(raft_log_id(3, 1, 3))
+            );
+
+            raft.shutdown().await.unwrap();
+        });
+    }
+
+    #[test]
     fn control_plane_raft_log_store_rejects_append_holes() {
         ControlPlaneRaftTypeConfig::run(async {
             let mut store = ControlPlaneRaftLogStore::empty();

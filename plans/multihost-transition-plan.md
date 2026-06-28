@@ -9195,6 +9195,12 @@ Phase 12.1 progress:
   membership. This pins the previous index-zero compatibility issue at the
   public OpenRaft API boundary; production networking, durable Raft-log
   storage, and multi-node replication remain future slices.
+- Added a restart smoke that takes the combined in-memory restart artifact
+  through OpenRaft's public `Raft::new` path. The test restores a log store
+  whose committed watermark is ahead of the state machine, verifies OpenRaft
+  replays the retained committed entries during startup, and checks that the
+  effective membership and local committed id advance to the committed
+  watermark without relying on election or client-write timing.
 - Deferred the single-node OpenRaft `client_write` smoke for now. With
   `openraft 0.10.0-alpha.26`, both timer-driven single-node leadership and
   manual `trigger().elect(false)` made the test timing-sensitive or hit an
