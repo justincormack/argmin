@@ -9015,6 +9015,11 @@ Status update:
   cleanup plus `DeleteBucket` helper. The profile is wired into
   `scripts/uat-s3-tests --smoke cleanup-versioned-stress` and the correctness
   soak.
+- Extended the standard UAT failure metrics summary with `http_500_response_total`
+  and cleanup-specific log-match counts for route-map expiry, generic 500
+  request-error evidence, and bucket-delete failure flight events. This keeps
+  backend-neutral `s3-tests` unchanged while making UAT soak failures report the
+  counters needed to separate expected retry pressure from local cleanup bugs.
 - Remaining close-out work is concentrated in deterministic interleaving tests,
   cleanup stress/diagnostics, and checking whether any foreground loops still
   need an earlier retry boundary before route-map validity expires.

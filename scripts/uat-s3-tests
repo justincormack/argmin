@@ -1109,6 +1109,7 @@ print_slowdown_summary() {
         local admission_wait_us
         local operation_aborted
         local request_errors
+        local http_500
         local storage_rpc_errors
         local storage_rpc_admission_total
         local storage_rpc_admission_wait
@@ -1247,6 +1248,7 @@ print_slowdown_summary() {
         admission_wait_us="$(latest_metric_sample_value "$metrics_log" request_admission_wait_us_total)"
         operation_aborted="$(latest_metric_sample_value "$metrics_log" operation_aborted_response_total)"
         request_errors="$(latest_metric_sample_value "$metrics_log" request_error_total)"
+        http_500="$(latest_metric_sample_value "$metrics_log" http_500_response_total)"
         storage_rpc_errors="$(latest_metric_sample_value "$metrics_log" storage_rpc_error_total)"
         storage_rpc_admission_total="$(latest_metric_sample_value "$metrics_log" storage_rpc_admission_total)"
         storage_rpc_admission_wait="$(latest_metric_sample_value "$metrics_log" storage_rpc_admission_wait_total)"
@@ -1383,7 +1385,7 @@ print_slowdown_summary() {
         else
             storage_rpc_admission_wait_percent="0.00"
         fi
-        echo "metrics slow_down_response_total=$slow_down request_admission_timeout_total=$admission_timeout request_admission_wait_total=$admission_wait request_admission_wait_us_total=$admission_wait_us operation_aborted_response_total=$operation_aborted request_error_total=$request_errors storage_rpc_error_total=$storage_rpc_errors storage_rpc_admission_total=$storage_rpc_admission_total storage_rpc_admission_wait_total=$storage_rpc_admission_wait storage_rpc_admission_wait_us_total=$storage_rpc_admission_wait_us storage_rpc_admission_wait_percent=$storage_rpc_admission_wait_percent storage_rpc_admission_timeout_total=$storage_rpc_admission_timeout" >&2
+        echo "metrics slow_down_response_total=$slow_down request_admission_timeout_total=$admission_timeout request_admission_wait_total=$admission_wait request_admission_wait_us_total=$admission_wait_us operation_aborted_response_total=$operation_aborted request_error_total=$request_errors http_500_response_total=$http_500 storage_rpc_error_total=$storage_rpc_errors storage_rpc_admission_total=$storage_rpc_admission_total storage_rpc_admission_wait_total=$storage_rpc_admission_wait storage_rpc_admission_wait_us_total=$storage_rpc_admission_wait_us storage_rpc_admission_wait_percent=$storage_rpc_admission_wait_percent storage_rpc_admission_timeout_total=$storage_rpc_admission_timeout" >&2
         echo "storage_rpc_active total=$storage_rpc_active_total completion=$storage_rpc_active_completion pending_envelope_active=$storage_rpc_pending_envelope_active pending_envelope_oldest_active_us=$storage_rpc_pending_envelope_oldest_active_us pending_envelope_oldest_active_node_id=$storage_rpc_pending_envelope_oldest_active_node_id pending_envelope_oldest_active_request_id=$storage_rpc_pending_envelope_oldest_active_request_id" >&2
         echo "metadata_recovery leader_total=$metadata_recovery_leader wait_total=$metadata_recovery_wait wait_us_total=$metadata_recovery_wait_us wait_us_max=$metadata_recovery_wait_us_max timeout_total=$metadata_recovery_timeout outcome_total=$metadata_recovery_outcome" >&2
         echo "metadata_budget exhausted_total=$metadata_budget_exhausted backoff_total=$metadata_backoff backoff_us_total=$metadata_backoff_us backoff_us_max=$metadata_backoff_us_max" >&2
@@ -1429,13 +1431,20 @@ print_slowdown_summary() {
     fi
     local slowdown_log_match_lines
     local slowdown_log_match_count=0
+    local request_error_500_count=0
+    local bucket_delete_failure_event_count=0
+    local route_map_expired_count=0
     if ((${#server_logs[@]})); then
         slowdown_log_match_lines="$(grep -hE "request_error .*status=503|SlowDown|slow_down" "${server_logs[@]}" 2>/dev/null || true)"
         if [[ -n "$slowdown_log_match_lines" ]]; then
             slowdown_log_match_count="$(printf '%s\n' "$slowdown_log_match_lines" | wc -l | tr -d ' ')"
         fi
+        request_error_500_count="$({ grep -hE "request_error .*status=500|HTTP response conversion produced InternalError|server produced HTTP 500" "${server_logs[@]}" 2>/dev/null || true; } | wc -l | tr -d ' ')"
+        bucket_delete_failure_event_count="$({ grep -hE "bucket_delete_(authorize|begin|finalize)_failed|bucket delete (begin|finalize) found visible data" "${server_logs[@]}" 2>/dev/null || true; } | wc -l | tr -d ' ')"
+        route_map_expired_count="$({ grep -hE "cause_label=route_map_expired|route_map_expired|RouteMapExpired" "${server_logs[@]}" 2>/dev/null || true; } | wc -l | tr -d ' ')"
     fi
     echo "log_matches status_503_or_slowdown=$slowdown_log_match_count" >&2
+    echo "cleanup_log_matches route_map_expired=$route_map_expired_count request_error_500=$request_error_500_count bucket_delete_failure_events=$bucket_delete_failure_event_count" >&2
 }
 
 cleanup_server() {
