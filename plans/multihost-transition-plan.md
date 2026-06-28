@@ -9123,6 +9123,13 @@ Phase 12.1 progress:
   membership. This pins the previous index-zero compatibility issue at the
   public OpenRaft API boundary; production networking, durable Raft-log
   storage, and multi-node replication remain future slices.
+- Deferred the single-node OpenRaft `client_write` smoke for now. With
+  `openraft 0.10.0-alpha.26`, both timer-driven single-node leadership and
+  manual `trigger().elect(false)` made the test timing-sensitive or hit an
+  internal leader/vote assertion under repeated runs. Keep logical command
+  coverage at the deterministic `RaftStateMachine::apply` boundary and keep
+  the public OpenRaft smoke at initialization until the spike has a
+  deterministic multi-node/network harness or a stable leadership setup.
 
 1. define the replicated control-plane state machine:
    - state includes cluster epoch, PG count, PG state, PG acting sets, node
