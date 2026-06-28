@@ -135,8 +135,8 @@ fn store_error_is_retryable_contention(error: &storage::StoreError) -> bool {
         | storage::StoreError::StaleShardLocation { .. }
         | storage::StoreError::PgNotActive { .. }
         | storage::StoreError::ShardPgNotActive { .. } => true,
-        storage::StoreError::StorageRpc { message, .. } => {
-            storage_rpc_message_is_retryable_route_state(message)
+        storage::StoreError::StorageRpc { code, .. } => {
+            storage_rpc_code_is_retryable_route_state(*code)
         }
         storage::StoreError::ShardStore { source, .. } => {
             store_error_is_retryable_contention(source)
@@ -145,12 +145,15 @@ fn store_error_is_retryable_contention(error: &storage::StoreError) -> bool {
     }
 }
 
-fn storage_rpc_message_is_retryable_route_state(message: &str) -> bool {
-    message.starts_with("StaleShardLocation: ")
-        || message.starts_with("InactivePgRoute: ")
-        || message.starts_with("NonActingSetAccess: ")
-        || message.starts_with("WrongClusterEpoch: ")
-        || message.contains("metadata command contention during")
+fn storage_rpc_code_is_retryable_route_state(code: storage::StorageRpcErrorCode) -> bool {
+    matches!(
+        code,
+        storage::StorageRpcErrorCode::StaleShardLocation
+            | storage::StorageRpcErrorCode::InactivePgRoute
+            | storage::StorageRpcErrorCode::NonActingSetAccess
+            | storage::StorageRpcErrorCode::WrongClusterEpoch
+            | storage::StorageRpcErrorCode::MetadataCommandContention
+    )
 }
 
 fn store_error_is_resource_exhausted(error: &storage::StoreError) -> bool {

@@ -37,7 +37,7 @@ use storage::{
     CanonicalUserId, ClusterEpoch, EcShape, LocalClusterMap,
     LocalUnixStorageNodeClientAdmissionSettings, LocalUnixStorageNodeClientConfig, NodeId, PgId,
     PgMetadataTransferArtifact, PgMetadataTransferError, PgState, SharedStorageNode,
-    StorageCluster, StorageClusterRuntimeMapHandle, StoreError,
+    StorageCluster, StorageClusterRuntimeMapHandle, StorageRpcErrorCode, StoreError,
 };
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
@@ -1116,12 +1116,9 @@ fn metadata_transfer_error_is_transient_route_refresh(error: &PgMetadataTransfer
 fn store_error_is_transient_route_refresh_for_metadata_transfer(error: &StoreError) -> bool {
     match error {
         StoreError::StaleShardLocation { .. } => true,
-        StoreError::StorageRpc { message, .. } => {
-            message.starts_with("StaleShardLocation: ")
-                || (message.starts_with("InactivePgRoute: historical peering inspection ")
-                    && message.contains(" requires Peering route, got active"))
-                || (message.starts_with("InactivePgRoute: historical metadata log read ")
-                    && message.contains(" requires Peering route, got active"))
+        StoreError::StorageRpc { code, .. } => {
+            *code == StorageRpcErrorCode::StaleShardLocation
+                || *code == StorageRpcErrorCode::MetadataTransferHistoricalRouteActive
         }
         StoreError::ShardStore { source, .. } => {
             store_error_is_transient_route_refresh_for_metadata_transfer(source)
@@ -2201,8 +2198,9 @@ mod tests {
     fn metadata_transfer_retry_treats_active_peering_inspection_as_transient() {
         let error = PgMetadataTransferError::Store(StoreError::StorageRpc {
             node_id: 0,
-            operation: "metadata command validate replay state preserving pending",
-            message: "InactivePgRoute: historical peering inspection for PG 0 at epoch 28 requires Peering route, got active".to_string(),
+            operation: "metadata command replica state",
+            code: StorageRpcErrorCode::MetadataTransferHistoricalRouteActive,
+            message: "historical peering inspection for PG 0 at epoch 28 requires Peering route, got active".to_string(),
         });
 
         assert!(metadata_transfer_error_is_transient_route_refresh(&error));
@@ -2212,8 +2210,9 @@ mod tests {
     fn metadata_transfer_retry_does_not_treat_active_route_mismatch_as_transient() {
         let error = PgMetadataTransferError::Store(StoreError::StorageRpc {
             node_id: 0,
-            operation: "metadata command validate replay state preserving pending",
-            message: "InactivePgRoute: historical peering inspection for PG 0 at epoch 28 requires Peering route, got peering".to_string(),
+            operation: "metadata command replica state",
+            code: StorageRpcErrorCode::InactivePgRoute,
+            message: "historical peering inspection for PG 0 at epoch 28 requires Peering route, got peering".to_string(),
         });
 
         assert!(!metadata_transfer_error_is_transient_route_refresh(&error));

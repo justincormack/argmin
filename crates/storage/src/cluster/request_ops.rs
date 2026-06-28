@@ -4165,6 +4165,7 @@ impl super::StorageCluster {
             return Err(BucketWriteDrainError::Store(StoreError::StorageRpc {
                 node_id: node_id.as_u32(),
                 operation: "object bucket payload reclaim root",
+                code: StorageRpcErrorCode::Internal,
                 message: "payload reclaim root does not belong to requested object metadata PG"
                     .to_string(),
             }));
@@ -5001,6 +5002,7 @@ impl super::StorageCluster {
                 return Err(ObjectPgActionError::Store(StoreError::StorageRpc {
                     node_id: node_id.as_u32(),
                     operation: "validate bucket list response",
+                    code: StorageRpcErrorCode::Internal,
                     message: format!(
                         "bucket {} belongs to bucket PG {}, not response PG {}",
                         bucket.name.as_str(),

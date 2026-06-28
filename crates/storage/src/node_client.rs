@@ -310,7 +310,8 @@ fn storage_rpc_response_error(
         code => StoreError::StorageRpc {
             node_id: node_id.as_u32(),
             operation: kind.operation_name(),
-            message: format!("{code:?}: {}", error.message),
+            code,
+            message: error.message,
         },
     }
 }

@@ -56,7 +56,7 @@ use crate::pg_store::{
     PgClusterMapHistoryReferenceSummary,
 };
 use crate::storage_rpc::{
-    STORAGE_RPC_MAX_METADATA_COMMAND_CHECKPOINT_CANDIDATES,
+    StorageRpcErrorCode, STORAGE_RPC_MAX_METADATA_COMMAND_CHECKPOINT_CANDIDATES,
     STORAGE_RPC_MAX_METADATA_COMMAND_LOG_ENTRY_RANGE_ENTRIES, STORAGE_RPC_MAX_PAYLOAD_LEN,
 };
 #[cfg(test)]
@@ -10691,10 +10691,7 @@ fn metadata_command_checkpoint_record_error_is_stale(error: &StoreError) -> bool
             context: "connect storage-node RPC socket",
             ..
         } => true,
-        StoreError::StorageRpc { message, .. } => {
-            is_retryable_remote_pg_route_error(message.as_str())
-                || message.contains("metadata command contention during")
-        }
+        StoreError::StorageRpc { code, .. } => storage_rpc_code_is_retryable_pg_route_error(*code),
         _ => false,
     }
 }
@@ -10715,16 +10712,17 @@ mod metadata_command_checkpoint_record_error_tests {
             &StoreError::StorageRpc {
                 node_id: 0,
                 operation: "metadata command checkpoint record current",
-                message:
-                    "Internal: metadata command contention during export metadata command checkpoint"
-                        .to_string(),
+                code: StorageRpcErrorCode::MetadataCommandContention,
+                message: "metadata command contention during export metadata command checkpoint"
+                    .to_string(),
             },
         ));
         assert!(!metadata_command_checkpoint_record_error_is_stale(
             &StoreError::StorageRpc {
                 node_id: 0,
                 operation: "metadata command checkpoint record current",
-                message: "Internal: metadata state digest mismatch".to_string(),
+                code: StorageRpcErrorCode::Internal,
+                message: "metadata state digest mismatch".to_string(),
             },
         ));
     }
@@ -10783,18 +10781,20 @@ fn shard_backfill_candidate_error_is_deferred(error: &StoreError) -> bool {
         | StoreError::StaleShardOperation { .. }
         | StoreError::StaleShardLocation { .. }
         | StoreError::StorageRpcResourceExhausted { .. } => true,
-        StoreError::StorageRpc { message, .. } => {
-            is_retryable_remote_pg_route_error(message.as_str())
-        }
+        StoreError::StorageRpc { code, .. } => storage_rpc_code_is_retryable_pg_route_error(*code),
         _ => false,
     }
 }
 
-fn is_retryable_remote_pg_route_error(message: &str) -> bool {
-    message.starts_with("StaleShardLocation: ")
-        || message.starts_with("InactivePgRoute: ")
-        || message.starts_with("NonActingSetAccess: ")
-        || message.starts_with("WrongClusterEpoch: ")
+fn storage_rpc_code_is_retryable_pg_route_error(code: StorageRpcErrorCode) -> bool {
+    matches!(
+        code,
+        StorageRpcErrorCode::StaleShardLocation
+            | StorageRpcErrorCode::InactivePgRoute
+            | StorageRpcErrorCode::NonActingSetAccess
+            | StorageRpcErrorCode::WrongClusterEpoch
+            | StorageRpcErrorCode::MetadataCommandContention
+    )
 }
 
 fn erasure_codec_for_shape(ec: EcShape, context: &'static str) -> Result<ErasureCodec, StoreError> {
@@ -10971,11 +10971,15 @@ fn placed_segment_recoverable_shard_error(error: ShardIoError) -> Result<(), Sto
             ..
         } => Ok(()),
         ShardIoError::Store {
-            source: StoreError::StorageRpc {
-                operation, message, ..
-            },
+            source:
+                StoreError::StorageRpc {
+                    operation,
+                    code,
+                    message,
+                    ..
+                },
             ..
-        } if is_recoverable_remote_shard_read_error(operation, message.as_str()) => Ok(()),
+        } if is_recoverable_remote_shard_read_error(operation, code, message.as_str()) => Ok(()),
         ShardIoError::Store {
             source: StoreError::Io { context, source },
             ..
@@ -10984,10 +10988,15 @@ fn placed_segment_recoverable_shard_error(error: ShardIoError) -> Result<(), Sto
     }
 }
 
-fn is_recoverable_remote_shard_read_error(operation: &'static str, message: &str) -> bool {
+fn is_recoverable_remote_shard_read_error(
+    operation: &'static str,
+    code: StorageRpcErrorCode,
+    message: &str,
+) -> bool {
     matches!(operation, "shard read" | "shard read range")
-        && (message == "Internal: shard not found"
-            || (message.starts_with("Internal: shard ") && message.contains(" ack mismatch: ")))
+        && code == StorageRpcErrorCode::Internal
+        && (message == "shard not found"
+            || (message.starts_with("shard ") && message.contains(" ack mismatch: ")))
 }
 
 fn is_recoverable_physical_shard_io_error(context: &'static str, kind: std::io::ErrorKind) -> bool {
@@ -11321,8 +11330,8 @@ mod reissue_decision_tests {
     #[test]
     fn placed_segment_read_recovers_remote_shard_read_damage_errors() {
         for message in [
-            "Internal: shard not found".to_string(),
-            "Internal: shard 00000000000000000000000000000000000000000000000000 ack mismatch: expected size 4 CRC 0x0000000000000001, got size 4 CRC 0x0000000000000002".to_string(),
+            "shard not found".to_string(),
+            "shard 00000000000000000000000000000000000000000000000000 ack mismatch: expected size 4 CRC 0x0000000000000001, got size 4 CRC 0x0000000000000002".to_string(),
         ] {
             let error = ShardIoError::Store {
                 node_id: 5,
@@ -11331,6 +11340,7 @@ mod reissue_decision_tests {
                 source: StoreError::StorageRpc {
                     node_id: 5,
                     operation: "shard read",
+                    code: StorageRpcErrorCode::Internal,
                     message,
                 },
             };
@@ -11342,8 +11352,8 @@ mod reissue_decision_tests {
     #[test]
     fn placed_segment_read_does_not_recover_unrelated_remote_rpc_errors() {
         for (operation, message) in [
-            ("shard read", "Internal: database is unavailable"),
-            ("shard delete", "Internal: shard not found"),
+            ("shard read", "database is unavailable"),
+            ("shard delete", "shard not found"),
         ] {
             let error = ShardIoError::Store {
                 node_id: 5,
@@ -11352,6 +11362,7 @@ mod reissue_decision_tests {
                 source: StoreError::StorageRpc {
                     node_id: 5,
                     operation,
+                    code: StorageRpcErrorCode::Internal,
                     message: message.to_string(),
                 },
             };

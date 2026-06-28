@@ -1,6 +1,7 @@
 /// Storage layer error types.
 use std::path::PathBuf;
 
+use crate::storage_rpc::StorageRpcErrorCode;
 use crate::types::{ClusterEpoch, PgState};
 
 /// Shard-level storage errors.
@@ -68,10 +69,11 @@ pub enum StoreError {
         source: Box<StoreError>,
     },
 
-    #[error("storage RPC {operation} failed on node {node_id}: {message}")]
+    #[error("storage RPC {operation} failed on node {node_id} with {code:?}: {message}")]
     StorageRpc {
         node_id: u32,
         operation: &'static str,
+        code: StorageRpcErrorCode,
         message: String,
     },
 

@@ -4320,12 +4320,14 @@ fn storage_rpc_resource_exhaustion_maps_to_slow_down() {
     assert_maps_to_operation_aborted(storage::StoreError::StorageRpc {
         node_id: 1,
         operation: "test operation",
-        message: "InactivePgRoute: PG 2 is Peering".to_string(),
+        code: storage::StorageRpcErrorCode::InactivePgRoute,
+        message: "PG 2 is Peering".to_string(),
     });
     assert_maps_to_operation_aborted(storage::StoreError::StorageRpc {
         node_id: 1,
         operation: "test operation",
-        message: "Internal: metadata command contention during bucket delete begin".to_string(),
+        code: storage::StorageRpcErrorCode::MetadataCommandContention,
+        message: "metadata command contention during bucket delete begin".to_string(),
     });
     assert_maps_to_operation_aborted(storage::StoreError::ShardStore {
         node_id: 1,

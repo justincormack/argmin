@@ -787,10 +787,10 @@ fn unix_object_mutation_client_rejects_stale_upload_part_stream_command_epoch() 
             err,
             ObjectPgActionError::Store(StoreError::StorageRpc {
                 operation: "object stream upload command build",
+                code: StorageRpcErrorCode::StaleShardLocation,
                 ref message,
                 ..
-            }) if message.starts_with("StaleShardLocation: ")
-                && message.contains(&format!("request route epoch {stale_epoch}"))
+            }) if message.contains(&format!("request route epoch {stale_epoch}"))
                 && message.contains(&format!("storage-node epoch {}", config.cluster_epoch))
         ),
         "stale UploadPart stream command-build RPC should fail route validation, got {err:?}"
@@ -2124,10 +2124,10 @@ fn unix_object_mutation_client_rejects_stale_stream_part_commit_command_epoch() 
             err,
             ObjectPgActionError::Store(StoreError::StorageRpc {
                 operation: "object stream part commit command build",
+                code: StorageRpcErrorCode::StaleShardLocation,
                 ref message,
                 ..
-            }) if message.starts_with("StaleShardLocation: ")
-                && message.contains(&format!("request route epoch {stale_epoch}"))
+            }) if message.contains(&format!("request route epoch {stale_epoch}"))
                 && message.contains(&format!("storage-node epoch {}", config.cluster_epoch))
         ),
         "stale stream-part commit command-build RPC should fail route validation, got {err:?}"

@@ -695,7 +695,7 @@ pub(crate) enum StorageRpcMessageKind {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u16)]
-pub(crate) enum StorageRpcErrorCode {
+pub enum StorageRpcErrorCode {
     FrameDecode = 1,
     PayloadDecode = 2,
     UnknownNode = 3,
@@ -715,6 +715,8 @@ pub(crate) enum StorageRpcErrorCode {
     NotFound = 17,
     BucketWriteReservationConflict = 18,
     BucketWriteReservationNotFound = 19,
+    MetadataCommandContention = 20,
+    MetadataTransferHistoricalRouteActive = 21,
 }
 
 impl StorageRpcErrorCode {
@@ -739,6 +741,8 @@ impl StorageRpcErrorCode {
             17 => Ok(Self::NotFound),
             18 => Ok(Self::BucketWriteReservationConflict),
             19 => Ok(Self::BucketWriteReservationNotFound),
+            20 => Ok(Self::MetadataCommandContention),
+            21 => Ok(Self::MetadataTransferHistoricalRouteActive),
             _ => Err(StorageRpcPayloadError::InvalidResponseEnvelope(
                 "unknown storage RPC error code",
             )),

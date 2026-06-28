@@ -8865,8 +8865,13 @@ impl StorageNodeConnectionHandler {
             });
         };
         if route.state != PgState::Peering {
+            let code = if route.state == PgState::Active {
+                StorageRpcErrorCode::MetadataTransferHistoricalRouteActive
+            } else {
+                StorageRpcErrorCode::InactivePgRoute
+            };
             return Err(StorageRpcErrorResponse {
-                code: StorageRpcErrorCode::InactivePgRoute,
+                code,
                 message: format!(
                     "historical peering inspection for PG {raw_pg_id} at epoch {} requires Peering route, got {}",
                     cluster_epoch.get(),
@@ -9820,6 +9825,10 @@ fn store_error_response(error: StoreError) -> StorageRpcErrorResponse {
             code: StorageRpcErrorCode::NotFound,
             message: "not found".to_string(),
         },
+        StoreError::MetadataCommandContention { context } => StorageRpcErrorResponse {
+            code: StorageRpcErrorCode::MetadataCommandContention,
+            message: format!("metadata command contention during {context}"),
+        },
         error => StorageRpcErrorResponse {
             code: StorageRpcErrorCode::Internal,
             message: error.to_string(),
@@ -9853,6 +9862,12 @@ fn bucket_snapshot_error_response(error: BucketSnapshotLoadError) -> StorageRpcE
             code: StorageRpcErrorCode::BucketWriteReservationNotFound,
             message: reservation_id,
         },
+        BucketSnapshotLoadError::Store(StoreError::MetadataCommandContention { context }) => {
+            StorageRpcErrorResponse {
+                code: StorageRpcErrorCode::MetadataCommandContention,
+                message: format!("metadata command contention during {context}"),
+            }
+        }
         error => StorageRpcErrorResponse {
             code: StorageRpcErrorCode::Internal,
             message: error.to_string(),
@@ -9881,16 +9896,32 @@ fn bucket_write_drain_heartbeat_error_response(
 }
 
 fn bucket_write_drain_error_response(error: BucketWriteDrainError) -> StorageRpcErrorResponse {
-    StorageRpcErrorResponse {
-        code: StorageRpcErrorCode::Internal,
-        message: error.to_string(),
+    match error {
+        BucketWriteDrainError::Store(StoreError::MetadataCommandContention { context }) => {
+            StorageRpcErrorResponse {
+                code: StorageRpcErrorCode::MetadataCommandContention,
+                message: format!("metadata command contention during {context}"),
+            }
+        }
+        error => StorageRpcErrorResponse {
+            code: StorageRpcErrorCode::Internal,
+            message: error.to_string(),
+        },
     }
 }
 
 fn object_pg_error_response(error: ObjectPgActionError) -> StorageRpcErrorResponse {
-    StorageRpcErrorResponse {
-        code: StorageRpcErrorCode::Internal,
-        message: error.to_string(),
+    match error {
+        ObjectPgActionError::Store(StoreError::MetadataCommandContention { context }) => {
+            StorageRpcErrorResponse {
+                code: StorageRpcErrorCode::MetadataCommandContention,
+                message: format!("metadata command contention during {context}"),
+            }
+        }
+        error => StorageRpcErrorResponse {
+            code: StorageRpcErrorCode::Internal,
+            message: error.to_string(),
+        },
     }
 }
 
@@ -13961,6 +13992,50 @@ mod tests {
             .unwrap();
         let validated = decode_metadata_command_state_response(&validate_payload).unwrap();
         assert_eq!(validated.state.state_digest, expected_state_digest);
+    }
+
+    #[test]
+    fn storage_node_server_classifies_active_historical_transfer_route() {
+        let tmp = test_util::tempdir();
+        let mut config = test_config(&tmp);
+        let source_route_epoch = ClusterEpoch::new(2).unwrap();
+        let current_epoch = ClusterEpoch::new(4).unwrap();
+        config.cluster_epoch = current_epoch;
+        config.pg_routes[0].cluster_epoch = current_epoch;
+        config.pg_routes[0].state = PgState::Peering;
+        config.historical_pg_routes.push(StorageNodePgRoute {
+            pg_id: 0,
+            cluster_epoch: source_route_epoch,
+            state: PgState::Active,
+            primary_node_id: NodeId::new(7),
+            acting_set: vec![NodeId::new(7)],
+        });
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let server = StorageNodeServer::bind(config.clone()).unwrap();
+        let socket_path = config.socket_path.clone();
+        let join = thread::spawn(move || server.accept_one().unwrap());
+
+        let mut client = UnixStream::connect(socket_path).unwrap();
+        let response = send_frame(
+            &mut client,
+            1,
+            StorageRpcMessageKind::MetadataCommandReplicaState,
+            encode_metadata_command_state_request(&StorageRpcMetadataCommandStateRequest {
+                node_id: NodeId::new(7),
+                cluster_epoch: source_route_epoch,
+                pg_id: PgId::new(0),
+            }),
+        );
+        drop(client);
+        join.join().unwrap();
+
+        let error = decode_storage_rpc_response_payload(&response.payload)
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(
+            error.code,
+            StorageRpcErrorCode::MetadataTransferHistoricalRouteActive
+        );
     }
 
     #[test]

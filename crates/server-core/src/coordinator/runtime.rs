@@ -1565,18 +1565,19 @@ fn shard_backfill_error_is_stale_retry(error: &StoreError) -> bool {
         | StoreError::StaleShardOperation { .. }
         | StoreError::StaleShardLocation { .. }
         | StoreError::StorageRpcResourceExhausted { .. } => true,
-        StoreError::StorageRpc { message, .. } => {
-            shard_backfill_remote_error_is_stale_retry(message.as_str())
-        }
+        StoreError::StorageRpc { code, .. } => shard_backfill_remote_error_is_stale_retry(*code),
         _ => false,
     }
 }
 
-fn shard_backfill_remote_error_is_stale_retry(message: &str) -> bool {
-    message.starts_with("StaleShardLocation: ")
-        || message.starts_with("InactivePgRoute: ")
-        || message.starts_with("NonActingSetAccess: ")
-        || message.starts_with("WrongClusterEpoch: ")
+fn shard_backfill_remote_error_is_stale_retry(code: storage::StorageRpcErrorCode) -> bool {
+    matches!(
+        code,
+        storage::StorageRpcErrorCode::StaleShardLocation
+            | storage::StorageRpcErrorCode::InactivePgRoute
+            | storage::StorageRpcErrorCode::NonActingSetAccess
+            | storage::StorageRpcErrorCode::WrongClusterEpoch
+    )
 }
 
 fn shard_backfill_queue_depth(storage_cluster: &StorageCluster) -> Option<usize> {
@@ -2899,8 +2900,8 @@ mod tests {
             &StoreError::StorageRpc {
                 node_id: 2,
                 operation: "shard repair write",
-                message: "StaleShardLocation: request route epoch 10 does not match storage-node epoch 11"
-                    .to_string(),
+                code: storage::StorageRpcErrorCode::StaleShardLocation,
+                message: "request route epoch 10 does not match storage-node epoch 11".to_string(),
             }
         ));
         assert!(!shard_backfill_error_is_stale_retry(&StoreError::NotFound));

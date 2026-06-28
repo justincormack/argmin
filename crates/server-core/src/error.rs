@@ -675,9 +675,10 @@ fn store_error_storage_rpc_detail(error: &StoreError) -> Option<String> {
         StoreError::StorageRpc {
             node_id,
             operation,
+            code,
             message,
         } => Some(format!(
-            "storage_rpc node_id={node_id} operation={operation:?} message={message:?}"
+            "storage_rpc node_id={node_id} operation={operation:?} code={code:?} message={message:?}"
         )),
         StoreError::StorageRpcResourceExhausted {
             node_id,

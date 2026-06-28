@@ -1619,6 +1619,7 @@ impl UnixStorageNodeClient {
         StoreError::StorageRpc {
             node_id: self.node_id.as_u32(),
             operation,
+            code: StorageRpcErrorCode::PayloadDecode,
             message,
         }
     }
@@ -1707,6 +1708,7 @@ impl UnixStorageNodeClient {
         let limit = u32::try_from(limit).map_err(|_| StoreError::StorageRpc {
             operation: "metadata command checkpoint candidates",
             node_id: self.node_id.as_u32(),
+            code: StorageRpcErrorCode::PayloadDecode,
             message: format!("checkpoint candidate limit {limit} exceeds u32::MAX"),
         })?;
         let request = StorageRpcMetadataCommandCheckpointCandidatesRequest {
