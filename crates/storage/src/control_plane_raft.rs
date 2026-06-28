@@ -1,7 +1,9 @@
 use std::collections::BTreeMap;
 use std::fmt;
+use std::future::Future;
 use std::io::{self, Cursor};
 use std::ops::{Bound, RangeBounds};
+use std::pin::Pin;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use futures_util::{Stream, StreamExt};
@@ -77,6 +79,32 @@ impl SubmittedControlPlaneRaftCommand {
 
 pub struct ControlPlaneRaftAuthority {
     raft: Raft<ControlPlaneRaftTypeConfig, ControlPlaneRaftStateMachine>,
+}
+
+pub type ControlPlaneRaftFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
+pub trait ControlPlaneRaftLinearizedCommandSink {
+    fn submit_control_plane_command(
+        &self,
+        command: ControlPlaneCommand,
+    ) -> ControlPlaneRaftFuture<'_, Result<SubmittedControlPlaneRaftCommand, ControlPlaneError>>;
+}
+
+pub trait ControlPlaneRaftLinearizedRuntimeMapSource {
+    fn linearized_runtime_map_snapshot(
+        &self,
+        issued_at_ms: u64,
+    ) -> ControlPlaneRaftFuture<'_, Result<ClusterRuntimeMapSnapshot, ControlPlaneError>>;
+}
+
+pub trait ControlPlaneRaftLinearizedAuthority:
+    ControlPlaneRaftLinearizedCommandSink + ControlPlaneRaftLinearizedRuntimeMapSource
+{
+}
+
+impl<T> ControlPlaneRaftLinearizedAuthority for T where
+    T: ControlPlaneRaftLinearizedCommandSink + ControlPlaneRaftLinearizedRuntimeMapSource
+{
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -193,6 +221,29 @@ impl ControlPlaneRaftAuthority {
             .shutdown()
             .await
             .map_err(|error| openraft_remote_error("shutdown", error))
+    }
+}
+
+impl ControlPlaneRaftLinearizedCommandSink for ControlPlaneRaftAuthority {
+    fn submit_control_plane_command(
+        &self,
+        command: ControlPlaneCommand,
+    ) -> ControlPlaneRaftFuture<'_, Result<SubmittedControlPlaneRaftCommand, ControlPlaneError>>
+    {
+        Box::pin(async move {
+            ControlPlaneRaftAuthority::submit_control_plane_command(self, command).await
+        })
+    }
+}
+
+impl ControlPlaneRaftLinearizedRuntimeMapSource for ControlPlaneRaftAuthority {
+    fn linearized_runtime_map_snapshot(
+        &self,
+        issued_at_ms: u64,
+    ) -> ControlPlaneRaftFuture<'_, Result<ClusterRuntimeMapSnapshot, ControlPlaneError>> {
+        Box::pin(async move {
+            ControlPlaneRaftAuthority::linearized_runtime_map_snapshot(self, issued_at_ms).await
+        })
     }
 }
 
@@ -3070,6 +3121,72 @@ mod tests {
                 .nodes()
                 .iter()
                 .any(|node| node.node_id() == NodeId::new(1)));
+
+            authority.shutdown().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn control_plane_openraft_linearized_authority_traits_submit_and_read() {
+        ControlPlaneRaftTypeConfig::run(async {
+            let log_store = ControlPlaneRaftLogStore::empty();
+            let state_machine = ControlPlaneRaftStateMachine::empty();
+            let raft = Raft::<ControlPlaneRaftTypeConfig, ControlPlaneRaftStateMachine>::new(
+                301,
+                test_raft_config("control-plane-raft-linearized-authority-trait-test"),
+                UnreachableRaftNetworkFactory,
+                log_store,
+                state_machine,
+            )
+            .await
+            .unwrap();
+
+            let authority = ControlPlaneRaftAuthority::new(raft);
+            authority
+                .initialize_membership(BTreeMap::from([(301, BasicNode::new("node-301"))]))
+                .await
+                .unwrap();
+            wait_for_local_leader(authority.raft(), "linearized authority trait leadership").await;
+
+            let command_sink: &dyn ControlPlaneRaftLinearizedCommandSink = &authority;
+            let write = command_sink
+                .submit_control_plane_command(ControlPlaneCommand::BootstrapInitialClusterMap {
+                    nodes: vec![(NodeId::new(301), "node-301".to_string())],
+                    pg_ids: vec![PgId::new(0)],
+                })
+                .await
+                .unwrap();
+            assert!(matches!(
+                write.outcome(),
+                ControlPlaneRaftCommandOutcome::Applied(
+                    ControlPlaneCommandResponse::BootstrapInitialClusterMap
+                )
+            ));
+
+            let runtime_map_source: &dyn ControlPlaneRaftLinearizedRuntimeMapSource = &authority;
+            let runtime_map = runtime_map_source
+                .linearized_runtime_map_snapshot(66_000)
+                .await
+                .unwrap();
+            let expected_read_index = control_plane_log_id_from_raft(
+                authority
+                    .status()
+                    .await
+                    .unwrap()
+                    .applied()
+                    .expect("trait read should have an applied tip"),
+            )
+            .expect("trait read should be non-bootstrap");
+
+            assert_eq!(
+                runtime_map.freshness_proof().read_index(),
+                Some(expected_read_index)
+            );
+            assert_eq!(runtime_map.freshness_proof().issued_at_ms(), Some(66_000));
+            assert!(runtime_map
+                .nodes()
+                .iter()
+                .any(|node| node.node_id() == NodeId::new(301)));
 
             authority.shutdown().await.unwrap();
         });

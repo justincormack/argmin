@@ -9402,6 +9402,12 @@ Phase 12.1 progress:
   initialized-state checks, and shutdown. The public OpenRaft smokes now use
   the wrapper for lifecycle operations, leaving raw `Raft` access only for
   white-box assertions and test-only leader waits.
+- Added an explicit async linearized authority trait boundary for the OpenRaft
+  wrapper. The Phase 11 `ControlPlaneLinearized*` traits remain synchronous for
+  the local/file-backed authority, while the Phase 12 OpenRaft path exposes
+  awaited command submission and read-index runtime-map reads without hiding a
+  runtime block inside the interface. A public smoke now exercises the wrapper
+  through those trait objects.
 - Added a test-only in-memory OpenRaft network factory that forwards
   append/vote/pre-vote/snapshot RPCs between registered local `Raft` handles.
   A two-node public smoke now initializes membership through node 101, waits for
