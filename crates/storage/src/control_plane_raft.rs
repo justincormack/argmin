@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::future::Future;
 use std::io::{self, Cursor};
@@ -170,6 +170,19 @@ impl ControlPlaneRaftAuthority {
             .is_initialized()
             .await
             .map_err(|error| openraft_remote_error("is-initialized", error))
+    }
+
+    pub async fn replace_voters(
+        &self,
+        voters: BTreeSet<ControlPlaneRaftNodeId>,
+        retain_removed_voters_as_learners: bool,
+    ) -> Result<LogIdOf<ControlPlaneRaftTypeConfig>, ControlPlaneError> {
+        let response = self
+            .raft
+            .change_membership(voters, retain_removed_voters_as_learners)
+            .await
+            .map_err(|error| openraft_remote_error("change-membership", error))?;
+        Ok(response.log_id)
     }
 
     pub async fn submit_control_plane_command(
@@ -3407,16 +3420,15 @@ mod tests {
                 )
             ));
 
-            let response = authority1
-                .raft()
-                .change_membership(BTreeSet::from([501]), false)
+            let membership_log_id = authority1
+                .replace_voters(BTreeSet::from([501]), false)
                 .await
                 .unwrap();
             authority1
                 .raft()
                 .wait(Some(Duration::from_secs(1)))
                 .applied_index_at_least(
-                    Some(response.log_id.index()),
+                    Some(membership_log_id.index()),
                     "two-node leader applied membership change",
                 )
                 .await
@@ -3435,7 +3447,7 @@ mod tests {
                 })
                 .await
                 .unwrap();
-            assert_eq!(raft_membership.0, Some(response.log_id));
+            assert_eq!(raft_membership.0, Some(membership_log_id));
             assert_eq!(raft_membership.1, BTreeSet::from([501]));
 
             let state_machine_membership = authority1
@@ -3451,7 +3463,7 @@ mod tests {
                 })
                 .await
                 .unwrap();
-            assert_eq!(state_machine_membership.0, Some(response.log_id));
+            assert_eq!(state_machine_membership.0, Some(membership_log_id));
             assert_eq!(state_machine_membership.1, BTreeSet::from([501]));
 
             authority1.shutdown().await.unwrap();

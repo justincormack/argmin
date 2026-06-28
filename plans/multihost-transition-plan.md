@@ -9436,10 +9436,11 @@ Phase 12.1 progress:
   follower's control-plane state unmutated.
 - Added a two-node OpenRaft membership-change smoke. After an initial
   control-plane command commits the bootstrap membership, the leader shrinks the
-  voter set through OpenRaft `change_membership`, and the test verifies the
-  leader's effective membership and state-machine `last_membership` agree on
-  the final membership log id. The removed follower is not required to apply
-  the final removal entry after OpenRaft has removed it from the voter set.
+  voter set through the `ControlPlaneRaftAuthority` lifecycle wrapper, and the
+  test verifies the leader's effective membership and state-machine
+  `last_membership` agree on the final membership log id. The removed follower
+  is not required to apply the final removal entry after OpenRaft has removed it
+  from the voter set.
 - Isolated the public OpenRaft smokes with distinct cluster names so the normal
   parallel `control_plane_raft` test group cannot share OpenRaft test identity
   while still exercising the real client-write and read-index paths.
