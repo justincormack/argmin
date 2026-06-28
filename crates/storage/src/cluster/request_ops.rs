@@ -3878,25 +3878,21 @@ impl super::StorageCluster {
         let claim_id = self.next_bucket_delete_finalize_claim_id()?;
         let owner_token = self.bucket_write_owner_token();
         let claimed_at = crate::clock::current_time_millis();
-        let claim = {
-            let bucket_node = self
-                .local_map
-                .metadata_pg_primary_node(self.operation_epoch(), PgId::new(bucket_pg_id))?;
-            bucket_node
-                .bucket_write_reservation_client()
-                .acquire_bucket_delete_finalize_claim(
-                    PgId::new(bucket_pg_id),
-                    bucket,
-                    bucket_incarnation_generation,
-                    &claim_id,
-                    &owner_token,
-                    self.operation_epoch(),
-                    claimed_at,
-                    claimed_at.checked_add(60_000),
-                    claimed_at,
-                )
-                .map_err(bucket_snapshot_error_to_bucket_write_drain_error)?
-        };
+        let bucket_write_reservation_client =
+            Arc::clone(bucket_store.bucket_write_reservation_client());
+        let claim = bucket_write_reservation_client
+            .acquire_bucket_delete_finalize_claim(
+                PgId::new(bucket_pg_id),
+                bucket,
+                bucket_incarnation_generation,
+                &claim_id,
+                &owner_token,
+                self.operation_epoch(),
+                claimed_at,
+                claimed_at.checked_add(60_000),
+                claimed_at,
+            )
+            .map_err(bucket_snapshot_error_to_bucket_write_drain_error)?;
         let Some(claim) = claim else {
             let _ = observability::event(
                 super::TRACE_TARGET,
@@ -3905,13 +3901,11 @@ impl super::StorageCluster {
             );
             return Ok(BucketDeleteFinalizeOutcome::Pending);
         };
+        crate::node::maybe_run_after_bucket_delete_finalize_claim_hook(bucket);
 
         let release_finalizer_claim = || -> Result<(), BucketWriteDrainError> {
-            let bucket_node = self
-                .local_map
-                .metadata_pg_primary_node(self.operation_epoch(), PgId::new(bucket_pg_id))?;
-            bucket_node
-                .bucket_write_reservation_client()
+            bucket_write_reservation_client
+                .as_ref()
                 .release_bucket_delete_finalize_claim(PgId::new(bucket_pg_id), &claim)
                 .map_err(bucket_snapshot_error_to_bucket_write_drain_error)?;
             Ok(())

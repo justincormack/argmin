@@ -6697,6 +6697,61 @@ fn bucket_delete_finalizer_expired_route_map_maps_to_operation_aborted() {
 }
 
 #[test]
+fn bucket_delete_finalizer_route_map_expiry_after_claim_releases_claim() {
+    let tmp = test_util::tempdir();
+    let bucket = "bucket-finalizer-mid-expired-route-map";
+    let storage_cluster = open_test_storage_cluster(tmp.path(), &[0]);
+    let coord = setup_same_process_coordinator_with_storage_cluster_without_background_sweepers(
+        Arc::clone(&storage_cluster),
+    );
+    coord
+        .create_bucket_for_owner("default-owner", bucket, false)
+        .unwrap();
+    delete_bucket_test(&coord, bucket).unwrap();
+
+    let bucket_name = trusted_bucket_name(bucket);
+    let valid_until = storage::clock::wall_time_millis().saturating_add(250);
+    let expiring_cluster =
+        same_store_cluster_with_route_map_validity(&storage_cluster, tmp.path(), Some(valid_until));
+    let expiring_coord =
+        setup_same_process_coordinator_with_storage_cluster_without_background_sweepers(
+            expiring_cluster,
+        );
+
+    let _storage_serial = STORAGE_TEST_HOOK_SERIAL
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap();
+    let _hook_guard = install_bucket_scoped_test_hooks(BucketScopedTestHooks {
+        target: Some(bucket_name.clone()),
+        after_bucket_delete_finalize_claim: Some(Arc::new(move || {
+            while storage::clock::wall_time_millis() <= valid_until {
+                thread::sleep(Duration::from_millis(5));
+            }
+        })),
+        ..BucketScopedTestHooks::default()
+    });
+
+    let err = expiring_coord
+        .read_runtime()
+        .try_finalize_bucket_delete_for(&bucket_name)
+        .unwrap_err();
+    assert!(
+        matches!(err, ServerError::OperationAborted),
+        "expected bucket delete finalizer mid-claim route-map expiry to map to OperationAborted, got {err:?}"
+    );
+    drop(_hook_guard);
+
+    assert_eq!(
+        storage_cluster
+            .try_finalize_bucket_delete(&bucket_name)
+            .unwrap(),
+        storage::BucketDeleteFinalizeOutcome::Finalized,
+        "mid-claim route-map expiry must release the finalizer claim for a fresh retry"
+    );
+}
+
+#[test]
 fn bucket_delete_finalizer_stale_metadata_route_maps_to_operation_aborted() {
     let tmp = test_util::tempdir();
     let storage_cluster = open_test_storage_cluster(tmp.path(), &[0]);

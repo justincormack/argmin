@@ -140,6 +140,7 @@ pub struct BucketScopedTestHooks {
     pub before_lifecycle_context_load: Option<Arc<dyn Fn() + Send + Sync>>,
     pub before_lifecycle_bucket_write_proof_acquire: Option<Arc<dyn Fn() + Send + Sync>>,
     pub after_begin_bucket_delete_drain: Option<Arc<dyn Fn() + Send + Sync>>,
+    pub after_bucket_delete_finalize_claim: Option<Arc<dyn Fn() + Send + Sync>>,
     pub after_bucket_delete_finalize: Option<Arc<dyn Fn() + Send + Sync>>,
     pub before_completed_multipart_prune:
         Option<Arc<dyn Fn() -> Result<(), ObjectPgActionError> + Send + Sync>>,
@@ -231,6 +232,14 @@ pub(crate) fn maybe_run_after_begin_bucket_delete_drain_hook(bucket: &BucketName
 
 #[cfg(not(any(test, feature = "test-hooks")))]
 pub(crate) fn maybe_run_after_begin_bucket_delete_drain_hook(_: &BucketName) {}
+
+#[cfg(any(test, feature = "test-hooks"))]
+pub(crate) fn maybe_run_after_bucket_delete_finalize_claim_hook(bucket: &BucketName) {
+    maybe_run_bucket_scoped_test_hook(bucket, |hooks| hooks.after_bucket_delete_finalize_claim)
+}
+
+#[cfg(not(any(test, feature = "test-hooks")))]
+pub(crate) fn maybe_run_after_bucket_delete_finalize_claim_hook(_: &BucketName) {}
 
 #[cfg(any(test, feature = "test-hooks"))]
 pub(crate) fn maybe_run_after_bucket_delete_finalize_hook(bucket: &BucketName) {

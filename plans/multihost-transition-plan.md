@@ -9031,6 +9031,11 @@ Status update:
   inactive routes, route-map expiry, metadata-command contention, and
   transfer-route inspection races visible in ordinary soak logs instead of
   requiring a second run with deep tracing.
+- Hardened bucket-delete finalizer claim cleanup across pinned route-map
+  expiry. The finalizer now releases a claim through the same
+  bucket-write-reservation client that acquired it, and the coordinator
+  regression covers expiry after claim acquisition returning
+  `OperationAborted` while leaving the claim releasable for a fresh retry.
 - Remaining close-out work is concentrated in deterministic interleaving tests,
   cleanup stress/diagnostics, and checking whether any foreground loops still
   need an earlier retry boundary before route-map validity expires.
