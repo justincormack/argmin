@@ -9250,6 +9250,11 @@ Phase 12.1 progress:
   enforces the inner `ControlPlaneLogId` sequence for normal/no-op entries, but
   the wrapper now also protects OpenRaft metadata-only entries and the
   `(term=0,index=0)` bootstrap bypass.
+- Added OpenRaft adapter overflow regressions. The state-machine wrapper now
+  has explicit coverage for refusing any entry after `u64::MAX` without moving
+  `last_applied`, and the in-memory log store has coverage for refusing an
+  append after a restored `u64::MAX` purged boundary without changing the log
+  watermark.
 - Added an OpenRaft-shaped runtime-map read-index helper on the state-machine
   wrapper. The wrapper now requires the proof input to exactly equal the full
   applied OpenRaft log id `(term,node,index)` before delegating to the

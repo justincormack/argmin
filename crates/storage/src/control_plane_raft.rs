@@ -1228,7 +1228,9 @@ mod tests {
     use openraft::type_config::TypeConfigExt;
     use openraft::{AnyError, Config, Membership, Raft, ReadPolicy};
 
-    use crate::control_plane::{NodeAvailabilityState, RuntimeMapFreshnessProof};
+    use crate::control_plane::{
+        ClusterControlSnapshot, NodeAvailabilityState, RuntimeMapFreshnessProof,
+    };
     use crate::types::PgId;
 
     #[derive(Debug, Clone, Copy, Default)]
@@ -1711,6 +1713,33 @@ mod tests {
         let err = state_machine.apply_entry(blank_entry(3, 1, 2)).unwrap_err();
         assert!(matches!(err, ControlPlaneError::CommandDecode { .. }));
         assert_eq!(state_machine.last_applied(), Some(raft_log_id(3, 2, 1)));
+    }
+
+    #[test]
+    fn control_plane_raft_state_machine_rejects_apply_after_max_index() {
+        let inner = ReplicatedControlPlaneStateMachine::new(
+            ClusterControlSnapshot::empty(),
+            Some(ControlPlaneLogId::new(1, u64::MAX).unwrap()),
+        );
+        let mut state_machine = ControlPlaneRaftStateMachine::new(
+            inner,
+            Some(raft_log_id(1, 7, u64::MAX)),
+            StoredMembership::default(),
+        )
+        .unwrap();
+
+        let err = state_machine
+            .apply_entry(blank_entry(1, 7, u64::MAX))
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            ControlPlaneError::ControlPlaneLogIndexOverflow { index: u64::MAX }
+        ));
+        assert_eq!(
+            state_machine.last_applied(),
+            Some(raft_log_id(1, 7, u64::MAX))
+        );
     }
 
     #[test]
@@ -2679,6 +2708,35 @@ mod tests {
                 entries.iter().map(|entry| entry.log_id).collect::<Vec<_>>(),
                 vec![raft_log_id(0, 1, 0)]
             );
+        });
+    }
+
+    #[test]
+    fn control_plane_raft_log_store_rejects_append_after_max_index() {
+        ControlPlaneRaftTypeConfig::run(async {
+            let artifact = ControlPlaneRaftLogStoreRestartArtifact {
+                last_purged_log_id: Some(raft_log_id(3, 1, u64::MAX)),
+                ..Default::default()
+            };
+            let mut store = ControlPlaneRaftLogStore::from_restart_artifact(artifact).unwrap();
+
+            let err = RaftLogStorage::append(
+                &mut store,
+                vec![blank_entry(3, 1, u64::MAX)],
+                IOFlushed::noop(),
+            )
+            .await
+            .unwrap_err();
+
+            assert!(err
+                .to_string()
+                .contains("cannot append after u64::MAX OpenRaft log index"));
+            let log_state = RaftLogStorage::get_log_state(&mut store).await.unwrap();
+            assert_eq!(
+                log_state.last_purged_log_id,
+                Some(raft_log_id(3, 1, u64::MAX))
+            );
+            assert_eq!(log_state.last_log_id, Some(raft_log_id(3, 1, u64::MAX)));
         });
     }
 
