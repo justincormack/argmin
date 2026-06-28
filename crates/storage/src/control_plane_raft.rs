@@ -1770,6 +1770,48 @@ mod tests {
             .expect("local single-node raft should have a committed leader vote");
     }
 
+    async fn initialized_two_node_authorities(
+        cluster_name: &'static str,
+        node1: ControlPlaneRaftNodeId,
+        node2: ControlPlaneRaftNodeId,
+    ) -> (ControlPlaneRaftAuthority, ControlPlaneRaftAuthority) {
+        let network = InMemoryRaftNetworkFactory::default();
+        let config = test_raft_config(cluster_name);
+        let raft1 = Raft::<ControlPlaneRaftTypeConfig, ControlPlaneRaftStateMachine>::new(
+            node1,
+            config.clone(),
+            network.clone(),
+            ControlPlaneRaftLogStore::empty(),
+            ControlPlaneRaftStateMachine::empty(),
+        )
+        .await
+        .unwrap();
+        let raft2 = Raft::<ControlPlaneRaftTypeConfig, ControlPlaneRaftStateMachine>::new(
+            node2,
+            config,
+            network.clone(),
+            ControlPlaneRaftLogStore::empty(),
+            ControlPlaneRaftStateMachine::empty(),
+        )
+        .await
+        .unwrap();
+        network.register(node1, raft1.clone());
+        network.register(node2, raft2.clone());
+        let authority1 = ControlPlaneRaftAuthority::new(raft1);
+        let authority2 = ControlPlaneRaftAuthority::new(raft2);
+
+        authority1
+            .initialize_membership(BTreeMap::from([
+                (node1, BasicNode::new(format!("node-{node1}"))),
+                (node2, BasicNode::new(format!("node-{node2}"))),
+            ]))
+            .await
+            .unwrap();
+        wait_for_local_leader(authority1.raft(), "two-node initialized leadership").await;
+
+        (authority1, authority2)
+    }
+
     fn raft_log_id(term: u64, node_id: u64, index: u64) -> LogIdOf<ControlPlaneRaftTypeConfig> {
         LogId::new(LeaderId { term, node_id }, index)
     }
@@ -3096,39 +3138,12 @@ mod tests {
     #[test]
     fn control_plane_openraft_two_node_client_write_replicates_to_follower() {
         ControlPlaneRaftTypeConfig::run(async {
-            let network = InMemoryRaftNetworkFactory::default();
-            let config = test_raft_config("control-plane-raft-two-node-replication-test");
-            let raft1 = Raft::<ControlPlaneRaftTypeConfig, ControlPlaneRaftStateMachine>::new(
+            let (authority1, authority2) = initialized_two_node_authorities(
+                "control-plane-raft-two-node-replication-test",
                 101,
-                config.clone(),
-                network.clone(),
-                ControlPlaneRaftLogStore::empty(),
-                ControlPlaneRaftStateMachine::empty(),
-            )
-            .await
-            .unwrap();
-            let raft2 = Raft::<ControlPlaneRaftTypeConfig, ControlPlaneRaftStateMachine>::new(
                 102,
-                config,
-                network.clone(),
-                ControlPlaneRaftLogStore::empty(),
-                ControlPlaneRaftStateMachine::empty(),
             )
-            .await
-            .unwrap();
-            network.register(101, raft1.clone());
-            network.register(102, raft2.clone());
-            let authority1 = ControlPlaneRaftAuthority::new(raft1);
-            let authority2 = ControlPlaneRaftAuthority::new(raft2);
-
-            authority1
-                .initialize_membership(BTreeMap::from([
-                    (101, BasicNode::new("node-101")),
-                    (102, BasicNode::new("node-102")),
-                ]))
-                .await
-                .unwrap();
-            wait_for_local_leader(authority1.raft(), "two-node initialized leadership").await;
+            .await;
 
             let write = authority1
                 .submit_control_plane_command(ControlPlaneCommand::BootstrapInitialClusterMap {
@@ -3172,6 +3187,76 @@ mod tests {
                 .unwrap();
             assert_eq!(follower_state.0, Some(write.log_id()));
             assert_eq!(follower_state.1, vec![NodeId::new(101), NodeId::new(102)]);
+
+            authority1.shutdown().await.unwrap();
+            authority2.shutdown().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn control_plane_openraft_two_node_read_index_runtime_map_uses_quorum_applied_tip() {
+        ControlPlaneRaftTypeConfig::run(async {
+            let (authority1, authority2) = initialized_two_node_authorities(
+                "control-plane-raft-two-node-read-index-runtime-map-test",
+                201,
+                202,
+            )
+            .await;
+
+            let write = authority1
+                .submit_control_plane_command(ControlPlaneCommand::BootstrapInitialClusterMap {
+                    nodes: vec![
+                        (NodeId::new(201), "node-201".to_string()),
+                        (NodeId::new(202), "node-202".to_string()),
+                    ],
+                    pg_ids: vec![PgId::new(0)],
+                })
+                .await
+                .unwrap();
+            assert!(matches!(
+                write.outcome(),
+                ControlPlaneRaftCommandOutcome::Applied(
+                    ControlPlaneCommandResponse::BootstrapInitialClusterMap
+                )
+            ));
+            authority2
+                .raft()
+                .wait(Some(Duration::from_secs(1)))
+                .applied_index_at_least(
+                    Some(write.log_id().index()),
+                    "two-node follower applied before read-index",
+                )
+                .await
+                .unwrap();
+
+            let runtime_map = authority1
+                .linearized_runtime_map_snapshot(55_000)
+                .await
+                .unwrap();
+            let applied_log_id = authority1
+                .status()
+                .await
+                .unwrap()
+                .applied()
+                .expect("read-index should have an applied tip");
+            assert!(applied_log_id.index() >= write.log_id().index());
+            let expected_read_index = control_plane_log_id_from_raft(applied_log_id)
+                .expect("read-index should be non-bootstrap");
+
+            assert_eq!(
+                runtime_map.freshness_proof().read_index(),
+                Some(expected_read_index)
+            );
+            assert_eq!(runtime_map.freshness_proof().issued_at_ms(), Some(55_000));
+            assert!(runtime_map.freshness_proof().is_serving_authority_read());
+            assert!(runtime_map
+                .nodes()
+                .iter()
+                .any(|node| node.node_id() == NodeId::new(201)));
+            assert!(runtime_map
+                .nodes()
+                .iter()
+                .any(|node| node.node_id() == NodeId::new(202)));
 
             authority1.shutdown().await.unwrap();
             authority2.shutdown().await.unwrap();

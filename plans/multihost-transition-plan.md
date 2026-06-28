@@ -9402,6 +9402,12 @@ Phase 12.1 progress:
   A two-node public smoke now initializes membership through node 101, waits for
   the initialized leader state, submits a control-plane command through the
   leader, and verifies the follower applies the same command state.
+- Added a two-node OpenRaft read-index runtime-map smoke over the same
+  in-memory network. After a replicated control-plane command reaches the
+  follower, the leader serves a linearized runtime map through
+  `ControlPlaneRaftAuthority::linearized_runtime_map_snapshot`, and the test
+  verifies the freshness proof is stamped with the leader state machine's
+  actual applied tip.
 - Isolated the public OpenRaft smokes with distinct cluster names so the normal
   parallel `control_plane_raft` test group cannot share OpenRaft test identity
   while still exercising the real client-write and read-index paths.
