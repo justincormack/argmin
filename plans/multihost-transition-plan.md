@@ -9142,6 +9142,16 @@ Phase 12.1 progress:
   points before the purged boundary. This is still not a production durable
   Raft-log format; it pins the restart invariants the durable implementation
   must preserve.
+- Tightened in-memory OpenRaft state-machine restart construction. The wrapper
+  constructor now rejects restart state where the dependency-free command state
+  and the full OpenRaft applied log id disagree on term/index, where the
+  OpenRaft wrapper claims a non-bootstrap log id but the command state has no
+  applied command, where the command state has an applied command but the
+  wrapper has no log id, or where stored membership metadata is invalid or not
+  included in the applied point. The command state intentionally does not store
+  OpenRaft's leader node id, so the full `(term,node,index)` identity remains
+  supplied and persisted by the OpenRaft metadata layer; the wrapper validates
+  the term/index portion it can prove from the inner state.
 - Tightened the in-memory OpenRaft state-machine wrapper's apply cursor. Before
   dispatching blank, membership, or normal entries, the wrapper now rejects
   first-entry gaps, duplicate/replayed bootstrap entries, lower-term next

@@ -551,15 +551,28 @@ pub struct ControlPlaneRaftStateMachine {
 impl ControlPlaneRaftStateMachine {
     #[must_use]
     pub fn empty() -> Self {
-        Self::new(
+        Self::from_parts_unchecked(
             ReplicatedControlPlaneStateMachine::empty(),
             None,
             StoredMembership::default(),
         )
     }
 
-    #[must_use]
     pub fn new(
+        inner: ReplicatedControlPlaneStateMachine,
+        last_applied: Option<LogIdOf<ControlPlaneRaftTypeConfig>>,
+        last_membership: StoredMembershipOf<ControlPlaneRaftTypeConfig>,
+    ) -> Result<Self, ControlPlaneError> {
+        Self::validate_restart_log_id_consistency(&inner, last_applied)?;
+        Self::validate_snapshot_membership_position(last_applied, &last_membership)?;
+        Ok(Self::from_parts_unchecked(
+            inner,
+            last_applied,
+            last_membership,
+        ))
+    }
+
+    fn from_parts_unchecked(
         inner: ReplicatedControlPlaneStateMachine,
         last_applied: Option<LogIdOf<ControlPlaneRaftTypeConfig>>,
         last_membership: StoredMembershipOf<ControlPlaneRaftTypeConfig>,
@@ -805,8 +818,38 @@ impl ControlPlaneRaftStateMachine {
             None => None,
         };
         self.validate_snapshot_install_position(meta.last_log_id)?;
-        self.validate_snapshot_membership_position(meta.last_log_id, &meta.last_membership)?;
+        Self::validate_snapshot_membership_position(meta.last_log_id, &meta.last_membership)?;
         Ok(snapshot_log_id)
+    }
+
+    fn validate_restart_log_id_consistency(
+        inner: &ReplicatedControlPlaneStateMachine,
+        last_applied: Option<LogIdOf<ControlPlaneRaftTypeConfig>>,
+    ) -> Result<(), ControlPlaneError> {
+        match (inner.last_applied(), last_applied) {
+            (None, None) => Ok(()),
+            (None, Some(log_id)) if is_openraft_bootstrap_log_id(log_id) => Ok(()),
+            (None, Some(log_id)) => Err(ControlPlaneError::SnapshotDecode {
+                message: format!(
+                    "OpenRaft state machine restart has log id {log_id} but no control-plane last-applied log id"
+                ),
+            }),
+            (Some(control_plane_log_id), Some(log_id))
+                if control_plane_log_id_from_raft(log_id) == Some(control_plane_log_id) =>
+            {
+                Ok(())
+            }
+            (Some(control_plane_log_id), Some(log_id)) => Err(ControlPlaneError::SnapshotDecode {
+                message: format!(
+                    "OpenRaft state machine restart log id {log_id} does not match control-plane last-applied {control_plane_log_id:?}"
+                ),
+            }),
+            (Some(control_plane_log_id), None) => Err(ControlPlaneError::SnapshotDecode {
+                message: format!(
+                    "OpenRaft state machine restart is missing log id for control-plane last-applied {control_plane_log_id:?}"
+                ),
+            }),
+        }
     }
 
     fn validate_snapshot_log_id_shape(
@@ -869,7 +912,6 @@ impl ControlPlaneRaftStateMachine {
     }
 
     fn validate_snapshot_membership_position(
-        &self,
         snapshot_last_log_id: Option<LogIdOf<ControlPlaneRaftTypeConfig>>,
         membership: &StoredMembershipOf<ControlPlaneRaftTypeConfig>,
     ) -> Result<(), ControlPlaneError> {
@@ -1133,6 +1175,19 @@ mod tests {
         Membership::new_with_defaults(vec![BTreeSet::from([1, 2])], [])
     }
 
+    fn replicated_state_machine_with_noops(
+        term: u64,
+        through_index: u64,
+    ) -> ReplicatedControlPlaneStateMachine {
+        let mut state_machine = ReplicatedControlPlaneStateMachine::empty();
+        for index in 1..=through_index {
+            state_machine
+                .apply_committed_noop(ControlPlaneLogId::new(term, index).unwrap())
+                .unwrap();
+        }
+        state_machine
+    }
+
     #[test]
     fn control_plane_raft_log_id_round_trips_term_and_index() {
         let control_plane_log_id = ControlPlaneLogId::new(7, 42).unwrap();
@@ -1244,6 +1299,76 @@ mod tests {
             target.last_membership().log_id(),
             &Some(raft_log_id(0, 7, 0))
         );
+    }
+
+    #[test]
+    fn control_plane_raft_state_machine_new_validates_restart_state() {
+        let empty = ControlPlaneRaftStateMachine::new(
+            ReplicatedControlPlaneStateMachine::empty(),
+            None,
+            StoredMembership::default(),
+        )
+        .unwrap();
+        assert_eq!(empty.last_applied(), None);
+
+        let bootstrap = ControlPlaneRaftStateMachine::new(
+            ReplicatedControlPlaneStateMachine::empty(),
+            Some(raft_log_id(0, 7, 0)),
+            StoredMembership::new(Some(raft_log_id(0, 7, 0)), test_membership()),
+        )
+        .unwrap();
+        assert_eq!(bootstrap.last_applied(), Some(raft_log_id(0, 7, 0)));
+        assert_eq!(bootstrap.inner().last_applied(), None);
+
+        let applied = ControlPlaneRaftStateMachine::new(
+            replicated_state_machine_with_noops(2, 3),
+            Some(raft_log_id(2, 7, 3)),
+            StoredMembership::new(Some(raft_log_id(2, 7, 2)), test_membership()),
+        )
+        .unwrap();
+        assert_eq!(applied.last_applied(), Some(raft_log_id(2, 7, 3)));
+        assert_eq!(
+            applied
+                .inner()
+                .last_applied()
+                .map(|log_id| (log_id.term(), log_id.index())),
+            Some((2, 3))
+        );
+    }
+
+    #[test]
+    fn control_plane_raft_state_machine_new_rejects_inconsistent_restart_state() {
+        let err = ControlPlaneRaftStateMachine::new(
+            replicated_state_machine_with_noops(2, 3),
+            None,
+            StoredMembership::default(),
+        )
+        .unwrap_err();
+        assert!(matches!(err, ControlPlaneError::SnapshotDecode { .. }));
+
+        let err = ControlPlaneRaftStateMachine::new(
+            ReplicatedControlPlaneStateMachine::empty(),
+            Some(raft_log_id(2, 7, 3)),
+            StoredMembership::default(),
+        )
+        .unwrap_err();
+        assert!(matches!(err, ControlPlaneError::SnapshotDecode { .. }));
+
+        let err = ControlPlaneRaftStateMachine::new(
+            replicated_state_machine_with_noops(2, 3),
+            Some(raft_log_id(3, 7, 3)),
+            StoredMembership::default(),
+        )
+        .unwrap_err();
+        assert!(matches!(err, ControlPlaneError::SnapshotDecode { .. }));
+
+        let err = ControlPlaneRaftStateMachine::new(
+            replicated_state_machine_with_noops(2, 3),
+            Some(raft_log_id(2, 7, 3)),
+            StoredMembership::new(Some(raft_log_id(2, 7, 4)), test_membership()),
+        )
+        .unwrap_err();
+        assert!(matches!(err, ControlPlaneError::SnapshotDecode { .. }));
     }
 
     #[test]
