@@ -680,6 +680,266 @@ impl ClusterControlSnapshot {
         Ok(())
     }
 
+    #[cfg(any(test, debug_assertions))]
+    fn validate_invariants(&self) -> Result<(), String> {
+        validate_required_cluster_map_history(
+            &self.history,
+            &self.pgs,
+            &self.nodes,
+            self.cluster_epoch,
+        )
+        .map_err(|error| error.to_string())?;
+
+        for pg in self.pgs.values() {
+            if pg.acting_set.is_empty() {
+                return Err(format!("PG {} has an empty acting set", pg.pg_id.get()));
+            }
+            let mut unique_nodes = BTreeSet::new();
+            for node_id in &pg.acting_set {
+                if !unique_nodes.insert(*node_id) {
+                    return Err(format!(
+                        "PG {} acting set repeats node {}",
+                        pg.pg_id.get(),
+                        node_id.as_u32()
+                    ));
+                }
+                if !self.nodes.contains_key(node_id) {
+                    return Err(format!(
+                        "PG {} acting set references unknown node {}",
+                        pg.pg_id.get(),
+                        node_id.as_u32()
+                    ));
+                }
+            }
+
+            match pg.state {
+                PgState::Active => {
+                    let Some(primary) = pg.active_primary else {
+                        return Err(format!("active PG {} has no primary", pg.pg_id.get()));
+                    };
+                    if !pg.acting_set.contains(&primary) {
+                        return Err(format!(
+                            "active PG {} primary {} is outside the acting set",
+                            pg.pg_id.get(),
+                            primary.as_u32()
+                        ));
+                    }
+                    if pg.active_metadata_proof.is_none() {
+                        return Err(format!(
+                            "active PG {} has no metadata proof",
+                            pg.pg_id.get()
+                        ));
+                    }
+                    if pg.active_metadata_proof_epoch.is_none() {
+                        return Err(format!(
+                            "active PG {} has no metadata proof epoch",
+                            pg.pg_id.get()
+                        ));
+                    }
+                    if pg.peering_metadata_proof_floor.is_some()
+                        || pg.peering_metadata_proof_floor_epoch.is_some()
+                        || pg.peering_metadata_proof_floor_imported
+                        || pg.peering_metadata_transfer.is_some()
+                        || pg.peering_metadata_transfer_source_route_epoch.is_some()
+                        || pg.peering_metadata_transfer_source_node_id.is_some()
+                        || pg.metadata_transfer_fenced
+                        || pg
+                            .metadata_transfer_fence_source_lease_deadline_ms
+                            .is_some()
+                        || pg.metadata_transfer_fence_source_imported
+                    {
+                        return Err(format!(
+                            "active PG {} carries peering metadata-transfer state",
+                            pg.pg_id.get()
+                        ));
+                    }
+                }
+                PgState::Peering => {
+                    if pg.active_primary.is_some()
+                        || pg.active_metadata_proof.is_some()
+                        || pg.active_metadata_proof_epoch.is_some()
+                        || pg.active_metadata_transfer_imported
+                    {
+                        return Err(format!(
+                            "peering PG {} carries active metadata state",
+                            pg.pg_id.get()
+                        ));
+                    }
+                    if pg.peering_metadata_proof_floor_epoch.is_some()
+                        && pg.peering_metadata_proof_floor.is_none()
+                    {
+                        return Err(format!(
+                            "peering PG {} has a floor epoch without a proof floor",
+                            pg.pg_id.get()
+                        ));
+                    }
+                    if pg.peering_metadata_proof_floor_imported
+                        && pg.peering_metadata_proof_floor_epoch.is_none()
+                    {
+                        return Err(format!(
+                            "peering PG {} has imported floor provenance without a floor epoch",
+                            pg.pg_id.get()
+                        ));
+                    }
+                    if pg.peering_metadata_transfer.is_some()
+                        && pg.peering_metadata_proof_floor.is_none()
+                    {
+                        return Err(format!(
+                            "peering PG {} has a transfer marker without a proof floor",
+                            pg.pg_id.get()
+                        ));
+                    }
+                    if pg.peering_metadata_transfer.is_some() && pg.metadata_transfer_fenced {
+                        return Err(format!(
+                            "peering PG {} has destination metadata transfer state and source transfer fence",
+                            pg.pg_id.get()
+                        ));
+                    }
+                    if pg.peering_metadata_transfer.is_some()
+                        && (pg.peering_metadata_transfer_source_route_epoch.is_none()
+                            || pg.peering_metadata_transfer_source_node_id.is_none())
+                    {
+                        return Err(format!(
+                            "peering PG {} has an incomplete transfer source route",
+                            pg.pg_id.get()
+                        ));
+                    }
+                    if pg.peering_metadata_transfer.is_none()
+                        && (pg.peering_metadata_transfer_source_route_epoch.is_some()
+                            || pg.peering_metadata_transfer_source_node_id.is_some())
+                    {
+                        return Err(format!(
+                            "peering PG {} has transfer source route fields without a transfer marker",
+                            pg.pg_id.get()
+                        ));
+                    }
+                    if pg.metadata_transfer_fence_source_imported && !pg.metadata_transfer_fenced {
+                        return Err(format!(
+                            "peering PG {} has imported fence provenance without a transfer fence",
+                            pg.pg_id.get()
+                        ));
+                    }
+                    if pg
+                        .metadata_transfer_fence_source_lease_deadline_ms
+                        .is_some()
+                        && !pg.metadata_transfer_fenced
+                    {
+                        return Err(format!(
+                            "peering PG {} has a fence source lease deadline without a transfer fence",
+                            pg.pg_id.get()
+                        ));
+                    }
+                }
+                PgState::Degraded | PgState::Backfilling | PgState::Inconsistent => {
+                    if pg.active_primary.is_some()
+                        || pg.active_metadata_proof.is_some()
+                        || pg.active_metadata_proof_epoch.is_some()
+                        || pg.active_metadata_transfer_imported
+                        || pg.peering_metadata_proof_floor.is_some()
+                        || pg.peering_metadata_proof_floor_epoch.is_some()
+                        || pg.peering_metadata_proof_floor_imported
+                        || pg.peering_metadata_transfer.is_some()
+                        || pg.peering_metadata_transfer_source_route_epoch.is_some()
+                        || pg.peering_metadata_transfer_source_node_id.is_some()
+                        || pg.metadata_transfer_fenced
+                        || pg
+                            .metadata_transfer_fence_source_lease_deadline_ms
+                            .is_some()
+                        || pg.metadata_transfer_fence_source_imported
+                    {
+                        return Err(format!(
+                            "non-active/non-peering PG {} carries active or peering metadata state",
+                            pg.pg_id.get()
+                        ));
+                    }
+                }
+            }
+        }
+
+        for node in self.nodes.values() {
+            if let Some(observed_epoch) = node.last_observed_epoch {
+                if observed_epoch > self.cluster_epoch {
+                    return Err(format!(
+                        "node {} observed future epoch {} above current {}",
+                        node.node_id.as_u32(),
+                        observed_epoch,
+                        self.cluster_epoch
+                    ));
+                }
+            }
+            if let Some(floor_epoch) = node.cluster_map_history_floor_epoch {
+                if floor_epoch > self.cluster_epoch {
+                    return Err(format!(
+                        "node {} has future cluster-map history floor {} above current {}",
+                        node.node_id.as_u32(),
+                        floor_epoch,
+                        self.cluster_epoch
+                    ));
+                }
+            }
+            for observation in node.pg_observations.values() {
+                if observation.observed_epoch != self.cluster_epoch {
+                    return Err(format!(
+                        "node {} observation for PG {} is from epoch {}, current is {}",
+                        node.node_id.as_u32(),
+                        observation.pg_id.get(),
+                        observation.observed_epoch,
+                        self.cluster_epoch
+                    ));
+                }
+                let Some(pg) = self.pgs.get(&observation.pg_id) else {
+                    return Err(format!(
+                        "node {} observation references unknown PG {}",
+                        node.node_id.as_u32(),
+                        observation.pg_id.get()
+                    ));
+                };
+                if !pg.acting_set.contains(&node.node_id) {
+                    return Err(format!(
+                        "node {} observation references PG {} outside the acting set",
+                        node.node_id.as_u32(),
+                        observation.pg_id.get()
+                    ));
+                }
+                if pg.state == PgState::Active
+                    && pg.active_primary == Some(node.node_id)
+                    && observation.state == PgState::Active
+                {
+                    if observation.has_pending_metadata_command {
+                        return Err(format!(
+                            "active primary node {} observation for PG {} has pending metadata command",
+                            node.node_id.as_u32(),
+                            observation.pg_id.get()
+                        ));
+                    }
+                    let Some(expected) = pg.active_metadata_proof else {
+                        return Err(format!(
+                            "active PG {} is missing metadata proof",
+                            pg.pg_id.get()
+                        ));
+                    };
+                    if !metadata_proof_satisfies_active_primary_observation_floor(
+                        expected,
+                        observation.metadata_proof,
+                        pg.active_metadata_transfer_imported,
+                        pg.active_metadata_proof_epoch,
+                        observation.observed_epoch,
+                    ) {
+                        return Err(format!(
+                            "active primary node {} observation for PG {} has proof {:?}, expected floor {:?}",
+                            node.node_id.as_u32(),
+                            observation.pg_id.get(),
+                            observation.metadata_proof,
+                            expected
+                        ));
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     fn record_history_from(&mut self, previous: &Self) {
         if previous.cluster_epoch == self.cluster_epoch {
             return;
@@ -1711,6 +1971,10 @@ fn applied_control_plane_command(
 ) -> AppliedControlPlaneCommand {
     if changed {
         next_snapshot.record_history_from(previous_snapshot);
+    }
+    #[cfg(any(test, debug_assertions))]
+    if let Err(error) = next_snapshot.validate_invariants() {
+        panic!("control-plane command produced invalid snapshot: {error}");
     }
     AppliedControlPlaneCommand::new(next_snapshot, response, changed)
 }
@@ -6864,7 +7128,7 @@ fn validate_authoritative_metadata_migration_source(
                 active_floor,
                 observation.metadata_proof,
                 record.active_metadata_transfer_imported,
-                Some(observation.observed_epoch),
+                record.active_metadata_proof_epoch,
                 observation.observed_epoch,
             )
         } else {
@@ -7721,6 +7985,11 @@ mod tests {
         now_ms: u64,
     ) -> Result<(), TestCaseError> {
         let snapshot = authority.snapshot();
+        if let Err(error) = snapshot.validate_invariants() {
+            return Err(TestCaseError::fail(format!(
+                "control-plane snapshot invariant failed: {error}"
+            )));
+        }
         let persisted = store
             .load()
             .expect("test control-plane store load")
@@ -8100,6 +8369,191 @@ mod tests {
             Some(ClusterEpoch::new(7).unwrap()),
             ClusterEpoch::new(7).unwrap(),
         ));
+    }
+
+    #[test]
+    fn authoritative_migration_source_does_not_invent_missing_active_proof_epoch() {
+        let tmp = test_util::tempdir();
+        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+        for node_id in [1, 2, 3] {
+            authority
+                .set_node_membership(NodeId::new(node_id), NodeMembershipState::Active)
+                .unwrap();
+            assert!(heartbeat_until_serving(&mut authority, node_id, 1_000).serving());
+        }
+        let pg_id = PgId::new(22);
+        let active_floor = PgMetadataProof {
+            applied_log_index: 42,
+            applied_log_hash: 0xabc,
+            state_digest: 0xdef,
+        };
+        authority
+            .set_pg_acting_set(pg_id, vec![NodeId::new(1), NodeId::new(2)])
+            .unwrap();
+        for node_id in [1, 2] {
+            heartbeat_with_pg_proof(
+                &mut authority,
+                node_id,
+                pg_id.get(),
+                PgState::Peering,
+                active_floor,
+                false,
+                2_000 + u64::from(node_id),
+            );
+        }
+        authority
+            .complete_pg_peering(
+                pg_id,
+                NodeId::new(1),
+                node_incarnation(&authority, 1),
+                2_010,
+            )
+            .unwrap();
+        heartbeat_with_pg_proof(
+            &mut authority,
+            1,
+            pg_id.get(),
+            PgState::Active,
+            active_floor,
+            false,
+            2_020,
+        );
+
+        let digest_only_progress = PgMetadataProof {
+            applied_log_index: active_floor.applied_log_index,
+            applied_log_hash: active_floor.applied_log_hash,
+            state_digest: active_floor.state_digest + 1,
+        };
+        let mut snapshot = authority.snapshot().clone();
+        snapshot
+            .pgs
+            .get_mut(&pg_id)
+            .unwrap()
+            .active_metadata_proof_epoch = None;
+        snapshot
+            .nodes
+            .get_mut(&NodeId::new(1))
+            .unwrap()
+            .pg_observations
+            .get_mut(&pg_id)
+            .unwrap()
+            .metadata_proof = digest_only_progress;
+        let record = snapshot.pg(pg_id).unwrap();
+
+        assert!(matches!(
+            validate_authoritative_metadata_migration_source(
+                &snapshot,
+                record,
+                &[NodeId::new(1), NodeId::new(3)],
+            ),
+            Err(ControlPlaneError::PgMetadataMigrationRequiresTransfer { pg_id: 22 })
+        ));
+    }
+
+    #[test]
+    fn control_snapshot_invariants_reject_active_pg_with_peering_transfer_state() {
+        let tmp = test_util::tempdir();
+        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+        authority
+            .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
+            .unwrap();
+        assert!(heartbeat_until_serving(&mut authority, 1, 1_000).serving());
+        let pg_id = PgId::new(23);
+        let proof = PgMetadataProof::new(7, 8, 9);
+        authority
+            .set_pg_acting_set(pg_id, vec![NodeId::new(1)])
+            .unwrap();
+        heartbeat_with_pg_proof(
+            &mut authority,
+            1,
+            pg_id.get(),
+            PgState::Peering,
+            proof,
+            false,
+            2_000,
+        );
+        authority
+            .complete_pg_peering(
+                pg_id,
+                NodeId::new(1),
+                node_incarnation(&authority, 1),
+                2_010,
+            )
+            .unwrap();
+
+        let mut snapshot = authority.snapshot().clone();
+        snapshot
+            .pgs
+            .get_mut(&pg_id)
+            .unwrap()
+            .peering_metadata_proof_floor = Some(proof);
+        let error = snapshot.validate_invariants().unwrap_err();
+        assert!(
+            error.contains("carries peering metadata-transfer state"),
+            "unexpected invariant error: {error}"
+        );
+    }
+
+    #[test]
+    fn control_snapshot_invariants_reject_transfer_destination_with_source_fence() {
+        let tmp = test_util::tempdir();
+        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+        for node_id in [1, 2] {
+            authority
+                .set_node_membership(NodeId::new(node_id), NodeMembershipState::Active)
+                .unwrap();
+            assert!(heartbeat_until_serving(&mut authority, node_id, 1_000).serving());
+        }
+        let pg_id = PgId::new(24);
+        let proof = PgMetadataProof::new(7, 8, 9);
+        authority
+            .set_pg_acting_set(pg_id, vec![NodeId::new(1)])
+            .unwrap();
+        heartbeat_with_pg_proof(
+            &mut authority,
+            1,
+            pg_id.get(),
+            PgState::Peering,
+            proof,
+            false,
+            2_000,
+        );
+        authority
+            .complete_pg_peering(
+                pg_id,
+                NodeId::new(1),
+                node_incarnation(&authority, 1),
+                2_010,
+            )
+            .unwrap();
+        heartbeat_with_pg_proof(
+            &mut authority,
+            1,
+            pg_id.get(),
+            PgState::Active,
+            proof,
+            false,
+            2_020,
+        );
+
+        let transfer = PgMetadataTransferProof::new(authority.snapshot().cluster_epoch(), proof);
+        authority
+            .set_pg_acting_set_with_metadata_transfer(pg_id, vec![NodeId::new(2)], transfer)
+            .unwrap();
+        let mut snapshot = authority.snapshot().clone();
+        snapshot
+            .pgs
+            .get_mut(&pg_id)
+            .unwrap()
+            .metadata_transfer_fenced = true;
+        let error = snapshot.validate_invariants().unwrap_err();
+        assert!(
+            error.contains("destination metadata transfer state and source transfer fence"),
+            "unexpected invariant error: {error}"
+        );
     }
 
     #[test]
@@ -11145,6 +11599,7 @@ mod tests {
             pg.state = PgState::Active;
             pg.active_primary = Some(NodeId::new(2));
             pg.active_metadata_proof = Some(PgMetadataProof::empty());
+            pg.active_metadata_proof_epoch = Some(authority.snapshot().cluster_epoch());
         }
         next_snapshot.bump_epoch().unwrap();
         authority.commit_snapshot(next_snapshot).unwrap();
