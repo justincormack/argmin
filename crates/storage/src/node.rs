@@ -1169,11 +1169,18 @@ impl SharedStorageNode {
     ) -> Result<NodePgHeartbeatObservation, StoreError> {
         let pg = self.get_pg(pg_id.get())?;
         let metadata_epoch = pg.metadata_command_replica_state()?.cluster_epoch;
-        let metadata_state =
+        let mut metadata_state =
             pg.metadata_command_replica_state_for_heartbeat(node_id.as_u32(), metadata_epoch)?;
-        let has_pending_metadata_command = pg
+        let mut has_pending_metadata_command = pg
             .pending_metadata_command_slot(node_id.as_u32(), metadata_epoch)?
             .is_some();
+        if has_pending_metadata_command {
+            metadata_state =
+                pg.validate_metadata_command_replay_state(node_id.as_u32(), metadata_epoch)?;
+            has_pending_metadata_command = pg
+                .pending_metadata_command_slot(node_id.as_u32(), metadata_epoch)?
+                .is_some();
+        }
         Ok(NodePgHeartbeatObservation {
             pg_id,
             state,
@@ -1900,6 +1907,59 @@ mod tests {
             .unwrap();
 
         assert!(observation.has_pending_metadata_command);
+    }
+
+    #[test]
+    fn shared_node_pg_heartbeat_observation_cleans_terminal_pending_command() {
+        let tmp = test_util::tempdir();
+        let node = SharedStorageNode::open(tmp.path(), &[0]).unwrap();
+        let bucket = bucket_name("terminal-pending-heartbeat");
+        let owner = crate::OwnerIdentity::from_principal("owner");
+        let config = CreateBucketConfig {
+            name: bucket.as_str(),
+            owner_principal: &owner.principal,
+            owner_canonical_id: &owner.canonical_id,
+            acl_grants: &AclGrants::default(),
+            public_read: false,
+            public_write: false,
+            versioning: BucketVersioningState::Disabled,
+            object_lock: BucketObjectLockConfig::default(),
+            ownership_controls: crate::BucketOwnershipControls {
+                object_ownership: crate::BucketObjectOwnership::ObjectWriter,
+            },
+        };
+        let command = MetadataCommandEnvelope::new(
+            MetadataCommandId::new(
+                ClusterEpoch::INITIAL,
+                PgId::new(0),
+                MetadataCommandLogIndex::new(1).unwrap(),
+            ),
+            MetadataCommandPayload::CreateBucket(
+                CreateBucketCommand::from_config(&config, 123, 1).unwrap(),
+            ),
+        );
+        {
+            let pg = node.get_pg(0).unwrap();
+            pg.try_insert_pending_metadata_command_slot(7, &command, Some(&bucket))
+                .unwrap();
+            pg.record_metadata_command_applied(7, &command).unwrap();
+            assert!(pg
+                .pending_metadata_command_slot(7, ClusterEpoch::INITIAL)
+                .unwrap()
+                .is_some());
+        }
+
+        let observation = node
+            .pg_heartbeat_observation(NodeId::new(7), PgId::new(0), PgState::Active)
+            .unwrap();
+
+        assert_eq!(observation.metadata_proof.applied_log_index, 1);
+        assert!(!observation.has_pending_metadata_command);
+        let pg = node.get_pg(0).unwrap();
+        assert!(pg
+            .pending_metadata_command_slot(7, ClusterEpoch::INITIAL)
+            .unwrap()
+            .is_none());
     }
 
     #[test]
