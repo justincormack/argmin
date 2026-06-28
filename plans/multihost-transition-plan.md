@@ -9207,6 +9207,11 @@ Phase 12.1 progress:
   applied log id and the dependency-free control-plane `last_applied` advance
   through the rejected entry. This pins the no-stall contract on the recovery
   path, not only on direct state-machine apply.
+- Added a public OpenRaft startup smoke for current-snapshot recovery. The test
+  starts `Raft::new` with an empty transient state machine that exposes a
+  cached current snapshot, then verifies OpenRaft installs that snapshot before
+  serving state-machine reads and reflects the committed watermark and
+  bootstrap membership without replaying the retained prefix.
 - Added a public OpenRaft read-index smoke for the non-leader path. With
   elections disabled and no learned leader, an initialized two-node membership rejects
   `ensure_linearizable(ReadPolicy::ReadIndex)` with `ForwardToLeader` instead

@@ -2494,6 +2494,98 @@ mod tests {
     }
 
     #[test]
+    fn control_plane_openraft_restart_restores_current_snapshot() {
+        ControlPlaneRaftTypeConfig::run(async {
+            let mut log_store = ControlPlaneRaftLogStore::empty();
+            RaftLogStorage::append(
+                &mut log_store,
+                vec![
+                    bootstrap_membership_entry(1),
+                    normal_entry(
+                        3,
+                        1,
+                        1,
+                        ControlPlaneCommand::BootstrapInitialClusterMap {
+                            nodes: vec![(NodeId::new(1), "node-1".to_string())],
+                            pg_ids: vec![PgId::new(0)],
+                        },
+                    ),
+                    blank_entry(3, 1, 2),
+                ],
+                IOFlushed::noop(),
+            )
+            .await
+            .unwrap();
+            RaftLogStorage::save_committed(&mut log_store, Some(raft_log_id(3, 1, 2)))
+                .await
+                .unwrap();
+            RaftLogStorage::purge(&mut log_store, raft_log_id(3, 1, 2))
+                .await
+                .unwrap();
+
+            let mut snapshot_source = ControlPlaneRaftStateMachine::empty();
+            snapshot_source
+                .apply_entry(bootstrap_membership_entry(1))
+                .unwrap();
+            snapshot_source
+                .apply_entry(normal_entry(
+                    3,
+                    1,
+                    1,
+                    ControlPlaneCommand::BootstrapInitialClusterMap {
+                        nodes: vec![(NodeId::new(1), "node-1".to_string())],
+                        pg_ids: vec![PgId::new(0)],
+                    },
+                ))
+                .unwrap();
+            snapshot_source.apply_entry(blank_entry(3, 1, 2)).unwrap();
+            let snapshot = snapshot_source.build_snapshot().unwrap();
+
+            let mut state_machine = ControlPlaneRaftStateMachine::empty();
+            state_machine.current_snapshot = Some(snapshot);
+
+            let raft = Raft::<ControlPlaneRaftTypeConfig, ControlPlaneRaftStateMachine>::new(
+                1,
+                test_raft_config(),
+                UnreachableRaftNetworkFactory,
+                log_store,
+                state_machine,
+            )
+            .await
+            .unwrap();
+
+            let raft_state = raft
+                .with_raft_state(|state| {
+                    (
+                        state.local_committed().cloned(),
+                        *state.membership_state.effective().log_id(),
+                    )
+                })
+                .await
+                .unwrap();
+            assert_eq!(raft_state.0, Some(raft_log_id(3, 1, 2)));
+            assert_eq!(raft_state.1, Some(raft_log_id(0, 1, 0)));
+            let applied_state = raft
+                .with_state_machine(|state_machine| {
+                    let last_applied = state_machine.last_applied();
+                    let node_ids = state_machine
+                        .inner()
+                        .snapshot()
+                        .nodes()
+                        .map(|node| node.node_id())
+                        .collect::<Vec<_>>();
+                    Box::pin(async move { (last_applied, node_ids) })
+                })
+                .await
+                .unwrap();
+            assert_eq!(applied_state.0, Some(raft_log_id(3, 1, 2)));
+            assert_eq!(applied_state.1, vec![NodeId::new(1)]);
+
+            raft.shutdown().await.unwrap();
+        });
+    }
+
+    #[test]
     fn control_plane_raft_log_store_rejects_append_holes() {
         ControlPlaneRaftTypeConfig::run(async {
             let mut store = ControlPlaneRaftLogStore::empty();
