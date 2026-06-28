@@ -8905,6 +8905,77 @@ Metadata PG migration and backfill design notes:
   there would mostly validate the harness rather than a production persisted
   refresh path. No further Phase 11 property-test gaps are currently tracked.
 
+DeleteBucket soak-stabilization follow-up:
+
+Recent Phase 11 soak runs have repeatedly found failures around `DeleteBucket`
+cleanup rather than ordinary route-change read/write correctness. At least
+three recent failures were in or adjacent to bucket teardown:
+
+- route-map lease expiry during long `DeleteBucket` begin work surfaced as
+  `InternalError` instead of a retryable `OperationAborted`. The immediate fix
+  maps `RouteMapExpired` to retryable contention at the server-core error
+  boundary, but the broader invariant is that foreground teardown work must
+  either finish within its route-map validity window or return a typed retryable
+  response.
+- previous soak failures exercised `DeleteBucket` drain/finalizer/retry paths
+  more than the steady-state object path. This is partly because the correctness
+  and UAT harnesses create many short-lived buckets, but it also means
+  `DeleteBucket` is now the main residual stress point for Phase 11.
+- failures during test cleanup are still correctness-relevant: cleanup uses the
+  same public S3 `DeleteBucket` path, so a 500 there indicates a real retry/error
+  semantics bug even if user data operations already passed.
+
+Keep a small explicit DeleteBucket close-out before treating Phase 11 as
+soak-clean:
+
+1. audit all `DeleteBucket`-begin and finalizer error mappings so stale routes,
+   stale metadata primaries, pending-command displacement, route-map expiry, and
+   storage-node overload consistently become `OperationAborted` or `SlowDown`,
+   not `InternalError`;
+2. audit foreground work budgets against route-map validity deadlines. Any
+   synchronous `DeleteBucket` loop that can run close to the validity window
+   must either refresh/retry the whole operation from a fresh storage-cluster
+   snapshot or return a typed retryable response before the map expires;
+3. prefer whole-operation retry boundaries over mid-operation route-map swaps:
+   when authorization and begin-delete are tied to a pinned storage snapshot,
+   retry by re-running authorization plus begin-delete with a fresh snapshot and
+   bucket identity check, rather than continuing a partially completed decision
+   on a different route map;
+4. add a focused regression for `DeleteBucket` begin crossing route-map expiry
+   or using an already-expired route map, ideally through the coordinator/S3
+   boundary rather than only the low-level mapper;
+5. add deterministic failpoint tests for the precise cleanup interleavings soak
+   has been sampling: route-map refresh during begin-delete, storage-node
+   restart between drain acquisition and mark-deleting apply, finalizer restart
+   with an already-deleting bucket, and stale frontend retry after the bucket was
+   recreated;
+6. add finalizer-side regression coverage for stale route-map and stale
+   metadata-route outcomes. DeleteBucket begin and asynchronous finalization have
+   different correctness boundaries, so both need explicit retry/error
+   semantics coverage;
+7. add or extend a bounded UAT cleanup stress profile that creates versioned
+   buckets across many metadata/data PGs, deletes all object versions, and then
+   repeatedly calls `DeleteBucket` while route maps refresh and storage nodes
+   restart;
+8. add metrics/assertions to distinguish expected retryable cleanup pressure
+   from real bugs: count `OperationAborted`/`SlowDown` cleanup retries, route-map
+   expiry retries, finalizer queue depth, and any `InternalError` during
+   cleanup;
+9. make the soak harness preserve enough DeleteBucket context on failure:
+   failing bucket name, bucket metadata PG, current route-map epoch/valid-until,
+   finalizer queue depth, pending bucket command, durable delete drain row, and
+   a short recent flight-event slice for the same request id;
+10. check the public cleanup helpers used by `s3-tests` and UAT. They should
+    retry AWS-compatible retryable responses, but they must not hide server
+    `InternalError`; local 500s during cleanup are bugs and should continue to
+    fail the run with enough diagnostics;
+11. update [`delete-bucket-reservation-classification-plan.md`](delete-bucket-reservation-classification-plan.md)
+    if the audit shows synchronous begin work is still too conservative. The
+    optimization should remain secondary to correctness: `DeleteBucket` must not
+    return success while visible object/MPU state can still appear, but it should
+    avoid long foreground waits when a safe `BucketNotEmpty` or retryable
+    response is already knowable.
+
 Exit criteria:
 
 1. stale primaries cannot accept writes after an epoch change

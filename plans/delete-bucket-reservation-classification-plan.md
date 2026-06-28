@@ -166,3 +166,15 @@ Do not tune bucket-delete finalizer scan/dequeue/deduplication policy solely fro
 that workload. Revisit per-PG finalizer limits, cooldowns, or scan pacing after
 we have a more realistic workload benchmark that includes longer-lived buckets
 and normal object access patterns.
+
+## Phase 11 Soak Follow-up
+
+Although the short-lived-bucket soak is not a production workload model, repeated
+Phase 11 soak failures have clustered around `DeleteBucket`. Treat that as a
+correctness and retry-semantics signal, not just benchmark noise.
+
+The concrete Phase 11 close-out checklist now lives in
+[`multihost-transition-plan.md`](multihost-transition-plan.md) under
+"DeleteBucket soak-stabilization follow-up". Revisit this reservation
+classification optimization only after those correctness, retry-semantics, and
+cleanup-stress items are stable.
