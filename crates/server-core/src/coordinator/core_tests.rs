@@ -13,7 +13,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use storage::storage_node_server::{
     StorageNodePgRoute, StorageNodeProcessConfig, StorageNodeServer,
 };
@@ -85,6 +85,29 @@ fn setup_coordinator_with_only_shard_backfill_worker(
             |_| Ok(ShardScavengerSweeper::disabled()),
             |storage_cluster| Ok(ShardRepairSweeper::disabled(Arc::clone(storage_cluster))),
             ShardBackfillSweeper::acquire_shared,
+            |_| Ok(StreamSessionSweeper::disabled()),
+        ),
+    )
+    .unwrap()
+}
+
+fn setup_coordinator_with_only_reclaim_worker(
+    storage_handle: StorageClusterRuntimeMapHandle,
+    storage_cluster: Arc<StorageCluster>,
+) -> Coordinator {
+    Coordinator::new_with_shared_caches_and_background_sweeper_factories(
+        storage_handle,
+        Arc::clone(&storage_cluster),
+        shared_caches_for_storage_cluster(&storage_cluster),
+        "us-east-1".to_string(),
+        None,
+        Some(test_sse_s3_provider()),
+        (
+            true,
+            |_, _| Ok(LifecycleSweeper::disabled()),
+            |_| Ok(ShardScavengerSweeper::disabled()),
+            |storage_cluster| Ok(ShardRepairSweeper::disabled(Arc::clone(storage_cluster))),
+            |_| Ok(ShardBackfillSweeper::disabled()),
             |_| Ok(StreamSessionSweeper::disabled()),
         ),
     )
@@ -853,6 +876,44 @@ fn delete_bucket_pins_runtime_map_after_authorization() {
         ))
         .unwrap_err();
     assert!(matches!(err, ServerError::BucketNotFound { .. }));
+}
+
+#[test]
+fn reclaim_worker_follows_runtime_map_refresh_for_bucket_finalize() {
+    let tmp = test_util::tempdir();
+    let initial = open_test_storage_cluster(tmp.path(), &[0, 1]);
+    let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&initial));
+    let coord = setup_coordinator_with_only_reclaim_worker(handle.clone(), Arc::clone(&initial));
+    coord
+        .create_bucket_for_owner("default-owner", "bucket", false)
+        .unwrap();
+
+    install_same_store_next_epoch_runtime_map(&handle, &initial, tmp.path());
+    thread::sleep(Duration::from_millis(250));
+
+    delete_bucket_test(&coord, "bucket").unwrap();
+
+    let bucket = trusted_bucket_name("bucket");
+    let deadline = Instant::now() + TEST_EVENT_TIMEOUT;
+    loop {
+        match coord.storage_node().test_head_bucket_raw(&bucket) {
+            Err(storage::BucketSnapshotLoadError::Metadata(
+                storage::MetadataError::BucketNotFound { .. },
+            )) => break,
+            Ok(info) if Instant::now() < deadline => {
+                assert_eq!(info.state, storage::BucketState::Deleting);
+                thread::sleep(Duration::from_millis(10));
+            }
+            Ok(info) => {
+                panic!(
+                    "reclaim worker did not finalize deleting bucket after runtime-map refresh: {info:?}"
+                );
+            }
+            Err(err) => {
+                panic!("unexpected bucket metadata error while waiting for finalize: {err:?}")
+            }
+        }
+    }
 }
 
 #[test]

@@ -5,6 +5,8 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use s3_types::BucketLifecycleConfiguration;
+#[cfg(test)]
+use storage::PgTopology;
 use storage::{
     AuthorizedMultipartUploadRecord, BucketInfo, BucketName, EcShape, GenerationId,
     ObjectEncryption, ObjectKey, ReclaimWorkItem, SegmentStoredBytesRequest, StorageCluster,
@@ -453,7 +455,7 @@ fn enqueue_durable_reclaim_work_if_due(
 
 /// The coordinator ties together EC, storage, and metadata.
 pub(super) struct ReclaimSweeper {
-    pub(super) storage_node: Arc<StorageCluster>,
+    pub(super) storage_handle: StorageClusterRuntimeMapHandle,
     pub(super) stop: Arc<AtomicBool>,
     pub(super) handle: Option<JoinHandle<()>>,
 }
@@ -507,7 +509,7 @@ pub(super) struct LifecycleSweepStats {
 impl Drop for ReclaimSweeper {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
-        self.storage_node.wake_reclaim_workers();
+        self.storage_handle.current().wake_reclaim_workers();
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
         }
@@ -516,13 +518,12 @@ impl Drop for ReclaimSweeper {
 
 impl ReclaimSweeper {
     pub(super) fn spawn(
-        storage_cluster: Arc<StorageCluster>,
+        storage_handle: StorageClusterRuntimeMapHandle,
         runtime: ReadRuntime,
     ) -> Result<Self, ServerError> {
         let stop = Arc::new(AtomicBool::new(false));
         let worker_stop = Arc::clone(&stop);
-        let worker_node = Arc::clone(&storage_cluster);
-        let admission = background_work_admission_for(&storage_cluster);
+        let storage_handle_for_drop = storage_handle.clone();
         let handle = std::thread::Builder::new()
             .name("argmin-reclaim".to_string())
             .spawn(move || {
@@ -533,6 +534,9 @@ impl ReclaimSweeper {
                 let mut next_durable_scan_at = Instant::now();
                 let mut pending_work = None;
                 while !worker_stop.load(Ordering::SeqCst) {
+                    let worker_node = storage_handle.current();
+                    let current_runtime = runtime.with_storage_node(Arc::clone(&worker_node));
+                    let admission = background_work_admission_for(&worker_node);
                     enqueue_durable_reclaim_work_if_due(
                         &worker_node,
                         &deferred_object_payload_reclaim_roots,
@@ -559,7 +563,10 @@ impl ReclaimSweeper {
                         })
                         .or_else(|| worker_node.wait_for_reclaim_work(&worker_stop))
                     else {
-                        break;
+                        if worker_stop.load(Ordering::SeqCst) {
+                            break;
+                        }
+                        continue;
                     };
                     let Some(_cleanup_permit) =
                         admission.try_acquire(BackgroundWorkClass::ReclaimCleanup)
@@ -591,11 +598,12 @@ impl ReclaimSweeper {
                                     (bucket, key, generation_id),
                                 );
                             } else {
-                                let result = runtime.try_reclaim_object_payload_for_with_outcome(
-                                    &bucket,
-                                    &key,
-                                    generation_id,
-                                );
+                                let result = current_runtime
+                                    .try_reclaim_object_payload_for_with_outcome(
+                                        &bucket,
+                                        &key,
+                                        generation_id,
+                                    );
                                 if matches!(
                                     result,
                                     Ok(storage::cluster::ObjectPayloadReclaimAttempt::Deferred)
@@ -621,7 +629,9 @@ impl ReclaimSweeper {
                             }
                         }
                         ReclaimWorkItem::BucketDelete(bucket) => {
-                            match runtime.try_finalize_bucket_delete_for_with_outcome(&bucket) {
+                            match current_runtime
+                                .try_finalize_bucket_delete_for_with_outcome(&bucket)
+                            {
                                 Ok(outcome) if outcome.is_terminal() => {
                                     worker_node.finish_bucket_delete_finalize_work(&bucket);
                                 }
@@ -651,7 +661,7 @@ impl ReclaimSweeper {
                 reason: format!("failed to start reclaim worker: {e}"),
             })?;
         Ok(Self {
-            storage_node: storage_cluster,
+            storage_handle: storage_handle_for_drop,
             stop,
             handle: Some(handle),
         })
@@ -659,7 +669,7 @@ impl ReclaimSweeper {
 
     pub(super) fn disabled(storage_cluster: Arc<StorageCluster>) -> Self {
         Self {
-            storage_node: storage_cluster,
+            storage_handle: StorageClusterRuntimeMapHandle::new(storage_cluster),
             stop: Arc::new(AtomicBool::new(true)),
             handle: None,
         }
@@ -1697,6 +1707,18 @@ impl StreamSessionSweeper {
 }
 
 impl ReadRuntime {
+    fn with_storage_node(&self, storage_node: Arc<StorageCluster>) -> Self {
+        Self {
+            storage_node: Arc::clone(&storage_node),
+            #[cfg(test)]
+            pg_topology: PgTopology::new(storage_node.test_pg_ids())
+                .expect("coordinator storage node should expose a valid PG topology"),
+            payload_buffer_pool: Arc::clone(&self.payload_buffer_pool),
+            sse_c_validator: self.sse_c_validator.clone(),
+            managed_key_provider: self.managed_key_provider.clone(),
+        }
+    }
+
     fn map_bucket_snapshot_error(error: storage::BucketSnapshotLoadError) -> ServerError {
         match error {
             storage::BucketSnapshotLoadError::Store(
