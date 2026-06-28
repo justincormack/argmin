@@ -9201,8 +9201,14 @@ Phase 12.1 progress:
   replays the retained committed entries during startup, and checks that the
   effective membership and local committed id advance to the committed
   watermark without relying on election or client-write timing.
+- Added a companion restart replay smoke for deterministic command rejection.
+  OpenRaft startup now replays a committed semantic rejection through the
+  in-memory state-machine wrapper and verifies that both the full OpenRaft
+  applied log id and the dependency-free control-plane `last_applied` advance
+  through the rejected entry. This pins the no-stall contract on the recovery
+  path, not only on direct state-machine apply.
 - Added a public OpenRaft read-index smoke for the non-leader path. With
-  elections disabled and no learned leader, an initialized node rejects
+  elections disabled and no learned leader, an initialized two-node membership rejects
   `ensure_linearizable(ReadPolicy::ReadIndex)` with `ForwardToLeader` instead
   of permitting a local runtime-map read. This pins the fail-closed read
   boundary until the production adapter wires leader-side read-index serving.

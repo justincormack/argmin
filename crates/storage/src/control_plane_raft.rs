@@ -2321,9 +2321,12 @@ mod tests {
             .await
             .unwrap();
 
-            raft.initialize(BTreeMap::from([(1, BasicNode::new("node-1"))]))
-                .await
-                .unwrap();
+            raft.initialize(BTreeMap::from([
+                (1, BasicNode::new("node-1")),
+                (2, BasicNode::new("node-2")),
+            ]))
+            .await
+            .unwrap();
 
             let err = raft
                 .ensure_linearizable(ReadPolicy::ReadIndex)
@@ -2410,6 +2413,81 @@ mod tests {
                     .unwrap(),
                 Some(raft_log_id(3, 1, 3))
             );
+
+            raft.shutdown().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn control_plane_openraft_restart_replays_rejected_committed_entry() {
+        ControlPlaneRaftTypeConfig::run(async {
+            let mut log_store = ControlPlaneRaftLogStore::empty();
+            RaftLogStorage::append(
+                &mut log_store,
+                vec![
+                    bootstrap_membership_entry(1),
+                    normal_entry(
+                        3,
+                        1,
+                        1,
+                        ControlPlaneCommand::BootstrapInitialClusterMap {
+                            nodes: vec![(NodeId::new(1), "node-1".to_string())],
+                            pg_ids: vec![PgId::new(0)],
+                        },
+                    ),
+                    normal_entry(
+                        3,
+                        1,
+                        2,
+                        ControlPlaneCommand::MarkNodeAvailability {
+                            node_id: NodeId::new(99),
+                            availability: NodeAvailabilityState::Healthy,
+                        },
+                    ),
+                ],
+                IOFlushed::noop(),
+            )
+            .await
+            .unwrap();
+            RaftLogStorage::save_committed(&mut log_store, Some(raft_log_id(3, 1, 2)))
+                .await
+                .unwrap();
+
+            let mut state_machine = ControlPlaneRaftStateMachine::empty();
+            state_machine
+                .apply_entry(bootstrap_membership_entry(1))
+                .unwrap();
+
+            let artifact =
+                ControlPlaneRaftRestartArtifact::capture(&log_store, &state_machine).unwrap();
+            let (_, restored_state_machine) = artifact.restore().unwrap();
+            let raft = Raft::<ControlPlaneRaftTypeConfig, ControlPlaneRaftStateMachine>::new(
+                1,
+                test_raft_config(),
+                UnreachableRaftNetworkFactory,
+                log_store,
+                restored_state_machine,
+            )
+            .await
+            .unwrap();
+
+            let applied_state = raft
+                .with_state_machine(|state_machine| {
+                    let last_applied = state_machine.last_applied();
+                    let inner_last_applied = state_machine.inner().last_applied();
+                    let node_ids = state_machine
+                        .inner()
+                        .snapshot()
+                        .nodes()
+                        .map(|node| node.node_id())
+                        .collect::<Vec<_>>();
+                    Box::pin(async move { (last_applied, inner_last_applied, node_ids) })
+                })
+                .await
+                .unwrap();
+            assert_eq!(applied_state.0, Some(raft_log_id(3, 1, 2)));
+            assert_eq!(applied_state.1, Some(ControlPlaneLogId::new(3, 2).unwrap()));
+            assert_eq!(applied_state.2, vec![NodeId::new(1)]);
 
             raft.shutdown().await.unwrap();
         });
