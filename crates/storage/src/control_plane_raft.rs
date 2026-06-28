@@ -1213,7 +1213,7 @@ mod tests {
         AppendEntriesRequest, AppendEntriesResponse, SnapshotResponse, VoteRequest, VoteResponse,
     };
     use openraft::type_config::TypeConfigExt;
-    use openraft::{AnyError, Config, Membership, Raft};
+    use openraft::{AnyError, Config, Membership, Raft, ReadPolicy};
 
     use crate::control_plane::{NodeAvailabilityState, RuntimeMapFreshnessProof};
     use crate::types::PgId;
@@ -2301,6 +2301,37 @@ mod tests {
             assert_eq!(entries.len(), 1);
             assert_eq!(entries[0].log_id, bootstrap_log_id);
             assert!(matches!(entries[0].payload, EntryPayload::Membership(_)));
+
+            raft.shutdown().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn control_plane_openraft_read_index_requires_leader() {
+        ControlPlaneRaftTypeConfig::run(async {
+            let log_store = ControlPlaneRaftLogStore::empty();
+            let state_machine = ControlPlaneRaftStateMachine::empty();
+            let raft = Raft::<ControlPlaneRaftTypeConfig, ControlPlaneRaftStateMachine>::new(
+                1,
+                test_raft_config(),
+                UnreachableRaftNetworkFactory,
+                log_store.clone(),
+                state_machine,
+            )
+            .await
+            .unwrap();
+
+            raft.initialize(BTreeMap::from([(1, BasicNode::new("node-1"))]))
+                .await
+                .unwrap();
+
+            let err = raft
+                .ensure_linearizable(ReadPolicy::ReadIndex)
+                .await
+                .unwrap_err();
+            let forward_to_leader = err.forward_to_leader().expect("read should need leader");
+            assert_eq!(forward_to_leader.leader_id, None);
+            assert_eq!(forward_to_leader.leader_node, None);
 
             raft.shutdown().await.unwrap();
         });

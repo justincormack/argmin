@@ -9201,6 +9201,11 @@ Phase 12.1 progress:
   replays the retained committed entries during startup, and checks that the
   effective membership and local committed id advance to the committed
   watermark without relying on election or client-write timing.
+- Added a public OpenRaft read-index smoke for the non-leader path. With
+  elections disabled and no learned leader, an initialized node rejects
+  `ensure_linearizable(ReadPolicy::ReadIndex)` with `ForwardToLeader` instead
+  of permitting a local runtime-map read. This pins the fail-closed read
+  boundary until the production adapter wires leader-side read-index serving.
 - Deferred the single-node OpenRaft `client_write` smoke for now. With
   `openraft 0.10.0-alpha.26`, both timer-driven single-node leadership and
   manual `trigger().elect(false)` made the test timing-sensitive or hit an
