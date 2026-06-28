@@ -9103,6 +9103,18 @@ Phase 12.1 progress:
   `last_applied` rather than stalling replay. This required adding
   `futures-util` as a direct storage dependency because OpenRaft's trait
   signature exposes `futures_util::Stream`.
+- Added an in-memory OpenRaft `RaftLogStorage`/`RaftLogReader` adapter for the
+  spike. It keeps vote, committed log id, purged boundary, and contiguous log
+  entries behind a shared reader-visible handle; rejects append/read holes and
+  invalid purge/truncate boundaries; calls OpenRaft's flush callback after
+  appended entries are visible; and implements the optional
+  `save_committed`/`read_committed` path so restart-gating semantics are
+  represented in tests. The adapter also models OpenRaft's special
+  initialization membership entry at `(term=0, index=0)` separately from
+  `ControlPlaneLogId`, so Raft cluster formation can proceed without making
+  zero a valid durable control-plane command index. This is intentionally
+  scaffolding only: it does not choose the production durable Raft-log format
+  or its fsync/batching policy.
 
 1. define the replicated control-plane state machine:
    - state includes cluster epoch, PG count, PG state, PG acting sets, node

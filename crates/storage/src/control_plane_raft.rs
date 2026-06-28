@@ -1,4 +1,7 @@
+use std::collections::BTreeMap;
 use std::io::{self, Cursor};
+use std::ops::{Bound, RangeBounds};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use futures_util::{Stream, StreamExt};
 use openraft::impls::leader_id_adv::LeaderId;
@@ -7,11 +10,14 @@ use openraft::impls::Entry;
 use openraft::impls::Vote;
 use openraft::storage::Snapshot;
 use openraft::storage::SnapshotMeta;
-use openraft::storage::{EntryResponder, RaftStateMachine};
-use openraft::type_config::alias::{LogIdOf, SnapshotMetaOf, SnapshotOf, StoredMembershipOf};
+use openraft::storage::{EntryResponder, IOFlushed, LogState, RaftLogStorage, RaftStateMachine};
+use openraft::type_config::alias::{
+    LogIdOf, SnapshotMetaOf, SnapshotOf, StoredMembershipOf, VoteOf,
+};
 use openraft::EntryPayload;
 use openraft::LogId;
 use openraft::OptionalSend;
+use openraft::RaftLogReader;
 use openraft::RaftSnapshotBuilder;
 use openraft::RaftTypeConfig;
 use openraft::StoredMembership;
@@ -89,6 +95,291 @@ pub fn assert_openraft_type_config() {
 
 fn control_plane_error_to_io_error(context: &'static str, error: ControlPlaneError) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, format!("{context}: {error}"))
+}
+
+fn raft_log_store_error(message: impl Into<String>) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, message.into())
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ControlPlaneRaftLogStore {
+    inner: Arc<Mutex<ControlPlaneRaftLogStoreInner>>,
+}
+
+#[derive(Debug, Default)]
+struct ControlPlaneRaftLogStoreInner {
+    vote: Option<VoteOf<ControlPlaneRaftTypeConfig>>,
+    committed: Option<LogIdOf<ControlPlaneRaftTypeConfig>>,
+    last_purged_log_id: Option<LogIdOf<ControlPlaneRaftTypeConfig>>,
+    entries: BTreeMap<u64, ControlPlaneRaftEntry>,
+}
+
+impl ControlPlaneRaftLogStore {
+    #[must_use]
+    pub fn empty() -> Self {
+        Self::default()
+    }
+
+    fn lock(&self) -> Result<MutexGuard<'_, ControlPlaneRaftLogStoreInner>, io::Error> {
+        self.inner
+            .lock()
+            .map_err(|_| io::Error::other("control-plane OpenRaft log store lock poisoned"))
+    }
+
+    fn validate_contiguous_append(
+        inner: &ControlPlaneRaftLogStoreInner,
+        entries: &[ControlPlaneRaftEntry],
+    ) -> Result<(), io::Error> {
+        let Some(first) = entries.first() else {
+            return Ok(());
+        };
+        let current_last_log_id = inner.last_log_id();
+        let expected_first_index = match current_last_log_id {
+            Some(log_id) => log_id.index().checked_add(1).ok_or_else(|| {
+                raft_log_store_error("cannot append after u64::MAX OpenRaft log index")
+            })?,
+            None => 0,
+        };
+        if first.log_id.index() != expected_first_index {
+            return Err(raft_log_store_error(format!(
+                "control-plane OpenRaft append starts at index {}, expected {}",
+                first.log_id.index(),
+                expected_first_index
+            )));
+        }
+
+        let mut expected_index = expected_first_index;
+        for entry in entries {
+            if entry.log_id.index() != expected_index {
+                return Err(raft_log_store_error(format!(
+                    "control-plane OpenRaft append leaves a log hole at index {expected_index}; next entry is {}",
+                    entry.log_id.index()
+                )));
+            }
+            expected_index = expected_index.checked_add(1).ok_or_else(|| {
+                raft_log_store_error("control-plane OpenRaft append range overflows u64")
+            })?;
+        }
+        Ok(())
+    }
+
+    fn range_start<RB>(range: &RB) -> Result<Option<u64>, io::Error>
+    where
+        RB: RangeBounds<u64>,
+    {
+        match range.start_bound() {
+            Bound::Included(start) => Ok(Some(*start)),
+            Bound::Excluded(start) => Ok(start.checked_add(1)),
+            Bound::Unbounded => Ok(Some(0)),
+        }
+    }
+
+    fn range_end_exclusive<RB>(range: &RB) -> Option<u64>
+    where
+        RB: RangeBounds<u64>,
+    {
+        match range.end_bound() {
+            Bound::Included(end) => end.checked_add(1),
+            Bound::Excluded(end) => Some(*end),
+            Bound::Unbounded => None,
+        }
+    }
+
+    fn before_range_end(index: u64, end_exclusive: Option<u64>) -> bool {
+        end_exclusive.is_none_or(|end_exclusive| index < end_exclusive)
+    }
+}
+
+impl ControlPlaneRaftLogStoreInner {
+    fn last_log_id(&self) -> Option<LogIdOf<ControlPlaneRaftTypeConfig>> {
+        self.entries
+            .last_key_value()
+            .map(|(_, entry)| entry.log_id)
+            .or(self.last_purged_log_id)
+    }
+}
+
+impl RaftLogReader<ControlPlaneRaftTypeConfig> for ControlPlaneRaftLogStore {
+    async fn try_get_log_entries<RB>(
+        &mut self,
+        range: RB,
+    ) -> Result<Vec<ControlPlaneRaftEntry>, io::Error>
+    where
+        RB: RangeBounds<u64> + Clone + std::fmt::Debug + OptionalSend,
+    {
+        let Some(start) = Self::range_start(&range)? else {
+            return Ok(Vec::new());
+        };
+        let end_exclusive = Self::range_end_exclusive(&range);
+        if end_exclusive.is_some_and(|end_exclusive| start >= end_exclusive) {
+            return Ok(Vec::new());
+        }
+
+        let inner = self.lock()?;
+        let Some((&first_present, _)) = inner.entries.first_key_value() else {
+            return Ok(Vec::new());
+        };
+        let Some((&last_present, _)) = inner.entries.last_key_value() else {
+            return Ok(Vec::new());
+        };
+
+        let mut entries = Vec::new();
+        let mut index = start.max(first_present);
+        while index <= last_present && Self::before_range_end(index, end_exclusive) {
+            let entry = inner.entries.get(&index).ok_or_else(|| {
+                raft_log_store_error(format!(
+                    "control-plane OpenRaft log hole at readable index {index}"
+                ))
+            })?;
+            entries.push(entry.clone());
+            let Some(next_index) = index.checked_add(1) else {
+                break;
+            };
+            index = next_index;
+        }
+        Ok(entries)
+    }
+
+    async fn read_vote(&mut self) -> Result<Option<VoteOf<ControlPlaneRaftTypeConfig>>, io::Error> {
+        Ok(self.lock()?.vote)
+    }
+}
+
+impl RaftLogStorage<ControlPlaneRaftTypeConfig> for ControlPlaneRaftLogStore {
+    type LogReader = Self;
+
+    async fn get_log_state(&mut self) -> Result<LogState<ControlPlaneRaftTypeConfig>, io::Error> {
+        let inner = self.lock()?;
+        Ok(LogState {
+            last_purged_log_id: inner.last_purged_log_id,
+            last_log_id: inner.last_log_id(),
+        })
+    }
+
+    async fn get_log_reader(&mut self) -> Self::LogReader {
+        self.clone()
+    }
+
+    async fn save_vote(
+        &mut self,
+        vote: &VoteOf<ControlPlaneRaftTypeConfig>,
+    ) -> Result<(), io::Error> {
+        self.lock()?.vote = Some(*vote);
+        Ok(())
+    }
+
+    async fn save_committed(
+        &mut self,
+        committed: Option<LogIdOf<ControlPlaneRaftTypeConfig>>,
+    ) -> Result<(), io::Error> {
+        self.lock()?.committed = committed;
+        Ok(())
+    }
+
+    async fn read_committed(
+        &mut self,
+    ) -> Result<Option<LogIdOf<ControlPlaneRaftTypeConfig>>, io::Error> {
+        Ok(self.lock()?.committed)
+    }
+
+    async fn append<I>(
+        &mut self,
+        entries: I,
+        callback: IOFlushed<ControlPlaneRaftTypeConfig>,
+    ) -> Result<(), io::Error>
+    where
+        I: IntoIterator<Item = ControlPlaneRaftEntry> + OptionalSend,
+        I::IntoIter: OptionalSend,
+    {
+        let entries = entries.into_iter().collect::<Vec<_>>();
+        {
+            let mut inner = self.lock()?;
+            if let Err(error) = Self::validate_contiguous_append(&inner, &entries) {
+                let message = error.to_string();
+                callback.io_completed(Err(raft_log_store_error(message.clone())));
+                return Err(raft_log_store_error(message));
+            }
+            for entry in entries {
+                inner.entries.insert(entry.log_id.index(), entry);
+            }
+        }
+        callback.io_completed(Ok(()));
+        Ok(())
+    }
+
+    async fn truncate_after(
+        &mut self,
+        last_log_id: Option<LogIdOf<ControlPlaneRaftTypeConfig>>,
+    ) -> Result<(), io::Error> {
+        let mut inner = self.lock()?;
+        let Some(last_log_id) = last_log_id else {
+            inner.entries.clear();
+            return Ok(());
+        };
+
+        if inner
+            .last_purged_log_id
+            .is_some_and(|purged| last_log_id.index() < purged.index())
+        {
+            return Err(raft_log_store_error(format!(
+                "cannot truncate control-plane OpenRaft log after purged boundary {last_log_id}"
+            )));
+        }
+        if let Some(existing) = inner.entries.get(&last_log_id.index()) {
+            if existing.log_id != last_log_id {
+                return Err(raft_log_store_error(format!(
+                    "cannot truncate control-plane OpenRaft log after mismatched log id {last_log_id}; stored {}",
+                    existing.log_id
+                )));
+            }
+        }
+        inner
+            .entries
+            .retain(|index, _| *index <= last_log_id.index());
+        Ok(())
+    }
+
+    async fn purge(
+        &mut self,
+        log_id: LogIdOf<ControlPlaneRaftTypeConfig>,
+    ) -> Result<(), io::Error> {
+        let mut inner = self.lock()?;
+        if let Some(last_purged_log_id) = inner.last_purged_log_id {
+            if log_id.index() <= last_purged_log_id.index() {
+                if log_id == last_purged_log_id {
+                    return Ok(());
+                }
+                return Err(raft_log_store_error(format!(
+                    "cannot repurge control-plane OpenRaft log to {log_id}; current purged boundary is {last_purged_log_id}"
+                )));
+            }
+        }
+        let Some(current_last_log_id) = inner.last_log_id() else {
+            return Err(raft_log_store_error(format!(
+                "cannot purge empty control-plane OpenRaft log to {log_id}"
+            )));
+        };
+        if log_id.index() > current_last_log_id.index() {
+            return Err(raft_log_store_error(format!(
+                "cannot purge control-plane OpenRaft log to {log_id}; current last log id is {current_last_log_id}"
+            )));
+        }
+        if let Some(entry) = inner.entries.get(&log_id.index()) {
+            if entry.log_id != log_id {
+                return Err(raft_log_store_error(format!(
+                    "cannot purge control-plane OpenRaft log to mismatched log id {log_id}; stored {}",
+                    entry.log_id
+                )));
+            }
+        }
+        inner.entries.retain(|index, _| *index > log_id.index());
+        inner.last_purged_log_id = Some(log_id);
+        Ok(())
+    }
+}
+
+fn is_openraft_bootstrap_log_id(log_id: LogIdOf<ControlPlaneRaftTypeConfig>) -> bool {
+    log_id.index() == 0 && log_id.committed_leader_id().term == 0
 }
 
 #[derive(Debug, Clone)]
@@ -192,27 +483,24 @@ impl ControlPlaneRaftStateMachine {
         entry: ControlPlaneRaftEntry,
     ) -> Result<ControlPlaneRaftApplyResponse, ControlPlaneError> {
         let raft_log_id = entry.log_id;
-        let control_plane_log_id =
-            control_plane_log_id_from_raft(raft_log_id).ok_or_else(|| {
-                ControlPlaneError::CommandDecode {
-                    message: format!(
-                        "invalid OpenRaft log id for control-plane entry: {raft_log_id}"
-                    ),
-                }
-            })?;
         match entry.payload {
             EntryPayload::Blank => {
+                let control_plane_log_id = Self::control_plane_log_id_for_entry(raft_log_id)?;
                 self.inner.apply_committed_noop(control_plane_log_id)?;
                 self.last_applied = Some(raft_log_id);
                 Ok(ControlPlaneRaftApplyResponse::Blank)
             }
             EntryPayload::Membership(membership) => {
-                self.inner.apply_committed_noop(control_plane_log_id)?;
+                if !is_openraft_bootstrap_log_id(raft_log_id) {
+                    let control_plane_log_id = Self::control_plane_log_id_for_entry(raft_log_id)?;
+                    self.inner.apply_committed_noop(control_plane_log_id)?;
+                }
                 self.last_membership = StoredMembership::new(Some(raft_log_id), membership);
                 self.last_applied = Some(raft_log_id);
                 Ok(ControlPlaneRaftApplyResponse::Membership)
             }
             EntryPayload::Normal(command) => {
+                let control_plane_log_id = Self::control_plane_log_id_for_entry(raft_log_id)?;
                 let applied = self
                     .inner
                     .apply_committed_command(control_plane_log_id, command)?;
@@ -229,6 +517,16 @@ impl ControlPlaneRaftStateMachine {
                 }
             }
         }
+    }
+
+    fn control_plane_log_id_for_entry(
+        raft_log_id: LogIdOf<ControlPlaneRaftTypeConfig>,
+    ) -> Result<ControlPlaneLogId, ControlPlaneError> {
+        control_plane_log_id_from_raft(raft_log_id).ok_or_else(|| {
+            ControlPlaneError::CommandDecode {
+                message: format!("invalid OpenRaft log id for control-plane entry: {raft_log_id}"),
+            }
+        })
     }
 
     pub fn build_snapshot(
@@ -276,7 +574,19 @@ impl ControlPlaneRaftStateMachine {
         artifact: &ControlPlaneSnapshotArtifact,
     ) -> Result<SnapshotMetaOf<ControlPlaneRaftTypeConfig>, ControlPlaneError> {
         let last_log_id = match artifact.last_applied() {
-            None => None,
+            None => match self.last_applied {
+                Some(last_applied) if is_openraft_bootstrap_log_id(last_applied) => {
+                    Some(last_applied)
+                }
+                Some(last_applied) => {
+                    return Err(ControlPlaneError::SnapshotDecode {
+                        message: format!(
+                            "snapshot artifact has no control-plane last-applied log id but OpenRaft log id is {last_applied}"
+                        ),
+                    });
+                }
+                None => None,
+            },
             Some(artifact_log_id) => {
                 let last_applied = self.last_applied.ok_or_else(|| {
                     ControlPlaneError::SnapshotDecode {
@@ -300,10 +610,7 @@ impl ControlPlaneRaftStateMachine {
             last_membership: self.last_membership.clone(),
             snapshot_id: format!(
                 "control-plane-{}",
-                artifact
-                    .last_applied()
-                    .map(|log_id| log_id.index())
-                    .unwrap_or(0)
+                last_log_id.map(|log_id| log_id.index()).unwrap_or(0)
             ),
         })
     }
@@ -313,6 +620,7 @@ impl ControlPlaneRaftStateMachine {
         meta: &SnapshotMetaOf<ControlPlaneRaftTypeConfig>,
     ) -> Result<Option<ControlPlaneLogId>, ControlPlaneError> {
         let snapshot_log_id = match meta.last_log_id {
+            Some(log_id) if is_openraft_bootstrap_log_id(log_id) => None,
             Some(log_id) => Some(Self::validate_snapshot_log_id_shape("last_log_id", log_id)?),
             None => None,
         };
@@ -388,7 +696,9 @@ impl ControlPlaneRaftStateMachine {
         let Some(membership_log_id) = membership.log_id().as_ref().copied() else {
             return Ok(());
         };
-        Self::validate_snapshot_log_id_shape("last_membership.log_id", membership_log_id)?;
+        if !is_openraft_bootstrap_log_id(membership_log_id) {
+            Self::validate_snapshot_log_id_shape("last_membership.log_id", membership_log_id)?;
+        }
         let Some(snapshot_last_log_id) = snapshot_last_log_id else {
             return Err(ControlPlaneError::SnapshotDecode {
                 message: format!(
@@ -533,6 +843,10 @@ mod tests {
         }
     }
 
+    fn bootstrap_membership_entry(node_id: u64) -> ControlPlaneRaftEntry {
+        membership_entry(0, node_id, 0)
+    }
+
     fn normal_entry(
         term: u64,
         node_id: u64,
@@ -624,6 +938,56 @@ mod tests {
                 .map(|log_id| (log_id.term(), log_id.index())),
             Some((1, 2))
         );
+    }
+
+    #[test]
+    fn control_plane_raft_state_machine_applies_openraft_bootstrap_membership() {
+        let mut state_machine = ControlPlaneRaftStateMachine::empty();
+
+        assert!(matches!(
+            state_machine
+                .apply_entry(bootstrap_membership_entry(7))
+                .unwrap(),
+            ControlPlaneRaftApplyResponse::Membership
+        ));
+        assert_eq!(state_machine.last_applied(), Some(raft_log_id(0, 7, 0)));
+        assert_eq!(
+            state_machine.last_membership().log_id(),
+            &Some(raft_log_id(0, 7, 0))
+        );
+        assert_eq!(state_machine.inner().last_applied(), None);
+
+        let snapshot = state_machine.build_snapshot().unwrap();
+        assert_eq!(snapshot.meta.last_log_id, Some(raft_log_id(0, 7, 0)));
+        assert_eq!(
+            snapshot.meta.last_membership.log_id(),
+            &Some(raft_log_id(0, 7, 0))
+        );
+
+        let mut target = ControlPlaneRaftStateMachine::empty();
+        target
+            .install_snapshot(&snapshot.meta, snapshot.snapshot)
+            .unwrap();
+        assert_eq!(target.last_applied(), Some(raft_log_id(0, 7, 0)));
+        assert_eq!(target.inner().last_applied(), None);
+        assert_eq!(
+            target.last_membership().log_id(),
+            &Some(raft_log_id(0, 7, 0))
+        );
+    }
+
+    #[test]
+    fn control_plane_raft_state_machine_rejects_nonzero_term_index_zero_membership() {
+        let mut state_machine = ControlPlaneRaftStateMachine::empty();
+
+        let err = state_machine
+            .apply_entry(membership_entry(1, 7, 0))
+            .unwrap_err();
+
+        assert!(matches!(err, ControlPlaneError::CommandDecode { .. }));
+        assert_eq!(state_machine.last_applied(), None);
+        assert_eq!(state_machine.last_membership().log_id(), &None);
+        assert_eq!(state_machine.inner().last_applied(), None);
     }
 
     #[test]
@@ -731,6 +1095,28 @@ mod tests {
     }
 
     #[test]
+    fn control_plane_raft_snapshot_install_rejects_nonzero_term_index_zero_log_id() {
+        let mut source = ControlPlaneRaftStateMachine::empty();
+        source.apply_entry(bootstrap_membership_entry(7)).unwrap();
+        let snapshot = source.build_snapshot().unwrap();
+
+        let mut bad_meta = snapshot.meta.clone();
+        bad_meta.last_log_id = Some(raft_log_id(1, 7, 0));
+        bad_meta.last_membership =
+            StoredMembership::new(Some(raft_log_id(1, 7, 0)), test_membership());
+
+        let mut target = ControlPlaneRaftStateMachine::empty();
+        let err = target
+            .install_snapshot(&bad_meta, snapshot.snapshot)
+            .unwrap_err();
+
+        assert!(matches!(err, ControlPlaneError::SnapshotDecode { .. }));
+        assert_eq!(target.last_applied(), None);
+        assert_eq!(target.last_membership().log_id(), &None);
+        assert_eq!(target.inner().last_applied(), None);
+    }
+
+    #[test]
     fn control_plane_raft_state_machine_maps_normal_outcomes_to_application_responses() {
         let mut state_machine = ControlPlaneRaftStateMachine::empty();
 
@@ -819,5 +1205,164 @@ mod tests {
                 .map(|log_id| (log_id.term(), log_id.index())),
             Some((1, 3))
         );
+    }
+
+    #[test]
+    fn control_plane_raft_log_store_tracks_vote_committed_and_visible_entries() {
+        ControlPlaneRaftTypeConfig::run(async {
+            let mut store = ControlPlaneRaftLogStore::empty();
+            let vote = Vote::<ControlPlaneRaftLeaderId>::new_committed(3, 1);
+
+            RaftLogStorage::save_vote(&mut store, &vote).await.unwrap();
+            assert_eq!(
+                RaftLogReader::read_vote(&mut store).await.unwrap(),
+                Some(vote)
+            );
+
+            RaftLogStorage::append(
+                &mut store,
+                vec![
+                    bootstrap_membership_entry(1),
+                    blank_entry(3, 1, 1),
+                    blank_entry(3, 1, 2),
+                ],
+                IOFlushed::noop(),
+            )
+            .await
+            .unwrap();
+
+            let mut reader = RaftLogStorage::get_log_reader(&mut store).await;
+            RaftLogStorage::append(&mut store, vec![blank_entry(3, 1, 3)], IOFlushed::noop())
+                .await
+                .unwrap();
+
+            let entries = RaftLogReader::try_get_log_entries(&mut reader, 0..4)
+                .await
+                .unwrap();
+            assert_eq!(
+                entries.iter().map(|entry| entry.log_id).collect::<Vec<_>>(),
+                vec![
+                    raft_log_id(0, 1, 0),
+                    raft_log_id(3, 1, 1),
+                    raft_log_id(3, 1, 2),
+                    raft_log_id(3, 1, 3),
+                ]
+            );
+
+            RaftLogStorage::save_committed(&mut store, Some(raft_log_id(3, 1, 2)))
+                .await
+                .unwrap();
+            assert_eq!(
+                RaftLogStorage::read_committed(&mut store).await.unwrap(),
+                Some(raft_log_id(3, 1, 2))
+            );
+
+            let log_state = RaftLogStorage::get_log_state(&mut store).await.unwrap();
+            assert_eq!(log_state.last_purged_log_id, None);
+            assert_eq!(log_state.last_log_id, Some(raft_log_id(3, 1, 3)));
+        });
+    }
+
+    #[test]
+    fn control_plane_raft_log_store_rejects_append_holes() {
+        ControlPlaneRaftTypeConfig::run(async {
+            let mut store = ControlPlaneRaftLogStore::empty();
+
+            let err =
+                RaftLogStorage::append(&mut store, vec![blank_entry(3, 1, 1)], IOFlushed::noop())
+                    .await
+                    .unwrap_err();
+            assert!(err.to_string().contains("expected 0"));
+            assert_eq!(
+                RaftLogStorage::get_log_state(&mut store)
+                    .await
+                    .unwrap()
+                    .last_log_id,
+                None
+            );
+
+            RaftLogStorage::append(
+                &mut store,
+                vec![bootstrap_membership_entry(1)],
+                IOFlushed::noop(),
+            )
+            .await
+            .unwrap();
+            let err = RaftLogStorage::append(
+                &mut store,
+                vec![blank_entry(3, 1, 1), blank_entry(3, 1, 3)],
+                IOFlushed::noop(),
+            )
+            .await
+            .unwrap_err();
+            assert!(err.to_string().contains("log hole at index 2"));
+            let entries = RaftLogReader::try_get_log_entries(&mut store, 1..5)
+                .await
+                .unwrap();
+            assert!(entries.is_empty());
+            let entries = RaftLogReader::try_get_log_entries(&mut store, 0..5)
+                .await
+                .unwrap();
+            assert_eq!(
+                entries.iter().map(|entry| entry.log_id).collect::<Vec<_>>(),
+                vec![raft_log_id(0, 1, 0)]
+            );
+        });
+    }
+
+    #[test]
+    fn control_plane_raft_log_store_purges_and_truncates_without_holes() {
+        ControlPlaneRaftTypeConfig::run(async {
+            let mut store = ControlPlaneRaftLogStore::empty();
+            RaftLogStorage::append(
+                &mut store,
+                vec![
+                    bootstrap_membership_entry(1),
+                    blank_entry(3, 1, 1),
+                    blank_entry(3, 1, 2),
+                    blank_entry(3, 1, 3),
+                    blank_entry(3, 1, 4),
+                ],
+                IOFlushed::noop(),
+            )
+            .await
+            .unwrap();
+
+            RaftLogStorage::purge(&mut store, raft_log_id(3, 1, 2))
+                .await
+                .unwrap();
+            let log_state = RaftLogStorage::get_log_state(&mut store).await.unwrap();
+            assert_eq!(log_state.last_purged_log_id, Some(raft_log_id(3, 1, 2)));
+            assert_eq!(log_state.last_log_id, Some(raft_log_id(3, 1, 4)));
+
+            let entries = RaftLogReader::try_get_log_entries(&mut store, 1..5)
+                .await
+                .unwrap();
+            assert_eq!(
+                entries.iter().map(|entry| entry.log_id).collect::<Vec<_>>(),
+                vec![raft_log_id(3, 1, 3), raft_log_id(3, 1, 4)]
+            );
+
+            RaftLogStorage::truncate_after(&mut store, Some(raft_log_id(3, 1, 3)))
+                .await
+                .unwrap();
+            let log_state = RaftLogStorage::get_log_state(&mut store).await.unwrap();
+            assert_eq!(log_state.last_purged_log_id, Some(raft_log_id(3, 1, 2)));
+            assert_eq!(log_state.last_log_id, Some(raft_log_id(3, 1, 3)));
+
+            RaftLogStorage::truncate_after(&mut store, Some(raft_log_id(3, 1, 2)))
+                .await
+                .unwrap();
+            let log_state = RaftLogStorage::get_log_state(&mut store).await.unwrap();
+            assert_eq!(log_state.last_purged_log_id, Some(raft_log_id(3, 1, 2)));
+            assert_eq!(log_state.last_log_id, Some(raft_log_id(3, 1, 2)));
+
+            RaftLogStorage::truncate_after(&mut store, None)
+                .await
+                .unwrap();
+            let log_state = RaftLogStorage::get_log_state(&mut store).await.unwrap();
+            assert_eq!(log_state.last_purged_log_id, Some(raft_log_id(3, 1, 2)));
+            assert_eq!(log_state.last_log_id, Some(raft_log_id(3, 1, 2)));
+        });
     }
 }
