@@ -106,6 +106,14 @@ pub struct ControlPlaneRaftLogStore {
     inner: Arc<Mutex<ControlPlaneRaftLogStoreInner>>,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct ControlPlaneRaftLogStoreRestartArtifact {
+    vote: Option<VoteOf<ControlPlaneRaftTypeConfig>>,
+    committed: Option<LogIdOf<ControlPlaneRaftTypeConfig>>,
+    last_purged_log_id: Option<LogIdOf<ControlPlaneRaftTypeConfig>>,
+    entries: Vec<ControlPlaneRaftEntry>,
+}
+
 #[derive(Debug, Default)]
 struct ControlPlaneRaftLogStoreInner {
     vote: Option<VoteOf<ControlPlaneRaftTypeConfig>>,
@@ -118,6 +126,38 @@ impl ControlPlaneRaftLogStore {
     #[must_use]
     pub fn empty() -> Self {
         Self::default()
+    }
+
+    pub fn export_restart_artifact(
+        &self,
+    ) -> Result<ControlPlaneRaftLogStoreRestartArtifact, io::Error> {
+        let inner = self.lock()?;
+        Ok(ControlPlaneRaftLogStoreRestartArtifact {
+            vote: inner.vote,
+            committed: inner.committed,
+            last_purged_log_id: inner.last_purged_log_id,
+            entries: inner.entries.values().cloned().collect(),
+        })
+    }
+
+    pub fn from_restart_artifact(
+        artifact: ControlPlaneRaftLogStoreRestartArtifact,
+    ) -> Result<Self, io::Error> {
+        let mut inner = ControlPlaneRaftLogStoreInner {
+            vote: artifact.vote,
+            committed: None,
+            last_purged_log_id: artifact.last_purged_log_id,
+            entries: BTreeMap::new(),
+        };
+        Self::validate_contiguous_append(&inner, &artifact.entries)?;
+        for entry in artifact.entries {
+            inner.entries.insert(entry.log_id.index(), entry);
+        }
+        Self::validate_committed_update(&inner, artifact.committed)?;
+        inner.committed = artifact.committed;
+        Ok(Self {
+            inner: Arc::new(Mutex::new(inner)),
+        })
     }
 
     fn lock(&self) -> Result<MutexGuard<'_, ControlPlaneRaftLogStoreInner>, io::Error> {
@@ -1903,5 +1943,125 @@ mod tests {
             assert_eq!(log_state.last_purged_log_id, Some(raft_log_id(3, 1, 2)));
             assert_eq!(log_state.last_log_id, Some(raft_log_id(3, 1, 2)));
         });
+    }
+
+    #[test]
+    fn control_plane_raft_log_store_restores_restart_artifact() {
+        ControlPlaneRaftTypeConfig::run(async {
+            let mut store = ControlPlaneRaftLogStore::empty();
+            let vote = Vote::<ControlPlaneRaftLeaderId>::new_committed(3, 1);
+            RaftLogStorage::save_vote(&mut store, &vote).await.unwrap();
+            RaftLogStorage::append(
+                &mut store,
+                vec![
+                    bootstrap_membership_entry(1),
+                    blank_entry(3, 1, 1),
+                    blank_entry(3, 1, 2),
+                    blank_entry(3, 1, 3),
+                    blank_entry(3, 1, 4),
+                ],
+                IOFlushed::noop(),
+            )
+            .await
+            .unwrap();
+            RaftLogStorage::save_committed(&mut store, Some(raft_log_id(3, 1, 2)))
+                .await
+                .unwrap();
+            RaftLogStorage::purge(&mut store, raft_log_id(3, 1, 2))
+                .await
+                .unwrap();
+
+            let artifact = store.export_restart_artifact().unwrap();
+            let mut restored = ControlPlaneRaftLogStore::from_restart_artifact(artifact).unwrap();
+
+            assert_eq!(
+                RaftLogReader::read_vote(&mut restored).await.unwrap(),
+                Some(vote)
+            );
+            assert_eq!(
+                RaftLogStorage::read_committed(&mut restored).await.unwrap(),
+                Some(raft_log_id(3, 1, 2))
+            );
+            let log_state = RaftLogStorage::get_log_state(&mut restored).await.unwrap();
+            assert_eq!(log_state.last_purged_log_id, Some(raft_log_id(3, 1, 2)));
+            assert_eq!(log_state.last_log_id, Some(raft_log_id(3, 1, 4)));
+
+            let entries = RaftLogReader::try_get_log_entries(&mut restored, 0..5)
+                .await
+                .unwrap();
+            assert_eq!(
+                entries.iter().map(|entry| entry.log_id).collect::<Vec<_>>(),
+                vec![raft_log_id(3, 1, 3), raft_log_id(3, 1, 4)]
+            );
+
+            RaftLogStorage::append(&mut restored, vec![blank_entry(3, 1, 5)], IOFlushed::noop())
+                .await
+                .unwrap();
+            let log_state = RaftLogStorage::get_log_state(&mut restored).await.unwrap();
+            assert_eq!(log_state.last_log_id, Some(raft_log_id(3, 1, 5)));
+        });
+    }
+
+    #[test]
+    fn control_plane_raft_log_store_rejects_invalid_restart_artifacts() {
+        let artifact_with_entry_at_purged_boundary = ControlPlaneRaftLogStoreRestartArtifact {
+            last_purged_log_id: Some(raft_log_id(3, 1, 2)),
+            entries: vec![blank_entry(3, 1, 2)],
+            ..Default::default()
+        };
+        let err =
+            ControlPlaneRaftLogStore::from_restart_artifact(artifact_with_entry_at_purged_boundary)
+                .unwrap_err();
+        assert!(err.to_string().contains("expected 3"));
+
+        let artifact_with_log_hole = ControlPlaneRaftLogStoreRestartArtifact {
+            entries: vec![
+                bootstrap_membership_entry(1),
+                blank_entry(3, 1, 1),
+                blank_entry(3, 1, 3),
+            ],
+            ..Default::default()
+        };
+        let err =
+            ControlPlaneRaftLogStore::from_restart_artifact(artifact_with_log_hole).unwrap_err();
+        assert!(err.to_string().contains("log hole at index 2"));
+
+        let artifact_with_future_committed = ControlPlaneRaftLogStoreRestartArtifact {
+            committed: Some(raft_log_id(3, 1, 3)),
+            entries: vec![
+                bootstrap_membership_entry(1),
+                blank_entry(3, 1, 1),
+                blank_entry(3, 1, 2),
+            ],
+            ..Default::default()
+        };
+        let err = ControlPlaneRaftLogStore::from_restart_artifact(artifact_with_future_committed)
+            .unwrap_err();
+        assert!(err.to_string().contains("current last log id"));
+
+        let artifact_with_mismatched_committed = ControlPlaneRaftLogStoreRestartArtifact {
+            committed: Some(raft_log_id(4, 1, 2)),
+            entries: vec![
+                bootstrap_membership_entry(1),
+                blank_entry(3, 1, 1),
+                blank_entry(3, 1, 2),
+            ],
+            ..Default::default()
+        };
+        let err =
+            ControlPlaneRaftLogStore::from_restart_artifact(artifact_with_mismatched_committed)
+                .unwrap_err();
+        assert!(err.to_string().contains("mismatched log id"));
+
+        let artifact_with_committed_before_purge = ControlPlaneRaftLogStoreRestartArtifact {
+            committed: Some(raft_log_id(3, 1, 1)),
+            last_purged_log_id: Some(raft_log_id(3, 1, 2)),
+            entries: vec![blank_entry(3, 1, 3)],
+            ..Default::default()
+        };
+        let err =
+            ControlPlaneRaftLogStore::from_restart_artifact(artifact_with_committed_before_purge)
+                .unwrap_err();
+        assert!(err.to_string().contains("before purged boundary"));
     }
 }

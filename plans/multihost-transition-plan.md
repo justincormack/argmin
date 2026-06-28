@@ -9131,6 +9131,17 @@ Phase 12.1 progress:
   and attempts to replace a committed vote with the same uncommitted vote. This
   keeps the spike store aligned with OpenRaft's rule that a node grants and
   persists only votes greater than or equal to the last vote it has seen.
+- Added restart-shaped validation for the in-memory OpenRaft log store. The
+  spike store can now export an opaque restart artifact carrying vote,
+  committed watermark, purged boundary, and remaining contiguous entries, and
+  rebuild a fresh store from that artifact only if the restored state satisfies
+  the same append, purge-boundary, and committed-watermark invariants. Focused
+  tests cover continuing appends after restoring a purged committed log, and
+  reject malformed artifacts with entries at the purged boundary, log holes,
+  future committed watermarks, mismatched committed log ids, or committed
+  points before the purged boundary. This is still not a production durable
+  Raft-log format; it pins the restart invariants the durable implementation
+  must preserve.
 - Tightened the in-memory OpenRaft state-machine wrapper's apply cursor. Before
   dispatching blank, membership, or normal entries, the wrapper now rejects
   first-entry gaps, duplicate/replayed bootstrap entries, lower-term next
