@@ -13481,6 +13481,140 @@ mod tests {
     }
 
     #[test]
+    fn storage_cluster_runtime_map_handle_extends_all_pinned_same_epoch_validity() {
+        let route = PgRouteSnapshot::reconstructed(
+            ClusterEpoch::INITIAL,
+            PgId::new(31),
+            NodeId::new(1),
+            vec![NodeId::new(1)],
+            PgState::Active,
+        );
+        let local_map = crate::cluster::LocalClusterMap::open_frontend_topology_only_with_pg_routes_and_validity(
+            NodeId::new(1),
+            [NodeId::new(1)],
+            &[31],
+            crate::EcShape { k: 1, m: 0 },
+            ClusterEpoch::INITIAL,
+            [crate::cluster::LocalPgRoute::from(&route)],
+            Some(1_000),
+        )
+        .unwrap();
+        let pinned_cluster = crate::StorageCluster::test_from_local_map_with_epoch(
+            Arc::new(local_map),
+            ClusterEpoch::INITIAL,
+        )
+        .unwrap();
+        let handle = crate::StorageClusterRuntimeMapHandle::new(Arc::clone(&pinned_cluster));
+        let candidate_map = crate::cluster::LocalClusterMap::open_frontend_topology_only_with_pg_routes_and_validity(
+            NodeId::new(1),
+            [NodeId::new(1)],
+            &[31],
+            crate::EcShape { k: 1, m: 0 },
+            ClusterEpoch::INITIAL,
+            [crate::cluster::LocalPgRoute::from(&route)],
+            Some(2_000),
+        )
+        .unwrap();
+        let candidate_cluster = crate::StorageCluster::test_from_local_map_with_epoch(
+            Arc::new(candidate_map),
+            ClusterEpoch::INITIAL,
+        )
+        .unwrap();
+
+        handle.install(Arc::clone(&candidate_cluster)).unwrap();
+
+        assert_eq!(pinned_cluster.route_map_valid_until_ms(), Some(2_000));
+        assert_eq!(handle.current().route_map_valid_until_ms(), Some(2_000));
+        assert_eq!(
+            Arc::as_ptr(&handle.current()),
+            Arc::as_ptr(&candidate_cluster)
+        );
+
+        let second_candidate_map = crate::cluster::LocalClusterMap::open_frontend_topology_only_with_pg_routes_and_validity(
+            NodeId::new(1),
+            [NodeId::new(1)],
+            &[31],
+            crate::EcShape { k: 1, m: 0 },
+            ClusterEpoch::INITIAL,
+            [crate::cluster::LocalPgRoute::from(&route)],
+            Some(3_000),
+        )
+        .unwrap();
+        let second_candidate_cluster = crate::StorageCluster::test_from_local_map_with_epoch(
+            Arc::new(second_candidate_map),
+            ClusterEpoch::INITIAL,
+        )
+        .unwrap();
+
+        handle
+            .install(Arc::clone(&second_candidate_cluster))
+            .unwrap();
+
+        assert_eq!(pinned_cluster.route_map_valid_until_ms(), Some(3_000));
+        assert_eq!(candidate_cluster.route_map_valid_until_ms(), Some(3_000));
+        assert_eq!(handle.current().route_map_valid_until_ms(), Some(3_000));
+        assert_eq!(
+            Arc::as_ptr(&handle.current()),
+            Arc::as_ptr(&second_candidate_cluster)
+        );
+    }
+
+    #[test]
+    fn storage_cluster_runtime_map_handle_does_not_extend_pinned_previous_epoch_validity() {
+        let initial_route = PgRouteSnapshot::reconstructed(
+            ClusterEpoch::INITIAL,
+            PgId::new(31),
+            NodeId::new(1),
+            vec![NodeId::new(1)],
+            PgState::Active,
+        );
+        let local_map = crate::cluster::LocalClusterMap::open_frontend_topology_only_with_pg_routes_and_validity(
+            NodeId::new(1),
+            [NodeId::new(1)],
+            &[31],
+            crate::EcShape { k: 1, m: 0 },
+            ClusterEpoch::INITIAL,
+            [crate::cluster::LocalPgRoute::from(&initial_route)],
+            Some(1_000),
+        )
+        .unwrap();
+        let pinned_cluster = crate::StorageCluster::test_from_local_map_with_epoch(
+            Arc::new(local_map),
+            ClusterEpoch::INITIAL,
+        )
+        .unwrap();
+        let handle = crate::StorageClusterRuntimeMapHandle::new(Arc::clone(&pinned_cluster));
+        let next_epoch = ClusterEpoch::new(ClusterEpoch::INITIAL.get() + 1).unwrap();
+        let next_route = PgRouteSnapshot::reconstructed(
+            next_epoch,
+            PgId::new(31),
+            NodeId::new(1),
+            vec![NodeId::new(1)],
+            PgState::Active,
+        );
+        let candidate_map = crate::cluster::LocalClusterMap::open_frontend_topology_only_with_pg_routes_and_validity(
+            NodeId::new(1),
+            [NodeId::new(1)],
+            &[31],
+            crate::EcShape { k: 1, m: 0 },
+            next_epoch,
+            [crate::cluster::LocalPgRoute::from(&next_route)],
+            Some(3_000),
+        )
+        .unwrap();
+        let candidate_cluster = crate::StorageCluster::test_from_local_map_with_epoch(
+            Arc::new(candidate_map),
+            next_epoch,
+        )
+        .unwrap();
+
+        handle.install(candidate_cluster).unwrap();
+
+        assert_eq!(pinned_cluster.route_map_valid_until_ms(), Some(1_000));
+        assert_eq!(handle.current().route_map_valid_until_ms(), Some(3_000));
+    }
+
+    #[test]
     fn storage_cluster_runtime_map_handle_accepts_unbounded_to_bounded_same_epoch() {
         let tmp = test_util::tempdir();
         let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));

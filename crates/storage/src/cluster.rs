@@ -1049,6 +1049,7 @@ pub struct StorageCluster {
 #[derive(Clone)]
 pub struct StorageClusterRuntimeMapHandle {
     cluster: Arc<RwLock<Arc<StorageCluster>>>,
+    same_epoch_generations: Arc<Mutex<Vec<Weak<StorageCluster>>>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1102,6 +1103,7 @@ impl Drop for StorageClusterRuntimeMapRefreshLoop {
 impl StorageClusterRuntimeMapHandle {
     pub fn new(initial: Arc<StorageCluster>) -> Self {
         Self {
+            same_epoch_generations: Arc::new(Mutex::new(vec![Arc::downgrade(&initial)])),
             cluster: Arc::new(RwLock::new(initial)),
         }
     }
@@ -1137,6 +1139,34 @@ impl StorageClusterRuntimeMapHandle {
                 current: current.route_map_valid_until_ms(),
                 candidate: candidate.route_map_valid_until_ms(),
             });
+        }
+        if candidate.cluster_epoch() == current.cluster_epoch() {
+            let candidate_valid_until = candidate.route_map_valid_until_ms();
+            let mut generations = self
+                .same_epoch_generations
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            // Same-epoch refreshes only extend the control-plane lease. Requests
+            // that pinned an older generation must see that extension too.
+            generations.retain(|generation| {
+                let Some(generation) = generation.upgrade() else {
+                    return false;
+                };
+                if generation.cluster_epoch() == candidate.cluster_epoch() {
+                    generation.extend_route_map_valid_until_ms(candidate_valid_until);
+                    true
+                } else {
+                    false
+                }
+            });
+            generations.push(Arc::downgrade(&candidate));
+        } else {
+            let mut generations = self
+                .same_epoch_generations
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            generations.clear();
+            generations.push(Arc::downgrade(&candidate));
         }
         *current = candidate;
         Ok(())
@@ -3821,6 +3851,10 @@ impl StorageCluster {
 
     pub fn route_map_valid_until_ms(&self) -> Option<u64> {
         self.local_map.route_map_valid_until_ms()
+    }
+
+    fn extend_route_map_valid_until_ms(&self, candidate: Option<u64>) {
+        self.local_map.extend_route_map_valid_until_ms(candidate);
     }
 
     pub fn is_route_map_valid_at(&self, now_ms: u64) -> bool {

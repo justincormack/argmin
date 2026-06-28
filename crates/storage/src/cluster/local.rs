@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -39,6 +39,19 @@ const LOCAL_RECLAIM_WORKER_WAIT_POLL_MILLIS: u64 = 100;
 const LOCAL_PLACED_SEGMENT_SHARD_REPAIR_WORKER_WAIT_POLL_MILLIS: u64 = 100;
 const METADATA_COMMAND_RECOVERY_WAIT_TIMEOUT: Duration = Duration::from_secs(1);
 const LOCAL_PLACED_SEGMENT_SHARD_REPAIR_HINT_QUEUE_LIMIT: usize = 4096;
+const ROUTE_MAP_VALID_UNTIL_UNBOUNDED: u64 = u64::MAX;
+
+fn encode_route_map_valid_until_ms(valid_until_ms: Option<u64>) -> AtomicU64 {
+    AtomicU64::new(valid_until_ms.unwrap_or(ROUTE_MAP_VALID_UNTIL_UNBOUNDED))
+}
+
+fn decode_route_map_valid_until_ms(encoded: u64) -> Option<u64> {
+    if encoded == ROUTE_MAP_VALID_UNTIL_UNBOUNDED {
+        None
+    } else {
+        Some(encoded)
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LocalNodeStoreConfig {
@@ -1303,7 +1316,7 @@ impl LocalClusterRuntimeState {
 #[derive(Debug)]
 pub struct LocalClusterMap {
     epoch: ClusterEpoch,
-    route_map_valid_until_ms: Option<u64>,
+    route_map_valid_until_ms: AtomicU64,
     metadata_primary_node_id: NodeId,
     nodes: BTreeMap<NodeId, LocalNodeStore>,
     pg_ids: Box<[u32]>,
@@ -1471,7 +1484,7 @@ impl LocalClusterMap {
             default_ec_shape,
             pg_routes,
             historical_pg_routes: BTreeMap::new(),
-            route_map_valid_until_ms: None,
+            route_map_valid_until_ms: encode_route_map_valid_until_ms(None),
             runtime_state: Arc::new(LocalClusterRuntimeState::new()),
             process_local_registry_key: Arc::as_ptr(metadata_primary.storage_node()) as usize,
             nodes,
@@ -1559,7 +1572,7 @@ impl LocalClusterMap {
             default_ec_shape,
             pg_routes,
             historical_pg_routes: BTreeMap::new(),
-            route_map_valid_until_ms,
+            route_map_valid_until_ms: encode_route_map_valid_until_ms(route_map_valid_until_ms),
             runtime_state: Arc::new(LocalClusterRuntimeState::new()),
             process_local_registry_key: Arc::as_ptr(metadata_primary.storage_node()) as usize,
             nodes,
@@ -1702,7 +1715,7 @@ impl LocalClusterMap {
             default_ec_shape,
             pg_routes,
             historical_pg_routes: BTreeMap::new(),
-            route_map_valid_until_ms: None,
+            route_map_valid_until_ms: encode_route_map_valid_until_ms(None),
             runtime_state: Arc::new(LocalClusterRuntimeState::new()),
             process_local_registry_key: Arc::as_ptr(metadata_primary.storage_node()) as usize,
             nodes,
@@ -1714,16 +1727,35 @@ impl LocalClusterMap {
     }
 
     pub fn route_map_valid_until_ms(&self) -> Option<u64> {
-        self.route_map_valid_until_ms
+        decode_route_map_valid_until_ms(self.route_map_valid_until_ms.load(Ordering::Acquire))
+    }
+
+    pub(crate) fn extend_route_map_valid_until_ms(&self, candidate: Option<u64>) {
+        let candidate = candidate.unwrap_or(ROUTE_MAP_VALID_UNTIL_UNBOUNDED);
+        let mut current = self.route_map_valid_until_ms.load(Ordering::Acquire);
+        loop {
+            if current == ROUTE_MAP_VALID_UNTIL_UNBOUNDED || current >= candidate {
+                return;
+            }
+            match self.route_map_valid_until_ms.compare_exchange_weak(
+                current,
+                candidate,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return,
+                Err(observed) => current = observed,
+            }
+        }
     }
 
     pub fn is_route_map_valid_at(&self, now_ms: u64) -> bool {
-        self.route_map_valid_until_ms
+        self.route_map_valid_until_ms()
             .is_none_or(|valid_until_ms| valid_until_ms > now_ms)
     }
 
     pub fn require_route_map_valid_at(&self, now_ms: u64) -> Result<(), StoreError> {
-        match self.route_map_valid_until_ms {
+        match self.route_map_valid_until_ms() {
             Some(valid_until_ms) if valid_until_ms <= now_ms => Err(StoreError::RouteMapExpired {
                 cluster_epoch: self.epoch,
                 valid_until_ms,
@@ -1742,7 +1774,7 @@ impl LocalClusterMap {
         pg_id: PgId,
     ) -> Result<(), ClusterBuildError> {
         let now_ms = crate::clock::current_time_millis();
-        match self.route_map_valid_until_ms {
+        match self.route_map_valid_until_ms() {
             Some(valid_until_ms) if valid_until_ms <= now_ms => {
                 Err(ClusterBuildError::RouteMapExpired {
                     pg_id: pg_id.get(),
@@ -1761,7 +1793,7 @@ impl LocalClusterMap {
         node_id: NodeId,
     ) -> Result<(), ShardIoError> {
         let now_ms = crate::clock::current_time_millis();
-        match self.route_map_valid_until_ms {
+        match self.route_map_valid_until_ms() {
             Some(valid_until_ms) if valid_until_ms <= now_ms => {
                 Err(ShardIoError::RouteMapExpired {
                     node_id: node_id.as_u32(),
@@ -2511,7 +2543,7 @@ impl LocalClusterMap {
 
     #[cfg(any(test, feature = "test-hooks"))]
     pub fn test_set_route_map_valid_until_ms(&mut self, valid_until_ms: Option<u64>) {
-        self.route_map_valid_until_ms = valid_until_ms;
+        self.route_map_valid_until_ms = encode_route_map_valid_until_ms(valid_until_ms);
     }
 
     pub fn process_local_registry_key(&self) -> usize {

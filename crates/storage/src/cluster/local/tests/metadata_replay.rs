@@ -143,7 +143,9 @@ fn expired_route_maps_reject_metadata_routing() {
     let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1], ec_shape).unwrap();
     let pg_id = PgId::new(1);
     let command = create_bucket_metadata_command(pg_id, 1, BucketName::new("bucket").unwrap());
-    map.route_map_valid_until_ms = Some(crate::clock::current_time_millis().saturating_add(60_000));
+    map.test_set_route_map_valid_until_ms(Some(
+        crate::clock::current_time_millis().saturating_add(60_000),
+    ));
 
     map.metadata_pg_primary_node(ClusterEpoch::INITIAL, pg_id)
         .unwrap();
@@ -153,7 +155,7 @@ fn expired_route_maps_reject_metadata_routing() {
         .unwrap();
 
     let expired_at = crate::clock::current_time_millis();
-    map.route_map_valid_until_ms = Some(expired_at);
+    map.test_set_route_map_valid_until_ms(Some(expired_at));
     let err = map
         .metadata_pg_primary_node(ClusterEpoch::INITIAL, pg_id)
         .unwrap_err();
