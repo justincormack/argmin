@@ -9392,6 +9392,11 @@ Phase 12.1 progress:
   initialized-state checks, and shutdown. The public OpenRaft smokes now use
   the wrapper for lifecycle operations, leaving raw `Raft` access only for
   white-box assertions and test-only leader waits.
+- Added a test-only in-memory OpenRaft network factory that forwards
+  append/vote/pre-vote/snapshot RPCs between registered local `Raft` handles.
+  A two-node public smoke now initializes membership through node 101, waits for
+  the initialized leader state, submits a control-plane command through the
+  leader, and verifies the follower applies the same command state.
 - Isolated the public OpenRaft smokes with distinct cluster names so the normal
   parallel `control_plane_raft` test group cannot share OpenRaft test identity
   while still exercising the real client-write and read-index paths.

@@ -1508,7 +1508,9 @@ mod tests {
 
     use super::*;
     use futures_util::stream;
-    use openraft::errors::{RPCError, ReplicationClosed, StreamingError, Unreachable};
+    use openraft::errors::{
+        NetworkError, RPCError, ReplicationClosed, StreamingError, Unreachable,
+    };
     use openraft::network::{RPCOption, RaftNetworkFactory, RaftNetworkV2};
     use openraft::raft::{
         AppendEntriesRequest, AppendEntriesResponse, SnapshotResponse, VoteRequest, VoteResponse,
@@ -1584,6 +1586,158 @@ mod tests {
             Err(StreamingError::Unreachable(
                 self.unreachable("full_snapshot"),
             ))
+        }
+    }
+
+    #[derive(Debug, Clone, Default)]
+    struct InMemoryRaftNetworkFactory {
+        peers: Arc<
+            Mutex<
+                BTreeMap<
+                    ControlPlaneRaftNodeId,
+                    Raft<ControlPlaneRaftTypeConfig, ControlPlaneRaftStateMachine>,
+                >,
+            >,
+        >,
+    }
+
+    impl InMemoryRaftNetworkFactory {
+        fn register(
+            &self,
+            node_id: ControlPlaneRaftNodeId,
+            raft: Raft<ControlPlaneRaftTypeConfig, ControlPlaneRaftStateMachine>,
+        ) {
+            self.peers.lock().unwrap().insert(node_id, raft);
+        }
+    }
+
+    impl RaftNetworkFactory<ControlPlaneRaftTypeConfig> for InMemoryRaftNetworkFactory {
+        type Network = InMemoryRaftNetwork;
+
+        async fn new_client(
+            &mut self,
+            target: ControlPlaneRaftNodeId,
+            _node: &BasicNode,
+        ) -> Self::Network {
+            InMemoryRaftNetwork {
+                peers: self.peers.clone(),
+                target,
+            }
+        }
+    }
+
+    #[derive(Clone)]
+    struct InMemoryRaftNetwork {
+        peers: Arc<
+            Mutex<
+                BTreeMap<
+                    ControlPlaneRaftNodeId,
+                    Raft<ControlPlaneRaftTypeConfig, ControlPlaneRaftStateMachine>,
+                >,
+            >,
+        >,
+        target: ControlPlaneRaftNodeId,
+    }
+
+    impl InMemoryRaftNetwork {
+        fn target_raft(
+            &self,
+            rpc_name: &'static str,
+        ) -> Result<
+            Raft<ControlPlaneRaftTypeConfig, ControlPlaneRaftStateMachine>,
+            RPCError<ControlPlaneRaftTypeConfig>,
+        > {
+            let peers = self.peers.lock().map_err(|_| {
+                RPCError::Network(NetworkError::from_string(
+                    "in-memory test raft network registry lock poisoned",
+                ))
+            })?;
+            peers.get(&self.target).cloned().ok_or_else(|| {
+                RPCError::Unreachable(Unreachable::new(&AnyError::error(format!(
+                    "in-memory test raft network has no target {} for {rpc_name}",
+                    self.target
+                ))))
+            })
+        }
+
+        fn remote_failure(
+            &self,
+            rpc_name: &'static str,
+            error: impl fmt::Display,
+        ) -> RPCError<ControlPlaneRaftTypeConfig> {
+            RPCError::Network(NetworkError::from_string(format!(
+                "in-memory test raft network {rpc_name} to node {} failed: {error}",
+                self.target
+            )))
+        }
+    }
+
+    impl fmt::Debug for InMemoryRaftNetwork {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.debug_struct("InMemoryRaftNetwork")
+                .field("target", &self.target)
+                .finish_non_exhaustive()
+        }
+    }
+
+    impl RaftNetworkV2<ControlPlaneRaftTypeConfig> for InMemoryRaftNetwork {
+        async fn append_entries(
+            &mut self,
+            rpc: AppendEntriesRequest<ControlPlaneRaftTypeConfig>,
+            _option: RPCOption,
+        ) -> Result<
+            AppendEntriesResponse<ControlPlaneRaftTypeConfig>,
+            RPCError<ControlPlaneRaftTypeConfig>,
+        > {
+            self.target_raft("append_entries")?
+                .append_entries(rpc)
+                .await
+                .map_err(|error| self.remote_failure("append_entries", error))
+        }
+
+        async fn vote(
+            &mut self,
+            rpc: VoteRequest<ControlPlaneRaftTypeConfig>,
+            _option: RPCOption,
+        ) -> Result<VoteResponse<ControlPlaneRaftTypeConfig>, RPCError<ControlPlaneRaftTypeConfig>>
+        {
+            self.target_raft("vote")?
+                .vote(rpc)
+                .await
+                .map_err(|error| self.remote_failure("vote", error))
+        }
+
+        async fn pre_vote(
+            &mut self,
+            rpc: VoteRequest<ControlPlaneRaftTypeConfig>,
+            _option: RPCOption,
+        ) -> Result<VoteResponse<ControlPlaneRaftTypeConfig>, RPCError<ControlPlaneRaftTypeConfig>>
+        {
+            self.target_raft("pre_vote")?
+                .pre_vote(rpc)
+                .await
+                .map_err(|error| self.remote_failure("pre_vote", error))
+        }
+
+        async fn full_snapshot(
+            &mut self,
+            vote: VoteOf<ControlPlaneRaftTypeConfig>,
+            snapshot: SnapshotOf<ControlPlaneRaftTypeConfig>,
+            _cancel: impl Future<Output = ReplicationClosed> + OptionalSend + 'static,
+            _option: RPCOption,
+        ) -> Result<
+            SnapshotResponse<ControlPlaneRaftTypeConfig>,
+            StreamingError<ControlPlaneRaftTypeConfig>,
+        > {
+            self.target_raft("full_snapshot")?
+                .install_full_snapshot(vote, snapshot)
+                .await
+                .map_err(|error| {
+                    StreamingError::Network(NetworkError::from_string(format!(
+                        "in-memory test raft network full_snapshot to node {} failed: {error}",
+                        self.target
+                    )))
+                })
         }
     }
 
@@ -2791,7 +2945,7 @@ mod tests {
                 }) if *node_id == 99
             ));
 
-            let applied_state = authority
+            let (applied_snapshot, (applied_log_id, _applied_membership)) = authority
                 .raft()
                 .with_state_machine(|state_machine| {
                     let snapshot = state_machine.inner().snapshot().clone();
@@ -2800,9 +2954,9 @@ mod tests {
                 })
                 .await
                 .unwrap();
-            assert!(applied_state.0.node(NodeId::new(1)).is_some());
-            assert!(applied_state.0.node(NodeId::new(99)).is_none());
-            assert_eq!(applied_state.1 .0, Some(rejected_log_id));
+            assert!(applied_snapshot.node(NodeId::new(1)).is_some());
+            assert!(applied_snapshot.node(NodeId::new(99)).is_none());
+            assert_eq!(applied_log_id, Some(rejected_log_id));
 
             let status = authority.status().await.unwrap();
             assert_eq!(status.node_id(), 1);
@@ -2936,6 +3090,91 @@ mod tests {
             ));
 
             authority.shutdown().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn control_plane_openraft_two_node_client_write_replicates_to_follower() {
+        ControlPlaneRaftTypeConfig::run(async {
+            let network = InMemoryRaftNetworkFactory::default();
+            let config = test_raft_config("control-plane-raft-two-node-replication-test");
+            let raft1 = Raft::<ControlPlaneRaftTypeConfig, ControlPlaneRaftStateMachine>::new(
+                101,
+                config.clone(),
+                network.clone(),
+                ControlPlaneRaftLogStore::empty(),
+                ControlPlaneRaftStateMachine::empty(),
+            )
+            .await
+            .unwrap();
+            let raft2 = Raft::<ControlPlaneRaftTypeConfig, ControlPlaneRaftStateMachine>::new(
+                102,
+                config,
+                network.clone(),
+                ControlPlaneRaftLogStore::empty(),
+                ControlPlaneRaftStateMachine::empty(),
+            )
+            .await
+            .unwrap();
+            network.register(101, raft1.clone());
+            network.register(102, raft2.clone());
+            let authority1 = ControlPlaneRaftAuthority::new(raft1);
+            let authority2 = ControlPlaneRaftAuthority::new(raft2);
+
+            authority1
+                .initialize_membership(BTreeMap::from([
+                    (101, BasicNode::new("node-101")),
+                    (102, BasicNode::new("node-102")),
+                ]))
+                .await
+                .unwrap();
+            wait_for_local_leader(authority1.raft(), "two-node initialized leadership").await;
+
+            let write = authority1
+                .submit_control_plane_command(ControlPlaneCommand::BootstrapInitialClusterMap {
+                    nodes: vec![
+                        (NodeId::new(101), "node-101".to_string()),
+                        (NodeId::new(102), "node-102".to_string()),
+                    ],
+                    pg_ids: vec![PgId::new(0)],
+                })
+                .await
+                .unwrap();
+            assert!(matches!(
+                write.outcome(),
+                ControlPlaneRaftCommandOutcome::Applied(
+                    ControlPlaneCommandResponse::BootstrapInitialClusterMap
+                )
+            ));
+
+            authority2
+                .raft()
+                .wait(Some(Duration::from_secs(1)))
+                .applied_index_at_least(
+                    Some(write.log_id().index()),
+                    "two-node follower applied client write",
+                )
+                .await
+                .unwrap();
+            let follower_state = authority2
+                .raft()
+                .with_state_machine(|state_machine| {
+                    let last_applied = state_machine.last_applied();
+                    let node_ids = state_machine
+                        .inner()
+                        .snapshot()
+                        .nodes()
+                        .map(|node| node.node_id())
+                        .collect::<Vec<_>>();
+                    Box::pin(async move { (last_applied, node_ids) })
+                })
+                .await
+                .unwrap();
+            assert_eq!(follower_state.0, Some(write.log_id()));
+            assert_eq!(follower_state.1, vec![NodeId::new(101), NodeId::new(102)]);
+
+            authority1.shutdown().await.unwrap();
+            authority2.shutdown().await.unwrap();
         });
     }
 
