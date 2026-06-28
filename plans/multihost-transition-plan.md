@@ -9007,6 +9007,14 @@ Status update:
   now proves `DeleteBucket` returns retryable metadata-command contention
   quickly, preserves the active drain, and leaves the bucket Active until the
   drain can be retried or expire-recovered.
+- Added a bounded `uat_pg_backfill_smoke cleanup-versioned-stress` profile for
+  soak harnesses to run during route-map refresh and storage-node restart
+  cycles. It creates versioned buckets spread across the configured bucket
+  metadata PGs, writes multiple versions for keys selected across object
+  metadata/data PGs where possible, and then exercises the shared versioned
+  cleanup plus `DeleteBucket` helper. The profile is wired into
+  `scripts/uat-s3-tests --smoke cleanup-versioned-stress` and the correctness
+  soak.
 - Remaining close-out work is concentrated in deterministic interleaving tests,
   cleanup stress/diagnostics, and checking whether any foreground loops still
   need an earlier retry boundary before route-map validity expires.

@@ -15,7 +15,7 @@ use storage::{BucketName, GenerationId, ObjectKey, PgTopology};
 
 fn usage() -> ! {
     eprintln!(
-        "usage: uat_pg_backfill_smoke create-put <bucket-file> <key> <body-file> | create-versioned-put-distinct-data-pg <bucket-file> <key-file> <data-pg-file> <key-prefix> <body-file> [target-data-pg] [excluded-metadata-pg-csv] | create-put-distinct-data-pg <bucket-file> <key-file> <data-pg-file> <key-prefix> <body-file> [target-data-pg] [excluded-metadata-pg-csv] | create-put-metadata-pg <bucket-file> <key-file> <metadata-pg-file> <key-prefix> <body-file> <target-metadata-pg> | put-for-data-pg <bucket-file> <key-file> <key-prefix> <body-file> <data-pg> [excluded-metadata-pg-csv] | put-for-metadata-pg <bucket-file> <key-file> <key-prefix> <body-file> <target-metadata-pg> | put <bucket-file> <key> <body-file> | put-expect-failure <bucket-file> <key> <body-file> | get <bucket-file> <key> <body-file> | get-expect-failure <bucket-file> <key> | head <bucket-file> <key> <body-file> | head-expect-failure <bucket-file> <key> | list-contains <bucket-file> <key>... | list-expect-failure <bucket-file> | list-versions-contains <bucket-file> <key>... | cleanup <bucket-file> <key>... | cleanup-versioned <bucket-file>"
+        "usage: uat_pg_backfill_smoke create-put <bucket-file> <key> <body-file> | create-versioned-put-distinct-data-pg <bucket-file> <key-file> <data-pg-file> <key-prefix> <body-file> [target-data-pg] [excluded-metadata-pg-csv] | create-put-distinct-data-pg <bucket-file> <key-file> <data-pg-file> <key-prefix> <body-file> [target-data-pg] [excluded-metadata-pg-csv] | create-put-metadata-pg <bucket-file> <key-file> <metadata-pg-file> <key-prefix> <body-file> <target-metadata-pg> | put-for-data-pg <bucket-file> <key-file> <key-prefix> <body-file> <data-pg> [excluded-metadata-pg-csv] | put-for-metadata-pg <bucket-file> <key-file> <key-prefix> <body-file> <target-metadata-pg> | put <bucket-file> <key> <body-file> | put-expect-failure <bucket-file> <key> <body-file> | get <bucket-file> <key> <body-file> | get-expect-failure <bucket-file> <key> | head <bucket-file> <key> <body-file> | head-expect-failure <bucket-file> <key> | list-contains <bucket-file> <key>... | list-expect-failure <bucket-file> | list-versions-contains <bucket-file> <key>... | cleanup <bucket-file> <key>... | cleanup-versioned <bucket-file> | cleanup-versioned-stress <bucket-count> <keys-per-bucket> <versions-per-key> <key-prefix> <body-file>"
     );
     std::process::exit(2);
 }
@@ -200,6 +200,15 @@ fn pg_topology_from_env() -> PgTopology {
     PgTopology::new(&pg_ids).expect("UAT PG topology must be valid")
 }
 
+fn pg_ids_from_env() -> Vec<u32> {
+    let pg_count = std::env::var("ARGMIN_PG_COUNT")
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+        .unwrap_or(1);
+    assert!(pg_count > 0, "ARGMIN_PG_COUNT must be greater than zero");
+    (0..pg_count).collect()
+}
+
 fn parse_pg_csv(value: Option<String>) -> BTreeSet<u32> {
     let Some(value) = value else {
         return BTreeSet::new();
@@ -311,6 +320,18 @@ fn choose_bucket_key_with_metadata_pg_and_distinct_data_pg(
     panic!("could not find UAT bucket/key with bucket and object metadata PG {target_metadata_pg}");
 }
 
+fn choose_bucket_with_metadata_pg(target_metadata_pg: u32) -> String {
+    let topology = pg_topology_from_env();
+    for _ in 0..10_000u32 {
+        let bucket = unique_bucket();
+        let bucket_name = BucketName::try_from(bucket.clone()).expect("UAT bucket must be valid");
+        if topology.bucket_metadata_pg_for(&bucket_name).get() == target_metadata_pg {
+            return bucket;
+        }
+    }
+    panic!("could not find UAT bucket with bucket metadata PG {target_metadata_pg}");
+}
+
 fn choose_existing_bucket_key_with_metadata_pg_and_distinct_data_pg(
     bucket: &str,
     key_prefix: &str,
@@ -329,6 +350,76 @@ fn choose_existing_bucket_key_with_metadata_pg_and_distinct_data_pg(
                 "could not find UAT key with object metadata PG {target_metadata_pg} in bucket {bucket}"
             )
         })
+}
+
+fn stress_key_for_pg(
+    topology: &PgTopology,
+    bucket: &str,
+    key_prefix: &str,
+    target_metadata_pg: u32,
+) -> (String, Option<u32>) {
+    if let Some((key, data_pg)) =
+        key_with_metadata_pg_and_distinct_data_pg(topology, bucket, key_prefix, target_metadata_pg)
+    {
+        return (key, Some(data_pg));
+    }
+    (key_prefix.to_string(), None)
+}
+
+async fn cleanup_versioned_stress(
+    client: &s3_tests::aws_sdk_s3::Client,
+    bucket_count: usize,
+    keys_per_bucket: usize,
+    versions_per_key: usize,
+    key_prefix: &str,
+    body: &[u8],
+) {
+    assert!(bucket_count > 0, "bucket-count must be greater than zero");
+    assert!(
+        keys_per_bucket > 0,
+        "keys-per-bucket must be greater than zero"
+    );
+    assert!(
+        versions_per_key > 0,
+        "versions-per-key must be greater than zero"
+    );
+    let topology = pg_topology_from_env();
+    let pg_ids = pg_ids_from_env();
+
+    for bucket_index in 0..bucket_count {
+        let target_bucket_pg = pg_ids[bucket_index % pg_ids.len()];
+        let bucket = choose_bucket_with_metadata_pg(target_bucket_pg);
+        eprintln!(
+            "cleanup-versioned-stress: bucket={} bucket_pg={} index={}/{}",
+            bucket,
+            target_bucket_pg,
+            bucket_index + 1,
+            bucket_count
+        );
+        create_bucket(client, &bucket).await;
+        enable_bucket_versioning(client, &bucket).await;
+
+        for key_index in 0..keys_per_bucket {
+            let target_object_pg = pg_ids[(bucket_index + key_index + 1) % pg_ids.len()];
+            let key_prefix = format!("{key_prefix}-b{bucket_index:03}-k{key_index:03}");
+            let (key, data_pg) =
+                stress_key_for_pg(&topology, &bucket, &key_prefix, target_object_pg);
+            eprintln!(
+                "cleanup-versioned-stress: bucket={} key={} target_object_pg={} data_pg={:?}",
+                bucket, key, target_object_pg, data_pg
+            );
+            for version_index in 0..versions_per_key {
+                let mut version_body = body.to_vec();
+                version_body.extend_from_slice(
+                    format!("\nbucket={bucket_index} key={key_index} version={version_index}\n")
+                        .as_bytes(),
+                );
+                put_object(client, &bucket, &key, version_body).await;
+            }
+        }
+
+        cleanup_versioned_bucket(client, &bucket).await;
+    }
 }
 
 fn main() {
@@ -796,6 +887,51 @@ fn main() {
                 let client = client_from_env();
                 let bucket = read_bucket(Path::new(&bucket_file));
                 cleanup_versioned_bucket(&client, &bucket).await;
+            });
+        }
+        "cleanup-versioned-stress" => {
+            let Some(bucket_count) = args
+                .next()
+                .and_then(|arg| arg.into_string().ok())
+                .and_then(|value| value.parse::<usize>().ok())
+            else {
+                usage();
+            };
+            let Some(keys_per_bucket) = args
+                .next()
+                .and_then(|arg| arg.into_string().ok())
+                .and_then(|value| value.parse::<usize>().ok())
+            else {
+                usage();
+            };
+            let Some(versions_per_key) = args
+                .next()
+                .and_then(|arg| arg.into_string().ok())
+                .and_then(|value| value.parse::<usize>().ok())
+            else {
+                usage();
+            };
+            let Some(key_prefix) = args.next().and_then(|arg| arg.into_string().ok()) else {
+                usage();
+            };
+            let Some(body_file) = args.next() else {
+                usage();
+            };
+            if args.next().is_some() {
+                usage();
+            }
+            run(async {
+                let client = client_from_env();
+                let body = read_body(Path::new(&body_file));
+                cleanup_versioned_stress(
+                    &client,
+                    bucket_count,
+                    keys_per_bucket,
+                    versions_per_key,
+                    &key_prefix,
+                    &body,
+                )
+                .await;
             });
         }
         _ => usage(),

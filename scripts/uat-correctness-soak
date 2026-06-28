@@ -106,6 +106,8 @@ run_step "route-change frontend restart" \
     ./scripts/uat-s3-tests "${uat_options[@]}" --smoke route-change-frontend-restart --repeat "$repeat_count"
 run_step "route-change full process restart" \
     ./scripts/uat-s3-tests "${uat_options[@]}" --smoke route-change-full-restart --repeat "$repeat_count"
+run_step "versioned cleanup DeleteBucket stress" \
+    ./scripts/uat-s3-tests "${uat_options[@]}" --smoke cleanup-versioned-stress --repeat "$repeat_count"
 run_step "PG backfill migration repeated transitions" \
     ./scripts/uat-s3-tests "${uat_options[@]}" --smoke pg-backfill-migration --repeat "$repeat_count"
 run_step "metadata PG migration repeated transitions" \
