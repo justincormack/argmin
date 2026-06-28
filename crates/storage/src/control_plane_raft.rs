@@ -336,12 +336,11 @@ impl ControlPlaneRaftLogStore {
                 "control-plane OpenRaft log store is missing vote state for committed log id {committed}"
             )));
         };
-        let committed_term = committed.committed_leader_id().term;
-        if vote.leader_id.term >= committed_term {
+        if vote.leader_id >= *committed.committed_leader_id() {
             return Ok(());
         }
         Err(raft_log_store_error(format!(
-            "control-plane OpenRaft log store vote {vote} is older than committed log id {committed}"
+            "control-plane OpenRaft log store vote {vote} does not cover committed log id {committed}"
         )))
     }
 
@@ -2247,6 +2246,15 @@ mod tests {
                 .unwrap_err();
             assert!(err.to_string().contains("missing vote state"));
 
+            let lower_node_same_term_vote = Vote::<ControlPlaneRaftLeaderId>::new_committed(3, 0);
+            RaftLogStorage::save_vote(&mut store, &lower_node_same_term_vote)
+                .await
+                .unwrap();
+            let err = RaftLogStorage::save_committed(&mut store, Some(raft_log_id(3, 1, 2)))
+                .await
+                .unwrap_err();
+            assert!(err.to_string().contains("does not cover"));
+
             let vote = Vote::<ControlPlaneRaftLeaderId>::new_committed(3, 1);
             RaftLogStorage::save_vote(&mut store, &vote).await.unwrap();
             RaftLogStorage::save_committed(&mut store, Some(raft_log_id(3, 1, 2)))
@@ -3139,6 +3147,22 @@ mod tests {
         };
         let err =
             ControlPlaneRaftLogStore::from_restart_artifact(artifact_with_stale_vote).unwrap_err();
-        assert!(err.to_string().contains("older than committed"));
+        assert!(err.to_string().contains("does not cover"));
+
+        let artifact_with_same_term_lower_node_vote = ControlPlaneRaftLogStoreRestartArtifact {
+            vote: Some(Vote::<ControlPlaneRaftLeaderId>::new_committed(3, 0)),
+            committed: Some(raft_log_id(3, 1, 2)),
+            entries: vec![
+                bootstrap_membership_entry(1),
+                blank_entry(3, 1, 1),
+                blank_entry(3, 1, 2),
+            ],
+            ..Default::default()
+        };
+        let err = ControlPlaneRaftLogStore::from_restart_artifact(
+            artifact_with_same_term_lower_node_vote,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("does not cover"));
     }
 }
