@@ -4223,12 +4223,33 @@ fn storage_rpc_resource_exhaustion_maps_to_slow_down() {
         ServerError::OperationAborted
     ));
     assert!(matches!(
+        super::map_store_error(storage::StoreError::RouteMapExpired {
+            cluster_epoch: storage::ClusterEpoch::INITIAL,
+            valid_until_ms: 1_000,
+            now_ms: 1_001,
+        }),
+        ServerError::OperationAborted
+    ));
+    assert!(matches!(
         super::map_store_error(storage::StoreError::ShardStore {
             node_id: 1,
             pg_id: 2,
             cluster_epoch: storage::ClusterEpoch::INITIAL,
             source: Box::new(storage::StoreError::MetadataCommandContention {
                 context: "pending command displaced during cleanup",
+            }),
+        }),
+        ServerError::OperationAborted
+    ));
+    assert!(matches!(
+        super::map_store_error(storage::StoreError::ShardStore {
+            node_id: 1,
+            pg_id: 2,
+            cluster_epoch: storage::ClusterEpoch::INITIAL,
+            source: Box::new(storage::StoreError::RouteMapExpired {
+                cluster_epoch: storage::ClusterEpoch::INITIAL,
+                valid_until_ms: 1_000,
+                now_ms: 1_001,
             }),
         }),
         ServerError::OperationAborted

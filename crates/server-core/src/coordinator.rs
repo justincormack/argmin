@@ -124,7 +124,8 @@ pub(super) fn metadata_error_is_command_contention(error: &storage::MetadataErro
 
 fn store_error_is_command_contention(error: &storage::StoreError) -> bool {
     match error {
-        storage::StoreError::MetadataCommandContention { .. } => true,
+        storage::StoreError::MetadataCommandContention { .. }
+        | storage::StoreError::RouteMapExpired { .. } => true,
         storage::StoreError::ShardStore { source, .. } => store_error_is_command_contention(source),
         _ => false,
     }
