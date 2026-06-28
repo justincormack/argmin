@@ -8905,7 +8905,7 @@ Metadata PG migration and backfill design notes:
   there would mostly validate the harness rather than a production persisted
   refresh path. No further Phase 11 property-test gaps are currently tracked.
 
-DeleteBucket soak-stabilization follow-up:
+Phase 11 soak/runtime-state stabilization follow-up:
 
 Recent Phase 11 soak runs have repeatedly found failures around `DeleteBucket`
 cleanup rather than ordinary route-change read/write correctness. At least
@@ -8925,8 +8925,17 @@ three recent failures were in or adjacent to bucket teardown:
   same public S3 `DeleteBucket` path, so a 500 there indicates a real retry/error
   semantics bug even if user data operations already passed.
 
-Keep a small explicit DeleteBucket close-out before treating Phase 11 as
-soak-clean:
+More recent failures have broadened the hardening scope. They still often show
+up under cleanup-heavy UAT profiles, but the root cause is not always
+`DeleteBucket` itself. Several failures have been in process-local runtime-map
+state, background worker queues, checkpoint diagnostics, and retry
+classification around refreshed routes. Treat these as Phase 11 correctness
+bugs: route-map refresh must not lose process-local state, background workers
+must stay coherent with durable metadata, and soak diagnostics must preserve
+enough state to distinguish real unfinished cleanup from stale volatile queue
+state.
+
+Keep an explicit Phase 11 close-out before treating the phase as soak-clean:
 
 1. audit all `DeleteBucket`-begin and finalizer error mappings so stale routes,
    stale metadata primaries, pending-command displacement, route-map expiry, and
@@ -8978,7 +8987,32 @@ soak-clean:
 12. completed: replace stringified remote `StorageRpc` retry classification with typed
     storage RPC error-code propagation through `StoreError`, so server-core can
     classify stale route/epoch/PG-state and command-contention responses without
-    parsing display text.
+    parsing display text;
+13. audit runtime-map refresh construction for every process-local state holder,
+    not just request-visible route data. Refreshes must preserve reclaim queues,
+    shard repair/backfill queues, metadata-command recovery single-flight state,
+    per-PG command locks, and background/admission registry identity when they
+    replace only the serving route map for the same process;
+14. add deterministic regressions for runtime-map refresh while background work
+    is queued, dequeued but not finished, pending due to durable rows, and
+    returning retryable errors. Cover both plain in-process clusters and the
+    Unix storage-node-client path used by UAT;
+15. reconcile volatile queue state with durable metadata in tests and
+    diagnostics. A bucket-delete outstanding item should not survive indefinitely
+    when there is no bucket row, no finalizer claim, no object rows, and no
+    reclaim root. If this state appears, the worker should clear it or the
+    diagnostic should identify it as a volatile queue/runtime-state bug rather
+    than an unfinished durable cleanup;
+16. extend failure preservation for cleanup/runtime-state soak failures to dump
+    durable state, not only public S3 visibility: bucket row, finalizer claim,
+    bucket write drain, pending command slot, object rows, object reclaim roots,
+    payload reclaim claims, current route-map epoch/valid-until, and queue
+    depths for the current runtime generation;
+17. define a repeatable soak gate for closing this hardening phase. At minimum,
+    `cleanup-versioned-stress --repeat 30`, the correctness soak, and one
+    restart/failover cleanup variant should pass without HTTP 500s, stuck
+    bucket-delete finalizers, unexplained `OperationAborted` growth, or stale
+    volatile queue state.
 
 Status update:
 
@@ -9036,9 +9070,18 @@ Status update:
   bucket-write-reservation client that acquired it, and the coordinator
   regression covers expiry after claim acquisition returning
   `OperationAborted` while leaving the claim releasable for a fresh retry.
+- Hardened runtime-map refresh to preserve process-local runtime state across
+  route-map replacement. Commit `36c6a4d1` carries `LocalClusterRuntimeState`
+  and the process-local registry key forward when constructing refreshed storage
+  clusters, preventing reclaim/finalizer queues and worker/admission state from
+  being tied to throwaway route-map generations. The storage regression proves a
+  bucket-delete finalizer queued before refresh is still visible, dequeueable,
+  and finishable after refresh. Follow-up coverage is still needed for the Unix
+  storage-node-client refresh path and the other process-local queues.
 - Remaining close-out work is concentrated in deterministic interleaving tests,
-  cleanup stress/diagnostics, and checking whether any foreground loops still
-  need an earlier retry boundary before route-map validity expires.
+  cleanup/runtime-state diagnostics, process-local state continuity across
+  refresh/restart, and checking whether any foreground loops still need an
+  earlier retry boundary before route-map validity expires.
 
 Exit criteria:
 
