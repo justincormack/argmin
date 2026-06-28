@@ -9441,6 +9441,11 @@ Phase 12.1 progress:
   `last_membership` agree on the final membership log id. The removed follower
   is not required to apply the final removal entry after OpenRaft has removed it
   from the voter set.
+- Extended the OpenRaft authority status/wait boundary. The wrapper now exposes
+  applied-index waiting and reports both OpenRaft's effective voter set and the
+  state machine's applied voter set, so public smokes can verify replicated
+  membership progress through the authority object instead of raw OpenRaft
+  state reads.
 - Isolated the public OpenRaft smokes with distinct cluster names so the normal
   parallel `control_plane_raft` test group cannot share OpenRaft test identity
   while still exercising the real client-write and read-index paths.

@@ -5,6 +5,7 @@ use std::io::{self, Cursor};
 use std::ops::{Bound, RangeBounds};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Duration;
 
 use futures_util::{Stream, StreamExt};
 use openraft::impls::leader_id_adv::LeaderId;
@@ -114,6 +115,10 @@ pub struct ControlPlaneRaftAuthorityStatus {
     last_log_id: Option<LogIdOf<ControlPlaneRaftTypeConfig>>,
     committed: Option<LogIdOf<ControlPlaneRaftTypeConfig>>,
     applied: Option<LogIdOf<ControlPlaneRaftTypeConfig>>,
+    effective_membership_log_id: Option<LogIdOf<ControlPlaneRaftTypeConfig>>,
+    effective_voters: BTreeSet<ControlPlaneRaftNodeId>,
+    applied_membership_log_id: Option<LogIdOf<ControlPlaneRaftTypeConfig>>,
+    applied_voters: BTreeSet<ControlPlaneRaftNodeId>,
 }
 
 impl ControlPlaneRaftAuthorityStatus {
@@ -140,6 +145,26 @@ impl ControlPlaneRaftAuthorityStatus {
     #[must_use]
     pub fn applied(&self) -> Option<LogIdOf<ControlPlaneRaftTypeConfig>> {
         self.applied
+    }
+
+    #[must_use]
+    pub fn effective_membership_log_id(&self) -> Option<LogIdOf<ControlPlaneRaftTypeConfig>> {
+        self.effective_membership_log_id
+    }
+
+    #[must_use]
+    pub fn effective_voters(&self) -> &BTreeSet<ControlPlaneRaftNodeId> {
+        &self.effective_voters
+    }
+
+    #[must_use]
+    pub fn applied_membership_log_id(&self) -> Option<LogIdOf<ControlPlaneRaftTypeConfig>> {
+        self.applied_membership_log_id
+    }
+
+    #[must_use]
+    pub fn applied_voters(&self) -> &BTreeSet<ControlPlaneRaftNodeId> {
+        &self.applied_voters
     }
 }
 
@@ -185,6 +210,20 @@ impl ControlPlaneRaftAuthority {
         Ok(response.log_id)
     }
 
+    pub async fn wait_for_applied_index_at_least(
+        &self,
+        index: u64,
+        timeout: Duration,
+        message: &'static str,
+    ) -> Result<(), ControlPlaneError> {
+        self.raft
+            .wait(Some(timeout))
+            .applied_index_at_least(Some(index), message)
+            .await
+            .map(|_| ())
+            .map_err(|error| openraft_remote_error("wait-applied-index", error))
+    }
+
     pub async fn submit_control_plane_command(
         &self,
         command: ControlPlaneCommand,
@@ -202,21 +241,27 @@ impl ControlPlaneRaftAuthority {
     pub async fn status(&self) -> Result<ControlPlaneRaftAuthorityStatus, ControlPlaneError> {
         let node_id = *self.raft.node_id();
         let current_leader = self.raft.current_leader().await;
-        let (last_log_id, committed) = self
+        let (last_log_id, committed, effective_membership_log_id, effective_voters) = self
             .raft
             .with_raft_state(|state| {
+                let effective_membership = state.membership_state.effective();
                 (
                     state.log_ids.last().cloned(),
                     state.local_committed().cloned(),
+                    *effective_membership.log_id(),
+                    effective_membership.membership().voter_ids().collect(),
                 )
             })
             .await
             .map_err(|error| openraft_remote_error("status raft-state read", error))?;
-        let applied = self
+        let (applied, applied_membership_log_id, applied_voters) = self
             .raft
             .with_state_machine(|state_machine| {
                 let last_applied = state_machine.last_applied();
-                Box::pin(async move { last_applied })
+                let membership = state_machine.last_membership();
+                let membership_log_id = *membership.log_id();
+                let voters = membership.membership().voter_ids().collect();
+                Box::pin(async move { (last_applied, membership_log_id, voters) })
             })
             .await
             .map_err(|error| openraft_remote_error("status state-machine read", error))?;
@@ -226,6 +271,10 @@ impl ControlPlaneRaftAuthority {
             last_log_id,
             committed,
             applied,
+            effective_membership_log_id,
+            effective_voters,
+            applied_membership_log_id,
+            applied_voters,
         })
     }
 
@@ -2980,12 +3029,9 @@ mod tests {
             assert!(authority.is_initialized().await.unwrap());
 
             let bootstrap_log_id = raft_log_id(0, 1, 0);
-            let raft_state = authority
-                .raft()
-                .with_raft_state(|state| *state.membership_state.effective().log_id())
-                .await
-                .unwrap();
-            assert_eq!(raft_state, Some(bootstrap_log_id));
+            let status = authority.status().await.unwrap();
+            assert_eq!(status.effective_membership_log_id(), Some(bootstrap_log_id));
+            assert_eq!(status.effective_voters(), &BTreeSet::from([1]));
 
             let entries = RaftLogReader::try_get_log_entries(&mut log_store, 0..1)
                 .await
@@ -3070,6 +3116,8 @@ mod tests {
             assert_eq!(status.last_log_id(), Some(rejected_log_id));
             assert_eq!(status.committed(), Some(rejected_log_id));
             assert_eq!(status.applied(), Some(rejected_log_id));
+            assert_eq!(status.effective_voters(), &BTreeSet::from([1]));
+            assert_eq!(status.applied_voters(), &BTreeSet::from([1]));
 
             authority.shutdown().await.unwrap();
         });
@@ -3293,10 +3341,9 @@ mod tests {
             ));
 
             authority2
-                .raft()
-                .wait(Some(Duration::from_secs(1)))
-                .applied_index_at_least(
-                    Some(write.log_id().index()),
+                .wait_for_applied_index_at_least(
+                    write.log_id().index(),
+                    Duration::from_secs(1),
                     "two-node follower applied client write",
                 )
                 .await
@@ -3366,10 +3413,9 @@ mod tests {
             ));
 
             authority2
-                .raft()
-                .wait(Some(Duration::from_secs(1)))
-                .applied_index_at_least(
-                    Some(rejected.log_id().index()),
+                .wait_for_applied_index_at_least(
+                    rejected.log_id().index(),
+                    Duration::from_secs(1),
                     "two-node follower applied rejected command",
                 )
                 .await
@@ -3425,46 +3471,21 @@ mod tests {
                 .await
                 .unwrap();
             authority1
-                .raft()
-                .wait(Some(Duration::from_secs(1)))
-                .applied_index_at_least(
-                    Some(membership_log_id.index()),
+                .wait_for_applied_index_at_least(
+                    membership_log_id.index(),
+                    Duration::from_secs(1),
                     "two-node leader applied membership change",
                 )
                 .await
                 .unwrap();
-            let raft_membership = authority1
-                .raft()
-                .with_raft_state(|state| {
-                    let log_id = *state.membership_state.effective().log_id();
-                    let voters = state
-                        .membership_state
-                        .effective()
-                        .membership()
-                        .voter_ids()
-                        .collect::<BTreeSet<_>>();
-                    (log_id, voters)
-                })
-                .await
-                .unwrap();
-            assert_eq!(raft_membership.0, Some(membership_log_id));
-            assert_eq!(raft_membership.1, BTreeSet::from([501]));
-
-            let state_machine_membership = authority1
-                .raft()
-                .with_state_machine(|state_machine| {
-                    let log_id = *state_machine.last_membership().log_id();
-                    let voters = state_machine
-                        .last_membership()
-                        .membership()
-                        .voter_ids()
-                        .collect::<BTreeSet<_>>();
-                    Box::pin(async move { (log_id, voters) })
-                })
-                .await
-                .unwrap();
-            assert_eq!(state_machine_membership.0, Some(membership_log_id));
-            assert_eq!(state_machine_membership.1, BTreeSet::from([501]));
+            let status = authority1.status().await.unwrap();
+            assert_eq!(
+                status.effective_membership_log_id(),
+                Some(membership_log_id)
+            );
+            assert_eq!(status.effective_voters(), &BTreeSet::from([501]));
+            assert_eq!(status.applied_membership_log_id(), Some(membership_log_id));
+            assert_eq!(status.applied_voters(), &BTreeSet::from([501]));
 
             authority1.shutdown().await.unwrap();
             authority2.shutdown().await.unwrap();
@@ -3498,10 +3519,9 @@ mod tests {
                 )
             ));
             authority2
-                .raft()
-                .wait(Some(Duration::from_secs(1)))
-                .applied_index_at_least(
-                    Some(write.log_id().index()),
+                .wait_for_applied_index_at_least(
+                    write.log_id().index(),
+                    Duration::from_secs(1),
                     "two-node follower applied before read-index",
                 )
                 .await
