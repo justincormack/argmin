@@ -260,6 +260,24 @@ impl ControlPlaneRaftLogStore {
         }
         Self::validate_known_log_id(inner, "commit", committed)
     }
+
+    fn validate_vote_update(
+        inner: &ControlPlaneRaftLogStoreInner,
+        vote: VoteOf<ControlPlaneRaftTypeConfig>,
+    ) -> Result<(), io::Error> {
+        let Some(previous_vote) = inner.vote else {
+            return Ok(());
+        };
+        if matches!(
+            vote.partial_cmp(&previous_vote),
+            Some(std::cmp::Ordering::Equal | std::cmp::Ordering::Greater)
+        ) {
+            return Ok(());
+        }
+        Err(raft_log_store_error(format!(
+            "cannot regress control-plane OpenRaft vote from {previous_vote} to {vote}"
+        )))
+    }
 }
 
 impl ControlPlaneRaftLogStoreInner {
@@ -336,7 +354,9 @@ impl RaftLogStorage<ControlPlaneRaftTypeConfig> for ControlPlaneRaftLogStore {
         &mut self,
         vote: &VoteOf<ControlPlaneRaftTypeConfig>,
     ) -> Result<(), io::Error> {
-        self.lock()?.vote = Some(*vote);
+        let mut inner = self.lock()?;
+        Self::validate_vote_update(&inner, *vote)?;
+        inner.vote = Some(*vote);
         Ok(())
     }
 
@@ -1414,6 +1434,56 @@ mod tests {
             let log_state = RaftLogStorage::get_log_state(&mut store).await.unwrap();
             assert_eq!(log_state.last_purged_log_id, None);
             assert_eq!(log_state.last_log_id, Some(raft_log_id(3, 1, 3)));
+        });
+    }
+
+    #[test]
+    fn control_plane_raft_log_store_rejects_vote_regression() {
+        ControlPlaneRaftTypeConfig::run(async {
+            let mut store = ControlPlaneRaftLogStore::empty();
+            let vote = Vote::<ControlPlaneRaftLeaderId>::new(3, 2);
+
+            RaftLogStorage::save_vote(&mut store, &vote).await.unwrap();
+
+            let lower_term = Vote::<ControlPlaneRaftLeaderId>::new(2, 99);
+            let err = RaftLogStorage::save_vote(&mut store, &lower_term)
+                .await
+                .unwrap_err();
+            assert!(err.to_string().contains("regress"));
+            assert_eq!(
+                RaftLogReader::read_vote(&mut store).await.unwrap(),
+                Some(vote)
+            );
+
+            let lower_node_same_term = Vote::<ControlPlaneRaftLeaderId>::new(3, 1);
+            let err = RaftLogStorage::save_vote(&mut store, &lower_node_same_term)
+                .await
+                .unwrap_err();
+            assert!(err.to_string().contains("regress"));
+
+            let committed = Vote::<ControlPlaneRaftLeaderId>::new_committed(3, 2);
+            RaftLogStorage::save_vote(&mut store, &committed)
+                .await
+                .unwrap();
+
+            let uncommitted_same_leader = Vote::<ControlPlaneRaftLeaderId>::new(3, 2);
+            let err = RaftLogStorage::save_vote(&mut store, &uncommitted_same_leader)
+                .await
+                .unwrap_err();
+            assert!(err.to_string().contains("regress"));
+            assert_eq!(
+                RaftLogReader::read_vote(&mut store).await.unwrap(),
+                Some(committed)
+            );
+
+            let higher = Vote::<ControlPlaneRaftLeaderId>::new(4, 1);
+            RaftLogStorage::save_vote(&mut store, &higher)
+                .await
+                .unwrap();
+            assert_eq!(
+                RaftLogReader::read_vote(&mut store).await.unwrap(),
+                Some(higher)
+            );
         });
     }
 

@@ -9125,6 +9125,12 @@ Phase 12.1 progress:
   operations such as `truncate_after(None)` in cases where Argmin has already
   recorded a committed restart gate; the current spike does not run
   `openraft::testing::log::suite` against this guarded in-memory store.
+- Tightened the in-memory OpenRaft log store's durable-vote boundary.
+  `save_vote` now rejects vote regression according to OpenRaft's `Vote`
+  partial-order contract, including lower terms, lower same-term leader ids,
+  and attempts to replace a committed vote with the same uncommitted vote. This
+  keeps the spike store aligned with OpenRaft's rule that a node grants and
+  persists only votes greater than or equal to the last vote it has seen.
 - Added a single-node OpenRaft initialization smoke over the in-memory log
   store and state-machine wrapper. The test uses a deliberately unreachable
   network factory, constructs an actual `Raft` instance, calls
