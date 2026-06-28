@@ -812,15 +812,105 @@ impl RaftStateMachine<ControlPlaneRaftTypeConfig> for ControlPlaneRaftStateMachi
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::future::Future;
+    use std::sync::Arc;
 
     use super::*;
     use futures_util::stream;
+    use openraft::errors::{RPCError, ReplicationClosed, StreamingError, Unreachable};
+    use openraft::network::{RPCOption, RaftNetworkFactory, RaftNetworkV2};
+    use openraft::raft::{
+        AppendEntriesRequest, AppendEntriesResponse, SnapshotResponse, VoteRequest, VoteResponse,
+    };
     use openraft::type_config::TypeConfigExt;
-    use openraft::Membership;
+    use openraft::{AnyError, Config, Membership, Raft};
 
     use crate::control_plane::NodeAvailabilityState;
     use crate::types::PgId;
+
+    #[derive(Debug, Clone, Copy, Default)]
+    struct UnreachableRaftNetworkFactory;
+
+    impl RaftNetworkFactory<ControlPlaneRaftTypeConfig> for UnreachableRaftNetworkFactory {
+        type Network = UnreachableRaftNetwork;
+
+        async fn new_client(
+            &mut self,
+            target: ControlPlaneRaftNodeId,
+            _node: &BasicNode,
+        ) -> Self::Network {
+            UnreachableRaftNetwork { target }
+        }
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    struct UnreachableRaftNetwork {
+        target: ControlPlaneRaftNodeId,
+    }
+
+    impl UnreachableRaftNetwork {
+        fn unreachable(&self, rpc_name: &'static str) -> Unreachable<ControlPlaneRaftTypeConfig> {
+            Unreachable::new(&AnyError::error(format!(
+                "test network should not send {rpc_name} to node {}",
+                self.target
+            )))
+        }
+    }
+
+    impl RaftNetworkV2<ControlPlaneRaftTypeConfig> for UnreachableRaftNetwork {
+        async fn append_entries(
+            &mut self,
+            _rpc: AppendEntriesRequest<ControlPlaneRaftTypeConfig>,
+            _option: RPCOption,
+        ) -> Result<
+            AppendEntriesResponse<ControlPlaneRaftTypeConfig>,
+            RPCError<ControlPlaneRaftTypeConfig>,
+        > {
+            Err(RPCError::Unreachable(self.unreachable("append_entries")))
+        }
+
+        async fn vote(
+            &mut self,
+            _rpc: VoteRequest<ControlPlaneRaftTypeConfig>,
+            _option: RPCOption,
+        ) -> Result<VoteResponse<ControlPlaneRaftTypeConfig>, RPCError<ControlPlaneRaftTypeConfig>>
+        {
+            Err(RPCError::Unreachable(self.unreachable("vote")))
+        }
+
+        async fn full_snapshot(
+            &mut self,
+            _vote: VoteOf<ControlPlaneRaftTypeConfig>,
+            _snapshot: SnapshotOf<ControlPlaneRaftTypeConfig>,
+            _cancel: impl Future<Output = ReplicationClosed> + OptionalSend + 'static,
+            _option: RPCOption,
+        ) -> Result<
+            SnapshotResponse<ControlPlaneRaftTypeConfig>,
+            StreamingError<ControlPlaneRaftTypeConfig>,
+        > {
+            Err(StreamingError::Unreachable(
+                self.unreachable("full_snapshot"),
+            ))
+        }
+    }
+
+    fn test_raft_config() -> Arc<Config> {
+        Arc::new(
+            Config {
+                cluster_name: "control-plane-raft-test".to_string(),
+                heartbeat_interval: 50,
+                election_timeout_min: 150,
+                election_timeout_max: 300,
+                enable_tick: false,
+                enable_heartbeat: false,
+                enable_elect: false,
+                ..Default::default()
+            }
+            .validate()
+            .unwrap(),
+        )
+    }
 
     fn raft_log_id(term: u64, node_id: u64, index: u64) -> LogIdOf<ControlPlaneRaftTypeConfig> {
         LogId::new(LeaderId { term, node_id }, index)
@@ -1260,6 +1350,44 @@ mod tests {
             let log_state = RaftLogStorage::get_log_state(&mut store).await.unwrap();
             assert_eq!(log_state.last_purged_log_id, None);
             assert_eq!(log_state.last_log_id, Some(raft_log_id(3, 1, 3)));
+        });
+    }
+
+    #[test]
+    fn control_plane_openraft_single_node_initialize_uses_bootstrap_membership() {
+        ControlPlaneRaftTypeConfig::run(async {
+            let mut log_store = ControlPlaneRaftLogStore::empty();
+            let state_machine = ControlPlaneRaftStateMachine::empty();
+            let raft = Raft::<ControlPlaneRaftTypeConfig, ControlPlaneRaftStateMachine>::new(
+                1,
+                test_raft_config(),
+                UnreachableRaftNetworkFactory,
+                log_store.clone(),
+                state_machine,
+            )
+            .await
+            .unwrap();
+
+            raft.initialize(BTreeMap::from([(1, BasicNode::new("node-1"))]))
+                .await
+                .unwrap();
+            assert!(raft.is_initialized().await.unwrap());
+
+            let bootstrap_log_id = raft_log_id(0, 1, 0);
+            let raft_state = raft
+                .with_raft_state(|state| *state.membership_state.effective().log_id())
+                .await
+                .unwrap();
+            assert_eq!(raft_state, Some(bootstrap_log_id));
+
+            let entries = RaftLogReader::try_get_log_entries(&mut log_store, 0..1)
+                .await
+                .unwrap();
+            assert_eq!(entries.len(), 1);
+            assert_eq!(entries[0].log_id, bootstrap_log_id);
+            assert!(matches!(entries[0].payload, EntryPayload::Membership(_)));
+
+            raft.shutdown().await.unwrap();
         });
     }
 

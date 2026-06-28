@@ -9115,6 +9115,14 @@ Phase 12.1 progress:
   zero a valid durable control-plane command index. This is intentionally
   scaffolding only: it does not choose the production durable Raft-log format
   or its fsync/batching policy.
+- Added a single-node OpenRaft initialization smoke over the in-memory log
+  store and state-machine wrapper. The test uses a deliberately unreachable
+  network factory, constructs an actual `Raft` instance, calls
+  `Raft::initialize`, and verifies that OpenRaft's `(term=0, index=0)`
+  bootstrap membership entry is persisted and reflected as the effective
+  membership. This pins the previous index-zero compatibility issue at the
+  public OpenRaft API boundary; production networking, durable Raft-log
+  storage, and multi-node replication remain future slices.
 
 1. define the replicated control-plane state machine:
    - state includes cluster epoch, PG count, PG state, PG acting sets, node
