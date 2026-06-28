@@ -567,6 +567,7 @@ impl ControlPlaneRaftStateMachine {
         entry: ControlPlaneRaftEntry,
     ) -> Result<ControlPlaneRaftApplyResponse, ControlPlaneError> {
         let raft_log_id = entry.log_id;
+        self.validate_apply_position(raft_log_id)?;
         match entry.payload {
             EntryPayload::Blank => {
                 let control_plane_log_id = Self::control_plane_log_id_for_entry(raft_log_id)?;
@@ -611,6 +612,61 @@ impl ControlPlaneRaftStateMachine {
                 message: format!("invalid OpenRaft log id for control-plane entry: {raft_log_id}"),
             }
         })
+    }
+
+    fn validate_apply_position(
+        &self,
+        raft_log_id: LogIdOf<ControlPlaneRaftTypeConfig>,
+    ) -> Result<(), ControlPlaneError> {
+        let Some(last_applied) = self.last_applied else {
+            if is_openraft_bootstrap_log_id(raft_log_id) {
+                return Ok(());
+            }
+            if raft_log_id.index() == 0 {
+                return Err(ControlPlaneError::CommandDecode {
+                    message: format!(
+                        "invalid OpenRaft log id for first control-plane entry: {raft_log_id}"
+                    ),
+                });
+            }
+            if raft_log_id.index() != 1 {
+                return Err(ControlPlaneError::ControlPlaneLogIndexMismatch {
+                    expected_index: 1,
+                    actual_index: raft_log_id.index(),
+                });
+            }
+            return Ok(());
+        };
+
+        let expected_index = last_applied.index().checked_add(1).ok_or(
+            ControlPlaneError::ControlPlaneLogIndexOverflow {
+                index: last_applied.index(),
+            },
+        )?;
+        if raft_log_id.index() != expected_index {
+            return Err(ControlPlaneError::ControlPlaneLogIndexMismatch {
+                expected_index,
+                actual_index: raft_log_id.index(),
+            });
+        }
+        if raft_log_id.committed_leader_id().term < last_applied.committed_leader_id().term {
+            return Err(ControlPlaneError::ControlPlaneLogTermRegression {
+                previous_term: last_applied.committed_leader_id().term,
+                actual_term: raft_log_id.committed_leader_id().term,
+                index: raft_log_id.index(),
+            });
+        }
+        if raft_log_id.committed_leader_id().term == last_applied.committed_leader_id().term
+            && raft_log_id.committed_leader_id().node_id
+                < last_applied.committed_leader_id().node_id
+        {
+            return Err(ControlPlaneError::CommandDecode {
+                message: format!(
+                    "OpenRaft log id {raft_log_id} is not after last applied log id {last_applied}"
+                ),
+            });
+        }
+        Ok(())
     }
 
     pub fn build_snapshot(
@@ -1162,6 +1218,54 @@ mod tests {
         assert_eq!(state_machine.last_applied(), None);
         assert_eq!(state_machine.last_membership().log_id(), &None);
         assert_eq!(state_machine.inner().last_applied(), None);
+    }
+
+    #[test]
+    fn control_plane_raft_state_machine_rejects_out_of_order_apply() {
+        let mut state_machine = ControlPlaneRaftStateMachine::empty();
+
+        let err = state_machine.apply_entry(blank_entry(3, 1, 2)).unwrap_err();
+        assert!(matches!(
+            err,
+            ControlPlaneError::ControlPlaneLogIndexMismatch {
+                expected_index: 1,
+                actual_index: 2,
+            }
+        ));
+        assert_eq!(state_machine.last_applied(), None);
+
+        state_machine
+            .apply_entry(bootstrap_membership_entry(1))
+            .unwrap();
+        let err = state_machine
+            .apply_entry(bootstrap_membership_entry(1))
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ControlPlaneError::ControlPlaneLogIndexMismatch {
+                expected_index: 1,
+                actual_index: 0,
+            }
+        ));
+        assert_eq!(state_machine.last_applied(), Some(raft_log_id(0, 1, 0)));
+
+        state_machine.apply_entry(blank_entry(3, 2, 1)).unwrap();
+        let err = state_machine
+            .apply_entry(blank_entry(2, 99, 2))
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ControlPlaneError::ControlPlaneLogTermRegression {
+                previous_term: 3,
+                actual_term: 2,
+                index: 2,
+            }
+        ));
+        assert_eq!(state_machine.last_applied(), Some(raft_log_id(3, 2, 1)));
+
+        let err = state_machine.apply_entry(blank_entry(3, 1, 2)).unwrap_err();
+        assert!(matches!(err, ControlPlaneError::CommandDecode { .. }));
+        assert_eq!(state_machine.last_applied(), Some(raft_log_id(3, 2, 1)));
     }
 
     #[test]

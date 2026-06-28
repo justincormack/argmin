@@ -9131,6 +9131,14 @@ Phase 12.1 progress:
   and attempts to replace a committed vote with the same uncommitted vote. This
   keeps the spike store aligned with OpenRaft's rule that a node grants and
   persists only votes greater than or equal to the last vote it has seen.
+- Tightened the in-memory OpenRaft state-machine wrapper's apply cursor. Before
+  dispatching blank, membership, or normal entries, the wrapper now rejects
+  first-entry gaps, duplicate/replayed bootstrap entries, lower-term next
+  entries, and lower same-term leader ids at the full OpenRaft
+  `(term,node,index)` boundary. The dependency-free command adapter still
+  enforces the inner `ControlPlaneLogId` sequence for normal/no-op entries, but
+  the wrapper now also protects OpenRaft metadata-only entries and the
+  `(term=0,index=0)` bootstrap bypass.
 - Added a single-node OpenRaft initialization smoke over the in-memory log
   store and state-machine wrapper. The test uses a deliberately unreachable
   network factory, constructs an actual `Raft` instance, calls
