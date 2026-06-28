@@ -8996,6 +8996,12 @@ Status update:
   route map validity deadline at their loop gates, so a route map that expires
   while cleanup is in progress returns a typed retryable route-map expiry
   instead of relying only on the next metadata-primary lookup to notice it.
+- The shared `s3-tests`/UAT `delete_bucket_retrying_operation_aborted` cleanup
+  helper now keeps retry counts and, on final failure, dumps bucket-visible
+  diagnostics from `HeadBucket`, `ListObjectsV2`, `ListObjectVersions`, and
+  `ListMultipartUploads`. This does not hide local `InternalError`; it makes the
+  failure report show whether cleanup still saw live objects, versions,
+  delete markers, or MPUs when `DeleteBucket` failed.
 - Remaining close-out work is concentrated in deterministic interleaving tests,
   cleanup stress/diagnostics, and checking whether any foreground loops still
   need an earlier retry boundary before route-map validity expires.

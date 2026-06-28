@@ -1900,8 +1900,11 @@ fn object_identifier_for_listed_version(key: &str, version_id: Option<&str>) -> 
 pub async fn delete_bucket_retrying_operation_aborted(client: &Client, bucket: &str) {
     const RETRY_DELAY: Duration = Duration::from_millis(100);
     let deadline = std::time::Instant::now() + configured_test_timeout();
+    let mut attempts = 0u32;
+    let mut retryable_errors = 0u32;
 
     loop {
+        attempts += 1;
         match client.delete_bucket().bucket(bucket).send().await {
             Ok(_) => return,
             Err(err) if is_bucket_already_absent(&err) => return,
@@ -1911,11 +1914,116 @@ pub async fn delete_bucket_retrying_operation_aborted(client: &Client, bucket: &
                     || is_bucket_not_empty(&err))
                     && std::time::Instant::now() < deadline =>
             {
+                retryable_errors += 1;
                 tokio::time::sleep(RETRY_DELAY).await;
             }
-            Err(err) => panic!("delete bucket: {err:?}"),
+            Err(err) => {
+                let context = delete_bucket_failure_context(client, bucket).await;
+                panic!(
+                    "delete bucket after {attempts} attempt(s), {retryable_errors} retryable error(s): {err:?}\n{context}"
+                );
+            }
         }
     }
+}
+
+async fn delete_bucket_failure_context(client: &Client, bucket: &str) -> String {
+    let mut context = Vec::new();
+    context.push(format!("delete bucket failure context: bucket={bucket}"));
+
+    match client.head_bucket().bucket(bucket).send().await {
+        Ok(_) => context.push("head_bucket=exists".to_string()),
+        Err(err) => context.push(format!("head_bucket={}", describe_sdk_error(&err))),
+    }
+
+    match client
+        .list_objects_v2()
+        .bucket(bucket)
+        .max_keys(10)
+        .send()
+        .await
+    {
+        Ok(resp) => {
+            let keys = resp
+                .contents()
+                .iter()
+                .filter_map(|object| object.key())
+                .take(10)
+                .collect::<Vec<_>>();
+            context.push(format!(
+                "list_objects_v2 key_count={} truncated={} sample_keys={keys:?}",
+                resp.key_count().unwrap_or_default(),
+                resp.is_truncated().unwrap_or(false)
+            ));
+        }
+        Err(err) => context.push(format!("list_objects_v2={}", describe_sdk_error(&err))),
+    }
+
+    match client
+        .list_object_versions()
+        .bucket(bucket)
+        .max_keys(10)
+        .send()
+        .await
+    {
+        Ok(resp) => {
+            let versions = resp
+                .versions()
+                .iter()
+                .filter_map(|version| version.key().map(|key| (key, version.version_id())))
+                .take(10)
+                .collect::<Vec<_>>();
+            let delete_markers = resp
+                .delete_markers()
+                .iter()
+                .filter_map(|marker| marker.key().map(|key| (key, marker.version_id())))
+                .take(10)
+                .collect::<Vec<_>>();
+            context.push(format!(
+                "list_object_versions truncated={} sample_versions={versions:?} sample_delete_markers={delete_markers:?}",
+                resp.is_truncated().unwrap_or(false)
+            ));
+        }
+        Err(err) => context.push(format!("list_object_versions={}", describe_sdk_error(&err))),
+    }
+
+    match client
+        .list_multipart_uploads()
+        .bucket(bucket)
+        .max_uploads(10)
+        .send()
+        .await
+    {
+        Ok(resp) => {
+            let uploads = resp
+                .uploads()
+                .iter()
+                .filter_map(|upload| upload.key().map(|key| (key, upload.upload_id())))
+                .take(10)
+                .collect::<Vec<_>>();
+            context.push(format!(
+                "list_multipart_uploads truncated={} sample_uploads={uploads:?}",
+                resp.is_truncated().unwrap_or(false)
+            ));
+        }
+        Err(err) => context.push(format!(
+            "list_multipart_uploads={}",
+            describe_sdk_error(&err)
+        )),
+    }
+
+    context.join("\n")
+}
+
+fn describe_sdk_error<E: ProvideErrorMetadata + std::fmt::Debug>(
+    err: &aws_sdk_s3::error::SdkError<E>,
+) -> String {
+    let code = s3_error_code(err).unwrap_or("<unknown>");
+    let message = err
+        .as_service_error()
+        .and_then(ProvideErrorMetadata::message)
+        .unwrap_or("<no message>");
+    format!("code={code} message={message:?} debug={err:?}")
 }
 
 pub async fn put_object_retrying_operation_aborted(
