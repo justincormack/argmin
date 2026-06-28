@@ -8558,6 +8558,44 @@ fn delete_bucket_expired_route_map_maps_to_operation_aborted() {
 }
 
 #[test]
+fn delete_bucket_route_map_expiry_after_drain_maps_to_operation_aborted() {
+    let tmp = test_util::tempdir();
+    let bucket = "bucket-delete-mid-expired-route-map";
+    let storage_cluster = open_test_storage_cluster(tmp.path(), &[0]);
+    let coord = setup_direct_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
+    coord
+        .create_bucket_for_owner("default-owner", bucket, false)
+        .unwrap();
+
+    let valid_until = storage::clock::wall_time_millis().saturating_add(250);
+    let expiring_cluster =
+        same_store_cluster_with_route_map_validity(&storage_cluster, tmp.path(), Some(valid_until));
+    let expiring_coord = setup_direct_coordinator_with_storage_cluster(expiring_cluster);
+
+    let _storage_serial = STORAGE_TEST_HOOK_SERIAL
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap();
+    let _hook_guard = install_bucket_scoped_test_hooks(BucketScopedTestHooks {
+        target: Some(trusted_bucket_name(bucket)),
+        after_begin_bucket_delete_drain: Some(Arc::new(move || {
+            while storage::clock::wall_time_millis() <= valid_until {
+                thread::sleep(Duration::from_millis(5));
+            }
+        })),
+        ..BucketScopedTestHooks::default()
+    });
+
+    let err = delete_bucket_test(&expiring_coord, bucket).unwrap_err();
+    assert!(matches!(err, ServerError::OperationAborted), "{err:?}");
+
+    let info = storage_cluster
+        .head_bucket_info(&trusted_bucket_name(bucket))
+        .unwrap();
+    assert_eq!(info.state, storage::BucketState::Active);
+}
+
+#[test]
 fn delete_bucket_stale_raw_authorization_does_not_delete_recreated_bucket() {
     let tmp = test_util::tempdir();
     let bucket = "bucket-delete-stale-auth-recreate";

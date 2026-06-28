@@ -2629,6 +2629,7 @@ impl super::StorageCluster {
         started: Option<std::time::Instant>,
         context: &'static str,
     ) -> Result<(), BucketWriteDrainError> {
+        self.require_route_map_valid_at(crate::clock::current_time_millis())?;
         let Some(started) = started else {
             return Ok(());
         };
@@ -3980,6 +3981,7 @@ impl super::StorageCluster {
         work_budget: &mut super::RequestWorkBudget,
     ) -> Result<BucketDeleteFinalizeOutcome, BucketWriteDrainError> {
         loop {
+            self.require_route_map_valid_at(crate::clock::current_time_millis())?;
             work_budget.check("bucket delete finalize work budget exhausted")?;
             if let Some(source) = self.bucket_visible_data_source(bucket, false)? {
                 let _ = observability::event(
