@@ -114,6 +114,12 @@ pub struct ControlPlaneRaftLogStoreRestartArtifact {
     entries: Vec<ControlPlaneRaftEntry>,
 }
 
+#[derive(Debug, Clone)]
+pub struct ControlPlaneRaftRestartArtifact {
+    log_store: ControlPlaneRaftLogStoreRestartArtifact,
+    state_machine: ControlPlaneRaftStateMachineRestartArtifact,
+}
+
 #[derive(Debug, Default)]
 struct ControlPlaneRaftLogStoreInner {
     vote: Option<VoteOf<ControlPlaneRaftTypeConfig>>,
@@ -326,6 +332,108 @@ impl ControlPlaneRaftLogStoreInner {
             .last_key_value()
             .map(|(_, entry)| entry.log_id)
             .or(self.last_purged_log_id)
+    }
+}
+
+impl ControlPlaneRaftRestartArtifact {
+    pub fn capture(
+        log_store: &ControlPlaneRaftLogStore,
+        state_machine: &ControlPlaneRaftStateMachine,
+    ) -> Result<Self, io::Error> {
+        Ok(Self {
+            log_store: log_store.export_restart_artifact()?,
+            state_machine: state_machine.export_restart_artifact(),
+        })
+    }
+
+    pub fn restore(
+        self,
+    ) -> Result<(ControlPlaneRaftLogStore, ControlPlaneRaftStateMachine), io::Error> {
+        let log_store = ControlPlaneRaftLogStore::from_restart_artifact(self.log_store.clone())?;
+        let state_machine =
+            ControlPlaneRaftStateMachine::from_restart_artifact(self.state_machine.clone())
+                .map_err(|error| {
+                    control_plane_error_to_io_error("OpenRaft state-machine restart", error)
+                })?;
+        Self::validate_log_store_state_machine_pair(&self.log_store, &self.state_machine)?;
+        Ok((log_store, state_machine))
+    }
+
+    fn validate_log_store_state_machine_pair(
+        log_store: &ControlPlaneRaftLogStoreRestartArtifact,
+        state_machine: &ControlPlaneRaftStateMachineRestartArtifact,
+    ) -> Result<(), io::Error> {
+        if let Some(last_purged_log_id) = log_store.last_purged_log_id {
+            match state_machine.last_applied {
+                Some(last_applied) if last_applied.index() > last_purged_log_id.index() => {}
+                Some(last_applied) if last_applied == last_purged_log_id => {}
+                Some(last_applied) => {
+                    return Err(raft_log_store_error(format!(
+                        "control-plane OpenRaft state-machine applied log id {last_applied} is behind purged boundary {last_purged_log_id}"
+                    )));
+                }
+                None => {
+                    return Err(raft_log_store_error(format!(
+                        "control-plane OpenRaft state-machine has no applied log id but log is purged through {last_purged_log_id}"
+                    )));
+                }
+            }
+        }
+
+        let Some(last_applied) = state_machine.last_applied else {
+            return Ok(());
+        };
+        let Some(known_applied) =
+            Self::log_store_artifact_log_id_at(log_store, last_applied.index())
+        else {
+            return Err(raft_log_store_error(format!(
+                "control-plane OpenRaft state-machine applied log id {last_applied} is not retained or purged in the log store"
+            )));
+        };
+        if known_applied != last_applied {
+            return Err(raft_log_store_error(format!(
+                "control-plane OpenRaft state-machine applied log id {last_applied} does not match log-store log id {known_applied}"
+            )));
+        }
+
+        if is_openraft_bootstrap_log_id(last_applied) {
+            return Ok(());
+        }
+        let Some(committed) = log_store.committed else {
+            return Err(raft_log_store_error(format!(
+                "control-plane OpenRaft state-machine applied log id {last_applied} has no committed restart gate"
+            )));
+        };
+        if last_applied.index() > committed.index() {
+            return Err(raft_log_store_error(format!(
+                "control-plane OpenRaft state-machine applied log id {last_applied} is after committed restart gate {committed}"
+            )));
+        }
+        if last_applied.index() == committed.index() && last_applied != committed {
+            return Err(raft_log_store_error(format!(
+                "control-plane OpenRaft state-machine applied log id {last_applied} conflicts with committed restart gate {committed}"
+            )));
+        }
+        Ok(())
+    }
+
+    fn log_store_artifact_log_id_at(
+        log_store: &ControlPlaneRaftLogStoreRestartArtifact,
+        index: u64,
+    ) -> Option<LogIdOf<ControlPlaneRaftTypeConfig>> {
+        if let Some(last_purged_log_id) = log_store.last_purged_log_id {
+            if index < last_purged_log_id.index() {
+                return None;
+            }
+            if index == last_purged_log_id.index() {
+                return Some(last_purged_log_id);
+            }
+        }
+        log_store
+            .entries
+            .iter()
+            .find(|entry| entry.log_id.index() == index)
+            .map(|entry| entry.log_id)
     }
 }
 
@@ -1245,6 +1353,18 @@ mod tests {
                 .unwrap();
         }
         state_machine
+    }
+
+    fn state_machine_restart_artifact_with_noops(
+        term: u64,
+        node_id: u64,
+        through_index: u64,
+    ) -> ControlPlaneRaftStateMachineRestartArtifact {
+        ControlPlaneRaftStateMachineRestartArtifact {
+            inner: replicated_state_machine_with_noops(term, through_index),
+            last_applied: Some(raft_log_id(term, node_id, through_index)),
+            last_membership: StoredMembership::default(),
+        }
     }
 
     #[test]
@@ -2344,6 +2464,116 @@ mod tests {
             let log_state = RaftLogStorage::get_log_state(&mut restored).await.unwrap();
             assert_eq!(log_state.last_log_id, Some(raft_log_id(3, 1, 5)));
         });
+    }
+
+    #[test]
+    fn control_plane_raft_combined_restart_restores_catchup_state() {
+        ControlPlaneRaftTypeConfig::run(async {
+            let mut log_store = ControlPlaneRaftLogStore::empty();
+            RaftLogStorage::append(
+                &mut log_store,
+                vec![
+                    bootstrap_membership_entry(1),
+                    blank_entry(3, 1, 1),
+                    blank_entry(3, 1, 2),
+                    blank_entry(3, 1, 3),
+                ],
+                IOFlushed::noop(),
+            )
+            .await
+            .unwrap();
+            RaftLogStorage::save_committed(&mut log_store, Some(raft_log_id(3, 1, 3)))
+                .await
+                .unwrap();
+
+            let mut state_machine = ControlPlaneRaftStateMachine::empty();
+            state_machine
+                .apply_entry(bootstrap_membership_entry(1))
+                .unwrap();
+            state_machine.apply_entry(blank_entry(3, 1, 1)).unwrap();
+            state_machine.apply_entry(blank_entry(3, 1, 2)).unwrap();
+
+            let artifact =
+                ControlPlaneRaftRestartArtifact::capture(&log_store, &state_machine).unwrap();
+            let (mut restored_log_store, mut restored_state_machine) = artifact.restore().unwrap();
+
+            assert_eq!(
+                RaftLogStorage::read_committed(&mut restored_log_store)
+                    .await
+                    .unwrap(),
+                Some(raft_log_id(3, 1, 3))
+            );
+            assert_eq!(
+                restored_state_machine.last_applied(),
+                Some(raft_log_id(3, 1, 2))
+            );
+            restored_state_machine
+                .apply_entry(blank_entry(3, 1, 3))
+                .unwrap();
+            assert_eq!(
+                restored_state_machine.last_applied(),
+                Some(raft_log_id(3, 1, 3))
+            );
+        });
+    }
+
+    #[test]
+    fn control_plane_raft_combined_restart_rejects_inconsistent_artifacts() {
+        let log_committed_through_two = ControlPlaneRaftLogStoreRestartArtifact {
+            committed: Some(raft_log_id(3, 1, 2)),
+            entries: vec![
+                bootstrap_membership_entry(1),
+                blank_entry(3, 1, 1),
+                blank_entry(3, 1, 2),
+                blank_entry(3, 1, 3),
+            ],
+            ..Default::default()
+        };
+        let applied_after_committed = ControlPlaneRaftRestartArtifact {
+            log_store: log_committed_through_two.clone(),
+            state_machine: state_machine_restart_artifact_with_noops(3, 1, 3),
+        };
+        let err = applied_after_committed.restore().unwrap_err();
+        assert!(err.to_string().contains("after committed restart gate"));
+
+        let missing_committed_gate = ControlPlaneRaftRestartArtifact {
+            log_store: ControlPlaneRaftLogStoreRestartArtifact {
+                entries: vec![bootstrap_membership_entry(1), blank_entry(3, 1, 1)],
+                ..Default::default()
+            },
+            state_machine: state_machine_restart_artifact_with_noops(3, 1, 1),
+        };
+        let err = missing_committed_gate.restore().unwrap_err();
+        assert!(err.to_string().contains("no committed restart gate"));
+
+        let applied_unknown_to_log = ControlPlaneRaftRestartArtifact {
+            log_store: ControlPlaneRaftLogStoreRestartArtifact {
+                committed: Some(raft_log_id(3, 1, 2)),
+                entries: vec![
+                    bootstrap_membership_entry(1),
+                    blank_entry(3, 1, 1),
+                    blank_entry(3, 1, 2),
+                ],
+                ..Default::default()
+            },
+            state_machine: state_machine_restart_artifact_with_noops(3, 1, 3),
+        };
+        let err = applied_unknown_to_log.restore().unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("is not retained or purged in the log store"));
+
+        let state_behind_purged_boundary = ControlPlaneRaftRestartArtifact {
+            log_store: ControlPlaneRaftLogStoreRestartArtifact {
+                committed: Some(raft_log_id(3, 1, 2)),
+                last_purged_log_id: Some(raft_log_id(3, 1, 2)),
+                entries: Vec::new(),
+                ..Default::default()
+            },
+            state_machine: state_machine_restart_artifact_with_noops(3, 1, 1),
+        };
+        let err = state_behind_purged_boundary.restore().unwrap_err();
+        assert!(err.to_string().contains("behind purged boundary"));
     }
 
     #[test]

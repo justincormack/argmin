@@ -9162,6 +9162,15 @@ Phase 12.1 progress:
   membership metadata beyond the applied point. The cached current snapshot is
   intentionally not part of this artifact because it is rebuildable from the
   authoritative state-machine state and OpenRaft metadata.
+- Added a combined in-memory OpenRaft restart artifact for the spike. It
+  captures the log-store and state-machine restart artifacts together and
+  restores them only after cross-validating their restart-gate invariants: an
+  applied state-machine log id must still be provable from the retained or
+  purged log metadata, must not be behind the purged boundary, and must not be
+  ahead of the persisted committed watermark. This permits a restarted state
+  machine to lag a committed watermark only when the retained log still has the
+  catch-up entries, and rejects independently-valid artifact pairs that would
+  lose committed work or serve from an uncommitted state.
 - Tightened the in-memory OpenRaft state-machine wrapper's apply cursor. Before
   dispatching blank, membership, or normal entries, the wrapper now rejects
   first-entry gaps, duplicate/replayed bootstrap entries, lower-term next
