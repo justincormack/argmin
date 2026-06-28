@@ -336,6 +336,11 @@ pub struct MetadataCommandApplyContextTestHookGuard {
     pub(super) scope_id: usize,
 }
 
+#[cfg(test)]
+pub(crate) struct MetadataCommandRecoveryTestGuard {
+    _guard: Box<dyn Send>,
+}
+
 const TRACE_TARGET: &str = "storage";
 
 type ShardScavengerLocationIdentity = (u32, u32, ShardKey);
@@ -4278,6 +4283,43 @@ impl StorageCluster {
     /// sharing process-local workers until a real cluster identity exists.
     pub fn process_local_registry_key(&self) -> usize {
         self.local_map.process_local_registry_key()
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_metadata_command_pg_lock_ptr(&self, pg_id: PgId) -> usize {
+        self.local_map
+            .runtime_state()
+            .test_metadata_command_pg_lock_ptr(pg_id)
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_metadata_command_recovery_flight_count(&self) -> usize {
+        self.local_map
+            .runtime_state()
+            .test_metadata_command_recovery_flight_count()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_begin_metadata_command_recovery_leader(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+    ) -> MetadataCommandRecoveryTestGuard {
+        match self
+            .local_map
+            .runtime_state()
+            .join_metadata_command_recovery(pg_id, command)
+        {
+            MetadataCommandRecoveryAdmission::Leader(guard) => MetadataCommandRecoveryTestGuard {
+                _guard: Box::new(guard),
+            },
+            MetadataCommandRecoveryAdmission::Waited { .. } => {
+                panic!("metadata command recovery admission unexpectedly waited")
+            }
+            MetadataCommandRecoveryAdmission::TimedOut { .. } => {
+                panic!("metadata command recovery admission unexpectedly timed out")
+            }
+        }
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
@@ -10096,6 +10138,16 @@ impl StorageCluster {
                 request,
                 shard_index,
             })
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_enqueue_placed_segment_shard_repair(
+        &self,
+        work_item: PlacedSegmentShardRepairWorkItem,
+    ) -> bool {
+        self.local_map
+            .runtime_state()
+            .enqueue_placed_segment_shard_repair(work_item)
     }
 
     fn schedule_placed_segment_shard_repair(

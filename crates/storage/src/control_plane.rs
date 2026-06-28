@@ -7994,6 +7994,46 @@ mod tests {
             .node_incarnation()
     }
 
+    fn placed_segment_shard_repair_work_item_for_runtime_refresh(
+        seed: u8,
+    ) -> crate::PlacedSegmentShardRepairWorkItem {
+        let mut segment_okh = [0; 16];
+        segment_okh[0] = seed;
+        crate::PlacedSegmentShardRepairWorkItem {
+            request: crate::SegmentStoredBytesRequest {
+                data_pg_id: 31,
+                segment_okh,
+                segment_vid: crate::GenerationId::new(u64::from(seed) + 1).unwrap(),
+                stored_size: usize::from(seed) + 1024,
+                segment_crc64: u64::from(seed),
+                ec: crate::EcShape { k: 1, m: 0 },
+            },
+            shard_index: crate::ShardIndex::new(0),
+        }
+    }
+
+    fn metadata_command_for_runtime_refresh(
+        seed: u8,
+    ) -> crate::metadata_command::MetadataCommandEnvelope {
+        crate::metadata_command::MetadataCommandEnvelope::new(
+            crate::metadata_command::MetadataCommandId::new(
+                ClusterEpoch::INITIAL,
+                PgId::new(31),
+                crate::metadata_command::MetadataCommandLogIndex::new(u64::from(seed) + 1)
+                    .unwrap(),
+            ),
+            crate::metadata_command::MetadataCommandPayload::AdvanceCompletedMultipartUploadSequence(
+                crate::metadata_command::AdvanceCompletedMultipartUploadSequenceCommand {
+                    bucket: crate::BucketName::try_from(format!(
+                        "runtime-refresh-command-{seed}"
+                    ))
+                    .unwrap(),
+                    completion_order: u64::from(seed),
+                },
+            ),
+        )
+    }
+
     #[derive(Debug, Clone, Copy)]
     enum ControlPlaneHeartbeatModelOp {
         CurrentHeartbeat {
@@ -13336,6 +13376,166 @@ mod tests {
         );
         refreshed.finish_bucket_delete_finalize_work(&bucket);
         assert!(refreshed.try_take_reclaim_work().is_none());
+    }
+
+    #[test]
+    fn storage_cluster_refresh_preserves_process_local_shard_repair_queue() {
+        let tmp = test_util::tempdir();
+        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+        authority
+            .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
+            .unwrap();
+        assert!(heartbeat_until_serving(&mut authority, 1, 1_000).serving());
+        authority
+            .set_pg_acting_set(PgId::new(31), vec![NodeId::new(1)])
+            .unwrap();
+        heartbeat_with_pg_observation(&mut authority, 1, 31, PgState::Peering, 2_000);
+
+        let peering_map = authority.snapshot().runtime_map(2_001).unwrap();
+        let cluster = crate::StorageCluster::from_runtime_map(
+            NodeId::new(1),
+            &peering_map,
+            crate::EcShape { k: 1, m: 0 },
+        )
+        .unwrap();
+        let repair = placed_segment_shard_repair_work_item_for_runtime_refresh(1);
+        assert!(cluster.test_enqueue_placed_segment_shard_repair(repair));
+
+        authority
+            .complete_pg_peering(
+                PgId::new(31),
+                NodeId::new(1),
+                node_incarnation(&authority, 1),
+                2_002,
+            )
+            .unwrap();
+        heartbeat_with_pg_observation(&mut authority, 1, 31, PgState::Active, 2_003);
+
+        let refreshed = cluster
+            .refresh_from_control_plane_runtime_map(&authority, 2_004)
+            .unwrap();
+        assert_eq!(
+            refreshed.try_take_placed_segment_shard_repair_work(),
+            Some(repair)
+        );
+        assert!(refreshed
+            .try_take_placed_segment_shard_repair_work()
+            .is_none());
+    }
+
+    #[test]
+    fn storage_cluster_refresh_preserves_metadata_runtime_state() {
+        let tmp = test_util::tempdir();
+        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+        authority
+            .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
+            .unwrap();
+        assert!(heartbeat_until_serving(&mut authority, 1, 1_000).serving());
+        authority
+            .set_pg_acting_set(PgId::new(31), vec![NodeId::new(1)])
+            .unwrap();
+        heartbeat_with_pg_observation(&mut authority, 1, 31, PgState::Peering, 2_000);
+
+        let peering_map = authority.snapshot().runtime_map(2_001).unwrap();
+        let cluster = crate::StorageCluster::from_runtime_map(
+            NodeId::new(1),
+            &peering_map,
+            crate::EcShape { k: 1, m: 0 },
+        )
+        .unwrap();
+        let pg_id = PgId::new(31);
+        let lock_ptr = cluster.test_metadata_command_pg_lock_ptr(pg_id);
+        let command = metadata_command_for_runtime_refresh(3);
+        assert_eq!(cluster.test_metadata_command_recovery_flight_count(), 0);
+        let guard = cluster.test_begin_metadata_command_recovery_leader(pg_id, &command);
+        assert_eq!(cluster.test_metadata_command_recovery_flight_count(), 1);
+
+        authority
+            .complete_pg_peering(
+                PgId::new(31),
+                NodeId::new(1),
+                node_incarnation(&authority, 1),
+                2_002,
+            )
+            .unwrap();
+        heartbeat_with_pg_observation(&mut authority, 1, 31, PgState::Active, 2_003);
+
+        let refreshed = cluster
+            .refresh_from_control_plane_runtime_map(&authority, 2_004)
+            .unwrap();
+        assert_eq!(refreshed.test_metadata_command_pg_lock_ptr(pg_id), lock_ptr);
+        assert_eq!(refreshed.test_metadata_command_recovery_flight_count(), 1);
+        drop(guard);
+        assert_eq!(refreshed.test_metadata_command_recovery_flight_count(), 0);
+    }
+
+    #[test]
+    fn storage_cluster_unix_refresh_preserves_process_local_runtime_state() {
+        let tmp = test_util::tempdir();
+        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+        authority
+            .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
+            .unwrap();
+        let endpoint = tmp
+            .path()
+            .join("node-1.sock")
+            .to_string_lossy()
+            .into_owned();
+        assert!(
+            heartbeat_until_serving_with_endpoint(&mut authority, 1, 1_000, endpoint).serving()
+        );
+        authority
+            .set_pg_acting_set(PgId::new(31), vec![NodeId::new(1)])
+            .unwrap();
+        heartbeat_with_pg_observation(&mut authority, 1, 31, PgState::Peering, 2_000);
+
+        let peering_map = authority.snapshot().runtime_map(2_001).unwrap();
+        let cluster = crate::StorageCluster::from_runtime_map_with_unix_storage_node_clients(
+            NodeId::new(1),
+            &peering_map,
+            crate::EcShape { k: 1, m: 0 },
+        )
+        .unwrap();
+        let registry_key = cluster.process_local_registry_key();
+        let bucket = crate::BucketName::try_from("unix-refresh-queue-bucket").unwrap();
+        cluster.enqueue_bucket_delete_finalize(&bucket);
+        let repair = placed_segment_shard_repair_work_item_for_runtime_refresh(2);
+        assert!(cluster.test_enqueue_placed_segment_shard_repair(repair));
+
+        authority
+            .complete_pg_peering(
+                PgId::new(31),
+                NodeId::new(1),
+                node_incarnation(&authority, 1),
+                2_002,
+            )
+            .unwrap();
+        heartbeat_with_pg_observation(&mut authority, 1, 31, PgState::Active, 2_003);
+
+        let refreshed = cluster
+            .refresh_from_control_plane_runtime_map_with_unix_storage_node_clients(
+                &authority,
+                2_004,
+                crate::cluster::LocalUnixStorageNodeClientAdmissionSettings::DEFAULT,
+            )
+            .unwrap();
+        assert_eq!(refreshed.process_local_registry_key(), registry_key);
+        assert_eq!(
+            refreshed.try_take_reclaim_work(),
+            Some(crate::ReclaimWorkItem::BucketDelete(bucket.clone()))
+        );
+        refreshed.finish_bucket_delete_finalize_work(&bucket);
+        assert_eq!(
+            refreshed.try_take_placed_segment_shard_repair_work(),
+            Some(repair)
+        );
+        assert!(refreshed.try_take_reclaim_work().is_none());
+        assert!(refreshed
+            .try_take_placed_segment_shard_repair_work()
+            .is_none());
     }
 
     #[test]

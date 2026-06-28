@@ -9076,8 +9076,11 @@ Status update:
   clusters, preventing reclaim/finalizer queues and worker/admission state from
   being tied to throwaway route-map generations. The storage regression proves a
   bucket-delete finalizer queued before refresh is still visible, dequeueable,
-  and finishable after refresh. Follow-up coverage is still needed for the Unix
-  storage-node-client refresh path and the other process-local queues.
+  and finishable after refresh. Follow-up regressions now also cover the shard
+  repair hint queue, the Unix storage-node-client refresh constructor, the
+  per-PG metadata-command lock registry, and active metadata-command recovery
+  single-flight state, so every current `LocalClusterRuntimeState` field has
+  deterministic refresh-preservation coverage.
 - Remaining close-out work is concentrated in deterministic interleaving tests,
   cleanup/runtime-state diagnostics, process-local state continuity across
   refresh/restart, and checking whether any foreground loops still need an

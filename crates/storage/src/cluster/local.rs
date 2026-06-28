@@ -1027,6 +1027,19 @@ impl LocalClusterRuntimeState {
         )
     }
 
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(crate) fn test_metadata_command_pg_lock_ptr(&self, pg_id: PgId) -> usize {
+        Arc::as_ptr(&self.metadata_command_pg_lock(pg_id)) as usize
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(crate) fn test_metadata_command_recovery_flight_count(&self) -> usize {
+        self.metadata_command_recovery_flights
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .len()
+    }
+
     pub(crate) fn join_metadata_command_recovery(
         &self,
         pg_id: PgId,
