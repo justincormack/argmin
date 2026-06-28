@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::fmt;
 use std::io::{self, Cursor};
 use std::ops::{Bound, RangeBounds};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -17,9 +18,11 @@ use openraft::type_config::alias::{
 use openraft::EntryPayload;
 use openraft::LogId;
 use openraft::OptionalSend;
+use openraft::Raft;
 use openraft::RaftLogReader;
 use openraft::RaftSnapshotBuilder;
 use openraft::RaftTypeConfig;
+use openraft::ReadPolicy;
 use openraft::StoredMembership;
 use placement::NodeId;
 
@@ -93,8 +96,52 @@ pub fn assert_openraft_type_config() {
     assert_config::<ControlPlaneRaftTypeConfig>();
 }
 
+pub async fn runtime_map_via_openraft_read_index(
+    raft: &Raft<ControlPlaneRaftTypeConfig, ControlPlaneRaftStateMachine>,
+    issued_at_ms: u64,
+) -> Result<ClusterRuntimeMapSnapshot, ControlPlaneError> {
+    let read_log_id = raft
+        .ensure_linearizable(ReadPolicy::ReadIndex)
+        .await
+        .map_err(|error| openraft_remote_error("read-index", error))?
+        .ok_or_else(|| ControlPlaneError::CommandDecode {
+            message: "OpenRaft read-index returned no applied log id".to_string(),
+        })?;
+    let read_index = control_plane_log_id_from_raft(read_log_id).ok_or_else(|| {
+        ControlPlaneError::CommandDecode {
+            message: format!("invalid OpenRaft read-index log id for runtime map: {read_log_id}"),
+        }
+    })?;
+
+    raft.with_state_machine(move |state_machine| {
+        Box::pin(async move {
+            let Some(last_applied) = state_machine.last_applied() else {
+                return Err(ControlPlaneError::ControlPlaneReadIndexNotApplied {
+                    read_index,
+                    last_applied: state_machine.inner().last_applied(),
+                });
+            };
+            if last_applied.index() < read_log_id.index() {
+                return Err(ControlPlaneError::ControlPlaneReadIndexNotApplied {
+                    read_index,
+                    last_applied: state_machine.inner().last_applied(),
+                });
+            }
+            state_machine.runtime_map_for_current_applied_read_index(issued_at_ms)
+        })
+    })
+    .await
+    .map_err(|error| openraft_remote_error("state-machine read", error))?
+}
+
 fn control_plane_error_to_io_error(context: &'static str, error: ControlPlaneError) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, format!("{context}: {error}"))
+}
+
+fn openraft_remote_error(context: &'static str, error: impl fmt::Display) -> ControlPlaneError {
+    ControlPlaneError::RpcRemote {
+        message: format!("OpenRaft {context} failed: {error}"),
+    }
 }
 
 fn raft_log_store_error(message: impl Into<String>) -> io::Error {
@@ -1360,10 +1407,10 @@ mod tests {
         }
     }
 
-    fn test_raft_config() -> Arc<Config> {
+    fn test_raft_config(cluster_name: &'static str) -> Arc<Config> {
         Arc::new(
             Config {
-                cluster_name: "control-plane-raft-test".to_string(),
+                cluster_name: cluster_name.to_string(),
                 heartbeat_interval: 50,
                 election_timeout_min: 150,
                 election_timeout_max: 300,
@@ -1375,6 +1422,18 @@ mod tests {
             .validate()
             .unwrap(),
         )
+    }
+
+    async fn wait_for_local_leader(
+        raft: &Raft<ControlPlaneRaftTypeConfig, ControlPlaneRaftStateMachine>,
+        message: &'static str,
+    ) {
+        raft.wait(Some(Duration::from_secs(1)))
+            .state(ServerState::Leader, message)
+            .await
+            .unwrap();
+        raft.as_leader()
+            .expect("local single-node raft should have a committed leader vote");
     }
 
     fn raft_log_id(term: u64, node_id: u64, index: u64) -> LogIdOf<ControlPlaneRaftTypeConfig> {
@@ -2465,7 +2524,7 @@ mod tests {
             let state_machine = ControlPlaneRaftStateMachine::empty();
             let raft = Raft::<ControlPlaneRaftTypeConfig, ControlPlaneRaftStateMachine>::new(
                 1,
-                test_raft_config(),
+                test_raft_config("control-plane-raft-bootstrap-membership-test"),
                 UnreachableRaftNetworkFactory,
                 log_store.clone(),
                 state_machine,
@@ -2503,7 +2562,7 @@ mod tests {
             let state_machine = ControlPlaneRaftStateMachine::empty();
             let raft = Raft::<ControlPlaneRaftTypeConfig, ControlPlaneRaftStateMachine>::new(
                 1,
-                test_raft_config(),
+                test_raft_config("control-plane-raft-client-write-test"),
                 UnreachableRaftNetworkFactory,
                 log_store,
                 state_machine,
@@ -2514,11 +2573,7 @@ mod tests {
             raft.initialize(BTreeMap::from([(1, BasicNode::new("node-1"))]))
                 .await
                 .unwrap();
-            raft.trigger().elect(false).await.unwrap();
-            raft.wait(Some(Duration::from_secs(1)))
-                .state(ServerState::Leader, "triggered single-node leadership")
-                .await
-                .unwrap();
+            wait_for_local_leader(&raft, "single-node initialization leadership").await;
 
             let bootstrap = raft
                 .client_write(ControlPlaneCommand::BootstrapInitialClusterMap {
@@ -2574,7 +2629,7 @@ mod tests {
             let state_machine = ControlPlaneRaftStateMachine::empty();
             let raft = Raft::<ControlPlaneRaftTypeConfig, ControlPlaneRaftStateMachine>::new(
                 1,
-                test_raft_config(),
+                test_raft_config("control-plane-raft-read-index-runtime-map-test"),
                 UnreachableRaftNetworkFactory,
                 log_store,
                 state_machine,
@@ -2585,11 +2640,7 @@ mod tests {
             raft.initialize(BTreeMap::from([(1, BasicNode::new("node-1"))]))
                 .await
                 .unwrap();
-            raft.trigger().elect(false).await.unwrap();
-            raft.wait(Some(Duration::from_secs(1)))
-                .state(ServerState::Leader, "triggered single-node leadership")
-                .await
-                .unwrap();
+            wait_for_local_leader(&raft, "single-node read-index leadership").await;
 
             let write = raft
                 .client_write(ControlPlaneCommand::BootstrapInitialClusterMap {
@@ -2605,28 +2656,21 @@ mod tests {
                 )
             ));
 
-            let read_log_id = raft
-                .ensure_linearizable(ReadPolicy::ReadIndex)
+            let runtime_map = runtime_map_via_openraft_read_index(&raft, 44_000)
                 .await
-                .unwrap()
-                .expect("leader read-index should return an applied log id");
-            let expected_control_plane_read_index = control_plane_log_id_from_raft(read_log_id)
-                .expect("read-index should be non-bootstrap");
-
-            let (runtime_map, applied_log_id) = raft
+                .unwrap();
+            let applied_log_id = raft
                 .with_state_machine(|state_machine| {
-                    let runtime_map = state_machine
-                        .runtime_map_for_current_applied_read_index(44_000)
-                        .unwrap();
                     let applied_log_id = state_machine
                         .last_applied()
                         .expect("read-index should have an applied tip");
-                    Box::pin(async move { (runtime_map, applied_log_id) })
+                    Box::pin(async move { applied_log_id })
                 })
                 .await
                 .unwrap();
+            let expected_control_plane_read_index = control_plane_log_id_from_raft(applied_log_id)
+                .expect("read-index should be non-bootstrap");
 
-            assert_eq!(applied_log_id, read_log_id);
             assert_eq!(
                 runtime_map.freshness_proof().read_index(),
                 Some(expected_control_plane_read_index)
@@ -2649,7 +2693,7 @@ mod tests {
             let state_machine = ControlPlaneRaftStateMachine::empty();
             let raft = Raft::<ControlPlaneRaftTypeConfig, ControlPlaneRaftStateMachine>::new(
                 1,
-                test_raft_config(),
+                test_raft_config("control-plane-raft-read-index-non-leader-test"),
                 UnreachableRaftNetworkFactory,
                 log_store.clone(),
                 state_machine,
@@ -2671,6 +2715,15 @@ mod tests {
             let forward_to_leader = err.forward_to_leader().expect("read should need leader");
             assert_eq!(forward_to_leader.leader_id, None);
             assert_eq!(forward_to_leader.leader_node, None);
+
+            let err = runtime_map_via_openraft_read_index(&raft, 44_000)
+                .await
+                .unwrap_err();
+            assert!(matches!(
+                err,
+                ControlPlaneError::RpcRemote { message }
+                    if message.contains("OpenRaft read-index failed")
+            ));
 
             raft.shutdown().await.unwrap();
         });
@@ -2716,7 +2769,7 @@ mod tests {
 
             let raft = Raft::<ControlPlaneRaftTypeConfig, ControlPlaneRaftStateMachine>::new(
                 1,
-                test_raft_config(),
+                test_raft_config("control-plane-raft-restart-replay-test"),
                 UnreachableRaftNetworkFactory,
                 restored_log_store.clone(),
                 restored_state_machine,
@@ -2807,7 +2860,7 @@ mod tests {
             let (_, restored_state_machine) = artifact.restore().unwrap();
             let raft = Raft::<ControlPlaneRaftTypeConfig, ControlPlaneRaftStateMachine>::new(
                 1,
-                test_raft_config(),
+                test_raft_config("control-plane-raft-restart-rejection-test"),
                 UnreachableRaftNetworkFactory,
                 log_store,
                 restored_state_machine,
@@ -2894,7 +2947,7 @@ mod tests {
 
             let raft = Raft::<ControlPlaneRaftTypeConfig, ControlPlaneRaftStateMachine>::new(
                 1,
-                test_raft_config(),
+                test_raft_config("control-plane-raft-current-snapshot-recovery-test"),
                 UnreachableRaftNetworkFactory,
                 log_store,
                 state_machine,

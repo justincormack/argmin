@@ -9334,18 +9334,27 @@ Phase 12.1 progress:
   of permitting a local runtime-map read. This pins the fail-closed read
   boundary until the production adapter wires leader-side read-index serving.
 - Added the matching public OpenRaft read-index leader smoke for the
-  single-node deterministic authority. The test manually triggers leadership,
-  applies a bootstrap command, confirms `ensure_linearizable(ReadPolicy::ReadIndex)`
-  returns the state machine's applied tip, and verifies the runtime-map
-  freshness proof is stamped with that applied log id rather than an earlier
-  captured round id.
+  single-node deterministic authority. The test lets OpenRaft's initialization
+  path elect the single voter, waits for this node to expose a committed local
+  leader vote, applies a bootstrap command, and verifies the runtime-map
+  freshness proof is stamped with the state machine's applied log id rather
+  than an earlier captured round id.
+- Added an adapter-facing OpenRaft read-index runtime-map helper that performs
+  the same sequence as a single operation: wait for `ReadPolicy::ReadIndex`,
+  fail closed if the state-machine read is behind the returned barrier, and
+  publish the map using the current applied tip. The leader and non-leader
+  public OpenRaft smokes now exercise this helper directly.
 - Added a deterministic public OpenRaft `client_write` smoke for a single-node
-  authority by disabling timer-driven elections, manually triggering election,
-  and waiting on the metrics `Leader` state rather than sleeping or relying on
-  randomized election timeouts. The smoke proves both an applied bootstrap
-  command and a deterministic semantic rejection return through OpenRaft's
-  client response path, and verifies the rejected command advances the applied
-  cursor without creating node state.
+  authority by disabling timer-driven elections, letting OpenRaft's
+  initialization path elect the single voter, and waiting for a committed local
+  leader vote rather than sleeping or relying on randomized election timeouts.
+  The smoke proves both an applied bootstrap command and a deterministic
+  semantic rejection return through OpenRaft's client response path, and
+  verifies the rejected command advances the applied cursor without creating
+  node state.
+- Isolated the public OpenRaft smokes with distinct cluster names so the normal
+  parallel `control_plane_raft` test group cannot share OpenRaft test identity
+  while still exercising the real client-write and read-index paths.
 
 1. define the replicated control-plane state machine:
    - state includes cluster epoch, PG count, PG state, PG acting sets, node
