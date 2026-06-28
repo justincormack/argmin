@@ -1396,6 +1396,15 @@ fn local_debug_metrics_body(state: &Arc<ServerState>) -> String {
             pg_id, event, sample.count
         );
     }
+    for sample in observability::metadata_command_checkpoint_record_error_dimension_snapshot() {
+        let outcome = debug_metric_label_value(sample.outcome);
+        let error_kind = debug_metric_label_value(sample.error_kind);
+        let _ = writeln!(
+            body,
+            "metadata_command_checkpoint_record_error_by_pg_total{{pg_id=\"{}\",outcome=\"{}\",error_kind=\"{}\"}} {}",
+            sample.pg_id, outcome, error_kind, sample.count
+        );
+    }
     for sample in observability::background_work_admission_dimension_snapshot() {
         let class = debug_metric_label_value(sample.class);
         let event = debug_metric_label_value(sample.event);

@@ -171,6 +171,9 @@ static METADATA_COMMAND_CHECKPOINT_RECORD_COMPACTION_FAILED_TOTAL: AtomicU64 = A
 static METADATA_COMMAND_CHECKPOINT_RECORD_FAILED_TOTAL: AtomicU64 = AtomicU64::new(0);
 static METADATA_COMMAND_CHECKPOINT_RECORD_LIMIT_REACHED_TOTAL: AtomicU64 = AtomicU64::new(0);
 static METADATA_COMMAND_CHECKPOINT_RECORD_SCAN_ERROR_TOTAL: AtomicU64 = AtomicU64::new(0);
+static METADATA_COMMAND_CHECKPOINT_RECORD_ERROR_DIMENSIONS: OnceLock<
+    Mutex<Vec<MetadataCommandCheckpointRecordErrorDimensionCounter>>,
+> = OnceLock::new();
 static BACKGROUND_WORK_ADMISSION_EVENT_TOTAL: AtomicU64 = AtomicU64::new(0);
 static BACKGROUND_WORK_ACTIVE_TOTAL: AtomicU64 = AtomicU64::new(0);
 static BACKGROUND_WORK_FINISHED_TOTAL: AtomicU64 = AtomicU64::new(0);
@@ -308,6 +311,14 @@ pub struct BackgroundWorkAdmissionDimensionSample {
     pub elapsed_us_total: u64,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MetadataCommandCheckpointRecordErrorDimensionSample {
+    pub pg_id: u32,
+    pub outcome: &'static str,
+    pub error_kind: &'static str,
+    pub count: u64,
+}
+
 struct MetadataCommandDimensionCounter {
     pg_id: u32,
     classifier: &'static str,
@@ -363,6 +374,13 @@ struct BackgroundWorkAdmissionDimensionCounter {
     event: &'static str,
     count: u64,
     elapsed_us_total: u64,
+}
+
+struct MetadataCommandCheckpointRecordErrorDimensionCounter {
+    pg_id: u32,
+    outcome: &'static str,
+    error_kind: &'static str,
+    count: u64,
 }
 
 impl FlightRecorder {
@@ -510,6 +528,11 @@ fn shard_backfill_event_dimensions() -> &'static Mutex<Vec<ShardBackfillEventDim
 fn background_work_admission_dimensions(
 ) -> &'static Mutex<Vec<BackgroundWorkAdmissionDimensionCounter>> {
     BACKGROUND_WORK_ADMISSION_DIMENSIONS.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+fn metadata_command_checkpoint_record_error_dimensions(
+) -> &'static Mutex<Vec<MetadataCommandCheckpointRecordErrorDimensionCounter>> {
+    METADATA_COMMAND_CHECKPOINT_RECORD_ERROR_DIMENSIONS.get_or_init(|| Mutex::new(Vec::new()))
 }
 
 fn fetch_max_atomic(counter: &AtomicU64, value: u64) {
@@ -734,6 +757,30 @@ fn increment_background_work_admission_dimension(
     }
 }
 
+fn increment_metadata_command_checkpoint_record_error_dimension(
+    pg_id: u32,
+    outcome: &'static str,
+    error_kind: &'static str,
+) {
+    let mut counters = metadata_command_checkpoint_record_error_dimensions()
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+    if let Some(counter) = counters.iter_mut().find(|counter| {
+        counter.pg_id == pg_id && counter.outcome == outcome && counter.error_kind == error_kind
+    }) {
+        counter.count = counter.count.saturating_add(1);
+        return;
+    }
+    if counters.len() < METADATA_COMMAND_DIMENSION_CAPACITY {
+        counters.push(MetadataCommandCheckpointRecordErrorDimensionCounter {
+            pg_id,
+            outcome,
+            error_kind,
+            count: 1,
+        });
+    }
+}
+
 #[must_use]
 pub fn metadata_command_conflict_dimension_snapshot() -> Vec<MetadataCommandDimensionSample> {
     metadata_command_dimension_snapshot(metadata_command_conflict_dimensions())
@@ -877,6 +924,24 @@ pub fn shard_backfill_event_dimension_snapshot() -> Vec<ShardBackfillEventDimens
             event: counter.event,
             count: counter.count,
         })
+        .collect()
+}
+
+#[must_use]
+pub fn metadata_command_checkpoint_record_error_dimension_snapshot(
+) -> Vec<MetadataCommandCheckpointRecordErrorDimensionSample> {
+    metadata_command_checkpoint_record_error_dimensions()
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .iter()
+        .map(
+            |counter| MetadataCommandCheckpointRecordErrorDimensionSample {
+                pg_id: counter.pg_id,
+                outcome: counter.outcome,
+                error_kind: counter.error_kind,
+                count: counter.count,
+            },
+        )
         .collect()
 }
 
@@ -1392,6 +1457,13 @@ pub struct MetadataCommandCheckpointRecordSummary {
     pub compaction_failed: usize,
     pub failed: usize,
     pub limit_reached: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MetadataCommandCheckpointRecordErrorSummary {
+    pub pg_id: u32,
+    pub outcome: &'static str,
+    pub error_kind: &'static str,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2985,6 +3057,25 @@ pub fn emit_metadata_command_checkpoint_record_scan_error(
     )
 }
 
+pub fn emit_metadata_command_checkpoint_record_error(
+    target: &'static str,
+    summary: MetadataCommandCheckpointRecordErrorSummary,
+) -> bool {
+    increment_metadata_command_checkpoint_record_error_dimension(
+        summary.pg_id,
+        summary.outcome,
+        summary.error_kind,
+    );
+    event(
+        target,
+        "metadata_command_checkpoint_record_error",
+        Some(format_args!(
+            "pg_id={} outcome={} error_kind={}",
+            summary.pg_id, summary.outcome, summary.error_kind
+        )),
+    )
+}
+
 pub fn emit_background_work_admission_event(
     target: &'static str,
     summary: BackgroundWorkAdmissionSummary,
@@ -3787,6 +3878,14 @@ mod tests {
             },
         );
         emit_metadata_command_checkpoint_record_scan_error("storage", &"checkpoint unavailable");
+        emit_metadata_command_checkpoint_record_error(
+            "storage",
+            MetadataCommandCheckpointRecordErrorSummary {
+                pg_id: 11,
+                outcome: "skipped_stale",
+                error_kind: "storage_rpc_unknown_pg",
+            },
+        );
         emit_background_work_admission_event(
             "storage",
             BackgroundWorkAdmissionSummary {
@@ -4211,6 +4310,14 @@ mod tests {
         assert_eq!(
             after.metadata_command_checkpoint_record_scan_error_total,
             before.metadata_command_checkpoint_record_scan_error_total + 1
+        );
+        assert!(
+            metadata_command_checkpoint_record_error_dimension_snapshot()
+                .iter()
+                .any(|sample| sample.pg_id == 11
+                    && sample.outcome == "skipped_stale"
+                    && sample.error_kind == "storage_rpc_unknown_pg"
+                    && sample.count >= 1)
         );
         assert_eq!(
             after.background_work_admission_event_total,

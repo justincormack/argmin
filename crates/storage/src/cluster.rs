@@ -4354,8 +4354,17 @@ impl StorageCluster {
                 Err(error) => {
                     if metadata_command_checkpoint_record_error_is_stale(&error) {
                         summary.skipped_stale_epoch += 1;
+                        note_metadata_command_checkpoint_record_error(
+                            route.pg_id(),
+                            "skipped_stale",
+                            &error,
+                        );
                     } else {
-                        note_metadata_command_checkpoint_record_error(route.pg_id(), &error);
+                        note_metadata_command_checkpoint_record_error(
+                            route.pg_id(),
+                            "failed",
+                            &error,
+                        );
                         summary.failed += 1;
                     }
                     continue;
@@ -4379,8 +4388,17 @@ impl StorageCluster {
                 Err(error) => {
                     if metadata_command_checkpoint_record_error_is_stale(&error) {
                         summary.skipped_stale_epoch += 1;
+                        note_metadata_command_checkpoint_record_error(
+                            route.pg_id(),
+                            "skipped_stale",
+                            &error,
+                        );
                     } else {
-                        note_metadata_command_checkpoint_record_error(route.pg_id(), &error);
+                        note_metadata_command_checkpoint_record_error(
+                            route.pg_id(),
+                            "failed",
+                            &error,
+                        );
                         summary.failed += 1;
                     }
                     continue;
@@ -4414,7 +4432,7 @@ impl StorageCluster {
                     continue;
                 }
                 Err(error) => {
-                    note_metadata_command_checkpoint_record_error(route.pg_id(), &error);
+                    note_metadata_command_checkpoint_record_error(route.pg_id(), "failed", &error);
                     summary.failed += 1;
                     continue;
                 }
@@ -4434,8 +4452,17 @@ impl StorageCluster {
                 Err(error) => {
                     if metadata_command_checkpoint_record_error_is_stale(&error) {
                         summary.skipped_stale_epoch += 1;
+                        note_metadata_command_checkpoint_record_error(
+                            route.pg_id(),
+                            "skipped_stale",
+                            &error,
+                        );
                     } else {
-                        note_metadata_command_checkpoint_record_error(route.pg_id(), &error);
+                        note_metadata_command_checkpoint_record_error(
+                            route.pg_id(),
+                            "failed",
+                            &error,
+                        );
                         summary.failed += 1;
                     }
                 }
@@ -10664,11 +10691,19 @@ fn note_shard_backfill_candidate_error(
     }
 }
 
-fn note_metadata_command_checkpoint_record_error(pg_id: PgId, error: &StoreError) {
-    let _ = observability::event(
+fn note_metadata_command_checkpoint_record_error(
+    pg_id: PgId,
+    outcome: &'static str,
+    error: &StoreError,
+) {
+    let error_kind = metadata_command_checkpoint_record_error_kind(error);
+    let _ = observability::emit_metadata_command_checkpoint_record_error(
         TRACE_TARGET,
-        "metadata_command_checkpoint_record_error",
-        Some(format_args!("pg_id={} error={error}", pg_id.get())),
+        observability::MetadataCommandCheckpointRecordErrorSummary {
+            pg_id: pg_id.get(),
+            outcome,
+            error_kind,
+        },
     );
 }
 
@@ -10701,10 +10736,122 @@ fn compact_metadata_command_log_for_checkpoint_record(
         Err(error) => {
             if metadata_command_checkpoint_record_error_is_stale(&error) {
                 summary.skipped_stale_epoch += 1;
+                note_metadata_command_checkpoint_record_error(pg_id, "skipped_stale", &error);
             } else {
-                note_metadata_command_checkpoint_record_error(pg_id, &error);
+                note_metadata_command_checkpoint_record_error(pg_id, "compaction_failed", &error);
                 summary.compaction_failed += 1;
             }
+        }
+    }
+}
+
+fn metadata_command_checkpoint_record_error_kind(error: &StoreError) -> &'static str {
+    match error {
+        StoreError::NotFound => "not_found",
+        StoreError::IntegrityError { .. } => "integrity_error",
+        StoreError::ShardAckMismatch { .. } => "shard_ack_mismatch",
+        StoreError::PayloadShardSetMismatch { .. } => "payload_shard_set_mismatch",
+        StoreError::PgNotFound { .. } => "pg_not_found",
+        StoreError::ClusterPgNotFound { .. } => "cluster_pg_not_found",
+        StoreError::ShardPgNotFound { .. } => "shard_pg_not_found",
+        StoreError::PgNotActive { .. } => "pg_not_active",
+        StoreError::ShardPgNotActive { .. } => "shard_pg_not_active",
+        StoreError::ShardStore { source, .. } => {
+            metadata_command_checkpoint_record_error_kind(source)
+        }
+        StoreError::StorageRpc { code, .. } => {
+            metadata_command_checkpoint_record_storage_rpc_error_kind(*code)
+        }
+        StoreError::StorageRpcResourceExhausted { .. } => "storage_rpc_resource_exhausted",
+        StoreError::StorageRpcShardDeleteInProgress { .. } => {
+            "storage_rpc_shard_delete_in_progress"
+        }
+        StoreError::StalePayloadOperation { .. } => "stale_payload_operation",
+        StoreError::StaleMetadataPrimaryBridge { .. } => "stale_metadata_primary_bridge",
+        StoreError::StaleMetadataOperation { .. } => "stale_metadata_operation",
+        StoreError::StaleMetadataRoute { .. } => "stale_metadata_route",
+        StoreError::RouteMapExpired { .. } => "route_map_expired",
+        StoreError::StaleMetadataCommand { .. } => "stale_metadata_command",
+        StoreError::MetadataCommandWrongPg { .. } => "metadata_command_wrong_pg",
+        StoreError::MetadataCommandFromNonPrimary { .. } => "metadata_command_from_non_primary",
+        StoreError::MetadataCommandLogConflict { .. } => "metadata_command_log_conflict",
+        StoreError::MetadataCommandPendingConflict { .. } => "metadata_command_pending_conflict",
+        StoreError::StaleShardOperation { .. } => "stale_shard_operation",
+        StoreError::StaleShardLocation { .. } => "stale_shard_location",
+        StoreError::MetadataCommandContention { .. } => "metadata_command_contention",
+        StoreError::MetadataTransferEmpty { .. } => "metadata_transfer_empty",
+        StoreError::MetadataCommandPendingOnNonPrimary { .. } => {
+            "metadata_command_pending_on_non_primary"
+        }
+        StoreError::MetadataCommandLogChecksumMismatch { .. } => {
+            "metadata_command_log_checksum_mismatch"
+        }
+        StoreError::MetadataCommandLogHashMismatch { .. } => "metadata_command_log_hash_mismatch",
+        StoreError::MetadataCommandReplicaStateMissing { .. } => {
+            "metadata_command_replica_state_missing"
+        }
+        StoreError::MetadataCommandReplicaStateDiverged { .. } => {
+            "metadata_command_replica_state_diverged"
+        }
+        StoreError::MetadataStateDigestMismatch { .. } => "metadata_state_digest_mismatch",
+        StoreError::MetadataTransferUnsupportedProof { .. } => {
+            "metadata_transfer_unsupported_proof"
+        }
+        StoreError::MetadataCheckpointInvalid { .. } => "metadata_checkpoint_invalid",
+        StoreError::NodeNotFound { .. } => "node_not_found",
+        StoreError::NodeNotInActingSet { .. } => "node_not_in_acting_set",
+        StoreError::ShardIndexMismatch { .. } => "shard_index_mismatch",
+        StoreError::ShardScavengerObservationWrongPg { .. } => {
+            "shard_scavenger_observation_wrong_pg"
+        }
+        StoreError::ShardScavengerObservationShardIndexMismatch { .. } => {
+            "shard_scavenger_observation_shard_index_mismatch"
+        }
+        StoreError::ShardScavengerObservationInconsistentReason { .. } => {
+            "shard_scavenger_observation_inconsistent_reason"
+        }
+        StoreError::InvalidKeyLength { .. } => "invalid_key_length",
+        StoreError::InvalidShardKeyHex => "invalid_shard_key_hex",
+        StoreError::ShardScavengerScanIncomplete { .. } => "shard_scavenger_scan_incomplete",
+        StoreError::Io { context, .. } if *context == "connect storage-node RPC socket" => {
+            "storage_rpc_socket_connect"
+        }
+        StoreError::Io { .. } => "io",
+        StoreError::Db { .. } => "db",
+        StoreError::ErasureCoding { .. } => "erasure_coding",
+    }
+}
+
+fn metadata_command_checkpoint_record_storage_rpc_error_kind(
+    code: StorageRpcErrorCode,
+) -> &'static str {
+    match code {
+        StorageRpcErrorCode::FrameDecode => "storage_rpc_frame_decode",
+        StorageRpcErrorCode::PayloadDecode => "storage_rpc_payload_decode",
+        StorageRpcErrorCode::UnknownNode => "storage_rpc_unknown_node",
+        StorageRpcErrorCode::UnknownPg => "storage_rpc_unknown_pg",
+        StorageRpcErrorCode::WrongClusterEpoch => "storage_rpc_wrong_cluster_epoch",
+        StorageRpcErrorCode::InactivePgRoute => "storage_rpc_inactive_pg_route",
+        StorageRpcErrorCode::StaleShardLocation => "storage_rpc_stale_shard_location",
+        StorageRpcErrorCode::NonActingSetAccess => "storage_rpc_non_acting_set_access",
+        StorageRpcErrorCode::UnsupportedOperation => "storage_rpc_unsupported_operation",
+        StorageRpcErrorCode::Internal => "storage_rpc_internal",
+        StorageRpcErrorCode::ResourceExhausted => "storage_rpc_resource_exhausted",
+        StorageRpcErrorCode::ReclaimClaimNotFound => "storage_rpc_reclaim_claim_not_found",
+        StorageRpcErrorCode::ShardDeleteInProgress => "storage_rpc_shard_delete_in_progress",
+        StorageRpcErrorCode::BucketWriteDrainConflict => "storage_rpc_bucket_write_drain_conflict",
+        StorageRpcErrorCode::BucketWriteDrainNotFound => "storage_rpc_bucket_write_drain_not_found",
+        StorageRpcErrorCode::ReclaimClaimConflict => "storage_rpc_reclaim_claim_conflict",
+        StorageRpcErrorCode::NotFound => "storage_rpc_not_found",
+        StorageRpcErrorCode::BucketWriteReservationConflict => {
+            "storage_rpc_bucket_write_reservation_conflict"
+        }
+        StorageRpcErrorCode::BucketWriteReservationNotFound => {
+            "storage_rpc_bucket_write_reservation_not_found"
+        }
+        StorageRpcErrorCode::MetadataCommandContention => "storage_rpc_metadata_command_contention",
+        StorageRpcErrorCode::MetadataTransferHistoricalRouteActive => {
+            "storage_rpc_metadata_transfer_historical_route_active"
         }
     }
 }
@@ -10785,6 +10932,77 @@ mod metadata_command_checkpoint_record_error_tests {
                 message: "metadata state digest mismatch".to_string(),
             },
         ));
+    }
+
+    #[test]
+    fn metadata_checkpoint_record_error_kind_labels_checkpoint_integrity_failures() {
+        let epoch = ClusterEpoch::new(3).unwrap();
+        assert_eq!(
+            metadata_command_checkpoint_record_error_kind(
+                &StoreError::MetadataCommandLogHashMismatch {
+                    node_id: 0,
+                    pg_id: 7,
+                    cluster_epoch: epoch,
+                    log_index: 9,
+                    expected_previous_log_hash: 11,
+                    actual_previous_log_hash: 12,
+                    expected_log_hash: 13,
+                    actual_log_hash: 14,
+                }
+            ),
+            "metadata_command_log_hash_mismatch"
+        );
+        assert_eq!(
+            metadata_command_checkpoint_record_error_kind(
+                &StoreError::MetadataCommandReplicaStateDiverged {
+                    node_id: 0,
+                    reference_node_id: 1,
+                    pg_id: 7,
+                    cluster_epoch: epoch,
+                    reference_cluster_epoch: epoch,
+                    applied_log_index: 9,
+                    reference_applied_log_index: 8,
+                    applied_log_hash: 10,
+                    reference_applied_log_hash: 11,
+                    state_digest: 12,
+                    reference_state_digest: 13,
+                }
+            ),
+            "metadata_command_replica_state_diverged"
+        );
+        assert_eq!(
+            metadata_command_checkpoint_record_error_kind(
+                &StoreError::MetadataStateDigestMismatch {
+                    node_id: 0,
+                    pg_id: 7,
+                    cluster_epoch: epoch,
+                    expected_digest: 12,
+                    actual_digest: 13,
+                }
+            ),
+            "metadata_state_digest_mismatch"
+        );
+        assert_eq!(
+            metadata_command_checkpoint_record_error_kind(&StoreError::MetadataCheckpointInvalid {
+                node_id: 0,
+                pg_id: 7,
+                cluster_epoch: epoch,
+                reason: "frame hash mismatch".to_string(),
+            }),
+            "metadata_checkpoint_invalid"
+        );
+        assert_eq!(
+            metadata_command_checkpoint_record_error_kind(
+                &StoreError::MetadataTransferUnsupportedProof {
+                    node_id: 0,
+                    pg_id: 7,
+                    cluster_epoch: epoch,
+                    applied_log_index: 9,
+                    applied_log_hash: 10,
+                }
+            ),
+            "metadata_transfer_unsupported_proof"
+        );
     }
 }
 

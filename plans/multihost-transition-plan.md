@@ -9025,6 +9025,12 @@ Status update:
   for `bucket_delete_finalize_outstanding_depth` to drain, and prints
   retry-pressure deltas for `OperationAborted`, `SlowDown`, request errors, and
   bucket-delete finalizer queue/outstanding depth.
+- Added a typed `metadata_command_checkpoint_record_error_by_pg_total` debug
+  metrics family and UAT summary output for checkpoint-record hard failures and
+  stale-route skips. This keeps route-race evidence such as unknown PGs,
+  inactive routes, route-map expiry, metadata-command contention, and
+  transfer-route inspection races visible in ordinary soak logs instead of
+  requiring a second run with deep tracing.
 - Remaining close-out work is concentrated in deterministic interleaving tests,
   cleanup stress/diagnostics, and checking whether any foreground loops still
   need an earlier retry boundary before route-map validity expires.
