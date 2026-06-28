@@ -3158,6 +3158,10 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
             snapshot.bump_authority_after_restart()?;
             snapshot.record_history_from(&previous_snapshot);
         }
+        #[cfg(any(test, debug_assertions))]
+        if let Err(error) = snapshot.validate_invariants() {
+            panic!("attempted to open invalid control-plane snapshot: {error}");
+        }
         store.save(&snapshot)?;
         Ok(Self { store, snapshot })
     }
@@ -3735,6 +3739,10 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
         mut next_snapshot: ClusterControlSnapshot,
     ) -> Result<(), ControlPlaneError> {
         next_snapshot.record_history_from(&self.snapshot);
+        #[cfg(any(test, debug_assertions))]
+        if let Err(error) = next_snapshot.validate_invariants() {
+            panic!("attempted to commit invalid control-plane snapshot: {error}");
+        }
         self.store.save(&next_snapshot)?;
         self.snapshot = next_snapshot;
         Ok(())
@@ -8631,6 +8639,56 @@ mod tests {
             error.contains("metadata transfer proof is below the proof floor"),
             "unexpected invariant error: {error}"
         );
+    }
+
+    #[test]
+    #[should_panic(expected = "attempted to commit invalid control-plane snapshot")]
+    fn direct_snapshot_commit_validates_control_plane_invariants() {
+        let tmp = test_util::tempdir();
+        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+        authority
+            .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
+            .unwrap();
+        assert!(heartbeat_until_serving(&mut authority, 1, 1_000).serving());
+        let pg_id = PgId::new(26);
+        authority
+            .set_pg_acting_set(pg_id, vec![NodeId::new(1)])
+            .unwrap();
+
+        let mut snapshot = authority.snapshot().clone();
+        let pg = snapshot.pgs.get_mut(&pg_id).unwrap();
+        pg.state = PgState::Active;
+        pg.active_primary = Some(NodeId::new(1));
+        pg.active_metadata_proof = Some(PgMetadataProof::empty());
+        authority.commit_snapshot(snapshot).unwrap();
+    }
+
+    #[test]
+    #[should_panic(expected = "attempted to open invalid control-plane snapshot")]
+    fn open_validates_control_plane_invariants_before_saving() {
+        let pg_id = PgId::new(27);
+        let mut snapshot = ClusterControlSnapshot::empty();
+        snapshot.nodes.insert(
+            NodeId::new(1),
+            NodeControlRecord::new(NodeId::new(1), NodeMembershipState::Active),
+        );
+        snapshot.pgs.insert(
+            pg_id,
+            PgControlRecord {
+                pg_id,
+                state: PgState::Peering,
+                acting_set: vec![NodeId::new(1)],
+                peering_metadata_transfer: Some(PgMetadataTransferProof::new(
+                    ClusterEpoch::new(7).unwrap(),
+                    PgMetadataProof::empty(),
+                )),
+                ..PgControlRecord::new(pg_id, vec![NodeId::new(1)])
+            },
+        );
+
+        let store = FailingStore::new(snapshot);
+        let _ = SingleAuthorityControlPlane::open(store);
     }
 
     #[test]
