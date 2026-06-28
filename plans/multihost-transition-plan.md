@@ -9002,6 +9002,11 @@ Status update:
   `ListMultipartUploads`. This does not hide local `InternalError`; it makes the
   failure report show whether cleanup still saw live objects, versions,
   delete markers, or MPUs when `DeleteBucket` failed.
+- Added a storage-level regression for restart between delete-drain acquisition
+  and `MarkBucketDeleting` apply. Reopening with an active pre-mark delete drain
+  now proves `DeleteBucket` returns retryable metadata-command contention
+  quickly, preserves the active drain, and leaves the bucket Active until the
+  drain can be retried or expire-recovered.
 - Remaining close-out work is concentrated in deterministic interleaving tests,
   cleanup stress/diagnostics, and checking whether any foreground loops still
   need an earlier retry boundary before route-map validity expires.
