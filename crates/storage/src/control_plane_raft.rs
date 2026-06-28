@@ -126,6 +126,24 @@ impl ControlPlaneRaftAuthority {
         &self.raft
     }
 
+    pub async fn initialize_membership(
+        &self,
+        nodes: BTreeMap<ControlPlaneRaftNodeId, BasicNode>,
+    ) -> Result<(), ControlPlaneError> {
+        self.raft
+            .initialize(nodes)
+            .await
+            .map_err(|error| openraft_remote_error("initialize", error))?;
+        Ok(())
+    }
+
+    pub async fn is_initialized(&self) -> Result<bool, ControlPlaneError> {
+        self.raft
+            .is_initialized()
+            .await
+            .map_err(|error| openraft_remote_error("is-initialized", error))
+    }
+
     pub async fn submit_control_plane_command(
         &self,
         command: ControlPlaneCommand,
@@ -168,6 +186,13 @@ impl ControlPlaneRaftAuthority {
             committed,
             applied,
         })
+    }
+
+    pub async fn shutdown(&self) -> Result<(), ControlPlaneError> {
+        self.raft
+            .shutdown()
+            .await
+            .map_err(|error| openraft_remote_error("shutdown", error))
     }
 }
 
@@ -2687,13 +2712,16 @@ mod tests {
             .await
             .unwrap();
 
-            raft.initialize(BTreeMap::from([(1, BasicNode::new("node-1"))]))
+            let authority = ControlPlaneRaftAuthority::new(raft);
+            authority
+                .initialize_membership(BTreeMap::from([(1, BasicNode::new("node-1"))]))
                 .await
                 .unwrap();
-            assert!(raft.is_initialized().await.unwrap());
+            assert!(authority.is_initialized().await.unwrap());
 
             let bootstrap_log_id = raft_log_id(0, 1, 0);
-            let raft_state = raft
+            let raft_state = authority
+                .raft()
                 .with_raft_state(|state| *state.membership_state.effective().log_id())
                 .await
                 .unwrap();
@@ -2706,7 +2734,7 @@ mod tests {
             assert_eq!(entries[0].log_id, bootstrap_log_id);
             assert!(matches!(entries[0].payload, EntryPayload::Membership(_)));
 
-            raft.shutdown().await.unwrap();
+            authority.shutdown().await.unwrap();
         });
     }
 
@@ -2725,11 +2753,12 @@ mod tests {
             .await
             .unwrap();
 
-            raft.initialize(BTreeMap::from([(1, BasicNode::new("node-1"))]))
+            let authority = ControlPlaneRaftAuthority::new(raft);
+            authority
+                .initialize_membership(BTreeMap::from([(1, BasicNode::new("node-1"))]))
                 .await
                 .unwrap();
-            wait_for_local_leader(&raft, "single-node initialization leadership").await;
-            let authority = ControlPlaneRaftAuthority::new(raft);
+            wait_for_local_leader(authority.raft(), "single-node initialization leadership").await;
 
             let bootstrap = authority
                 .submit_control_plane_command(ControlPlaneCommand::BootstrapInitialClusterMap {
@@ -2782,7 +2811,7 @@ mod tests {
             assert_eq!(status.committed(), Some(rejected_log_id));
             assert_eq!(status.applied(), Some(rejected_log_id));
 
-            authority.raft().shutdown().await.unwrap();
+            authority.shutdown().await.unwrap();
         });
     }
 
@@ -2801,11 +2830,12 @@ mod tests {
             .await
             .unwrap();
 
-            raft.initialize(BTreeMap::from([(1, BasicNode::new("node-1"))]))
+            let authority = ControlPlaneRaftAuthority::new(raft);
+            authority
+                .initialize_membership(BTreeMap::from([(1, BasicNode::new("node-1"))]))
                 .await
                 .unwrap();
-            wait_for_local_leader(&raft, "single-node read-index leadership").await;
-            let authority = ControlPlaneRaftAuthority::new(raft);
+            wait_for_local_leader(authority.raft(), "single-node read-index leadership").await;
 
             let write = authority
                 .submit_control_plane_command(ControlPlaneCommand::BootstrapInitialClusterMap {
@@ -2845,7 +2875,7 @@ mod tests {
                 .iter()
                 .any(|node| node.node_id() == NodeId::new(1)));
 
-            authority.raft().shutdown().await.unwrap();
+            authority.shutdown().await.unwrap();
         });
     }
 
@@ -2864,14 +2894,17 @@ mod tests {
             .await
             .unwrap();
 
-            raft.initialize(BTreeMap::from([
-                (1, BasicNode::new("node-1")),
-                (2, BasicNode::new("node-2")),
-            ]))
-            .await
-            .unwrap();
+            let authority = ControlPlaneRaftAuthority::new(raft);
+            authority
+                .initialize_membership(BTreeMap::from([
+                    (1, BasicNode::new("node-1")),
+                    (2, BasicNode::new("node-2")),
+                ]))
+                .await
+                .unwrap();
 
-            let err = raft
+            let err = authority
+                .raft()
                 .ensure_linearizable(ReadPolicy::ReadIndex)
                 .await
                 .unwrap_err();
@@ -2879,7 +2912,6 @@ mod tests {
             assert_eq!(forward_to_leader.leader_id, None);
             assert_eq!(forward_to_leader.leader_node, None);
 
-            let authority = ControlPlaneRaftAuthority::new(raft);
             let err = authority
                 .linearized_runtime_map_snapshot(44_000)
                 .await
@@ -2903,7 +2935,7 @@ mod tests {
                     if message.contains("OpenRaft client-write failed")
             ));
 
-            authority.raft().shutdown().await.unwrap();
+            authority.shutdown().await.unwrap();
         });
     }
 

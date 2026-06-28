@@ -9380,6 +9380,10 @@ Phase 12.1 progress:
   local node id, learned leader, last log id, committed id, and state-machine
   applied id. The single-node public smoke now verifies those fields after an
   applied command followed by a deterministic semantic rejection.
+- Added authority lifecycle methods for OpenRaft membership initialization,
+  initialized-state checks, and shutdown. The public OpenRaft smokes now use
+  the wrapper for lifecycle operations, leaving raw `Raft` access only for
+  white-box assertions and test-only leader waits.
 - Isolated the public OpenRaft smokes with distinct cluster names so the normal
   parallel `control_plane_raft` test group cannot share OpenRaft test identity
   while still exercising the real client-write and read-index paths.
