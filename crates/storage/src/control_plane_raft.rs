@@ -46,6 +46,35 @@ pub enum ControlPlaneRaftApplyResponse {
     Rejected(ControlPlaneError),
 }
 
+#[derive(Debug)]
+pub enum ControlPlaneRaftCommandOutcome {
+    Applied(ControlPlaneCommandResponse),
+    Rejected(ControlPlaneError),
+}
+
+#[derive(Debug)]
+pub struct SubmittedControlPlaneRaftCommand {
+    log_id: LogIdOf<ControlPlaneRaftTypeConfig>,
+    outcome: ControlPlaneRaftCommandOutcome,
+}
+
+impl SubmittedControlPlaneRaftCommand {
+    #[must_use]
+    pub fn log_id(&self) -> LogIdOf<ControlPlaneRaftTypeConfig> {
+        self.log_id
+    }
+
+    #[must_use]
+    pub fn outcome(&self) -> &ControlPlaneRaftCommandOutcome {
+        &self.outcome
+    }
+
+    #[must_use]
+    pub fn into_outcome(self) -> ControlPlaneRaftCommandOutcome {
+        self.outcome
+    }
+}
+
 openraft::declare_raft_types!(
     pub ControlPlaneRaftTypeConfig:
         D = ControlPlaneCommand,
@@ -94,6 +123,36 @@ pub fn raft_log_id_from_control_plane(
 pub fn assert_openraft_type_config() {
     fn assert_config<C: RaftTypeConfig>() {}
     assert_config::<ControlPlaneRaftTypeConfig>();
+}
+
+pub async fn submit_control_plane_command_via_openraft(
+    raft: &Raft<ControlPlaneRaftTypeConfig, ControlPlaneRaftStateMachine>,
+    command: ControlPlaneCommand,
+) -> Result<SubmittedControlPlaneRaftCommand, ControlPlaneError> {
+    let response = raft
+        .client_write(command)
+        .await
+        .map_err(|error| openraft_remote_error("client-write", error))?;
+    let outcome = match response.data {
+        ControlPlaneRaftApplyResponse::Applied(response) => {
+            ControlPlaneRaftCommandOutcome::Applied(response)
+        }
+        ControlPlaneRaftApplyResponse::Rejected(error) => {
+            ControlPlaneRaftCommandOutcome::Rejected(error)
+        }
+        ControlPlaneRaftApplyResponse::Blank | ControlPlaneRaftApplyResponse::Membership => {
+            return Err(ControlPlaneError::CommandDecode {
+                message: format!(
+                    "OpenRaft client-write for control-plane command returned non-command response at {}",
+                    response.log_id
+                ),
+            });
+        }
+    };
+    Ok(SubmittedControlPlaneRaftCommand {
+        log_id: response.log_id,
+        outcome,
+    })
 }
 
 pub async fn runtime_map_via_openraft_read_index(
@@ -2575,35 +2634,39 @@ mod tests {
                 .unwrap();
             wait_for_local_leader(&raft, "single-node initialization leadership").await;
 
-            let bootstrap = raft
-                .client_write(ControlPlaneCommand::BootstrapInitialClusterMap {
+            let bootstrap = submit_control_plane_command_via_openraft(
+                &raft,
+                ControlPlaneCommand::BootstrapInitialClusterMap {
                     nodes: vec![(NodeId::new(1), "node-1".to_string())],
                     pg_ids: vec![PgId::new(0)],
-                })
-                .await
-                .unwrap();
-            let bootstrap_log_id = bootstrap.log_id;
+                },
+            )
+            .await
+            .unwrap();
+            let bootstrap_log_id = bootstrap.log_id();
             assert!(matches!(
-                bootstrap.data,
-                ControlPlaneRaftApplyResponse::Applied(
+                bootstrap.outcome(),
+                ControlPlaneRaftCommandOutcome::Applied(
                     ControlPlaneCommandResponse::BootstrapInitialClusterMap
                 )
             ));
 
-            let rejected = raft
-                .client_write(ControlPlaneCommand::MarkNodeAvailability {
+            let rejected = submit_control_plane_command_via_openraft(
+                &raft,
+                ControlPlaneCommand::MarkNodeAvailability {
                     node_id: NodeId::new(99),
                     availability: NodeAvailabilityState::Healthy,
-                })
-                .await
-                .unwrap();
-            assert_eq!(rejected.log_id.index(), bootstrap_log_id.index() + 1);
-            let rejected_log_id = rejected.log_id;
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(rejected.log_id().index(), bootstrap_log_id.index() + 1);
+            let rejected_log_id = rejected.log_id();
             assert!(matches!(
-                rejected.data,
-                ControlPlaneRaftApplyResponse::Rejected(ControlPlaneError::UnknownNode {
+                rejected.outcome(),
+                ControlPlaneRaftCommandOutcome::Rejected(ControlPlaneError::UnknownNode {
                     node_id
-                }) if node_id == 99
+                }) if *node_id == 99
             ));
 
             let applied_state = raft
@@ -2642,16 +2705,18 @@ mod tests {
                 .unwrap();
             wait_for_local_leader(&raft, "single-node read-index leadership").await;
 
-            let write = raft
-                .client_write(ControlPlaneCommand::BootstrapInitialClusterMap {
+            let write = submit_control_plane_command_via_openraft(
+                &raft,
+                ControlPlaneCommand::BootstrapInitialClusterMap {
                     nodes: vec![(NodeId::new(1), "node-1".to_string())],
                     pg_ids: vec![PgId::new(0)],
-                })
-                .await
-                .unwrap();
+                },
+            )
+            .await
+            .unwrap();
             assert!(matches!(
-                write.data,
-                ControlPlaneRaftApplyResponse::Applied(
+                write.outcome(),
+                ControlPlaneRaftCommandOutcome::Applied(
                     ControlPlaneCommandResponse::BootstrapInitialClusterMap
                 )
             ));
@@ -2723,6 +2788,21 @@ mod tests {
                 err,
                 ControlPlaneError::RpcRemote { message }
                     if message.contains("OpenRaft read-index failed")
+            ));
+
+            let err = submit_control_plane_command_via_openraft(
+                &raft,
+                ControlPlaneCommand::BootstrapInitialClusterMap {
+                    nodes: vec![(NodeId::new(1), "node-1".to_string())],
+                    pg_ids: vec![PgId::new(0)],
+                },
+            )
+            .await
+            .unwrap_err();
+            assert!(matches!(
+                err,
+                ControlPlaneError::RpcRemote { message }
+                    if message.contains("OpenRaft client-write failed")
             ));
 
             raft.shutdown().await.unwrap();

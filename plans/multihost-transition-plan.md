@@ -9353,6 +9353,12 @@ Phase 12.1 progress:
   semantic rejection return through OpenRaft's client response path, and
   verifies the rejected command advances the applied cursor without creating
   node state.
+- Added an adapter-facing OpenRaft command-submit helper that maps
+  `client_write` into an Argmin-shaped committed command outcome. Applied
+  commands and deterministic semantic rejections both return as data with the
+  OpenRaft log id, while OpenRaft API failures remain transport/consensus
+  errors. The public OpenRaft smokes now exercise applied, rejected, and
+  not-leader submit paths through this helper.
 - Isolated the public OpenRaft smokes with distinct cluster names so the normal
   parallel `control_plane_raft` test group cannot share OpenRaft test identity
   while still exercising the real client-write and read-index paths.
