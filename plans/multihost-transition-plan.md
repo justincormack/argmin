@@ -8988,8 +8988,9 @@ Status update:
   boundary. Storage-node overload remains `SlowDown`.
 - Added coordinator-level regressions for `DeleteBucket` using an already
   expired route map, for `DeleteBucket` begin crossing route-map expiry after
-  durable drain acquisition, and for bucket-delete finalization using an expired
-  route map. The finalizer command-contention regression remains in place.
+  durable drain acquisition, for bucket-delete finalization using an expired
+  route map, and for bucket-delete finalization using a stale metadata route.
+  The finalizer command-contention regression remains in place.
 - `DeleteBucket` begin/finalize foreground loops now explicitly check the pinned
   route map validity deadline at their loop gates, so a route map that expires
   while cleanup is in progress returns a typed retryable route-map expiry

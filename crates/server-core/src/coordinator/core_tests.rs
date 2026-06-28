@@ -1260,6 +1260,74 @@ fn same_store_cluster_with_route_map_validity(
     StorageCluster::from_local_map(Arc::new(local_map)).unwrap()
 }
 
+fn same_epoch_cluster_with_stale_current_pg_routes(
+    initial: &Arc<StorageCluster>,
+    node_root: &std::path::Path,
+) -> Arc<StorageCluster> {
+    let node_count = u32::from(initial.default_payload_ec_shape().k)
+        + u32::from(initial.default_payload_ec_shape().m);
+    let configs = (0..node_count)
+        .map(|node_id| {
+            LocalNodeStoreConfig::new(
+                NodeId::new(node_id),
+                node_root.join(format!("node-{node_id:04}")),
+            )
+        })
+        .collect::<Vec<_>>();
+    let next_epoch = ClusterEpoch::new(initial.cluster_epoch().get() + 1).unwrap();
+    let acting_set = (0..node_count).map(NodeId::new).collect::<Vec<_>>();
+    let routes = initial
+        .test_pg_ids()
+        .iter()
+        .map(|pg_id| {
+            let route = storage::control_plane::PgRouteSnapshot::reconstructed(
+                next_epoch,
+                PgId::new(*pg_id),
+                NodeId::new(0),
+                acting_set.clone(),
+                PgState::Active,
+            );
+            LocalPgRoute::from(&route)
+        })
+        .collect::<Vec<_>>();
+    let historical_routes = initial
+        .local_pg_routes()
+        .map(|route| {
+            storage::control_plane::PgRouteSnapshot::reconstructed(
+                route.cluster_epoch(),
+                route.pg_id(),
+                route.primary_node_id(),
+                route.acting_set().to_vec(),
+                route.state(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut local_map = LocalClusterMap::open_frontend_with_configs_and_pg_routes(
+        NodeId::new(0),
+        configs,
+        initial.test_pg_ids(),
+        initial.default_payload_ec_shape(),
+        next_epoch,
+        routes,
+    )
+    .unwrap();
+    local_map.test_install_historical_pg_routes(historical_routes);
+    let stale_current_routes = initial
+        .local_pg_routes()
+        .map(|route| {
+            storage::control_plane::PgRouteSnapshot::reconstructed(
+                route.cluster_epoch(),
+                route.pg_id(),
+                route.primary_node_id(),
+                route.acting_set().to_vec(),
+                route.state(),
+            )
+        })
+        .collect::<Vec<_>>();
+    local_map.test_install_pg_routes(stale_current_routes);
+    StorageCluster::from_local_map(Arc::new(local_map)).unwrap()
+}
+
 fn install_same_store_next_epoch_runtime_map_with_peering_pg(
     handle: &StorageClusterRuntimeMapHandle,
     initial: &Arc<StorageCluster>,
@@ -6625,6 +6693,46 @@ fn bucket_delete_finalizer_expired_route_map_maps_to_operation_aborted() {
     assert!(
         matches!(err, ServerError::OperationAborted),
         "expected bucket delete finalizer route-map expiry to map to OperationAborted, got {err:?}"
+    );
+}
+
+#[test]
+fn bucket_delete_finalizer_stale_metadata_route_maps_to_operation_aborted() {
+    let tmp = test_util::tempdir();
+    let storage_cluster = open_test_storage_cluster(tmp.path(), &[0]);
+    let coord = setup_same_process_coordinator_with_storage_cluster_without_background_sweepers(
+        Arc::clone(&storage_cluster),
+    );
+    coord
+        .create_bucket_for_owner("default-owner", "bucket", false)
+        .unwrap();
+    delete_bucket_test(&coord, "bucket").unwrap();
+
+    let bucket = trusted_bucket_name("bucket");
+    let stale_cluster =
+        same_epoch_cluster_with_stale_current_pg_routes(&storage_cluster, tmp.path());
+    let storage_err = stale_cluster
+        .try_finalize_bucket_delete(&bucket)
+        .unwrap_err();
+    assert!(
+        matches!(
+            storage_err,
+            storage::BucketWriteDrainError::Store(storage::StoreError::StaleMetadataRoute { .. })
+        ),
+        "fixture should exercise StaleMetadataRoute, got {storage_err:?}"
+    );
+
+    let stale_coord =
+        setup_same_process_coordinator_with_storage_cluster_without_background_sweepers(
+            stale_cluster,
+        );
+    let err = stale_coord
+        .read_runtime()
+        .try_finalize_bucket_delete_for(&bucket)
+        .unwrap_err();
+    assert!(
+        matches!(err, ServerError::OperationAborted),
+        "expected bucket delete finalizer stale metadata route to map to OperationAborted, got {err:?}"
     );
 }
 
