@@ -40,6 +40,7 @@ const ORPHAN_OBJECT_PAYLOAD_RECLAIM_BUCKET_INCARNATION: u64 = 0;
 const BUCKET_DELETE_FINALIZE_SCAN_LIMIT_PER_PG: usize = 16;
 const BUCKET_DELETE_BEGIN_WORK_BUDGET_MILLIS: u64 = 10_000;
 const BUCKET_DELETE_FINALIZE_WORK_BUDGET_MILLIS: u64 = 10_000;
+const BUCKET_DELETE_EXACT_BUCKET_PENDING_PROBE_PARALLELISM: usize = 8;
 const COMPLETED_MULTIPART_CLEANUP_WORK_BUDGET_MILLIS: u64 = 10_000;
 const BUCKET_DELETE_RESERVATION_DRAIN_WAIT_MILLIS: u64 = 1_000;
 const BUCKET_DELETE_DRAIN_LEASE_MILLIS: u64 = BUCKET_DELETE_BEGIN_WORK_BUDGET_MILLIS + 5_000;
@@ -2587,8 +2588,47 @@ impl super::StorageCluster {
         started: Option<std::time::Instant>,
         work_budget: &mut super::RequestWorkBudget,
     ) -> Result<(), BucketWriteDrainError> {
-        for raw_pg_id in self.metadata_pg_ids() {
-            let object_pg_id = PgId::new(raw_pg_id);
+        let object_pg_ids: Vec<PgId> = self.metadata_pg_ids().into_iter().map(PgId::new).collect();
+        for object_pg_id in &object_pg_ids {
+            self.check_bucket_delete_begin_work_budget(
+                bucket,
+                started,
+                "bucket delete exact-bucket drain budget exhausted",
+            )?;
+            if let Some(started) = started {
+                Self::emit_bucket_delete_begin_loop_step(
+                    bucket,
+                    self.bucket_metadata_pg_id(bucket).into(),
+                    started,
+                    "probe_exact_bucket_object_pg_start",
+                    format!("object_pg_id={}", object_pg_id.get()),
+                );
+            }
+        }
+        let exact_pending = self.pending_exact_bucket_metadata_commands_on_all_pgs(
+            bucket,
+            &object_pg_ids,
+            started,
+        )?;
+        self.check_bucket_delete_begin_work_budget(
+            bucket,
+            started,
+            "bucket delete exact-bucket drain budget exhausted",
+        )?;
+        if let Some(started) = started {
+            Self::emit_bucket_delete_begin_loop_step(
+                bucket,
+                self.bucket_metadata_pg_id(bucket).into(),
+                started,
+                "probe_exact_bucket_object_pgs_done",
+                format!(
+                    "object_pg_count={} exact_pending_count={}",
+                    object_pg_ids.len(),
+                    exact_pending.len()
+                ),
+            );
+        }
+        for (object_pg_id, command) in exact_pending {
             self.check_bucket_delete_begin_work_budget(
                 bucket,
                 started,
@@ -2600,7 +2640,11 @@ impl super::StorageCluster {
                     self.bucket_metadata_pg_id(bucket).into(),
                     started,
                     "drain_exact_bucket_object_pg_start",
-                    format!("object_pg_id={}", object_pg_id.get()),
+                    format!(
+                        "object_pg_id={} command_kind={}",
+                        object_pg_id.get(),
+                        command.payload().kind_name()
+                    ),
                 );
             }
             self.drain_pending_object_metadata_commands_for_exact_bucket_with_work_budget(
@@ -2621,6 +2665,48 @@ impl super::StorageCluster {
             }
         }
         Ok(())
+    }
+
+    fn pending_exact_bucket_metadata_commands_on_all_pgs(
+        &self,
+        bucket: &BucketName,
+        object_pg_ids: &[PgId],
+        started: Option<std::time::Instant>,
+    ) -> Result<Vec<(PgId, MetadataCommandEnvelope)>, BucketWriteDrainError> {
+        let mut exact_pending = Vec::new();
+        for chunk in object_pg_ids.chunks(BUCKET_DELETE_EXACT_BUCKET_PENDING_PROBE_PARALLELISM) {
+            let mut chunk_pending = std::thread::scope(|scope| {
+                let mut handles = Vec::with_capacity(chunk.len());
+                for &object_pg_id in chunk {
+                    handles.push((
+                        object_pg_id,
+                        scope.spawn(move || {
+                            self.pending_metadata_command_for_bucket(object_pg_id, bucket)
+                        }),
+                    ));
+                }
+
+                let mut chunk_pending = Vec::new();
+                for (object_pg_id, handle) in handles {
+                    let pending = match handle.join() {
+                        Ok(result) => result.map_err(BucketWriteDrainError::from)?,
+                        Err(payload) => std::panic::resume_unwind(payload),
+                    };
+                    if let Some(command) = pending.filter(|command| command.bucket_name() == bucket)
+                    {
+                        chunk_pending.push((object_pg_id, command));
+                    }
+                }
+                Ok::<_, BucketWriteDrainError>(chunk_pending)
+            })?;
+            exact_pending.append(&mut chunk_pending);
+            self.check_bucket_delete_begin_work_budget(
+                bucket,
+                started,
+                "bucket delete exact-bucket drain budget exhausted",
+            )?;
+        }
+        Ok(exact_pending)
     }
 
     fn check_bucket_delete_begin_work_budget(
