@@ -252,11 +252,13 @@ impl SharedStorageNode {
             let info = match PgMetadataStore::head_bucket_raw(&*bucket_pg, bucket) {
                 Ok(info) => info,
                 Err(crate::error::MetadataError::BucketNotFound { .. }) => {
+                    self.finish_bucket_delete_finalize_work(bucket);
                     return Ok(BucketDeleteFinalizeOutcome::NotFound);
                 }
                 Err(other) => return Err(other.into()),
             };
             if info.state != BucketState::Deleting {
+                self.finish_bucket_delete_finalize_work(bucket);
                 return Ok(BucketDeleteFinalizeOutcome::NotDeleting);
             }
         }
@@ -319,10 +321,16 @@ impl SharedStorageNode {
         })?;
 
         match self.delete_bucket_metadata(bucket) {
-            Ok(()) => Ok(BucketDeleteFinalizeOutcome::Finalized),
+            Ok(()) => {
+                self.finish_bucket_delete_finalize_work(bucket);
+                Ok(BucketDeleteFinalizeOutcome::Finalized)
+            }
             Err(crate::error::BucketWriteDrainError::Metadata(
                 crate::error::MetadataError::BucketNotFound { .. },
-            )) => Ok(BucketDeleteFinalizeOutcome::NotFound),
+            )) => {
+                self.finish_bucket_delete_finalize_work(bucket);
+                Ok(BucketDeleteFinalizeOutcome::NotFound)
+            }
             Err(other) => Err(other),
         }
     }

@@ -3855,6 +3855,7 @@ impl super::StorageCluster {
                         "bucket_finalize_not_found",
                         Some(format_args!("bucket={:?} pg_id={}", bucket, bucket_pg_id)),
                     );
+                    self.finish_bucket_delete_finalize_work(bucket);
                     return Ok(BucketDeleteFinalizeOutcome::NotFound);
                 }
                 Err(other) => return Err(bucket_snapshot_error_to_bucket_write_drain_error(other)),
@@ -3868,6 +3869,7 @@ impl super::StorageCluster {
                         bucket, bucket_pg_id, info.state
                     )),
                 );
+                self.finish_bucket_delete_finalize_work(bucket);
                 return Ok(BucketDeleteFinalizeOutcome::NotDeleting);
             }
             info.bucket_incarnation_generation
@@ -3939,18 +3941,21 @@ impl super::StorageCluster {
             ) => match release_finalizer_claim() {
                 Ok(()) => {
                     crate::node::maybe_run_after_bucket_delete_finalize_hook(bucket);
+                    self.finish_bucket_delete_finalize_work(bucket);
                     Ok(outcome)
                 }
                 Err(BucketWriteDrainError::Metadata(MetadataError::ReclaimClaimNotFound {
                     ..
                 })) => {
                     crate::node::maybe_run_after_bucket_delete_finalize_hook(bucket);
+                    self.finish_bucket_delete_finalize_work(bucket);
                     Ok(outcome)
                 }
                 Err(BucketWriteDrainError::Metadata(MetadataError::ReclaimClaimConflict {
                     ..
                 })) => {
                     crate::node::maybe_run_after_bucket_delete_finalize_hook(bucket);
+                    self.finish_bucket_delete_finalize_work(bucket);
                     Ok(outcome)
                 }
                 Err(error) => Err(error),
@@ -7850,6 +7855,15 @@ impl super::StorageCluster {
             .local_map
             .runtime_state()
             .enqueue_bucket_delete_finalize(bucket);
+    }
+
+    pub fn finish_bucket_delete_finalize_work(&self, bucket: &BucketName) {
+        if self.operation_epoch() != self.cluster_epoch() {
+            return;
+        }
+        self.local_map
+            .runtime_state()
+            .finish_bucket_delete_finalize_work(bucket);
     }
 
     pub fn try_take_reclaim_work(&self) -> Option<ReclaimWorkItem> {

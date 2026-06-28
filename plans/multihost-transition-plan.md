@@ -9020,6 +9020,11 @@ Status update:
   request-error evidence, and bucket-delete failure flight events. This keeps
   backend-neutral `s3-tests` unchanged while making UAT soak failures report the
   counters needed to separate expected retry pressure from local cleanup bugs.
+- Tightened `scripts/uat-s3-tests --smoke cleanup-versioned-stress` so it now
+  records pre-workload retry/error counters, fails if HTTP 500s increase, waits
+  for `bucket_delete_finalize_outstanding_depth` to drain, and prints
+  retry-pressure deltas for `OperationAborted`, `SlowDown`, request errors, and
+  bucket-delete finalizer queue/outstanding depth.
 - Remaining close-out work is concentrated in deterministic interleaving tests,
   cleanup stress/diagnostics, and checking whether any foreground loops still
   need an earlier retry boundary before route-map validity expires.

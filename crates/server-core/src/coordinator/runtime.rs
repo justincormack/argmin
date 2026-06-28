@@ -362,6 +362,7 @@ fn background_work_durable_backlog_active(snapshot: observability::MetricsSnapsh
         || snapshot.object_payload_reclaim_queue_depth > 0
         || snapshot.object_payload_reclaim_outstanding_depth > 0
         || snapshot.bucket_delete_finalize_queue_depth > 0
+        || snapshot.bucket_delete_finalize_outstanding_depth > 0
         || snapshot.shard_repair_queue_depth > 0
         || snapshot.shard_backfill_queue_depth > 0
 }
@@ -620,7 +621,12 @@ impl ReclaimSweeper {
                             }
                         }
                         ReclaimWorkItem::BucketDelete(bucket) => {
-                            let _ = runtime.try_finalize_bucket_delete_for(&bucket);
+                            match runtime.try_finalize_bucket_delete_for_with_outcome(&bucket) {
+                                Ok(outcome) if outcome.is_terminal() => {
+                                    worker_node.finish_bucket_delete_finalize_work(&bucket);
+                                }
+                                Ok(_) | Err(_) => {}
+                            }
                         }
                     }
                     if pending_work.is_none() && !deferred_object_payload_reclaim.is_empty() {
@@ -2522,19 +2528,26 @@ impl ReadRuntime {
         )
     }
 
+    #[cfg(test)]
     pub(super) fn try_finalize_bucket_delete_for(
         &self,
         bucket: &BucketName,
     ) -> Result<(), ServerError> {
-        match self.storage_node.try_finalize_bucket_delete(bucket) {
-            Ok(
-                storage::BucketDeleteFinalizeOutcome::NotFound
-                | storage::BucketDeleteFinalizeOutcome::NotDeleting
-                | storage::BucketDeleteFinalizeOutcome::Pending
-                | storage::BucketDeleteFinalizeOutcome::Finalized,
-            ) => Ok(()),
-            Err(error) => Err(super::bucket::map_bucket_write_drain_error(error)),
+        match self.try_finalize_bucket_delete_for_with_outcome(bucket)? {
+            storage::BucketDeleteFinalizeOutcome::NotFound
+            | storage::BucketDeleteFinalizeOutcome::NotDeleting
+            | storage::BucketDeleteFinalizeOutcome::Pending
+            | storage::BucketDeleteFinalizeOutcome::Finalized => Ok(()),
         }
+    }
+
+    pub(super) fn try_finalize_bucket_delete_for_with_outcome(
+        &self,
+        bucket: &BucketName,
+    ) -> Result<storage::BucketDeleteFinalizeOutcome, ServerError> {
+        self.storage_node
+            .try_finalize_bucket_delete(bucket)
+            .map_err(super::bucket::map_bucket_write_drain_error)
     }
 
     pub(super) fn read_checked_segment_payload(

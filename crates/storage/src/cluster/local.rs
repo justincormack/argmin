@@ -980,6 +980,7 @@ struct LocalReclaimQueueState {
     outstanding_objects: HashMap<LocalReclaimRoot, u32>,
     object_payload_outstanding_by_pg: HashMap<u32, usize>,
     queued_bucket_deletes: HashSet<BucketName>,
+    outstanding_bucket_deletes: HashSet<BucketName>,
 }
 
 #[derive(Debug)]
@@ -998,6 +999,7 @@ impl LocalClusterRuntimeState {
                     outstanding_objects: HashMap::new(),
                     object_payload_outstanding_by_pg: HashMap::new(),
                     queued_bucket_deletes: HashSet::new(),
+                    outstanding_bucket_deletes: HashSet::new(),
                 }),
                 Condvar::new(),
             ),
@@ -1146,6 +1148,7 @@ impl LocalClusterRuntimeState {
         let (state_lock, cv) = &self.reclaim_queue;
         let mut state = state_lock.lock().unwrap_or_else(|e| e.into_inner());
         let bucket = bucket.clone();
+        state.outstanding_bucket_deletes.insert(bucket.clone());
         if state.queued_bucket_deletes.insert(bucket.clone()) {
             state
                 .work_queue
@@ -1156,6 +1159,18 @@ impl LocalClusterRuntimeState {
         } else {
             Self::emit_reclaim_queue_action(&state, "bucket_delete", "deduplicate");
             false
+        }
+    }
+
+    pub(crate) fn finish_bucket_delete_finalize_work(&self, bucket: &BucketName) {
+        let mut state = self
+            .reclaim_queue
+            .0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        state.queued_bucket_deletes.remove(bucket);
+        if state.outstanding_bucket_deletes.remove(bucket) {
+            Self::emit_reclaim_queue_action(&state, "bucket_delete", "finish");
         }
     }
 
@@ -1292,6 +1307,7 @@ impl LocalClusterRuntimeState {
                 object_payload_depth: state.queued_objects.len(),
                 object_payload_outstanding_depth: state.outstanding_objects.len(),
                 bucket_delete_depth: state.queued_bucket_deletes.len(),
+                bucket_delete_outstanding_depth: state.outstanding_bucket_deletes.len(),
             },
         );
     }

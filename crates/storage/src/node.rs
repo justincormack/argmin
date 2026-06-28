@@ -398,6 +398,12 @@ pub enum BucketDeleteFinalizeOutcome {
     Finalized,
 }
 
+impl BucketDeleteFinalizeOutcome {
+    pub fn is_terminal(self) -> bool {
+        matches!(self, Self::NotFound | Self::NotDeleting | Self::Finalized)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum BucketCreateAttemptOutcome {
     Created(BucketInfo),
@@ -408,6 +414,7 @@ struct ReclaimQueueState {
     work_queue: VecDeque<ReclaimWorkItem>,
     queued_objects: HashSet<ReclaimRoot>,
     queued_bucket_deletes: HashSet<BucketName>,
+    outstanding_bucket_deletes: HashSet<BucketName>,
 }
 
 #[cfg(any(test, feature = "test-hooks"))]
@@ -451,6 +458,7 @@ impl SharedStorageNode {
                     work_queue: VecDeque::new(),
                     queued_objects: HashSet::new(),
                     queued_bucket_deletes: HashSet::new(),
+                    outstanding_bucket_deletes: HashSet::new(),
                 }),
                 Condvar::new(),
             ),
@@ -522,6 +530,7 @@ impl SharedStorageNode {
                     work_queue: VecDeque::new(),
                     queued_objects: HashSet::new(),
                     queued_bucket_deletes: HashSet::new(),
+                    outstanding_bucket_deletes: HashSet::new(),
                 }),
                 Condvar::new(),
             ),
@@ -1570,6 +1579,7 @@ impl SharedStorageNode {
         let (state_lock, cv) = &self.reclaim_queue;
         let mut state = state_lock.lock().unwrap_or_else(|e| e.into_inner());
         let bucket = bucket.clone();
+        state.outstanding_bucket_deletes.insert(bucket.clone());
         if state.queued_bucket_deletes.insert(bucket.clone()) {
             state
                 .work_queue
@@ -1580,6 +1590,18 @@ impl SharedStorageNode {
         } else {
             Self::emit_reclaim_queue_action(&state, "bucket_delete", "deduplicate");
             false
+        }
+    }
+
+    pub fn finish_bucket_delete_finalize_work(&self, bucket: &BucketName) {
+        let mut state = self
+            .reclaim_queue
+            .0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        state.queued_bucket_deletes.remove(bucket);
+        if state.outstanding_bucket_deletes.remove(bucket) {
+            Self::emit_reclaim_queue_action(&state, "bucket_delete", "finish");
         }
     }
 
@@ -1646,6 +1668,7 @@ impl SharedStorageNode {
                 object_payload_depth: state.queued_objects.len(),
                 object_payload_outstanding_depth: 0,
                 bucket_delete_depth: state.queued_bucket_deletes.len(),
+                bucket_delete_outstanding_depth: state.outstanding_bucket_deletes.len(),
             },
         );
     }
@@ -2355,6 +2378,35 @@ mod tests {
             node.try_finalize_bucket_delete(&bucket).unwrap(),
             BucketDeleteFinalizeOutcome::NotFound
         );
+    }
+
+    #[test]
+    fn bucket_delete_finalize_outstanding_survives_dequeue_until_finish() {
+        let tmp = test_util::tempdir();
+        let node = SharedStorageNode::open(tmp.path(), &[0, 1]).unwrap();
+        let bucket = bucket_name("bucket");
+
+        assert!(node.enqueue_bucket_delete_finalize(&bucket));
+        {
+            let state = node.reclaim_queue.0.lock().unwrap();
+            assert_eq!(state.queued_bucket_deletes.len(), 1);
+            assert_eq!(state.outstanding_bucket_deletes.len(), 1);
+        }
+
+        assert_eq!(
+            node.try_take_reclaim_work(),
+            Some(ReclaimWorkItem::BucketDelete(bucket.clone()))
+        );
+        {
+            let state = node.reclaim_queue.0.lock().unwrap();
+            assert!(state.queued_bucket_deletes.is_empty());
+            assert_eq!(state.outstanding_bucket_deletes.len(), 1);
+        }
+
+        node.finish_bucket_delete_finalize_work(&bucket);
+        let state = node.reclaim_queue.0.lock().unwrap();
+        assert!(state.queued_bucket_deletes.is_empty());
+        assert!(state.outstanding_bucket_deletes.is_empty());
     }
 
     #[test]
