@@ -9160,6 +9160,14 @@ Phase 12.1 progress:
   enforces the inner `ControlPlaneLogId` sequence for normal/no-op entries, but
   the wrapper now also protects OpenRaft metadata-only entries and the
   `(term=0,index=0)` bootstrap bypass.
+- Added an OpenRaft-shaped runtime-map read-index helper on the state-machine
+  wrapper. The wrapper now requires the proof input to exactly equal the full
+  applied OpenRaft log id `(term,node,index)` before delegating to the
+  dependency-free command state-machine's `ReadIndex` proof builder, and
+  rejects invalid bootstrap/zero read indexes, unapplied indexes, and
+  same-term/index leader-node mismatches. This keeps the eventual OpenRaft read
+  adapter from accidentally publishing a freshness proof for a log point that
+  is only partially represented by the inner `ControlPlaneLogId`.
 - Added a single-node OpenRaft initialization smoke over the in-memory log
   store and state-machine wrapper. The test uses a deliberately unreachable
   network factory, constructs an actual `Raft` instance, calls

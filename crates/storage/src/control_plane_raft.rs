@@ -23,7 +23,7 @@ use openraft::RaftTypeConfig;
 use openraft::StoredMembership;
 use placement::NodeId;
 
-use crate::control_plane::ControlPlaneError;
+use crate::control_plane::{ClusterRuntimeMapSnapshot, ControlPlaneError};
 use crate::control_plane_command::{
     ControlPlaneCommand, ControlPlaneCommandResponse, ControlPlaneLogId,
     ControlPlaneSnapshotArtifact, ReplicatedControlPlaneStateMachine,
@@ -615,6 +615,39 @@ impl ControlPlaneRaftStateMachine {
         (self.last_applied, self.last_membership.clone())
     }
 
+    pub fn runtime_map_for_applied_read_index(
+        &self,
+        read_index: LogIdOf<ControlPlaneRaftTypeConfig>,
+        issued_at_ms: u64,
+    ) -> Result<ClusterRuntimeMapSnapshot, ControlPlaneError> {
+        let control_plane_read_index = control_plane_log_id_from_raft(read_index).ok_or_else(|| {
+            ControlPlaneError::CommandDecode {
+                message: format!(
+                    "invalid OpenRaft read-index log id for control-plane runtime map proof: {read_index}"
+                ),
+            }
+        })?;
+        if self.last_applied != Some(read_index) {
+            if let Some(last_applied) = self.last_applied {
+                if last_applied.committed_leader_id().term == read_index.committed_leader_id().term
+                    && last_applied.index() == read_index.index()
+                {
+                    return Err(ControlPlaneError::CommandDecode {
+                        message: format!(
+                            "OpenRaft read-index log id {read_index} does not match applied log id {last_applied}"
+                        ),
+                    });
+                }
+            }
+            return Err(ControlPlaneError::ControlPlaneReadIndexNotApplied {
+                read_index: control_plane_read_index,
+                last_applied: self.inner.last_applied(),
+            });
+        }
+        self.inner
+            .runtime_map_for_read_index(control_plane_read_index, issued_at_ms)
+    }
+
     pub fn apply_entry(
         &mut self,
         entry: ControlPlaneRaftEntry,
@@ -1048,7 +1081,7 @@ mod tests {
     use openraft::type_config::TypeConfigExt;
     use openraft::{AnyError, Config, Membership, Raft};
 
-    use crate::control_plane::NodeAvailabilityState;
+    use crate::control_plane::{NodeAvailabilityState, RuntimeMapFreshnessProof};
     use crate::types::PgId;
 
     #[derive(Debug, Clone, Copy, Default)]
@@ -1604,6 +1637,78 @@ mod tests {
                 .map(|log_id| (log_id.term(), log_id.index())),
             Some((1, 2))
         );
+    }
+
+    #[test]
+    fn control_plane_raft_state_machine_runtime_map_read_index_uses_applied_log_id() {
+        let mut state_machine = ControlPlaneRaftStateMachine::empty();
+        state_machine
+            .apply_entry(normal_entry(
+                2,
+                7,
+                1,
+                ControlPlaneCommand::BootstrapInitialClusterMap {
+                    nodes: vec![(NodeId::new(1), "node-1".to_string())],
+                    pg_ids: vec![PgId::new(0)],
+                },
+            ))
+            .unwrap();
+
+        let runtime_map = state_machine
+            .runtime_map_for_applied_read_index(raft_log_id(2, 7, 1), 12_345)
+            .unwrap();
+
+        assert_eq!(
+            runtime_map.freshness_proof(),
+            &RuntimeMapFreshnessProof::ReadIndex {
+                authority_incarnation: runtime_map.freshness_proof().authority_incarnation(),
+                read_index: ControlPlaneLogId::new(2, 1).unwrap(),
+                issued_at_ms: 12_345,
+            }
+        );
+        assert_eq!(
+            runtime_map.freshness_proof().read_index(),
+            Some(ControlPlaneLogId::new(2, 1).unwrap())
+        );
+        assert!(runtime_map.freshness_proof().is_serving_authority_read());
+    }
+
+    #[test]
+    fn control_plane_raft_state_machine_runtime_map_rejects_unapplied_read_index() {
+        let mut state_machine = ControlPlaneRaftStateMachine::empty();
+        state_machine.apply_entry(blank_entry(3, 7, 1)).unwrap();
+
+        let future_index = state_machine
+            .runtime_map_for_applied_read_index(raft_log_id(3, 7, 2), 12_345)
+            .unwrap_err();
+        assert!(matches!(
+            future_index,
+            ControlPlaneError::ControlPlaneReadIndexNotApplied { .. }
+        ));
+
+        let lower_term_higher_index = state_machine
+            .runtime_map_for_applied_read_index(raft_log_id(2, 7, 2), 12_345)
+            .unwrap_err();
+        assert!(matches!(
+            lower_term_higher_index,
+            ControlPlaneError::ControlPlaneReadIndexNotApplied { .. }
+        ));
+
+        let same_position_different_leader = state_machine
+            .runtime_map_for_applied_read_index(raft_log_id(3, 8, 1), 12_345)
+            .unwrap_err();
+        assert!(matches!(
+            same_position_different_leader,
+            ControlPlaneError::CommandDecode { .. }
+        ));
+
+        let invalid_bootstrap_read_index = state_machine
+            .runtime_map_for_applied_read_index(raft_log_id(0, 7, 0), 12_345)
+            .unwrap_err();
+        assert!(matches!(
+            invalid_bootstrap_read_index,
+            ControlPlaneError::CommandDecode { .. }
+        ));
     }
 
     #[test]
