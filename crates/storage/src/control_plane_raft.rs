@@ -548,6 +548,13 @@ pub struct ControlPlaneRaftStateMachine {
     current_snapshot: Option<SnapshotOf<ControlPlaneRaftTypeConfig>>,
 }
 
+#[derive(Debug, Clone)]
+pub struct ControlPlaneRaftStateMachineRestartArtifact {
+    inner: ReplicatedControlPlaneStateMachine,
+    last_applied: Option<LogIdOf<ControlPlaneRaftTypeConfig>>,
+    last_membership: StoredMembershipOf<ControlPlaneRaftTypeConfig>,
+}
+
 impl ControlPlaneRaftStateMachine {
     #[must_use]
     pub fn empty() -> Self {
@@ -570,6 +577,25 @@ impl ControlPlaneRaftStateMachine {
             last_applied,
             last_membership,
         ))
+    }
+
+    #[must_use]
+    pub fn export_restart_artifact(&self) -> ControlPlaneRaftStateMachineRestartArtifact {
+        ControlPlaneRaftStateMachineRestartArtifact {
+            inner: self.inner.clone(),
+            last_applied: self.last_applied,
+            last_membership: self.last_membership.clone(),
+        }
+    }
+
+    pub fn from_restart_artifact(
+        artifact: ControlPlaneRaftStateMachineRestartArtifact,
+    ) -> Result<Self, ControlPlaneError> {
+        Self::new(
+            artifact.inner,
+            artifact.last_applied,
+            artifact.last_membership,
+        )
     }
 
     fn from_parts_unchecked(
@@ -1399,6 +1425,94 @@ mod tests {
             replicated_state_machine_with_noops(2, 3),
             Some(raft_log_id(2, 7, 3)),
             StoredMembership::new(Some(raft_log_id(2, 7, 4)), test_membership()),
+        )
+        .unwrap_err();
+        assert!(matches!(err, ControlPlaneError::SnapshotDecode { .. }));
+    }
+
+    #[test]
+    fn control_plane_raft_state_machine_restores_restart_artifact() {
+        let mut source = ControlPlaneRaftStateMachine::empty();
+        source
+            .apply_entry(normal_entry(
+                2,
+                7,
+                1,
+                ControlPlaneCommand::BootstrapInitialClusterMap {
+                    nodes: vec![(NodeId::new(1), "node-1".to_string())],
+                    pg_ids: vec![PgId::new(0)],
+                },
+            ))
+            .unwrap();
+        source.apply_entry(membership_entry(2, 7, 2)).unwrap();
+        assert!(matches!(
+            source
+                .apply_entry(normal_entry(
+                    2,
+                    7,
+                    3,
+                    ControlPlaneCommand::MarkNodeAvailability {
+                        node_id: NodeId::new(99),
+                        availability: NodeAvailabilityState::Healthy,
+                    },
+                ))
+                .unwrap(),
+            ControlPlaneRaftApplyResponse::Rejected(ControlPlaneError::UnknownNode { node_id: 99 })
+        ));
+
+        let artifact = source.export_restart_artifact();
+        let mut restored = ControlPlaneRaftStateMachine::from_restart_artifact(artifact).unwrap();
+
+        assert_eq!(restored.last_applied(), Some(raft_log_id(2, 7, 3)));
+        assert_eq!(
+            restored.last_membership().log_id(),
+            &Some(raft_log_id(2, 7, 2))
+        );
+        assert_eq!(restored.inner().snapshot(), source.inner().snapshot());
+        assert!(restored.current_snapshot().is_none());
+
+        restored.apply_entry(blank_entry(2, 7, 4)).unwrap();
+        let runtime_map = restored
+            .runtime_map_for_applied_read_index(raft_log_id(2, 7, 4), 12_345)
+            .unwrap();
+        assert_eq!(
+            runtime_map.freshness_proof().read_index(),
+            Some(ControlPlaneLogId::new(2, 4).unwrap())
+        );
+    }
+
+    #[test]
+    fn control_plane_raft_state_machine_rejects_invalid_restart_artifacts() {
+        let inner_with_applied = replicated_state_machine_with_noops(2, 3);
+        let err = ControlPlaneRaftStateMachine::from_restart_artifact(
+            ControlPlaneRaftStateMachineRestartArtifact {
+                inner: inner_with_applied.clone(),
+                last_applied: None,
+                last_membership: StoredMembership::default(),
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, ControlPlaneError::SnapshotDecode { .. }));
+
+        let err = ControlPlaneRaftStateMachine::from_restart_artifact(
+            ControlPlaneRaftStateMachineRestartArtifact {
+                inner: ReplicatedControlPlaneStateMachine::empty(),
+                last_applied: Some(raft_log_id(2, 7, 3)),
+                last_membership: StoredMembership::default(),
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, ControlPlaneError::SnapshotDecode { .. }));
+
+        let err = ControlPlaneRaftStateMachine::from_restart_artifact(
+            ControlPlaneRaftStateMachineRestartArtifact {
+                inner: inner_with_applied,
+                last_applied: Some(raft_log_id(2, 7, 3)),
+                last_membership: StoredMembership::new(
+                    Some(raft_log_id(2, 7, 4)),
+                    test_membership(),
+                ),
+            },
         )
         .unwrap_err();
         assert!(matches!(err, ControlPlaneError::SnapshotDecode { .. }));

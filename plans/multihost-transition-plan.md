@@ -9152,6 +9152,16 @@ Phase 12.1 progress:
   OpenRaft's leader node id, so the full `(term,node,index)` identity remains
   supplied and persisted by the OpenRaft metadata layer; the wrapper validates
   the term/index portion it can prove from the inner state.
+- Added restart-shaped validation for the in-memory OpenRaft state-machine
+  wrapper. The spike wrapper can now export an opaque restart artifact carrying
+  the dependency-free command state, full OpenRaft applied log id, and applied
+  membership metadata, then rebuild only through the checked constructor above.
+  Focused tests cover restoring after applied and deterministically rejected
+  committed commands, continuing replay from the restored point, and rejecting
+  malformed artifacts with missing wrapper log ids, phantom wrapper log ids, or
+  membership metadata beyond the applied point. The cached current snapshot is
+  intentionally not part of this artifact because it is rebuildable from the
+  authoritative state-machine state and OpenRaft metadata.
 - Tightened the in-memory OpenRaft state-machine wrapper's apply cursor. Before
   dispatching blank, membership, or normal entries, the wrapper now rejects
   first-entry gaps, duplicate/replayed bootstrap entries, lower-term next
