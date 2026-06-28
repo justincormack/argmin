@@ -161,6 +161,7 @@ impl ControlPlaneRaftLogStore {
         }
         Self::validate_committed_update(&inner, artifact.committed)?;
         inner.committed = artifact.committed;
+        Self::validate_purged_boundary_has_committed(&inner)?;
         Ok(Self {
             inner: Arc::new(Mutex::new(inner)),
         })
@@ -341,6 +342,25 @@ impl ControlPlaneRaftLogStore {
         }
         Err(raft_log_store_error(format!(
             "control-plane OpenRaft log store vote {vote} is older than committed log id {committed}"
+        )))
+    }
+
+    fn validate_purged_boundary_has_committed(
+        inner: &ControlPlaneRaftLogStoreInner,
+    ) -> Result<(), io::Error> {
+        let Some(last_purged_log_id) = inner.last_purged_log_id else {
+            return Ok(());
+        };
+        let Some(committed) = inner.committed else {
+            return Err(raft_log_store_error(format!(
+                "control-plane OpenRaft log store has purged boundary {last_purged_log_id} without a committed restart gate"
+            )));
+        };
+        if last_purged_log_id.index() <= committed.index() {
+            return Ok(());
+        }
+        Err(raft_log_store_error(format!(
+            "control-plane OpenRaft purged boundary {last_purged_log_id} is after committed log id {committed}"
         )))
     }
 }
@@ -621,6 +641,10 @@ impl RaftLogStorage<ControlPlaneRaftTypeConfig> for ControlPlaneRaftLogStore {
                     "cannot purge control-plane OpenRaft log to {log_id}; committed log id is {committed}"
                 )));
             }
+        } else {
+            return Err(raft_log_store_error(format!(
+                "cannot purge control-plane OpenRaft log to {log_id}; no committed restart gate"
+            )));
         }
         Self::validate_known_log_id(&inner, "purge to", log_id)?;
         inner.entries.retain(|index, _| *index > log_id.index());
@@ -2322,6 +2346,11 @@ mod tests {
                 .unwrap_err();
             assert!(err.to_string().contains("mismatched log id"));
 
+            let vote = Vote::<ControlPlaneRaftLeaderId>::new_committed(3, 1);
+            RaftLogStorage::save_vote(&mut store, &vote).await.unwrap();
+            RaftLogStorage::save_committed(&mut store, Some(raft_log_id(3, 1, 1)))
+                .await
+                .unwrap();
             RaftLogStorage::purge(&mut store, raft_log_id(3, 1, 1))
                 .await
                 .unwrap();
@@ -2757,6 +2786,8 @@ mod tests {
     fn control_plane_raft_log_store_rejects_append_after_max_index() {
         ControlPlaneRaftTypeConfig::run(async {
             let artifact = ControlPlaneRaftLogStoreRestartArtifact {
+                vote: Some(Vote::<ControlPlaneRaftLeaderId>::new_committed(3, 1)),
+                committed: Some(raft_log_id(3, 1, u64::MAX)),
                 last_purged_log_id: Some(raft_log_id(3, 1, u64::MAX)),
                 ..Default::default()
             };
@@ -2800,6 +2831,16 @@ mod tests {
             .await
             .unwrap();
 
+            let err = RaftLogStorage::purge(&mut store, raft_log_id(3, 1, 2))
+                .await
+                .unwrap_err();
+            assert!(err.to_string().contains("no committed restart gate"));
+
+            let vote = Vote::<ControlPlaneRaftLeaderId>::new_committed(3, 1);
+            RaftLogStorage::save_vote(&mut store, &vote).await.unwrap();
+            RaftLogStorage::save_committed(&mut store, Some(raft_log_id(3, 1, 2)))
+                .await
+                .unwrap();
             RaftLogStorage::purge(&mut store, raft_log_id(3, 1, 2))
                 .await
                 .unwrap();
@@ -2831,7 +2872,7 @@ mod tests {
 
             RaftLogStorage::truncate_after(&mut store, None)
                 .await
-                .unwrap();
+                .unwrap_err();
             let log_state = RaftLogStorage::get_log_state(&mut store).await.unwrap();
             assert_eq!(log_state.last_purged_log_id, Some(raft_log_id(3, 1, 2)));
             assert_eq!(log_state.last_log_id, Some(raft_log_id(3, 1, 2)));
