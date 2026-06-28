@@ -1277,6 +1277,7 @@ mod tests {
     use std::collections::{BTreeMap, BTreeSet};
     use std::future::Future;
     use std::sync::Arc;
+    use std::time::Duration;
 
     use super::*;
     use futures_util::stream;
@@ -1286,7 +1287,7 @@ mod tests {
         AppendEntriesRequest, AppendEntriesResponse, SnapshotResponse, VoteRequest, VoteResponse,
     };
     use openraft::type_config::TypeConfigExt;
-    use openraft::{AnyError, Config, Membership, Raft, ReadPolicy};
+    use openraft::{AnyError, Config, Membership, Raft, ReadPolicy, ServerState};
 
     use crate::control_plane::{
         ClusterControlSnapshot, NodeAvailabilityState, RuntimeMapFreshnessProof,
@@ -2490,6 +2491,77 @@ mod tests {
             assert_eq!(entries.len(), 1);
             assert_eq!(entries[0].log_id, bootstrap_log_id);
             assert!(matches!(entries[0].payload, EntryPayload::Membership(_)));
+
+            raft.shutdown().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn control_plane_openraft_triggered_single_node_client_write_applies_and_rejects() {
+        ControlPlaneRaftTypeConfig::run(async {
+            let log_store = ControlPlaneRaftLogStore::empty();
+            let state_machine = ControlPlaneRaftStateMachine::empty();
+            let raft = Raft::<ControlPlaneRaftTypeConfig, ControlPlaneRaftStateMachine>::new(
+                1,
+                test_raft_config(),
+                UnreachableRaftNetworkFactory,
+                log_store,
+                state_machine,
+            )
+            .await
+            .unwrap();
+
+            raft.initialize(BTreeMap::from([(1, BasicNode::new("node-1"))]))
+                .await
+                .unwrap();
+            raft.trigger().elect(false).await.unwrap();
+            raft.wait(Some(Duration::from_secs(1)))
+                .state(ServerState::Leader, "triggered single-node leadership")
+                .await
+                .unwrap();
+
+            let bootstrap = raft
+                .client_write(ControlPlaneCommand::BootstrapInitialClusterMap {
+                    nodes: vec![(NodeId::new(1), "node-1".to_string())],
+                    pg_ids: vec![PgId::new(0)],
+                })
+                .await
+                .unwrap();
+            let bootstrap_log_id = bootstrap.log_id;
+            assert!(matches!(
+                bootstrap.data,
+                ControlPlaneRaftApplyResponse::Applied(
+                    ControlPlaneCommandResponse::BootstrapInitialClusterMap
+                )
+            ));
+
+            let rejected = raft
+                .client_write(ControlPlaneCommand::MarkNodeAvailability {
+                    node_id: NodeId::new(99),
+                    availability: NodeAvailabilityState::Healthy,
+                })
+                .await
+                .unwrap();
+            assert_eq!(rejected.log_id.index(), bootstrap_log_id.index() + 1);
+            let rejected_log_id = rejected.log_id;
+            assert!(matches!(
+                rejected.data,
+                ControlPlaneRaftApplyResponse::Rejected(ControlPlaneError::UnknownNode {
+                    node_id
+                }) if node_id == 99
+            ));
+
+            let applied_state = raft
+                .with_state_machine(|state_machine| {
+                    let snapshot = state_machine.inner().snapshot().clone();
+                    let applied_state = ControlPlaneRaftStateMachine::applied_state(state_machine);
+                    Box::pin(async move { (snapshot, applied_state) })
+                })
+                .await
+                .unwrap();
+            assert!(applied_state.0.node(NodeId::new(1)).is_some());
+            assert!(applied_state.0.node(NodeId::new(99)).is_none());
+            assert_eq!(applied_state.1 .0, Some(rejected_log_id));
 
             raft.shutdown().await.unwrap();
         });

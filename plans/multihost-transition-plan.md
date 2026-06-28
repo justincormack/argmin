@@ -9333,13 +9333,13 @@ Phase 12.1 progress:
   `ensure_linearizable(ReadPolicy::ReadIndex)` with `ForwardToLeader` instead
   of permitting a local runtime-map read. This pins the fail-closed read
   boundary until the production adapter wires leader-side read-index serving.
-- Deferred the single-node OpenRaft `client_write` smoke for now. With
-  `openraft 0.10.0-alpha.26`, both timer-driven single-node leadership and
-  manual `trigger().elect(false)` made the test timing-sensitive or hit an
-  internal leader/vote assertion under repeated runs. Keep logical command
-  coverage at the deterministic `RaftStateMachine::apply` boundary and keep
-  the public OpenRaft smoke at initialization until the spike has a
-  deterministic multi-node/network harness or a stable leadership setup.
+- Added a deterministic public OpenRaft `client_write` smoke for a single-node
+  authority by disabling timer-driven elections, manually triggering election,
+  and waiting on the metrics `Leader` state rather than sleeping or relying on
+  randomized election timeouts. The smoke proves both an applied bootstrap
+  command and a deterministic semantic rejection return through OpenRaft's
+  client response path, and verifies the rejected command advances the applied
+  cursor without creating node state.
 
 1. define the replicated control-plane state machine:
    - state includes cluster epoch, PG count, PG state, PG acting sets, node
