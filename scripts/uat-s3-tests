@@ -1094,6 +1094,74 @@ wait_for_metadata_checkpoint_compaction_metrics() {
     done
 }
 
+metadata_checkpoint_response_field() {
+    local response_path="$1"
+    local field_name="$2"
+    awk -v field_name="$field_name" '
+        {
+            for (i = 1; i <= NF; i++) {
+                split($i, parts, "=")
+                if (parts[1] == field_name) {
+                    print parts[2]
+                    found = 1
+                }
+            }
+        }
+        END {
+            if (!found) {
+                print "0"
+            }
+        }
+    ' "$response_path"
+}
+
+record_metadata_checkpoint_for_pg() {
+    local pg_id="$1"
+    local deadline_seconds="$2"
+    local metrics_path="$3"
+    local min_checkpoint_deleted_entries="$4"
+    local start
+    start="$(date +%s)"
+    while true; do
+        local response_path
+        response_path="$(mktemp)"
+        local status
+        status="$(curl -k -sS -o "$response_path" -w '%{http_code}' -X POST "$endpoint/__argmin/debug/metadata-checkpoint/record/$pg_id" || true)"
+        local recorded
+        local compacted
+        local deleted_entries
+        local compaction_failed
+        local failed
+        recorded="$(metadata_checkpoint_response_field "$response_path" recorded)"
+        compacted="$(metadata_checkpoint_response_field "$response_path" compacted)"
+        deleted_entries="$(metadata_checkpoint_response_field "$response_path" compaction_deleted_entries)"
+        compaction_failed="$(metadata_checkpoint_response_field "$response_path" compaction_failed)"
+        failed="$(metadata_checkpoint_response_field "$response_path" failed)"
+        if ((compaction_failed > 0 || failed > 0)); then
+            cat "$response_path" >&2 || true
+            rm -f "$response_path"
+            die "metadata checkpoint forced record failed for PG $pg_id: compaction_failed=$compaction_failed failed=$failed"
+        fi
+        if [[ "$status" == "200" ]]; then
+            sample_frontend_metrics "$metrics_path"
+            local metric_deleted_entries
+            metric_deleted_entries="$(latest_metric_sample_value "$metrics_path" metadata_command_checkpoint_record_compaction_deleted_entries_total)"
+            if ((recorded > 0 && ((compacted > 0 && deleted_entries > 0) || metric_deleted_entries > min_checkpoint_deleted_entries))); then
+                echo "== argmin-s3 UAT metadata checkpoint PG $pg_id: $(tr '\n' ' ' <"$response_path") metrics_deleted_entries=$metric_deleted_entries =="
+                rm -f "$response_path"
+                return 0
+            fi
+        fi
+        if (($(date +%s) - start >= deadline_seconds)); then
+            cat "$response_path" >&2 || true
+            rm -f "$response_path"
+            die "timed out recording compacted metadata checkpoint for PG $pg_id; last HTTP status $status recorded=$recorded compacted=$compacted deleted_entries=$deleted_entries"
+        fi
+        rm -f "$response_path"
+        sleep 0.2
+    done
+}
+
 print_slowdown_summary() {
     if ((slowdown_summary_printed)); then
         return 0
@@ -2207,15 +2275,11 @@ run_metadata_pg_migration_smoke() {
     "${pg_backfill_smoke_cmd[@]}" get "$bucket_file" "$new_key" "$new_body_file"
 
     sample_frontend_metrics "$metrics_path"
-    local min_checkpoint_recorded
-    local min_checkpoint_compacted
     local min_checkpoint_deleted_entries
     local max_checkpoint_record_failed
     local max_checkpoint_scan_error
     local max_checkpoint_compaction_failed
-    min_checkpoint_recorded="$(($(latest_metric_sample_value "$metrics_path" metadata_command_checkpoint_record_recorded_total) + 1))"
-    min_checkpoint_compacted="$(($(latest_metric_sample_value "$metrics_path" metadata_command_checkpoint_record_compacted_total) + 1))"
-    min_checkpoint_deleted_entries="$(($(latest_metric_sample_value "$metrics_path" metadata_command_checkpoint_record_compaction_deleted_entries_total) + 1))"
+    min_checkpoint_deleted_entries="$(latest_metric_sample_value "$metrics_path" metadata_command_checkpoint_record_compaction_deleted_entries_total)"
     max_checkpoint_record_failed="$(latest_metric_sample_value "$metrics_path" metadata_command_checkpoint_record_failed_total)"
     max_checkpoint_scan_error="$(latest_metric_sample_value "$metrics_path" metadata_command_checkpoint_record_scan_error_total)"
     max_checkpoint_compaction_failed="$(latest_metric_sample_value "$metrics_path" metadata_command_checkpoint_record_compaction_failed_total)"
@@ -2226,15 +2290,18 @@ run_metadata_pg_migration_smoke() {
     local final_key
     final_key="$(tr -d '[:space:]' <"$final_key_file")"
 
-    wait_for_metadata_checkpoint_compaction_metrics \
-        "$metrics_path" \
-        30 \
-        "$min_checkpoint_recorded" \
-        "$min_checkpoint_compacted" \
-        "$min_checkpoint_deleted_entries" \
-        "$max_checkpoint_record_failed" \
-        "$max_checkpoint_scan_error" \
-        "$max_checkpoint_compaction_failed"
+    record_metadata_checkpoint_for_pg "$target_metadata_pg" 30 "$metrics_path" "$min_checkpoint_deleted_entries"
+    sample_frontend_metrics "$metrics_path"
+    local checkpoint_record_failed
+    local checkpoint_scan_error
+    local checkpoint_compaction_failed
+    checkpoint_record_failed="$(latest_metric_sample_value "$metrics_path" metadata_command_checkpoint_record_failed_total)"
+    checkpoint_scan_error="$(latest_metric_sample_value "$metrics_path" metadata_command_checkpoint_record_scan_error_total)"
+    checkpoint_compaction_failed="$(latest_metric_sample_value "$metrics_path" metadata_command_checkpoint_record_compaction_failed_total)"
+    if ((checkpoint_record_failed > max_checkpoint_record_failed || checkpoint_scan_error > max_checkpoint_scan_error || checkpoint_compaction_failed > max_checkpoint_compaction_failed)); then
+        cat "$metrics_path" >&2 || true
+        die "metadata checkpoint smoke saw hard failure: record_failed=$checkpoint_record_failed scan_error=$checkpoint_scan_error compaction_failed=$checkpoint_compaction_failed"
+    fi
 
     echo "== argmin-s3 UAT metadata PG migration restart checkpoint source nodes =="
     restart_storage_node 0

@@ -4370,6 +4370,60 @@ impl StorageCluster {
         )
     }
 
+    pub fn record_current_metadata_command_checkpoint_for_pg(
+        &self,
+        pg_id: PgId,
+    ) -> Result<MetadataCommandCheckpointRecordSummary, StoreError> {
+        let mut summary = MetadataCommandCheckpointRecordSummary::default();
+        let route = self
+            .local_pg_route(pg_id)
+            .ok_or_else(|| StoreError::ClusterPgNotFound {
+                pg_id: pg_id.get(),
+                cluster_epoch: self.operation_epoch(),
+            })?;
+        summary.scanned += 1;
+        if route.state() != PgState::Active {
+            return Err(StoreError::PgNotActive {
+                pg_id: pg_id.get(),
+                cluster_epoch: route.cluster_epoch(),
+                state: route.state(),
+            });
+        }
+        let primary_node = self
+            .local_map
+            .metadata_pg_primary_node(self.operation_epoch(), pg_id)?;
+        let metadata_client = primary_node.metadata_command_client();
+        let state = metadata_client.metadata_command_replica_state(pg_id)?;
+        if state.cluster_epoch != route.cluster_epoch() {
+            return Err(StoreError::StaleMetadataRoute {
+                pg_id: pg_id.get(),
+                route_epoch: state.cluster_epoch,
+                current_epoch: route.cluster_epoch(),
+            });
+        }
+        if state.applied_log_index == 0 && state.applied_log_hash == 0 {
+            summary.skipped_empty += 1;
+            return Ok(summary);
+        }
+        match metadata_client.record_current_metadata_command_checkpoint(pg_id, state.cluster_epoch)
+        {
+            Ok(_) => {
+                summary.recorded += 1;
+                compact_metadata_command_log_for_checkpoint_record(
+                    metadata_client.as_ref(),
+                    pg_id,
+                    state.cluster_epoch,
+                    &mut summary,
+                );
+            }
+            Err(error) => {
+                note_metadata_command_checkpoint_record_error(pg_id, "failed", &error);
+                return Err(error);
+            }
+        }
+        Ok(summary)
+    }
+
     fn record_routine_metadata_command_checkpoints_with_limit(
         &self,
         limit: usize,

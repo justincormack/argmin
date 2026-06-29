@@ -27,7 +27,7 @@ use super::{HttpFrontend, S3HyperBody};
 use crate::coordinator::MAX_OBJECT_SIZE;
 use crate::error::ServerError;
 use server_core::metadata_blob::USER_METADATA_SIZE_LIMIT;
-use storage::{BucketName, SessionId};
+use storage::{BucketName, PgId, SessionId};
 
 const TRACE_TARGET: &str = "server_http";
 const MAX_STREAMING_POST_PART_HEADER_BYTES: usize = 8 * 1024;
@@ -1034,6 +1034,56 @@ fn local_debug_response(
                 error_diagnostic: None,
             })
         }
+        (&http::Method::POST, path)
+            if path.starts_with("/__argmin/debug/metadata-checkpoint/record/") =>
+        {
+            let raw_pg_id = path.trim_start_matches("/__argmin/debug/metadata-checkpoint/record/");
+            let Some(pg_id) = raw_pg_id.parse::<u32>().ok().map(PgId::new) else {
+                return Some(local_debug_text_response(
+                    400,
+                    "invalid pg id\n".to_string(),
+                ));
+            };
+            let result = state
+                .pool
+                .first()
+                .expect("server has at least one frontend")
+                .coordinator
+                .storage_node_for_request()
+                .record_current_metadata_command_checkpoint_for_pg(pg_id);
+            match result {
+                Ok(summary) => {
+                    let status_code = if summary.compaction_failed == 0 && summary.failed == 0 {
+                        200
+                    } else {
+                        409
+                    };
+                    Some(local_debug_text_response(
+                        status_code,
+                        format!(
+                            "pg_id={} scanned={} recorded={} already_current={} skipped_cadence={} skipped_inactive={} skipped_empty={} skipped_stale_epoch={} compacted={} compaction_deleted_entries={} compaction_noop={} compaction_no_checkpoint={} compaction_pending={} compaction_failed={} failed={} limit_reached={}\n",
+                            pg_id.get(),
+                            summary.scanned,
+                            summary.recorded,
+                            summary.already_current,
+                            summary.skipped_cadence,
+                            summary.skipped_inactive,
+                            summary.skipped_empty,
+                            summary.skipped_stale_epoch,
+                            summary.compacted,
+                            summary.compaction_deleted_entries,
+                            summary.compaction_noop,
+                            summary.compaction_no_checkpoint,
+                            summary.compaction_pending,
+                            summary.compaction_failed,
+                            summary.failed,
+                            summary.limit_reached
+                        ),
+                    ))
+                }
+                Err(error) => Some(local_debug_text_response(409, format!("{error}\n"))),
+            }
+        }
         (_, path) if path.starts_with("/__argmin/debug/") || path == "/__argmin/debug" => {
             let body = b"not found\n".to_vec();
             Some(S3Response {
@@ -1051,6 +1101,22 @@ fn local_debug_response(
             })
         }
         _ => None,
+    }
+}
+
+fn local_debug_text_response(status_code: u16, body: String) -> S3Response {
+    S3Response {
+        status_code,
+        headers: vec![
+            (
+                "Content-Type".to_string(),
+                "text/plain; charset=utf-8".to_string(),
+            ),
+            ("Content-Length".to_string(), body.len().to_string()),
+        ],
+        body: body.into_bytes(),
+        stream: None,
+        error_diagnostic: None,
     }
 }
 
@@ -4795,6 +4861,40 @@ mod tests {
         assert!(response.contains("request_admission_wait_total "));
         assert!(response.contains("request_admission_timeout_total "));
         assert!(!response.contains("bucket_lock_wait_exceeded_total "));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn local_debug_metadata_checkpoint_record_endpoint_bypasses_request_admission() {
+        let tmp = test_util::tempdir();
+        let frontend = setup_frontend(tmp.path());
+        let config = ServeConfig {
+            local_debug_endpoint: true,
+            ..ServeConfig::default()
+        };
+        let (addr, _guard) = start_test_server_with_config(frontend, config, 0).await;
+
+        let mut stream = StdTcpStream::connect(&addr).unwrap();
+        stream
+            .write_all(
+                concat!(
+                    "POST /__argmin/debug/metadata-checkpoint/record/0 HTTP/1.1\r\n",
+                    "Host: localhost\r\n",
+                    "Content-Length: 0\r\n",
+                    "Connection: close\r\n",
+                    "\r\n",
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+        let response = read_http_response(&mut stream, Duration::from_secs(3));
+
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert!(response
+            .to_ascii_lowercase()
+            .contains("content-type: text/plain; charset=utf-8"));
+        assert!(response.contains("pg_id=0"), "{response}");
+        assert!(response.contains("scanned=1"), "{response}");
+        assert!(response.contains("skipped_empty=1"), "{response}");
     }
 
     #[tokio::test(flavor = "multi_thread")]
