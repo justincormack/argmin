@@ -98,6 +98,11 @@ impl BucketVisibleDataSource {
     }
 }
 
+enum PutObjectStreamUploadCleanup {
+    Live(BucketVisibleDataSource),
+    Aborted { count: usize },
+}
+
 fn bucket_delete_visible_data_diagnostics_enabled() -> bool {
     std::env::var_os("ARGMIN_BUCKET_DELETE_VISIBLE_DATA_DIAGNOSTICS").is_some()
 }
@@ -3424,34 +3429,26 @@ impl super::StorageCluster {
                     bucket,
                     pg_id,
                     started,
-                    "active_stream_recheck_start",
+                    "stream_cleanup_start",
                     format!("iteration={loop_iteration}"),
                 );
-                if let Some(source) = self.active_put_object_stream_upload_source(bucket)? {
-                    return Err(self.bucket_delete_not_empty_error(bucket, pg_id, source));
+                match self.cleanup_abandoned_put_object_stream_uploads_for_bucket(bucket)? {
+                    PutObjectStreamUploadCleanup::Live(source) => {
+                        return Err(self.bucket_delete_not_empty_error(bucket, pg_id, source));
+                    }
+                    PutObjectStreamUploadCleanup::Aborted { count } => {
+                        Self::emit_bucket_delete_begin_loop_step(
+                            bucket,
+                            pg_id,
+                            started,
+                            "stream_cleanup_done",
+                            format!(
+                                "iteration={} pass=before_reservation_wait aborted_stream_uploads={}",
+                                loop_iteration, count
+                            ),
+                        );
+                    }
                 }
-                Self::emit_bucket_delete_begin_loop_step(
-                    bucket,
-                    pg_id,
-                    started,
-                    "active_stream_recheck_done",
-                    format!("iteration={loop_iteration}"),
-                );
-                Self::emit_bucket_delete_begin_loop_step(
-                    bucket,
-                    pg_id,
-                    started,
-                    "abort_abandoned_stream_uploads_start",
-                    format!("iteration={} pass=before_reservation_wait", loop_iteration),
-                );
-                self.abort_abandoned_put_object_stream_uploads_for_bucket(bucket)?;
-                Self::emit_bucket_delete_begin_loop_step(
-                    bucket,
-                    pg_id,
-                    started,
-                    "abort_abandoned_stream_uploads_done",
-                    format!("iteration={} pass=before_reservation_wait", loop_iteration),
-                );
                 Self::emit_bucket_delete_begin_loop_step(
                     bucket,
                     pg_id,
@@ -3515,57 +3512,68 @@ impl super::StorageCluster {
                     bucket,
                     pg_id,
                     started,
-                    "abort_abandoned_stream_uploads_start",
+                    "stream_cleanup_start",
                     format!("iteration={} pass=before_visibility_check", loop_iteration),
                 );
-                self.abort_abandoned_put_object_stream_uploads_for_bucket(bucket)?;
+                let aborted_stream_uploads =
+                    match self.cleanup_abandoned_put_object_stream_uploads_for_bucket(bucket)? {
+                        PutObjectStreamUploadCleanup::Live(source) => {
+                            return Err(self.bucket_delete_not_empty_error(bucket, pg_id, source));
+                        }
+                        PutObjectStreamUploadCleanup::Aborted { count } => count,
+                    };
                 Self::emit_bucket_delete_begin_loop_step(
                     bucket,
                     pg_id,
                     started,
-                    "abort_abandoned_stream_uploads_done",
-                    format!("iteration={} pass=before_visibility_check", loop_iteration),
-                );
-                Self::emit_bucket_delete_begin_loop_step(
-                    bucket,
-                    pg_id,
-                    started,
-                    "drain_exact_bucket_object_commands_start",
+                    "stream_cleanup_done",
                     format!(
-                        "iteration={} command_kind=none pass=before_visibility_check",
-                        loop_iteration
+                        "iteration={} pass=before_visibility_check aborted_stream_uploads={}",
+                        loop_iteration, aborted_stream_uploads
                     ),
                 );
-                match self
-                    .drain_pending_object_metadata_commands_for_exact_bucket_on_all_pgs_with_budget(
+                if aborted_stream_uploads > 0 {
+                    Self::emit_bucket_delete_begin_loop_step(
                         bucket,
-                        Some(started),
-                        &mut work_budget,
-                    ) {
-                    Ok(()) => {}
-                    Err(BucketWriteDrainError::Store(StoreError::MetadataCommandContention {
-                        ..
-                    })) => {
-                        super::sleep_after_metadata_contention_retry_for(
-                            "bucket_delete_begin",
-                            Some(pg_id),
-                            "bucket delete exact bucket object drain before visibility check contention",
-                            &mut metadata_contention_retries,
-                        );
-                        continue;
+                        pg_id,
+                        started,
+                        "drain_exact_bucket_object_commands_start",
+                        format!(
+                            "iteration={} command_kind=none pass=after_abandoned_stream_abort",
+                            loop_iteration
+                        ),
+                    );
+                    match self
+                        .drain_pending_object_metadata_commands_for_exact_bucket_on_all_pgs_with_budget(
+                            bucket,
+                            Some(started),
+                            &mut work_budget,
+                        ) {
+                        Ok(()) => {}
+                        Err(BucketWriteDrainError::Store(StoreError::MetadataCommandContention {
+                            ..
+                        })) => {
+                            super::sleep_after_metadata_contention_retry_for(
+                                "bucket_delete_begin",
+                                Some(pg_id),
+                                "bucket delete exact bucket object drain after abandoned stream abort contention",
+                                &mut metadata_contention_retries,
+                            );
+                            continue;
+                        }
+                        Err(error) => return Err(error),
                     }
-                    Err(error) => return Err(error),
+                    Self::emit_bucket_delete_begin_loop_step(
+                        bucket,
+                        pg_id,
+                        started,
+                        "drain_exact_bucket_object_commands_done",
+                        format!(
+                            "iteration={} command_kind=none pass=after_abandoned_stream_abort",
+                            loop_iteration
+                        ),
+                    );
                 }
-                Self::emit_bucket_delete_begin_loop_step(
-                    bucket,
-                    pg_id,
-                    started,
-                    "drain_exact_bucket_object_commands_done",
-                    format!(
-                        "iteration={} command_kind=none pass=before_visibility_check",
-                        loop_iteration
-                    ),
-                );
                 Self::emit_bucket_delete_begin_loop_step(
                     bucket,
                     pg_id,
@@ -3823,12 +3831,13 @@ impl super::StorageCluster {
         }
     }
 
-    fn abort_abandoned_put_object_stream_uploads_for_bucket(
+    fn cleanup_abandoned_put_object_stream_uploads_for_bucket(
         &self,
         bucket: &BucketName,
-    ) -> Result<(), BucketWriteDrainError> {
+    ) -> Result<PutObjectStreamUploadCleanup, BucketWriteDrainError> {
         const STREAM_UPLOAD_DELETE_PAGE_LIMIT: u32 = 128;
 
+        let mut aborted_count = 0usize;
         for raw_pg_id in self.metadata_pg_ids() {
             let pg_id = PgId::new(raw_pg_id);
             let mut marker = None;
@@ -3868,7 +3877,9 @@ impl super::StorageCluster {
                         continue;
                     }
                     if self.stream_upload_has_live_bucket_write_reservation(&upload)? {
-                        continue;
+                        return Ok(PutObjectStreamUploadCleanup::Live(
+                            BucketVisibleDataSource::StreamUpload { pg_id },
+                        ));
                     }
                     match self.abort_stream_upload_session(
                         &upload.bucket,
@@ -3893,6 +3904,7 @@ impl super::StorageCluster {
                     .map_err(super::object_pg_action_error_to_bucket_snapshot_error)
                     .map_err(bucket_snapshot_error_to_bucket_write_drain_error)?;
                     aborted_any = true;
+                    aborted_count += 1;
                 }
 
                 if aborted_any {
@@ -3907,7 +3919,9 @@ impl super::StorageCluster {
             }
         }
 
-        Ok(())
+        Ok(PutObjectStreamUploadCleanup::Aborted {
+            count: aborted_count,
+        })
     }
 
     pub fn try_finalize_bucket_delete(

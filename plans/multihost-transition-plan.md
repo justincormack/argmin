@@ -9015,6 +9015,19 @@ Keep an explicit Phase 11 close-out before treating the phase as soak-clean:
     restart/failover cleanup variant should pass without HTTP 500s, stuck
     bucket-delete finalizers, unexplained `OperationAborted` growth, or stale
     volatile queue state.
+18. rework `DeleteBucket` begin from repeated full-cluster rediscovery into a
+    monotonic proof-progress protocol. The current durable delete drain records
+    only ownership/lease identity, and an error path rolls that drain back, so
+    every retry must rescan all object PGs, stream sessions, and pending-command
+    state from zero. That is correct but does not prove forward progress under
+    route churn or high PG counts. Add durable progress state, or an equivalent
+    command-log frontier proof, tied to the bucket delete drain: each object PG
+    should be advanced to a recorded safe frontier for the bucket, later retries
+    should resume from the unfinished PG/frontier rather than restarting the
+    whole proof, and the final emptiness decision should depend on those
+    recorded frontiers plus a fresh post-drain visibility check. The protocol
+    must preserve the Phase 9.4 rule that no admitted writer can publish after
+    `DeleteBucket` has decided the bucket is empty.
 
 Status update:
 
@@ -9083,6 +9096,14 @@ Status update:
   per-PG metadata-command lock registry, and active metadata-command recovery
   single-flight state, so every current `LocalClusterRuntimeState` field has
   deterministic refresh-preservation coverage.
+- Trimmed redundant synchronous `DeleteBucket` begin work on the empty/no-pending
+  path. The live stream-upload blocker check and abandoned stream-upload cleanup
+  now share one pre-reservation-wait scan, preserving the expired direct-PUT
+  stream proof cleanup that releases durable reservations. The extra
+  exact-bucket all-PG drain before the visibility check is skipped unless
+  post-wait stream cleanup actually aborted sessions. This reduces the
+  foreground work that caused cleanup-only failures to exhaust the begin budget,
+  but it is not the durable proof-progress protocol called out in item 18.
 - Remaining close-out work is concentrated in deterministic interleaving tests,
   cleanup/runtime-state diagnostics, process-local state continuity across
   refresh/restart, and checking whether any foreground loops still need an
