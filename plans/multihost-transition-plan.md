@@ -8939,83 +8939,83 @@ state.
 
 Keep an explicit Phase 11 close-out before treating the phase as soak-clean:
 
-1. audit all `DeleteBucket`-begin and finalizer error mappings so stale routes,
+1. status: partial. Audit all `DeleteBucket`-begin and finalizer error mappings so stale routes,
    stale metadata primaries, pending-command displacement, route-map expiry, and
    storage-node overload consistently become `OperationAborted` or `SlowDown`,
    not `InternalError`;
-2. audit foreground work budgets against route-map validity deadlines. Any
+2. status: partial. Audit foreground work budgets against route-map validity deadlines. Any
    synchronous `DeleteBucket` loop that can run close to the validity window
    must either refresh/retry the whole operation from a fresh storage-cluster
    snapshot or return a typed retryable response before the map expires;
-3. prefer whole-operation retry boundaries over mid-operation route-map swaps:
+3. status: open. Prefer whole-operation retry boundaries over mid-operation route-map swaps:
    when authorization and begin-delete are tied to a pinned storage snapshot,
    retry by re-running authorization plus begin-delete with a fresh snapshot and
    bucket identity check, rather than continuing a partially completed decision
    on a different route map;
-4. add a focused regression for `DeleteBucket` begin crossing route-map expiry
+4. status: completed. Add a focused regression for `DeleteBucket` begin crossing route-map expiry
    or using an already-expired route map, ideally through the coordinator/S3
    boundary rather than only the low-level mapper;
-5. add deterministic failpoint tests for the precise cleanup interleavings soak
+5. status: partial. Add deterministic failpoint tests for the precise cleanup interleavings soak
    has been sampling: route-map refresh during begin-delete, storage-node
    restart between drain acquisition and mark-deleting apply, finalizer restart
    with an already-deleting bucket, and stale frontend retry after the bucket was
    recreated;
-6. add finalizer-side regression coverage for stale route-map and stale
+6. status: completed. Add finalizer-side regression coverage for stale route-map and stale
    metadata-route outcomes. DeleteBucket begin and asynchronous finalization have
    different correctness boundaries, so both need explicit retry/error
    semantics coverage;
-7. add or extend a bounded UAT cleanup stress profile that creates versioned
+7. status: completed. Add or extend a bounded UAT cleanup stress profile that creates versioned
    buckets across many metadata/data PGs, deletes all object versions, and then
    repeatedly calls `DeleteBucket` while route maps refresh and storage nodes
    restart;
-8. add metrics/assertions to distinguish expected retryable cleanup pressure
+8. status: completed. Add metrics/assertions to distinguish expected retryable cleanup pressure
    from real bugs: count `OperationAborted`/`SlowDown` cleanup retries, route-map
    expiry retries, finalizer queue depth, and any `InternalError` during
    cleanup;
-9. make the soak harness preserve enough DeleteBucket context on failure:
+9. status: partial. Make the soak harness preserve enough DeleteBucket context on failure:
    failing bucket name, bucket metadata PG, current route-map epoch/valid-until,
    finalizer queue depth, pending bucket command, durable delete drain row, and
    a short recent flight-event slice for the same request id;
-10. check the public cleanup helpers used by `s3-tests` and UAT. They should
+10. status: completed. Check the public cleanup helpers used by `s3-tests` and UAT. They should
     retry AWS-compatible retryable responses, but they must not hide server
     `InternalError`; local 500s during cleanup are bugs and should continue to
     fail the run with enough diagnostics;
-11. update [`delete-bucket-reservation-classification-plan.md`](delete-bucket-reservation-classification-plan.md)
+11. status: open. Update [`delete-bucket-reservation-classification-plan.md`](delete-bucket-reservation-classification-plan.md)
     if the audit shows synchronous begin work is still too conservative. The
     optimization should remain secondary to correctness: `DeleteBucket` must not
     return success while visible object/MPU state can still appear, but it should
     avoid long foreground waits when a safe `BucketNotEmpty` or retryable
     response is already knowable;
-12. completed: replace stringified remote `StorageRpc` retry classification with typed
+12. status: completed. Replace stringified remote `StorageRpc` retry classification with typed
     storage RPC error-code propagation through `StoreError`, so server-core can
     classify stale route/epoch/PG-state and command-contention responses without
     parsing display text;
-13. audit runtime-map refresh construction for every process-local state holder,
+13. status: completed. Audit runtime-map refresh construction for every process-local state holder,
     not just request-visible route data. Refreshes must preserve reclaim queues,
     shard repair/backfill queues, metadata-command recovery single-flight state,
     per-PG command locks, and background/admission registry identity when they
     replace only the serving route map for the same process;
-14. add deterministic regressions for runtime-map refresh while background work
+14. status: completed. Add deterministic regressions for runtime-map refresh while background work
     is queued, dequeued but not finished, pending due to durable rows, and
     returning retryable errors. Cover both plain in-process clusters and the
     Unix storage-node-client path used by UAT;
-15. reconcile volatile queue state with durable metadata in tests and
+15. status: partial. Reconcile volatile queue state with durable metadata in tests and
     diagnostics. A bucket-delete outstanding item should not survive indefinitely
     when there is no bucket row, no finalizer claim, no object rows, and no
     reclaim root. If this state appears, the worker should clear it or the
     diagnostic should identify it as a volatile queue/runtime-state bug rather
     than an unfinished durable cleanup;
-16. extend failure preservation for cleanup/runtime-state soak failures to dump
+16. status: partial. Extend failure preservation for cleanup/runtime-state soak failures to dump
     durable state, not only public S3 visibility: bucket row, finalizer claim,
     bucket write drain, pending command slot, object rows, object reclaim roots,
     payload reclaim claims, current route-map epoch/valid-until, and queue
     depths for the current runtime generation;
-17. define a repeatable soak gate for closing this hardening phase. At minimum,
+17. status: open. Define a repeatable soak gate for closing this hardening phase. At minimum,
     `cleanup-versioned-stress --repeat 30`, the correctness soak, and one
     restart/failover cleanup variant should pass without HTTP 500s, stuck
     bucket-delete finalizers, unexplained `OperationAborted` growth, or stale
     volatile queue state.
-18. rework `DeleteBucket` begin from repeated full-cluster rediscovery into a
+18. status: open. Rework `DeleteBucket` begin from repeated full-cluster rediscovery into a
     monotonic proof-progress protocol. The current durable delete drain records
     only ownership/lease identity, and an error path rolls that drain back, so
     every retry must rescan all object PGs, stream sessions, and pending-command
