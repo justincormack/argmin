@@ -80,6 +80,7 @@ impl SubmittedControlPlaneRaftCommand {
 
 pub struct ControlPlaneRaftAuthority {
     raft: Raft<ControlPlaneRaftTypeConfig, ControlPlaneRaftStateMachine>,
+    log_store: Option<ControlPlaneRaftLogStore>,
 }
 
 pub type ControlPlaneRaftFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -112,7 +113,10 @@ impl<T> ControlPlaneRaftLinearizedAuthority for T where
 pub struct ControlPlaneRaftAuthorityStatus {
     node_id: ControlPlaneRaftNodeId,
     current_leader: Option<ControlPlaneRaftNodeId>,
+    persisted_vote: Option<VoteOf<ControlPlaneRaftTypeConfig>>,
+    current_term: Option<ControlPlaneRaftTerm>,
     last_log_id: Option<LogIdOf<ControlPlaneRaftTypeConfig>>,
+    last_purged_log_id: Option<LogIdOf<ControlPlaneRaftTypeConfig>>,
     committed: Option<LogIdOf<ControlPlaneRaftTypeConfig>>,
     applied: Option<LogIdOf<ControlPlaneRaftTypeConfig>>,
     current_snapshot: Option<LogIdOf<ControlPlaneRaftTypeConfig>>,
@@ -134,8 +138,23 @@ impl ControlPlaneRaftAuthorityStatus {
     }
 
     #[must_use]
+    pub fn persisted_vote(&self) -> Option<VoteOf<ControlPlaneRaftTypeConfig>> {
+        self.persisted_vote
+    }
+
+    #[must_use]
+    pub fn current_term(&self) -> Option<ControlPlaneRaftTerm> {
+        self.current_term
+    }
+
+    #[must_use]
     pub fn last_log_id(&self) -> Option<LogIdOf<ControlPlaneRaftTypeConfig>> {
         self.last_log_id
+    }
+
+    #[must_use]
+    pub fn last_purged_log_id(&self) -> Option<LogIdOf<ControlPlaneRaftTypeConfig>> {
+        self.last_purged_log_id
     }
 
     #[must_use]
@@ -177,7 +196,21 @@ impl ControlPlaneRaftAuthorityStatus {
 impl ControlPlaneRaftAuthority {
     #[must_use]
     pub fn new(raft: Raft<ControlPlaneRaftTypeConfig, ControlPlaneRaftStateMachine>) -> Self {
-        Self { raft }
+        Self {
+            raft,
+            log_store: None,
+        }
+    }
+
+    #[must_use]
+    pub fn new_with_log_store(
+        raft: Raft<ControlPlaneRaftTypeConfig, ControlPlaneRaftStateMachine>,
+        log_store: ControlPlaneRaftLogStore,
+    ) -> Self {
+        Self {
+            raft,
+            log_store: Some(log_store),
+        }
     }
 
     #[must_use]
@@ -286,6 +319,21 @@ impl ControlPlaneRaftAuthority {
     pub async fn status(&self) -> Result<ControlPlaneRaftAuthorityStatus, ControlPlaneError> {
         let node_id = *self.raft.node_id();
         let current_leader = self.raft.current_leader().await;
+        let persisted_vote = self
+            .log_store
+            .as_ref()
+            .map(ControlPlaneRaftLogStore::persisted_vote)
+            .transpose()
+            .map_err(|error| openraft_remote_error("status log-store vote read", error))?
+            .flatten();
+        let current_term = persisted_vote.map(|vote| vote.leader_id.term);
+        let last_purged_log_id = self
+            .log_store
+            .as_ref()
+            .map(ControlPlaneRaftLogStore::last_purged_log_id)
+            .transpose()
+            .map_err(|error| openraft_remote_error("status log-store read", error))?
+            .flatten();
         let (last_log_id, committed, effective_membership_log_id, effective_voters) = self
             .raft
             .with_raft_state(|state| {
@@ -316,7 +364,10 @@ impl ControlPlaneRaftAuthority {
         Ok(ControlPlaneRaftAuthorityStatus {
             node_id,
             current_leader,
+            persisted_vote,
+            current_term,
             last_log_id,
+            last_purged_log_id,
             committed,
             applied,
             current_snapshot,
@@ -539,6 +590,10 @@ impl ControlPlaneRaftLogStore {
         &self,
     ) -> Result<Option<LogIdOf<ControlPlaneRaftTypeConfig>>, io::Error> {
         Ok(self.lock()?.last_purged_log_id)
+    }
+
+    pub fn persisted_vote(&self) -> Result<Option<VoteOf<ControlPlaneRaftTypeConfig>>, io::Error> {
+        Ok(self.lock()?.vote)
     }
 
     pub fn from_restart_artifact(
@@ -2129,9 +2184,10 @@ mod tests {
         network.register(node1, raft1.clone());
         network.register(node2, raft2.clone());
         network.register(node3, raft3.clone());
-        let authority1 = ControlPlaneRaftAuthority::new(raft1);
+        let authority1 =
+            ControlPlaneRaftAuthority::new_with_log_store(raft1, leader_log_store.clone());
         let authority2 = ControlPlaneRaftAuthority::new(raft2);
-        let authority3 = ControlPlaneRaftAuthority::new(raft3);
+        let authority3 = ControlPlaneRaftAuthority::new_with_log_store(raft3, log_store3.clone());
 
         authority1
             .initialize_membership(BTreeMap::from([
@@ -3282,7 +3338,7 @@ mod tests {
             .await
             .unwrap();
 
-            let authority = ControlPlaneRaftAuthority::new(raft);
+            let authority = ControlPlaneRaftAuthority::new_with_log_store(raft, log_store.clone());
             authority
                 .initialize_membership(BTreeMap::from([(1, BasicNode::new("node-1"))]))
                 .await
@@ -3314,13 +3370,13 @@ mod tests {
                 1,
                 test_raft_config("control-plane-raft-client-write-test"),
                 UnreachableRaftNetworkFactory,
-                log_store,
+                log_store.clone(),
                 state_machine,
             )
             .await
             .unwrap();
 
-            let authority = ControlPlaneRaftAuthority::new(raft);
+            let authority = ControlPlaneRaftAuthority::new_with_log_store(raft, log_store);
             authority
                 .initialize_membership(BTreeMap::from([(1, BasicNode::new("node-1"))]))
                 .await
@@ -3374,6 +3430,19 @@ mod tests {
             let status = authority.status().await.unwrap();
             assert_eq!(status.node_id(), 1);
             assert_eq!(status.current_leader(), Some(1));
+            let persisted_vote = status
+                .persisted_vote()
+                .expect("single-node leader should persist a vote");
+            assert!(persisted_vote.committed);
+            assert_eq!(persisted_vote.leader_id.node_id, 1);
+            assert_eq!(
+                status.current_term(),
+                Some(rejected_log_id.committed_leader_id().term)
+            );
+            assert_eq!(
+                persisted_vote.leader_id.term,
+                rejected_log_id.committed_leader_id().term
+            );
             assert_eq!(status.last_log_id(), Some(rejected_log_id));
             assert_eq!(status.committed(), Some(rejected_log_id));
             assert_eq!(status.applied(), Some(rejected_log_id));
@@ -4129,6 +4198,7 @@ mod tests {
                 .unwrap();
 
             let (restored_log_store, restored_state_machine) = restart_artifact.restore().unwrap();
+            let restored_log_store_for_status = restored_log_store.clone();
             let restarted_raft =
                 Raft::<ControlPlaneRaftTypeConfig, ControlPlaneRaftStateMachine>::new(
                     803,
@@ -4140,7 +4210,10 @@ mod tests {
                 .await
                 .unwrap();
             network.register(803, restarted_raft.clone());
-            let restarted_authority = ControlPlaneRaftAuthority::new(restarted_raft);
+            let restarted_authority = ControlPlaneRaftAuthority::new_with_log_store(
+                restarted_raft,
+                restored_log_store_for_status,
+            );
 
             let catch_up_trigger = authority1
                 .submit_control_plane_command(ControlPlaneCommand::MarkNodeAvailability {
@@ -4309,11 +4382,26 @@ mod tests {
                 "leader purged log prefix covered by snapshot",
             )
             .await;
+            let leader_status = authority1.status().await.unwrap();
+            let leader_vote = leader_status
+                .persisted_vote()
+                .expect("leader should report its persisted vote");
+            assert!(leader_vote.committed);
+            assert_eq!(leader_vote.leader_id.node_id, 1101);
+            assert_eq!(
+                leader_status.current_term(),
+                Some(offline_write.log_id().committed_leader_id().term)
+            );
+            assert_eq!(
+                leader_status.last_purged_log_id(),
+                Some(offline_write.log_id())
+            );
 
             authority3.shutdown().await.unwrap();
             network.unregister(1103);
 
             let (restored_log_store, restored_state_machine) = restart_artifact.restore().unwrap();
+            let restored_log_store_for_status = restored_log_store.clone();
             let restarted_raft =
                 Raft::<ControlPlaneRaftTypeConfig, ControlPlaneRaftStateMachine>::new(
                     1103,
@@ -4325,7 +4413,10 @@ mod tests {
                 .await
                 .unwrap();
             network.register(1103, restarted_raft.clone());
-            let restarted_authority = ControlPlaneRaftAuthority::new(restarted_raft);
+            let restarted_authority = ControlPlaneRaftAuthority::new_with_log_store(
+                restarted_raft,
+                restored_log_store_for_status,
+            );
             authority1
                 .raft()
                 .trigger()
@@ -4358,6 +4449,18 @@ mod tests {
                 .unwrap();
             let restarted_status = restarted_authority.status().await.unwrap();
             assert_eq!(restarted_status.applied(), Some(catch_up_trigger.log_id()));
+            let restarted_vote = restarted_status
+                .persisted_vote()
+                .expect("restarted follower should retain its persisted vote");
+            assert_eq!(restarted_vote.leader_id.node_id, 1101);
+            assert_eq!(
+                restarted_status.current_term(),
+                Some(catch_up_trigger.log_id().committed_leader_id().term)
+            );
+            assert_eq!(
+                restarted_status.last_purged_log_id(),
+                Some(offline_write.log_id())
+            );
             assert_eq!(
                 restarted_status.current_snapshot(),
                 Some(offline_write.log_id())
@@ -4468,6 +4571,7 @@ mod tests {
             ));
 
             let (restored_log_store, restored_state_machine) = restart_artifact.restore().unwrap();
+            let restored_log_store_for_status = restored_log_store.clone();
             let restarted_raft =
                 Raft::<ControlPlaneRaftTypeConfig, ControlPlaneRaftStateMachine>::new(
                     901,
@@ -4479,7 +4583,10 @@ mod tests {
                 .await
                 .unwrap();
             network.register(901, restarted_raft.clone());
-            let restarted_authority = ControlPlaneRaftAuthority::new(restarted_raft);
+            let restarted_authority = ControlPlaneRaftAuthority::new_with_log_store(
+                restarted_raft,
+                restored_log_store_for_status,
+            );
             restarted_authority
                 .wait_for_current_leader(
                     901,

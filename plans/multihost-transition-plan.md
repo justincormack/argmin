@@ -9578,6 +9578,14 @@ Phase 12.1 progress:
   the Phase 12 diagnostics surface closer to the planned leader/term,
   committed/applied, membership, and snapshot-index report without exposing
   private state-machine internals to callers.
+- Extended the same OpenRaft authority status boundary with the attached
+  log-store purged watermark when the authority owns a log-store handle. The
+  snapshot catch-up smoke now verifies both the leader and restarted follower
+  report the snapshot-covered purge boundary through the public status surface.
+- Extended that public status surface with the attached log-store's persisted
+  OpenRaft vote and derived current term. Single-node command submission and
+  snapshot catch-up smokes now pin the leader/term diagnostics without exposing
+  raw store internals to callers.
 - Added OpenRaft leader-restart resume coverage. A three-voter in-memory
   cluster now captures the leader's persisted OpenRaft/control-plane artifacts,
   removes the leader from the test network, verifies a follower cannot accept a
