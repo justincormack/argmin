@@ -9644,6 +9644,11 @@ Phase 12.1 progress:
   state-machine cluster epoch. The restarted-leader resume smoke now proves the
   recovered leader's diagnostic epoch matches the runtime map epoch it serves
   after committing a post-restart command.
+- Extended the OpenRaft authority status surface with compact control-plane
+  state diagnostics: authority incarnation, retained-history count and epoch
+  bounds, and the oldest storage-reported history floor. The restarted-leader
+  resume smoke now pins these fields against the served runtime-map proof and
+  retained route history after post-restart epoch changes.
 
 1. define the replicated control-plane state machine:
    - state includes cluster epoch, PG count, PG state, PG acting sets, node

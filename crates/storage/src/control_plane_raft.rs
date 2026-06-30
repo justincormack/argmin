@@ -29,7 +29,7 @@ use openraft::ReadPolicy;
 use openraft::StoredMembership;
 use placement::NodeId;
 
-use crate::control_plane::{ClusterRuntimeMapSnapshot, ControlPlaneError};
+use crate::control_plane::{AuthorityIncarnation, ClusterRuntimeMapSnapshot, ControlPlaneError};
 use crate::control_plane_command::{
     ControlPlaneCommand, ControlPlaneCommandResponse, ControlPlaneLogId,
     ControlPlaneSnapshotArtifact, ReplicatedControlPlaneStateMachine,
@@ -121,7 +121,12 @@ pub struct ControlPlaneRaftAuthorityStatus {
     committed: Option<LogIdOf<ControlPlaneRaftTypeConfig>>,
     applied: Option<LogIdOf<ControlPlaneRaftTypeConfig>>,
     current_snapshot: Option<LogIdOf<ControlPlaneRaftTypeConfig>>,
+    authority_incarnation: AuthorityIncarnation,
     current_cluster_epoch: ClusterEpoch,
+    retained_history_count: usize,
+    oldest_retained_history_epoch: Option<ClusterEpoch>,
+    newest_retained_history_epoch: Option<ClusterEpoch>,
+    oldest_storage_history_floor_epoch: Option<ClusterEpoch>,
     effective_membership_log_id: Option<LogIdOf<ControlPlaneRaftTypeConfig>>,
     effective_voters: BTreeSet<ControlPlaneRaftNodeId>,
     effective_learners: BTreeSet<ControlPlaneRaftNodeId>,
@@ -177,8 +182,33 @@ impl ControlPlaneRaftAuthorityStatus {
     }
 
     #[must_use]
+    pub fn authority_incarnation(&self) -> AuthorityIncarnation {
+        self.authority_incarnation
+    }
+
+    #[must_use]
     pub fn current_cluster_epoch(&self) -> ClusterEpoch {
         self.current_cluster_epoch
+    }
+
+    #[must_use]
+    pub fn retained_history_count(&self) -> usize {
+        self.retained_history_count
+    }
+
+    #[must_use]
+    pub fn oldest_retained_history_epoch(&self) -> Option<ClusterEpoch> {
+        self.oldest_retained_history_epoch
+    }
+
+    #[must_use]
+    pub fn newest_retained_history_epoch(&self) -> Option<ClusterEpoch> {
+        self.newest_retained_history_epoch
+    }
+
+    #[must_use]
+    pub fn oldest_storage_history_floor_epoch(&self) -> Option<ClusterEpoch> {
+        self.oldest_storage_history_floor_epoch
     }
 
     #[must_use]
@@ -376,7 +406,12 @@ impl ControlPlaneRaftAuthority {
         let (
             applied,
             current_snapshot,
+            authority_incarnation,
             current_cluster_epoch,
+            retained_history_count,
+            oldest_retained_history_epoch,
+            newest_retained_history_epoch,
+            oldest_storage_history_floor_epoch,
             applied_membership_log_id,
             applied_voters,
             applied_learners,
@@ -387,7 +422,22 @@ impl ControlPlaneRaftAuthority {
                 let current_snapshot = state_machine
                     .current_snapshot()
                     .and_then(|snapshot| snapshot.meta.last_log_id);
-                let current_cluster_epoch = state_machine.inner().snapshot().cluster_epoch();
+                let snapshot = state_machine.inner().snapshot();
+                let authority_incarnation = snapshot.authority_incarnation();
+                let current_cluster_epoch = snapshot.cluster_epoch();
+                let retained_history_count = snapshot.cluster_map_history().len();
+                let oldest_retained_history_epoch = snapshot
+                    .cluster_map_history()
+                    .first()
+                    .map(|record| record.cluster_epoch());
+                let newest_retained_history_epoch = snapshot
+                    .cluster_map_history()
+                    .last()
+                    .map(|record| record.cluster_epoch());
+                let oldest_storage_history_floor_epoch = snapshot
+                    .nodes()
+                    .filter_map(|node| node.cluster_map_history_floor_epoch())
+                    .min();
                 let membership = state_machine.last_membership();
                 let membership_log_id = *membership.log_id();
                 let voters = membership.membership().voter_ids().collect();
@@ -396,7 +446,12 @@ impl ControlPlaneRaftAuthority {
                     (
                         last_applied,
                         current_snapshot,
+                        authority_incarnation,
                         current_cluster_epoch,
+                        retained_history_count,
+                        oldest_retained_history_epoch,
+                        newest_retained_history_epoch,
+                        oldest_storage_history_floor_epoch,
                         membership_log_id,
                         voters,
                         learners,
@@ -415,7 +470,12 @@ impl ControlPlaneRaftAuthority {
             committed,
             applied,
             current_snapshot,
+            authority_incarnation,
             current_cluster_epoch,
+            retained_history_count,
+            oldest_retained_history_epoch,
+            newest_retained_history_epoch,
+            oldest_storage_history_floor_epoch,
             effective_membership_log_id,
             effective_voters,
             effective_learners,
@@ -5066,9 +5126,25 @@ mod tests {
             let restarted_status = restarted_authority.status().await.unwrap();
             assert_eq!(restarted_status.applied(), Some(resumed_write.log_id()));
             assert_eq!(
+                restarted_status.authority_incarnation(),
+                runtime_map.freshness_proof().authority_incarnation()
+            );
+            assert_eq!(
                 restarted_status.current_cluster_epoch(),
                 runtime_map.cluster_epoch()
             );
+            assert_eq!(restarted_status.oldest_storage_history_floor_epoch(), None);
+            assert!(
+                restarted_status.retained_history_count() > 0,
+                "restarted leader should retain historical route state after epoch changes"
+            );
+            assert!(
+                restarted_status.oldest_retained_history_epoch()
+                    <= restarted_status.newest_retained_history_epoch()
+            );
+            assert!(restarted_status
+                .newest_retained_history_epoch()
+                .is_some_and(|epoch| epoch < restarted_status.current_cluster_epoch()));
 
             let restarted_node903_availability = restarted_authority
                 .raft()
