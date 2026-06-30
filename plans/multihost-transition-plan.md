@@ -9119,10 +9119,15 @@ Keep an explicit Phase 11 close-out before treating the phase as soak-clean:
          exposing `final_visibility_check` as the current retryable phase until
          `MarkBucketDeleting` is built and applied. A focused storage regression
          observes that intermediate phase before command-id allocation and then
-         verifies the terminal `mark_deleting` outcome overwrites it. Remaining
-         work: add resumable frontier/state for stream cleanup and use the
-         final-visibility phase to skip already-proven earlier phases on
-         adoption.
+         verifies the terminal `mark_deleting` outcome overwrites it. Adoption
+         now treats a matching retryable `final_visibility_check` attempt row as
+         a resume cursor: if the bucket PG has no pending command, it skips the
+         already-proven exact object-PG drain, stream cleanup, reservation wait,
+         and post-reservation drain phases and re-enters at the final visibility
+         proof. A storage regression installs a failing post-reservation progress
+         hook and proves that a final-visibility adoption reaches
+         `mark_deleting` without repeating that scan. Remaining work: add
+         resumable frontier/state for stream cleanup.
       5. status: open. Revisit reservation classification only after attempts are resumable;
          it should be an optimization on top of a convergent state machine, not
          the convergence mechanism itself.

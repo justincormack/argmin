@@ -3106,21 +3106,28 @@ impl super::StorageCluster {
         &self,
         progress: BucketDeleteExactDrainProgress<'_>,
     ) -> Result<Option<u32>, BucketWriteDrainError> {
-        let record = progress
-            .client
-            .bucket_delete_attempt_outcome(
-                PgId::new(progress.drain.pg_id),
-                &progress.drain.record.bucket,
-            )
+        let record = self.bucket_delete_matching_attempt_outcome(
+            progress.client,
+            PgId::new(progress.drain.pg_id),
+            progress.drain,
+        )?;
+        Ok(record.and_then(|record| record.post_reservation_next_object_pg_id))
+    }
+
+    fn bucket_delete_matching_attempt_outcome(
+        &self,
+        client: &dyn BucketWriteReservationNodeClient,
+        pg_id: PgId,
+        drain: &super::DurableBucketWriteDrain,
+    ) -> Result<Option<BucketDeleteAttemptOutcomeRecord>, BucketWriteDrainError> {
+        let record = client
+            .bucket_delete_attempt_outcome(pg_id, &drain.record.bucket)
             .map_err(bucket_snapshot_error_to_bucket_write_drain_error)?;
-        Ok(record
-            .filter(|record| {
-                record.drain_id == progress.drain.record.drain_id
-                    && record.cluster_epoch == progress.drain.record.cluster_epoch
-                    && record.bucket_execution_generation
-                        == progress.drain.record.bucket_execution_generation
-            })
-            .and_then(|record| record.post_reservation_next_object_pg_id))
+        Ok(record.filter(|record| {
+            record.drain_id == drain.record.drain_id
+                && record.cluster_epoch == drain.record.cluster_epoch
+                && record.bucket_execution_generation == drain.record.bucket_execution_generation
+        }))
     }
 
     fn record_bucket_delete_post_reservation_next_object_pg_id(
@@ -3638,6 +3645,16 @@ impl super::StorageCluster {
         .for_pg(pg_id);
         let mut loop_iteration = 0u64;
         let mut attempt_phase = BucketDeleteAttemptPhase::Initial;
+        let mut can_resume_at_final_visibility = self
+            .bucket_delete_matching_attempt_outcome(
+                node_store.bucket_write_reservation_client().as_ref(),
+                pg_id,
+                &durable_drain,
+            )?
+            .is_some_and(|record| {
+                record.outcome == BucketDeleteAttemptOutcomeKind::Retryable
+                    && record.phase == BucketDeleteAttemptPhase::FinalVisibilityCheck
+            });
         let result = (|| loop {
             loop_iteration += 1;
             attempt_phase = BucketDeleteAttemptPhase::Initial;
@@ -3676,6 +3693,7 @@ impl super::StorageCluster {
                 ),
             );
             let (command, clear_pending_on_zero_apply) = if let Some(command) = pending_command {
+                can_resume_at_final_visibility = false;
                 if self
                     .drain_unrelated_pending_metadata_command_for_bucket_with_work_budget(
                         pg_id,
@@ -3886,229 +3904,22 @@ impl super::StorageCluster {
                     }
                 }
             } else {
-                Self::emit_bucket_delete_begin_loop_step(
-                    bucket,
-                    pg_id,
-                    started,
-                    "drain_exact_bucket_object_commands_start",
-                    format!(
-                        "iteration={} command_kind=none pass=initial",
-                        loop_iteration
-                    ),
-                );
-                match self
-                    .drain_pending_object_metadata_commands_for_exact_bucket_on_all_pgs_with_budget(
+                if can_resume_at_final_visibility {
+                    Self::emit_bucket_delete_begin_loop_step(
                         bucket,
-                        Some(started),
-                        &mut work_budget,
-                        None,
-                    ) {
-                    Ok(()) => {}
-                    Err(BucketWriteDrainError::Store(StoreError::MetadataCommandContention {
-                        ..
-                    })) => {
-                        super::sleep_after_metadata_contention_retry_for(
-                            "bucket_delete_begin",
-                            Some(pg_id),
-                            "bucket delete initial exact bucket object drain contention",
-                            &mut metadata_contention_retries,
-                        );
-                        continue;
-                    }
-                    Err(error) => return Err(error),
-                }
-                Self::emit_bucket_delete_begin_loop_step(
-                    bucket,
-                    pg_id,
-                    started,
-                    "drain_exact_bucket_object_commands_done",
-                    format!(
-                        "iteration={} command_kind=none pass=initial",
-                        loop_iteration
-                    ),
-                );
-                Self::emit_bucket_delete_begin_loop_step(
-                    bucket,
-                    pg_id,
-                    started,
-                    "pending_command_recheck_start",
-                    format!("iteration={} pass=after_object_drain", loop_iteration),
-                );
-                let pending_after_object_drain =
-                    self.pending_metadata_command_for_bucket(pg_id, bucket)?;
-                Self::emit_bucket_delete_begin_loop_step(
-                    bucket,
-                    pg_id,
-                    started,
-                    "pending_command_recheck_done",
-                    format!(
-                        "iteration={} pass=after_object_drain has_pending={} command_kind={}",
-                        loop_iteration,
-                        pending_after_object_drain.is_some(),
-                        pending_after_object_drain
-                            .as_ref()
-                            .map_or("none", |command| command.payload().kind_name())
-                    ),
-                );
-                if pending_after_object_drain.is_some() {
-                    super::sleep_after_metadata_contention_retry_for(
-                        "bucket_delete_begin",
-                        Some(pg_id),
-                        "bucket delete pending command remained after object drain",
-                        &mut metadata_contention_retries,
+                        pg_id,
+                        started,
+                        "resume_final_visibility",
+                        format!("iteration={loop_iteration}"),
                     );
-                    continue;
-                }
-                Self::emit_bucket_delete_begin_loop_step(
-                    bucket,
-                    pg_id,
-                    started,
-                    "stream_cleanup_start",
-                    format!("iteration={loop_iteration}"),
-                );
-                attempt_phase = BucketDeleteAttemptPhase::StreamCleanup;
-                match self.cleanup_abandoned_put_object_stream_uploads_for_bucket(bucket)? {
-                    PutObjectStreamUploadCleanup::Live(source) => {
-                        self.record_bucket_delete_attempt_outcome_for_drain_with_client(
-                            node_store.bucket_write_reservation_client().as_ref(),
-                            &durable_drain,
-                            BucketDeleteAttemptOutcomeKind::NotEmpty,
-                            BucketDeleteAttemptPhase::StreamCleanup,
-                            format!(
-                                "live stream blocker during cleanup before reservation wait: {source:?}"
-                            ),
-                        );
-                        return Err(self.bucket_delete_not_empty_error(bucket, pg_id, source));
-                    }
-                    PutObjectStreamUploadCleanup::Aborted { count } => {
-                        Self::emit_bucket_delete_begin_loop_step(
-                            bucket,
-                            pg_id,
-                            started,
-                            "stream_cleanup_done",
-                            format!(
-                                "iteration={} pass=before_reservation_wait aborted_stream_uploads={}",
-                                loop_iteration, count
-                            ),
-                        );
-                    }
-                }
-                Self::emit_bucket_delete_begin_loop_step(
-                    bucket,
-                    pg_id,
-                    started,
-                    "wait_reservations_empty_start",
-                    format!("iteration={loop_iteration}"),
-                );
-                attempt_phase = BucketDeleteAttemptPhase::ReservationWait;
-                self.wait_for_durable_bucket_write_reservations_empty(
-                    bucket,
-                    started,
-                    &mut work_budget,
-                )?;
-                Self::emit_bucket_delete_begin_loop_step(
-                    bucket,
-                    pg_id,
-                    started,
-                    "wait_reservations_empty_done",
-                    format!("iteration={loop_iteration}"),
-                );
-                Self::emit_bucket_delete_begin_loop_step(
-                    bucket,
-                    pg_id,
-                    started,
-                    "drain_exact_bucket_object_commands_start",
-                    format!(
-                        "iteration={} command_kind=none pass=after_reservation_wait",
-                        loop_iteration
-                    ),
-                );
-                attempt_phase = BucketDeleteAttemptPhase::PostReservationObjectDrain;
-                match self
-                    .drain_pending_object_metadata_commands_for_exact_bucket_on_all_pgs_with_budget(
-                        bucket,
-                        Some(started),
-                        &mut work_budget,
-                        Some(BucketDeleteExactDrainProgress {
-                            client: node_store.bucket_write_reservation_client().as_ref(),
-                            drain: &durable_drain,
-                        }),
-                    ) {
-                    Ok(()) => {}
-                    Err(BucketWriteDrainError::Store(StoreError::MetadataCommandContention {
-                        ..
-                    })) => {
-                        super::sleep_after_metadata_contention_retry_for(
-                            "bucket_delete_begin",
-                            Some(pg_id),
-                            "bucket delete exact bucket object drain after reservation wait contention",
-                            &mut metadata_contention_retries,
-                        );
-                        continue;
-                    }
-                    Err(error) => return Err(error),
-                }
-                Self::emit_bucket_delete_begin_loop_step(
-                    bucket,
-                    pg_id,
-                    started,
-                    "drain_exact_bucket_object_commands_done",
-                    format!(
-                        "iteration={} command_kind=none pass=after_reservation_wait",
-                        loop_iteration
-                    ),
-                );
-                let post_reservation_progress = BucketDeleteExactDrainProgress {
-                    client: node_store.bucket_write_reservation_client().as_ref(),
-                    drain: &durable_drain,
-                };
-                self.record_bucket_delete_post_reservation_next_object_pg_id(
-                    post_reservation_progress,
-                    0,
-                )?;
-                Self::emit_bucket_delete_begin_loop_step(
-                    bucket,
-                    pg_id,
-                    started,
-                    "stream_cleanup_start",
-                    format!("iteration={} pass=before_visibility_check", loop_iteration),
-                );
-                attempt_phase = BucketDeleteAttemptPhase::StreamCleanup;
-                let aborted_stream_uploads = match self
-                    .cleanup_abandoned_put_object_stream_uploads_for_bucket(bucket)?
-                {
-                    PutObjectStreamUploadCleanup::Live(source) => {
-                        self.record_bucket_delete_attempt_outcome_for_drain_with_client(
-                            node_store.bucket_write_reservation_client().as_ref(),
-                            &durable_drain,
-                            BucketDeleteAttemptOutcomeKind::NotEmpty,
-                            BucketDeleteAttemptPhase::StreamCleanup,
-                            format!(
-                                    "live stream blocker during cleanup before visibility check: {source:?}"
-                                ),
-                            );
-                        return Err(self.bucket_delete_not_empty_error(bucket, pg_id, source));
-                    }
-                    PutObjectStreamUploadCleanup::Aborted { count } => count,
-                };
-                Self::emit_bucket_delete_begin_loop_step(
-                    bucket,
-                    pg_id,
-                    started,
-                    "stream_cleanup_done",
-                    format!(
-                        "iteration={} pass=before_visibility_check aborted_stream_uploads={}",
-                        loop_iteration, aborted_stream_uploads
-                    ),
-                );
-                if aborted_stream_uploads > 0 {
+                } else {
                     Self::emit_bucket_delete_begin_loop_step(
                         bucket,
                         pg_id,
                         started,
                         "drain_exact_bucket_object_commands_start",
                         format!(
-                            "iteration={} command_kind=none pass=after_abandoned_stream_abort",
+                            "iteration={} command_kind=none pass=initial",
                             loop_iteration
                         ),
                     );
@@ -4126,7 +3937,7 @@ impl super::StorageCluster {
                             super::sleep_after_metadata_contention_retry_for(
                                 "bucket_delete_begin",
                                 Some(pg_id),
-                                "bucket delete exact bucket object drain after abandoned stream abort contention",
+                                "bucket delete initial exact bucket object drain contention",
                                 &mut metadata_contention_retries,
                             );
                             continue;
@@ -4139,42 +3950,259 @@ impl super::StorageCluster {
                         started,
                         "drain_exact_bucket_object_commands_done",
                         format!(
-                            "iteration={} command_kind=none pass=after_abandoned_stream_abort",
+                            "iteration={} command_kind=none pass=initial",
                             loop_iteration
                         ),
                     );
-                }
-                Self::emit_bucket_delete_begin_loop_step(
-                    bucket,
-                    pg_id,
-                    started,
-                    "pending_command_recheck_start",
-                    format!("iteration={} pass=before_visibility_check", loop_iteration),
-                );
-                let pending_before_visibility_check =
-                    self.pending_metadata_command_for_bucket(pg_id, bucket)?;
-                Self::emit_bucket_delete_begin_loop_step(
-                    bucket,
-                    pg_id,
-                    started,
-                    "pending_command_recheck_done",
-                    format!(
-                        "iteration={} pass=before_visibility_check has_pending={} command_kind={}",
-                        loop_iteration,
-                        pending_before_visibility_check.is_some(),
-                        pending_before_visibility_check
-                            .as_ref()
-                            .map_or("none", |command| command.payload().kind_name())
-                    ),
-                );
-                if pending_before_visibility_check.is_some() {
-                    super::sleep_after_metadata_contention_retry_for(
-                        "bucket_delete_begin",
-                        Some(pg_id),
-                        "bucket delete pending command remained before visibility check",
-                        &mut metadata_contention_retries,
+                    Self::emit_bucket_delete_begin_loop_step(
+                        bucket,
+                        pg_id,
+                        started,
+                        "pending_command_recheck_start",
+                        format!("iteration={} pass=after_object_drain", loop_iteration),
                     );
-                    continue;
+                    let pending_after_object_drain =
+                        self.pending_metadata_command_for_bucket(pg_id, bucket)?;
+                    Self::emit_bucket_delete_begin_loop_step(
+                        bucket,
+                        pg_id,
+                        started,
+                        "pending_command_recheck_done",
+                        format!(
+                            "iteration={} pass=after_object_drain has_pending={} command_kind={}",
+                            loop_iteration,
+                            pending_after_object_drain.is_some(),
+                            pending_after_object_drain
+                                .as_ref()
+                                .map_or("none", |command| command.payload().kind_name())
+                        ),
+                    );
+                    if pending_after_object_drain.is_some() {
+                        super::sleep_after_metadata_contention_retry_for(
+                            "bucket_delete_begin",
+                            Some(pg_id),
+                            "bucket delete pending command remained after object drain",
+                            &mut metadata_contention_retries,
+                        );
+                        continue;
+                    }
+                    Self::emit_bucket_delete_begin_loop_step(
+                        bucket,
+                        pg_id,
+                        started,
+                        "stream_cleanup_start",
+                        format!("iteration={loop_iteration}"),
+                    );
+                    attempt_phase = BucketDeleteAttemptPhase::StreamCleanup;
+                    match self.cleanup_abandoned_put_object_stream_uploads_for_bucket(bucket)? {
+                        PutObjectStreamUploadCleanup::Live(source) => {
+                            self.record_bucket_delete_attempt_outcome_for_drain_with_client(
+                                node_store.bucket_write_reservation_client().as_ref(),
+                                &durable_drain,
+                                BucketDeleteAttemptOutcomeKind::NotEmpty,
+                                BucketDeleteAttemptPhase::StreamCleanup,
+                                format!(
+                                    "live stream blocker during cleanup before reservation wait: {source:?}"
+                                ),
+                            );
+                            return Err(self.bucket_delete_not_empty_error(bucket, pg_id, source));
+                        }
+                        PutObjectStreamUploadCleanup::Aborted { count } => {
+                            Self::emit_bucket_delete_begin_loop_step(
+                                bucket,
+                                pg_id,
+                                started,
+                                "stream_cleanup_done",
+                                format!(
+                                    "iteration={} pass=before_reservation_wait aborted_stream_uploads={}",
+                                    loop_iteration, count
+                                ),
+                            );
+                        }
+                    }
+                    Self::emit_bucket_delete_begin_loop_step(
+                        bucket,
+                        pg_id,
+                        started,
+                        "wait_reservations_empty_start",
+                        format!("iteration={loop_iteration}"),
+                    );
+                    attempt_phase = BucketDeleteAttemptPhase::ReservationWait;
+                    self.wait_for_durable_bucket_write_reservations_empty(
+                        bucket,
+                        started,
+                        &mut work_budget,
+                    )?;
+                    Self::emit_bucket_delete_begin_loop_step(
+                        bucket,
+                        pg_id,
+                        started,
+                        "wait_reservations_empty_done",
+                        format!("iteration={loop_iteration}"),
+                    );
+                    Self::emit_bucket_delete_begin_loop_step(
+                        bucket,
+                        pg_id,
+                        started,
+                        "drain_exact_bucket_object_commands_start",
+                        format!(
+                            "iteration={} command_kind=none pass=after_reservation_wait",
+                            loop_iteration
+                        ),
+                    );
+                    attempt_phase = BucketDeleteAttemptPhase::PostReservationObjectDrain;
+                    match self
+                        .drain_pending_object_metadata_commands_for_exact_bucket_on_all_pgs_with_budget(
+                            bucket,
+                            Some(started),
+                            &mut work_budget,
+                            Some(BucketDeleteExactDrainProgress {
+                                client: node_store.bucket_write_reservation_client().as_ref(),
+                                drain: &durable_drain,
+                            }),
+                        ) {
+                        Ok(()) => {}
+                        Err(BucketWriteDrainError::Store(StoreError::MetadataCommandContention {
+                            ..
+                        })) => {
+                            super::sleep_after_metadata_contention_retry_for(
+                                "bucket_delete_begin",
+                                Some(pg_id),
+                                "bucket delete exact bucket object drain after reservation wait contention",
+                                &mut metadata_contention_retries,
+                            );
+                            continue;
+                        }
+                        Err(error) => return Err(error),
+                    }
+                    Self::emit_bucket_delete_begin_loop_step(
+                        bucket,
+                        pg_id,
+                        started,
+                        "drain_exact_bucket_object_commands_done",
+                        format!(
+                            "iteration={} command_kind=none pass=after_reservation_wait",
+                            loop_iteration
+                        ),
+                    );
+                    let post_reservation_progress = BucketDeleteExactDrainProgress {
+                        client: node_store.bucket_write_reservation_client().as_ref(),
+                        drain: &durable_drain,
+                    };
+                    self.record_bucket_delete_post_reservation_next_object_pg_id(
+                        post_reservation_progress,
+                        0,
+                    )?;
+                    Self::emit_bucket_delete_begin_loop_step(
+                        bucket,
+                        pg_id,
+                        started,
+                        "stream_cleanup_start",
+                        format!("iteration={} pass=before_visibility_check", loop_iteration),
+                    );
+                    attempt_phase = BucketDeleteAttemptPhase::StreamCleanup;
+                    let aborted_stream_uploads = match self
+                        .cleanup_abandoned_put_object_stream_uploads_for_bucket(bucket)?
+                    {
+                        PutObjectStreamUploadCleanup::Live(source) => {
+                            self.record_bucket_delete_attempt_outcome_for_drain_with_client(
+                                node_store.bucket_write_reservation_client().as_ref(),
+                                &durable_drain,
+                                BucketDeleteAttemptOutcomeKind::NotEmpty,
+                                BucketDeleteAttemptPhase::StreamCleanup,
+                                format!(
+                                    "live stream blocker during cleanup before visibility check: {source:?}"
+                                ),
+                            );
+                            return Err(self.bucket_delete_not_empty_error(bucket, pg_id, source));
+                        }
+                        PutObjectStreamUploadCleanup::Aborted { count } => count,
+                    };
+                    Self::emit_bucket_delete_begin_loop_step(
+                        bucket,
+                        pg_id,
+                        started,
+                        "stream_cleanup_done",
+                        format!(
+                            "iteration={} pass=before_visibility_check aborted_stream_uploads={}",
+                            loop_iteration, aborted_stream_uploads
+                        ),
+                    );
+                    if aborted_stream_uploads > 0 {
+                        Self::emit_bucket_delete_begin_loop_step(
+                            bucket,
+                            pg_id,
+                            started,
+                            "drain_exact_bucket_object_commands_start",
+                            format!(
+                                "iteration={} command_kind=none pass=after_abandoned_stream_abort",
+                                loop_iteration
+                            ),
+                        );
+                        match self
+                            .drain_pending_object_metadata_commands_for_exact_bucket_on_all_pgs_with_budget(
+                                bucket,
+                                Some(started),
+                                &mut work_budget,
+                                None,
+                            ) {
+                            Ok(()) => {}
+                            Err(BucketWriteDrainError::Store(StoreError::MetadataCommandContention {
+                                ..
+                            })) => {
+                                super::sleep_after_metadata_contention_retry_for(
+                                    "bucket_delete_begin",
+                                    Some(pg_id),
+                                    "bucket delete exact bucket object drain after abandoned stream abort contention",
+                                    &mut metadata_contention_retries,
+                                );
+                                continue;
+                            }
+                            Err(error) => return Err(error),
+                        }
+                        Self::emit_bucket_delete_begin_loop_step(
+                            bucket,
+                            pg_id,
+                            started,
+                            "drain_exact_bucket_object_commands_done",
+                            format!(
+                                "iteration={} command_kind=none pass=after_abandoned_stream_abort",
+                                loop_iteration
+                            ),
+                        );
+                    }
+                    Self::emit_bucket_delete_begin_loop_step(
+                        bucket,
+                        pg_id,
+                        started,
+                        "pending_command_recheck_start",
+                        format!("iteration={} pass=before_visibility_check", loop_iteration),
+                    );
+                    let pending_before_visibility_check =
+                        self.pending_metadata_command_for_bucket(pg_id, bucket)?;
+                    Self::emit_bucket_delete_begin_loop_step(
+                        bucket,
+                        pg_id,
+                        started,
+                        "pending_command_recheck_done",
+                        format!(
+                            "iteration={} pass=before_visibility_check has_pending={} command_kind={}",
+                            loop_iteration,
+                            pending_before_visibility_check.is_some(),
+                            pending_before_visibility_check
+                                .as_ref()
+                                .map_or("none", |command| command.payload().kind_name())
+                        ),
+                    );
+                    if pending_before_visibility_check.is_some() {
+                        super::sleep_after_metadata_contention_retry_for(
+                            "bucket_delete_begin",
+                            Some(pg_id),
+                            "bucket delete pending command remained before visibility check",
+                            &mut metadata_contention_retries,
+                        );
+                        continue;
+                    }
                 }
                 Self::emit_bucket_delete_begin_loop_step(
                     bucket,
