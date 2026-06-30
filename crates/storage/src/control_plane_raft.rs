@@ -124,6 +124,68 @@ impl<T> ControlPlaneRaftLinearizedAuthority for T where
 {
 }
 
+#[derive(Clone)]
+pub struct ControlPlaneRaftAuthorityHandle {
+    inner: Arc<dyn ControlPlaneRaftLinearizedAuthority + Send + Sync>,
+}
+
+impl ControlPlaneRaftAuthorityHandle {
+    pub fn new<T>(authority: Arc<T>) -> Self
+    where
+        T: ControlPlaneRaftLinearizedAuthority + Send + Sync + 'static,
+    {
+        Self { inner: authority }
+    }
+
+    pub fn from_linearized_authority(
+        authority: Arc<dyn ControlPlaneRaftLinearizedAuthority + Send + Sync>,
+    ) -> Self {
+        Self { inner: authority }
+    }
+
+    #[must_use]
+    pub fn as_linearized_authority(
+        &self,
+    ) -> &(dyn ControlPlaneRaftLinearizedAuthority + Send + Sync + 'static) {
+        &*self.inner
+    }
+}
+
+impl fmt::Debug for ControlPlaneRaftAuthorityHandle {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ControlPlaneRaftAuthorityHandle")
+            .finish_non_exhaustive()
+    }
+}
+
+impl ControlPlaneRaftLinearizedCommandSink for ControlPlaneRaftAuthorityHandle {
+    fn submit_control_plane_command(
+        &self,
+        command: ControlPlaneCommand,
+    ) -> ControlPlaneRaftFuture<'_, Result<SubmittedControlPlaneRaftCommand, ControlPlaneError>>
+    {
+        self.inner.submit_control_plane_command(command)
+    }
+}
+
+impl ControlPlaneRaftLinearizedRuntimeMapSource for ControlPlaneRaftAuthorityHandle {
+    fn linearized_runtime_map_snapshot(
+        &self,
+        issued_at_ms: u64,
+    ) -> ControlPlaneRaftFuture<'_, Result<ClusterRuntimeMapSnapshot, ControlPlaneError>> {
+        self.inner.linearized_runtime_map_snapshot(issued_at_ms)
+    }
+}
+
+impl ControlPlaneRaftAuthorityStatusSource for ControlPlaneRaftAuthorityHandle {
+    fn status(
+        &self,
+    ) -> ControlPlaneRaftFuture<'_, Result<ControlPlaneRaftAuthorityStatus, ControlPlaneError>>
+    {
+        self.inner.status()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ControlPlaneRaftAuthorityStatus {
     node_id: ControlPlaneRaftNodeId,
@@ -2841,6 +2903,36 @@ mod tests {
         panic!("{message}: log store did not purge through {log_id}");
     }
 
+    async fn expect_bounded_control_plane_raft<T, Fut>(
+        future: Fut,
+        timeout: Duration,
+        message: &'static str,
+    ) -> T
+    where
+        Fut: Future<Output = Result<T, ControlPlaneError>> + OptionalSend,
+    {
+        match ControlPlaneRaftTypeConfig::timeout(timeout, future).await {
+            Ok(Ok(value)) => value,
+            Ok(Err(error)) => panic!("{message}: {error:?}"),
+            Err(_) => panic!("{message}: timed out after {timeout:?}"),
+        }
+    }
+
+    async fn expect_bounded_control_plane_raft_error<T, Fut>(
+        future: Fut,
+        timeout: Duration,
+        message: &'static str,
+    ) -> ControlPlaneError
+    where
+        Fut: Future<Output = Result<T, ControlPlaneError>> + OptionalSend,
+    {
+        match ControlPlaneRaftTypeConfig::timeout(timeout, future).await {
+            Ok(Ok(_)) => panic!("{message}: unexpectedly succeeded"),
+            Ok(Err(error)) => error,
+            Err(_) => panic!("{message}: timed out after {timeout:?}"),
+        }
+    }
+
     fn raft_log_id(term: u64, node_id: u64, index: u64) -> LogIdOf<ControlPlaneRaftTypeConfig> {
         LogId::new(LeaderId { term, node_id }, index)
     }
@@ -4185,7 +4277,7 @@ mod tests {
     }
 
     #[test]
-    fn control_plane_openraft_linearized_authority_trait_submits_reads_and_reports_status() {
+    fn control_plane_openraft_linearized_authority_handle_submits_reads_and_reports_status() {
         ControlPlaneRaftTypeConfig::run(async {
             let log_store = ControlPlaneRaftLogStore::empty();
             let state_machine = ControlPlaneRaftStateMachine::empty();
@@ -4199,14 +4291,15 @@ mod tests {
             .await
             .unwrap();
 
-            let authority = ControlPlaneRaftAuthority::new(raft);
+            let authority = Arc::new(ControlPlaneRaftAuthority::new(raft));
             authority
                 .initialize_membership(BTreeMap::from([(301, BasicNode::new("node-301"))]))
                 .await
                 .unwrap();
             wait_for_local_leader(authority.raft(), "linearized authority trait leadership").await;
 
-            let linearized_authority: &dyn ControlPlaneRaftLinearizedAuthority = &authority;
+            let handle = ControlPlaneRaftAuthorityHandle::new(Arc::clone(&authority));
+            let linearized_authority = handle.as_linearized_authority();
             let write = linearized_authority
                 .submit_control_plane_command(ControlPlaneCommand::BootstrapInitialClusterMap {
                     nodes: vec![(NodeId::new(301), "node-301".to_string())],
@@ -4600,6 +4693,7 @@ mod tests {
     #[test]
     fn control_plane_openraft_two_node_membership_change_updates_state_machine() {
         ControlPlaneRaftTypeConfig::run(async {
+            let operation_timeout = Duration::from_secs(2);
             let (authority1, authority2) = initialized_two_node_authorities(
                 "control-plane-raft-two-node-membership-change-test",
                 501,
@@ -4607,16 +4701,20 @@ mod tests {
             )
             .await;
 
-            let bootstrap = authority1
-                .submit_control_plane_command(ControlPlaneCommand::BootstrapInitialClusterMap {
-                    nodes: vec![
-                        (NodeId::new(501), "node-501".to_string()),
-                        (NodeId::new(502), "node-502".to_string()),
-                    ],
-                    pg_ids: vec![PgId::new(0)],
-                })
-                .await
-                .unwrap();
+            let bootstrap = expect_bounded_control_plane_raft(
+                authority1.submit_control_plane_command(
+                    ControlPlaneCommand::BootstrapInitialClusterMap {
+                        nodes: vec![
+                            (NodeId::new(501), "node-501".to_string()),
+                            (NodeId::new(502), "node-502".to_string()),
+                        ],
+                        pg_ids: vec![PgId::new(0)],
+                    },
+                ),
+                operation_timeout,
+                "two-node membership test bootstrap command",
+            )
+            .await;
             assert!(matches!(
                 bootstrap.outcome(),
                 ControlPlaneRaftCommandOutcome::Applied(
@@ -4632,7 +4730,12 @@ mod tests {
                 .await
                 .unwrap();
 
-            authority1.transfer_leadership_to(502).await.unwrap();
+            expect_bounded_control_plane_raft(
+                authority1.transfer_leadership_to(502),
+                operation_timeout,
+                "two-node membership test transfer leadership to removed voter",
+            )
+            .await;
             authority1
                 .wait_for_current_leader(
                     502,
@@ -4650,10 +4753,12 @@ mod tests {
                 .await
                 .unwrap();
 
-            let pre_removal_runtime_map = authority2
-                .linearized_runtime_map_snapshot(50_000)
-                .await
-                .unwrap();
+            let pre_removal_runtime_map = expect_bounded_control_plane_raft(
+                authority2.linearized_runtime_map_snapshot(50_000),
+                operation_timeout,
+                "two-node membership test pre-removal read-index runtime map",
+            )
+            .await;
             assert!(pre_removal_runtime_map
                 .freshness_proof()
                 .is_serving_authority_read());
@@ -4661,13 +4766,17 @@ mod tests {
                 pre_removal_runtime_map.freshness_proof().issued_at_ms(),
                 Some(50_000)
             );
-            let pre_removal_write = authority2
-                .submit_control_plane_command(ControlPlaneCommand::MarkNodeAvailability {
-                    node_id: NodeId::new(502),
-                    availability: NodeAvailabilityState::Unavailable,
-                })
-                .await
-                .unwrap();
+            let pre_removal_write = expect_bounded_control_plane_raft(
+                authority2.submit_control_plane_command(
+                    ControlPlaneCommand::MarkNodeAvailability {
+                        node_id: NodeId::new(502),
+                        availability: NodeAvailabilityState::Unavailable,
+                    },
+                ),
+                operation_timeout,
+                "two-node membership test pre-removal write through removed voter",
+            )
+            .await;
             assert!(matches!(
                 pre_removal_write.outcome(),
                 ControlPlaneRaftCommandOutcome::Applied(
@@ -4675,10 +4784,35 @@ mod tests {
                 )
             ));
 
-            let membership_log_id = authority2
-                .replace_voters(BTreeSet::from([501]), false)
+            expect_bounded_control_plane_raft(
+                authority2.transfer_leadership_to(501),
+                operation_timeout,
+                "two-node membership test transfer leadership back before removal",
+            )
+            .await;
+            authority1
+                .wait_for_current_leader(
+                    501,
+                    Duration::from_secs(1),
+                    "surviving voter became leader before membership removal",
+                )
                 .await
                 .unwrap();
+            authority2
+                .wait_for_current_leader(
+                    501,
+                    Duration::from_secs(1),
+                    "removed voter observed surviving leader before removal",
+                )
+                .await
+                .unwrap();
+
+            let membership_log_id = expect_bounded_control_plane_raft(
+                authority1.replace_voters(BTreeSet::from([501]), false),
+                operation_timeout,
+                "two-node membership test remove previously serving voter from membership",
+            )
+            .await;
             authority1
                 .wait_for_applied_index_at_least(
                     membership_log_id.index(),
@@ -4687,16 +4821,20 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            authority1.raft().trigger().elect(false).await.unwrap();
             authority1
                 .wait_for_current_leader(
                     501,
                     Duration::from_secs(1),
-                    "remaining voter became leader after membership removal",
+                    "remaining voter stayed leader after membership removal",
                 )
                 .await
                 .unwrap();
-            let status = authority1.status().await.unwrap();
+            let status = expect_bounded_control_plane_raft(
+                authority1.status(),
+                operation_timeout,
+                "two-node membership test status after membership removal",
+            )
+            .await;
             assert_eq!(status.current_leader(), Some(501));
             assert_eq!(
                 status.effective_membership_log_id(),
@@ -4710,35 +4848,45 @@ mod tests {
             assert_eq!(status.applied_membership_log_id(), Some(membership_log_id));
             assert_eq!(status.applied_voters(), &BTreeSet::from([501]));
 
-            let removed_read_err = authority2
-                .linearized_runtime_map_snapshot(50_100)
-                .await
-                .unwrap_err();
+            let removed_read_err = expect_bounded_control_plane_raft_error(
+                authority2.linearized_runtime_map_snapshot(50_100),
+                operation_timeout,
+                "two-node membership test removed voter read-index runtime map",
+            )
+            .await;
             assert!(matches!(
                 removed_read_err,
                 ControlPlaneError::RpcRemote { message }
                     if message.contains("OpenRaft read-index failed")
             ));
-            let removed_write_err = authority2
-                .submit_control_plane_command(ControlPlaneCommand::MarkNodeAvailability {
-                    node_id: NodeId::new(502),
-                    availability: NodeAvailabilityState::Unavailable,
-                })
-                .await
-                .unwrap_err();
+            let removed_write_err = expect_bounded_control_plane_raft_error(
+                authority2.submit_control_plane_command(
+                    ControlPlaneCommand::MarkNodeAvailability {
+                        node_id: NodeId::new(502),
+                        availability: NodeAvailabilityState::Unavailable,
+                    },
+                ),
+                operation_timeout,
+                "two-node membership test removed voter write",
+            )
+            .await;
             assert!(matches!(
                 removed_write_err,
                 ControlPlaneError::RpcRemote { message }
                     if message.contains("OpenRaft client-write failed")
             ));
 
-            let follow_up = authority1
-                .submit_control_plane_command(ControlPlaneCommand::MarkNodeAvailability {
-                    node_id: NodeId::new(501),
-                    availability: NodeAvailabilityState::Unavailable,
-                })
-                .await
-                .unwrap();
+            let follow_up = expect_bounded_control_plane_raft(
+                authority1.submit_control_plane_command(
+                    ControlPlaneCommand::MarkNodeAvailability {
+                        node_id: NodeId::new(501),
+                        availability: NodeAvailabilityState::Unavailable,
+                    },
+                ),
+                operation_timeout,
+                "two-node membership test follow-up write through surviving voter",
+            )
+            .await;
             assert!(matches!(
                 follow_up.outcome(),
                 ControlPlaneRaftCommandOutcome::Applied(
@@ -4746,7 +4894,12 @@ mod tests {
                 )
             ));
             assert!(follow_up.log_id().index() > membership_log_id.index());
-            let follow_up_status = authority1.status().await.unwrap();
+            let follow_up_status = expect_bounded_control_plane_raft(
+                authority1.status(),
+                operation_timeout,
+                "two-node membership test follow-up status",
+            )
+            .await;
             assert_eq!(follow_up_status.applied(), Some(follow_up.log_id()));
             assert_eq!(
                 follow_up_status.effective_membership_log_id(),

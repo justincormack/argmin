@@ -9731,6 +9731,18 @@ Phase 12.1 progress:
   reads. The trait smoke now exercises command, read-index runtime map, and
   readiness/status access through a single boundary that later admin/readiness
   wiring can depend on without naming the concrete OpenRaft wrapper.
+- Added a cloneable OpenRaft authority handle around the object-safe
+  linearized authority boundary. The handle keeps command submission,
+  read-index runtime-map reads, and status/readiness access behind an
+  `Arc<dyn ... + Send + Sync>` dependency, so the next RPC/admin wiring can
+  pass authority capabilities around without coupling callers to the concrete
+  OpenRaft wrapper or test-only raft construction details.
+- Hardened the two-node membership-change smoke so it no longer relies on a
+  leader removing itself from the voter set. The removed node still proves it
+  served a linearized read and write before removal, but leadership is handed
+  back to the surviving voter before committing the removal. The same smoke now
+  bounds each OpenRaft-facing operation so a stalled membership/read/write
+  future fails with the operation label instead of hanging the whole suite.
 
 1. define the replicated control-plane state machine:
    - state includes cluster epoch, PG count, PG state, PG acting sets, node
