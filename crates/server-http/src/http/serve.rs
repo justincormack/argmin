@@ -1281,6 +1281,7 @@ fn local_debug_metrics_body(state: &Arc<ServerState>) -> String {
             "reclaim_work_queue_depth {}\n",
             "object_payload_reclaim_queue_depth {}\n",
             "object_payload_reclaim_outstanding_depth {}\n",
+            "bucket_delete_begin_queue_depth {}\n",
             "bucket_delete_finalize_queue_depth {}\n",
             "bucket_delete_finalize_outstanding_depth {}\n",
             "reclaim_work_queue_action_total {}\n",
@@ -1385,6 +1386,7 @@ fn local_debug_metrics_body(state: &Arc<ServerState>) -> String {
         snapshot.reclaim_work_queue_depth,
         snapshot.object_payload_reclaim_queue_depth,
         snapshot.object_payload_reclaim_outstanding_depth,
+        snapshot.bucket_delete_begin_queue_depth,
         snapshot.bucket_delete_finalize_queue_depth,
         snapshot.bucket_delete_finalize_outstanding_depth,
         snapshot.reclaim_work_queue_action_total,
@@ -4914,6 +4916,9 @@ mod tests {
         assert!(response.contains("metadata_command_backoff_total "));
         assert!(response.contains("metadata_command_backoff_us_total "));
         assert!(response.contains("metadata_command_backoff_us_max "));
+        assert!(response.contains("bucket_delete_begin_queue_depth "));
+        assert!(response.contains("bucket_delete_finalize_queue_depth "));
+        assert!(response.contains("bucket_delete_finalize_outstanding_depth "));
         assert!(response.contains("shard_repair_queue_depth "));
         assert!(response.contains("shard_repair_event_total "));
         assert!(response.contains("shard_repair_shards_rewritten_total "));

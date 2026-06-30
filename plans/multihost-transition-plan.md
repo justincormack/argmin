@@ -9007,7 +9007,13 @@ Keep an explicit Phase 11 close-out before treating the phase as soak-clean:
     when there is no bucket row, no finalizer claim, no object rows, and no
     reclaim root. If this state appears, the worker should clear it or the
     diagnostic should identify it as a volatile queue/runtime-state bug rather
-    than an unfinished durable cleanup;
+    than an unfinished durable cleanup. The reclaim queue metrics now split
+    active-bucket `BucketDeleteBegin` retry queue depth from
+    `BucketDelete` finalizer queue/outstanding depth, so soak output can
+    distinguish a stuck begin retry from stuck final deletion instead of
+    reporting both as one bucket-delete queue. The cleanup-versioned-stress
+    health gate now also requires the begin retry queue to drain, not only
+    finalizer outstanding depth;
 16. status: partial. Extend failure preservation for cleanup/runtime-state soak failures to dump
     durable state, not only public S3 visibility: bucket row, finalizer claim,
     bucket write drain, pending command slot, object rows, object reclaim roots,

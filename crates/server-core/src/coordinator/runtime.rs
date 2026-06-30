@@ -364,6 +364,7 @@ fn background_work_durable_backlog_active(snapshot: observability::MetricsSnapsh
     snapshot.reclaim_work_queue_depth > 0
         || snapshot.object_payload_reclaim_queue_depth > 0
         || snapshot.object_payload_reclaim_outstanding_depth > 0
+        || snapshot.bucket_delete_begin_queue_depth > 0
         || snapshot.bucket_delete_finalize_queue_depth > 0
         || snapshot.bucket_delete_finalize_outstanding_depth > 0
         || snapshot.shard_repair_queue_depth > 0

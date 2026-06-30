@@ -1350,9 +1350,9 @@ impl LocalClusterRuntimeState {
                 queue_depth: state.work_queue.len(),
                 object_payload_depth: state.queued_objects.len(),
                 object_payload_outstanding_depth: state.outstanding_objects.len(),
-                bucket_delete_depth: state.queued_bucket_deletes.len()
-                    + state.queued_bucket_delete_begins.len(),
-                bucket_delete_outstanding_depth: state.outstanding_bucket_deletes.len(),
+                bucket_delete_begin_depth: state.queued_bucket_delete_begins.len(),
+                bucket_delete_finalize_depth: state.queued_bucket_deletes.len(),
+                bucket_delete_finalize_outstanding_depth: state.outstanding_bucket_deletes.len(),
             },
         );
     }

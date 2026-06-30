@@ -1242,6 +1242,7 @@ print_slowdown_summary() {
         local reclaim_queue_depth
         local object_payload_reclaim_queue_depth
         local object_payload_reclaim_outstanding_depth
+        local bucket_delete_begin_queue_depth
         local bucket_delete_finalize_queue_depth
         local bucket_delete_finalize_outstanding_depth
         local reclaim_queue_action
@@ -1381,6 +1382,7 @@ print_slowdown_summary() {
         reclaim_queue_depth="$(latest_metric_sample_value "$metrics_log" reclaim_work_queue_depth)"
         object_payload_reclaim_queue_depth="$(latest_metric_sample_value "$metrics_log" object_payload_reclaim_queue_depth)"
         object_payload_reclaim_outstanding_depth="$(latest_metric_sample_value "$metrics_log" object_payload_reclaim_outstanding_depth)"
+        bucket_delete_begin_queue_depth="$(latest_metric_sample_value "$metrics_log" bucket_delete_begin_queue_depth)"
         bucket_delete_finalize_queue_depth="$(latest_metric_sample_value "$metrics_log" bucket_delete_finalize_queue_depth)"
         bucket_delete_finalize_outstanding_depth="$(latest_metric_sample_value "$metrics_log" bucket_delete_finalize_outstanding_depth)"
         reclaim_queue_action="$(latest_metric_sample_value "$metrics_log" reclaim_work_queue_action_total)"
@@ -1498,7 +1500,7 @@ print_slowdown_summary() {
         echo "storage_rpc_active total=$storage_rpc_active_total completion=$storage_rpc_active_completion pending_envelope_active=$storage_rpc_pending_envelope_active pending_envelope_oldest_active_us=$storage_rpc_pending_envelope_oldest_active_us pending_envelope_oldest_active_node_id=$storage_rpc_pending_envelope_oldest_active_node_id pending_envelope_oldest_active_request_id=$storage_rpc_pending_envelope_oldest_active_request_id" >&2
         echo "metadata_recovery leader_total=$metadata_recovery_leader wait_total=$metadata_recovery_wait wait_us_total=$metadata_recovery_wait_us wait_us_max=$metadata_recovery_wait_us_max timeout_total=$metadata_recovery_timeout outcome_total=$metadata_recovery_outcome" >&2
         echo "metadata_budget exhausted_total=$metadata_budget_exhausted backoff_total=$metadata_backoff backoff_us_total=$metadata_backoff_us backoff_us_max=$metadata_backoff_us_max" >&2
-        echo "reclaim queue_depth=$reclaim_queue_depth object_payload_queue_depth=$object_payload_reclaim_queue_depth object_payload_outstanding_depth=$object_payload_reclaim_outstanding_depth bucket_delete_queue_depth=$bucket_delete_finalize_queue_depth bucket_delete_outstanding_depth=$bucket_delete_finalize_outstanding_depth queue_action_total=$reclaim_queue_action object_payload_event_total=$object_payload_reclaim_event durable_scan_total=$object_payload_reclaim_durable_scan" >&2
+        echo "reclaim queue_depth=$reclaim_queue_depth object_payload_queue_depth=$object_payload_reclaim_queue_depth object_payload_outstanding_depth=$object_payload_reclaim_outstanding_depth bucket_delete_begin_queue_depth=$bucket_delete_begin_queue_depth bucket_delete_finalize_queue_depth=$bucket_delete_finalize_queue_depth bucket_delete_finalize_outstanding_depth=$bucket_delete_finalize_outstanding_depth queue_action_total=$reclaim_queue_action object_payload_event_total=$object_payload_reclaim_event durable_scan_total=$object_payload_reclaim_durable_scan" >&2
         echo "shard_repair queue_depth=$shard_repair_queue_depth event_total=$shard_repair_event shards_rewritten_total=$shard_repair_shards_rewritten" >&2
         echo "shard_repair_events durable_scan_empty=$shard_repair_durable_scan_empty durable_scan_queued=$shard_repair_durable_scan_queued durable_scan_no_new_enqueue=$shard_repair_durable_scan_no_new_enqueue queued=$shard_repair_queued queue_full=$shard_repair_queue_full deduped=$shard_repair_deduped started=$shard_repair_started resolved_clean=$shard_repair_resolved_clean repaired=$shard_repair_repaired complete_succeeded=$shard_repair_complete_succeeded complete_stale=$shard_repair_complete_stale complete_failed=$shard_repair_complete_failed failed=$shard_repair_failed unrecoverable=$shard_repair_unrecoverable" >&2
         echo "shard_backfill queue_depth=$shard_backfill_queue_depth event_total=$shard_backfill_event shards_written_total=$shard_backfill_shards_written" >&2
@@ -2476,27 +2478,29 @@ assert_cleanup_versioned_stress_metrics_clean() {
         local operation_aborted
         local slow_down
         local request_error
-        local bucket_delete_queue_depth
-        local bucket_delete_outstanding_depth
+        local bucket_delete_begin_queue_depth
+        local bucket_delete_finalize_queue_depth
+        local bucket_delete_finalize_outstanding_depth
         http_500="$(latest_metric_sample_value "$metrics_path" http_500_response_total)"
         operation_aborted="$(latest_metric_sample_value "$metrics_path" operation_aborted_response_total)"
         slow_down="$(latest_metric_sample_value "$metrics_path" slow_down_response_total)"
         request_error="$(latest_metric_sample_value "$metrics_path" request_error_total)"
-        bucket_delete_queue_depth="$(latest_metric_sample_value "$metrics_path" bucket_delete_finalize_queue_depth)"
-        bucket_delete_outstanding_depth="$(latest_metric_sample_value "$metrics_path" bucket_delete_finalize_outstanding_depth)"
+        bucket_delete_begin_queue_depth="$(latest_metric_sample_value "$metrics_path" bucket_delete_begin_queue_depth)"
+        bucket_delete_finalize_queue_depth="$(latest_metric_sample_value "$metrics_path" bucket_delete_finalize_queue_depth)"
+        bucket_delete_finalize_outstanding_depth="$(latest_metric_sample_value "$metrics_path" bucket_delete_finalize_outstanding_depth)"
 
         if ((http_500 > initial_http_500)); then
             cat "$metrics_path" >&2 || true
             echo "error: cleanup versioned stress saw HTTP 500 increase: before=$initial_http_500 after=$http_500" >&2
             return 1
         fi
-        if ((bucket_delete_outstanding_depth == 0)); then
-            echo "== argmin-s3 UAT cleanup metrics: operation_aborted_delta=$((operation_aborted - initial_operation_aborted)) slow_down_delta=$((slow_down - initial_slow_down)) request_error_delta=$((request_error - initial_request_error)) http_500_delta=$((http_500 - initial_http_500)) bucket_delete_queue_depth=$bucket_delete_queue_depth bucket_delete_outstanding_depth=$bucket_delete_outstanding_depth =="
+        if ((bucket_delete_begin_queue_depth == 0 && bucket_delete_finalize_outstanding_depth == 0)); then
+            echo "== argmin-s3 UAT cleanup metrics: operation_aborted_delta=$((operation_aborted - initial_operation_aborted)) slow_down_delta=$((slow_down - initial_slow_down)) request_error_delta=$((request_error - initial_request_error)) http_500_delta=$((http_500 - initial_http_500)) bucket_delete_begin_queue_depth=$bucket_delete_begin_queue_depth bucket_delete_finalize_queue_depth=$bucket_delete_finalize_queue_depth bucket_delete_finalize_outstanding_depth=$bucket_delete_finalize_outstanding_depth =="
             return 0
         fi
         if (($(date +%s) - start >= deadline_seconds)); then
             cat "$metrics_path" >&2 || true
-            echo "error: cleanup versioned stress left bucket delete finalizer outstanding depth $bucket_delete_outstanding_depth" >&2
+            echo "error: cleanup versioned stress left bucket delete begin queue depth $bucket_delete_begin_queue_depth and finalizer outstanding depth $bucket_delete_finalize_outstanding_depth" >&2
             return 1
         fi
         sleep 0.2
