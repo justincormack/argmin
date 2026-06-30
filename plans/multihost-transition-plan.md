@@ -9612,6 +9612,17 @@ Phase 12.1 progress:
   artifacts, verifies the restored authority still reports the final effective
   and applied voter set through the status boundary, and catches up a
   post-restart command under the promoted membership.
+- Extended OpenRaft membership-removal coverage. The removed voter first becomes
+  the serving leader and successfully serves both a read-index runtime map and a
+  client write. After that leader is removed from the control-plane membership,
+  the removed authority fails closed for both linearized runtime-map reads and
+  client writes, while the surviving voter can continue committing under the
+  reduced voter set and reports the retained membership boundary through the
+  authority status surface.
+- Extended the stale-leader lifecycle coverage in the OpenRaft authority
+  wrapper. After deterministic leadership transfer, the old leader now fails
+  closed not only for linearized runtime-map reads and client writes, but also
+  for voter replacement and learner addition requests.
 
 1. define the replicated control-plane state machine:
    - state includes cluster epoch, PG count, PG state, PG acting sets, node

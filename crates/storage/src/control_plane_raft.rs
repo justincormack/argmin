@@ -3844,6 +3844,24 @@ mod tests {
                 ControlPlaneError::RpcRemote { message }
                     if message.contains("OpenRaft client-write failed")
             ));
+            let old_leader_replace_voters_err = authority1
+                .replace_voters(BTreeSet::from([701]), false)
+                .await
+                .unwrap_err();
+            assert!(matches!(
+                old_leader_replace_voters_err,
+                ControlPlaneError::RpcRemote { message }
+                    if message.contains("OpenRaft change-membership failed")
+            ));
+            let old_leader_add_learner_err = authority1
+                .add_learner(703, BasicNode::new("node-703"), false)
+                .await
+                .unwrap_err();
+            assert!(matches!(
+                old_leader_add_learner_err,
+                ControlPlaneError::RpcRemote { message }
+                    if message.contains("OpenRaft add-learner failed")
+            ));
 
             let follow_up = authority2
                 .submit_control_plane_command(ControlPlaneCommand::MarkNodeAvailability {
@@ -3919,8 +3937,59 @@ mod tests {
                     ControlPlaneCommandResponse::BootstrapInitialClusterMap
                 )
             ));
+            authority2
+                .wait_for_applied_index_at_least(
+                    bootstrap.log_id().index(),
+                    Duration::from_secs(1),
+                    "removed voter candidate applied bootstrap before serving",
+                )
+                .await
+                .unwrap();
 
-            let membership_log_id = authority1
+            authority1.transfer_leadership_to(502).await.unwrap();
+            authority1
+                .wait_for_current_leader(
+                    502,
+                    Duration::from_secs(1),
+                    "old leader observed removed voter leadership",
+                )
+                .await
+                .unwrap();
+            authority2
+                .wait_for_current_leader(
+                    502,
+                    Duration::from_secs(1),
+                    "removed voter became serving leader before removal",
+                )
+                .await
+                .unwrap();
+
+            let pre_removal_runtime_map = authority2
+                .linearized_runtime_map_snapshot(50_000)
+                .await
+                .unwrap();
+            assert!(pre_removal_runtime_map
+                .freshness_proof()
+                .is_serving_authority_read());
+            assert_eq!(
+                pre_removal_runtime_map.freshness_proof().issued_at_ms(),
+                Some(50_000)
+            );
+            let pre_removal_write = authority2
+                .submit_control_plane_command(ControlPlaneCommand::MarkNodeAvailability {
+                    node_id: NodeId::new(502),
+                    availability: NodeAvailabilityState::Unavailable,
+                })
+                .await
+                .unwrap();
+            assert!(matches!(
+                pre_removal_write.outcome(),
+                ControlPlaneRaftCommandOutcome::Applied(
+                    ControlPlaneCommandResponse::MarkNodeAvailability
+                )
+            ));
+
+            let membership_log_id = authority2
                 .replace_voters(BTreeSet::from([501]), false)
                 .await
                 .unwrap();
@@ -3932,7 +4001,17 @@ mod tests {
                 )
                 .await
                 .unwrap();
+            authority1.raft().trigger().elect(false).await.unwrap();
+            authority1
+                .wait_for_current_leader(
+                    501,
+                    Duration::from_secs(1),
+                    "remaining voter became leader after membership removal",
+                )
+                .await
+                .unwrap();
             let status = authority1.status().await.unwrap();
+            assert_eq!(status.current_leader(), Some(501));
             assert_eq!(
                 status.effective_membership_log_id(),
                 Some(membership_log_id)
@@ -3940,6 +4019,55 @@ mod tests {
             assert_eq!(status.effective_voters(), &BTreeSet::from([501]));
             assert_eq!(status.applied_membership_log_id(), Some(membership_log_id));
             assert_eq!(status.applied_voters(), &BTreeSet::from([501]));
+
+            let removed_read_err = authority2
+                .linearized_runtime_map_snapshot(50_100)
+                .await
+                .unwrap_err();
+            assert!(matches!(
+                removed_read_err,
+                ControlPlaneError::RpcRemote { message }
+                    if message.contains("OpenRaft read-index failed")
+            ));
+            let removed_write_err = authority2
+                .submit_control_plane_command(ControlPlaneCommand::MarkNodeAvailability {
+                    node_id: NodeId::new(502),
+                    availability: NodeAvailabilityState::Unavailable,
+                })
+                .await
+                .unwrap_err();
+            assert!(matches!(
+                removed_write_err,
+                ControlPlaneError::RpcRemote { message }
+                    if message.contains("OpenRaft client-write failed")
+            ));
+
+            let follow_up = authority1
+                .submit_control_plane_command(ControlPlaneCommand::MarkNodeAvailability {
+                    node_id: NodeId::new(501),
+                    availability: NodeAvailabilityState::Unavailable,
+                })
+                .await
+                .unwrap();
+            assert!(matches!(
+                follow_up.outcome(),
+                ControlPlaneRaftCommandOutcome::Applied(
+                    ControlPlaneCommandResponse::MarkNodeAvailability
+                )
+            ));
+            assert!(follow_up.log_id().index() > membership_log_id.index());
+            let follow_up_status = authority1.status().await.unwrap();
+            assert_eq!(follow_up_status.applied(), Some(follow_up.log_id()));
+            assert_eq!(
+                follow_up_status.effective_membership_log_id(),
+                Some(membership_log_id)
+            );
+            assert_eq!(follow_up_status.effective_voters(), &BTreeSet::from([501]));
+            assert_eq!(
+                follow_up_status.applied_membership_log_id(),
+                Some(membership_log_id)
+            );
+            assert_eq!(follow_up_status.applied_voters(), &BTreeSet::from([501]));
 
             authority1.shutdown().await.unwrap();
             authority2.shutdown().await.unwrap();
