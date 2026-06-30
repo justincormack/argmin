@@ -9046,9 +9046,16 @@ Keep an explicit Phase 11 close-out before treating the phase as soak-clean:
          the temporary fence. The first slice preserves leased active delete
          drains across retryable begin failures, lets later requests adopt them,
          and clears stale-generation drains by exact identity.
-      2. status: open. Record bounded attempt outcome/debug state on the durable bucket-PG
+      2. status: partial. Record bounded attempt outcome/debug state on the durable bucket-PG
          authority: incomplete retryable context, terminal not-empty blocker,
-         stale generation/recreate, and successful `MarkBucketDeleting`.
+         stale generation/recreate, and successful `MarkBucketDeleting`. The
+         current slice adds a single-row-per-bucket durable outcome record on
+         the bucket PG, exposed through local and Unix storage-node clients, and
+         records retryable preserved attempts, terminal not-empty blockers,
+         stale-generation drain rollback, and successful `MarkBucketDeleting`
+         best-effort from `DeleteBucket` begin. This is diagnostic state only;
+         background adoption and resumable proof frontiers are still tracked by
+         later items.
       3. status: open. Add a background worker path that advances the same state machine used
          by foreground requests rather than inventing a second cleanup path.
       4. status: open. Add durable proof progress/frontiers for the expensive all-object-PG

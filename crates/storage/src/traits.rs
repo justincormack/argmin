@@ -215,6 +215,20 @@ pub(crate) trait PgMetadataStore {
         now: u64,
     ) -> Result<BucketWriteDrainRecord, MetadataError>;
 
+    /// Record the last durable DeleteBucket attempt outcome for this bucket.
+    #[allow(dead_code)]
+    fn record_bucket_delete_attempt_outcome(
+        &self,
+        record: &BucketDeleteAttemptOutcomeRecord,
+    ) -> Result<(), MetadataError>;
+
+    /// Read the last durable DeleteBucket attempt outcome for this bucket.
+    #[allow(dead_code)]
+    fn bucket_delete_attempt_outcome(
+        &self,
+        name: &BucketName,
+    ) -> Result<Option<BucketDeleteAttemptOutcomeRecord>, MetadataError>;
+
     /// Set bucket versioning state.
     ///
     /// Validates transitions: Disabled→Enabled and Enabled↔Suspended are allowed.

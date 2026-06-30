@@ -398,6 +398,68 @@ impl BucketWriteReservationNodeClient for UnixStorageNodeClient {
         Ok(response.record)
     }
 
+    fn record_bucket_delete_attempt_outcome(
+        &self,
+        pg_id: PgId,
+        record: &BucketDeleteAttemptOutcomeRecord,
+    ) -> Result<(), BucketSnapshotLoadError> {
+        let request = StorageRpcBucketDeleteAttemptOutcomeRecordRequest {
+            node_id: self.node_id,
+            cluster_epoch: self.cluster_epoch,
+            pg_id,
+            record: record.clone(),
+        };
+        let payload =
+            encode_bucket_delete_attempt_outcome_record_request(&request).map_err(|error| {
+                BucketSnapshotLoadError::Store(self.rpc_payload_error(
+                    "encode bucket delete attempt outcome record request",
+                    error.to_string(),
+                ))
+            })?;
+        self.rpc_request(
+            StorageRpcMessageKind::BucketDeleteAttemptOutcomeRecord,
+            payload,
+        )
+        .map(|_| ())
+        .map_err(BucketSnapshotLoadError::Store)
+    }
+
+    fn bucket_delete_attempt_outcome(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+    ) -> Result<Option<BucketDeleteAttemptOutcomeRecord>, BucketSnapshotLoadError> {
+        let request = StorageRpcBucketRequest {
+            node_id: self.node_id,
+            cluster_epoch: self.cluster_epoch,
+            pg_id,
+            bucket: bucket.clone(),
+        };
+        let payload = encode_bucket_request(&request);
+        let response = self
+            .rpc_request(
+                StorageRpcMessageKind::BucketDeleteAttemptOutcomeGet,
+                payload,
+            )
+            .map_err(BucketSnapshotLoadError::Store)?;
+        let response = decode_bucket_delete_attempt_outcome_optional_record_response(&response)
+            .map_err(|error| {
+                BucketSnapshotLoadError::Store(self.rpc_payload_error(
+                    "decode bucket delete attempt outcome get response",
+                    error.to_string(),
+                ))
+            })?;
+        if let Some(record) = &response.record {
+            if record.bucket != *bucket {
+                return Err(BucketSnapshotLoadError::Store(self.rpc_payload_error(
+                    "validate bucket delete attempt outcome get response",
+                    "outcome response bucket does not match request".to_string(),
+                )));
+            }
+        }
+        Ok(response.record)
+    }
+
     fn acquire_durable_bucket_write_reservation(
         &self,
         pg_id: PgId,

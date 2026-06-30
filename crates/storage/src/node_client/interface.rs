@@ -168,6 +168,18 @@ pub(crate) trait BucketWriteReservationNodeClient: Send + Sync {
         bucket: &BucketName,
     ) -> Result<Option<BucketWriteDrainRecord>, BucketSnapshotLoadError>;
 
+    fn record_bucket_delete_attempt_outcome(
+        &self,
+        pg_id: PgId,
+        record: &BucketDeleteAttemptOutcomeRecord,
+    ) -> Result<(), BucketSnapshotLoadError>;
+
+    fn bucket_delete_attempt_outcome(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+    ) -> Result<Option<BucketDeleteAttemptOutcomeRecord>, BucketSnapshotLoadError>;
+
     #[allow(clippy::too_many_arguments)]
     fn acquire_durable_bucket_write_reservation(
         &self,
@@ -1345,6 +1357,18 @@ pub(crate) trait StorageNodeClient:
         pg_id: PgId,
         bucket: &BucketName,
     ) -> Result<Option<BucketWriteDrainRecord>, BucketSnapshotLoadError>;
+
+    fn record_bucket_delete_attempt_outcome(
+        &self,
+        pg_id: PgId,
+        record: &BucketDeleteAttemptOutcomeRecord,
+    ) -> Result<(), BucketSnapshotLoadError>;
+
+    fn bucket_delete_attempt_outcome(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+    ) -> Result<Option<BucketDeleteAttemptOutcomeRecord>, BucketSnapshotLoadError>;
 
     #[allow(clippy::too_many_arguments)]
     fn acquire_durable_bucket_write_reservation(

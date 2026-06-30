@@ -1049,6 +1049,14 @@ fn active_put_object_stream_upload_blocks_bucket_delete() {
         "terminal BucketNotEmpty should clear adopted delete drain {}",
         drain.record.drain_id
     );
+    let outcome = crate::PgMetadataStore::bucket_delete_attempt_outcome(&*bucket_pg, &bucket)
+        .unwrap()
+        .expect("terminal BucketNotEmpty should record the delete attempt outcome");
+    assert_eq!(outcome.drain_id, drain.record.drain_id);
+    assert_eq!(
+        outcome.outcome,
+        crate::BucketDeleteAttemptOutcomeKind::NotEmpty
+    );
     drop(bucket_pg);
 
     cluster

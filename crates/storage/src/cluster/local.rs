@@ -1182,6 +1182,12 @@ impl LocalClusterRuntimeState {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         state.queued_bucket_deletes.remove(bucket);
+        state.work_queue.retain(|work| {
+            !matches!(
+                work,
+                ReclaimWorkItem::BucketDelete(queued_bucket) if queued_bucket == bucket
+            )
+        });
         if state.outstanding_bucket_deletes.remove(bucket) {
             Self::emit_reclaim_queue_action(&state, "bucket_delete", "finish");
         }

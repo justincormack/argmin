@@ -4647,6 +4647,71 @@ fn bucket_write_drain_from_row(
     })
 }
 
+fn bucket_delete_attempt_outcome_from_row(
+    row: &rusqlite::Row<'_>,
+) -> Result<BucketDeleteAttemptOutcomeRecord, rusqlite::Error> {
+    let bucket_raw: String = row.get(0)?;
+    let cluster_epoch_raw: i64 = row.get(2)?;
+    let bucket_execution_generation_raw: i64 = row.get(3)?;
+    let outcome_raw: i64 = row.get(4)?;
+    let updated_at_raw: i64 = row.get(6)?;
+    let outcome = match outcome_raw {
+        0 => BucketDeleteAttemptOutcomeKind::Retryable,
+        1 => BucketDeleteAttemptOutcomeKind::NotEmpty,
+        2 => BucketDeleteAttemptOutcomeKind::StaleGeneration,
+        3 => BucketDeleteAttemptOutcomeKind::MarkDeleting,
+        _ => {
+            return Err(rusqlite::Error::FromSqlConversionFailure(
+                4,
+                rusqlite::types::Type::Integer,
+                Box::from(format!(
+                    "invalid bucket delete attempt outcome: {outcome_raw}"
+                )),
+            ));
+        }
+    };
+    Ok(BucketDeleteAttemptOutcomeRecord {
+        bucket: BucketName::new(bucket_raw).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                0,
+                rusqlite::types::Type::Text,
+                Box::from(error),
+            )
+        })?,
+        drain_id: row.get(1)?,
+        cluster_epoch: u64::try_from(cluster_epoch_raw)
+            .ok()
+            .and_then(ClusterEpoch::new)
+            .ok_or_else(|| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    2,
+                    rusqlite::types::Type::Integer,
+                    Box::from(format!("invalid cluster_epoch: {cluster_epoch_raw}")),
+                )
+            })?,
+        bucket_execution_generation: u64::try_from(bucket_execution_generation_raw).map_err(
+            |_| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    3,
+                    rusqlite::types::Type::Integer,
+                    Box::from(format!(
+                        "invalid bucket_execution_generation: {bucket_execution_generation_raw}"
+                    )),
+                )
+            },
+        )?,
+        outcome,
+        detail: row.get(5)?,
+        updated_at: u64::try_from(updated_at_raw).map_err(|_| {
+            rusqlite::Error::FromSqlConversionFailure(
+                6,
+                rusqlite::types::Type::Integer,
+                Box::from(format!("invalid updated_at: {updated_at_raw}")),
+            )
+        })?,
+    })
+}
+
 fn object_payload_reclaim_claim_from_row(
     row: &rusqlite::Row<'_>,
 ) -> Result<ObjectPayloadReclaimClaimRecord, rusqlite::Error> {
@@ -5963,6 +6028,79 @@ impl PgMetadataStore for PgStore {
                 let _ = self.conn.execute_batch("ROLLBACK");
                 Err(error)
             }
+        }
+    }
+
+    fn record_bucket_delete_attempt_outcome(
+        &self,
+        record: &BucketDeleteAttemptOutcomeRecord,
+    ) -> Result<(), MetadataError> {
+        if record.detail.len() > BUCKET_DELETE_ATTEMPT_OUTCOME_DETAIL_MAX_LEN {
+            return Err(MetadataError::Db {
+                context: "record bucket delete attempt outcome detail length",
+                source: rusqlite::Error::ToSqlConversionFailure(Box::from(
+                    "bucket delete attempt outcome detail exceeds maximum length",
+                )),
+            });
+        }
+        let generation = i64::try_from(record.bucket_execution_generation).map_err(|source| {
+            MetadataError::Db {
+                context: "record bucket delete attempt outcome generation",
+                source: rusqlite::Error::ToSqlConversionFailure(Box::new(source)),
+            }
+        })?;
+        let updated_at = i64::try_from(record.updated_at).map_err(|source| MetadataError::Db {
+            context: "record bucket delete attempt outcome updated_at",
+            source: rusqlite::Error::ToSqlConversionFailure(Box::new(source)),
+        })?;
+        self.conn
+            .execute(
+                "INSERT INTO bucket_delete_attempt_outcomes \
+                 (bucket_name, drain_id, cluster_epoch, bucket_execution_generation, \
+                  outcome, detail, updated_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
+                 ON CONFLICT(bucket_name) DO UPDATE SET \
+                   drain_id = excluded.drain_id, \
+                   cluster_epoch = excluded.cluster_epoch, \
+                   bucket_execution_generation = excluded.bucket_execution_generation, \
+                   outcome = excluded.outcome, \
+                   detail = excluded.detail, \
+                   updated_at = excluded.updated_at",
+                params![
+                    record.bucket.as_str(),
+                    &record.drain_id,
+                    record.cluster_epoch.get(),
+                    generation,
+                    record.outcome as u8,
+                    &record.detail,
+                    updated_at,
+                ],
+            )
+            .map(|_| ())
+            .map_err(|source| MetadataError::Db {
+                context: "record bucket delete attempt outcome",
+                source,
+            })
+    }
+
+    fn bucket_delete_attempt_outcome(
+        &self,
+        name: &BucketName,
+    ) -> Result<Option<BucketDeleteAttemptOutcomeRecord>, MetadataError> {
+        match self.conn.query_row(
+            "SELECT bucket_name, drain_id, cluster_epoch, bucket_execution_generation, \
+                    outcome, detail, updated_at \
+             FROM bucket_delete_attempt_outcomes \
+             WHERE bucket_name = ?1",
+            params![name.as_str()],
+            bucket_delete_attempt_outcome_from_row,
+        ) {
+            Ok(record) => Ok(Some(record)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(source) => Err(MetadataError::Db {
+                context: "load bucket delete attempt outcome",
+                source,
+            }),
         }
     }
 

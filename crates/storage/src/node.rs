@@ -1609,6 +1609,12 @@ impl SharedStorageNode {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         state.queued_bucket_deletes.remove(bucket);
+        state.work_queue.retain(|work| {
+            !matches!(
+                work,
+                ReclaimWorkItem::BucketDelete(queued_bucket) if queued_bucket == bucket
+            )
+        });
         if state.outstanding_bucket_deletes.remove(bucket) {
             Self::emit_reclaim_queue_action(&state, "bucket_delete", "finish");
         }
@@ -2416,6 +2422,30 @@ mod tests {
         let state = node.reclaim_queue.0.lock().unwrap();
         assert!(state.queued_bucket_deletes.is_empty());
         assert!(state.outstanding_bucket_deletes.is_empty());
+    }
+
+    #[test]
+    fn finish_bucket_delete_finalize_work_purges_stale_queued_items() {
+        let tmp = test_util::tempdir();
+        let node = SharedStorageNode::open(tmp.path(), &[0, 1]).unwrap();
+        let bucket = bucket_name("bucket");
+        let other_bucket = bucket_name("other");
+
+        assert!(node.enqueue_bucket_delete_finalize(&bucket));
+        assert_eq!(
+            node.try_take_reclaim_work(),
+            Some(ReclaimWorkItem::BucketDelete(bucket.clone()))
+        );
+        assert!(node.enqueue_bucket_delete_finalize(&bucket));
+        assert!(node.enqueue_bucket_delete_finalize(&other_bucket));
+
+        node.finish_bucket_delete_finalize_work(&bucket);
+
+        assert_eq!(
+            node.try_take_reclaim_work(),
+            Some(ReclaimWorkItem::BucketDelete(other_bucket))
+        );
+        assert_eq!(node.try_take_reclaim_work(), None);
     }
 
     #[test]

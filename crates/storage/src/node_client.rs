@@ -30,6 +30,7 @@ use crate::pg_store::{MetadataCommandCheckpoint, ScavengerShardFileScan, Scaveng
 use crate::pg_topology::PgTopology;
 use crate::storage_rpc::{
     decode_abort_multipart_cleanup_response,
+    decode_bucket_delete_attempt_outcome_optional_record_response,
     decode_bucket_delete_finalize_claim_optional_record_response,
     decode_bucket_delete_finalize_roots_response, decode_bucket_delete_finalized_response,
     decode_bucket_execution_generations_response, decode_bucket_fast_path_identities_response,
@@ -83,6 +84,7 @@ use crate::storage_rpc::{
     decode_stream_uploads_list_response, encode_abort_multipart_cleanup_request,
     encode_abort_multipart_command_build_request,
     encode_authorized_abort_multipart_command_build_request, encode_bucket_batch_request,
+    encode_bucket_delete_attempt_outcome_record_request,
     encode_bucket_delete_finalize_claim_acquire_request,
     encode_bucket_delete_finalize_claim_record_request,
     encode_bucket_delete_finalize_roots_request, encode_bucket_list_request,
@@ -149,6 +151,7 @@ use crate::storage_rpc::{
     encode_stream_uploads_pg_list_request, read_storage_rpc_frame_from, write_storage_rpc_frame_to,
     StorageRpcAbortMultipartCleanupRequest, StorageRpcAbortMultipartCommandBuildRequest,
     StorageRpcAuthorizedAbortMultipartCommandBuildRequest, StorageRpcBucketBatchRequest,
+    StorageRpcBucketDeleteAttemptOutcomeRecordRequest,
     StorageRpcBucketDeleteFinalizeClaimAcquireRequest,
     StorageRpcBucketDeleteFinalizeClaimRecordRequest, StorageRpcBucketDeleteFinalizeRootsRequest,
     StorageRpcBucketDeleteFinalizedOutcome, StorageRpcBucketDeleteFinalizedResponse,
@@ -233,11 +236,11 @@ use crate::traits::{DurableBucketWriteReservationHeartbeat, PgMetadataStore, Sha
 #[cfg(test)]
 use crate::types::BucketSnapshotTagsRequest;
 use crate::types::{
-    AbortMultipartUploadCleanup, AuthorizedMultipartUploadRecord, BucketDeleteFinalizeClaimRecord,
-    BucketDeleteFinalizeRoot, BucketFastPathIdentity, BucketInfo, BucketName, BucketSnapshot,
-    BucketSnapshotPair, BucketSnapshotRequest, BucketState, BucketSubresourceKind,
-    BucketWriteDrainRecord, BucketWriteReservationRecord, ClusterEpoch, CommitDirectPutObjectReq,
-    CompleteMultipartCommitCleanup, CompleteMultipartCommitRequest,
+    AbortMultipartUploadCleanup, AuthorizedMultipartUploadRecord, BucketDeleteAttemptOutcomeRecord,
+    BucketDeleteFinalizeClaimRecord, BucketDeleteFinalizeRoot, BucketFastPathIdentity, BucketInfo,
+    BucketName, BucketSnapshot, BucketSnapshotPair, BucketSnapshotRequest, BucketState,
+    BucketSubresourceKind, BucketWriteDrainRecord, BucketWriteReservationRecord, ClusterEpoch,
+    CommitDirectPutObjectReq, CompleteMultipartCommitCleanup, CompleteMultipartCommitRequest,
     CompletedMultipartUploadRecordPage, CreateBucketConfig, CreateMultipartUploadReq,
     CreateStreamUploadReq, DataPgId, DirectPutCommitSnapshot, DirectPutCommitStorageSnapshot,
     EcShape, GenerationId, LifecycleSweepBuckets, LifecycleSweepClaimRecord, LifecycleSweepRoot,

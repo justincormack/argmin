@@ -379,6 +379,51 @@ fn lifecycle_sweep_claim_rejects_deleting_or_drained_bucket() {
 }
 
 #[test]
+fn bucket_delete_attempt_outcome_records_last_state() {
+    let tmp = test_util::tempdir();
+    let store = PgStore::open(tmp.path(), 12).unwrap();
+    let bucket = trusted_bucket_name("delete-attempt-outcome-bucket");
+    create_probe_bucket_direct(&store, &bucket);
+
+    let drain = store
+        .begin_durable_bucket_write_drain(
+            &bucket,
+            "delete-drain",
+            "delete-owner",
+            ClusterEpoch::INITIAL,
+            10,
+            Some(100),
+        )
+        .unwrap();
+    let first = BucketDeleteAttemptOutcomeRecord {
+        bucket: bucket.clone(),
+        drain_id: drain.drain_id.clone(),
+        cluster_epoch: drain.cluster_epoch,
+        bucket_execution_generation: drain.bucket_execution_generation,
+        outcome: BucketDeleteAttemptOutcomeKind::Retryable,
+        detail: "route expired".to_string(),
+        updated_at: 11,
+    };
+    store.record_bucket_delete_attempt_outcome(&first).unwrap();
+    assert_eq!(
+        store.bucket_delete_attempt_outcome(&bucket).unwrap(),
+        Some(first.clone())
+    );
+
+    let second = BucketDeleteAttemptOutcomeRecord {
+        outcome: BucketDeleteAttemptOutcomeKind::MarkDeleting,
+        detail: "mark bucket deleting applied".to_string(),
+        updated_at: 12,
+        ..first
+    };
+    store.record_bucket_delete_attempt_outcome(&second).unwrap();
+    assert_eq!(
+        store.bucket_delete_attempt_outcome(&bucket).unwrap(),
+        Some(second)
+    );
+}
+
+#[test]
 fn bucket_write_drain_heartbeat_fences_stale_delete_owner() {
     let tmp = test_util::tempdir();
     let store = PgStore::open(tmp.path(), 12).unwrap();

@@ -708,6 +708,22 @@ impl BucketWriteReservationNodeClient for LocalStorageNodeClient {
         <Self as StorageNodeClient>::durable_bucket_write_drain(self, pg_id, bucket)
     }
 
+    fn record_bucket_delete_attempt_outcome(
+        &self,
+        pg_id: PgId,
+        record: &BucketDeleteAttemptOutcomeRecord,
+    ) -> Result<(), BucketSnapshotLoadError> {
+        <Self as StorageNodeClient>::record_bucket_delete_attempt_outcome(self, pg_id, record)
+    }
+
+    fn bucket_delete_attempt_outcome(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+    ) -> Result<Option<BucketDeleteAttemptOutcomeRecord>, BucketSnapshotLoadError> {
+        <Self as StorageNodeClient>::bucket_delete_attempt_outcome(self, pg_id, bucket)
+    }
+
     fn acquire_durable_bucket_write_reservation(
         &self,
         pg_id: PgId,
@@ -1667,6 +1683,28 @@ impl StorageNodeClient for LocalStorageNodeClient {
     ) -> Result<Option<BucketWriteDrainRecord>, BucketSnapshotLoadError> {
         let pg = self.storage_node.get_pg(pg_id.get())?;
         Ok(PgMetadataStore::durable_bucket_write_drain(&*pg, bucket)?)
+    }
+
+    fn record_bucket_delete_attempt_outcome(
+        &self,
+        pg_id: PgId,
+        record: &BucketDeleteAttemptOutcomeRecord,
+    ) -> Result<(), BucketSnapshotLoadError> {
+        let pg = self.storage_node.get_pg(pg_id.get())?;
+        Ok(PgMetadataStore::record_bucket_delete_attempt_outcome(
+            &*pg, record,
+        )?)
+    }
+
+    fn bucket_delete_attempt_outcome(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+    ) -> Result<Option<BucketDeleteAttemptOutcomeRecord>, BucketSnapshotLoadError> {
+        let pg = self.storage_node.get_pg(pg_id.get())?;
+        Ok(PgMetadataStore::bucket_delete_attempt_outcome(
+            &*pg, bucket,
+        )?)
     }
 
     fn acquire_durable_bucket_write_reservation(

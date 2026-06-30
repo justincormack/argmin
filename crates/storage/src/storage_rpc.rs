@@ -15,13 +15,14 @@ use crate::{
         ScavengerShardRow,
     },
     types::{
-        AbortMultipartUploadCleanup, BucketDeleteFinalizeClaimRecord, BucketDeleteFinalizeRoot,
-        BucketEncryptionConfig, BucketFastPathIdentity, BucketInfo, BucketObjectOwnership,
-        BucketOwnershipControls, BucketSnapshot, BucketSnapshotPair, BucketSnapshotRequest,
-        BucketSnapshotTagsRequest, BucketState, BucketSubresourceAux, BucketSubresourceKind,
-        BucketWriteDrainRecord, BucketWriteDrainState, BucketWriteReservationRecord,
-        ChecksumAlgorithm, ChecksumBytes, ChecksumType, ClusterEpoch, CommitDirectPutObjectReq,
-        CompleteMultipartCommitCleanup, CompleteMultipartCommitRequest,
+        AbortMultipartUploadCleanup, BucketDeleteAttemptOutcomeKind,
+        BucketDeleteAttemptOutcomeRecord, BucketDeleteFinalizeClaimRecord,
+        BucketDeleteFinalizeRoot, BucketEncryptionConfig, BucketFastPathIdentity, BucketInfo,
+        BucketObjectOwnership, BucketOwnershipControls, BucketSnapshot, BucketSnapshotPair,
+        BucketSnapshotRequest, BucketSnapshotTagsRequest, BucketState, BucketSubresourceAux,
+        BucketSubresourceKind, BucketWriteDrainRecord, BucketWriteDrainState,
+        BucketWriteReservationRecord, ChecksumAlgorithm, ChecksumBytes, ChecksumType, ClusterEpoch,
+        CommitDirectPutObjectReq, CompleteMultipartCommitCleanup, CompleteMultipartCommitRequest,
         CompletedMultipartUploadRecord, CreateBucketConfig, CreateMultipartUploadReq,
         CreateStreamUploadReq, DataPgId, DeleteMarkerRecord, DirectPutCommitStorageSnapshot,
         EcShape, EffectiveBucketEncryptionConfig, EtagKind, GenerationId, LifecycleSweepBuckets,
@@ -51,7 +52,8 @@ use crate::{
         StreamPutFinalizeStorageSnapshot, StreamUploadPartSnapshot,
         StreamUploadPartStorageSnapshot, StreamUploadRecord, StreamUploadSegmentRecord,
         StreamUploadState, StreamUploadTarget, TerminalStreamCleanupRecord, UploadId, UploadState,
-        VersionId, WriteAck, PLACED_SEGMENT_SHARD_BACKFILL_CLAIM_ID_MAX_LEN,
+        VersionId, WriteAck, BUCKET_DELETE_ATTEMPT_OUTCOME_DETAIL_MAX_LEN,
+        PLACED_SEGMENT_SHARD_BACKFILL_CLAIM_ID_MAX_LEN,
         PLACED_SEGMENT_SHARD_BACKFILL_LAST_ERROR_MAX_LEN, PLACED_SEGMENT_SHARD_BACKFILL_LIST_LIMIT,
         PLACED_SEGMENT_SHARD_BACKFILL_OWNER_TOKEN_MAX_LEN,
         PLACED_SEGMENT_SHARD_REPAIR_CLAIM_ID_MAX_LEN,
@@ -266,6 +268,16 @@ const STORAGE_RPC_BUCKET_WRITE_RECORD_MAX_LEN: usize = STORAGE_RPC_MAX_BUCKET_NA
     + 1
     + 4
     + STORAGE_RPC_MAX_BUCKET_WRITE_TARGET_CONTEXT_LEN;
+const STORAGE_RPC_BUCKET_DELETE_ATTEMPT_OUTCOME_RECORD_MAX_LEN: usize =
+    STORAGE_RPC_MAX_BUCKET_NAME_FIELD_LEN
+        + 4
+        + STORAGE_RPC_MAX_BUCKET_WRITE_RESERVATION_ID_LEN
+        + 8
+        + 8
+        + 1
+        + 4
+        + BUCKET_DELETE_ATTEMPT_OUTCOME_DETAIL_MAX_LEN
+        + 8;
 const STORAGE_RPC_MAX_BUCKET_OWNER_PRINCIPAL_LEN: usize = 1024;
 const STORAGE_RPC_MAX_BUCKET_OWNER_CANONICAL_ID_LEN: usize = 1024;
 const STORAGE_RPC_MAX_BUCKET_ACL_GRANTS_LEN: usize = 64 * 1024;
@@ -440,6 +452,9 @@ const STORAGE_RPC_MAX_BUCKET_WRITE_DRAIN_HEARTBEAT_PAYLOAD_LEN: usize =
     STORAGE_RPC_MAX_BUCKET_WRITE_DRAIN_RECORD_PAYLOAD_LEN + 8;
 const STORAGE_RPC_MAX_BUCKET_WRITE_DRAIN_EXPIRED_PAYLOAD_LEN: usize =
     STORAGE_RPC_MAX_BUCKET_REQUEST_PAYLOAD_LEN + 8;
+const STORAGE_RPC_MAX_BUCKET_DELETE_ATTEMPT_OUTCOME_RECORD_PAYLOAD_LEN: usize =
+    STORAGE_RPC_MAX_METADATA_COMMAND_STATE_PAYLOAD_LEN
+        + STORAGE_RPC_BUCKET_DELETE_ATTEMPT_OUTCOME_RECORD_MAX_LEN;
 const STORAGE_RPC_MAX_BUCKET_WRITE_RESERVATIONS_LIST_PAYLOAD_LEN: usize =
     STORAGE_RPC_MAX_BUCKET_REQUEST_PAYLOAD_LEN;
 const STORAGE_RPC_MAX_BUCKET_DELETE_FINALIZE_ROOTS_REQUEST_PAYLOAD_LEN: usize =
@@ -671,6 +686,8 @@ pub(crate) enum StorageRpcMessageKind {
     MetadataCommandPgLockAcquire = 121,
     MetadataCommandPgLockRelease = 122,
     BucketWriteDrainGet = 155,
+    BucketDeleteAttemptOutcomeRecord = 156,
+    BucketDeleteAttemptOutcomeGet = 157,
     BucketWriteDrainHeartbeat = 124,
     MetadataCommandRetainedLogHashes = 125,
     MetadataCommandRetainedLogEntries = 126,
@@ -893,6 +910,8 @@ impl StorageRpcMessageKind {
             Self::BucketWriteDrainClear => "bucket write drain clear",
             Self::BucketWriteDrainClearExpired => "bucket write drain clear expired",
             Self::BucketWriteDrainGet => "bucket write drain get",
+            Self::BucketDeleteAttemptOutcomeRecord => "bucket delete attempt outcome record",
+            Self::BucketDeleteAttemptOutcomeGet => "bucket delete attempt outcome get",
             Self::BucketWriteDrainHeartbeat => "bucket write drain heartbeat",
             Self::BucketWriteDrainExists => "bucket write drain exists",
             Self::BucketWriteReservationsList => "bucket write reservations list",
@@ -1088,6 +1107,8 @@ impl StorageRpcMessageKind {
             121 => Ok(Self::MetadataCommandPgLockAcquire),
             122 => Ok(Self::MetadataCommandPgLockRelease),
             155 => Ok(Self::BucketWriteDrainGet),
+            156 => Ok(Self::BucketDeleteAttemptOutcomeRecord),
+            157 => Ok(Self::BucketDeleteAttemptOutcomeGet),
             124 => Ok(Self::BucketWriteDrainHeartbeat),
             125 => Ok(Self::MetadataCommandRetainedLogHashes),
             126 => Ok(Self::MetadataCommandRetainedLogEntries),
@@ -1318,6 +1339,19 @@ pub(crate) struct StorageRpcBucketWriteDrainClearExpiredRequest {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StorageRpcBucketWriteDrainOptionalRecordResponse {
     pub(crate) record: Option<BucketWriteDrainRecord>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StorageRpcBucketDeleteAttemptOutcomeRecordRequest {
+    pub(crate) node_id: NodeId,
+    pub(crate) cluster_epoch: ClusterEpoch,
+    pub(crate) pg_id: PgId,
+    pub(crate) record: BucketDeleteAttemptOutcomeRecord,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StorageRpcBucketDeleteAttemptOutcomeOptionalRecordResponse {
+    pub(crate) record: Option<BucketDeleteAttemptOutcomeRecord>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3638,8 +3672,12 @@ fn message_kind_request_max_payload_len(
         StorageRpcMessageKind::BucketWriteDrainClearExpired => {
             STORAGE_RPC_MAX_BUCKET_WRITE_DRAIN_EXPIRED_PAYLOAD_LEN
         }
+        StorageRpcMessageKind::BucketDeleteAttemptOutcomeRecord => {
+            STORAGE_RPC_MAX_BUCKET_DELETE_ATTEMPT_OUTCOME_RECORD_PAYLOAD_LEN
+        }
         StorageRpcMessageKind::BucketWriteDrainExists
         | StorageRpcMessageKind::BucketWriteDrainGet
+        | StorageRpcMessageKind::BucketDeleteAttemptOutcomeGet
         | StorageRpcMessageKind::BucketWriteReservationsList
         | StorageRpcMessageKind::BucketDeleteFinalized => {
             STORAGE_RPC_MAX_BUCKET_REQUEST_PAYLOAD_LEN
@@ -11192,6 +11230,72 @@ pub(crate) fn decode_bucket_write_drain_optional_record_response(
     Ok(StorageRpcBucketWriteDrainOptionalRecordResponse { record })
 }
 
+pub(crate) fn encode_bucket_delete_attempt_outcome_record_request(
+    request: &StorageRpcBucketDeleteAttemptOutcomeRecordRequest,
+) -> Result<Vec<u8>, StorageRpcPayloadError> {
+    validate_bucket_delete_attempt_outcome_record(&request.record)?;
+    let mut out = Vec::new();
+    put_u32(&mut out, request.node_id.as_u32());
+    put_u64(&mut out, request.cluster_epoch.get());
+    put_u32(&mut out, request.pg_id.get());
+    put_bucket_delete_attempt_outcome_record(&mut out, &request.record);
+    Ok(out)
+}
+
+pub(crate) fn decode_bucket_delete_attempt_outcome_record_request(
+    bytes: &[u8],
+) -> Result<StorageRpcBucketDeleteAttemptOutcomeRecordRequest, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let node_id = NodeId::new(decoder.read_u32()?);
+    let cluster_epoch = decoder.read_cluster_epoch()?;
+    let pg_id = PgId::new(decoder.read_u32()?);
+    let record = decoder.read_bucket_delete_attempt_outcome_record()?;
+    decoder.finish()?;
+    validate_bucket_delete_attempt_outcome_record(&record)?;
+    Ok(StorageRpcBucketDeleteAttemptOutcomeRecordRequest {
+        node_id,
+        cluster_epoch,
+        pg_id,
+        record,
+    })
+}
+
+pub(crate) fn encode_bucket_delete_attempt_outcome_optional_record_response(
+    response: &StorageRpcBucketDeleteAttemptOutcomeOptionalRecordResponse,
+) -> Result<Vec<u8>, StorageRpcPayloadError> {
+    let mut out = Vec::new();
+    match &response.record {
+        Some(record) => {
+            validate_bucket_delete_attempt_outcome_record(record)?;
+            put_u8(&mut out, 1);
+            put_bucket_delete_attempt_outcome_record(&mut out, record);
+        }
+        None => put_u8(&mut out, 0),
+    }
+    Ok(out)
+}
+
+pub(crate) fn decode_bucket_delete_attempt_outcome_optional_record_response(
+    bytes: &[u8],
+) -> Result<StorageRpcBucketDeleteAttemptOutcomeOptionalRecordResponse, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let record = match decoder.read_u8()? {
+        0 => None,
+        1 => {
+            let record = decoder.read_bucket_delete_attempt_outcome_record()?;
+            validate_bucket_delete_attempt_outcome_record(&record)?;
+            Some(record)
+        }
+        _ => {
+            return Err(StorageRpcPayloadError::InvalidResponseEnvelope(
+                "unknown optional bucket delete attempt outcome record tag",
+            ));
+        }
+    };
+    decoder.finish()?;
+    Ok(StorageRpcBucketDeleteAttemptOutcomeOptionalRecordResponse { record })
+}
+
 pub(crate) fn encode_bucket_write_reservations_list_response(
     response: &StorageRpcBucketWriteReservationsListResponse,
 ) -> Result<Vec<u8>, StorageRpcPayloadError> {
@@ -11904,6 +12008,29 @@ fn validate_bucket_write_drain_record(
     validate_bucket_write_drain_identity(&record.drain_id, &record.owner_token)
 }
 
+fn validate_bucket_delete_attempt_outcome_record(
+    record: &BucketDeleteAttemptOutcomeRecord,
+) -> Result<(), StorageRpcPayloadError> {
+    if record.drain_id.is_empty()
+        || record.drain_id.len() > STORAGE_RPC_MAX_BUCKET_WRITE_RESERVATION_ID_LEN
+    {
+        return Err(StorageRpcPayloadError::InvalidBucketWriteReservationProof(
+            "drain id exceeds maximum length",
+        ));
+    }
+    if record.detail.len() > BUCKET_DELETE_ATTEMPT_OUTCOME_DETAIL_MAX_LEN {
+        return Err(StorageRpcPayloadError::InvalidBucketWriteReservationProof(
+            "bucket delete attempt outcome detail exceeds maximum length",
+        ));
+    }
+    if record.cluster_epoch.get() == 0 {
+        return Err(StorageRpcPayloadError::InvalidBucketWriteReservationProof(
+            "outcome epoch must not be zero",
+        ));
+    }
+    Ok(())
+}
+
 fn validate_bucket_delete_finalize_claim_record(
     record: &BucketDeleteFinalizeClaimRecord,
 ) -> Result<(), StorageRpcPayloadError> {
@@ -12429,6 +12556,49 @@ impl<'a> StorageRpcDecoder<'a> {
             state,
             created_at,
             lease_deadline,
+        })
+    }
+
+    fn read_bucket_delete_attempt_outcome_record(
+        &mut self,
+    ) -> Result<BucketDeleteAttemptOutcomeRecord, StorageRpcPayloadError> {
+        let bucket = self.read_bucket_name().map_err(|_| {
+            StorageRpcPayloadError::InvalidBucketWriteReservationProof("invalid bucket name")
+        })?;
+        let drain_id = self.read_string_with_limit(
+            STORAGE_RPC_MAX_BUCKET_WRITE_RESERVATION_ID_LEN,
+            StorageRpcPayloadError::InvalidBucketWriteReservationProof(
+                "drain id exceeds maximum length",
+            ),
+        )?;
+        let cluster_epoch = self.read_cluster_epoch()?;
+        let bucket_execution_generation = self.read_u64()?;
+        let outcome = match self.read_u8()? {
+            0 => BucketDeleteAttemptOutcomeKind::Retryable,
+            1 => BucketDeleteAttemptOutcomeKind::NotEmpty,
+            2 => BucketDeleteAttemptOutcomeKind::StaleGeneration,
+            3 => BucketDeleteAttemptOutcomeKind::MarkDeleting,
+            _ => {
+                return Err(StorageRpcPayloadError::InvalidBucketWriteReservationProof(
+                    "invalid bucket delete attempt outcome",
+                ));
+            }
+        };
+        let detail = self.read_string_with_limit(
+            BUCKET_DELETE_ATTEMPT_OUTCOME_DETAIL_MAX_LEN,
+            StorageRpcPayloadError::InvalidBucketWriteReservationProof(
+                "bucket delete attempt outcome detail exceeds maximum length",
+            ),
+        )?;
+        let updated_at = self.read_u64()?;
+        Ok(BucketDeleteAttemptOutcomeRecord {
+            bucket,
+            drain_id,
+            cluster_epoch,
+            bucket_execution_generation,
+            outcome,
+            detail,
+            updated_at,
         })
     }
 
@@ -14859,6 +15029,19 @@ fn put_bucket_write_drain_record(out: &mut Vec<u8>, record: &BucketWriteDrainRec
     put_optional_u64(out, record.lease_deadline);
 }
 
+fn put_bucket_delete_attempt_outcome_record(
+    out: &mut Vec<u8>,
+    record: &BucketDeleteAttemptOutcomeRecord,
+) {
+    put_string(out, record.bucket.as_str());
+    put_string(out, &record.drain_id);
+    put_u64(out, record.cluster_epoch.get());
+    put_u64(out, record.bucket_execution_generation);
+    put_u8(out, record.outcome as u8);
+    put_string(out, &record.detail);
+    put_u64(out, record.updated_at);
+}
+
 fn put_bucket_delete_finalize_root(out: &mut Vec<u8>, root: &BucketDeleteFinalizeRoot) {
     put_string(out, root.bucket.as_str());
     put_u64(out, root.bucket_incarnation_generation);
@@ -16376,9 +16559,10 @@ mod tests {
             MetadataCommandLogIndex, MetadataCommandPayload,
         },
         types::{
-            AclGrants, BucketDeleteFinalizeClaimRecord, BucketObjectLockConfig,
-            BucketVersioningState, BucketWriteDrainRecord, BucketWriteDrainState, CanonicalUserId,
-            ClusterEpoch, CreateBucketConfig, GenerationId, ObjectKey, PgId, SessionId,
+            AclGrants, BucketDeleteAttemptOutcomeKind, BucketDeleteAttemptOutcomeRecord,
+            BucketDeleteFinalizeClaimRecord, BucketObjectLockConfig, BucketVersioningState,
+            BucketWriteDrainRecord, BucketWriteDrainState, CanonicalUserId, ClusterEpoch,
+            CreateBucketConfig, GenerationId, ObjectKey, PgId, SessionId,
         },
     };
 
@@ -18681,6 +18865,16 @@ mod tests {
                 STORAGE_RPC_MAX_BUCKET_REQUEST_PAYLOAD_LEN,
             ),
             (
+                StorageRpcMessageKind::BucketDeleteAttemptOutcomeRecord,
+                STORAGE_RPC_MAX_BUCKET_DELETE_ATTEMPT_OUTCOME_RECORD_PAYLOAD_LEN + 1,
+                STORAGE_RPC_MAX_BUCKET_DELETE_ATTEMPT_OUTCOME_RECORD_PAYLOAD_LEN,
+            ),
+            (
+                StorageRpcMessageKind::BucketDeleteAttemptOutcomeGet,
+                STORAGE_RPC_MAX_BUCKET_REQUEST_PAYLOAD_LEN + 1,
+                STORAGE_RPC_MAX_BUCKET_REQUEST_PAYLOAD_LEN,
+            ),
+            (
                 StorageRpcMessageKind::BucketMetadataControlPendingMatch,
                 STORAGE_RPC_MAX_BUCKET_METADATA_CONTROL_REQUEST_PAYLOAD_LEN + 1,
                 STORAGE_RPC_MAX_BUCKET_METADATA_CONTROL_REQUEST_PAYLOAD_LEN,
@@ -18834,6 +19028,57 @@ mod tests {
                 StorageRpcFrameError::PayloadTooLarge { len, limit }
             )) if len == STORAGE_RPC_MAX_BUCKET_WRITE_DRAIN_RECORD_PAYLOAD_LEN + 1
                 && limit == STORAGE_RPC_MAX_BUCKET_WRITE_DRAIN_RECORD_PAYLOAD_LEN
+        ));
+
+        let outcome_route_epoch = ClusterEpoch::new(2).unwrap();
+        let outcome_payload = encode_bucket_delete_attempt_outcome_record_request(
+            &StorageRpcBucketDeleteAttemptOutcomeRecordRequest {
+                node_id,
+                cluster_epoch: outcome_route_epoch,
+                pg_id,
+                record: BucketDeleteAttemptOutcomeRecord {
+                    bucket: bucket.clone(),
+                    drain_id: drain_id.clone(),
+                    cluster_epoch,
+                    bucket_execution_generation: 3,
+                    outcome: BucketDeleteAttemptOutcomeKind::Retryable,
+                    detail: "e".repeat(BUCKET_DELETE_ATTEMPT_OUTCOME_DETAIL_MAX_LEN),
+                    updated_at: 6,
+                },
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            outcome_payload.len(),
+            STORAGE_RPC_MAX_BUCKET_DELETE_ATTEMPT_OUTCOME_RECORD_PAYLOAD_LEN
+        );
+        let outcome_frame = encode_storage_rpc_frame(
+            13,
+            StorageRpcMessageKind::BucketDeleteAttemptOutcomeRecord,
+            &outcome_payload,
+        )
+        .unwrap();
+        let decoded = read_storage_rpc_request_frame_from(&mut Cursor::new(outcome_frame)).unwrap();
+        assert_eq!(decoded.payload, outcome_payload);
+        let decoded_request =
+            decode_bucket_delete_attempt_outcome_record_request(&outcome_payload).unwrap();
+        assert_eq!(decoded_request.cluster_epoch, outcome_route_epoch);
+        assert_eq!(decoded_request.record.cluster_epoch, cluster_epoch);
+
+        let mut oversized_outcome_payload = outcome_payload.clone();
+        oversized_outcome_payload.push(0);
+        let oversized_outcome_frame = encode_storage_rpc_frame(
+            14,
+            StorageRpcMessageKind::BucketDeleteAttemptOutcomeRecord,
+            &oversized_outcome_payload,
+        )
+        .unwrap();
+        assert!(matches!(
+            read_storage_rpc_request_frame_from(&mut Cursor::new(oversized_outcome_frame)),
+            Err(StorageRpcStreamError::Frame(
+                StorageRpcFrameError::PayloadTooLarge { len, limit }
+            )) if len == STORAGE_RPC_MAX_BUCKET_DELETE_ATTEMPT_OUTCOME_RECORD_PAYLOAD_LEN + 1
+                && limit == STORAGE_RPC_MAX_BUCKET_DELETE_ATTEMPT_OUTCOME_RECORD_PAYLOAD_LEN
         ));
 
         let claim_payload = encode_bucket_delete_finalize_claim_record_request(

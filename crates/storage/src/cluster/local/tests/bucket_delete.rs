@@ -813,7 +813,37 @@ fn begin_bucket_delete_retries_when_pending_slot_wins_before_command_id() {
             ),
             "bucket delete owner should return retryable contention after a winning pending slot advances the bucket generation, got {err:?}"
         );
+    {
+        let pg = map
+            .node(NodeId::new(1))
+            .unwrap()
+            .storage_node()
+            .get_pg(pg_id.get())
+            .unwrap();
+        let outcome = crate::PgMetadataStore::bucket_delete_attempt_outcome(&*pg, &bucket)
+            .unwrap()
+            .expect("retryable DeleteBucket begin should record an attempt outcome");
+        assert_eq!(
+            outcome.outcome,
+            crate::BucketDeleteAttemptOutcomeKind::Retryable
+        );
+    }
     cluster.begin_bucket_delete(&bucket).unwrap();
+    {
+        let pg = map
+            .node(NodeId::new(1))
+            .unwrap()
+            .storage_node()
+            .get_pg(pg_id.get())
+            .unwrap();
+        let outcome = crate::PgMetadataStore::bucket_delete_attempt_outcome(&*pg, &bucket)
+            .unwrap()
+            .expect("successful DeleteBucket begin should record an attempt outcome");
+        assert_eq!(
+            outcome.outcome,
+            crate::BucketDeleteAttemptOutcomeKind::MarkDeleting
+        );
+    }
 
     assert!(
         hook_ran.load(Ordering::SeqCst),

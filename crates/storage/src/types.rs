@@ -2446,6 +2446,31 @@ pub struct BucketWriteDrainRecord {
     pub lease_deadline: Option<u64>,
 }
 
+/// Maximum stored diagnostic detail for a durable DeleteBucket attempt outcome.
+pub const BUCKET_DELETE_ATTEMPT_OUTCOME_DETAIL_MAX_LEN: usize = 1024;
+
+/// Durable DeleteBucket attempt outcome kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum BucketDeleteAttemptOutcomeKind {
+    Retryable = 0,
+    NotEmpty = 1,
+    StaleGeneration = 2,
+    MarkDeleting = 3,
+}
+
+/// Last durable DeleteBucket attempt outcome for a bucket.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BucketDeleteAttemptOutcomeRecord {
+    pub bucket: BucketName,
+    pub drain_id: String,
+    pub cluster_epoch: ClusterEpoch,
+    pub bucket_execution_generation: u64,
+    pub outcome: BucketDeleteAttemptOutcomeKind,
+    pub detail: String,
+    pub updated_at: u64,
+}
+
 /// Bucket metadata.
 #[derive(Clone)]
 pub struct BucketInfo {

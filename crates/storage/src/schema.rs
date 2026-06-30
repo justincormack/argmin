@@ -625,6 +625,19 @@ CREATE TABLE IF NOT EXISTS bucket_write_drains (
     FOREIGN KEY (bucket_name) REFERENCES buckets(name) ON DELETE CASCADE
 )";
 
+/// Last durable DeleteBucket attempt outcome per bucket.
+const CREATE_BUCKET_DELETE_ATTEMPT_OUTCOMES_TABLE: &str = "\
+CREATE TABLE IF NOT EXISTS bucket_delete_attempt_outcomes (
+    bucket_name      TEXT PRIMARY KEY,
+    drain_id         TEXT NOT NULL CHECK (length(drain_id) BETWEEN 1 AND 256),
+    cluster_epoch    INTEGER NOT NULL CHECK (cluster_epoch > 0),
+    bucket_execution_generation INTEGER NOT NULL CHECK (bucket_execution_generation >= 0),
+    outcome          INTEGER NOT NULL CHECK (outcome IN (0, 1, 2, 3)),
+    detail           TEXT NOT NULL CHECK (length(detail) <= 1024),
+    updated_at       INTEGER NOT NULL CHECK (updated_at >= 0),
+    FOREIGN KEY (bucket_name) REFERENCES buckets(name) ON DELETE CASCADE
+)";
+
 /// Index for bucket listing by owner and bucket name.
 const CREATE_BUCKETS_OWNER_LIST_INDEX: &str = "\
 CREATE INDEX IF NOT EXISTS idx_buckets_owner_list ON buckets (owner_principal, name)";
@@ -790,6 +803,7 @@ pub fn init_pg_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
     conn.execute(CREATE_BUCKETS_TABLE, [])?;
     conn.execute(CREATE_BUCKET_WRITE_RESERVATIONS_TABLE, [])?;
     conn.execute(CREATE_BUCKET_WRITE_DRAINS_TABLE, [])?;
+    conn.execute(CREATE_BUCKET_DELETE_ATTEMPT_OUTCOMES_TABLE, [])?;
     conn.execute(CREATE_BUCKET_DELETE_FINALIZE_CLAIMS_TABLE, [])?;
     conn.execute(CREATE_LIFECYCLE_SWEEP_CLAIMS_TABLE, [])?;
     conn.execute(CREATE_BUCKETS_OWNER_LIST_INDEX, [])?;
