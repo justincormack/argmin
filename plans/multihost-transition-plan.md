@@ -9126,8 +9126,16 @@ Keep an explicit Phase 11 close-out before treating the phase as soak-clean:
          and post-reservation drain phases and re-enters at the final visibility
          proof. A storage regression installs a failing post-reservation progress
          hook and proves that a final-visibility adoption reaches
-         `mark_deleting` without repeating that scan. Remaining work: add
-         resumable frontier/state for stream cleanup.
+         `mark_deleting` without repeating that scan. Stream cleanup now has a
+         conservative adoption point as well: entering cleanup records a
+         retryable `stream_cleanup` attempt row, and a later matching adoption
+         can skip the initial pre-cleanup exact-bucket scan while still
+         re-running stream cleanup, reservation wait, post-reservation object-PG
+         validation, and final visibility. A storage regression verifies that
+         stream-cleanup adoption still runs the post-reservation validation
+         before reaching `mark_deleting`. Remaining work: decide whether finer
+         stream-cleanup page/frontier state is needed, or whether the current
+         conservative cleanup resume point is enough for soak closure.
       5. status: open. Revisit reservation classification only after attempts are resumable;
          it should be an optimization on top of a convergent state machine, not
          the convergence mechanism itself.
