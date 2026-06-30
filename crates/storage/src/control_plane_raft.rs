@@ -34,7 +34,7 @@ use crate::control_plane_command::{
     ControlPlaneCommand, ControlPlaneCommandResponse, ControlPlaneLogId,
     ControlPlaneSnapshotArtifact, ReplicatedControlPlaneStateMachine,
 };
-use crate::ClusterEpoch;
+use crate::{ClusterEpoch, PgState};
 
 pub type ControlPlaneRaftNodeId = u64;
 pub type ControlPlaneRaftTerm = u64;
@@ -127,6 +127,12 @@ pub struct ControlPlaneRaftAuthorityStatus {
     oldest_retained_history_epoch: Option<ClusterEpoch>,
     newest_retained_history_epoch: Option<ClusterEpoch>,
     oldest_storage_history_floor_epoch: Option<ClusterEpoch>,
+    pg_count: usize,
+    active_pg_count: usize,
+    peering_pg_count: usize,
+    degraded_pg_count: usize,
+    backfilling_pg_count: usize,
+    inconsistent_pg_count: usize,
     effective_membership_log_id: Option<LogIdOf<ControlPlaneRaftTypeConfig>>,
     effective_voters: BTreeSet<ControlPlaneRaftNodeId>,
     effective_learners: BTreeSet<ControlPlaneRaftNodeId>,
@@ -209,6 +215,36 @@ impl ControlPlaneRaftAuthorityStatus {
     #[must_use]
     pub fn oldest_storage_history_floor_epoch(&self) -> Option<ClusterEpoch> {
         self.oldest_storage_history_floor_epoch
+    }
+
+    #[must_use]
+    pub fn pg_count(&self) -> usize {
+        self.pg_count
+    }
+
+    #[must_use]
+    pub fn active_pg_count(&self) -> usize {
+        self.active_pg_count
+    }
+
+    #[must_use]
+    pub fn peering_pg_count(&self) -> usize {
+        self.peering_pg_count
+    }
+
+    #[must_use]
+    pub fn degraded_pg_count(&self) -> usize {
+        self.degraded_pg_count
+    }
+
+    #[must_use]
+    pub fn backfilling_pg_count(&self) -> usize {
+        self.backfilling_pg_count
+    }
+
+    #[must_use]
+    pub fn inconsistent_pg_count(&self) -> usize {
+        self.inconsistent_pg_count
     }
 
     #[must_use]
@@ -412,6 +448,12 @@ impl ControlPlaneRaftAuthority {
             oldest_retained_history_epoch,
             newest_retained_history_epoch,
             oldest_storage_history_floor_epoch,
+            pg_count,
+            active_pg_count,
+            peering_pg_count,
+            degraded_pg_count,
+            backfilling_pg_count,
+            inconsistent_pg_count,
             applied_membership_log_id,
             applied_voters,
             applied_learners,
@@ -438,6 +480,22 @@ impl ControlPlaneRaftAuthority {
                     .nodes()
                     .filter_map(|node| node.cluster_map_history_floor_epoch())
                     .min();
+                let mut pg_count = 0;
+                let mut active_pg_count = 0;
+                let mut peering_pg_count = 0;
+                let mut degraded_pg_count = 0;
+                let mut backfilling_pg_count = 0;
+                let mut inconsistent_pg_count = 0;
+                for pg in snapshot.pgs() {
+                    pg_count += 1;
+                    match pg.state() {
+                        PgState::Active => active_pg_count += 1,
+                        PgState::Peering => peering_pg_count += 1,
+                        PgState::Degraded => degraded_pg_count += 1,
+                        PgState::Backfilling => backfilling_pg_count += 1,
+                        PgState::Inconsistent => inconsistent_pg_count += 1,
+                    }
+                }
                 let membership = state_machine.last_membership();
                 let membership_log_id = *membership.log_id();
                 let voters = membership.membership().voter_ids().collect();
@@ -452,6 +510,12 @@ impl ControlPlaneRaftAuthority {
                         oldest_retained_history_epoch,
                         newest_retained_history_epoch,
                         oldest_storage_history_floor_epoch,
+                        pg_count,
+                        active_pg_count,
+                        peering_pg_count,
+                        degraded_pg_count,
+                        backfilling_pg_count,
+                        inconsistent_pg_count,
                         membership_log_id,
                         voters,
                         learners,
@@ -476,6 +540,12 @@ impl ControlPlaneRaftAuthority {
             oldest_retained_history_epoch,
             newest_retained_history_epoch,
             oldest_storage_history_floor_epoch,
+            pg_count,
+            active_pg_count,
+            peering_pg_count,
+            degraded_pg_count,
+            backfilling_pg_count,
+            inconsistent_pg_count,
             effective_membership_log_id,
             effective_voters,
             effective_learners,
@@ -5145,6 +5215,12 @@ mod tests {
             assert!(restarted_status
                 .newest_retained_history_epoch()
                 .is_some_and(|epoch| epoch < restarted_status.current_cluster_epoch()));
+            assert_eq!(restarted_status.pg_count(), 1);
+            assert_eq!(restarted_status.active_pg_count(), 0);
+            assert_eq!(restarted_status.peering_pg_count(), 1);
+            assert_eq!(restarted_status.degraded_pg_count(), 0);
+            assert_eq!(restarted_status.backfilling_pg_count(), 0);
+            assert_eq!(restarted_status.inconsistent_pg_count(), 0);
 
             let restarted_node903_availability = restarted_authority
                 .raft()

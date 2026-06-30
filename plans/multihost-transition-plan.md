@@ -9649,6 +9649,10 @@ Phase 12.1 progress:
   bounds, and the oldest storage-reported history floor. The restarted-leader
   resume smoke now pins these fields against the served runtime-map proof and
   retained route history after post-restart epoch changes.
+- Extended the same status surface with PG-state counters for the canonical
+  state machine. The restarted-leader resume smoke now verifies the recovered
+  leader reports the expected PG count and Peering/Active/degraded/backfill/
+  inconsistent breakdown after replaying the post-restart command.
 
 1. define the replicated control-plane state machine:
    - state includes cluster epoch, PG count, PG state, PG acting sets, node
