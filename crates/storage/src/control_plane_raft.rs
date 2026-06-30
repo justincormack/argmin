@@ -104,13 +104,23 @@ pub trait ControlPlaneRaftLinearizedRuntimeMapSource {
     ) -> ControlPlaneRaftFuture<'_, Result<ClusterRuntimeMapSnapshot, ControlPlaneError>>;
 }
 
+pub trait ControlPlaneRaftAuthorityStatusSource {
+    fn status(
+        &self,
+    ) -> ControlPlaneRaftFuture<'_, Result<ControlPlaneRaftAuthorityStatus, ControlPlaneError>>;
+}
+
 pub trait ControlPlaneRaftLinearizedAuthority:
-    ControlPlaneRaftLinearizedCommandSink + ControlPlaneRaftLinearizedRuntimeMapSource
+    ControlPlaneRaftLinearizedCommandSink
+    + ControlPlaneRaftLinearizedRuntimeMapSource
+    + ControlPlaneRaftAuthorityStatusSource
 {
 }
 
 impl<T> ControlPlaneRaftLinearizedAuthority for T where
-    T: ControlPlaneRaftLinearizedCommandSink + ControlPlaneRaftLinearizedRuntimeMapSource
+    T: ControlPlaneRaftLinearizedCommandSink
+        + ControlPlaneRaftLinearizedRuntimeMapSource
+        + ControlPlaneRaftAuthorityStatusSource
 {
 }
 
@@ -953,6 +963,15 @@ impl ControlPlaneRaftLinearizedRuntimeMapSource for ControlPlaneRaftAuthority {
         Box::pin(async move {
             ControlPlaneRaftAuthority::linearized_runtime_map_snapshot(self, issued_at_ms).await
         })
+    }
+}
+
+impl ControlPlaneRaftAuthorityStatusSource for ControlPlaneRaftAuthority {
+    fn status(
+        &self,
+    ) -> ControlPlaneRaftFuture<'_, Result<ControlPlaneRaftAuthorityStatus, ControlPlaneError>>
+    {
+        Box::pin(async move { ControlPlaneRaftAuthority::status(self).await })
     }
 }
 
@@ -4166,7 +4185,7 @@ mod tests {
     }
 
     #[test]
-    fn control_plane_openraft_linearized_authority_traits_submit_and_read() {
+    fn control_plane_openraft_linearized_authority_trait_submits_reads_and_reports_status() {
         ControlPlaneRaftTypeConfig::run(async {
             let log_store = ControlPlaneRaftLogStore::empty();
             let state_machine = ControlPlaneRaftStateMachine::empty();
@@ -4187,8 +4206,8 @@ mod tests {
                 .unwrap();
             wait_for_local_leader(authority.raft(), "linearized authority trait leadership").await;
 
-            let command_sink: &dyn ControlPlaneRaftLinearizedCommandSink = &authority;
-            let write = command_sink
+            let linearized_authority: &dyn ControlPlaneRaftLinearizedAuthority = &authority;
+            let write = linearized_authority
                 .submit_control_plane_command(ControlPlaneCommand::BootstrapInitialClusterMap {
                     nodes: vec![(NodeId::new(301), "node-301".to_string())],
                     pg_ids: vec![PgId::new(0)],
@@ -4202,16 +4221,19 @@ mod tests {
                 )
             ));
 
-            let runtime_map_source: &dyn ControlPlaneRaftLinearizedRuntimeMapSource = &authority;
-            let runtime_map = runtime_map_source
+            let runtime_map = linearized_authority
                 .linearized_runtime_map_snapshot(66_000)
                 .await
                 .unwrap();
+            let status = linearized_authority.status().await.unwrap();
+            assert_eq!(
+                status.linearized_authority_readiness(),
+                ControlPlaneRaftLinearizedAuthorityReadiness::Serving
+            );
+            assert_eq!(status.current_leader(), Some(301));
+            assert_eq!(status.applied(), Some(write.log_id()));
             let expected_read_index = control_plane_log_id_from_raft(
-                authority
-                    .status()
-                    .await
-                    .unwrap()
+                status
                     .applied()
                     .expect("trait read should have an applied tip"),
             )

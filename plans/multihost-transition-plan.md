@@ -9726,6 +9726,11 @@ Phase 12.1 progress:
   last-log, committed, and applied positions together, while the current-snapshot
   recovery smoke verifies restored purged, committed, applied, and snapshot
   indexes through the public authority status view.
+- Added an object-safe authority status trait and folded it into the linearized
+  OpenRaft authority boundary alongside command submission and runtime-map
+  reads. The trait smoke now exercises command, read-index runtime map, and
+  readiness/status access through a single boundary that later admin/readiness
+  wiring can depend on without naming the concrete OpenRaft wrapper.
 
 1. define the replicated control-plane state machine:
    - state includes cluster epoch, PG count, PG state, PG acting sets, node
