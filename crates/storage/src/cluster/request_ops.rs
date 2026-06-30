@@ -2361,6 +2361,7 @@ impl super::StorageCluster {
                                     PgId::new(pg_id),
                                     &existing,
                                     BucketDeleteAttemptOutcomeKind::StaleGeneration,
+                                    BucketDeleteAttemptPhase::Initial,
                                     format!(
                                         "stale drain generation {} current generation {}",
                                         existing.bucket_execution_generation,
@@ -2471,6 +2472,7 @@ impl super::StorageCluster {
         pg_id: PgId,
         record: &BucketWriteDrainRecord,
         outcome: BucketDeleteAttemptOutcomeKind,
+        phase: BucketDeleteAttemptPhase,
         detail: String,
     ) {
         let result = (|| {
@@ -2482,6 +2484,7 @@ impl super::StorageCluster {
                 pg_id,
                 record,
                 outcome,
+                phase,
                 detail,
             );
             Ok::<(), BucketWriteDrainError>(())
@@ -2508,6 +2511,7 @@ impl super::StorageCluster {
         pg_id: PgId,
         record: &BucketWriteDrainRecord,
         outcome: BucketDeleteAttemptOutcomeKind,
+        phase: BucketDeleteAttemptPhase,
         detail: String,
     ) {
         let detail = Self::bounded_bucket_delete_attempt_detail(detail);
@@ -2517,6 +2521,7 @@ impl super::StorageCluster {
             cluster_epoch: record.cluster_epoch,
             bucket_execution_generation: record.bucket_execution_generation,
             outcome,
+            phase,
             detail,
             post_reservation_next_object_pg_id: None,
             updated_at: crate::clock::current_time_millis(),
@@ -2542,6 +2547,7 @@ impl super::StorageCluster {
         client: &dyn BucketWriteReservationNodeClient,
         drain: &super::DurableBucketWriteDrain,
         outcome: BucketDeleteAttemptOutcomeKind,
+        phase: BucketDeleteAttemptPhase,
         detail: String,
     ) {
         self.record_bucket_delete_attempt_outcome_with_client(
@@ -2549,6 +2555,7 @@ impl super::StorageCluster {
             PgId::new(drain.pg_id),
             &drain.record,
             outcome,
+            phase,
             detail,
         );
     }
@@ -3025,17 +3032,18 @@ impl super::StorageCluster {
                 return Err(bucket_snapshot_error_to_bucket_write_drain_error(error));
             }
         };
-        let (outcome, detail) = existing
+        let (outcome, phase, detail) = existing
             .filter(|record| {
                 record.drain_id == progress.drain.record.drain_id
                     && record.cluster_epoch == progress.drain.record.cluster_epoch
                     && record.bucket_execution_generation
                         == progress.drain.record.bucket_execution_generation
             })
-            .map(|record| (record.outcome, record.detail))
+            .map(|record| (record.outcome, record.phase, record.detail))
             .unwrap_or_else(|| {
                 (
                     BucketDeleteAttemptOutcomeKind::Retryable,
+                    BucketDeleteAttemptPhase::PostReservationObjectDrain,
                     format!(
                         "post-reservation exact-bucket drain progressed to object PG {next_object_pg_id}"
                     ),
@@ -3048,6 +3056,7 @@ impl super::StorageCluster {
             cluster_epoch: progress.drain.record.cluster_epoch,
             bucket_execution_generation: progress.drain.record.bucket_execution_generation,
             outcome,
+            phase,
             detail,
             post_reservation_next_object_pg_id: Some(next_object_pg_id),
             updated_at: crate::clock::current_time_millis(),
@@ -3375,6 +3384,7 @@ impl super::StorageCluster {
                             pg_id,
                             &existing,
                             BucketDeleteAttemptOutcomeKind::NotEmpty,
+                            BucketDeleteAttemptPhase::Initial,
                             format!("live stream blocker before drain adoption: {source:?}"),
                         );
                         match node_store
@@ -3510,8 +3520,10 @@ impl super::StorageCluster {
         .for_operation("bucket_delete_begin")
         .for_pg(pg_id);
         let mut loop_iteration = 0u64;
+        let mut attempt_phase = BucketDeleteAttemptPhase::Initial;
         let result = (|| loop {
             loop_iteration += 1;
+            attempt_phase = BucketDeleteAttemptPhase::Initial;
             Self::emit_bucket_delete_begin_loop_step(
                 bucket,
                 pg_id,
@@ -3837,12 +3849,14 @@ impl super::StorageCluster {
                     "stream_cleanup_start",
                     format!("iteration={loop_iteration}"),
                 );
+                attempt_phase = BucketDeleteAttemptPhase::StreamCleanup;
                 match self.cleanup_abandoned_put_object_stream_uploads_for_bucket(bucket)? {
                     PutObjectStreamUploadCleanup::Live(source) => {
                         self.record_bucket_delete_attempt_outcome_for_drain_with_client(
                             node_store.bucket_write_reservation_client().as_ref(),
                             &durable_drain,
                             BucketDeleteAttemptOutcomeKind::NotEmpty,
+                            BucketDeleteAttemptPhase::StreamCleanup,
                             format!(
                                 "live stream blocker during cleanup before reservation wait: {source:?}"
                             ),
@@ -3869,6 +3883,7 @@ impl super::StorageCluster {
                     "wait_reservations_empty_start",
                     format!("iteration={loop_iteration}"),
                 );
+                attempt_phase = BucketDeleteAttemptPhase::ReservationWait;
                 self.wait_for_durable_bucket_write_reservations_empty(
                     bucket,
                     started,
@@ -3891,6 +3906,7 @@ impl super::StorageCluster {
                         loop_iteration
                     ),
                 );
+                attempt_phase = BucketDeleteAttemptPhase::PostReservationObjectDrain;
                 match self
                     .drain_pending_object_metadata_commands_for_exact_bucket_on_all_pgs_with_budget(
                         bucket,
@@ -3940,6 +3956,7 @@ impl super::StorageCluster {
                     "stream_cleanup_start",
                     format!("iteration={} pass=before_visibility_check", loop_iteration),
                 );
+                attempt_phase = BucketDeleteAttemptPhase::StreamCleanup;
                 let aborted_stream_uploads = match self
                     .cleanup_abandoned_put_object_stream_uploads_for_bucket(bucket)?
                 {
@@ -3948,6 +3965,7 @@ impl super::StorageCluster {
                             node_store.bucket_write_reservation_client().as_ref(),
                             &durable_drain,
                             BucketDeleteAttemptOutcomeKind::NotEmpty,
+                            BucketDeleteAttemptPhase::StreamCleanup,
                             format!(
                                     "live stream blocker during cleanup before visibility check: {source:?}"
                                 ),
@@ -4048,11 +4066,13 @@ impl super::StorageCluster {
                     "visibility_check_start",
                     format!("iteration={loop_iteration}"),
                 );
+                attempt_phase = BucketDeleteAttemptPhase::FinalVisibilityCheck;
                 if let Some(source) = self.bucket_visible_data_source(bucket, true)? {
                     self.record_bucket_delete_attempt_outcome_for_drain_with_client(
                         node_store.bucket_write_reservation_client().as_ref(),
                         &durable_drain,
                         BucketDeleteAttemptOutcomeKind::NotEmpty,
+                        BucketDeleteAttemptPhase::FinalVisibilityCheck,
                         format!("visible data blocker: {source:?}"),
                     );
                     return Err(self.bucket_delete_not_empty_error(bucket, pg_id, source));
@@ -4071,6 +4091,7 @@ impl super::StorageCluster {
                     "heartbeat_before_build_mark_start",
                     format!("iteration={loop_iteration}"),
                 );
+                attempt_phase = BucketDeleteAttemptPhase::MarkDeleting;
                 durable_drain = self.heartbeat_durable_bucket_delete_drain(&durable_drain)?;
                 Self::emit_bucket_delete_begin_loop_step(
                     bucket,
@@ -4246,6 +4267,7 @@ impl super::StorageCluster {
                     node_store.bucket_write_reservation_client().as_ref(),
                     &durable_drain,
                     BucketDeleteAttemptOutcomeKind::MarkDeleting,
+                    BucketDeleteAttemptPhase::MarkDeleting,
                     format!("mark bucket deleting applied after {loop_iteration} iteration(s)"),
                 );
                 let _ = observability::emit_flight_event(
@@ -4265,9 +4287,10 @@ impl super::StorageCluster {
                     super::TRACE_TARGET,
                     "bucket_delete_begin_failed",
                     format!(
-                        "bucket={:?} pg_id={} phase=budgeted_loop elapsed_us={} error={:?}",
+                        "bucket={:?} pg_id={} phase={:?} elapsed_us={} error={:?}",
                         bucket,
                         pg_id.get(),
+                        attempt_phase,
                         started.elapsed().as_micros(),
                         error
                     ),
@@ -4279,6 +4302,7 @@ impl super::StorageCluster {
                         node_store.bucket_write_reservation_client().as_ref(),
                         &durable_drain,
                         BucketDeleteAttemptOutcomeKind::Retryable,
+                        attempt_phase,
                         format!("retryable begin error: {error:?}"),
                     );
                     let _ = observability::event(

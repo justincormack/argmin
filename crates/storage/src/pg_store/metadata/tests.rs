@@ -401,6 +401,7 @@ fn bucket_delete_attempt_outcome_records_last_state() {
         cluster_epoch: drain.cluster_epoch,
         bucket_execution_generation: drain.bucket_execution_generation,
         outcome: BucketDeleteAttemptOutcomeKind::Retryable,
+        phase: BucketDeleteAttemptPhase::PostReservationObjectDrain,
         detail: "route expired".to_string(),
         post_reservation_next_object_pg_id: Some(7),
         updated_at: 11,
@@ -413,6 +414,7 @@ fn bucket_delete_attempt_outcome_records_last_state() {
 
     let second = BucketDeleteAttemptOutcomeRecord {
         outcome: BucketDeleteAttemptOutcomeKind::MarkDeleting,
+        phase: BucketDeleteAttemptPhase::MarkDeleting,
         detail: "mark bucket deleting applied".to_string(),
         updated_at: 12,
         ..first

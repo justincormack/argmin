@@ -1057,6 +1057,7 @@ fn active_put_object_stream_upload_blocks_bucket_delete() {
         outcome.outcome,
         crate::BucketDeleteAttemptOutcomeKind::NotEmpty
     );
+    assert_eq!(outcome.phase, crate::BucketDeleteAttemptPhase::Initial);
     drop(bucket_pg);
 
     cluster

@@ -2459,6 +2459,18 @@ pub enum BucketDeleteAttemptOutcomeKind {
     MarkDeleting = 3,
 }
 
+/// Durable DeleteBucket begin phase reached by the recorded attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum BucketDeleteAttemptPhase {
+    Initial = 0,
+    ReservationWait = 1,
+    PostReservationObjectDrain = 2,
+    StreamCleanup = 3,
+    FinalVisibilityCheck = 4,
+    MarkDeleting = 5,
+}
+
 /// Last durable DeleteBucket attempt outcome for a bucket.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BucketDeleteAttemptOutcomeRecord {
@@ -2467,6 +2479,7 @@ pub struct BucketDeleteAttemptOutcomeRecord {
     pub cluster_epoch: ClusterEpoch,
     pub bucket_execution_generation: u64,
     pub outcome: BucketDeleteAttemptOutcomeKind,
+    pub phase: BucketDeleteAttemptPhase,
     pub detail: String,
     pub post_reservation_next_object_pg_id: Option<u32>,
     pub updated_at: u64,

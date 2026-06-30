@@ -828,6 +828,7 @@ fn begin_bucket_delete_retries_when_pending_slot_wins_before_command_id() {
             outcome.outcome,
             crate::BucketDeleteAttemptOutcomeKind::Retryable
         );
+        assert_eq!(outcome.phase, crate::BucketDeleteAttemptPhase::MarkDeleting);
     }
     assert_eq!(
         cluster.try_take_reclaim_work(),
@@ -855,6 +856,7 @@ fn begin_bucket_delete_retries_when_pending_slot_wins_before_command_id() {
             outcome.outcome,
             crate::BucketDeleteAttemptOutcomeKind::MarkDeleting
         );
+        assert_eq!(outcome.phase, crate::BucketDeleteAttemptPhase::MarkDeleting);
     }
 
     assert!(
@@ -3137,6 +3139,7 @@ fn post_reservation_exact_bucket_frontier_is_identity_fenced_and_resettable() {
             cluster_epoch: drain.record.cluster_epoch,
             bucket_execution_generation: drain.record.bucket_execution_generation,
             outcome: crate::BucketDeleteAttemptOutcomeKind::Retryable,
+            phase: crate::BucketDeleteAttemptPhase::PostReservationObjectDrain,
             detail: "stale progress must not be trusted".to_string(),
             post_reservation_next_object_pg_id: Some(pg_count),
             updated_at: crate::clock::current_time_millis(),

@@ -16,20 +16,20 @@ use crate::{
     },
     types::{
         AbortMultipartUploadCleanup, BucketDeleteAttemptOutcomeKind,
-        BucketDeleteAttemptOutcomeRecord, BucketDeleteFinalizeClaimRecord,
-        BucketDeleteFinalizeRoot, BucketEncryptionConfig, BucketFastPathIdentity, BucketInfo,
-        BucketObjectOwnership, BucketOwnershipControls, BucketSnapshot, BucketSnapshotPair,
-        BucketSnapshotRequest, BucketSnapshotTagsRequest, BucketState, BucketSubresourceAux,
-        BucketSubresourceKind, BucketWriteDrainRecord, BucketWriteDrainState,
-        BucketWriteReservationRecord, ChecksumAlgorithm, ChecksumBytes, ChecksumType, ClusterEpoch,
-        CommitDirectPutObjectReq, CompleteMultipartCommitCleanup, CompleteMultipartCommitRequest,
-        CompletedMultipartUploadRecord, CreateBucketConfig, CreateMultipartUploadReq,
-        CreateStreamUploadReq, DataPgId, DeleteMarkerRecord, DirectPutCommitStorageSnapshot,
-        EcShape, EffectiveBucketEncryptionConfig, EtagKind, GenerationId, LifecycleSweepBuckets,
-        LifecycleSweepClaimRecord, LifecycleSweepRoot, LifecycleSweepRootSource,
-        ListMultipartUploadsReq, ListMultipartUploadsResp, ListObjectVersionsReq,
-        ListObjectVersionsResp, ListObjectsReq, ListObjectsResp, ListPartsResp,
-        ListedMultipartParts, LiveObjectRecord, LoadedBucketSubresource,
+        BucketDeleteAttemptOutcomeRecord, BucketDeleteAttemptPhase,
+        BucketDeleteFinalizeClaimRecord, BucketDeleteFinalizeRoot, BucketEncryptionConfig,
+        BucketFastPathIdentity, BucketInfo, BucketObjectOwnership, BucketOwnershipControls,
+        BucketSnapshot, BucketSnapshotPair, BucketSnapshotRequest, BucketSnapshotTagsRequest,
+        BucketState, BucketSubresourceAux, BucketSubresourceKind, BucketWriteDrainRecord,
+        BucketWriteDrainState, BucketWriteReservationRecord, ChecksumAlgorithm, ChecksumBytes,
+        ChecksumType, ClusterEpoch, CommitDirectPutObjectReq, CompleteMultipartCommitCleanup,
+        CompleteMultipartCommitRequest, CompletedMultipartUploadRecord, CreateBucketConfig,
+        CreateMultipartUploadReq, CreateStreamUploadReq, DataPgId, DeleteMarkerRecord,
+        DirectPutCommitStorageSnapshot, EcShape, EffectiveBucketEncryptionConfig, EtagKind,
+        GenerationId, LifecycleSweepBuckets, LifecycleSweepClaimRecord, LifecycleSweepRoot,
+        LifecycleSweepRootSource, ListMultipartUploadsReq, ListMultipartUploadsResp,
+        ListObjectVersionsReq, ListObjectVersionsResp, ListObjectsReq, ListObjectsResp,
+        ListPartsResp, ListedMultipartParts, LiveObjectRecord, LoadedBucketSubresource,
         ManagedEncryptionAlgorithm, MultipartChecksumConfig, MultipartCompletionPreflight,
         MultipartCompletionSnapshot, MultipartPartRecord, MultipartPartSegmentRecord,
         MultipartReclaimPartRecord, MultipartReclaimPartSegmentRecord, MultipartReclaimRecord,
@@ -274,6 +274,7 @@ const STORAGE_RPC_BUCKET_DELETE_ATTEMPT_OUTCOME_RECORD_MAX_LEN: usize =
         + STORAGE_RPC_MAX_BUCKET_WRITE_RESERVATION_ID_LEN
         + 8
         + 8
+        + 1
         + 1
         + 4
         + BUCKET_DELETE_ATTEMPT_OUTCOME_DETAIL_MAX_LEN
@@ -12717,6 +12718,19 @@ impl<'a> StorageRpcDecoder<'a> {
                 ));
             }
         };
+        let phase = match self.read_u8()? {
+            0 => BucketDeleteAttemptPhase::Initial,
+            1 => BucketDeleteAttemptPhase::ReservationWait,
+            2 => BucketDeleteAttemptPhase::PostReservationObjectDrain,
+            3 => BucketDeleteAttemptPhase::StreamCleanup,
+            4 => BucketDeleteAttemptPhase::FinalVisibilityCheck,
+            5 => BucketDeleteAttemptPhase::MarkDeleting,
+            _ => {
+                return Err(StorageRpcPayloadError::InvalidBucketWriteReservationProof(
+                    "invalid bucket delete attempt phase",
+                ));
+            }
+        };
         let detail = self.read_string_with_limit(
             BUCKET_DELETE_ATTEMPT_OUTCOME_DETAIL_MAX_LEN,
             StorageRpcPayloadError::InvalidBucketWriteReservationProof(
@@ -12731,6 +12745,7 @@ impl<'a> StorageRpcDecoder<'a> {
             cluster_epoch,
             bucket_execution_generation,
             outcome,
+            phase,
             detail,
             post_reservation_next_object_pg_id,
             updated_at,
@@ -15183,6 +15198,7 @@ fn put_bucket_delete_attempt_outcome_record(
     put_u64(out, record.cluster_epoch.get());
     put_u64(out, record.bucket_execution_generation);
     put_u8(out, record.outcome as u8);
+    put_u8(out, record.phase as u8);
     put_string(out, &record.detail);
     put_optional_u32(out, record.post_reservation_next_object_pg_id);
     put_u64(out, record.updated_at);
@@ -19194,6 +19210,7 @@ mod tests {
                     cluster_epoch,
                     bucket_execution_generation: 3,
                     outcome: BucketDeleteAttemptOutcomeKind::Retryable,
+                    phase: BucketDeleteAttemptPhase::PostReservationObjectDrain,
                     detail: "e".repeat(BUCKET_DELETE_ATTEMPT_OUTCOME_DETAIL_MAX_LEN),
                     post_reservation_next_object_pg_id: Some(7),
                     updated_at: 6,

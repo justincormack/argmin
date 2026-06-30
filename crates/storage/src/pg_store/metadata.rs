@@ -4654,8 +4654,9 @@ fn bucket_delete_attempt_outcome_from_row(
     let cluster_epoch_raw: i64 = row.get(2)?;
     let bucket_execution_generation_raw: i64 = row.get(3)?;
     let outcome_raw: i64 = row.get(4)?;
-    let post_reservation_next_object_pg_id_raw: Option<i64> = row.get(6)?;
-    let updated_at_raw: i64 = row.get(7)?;
+    let phase_raw: i64 = row.get(5)?;
+    let post_reservation_next_object_pg_id_raw: Option<i64> = row.get(7)?;
+    let updated_at_raw: i64 = row.get(8)?;
     let outcome = match outcome_raw {
         0 => BucketDeleteAttemptOutcomeKind::Retryable,
         1 => BucketDeleteAttemptOutcomeKind::NotEmpty,
@@ -4668,6 +4669,21 @@ fn bucket_delete_attempt_outcome_from_row(
                 Box::from(format!(
                     "invalid bucket delete attempt outcome: {outcome_raw}"
                 )),
+            ));
+        }
+    };
+    let phase = match phase_raw {
+        0 => BucketDeleteAttemptPhase::Initial,
+        1 => BucketDeleteAttemptPhase::ReservationWait,
+        2 => BucketDeleteAttemptPhase::PostReservationObjectDrain,
+        3 => BucketDeleteAttemptPhase::StreamCleanup,
+        4 => BucketDeleteAttemptPhase::FinalVisibilityCheck,
+        5 => BucketDeleteAttemptPhase::MarkDeleting,
+        _ => {
+            return Err(rusqlite::Error::FromSqlConversionFailure(
+                5,
+                rusqlite::types::Type::Integer,
+                Box::from(format!("invalid bucket delete attempt phase: {phase_raw}")),
             ));
         }
     };
@@ -4702,12 +4718,13 @@ fn bucket_delete_attempt_outcome_from_row(
             },
         )?,
         outcome,
-        detail: row.get(5)?,
+        phase,
+        detail: row.get(6)?,
         post_reservation_next_object_pg_id: post_reservation_next_object_pg_id_raw
             .map(|raw| {
                 u32::try_from(raw).map_err(|_| {
                     rusqlite::Error::FromSqlConversionFailure(
-                        6,
+                        7,
                         rusqlite::types::Type::Integer,
                         Box::from(format!("invalid post_reservation_next_object_pg_id: {raw}")),
                     )
@@ -4716,7 +4733,7 @@ fn bucket_delete_attempt_outcome_from_row(
             .transpose()?,
         updated_at: u64::try_from(updated_at_raw).map_err(|_| {
             rusqlite::Error::FromSqlConversionFailure(
-                7,
+                8,
                 rusqlite::types::Type::Integer,
                 Box::from(format!("invalid updated_at: {updated_at_raw}")),
             )
@@ -6071,13 +6088,14 @@ impl PgMetadataStore for PgStore {
             .execute(
                 "INSERT INTO bucket_delete_attempt_outcomes \
                  (bucket_name, drain_id, cluster_epoch, bucket_execution_generation, \
-                  outcome, detail, post_reservation_next_object_pg_id, updated_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
+                  outcome, phase, detail, post_reservation_next_object_pg_id, updated_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) \
                  ON CONFLICT(bucket_name) DO UPDATE SET \
                    drain_id = excluded.drain_id, \
                    cluster_epoch = excluded.cluster_epoch, \
                    bucket_execution_generation = excluded.bucket_execution_generation, \
                    outcome = excluded.outcome, \
+                   phase = excluded.phase, \
                    detail = excluded.detail, \
                    post_reservation_next_object_pg_id = excluded.post_reservation_next_object_pg_id, \
                    updated_at = excluded.updated_at",
@@ -6087,6 +6105,7 @@ impl PgMetadataStore for PgStore {
                     record.cluster_epoch.get(),
                     generation,
                     record.outcome as u8,
+                    record.phase as u8,
                     &record.detail,
                     post_reservation_next_object_pg_id,
                     updated_at,
@@ -6105,7 +6124,7 @@ impl PgMetadataStore for PgStore {
     ) -> Result<Option<BucketDeleteAttemptOutcomeRecord>, MetadataError> {
         match self.conn.query_row(
             "SELECT bucket_name, drain_id, cluster_epoch, bucket_execution_generation, \
-                    outcome, detail, post_reservation_next_object_pg_id, updated_at \
+                    outcome, phase, detail, post_reservation_next_object_pg_id, updated_at \
              FROM bucket_delete_attempt_outcomes \
              WHERE bucket_name = ?1",
             params![name.as_str()],
