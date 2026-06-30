@@ -5654,6 +5654,24 @@ fn put_object_retrying_operation_aborted(
     unreachable!("retry loop must return on final attempt")
 }
 
+fn delete_object_retrying_operation_aborted(
+    coord: &Coordinator,
+    req: &DeleteObjectRequest<'_>,
+) -> Result<DeleteObjectResult, ServerError> {
+    const MAX_ATTEMPTS: usize = 20;
+
+    for attempt in 0..MAX_ATTEMPTS {
+        match coord.delete_object(req) {
+            Ok(result) => return Ok(result),
+            Err(ServerError::OperationAborted) if attempt + 1 < MAX_ATTEMPTS => {
+                thread::sleep(Duration::from_millis(1));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    unreachable!("retry loop must return on final attempt")
+}
+
 #[test]
 fn get_object_is_consistent_during_concurrent_overwrite() {
     let tmp = test_util::tempdir();
@@ -6127,17 +6145,20 @@ fn delete_object_is_consistent_during_concurrent_overwrite() {
         });
         let t_delete = thread::spawn(move || {
             b2.wait();
-            deleter.delete_object(&DeleteObjectRequest {
-                object: object_version_request_with_expected_owner(
-                    "bucket",
-                    "key",
-                    None,
-                    test_requester(),
-                    None,
-                ),
-                bypass_governance: false,
-                cond: NO_DELETE,
-            })
+            delete_object_retrying_operation_aborted(
+                &deleter,
+                &DeleteObjectRequest {
+                    object: object_version_request_with_expected_owner(
+                        "bucket",
+                        "key",
+                        None,
+                        test_requester(),
+                        None,
+                    ),
+                    bypass_governance: false,
+                    cond: NO_DELETE,
+                },
+            )
         });
 
         barrier.wait();

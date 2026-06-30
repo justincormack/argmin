@@ -9103,11 +9103,14 @@ Keep an explicit Phase 11 close-out before treating the phase as soak-clean:
          coverage now verifies the frontier identity fence, reset persistence,
          resumed scanning from the persisted frontier, and phase recording,
          while metadata/RPC tests verify the fields round-trip through storage
-         and Unix RPC.
+         and Unix RPC. End-to-end storage coverage now proves a foreground
+         `DeleteBucket` can persist a partial post-reservation frontier, fail
+         retryably, preserve that frontier when recording the retryable outcome,
+         and let a later foreground attempt adopt the active drain and resume
+         from the later object PGs.
          Remaining work: add resumable frontier/state for stream cleanup and
-         final visibility phases, and add a deterministic end-to-end
-         interleaving test around foreground/background adoption of a partially
-         progressed delete attempt.
+         final visibility phases, and add background-worker adoption coverage
+         for a partially progressed delete attempt.
       5. status: open. Revisit reservation classification only after attempts are resumable;
          it should be an optimization on top of a convergent state machine, not
          the convergence mechanism itself.

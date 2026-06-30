@@ -177,6 +177,10 @@ type StreamPutFinalizeCommandIdTestHook = Arc<dyn Fn() + Send + Sync>;
 type BucketDeleteCommandIdTestHook = Arc<dyn Fn() + Send + Sync>;
 
 #[cfg(test)]
+type BucketDeletePostReservationProgressTestHook =
+    Arc<dyn Fn(u32) -> Result<(), StoreError> + Send + Sync>;
+
+#[cfg(test)]
 type CompletedMultipartOrderCommandIdTestHook = Arc<dyn Fn() + Send + Sync>;
 
 #[cfg(test)]
@@ -207,6 +211,11 @@ static BEFORE_STREAM_PUT_FINALIZE_COMMAND_ID_HOOKS: OnceLock<
 #[cfg(test)]
 static BEFORE_BUCKET_DELETE_COMMAND_ID_HOOKS: OnceLock<
     Mutex<HashMap<usize, BucketDeleteCommandIdTestHook>>,
+> = OnceLock::new();
+
+#[cfg(test)]
+static AFTER_BUCKET_DELETE_POST_RESERVATION_PROGRESS_HOOKS: OnceLock<
+    Mutex<HashMap<usize, BucketDeletePostReservationProgressTestHook>>,
 > = OnceLock::new();
 
 #[cfg(test)]
@@ -246,6 +255,11 @@ pub(crate) struct StreamPutFinalizeCommandIdTestHookGuard {
 
 #[cfg(test)]
 pub(crate) struct BucketDeleteCommandIdTestHookGuard {
+    scope_id: usize,
+}
+
+#[cfg(test)]
+pub(crate) struct BucketDeletePostReservationProgressTestHookGuard {
     scope_id: usize,
 }
 
@@ -318,6 +332,18 @@ impl Drop for BucketDeleteCommandIdTestHookGuard {
     fn drop(&mut self) {
         let hooks =
             BEFORE_BUCKET_DELETE_COMMAND_ID_HOOKS.get_or_init(|| Mutex::new(HashMap::new()));
+        hooks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.scope_id);
+    }
+}
+
+#[cfg(test)]
+impl Drop for BucketDeletePostReservationProgressTestHookGuard {
+    fn drop(&mut self) {
+        let hooks = AFTER_BUCKET_DELETE_POST_RESERVATION_PROGRESS_HOOKS
+            .get_or_init(|| Mutex::new(HashMap::new()));
         hooks
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -444,6 +470,23 @@ fn maybe_run_before_bucket_delete_command_id_hook(_scope_id: usize) {
     if let Some(hook) = hook {
         hook();
     }
+}
+
+#[cfg(test)]
+fn maybe_run_after_bucket_delete_post_reservation_progress_hook(
+    _scope_id: usize,
+    _next_object_pg_id: u32,
+) -> Result<(), StoreError> {
+    let hook = AFTER_BUCKET_DELETE_POST_RESERVATION_PROGRESS_HOOKS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&_scope_id)
+        .cloned();
+    if let Some(hook) = hook {
+        hook(_next_object_pg_id)?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -746,6 +789,20 @@ impl super::StorageCluster {
             .unwrap_or_else(|e| e.into_inner())
             .insert(scope_id, hook);
         BucketDeleteCommandIdTestHookGuard { scope_id }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_install_after_bucket_delete_post_reservation_progress_hook(
+        &self,
+        hook: BucketDeletePostReservationProgressTestHook,
+    ) -> BucketDeletePostReservationProgressTestHookGuard {
+        let scope_id = self.metadata_command_apply_test_hook_scope_id();
+        let slot = AFTER_BUCKET_DELETE_POST_RESERVATION_PROGRESS_HOOKS
+            .get_or_init(|| Mutex::new(HashMap::new()));
+        slot.lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(scope_id, hook);
+        BucketDeletePostReservationProgressTestHookGuard { scope_id }
     }
 
     #[cfg(test)]
@@ -2515,6 +2572,32 @@ impl super::StorageCluster {
         detail: String,
     ) {
         let detail = Self::bounded_bucket_delete_attempt_detail(detail);
+        let post_reservation_next_object_pg_id =
+            match client.bucket_delete_attempt_outcome(pg_id, &record.bucket) {
+                Ok(existing) => existing
+                    .filter(|existing| {
+                        existing.drain_id == record.drain_id
+                            && existing.cluster_epoch == record.cluster_epoch
+                            && existing.bucket_execution_generation
+                                == record.bucket_execution_generation
+                    })
+                    .and_then(|existing| existing.post_reservation_next_object_pg_id),
+                Err(error) => {
+                    let _ = observability::event(
+                        super::TRACE_TARGET,
+                        "bucket_delete_attempt_outcome_progress_load_failed",
+                        Some(format_args!(
+                            "bucket={:?} pg_id={} drain_id={} outcome={:?} error={:?}",
+                            record.bucket,
+                            pg_id.get(),
+                            record.drain_id,
+                            outcome,
+                            error
+                        )),
+                    );
+                    None
+                }
+            };
         let outcome_record = BucketDeleteAttemptOutcomeRecord {
             bucket: record.bucket.clone(),
             drain_id: record.drain_id.clone(),
@@ -2523,7 +2606,7 @@ impl super::StorageCluster {
             outcome,
             phase,
             detail,
-            post_reservation_next_object_pg_id: None,
+            post_reservation_next_object_pg_id,
             updated_at: crate::clock::current_time_millis(),
         };
         if let Err(error) = client.record_bucket_delete_attempt_outcome(pg_id, &outcome_record) {
@@ -2883,10 +2966,17 @@ impl super::StorageCluster {
                 }
             }
             if let (Some(progress), Some(last_pg)) = (progress, chunk.last()) {
+                let next_object_pg_id = last_pg.get().saturating_add(1);
                 self.record_bucket_delete_post_reservation_next_object_pg_id(
                     progress,
-                    last_pg.get().saturating_add(1),
+                    next_object_pg_id,
                 )?;
+                #[cfg(test)]
+                maybe_run_after_bucket_delete_post_reservation_progress_hook(
+                    self.metadata_command_apply_test_hook_scope_id(),
+                    next_object_pg_id,
+                )
+                .map_err(BucketWriteDrainError::from)?;
             }
         }
         self.check_bucket_delete_begin_work_budget(
