@@ -44,19 +44,7 @@ async fn cleanup_plain_bucket(
         }
     }
 
-    for client in [root_client, constrained_client] {
-        if client
-            .delete_bucket()
-            .bucket(bucket)
-            .send_retrying_operation_aborted("delete bucket during constrained write cleanup")
-            .await
-            .is_ok()
-        {
-            return;
-        }
-    }
-
-    panic!("bucket cleanup delete failed for {bucket}");
+    s3_tests::delete_bucket_retrying_operation_aborted(root_client, bucket).await;
 }
 
 #[test]

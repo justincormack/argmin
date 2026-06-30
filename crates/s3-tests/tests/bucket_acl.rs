@@ -94,6 +94,10 @@ async fn cleanup(bucket: &str) {
         match result {
             Ok(_) => return,
             Err(err) => {
+                if sdk_err_status(&err) == 404 {
+                    assert_sdk_err_code(&err, "NoSuchBucket");
+                    return;
+                }
                 if sdk_err_status(&err) == 409 {
                     assert_sdk_err_code(&err, "OperationAborted");
                     if attempt < 19 {

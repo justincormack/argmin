@@ -39,6 +39,7 @@ use crate::*;
 const INTERNAL_LIST_PAGE_SIZE: u32 = 1_000;
 const ORPHAN_OBJECT_PAYLOAD_RECLAIM_BUCKET_INCARNATION: u64 = 0;
 const BUCKET_DELETE_FINALIZE_SCAN_LIMIT_PER_PG: usize = 16;
+const BUCKET_DELETE_BEGIN_SCAN_LIMIT_PER_PG: usize = 16;
 const BUCKET_DELETE_BEGIN_WORK_BUDGET_MILLIS: u64 = 10_000;
 const BUCKET_DELETE_FINALIZE_WORK_BUDGET_MILLIS: u64 = 10_000;
 const BUCKET_DELETE_EXACT_BUCKET_PENDING_PROBE_PARALLELISM: usize = 8;
@@ -62,6 +63,12 @@ pub(crate) struct DurableObjectPayloadReclaimScan {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct DurableBucketDeleteFinalizeScan {
+    pub queued: usize,
+    pub errors: usize,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct DurableBucketDeleteBeginScan {
     pub queued: usize,
     pub errors: usize,
 }
@@ -8276,17 +8283,21 @@ impl super::StorageCluster {
     }
 
     pub fn enqueue_durable_reclaim_work(&self) {
-        self.enqueue_durable_reclaim_work_excluding_object_payload(&HashSet::new());
+        self.enqueue_durable_reclaim_work_excluding(&HashSet::new(), &HashSet::new());
     }
 
-    pub fn enqueue_durable_reclaim_work_excluding_object_payload(
+    pub fn enqueue_durable_reclaim_work_excluding(
         &self,
         excluded_object_payload_roots: &HashSet<(BucketName, ObjectKey, GenerationId)>,
+        excluded_bucket_delete_begin_roots: &HashSet<BucketDeleteBeginRoot>,
     ) {
         if self.operation_epoch() != self.cluster_epoch() {
             return;
         }
         self.enqueue_durable_object_payload_reclaim_roots_excluding(excluded_object_payload_roots);
+        self.enqueue_durable_bucket_delete_begin_roots_excluding(
+            excluded_bucket_delete_begin_roots,
+        );
         self.enqueue_durable_bucket_delete_finalize_roots();
     }
 
@@ -8696,6 +8707,83 @@ impl super::StorageCluster {
                     emit_scan("pg_capacity_deferred");
                 }
                 None => {}
+            }
+        }
+        scan
+    }
+
+    pub(crate) fn enqueue_durable_bucket_delete_begin_roots_excluding(
+        &self,
+        excluded_roots: &HashSet<BucketDeleteBeginRoot>,
+    ) -> DurableBucketDeleteBeginScan {
+        if self.operation_epoch() != self.cluster_epoch() {
+            return DurableBucketDeleteBeginScan::default();
+        }
+
+        let mut scan = DurableBucketDeleteBeginScan::default();
+        for pg_id in self.metadata_pg_ids() {
+            let pg_id = PgId::new(pg_id);
+            let node = match self
+                .local_map
+                .metadata_pg_primary_node(self.operation_epoch(), pg_id)
+            {
+                Ok(node) => node,
+                Err(error) => {
+                    scan.errors += 1;
+                    let _ = observability::event(
+                        super::TRACE_TARGET,
+                        "bucket_begin_durable_scan_pg_error",
+                        Some(format_args!("pg_id={} error={:?}", pg_id.get(), error)),
+                    );
+                    continue;
+                }
+            };
+            let now = crate::clock::current_time_millis();
+            let mut start_after_bucket = None;
+            let mut queued_for_pg = 0usize;
+            loop {
+                let roots = match node
+                    .bucket_write_reservation_client()
+                    .get_bucket_delete_begin_roots(
+                        pg_id,
+                        now,
+                        start_after_bucket.as_ref(),
+                        BUCKET_DELETE_BEGIN_SCAN_LIMIT_PER_PG,
+                    ) {
+                    Ok(roots) => roots,
+                    Err(error) => {
+                        scan.errors += 1;
+                        let _ = observability::event(
+                            super::TRACE_TARGET,
+                            "bucket_begin_durable_scan_pg_error",
+                            Some(format_args!("pg_id={} error={:?}", pg_id.get(), error)),
+                        );
+                        break;
+                    }
+                };
+                if roots.is_empty() {
+                    break;
+                }
+                let page_len = roots.len();
+                for root in roots {
+                    start_after_bucket = Some(root.bucket.clone());
+                    if excluded_roots.contains(&root) {
+                        continue;
+                    }
+                    self.local_map
+                        .runtime_state()
+                        .enqueue_bucket_delete_begin(root);
+                    scan.queued += 1;
+                    queued_for_pg += 1;
+                    if queued_for_pg >= BUCKET_DELETE_BEGIN_SCAN_LIMIT_PER_PG {
+                        break;
+                    }
+                }
+                if queued_for_pg >= BUCKET_DELETE_BEGIN_SCAN_LIMIT_PER_PG
+                    || page_len < BUCKET_DELETE_BEGIN_SCAN_LIMIT_PER_PG
+                {
+                    break;
+                }
             }
         }
         scan

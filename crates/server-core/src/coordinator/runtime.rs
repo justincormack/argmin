@@ -501,14 +501,17 @@ fn shortest_retry_sleep(left: Option<Duration>, right: Option<Duration>) -> Opti
 fn enqueue_durable_reclaim_work_if_due(
     storage_node: &StorageCluster,
     excluded_object_payload_roots: &HashSet<ObjectPayloadReclaimRoot>,
+    excluded_bucket_delete_begin_roots: &HashSet<BucketDeleteBeginRoot>,
     next_scan_at: &mut Instant,
 ) {
     let now = Instant::now();
     if now < *next_scan_at {
         return;
     }
-    storage_node
-        .enqueue_durable_reclaim_work_excluding_object_payload(excluded_object_payload_roots);
+    storage_node.enqueue_durable_reclaim_work_excluding(
+        excluded_object_payload_roots,
+        excluded_bucket_delete_begin_roots,
+    );
     *next_scan_at = now + RECLAIM_DURABLE_SCAN_INTERVAL;
 }
 
@@ -605,6 +608,7 @@ impl ReclaimSweeper {
                     enqueue_durable_reclaim_work_if_due(
                         &worker_node,
                         &deferred_object_payload_reclaim_roots,
+                        &deferred_bucket_delete_begin_roots,
                         &mut next_durable_scan_at,
                     );
                     let Some(work) = pending_work
@@ -619,6 +623,7 @@ impl ReclaimSweeper {
                             enqueue_durable_reclaim_work_if_due(
                                 &worker_node,
                                 &deferred_object_payload_reclaim_roots,
+                                &deferred_bucket_delete_begin_roots,
                                 &mut next_durable_scan_at,
                             );
                             worker_node.try_take_reclaim_work().or_else(|| {
@@ -780,6 +785,7 @@ impl ReclaimSweeper {
                         enqueue_durable_reclaim_work_if_due(
                             &worker_node,
                             &deferred_object_payload_reclaim_roots,
+                            &deferred_bucket_delete_begin_roots,
                             &mut next_durable_scan_at,
                         );
                         if let Some(work) = worker_node.try_take_reclaim_work() {

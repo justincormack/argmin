@@ -1,6 +1,9 @@
 use s3_http_tests::{create_bucket, run, unique_bucket, CTX};
 use s3_tests::aws_sdk_s3::primitives::ByteStream;
-use s3_tests::{assert_s3_err_code, err_status, sse_c_header_values, test_sse_c_key};
+use s3_tests::{
+    assert_s3_err_code, delete_bucket_retrying_operation_aborted, err_status, sse_c_header_values,
+    test_sse_c_key,
+};
 
 #[test]
 fn test_sse_c_put_requires_https() {
@@ -24,7 +27,7 @@ fn test_sse_c_put_requires_https() {
         assert_eq!(err_status(&result), 400);
         assert_s3_err_code(&result, "InvalidArgument");
 
-        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+        delete_bucket_retrying_operation_aborted(client, &bucket).await;
     });
 }
 
@@ -75,7 +78,7 @@ fn test_sse_c_get_and_head_require_https() {
             .send()
             .await
             .unwrap();
-        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+        delete_bucket_retrying_operation_aborted(client, &bucket).await;
     });
 }
 
@@ -113,6 +116,6 @@ fn test_plain_http_without_sse_c_still_works() {
             .send()
             .await
             .unwrap();
-        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+        delete_bucket_retrying_operation_aborted(client, &bucket).await;
     });
 }

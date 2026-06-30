@@ -1,3 +1,4 @@
+use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::primitives::{ByteStream, DateTime};
 use aws_sdk_s3::types::{
     ObjectCannedAcl, ObjectLockLegalHold, ObjectLockLegalHoldStatus, ObjectLockRetention,
@@ -96,19 +97,43 @@ async fn cleanup_plain_bucket(
         }
     }
 
-    for client in [root_client, non_root_client] {
-        if client
-            .delete_bucket()
-            .bucket(bucket)
-            .send_retrying_operation_aborted("delete object admin bucket during cleanup")
-            .await
-            .is_ok()
-        {
-            return;
+    let mut last_error = None;
+    for attempt in 0..20 {
+        let mut saw_retryable = false;
+        for client in [root_client, non_root_client] {
+            match client
+                .delete_bucket()
+                .bucket(bucket)
+                .send_retrying_operation_aborted("delete object admin bucket during cleanup")
+                .await
+            {
+                Ok(_) => return,
+                Err(err)
+                    if err.as_service_error().and_then(ProvideErrorMetadata::code)
+                        == Some("NoSuchBucket") =>
+                {
+                    return;
+                }
+                Err(err) => {
+                    let raw = format!("{err:?}");
+                    saw_retryable |= raw.contains("OperationAborted")
+                        || raw.contains("BucketNotEmpty")
+                        || raw.contains("NoSuchBucket");
+                    last_error = Some(raw);
+                }
+            }
         }
+        if saw_retryable && attempt < 19 {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            continue;
+        }
+        break;
     }
 
-    panic!("bucket cleanup delete failed for {bucket}");
+    panic!(
+        "bucket cleanup delete failed for {bucket}: {}",
+        last_error.unwrap_or_else(|| "no delete attempt was made".to_string())
+    );
 }
 
 async fn cleanup_object_lock_version(

@@ -1,6 +1,7 @@
 use s3_http_tests::{create_bucket, run, unique_bucket, CTX};
 use s3_tests::{
-    post_object_to_test_endpoint, sigv4_post_sse_c_fields_for_credentials, test_sse_c_key,
+    delete_bucket_retrying_operation_aborted, post_object_to_test_endpoint,
+    sigv4_post_sse_c_fields_for_credentials, test_sse_c_key,
 };
 
 fn assert_error_code(body: &str, code: &str) {
@@ -46,6 +47,6 @@ fn test_post_object_sse_c_requires_https() {
         assert_error_code(&body, "InvalidArgument");
 
         let _ = client.delete_object().bucket(&bucket).key(key).send().await;
-        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+        delete_bucket_retrying_operation_aborted(client, &bucket).await;
     });
 }

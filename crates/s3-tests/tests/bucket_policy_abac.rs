@@ -50,6 +50,11 @@ async fn cleanup_with_client(client: &aws_sdk_s3::Client, bucket: &str, keys: &[
         {
             Ok(_) => return,
             Err(err) => {
+                if err.as_service_error().and_then(ProvideErrorMetadata::code)
+                    == Some("NoSuchBucket")
+                {
+                    return;
+                }
                 let raw = format!("{err:?}");
                 if raw.contains("OperationAborted") || raw.contains("BucketNotEmpty") {
                     tokio::time::sleep(std::time::Duration::from_millis(200)).await;

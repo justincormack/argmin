@@ -2910,6 +2910,143 @@ fn begin_bucket_delete_adopts_active_delete_drain_after_reopen() {
 }
 
 #[test]
+fn durable_scan_queues_active_delete_begin_drain_after_reopen() {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1], ec_shape).unwrap();
+    let bucket = {
+        let topology = map
+            .nodes
+            .get(&NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        bucket_for_pg(topology, 1, "delete-active-drain-scan-")
+    };
+
+    let map = Arc::new(map);
+    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    create_test_bucket(&cluster, &bucket);
+    let bucket_info = cluster.test_head_bucket_raw(&bucket).unwrap();
+    let drain = match cluster.begin_durable_bucket_delete_drain(&bucket).unwrap() {
+        crate::cluster::DurableBucketDeleteDrainBegin::Acquired(drain) => drain,
+        crate::cluster::DurableBucketDeleteDrainBegin::AlreadyDeleting => {
+            panic!("fresh active bucket should acquire delete drain")
+        }
+    };
+    drop(cluster);
+    drop(map);
+
+    let reopened =
+        Arc::new(LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1], ec_shape).unwrap());
+    let reopened_cluster = crate::StorageCluster::from_local_map(Arc::clone(&reopened)).unwrap();
+    let expected_root = crate::BucketDeleteBeginRoot {
+        bucket: bucket.clone(),
+        bucket_execution_generation: bucket_info.bucket_execution_generation,
+        bucket_incarnation_generation: bucket_info.bucket_incarnation_generation,
+    };
+
+    let scan =
+        reopened_cluster.enqueue_durable_bucket_delete_begin_roots_excluding(&HashSet::new());
+    assert_eq!(scan.errors, 0);
+    assert_eq!(scan.queued, 1);
+    assert_eq!(
+        reopened_cluster.try_take_reclaim_work(),
+        Some(crate::ReclaimWorkItem::BucketDeleteBegin(
+            expected_root.clone()
+        ))
+    );
+
+    let excluded = HashSet::from([expected_root]);
+    let scan = reopened_cluster.enqueue_durable_bucket_delete_begin_roots_excluding(&excluded);
+    assert_eq!(scan.errors, 0);
+    assert_eq!(scan.queued, 0);
+    assert_eq!(reopened_cluster.try_take_reclaim_work(), None);
+
+    reopened_cluster
+        .clear_durable_bucket_delete_drain(&drain)
+        .unwrap();
+}
+
+#[test]
+fn durable_scan_paginates_past_excluded_delete_begin_drains() {
+    const PAGE_LIMIT: usize = 16;
+
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1], ec_shape).unwrap();
+    let buckets = {
+        let topology = map
+            .nodes
+            .get(&NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        let mut buckets = Vec::new();
+        for index in 0..=PAGE_LIMIT {
+            buckets.push(bucket_for_pg(
+                topology,
+                1,
+                &format!("delete-begin-page-{index:02}-"),
+            ));
+        }
+        buckets.sort();
+        buckets
+    };
+
+    let map = Arc::new(map);
+    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let mut drains = Vec::new();
+    let mut roots = Vec::new();
+    for bucket in &buckets {
+        create_test_bucket(&cluster, bucket);
+        let bucket_info = cluster.test_head_bucket_raw(bucket).unwrap();
+        let drain = match cluster.begin_durable_bucket_delete_drain(bucket).unwrap() {
+            crate::cluster::DurableBucketDeleteDrainBegin::Acquired(drain) => drain,
+            crate::cluster::DurableBucketDeleteDrainBegin::AlreadyDeleting => {
+                panic!("fresh active bucket should acquire delete drain")
+            }
+        };
+        drains.push(drain);
+        roots.push(crate::BucketDeleteBeginRoot {
+            bucket: bucket.clone(),
+            bucket_execution_generation: bucket_info.bucket_execution_generation,
+            bucket_incarnation_generation: bucket_info.bucket_incarnation_generation,
+        });
+    }
+    drop(cluster);
+    drop(map);
+
+    let reopened =
+        Arc::new(LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1], ec_shape).unwrap());
+    let reopened_cluster = crate::StorageCluster::from_local_map(Arc::clone(&reopened)).unwrap();
+    let excluded = roots
+        .iter()
+        .take(PAGE_LIMIT)
+        .cloned()
+        .collect::<HashSet<_>>();
+
+    let scan = reopened_cluster.enqueue_durable_bucket_delete_begin_roots_excluding(&excluded);
+    assert_eq!(scan.errors, 0);
+    assert_eq!(scan.queued, 1);
+    assert_eq!(
+        reopened_cluster.try_take_reclaim_work(),
+        Some(crate::ReclaimWorkItem::BucketDeleteBegin(
+            roots[PAGE_LIMIT].clone()
+        ))
+    );
+    assert_eq!(reopened_cluster.try_take_reclaim_work(), None);
+
+    for drain in drains {
+        reopened_cluster
+            .clear_durable_bucket_delete_drain(&drain)
+            .unwrap();
+    }
+}
+
+#[test]
 fn begin_bucket_delete_drains_pending_delete_marker_before_emptiness_decision() {
     let tmp = test_util::tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];

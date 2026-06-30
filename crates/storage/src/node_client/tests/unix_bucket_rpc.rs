@@ -1221,7 +1221,7 @@ fn unix_bucket_write_reservation_client_routes_drain_and_finalize_coordination()
     };
     private_socket_dir(config.socket_path.parent().unwrap());
     let server = Arc::new(StorageNodeServer::bind(config.clone()).unwrap());
-    let server_threads: Vec<_> = (0..15)
+    let server_threads: Vec<_> = (0..18)
         .map(|_| {
             let server = Arc::clone(&server);
             thread::spawn(move || server.accept_one().unwrap())
@@ -1318,6 +1318,34 @@ fn unix_bucket_write_reservation_client_routes_drain_and_finalize_coordination()
     .unwrap()
     .expect("expired drain should clear");
     assert_eq!(expired.drain_id, "expired-drain-rpc-1");
+
+    let active_begin_drain = BucketWriteReservationNodeClient::begin_durable_bucket_write_drain(
+        &client,
+        PgId::new(0),
+        &bucket,
+        "active-begin-drain-rpc-1",
+        "active-begin-drain-owner-rpc-1",
+        ClusterEpoch::new(1).unwrap(),
+        61,
+        Some(120),
+    )
+    .unwrap();
+    let begin_roots = BucketWriteReservationNodeClient::get_bucket_delete_begin_roots(
+        &client,
+        PgId::new(0),
+        90,
+        None,
+        16,
+    )
+    .unwrap();
+    assert_eq!(begin_roots.len(), 1);
+    assert_eq!(begin_roots[0].bucket, bucket);
+    BucketWriteReservationNodeClient::clear_durable_bucket_write_drain(
+        &client,
+        PgId::new(0),
+        &active_begin_drain,
+    )
+    .unwrap();
 
     let claim = BucketWriteReservationNodeClient::acquire_bucket_delete_finalize_claim(
         &client,

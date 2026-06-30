@@ -6104,6 +6104,97 @@ impl PgMetadataStore for PgStore {
         }
     }
 
+    fn get_bucket_delete_begin_roots(
+        &self,
+        now: u64,
+        start_after_bucket: Option<&BucketName>,
+        limit: usize,
+    ) -> Result<Vec<crate::BucketDeleteBeginRoot>, MetadataError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let now = i64::try_from(now).map_err(|source| MetadataError::Db {
+            context: "get bucket delete begin roots now",
+            source: rusqlite::Error::ToSqlConversionFailure(Box::new(source)),
+        })?;
+        let limit_i64 = i64::try_from(limit).map_err(|source| MetadataError::Db {
+            context: "get bucket delete begin roots limit",
+            source: rusqlite::Error::ToSqlConversionFailure(Box::new(source)),
+        })?;
+        let mut stmt = self
+            .conn
+            .prepare_cached(
+                "SELECT d.bucket_name, d.bucket_execution_generation, \
+                        b.bucket_incarnation_generation \
+                 FROM bucket_write_drains d \
+                 JOIN buckets b \
+                   ON b.name = d.bucket_name \
+                  AND b.bucket_execution_generation = d.bucket_execution_generation \
+                  AND b.state = ?1 \
+                 WHERE d.lease_deadline IS NOT NULL \
+                   AND d.lease_deadline > ?2 \
+                   AND (?3 IS NULL OR d.bucket_name > ?3) \
+                 ORDER BY d.bucket_name ASC \
+                 LIMIT ?4",
+            )
+            .map_err(|source| MetadataError::Db {
+                context: "prepare get bucket delete begin roots",
+                source,
+            })?;
+        let rows = stmt
+            .query_map(
+                params![
+                    BucketState::Active as u8,
+                    now,
+                    start_after_bucket.map(BucketName::as_str),
+                    limit_i64
+                ],
+                |row| {
+                    let bucket_execution_generation_raw = row.get::<_, i64>(1)?;
+                    let bucket_incarnation_generation_raw = row.get::<_, i64>(2)?;
+                    Ok(crate::BucketDeleteBeginRoot {
+                        bucket: row.get(0)?,
+                        bucket_execution_generation: u64::try_from(
+                            bucket_execution_generation_raw,
+                        )
+                        .map_err(|_| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                1,
+                                rusqlite::types::Type::Integer,
+                                Box::from(format!(
+                                    "invalid bucket_execution_generation: {bucket_execution_generation_raw}"
+                                )),
+                            )
+                        })?,
+                        bucket_incarnation_generation: u64::try_from(
+                            bucket_incarnation_generation_raw,
+                        )
+                        .map_err(|_| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                2,
+                                rusqlite::types::Type::Integer,
+                                Box::from(format!(
+                                    "invalid bucket_incarnation_generation: {bucket_incarnation_generation_raw}"
+                                )),
+                            )
+                        })?,
+                    })
+                },
+            )
+            .map_err(|source| MetadataError::Db {
+                context: "query get bucket delete begin roots",
+                source,
+            })?;
+        let mut roots = Vec::new();
+        for row in rows {
+            roots.push(row.map_err(|source| MetadataError::Db {
+                context: "row get bucket delete begin roots",
+                source,
+            })?);
+        }
+        Ok(roots)
+    }
+
     #[cfg(test)]
     fn put_bucket_versioning(
         &self,

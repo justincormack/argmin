@@ -952,6 +952,47 @@ impl BucketWriteReservationNodeClient for UnixStorageNodeClient {
         Ok(response.roots)
     }
 
+    fn get_bucket_delete_begin_roots(
+        &self,
+        pg_id: PgId,
+        now: u64,
+        start_after_bucket: Option<&BucketName>,
+        limit: usize,
+    ) -> Result<Vec<BucketDeleteBeginRoot>, BucketSnapshotLoadError> {
+        let request = StorageRpcBucketDeleteBeginRootsRequest {
+            route: StorageRpcBucketPgRequest {
+                node_id: self.node_id,
+                cluster_epoch: self.cluster_epoch,
+                pg_id,
+            },
+            now,
+            start_after_bucket: start_after_bucket.cloned(),
+            limit,
+        };
+        let payload = encode_bucket_delete_begin_roots_request(&request).map_err(|error| {
+            BucketSnapshotLoadError::Store(self.rpc_payload_error(
+                "encode bucket delete begin roots request",
+                error.to_string(),
+            ))
+        })?;
+        let response = self
+            .rpc_request(StorageRpcMessageKind::BucketDeleteBeginRoots, payload)
+            .map_err(BucketSnapshotLoadError::Store)?;
+        let response = decode_bucket_delete_begin_roots_response(&response).map_err(|error| {
+            BucketSnapshotLoadError::Store(self.rpc_payload_error(
+                "decode bucket delete begin roots response",
+                error.to_string(),
+            ))
+        })?;
+        if response.roots.len() > limit {
+            return Err(BucketSnapshotLoadError::Store(self.rpc_payload_error(
+                "validate bucket delete begin roots response",
+                "root count exceeds request limit".to_string(),
+            )));
+        }
+        Ok(response.roots)
+    }
+
     fn acquire_bucket_delete_finalize_claim(
         &self,
         pg_id: PgId,

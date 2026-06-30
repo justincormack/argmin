@@ -37,7 +37,7 @@ use crate::pg_store::{MetadataCommandCheckpoint, PgStore};
 use crate::storage_rpc::{
     decode_abort_multipart_cleanup_request, decode_abort_multipart_command_build_request,
     decode_authorized_abort_multipart_command_build_request, decode_bucket_batch_request,
-    decode_bucket_delete_attempt_outcome_record_request,
+    decode_bucket_delete_attempt_outcome_record_request, decode_bucket_delete_begin_roots_request,
     decode_bucket_delete_finalize_claim_acquire_request,
     decode_bucket_delete_finalize_claim_record_request,
     decode_bucket_delete_finalize_roots_request, decode_bucket_list_request,
@@ -104,6 +104,7 @@ use crate::storage_rpc::{
     decode_stream_upload_session_request, decode_stream_uploads_list_request,
     decode_stream_uploads_pg_list_request, encode_abort_multipart_cleanup_response,
     encode_bucket_delete_attempt_outcome_optional_record_response,
+    encode_bucket_delete_begin_roots_response,
     encode_bucket_delete_finalize_claim_optional_record_response,
     encode_bucket_delete_finalize_roots_response, encode_bucket_delete_finalized_response,
     encode_bucket_execution_generations_response, encode_bucket_fast_path_identities_response,
@@ -161,8 +162,8 @@ use crate::storage_rpc::{
     StorageRpcAbortMultipartCommandBuildRequest,
     StorageRpcAuthorizedAbortMultipartCommandBuildRequest, StorageRpcBucketBatchRequest,
     StorageRpcBucketDeleteAttemptOutcomeOptionalRecordResponse,
-    StorageRpcBucketDeleteAttemptOutcomeRecordRequest,
-    StorageRpcBucketDeleteFinalizeClaimAcquireRequest,
+    StorageRpcBucketDeleteAttemptOutcomeRecordRequest, StorageRpcBucketDeleteBeginRootsRequest,
+    StorageRpcBucketDeleteBeginRootsResponse, StorageRpcBucketDeleteFinalizeClaimAcquireRequest,
     StorageRpcBucketDeleteFinalizeClaimOptionalRecordResponse,
     StorageRpcBucketDeleteFinalizeClaimRecordRequest, StorageRpcBucketDeleteFinalizeRootsRequest,
     StorageRpcBucketDeleteFinalizeRootsResponse, StorageRpcBucketDeleteFinalizedOutcome,
@@ -1758,6 +1759,15 @@ impl StorageNodeConnectionHandler {
             StorageRpcMessageKind::BucketDeleteFinalizeRoots => {
                 match decode_bucket_delete_finalize_roots_request(&frame.payload) {
                     Ok(request) => self.bucket_delete_finalize_roots_response(request),
+                    Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
+                        code: StorageRpcErrorCode::PayloadDecode,
+                        message: error.to_string(),
+                    }),
+                }
+            }
+            StorageRpcMessageKind::BucketDeleteBeginRoots => {
+                match decode_bucket_delete_begin_roots_request(&frame.payload) {
+                    Ok(request) => self.bucket_delete_begin_roots_response(request),
                     Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
                         code: StorageRpcErrorCode::PayloadDecode,
                         message: error.to_string(),
@@ -3622,6 +3632,40 @@ impl StorageNodeConnectionHandler {
             Ok(roots) => {
                 let payload = encode_bucket_delete_finalize_roots_response(
                     &StorageRpcBucketDeleteFinalizeRootsResponse { roots },
+                )?;
+                Ok(encode_storage_rpc_success_response(&payload))
+            }
+            Err(error) => encode_storage_rpc_error_response(&bucket_snapshot_error_response(error)),
+        }
+    }
+
+    fn bucket_delete_begin_roots_response(
+        &self,
+        request: StorageRpcBucketDeleteBeginRootsRequest,
+    ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
+        if let Err(error) = self.validate_pg_route(
+            request.route.node_id,
+            request.route.cluster_epoch,
+            request.route.pg_id,
+        ) {
+            return encode_storage_rpc_error_response(&error);
+        }
+        if let Err(error) =
+            self.validate_primary_pg(request.route.pg_id, "bucket delete begin roots")
+        {
+            return encode_storage_rpc_error_response(&error);
+        }
+        let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
+        match BucketWriteReservationNodeClient::get_bucket_delete_begin_roots(
+            &local_client,
+            request.route.pg_id,
+            request.now,
+            request.start_after_bucket.as_ref(),
+            request.limit,
+        ) {
+            Ok(roots) => {
+                let payload = encode_bucket_delete_begin_roots_response(
+                    &StorageRpcBucketDeleteBeginRootsResponse { roots },
                 )?;
                 Ok(encode_storage_rpc_success_response(&payload))
             }

@@ -870,6 +870,22 @@ impl BucketWriteReservationNodeClient for LocalStorageNodeClient {
         <Self as StorageNodeClient>::get_bucket_delete_finalize_roots(self, pg_id, now, limit)
     }
 
+    fn get_bucket_delete_begin_roots(
+        &self,
+        pg_id: PgId,
+        now: u64,
+        start_after_bucket: Option<&BucketName>,
+        limit: usize,
+    ) -> Result<Vec<BucketDeleteBeginRoot>, BucketSnapshotLoadError> {
+        <Self as StorageNodeClient>::get_bucket_delete_begin_roots(
+            self,
+            pg_id,
+            now,
+            start_after_bucket,
+            limit,
+        )
+    }
+
     fn acquire_bucket_delete_finalize_claim(
         &self,
         pg_id: PgId,
@@ -3748,6 +3764,22 @@ impl StorageNodeClient for LocalStorageNodeClient {
         let pg = self.storage_node.get_pg(pg_id.get())?;
         Ok(PgMetadataStore::get_bucket_delete_finalize_roots(
             &*pg, now, limit,
+        )?)
+    }
+
+    fn get_bucket_delete_begin_roots(
+        &self,
+        pg_id: PgId,
+        now: u64,
+        start_after_bucket: Option<&BucketName>,
+        limit: usize,
+    ) -> Result<Vec<BucketDeleteBeginRoot>, BucketSnapshotLoadError> {
+        let pg = self.storage_node.get_pg(pg_id.get())?;
+        Ok(PgMetadataStore::get_bucket_delete_begin_roots(
+            &*pg,
+            now,
+            start_after_bucket,
+            limit,
         )?)
     }
 

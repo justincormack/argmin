@@ -2,8 +2,8 @@ use std::time::Duration;
 
 use s3_http_tests::{create_bucket, run, test_agent, unique_bucket, CTX};
 use s3_tests::{
-    object_url, presign_url_with_credentials, sse_c_header_values, test_sse_c_key,
-    SignedRequestCredentials,
+    delete_bucket_retrying_operation_aborted, object_url, presign_url_with_credentials,
+    sse_c_header_values, test_sse_c_key, SignedRequestCredentials,
 };
 
 macro_rules! with_presigned_headers {
@@ -61,6 +61,6 @@ fn test_presigned_sse_c_put_requires_https() {
             "expected InvalidArgument, got {body}"
         );
 
-        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+        delete_bucket_retrying_operation_aborted(client, &bucket).await;
     });
 }

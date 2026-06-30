@@ -2,7 +2,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use s3_tests::{
     aws_sdk_s3::{self, primitives::ByteStream},
-    build_client_with_ca, err_status, TestServer, RT,
+    build_client_with_ca, delete_bucket_retrying_operation_aborted, err_status, TestServer, RT,
 };
 
 static BUCKET_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -41,7 +41,7 @@ fn test_bucket_create_naming_good_starts_alpha() {
         let (_server, client) = local_client().await;
         let bucket = format!("abc-{}", unique_bucket());
         client.create_bucket().bucket(&bucket).send().await.unwrap();
-        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+        delete_bucket_retrying_operation_aborted(&client, &bucket).await;
     });
 }
 
@@ -51,7 +51,7 @@ fn test_bucket_create_naming_good_starts_digit() {
         let (_server, client) = local_client().await;
         let bucket = format!("3bucket-{}", unique_bucket());
         client.create_bucket().bucket(&bucket).send().await.unwrap();
-        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+        delete_bucket_retrying_operation_aborted(&client, &bucket).await;
     });
 }
 
@@ -61,7 +61,7 @@ fn test_bucket_create_naming_good_contains_period() {
         let (_server, client) = local_client().await;
         let bucket = format!("foo.bar.{}", unique_bucket());
         client.create_bucket().bucket(&bucket).send().await.unwrap();
-        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+        delete_bucket_retrying_operation_aborted(&client, &bucket).await;
     });
 }
 
@@ -71,7 +71,7 @@ fn test_bucket_create_naming_good_contains_hyphen() {
         let (_server, client) = local_client().await;
         let bucket = format!("foo-bar-{}", unique_bucket());
         client.create_bucket().bucket(&bucket).send().await.unwrap();
-        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+        delete_bucket_retrying_operation_aborted(&client, &bucket).await;
     });
 }
 
@@ -87,7 +87,7 @@ fn test_bucket_create_naming_good_long_63() {
         };
         assert_eq!(bucket.len(), 63);
         client.create_bucket().bucket(&bucket).send().await.unwrap();
-        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+        delete_bucket_retrying_operation_aborted(&client, &bucket).await;
     });
 }
 
@@ -97,7 +97,7 @@ fn test_bucket_create_naming_good_three_chars() {
         let (_server, client) = local_client().await;
         let bucket = "abc";
         client.create_bucket().bucket(bucket).send().await.unwrap();
-        client.delete_bucket().bucket(bucket).send().await.unwrap();
+        delete_bucket_retrying_operation_aborted(&client, bucket).await;
     });
 }
 
@@ -107,7 +107,7 @@ fn test_bucket_create_naming_good_all_digits() {
         let (_server, client) = local_client().await;
         let bucket = "123456";
         client.create_bucket().bucket(bucket).send().await.unwrap();
-        client.delete_bucket().bucket(bucket).send().await.unwrap();
+        delete_bucket_retrying_operation_aborted(&client, bucket).await;
     });
 }
 
@@ -143,7 +143,7 @@ fn test_bucket_create_naming_good_has_period_put_get() {
             .send()
             .await
             .unwrap();
-        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+        delete_bucket_retrying_operation_aborted(&client, &bucket).await;
     });
 }
 
@@ -179,7 +179,7 @@ fn test_bucket_create_naming_good_has_hyphen_put_get() {
             .send()
             .await
             .unwrap();
-        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+        delete_bucket_retrying_operation_aborted(&client, &bucket).await;
     });
 }
 
@@ -380,7 +380,7 @@ fn test_bucket_create_naming_good_long_60() {
         };
         assert_eq!(bucket.len(), 60);
         client.create_bucket().bucket(&bucket).send().await.unwrap();
-        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+        delete_bucket_retrying_operation_aborted(&client, &bucket).await;
     });
 }
 
@@ -396,7 +396,7 @@ fn test_bucket_create_naming_good_long_61() {
         };
         assert_eq!(bucket.len(), 61);
         client.create_bucket().bucket(&bucket).send().await.unwrap();
-        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+        delete_bucket_retrying_operation_aborted(&client, &bucket).await;
     });
 }
 
@@ -412,7 +412,7 @@ fn test_bucket_create_naming_good_long_62() {
         };
         assert_eq!(bucket.len(), 62);
         client.create_bucket().bucket(&bucket).send().await.unwrap();
-        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+        delete_bucket_retrying_operation_aborted(&client, &bucket).await;
     });
 }
 

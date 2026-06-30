@@ -296,6 +296,14 @@ pub(crate) trait BucketWriteReservationNodeClient: Send + Sync {
         limit: usize,
     ) -> Result<Vec<BucketDeleteFinalizeRoot>, BucketSnapshotLoadError>;
 
+    fn get_bucket_delete_begin_roots(
+        &self,
+        pg_id: PgId,
+        now: u64,
+        start_after_bucket: Option<&BucketName>,
+        limit: usize,
+    ) -> Result<Vec<BucketDeleteBeginRoot>, BucketSnapshotLoadError>;
+
     #[allow(clippy::too_many_arguments)]
     fn acquire_bucket_delete_finalize_claim(
         &self,
@@ -1899,6 +1907,14 @@ pub(crate) trait StorageNodeClient:
         now: u64,
         limit: usize,
     ) -> Result<Vec<BucketDeleteFinalizeRoot>, BucketSnapshotLoadError>;
+
+    fn get_bucket_delete_begin_roots(
+        &self,
+        pg_id: PgId,
+        now: u64,
+        start_after_bucket: Option<&BucketName>,
+        limit: usize,
+    ) -> Result<Vec<BucketDeleteBeginRoot>, BucketSnapshotLoadError>;
 
     #[allow(clippy::too_many_arguments)]
     fn acquire_bucket_delete_finalize_claim(

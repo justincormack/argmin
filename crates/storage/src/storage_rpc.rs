@@ -61,7 +61,7 @@ use crate::{
         PLACED_SEGMENT_SHARD_REPAIR_OWNER_TOKEN_MAX_LEN, SESSION_ID_LEN, SHARD_KEY_LEN,
         UPLOAD_ID_LEN,
     },
-    BucketName, NodeId,
+    BucketDeleteBeginRoot, BucketName, NodeId,
 };
 use s3_types::{
     AclGrants, BucketObjectLockConfig, BucketVersioningState, CanonicalUserId,
@@ -459,10 +459,20 @@ const STORAGE_RPC_MAX_BUCKET_WRITE_RESERVATIONS_LIST_PAYLOAD_LEN: usize =
     STORAGE_RPC_MAX_BUCKET_REQUEST_PAYLOAD_LEN;
 const STORAGE_RPC_MAX_BUCKET_DELETE_FINALIZE_ROOTS_REQUEST_PAYLOAD_LEN: usize =
     STORAGE_RPC_MAX_METADATA_COMMAND_STATE_PAYLOAD_LEN + 8 + 4;
+const STORAGE_RPC_MAX_BUCKET_DELETE_BEGIN_ROOTS_REQUEST_PAYLOAD_LEN: usize =
+    STORAGE_RPC_MAX_METADATA_COMMAND_STATE_PAYLOAD_LEN
+        + 8
+        + 1
+        + 4
+        + STORAGE_RPC_MAX_BUCKET_NAME_LEN
+        + 4;
 const STORAGE_RPC_MAX_BUCKET_DELETE_FINALIZE_ROOTS: usize = 1024;
+const STORAGE_RPC_MAX_BUCKET_DELETE_BEGIN_ROOTS: usize = 1024;
 const STORAGE_RPC_MAX_LIFECYCLE_SWEEP_ROOTS: usize = 1024;
 const STORAGE_RPC_BUCKET_DELETE_FINALIZE_ROOT_MAX_LEN: usize =
     STORAGE_RPC_MAX_BUCKET_NAME_FIELD_LEN + 8;
+const STORAGE_RPC_BUCKET_DELETE_BEGIN_ROOT_MAX_LEN: usize =
+    STORAGE_RPC_MAX_BUCKET_NAME_FIELD_LEN + 8 + 8;
 const STORAGE_RPC_BUCKET_DELETE_FINALIZE_CLAIM_RECORD_MAX_LEN: usize =
     STORAGE_RPC_MAX_BUCKET_NAME_FIELD_LEN
         + 8
@@ -688,6 +698,7 @@ pub(crate) enum StorageRpcMessageKind {
     BucketWriteDrainGet = 155,
     BucketDeleteAttemptOutcomeRecord = 156,
     BucketDeleteAttemptOutcomeGet = 157,
+    BucketDeleteBeginRoots = 158,
     BucketWriteDrainHeartbeat = 124,
     MetadataCommandRetainedLogHashes = 125,
     MetadataCommandRetainedLogEntries = 126,
@@ -917,6 +928,7 @@ impl StorageRpcMessageKind {
             Self::BucketWriteReservationsList => "bucket write reservations list",
             Self::BucketDeleteFinalized => "bucket delete finalized",
             Self::BucketDeleteFinalizeRoots => "bucket delete finalize roots",
+            Self::BucketDeleteBeginRoots => "bucket delete begin roots",
             Self::BucketDeleteFinalizeClaimAcquire => "bucket delete finalize claim acquire",
             Self::BucketDeleteFinalizeClaimRelease => "bucket delete finalize claim release",
             Self::BucketMetadataControlPendingMatch => "bucket metadata control pending match",
@@ -1109,6 +1121,7 @@ impl StorageRpcMessageKind {
             155 => Ok(Self::BucketWriteDrainGet),
             156 => Ok(Self::BucketDeleteAttemptOutcomeRecord),
             157 => Ok(Self::BucketDeleteAttemptOutcomeGet),
+            158 => Ok(Self::BucketDeleteBeginRoots),
             124 => Ok(Self::BucketWriteDrainHeartbeat),
             125 => Ok(Self::MetadataCommandRetainedLogHashes),
             126 => Ok(Self::MetadataCommandRetainedLogEntries),
@@ -1380,6 +1393,19 @@ pub(crate) struct StorageRpcBucketDeleteFinalizeRootsRequest {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StorageRpcBucketDeleteFinalizeRootsResponse {
     pub(crate) roots: Vec<BucketDeleteFinalizeRoot>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StorageRpcBucketDeleteBeginRootsRequest {
+    pub(crate) route: StorageRpcBucketPgRequest,
+    pub(crate) now: u64,
+    pub(crate) start_after_bucket: Option<BucketName>,
+    pub(crate) limit: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StorageRpcBucketDeleteBeginRootsResponse {
+    pub(crate) roots: Vec<BucketDeleteBeginRoot>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3684,6 +3710,9 @@ fn message_kind_request_max_payload_len(
         }
         StorageRpcMessageKind::BucketDeleteFinalizeRoots => {
             STORAGE_RPC_MAX_BUCKET_DELETE_FINALIZE_ROOTS_REQUEST_PAYLOAD_LEN
+        }
+        StorageRpcMessageKind::BucketDeleteBeginRoots => {
+            STORAGE_RPC_MAX_BUCKET_DELETE_BEGIN_ROOTS_REQUEST_PAYLOAD_LEN
         }
         StorageRpcMessageKind::BucketDeleteFinalizeClaimAcquire => {
             STORAGE_RPC_MAX_BUCKET_DELETE_FINALIZE_CLAIM_ACQUIRE_PAYLOAD_LEN
@@ -11471,6 +11500,108 @@ pub(crate) fn decode_bucket_delete_finalize_roots_response(
     Ok(StorageRpcBucketDeleteFinalizeRootsResponse { roots })
 }
 
+pub(crate) fn encode_bucket_delete_begin_roots_request(
+    request: &StorageRpcBucketDeleteBeginRootsRequest,
+) -> Result<Vec<u8>, StorageRpcPayloadError> {
+    if request.limit > STORAGE_RPC_MAX_BUCKET_DELETE_BEGIN_ROOTS {
+        return Err(StorageRpcPayloadError::PayloadTooLarge {
+            len: request.limit,
+            limit: STORAGE_RPC_MAX_BUCKET_DELETE_BEGIN_ROOTS,
+        });
+    }
+    let mut out = encode_bucket_pg_request(&request.route)?;
+    put_u64(&mut out, request.now);
+    put_optional_string(
+        &mut out,
+        request.start_after_bucket.as_ref().map(BucketName::as_str),
+    );
+    put_u32(
+        &mut out,
+        u32::try_from(request.limit).map_err(|_| StorageRpcPayloadError::PayloadTooLarge {
+            len: request.limit,
+            limit: u32::MAX as usize,
+        })?,
+    );
+    Ok(out)
+}
+
+pub(crate) fn decode_bucket_delete_begin_roots_request(
+    bytes: &[u8],
+) -> Result<StorageRpcBucketDeleteBeginRootsRequest, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let route = decoder.read_bucket_pg_request()?;
+    let now = decoder.read_u64()?;
+    let start_after_bucket = decoder
+        .read_optional_string_with_limit(
+            STORAGE_RPC_MAX_BUCKET_NAME_LEN,
+            StorageRpcPayloadError::InvalidDurableClaimToken("bucket name exceeds maximum length"),
+        )?
+        .map(BucketName::try_from)
+        .transpose()
+        .map_err(|_| StorageRpcPayloadError::InvalidDurableClaimToken("invalid bucket name"))?;
+    let limit = decoder.read_u32()? as usize;
+    decoder.finish()?;
+    if limit > STORAGE_RPC_MAX_BUCKET_DELETE_BEGIN_ROOTS {
+        return Err(StorageRpcPayloadError::PayloadTooLarge {
+            len: limit,
+            limit: STORAGE_RPC_MAX_BUCKET_DELETE_BEGIN_ROOTS,
+        });
+    }
+    Ok(StorageRpcBucketDeleteBeginRootsRequest {
+        route,
+        now,
+        start_after_bucket,
+        limit,
+    })
+}
+
+pub(crate) fn encode_bucket_delete_begin_roots_response(
+    response: &StorageRpcBucketDeleteBeginRootsResponse,
+) -> Result<Vec<u8>, StorageRpcPayloadError> {
+    if response.roots.len() > STORAGE_RPC_MAX_BUCKET_DELETE_BEGIN_ROOTS {
+        return Err(StorageRpcPayloadError::PayloadTooLarge {
+            len: response.roots.len(),
+            limit: STORAGE_RPC_MAX_BUCKET_DELETE_BEGIN_ROOTS,
+        });
+    }
+    let mut out = Vec::new();
+    put_u32(
+        &mut out,
+        u32::try_from(response.roots.len()).map_err(|_| {
+            StorageRpcPayloadError::PayloadTooLarge {
+                len: response.roots.len(),
+                limit: u32::MAX as usize,
+            }
+        })?,
+    );
+    for root in &response.roots {
+        put_bucket_delete_begin_root(&mut out, root);
+    }
+    Ok(out)
+}
+
+pub(crate) fn decode_bucket_delete_begin_roots_response(
+    bytes: &[u8],
+) -> Result<StorageRpcBucketDeleteBeginRootsResponse, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let count = decoder.read_bounded_remaining_count(
+        STORAGE_RPC_BUCKET_DELETE_BEGIN_ROOT_MAX_LEN.min(1),
+        "bucket delete begin root count exceeds payload",
+    )?;
+    if count > STORAGE_RPC_MAX_BUCKET_DELETE_BEGIN_ROOTS {
+        return Err(StorageRpcPayloadError::PayloadTooLarge {
+            len: count,
+            limit: STORAGE_RPC_MAX_BUCKET_DELETE_BEGIN_ROOTS,
+        });
+    }
+    let mut roots = Vec::new();
+    for _ in 0..count {
+        roots.push(decoder.read_bucket_delete_begin_root()?);
+    }
+    decoder.finish()?;
+    Ok(StorageRpcBucketDeleteBeginRootsResponse { roots })
+}
+
 pub(crate) fn encode_bucket_delete_finalize_claim_acquire_request(
     request: &StorageRpcBucketDeleteFinalizeClaimAcquireRequest,
 ) -> Result<Vec<u8>, StorageRpcPayloadError> {
@@ -12607,6 +12738,16 @@ impl<'a> StorageRpcDecoder<'a> {
     ) -> Result<BucketDeleteFinalizeRoot, StorageRpcPayloadError> {
         Ok(BucketDeleteFinalizeRoot {
             bucket: self.read_bucket_name()?,
+            bucket_incarnation_generation: self.read_u64()?,
+        })
+    }
+
+    fn read_bucket_delete_begin_root(
+        &mut self,
+    ) -> Result<BucketDeleteBeginRoot, StorageRpcPayloadError> {
+        Ok(BucketDeleteBeginRoot {
+            bucket: self.read_bucket_name()?,
+            bucket_execution_generation: self.read_u64()?,
             bucket_incarnation_generation: self.read_u64()?,
         })
     }
@@ -15044,6 +15185,12 @@ fn put_bucket_delete_attempt_outcome_record(
 
 fn put_bucket_delete_finalize_root(out: &mut Vec<u8>, root: &BucketDeleteFinalizeRoot) {
     put_string(out, root.bucket.as_str());
+    put_u64(out, root.bucket_incarnation_generation);
+}
+
+fn put_bucket_delete_begin_root(out: &mut Vec<u8>, root: &BucketDeleteBeginRoot) {
+    put_string(out, root.bucket.as_str());
+    put_u64(out, root.bucket_execution_generation);
     put_u64(out, root.bucket_incarnation_generation);
 }
 

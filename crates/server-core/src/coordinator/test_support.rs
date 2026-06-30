@@ -665,6 +665,25 @@ pub(crate) fn delete_bucket_test(coord: &Coordinator, name: &str) -> Result<(), 
     ))
 }
 
+pub(crate) fn delete_bucket_eventually_test(
+    coord: &Coordinator,
+    name: &str,
+) -> Result<(), ServerError> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match delete_bucket_test(coord, name) {
+            Ok(()) => return Ok(()),
+            Err(ServerError::OperationAborted) if Instant::now() < deadline => {
+                let _ = coord
+                    .read_runtime()
+                    .try_finalize_bucket_delete_for(&trusted_bucket_name(name));
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err(err) => return Err(err),
+        }
+    }
+}
+
 pub(crate) fn bucket_request_with_expected_owner<'a>(
     name: &'a str,
     requester: Requester,

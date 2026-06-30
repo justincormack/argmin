@@ -9056,7 +9056,7 @@ Keep an explicit Phase 11 close-out before treating the phase as soak-clean:
          best-effort from `DeleteBucket` begin. This is diagnostic state only;
          background adoption and resumable proof frontiers are still tracked by
          later items.
-      3. status: partial. Add a background worker path that advances the same state machine used
+      3. status: completed. Add a background worker path that advances the same state machine used
          by foreground requests rather than inventing a second cleanup path. The
          current slice queues a distinct background `BucketDeleteBegin` reclaim
          item when foreground begin work preserves a retryable active drain, and
@@ -9066,10 +9066,12 @@ Keep an explicit Phase 11 close-out before treating the phase as soak-clean:
          across early retryable route/map failures with a cooldown instead of
          being dropped or hot-looped, stale roots are dropped when the bucket is
          deleted/recreated, and a successful background begin enqueues the
-         normal bucket-delete finalizer work. Durable scanning of
-         already-preserved active drains after process restart still needs a
-         follow-up scan/RPC shape; finalizer work remains a separate
-         `BucketDelete` queue item.
+         normal bucket-delete finalizer work. Durable reclaim scans now find
+         unexpired active delete-begin drains on bucket PGs, including over the
+         Unix storage-node RPC boundary used by UAT, and enqueue the same
+         generation-fenced `BucketDeleteBegin` root after process restart or
+         volatile queue loss. Finalizer work remains a separate `BucketDelete`
+         queue item.
       4. status: open. Add durable proof progress/frontiers for the expensive all-object-PG
          exact-bucket drain once the attempt can already survive and be adopted.
       5. status: open. Revisit reservation classification only after attempts are resumable;

@@ -1317,7 +1317,7 @@ fn delete_bucket_drains_unqueued_payload_reclaim() {
         )
         .unwrap();
 
-    delete_bucket_test(&coord, "bucket").unwrap();
+    delete_bucket_eventually_test(&coord, "bucket").unwrap();
     assert!(matches!(
         coord.unchecked_active_bucket_summary("bucket"),
         Err(ServerError::BucketNotFound { .. })
@@ -1467,7 +1467,7 @@ fn create_bucket_reuse_drains_unleased_multipart_reclaim_without_worker() {
             NO_DELETE,
         ))
         .unwrap();
-    delete_bucket_test(&coord, "bucket").unwrap();
+    delete_bucket_eventually_test(&coord, "bucket").unwrap();
 
     coord
         .create_bucket_for_owner("default-owner", "bucket", false)

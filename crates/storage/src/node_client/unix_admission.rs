@@ -552,6 +552,7 @@ pub(crate) fn storage_rpc_admission_class(
         | StorageRpcMessageKind::BucketDeleteAttemptOutcomeGet
         | StorageRpcMessageKind::BucketDeleteFinalized
         | StorageRpcMessageKind::BucketDeleteFinalizeRoots
+        | StorageRpcMessageKind::BucketDeleteBeginRoots
         | StorageRpcMessageKind::BucketDeleteFinalizeClaimAcquire
         | StorageRpcMessageKind::BucketDeleteFinalizeClaimRelease
         | StorageRpcMessageKind::BucketMarkDeletingCommandBuild

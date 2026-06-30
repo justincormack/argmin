@@ -229,6 +229,14 @@ pub(crate) trait PgMetadataStore {
         name: &BucketName,
     ) -> Result<Option<BucketDeleteAttemptOutcomeRecord>, MetadataError>;
 
+    /// Find active, unexpired DeleteBucket begin drains that should be retried.
+    fn get_bucket_delete_begin_roots(
+        &self,
+        now: u64,
+        start_after_bucket: Option<&BucketName>,
+        limit: usize,
+    ) -> Result<Vec<crate::BucketDeleteBeginRoot>, MetadataError>;
+
     /// Set bucket versioning state.
     ///
     /// Validates transitions: Disabled→Enabled and Enabled↔Suspended are allowed.

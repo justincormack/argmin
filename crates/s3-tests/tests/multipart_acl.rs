@@ -69,6 +69,9 @@ async fn cleanup(bucket: &str, keys: &[&str]) {
             Ok(_) => return,
             Err(err) => {
                 let raw = format!("{err:?}");
+                if raw.contains("NoSuchBucket") {
+                    return;
+                }
                 if raw.contains("OperationAborted") || raw.contains("BucketNotEmpty") {
                     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
                     continue;

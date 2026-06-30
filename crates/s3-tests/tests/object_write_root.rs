@@ -61,19 +61,7 @@ async fn cleanup_plain_bucket(
         }
     }
 
-    for client in [root_client, non_root_client] {
-        if client
-            .delete_bucket()
-            .bucket(bucket)
-            .send_retrying_operation_aborted("delete bucket during root write cleanup")
-            .await
-            .is_ok()
-        {
-            return;
-        }
-    }
-
-    panic!("bucket cleanup delete failed for {bucket}");
+    s3_tests::delete_bucket_retrying_operation_aborted(root_client, bucket).await;
 }
 
 #[test]

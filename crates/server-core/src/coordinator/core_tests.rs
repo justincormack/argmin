@@ -8934,7 +8934,10 @@ fn delete_bucket_route_map_expiry_after_drain_maps_to_operation_aborted() {
     let valid_until = storage::clock::wall_time_millis().saturating_add(250);
     let expiring_cluster =
         same_store_cluster_with_route_map_validity(&storage_cluster, tmp.path(), Some(valid_until));
-    let expiring_coord = setup_direct_coordinator_with_storage_cluster(expiring_cluster);
+    let expiring_coord =
+        setup_same_process_coordinator_with_storage_cluster_without_background_sweepers(
+            expiring_cluster,
+        );
 
     let _storage_serial = STORAGE_TEST_HOOK_SERIAL
         .get_or_init(|| Mutex::new(()))
