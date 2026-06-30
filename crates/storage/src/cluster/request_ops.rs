@@ -180,6 +180,10 @@ type BucketDeleteCommandIdTestHook = Arc<dyn Fn() + Send + Sync>;
 pub type BucketDeletePostReservationProgressTestHook =
     Arc<dyn Fn(u32) -> Result<(), StoreError> + Send + Sync>;
 
+#[cfg(any(test, feature = "test-hooks"))]
+pub type BucketDeleteExactDrainStartTestHook =
+    Arc<dyn Fn(bool, u32) -> Result<(), StoreError> + Send + Sync>;
+
 #[cfg(test)]
 type CompletedMultipartOrderCommandIdTestHook = Arc<dyn Fn() + Send + Sync>;
 
@@ -216,6 +220,11 @@ static BEFORE_BUCKET_DELETE_COMMAND_ID_HOOKS: OnceLock<
 #[cfg(any(test, feature = "test-hooks"))]
 static AFTER_BUCKET_DELETE_POST_RESERVATION_PROGRESS_HOOKS: OnceLock<
     Mutex<HashMap<usize, BucketDeletePostReservationProgressTestHook>>,
+> = OnceLock::new();
+
+#[cfg(any(test, feature = "test-hooks"))]
+static BEFORE_BUCKET_DELETE_EXACT_DRAIN_HOOKS: OnceLock<
+    Mutex<HashMap<usize, BucketDeleteExactDrainStartTestHook>>,
 > = OnceLock::new();
 
 #[cfg(test)]
@@ -260,6 +269,11 @@ pub(crate) struct BucketDeleteCommandIdTestHookGuard {
 
 #[cfg(any(test, feature = "test-hooks"))]
 pub struct BucketDeletePostReservationProgressTestHookGuard {
+    scope_id: usize,
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+pub struct BucketDeleteExactDrainStartTestHookGuard {
     scope_id: usize,
 }
 
@@ -344,6 +358,18 @@ impl Drop for BucketDeletePostReservationProgressTestHookGuard {
     fn drop(&mut self) {
         let hooks = AFTER_BUCKET_DELETE_POST_RESERVATION_PROGRESS_HOOKS
             .get_or_init(|| Mutex::new(HashMap::new()));
+        hooks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.scope_id);
+    }
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+impl Drop for BucketDeleteExactDrainStartTestHookGuard {
+    fn drop(&mut self) {
+        let hooks =
+            BEFORE_BUCKET_DELETE_EXACT_DRAIN_HOOKS.get_or_init(|| Mutex::new(HashMap::new()));
         hooks
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -485,6 +511,24 @@ fn maybe_run_after_bucket_delete_post_reservation_progress_hook(
         .cloned();
     if let Some(hook) = hook {
         hook(_next_object_pg_id)?;
+    }
+    Ok(())
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+fn maybe_run_before_bucket_delete_exact_drain_hook(
+    _scope_id: usize,
+    _has_progress: bool,
+    _next_object_pg_id: u32,
+) -> Result<(), StoreError> {
+    let hook = BEFORE_BUCKET_DELETE_EXACT_DRAIN_HOOKS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&_scope_id)
+        .cloned();
+    if let Some(hook) = hook {
+        hook(_has_progress, _next_object_pg_id)?;
     }
     Ok(())
 }
@@ -803,6 +847,20 @@ impl super::StorageCluster {
             .unwrap_or_else(|e| e.into_inner())
             .insert(scope_id, hook);
         BucketDeletePostReservationProgressTestHookGuard { scope_id }
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_install_before_bucket_delete_exact_drain_hook(
+        &self,
+        hook: BucketDeleteExactDrainStartTestHook,
+    ) -> BucketDeleteExactDrainStartTestHookGuard {
+        let scope_id = self.metadata_command_apply_test_hook_scope_id();
+        let slot =
+            BEFORE_BUCKET_DELETE_EXACT_DRAIN_HOOKS.get_or_init(|| Mutex::new(HashMap::new()));
+        slot.lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(scope_id, hook);
+        BucketDeleteExactDrainStartTestHookGuard { scope_id }
     }
 
     #[cfg(test)]
@@ -2319,6 +2377,45 @@ impl super::StorageCluster {
         self.begin_durable_bucket_delete_drain_with_budget(bucket, None)
     }
 
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_seed_bucket_delete_attempt_outcome(
+        &self,
+        bucket: &BucketName,
+        outcome: BucketDeleteAttemptOutcomeKind,
+        phase: BucketDeleteAttemptPhase,
+        detail: String,
+        post_reservation_next_object_pg_id: Option<u32>,
+    ) -> Result<(), BucketWriteDrainError> {
+        let drain = match self.begin_durable_bucket_delete_drain(bucket)? {
+            super::DurableBucketDeleteDrainBegin::Acquired(drain) => drain,
+            super::DurableBucketDeleteDrainBegin::AlreadyDeleting => {
+                return Err(StoreError::MetadataCommandContention {
+                    context: "test seed bucket delete attempt outcome already deleting",
+                }
+                .into());
+            }
+        };
+        let pg_id = PgId::new(drain.pg_id);
+        let node = self
+            .local_map
+            .metadata_pg_primary_node(self.operation_epoch(), pg_id)
+            .map_err(BucketWriteDrainError::from)?;
+        let record = BucketDeleteAttemptOutcomeRecord {
+            bucket: drain.record.bucket.clone(),
+            drain_id: drain.record.drain_id.clone(),
+            cluster_epoch: drain.record.cluster_epoch,
+            bucket_execution_generation: drain.record.bucket_execution_generation,
+            outcome,
+            phase,
+            detail,
+            post_reservation_next_object_pg_id,
+            updated_at: crate::clock::current_time_millis(),
+        };
+        node.bucket_write_reservation_client()
+            .record_bucket_delete_attempt_outcome(pg_id, &record)
+            .map_err(bucket_snapshot_error_to_bucket_write_drain_error)
+    }
+
     fn begin_durable_bucket_delete_drain_with_budget(
         &self,
         bucket: &BucketName,
@@ -2882,6 +2979,13 @@ impl super::StorageCluster {
                 .unwrap_or(0),
             None => 0,
         };
+        #[cfg(any(test, feature = "test-hooks"))]
+        maybe_run_before_bucket_delete_exact_drain_hook(
+            self.metadata_command_apply_test_hook_scope_id(),
+            progress.is_some(),
+            next_object_pg_id,
+        )
+        .map_err(BucketWriteDrainError::from)?;
         let mut scanned_count = 0usize;
         let mut drained_count = 0usize;
         for object_pg_id in object_pg_ids

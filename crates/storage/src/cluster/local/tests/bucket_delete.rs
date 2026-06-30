@@ -3570,8 +3570,10 @@ fn begin_bucket_delete_adopts_preserved_post_reservation_frontier() {
         .unwrap();
 
     let delete_waiting = Arc::new((Mutex::new(false), Condvar::new()));
+    let release_delete_wait = Arc::new((Mutex::new(false), Condvar::new()));
     let hook_bucket = bucket.clone();
     let delete_waiting_for_hook = Arc::clone(&delete_waiting);
+    let release_delete_wait_for_hook = Arc::clone(&release_delete_wait);
     let _bucket_hook_guard =
         crate::node::install_bucket_scoped_test_hooks(crate::node::BucketScopedTestHooks {
             target: Some(hook_bucket),
@@ -3579,6 +3581,11 @@ fn begin_bucket_delete_adopts_preserved_post_reservation_frontier() {
                 let (lock, cv) = &*delete_waiting_for_hook;
                 *lock.lock().unwrap() = true;
                 cv.notify_all();
+
+                let (release_lock, release_cv) = &*release_delete_wait_for_hook;
+                let _release_guard = release_cv
+                    .wait_while(release_lock.lock().unwrap(), |released| !*released)
+                    .unwrap();
             })),
             ..crate::node::BucketScopedTestHooks::default()
         });
@@ -3653,6 +3660,11 @@ fn begin_bucket_delete_adopts_preserved_post_reservation_frontier() {
     cluster
         .release_durable_bucket_write_reservation(reservation)
         .unwrap();
+    {
+        let (lock, cv) = &*release_delete_wait;
+        *lock.lock().unwrap() = true;
+        cv.notify_all();
+    }
 
     let err = delete_thread.join().unwrap().unwrap_err();
     assert!(

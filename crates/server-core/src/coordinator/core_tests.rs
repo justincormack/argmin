@@ -1050,6 +1050,95 @@ fn reclaim_worker_adopts_bucket_delete_begin_after_partial_frontier() {
 }
 
 #[test]
+fn reclaim_worker_adopts_bucket_delete_begin_from_stream_cleanup_phase() {
+    let tmp = test_util::tempdir();
+    let bucket = trusted_bucket_name("bucket-delete-begin-worker-stream-cleanup");
+    let initial = open_test_storage_cluster(tmp.path(), &[0, 1, 2]);
+    let direct_coord = setup_direct_coordinator_with_storage_cluster(Arc::clone(&initial));
+    direct_coord
+        .create_bucket_for_owner("default-owner", bucket.as_str(), false)
+        .unwrap();
+    let bucket_identity = initial.test_head_bucket_raw(&bucket).unwrap();
+
+    initial
+        .test_seed_bucket_delete_attempt_outcome(
+            &bucket,
+            storage::BucketDeleteAttemptOutcomeKind::Retryable,
+            storage::BucketDeleteAttemptPhase::StreamCleanup,
+            "seeded stream-cleanup retryable attempt".to_string(),
+            None,
+        )
+        .unwrap();
+
+    let post_reservation_scan_ran = Arc::new(AtomicBool::new(false));
+    let post_reservation_scan_ran_for_hook = Arc::clone(&post_reservation_scan_ran);
+    let initial_scan_ran = Arc::new(AtomicBool::new(false));
+    let initial_scan_ran_for_hook = Arc::clone(&initial_scan_ran);
+    let _exact_drain_hook_guard = initial.test_install_before_bucket_delete_exact_drain_hook(
+        Arc::new(move |has_progress, next_object_pg_id| {
+            if !has_progress {
+                initial_scan_ran_for_hook.store(true, Ordering::SeqCst);
+                return Err(storage::StoreError::Io {
+                    context: "unexpected initial exact-bucket drain during stream-cleanup adoption",
+                    source: std::io::Error::other(format!("next_object_pg_id={next_object_pg_id}")),
+                });
+            }
+            Ok(())
+        }),
+    );
+    let _progress_hook_guard = initial
+        .test_install_after_bucket_delete_post_reservation_progress_hook(Arc::new(
+            move |_next_object_pg_id| {
+                post_reservation_scan_ran_for_hook.store(true, Ordering::SeqCst);
+                Ok(())
+            },
+        ));
+
+    let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&initial));
+    let _coord = setup_coordinator_with_only_reclaim_worker(handle, Arc::clone(&initial));
+    initial.enqueue_bucket_delete_begin(
+        &bucket,
+        bucket_identity.bucket_execution_generation,
+        bucket_identity.bucket_incarnation_generation,
+    );
+
+    let deadline = Instant::now() + TEST_EVENT_TIMEOUT;
+    loop {
+        match initial.test_head_bucket_raw(&bucket) {
+            Ok(info) if info.state == storage::BucketState::Deleting => break,
+            Err(storage::BucketSnapshotLoadError::Metadata(
+                storage::MetadataError::BucketNotFound { .. },
+            )) => break,
+            Ok(info) if Instant::now() < deadline => {
+                assert_eq!(
+                    info.state,
+                    storage::BucketState::Active,
+                    "unexpected bucket state while waiting for stream-cleanup adoption"
+                );
+                thread::sleep(Duration::from_millis(10));
+            }
+            Ok(info) => {
+                panic!("reclaim worker did not adopt stream-cleanup BucketDeleteBegin: {info:?}");
+            }
+            Err(err) => {
+                panic!(
+                    "unexpected bucket metadata error while waiting for stream-cleanup adoption: {err:?}"
+                )
+            }
+        }
+    }
+
+    assert!(
+        post_reservation_scan_ran.load(Ordering::SeqCst),
+        "stream-cleanup worker adoption must still revalidate the post-reservation object-PG drain"
+    );
+    assert!(
+        !initial_scan_ran.load(Ordering::SeqCst),
+        "stream-cleanup worker adoption must skip the initial pre-cleanup exact-bucket drain"
+    );
+}
+
+#[test]
 fn reclaim_worker_drops_stale_bucket_delete_begin_after_bucket_recreate() {
     let tmp = test_util::tempdir();
     let bucket = trusted_bucket_name("bucket-delete-begin-stale-recreate");

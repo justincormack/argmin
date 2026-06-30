@@ -9133,9 +9133,13 @@ Keep an explicit Phase 11 close-out before treating the phase as soak-clean:
          re-running stream cleanup, reservation wait, post-reservation object-PG
          validation, and final visibility. A storage regression verifies that
          stream-cleanup adoption still runs the post-reservation validation
-         before reaching `mark_deleting`. Remaining work: decide whether finer
-         stream-cleanup page/frontier state is needed, or whether the current
-         conservative cleanup resume point is enough for soak closure.
+         before reaching `mark_deleting`; a coordinator-level reclaim-worker
+         regression now seeds the same durable phase and proves the actual
+         background `BucketDeleteBegin` worker adopts it, revalidates the
+         post-reservation object-PG drain, and reaches deleting/finalized
+         progress. Remaining work: decide whether finer stream-cleanup
+         page/frontier state is needed, or whether the current conservative
+         cleanup resume point is enough for soak closure.
       5. status: open. Revisit reservation classification only after attempts are resumable;
          it should be an optimization on top of a convergent state machine, not
          the convergence mechanism itself.
