@@ -4057,6 +4057,230 @@ mod tests {
     }
 
     #[test]
+    fn control_plane_openraft_promoted_voter_restart_preserves_membership() {
+        ControlPlaneRaftTypeConfig::run(async {
+            let network = InMemoryRaftNetworkFactory::default();
+            let config = test_raft_config("control-plane-raft-promoted-voter-restart-test");
+            let log_store3 = ControlPlaneRaftLogStore::empty();
+            let raft1 = Raft::<ControlPlaneRaftTypeConfig, ControlPlaneRaftStateMachine>::new(
+                621,
+                config.clone(),
+                network.clone(),
+                ControlPlaneRaftLogStore::empty(),
+                ControlPlaneRaftStateMachine::empty(),
+            )
+            .await
+            .unwrap();
+            let raft2 = Raft::<ControlPlaneRaftTypeConfig, ControlPlaneRaftStateMachine>::new(
+                622,
+                config.clone(),
+                network.clone(),
+                ControlPlaneRaftLogStore::empty(),
+                ControlPlaneRaftStateMachine::empty(),
+            )
+            .await
+            .unwrap();
+            let raft3 = Raft::<ControlPlaneRaftTypeConfig, ControlPlaneRaftStateMachine>::new(
+                623,
+                config.clone(),
+                network.clone(),
+                log_store3.clone(),
+                ControlPlaneRaftStateMachine::empty(),
+            )
+            .await
+            .unwrap();
+            network.register(621, raft1.clone());
+            network.register(622, raft2.clone());
+            network.register(623, raft3.clone());
+            let authority1 = ControlPlaneRaftAuthority::new(raft1);
+            let authority2 = ControlPlaneRaftAuthority::new(raft2);
+            let authority3 =
+                ControlPlaneRaftAuthority::new_with_log_store(raft3, log_store3.clone());
+
+            authority1
+                .initialize_membership(BTreeMap::from([
+                    (621, BasicNode::new("node-621")),
+                    (622, BasicNode::new("node-622")),
+                ]))
+                .await
+                .unwrap();
+            wait_for_local_leader(
+                authority1.raft(),
+                "two-voter cluster initialized before promoted-voter restart",
+            )
+            .await;
+
+            let bootstrap = authority1
+                .submit_control_plane_command(ControlPlaneCommand::BootstrapInitialClusterMap {
+                    nodes: vec![
+                        (NodeId::new(621), "node-621".to_string()),
+                        (NodeId::new(622), "node-622".to_string()),
+                        (NodeId::new(623), "node-623".to_string()),
+                    ],
+                    pg_ids: vec![PgId::new(0)],
+                })
+                .await
+                .unwrap();
+            assert!(matches!(
+                bootstrap.outcome(),
+                ControlPlaneRaftCommandOutcome::Applied(
+                    ControlPlaneCommandResponse::BootstrapInitialClusterMap
+                )
+            ));
+
+            let learner_log_id = authority1
+                .add_learner(623, BasicNode::new("node-623"), false)
+                .await
+                .unwrap();
+            authority3
+                .wait_for_applied_index_at_least(
+                    learner_log_id.index(),
+                    Duration::from_secs(1),
+                    "restart candidate applied learner membership",
+                )
+                .await
+                .unwrap();
+
+            let promote_log_id = authority1
+                .replace_voters(BTreeSet::from([621, 622, 623]), true)
+                .await
+                .unwrap();
+            authority3
+                .wait_for_applied_index_at_least(
+                    promote_log_id.index(),
+                    Duration::from_secs(1),
+                    "restart candidate applied voter promotion",
+                )
+                .await
+                .unwrap();
+            let pre_restart_status = authority3.status().await.unwrap();
+            assert_eq!(pre_restart_status.applied(), Some(promote_log_id));
+            assert_eq!(
+                pre_restart_status.effective_membership_log_id(),
+                Some(promote_log_id)
+            );
+            assert_eq!(
+                pre_restart_status.effective_voters(),
+                &BTreeSet::from([621, 622, 623])
+            );
+            assert_eq!(
+                pre_restart_status.applied_membership_log_id(),
+                Some(promote_log_id)
+            );
+            assert_eq!(
+                pre_restart_status.applied_voters(),
+                &BTreeSet::from([621, 622, 623])
+            );
+
+            let restart_artifact =
+                capture_openraft_restart_artifact(&log_store3, &authority3).await;
+            authority3.shutdown().await.unwrap();
+            network.unregister(623);
+
+            let (restored_log_store, restored_state_machine) = restart_artifact.restore().unwrap();
+            let restored_log_store_for_status = restored_log_store.clone();
+            let restarted_raft =
+                Raft::<ControlPlaneRaftTypeConfig, ControlPlaneRaftStateMachine>::new(
+                    623,
+                    config,
+                    network.clone(),
+                    restored_log_store,
+                    restored_state_machine,
+                )
+                .await
+                .unwrap();
+            network.register(623, restarted_raft.clone());
+            let restarted_authority = ControlPlaneRaftAuthority::new_with_log_store(
+                restarted_raft,
+                restored_log_store_for_status,
+            );
+
+            let restarted_status = restarted_authority.status().await.unwrap();
+            assert_eq!(restarted_status.applied(), Some(promote_log_id));
+            assert_eq!(
+                restarted_status.effective_membership_log_id(),
+                Some(promote_log_id)
+            );
+            assert_eq!(
+                restarted_status.effective_voters(),
+                &BTreeSet::from([621, 622, 623])
+            );
+            assert_eq!(
+                restarted_status.applied_membership_log_id(),
+                Some(promote_log_id)
+            );
+            assert_eq!(
+                restarted_status.applied_voters(),
+                &BTreeSet::from([621, 622, 623])
+            );
+
+            let post_restart_write = authority1
+                .submit_control_plane_command(ControlPlaneCommand::MarkNodeAvailability {
+                    node_id: NodeId::new(623),
+                    availability: NodeAvailabilityState::Unavailable,
+                })
+                .await
+                .unwrap();
+            assert!(matches!(
+                post_restart_write.outcome(),
+                ControlPlaneRaftCommandOutcome::Applied(
+                    ControlPlaneCommandResponse::MarkNodeAvailability
+                )
+            ));
+            assert!(post_restart_write.log_id().index() > promote_log_id.index());
+            restarted_authority
+                .wait_for_applied_index_at_least(
+                    post_restart_write.log_id().index(),
+                    Duration::from_secs(1),
+                    "restarted promoted voter applied post-restart command",
+                )
+                .await
+                .unwrap();
+            let caught_up_status = restarted_authority.status().await.unwrap();
+            assert_eq!(
+                caught_up_status.applied(),
+                Some(post_restart_write.log_id())
+            );
+            assert_eq!(
+                caught_up_status.effective_membership_log_id(),
+                Some(promote_log_id)
+            );
+            assert_eq!(
+                caught_up_status.effective_voters(),
+                &BTreeSet::from([621, 622, 623])
+            );
+            assert_eq!(
+                caught_up_status.applied_membership_log_id(),
+                Some(promote_log_id)
+            );
+            assert_eq!(
+                caught_up_status.applied_voters(),
+                &BTreeSet::from([621, 622, 623])
+            );
+            let node623_availability = restarted_authority
+                .raft()
+                .with_state_machine(|state_machine| {
+                    let availability = state_machine
+                        .inner()
+                        .snapshot()
+                        .node(NodeId::new(623))
+                        .map(|node| node.availability());
+                    Box::pin(async move { availability })
+                })
+                .await
+                .unwrap();
+            assert_eq!(
+                node623_availability,
+                Some(NodeAvailabilityState::Unavailable)
+            );
+
+            authority1.shutdown().await.unwrap();
+            authority2.shutdown().await.unwrap();
+            restarted_authority.shutdown().await.unwrap();
+        });
+    }
+
+    #[test]
     fn control_plane_openraft_two_node_read_index_runtime_map_uses_quorum_applied_tip() {
         ControlPlaneRaftTypeConfig::run(async {
             let (authority1, authority2) = initialized_two_node_authorities(

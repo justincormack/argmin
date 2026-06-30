@@ -9607,6 +9607,11 @@ Phase 12.1 progress:
   previously committed cluster map. Normal dead-leader election remains tied to
   OpenRaft's leader-lease/election-timeout semantics rather than a timer-free
   trigger.
+- Added OpenRaft promoted-voter restart coverage. A learner promoted into the
+  voter set now exports and restores its persisted OpenRaft/control-plane
+  artifacts, verifies the restored authority still reports the final effective
+  and applied voter set through the status boundary, and catches up a
+  post-restart command under the promoted membership.
 
 1. define the replicated control-plane state machine:
    - state includes cluster epoch, PG count, PG state, PG acting sets, node
