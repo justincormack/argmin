@@ -9530,6 +9530,12 @@ Phase 12.1 progress:
 - Isolated the public OpenRaft smokes with distinct cluster names so the normal
   parallel `control_plane_raft` test group cannot share OpenRaft test identity
   while still exercising the real client-write and read-index paths.
+- Added OpenRaft follower-restart catch-up coverage. A three-voter in-memory
+  cluster now captures a follower restart artifact, removes that follower from
+  the test network, commits a command through the remaining quorum, restores the
+  follower, and verifies a later write drives the restarted follower through the
+  missing committed prefix with the expected Raft membership and control-plane
+  node-state effects.
 
 1. define the replicated control-plane state machine:
    - state includes cluster epoch, PG count, PG state, PG acting sets, node

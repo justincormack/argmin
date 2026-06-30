@@ -1762,6 +1762,10 @@ mod tests {
         ) {
             self.peers.lock().unwrap().insert(node_id, raft);
         }
+
+        fn unregister(&self, node_id: ControlPlaneRaftNodeId) {
+            self.peers.lock().unwrap().remove(&node_id);
+        }
     }
 
     impl RaftNetworkFactory<ControlPlaneRaftTypeConfig> for InMemoryRaftNetworkFactory {
@@ -2035,6 +2039,90 @@ mod tests {
         wait_for_local_leader(authority1.raft(), "three-node initialized leadership").await;
 
         (authority1, authority2, authority3)
+    }
+
+    async fn initialized_three_node_voter_authorities(
+        cluster_name: &'static str,
+        node1: ControlPlaneRaftNodeId,
+        node2: ControlPlaneRaftNodeId,
+        node3: ControlPlaneRaftNodeId,
+    ) -> (
+        InMemoryRaftNetworkFactory,
+        Arc<Config>,
+        ControlPlaneRaftLogStore,
+        ControlPlaneRaftAuthority,
+        ControlPlaneRaftAuthority,
+        ControlPlaneRaftAuthority,
+    ) {
+        let network = InMemoryRaftNetworkFactory::default();
+        let config = test_raft_config(cluster_name);
+        let raft1 = Raft::<ControlPlaneRaftTypeConfig, ControlPlaneRaftStateMachine>::new(
+            node1,
+            config.clone(),
+            network.clone(),
+            ControlPlaneRaftLogStore::empty(),
+            ControlPlaneRaftStateMachine::empty(),
+        )
+        .await
+        .unwrap();
+        let raft2 = Raft::<ControlPlaneRaftTypeConfig, ControlPlaneRaftStateMachine>::new(
+            node2,
+            config.clone(),
+            network.clone(),
+            ControlPlaneRaftLogStore::empty(),
+            ControlPlaneRaftStateMachine::empty(),
+        )
+        .await
+        .unwrap();
+        let log_store3 = ControlPlaneRaftLogStore::empty();
+        let raft3 = Raft::<ControlPlaneRaftTypeConfig, ControlPlaneRaftStateMachine>::new(
+            node3,
+            config.clone(),
+            network.clone(),
+            log_store3.clone(),
+            ControlPlaneRaftStateMachine::empty(),
+        )
+        .await
+        .unwrap();
+        network.register(node1, raft1.clone());
+        network.register(node2, raft2.clone());
+        network.register(node3, raft3.clone());
+        let authority1 = ControlPlaneRaftAuthority::new(raft1);
+        let authority2 = ControlPlaneRaftAuthority::new(raft2);
+        let authority3 = ControlPlaneRaftAuthority::new(raft3);
+
+        authority1
+            .initialize_membership(BTreeMap::from([
+                (node1, BasicNode::new(format!("node-{node1}"))),
+                (node2, BasicNode::new(format!("node-{node2}"))),
+                (node3, BasicNode::new(format!("node-{node3}"))),
+            ]))
+            .await
+            .unwrap();
+        wait_for_local_leader(authority1.raft(), "three-voter initialized leadership").await;
+
+        (
+            network, config, log_store3, authority1, authority2, authority3,
+        )
+    }
+
+    async fn capture_openraft_restart_artifact(
+        log_store: &ControlPlaneRaftLogStore,
+        authority: &ControlPlaneRaftAuthority,
+    ) -> ControlPlaneRaftRestartArtifact {
+        let log_store = log_store.export_restart_artifact().unwrap();
+        let state_machine = authority
+            .raft()
+            .with_state_machine(|state_machine| {
+                let artifact = state_machine.export_restart_artifact();
+                Box::pin(async move { artifact })
+            })
+            .await
+            .unwrap();
+        ControlPlaneRaftRestartArtifact {
+            log_store,
+            state_machine,
+        }
     }
 
     fn raft_log_id(term: u64, node_id: u64, index: u64) -> LogIdOf<ControlPlaneRaftTypeConfig> {
@@ -3904,6 +3992,147 @@ mod tests {
 
             authority1.shutdown().await.unwrap();
             authority2.shutdown().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn control_plane_openraft_restarted_follower_catches_up_committed_prefix() {
+        ControlPlaneRaftTypeConfig::run(async {
+            let (network, config, follower_log_store, authority1, authority2, authority3) =
+                initialized_three_node_voter_authorities(
+                    "control-plane-raft-follower-restart-catch-up-test",
+                    801,
+                    802,
+                    803,
+                )
+                .await;
+
+            let bootstrap = authority1
+                .submit_control_plane_command(ControlPlaneCommand::BootstrapInitialClusterMap {
+                    nodes: vec![
+                        (NodeId::new(801), "node-801".to_string()),
+                        (NodeId::new(802), "node-802".to_string()),
+                        (NodeId::new(803), "node-803".to_string()),
+                    ],
+                    pg_ids: vec![PgId::new(0)],
+                })
+                .await
+                .unwrap();
+            assert!(matches!(
+                bootstrap.outcome(),
+                ControlPlaneRaftCommandOutcome::Applied(
+                    ControlPlaneCommandResponse::BootstrapInitialClusterMap
+                )
+            ));
+            authority3
+                .wait_for_applied_index_at_least(
+                    bootstrap.log_id().index(),
+                    Duration::from_secs(1),
+                    "third voter applied bootstrap before restart",
+                )
+                .await
+                .unwrap();
+
+            let restart_artifact =
+                capture_openraft_restart_artifact(&follower_log_store, &authority3).await;
+            authority3.shutdown().await.unwrap();
+            network.unregister(803);
+
+            let offline_write = authority1
+                .submit_control_plane_command(ControlPlaneCommand::MarkNodeAvailability {
+                    node_id: NodeId::new(802),
+                    availability: NodeAvailabilityState::Unavailable,
+                })
+                .await
+                .unwrap();
+            assert!(matches!(
+                offline_write.outcome(),
+                ControlPlaneRaftCommandOutcome::Applied(
+                    ControlPlaneCommandResponse::MarkNodeAvailability
+                )
+            ));
+            authority2
+                .wait_for_applied_index_at_least(
+                    offline_write.log_id().index(),
+                    Duration::from_secs(1),
+                    "second voter applied command committed while third voter was down",
+                )
+                .await
+                .unwrap();
+
+            let (restored_log_store, restored_state_machine) = restart_artifact.restore().unwrap();
+            let restarted_raft =
+                Raft::<ControlPlaneRaftTypeConfig, ControlPlaneRaftStateMachine>::new(
+                    803,
+                    config,
+                    network.clone(),
+                    restored_log_store,
+                    restored_state_machine,
+                )
+                .await
+                .unwrap();
+            network.register(803, restarted_raft.clone());
+            let restarted_authority = ControlPlaneRaftAuthority::new(restarted_raft);
+
+            let catch_up_trigger = authority1
+                .submit_control_plane_command(ControlPlaneCommand::MarkNodeAvailability {
+                    node_id: NodeId::new(803),
+                    availability: NodeAvailabilityState::Unavailable,
+                })
+                .await
+                .unwrap();
+            assert!(matches!(
+                catch_up_trigger.outcome(),
+                ControlPlaneRaftCommandOutcome::Applied(
+                    ControlPlaneCommandResponse::MarkNodeAvailability
+                )
+            ));
+            assert!(catch_up_trigger.log_id().index() > offline_write.log_id().index());
+
+            restarted_authority
+                .wait_for_applied_index_at_least(
+                    catch_up_trigger.log_id().index(),
+                    Duration::from_secs(1),
+                    "restarted third voter caught up missing committed prefix",
+                )
+                .await
+                .unwrap();
+            let restarted_status = restarted_authority.status().await.unwrap();
+            assert_eq!(restarted_status.current_leader(), Some(801));
+            assert_eq!(restarted_status.applied(), Some(catch_up_trigger.log_id()));
+            assert_eq!(
+                restarted_status.effective_voters(),
+                &BTreeSet::from([801, 802, 803])
+            );
+
+            let restarted_state = restarted_authority
+                .raft()
+                .with_state_machine(|state_machine| {
+                    let snapshot = state_machine.inner().snapshot();
+                    let node_ids = snapshot
+                        .nodes()
+                        .map(|node| node.node_id())
+                        .collect::<Vec<_>>();
+                    let node802_availability = snapshot
+                        .node(NodeId::new(802))
+                        .map(|node| node.availability());
+                    let node803_availability = snapshot
+                        .node(NodeId::new(803))
+                        .map(|node| node.availability());
+                    Box::pin(async move { (node_ids, node802_availability, node803_availability) })
+                })
+                .await
+                .unwrap();
+            assert_eq!(
+                restarted_state.0,
+                vec![NodeId::new(801), NodeId::new(802), NodeId::new(803)]
+            );
+            assert_eq!(restarted_state.1, Some(NodeAvailabilityState::Unavailable));
+            assert_eq!(restarted_state.2, Some(NodeAvailabilityState::Unavailable));
+
+            authority1.shutdown().await.unwrap();
+            authority2.shutdown().await.unwrap();
+            restarted_authority.shutdown().await.unwrap();
         });
     }
 
