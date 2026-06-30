@@ -9515,6 +9515,11 @@ Phase 12.1 progress:
   state machine's applied voter set, so public smokes can verify replicated
   membership progress through the authority object instead of raw OpenRaft
   state reads.
+- Added an OpenRaft learner lifecycle wrapper and smoke. A three-node in-memory
+  cluster now adds node 603 as a learner through `ControlPlaneRaftAuthority`,
+  waits for the learner to apply the learner-membership entry, promotes it into
+  the voter set, and verifies both the leader and promoted node expose the final
+  voter set through the authority status boundary.
 - Isolated the public OpenRaft smokes with distinct cluster names so the normal
   parallel `control_plane_raft` test group cannot share OpenRaft test identity
   while still exercising the real client-write and read-index paths.

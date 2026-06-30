@@ -210,6 +210,20 @@ impl ControlPlaneRaftAuthority {
         Ok(response.log_id)
     }
 
+    pub async fn add_learner(
+        &self,
+        node_id: ControlPlaneRaftNodeId,
+        node: BasicNode,
+        wait_for_catch_up: bool,
+    ) -> Result<LogIdOf<ControlPlaneRaftTypeConfig>, ControlPlaneError> {
+        let response = self
+            .raft
+            .add_learner(node_id, node, wait_for_catch_up)
+            .await
+            .map_err(|error| openraft_remote_error("add-learner", error))?;
+        Ok(response.log_id)
+    }
+
     pub async fn wait_for_applied_index_at_least(
         &self,
         index: u64,
@@ -1925,6 +1939,64 @@ mod tests {
         (authority1, authority2)
     }
 
+    async fn initialized_three_node_cluster_with_two_voters(
+        cluster_name: &'static str,
+        node1: ControlPlaneRaftNodeId,
+        node2: ControlPlaneRaftNodeId,
+        node3: ControlPlaneRaftNodeId,
+    ) -> (
+        ControlPlaneRaftAuthority,
+        ControlPlaneRaftAuthority,
+        ControlPlaneRaftAuthority,
+    ) {
+        let network = InMemoryRaftNetworkFactory::default();
+        let config = test_raft_config(cluster_name);
+        let raft1 = Raft::<ControlPlaneRaftTypeConfig, ControlPlaneRaftStateMachine>::new(
+            node1,
+            config.clone(),
+            network.clone(),
+            ControlPlaneRaftLogStore::empty(),
+            ControlPlaneRaftStateMachine::empty(),
+        )
+        .await
+        .unwrap();
+        let raft2 = Raft::<ControlPlaneRaftTypeConfig, ControlPlaneRaftStateMachine>::new(
+            node2,
+            config.clone(),
+            network.clone(),
+            ControlPlaneRaftLogStore::empty(),
+            ControlPlaneRaftStateMachine::empty(),
+        )
+        .await
+        .unwrap();
+        let raft3 = Raft::<ControlPlaneRaftTypeConfig, ControlPlaneRaftStateMachine>::new(
+            node3,
+            config,
+            network.clone(),
+            ControlPlaneRaftLogStore::empty(),
+            ControlPlaneRaftStateMachine::empty(),
+        )
+        .await
+        .unwrap();
+        network.register(node1, raft1.clone());
+        network.register(node2, raft2.clone());
+        network.register(node3, raft3.clone());
+        let authority1 = ControlPlaneRaftAuthority::new(raft1);
+        let authority2 = ControlPlaneRaftAuthority::new(raft2);
+        let authority3 = ControlPlaneRaftAuthority::new(raft3);
+
+        authority1
+            .initialize_membership(BTreeMap::from([
+                (node1, BasicNode::new(format!("node-{node1}"))),
+                (node2, BasicNode::new(format!("node-{node2}"))),
+            ]))
+            .await
+            .unwrap();
+        wait_for_local_leader(authority1.raft(), "three-node initialized leadership").await;
+
+        (authority1, authority2, authority3)
+    }
+
     fn raft_log_id(term: u64, node_id: u64, index: u64) -> LogIdOf<ControlPlaneRaftTypeConfig> {
         LogId::new(LeaderId { term, node_id }, index)
     }
@@ -3489,6 +3561,116 @@ mod tests {
 
             authority1.shutdown().await.unwrap();
             authority2.shutdown().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn control_plane_openraft_adds_learner_then_promotes_to_voter() {
+        ControlPlaneRaftTypeConfig::run(async {
+            let (authority1, authority2, authority3) =
+                initialized_three_node_cluster_with_two_voters(
+                    "control-plane-raft-add-learner-promote-test",
+                    601,
+                    602,
+                    603,
+                )
+                .await;
+
+            let bootstrap = authority1
+                .submit_control_plane_command(ControlPlaneCommand::BootstrapInitialClusterMap {
+                    nodes: vec![
+                        (NodeId::new(601), "node-601".to_string()),
+                        (NodeId::new(602), "node-602".to_string()),
+                        (NodeId::new(603), "node-603".to_string()),
+                    ],
+                    pg_ids: vec![PgId::new(0)],
+                })
+                .await
+                .unwrap();
+            assert!(matches!(
+                bootstrap.outcome(),
+                ControlPlaneRaftCommandOutcome::Applied(
+                    ControlPlaneCommandResponse::BootstrapInitialClusterMap
+                )
+            ));
+
+            let learner_log_id = authority1
+                .add_learner(603, BasicNode::new("node-603"), false)
+                .await
+                .unwrap();
+            authority3
+                .wait_for_applied_index_at_least(
+                    learner_log_id.index(),
+                    Duration::from_secs(1),
+                    "new learner applied learner membership",
+                )
+                .await
+                .unwrap();
+            let learner_status = authority3.status().await.unwrap();
+            assert_eq!(learner_status.applied(), Some(learner_log_id));
+            assert_eq!(learner_status.applied_voters(), &BTreeSet::from([601, 602]));
+
+            let promote_log_id = authority1
+                .replace_voters(BTreeSet::from([601, 602, 603]), true)
+                .await
+                .unwrap();
+            authority1
+                .wait_for_applied_index_at_least(
+                    promote_log_id.index(),
+                    Duration::from_secs(1),
+                    "leader applied learner promotion",
+                )
+                .await
+                .unwrap();
+            authority3
+                .wait_for_applied_index_at_least(
+                    promote_log_id.index(),
+                    Duration::from_secs(1),
+                    "promoted learner applied voter membership",
+                )
+                .await
+                .unwrap();
+
+            let leader_status = authority1.status().await.unwrap();
+            assert_eq!(
+                leader_status.effective_membership_log_id(),
+                Some(promote_log_id)
+            );
+            assert_eq!(
+                leader_status.effective_voters(),
+                &BTreeSet::from([601, 602, 603])
+            );
+            assert_eq!(
+                leader_status.applied_membership_log_id(),
+                Some(promote_log_id)
+            );
+            assert_eq!(
+                leader_status.applied_voters(),
+                &BTreeSet::from([601, 602, 603])
+            );
+
+            let promoted_status = authority3.status().await.unwrap();
+            assert_eq!(promoted_status.applied(), Some(promote_log_id));
+            assert_eq!(
+                promoted_status.effective_membership_log_id(),
+                Some(promote_log_id)
+            );
+            assert_eq!(
+                promoted_status.effective_voters(),
+                &BTreeSet::from([601, 602, 603])
+            );
+            assert_eq!(
+                promoted_status.applied_membership_log_id(),
+                Some(promote_log_id)
+            );
+            assert_eq!(
+                promoted_status.applied_voters(),
+                &BTreeSet::from([601, 602, 603])
+            );
+
+            authority1.shutdown().await.unwrap();
+            authority2.shutdown().await.unwrap();
+            authority3.shutdown().await.unwrap();
         });
     }
 
