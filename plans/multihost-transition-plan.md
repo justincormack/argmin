@@ -9682,6 +9682,11 @@ Phase 12.1 progress:
   verifies the recovered leader reports the expected active storage-node set
   and Suspect/Unavailable breakdown after replaying a post-restart node
   availability command.
+- Extended the PG diagnostics on the same status surface with deterministic
+  sub-state counters for assigned active primaries, peering metadata-transfer
+  markers, and metadata-transfer fences. These deliberately avoid wall-clock
+  lease checks, so the authority status remains a replay-safe view of
+  replicated control-plane state.
 
 1. define the replicated control-plane state machine:
    - state includes cluster epoch, PG count, PG state, PG acting sets, node

@@ -145,6 +145,9 @@ pub struct ControlPlaneRaftAuthorityStatus {
     degraded_pg_count: usize,
     backfilling_pg_count: usize,
     inconsistent_pg_count: usize,
+    active_primary_pg_count: usize,
+    peering_metadata_transfer_pg_count: usize,
+    metadata_transfer_fenced_pg_count: usize,
     effective_membership_log_id: Option<LogIdOf<ControlPlaneRaftTypeConfig>>,
     effective_voters: BTreeSet<ControlPlaneRaftNodeId>,
     effective_learners: BTreeSet<ControlPlaneRaftNodeId>,
@@ -302,6 +305,21 @@ impl ControlPlaneRaftAuthorityStatus {
     #[must_use]
     pub fn inconsistent_pg_count(&self) -> usize {
         self.inconsistent_pg_count
+    }
+
+    #[must_use]
+    pub fn active_primary_pg_count(&self) -> usize {
+        self.active_primary_pg_count
+    }
+
+    #[must_use]
+    pub fn peering_metadata_transfer_pg_count(&self) -> usize {
+        self.peering_metadata_transfer_pg_count
+    }
+
+    #[must_use]
+    pub fn metadata_transfer_fenced_pg_count(&self) -> usize {
+        self.metadata_transfer_fenced_pg_count
     }
 
     #[must_use]
@@ -520,6 +538,9 @@ impl ControlPlaneRaftAuthority {
             degraded_pg_count,
             backfilling_pg_count,
             inconsistent_pg_count,
+            active_primary_pg_count,
+            peering_metadata_transfer_pg_count,
+            metadata_transfer_fenced_pg_count,
             applied_membership_log_id,
             applied_voters,
             applied_learners,
@@ -576,6 +597,9 @@ impl ControlPlaneRaftAuthority {
                 let mut degraded_pg_count = 0;
                 let mut backfilling_pg_count = 0;
                 let mut inconsistent_pg_count = 0;
+                let mut active_primary_pg_count = 0;
+                let mut peering_metadata_transfer_pg_count = 0;
+                let mut metadata_transfer_fenced_pg_count = 0;
                 for pg in snapshot.pgs() {
                     pg_count += 1;
                     match pg.state() {
@@ -584,6 +608,15 @@ impl ControlPlaneRaftAuthority {
                         PgState::Degraded => degraded_pg_count += 1,
                         PgState::Backfilling => backfilling_pg_count += 1,
                         PgState::Inconsistent => inconsistent_pg_count += 1,
+                    }
+                    if pg.active_primary().is_some() {
+                        active_primary_pg_count += 1;
+                    }
+                    if pg.peering_metadata_transfer().is_some() {
+                        peering_metadata_transfer_pg_count += 1;
+                    }
+                    if pg.metadata_transfer_fenced() {
+                        metadata_transfer_fenced_pg_count += 1;
                     }
                 }
                 let membership = state_machine.last_membership();
@@ -615,6 +648,9 @@ impl ControlPlaneRaftAuthority {
                         degraded_pg_count,
                         backfilling_pg_count,
                         inconsistent_pg_count,
+                        active_primary_pg_count,
+                        peering_metadata_transfer_pg_count,
+                        metadata_transfer_fenced_pg_count,
                         membership_log_id,
                         voters,
                         learners,
@@ -654,6 +690,9 @@ impl ControlPlaneRaftAuthority {
             degraded_pg_count,
             backfilling_pg_count,
             inconsistent_pg_count,
+            active_primary_pg_count,
+            peering_metadata_transfer_pg_count,
+            metadata_transfer_fenced_pg_count,
             effective_membership_log_id,
             effective_voters,
             effective_learners,
@@ -5338,6 +5377,9 @@ mod tests {
             assert_eq!(restarted_status.degraded_pg_count(), 0);
             assert_eq!(restarted_status.backfilling_pg_count(), 0);
             assert_eq!(restarted_status.inconsistent_pg_count(), 0);
+            assert_eq!(restarted_status.active_primary_pg_count(), 0);
+            assert_eq!(restarted_status.peering_metadata_transfer_pg_count(), 0);
+            assert_eq!(restarted_status.metadata_transfer_fenced_pg_count(), 0);
 
             let restarted_node903_availability = restarted_authority
                 .raft()
