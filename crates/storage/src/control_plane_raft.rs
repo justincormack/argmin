@@ -4321,6 +4321,133 @@ mod tests {
     }
 
     #[test]
+    fn control_plane_openraft_transferred_leader_continues_after_old_leader_loss() {
+        ControlPlaneRaftTypeConfig::run(async {
+            let ThreeVoterAuthorityFixture {
+                network,
+                config: _,
+                leader_log_store: _,
+                third_log_store: _,
+                authority1,
+                authority2,
+                authority3,
+            } = initialized_three_node_voter_authorities(
+                "control-plane-raft-post-transfer-old-leader-loss-test",
+                1001,
+                1002,
+                1003,
+            )
+            .await;
+
+            let bootstrap = authority1
+                .submit_control_plane_command(ControlPlaneCommand::BootstrapInitialClusterMap {
+                    nodes: vec![
+                        (NodeId::new(1001), "node-1001".to_string()),
+                        (NodeId::new(1002), "node-1002".to_string()),
+                        (NodeId::new(1003), "node-1003".to_string()),
+                    ],
+                    pg_ids: vec![PgId::new(0)],
+                })
+                .await
+                .unwrap();
+            assert!(matches!(
+                bootstrap.outcome(),
+                ControlPlaneRaftCommandOutcome::Applied(
+                    ControlPlaneCommandResponse::BootstrapInitialClusterMap
+                )
+            ));
+            authority2
+                .wait_for_applied_index_at_least(
+                    bootstrap.log_id().index(),
+                    Duration::from_secs(1),
+                    "second voter applied bootstrap before leader loss",
+                )
+                .await
+                .unwrap();
+            authority3
+                .wait_for_applied_index_at_least(
+                    bootstrap.log_id().index(),
+                    Duration::from_secs(1),
+                    "third voter applied bootstrap before leader loss",
+                )
+                .await
+                .unwrap();
+
+            authority1.transfer_leadership_to(1002).await.unwrap();
+            authority2
+                .wait_for_current_leader(
+                    1002,
+                    Duration::from_secs(1),
+                    "second voter accepted leadership before old leader loss",
+                )
+                .await
+                .unwrap();
+            authority3
+                .wait_for_current_leader(
+                    1002,
+                    Duration::from_secs(1),
+                    "third voter learned transferred leader before old leader loss",
+                )
+                .await
+                .unwrap();
+
+            authority1.shutdown().await.unwrap();
+            network.unregister(1001);
+
+            let failover_write = authority2
+                .submit_control_plane_command(ControlPlaneCommand::MarkNodeAvailability {
+                    node_id: NodeId::new(1001),
+                    availability: NodeAvailabilityState::Unavailable,
+                })
+                .await
+                .unwrap();
+            assert!(matches!(
+                failover_write.outcome(),
+                ControlPlaneRaftCommandOutcome::Applied(
+                    ControlPlaneCommandResponse::MarkNodeAvailability
+                )
+            ));
+            assert_eq!(failover_write.log_id().committed_leader_id().node_id, 1002);
+            assert!(
+                failover_write.log_id().committed_leader_id().term
+                    > bootstrap.log_id().committed_leader_id().term
+            );
+            authority3
+                .wait_for_applied_index_at_least(
+                    failover_write.log_id().index(),
+                    Duration::from_secs(1),
+                    "third voter applied failover leader write",
+                )
+                .await
+                .unwrap();
+
+            let follower_state = authority3
+                .raft()
+                .with_state_machine(|state_machine| {
+                    let snapshot = state_machine.inner().snapshot();
+                    let node_ids = snapshot
+                        .nodes()
+                        .map(|node| node.node_id())
+                        .collect::<Vec<_>>();
+                    let node1001_availability = snapshot
+                        .node(NodeId::new(1001))
+                        .map(|node| node.availability());
+                    Box::pin(async move { (node_ids, node1001_availability) })
+                })
+                .await
+                .unwrap();
+            assert_eq!(
+                follower_state.0,
+                vec![NodeId::new(1001), NodeId::new(1002), NodeId::new(1003)]
+            );
+            assert_eq!(follower_state.1, Some(NodeAvailabilityState::Unavailable));
+
+            authority2.shutdown().await.unwrap();
+            authority3.shutdown().await.unwrap();
+        });
+    }
+
+    #[test]
     fn control_plane_openraft_restart_replays_committed_entries() {
         ControlPlaneRaftTypeConfig::run(async {
             let mut log_store = ControlPlaneRaftLogStore::empty();

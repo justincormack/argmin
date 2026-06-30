@@ -9570,6 +9570,14 @@ Phase 12.1 progress:
   linearized write while the leader is absent, restores the leader, and proves
   the restored leader resumes command submission, follower replication, and
   read-index runtime-map service from the committed prefix.
+- Added deterministic OpenRaft post-transfer leader-loss coverage. A
+  three-voter in-memory cluster now transfers leadership to a surviving voter,
+  removes the old leader from the test network before the next write, commits a
+  control-plane command through the transferred leader, and verifies the
+  remaining follower applies the same node-state transition without losing the
+  previously committed cluster map. Normal dead-leader election remains tied to
+  OpenRaft's leader-lease/election-timeout semantics rather than a timer-free
+  trigger.
 
 1. define the replicated control-plane state machine:
    - state includes cluster epoch, PG count, PG state, PG acting sets, node
