@@ -907,6 +907,45 @@ sample_frontend_metrics() {
     curl -k -sS "$endpoint/__argmin/debug/metrics" >"$output_path"
 }
 
+local_debug_endpoint_enabled() {
+    case "$uat_local_debug_endpoint" in
+        1|true|TRUE|True|yes|YES|Yes|on|ON|On)
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+print_bucket_delete_attempt_debug() {
+    local bucket="$1"
+    if [[ -z "$bucket" ]] || ! local_debug_endpoint_enabled; then
+        return 0
+    fi
+    echo "== argmin-s3 UAT bucket delete attempt debug: bucket=$bucket ==" >&2
+    curl -k -sS "$endpoint/__argmin/debug/bucket-delete-attempt/$bucket" >&2 || true
+}
+
+print_bucket_file_delete_attempt_debug() {
+    local bucket_file="$1"
+    [[ -s "$bucket_file" ]] || return 0
+
+    local bucket
+    bucket="$(tr -d '[:space:]' <"$bucket_file")"
+    print_bucket_delete_attempt_debug "$bucket"
+}
+
+print_bucket_list_delete_attempt_debug() {
+    local bucket_list_file="$1"
+    [[ -s "$bucket_list_file" ]] || return 0
+
+    local bucket
+    while IFS= read -r bucket; do
+        print_bucket_delete_attempt_debug "$bucket"
+    done <"$bucket_list_file"
+}
+
 wait_for_storage_shard_files() {
     local expected_count="$1"
     local deadline_seconds="$2"
@@ -1689,11 +1728,9 @@ else
 fi
 
 readiness_url="$endpoint/"
-case "$uat_local_debug_endpoint" in
-    1|true|TRUE|True|yes|YES|Yes|on|ON|On)
-        readiness_url="$endpoint/__argmin/debug/metrics"
-        ;;
-esac
+if local_debug_endpoint_enabled; then
+    readiness_url="$endpoint/__argmin/debug/metrics"
+fi
 
 wait_for_https_ready() {
     for _ in {1..200}; do
@@ -1726,11 +1763,9 @@ start_metrics_sampler() {
     echo "== argmin-s3 UAT frontend metrics samples: $metrics_log =="
 }
 
-case "$uat_local_debug_endpoint" in
-    1|true|TRUE|True|yes|YES|Yes|on|ON|On)
-        start_metrics_sampler
-        ;;
-esac
+if local_debug_endpoint_enabled; then
+    start_metrics_sampler
+fi
 
 run_nextest() {
     local label="$1"
@@ -2361,7 +2396,10 @@ cleanup_route_change_smoke() {
 
     echo "== argmin-s3 UAT route-change cleanup iteration $iteration =="
     print_command "${pg_backfill_smoke_cmd[@]}" cleanup-versioned "$bucket_file"
-    "${pg_backfill_smoke_cmd[@]}" cleanup-versioned "$bucket_file"
+    if ! "${pg_backfill_smoke_cmd[@]}" cleanup-versioned "$bucket_file"; then
+        print_bucket_file_delete_attempt_debug "$bucket_file"
+        return 1
+    fi
 }
 
 cleanup_pg_backfill_migration_smoke() {
@@ -2379,7 +2417,10 @@ cleanup_pg_backfill_migration_smoke() {
 
     echo "== argmin-s3 UAT PG backfill cleanup iteration $iteration =="
     print_command "${pg_backfill_smoke_cmd[@]}" cleanup "$bucket_file" "$old_key" "$new_key"
-    "${pg_backfill_smoke_cmd[@]}" cleanup "$bucket_file" "$old_key" "$new_key"
+    if ! "${pg_backfill_smoke_cmd[@]}" cleanup "$bucket_file" "$old_key" "$new_key"; then
+        print_bucket_file_delete_attempt_debug "$bucket_file"
+        return 1
+    fi
 }
 
 cleanup_metadata_pg_migration_smoke() {
@@ -2404,10 +2445,16 @@ cleanup_metadata_pg_migration_smoke() {
     echo "== argmin-s3 UAT metadata PG migration cleanup iteration $iteration =="
     if [[ -n "$final_key" ]]; then
         print_command "${pg_backfill_smoke_cmd[@]}" cleanup "$bucket_file" "$old_key" "$new_key" "$final_key"
-        "${pg_backfill_smoke_cmd[@]}" cleanup "$bucket_file" "$old_key" "$new_key" "$final_key"
+        if ! "${pg_backfill_smoke_cmd[@]}" cleanup "$bucket_file" "$old_key" "$new_key" "$final_key"; then
+            print_bucket_file_delete_attempt_debug "$bucket_file"
+            return 1
+        fi
     else
         print_command "${pg_backfill_smoke_cmd[@]}" cleanup "$bucket_file" "$old_key" "$new_key"
-        "${pg_backfill_smoke_cmd[@]}" cleanup "$bucket_file" "$old_key" "$new_key"
+        if ! "${pg_backfill_smoke_cmd[@]}" cleanup "$bucket_file" "$old_key" "$new_key"; then
+            print_bucket_file_delete_attempt_debug "$bucket_file"
+            return 1
+        fi
     fi
 }
 
@@ -2421,7 +2468,10 @@ assert_cleanup_versioned_stress_metrics_clean() {
     local start
     start="$(date +%s)"
     while true; do
-        sample_frontend_metrics "$metrics_path"
+        if ! sample_frontend_metrics "$metrics_path"; then
+            echo "error: cleanup versioned stress could not scrape frontend metrics" >&2
+            return 1
+        fi
         local http_500
         local operation_aborted
         local slow_down
@@ -2437,7 +2487,8 @@ assert_cleanup_versioned_stress_metrics_clean() {
 
         if ((http_500 > initial_http_500)); then
             cat "$metrics_path" >&2 || true
-            die "cleanup versioned stress saw HTTP 500 increase: before=$initial_http_500 after=$http_500"
+            echo "error: cleanup versioned stress saw HTTP 500 increase: before=$initial_http_500 after=$http_500" >&2
+            return 1
         fi
         if ((bucket_delete_outstanding_depth == 0)); then
             echo "== argmin-s3 UAT cleanup metrics: operation_aborted_delta=$((operation_aborted - initial_operation_aborted)) slow_down_delta=$((slow_down - initial_slow_down)) request_error_delta=$((request_error - initial_request_error)) http_500_delta=$((http_500 - initial_http_500)) bucket_delete_queue_depth=$bucket_delete_queue_depth bucket_delete_outstanding_depth=$bucket_delete_outstanding_depth =="
@@ -2445,7 +2496,8 @@ assert_cleanup_versioned_stress_metrics_clean() {
         fi
         if (($(date +%s) - start >= deadline_seconds)); then
             cat "$metrics_path" >&2 || true
-            die "cleanup versioned stress left bucket delete finalizer outstanding depth $bucket_delete_outstanding_depth"
+            echo "error: cleanup versioned stress left bucket delete finalizer outstanding depth $bucket_delete_outstanding_depth" >&2
+            return 1
         fi
         sleep 0.2
     done
@@ -2455,6 +2507,7 @@ run_cleanup_versioned_stress_smoke() {
     local iteration="${1:-1}"
     local smoke_dir="$data_dir/cleanup-versioned-stress-smoke/iteration-$iteration"
     local body_file="$smoke_dir/body.bin"
+    local bucket_list_file="$smoke_dir/buckets"
     local metrics_path="$smoke_dir/metrics.prom"
     local bucket_count="${ARGMIN_CLEANUP_VERSIONED_STRESS_BUCKETS:-2}"
     local keys_per_bucket="${ARGMIN_CLEANUP_VERSIONED_STRESS_KEYS:-4}"
@@ -2478,15 +2531,22 @@ run_cleanup_versioned_stress_smoke() {
     initial_request_error="$(latest_metric_sample_value "$metrics_path" request_error_total)"
 
     echo "== argmin-s3 UAT cleanup versioned stress workload =="
-    print_command "${pg_backfill_smoke_cmd[@]}" cleanup-versioned-stress "$bucket_count" "$keys_per_bucket" "$versions_per_key" "uat-cleanup-versioned-stress-$iteration" "$body_file"
-    "${pg_backfill_smoke_cmd[@]}" cleanup-versioned-stress "$bucket_count" "$keys_per_bucket" "$versions_per_key" "uat-cleanup-versioned-stress-$iteration" "$body_file"
+    : >"$bucket_list_file"
+    print_command "${pg_backfill_smoke_cmd[@]}" cleanup-versioned-stress "$bucket_count" "$keys_per_bucket" "$versions_per_key" "uat-cleanup-versioned-stress-$iteration" "$body_file" "$bucket_list_file"
+    if ! "${pg_backfill_smoke_cmd[@]}" cleanup-versioned-stress "$bucket_count" "$keys_per_bucket" "$versions_per_key" "uat-cleanup-versioned-stress-$iteration" "$body_file" "$bucket_list_file"; then
+        print_bucket_list_delete_attempt_debug "$bucket_list_file"
+        return 1
+    fi
     assert_cleanup_versioned_stress_metrics_clean \
         "$metrics_path" \
         "$initial_http_500" \
         "$initial_operation_aborted" \
         "$initial_slow_down" \
         "$initial_request_error" \
-        20
+        20 || {
+            print_bucket_list_delete_attempt_debug "$bucket_list_file"
+            return 1
+        }
 }
 
 assert_pg_backfill_migration_final_clean() {

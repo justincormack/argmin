@@ -1,4 +1,4 @@
-use std::{collections::BTreeSet, path::Path};
+use std::{collections::BTreeSet, io::Write, path::Path};
 
 use s3_tests::{
     aws_sdk_s3::{
@@ -15,7 +15,7 @@ use storage::{BucketName, GenerationId, ObjectKey, PgTopology};
 
 fn usage() -> ! {
     eprintln!(
-        "usage: uat_pg_backfill_smoke create-put <bucket-file> <key> <body-file> | create-versioned-put-distinct-data-pg <bucket-file> <key-file> <data-pg-file> <key-prefix> <body-file> [target-data-pg] [excluded-metadata-pg-csv] | create-put-distinct-data-pg <bucket-file> <key-file> <data-pg-file> <key-prefix> <body-file> [target-data-pg] [excluded-metadata-pg-csv] | create-put-metadata-pg <bucket-file> <key-file> <metadata-pg-file> <key-prefix> <body-file> <target-metadata-pg> | put-for-data-pg <bucket-file> <key-file> <key-prefix> <body-file> <data-pg> [excluded-metadata-pg-csv] | put-for-metadata-pg <bucket-file> <key-file> <key-prefix> <body-file> <target-metadata-pg> | put <bucket-file> <key> <body-file> | put-expect-failure <bucket-file> <key> <body-file> | get <bucket-file> <key> <body-file> | get-expect-failure <bucket-file> <key> | head <bucket-file> <key> <body-file> | head-expect-failure <bucket-file> <key> | list-contains <bucket-file> <key>... | list-expect-failure <bucket-file> | list-versions-contains <bucket-file> <key>... | cleanup <bucket-file> <key>... | cleanup-versioned <bucket-file> | cleanup-versioned-stress <bucket-count> <keys-per-bucket> <versions-per-key> <key-prefix> <body-file>"
+        "usage: uat_pg_backfill_smoke create-put <bucket-file> <key> <body-file> | create-versioned-put-distinct-data-pg <bucket-file> <key-file> <data-pg-file> <key-prefix> <body-file> [target-data-pg] [excluded-metadata-pg-csv] | create-put-distinct-data-pg <bucket-file> <key-file> <data-pg-file> <key-prefix> <body-file> [target-data-pg] [excluded-metadata-pg-csv] | create-put-metadata-pg <bucket-file> <key-file> <metadata-pg-file> <key-prefix> <body-file> <target-metadata-pg> | put-for-data-pg <bucket-file> <key-file> <key-prefix> <body-file> <data-pg> [excluded-metadata-pg-csv] | put-for-metadata-pg <bucket-file> <key-file> <key-prefix> <body-file> <target-metadata-pg> | put <bucket-file> <key> <body-file> | put-expect-failure <bucket-file> <key> <body-file> | get <bucket-file> <key> <body-file> | get-expect-failure <bucket-file> <key> | head <bucket-file> <key> <body-file> | head-expect-failure <bucket-file> <key> | list-contains <bucket-file> <key>... | list-expect-failure <bucket-file> | list-versions-contains <bucket-file> <key>... | cleanup <bucket-file> <key>... | cleanup-versioned <bucket-file> | cleanup-versioned-stress <bucket-count> <keys-per-bucket> <versions-per-key> <key-prefix> <body-file> [bucket-log-file]"
     );
     std::process::exit(2);
 }
@@ -373,6 +373,7 @@ async fn cleanup_versioned_stress(
     versions_per_key: usize,
     key_prefix: &str,
     body: &[u8],
+    bucket_log_path: Option<&Path>,
 ) {
     assert!(bucket_count > 0, "bucket-count must be greater than zero");
     assert!(
@@ -389,6 +390,18 @@ async fn cleanup_versioned_stress(
     for bucket_index in 0..bucket_count {
         let target_bucket_pg = pg_ids[bucket_index % pg_ids.len()];
         let bucket = choose_bucket_with_metadata_pg(target_bucket_pg);
+        if let Some(bucket_log_path) = bucket_log_path {
+            let mut bucket_log = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(bucket_log_path)
+                .unwrap_or_else(|error| {
+                    panic!("open bucket log {}: {error}", bucket_log_path.display())
+                });
+            writeln!(bucket_log, "{bucket}").unwrap_or_else(|error| {
+                panic!("write bucket log {}: {error}", bucket_log_path.display())
+            });
+        }
         eprintln!(
             "cleanup-versioned-stress: bucket={} bucket_pg={} index={}/{}",
             bucket,
@@ -917,12 +930,14 @@ fn main() {
             let Some(body_file) = args.next() else {
                 usage();
             };
+            let bucket_log_file = args.next();
             if args.next().is_some() {
                 usage();
             }
             run(async {
                 let client = client_from_env();
                 let body = read_body(Path::new(&body_file));
+                let bucket_log_path = bucket_log_file.as_deref().map(Path::new);
                 cleanup_versioned_stress(
                     &client,
                     bucket_count,
@@ -930,6 +945,7 @@ fn main() {
                     versions_per_key,
                     &key_prefix,
                     &body,
+                    bucket_log_path,
                 )
                 .await;
             });
