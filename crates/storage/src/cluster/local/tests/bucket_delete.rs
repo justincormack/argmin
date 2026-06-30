@@ -3451,19 +3451,29 @@ fn begin_bucket_delete_adopts_preserved_post_reservation_frontier() {
         preserved_frontier > 0 && preserved_frontier < pg_count,
         "frontier should identify a partial post-reservation scan, got {preserved_frontier}"
     );
+    let resume_root = match cluster.try_take_reclaim_work() {
+        Some(crate::ReclaimWorkItem::BucketDeleteBegin(root)) => root,
+        other => panic!(
+            "retryable preserved DeleteBucket begin should queue background resume work, got {other:?}"
+        ),
+    };
+    assert_eq!(resume_root.bucket, bucket);
     assert_eq!(
-        cluster.try_take_reclaim_work(),
-        Some(crate::ReclaimWorkItem::BucketDeleteBegin(
-            crate::BucketDeleteBeginRoot {
-                bucket: bucket.clone(),
-                bucket_execution_generation: initial_bucket.bucket_execution_generation,
-                bucket_incarnation_generation: initial_bucket.bucket_incarnation_generation,
-            }
-        )),
-        "retryable preserved DeleteBucket begin should queue background resume work"
+        resume_root.bucket_execution_generation,
+        initial_bucket.bucket_execution_generation
+    );
+    assert_eq!(
+        resume_root.bucket_incarnation_generation,
+        initial_bucket.bucket_incarnation_generation
     );
 
-    cluster.begin_bucket_delete(&bucket).unwrap();
+    cluster
+        .begin_bucket_delete_if_current(
+            &resume_root.bucket,
+            resume_root.bucket_execution_generation,
+            resume_root.bucket_incarnation_generation,
+        )
+        .unwrap();
 
     assert!(
         pending_metadata_command_for_test(&map, later_pg_id, &bucket).is_none(),
