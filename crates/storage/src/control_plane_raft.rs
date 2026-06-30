@@ -529,6 +529,106 @@ impl ControlPlaneRaftAuthorityAdmin for ControlPlaneRaftAuthorityServiceHandle {
     }
 }
 
+#[derive(Clone)]
+pub struct ControlPlaneRaftAuthorityRoutingHandle {
+    observer: ControlPlaneRaftAuthorityServiceHandle,
+    directory: ControlPlaneRaftAuthorityServiceDirectoryHandle,
+}
+
+impl ControlPlaneRaftAuthorityRoutingHandle {
+    #[must_use]
+    pub fn new(
+        observer: ControlPlaneRaftAuthorityServiceHandle,
+        directory: ControlPlaneRaftAuthorityServiceDirectoryHandle,
+    ) -> Self {
+        Self {
+            observer,
+            directory,
+        }
+    }
+
+    pub async fn current_leader_service(
+        &self,
+    ) -> Result<ControlPlaneRaftAuthorityServiceHandle, ControlPlaneError> {
+        let status = self.observer.status().await?;
+        self.directory
+            .authority_service_for_status_leader(&status)
+            .await
+    }
+
+    pub async fn submit_control_plane_command(
+        &self,
+        command: ControlPlaneCommand,
+    ) -> Result<SubmittedControlPlaneRaftCommand, ControlPlaneError> {
+        self.current_leader_service()
+            .await?
+            .submit_control_plane_command(command)
+            .await
+    }
+
+    pub async fn linearized_runtime_map_snapshot(
+        &self,
+        issued_at_ms: u64,
+    ) -> Result<ClusterRuntimeMapSnapshot, ControlPlaneError> {
+        self.current_leader_service()
+            .await?
+            .linearized_runtime_map_snapshot(issued_at_ms)
+            .await
+    }
+
+    pub async fn observer_status(
+        &self,
+    ) -> Result<ControlPlaneRaftAuthorityStatus, ControlPlaneError> {
+        self.observer.status().await
+    }
+
+    pub async fn status(&self) -> Result<ControlPlaneRaftAuthorityStatus, ControlPlaneError> {
+        self.current_leader_service().await?.status().await
+    }
+}
+
+impl fmt::Debug for ControlPlaneRaftAuthorityRoutingHandle {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ControlPlaneRaftAuthorityRoutingHandle")
+            .finish_non_exhaustive()
+    }
+}
+
+impl ControlPlaneRaftLinearizedCommandSink for ControlPlaneRaftAuthorityRoutingHandle {
+    fn submit_control_plane_command(
+        &self,
+        command: ControlPlaneCommand,
+    ) -> ControlPlaneRaftFuture<'_, Result<SubmittedControlPlaneRaftCommand, ControlPlaneError>>
+    {
+        Box::pin(
+            ControlPlaneRaftAuthorityRoutingHandle::submit_control_plane_command(self, command),
+        )
+    }
+}
+
+impl ControlPlaneRaftLinearizedRuntimeMapSource for ControlPlaneRaftAuthorityRoutingHandle {
+    fn linearized_runtime_map_snapshot(
+        &self,
+        issued_at_ms: u64,
+    ) -> ControlPlaneRaftFuture<'_, Result<ClusterRuntimeMapSnapshot, ControlPlaneError>> {
+        Box::pin(
+            ControlPlaneRaftAuthorityRoutingHandle::linearized_runtime_map_snapshot(
+                self,
+                issued_at_ms,
+            ),
+        )
+    }
+}
+
+impl ControlPlaneRaftAuthorityStatusSource for ControlPlaneRaftAuthorityRoutingHandle {
+    fn status(
+        &self,
+    ) -> ControlPlaneRaftFuture<'_, Result<ControlPlaneRaftAuthorityStatus, ControlPlaneError>>
+    {
+        Box::pin(ControlPlaneRaftAuthorityRoutingHandle::status(self))
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ControlPlaneRaftAuthorityStatus {
     node_id: ControlPlaneRaftNodeId,
@@ -4966,8 +5066,12 @@ mod tests {
                 "authority service directory lookup follower",
             )
             .await;
+            let routed_client = ControlPlaneRaftAuthorityRoutingHandle::new(
+                leader_service.clone(),
+                directory.clone(),
+            );
             let bootstrap = expect_bounded_control_plane_raft(
-                leader_service.submit_control_plane_command(
+                routed_client.submit_control_plane_command(
                     ControlPlaneCommand::BootstrapInitialClusterMap {
                         nodes: vec![
                             (NodeId::new(411), "node-411".to_string()),
@@ -5013,8 +5117,53 @@ mod tests {
                 "authority service directory wait for transferred leader",
             )
             .await;
+            expect_bounded_control_plane_raft(
+                leader_service.wait_for_current_leader(
+                    412,
+                    Duration::from_secs(1),
+                    "authority service directory observer saw transferred leader",
+                ),
+                operation_timeout,
+                "authority service directory wait for observer transfer view",
+            )
+            .await;
+            let routed_write = expect_bounded_control_plane_raft(
+                routed_client.submit_control_plane_command(
+                    ControlPlaneCommand::MarkNodeAvailability {
+                        node_id: NodeId::new(411),
+                        availability: NodeAvailabilityState::Unavailable,
+                    },
+                ),
+                operation_timeout,
+                "authority service directory routed command after transfer",
+            )
+            .await;
+            assert!(matches!(
+                routed_write.outcome(),
+                ControlPlaneRaftCommandOutcome::Applied(
+                    ControlPlaneCommandResponse::MarkNodeAvailability
+                )
+            ));
             let follower_status = follower_service.status().await.unwrap();
             assert_eq!(follower_status.current_leader(), Some(412));
+            let routed_status = expect_bounded_control_plane_raft(
+                routed_client.status(),
+                operation_timeout,
+                "authority service directory routed status after transfer",
+            )
+            .await;
+            assert_eq!(routed_status.node_id(), 412);
+            assert!(routed_status.local_leader());
+            assert!(routed_status.linearized_authority_serving());
+            let observer_status = expect_bounded_control_plane_raft(
+                routed_client.observer_status(),
+                operation_timeout,
+                "authority service directory observer status after transfer",
+            )
+            .await;
+            assert_eq!(observer_status.node_id(), 411);
+            assert_eq!(observer_status.current_leader(), Some(412));
+            assert!(!observer_status.local_leader());
             let routed_leader_service = expect_bounded_control_plane_raft(
                 directory.authority_service_for_status_leader(&follower_status),
                 operation_timeout,
@@ -5022,7 +5171,7 @@ mod tests {
             )
             .await;
             let runtime_map = expect_bounded_control_plane_raft(
-                routed_leader_service.linearized_runtime_map_snapshot(91_000),
+                routed_client.linearized_runtime_map_snapshot(91_000),
                 operation_timeout,
                 "authority service directory routed runtime map read",
             )
@@ -5036,6 +5185,16 @@ mod tests {
                 .nodes()
                 .iter()
                 .any(|node| node.node_id() == NodeId::new(412)));
+            let direct_runtime_map = expect_bounded_control_plane_raft(
+                routed_leader_service.linearized_runtime_map_snapshot(91_001),
+                operation_timeout,
+                "authority service directory direct leader runtime map read",
+            )
+            .await;
+            assert_eq!(
+                direct_runtime_map.freshness_proof().issued_at_ms(),
+                Some(91_001)
+            );
 
             expect_bounded_control_plane_raft(
                 leader_service.shutdown(),

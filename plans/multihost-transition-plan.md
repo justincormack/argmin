@@ -9778,6 +9778,14 @@ Phase 12.1 progress:
   directory to resolve the current leader service without naming the concrete
   OpenRaft wrapper; the directory smoke now transfers leadership and serves a
   runtime-map read through the status-derived leader route.
+- Added a cloneable OpenRaft authority routing handle that composes an observer
+  service with the service directory. Linearized command submission and
+  runtime-map reads now have a capability-level client surface that observes
+  the current leader, resolves it through the directory, and executes the
+  operation on the leader service. Its status view is routed to the same leader
+  capability, with the observer-local status exposed only through an explicit
+  observer method; the directory smoke proves the same client continues routing
+  correctly after leadership transfer.
 
 1. define the replicated control-plane state machine:
    - state includes cluster epoch, PG count, PG state, PG acting sets, node
