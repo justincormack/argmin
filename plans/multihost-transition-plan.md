@@ -9009,7 +9009,11 @@ Keep an explicit Phase 11 close-out before treating the phase as soak-clean:
     durable state, not only public S3 visibility: bucket row, finalizer claim,
     bucket write drain, pending command slot, object rows, object reclaim roots,
     payload reclaim claims, current route-map epoch/valid-until, and queue
-    depths for the current runtime generation;
+    depths for the current runtime generation. A local-only debug endpoint now
+    exposes the durable `DeleteBucket` attempt outcome/progress row for a named
+    bucket, including outcome, phase, post-reservation frontier, and detail, so
+    a failing soak run can inspect the bucket-PG attempt state directly without
+    relying only on public S3 visibility;
 17. status: open. Define a repeatable soak gate for closing this hardening phase. At minimum,
     `cleanup-versioned-stress --repeat 30`, the correctness soak, and one
     restart/failover cleanup variant should pass without HTTP 500s, stuck

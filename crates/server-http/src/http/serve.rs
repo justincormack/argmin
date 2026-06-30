@@ -18,7 +18,8 @@ use tokio::sync::Semaphore;
 use tokio_rustls::TlsAcceptor;
 
 use super::request::{
-    parse_upload_part_query, S3Request, TransportSecurity, MAX_BUFFERED_CONTROL_BODY_SIZE,
+    parse_upload_part_query, percent_decode_strict, S3Request, TransportSecurity,
+    MAX_BUFFERED_CONTROL_BODY_SIZE,
 };
 use super::response::{S3Response, WireResponseIds};
 use super::router::{route, S3Operation};
@@ -27,7 +28,10 @@ use super::{HttpFrontend, S3HyperBody};
 use crate::coordinator::MAX_OBJECT_SIZE;
 use crate::error::ServerError;
 use server_core::metadata_blob::USER_METADATA_SIZE_LIMIT;
-use storage::{BucketName, PgId, SessionId};
+use storage::{
+    BucketDeleteAttemptOutcomeKind, BucketDeleteAttemptOutcomeRecord, BucketDeleteAttemptPhase,
+    BucketName, PgId, SessionId,
+};
 
 const TRACE_TARGET: &str = "server_http";
 const MAX_STREAMING_POST_PART_HEADER_BYTES: usize = 8 * 1024;
@@ -1034,6 +1038,48 @@ fn local_debug_response(
                 error_diagnostic: None,
             })
         }
+        (&http::Method::GET, path)
+            if path.starts_with("/__argmin/debug/bucket-delete-attempt/") =>
+        {
+            let raw_bucket = path.trim_start_matches("/__argmin/debug/bucket-delete-attempt/");
+            let bucket = match percent_decode_strict(raw_bucket)
+                .ok()
+                .and_then(|bucket| BucketName::try_from(bucket).ok())
+            {
+                Some(bucket) => bucket,
+                None => {
+                    return Some(local_debug_text_response(
+                        400,
+                        "invalid bucket\n".to_string(),
+                    ));
+                }
+            };
+            let storage = state
+                .pool
+                .first()
+                .expect("server has at least one frontend")
+                .coordinator
+                .storage_node_for_request();
+            match storage.bucket_delete_attempt_outcome(&bucket) {
+                Ok(Some(record)) => Some(local_debug_text_response(
+                    200,
+                    local_debug_bucket_delete_attempt_body(
+                        &bucket,
+                        storage.bucket_pg_id_for(&bucket),
+                        Some(&record),
+                    ),
+                )),
+                Ok(None) => Some(local_debug_text_response(
+                    200,
+                    local_debug_bucket_delete_attempt_body(
+                        &bucket,
+                        storage.bucket_pg_id_for(&bucket),
+                        None,
+                    ),
+                )),
+                Err(error) => Some(local_debug_text_response(409, format!("{error:?}\n"))),
+            }
+        }
         (&http::Method::POST, path)
             if path.starts_with("/__argmin/debug/metadata-checkpoint/record/") =>
         {
@@ -1117,6 +1163,53 @@ fn local_debug_text_response(status_code: u16, body: String) -> S3Response {
         body: body.into_bytes(),
         stream: None,
         error_diagnostic: None,
+    }
+}
+
+fn local_debug_bucket_delete_attempt_body(
+    bucket: &BucketName,
+    pg_id: u32,
+    record: Option<&BucketDeleteAttemptOutcomeRecord>,
+) -> String {
+    match record {
+        Some(record) => format!(
+            "present=1 bucket={:?} pg_id={} drain_id={:?} cluster_epoch={} bucket_execution_generation={} outcome={} phase={} post_reservation_next_object_pg_id={} updated_at={} detail={}\n",
+            bucket.as_str(),
+            pg_id,
+            record.drain_id,
+            record.cluster_epoch.get(),
+            record.bucket_execution_generation,
+            local_debug_bucket_delete_attempt_outcome(record.outcome),
+            local_debug_bucket_delete_attempt_phase(record.phase),
+            record
+                .post_reservation_next_object_pg_id
+                .map_or_else(|| "none".to_string(), |pg_id| pg_id.to_string()),
+            record.updated_at,
+            observability::escaped(&record.detail),
+        ),
+        None => format!("present=0 bucket={:?} pg_id={}\n", bucket.as_str(), pg_id),
+    }
+}
+
+fn local_debug_bucket_delete_attempt_outcome(
+    outcome: BucketDeleteAttemptOutcomeKind,
+) -> &'static str {
+    match outcome {
+        BucketDeleteAttemptOutcomeKind::Retryable => "retryable",
+        BucketDeleteAttemptOutcomeKind::NotEmpty => "not_empty",
+        BucketDeleteAttemptOutcomeKind::StaleGeneration => "stale_generation",
+        BucketDeleteAttemptOutcomeKind::MarkDeleting => "mark_deleting",
+    }
+}
+
+fn local_debug_bucket_delete_attempt_phase(phase: BucketDeleteAttemptPhase) -> &'static str {
+    match phase {
+        BucketDeleteAttemptPhase::Initial => "initial",
+        BucketDeleteAttemptPhase::ReservationWait => "reservation_wait",
+        BucketDeleteAttemptPhase::PostReservationObjectDrain => "post_reservation_object_drain",
+        BucketDeleteAttemptPhase::StreamCleanup => "stream_cleanup",
+        BucketDeleteAttemptPhase::FinalVisibilityCheck => "final_visibility_check",
+        BucketDeleteAttemptPhase::MarkDeleting => "mark_deleting",
     }
 }
 
@@ -4861,6 +4954,79 @@ mod tests {
         assert!(response.contains("request_admission_wait_total "));
         assert!(response.contains("request_admission_timeout_total "));
         assert!(!response.contains("bucket_lock_wait_exceeded_total "));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn local_debug_bucket_delete_attempt_endpoint_returns_absent_record() {
+        let tmp = test_util::tempdir();
+        let frontend = setup_frontend(tmp.path());
+        create_test_bucket(&frontend, "debug-attempt-bucket");
+        let config = ServeConfig {
+            local_debug_endpoint: true,
+            ..ServeConfig::default()
+        };
+        let (addr, _guard) = start_test_server_with_config(frontend, config, 0).await;
+
+        let mut stream = StdTcpStream::connect(&addr).unwrap();
+        stream
+            .write_all(
+                concat!(
+                    "GET /__argmin/debug/bucket-delete-attempt/%64ebug-attempt-bucket HTTP/1.1\r\n",
+                    "Host: localhost\r\n",
+                    "Connection: close\r\n",
+                    "\r\n",
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+        let response = read_http_response(&mut stream, Duration::from_secs(3));
+
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert!(response.contains("present=0"), "{response}");
+        assert!(
+            response.contains("bucket=\"debug-attempt-bucket\""),
+            "{response}"
+        );
+        assert!(response.contains("pg_id="), "{response}");
+    }
+
+    #[test]
+    fn local_debug_bucket_delete_attempt_body_formats_populated_record() {
+        let bucket = BucketName::try_from("debug-attempt-bucket".to_string()).unwrap();
+        let record = BucketDeleteAttemptOutcomeRecord {
+            bucket: bucket.clone(),
+            drain_id: "delete-drain-1".to_string(),
+            cluster_epoch: storage::ClusterEpoch::new(7).unwrap(),
+            bucket_execution_generation: 11,
+            outcome: BucketDeleteAttemptOutcomeKind::Retryable,
+            phase: BucketDeleteAttemptPhase::PostReservationObjectDrain,
+            detail: "line1\nline2\t\x1b[31m".to_string(),
+            post_reservation_next_object_pg_id: Some(17),
+            updated_at: 12345,
+        };
+
+        let body = local_debug_bucket_delete_attempt_body(&bucket, 3, Some(&record));
+
+        assert!(body.starts_with("present=1 "), "{body}");
+        assert!(body.contains("bucket=\"debug-attempt-bucket\""), "{body}");
+        assert!(body.contains("pg_id=3"), "{body}");
+        assert!(body.contains("drain_id=\"delete-drain-1\""), "{body}");
+        assert!(body.contains("cluster_epoch=7"), "{body}");
+        assert!(body.contains("bucket_execution_generation=11"), "{body}");
+        assert!(body.contains("outcome=retryable"), "{body}");
+        assert!(
+            body.contains("phase=post_reservation_object_drain"),
+            "{body}"
+        );
+        assert!(
+            body.contains("post_reservation_next_object_pg_id=17"),
+            "{body}"
+        );
+        assert!(body.contains("updated_at=12345"), "{body}");
+        assert!(
+            body.contains(r#"detail="line1\nline2\t\u{1b}[31m""#),
+            "{body}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

@@ -11338,6 +11338,10 @@ impl super::StorageCluster {
         self.bucket_metadata_pg_id(bucket)
     }
 
+    pub fn bucket_pg_id_for(&self, bucket: &BucketName) -> u32 {
+        self.bucket_metadata_pg_id(bucket)
+    }
+
     #[cfg(any(test, feature = "test-hooks"))]
     pub fn test_head_bucket_raw(
         &self,
@@ -11345,6 +11349,18 @@ impl super::StorageCluster {
     ) -> Result<BucketInfo, BucketSnapshotLoadError> {
         self.metadata_primary_bridge_node()?
             .test_head_bucket_raw(bucket)
+    }
+
+    pub fn bucket_delete_attempt_outcome(
+        &self,
+        bucket: &BucketName,
+    ) -> Result<Option<BucketDeleteAttemptOutcomeRecord>, BucketSnapshotLoadError> {
+        let pg_id = PgId::new(self.bucket_metadata_pg_id(bucket));
+        let node = self
+            .local_map
+            .metadata_pg_primary_node(self.operation_epoch(), pg_id)?;
+        node.bucket_write_reservation_client()
+            .bucket_delete_attempt_outcome(pg_id, bucket)
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
