@@ -122,8 +122,10 @@ pub struct ControlPlaneRaftAuthorityStatus {
     current_snapshot: Option<LogIdOf<ControlPlaneRaftTypeConfig>>,
     effective_membership_log_id: Option<LogIdOf<ControlPlaneRaftTypeConfig>>,
     effective_voters: BTreeSet<ControlPlaneRaftNodeId>,
+    effective_learners: BTreeSet<ControlPlaneRaftNodeId>,
     applied_membership_log_id: Option<LogIdOf<ControlPlaneRaftTypeConfig>>,
     applied_voters: BTreeSet<ControlPlaneRaftNodeId>,
+    applied_learners: BTreeSet<ControlPlaneRaftNodeId>,
 }
 
 impl ControlPlaneRaftAuthorityStatus {
@@ -183,6 +185,11 @@ impl ControlPlaneRaftAuthorityStatus {
     }
 
     #[must_use]
+    pub fn effective_learners(&self) -> &BTreeSet<ControlPlaneRaftNodeId> {
+        &self.effective_learners
+    }
+
+    #[must_use]
     pub fn applied_membership_log_id(&self) -> Option<LogIdOf<ControlPlaneRaftTypeConfig>> {
         self.applied_membership_log_id
     }
@@ -190,6 +197,11 @@ impl ControlPlaneRaftAuthorityStatus {
     #[must_use]
     pub fn applied_voters(&self) -> &BTreeSet<ControlPlaneRaftNodeId> {
         &self.applied_voters
+    }
+
+    #[must_use]
+    pub fn applied_learners(&self) -> &BTreeSet<ControlPlaneRaftNodeId> {
+        &self.applied_learners
     }
 }
 
@@ -334,7 +346,13 @@ impl ControlPlaneRaftAuthority {
             .transpose()
             .map_err(|error| openraft_remote_error("status log-store read", error))?
             .flatten();
-        let (last_log_id, committed, effective_membership_log_id, effective_voters) = self
+        let (
+            last_log_id,
+            committed,
+            effective_membership_log_id,
+            effective_voters,
+            effective_learners,
+        ) = self
             .raft
             .with_raft_state(|state| {
                 let effective_membership = state.membership_state.effective();
@@ -343,11 +361,18 @@ impl ControlPlaneRaftAuthority {
                     state.local_committed().cloned(),
                     *effective_membership.log_id(),
                     effective_membership.membership().voter_ids().collect(),
+                    effective_membership.membership().learner_ids().collect(),
                 )
             })
             .await
             .map_err(|error| openraft_remote_error("status raft-state read", error))?;
-        let (applied, current_snapshot, applied_membership_log_id, applied_voters) = self
+        let (
+            applied,
+            current_snapshot,
+            applied_membership_log_id,
+            applied_voters,
+            applied_learners,
+        ) = self
             .raft
             .with_state_machine(|state_machine| {
                 let last_applied = state_machine.last_applied();
@@ -357,7 +382,16 @@ impl ControlPlaneRaftAuthority {
                 let membership = state_machine.last_membership();
                 let membership_log_id = *membership.log_id();
                 let voters = membership.membership().voter_ids().collect();
-                Box::pin(async move { (last_applied, current_snapshot, membership_log_id, voters) })
+                let learners = membership.membership().learner_ids().collect();
+                Box::pin(async move {
+                    (
+                        last_applied,
+                        current_snapshot,
+                        membership_log_id,
+                        voters,
+                        learners,
+                    )
+                })
             })
             .await
             .map_err(|error| openraft_remote_error("status state-machine read", error))?;
@@ -373,8 +407,10 @@ impl ControlPlaneRaftAuthority {
             current_snapshot,
             effective_membership_log_id,
             effective_voters,
+            effective_learners,
             applied_membership_log_id,
             applied_voters,
+            applied_learners,
         })
     }
 
@@ -4118,7 +4154,21 @@ mod tests {
                 .unwrap();
             let learner_status = authority3.status().await.unwrap();
             assert_eq!(learner_status.applied(), Some(learner_log_id));
+            assert_eq!(
+                learner_status.effective_membership_log_id(),
+                Some(learner_log_id)
+            );
+            assert_eq!(
+                learner_status.effective_voters(),
+                &BTreeSet::from([601, 602])
+            );
+            assert_eq!(learner_status.effective_learners(), &BTreeSet::from([603]));
+            assert_eq!(
+                learner_status.applied_membership_log_id(),
+                Some(learner_log_id)
+            );
             assert_eq!(learner_status.applied_voters(), &BTreeSet::from([601, 602]));
+            assert_eq!(learner_status.applied_learners(), &BTreeSet::from([603]));
 
             let promote_log_id = authority1
                 .replace_voters(BTreeSet::from([601, 602, 603]), true)
@@ -4150,6 +4200,7 @@ mod tests {
                 leader_status.effective_voters(),
                 &BTreeSet::from([601, 602, 603])
             );
+            assert_eq!(leader_status.effective_learners(), &BTreeSet::new());
             assert_eq!(
                 leader_status.applied_membership_log_id(),
                 Some(promote_log_id)
@@ -4158,6 +4209,7 @@ mod tests {
                 leader_status.applied_voters(),
                 &BTreeSet::from([601, 602, 603])
             );
+            assert_eq!(leader_status.applied_learners(), &BTreeSet::new());
 
             let promoted_status = authority3.status().await.unwrap();
             assert_eq!(promoted_status.applied(), Some(promote_log_id));
@@ -4169,6 +4221,7 @@ mod tests {
                 promoted_status.effective_voters(),
                 &BTreeSet::from([601, 602, 603])
             );
+            assert_eq!(promoted_status.effective_learners(), &BTreeSet::new());
             assert_eq!(
                 promoted_status.applied_membership_log_id(),
                 Some(promote_log_id)
@@ -4177,6 +4230,7 @@ mod tests {
                 promoted_status.applied_voters(),
                 &BTreeSet::from([601, 602, 603])
             );
+            assert_eq!(promoted_status.applied_learners(), &BTreeSet::new());
 
             authority1.shutdown().await.unwrap();
             authority2.shutdown().await.unwrap();

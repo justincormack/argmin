@@ -9635,6 +9635,11 @@ Phase 12.1 progress:
   wrapper. After deterministic leadership transfer, the old leader now fails
   closed not only for linearized runtime-map reads and client writes, but also
   for voter replacement and learner addition requests.
+- Extended the OpenRaft authority status surface with effective and applied
+  learner sets. The learner lifecycle smoke now proves the added learner is
+  visible as a learner through both the Raft effective membership and the
+  applied state-machine membership before promotion, and that promotion clears
+  the learner set while exposing the final voter set.
 
 1. define the replicated control-plane state machine:
    - state includes cluster epoch, PG count, PG state, PG acting sets, node
