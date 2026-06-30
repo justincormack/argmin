@@ -115,6 +115,7 @@ pub struct ControlPlaneRaftAuthorityStatus {
     last_log_id: Option<LogIdOf<ControlPlaneRaftTypeConfig>>,
     committed: Option<LogIdOf<ControlPlaneRaftTypeConfig>>,
     applied: Option<LogIdOf<ControlPlaneRaftTypeConfig>>,
+    current_snapshot: Option<LogIdOf<ControlPlaneRaftTypeConfig>>,
     effective_membership_log_id: Option<LogIdOf<ControlPlaneRaftTypeConfig>>,
     effective_voters: BTreeSet<ControlPlaneRaftNodeId>,
     applied_membership_log_id: Option<LogIdOf<ControlPlaneRaftTypeConfig>>,
@@ -145,6 +146,11 @@ impl ControlPlaneRaftAuthorityStatus {
     #[must_use]
     pub fn applied(&self) -> Option<LogIdOf<ControlPlaneRaftTypeConfig>> {
         self.applied
+    }
+
+    #[must_use]
+    pub fn current_snapshot(&self) -> Option<LogIdOf<ControlPlaneRaftTypeConfig>> {
+        self.current_snapshot
     }
 
     #[must_use]
@@ -293,14 +299,17 @@ impl ControlPlaneRaftAuthority {
             })
             .await
             .map_err(|error| openraft_remote_error("status raft-state read", error))?;
-        let (applied, applied_membership_log_id, applied_voters) = self
+        let (applied, current_snapshot, applied_membership_log_id, applied_voters) = self
             .raft
             .with_state_machine(|state_machine| {
                 let last_applied = state_machine.last_applied();
+                let current_snapshot = state_machine
+                    .current_snapshot()
+                    .and_then(|snapshot| snapshot.meta.last_log_id);
                 let membership = state_machine.last_membership();
                 let membership_log_id = *membership.log_id();
                 let voters = membership.membership().voter_ids().collect();
-                Box::pin(async move { (last_applied, membership_log_id, voters) })
+                Box::pin(async move { (last_applied, current_snapshot, membership_log_id, voters) })
             })
             .await
             .map_err(|error| openraft_remote_error("status state-machine read", error))?;
@@ -310,6 +319,7 @@ impl ControlPlaneRaftAuthority {
             last_log_id,
             committed,
             applied,
+            current_snapshot,
             effective_membership_log_id,
             effective_voters,
             applied_membership_log_id,
@@ -523,6 +533,12 @@ impl ControlPlaneRaftLogStore {
             last_purged_log_id: inner.last_purged_log_id,
             entries: inner.entries.values().cloned().collect(),
         })
+    }
+
+    pub fn last_purged_log_id(
+        &self,
+    ) -> Result<Option<LogIdOf<ControlPlaneRaftTypeConfig>>, io::Error> {
+        Ok(self.lock()?.last_purged_log_id)
     }
 
     pub fn from_restart_artifact(
@@ -1013,20 +1029,20 @@ impl RaftLogStorage<ControlPlaneRaftTypeConfig> for ControlPlaneRaftLogStore {
                 )));
             }
         }
-        if let Some(committed) = inner.committed {
-            if log_id.index() > committed.index() {
-                return Err(raft_log_store_error(format!(
-                    "cannot purge control-plane OpenRaft log to {log_id}; committed log id is {committed}"
-                )));
-            }
-        } else {
+        if inner.committed.is_none() {
             return Err(raft_log_store_error(format!(
                 "cannot purge control-plane OpenRaft log to {log_id}; no committed restart gate"
             )));
         }
-        Self::validate_known_log_id(&inner, "purge to", log_id)?;
+        Self::validate_vote_covers_committed(inner.vote, log_id)?;
         inner.entries.retain(|index, _| *index > log_id.index());
         inner.last_purged_log_id = Some(log_id);
+        if inner
+            .committed
+            .is_some_and(|committed| committed.index() < log_id.index())
+        {
+            inner.committed = Some(log_id);
+        }
         Ok(())
     }
 }
@@ -1913,6 +1929,13 @@ mod tests {
     }
 
     fn test_raft_config(cluster_name: &'static str) -> Arc<Config> {
+        test_raft_config_with_log_reversion(cluster_name, None)
+    }
+
+    fn test_raft_config_with_log_reversion(
+        cluster_name: &'static str,
+        allow_log_reversion: Option<bool>,
+    ) -> Arc<Config> {
         Arc::new(
             Config {
                 cluster_name: cluster_name.to_string(),
@@ -1922,6 +1945,7 @@ mod tests {
                 enable_tick: false,
                 enable_heartbeat: false,
                 enable_elect: false,
+                allow_log_reversion,
                 ..Default::default()
             }
             .validate()
@@ -2057,8 +2081,22 @@ mod tests {
         node2: ControlPlaneRaftNodeId,
         node3: ControlPlaneRaftNodeId,
     ) -> ThreeVoterAuthorityFixture {
+        initialized_three_node_voter_authorities_with_config(
+            test_raft_config(cluster_name),
+            node1,
+            node2,
+            node3,
+        )
+        .await
+    }
+
+    async fn initialized_three_node_voter_authorities_with_config(
+        config: Arc<Config>,
+        node1: ControlPlaneRaftNodeId,
+        node2: ControlPlaneRaftNodeId,
+        node3: ControlPlaneRaftNodeId,
+    ) -> ThreeVoterAuthorityFixture {
         let network = InMemoryRaftNetworkFactory::default();
-        let config = test_raft_config(cluster_name);
         let leader_log_store = ControlPlaneRaftLogStore::empty();
         let raft1 = Raft::<ControlPlaneRaftTypeConfig, ControlPlaneRaftStateMachine>::new(
             node1,
@@ -2133,6 +2171,20 @@ mod tests {
             log_store,
             state_machine,
         }
+    }
+
+    async fn wait_for_log_purged_to(
+        log_store: &ControlPlaneRaftLogStore,
+        log_id: LogIdOf<ControlPlaneRaftTypeConfig>,
+        message: &'static str,
+    ) {
+        for _ in 0..100 {
+            if log_store.last_purged_log_id().unwrap() == Some(log_id) {
+                return;
+            }
+            ControlPlaneRaftTypeConfig::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("{message}: log store did not purge through {log_id}");
     }
 
     fn raft_log_id(term: u64, node_id: u64, index: u64) -> LogIdOf<ControlPlaneRaftTypeConfig> {
@@ -3178,7 +3230,7 @@ mod tests {
     }
 
     #[test]
-    fn control_plane_raft_log_store_rejects_purging_past_committed_watermark() {
+    fn control_plane_raft_log_store_promotes_committed_gate_when_snapshot_purge_passes_it() {
         ControlPlaneRaftTypeConfig::run(async {
             let mut store = ControlPlaneRaftLogStore::empty();
             RaftLogStorage::append(
@@ -3199,20 +3251,19 @@ mod tests {
                 .await
                 .unwrap();
 
-            let err = RaftLogStorage::purge(&mut store, raft_log_id(3, 1, 3))
-                .await
-                .unwrap_err();
-            assert!(err.to_string().contains("committed log id"));
-
-            RaftLogStorage::purge(&mut store, raft_log_id(3, 1, 2))
+            RaftLogStorage::purge(&mut store, raft_log_id(3, 1, 3))
                 .await
                 .unwrap();
             let log_state = RaftLogStorage::get_log_state(&mut store).await.unwrap();
-            assert_eq!(log_state.last_purged_log_id, Some(raft_log_id(3, 1, 2)));
+            assert_eq!(log_state.last_purged_log_id, Some(raft_log_id(3, 1, 3)));
             assert_eq!(
                 RaftLogStorage::read_committed(&mut store).await.unwrap(),
-                Some(raft_log_id(3, 1, 2))
+                Some(raft_log_id(3, 1, 3))
             );
+            let entries = RaftLogReader::try_get_log_entries(&mut store, 0..4)
+                .await
+                .unwrap();
+            assert!(entries.is_empty());
         });
     }
 
@@ -4144,6 +4195,198 @@ mod tests {
                 restarted_state.0,
                 vec![NodeId::new(801), NodeId::new(802), NodeId::new(803)]
             );
+            assert_eq!(restarted_state.1, Some(NodeAvailabilityState::Unavailable));
+            assert_eq!(restarted_state.2, Some(NodeAvailabilityState::Unavailable));
+
+            authority1.shutdown().await.unwrap();
+            authority2.shutdown().await.unwrap();
+            restarted_authority.shutdown().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn control_plane_openraft_restarted_follower_catches_up_from_leader_snapshot() {
+        ControlPlaneRaftTypeConfig::run(async {
+            let ThreeVoterAuthorityFixture {
+                network,
+                config,
+                leader_log_store,
+                third_log_store,
+                authority1,
+                authority2,
+                authority3,
+            } = initialized_three_node_voter_authorities_with_config(
+                test_raft_config_with_log_reversion(
+                    "control-plane-raft-follower-snapshot-catch-up-test",
+                    Some(true),
+                ),
+                1101,
+                1102,
+                1103,
+            )
+            .await;
+
+            let bootstrap = authority1
+                .submit_control_plane_command(ControlPlaneCommand::BootstrapInitialClusterMap {
+                    nodes: vec![
+                        (NodeId::new(1101), "node-1101".to_string()),
+                        (NodeId::new(1102), "node-1102".to_string()),
+                        (NodeId::new(1103), "node-1103".to_string()),
+                    ],
+                    pg_ids: vec![PgId::new(0)],
+                })
+                .await
+                .unwrap();
+            assert!(matches!(
+                bootstrap.outcome(),
+                ControlPlaneRaftCommandOutcome::Applied(
+                    ControlPlaneCommandResponse::BootstrapInitialClusterMap
+                )
+            ));
+            authority3
+                .wait_for_applied_index_at_least(
+                    bootstrap.log_id().index(),
+                    Duration::from_secs(1),
+                    "third voter applied bootstrap before snapshot catch-up restart",
+                )
+                .await
+                .unwrap();
+
+            let restart_artifact =
+                capture_openraft_restart_artifact(&third_log_store, &authority3).await;
+
+            let offline_write = authority1
+                .submit_control_plane_command(ControlPlaneCommand::MarkNodeAvailability {
+                    node_id: NodeId::new(1102),
+                    availability: NodeAvailabilityState::Unavailable,
+                })
+                .await
+                .unwrap();
+            assert!(matches!(
+                offline_write.outcome(),
+                ControlPlaneRaftCommandOutcome::Applied(
+                    ControlPlaneCommandResponse::MarkNodeAvailability
+                )
+            ));
+            authority2
+                .wait_for_applied_index_at_least(
+                    offline_write.log_id().index(),
+                    Duration::from_secs(1),
+                    "second voter applied command before leader snapshot purge",
+                )
+                .await
+                .unwrap();
+            authority3
+                .wait_for_applied_index_at_least(
+                    offline_write.log_id().index(),
+                    Duration::from_secs(1),
+                    "third voter applied command before leader snapshot purge",
+                )
+                .await
+                .unwrap();
+
+            let mut snapshot_progress = authority1.raft().watch_snapshot_progress();
+            authority1.raft().trigger().snapshot().await.unwrap();
+            snapshot_progress
+                .wait_until_ge(&Some(offline_write.log_id()))
+                .await
+                .unwrap();
+            let leader_snapshot = authority1.raft().get_snapshot().await.unwrap().unwrap();
+            assert_eq!(
+                leader_snapshot.meta.last_log_id,
+                Some(offline_write.log_id())
+            );
+
+            authority1
+                .raft()
+                .trigger()
+                .purge_log(offline_write.log_id().index())
+                .await
+                .unwrap();
+            wait_for_log_purged_to(
+                &leader_log_store,
+                offline_write.log_id(),
+                "leader purged log prefix covered by snapshot",
+            )
+            .await;
+
+            authority3.shutdown().await.unwrap();
+            network.unregister(1103);
+
+            let (restored_log_store, restored_state_machine) = restart_artifact.restore().unwrap();
+            let restarted_raft =
+                Raft::<ControlPlaneRaftTypeConfig, ControlPlaneRaftStateMachine>::new(
+                    1103,
+                    config,
+                    network.clone(),
+                    restored_log_store,
+                    restored_state_machine,
+                )
+                .await
+                .unwrap();
+            network.register(1103, restarted_raft.clone());
+            let restarted_authority = ControlPlaneRaftAuthority::new(restarted_raft);
+            authority1
+                .raft()
+                .trigger()
+                .allow_next_revert(&1103, true)
+                .await
+                .unwrap()
+                .unwrap();
+
+            let catch_up_trigger = authority1
+                .submit_control_plane_command(ControlPlaneCommand::MarkNodeAvailability {
+                    node_id: NodeId::new(1103),
+                    availability: NodeAvailabilityState::Unavailable,
+                })
+                .await
+                .unwrap();
+            assert!(matches!(
+                catch_up_trigger.outcome(),
+                ControlPlaneRaftCommandOutcome::Applied(
+                    ControlPlaneCommandResponse::MarkNodeAvailability
+                )
+            ));
+
+            restarted_authority
+                .wait_for_applied_index_at_least(
+                    catch_up_trigger.log_id().index(),
+                    Duration::from_secs(1),
+                    "restarted third voter caught up through leader snapshot",
+                )
+                .await
+                .unwrap();
+            let restarted_status = restarted_authority.status().await.unwrap();
+            assert_eq!(restarted_status.applied(), Some(catch_up_trigger.log_id()));
+            assert_eq!(
+                restarted_status.current_snapshot(),
+                Some(offline_write.log_id())
+            );
+
+            let restarted_state = restarted_authority
+                .raft()
+                .with_state_machine(|state_machine| {
+                    let snapshot_log_id = state_machine
+                        .current_snapshot()
+                        .and_then(|snapshot| snapshot.meta.last_log_id);
+                    let snapshot = state_machine.inner().snapshot();
+                    let node1102_availability = snapshot
+                        .node(NodeId::new(1102))
+                        .map(|node| node.availability());
+                    let node1103_availability = snapshot
+                        .node(NodeId::new(1103))
+                        .map(|node| node.availability());
+                    Box::pin(async move {
+                        (
+                            snapshot_log_id,
+                            node1102_availability,
+                            node1103_availability,
+                        )
+                    })
+                })
+                .await
+                .unwrap();
+            assert_eq!(restarted_state.0, Some(offline_write.log_id()));
             assert_eq!(restarted_state.1, Some(NodeAvailabilityState::Unavailable));
             assert_eq!(restarted_state.2, Some(NodeAvailabilityState::Unavailable));
 

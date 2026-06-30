@@ -9564,6 +9564,20 @@ Phase 12.1 progress:
   follower, and verifies a later write drives the restarted follower through the
   missing committed prefix with the expected Raft membership and control-plane
   node-state effects.
+- Added OpenRaft follower snapshot catch-up coverage. The spike now captures a
+  stale follower artifact, commits a command and waits for the live follower to
+  apply it, forces the leader to build and purge a snapshot covering that
+  command, restores the stale artifact with test-only log reversion enabled,
+  and verifies the next write brings the restarted follower current through the
+  leader's snapshot transfer path rather than retained-prefix replay. This also
+  pinned the log-store restart-gate rule for snapshot install: a purge through a
+  snapshot watermark may advance the committed restart gate to keep the purged
+  boundary restart-consistent.
+- Extended the OpenRaft authority status boundary with the current state-machine
+  snapshot watermark and pinned it in the snapshot catch-up smoke. This moves
+  the Phase 12 diagnostics surface closer to the planned leader/term,
+  committed/applied, membership, and snapshot-index report without exposing
+  private state-machine internals to callers.
 - Added OpenRaft leader-restart resume coverage. A three-voter in-memory
   cluster now captures the leader's persisted OpenRaft/control-plane artifacts,
   removes the leader from the test network, verifies a follower cannot accept a
