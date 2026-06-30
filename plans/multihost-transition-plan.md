@@ -9101,12 +9101,13 @@ Keep an explicit Phase 11 close-out before treating the phase as soak-clean:
          or mark deleting), so retryable/not-empty diagnostics no longer need
          to infer the failed phase from free-text detail. Deterministic storage
          coverage now verifies the frontier identity fence, reset persistence,
-         and phase recording, while metadata/RPC tests verify the fields
-         round-trip through storage and Unix RPC.
+         resumed scanning from the persisted frontier, and phase recording,
+         while metadata/RPC tests verify the fields round-trip through storage
+         and Unix RPC.
          Remaining work: add resumable frontier/state for stream cleanup and
          final visibility phases, and add a deterministic end-to-end
-         interleaving test once there is a nonblocking fixture for partial
-         exact-bucket object-PG drain progress.
+         interleaving test around foreground/background adoption of a partially
+         progressed delete attempt.
       5. status: open. Revisit reservation classification only after attempts are resumable;
          it should be an optimization on top of a convergent state machine, not
          the convergence mechanism itself.

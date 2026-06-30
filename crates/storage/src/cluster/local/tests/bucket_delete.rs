@@ -3181,6 +3181,97 @@ fn post_reservation_exact_bucket_frontier_is_identity_fenced_and_resettable() {
 }
 
 #[test]
+fn post_reservation_exact_bucket_frontier_resumes_after_recorded_pg() {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2], ec_shape).unwrap();
+    let (bucket, lower_key, later_key, pg_count) = {
+        let topology = map
+            .nodes
+            .get(&NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        let bucket = bucket_for_pg(topology, 1, "delete-progress-resume-");
+        let lower_key = key_for_object_pg(topology, &bucket, 0, "lower-");
+        let later_key = key_for_object_pg(topology, &bucket, 2, "later-");
+        (bucket, lower_key, later_key, topology.pg_count())
+    };
+    assert!(
+        pg_count > 2,
+        "test requires at least three metadata PGs to prove frontier resume"
+    );
+
+    let map = Arc::new(map);
+    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    create_test_bucket(&cluster, &bucket);
+    let drain = match cluster.begin_durable_bucket_delete_drain(&bucket).unwrap() {
+        crate::cluster::DurableBucketDeleteDrainBegin::Acquired(drain) => drain,
+        crate::cluster::DurableBucketDeleteDrainBegin::AlreadyDeleting => {
+            panic!("fresh active bucket should acquire delete drain")
+        }
+    };
+
+    let lower_pg_id = PgId::new(0);
+    let lower_command = MetadataCommandEnvelope::new(
+        cluster
+            .next_object_metadata_command_id(lower_pg_id)
+            .unwrap(),
+        MetadataCommandPayload::ReserveObjectGeneration(ReserveObjectGenerationCommand::new(
+            bucket.clone(),
+            lower_key,
+            crate::SessionId::try_from("81".repeat(16)).unwrap(),
+            crate::GenerationId::MIN,
+            crate::clock::current_time_millis(),
+        )),
+    );
+    insert_pending_metadata_command_for_test(&map, lower_pg_id, &bucket, &lower_command);
+
+    let later_pg_id = PgId::new(2);
+    let later_command = MetadataCommandEnvelope::new(
+        cluster
+            .next_object_metadata_command_id(later_pg_id)
+            .unwrap(),
+        MetadataCommandPayload::ReserveObjectGeneration(ReserveObjectGenerationCommand::new(
+            bucket.clone(),
+            later_key,
+            crate::SessionId::try_from("82".repeat(16)).unwrap(),
+            crate::GenerationId::MIN,
+            crate::clock::current_time_millis(),
+        )),
+    );
+    insert_pending_metadata_command_for_test(&map, later_pg_id, &bucket, &later_command);
+
+    cluster
+        .test_record_bucket_delete_post_reservation_next_object_pg_id(&drain, 2)
+        .unwrap();
+    cluster
+        .test_drain_pending_object_metadata_commands_for_exact_bucket_after_reservation(
+            &bucket, &drain,
+        )
+        .unwrap();
+
+    assert!(
+        pending_metadata_command_for_test(&map, lower_pg_id, &bucket).is_some(),
+        "post-reservation resume must not revisit object PGs below the stored frontier"
+    );
+    assert!(
+        pending_metadata_command_for_test(&map, later_pg_id, &bucket).is_none(),
+        "post-reservation resume must drain object PGs at or above the stored frontier"
+    );
+    assert_eq!(
+        cluster
+            .test_bucket_delete_post_reservation_next_object_pg_id(&drain)
+            .unwrap(),
+        Some(pg_count),
+        "completed resumed scan should advance the durable frontier to the end"
+    );
+
+    cluster.clear_durable_bucket_delete_drain(&drain).unwrap();
+}
+
+#[test]
 fn begin_bucket_delete_drains_pending_delete_marker_before_emptiness_decision() {
     let tmp = test_util::tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];

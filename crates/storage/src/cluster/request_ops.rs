@@ -2946,6 +2946,33 @@ impl super::StorageCluster {
         })
     }
 
+    #[cfg(test)]
+    pub(crate) fn test_drain_pending_object_metadata_commands_for_exact_bucket_after_reservation(
+        &self,
+        bucket: &BucketName,
+        drain: &super::DurableBucketWriteDrain,
+    ) -> Result<(), BucketWriteDrainError> {
+        let pg_id = PgId::new(drain.pg_id);
+        let node = self
+            .local_map
+            .metadata_pg_primary_node(self.operation_epoch(), pg_id)?;
+        let mut work_budget = super::RequestWorkBudget::new(
+            std::time::Duration::from_millis(BUCKET_DELETE_BEGIN_WORK_BUDGET_MILLIS),
+            None,
+        )
+        .for_operation("bucket_delete_begin")
+        .for_pg(pg_id);
+        self.drain_pending_object_metadata_commands_for_exact_bucket_on_all_pgs_with_budget(
+            bucket,
+            None,
+            &mut work_budget,
+            Some(BucketDeleteExactDrainProgress {
+                client: node.bucket_write_reservation_client().as_ref(),
+                drain,
+            }),
+        )
+    }
+
     fn pending_exact_bucket_metadata_commands_on_pgs(
         &self,
         bucket: &BucketName,
