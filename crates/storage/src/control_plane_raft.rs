@@ -110,14 +110,7 @@ pub trait ControlPlaneRaftAuthorityStatusSource {
     ) -> ControlPlaneRaftFuture<'_, Result<ControlPlaneRaftAuthorityStatus, ControlPlaneError>>;
 }
 
-pub trait ControlPlaneRaftAuthorityAdmin {
-    fn initialize_membership(
-        &self,
-        nodes: BTreeMap<ControlPlaneRaftNodeId, BasicNode>,
-    ) -> ControlPlaneRaftFuture<'_, Result<(), ControlPlaneError>>;
-
-    fn is_initialized(&self) -> ControlPlaneRaftFuture<'_, Result<bool, ControlPlaneError>>;
-
+pub trait ControlPlaneRaftLeaderRoutedAdmin {
     fn replace_voters(
         &self,
         voters: BTreeSet<ControlPlaneRaftNodeId>,
@@ -135,6 +128,15 @@ pub trait ControlPlaneRaftAuthorityAdmin {
         &self,
         node_id: ControlPlaneRaftNodeId,
     ) -> ControlPlaneRaftFuture<'_, Result<(), ControlPlaneError>>;
+}
+
+pub trait ControlPlaneRaftAuthorityAdmin: ControlPlaneRaftLeaderRoutedAdmin {
+    fn initialize_membership(
+        &self,
+        nodes: BTreeMap<ControlPlaneRaftNodeId, BasicNode>,
+    ) -> ControlPlaneRaftFuture<'_, Result<(), ControlPlaneError>>;
+
+    fn is_initialized(&self) -> ControlPlaneRaftFuture<'_, Result<bool, ControlPlaneError>>;
 
     fn wait_for_applied_index_at_least(
         &self,
@@ -306,6 +308,69 @@ impl ControlPlaneRaftAuthorityStatusSource for ControlPlaneRaftAuthorityHandle {
 }
 
 #[derive(Clone)]
+pub struct ControlPlaneRaftLeaderRoutedAdminHandle {
+    inner: Arc<dyn ControlPlaneRaftLeaderRoutedAdmin + Send + Sync>,
+}
+
+impl ControlPlaneRaftLeaderRoutedAdminHandle {
+    pub fn new<T>(authority: Arc<T>) -> Self
+    where
+        T: ControlPlaneRaftLeaderRoutedAdmin + Send + Sync + 'static,
+    {
+        Self { inner: authority }
+    }
+
+    pub fn from_leader_routed_admin(
+        authority: Arc<dyn ControlPlaneRaftLeaderRoutedAdmin + Send + Sync>,
+    ) -> Self {
+        Self { inner: authority }
+    }
+
+    #[must_use]
+    pub fn as_leader_routed_admin(
+        &self,
+    ) -> &(dyn ControlPlaneRaftLeaderRoutedAdmin + Send + Sync + 'static) {
+        &*self.inner
+    }
+}
+
+impl fmt::Debug for ControlPlaneRaftLeaderRoutedAdminHandle {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ControlPlaneRaftLeaderRoutedAdminHandle")
+            .finish_non_exhaustive()
+    }
+}
+
+impl ControlPlaneRaftLeaderRoutedAdmin for ControlPlaneRaftLeaderRoutedAdminHandle {
+    fn replace_voters(
+        &self,
+        voters: BTreeSet<ControlPlaneRaftNodeId>,
+        retain_removed_voters_as_learners: bool,
+    ) -> ControlPlaneRaftFuture<'_, Result<LogIdOf<ControlPlaneRaftTypeConfig>, ControlPlaneError>>
+    {
+        self.inner
+            .replace_voters(voters, retain_removed_voters_as_learners)
+    }
+
+    fn add_learner(
+        &self,
+        node_id: ControlPlaneRaftNodeId,
+        node: BasicNode,
+        wait_for_catch_up: bool,
+    ) -> ControlPlaneRaftFuture<'_, Result<LogIdOf<ControlPlaneRaftTypeConfig>, ControlPlaneError>>
+    {
+        self.inner.add_learner(node_id, node, wait_for_catch_up)
+    }
+
+    fn transfer_leadership_to(
+        &self,
+        node_id: ControlPlaneRaftNodeId,
+    ) -> ControlPlaneRaftFuture<'_, Result<(), ControlPlaneError>> {
+        self.inner.transfer_leadership_to(node_id)
+    }
+}
+
+#[derive(Clone)]
 pub struct ControlPlaneRaftAuthorityAdminHandle {
     inner: Arc<dyn ControlPlaneRaftAuthorityAdmin + Send + Sync>,
 }
@@ -339,18 +404,7 @@ impl fmt::Debug for ControlPlaneRaftAuthorityAdminHandle {
     }
 }
 
-impl ControlPlaneRaftAuthorityAdmin for ControlPlaneRaftAuthorityAdminHandle {
-    fn initialize_membership(
-        &self,
-        nodes: BTreeMap<ControlPlaneRaftNodeId, BasicNode>,
-    ) -> ControlPlaneRaftFuture<'_, Result<(), ControlPlaneError>> {
-        self.inner.initialize_membership(nodes)
-    }
-
-    fn is_initialized(&self) -> ControlPlaneRaftFuture<'_, Result<bool, ControlPlaneError>> {
-        self.inner.is_initialized()
-    }
-
+impl ControlPlaneRaftLeaderRoutedAdmin for ControlPlaneRaftAuthorityAdminHandle {
     fn replace_voters(
         &self,
         voters: BTreeSet<ControlPlaneRaftNodeId>,
@@ -376,6 +430,19 @@ impl ControlPlaneRaftAuthorityAdmin for ControlPlaneRaftAuthorityAdminHandle {
         node_id: ControlPlaneRaftNodeId,
     ) -> ControlPlaneRaftFuture<'_, Result<(), ControlPlaneError>> {
         self.inner.transfer_leadership_to(node_id)
+    }
+}
+
+impl ControlPlaneRaftAuthorityAdmin for ControlPlaneRaftAuthorityAdminHandle {
+    fn initialize_membership(
+        &self,
+        nodes: BTreeMap<ControlPlaneRaftNodeId, BasicNode>,
+    ) -> ControlPlaneRaftFuture<'_, Result<(), ControlPlaneError>> {
+        self.inner.initialize_membership(nodes)
+    }
+
+    fn is_initialized(&self) -> ControlPlaneRaftFuture<'_, Result<bool, ControlPlaneError>> {
+        self.inner.is_initialized()
     }
 
     fn wait_for_applied_index_at_least(
@@ -465,18 +532,7 @@ impl ControlPlaneRaftAuthorityStatusSource for ControlPlaneRaftAuthorityServiceH
     }
 }
 
-impl ControlPlaneRaftAuthorityAdmin for ControlPlaneRaftAuthorityServiceHandle {
-    fn initialize_membership(
-        &self,
-        nodes: BTreeMap<ControlPlaneRaftNodeId, BasicNode>,
-    ) -> ControlPlaneRaftFuture<'_, Result<(), ControlPlaneError>> {
-        self.inner.initialize_membership(nodes)
-    }
-
-    fn is_initialized(&self) -> ControlPlaneRaftFuture<'_, Result<bool, ControlPlaneError>> {
-        self.inner.is_initialized()
-    }
-
+impl ControlPlaneRaftLeaderRoutedAdmin for ControlPlaneRaftAuthorityServiceHandle {
     fn replace_voters(
         &self,
         voters: BTreeSet<ControlPlaneRaftNodeId>,
@@ -502,6 +558,19 @@ impl ControlPlaneRaftAuthorityAdmin for ControlPlaneRaftAuthorityServiceHandle {
         node_id: ControlPlaneRaftNodeId,
     ) -> ControlPlaneRaftFuture<'_, Result<(), ControlPlaneError>> {
         self.inner.transfer_leadership_to(node_id)
+    }
+}
+
+impl ControlPlaneRaftAuthorityAdmin for ControlPlaneRaftAuthorityServiceHandle {
+    fn initialize_membership(
+        &self,
+        nodes: BTreeMap<ControlPlaneRaftNodeId, BasicNode>,
+    ) -> ControlPlaneRaftFuture<'_, Result<(), ControlPlaneError>> {
+        self.inner.initialize_membership(nodes)
+    }
+
+    fn is_initialized(&self) -> ControlPlaneRaftFuture<'_, Result<bool, ControlPlaneError>> {
+        self.inner.is_initialized()
     }
 
     fn wait_for_applied_index_at_least(
@@ -659,6 +728,43 @@ impl ControlPlaneRaftAuthorityStatusSource for ControlPlaneRaftAuthorityRoutingH
     ) -> ControlPlaneRaftFuture<'_, Result<ControlPlaneRaftAuthorityStatus, ControlPlaneError>>
     {
         Box::pin(ControlPlaneRaftAuthorityRoutingHandle::status(self))
+    }
+}
+
+impl ControlPlaneRaftLeaderRoutedAdmin for ControlPlaneRaftAuthorityRoutingHandle {
+    fn replace_voters(
+        &self,
+        voters: BTreeSet<ControlPlaneRaftNodeId>,
+        retain_removed_voters_as_learners: bool,
+    ) -> ControlPlaneRaftFuture<'_, Result<LogIdOf<ControlPlaneRaftTypeConfig>, ControlPlaneError>>
+    {
+        Box::pin(ControlPlaneRaftAuthorityRoutingHandle::replace_voters(
+            self,
+            voters,
+            retain_removed_voters_as_learners,
+        ))
+    }
+
+    fn add_learner(
+        &self,
+        node_id: ControlPlaneRaftNodeId,
+        node: BasicNode,
+        wait_for_catch_up: bool,
+    ) -> ControlPlaneRaftFuture<'_, Result<LogIdOf<ControlPlaneRaftTypeConfig>, ControlPlaneError>>
+    {
+        Box::pin(ControlPlaneRaftAuthorityRoutingHandle::add_learner(
+            self,
+            node_id,
+            node,
+            wait_for_catch_up,
+        ))
+    }
+
+    fn transfer_leadership_to(
+        &self,
+        node_id: ControlPlaneRaftNodeId,
+    ) -> ControlPlaneRaftFuture<'_, Result<(), ControlPlaneError>> {
+        Box::pin(ControlPlaneRaftAuthorityRoutingHandle::transfer_leadership_to(self, node_id))
     }
 }
 
@@ -1513,18 +1619,7 @@ impl ControlPlaneRaftAuthorityStatusSource for ControlPlaneRaftAuthority {
     }
 }
 
-impl ControlPlaneRaftAuthorityAdmin for ControlPlaneRaftAuthority {
-    fn initialize_membership(
-        &self,
-        nodes: BTreeMap<ControlPlaneRaftNodeId, BasicNode>,
-    ) -> ControlPlaneRaftFuture<'_, Result<(), ControlPlaneError>> {
-        Box::pin(async move { ControlPlaneRaftAuthority::initialize_membership(self, nodes).await })
-    }
-
-    fn is_initialized(&self) -> ControlPlaneRaftFuture<'_, Result<bool, ControlPlaneError>> {
-        Box::pin(async move { ControlPlaneRaftAuthority::is_initialized(self).await })
-    }
-
+impl ControlPlaneRaftLeaderRoutedAdmin for ControlPlaneRaftAuthority {
     fn replace_voters(
         &self,
         voters: BTreeSet<ControlPlaneRaftNodeId>,
@@ -1560,6 +1655,19 @@ impl ControlPlaneRaftAuthorityAdmin for ControlPlaneRaftAuthority {
         Box::pin(
             async move { ControlPlaneRaftAuthority::transfer_leadership_to(self, node_id).await },
         )
+    }
+}
+
+impl ControlPlaneRaftAuthorityAdmin for ControlPlaneRaftAuthority {
+    fn initialize_membership(
+        &self,
+        nodes: BTreeMap<ControlPlaneRaftNodeId, BasicNode>,
+    ) -> ControlPlaneRaftFuture<'_, Result<(), ControlPlaneError>> {
+        Box::pin(async move { ControlPlaneRaftAuthority::initialize_membership(self, nodes).await })
+    }
+
+    fn is_initialized(&self) -> ControlPlaneRaftFuture<'_, Result<bool, ControlPlaneError>> {
+        Box::pin(async move { ControlPlaneRaftAuthority::is_initialized(self).await })
     }
 
     fn wait_for_applied_index_at_least(
@@ -5103,6 +5211,9 @@ mod tests {
                 leader_service.clone(),
                 directory.clone(),
             );
+            let routed_admin =
+                ControlPlaneRaftLeaderRoutedAdminHandle::new(Arc::new(routed_client.clone()));
+            let leader_routed_admin = routed_admin.as_leader_routed_admin();
             let bootstrap = expect_bounded_control_plane_raft(
                 routed_client.submit_control_plane_command(
                     ControlPlaneCommand::BootstrapInitialClusterMap {
@@ -5135,7 +5246,7 @@ mod tests {
             .await;
 
             expect_bounded_control_plane_raft(
-                routed_client.transfer_leadership_to(412),
+                leader_routed_admin.transfer_leadership_to(412),
                 operation_timeout,
                 "authority service directory routed transfer leadership",
             )
@@ -5229,7 +5340,7 @@ mod tests {
                 Some(91_001)
             );
             let routed_membership_log_id = expect_bounded_control_plane_raft(
-                routed_client.replace_voters(BTreeSet::from([412]), false),
+                leader_routed_admin.replace_voters(BTreeSet::from([412]), false),
                 operation_timeout,
                 "authority service directory routed voter replacement",
             )

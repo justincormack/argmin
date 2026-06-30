@@ -9821,6 +9821,13 @@ Phase 12.1 progress:
   route through before bootstrap. The directory smoke now drives leadership
   transfer and voter replacement through the same routed client used for
   linearized writes, reads, and status.
+- Split the initialized-cluster admin surface into a narrower object-safe
+  leader-routed admin trait and cloneable handle. Full authority admin still
+  owns bootstrap, wait, and shutdown operations, while post-bootstrap
+  membership/leadership operations can be passed to RPC/client wiring as a
+  capability that is safe for the leader-routing handle to implement. The
+  directory smoke now proves that narrow handle can transfer leadership and
+  replace voters through the routed client.
 
 1. define the replicated control-plane state machine:
    - state includes cluster epoch, PG count, PG state, PG acting sets, node
