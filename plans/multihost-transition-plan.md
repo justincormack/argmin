@@ -9139,7 +9139,11 @@ Keep an explicit Phase 11 close-out before treating the phase as soak-clean:
          post-reservation object-PG drain, and reaches deleting/finalized
          progress. Remaining work: decide whether finer stream-cleanup
          page/frontier state is needed, or whether the current conservative
-         cleanup resume point is enough for soak closure.
+         cleanup resume point is enough for soak closure. Final-visibility
+         adoption now also has a coordinator-level reclaim-worker regression
+         that seeds a durable `final_visibility_check` attempt and fails if the
+         worker repeats any exact-bucket drain phase instead of resuming at the
+         final proof.
       5. status: open. Revisit reservation classification only after attempts are resumable;
          it should be an optimization on top of a convergent state machine, not
          the convergence mechanism itself.

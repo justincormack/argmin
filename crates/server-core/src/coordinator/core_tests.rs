@@ -1139,6 +1139,81 @@ fn reclaim_worker_adopts_bucket_delete_begin_from_stream_cleanup_phase() {
 }
 
 #[test]
+fn reclaim_worker_adopts_bucket_delete_begin_from_final_visibility_phase() {
+    let tmp = test_util::tempdir();
+    let bucket = trusted_bucket_name("bucket-delete-begin-worker-final-visibility");
+    let initial = open_test_storage_cluster(tmp.path(), &[0, 1, 2]);
+    let direct_coord = setup_direct_coordinator_with_storage_cluster(Arc::clone(&initial));
+    direct_coord
+        .create_bucket_for_owner("default-owner", bucket.as_str(), false)
+        .unwrap();
+    let bucket_identity = initial.test_head_bucket_raw(&bucket).unwrap();
+
+    initial
+        .test_seed_bucket_delete_attempt_outcome(
+            &bucket,
+            storage::BucketDeleteAttemptOutcomeKind::Retryable,
+            storage::BucketDeleteAttemptPhase::FinalVisibilityCheck,
+            "seeded final-visibility retryable attempt".to_string(),
+            Some(0),
+        )
+        .unwrap();
+
+    let exact_drain_ran = Arc::new(AtomicBool::new(false));
+    let exact_drain_ran_for_hook = Arc::clone(&exact_drain_ran);
+    let _exact_drain_hook_guard = initial.test_install_before_bucket_delete_exact_drain_hook(
+        Arc::new(move |has_progress, next_object_pg_id| {
+            exact_drain_ran_for_hook.store(true, Ordering::SeqCst);
+            Err(storage::StoreError::Io {
+                context: "unexpected exact-bucket drain during final-visibility adoption",
+                source: std::io::Error::other(format!(
+                    "has_progress={has_progress} next_object_pg_id={next_object_pg_id}"
+                )),
+            })
+        }),
+    );
+
+    let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&initial));
+    let _coord = setup_coordinator_with_only_reclaim_worker(handle, Arc::clone(&initial));
+    initial.enqueue_bucket_delete_begin(
+        &bucket,
+        bucket_identity.bucket_execution_generation,
+        bucket_identity.bucket_incarnation_generation,
+    );
+
+    let deadline = Instant::now() + TEST_EVENT_TIMEOUT;
+    loop {
+        match initial.test_head_bucket_raw(&bucket) {
+            Ok(info) if info.state == storage::BucketState::Deleting => break,
+            Err(storage::BucketSnapshotLoadError::Metadata(
+                storage::MetadataError::BucketNotFound { .. },
+            )) => break,
+            Ok(info) if Instant::now() < deadline => {
+                assert_eq!(
+                    info.state,
+                    storage::BucketState::Active,
+                    "unexpected bucket state while waiting for final-visibility adoption"
+                );
+                thread::sleep(Duration::from_millis(10));
+            }
+            Ok(info) => {
+                panic!("reclaim worker did not adopt final-visibility BucketDeleteBegin: {info:?}");
+            }
+            Err(err) => {
+                panic!(
+                    "unexpected bucket metadata error while waiting for final-visibility adoption: {err:?}"
+                )
+            }
+        }
+    }
+
+    assert!(
+        !exact_drain_ran.load(Ordering::SeqCst),
+        "final-visibility worker adoption must skip exact-bucket drain phases"
+    );
+}
+
+#[test]
 fn reclaim_worker_drops_stale_bucket_delete_begin_after_bucket_recreate() {
     let tmp = test_util::tempdir();
     let bucket = trusted_bucket_name("bucket-delete-begin-stale-recreate");
