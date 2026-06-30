@@ -185,6 +185,50 @@ pub trait ControlPlaneRaftAuthorityServiceDirectory {
 }
 
 #[derive(Clone)]
+pub struct ControlPlaneRaftAuthorityServiceDirectoryHandle {
+    inner: Arc<dyn ControlPlaneRaftAuthorityServiceDirectory + Send + Sync>,
+}
+
+impl ControlPlaneRaftAuthorityServiceDirectoryHandle {
+    pub fn new<T>(directory: Arc<T>) -> Self
+    where
+        T: ControlPlaneRaftAuthorityServiceDirectory + Send + Sync + 'static,
+    {
+        Self { inner: directory }
+    }
+
+    pub fn from_service_directory(
+        directory: Arc<dyn ControlPlaneRaftAuthorityServiceDirectory + Send + Sync>,
+    ) -> Self {
+        Self { inner: directory }
+    }
+
+    #[must_use]
+    pub fn as_service_directory(
+        &self,
+    ) -> &(dyn ControlPlaneRaftAuthorityServiceDirectory + Send + Sync + 'static) {
+        &*self.inner
+    }
+}
+
+impl fmt::Debug for ControlPlaneRaftAuthorityServiceDirectoryHandle {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ControlPlaneRaftAuthorityServiceDirectoryHandle")
+            .finish_non_exhaustive()
+    }
+}
+
+impl ControlPlaneRaftAuthorityServiceDirectory for ControlPlaneRaftAuthorityServiceDirectoryHandle {
+    fn authority_service_for_node(
+        &self,
+        node_id: ControlPlaneRaftNodeId,
+    ) -> ControlPlaneRaftFuture<'_, Result<ControlPlaneRaftAuthorityServiceHandle, ControlPlaneError>>
+    {
+        self.inner.authority_service_for_node(node_id)
+    }
+}
+
+#[derive(Clone)]
 pub struct ControlPlaneRaftAuthorityHandle {
     inner: Arc<dyn ControlPlaneRaftLinearizedAuthority + Send + Sync>,
 }
@@ -4885,6 +4929,8 @@ mod tests {
                 412,
                 ControlPlaneRaftAuthorityServiceHandle::new(Arc::clone(&authority2)),
             );
+            let directory =
+                ControlPlaneRaftAuthorityServiceDirectoryHandle::new(Arc::new(directory));
 
             let missing = directory.authority_service_for_node(499).await;
             assert!(matches!(

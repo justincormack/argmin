@@ -9769,6 +9769,10 @@ Phase 12.1 progress:
   through service handles resolved from the directory, giving future RPC/admin
   client routing a capability-level boundary without exposing the concrete
   OpenRaft wrapper.
+- Added the cloneable OpenRaft authority service directory handle, matching the
+  existing linearized/admin/service handle pattern. The directory smoke now
+  routes through that handle, so future RPC/client code can receive a directory
+  capability without depending on the concrete directory implementation.
 
 1. define the replicated control-plane state machine:
    - state includes cluster epoch, PG count, PG state, PG acting sets, node
