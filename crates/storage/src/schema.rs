@@ -634,6 +634,9 @@ CREATE TABLE IF NOT EXISTS bucket_delete_attempt_outcomes (
     bucket_execution_generation INTEGER NOT NULL CHECK (bucket_execution_generation >= 0),
     outcome          INTEGER NOT NULL CHECK (outcome IN (0, 1, 2, 3)),
     detail           TEXT NOT NULL CHECK (length(detail) <= 1024),
+    post_reservation_next_object_pg_id INTEGER CHECK (
+        post_reservation_next_object_pg_id IS NULL OR post_reservation_next_object_pg_id >= 0
+    ),
     updated_at       INTEGER NOT NULL CHECK (updated_at >= 0),
     FOREIGN KEY (bucket_name) REFERENCES buckets(name) ON DELETE CASCADE
 )";

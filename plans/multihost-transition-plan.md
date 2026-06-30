@@ -9066,14 +9066,36 @@ Keep an explicit Phase 11 close-out before treating the phase as soak-clean:
          across early retryable route/map failures with a cooldown instead of
          being dropped or hot-looped, stale roots are dropped when the bucket is
          deleted/recreated, and a successful background begin enqueues the
-         normal bucket-delete finalizer work. Durable reclaim scans now find
-         unexpired active delete-begin drains on bucket PGs, including over the
-         Unix storage-node RPC boundary used by UAT, and enqueue the same
-         generation-fenced `BucketDeleteBegin` root after process restart or
-         volatile queue loss. Finalizer work remains a separate `BucketDelete`
-         queue item.
-      4. status: open. Add durable proof progress/frontiers for the expensive all-object-PG
+         normal bucket-delete finalizer work. Explicitly queued foreground
+         handoffs carry live preserved attempts; durable reclaim scans are
+         limited to expired/orphaned delete-begin drains so they cannot steal a
+         live foreground drain and race the original caller. Those scans work
+         over the Unix storage-node RPC boundary used by UAT and enqueue the
+         same generation-fenced `BucketDeleteBegin` root after process restart
+         or volatile queue loss once the abandoned drain lease has expired.
+         Finalizer work remains a separate `BucketDelete` queue item.
+      4. status: partial. Add durable proof progress/frontiers for the expensive all-object-PG
          exact-bucket drain once the attempt can already survive and be adopted.
+         The current slice stores a typed
+         `post_reservation_next_object_pg_id` on the durable attempt row and
+         uses it only for the post-reservation exact-bucket object-PG drain,
+         after the bucket write drain has fenced new writers and the durable
+         write reservations have emptied. The pre-reservation convergence pass,
+         reservation-wait helper pass, and abandoned-stream cleanup pass remain
+         conservative full scans because admitted writers or stream cleanup can
+         create object-PG work behind any earlier frontier. Entering stream
+         cleanup must durably reset the frontier to zero before cleanup
+         proceeds, so retries cannot treat the pre-cleanup proof as covering
+         newly created abort-stream work. The frontier is trusted only when the
+         stored drain id, cluster epoch, and bucket execution generation match
+         the adopted active delete drain. Deterministic storage coverage now
+         verifies the frontier identity fence and reset persistence, while
+         metadata/RPC tests verify the field round-trips through storage and
+         Unix RPC.
+         Remaining work: add durable/frontier state for stream cleanup and final
+         visibility phases, and add a deterministic end-to-end interleaving test
+         once there is a nonblocking fixture for partial exact-bucket object-PG
+         drain progress.
       5. status: open. Revisit reservation classification only after attempts are resumable;
          it should be an optimization on top of a convergent state machine, not
          the convergence mechanism itself.

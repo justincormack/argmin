@@ -229,7 +229,7 @@ pub(crate) trait PgMetadataStore {
         name: &BucketName,
     ) -> Result<Option<BucketDeleteAttemptOutcomeRecord>, MetadataError>;
 
-    /// Find active, unexpired DeleteBucket begin drains that should be retried.
+    /// Find expired/orphaned DeleteBucket begin drains that should be retried.
     fn get_bucket_delete_begin_roots(
         &self,
         now: u64,

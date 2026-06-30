@@ -4654,7 +4654,8 @@ fn bucket_delete_attempt_outcome_from_row(
     let cluster_epoch_raw: i64 = row.get(2)?;
     let bucket_execution_generation_raw: i64 = row.get(3)?;
     let outcome_raw: i64 = row.get(4)?;
-    let updated_at_raw: i64 = row.get(6)?;
+    let post_reservation_next_object_pg_id_raw: Option<i64> = row.get(6)?;
+    let updated_at_raw: i64 = row.get(7)?;
     let outcome = match outcome_raw {
         0 => BucketDeleteAttemptOutcomeKind::Retryable,
         1 => BucketDeleteAttemptOutcomeKind::NotEmpty,
@@ -4702,9 +4703,20 @@ fn bucket_delete_attempt_outcome_from_row(
         )?,
         outcome,
         detail: row.get(5)?,
+        post_reservation_next_object_pg_id: post_reservation_next_object_pg_id_raw
+            .map(|raw| {
+                u32::try_from(raw).map_err(|_| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        6,
+                        rusqlite::types::Type::Integer,
+                        Box::from(format!("invalid post_reservation_next_object_pg_id: {raw}")),
+                    )
+                })
+            })
+            .transpose()?,
         updated_at: u64::try_from(updated_at_raw).map_err(|_| {
             rusqlite::Error::FromSqlConversionFailure(
-                6,
+                7,
                 rusqlite::types::Type::Integer,
                 Box::from(format!("invalid updated_at: {updated_at_raw}")),
             )
@@ -6053,18 +6065,21 @@ impl PgMetadataStore for PgStore {
             context: "record bucket delete attempt outcome updated_at",
             source: rusqlite::Error::ToSqlConversionFailure(Box::new(source)),
         })?;
+        let post_reservation_next_object_pg_id =
+            record.post_reservation_next_object_pg_id.map(i64::from);
         self.conn
             .execute(
                 "INSERT INTO bucket_delete_attempt_outcomes \
                  (bucket_name, drain_id, cluster_epoch, bucket_execution_generation, \
-                  outcome, detail, updated_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
+                  outcome, detail, post_reservation_next_object_pg_id, updated_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
                  ON CONFLICT(bucket_name) DO UPDATE SET \
                    drain_id = excluded.drain_id, \
                    cluster_epoch = excluded.cluster_epoch, \
                    bucket_execution_generation = excluded.bucket_execution_generation, \
                    outcome = excluded.outcome, \
                    detail = excluded.detail, \
+                   post_reservation_next_object_pg_id = excluded.post_reservation_next_object_pg_id, \
                    updated_at = excluded.updated_at",
                 params![
                     record.bucket.as_str(),
@@ -6073,6 +6088,7 @@ impl PgMetadataStore for PgStore {
                     generation,
                     record.outcome as u8,
                     &record.detail,
+                    post_reservation_next_object_pg_id,
                     updated_at,
                 ],
             )
@@ -6089,7 +6105,7 @@ impl PgMetadataStore for PgStore {
     ) -> Result<Option<BucketDeleteAttemptOutcomeRecord>, MetadataError> {
         match self.conn.query_row(
             "SELECT bucket_name, drain_id, cluster_epoch, bucket_execution_generation, \
-                    outcome, detail, updated_at \
+                    outcome, detail, post_reservation_next_object_pg_id, updated_at \
              FROM bucket_delete_attempt_outcomes \
              WHERE bucket_name = ?1",
             params![name.as_str()],
@@ -6132,7 +6148,7 @@ impl PgMetadataStore for PgStore {
                   AND b.bucket_execution_generation = d.bucket_execution_generation \
                   AND b.state = ?1 \
                  WHERE d.lease_deadline IS NOT NULL \
-                   AND d.lease_deadline > ?2 \
+                   AND d.lease_deadline <= ?2 \
                    AND (?3 IS NULL OR d.bucket_name > ?3) \
                  ORDER BY d.bucket_name ASC \
                  LIMIT ?4",

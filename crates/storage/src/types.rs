@@ -2468,6 +2468,7 @@ pub struct BucketDeleteAttemptOutcomeRecord {
     pub bucket_execution_generation: u64,
     pub outcome: BucketDeleteAttemptOutcomeKind,
     pub detail: String,
+    pub post_reservation_next_object_pg_id: Option<u32>,
     pub updated_at: u64,
 }
 

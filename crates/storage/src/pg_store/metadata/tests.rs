@@ -402,6 +402,7 @@ fn bucket_delete_attempt_outcome_records_last_state() {
         bucket_execution_generation: drain.bucket_execution_generation,
         outcome: BucketDeleteAttemptOutcomeKind::Retryable,
         detail: "route expired".to_string(),
+        post_reservation_next_object_pg_id: Some(7),
         updated_at: 11,
     };
     store.record_bucket_delete_attempt_outcome(&first).unwrap();

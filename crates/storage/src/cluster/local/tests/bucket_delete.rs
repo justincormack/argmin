@@ -2910,7 +2910,7 @@ fn begin_bucket_delete_adopts_active_delete_drain_after_reopen() {
 }
 
 #[test]
-fn durable_scan_queues_active_delete_begin_drain_after_reopen() {
+fn durable_scan_skips_live_and_queues_expired_delete_begin_drain_after_reopen() {
     let tmp = test_util::tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
     let ec_shape = EcShape { k: 2, m: 1 };
@@ -2929,7 +2929,7 @@ fn durable_scan_queues_active_delete_begin_drain_after_reopen() {
     let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&cluster, &bucket);
     let bucket_info = cluster.test_head_bucket_raw(&bucket).unwrap();
-    let drain = match cluster.begin_durable_bucket_delete_drain(&bucket).unwrap() {
+    let live_drain = match cluster.begin_durable_bucket_delete_drain(&bucket).unwrap() {
         crate::cluster::DurableBucketDeleteDrainBegin::Acquired(drain) => drain,
         crate::cluster::DurableBucketDeleteDrainBegin::AlreadyDeleting => {
             panic!("fresh active bucket should acquire delete drain")
@@ -2950,6 +2950,35 @@ fn durable_scan_queues_active_delete_begin_drain_after_reopen() {
     let scan =
         reopened_cluster.enqueue_durable_bucket_delete_begin_roots_excluding(&HashSet::new());
     assert_eq!(scan.errors, 0);
+    assert_eq!(scan.queued, 0);
+    assert_eq!(reopened_cluster.try_take_reclaim_work(), None);
+    reopened_cluster
+        .clear_durable_bucket_delete_drain(&live_drain)
+        .unwrap();
+
+    let expired_drain = {
+        let bucket_pg = reopened
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .get_pg(1)
+            .unwrap();
+        let now = crate::clock::current_time_millis();
+        crate::PgMetadataStore::begin_durable_bucket_write_drain(
+            &*bucket_pg,
+            &bucket,
+            "expired-delete-begin-scan-drain",
+            "expired-delete-begin-scan-owner",
+            crate::ClusterEpoch::INITIAL,
+            now.saturating_sub(10),
+            Some(now.saturating_sub(1)),
+        )
+        .unwrap()
+    };
+
+    let scan =
+        reopened_cluster.enqueue_durable_bucket_delete_begin_roots_excluding(&HashSet::new());
+    assert_eq!(scan.errors, 0);
     assert_eq!(scan.queued, 1);
     assert_eq!(
         reopened_cluster.try_take_reclaim_work(),
@@ -2965,7 +2994,10 @@ fn durable_scan_queues_active_delete_begin_drain_after_reopen() {
     assert_eq!(reopened_cluster.try_take_reclaim_work(), None);
 
     reopened_cluster
-        .clear_durable_bucket_delete_drain(&drain)
+        .clear_durable_bucket_delete_drain(&crate::cluster::DurableBucketWriteDrain {
+            pg_id: 1,
+            record: expired_drain,
+        })
         .unwrap();
 }
 
@@ -3000,15 +3032,26 @@ fn durable_scan_paginates_past_excluded_delete_begin_drains() {
     let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
     let mut drains = Vec::new();
     let mut roots = Vec::new();
-    for bucket in &buckets {
+    let now = crate::clock::current_time_millis();
+    for (index, bucket) in buckets.iter().enumerate() {
         create_test_bucket(&cluster, bucket);
         let bucket_info = cluster.test_head_bucket_raw(bucket).unwrap();
-        let drain = match cluster.begin_durable_bucket_delete_drain(bucket).unwrap() {
-            crate::cluster::DurableBucketDeleteDrainBegin::Acquired(drain) => drain,
-            crate::cluster::DurableBucketDeleteDrainBegin::AlreadyDeleting => {
-                panic!("fresh active bucket should acquire delete drain")
-            }
-        };
+        let bucket_pg = map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .get_pg(1)
+            .unwrap();
+        let drain = crate::PgMetadataStore::begin_durable_bucket_write_drain(
+            &*bucket_pg,
+            bucket,
+            &format!("expired-delete-begin-page-drain-{index}"),
+            "expired-delete-begin-page-owner",
+            crate::ClusterEpoch::INITIAL,
+            now.saturating_sub(10),
+            Some(now.saturating_sub(1)),
+        )
+        .unwrap();
         drains.push(drain);
         roots.push(crate::BucketDeleteBeginRoot {
             bucket: bucket.clone(),
@@ -3041,9 +3084,97 @@ fn durable_scan_paginates_past_excluded_delete_begin_drains() {
 
     for drain in drains {
         reopened_cluster
-            .clear_durable_bucket_delete_drain(&drain)
+            .clear_durable_bucket_delete_drain(&crate::cluster::DurableBucketWriteDrain {
+                pg_id: 1,
+                record: drain,
+            })
             .unwrap();
     }
+}
+
+#[test]
+fn post_reservation_exact_bucket_frontier_is_identity_fenced_and_resettable() {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2], ec_shape).unwrap();
+    let (bucket, pg_count) = {
+        let topology = map
+            .nodes
+            .get(&NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        (
+            bucket_for_pg(topology, 1, "delete-progress-frontier-"),
+            topology.pg_count(),
+        )
+    };
+
+    let map = Arc::new(map);
+    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    create_test_bucket(&cluster, &bucket);
+    let drain = match cluster.begin_durable_bucket_delete_drain(&bucket).unwrap() {
+        crate::cluster::DurableBucketDeleteDrainBegin::Acquired(drain) => drain,
+        crate::cluster::DurableBucketDeleteDrainBegin::AlreadyDeleting => {
+            panic!("fresh active bucket should acquire delete drain")
+        }
+    };
+    let bucket_pg_id = PgId::new(drain.pg_id);
+    let bucket_pg_primary = map
+        .metadata_pg_primary_node(crate::ClusterEpoch::INITIAL, bucket_pg_id)
+        .unwrap();
+    let bucket_pg = bucket_pg_primary
+        .storage_node()
+        .get_pg(bucket_pg_id.get())
+        .unwrap();
+
+    crate::PgMetadataStore::record_bucket_delete_attempt_outcome(
+        &*bucket_pg,
+        &crate::BucketDeleteAttemptOutcomeRecord {
+            bucket: bucket.clone(),
+            drain_id: "stale-delete-drain".to_string(),
+            cluster_epoch: drain.record.cluster_epoch,
+            bucket_execution_generation: drain.record.bucket_execution_generation,
+            outcome: crate::BucketDeleteAttemptOutcomeKind::Retryable,
+            detail: "stale progress must not be trusted".to_string(),
+            post_reservation_next_object_pg_id: Some(pg_count),
+            updated_at: crate::clock::current_time_millis(),
+        },
+    )
+    .unwrap();
+    drop(bucket_pg);
+    assert_eq!(
+        cluster
+            .test_bucket_delete_post_reservation_next_object_pg_id(&drain)
+            .unwrap(),
+        None,
+        "frontier from a different drain identity must not be trusted"
+    );
+
+    cluster
+        .test_record_bucket_delete_post_reservation_next_object_pg_id(&drain, pg_count)
+        .unwrap();
+    assert_eq!(
+        cluster
+            .test_bucket_delete_post_reservation_next_object_pg_id(&drain)
+            .unwrap(),
+        Some(pg_count),
+        "empty post-reservation scan should advance the durable frontier"
+    );
+
+    cluster
+        .test_record_bucket_delete_post_reservation_next_object_pg_id(&drain, 0)
+        .unwrap();
+    assert_eq!(
+        cluster
+            .test_bucket_delete_post_reservation_next_object_pg_id(&drain)
+            .unwrap(),
+        Some(0),
+        "pre-cleanup reset must be persisted before cleanup can proceed"
+    );
+
+    cluster.clear_durable_bucket_delete_drain(&drain).unwrap();
 }
 
 #[test]

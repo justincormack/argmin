@@ -81,6 +81,12 @@ enum AbortMultipartUploadDrainMode {
     Stop,
 }
 
+#[derive(Clone, Copy)]
+struct BucketDeleteExactDrainProgress<'a> {
+    client: &'a dyn BucketWriteReservationNodeClient,
+    drain: &'a super::DurableBucketWriteDrain,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BucketVisibleDataSource {
     ObjectVersion { pg_id: PgId },
@@ -2512,6 +2518,7 @@ impl super::StorageCluster {
             bucket_execution_generation: record.bucket_execution_generation,
             outcome,
             detail,
+            post_reservation_next_object_pg_id: None,
             updated_at: crate::clock::current_time_millis(),
         };
         if let Err(error) = client.record_bucket_delete_attempt_outcome(pg_id, &outcome_record) {
@@ -2626,6 +2633,7 @@ impl super::StorageCluster {
                 bucket,
                 Some(delete_started),
                 work_budget,
+                None,
             )?;
             crate::node::maybe_run_bucket_write_drain_wait_hook(bucket);
             std::thread::sleep(std::time::Duration::from_millis(1));
@@ -2775,9 +2783,22 @@ impl super::StorageCluster {
         bucket: &BucketName,
         started: Option<std::time::Instant>,
         work_budget: &mut super::RequestWorkBudget,
+        progress: Option<BucketDeleteExactDrainProgress<'_>>,
     ) -> Result<(), BucketWriteDrainError> {
         let object_pg_ids: Vec<PgId> = self.metadata_pg_ids().into_iter().map(PgId::new).collect();
-        for object_pg_id in &object_pg_ids {
+        let next_object_pg_id = match progress {
+            Some(progress) => self
+                .bucket_delete_post_reservation_next_object_pg_id(progress)?
+                .unwrap_or(0),
+            None => 0,
+        };
+        let mut scanned_count = 0usize;
+        let mut drained_count = 0usize;
+        for object_pg_id in object_pg_ids
+            .iter()
+            .copied()
+            .filter(|object_pg_id| object_pg_id.get() >= next_object_pg_id)
+        {
             self.check_bucket_delete_begin_work_budget(
                 bucket,
                 started,
@@ -2793,11 +2814,74 @@ impl super::StorageCluster {
                 );
             }
         }
-        let exact_pending = self.pending_exact_bucket_metadata_commands_on_all_pgs(
-            bucket,
-            &object_pg_ids,
-            started,
-        )?;
+        for chunk in object_pg_ids
+            .iter()
+            .copied()
+            .filter(|object_pg_id| object_pg_id.get() >= next_object_pg_id)
+            .collect::<Vec<_>>()
+            .chunks(BUCKET_DELETE_EXACT_BUCKET_PENDING_PROBE_PARALLELISM)
+        {
+            let chunk_pending =
+                self.pending_exact_bucket_metadata_commands_on_pgs(bucket, chunk, started)?;
+            scanned_count += chunk.len();
+            if let Some(started) = started {
+                Self::emit_bucket_delete_begin_loop_step(
+                    bucket,
+                    self.bucket_metadata_pg_id(bucket).into(),
+                    started,
+                    "probe_exact_bucket_object_pg_chunk_done",
+                    format!(
+                        "chunk_pg_count={} chunk_exact_pending_count={} scanned_count={}",
+                        chunk.len(),
+                        chunk_pending.len(),
+                        scanned_count
+                    ),
+                );
+            }
+            for (object_pg_id, command) in chunk_pending {
+                self.check_bucket_delete_begin_work_budget(
+                    bucket,
+                    started,
+                    "bucket delete exact-bucket drain budget exhausted",
+                )?;
+                if let Some(started) = started {
+                    Self::emit_bucket_delete_begin_loop_step(
+                        bucket,
+                        self.bucket_metadata_pg_id(bucket).into(),
+                        started,
+                        "drain_exact_bucket_object_pg_start",
+                        format!(
+                            "object_pg_id={} command_kind={}",
+                            object_pg_id.get(),
+                            command.payload().kind_name()
+                        ),
+                    );
+                }
+                self.drain_pending_object_metadata_commands_for_exact_bucket_with_work_budget(
+                    object_pg_id,
+                    bucket,
+                    work_budget,
+                )
+                .map_err(super::object_pg_action_error_to_bucket_snapshot_error)
+                .map_err(bucket_snapshot_error_to_bucket_write_drain_error)?;
+                drained_count += 1;
+                if let Some(started) = started {
+                    Self::emit_bucket_delete_begin_loop_step(
+                        bucket,
+                        self.bucket_metadata_pg_id(bucket).into(),
+                        started,
+                        "drain_exact_bucket_object_pg_done",
+                        format!("object_pg_id={}", object_pg_id.get()),
+                    );
+                }
+            }
+            if let (Some(progress), Some(last_pg)) = (progress, chunk.last()) {
+                self.record_bucket_delete_post_reservation_next_object_pg_id(
+                    progress,
+                    last_pg.get().saturating_add(1),
+                )?;
+            }
+        }
         self.check_bucket_delete_begin_work_budget(
             bucket,
             started,
@@ -2810,91 +2894,183 @@ impl super::StorageCluster {
                 started,
                 "probe_exact_bucket_object_pgs_done",
                 format!(
-                    "object_pg_count={} exact_pending_count={}",
+                    "object_pg_count={} skipped_before_pg={} scanned_count={} drained_count={}",
                     object_pg_ids.len(),
-                    exact_pending.len()
+                    next_object_pg_id,
+                    scanned_count,
+                    drained_count
                 ),
             );
-        }
-        for (object_pg_id, command) in exact_pending {
-            self.check_bucket_delete_begin_work_budget(
-                bucket,
-                started,
-                "bucket delete exact-bucket drain budget exhausted",
-            )?;
-            if let Some(started) = started {
-                Self::emit_bucket_delete_begin_loop_step(
-                    bucket,
-                    self.bucket_metadata_pg_id(bucket).into(),
-                    started,
-                    "drain_exact_bucket_object_pg_start",
-                    format!(
-                        "object_pg_id={} command_kind={}",
-                        object_pg_id.get(),
-                        command.payload().kind_name()
-                    ),
-                );
-            }
-            self.drain_pending_object_metadata_commands_for_exact_bucket_with_work_budget(
-                object_pg_id,
-                bucket,
-                work_budget,
-            )
-            .map_err(super::object_pg_action_error_to_bucket_snapshot_error)
-            .map_err(bucket_snapshot_error_to_bucket_write_drain_error)?;
-            if let Some(started) = started {
-                Self::emit_bucket_delete_begin_loop_step(
-                    bucket,
-                    self.bucket_metadata_pg_id(bucket).into(),
-                    started,
-                    "drain_exact_bucket_object_pg_done",
-                    format!("object_pg_id={}", object_pg_id.get()),
-                );
-            }
         }
         Ok(())
     }
 
-    fn pending_exact_bucket_metadata_commands_on_all_pgs(
+    #[cfg(test)]
+    pub(crate) fn test_record_bucket_delete_post_reservation_next_object_pg_id(
+        &self,
+        drain: &super::DurableBucketWriteDrain,
+        next_object_pg_id: u32,
+    ) -> Result<(), BucketWriteDrainError> {
+        let pg_id = PgId::new(drain.pg_id);
+        let node = self
+            .local_map
+            .metadata_pg_primary_node(self.operation_epoch(), pg_id)?;
+        self.record_bucket_delete_post_reservation_next_object_pg_id(
+            BucketDeleteExactDrainProgress {
+                client: node.bucket_write_reservation_client().as_ref(),
+                drain,
+            },
+            next_object_pg_id,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_bucket_delete_post_reservation_next_object_pg_id(
+        &self,
+        drain: &super::DurableBucketWriteDrain,
+    ) -> Result<Option<u32>, BucketWriteDrainError> {
+        let pg_id = PgId::new(drain.pg_id);
+        let node = self
+            .local_map
+            .metadata_pg_primary_node(self.operation_epoch(), pg_id)?;
+        self.bucket_delete_post_reservation_next_object_pg_id(BucketDeleteExactDrainProgress {
+            client: node.bucket_write_reservation_client().as_ref(),
+            drain,
+        })
+    }
+
+    fn pending_exact_bucket_metadata_commands_on_pgs(
         &self,
         bucket: &BucketName,
         object_pg_ids: &[PgId],
         started: Option<std::time::Instant>,
     ) -> Result<Vec<(PgId, MetadataCommandEnvelope)>, BucketWriteDrainError> {
         let mut exact_pending = Vec::new();
-        for chunk in object_pg_ids.chunks(BUCKET_DELETE_EXACT_BUCKET_PENDING_PROBE_PARALLELISM) {
-            let mut chunk_pending = std::thread::scope(|scope| {
-                let mut handles = Vec::with_capacity(chunk.len());
-                for &object_pg_id in chunk {
-                    handles.push((
-                        object_pg_id,
-                        scope.spawn(move || {
-                            self.pending_metadata_command_for_bucket(object_pg_id, bucket)
-                        }),
-                    ));
-                }
+        let mut chunk_pending = std::thread::scope(|scope| {
+            let mut handles = Vec::with_capacity(object_pg_ids.len());
+            for &object_pg_id in object_pg_ids {
+                handles.push((
+                    object_pg_id,
+                    scope.spawn(move || {
+                        self.pending_metadata_command_for_bucket(object_pg_id, bucket)
+                    }),
+                ));
+            }
 
-                let mut chunk_pending = Vec::new();
-                for (object_pg_id, handle) in handles {
-                    let pending = match handle.join() {
-                        Ok(result) => result.map_err(BucketWriteDrainError::from)?,
-                        Err(payload) => std::panic::resume_unwind(payload),
-                    };
-                    if let Some(command) = pending.filter(|command| command.bucket_name() == bucket)
-                    {
-                        chunk_pending.push((object_pg_id, command));
-                    }
+            let mut chunk_pending = Vec::new();
+            for (object_pg_id, handle) in handles {
+                let pending = match handle.join() {
+                    Ok(result) => result.map_err(BucketWriteDrainError::from)?,
+                    Err(payload) => std::panic::resume_unwind(payload),
+                };
+                if let Some(command) = pending.filter(|command| command.bucket_name() == bucket) {
+                    chunk_pending.push((object_pg_id, command));
                 }
-                Ok::<_, BucketWriteDrainError>(chunk_pending)
-            })?;
-            exact_pending.append(&mut chunk_pending);
-            self.check_bucket_delete_begin_work_budget(
-                bucket,
-                started,
-                "bucket delete exact-bucket drain budget exhausted",
-            )?;
-        }
+            }
+            Ok::<_, BucketWriteDrainError>(chunk_pending)
+        })?;
+        exact_pending.append(&mut chunk_pending);
+        self.check_bucket_delete_begin_work_budget(
+            bucket,
+            started,
+            "bucket delete exact-bucket drain budget exhausted",
+        )?;
         Ok(exact_pending)
+    }
+
+    fn bucket_delete_post_reservation_next_object_pg_id(
+        &self,
+        progress: BucketDeleteExactDrainProgress<'_>,
+    ) -> Result<Option<u32>, BucketWriteDrainError> {
+        let record = progress
+            .client
+            .bucket_delete_attempt_outcome(
+                PgId::new(progress.drain.pg_id),
+                &progress.drain.record.bucket,
+            )
+            .map_err(bucket_snapshot_error_to_bucket_write_drain_error)?;
+        Ok(record
+            .filter(|record| {
+                record.drain_id == progress.drain.record.drain_id
+                    && record.cluster_epoch == progress.drain.record.cluster_epoch
+                    && record.bucket_execution_generation
+                        == progress.drain.record.bucket_execution_generation
+            })
+            .and_then(|record| record.post_reservation_next_object_pg_id))
+    }
+
+    fn record_bucket_delete_post_reservation_next_object_pg_id(
+        &self,
+        progress: BucketDeleteExactDrainProgress<'_>,
+        next_object_pg_id: u32,
+    ) -> Result<(), BucketWriteDrainError> {
+        let existing = match progress.client.bucket_delete_attempt_outcome(
+            PgId::new(progress.drain.pg_id),
+            &progress.drain.record.bucket,
+        ) {
+            Ok(existing) => existing,
+            Err(error) => {
+                let _ = observability::event(
+                    super::TRACE_TARGET,
+                    "bucket_delete_attempt_progress_load_failed",
+                    Some(format_args!(
+                        "bucket={:?} pg_id={} drain_id={} next_object_pg_id={} error={:?}",
+                        progress.drain.record.bucket,
+                        progress.drain.pg_id,
+                        progress.drain.record.drain_id,
+                        next_object_pg_id,
+                        error
+                    )),
+                );
+                return Err(bucket_snapshot_error_to_bucket_write_drain_error(error));
+            }
+        };
+        let (outcome, detail) = existing
+            .filter(|record| {
+                record.drain_id == progress.drain.record.drain_id
+                    && record.cluster_epoch == progress.drain.record.cluster_epoch
+                    && record.bucket_execution_generation
+                        == progress.drain.record.bucket_execution_generation
+            })
+            .map(|record| (record.outcome, record.detail))
+            .unwrap_or_else(|| {
+                (
+                    BucketDeleteAttemptOutcomeKind::Retryable,
+                    format!(
+                        "post-reservation exact-bucket drain progressed to object PG {next_object_pg_id}"
+                    ),
+                )
+            });
+        let detail = Self::bounded_bucket_delete_attempt_detail(detail);
+        let record = BucketDeleteAttemptOutcomeRecord {
+            bucket: progress.drain.record.bucket.clone(),
+            drain_id: progress.drain.record.drain_id.clone(),
+            cluster_epoch: progress.drain.record.cluster_epoch,
+            bucket_execution_generation: progress.drain.record.bucket_execution_generation,
+            outcome,
+            detail,
+            post_reservation_next_object_pg_id: Some(next_object_pg_id),
+            updated_at: crate::clock::current_time_millis(),
+        };
+        if let Err(error) = progress
+            .client
+            .record_bucket_delete_attempt_outcome(PgId::new(progress.drain.pg_id), &record)
+        {
+            let _ = observability::event(
+                super::TRACE_TARGET,
+                "bucket_delete_attempt_progress_record_failed",
+                Some(format_args!(
+                    "bucket={:?} pg_id={} drain_id={} next_object_pg_id={} error={:?}",
+                    progress.drain.record.bucket,
+                    progress.drain.pg_id,
+                    progress.drain.record.drain_id,
+                    next_object_pg_id,
+                    error
+                )),
+            );
+            return Err(bucket_snapshot_error_to_bucket_write_drain_error(error));
+        }
+        Ok(())
     }
 
     fn check_bucket_delete_begin_work_budget(
@@ -3544,6 +3720,7 @@ impl super::StorageCluster {
                                 bucket,
                                 Some(started),
                                 &mut work_budget,
+                                None,
                             ) {
                             Ok(()) => {}
                             Err(BucketWriteDrainError::Store(
@@ -3595,6 +3772,7 @@ impl super::StorageCluster {
                         bucket,
                         Some(started),
                         &mut work_budget,
+                        None,
                     ) {
                     Ok(()) => {}
                     Err(BucketWriteDrainError::Store(StoreError::MetadataCommandContention {
@@ -3718,6 +3896,10 @@ impl super::StorageCluster {
                         bucket,
                         Some(started),
                         &mut work_budget,
+                        Some(BucketDeleteExactDrainProgress {
+                            client: node_store.bucket_write_reservation_client().as_ref(),
+                            drain: &durable_drain,
+                        }),
                     ) {
                     Ok(()) => {}
                     Err(BucketWriteDrainError::Store(StoreError::MetadataCommandContention {
@@ -3743,6 +3925,14 @@ impl super::StorageCluster {
                         loop_iteration
                     ),
                 );
+                let post_reservation_progress = BucketDeleteExactDrainProgress {
+                    client: node_store.bucket_write_reservation_client().as_ref(),
+                    drain: &durable_drain,
+                };
+                self.record_bucket_delete_post_reservation_next_object_pg_id(
+                    post_reservation_progress,
+                    0,
+                )?;
                 Self::emit_bucket_delete_begin_loop_step(
                     bucket,
                     pg_id,
@@ -3792,6 +3982,7 @@ impl super::StorageCluster {
                             bucket,
                             Some(started),
                             &mut work_budget,
+                            None,
                         ) {
                         Ok(()) => {}
                         Err(BucketWriteDrainError::Store(StoreError::MetadataCommandContention {
