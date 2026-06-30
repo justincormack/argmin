@@ -8942,7 +8942,10 @@ Keep an explicit Phase 11 close-out before treating the phase as soak-clean:
 1. status: partial. Audit all `DeleteBucket`-begin and finalizer error mappings so stale routes,
    stale metadata primaries, pending-command displacement, route-map expiry, and
    storage-node overload consistently become `OperationAborted` or `SlowDown`,
-   not `InternalError`;
+   not `InternalError`. Bucket write-reservation conflict/not-found outcomes are
+   now classified with the other metadata-command contention cases so a
+   competing drain or recovery worker cannot leak an internal reservation state
+   to clients instead of the retryable conflict surface;
 2. status: partial. Audit foreground work budgets against route-map validity deadlines. Any
    synchronous `DeleteBucket` loop that can run close to the validity window
    must either refresh/retry the whole operation from a fresh storage-cluster
@@ -9107,11 +9110,12 @@ Keep an explicit Phase 11 close-out before treating the phase as soak-clean:
          `DeleteBucket` can persist a partial post-reservation frontier, fail
          retryably, preserve that frontier when recording the retryable outcome,
          and let the generation-fenced `BucketDeleteBegin` worker entry point
-         adopt the active drain and resume from the later object PGs.
+         adopt the active drain and resume from the later object PGs. A
+         coordinator-level reclaim-worker regression now also drives the actual
+         background thread through a foreground attempt that persisted a partial
+         post-reservation frontier and then failed retryably.
          Remaining work: add resumable frontier/state for stream cleanup and
-         final visibility phases, and add full background-worker thread
-         coverage for a partially progressed delete attempt if the storage-layer
-         worker-entry regression is not enough to close that risk.
+         final visibility phases.
       5. status: open. Revisit reservation classification only after attempts are resumable;
          it should be an optimization on top of a convergent state machine, not
          the convergence mechanism itself.

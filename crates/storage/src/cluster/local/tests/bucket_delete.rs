@@ -3276,7 +3276,7 @@ fn begin_bucket_delete_adopts_preserved_post_reservation_frontier() {
     let _serial = lock_bucket_scoped_hook_test();
     let tmp = test_util::tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
-    let pg_ids: Vec<u32> = (0..10).collect();
+    let pg_ids: Vec<u32> = (0..32).collect();
     let ec_shape = EcShape { k: 2, m: 1 };
     let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &pg_ids, ec_shape).unwrap();
     let (bucket, lower_key, later_key, pg_count) = {
@@ -3293,8 +3293,8 @@ fn begin_bucket_delete_adopts_preserved_post_reservation_frontier() {
         (bucket, lower_key, later_key, topology.pg_count())
     };
     assert!(
-        pg_count > 8,
-        "test requires more than one exact-bucket drain chunk"
+        pg_count >= 32,
+        "test requires several exact-bucket drain chunks"
     );
     set_route_primary(&mut map, 1, NodeId::new(1));
 

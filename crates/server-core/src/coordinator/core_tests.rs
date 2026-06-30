@@ -975,6 +975,81 @@ fn reclaim_worker_retries_bucket_delete_begin_after_early_route_map_failure() {
 }
 
 #[test]
+fn reclaim_worker_adopts_bucket_delete_begin_after_partial_frontier() {
+    let tmp = test_util::tempdir();
+    let pg_ids: Vec<u32> = (0..32).collect();
+    let bucket = trusted_bucket_name("bucket-delete-begin-worker-frontier");
+    let initial = open_test_storage_cluster(tmp.path(), &pg_ids);
+    let direct_coord = setup_direct_coordinator_with_storage_cluster(Arc::clone(&initial));
+    direct_coord
+        .create_bucket_for_owner("default-owner", bucket.as_str(), false)
+        .unwrap();
+
+    let pg_count = initial.test_pg_ids().len() as u32;
+    assert!(
+        pg_count >= 32,
+        "test requires several exact-bucket drain chunks"
+    );
+    let fail_after_first_frontier = Arc::new(AtomicBool::new(true));
+    let fail_after_first_frontier_for_hook = Arc::clone(&fail_after_first_frontier);
+    let _progress_hook_guard = initial
+        .test_install_after_bucket_delete_post_reservation_progress_hook(Arc::new(
+            move |next_object_pg_id| {
+                if next_object_pg_id < pg_count
+                    && fail_after_first_frontier_for_hook.swap(false, Ordering::SeqCst)
+                {
+                    return Err(storage::StoreError::RouteMapExpired {
+                        cluster_epoch: ClusterEpoch::INITIAL,
+                        valid_until_ms: 0,
+                        now_ms: 1,
+                    });
+                }
+                Ok(())
+            },
+        ));
+
+    let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&initial));
+    let _coord = setup_coordinator_with_only_reclaim_worker(handle, Arc::clone(&initial));
+
+    let err = initial.begin_bucket_delete(&bucket).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            storage::BucketWriteDrainError::Store(storage::StoreError::RouteMapExpired { .. })
+        ),
+        "foreground DeleteBucket should preserve the attempt on injected route expiry, got {err:?}"
+    );
+    assert!(
+        !fail_after_first_frontier.load(Ordering::SeqCst),
+        "test hook should fail after the first persisted post-reservation frontier"
+    );
+
+    let deadline = Instant::now() + TEST_EVENT_TIMEOUT;
+    loop {
+        match initial.test_head_bucket_raw(&bucket) {
+            Ok(info) if info.state == storage::BucketState::Deleting => break,
+            Err(storage::BucketSnapshotLoadError::Metadata(
+                storage::MetadataError::BucketNotFound { .. },
+            )) => break,
+            Ok(info) if Instant::now() < deadline => {
+                assert_eq!(
+                    info.state,
+                    storage::BucketState::Active,
+                    "unexpected bucket state while waiting for background begin adoption"
+                );
+                thread::sleep(Duration::from_millis(10));
+            }
+            Ok(info) => {
+                panic!("reclaim worker did not adopt partial BucketDeleteBegin: {info:?}");
+            }
+            Err(err) => {
+                panic!("unexpected bucket metadata error while waiting for begin adoption: {err:?}")
+            }
+        }
+    }
+}
+
+#[test]
 fn reclaim_worker_drops_stale_bucket_delete_begin_after_bucket_recreate() {
     let tmp = test_util::tempdir();
     let bucket = trusted_bucket_name("bucket-delete-begin-stale-recreate");

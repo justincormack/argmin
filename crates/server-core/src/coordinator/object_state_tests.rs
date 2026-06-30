@@ -5717,7 +5717,7 @@ fn get_object_is_consistent_during_concurrent_overwrite() {
 
         let t_write = thread::spawn(move || {
             b1.wait();
-            test_helpers::put_object(
+            put_object_retrying_operation_aborted(
                 &writer,
                 &PutObjectRequest {
                     encryption: WriteEncryptionRequest::none(),
@@ -5826,7 +5826,7 @@ fn copy_object_is_consistent_during_concurrent_overwrite() {
 
         let t_write = thread::spawn(move || {
             b1.wait();
-            test_helpers::put_object(
+            put_object_retrying_operation_aborted(
                 &writer,
                 &PutObjectRequest {
                     encryption: WriteEncryptionRequest::none(),

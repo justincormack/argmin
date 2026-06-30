@@ -176,8 +176,8 @@ type StreamPutFinalizeCommandIdTestHook = Arc<dyn Fn() + Send + Sync>;
 #[cfg(test)]
 type BucketDeleteCommandIdTestHook = Arc<dyn Fn() + Send + Sync>;
 
-#[cfg(test)]
-type BucketDeletePostReservationProgressTestHook =
+#[cfg(any(test, feature = "test-hooks"))]
+pub type BucketDeletePostReservationProgressTestHook =
     Arc<dyn Fn(u32) -> Result<(), StoreError> + Send + Sync>;
 
 #[cfg(test)]
@@ -213,7 +213,7 @@ static BEFORE_BUCKET_DELETE_COMMAND_ID_HOOKS: OnceLock<
     Mutex<HashMap<usize, BucketDeleteCommandIdTestHook>>,
 > = OnceLock::new();
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-hooks"))]
 static AFTER_BUCKET_DELETE_POST_RESERVATION_PROGRESS_HOOKS: OnceLock<
     Mutex<HashMap<usize, BucketDeletePostReservationProgressTestHook>>,
 > = OnceLock::new();
@@ -258,8 +258,8 @@ pub(crate) struct BucketDeleteCommandIdTestHookGuard {
     scope_id: usize,
 }
 
-#[cfg(test)]
-pub(crate) struct BucketDeletePostReservationProgressTestHookGuard {
+#[cfg(any(test, feature = "test-hooks"))]
+pub struct BucketDeletePostReservationProgressTestHookGuard {
     scope_id: usize,
 }
 
@@ -339,7 +339,7 @@ impl Drop for BucketDeleteCommandIdTestHookGuard {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-hooks"))]
 impl Drop for BucketDeletePostReservationProgressTestHookGuard {
     fn drop(&mut self) {
         let hooks = AFTER_BUCKET_DELETE_POST_RESERVATION_PROGRESS_HOOKS
@@ -472,7 +472,7 @@ fn maybe_run_before_bucket_delete_command_id_hook(_scope_id: usize) {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-hooks"))]
 fn maybe_run_after_bucket_delete_post_reservation_progress_hook(
     _scope_id: usize,
     _next_object_pg_id: u32,
@@ -791,8 +791,8 @@ impl super::StorageCluster {
         BucketDeleteCommandIdTestHookGuard { scope_id }
     }
 
-    #[cfg(test)]
-    pub(crate) fn test_install_after_bucket_delete_post_reservation_progress_hook(
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_install_after_bucket_delete_post_reservation_progress_hook(
         &self,
         hook: BucketDeletePostReservationProgressTestHook,
     ) -> BucketDeletePostReservationProgressTestHookGuard {
@@ -2971,7 +2971,7 @@ impl super::StorageCluster {
                     progress,
                     next_object_pg_id,
                 )?;
-                #[cfg(test)]
+                #[cfg(any(test, feature = "test-hooks"))]
                 maybe_run_after_bucket_delete_post_reservation_progress_hook(
                     self.metadata_command_apply_test_hook_scope_id(),
                     next_object_pg_id,
@@ -3501,7 +3501,7 @@ impl super::StorageCluster {
                             pg_id,
                             &existing,
                             BucketDeleteAttemptOutcomeKind::NotEmpty,
-                            BucketDeleteAttemptPhase::Initial,
+                            BucketDeleteAttemptPhase::StreamCleanup,
                             format!("live stream blocker before drain adoption: {source:?}"),
                         );
                         match node_store
