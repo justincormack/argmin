@@ -177,6 +177,13 @@ impl<T> ControlPlaneRaftAuthorityService for T where
 {
 }
 
+pub trait ControlPlaneRaftAuthorityServiceDirectory {
+    fn authority_service_for_node(
+        &self,
+        node_id: ControlPlaneRaftNodeId,
+    ) -> ControlPlaneRaftFuture<'_, Result<ControlPlaneRaftAuthorityServiceHandle, ControlPlaneError>>;
+}
+
 #[derive(Clone)]
 pub struct ControlPlaneRaftAuthorityHandle {
     inner: Arc<dyn ControlPlaneRaftLinearizedAuthority + Send + Sync>,
@@ -2836,6 +2843,51 @@ mod tests {
         }
     }
 
+    #[derive(Debug, Clone, Default)]
+    struct InMemoryAuthorityServiceDirectory {
+        services:
+            Arc<Mutex<BTreeMap<ControlPlaneRaftNodeId, ControlPlaneRaftAuthorityServiceHandle>>>,
+    }
+
+    impl InMemoryAuthorityServiceDirectory {
+        fn register(
+            &self,
+            node_id: ControlPlaneRaftNodeId,
+            service: ControlPlaneRaftAuthorityServiceHandle,
+        ) {
+            self.services.lock().unwrap().insert(node_id, service);
+        }
+    }
+
+    impl ControlPlaneRaftAuthorityServiceDirectory for InMemoryAuthorityServiceDirectory {
+        fn authority_service_for_node(
+            &self,
+            node_id: ControlPlaneRaftNodeId,
+        ) -> ControlPlaneRaftFuture<
+            '_,
+            Result<ControlPlaneRaftAuthorityServiceHandle, ControlPlaneError>,
+        > {
+            let result = (|| {
+                let services = self
+                    .services
+                    .lock()
+                    .map_err(|_| ControlPlaneError::RpcRemote {
+                        message: "in-memory test authority service directory lock poisoned"
+                            .to_string(),
+                    })?;
+                services
+                    .get(&node_id)
+                    .cloned()
+                    .ok_or_else(|| ControlPlaneError::RpcRemote {
+                        message: format!(
+                            "in-memory test authority service directory has no node {node_id}"
+                        ),
+                    })
+            })();
+            Box::pin(std::future::ready(result))
+        }
+    }
+
     impl RaftNetworkFactory<ControlPlaneRaftTypeConfig> for InMemoryRaftNetworkFactory {
         type Network = InMemoryRaftNetwork;
 
@@ -4807,6 +4859,125 @@ mod tests {
                 service2.shutdown(),
                 operation_timeout,
                 "admin handle shutdown surviving voter",
+            )
+            .await;
+        });
+    }
+
+    #[test]
+    fn control_plane_openraft_authority_service_directory_routes_by_node_id() {
+        ControlPlaneRaftTypeConfig::run(async {
+            let operation_timeout = Duration::from_secs(2);
+            let (authority1, authority2) = initialized_two_node_authorities(
+                "control-plane-raft-authority-service-directory-test",
+                411,
+                412,
+            )
+            .await;
+            let authority1 = Arc::new(authority1);
+            let authority2 = Arc::new(authority2);
+            let directory = InMemoryAuthorityServiceDirectory::default();
+            directory.register(
+                411,
+                ControlPlaneRaftAuthorityServiceHandle::new(Arc::clone(&authority1)),
+            );
+            directory.register(
+                412,
+                ControlPlaneRaftAuthorityServiceHandle::new(Arc::clone(&authority2)),
+            );
+
+            let missing = directory.authority_service_for_node(499).await;
+            assert!(matches!(
+                missing,
+                Err(ControlPlaneError::RpcRemote { message })
+                    if message.contains("no node 499")
+            ));
+
+            let leader_service = expect_bounded_control_plane_raft(
+                directory.authority_service_for_node(411),
+                operation_timeout,
+                "authority service directory lookup leader",
+            )
+            .await;
+            let follower_service = expect_bounded_control_plane_raft(
+                directory.authority_service_for_node(412),
+                operation_timeout,
+                "authority service directory lookup follower",
+            )
+            .await;
+            let bootstrap = expect_bounded_control_plane_raft(
+                leader_service.submit_control_plane_command(
+                    ControlPlaneCommand::BootstrapInitialClusterMap {
+                        nodes: vec![
+                            (NodeId::new(411), "node-411".to_string()),
+                            (NodeId::new(412), "node-412".to_string()),
+                        ],
+                        pg_ids: vec![PgId::new(0)],
+                    },
+                ),
+                operation_timeout,
+                "authority service directory bootstrap command",
+            )
+            .await;
+            assert!(matches!(
+                bootstrap.outcome(),
+                ControlPlaneRaftCommandOutcome::Applied(
+                    ControlPlaneCommandResponse::BootstrapInitialClusterMap
+                )
+            ));
+            expect_bounded_control_plane_raft(
+                follower_service.wait_for_applied_index_at_least(
+                    bootstrap.log_id().index(),
+                    Duration::from_secs(1),
+                    "authority service directory follower applied bootstrap",
+                ),
+                operation_timeout,
+                "authority service directory follower wait",
+            )
+            .await;
+
+            expect_bounded_control_plane_raft(
+                leader_service.transfer_leadership_to(412),
+                operation_timeout,
+                "authority service directory transfer leadership",
+            )
+            .await;
+            expect_bounded_control_plane_raft(
+                follower_service.wait_for_current_leader(
+                    412,
+                    Duration::from_secs(1),
+                    "authority service directory observed transferred leader",
+                ),
+                operation_timeout,
+                "authority service directory wait for transferred leader",
+            )
+            .await;
+            let runtime_map = expect_bounded_control_plane_raft(
+                follower_service.linearized_runtime_map_snapshot(91_000),
+                operation_timeout,
+                "authority service directory runtime map read",
+            )
+            .await;
+            assert_eq!(runtime_map.freshness_proof().issued_at_ms(), Some(91_000));
+            assert!(runtime_map
+                .nodes()
+                .iter()
+                .any(|node| node.node_id() == NodeId::new(411)));
+            assert!(runtime_map
+                .nodes()
+                .iter()
+                .any(|node| node.node_id() == NodeId::new(412)));
+
+            expect_bounded_control_plane_raft(
+                leader_service.shutdown(),
+                operation_timeout,
+                "authority service directory shutdown old leader",
+            )
+            .await;
+            expect_bounded_control_plane_raft(
+                follower_service.shutdown(),
+                operation_timeout,
+                "authority service directory shutdown transferred leader",
             )
             .await;
         });

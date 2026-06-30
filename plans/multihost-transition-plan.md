@@ -9763,6 +9763,12 @@ Phase 12.1 progress:
   submission, leadership transfer, voter replacement, status inspection, and
   shutdown through that single object-safe capability, matching the shape an
   RPC-facing control-plane service can expose.
+- Added an object-safe OpenRaft authority service directory boundary for
+  node-id based service lookup. A test-only in-memory directory now routes
+  bootstrap, leadership transfer, linearized runtime-map read, and shutdown
+  through service handles resolved from the directory, giving future RPC/admin
+  client routing a capability-level boundary without exposing the concrete
+  OpenRaft wrapper.
 
 1. define the replicated control-plane state machine:
    - state includes cluster epoch, PG count, PG state, PG acting sets, node
