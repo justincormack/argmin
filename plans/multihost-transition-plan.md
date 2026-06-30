@@ -9524,7 +9524,9 @@ Phase 12.1 progress:
   now forwards transfer-leader RPCs, the authority wrapper can request
   leadership transfer and wait for a learned leader, and a two-node smoke proves
   the old leader rejects a post-transfer command while the new leader commits
-  and replicates the next command.
+  and replicates the next command. The same smoke now also proves the old leader
+  cannot publish a read-index runtime map after transfer, while the new leader
+  publishes a serving map stamped with the post-transfer applied log id.
 - Isolated the public OpenRaft smokes with distinct cluster names so the normal
   parallel `control_plane_raft` test group cannot share OpenRaft test identity
   while still exercising the real client-write and read-index paths.

@@ -3604,6 +3604,16 @@ mod tests {
                 .await
                 .unwrap();
 
+            let old_leader_read_err = authority1
+                .linearized_runtime_map_snapshot(77_000)
+                .await
+                .unwrap_err();
+            assert!(matches!(
+                old_leader_read_err,
+                ControlPlaneError::RpcRemote { message }
+                    if message.contains("OpenRaft read-index failed")
+            ));
+
             let old_leader_err = authority1
                 .submit_control_plane_command(ControlPlaneCommand::MarkNodeAvailability {
                     node_id: NodeId::new(701),
@@ -3646,6 +3656,19 @@ mod tests {
             assert_eq!(new_status.current_leader(), Some(702));
             assert_eq!(old_status.applied(), Some(follow_up.log_id()));
             assert_eq!(new_status.applied(), Some(follow_up.log_id()));
+
+            let runtime_map = authority2
+                .linearized_runtime_map_snapshot(78_000)
+                .await
+                .unwrap();
+            let expected_read_index = control_plane_log_id_from_raft(follow_up.log_id())
+                .expect("post-transfer command log id should be non-bootstrap");
+            assert_eq!(
+                runtime_map.freshness_proof().read_index(),
+                Some(expected_read_index)
+            );
+            assert_eq!(runtime_map.freshness_proof().issued_at_ms(), Some(78_000));
+            assert!(runtime_map.freshness_proof().is_serving_authority_read());
 
             authority1.shutdown().await.unwrap();
             authority2.shutdown().await.unwrap();
