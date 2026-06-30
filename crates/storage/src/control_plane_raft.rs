@@ -167,6 +167,16 @@ impl<T> ControlPlaneRaftLinearizedAuthority for T where
 {
 }
 
+pub trait ControlPlaneRaftAuthorityService:
+    ControlPlaneRaftLinearizedAuthority + ControlPlaneRaftAuthorityAdmin
+{
+}
+
+impl<T> ControlPlaneRaftAuthorityService for T where
+    T: ControlPlaneRaftLinearizedAuthority + ControlPlaneRaftAuthorityAdmin
+{
+}
+
 #[derive(Clone)]
 pub struct ControlPlaneRaftAuthorityHandle {
     inner: Arc<dyn ControlPlaneRaftLinearizedAuthority + Send + Sync>,
@@ -264,6 +274,132 @@ impl fmt::Debug for ControlPlaneRaftAuthorityAdminHandle {
 }
 
 impl ControlPlaneRaftAuthorityAdmin for ControlPlaneRaftAuthorityAdminHandle {
+    fn initialize_membership(
+        &self,
+        nodes: BTreeMap<ControlPlaneRaftNodeId, BasicNode>,
+    ) -> ControlPlaneRaftFuture<'_, Result<(), ControlPlaneError>> {
+        self.inner.initialize_membership(nodes)
+    }
+
+    fn is_initialized(&self) -> ControlPlaneRaftFuture<'_, Result<bool, ControlPlaneError>> {
+        self.inner.is_initialized()
+    }
+
+    fn replace_voters(
+        &self,
+        voters: BTreeSet<ControlPlaneRaftNodeId>,
+        retain_removed_voters_as_learners: bool,
+    ) -> ControlPlaneRaftFuture<'_, Result<LogIdOf<ControlPlaneRaftTypeConfig>, ControlPlaneError>>
+    {
+        self.inner
+            .replace_voters(voters, retain_removed_voters_as_learners)
+    }
+
+    fn add_learner(
+        &self,
+        node_id: ControlPlaneRaftNodeId,
+        node: BasicNode,
+        wait_for_catch_up: bool,
+    ) -> ControlPlaneRaftFuture<'_, Result<LogIdOf<ControlPlaneRaftTypeConfig>, ControlPlaneError>>
+    {
+        self.inner.add_learner(node_id, node, wait_for_catch_up)
+    }
+
+    fn transfer_leadership_to(
+        &self,
+        node_id: ControlPlaneRaftNodeId,
+    ) -> ControlPlaneRaftFuture<'_, Result<(), ControlPlaneError>> {
+        self.inner.transfer_leadership_to(node_id)
+    }
+
+    fn wait_for_applied_index_at_least(
+        &self,
+        index: u64,
+        timeout: Duration,
+        message: &'static str,
+    ) -> ControlPlaneRaftFuture<'_, Result<(), ControlPlaneError>> {
+        self.inner
+            .wait_for_applied_index_at_least(index, timeout, message)
+    }
+
+    fn wait_for_current_leader(
+        &self,
+        leader_id: ControlPlaneRaftNodeId,
+        timeout: Duration,
+        message: &'static str,
+    ) -> ControlPlaneRaftFuture<'_, Result<(), ControlPlaneError>> {
+        self.inner
+            .wait_for_current_leader(leader_id, timeout, message)
+    }
+
+    fn shutdown(&self) -> ControlPlaneRaftFuture<'_, Result<(), ControlPlaneError>> {
+        self.inner.shutdown()
+    }
+}
+
+#[derive(Clone)]
+pub struct ControlPlaneRaftAuthorityServiceHandle {
+    inner: Arc<dyn ControlPlaneRaftAuthorityService + Send + Sync>,
+}
+
+impl ControlPlaneRaftAuthorityServiceHandle {
+    pub fn new<T>(authority: Arc<T>) -> Self
+    where
+        T: ControlPlaneRaftAuthorityService + Send + Sync + 'static,
+    {
+        Self { inner: authority }
+    }
+
+    pub fn from_authority_service(
+        authority: Arc<dyn ControlPlaneRaftAuthorityService + Send + Sync>,
+    ) -> Self {
+        Self { inner: authority }
+    }
+
+    #[must_use]
+    pub fn as_authority_service(
+        &self,
+    ) -> &(dyn ControlPlaneRaftAuthorityService + Send + Sync + 'static) {
+        &*self.inner
+    }
+}
+
+impl fmt::Debug for ControlPlaneRaftAuthorityServiceHandle {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ControlPlaneRaftAuthorityServiceHandle")
+            .finish_non_exhaustive()
+    }
+}
+
+impl ControlPlaneRaftLinearizedCommandSink for ControlPlaneRaftAuthorityServiceHandle {
+    fn submit_control_plane_command(
+        &self,
+        command: ControlPlaneCommand,
+    ) -> ControlPlaneRaftFuture<'_, Result<SubmittedControlPlaneRaftCommand, ControlPlaneError>>
+    {
+        self.inner.submit_control_plane_command(command)
+    }
+}
+
+impl ControlPlaneRaftLinearizedRuntimeMapSource for ControlPlaneRaftAuthorityServiceHandle {
+    fn linearized_runtime_map_snapshot(
+        &self,
+        issued_at_ms: u64,
+    ) -> ControlPlaneRaftFuture<'_, Result<ClusterRuntimeMapSnapshot, ControlPlaneError>> {
+        self.inner.linearized_runtime_map_snapshot(issued_at_ms)
+    }
+}
+
+impl ControlPlaneRaftAuthorityStatusSource for ControlPlaneRaftAuthorityServiceHandle {
+    fn status(
+        &self,
+    ) -> ControlPlaneRaftFuture<'_, Result<ControlPlaneRaftAuthorityStatus, ControlPlaneError>>
+    {
+        self.inner.status()
+    }
+}
+
+impl ControlPlaneRaftAuthorityAdmin for ControlPlaneRaftAuthorityServiceHandle {
     fn initialize_membership(
         &self,
         nodes: BTreeMap<ControlPlaneRaftNodeId, BasicNode>,
@@ -4579,13 +4715,13 @@ mod tests {
             .await;
             let authority1 = Arc::new(authority1);
             let authority2 = Arc::new(authority2);
-            let admin1 = ControlPlaneRaftAuthorityAdminHandle::new(Arc::clone(&authority1));
-            let admin2 = ControlPlaneRaftAuthorityAdminHandle::new(Arc::clone(&authority2));
-            let linearized1 = ControlPlaneRaftAuthorityHandle::new(Arc::clone(&authority1));
+            let service1 = ControlPlaneRaftAuthorityServiceHandle::new(Arc::clone(&authority1));
+            let service2 = ControlPlaneRaftAuthorityServiceHandle::new(Arc::clone(&authority2));
+            let authority_service1 = service1.as_authority_service();
 
-            assert!(admin1.as_admin_authority().is_initialized().await.unwrap());
+            assert!(authority_service1.is_initialized().await.unwrap());
             let bootstrap = expect_bounded_control_plane_raft(
-                linearized1.submit_control_plane_command(
+                authority_service1.submit_control_plane_command(
                     ControlPlaneCommand::BootstrapInitialClusterMap {
                         nodes: vec![
                             (NodeId::new(401), "node-401".to_string()),
@@ -4605,7 +4741,7 @@ mod tests {
                 )
             ));
             expect_bounded_control_plane_raft(
-                admin2.wait_for_applied_index_at_least(
+                service2.wait_for_applied_index_at_least(
                     bootstrap.log_id().index(),
                     Duration::from_secs(1),
                     "admin handle follower applied bootstrap",
@@ -4616,13 +4752,13 @@ mod tests {
             .await;
 
             expect_bounded_control_plane_raft(
-                admin1.transfer_leadership_to(402),
+                authority_service1.transfer_leadership_to(402),
                 operation_timeout,
                 "admin handle transfer leadership",
             )
             .await;
             expect_bounded_control_plane_raft(
-                admin2.wait_for_current_leader(
+                service2.wait_for_current_leader(
                     402,
                     Duration::from_secs(1),
                     "admin handle observed transferred leader",
@@ -4633,13 +4769,13 @@ mod tests {
             .await;
 
             let membership_log_id = expect_bounded_control_plane_raft(
-                admin2.replace_voters(BTreeSet::from([402]), false),
+                service2.replace_voters(BTreeSet::from([402]), false),
                 operation_timeout,
                 "admin handle replace voters",
             )
             .await;
             expect_bounded_control_plane_raft(
-                admin2.wait_for_applied_index_at_least(
+                service2.wait_for_applied_index_at_least(
                     membership_log_id.index(),
                     Duration::from_secs(1),
                     "admin handle applied voter replacement",
@@ -4649,7 +4785,7 @@ mod tests {
             )
             .await;
 
-            let status = authority2.status().await.unwrap();
+            let status = service2.status().await.unwrap();
             assert_eq!(status.current_leader(), Some(402));
             assert_eq!(
                 status.effective_membership_log_id(),
@@ -4662,13 +4798,13 @@ mod tests {
             );
 
             expect_bounded_control_plane_raft(
-                admin1.shutdown(),
+                authority_service1.shutdown(),
                 operation_timeout,
                 "admin handle shutdown removed voter",
             )
             .await;
             expect_bounded_control_plane_raft(
-                admin2.shutdown(),
+                service2.shutdown(),
                 operation_timeout,
                 "admin handle shutdown surviving voter",
             )

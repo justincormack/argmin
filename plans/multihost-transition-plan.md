@@ -9753,6 +9753,12 @@ Phase 12.1 progress:
   leader waits, and shutdown. A bounded smoke now drives leadership transfer
   and voter replacement through that handle, so future RPC/admin wiring can use
   an authority capability instead of naming the concrete OpenRaft wrapper.
+- Added a composed OpenRaft authority service boundary and cloneable service
+  handle that combines the linearized command/read/status surface with the
+  lifecycle/admin surface. The mixed admin smoke now drives bootstrap command
+  submission, leadership transfer, voter replacement, status inspection, and
+  shutdown through that single object-safe capability, matching the shape an
+  RPC-facing control-plane service can expose.
 
 1. define the replicated control-plane state machine:
    - state includes cluster epoch, PG count, PG state, PG acting sets, node
