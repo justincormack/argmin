@@ -26,6 +26,7 @@ use openraft::RaftLogReader;
 use openraft::RaftSnapshotBuilder;
 use openraft::RaftTypeConfig;
 use openraft::ReadPolicy;
+use openraft::ServerState;
 use openraft::StoredMembership;
 use placement::NodeId;
 
@@ -117,6 +118,7 @@ impl<T> ControlPlaneRaftLinearizedAuthority for T where
 pub struct ControlPlaneRaftAuthorityStatus {
     node_id: ControlPlaneRaftNodeId,
     current_leader: Option<ControlPlaneRaftNodeId>,
+    server_state: ServerState,
     persisted_vote: Option<VoteOf<ControlPlaneRaftTypeConfig>>,
     current_term: Option<ControlPlaneRaftTerm>,
     last_log_id: Option<LogIdOf<ControlPlaneRaftTypeConfig>>,
@@ -171,6 +173,11 @@ impl ControlPlaneRaftAuthorityStatus {
     #[must_use]
     pub fn current_leader(&self) -> Option<ControlPlaneRaftNodeId> {
         self.current_leader
+    }
+
+    #[must_use]
+    pub fn server_state(&self) -> ServerState {
+        self.server_state
     }
 
     #[must_use]
@@ -533,6 +540,7 @@ impl ControlPlaneRaftAuthority {
         let (
             last_log_id,
             committed,
+            server_state,
             effective_membership_log_id,
             effective_voters,
             effective_learners,
@@ -543,6 +551,7 @@ impl ControlPlaneRaftAuthority {
                 (
                     state.log_ids.last().cloned(),
                     state.local_committed().cloned(),
+                    state.server_state,
                     *effective_membership.log_id(),
                     effective_membership.membership().voter_ids().collect(),
                     effective_membership.membership().learner_ids().collect(),
@@ -733,6 +742,7 @@ impl ControlPlaneRaftAuthority {
         Ok(ControlPlaneRaftAuthorityStatus {
             node_id,
             current_leader,
+            server_state,
             persisted_vote,
             current_term,
             last_log_id,
@@ -2152,7 +2162,7 @@ mod tests {
         TransferLeaderResponse, VoteRequest, VoteResponse,
     };
     use openraft::type_config::TypeConfigExt;
-    use openraft::{AnyError, Config, Membership, Raft, ReadPolicy, ServerState};
+    use openraft::{AnyError, Config, Membership, Raft, ReadPolicy};
 
     use crate::control_plane::{
         ClusterControlSnapshot, NodeAvailabilityState, NodeHeartbeat, RuntimeMapFreshnessProof,
@@ -3872,6 +3882,7 @@ mod tests {
             let status = authority.status().await.unwrap();
             assert_eq!(status.node_id(), 1);
             assert_eq!(status.current_leader(), Some(1));
+            assert_eq!(status.server_state(), ServerState::Leader);
             let persisted_vote = status
                 .persisted_vote()
                 .expect("single-node leader should persist a vote");
@@ -4350,6 +4361,8 @@ mod tests {
             let new_status = authority2.status().await.unwrap();
             assert_eq!(old_status.current_leader(), Some(702));
             assert_eq!(new_status.current_leader(), Some(702));
+            assert_eq!(old_status.server_state(), ServerState::Follower);
+            assert_eq!(new_status.server_state(), ServerState::Leader);
             assert_eq!(old_status.applied(), Some(follow_up.log_id()));
             assert_eq!(new_status.applied(), Some(follow_up.log_id()));
 
@@ -5477,6 +5490,7 @@ mod tests {
                 vec![NodeId::new(901), NodeId::new(902), NodeId::new(903)]
             );
             let restarted_status = restarted_authority.status().await.unwrap();
+            assert_eq!(restarted_status.server_state(), ServerState::Leader);
             assert_eq!(restarted_status.applied(), Some(resumed_write.log_id()));
             assert_eq!(
                 restarted_status.authority_incarnation(),

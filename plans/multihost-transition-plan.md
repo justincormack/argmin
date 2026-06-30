@@ -9700,6 +9700,11 @@ Phase 12.1 progress:
   metadata-transfer fence source leases. These are reported as replicated state
   facts only; serving freshness and lease validity remain outside this
   replay-safe status path until the Phase 12 monotonic-clock lease-read design.
+- Extended the OpenRaft authority status surface with the local OpenRaft server
+  state, so diagnostics can distinguish a node that knows the current leader
+  from a node that is itself Leader, Follower, Learner, Candidate, or shutting
+  down. The single-node, leader-transfer, and restarted-leader smokes now pin
+  the role transitions through the public authority boundary.
 
 1. define the replicated control-plane state machine:
    - state includes cluster epoch, PG count, PG state, PG acting sets, node
