@@ -9720,6 +9720,12 @@ Phase 12.1 progress:
   state, so diagnostics do not need to reverse-engineer the serving reason from
   several booleans. This remains a status/readiness view only; request serving
   still goes through OpenRaft command submission and read-index barriers.
+- Extended the OpenRaft authority status boundary with compact log-index
+  accessors and signed committed/applied and log/committed gap diagnostics. The
+  single-node command smoke now verifies a rejected committed command advances
+  last-log, committed, and applied positions together, while the current-snapshot
+  recovery smoke verifies restored purged, committed, applied, and snapshot
+  indexes through the public authority status view.
 
 1. define the replicated control-plane state machine:
    - state includes cluster epoch, PG count, PG state, PG acting sets, node

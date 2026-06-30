@@ -265,8 +265,18 @@ impl ControlPlaneRaftAuthorityStatus {
     }
 
     #[must_use]
+    pub fn last_log_index(&self) -> Option<u64> {
+        self.last_log_id.map(|log_id| log_id.index())
+    }
+
+    #[must_use]
     pub fn last_purged_log_id(&self) -> Option<LogIdOf<ControlPlaneRaftTypeConfig>> {
         self.last_purged_log_id
+    }
+
+    #[must_use]
+    pub fn last_purged_index(&self) -> Option<u64> {
+        self.last_purged_log_id.map(|log_id| log_id.index())
     }
 
     #[must_use]
@@ -275,13 +285,48 @@ impl ControlPlaneRaftAuthorityStatus {
     }
 
     #[must_use]
+    pub fn committed_index(&self) -> Option<u64> {
+        self.committed.map(|log_id| log_id.index())
+    }
+
+    #[must_use]
     pub fn applied(&self) -> Option<LogIdOf<ControlPlaneRaftTypeConfig>> {
         self.applied
     }
 
     #[must_use]
+    pub fn applied_index(&self) -> Option<u64> {
+        self.applied.map(|log_id| log_id.index())
+    }
+
+    #[must_use]
     pub fn current_snapshot(&self) -> Option<LogIdOf<ControlPlaneRaftTypeConfig>> {
         self.current_snapshot
+    }
+
+    #[must_use]
+    pub fn current_snapshot_index(&self) -> Option<u64> {
+        self.current_snapshot.map(|log_id| log_id.index())
+    }
+
+    #[must_use]
+    pub fn committed_to_applied_index_gap(&self) -> Option<i128> {
+        Some(i128::from(self.committed?.index()) - i128::from(self.applied?.index()))
+    }
+
+    #[must_use]
+    pub fn last_log_to_committed_index_gap(&self) -> Option<i128> {
+        Some(i128::from(self.last_log_id?.index()) - i128::from(self.committed?.index()))
+    }
+
+    #[must_use]
+    pub fn applied_caught_up_to_committed(&self) -> bool {
+        self.committed_to_applied_index_gap() == Some(0)
+    }
+
+    #[must_use]
+    pub fn committed_caught_up_to_last_log(&self) -> bool {
+        self.last_log_to_committed_index_gap() == Some(0)
     }
 
     #[must_use]
@@ -4018,8 +4063,19 @@ mod tests {
                 rejected_log_id.committed_leader_id().term
             );
             assert_eq!(status.last_log_id(), Some(rejected_log_id));
+            assert_eq!(status.last_log_index(), Some(rejected_log_id.index()));
+            assert_eq!(status.last_purged_log_id(), None);
+            assert_eq!(status.last_purged_index(), None);
             assert_eq!(status.committed(), Some(rejected_log_id));
+            assert_eq!(status.committed_index(), Some(rejected_log_id.index()));
             assert_eq!(status.applied(), Some(rejected_log_id));
+            assert_eq!(status.applied_index(), Some(rejected_log_id.index()));
+            assert_eq!(status.current_snapshot(), None);
+            assert_eq!(status.current_snapshot_index(), None);
+            assert_eq!(status.committed_to_applied_index_gap(), Some(0));
+            assert_eq!(status.last_log_to_committed_index_gap(), Some(0));
+            assert!(status.applied_caught_up_to_committed());
+            assert!(status.committed_caught_up_to_last_log());
             assert_eq!(status.effective_voters(), &BTreeSet::from([1]));
             assert_eq!(status.applied_voters(), &BTreeSet::from([1]));
             assert_eq!(status.storage_node_lease_deadline_count(), 1);
@@ -6099,7 +6155,7 @@ mod tests {
                 1,
                 test_raft_config("control-plane-raft-current-snapshot-recovery-test"),
                 UnreachableRaftNetworkFactory,
-                log_store,
+                log_store.clone(),
                 state_machine,
             )
             .await
@@ -6132,7 +6188,16 @@ mod tests {
             assert_eq!(applied_state.0, Some(raft_log_id(3, 1, 2)));
             assert_eq!(applied_state.1, vec![NodeId::new(1)]);
 
-            raft.shutdown().await.unwrap();
+            let authority = ControlPlaneRaftAuthority::new_with_log_store(raft, log_store);
+            let status = authority.status().await.unwrap();
+            assert_eq!(status.last_purged_index(), Some(2));
+            assert_eq!(status.committed_index(), Some(2));
+            assert_eq!(status.applied_index(), Some(2));
+            assert_eq!(status.current_snapshot_index(), Some(2));
+            assert_eq!(status.committed_to_applied_index_gap(), Some(0));
+            assert!(status.applied_caught_up_to_committed());
+
+            authority.shutdown().await.unwrap();
         });
     }
 
