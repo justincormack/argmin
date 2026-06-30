@@ -9747,6 +9747,12 @@ Phase 12.1 progress:
   back to the surviving voter before committing the removal. The same smoke now
   bounds each OpenRaft-facing operation so a stalled membership/read/write
   future fails with the operation label instead of hanging the whole suite.
+- Added an object-safe OpenRaft authority admin boundary and cloneable admin
+  handle for lifecycle and membership operations: initialization, initialized
+  checks, voter replacement, learner addition, leadership transfer, applied/
+  leader waits, and shutdown. A bounded smoke now drives leadership transfer
+  and voter replacement through that handle, so future RPC/admin wiring can use
+  an authority capability instead of naming the concrete OpenRaft wrapper.
 
 1. define the replicated control-plane state machine:
    - state includes cluster epoch, PG count, PG state, PG acting sets, node
