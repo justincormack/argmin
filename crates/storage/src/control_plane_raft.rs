@@ -34,6 +34,7 @@ use crate::control_plane_command::{
     ControlPlaneCommand, ControlPlaneCommandResponse, ControlPlaneLogId,
     ControlPlaneSnapshotArtifact, ReplicatedControlPlaneStateMachine,
 };
+use crate::ClusterEpoch;
 
 pub type ControlPlaneRaftNodeId = u64;
 pub type ControlPlaneRaftTerm = u64;
@@ -120,6 +121,7 @@ pub struct ControlPlaneRaftAuthorityStatus {
     committed: Option<LogIdOf<ControlPlaneRaftTypeConfig>>,
     applied: Option<LogIdOf<ControlPlaneRaftTypeConfig>>,
     current_snapshot: Option<LogIdOf<ControlPlaneRaftTypeConfig>>,
+    current_cluster_epoch: ClusterEpoch,
     effective_membership_log_id: Option<LogIdOf<ControlPlaneRaftTypeConfig>>,
     effective_voters: BTreeSet<ControlPlaneRaftNodeId>,
     effective_learners: BTreeSet<ControlPlaneRaftNodeId>,
@@ -172,6 +174,11 @@ impl ControlPlaneRaftAuthorityStatus {
     #[must_use]
     pub fn current_snapshot(&self) -> Option<LogIdOf<ControlPlaneRaftTypeConfig>> {
         self.current_snapshot
+    }
+
+    #[must_use]
+    pub fn current_cluster_epoch(&self) -> ClusterEpoch {
+        self.current_cluster_epoch
     }
 
     #[must_use]
@@ -369,6 +376,7 @@ impl ControlPlaneRaftAuthority {
         let (
             applied,
             current_snapshot,
+            current_cluster_epoch,
             applied_membership_log_id,
             applied_voters,
             applied_learners,
@@ -379,6 +387,7 @@ impl ControlPlaneRaftAuthority {
                 let current_snapshot = state_machine
                     .current_snapshot()
                     .and_then(|snapshot| snapshot.meta.last_log_id);
+                let current_cluster_epoch = state_machine.inner().snapshot().cluster_epoch();
                 let membership = state_machine.last_membership();
                 let membership_log_id = *membership.log_id();
                 let voters = membership.membership().voter_ids().collect();
@@ -387,6 +396,7 @@ impl ControlPlaneRaftAuthority {
                     (
                         last_applied,
                         current_snapshot,
+                        current_cluster_epoch,
                         membership_log_id,
                         voters,
                         learners,
@@ -405,6 +415,7 @@ impl ControlPlaneRaftAuthority {
             committed,
             applied,
             current_snapshot,
+            current_cluster_epoch,
             effective_membership_log_id,
             effective_voters,
             effective_learners,
@@ -5051,6 +5062,12 @@ mod tests {
                     .map(|node| node.node_id())
                     .collect::<Vec<_>>(),
                 vec![NodeId::new(901), NodeId::new(902), NodeId::new(903)]
+            );
+            let restarted_status = restarted_authority.status().await.unwrap();
+            assert_eq!(restarted_status.applied(), Some(resumed_write.log_id()));
+            assert_eq!(
+                restarted_status.current_cluster_epoch(),
+                runtime_map.cluster_epoch()
             );
 
             let restarted_node903_availability = restarted_authority

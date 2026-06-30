@@ -9640,6 +9640,10 @@ Phase 12.1 progress:
   visible as a learner through both the Raft effective membership and the
   applied state-machine membership before promotion, and that promotion clears
   the learner set while exposing the final voter set.
+- Extended the OpenRaft authority status surface with the canonical
+  state-machine cluster epoch. The restarted-leader resume smoke now proves the
+  recovered leader's diagnostic epoch matches the runtime map epoch it serves
+  after committing a post-restart command.
 
 1. define the replicated control-plane state machine:
    - state includes cluster epoch, PG count, PG state, PG acting sets, node
