@@ -9655,6 +9655,11 @@ Phase 12.1 progress:
   state machine. The restarted-leader resume smoke now verifies the recovered
   leader reports the expected PG count and Peering/Active/degraded/backfill/
   inconsistent breakdown after replaying the post-restart command.
+- Extended the OpenRaft authority status surface with replicated storage-node
+  membership and availability counters. The restarted-leader resume smoke now
+  verifies the recovered leader reports the expected active storage-node set
+  and Suspect/Unavailable breakdown after replaying a post-restart node
+  availability command.
 
 1. define the replicated control-plane state machine:
    - state includes cluster epoch, PG count, PG state, PG acting sets, node

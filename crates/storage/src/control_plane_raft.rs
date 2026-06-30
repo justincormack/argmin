@@ -29,7 +29,10 @@ use openraft::ReadPolicy;
 use openraft::StoredMembership;
 use placement::NodeId;
 
-use crate::control_plane::{AuthorityIncarnation, ClusterRuntimeMapSnapshot, ControlPlaneError};
+use crate::control_plane::{
+    AuthorityIncarnation, ClusterRuntimeMapSnapshot, ControlPlaneError, NodeAvailabilityState,
+    NodeMembershipState,
+};
 use crate::control_plane_command::{
     ControlPlaneCommand, ControlPlaneCommandResponse, ControlPlaneLogId,
     ControlPlaneSnapshotArtifact, ReplicatedControlPlaneStateMachine,
@@ -127,6 +130,15 @@ pub struct ControlPlaneRaftAuthorityStatus {
     oldest_retained_history_epoch: Option<ClusterEpoch>,
     newest_retained_history_epoch: Option<ClusterEpoch>,
     oldest_storage_history_floor_epoch: Option<ClusterEpoch>,
+    storage_node_count: usize,
+    joining_storage_node_count: usize,
+    active_storage_node_count: usize,
+    draining_storage_node_count: usize,
+    out_storage_node_count: usize,
+    removed_storage_node_count: usize,
+    healthy_storage_node_count: usize,
+    suspect_storage_node_count: usize,
+    unavailable_storage_node_count: usize,
     pg_count: usize,
     active_pg_count: usize,
     peering_pg_count: usize,
@@ -215,6 +227,51 @@ impl ControlPlaneRaftAuthorityStatus {
     #[must_use]
     pub fn oldest_storage_history_floor_epoch(&self) -> Option<ClusterEpoch> {
         self.oldest_storage_history_floor_epoch
+    }
+
+    #[must_use]
+    pub fn storage_node_count(&self) -> usize {
+        self.storage_node_count
+    }
+
+    #[must_use]
+    pub fn joining_storage_node_count(&self) -> usize {
+        self.joining_storage_node_count
+    }
+
+    #[must_use]
+    pub fn active_storage_node_count(&self) -> usize {
+        self.active_storage_node_count
+    }
+
+    #[must_use]
+    pub fn draining_storage_node_count(&self) -> usize {
+        self.draining_storage_node_count
+    }
+
+    #[must_use]
+    pub fn out_storage_node_count(&self) -> usize {
+        self.out_storage_node_count
+    }
+
+    #[must_use]
+    pub fn removed_storage_node_count(&self) -> usize {
+        self.removed_storage_node_count
+    }
+
+    #[must_use]
+    pub fn healthy_storage_node_count(&self) -> usize {
+        self.healthy_storage_node_count
+    }
+
+    #[must_use]
+    pub fn suspect_storage_node_count(&self) -> usize {
+        self.suspect_storage_node_count
+    }
+
+    #[must_use]
+    pub fn unavailable_storage_node_count(&self) -> usize {
+        self.unavailable_storage_node_count
     }
 
     #[must_use]
@@ -448,6 +505,15 @@ impl ControlPlaneRaftAuthority {
             oldest_retained_history_epoch,
             newest_retained_history_epoch,
             oldest_storage_history_floor_epoch,
+            storage_node_count,
+            joining_storage_node_count,
+            active_storage_node_count,
+            draining_storage_node_count,
+            out_storage_node_count,
+            removed_storage_node_count,
+            healthy_storage_node_count,
+            suspect_storage_node_count,
+            unavailable_storage_node_count,
             pg_count,
             active_pg_count,
             peering_pg_count,
@@ -480,6 +546,30 @@ impl ControlPlaneRaftAuthority {
                     .nodes()
                     .filter_map(|node| node.cluster_map_history_floor_epoch())
                     .min();
+                let mut storage_node_count = 0;
+                let mut joining_storage_node_count = 0;
+                let mut active_storage_node_count = 0;
+                let mut draining_storage_node_count = 0;
+                let mut out_storage_node_count = 0;
+                let mut removed_storage_node_count = 0;
+                let mut healthy_storage_node_count = 0;
+                let mut suspect_storage_node_count = 0;
+                let mut unavailable_storage_node_count = 0;
+                for node in snapshot.nodes() {
+                    storage_node_count += 1;
+                    match node.membership() {
+                        NodeMembershipState::Joining => joining_storage_node_count += 1,
+                        NodeMembershipState::Active => active_storage_node_count += 1,
+                        NodeMembershipState::Draining => draining_storage_node_count += 1,
+                        NodeMembershipState::Out => out_storage_node_count += 1,
+                        NodeMembershipState::Removed => removed_storage_node_count += 1,
+                    }
+                    match node.availability() {
+                        NodeAvailabilityState::Healthy => healthy_storage_node_count += 1,
+                        NodeAvailabilityState::Suspect => suspect_storage_node_count += 1,
+                        NodeAvailabilityState::Unavailable => unavailable_storage_node_count += 1,
+                    }
+                }
                 let mut pg_count = 0;
                 let mut active_pg_count = 0;
                 let mut peering_pg_count = 0;
@@ -510,6 +600,15 @@ impl ControlPlaneRaftAuthority {
                         oldest_retained_history_epoch,
                         newest_retained_history_epoch,
                         oldest_storage_history_floor_epoch,
+                        storage_node_count,
+                        joining_storage_node_count,
+                        active_storage_node_count,
+                        draining_storage_node_count,
+                        out_storage_node_count,
+                        removed_storage_node_count,
+                        healthy_storage_node_count,
+                        suspect_storage_node_count,
+                        unavailable_storage_node_count,
                         pg_count,
                         active_pg_count,
                         peering_pg_count,
@@ -540,6 +639,15 @@ impl ControlPlaneRaftAuthority {
             oldest_retained_history_epoch,
             newest_retained_history_epoch,
             oldest_storage_history_floor_epoch,
+            storage_node_count,
+            joining_storage_node_count,
+            active_storage_node_count,
+            draining_storage_node_count,
+            out_storage_node_count,
+            removed_storage_node_count,
+            healthy_storage_node_count,
+            suspect_storage_node_count,
+            unavailable_storage_node_count,
             pg_count,
             active_pg_count,
             peering_pg_count,
@@ -5215,6 +5323,15 @@ mod tests {
             assert!(restarted_status
                 .newest_retained_history_epoch()
                 .is_some_and(|epoch| epoch < restarted_status.current_cluster_epoch()));
+            assert_eq!(restarted_status.storage_node_count(), 3);
+            assert_eq!(restarted_status.joining_storage_node_count(), 0);
+            assert_eq!(restarted_status.active_storage_node_count(), 3);
+            assert_eq!(restarted_status.draining_storage_node_count(), 0);
+            assert_eq!(restarted_status.out_storage_node_count(), 0);
+            assert_eq!(restarted_status.removed_storage_node_count(), 0);
+            assert_eq!(restarted_status.healthy_storage_node_count(), 0);
+            assert_eq!(restarted_status.suspect_storage_node_count(), 2);
+            assert_eq!(restarted_status.unavailable_storage_node_count(), 1);
             assert_eq!(restarted_status.pg_count(), 1);
             assert_eq!(restarted_status.active_pg_count(), 0);
             assert_eq!(restarted_status.peering_pg_count(), 1);
