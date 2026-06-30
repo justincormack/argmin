@@ -8,9 +8,9 @@ use s3_types::BucketLifecycleConfiguration;
 #[cfg(test)]
 use storage::PgTopology;
 use storage::{
-    AuthorizedMultipartUploadRecord, BucketInfo, BucketName, EcShape, GenerationId,
-    ObjectEncryption, ObjectKey, ReclaimWorkItem, SegmentStoredBytesRequest, StorageCluster,
-    StorageClusterRuntimeMapHandle, StoreError, UploadId, UploadState, VersionId,
+    AuthorizedMultipartUploadRecord, BucketDeleteBeginRoot, BucketInfo, BucketName, EcShape,
+    GenerationId, ObjectEncryption, ObjectKey, ReclaimWorkItem, SegmentStoredBytesRequest,
+    StorageCluster, StorageClusterRuntimeMapHandle, StoreError, UploadId, UploadState, VersionId,
 };
 
 use super::payload::SharedPayloadBuffer;
@@ -47,6 +47,7 @@ static SHARD_REPAIR_CLAIM_COUNTER: AtomicU64 = AtomicU64::new(1);
 static SHARD_BACKFILL_CLAIM_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 const OBJECT_PAYLOAD_RECLAIM_PG_RETRY_COOLDOWN: Duration = Duration::from_millis(100);
+const BUCKET_DELETE_BEGIN_RETRY_COOLDOWN: Duration = Duration::from_millis(100);
 const RECLAIM_DURABLE_SCAN_INTERVAL: Duration = Duration::from_millis(250);
 const SHARD_REPAIR_DURABLE_SCAN_INTERVAL: Duration = Duration::from_millis(250);
 const SHARD_REPAIR_CLAIM_LEASE_MILLIS: u64 = 30_000;
@@ -439,6 +440,64 @@ fn defer_object_payload_reclaim(
     }
 }
 
+fn earliest_bucket_delete_begin_retry_sleep(
+    deferred_work: &VecDeque<BucketDeleteBeginRoot>,
+    retry_after_by_root: &HashMap<BucketDeleteBeginRoot, Instant>,
+) -> Option<Duration> {
+    let now = Instant::now();
+    let mut earliest_retry: Option<Instant> = None;
+    for root in deferred_work {
+        let retry_after = retry_after_by_root.get(root)?;
+        if *retry_after <= now {
+            return None;
+        }
+        earliest_retry = Some(match earliest_retry {
+            Some(earliest_retry) => earliest_retry.min(*retry_after),
+            None => *retry_after,
+        });
+    }
+    earliest_retry.map(|retry_after| {
+        retry_after
+            .duration_since(now)
+            .min(BUCKET_DELETE_BEGIN_RETRY_COOLDOWN)
+    })
+}
+
+fn defer_bucket_delete_begin(
+    deferred_work: &mut VecDeque<BucketDeleteBeginRoot>,
+    deferred_roots: &mut HashSet<BucketDeleteBeginRoot>,
+    root: BucketDeleteBeginRoot,
+) {
+    if deferred_roots.insert(root.clone()) {
+        deferred_work.push_back(root);
+    }
+}
+
+fn bucket_delete_begin_root_is_stale(
+    storage_node: &StorageCluster,
+    root: &BucketDeleteBeginRoot,
+) -> bool {
+    match storage_node.head_bucket_info(&root.bucket) {
+        Ok(info) => {
+            info.bucket_execution_generation != root.bucket_execution_generation
+                || info.bucket_incarnation_generation != root.bucket_incarnation_generation
+        }
+        Err(storage::BucketSnapshotLoadError::Metadata(
+            storage::MetadataError::BucketNotFound { .. },
+        )) => true,
+        Err(_) => false,
+    }
+}
+
+fn shortest_retry_sleep(left: Option<Duration>, right: Option<Duration>) -> Option<Duration> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(left.min(right)),
+        (Some(left), None) => Some(left),
+        (None, Some(right)) => Some(right),
+        (None, None) => None,
+    }
+}
+
 fn enqueue_durable_reclaim_work_if_due(
     storage_node: &StorageCluster,
     excluded_object_payload_roots: &HashSet<ObjectPayloadReclaimRoot>,
@@ -531,6 +590,12 @@ impl ReclaimSweeper {
                     HashMap::new();
                 let mut deferred_object_payload_reclaim = VecDeque::new();
                 let mut deferred_object_payload_reclaim_roots = HashSet::new();
+                let mut bucket_delete_begin_retry_after: HashMap<BucketDeleteBeginRoot, Instant> =
+                    HashMap::new();
+                let mut deferred_bucket_delete_begin: VecDeque<BucketDeleteBeginRoot> =
+                    VecDeque::new();
+                let mut deferred_bucket_delete_begin_roots: HashSet<BucketDeleteBeginRoot> =
+                    HashSet::new();
                 let mut next_durable_scan_at = Instant::now();
                 let mut pending_work = None;
                 while !worker_stop.load(Ordering::SeqCst) {
@@ -546,7 +611,9 @@ impl ReclaimSweeper {
                         .take()
                         .or_else(|| worker_node.try_take_reclaim_work())
                         .or_else(|| {
-                            if deferred_object_payload_reclaim.is_empty() {
+                            if deferred_object_payload_reclaim.is_empty()
+                                && deferred_bucket_delete_begin.is_empty()
+                            {
                                 return None;
                             }
                             enqueue_durable_reclaim_work_if_due(
@@ -555,9 +622,13 @@ impl ReclaimSweeper {
                                 &mut next_durable_scan_at,
                             );
                             worker_node.try_take_reclaim_work().or_else(|| {
-                                deferred_object_payload_reclaim.pop_front().map(|root| {
+                                if let Some(root) = deferred_object_payload_reclaim.pop_front() {
                                     deferred_object_payload_reclaim_roots.remove(&root);
-                                    ReclaimWorkItem::ObjectPayload(root)
+                                    return Some(ReclaimWorkItem::ObjectPayload(root));
+                                }
+                                deferred_bucket_delete_begin.pop_front().map(|root| {
+                                    deferred_bucket_delete_begin_roots.remove(&root);
+                                    ReclaimWorkItem::BucketDeleteBegin(root)
                                 })
                             })
                         })
@@ -634,12 +705,78 @@ impl ReclaimSweeper {
                             {
                                 Ok(outcome) if outcome.is_terminal() => {
                                     worker_node.finish_bucket_delete_finalize_work(&bucket);
+                                    bucket_delete_begin_retry_after
+                                        .retain(|root, _| root.bucket != bucket);
+                                    deferred_bucket_delete_begin_roots
+                                        .retain(|root| root.bucket != bucket);
+                                    deferred_bucket_delete_begin
+                                        .retain(|root| root.bucket != bucket);
                                 }
                                 Ok(_) | Err(_) => {}
                             }
                         }
+                        ReclaimWorkItem::BucketDeleteBegin(root) => {
+                            if deferred_bucket_delete_begin_roots.contains(&root) {
+                                continue;
+                            }
+                            let is_cooled = if let Some(retry_after) =
+                                bucket_delete_begin_retry_after.get(&root)
+                            {
+                                *retry_after > Instant::now()
+                            } else {
+                                false
+                            };
+                            if is_cooled {
+                                defer_bucket_delete_begin(
+                                    &mut deferred_bucket_delete_begin,
+                                    &mut deferred_bucket_delete_begin_roots,
+                                    root,
+                                );
+                            } else {
+                                match current_runtime.storage_node.begin_bucket_delete_if_current(
+                                    &root.bucket,
+                                    root.bucket_execution_generation,
+                                    root.bucket_incarnation_generation,
+                                ) {
+                                    Ok(()) => {
+                                        bucket_delete_begin_retry_after.remove(&root);
+                                        worker_node.enqueue_bucket_delete_finalize(&root.bucket);
+                                    }
+                                    Err(error) => {
+                                        if bucket_delete_begin_root_is_stale(
+                                            &current_runtime.storage_node,
+                                            &root,
+                                        ) {
+                                            bucket_delete_begin_retry_after.remove(&root);
+                                            continue;
+                                        }
+                                        let server_error =
+                                            super::bucket::map_bucket_write_drain_error(error);
+                                        if matches!(
+                                            server_error,
+                                            ServerError::OperationAborted | ServerError::SlowDown
+                                        ) {
+                                            bucket_delete_begin_retry_after.insert(
+                                                root.clone(),
+                                                Instant::now() + BUCKET_DELETE_BEGIN_RETRY_COOLDOWN,
+                                            );
+                                            defer_bucket_delete_begin(
+                                                &mut deferred_bucket_delete_begin,
+                                                &mut deferred_bucket_delete_begin_roots,
+                                                root,
+                                            );
+                                        } else {
+                                            bucket_delete_begin_retry_after.remove(&root);
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
-                    if pending_work.is_none() && !deferred_object_payload_reclaim.is_empty() {
+                    if pending_work.is_none()
+                        && (!deferred_object_payload_reclaim.is_empty()
+                            || !deferred_bucket_delete_begin.is_empty())
+                    {
                         enqueue_durable_reclaim_work_if_due(
                             &worker_node,
                             &deferred_object_payload_reclaim_roots,
@@ -647,10 +784,16 @@ impl ReclaimSweeper {
                         );
                         if let Some(work) = worker_node.try_take_reclaim_work() {
                             pending_work = Some(work);
-                        } else if let Some(sleep_for) = earliest_object_payload_reclaim_retry_sleep(
-                            &worker_node,
-                            &deferred_object_payload_reclaim,
-                            &object_payload_reclaim_pg_retry_after,
+                        } else if let Some(sleep_for) = shortest_retry_sleep(
+                            earliest_object_payload_reclaim_retry_sleep(
+                                &worker_node,
+                                &deferred_object_payload_reclaim,
+                                &object_payload_reclaim_pg_retry_after,
+                            ),
+                            earliest_bucket_delete_begin_retry_sleep(
+                                &deferred_bucket_delete_begin,
+                                &bucket_delete_begin_retry_after,
+                            ),
                         ) {
                             std::thread::sleep(sleep_for);
                         }

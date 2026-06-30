@@ -917,6 +917,119 @@ fn reclaim_worker_follows_runtime_map_refresh_for_bucket_finalize() {
 }
 
 #[test]
+fn reclaim_worker_retries_bucket_delete_begin_after_early_route_map_failure() {
+    let tmp = test_util::tempdir();
+    let bucket = trusted_bucket_name("bucket-delete-begin-retry-after-route-refresh");
+    let initial = open_test_storage_cluster(tmp.path(), &[0, 1]);
+    let direct_coord = setup_direct_coordinator_with_storage_cluster(Arc::clone(&initial));
+    direct_coord
+        .create_bucket_for_owner("default-owner", bucket.as_str(), false)
+        .unwrap();
+    let bucket_identity = initial.test_head_bucket_raw(&bucket).unwrap();
+
+    let expired = same_store_cluster_with_route_map_validity(&initial, tmp.path(), Some(1));
+    let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&expired));
+    let _coord = setup_coordinator_with_only_reclaim_worker(handle.clone(), Arc::clone(&expired));
+
+    expired.enqueue_bucket_delete_begin(
+        &bucket,
+        bucket_identity.bucket_execution_generation,
+        bucket_identity.bucket_incarnation_generation,
+    );
+    thread::sleep(Duration::from_millis(350));
+
+    let active_before_refresh = initial.test_head_bucket_raw(&bucket).unwrap();
+    assert_eq!(
+        active_before_refresh.state,
+        storage::BucketState::Active,
+        "expired route map should make the first background begin retryable before it can mark deleting"
+    );
+
+    install_same_store_next_epoch_runtime_map(&handle, &initial, tmp.path());
+
+    let deadline = Instant::now() + TEST_EVENT_TIMEOUT;
+    loop {
+        match initial.test_head_bucket_raw(&bucket) {
+            Ok(info) if info.state == storage::BucketState::Deleting => break,
+            Err(storage::BucketSnapshotLoadError::Metadata(
+                storage::MetadataError::BucketNotFound { .. },
+            )) => break,
+            Ok(info) if Instant::now() < deadline => {
+                assert_eq!(
+                    info.state,
+                    storage::BucketState::Active,
+                    "unexpected bucket state while waiting for background begin retry"
+                );
+                thread::sleep(Duration::from_millis(10));
+            }
+            Ok(info) => {
+                panic!(
+                    "reclaim worker did not retry BucketDeleteBegin after route refresh: {info:?}"
+                );
+            }
+            Err(err) => {
+                panic!("unexpected bucket metadata error while waiting for begin retry: {err:?}")
+            }
+        }
+    }
+}
+
+#[test]
+fn reclaim_worker_drops_stale_bucket_delete_begin_after_bucket_recreate() {
+    let tmp = test_util::tempdir();
+    let bucket = trusted_bucket_name("bucket-delete-begin-stale-recreate");
+    let initial = open_test_storage_cluster(tmp.path(), &[0, 1]);
+    let direct_coord = setup_direct_coordinator_with_storage_cluster(Arc::clone(&initial));
+    direct_coord
+        .create_bucket_for_owner("old-owner", bucket.as_str(), false)
+        .unwrap();
+    let old_identity = initial.test_head_bucket_raw(&bucket).unwrap();
+
+    let expired = same_store_cluster_with_route_map_validity(&initial, tmp.path(), Some(1));
+    let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&expired));
+    let _coord = setup_coordinator_with_only_reclaim_worker(handle.clone(), Arc::clone(&expired));
+
+    expired.enqueue_bucket_delete_begin(
+        &bucket,
+        old_identity.bucket_execution_generation,
+        old_identity.bucket_incarnation_generation,
+    );
+    thread::sleep(Duration::from_millis(350));
+
+    initial.begin_bucket_delete(&bucket).unwrap();
+    delete_bucket_metadata_or_accept_reclaim_worker_finalize(&initial, &bucket);
+    direct_coord
+        .create_bucket_for_owner("new-owner", bucket.as_str(), false)
+        .unwrap();
+    let recreated = initial.test_head_bucket_raw(&bucket).unwrap();
+    assert_ne!(
+        recreated.bucket_incarnation_generation,
+        old_identity.bucket_incarnation_generation
+    );
+
+    install_same_store_next_epoch_runtime_map(&handle, &initial, tmp.path());
+
+    let deadline = Instant::now() + TEST_EVENT_TIMEOUT;
+    loop {
+        let current = initial.test_head_bucket_raw(&bucket).unwrap();
+        assert_eq!(current.owner_principal, "new-owner");
+        assert_eq!(
+            current.bucket_incarnation_generation,
+            recreated.bucket_incarnation_generation
+        );
+        assert_eq!(
+            current.state,
+            storage::BucketState::Active,
+            "stale BucketDeleteBegin must not delete the recreated bucket"
+        );
+        if Instant::now() >= deadline {
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[test]
 fn bucket_subresource_write_pins_runtime_map_after_authorization() {
     let tmp = test_util::tempdir();
     let initial = open_test_storage_cluster(tmp.path(), &[0, 1]);

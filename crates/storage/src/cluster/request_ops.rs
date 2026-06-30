@@ -3049,6 +3049,7 @@ impl super::StorageCluster {
             }
         };
         let current_bucket_execution_generation;
+        let current_bucket_incarnation_generation;
         {
             let raw_snapshot_started = std::time::Instant::now();
             let _ = observability::emit_flight_event(
@@ -3106,6 +3107,7 @@ impl super::StorageCluster {
                 }
             }
             current_bucket_execution_generation = current.bucket_execution_generation;
+            current_bucket_incarnation_generation = current.bucket_incarnation_generation;
             if current.state == BucketState::Deleting {
                 if let Some(command) = self
                     .pending_metadata_command_for_bucket(pg_id, bucket)
@@ -4088,6 +4090,11 @@ impl super::StorageCluster {
                             "bucket={:?} pg_id={} drain_id={} error={:?}",
                             bucket, pg_id, durable_drain.record.drain_id, error
                         )),
+                    );
+                    self.enqueue_bucket_delete_begin(
+                        bucket,
+                        current_bucket_execution_generation,
+                        current_bucket_incarnation_generation,
                     );
                 }
                 Err(error)
@@ -8230,6 +8237,26 @@ impl super::StorageCluster {
             .local_map
             .runtime_state()
             .enqueue_bucket_delete_finalize(bucket);
+    }
+
+    pub fn enqueue_bucket_delete_begin(
+        &self,
+        bucket: &BucketName,
+        bucket_execution_generation: u64,
+        bucket_incarnation_generation: u64,
+    ) {
+        if self.operation_epoch() != self.cluster_epoch() {
+            return;
+        }
+        let root = crate::BucketDeleteBeginRoot {
+            bucket: bucket.clone(),
+            bucket_execution_generation,
+            bucket_incarnation_generation,
+        };
+        let _ = self
+            .local_map
+            .runtime_state()
+            .enqueue_bucket_delete_begin(root);
     }
 
     pub fn finish_bucket_delete_finalize_work(&self, bucket: &BucketName) {

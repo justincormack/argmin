@@ -774,6 +774,7 @@ fn begin_bucket_delete_retries_when_pending_slot_wins_before_command_id() {
     create_test_bucket(&cluster, &bucket);
 
     let pg_id = PgId::new(1);
+    let initial_bucket = cluster.test_head_bucket_raw(&bucket).unwrap();
     let hook_ran = Arc::new(AtomicBool::new(false));
     let hook_map = Arc::clone(&map);
     let hook_bucket = bucket.clone();
@@ -828,6 +829,17 @@ fn begin_bucket_delete_retries_when_pending_slot_wins_before_command_id() {
             crate::BucketDeleteAttemptOutcomeKind::Retryable
         );
     }
+    assert_eq!(
+        cluster.try_take_reclaim_work(),
+        Some(crate::ReclaimWorkItem::BucketDeleteBegin(
+            crate::BucketDeleteBeginRoot {
+                bucket: bucket.clone(),
+                bucket_execution_generation: initial_bucket.bucket_execution_generation,
+                bucket_incarnation_generation: initial_bucket.bucket_incarnation_generation,
+            }
+        )),
+        "retryable preserved DeleteBucket begin should queue background resume work"
+    );
     cluster.begin_bucket_delete(&bucket).unwrap();
     {
         let pg = map

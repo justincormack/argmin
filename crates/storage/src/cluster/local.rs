@@ -972,6 +972,7 @@ impl Drop for MetadataCommandRecoveryGuard {
 }
 
 type LocalReclaimRoot = (BucketName, ObjectKey, GenerationId);
+type LocalBucketDeleteBeginRoot = crate::BucketDeleteBeginRoot;
 
 #[derive(Debug)]
 struct LocalReclaimQueueState {
@@ -979,6 +980,7 @@ struct LocalReclaimQueueState {
     queued_objects: HashSet<LocalReclaimRoot>,
     outstanding_objects: HashMap<LocalReclaimRoot, u32>,
     object_payload_outstanding_by_pg: HashMap<u32, usize>,
+    queued_bucket_delete_begins: HashSet<LocalBucketDeleteBeginRoot>,
     queued_bucket_deletes: HashSet<BucketName>,
     outstanding_bucket_deletes: HashSet<BucketName>,
 }
@@ -998,6 +1000,7 @@ impl LocalClusterRuntimeState {
                     queued_objects: HashSet::new(),
                     outstanding_objects: HashMap::new(),
                     object_payload_outstanding_by_pg: HashMap::new(),
+                    queued_bucket_delete_begins: HashSet::new(),
                     queued_bucket_deletes: HashSet::new(),
                     outstanding_bucket_deletes: HashSet::new(),
                 }),
@@ -1175,6 +1178,22 @@ impl LocalClusterRuntimeState {
         }
     }
 
+    pub(crate) fn enqueue_bucket_delete_begin(&self, root: LocalBucketDeleteBeginRoot) -> bool {
+        let (state_lock, cv) = &self.reclaim_queue;
+        let mut state = state_lock.lock().unwrap_or_else(|e| e.into_inner());
+        if state.queued_bucket_delete_begins.insert(root.clone()) {
+            state
+                .work_queue
+                .push_back(ReclaimWorkItem::BucketDeleteBegin(root));
+            Self::emit_reclaim_queue_action(&state, "bucket_delete_begin", "enqueue");
+            cv.notify_one();
+            true
+        } else {
+            Self::emit_reclaim_queue_action(&state, "bucket_delete_begin", "deduplicate");
+            false
+        }
+    }
+
     pub(crate) fn finish_bucket_delete_finalize_work(&self, bucket: &BucketName) {
         let mut state = self
             .reclaim_queue
@@ -1182,11 +1201,13 @@ impl LocalClusterRuntimeState {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         state.queued_bucket_deletes.remove(bucket);
-        state.work_queue.retain(|work| {
-            !matches!(
-                work,
-                ReclaimWorkItem::BucketDelete(queued_bucket) if queued_bucket == bucket
-            )
+        state
+            .queued_bucket_delete_begins
+            .retain(|root| root.bucket != *bucket);
+        state.work_queue.retain(|work| match work {
+            ReclaimWorkItem::BucketDelete(queued_bucket) => queued_bucket != bucket,
+            ReclaimWorkItem::BucketDeleteBegin(root) => root.bucket != *bucket,
+            ReclaimWorkItem::ObjectPayload(_) => true,
         });
         if state.outstanding_bucket_deletes.remove(bucket) {
             Self::emit_reclaim_queue_action(&state, "bucket_delete", "finish");
@@ -1304,6 +1325,10 @@ impl LocalClusterRuntimeState {
                 state.queued_objects.remove(root);
                 Self::emit_reclaim_queue_action(state, "object_payload", "dequeue");
             }
+            ReclaimWorkItem::BucketDeleteBegin(root) => {
+                state.queued_bucket_delete_begins.remove(root);
+                Self::emit_reclaim_queue_action(state, "bucket_delete_begin", "dequeue");
+            }
             ReclaimWorkItem::BucketDelete(bucket) => {
                 state.queued_bucket_deletes.remove(bucket);
                 Self::emit_reclaim_queue_action(state, "bucket_delete", "dequeue");
@@ -1325,7 +1350,8 @@ impl LocalClusterRuntimeState {
                 queue_depth: state.work_queue.len(),
                 object_payload_depth: state.queued_objects.len(),
                 object_payload_outstanding_depth: state.outstanding_objects.len(),
-                bucket_delete_depth: state.queued_bucket_deletes.len(),
+                bucket_delete_depth: state.queued_bucket_deletes.len()
+                    + state.queued_bucket_delete_begins.len(),
                 bucket_delete_outstanding_depth: state.outstanding_bucket_deletes.len(),
             },
         );

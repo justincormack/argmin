@@ -72,8 +72,8 @@ pub use node::{
     install_bucket_scoped_test_hooks, BucketScopedTestHookGuard, BucketScopedTestHooks,
 };
 pub use node::{
-    BucketCreateAttemptOutcome, BucketDeleteFinalizeOutcome, LocalStorageNode, ReclaimWorkItem,
-    SharedStorageNode,
+    BucketCreateAttemptOutcome, BucketDeleteBeginRoot, BucketDeleteFinalizeOutcome,
+    LocalStorageNode, ReclaimWorkItem, SharedStorageNode,
 };
 pub use pg_store::{
     MetadataCheckpointRow, MetadataCheckpointTableBlock, MetadataCheckpointTableDigest,
