@@ -9114,8 +9114,15 @@ Keep an explicit Phase 11 close-out before treating the phase as soak-clean:
          coordinator-level reclaim-worker regression now also drives the actual
          background thread through a foreground attempt that persisted a partial
          post-reservation frontier and then failed retryably.
-         Remaining work: add resumable frontier/state for stream cleanup and
-         final visibility phases.
+         The durable attempt row is now also updated before entering the final
+         visibility check, preserving the reset post-reservation frontier and
+         exposing `final_visibility_check` as the current retryable phase until
+         `MarkBucketDeleting` is built and applied. A focused storage regression
+         observes that intermediate phase before command-id allocation and then
+         verifies the terminal `mark_deleting` outcome overwrites it. Remaining
+         work: add resumable frontier/state for stream cleanup and use the
+         final-visibility phase to skip already-proven earlier phases on
+         adoption.
       5. status: open. Revisit reservation classification only after attempts are resumable;
          it should be an optimization on top of a convergent state machine, not
          the convergence mechanism itself.

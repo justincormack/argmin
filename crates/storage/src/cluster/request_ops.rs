@@ -4184,6 +4184,13 @@ impl super::StorageCluster {
                     format!("iteration={loop_iteration}"),
                 );
                 attempt_phase = BucketDeleteAttemptPhase::FinalVisibilityCheck;
+                self.record_bucket_delete_attempt_outcome_for_drain_with_client(
+                    node_store.bucket_write_reservation_client().as_ref(),
+                    &durable_drain,
+                    BucketDeleteAttemptOutcomeKind::Retryable,
+                    BucketDeleteAttemptPhase::FinalVisibilityCheck,
+                    "final visibility check started".to_string(),
+                );
                 if let Some(source) = self.bucket_visible_data_source(bucket, true)? {
                     self.record_bucket_delete_attempt_outcome_for_drain_with_client(
                         node_store.bucket_write_reservation_client().as_ref(),

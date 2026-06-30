@@ -3095,6 +3095,80 @@ fn durable_scan_paginates_past_excluded_delete_begin_drains() {
 }
 
 #[test]
+fn begin_bucket_delete_records_final_visibility_phase_before_mark_command() {
+    let _serial = lock_metadata_command_apply_hook_test();
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2], ec_shape).unwrap();
+    let bucket = {
+        let topology = map
+            .nodes
+            .get(&NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        bucket_for_pg(topology, 1, "delete-final-visibility-phase-")
+    };
+    set_route_primary(&mut map, 1, NodeId::new(1));
+
+    let map = Arc::new(map);
+    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    create_test_bucket(&cluster, &bucket);
+
+    let pg_id = PgId::new(1);
+    let hook_ran = Arc::new(AtomicBool::new(false));
+    let hook_map = Arc::clone(&map);
+    let hook_bucket = bucket.clone();
+    let hook_ran_for_closure = Arc::clone(&hook_ran);
+    let _hook_guard =
+        cluster.test_install_before_bucket_delete_command_id_hook(Arc::new(move || {
+            hook_ran_for_closure.store(true, Ordering::SeqCst);
+            let primary = hook_map
+                .metadata_pg_primary_node(ClusterEpoch::INITIAL, pg_id)
+                .unwrap();
+            let pg = primary.storage_node().get_pg(pg_id.get()).unwrap();
+            let outcome = crate::PgMetadataStore::bucket_delete_attempt_outcome(&*pg, &hook_bucket)
+                .unwrap()
+                .expect("DeleteBucket should record final visibility progress before mark command");
+            assert_eq!(
+                outcome.outcome,
+                crate::BucketDeleteAttemptOutcomeKind::Retryable
+            );
+            assert_eq!(
+                outcome.phase,
+                crate::BucketDeleteAttemptPhase::FinalVisibilityCheck
+            );
+            assert_eq!(
+                outcome.post_reservation_next_object_pg_id,
+                Some(0),
+                "final visibility progress should preserve the pre-cleanup frontier reset"
+            );
+        }));
+
+    cluster.begin_bucket_delete(&bucket).unwrap();
+    assert!(
+        hook_ran.load(Ordering::SeqCst),
+        "test hook should observe the attempt before MarkBucketDeleting id allocation"
+    );
+
+    let pg = map
+        .node(NodeId::new(1))
+        .unwrap()
+        .storage_node()
+        .get_pg(pg_id.get())
+        .unwrap();
+    let outcome = crate::PgMetadataStore::bucket_delete_attempt_outcome(&*pg, &bucket)
+        .unwrap()
+        .expect("successful DeleteBucket begin should record terminal outcome");
+    assert_eq!(
+        outcome.outcome,
+        crate::BucketDeleteAttemptOutcomeKind::MarkDeleting
+    );
+    assert_eq!(outcome.phase, crate::BucketDeleteAttemptPhase::MarkDeleting);
+}
+
+#[test]
 fn post_reservation_exact_bucket_frontier_is_identity_fenced_and_resettable() {
     let tmp = test_util::tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
