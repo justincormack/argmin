@@ -9016,18 +9016,28 @@ Keep an explicit Phase 11 close-out before treating the phase as soak-clean:
     bucket-delete finalizers, unexplained `OperationAborted` growth, or stale
     volatile queue state.
 18. status: open. Rework `DeleteBucket` begin from repeated full-cluster rediscovery into a
-    monotonic proof-progress protocol. The current durable delete drain records
-    only ownership/lease identity, and an error path rolls that drain back, so
-    every retry must rescan all object PGs, stream sessions, and pending-command
-    state from zero. That is correct but does not prove forward progress under
-    route churn or high PG counts. Add durable progress state, or an equivalent
-    command-log frontier proof, tied to the bucket delete drain: each object PG
-    should be advanced to a recorded safe frontier for the bucket, later retries
-    should resume from the unfinished PG/frontier rather than restarting the
-    whole proof, and the final emptiness decision should depend on those
-    recorded frontiers plus a fresh post-drain visibility check. The protocol
-    must preserve the Phase 9.4 rule that no admitted writer can publish after
-    `DeleteBucket` has decided the bucket is empty.
+    durable `DeleteBucket` attempt state machine. The current durable delete
+    drain records only ownership/lease identity, and an error path rolls that
+    drain back, so every retry must rescan all object PGs, stream sessions, and
+    pending-command state from zero. That is correct but does not prove forward
+    progress under route churn or high PG counts. A retryable foreground
+    `OperationAborted` should mean the current HTTP request did not complete the
+    delete attempt, not that the delete attempt was abandoned. Keep the durable
+    fence/attempt alive across retryable failures, make later client requests
+    and background workers adopt or advance the attempt, and make other
+    operations that encounter the temporary fence either help converge required
+    pending work, return a retryable conflict, or observe the terminal deleting
+    state. The attempt should carry durable phase/progress state, such as the
+    current object PG/frontier, stream-cleanup phase, reservation-drain phase,
+    and final visibility-check requirement, so later retries resume from the
+    unfinished work instead of restarting the whole proof. Record terminal
+    attempt outcomes durably or in bounded diagnostic history even when no
+    client request is still waiting: successful `MarkBucketDeleting`, failed
+    not-empty proof with the blocking source, stale bucket generation/recreate,
+    and retryable/internal failure context should all be visible to debug
+    tooling and test hooks. The protocol must preserve the Phase 9.4 rule that
+    no admitted writer can publish after `DeleteBucket` has decided the bucket
+    is empty.
 
 Status update:
 
