@@ -119,6 +119,12 @@ pub struct ControlPlaneRaftAuthorityStatus {
     node_id: ControlPlaneRaftNodeId,
     current_leader: Option<ControlPlaneRaftNodeId>,
     server_state: ServerState,
+    local_leader: bool,
+    effective_voter: bool,
+    effective_learner: bool,
+    applied_voter: bool,
+    applied_learner: bool,
+    linearized_authority_serving: bool,
     persisted_vote: Option<VoteOf<ControlPlaneRaftTypeConfig>>,
     current_term: Option<ControlPlaneRaftTerm>,
     last_log_id: Option<LogIdOf<ControlPlaneRaftTypeConfig>>,
@@ -178,6 +184,36 @@ impl ControlPlaneRaftAuthorityStatus {
     #[must_use]
     pub fn server_state(&self) -> ServerState {
         self.server_state
+    }
+
+    #[must_use]
+    pub fn local_leader(&self) -> bool {
+        self.local_leader
+    }
+
+    #[must_use]
+    pub fn effective_voter(&self) -> bool {
+        self.effective_voter
+    }
+
+    #[must_use]
+    pub fn effective_learner(&self) -> bool {
+        self.effective_learner
+    }
+
+    #[must_use]
+    pub fn applied_voter(&self) -> bool {
+        self.applied_voter
+    }
+
+    #[must_use]
+    pub fn applied_learner(&self) -> bool {
+        self.applied_learner
+    }
+
+    #[must_use]
+    pub fn linearized_authority_serving(&self) -> bool {
+        self.linearized_authority_serving
     }
 
     #[must_use]
@@ -553,8 +589,14 @@ impl ControlPlaneRaftAuthority {
                     state.local_committed().cloned(),
                     state.server_state,
                     *effective_membership.log_id(),
-                    effective_membership.membership().voter_ids().collect(),
-                    effective_membership.membership().learner_ids().collect(),
+                    effective_membership
+                        .membership()
+                        .voter_ids()
+                        .collect::<BTreeSet<_>>(),
+                    effective_membership
+                        .membership()
+                        .learner_ids()
+                        .collect::<BTreeSet<_>>(),
                 )
             })
             .await
@@ -695,8 +737,11 @@ impl ControlPlaneRaftAuthority {
                 }
                 let membership = state_machine.last_membership();
                 let membership_log_id = *membership.log_id();
-                let voters = membership.membership().voter_ids().collect();
-                let learners = membership.membership().learner_ids().collect();
+                let voters = membership.membership().voter_ids().collect::<BTreeSet<_>>();
+                let learners = membership
+                    .membership()
+                    .learner_ids()
+                    .collect::<BTreeSet<_>>();
                 Box::pin(async move {
                     (
                         last_applied,
@@ -739,10 +784,22 @@ impl ControlPlaneRaftAuthority {
             })
             .await
             .map_err(|error| openraft_remote_error("status state-machine read", error))?;
+        let local_leader = server_state == ServerState::Leader && current_leader == Some(node_id);
+        let effective_voter = effective_voters.contains(&node_id);
+        let effective_learner = effective_learners.contains(&node_id);
+        let applied_voter = applied_voters.contains(&node_id);
+        let applied_learner = applied_learners.contains(&node_id);
+        let linearized_authority_serving = local_leader && effective_voter;
         Ok(ControlPlaneRaftAuthorityStatus {
             node_id,
             current_leader,
             server_state,
+            local_leader,
+            effective_voter,
+            effective_learner,
+            applied_voter,
+            applied_learner,
+            linearized_authority_serving,
             persisted_vote,
             current_term,
             last_log_id,
@@ -3883,6 +3940,12 @@ mod tests {
             assert_eq!(status.node_id(), 1);
             assert_eq!(status.current_leader(), Some(1));
             assert_eq!(status.server_state(), ServerState::Leader);
+            assert!(status.local_leader());
+            assert!(status.effective_voter());
+            assert!(!status.effective_learner());
+            assert!(status.applied_voter());
+            assert!(!status.applied_learner());
+            assert!(status.linearized_authority_serving());
             let persisted_vote = status
                 .persisted_vote()
                 .expect("single-node leader should persist a vote");
@@ -4363,6 +4426,12 @@ mod tests {
             assert_eq!(new_status.current_leader(), Some(702));
             assert_eq!(old_status.server_state(), ServerState::Follower);
             assert_eq!(new_status.server_state(), ServerState::Leader);
+            assert!(!old_status.local_leader());
+            assert!(old_status.effective_voter());
+            assert!(!old_status.linearized_authority_serving());
+            assert!(new_status.local_leader());
+            assert!(new_status.effective_voter());
+            assert!(new_status.linearized_authority_serving());
             assert_eq!(old_status.applied(), Some(follow_up.log_id()));
             assert_eq!(new_status.applied(), Some(follow_up.log_id()));
 
@@ -4600,12 +4669,17 @@ mod tests {
                 &BTreeSet::from([601, 602])
             );
             assert_eq!(learner_status.effective_learners(), &BTreeSet::from([603]));
+            assert!(!learner_status.effective_voter());
+            assert!(learner_status.effective_learner());
+            assert!(!learner_status.linearized_authority_serving());
             assert_eq!(
                 learner_status.applied_membership_log_id(),
                 Some(learner_log_id)
             );
             assert_eq!(learner_status.applied_voters(), &BTreeSet::from([601, 602]));
             assert_eq!(learner_status.applied_learners(), &BTreeSet::from([603]));
+            assert!(!learner_status.applied_voter());
+            assert!(learner_status.applied_learner());
 
             let promote_log_id = authority1
                 .replace_voters(BTreeSet::from([601, 602, 603]), true)
@@ -4638,6 +4712,10 @@ mod tests {
                 &BTreeSet::from([601, 602, 603])
             );
             assert_eq!(leader_status.effective_learners(), &BTreeSet::new());
+            assert!(leader_status.local_leader());
+            assert!(leader_status.effective_voter());
+            assert!(!leader_status.effective_learner());
+            assert!(leader_status.linearized_authority_serving());
             assert_eq!(
                 leader_status.applied_membership_log_id(),
                 Some(promote_log_id)
@@ -4647,6 +4725,8 @@ mod tests {
                 &BTreeSet::from([601, 602, 603])
             );
             assert_eq!(leader_status.applied_learners(), &BTreeSet::new());
+            assert!(leader_status.applied_voter());
+            assert!(!leader_status.applied_learner());
 
             let promoted_status = authority3.status().await.unwrap();
             assert_eq!(promoted_status.applied(), Some(promote_log_id));
@@ -4659,6 +4739,9 @@ mod tests {
                 &BTreeSet::from([601, 602, 603])
             );
             assert_eq!(promoted_status.effective_learners(), &BTreeSet::new());
+            assert!(promoted_status.effective_voter());
+            assert!(!promoted_status.effective_learner());
+            assert!(!promoted_status.linearized_authority_serving());
             assert_eq!(
                 promoted_status.applied_membership_log_id(),
                 Some(promote_log_id)
@@ -4668,6 +4751,8 @@ mod tests {
                 &BTreeSet::from([601, 602, 603])
             );
             assert_eq!(promoted_status.applied_learners(), &BTreeSet::new());
+            assert!(promoted_status.applied_voter());
+            assert!(!promoted_status.applied_learner());
 
             authority1.shutdown().await.unwrap();
             authority2.shutdown().await.unwrap();
@@ -5491,6 +5576,12 @@ mod tests {
             );
             let restarted_status = restarted_authority.status().await.unwrap();
             assert_eq!(restarted_status.server_state(), ServerState::Leader);
+            assert!(restarted_status.local_leader());
+            assert!(restarted_status.effective_voter());
+            assert!(!restarted_status.effective_learner());
+            assert!(restarted_status.applied_voter());
+            assert!(!restarted_status.applied_learner());
+            assert!(restarted_status.linearized_authority_serving());
             assert_eq!(restarted_status.applied(), Some(resumed_write.log_id()));
             assert_eq!(
                 restarted_status.authority_incarnation(),

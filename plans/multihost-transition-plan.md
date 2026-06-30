@@ -9705,6 +9705,11 @@ Phase 12.1 progress:
   from a node that is itself Leader, Follower, Learner, Candidate, or shutting
   down. The single-node, leader-transfer, and restarted-leader smokes now pin
   the role transitions through the public authority boundary.
+- Added derived OpenRaft authority status flags for local leadership, local
+  effective/applied voter and learner membership, and whether the local node is
+  currently expected to serve the linearized authority path. These are
+  diagnostic facts only; the actual serving path remains OpenRaft
+  `client_write` and `ReadPolicy::ReadIndex`.
 
 1. define the replicated control-plane state machine:
    - state includes cluster epoch, PG count, PG state, PG acting sets, node
