@@ -576,6 +576,39 @@ impl ControlPlaneRaftAuthorityRoutingHandle {
             .await
     }
 
+    pub async fn replace_voters(
+        &self,
+        voters: BTreeSet<ControlPlaneRaftNodeId>,
+        retain_removed_voters_as_learners: bool,
+    ) -> Result<LogIdOf<ControlPlaneRaftTypeConfig>, ControlPlaneError> {
+        self.current_leader_service()
+            .await?
+            .replace_voters(voters, retain_removed_voters_as_learners)
+            .await
+    }
+
+    pub async fn add_learner(
+        &self,
+        node_id: ControlPlaneRaftNodeId,
+        node: BasicNode,
+        wait_for_catch_up: bool,
+    ) -> Result<LogIdOf<ControlPlaneRaftTypeConfig>, ControlPlaneError> {
+        self.current_leader_service()
+            .await?
+            .add_learner(node_id, node, wait_for_catch_up)
+            .await
+    }
+
+    pub async fn transfer_leadership_to(
+        &self,
+        node_id: ControlPlaneRaftNodeId,
+    ) -> Result<(), ControlPlaneError> {
+        self.current_leader_service()
+            .await?
+            .transfer_leadership_to(node_id)
+            .await
+    }
+
     pub async fn observer_status(
         &self,
     ) -> Result<ControlPlaneRaftAuthorityStatus, ControlPlaneError> {
@@ -5102,9 +5135,9 @@ mod tests {
             .await;
 
             expect_bounded_control_plane_raft(
-                leader_service.transfer_leadership_to(412),
+                routed_client.transfer_leadership_to(412),
                 operation_timeout,
-                "authority service directory transfer leadership",
+                "authority service directory routed transfer leadership",
             )
             .await;
             expect_bounded_control_plane_raft(
@@ -5195,6 +5228,39 @@ mod tests {
                 direct_runtime_map.freshness_proof().issued_at_ms(),
                 Some(91_001)
             );
+            let routed_membership_log_id = expect_bounded_control_plane_raft(
+                routed_client.replace_voters(BTreeSet::from([412]), false),
+                operation_timeout,
+                "authority service directory routed voter replacement",
+            )
+            .await;
+            expect_bounded_control_plane_raft(
+                follower_service.wait_for_applied_index_at_least(
+                    routed_membership_log_id.index(),
+                    Duration::from_secs(1),
+                    "authority service directory routed voter replacement applied",
+                ),
+                operation_timeout,
+                "authority service directory wait for routed voter replacement",
+            )
+            .await;
+            let routed_membership_status = expect_bounded_control_plane_raft(
+                routed_client.status(),
+                operation_timeout,
+                "authority service directory routed status after voter replacement",
+            )
+            .await;
+            assert_eq!(routed_membership_status.node_id(), 412);
+            assert_eq!(
+                routed_membership_status.effective_membership_log_id(),
+                Some(routed_membership_log_id)
+            );
+            assert_eq!(
+                routed_membership_status.effective_voters(),
+                &BTreeSet::from([412])
+            );
+            assert!(routed_membership_status.local_leader());
+            assert!(routed_membership_status.linearized_authority_serving());
 
             expect_bounded_control_plane_raft(
                 leader_service.shutdown(),

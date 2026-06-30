@@ -9810,6 +9810,13 @@ Phase 12.1 progress:
   capability, with the observer-local status exposed only through an explicit
   observer method; the directory smoke proves the same client continues routing
   correctly after leadership transfer.
+- Extended that routing handle with explicit leader-routed admin helpers for
+  operations that require an initialized current leader: leadership transfer,
+  voter replacement, and learner addition. Cluster initialization remains
+  outside this routed-leader contract because there is no current leader to
+  route through before bootstrap. The directory smoke now drives leadership
+  transfer and voter replacement through the same routed client used for
+  linearized writes, reads, and status.
 
 1. define the replicated control-plane state machine:
    - state includes cluster epoch, PG count, PG state, PG acting sets, node
