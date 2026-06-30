@@ -9773,6 +9773,11 @@ Phase 12.1 progress:
   existing linearized/admin/service handle pattern. The directory smoke now
   routes through that handle, so future RPC/client code can receive a directory
   capability without depending on the concrete directory implementation.
+- Added a leader-routing helper on the OpenRaft authority service directory
+  handle. Callers can now combine an observed authority status with the service
+  directory to resolve the current leader service without naming the concrete
+  OpenRaft wrapper; the directory smoke now transfers leadership and serves a
+  runtime-map read through the status-derived leader route.
 
 1. define the replicated control-plane state machine:
    - state includes cluster epoch, PG count, PG state, PG acting sets, node
