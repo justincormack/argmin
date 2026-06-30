@@ -2041,26 +2041,30 @@ mod tests {
         (authority1, authority2, authority3)
     }
 
+    struct ThreeVoterAuthorityFixture {
+        network: InMemoryRaftNetworkFactory,
+        config: Arc<Config>,
+        leader_log_store: ControlPlaneRaftLogStore,
+        third_log_store: ControlPlaneRaftLogStore,
+        authority1: ControlPlaneRaftAuthority,
+        authority2: ControlPlaneRaftAuthority,
+        authority3: ControlPlaneRaftAuthority,
+    }
+
     async fn initialized_three_node_voter_authorities(
         cluster_name: &'static str,
         node1: ControlPlaneRaftNodeId,
         node2: ControlPlaneRaftNodeId,
         node3: ControlPlaneRaftNodeId,
-    ) -> (
-        InMemoryRaftNetworkFactory,
-        Arc<Config>,
-        ControlPlaneRaftLogStore,
-        ControlPlaneRaftAuthority,
-        ControlPlaneRaftAuthority,
-        ControlPlaneRaftAuthority,
-    ) {
+    ) -> ThreeVoterAuthorityFixture {
         let network = InMemoryRaftNetworkFactory::default();
         let config = test_raft_config(cluster_name);
+        let leader_log_store = ControlPlaneRaftLogStore::empty();
         let raft1 = Raft::<ControlPlaneRaftTypeConfig, ControlPlaneRaftStateMachine>::new(
             node1,
             config.clone(),
             network.clone(),
-            ControlPlaneRaftLogStore::empty(),
+            leader_log_store.clone(),
             ControlPlaneRaftStateMachine::empty(),
         )
         .await
@@ -2101,9 +2105,15 @@ mod tests {
             .unwrap();
         wait_for_local_leader(authority1.raft(), "three-voter initialized leadership").await;
 
-        (
-            network, config, log_store3, authority1, authority2, authority3,
-        )
+        ThreeVoterAuthorityFixture {
+            network,
+            config,
+            leader_log_store,
+            third_log_store: log_store3,
+            authority1,
+            authority2,
+            authority3,
+        }
     }
 
     async fn capture_openraft_restart_artifact(
@@ -3998,14 +4008,21 @@ mod tests {
     #[test]
     fn control_plane_openraft_restarted_follower_catches_up_committed_prefix() {
         ControlPlaneRaftTypeConfig::run(async {
-            let (network, config, follower_log_store, authority1, authority2, authority3) =
-                initialized_three_node_voter_authorities(
-                    "control-plane-raft-follower-restart-catch-up-test",
-                    801,
-                    802,
-                    803,
-                )
-                .await;
+            let ThreeVoterAuthorityFixture {
+                network,
+                config,
+                leader_log_store: _,
+                third_log_store,
+                authority1,
+                authority2,
+                authority3,
+            } = initialized_three_node_voter_authorities(
+                "control-plane-raft-follower-restart-catch-up-test",
+                801,
+                802,
+                803,
+            )
+            .await;
 
             let bootstrap = authority1
                 .submit_control_plane_command(ControlPlaneCommand::BootstrapInitialClusterMap {
@@ -4034,7 +4051,7 @@ mod tests {
                 .unwrap();
 
             let restart_artifact =
-                capture_openraft_restart_artifact(&follower_log_store, &authority3).await;
+                capture_openraft_restart_artifact(&third_log_store, &authority3).await;
             authority3.shutdown().await.unwrap();
             network.unregister(803);
 
@@ -4133,6 +4150,173 @@ mod tests {
             authority1.shutdown().await.unwrap();
             authority2.shutdown().await.unwrap();
             restarted_authority.shutdown().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn control_plane_openraft_restarted_leader_resumes_writes_and_reads() {
+        ControlPlaneRaftTypeConfig::run(async {
+            let ThreeVoterAuthorityFixture {
+                network,
+                config,
+                leader_log_store,
+                third_log_store: _,
+                authority1,
+                authority2,
+                authority3,
+            } = initialized_three_node_voter_authorities(
+                "control-plane-raft-leader-restart-resume-test",
+                901,
+                902,
+                903,
+            )
+            .await;
+
+            let bootstrap = authority1
+                .submit_control_plane_command(ControlPlaneCommand::BootstrapInitialClusterMap {
+                    nodes: vec![
+                        (NodeId::new(901), "node-901".to_string()),
+                        (NodeId::new(902), "node-902".to_string()),
+                        (NodeId::new(903), "node-903".to_string()),
+                    ],
+                    pg_ids: vec![PgId::new(0)],
+                })
+                .await
+                .unwrap();
+            assert!(matches!(
+                bootstrap.outcome(),
+                ControlPlaneRaftCommandOutcome::Applied(
+                    ControlPlaneCommandResponse::BootstrapInitialClusterMap
+                )
+            ));
+            authority2
+                .wait_for_applied_index_at_least(
+                    bootstrap.log_id().index(),
+                    Duration::from_secs(1),
+                    "second voter applied bootstrap before leader restart",
+                )
+                .await
+                .unwrap();
+            authority3
+                .wait_for_applied_index_at_least(
+                    bootstrap.log_id().index(),
+                    Duration::from_secs(1),
+                    "third voter applied bootstrap before leader restart",
+                )
+                .await
+                .unwrap();
+
+            let restart_artifact =
+                capture_openraft_restart_artifact(&leader_log_store, &authority1).await;
+            authority1.shutdown().await.unwrap();
+            network.unregister(901);
+
+            let follower_write_err = authority2
+                .submit_control_plane_command(ControlPlaneCommand::MarkNodeAvailability {
+                    node_id: NodeId::new(902),
+                    availability: NodeAvailabilityState::Unavailable,
+                })
+                .await
+                .unwrap_err();
+            assert!(matches!(
+                follower_write_err,
+                ControlPlaneError::RpcRemote { message }
+                    if message.contains("OpenRaft client-write failed")
+            ));
+
+            let (restored_log_store, restored_state_machine) = restart_artifact.restore().unwrap();
+            let restarted_raft =
+                Raft::<ControlPlaneRaftTypeConfig, ControlPlaneRaftStateMachine>::new(
+                    901,
+                    config,
+                    network.clone(),
+                    restored_log_store,
+                    restored_state_machine,
+                )
+                .await
+                .unwrap();
+            network.register(901, restarted_raft.clone());
+            let restarted_authority = ControlPlaneRaftAuthority::new(restarted_raft);
+            restarted_authority
+                .wait_for_current_leader(
+                    901,
+                    Duration::from_secs(1),
+                    "restarted leader recovered current leadership",
+                )
+                .await
+                .unwrap();
+
+            let resumed_write = restarted_authority
+                .submit_control_plane_command(ControlPlaneCommand::MarkNodeAvailability {
+                    node_id: NodeId::new(903),
+                    availability: NodeAvailabilityState::Unavailable,
+                })
+                .await
+                .unwrap();
+            assert!(matches!(
+                resumed_write.outcome(),
+                ControlPlaneRaftCommandOutcome::Applied(
+                    ControlPlaneCommandResponse::MarkNodeAvailability
+                )
+            ));
+            assert!(resumed_write.log_id().index() > bootstrap.log_id().index());
+            authority2
+                .wait_for_applied_index_at_least(
+                    resumed_write.log_id().index(),
+                    Duration::from_secs(1),
+                    "second voter applied restarted leader write",
+                )
+                .await
+                .unwrap();
+            authority3
+                .wait_for_applied_index_at_least(
+                    resumed_write.log_id().index(),
+                    Duration::from_secs(1),
+                    "third voter applied restarted leader write",
+                )
+                .await
+                .unwrap();
+
+            let runtime_map = restarted_authority
+                .linearized_runtime_map_snapshot(90_000)
+                .await
+                .unwrap();
+            let expected_read_index = control_plane_log_id_from_raft(resumed_write.log_id())
+                .expect("restarted leader command log id should be non-bootstrap");
+            assert_eq!(
+                runtime_map.freshness_proof().read_index(),
+                Some(expected_read_index)
+            );
+            assert_eq!(runtime_map.freshness_proof().issued_at_ms(), Some(90_000));
+            assert_eq!(
+                runtime_map
+                    .nodes()
+                    .iter()
+                    .map(|node| node.node_id())
+                    .collect::<Vec<_>>(),
+                vec![NodeId::new(901), NodeId::new(902), NodeId::new(903)]
+            );
+
+            let restarted_node903_availability = restarted_authority
+                .raft()
+                .with_state_machine(|state_machine| {
+                    let availability = state_machine
+                        .inner()
+                        .snapshot()
+                        .node(NodeId::new(903))
+                        .map(|node| node.availability());
+                    Box::pin(async move { availability })
+                })
+                .await
+                .unwrap();
+            assert_eq!(
+                restarted_node903_availability,
+                Some(NodeAvailabilityState::Unavailable)
+            );
+
+            restarted_authority.shutdown().await.unwrap();
+            authority2.shutdown().await.unwrap();
+            authority3.shutdown().await.unwrap();
         });
     }
 

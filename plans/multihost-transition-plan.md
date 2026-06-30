@@ -9536,6 +9536,12 @@ Phase 12.1 progress:
   follower, and verifies a later write drives the restarted follower through the
   missing committed prefix with the expected Raft membership and control-plane
   node-state effects.
+- Added OpenRaft leader-restart resume coverage. A three-voter in-memory
+  cluster now captures the leader's persisted OpenRaft/control-plane artifacts,
+  removes the leader from the test network, verifies a follower cannot accept a
+  linearized write while the leader is absent, restores the leader, and proves
+  the restored leader resumes command submission, follower replication, and
+  read-index runtime-map service from the committed prefix.
 
 1. define the replicated control-plane state machine:
    - state includes cluster epoch, PG count, PG state, PG acting sets, node
