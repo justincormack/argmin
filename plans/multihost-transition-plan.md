@@ -9713,6 +9713,12 @@ Phase 12.1 progress:
   currently expected to serve the linearized authority path. These are
   diagnostic facts only; the actual serving path remains OpenRaft
   `client_write` and `ReadPolicy::ReadIndex`.
+- Added a compact linearized-authority readiness classification to the same
+  status surface. It reports `Serving`, `NotLocalLeader`, or
+  `NotEffectiveVoter` from the OpenRaft leadership and effective-membership
+  state, so diagnostics do not need to reverse-engineer the serving reason from
+  several booleans. This remains a status/readiness view only; request serving
+  still goes through OpenRaft command submission and read-index barriers.
 
 1. define the replicated control-plane state machine:
    - state includes cluster epoch, PG count, PG state, PG acting sets, node

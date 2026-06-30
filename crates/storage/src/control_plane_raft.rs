@@ -170,6 +170,34 @@ pub struct ControlPlaneRaftAuthorityStatus {
     applied_learners: BTreeSet<ControlPlaneRaftNodeId>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ControlPlaneRaftLinearizedAuthorityReadiness {
+    Serving,
+    NotLocalLeader,
+    NotEffectiveVoter,
+}
+
+impl ControlPlaneRaftLinearizedAuthorityReadiness {
+    #[must_use]
+    pub fn serving(self) -> bool {
+        matches!(self, Self::Serving)
+    }
+}
+
+#[must_use]
+fn linearized_authority_readiness_from_flags(
+    local_leader: bool,
+    effective_voter: bool,
+) -> ControlPlaneRaftLinearizedAuthorityReadiness {
+    if !local_leader {
+        ControlPlaneRaftLinearizedAuthorityReadiness::NotLocalLeader
+    } else if !effective_voter {
+        ControlPlaneRaftLinearizedAuthorityReadiness::NotEffectiveVoter
+    } else {
+        ControlPlaneRaftLinearizedAuthorityReadiness::Serving
+    }
+}
+
 impl ControlPlaneRaftAuthorityStatus {
     #[must_use]
     pub fn node_id(&self) -> ControlPlaneRaftNodeId {
@@ -214,6 +242,11 @@ impl ControlPlaneRaftAuthorityStatus {
     #[must_use]
     pub fn linearized_authority_serving(&self) -> bool {
         self.linearized_authority_serving
+    }
+
+    #[must_use]
+    pub fn linearized_authority_readiness(&self) -> ControlPlaneRaftLinearizedAuthorityReadiness {
+        linearized_authority_readiness_from_flags(self.local_leader, self.effective_voter)
     }
 
     #[must_use]
@@ -789,7 +822,8 @@ impl ControlPlaneRaftAuthority {
         let effective_learner = effective_learners.contains(&node_id);
         let applied_voter = applied_voters.contains(&node_id);
         let applied_learner = applied_learners.contains(&node_id);
-        let linearized_authority_serving = local_leader && effective_voter;
+        let linearized_authority_serving =
+            linearized_authority_readiness_from_flags(local_leader, effective_voter).serving();
         Ok(ControlPlaneRaftAuthorityStatus {
             node_id,
             current_leader,
@@ -2709,6 +2743,26 @@ mod tests {
         }
     }
 
+    #[test]
+    fn control_plane_raft_linearized_authority_readiness_from_flags_is_ordered() {
+        assert_eq!(
+            linearized_authority_readiness_from_flags(false, false),
+            ControlPlaneRaftLinearizedAuthorityReadiness::NotLocalLeader
+        );
+        assert_eq!(
+            linearized_authority_readiness_from_flags(false, true),
+            ControlPlaneRaftLinearizedAuthorityReadiness::NotLocalLeader
+        );
+        assert_eq!(
+            linearized_authority_readiness_from_flags(true, false),
+            ControlPlaneRaftLinearizedAuthorityReadiness::NotEffectiveVoter
+        );
+        assert_eq!(
+            linearized_authority_readiness_from_flags(true, true),
+            ControlPlaneRaftLinearizedAuthorityReadiness::Serving
+        );
+    }
+
     async fn wait_for_log_purged_to(
         log_store: &ControlPlaneRaftLogStore,
         log_id: LogIdOf<ControlPlaneRaftTypeConfig>,
@@ -3945,6 +3999,10 @@ mod tests {
             assert!(!status.effective_learner());
             assert!(status.applied_voter());
             assert!(!status.applied_learner());
+            assert_eq!(
+                status.linearized_authority_readiness(),
+                ControlPlaneRaftLinearizedAuthorityReadiness::Serving
+            );
             assert!(status.linearized_authority_serving());
             let persisted_vote = status
                 .persisted_vote()
@@ -4428,9 +4486,17 @@ mod tests {
             assert_eq!(new_status.server_state(), ServerState::Leader);
             assert!(!old_status.local_leader());
             assert!(old_status.effective_voter());
+            assert_eq!(
+                old_status.linearized_authority_readiness(),
+                ControlPlaneRaftLinearizedAuthorityReadiness::NotLocalLeader
+            );
             assert!(!old_status.linearized_authority_serving());
             assert!(new_status.local_leader());
             assert!(new_status.effective_voter());
+            assert_eq!(
+                new_status.linearized_authority_readiness(),
+                ControlPlaneRaftLinearizedAuthorityReadiness::Serving
+            );
             assert!(new_status.linearized_authority_serving());
             assert_eq!(old_status.applied(), Some(follow_up.log_id()));
             assert_eq!(new_status.applied(), Some(follow_up.log_id()));
@@ -4559,6 +4625,10 @@ mod tests {
                 Some(membership_log_id)
             );
             assert_eq!(status.effective_voters(), &BTreeSet::from([501]));
+            assert_eq!(
+                status.linearized_authority_readiness(),
+                ControlPlaneRaftLinearizedAuthorityReadiness::Serving
+            );
             assert_eq!(status.applied_membership_log_id(), Some(membership_log_id));
             assert_eq!(status.applied_voters(), &BTreeSet::from([501]));
 
@@ -4671,6 +4741,10 @@ mod tests {
             assert_eq!(learner_status.effective_learners(), &BTreeSet::from([603]));
             assert!(!learner_status.effective_voter());
             assert!(learner_status.effective_learner());
+            assert_eq!(
+                learner_status.linearized_authority_readiness(),
+                ControlPlaneRaftLinearizedAuthorityReadiness::NotLocalLeader
+            );
             assert!(!learner_status.linearized_authority_serving());
             assert_eq!(
                 learner_status.applied_membership_log_id(),
@@ -4715,6 +4789,10 @@ mod tests {
             assert!(leader_status.local_leader());
             assert!(leader_status.effective_voter());
             assert!(!leader_status.effective_learner());
+            assert_eq!(
+                leader_status.linearized_authority_readiness(),
+                ControlPlaneRaftLinearizedAuthorityReadiness::Serving
+            );
             assert!(leader_status.linearized_authority_serving());
             assert_eq!(
                 leader_status.applied_membership_log_id(),
@@ -4741,6 +4819,10 @@ mod tests {
             assert_eq!(promoted_status.effective_learners(), &BTreeSet::new());
             assert!(promoted_status.effective_voter());
             assert!(!promoted_status.effective_learner());
+            assert_eq!(
+                promoted_status.linearized_authority_readiness(),
+                ControlPlaneRaftLinearizedAuthorityReadiness::NotLocalLeader
+            );
             assert!(!promoted_status.linearized_authority_serving());
             assert_eq!(
                 promoted_status.applied_membership_log_id(),
@@ -5581,6 +5663,10 @@ mod tests {
             assert!(!restarted_status.effective_learner());
             assert!(restarted_status.applied_voter());
             assert!(!restarted_status.applied_learner());
+            assert_eq!(
+                restarted_status.linearized_authority_readiness(),
+                ControlPlaneRaftLinearizedAuthorityReadiness::Serving
+            );
             assert!(restarted_status.linearized_authority_serving());
             assert_eq!(restarted_status.applied(), Some(resumed_write.log_id()));
             assert_eq!(
