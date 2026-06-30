@@ -9520,6 +9520,11 @@ Phase 12.1 progress:
   waits for the learner to apply the learner-membership entry, promotes it into
   the voter set, and verifies both the leader and promoted node expose the final
   voter set through the authority status boundary.
+- Added deterministic OpenRaft leader-transfer coverage. The in-memory network
+  now forwards transfer-leader RPCs, the authority wrapper can request
+  leadership transfer and wait for a learned leader, and a two-node smoke proves
+  the old leader rejects a post-transfer command while the new leader commits
+  and replicates the next command.
 - Isolated the public OpenRaft smokes with distinct cluster names so the normal
   parallel `control_plane_raft` test group cannot share OpenRaft test identity
   while still exercising the real client-write and read-index paths.

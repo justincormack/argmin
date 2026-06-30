@@ -224,6 +224,17 @@ impl ControlPlaneRaftAuthority {
         Ok(response.log_id)
     }
 
+    pub async fn transfer_leadership_to(
+        &self,
+        node_id: ControlPlaneRaftNodeId,
+    ) -> Result<(), ControlPlaneError> {
+        self.raft
+            .trigger()
+            .transfer_leader(node_id)
+            .await
+            .map_err(|error| openraft_remote_error("transfer-leader", error))
+    }
+
     pub async fn wait_for_applied_index_at_least(
         &self,
         index: u64,
@@ -236,6 +247,20 @@ impl ControlPlaneRaftAuthority {
             .await
             .map(|_| ())
             .map_err(|error| openraft_remote_error("wait-applied-index", error))
+    }
+
+    pub async fn wait_for_current_leader(
+        &self,
+        leader_id: ControlPlaneRaftNodeId,
+        timeout: Duration,
+        message: &'static str,
+    ) -> Result<(), ControlPlaneError> {
+        self.raft
+            .wait(Some(timeout))
+            .current_leader(leader_id, message)
+            .await
+            .map(|_| ())
+            .map_err(|error| openraft_remote_error("wait-current-leader", error))
     }
 
     pub async fn submit_control_plane_command(
@@ -1640,7 +1665,8 @@ mod tests {
     };
     use openraft::network::{RPCOption, RaftNetworkFactory, RaftNetworkV2};
     use openraft::raft::{
-        AppendEntriesRequest, AppendEntriesResponse, SnapshotResponse, VoteRequest, VoteResponse,
+        AppendEntriesRequest, AppendEntriesResponse, SnapshotResponse, TransferLeaderRequest,
+        TransferLeaderResponse, VoteRequest, VoteResponse,
     };
     use openraft::type_config::TypeConfigExt;
     use openraft::{AnyError, Config, Membership, Raft, ReadPolicy, ServerState};
@@ -1865,6 +1891,20 @@ mod tests {
                         self.target
                     )))
                 })
+        }
+
+        async fn transfer_leader(
+            &mut self,
+            req: TransferLeaderRequest<ControlPlaneRaftTypeConfig>,
+            _option: RPCOption,
+        ) -> Result<
+            TransferLeaderResponse<ControlPlaneRaftTypeConfig>,
+            RPCError<ControlPlaneRaftTypeConfig>,
+        > {
+            self.target_raft("transfer_leader")?
+                .handle_transfer_leader(req)
+                .await
+                .map_err(|error| self.remote_failure("transfer_leader", error))
         }
     }
 
@@ -3505,6 +3545,107 @@ mod tests {
             assert!(follower_state.1.node(NodeId::new(401)).is_some());
             assert!(follower_state.1.node(NodeId::new(402)).is_some());
             assert!(follower_state.1.node(NodeId::new(499)).is_none());
+
+            authority1.shutdown().await.unwrap();
+            authority2.shutdown().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn control_plane_openraft_leader_transfer_fences_old_leader() {
+        ControlPlaneRaftTypeConfig::run(async {
+            let (authority1, authority2) = initialized_two_node_authorities(
+                "control-plane-raft-leader-transfer-test",
+                701,
+                702,
+            )
+            .await;
+
+            let bootstrap = authority1
+                .submit_control_plane_command(ControlPlaneCommand::BootstrapInitialClusterMap {
+                    nodes: vec![
+                        (NodeId::new(701), "node-701".to_string()),
+                        (NodeId::new(702), "node-702".to_string()),
+                    ],
+                    pg_ids: vec![PgId::new(0)],
+                })
+                .await
+                .unwrap();
+            assert!(matches!(
+                bootstrap.outcome(),
+                ControlPlaneRaftCommandOutcome::Applied(
+                    ControlPlaneCommandResponse::BootstrapInitialClusterMap
+                )
+            ));
+            authority2
+                .wait_for_applied_index_at_least(
+                    bootstrap.log_id().index(),
+                    Duration::from_secs(1),
+                    "new leader candidate applied bootstrap before transfer",
+                )
+                .await
+                .unwrap();
+
+            authority1.transfer_leadership_to(702).await.unwrap();
+            authority1
+                .wait_for_current_leader(
+                    702,
+                    Duration::from_secs(1),
+                    "old leader observed transferred leader",
+                )
+                .await
+                .unwrap();
+            authority2
+                .wait_for_current_leader(
+                    702,
+                    Duration::from_secs(1),
+                    "new leader observed transferred leadership",
+                )
+                .await
+                .unwrap();
+
+            let old_leader_err = authority1
+                .submit_control_plane_command(ControlPlaneCommand::MarkNodeAvailability {
+                    node_id: NodeId::new(701),
+                    availability: NodeAvailabilityState::Unavailable,
+                })
+                .await
+                .unwrap_err();
+            assert!(matches!(
+                old_leader_err,
+                ControlPlaneError::RpcRemote { message }
+                    if message.contains("OpenRaft client-write failed")
+            ));
+
+            let follow_up = authority2
+                .submit_control_plane_command(ControlPlaneCommand::MarkNodeAvailability {
+                    node_id: NodeId::new(702),
+                    availability: NodeAvailabilityState::Unavailable,
+                })
+                .await
+                .unwrap();
+            assert!(matches!(
+                follow_up.outcome(),
+                ControlPlaneRaftCommandOutcome::Applied(
+                    ControlPlaneCommandResponse::MarkNodeAvailability
+                )
+            ));
+            assert!(follow_up.log_id().index() > bootstrap.log_id().index());
+
+            authority1
+                .wait_for_applied_index_at_least(
+                    follow_up.log_id().index(),
+                    Duration::from_secs(1),
+                    "old leader follower applied post-transfer command",
+                )
+                .await
+                .unwrap();
+            let old_status = authority1.status().await.unwrap();
+            let new_status = authority2.status().await.unwrap();
+            assert_eq!(old_status.current_leader(), Some(702));
+            assert_eq!(new_status.current_leader(), Some(702));
+            assert_eq!(old_status.applied(), Some(follow_up.log_id()));
+            assert_eq!(new_status.applied(), Some(follow_up.log_id()));
 
             authority1.shutdown().await.unwrap();
             authority2.shutdown().await.unwrap();
