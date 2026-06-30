@@ -700,6 +700,14 @@ impl BucketWriteReservationNodeClient for LocalStorageNodeClient {
         <Self as StorageNodeClient>::durable_bucket_write_drain_exists(self, pg_id, bucket)
     }
 
+    fn durable_bucket_write_drain(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+    ) -> Result<Option<BucketWriteDrainRecord>, BucketSnapshotLoadError> {
+        <Self as StorageNodeClient>::durable_bucket_write_drain(self, pg_id, bucket)
+    }
+
     fn acquire_durable_bucket_write_reservation(
         &self,
         pg_id: PgId,
@@ -1650,6 +1658,15 @@ impl StorageNodeClient for LocalStorageNodeClient {
     ) -> Result<bool, BucketSnapshotLoadError> {
         let pg = self.storage_node.get_pg(pg_id.get())?;
         Ok(PgMetadataStore::durable_bucket_write_drain(&*pg, bucket)?.is_some())
+    }
+
+    fn durable_bucket_write_drain(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+    ) -> Result<Option<BucketWriteDrainRecord>, BucketSnapshotLoadError> {
+        let pg = self.storage_node.get_pg(pg_id.get())?;
+        Ok(PgMetadataStore::durable_bucket_write_drain(&*pg, bucket)?)
     }
 
     fn acquire_durable_bucket_write_reservation(

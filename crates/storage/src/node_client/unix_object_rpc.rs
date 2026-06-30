@@ -363,6 +363,41 @@ impl BucketWriteReservationNodeClient for UnixStorageNodeClient {
         Ok(response.value)
     }
 
+    fn durable_bucket_write_drain(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+    ) -> Result<Option<BucketWriteDrainRecord>, BucketSnapshotLoadError> {
+        let request = StorageRpcBucketRequest {
+            node_id: self.node_id,
+            cluster_epoch: self.cluster_epoch,
+            pg_id,
+            bucket: bucket.clone(),
+        };
+        let payload = encode_bucket_request(&request);
+        let response = self
+            .rpc_request(StorageRpcMessageKind::BucketWriteDrainGet, payload)
+            .map_err(BucketSnapshotLoadError::Store)?;
+        let response =
+            decode_bucket_write_drain_optional_record_response(&response).map_err(|error| {
+                BucketSnapshotLoadError::Store(
+                    self.rpc_payload_error(
+                        "decode bucket write drain get response",
+                        error.to_string(),
+                    ),
+                )
+            })?;
+        if let Some(record) = &response.record {
+            if record.bucket != *bucket {
+                return Err(BucketSnapshotLoadError::Store(self.rpc_payload_error(
+                    "validate bucket write drain get response",
+                    "drain response bucket does not match request".to_string(),
+                )));
+            }
+        }
+        Ok(response.record)
+    }
+
     fn acquire_durable_bucket_write_reservation(
         &self,
         pg_id: PgId,

@@ -546,6 +546,7 @@ pub(crate) fn storage_rpc_admission_class(
         | StorageRpcMessageKind::BucketWriteDrainBegin
         | StorageRpcMessageKind::BucketWriteDrainClear
         | StorageRpcMessageKind::BucketWriteDrainClearExpired
+        | StorageRpcMessageKind::BucketWriteDrainGet
         | StorageRpcMessageKind::BucketWriteDrainHeartbeat
         | StorageRpcMessageKind::BucketDeleteFinalized
         | StorageRpcMessageKind::BucketDeleteFinalizeRoots

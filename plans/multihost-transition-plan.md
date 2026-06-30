@@ -9038,6 +9038,24 @@ Keep an explicit Phase 11 close-out before treating the phase as soak-clean:
     tooling and test hooks. The protocol must preserve the Phase 9.4 rule that
     no admitted writer can publish after `DeleteBucket` has decided the bucket
     is empty.
+    - staged implementation:
+      1. status: started. Add the durable attempt semantics before adding per-PG frontiers:
+         retryable foreground failures leave the active drain/attempt in place,
+         and later `DeleteBucket` calls can adopt it for the same bucket
+         generation. Terminal not-empty/stale-generation outcomes still clear
+         the temporary fence. The first slice preserves leased active delete
+         drains across retryable begin failures, lets later requests adopt them,
+         and clears stale-generation drains by exact identity.
+      2. status: open. Record bounded attempt outcome/debug state on the durable bucket-PG
+         authority: incomplete retryable context, terminal not-empty blocker,
+         stale generation/recreate, and successful `MarkBucketDeleting`.
+      3. status: open. Add a background worker path that advances the same state machine used
+         by foreground requests rather than inventing a second cleanup path.
+      4. status: open. Add durable proof progress/frontiers for the expensive all-object-PG
+         exact-bucket drain once the attempt can already survive and be adopted.
+      5. status: open. Revisit reservation classification only after attempts are resumable;
+         it should be an optimization on top of a convergent state machine, not
+         the convergence mechanism itself.
 
 Status update:
 

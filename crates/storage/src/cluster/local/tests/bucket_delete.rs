@@ -2810,7 +2810,7 @@ fn begin_bucket_delete_bounds_active_delete_drain_wait() {
 }
 
 #[test]
-fn begin_bucket_delete_bounds_active_delete_drain_after_reopen() {
+fn begin_bucket_delete_adopts_active_delete_drain_after_reopen() {
     let tmp = test_util::tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
     let ec_shape = EcShape { k: 2, m: 1 };
@@ -2840,19 +2840,9 @@ fn begin_bucket_delete_bounds_active_delete_drain_after_reopen() {
     let reopened =
         Arc::new(LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1], ec_shape).unwrap());
     let reopened_cluster = crate::StorageCluster::from_local_map(Arc::clone(&reopened)).unwrap();
-    let started = std::time::Instant::now();
-    let err = reopened_cluster.begin_bucket_delete(&bucket).unwrap_err();
-    assert!(
-        started.elapsed() < Duration::from_secs(15),
-        "DeleteBucket should not wait indefinitely behind a pre-mark delete drain after reopen"
-    );
-    assert!(
-        matches!(
-            err,
-            crate::BucketWriteDrainError::Store(StoreError::MetadataCommandContention { .. })
-        ),
-        "active pre-mark delete drain after reopen should be retryable contention, got {err:?}"
-    );
+    reopened_cluster
+        .begin_bucket_delete(&bucket)
+        .expect("DeleteBucket should adopt and complete an active pre-mark drain after reopen");
 
     let bucket_pg = reopened
         .node(NodeId::new(0))
@@ -2866,14 +2856,14 @@ fn begin_bucket_delete_bounds_active_delete_drain_after_reopen() {
             .as_ref()
             .map(|record| record.drain_id.as_str()),
         Some(drain.record.drain_id.as_str()),
-        "DeleteBucket must preserve the active pre-reopen delete drain"
+        "DeleteBucket adoption should preserve the original drain identity"
     );
     assert_eq!(
         crate::PgMetadataStore::head_bucket_raw(&*bucket_pg, &bucket)
             .unwrap()
             .state,
-        crate::BucketState::Active,
-        "pre-mark delete drain after reopen must leave the bucket active"
+        crate::BucketState::Deleting,
+        "adopted pre-mark delete drain should reach terminal deleting state"
     );
 }
 

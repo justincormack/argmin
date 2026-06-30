@@ -162,6 +162,12 @@ pub(crate) trait BucketWriteReservationNodeClient: Send + Sync {
         bucket: &BucketName,
     ) -> Result<bool, BucketSnapshotLoadError>;
 
+    fn durable_bucket_write_drain(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+    ) -> Result<Option<BucketWriteDrainRecord>, BucketSnapshotLoadError>;
+
     #[allow(clippy::too_many_arguments)]
     fn acquire_durable_bucket_write_reservation(
         &self,
@@ -1333,6 +1339,12 @@ pub(crate) trait StorageNodeClient:
         pg_id: PgId,
         bucket: &BucketName,
     ) -> Result<bool, BucketSnapshotLoadError>;
+
+    fn durable_bucket_write_drain(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+    ) -> Result<Option<BucketWriteDrainRecord>, BucketSnapshotLoadError>;
 
     #[allow(clippy::too_many_arguments)]
     fn acquire_durable_bucket_write_reservation(

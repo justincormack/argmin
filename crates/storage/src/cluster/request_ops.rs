@@ -2308,6 +2308,74 @@ impl super::StorageCluster {
                         );
                         continue;
                     }
+                    if let Some(existing) = node
+                        .bucket_write_reservation_client()
+                        .durable_bucket_write_drain(PgId::new(pg_id), bucket)
+                        .map_err(bucket_snapshot_error_to_bucket_write_drain_error)?
+                    {
+                        match node
+                            .bucket_metadata_client()
+                            .head_bucket_raw(PgId::new(pg_id), bucket)
+                        {
+                            Ok(current)
+                                if current.state == BucketState::Active
+                                    && current.bucket_execution_generation
+                                        == existing.bucket_execution_generation
+                                    && existing.lease_deadline.is_some() =>
+                            {
+                                let _ = observability::event(
+                                    super::TRACE_TARGET,
+                                    "bucket_delete_drain_adopted",
+                                    Some(format_args!(
+                                        "bucket={:?} pg_id={} drain_id={}",
+                                        bucket, pg_id, existing.drain_id
+                                    )),
+                                );
+                                return Ok(super::DurableBucketDeleteDrainBegin::Acquired(
+                                    super::DurableBucketWriteDrain {
+                                        pg_id,
+                                        record: existing,
+                                    },
+                                ));
+                            }
+                            Ok(current)
+                                if current.state == BucketState::Active
+                                    && current.bucket_execution_generation
+                                        != existing.bucket_execution_generation =>
+                            {
+                                node.bucket_write_reservation_client()
+                                    .clear_durable_bucket_write_drain(PgId::new(pg_id), &existing)
+                                    .map_err(bucket_snapshot_error_to_bucket_write_drain_error)?;
+                                let _ = observability::event(
+                                    super::TRACE_TARGET,
+                                    "bucket_delete_stale_drain_rollback",
+                                    Some(format_args!(
+                                        "bucket={:?} pg_id={} drain_id={} drain_generation={} current_generation={}",
+                                        bucket,
+                                        pg_id,
+                                        existing.drain_id,
+                                        existing.bucket_execution_generation,
+                                        current.bucket_execution_generation
+                                    )),
+                                );
+                                continue;
+                            }
+                            Ok(_) => {}
+                            Err(BucketSnapshotLoadError::Metadata(
+                                MetadataError::BucketNotFound { .. },
+                            )) => {
+                                return Err(MetadataError::BucketNotFound {
+                                    name: bucket.clone(),
+                                }
+                                .into());
+                            }
+                            Err(error) => {
+                                return Err(bucket_snapshot_error_to_bucket_write_drain_error(
+                                    error,
+                                ));
+                            }
+                        }
+                    }
                     match node
                         .bucket_metadata_client()
                         .head_bucket_raw(PgId::new(pg_id), bucket)
@@ -2872,6 +2940,7 @@ impl super::StorageCluster {
                 return Err(error.into());
             }
         };
+        let current_bucket_execution_generation;
         {
             let raw_snapshot_started = std::time::Instant::now();
             let _ = observability::emit_flight_event(
@@ -2928,6 +2997,7 @@ impl super::StorageCluster {
                     .into());
                 }
             }
+            current_bucket_execution_generation = current.bucket_execution_generation;
             if current.state == BucketState::Deleting {
                 if let Some(command) = self
                     .pending_metadata_command_for_bucket(pg_id, bucket)
@@ -2999,6 +3069,39 @@ impl super::StorageCluster {
                         source
                     ),
                 );
+                if let Some(existing) = node_store
+                    .bucket_write_reservation_client()
+                    .durable_bucket_write_drain(pg_id, bucket)
+                    .map_err(bucket_snapshot_error_to_bucket_write_drain_error)?
+                {
+                    if existing.bucket_execution_generation == current_bucket_execution_generation
+                        && existing.lease_deadline.is_some()
+                    {
+                        match node_store
+                            .bucket_write_reservation_client()
+                            .clear_durable_bucket_write_drain(pg_id, &existing)
+                            .map_err(bucket_snapshot_error_to_bucket_write_drain_error)
+                        {
+                            Ok(()) => {}
+                            Err(BucketWriteDrainError::Metadata(
+                                MetadataError::BucketWriteDrainNotFound { .. }
+                                | MetadataError::BucketNotFound { .. },
+                            )) => {}
+                            Err(error) => return Err(error),
+                        }
+                        let _ = observability::event(
+                            super::TRACE_TARGET,
+                            "bucket_delete_terminal_not_empty_drain_rollback",
+                            Some(format_args!(
+                                "bucket={:?} pg_id={} drain_id={} source={:?}",
+                                bucket,
+                                pg_id.get(),
+                                existing.drain_id,
+                                source
+                            )),
+                        );
+                    }
+                }
                 return Err(self.bucket_delete_not_empty_error(bucket, pg_id, source));
             }
             Ok(None) => {
@@ -3825,9 +3928,37 @@ impl super::StorageCluster {
                         error
                     ),
                 );
-                self.rollback_durable_bucket_delete_drain(&durable_drain)?;
+                if Self::bucket_delete_begin_error_should_rollback_drain(&error) {
+                    self.rollback_durable_bucket_delete_drain(&durable_drain)?;
+                } else {
+                    let _ = observability::event(
+                        super::TRACE_TARGET,
+                        "bucket_delete_begin_preserved_retryable_attempt",
+                        Some(format_args!(
+                            "bucket={:?} pg_id={} drain_id={} error={:?}",
+                            bucket, pg_id, durable_drain.record.drain_id, error
+                        )),
+                    );
+                }
                 Err(error)
             }
+        }
+    }
+
+    fn bucket_delete_begin_error_should_rollback_drain(error: &BucketWriteDrainError) -> bool {
+        match error {
+            BucketWriteDrainError::Store(
+                StoreError::MetadataCommandContention { .. }
+                | StoreError::RouteMapExpired { .. }
+                | StoreError::StaleMetadataOperation { .. }
+                | StoreError::StaleMetadataRoute { .. },
+            ) => false,
+            BucketWriteDrainError::Store(StoreError::StorageRpc { code, .. })
+                if super::storage_rpc_code_is_retryable_pg_route_error(*code) =>
+            {
+                false
+            }
+            _ => true,
         }
     }
 

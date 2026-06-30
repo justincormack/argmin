@@ -670,6 +670,7 @@ pub(crate) enum StorageRpcMessageKind {
     ObjectStreamUploadsPgList = 120,
     MetadataCommandPgLockAcquire = 121,
     MetadataCommandPgLockRelease = 122,
+    BucketWriteDrainGet = 155,
     BucketWriteDrainHeartbeat = 124,
     MetadataCommandRetainedLogHashes = 125,
     MetadataCommandRetainedLogEntries = 126,
@@ -891,6 +892,7 @@ impl StorageRpcMessageKind {
             Self::BucketWriteDrainBegin => "bucket write drain begin",
             Self::BucketWriteDrainClear => "bucket write drain clear",
             Self::BucketWriteDrainClearExpired => "bucket write drain clear expired",
+            Self::BucketWriteDrainGet => "bucket write drain get",
             Self::BucketWriteDrainHeartbeat => "bucket write drain heartbeat",
             Self::BucketWriteDrainExists => "bucket write drain exists",
             Self::BucketWriteReservationsList => "bucket write reservations list",
@@ -1085,6 +1087,7 @@ impl StorageRpcMessageKind {
             120 => Ok(Self::ObjectStreamUploadsPgList),
             121 => Ok(Self::MetadataCommandPgLockAcquire),
             122 => Ok(Self::MetadataCommandPgLockRelease),
+            155 => Ok(Self::BucketWriteDrainGet),
             124 => Ok(Self::BucketWriteDrainHeartbeat),
             125 => Ok(Self::MetadataCommandRetainedLogHashes),
             126 => Ok(Self::MetadataCommandRetainedLogEntries),
@@ -3636,6 +3639,7 @@ fn message_kind_request_max_payload_len(
             STORAGE_RPC_MAX_BUCKET_WRITE_DRAIN_EXPIRED_PAYLOAD_LEN
         }
         StorageRpcMessageKind::BucketWriteDrainExists
+        | StorageRpcMessageKind::BucketWriteDrainGet
         | StorageRpcMessageKind::BucketWriteReservationsList
         | StorageRpcMessageKind::BucketDeleteFinalized => {
             STORAGE_RPC_MAX_BUCKET_REQUEST_PAYLOAD_LEN
@@ -18668,6 +18672,11 @@ mod tests {
             ),
             (
                 StorageRpcMessageKind::BucketWriteDrainExists,
+                STORAGE_RPC_MAX_BUCKET_REQUEST_PAYLOAD_LEN + 1,
+                STORAGE_RPC_MAX_BUCKET_REQUEST_PAYLOAD_LEN,
+            ),
+            (
+                StorageRpcMessageKind::BucketWriteDrainGet,
                 STORAGE_RPC_MAX_BUCKET_REQUEST_PAYLOAD_LEN + 1,
                 STORAGE_RPC_MAX_BUCKET_REQUEST_PAYLOAD_LEN,
             ),

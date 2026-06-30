@@ -1221,7 +1221,7 @@ fn unix_bucket_write_reservation_client_routes_drain_and_finalize_coordination()
     };
     private_socket_dir(config.socket_path.parent().unwrap());
     let server = Arc::new(StorageNodeServer::bind(config.clone()).unwrap());
-    let server_threads: Vec<_> = (0..13)
+    let server_threads: Vec<_> = (0..15)
         .map(|_| {
             let server = Arc::clone(&server);
             thread::spawn(move || server.accept_one().unwrap())
@@ -1263,6 +1263,17 @@ fn unix_bucket_write_reservation_client_routes_drain_and_finalize_coordination()
         )
         .unwrap()
     );
+    assert_eq!(
+        BucketWriteReservationNodeClient::durable_bucket_write_drain(
+            &client,
+            PgId::new(0),
+            &bucket,
+        )
+        .unwrap()
+        .as_ref()
+        .map(|record| record.drain_id.as_str()),
+        Some("drain-rpc-1")
+    );
     BucketWriteReservationNodeClient::clear_durable_bucket_write_drain(
         &client,
         PgId::new(0),
@@ -1276,6 +1287,15 @@ fn unix_bucket_write_reservation_client_routes_drain_and_finalize_coordination()
             &bucket,
         )
         .unwrap()
+    );
+    assert!(
+        BucketWriteReservationNodeClient::durable_bucket_write_drain(
+            &client,
+            PgId::new(0),
+            &bucket,
+        )
+        .unwrap()
+        .is_none()
     );
 
     BucketWriteReservationNodeClient::begin_durable_bucket_write_drain(

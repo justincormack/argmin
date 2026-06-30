@@ -1021,6 +1021,12 @@ fn active_put_object_stream_upload_blocks_bucket_delete() {
             crate::ObjectEncryption::None,
         )
         .unwrap();
+    let drain = match cluster.begin_durable_bucket_delete_drain(&bucket).unwrap() {
+        crate::cluster::DurableBucketDeleteDrainBegin::Acquired(drain) => drain,
+        crate::cluster::DurableBucketDeleteDrainBegin::AlreadyDeleting => {
+            panic!("fresh active bucket should acquire delete drain")
+        }
+    };
 
     let err = cluster.begin_bucket_delete(&bucket).unwrap_err();
     assert!(
@@ -1030,6 +1036,20 @@ fn active_put_object_stream_upload_blocks_bucket_delete() {
         ),
         "connected direct PUT stream must make DeleteBucket return BucketNotEmpty: {err:?}"
     );
+    let bucket_pg = map
+        .node(NodeId::new(1))
+        .unwrap()
+        .storage_node()
+        .get_pg(1)
+        .unwrap();
+    assert!(
+        crate::PgMetadataStore::durable_bucket_write_drain(&*bucket_pg, &bucket)
+            .unwrap()
+            .is_none(),
+        "terminal BucketNotEmpty should clear adopted delete drain {}",
+        drain.record.drain_id
+    );
+    drop(bucket_pg);
 
     cluster
         .abort_stream_upload_session(&bucket, &key, &session_id)
