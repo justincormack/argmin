@@ -130,6 +130,9 @@ pub struct ControlPlaneRaftAuthorityStatus {
     oldest_retained_history_epoch: Option<ClusterEpoch>,
     newest_retained_history_epoch: Option<ClusterEpoch>,
     oldest_storage_history_floor_epoch: Option<ClusterEpoch>,
+    storage_node_lease_deadline_count: usize,
+    earliest_storage_node_lease_deadline_ms: Option<u64>,
+    latest_storage_node_lease_deadline_ms: Option<u64>,
     storage_node_count: usize,
     joining_storage_node_count: usize,
     active_storage_node_count: usize,
@@ -148,6 +151,9 @@ pub struct ControlPlaneRaftAuthorityStatus {
     active_primary_pg_count: usize,
     peering_metadata_transfer_pg_count: usize,
     metadata_transfer_fenced_pg_count: usize,
+    metadata_transfer_fence_source_lease_deadline_count: usize,
+    earliest_metadata_transfer_fence_source_lease_deadline_ms: Option<u64>,
+    latest_metadata_transfer_fence_source_lease_deadline_ms: Option<u64>,
     effective_membership_log_id: Option<LogIdOf<ControlPlaneRaftTypeConfig>>,
     effective_voters: BTreeSet<ControlPlaneRaftNodeId>,
     effective_learners: BTreeSet<ControlPlaneRaftNodeId>,
@@ -230,6 +236,21 @@ impl ControlPlaneRaftAuthorityStatus {
     #[must_use]
     pub fn oldest_storage_history_floor_epoch(&self) -> Option<ClusterEpoch> {
         self.oldest_storage_history_floor_epoch
+    }
+
+    #[must_use]
+    pub fn storage_node_lease_deadline_count(&self) -> usize {
+        self.storage_node_lease_deadline_count
+    }
+
+    #[must_use]
+    pub fn earliest_storage_node_lease_deadline_ms(&self) -> Option<u64> {
+        self.earliest_storage_node_lease_deadline_ms
+    }
+
+    #[must_use]
+    pub fn latest_storage_node_lease_deadline_ms(&self) -> Option<u64> {
+        self.latest_storage_node_lease_deadline_ms
     }
 
     #[must_use]
@@ -320,6 +341,21 @@ impl ControlPlaneRaftAuthorityStatus {
     #[must_use]
     pub fn metadata_transfer_fenced_pg_count(&self) -> usize {
         self.metadata_transfer_fenced_pg_count
+    }
+
+    #[must_use]
+    pub fn metadata_transfer_fence_source_lease_deadline_count(&self) -> usize {
+        self.metadata_transfer_fence_source_lease_deadline_count
+    }
+
+    #[must_use]
+    pub fn earliest_metadata_transfer_fence_source_lease_deadline_ms(&self) -> Option<u64> {
+        self.earliest_metadata_transfer_fence_source_lease_deadline_ms
+    }
+
+    #[must_use]
+    pub fn latest_metadata_transfer_fence_source_lease_deadline_ms(&self) -> Option<u64> {
+        self.latest_metadata_transfer_fence_source_lease_deadline_ms
     }
 
     #[must_use]
@@ -523,6 +559,9 @@ impl ControlPlaneRaftAuthority {
             oldest_retained_history_epoch,
             newest_retained_history_epoch,
             oldest_storage_history_floor_epoch,
+            storage_node_lease_deadline_count,
+            earliest_storage_node_lease_deadline_ms,
+            latest_storage_node_lease_deadline_ms,
             storage_node_count,
             joining_storage_node_count,
             active_storage_node_count,
@@ -541,6 +580,9 @@ impl ControlPlaneRaftAuthority {
             active_primary_pg_count,
             peering_metadata_transfer_pg_count,
             metadata_transfer_fenced_pg_count,
+            metadata_transfer_fence_source_lease_deadline_count,
+            earliest_metadata_transfer_fence_source_lease_deadline_ms,
+            latest_metadata_transfer_fence_source_lease_deadline_ms,
             applied_membership_log_id,
             applied_voters,
             applied_learners,
@@ -567,6 +609,9 @@ impl ControlPlaneRaftAuthority {
                     .nodes()
                     .filter_map(|node| node.cluster_map_history_floor_epoch())
                     .min();
+                let mut storage_node_lease_deadline_count = 0;
+                let mut earliest_storage_node_lease_deadline_ms = None;
+                let mut latest_storage_node_lease_deadline_ms = None;
                 let mut storage_node_count = 0;
                 let mut joining_storage_node_count = 0;
                 let mut active_storage_node_count = 0;
@@ -590,6 +635,14 @@ impl ControlPlaneRaftAuthority {
                         NodeAvailabilityState::Suspect => suspect_storage_node_count += 1,
                         NodeAvailabilityState::Unavailable => unavailable_storage_node_count += 1,
                     }
+                    if let Some(deadline_ms) = node.lease_deadline_ms() {
+                        observe_deadline_range(
+                            deadline_ms,
+                            &mut storage_node_lease_deadline_count,
+                            &mut earliest_storage_node_lease_deadline_ms,
+                            &mut latest_storage_node_lease_deadline_ms,
+                        );
+                    }
                 }
                 let mut pg_count = 0;
                 let mut active_pg_count = 0;
@@ -600,6 +653,9 @@ impl ControlPlaneRaftAuthority {
                 let mut active_primary_pg_count = 0;
                 let mut peering_metadata_transfer_pg_count = 0;
                 let mut metadata_transfer_fenced_pg_count = 0;
+                let mut metadata_transfer_fence_source_lease_deadline_count = 0;
+                let mut earliest_metadata_transfer_fence_source_lease_deadline_ms = None;
+                let mut latest_metadata_transfer_fence_source_lease_deadline_ms = None;
                 for pg in snapshot.pgs() {
                     pg_count += 1;
                     match pg.state() {
@@ -618,6 +674,15 @@ impl ControlPlaneRaftAuthority {
                     if pg.metadata_transfer_fenced() {
                         metadata_transfer_fenced_pg_count += 1;
                     }
+                    if let Some(deadline_ms) = pg.metadata_transfer_fence_source_lease_deadline_ms()
+                    {
+                        observe_deadline_range(
+                            deadline_ms,
+                            &mut metadata_transfer_fence_source_lease_deadline_count,
+                            &mut earliest_metadata_transfer_fence_source_lease_deadline_ms,
+                            &mut latest_metadata_transfer_fence_source_lease_deadline_ms,
+                        );
+                    }
                 }
                 let membership = state_machine.last_membership();
                 let membership_log_id = *membership.log_id();
@@ -633,6 +698,9 @@ impl ControlPlaneRaftAuthority {
                         oldest_retained_history_epoch,
                         newest_retained_history_epoch,
                         oldest_storage_history_floor_epoch,
+                        storage_node_lease_deadline_count,
+                        earliest_storage_node_lease_deadline_ms,
+                        latest_storage_node_lease_deadline_ms,
                         storage_node_count,
                         joining_storage_node_count,
                         active_storage_node_count,
@@ -651,6 +719,9 @@ impl ControlPlaneRaftAuthority {
                         active_primary_pg_count,
                         peering_metadata_transfer_pg_count,
                         metadata_transfer_fenced_pg_count,
+                        metadata_transfer_fence_source_lease_deadline_count,
+                        earliest_metadata_transfer_fence_source_lease_deadline_ms,
+                        latest_metadata_transfer_fence_source_lease_deadline_ms,
                         membership_log_id,
                         voters,
                         learners,
@@ -675,6 +746,9 @@ impl ControlPlaneRaftAuthority {
             oldest_retained_history_epoch,
             newest_retained_history_epoch,
             oldest_storage_history_floor_epoch,
+            storage_node_lease_deadline_count,
+            earliest_storage_node_lease_deadline_ms,
+            latest_storage_node_lease_deadline_ms,
             storage_node_count,
             joining_storage_node_count,
             active_storage_node_count,
@@ -693,6 +767,9 @@ impl ControlPlaneRaftAuthority {
             active_primary_pg_count,
             peering_metadata_transfer_pg_count,
             metadata_transfer_fenced_pg_count,
+            metadata_transfer_fence_source_lease_deadline_count,
+            earliest_metadata_transfer_fence_source_lease_deadline_ms,
+            latest_metadata_transfer_fence_source_lease_deadline_ms,
             effective_membership_log_id,
             effective_voters,
             effective_learners,
@@ -863,6 +940,17 @@ fn openraft_remote_error(context: &'static str, error: impl fmt::Display) -> Con
 
 fn raft_log_store_error(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message.into())
+}
+
+fn observe_deadline_range(
+    deadline_ms: u64,
+    count: &mut usize,
+    earliest_ms: &mut Option<u64>,
+    latest_ms: &mut Option<u64>,
+) {
+    *count += 1;
+    *earliest_ms = Some(earliest_ms.map_or(deadline_ms, |existing| existing.min(deadline_ms)));
+    *latest_ms = Some(latest_ms.map_or(deadline_ms, |existing| existing.max(deadline_ms)));
 }
 
 #[derive(Debug, Clone, Default)]
@@ -2067,9 +2155,10 @@ mod tests {
     use openraft::{AnyError, Config, Membership, Raft, ReadPolicy, ServerState};
 
     use crate::control_plane::{
-        ClusterControlSnapshot, NodeAvailabilityState, RuntimeMapFreshnessProof,
+        ClusterControlSnapshot, NodeAvailabilityState, NodeHeartbeat, RuntimeMapFreshnessProof,
     };
     use crate::types::PgId;
+    use crate::PgClusterMapHistoryReferenceSummary;
 
     #[derive(Debug, Clone, Copy, Default)]
     struct UnreachableRaftNetworkFactory;
@@ -3721,6 +3810,35 @@ mod tests {
                     ControlPlaneCommandResponse::BootstrapInitialClusterMap
                 )
             ));
+            let bootstrap_epoch = authority.status().await.unwrap().current_cluster_epoch();
+
+            let heartbeat = authority
+                .submit_control_plane_command(ControlPlaneCommand::RecordNodeHeartbeat {
+                    heartbeat: NodeHeartbeat {
+                        node_id: NodeId::new(1),
+                        node_incarnation: 1,
+                        endpoint: "node-1".to_string(),
+                        observed_epoch: bootstrap_epoch,
+                        requested_lease_duration_ms: 345,
+                        cluster_map_history_reference_summary:
+                            PgClusterMapHistoryReferenceSummary {
+                                oldest_live_placement_epoch: None,
+                                oldest_durable_backfill_epoch: None,
+                            },
+                        pg_observations: Vec::new(),
+                    },
+                    heartbeat_at_ms: 12_000,
+                    lease_deadline_ms: 12_345,
+                })
+                .await
+                .unwrap();
+            assert_eq!(heartbeat.log_id().index(), bootstrap_log_id.index() + 1);
+            assert!(matches!(
+                heartbeat.outcome(),
+                ControlPlaneRaftCommandOutcome::Applied(
+                    ControlPlaneCommandResponse::RecordNodeHeartbeat
+                )
+            ));
 
             let rejected = authority
                 .submit_control_plane_command(ControlPlaneCommand::MarkNodeAvailability {
@@ -3729,7 +3847,7 @@ mod tests {
                 })
                 .await
                 .unwrap();
-            assert_eq!(rejected.log_id().index(), bootstrap_log_id.index() + 1);
+            assert_eq!(rejected.log_id().index(), heartbeat.log_id().index() + 1);
             let rejected_log_id = rejected.log_id();
             assert!(matches!(
                 rejected.outcome(),
@@ -3772,6 +3890,24 @@ mod tests {
             assert_eq!(status.applied(), Some(rejected_log_id));
             assert_eq!(status.effective_voters(), &BTreeSet::from([1]));
             assert_eq!(status.applied_voters(), &BTreeSet::from([1]));
+            assert_eq!(status.storage_node_lease_deadline_count(), 1);
+            assert_eq!(
+                status.earliest_storage_node_lease_deadline_ms(),
+                Some(12_345)
+            );
+            assert_eq!(status.latest_storage_node_lease_deadline_ms(), Some(12_345));
+            assert_eq!(
+                status.metadata_transfer_fence_source_lease_deadline_count(),
+                0
+            );
+            assert_eq!(
+                status.earliest_metadata_transfer_fence_source_lease_deadline_ms(),
+                None
+            );
+            assert_eq!(
+                status.latest_metadata_transfer_fence_source_lease_deadline_ms(),
+                None
+            );
 
             authority.shutdown().await.unwrap();
         });
@@ -5380,6 +5516,27 @@ mod tests {
             assert_eq!(restarted_status.active_primary_pg_count(), 0);
             assert_eq!(restarted_status.peering_metadata_transfer_pg_count(), 0);
             assert_eq!(restarted_status.metadata_transfer_fenced_pg_count(), 0);
+            assert_eq!(restarted_status.storage_node_lease_deadline_count(), 0);
+            assert_eq!(
+                restarted_status.earliest_storage_node_lease_deadline_ms(),
+                None
+            );
+            assert_eq!(
+                restarted_status.latest_storage_node_lease_deadline_ms(),
+                None
+            );
+            assert_eq!(
+                restarted_status.metadata_transfer_fence_source_lease_deadline_count(),
+                0
+            );
+            assert_eq!(
+                restarted_status.earliest_metadata_transfer_fence_source_lease_deadline_ms(),
+                None
+            );
+            assert_eq!(
+                restarted_status.latest_metadata_transfer_fence_source_lease_deadline_ms(),
+                None
+            );
 
             let restarted_node903_availability = restarted_authority
                 .raft()

@@ -9691,6 +9691,11 @@ Phase 12.1 progress:
   markers, and metadata-transfer fences. These deliberately avoid wall-clock
   lease checks, so the authority status remains a replay-safe view of
   replicated control-plane state.
+- Extended the status surface with raw persisted lease-deadline diagnostics:
+  counts and min/max deadline values for storage-node heartbeat leases and
+  metadata-transfer fence source leases. These are reported as replicated state
+  facts only; serving freshness and lease validity remain outside this
+  replay-safe status path until the Phase 12 monotonic-clock lease-read design.
 
 1. define the replicated control-plane state machine:
    - state includes cluster epoch, PG count, PG state, PG acting sets, node
