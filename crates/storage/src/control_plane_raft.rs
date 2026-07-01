@@ -208,20 +208,6 @@ pub trait ControlPlaneRaftAuthorityNodeLifecycle {
     fn shutdown(&self) -> ControlPlaneRaftFuture<'_, Result<(), ControlPlaneError>>;
 }
 
-pub trait ControlPlaneRaftAuthorityAdmin:
-    ControlPlaneRaftLeaderRoutedAdmin
-    + ControlPlaneRaftAuthorityBootstrap
-    + ControlPlaneRaftAuthorityNodeLifecycle
-{
-}
-
-impl<T> ControlPlaneRaftAuthorityAdmin for T where
-    T: ControlPlaneRaftLeaderRoutedAdmin
-        + ControlPlaneRaftAuthorityBootstrap
-        + ControlPlaneRaftAuthorityNodeLifecycle
-{
-}
-
 pub trait ControlPlaneRaftLinearizedAuthority:
     ControlPlaneRaftLinearizedCommandSink
     + ControlPlaneRaftLinearizedRuntimeMapSource
@@ -237,12 +223,18 @@ impl<T> ControlPlaneRaftLinearizedAuthority for T where
 }
 
 pub trait ControlPlaneRaftAuthorityService:
-    ControlPlaneRaftLinearizedAuthority + ControlPlaneRaftAuthorityAdmin
+    ControlPlaneRaftLinearizedAuthority
+    + ControlPlaneRaftLeaderRoutedAdmin
+    + ControlPlaneRaftAuthorityBootstrap
+    + ControlPlaneRaftAuthorityNodeLifecycle
 {
 }
 
 impl<T> ControlPlaneRaftAuthorityService for T where
-    T: ControlPlaneRaftLinearizedAuthority + ControlPlaneRaftAuthorityAdmin
+    T: ControlPlaneRaftLinearizedAuthority
+        + ControlPlaneRaftLeaderRoutedAdmin
+        + ControlPlaneRaftAuthorityBootstrap
+        + ControlPlaneRaftAuthorityNodeLifecycle
 {
 }
 
@@ -964,108 +956,6 @@ impl ControlPlaneRaftLeaderRoutedAdmin for ControlPlaneRaftRoutedAuthorityHandle
         node_id: ControlPlaneRaftNodeId,
     ) -> ControlPlaneRaftFuture<'_, Result<(), ControlPlaneError>> {
         self.inner.transfer_leadership_to(node_id)
-    }
-}
-
-#[derive(Clone)]
-pub struct ControlPlaneRaftAuthorityAdminHandle {
-    inner: Arc<dyn ControlPlaneRaftAuthorityAdmin + Send + Sync>,
-}
-
-impl ControlPlaneRaftAuthorityAdminHandle {
-    pub fn new<T>(authority: Arc<T>) -> Self
-    where
-        T: ControlPlaneRaftAuthorityAdmin + Send + Sync + 'static,
-    {
-        Self { inner: authority }
-    }
-
-    pub fn from_admin_authority(
-        authority: Arc<dyn ControlPlaneRaftAuthorityAdmin + Send + Sync>,
-    ) -> Self {
-        Self { inner: authority }
-    }
-
-    #[must_use]
-    pub fn as_admin_authority(
-        &self,
-    ) -> &(dyn ControlPlaneRaftAuthorityAdmin + Send + Sync + 'static) {
-        &*self.inner
-    }
-}
-
-impl fmt::Debug for ControlPlaneRaftAuthorityAdminHandle {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("ControlPlaneRaftAuthorityAdminHandle")
-            .finish_non_exhaustive()
-    }
-}
-
-impl ControlPlaneRaftLeaderRoutedAdmin for ControlPlaneRaftAuthorityAdminHandle {
-    fn replace_voters(
-        &self,
-        voters: BTreeSet<ControlPlaneRaftNodeId>,
-        retain_removed_voters_as_learners: bool,
-    ) -> ControlPlaneRaftFuture<'_, Result<LogIdOf<ControlPlaneRaftTypeConfig>, ControlPlaneError>>
-    {
-        self.inner
-            .replace_voters(voters, retain_removed_voters_as_learners)
-    }
-
-    fn add_learner(
-        &self,
-        node_id: ControlPlaneRaftNodeId,
-        node: BasicNode,
-        wait_for_catch_up: bool,
-    ) -> ControlPlaneRaftFuture<'_, Result<LogIdOf<ControlPlaneRaftTypeConfig>, ControlPlaneError>>
-    {
-        self.inner.add_learner(node_id, node, wait_for_catch_up)
-    }
-
-    fn transfer_leadership_to(
-        &self,
-        node_id: ControlPlaneRaftNodeId,
-    ) -> ControlPlaneRaftFuture<'_, Result<(), ControlPlaneError>> {
-        self.inner.transfer_leadership_to(node_id)
-    }
-}
-
-impl ControlPlaneRaftAuthorityBootstrap for ControlPlaneRaftAuthorityAdminHandle {
-    fn initialize_membership(
-        &self,
-        nodes: BTreeMap<ControlPlaneRaftNodeId, BasicNode>,
-    ) -> ControlPlaneRaftFuture<'_, Result<(), ControlPlaneError>> {
-        self.inner.initialize_membership(nodes)
-    }
-
-    fn is_initialized(&self) -> ControlPlaneRaftFuture<'_, Result<bool, ControlPlaneError>> {
-        self.inner.is_initialized()
-    }
-}
-
-impl ControlPlaneRaftAuthorityNodeLifecycle for ControlPlaneRaftAuthorityAdminHandle {
-    fn wait_for_applied_index_at_least(
-        &self,
-        index: u64,
-        timeout: Duration,
-        message: &'static str,
-    ) -> ControlPlaneRaftFuture<'_, Result<(), ControlPlaneError>> {
-        self.inner
-            .wait_for_applied_index_at_least(index, timeout, message)
-    }
-
-    fn wait_for_current_leader(
-        &self,
-        leader_id: ControlPlaneRaftNodeId,
-        timeout: Duration,
-        message: &'static str,
-    ) -> ControlPlaneRaftFuture<'_, Result<(), ControlPlaneError>> {
-        self.inner
-            .wait_for_current_leader(leader_id, timeout, message)
-    }
-
-    fn shutdown(&self) -> ControlPlaneRaftFuture<'_, Result<(), ControlPlaneError>> {
-        self.inner.shutdown()
     }
 }
 

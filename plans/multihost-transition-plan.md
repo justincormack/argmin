@@ -9973,6 +9973,10 @@ Phase 12.1 progress:
   initialization wiring now use bootstrap-only handles for membership
   initialization state and node-lifecycle-only handles for applied-index waits,
   leader observation, and shutdown.
+- Removed the unused combined admin authority layer. The full service boundary
+  now composes the explicit command/read/status, leader-routed admin,
+  bootstrap, and node-lifecycle traits directly, so there is no separate
+  bootstrap/lifecycle/admin handle that callers can depend on accidentally.
 
 1. define the replicated control-plane state machine:
    - state includes cluster epoch, PG count, PG state, PG acting sets, node
