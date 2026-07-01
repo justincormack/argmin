@@ -920,6 +920,14 @@ impl BucketWriteReservationNodeClient for LocalStorageNodeClient {
         <Self as StorageNodeClient>::release_bucket_delete_finalize_claim(self, pg_id, claim)
     }
 
+    fn bucket_delete_finalize_claim(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+    ) -> Result<Option<BucketDeleteFinalizeClaimRecord>, BucketSnapshotLoadError> {
+        <Self as StorageNodeClient>::bucket_delete_finalize_claim(self, pg_id, bucket)
+    }
+
     fn get_lifecycle_sweep_roots(
         &self,
         pg_id: PgId,
@@ -3823,6 +3831,15 @@ impl StorageNodeClient for LocalStorageNodeClient {
             &claim.owner_token,
             claim.cluster_epoch,
         )?)
+    }
+
+    fn bucket_delete_finalize_claim(
+        &self,
+        pg_id: PgId,
+        _bucket: &BucketName,
+    ) -> Result<Option<BucketDeleteFinalizeClaimRecord>, BucketSnapshotLoadError> {
+        let pg = self.storage_node.get_pg(pg_id.get())?;
+        Ok(PgMetadataStore::bucket_delete_finalize_claim(&*pg)?)
     }
 
     fn get_lifecycle_sweep_roots(

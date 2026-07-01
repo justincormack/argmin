@@ -1774,6 +1774,15 @@ impl StorageNodeConnectionHandler {
                     }),
                 }
             }
+            StorageRpcMessageKind::BucketDeleteFinalizeClaimGet => {
+                match decode_bucket_request(&frame.payload) {
+                    Ok(request) => self.bucket_delete_finalize_claim_get_response(request),
+                    Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
+                        code: StorageRpcErrorCode::PayloadDecode,
+                        message: error.to_string(),
+                    }),
+                }
+            }
             StorageRpcMessageKind::BucketDeleteFinalizeClaimAcquire => {
                 match decode_bucket_delete_finalize_claim_acquire_request(&frame.payload) {
                     Ok(request) => self.bucket_delete_finalize_claim_acquire_response(request),
@@ -3703,6 +3712,38 @@ impl StorageNodeConnectionHandler {
             request.claimed_at,
             request.lease_deadline,
             request.now,
+        ) {
+            Ok(record) => {
+                let payload = encode_bucket_delete_finalize_claim_optional_record_response(
+                    &StorageRpcBucketDeleteFinalizeClaimOptionalRecordResponse { record },
+                )?;
+                Ok(encode_storage_rpc_success_response(&payload))
+            }
+            Err(error) => encode_storage_rpc_error_response(&bucket_snapshot_error_response(error)),
+        }
+    }
+
+    fn bucket_delete_finalize_claim_get_response(
+        &self,
+        request: StorageRpcBucketRequest,
+    ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
+        if let Err(error) =
+            self.validate_pg_route(request.node_id, request.cluster_epoch, request.pg_id)
+        {
+            return encode_storage_rpc_error_response(&error);
+        }
+        if let Err(error) = self.validate_primary_pg_for_bucket(
+            request.pg_id,
+            &request.bucket,
+            "bucket delete finalize claim get",
+        ) {
+            return encode_storage_rpc_error_response(&error);
+        }
+        let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
+        match BucketWriteReservationNodeClient::bucket_delete_finalize_claim(
+            &local_client,
+            request.pg_id,
+            &request.bucket,
         ) {
             Ok(record) => {
                 let payload = encode_bucket_delete_finalize_claim_optional_record_response(

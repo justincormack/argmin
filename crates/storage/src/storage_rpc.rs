@@ -702,6 +702,7 @@ pub(crate) enum StorageRpcMessageKind {
     BucketDeleteAttemptOutcomeRecord = 156,
     BucketDeleteAttemptOutcomeGet = 157,
     BucketDeleteBeginRoots = 158,
+    BucketDeleteFinalizeClaimGet = 159,
     BucketWriteDrainHeartbeat = 124,
     MetadataCommandRetainedLogHashes = 125,
     MetadataCommandRetainedLogEntries = 126,
@@ -932,6 +933,7 @@ impl StorageRpcMessageKind {
             Self::BucketDeleteFinalized => "bucket delete finalized",
             Self::BucketDeleteFinalizeRoots => "bucket delete finalize roots",
             Self::BucketDeleteBeginRoots => "bucket delete begin roots",
+            Self::BucketDeleteFinalizeClaimGet => "bucket delete finalize claim get",
             Self::BucketDeleteFinalizeClaimAcquire => "bucket delete finalize claim acquire",
             Self::BucketDeleteFinalizeClaimRelease => "bucket delete finalize claim release",
             Self::BucketMetadataControlPendingMatch => "bucket metadata control pending match",
@@ -1125,6 +1127,7 @@ impl StorageRpcMessageKind {
             156 => Ok(Self::BucketDeleteAttemptOutcomeRecord),
             157 => Ok(Self::BucketDeleteAttemptOutcomeGet),
             158 => Ok(Self::BucketDeleteBeginRoots),
+            159 => Ok(Self::BucketDeleteFinalizeClaimGet),
             124 => Ok(Self::BucketWriteDrainHeartbeat),
             125 => Ok(Self::MetadataCommandRetainedLogHashes),
             126 => Ok(Self::MetadataCommandRetainedLogEntries),
@@ -3707,6 +3710,7 @@ fn message_kind_request_max_payload_len(
         StorageRpcMessageKind::BucketWriteDrainExists
         | StorageRpcMessageKind::BucketWriteDrainGet
         | StorageRpcMessageKind::BucketDeleteAttemptOutcomeGet
+        | StorageRpcMessageKind::BucketDeleteFinalizeClaimGet
         | StorageRpcMessageKind::BucketWriteReservationsList
         | StorageRpcMessageKind::BucketDeleteFinalized => {
             STORAGE_RPC_MAX_BUCKET_REQUEST_PAYLOAD_LEN

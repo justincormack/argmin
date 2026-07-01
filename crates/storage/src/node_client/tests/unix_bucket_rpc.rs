@@ -1221,7 +1221,7 @@ fn unix_bucket_write_reservation_client_routes_drain_and_finalize_coordination()
     };
     private_socket_dir(config.socket_path.parent().unwrap());
     let server = Arc::new(StorageNodeServer::bind(config.clone()).unwrap());
-    let server_threads: Vec<_> = (0..21)
+    let server_threads: Vec<_> = (0..23)
         .map(|_| {
             let server = Arc::clone(&server);
             thread::spawn(move || server.accept_one().unwrap())
@@ -1404,6 +1404,19 @@ fn unix_bucket_write_reservation_client_routes_drain_and_finalize_coordination()
     )
     .unwrap()
     .expect("expired finalizer claim should be stealable");
+    let observed_claim = BucketWriteReservationNodeClient::bucket_delete_finalize_claim(
+        &client,
+        PgId::new(0),
+        &finalize_bucket,
+    )
+    .unwrap()
+    .expect("finalize claim read should return current claim");
+    assert_eq!(observed_claim.bucket, finalize_bucket);
+    assert_eq!(observed_claim.claim_id, replacement_claim.claim_id);
+    assert_eq!(
+        observed_claim.bucket_incarnation_generation,
+        finalize_bucket_incarnation_generation
+    );
     let stale_release = BucketWriteReservationNodeClient::release_bucket_delete_finalize_claim(
         &client,
         PgId::new(0),
@@ -1420,6 +1433,15 @@ fn unix_bucket_write_reservation_client_routes_drain_and_finalize_coordination()
         &replacement_claim,
     )
     .unwrap();
+    assert!(
+        BucketWriteReservationNodeClient::bucket_delete_finalize_claim(
+            &client,
+            PgId::new(0),
+            &finalize_bucket,
+        )
+        .unwrap()
+        .is_none()
+    );
 
     let roots = BucketWriteReservationNodeClient::get_bucket_delete_finalize_roots(
         &client,

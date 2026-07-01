@@ -11741,6 +11741,22 @@ impl super::StorageCluster {
                 }
             });
 
+        let finalize_claim = node
+            .bucket_write_reservation_client()
+            .bucket_delete_finalize_claim(pg_id, bucket)?
+            .map(|record| BucketDeleteDebugFinalizeClaim {
+                matches_bucket: record.bucket == *bucket,
+                bucket: record.bucket,
+                bucket_incarnation_generation: record.bucket_incarnation_generation,
+                claim_id: record.claim_id,
+                cluster_epoch: record.cluster_epoch,
+                pg_id: record.pg_id,
+                claimed_at: record.claimed_at,
+                lease_deadline: record.lease_deadline,
+                attempt_count: record.attempt_count,
+                last_error: record.last_error,
+            });
+
         let attempt_outcome = node
             .bucket_write_reservation_client()
             .bucket_delete_attempt_outcome(pg_id, bucket)?;
@@ -11751,6 +11767,7 @@ impl super::StorageCluster {
             bucket_row,
             durable_write_drain,
             pending_metadata_command,
+            finalize_claim,
             attempt_outcome,
         })
     }

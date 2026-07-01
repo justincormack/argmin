@@ -8716,6 +8716,20 @@ impl PgMetadataStore for PgStore {
         )
     }
 
+    fn bucket_delete_finalize_claim(
+        &self,
+    ) -> Result<Option<BucketDeleteFinalizeClaimRecord>, MetadataError> {
+        self.query_row_cached_optional_metadata(
+            "SELECT bucket, bucket_incarnation_generation, claim_id, owner_token, \
+                    cluster_epoch, pg_id, claimed_at, lease_deadline, attempt_count, last_error \
+             FROM bucket_delete_finalize_claims \
+             WHERE singleton = 0",
+            [],
+            "bucket delete finalize claim",
+            bucket_delete_finalize_claim_from_row,
+        )
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn acquire_lifecycle_sweep_claim(
         &self,

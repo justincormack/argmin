@@ -2503,6 +2503,21 @@ pub struct BucketDeleteDebugDrain {
     pub lease_deadline: Option<u64>,
 }
 
+/// Durable bucket-delete finalizer claim fields included in local-debug output.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BucketDeleteDebugFinalizeClaim {
+    pub bucket: BucketName,
+    pub matches_bucket: bool,
+    pub bucket_incarnation_generation: u64,
+    pub claim_id: String,
+    pub cluster_epoch: ClusterEpoch,
+    pub pg_id: u32,
+    pub claimed_at: u64,
+    pub lease_deadline: Option<u64>,
+    pub attempt_count: u64,
+    pub last_error: Option<String>,
+}
+
 /// Pending bucket-PG metadata command fields included in local-debug output.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BucketDeleteDebugPendingCommand {
@@ -2521,6 +2536,7 @@ pub struct BucketDeleteDebugSnapshot {
     pub pg_id: u32,
     pub bucket_row: Option<BucketDeleteDebugBucketRow>,
     pub durable_write_drain: Option<BucketDeleteDebugDrain>,
+    pub finalize_claim: Option<BucketDeleteDebugFinalizeClaim>,
     pub pending_metadata_command: Option<BucketDeleteDebugPendingCommand>,
     pub attempt_outcome: Option<BucketDeleteAttemptOutcomeRecord>,
 }

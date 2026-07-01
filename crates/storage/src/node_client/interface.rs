@@ -324,6 +324,12 @@ pub(crate) trait BucketWriteReservationNodeClient: Send + Sync {
         claim: &BucketDeleteFinalizeClaimRecord,
     ) -> Result<(), BucketSnapshotLoadError>;
 
+    fn bucket_delete_finalize_claim(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+    ) -> Result<Option<BucketDeleteFinalizeClaimRecord>, BucketSnapshotLoadError>;
+
     fn get_lifecycle_sweep_roots(
         &self,
         pg_id: PgId,
@@ -1935,6 +1941,12 @@ pub(crate) trait StorageNodeClient:
         pg_id: PgId,
         claim: &BucketDeleteFinalizeClaimRecord,
     ) -> Result<(), BucketSnapshotLoadError>;
+
+    fn bucket_delete_finalize_claim(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+    ) -> Result<Option<BucketDeleteFinalizeClaimRecord>, BucketSnapshotLoadError>;
 
     fn get_lifecycle_sweep_roots(
         &self,

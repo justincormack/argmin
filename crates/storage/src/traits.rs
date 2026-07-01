@@ -641,6 +641,11 @@ pub(crate) trait PgMetadataStore {
         cluster_epoch: ClusterEpoch,
     ) -> Result<(), MetadataError>;
 
+    /// Read the current durable bucket-delete finalizer claim for diagnostics.
+    fn bucket_delete_finalize_claim(
+        &self,
+    ) -> Result<Option<BucketDeleteFinalizeClaimRecord>, MetadataError>;
+
     /// Acquire a durable lifecycle sweep claim for one bucket incarnation.
     #[allow(clippy::too_many_arguments)]
     fn acquire_lifecycle_sweep_claim(

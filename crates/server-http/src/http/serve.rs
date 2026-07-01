@@ -1212,6 +1212,27 @@ fn local_debug_bucket_delete_attempt_body(snapshot: &BucketDeleteDebugSnapshot) 
         None => body.push_str("pending_metadata_command=absent\n"),
     }
 
+    match &snapshot.finalize_claim {
+        Some(claim) => {
+            writeln!(
+                &mut body,
+                "finalize_claim=present bucket={:?} matches_bucket={} bucket_incarnation_generation={} claim_id={:?} cluster_epoch={} pg_id={} claimed_at={} lease_deadline={} attempt_count={} last_error={}",
+                claim.bucket.as_str(),
+                claim.matches_bucket,
+                claim.bucket_incarnation_generation,
+                claim.claim_id,
+                claim.cluster_epoch.get(),
+                claim.pg_id,
+                claim.claimed_at,
+                local_debug_optional_u64(claim.lease_deadline),
+                claim.attempt_count,
+                observability::escaped(claim.last_error.as_deref().unwrap_or("")),
+            )
+            .expect("write to String");
+        }
+        None => body.push_str("finalize_claim=absent\n"),
+    }
+
     match &snapshot.attempt_outcome {
         Some(record) => {
             writeln!(
@@ -5059,6 +5080,7 @@ mod tests {
             response.contains("pending_metadata_command=absent"),
             "{response}"
         );
+        assert!(response.contains("finalize_claim=absent"), "{response}");
         assert!(response.contains("attempt_outcome=absent"), "{response}");
         assert!(response.contains("pg_id="), "{response}");
     }
@@ -5088,6 +5110,18 @@ mod tests {
                 cluster_epoch: storage::ClusterEpoch::new(7).unwrap(),
                 pg_id: 3,
                 log_index: 88,
+            }),
+            finalize_claim: Some(storage::BucketDeleteDebugFinalizeClaim {
+                bucket: bucket.clone(),
+                matches_bucket: true,
+                bucket_incarnation_generation: 34,
+                claim_id: "finalize-claim-1".to_string(),
+                cluster_epoch: storage::ClusterEpoch::new(8).unwrap(),
+                pg_id: 3,
+                claimed_at: 1010,
+                lease_deadline: Some(2020),
+                attempt_count: 2,
+                last_error: Some("retry\nlater".to_string()),
             }),
             attempt_outcome: Some(storage::BucketDeleteAttemptOutcomeRecord {
                 bucket: bucket.clone(),
@@ -5123,6 +5157,12 @@ mod tests {
         );
         assert!(body.contains("matches_bucket=true"), "{body}");
         assert!(body.contains("log_index=88"), "{body}");
+        assert!(body.contains("finalize_claim=present"), "{body}");
+        assert!(body.contains("claim_id=\"finalize-claim-1\""), "{body}");
+        assert!(body.contains("claimed_at=1010"), "{body}");
+        assert!(body.contains("lease_deadline=2020"), "{body}");
+        assert!(body.contains("attempt_count=2"), "{body}");
+        assert!(body.contains(r#"last_error="retry\nlater""#), "{body}");
         assert!(body.contains("attempt_outcome=present present=1"), "{body}");
         assert!(body.contains("drain_id=\"delete-drain-1\""), "{body}");
         assert!(body.contains("cluster_epoch=7"), "{body}");

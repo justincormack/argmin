@@ -1082,6 +1082,31 @@ impl BucketWriteReservationNodeClient for UnixStorageNodeClient {
         )
     }
 
+    fn bucket_delete_finalize_claim(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+    ) -> Result<Option<BucketDeleteFinalizeClaimRecord>, BucketSnapshotLoadError> {
+        let request = StorageRpcBucketRequest {
+            node_id: self.node_id,
+            cluster_epoch: self.cluster_epoch,
+            pg_id,
+            bucket: bucket.clone(),
+        };
+        let payload = encode_bucket_request(&request);
+        let response = self
+            .rpc_request(StorageRpcMessageKind::BucketDeleteFinalizeClaimGet, payload)
+            .map_err(BucketSnapshotLoadError::Store)?;
+        let response = decode_bucket_delete_finalize_claim_optional_record_response(&response)
+            .map_err(|error| {
+                BucketSnapshotLoadError::Store(self.rpc_payload_error(
+                    "decode bucket delete finalize claim get response",
+                    error.to_string(),
+                ))
+            })?;
+        Ok(response.record)
+    }
+
     fn get_lifecycle_sweep_roots(
         &self,
         pg_id: PgId,
