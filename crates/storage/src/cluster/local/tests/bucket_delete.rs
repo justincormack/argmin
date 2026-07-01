@@ -4006,6 +4006,211 @@ fn begin_bucket_delete_adopts_preserved_post_reservation_frontier() {
 }
 
 #[test]
+fn begin_bucket_delete_adopts_preserved_initial_frontier_then_resets_before_stream_cleanup() {
+    let _serial = lock_bucket_scoped_hook_test();
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let pg_ids: Vec<u32> = (0..32).collect();
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &pg_ids, ec_shape).unwrap();
+    let (bucket, lower_key, later_key, pg_count) = {
+        let topology = map
+            .nodes
+            .get(&NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        let bucket = bucket_for_pg(topology, 1, "delete-initial-progress-adopt-");
+        let lower_key = key_for_object_pg(topology, &bucket, 0, "lower-");
+        let later_pg = topology.pg_count() - 1;
+        let later_key = key_for_object_pg(topology, &bucket, later_pg, "later-");
+        (bucket, lower_key, later_key, topology.pg_count())
+    };
+    assert!(
+        pg_count >= 32,
+        "test requires several exact-bucket drain chunks"
+    );
+    set_route_primary(&mut map, 1, NodeId::new(1));
+
+    let map = Arc::new(map);
+    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    create_test_bucket(&cluster, &bucket);
+    let initial_bucket = {
+        let bucket_pg = map
+            .node(NodeId::new(1))
+            .unwrap()
+            .storage_node()
+            .get_pg(1)
+            .unwrap();
+        crate::PgMetadataStore::head_bucket_raw(&*bucket_pg, &bucket).unwrap()
+    };
+
+    let hook_stage = Arc::new(AtomicUsize::new(0));
+    let first_frontier = Arc::new(AtomicUsize::new(0));
+    let reset_seen = Arc::new(AtomicBool::new(false));
+    let hook_stage_for_hook = Arc::clone(&hook_stage);
+    let first_frontier_for_hook = Arc::clone(&first_frontier);
+    let reset_seen_for_hook = Arc::clone(&reset_seen);
+    let _progress_hook_guard = cluster.test_install_after_bucket_delete_exact_drain_progress_hook(
+        Arc::new(move |phase, next_object_pg_id| {
+            match (hook_stage_for_hook.load(Ordering::SeqCst), phase) {
+                (0, crate::BucketDeleteAttemptPhase::Initial)
+                    if next_object_pg_id > 0 && next_object_pg_id < pg_count =>
+                {
+                    first_frontier_for_hook.store(next_object_pg_id as usize, Ordering::SeqCst);
+                    hook_stage_for_hook.store(1, Ordering::SeqCst);
+                    return Err(StoreError::RouteMapExpired {
+                        cluster_epoch: ClusterEpoch::INITIAL,
+                        valid_until_ms: 0,
+                        now_ms: 1,
+                    });
+                }
+                (1, crate::BucketDeleteAttemptPhase::Initial) if next_object_pg_id == pg_count => {
+                    hook_stage_for_hook.store(2, Ordering::SeqCst);
+                    return Err(StoreError::RouteMapExpired {
+                        cluster_epoch: ClusterEpoch::INITIAL,
+                        valid_until_ms: 0,
+                        now_ms: 1,
+                    });
+                }
+                (_, crate::BucketDeleteAttemptPhase::StreamCleanup) if next_object_pg_id == 0 => {
+                    reset_seen_for_hook.store(true, Ordering::SeqCst);
+                }
+                _ => {}
+            }
+            Ok(())
+        }),
+    );
+
+    let first_err = cluster.begin_bucket_delete(&bucket).unwrap_err();
+    assert!(
+        matches!(
+            first_err,
+            crate::BucketWriteDrainError::Store(StoreError::RouteMapExpired { .. })
+        ),
+        "first DeleteBucket should preserve the attempt on injected route expiry, got {first_err:?}"
+    );
+    let preserved_drain = {
+        let bucket_pg = map
+            .node(NodeId::new(1))
+            .unwrap()
+            .storage_node()
+            .get_pg(1)
+            .unwrap();
+        crate::PgMetadataStore::durable_bucket_write_drain(&*bucket_pg, &bucket)
+            .unwrap()
+            .expect("retryable failure should preserve the active delete drain")
+    };
+    let first_frontier = first_frontier.load(Ordering::SeqCst) as u32;
+    assert!(
+        first_frontier > 0 && first_frontier < pg_count,
+        "first attempt should persist a partial initial frontier, got {first_frontier}"
+    );
+    let initial_outcome = cluster
+        .test_bucket_delete_post_reservation_next_object_pg_id(
+            &crate::cluster::DurableBucketWriteDrain {
+                pg_id: 1,
+                record: preserved_drain.clone(),
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        initial_outcome,
+        Some(first_frontier),
+        "first retryable failure should persist the initial exact-bucket frontier"
+    );
+
+    let lower_pg_id = PgId::new(0);
+    let lower_command = MetadataCommandEnvelope::new(
+        cluster
+            .next_object_metadata_command_id(lower_pg_id)
+            .unwrap(),
+        MetadataCommandPayload::ReserveObjectGeneration(ReserveObjectGenerationCommand::new(
+            bucket.clone(),
+            lower_key,
+            crate::SessionId::try_from("87".repeat(16)).unwrap(),
+            crate::GenerationId::MIN,
+            crate::clock::current_time_millis(),
+        )),
+    );
+    insert_pending_metadata_command_for_test(&map, lower_pg_id, &bucket, &lower_command);
+
+    let later_pg_id = PgId::new(pg_count - 1);
+    let later_command = MetadataCommandEnvelope::new(
+        cluster
+            .next_object_metadata_command_id(later_pg_id)
+            .unwrap(),
+        MetadataCommandPayload::ReserveObjectGeneration(ReserveObjectGenerationCommand::new(
+            bucket.clone(),
+            later_key,
+            crate::SessionId::try_from("88".repeat(16)).unwrap(),
+            crate::GenerationId::MIN,
+            crate::clock::current_time_millis(),
+        )),
+    );
+    insert_pending_metadata_command_for_test(&map, later_pg_id, &bucket, &later_command);
+
+    let second_err = cluster.begin_bucket_delete(&bucket).unwrap_err();
+    assert!(
+        matches!(
+            second_err,
+            crate::BucketWriteDrainError::Store(StoreError::RouteMapExpired { .. })
+        ),
+        "second DeleteBucket should fail after completing the resumed initial scan, got {second_err:?}"
+    );
+    assert_eq!(
+        hook_stage.load(Ordering::SeqCst),
+        2,
+        "second attempt should reach the completed initial frontier"
+    );
+    assert!(
+        pending_metadata_command_for_test(&map, lower_pg_id, &bucket).is_some(),
+        "resumed initial scan must not revisit object PGs below the stored frontier"
+    );
+    assert!(
+        pending_metadata_command_for_test(&map, later_pg_id, &bucket).is_none(),
+        "resumed initial scan must drain object PGs at or above the stored frontier"
+    );
+
+    cluster
+        .begin_bucket_delete_if_current(
+            &bucket,
+            initial_bucket.bucket_execution_generation,
+            initial_bucket.bucket_incarnation_generation,
+        )
+        .unwrap();
+    assert!(
+        reset_seen.load(Ordering::SeqCst),
+        "successful retry should reset the exact-bucket frontier before stream cleanup"
+    );
+    assert!(
+        pending_metadata_command_for_test(&map, lower_pg_id, &bucket).is_none(),
+        "post-reset post-reservation scan should drain lower object PG work"
+    );
+    let bucket_pg = map
+        .node(NodeId::new(1))
+        .unwrap()
+        .storage_node()
+        .get_pg(1)
+        .unwrap();
+    let info = crate::PgMetadataStore::head_bucket_raw(&*bucket_pg, &bucket).unwrap();
+    assert_eq!(info.state, crate::BucketState::Deleting);
+    let outcome = crate::PgMetadataStore::bucket_delete_attempt_outcome(&*bucket_pg, &bucket)
+        .unwrap()
+        .expect("successful adopted attempt should record final outcome");
+    assert_eq!(
+        outcome.outcome,
+        crate::BucketDeleteAttemptOutcomeKind::MarkDeleting
+    );
+    assert_eq!(
+        outcome.post_reservation_next_object_pg_id,
+        Some(0),
+        "stream cleanup reset should be preserved in the final outcome"
+    );
+    assert_eq!(outcome.drain_id, preserved_drain.drain_id);
+}
+
+#[test]
 fn begin_bucket_delete_drains_pending_delete_marker_before_emptiness_decision() {
     let tmp = test_util::tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];

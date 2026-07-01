@@ -85,6 +85,7 @@ enum AbortMultipartUploadDrainMode {
 struct BucketDeleteExactDrainProgress<'a> {
     client: &'a dyn BucketWriteReservationNodeClient,
     drain: &'a super::DurableBucketWriteDrain,
+    phase: BucketDeleteAttemptPhase,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -189,6 +190,10 @@ pub type BucketDeletePostReservationProgressTestHook =
     Arc<dyn Fn(u32) -> Result<(), StoreError> + Send + Sync>;
 
 #[cfg(any(test, feature = "test-hooks"))]
+pub type BucketDeleteExactDrainProgressTestHook =
+    Arc<dyn Fn(BucketDeleteAttemptPhase, u32) -> Result<(), StoreError> + Send + Sync>;
+
+#[cfg(any(test, feature = "test-hooks"))]
 pub type BucketDeleteExactDrainStartTestHook =
     Arc<dyn Fn(bool, u32) -> Result<(), StoreError> + Send + Sync>;
 
@@ -238,6 +243,11 @@ static AFTER_BUCKET_DELETE_FINAL_VISIBILITY_PROVEN_HOOKS: OnceLock<
 #[cfg(any(test, feature = "test-hooks"))]
 static AFTER_BUCKET_DELETE_POST_RESERVATION_PROGRESS_HOOKS: OnceLock<
     Mutex<HashMap<usize, BucketDeletePostReservationProgressTestHook>>,
+> = OnceLock::new();
+
+#[cfg(any(test, feature = "test-hooks"))]
+static AFTER_BUCKET_DELETE_EXACT_DRAIN_PROGRESS_HOOKS: OnceLock<
+    Mutex<HashMap<usize, BucketDeleteExactDrainProgressTestHook>>,
 > = OnceLock::new();
 
 #[cfg(any(test, feature = "test-hooks"))]
@@ -297,6 +307,11 @@ pub struct BucketDeleteFinalVisibilityProvenTestHookGuard {
 
 #[cfg(any(test, feature = "test-hooks"))]
 pub struct BucketDeletePostReservationProgressTestHookGuard {
+    scope_id: usize,
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+pub struct BucketDeleteExactDrainProgressTestHookGuard {
     scope_id: usize,
 }
 
@@ -409,6 +424,18 @@ impl Drop for BucketDeleteFinalVisibilityProvenTestHookGuard {
 impl Drop for BucketDeletePostReservationProgressTestHookGuard {
     fn drop(&mut self) {
         let hooks = AFTER_BUCKET_DELETE_POST_RESERVATION_PROGRESS_HOOKS
+            .get_or_init(|| Mutex::new(HashMap::new()));
+        hooks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.scope_id);
+    }
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+impl Drop for BucketDeleteExactDrainProgressTestHookGuard {
+    fn drop(&mut self) {
+        let hooks = AFTER_BUCKET_DELETE_EXACT_DRAIN_PROGRESS_HOOKS
             .get_or_init(|| Mutex::new(HashMap::new()));
         hooks
             .lock()
@@ -595,6 +622,24 @@ fn maybe_run_after_bucket_delete_post_reservation_progress_hook(
         .cloned();
     if let Some(hook) = hook {
         hook(_next_object_pg_id)?;
+    }
+    Ok(())
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+fn maybe_run_after_bucket_delete_exact_drain_progress_hook(
+    _scope_id: usize,
+    _phase: BucketDeleteAttemptPhase,
+    _next_object_pg_id: u32,
+) -> Result<(), StoreError> {
+    let hook = AFTER_BUCKET_DELETE_EXACT_DRAIN_PROGRESS_HOOKS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&_scope_id)
+        .cloned();
+    if let Some(hook) = hook {
+        hook(_phase, _next_object_pg_id)?;
     }
     Ok(())
 }
@@ -959,6 +1004,20 @@ impl super::StorageCluster {
             .unwrap_or_else(|e| e.into_inner())
             .insert(scope_id, hook);
         BucketDeletePostReservationProgressTestHookGuard { scope_id }
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_install_after_bucket_delete_exact_drain_progress_hook(
+        &self,
+        hook: BucketDeleteExactDrainProgressTestHook,
+    ) -> BucketDeleteExactDrainProgressTestHookGuard {
+        let scope_id = self.metadata_command_apply_test_hook_scope_id();
+        let slot = AFTER_BUCKET_DELETE_EXACT_DRAIN_PROGRESS_HOOKS
+            .get_or_init(|| Mutex::new(HashMap::new()));
+        slot.lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(scope_id, hook);
+        BucketDeleteExactDrainProgressTestHookGuard { scope_id }
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
@@ -3189,11 +3248,13 @@ impl super::StorageCluster {
                     next_object_pg_id,
                 )?;
                 #[cfg(any(test, feature = "test-hooks"))]
-                maybe_run_after_bucket_delete_post_reservation_progress_hook(
-                    self.metadata_command_apply_test_hook_scope_id(),
-                    next_object_pg_id,
-                )
-                .map_err(BucketWriteDrainError::from)?;
+                if progress.phase == BucketDeleteAttemptPhase::PostReservationObjectDrain {
+                    maybe_run_after_bucket_delete_post_reservation_progress_hook(
+                        self.metadata_command_apply_test_hook_scope_id(),
+                        next_object_pg_id,
+                    )
+                    .map_err(BucketWriteDrainError::from)?;
+                }
             }
         }
         self.check_bucket_delete_begin_work_budget(
@@ -3233,6 +3294,7 @@ impl super::StorageCluster {
             BucketDeleteExactDrainProgress {
                 client: node.bucket_write_reservation_client().as_ref(),
                 drain,
+                phase: BucketDeleteAttemptPhase::PostReservationObjectDrain,
             },
             next_object_pg_id,
         )
@@ -3250,6 +3312,7 @@ impl super::StorageCluster {
         self.bucket_delete_post_reservation_next_object_pg_id(BucketDeleteExactDrainProgress {
             client: node.bucket_write_reservation_client().as_ref(),
             drain,
+            phase: BucketDeleteAttemptPhase::PostReservationObjectDrain,
         })
     }
 
@@ -3276,6 +3339,7 @@ impl super::StorageCluster {
             Some(BucketDeleteExactDrainProgress {
                 client: node.bucket_write_reservation_client().as_ref(),
                 drain,
+                phase: BucketDeleteAttemptPhase::PostReservationObjectDrain,
             }),
         )
     }
@@ -3384,9 +3448,10 @@ impl super::StorageCluster {
             .unwrap_or_else(|| {
                 (
                     BucketDeleteAttemptOutcomeKind::Retryable,
-                    BucketDeleteAttemptPhase::PostReservationObjectDrain,
+                    progress.phase,
                     format!(
-                        "post-reservation exact-bucket drain progressed to object PG {next_object_pg_id}"
+                        "{:?} exact-bucket drain progressed to object PG {next_object_pg_id}",
+                        progress.phase
                     ),
                 )
             });
@@ -3420,6 +3485,13 @@ impl super::StorageCluster {
             );
             return Err(bucket_snapshot_error_to_bucket_write_drain_error(error));
         }
+        #[cfg(any(test, feature = "test-hooks"))]
+        maybe_run_after_bucket_delete_exact_drain_progress_hook(
+            self.metadata_command_apply_test_hook_scope_id(),
+            progress.phase,
+            next_object_pg_id,
+        )
+        .map_err(BucketWriteDrainError::from)?;
         Ok(())
     }
 
@@ -4106,7 +4178,11 @@ impl super::StorageCluster {
                                 bucket,
                                 Some(started),
                                 &mut work_budget,
-                                None,
+                                Some(BucketDeleteExactDrainProgress {
+                                    client: node_store.bucket_write_reservation_client().as_ref(),
+                                    drain: &durable_drain,
+                                    phase: BucketDeleteAttemptPhase::Initial,
+                                }),
                             ) {
                             Ok(()) => {}
                             Err(BucketWriteDrainError::Store(
@@ -4185,7 +4261,13 @@ impl super::StorageCluster {
                                     bucket,
                                     Some(started),
                                     &mut work_budget,
-                                    None,
+                                    Some(BucketDeleteExactDrainProgress {
+                                        client: node_store
+                                            .bucket_write_reservation_client()
+                                            .as_ref(),
+                                        drain: &durable_drain,
+                                        phase: BucketDeleteAttemptPhase::Initial,
+                                    }),
                                 ) {
                                 Ok(()) => {}
                                 Err(BucketWriteDrainError::Store(
@@ -4276,6 +4358,14 @@ impl super::StorageCluster {
                             BucketDeleteAttemptPhase::StreamCleanup,
                             "stream cleanup started".to_string(),
                         );
+                        self.record_bucket_delete_post_reservation_next_object_pg_id(
+                            BucketDeleteExactDrainProgress {
+                                client: node_store.bucket_write_reservation_client().as_ref(),
+                                drain: &durable_drain,
+                                phase: BucketDeleteAttemptPhase::StreamCleanup,
+                            },
+                            0,
+                        )?;
                         can_resume_at_stream_cleanup = true;
                         match self.cleanup_abandoned_put_object_stream_uploads_for_bucket(bucket)? {
                             PutObjectStreamUploadCleanup::Live(source) => {
@@ -4344,6 +4434,7 @@ impl super::StorageCluster {
                                 Some(BucketDeleteExactDrainProgress {
                                     client: node_store.bucket_write_reservation_client().as_ref(),
                                     drain: &durable_drain,
+                                    phase: BucketDeleteAttemptPhase::PostReservationObjectDrain,
                                 }),
                             ) {
                             Ok(()) => {}
@@ -4373,6 +4464,7 @@ impl super::StorageCluster {
                         let post_reservation_progress = BucketDeleteExactDrainProgress {
                             client: node_store.bucket_write_reservation_client().as_ref(),
                             drain: &durable_drain,
+                            phase: BucketDeleteAttemptPhase::PostReservationObjectDrain,
                         };
                         self.record_bucket_delete_post_reservation_next_object_pg_id(
                             post_reservation_progress,

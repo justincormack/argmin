@@ -1697,23 +1697,52 @@ fn build_control_plane_storage_node_process_config(
     let observed_epoch = ClusterEpoch::INITIAL;
     let lease_ms = u64::try_from(config.control_plane_heartbeat_lease_duration.as_millis())
         .map_err(|_| "ARGMIN_CONTROL_PLANE_HEARTBEAT_LEASE_MS is too large".to_string())?;
-    let heartbeat = node
-        .control_plane_heartbeat(
-            node_id,
-            node_incarnation,
-            configured_socket_path,
-            observed_epoch,
-            lease_ms,
-            std::iter::empty(),
-        )
-        .map_err(|error| format!("failed to build storage-node startup heartbeat: {error}"))?;
-    let refresh = UnixControlPlaneClient::new(control_plane_socket_path)
-        .refresh_node_heartbeat(heartbeat, storage::clock::current_time_millis())
-        .map_err(|error| {
-            format!(
-                "failed to refresh control-plane runtime map from {control_plane_socket_path}: {error}"
+    let retry_deadline = control_plane_startup_retry_deadline(config);
+    let retry_delay = control_plane_startup_retry_delay(config);
+    let started_at = Instant::now();
+    let mut attempts = 0_u32;
+    let refresh = loop {
+        attempts = attempts.saturating_add(1);
+        let heartbeat = node
+            .control_plane_heartbeat(
+                node_id,
+                node_incarnation,
+                configured_socket_path,
+                observed_epoch,
+                lease_ms,
+                std::iter::empty(),
             )
-        })?;
+            .map_err(|error| format!("failed to build storage-node startup heartbeat: {error}"))?;
+        match UnixControlPlaneClient::new(control_plane_socket_path)
+            .refresh_node_heartbeat(heartbeat, storage::clock::current_time_millis())
+            .map_err(|error| {
+                format!(
+                    "failed to refresh control-plane runtime map from {control_plane_socket_path}: {error}"
+                )
+            }) {
+            Ok(refresh) => {
+                if attempts > 1 {
+                    eprintln!(
+                        "argmin-s3 storage-node control-plane runtime map became ready after {} attempts",
+                        attempts
+                    );
+                }
+                break refresh;
+            }
+            Err(error)
+                if control_plane_startup_error_is_retryable(&error)
+                    && started_at.elapsed() < retry_deadline =>
+            {
+                if attempts == 1 || attempts.is_multiple_of(10) {
+                    eprintln!(
+                        "argmin-s3 storage-node waiting for control-plane runtime map during startup: {error}"
+                    );
+                }
+                thread::sleep(retry_delay);
+            }
+            Err(error) => return Err(error),
+        }
+    };
     let (_lease, runtime_map) = refresh.into_parts();
     let node_config = StorageNodeProcessConfig::from_runtime_map(
         node_id,
@@ -1815,6 +1844,10 @@ async fn build_remote_frontend_storage_cluster_retrying_startup(
 }
 
 fn frontend_control_plane_startup_retry_deadline(config: &ServerConfig) -> Duration {
+    control_plane_startup_retry_deadline(config)
+}
+
+fn control_plane_startup_retry_deadline(config: &ServerConfig) -> Duration {
     let refresh_budget = config.control_plane_refresh_interval.saturating_mul(20);
     let lease_budget = config
         .control_plane_heartbeat_lease_duration
@@ -1825,6 +1858,10 @@ fn frontend_control_plane_startup_retry_deadline(config: &ServerConfig) -> Durat
 }
 
 fn frontend_control_plane_startup_retry_delay(config: &ServerConfig) -> Duration {
+    control_plane_startup_retry_delay(config)
+}
+
+fn control_plane_startup_retry_delay(config: &ServerConfig) -> Duration {
     config
         .control_plane_refresh_interval
         .max(Duration::from_millis(50))
@@ -1832,7 +1869,12 @@ fn frontend_control_plane_startup_retry_delay(config: &ServerConfig) -> Duration
 }
 
 fn frontend_control_plane_startup_error_is_retryable(error: &str) -> bool {
+    control_plane_startup_error_is_retryable(error)
+}
+
+fn control_plane_startup_error_is_retryable(error: &str) -> bool {
     error.starts_with("failed to fetch control-plane runtime map from ")
+        || error.starts_with("failed to refresh control-plane runtime map from ")
         || control_plane_runtime_map_not_ready_for_serving(error)
         || error == "control-plane runtime map has no routed nodes"
 }
@@ -2695,6 +2737,38 @@ mod tests {
         })
     }
 
+    fn serve_control_plane_storage_node_startup_refresh_after_dropped_connection(
+        socket_path: PathBuf,
+        node_id: NodeId,
+    ) -> std::thread::JoinHandle<Vec<u64>> {
+        let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+        std::thread::spawn(move || {
+            use storage::control_plane::{handle_control_plane_unix_stream, NodeMembershipState};
+            use storage::PgId;
+
+            let state_path = socket_path.with_extension("state");
+            let store = FileControlPlaneStore::new(state_path);
+            let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+            authority
+                .set_node_membership(node_id, NodeMembershipState::Active)
+                .unwrap();
+            authority
+                .set_pg_acting_set(PgId::new(0), vec![node_id])
+                .unwrap();
+
+            let (dropped_stream, _addr) = listener.accept().unwrap();
+            drop(dropped_stream);
+
+            let (mut stream, _addr) = listener.accept().unwrap();
+            handle_control_plane_unix_stream(&mut authority, &mut stream, 1_000).unwrap();
+            vec![authority
+                .snapshot()
+                .node(node_id)
+                .unwrap()
+                .node_incarnation()]
+        })
+    }
+
     fn serve_frontend_control_plane_runtime_map_refresh(
         socket_path: PathBuf,
         node_id: NodeId,
@@ -2988,6 +3062,41 @@ mod tests {
             assert_eq!(node_config.pg_ids, vec![0]);
             assert_eq!(node_config.pg_routes[0].state, PgState::Peering);
         }
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn storage_node_control_plane_startup_retries_transient_refresh_failure() {
+        let tmp = short_unix_socket_test_dir("sbr");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let socket_path = tmp.join("cp.sock");
+        let endpoint = tmp.join("n0.sock");
+        let server = serve_control_plane_storage_node_startup_refresh_after_dropped_connection(
+            socket_path.clone(),
+            NodeId::new(0),
+        );
+        let ec_config = EcConfig::new(1, 0).unwrap();
+        let mut config = test_server_config();
+        config.process_role = ProcessRole::StorageNode;
+        config.local_node_count = 1;
+        config.pg_count = 1;
+        config.storage_pg_ids = vec![0];
+        config.storage_node_id = Some(0);
+        config.storage_node_data_dir = Some(tmp.join("node-0-data").display().to_string());
+        config.storage_node_socket_path = Some(endpoint.display().to_string());
+        config.control_plane_socket_path = Some(socket_path.display().to_string());
+        config.control_plane_refresh_interval = std::time::Duration::from_millis(1);
+
+        let (node_config, control_plane_node_incarnation) =
+            build_storage_node_process_config(&config, &ec_config).unwrap();
+
+        let observed_incarnations = server.join().unwrap();
+        assert_eq!(control_plane_node_incarnation, Some(1));
+        assert_eq!(observed_incarnations, vec![1]);
+        assert_eq!(node_config.node_id, NodeId::new(0));
+        assert_eq!(node_config.socket_path, endpoint);
+        assert_eq!(node_config.pg_ids, vec![0]);
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }
