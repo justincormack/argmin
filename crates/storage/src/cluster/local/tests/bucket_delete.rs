@@ -3384,6 +3384,126 @@ fn begin_bucket_delete_adopts_final_visibility_proven_without_repeating_visibili
 }
 
 #[test]
+fn begin_bucket_delete_renews_drain_after_final_visibility_proof_before_retryable_exit() {
+    let _serial = lock_bucket_scoped_hook_test();
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2], ec_shape).unwrap();
+    let bucket = {
+        let topology = map
+            .nodes
+            .get(&NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        bucket_for_pg(topology, 1, "delete-final-visibility-renew-")
+    };
+    set_route_primary(&mut map, 1, NodeId::new(1));
+
+    let map = Arc::new(map);
+    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    create_test_bucket(&cluster, &bucket);
+    let clock = Arc::new(crate::clock::test_time_override_guard(1_000));
+    let advanced_during_visibility = Arc::new(AtomicBool::new(false));
+    let advanced_during_visibility_for_hook = Arc::clone(&advanced_during_visibility);
+    let clock_for_visibility_hook = Arc::clone(&clock);
+    let visibility_hook_guard =
+        cluster.test_install_before_bucket_delete_final_visibility_hook(Arc::new(move || {
+            clock_for_visibility_hook.set(12_000);
+            advanced_during_visibility_for_hook.store(true, Ordering::SeqCst);
+            Ok(())
+        }));
+    let proven_hook_guard =
+        cluster.test_install_after_bucket_delete_final_visibility_proven_hook(Arc::new(|| {
+            Err(StoreError::MetadataCommandContention {
+                context: "injected retryable error after final visibility proof",
+            })
+        }));
+
+    let err = cluster.begin_bucket_delete(&bucket).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            crate::BucketWriteDrainError::Store(StoreError::MetadataCommandContention {
+                context: "injected retryable error after final visibility proof"
+            })
+        ),
+        "expected injected retryable error, got {err:?}"
+    );
+    assert!(
+        advanced_during_visibility.load(Ordering::SeqCst),
+        "test must advance logical time during final visibility"
+    );
+    drop(proven_hook_guard);
+    drop(visibility_hook_guard);
+
+    let bucket_pg_id = PgId::new(cluster.bucket_metadata_pg_id(&bucket));
+    let bucket_pg_primary = map
+        .metadata_pg_primary_node(crate::ClusterEpoch::INITIAL, bucket_pg_id)
+        .unwrap();
+    let bucket_pg = bucket_pg_primary
+        .storage_node()
+        .get_pg(bucket_pg_id.get())
+        .unwrap();
+    let preserved_drain = crate::PgMetadataStore::durable_bucket_write_drain(&*bucket_pg, &bucket)
+        .unwrap()
+        .expect("retryable final visibility proof should preserve the delete drain");
+    let preserved_deadline = preserved_drain
+        .lease_deadline
+        .expect("preserved delete drain should remain leased");
+    assert!(
+        preserved_deadline > 20_000,
+        "final visibility proof should renew the drain for a later retry; deadline={preserved_deadline}"
+    );
+    let outcome = crate::PgMetadataStore::bucket_delete_attempt_outcome(&*bucket_pg, &bucket)
+        .unwrap()
+        .expect("retryable final visibility proof should record an attempt outcome");
+    assert_eq!(
+        outcome.phase,
+        crate::BucketDeleteAttemptPhase::FinalVisibilityProven
+    );
+    assert_eq!(outcome.drain_id, preserved_drain.drain_id);
+    drop(bucket_pg);
+
+    clock.set(20_000);
+    let visibility_reran = Arc::new(AtomicBool::new(false));
+    let visibility_reran_for_hook = Arc::clone(&visibility_reran);
+    let _visibility_retry_hook_guard = cluster
+        .test_install_before_bucket_delete_final_visibility_hook(Arc::new(move || {
+            visibility_reran_for_hook.store(true, Ordering::SeqCst);
+            Err(StoreError::Io {
+                context: "unexpected final visibility rerun after preserved proof",
+                source: std::io::Error::other("final visibility should already be proven"),
+            })
+        }));
+
+    cluster
+        .begin_bucket_delete(&bucket)
+        .expect("retry should adopt the preserved final-visibility proof");
+    assert!(
+        !visibility_reran.load(Ordering::SeqCst),
+        "retry should not rerun final visibility while the preserved drain is live"
+    );
+    let bucket_pg = map
+        .node(NodeId::new(1))
+        .unwrap()
+        .storage_node()
+        .get_pg(bucket_pg_id.get())
+        .unwrap();
+    let info = crate::PgMetadataStore::head_bucket_raw(&*bucket_pg, &bucket).unwrap();
+    assert_eq!(info.state, crate::BucketState::Deleting);
+    let final_outcome = crate::PgMetadataStore::bucket_delete_attempt_outcome(&*bucket_pg, &bucket)
+        .unwrap()
+        .expect("successful adopted DeleteBucket begin should record terminal outcome");
+    assert_eq!(
+        final_outcome.outcome,
+        crate::BucketDeleteAttemptOutcomeKind::MarkDeleting
+    );
+    assert_eq!(final_outcome.drain_id, preserved_drain.drain_id);
+}
+
+#[test]
 fn begin_bucket_delete_adopts_stream_cleanup_phase_and_revalidates_after_reservations() {
     let _serial = lock_bucket_scoped_hook_test();
     let tmp = test_util::tempdir();

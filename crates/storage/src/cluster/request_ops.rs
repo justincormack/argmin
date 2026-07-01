@@ -181,6 +181,10 @@ pub type BucketDeleteFinalVisibilityStartTestHook =
     Arc<dyn Fn() -> Result<(), StoreError> + Send + Sync>;
 
 #[cfg(any(test, feature = "test-hooks"))]
+pub type BucketDeleteFinalVisibilityProvenTestHook =
+    Arc<dyn Fn() -> Result<(), StoreError> + Send + Sync>;
+
+#[cfg(any(test, feature = "test-hooks"))]
 pub type BucketDeletePostReservationProgressTestHook =
     Arc<dyn Fn(u32) -> Result<(), StoreError> + Send + Sync>;
 
@@ -224,6 +228,11 @@ static BEFORE_BUCKET_DELETE_COMMAND_ID_HOOKS: OnceLock<
 #[cfg(any(test, feature = "test-hooks"))]
 static BEFORE_BUCKET_DELETE_FINAL_VISIBILITY_HOOKS: OnceLock<
     Mutex<HashMap<usize, BucketDeleteFinalVisibilityStartTestHook>>,
+> = OnceLock::new();
+
+#[cfg(any(test, feature = "test-hooks"))]
+static AFTER_BUCKET_DELETE_FINAL_VISIBILITY_PROVEN_HOOKS: OnceLock<
+    Mutex<HashMap<usize, BucketDeleteFinalVisibilityProvenTestHook>>,
 > = OnceLock::new();
 
 #[cfg(any(test, feature = "test-hooks"))]
@@ -278,6 +287,11 @@ pub(crate) struct BucketDeleteCommandIdTestHookGuard {
 
 #[cfg(any(test, feature = "test-hooks"))]
 pub struct BucketDeleteFinalVisibilityStartTestHookGuard {
+    scope_id: usize,
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+pub struct BucketDeleteFinalVisibilityProvenTestHookGuard {
     scope_id: usize,
 }
 
@@ -372,6 +386,18 @@ impl Drop for BucketDeleteFinalVisibilityStartTestHookGuard {
     fn drop(&mut self) {
         let hooks =
             BEFORE_BUCKET_DELETE_FINAL_VISIBILITY_HOOKS.get_or_init(|| Mutex::new(HashMap::new()));
+        hooks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.scope_id);
+    }
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+impl Drop for BucketDeleteFinalVisibilityProvenTestHookGuard {
+    fn drop(&mut self) {
+        let hooks = AFTER_BUCKET_DELETE_FINAL_VISIBILITY_PROVEN_HOOKS
+            .get_or_init(|| Mutex::new(HashMap::new()));
         hooks
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -529,6 +555,22 @@ fn maybe_run_before_bucket_delete_final_visibility_hook(
     _scope_id: usize,
 ) -> Result<(), StoreError> {
     let hook = BEFORE_BUCKET_DELETE_FINAL_VISIBILITY_HOOKS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&_scope_id)
+        .cloned();
+    if let Some(hook) = hook {
+        hook()?;
+    }
+    Ok(())
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+fn maybe_run_after_bucket_delete_final_visibility_proven_hook(
+    _scope_id: usize,
+) -> Result<(), StoreError> {
+    let hook = AFTER_BUCKET_DELETE_FINAL_VISIBILITY_PROVEN_HOOKS
         .get_or_init(|| Mutex::new(HashMap::new()))
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -889,6 +931,20 @@ impl super::StorageCluster {
             .unwrap_or_else(|e| e.into_inner())
             .insert(scope_id, hook);
         BucketDeleteFinalVisibilityStartTestHookGuard { scope_id }
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_install_after_bucket_delete_final_visibility_proven_hook(
+        &self,
+        hook: BucketDeleteFinalVisibilityProvenTestHook,
+    ) -> BucketDeleteFinalVisibilityProvenTestHookGuard {
+        let scope_id = self.metadata_command_apply_test_hook_scope_id();
+        let slot = AFTER_BUCKET_DELETE_FINAL_VISIBILITY_PROVEN_HOOKS
+            .get_or_init(|| Mutex::new(HashMap::new()));
+        slot.lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(scope_id, hook);
+        BucketDeleteFinalVisibilityProvenTestHookGuard { scope_id }
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
@@ -4504,6 +4560,21 @@ impl super::StorageCluster {
                         "visibility_check_done",
                         format!("iteration={loop_iteration}"),
                     );
+                    Self::emit_bucket_delete_begin_loop_step(
+                        bucket,
+                        pg_id,
+                        started,
+                        "heartbeat_after_visibility_check_start",
+                        format!("iteration={loop_iteration}"),
+                    );
+                    durable_drain = self.heartbeat_durable_bucket_delete_drain(&durable_drain)?;
+                    Self::emit_bucket_delete_begin_loop_step(
+                        bucket,
+                        pg_id,
+                        started,
+                        "heartbeat_after_visibility_check_done",
+                        format!("iteration={loop_iteration}"),
+                    );
                     attempt_phase = BucketDeleteAttemptPhase::FinalVisibilityProven;
                     self.record_bucket_delete_attempt_outcome_for_drain_with_client(
                         node_store.bucket_write_reservation_client().as_ref(),
@@ -4513,6 +4584,11 @@ impl super::StorageCluster {
                         "final visibility check proven".to_string(),
                     );
                     can_resume_at_mark_deleting = true;
+                    #[cfg(any(test, feature = "test-hooks"))]
+                    maybe_run_after_bucket_delete_final_visibility_proven_hook(
+                        self.metadata_command_apply_test_hook_scope_id(),
+                    )
+                    .map_err(BucketWriteDrainError::from)?;
                     self.check_bucket_delete_begin_work_budget(
                         bucket,
                         Some(started),
