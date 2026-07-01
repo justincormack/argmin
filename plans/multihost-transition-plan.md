@@ -9925,6 +9925,15 @@ Phase 12.1 progress:
   rather than the full service directory. Bootstrap and shutdown lookup still
   use the full service surface, but post-bootstrap routed clients no longer
   carry a capability that can fetch bootstrap/lifecycle services.
+- Narrowed the routing client's observer dependency to a status-only authority
+  handle. Routed command/read/status and membership operations already use the
+  directory-selected serving routed authority, while observer-local diagnostics
+  no longer require handing the client bootstrap, wait, or shutdown methods.
+- Split bootstrap/lifecycle operations from leader-routed membership admin
+  operations at the authority trait boundary. The full admin handle still
+  composes both surfaces for callers that need it, while tests now exercise a
+  lifecycle-only handle for initialization checks, applied-index/leader waits,
+  and shutdown.
 
 1. define the replicated control-plane state machine:
    - state includes cluster epoch, PG count, PG state, PG acting sets, node
