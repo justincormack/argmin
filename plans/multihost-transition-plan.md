@@ -9858,6 +9858,11 @@ Phase 12.1 progress:
   capability that is safe for the leader-routing handle to implement. The
   directory smoke now proves that narrow handle can transfer leadership and
   replace voters through the routed client.
+- Added a composed object-safe routed-authority trait and cloneable handle for
+  post-bootstrap clients that need linearized command/read/status access plus
+  leader-routed membership operations. The directory smoke now drives a routed
+  command, read, status, and voter replacement through this single capability,
+  while bootstrap remains on the full service/admin surface.
 - Added an object-safe status-list capability to the OpenRaft authority service
   directory. This gives future RPC/admin wiring a narrow cluster-status surface
   that can enumerate known raft authorities without naming the in-memory test

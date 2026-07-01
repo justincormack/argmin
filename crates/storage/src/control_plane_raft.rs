@@ -179,6 +179,16 @@ impl<T> ControlPlaneRaftAuthorityService for T where
 {
 }
 
+pub trait ControlPlaneRaftRoutedAuthority:
+    ControlPlaneRaftLinearizedAuthority + ControlPlaneRaftLeaderRoutedAdmin
+{
+}
+
+impl<T> ControlPlaneRaftRoutedAuthority for T where
+    T: ControlPlaneRaftLinearizedAuthority + ControlPlaneRaftLeaderRoutedAdmin
+{
+}
+
 pub trait ControlPlaneRaftAuthorityStatusListSource {
     fn authority_statuses(
         &self,
@@ -457,6 +467,97 @@ impl fmt::Debug for ControlPlaneRaftLeaderRoutedAdminHandle {
 }
 
 impl ControlPlaneRaftLeaderRoutedAdmin for ControlPlaneRaftLeaderRoutedAdminHandle {
+    fn replace_voters(
+        &self,
+        voters: BTreeSet<ControlPlaneRaftNodeId>,
+        retain_removed_voters_as_learners: bool,
+    ) -> ControlPlaneRaftFuture<'_, Result<LogIdOf<ControlPlaneRaftTypeConfig>, ControlPlaneError>>
+    {
+        self.inner
+            .replace_voters(voters, retain_removed_voters_as_learners)
+    }
+
+    fn add_learner(
+        &self,
+        node_id: ControlPlaneRaftNodeId,
+        node: BasicNode,
+        wait_for_catch_up: bool,
+    ) -> ControlPlaneRaftFuture<'_, Result<LogIdOf<ControlPlaneRaftTypeConfig>, ControlPlaneError>>
+    {
+        self.inner.add_learner(node_id, node, wait_for_catch_up)
+    }
+
+    fn transfer_leadership_to(
+        &self,
+        node_id: ControlPlaneRaftNodeId,
+    ) -> ControlPlaneRaftFuture<'_, Result<(), ControlPlaneError>> {
+        self.inner.transfer_leadership_to(node_id)
+    }
+}
+
+#[derive(Clone)]
+pub struct ControlPlaneRaftRoutedAuthorityHandle {
+    inner: Arc<dyn ControlPlaneRaftRoutedAuthority + Send + Sync>,
+}
+
+impl ControlPlaneRaftRoutedAuthorityHandle {
+    pub fn new<T>(authority: Arc<T>) -> Self
+    where
+        T: ControlPlaneRaftRoutedAuthority + Send + Sync + 'static,
+    {
+        Self { inner: authority }
+    }
+
+    pub fn from_routed_authority(
+        authority: Arc<dyn ControlPlaneRaftRoutedAuthority + Send + Sync>,
+    ) -> Self {
+        Self { inner: authority }
+    }
+
+    #[must_use]
+    pub fn as_routed_authority(
+        &self,
+    ) -> &(dyn ControlPlaneRaftRoutedAuthority + Send + Sync + 'static) {
+        &*self.inner
+    }
+}
+
+impl fmt::Debug for ControlPlaneRaftRoutedAuthorityHandle {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ControlPlaneRaftRoutedAuthorityHandle")
+            .finish_non_exhaustive()
+    }
+}
+
+impl ControlPlaneRaftLinearizedCommandSink for ControlPlaneRaftRoutedAuthorityHandle {
+    fn submit_control_plane_command(
+        &self,
+        command: ControlPlaneCommand,
+    ) -> ControlPlaneRaftFuture<'_, Result<SubmittedControlPlaneRaftCommand, ControlPlaneError>>
+    {
+        self.inner.submit_control_plane_command(command)
+    }
+}
+
+impl ControlPlaneRaftLinearizedRuntimeMapSource for ControlPlaneRaftRoutedAuthorityHandle {
+    fn linearized_runtime_map_snapshot(
+        &self,
+        issued_at_ms: u64,
+    ) -> ControlPlaneRaftFuture<'_, Result<ClusterRuntimeMapSnapshot, ControlPlaneError>> {
+        self.inner.linearized_runtime_map_snapshot(issued_at_ms)
+    }
+}
+
+impl ControlPlaneRaftAuthorityStatusSource for ControlPlaneRaftRoutedAuthorityHandle {
+    fn status(
+        &self,
+    ) -> ControlPlaneRaftFuture<'_, Result<ControlPlaneRaftAuthorityStatus, ControlPlaneError>>
+    {
+        self.inner.status()
+    }
+}
+
+impl ControlPlaneRaftLeaderRoutedAdmin for ControlPlaneRaftRoutedAuthorityHandle {
     fn replace_voters(
         &self,
         voters: BTreeSet<ControlPlaneRaftNodeId>,
@@ -5462,6 +5563,9 @@ mod tests {
             let routed_admin =
                 ControlPlaneRaftLeaderRoutedAdminHandle::new(Arc::new(routed_client.clone()));
             let leader_routed_admin = routed_admin.as_leader_routed_admin();
+            let routed_authority_handle =
+                ControlPlaneRaftRoutedAuthorityHandle::new(Arc::new(routed_client.clone()));
+            let routed_authority = routed_authority_handle.as_routed_authority();
             let bootstrap = expect_bounded_control_plane_raft(
                 routed_client.submit_control_plane_command(
                     ControlPlaneCommand::BootstrapInitialClusterMap {
@@ -5566,7 +5670,7 @@ mod tests {
             assert_eq!(serving_status.node_id(), 412);
             assert!(serving_status.linearized_authority_serving());
             let routed_write = expect_bounded_control_plane_raft(
-                routed_client.submit_control_plane_command(
+                routed_authority.submit_control_plane_command(
                     ControlPlaneCommand::MarkNodeAvailability {
                         node_id: NodeId::new(411),
                         availability: NodeAvailabilityState::Unavailable,
@@ -5585,7 +5689,7 @@ mod tests {
             let follower_status = follower_service.status().await.unwrap();
             assert_eq!(follower_status.current_leader(), Some(412));
             let routed_status = expect_bounded_control_plane_raft(
-                routed_client.status(),
+                routed_authority.status(),
                 operation_timeout,
                 "authority service directory routed status after transfer",
             )
@@ -5603,7 +5707,7 @@ mod tests {
             assert_eq!(observer_status.current_leader(), Some(412));
             assert!(!observer_status.local_leader());
             let runtime_map = expect_bounded_control_plane_raft(
-                routed_client.linearized_runtime_map_snapshot(91_000),
+                routed_authority.linearized_runtime_map_snapshot(91_000),
                 operation_timeout,
                 "authority service directory routed runtime map read",
             )
@@ -5628,7 +5732,7 @@ mod tests {
                 Some(91_001)
             );
             let routed_membership_log_id = expect_bounded_control_plane_raft(
-                leader_routed_admin.replace_voters(BTreeSet::from([412]), false),
+                routed_authority.replace_voters(BTreeSet::from([412]), false),
                 operation_timeout,
                 "authority service directory routed voter replacement",
             )
