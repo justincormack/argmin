@@ -9934,6 +9934,11 @@ Phase 12.1 progress:
   composes both surfaces for callers that need it, while tests now exercise a
   lifecycle-only handle for initialization checks, applied-index/leader waits,
   and shutdown.
+- Added an object-safe lifecycle-directory capability for explicit node
+  lifecycle lookup. The full service directory still exists for bootstrap/full
+  service callers, but tests now resolve lifecycle-only handles for
+  applied-index waits, leader-observation waits, and shutdown instead of
+  carrying command/read/status capability into those paths.
 
 1. define the replicated control-plane state machine:
    - state includes cluster epoch, PG count, PG state, PG acting sets, node
