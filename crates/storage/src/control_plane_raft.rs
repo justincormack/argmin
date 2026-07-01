@@ -3473,8 +3473,13 @@ mod tests {
 
     #[derive(Debug, Clone, Default)]
     struct InMemoryAuthorityServiceDirectory {
-        services:
-            Arc<Mutex<BTreeMap<ControlPlaneRaftNodeId, ControlPlaneRaftAuthorityServiceHandle>>>,
+        entries: Arc<Mutex<BTreeMap<ControlPlaneRaftNodeId, InMemoryAuthorityServiceEntry>>>,
+    }
+
+    #[derive(Debug, Clone)]
+    struct InMemoryAuthorityServiceEntry {
+        service: ControlPlaneRaftAuthorityServiceHandle,
+        routed_authority: ControlPlaneRaftRoutedAuthorityHandle,
     }
 
     impl InMemoryAuthorityServiceDirectory {
@@ -3483,7 +3488,15 @@ mod tests {
             node_id: ControlPlaneRaftNodeId,
             service: ControlPlaneRaftAuthorityServiceHandle,
         ) {
-            self.services.lock().unwrap().insert(node_id, service);
+            let routed_authority =
+                ControlPlaneRaftRoutedAuthorityHandle::new(Arc::new(service.clone()));
+            self.entries.lock().unwrap().insert(
+                node_id,
+                InMemoryAuthorityServiceEntry {
+                    service,
+                    routed_authority,
+                },
+            );
         }
     }
 
@@ -3498,19 +3511,19 @@ mod tests {
             >,
         > {
             Box::pin(async move {
-                let services = {
-                    let services =
-                        self.services
+                let entries = {
+                    let entries =
+                        self.entries
                             .lock()
                             .map_err(|_| ControlPlaneError::RpcRemote {
                                 message: "in-memory test authority service directory lock poisoned"
                                     .to_string(),
                             })?;
-                    services.clone()
+                    entries.clone()
                 };
                 let mut statuses = BTreeMap::new();
-                for (node_id, service) in services {
-                    let status = service.status().await.map_err(|error| {
+                for (node_id, entry) in entries {
+                    let status = entry.service.status().await.map_err(|error| {
                         ControlPlaneError::RpcRemote {
                             message: format!(
                                 "in-memory test authority service directory status for node {node_id} failed: {error:?}"
@@ -3533,19 +3546,48 @@ mod tests {
             Result<ControlPlaneRaftAuthorityServiceHandle, ControlPlaneError>,
         > {
             let result = (|| {
-                let services = self
-                    .services
+                let entries = self
+                    .entries
                     .lock()
                     .map_err(|_| ControlPlaneError::RpcRemote {
                         message: "in-memory test authority service directory lock poisoned"
                             .to_string(),
                     })?;
-                services
+                entries
                     .get(&node_id)
-                    .cloned()
+                    .map(|entry| entry.service.clone())
                     .ok_or_else(|| ControlPlaneError::RpcRemote {
                         message: format!(
                             "in-memory test authority service directory has no node {node_id}"
+                        ),
+                    })
+            })();
+            Box::pin(std::future::ready(result))
+        }
+    }
+
+    impl ControlPlaneRaftRoutedAuthorityDirectory for InMemoryAuthorityServiceDirectory {
+        fn routed_authority_for_node(
+            &self,
+            node_id: ControlPlaneRaftNodeId,
+        ) -> ControlPlaneRaftFuture<
+            '_,
+            Result<ControlPlaneRaftRoutedAuthorityHandle, ControlPlaneError>,
+        > {
+            let result = (|| {
+                let entries = self
+                    .entries
+                    .lock()
+                    .map_err(|_| ControlPlaneError::RpcRemote {
+                        message: "in-memory test authority service directory lock poisoned"
+                            .to_string(),
+                    })?;
+                entries
+                    .get(&node_id)
+                    .map(|entry| entry.routed_authority.clone())
+                    .ok_or_else(|| ControlPlaneError::RpcRemote {
+                        message: format!(
+                            "in-memory test authority service directory has no routed node {node_id}"
                         ),
                     })
             })();
@@ -5646,6 +5688,8 @@ mod tests {
                 412,
                 ControlPlaneRaftAuthorityServiceHandle::new(Arc::clone(&authority2)),
             );
+            let routed_directory =
+                ControlPlaneRaftRoutedAuthorityDirectoryHandle::new(Arc::new(directory.clone()));
             let directory =
                 ControlPlaneRaftAuthorityServiceDirectoryHandle::new(Arc::new(directory));
 
@@ -5668,8 +5712,6 @@ mod tests {
                 "authority service directory lookup follower",
             )
             .await;
-            let routed_directory =
-                ControlPlaneRaftRoutedAuthorityDirectoryHandle::new(Arc::new(directory.clone()));
             let routed_client = ControlPlaneRaftAuthorityRoutingHandle::new(
                 leader_service.clone(),
                 routed_directory.clone(),

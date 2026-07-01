@@ -9903,6 +9903,11 @@ Phase 12.1 progress:
   directory for command/read/status plus leader-routed membership access without
   receiving bootstrap, wait, or shutdown methods. The directory smoke now uses
   that narrow capability for direct serving status and runtime-map reads.
+- Split the in-memory directory smoke scaffold so node registration stores a
+  full service capability and a separate routed-authority capability. The
+  routed client is now built from the narrow routed-directory handle directly,
+  while bootstrap and shutdown still go through the full service-directory
+  surface.
 - Tightened the routing handle to consume that narrow current-serving
   routed-authority capability internally for post-bootstrap command, read,
   status, and leader-routed membership operations. The full service lookup
