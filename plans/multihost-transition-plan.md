@@ -9981,6 +9981,12 @@ Phase 12.1 progress:
   exposes only status-list, bootstrap, node-lifecycle, and routed-authority
   capabilities; the in-memory test scaffold still registers a full service
   handle but immediately narrows it before storing lookup entries.
+- Removed the final composed authority service trait and handle. Tests and
+  in-memory directory registration now build explicit linearized, status,
+  bootstrap, node-lifecycle, routed-authority, and leader-routed admin handles
+  directly from the concrete OpenRaft authority, so no remaining Phase 12
+  raft capability hands callers the full command/read/status/admin/bootstrap/
+  lifecycle surface by accident.
 
 1. define the replicated control-plane state machine:
    - state includes cluster epoch, PG count, PG state, PG acting sets, node

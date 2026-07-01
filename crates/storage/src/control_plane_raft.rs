@@ -222,22 +222,6 @@ impl<T> ControlPlaneRaftLinearizedAuthority for T where
 {
 }
 
-pub trait ControlPlaneRaftAuthorityService:
-    ControlPlaneRaftLinearizedAuthority
-    + ControlPlaneRaftLeaderRoutedAdmin
-    + ControlPlaneRaftAuthorityBootstrap
-    + ControlPlaneRaftAuthorityNodeLifecycle
-{
-}
-
-impl<T> ControlPlaneRaftAuthorityService for T where
-    T: ControlPlaneRaftLinearizedAuthority
-        + ControlPlaneRaftLeaderRoutedAdmin
-        + ControlPlaneRaftAuthorityBootstrap
-        + ControlPlaneRaftAuthorityNodeLifecycle
-{
-}
-
 pub trait ControlPlaneRaftRoutedAuthority:
     ControlPlaneRaftLinearizedAuthority + ControlPlaneRaftLeaderRoutedAdmin
 {
@@ -914,136 +898,6 @@ impl fmt::Debug for ControlPlaneRaftAuthorityNodeLifecycleHandle {
 }
 
 impl ControlPlaneRaftAuthorityNodeLifecycle for ControlPlaneRaftAuthorityNodeLifecycleHandle {
-    fn wait_for_applied_index_at_least(
-        &self,
-        index: u64,
-        timeout: Duration,
-        message: &'static str,
-    ) -> ControlPlaneRaftFuture<'_, Result<(), ControlPlaneError>> {
-        self.inner
-            .wait_for_applied_index_at_least(index, timeout, message)
-    }
-
-    fn wait_for_current_leader(
-        &self,
-        leader_id: ControlPlaneRaftNodeId,
-        timeout: Duration,
-        message: &'static str,
-    ) -> ControlPlaneRaftFuture<'_, Result<(), ControlPlaneError>> {
-        self.inner
-            .wait_for_current_leader(leader_id, timeout, message)
-    }
-
-    fn shutdown(&self) -> ControlPlaneRaftFuture<'_, Result<(), ControlPlaneError>> {
-        self.inner.shutdown()
-    }
-}
-
-#[derive(Clone)]
-pub struct ControlPlaneRaftAuthorityServiceHandle {
-    inner: Arc<dyn ControlPlaneRaftAuthorityService + Send + Sync>,
-}
-
-impl ControlPlaneRaftAuthorityServiceHandle {
-    pub fn new<T>(authority: Arc<T>) -> Self
-    where
-        T: ControlPlaneRaftAuthorityService + Send + Sync + 'static,
-    {
-        Self { inner: authority }
-    }
-
-    pub fn from_authority_service(
-        authority: Arc<dyn ControlPlaneRaftAuthorityService + Send + Sync>,
-    ) -> Self {
-        Self { inner: authority }
-    }
-
-    #[must_use]
-    pub fn as_authority_service(
-        &self,
-    ) -> &(dyn ControlPlaneRaftAuthorityService + Send + Sync + 'static) {
-        &*self.inner
-    }
-}
-
-impl fmt::Debug for ControlPlaneRaftAuthorityServiceHandle {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("ControlPlaneRaftAuthorityServiceHandle")
-            .finish_non_exhaustive()
-    }
-}
-
-impl ControlPlaneRaftLinearizedCommandSink for ControlPlaneRaftAuthorityServiceHandle {
-    fn submit_control_plane_command(
-        &self,
-        command: ControlPlaneCommand,
-    ) -> ControlPlaneRaftFuture<'_, Result<SubmittedControlPlaneRaftCommand, ControlPlaneError>>
-    {
-        self.inner.submit_control_plane_command(command)
-    }
-}
-
-impl ControlPlaneRaftLinearizedRuntimeMapSource for ControlPlaneRaftAuthorityServiceHandle {
-    fn linearized_runtime_map_snapshot(
-        &self,
-        issued_at_ms: u64,
-    ) -> ControlPlaneRaftFuture<'_, Result<ClusterRuntimeMapSnapshot, ControlPlaneError>> {
-        self.inner.linearized_runtime_map_snapshot(issued_at_ms)
-    }
-}
-
-impl ControlPlaneRaftAuthorityStatusSource for ControlPlaneRaftAuthorityServiceHandle {
-    fn status(
-        &self,
-    ) -> ControlPlaneRaftFuture<'_, Result<ControlPlaneRaftAuthorityStatus, ControlPlaneError>>
-    {
-        self.inner.status()
-    }
-}
-
-impl ControlPlaneRaftLeaderRoutedAdmin for ControlPlaneRaftAuthorityServiceHandle {
-    fn replace_voters(
-        &self,
-        voters: BTreeSet<ControlPlaneRaftNodeId>,
-        retain_removed_voters_as_learners: bool,
-    ) -> ControlPlaneRaftFuture<'_, Result<LogIdOf<ControlPlaneRaftTypeConfig>, ControlPlaneError>>
-    {
-        self.inner
-            .replace_voters(voters, retain_removed_voters_as_learners)
-    }
-
-    fn add_learner(
-        &self,
-        node_id: ControlPlaneRaftNodeId,
-        node: BasicNode,
-        wait_for_catch_up: bool,
-    ) -> ControlPlaneRaftFuture<'_, Result<LogIdOf<ControlPlaneRaftTypeConfig>, ControlPlaneError>>
-    {
-        self.inner.add_learner(node_id, node, wait_for_catch_up)
-    }
-
-    fn transfer_leadership_to(
-        &self,
-        node_id: ControlPlaneRaftNodeId,
-    ) -> ControlPlaneRaftFuture<'_, Result<(), ControlPlaneError>> {
-        self.inner.transfer_leadership_to(node_id)
-    }
-}
-
-impl ControlPlaneRaftAuthorityBootstrap for ControlPlaneRaftAuthorityServiceHandle {
-    fn initialize_membership(
-        &self,
-        nodes: BTreeMap<ControlPlaneRaftNodeId, BasicNode>,
-    ) -> ControlPlaneRaftFuture<'_, Result<(), ControlPlaneError>> {
-        self.inner.initialize_membership(nodes)
-    }
-
-    fn is_initialized(&self) -> ControlPlaneRaftFuture<'_, Result<bool, ControlPlaneError>> {
-        self.inner.is_initialized()
-    }
-}
-
-impl ControlPlaneRaftAuthorityNodeLifecycle for ControlPlaneRaftAuthorityServiceHandle {
     fn wait_for_applied_index_at_least(
         &self,
         index: u64,
@@ -3617,7 +3471,7 @@ mod tests {
     }
 
     #[derive(Debug, Clone, Default)]
-    struct InMemoryAuthorityServiceDirectory {
+    struct InMemoryAuthorityCapabilityDirectory {
         entries: Arc<Mutex<BTreeMap<ControlPlaneRaftNodeId, InMemoryAuthorityServiceEntry>>>,
     }
 
@@ -3629,19 +3483,22 @@ mod tests {
         routed_authority: ControlPlaneRaftRoutedAuthorityHandle,
     }
 
-    impl InMemoryAuthorityServiceDirectory {
-        fn register(
-            &self,
-            node_id: ControlPlaneRaftNodeId,
-            service: ControlPlaneRaftAuthorityServiceHandle,
-        ) {
-            let status = ControlPlaneRaftAuthorityStatusHandle::new(Arc::new(service.clone()));
-            let bootstrap =
-                ControlPlaneRaftAuthorityBootstrapHandle::new(Arc::new(service.clone()));
+    impl InMemoryAuthorityCapabilityDirectory {
+        fn register<T>(&self, node_id: ControlPlaneRaftNodeId, authority: Arc<T>)
+        where
+            T: ControlPlaneRaftAuthorityStatusSource
+                + ControlPlaneRaftAuthorityBootstrap
+                + ControlPlaneRaftAuthorityNodeLifecycle
+                + ControlPlaneRaftRoutedAuthority
+                + Send
+                + Sync
+                + 'static,
+        {
+            let status = ControlPlaneRaftAuthorityStatusHandle::new(Arc::clone(&authority));
+            let bootstrap = ControlPlaneRaftAuthorityBootstrapHandle::new(Arc::clone(&authority));
             let node_lifecycle =
-                ControlPlaneRaftAuthorityNodeLifecycleHandle::new(Arc::new(service.clone()));
-            let routed_authority =
-                ControlPlaneRaftRoutedAuthorityHandle::new(Arc::new(service.clone()));
+                ControlPlaneRaftAuthorityNodeLifecycleHandle::new(Arc::clone(&authority));
+            let routed_authority = ControlPlaneRaftRoutedAuthorityHandle::new(authority);
             self.entries.lock().unwrap().insert(
                 node_id,
                 InMemoryAuthorityServiceEntry {
@@ -3654,7 +3511,7 @@ mod tests {
         }
     }
 
-    impl ControlPlaneRaftAuthorityStatusListSource for InMemoryAuthorityServiceDirectory {
+    impl ControlPlaneRaftAuthorityStatusListSource for InMemoryAuthorityCapabilityDirectory {
         fn authority_statuses(
             &self,
         ) -> ControlPlaneRaftFuture<
@@ -3692,7 +3549,7 @@ mod tests {
         }
     }
 
-    impl ControlPlaneRaftAuthorityBootstrapDirectory for InMemoryAuthorityServiceDirectory {
+    impl ControlPlaneRaftAuthorityBootstrapDirectory for InMemoryAuthorityCapabilityDirectory {
         fn authority_bootstrap_for_node(
             &self,
             node_id: ControlPlaneRaftNodeId,
@@ -3721,7 +3578,7 @@ mod tests {
         }
     }
 
-    impl ControlPlaneRaftAuthorityNodeLifecycleDirectory for InMemoryAuthorityServiceDirectory {
+    impl ControlPlaneRaftAuthorityNodeLifecycleDirectory for InMemoryAuthorityCapabilityDirectory {
         fn authority_node_lifecycle_for_node(
             &self,
             node_id: ControlPlaneRaftNodeId,
@@ -3750,7 +3607,7 @@ mod tests {
         }
     }
 
-    impl ControlPlaneRaftRoutedAuthorityDirectory for InMemoryAuthorityServiceDirectory {
+    impl ControlPlaneRaftRoutedAuthorityDirectory for InMemoryAuthorityCapabilityDirectory {
         fn routed_authority_for_node(
             &self,
             node_id: ControlPlaneRaftNodeId,
@@ -5743,7 +5600,7 @@ mod tests {
     }
 
     #[test]
-    fn control_plane_openraft_admin_handle_manages_membership_and_leadership() {
+    fn control_plane_openraft_explicit_handles_manage_membership_and_leadership() {
         ControlPlaneRaftTypeConfig::run(async {
             let operation_timeout = Duration::from_secs(2);
             let (authority1, authority2) = initialized_two_node_authorities(
@@ -5754,18 +5611,21 @@ mod tests {
             .await;
             let authority1 = Arc::new(authority1);
             let authority2 = Arc::new(authority2);
-            let service1 = ControlPlaneRaftAuthorityServiceHandle::new(Arc::clone(&authority1));
-            let service2 = ControlPlaneRaftAuthorityServiceHandle::new(Arc::clone(&authority2));
+            let linearized1 = ControlPlaneRaftAuthorityHandle::new(Arc::clone(&authority1));
+            let admin1 = ControlPlaneRaftLeaderRoutedAdminHandle::new(Arc::clone(&authority1));
+            let admin2 = ControlPlaneRaftLeaderRoutedAdminHandle::new(Arc::clone(&authority2));
+            let status2 = ControlPlaneRaftAuthorityStatusHandle::new(Arc::clone(&authority2));
             let bootstrap1 = ControlPlaneRaftAuthorityBootstrapHandle::new(Arc::clone(&authority1));
             let lifecycle1 =
                 ControlPlaneRaftAuthorityNodeLifecycleHandle::new(Arc::clone(&authority1));
             let lifecycle2 =
                 ControlPlaneRaftAuthorityNodeLifecycleHandle::new(Arc::clone(&authority2));
-            let authority_service1 = service1.as_authority_service();
+            let command_sink = linearized1.as_linearized_authority();
+            let leader_admin = admin1.as_leader_routed_admin();
 
             assert!(bootstrap1.is_initialized().await.unwrap());
             let bootstrap = expect_bounded_control_plane_raft(
-                authority_service1.submit_control_plane_command(
+                command_sink.submit_control_plane_command(
                     ControlPlaneCommand::BootstrapInitialClusterMap {
                         nodes: vec![
                             (NodeId::new(401), "node-401".to_string()),
@@ -5775,7 +5635,7 @@ mod tests {
                     },
                 ),
                 operation_timeout,
-                "admin handle bootstrap command",
+                "explicit handles bootstrap command",
             )
             .await;
             assert!(matches!(
@@ -5788,48 +5648,48 @@ mod tests {
                 lifecycle2.wait_for_applied_index_at_least(
                     bootstrap.log_id().index(),
                     Duration::from_secs(1),
-                    "admin handle follower applied bootstrap",
+                    "explicit handles follower applied bootstrap",
                 ),
                 operation_timeout,
-                "admin handle wait for follower bootstrap",
+                "explicit handles wait for follower bootstrap",
             )
             .await;
 
             expect_bounded_control_plane_raft(
-                authority_service1.transfer_leadership_to(402),
+                leader_admin.transfer_leadership_to(402),
                 operation_timeout,
-                "admin handle transfer leadership",
+                "explicit handles transfer leadership",
             )
             .await;
             expect_bounded_control_plane_raft(
                 lifecycle2.wait_for_current_leader(
                     402,
                     Duration::from_secs(1),
-                    "admin handle observed transferred leader",
+                    "explicit handles observed transferred leader",
                 ),
                 operation_timeout,
-                "admin handle wait for transferred leader",
+                "explicit handles wait for transferred leader",
             )
             .await;
 
             let membership_log_id = expect_bounded_control_plane_raft(
-                service2.replace_voters(BTreeSet::from([402]), false),
+                admin2.replace_voters(BTreeSet::from([402]), false),
                 operation_timeout,
-                "admin handle replace voters",
+                "explicit handles replace voters",
             )
             .await;
             expect_bounded_control_plane_raft(
                 lifecycle2.wait_for_applied_index_at_least(
                     membership_log_id.index(),
                     Duration::from_secs(1),
-                    "admin handle applied voter replacement",
+                    "explicit handles applied voter replacement",
                 ),
                 operation_timeout,
-                "admin handle wait for voter replacement",
+                "explicit handles wait for voter replacement",
             )
             .await;
 
-            let status = service2.status().await.unwrap();
+            let status = status2.status().await.unwrap();
             assert_eq!(status.current_leader(), Some(402));
             assert_eq!(
                 status.effective_membership_log_id(),
@@ -5844,13 +5704,13 @@ mod tests {
             expect_bounded_control_plane_raft(
                 lifecycle1.shutdown(),
                 operation_timeout,
-                "admin handle shutdown removed voter",
+                "explicit handles shutdown removed voter",
             )
             .await;
             expect_bounded_control_plane_raft(
                 lifecycle2.shutdown(),
                 operation_timeout,
-                "admin handle shutdown surviving voter",
+                "explicit handles shutdown surviving voter",
             )
             .await;
         });
@@ -5861,22 +5721,16 @@ mod tests {
         ControlPlaneRaftTypeConfig::run(async {
             let operation_timeout = Duration::from_secs(2);
             let (authority1, authority2) = initialized_two_node_authorities(
-                "control-plane-raft-authority-service-directory-test",
+                "control-plane-raft-authority-capability-directory-test",
                 411,
                 412,
             )
             .await;
             let authority1 = Arc::new(authority1);
             let authority2 = Arc::new(authority2);
-            let directory = InMemoryAuthorityServiceDirectory::default();
-            directory.register(
-                411,
-                ControlPlaneRaftAuthorityServiceHandle::new(Arc::clone(&authority1)),
-            );
-            directory.register(
-                412,
-                ControlPlaneRaftAuthorityServiceHandle::new(Arc::clone(&authority2)),
-            );
+            let directory = InMemoryAuthorityCapabilityDirectory::default();
+            directory.register(411, Arc::clone(&authority1));
+            directory.register(412, Arc::clone(&authority2));
             let bootstrap_directory =
                 ControlPlaneRaftAuthorityBootstrapDirectoryHandle::new(Arc::new(directory.clone()));
             let routed_directory =
@@ -6241,15 +6095,9 @@ mod tests {
             wait_for_local_leader(authority1.raft(), "directory first independent leader").await;
             wait_for_local_leader(authority2.raft(), "directory second independent leader").await;
 
-            let directory = InMemoryAuthorityServiceDirectory::default();
-            directory.register(
-                421,
-                ControlPlaneRaftAuthorityServiceHandle::new(Arc::clone(&authority1)),
-            );
-            directory.register(
-                422,
-                ControlPlaneRaftAuthorityServiceHandle::new(Arc::clone(&authority2)),
-            );
+            let directory = InMemoryAuthorityCapabilityDirectory::default();
+            directory.register(421, Arc::clone(&authority1));
+            directory.register(422, Arc::clone(&authority2));
             let routed_directory =
                 ControlPlaneRaftRoutedAuthorityDirectoryHandle::new(Arc::new(directory));
 
