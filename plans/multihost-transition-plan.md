@@ -9893,6 +9893,11 @@ Phase 12.1 progress:
   status, and leader-routed membership operations. The full service lookup
   remains available from the directory for bootstrap/lifecycle callers, while
   routed clients now avoid depending on the broader service surface.
+- Added a routed-authority directory capability and cloneable handle. Clients
+  that only need post-bootstrap routed command/read/status and membership
+  operations can now look up a node or the current serving authority without
+  receiving the full bootstrap/lifecycle service surface; the existing service
+  directory adapts to this narrow view for in-memory spike wiring.
 
 1. define the replicated control-plane state machine:
    - state includes cluster epoch, PG count, PG state, PG acting sets, node
