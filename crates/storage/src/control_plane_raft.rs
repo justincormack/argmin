@@ -305,6 +305,15 @@ impl ControlPlaneRaftAuthorityServiceDirectoryHandle {
         let node_id = current_serving_authority_node_id(&statuses)?;
         self.authority_service_for_node(node_id).await
     }
+
+    pub async fn current_serving_routed_authority(
+        &self,
+    ) -> Result<ControlPlaneRaftRoutedAuthorityHandle, ControlPlaneError> {
+        let service = self.current_serving_authority_service().await?;
+        Ok(ControlPlaneRaftRoutedAuthorityHandle::new(Arc::new(
+            service,
+        )))
+    }
 }
 
 fn current_serving_authority_node_id(
@@ -5669,6 +5678,20 @@ mod tests {
             let serving_status = serving_service.status().await.unwrap();
             assert_eq!(serving_status.node_id(), 412);
             assert!(serving_status.linearized_authority_serving());
+            let serving_routed_authority = expect_bounded_control_plane_raft(
+                directory.current_serving_routed_authority(),
+                operation_timeout,
+                "authority service directory current serving routed authority",
+            )
+            .await;
+            let serving_routed_status = expect_bounded_control_plane_raft(
+                serving_routed_authority.status(),
+                operation_timeout,
+                "authority service directory current serving routed authority status",
+            )
+            .await;
+            assert_eq!(serving_routed_status.node_id(), 412);
+            assert!(serving_routed_status.linearized_authority_serving());
             let routed_write = expect_bounded_control_plane_raft(
                 routed_authority.submit_control_plane_command(
                     ControlPlaneCommand::MarkNodeAvailability {
@@ -5722,9 +5745,9 @@ mod tests {
                 .iter()
                 .any(|node| node.node_id() == NodeId::new(412)));
             let direct_runtime_map = expect_bounded_control_plane_raft(
-                serving_service.linearized_runtime_map_snapshot(91_001),
+                serving_routed_authority.linearized_runtime_map_snapshot(91_001),
                 operation_timeout,
-                "authority service directory direct serving runtime map read",
+                "authority service directory current serving routed runtime map read",
             )
             .await;
             assert_eq!(

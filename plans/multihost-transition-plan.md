@@ -9883,6 +9883,11 @@ Phase 12.1 progress:
   it now has direct coverage for selecting the sole serving authority,
   rejecting an empty serving set, and rejecting directory-key/status-node
   mismatches before any routed RPC is attempted.
+- Added a directory helper that narrows the selected current-serving authority
+  to the post-bootstrap routed-authority capability. This lets callers ask the
+  directory for command/read/status plus leader-routed membership access without
+  receiving bootstrap, wait, or shutdown methods. The directory smoke now uses
+  that narrow capability for direct serving status and runtime-map reads.
 
 1. define the replicated control-plane state machine:
    - state includes cluster epoch, PG count, PG state, PG acting sets, node
