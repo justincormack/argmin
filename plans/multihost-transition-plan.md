@@ -9136,17 +9136,24 @@ Keep an explicit Phase 11 close-out before treating the phase as soak-clean:
          post-reservation frontier and then failed retryably.
          The durable attempt row is now also updated before entering the final
          visibility check, preserving the reset post-reservation frontier and
-         exposing `final_visibility_check` as the current retryable phase until
-         `MarkBucketDeleting` is built and applied. A focused storage regression
-         observes that intermediate phase before command-id allocation and then
-         verifies the terminal `mark_deleting` outcome overwrites it. Adoption
-         now treats a matching retryable `final_visibility_check` attempt row as
-         a resume cursor: if the bucket PG has no pending command, it skips the
-         already-proven exact object-PG drain, stream cleanup, reservation wait,
-         and post-reservation drain phases and re-enters at the final visibility
-         proof. A storage regression installs a failing post-reservation progress
-         hook and proves that a final-visibility adoption reaches
-         `mark_deleting` without repeating that scan. Stream cleanup now has a
+         exposing `final_visibility_check` as the current retryable phase while
+         the check is still only started/in progress. Once that check completes
+         without visible data, the attempt row advances to
+         `final_visibility_proven`; a retryable failure after that point can be
+         adopted with a fresh budget and resume directly at `MarkBucketDeleting`
+         instead of paying for another all-PG visibility proof. A focused
+         storage regression observes the proven phase before command-id
+         allocation and then verifies the terminal `mark_deleting` outcome
+         overwrites it. Adoption treats a matching retryable
+         `final_visibility_check` attempt row as a conservative resume cursor:
+         if the bucket PG has no pending command, it skips the already-proven
+         exact object-PG drain, stream cleanup, reservation wait, and
+         post-reservation drain phases and re-enters at the final visibility
+         proof. It treats a matching retryable `final_visibility_proven` row as
+         stronger evidence and skips the visibility proof too. Storage
+         regressions install failing post-reservation and final-visibility hooks
+         and prove the two adoption points reach `mark_deleting` without
+         repeating the wrong scan. Stream cleanup now has a
          conservative adoption point as well: entering cleanup records a
          retryable `stream_cleanup` attempt row, and a later matching adoption
          can skip the initial pre-cleanup exact-bucket scan while still
@@ -9160,10 +9167,10 @@ Keep an explicit Phase 11 close-out before treating the phase as soak-clean:
          progress. Remaining work: decide whether finer stream-cleanup
          page/frontier state is needed, or whether the current conservative
          cleanup resume point is enough for soak closure. Final-visibility
-         adoption now also has a coordinator-level reclaim-worker regression
-         that seeds a durable `final_visibility_check` attempt and fails if the
-         worker repeats any exact-bucket drain phase instead of resuming at the
-         final proof.
+         adoption now also has coordinator-level reclaim-worker regressions that
+         seed durable `final_visibility_check` and `final_visibility_proven`
+         attempts and fail if the worker repeats an already-proven phase instead
+         of resuming at the right point.
          A route-change-restart soak failure at `a3ce3c64` showed another
          final-visibility boundary issue: the foreground request completed the
          final visibility scan after its begin budget was already exhausted,
@@ -9171,12 +9178,18 @@ Keep an explicit Phase 11 close-out before treating the phase as soak-clean:
          because the shared proof/apply budget had no time left. The begin path
          now checks the begin budget again after final visibility and before
          allocating/installing the mark command, so an over-budget request
-         preserves the durable final-visibility cursor instead of dirtying the
-         command slot. Once a matching mark command exists, applying it uses a
-         fresh command-apply budget with separate diagnostics
-         (`bucket_delete_mark_deleting_apply`), because at that point the
-         system should advance the irreversible command rather than fail
-         immediately on already-spent proof budget.
+         preserves the durable final-visibility-proven cursor instead of
+         dirtying the command slot. Later route-change-node-restart soak
+         failures at `7e9d95d5` showed this cursor still needed a distinct
+         proven phase: both failed buckets were publicly empty, with no MPU,
+         object, reclaim-root, finalizer-claim, or pending-command blocker, but
+         the active drain was stuck at `final_visibility_check` after budget
+         exhaustion. The phase split now lets a completed visibility proof
+         resume directly at mark-deleting. Once a matching mark command exists,
+         applying it uses a fresh command-apply budget with separate diagnostics
+         (`bucket_delete_mark_deleting_apply`), because at that point the system
+         should advance the irreversible command rather than fail immediately on
+         already-spent proof budget.
       5. status: open. Revisit reservation classification only after attempts are resumable;
          it should be an optimization on top of a convergent state machine, not
          the convergence mechanism itself.

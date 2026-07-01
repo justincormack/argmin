@@ -2468,7 +2468,8 @@ pub enum BucketDeleteAttemptPhase {
     PostReservationObjectDrain = 2,
     StreamCleanup = 3,
     FinalVisibilityCheck = 4,
-    MarkDeleting = 5,
+    FinalVisibilityProven = 5,
+    MarkDeleting = 6,
 }
 
 /// Last durable DeleteBucket attempt outcome for a bucket.

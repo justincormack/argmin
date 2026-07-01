@@ -1449,6 +1449,7 @@ fn local_debug_bucket_delete_attempt_phase(phase: BucketDeleteAttemptPhase) -> &
         BucketDeleteAttemptPhase::PostReservationObjectDrain => "post_reservation_object_drain",
         BucketDeleteAttemptPhase::StreamCleanup => "stream_cleanup",
         BucketDeleteAttemptPhase::FinalVisibilityCheck => "final_visibility_check",
+        BucketDeleteAttemptPhase::FinalVisibilityProven => "final_visibility_proven",
         BucketDeleteAttemptPhase::MarkDeleting => "mark_deleting",
     }
 }

@@ -3174,7 +3174,7 @@ fn begin_bucket_delete_records_final_visibility_phase_before_mark_command() {
             );
             assert_eq!(
                 outcome.phase,
-                crate::BucketDeleteAttemptPhase::FinalVisibilityCheck
+                crate::BucketDeleteAttemptPhase::FinalVisibilityProven
             );
             assert_eq!(
                 outcome.post_reservation_next_object_pg_id,
@@ -3276,6 +3276,93 @@ fn begin_bucket_delete_adopts_final_visibility_phase_without_repeating_post_rese
     assert!(
         !post_reservation_scan_ran.load(Ordering::SeqCst),
         "final-visibility adoption should not repeat the post-reservation scan"
+    );
+    let bucket_pg = map
+        .node(NodeId::new(1))
+        .unwrap()
+        .storage_node()
+        .get_pg(bucket_pg_id.get())
+        .unwrap();
+    let info = crate::PgMetadataStore::head_bucket_raw(&*bucket_pg, &bucket).unwrap();
+    assert_eq!(info.state, crate::BucketState::Deleting);
+    let outcome = crate::PgMetadataStore::bucket_delete_attempt_outcome(&*bucket_pg, &bucket)
+        .unwrap()
+        .expect("successful adopted DeleteBucket begin should record terminal outcome");
+    assert_eq!(
+        outcome.outcome,
+        crate::BucketDeleteAttemptOutcomeKind::MarkDeleting
+    );
+    assert_eq!(outcome.phase, crate::BucketDeleteAttemptPhase::MarkDeleting);
+    assert_eq!(outcome.drain_id, drain.record.drain_id);
+}
+
+#[test]
+fn begin_bucket_delete_adopts_final_visibility_proven_without_repeating_visibility_check() {
+    let _serial = lock_bucket_scoped_hook_test();
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2], ec_shape).unwrap();
+    let bucket = {
+        let topology = map
+            .nodes
+            .get(&NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        bucket_for_pg(topology, 1, "delete-final-visibility-proven-adopt-")
+    };
+    set_route_primary(&mut map, 1, NodeId::new(1));
+
+    let map = Arc::new(map);
+    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    create_test_bucket(&cluster, &bucket);
+    let drain = match cluster.begin_durable_bucket_delete_drain(&bucket).unwrap() {
+        crate::cluster::DurableBucketDeleteDrainBegin::Acquired(drain) => drain,
+        crate::cluster::DurableBucketDeleteDrainBegin::AlreadyDeleting => {
+            panic!("fresh active bucket should acquire delete drain")
+        }
+    };
+    let bucket_pg_id = PgId::new(drain.pg_id);
+    let bucket_pg_primary = map
+        .metadata_pg_primary_node(crate::ClusterEpoch::INITIAL, bucket_pg_id)
+        .unwrap();
+    let bucket_pg = bucket_pg_primary
+        .storage_node()
+        .get_pg(bucket_pg_id.get())
+        .unwrap();
+    crate::PgMetadataStore::record_bucket_delete_attempt_outcome(
+        &*bucket_pg,
+        &crate::BucketDeleteAttemptOutcomeRecord {
+            bucket: bucket.clone(),
+            drain_id: drain.record.drain_id.clone(),
+            cluster_epoch: drain.record.cluster_epoch,
+            bucket_execution_generation: drain.record.bucket_execution_generation,
+            outcome: crate::BucketDeleteAttemptOutcomeKind::Retryable,
+            phase: crate::BucketDeleteAttemptPhase::FinalVisibilityProven,
+            detail: "resume after final visibility proof".to_string(),
+            post_reservation_next_object_pg_id: Some(0),
+            updated_at: crate::clock::current_time_millis(),
+        },
+    )
+    .unwrap();
+    drop(bucket_pg);
+
+    let visibility_check_ran = Arc::new(AtomicBool::new(false));
+    let visibility_check_ran_for_hook = Arc::clone(&visibility_check_ran);
+    let _visibility_hook_guard =
+        cluster.test_install_before_bucket_delete_final_visibility_hook(Arc::new(move || {
+            visibility_check_ran_for_hook.store(true, Ordering::SeqCst);
+            Err(StoreError::Io {
+                context: "unexpected final visibility scan during proven adoption",
+                source: std::io::Error::other("final visibility should already be proven"),
+            })
+        }));
+
+    cluster.begin_bucket_delete(&bucket).unwrap();
+    assert!(
+        !visibility_check_ran.load(Ordering::SeqCst),
+        "final-visibility-proven adoption should not repeat the visibility scan"
     );
     let bucket_pg = map
         .node(NodeId::new(1))

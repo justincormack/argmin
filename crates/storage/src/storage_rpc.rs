@@ -12734,7 +12734,8 @@ impl<'a> StorageRpcDecoder<'a> {
             2 => BucketDeleteAttemptPhase::PostReservationObjectDrain,
             3 => BucketDeleteAttemptPhase::StreamCleanup,
             4 => BucketDeleteAttemptPhase::FinalVisibilityCheck,
-            5 => BucketDeleteAttemptPhase::MarkDeleting,
+            5 => BucketDeleteAttemptPhase::FinalVisibilityProven,
+            6 => BucketDeleteAttemptPhase::MarkDeleting,
             _ => {
                 return Err(StorageRpcPayloadError::InvalidBucketWriteReservationProof(
                     "invalid bucket delete attempt phase",
@@ -19220,7 +19221,7 @@ mod tests {
                     cluster_epoch,
                     bucket_execution_generation: 3,
                     outcome: BucketDeleteAttemptOutcomeKind::Retryable,
-                    phase: BucketDeleteAttemptPhase::PostReservationObjectDrain,
+                    phase: BucketDeleteAttemptPhase::FinalVisibilityProven,
                     detail: "e".repeat(BUCKET_DELETE_ATTEMPT_OUTCOME_DETAIL_MAX_LEN),
                     post_reservation_next_object_pg_id: Some(7),
                     updated_at: 6,

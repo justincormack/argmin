@@ -4678,7 +4678,8 @@ fn bucket_delete_attempt_outcome_from_row(
         2 => BucketDeleteAttemptPhase::PostReservationObjectDrain,
         3 => BucketDeleteAttemptPhase::StreamCleanup,
         4 => BucketDeleteAttemptPhase::FinalVisibilityCheck,
-        5 => BucketDeleteAttemptPhase::MarkDeleting,
+        5 => BucketDeleteAttemptPhase::FinalVisibilityProven,
+        6 => BucketDeleteAttemptPhase::MarkDeleting,
         _ => {
             return Err(rusqlite::Error::FromSqlConversionFailure(
                 5,
