@@ -929,25 +929,19 @@ impl ControlPlaneRaftAuthorityAdmin for ControlPlaneRaftAuthorityServiceHandle {
 #[derive(Clone)]
 pub struct ControlPlaneRaftAuthorityRoutingHandle {
     observer: ControlPlaneRaftAuthorityServiceHandle,
-    directory: ControlPlaneRaftAuthorityServiceDirectoryHandle,
+    directory: ControlPlaneRaftRoutedAuthorityDirectoryHandle,
 }
 
 impl ControlPlaneRaftAuthorityRoutingHandle {
     #[must_use]
     pub fn new(
         observer: ControlPlaneRaftAuthorityServiceHandle,
-        directory: ControlPlaneRaftAuthorityServiceDirectoryHandle,
+        directory: ControlPlaneRaftRoutedAuthorityDirectoryHandle,
     ) -> Self {
         Self {
             observer,
             directory,
         }
-    }
-
-    pub async fn current_serving_authority_service(
-        &self,
-    ) -> Result<ControlPlaneRaftAuthorityServiceHandle, ControlPlaneError> {
-        self.directory.current_serving_authority_service().await
     }
 
     pub async fn current_serving_routed_authority(
@@ -5674,9 +5668,11 @@ mod tests {
                 "authority service directory lookup follower",
             )
             .await;
+            let routed_directory =
+                ControlPlaneRaftRoutedAuthorityDirectoryHandle::new(Arc::new(directory.clone()));
             let routed_client = ControlPlaneRaftAuthorityRoutingHandle::new(
                 leader_service.clone(),
-                directory.clone(),
+                routed_directory.clone(),
             );
             let routed_admin =
                 ControlPlaneRaftLeaderRoutedAdminHandle::new(Arc::new(routed_client.clone()));
@@ -5767,8 +5763,6 @@ mod tests {
                     .collect::<BTreeSet<_>>(),
                 BTreeSet::from([411, 412])
             );
-            let routed_directory =
-                ControlPlaneRaftRoutedAuthorityDirectoryHandle::new(Arc::new(directory.clone()));
             let routed_directory_statuses = expect_bounded_control_plane_raft(
                 routed_directory.authority_statuses(),
                 operation_timeout,

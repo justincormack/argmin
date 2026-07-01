@@ -9913,6 +9913,10 @@ Phase 12.1 progress:
   operations can now look up a node or the current serving authority without
   receiving the full bootstrap/lifecycle service surface; the existing service
   directory adapts to this narrow view for in-memory spike wiring.
+- Tightened the routing client to depend on the routed-authority directory
+  rather than the full service directory. Bootstrap and shutdown lookup still
+  use the full service surface, but post-bootstrap routed clients no longer
+  carry a capability that can fetch bootstrap/lifecycle services.
 
 1. define the replicated control-plane state machine:
    - state includes cluster epoch, PG count, PG state, PG acting sets, node
