@@ -4589,11 +4589,6 @@ impl super::StorageCluster {
                         self.metadata_command_apply_test_hook_scope_id(),
                     )
                     .map_err(BucketWriteDrainError::from)?;
-                    self.check_bucket_delete_begin_work_budget(
-                        bucket,
-                        Some(started),
-                        "bucket delete final visibility budget exhausted before mark deleting",
-                    )?;
                 }
                 Self::emit_bucket_delete_begin_loop_step(
                     bucket,
