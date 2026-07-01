@@ -9844,6 +9844,11 @@ Phase 12.1 progress:
   that can enumerate known raft authorities without naming the in-memory test
   directory or the concrete OpenRaft wrapper; the directory smoke now verifies
   the status list after leader transfer.
+- Added a directory-owned current-serving-authority route helper. Leader-routed
+  clients now ask the directory to derive exactly one serving authority from
+  the status list instead of trusting a single observer's current-leader view,
+  and the route fails closed if the directory reports no serving authority or
+  multiple serving authorities.
 
 1. define the replicated control-plane state machine:
    - state includes cluster epoch, PG count, PG state, PG acting sets, node

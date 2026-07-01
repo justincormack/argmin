@@ -243,6 +243,46 @@ impl ControlPlaneRaftAuthorityServiceDirectoryHandle {
     {
         self.inner.authority_statuses().await
     }
+
+    pub async fn current_serving_authority_service(
+        &self,
+    ) -> Result<ControlPlaneRaftAuthorityServiceHandle, ControlPlaneError> {
+        let statuses = self.authority_statuses().await?;
+        let node_id = current_serving_authority_node_id(&statuses)?;
+        self.authority_service_for_node(node_id).await
+    }
+}
+
+fn current_serving_authority_node_id(
+    statuses: &BTreeMap<ControlPlaneRaftNodeId, ControlPlaneRaftAuthorityStatus>,
+) -> Result<ControlPlaneRaftNodeId, ControlPlaneError> {
+    let mut serving_node_id = None;
+    for (directory_node_id, status) in statuses {
+        if *directory_node_id != status.node_id() {
+            return Err(ControlPlaneError::RpcRemote {
+                message: format!(
+                    "authority service directory status key {} disagrees with reported node {}",
+                    directory_node_id,
+                    status.node_id()
+                ),
+            });
+        }
+        if !status.linearized_authority_serving() {
+            continue;
+        }
+        if let Some(existing_node_id) = serving_node_id {
+            return Err(ControlPlaneError::RpcRemote {
+                message: format!(
+                    "authority service directory found multiple serving raft authorities: {existing_node_id} and {}",
+                    status.node_id()
+                ),
+            });
+        }
+        serving_node_id = Some(status.node_id());
+    }
+    serving_node_id.ok_or_else(|| ControlPlaneError::RpcRemote {
+        message: "authority service directory found no serving raft authority".to_string(),
+    })
 }
 
 impl fmt::Debug for ControlPlaneRaftAuthorityServiceDirectoryHandle {
@@ -648,10 +688,7 @@ impl ControlPlaneRaftAuthorityRoutingHandle {
     pub async fn current_leader_service(
         &self,
     ) -> Result<ControlPlaneRaftAuthorityServiceHandle, ControlPlaneError> {
-        let status = self.observer.status().await?;
-        self.directory
-            .authority_service_for_status_leader(&status)
-            .await
+        self.directory.current_serving_authority_service().await
     }
 
     pub async fn submit_control_plane_command(
@@ -5359,6 +5396,15 @@ mod tests {
             assert_eq!(new_leader_status.current_leader(), Some(412));
             assert!(new_leader_status.local_leader());
             assert!(new_leader_status.linearized_authority_serving());
+            let serving_service = expect_bounded_control_plane_raft(
+                directory.current_serving_authority_service(),
+                operation_timeout,
+                "authority service directory current serving authority",
+            )
+            .await;
+            let serving_status = serving_service.status().await.unwrap();
+            assert_eq!(serving_status.node_id(), 412);
+            assert!(serving_status.linearized_authority_serving());
             let routed_write = expect_bounded_control_plane_raft(
                 routed_client.submit_control_plane_command(
                     ControlPlaneCommand::MarkNodeAvailability {
@@ -5473,6 +5519,71 @@ mod tests {
                 "authority service directory shutdown transferred leader",
             )
             .await;
+        });
+    }
+
+    #[test]
+    fn control_plane_openraft_authority_service_directory_rejects_multiple_serving_authorities() {
+        ControlPlaneRaftTypeConfig::run(async {
+            let operation_timeout = Duration::from_secs(2);
+            let network = InMemoryRaftNetworkFactory::default();
+            let raft1 = Raft::<ControlPlaneRaftTypeConfig, ControlPlaneRaftStateMachine>::new(
+                421,
+                test_raft_config("control-plane-raft-directory-multiple-serving-test-421"),
+                network.clone(),
+                ControlPlaneRaftLogStore::empty(),
+                ControlPlaneRaftStateMachine::empty(),
+            )
+            .await
+            .unwrap();
+            let raft2 = Raft::<ControlPlaneRaftTypeConfig, ControlPlaneRaftStateMachine>::new(
+                422,
+                test_raft_config("control-plane-raft-directory-multiple-serving-test-422"),
+                network,
+                ControlPlaneRaftLogStore::empty(),
+                ControlPlaneRaftStateMachine::empty(),
+            )
+            .await
+            .unwrap();
+            let authority1 = Arc::new(ControlPlaneRaftAuthority::new(raft1));
+            let authority2 = Arc::new(ControlPlaneRaftAuthority::new(raft2));
+            authority1
+                .initialize_membership(BTreeMap::from([(421, BasicNode::new("node-421"))]))
+                .await
+                .unwrap();
+            authority2
+                .initialize_membership(BTreeMap::from([(422, BasicNode::new("node-422"))]))
+                .await
+                .unwrap();
+            wait_for_local_leader(authority1.raft(), "directory first independent leader").await;
+            wait_for_local_leader(authority2.raft(), "directory second independent leader").await;
+
+            let directory = InMemoryAuthorityServiceDirectory::default();
+            directory.register(
+                421,
+                ControlPlaneRaftAuthorityServiceHandle::new(Arc::clone(&authority1)),
+            );
+            directory.register(
+                422,
+                ControlPlaneRaftAuthorityServiceHandle::new(Arc::clone(&authority2)),
+            );
+            let directory =
+                ControlPlaneRaftAuthorityServiceDirectoryHandle::new(Arc::new(directory));
+
+            let err = expect_bounded_control_plane_raft_error(
+                directory.current_serving_authority_service(),
+                operation_timeout,
+                "authority service directory rejects multiple serving authorities",
+            )
+            .await;
+            assert!(matches!(
+                err,
+                ControlPlaneError::RpcRemote { message }
+                    if message.contains("multiple serving raft authorities")
+            ));
+
+            authority1.shutdown().await.unwrap();
+            authority2.shutdown().await.unwrap();
         });
     }
 
