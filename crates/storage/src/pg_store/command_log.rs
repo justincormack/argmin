@@ -1928,6 +1928,23 @@ impl PgStore {
         node_id: u32,
         cluster_epoch: ClusterEpoch,
     ) -> Result<Option<PendingMetadataCommandSlot>, StoreError> {
+        let Some(slot) = self.pending_metadata_command_slot_any_epoch(node_id)? else {
+            return Ok(None);
+        };
+        if slot.id.cluster_epoch() != cluster_epoch {
+            return Err(StoreError::StaleMetadataOperation {
+                pg_id: self.pg_id,
+                operation_epoch: cluster_epoch,
+                current_epoch: slot.id.cluster_epoch(),
+            });
+        }
+        Ok(Some(slot))
+    }
+
+    pub(crate) fn pending_metadata_command_slot_any_epoch(
+        &self,
+        node_id: u32,
+    ) -> Result<Option<PendingMetadataCommandSlot>, StoreError> {
         let raw = self.query_row_cached_optional(
             "SELECT cluster_epoch, pg_id, log_index, command_checksum, command_bytes, scope_bucket \
              FROM metadata_command_pending_slot WHERE singleton = 0",
@@ -1960,13 +1977,6 @@ impl PgStore {
             raw_cluster_epoch,
         )?)
         .expect("pending slot stores non-zero cluster epoch");
-        if stored_epoch != cluster_epoch {
-            return Err(StoreError::StaleMetadataOperation {
-                pg_id: self.pg_id,
-                operation_epoch: cluster_epoch,
-                current_epoch: stored_epoch,
-            });
-        }
         let stored_pg_id: u32 = raw_pg_id.try_into().map_err(|_| StoreError::Db {
             context: "decode pending slot PG id",
             source: rusqlite::Error::FromSqlConversionFailure(
@@ -1980,7 +1990,7 @@ impl PgStore {
                 node_id,
                 command_pg_id: stored_pg_id,
                 target_pg_id: self.pg_id,
-                cluster_epoch,
+                cluster_epoch: stored_epoch,
             });
         }
         let log_index = MetadataCommandLogIndex::new(decode_nonnegative_u64(
@@ -1994,7 +2004,7 @@ impl PgStore {
             return Err(StoreError::MetadataCommandLogChecksumMismatch {
                 node_id,
                 pg_id: self.pg_id,
-                cluster_epoch,
+                cluster_epoch: stored_epoch,
                 log_index: log_index.get(),
                 stored_checksum: command_checksum,
                 computed_checksum,
@@ -2004,16 +2014,16 @@ impl PgStore {
             StoreError::MetadataCommandLogConflict {
                 node_id,
                 pg_id: self.pg_id,
-                cluster_epoch,
+                cluster_epoch: stored_epoch,
                 log_index: log_index.get(),
             }
         })?;
-        let id = MetadataCommandId::new(cluster_epoch, PgId::new(self.pg_id), log_index);
+        let id = MetadataCommandId::new(stored_epoch, PgId::new(self.pg_id), log_index);
         if header.id() != id || header.kind() != MetadataCommandLogEntryKind::Applied {
             return Err(StoreError::MetadataCommandLogConflict {
                 node_id,
                 pg_id: self.pg_id,
-                cluster_epoch,
+                cluster_epoch: stored_epoch,
                 log_index: log_index.get(),
             });
         }
@@ -2034,6 +2044,37 @@ impl PgStore {
             command_bytes,
             scope_bucket,
         }))
+    }
+
+    pub(crate) fn clean_epoch_mismatched_orphan_pending_metadata_command_slot(
+        &self,
+        node_id: u32,
+        current_epoch: ClusterEpoch,
+    ) -> Result<bool, StoreError> {
+        let Some(slot) = self.pending_metadata_command_slot_any_epoch(node_id)? else {
+            return Ok(false);
+        };
+        if slot.id.cluster_epoch() == current_epoch {
+            return Ok(false);
+        }
+        if self
+            .load_metadata_command_log_entry(
+                "load epoch-mismatched metadata command pending slot terminal entry",
+                slot.id.cluster_epoch(),
+                slot.id.pg_id(),
+                slot.id.log_index(),
+            )?
+            .is_some()
+        {
+            return Err(StoreError::MetadataCommandLogConflict {
+                node_id,
+                pg_id: self.pg_id,
+                cluster_epoch: slot.id.cluster_epoch(),
+                log_index: slot.id.log_index().get(),
+            });
+        }
+        self.remove_pending_metadata_command_slot_exact(node_id, &slot)?;
+        Ok(true)
     }
 
     pub(crate) fn pending_metadata_command_envelope(

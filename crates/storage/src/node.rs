@@ -1200,9 +1200,18 @@ impl SharedStorageNode {
         let metadata_epoch = pg.metadata_command_replica_state()?.cluster_epoch;
         let mut metadata_state =
             pg.metadata_command_replica_state_for_heartbeat(node_id.as_u32(), metadata_epoch)?;
-        let mut has_pending_metadata_command = pg
-            .pending_metadata_command_slot(node_id.as_u32(), metadata_epoch)?
-            .is_some();
+        let pending_slot = pg.pending_metadata_command_slot_any_epoch(node_id.as_u32())?;
+        let mut has_pending_metadata_command = match pending_slot {
+            Some(slot) if slot.id.cluster_epoch() == metadata_epoch => true,
+            Some(_) => {
+                pg.clean_epoch_mismatched_orphan_pending_metadata_command_slot(
+                    node_id.as_u32(),
+                    metadata_epoch,
+                )?;
+                false
+            }
+            None => false,
+        };
         if has_pending_metadata_command {
             metadata_state =
                 pg.validate_metadata_command_replay_state(node_id.as_u32(), metadata_epoch)?;
@@ -1980,6 +1989,63 @@ mod tests {
             .unwrap();
 
         assert!(observation.has_pending_metadata_command);
+    }
+
+    #[test]
+    fn shared_node_pg_heartbeat_observation_cleans_epoch_mismatched_orphan_pending_command() {
+        let tmp = test_util::tempdir();
+        let node = SharedStorageNode::open(tmp.path(), &[0]).unwrap();
+        let bucket = bucket_name("future-pending-heartbeat");
+        let owner = crate::OwnerIdentity::from_principal("owner");
+        let config = CreateBucketConfig {
+            name: bucket.as_str(),
+            owner_principal: &owner.principal,
+            owner_canonical_id: &owner.canonical_id,
+            acl_grants: &AclGrants::default(),
+            public_read: false,
+            public_write: false,
+            versioning: BucketVersioningState::Disabled,
+            object_lock: BucketObjectLockConfig::default(),
+            ownership_controls: crate::BucketOwnershipControls {
+                object_ownership: crate::BucketObjectOwnership::ObjectWriter,
+            },
+        };
+        let future_epoch = ClusterEpoch::new(2).unwrap();
+        let command = MetadataCommandEnvelope::new(
+            MetadataCommandId::new(
+                future_epoch,
+                PgId::new(0),
+                MetadataCommandLogIndex::new(1).unwrap(),
+            ),
+            MetadataCommandPayload::CreateBucket(
+                CreateBucketCommand::from_config(&config, 123, 1).unwrap(),
+            ),
+        );
+        let metadata_state = {
+            let pg = node.get_pg(0).unwrap();
+            pg.try_insert_pending_metadata_command_slot(7, &command, Some(&bucket))
+                .unwrap();
+            assert!(pg
+                .pending_metadata_command_slot_any_epoch(7)
+                .unwrap()
+                .is_some());
+            pg.metadata_command_replica_state().unwrap()
+        };
+
+        let observation = node
+            .pg_heartbeat_observation(NodeId::new(7), PgId::new(0), PgState::Peering)
+            .unwrap();
+
+        assert_eq!(
+            observation.metadata_proof.applied_log_index,
+            metadata_state.applied_log_index
+        );
+        assert!(!observation.has_pending_metadata_command);
+        let pg = node.get_pg(0).unwrap();
+        assert!(pg
+            .pending_metadata_command_slot_any_epoch(7)
+            .unwrap()
+            .is_none());
     }
 
     #[test]
