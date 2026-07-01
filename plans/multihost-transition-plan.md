@@ -9834,6 +9834,11 @@ Phase 12.1 progress:
   capability that is safe for the leader-routing handle to implement. The
   directory smoke now proves that narrow handle can transfer leadership and
   replace voters through the routed client.
+- Added an object-safe status-list capability to the OpenRaft authority service
+  directory. This gives future RPC/admin wiring a narrow cluster-status surface
+  that can enumerate known raft authorities without naming the in-memory test
+  directory or the concrete OpenRaft wrapper; the directory smoke now verifies
+  the status list after leader transfer.
 
 1. define the replicated control-plane state machine:
    - state includes cluster epoch, PG count, PG state, PG acting sets, node

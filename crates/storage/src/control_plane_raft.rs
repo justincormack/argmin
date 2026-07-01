@@ -184,6 +184,16 @@ pub trait ControlPlaneRaftAuthorityServiceDirectory {
         &self,
         node_id: ControlPlaneRaftNodeId,
     ) -> ControlPlaneRaftFuture<'_, Result<ControlPlaneRaftAuthorityServiceHandle, ControlPlaneError>>;
+
+    fn authority_statuses(
+        &self,
+    ) -> ControlPlaneRaftFuture<
+        '_,
+        Result<
+            BTreeMap<ControlPlaneRaftNodeId, ControlPlaneRaftAuthorityStatus>,
+            ControlPlaneError,
+        >,
+    >;
 }
 
 #[derive(Clone)]
@@ -226,6 +236,13 @@ impl ControlPlaneRaftAuthorityServiceDirectoryHandle {
             })?;
         self.authority_service_for_node(leader_id).await
     }
+
+    pub async fn authority_statuses(
+        &self,
+    ) -> Result<BTreeMap<ControlPlaneRaftNodeId, ControlPlaneRaftAuthorityStatus>, ControlPlaneError>
+    {
+        self.inner.authority_statuses().await
+    }
 }
 
 impl fmt::Debug for ControlPlaneRaftAuthorityServiceDirectoryHandle {
@@ -242,6 +259,18 @@ impl ControlPlaneRaftAuthorityServiceDirectory for ControlPlaneRaftAuthorityServ
     ) -> ControlPlaneRaftFuture<'_, Result<ControlPlaneRaftAuthorityServiceHandle, ControlPlaneError>>
     {
         self.inner.authority_service_for_node(node_id)
+    }
+
+    fn authority_statuses(
+        &self,
+    ) -> ControlPlaneRaftFuture<
+        '_,
+        Result<
+            BTreeMap<ControlPlaneRaftNodeId, ControlPlaneRaftAuthorityStatus>,
+            ControlPlaneError,
+        >,
+    > {
+        self.inner.authority_statuses()
     }
 }
 
@@ -3186,6 +3215,41 @@ mod tests {
             })();
             Box::pin(std::future::ready(result))
         }
+
+        fn authority_statuses(
+            &self,
+        ) -> ControlPlaneRaftFuture<
+            '_,
+            Result<
+                BTreeMap<ControlPlaneRaftNodeId, ControlPlaneRaftAuthorityStatus>,
+                ControlPlaneError,
+            >,
+        > {
+            Box::pin(async move {
+                let services = {
+                    let services =
+                        self.services
+                            .lock()
+                            .map_err(|_| ControlPlaneError::RpcRemote {
+                                message: "in-memory test authority service directory lock poisoned"
+                                    .to_string(),
+                            })?;
+                    services.clone()
+                };
+                let mut statuses = BTreeMap::new();
+                for (node_id, service) in services {
+                    let status = service.status().await.map_err(|error| {
+                        ControlPlaneError::RpcRemote {
+                            message: format!(
+                                "in-memory test authority service directory status for node {node_id} failed: {error:?}"
+                            ),
+                        }
+                    })?;
+                    statuses.insert(node_id, status);
+                }
+                Ok(statuses)
+            })
+        }
     }
 
     impl RaftNetworkFactory<ControlPlaneRaftTypeConfig> for InMemoryRaftNetworkFactory {
@@ -5271,6 +5335,30 @@ mod tests {
                 "authority service directory wait for observer transfer view",
             )
             .await;
+            let transferred_statuses = expect_bounded_control_plane_raft(
+                directory.authority_statuses(),
+                operation_timeout,
+                "authority service directory statuses after transfer",
+            )
+            .await;
+            assert_eq!(
+                transferred_statuses
+                    .keys()
+                    .copied()
+                    .collect::<BTreeSet<_>>(),
+                BTreeSet::from([411, 412])
+            );
+            let old_leader_status = transferred_statuses
+                .get(&411)
+                .expect("directory should report old leader");
+            assert_eq!(old_leader_status.current_leader(), Some(412));
+            assert!(!old_leader_status.local_leader());
+            let new_leader_status = transferred_statuses
+                .get(&412)
+                .expect("directory should report new leader");
+            assert_eq!(new_leader_status.current_leader(), Some(412));
+            assert!(new_leader_status.local_leader());
+            assert!(new_leader_status.linearized_authority_serving());
             let routed_write = expect_bounded_control_plane_raft(
                 routed_client.submit_control_plane_command(
                     ControlPlaneCommand::MarkNodeAvailability {
