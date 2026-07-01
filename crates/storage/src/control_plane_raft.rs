@@ -208,16 +208,6 @@ pub trait ControlPlaneRaftAuthorityNodeLifecycle {
     fn shutdown(&self) -> ControlPlaneRaftFuture<'_, Result<(), ControlPlaneError>>;
 }
 
-pub trait ControlPlaneRaftAuthorityLifecycle:
-    ControlPlaneRaftAuthorityBootstrap + ControlPlaneRaftAuthorityNodeLifecycle
-{
-}
-
-impl<T> ControlPlaneRaftAuthorityLifecycle for T where
-    T: ControlPlaneRaftAuthorityBootstrap + ControlPlaneRaftAuthorityNodeLifecycle
-{
-}
-
 pub trait ControlPlaneRaftAuthorityAdmin:
     ControlPlaneRaftLeaderRoutedAdmin
     + ControlPlaneRaftAuthorityBootstrap
@@ -1161,79 +1151,6 @@ impl fmt::Debug for ControlPlaneRaftAuthorityNodeLifecycleHandle {
 }
 
 impl ControlPlaneRaftAuthorityNodeLifecycle for ControlPlaneRaftAuthorityNodeLifecycleHandle {
-    fn wait_for_applied_index_at_least(
-        &self,
-        index: u64,
-        timeout: Duration,
-        message: &'static str,
-    ) -> ControlPlaneRaftFuture<'_, Result<(), ControlPlaneError>> {
-        self.inner
-            .wait_for_applied_index_at_least(index, timeout, message)
-    }
-
-    fn wait_for_current_leader(
-        &self,
-        leader_id: ControlPlaneRaftNodeId,
-        timeout: Duration,
-        message: &'static str,
-    ) -> ControlPlaneRaftFuture<'_, Result<(), ControlPlaneError>> {
-        self.inner
-            .wait_for_current_leader(leader_id, timeout, message)
-    }
-
-    fn shutdown(&self) -> ControlPlaneRaftFuture<'_, Result<(), ControlPlaneError>> {
-        self.inner.shutdown()
-    }
-}
-
-#[derive(Clone)]
-pub struct ControlPlaneRaftAuthorityLifecycleHandle {
-    inner: Arc<dyn ControlPlaneRaftAuthorityLifecycle + Send + Sync>,
-}
-
-impl ControlPlaneRaftAuthorityLifecycleHandle {
-    pub fn new<T>(authority: Arc<T>) -> Self
-    where
-        T: ControlPlaneRaftAuthorityLifecycle + Send + Sync + 'static,
-    {
-        Self { inner: authority }
-    }
-
-    pub fn from_authority(
-        authority: Arc<dyn ControlPlaneRaftAuthorityLifecycle + Send + Sync>,
-    ) -> Self {
-        Self { inner: authority }
-    }
-
-    #[must_use]
-    pub fn as_authority(
-        &self,
-    ) -> &(dyn ControlPlaneRaftAuthorityLifecycle + Send + Sync + 'static) {
-        &*self.inner
-    }
-}
-
-impl fmt::Debug for ControlPlaneRaftAuthorityLifecycleHandle {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("ControlPlaneRaftAuthorityLifecycleHandle")
-            .finish_non_exhaustive()
-    }
-}
-
-impl ControlPlaneRaftAuthorityBootstrap for ControlPlaneRaftAuthorityLifecycleHandle {
-    fn initialize_membership(
-        &self,
-        nodes: BTreeMap<ControlPlaneRaftNodeId, BasicNode>,
-    ) -> ControlPlaneRaftFuture<'_, Result<(), ControlPlaneError>> {
-        self.inner.initialize_membership(nodes)
-    }
-
-    fn is_initialized(&self) -> ControlPlaneRaftFuture<'_, Result<bool, ControlPlaneError>> {
-        self.inner.is_initialized()
-    }
-}
-
-impl ControlPlaneRaftAuthorityNodeLifecycle for ControlPlaneRaftAuthorityLifecycleHandle {
     fn wait_for_applied_index_at_least(
         &self,
         index: u64,
@@ -6103,11 +6020,14 @@ mod tests {
             let authority2 = Arc::new(authority2);
             let service1 = ControlPlaneRaftAuthorityServiceHandle::new(Arc::clone(&authority1));
             let service2 = ControlPlaneRaftAuthorityServiceHandle::new(Arc::clone(&authority2));
-            let lifecycle1 = ControlPlaneRaftAuthorityLifecycleHandle::new(Arc::clone(&authority1));
-            let lifecycle2 = ControlPlaneRaftAuthorityLifecycleHandle::new(Arc::clone(&authority2));
+            let bootstrap1 = ControlPlaneRaftAuthorityBootstrapHandle::new(Arc::clone(&authority1));
+            let lifecycle1 =
+                ControlPlaneRaftAuthorityNodeLifecycleHandle::new(Arc::clone(&authority1));
+            let lifecycle2 =
+                ControlPlaneRaftAuthorityNodeLifecycleHandle::new(Arc::clone(&authority2));
             let authority_service1 = service1.as_authority_service();
 
-            assert!(lifecycle1.is_initialized().await.unwrap());
+            assert!(bootstrap1.is_initialized().await.unwrap());
             let bootstrap = expect_bounded_control_plane_raft(
                 authority_service1.submit_control_plane_command(
                     ControlPlaneCommand::BootstrapInitialClusterMap {

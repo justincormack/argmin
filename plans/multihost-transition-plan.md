@@ -9969,6 +9969,10 @@ Phase 12.1 progress:
   directory surface, so post-bootstrap routed reads, writes, status, and
   membership operations do not ask a full-service directory for bootstrap or
   lifecycle-capable services.
+- Removed the remaining combined bootstrap/node-lifecycle handle. Test and
+  initialization wiring now use bootstrap-only handles for membership
+  initialization state and node-lifecycle-only handles for applied-index waits,
+  leader observation, and shutdown.
 
 1. define the replicated control-plane state machine:
    - state includes cluster epoch, PG count, PG state, PG acting sets, node
