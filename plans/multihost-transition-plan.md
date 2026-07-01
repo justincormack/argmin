@@ -9159,6 +9159,19 @@ Keep an explicit Phase 11 close-out before treating the phase as soak-clean:
          that seeds a durable `final_visibility_check` attempt and fails if the
          worker repeats any exact-bucket drain phase instead of resuming at the
          final proof.
+         A route-change-restart soak failure at `a3ce3c64` showed another
+         final-visibility boundary issue: the foreground request completed the
+         final visibility scan after its begin budget was already exhausted,
+         then installed `MarkBucketDeleting` and immediately failed applying it
+         because the shared proof/apply budget had no time left. The begin path
+         now checks the begin budget again after final visibility and before
+         allocating/installing the mark command, so an over-budget request
+         preserves the durable final-visibility cursor instead of dirtying the
+         command slot. Once a matching mark command exists, applying it uses a
+         fresh command-apply budget with separate diagnostics
+         (`bucket_delete_mark_deleting_apply`), because at that point the
+         system should advance the irreversible command rather than fail
+         immediately on already-spent proof budget.
       5. status: open. Revisit reservation classification only after attempts are resumable;
          it should be an optimization on top of a convergent state machine, not
          the convergence mechanism itself.

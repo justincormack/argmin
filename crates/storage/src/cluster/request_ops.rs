@@ -4417,6 +4417,11 @@ impl super::StorageCluster {
                     "visibility_check_done",
                     format!("iteration={loop_iteration}"),
                 );
+                self.check_bucket_delete_begin_work_budget(
+                    bucket,
+                    Some(started),
+                    "bucket delete final visibility budget exhausted before mark deleting",
+                )?;
                 Self::emit_bucket_delete_begin_loop_step(
                     bucket,
                     pg_id,
@@ -4556,12 +4561,18 @@ impl super::StorageCluster {
                     clear_pending_on_zero_apply
                 ),
             );
+            let mut mark_apply_budget = super::RequestWorkBudget::new(
+                std::time::Duration::from_millis(METADATA_COMMAND_APPLY_RETRY_BUDGET_MILLIS),
+                None,
+            )
+            .for_operation("bucket_delete_mark_deleting_apply")
+            .for_pg(pg_id);
             let outcome = self
                 .finish_pending_metadata_command_to_acting_set_allow_partial_exact_conflict_retry_with_work_budget(
                     pg_id,
                     &command,
                     clear_pending_on_zero_apply,
-                    &mut work_budget,
+                    &mut mark_apply_budget,
                 )
                 .map_err(bucket_snapshot_error_to_bucket_write_drain_error)?;
             Self::emit_bucket_delete_begin_loop_step(
