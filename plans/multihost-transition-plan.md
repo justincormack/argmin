@@ -9812,19 +9812,18 @@ Phase 12.1 progress:
   existing linearized/admin/service handle pattern. The directory smoke now
   routes through that handle, so future RPC/client code can receive a directory
   capability without depending on the concrete directory implementation.
-- Added a leader-routing helper on the OpenRaft authority service directory
-  handle. Callers can now combine an observed authority status with the service
-  directory to resolve the current leader service without naming the concrete
-  OpenRaft wrapper; the directory smoke now transfers leadership and serves a
-  runtime-map read through the status-derived leader route.
+- Removed the earlier status-derived leader route on the OpenRaft authority
+  service directory after adding the directory-owned serving-authority selector.
+  Direct and routed reads now use the same fail-closed directory decision, so a
+  stale observer status cannot choose a serving capability.
 - Added a cloneable OpenRaft authority routing handle that composes an observer
   service with the service directory. Linearized command submission and
-  runtime-map reads now have a capability-level client surface that observes
-  the current leader, resolves it through the directory, and executes the
-  operation on the leader service. Its status view is routed to the same leader
-  capability, with the observer-local status exposed only through an explicit
-  observer method; the directory smoke proves the same client continues routing
-  correctly after leadership transfer.
+  runtime-map reads now have a capability-level client surface that asks the
+  directory for the current serving authority and executes the operation on
+  that service. Its status view is routed to the same serving capability, with
+  the observer-local status exposed only through an explicit observer method;
+  the directory smoke proves the same client continues routing correctly after
+  leadership transfer.
 - Extended that routing handle with explicit leader-routed admin helpers for
   operations that require an initialized current leader: leadership transfer,
   voter replacement, and learner addition. Cluster initialization remains

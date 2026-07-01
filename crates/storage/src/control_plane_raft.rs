@@ -222,21 +222,6 @@ impl ControlPlaneRaftAuthorityServiceDirectoryHandle {
         &*self.inner
     }
 
-    pub async fn authority_service_for_status_leader(
-        &self,
-        status: &ControlPlaneRaftAuthorityStatus,
-    ) -> Result<ControlPlaneRaftAuthorityServiceHandle, ControlPlaneError> {
-        let leader_id = status
-            .current_leader()
-            .ok_or_else(|| ControlPlaneError::RpcRemote {
-                message: format!(
-                    "authority service directory cannot route from node {} without a current leader",
-                    status.node_id()
-                ),
-            })?;
-        self.authority_service_for_node(leader_id).await
-    }
-
     pub async fn authority_statuses(
         &self,
     ) -> Result<BTreeMap<ControlPlaneRaftNodeId, ControlPlaneRaftAuthorityStatus>, ControlPlaneError>
@@ -5538,12 +5523,6 @@ mod tests {
             assert_eq!(observer_status.node_id(), 411);
             assert_eq!(observer_status.current_leader(), Some(412));
             assert!(!observer_status.local_leader());
-            let routed_leader_service = expect_bounded_control_plane_raft(
-                directory.authority_service_for_status_leader(&follower_status),
-                operation_timeout,
-                "authority service directory route observed leader",
-            )
-            .await;
             let runtime_map = expect_bounded_control_plane_raft(
                 routed_client.linearized_runtime_map_snapshot(91_000),
                 operation_timeout,
@@ -5560,9 +5539,9 @@ mod tests {
                 .iter()
                 .any(|node| node.node_id() == NodeId::new(412)));
             let direct_runtime_map = expect_bounded_control_plane_raft(
-                routed_leader_service.linearized_runtime_map_snapshot(91_001),
+                serving_service.linearized_runtime_map_snapshot(91_001),
                 operation_timeout,
-                "authority service directory direct leader runtime map read",
+                "authority service directory direct serving runtime map read",
             )
             .await;
             assert_eq!(
