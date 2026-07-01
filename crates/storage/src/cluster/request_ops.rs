@@ -11772,6 +11772,8 @@ impl super::StorageCluster {
             .bucket_write_reservation_client()
             .bucket_delete_attempt_outcome(pg_id, bucket)?;
 
+        let mut object_version_samples = Vec::new();
+        let mut object_version_sample_errors = Vec::new();
         let mut payload_reclaim_roots = Vec::new();
         let mut payload_reclaim_root_errors = Vec::new();
         for raw_pg_id in self.metadata_pg_ids() {
@@ -11782,13 +11784,44 @@ impl super::StorageCluster {
             {
                 Ok(node) => node,
                 Err(error) => {
+                    let detail = error.to_string();
+                    object_version_sample_errors.push(BucketDeleteDebugObjectVersionSampleError {
+                        object_pg_id: raw_pg_id,
+                        detail: detail.clone(),
+                    });
                     payload_reclaim_root_errors.push(BucketDeleteDebugPayloadReclaimRootError {
                         object_pg_id: raw_pg_id,
-                        detail: error.to_string(),
+                        detail,
                     });
                     continue;
                 }
             };
+            match node
+                .object_listing_metadata_client()
+                .list_object_versions_page(
+                    object_pg_id,
+                    &ListObjectVersionsReq {
+                        bucket: bucket.clone(),
+                        prefix: None,
+                        key_marker: None,
+                        version_id_marker: None,
+                        start_at: None,
+                        max_keys: 1,
+                    },
+                ) {
+                Ok(resp) => {
+                    if let Some(stored) = resp.versions.into_iter().next() {
+                        object_version_samples
+                            .push(Self::bucket_delete_debug_object_sample(raw_pg_id, stored));
+                    }
+                }
+                Err(error) => {
+                    object_version_sample_errors.push(BucketDeleteDebugObjectVersionSampleError {
+                        object_pg_id: raw_pg_id,
+                        detail: error.to_string(),
+                    });
+                }
+            }
             let root = match node
                 .object_mutation_metadata_client()
                 .get_bucket_payload_reclaim_root(object_pg_id, bucket)
@@ -11814,10 +11847,33 @@ impl super::StorageCluster {
                 });
                 continue;
             }
+            let reclaim_details = match node
+                .object_mutation_metadata_client()
+                .get_object_payload_reclaim(
+                    object_pg_id,
+                    &root.bucket,
+                    &root.key,
+                    root.generation_id,
+                ) {
+                Ok(Some(reclaim)) => Some(Self::bucket_delete_debug_reclaim_details(&reclaim)),
+                Ok(None) => None,
+                Err(error) => {
+                    payload_reclaim_root_errors.push(BucketDeleteDebugPayloadReclaimRootError {
+                        object_pg_id: raw_pg_id,
+                        detail: error.to_string(),
+                    });
+                    None
+                }
+            };
+            let (reclaim_kind, reclaim_created_at, reclaim_item_count) =
+                reclaim_details.unwrap_or((None, None, None));
             payload_reclaim_roots.push(BucketDeleteDebugPayloadReclaimRoot {
                 object_pg_id: raw_pg_id,
                 key: root.key,
                 generation_id: root.generation_id,
+                reclaim_kind,
+                reclaim_created_at,
+                reclaim_item_count,
             });
         }
 
@@ -11832,10 +11888,59 @@ impl super::StorageCluster {
             durable_write_drain,
             pending_metadata_command,
             finalize_claim,
+            object_version_samples,
+            object_version_sample_errors,
             payload_reclaim_roots,
             payload_reclaim_root_errors,
             attempt_outcome,
         })
+    }
+
+    fn bucket_delete_debug_object_sample(
+        object_pg_id: u32,
+        stored: StoredObject,
+    ) -> BucketDeleteDebugObjectVersionSample {
+        match stored {
+            StoredObject::Live(record) => BucketDeleteDebugObjectVersionSample {
+                object_pg_id,
+                kind: BucketDeleteDebugObjectVersionKind::Live,
+                key: record.key,
+                version_id: record.version_id,
+                generation_id: Some(record.generation_id),
+                size: Some(record.size),
+                layout: Some(record.layout),
+                last_modified: record.last_modified,
+                became_noncurrent_at: record.became_noncurrent_at,
+            },
+            StoredObject::DeleteMarker(record) => BucketDeleteDebugObjectVersionSample {
+                object_pg_id,
+                kind: BucketDeleteDebugObjectVersionKind::DeleteMarker,
+                key: record.key,
+                version_id: record.version_id,
+                generation_id: None,
+                size: None,
+                layout: None,
+                last_modified: record.last_modified,
+                became_noncurrent_at: None,
+            },
+        }
+    }
+
+    fn bucket_delete_debug_reclaim_details(
+        reclaim: &ObjectPayloadReclaimCommand,
+    ) -> (Option<ObjectPayloadReclaimKind>, Option<u64>, Option<usize>) {
+        match reclaim {
+            ObjectPayloadReclaimCommand::Segments(record) => (
+                Some(ObjectPayloadReclaimKind::ObjectSegments),
+                Some(record.created_at),
+                Some(record.segments.len()),
+            ),
+            ObjectPayloadReclaimCommand::Multipart(record) => (
+                Some(ObjectPayloadReclaimKind::Multipart),
+                Some(record.created_at),
+                Some(record.parts.len()),
+            ),
+        }
     }
 
     #[cfg(any(test, feature = "test-hooks"))]

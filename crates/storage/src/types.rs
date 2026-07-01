@@ -2529,12 +2529,43 @@ pub struct BucketDeleteDebugPendingCommand {
     pub log_index: u64,
 }
 
+/// Sanitized object-version row sample included in local-debug output.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BucketDeleteDebugObjectVersionSample {
+    pub object_pg_id: u32,
+    pub kind: BucketDeleteDebugObjectVersionKind,
+    pub key: ObjectKey,
+    pub version_id: VersionId,
+    pub generation_id: Option<GenerationId>,
+    pub size: Option<u64>,
+    pub layout: Option<ObjectLayout>,
+    pub last_modified: u64,
+    pub became_noncurrent_at: Option<u64>,
+}
+
+/// Sanitized object-version row kind included in local-debug output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BucketDeleteDebugObjectVersionKind {
+    Live,
+    DeleteMarker,
+}
+
+/// Object-version sample scan error fields included in local-debug output.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BucketDeleteDebugObjectVersionSampleError {
+    pub object_pg_id: u32,
+    pub detail: String,
+}
+
 /// Bucket-scoped payload reclaim root fields included in local-debug output.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BucketDeleteDebugPayloadReclaimRoot {
     pub object_pg_id: u32,
     pub key: ObjectKey,
     pub generation_id: GenerationId,
+    pub reclaim_kind: Option<ObjectPayloadReclaimKind>,
+    pub reclaim_created_at: Option<u64>,
+    pub reclaim_item_count: Option<usize>,
 }
 
 /// Payload reclaim root scan error fields included in local-debug output.
@@ -2557,6 +2588,8 @@ pub struct BucketDeleteDebugSnapshot {
     pub durable_write_drain: Option<BucketDeleteDebugDrain>,
     pub finalize_claim: Option<BucketDeleteDebugFinalizeClaim>,
     pub pending_metadata_command: Option<BucketDeleteDebugPendingCommand>,
+    pub object_version_samples: Vec<BucketDeleteDebugObjectVersionSample>,
+    pub object_version_sample_errors: Vec<BucketDeleteDebugObjectVersionSampleError>,
     pub payload_reclaim_roots: Vec<BucketDeleteDebugPayloadReclaimRoot>,
     pub payload_reclaim_root_errors: Vec<BucketDeleteDebugPayloadReclaimRootError>,
     pub attempt_outcome: Option<BucketDeleteAttemptOutcomeRecord>,

@@ -1239,6 +1239,46 @@ fn local_debug_bucket_delete_attempt_body(snapshot: &BucketDeleteDebugSnapshot) 
 
     writeln!(
         &mut body,
+        "object_version_samples_count={}",
+        snapshot.object_version_samples.len()
+    )
+    .expect("write to String");
+    for (index, sample) in snapshot.object_version_samples.iter().enumerate() {
+        writeln!(
+            &mut body,
+            "object_version_sample index={} object_pg_id={} kind={} key={:?} version_id={} generation_id={} size={} layout={} last_modified={} became_noncurrent_at={}",
+            index,
+            sample.object_pg_id,
+            local_debug_object_version_kind(sample.kind),
+            sample.key.as_str(),
+            sample.version_id,
+            local_debug_optional_generation_id(sample.generation_id),
+            local_debug_optional_u64(sample.size),
+            local_debug_optional_object_layout(sample.layout),
+            sample.last_modified,
+            local_debug_optional_u64(sample.became_noncurrent_at),
+        )
+        .expect("write to String");
+    }
+    writeln!(
+        &mut body,
+        "object_version_sample_errors_count={}",
+        snapshot.object_version_sample_errors.len()
+    )
+    .expect("write to String");
+    for (index, error) in snapshot.object_version_sample_errors.iter().enumerate() {
+        writeln!(
+            &mut body,
+            "object_version_sample_error index={} object_pg_id={} detail={}",
+            index,
+            error.object_pg_id,
+            observability::escaped(&error.detail),
+        )
+        .expect("write to String");
+    }
+
+    writeln!(
+        &mut body,
         "payload_reclaim_roots_count={}",
         snapshot.payload_reclaim_roots.len()
     )
@@ -1246,11 +1286,14 @@ fn local_debug_bucket_delete_attempt_body(snapshot: &BucketDeleteDebugSnapshot) 
     for (index, root) in snapshot.payload_reclaim_roots.iter().enumerate() {
         writeln!(
             &mut body,
-            "payload_reclaim_root index={} object_pg_id={} key={:?} generation_id={}",
+            "payload_reclaim_root index={} object_pg_id={} key={:?} generation_id={} reclaim_kind={} reclaim_created_at={} reclaim_item_count={}",
             index,
             root.object_pg_id,
             root.key.as_str(),
             root.generation_id.get(),
+            local_debug_optional_reclaim_kind(root.reclaim_kind),
+            local_debug_optional_u64(root.reclaim_created_at),
+            local_debug_optional_usize(root.reclaim_item_count),
         )
         .expect("write to String");
     }
@@ -1305,6 +1348,43 @@ fn local_debug_optional_u32(value: Option<u32>) -> String {
 
 fn local_debug_optional_u64(value: Option<u64>) -> String {
     value.map_or_else(|| "none".to_string(), |value| value.to_string())
+}
+
+fn local_debug_optional_usize(value: Option<usize>) -> String {
+    value.map_or_else(|| "none".to_string(), |value| value.to_string())
+}
+
+fn local_debug_optional_generation_id(value: Option<storage::GenerationId>) -> String {
+    value.map_or_else(|| "none".to_string(), |value| value.get().to_string())
+}
+
+fn local_debug_object_version_kind(
+    kind: storage::BucketDeleteDebugObjectVersionKind,
+) -> &'static str {
+    match kind {
+        storage::BucketDeleteDebugObjectVersionKind::Live => "live",
+        storage::BucketDeleteDebugObjectVersionKind::DeleteMarker => "delete_marker",
+    }
+}
+
+fn local_debug_optional_object_layout(value: Option<storage::ObjectLayout>) -> String {
+    match value {
+        None => "none".to_string(),
+        Some(storage::ObjectLayout::Standard) => "standard".to_string(),
+        Some(storage::ObjectLayout::MultipartManifest { parts_count }) => {
+            format!("multipart_manifest:{parts_count}")
+        }
+    }
+}
+
+fn local_debug_optional_reclaim_kind(
+    value: Option<storage::ObjectPayloadReclaimKind>,
+) -> &'static str {
+    match value {
+        None => "none",
+        Some(storage::ObjectPayloadReclaimKind::ObjectSegments) => "object_segments",
+        Some(storage::ObjectPayloadReclaimKind::Multipart) => "multipart",
+    }
 }
 
 fn local_debug_bucket_delete_attempt_outcome(
@@ -5127,6 +5207,14 @@ mod tests {
         );
         assert!(response.contains("finalize_claim=absent"), "{response}");
         assert!(
+            response.contains("object_version_samples_count=0"),
+            "{response}"
+        );
+        assert!(
+            response.contains("object_version_sample_errors_count=0"),
+            "{response}"
+        );
+        assert!(
             response.contains("payload_reclaim_roots_count=0"),
             "{response}"
         );
@@ -5180,10 +5268,47 @@ mod tests {
                 attempt_count: 2,
                 last_error: Some("retry\nlater".to_string()),
             }),
+            object_version_samples: vec![
+                storage::BucketDeleteDebugObjectVersionSample {
+                    object_pg_id: 6,
+                    kind: storage::BucketDeleteDebugObjectVersionKind::Live,
+                    key: storage::ObjectKey::try_from("live-key\none".to_string()).unwrap(),
+                    version_id: storage::VersionId::Versioned(
+                        std::num::NonZeroU64::new(77).unwrap(),
+                    ),
+                    generation_id: Some(storage::GenerationId::new(123).unwrap()),
+                    size: Some(456),
+                    layout: Some(storage::ObjectLayout::MultipartManifest {
+                        parts_count: std::num::NonZeroU32::new(3).unwrap(),
+                    }),
+                    last_modified: 3030,
+                    became_noncurrent_at: Some(4040),
+                },
+                storage::BucketDeleteDebugObjectVersionSample {
+                    object_pg_id: 7,
+                    kind: storage::BucketDeleteDebugObjectVersionKind::DeleteMarker,
+                    key: storage::ObjectKey::try_from("marker-key".to_string()).unwrap(),
+                    version_id: storage::VersionId::Null,
+                    generation_id: None,
+                    size: None,
+                    layout: None,
+                    last_modified: 5050,
+                    became_noncurrent_at: None,
+                },
+            ],
+            object_version_sample_errors: vec![
+                storage::BucketDeleteDebugObjectVersionSampleError {
+                    object_pg_id: 8,
+                    detail: "object route\nexpired".to_string(),
+                },
+            ],
             payload_reclaim_roots: vec![storage::BucketDeleteDebugPayloadReclaimRoot {
                 object_pg_id: 4,
                 key: storage::ObjectKey::try_from("root-key\none".to_string()).unwrap(),
                 generation_id: storage::GenerationId::new(99).unwrap(),
+                reclaim_kind: Some(storage::ObjectPayloadReclaimKind::ObjectSegments),
+                reclaim_created_at: Some(9090),
+                reclaim_item_count: Some(2),
             }],
             payload_reclaim_root_errors: vec![storage::BucketDeleteDebugPayloadReclaimRootError {
                 object_pg_id: 5,
@@ -5233,10 +5358,33 @@ mod tests {
         assert!(body.contains("lease_deadline=2020"), "{body}");
         assert!(body.contains("attempt_count=2"), "{body}");
         assert!(body.contains(r#"last_error="retry\nlater""#), "{body}");
+        assert!(body.contains("object_version_samples_count=2"), "{body}");
+        assert!(
+            body.contains(
+                r#"object_version_sample index=0 object_pg_id=6 kind=live key="live-key\none" version_id=77 generation_id=123 size=456 layout=multipart_manifest:3 last_modified=3030 became_noncurrent_at=4040"#
+            ),
+            "{body}"
+        );
+        assert!(
+            body.contains(
+                r#"object_version_sample index=1 object_pg_id=7 kind=delete_marker key="marker-key" version_id=null generation_id=none size=none layout=none last_modified=5050 became_noncurrent_at=none"#
+            ),
+            "{body}"
+        );
+        assert!(
+            body.contains("object_version_sample_errors_count=1"),
+            "{body}"
+        );
+        assert!(
+            body.contains(
+                r#"object_version_sample_error index=0 object_pg_id=8 detail="object route\nexpired""#
+            ),
+            "{body}"
+        );
         assert!(body.contains("payload_reclaim_roots_count=1"), "{body}");
         assert!(
             body.contains(
-                r#"payload_reclaim_root index=0 object_pg_id=4 key="root-key\none" generation_id=99"#
+                r#"payload_reclaim_root index=0 object_pg_id=4 key="root-key\none" generation_id=99 reclaim_kind=object_segments reclaim_created_at=9090 reclaim_item_count=2"#
             ),
             "{body}"
         );
