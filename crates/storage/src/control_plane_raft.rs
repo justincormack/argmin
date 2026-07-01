@@ -847,11 +847,17 @@ impl ControlPlaneRaftAuthorityRoutingHandle {
         self.directory.current_serving_authority_service().await
     }
 
+    pub async fn current_serving_routed_authority(
+        &self,
+    ) -> Result<ControlPlaneRaftRoutedAuthorityHandle, ControlPlaneError> {
+        self.directory.current_serving_routed_authority().await
+    }
+
     pub async fn submit_control_plane_command(
         &self,
         command: ControlPlaneCommand,
     ) -> Result<SubmittedControlPlaneRaftCommand, ControlPlaneError> {
-        self.current_serving_authority_service()
+        self.current_serving_routed_authority()
             .await?
             .submit_control_plane_command(command)
             .await
@@ -861,7 +867,7 @@ impl ControlPlaneRaftAuthorityRoutingHandle {
         &self,
         issued_at_ms: u64,
     ) -> Result<ClusterRuntimeMapSnapshot, ControlPlaneError> {
-        self.current_serving_authority_service()
+        self.current_serving_routed_authority()
             .await?
             .linearized_runtime_map_snapshot(issued_at_ms)
             .await
@@ -872,7 +878,7 @@ impl ControlPlaneRaftAuthorityRoutingHandle {
         voters: BTreeSet<ControlPlaneRaftNodeId>,
         retain_removed_voters_as_learners: bool,
     ) -> Result<LogIdOf<ControlPlaneRaftTypeConfig>, ControlPlaneError> {
-        self.current_serving_authority_service()
+        self.current_serving_routed_authority()
             .await?
             .replace_voters(voters, retain_removed_voters_as_learners)
             .await
@@ -884,7 +890,7 @@ impl ControlPlaneRaftAuthorityRoutingHandle {
         node: BasicNode,
         wait_for_catch_up: bool,
     ) -> Result<LogIdOf<ControlPlaneRaftTypeConfig>, ControlPlaneError> {
-        self.current_serving_authority_service()
+        self.current_serving_routed_authority()
             .await?
             .add_learner(node_id, node, wait_for_catch_up)
             .await
@@ -894,7 +900,7 @@ impl ControlPlaneRaftAuthorityRoutingHandle {
         &self,
         node_id: ControlPlaneRaftNodeId,
     ) -> Result<(), ControlPlaneError> {
-        self.current_serving_authority_service()
+        self.current_serving_routed_authority()
             .await?
             .transfer_leadership_to(node_id)
             .await
@@ -907,7 +913,7 @@ impl ControlPlaneRaftAuthorityRoutingHandle {
     }
 
     pub async fn status(&self) -> Result<ControlPlaneRaftAuthorityStatus, ControlPlaneError> {
-        self.current_serving_authority_service()
+        self.current_serving_routed_authority()
             .await?
             .status()
             .await
@@ -5692,6 +5698,20 @@ mod tests {
             .await;
             assert_eq!(serving_routed_status.node_id(), 412);
             assert!(serving_routed_status.linearized_authority_serving());
+            let routed_client_serving_authority = expect_bounded_control_plane_raft(
+                routed_client.current_serving_routed_authority(),
+                operation_timeout,
+                "authority routing handle current serving routed authority",
+            )
+            .await;
+            let routed_client_serving_status = expect_bounded_control_plane_raft(
+                routed_client_serving_authority.status(),
+                operation_timeout,
+                "authority routing handle current serving routed authority status",
+            )
+            .await;
+            assert_eq!(routed_client_serving_status.node_id(), 412);
+            assert!(routed_client_serving_status.linearized_authority_serving());
             let routed_write = expect_bounded_control_plane_raft(
                 routed_authority.submit_control_plane_command(
                     ControlPlaneCommand::MarkNodeAvailability {

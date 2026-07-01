@@ -9888,6 +9888,11 @@ Phase 12.1 progress:
   directory for command/read/status plus leader-routed membership access without
   receiving bootstrap, wait, or shutdown methods. The directory smoke now uses
   that narrow capability for direct serving status and runtime-map reads.
+- Tightened the routing handle to consume that narrow current-serving
+  routed-authority capability internally for post-bootstrap command, read,
+  status, and leader-routed membership operations. The full service lookup
+  remains available from the directory for bootstrap/lifecycle callers, while
+  routed clients now avoid depending on the broader service surface.
 
 1. define the replicated control-plane state machine:
    - state includes cluster epoch, PG count, PG state, PG acting sets, node
