@@ -9816,6 +9816,10 @@ Phase 12.1 progress:
   service directory after adding the directory-owned serving-authority selector.
   Direct and routed reads now use the same fail-closed directory decision, so a
   stale observer status cannot choose a serving capability.
+- Renamed the routing handle's internal route helper from "current leader" to
+  "current serving authority" so the code-level boundary matches the selector:
+  operations route through the directory's serving-capability decision, not
+  through an observer's current-leader status field.
 - Added a cloneable OpenRaft authority routing handle that composes an observer
   service with the service directory. Linearized command submission and
   runtime-map reads now have a capability-level client surface that asks the
