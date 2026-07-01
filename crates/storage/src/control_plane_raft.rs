@@ -407,22 +407,6 @@ impl ControlPlaneRaftAuthorityServiceDirectoryHandle {
     {
         self.inner.authority_statuses().await
     }
-
-    pub async fn current_serving_authority_service(
-        &self,
-    ) -> Result<ControlPlaneRaftAuthorityServiceHandle, ControlPlaneError> {
-        let statuses = self.authority_statuses().await?;
-        let node_id = current_serving_authority_node_id(&statuses)?;
-        self.authority_service_for_node(node_id).await
-    }
-
-    pub async fn current_serving_routed_authority(
-        &self,
-    ) -> Result<ControlPlaneRaftRoutedAuthorityHandle, ControlPlaneError> {
-        let statuses = self.authority_statuses().await?;
-        let node_id = current_serving_authority_node_id(&statuses)?;
-        self.routed_authority_for_node(node_id).await
-    }
 }
 
 fn current_serving_authority_node_id(
@@ -433,7 +417,7 @@ fn current_serving_authority_node_id(
         if *directory_node_id != status.node_id() {
             return Err(ControlPlaneError::RpcRemote {
                 message: format!(
-                    "authority service directory status key {} disagrees with reported node {}",
+                    "raft authority directory status key {} disagrees with reported node {}",
                     directory_node_id,
                     status.node_id()
                 ),
@@ -445,7 +429,7 @@ fn current_serving_authority_node_id(
         if let Some(existing_node_id) = serving_node_id {
             return Err(ControlPlaneError::RpcRemote {
                 message: format!(
-                    "authority service directory found multiple serving raft authorities: {existing_node_id} and {}",
+                    "raft authority directory found multiple serving raft authorities: {existing_node_id} and {}",
                     status.node_id()
                 ),
             });
@@ -453,7 +437,7 @@ fn current_serving_authority_node_id(
         serving_node_id = Some(status.node_id());
     }
     serving_node_id.ok_or_else(|| ControlPlaneError::RpcRemote {
-        message: "authority service directory found no serving raft authority".to_string(),
+        message: "raft authority directory found no serving raft authority".to_string(),
     })
 }
 
@@ -6426,29 +6410,6 @@ mod tests {
             assert_eq!(new_leader_status.current_leader(), Some(412));
             assert!(new_leader_status.local_leader());
             assert!(new_leader_status.linearized_authority_serving());
-            let serving_service = expect_bounded_control_plane_raft(
-                directory.current_serving_authority_service(),
-                operation_timeout,
-                "authority service directory current serving authority",
-            )
-            .await;
-            let serving_status = serving_service.status().await.unwrap();
-            assert_eq!(serving_status.node_id(), 412);
-            assert!(serving_status.linearized_authority_serving());
-            let serving_routed_authority = expect_bounded_control_plane_raft(
-                directory.current_serving_routed_authority(),
-                operation_timeout,
-                "authority service directory current serving routed authority",
-            )
-            .await;
-            let serving_routed_status = expect_bounded_control_plane_raft(
-                serving_routed_authority.status(),
-                operation_timeout,
-                "authority service directory current serving routed authority status",
-            )
-            .await;
-            assert_eq!(serving_routed_status.node_id(), 412);
-            assert!(serving_routed_status.linearized_authority_serving());
             let routed_directory_authority = expect_bounded_control_plane_raft(
                 routed_directory.routed_authority_for_node(412),
                 operation_timeout,
@@ -6544,7 +6505,7 @@ mod tests {
                 .iter()
                 .any(|node| node.node_id() == NodeId::new(412)));
             let direct_runtime_map = expect_bounded_control_plane_raft(
-                serving_routed_authority.linearized_runtime_map_snapshot(91_001),
+                routed_directory_serving_authority.linearized_runtime_map_snapshot(91_001),
                 operation_timeout,
                 "authority service directory current serving routed runtime map read",
             )
@@ -6647,13 +6608,13 @@ mod tests {
                 422,
                 ControlPlaneRaftAuthorityServiceHandle::new(Arc::clone(&authority2)),
             );
-            let directory =
-                ControlPlaneRaftAuthorityServiceDirectoryHandle::new(Arc::new(directory));
+            let routed_directory =
+                ControlPlaneRaftRoutedAuthorityDirectoryHandle::new(Arc::new(directory));
 
             let err = expect_bounded_control_plane_raft_error(
-                directory.current_serving_authority_service(),
+                routed_directory.current_serving_routed_authority(),
                 operation_timeout,
-                "authority service directory rejects multiple serving authorities",
+                "routed authority directory rejects multiple serving authorities",
             )
             .await;
             assert!(matches!(

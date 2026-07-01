@@ -9964,6 +9964,11 @@ Phase 12.1 progress:
   read, membership-admin, or wait/shutdown capability; the in-memory raft
   directory smoke verifies both missing-node rejection and initialized-state
   lookup through that narrow surface.
+- Removed current-serving lookup helpers from the broad authority-service
+  directory handle. Current-serving selection now stays on the routed-authority
+  directory surface, so post-bootstrap routed reads, writes, status, and
+  membership operations do not ask a full-service directory for bootstrap or
+  lifecycle-capable services.
 
 1. define the replicated control-plane state machine:
    - state includes cluster epoch, PG count, PG state, PG acting sets, node
