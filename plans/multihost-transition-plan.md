@@ -9987,6 +9987,11 @@ Phase 12.1 progress:
   directly from the concrete OpenRaft authority, so no remaining Phase 12
   raft capability hands callers the full command/read/status/admin/bootstrap/
   lifecycle surface by accident.
+- Split status enumeration out of the bootstrap, node-lifecycle, and
+  routed-authority directory traits. Directory capabilities now perform only
+  node-id lookup for their own narrow surface, while leader-routing clients take
+  an explicit status-list handle when they need to discover the current serving
+  authority.
 
 1. define the replicated control-plane state machine:
    - state includes cluster epoch, PG count, PG state, PG acting sets, node

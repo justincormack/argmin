@@ -244,9 +244,7 @@ pub trait ControlPlaneRaftAuthorityStatusListSource {
     >;
 }
 
-pub trait ControlPlaneRaftAuthorityBootstrapDirectory:
-    ControlPlaneRaftAuthorityStatusListSource
-{
+pub trait ControlPlaneRaftAuthorityBootstrapDirectory {
     fn authority_bootstrap_for_node(
         &self,
         node_id: ControlPlaneRaftNodeId,
@@ -256,9 +254,7 @@ pub trait ControlPlaneRaftAuthorityBootstrapDirectory:
     >;
 }
 
-pub trait ControlPlaneRaftAuthorityNodeLifecycleDirectory:
-    ControlPlaneRaftAuthorityStatusListSource
-{
+pub trait ControlPlaneRaftAuthorityNodeLifecycleDirectory {
     fn authority_node_lifecycle_for_node(
         &self,
         node_id: ControlPlaneRaftNodeId,
@@ -268,9 +264,7 @@ pub trait ControlPlaneRaftAuthorityNodeLifecycleDirectory:
     >;
 }
 
-pub trait ControlPlaneRaftRoutedAuthorityDirectory:
-    ControlPlaneRaftAuthorityStatusListSource
-{
+pub trait ControlPlaneRaftRoutedAuthorityDirectory {
     fn routed_authority_for_node(
         &self,
         node_id: ControlPlaneRaftNodeId,
@@ -390,13 +384,6 @@ impl ControlPlaneRaftAuthorityBootstrapDirectoryHandle {
         &*self.inner
     }
 
-    pub async fn authority_statuses(
-        &self,
-    ) -> Result<BTreeMap<ControlPlaneRaftNodeId, ControlPlaneRaftAuthorityStatus>, ControlPlaneError>
-    {
-        self.inner.authority_statuses().await
-    }
-
     pub async fn authority_bootstrap_for_node(
         &self,
         node_id: ControlPlaneRaftNodeId,
@@ -409,22 +396,6 @@ impl fmt::Debug for ControlPlaneRaftAuthorityBootstrapDirectoryHandle {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ControlPlaneRaftAuthorityBootstrapDirectoryHandle")
             .finish_non_exhaustive()
-    }
-}
-
-impl ControlPlaneRaftAuthorityStatusListSource
-    for ControlPlaneRaftAuthorityBootstrapDirectoryHandle
-{
-    fn authority_statuses(
-        &self,
-    ) -> ControlPlaneRaftFuture<
-        '_,
-        Result<
-            BTreeMap<ControlPlaneRaftNodeId, ControlPlaneRaftAuthorityStatus>,
-            ControlPlaneError,
-        >,
-    > {
-        self.inner.authority_statuses()
     }
 }
 
@@ -468,13 +439,6 @@ impl ControlPlaneRaftAuthorityNodeLifecycleDirectoryHandle {
         &*self.inner
     }
 
-    pub async fn authority_statuses(
-        &self,
-    ) -> Result<BTreeMap<ControlPlaneRaftNodeId, ControlPlaneRaftAuthorityStatus>, ControlPlaneError>
-    {
-        self.inner.authority_statuses().await
-    }
-
     pub async fn authority_node_lifecycle_for_node(
         &self,
         node_id: ControlPlaneRaftNodeId,
@@ -487,22 +451,6 @@ impl fmt::Debug for ControlPlaneRaftAuthorityNodeLifecycleDirectoryHandle {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ControlPlaneRaftAuthorityNodeLifecycleDirectoryHandle")
             .finish_non_exhaustive()
-    }
-}
-
-impl ControlPlaneRaftAuthorityStatusListSource
-    for ControlPlaneRaftAuthorityNodeLifecycleDirectoryHandle
-{
-    fn authority_statuses(
-        &self,
-    ) -> ControlPlaneRaftFuture<
-        '_,
-        Result<
-            BTreeMap<ControlPlaneRaftNodeId, ControlPlaneRaftAuthorityStatus>,
-            ControlPlaneError,
-        >,
-    > {
-        self.inner.authority_statuses()
     }
 }
 
@@ -546,26 +494,11 @@ impl ControlPlaneRaftRoutedAuthorityDirectoryHandle {
         &*self.inner
     }
 
-    pub async fn authority_statuses(
-        &self,
-    ) -> Result<BTreeMap<ControlPlaneRaftNodeId, ControlPlaneRaftAuthorityStatus>, ControlPlaneError>
-    {
-        self.inner.authority_statuses().await
-    }
-
     pub async fn routed_authority_for_node(
         &self,
         node_id: ControlPlaneRaftNodeId,
     ) -> Result<ControlPlaneRaftRoutedAuthorityHandle, ControlPlaneError> {
         self.inner.routed_authority_for_node(node_id).await
-    }
-
-    pub async fn current_serving_routed_authority(
-        &self,
-    ) -> Result<ControlPlaneRaftRoutedAuthorityHandle, ControlPlaneError> {
-        let statuses = self.authority_statuses().await?;
-        let node_id = current_serving_authority_node_id(&statuses)?;
-        self.routed_authority_for_node(node_id).await
     }
 }
 
@@ -573,20 +506,6 @@ impl fmt::Debug for ControlPlaneRaftRoutedAuthorityDirectoryHandle {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ControlPlaneRaftRoutedAuthorityDirectoryHandle")
             .finish_non_exhaustive()
-    }
-}
-
-impl ControlPlaneRaftAuthorityStatusListSource for ControlPlaneRaftRoutedAuthorityDirectoryHandle {
-    fn authority_statuses(
-        &self,
-    ) -> ControlPlaneRaftFuture<
-        '_,
-        Result<
-            BTreeMap<ControlPlaneRaftNodeId, ControlPlaneRaftAuthorityStatus>,
-            ControlPlaneError,
-        >,
-    > {
-        self.inner.authority_statuses()
     }
 }
 
@@ -926,6 +845,7 @@ impl ControlPlaneRaftAuthorityNodeLifecycle for ControlPlaneRaftAuthorityNodeLif
 #[derive(Clone)]
 pub struct ControlPlaneRaftAuthorityRoutingHandle {
     observer: ControlPlaneRaftAuthorityStatusHandle,
+    status_list: ControlPlaneRaftAuthorityStatusListHandle,
     directory: ControlPlaneRaftRoutedAuthorityDirectoryHandle,
 }
 
@@ -933,10 +853,12 @@ impl ControlPlaneRaftAuthorityRoutingHandle {
     #[must_use]
     pub fn new(
         observer: ControlPlaneRaftAuthorityStatusHandle,
+        status_list: ControlPlaneRaftAuthorityStatusListHandle,
         directory: ControlPlaneRaftRoutedAuthorityDirectoryHandle,
     ) -> Self {
         Self {
             observer,
+            status_list,
             directory,
         }
     }
@@ -944,7 +866,9 @@ impl ControlPlaneRaftAuthorityRoutingHandle {
     pub async fn current_serving_routed_authority(
         &self,
     ) -> Result<ControlPlaneRaftRoutedAuthorityHandle, ControlPlaneError> {
-        self.directory.current_serving_routed_authority().await
+        let statuses = self.status_list.authority_statuses().await?;
+        let node_id = current_serving_authority_node_id(&statuses)?;
+        self.directory.routed_authority_for_node(node_id).await
     }
 
     pub async fn submit_control_plane_command(
@@ -5793,6 +5717,7 @@ mod tests {
             .await;
             let routed_client = ControlPlaneRaftAuthorityRoutingHandle::new(
                 observer_status,
+                status_list_handle.clone(),
                 routed_directory.clone(),
             );
             let routed_admin =
@@ -5882,19 +5807,6 @@ mod tests {
                     .collect::<BTreeSet<_>>(),
                 BTreeSet::from([411, 412])
             );
-            let routed_directory_statuses = expect_bounded_control_plane_raft(
-                routed_directory.authority_statuses(),
-                operation_timeout,
-                "routed authority directory statuses after transfer",
-            )
-            .await;
-            assert_eq!(
-                routed_directory_statuses
-                    .keys()
-                    .copied()
-                    .collect::<BTreeSet<_>>(),
-                BTreeSet::from([411, 412])
-            );
             let old_leader_status = transferred_statuses
                 .get(&411)
                 .expect("directory should report old leader");
@@ -5920,20 +5832,6 @@ mod tests {
             .await;
             assert_eq!(routed_directory_status.node_id(), 412);
             assert!(routed_directory_status.linearized_authority_serving());
-            let routed_directory_serving_authority = expect_bounded_control_plane_raft(
-                routed_directory.current_serving_routed_authority(),
-                operation_timeout,
-                "routed authority directory current serving routed authority",
-            )
-            .await;
-            let routed_directory_serving_status = expect_bounded_control_plane_raft(
-                routed_directory_serving_authority.status(),
-                operation_timeout,
-                "routed authority directory current serving routed authority status",
-            )
-            .await;
-            assert_eq!(routed_directory_serving_status.node_id(), 412);
-            assert!(routed_directory_serving_status.linearized_authority_serving());
             let routed_client_serving_authority = expect_bounded_control_plane_raft(
                 routed_client.current_serving_routed_authority(),
                 operation_timeout,
@@ -6000,7 +5898,7 @@ mod tests {
                 .iter()
                 .any(|node| node.node_id() == NodeId::new(412)));
             let direct_runtime_map = expect_bounded_control_plane_raft(
-                routed_directory_serving_authority.linearized_runtime_map_snapshot(91_001),
+                routed_client_serving_authority.linearized_runtime_map_snapshot(91_001),
                 operation_timeout,
                 "authority capability directory current serving routed runtime map read",
             )
@@ -6099,12 +5997,21 @@ mod tests {
             directory.register(421, Arc::clone(&authority1));
             directory.register(422, Arc::clone(&authority2));
             let routed_directory =
-                ControlPlaneRaftRoutedAuthorityDirectoryHandle::new(Arc::new(directory));
+                ControlPlaneRaftRoutedAuthorityDirectoryHandle::new(Arc::new(directory.clone()));
+            let status_list =
+                ControlPlaneRaftAuthorityStatusListHandle::new(Arc::new(directory.clone()));
+            let observer_status =
+                ControlPlaneRaftAuthorityStatusHandle::new(Arc::clone(&authority1));
+            let routed_client = ControlPlaneRaftAuthorityRoutingHandle::new(
+                observer_status,
+                status_list,
+                routed_directory,
+            );
 
             let err = expect_bounded_control_plane_raft_error(
-                routed_directory.current_serving_routed_authority(),
+                routed_client.current_serving_routed_authority(),
                 operation_timeout,
-                "routed authority directory rejects multiple serving authorities",
+                "routing handle rejects multiple serving authorities",
             )
             .await;
             assert!(matches!(
