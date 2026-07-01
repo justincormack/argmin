@@ -11764,6 +11764,10 @@ impl super::StorageCluster {
         Ok(BucketDeleteDebugSnapshot {
             bucket: bucket.clone(),
             pg_id: pg_id.get(),
+            cluster_epoch: self.cluster_epoch(),
+            operation_epoch: self.operation_epoch(),
+            route_map_valid_until_ms: self.route_map_valid_until_ms(),
+            bucket_pg_primary_node_id: node.node_id().as_u32(),
             bucket_row,
             durable_write_drain,
             pending_metadata_command,

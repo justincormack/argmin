@@ -1160,9 +1160,13 @@ fn local_debug_bucket_delete_attempt_body(snapshot: &BucketDeleteDebugSnapshot) 
     let mut body = String::new();
     writeln!(
         &mut body,
-        "bucket={:?} pg_id={}",
+        "bucket={:?} pg_id={} cluster_epoch={} operation_epoch={} route_map_valid_until_ms={} bucket_pg_primary_node_id={}",
         snapshot.bucket.as_str(),
-        snapshot.pg_id
+        snapshot.pg_id,
+        snapshot.cluster_epoch.get(),
+        snapshot.operation_epoch.get(),
+        local_debug_optional_u64(snapshot.route_map_valid_until_ms),
+        snapshot.bucket_pg_primary_node_id,
     )
     .expect("write to String");
     match &snapshot.bucket_row {
@@ -5072,6 +5076,13 @@ mod tests {
         );
         assert!(response.contains("bucket_row=present"), "{response}");
         assert!(response.contains("state=active"), "{response}");
+        assert!(response.contains("cluster_epoch="), "{response}");
+        assert!(response.contains("operation_epoch="), "{response}");
+        assert!(response.contains("route_map_valid_until_ms="), "{response}");
+        assert!(
+            response.contains("bucket_pg_primary_node_id="),
+            "{response}"
+        );
         assert!(
             response.contains("durable_write_drain=absent"),
             "{response}"
@@ -5091,6 +5102,10 @@ mod tests {
         let snapshot = BucketDeleteDebugSnapshot {
             bucket: bucket.clone(),
             pg_id: 3,
+            cluster_epoch: storage::ClusterEpoch::new(9).unwrap(),
+            operation_epoch: storage::ClusterEpoch::new(7).unwrap(),
+            route_map_valid_until_ms: Some(123456),
+            bucket_pg_primary_node_id: 42,
             bucket_row: Some(storage::BucketDeleteDebugBucketRow {
                 state: BucketState::Deleting,
                 bucket_execution_generation: 12,
@@ -5144,6 +5159,10 @@ mod tests {
         );
         assert!(body.contains("bucket=\"debug-attempt-bucket\""), "{body}");
         assert!(body.contains("pg_id=3"), "{body}");
+        assert!(body.contains("cluster_epoch=9"), "{body}");
+        assert!(body.contains("operation_epoch=7"), "{body}");
+        assert!(body.contains("route_map_valid_until_ms=123456"), "{body}");
+        assert!(body.contains("bucket_pg_primary_node_id=42"), "{body}");
         assert!(body.contains("bucket_row=present"), "{body}");
         assert!(body.contains("state=deleting"), "{body}");
         assert!(body.contains("bucket_execution_generation=12"), "{body}");

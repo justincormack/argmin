@@ -2534,6 +2534,10 @@ pub struct BucketDeleteDebugPendingCommand {
 pub struct BucketDeleteDebugSnapshot {
     pub bucket: BucketName,
     pub pg_id: u32,
+    pub cluster_epoch: ClusterEpoch,
+    pub operation_epoch: ClusterEpoch,
+    pub route_map_valid_until_ms: Option<u64>,
+    pub bucket_pg_primary_node_id: u32,
     pub bucket_row: Option<BucketDeleteDebugBucketRow>,
     pub durable_write_drain: Option<BucketDeleteDebugDrain>,
     pub finalize_claim: Option<BucketDeleteDebugFinalizeClaim>,
