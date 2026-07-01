@@ -181,14 +181,16 @@ pub trait ControlPlaneRaftLeaderRoutedAdmin {
     ) -> ControlPlaneRaftFuture<'_, Result<(), ControlPlaneError>>;
 }
 
-pub trait ControlPlaneRaftAuthorityLifecycle {
+pub trait ControlPlaneRaftAuthorityBootstrap {
     fn initialize_membership(
         &self,
         nodes: BTreeMap<ControlPlaneRaftNodeId, BasicNode>,
     ) -> ControlPlaneRaftFuture<'_, Result<(), ControlPlaneError>>;
 
     fn is_initialized(&self) -> ControlPlaneRaftFuture<'_, Result<bool, ControlPlaneError>>;
+}
 
+pub trait ControlPlaneRaftAuthorityNodeLifecycle {
     fn wait_for_applied_index_at_least(
         &self,
         index: u64,
@@ -206,13 +208,27 @@ pub trait ControlPlaneRaftAuthorityLifecycle {
     fn shutdown(&self) -> ControlPlaneRaftFuture<'_, Result<(), ControlPlaneError>>;
 }
 
+pub trait ControlPlaneRaftAuthorityLifecycle:
+    ControlPlaneRaftAuthorityBootstrap + ControlPlaneRaftAuthorityNodeLifecycle
+{
+}
+
+impl<T> ControlPlaneRaftAuthorityLifecycle for T where
+    T: ControlPlaneRaftAuthorityBootstrap + ControlPlaneRaftAuthorityNodeLifecycle
+{
+}
+
 pub trait ControlPlaneRaftAuthorityAdmin:
-    ControlPlaneRaftLeaderRoutedAdmin + ControlPlaneRaftAuthorityLifecycle
+    ControlPlaneRaftLeaderRoutedAdmin
+    + ControlPlaneRaftAuthorityBootstrap
+    + ControlPlaneRaftAuthorityNodeLifecycle
 {
 }
 
 impl<T> ControlPlaneRaftAuthorityAdmin for T where
-    T: ControlPlaneRaftLeaderRoutedAdmin + ControlPlaneRaftAuthorityLifecycle
+    T: ControlPlaneRaftLeaderRoutedAdmin
+        + ControlPlaneRaftAuthorityBootstrap
+        + ControlPlaneRaftAuthorityNodeLifecycle
 {
 }
 
@@ -271,15 +287,15 @@ pub trait ControlPlaneRaftAuthorityServiceDirectory:
     ) -> ControlPlaneRaftFuture<'_, Result<ControlPlaneRaftAuthorityServiceHandle, ControlPlaneError>>;
 }
 
-pub trait ControlPlaneRaftAuthorityLifecycleDirectory:
+pub trait ControlPlaneRaftAuthorityNodeLifecycleDirectory:
     ControlPlaneRaftAuthorityStatusListSource
 {
-    fn authority_lifecycle_for_node(
+    fn authority_node_lifecycle_for_node(
         &self,
         node_id: ControlPlaneRaftNodeId,
     ) -> ControlPlaneRaftFuture<
         '_,
-        Result<ControlPlaneRaftAuthorityLifecycleHandle, ControlPlaneError>,
+        Result<ControlPlaneRaftAuthorityNodeLifecycleHandle, ControlPlaneError>,
     >;
 }
 
@@ -460,19 +476,19 @@ impl ControlPlaneRaftAuthorityServiceDirectory for ControlPlaneRaftAuthorityServ
     }
 }
 
-impl ControlPlaneRaftAuthorityLifecycleDirectory
+impl ControlPlaneRaftAuthorityNodeLifecycleDirectory
     for ControlPlaneRaftAuthorityServiceDirectoryHandle
 {
-    fn authority_lifecycle_for_node(
+    fn authority_node_lifecycle_for_node(
         &self,
         node_id: ControlPlaneRaftNodeId,
     ) -> ControlPlaneRaftFuture<
         '_,
-        Result<ControlPlaneRaftAuthorityLifecycleHandle, ControlPlaneError>,
+        Result<ControlPlaneRaftAuthorityNodeLifecycleHandle, ControlPlaneError>,
     > {
         Box::pin(async move {
             let service = self.authority_service_for_node(node_id).await?;
-            Ok(ControlPlaneRaftAuthorityLifecycleHandle::new(Arc::new(
+            Ok(ControlPlaneRaftAuthorityNodeLifecycleHandle::new(Arc::new(
                 service,
             )))
         })
@@ -495,28 +511,28 @@ impl ControlPlaneRaftRoutedAuthorityDirectory for ControlPlaneRaftAuthorityServi
 }
 
 #[derive(Clone)]
-pub struct ControlPlaneRaftAuthorityLifecycleDirectoryHandle {
-    inner: Arc<dyn ControlPlaneRaftAuthorityLifecycleDirectory + Send + Sync>,
+pub struct ControlPlaneRaftAuthorityNodeLifecycleDirectoryHandle {
+    inner: Arc<dyn ControlPlaneRaftAuthorityNodeLifecycleDirectory + Send + Sync>,
 }
 
-impl ControlPlaneRaftAuthorityLifecycleDirectoryHandle {
+impl ControlPlaneRaftAuthorityNodeLifecycleDirectoryHandle {
     pub fn new<T>(directory: Arc<T>) -> Self
     where
-        T: ControlPlaneRaftAuthorityLifecycleDirectory + Send + Sync + 'static,
+        T: ControlPlaneRaftAuthorityNodeLifecycleDirectory + Send + Sync + 'static,
     {
         Self { inner: directory }
     }
 
-    pub fn from_lifecycle_directory(
-        directory: Arc<dyn ControlPlaneRaftAuthorityLifecycleDirectory + Send + Sync>,
+    pub fn from_node_lifecycle_directory(
+        directory: Arc<dyn ControlPlaneRaftAuthorityNodeLifecycleDirectory + Send + Sync>,
     ) -> Self {
         Self { inner: directory }
     }
 
     #[must_use]
-    pub fn as_lifecycle_directory(
+    pub fn as_node_lifecycle_directory(
         &self,
-    ) -> &(dyn ControlPlaneRaftAuthorityLifecycleDirectory + Send + Sync + 'static) {
+    ) -> &(dyn ControlPlaneRaftAuthorityNodeLifecycleDirectory + Send + Sync + 'static) {
         &*self.inner
     }
 
@@ -527,23 +543,23 @@ impl ControlPlaneRaftAuthorityLifecycleDirectoryHandle {
         self.inner.authority_statuses().await
     }
 
-    pub async fn authority_lifecycle_for_node(
+    pub async fn authority_node_lifecycle_for_node(
         &self,
         node_id: ControlPlaneRaftNodeId,
-    ) -> Result<ControlPlaneRaftAuthorityLifecycleHandle, ControlPlaneError> {
-        self.inner.authority_lifecycle_for_node(node_id).await
+    ) -> Result<ControlPlaneRaftAuthorityNodeLifecycleHandle, ControlPlaneError> {
+        self.inner.authority_node_lifecycle_for_node(node_id).await
     }
 }
 
-impl fmt::Debug for ControlPlaneRaftAuthorityLifecycleDirectoryHandle {
+impl fmt::Debug for ControlPlaneRaftAuthorityNodeLifecycleDirectoryHandle {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("ControlPlaneRaftAuthorityLifecycleDirectoryHandle")
+        f.debug_struct("ControlPlaneRaftAuthorityNodeLifecycleDirectoryHandle")
             .finish_non_exhaustive()
     }
 }
 
 impl ControlPlaneRaftAuthorityStatusListSource
-    for ControlPlaneRaftAuthorityLifecycleDirectoryHandle
+    for ControlPlaneRaftAuthorityNodeLifecycleDirectoryHandle
 {
     fn authority_statuses(
         &self,
@@ -558,17 +574,17 @@ impl ControlPlaneRaftAuthorityStatusListSource
     }
 }
 
-impl ControlPlaneRaftAuthorityLifecycleDirectory
-    for ControlPlaneRaftAuthorityLifecycleDirectoryHandle
+impl ControlPlaneRaftAuthorityNodeLifecycleDirectory
+    for ControlPlaneRaftAuthorityNodeLifecycleDirectoryHandle
 {
-    fn authority_lifecycle_for_node(
+    fn authority_node_lifecycle_for_node(
         &self,
         node_id: ControlPlaneRaftNodeId,
     ) -> ControlPlaneRaftFuture<
         '_,
-        Result<ControlPlaneRaftAuthorityLifecycleHandle, ControlPlaneError>,
+        Result<ControlPlaneRaftAuthorityNodeLifecycleHandle, ControlPlaneError>,
     > {
-        self.inner.authority_lifecycle_for_node(node_id)
+        self.inner.authority_node_lifecycle_for_node(node_id)
     }
 }
 
@@ -931,7 +947,7 @@ impl ControlPlaneRaftLeaderRoutedAdmin for ControlPlaneRaftAuthorityAdminHandle 
     }
 }
 
-impl ControlPlaneRaftAuthorityLifecycle for ControlPlaneRaftAuthorityAdminHandle {
+impl ControlPlaneRaftAuthorityBootstrap for ControlPlaneRaftAuthorityAdminHandle {
     fn initialize_membership(
         &self,
         nodes: BTreeMap<ControlPlaneRaftNodeId, BasicNode>,
@@ -942,7 +958,116 @@ impl ControlPlaneRaftAuthorityLifecycle for ControlPlaneRaftAuthorityAdminHandle
     fn is_initialized(&self) -> ControlPlaneRaftFuture<'_, Result<bool, ControlPlaneError>> {
         self.inner.is_initialized()
     }
+}
 
+impl ControlPlaneRaftAuthorityNodeLifecycle for ControlPlaneRaftAuthorityAdminHandle {
+    fn wait_for_applied_index_at_least(
+        &self,
+        index: u64,
+        timeout: Duration,
+        message: &'static str,
+    ) -> ControlPlaneRaftFuture<'_, Result<(), ControlPlaneError>> {
+        self.inner
+            .wait_for_applied_index_at_least(index, timeout, message)
+    }
+
+    fn wait_for_current_leader(
+        &self,
+        leader_id: ControlPlaneRaftNodeId,
+        timeout: Duration,
+        message: &'static str,
+    ) -> ControlPlaneRaftFuture<'_, Result<(), ControlPlaneError>> {
+        self.inner
+            .wait_for_current_leader(leader_id, timeout, message)
+    }
+
+    fn shutdown(&self) -> ControlPlaneRaftFuture<'_, Result<(), ControlPlaneError>> {
+        self.inner.shutdown()
+    }
+}
+
+#[derive(Clone)]
+pub struct ControlPlaneRaftAuthorityBootstrapHandle {
+    inner: Arc<dyn ControlPlaneRaftAuthorityBootstrap + Send + Sync>,
+}
+
+impl ControlPlaneRaftAuthorityBootstrapHandle {
+    pub fn new<T>(authority: Arc<T>) -> Self
+    where
+        T: ControlPlaneRaftAuthorityBootstrap + Send + Sync + 'static,
+    {
+        Self { inner: authority }
+    }
+
+    pub fn from_bootstrap_authority(
+        authority: Arc<dyn ControlPlaneRaftAuthorityBootstrap + Send + Sync>,
+    ) -> Self {
+        Self { inner: authority }
+    }
+
+    #[must_use]
+    pub fn as_bootstrap_authority(
+        &self,
+    ) -> &(dyn ControlPlaneRaftAuthorityBootstrap + Send + Sync + 'static) {
+        &*self.inner
+    }
+}
+
+impl fmt::Debug for ControlPlaneRaftAuthorityBootstrapHandle {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ControlPlaneRaftAuthorityBootstrapHandle")
+            .finish_non_exhaustive()
+    }
+}
+
+impl ControlPlaneRaftAuthorityBootstrap for ControlPlaneRaftAuthorityBootstrapHandle {
+    fn initialize_membership(
+        &self,
+        nodes: BTreeMap<ControlPlaneRaftNodeId, BasicNode>,
+    ) -> ControlPlaneRaftFuture<'_, Result<(), ControlPlaneError>> {
+        self.inner.initialize_membership(nodes)
+    }
+
+    fn is_initialized(&self) -> ControlPlaneRaftFuture<'_, Result<bool, ControlPlaneError>> {
+        self.inner.is_initialized()
+    }
+}
+
+#[derive(Clone)]
+pub struct ControlPlaneRaftAuthorityNodeLifecycleHandle {
+    inner: Arc<dyn ControlPlaneRaftAuthorityNodeLifecycle + Send + Sync>,
+}
+
+impl ControlPlaneRaftAuthorityNodeLifecycleHandle {
+    pub fn new<T>(authority: Arc<T>) -> Self
+    where
+        T: ControlPlaneRaftAuthorityNodeLifecycle + Send + Sync + 'static,
+    {
+        Self { inner: authority }
+    }
+
+    pub fn from_node_lifecycle_authority(
+        authority: Arc<dyn ControlPlaneRaftAuthorityNodeLifecycle + Send + Sync>,
+    ) -> Self {
+        Self { inner: authority }
+    }
+
+    #[must_use]
+    pub fn as_node_lifecycle_authority(
+        &self,
+    ) -> &(dyn ControlPlaneRaftAuthorityNodeLifecycle + Send + Sync + 'static) {
+        &*self.inner
+    }
+}
+
+impl fmt::Debug for ControlPlaneRaftAuthorityNodeLifecycleHandle {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ControlPlaneRaftAuthorityNodeLifecycleHandle")
+            .finish_non_exhaustive()
+    }
+}
+
+impl ControlPlaneRaftAuthorityNodeLifecycle for ControlPlaneRaftAuthorityNodeLifecycleHandle {
     fn wait_for_applied_index_at_least(
         &self,
         index: u64,
@@ -1002,7 +1127,7 @@ impl fmt::Debug for ControlPlaneRaftAuthorityLifecycleHandle {
     }
 }
 
-impl ControlPlaneRaftAuthorityLifecycle for ControlPlaneRaftAuthorityLifecycleHandle {
+impl ControlPlaneRaftAuthorityBootstrap for ControlPlaneRaftAuthorityLifecycleHandle {
     fn initialize_membership(
         &self,
         nodes: BTreeMap<ControlPlaneRaftNodeId, BasicNode>,
@@ -1013,7 +1138,9 @@ impl ControlPlaneRaftAuthorityLifecycle for ControlPlaneRaftAuthorityLifecycleHa
     fn is_initialized(&self) -> ControlPlaneRaftFuture<'_, Result<bool, ControlPlaneError>> {
         self.inner.is_initialized()
     }
+}
 
+impl ControlPlaneRaftAuthorityNodeLifecycle for ControlPlaneRaftAuthorityLifecycleHandle {
     fn wait_for_applied_index_at_least(
         &self,
         index: u64,
@@ -1130,7 +1257,7 @@ impl ControlPlaneRaftLeaderRoutedAdmin for ControlPlaneRaftAuthorityServiceHandl
     }
 }
 
-impl ControlPlaneRaftAuthorityLifecycle for ControlPlaneRaftAuthorityServiceHandle {
+impl ControlPlaneRaftAuthorityBootstrap for ControlPlaneRaftAuthorityServiceHandle {
     fn initialize_membership(
         &self,
         nodes: BTreeMap<ControlPlaneRaftNodeId, BasicNode>,
@@ -1141,7 +1268,9 @@ impl ControlPlaneRaftAuthorityLifecycle for ControlPlaneRaftAuthorityServiceHand
     fn is_initialized(&self) -> ControlPlaneRaftFuture<'_, Result<bool, ControlPlaneError>> {
         self.inner.is_initialized()
     }
+}
 
+impl ControlPlaneRaftAuthorityNodeLifecycle for ControlPlaneRaftAuthorityServiceHandle {
     fn wait_for_applied_index_at_least(
         &self,
         index: u64,
@@ -2227,7 +2356,7 @@ impl ControlPlaneRaftLeaderRoutedAdmin for ControlPlaneRaftAuthority {
     }
 }
 
-impl ControlPlaneRaftAuthorityLifecycle for ControlPlaneRaftAuthority {
+impl ControlPlaneRaftAuthorityBootstrap for ControlPlaneRaftAuthority {
     fn initialize_membership(
         &self,
         nodes: BTreeMap<ControlPlaneRaftNodeId, BasicNode>,
@@ -2238,7 +2367,9 @@ impl ControlPlaneRaftAuthorityLifecycle for ControlPlaneRaftAuthority {
     fn is_initialized(&self) -> ControlPlaneRaftFuture<'_, Result<bool, ControlPlaneError>> {
         Box::pin(async move { ControlPlaneRaftAuthority::is_initialized(self).await })
     }
+}
 
+impl ControlPlaneRaftAuthorityNodeLifecycle for ControlPlaneRaftAuthority {
     fn wait_for_applied_index_at_least(
         &self,
         index: u64,
@@ -3720,7 +3851,7 @@ mod tests {
     #[derive(Debug, Clone)]
     struct InMemoryAuthorityServiceEntry {
         service: ControlPlaneRaftAuthorityServiceHandle,
-        lifecycle: ControlPlaneRaftAuthorityLifecycleHandle,
+        node_lifecycle: ControlPlaneRaftAuthorityNodeLifecycleHandle,
         routed_authority: ControlPlaneRaftRoutedAuthorityHandle,
     }
 
@@ -3730,15 +3861,15 @@ mod tests {
             node_id: ControlPlaneRaftNodeId,
             service: ControlPlaneRaftAuthorityServiceHandle,
         ) {
-            let lifecycle =
-                ControlPlaneRaftAuthorityLifecycleHandle::new(Arc::new(service.clone()));
+            let node_lifecycle =
+                ControlPlaneRaftAuthorityNodeLifecycleHandle::new(Arc::new(service.clone()));
             let routed_authority =
                 ControlPlaneRaftRoutedAuthorityHandle::new(Arc::new(service.clone()));
             self.entries.lock().unwrap().insert(
                 node_id,
                 InMemoryAuthorityServiceEntry {
                     service,
-                    lifecycle,
+                    node_lifecycle,
                     routed_authority,
                 },
             );
@@ -3811,13 +3942,13 @@ mod tests {
         }
     }
 
-    impl ControlPlaneRaftAuthorityLifecycleDirectory for InMemoryAuthorityServiceDirectory {
-        fn authority_lifecycle_for_node(
+    impl ControlPlaneRaftAuthorityNodeLifecycleDirectory for InMemoryAuthorityServiceDirectory {
+        fn authority_node_lifecycle_for_node(
             &self,
             node_id: ControlPlaneRaftNodeId,
         ) -> ControlPlaneRaftFuture<
             '_,
-            Result<ControlPlaneRaftAuthorityLifecycleHandle, ControlPlaneError>,
+            Result<ControlPlaneRaftAuthorityNodeLifecycleHandle, ControlPlaneError>,
         > {
             let result = (|| {
                 let entries = self
@@ -3829,10 +3960,10 @@ mod tests {
                     })?;
                 entries
                     .get(&node_id)
-                    .map(|entry| entry.lifecycle.clone())
+                    .map(|entry| entry.node_lifecycle.clone())
                     .ok_or_else(|| ControlPlaneError::RpcRemote {
                         message: format!(
-                            "in-memory test authority service directory has no lifecycle node {node_id}"
+                            "in-memory test authority service directory has no node-lifecycle node {node_id}"
                         ),
                     })
             })();
@@ -5966,8 +6097,10 @@ mod tests {
             );
             let routed_directory =
                 ControlPlaneRaftRoutedAuthorityDirectoryHandle::new(Arc::new(directory.clone()));
-            let lifecycle_directory =
-                ControlPlaneRaftAuthorityLifecycleDirectoryHandle::new(Arc::new(directory.clone()));
+            let node_lifecycle_directory =
+                ControlPlaneRaftAuthorityNodeLifecycleDirectoryHandle::new(Arc::new(
+                    directory.clone(),
+                ));
             let directory =
                 ControlPlaneRaftAuthorityServiceDirectoryHandle::new(Arc::new(directory));
             let observer_status =
@@ -5979,11 +6112,13 @@ mod tests {
                 Err(ControlPlaneError::RpcRemote { message })
                     if message.contains("no node 499")
             ));
-            let missing_lifecycle = lifecycle_directory.authority_lifecycle_for_node(499).await;
+            let missing_node_lifecycle = node_lifecycle_directory
+                .authority_node_lifecycle_for_node(499)
+                .await;
             assert!(matches!(
-                missing_lifecycle,
+                missing_node_lifecycle,
                 Err(ControlPlaneError::RpcRemote { message })
-                    if message.contains("no lifecycle node 499")
+                    if message.contains("no node-lifecycle node 499")
             ));
 
             let _leader_service = expect_bounded_control_plane_raft(
@@ -5998,16 +6133,16 @@ mod tests {
                 "authority service directory lookup follower",
             )
             .await;
-            let leader_lifecycle = expect_bounded_control_plane_raft(
-                lifecycle_directory.authority_lifecycle_for_node(411),
+            let leader_node_lifecycle = expect_bounded_control_plane_raft(
+                node_lifecycle_directory.authority_node_lifecycle_for_node(411),
                 operation_timeout,
-                "authority lifecycle directory lookup leader",
+                "authority node-lifecycle directory lookup leader",
             )
             .await;
-            let follower_lifecycle = expect_bounded_control_plane_raft(
-                lifecycle_directory.authority_lifecycle_for_node(412),
+            let follower_node_lifecycle = expect_bounded_control_plane_raft(
+                node_lifecycle_directory.authority_node_lifecycle_for_node(412),
                 operation_timeout,
-                "authority lifecycle directory lookup follower",
+                "authority node-lifecycle directory lookup follower",
             )
             .await;
             let routed_client = ControlPlaneRaftAuthorityRoutingHandle::new(
@@ -6041,7 +6176,7 @@ mod tests {
                 )
             ));
             expect_bounded_control_plane_raft(
-                follower_lifecycle.wait_for_applied_index_at_least(
+                follower_node_lifecycle.wait_for_applied_index_at_least(
                     bootstrap.log_id().index(),
                     Duration::from_secs(1),
                     "authority service directory follower applied bootstrap",
@@ -6058,7 +6193,7 @@ mod tests {
             )
             .await;
             expect_bounded_control_plane_raft(
-                follower_lifecycle.wait_for_current_leader(
+                follower_node_lifecycle.wait_for_current_leader(
                     412,
                     Duration::from_secs(1),
                     "authority service directory observed transferred leader",
@@ -6068,7 +6203,7 @@ mod tests {
             )
             .await;
             expect_bounded_control_plane_raft(
-                leader_lifecycle.wait_for_current_leader(
+                leader_node_lifecycle.wait_for_current_leader(
                     412,
                     Duration::from_secs(1),
                     "authority service directory observer saw transferred leader",
@@ -6261,7 +6396,7 @@ mod tests {
             )
             .await;
             expect_bounded_control_plane_raft(
-                follower_lifecycle.wait_for_applied_index_at_least(
+                follower_node_lifecycle.wait_for_applied_index_at_least(
                     routed_membership_log_id.index(),
                     Duration::from_secs(1),
                     "authority service directory routed voter replacement applied",
@@ -6289,13 +6424,13 @@ mod tests {
             assert!(routed_membership_status.linearized_authority_serving());
 
             expect_bounded_control_plane_raft(
-                leader_lifecycle.shutdown(),
+                leader_node_lifecycle.shutdown(),
                 operation_timeout,
                 "authority service directory shutdown old leader",
             )
             .await;
             expect_bounded_control_plane_raft(
-                follower_lifecycle.shutdown(),
+                follower_node_lifecycle.shutdown(),
                 operation_timeout,
                 "authority service directory shutdown transferred leader",
             )

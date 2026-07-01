@@ -9941,6 +9941,11 @@ Phase 12.1 progress:
   service callers, but tests now resolve lifecycle-only handles for
   applied-index waits, leader-observation waits, and shutdown instead of
   carrying command/read/status capability into those paths.
+- Split raft bootstrap/init from node lifecycle wait/shutdown at the trait
+  boundary. The existing broad lifecycle handle remains as a composition for
+  callers that need both, while explicit directory lookup now returns a
+  node-lifecycle-only handle so wait/shutdown paths do not receive bootstrap
+  initialization capability.
 
 1. define the replicated control-plane state machine:
    - state includes cluster epoch, PG count, PG state, PG acting sets, node
