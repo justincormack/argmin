@@ -9026,13 +9026,15 @@ Keep an explicit Phase 11 close-out before treating the phase as soak-clean:
     targets the named bucket, the current bucket-delete finalizer claim row for
     the bucket PG and whether it targets the named bucket, plus the durable
     `DeleteBucket` attempt outcome/progress row including outcome, phase,
-    post-reservation frontier, and detail. This lets a failing soak run inspect
-    the bucket-PG attempt state directly without relying only on public S3
-    visibility. The route-change, PG backfill, metadata-PG migration, and
-    cleanup-versioned-stress UAT cleanup wrappers now query that endpoint when
-    their cleanup command fails, before teardown removes the live debug surface.
-    Remaining diagnostic gaps are per-object rows and object reclaim
-    roots/payload reclaim claims in the same failure bundle;
+    post-reservation frontier, and detail. It also reports one validated
+    bucket-scoped object payload reclaim root per object PG, with object PG id,
+    key, and generation id. This lets a failing soak run inspect the bucket-PG
+    attempt state and durable bucket-owned reclaim blockers directly without
+    relying only on public S3 visibility. The route-change, PG backfill,
+    metadata-PG migration, and cleanup-versioned-stress UAT cleanup wrappers
+    now query that endpoint when their cleanup command fails, before teardown
+    removes the live debug surface. Remaining diagnostic gaps are per-object
+    rows and payload reclaim claims in the same failure bundle;
 17. status: open. Define a repeatable soak gate for closing this hardening phase. At minimum,
     `cleanup-versioned-stress --repeat 30`, the correctness soak, and one
     restart/failover cleanup variant should pass without HTTP 500s, stuck

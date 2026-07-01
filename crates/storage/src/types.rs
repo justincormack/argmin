@@ -2529,6 +2529,21 @@ pub struct BucketDeleteDebugPendingCommand {
     pub log_index: u64,
 }
 
+/// Bucket-scoped payload reclaim root fields included in local-debug output.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BucketDeleteDebugPayloadReclaimRoot {
+    pub object_pg_id: u32,
+    pub key: ObjectKey,
+    pub generation_id: GenerationId,
+}
+
+/// Payload reclaim root scan error fields included in local-debug output.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BucketDeleteDebugPayloadReclaimRootError {
+    pub object_pg_id: u32,
+    pub detail: String,
+}
+
 /// Read-only durable state used by the local DeleteBucket debug endpoint.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BucketDeleteDebugSnapshot {
@@ -2542,6 +2557,8 @@ pub struct BucketDeleteDebugSnapshot {
     pub durable_write_drain: Option<BucketDeleteDebugDrain>,
     pub finalize_claim: Option<BucketDeleteDebugFinalizeClaim>,
     pub pending_metadata_command: Option<BucketDeleteDebugPendingCommand>,
+    pub payload_reclaim_roots: Vec<BucketDeleteDebugPayloadReclaimRoot>,
+    pub payload_reclaim_root_errors: Vec<BucketDeleteDebugPayloadReclaimRootError>,
     pub attempt_outcome: Option<BucketDeleteAttemptOutcomeRecord>,
 }
 

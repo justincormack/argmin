@@ -11761,6 +11761,55 @@ impl super::StorageCluster {
             .bucket_write_reservation_client()
             .bucket_delete_attempt_outcome(pg_id, bucket)?;
 
+        let mut payload_reclaim_roots = Vec::new();
+        let mut payload_reclaim_root_errors = Vec::new();
+        for raw_pg_id in self.metadata_pg_ids() {
+            let object_pg_id = PgId::new(raw_pg_id);
+            let node = match self
+                .local_map
+                .metadata_pg_primary_node(self.operation_epoch(), object_pg_id)
+            {
+                Ok(node) => node,
+                Err(error) => {
+                    payload_reclaim_root_errors.push(BucketDeleteDebugPayloadReclaimRootError {
+                        object_pg_id: raw_pg_id,
+                        detail: error.to_string(),
+                    });
+                    continue;
+                }
+            };
+            let root = match node
+                .object_mutation_metadata_client()
+                .get_bucket_payload_reclaim_root(object_pg_id, bucket)
+            {
+                Ok(Some(root)) => root,
+                Ok(None) => continue,
+                Err(error) => {
+                    payload_reclaim_root_errors.push(BucketDeleteDebugPayloadReclaimRootError {
+                        object_pg_id: raw_pg_id,
+                        detail: error.to_string(),
+                    });
+                    continue;
+                }
+            };
+            if let Err(error) = self.validate_bucket_payload_reclaim_root_for_pg(
+                object_pg_id,
+                &root,
+                node.node_id(),
+            ) {
+                payload_reclaim_root_errors.push(BucketDeleteDebugPayloadReclaimRootError {
+                    object_pg_id: raw_pg_id,
+                    detail: error.to_string(),
+                });
+                continue;
+            }
+            payload_reclaim_roots.push(BucketDeleteDebugPayloadReclaimRoot {
+                object_pg_id: raw_pg_id,
+                key: root.key,
+                generation_id: root.generation_id,
+            });
+        }
+
         Ok(BucketDeleteDebugSnapshot {
             bucket: bucket.clone(),
             pg_id: pg_id.get(),
@@ -11772,6 +11821,8 @@ impl super::StorageCluster {
             durable_write_drain,
             pending_metadata_command,
             finalize_claim,
+            payload_reclaim_roots,
+            payload_reclaim_root_errors,
             attempt_outcome,
         })
     }

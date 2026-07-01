@@ -1237,6 +1237,40 @@ fn local_debug_bucket_delete_attempt_body(snapshot: &BucketDeleteDebugSnapshot) 
         None => body.push_str("finalize_claim=absent\n"),
     }
 
+    writeln!(
+        &mut body,
+        "payload_reclaim_roots_count={}",
+        snapshot.payload_reclaim_roots.len()
+    )
+    .expect("write to String");
+    for (index, root) in snapshot.payload_reclaim_roots.iter().enumerate() {
+        writeln!(
+            &mut body,
+            "payload_reclaim_root index={} object_pg_id={} key={:?} generation_id={}",
+            index,
+            root.object_pg_id,
+            root.key.as_str(),
+            root.generation_id.get(),
+        )
+        .expect("write to String");
+    }
+    writeln!(
+        &mut body,
+        "payload_reclaim_root_errors_count={}",
+        snapshot.payload_reclaim_root_errors.len()
+    )
+    .expect("write to String");
+    for (index, error) in snapshot.payload_reclaim_root_errors.iter().enumerate() {
+        writeln!(
+            &mut body,
+            "payload_reclaim_root_error index={} object_pg_id={} detail={}",
+            index,
+            error.object_pg_id,
+            observability::escaped(&error.detail),
+        )
+        .expect("write to String");
+    }
+
     match &snapshot.attempt_outcome {
         Some(record) => {
             writeln!(
@@ -5092,6 +5126,14 @@ mod tests {
             "{response}"
         );
         assert!(response.contains("finalize_claim=absent"), "{response}");
+        assert!(
+            response.contains("payload_reclaim_roots_count=0"),
+            "{response}"
+        );
+        assert!(
+            response.contains("payload_reclaim_root_errors_count=0"),
+            "{response}"
+        );
         assert!(response.contains("attempt_outcome=absent"), "{response}");
         assert!(response.contains("pg_id="), "{response}");
     }
@@ -5138,6 +5180,15 @@ mod tests {
                 attempt_count: 2,
                 last_error: Some("retry\nlater".to_string()),
             }),
+            payload_reclaim_roots: vec![storage::BucketDeleteDebugPayloadReclaimRoot {
+                object_pg_id: 4,
+                key: storage::ObjectKey::try_from("root-key\none".to_string()).unwrap(),
+                generation_id: storage::GenerationId::new(99).unwrap(),
+            }],
+            payload_reclaim_root_errors: vec![storage::BucketDeleteDebugPayloadReclaimRootError {
+                object_pg_id: 5,
+                detail: "route\nexpired".to_string(),
+            }],
             attempt_outcome: Some(storage::BucketDeleteAttemptOutcomeRecord {
                 bucket: bucket.clone(),
                 drain_id: "delete-drain-1".to_string(),
@@ -5182,6 +5233,23 @@ mod tests {
         assert!(body.contains("lease_deadline=2020"), "{body}");
         assert!(body.contains("attempt_count=2"), "{body}");
         assert!(body.contains(r#"last_error="retry\nlater""#), "{body}");
+        assert!(body.contains("payload_reclaim_roots_count=1"), "{body}");
+        assert!(
+            body.contains(
+                r#"payload_reclaim_root index=0 object_pg_id=4 key="root-key\none" generation_id=99"#
+            ),
+            "{body}"
+        );
+        assert!(
+            body.contains("payload_reclaim_root_errors_count=1"),
+            "{body}"
+        );
+        assert!(
+            body.contains(
+                r#"payload_reclaim_root_error index=0 object_pg_id=5 detail="route\nexpired""#
+            ),
+            "{body}"
+        );
         assert!(body.contains("attempt_outcome=present present=1"), "{body}");
         assert!(body.contains("drain_id=\"delete-drain-1\""), "{body}");
         assert!(body.contains("cluster_epoch=7"), "{body}");
