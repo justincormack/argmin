@@ -72,6 +72,85 @@ Every public `StorageCluster` operation must fit one of these classes:
 - Crash-durable orphan discovery is a later scavenger/reclaim responsibility.
   Injected best-effort cleanup failures may leave only explicitly documented
   orphan payload or ack state for that later process.
+- Opening a `PgStore` is intended to become a recovery boundary, not just a
+  schema bootstrap, so that a reopened store reconciles or rejects crash
+  leftovers before it serves. This is a target invariant: the implementation
+  is being introduced by the Phase 11 stabilisation slices and is not yet
+  enforced at open/bind. See [PG Store Recovery
+  Boundary](#pg-store-recovery-boundary) below.
+
+## PG Store Recovery Boundary
+
+This section states both the current behavior and the required target, so that
+readers do not infer that `PgStore::open` / `StorageNodeServer::bind` already
+enforce recovery.
+
+### Current behavior
+
+`PgStore::open` bootstraps the schema, digest triggers, and replica-state row.
+It does not reconcile crash leftovers. `SharedStorageNode::open` and
+`StorageNodeServer::bind` likewise perform no recovery, so a restarted storage
+node serves on whatever denormalised state survived the crash. Today the two
+known crash-leftover classes are reconciled reactively, not at open:
+
+- a *terminal* pending command slot (a slot whose command is already in the
+  command log) is cleaned inside `SharedStorageNode::pg_heartbeat_observation`
+  on the next heartbeat tick;
+- an *epoch-mismatched orphan* pending command slot (a slot whose epoch differs
+  from the stored replica state epoch) is cleaned in the same heartbeat path.
+
+Command-log hash-chain and materialised-digest integrity are checked on the
+command-apply path (`metadata_command_acceptance`), not at open. Until the
+target boundary lands, a crash leftover can affect serving between restart and
+the first heartbeat tick.
+
+### Required target boundary
+
+Recovery must become a distinct pass that runs after `PgStore::open` and before
+the store serves, invoked by the layer that owns node identity
+(`StorageNodeServer::bind` and the local-cluster builder) because the singleton
+pending command slot is keyed by the owning `NodeId`, which neither `PgStore`
+nor `SharedStorageNode` holds. The recovery epoch is the store's own
+`metadata_command_replica_state.cluster_epoch`, read internally; an external
+authority or config epoch must never be supplied as the recovery epoch, since
+orphan detection compares the slot's epoch against the stored replica epoch and
+a mismatched external value would defeat the check.
+
+Recovery classifies anomalies into two groups and treats them differently.
+
+Fail closed (possible corruption). Recovery returns a typed error and the store
+does not serve:
+
+- command-log hash-chain break (`MetadataCommandLogHashMismatch`);
+- materialised digest mismatch: `metadata_command_replica_state.state_digest`
+  disagrees with a full recomputation from rows
+  (`MetadataStateDigestMismatch`);
+- a forked or out-of-order command log.
+
+Reconcile (benign crash leftovers). Recovery repairs the state and continues:
+
+- a *terminal* pending command slot: a slot whose command is already present in
+  the command log, left behind when a crash occurs between apply and slot
+  removal;
+- an *epoch-mismatched orphan* pending command slot: a slot whose epoch differs
+  from the stored replica state epoch, for example a command prepared under an
+  epoch that has since advanced and will never be applied.
+
+The two slot reconciliations are order-dependent: the epoch-mismatched orphan
+cleanup must precede replay validation, because replay validation reads the
+pending slot through the epoch-checked path and would otherwise reject the
+orphan before the cleanup can run. This mirrors the current heartbeat
+observation path, which already sequences these two cleanups correctly but
+silently and only on the next heartbeat tick.
+
+Once the target lands, recovery is the primary correctness boundary and the
+heartbeat-side cleanups become defence-in-depth: a crash leftover must not
+depend on the next heartbeat tick to be reconciled. The distinction between
+fail-closed and reconcile is deliberate: corruption is surfaced, crash leftovers
+are healed idempotently, and a recovered store is indistinguishable from one
+that committed cleanly apart from the diagnostic trace. The full recovery
+contract and its implementation slices live in
+[multihost-phase-11-stabilisation-plan.md](../plans/multihost-phase-11-stabilisation-plan.md).
 
 ## StorageCluster Method Matrix
 
