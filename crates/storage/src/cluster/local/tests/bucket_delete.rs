@@ -828,7 +828,10 @@ fn begin_bucket_delete_retries_when_pending_slot_wins_before_command_id() {
             outcome.outcome,
             crate::BucketDeleteAttemptOutcomeKind::Retryable
         );
-        assert_eq!(outcome.phase, crate::BucketDeleteAttemptPhase::MarkDeleting);
+        assert_eq!(
+            outcome.phase,
+            crate::BucketDeleteAttemptPhase::StreamCleanup
+        );
     }
     assert_eq!(
         cluster.try_take_reclaim_work(),
@@ -2855,6 +2858,7 @@ fn begin_bucket_delete_bounds_active_delete_drain_wait() {
 
 #[test]
 fn begin_bucket_delete_adopts_active_delete_drain_after_reopen() {
+    let _serial = lock_bucket_scoped_hook_test();
     let tmp = test_util::tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
     let ec_shape = EcShape { k: 2, m: 1 };
@@ -2872,21 +2876,42 @@ fn begin_bucket_delete_adopts_active_delete_drain_after_reopen() {
     let map = Arc::new(map);
     let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&cluster, &bucket);
+    let clock = Arc::new(crate::clock::test_time_override_guard(1_000));
     let drain = match cluster.begin_durable_bucket_delete_drain(&bucket).unwrap() {
         crate::cluster::DurableBucketDeleteDrainBegin::Acquired(drain) => drain,
         crate::cluster::DurableBucketDeleteDrainBegin::AlreadyDeleting => {
             panic!("fresh active bucket should acquire delete drain")
         }
     };
+    let original_deadline = drain
+        .record
+        .lease_deadline
+        .expect("delete drains should carry a recovery lease deadline");
+    clock.set(12_000);
     drop(cluster);
     drop(map);
 
     let reopened =
         Arc::new(LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1], ec_shape).unwrap());
     let reopened_cluster = crate::StorageCluster::from_local_map(Arc::clone(&reopened)).unwrap();
+    let advanced_during_proof = Arc::new(AtomicBool::new(false));
+    let advanced_during_proof_for_hook = Arc::clone(&advanced_during_proof);
+    let clock_for_hook = Arc::clone(&clock);
+    let _progress_hook_guard = reopened_cluster
+        .test_install_after_bucket_delete_post_reservation_progress_hook(Arc::new(
+            move |_next_object_pg_id| {
+                clock_for_hook.set(17_000);
+                advanced_during_proof_for_hook.store(true, Ordering::SeqCst);
+                Ok(())
+            },
+        ));
     reopened_cluster
         .begin_bucket_delete(&bucket)
         .expect("DeleteBucket should adopt and complete an active pre-mark drain after reopen");
+    assert!(
+        advanced_during_proof.load(Ordering::SeqCst),
+        "test must advance logical time during the adopted DeleteBucket proof"
+    );
 
     let bucket_pg = reopened
         .node(NodeId::new(0))
@@ -2901,6 +2926,18 @@ fn begin_bucket_delete_adopts_active_delete_drain_after_reopen() {
             .map(|record| record.drain_id.as_str()),
         Some(drain.record.drain_id.as_str()),
         "DeleteBucket adoption should preserve the original drain identity"
+    );
+    let renewed_deadline = crate::PgMetadataStore::durable_bucket_write_drain(&*bucket_pg, &bucket)
+        .unwrap()
+        .and_then(|record| record.lease_deadline)
+        .expect("adopted delete drain should remain leased until finalization");
+    assert!(
+        renewed_deadline > original_deadline,
+        "adopted delete drain should renew before long proof phases; original={original_deadline} renewed={renewed_deadline}"
+    );
+    assert!(
+        renewed_deadline > crate::clock::current_time_millis(),
+        "adopted delete drain should still be live after the proof reaches MarkBucketDeleting"
     );
     assert_eq!(
         crate::PgMetadataStore::head_bucket_raw(&*bucket_pg, &bucket)

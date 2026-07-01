@@ -9241,6 +9241,15 @@ Status update:
   post-wait stream cleanup actually aborted sessions. This reduces the
   foreground work that caused cleanup-only failures to exhaust the begin budget,
   but it is not the durable proof-progress protocol called out in item 18.
+- A route-change-restart soak failure showed the pre-mark `DeleteBucket` proof
+  can legitimately outlive the durable delete-drain lease under route churn:
+  two attempts reached final visibility, then failed at `MarkBucketDeleting`
+  with `stale bucket delete drain before mark deleting`. Adopted delete drains
+  now renew their lease immediately, and the begin loop heartbeats the drain
+  before long stream-cleanup and visibility-check phases rather than waiting
+  until command construction. The storage regression advances logical time
+  during an adopted pre-mark proof and verifies the original drain identity is
+  preserved while its lease is extended before the bucket reaches `Deleting`.
 - Remaining close-out work is concentrated in deterministic interleaving tests,
   cleanup/runtime-state diagnostics, process-local state continuity across
   refresh/restart, and checking whether any foreground loops still need an

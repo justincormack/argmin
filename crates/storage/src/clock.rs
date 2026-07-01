@@ -24,6 +24,32 @@ pub fn with_time_override<T>(now_millis: u64, f: impl FnOnce() -> T) -> T {
     })
 }
 
+#[cfg(test)]
+pub struct TestTimeOverrideGuard {
+    previous: Option<u64>,
+}
+
+#[cfg(test)]
+impl TestTimeOverrideGuard {
+    pub fn set(&self, now_millis: u64) {
+        TIME_OVERRIDE_MILLIS.with(|slot| slot.set(Some(now_millis)));
+    }
+}
+
+#[cfg(test)]
+impl Drop for TestTimeOverrideGuard {
+    fn drop(&mut self) {
+        TIME_OVERRIDE_MILLIS.with(|slot| slot.set(self.previous));
+    }
+}
+
+#[cfg(test)]
+pub fn test_time_override_guard(now_millis: u64) -> TestTimeOverrideGuard {
+    TIME_OVERRIDE_MILLIS.with(|slot| TestTimeOverrideGuard {
+        previous: slot.replace(Some(now_millis)),
+    })
+}
+
 pub fn override_time_millis() -> Option<u64> {
     TIME_OVERRIDE_MILLIS.with(Cell::get)
 }

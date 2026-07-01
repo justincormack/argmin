@@ -2499,12 +2499,13 @@ impl super::StorageCluster {
                                         bucket, pg_id, existing.drain_id
                                     )),
                                 );
-                                return Ok(super::DurableBucketDeleteDrainBegin::Acquired(
-                                    super::DurableBucketWriteDrain {
+                                let renewed = self.heartbeat_durable_bucket_delete_drain(
+                                    &super::DurableBucketWriteDrain {
                                         pg_id,
                                         record: existing,
                                     },
-                                ));
+                                )?;
+                                return Ok(super::DurableBucketDeleteDrainBegin::Acquired(renewed));
                             }
                             Ok(current)
                                 if current.state == BucketState::Active
@@ -4111,6 +4112,22 @@ impl super::StorageCluster {
                             continue;
                         }
                     }
+                    attempt_phase = BucketDeleteAttemptPhase::StreamCleanup;
+                    Self::emit_bucket_delete_begin_loop_step(
+                        bucket,
+                        pg_id,
+                        started,
+                        "heartbeat_before_stream_cleanup_start",
+                        format!("iteration={loop_iteration}"),
+                    );
+                    durable_drain = self.heartbeat_durable_bucket_delete_drain(&durable_drain)?;
+                    Self::emit_bucket_delete_begin_loop_step(
+                        bucket,
+                        pg_id,
+                        started,
+                        "heartbeat_before_stream_cleanup_done",
+                        format!("iteration={loop_iteration}"),
+                    );
                     Self::emit_bucket_delete_begin_loop_step(
                         bucket,
                         pg_id,
@@ -4226,6 +4243,22 @@ impl super::StorageCluster {
                         post_reservation_progress,
                         0,
                     )?;
+                    attempt_phase = BucketDeleteAttemptPhase::StreamCleanup;
+                    Self::emit_bucket_delete_begin_loop_step(
+                        bucket,
+                        pg_id,
+                        started,
+                        "heartbeat_before_visibility_stream_cleanup_start",
+                        format!("iteration={} pass=before_visibility_check", loop_iteration),
+                    );
+                    durable_drain = self.heartbeat_durable_bucket_delete_drain(&durable_drain)?;
+                    Self::emit_bucket_delete_begin_loop_step(
+                        bucket,
+                        pg_id,
+                        started,
+                        "heartbeat_before_visibility_stream_cleanup_done",
+                        format!("iteration={} pass=before_visibility_check", loop_iteration),
+                    );
                     Self::emit_bucket_delete_begin_loop_step(
                         bucket,
                         pg_id,
@@ -4337,6 +4370,22 @@ impl super::StorageCluster {
                         continue;
                     }
                 }
+                attempt_phase = BucketDeleteAttemptPhase::FinalVisibilityCheck;
+                Self::emit_bucket_delete_begin_loop_step(
+                    bucket,
+                    pg_id,
+                    started,
+                    "heartbeat_before_visibility_check_start",
+                    format!("iteration={loop_iteration}"),
+                );
+                durable_drain = self.heartbeat_durable_bucket_delete_drain(&durable_drain)?;
+                Self::emit_bucket_delete_begin_loop_step(
+                    bucket,
+                    pg_id,
+                    started,
+                    "heartbeat_before_visibility_check_done",
+                    format!("iteration={loop_iteration}"),
+                );
                 Self::emit_bucket_delete_begin_loop_step(
                     bucket,
                     pg_id,
@@ -4344,7 +4393,6 @@ impl super::StorageCluster {
                     "visibility_check_start",
                     format!("iteration={loop_iteration}"),
                 );
-                attempt_phase = BucketDeleteAttemptPhase::FinalVisibilityCheck;
                 self.record_bucket_delete_attempt_outcome_for_drain_with_client(
                     node_store.bucket_write_reservation_client().as_ref(),
                     &durable_drain,
