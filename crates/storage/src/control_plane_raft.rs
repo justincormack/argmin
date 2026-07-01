@@ -179,12 +179,7 @@ impl<T> ControlPlaneRaftAuthorityService for T where
 {
 }
 
-pub trait ControlPlaneRaftAuthorityServiceDirectory {
-    fn authority_service_for_node(
-        &self,
-        node_id: ControlPlaneRaftNodeId,
-    ) -> ControlPlaneRaftFuture<'_, Result<ControlPlaneRaftAuthorityServiceHandle, ControlPlaneError>>;
-
+pub trait ControlPlaneRaftAuthorityStatusListSource {
     fn authority_statuses(
         &self,
     ) -> ControlPlaneRaftFuture<
@@ -194,6 +189,70 @@ pub trait ControlPlaneRaftAuthorityServiceDirectory {
             ControlPlaneError,
         >,
     >;
+}
+
+pub trait ControlPlaneRaftAuthorityServiceDirectory:
+    ControlPlaneRaftAuthorityStatusListSource
+{
+    fn authority_service_for_node(
+        &self,
+        node_id: ControlPlaneRaftNodeId,
+    ) -> ControlPlaneRaftFuture<'_, Result<ControlPlaneRaftAuthorityServiceHandle, ControlPlaneError>>;
+}
+
+#[derive(Clone)]
+pub struct ControlPlaneRaftAuthorityStatusListHandle {
+    inner: Arc<dyn ControlPlaneRaftAuthorityStatusListSource + Send + Sync>,
+}
+
+impl ControlPlaneRaftAuthorityStatusListHandle {
+    pub fn new<T>(status_list: Arc<T>) -> Self
+    where
+        T: ControlPlaneRaftAuthorityStatusListSource + Send + Sync + 'static,
+    {
+        Self { inner: status_list }
+    }
+
+    pub fn from_status_list(
+        status_list: Arc<dyn ControlPlaneRaftAuthorityStatusListSource + Send + Sync>,
+    ) -> Self {
+        Self { inner: status_list }
+    }
+
+    #[must_use]
+    pub fn as_status_list(
+        &self,
+    ) -> &(dyn ControlPlaneRaftAuthorityStatusListSource + Send + Sync + 'static) {
+        &*self.inner
+    }
+
+    pub async fn authority_statuses(
+        &self,
+    ) -> Result<BTreeMap<ControlPlaneRaftNodeId, ControlPlaneRaftAuthorityStatus>, ControlPlaneError>
+    {
+        self.inner.authority_statuses().await
+    }
+}
+
+impl fmt::Debug for ControlPlaneRaftAuthorityStatusListHandle {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ControlPlaneRaftAuthorityStatusListHandle")
+            .finish_non_exhaustive()
+    }
+}
+
+impl ControlPlaneRaftAuthorityStatusListSource for ControlPlaneRaftAuthorityStatusListHandle {
+    fn authority_statuses(
+        &self,
+    ) -> ControlPlaneRaftFuture<
+        '_,
+        Result<
+            BTreeMap<ControlPlaneRaftNodeId, ControlPlaneRaftAuthorityStatus>,
+            ControlPlaneError,
+        >,
+    > {
+        self.inner.authority_statuses()
+    }
 }
 
 #[derive(Clone)]
@@ -277,15 +336,7 @@ impl fmt::Debug for ControlPlaneRaftAuthorityServiceDirectoryHandle {
     }
 }
 
-impl ControlPlaneRaftAuthorityServiceDirectory for ControlPlaneRaftAuthorityServiceDirectoryHandle {
-    fn authority_service_for_node(
-        &self,
-        node_id: ControlPlaneRaftNodeId,
-    ) -> ControlPlaneRaftFuture<'_, Result<ControlPlaneRaftAuthorityServiceHandle, ControlPlaneError>>
-    {
-        self.inner.authority_service_for_node(node_id)
-    }
-
+impl ControlPlaneRaftAuthorityStatusListSource for ControlPlaneRaftAuthorityServiceDirectoryHandle {
     fn authority_statuses(
         &self,
     ) -> ControlPlaneRaftFuture<
@@ -296,6 +347,16 @@ impl ControlPlaneRaftAuthorityServiceDirectory for ControlPlaneRaftAuthorityServ
         >,
     > {
         self.inner.authority_statuses()
+    }
+}
+
+impl ControlPlaneRaftAuthorityServiceDirectory for ControlPlaneRaftAuthorityServiceDirectoryHandle {
+    fn authority_service_for_node(
+        &self,
+        node_id: ControlPlaneRaftNodeId,
+    ) -> ControlPlaneRaftFuture<'_, Result<ControlPlaneRaftAuthorityServiceHandle, ControlPlaneError>>
+    {
+        self.inner.authority_service_for_node(node_id)
     }
 }
 
@@ -3213,34 +3274,7 @@ mod tests {
         }
     }
 
-    impl ControlPlaneRaftAuthorityServiceDirectory for InMemoryAuthorityServiceDirectory {
-        fn authority_service_for_node(
-            &self,
-            node_id: ControlPlaneRaftNodeId,
-        ) -> ControlPlaneRaftFuture<
-            '_,
-            Result<ControlPlaneRaftAuthorityServiceHandle, ControlPlaneError>,
-        > {
-            let result = (|| {
-                let services = self
-                    .services
-                    .lock()
-                    .map_err(|_| ControlPlaneError::RpcRemote {
-                        message: "in-memory test authority service directory lock poisoned"
-                            .to_string(),
-                    })?;
-                services
-                    .get(&node_id)
-                    .cloned()
-                    .ok_or_else(|| ControlPlaneError::RpcRemote {
-                        message: format!(
-                            "in-memory test authority service directory has no node {node_id}"
-                        ),
-                    })
-            })();
-            Box::pin(std::future::ready(result))
-        }
-
+    impl ControlPlaneRaftAuthorityStatusListSource for InMemoryAuthorityServiceDirectory {
         fn authority_statuses(
             &self,
         ) -> ControlPlaneRaftFuture<
@@ -3274,6 +3308,35 @@ mod tests {
                 }
                 Ok(statuses)
             })
+        }
+    }
+
+    impl ControlPlaneRaftAuthorityServiceDirectory for InMemoryAuthorityServiceDirectory {
+        fn authority_service_for_node(
+            &self,
+            node_id: ControlPlaneRaftNodeId,
+        ) -> ControlPlaneRaftFuture<
+            '_,
+            Result<ControlPlaneRaftAuthorityServiceHandle, ControlPlaneError>,
+        > {
+            let result = (|| {
+                let services = self
+                    .services
+                    .lock()
+                    .map_err(|_| ControlPlaneError::RpcRemote {
+                        message: "in-memory test authority service directory lock poisoned"
+                            .to_string(),
+                    })?;
+                services
+                    .get(&node_id)
+                    .cloned()
+                    .ok_or_else(|| ControlPlaneError::RpcRemote {
+                        message: format!(
+                            "in-memory test authority service directory has no node {node_id}"
+                        ),
+                    })
+            })();
+            Box::pin(std::future::ready(result))
         }
     }
 
@@ -5462,6 +5525,19 @@ mod tests {
                 "authority service directory statuses after transfer",
             )
             .await;
+            let status_list_handle =
+                ControlPlaneRaftAuthorityStatusListHandle::new(Arc::new(directory.clone()));
+            let status_list = status_list_handle.as_status_list();
+            let listed_statuses = expect_bounded_control_plane_raft(
+                status_list.authority_statuses(),
+                operation_timeout,
+                "authority status-list handle statuses after transfer",
+            )
+            .await;
+            assert_eq!(
+                listed_statuses.keys().copied().collect::<BTreeSet<_>>(),
+                BTreeSet::from([411, 412])
+            );
             assert_eq!(
                 transferred_statuses
                     .keys()

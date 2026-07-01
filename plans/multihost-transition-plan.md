@@ -9863,6 +9863,10 @@ Phase 12.1 progress:
   that can enumerate known raft authorities without naming the in-memory test
   directory or the concrete OpenRaft wrapper; the directory smoke now verifies
   the status list after leader transfer.
+- Split that status-list capability into its own cloneable handle, matching the
+  existing command/admin/service handle pattern. Future diagnostics and admin
+  clients can now depend only on the status-list surface when they do not need
+  service lookup or routed command execution.
 - Added a directory-owned current-serving-authority route helper. Leader-routed
   clients now ask the directory to derive exactly one serving authority from
   the status list instead of trusting a single observer's current-leader view,
