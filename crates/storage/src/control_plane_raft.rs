@@ -3699,6 +3699,102 @@ mod tests {
         );
     }
 
+    fn test_authority_status(
+        node_id: ControlPlaneRaftNodeId,
+        linearized_authority_serving: bool,
+    ) -> ControlPlaneRaftAuthorityStatus {
+        ControlPlaneRaftAuthorityStatus {
+            node_id,
+            current_leader: linearized_authority_serving.then_some(node_id),
+            server_state: if linearized_authority_serving {
+                ServerState::Leader
+            } else {
+                ServerState::Follower
+            },
+            local_leader: linearized_authority_serving,
+            effective_voter: linearized_authority_serving,
+            effective_learner: false,
+            applied_voter: linearized_authority_serving,
+            applied_learner: false,
+            linearized_authority_serving,
+            persisted_vote: None,
+            current_term: None,
+            last_log_id: None,
+            last_purged_log_id: None,
+            committed: None,
+            applied: None,
+            current_snapshot: None,
+            authority_incarnation: AuthorityIncarnation::INITIAL,
+            current_cluster_epoch: ClusterEpoch::INITIAL,
+            retained_history_count: 0,
+            oldest_retained_history_epoch: None,
+            newest_retained_history_epoch: None,
+            oldest_storage_history_floor_epoch: None,
+            storage_node_lease_deadline_count: 0,
+            earliest_storage_node_lease_deadline_ms: None,
+            latest_storage_node_lease_deadline_ms: None,
+            storage_node_count: 0,
+            joining_storage_node_count: 0,
+            active_storage_node_count: 0,
+            draining_storage_node_count: 0,
+            out_storage_node_count: 0,
+            removed_storage_node_count: 0,
+            healthy_storage_node_count: 0,
+            suspect_storage_node_count: 0,
+            unavailable_storage_node_count: 0,
+            pg_count: 0,
+            active_pg_count: 0,
+            peering_pg_count: 0,
+            degraded_pg_count: 0,
+            backfilling_pg_count: 0,
+            inconsistent_pg_count: 0,
+            active_primary_pg_count: 0,
+            peering_metadata_transfer_pg_count: 0,
+            metadata_transfer_fenced_pg_count: 0,
+            metadata_transfer_fence_source_lease_deadline_count: 0,
+            earliest_metadata_transfer_fence_source_lease_deadline_ms: None,
+            latest_metadata_transfer_fence_source_lease_deadline_ms: None,
+            effective_membership_log_id: None,
+            effective_voters: linearized_authority_serving
+                .then_some(node_id)
+                .into_iter()
+                .collect(),
+            effective_learners: BTreeSet::new(),
+            applied_membership_log_id: None,
+            applied_voters: linearized_authority_serving
+                .then_some(node_id)
+                .into_iter()
+                .collect(),
+            applied_learners: BTreeSet::new(),
+        }
+    }
+
+    #[test]
+    fn control_plane_raft_current_serving_authority_node_id_fails_closed() {
+        let statuses = BTreeMap::from([
+            (431, test_authority_status(431, false)),
+            (432, test_authority_status(432, true)),
+        ]);
+        assert_eq!(current_serving_authority_node_id(&statuses).unwrap(), 432);
+
+        let no_serving = BTreeMap::from([
+            (431, test_authority_status(431, false)),
+            (432, test_authority_status(432, false)),
+        ]);
+        assert!(matches!(
+            current_serving_authority_node_id(&no_serving),
+            Err(ControlPlaneError::RpcRemote { message })
+                if message.contains("no serving raft authority")
+        ));
+
+        let key_mismatch = BTreeMap::from([(431, test_authority_status(432, false))]);
+        assert!(matches!(
+            current_serving_authority_node_id(&key_mismatch),
+            Err(ControlPlaneError::RpcRemote { message })
+                if message.contains("status key 431 disagrees with reported node 432")
+        ));
+    }
+
     async fn wait_for_log_purged_to(
         log_store: &ControlPlaneRaftLogStore,
         log_id: LogIdOf<ControlPlaneRaftTypeConfig>,

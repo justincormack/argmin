@@ -9849,6 +9849,10 @@ Phase 12.1 progress:
   the status list instead of trusting a single observer's current-leader view,
   and the route fails closed if the directory reports no serving authority or
   multiple serving authorities.
+- Pinned the current-serving-authority selector's deterministic failure modes:
+  it now has direct coverage for selecting the sole serving authority,
+  rejecting an empty serving set, and rejecting directory-key/status-node
+  mismatches before any routed RPC is attempted.
 
 1. define the replicated control-plane state machine:
    - state includes cluster epoch, PG count, PG state, PG acting sets, node
