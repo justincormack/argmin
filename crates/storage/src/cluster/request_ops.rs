@@ -11648,6 +11648,65 @@ impl super::StorageCluster {
             .bucket_delete_attempt_outcome(pg_id, bucket)
     }
 
+    pub fn bucket_delete_debug_snapshot(
+        &self,
+        bucket: &BucketName,
+    ) -> Result<BucketDeleteDebugSnapshot, BucketSnapshotLoadError> {
+        let pg_id = PgId::new(self.bucket_metadata_pg_id(bucket));
+        let node = self
+            .local_map
+            .metadata_pg_primary_node(self.operation_epoch(), pg_id)?;
+
+        let bucket_row = match node.bucket_metadata_client().head_bucket_raw(pg_id, bucket) {
+            Ok(info) => Some(BucketDeleteDebugBucketRow {
+                state: info.state,
+                bucket_execution_generation: info.bucket_execution_generation,
+                bucket_incarnation_generation: info.bucket_incarnation_generation,
+            }),
+            Err(BucketSnapshotLoadError::Metadata(MetadataError::BucketNotFound { .. })) => None,
+            Err(error) => return Err(error),
+        };
+
+        let durable_write_drain = node
+            .bucket_write_reservation_client()
+            .durable_bucket_write_drain(pg_id, bucket)?
+            .map(|record| BucketDeleteDebugDrain {
+                drain_id: record.drain_id,
+                cluster_epoch: record.cluster_epoch,
+                bucket_execution_generation: record.bucket_execution_generation,
+                created_at: record.created_at,
+                lease_deadline: record.lease_deadline,
+            });
+
+        let pending_metadata_command = self
+            .pending_metadata_command_for_bucket(pg_id, bucket)?
+            .map(|command| {
+                let id = command.id();
+                let target_bucket = command.bucket_name().clone();
+                BucketDeleteDebugPendingCommand {
+                    kind: command.payload().kind_name(),
+                    matches_bucket: target_bucket == *bucket,
+                    target_bucket,
+                    cluster_epoch: id.cluster_epoch(),
+                    pg_id: id.pg_id().get(),
+                    log_index: id.log_index().get(),
+                }
+            });
+
+        let attempt_outcome = node
+            .bucket_write_reservation_client()
+            .bucket_delete_attempt_outcome(pg_id, bucket)?;
+
+        Ok(BucketDeleteDebugSnapshot {
+            bucket: bucket.clone(),
+            pg_id: pg_id.get(),
+            bucket_row,
+            durable_write_drain,
+            pending_metadata_command,
+            attempt_outcome,
+        })
+    }
+
     #[cfg(any(test, feature = "test-hooks"))]
     pub fn test_object_pg_id_for(&self, bucket: &BucketName, key: &ObjectKey) -> u32 {
         self.object_metadata_pg_id(bucket, key)

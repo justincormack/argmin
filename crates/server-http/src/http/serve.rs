@@ -29,8 +29,8 @@ use crate::coordinator::MAX_OBJECT_SIZE;
 use crate::error::ServerError;
 use server_core::metadata_blob::USER_METADATA_SIZE_LIMIT;
 use storage::{
-    BucketDeleteAttemptOutcomeKind, BucketDeleteAttemptOutcomeRecord, BucketDeleteAttemptPhase,
-    BucketName, PgId, SessionId,
+    BucketDeleteAttemptOutcomeKind, BucketDeleteAttemptPhase, BucketDeleteDebugSnapshot,
+    BucketName, BucketState, PgId, SessionId,
 };
 
 const TRACE_TARGET: &str = "server_http";
@@ -1060,22 +1060,10 @@ fn local_debug_response(
                 .expect("server has at least one frontend")
                 .coordinator
                 .storage_node_for_request();
-            match storage.bucket_delete_attempt_outcome(&bucket) {
-                Ok(Some(record)) => Some(local_debug_text_response(
+            match storage.bucket_delete_debug_snapshot(&bucket) {
+                Ok(snapshot) => Some(local_debug_text_response(
                     200,
-                    local_debug_bucket_delete_attempt_body(
-                        &bucket,
-                        storage.bucket_pg_id_for(&bucket),
-                        Some(&record),
-                    ),
-                )),
-                Ok(None) => Some(local_debug_text_response(
-                    200,
-                    local_debug_bucket_delete_attempt_body(
-                        &bucket,
-                        storage.bucket_pg_id_for(&bucket),
-                        None,
-                    ),
+                    local_debug_bucket_delete_attempt_body(&snapshot),
                 )),
                 Err(error) => Some(local_debug_text_response(409, format!("{error:?}\n"))),
             }
@@ -1166,29 +1154,98 @@ fn local_debug_text_response(status_code: u16, body: String) -> S3Response {
     }
 }
 
-fn local_debug_bucket_delete_attempt_body(
-    bucket: &BucketName,
-    pg_id: u32,
-    record: Option<&BucketDeleteAttemptOutcomeRecord>,
-) -> String {
-    match record {
-        Some(record) => format!(
-            "present=1 bucket={:?} pg_id={} drain_id={:?} cluster_epoch={} bucket_execution_generation={} outcome={} phase={} post_reservation_next_object_pg_id={} updated_at={} detail={}\n",
-            bucket.as_str(),
-            pg_id,
-            record.drain_id,
-            record.cluster_epoch.get(),
-            record.bucket_execution_generation,
-            local_debug_bucket_delete_attempt_outcome(record.outcome),
-            local_debug_bucket_delete_attempt_phase(record.phase),
-            record
-                .post_reservation_next_object_pg_id
-                .map_or_else(|| "none".to_string(), |pg_id| pg_id.to_string()),
-            record.updated_at,
-            observability::escaped(&record.detail),
-        ),
-        None => format!("present=0 bucket={:?} pg_id={}\n", bucket.as_str(), pg_id),
+fn local_debug_bucket_delete_attempt_body(snapshot: &BucketDeleteDebugSnapshot) -> String {
+    use std::fmt::Write as _;
+
+    let mut body = String::new();
+    writeln!(
+        &mut body,
+        "bucket={:?} pg_id={}",
+        snapshot.bucket.as_str(),
+        snapshot.pg_id
+    )
+    .expect("write to String");
+    match &snapshot.bucket_row {
+        Some(row) => {
+            writeln!(
+                &mut body,
+                "bucket_row=present state={} bucket_execution_generation={} bucket_incarnation_generation={}",
+                local_debug_bucket_state(row.state),
+                row.bucket_execution_generation,
+                row.bucket_incarnation_generation,
+            )
+            .expect("write to String");
+        }
+        None => body.push_str("bucket_row=absent\n"),
     }
+
+    match &snapshot.durable_write_drain {
+        Some(drain) => {
+            writeln!(
+                &mut body,
+                "durable_write_drain=present drain_id={:?} cluster_epoch={} bucket_execution_generation={} created_at={} lease_deadline={}",
+                drain.drain_id,
+                drain.cluster_epoch.get(),
+                drain.bucket_execution_generation,
+                drain.created_at,
+                local_debug_optional_u64(drain.lease_deadline),
+            )
+            .expect("write to String");
+        }
+        None => body.push_str("durable_write_drain=absent\n"),
+    }
+
+    match &snapshot.pending_metadata_command {
+        Some(command) => {
+            writeln!(
+                &mut body,
+                "pending_metadata_command=present kind={} target_bucket={:?} matches_bucket={} cluster_epoch={} pg_id={} log_index={}",
+                command.kind,
+                command.target_bucket.as_str(),
+                command.matches_bucket,
+                command.cluster_epoch.get(),
+                command.pg_id,
+                command.log_index,
+            )
+            .expect("write to String");
+        }
+        None => body.push_str("pending_metadata_command=absent\n"),
+    }
+
+    match &snapshot.attempt_outcome {
+        Some(record) => {
+            writeln!(
+                &mut body,
+                "attempt_outcome=present present=1 drain_id={:?} cluster_epoch={} bucket_execution_generation={} outcome={} phase={} post_reservation_next_object_pg_id={} updated_at={} detail={}",
+                record.drain_id,
+                record.cluster_epoch.get(),
+                record.bucket_execution_generation,
+                local_debug_bucket_delete_attempt_outcome(record.outcome),
+                local_debug_bucket_delete_attempt_phase(record.phase),
+                local_debug_optional_u32(record.post_reservation_next_object_pg_id),
+                record.updated_at,
+                observability::escaped(&record.detail),
+            )
+            .expect("write to String");
+        }
+        None => body.push_str("attempt_outcome=absent present=0\n"),
+    }
+    body
+}
+
+fn local_debug_bucket_state(state: BucketState) -> &'static str {
+    match state {
+        BucketState::Active => "active",
+        BucketState::Deleting => "deleting",
+    }
+}
+
+fn local_debug_optional_u32(value: Option<u32>) -> String {
+    value.map_or_else(|| "none".to_string(), |value| value.to_string())
+}
+
+fn local_debug_optional_u64(value: Option<u64>) -> String {
+    value.map_or_else(|| "none".to_string(), |value| value.to_string())
 }
 
 fn local_debug_bucket_delete_attempt_outcome(
@@ -4992,29 +5049,81 @@ mod tests {
             response.contains("bucket=\"debug-attempt-bucket\""),
             "{response}"
         );
+        assert!(response.contains("bucket_row=present"), "{response}");
+        assert!(response.contains("state=active"), "{response}");
+        assert!(
+            response.contains("durable_write_drain=absent"),
+            "{response}"
+        );
+        assert!(
+            response.contains("pending_metadata_command=absent"),
+            "{response}"
+        );
+        assert!(response.contains("attempt_outcome=absent"), "{response}");
         assert!(response.contains("pg_id="), "{response}");
     }
 
     #[test]
     fn local_debug_bucket_delete_attempt_body_formats_populated_record() {
         let bucket = BucketName::try_from("debug-attempt-bucket".to_string()).unwrap();
-        let record = BucketDeleteAttemptOutcomeRecord {
+        let snapshot = BucketDeleteDebugSnapshot {
             bucket: bucket.clone(),
-            drain_id: "delete-drain-1".to_string(),
-            cluster_epoch: storage::ClusterEpoch::new(7).unwrap(),
-            bucket_execution_generation: 11,
-            outcome: BucketDeleteAttemptOutcomeKind::Retryable,
-            phase: BucketDeleteAttemptPhase::PostReservationObjectDrain,
-            detail: "line1\nline2\t\x1b[31m".to_string(),
-            post_reservation_next_object_pg_id: Some(17),
-            updated_at: 12345,
+            pg_id: 3,
+            bucket_row: Some(storage::BucketDeleteDebugBucketRow {
+                state: BucketState::Deleting,
+                bucket_execution_generation: 12,
+                bucket_incarnation_generation: 34,
+            }),
+            durable_write_drain: Some(storage::BucketDeleteDebugDrain {
+                drain_id: "delete-drain-1".to_string(),
+                cluster_epoch: storage::ClusterEpoch::new(7).unwrap(),
+                bucket_execution_generation: 11,
+                created_at: 1000,
+                lease_deadline: Some(2000),
+            }),
+            pending_metadata_command: Some(storage::BucketDeleteDebugPendingCommand {
+                kind: "mark_bucket_deleting",
+                target_bucket: bucket.clone(),
+                matches_bucket: true,
+                cluster_epoch: storage::ClusterEpoch::new(7).unwrap(),
+                pg_id: 3,
+                log_index: 88,
+            }),
+            attempt_outcome: Some(storage::BucketDeleteAttemptOutcomeRecord {
+                bucket: bucket.clone(),
+                drain_id: "delete-drain-1".to_string(),
+                cluster_epoch: storage::ClusterEpoch::new(7).unwrap(),
+                bucket_execution_generation: 11,
+                outcome: BucketDeleteAttemptOutcomeKind::Retryable,
+                phase: BucketDeleteAttemptPhase::PostReservationObjectDrain,
+                detail: "line1\nline2\t\x1b[31m".to_string(),
+                post_reservation_next_object_pg_id: Some(17),
+                updated_at: 12345,
+            }),
         };
 
-        let body = local_debug_bucket_delete_attempt_body(&bucket, 3, Some(&record));
+        let body = local_debug_bucket_delete_attempt_body(&snapshot);
 
-        assert!(body.starts_with("present=1 "), "{body}");
+        assert!(
+            body.starts_with("bucket=\"debug-attempt-bucket\" "),
+            "{body}"
+        );
         assert!(body.contains("bucket=\"debug-attempt-bucket\""), "{body}");
         assert!(body.contains("pg_id=3"), "{body}");
+        assert!(body.contains("bucket_row=present"), "{body}");
+        assert!(body.contains("state=deleting"), "{body}");
+        assert!(body.contains("bucket_execution_generation=12"), "{body}");
+        assert!(body.contains("bucket_incarnation_generation=34"), "{body}");
+        assert!(body.contains("durable_write_drain=present"), "{body}");
+        assert!(body.contains("created_at=1000"), "{body}");
+        assert!(body.contains("lease_deadline=2000"), "{body}");
+        assert!(
+            body.contains("pending_metadata_command=present kind=mark_bucket_deleting"),
+            "{body}"
+        );
+        assert!(body.contains("matches_bucket=true"), "{body}");
+        assert!(body.contains("log_index=88"), "{body}");
+        assert!(body.contains("attempt_outcome=present present=1"), "{body}");
         assert!(body.contains("drain_id=\"delete-drain-1\""), "{body}");
         assert!(body.contains("cluster_epoch=7"), "{body}");
         assert!(body.contains("bucket_execution_generation=11"), "{body}");

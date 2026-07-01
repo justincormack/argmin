@@ -2485,6 +2485,46 @@ pub struct BucketDeleteAttemptOutcomeRecord {
     pub updated_at: u64,
 }
 
+/// Sanitized bucket row fields included in DeleteBucket local-debug output.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BucketDeleteDebugBucketRow {
+    pub state: BucketState,
+    pub bucket_execution_generation: u64,
+    pub bucket_incarnation_generation: u64,
+}
+
+/// Sanitized durable bucket write-drain fields included in local-debug output.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BucketDeleteDebugDrain {
+    pub drain_id: String,
+    pub cluster_epoch: ClusterEpoch,
+    pub bucket_execution_generation: u64,
+    pub created_at: u64,
+    pub lease_deadline: Option<u64>,
+}
+
+/// Pending bucket-PG metadata command fields included in local-debug output.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BucketDeleteDebugPendingCommand {
+    pub kind: &'static str,
+    pub target_bucket: BucketName,
+    pub matches_bucket: bool,
+    pub cluster_epoch: ClusterEpoch,
+    pub pg_id: u32,
+    pub log_index: u64,
+}
+
+/// Read-only durable state used by the local DeleteBucket debug endpoint.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BucketDeleteDebugSnapshot {
+    pub bucket: BucketName,
+    pub pg_id: u32,
+    pub bucket_row: Option<BucketDeleteDebugBucketRow>,
+    pub durable_write_drain: Option<BucketDeleteDebugDrain>,
+    pub pending_metadata_command: Option<BucketDeleteDebugPendingCommand>,
+    pub attempt_outcome: Option<BucketDeleteAttemptOutcomeRecord>,
+}
+
 /// Bucket metadata.
 #[derive(Clone)]
 pub struct BucketInfo {
