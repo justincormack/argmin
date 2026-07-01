@@ -287,6 +287,18 @@ pub trait ControlPlaneRaftAuthorityServiceDirectory:
     ) -> ControlPlaneRaftFuture<'_, Result<ControlPlaneRaftAuthorityServiceHandle, ControlPlaneError>>;
 }
 
+pub trait ControlPlaneRaftAuthorityBootstrapDirectory:
+    ControlPlaneRaftAuthorityStatusListSource
+{
+    fn authority_bootstrap_for_node(
+        &self,
+        node_id: ControlPlaneRaftNodeId,
+    ) -> ControlPlaneRaftFuture<
+        '_,
+        Result<ControlPlaneRaftAuthorityBootstrapHandle, ControlPlaneError>,
+    >;
+}
+
 pub trait ControlPlaneRaftAuthorityNodeLifecycleDirectory:
     ControlPlaneRaftAuthorityStatusListSource
 {
@@ -476,6 +488,25 @@ impl ControlPlaneRaftAuthorityServiceDirectory for ControlPlaneRaftAuthorityServ
     }
 }
 
+impl ControlPlaneRaftAuthorityBootstrapDirectory
+    for ControlPlaneRaftAuthorityServiceDirectoryHandle
+{
+    fn authority_bootstrap_for_node(
+        &self,
+        node_id: ControlPlaneRaftNodeId,
+    ) -> ControlPlaneRaftFuture<
+        '_,
+        Result<ControlPlaneRaftAuthorityBootstrapHandle, ControlPlaneError>,
+    > {
+        Box::pin(async move {
+            let service = self.authority_service_for_node(node_id).await?;
+            Ok(ControlPlaneRaftAuthorityBootstrapHandle::new(Arc::new(
+                service,
+            )))
+        })
+    }
+}
+
 impl ControlPlaneRaftAuthorityNodeLifecycleDirectory
     for ControlPlaneRaftAuthorityServiceDirectoryHandle
 {
@@ -507,6 +538,84 @@ impl ControlPlaneRaftRoutedAuthorityDirectory for ControlPlaneRaftAuthorityServi
                 service,
             )))
         })
+    }
+}
+
+#[derive(Clone)]
+pub struct ControlPlaneRaftAuthorityBootstrapDirectoryHandle {
+    inner: Arc<dyn ControlPlaneRaftAuthorityBootstrapDirectory + Send + Sync>,
+}
+
+impl ControlPlaneRaftAuthorityBootstrapDirectoryHandle {
+    pub fn new<T>(directory: Arc<T>) -> Self
+    where
+        T: ControlPlaneRaftAuthorityBootstrapDirectory + Send + Sync + 'static,
+    {
+        Self { inner: directory }
+    }
+
+    pub fn from_bootstrap_directory(
+        directory: Arc<dyn ControlPlaneRaftAuthorityBootstrapDirectory + Send + Sync>,
+    ) -> Self {
+        Self { inner: directory }
+    }
+
+    #[must_use]
+    pub fn as_bootstrap_directory(
+        &self,
+    ) -> &(dyn ControlPlaneRaftAuthorityBootstrapDirectory + Send + Sync + 'static) {
+        &*self.inner
+    }
+
+    pub async fn authority_statuses(
+        &self,
+    ) -> Result<BTreeMap<ControlPlaneRaftNodeId, ControlPlaneRaftAuthorityStatus>, ControlPlaneError>
+    {
+        self.inner.authority_statuses().await
+    }
+
+    pub async fn authority_bootstrap_for_node(
+        &self,
+        node_id: ControlPlaneRaftNodeId,
+    ) -> Result<ControlPlaneRaftAuthorityBootstrapHandle, ControlPlaneError> {
+        self.inner.authority_bootstrap_for_node(node_id).await
+    }
+}
+
+impl fmt::Debug for ControlPlaneRaftAuthorityBootstrapDirectoryHandle {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ControlPlaneRaftAuthorityBootstrapDirectoryHandle")
+            .finish_non_exhaustive()
+    }
+}
+
+impl ControlPlaneRaftAuthorityStatusListSource
+    for ControlPlaneRaftAuthorityBootstrapDirectoryHandle
+{
+    fn authority_statuses(
+        &self,
+    ) -> ControlPlaneRaftFuture<
+        '_,
+        Result<
+            BTreeMap<ControlPlaneRaftNodeId, ControlPlaneRaftAuthorityStatus>,
+            ControlPlaneError,
+        >,
+    > {
+        self.inner.authority_statuses()
+    }
+}
+
+impl ControlPlaneRaftAuthorityBootstrapDirectory
+    for ControlPlaneRaftAuthorityBootstrapDirectoryHandle
+{
+    fn authority_bootstrap_for_node(
+        &self,
+        node_id: ControlPlaneRaftNodeId,
+    ) -> ControlPlaneRaftFuture<
+        '_,
+        Result<ControlPlaneRaftAuthorityBootstrapHandle, ControlPlaneError>,
+    > {
+        self.inner.authority_bootstrap_for_node(node_id)
     }
 }
 
@@ -3851,6 +3960,7 @@ mod tests {
     #[derive(Debug, Clone)]
     struct InMemoryAuthorityServiceEntry {
         service: ControlPlaneRaftAuthorityServiceHandle,
+        bootstrap: ControlPlaneRaftAuthorityBootstrapHandle,
         node_lifecycle: ControlPlaneRaftAuthorityNodeLifecycleHandle,
         routed_authority: ControlPlaneRaftRoutedAuthorityHandle,
     }
@@ -3861,6 +3971,8 @@ mod tests {
             node_id: ControlPlaneRaftNodeId,
             service: ControlPlaneRaftAuthorityServiceHandle,
         ) {
+            let bootstrap =
+                ControlPlaneRaftAuthorityBootstrapHandle::new(Arc::new(service.clone()));
             let node_lifecycle =
                 ControlPlaneRaftAuthorityNodeLifecycleHandle::new(Arc::new(service.clone()));
             let routed_authority =
@@ -3869,6 +3981,7 @@ mod tests {
                 node_id,
                 InMemoryAuthorityServiceEntry {
                     service,
+                    bootstrap,
                     node_lifecycle,
                     routed_authority,
                 },
@@ -3935,6 +4048,35 @@ mod tests {
                     .ok_or_else(|| ControlPlaneError::RpcRemote {
                         message: format!(
                             "in-memory test authority service directory has no node {node_id}"
+                        ),
+                    })
+            })();
+            Box::pin(std::future::ready(result))
+        }
+    }
+
+    impl ControlPlaneRaftAuthorityBootstrapDirectory for InMemoryAuthorityServiceDirectory {
+        fn authority_bootstrap_for_node(
+            &self,
+            node_id: ControlPlaneRaftNodeId,
+        ) -> ControlPlaneRaftFuture<
+            '_,
+            Result<ControlPlaneRaftAuthorityBootstrapHandle, ControlPlaneError>,
+        > {
+            let result = (|| {
+                let entries = self
+                    .entries
+                    .lock()
+                    .map_err(|_| ControlPlaneError::RpcRemote {
+                        message: "in-memory test authority service directory lock poisoned"
+                            .to_string(),
+                    })?;
+                entries
+                    .get(&node_id)
+                    .map(|entry| entry.bootstrap.clone())
+                    .ok_or_else(|| ControlPlaneError::RpcRemote {
+                        message: format!(
+                            "in-memory test authority service directory has no bootstrap node {node_id}"
                         ),
                     })
             })();
@@ -6095,6 +6237,8 @@ mod tests {
                 412,
                 ControlPlaneRaftAuthorityServiceHandle::new(Arc::clone(&authority2)),
             );
+            let bootstrap_directory =
+                ControlPlaneRaftAuthorityBootstrapDirectoryHandle::new(Arc::new(directory.clone()));
             let routed_directory =
                 ControlPlaneRaftRoutedAuthorityDirectoryHandle::new(Arc::new(directory.clone()));
             let node_lifecycle_directory =
@@ -6111,6 +6255,12 @@ mod tests {
                 missing,
                 Err(ControlPlaneError::RpcRemote { message })
                     if message.contains("no node 499")
+            ));
+            let missing_bootstrap = bootstrap_directory.authority_bootstrap_for_node(499).await;
+            assert!(matches!(
+                missing_bootstrap,
+                Err(ControlPlaneError::RpcRemote { message })
+                    if message.contains("no bootstrap node 499")
             ));
             let missing_node_lifecycle = node_lifecycle_directory
                 .authority_node_lifecycle_for_node(499)
@@ -6133,6 +6283,20 @@ mod tests {
                 "authority service directory lookup follower",
             )
             .await;
+            let leader_bootstrap = expect_bounded_control_plane_raft(
+                bootstrap_directory.authority_bootstrap_for_node(411),
+                operation_timeout,
+                "authority bootstrap directory lookup leader",
+            )
+            .await;
+            assert!(
+                expect_bounded_control_plane_raft(
+                    leader_bootstrap.is_initialized(),
+                    operation_timeout,
+                    "authority bootstrap directory is initialized check",
+                )
+                .await
+            );
             let leader_node_lifecycle = expect_bounded_control_plane_raft(
                 node_lifecycle_directory.authority_node_lifecycle_for_node(411),
                 operation_timeout,

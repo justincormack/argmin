@@ -9946,6 +9946,11 @@ Phase 12.1 progress:
   callers that need both, while explicit directory lookup now returns a
   node-lifecycle-only handle so wait/shutdown paths do not receive bootstrap
   initialization capability.
+- Added an object-safe bootstrap-directory capability. Initialization callers
+  can now resolve bootstrap-only handles by node without receiving command,
+  read, membership-admin, or wait/shutdown capability; the in-memory raft
+  directory smoke verifies both missing-node rejection and initialized-state
+  lookup through that narrow surface.
 
 1. define the replicated control-plane state machine:
    - state includes cluster epoch, PG count, PG state, PG acting sets, node
