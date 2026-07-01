@@ -260,15 +260,6 @@ pub trait ControlPlaneRaftAuthorityStatusListSource {
     >;
 }
 
-pub trait ControlPlaneRaftAuthorityServiceDirectory:
-    ControlPlaneRaftAuthorityStatusListSource
-{
-    fn authority_service_for_node(
-        &self,
-        node_id: ControlPlaneRaftNodeId,
-    ) -> ControlPlaneRaftFuture<'_, Result<ControlPlaneRaftAuthorityServiceHandle, ControlPlaneError>>;
-}
-
 pub trait ControlPlaneRaftAuthorityBootstrapDirectory:
     ControlPlaneRaftAuthorityStatusListSource
 {
@@ -357,40 +348,6 @@ impl ControlPlaneRaftAuthorityStatusListSource for ControlPlaneRaftAuthorityStat
     }
 }
 
-#[derive(Clone)]
-pub struct ControlPlaneRaftAuthorityServiceDirectoryHandle {
-    inner: Arc<dyn ControlPlaneRaftAuthorityServiceDirectory + Send + Sync>,
-}
-
-impl ControlPlaneRaftAuthorityServiceDirectoryHandle {
-    pub fn new<T>(directory: Arc<T>) -> Self
-    where
-        T: ControlPlaneRaftAuthorityServiceDirectory + Send + Sync + 'static,
-    {
-        Self { inner: directory }
-    }
-
-    pub fn from_service_directory(
-        directory: Arc<dyn ControlPlaneRaftAuthorityServiceDirectory + Send + Sync>,
-    ) -> Self {
-        Self { inner: directory }
-    }
-
-    #[must_use]
-    pub fn as_service_directory(
-        &self,
-    ) -> &(dyn ControlPlaneRaftAuthorityServiceDirectory + Send + Sync + 'static) {
-        &*self.inner
-    }
-
-    pub async fn authority_statuses(
-        &self,
-    ) -> Result<BTreeMap<ControlPlaneRaftNodeId, ControlPlaneRaftAuthorityStatus>, ControlPlaneError>
-    {
-        self.inner.authority_statuses().await
-    }
-}
-
 fn current_serving_authority_node_id(
     statuses: &BTreeMap<ControlPlaneRaftNodeId, ControlPlaneRaftAuthorityStatus>,
 ) -> Result<ControlPlaneRaftNodeId, ControlPlaneError> {
@@ -421,90 +378,6 @@ fn current_serving_authority_node_id(
     serving_node_id.ok_or_else(|| ControlPlaneError::RpcRemote {
         message: "raft authority directory found no serving raft authority".to_string(),
     })
-}
-
-impl fmt::Debug for ControlPlaneRaftAuthorityServiceDirectoryHandle {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("ControlPlaneRaftAuthorityServiceDirectoryHandle")
-            .finish_non_exhaustive()
-    }
-}
-
-impl ControlPlaneRaftAuthorityStatusListSource for ControlPlaneRaftAuthorityServiceDirectoryHandle {
-    fn authority_statuses(
-        &self,
-    ) -> ControlPlaneRaftFuture<
-        '_,
-        Result<
-            BTreeMap<ControlPlaneRaftNodeId, ControlPlaneRaftAuthorityStatus>,
-            ControlPlaneError,
-        >,
-    > {
-        self.inner.authority_statuses()
-    }
-}
-
-impl ControlPlaneRaftAuthorityServiceDirectory for ControlPlaneRaftAuthorityServiceDirectoryHandle {
-    fn authority_service_for_node(
-        &self,
-        node_id: ControlPlaneRaftNodeId,
-    ) -> ControlPlaneRaftFuture<'_, Result<ControlPlaneRaftAuthorityServiceHandle, ControlPlaneError>>
-    {
-        self.inner.authority_service_for_node(node_id)
-    }
-}
-
-impl ControlPlaneRaftAuthorityBootstrapDirectory
-    for ControlPlaneRaftAuthorityServiceDirectoryHandle
-{
-    fn authority_bootstrap_for_node(
-        &self,
-        node_id: ControlPlaneRaftNodeId,
-    ) -> ControlPlaneRaftFuture<
-        '_,
-        Result<ControlPlaneRaftAuthorityBootstrapHandle, ControlPlaneError>,
-    > {
-        Box::pin(async move {
-            let service = self.authority_service_for_node(node_id).await?;
-            Ok(ControlPlaneRaftAuthorityBootstrapHandle::new(Arc::new(
-                service,
-            )))
-        })
-    }
-}
-
-impl ControlPlaneRaftAuthorityNodeLifecycleDirectory
-    for ControlPlaneRaftAuthorityServiceDirectoryHandle
-{
-    fn authority_node_lifecycle_for_node(
-        &self,
-        node_id: ControlPlaneRaftNodeId,
-    ) -> ControlPlaneRaftFuture<
-        '_,
-        Result<ControlPlaneRaftAuthorityNodeLifecycleHandle, ControlPlaneError>,
-    > {
-        Box::pin(async move {
-            let service = self.authority_service_for_node(node_id).await?;
-            Ok(ControlPlaneRaftAuthorityNodeLifecycleHandle::new(Arc::new(
-                service,
-            )))
-        })
-    }
-}
-
-impl ControlPlaneRaftRoutedAuthorityDirectory for ControlPlaneRaftAuthorityServiceDirectoryHandle {
-    fn routed_authority_for_node(
-        &self,
-        node_id: ControlPlaneRaftNodeId,
-    ) -> ControlPlaneRaftFuture<'_, Result<ControlPlaneRaftRoutedAuthorityHandle, ControlPlaneError>>
-    {
-        Box::pin(async move {
-            let service = self.authority_service_for_node(node_id).await?;
-            Ok(ControlPlaneRaftRoutedAuthorityHandle::new(Arc::new(
-                service,
-            )))
-        })
-    }
 }
 
 #[derive(Clone)]
@@ -3750,7 +3623,7 @@ mod tests {
 
     #[derive(Debug, Clone)]
     struct InMemoryAuthorityServiceEntry {
-        service: ControlPlaneRaftAuthorityServiceHandle,
+        status: ControlPlaneRaftAuthorityStatusHandle,
         bootstrap: ControlPlaneRaftAuthorityBootstrapHandle,
         node_lifecycle: ControlPlaneRaftAuthorityNodeLifecycleHandle,
         routed_authority: ControlPlaneRaftRoutedAuthorityHandle,
@@ -3762,6 +3635,7 @@ mod tests {
             node_id: ControlPlaneRaftNodeId,
             service: ControlPlaneRaftAuthorityServiceHandle,
         ) {
+            let status = ControlPlaneRaftAuthorityStatusHandle::new(Arc::new(service.clone()));
             let bootstrap =
                 ControlPlaneRaftAuthorityBootstrapHandle::new(Arc::new(service.clone()));
             let node_lifecycle =
@@ -3771,7 +3645,7 @@ mod tests {
             self.entries.lock().unwrap().insert(
                 node_id,
                 InMemoryAuthorityServiceEntry {
-                    service,
+                    status,
                     bootstrap,
                     node_lifecycle,
                     routed_authority,
@@ -3796,17 +3670,18 @@ mod tests {
                         self.entries
                             .lock()
                             .map_err(|_| ControlPlaneError::RpcRemote {
-                                message: "in-memory test authority service directory lock poisoned"
-                                    .to_string(),
+                                message:
+                                    "in-memory test authority capability directory lock poisoned"
+                                        .to_string(),
                             })?;
                     entries.clone()
                 };
                 let mut statuses = BTreeMap::new();
                 for (node_id, entry) in entries {
-                    let status = entry.service.status().await.map_err(|error| {
+                    let status = entry.status.status().await.map_err(|error| {
                         ControlPlaneError::RpcRemote {
                             message: format!(
-                                "in-memory test authority service directory status for node {node_id} failed: {error:?}"
+                                "in-memory test authority capability directory status for node {node_id} failed: {error:?}"
                             ),
                         }
                     })?;
@@ -3814,35 +3689,6 @@ mod tests {
                 }
                 Ok(statuses)
             })
-        }
-    }
-
-    impl ControlPlaneRaftAuthorityServiceDirectory for InMemoryAuthorityServiceDirectory {
-        fn authority_service_for_node(
-            &self,
-            node_id: ControlPlaneRaftNodeId,
-        ) -> ControlPlaneRaftFuture<
-            '_,
-            Result<ControlPlaneRaftAuthorityServiceHandle, ControlPlaneError>,
-        > {
-            let result = (|| {
-                let entries = self
-                    .entries
-                    .lock()
-                    .map_err(|_| ControlPlaneError::RpcRemote {
-                        message: "in-memory test authority service directory lock poisoned"
-                            .to_string(),
-                    })?;
-                entries
-                    .get(&node_id)
-                    .map(|entry| entry.service.clone())
-                    .ok_or_else(|| ControlPlaneError::RpcRemote {
-                        message: format!(
-                            "in-memory test authority service directory has no node {node_id}"
-                        ),
-                    })
-            })();
-            Box::pin(std::future::ready(result))
         }
     }
 
@@ -3859,7 +3705,7 @@ mod tests {
                     .entries
                     .lock()
                     .map_err(|_| ControlPlaneError::RpcRemote {
-                        message: "in-memory test authority service directory lock poisoned"
+                        message: "in-memory test authority capability directory lock poisoned"
                             .to_string(),
                     })?;
                 entries
@@ -3867,7 +3713,7 @@ mod tests {
                     .map(|entry| entry.bootstrap.clone())
                     .ok_or_else(|| ControlPlaneError::RpcRemote {
                         message: format!(
-                            "in-memory test authority service directory has no bootstrap node {node_id}"
+                            "in-memory test authority capability directory has no bootstrap node {node_id}"
                         ),
                     })
             })();
@@ -3888,7 +3734,7 @@ mod tests {
                     .entries
                     .lock()
                     .map_err(|_| ControlPlaneError::RpcRemote {
-                        message: "in-memory test authority service directory lock poisoned"
+                        message: "in-memory test authority capability directory lock poisoned"
                             .to_string(),
                     })?;
                 entries
@@ -3896,7 +3742,7 @@ mod tests {
                     .map(|entry| entry.node_lifecycle.clone())
                     .ok_or_else(|| ControlPlaneError::RpcRemote {
                         message: format!(
-                            "in-memory test authority service directory has no node-lifecycle node {node_id}"
+                            "in-memory test authority capability directory has no node-lifecycle node {node_id}"
                         ),
                     })
             })();
@@ -3917,7 +3763,7 @@ mod tests {
                     .entries
                     .lock()
                     .map_err(|_| ControlPlaneError::RpcRemote {
-                        message: "in-memory test authority service directory lock poisoned"
+                        message: "in-memory test authority capability directory lock poisoned"
                             .to_string(),
                     })?;
                 entries
@@ -3925,7 +3771,7 @@ mod tests {
                     .map(|entry| entry.routed_authority.clone())
                     .ok_or_else(|| ControlPlaneError::RpcRemote {
                         message: format!(
-                            "in-memory test authority service directory has no routed node {node_id}"
+                            "in-memory test authority capability directory has no routed node {node_id}"
                         ),
                     })
             })();
@@ -6011,7 +5857,7 @@ mod tests {
     }
 
     #[test]
-    fn control_plane_openraft_authority_service_directory_routes_by_node_id() {
+    fn control_plane_openraft_authority_directories_route_by_node_id() {
         ControlPlaneRaftTypeConfig::run(async {
             let operation_timeout = Duration::from_secs(2);
             let (authority1, authority2) = initialized_two_node_authorities(
@@ -6039,17 +5885,11 @@ mod tests {
                 ControlPlaneRaftAuthorityNodeLifecycleDirectoryHandle::new(Arc::new(
                     directory.clone(),
                 ));
-            let directory =
-                ControlPlaneRaftAuthorityServiceDirectoryHandle::new(Arc::new(directory));
+            let status_list_handle =
+                ControlPlaneRaftAuthorityStatusListHandle::new(Arc::new(directory.clone()));
             let observer_status =
                 ControlPlaneRaftAuthorityStatusHandle::new(Arc::clone(&authority1));
 
-            let missing = directory.authority_service_for_node(499).await;
-            assert!(matches!(
-                missing,
-                Err(ControlPlaneError::RpcRemote { message })
-                    if message.contains("no node 499")
-            ));
             let missing_bootstrap = bootstrap_directory.authority_bootstrap_for_node(499).await;
             assert!(matches!(
                 missing_bootstrap,
@@ -6064,19 +5904,13 @@ mod tests {
                 Err(ControlPlaneError::RpcRemote { message })
                     if message.contains("no node-lifecycle node 499")
             ));
+            let missing_routed = routed_directory.routed_authority_for_node(499).await;
+            assert!(matches!(
+                missing_routed,
+                Err(ControlPlaneError::RpcRemote { message })
+                    if message.contains("no routed node 499")
+            ));
 
-            let _leader_service = expect_bounded_control_plane_raft(
-                directory.authority_service_for_node(411),
-                operation_timeout,
-                "authority service directory lookup leader",
-            )
-            .await;
-            let follower_service = expect_bounded_control_plane_raft(
-                directory.authority_service_for_node(412),
-                operation_timeout,
-                "authority service directory lookup follower",
-            )
-            .await;
             let leader_bootstrap = expect_bounded_control_plane_raft(
                 bootstrap_directory.authority_bootstrap_for_node(411),
                 operation_timeout,
@@ -6124,7 +5958,7 @@ mod tests {
                     },
                 ),
                 operation_timeout,
-                "authority service directory bootstrap command",
+                "authority capability directory bootstrap command",
             )
             .await;
             assert!(matches!(
@@ -6137,47 +5971,45 @@ mod tests {
                 follower_node_lifecycle.wait_for_applied_index_at_least(
                     bootstrap.log_id().index(),
                     Duration::from_secs(1),
-                    "authority service directory follower applied bootstrap",
+                    "authority capability directory follower applied bootstrap",
                 ),
                 operation_timeout,
-                "authority service directory follower wait",
+                "authority capability directory follower wait",
             )
             .await;
 
             expect_bounded_control_plane_raft(
                 leader_routed_admin.transfer_leadership_to(412),
                 operation_timeout,
-                "authority service directory routed transfer leadership",
+                "authority capability directory routed transfer leadership",
             )
             .await;
             expect_bounded_control_plane_raft(
                 follower_node_lifecycle.wait_for_current_leader(
                     412,
                     Duration::from_secs(1),
-                    "authority service directory observed transferred leader",
+                    "authority capability directory observed transferred leader",
                 ),
                 operation_timeout,
-                "authority service directory wait for transferred leader",
+                "authority capability directory wait for transferred leader",
             )
             .await;
             expect_bounded_control_plane_raft(
                 leader_node_lifecycle.wait_for_current_leader(
                     412,
                     Duration::from_secs(1),
-                    "authority service directory observer saw transferred leader",
+                    "authority capability directory observer saw transferred leader",
                 ),
                 operation_timeout,
-                "authority service directory wait for observer transfer view",
+                "authority capability directory wait for observer transfer view",
             )
             .await;
             let transferred_statuses = expect_bounded_control_plane_raft(
-                directory.authority_statuses(),
+                status_list_handle.authority_statuses(),
                 operation_timeout,
-                "authority service directory statuses after transfer",
+                "authority status-list directory statuses after transfer",
             )
             .await;
-            let status_list_handle =
-                ControlPlaneRaftAuthorityStatusListHandle::new(Arc::new(directory.clone()));
             let status_list = status_list_handle.as_status_list();
             let listed_statuses = expect_bounded_control_plane_raft(
                 status_list.authority_statuses(),
@@ -6270,7 +6102,7 @@ mod tests {
                     },
                 ),
                 operation_timeout,
-                "authority service directory routed command after transfer",
+                "authority capability directory routed command after transfer",
             )
             .await;
             assert!(matches!(
@@ -6279,21 +6111,20 @@ mod tests {
                     ControlPlaneCommandResponse::MarkNodeAvailability
                 )
             ));
-            let follower_status = follower_service.status().await.unwrap();
-            assert_eq!(follower_status.current_leader(), Some(412));
             let routed_status = expect_bounded_control_plane_raft(
                 routed_authority.status(),
                 operation_timeout,
-                "authority service directory routed status after transfer",
+                "authority capability directory routed status after transfer",
             )
             .await;
             assert_eq!(routed_status.node_id(), 412);
+            assert_eq!(routed_status.current_leader(), Some(412));
             assert!(routed_status.local_leader());
             assert!(routed_status.linearized_authority_serving());
             let observer_status = expect_bounded_control_plane_raft(
                 routed_client.observer_status(),
                 operation_timeout,
-                "authority service directory observer status after transfer",
+                "authority capability directory observer status after transfer",
             )
             .await;
             assert_eq!(observer_status.node_id(), 411);
@@ -6302,7 +6133,7 @@ mod tests {
             let runtime_map = expect_bounded_control_plane_raft(
                 routed_authority.linearized_runtime_map_snapshot(91_000),
                 operation_timeout,
-                "authority service directory routed runtime map read",
+                "authority capability directory routed runtime map read",
             )
             .await;
             assert_eq!(runtime_map.freshness_proof().issued_at_ms(), Some(91_000));
@@ -6317,7 +6148,7 @@ mod tests {
             let direct_runtime_map = expect_bounded_control_plane_raft(
                 routed_directory_serving_authority.linearized_runtime_map_snapshot(91_001),
                 operation_timeout,
-                "authority service directory current serving routed runtime map read",
+                "authority capability directory current serving routed runtime map read",
             )
             .await;
             assert_eq!(
@@ -6327,23 +6158,23 @@ mod tests {
             let routed_membership_log_id = expect_bounded_control_plane_raft(
                 routed_authority.replace_voters(BTreeSet::from([412]), false),
                 operation_timeout,
-                "authority service directory routed voter replacement",
+                "authority capability directory routed voter replacement",
             )
             .await;
             expect_bounded_control_plane_raft(
                 follower_node_lifecycle.wait_for_applied_index_at_least(
                     routed_membership_log_id.index(),
                     Duration::from_secs(1),
-                    "authority service directory routed voter replacement applied",
+                    "authority capability directory routed voter replacement applied",
                 ),
                 operation_timeout,
-                "authority service directory wait for routed voter replacement",
+                "authority capability directory wait for routed voter replacement",
             )
             .await;
             let routed_membership_status = expect_bounded_control_plane_raft(
                 routed_client.status(),
                 operation_timeout,
-                "authority service directory routed status after voter replacement",
+                "authority capability directory routed status after voter replacement",
             )
             .await;
             assert_eq!(routed_membership_status.node_id(), 412);
@@ -6361,20 +6192,21 @@ mod tests {
             expect_bounded_control_plane_raft(
                 leader_node_lifecycle.shutdown(),
                 operation_timeout,
-                "authority service directory shutdown old leader",
+                "authority capability directory shutdown old leader",
             )
             .await;
             expect_bounded_control_plane_raft(
                 follower_node_lifecycle.shutdown(),
                 operation_timeout,
-                "authority service directory shutdown transferred leader",
+                "authority capability directory shutdown transferred leader",
             )
             .await;
         });
     }
 
     #[test]
-    fn control_plane_openraft_authority_service_directory_rejects_multiple_serving_authorities() {
+    fn control_plane_openraft_authority_capability_directory_rejects_multiple_serving_authorities()
+    {
         ControlPlaneRaftTypeConfig::run(async {
             let operation_timeout = Duration::from_secs(2);
             let network = InMemoryRaftNetworkFactory::default();

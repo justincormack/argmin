@@ -9977,6 +9977,10 @@ Phase 12.1 progress:
   now composes the explicit command/read/status, leader-routed admin,
   bootstrap, and node-lifecycle traits directly, so there is no separate
   bootstrap/lifecycle/admin handle that callers can depend on accidentally.
+- Removed the full-service authority directory boundary. Directory lookup now
+  exposes only status-list, bootstrap, node-lifecycle, and routed-authority
+  capabilities; the in-memory test scaffold still registers a full service
+  handle but immediately narrows it before storing lookup entries.
 
 1. define the replicated control-plane state machine:
    - state includes cluster epoch, PG count, PG state, PG acting sets, node
