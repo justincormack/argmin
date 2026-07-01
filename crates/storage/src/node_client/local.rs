@@ -1383,6 +1383,13 @@ impl ObjectMutationMetadataNodeClient for LocalStorageNodeClient {
         )
     }
 
+    fn object_payload_reclaim_claim(
+        &self,
+        pg_id: PgId,
+    ) -> Result<Option<ObjectPayloadReclaimClaimRecord>, BucketSnapshotLoadError> {
+        <Self as StorageNodeClient>::object_payload_reclaim_claim(self, pg_id)
+    }
+
     fn acquire_object_payload_reclaim_claim(
         &self,
         pg_id: PgId,
@@ -3710,6 +3717,14 @@ impl StorageNodeClient for LocalStorageNodeClient {
                     .map(ObjectPayloadReclaimCommand::Multipart),
             )
         }
+    }
+
+    fn object_payload_reclaim_claim(
+        &self,
+        pg_id: PgId,
+    ) -> Result<Option<ObjectPayloadReclaimClaimRecord>, BucketSnapshotLoadError> {
+        let pg = self.storage_node.get_pg(pg_id.get())?;
+        Ok(PgMetadataStore::object_payload_reclaim_claim(&*pg)?)
     }
 
     fn acquire_object_payload_reclaim_claim(

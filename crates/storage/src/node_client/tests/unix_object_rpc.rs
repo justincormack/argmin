@@ -323,7 +323,7 @@ fn unix_object_mutation_metadata_client_loads_snapshots_and_builds_commands() {
     }
     private_socket_dir(config.socket_path.parent().unwrap());
     let server = Arc::new(StorageNodeServer::bind(config.clone()).unwrap());
-    let server_threads: Vec<_> = (0..18)
+    let server_threads: Vec<_> = (0..19)
         .map(|_| {
             let server = Arc::clone(&server);
             thread::spawn(move || server.accept_one().unwrap())
@@ -460,6 +460,11 @@ fn unix_object_mutation_metadata_client_loads_snapshots_and_builds_commands() {
     assert_eq!(claim.bucket, bucket);
     assert_eq!(claim.key, key);
     assert_eq!(claim.generation_id, reclaim_generation_id);
+    let loaded_claim =
+        ObjectMutationMetadataNodeClient::object_payload_reclaim_claim(&client, PgId::new(0))
+            .unwrap()
+            .expect("seeded object reclaim claim should load");
+    assert_eq!(loaded_claim, claim);
     ObjectMutationMetadataNodeClient::release_object_payload_reclaim_claim(
         &client,
         PgId::new(0),

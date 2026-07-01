@@ -2575,6 +2575,31 @@ pub struct BucketDeleteDebugPayloadReclaimRootError {
     pub detail: String,
 }
 
+/// Durable object-payload reclaim worker claim fields included in local-debug output.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BucketDeleteDebugPayloadReclaimClaim {
+    pub object_pg_id: u32,
+    pub bucket: BucketName,
+    pub matches_bucket: bool,
+    pub bucket_incarnation_generation: u64,
+    pub key: ObjectKey,
+    pub generation_id: GenerationId,
+    pub reclaim_kind: ObjectPayloadReclaimKind,
+    pub claim_id: String,
+    pub cluster_epoch: ClusterEpoch,
+    pub claimed_at: u64,
+    pub lease_deadline: Option<u64>,
+    pub attempt_count: u64,
+    pub last_error: Option<String>,
+}
+
+/// Payload reclaim claim scan error fields included in local-debug output.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BucketDeleteDebugPayloadReclaimClaimError {
+    pub object_pg_id: u32,
+    pub detail: String,
+}
+
 /// Read-only durable state used by the local DeleteBucket debug endpoint.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BucketDeleteDebugSnapshot {
@@ -2592,6 +2617,8 @@ pub struct BucketDeleteDebugSnapshot {
     pub object_version_sample_errors: Vec<BucketDeleteDebugObjectVersionSampleError>,
     pub payload_reclaim_roots: Vec<BucketDeleteDebugPayloadReclaimRoot>,
     pub payload_reclaim_root_errors: Vec<BucketDeleteDebugPayloadReclaimRootError>,
+    pub payload_reclaim_claims: Vec<BucketDeleteDebugPayloadReclaimClaim>,
+    pub payload_reclaim_claim_errors: Vec<BucketDeleteDebugPayloadReclaimClaimError>,
     pub attempt_outcome: Option<BucketDeleteAttemptOutcomeRecord>,
 }
 

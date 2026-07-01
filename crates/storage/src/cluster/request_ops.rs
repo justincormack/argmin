@@ -11776,6 +11776,8 @@ impl super::StorageCluster {
         let mut object_version_sample_errors = Vec::new();
         let mut payload_reclaim_roots = Vec::new();
         let mut payload_reclaim_root_errors = Vec::new();
+        let mut payload_reclaim_claims = Vec::new();
+        let mut payload_reclaim_claim_errors = Vec::new();
         for raw_pg_id in self.metadata_pg_ids() {
             let object_pg_id = PgId::new(raw_pg_id);
             let node = match self
@@ -11786,6 +11788,10 @@ impl super::StorageCluster {
                 Err(error) => {
                     let detail = error.to_string();
                     object_version_sample_errors.push(BucketDeleteDebugObjectVersionSampleError {
+                        object_pg_id: raw_pg_id,
+                        detail: detail.clone(),
+                    });
+                    payload_reclaim_claim_errors.push(BucketDeleteDebugPayloadReclaimClaimError {
                         object_pg_id: raw_pg_id,
                         detail: detail.clone(),
                     });
@@ -11817,6 +11823,35 @@ impl super::StorageCluster {
                 }
                 Err(error) => {
                     object_version_sample_errors.push(BucketDeleteDebugObjectVersionSampleError {
+                        object_pg_id: raw_pg_id,
+                        detail: error.to_string(),
+                    });
+                }
+            }
+            match node
+                .object_mutation_metadata_client()
+                .object_payload_reclaim_claim(object_pg_id)
+            {
+                Ok(Some(claim)) => {
+                    payload_reclaim_claims.push(BucketDeleteDebugPayloadReclaimClaim {
+                        object_pg_id: raw_pg_id,
+                        matches_bucket: claim.bucket == *bucket,
+                        bucket: claim.bucket,
+                        bucket_incarnation_generation: claim.bucket_incarnation_generation,
+                        key: claim.key,
+                        generation_id: claim.generation_id,
+                        reclaim_kind: claim.reclaim_kind,
+                        claim_id: claim.claim_id,
+                        cluster_epoch: claim.cluster_epoch,
+                        claimed_at: claim.claimed_at,
+                        lease_deadline: claim.lease_deadline,
+                        attempt_count: claim.attempt_count,
+                        last_error: claim.last_error,
+                    });
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    payload_reclaim_claim_errors.push(BucketDeleteDebugPayloadReclaimClaimError {
                         object_pg_id: raw_pg_id,
                         detail: error.to_string(),
                     });
@@ -11892,6 +11927,8 @@ impl super::StorageCluster {
             object_version_sample_errors,
             payload_reclaim_roots,
             payload_reclaim_root_errors,
+            payload_reclaim_claims,
+            payload_reclaim_claim_errors,
             attempt_outcome,
         })
     }

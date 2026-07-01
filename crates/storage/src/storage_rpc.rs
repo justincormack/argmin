@@ -698,6 +698,7 @@ pub(crate) enum StorageRpcMessageKind {
     ObjectStreamUploadsPgList = 120,
     MetadataCommandPgLockAcquire = 121,
     MetadataCommandPgLockRelease = 122,
+    ObjectPayloadReclaimClaimGet = 160,
     BucketWriteDrainGet = 155,
     BucketDeleteAttemptOutcomeRecord = 156,
     BucketDeleteAttemptOutcomeGet = 157,
@@ -961,6 +962,7 @@ impl StorageRpcMessageKind {
             Self::ObjectPayloadReclaimLoad => "object payload reclaim load",
             Self::ObjectPayloadReclaimClaimAcquire => "object payload reclaim claim acquire",
             Self::ObjectPayloadReclaimClaimRelease => "object payload reclaim claim release",
+            Self::ObjectPayloadReclaimClaimGet => "object payload reclaim claim get",
             Self::PlacedSegmentShardRepairRecord => "placed segment shard repair record",
             Self::PlacedSegmentShardRepairs => "placed segment shard repairs",
             Self::PlacedSegmentShardRepairResolve => "placed segment shard repair resolve",
@@ -1128,6 +1130,7 @@ impl StorageRpcMessageKind {
             157 => Ok(Self::BucketDeleteAttemptOutcomeGet),
             158 => Ok(Self::BucketDeleteBeginRoots),
             159 => Ok(Self::BucketDeleteFinalizeClaimGet),
+            160 => Ok(Self::ObjectPayloadReclaimClaimGet),
             124 => Ok(Self::BucketWriteDrainHeartbeat),
             125 => Ok(Self::MetadataCommandRetainedLogHashes),
             126 => Ok(Self::MetadataCommandRetainedLogEntries),
@@ -3625,6 +3628,9 @@ fn message_kind_request_max_payload_len(
         }
         StorageRpcMessageKind::ObjectPayloadReclaimClaimAcquire => {
             STORAGE_RPC_MAX_OBJECT_PAYLOAD_RECLAIM_CLAIM_ACQUIRE_PAYLOAD_LEN
+        }
+        StorageRpcMessageKind::ObjectPayloadReclaimClaimGet => {
+            STORAGE_RPC_MAX_METADATA_COMMAND_STATE_PAYLOAD_LEN
         }
         StorageRpcMessageKind::ObjectPayloadReclaimClaimRelease => {
             STORAGE_RPC_MAX_OBJECT_PAYLOAD_RECLAIM_CLAIM_RECORD_PAYLOAD_LEN

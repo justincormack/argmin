@@ -2105,6 +2105,15 @@ impl StorageNodeConnectionHandler {
                     }),
                 }
             }
+            StorageRpcMessageKind::ObjectPayloadReclaimClaimGet => {
+                match decode_metadata_command_state_request(&frame.payload) {
+                    Ok(request) => self.object_payload_reclaim_claim_get_response(request),
+                    Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
+                        code: StorageRpcErrorCode::PayloadDecode,
+                        message: error.to_string(),
+                    }),
+                }
+            }
             StorageRpcMessageKind::ObjectPayloadReclaimClaimRelease => {
                 match decode_object_payload_reclaim_claim_record_request(&frame.payload) {
                     Ok(request) => self.object_payload_reclaim_claim_release_response(request),
@@ -4990,6 +4999,35 @@ impl StorageNodeConnectionHandler {
             request.claimed_at,
             request.lease_deadline,
             request.now,
+        ) {
+            Ok(record) => {
+                let payload = encode_object_payload_reclaim_claim_optional_record_response(
+                    &StorageRpcObjectPayloadReclaimClaimOptionalRecordResponse { record },
+                )?;
+                Ok(encode_storage_rpc_success_response(&payload))
+            }
+            Err(error) => encode_storage_rpc_error_response(&bucket_snapshot_error_response(error)),
+        }
+    }
+
+    fn object_payload_reclaim_claim_get_response(
+        &self,
+        request: StorageRpcMetadataCommandStateRequest,
+    ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
+        if let Err(error) =
+            self.validate_pg_route(request.node_id, request.cluster_epoch, request.pg_id)
+        {
+            return encode_storage_rpc_error_response(&error);
+        }
+        if let Err(error) =
+            self.validate_primary_pg(request.pg_id, "object payload reclaim claim get")
+        {
+            return encode_storage_rpc_error_response(&error);
+        }
+        let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
+        match ObjectMutationMetadataNodeClient::object_payload_reclaim_claim(
+            &local_client,
+            request.pg_id,
         ) {
             Ok(record) => {
                 let payload = encode_object_payload_reclaim_claim_optional_record_response(

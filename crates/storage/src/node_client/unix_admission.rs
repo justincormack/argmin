@@ -484,6 +484,7 @@ pub(crate) fn storage_rpc_admission_class(
         | StorageRpcMessageKind::ObjectPayloadReclaimRoot
         | StorageRpcMessageKind::ObjectPayloadReclaimLoad
         | StorageRpcMessageKind::ObjectPayloadReclaimClaimAcquire
+        | StorageRpcMessageKind::ObjectPayloadReclaimClaimGet
         | StorageRpcMessageKind::ClusterMapHistoryReferenceSummary
         | StorageRpcMessageKind::ShardScavengerObservationRecord
         | StorageRpcMessageKind::ShardScavengerObservationResolve => {

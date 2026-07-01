@@ -643,6 +643,11 @@ pub(crate) trait ObjectMutationMetadataNodeClient: Send + Sync {
         generation_id: GenerationId,
     ) -> Result<Option<ObjectPayloadReclaimCommand>, BucketSnapshotLoadError>;
 
+    fn object_payload_reclaim_claim(
+        &self,
+        pg_id: PgId,
+    ) -> Result<Option<ObjectPayloadReclaimClaimRecord>, BucketSnapshotLoadError>;
+
     #[allow(clippy::too_many_arguments)]
     fn acquire_object_payload_reclaim_claim(
         &self,
@@ -1883,6 +1888,11 @@ pub(crate) trait StorageNodeClient:
         key: &ObjectKey,
         generation_id: GenerationId,
     ) -> Result<Option<ObjectPayloadReclaimCommand>, BucketSnapshotLoadError>;
+
+    fn object_payload_reclaim_claim(
+        &self,
+        pg_id: PgId,
+    ) -> Result<Option<ObjectPayloadReclaimClaimRecord>, BucketSnapshotLoadError>;
 
     #[allow(clippy::too_many_arguments)]
     fn acquire_object_payload_reclaim_claim(

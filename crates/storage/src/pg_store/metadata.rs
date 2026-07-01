@@ -8397,6 +8397,26 @@ impl PgMetadataStore for PgStore {
         )
     }
 
+    fn object_payload_reclaim_claim(
+        &self,
+    ) -> Result<Option<ObjectPayloadReclaimClaimRecord>, MetadataError> {
+        self.conn
+            .query_row(
+                "SELECT bucket, bucket_incarnation_generation, key, generation_id, reclaim_kind, \
+                        claim_id, owner_token, cluster_epoch, pg_id, claimed_at, \
+                        lease_deadline, attempt_count, last_error \
+                 FROM object_payload_reclaim_claims \
+                 WHERE singleton = 0",
+                [],
+                object_payload_reclaim_claim_from_row,
+            )
+            .optional()
+            .map_err(|source| MetadataError::Db {
+                context: "load object payload reclaim claim",
+                source,
+            })
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn release_object_payload_reclaim_claim(
         &self,

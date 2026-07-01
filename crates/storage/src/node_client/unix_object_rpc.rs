@@ -2571,6 +2571,34 @@ impl ObjectMutationMetadataNodeClient for UnixStorageNodeClient {
         Ok(response.reclaim)
     }
 
+    fn object_payload_reclaim_claim(
+        &self,
+        pg_id: PgId,
+    ) -> Result<Option<ObjectPayloadReclaimClaimRecord>, BucketSnapshotLoadError> {
+        let payload = self.encode_metadata_command_state_request(pg_id);
+        let response = self
+            .rpc_request(StorageRpcMessageKind::ObjectPayloadReclaimClaimGet, payload)
+            .map_err(BucketSnapshotLoadError::Store)?;
+        let response = decode_object_payload_reclaim_claim_optional_record_response(&response)
+            .map_err(|error| {
+                BucketSnapshotLoadError::Store(self.rpc_payload_error(
+                    "decode object payload reclaim claim get response",
+                    error.to_string(),
+                ))
+            })?;
+        if response
+            .record
+            .as_ref()
+            .is_some_and(|record| record.pg_id != pg_id.get())
+        {
+            return Err(BucketSnapshotLoadError::Store(self.rpc_payload_error(
+                "validate object payload reclaim claim get response",
+                "claim response PG does not match request".to_string(),
+            )));
+        }
+        Ok(response.record)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn acquire_object_payload_reclaim_claim(
         &self,

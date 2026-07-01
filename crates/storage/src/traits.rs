@@ -559,6 +559,14 @@ pub(crate) trait PgMetadataStore {
     /// were lost across process restart.
     fn get_payload_reclaim_root(&self) -> Result<Option<PayloadReclaimRoot>, MetadataError>;
 
+    /// Return the active object-payload reclaim claim on this metadata PG, if any.
+    ///
+    /// Used by local diagnostics to distinguish durable reclaim roots from
+    /// worker ownership that is still active or waiting for lease expiry.
+    fn object_payload_reclaim_claim(
+        &self,
+    ) -> Result<Option<ObjectPayloadReclaimClaimRecord>, MetadataError>;
+
     /// Return deleting bucket finalizer roots on this metadata PG.
     ///
     /// Used by bucket finalizer workers to recover durable roots when local

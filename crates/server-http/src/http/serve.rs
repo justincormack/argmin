@@ -1314,6 +1314,50 @@ fn local_debug_bucket_delete_attempt_body(snapshot: &BucketDeleteDebugSnapshot) 
         .expect("write to String");
     }
 
+    writeln!(
+        &mut body,
+        "payload_reclaim_claims_count={}",
+        snapshot.payload_reclaim_claims.len()
+    )
+    .expect("write to String");
+    for (index, claim) in snapshot.payload_reclaim_claims.iter().enumerate() {
+        writeln!(
+            &mut body,
+            "payload_reclaim_claim index={} object_pg_id={} bucket={:?} matches_bucket={} bucket_incarnation_generation={} key={:?} generation_id={} reclaim_kind={} claim_id={:?} cluster_epoch={} claimed_at={} lease_deadline={} attempt_count={} last_error={}",
+            index,
+            claim.object_pg_id,
+            claim.bucket.as_str(),
+            claim.matches_bucket,
+            claim.bucket_incarnation_generation,
+            claim.key.as_str(),
+            claim.generation_id.get(),
+            local_debug_optional_reclaim_kind(Some(claim.reclaim_kind)),
+            claim.claim_id,
+            claim.cluster_epoch.get(),
+            claim.claimed_at,
+            local_debug_optional_u64(claim.lease_deadline),
+            claim.attempt_count,
+            observability::escaped(claim.last_error.as_deref().unwrap_or("")),
+        )
+        .expect("write to String");
+    }
+    writeln!(
+        &mut body,
+        "payload_reclaim_claim_errors_count={}",
+        snapshot.payload_reclaim_claim_errors.len()
+    )
+    .expect("write to String");
+    for (index, error) in snapshot.payload_reclaim_claim_errors.iter().enumerate() {
+        writeln!(
+            &mut body,
+            "payload_reclaim_claim_error index={} object_pg_id={} detail={}",
+            index,
+            error.object_pg_id,
+            observability::escaped(&error.detail),
+        )
+        .expect("write to String");
+    }
+
     match &snapshot.attempt_outcome {
         Some(record) => {
             writeln!(
@@ -5222,6 +5266,14 @@ mod tests {
             response.contains("payload_reclaim_root_errors_count=0"),
             "{response}"
         );
+        assert!(
+            response.contains("payload_reclaim_claims_count=0"),
+            "{response}"
+        );
+        assert!(
+            response.contains("payload_reclaim_claim_errors_count=0"),
+            "{response}"
+        );
         assert!(response.contains("attempt_outcome=absent"), "{response}");
         assert!(response.contains("pg_id="), "{response}");
     }
@@ -5314,6 +5366,27 @@ mod tests {
                 object_pg_id: 5,
                 detail: "route\nexpired".to_string(),
             }],
+            payload_reclaim_claims: vec![storage::BucketDeleteDebugPayloadReclaimClaim {
+                object_pg_id: 9,
+                bucket: bucket.clone(),
+                matches_bucket: true,
+                bucket_incarnation_generation: 34,
+                key: storage::ObjectKey::try_from("claim-key\none".to_string()).unwrap(),
+                generation_id: storage::GenerationId::new(101).unwrap(),
+                reclaim_kind: storage::ObjectPayloadReclaimKind::Multipart,
+                claim_id: "payload-claim-1".to_string(),
+                cluster_epoch: storage::ClusterEpoch::new(10).unwrap(),
+                claimed_at: 6060,
+                lease_deadline: Some(7070),
+                attempt_count: 3,
+                last_error: Some("payload\nbusy".to_string()),
+            }],
+            payload_reclaim_claim_errors: vec![
+                storage::BucketDeleteDebugPayloadReclaimClaimError {
+                    object_pg_id: 10,
+                    detail: "claim route\nexpired".to_string(),
+                },
+            ],
             attempt_outcome: Some(storage::BucketDeleteAttemptOutcomeRecord {
                 bucket: bucket.clone(),
                 drain_id: "delete-drain-1".to_string(),
@@ -5395,6 +5468,23 @@ mod tests {
         assert!(
             body.contains(
                 r#"payload_reclaim_root_error index=0 object_pg_id=5 detail="route\nexpired""#
+            ),
+            "{body}"
+        );
+        assert!(body.contains("payload_reclaim_claims_count=1"), "{body}");
+        assert!(
+            body.contains(
+                r#"payload_reclaim_claim index=0 object_pg_id=9 bucket="debug-attempt-bucket" matches_bucket=true bucket_incarnation_generation=34 key="claim-key\none" generation_id=101 reclaim_kind=multipart claim_id="payload-claim-1" cluster_epoch=10 claimed_at=6060 lease_deadline=7070 attempt_count=3 last_error="payload\nbusy""#
+            ),
+            "{body}"
+        );
+        assert!(
+            body.contains("payload_reclaim_claim_errors_count=1"),
+            "{body}"
+        );
+        assert!(
+            body.contains(
+                r#"payload_reclaim_claim_error index=0 object_pg_id=10 detail="claim route\nexpired""#
             ),
             "{body}"
         );
