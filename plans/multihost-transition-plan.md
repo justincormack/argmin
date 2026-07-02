@@ -10159,6 +10159,18 @@ Phase 12.2 progress:
   atomic rename, and parent-directory sync, and loaded back through the
   checksum/restart-validation decoder. Tests cover nested-directory store/load
   and corrupt-file rejection.
+- Added a durable single-node OpenRaft authority constructor for the
+  experimental path. It loads and validates the local restart artifact when
+  present, restores the OpenRaft log/state-machine pair through the durable
+  decoder, starts empty when the artifact is absent, and rejects corrupt
+  artifacts before constructing Raft. Tests cover missing-artifact empty
+  startup, replaying a committed suffix from a stored artifact, and corrupt
+  artifact startup rejection. Startup also validates that persisted vote/log
+  leader identities in the artifact match the local single-node Raft identity,
+  and that retained/applied membership payloads are exactly the local
+  single-voter membership, while an unpositioned state-machine membership must
+  be the canonical empty default, so a valid artifact from another node or a
+  multi-voter artifact fails closed before `Raft::new`.
 
 1. define the replicated control-plane state machine:
    - state includes cluster epoch, PG count, PG state, PG acting sets, node

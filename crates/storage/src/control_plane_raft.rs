@@ -1546,27 +1546,33 @@ impl RaftNetworkV2<ControlPlaneRaftTypeConfig> for ExperimentalSingleNodeRaftNet
     }
 }
 
+fn experimental_single_node_raft_config(
+    cluster_name: impl Into<String>,
+) -> Result<Arc<Config>, ControlPlaneError> {
+    Ok(Arc::new(
+        Config {
+            cluster_name: cluster_name.into(),
+            heartbeat_interval: 50,
+            election_timeout_min: 150,
+            election_timeout_max: 300,
+            enable_tick: false,
+            enable_heartbeat: false,
+            enable_elect: false,
+            ..Default::default()
+        }
+        .validate()
+        .map_err(|error| ControlPlaneError::RpcRemote {
+            message: format!("OpenRaft experimental single-node config failed: {error}"),
+        })?,
+    ))
+}
+
 impl ControlPlaneRaftAuthority {
     pub async fn new_experimental_single_node_in_memory(
         cluster_name: impl Into<String>,
         node_id: ControlPlaneRaftNodeId,
     ) -> Result<Self, ControlPlaneError> {
-        let config = Arc::new(
-            Config {
-                cluster_name: cluster_name.into(),
-                heartbeat_interval: 50,
-                election_timeout_min: 150,
-                election_timeout_max: 300,
-                enable_tick: false,
-                enable_heartbeat: false,
-                enable_elect: false,
-                ..Default::default()
-            }
-            .validate()
-            .map_err(|error| ControlPlaneError::RpcRemote {
-                message: format!("OpenRaft experimental single-node config failed: {error}"),
-            })?,
-        );
+        let config = experimental_single_node_raft_config(cluster_name)?;
         let log_store = ControlPlaneRaftLogStore::empty();
         let raft = Raft::<ControlPlaneRaftTypeConfig, ControlPlaneRaftStateMachine>::new(
             node_id,
@@ -1577,6 +1583,45 @@ impl ControlPlaneRaftAuthority {
         )
         .await
         .map_err(|error| openraft_remote_error("new experimental single-node authority", error))?;
+        Ok(Self::new_with_log_store(raft, log_store))
+    }
+
+    pub async fn new_experimental_single_node_durable(
+        cluster_name: impl Into<String>,
+        node_id: ControlPlaneRaftNodeId,
+        artifact_path: &Path,
+    ) -> Result<Self, ControlPlaneError> {
+        let config = experimental_single_node_raft_config(cluster_name)?;
+        let (log_store, state_machine) =
+            match ControlPlaneRaftRestartArtifact::load_durable_artifact(artifact_path) {
+                Ok(artifact) => {
+                    artifact.validate_single_node_local_identity(node_id)?;
+                    artifact.restore().map_err(|source| ControlPlaneError::Io {
+                        context: "restore control-plane OpenRaft durable restart artifact",
+                        source,
+                    })?
+                }
+                Err(ControlPlaneError::Io { source, .. })
+                    if source.kind() == io::ErrorKind::NotFound =>
+                {
+                    (
+                        ControlPlaneRaftLogStore::empty(),
+                        ControlPlaneRaftStateMachine::empty(),
+                    )
+                }
+                Err(error) => return Err(error),
+            };
+        let raft = Raft::<ControlPlaneRaftTypeConfig, ControlPlaneRaftStateMachine>::new(
+            node_id,
+            config,
+            ExperimentalSingleNodeRaftNetworkFactory,
+            log_store.clone(),
+            state_machine,
+        )
+        .await
+        .map_err(|error| {
+            openraft_remote_error("new experimental durable single-node authority", error)
+        })?;
         Ok(Self::new_with_log_store(raft, log_store))
     }
 
@@ -2764,6 +2809,117 @@ impl ControlPlaneRaftRestartArtifact {
                 })?;
         Self::validate_log_store_state_machine_pair(&self.log_store, &self.state_machine)?;
         Ok((log_store, state_machine))
+    }
+
+    fn validate_single_node_local_identity(
+        &self,
+        local_node_id: ControlPlaneRaftNodeId,
+    ) -> Result<(), ControlPlaneError> {
+        if let Some(vote) = self.log_store.vote {
+            Self::validate_single_node_leader_id("persisted vote", vote.leader_id, local_node_id)?;
+        }
+        if let Some(committed) = self.log_store.committed {
+            Self::validate_single_node_log_id("committed log id", committed, local_node_id)?;
+        }
+        if let Some(last_purged_log_id) = self.log_store.last_purged_log_id {
+            Self::validate_single_node_log_id(
+                "purged boundary log id",
+                last_purged_log_id,
+                local_node_id,
+            )?;
+        }
+        for entry in &self.log_store.entries {
+            Self::validate_single_node_log_id("retained log entry", entry.log_id, local_node_id)?;
+            if let EntryPayload::Membership(membership) = &entry.payload {
+                Self::validate_single_node_membership(
+                    "retained log entry membership",
+                    membership,
+                    local_node_id,
+                )?;
+            }
+        }
+        if let Some(last_applied) = self.state_machine.last_applied {
+            Self::validate_single_node_log_id(
+                "state-machine applied log id",
+                last_applied,
+                local_node_id,
+            )?;
+        }
+        match self.state_machine.last_membership.log_id() {
+            Some(last_membership_log_id) => {
+                Self::validate_single_node_log_id(
+                    "state-machine membership log id",
+                    *last_membership_log_id,
+                    local_node_id,
+                )?;
+                Self::validate_single_node_membership(
+                    "state-machine membership",
+                    self.state_machine.last_membership.membership(),
+                    local_node_id,
+                )?;
+            }
+            None => {
+                Self::validate_uninitialized_membership(
+                    "state-machine membership",
+                    self.state_machine.last_membership.membership(),
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_single_node_log_id(
+        context: &'static str,
+        log_id: LogIdOf<ControlPlaneRaftTypeConfig>,
+        local_node_id: ControlPlaneRaftNodeId,
+    ) -> Result<(), ControlPlaneError> {
+        Self::validate_single_node_leader_id(context, *log_id.committed_leader_id(), local_node_id)
+    }
+
+    fn validate_single_node_leader_id(
+        context: &'static str,
+        leader_id: ControlPlaneRaftLeaderId,
+        local_node_id: ControlPlaneRaftNodeId,
+    ) -> Result<(), ControlPlaneError> {
+        if leader_id.node_id == local_node_id {
+            return Ok(());
+        }
+        Err(raft_artifact_protocol_error(format!(
+            "control-plane OpenRaft durable restart artifact {context} belongs to OpenRaft node {}, not local node {local_node_id}",
+            leader_id.node_id
+        )))
+    }
+
+    fn validate_single_node_membership(
+        context: &'static str,
+        membership: &Membership<ControlPlaneRaftNodeId, BasicNode>,
+        local_node_id: ControlPlaneRaftNodeId,
+    ) -> Result<(), ControlPlaneError> {
+        let expected_voters = BTreeSet::from([local_node_id]);
+        let configs = membership.get_joint_config();
+        let learners = membership.learner_ids().collect::<BTreeSet<_>>();
+        if configs.len() == 1 && configs.first() == Some(&expected_voters) && learners.is_empty() {
+            return Ok(());
+        }
+        let voters = membership.voter_ids().collect::<BTreeSet<_>>();
+        Err(raft_artifact_protocol_error(format!(
+            "control-plane OpenRaft durable restart artifact {context} must be single-node membership for local node {local_node_id}; voters={voters:?} learners={learners:?}"
+        )))
+    }
+
+    fn validate_uninitialized_membership(
+        context: &'static str,
+        membership: &Membership<ControlPlaneRaftNodeId, BasicNode>,
+    ) -> Result<(), ControlPlaneError> {
+        let configs = membership.get_joint_config();
+        let learners = membership.learner_ids().collect::<BTreeSet<_>>();
+        if configs.is_empty() && learners.is_empty() {
+            return Ok(());
+        }
+        let voters = membership.voter_ids().collect::<BTreeSet<_>>();
+        Err(raft_artifact_protocol_error(format!(
+            "control-plane OpenRaft durable restart artifact {context} without log id must be empty uninitialized membership; voters={voters:?} learners={learners:?}"
+        )))
     }
 
     fn validate_log_store_state_machine_pair(
@@ -5070,8 +5226,22 @@ mod tests {
         }
     }
 
+    fn single_node_membership_entry(term: u64, node_id: u64, index: u64) -> ControlPlaneRaftEntry {
+        Entry {
+            log_id: raft_log_id(term, node_id, index),
+            payload: EntryPayload::Membership(Membership::new_with_defaults(
+                vec![BTreeSet::from([node_id])],
+                [],
+            )),
+        }
+    }
+
     fn bootstrap_membership_entry(node_id: u64) -> ControlPlaneRaftEntry {
         membership_entry(0, node_id, 0)
+    }
+
+    fn single_node_bootstrap_membership_entry(node_id: u64) -> ControlPlaneRaftEntry {
+        single_node_membership_entry(0, node_id, 0)
     }
 
     fn normal_entry(
@@ -8853,9 +9023,9 @@ mod tests {
             RaftLogStorage::append(
                 &mut log_store,
                 vec![
-                    bootstrap_membership_entry(1),
+                    single_node_bootstrap_membership_entry(1),
                     blank_entry(3, 1, 1),
-                    membership_entry(3, 1, 2),
+                    single_node_membership_entry(3, 1, 2),
                     blank_entry(3, 1, 3),
                 ],
                 IOFlushed::noop(),
@@ -9498,6 +9668,215 @@ mod tests {
             ControlPlaneRaftRestartArtifact::load_durable_artifact(&path),
             "checksum mismatch",
         );
+    }
+
+    #[test]
+    fn control_plane_openraft_durable_single_node_starts_empty_without_artifact() {
+        ControlPlaneRaftTypeConfig::run(async {
+            let tmp = test_util::tempdir();
+            let path = tmp.path().join("missing").join("raft.state");
+            let authority = ControlPlaneRaftAuthority::new_experimental_single_node_durable(
+                "control-plane-raft-durable-empty-start-test",
+                1,
+                &path,
+            )
+            .await
+            .unwrap();
+
+            assert!(!authority.is_initialized().await.unwrap());
+            let status = authority.status().await.unwrap();
+            assert_eq!(status.applied(), None);
+            assert_eq!(status.committed(), None);
+            assert_eq!(status.persisted_vote(), None);
+        });
+    }
+
+    #[test]
+    fn control_plane_openraft_durable_single_node_restores_artifact() {
+        ControlPlaneRaftTypeConfig::run(async {
+            let tmp = test_util::tempdir();
+            let path = tmp.path().join("raft.state");
+
+            let mut log_store = ControlPlaneRaftLogStore::empty();
+            RaftLogStorage::append(
+                &mut log_store,
+                vec![
+                    single_node_bootstrap_membership_entry(1),
+                    blank_entry(3, 1, 1),
+                    single_node_membership_entry(3, 1, 2),
+                    blank_entry(3, 1, 3),
+                ],
+                IOFlushed::noop(),
+            )
+            .await
+            .unwrap();
+            RaftLogStorage::save_vote(
+                &mut log_store,
+                &Vote::<ControlPlaneRaftLeaderId>::new_committed(3, 1),
+            )
+            .await
+            .unwrap();
+            RaftLogStorage::save_committed(&mut log_store, Some(raft_log_id(3, 1, 3)))
+                .await
+                .unwrap();
+
+            let mut state_machine = ControlPlaneRaftStateMachine::empty();
+            state_machine
+                .apply_entry(single_node_bootstrap_membership_entry(1))
+                .unwrap();
+            state_machine.apply_entry(blank_entry(3, 1, 1)).unwrap();
+            ControlPlaneRaftRestartArtifact::capture(&log_store, &state_machine)
+                .unwrap()
+                .store_durable_artifact(&path)
+                .unwrap();
+
+            let authority = ControlPlaneRaftAuthority::new_experimental_single_node_durable(
+                "control-plane-raft-durable-restore-test",
+                1,
+                &path,
+            )
+            .await
+            .unwrap();
+            assert!(authority.is_initialized().await.unwrap());
+            authority
+                .wait_for_applied_log_id(
+                    raft_log_id(3, 1, 3),
+                    Duration::from_secs(1),
+                    "durable single-node authority replayed committed suffix",
+                )
+                .await
+                .unwrap();
+            let status = authority.status().await.unwrap();
+            assert_eq!(status.applied(), Some(raft_log_id(3, 1, 3)));
+            assert_eq!(status.committed(), Some(raft_log_id(3, 1, 3)));
+            assert_eq!(
+                status.applied_membership_log_id(),
+                Some(raft_log_id(3, 1, 2))
+            );
+        });
+    }
+
+    #[test]
+    fn control_plane_openraft_durable_single_node_rejects_multi_voter_artifact() {
+        ControlPlaneRaftTypeConfig::run(async {
+            let tmp = test_util::tempdir();
+            let path = tmp.path().join("raft.state");
+            let artifact = ControlPlaneRaftRestartArtifact {
+                log_store: ControlPlaneRaftLogStoreRestartArtifact {
+                    vote: Some(Vote::<ControlPlaneRaftLeaderId>::new_committed(3, 1)),
+                    committed: Some(raft_log_id(3, 1, 1)),
+                    entries: vec![
+                        single_node_bootstrap_membership_entry(1),
+                        membership_entry(3, 1, 1),
+                    ],
+                    ..Default::default()
+                },
+                state_machine: ControlPlaneRaftStateMachineRestartArtifact {
+                    inner: replicated_state_machine_with_noops(3, 1),
+                    last_applied: Some(raft_log_id(3, 1, 1)),
+                    last_membership: StoredMembership::new(
+                        Some(raft_log_id(3, 1, 1)),
+                        test_membership(),
+                    ),
+                },
+            };
+            artifact.store_durable_artifact(&path).unwrap();
+
+            assert_error_contains(
+                ControlPlaneRaftAuthority::new_experimental_single_node_durable(
+                    "control-plane-raft-durable-multi-voter-start-test",
+                    1,
+                    &path,
+                )
+                .await,
+                "must be single-node membership for local node 1",
+            );
+        });
+    }
+
+    #[test]
+    fn control_plane_openraft_durable_single_node_rejects_unpositioned_multi_voter_membership() {
+        ControlPlaneRaftTypeConfig::run(async {
+            let tmp = test_util::tempdir();
+            let path = tmp.path().join("raft.state");
+            let artifact = ControlPlaneRaftRestartArtifact {
+                log_store: ControlPlaneRaftLogStoreRestartArtifact {
+                    vote: Some(Vote::<ControlPlaneRaftLeaderId>::new_committed(3, 1)),
+                    committed: Some(raft_log_id(3, 1, 1)),
+                    entries: vec![
+                        single_node_bootstrap_membership_entry(1),
+                        blank_entry(3, 1, 1),
+                    ],
+                    ..Default::default()
+                },
+                state_machine: ControlPlaneRaftStateMachineRestartArtifact {
+                    inner: replicated_state_machine_with_noops(3, 1),
+                    last_applied: Some(raft_log_id(3, 1, 1)),
+                    last_membership: StoredMembership::new(None, test_membership()),
+                },
+            };
+            artifact.store_durable_artifact(&path).unwrap();
+
+            assert_error_contains(
+                ControlPlaneRaftAuthority::new_experimental_single_node_durable(
+                    "control-plane-raft-durable-unpositioned-multi-voter-start-test",
+                    1,
+                    &path,
+                )
+                .await,
+                "without log id must be empty uninitialized membership",
+            );
+        });
+    }
+
+    #[test]
+    fn control_plane_openraft_durable_single_node_rejects_wrong_node_artifact() {
+        ControlPlaneRaftTypeConfig::run(async {
+            let tmp = test_util::tempdir();
+            let path = tmp.path().join("raft.state");
+            let artifact = ControlPlaneRaftRestartArtifact {
+                log_store: ControlPlaneRaftLogStoreRestartArtifact {
+                    vote: Some(Vote::<ControlPlaneRaftLeaderId>::new_committed(3, 1)),
+                    committed: Some(raft_log_id(3, 1, 1)),
+                    entries: vec![
+                        single_node_bootstrap_membership_entry(1),
+                        blank_entry(3, 1, 1),
+                    ],
+                    ..Default::default()
+                },
+                state_machine: state_machine_restart_artifact_with_noops(3, 1, 1),
+            };
+            artifact.store_durable_artifact(&path).unwrap();
+
+            assert_error_contains(
+                ControlPlaneRaftAuthority::new_experimental_single_node_durable(
+                    "control-plane-raft-durable-wrong-node-start-test",
+                    2,
+                    &path,
+                )
+                .await,
+                "belongs to OpenRaft node 1, not local node 2",
+            );
+        });
+    }
+
+    #[test]
+    fn control_plane_openraft_durable_single_node_rejects_corrupt_artifact() {
+        ControlPlaneRaftTypeConfig::run(async {
+            let tmp = test_util::tempdir();
+            let path = tmp.path().join("raft.state");
+            std::fs::write(&path, b"not a durable artifact").unwrap();
+
+            assert_error_contains(
+                ControlPlaneRaftAuthority::new_experimental_single_node_durable(
+                    "control-plane-raft-durable-corrupt-start-test",
+                    1,
+                    &path,
+                )
+                .await,
+                "checksum mismatch",
+            );
+        });
     }
 
     #[test]
