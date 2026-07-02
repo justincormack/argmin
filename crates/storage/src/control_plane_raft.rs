@@ -8,10 +8,15 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use futures_util::{Stream, StreamExt};
+use openraft::errors::{RPCError, ReplicationClosed, StreamingError, Unreachable};
 use openraft::impls::leader_id_adv::LeaderId;
 use openraft::impls::BasicNode;
 use openraft::impls::Entry;
 use openraft::impls::Vote;
+use openraft::network::{RPCOption, RaftNetworkFactory, RaftNetworkV2};
+use openraft::raft::{
+    AppendEntriesRequest, AppendEntriesResponse, SnapshotResponse, VoteRequest, VoteResponse,
+};
 use openraft::storage::Snapshot;
 use openraft::storage::SnapshotMeta;
 use openraft::storage::{EntryResponder, IOFlushed, LogState, RaftLogStorage, RaftStateMachine};
@@ -29,11 +34,12 @@ use openraft::RaftTypeConfig;
 use openraft::ReadPolicy;
 use openraft::ServerState;
 use openraft::StoredMembership;
+use openraft::{AnyError, Config};
 use placement::NodeId;
 
 use crate::control_plane::{
-    AuthorityIncarnation, ClusterRuntimeMapSnapshot, ControlPlaneError, NodeAvailabilityState,
-    NodeMembershipState,
+    AuthorityIncarnation, ClusterControlSnapshot, ClusterRuntimeMapSnapshot, ControlPlaneError,
+    NodeAvailabilityState, NodeMembershipState,
 };
 use crate::control_plane_command::{
     ControlPlaneCommand, ControlPlaneCommandResponse, ControlPlaneLogId,
@@ -1470,7 +1476,106 @@ impl ControlPlaneRaftAuthorityStatus {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+struct ExperimentalSingleNodeRaftNetworkFactory;
+
+impl RaftNetworkFactory<ControlPlaneRaftTypeConfig> for ExperimentalSingleNodeRaftNetworkFactory {
+    type Network = ExperimentalSingleNodeRaftNetwork;
+
+    async fn new_client(
+        &mut self,
+        target: ControlPlaneRaftNodeId,
+        _node: &BasicNode,
+    ) -> Self::Network {
+        ExperimentalSingleNodeRaftNetwork { target }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ExperimentalSingleNodeRaftNetwork {
+    target: ControlPlaneRaftNodeId,
+}
+
+impl ExperimentalSingleNodeRaftNetwork {
+    fn unreachable(&self, rpc_name: &'static str) -> Unreachable<ControlPlaneRaftTypeConfig> {
+        Unreachable::new(&AnyError::error(format!(
+            "experimental single-node control-plane raft network has no remote target {} for {rpc_name}",
+            self.target
+        )))
+    }
+}
+
+impl RaftNetworkV2<ControlPlaneRaftTypeConfig> for ExperimentalSingleNodeRaftNetwork {
+    async fn append_entries(
+        &mut self,
+        _rpc: AppendEntriesRequest<ControlPlaneRaftTypeConfig>,
+        _option: RPCOption,
+    ) -> Result<
+        AppendEntriesResponse<ControlPlaneRaftTypeConfig>,
+        RPCError<ControlPlaneRaftTypeConfig>,
+    > {
+        Err(RPCError::Unreachable(self.unreachable("append_entries")))
+    }
+
+    async fn vote(
+        &mut self,
+        _rpc: VoteRequest<ControlPlaneRaftTypeConfig>,
+        _option: RPCOption,
+    ) -> Result<VoteResponse<ControlPlaneRaftTypeConfig>, RPCError<ControlPlaneRaftTypeConfig>>
+    {
+        Err(RPCError::Unreachable(self.unreachable("vote")))
+    }
+
+    async fn full_snapshot(
+        &mut self,
+        _vote: VoteOf<ControlPlaneRaftTypeConfig>,
+        _snapshot: SnapshotOf<ControlPlaneRaftTypeConfig>,
+        _cancel: impl Future<Output = ReplicationClosed> + OptionalSend + 'static,
+        _option: RPCOption,
+    ) -> Result<
+        SnapshotResponse<ControlPlaneRaftTypeConfig>,
+        StreamingError<ControlPlaneRaftTypeConfig>,
+    > {
+        Err(StreamingError::Unreachable(
+            self.unreachable("full_snapshot"),
+        ))
+    }
+}
+
 impl ControlPlaneRaftAuthority {
+    pub async fn new_experimental_single_node_in_memory(
+        cluster_name: impl Into<String>,
+        node_id: ControlPlaneRaftNodeId,
+    ) -> Result<Self, ControlPlaneError> {
+        let config = Arc::new(
+            Config {
+                cluster_name: cluster_name.into(),
+                heartbeat_interval: 50,
+                election_timeout_min: 150,
+                election_timeout_max: 300,
+                enable_tick: false,
+                enable_heartbeat: false,
+                enable_elect: false,
+                ..Default::default()
+            }
+            .validate()
+            .map_err(|error| ControlPlaneError::RpcRemote {
+                message: format!("OpenRaft experimental single-node config failed: {error}"),
+            })?,
+        );
+        let log_store = ControlPlaneRaftLogStore::empty();
+        let raft = Raft::<ControlPlaneRaftTypeConfig, ControlPlaneRaftStateMachine>::new(
+            node_id,
+            config,
+            ExperimentalSingleNodeRaftNetworkFactory,
+            log_store.clone(),
+            ControlPlaneRaftStateMachine::empty(),
+        )
+        .await
+        .map_err(|error| openraft_remote_error("new experimental single-node authority", error))?;
+        Ok(Self::new_with_log_store(raft, log_store))
+    }
+
     #[must_use]
     pub fn new(raft: Raft<ControlPlaneRaftTypeConfig, ControlPlaneRaftStateMachine>) -> Self {
         Self {
@@ -1504,6 +1609,15 @@ impl ControlPlaneRaftAuthority {
             .await
             .map_err(|error| openraft_remote_error("initialize", error))?;
         Ok(())
+    }
+
+    pub async fn initialize_single_node_membership(
+        &self,
+        node_id: ControlPlaneRaftNodeId,
+    ) -> Result<(), ControlPlaneError> {
+        let mut nodes = BTreeMap::new();
+        nodes.insert(node_id, BasicNode::default());
+        self.initialize_membership(nodes).await
     }
 
     pub async fn is_initialized(&self) -> Result<bool, ControlPlaneError> {
@@ -1632,6 +1746,18 @@ impl ControlPlaneRaftAuthority {
         issued_at_ms: u64,
     ) -> Result<ClusterRuntimeMapSnapshot, ControlPlaneError> {
         runtime_map_via_openraft_read_index(&self.raft, issued_at_ms).await
+    }
+
+    pub async fn current_control_plane_snapshot(
+        &self,
+    ) -> Result<ClusterControlSnapshot, ControlPlaneError> {
+        self.raft
+            .with_state_machine(|state_machine| {
+                let snapshot = state_machine.inner().snapshot().clone();
+                Box::pin(async move { snapshot })
+            })
+            .await
+            .map_err(|error| openraft_remote_error("state-machine snapshot read", error))
     }
 
     pub async fn status(&self) -> Result<ControlPlaneRaftAuthorityStatus, ControlPlaneError> {

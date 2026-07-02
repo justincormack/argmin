@@ -10012,6 +10012,18 @@ Phase 12.1 progress:
   and serving readiness before routed command, read, or status calls use it.
   A regression now fails closed when a directory returns a different node's
   linearized authority handle.
+- Added the first non-default process integration for the OpenRaft control
+  plane. `ARGMIN_CONTROL_PLANE_EXPERIMENTAL_RAFT=true` starts an in-memory
+  single-node OpenRaft authority behind the existing Unix control-plane RPC
+  boundary, explicitly initializes the single-voter membership, bootstraps the
+  configured cluster map through the replicated command path, serves runtime
+  maps through read-index, and submits heartbeats, ready-peering completions,
+  metadata-transfer admin commands, and lease expiry through Raft. This is only
+  a process-level boundary smoke for Phase 12.1; durable Raft storage,
+  multi-node process networking, upgrade/migration, and production cutover
+  remain later Phase 12 work. The `ARGMIN_CONTROL_PLANE_EXPERIMENTAL_RAFT`
+  flag is temporary spike wiring and must be removed or replaced by the final
+  control-plane mode selection once the durable/multi-node Raft path is ready.
 
 1. define the replicated control-plane state machine:
    - state includes cluster epoch, PG count, PG state, PG acting sets, node

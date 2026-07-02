@@ -2,6 +2,7 @@ mod config;
 
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
+use std::future::Future;
 use std::io;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
@@ -24,10 +25,15 @@ use server_core::sse::{
 };
 use storage::control_plane::{
     build_control_plane_unix_response, read_control_plane_unix_request,
-    write_control_plane_unix_response, ClusterRuntimeMapSnapshot,
-    ControlPlaneHeartbeatRuntimeMapSource, ControlPlaneRuntimeMapSource, FileControlPlaneStore,
-    PgMetadataProof, PgMetadataTransferProof, PgRouteSnapshot, SingleAuthorityControlPlane,
-    UnixControlPlaneClient,
+    write_control_plane_unix_response, ClusterControlSnapshot, ClusterRuntimeMapSnapshot,
+    ControlPlaneAdmin, ControlPlaneError, ControlPlaneHeartbeatRefresh,
+    ControlPlaneHeartbeatRuntimeMapSource, ControlPlaneRuntimeMapSource,
+    FencedPgMetadataTransferSnapshot, FileControlPlaneStore, PgMetadataProof,
+    PgMetadataTransferProof, PgRouteSnapshot, SingleAuthorityControlPlane, UnixControlPlaneClient,
+};
+use storage::control_plane_command::{ControlPlaneCommand, ControlPlaneCommandResponse};
+use storage::control_plane_raft::{
+    ControlPlaneRaftAuthority, ControlPlaneRaftCommandOutcome, ControlPlaneRaftNodeId,
 };
 use storage::storage_node_server::{
     advance_storage_node_incarnation, StorageNodeControlPlaneRefreshLoop, StorageNodeDataDirGuard,
@@ -40,6 +46,7 @@ use storage::{
     StorageCluster, StorageClusterRuntimeMapHandle, StorageRpcErrorCode, StoreError,
 };
 use tokio::net::TcpListener;
+use tokio::runtime::Handle;
 use tokio_rustls::TlsAcceptor;
 
 use config::{ConfiguredCredential, ConfiguredCredentialProfile, ProcessRole, ServerConfig};
@@ -1203,6 +1210,10 @@ fn format_optional_epoch(epoch: Option<ClusterEpoch>) -> String {
 }
 
 fn run_control_plane_process(config: &ServerConfig) -> ! {
+    if config.control_plane_experimental_raft {
+        run_experimental_raft_control_plane_process(config);
+    }
+
     let state_path = config
         .control_plane_state_path
         .as_deref()
@@ -1279,6 +1290,316 @@ fn run_control_plane_process(config: &ServerConfig) -> ! {
     }
 }
 
+struct ExperimentalRaftControlPlane {
+    runtime: Handle,
+    authority: Arc<ControlPlaneRaftAuthority>,
+}
+
+impl ExperimentalRaftControlPlane {
+    fn block_on<F: Future>(&self, future: F) -> F::Output {
+        block_on_control_plane_raft(&self.runtime, future)
+    }
+
+    fn submit_raft_command(
+        &self,
+        command: ControlPlaneCommand,
+    ) -> Result<ControlPlaneCommandResponse, ControlPlaneError> {
+        let submitted = self.block_on(self.authority.submit_control_plane_command(command))?;
+        match submitted.into_outcome() {
+            ControlPlaneRaftCommandOutcome::Applied(response) => Ok(response),
+            ControlPlaneRaftCommandOutcome::Rejected(error) => Err(error),
+        }
+    }
+
+    fn current_snapshot(&self) -> Result<ClusterControlSnapshot, ControlPlaneError> {
+        self.block_on(self.authority.current_control_plane_snapshot())
+    }
+
+    fn expire_heartbeat_leases(
+        &self,
+        now_ms: u64,
+    ) -> Result<(ClusterEpoch, usize, usize), ControlPlaneError> {
+        let response = self.submit_raft_command(ControlPlaneCommand::ExpireHeartbeatLeases {
+            expire_at_ms: now_ms,
+        })?;
+        let ControlPlaneCommandResponse::ExpireHeartbeatLeases {
+            expired_nodes,
+            peering_pgs,
+        } = response
+        else {
+            unreachable!("heartbeat lease expiry command returned the wrong response");
+        };
+        Ok((
+            self.current_snapshot()?.cluster_epoch(),
+            expired_nodes.len(),
+            peering_pgs.len(),
+        ))
+    }
+}
+
+impl ControlPlaneRuntimeMapSource for ExperimentalRaftControlPlane {
+    fn runtime_map_snapshot(
+        &self,
+        authority_now_ms: u64,
+    ) -> Result<ClusterRuntimeMapSnapshot, ControlPlaneError> {
+        self.block_on(
+            self.authority
+                .linearized_runtime_map_snapshot(authority_now_ms),
+        )
+    }
+}
+
+impl ControlPlaneHeartbeatRuntimeMapSource for ExperimentalRaftControlPlane {
+    fn refresh_node_heartbeat(
+        &mut self,
+        heartbeat: storage::control_plane::NodeHeartbeat,
+        authority_now_ms: u64,
+    ) -> Result<ControlPlaneHeartbeatRefresh, ControlPlaneError> {
+        let node_id = heartbeat.node_id;
+        let observed_epoch = heartbeat.observed_epoch;
+        let requested_lease_duration_ms = heartbeat.requested_lease_duration_ms;
+        let lease_deadline_ms = authority_now_ms
+            .checked_add(requested_lease_duration_ms)
+            .ok_or(ControlPlaneError::LeaseDeadlineOverflow)?;
+        let pre_record_epoch = self.current_snapshot()?.cluster_epoch();
+        self.submit_raft_command(ControlPlaneCommand::RecordNodeHeartbeat {
+            heartbeat,
+            heartbeat_at_ms: authority_now_ms,
+            lease_deadline_ms,
+        })?;
+        let snapshot = self.current_snapshot()?;
+        let mut lease = snapshot.heartbeat_lease_after_record(
+            node_id,
+            observed_epoch,
+            pre_record_epoch,
+            lease_deadline_ms,
+            authority_now_ms,
+        )?;
+        let ready = snapshot.ready_pg_peering_completions(authority_now_ms)?;
+        if !ready.is_empty() {
+            self.submit_raft_command(ControlPlaneCommand::CompleteReadyPgPeerings {
+                ready_at_ms: authority_now_ms,
+                ready,
+            })?;
+            lease = self
+                .current_snapshot()?
+                .current_heartbeat_lease_for_node(node_id, authority_now_ms)?;
+        }
+        let runtime_map = self
+            .current_snapshot()?
+            .runtime_map_for_storage_node_refresh(authority_now_ms, node_id)?;
+        Ok(ControlPlaneHeartbeatRefresh::new(lease, runtime_map))
+    }
+}
+
+impl ControlPlaneAdmin for ExperimentalRaftControlPlane {
+    fn set_pg_acting_set(
+        &mut self,
+        pg_id: PgId,
+        acting_set: Vec<NodeId>,
+    ) -> Result<ClusterControlSnapshot, ControlPlaneError> {
+        self.submit_raft_command(ControlPlaneCommand::SetPgActingSet { pg_id, acting_set })?;
+        self.current_snapshot()
+    }
+
+    fn fence_pg_for_metadata_transfer(
+        &mut self,
+        pg_id: PgId,
+    ) -> Result<ClusterControlSnapshot, ControlPlaneError> {
+        Ok(self
+            .fence_pg_for_metadata_transfer_with_source_lease(pg_id)?
+            .into_parts()
+            .0)
+    }
+
+    fn fence_pg_for_metadata_transfer_with_source_lease(
+        &mut self,
+        pg_id: PgId,
+    ) -> Result<FencedPgMetadataTransferSnapshot, ControlPlaneError> {
+        let response =
+            self.submit_raft_command(ControlPlaneCommand::FencePgForMetadataTransfer { pg_id })?;
+        let ControlPlaneCommandResponse::FencePgForMetadataTransfer {
+            source_primary_lease_deadline_ms,
+        } = response
+        else {
+            unreachable!("metadata transfer fence command returned the wrong response");
+        };
+        Ok(FencedPgMetadataTransferSnapshot::new(
+            self.current_snapshot()?,
+            source_primary_lease_deadline_ms,
+        ))
+    }
+
+    fn set_pg_acting_set_with_metadata_transfer(
+        &mut self,
+        pg_id: PgId,
+        acting_set: Vec<NodeId>,
+        transfer: PgMetadataTransferProof,
+    ) -> Result<ClusterControlSnapshot, ControlPlaneError> {
+        self.submit_raft_command(ControlPlaneCommand::SetPgActingSetWithMetadataTransfer {
+            pg_id,
+            acting_set,
+            transfer,
+        })?;
+        self.current_snapshot()
+    }
+}
+
+fn block_on_control_plane_raft<F: Future>(runtime: &Handle, future: F) -> F::Output {
+    if Handle::try_current().is_ok() {
+        tokio::task::block_in_place(|| runtime.block_on(future))
+    } else {
+        runtime.block_on(future)
+    }
+}
+
+fn run_experimental_raft_control_plane_process(config: &ServerConfig) -> ! {
+    let state_path = config
+        .control_plane_state_path
+        .as_deref()
+        .expect("control-plane role requires state path");
+    let socket_path = config
+        .control_plane_socket_path
+        .as_deref()
+        .expect("control-plane role requires socket path");
+    let _state_lock =
+        acquire_control_plane_state_lock(Path::new(state_path)).unwrap_or_else(|error| {
+            eprintln!("{error}");
+            std::process::exit(1);
+        });
+    let listener = bind_control_plane_socket(Path::new(socket_path)).unwrap_or_else(|error| {
+        eprintln!("{error}");
+        std::process::exit(1);
+    });
+
+    let runtime = Handle::current();
+    let node_id: ControlPlaneRaftNodeId = 1;
+    let authority = block_on_control_plane_raft(&runtime, async {
+        let authority = ControlPlaneRaftAuthority::new_experimental_single_node_in_memory(
+            format!("argmin-s3-experimental-control-plane-{socket_path}"),
+            node_id,
+        )
+        .await?;
+        authority.initialize_single_node_membership(node_id).await?;
+        authority
+            .wait_for_current_leader(
+                node_id,
+                Duration::from_secs(1),
+                "experimental single-node control-plane startup leadership",
+            )
+            .await?;
+        Ok::<_, ControlPlaneError>(Arc::new(authority))
+    })
+    .unwrap_or_else(|error| {
+        eprintln!("failed to initialize experimental OpenRaft control-plane: {error}");
+        std::process::exit(1);
+    });
+    let mut control_plane = ExperimentalRaftControlPlane {
+        runtime,
+        authority: Arc::clone(&authority),
+    };
+    bootstrap_empty_experimental_raft_control_plane(&mut control_plane, config).unwrap_or_else(
+        |error| {
+            eprintln!("failed to bootstrap experimental OpenRaft control-plane state: {error}");
+            std::process::exit(1);
+        },
+    );
+    let authority = Arc::new(Mutex::new(control_plane));
+    let active_rpc_workers = Arc::new(AtomicUsize::new(0));
+    eprintln!(
+        "argmin-s3 experimental in-memory OpenRaft control-plane manager using lock state {} on {} (raft node {}, lease scan {} ms)",
+        state_path,
+        socket_path,
+        node_id,
+        config.control_plane_lease_scan_interval.as_millis()
+    );
+
+    loop {
+        for _ in 0..CONTROL_PLANE_ACCEPT_BATCH_LIMIT {
+            match listener.accept() {
+                Ok((stream, _addr)) => {
+                    spawn_control_plane_rpc_worker(
+                        stream,
+                        Arc::clone(&authority),
+                        Arc::clone(&active_rpc_workers),
+                    );
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                Err(error) => {
+                    eprintln!("control-plane socket accept failed: {error}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        let now_ms = storage::clock::current_time_millis();
+        let expiry = authority
+            .lock()
+            .expect("control-plane authority mutex poisoned")
+            .expire_heartbeat_leases(now_ms);
+        match expiry {
+            Ok((cluster_epoch, expired_nodes, peering_pgs)) if expired_nodes > 0 => {
+                eprintln!(
+                    "experimental OpenRaft control-plane expired {} node leases at epoch {} and moved {} PGs to peering",
+                    expired_nodes,
+                    cluster_epoch,
+                    peering_pgs
+                );
+            }
+            Ok(_) => {}
+            Err(error) => {
+                eprintln!("experimental OpenRaft control-plane lease expiry failed: {error}");
+                std::process::exit(1);
+            }
+        }
+        thread::sleep(config.control_plane_lease_scan_interval);
+    }
+}
+
+fn bootstrap_empty_experimental_raft_control_plane(
+    authority: &mut ExperimentalRaftControlPlane,
+    config: &ServerConfig,
+) -> Result<(), String> {
+    if authority
+        .current_snapshot()
+        .map_err(|error| error.to_string())?
+        .nodes()
+        .next()
+        .is_some()
+    {
+        return Ok(());
+    }
+    if config.storage_node_sockets.is_empty() {
+        return Ok(());
+    }
+
+    let nodes: Vec<(NodeId, String)> = config
+        .storage_node_sockets
+        .iter()
+        .map(|entry| (NodeId::new(entry.node_id), entry.socket_path.clone()))
+        .collect();
+    let pg_ids: Vec<storage::PgId> = config
+        .storage_pg_ids
+        .iter()
+        .copied()
+        .map(storage::PgId::new)
+        .collect();
+    let node_count = nodes.len();
+    authority
+        .submit_raft_command(ControlPlaneCommand::BootstrapInitialClusterMap { nodes, pg_ids })
+        .map_err(|error| error.to_string())?;
+    let epoch = authority
+        .current_snapshot()
+        .map_err(|error| error.to_string())?
+        .cluster_epoch();
+    eprintln!(
+        "experimental OpenRaft control-plane bootstrapped {} nodes and {} PG acting sets at epoch {}",
+        node_count,
+        config.storage_pg_ids.len(),
+        epoch
+    );
+    Ok(())
+}
+
 fn bootstrap_empty_control_plane(
     authority: &mut SingleAuthorityControlPlane<FileControlPlaneStore>,
     config: &ServerConfig,
@@ -1316,7 +1637,15 @@ fn bootstrap_empty_control_plane(
 
 fn spawn_control_plane_rpc_worker(
     mut stream: UnixStream,
-    authority: Arc<Mutex<SingleAuthorityControlPlane<FileControlPlaneStore>>>,
+    authority: Arc<
+        Mutex<
+            impl ControlPlaneAdmin
+                + ControlPlaneHeartbeatRuntimeMapSource
+                + ControlPlaneRuntimeMapSource
+                + Send
+                + 'static,
+        >,
+    >,
     active_rpc_workers: Arc<AtomicUsize>,
 ) {
     match active_rpc_workers.fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
@@ -2202,6 +2531,7 @@ mod tests {
                 LocalUnixStorageNodeClientConfig::DEFAULT_RPC_CONTROL_ADMISSION_WAIT_TIMEOUT,
             control_plane_state_path: None,
             control_plane_socket_path: None,
+            control_plane_experimental_raft: false,
             control_plane_lease_scan_interval: std::time::Duration::from_millis(250),
             control_plane_refresh_interval: std::time::Duration::from_millis(250),
             control_plane_heartbeat_lease_duration: std::time::Duration::from_millis(1000),
@@ -2230,6 +2560,67 @@ mod tests {
     #[test]
     fn root_process_check_rejects_effective_uid_zero() {
         assert_eq!(reject_root_process(0), Err(ROOT_PROCESS_ERROR));
+    }
+
+    #[test]
+    fn experimental_raft_control_plane_bootstraps_runtime_map() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime should build");
+        let handle = runtime.handle().clone();
+        let authority = runtime.block_on(async {
+            let authority = ControlPlaneRaftAuthority::new_experimental_single_node_in_memory(
+                format!(
+                    "argmin-s3-experimental-raft-process-test-{}",
+                    std::process::id()
+                ),
+                1,
+            )
+            .await
+            .expect("experimental raft authority should initialize");
+            authority
+                .initialize_single_node_membership(1)
+                .await
+                .expect("single-node raft membership should initialize");
+            authority
+                .wait_for_current_leader(
+                    1,
+                    Duration::from_secs(1),
+                    "experimental process test leadership",
+                )
+                .await
+                .expect("single-node raft should become leader");
+            Arc::new(authority)
+        });
+        let mut control_plane = ExperimentalRaftControlPlane {
+            runtime: handle,
+            authority: Arc::clone(&authority),
+        };
+        let mut config = test_server_config();
+        config.storage_node_sockets = vec![config::ConfiguredStorageNodeSocket {
+            node_id: 1,
+            socket_path: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
+        }];
+        config.storage_pg_ids = vec![0];
+
+        bootstrap_empty_experimental_raft_control_plane(&mut control_plane, &config)
+            .expect("experimental raft control-plane bootstrap should succeed");
+        let runtime_map = control_plane
+            .runtime_map_snapshot(10_000)
+            .expect("experimental raft runtime map should serve");
+        assert_eq!(runtime_map.nodes().len(), 1);
+        assert_eq!(runtime_map.nodes()[0].node_id(), NodeId::new(1));
+        assert_eq!(
+            runtime_map.nodes()[0].endpoint(),
+            "/tmp/argmin-experimental-raft-node-1.sock"
+        );
+        assert_eq!(runtime_map.pg_routes().len(), 1);
+        assert_eq!(runtime_map.pg_routes()[0].pg_id(), PgId::new(0));
+
+        runtime
+            .block_on(authority.shutdown())
+            .expect("experimental raft authority should shut down");
     }
 
     #[test]

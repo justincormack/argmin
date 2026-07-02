@@ -92,6 +92,7 @@ pub(crate) struct ServerConfig {
     pub(crate) storage_node_rpc_control_admission_wait_timeout: Duration,
     pub(crate) control_plane_state_path: Option<String>,
     pub(crate) control_plane_socket_path: Option<String>,
+    pub(crate) control_plane_experimental_raft: bool,
     pub(crate) control_plane_lease_scan_interval: Duration,
     pub(crate) control_plane_refresh_interval: Duration,
     pub(crate) control_plane_heartbeat_lease_duration: Duration,
@@ -135,6 +136,7 @@ impl ServerConfig {
     ///   `ARGMIN_STORAGE_NODE_RPC_CONTROL_ADMISSION_WAIT_MS` (1000)
     ///   `ARGMIN_CONTROL_PLANE_STATE_PATH` (required for control-plane role)
     ///   `ARGMIN_CONTROL_PLANE_SOCKET_PATH` (required for control-plane role, optional dynamic route source for frontend/storage roles)
+    ///   `ARGMIN_CONTROL_PLANE_EXPERIMENTAL_RAFT` (false)
     ///   `ARGMIN_CONTROL_PLANE_LEASE_SCAN_MS` (250)
     ///   `ARGMIN_CONTROL_PLANE_REFRESH_MS` (250)
     ///   `ARGMIN_CONTROL_PLANE_HEARTBEAT_LEASE_MS` (1000)
@@ -291,6 +293,10 @@ impl ServerConfig {
             Duration::from_millis(storage_node_rpc_control_admission_wait_ms);
         let control_plane_state_path = get("ARGMIN_CONTROL_PLANE_STATE_PATH");
         let control_plane_socket_path = get("ARGMIN_CONTROL_PLANE_SOCKET_PATH");
+        let control_plane_experimental_raft = match get("ARGMIN_CONTROL_PLANE_EXPERIMENTAL_RAFT") {
+            Some(value) => parse_bool_env("ARGMIN_CONTROL_PLANE_EXPERIMENTAL_RAFT", &value)?,
+            None => false,
+        };
         let control_plane_lease_scan_ms: u64 = get("ARGMIN_CONTROL_PLANE_LEASE_SCAN_MS")
             .unwrap_or_else(|| "250".to_string())
             .parse()
@@ -498,6 +504,7 @@ impl ServerConfig {
             storage_node_rpc_control_admission_wait_timeout,
             control_plane_state_path,
             control_plane_socket_path,
+            control_plane_experimental_raft,
             control_plane_lease_scan_interval,
             control_plane_refresh_interval,
             control_plane_heartbeat_lease_duration,
@@ -908,6 +915,7 @@ mod tests {
         );
         assert_eq!(cfg.control_plane_state_path, None);
         assert_eq!(cfg.control_plane_socket_path, None);
+        assert!(!cfg.control_plane_experimental_raft);
         assert_eq!(
             cfg.control_plane_lease_scan_interval,
             Duration::from_millis(250)
@@ -961,6 +969,7 @@ mod tests {
                 "/tmp/control-plane.sock",
             ),
             ("ARGMIN_CONTROL_PLANE_LEASE_SCAN_MS", "125"),
+            ("ARGMIN_CONTROL_PLANE_EXPERIMENTAL_RAFT", "true"),
             ("ARGMIN_CONTROL_PLANE_REFRESH_MS", "200"),
             ("ARGMIN_CONTROL_PLANE_HEARTBEAT_LEASE_MS", "900"),
             ("ARGMIN_LOCAL_NODE_COUNT", "12"),
@@ -984,6 +993,7 @@ mod tests {
             cfg.control_plane_socket_path.as_deref(),
             Some("/tmp/control-plane.sock")
         );
+        assert!(cfg.control_plane_experimental_raft);
         assert_eq!(
             cfg.control_plane_lease_scan_interval,
             Duration::from_millis(125)

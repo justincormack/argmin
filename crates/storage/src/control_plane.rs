@@ -569,7 +569,7 @@ impl ClusterControlSnapshot {
         )
     }
 
-    fn runtime_map_for_storage_node_refresh(
+    pub fn runtime_map_for_storage_node_refresh(
         &self,
         now_ms: u64,
         refreshing_node_id: NodeId,
@@ -963,6 +963,96 @@ impl ClusterControlSnapshot {
         let protection =
             required_cluster_map_history_protection(self.pgs.values(), self.nodes.values());
         prune_cluster_map_history(&mut self.history, &protection);
+    }
+
+    pub fn ready_pg_peering_completions(
+        &self,
+        now_ms: u64,
+    ) -> Result<Vec<ReadyPgPeeringCompletion>, ControlPlaneError> {
+        let mut ready = Vec::new();
+        for record in self.pgs.values() {
+            if record.state != PgState::Peering {
+                continue;
+            }
+            if record.metadata_transfer_fenced {
+                continue;
+            }
+            let Some(primary) =
+                deterministic_pg_primary_for_snapshot(self, record.acting_set(), now_ms)
+            else {
+                continue;
+            };
+            match validate_pg_peering_observations(self, record.pg_id, record.acting_set(), now_ms)
+            {
+                Ok(active_metadata_proof)
+                    if validate_peering_metadata_proof_floor(
+                        self.cluster_epoch,
+                        record.pg_id,
+                        primary,
+                        record.peering_metadata_proof_floor_context(),
+                        record.peering_metadata_transfer,
+                        active_metadata_proof,
+                    )
+                    .is_ok() =>
+                {
+                    ready.push(ReadyPgPeeringCompletion {
+                        pg_id: record.pg_id,
+                        primary,
+                        active_metadata_proof,
+                        active_metadata_proof_epoch: self.cluster_epoch,
+                    })
+                }
+                Ok(_) => {}
+                Err(
+                    ControlPlaneError::PgPeeringMissingObservation { .. }
+                    | ControlPlaneError::PgPeeringObservationNotPeering { .. }
+                    | ControlPlaneError::PgPeeringMetadataProofMismatch { .. }
+                    | ControlPlaneError::PgPeeringPendingMetadataCommand { .. },
+                ) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(ready)
+    }
+
+    pub fn current_heartbeat_lease_for_node(
+        &self,
+        node_id: NodeId,
+        now_ms: u64,
+    ) -> Result<HeartbeatLease, ControlPlaneError> {
+        let record = self.node(node_id).ok_or(ControlPlaneError::UnknownNode {
+            node_id: node_id.as_u32(),
+        })?;
+        Ok(HeartbeatLease {
+            authority_incarnation: self.authority_incarnation,
+            cluster_epoch: self.cluster_epoch,
+            node_id,
+            lease_deadline_ms: record.lease_deadline_ms.unwrap_or(now_ms),
+            serving: record.can_serve_primary(self.cluster_epoch, now_ms),
+            snapshot: self.clone(),
+        })
+    }
+
+    pub fn heartbeat_lease_after_record(
+        &self,
+        node_id: NodeId,
+        observed_epoch: ClusterEpoch,
+        pre_record_epoch: ClusterEpoch,
+        lease_deadline_ms: u64,
+        now_ms: u64,
+    ) -> Result<HeartbeatLease, ControlPlaneError> {
+        let serving = self.node(node_id).is_some_and(|record| {
+            observed_epoch == pre_record_epoch
+                && record.can_serve_primary(self.cluster_epoch, now_ms)
+        });
+        Ok(HeartbeatLease {
+            authority_incarnation: self.authority_incarnation,
+            cluster_epoch: self.cluster_epoch,
+            node_id,
+            lease_deadline_ms,
+            serving,
+            snapshot: self.clone(),
+        })
     }
 }
 
@@ -2815,6 +2905,11 @@ pub struct ControlPlaneHeartbeatRefresh {
 
 impl ControlPlaneHeartbeatRefresh {
     #[must_use]
+    pub fn new(lease: HeartbeatLease, runtime_map: ClusterRuntimeMapSnapshot) -> Self {
+        Self { lease, runtime_map }
+    }
+
+    #[must_use]
     pub fn lease(&self) -> &HeartbeatLease {
         &self.lease
     }
@@ -3298,53 +3393,7 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
         &mut self,
         now_ms: u64,
     ) -> Result<Vec<PgId>, ControlPlaneError> {
-        let mut ready = Vec::new();
-        for record in self.snapshot.pgs.values() {
-            if record.state != PgState::Peering {
-                continue;
-            }
-            if record.metadata_transfer_fenced {
-                continue;
-            }
-            let Some(primary) =
-                deterministic_pg_primary_for_snapshot(&self.snapshot, record.acting_set(), now_ms)
-            else {
-                continue;
-            };
-            match validate_pg_peering_observations(
-                &self.snapshot,
-                record.pg_id,
-                record.acting_set(),
-                now_ms,
-            ) {
-                Ok(active_metadata_proof)
-                    if validate_peering_metadata_proof_floor(
-                        self.snapshot.cluster_epoch,
-                        record.pg_id,
-                        primary,
-                        record.peering_metadata_proof_floor_context(),
-                        record.peering_metadata_transfer,
-                        active_metadata_proof,
-                    )
-                    .is_ok() =>
-                {
-                    ready.push(ReadyPgPeeringCompletion {
-                        pg_id: record.pg_id,
-                        primary,
-                        active_metadata_proof,
-                        active_metadata_proof_epoch: self.snapshot.cluster_epoch,
-                    })
-                }
-                Ok(_) => {}
-                Err(
-                    ControlPlaneError::PgPeeringMissingObservation { .. }
-                    | ControlPlaneError::PgPeeringObservationNotPeering { .. }
-                    | ControlPlaneError::PgPeeringMetadataProofMismatch { .. }
-                    | ControlPlaneError::PgPeeringPendingMetadataCommand { .. },
-                ) => {}
-                Err(error) => return Err(error),
-            }
-        }
+        let ready = self.snapshot.ready_pg_peering_completions(now_ms)?;
         if ready.is_empty() {
             return Ok(Vec::new());
         }
@@ -3401,20 +3450,8 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
         node_id: NodeId,
         now_ms: u64,
     ) -> Result<HeartbeatLease, ControlPlaneError> {
-        let record = self
-            .snapshot
-            .node(node_id)
-            .ok_or(ControlPlaneError::UnknownNode {
-                node_id: node_id.as_u32(),
-            })?;
-        Ok(HeartbeatLease {
-            authority_incarnation: self.snapshot.authority_incarnation,
-            cluster_epoch: self.snapshot.cluster_epoch,
-            node_id,
-            lease_deadline_ms: record.lease_deadline_ms.unwrap_or(now_ms),
-            serving: record.can_serve_primary(self.snapshot.cluster_epoch, now_ms),
-            snapshot: self.snapshot.clone(),
-        })
+        self.snapshot
+            .current_heartbeat_lease_for_node(node_id, now_ms)
     }
 
     pub fn expire_heartbeat_leases(
