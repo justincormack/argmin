@@ -3996,6 +3996,30 @@ impl UnixControlPlaneClient {
         }
     }
 
+    fn send_liveness_request(
+        &self,
+        kind: ControlPlaneRpcKind,
+        payload: &[u8],
+        retry_budget: Duration,
+    ) -> Result<Vec<u8>, ControlPlaneError> {
+        debug_assert_eq!(kind, ControlPlaneRpcKind::RefreshNodeHeartbeat);
+        let deadline = Instant::now() + retry_budget;
+        loop {
+            match self.send_request(kind, payload) {
+                Ok(payload) => return Ok(payload),
+                Err(error)
+                    if error.is_retryable_control_plane_rpc_transport_error()
+                        && Instant::now() < deadline =>
+                {
+                    let now = Instant::now();
+                    let remaining = deadline.saturating_duration_since(now);
+                    std::thread::sleep(remaining.min(CONTROL_PLANE_RPC_CHECK_APPLIED_BACKOFF));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
     fn wait_for_metadata_transfer_install_applied(
         &self,
         pg_id: PgId,
@@ -4416,7 +4440,12 @@ impl ControlPlaneHeartbeatRuntimeMapSource for UnixControlPlaneClient {
     ) -> Result<ControlPlaneHeartbeatRefresh, ControlPlaneError> {
         let mut payload = Vec::new();
         write_node_heartbeat(&mut payload, &heartbeat)?;
-        let payload = self.send_request(ControlPlaneRpcKind::RefreshNodeHeartbeat, &payload)?;
+        let retry_budget = Duration::from_millis(heartbeat.requested_lease_duration_ms);
+        let payload = self.send_liveness_request(
+            ControlPlaneRpcKind::RefreshNodeHeartbeat,
+            &payload,
+            retry_budget,
+        )?;
         let mut reader = PayloadReader::new(&payload);
         let lease = read_heartbeat_lease(&mut reader)?;
         let runtime_map = read_runtime_map_snapshot(&mut reader)?;
@@ -6105,6 +6134,11 @@ pub enum ControlPlaneError {
 impl ControlPlaneError {
     #[must_use]
     pub fn is_retryable_read_only_rpc_transport_error(&self) -> bool {
+        self.is_retryable_control_plane_rpc_transport_error()
+    }
+
+    #[must_use]
+    pub fn is_retryable_control_plane_rpc_transport_error(&self) -> bool {
         let Self::Io { source, .. } = self else {
             return false;
         };
@@ -9599,6 +9633,140 @@ mod tests {
             refresh.runtime_map().nodes()[0].cluster_map_history_floor_epoch(),
             Some(heartbeat_epoch)
         );
+    }
+
+    #[test]
+    fn unix_control_plane_client_retries_heartbeat_after_lost_response() {
+        let tmp = test_util::tempdir();
+        let socket_path = tmp.path().join("control-plane.sock");
+        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+        authority
+            .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
+            .unwrap();
+        authority
+            .set_pg_acting_set(PgId::new(7), vec![NodeId::new(1)])
+            .unwrap();
+        let heartbeat_epoch = authority.snapshot().cluster_epoch();
+        let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _addr) = listener.accept().unwrap();
+            let request = read_control_plane_unix_request(&mut stream).unwrap();
+            assert_eq!(request.kind, ControlPlaneRpcKind::RefreshNodeHeartbeat);
+            let response = build_control_plane_unix_response(&mut authority, request, 2_000)
+                .expect("heartbeat refresh should apply before response loss");
+            assert_eq!(response.kind, ControlPlaneRpcKind::RefreshNodeHeartbeat);
+            assert_eq!(
+                authority
+                    .snapshot()
+                    .node(NodeId::new(1))
+                    .unwrap()
+                    .lease_deadline_ms(),
+                Some(2_100)
+            );
+            drop(response);
+            drop(stream);
+
+            let (mut stream, _addr) = listener.accept().unwrap();
+            let request = read_control_plane_unix_request(&mut stream).unwrap();
+            assert_eq!(request.kind, ControlPlaneRpcKind::RefreshNodeHeartbeat);
+            respond_control_plane_unix_request(&mut authority, &mut stream, request, 2_050)
+                .unwrap();
+            assert_eq!(
+                authority
+                    .snapshot()
+                    .node(NodeId::new(1))
+                    .unwrap()
+                    .lease_deadline_ms(),
+                Some(2_150)
+            );
+        });
+
+        let mut client = UnixControlPlaneClient::new(&socket_path);
+        let refresh = client
+            .refresh_node_heartbeat(
+                NodeHeartbeat {
+                    node_id: NodeId::new(1),
+                    node_incarnation: 42,
+                    endpoint: "/tmp/argmin-node-1.sock".to_owned(),
+                    observed_epoch: heartbeat_epoch,
+                    requested_lease_duration_ms: 100,
+                    cluster_map_history_reference_summary: PgClusterMapHistoryReferenceSummary {
+                        oldest_live_placement_epoch: Some(heartbeat_epoch),
+                        oldest_durable_backfill_epoch: None,
+                    },
+                    pg_observations: Vec::new(),
+                },
+                0,
+            )
+            .unwrap();
+
+        server.join().unwrap();
+        assert_eq!(refresh.lease().lease_deadline_ms(), 2_150);
+        assert_eq!(
+            refresh.runtime_map().nodes()[0].endpoint(),
+            "/tmp/argmin-node-1.sock"
+        );
+    }
+
+    #[test]
+    fn unix_control_plane_client_stops_heartbeat_retry_before_lease_window_expires() {
+        let tmp = test_util::tempdir();
+        let socket_path = tmp.path().join("control-plane.sock");
+        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+        authority
+            .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
+            .unwrap();
+        authority
+            .set_pg_acting_set(PgId::new(7), vec![NodeId::new(1)])
+            .unwrap();
+        let heartbeat_epoch = authority.snapshot().cluster_epoch();
+        let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _addr) = listener.accept().unwrap();
+            let request = read_control_plane_unix_request(&mut stream).unwrap();
+            assert_eq!(request.kind, ControlPlaneRpcKind::RefreshNodeHeartbeat);
+            let response = build_control_plane_unix_response(&mut authority, request, 2_000)
+                .expect("heartbeat refresh should apply before response loss");
+            assert_eq!(response.kind, ControlPlaneRpcKind::RefreshNodeHeartbeat);
+            assert_eq!(
+                authority
+                    .snapshot()
+                    .node(NodeId::new(1))
+                    .unwrap()
+                    .lease_deadline_ms(),
+                Some(2_001)
+            );
+            drop(response);
+            drop(stream);
+        });
+
+        let mut client = UnixControlPlaneClient::new(&socket_path);
+        let error = client
+            .refresh_node_heartbeat(
+                NodeHeartbeat {
+                    node_id: NodeId::new(1),
+                    node_incarnation: 42,
+                    endpoint: "/tmp/argmin-node-1.sock".to_owned(),
+                    observed_epoch: heartbeat_epoch,
+                    requested_lease_duration_ms: 1,
+                    cluster_map_history_reference_summary: PgClusterMapHistoryReferenceSummary {
+                        oldest_live_placement_epoch: Some(heartbeat_epoch),
+                        oldest_durable_backfill_epoch: None,
+                    },
+                    pg_observations: Vec::new(),
+                },
+                0,
+            )
+            .unwrap_err();
+
+        server.join().unwrap();
+        assert!(matches!(error, ControlPlaneError::Io { source, .. }
+            if source.kind() == ErrorKind::ConnectionRefused
+                || source.kind() == ErrorKind::NotFound
+                || source.kind() == ErrorKind::UnexpectedEof
+                || source.kind() == ErrorKind::ConnectionReset));
     }
 
     #[test]

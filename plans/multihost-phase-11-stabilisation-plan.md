@@ -705,7 +705,14 @@ when prioritised. They correspond to the remaining findings from the Phase 11 re
     response.
   - **Time-based liveness commands:** `RecordNodeHeartbeat` and `ExpireHeartbeatLeases`
     need bounded retry/reconnect, but with care that retrying the same timestamp/deadline is
-    monotonic and cannot shorten a valid lease or resurrect an expired one.
+    monotonic and cannot shorten a valid lease or resurrect an expired one. **Status:**
+    the Unix `RefreshNodeHeartbeat` path now retries retryable transport failures within a
+    bounded deadline capped by the requested lease duration. Repeating a heartbeat inside
+    that lease window is monotonic for a live node: it refreshes the same node
+    incarnation/endpoint and can extend, but not shorten, the lease. Storage regressions
+    inject response loss after the first heartbeat apply and verify both in-window retry
+    returning a later lease deadline and short-lease fail-closed behavior before the generic
+    control-plane retry deadline could resurrect an expired lease.
   - **Non-idempotent route/provenance transitions:** add explicit check-applied paths for
     `FencePgForMetadataTransfer`, `FencePgForMetadataTransferRuntimeMap`,
     `SetPgActingSetWithMetadataTransfer`,
