@@ -1686,6 +1686,174 @@ fn assert_cached_metadata_digest_matches_materialized(store: &PgStore) {
     assert_eq!(cached, materialized);
 }
 
+fn assert_pg_recovery_invariants_after_commit_failure(
+    store: &PgStore,
+    case_name: &str,
+) -> MetadataCommandReplicaState {
+    assert_cached_metadata_digest_matches_materialized(store);
+    let state = store
+        .validate_metadata_command_replay_state(0, ClusterEpoch::INITIAL)
+        .unwrap_or_else(|err| panic!("{case_name}: replay validation failed: {err:?}"));
+    assert_eq!(
+        state.state_digest,
+        store.metadata_state_digest().unwrap(),
+        "{case_name}: replica state digest should match materialized rows"
+    );
+    assert!(
+        store
+            .pending_metadata_command_slot_any_epoch(0)
+            .unwrap()
+            .is_none(),
+        "{case_name}: recovered PG should not retain a pending slot"
+    );
+    state
+}
+
+fn assert_pg_accepts_next_command_after_recovery(
+    store: &PgStore,
+    case_name: &str,
+    state: &MetadataCommandReplicaState,
+) {
+    let next_bucket = trusted_bucket_name(format!("recovered-next-{case_name}"));
+    let next_command = create_bucket_probe_command(
+        1,
+        state
+            .applied_log_index
+            .checked_add(1)
+            .expect("test command log index can advance"),
+        next_bucket,
+        10_000 + state.applied_log_index,
+    );
+    assert_eq!(
+        store
+            .metadata_command_acceptance(0, &next_command)
+            .unwrap_or_else(|err| {
+                panic!("{case_name}: next metadata command acceptance failed: {err:?}")
+            }),
+        MetadataCommandAcceptance::Apply,
+        "{case_name}: recovered PG should accept the next command without retry or drain"
+    );
+    store
+        .record_metadata_command_applied(0, &next_command)
+        .unwrap_or_else(|err| panic!("{case_name}: next metadata command failed: {err:?}"));
+    assert_cached_metadata_digest_matches_materialized(store);
+}
+
+fn assert_commit_failure_recovers_for_metadata_mutator(
+    case_name: &str,
+    setup: impl FnOnce(&PgStore),
+    mutate: impl FnOnce(&PgStore) -> Result<(), MetadataError>,
+) {
+    let tmp = test_util::tempdir();
+    {
+        let store = PgStore::open(tmp.path(), 1).unwrap();
+        setup(&store);
+        store.refresh_metadata_command_state_digest().unwrap();
+        assert_pg_recovery_invariants_after_commit_failure(&store, case_name);
+
+        store.fail_next_metadata_txn_commit();
+        let err = match mutate(&store) {
+            Ok(()) => panic!("{case_name}: injected commit failure was not used"),
+            Err(err) => err,
+        };
+        assert!(
+            matches!(err, MetadataError::Db { .. }),
+            "{case_name}: expected injected commit failure DB error, got {err:?}"
+        );
+        assert_eq!(
+            store.clean_metadata_digest_revision.load(Ordering::Relaxed),
+            UNCLEAN_METADATA_DIGEST_REVISION,
+            "{case_name}: injected commit failure should invalidate the clean digest marker"
+        );
+    }
+
+    let recovered = PgStore::open(tmp.path(), 1).unwrap();
+    recovered
+        .recover(super::super::PgStoreRecoveryContext {
+            node_id: NodeId::new(0),
+        })
+        .unwrap_or_else(|err| panic!("{case_name}: recovery failed: {err:?}"));
+    let state = assert_pg_recovery_invariants_after_commit_failure(&recovered, case_name);
+    assert_pg_accepts_next_command_after_recovery(&recovered, case_name, &state);
+}
+
+#[test]
+fn metadata_txn_commit_failure_recovers_representative_mutators() {
+    assert_commit_failure_recovers_for_metadata_mutator(
+        "create-bucket",
+        |_| {},
+        |store| {
+            let bucket = trusted_bucket_name("commit-fail-create-bucket");
+            PgMetadataStore::create_bucket(
+                store,
+                &bucket,
+                "owner",
+                &CanonicalUserId::from_principal("owner"),
+                &AclGrants::default(),
+                false,
+                false,
+            )
+        },
+    );
+
+    assert_commit_failure_recovers_for_metadata_mutator(
+        "put-bucket-versioning",
+        |store| create_probe_bucket_direct(store, &trusted_bucket_name("commit-fail-versioning")),
+        |store| {
+            PgMetadataStore::put_bucket_versioning(
+                store,
+                &trusted_bucket_name("commit-fail-versioning"),
+                BucketVersioningState::Enabled,
+            )
+        },
+    );
+
+    assert_commit_failure_recovers_for_metadata_mutator(
+        "put-bucket-acl",
+        |store| create_probe_bucket_direct(store, &trusted_bucket_name("commit-fail-acl")),
+        |store| {
+            PgMetadataStore::put_bucket_acl(
+                store,
+                &trusted_bucket_name("commit-fail-acl"),
+                &AclGrants::default(),
+                true,
+                false,
+            )
+        },
+    );
+
+    assert_commit_failure_recovers_for_metadata_mutator(
+        "mark-bucket-deleting",
+        |store| create_probe_bucket_direct(store, &trusted_bucket_name("commit-fail-delete")),
+        |store| store.mark_bucket_deleting(&trusted_bucket_name("commit-fail-delete")),
+    );
+
+    assert_commit_failure_recovers_for_metadata_mutator(
+        "create-multipart-upload",
+        |store| create_probe_bucket_direct(store, &trusted_bucket_name("commit-fail-mpu")),
+        |store| {
+            PgMetadataStore::create_multipart_upload(
+                store,
+                &CreateMultipartUploadReq {
+                    upload_id: crate::tests::multipart_upload_id("commit-fail-mpu-upload"),
+                    bucket: trusted_bucket_name("commit-fail-mpu"),
+                    key: trusted_object_key("object"),
+                    tags: None,
+                    metadata_blob: SerializedMetadataBlob::default(),
+                    system_metadata_blob: SerializedSystemMetadataBlob::default(),
+                    initiator: test_owner(),
+                    owner: test_owner(),
+                    acl_grants: AclGrants::default(),
+                    public_read: false,
+                    object_lock: ObjectLockState::default(),
+                    checksum: None,
+                    encryption: ObjectEncryption::None,
+                },
+            )
+        },
+    );
+}
+
 #[test]
 fn metadata_digest_cache_tracks_row_changes_incrementally() {
     let tmp = test_util::tempdir();

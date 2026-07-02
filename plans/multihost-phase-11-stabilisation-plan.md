@@ -278,6 +278,14 @@ Progress update:
    (e) the PG can accept the next command without a spurious retry/drain cycle.
    This single harness would have caught `c828f3a5`, `c5776092`, and `791b409c`.
 
+   Progress update: a reusable harness now covers representative generic-transaction
+   mutators (`create_bucket`, bucket versioning, bucket ACL, `mark_bucket_deleting`, and
+   create multipart upload). Each case injects a commit failure, reopens and recovers the
+   PG, checks cached-vs-materialised table digests and replica-state digest consistency,
+   asserts no pending slot remains, and then applies a follow-on metadata command. The
+   remaining work is to extend this matrix across the rest of the digest-affecting mutators,
+   including hand-written transaction paths that do not use `with_immediate_txn`.
+
 7. **Storage-node restart coverage.** Add a test that opens a PG through
    `StorageNodeServer::bind` (the production restart path), after a crash that orphans a
    terminal slot and a commit-failed transaction, and asserts the server does not serve a
