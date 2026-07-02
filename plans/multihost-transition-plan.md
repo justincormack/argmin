@@ -10034,6 +10034,10 @@ Phase 12.1 progress:
   control-plane wire protocol with deterministic authority timestamps, proving
   the process-mode adapter works across the actual storage-node/front-end RPC
   framing rather than only through direct in-process trait calls.
+- Added the matching Unix RPC smoke for frontend-style runtime-map reads. The
+  experimental authority now serves `UnixControlPlaneClient::runtime_map_snapshot`
+  through OpenRaft read-index and the test asserts the wire-decoded freshness
+  proof carries a nonzero Raft log id and the deterministic issued timestamp.
 
 1. define the replicated control-plane state machine:
    - state includes cluster epoch, PG count, PG state, PG acting sets, node

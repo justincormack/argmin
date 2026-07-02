@@ -2852,6 +2852,50 @@ mod tests {
     }
 
     #[test]
+    fn experimental_raft_control_plane_serves_unix_runtime_map_read_index() {
+        let mut harness = experimental_raft_test_harness("unix-runtime-map-test");
+        let mut config = test_server_config();
+        config.storage_node_sockets = vec![config::ConfiguredStorageNodeSocket {
+            node_id: 1,
+            socket_path: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
+        }];
+        config.storage_pg_ids = vec![11];
+        bootstrap_empty_experimental_raft_control_plane(&mut harness.control_plane, &config)
+            .expect("experimental raft control-plane bootstrap should succeed");
+
+        let tmp = short_unix_socket_test_dir("experimental-raft-unix-runtime-map");
+        std::fs::create_dir_all(&tmp).unwrap();
+        let socket_path = tmp.join("control-plane.sock");
+        let server = spawn_experimental_raft_unix_rpc_server(&harness, &socket_path, 31_000);
+        let client = UnixControlPlaneClient::new(&socket_path);
+        let runtime_map = client
+            .runtime_map_snapshot(0)
+            .expect("Unix runtime-map read should succeed");
+        server.join().unwrap();
+
+        assert_eq!(runtime_map.nodes().len(), 1);
+        assert_eq!(runtime_map.nodes()[0].node_id(), NodeId::new(1));
+        assert_eq!(
+            runtime_map.nodes()[0].endpoint(),
+            "/tmp/argmin-experimental-raft-node-1.sock"
+        );
+        assert_eq!(runtime_map.pg_routes().len(), 1);
+        assert_eq!(runtime_map.pg_routes()[0].pg_id(), PgId::new(11));
+        assert_eq!(runtime_map.freshness_proof().issued_at_ms(), Some(31_000));
+        let read_index = runtime_map
+            .freshness_proof()
+            .read_index()
+            .expect("experimental raft runtime-map proof should carry a read index");
+        assert_ne!(read_index.term(), 0);
+        assert_ne!(read_index.index(), 0);
+        assert!(runtime_map.freshness_proof().is_serving_authority_read());
+
+        std::fs::remove_file(&socket_path).unwrap();
+        std::fs::remove_dir_all(&tmp).unwrap();
+        harness.shutdown();
+    }
+
+    #[test]
     fn root_process_check_accepts_non_root_effective_uid() {
         assert_eq!(reject_root_process(1_000), Ok(()));
     }
