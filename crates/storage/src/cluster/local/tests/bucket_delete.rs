@@ -528,6 +528,71 @@ fn bucket_finalize_durable_claim_blocks_second_worker_until_released() {
 }
 
 #[test]
+fn stale_bucket_finalize_claim_for_deleted_generation_does_not_block_recreated_bucket() {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2], ec_shape).unwrap();
+    let bucket = {
+        let topology = map
+            .nodes
+            .get(&NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        bucket_for_pg(topology, 1, "delete-finalize-stale-claim-")
+    };
+    set_route_primary(&mut map, 1, NodeId::new(1));
+    let map = Arc::new(map);
+    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    create_test_bucket(&cluster, &bucket);
+    cluster.begin_bucket_delete(&bucket).unwrap();
+
+    let primary_pg = map
+        .node(NodeId::new(1))
+        .unwrap()
+        .storage_node()
+        .get_pg(1)
+        .unwrap();
+    let old_deleting = crate::PgMetadataStore::head_bucket_record_raw(&*primary_pg, &bucket)
+        .expect("old bucket should be deleting");
+    let _stale_claim = crate::PgMetadataStore::acquire_bucket_delete_finalize_claim(
+        &*primary_pg,
+        &bucket,
+        old_deleting.bucket_incarnation_generation,
+        "stale-finalizer-claim",
+        "worker-that-lost-response",
+        ClusterEpoch::INITIAL,
+        10,
+        Some(70_000),
+        10,
+    )
+    .unwrap()
+    .expect("old delete generation should be claimable");
+    drop(primary_pg);
+
+    for node_id in node_ids {
+        let pg = map.node(node_id).unwrap().storage_node().get_pg(1).unwrap();
+        crate::PgMetadataStore::delete_finalized_bucket(&*pg, &bucket)
+            .expect("test should be able to simulate old-generation finalizer row deletion");
+    }
+
+    create_test_bucket(&cluster, &bucket);
+    let recreated = cluster.test_head_bucket_raw(&bucket).unwrap();
+    assert!(
+        recreated.bucket_incarnation_generation > old_deleting.bucket_incarnation_generation,
+        "recreated bucket must have a distinct incarnation"
+    );
+
+    cluster.begin_bucket_delete(&bucket).unwrap();
+    assert_eq!(
+        cluster.try_finalize_bucket_delete(&bucket).unwrap(),
+        crate::BucketDeleteFinalizeOutcome::Finalized,
+        "a live stale finalizer claim for a deleted generation must not block recreated bucket finalization"
+    );
+}
+
+#[test]
 fn finalized_bucket_delete_releases_finalizer_claim_for_next_same_pg_bucket() {
     let tmp = test_util::tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
@@ -3504,6 +3569,125 @@ fn begin_bucket_delete_renews_drain_after_final_visibility_proof_before_retryabl
 }
 
 #[test]
+fn begin_bucket_delete_route_expiry_after_final_visibility_preserves_for_fenced_retry() {
+    let _serial = lock_bucket_scoped_hook_test();
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2], ec_shape).unwrap();
+    let bucket = {
+        let topology = map
+            .nodes
+            .get(&NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        bucket_for_pg(topology, 1, "delete-route-expiry-after-proof-")
+    };
+    set_route_primary(&mut map, 1, NodeId::new(1));
+
+    let map = Arc::new(map);
+    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    create_test_bucket(&cluster, &bucket);
+    let initial_bucket = cluster.test_head_bucket_raw(&bucket).unwrap();
+
+    let hook_ran = Arc::new(AtomicBool::new(false));
+    let hook_ran_for_hook = Arc::clone(&hook_ran);
+    let route_expiry_hook_guard = cluster
+        .test_install_after_bucket_delete_final_visibility_proven_hook(Arc::new(move || {
+            hook_ran_for_hook.store(true, Ordering::SeqCst);
+            Err(StoreError::RouteMapExpired {
+                cluster_epoch: ClusterEpoch::INITIAL,
+                valid_until_ms: 0,
+                now_ms: 1,
+            })
+        }));
+
+    let err = cluster.begin_bucket_delete(&bucket).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            crate::BucketWriteDrainError::Store(StoreError::RouteMapExpired { .. })
+        ),
+        "expected injected route expiry after final visibility proof, got {err:?}"
+    );
+    assert!(
+        hook_ran.load(Ordering::SeqCst),
+        "route-expiry hook should run after final visibility is proven"
+    );
+
+    let bucket_pg_id = PgId::new(cluster.bucket_metadata_pg_id(&bucket));
+    let bucket_pg = map
+        .node(NodeId::new(1))
+        .unwrap()
+        .storage_node()
+        .get_pg(bucket_pg_id.get())
+        .unwrap();
+    let preserved_drain = crate::PgMetadataStore::durable_bucket_write_drain(&*bucket_pg, &bucket)
+        .unwrap()
+        .expect("route expiry after final visibility should preserve the delete drain");
+    let outcome = crate::PgMetadataStore::bucket_delete_attempt_outcome(&*bucket_pg, &bucket)
+        .unwrap()
+        .expect("route expiry after final visibility should record attempt progress");
+    assert_eq!(
+        outcome.outcome,
+        crate::BucketDeleteAttemptOutcomeKind::Retryable
+    );
+    assert_eq!(
+        outcome.phase,
+        crate::BucketDeleteAttemptPhase::FinalVisibilityProven
+    );
+    assert_eq!(outcome.drain_id, preserved_drain.drain_id);
+    drop(bucket_pg);
+
+    let resume_root = match cluster.try_take_reclaim_work() {
+        Some(crate::ReclaimWorkItem::BucketDeleteBegin(root)) => root,
+        other => {
+            panic!("route-expired DeleteBucket begin should queue fenced resume, got {other:?}")
+        }
+    };
+    assert_eq!(resume_root.bucket, bucket);
+    assert_eq!(
+        resume_root.bucket_execution_generation,
+        initial_bucket.bucket_execution_generation
+    );
+    assert_eq!(
+        resume_root.bucket_incarnation_generation,
+        initial_bucket.bucket_incarnation_generation
+    );
+
+    drop(route_expiry_hook_guard);
+    cluster
+        .begin_bucket_delete_if_current(
+            &resume_root.bucket,
+            resume_root.bucket_execution_generation,
+            resume_root.bucket_incarnation_generation,
+        )
+        .expect("fenced retry should adopt the preserved route-expired attempt");
+
+    let bucket_pg = map
+        .node(NodeId::new(1))
+        .unwrap()
+        .storage_node()
+        .get_pg(bucket_pg_id.get())
+        .unwrap();
+    let info = crate::PgMetadataStore::head_bucket_raw(&*bucket_pg, &bucket).unwrap();
+    assert_eq!(info.state, crate::BucketState::Deleting);
+    let final_outcome = crate::PgMetadataStore::bucket_delete_attempt_outcome(&*bucket_pg, &bucket)
+        .unwrap()
+        .expect("successful fenced retry should record terminal outcome");
+    assert_eq!(
+        final_outcome.outcome,
+        crate::BucketDeleteAttemptOutcomeKind::MarkDeleting
+    );
+    assert_eq!(
+        final_outcome.phase,
+        crate::BucketDeleteAttemptPhase::MarkDeleting
+    );
+    assert_eq!(final_outcome.drain_id, preserved_drain.drain_id);
+}
+
+#[test]
 fn begin_bucket_delete_committed_response_loss_retry_observes_deleting() {
     let _serial = lock_metadata_command_apply_hook_test();
     let tmp = test_util::tempdir();
@@ -3994,6 +4178,110 @@ fn begin_bucket_delete_adopts_reservation_wait_phase_without_repeating_initial_s
         crate::BucketDeleteAttemptOutcomeKind::MarkDeleting
     );
     assert_eq!(outcome.phase, crate::BucketDeleteAttemptPhase::MarkDeleting);
+    assert_eq!(outcome.drain_id, drain.record.drain_id);
+}
+
+#[test]
+fn begin_bucket_delete_adopted_attempt_clears_drain_on_bucket_not_empty() {
+    let _serial = lock_bucket_scoped_hook_test();
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2], ec_shape).unwrap();
+    let (bucket, key) = {
+        let topology = map
+            .nodes
+            .get(&NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        let bucket = bucket_for_pg(topology, 1, "delete-adopt-not-empty-");
+        let key = key_for_object_pg(topology, &bucket, 2, "object-");
+        (bucket, key)
+    };
+    set_route_primary(&mut map, 1, NodeId::new(1));
+    set_route_primary(&mut map, 2, NodeId::new(2));
+
+    let map = Arc::new(map);
+    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    create_test_bucket(&cluster, &bucket);
+    write_committed_direct_segment_for_with_okh(
+        &cluster,
+        &bucket,
+        &key,
+        [0x5d; 16],
+        b"visible object after preserved delete attempt",
+    );
+
+    let drain = match cluster.begin_durable_bucket_delete_drain(&bucket).unwrap() {
+        crate::cluster::DurableBucketDeleteDrainBegin::Acquired(drain) => drain,
+        crate::cluster::DurableBucketDeleteDrainBegin::AlreadyDeleting => {
+            panic!("fresh active bucket should acquire delete drain")
+        }
+    };
+    let bucket_pg_id = PgId::new(drain.pg_id);
+    let bucket_pg_primary = map
+        .metadata_pg_primary_node(crate::ClusterEpoch::INITIAL, bucket_pg_id)
+        .unwrap();
+    let bucket_pg = bucket_pg_primary
+        .storage_node()
+        .get_pg(bucket_pg_id.get())
+        .unwrap();
+    crate::PgMetadataStore::record_bucket_delete_attempt_outcome(
+        &*bucket_pg,
+        &crate::BucketDeleteAttemptOutcomeRecord {
+            bucket: bucket.clone(),
+            drain_id: drain.record.drain_id.clone(),
+            cluster_epoch: drain.record.cluster_epoch,
+            bucket_execution_generation: drain.record.bucket_execution_generation,
+            outcome: crate::BucketDeleteAttemptOutcomeKind::Retryable,
+            phase: crate::BucketDeleteAttemptPhase::ReservationWait,
+            detail: "resume from reservation wait before terminal not-empty".to_string(),
+            post_reservation_next_object_pg_id: None,
+            updated_at: crate::clock::current_time_millis(),
+        },
+    )
+    .unwrap();
+    drop(bucket_pg);
+
+    let err = cluster.begin_bucket_delete(&bucket).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            crate::BucketWriteDrainError::Metadata(crate::MetadataError::BucketNotEmpty)
+        ),
+        "adopted DeleteBucket attempt should return terminal BucketNotEmpty, got {err:?}"
+    );
+
+    let bucket_pg = map
+        .node(NodeId::new(1))
+        .unwrap()
+        .storage_node()
+        .get_pg(bucket_pg_id.get())
+        .unwrap();
+    assert!(
+        crate::PgMetadataStore::durable_bucket_write_drain(&*bucket_pg, &bucket)
+            .unwrap()
+            .is_none(),
+        "terminal BucketNotEmpty after adoption must clear the preserved delete drain"
+    );
+    let info = crate::PgMetadataStore::head_bucket_raw(&*bucket_pg, &bucket).unwrap();
+    assert_eq!(
+        info.state,
+        crate::BucketState::Active,
+        "terminal BucketNotEmpty must leave the bucket active"
+    );
+    let outcome = crate::PgMetadataStore::bucket_delete_attempt_outcome(&*bucket_pg, &bucket)
+        .unwrap()
+        .expect("terminal adopted attempt should record the not-empty outcome");
+    assert_eq!(
+        outcome.outcome,
+        crate::BucketDeleteAttemptOutcomeKind::NotEmpty
+    );
+    assert_eq!(
+        outcome.phase,
+        crate::BucketDeleteAttemptPhase::FinalVisibilityCheck
+    );
     assert_eq!(outcome.drain_id, drain.record.drain_id);
 }
 

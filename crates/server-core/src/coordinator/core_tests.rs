@@ -975,6 +975,82 @@ fn reclaim_worker_retries_bucket_delete_begin_after_early_route_map_failure() {
 }
 
 #[test]
+fn bucket_delete_begin_marks_deleting_on_retained_route_after_runtime_map_primary_move() {
+    let tmp = test_util::tempdir();
+    let bucket = trusted_bucket_name("bucket-delete-begin-retained-route");
+    let initial = open_test_storage_cluster(tmp.path(), &[0, 1, 2]);
+    let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&initial));
+    let direct_coord = setup_direct_coordinator_with_storage_cluster(Arc::clone(&initial));
+    direct_coord
+        .create_bucket_for_owner("default-owner", bucket.as_str(), false)
+        .unwrap();
+    let bucket_identity = initial.test_head_bucket_raw(&bucket).unwrap();
+    let bucket_pg_id = PgId::new(initial.test_bucket_pg_id_for(&bucket));
+    assert_eq!(
+        initial
+            .local_pg_route(bucket_pg_id)
+            .expect("initial bucket PG route should exist")
+            .primary_node_id(),
+        NodeId::new(0),
+        "test assumes the pinned route starts on node 0"
+    );
+
+    let installed_next_epoch = Arc::new(AtomicBool::new(false));
+    let installed_next_epoch_for_hook = Arc::clone(&installed_next_epoch);
+    let handle_for_hook = handle.clone();
+    let initial_for_hook = Arc::clone(&initial);
+    let node_root = tmp.path().to_path_buf();
+    let _hook_guard = initial.test_install_after_bucket_delete_final_visibility_proven_hook(
+        Arc::new(move || {
+            install_same_store_next_epoch_runtime_map_with_primary(
+                &handle_for_hook,
+                &initial_for_hook,
+                &node_root,
+                NodeId::new(1),
+            );
+            installed_next_epoch_for_hook.store(true, Ordering::SeqCst);
+            Ok(())
+        }),
+    );
+
+    initial
+        .begin_bucket_delete(&bucket)
+        .expect("pinned DeleteBucket begin should commit on retained route after runtime-map move");
+    assert!(
+        installed_next_epoch.load(Ordering::SeqCst),
+        "test hook should install the next-epoch route map before mark-deleting apply"
+    );
+
+    let current = handle.current();
+    assert_eq!(
+        current.cluster_epoch().get(),
+        initial.cluster_epoch().get() + 1,
+        "runtime map should advance while the pinned operation is still running"
+    );
+    assert_eq!(
+        current
+            .local_pg_route(bucket_pg_id)
+            .expect("current bucket PG route should exist")
+            .primary_node_id(),
+        NodeId::new(1),
+        "current route should move the bucket PG primary away from the pinned route"
+    );
+    let current_info = current
+        .test_head_bucket_raw(&bucket)
+        .expect("current route should observe the retained-route commit");
+    assert_eq!(current_info.state, storage::BucketState::Deleting);
+    assert_eq!(
+        current_info.bucket_execution_generation,
+        bucket_identity.bucket_execution_generation + 1,
+        "retained-route mark-deleting should apply exactly once to the same bucket generation"
+    );
+    assert_eq!(
+        current_info.bucket_incarnation_generation,
+        bucket_identity.bucket_incarnation_generation
+    );
+}
+
+#[test]
 fn reclaim_worker_adopts_bucket_delete_begin_after_partial_frontier() {
     let tmp = test_util::tempdir();
     let pg_ids: Vec<u32> = (0..32).collect();
@@ -1744,6 +1820,20 @@ fn install_same_store_next_epoch_runtime_map(
     initial: &Arc<StorageCluster>,
     node_root: &std::path::Path,
 ) {
+    install_same_store_next_epoch_runtime_map_with_primary(
+        handle,
+        initial,
+        node_root,
+        NodeId::new(0),
+    );
+}
+
+fn install_same_store_next_epoch_runtime_map_with_primary(
+    handle: &StorageClusterRuntimeMapHandle,
+    initial: &Arc<StorageCluster>,
+    node_root: &std::path::Path,
+    primary_node_id: NodeId,
+) {
     let node_count = u32::from(initial.default_payload_ec_shape().k)
         + u32::from(initial.default_payload_ec_shape().m);
     let configs = (0..node_count)
@@ -1763,7 +1853,7 @@ fn install_same_store_next_epoch_runtime_map(
             let route = storage::control_plane::PgRouteSnapshot::reconstructed(
                 next_epoch,
                 PgId::new(*pg_id),
-                NodeId::new(0),
+                primary_node_id,
                 acting_set.clone(),
                 PgState::Active,
             );

@@ -676,19 +676,42 @@ when prioritised. They correspond to the remaining findings from the Phase 11 re
     observe the same bucket incarnation as already deleting without reapplying against
     a recreated bucket, and must clear any terminal pending command left by the lost
     response.
-  - `S6-BD2`: B5 route change during DeleteBucket begin. Pin the old route, advance
-    the runtime map before or during mark-deleting apply, and assert begin either
-    commits exactly once on the retained route or fails closed with the durable
-    attempt preserved for fenced adoption.
-  - `S6-BD3`: B4 finalizer retained-route cleanup. Start from a `Deleting` bucket,
-    move routes before reclaim/finalized-row cleanup, and assert finalization uses
-    the retained bucket generation/proof and cannot affect a recreated bucket.
-  - `S6-BD4`: no-client worker adoption. Durable begin/finalizer work must survive
-    response loss, dequeue, and restart, then continue through the same cursor/adoption
-    state without requiring another client `DeleteBucket`.
-  - `S6-BD5`: terminal not-empty after preserved drain. If adoption reaches a real
-    terminal `BucketNotEmpty`, the preserved drain/fence is cleared or terminally
-    recorded so the bucket is not left artificially write-fenced.
+  - `S6-BD2`:
+    `bucket_delete_begin_marks_deleting_on_retained_route_after_runtime_map_primary_move`
+    in `crates/server-core/src/coordinator/core_tests.rs` covers B5 route change
+    during DeleteBucket begin: the pinned operation proves final visibility, the
+    runtime map advances to a next epoch with a different bucket-PG primary before
+    mark-deleting apply, and the operation commits exactly once on the retained
+    route so the current map observes the same bucket incarnation as `Deleting`.
+    `begin_bucket_delete_route_expiry_after_final_visibility_preserves_for_fenced_retry`
+    in `crates/storage/src/cluster/local/tests/bucket_delete.rs` separately covers
+    route-map expiry after final visibility: the attempt is preserved and a fenced
+    retry root can adopt the same drain and mark the bucket deleting.
+  - `S6-BD3`:
+    `stale_bucket_finalize_claim_for_deleted_generation_does_not_block_recreated_bucket`
+    and `stale_delete_drain_identity_cannot_clear_recreated_bucket_drain` in
+    `crates/storage/src/cluster/local/tests/bucket_delete.rs` cover B4 finalizer
+    retained-generation cleanup. A finalizer claim or drain from a deleted bucket
+    generation must not block or clear the recreated bucket generation, and a
+    recreated bucket must be finalized through its own generation proof.
+  - `S6-BD4`: `reclaim_worker_adopts_bucket_delete_begin_after_partial_frontier`,
+    `reclaim_worker_adopts_bucket_delete_begin_from_stream_cleanup_phase`,
+    `reclaim_worker_adopts_bucket_delete_begin_from_reservation_wait_phase`,
+    `reclaim_worker_adopts_bucket_delete_begin_from_final_visibility_phase`, and
+    `reclaim_worker_adopts_bucket_delete_begin_from_final_visibility_proven_phase`
+    in `crates/server-core/src/coordinator/core_tests.rs`, plus
+    `finalized_bucket_delete_after_reopen_does_not_need_begin_waiter` and
+    `durable_bucket_finalize_scan_recovers_lost_local_queue_after_reopen` in
+    `crates/storage/src/cluster/local/tests/bucket_delete.rs`, cover no-client
+    worker adoption. Durable begin/finalizer work survives response loss, dequeue,
+    and restart, then continues through the same cursor/adoption state without
+    requiring another client `DeleteBucket`.
+  - `S6-BD5`:
+    `begin_bucket_delete_adopted_attempt_clears_drain_on_bucket_not_empty` in
+    `crates/storage/src/cluster/local/tests/bucket_delete.rs` covers terminal
+    not-empty after preserved drain. If adoption reaches a real terminal
+    `BucketNotEmpty`, the preserved drain/fence is cleared and the not-empty
+    outcome is recorded so the bucket is not left artificially write-fenced.
 
   Harness requirements:
   - failpoints must be named and token-scoped; no sleeps or global "next operation" hooks

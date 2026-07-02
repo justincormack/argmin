@@ -8499,9 +8499,6 @@ impl PgMetadataStore for PgStore {
                     {
                         return Ok(Some(existing));
                     }
-                    if existing.lease_deadline.is_none_or(|deadline| deadline > now) {
-                        return Ok(None);
-                    }
                     if !same_work {
                         let existing_bucket_still_deleting = store
                             .conn
@@ -8531,9 +8528,11 @@ impl PgMetadataStore for PgStore {
                                 [],
                             )
                             .map_err(|source| MetadataError::Db {
-                                context: "clear expired terminal bucket delete finalize claim",
+                                context: "clear stale terminal bucket delete finalize claim",
                                 source,
                             })?;
+                    } else if existing.lease_deadline.is_none_or(|deadline| deadline > now) {
+                        return Ok(None);
                     } else {
                         attempt_count =
                             i64::try_from(existing.attempt_count.saturating_add(1)).map_err(
