@@ -774,7 +774,7 @@ fn transfer_control_plane_pg_metadata_live(
         return Ok(summary);
     }
     let fenced = control_plane
-        .fence_pg_for_metadata_transfer_runtime_map_with_source_lease(pg_id)
+        .fence_pg_for_metadata_transfer_runtime_map_with_source_lease_checked(pg_id)
         .map_err(|error| format!("failed to fence live PG for metadata transfer: {error}"))?;
     let (fenced_runtime, source_lease_deadline_ms) = fenced.into_parts();
     let source_node_id = metadata_transfer_peering_source_node_id(&fenced_runtime, pg_id)?;
@@ -782,7 +782,7 @@ fn transfer_control_plane_pg_metadata_live(
         wait_for_metadata_transfer_source_lease_to_expire(source_lease_deadline_ms);
     }
     let source_runtime = control_plane
-        .fence_pg_for_metadata_transfer_runtime_map(pg_id)
+        .fence_pg_for_metadata_transfer_runtime_map_checked(pg_id)
         .map_err(|error| format!("failed to refresh fenced PG metadata transfer map: {error}"))?;
     metadata_transfer_peering_source_route_matches(&source_runtime, pg_id, source_node_id)?;
     maybe_fail_metadata_transfer_live(failpoint, MetadataTransferLiveFailpoint::Fence)?;

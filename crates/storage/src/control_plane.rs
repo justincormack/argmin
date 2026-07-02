@@ -4039,6 +4039,49 @@ impl UnixControlPlaneClient {
         }
     }
 
+    fn validate_metadata_transfer_fence_response(
+        &self,
+        pg_id: PgId,
+        fenced: FencedPgMetadataTransferRuntimeMap,
+    ) -> Result<FencedPgMetadataTransferRuntimeMap, ControlPlaneError> {
+        if metadata_transfer_fence_observable(fenced.runtime_map(), pg_id) {
+            return Ok(fenced);
+        }
+        Err(ControlPlaneError::RpcUnconfirmed {
+            message: format!(
+                "metadata-transfer fence for PG {} returned runtime map without an observable peering route",
+                pg_id.get()
+            ),
+        })
+    }
+
+    fn retry_metadata_transfer_fence_after_response_loss(
+        &self,
+        pg_id: PgId,
+    ) -> Result<FencedPgMetadataTransferRuntimeMap, ControlPlaneError> {
+        let deadline = Instant::now() + CONTROL_PLANE_RPC_CHECK_APPLIED_DEADLINE;
+        loop {
+            match self
+                .fence_pg_for_metadata_transfer_runtime_map_with_source_lease(pg_id)
+                .and_then(|fenced| self.validate_metadata_transfer_fence_response(pg_id, fenced))
+            {
+                Ok(fenced) => return Ok(fenced),
+                Err(error) if error.is_maybe_applied_control_plane_rpc_response_loss() => {
+                    if Instant::now() >= deadline {
+                        return Err(ControlPlaneError::RpcUnconfirmed {
+                            message: format!(
+                                "metadata-transfer fence for PG {} was not confirmed after lost control-plane RPC response: {error}",
+                                pg_id.get()
+                            ),
+                        });
+                    }
+                    std::thread::sleep(CONTROL_PLANE_RPC_CHECK_APPLIED_BACKOFF);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
     pub fn set_pg_acting_set(
         &self,
         pg_id: PgId,
@@ -4085,6 +4128,16 @@ impl UnixControlPlaneClient {
             .0)
     }
 
+    pub fn fence_pg_for_metadata_transfer_runtime_map_checked(
+        &self,
+        pg_id: PgId,
+    ) -> Result<ClusterRuntimeMapSnapshot, ControlPlaneError> {
+        Ok(self
+            .fence_pg_for_metadata_transfer_runtime_map_with_source_lease_checked(pg_id)?
+            .into_parts()
+            .0)
+    }
+
     pub fn fence_pg_for_metadata_transfer_runtime_map_with_source_lease(
         &self,
         pg_id: PgId,
@@ -4103,6 +4156,22 @@ impl UnixControlPlaneClient {
             runtime_map,
             source_primary_lease_deadline_ms,
         ))
+    }
+
+    pub fn fence_pg_for_metadata_transfer_runtime_map_with_source_lease_checked(
+        &self,
+        pg_id: PgId,
+    ) -> Result<FencedPgMetadataTransferRuntimeMap, ControlPlaneError> {
+        match self
+            .fence_pg_for_metadata_transfer_runtime_map_with_source_lease(pg_id)
+            .and_then(|fenced| self.validate_metadata_transfer_fence_response(pg_id, fenced))
+        {
+            Ok(fenced) => Ok(fenced),
+            Err(error) if error.is_maybe_applied_control_plane_rpc_response_loss() => {
+                self.retry_metadata_transfer_fence_after_response_loss(pg_id)
+            }
+            Err(error) => Err(error),
+        }
     }
 
     pub fn set_pg_acting_set_with_metadata_transfer(
@@ -4240,6 +4309,17 @@ fn metadata_transfer_install_applied(
                 && route.acting_set() == acting_set
                 && route.peering_metadata_transfer() == Some(transfer)
         })
+}
+
+fn metadata_transfer_fence_observable(
+    runtime_map: &ClusterRuntimeMapSnapshot,
+    pg_id: PgId,
+) -> bool {
+    runtime_map
+        .pg_routes()
+        .iter()
+        .find(|route| route.pg_id() == pg_id)
+        .is_some_and(|route| route.state() == PgState::Peering)
 }
 
 impl ControlPlaneHeartbeatRuntimeMapSource for UnixControlPlaneClient {
@@ -9560,6 +9640,96 @@ mod tests {
         let same_epoch = retry_snapshot.cluster_epoch();
         assert_eq!(same_epoch, reopened_epoch);
         assert_eq!(retry_source_lease_deadline_ms, Some(2_102));
+    }
+
+    #[test]
+    fn unix_control_plane_client_retries_convergent_fence_after_lost_response() {
+        let tmp = test_util::tempdir();
+        let socket_path = tmp.path().join("control-plane.sock");
+        let state_path = tmp.path().join("control-plane.state");
+        let store = FileControlPlaneStore::new(&state_path);
+        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+        authority
+            .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
+            .unwrap();
+        assert!(heartbeat_until_serving(&mut authority, 1, 1_000).serving());
+        let active_proof = PgMetadataProof::new(9, 10, 11);
+        authority
+            .set_pg_acting_set(PgId::new(44), vec![NodeId::new(1)])
+            .unwrap();
+        heartbeat_with_pg_proof(
+            &mut authority,
+            1,
+            44,
+            PgState::Peering,
+            active_proof,
+            false,
+            2_000,
+        );
+        authority
+            .complete_pg_peering(
+                PgId::new(44),
+                NodeId::new(1),
+                node_incarnation(&authority, 1),
+                2_001,
+            )
+            .unwrap();
+        heartbeat_with_pg_proof(
+            &mut authority,
+            1,
+            44,
+            PgState::Active,
+            active_proof,
+            false,
+            2_002,
+        );
+        let active_epoch = authority.snapshot().cluster_epoch();
+        let expected_fence_epoch = ClusterEpoch::new(active_epoch.get() + 1).unwrap();
+        let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+        let server = std::thread::spawn(move || {
+            for request_number in 0..2 {
+                let (mut stream, _addr) = listener.accept().unwrap();
+                let request = read_control_plane_unix_request(&mut stream).unwrap();
+                assert_eq!(
+                    request.kind,
+                    ControlPlaneRpcKind::FencePgForMetadataTransferRuntimeMap
+                );
+                if request_number == 0 {
+                    let response =
+                        build_control_plane_unix_response(&mut authority, request, 2_003)
+                            .expect("metadata-transfer fence should apply before response loss");
+                    assert_eq!(
+                        response.kind,
+                        ControlPlaneRpcKind::FencePgForMetadataTransferRuntimeMap
+                    );
+                    assert_eq!(authority.snapshot().cluster_epoch(), expected_fence_epoch);
+                    drop(response);
+                    drop(stream);
+                } else {
+                    respond_control_plane_unix_request(&mut authority, &mut stream, request, 2_004)
+                        .unwrap();
+                }
+            }
+            assert_eq!(authority.snapshot().cluster_epoch(), expected_fence_epoch);
+        });
+
+        let client = UnixControlPlaneClient::new(&socket_path);
+        let fenced = client
+            .fence_pg_for_metadata_transfer_runtime_map_with_source_lease_checked(PgId::new(44))
+            .unwrap();
+
+        server.join().unwrap();
+        assert_eq!(fenced.runtime_map().cluster_epoch(), expected_fence_epoch);
+        assert_eq!(fenced.source_primary_lease_deadline_ms(), Some(2_102));
+        let route = fenced
+            .runtime_map()
+            .pg_routes()
+            .iter()
+            .find(|route| route.pg_id() == PgId::new(44))
+            .unwrap();
+        assert_eq!(route.state(), PgState::Peering);
+        assert_eq!(route.acting_set(), &[NodeId::new(1)]);
+        assert_eq!(route.primary_lease_deadline_ms(), None);
     }
 
     #[test]
