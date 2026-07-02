@@ -502,9 +502,9 @@ when prioritised. They correspond to the remaining findings from the Phase 11 re
   | CompleteMultipartUpload | Covered locally before multipart commit apply, matching pending completion, and terminal cleanup after already-recorded completion: `S6-CMP1`, `S6-CMP4`. | Covered locally and through installed Unix clients for stale epoch and real Peering: `S6-CMP2`, `S6-CMP3`. | No current Slice 6 CompleteMultipartUpload gap named. |
   | AbortMultipartUpload | Covered for coordinator route-map pinning, command-conflict mapping, storage-level partial apply/reopen, matching pending abort, zero-apply retry, exact B3 committed-abort response-loss retry, and API-level second-abort behavior: `S6-ABORT1`, `S6-ABORT2`, `S6-ABORT6`, `S6-ABORT7`. | Covered locally and through installed Unix clients for real-Peering stale-primary abort rejection in `S6-ABORT4` and `S6-ABORT5`; stale upload-row and multipart-trace stale snapshot coverage exists in `S6-ABORT3`. | No current Slice 6 AbortMultipartUpload gap named. |
   | UploadPart stream finalization | Covered locally before `CommitStreamPart` apply across an epoch change, including UploadPartCopy-shaped copied segments, storage retry/finalize cleanup, and exact B3 committed-part response-loss retry: `S6-UPF1`, `S6-UPF2`, `S6-UPF4`. | Covered by installed Unix stale/Peering paths for UploadPart and UploadPartCopy finalization: `S6-UPF3`. | No current Slice 6 UploadPart stream-finalization gap named. |
-  | UploadPart stream-session creation | Covered by coordinator route-map pinning and storage create retry/reservation tests: `S6-UPC1`, `S6-UPC2`. | Covered through installed Unix stale/Peering paths with no session, segment rows, pending command, or reservation leak: `S6-UPC3`. | Add a minimal B2 pending-slot/reservation crossing test if the existing command tests do not hit it precisely enough. |
-  | GET/HEAD payload reads | Covered locally after metadata snapshot and by installed-Unix retained-route read: `S6-READ1`, `S6-READ2`. | Covered for object metadata PG Peering fail-closed: `S6-READ3`. | Add an explicit malformed/stale current-route negative where a current-route payload read cannot accidentally succeed after disjoint placement. |
-  | Object and version LIST | Covered locally across route-map swaps during listing and pagination, including delimiter/common-prefix continuation: `S6-LIST1`; UAT route-change smokes cover process-level retained-list behavior. | Covered for composite/listing Peering fail-closed at storage level: `S6-LIST2`; read/list object metadata PG Peering fail-closed is also in `S6-READ3`. | Add a deterministic multi-object-PG LIST route-change matrix if pagination coverage does not already span object-PG movement. |
+  | UploadPart stream-session creation | Covered by coordinator route-map pinning, direct B2 pending-slot/reservation reopen convergence, and storage create retry/reservation tests: `S6-UPC1`, `S6-UPC2`. | Covered through installed Unix stale/Peering paths with no session, segment rows, pending command, or reservation leak: `S6-UPC3`. | No current Slice 6 UploadPart stream-session creation gap named. |
+  | GET/HEAD payload reads | Covered locally after metadata snapshot and by installed-Unix retained-route read, including a disjoint-placement current-route negative before retained-route success: `S6-READ1`, `S6-READ2`. | Covered for object metadata PG Peering fail-closed: `S6-READ3`. | No current Slice 6 GET/HEAD payload read gap named. |
+  | Object and version LIST | Covered locally across route-map swaps during listing and pagination, including delimiter/common-prefix continuation and a deterministic multi-object-PG list crossing: `S6-LIST1`; UAT route-change smokes cover process-level retained-list behavior. | Covered for composite/listing Peering fail-closed at storage level: `S6-LIST2`; read/list object metadata PG Peering fail-closed is also in `S6-READ3`. | No current Slice 6 LIST gap named. |
   | DeleteBucket begin/finalize | Covered by a separate bucket-delete hardening plan and many recent regressions. | Partially covered, but recent soak failures show this is still the largest open correctness/robustness area. | Keep this out of the generic matrix except for shared failpoint API reuse; track durable attempt/adoption/finalizer interleavings in the bucket-delete plan. |
   | Control-plane PG transitions | Slice 4 covers `open -> mutate -> save -> reload -> continue` for current transitions. | Stale runtime-map and stale authorization fail-closed coverage exists. | Slice 7 handles lost-response/check-applied behavior for mutating control-plane RPCs. |
 
@@ -632,10 +632,12 @@ when prioritised. They correspond to the remaining findings from the Phase 11 re
     `upload_part_copy_pins_runtime_map_after_stream_session_create`, and
     `upload_part_append_request_maps_command_log_conflict_to_operation_aborted`
     in `crates/server-core/src/coordinator/core_tests.rs`.
-  - `S6-UPC2`: `upload_part_stream_create_zero_apply_reopens_and_converges`,
-    `begin_upload_part_stream_pending_install_race_reruns_action`, and
-    `begin_upload_part_stream_drains_pending_completion_before_create`
-    in `crates/storage/src/cluster/local/tests/multipart.rs`.
+  - `S6-UPC2`: `upload_part_stream_create_zero_apply_reopens_and_converges`
+    covers direct B2 pending-slot/reservation reopen convergence;
+    `begin_upload_part_stream_pending_install_race_reruns_action` and
+    `begin_upload_part_stream_drains_pending_completion_before_create` cover
+    live contender drain/retry behavior in
+    `crates/storage/src/cluster/local/tests/multipart.rs`.
   - `S6-UPC3`: `non_current_epoch_unix_upload_part_stream_session_create_fails_closed_without_remote_mutation`,
     `control_plane_peering_unix_upload_part_session_old_primary_fails_closed_without_remote_mutation`
     in `crates/storage/src/cluster/local/tests/unix_clients.rs`.
@@ -644,12 +646,16 @@ when prioritised. They correspond to the remaining findings from the Phase 11 re
     and `get_uses_retained_payload_route_over_unix_after_data_pg_move_and_metadata_reads_stay_available`
     in `crates/server-core/src/coordinator/core_tests.rs`.
   - `S6-READ2`: `cross_epoch_segment_read_uses_retained_route_over_unix_storage_nodes`
-    in `crates/storage/src/cluster/local/tests/unix_clients.rs`.
+    in `crates/storage/src/cluster/local/tests/unix_clients.rs`; this uses disjoint old/new
+    acting sets, asserts the current-route read fails, then verifies the retained
+    placement-epoch read succeeds.
   - `S6-READ3`: `read_and_list_fail_closed_while_object_metadata_pg_is_peering`
     in `crates/server-core/src/coordinator/core_tests.rs` and
     `object_read_snapshot_fails_closed_while_metadata_pg_is_peering`
     in `crates/storage/src/cluster/local/tests/object_read.rs`.
-  - `S6-LIST1`: `list_objects_epoch_change_before_storage_list_uses_pinned_route`,
+  - `S6-LIST1`: `list_objects_epoch_change_before_storage_list_uses_pinned_route`
+    uses keys across distinct object metadata PGs and swaps to a historical-route
+    runtime map before storage listing;
     `list_objects_continuation_survives_epoch_change_between_pages`,
     `list_objects_delimiter_continuation_survives_epoch_change_between_pages`,
     `list_object_versions_continuation_survives_epoch_change_between_pages`, and

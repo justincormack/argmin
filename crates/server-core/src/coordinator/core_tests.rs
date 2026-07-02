@@ -3865,7 +3865,21 @@ fn list_objects_epoch_change_before_storage_list_uses_pinned_route() {
         .create_bucket_for_owner("default-owner", bucket, false)
         .unwrap();
 
-    for (key, data) in [("a/1", b"1".as_slice()), ("a/2", b"2"), ("b/1", b"3")] {
+    let pg_ids = initial.test_pg_ids();
+    assert!(
+        pg_ids.len() >= 2,
+        "test requires at least two object metadata PGs"
+    );
+    let key_a = find_key_for_object_metadata_pg_with_prefix(&initial, bucket, pg_ids[0], "a/");
+    let key_b = find_key_for_object_metadata_pg_with_prefix(&initial, bucket, pg_ids[1], "b/");
+    let key_c = find_key_for_object_metadata_pg_with_prefix(&initial, bucket, pg_ids[0], "c/");
+    assert_ne!(
+        initial.test_object_pg_id_for(&trusted_bucket_name(bucket), &trusted_object_key(&key_a)),
+        initial.test_object_pg_id_for(&trusted_bucket_name(bucket), &trusted_object_key(&key_b)),
+        "test fixture must span multiple object metadata PGs"
+    );
+
+    for key in [&key_a, &key_b, &key_c] {
         test_helpers::put_object(
             &coord,
             &PutObjectRequest {
@@ -3873,7 +3887,7 @@ fn list_objects_epoch_change_before_storage_list_uses_pinned_route() {
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
                 object: object_request_with_expected_owner(bucket, key, test_requester(), None),
-                data,
+                data: key.as_bytes(),
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
@@ -3918,7 +3932,7 @@ fn list_objects_epoch_change_before_storage_list_uses_pinned_route() {
         .iter()
         .map(|object| object.key.as_str())
         .collect::<Vec<_>>();
-    assert_eq!(keys, ["a/1", "a/2", "b/1"]);
+    assert_eq!(keys, [key_a.as_str(), key_b.as_str(), key_c.as_str()]);
     assert!(!result.is_truncated);
 }
 
