@@ -117,6 +117,18 @@ fix is local to one mutator.
 
 ### Work items
 
+Status summary:
+
+- **Completed:** recovery semantics, opened-store recovery invocation, cached-table drift
+  detect-and-repair, pending-slot finalization, divergent open-time cleanup consolidation,
+  and storage-node bind coverage for the main recovery classes.
+- **Partially complete:** the generic commit-fault hook and crash-recovery test harness now
+  cover representative generic and hand-written transactions, but the mutator matrix is
+  not yet exhaustive.
+- **Remaining Slice 1 work:** finish the digest-affecting mutator inventory, classify or
+  explicitly transaction-wrap single-statement mutators, and add the missing heavier
+  multipart/stream commit-failure cases.
+
 Progress update:
 
 - `PgStore::recover` exists as an opened-store recovery boundary, and both
@@ -149,6 +161,7 @@ Progress update:
    distinction deliberately.
 
 2. **Recovery is a method on an opened store, invoked by node-identity-owning callers.**
+   **Completed.**
    Recovery needs `node_id`, which neither `PgStore` nor `SharedStorageNode` owns.
    `SharedStorageNode::open` / `open_with_default_ec_shape` (`node.rs:489`/`493`) take only
    data dir, pg ids, and EC shape; node identity is supplied per-call (e.g.
@@ -184,7 +197,8 @@ Progress update:
       also performs the materialised digest verification (see work item 2b);
    4. assert that any surviving pending slot references a live, in-order log entry.
 
-2b. **Cached-table refresh and per-table diagnostics on top of replay validation.** Replay
+2b. **Cached-table refresh and per-table diagnostics on top of replay validation.**
+   **Completed for Slice 1.** Replay
    validation (step 2.iii) already verifies `state.state_digest` against a full materialised
    recompute — `metadata_state_digest()` at `command_log.rs:2882`, which calls
    `metadata_table_digest()` (`command_log.rs:4095`/`4415`, a canonical row scan) per table.
@@ -211,14 +225,13 @@ Progress update:
    genuine corruption (stale trigger producing a wrong stored digest, or a rolled-back
    transaction). The detect step runs only after step 2.iii has already confirmed the stored
    digest, so a mismatch here is cache-only drift with provably-correct materialised state.
-   Decide explicitly whether xor-cancelled per-table drift should fail closed (it indicates a
-   trigger bug — the Slice 2 root cause — and silent refresh could mask it) or warn-and-repair
-   (the materialised state is provably correct, so serving can continue). The recommendation
-   is warn-and-repair for Slice 1 with a prominent trace, and let Slice 2's trigger-body check
-   escalate to fail-closed once the root cause is detectable. Either way, refresh runs only
-   after detection so the diagnostic is meaningful.
+   Slice 1 uses warn-and-repair with a prominent trace: the materialised state has already
+   been proven correct, so recovery refreshes the cached rows before serving. Slice 2's
+   trigger-body check remains the place to detect the stale-trigger root cause and decide
+   whether that should become fail-closed.
 
 3. **Generalise the existing commit-fault hook.** The `fail_next_delete_finalized_bucket_commit`
+   **Partially complete.**
    flag (`pg_store.rs:387`) is a per-mutator test hook. Lift it to a generic
    `fail_next_metadata_txn_commit` hook so the crash-recovery property test (work item 6)
    can inject a commit failure into any digest-affecting transaction, not just finalized
@@ -234,7 +247,8 @@ Progress update:
    classification as crash-atomic single statements or conversion to an explicit
    transaction if their rollback boundary matters.
 
-4. **Make pending-slot removal transactional at the safe finalization boundary.** A first
+4. **Make pending-slot removal transactional at the safe finalization boundary.**
+   **Completed.** A first
    attempt to make `record_metadata_command_applied` delete the matching pending slot proved
    too early: that function is called per replica during fanout, and clearing the primary
    slot as soon as the primary records the command breaks partial-fanout recovery and
@@ -252,7 +266,8 @@ Progress update:
    This keeps the legitimate "applied on some/all replicas but still pending on the primary"
    intermediate state representable, while tightening the actual cleanup operation.
 
-5. **Consolidate the divergent open-time cleanups.** Once `PgStore::recover` reconciles
+5. **Consolidate the divergent open-time cleanups.** **Completed.** Once
+   `PgStore::recover` reconciles
    terminal and orphan slots for every role and every caller:
    - delete `clean_terminal_primary_pending_slot_on_open` (`cluster/local.rs:3868`) and
      fold its bucket-write-reservation release into the recovery pass (or a documented
@@ -271,7 +286,8 @@ Progress update:
    remains necessary for genuine primary-pending commands that have not yet been applied to
    every replica.
 
-6. **Crash-recovery property test for every digest-affecting mutator.** Using the
+6. **Crash-recovery property test for every digest-affecting mutator.**
+   **Partially complete.** Using the
    generalised hook from work item 3, for each metadata-mutating transaction: inject a
    commit failure, reopen the PG through `PgStore::open` then `pg.recover(ctx)`, and assert
    (a) per-table materialised digests match the cached `metadata_table_digests` rows and
@@ -295,7 +311,8 @@ Progress update:
    mutators with no explicit transaction and the heavier multipart completion/stream-part
    transaction paths.
 
-7. **Storage-node restart coverage.** Add a test that opens a PG through
+7. **Storage-node restart coverage.** **Completed for current Slice 1 recovery classes.**
+   Add a test that opens a PG through
    `StorageNodeServer::bind` (the production restart path), after a crash that orphans a
    terminal slot and a commit-failed transaction, and asserts the server does not serve a
    read until recovery has reconciled the state. This pins the path that currently has zero
@@ -309,23 +326,27 @@ Progress update:
 
 ### Exit criteria
 
-1. `PgStore::recover(&self, PgStoreRecoveryContext { node_id })` reconciles
+1. **Completed:** `PgStore::recover(&self, PgStoreRecoveryContext { node_id })` reconciles
    epoch-mismatched orphan and terminal pending slots (in that order) and fails closed on
    materialised-digest or hash-chain mismatch. `PgStore::open` stays raw; recovery is
    invoked by node-identity-owning callers, not threaded through `SharedStorageNode::open`.
-2. `StorageNodeServer::bind` and the local-cluster builder both call `recover` per PG with
-   their node id, so a restarted storage node never serves on an unvalidated PG.
-3. Pending-slot finalization is transactional and exact-match, while
+2. **Completed:** `StorageNodeServer::bind` and the local-cluster builder both call
+   `recover` per PG with their node id, so a restarted storage node never serves on an
+   unvalidated PG.
+3. **Completed:** Pending-slot finalization is transactional and exact-match, while
    `record_metadata_command_applied` remains per-replica recording only so partial-fanout
    recovery remains correct.
-4. The local-cluster build path and the storage-node server share one recovery code path;
-   `clean_terminal_primary_pending_slot_on_open` is removed.
-5. A crash-recovery property test covers every digest-affecting mutator and asserts the
-   five post-recovery invariants above, including materialised-vs-cached digest agreement
-   and that an epoch-mismatched orphan slot does not block recovery.
-6. The reactive heartbeat cleanups (`c5776092`, `791b409c`) remain as a defence-in-depth
-   heartbeat-side check but are no longer the primary correctness mechanism; this is
-   documented in `guides/storage-cluster-invariants.md`.
+4. **Completed:** The local-cluster build path and the storage-node server share one
+   recovery code path; `clean_terminal_primary_pending_slot_on_open` is removed.
+5. **Partially complete:** A crash-recovery property test covers representative
+   digest-affecting mutators and asserts the five post-recovery invariants above,
+   including materialised-vs-cached digest agreement and that an epoch-mismatched orphan
+   slot does not block recovery. Remaining: make this matrix exhaustive, with explicit
+   coverage or classification for single-statement mutators and heavier multipart/stream
+   commit paths.
+6. **Completed:** The reactive heartbeat cleanups (`c5776092`, `791b409c`) remain as a
+   defence-in-depth heartbeat-side check but are no longer the primary correctness
+   mechanism; this is documented in `guides/storage-cluster-invariants.md`.
 
 ### Out of scope for Slice 1
 
