@@ -223,26 +223,29 @@ Progress update:
    can inject a commit failure into any digest-affecting transaction, not just finalized
    bucket delete.
 
-4. **Make pending-slot removal atomic with apply, on an exact full-identity match.** Change
-   `record_metadata_command_applied` (`command_log.rs:3303`) to delete the matching pending
-   slot in the same transaction that records the applied log entry. The match must be on the
-   **full slot identity** — `cluster_epoch + pg_id + log_index + command_checksum +
-   command_bytes + scope_bucket` — not just the command id (epoch/pg/index). The slot
-   carries checksum/bytes/scope precisely so a reissued command at the same id can be
-   distinguished; reusing the existing exact-match helper `pending_slot_terminal_entry_matches`
-   (`command_log.rs:3119`) keeps this consistent. Only remove the slot when it matches the
-   command being applied; do not remove unrelated slots.
+   Progress update: the generic hook now exists on `PgStore` and is consumed by
+   `with_immediate_txn` immediately before `COMMIT`. It rolls back, invalidates the clean
+   digest revision, and returns the caller's normal commit-context error. The old
+   delete-finalized hook still exists for its hand-written transaction path; the generic hook
+   covers the common metadata transaction helper used by most digest-affecting mutators.
 
-   This is deliberately distinct from the broader terminal-slot cleanup in work item 2.iii:
-   - work item 2.iii (`validate_metadata_command_replay_state` with `CleanTerminal`)
-     reconciles *any* terminal slot found during recovery/replay (slots whose command is
-     already in the log, however they got there);
-   - this work item removes *the specific* slot for the command just applied, at the moment
-     of apply, closing the crash window between apply and explicit removal.
+4. **Make pending-slot removal transactional at the safe finalization boundary.** A first
+   attempt to make `record_metadata_command_applied` delete the matching pending slot proved
+   too early: that function is called per replica during fanout, and clearing the primary
+   slot as soon as the primary records the command breaks partial-fanout recovery and
+   reissue paths. The pending slot must survive until the acting set has converged or a
+   recovery/drain path has decided the terminal command can be finalized.
 
-   Both are needed: this one prevents the orphan being created; 2.iii cleans any that exist
-   despite it. Audit the apply path to confirm the slot's `scope_bucket` is available at
-   apply time so the full-identity match is unambiguous.
+   The safe hardening is therefore narrower:
+   - keep `record_metadata_command_applied` as per-replica log/state recording only;
+   - make `remove_pending_metadata_command_slot` transactional, with an exact full-identity
+     match (`cluster_epoch + pg_id + log_index + command_checksum + command_bytes +
+     scope_bucket`) and a terminal log-entry check before removal;
+   - continue using recovery validation (`CleanTerminal`) to reconcile terminal slots left
+     by crashes before this explicit cleanup point.
+
+   This keeps the legitimate "applied on some/all replicas but still pending on the primary"
+   intermediate state representable, while tightening the actual cleanup operation.
 
 5. **Consolidate the divergent open-time cleanups.** Once `PgStore::recover` reconciles
    terminal and orphan slots for every role and every caller:
@@ -271,6 +274,10 @@ Progress update:
    read until recovery has reconciled the state. This pins the path that currently has zero
    recovery.
 
+   Progress update: `StorageNodeServer::bind` now has direct regressions for cleaning a
+   terminal pending metadata command during bind recovery and for failing closed on a
+   corrupted metadata state digest before serving.
+
 ### Exit criteria
 
 1. `PgStore::recover(&self, PgStoreRecoveryContext { node_id })` reconciles
@@ -279,8 +286,9 @@ Progress update:
    invoked by node-identity-owning callers, not threaded through `SharedStorageNode::open`.
 2. `StorageNodeServer::bind` and the local-cluster builder both call `recover` per PG with
    their node id, so a restarted storage node never serves on an unvalidated PG.
-3. `record_metadata_command_applied` removes the matching pending slot atomically with the
-   applied log entry, on a full-identity match (epoch/pg/index/checksum/bytes/scope).
+3. Pending-slot finalization is transactional and exact-match, while
+   `record_metadata_command_applied` remains per-replica recording only so partial-fanout
+   recovery remains correct.
 4. The local-cluster build path and the storage-node server share one recovery code path;
    `clean_terminal_primary_pending_slot_on_open` is removed or narrowed to a documented
    non-recovery responsibility.

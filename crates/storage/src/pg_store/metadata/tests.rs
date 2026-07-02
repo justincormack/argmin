@@ -1330,6 +1330,43 @@ fn delete_finalized_bucket_commit_failure_invalidates_clean_digest_revision() {
 }
 
 #[test]
+fn fail_next_metadata_txn_commit_rolls_back_common_metadata_transaction() {
+    let tmp = test_util::tempdir();
+    let store = PgStore::open(tmp.path(), 1).unwrap();
+    let bucket = trusted_bucket_name("generic-commit-failure");
+
+    store.fail_next_metadata_txn_commit();
+    let err = PgMetadataStore::create_bucket(
+        &store,
+        &bucket,
+        "owner",
+        &CanonicalUserId::from_principal("owner"),
+        &AclGrants::default(),
+        false,
+        false,
+    )
+    .unwrap_err();
+    assert!(matches!(
+        err,
+        MetadataError::Db {
+            context: "create bucket (commit txn)",
+            ..
+        }
+    ));
+    assert!(
+        matches!(
+            store.head_bucket_record_raw(&bucket),
+            Err(MetadataError::BucketNotFound { .. })
+        ),
+        "injected commit failure must roll back the metadata transaction"
+    );
+    assert_eq!(
+        store.clean_metadata_digest_revision.load(Ordering::Relaxed),
+        UNCLEAN_METADATA_DIGEST_REVISION
+    );
+}
+
+#[test]
 fn get_bucket_delete_finalize_roots_returns_deleting_buckets_in_order() {
     let tmp = test_util::tempdir();
     let store = PgStore::open(tmp.path(), 11).unwrap();
@@ -3840,6 +3877,47 @@ fn terminal_pending_metadata_command_slot_is_cleaned_on_validation() {
 }
 
 #[test]
+fn pending_slot_finalization_rejects_mismatched_scope_bucket() {
+    let tmp = test_util::tempdir();
+    let store = PgStore::open(tmp.path(), 1).unwrap();
+    let bucket = trusted_bucket_name("pending-slot-scope");
+    let wrong_scope = trusted_bucket_name("pending-slot-wrong-scope");
+    let command = create_bucket_probe_command(1, 1, bucket.clone(), 1);
+    store.record_metadata_command_applied(0, &command).unwrap();
+    store
+        .conn
+        .execute(
+            "INSERT INTO metadata_command_pending_slot \
+             (singleton, cluster_epoch, pg_id, log_index, command_checksum, command_bytes, scope_bucket) \
+             VALUES (0, ?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                command.id().cluster_epoch().get() as i64,
+                command.id().pg_id().get() as i64,
+                command.id().log_index().get() as i64,
+                command.checksum_crc64() as i64,
+                command.command_bytes(),
+                wrong_scope.as_str(),
+            ],
+        )
+        .unwrap();
+
+    let err = store
+        .remove_pending_metadata_command_slot(0, &command)
+        .unwrap_err();
+    assert!(
+        matches!(err, StoreError::MetadataCommandPendingConflict { .. }),
+        "mismatched scope bucket must fail closed during finalization, got {err:?}"
+    );
+    assert!(
+        store
+            .pending_metadata_command_slot(0, ClusterEpoch::INITIAL)
+            .unwrap()
+            .is_some(),
+        "failed finalization must not remove the mismatched scoped slot"
+    );
+}
+
+#[test]
 fn abandoned_pending_slot_with_unadvanced_replica_state_recovers_on_validation() {
     let tmp = test_util::tempdir();
     let store = PgStore::open(tmp.path(), 1).unwrap();
@@ -3877,6 +3955,50 @@ fn abandoned_pending_slot_with_unadvanced_replica_state_recovers_on_validation()
             .unwrap()
             .is_none(),
         "validation should advance matching abandoned row and clean the pending slot"
+    );
+}
+
+#[test]
+fn abandoned_pending_slot_rejects_mismatched_scope_bucket_on_validation() {
+    let tmp = test_util::tempdir();
+    let store = PgStore::open(tmp.path(), 1).unwrap();
+    let bucket = trusted_bucket_name("abandoned-pending-slot-scope");
+    let wrong_scope = trusted_bucket_name("abandoned-pending-slot-wrong-scope");
+    let command = create_bucket_probe_command(1, 1, bucket, 1);
+    store
+        .try_insert_pending_metadata_command_slot(0, &command, Some(&wrong_scope))
+        .unwrap();
+    store
+        .conn
+        .execute(
+            "INSERT INTO metadata_command_log \
+             (cluster_epoch, pg_id, log_index, command_checksum, command_bytes, abandoned, previous_log_hash, log_hash) \
+             VALUES (?1, ?2, ?3, ?4, ?5, 1, NULL, NULL)",
+            params![
+                ClusterEpoch::INITIAL.get() as i64,
+                1_i64,
+                1_i64,
+                command.abandoned_log_checksum_crc64() as i64,
+                command.abandoned_log_bytes(),
+            ],
+        )
+        .unwrap();
+
+    let err = store
+        .validate_metadata_command_replay_state(0, ClusterEpoch::INITIAL)
+        .unwrap_err();
+    assert!(
+        matches!(err, StoreError::MetadataCommandLogConflict { .. }),
+        "mismatched scope bucket must fail closed before abandoned cleanup, got {err:?}"
+    );
+    let state = store.metadata_command_replica_state().unwrap();
+    assert_eq!(state.applied_log_index, 0);
+    assert!(
+        store
+            .pending_metadata_command_slot(0, ClusterEpoch::INITIAL)
+            .unwrap()
+            .is_some(),
+        "failed abandoned cleanup must not remove the mismatched scoped slot"
     );
 }
 

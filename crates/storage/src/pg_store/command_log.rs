@@ -2113,7 +2113,7 @@ impl PgStore {
             });
         }
         if let Some(scope_bucket) = slot.scope_bucket {
-            if command.bucket_name() != &scope_bucket {
+            if !Self::pending_slot_scope_matches_command(&scope_bucket, &command) {
                 return Err(StoreError::MetadataCommandPendingConflict {
                     pg_id: self.pg_id,
                     cluster_epoch,
@@ -2244,6 +2244,40 @@ impl PgStore {
         node_id: u32,
         command: &MetadataCommandEnvelope,
     ) -> Result<bool, StoreError> {
+        if self.conn.is_autocommit() {
+            self.conn
+                .execute_batch("BEGIN IMMEDIATE")
+                .map_err(|source| StoreError::Db {
+                    context: "remove pending metadata command slot (begin txn)",
+                    source,
+                })?;
+            let result = self.remove_pending_metadata_command_slot_inner(node_id, command);
+            match result {
+                Ok(removed) => {
+                    if let Err(source) = self.conn.execute_batch("COMMIT") {
+                        let _ = self.conn.execute_batch("ROLLBACK");
+                        return Err(StoreError::Db {
+                            context: "remove pending metadata command slot (commit txn)",
+                            source,
+                        });
+                    }
+                    Ok(removed)
+                }
+                Err(error) => {
+                    let _ = self.conn.execute_batch("ROLLBACK");
+                    Err(error)
+                }
+            }
+        } else {
+            self.remove_pending_metadata_command_slot_inner(node_id, command)
+        }
+    }
+
+    fn remove_pending_metadata_command_slot_inner(
+        &self,
+        node_id: u32,
+        command: &MetadataCommandEnvelope,
+    ) -> Result<bool, StoreError> {
         if command.id().pg_id().get() != self.pg_id {
             return Err(StoreError::MetadataCommandWrongPg {
                 node_id,
@@ -2262,6 +2296,16 @@ impl PgStore {
             || slot.command_bytes != command.command_bytes()
         {
             return Ok(false);
+        }
+        if let Some(scope_bucket) = &slot.scope_bucket {
+            if !Self::pending_slot_scope_matches_command(scope_bucket, command) {
+                return Err(StoreError::MetadataCommandPendingConflict {
+                    pg_id: self.pg_id,
+                    cluster_epoch: command.id().cluster_epoch(),
+                    existing_log_index: slot.id.log_index().get(),
+                    candidate_log_index: command.id().log_index().get(),
+                });
+            }
         }
         let Some(entry) = self.load_metadata_command_log_entry(
             "load terminal metadata command log entry before pending slot removal",
@@ -3275,6 +3319,7 @@ impl PgStore {
                 return Ok(PendingMetadataCommandSlotAction::Unresolved);
             };
             if entry.abandoned && self.pending_slot_terminal_entry_matches(node_id, slot, &entry)? {
+                self.validate_pending_slot_scope_provenance(node_id, state.cluster_epoch, slot)?;
                 return Ok(PendingMetadataCommandSlotAction::AdvanceAbandonedThenClean);
             }
             return Err(StoreError::MetadataCommandLogConflict {
@@ -3307,6 +3352,7 @@ impl PgStore {
             });
         };
         if self.pending_slot_terminal_entry_matches(node_id, slot, &entry)? {
+            self.validate_pending_slot_scope_provenance(node_id, state.cluster_epoch, slot)?;
             return Ok(PendingMetadataCommandSlotAction::CleanTerminal);
         }
         Err(StoreError::MetadataCommandLogConflict {
@@ -3315,6 +3361,25 @@ impl PgStore {
             cluster_epoch: state.cluster_epoch,
             log_index: slot_index,
         })
+    }
+
+    fn validate_pending_slot_scope_provenance(
+        &self,
+        node_id: u32,
+        cluster_epoch: ClusterEpoch,
+        slot: &PendingMetadataCommandSlot,
+    ) -> Result<(), StoreError> {
+        if let Some(scope_bucket) = &slot.scope_bucket {
+            if !Self::pending_slot_scope_matches_slot(scope_bucket, slot) {
+                return Err(StoreError::MetadataCommandLogConflict {
+                    node_id,
+                    pg_id: self.pg_id,
+                    cluster_epoch,
+                    log_index: slot.id.log_index().get(),
+                });
+            }
+        }
+        Ok(())
     }
 
     fn remove_pending_metadata_command_slot_exact(
@@ -3329,13 +3394,15 @@ impl PgStore {
                AND pg_id = ?2 \
                AND log_index = ?3 \
                AND command_checksum = ?4 \
-               AND command_bytes = ?5",
+               AND command_bytes = ?5 \
+               AND scope_bucket IS ?6",
             params![
                 slot.id.cluster_epoch().get() as i64,
                 slot.id.pg_id().get() as i64,
                 slot.id.log_index().get() as i64,
                 slot.command_checksum as i64,
                 slot.command_bytes.as_slice(),
+                slot.scope_bucket.as_ref().map(BucketName::as_str),
             ],
             "remove exact metadata command pending slot",
         )?;
@@ -3348,6 +3415,25 @@ impl PgStore {
             cluster_epoch: slot.id.cluster_epoch(),
             log_index: slot.id.log_index().get(),
         })
+    }
+
+    fn pending_slot_scope_matches_command(
+        scope_bucket: &BucketName,
+        command: &MetadataCommandEnvelope,
+    ) -> bool {
+        command.bucket_name() == scope_bucket
+    }
+
+    fn pending_slot_scope_matches_slot(
+        scope_bucket: &BucketName,
+        slot: &PendingMetadataCommandSlot,
+    ) -> bool {
+        let Ok(command) = decode_metadata_command_envelope(&slot.command_bytes) else {
+            return false;
+        };
+        command.id() == slot.id
+            && command.checksum_crc64() == slot.command_checksum
+            && command.bucket_name() == scope_bucket
     }
 
     pub(crate) fn metadata_command_acceptance(

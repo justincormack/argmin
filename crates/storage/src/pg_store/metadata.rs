@@ -10,6 +10,12 @@ fn combined_stream_segment_payload_crc64(segments: &[StreamUploadSegmentRecord])
 
 impl PgStore {
     #[cfg(test)]
+    pub(crate) fn fail_next_metadata_txn_commit(&self) {
+        self.fail_next_metadata_txn_commit
+            .store(true, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
     fn fail_next_delete_finalized_bucket_commit(&self) {
         self.fail_next_delete_finalized_bucket_commit
             .store(true, Ordering::Relaxed);
@@ -46,12 +52,27 @@ impl PgStore {
         let result = body(self);
         match result {
             Ok(value) => {
-                self.conn
-                    .execute_batch("COMMIT")
-                    .map_err(|source| MetadataError::Db {
+                #[cfg(test)]
+                if self
+                    .fail_next_metadata_txn_commit
+                    .swap(false, Ordering::Relaxed)
+                {
+                    let _ = self.conn.execute_batch("ROLLBACK");
+                    self.invalidate_clean_metadata_digest_revision();
+                    return Err(MetadataError::Db {
+                        context: commit_context,
+                        source: rusqlite::Error::InvalidQuery,
+                    });
+                }
+
+                if let Err(source) = self.conn.execute_batch("COMMIT") {
+                    let _ = self.conn.execute_batch("ROLLBACK");
+                    self.invalidate_clean_metadata_digest_revision();
+                    return Err(MetadataError::Db {
                         context: commit_context,
                         source,
-                    })?;
+                    });
+                }
                 Ok(value)
             }
             Err(error) => {

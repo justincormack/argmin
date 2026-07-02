@@ -12720,6 +12720,101 @@ mod tests {
     }
 
     #[test]
+    fn storage_node_server_bind_cleans_terminal_pending_metadata_command() {
+        let tmp = test_util::tempdir();
+        let config = test_config(&tmp);
+        let bucket = crate::tests::bucket_name("bind-terminal-pending");
+        let owner = crate::OwnerIdentity::from_principal("owner");
+        let create_config = crate::CreateBucketConfig {
+            name: bucket.as_str(),
+            owner_principal: &owner.principal,
+            owner_canonical_id: &owner.canonical_id,
+            acl_grants: &AclGrants::default(),
+            public_read: false,
+            public_write: false,
+            versioning: BucketVersioningState::Disabled,
+            object_lock: BucketObjectLockConfig::default(),
+            ownership_controls: crate::BucketOwnershipControls {
+                object_ownership: crate::BucketObjectOwnership::ObjectWriter,
+            },
+        };
+        let command = MetadataCommandEnvelope::new(
+            MetadataCommandId::new(
+                ClusterEpoch::new(1).unwrap(),
+                PgId::new(0),
+                MetadataCommandLogIndex::new(1).unwrap(),
+            ),
+            MetadataCommandPayload::CreateBucket(
+                CreateBucketCommand::from_config(&create_config, 123, 1).unwrap(),
+            ),
+        );
+        {
+            let node = SharedStorageNode::open_with_default_ec_shape(
+                &config.data_dir,
+                &config.pg_ids,
+                config.default_ec_shape,
+            )
+            .unwrap();
+            let pg = node.get_pg(0).unwrap();
+            pg.try_insert_pending_metadata_command_slot(7, &command, Some(&bucket))
+                .unwrap();
+            pg.apply_metadata_command_and_record(7, &command).unwrap();
+            assert!(pg
+                .pending_metadata_command_slot(7, ClusterEpoch::new(1).unwrap())
+                .unwrap()
+                .is_some());
+        }
+
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let restarted = StorageNodeServer::bind(config).unwrap();
+        let pg = restarted._node.get_pg(0).unwrap();
+        assert!(
+            pg.pending_metadata_command_slot(7, ClusterEpoch::new(1).unwrap())
+                .unwrap()
+                .is_none(),
+            "bind recovery should clean terminal pending metadata commands"
+        );
+        assert!(pg.head_bucket_record_raw(&bucket).is_ok());
+    }
+
+    #[test]
+    fn storage_node_server_bind_fails_closed_on_corrupted_metadata_state_digest() {
+        let tmp = test_util::tempdir();
+        let config = test_config(&tmp);
+        {
+            let node = SharedStorageNode::open_with_default_ec_shape(
+                &config.data_dir,
+                &config.pg_ids,
+                config.default_ec_shape,
+            )
+            .unwrap();
+            let pg = node.get_pg(0).unwrap();
+            pg.connection()
+                .execute(
+                    "UPDATE metadata_command_replica_state \
+                     SET state_digest = state_digest + 1 \
+                     WHERE singleton = 0",
+                    [],
+                )
+                .unwrap();
+        }
+
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let error = bind_error(config);
+        assert!(
+            matches!(
+                error,
+                StorageNodeServerError::Store(StoreError::MetadataStateDigestMismatch {
+                    node_id: 7,
+                    pg_id: 0,
+                    ..
+                })
+            ),
+            "bind should fail closed on corrupted metadata state digest: {error:?}"
+        );
+    }
+
+    #[test]
     fn storage_node_server_rejects_active_socket_owner() {
         let tmp = test_util::tempdir();
         let config = test_config(&tmp);
