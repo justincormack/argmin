@@ -10107,7 +10107,13 @@ impl super::StorageCluster {
                 }
             }};
         }
-        let mutation_client = self.object_mutation_metadata_primary_client(bucket, key)?;
+        let mutation_client = match self.object_mutation_metadata_primary_client(bucket, key) {
+            Ok(client) => client,
+            Err(error) => {
+                release_caller_bucket_write_proof_if_unowned!()?;
+                return Err(error.into());
+            }
+        };
 
         let (command, new_pending_command, prepared) = loop {
             while let Some(command) = match self.pending_metadata_command_for_bucket(pg_id, bucket)

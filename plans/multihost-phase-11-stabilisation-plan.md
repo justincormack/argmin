@@ -495,7 +495,7 @@ when prioritised. They correspond to the remaining findings from the Phase 11 re
   | Path | Positive crossing coverage | Stale-primary / Peering fail-closed coverage | Remaining Slice 6 gap |
   | --- | --- | --- | --- |
   | Direct PUT / overwrite | Covered locally at B1/B2: `S6-DP1`. | Covered locally and through installed Unix clients for stale epoch and control-plane-driven Peering: `S6-DP2`, `S6-DP3`. | Add B3 lost-response/idempotent-retry coverage if not already covered by command replay tests. |
-  | Streaming PutObject | Partially covered: stream session pinning and command-conflict cleanup are named in `S6-SP1`, and storage command retry/finalize cleanup is named in `S6-SP2`. | Partially covered for remote segment append/commit stale epoch in `S6-SP3`; no complete real-Peering matrix is named yet for `CommitStreamPut`. | Add explicit route-change/Peering tests for `CommitStreamPut`, terminal checksum/final chunk failure cleanup, and abort cleanup across B1/B2/B4/B5. |
+  | Streaming PutObject | Partially covered: stream session pinning and command-conflict cleanup are named in `S6-SP1`, and storage command retry/finalize cleanup is named in `S6-SP2`. | Covered locally for real-Peering `CommitStreamPut` in `S6-SP4`; remote stale segment append/commit is named in `S6-SP3`. | Add installed-Unix real-Peering `CommitStreamPut`, terminal checksum/final chunk failure cleanup, and abort cleanup across B1/B2/B4/B5. |
   | DeleteObject | Covered locally before metadata apply across a runtime-map epoch change: `S6-DEL1`. | Covered locally and through installed Unix clients for stale epoch and real Peering: `S6-DEL2`, `S6-DEL3`. | Add explicit B3 response-loss/retry shape for committed delete if absent. |
   | Object metadata mutations: tags/legal hold/retention/ACL-shaped path | Covered for tags, legal hold, and retention locally before shared `PutObjectMetadata` apply across an epoch change: `S6-META1`. ACL is the same serialization shape but not named yet. | Covered for shared object-metadata update locally and through installed Unix clients for stale epoch and real Peering: `S6-META2`, `S6-META3`. | Decide whether ACL needs one representative test or remains covered by shared command-shape evidence. |
   | CopyObject destination publish | Covered locally before destination `CommitDirectPutObject` across a runtime-map epoch change: `S6-COPY1`. | Covered locally and through installed Unix clients for real Peering: `S6-COPY2`, `S6-COPY3`. | Add B3 committed-copy response-loss/idempotent retry coverage if missing. |
@@ -531,6 +531,8 @@ when prioritised. They correspond to the remaining findings from the Phase 11 re
     `crates/server-core/src/coordinator/multipart_stateful_tests.rs`.
   - `S6-SP3`: `non_current_epoch_unix_stream_append_commit_fails_closed_and_cleans_remote_state`
     in `crates/storage/src/cluster/local/tests/unix_clients.rs`.
+  - `S6-SP4`: `control_plane_peering_stream_put_finalize_old_primary_fails_closed_and_preserves_staging`
+    in `crates/storage/src/cluster/local/tests/stream_commands.rs`.
   - `S6-DEL1`: `delete_object_epoch_change_before_metadata_apply_commits_once_on_pinned_route`
     in `crates/server-core/src/coordinator/core_tests.rs`.
   - `S6-DEL2`: `non_current_epoch_object_delete_fails_closed_without_mutation`,
