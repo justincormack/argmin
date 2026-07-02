@@ -10207,7 +10207,15 @@ Phase 12.2 progress:
   second restart-after-command test now drives storage-node heartbeat refresh
   through Peering to Active, shuts down, restores from the same state file, and
   verifies that the restored snapshot and runtime map preserve the active
-  primary lease/proof state.
+  primary lease/proof state. A third restart-after-command test now fences an
+  active PG for metadata transfer, installs a destination acting set with the
+  transfer proof, restarts from the same state file, and verifies that the
+  restored snapshot and runtime map preserve the transfer proof, source route
+  epoch, and source node identity. A fourth process test now restarts from a
+  durable active-PG artifact and serves the real frontend runtime-map refresh
+  loop over the Unix control-plane RPC, proving that startup bootstrap and a
+  subsequent refresh-loop pass both read from the restarted durable Raft
+  authority.
 
 1. define the replicated control-plane state machine:
    - state includes cluster epoch, PG count, PG state, PG acting sets, node
