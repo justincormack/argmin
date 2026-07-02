@@ -10197,6 +10197,13 @@ Phase 12.2 progress:
   further runtime-map/admin/heartbeat service until restart, preventing the
   process from continuing on in-memory state that is not present in
   `ARGMIN_CONTROL_PLANE_STATE_PATH`.
+- Extended the process-layer durable restart coverage past bootstrap. A new
+  `argmin-s3` experimental durable harness starts from the local restart
+  artifact, checkpoints membership/startup catch-up, and keeps the same
+  process adapter path as production. The first restart-after-command test
+  mutates a PG acting set through the durable raft process wrapper, shuts down,
+  restores from the same `ARGMIN_CONTROL_PLANE_STATE_PATH`, and verifies that
+  bootstrap remains a no-op while the changed acting set is still present.
 
 1. define the replicated control-plane state machine:
    - state includes cluster epoch, PG count, PG state, PG acting sets, node

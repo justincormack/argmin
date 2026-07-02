@@ -2679,6 +2679,74 @@ mod tests {
         }
     }
 
+    fn experimental_raft_durable_test_harness(
+        name: &str,
+        state_path: &Path,
+    ) -> ExperimentalRaftTestHarness {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime should build");
+        let handle = runtime.handle().clone();
+        let authority = runtime.block_on(async {
+            let authority = ControlPlaneRaftAuthority::new_experimental_single_node_durable(
+                format!(
+                    "argmin-s3-experimental-durable-raft-{name}-{}",
+                    std::process::id()
+                ),
+                1,
+                state_path,
+            )
+            .await
+            .expect("durable experimental raft authority should initialize");
+            if !authority
+                .is_initialized()
+                .await
+                .expect("durable raft initialization status should read")
+            {
+                authority
+                    .initialize_single_node_membership(1)
+                    .await
+                    .expect("single-node durable raft membership should initialize");
+                authority
+                    .store_durable_restart_artifact(state_path)
+                    .await
+                    .expect("single-node durable raft membership should checkpoint");
+            }
+            authority
+                .wait_for_current_leader(
+                    1,
+                    Duration::from_secs(1),
+                    "durable experimental process test leadership",
+                )
+                .await
+                .expect("single-node durable raft should become leader");
+            wait_for_experimental_raft_startup_catch_up(
+                &authority,
+                Duration::from_secs(1),
+                "durable experimental process test committed replay",
+            )
+            .await
+            .expect("single-node durable raft should apply committed prefix");
+            authority
+                .store_durable_restart_artifact(state_path)
+                .await
+                .expect("single-node durable raft startup should checkpoint");
+            Arc::new(authority)
+        });
+        let control_plane = ExperimentalRaftControlPlane {
+            runtime: handle,
+            authority: Arc::clone(&authority),
+            durable_artifact_path: Some(state_path.to_path_buf()),
+            durable_poison: None,
+        };
+        ExperimentalRaftTestHarness {
+            runtime,
+            authority,
+            control_plane,
+        }
+    }
+
     fn spawn_experimental_raft_unix_rpc_server(
         harness: &ExperimentalRaftTestHarness,
         socket_path: &Path,
@@ -3552,6 +3620,62 @@ mod tests {
         std::fs::remove_file(&socket_path).unwrap();
         std::fs::remove_dir_all(&tmp).unwrap();
         harness.shutdown();
+    }
+
+    #[test]
+    fn experimental_raft_control_plane_durable_restart_restores_acting_set_admin() {
+        let state_dir = short_unix_socket_test_dir("experimental-raft-durable-acting-set");
+        let _ = fs::remove_dir_all(&state_dir);
+        fs::create_dir_all(&state_dir).unwrap();
+        let state_path = state_dir.join("control-plane.state");
+        let mut config = test_server_config();
+        config.storage_node_sockets = vec![
+            config::ConfiguredStorageNodeSocket {
+                node_id: 1,
+                socket_path: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
+            },
+            config::ConfiguredStorageNodeSocket {
+                node_id: 2,
+                socket_path: "/tmp/argmin-experimental-raft-node-2.sock".to_string(),
+            },
+        ];
+        config.storage_pg_ids = vec![19];
+
+        let mut harness =
+            experimental_raft_durable_test_harness("acting-set-before-restart", &state_path);
+        bootstrap_empty_experimental_raft_control_plane(&mut harness.control_plane, &config)
+            .expect("durable experimental raft control-plane bootstrap should succeed");
+        let changed = harness
+            .control_plane
+            .set_pg_acting_set(PgId::new(19), vec![NodeId::new(2)])
+            .expect("durable acting-set admin command should checkpoint");
+        let changed_epoch = changed.cluster_epoch();
+        let changed_pg = changed
+            .pg(PgId::new(19))
+            .expect("changed PG should remain present");
+        assert_eq!(changed_pg.state(), PgState::Peering);
+        assert_eq!(changed_pg.acting_set(), &[NodeId::new(2)]);
+        assert!(state_path.exists());
+        harness.shutdown();
+
+        let mut restarted =
+            experimental_raft_durable_test_harness("acting-set-after-restart", &state_path);
+        bootstrap_empty_experimental_raft_control_plane(&mut restarted.control_plane, &config)
+            .expect("durable experimental raft control-plane restart bootstrap should be a no-op");
+        let restored = restarted
+            .control_plane
+            .current_snapshot()
+            .expect("durable experimental raft snapshot should read after restart");
+        assert_eq!(restored.cluster_epoch(), changed_epoch);
+        let restored_pg = restored
+            .pg(PgId::new(19))
+            .expect("restored PG should remain present");
+        assert_eq!(restored_pg.state(), PgState::Peering);
+        assert_eq!(restored_pg.acting_set(), &[NodeId::new(2)]);
+        assert_eq!(restored_pg.active_primary(), None);
+
+        restarted.shutdown();
+        fs::remove_dir_all(&state_dir).unwrap();
     }
 
     #[test]
