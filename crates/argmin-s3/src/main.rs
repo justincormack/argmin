@@ -3021,6 +3021,59 @@ mod tests {
     }
 
     #[test]
+    fn experimental_raft_control_plane_unix_heartbeat_rejects_unknown_node() {
+        let mut harness = experimental_raft_test_harness("unix-heartbeat-reject-test");
+        let mut config = test_server_config();
+        config.storage_node_sockets = vec![config::ConfiguredStorageNodeSocket {
+            node_id: 1,
+            socket_path: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
+        }];
+        config.storage_pg_ids = vec![9];
+        bootstrap_empty_experimental_raft_control_plane(&mut harness.control_plane, &config)
+            .expect("experimental raft control-plane bootstrap should succeed");
+        let before = harness
+            .control_plane
+            .current_snapshot()
+            .expect("experimental snapshot should read before rejected heartbeat");
+
+        let tmp = short_unix_socket_test_dir("experimental-raft-unix-heartbeat-reject");
+        std::fs::create_dir_all(&tmp).unwrap();
+        let socket_path = tmp.join("control-plane.sock");
+        let server = spawn_experimental_raft_unix_rpc_server(&harness, &socket_path, 30_050);
+        let mut client = UnixControlPlaneClient::new(&socket_path);
+        let error = client
+            .refresh_node_heartbeat(
+                NodeHeartbeat {
+                    node_id: NodeId::new(99),
+                    node_incarnation: 1,
+                    endpoint: "/tmp/argmin-experimental-raft-node-99.sock".to_string(),
+                    observed_epoch: before.cluster_epoch(),
+                    requested_lease_duration_ms: 500,
+                    cluster_map_history_reference_summary:
+                        storage::PgClusterMapHistoryReferenceSummary::default(),
+                    pg_observations: Vec::new(),
+                },
+                0,
+            )
+            .expect_err("Unix heartbeat rejection should cross the RPC boundary");
+        server.join().unwrap();
+
+        assert!(matches!(
+            error,
+            ControlPlaneError::RpcRemote { message } if message.contains("unknown node 99")
+        ));
+        let after = harness
+            .control_plane
+            .current_snapshot()
+            .expect("experimental snapshot should read after rejected heartbeat");
+        assert_eq!(after, before);
+
+        std::fs::remove_file(&socket_path).unwrap();
+        std::fs::remove_dir_all(&tmp).unwrap();
+        harness.shutdown();
+    }
+
+    #[test]
     fn experimental_raft_control_plane_serves_unix_runtime_map_read_index() {
         let mut harness = experimental_raft_test_harness("unix-runtime-map-test");
         let mut config = test_server_config();

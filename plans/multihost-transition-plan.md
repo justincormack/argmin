@@ -10038,6 +10038,10 @@ Phase 12.1 progress:
   control-plane wire protocol with deterministic authority timestamps, proving
   the process-mode adapter works across the actual storage-node/front-end RPC
   framing rather than only through direct in-process trait calls.
+- Added fail-closed Unix RPC coverage for rejected storage-node heartbeat
+  refresh through the experimental authority. A heartbeat for an unknown node
+  returns the existing remote control-plane error through the process adapter
+  and leaves the replicated snapshot unchanged.
 - Added the matching Unix RPC smoke for frontend-style runtime-map reads. The
   experimental authority now serves `UnixControlPlaneClient::runtime_map_snapshot`
   through OpenRaft read-index and the test asserts the wire-decoded freshness
