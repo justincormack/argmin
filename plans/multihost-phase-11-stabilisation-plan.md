@@ -455,13 +455,18 @@ when prioritised. They correspond to the remaining findings from the Phase 11 re
   4. Tests no longer depend on generic digest-only progress; they either use logged
      commands, imported-transfer provenance, or expect rejection.
 
-- **Slice 4: Control-plane transition open/save/reload property tests.** The
-    `6f9d1605` "second restart fails" bug is the canonical shape: transition code copies
-    active fields verbatim into a stricter-shaped peering target. Grep for every
-    `record.peering_X = record.active_Y` assignment in `control_plane.rs` and promote the
-    ad-hoc `open -> mutate -> save -> reload -> open` cycle used in the security dossiers
-    to a permanent proptest over the PG state-transition graph (Active<->Peering, transfer
-    marker install/clear, floor preservation, restart epoch bump).
+- **Slice 4: Control-plane transition open/save/reload property tests.** **Completed for
+  the current Phase 11 PG transition graph.** The `6f9d1605` "second restart fails" bug is
+  the canonical shape: transition code copies active fields verbatim into a stricter-shaped
+  peering target. The heartbeat/control-plane model proptest now includes file-backed
+  authority restarts as first-class operations, so randomly generated heartbeat, acting-set,
+  lease-expiry, and peering-completion sequences must survive `save -> open -> validate ->
+  continue`. A focused deterministic regression also walks the PG graph through
+  `Peering -> Active`, active restart, overlap acting-set migration, non-overlap metadata
+  transfer, imported active completion, and imported active restart, reopening the
+  file-backed authority at each load-bearing boundary. This pins proof-floor preservation,
+  transfer source route provenance, imported transfer markers, and restart epoch bumping at
+  the parser/runtime boundary.
 
 - **Slice 6: Deterministic fault-injection harness promotion.** Promote the
   token-scoped deterministic fault gate (Phase 11 work item 11) into the standard

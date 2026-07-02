@@ -8098,6 +8098,7 @@ mod tests {
         ExpireLeases {
             advance_ms: u16,
         },
+        RestartAuthority,
     }
 
     #[derive(Debug, Clone, Copy)]
@@ -8169,6 +8170,7 @@ mod tests {
             2 => (1_u16..250).prop_map(
                 |advance_ms| ControlPlaneHeartbeatModelOp::ExpireLeases { advance_ms }
             ),
+            2 => Just(ControlPlaneHeartbeatModelOp::RestartAuthority),
         ]
     }
 
@@ -8237,6 +8239,23 @@ mod tests {
 
     fn heartbeat_model_node_id(node_slot: u8) -> u32 {
         1 + u32::from(node_slot % 3)
+    }
+
+    fn reopen_file_authority(
+        store: &FileControlPlaneStore,
+    ) -> SingleAuthorityControlPlane<FileControlPlaneStore> {
+        SingleAuthorityControlPlane::open(store.clone()).expect("test control-plane reopen")
+    }
+
+    fn assert_persisted_snapshot_matches_authority(
+        authority: &SingleAuthorityControlPlane<FileControlPlaneStore>,
+        store: &FileControlPlaneStore,
+    ) {
+        assert_eq!(
+            store.load().unwrap().unwrap(),
+            *authority.snapshot(),
+            "persisted control-plane snapshot must match live authority"
+        );
     }
 
     fn heartbeat_model_pg_id() -> PgId {
@@ -16801,6 +16820,9 @@ mod tests {
                         now_ms = now_ms.saturating_add(u64::from(advance_ms));
                         authority.expire_heartbeat_leases(now_ms).unwrap();
                     }
+                    ControlPlaneHeartbeatModelOp::RestartAuthority => {
+                        authority = reopen_file_authority(&store);
+                    }
                 }
 
                 assert_control_plane_heartbeat_model_invariants(&authority, &store, now_ms)?;
@@ -18283,6 +18305,250 @@ mod tests {
         assert_eq!(pg.state(), PgState::Peering);
         assert_eq!(pg.acting_set(), &[NodeId::new(1), NodeId::new(3)]);
         assert_eq!(pg.peering_metadata_proof_floor(), Some(active_proof));
+    }
+
+    #[test]
+    fn pg_transition_graph_survives_file_reopen_and_continues() {
+        let tmp = test_util::tempdir();
+        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store.clone()).unwrap();
+        for node_id in [1, 2, 3] {
+            authority
+                .set_node_membership(NodeId::new(node_id), NodeMembershipState::Active)
+                .unwrap();
+            assert!(heartbeat_until_serving(&mut authority, node_id, 1_000).serving());
+        }
+
+        let pg_id = PgId::new(61);
+        let initial_proof = PgMetadataProof::new(9, 10, 11);
+        authority
+            .set_pg_acting_set(pg_id, vec![NodeId::new(1)])
+            .unwrap();
+        assert_persisted_snapshot_matches_authority(&authority, &store);
+        authority = reopen_file_authority(&store);
+        assert_eq!(
+            authority.snapshot().pg(pg_id).unwrap().state(),
+            PgState::Peering
+        );
+
+        heartbeat_with_pg_proof(
+            &mut authority,
+            1,
+            pg_id.get(),
+            PgState::Peering,
+            initial_proof,
+            false,
+            2_000,
+        );
+        authority
+            .complete_pg_peering(
+                pg_id,
+                NodeId::new(1),
+                node_incarnation(&authority, 1),
+                2_001,
+            )
+            .unwrap();
+        assert_eq!(
+            authority.snapshot().pg(pg_id).unwrap().state(),
+            PgState::Active
+        );
+        assert_persisted_snapshot_matches_authority(&authority, &store);
+
+        authority = reopen_file_authority(&store);
+        let restarted_pg = authority.snapshot().pg(pg_id).unwrap();
+        assert_eq!(restarted_pg.state(), PgState::Peering);
+        assert_eq!(
+            restarted_pg.peering_metadata_proof_floor(),
+            Some(initial_proof)
+        );
+        assert_eq!(restarted_pg.peering_metadata_transfer(), None);
+
+        heartbeat_with_pg_proof(
+            &mut authority,
+            1,
+            pg_id.get(),
+            PgState::Peering,
+            initial_proof,
+            false,
+            2_010,
+        );
+        authority
+            .complete_pg_peering(
+                pg_id,
+                NodeId::new(1),
+                node_incarnation(&authority, 1),
+                2_011,
+            )
+            .unwrap();
+        heartbeat_with_pg_proof(
+            &mut authority,
+            1,
+            pg_id.get(),
+            PgState::Active,
+            initial_proof,
+            false,
+            2_012,
+        );
+
+        let expected_overlap_floor_epoch = authority
+            .snapshot()
+            .pg(pg_id)
+            .unwrap()
+            .active_metadata_proof_epoch();
+        authority
+            .set_pg_acting_set(pg_id, vec![NodeId::new(1), NodeId::new(2)])
+            .unwrap();
+        let overlap_pg = authority.snapshot().pg(pg_id).unwrap();
+        assert_eq!(overlap_pg.state(), PgState::Peering);
+        assert_eq!(
+            overlap_pg.peering_metadata_proof_floor(),
+            Some(initial_proof)
+        );
+        assert_persisted_snapshot_matches_authority(&authority, &store);
+
+        authority = reopen_file_authority(&store);
+        let overlap_pg = authority.snapshot().pg(pg_id).unwrap();
+        assert_eq!(overlap_pg.state(), PgState::Peering);
+        assert_eq!(
+            overlap_pg.peering_metadata_proof_floor(),
+            Some(initial_proof)
+        );
+        assert_eq!(
+            overlap_pg.peering_metadata_proof_floor_epoch(),
+            expected_overlap_floor_epoch
+        );
+        for (node_id, now_ms) in [(1, 2_020), (2, 2_021)] {
+            heartbeat_with_pg_proof(
+                &mut authority,
+                node_id,
+                pg_id.get(),
+                PgState::Peering,
+                initial_proof,
+                false,
+                now_ms,
+            );
+        }
+        assert_eq!(
+            authority.complete_ready_pg_peerings(2_022).unwrap(),
+            vec![pg_id]
+        );
+        let active_pg = authority.snapshot().pg(pg_id).unwrap();
+        assert_eq!(active_pg.state(), PgState::Active);
+        assert_eq!(active_pg.active_metadata_proof(), Some(initial_proof));
+        assert_persisted_snapshot_matches_authority(&authority, &store);
+
+        authority = reopen_file_authority(&store);
+        for (node_id, now_ms) in [(1, 2_030), (2, 2_031)] {
+            heartbeat_with_pg_proof(
+                &mut authority,
+                node_id,
+                pg_id.get(),
+                PgState::Peering,
+                initial_proof,
+                false,
+                now_ms,
+            );
+        }
+        authority.complete_ready_pg_peerings(2_032).unwrap();
+        let active_epoch = authority.snapshot().cluster_epoch();
+        let active_pg = authority.snapshot().pg(pg_id).unwrap();
+        let source_primary = active_pg.active_primary().unwrap();
+        let source_proof = active_pg.active_metadata_proof().unwrap();
+        let imported_proof = PgMetadataProof::new(
+            source_proof.applied_log_index + 1,
+            source_proof.applied_log_hash + 100,
+            source_proof.state_digest + 100,
+        );
+        let transfer = PgMetadataTransferProof::new_with_imported_metadata_proof(
+            active_epoch,
+            source_proof,
+            imported_proof,
+        );
+        authority
+            .set_pg_acting_set_with_metadata_transfer(pg_id, vec![NodeId::new(3)], transfer)
+            .unwrap();
+        let transfer_pg = authority.snapshot().pg(pg_id).unwrap();
+        assert_eq!(transfer_pg.state(), PgState::Peering);
+        assert_eq!(transfer_pg.acting_set(), &[NodeId::new(3)]);
+        assert_eq!(transfer_pg.peering_metadata_transfer(), Some(transfer));
+        assert_eq!(
+            transfer_pg.peering_metadata_transfer_source_route_epoch(),
+            Some(active_epoch)
+        );
+        assert_eq!(
+            transfer_pg.peering_metadata_transfer_source_node_id(),
+            Some(source_primary)
+        );
+        assert_persisted_snapshot_matches_authority(&authority, &store);
+
+        authority = reopen_file_authority(&store);
+        let transfer_pg = authority.snapshot().pg(pg_id).unwrap();
+        assert_eq!(transfer_pg.state(), PgState::Peering);
+        assert_eq!(transfer_pg.peering_metadata_transfer(), Some(transfer));
+        assert_eq!(
+            transfer_pg.peering_metadata_proof_floor(),
+            Some(imported_proof)
+        );
+        assert_eq!(
+            transfer_pg.peering_metadata_proof_floor_epoch(),
+            Some(active_epoch)
+        );
+        heartbeat_with_pg_proof(
+            &mut authority,
+            3,
+            pg_id.get(),
+            PgState::Peering,
+            imported_proof,
+            false,
+            2_040,
+        );
+        authority
+            .complete_pg_peering(
+                pg_id,
+                NodeId::new(3),
+                node_incarnation(&authority, 3),
+                2_041,
+            )
+            .unwrap();
+        let imported_active_pg = authority.snapshot().pg(pg_id).unwrap();
+        assert_eq!(imported_active_pg.state(), PgState::Active);
+        assert_eq!(
+            imported_active_pg.active_metadata_proof(),
+            Some(imported_proof)
+        );
+        assert!(imported_active_pg.active_metadata_transfer_imported());
+        assert_persisted_snapshot_matches_authority(&authority, &store);
+
+        authority = reopen_file_authority(&store);
+        let restarted_import_pg = authority.snapshot().pg(pg_id).unwrap();
+        assert_eq!(restarted_import_pg.state(), PgState::Peering);
+        assert_eq!(
+            restarted_import_pg.peering_metadata_proof_floor(),
+            Some(imported_proof)
+        );
+        assert!(restarted_import_pg.peering_metadata_proof_floor_imported());
+        assert_eq!(restarted_import_pg.peering_metadata_transfer(), None);
+        heartbeat_with_pg_proof(
+            &mut authority,
+            3,
+            pg_id.get(),
+            PgState::Peering,
+            imported_proof,
+            false,
+            2_050,
+        );
+        authority
+            .complete_pg_peering(
+                pg_id,
+                NodeId::new(3),
+                node_incarnation(&authority, 3),
+                2_051,
+            )
+            .unwrap();
+        assert_eq!(
+            authority.snapshot().pg(pg_id).unwrap().state(),
+            PgState::Active
+        );
     }
 
     #[test]
