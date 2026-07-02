@@ -140,7 +140,7 @@ Progress update:
   migration and storage-side `None => owner` fallback were removed because they could mutate
   materialised rows on reopen and make caller semantics unclear.
 
-1. **Define recovery semantics explicitly.** Document, in
+1. **Define recovery semantics explicitly.** **Completed.** Document, in
    [`guides/storage-cluster-invariants.md`](../guides/storage-cluster-invariants.md), that
    opening a PG store is a recovery boundary and state which anomaly classes fail closed
    (possible corruption: hash-chain break, digest mismatch, forked log) versus which are
@@ -227,8 +227,12 @@ Progress update:
    Progress update: the generic hook now exists on `PgStore` and is consumed by
    `with_immediate_txn` immediately before `COMMIT`. It rolls back, invalidates the clean
    digest revision, and returns the caller's normal commit-context error. The old
-   delete-finalized hook still exists for its hand-written transaction path; the generic hook
-   covers the common metadata transaction helper used by most digest-affecting mutators.
+   delete-finalized hook still exists for its legacy targeted regression, but the generic
+   hook now also runs at hand-written metadata transaction commit points in
+   `metadata.rs`. Single-statement mutators with no explicit transaction, such as stream
+   upload session create, have no injected commit window yet; they need either explicit
+   classification as crash-atomic single statements or conversion to an explicit
+   transaction if their rollback boundary matters.
 
 4. **Make pending-slot removal transactional at the safe finalization boundary.** A first
    attempt to make `record_metadata_command_applied` delete the matching pending slot proved
@@ -279,12 +283,17 @@ Progress update:
    This single harness would have caught `c828f3a5`, `c5776092`, and `791b409c`.
 
    Progress update: a reusable harness now covers representative generic-transaction
-   mutators (`create_bucket`, bucket versioning, bucket ACL, `mark_bucket_deleting`, and
-   create multipart upload). Each case injects a commit failure, reopens and recovers the
-   PG, checks cached-vs-materialised table digests and replica-state digest consistency,
-   asserts no pending slot remains, and then applies a follow-on metadata command. The
-   remaining work is to extend this matrix across the rest of the digest-affecting mutators,
-   including hand-written transaction paths that do not use `with_immediate_txn`.
+   mutators (`create_bucket`, bucket versioning, bucket ACL, bucket encryption, bucket
+   subresource, `mark_bucket_deleting`, and create multipart upload) plus representative
+   hand-written metadata transactions (object metadata put, object generation reservation,
+   segmented object put, object-segment reclaim, multipart reclaim, multipart upload
+   delete, and staged multipart part segment upsert). Each case injects a commit failure,
+   reopens and recovers the PG, checks cached-vs-materialised table digests and
+   replica-state digest consistency, asserts no pending slot remains, asserts the PG
+   accepts the next metadata command, and then applies that command. The remaining work is
+   to complete the inventory of digest-affecting mutators, especially single-statement
+   mutators with no explicit transaction and the heavier multipart completion/stream-part
+   transaction paths.
 
 7. **Storage-node restart coverage.** Add a test that opens a PG through
    `StorageNodeServer::bind` (the production restart path), after a crash that orphans a
@@ -294,7 +303,9 @@ Progress update:
 
    Progress update: `StorageNodeServer::bind` now has direct regressions for cleaning a
    terminal pending metadata command during bind recovery and for failing closed on a
-   corrupted metadata state digest before serving.
+   corrupted metadata state digest before serving. Bind also has a direct regression for
+   repairing cache-only per-table digest drift before serving, so the production restart
+   path is pinned for the same drift class as `PgStore::recover`.
 
 ### Exit criteria
 

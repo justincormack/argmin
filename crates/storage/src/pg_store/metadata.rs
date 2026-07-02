@@ -52,27 +52,7 @@ impl PgStore {
         let result = body(self);
         match result {
             Ok(value) => {
-                #[cfg(test)]
-                if self
-                    .fail_next_metadata_txn_commit
-                    .swap(false, Ordering::Relaxed)
-                {
-                    let _ = self.conn.execute_batch("ROLLBACK");
-                    self.invalidate_clean_metadata_digest_revision();
-                    return Err(MetadataError::Db {
-                        context: commit_context,
-                        source: rusqlite::Error::InvalidQuery,
-                    });
-                }
-
-                if let Err(source) = self.conn.execute_batch("COMMIT") {
-                    let _ = self.conn.execute_batch("ROLLBACK");
-                    self.invalidate_clean_metadata_digest_revision();
-                    return Err(MetadataError::Db {
-                        context: commit_context,
-                        source,
-                    });
-                }
+                self.commit_immediate_txn(commit_context)?;
                 Ok(value)
             }
             Err(error) => {
@@ -80,6 +60,28 @@ impl PgStore {
                 Err(error)
             }
         }
+    }
+
+    fn commit_immediate_txn(&self, context: &'static str) -> Result<(), MetadataError> {
+        #[cfg(test)]
+        if self
+            .fail_next_metadata_txn_commit
+            .swap(false, Ordering::Relaxed)
+        {
+            let _ = self.conn.execute_batch("ROLLBACK");
+            self.invalidate_clean_metadata_digest_revision();
+            return Err(MetadataError::Db {
+                context,
+                source: rusqlite::Error::InvalidQuery,
+            });
+        }
+
+        if let Err(source) = self.conn.execute_batch("COMMIT") {
+            let _ = self.conn.execute_batch("ROLLBACK");
+            self.invalidate_clean_metadata_digest_revision();
+            return Err(MetadataError::Db { context, source });
+        }
+        Ok(())
     }
 
     #[cfg(test)]
@@ -762,14 +764,8 @@ impl PgStore {
 
         match result {
             Ok(record) => {
-                if let Err(source) = self.conn.execute_batch("COMMIT") {
-                    let _ = self.conn.execute_batch("ROLLBACK");
-                    self.invalidate_clean_metadata_digest_revision();
-                    return Err(BucketSnapshotLoadError::Metadata(MetadataError::Db {
-                        context: "apply metadata command and record (commit txn)",
-                        source,
-                    }));
-                }
+                self.commit_immediate_txn("apply metadata command and record (commit txn)")
+                    .map_err(BucketSnapshotLoadError::Metadata)?;
                 self.mark_metadata_state_digest_clean_at_revision(record.digest_revision);
                 Ok(record.state)
             }
@@ -5163,14 +5159,7 @@ impl PgMetadataStore for PgStore {
                     });
                 }
 
-                if let Err(source) = self.conn.execute_batch("COMMIT") {
-                    let _ = self.conn.execute_batch("ROLLBACK");
-                    self.invalidate_clean_metadata_digest_revision();
-                    return Err(MetadataError::Db {
-                        context: "delete finalized bucket (commit txn)",
-                        source,
-                    });
-                }
+                self.commit_immediate_txn("delete finalized bucket (commit txn)")?;
                 deleted
             }
             Err(error) => {
@@ -5694,13 +5683,8 @@ impl PgMetadataStore for PgStore {
         })();
 
         match result {
-            Ok(()) => self.conn.execute_batch("COMMIT").map_err(|source| {
-                let _ = self.conn.execute_batch("ROLLBACK");
-                MetadataError::Db {
-                    context: "commit release metadata command bucket write reservation",
-                    source,
-                }
-            }),
+            Ok(()) => self
+                .commit_immediate_txn("commit release metadata command bucket write reservation"),
             Err(error) => {
                 let _ = self.conn.execute_batch("ROLLBACK");
                 Err(error)
@@ -5920,16 +5904,8 @@ impl PgMetadataStore for PgStore {
         })();
         match result {
             Ok(record) => self
-                .conn
-                .execute_batch("COMMIT")
-                .map(|()| record)
-                .map_err(|source| {
-                    let _ = self.conn.execute_batch("ROLLBACK");
-                    MetadataError::Db {
-                        context: "clear expired durable bucket write drain (commit txn)",
-                        source,
-                    }
-                }),
+                .commit_immediate_txn("clear expired durable bucket write drain (commit txn)")
+                .map(|()| record),
             Err(error) => {
                 let _ = self.conn.execute_batch("ROLLBACK");
                 Err(error)
@@ -6054,16 +6030,8 @@ impl PgMetadataStore for PgStore {
         })();
         match result {
             Ok(record) => self
-                .conn
-                .execute_batch("COMMIT")
-                .map(|()| record)
-                .map_err(|source| {
-                    let _ = self.conn.execute_batch("ROLLBACK");
-                    MetadataError::Db {
-                        context: "heartbeat durable bucket write drain (commit txn)",
-                        source,
-                    }
-                }),
+                .commit_immediate_txn("heartbeat durable bucket write drain (commit txn)")
+                .map(|()| record),
             Err(error) => {
                 let _ = self.conn.execute_batch("ROLLBACK");
                 Err(error)
@@ -6617,13 +6585,7 @@ impl PgMetadataStore for PgStore {
 
         match result {
             Ok(()) => {
-                if let Err(e) = self.conn.execute_batch("COMMIT") {
-                    let _ = self.conn.execute_batch("ROLLBACK");
-                    return Err(MetadataError::Db {
-                        context: "put object meta (commit txn)",
-                        source: e,
-                    });
-                }
+                self.commit_immediate_txn("put object meta (commit txn)")?;
                 Ok(())
             }
             Err(e) => {
@@ -6865,13 +6827,7 @@ impl PgMetadataStore for PgStore {
 
         match result {
             Ok(()) => {
-                if let Err(e) = self.conn.execute_batch("COMMIT") {
-                    let _ = self.conn.execute_batch("ROLLBACK");
-                    return Err(MetadataError::Db {
-                        context: "delete object version (commit txn)",
-                        source: e,
-                    });
-                }
+                self.commit_immediate_txn("delete object version (commit txn)")?;
                 Ok(())
             }
             Err(e) => {
@@ -7296,13 +7252,7 @@ impl PgMetadataStore for PgStore {
 
         match result {
             Ok(generation_id) => {
-                if let Err(e) = self.conn.execute_batch("COMMIT") {
-                    let _ = self.conn.execute_batch("ROLLBACK");
-                    return Err(MetadataError::Db {
-                        context: "reserve object generation (commit txn)",
-                        source: e,
-                    });
-                }
+                self.commit_immediate_txn("reserve object generation (commit txn)")?;
                 Ok(generation_id)
             }
             Err(err) => {
@@ -7403,13 +7353,7 @@ impl PgMetadataStore for PgStore {
 
         match result {
             Ok(()) => {
-                if let Err(e) = self.conn.execute_batch("COMMIT") {
-                    let _ = self.conn.execute_batch("ROLLBACK");
-                    return Err(MetadataError::Db {
-                        context: "put object segments reclaim (commit txn)",
-                        source: e,
-                    });
-                }
+                self.commit_immediate_txn("put object segments reclaim (commit txn)")?;
                 Ok(())
             }
             Err(e) => {
@@ -7631,13 +7575,7 @@ impl PgMetadataStore for PgStore {
 
         match result {
             Ok(()) => {
-                if let Err(e) = self.conn.execute_batch("COMMIT") {
-                    let _ = self.conn.execute_batch("ROLLBACK");
-                    return Err(MetadataError::Db {
-                        context: "put multipart reclaim (commit txn)",
-                        source: e,
-                    });
-                }
+                self.commit_immediate_txn("put multipart reclaim (commit txn)")?;
                 Ok(())
             }
             Err(e) => {
@@ -9511,13 +9449,7 @@ impl PgMetadataStore for PgStore {
 
         match result {
             Ok(()) => {
-                if let Err(e) = self.conn.execute_batch("COMMIT") {
-                    let _ = self.conn.execute_batch("ROLLBACK");
-                    return Err(MetadataError::Db {
-                        context: "delete multipart upload (commit txn)",
-                        source: e,
-                    });
-                }
+                self.commit_immediate_txn("delete multipart upload (commit txn)")?;
                 Ok(())
             }
             Err(err) => {
@@ -9823,13 +9755,7 @@ impl PgMetadataStore for PgStore {
 
         match result {
             Ok(prev_gen) => {
-                if let Err(e) = self.conn.execute_batch("COMMIT") {
-                    let _ = self.conn.execute_batch("ROLLBACK");
-                    return Err(MetadataError::Db {
-                        context: "upsert part (commit txn)",
-                        source: e,
-                    });
-                }
+                self.commit_immediate_txn("upsert part (commit txn)")?;
                 Ok(prev_gen)
             }
             Err(e) => {
@@ -10003,13 +9929,7 @@ impl PgMetadataStore for PgStore {
 
         match result {
             Ok(prev_state) => {
-                if let Err(e) = self.conn.execute_batch("COMMIT") {
-                    let _ = self.conn.execute_batch("ROLLBACK");
-                    return Err(MetadataError::Db {
-                        context: "upsert multipart part segments (commit txn)",
-                        source: e,
-                    });
-                }
+                self.commit_immediate_txn("upsert multipart part segments (commit txn)")?;
                 Ok(prev_state)
             }
             Err(e) => {
@@ -10192,13 +10112,7 @@ impl PgMetadataStore for PgStore {
 
         match result {
             Ok(()) => {
-                if let Err(e) = self.conn.execute_batch("COMMIT") {
-                    let _ = self.conn.execute_batch("ROLLBACK");
-                    return Err(MetadataError::Db {
-                        context: "commit object parts (commit txn)",
-                        source: e,
-                    });
-                }
+                self.commit_immediate_txn("commit object parts (commit txn)")?;
                 Ok(())
             }
             Err(e) => {
@@ -10760,13 +10674,7 @@ impl PgMetadataStore for PgStore {
 
         match result {
             Ok(cleanup) => {
-                if let Err(e) = self.conn.execute_batch("COMMIT") {
-                    let _ = self.conn.execute_batch("ROLLBACK");
-                    return Err(MetadataError::Db {
-                        context: "complete multipart commit (commit txn)",
-                        source: e,
-                    });
-                }
+                self.commit_immediate_txn("complete multipart commit (commit txn)")?;
                 Ok(cleanup)
             }
             Err(e) => {
@@ -11240,13 +11148,7 @@ impl PgMetadataStore for PgStore {
 
         match result {
             Ok(()) => {
-                if let Err(e) = self.conn.execute_batch("COMMIT") {
-                    let _ = self.conn.execute_batch("ROLLBACK");
-                    return Err(MetadataError::Db {
-                        context: "put segment object (commit txn)",
-                        source: e,
-                    });
-                }
+                self.commit_immediate_txn("put segment object (commit txn)")?;
                 Ok(())
             }
             Err(e) => {
@@ -11491,13 +11393,7 @@ impl PgMetadataStore for PgStore {
 
         match result {
             Ok(displaced_segments) => {
-                if let Err(e) = self.conn.execute_batch("COMMIT") {
-                    let _ = self.conn.execute_batch("ROLLBACK");
-                    return Err(MetadataError::Db {
-                        context: "commit stream part (commit txn)",
-                        source: e,
-                    });
-                }
+                self.commit_immediate_txn("commit stream part (commit txn)")?;
                 Ok(displaced_segments)
             }
             Err(e) => {

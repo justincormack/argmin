@@ -12778,6 +12778,58 @@ mod tests {
     }
 
     #[test]
+    fn storage_node_server_bind_repairs_cache_only_table_digest_drift() {
+        let tmp = test_util::tempdir();
+        let config = test_config(&tmp);
+        let bucket = crate::tests::bucket_name("bind-cache-drift");
+        {
+            let node = SharedStorageNode::open_with_default_ec_shape(
+                &config.data_dir,
+                &config.pg_ids,
+                config.default_ec_shape,
+            )
+            .unwrap();
+            let pg = node.get_pg(0).unwrap();
+            PgMetadataStore::create_bucket(
+                &*pg,
+                &bucket,
+                "owner",
+                &crate::CanonicalUserId::from_principal("owner"),
+                &AclGrants::default(),
+                false,
+                false,
+            )
+            .unwrap();
+            pg.refresh_metadata_command_state_digest().unwrap();
+            pg.connection()
+                .execute(
+                    "UPDATE metadata_table_digests \
+                     SET table_digest = table_digest + 1 \
+                     WHERE table_name = ?1",
+                    rusqlite::params!["buckets"],
+                )
+                .unwrap();
+            assert!(
+                !pg.test_metadata_digest_table_mismatches()
+                    .unwrap()
+                    .is_empty(),
+                "test setup should create cache-only table digest drift"
+            );
+        }
+
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let restarted = StorageNodeServer::bind(config).unwrap();
+        let pg = restarted._node.get_pg(0).unwrap();
+        assert!(
+            pg.test_metadata_digest_table_mismatches()
+                .unwrap()
+                .is_empty(),
+            "bind recovery should refresh cache-only table digest drift"
+        );
+        assert!(pg.head_bucket_record_raw(&bucket).is_ok());
+    }
+
+    #[test]
     fn storage_node_server_bind_fails_closed_on_corrupted_metadata_state_digest() {
         let tmp = test_util::tempdir();
         let config = test_config(&tmp);

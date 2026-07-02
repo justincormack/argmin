@@ -1777,6 +1777,93 @@ fn assert_commit_failure_recovers_for_metadata_mutator(
     assert_pg_accepts_next_command_after_recovery(&recovered, case_name, &state);
 }
 
+fn test_live_object(bucket: BucketName, key: ObjectKey, generation_id: u64) -> PutLiveObjectReq {
+    PutLiveObjectReq {
+        bucket,
+        key,
+        version_id: VersionId::Null,
+        owner: test_owner(),
+        acl_grants: AclGrants::default(),
+        public_read: false,
+        generation_id: GenerationId::new(generation_id).unwrap(),
+        size: 64,
+        etag: ObjectEtag::single_part(generation_id),
+        ec: EcShape { k: 2, m: 1 },
+        layout: ObjectLayout::Standard,
+        tags: None,
+        metadata_blob: Some(SerializedMetadataBlob::default()),
+        system_metadata_blob: Some(SerializedSystemMetadataBlob::default()),
+        object_lock: ObjectLockState::default(),
+        encryption: ObjectEncryption::None,
+    }
+}
+
+fn test_object_segment(
+    bucket: BucketName,
+    key: ObjectKey,
+    version_id: VersionId,
+    segment_index: u32,
+) -> ObjectSegmentRecord {
+    ObjectSegmentRecord {
+        bucket,
+        key,
+        version_id,
+        segment_index,
+        size: 64,
+        segment_crc64: 0x1234 + u64::from(segment_index),
+        segment_okh: [segment_index as u8; 16],
+        segment_vid: GenerationId::new(u64::from(segment_index) + 1).unwrap(),
+        data_pg_id: segment_index + 1,
+        placement_cluster_epoch: ClusterEpoch::INITIAL,
+        ec_k: 2,
+        ec_m: 1,
+    }
+}
+
+fn test_multipart_part(upload_id: UploadId, part_number: u32) -> MultipartPartRecord {
+    MultipartPartRecord {
+        upload_id,
+        part_number,
+        generation: 0,
+        size: 64,
+        payload_crc64: 0x5678 + u64::from(part_number),
+        etag: format!("part-{part_number}").into_bytes(),
+        etag_kind: EtagKind::Crc64,
+        part_okh: [part_number as u8; 16],
+        part_vid: GenerationId::new(u64::from(part_number) + 10).unwrap(),
+        placement_cluster_epoch: ClusterEpoch::INITIAL,
+        ec_k: 2,
+        ec_m: 1,
+        last_modified: 42 + u64::from(part_number),
+        checksum: None,
+    }
+}
+
+fn test_multipart_part_segment(
+    bucket: BucketName,
+    key: ObjectKey,
+    upload_id: UploadId,
+    part_number: u32,
+    segment_index: u32,
+) -> MultipartPartSegmentRecord {
+    MultipartPartSegmentRecord {
+        bucket,
+        key,
+        upload_id,
+        version_id: PART_SEGMENT_STAGING_VERSION_ID.to_u64(),
+        part_number,
+        segment_index,
+        size: 64,
+        segment_crc64: 0x9abc + u64::from(segment_index),
+        segment_okh: [segment_index as u8; 16],
+        segment_vid: GenerationId::new(u64::from(segment_index) + 20).unwrap(),
+        data_pg_id: segment_index + 1,
+        placement_cluster_epoch: ClusterEpoch::INITIAL,
+        ec_k: 2,
+        ec_m: 1,
+    }
+}
+
 #[test]
 fn metadata_txn_commit_failure_recovers_representative_mutators() {
     assert_commit_failure_recovers_for_metadata_mutator(
@@ -1850,6 +1937,202 @@ fn metadata_txn_commit_failure_recovers_representative_mutators() {
                     encryption: ObjectEncryption::None,
                 },
             )
+        },
+    );
+
+    assert_commit_failure_recovers_for_metadata_mutator(
+        "put-bucket-encryption",
+        |store| create_probe_bucket_direct(store, &trusted_bucket_name("commit-fail-encryption")),
+        |store| {
+            PgMetadataStore::put_bucket_encryption(
+                store,
+                &trusted_bucket_name("commit-fail-encryption"),
+                BucketEncryptionConfig {
+                    default_encryption: Some(ManagedEncryptionAlgorithm::Aes256),
+                    sse_c_blocked: true,
+                },
+            )
+        },
+    );
+
+    assert_commit_failure_recovers_for_metadata_mutator(
+        "put-bucket-subresource",
+        |store| create_probe_bucket_direct(store, &trusted_bucket_name("commit-fail-subresource")),
+        |store| {
+            PgMetadataStore::put_bucket_subresource(
+                store,
+                &trusted_bucket_name("commit-fail-subresource"),
+                PutBucketSubresource {
+                    kind: BucketSubresourceKind::Policy,
+                    body: r#"{"Statement":[]}"#,
+                    aux: BucketSubresourceAux::policy(true),
+                },
+            )
+        },
+    );
+
+    assert_commit_failure_recovers_for_metadata_mutator(
+        "put-object-meta",
+        |store| create_probe_bucket_direct(store, &trusted_bucket_name("commit-fail-object-meta")),
+        |store| {
+            let bucket = trusted_bucket_name("commit-fail-object-meta");
+            let key = trusted_object_key("object");
+            PgMetadataStore::put_object_meta(
+                store,
+                &PutObjectReq::Live(test_live_object(bucket, key, 1)),
+            )
+        },
+    );
+
+    assert_commit_failure_recovers_for_metadata_mutator(
+        "reserve-object-generation",
+        |store| create_probe_bucket_direct(store, &trusted_bucket_name("commit-fail-reserve")),
+        |store| {
+            PgMetadataStore::reserve_object_generation(
+                store,
+                &trusted_bucket_name("commit-fail-reserve"),
+                &trusted_object_key("object"),
+                &SessionId::try_from("a1".repeat(16)).unwrap(),
+            )
+            .map(|_| ())
+        },
+    );
+
+    assert_commit_failure_recovers_for_metadata_mutator(
+        "put-object-with-segments",
+        |store| {
+            create_probe_bucket_direct(store, &trusted_bucket_name("commit-fail-segment-object"));
+        },
+        |store| {
+            let bucket = trusted_bucket_name("commit-fail-segment-object");
+            let key = trusted_object_key("object");
+            let object = test_live_object(bucket.clone(), key.clone(), 2);
+            let segments = vec![test_object_segment(bucket, key, VersionId::Null, 0)];
+            PgMetadataStore::put_object_with_segments(store, &object, &segments)
+        },
+    );
+
+    assert_commit_failure_recovers_for_metadata_mutator(
+        "put-object-segments-reclaim",
+        |store| create_probe_bucket_direct(store, &trusted_bucket_name("commit-fail-reclaim")),
+        |store| {
+            let bucket = trusted_bucket_name("commit-fail-reclaim");
+            let key = trusted_object_key("object");
+            PgMetadataStore::put_object_segments_reclaim(
+                store,
+                &ObjectSegmentsReclaimRecord {
+                    bucket,
+                    key,
+                    generation_id: GenerationId::new(3).unwrap(),
+                    created_at: 50,
+                    segments: vec![ObjectSegmentsReclaimSegmentRecord {
+                        segment_index: 0,
+                        segment_okh: [3; 16],
+                        segment_vid: GenerationId::new(4).unwrap(),
+                        data_pg_id: 1,
+                        ec: EcShape { k: 2, m: 1 },
+                    }],
+                },
+            )
+        },
+    );
+
+    assert_commit_failure_recovers_for_metadata_mutator(
+        "put-multipart-reclaim",
+        |store| {
+            create_probe_bucket_direct(
+                store,
+                &trusted_bucket_name("commit-fail-multipart-reclaim"),
+            );
+        },
+        |store| {
+            PgMetadataStore::put_multipart_reclaim(
+                store,
+                &MultipartReclaimRecord {
+                    bucket: trusted_bucket_name("commit-fail-multipart-reclaim"),
+                    key: trusted_object_key("object"),
+                    generation_id: GenerationId::new(5).unwrap(),
+                    created_at: 51,
+                    parts: vec![MultipartReclaimPartRecord::ShardSet {
+                        part_number: 1,
+                        part_okh: [4; 16],
+                        part_vid: GenerationId::new(6).unwrap(),
+                        data_pg_id: 1,
+                        ec: EcShape { k: 2, m: 1 },
+                    }],
+                },
+            )
+        },
+    );
+
+    assert_commit_failure_recovers_for_metadata_mutator(
+        "delete-multipart-upload",
+        |store| {
+            create_probe_bucket_direct(store, &trusted_bucket_name("commit-fail-delete-mpu"));
+            PgMetadataStore::create_multipart_upload(
+                store,
+                &CreateMultipartUploadReq {
+                    upload_id: crate::tests::multipart_upload_id("commit-fail-delete-mpu-upload"),
+                    bucket: trusted_bucket_name("commit-fail-delete-mpu"),
+                    key: trusted_object_key("object"),
+                    tags: None,
+                    metadata_blob: SerializedMetadataBlob::default(),
+                    system_metadata_blob: SerializedSystemMetadataBlob::default(),
+                    initiator: test_owner(),
+                    owner: test_owner(),
+                    acl_grants: AclGrants::default(),
+                    public_read: false,
+                    object_lock: ObjectLockState::default(),
+                    checksum: None,
+                    encryption: ObjectEncryption::None,
+                },
+            )
+            .unwrap();
+        },
+        |store| {
+            PgMetadataStore::delete_multipart_upload(
+                store,
+                &crate::tests::multipart_upload_id("commit-fail-delete-mpu-upload"),
+            )
+        },
+    );
+
+    assert_commit_failure_recovers_for_metadata_mutator(
+        "upsert-multipart-part-segments",
+        |store| {
+            create_probe_bucket_direct(store, &trusted_bucket_name("commit-fail-part-segments"));
+            PgMetadataStore::create_multipart_upload(
+                store,
+                &CreateMultipartUploadReq {
+                    upload_id: crate::tests::multipart_upload_id(
+                        "commit-fail-part-segments-upload",
+                    ),
+                    bucket: trusted_bucket_name("commit-fail-part-segments"),
+                    key: trusted_object_key("object"),
+                    tags: None,
+                    metadata_blob: SerializedMetadataBlob::default(),
+                    system_metadata_blob: SerializedSystemMetadataBlob::default(),
+                    initiator: test_owner(),
+                    owner: test_owner(),
+                    acl_grants: AclGrants::default(),
+                    public_read: false,
+                    object_lock: ObjectLockState::default(),
+                    checksum: None,
+                    encryption: ObjectEncryption::None,
+                },
+            )
+            .unwrap();
+        },
+        |store| {
+            let upload_id = crate::tests::multipart_upload_id("commit-fail-part-segments-upload");
+            let bucket = trusted_bucket_name("commit-fail-part-segments");
+            let key = trusted_object_key("object");
+            let part = MultipartPartRecord {
+                part_okh: [0; 16],
+                ..test_multipart_part(upload_id.clone(), 1)
+            };
+            let segments = vec![test_multipart_part_segment(bucket, key, upload_id, 1, 0)];
+            PgMetadataStore::upsert_multipart_part_segments(store, &part, &segments).map(|_| ())
         },
     );
 }
