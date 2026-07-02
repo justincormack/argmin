@@ -10332,9 +10332,16 @@ Phase 12.3 progress:
   Raft log-id/entry/command encoding, preserves pre-vote as a distinct request
   tag, bounds append-entry decode allocation, and fails closed on wrong
   direction, truncation, checksum mismatch, incompatible magic/version,
-  trailing bytes, and unknown tags. Snapshot streaming frames remain separate
-  follow-up work because their transport semantics differ from ordinary request/
-  response frames.
+  trailing bytes, and unknown tags. Snapshot streaming frames are kept separate
+  from ordinary request/response frames because their transport semantics differ.
+- Added separate versioned, CRC-protected snapshot install request/response
+  frames for the OpenRaft full-snapshot path. The request frame carries the
+  leader vote plus snapshot metadata and bytes, the response frame carries the
+  responder vote, and both use distinct frame kinds so snapshot request and
+  response payloads fail closed across direction before any payload fields are
+  trusted. Snapshot request decode requires explicit total-frame and snapshot-
+  payload byte limits, and rejects over-limit payloads before copying snapshot
+  bytes into an owned buffer.
 
 1. define the replicated control-plane state machine:
    - state includes cluster epoch, PG count, PG state, PG acting sets, node

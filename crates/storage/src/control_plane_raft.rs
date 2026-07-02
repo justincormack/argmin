@@ -70,6 +70,17 @@ pub enum ControlPlaneRaftPeerRpcResponse {
     Vote(VoteResponse<ControlPlaneRaftTypeConfig>),
 }
 
+#[derive(Debug, Clone)]
+pub struct ControlPlaneRaftPeerSnapshotRequest {
+    pub vote: VoteOf<ControlPlaneRaftTypeConfig>,
+    pub snapshot: SnapshotOf<ControlPlaneRaftTypeConfig>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ControlPlaneRaftPeerSnapshotResponse {
+    pub response: SnapshotResponse<ControlPlaneRaftTypeConfig>,
+}
+
 impl ControlPlaneRaftPeerRpcRequest {
     pub fn encode_frame(&self) -> Result<Vec<u8>, ControlPlaneError> {
         let mut out = Vec::new();
@@ -151,6 +162,69 @@ impl ControlPlaneRaftPeerRpcResponse {
                 ))),
             }
         })
+    }
+}
+
+impl ControlPlaneRaftPeerSnapshotRequest {
+    pub fn encode_frame(&self) -> Result<Vec<u8>, ControlPlaneError> {
+        let mut out = Vec::new();
+        out.extend_from_slice(CONTROL_PLANE_RAFT_PEER_RPC_MAGIC);
+        write_raft_u16(&mut out, CONTROL_PLANE_RAFT_PEER_RPC_VERSION);
+        write_raft_u8(&mut out, CONTROL_PLANE_RAFT_PEER_RPC_KIND_SNAPSHOT_REQUEST);
+        write_raft_vote(&mut out, self.vote);
+        write_raft_snapshot(&mut out, &self.snapshot)?;
+        append_raft_artifact_checksum(&mut out);
+        Ok(out)
+    }
+
+    pub fn decode_frame(
+        bytes: &[u8],
+        max_frame_bytes: usize,
+        max_snapshot_bytes: usize,
+    ) -> Result<Self, ControlPlaneError> {
+        if bytes.len() > max_frame_bytes {
+            return Err(raft_artifact_protocol_error(format!(
+                "control-plane OpenRaft peer snapshot request frame size {} bytes exceeds limit {}",
+                bytes.len(),
+                max_frame_bytes
+            )));
+        }
+        decode_raft_peer_rpc_frame(
+            bytes,
+            CONTROL_PLANE_RAFT_PEER_RPC_KIND_SNAPSHOT_REQUEST,
+            |reader| {
+                let vote = reader.read_vote()?;
+                let snapshot = reader
+                    .read_snapshot_limited("raft peer snapshot payload", max_snapshot_bytes)?;
+                Ok(Self { vote, snapshot })
+            },
+        )
+    }
+}
+
+impl ControlPlaneRaftPeerSnapshotResponse {
+    pub fn encode_frame(&self) -> Result<Vec<u8>, ControlPlaneError> {
+        let mut out = Vec::new();
+        out.extend_from_slice(CONTROL_PLANE_RAFT_PEER_RPC_MAGIC);
+        write_raft_u16(&mut out, CONTROL_PLANE_RAFT_PEER_RPC_VERSION);
+        write_raft_u8(&mut out, CONTROL_PLANE_RAFT_PEER_RPC_KIND_SNAPSHOT_RESPONSE);
+        write_raft_vote(&mut out, self.response.vote);
+        append_raft_artifact_checksum(&mut out);
+        Ok(out)
+    }
+
+    pub fn decode_frame(bytes: &[u8]) -> Result<Self, ControlPlaneError> {
+        decode_raft_peer_rpc_frame(
+            bytes,
+            CONTROL_PLANE_RAFT_PEER_RPC_KIND_SNAPSHOT_RESPONSE,
+            |reader| {
+                Ok(Self {
+                    response: SnapshotResponse {
+                        vote: reader.read_vote()?,
+                    },
+                })
+            },
+        )
     }
 }
 
@@ -2722,6 +2796,8 @@ const CONTROL_PLANE_RAFT_PEER_RPC_VERSION: u16 = 1;
 const CONTROL_PLANE_RAFT_PEER_RPC_CHECKSUM_LEN: usize = 8;
 const CONTROL_PLANE_RAFT_PEER_RPC_KIND_REQUEST: u8 = 1;
 const CONTROL_PLANE_RAFT_PEER_RPC_KIND_RESPONSE: u8 = 2;
+const CONTROL_PLANE_RAFT_PEER_RPC_KIND_SNAPSHOT_REQUEST: u8 = 3;
+const CONTROL_PLANE_RAFT_PEER_RPC_KIND_SNAPSHOT_RESPONSE: u8 = 4;
 const CONTROL_PLANE_RAFT_PEER_RPC_REQUEST_APPEND_ENTRIES: u8 = 1;
 const CONTROL_PLANE_RAFT_PEER_RPC_REQUEST_VOTE: u8 = 2;
 const CONTROL_PLANE_RAFT_PEER_RPC_REQUEST_PRE_VOTE: u8 = 3;
@@ -3707,10 +3783,18 @@ fn write_raft_option_snapshot(
         None => write_raft_u8(out, 0),
         Some(snapshot) => {
             write_raft_u8(out, 1);
-            write_raft_snapshot_meta(out, &snapshot.meta)?;
-            write_raft_bytes(out, snapshot.snapshot.get_ref())?;
+            write_raft_snapshot(out, snapshot)?;
         }
     }
+    Ok(())
+}
+
+fn write_raft_snapshot(
+    out: &mut Vec<u8>,
+    snapshot: &SnapshotOf<ControlPlaneRaftTypeConfig>,
+) -> Result<(), ControlPlaneError> {
+    write_raft_snapshot_meta(out, &snapshot.meta)?;
+    write_raft_bytes(out, snapshot.snapshot.get_ref())?;
     Ok(())
 }
 
@@ -4018,6 +4102,20 @@ impl<'a> RaftArtifactReader<'a> {
         self.read_exact(len)
     }
 
+    fn read_limited_bytes(
+        &mut self,
+        field: &'static str,
+        max_len: usize,
+    ) -> Result<&'a [u8], ControlPlaneError> {
+        let len = self.read_len(field)?;
+        if len > max_len {
+            return Err(raft_artifact_protocol_error(format!(
+                "{field} length {len} exceeds limit {max_len}"
+            )));
+        }
+        self.read_exact(len)
+    }
+
     fn read_string(&mut self) -> Result<String, ControlPlaneError> {
         let bytes = self.read_bytes("raft string")?;
         std::str::from_utf8(bytes)
@@ -4150,18 +4248,36 @@ impl<'a> RaftArtifactReader<'a> {
     ) -> Result<Option<SnapshotOf<ControlPlaneRaftTypeConfig>>, ControlPlaneError> {
         match self.read_u8()? {
             0 => Ok(None),
-            1 => {
-                let meta = self.read_snapshot_meta()?;
-                let payload = self.read_bytes("raft cached snapshot payload")?.to_vec();
-                Ok(Some(Snapshot {
-                    meta,
-                    snapshot: Cursor::new(payload),
-                }))
-            }
+            1 => Ok(Some(self.read_snapshot("raft cached snapshot payload")?)),
             value => Err(raft_artifact_protocol_error(format!(
                 "invalid control-plane OpenRaft durable optional snapshot tag {value}"
             ))),
         }
+    }
+
+    fn read_snapshot(
+        &mut self,
+        payload_field: &'static str,
+    ) -> Result<SnapshotOf<ControlPlaneRaftTypeConfig>, ControlPlaneError> {
+        let meta = self.read_snapshot_meta()?;
+        let payload = self.read_bytes(payload_field)?.to_vec();
+        Ok(Snapshot {
+            meta,
+            snapshot: Cursor::new(payload),
+        })
+    }
+
+    fn read_snapshot_limited(
+        &mut self,
+        payload_field: &'static str,
+        max_payload_bytes: usize,
+    ) -> Result<SnapshotOf<ControlPlaneRaftTypeConfig>, ControlPlaneError> {
+        let meta = self.read_snapshot_meta()?;
+        let payload = self.read_limited_bytes(payload_field, max_payload_bytes)?;
+        Ok(Snapshot {
+            meta,
+            snapshot: Cursor::new(payload.to_vec()),
+        })
     }
 
     fn read_snapshot_meta(
@@ -5813,6 +5929,117 @@ mod tests {
             .unwrap();
         let decoded = ControlPlaneRaftPeerRpcResponse::decode_frame(&encoded).unwrap();
         assert_eq!(decoded, ControlPlaneRaftPeerRpcResponse::Vote(vote));
+    }
+
+    #[test]
+    fn control_plane_raft_peer_snapshot_frames_round_trip() {
+        let mut state_machine = ControlPlaneRaftStateMachine::empty();
+        state_machine
+            .apply_entry(bootstrap_membership_entry(1))
+            .unwrap();
+        let snapshot = state_machine.build_snapshot().unwrap();
+        assert!(!snapshot.snapshot.get_ref().is_empty());
+
+        let request = ControlPlaneRaftPeerSnapshotRequest {
+            vote: Vote::<ControlPlaneRaftLeaderId>::new_committed(1, 1),
+            snapshot: snapshot.clone(),
+        };
+        let encoded = request.encode_frame().unwrap();
+        let decoded =
+            ControlPlaneRaftPeerSnapshotRequest::decode_frame(&encoded, usize::MAX, usize::MAX)
+                .unwrap();
+        assert_eq!(decoded.vote, request.vote);
+        assert_eq!(decoded.snapshot.meta, request.snapshot.meta);
+        assert_eq!(
+            decoded.snapshot.snapshot.get_ref(),
+            request.snapshot.snapshot.get_ref()
+        );
+
+        let response = ControlPlaneRaftPeerSnapshotResponse {
+            response: SnapshotResponse::new(Vote::<ControlPlaneRaftLeaderId>::new_committed(2, 1)),
+        };
+        let encoded = response.encode_frame().unwrap();
+        let decoded = ControlPlaneRaftPeerSnapshotResponse::decode_frame(&encoded).unwrap();
+        assert_eq!(decoded, response);
+    }
+
+    #[test]
+    fn control_plane_raft_peer_snapshot_frames_fail_closed_across_direction() {
+        let mut state_machine = ControlPlaneRaftStateMachine::empty();
+        state_machine
+            .apply_entry(bootstrap_membership_entry(1))
+            .unwrap();
+        let snapshot = state_machine.build_snapshot().unwrap();
+
+        let request = ControlPlaneRaftPeerSnapshotRequest {
+            vote: Vote::<ControlPlaneRaftLeaderId>::new_committed(1, 1),
+            snapshot,
+        };
+        let encoded_request = request.encode_frame().unwrap();
+        let err = ControlPlaneRaftPeerSnapshotResponse::decode_frame(&encoded_request).unwrap_err();
+        assert!(matches!(
+            err,
+            ControlPlaneError::CommandDecode { message }
+                if message.contains("does not match expected kind")
+        ));
+
+        let response = ControlPlaneRaftPeerSnapshotResponse {
+            response: SnapshotResponse::new(Vote::<ControlPlaneRaftLeaderId>::new(3, 1)),
+        };
+        let encoded_response = response.encode_frame().unwrap();
+        let err = ControlPlaneRaftPeerSnapshotRequest::decode_frame(
+            &encoded_response,
+            usize::MAX,
+            usize::MAX,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            ControlPlaneError::CommandDecode { message }
+                if message.contains("does not match expected kind")
+        ));
+    }
+
+    #[test]
+    fn control_plane_raft_peer_snapshot_request_decode_enforces_size_limits() {
+        let mut state_machine = ControlPlaneRaftStateMachine::empty();
+        state_machine
+            .apply_entry(bootstrap_membership_entry(1))
+            .unwrap();
+        let snapshot = state_machine.build_snapshot().unwrap();
+        let payload_len = snapshot.snapshot.get_ref().len();
+        assert!(payload_len > 0);
+
+        let request = ControlPlaneRaftPeerSnapshotRequest {
+            vote: Vote::<ControlPlaneRaftLeaderId>::new_committed(1, 1),
+            snapshot,
+        };
+        let encoded = request.encode_frame().unwrap();
+        let err = ControlPlaneRaftPeerSnapshotRequest::decode_frame(
+            &encoded,
+            encoded.len() - 1,
+            usize::MAX,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            ControlPlaneError::CommandDecode { message }
+                if message.contains("peer snapshot request frame size")
+                    && message.contains("exceeds limit")
+        ));
+
+        let err = ControlPlaneRaftPeerSnapshotRequest::decode_frame(
+            &encoded,
+            usize::MAX,
+            payload_len - 1,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            ControlPlaneError::CommandDecode { message }
+                if message.contains("raft peer snapshot payload length")
+                    && message.contains("exceeds limit")
+        ));
     }
 
     #[test]
