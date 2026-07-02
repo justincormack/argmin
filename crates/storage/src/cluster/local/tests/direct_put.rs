@@ -586,6 +586,148 @@ fn direct_put_overwrite_committed_response_loss_retry_preserves_reclaim_generati
 }
 
 #[test]
+fn copy_object_destination_committed_response_loss_retry_returns_existing_commit() {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let pg_ids = [0, 1, 2, 3];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &pg_ids, ec_shape).unwrap();
+    let topology = map
+        .node(NodeId::new(0))
+        .unwrap()
+        .storage_node()
+        .pg_topology();
+    let bucket = bucket_for_pg(topology, 1, "copy-object-response-loss-");
+    let source_key = key_for_object_pg(topology, &bucket, 2, "source-");
+    let dst_key = key_for_object_pg(topology, &bucket, 2, "dest-");
+    for pg_id in pg_ids {
+        set_route_primary(&mut map, pg_id, NodeId::new(1));
+    }
+
+    let map = Arc::new(map);
+    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let source_payload = b"copied object payload after response loss";
+    let source_segment = write_committed_direct_segment_for_with_okh(
+        &cluster,
+        &bucket,
+        &source_key,
+        [0xcb; 16],
+        source_payload,
+    );
+
+    let reservation_id =
+        crate::SessionId::try_from("56565656565656565656565656565656".to_string()).unwrap();
+    let generation_id = cluster
+        .reserve_put_object_generation(&bucket, &dst_key, &reservation_id)
+        .unwrap();
+    let dst_segment_okh = [0xcc; 16];
+    let written = cluster
+        .write_direct_put_segment_payload_shards(
+            &bucket,
+            &dst_key,
+            generation_id,
+            0,
+            &dst_segment_okh,
+            &source_segment.payload,
+        )
+        .unwrap();
+    let commit_req = direct_put_commit_req(
+        &cluster,
+        DirectPutCommitReqFixture {
+            bucket: &bucket,
+            key: &dst_key,
+            reservation_id,
+            generation_id,
+            payload: &source_segment.payload,
+            segment_okh: dst_segment_okh,
+            written: &written,
+        },
+    );
+
+    let _serial = lock_metadata_command_apply_hook_test();
+    let hook_guard = cluster.test_install_after_direct_put_metadata_publish_hook(Arc::new(|| {
+        Err(crate::ObjectPgActionError::InvalidRequest {
+            reason: "injected CopyObject destination response loss".to_string(),
+        })
+    }));
+
+    let first_err = cluster
+        .commit_direct_put_object_from_payload_shards(
+            &commit_req,
+            &written.written_shards,
+            |snapshot| {
+                assert!(
+                    snapshot.existing_etag.is_none(),
+                    "copy destination should not exist before first publish"
+                );
+                Ok::<(), ()>(())
+            },
+        )
+        .unwrap_err();
+    assert!(
+        matches!(
+            first_err,
+            crate::ObjectPgActionError::InvalidRequest { ref reason }
+                if reason == "injected CopyObject destination response loss"
+        ),
+        "expected injected post-commit CopyObject response-loss error, got {first_err:?}"
+    );
+    drop(hook_guard);
+
+    let outcome = cluster
+        .commit_direct_put_object_from_payload_shards(
+            &commit_req,
+            &written.written_shards,
+            |_| -> Result<(), ()> {
+                panic!("committed CopyObject destination retry must not rerun action")
+            },
+        )
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(outcome.version_id, crate::VersionId::Null);
+    assert_eq!(outcome.live_size, source_segment.payload.len() as u64);
+    assert_eq!(outcome.stale_generation_id, None);
+    let dst_object_pg = map
+        .node(NodeId::new(0))
+        .unwrap()
+        .storage_node()
+        .pg_topology()
+        .object_pg_for(&bucket, &dst_key);
+    assert_direct_put_metadata_on_acting_nodes(
+        &map,
+        &node_ids,
+        dst_object_pg,
+        &commit_req,
+        &outcome,
+    );
+    assert!(pending_metadata_command_for_test(&map, PgId::new(dst_object_pg), &bucket).is_none());
+    assert_clean_metadata_command_stream(&map, &[dst_object_pg]);
+    assert_bucket_write_reservations_released(&map, &bucket);
+    let source_object_pg = map
+        .node(NodeId::new(0))
+        .unwrap()
+        .storage_node()
+        .pg_topology()
+        .object_pg_for(&bucket, &source_key);
+    for node_id in node_ids {
+        let source_pg = map
+            .node(node_id)
+            .unwrap()
+            .storage_node()
+            .get_pg(source_object_pg)
+            .unwrap();
+        let stored =
+            crate::PgMetadataStore::get_object_meta(&*source_pg, &bucket, &source_key).unwrap();
+        assert_eq!(
+            stored.as_live().unwrap().generation_id,
+            source_segment.generation_id,
+            "committed CopyObject retry must preserve source object on node {node_id:?}"
+        );
+    }
+}
+
+#[test]
 fn stale_direct_put_reservation_cannot_resurrect_deleted_null_version() {
     let tmp = test_util::tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
