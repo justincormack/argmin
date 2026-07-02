@@ -624,7 +624,8 @@ fn fence_control_plane_pg_for_metadata_transfer_live(
     pg_id: PgId,
 ) -> Result<ClusterEpoch, String> {
     UnixControlPlaneClient::new(socket_path)
-        .fence_pg_for_metadata_transfer(pg_id)
+        .fence_pg_for_metadata_transfer_runtime_map_checked(pg_id)
+        .map(|runtime_map| runtime_map.cluster_epoch())
         .map_err(|error| format!("failed to fence live PG for metadata transfer: {error}"))
 }
 

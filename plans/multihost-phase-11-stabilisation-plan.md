@@ -722,12 +722,16 @@ when prioritised. They correspond to the remaining findings from the Phase 11 re
     state is already present:
     - `FencePgForMetadataTransfer`: PG is already fenced/peering with the expected source
       route, source lease, and transfer proof. **Status:** the live Unix
-      `FencePgForMetadataTransferRuntimeMap` paths now use checked fence helpers. The
-      runtime map exposes the peering route but not the private fence bit, so the helper
-      relies on the audited convergent apply path: after a fence applies, resubmitting the
-      same fence returns the same epoch/source lease without advancing state. A storage
-      regression injects response loss after the first fence apply and asserts the retry is
-      the same fence command and does not bump the epoch again.
+      metadata-transfer commands no longer use the bare epoch-only
+      `FencePgForMetadataTransfer` RPC; the standalone live fence path and the full transfer
+      flow both use checked `FencePgForMetadataTransferRuntimeMap` helpers. The runtime map
+      exposes the peering route but not the private fence bit, so the helper relies on the
+      audited convergent apply path: after a fence applies, resubmitting the same fence
+      returns the same epoch/source lease without advancing state. A storage regression
+      injects response loss after the first fence apply and asserts the retry is the same
+      fence command and does not bump the epoch again. The bare Unix epoch-only helper
+      remains a low-level RPC wrapper and should not be used by live admin flows that need
+      response-loss confirmation.
     - `SetPgActingSetWithMetadataTransfer`: PG route has the expected acting set and matching
       metadata-transfer proof. **Status:** the Unix `SetPgActingSetWithMetadataTransfer`
       and `SetPgActingSetWithMetadataTransferRuntimeMap` live paths now treat read-side
