@@ -4,13 +4,14 @@ use std::fs::{self, File};
 use std::future::Future;
 use std::io::{self, Cursor, Read, Write};
 use std::ops::{Bound, RangeBounds};
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use futures_util::{Stream, StreamExt};
-use openraft::errors::{RPCError, ReplicationClosed, StreamingError, Unreachable};
+use openraft::errors::{NetworkError, RPCError, ReplicationClosed, StreamingError, Unreachable};
 use openraft::impls::leader_id_adv::LeaderId;
 use openraft::impls::BasicNode;
 use openraft::impls::Entry;
@@ -408,6 +409,7 @@ impl ControlPlaneRaftPeerSnapshotResponse {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ControlPlaneRaftPeerTransportLimits {
+    pub max_frame_bytes: usize,
     pub max_append_entries: usize,
     pub max_append_entries_bytes: usize,
     pub max_snapshot_bytes: usize,
@@ -630,6 +632,388 @@ impl fmt::Display for ControlPlaneRaftPeerTransportRejection {
 }
 
 impl std::error::Error for ControlPlaneRaftPeerTransportRejection {}
+
+fn raft_rpc_error_from_transport_rejection(
+    rejection: ControlPlaneRaftPeerTransportRejection,
+) -> RPCError<ControlPlaneRaftTypeConfig> {
+    let message = rejection.to_string();
+    match rejection {
+        ControlPlaneRaftPeerTransportRejection::UnknownTarget { .. } => {
+            RPCError::Unreachable(Unreachable::new(&AnyError::error(message)))
+        }
+        _ => RPCError::Network(NetworkError::from_string(message)),
+    }
+}
+
+fn raft_streaming_error_from_transport_rejection(
+    rejection: ControlPlaneRaftPeerTransportRejection,
+) -> StreamingError<ControlPlaneRaftTypeConfig> {
+    let message = rejection.to_string();
+    match rejection {
+        ControlPlaneRaftPeerTransportRejection::UnknownTarget { .. } => {
+            StreamingError::Unreachable(Unreachable::new(&AnyError::error(message)))
+        }
+        _ => StreamingError::Network(NetworkError::from_string(message)),
+    }
+}
+
+fn raft_streaming_error_from_rpc_error(
+    error: RPCError<ControlPlaneRaftTypeConfig>,
+) -> StreamingError<ControlPlaneRaftTypeConfig> {
+    match error {
+        RPCError::Timeout(error) => StreamingError::Network(NetworkError::from_string(format!(
+            "control-plane OpenRaft peer validation timed out: {error}"
+        ))),
+        RPCError::Unreachable(error) => StreamingError::Unreachable(error),
+        RPCError::Network(error) => StreamingError::Network(error),
+        RPCError::RemoteError(error) => StreamingError::Network(NetworkError::from_string(
+            format!("control-plane OpenRaft peer validation remote error: {error}"),
+        )),
+    }
+}
+
+fn raft_rpc_protocol_error(
+    context: &'static str,
+    error: ControlPlaneError,
+) -> RPCError<ControlPlaneRaftTypeConfig> {
+    RPCError::Network(NetworkError::from_string(format!(
+        "control-plane OpenRaft {context} peer frame failed: {error:?}"
+    )))
+}
+
+fn raft_streaming_protocol_error(
+    context: &'static str,
+    error: ControlPlaneError,
+) -> StreamingError<ControlPlaneRaftTypeConfig> {
+    StreamingError::Network(NetworkError::from_string(format!(
+        "control-plane OpenRaft {context} peer frame failed: {error:?}"
+    )))
+}
+
+fn raft_unix_io_rpc_error(
+    context: &'static str,
+    target: ControlPlaneRaftNodeId,
+    source: io::Error,
+) -> RPCError<ControlPlaneRaftTypeConfig> {
+    let message = format!(
+        "control-plane OpenRaft Unix peer transport {context} for node {target} failed: {source}"
+    );
+    match source.kind() {
+        io::ErrorKind::NotFound
+        | io::ErrorKind::ConnectionRefused
+        | io::ErrorKind::ConnectionAborted
+        | io::ErrorKind::ConnectionReset
+        | io::ErrorKind::NotConnected
+        | io::ErrorKind::BrokenPipe
+        | io::ErrorKind::UnexpectedEof
+        | io::ErrorKind::TimedOut => {
+            RPCError::Unreachable(Unreachable::new(&AnyError::error(message)))
+        }
+        _ => RPCError::Network(NetworkError::from_string(message)),
+    }
+}
+
+fn raft_unix_transport_rpc_error(
+    context: &'static str,
+    target: ControlPlaneRaftNodeId,
+    error: ControlPlaneError,
+) -> RPCError<ControlPlaneRaftTypeConfig> {
+    match error {
+        ControlPlaneError::Io { source, .. } => raft_unix_io_rpc_error(context, target, source),
+        error => raft_rpc_protocol_error(context, error),
+    }
+}
+
+fn raft_unix_transport_streaming_error(
+    context: &'static str,
+    target: ControlPlaneRaftNodeId,
+    error: ControlPlaneError,
+) -> StreamingError<ControlPlaneRaftTypeConfig> {
+    match raft_unix_transport_rpc_error(context, target, error) {
+        RPCError::Unreachable(error) => StreamingError::Unreachable(error),
+        RPCError::Network(error) => StreamingError::Network(error),
+        RPCError::Timeout(error) => StreamingError::Network(NetworkError::from_string(format!(
+            "control-plane OpenRaft Unix peer transport {context} timed out for node {target}: {error}"
+        ))),
+        RPCError::RemoteError(error) => StreamingError::Network(NetworkError::from_string(
+            format!(
+                "control-plane OpenRaft Unix peer transport {context} remote error for node {target}: {error}"
+            ),
+        )),
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ControlPlaneRaftUnixPeerNetworkFactory {
+    local_node_id: ControlPlaneRaftNodeId,
+    policy: Arc<ControlPlaneRaftPeerTransportPolicy>,
+    rpc_timeout: Duration,
+}
+
+impl ControlPlaneRaftUnixPeerNetworkFactory {
+    #[must_use]
+    pub fn new(
+        local_node_id: ControlPlaneRaftNodeId,
+        policy: ControlPlaneRaftPeerTransportPolicy,
+        rpc_timeout: Duration,
+    ) -> Self {
+        Self {
+            local_node_id,
+            policy: Arc::new(policy),
+            rpc_timeout,
+        }
+    }
+}
+
+impl RaftNetworkFactory<ControlPlaneRaftTypeConfig> for ControlPlaneRaftUnixPeerNetworkFactory {
+    type Network = ControlPlaneRaftUnixPeerNetwork;
+
+    async fn new_client(
+        &mut self,
+        target: ControlPlaneRaftNodeId,
+        node: &BasicNode,
+    ) -> Self::Network {
+        ControlPlaneRaftUnixPeerNetwork {
+            local_node_id: self.local_node_id,
+            target,
+            node: node.clone(),
+            policy: Arc::clone(&self.policy),
+            rpc_timeout: self.rpc_timeout,
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct ControlPlaneRaftUnixPeerNetwork {
+    local_node_id: ControlPlaneRaftNodeId,
+    target: ControlPlaneRaftNodeId,
+    node: BasicNode,
+    policy: Arc<ControlPlaneRaftPeerTransportPolicy>,
+    rpc_timeout: Duration,
+}
+
+impl ControlPlaneRaftUnixPeerNetwork {
+    fn encoded_append_entries_payload_len(
+        entries: &[ControlPlaneRaftEntry],
+    ) -> Result<usize, RPCError<ControlPlaneRaftTypeConfig>> {
+        let mut encoded = Vec::new();
+        write_raft_u32(
+            &mut encoded,
+            raft_len_as_u32(entries.len(), "raft append entries")
+                .map_err(|error| raft_rpc_protocol_error("append_entries encode", error))?,
+        );
+        for entry in entries {
+            write_raft_entry(&mut encoded, entry)
+                .map_err(|error| raft_rpc_protocol_error("append_entries encode", error))?;
+        }
+        Ok(encoded.len())
+    }
+
+    fn request_identity(
+        &self,
+    ) -> Result<ControlPlaneRaftPeerFrameIdentity, RPCError<ControlPlaneRaftTypeConfig>> {
+        self.policy
+            .frame_identity(self.local_node_id, self.target)
+            .map_err(raft_rpc_error_from_transport_rejection)
+    }
+
+    fn response_identity(
+        identity: &ControlPlaneRaftPeerFrameIdentity,
+    ) -> ControlPlaneRaftPeerFrameIdentity {
+        reverse_raft_peer_frame_identity(identity)
+    }
+
+    fn connect(
+        &self,
+        rpc_name: &'static str,
+    ) -> Result<UnixStream, RPCError<ControlPlaneRaftTypeConfig>> {
+        self.policy
+            .validate_target_node(self.target, &self.node, rpc_name)
+            .map_err(raft_rpc_error_from_transport_rejection)?;
+        let stream = UnixStream::connect(&self.node.addr)
+            .map_err(|source| raft_unix_io_rpc_error("connect", self.target, source))?;
+        stream
+            .set_read_timeout(Some(self.rpc_timeout))
+            .map_err(|source| raft_unix_io_rpc_error("set read timeout", self.target, source))?;
+        stream
+            .set_write_timeout(Some(self.rpc_timeout))
+            .map_err(|source| raft_unix_io_rpc_error("set write timeout", self.target, source))?;
+        Ok(stream)
+    }
+
+    fn send_rpc_frame(
+        &self,
+        rpc_name: &'static str,
+        request: ControlPlaneRaftPeerRpcRequest,
+    ) -> Result<ControlPlaneRaftPeerRpcResponse, RPCError<ControlPlaneRaftTypeConfig>> {
+        let identity = self.request_identity()?;
+        let encoded = request
+            .encode_frame_for_peer(&identity)
+            .map_err(|error| raft_rpc_protocol_error("encode", error))?;
+        let mut stream = self.connect(rpc_name)?;
+        write_control_plane_raft_peer_transport_frame(&mut stream, &encoded).map_err(|error| {
+            raft_unix_transport_rpc_error("write transport", self.target, error)
+        })?;
+        let response_frame = read_control_plane_raft_peer_transport_frame(
+            &mut stream,
+            self.policy.limits.max_frame_bytes,
+        )
+        .map_err(|error| raft_unix_transport_rpc_error("read transport", self.target, error))?;
+        ControlPlaneRaftPeerRpcResponse::decode_frame_for_peer(
+            &response_frame,
+            &Self::response_identity(&identity),
+        )
+        .map_err(|error| raft_rpc_protocol_error("response decode", error))
+    }
+
+    fn send_snapshot_frame(
+        &self,
+        vote: VoteOf<ControlPlaneRaftTypeConfig>,
+        snapshot: SnapshotOf<ControlPlaneRaftTypeConfig>,
+    ) -> Result<
+        SnapshotResponse<ControlPlaneRaftTypeConfig>,
+        StreamingError<ControlPlaneRaftTypeConfig>,
+    > {
+        self.policy
+            .validate_target_node(self.target, &self.node, "full_snapshot")
+            .map_err(raft_streaming_error_from_transport_rejection)?;
+        self.policy
+            .validate_snapshot(self.target, snapshot.snapshot.get_ref().len())
+            .map_err(raft_streaming_error_from_transport_rejection)?;
+        let identity = self
+            .request_identity()
+            .map_err(raft_streaming_error_from_rpc_error)?;
+        let encoded = ControlPlaneRaftPeerSnapshotRequest { vote, snapshot }
+            .encode_frame_for_peer(&identity)
+            .map_err(|error| raft_streaming_protocol_error("full_snapshot encode", error))?;
+        let mut stream = self
+            .connect("full_snapshot")
+            .map_err(raft_streaming_error_from_rpc_error)?;
+        write_control_plane_raft_peer_transport_frame(&mut stream, &encoded).map_err(|error| {
+            raft_unix_transport_streaming_error("full_snapshot write transport", self.target, error)
+        })?;
+        let response_frame = read_control_plane_raft_peer_transport_frame(
+            &mut stream,
+            self.policy.limits.max_frame_bytes,
+        )
+        .map_err(|error| {
+            raft_unix_transport_streaming_error("full_snapshot read transport", self.target, error)
+        })?;
+        let response = ControlPlaneRaftPeerSnapshotResponse::decode_frame_for_peer(
+            &response_frame,
+            &Self::response_identity(&identity),
+        )
+        .map_err(|error| raft_streaming_protocol_error("full_snapshot response decode", error))?;
+        Ok(response.response)
+    }
+}
+
+impl fmt::Debug for ControlPlaneRaftUnixPeerNetwork {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ControlPlaneRaftUnixPeerNetwork")
+            .field("local_node_id", &self.local_node_id)
+            .field("target", &self.target)
+            .finish_non_exhaustive()
+    }
+}
+
+impl RaftNetworkV2<ControlPlaneRaftTypeConfig> for ControlPlaneRaftUnixPeerNetwork {
+    async fn append_entries(
+        &mut self,
+        rpc: AppendEntriesRequest<ControlPlaneRaftTypeConfig>,
+        _option: RPCOption,
+    ) -> Result<
+        AppendEntriesResponse<ControlPlaneRaftTypeConfig>,
+        RPCError<ControlPlaneRaftTypeConfig>,
+    > {
+        self.policy
+            .validate_append_entries(
+                self.target,
+                rpc.entries.len(),
+                Self::encoded_append_entries_payload_len(&rpc.entries)?,
+            )
+            .map_err(raft_rpc_error_from_transport_rejection)?;
+        let ControlPlaneRaftPeerRpcResponse::AppendEntries(response) = self.send_rpc_frame(
+            "append_entries",
+            ControlPlaneRaftPeerRpcRequest::AppendEntries(rpc),
+        )?
+        else {
+            return Err(raft_rpc_protocol_error(
+                "append_entries response decode",
+                raft_artifact_protocol_error("decoded non-append_entries response frame"),
+            ));
+        };
+        Ok(response)
+    }
+
+    async fn vote(
+        &mut self,
+        rpc: VoteRequest<ControlPlaneRaftTypeConfig>,
+        _option: RPCOption,
+    ) -> Result<VoteResponse<ControlPlaneRaftTypeConfig>, RPCError<ControlPlaneRaftTypeConfig>>
+    {
+        let ControlPlaneRaftPeerRpcResponse::Vote(response) =
+            self.send_rpc_frame("vote", ControlPlaneRaftPeerRpcRequest::Vote(rpc))?
+        else {
+            return Err(raft_rpc_protocol_error(
+                "vote response decode",
+                raft_artifact_protocol_error("decoded non-vote response frame"),
+            ));
+        };
+        Ok(response)
+    }
+
+    async fn pre_vote(
+        &mut self,
+        rpc: VoteRequest<ControlPlaneRaftTypeConfig>,
+        _option: RPCOption,
+    ) -> Result<VoteResponse<ControlPlaneRaftTypeConfig>, RPCError<ControlPlaneRaftTypeConfig>>
+    {
+        let ControlPlaneRaftPeerRpcResponse::Vote(response) =
+            self.send_rpc_frame("pre_vote", ControlPlaneRaftPeerRpcRequest::PreVote(rpc))?
+        else {
+            return Err(raft_rpc_protocol_error(
+                "pre_vote response decode",
+                raft_artifact_protocol_error("decoded non-vote response frame"),
+            ));
+        };
+        Ok(response)
+    }
+
+    async fn full_snapshot(
+        &mut self,
+        vote: VoteOf<ControlPlaneRaftTypeConfig>,
+        snapshot: SnapshotOf<ControlPlaneRaftTypeConfig>,
+        _cancel: impl Future<Output = ReplicationClosed> + OptionalSend + 'static,
+        _option: RPCOption,
+    ) -> Result<
+        SnapshotResponse<ControlPlaneRaftTypeConfig>,
+        StreamingError<ControlPlaneRaftTypeConfig>,
+    > {
+        self.send_snapshot_frame(vote, snapshot)
+    }
+
+    async fn transfer_leader(
+        &mut self,
+        req: TransferLeaderRequest<ControlPlaneRaftTypeConfig>,
+        _option: RPCOption,
+    ) -> Result<
+        TransferLeaderResponse<ControlPlaneRaftTypeConfig>,
+        RPCError<ControlPlaneRaftTypeConfig>,
+    > {
+        let ControlPlaneRaftPeerRpcResponse::TransferLeader(response) = self.send_rpc_frame(
+            "transfer_leader",
+            ControlPlaneRaftPeerRpcRequest::TransferLeader(req),
+        )?
+        else {
+            return Err(raft_rpc_protocol_error(
+                "transfer_leader response decode",
+                raft_artifact_protocol_error("decoded non-transfer_leader response frame"),
+            ));
+        };
+        Ok(response)
+    }
+}
 
 #[derive(Debug)]
 pub enum ControlPlaneRaftApplyResponse {
@@ -5780,7 +6164,12 @@ impl RaftStateMachine<ControlPlaneRaftTypeConfig> for ControlPlaneRaftStateMachi
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
     use std::future::Future;
-    use std::sync::Arc;
+    use std::os::unix::net::UnixListener;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+    use std::thread;
     use std::time::Duration;
 
     use super::*;
@@ -6553,6 +6942,7 @@ mod tests {
             "control-plane-raft-peer-transport-test",
             BTreeMap::from([(1, BasicNode::new("node-1")), (2, BasicNode::new("node-2"))]),
             ControlPlaneRaftPeerTransportLimits {
+                max_frame_bytes: 4096,
                 max_append_entries: 1,
                 max_append_entries_bytes: 128,
                 max_snapshot_bytes: 0,
@@ -6574,6 +6964,16 @@ mod tests {
         let checksum_start = frame.len() - CONTROL_PLANE_RAFT_PEER_RPC_CHECKSUM_LEN;
         frame.truncate(checksum_start);
         append_raft_artifact_checksum(frame);
+    }
+
+    static RAFT_UNIX_SOCKET_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+    fn raft_unix_socket_path(test_name: &str) -> PathBuf {
+        let sequence = RAFT_UNIX_SOCKET_COUNTER.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "argmin-control-plane-raft-{test_name}-{}-{sequence}.sock",
+            std::process::id()
+        ))
     }
 
     #[test]
@@ -7164,6 +7564,206 @@ mod tests {
                 StreamingError::Network(error)
                     if error.to_string().contains("bytes exceeds limit 0")
             ));
+        });
+    }
+
+    #[test]
+    fn control_plane_raft_unix_peer_network_vote_round_trips_framed_identity() {
+        ControlPlaneRaftTypeConfig::run(async {
+            let socket_path = raft_unix_socket_path("vote-round-trip");
+            let listener = UnixListener::bind(&socket_path).unwrap();
+            let limits = ControlPlaneRaftPeerTransportLimits {
+                max_frame_bytes: 4096,
+                max_append_entries: 8,
+                max_append_entries_bytes: 4096,
+                max_snapshot_bytes: 4096,
+            };
+            let expected_request_identity =
+                ControlPlaneRaftPeerFrameIdentity::new("control-plane-raft-unix-peer-test", 1, 2);
+            let server_identity = expected_request_identity.clone();
+            let server_path = socket_path.clone();
+            let server = thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(1)))
+                    .unwrap();
+                stream
+                    .set_write_timeout(Some(Duration::from_secs(1)))
+                    .unwrap();
+
+                let request_frame = read_control_plane_raft_peer_transport_frame(
+                    &mut stream,
+                    limits.max_frame_bytes,
+                )
+                .unwrap();
+                let request = ControlPlaneRaftPeerRpcRequest::decode_frame_for_peer(
+                    &request_frame,
+                    &server_identity,
+                )
+                .unwrap();
+                let ControlPlaneRaftPeerRpcRequest::Vote(request) = request else {
+                    panic!("decoded wrong Unix peer request variant");
+                };
+                assert_eq!(request.vote, Vote::<ControlPlaneRaftLeaderId>::new(7, 1));
+                assert_eq!(request.last_log_id, Some(raft_log_id(6, 1, 10)));
+                assert!(!request.leadership_transfer);
+
+                let response = ControlPlaneRaftPeerRpcResponse::Vote(VoteResponse {
+                    vote: Vote::<ControlPlaneRaftLeaderId>::new_committed(8, 2),
+                    vote_granted: true,
+                    last_log_id: Some(raft_log_id(7, 2, 11)),
+                });
+                let response_frame = response
+                    .encode_frame_for_peer(&reverse_raft_peer_frame_identity(&server_identity))
+                    .unwrap();
+                write_control_plane_raft_peer_transport_frame(&mut stream, &response_frame)
+                    .unwrap();
+                let _ = std::fs::remove_file(server_path);
+            });
+
+            let node = BasicNode::new(socket_path.display().to_string());
+            let policy = ControlPlaneRaftPeerTransportPolicy::new(
+                "control-plane-raft-unix-peer-test",
+                BTreeMap::from([(1, BasicNode::new("node-1")), (2, node.clone())]),
+                limits,
+            );
+            let mut factory =
+                ControlPlaneRaftUnixPeerNetworkFactory::new(1, policy, Duration::from_secs(1));
+            let mut network = factory.new_client(2, &node).await;
+            let response = network
+                .vote(
+                    VoteRequest {
+                        vote: Vote::<ControlPlaneRaftLeaderId>::new(7, 1),
+                        last_log_id: Some(raft_log_id(6, 1, 10)),
+                        leadership_transfer: false,
+                    },
+                    RPCOption::new(Duration::from_secs(1)),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(
+                response,
+                VoteResponse {
+                    vote: Vote::<ControlPlaneRaftLeaderId>::new_committed(8, 2),
+                    vote_granted: true,
+                    last_log_id: Some(raft_log_id(7, 2, 11)),
+                }
+            );
+            server.join().unwrap();
+            let _ = std::fs::remove_file(socket_path);
+        });
+    }
+
+    #[test]
+    fn control_plane_raft_unix_peer_network_read_eof_is_unreachable() {
+        ControlPlaneRaftTypeConfig::run(async {
+            let socket_path = raft_unix_socket_path("vote-eof");
+            let listener = UnixListener::bind(&socket_path).unwrap();
+            let limits = ControlPlaneRaftPeerTransportLimits {
+                max_frame_bytes: 4096,
+                max_append_entries: 8,
+                max_append_entries_bytes: 4096,
+                max_snapshot_bytes: 4096,
+            };
+            let server_path = socket_path.clone();
+            let server = thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let _ = read_control_plane_raft_peer_transport_frame(
+                    &mut stream,
+                    limits.max_frame_bytes,
+                )
+                .unwrap();
+                drop(stream);
+                let _ = std::fs::remove_file(server_path);
+            });
+
+            let node = BasicNode::new(socket_path.display().to_string());
+            let policy = ControlPlaneRaftPeerTransportPolicy::new(
+                "control-plane-raft-unix-peer-eof-test",
+                BTreeMap::from([(1, BasicNode::new("node-1")), (2, node.clone())]),
+                limits,
+            );
+            let mut factory =
+                ControlPlaneRaftUnixPeerNetworkFactory::new(1, policy, Duration::from_secs(1));
+            let mut network = factory.new_client(2, &node).await;
+            let err = network
+                .vote(
+                    VoteRequest {
+                        vote: Vote::<ControlPlaneRaftLeaderId>::new(7, 1),
+                        last_log_id: None,
+                        leadership_transfer: false,
+                    },
+                    RPCOption::new(Duration::from_secs(1)),
+                )
+                .await
+                .unwrap_err();
+
+            assert!(matches!(
+                err,
+                RPCError::Unreachable(error)
+                    if error.to_string().contains("read transport")
+            ));
+            server.join().unwrap();
+            let _ = std::fs::remove_file(socket_path);
+        });
+    }
+
+    #[test]
+    fn control_plane_raft_unix_peer_snapshot_read_eof_is_unreachable() {
+        ControlPlaneRaftTypeConfig::run(async {
+            let socket_path = raft_unix_socket_path("snapshot-eof");
+            let listener = UnixListener::bind(&socket_path).unwrap();
+            let limits = ControlPlaneRaftPeerTransportLimits {
+                max_frame_bytes: 8192,
+                max_append_entries: 8,
+                max_append_entries_bytes: 4096,
+                max_snapshot_bytes: 8192,
+            };
+            let server_path = socket_path.clone();
+            let server = thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let _ = read_control_plane_raft_peer_transport_frame(
+                    &mut stream,
+                    limits.max_frame_bytes,
+                )
+                .unwrap();
+                drop(stream);
+                let _ = std::fs::remove_file(server_path);
+            });
+
+            let node = BasicNode::new(socket_path.display().to_string());
+            let policy = ControlPlaneRaftPeerTransportPolicy::new(
+                "control-plane-raft-unix-peer-snapshot-eof-test",
+                BTreeMap::from([(1, BasicNode::new("node-1")), (2, node.clone())]),
+                limits,
+            );
+            let mut state_machine = ControlPlaneRaftStateMachine::empty();
+            state_machine
+                .apply_entry(bootstrap_membership_entry(1))
+                .unwrap();
+            let snapshot = state_machine.build_snapshot().unwrap();
+
+            let mut factory =
+                ControlPlaneRaftUnixPeerNetworkFactory::new(1, policy, Duration::from_secs(1));
+            let mut network = factory.new_client(2, &node).await;
+            let err = network
+                .full_snapshot(
+                    Vote::<ControlPlaneRaftLeaderId>::new_committed(7, 1),
+                    snapshot,
+                    std::future::pending::<ReplicationClosed>(),
+                    RPCOption::new(Duration::from_secs(1)),
+                )
+                .await
+                .unwrap_err();
+
+            assert!(matches!(
+                err,
+                StreamingError::Unreachable(error)
+                    if error.to_string().contains("full_snapshot read transport")
+            ));
+            server.join().unwrap();
+            let _ = std::fs::remove_file(socket_path);
         });
     }
 
@@ -9456,7 +10056,20 @@ mod tests {
             )
             .await;
             let routed_client_serving_status = expect_bounded_control_plane_raft(
-                routed_client_serving_authority.status(),
+                async {
+                    for _ in 0..100 {
+                        let status = routed_client_serving_authority.status().await?;
+                        if status.linearized_authority_serving() {
+                            return Ok(status);
+                        }
+                        ControlPlaneRaftTypeConfig::sleep(Duration::from_millis(10)).await;
+                    }
+                    Err(ControlPlaneError::RpcRemote {
+                        message:
+                            "authority routing handle selected authority did not report serving"
+                                .to_string(),
+                    })
+                },
                 operation_timeout,
                 "authority routing handle current serving routed authority status",
             )

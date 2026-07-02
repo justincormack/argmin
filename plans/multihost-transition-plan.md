@@ -10366,6 +10366,13 @@ Phase 12.3 progress:
   response. The in-process test network now uses this dispatcher, so the next
   Unix/process listener can be a bounded frame read plus dispatcher plus framed
   response write rather than a parallel RPC implementation.
+- Added the first Unix-socket OpenRaft peer network factory/client. It reuses
+  the peer transport policy, identity-framed CRC codecs, bounded length-prefix
+  IO helper, explicit read/write timeouts, and OpenRaft network/streaming error
+  mapping for append-entries, vote, pre-vote, snapshot, and transfer-leader
+  traffic. A focused socket round-trip regression pins request/response
+  identity validation for vote RPCs; process listener wiring remains the next
+  layer.
 
 1. define the replicated control-plane state machine:
    - state includes cluster epoch, PG count, PG state, PG acting sets, node
