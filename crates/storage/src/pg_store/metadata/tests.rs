@@ -2097,6 +2097,37 @@ fn metadata_txn_commit_failure_recovers_representative_mutators() {
     );
 
     assert_commit_failure_recovers_for_metadata_mutator(
+        "upsert-multipart-part",
+        |store| {
+            create_probe_bucket_direct(store, &trusted_bucket_name("commit-fail-upsert-part"));
+            PgMetadataStore::create_multipart_upload(
+                store,
+                &CreateMultipartUploadReq {
+                    upload_id: crate::tests::multipart_upload_id("commit-fail-upsert-part-upload"),
+                    bucket: trusted_bucket_name("commit-fail-upsert-part"),
+                    key: trusted_object_key("object"),
+                    tags: None,
+                    metadata_blob: SerializedMetadataBlob::default(),
+                    system_metadata_blob: SerializedSystemMetadataBlob::default(),
+                    initiator: test_owner(),
+                    owner: test_owner(),
+                    acl_grants: AclGrants::default(),
+                    public_read: false,
+                    object_lock: ObjectLockState::default(),
+                    checksum: None,
+                    encryption: ObjectEncryption::None,
+                },
+            )
+            .unwrap();
+        },
+        |store| {
+            let upload_id = crate::tests::multipart_upload_id("commit-fail-upsert-part-upload");
+            PgMetadataStore::upsert_multipart_part(store, &test_multipart_part(upload_id, 1))
+                .map(|_| ())
+        },
+    );
+
+    assert_commit_failure_recovers_for_metadata_mutator(
         "put-bucket-encryption",
         |store| create_probe_bucket_direct(store, &trusted_bucket_name("commit-fail-encryption")),
         |store| {
@@ -2242,6 +2273,33 @@ fn metadata_txn_commit_failure_recovers_representative_mutators() {
     );
 
     assert_commit_failure_recovers_for_metadata_mutator(
+        "delete-bucket-subresource",
+        |store| {
+            create_probe_bucket_direct(
+                store,
+                &trusted_bucket_name("commit-fail-delete-subresource"),
+            );
+            PgMetadataStore::put_bucket_subresource(
+                store,
+                &trusted_bucket_name("commit-fail-delete-subresource"),
+                PutBucketSubresource {
+                    kind: BucketSubresourceKind::Policy,
+                    body: r#"{"Statement":[]}"#,
+                    aux: BucketSubresourceAux::policy(false),
+                },
+            )
+            .unwrap();
+        },
+        |store| {
+            PgMetadataStore::delete_bucket_subresource(
+                store,
+                &trusted_bucket_name("commit-fail-delete-subresource"),
+                BucketSubresourceKind::Policy,
+            )
+        },
+    );
+
+    assert_commit_failure_recovers_for_metadata_mutator(
         "put-object-meta",
         |store| create_probe_bucket_direct(store, &trusted_bucket_name("commit-fail-object-meta")),
         |store| {
@@ -2250,6 +2308,28 @@ fn metadata_txn_commit_failure_recovers_representative_mutators() {
             PgMetadataStore::put_object_meta(
                 store,
                 &PutObjectReq::Live(test_live_object(bucket, key, 1)),
+            )
+        },
+    );
+
+    assert_commit_failure_recovers_for_metadata_mutator(
+        "delete-object-version",
+        |store| {
+            create_probe_bucket_direct(store, &trusted_bucket_name("commit-fail-delete-version"));
+            let bucket = trusted_bucket_name("commit-fail-delete-version");
+            let key = trusted_object_key("object");
+            PgMetadataStore::put_object_meta(
+                store,
+                &PutObjectReq::Live(test_live_object(bucket, key, 1)),
+            )
+            .unwrap();
+        },
+        |store| {
+            PgMetadataStore::delete_object_version(
+                store,
+                &trusted_bucket_name("commit-fail-delete-version"),
+                &trusted_object_key("object"),
+                VersionId::Null,
             )
         },
     );
@@ -2505,6 +2585,30 @@ fn metadata_txn_commit_failure_recovers_representative_mutators() {
                 &segments,
             )
             .map(|_| ())
+        },
+    );
+
+    assert_commit_failure_recovers_for_metadata_mutator(
+        "delete-stream-upload",
+        |store| {
+            create_probe_bucket_direct(store, &trusted_bucket_name("commit-fail-delete-stream"));
+            PgMetadataStore::create_stream_upload(
+                store,
+                &CreateStreamUploadReq {
+                    session_id: SessionId::try_from("d1".repeat(16)).unwrap(),
+                    bucket: trusted_bucket_name("commit-fail-delete-stream"),
+                    key: trusted_object_key("object"),
+                    target: StreamUploadTarget::PutObject,
+                    encryption: ObjectEncryption::None,
+                },
+            )
+            .unwrap();
+        },
+        |store| {
+            PgMetadataStore::delete_stream_upload(
+                store,
+                &SessionId::try_from("d1".repeat(16)).unwrap(),
+            )
         },
     );
 }

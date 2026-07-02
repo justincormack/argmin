@@ -301,34 +301,34 @@ Progress update:
    Progress update: a reusable harness now covers representative generic-transaction
    mutators (`create_bucket`, bucket versioning, bucket ACL, bucket encryption, bucket
    Object Lock, public access block put/delete, ownership controls put/delete, ABAC,
-   bucket subresource, `mark_bucket_deleting`, and create multipart upload), explicit
-   bucket lifecycle transactions (`delete_finalized_bucket`, metadata-command reservation
-   release, expired drain clear, and drain heartbeat), plus representative hand-written
-   metadata transactions (object metadata put, object generation reservation, segmented
-   object put, object-segment reclaim, multipart reclaim, multipart upload delete,
-   committed multipart object-part manifest insertion, full multipart completion, staged
-   multipart part segment upsert, and streamed UploadPart finalization). Each case injects a
-   commit failure, reopens and recovers the PG, checks cached-vs-materialised table digests
-   and replica-state digest consistency, asserts no pending slot remains, asserts the PG
-   accepts the next metadata command, and then applies that command. The remaining work is
-   to complete the inventory of digest-affecting mutators, especially single-statement
-   mutators with no explicit transaction. Those need either explicit classification as
-   SQLite crash-atomic single statements or conversion to explicit transactions if their
-   rollback boundary matters.
+   bucket subresource put/delete, `mark_bucket_deleting`, and create multipart upload),
+   explicit bucket lifecycle transactions (`delete_finalized_bucket`,
+   metadata-command reservation release, expired drain clear, and drain heartbeat), plus
+   representative hand-written metadata transactions (object metadata put, object-version
+   delete, object generation reservation, segmented object put, object-segment reclaim,
+   multipart reclaim, multipart upload delete, direct multipart part upsert, committed
+   multipart object-part manifest insertion, full multipart completion, staged multipart
+   part segment upsert, streamed UploadPart finalization, and standalone stream-upload
+   delete). Each case injects a commit failure, reopens and recovers the PG, checks
+   cached-vs-materialised table digests and replica-state digest consistency, asserts no
+   pending slot remains, asserts the PG accepts the next metadata command, and then applies
+   that command. The explicit multi-statement transaction inventory is now represented by
+   direct commit-failure coverage. A follow-up audit pass classified the remaining
+   digest-affecting `PgMetadataStore` methods as single SQLite statement maintenance paths,
+   or as read-before-single-write helpers where the pre-write read failure leaves no
+   mutation to recover. Those paths do not need the commit-failure hook unless they are
+   later expanded into multiple writes.
 
-   Remaining inventory groups visible from the `PgMetadataStore` surface:
-   - single-statement bucket reservation/drain/finalizer/lifecycle/reclaim claim
-     maintenance rows, especially `acquire_*`, direct `release_*`/`clear_*`, claim
-     heartbeats/error records, and attempt-outcome helpers;
-   - smaller bucket configuration mutators not yet represented by the matrix, currently
-     delete-subresource variants;
-   - smaller object metadata mutators, such as object ACL, retention, legal hold,
-     object-tag put/delete, object metadata delete, object-version delete, and generation
-     reservation release;
-   - single-statement stream/upload maintenance mutators, such as stream upload create,
-     stream upload state/delete, stream segment append, stream segment publish helpers, MPU
-     state changes, direct MPU part upsert, completed-upload delete, object-part delete,
-     object-segment delete, and reclaim-row delete helpers.
+   Remaining non-transactional groups to keep under ordinary digest-consistency coverage:
+   - bucket reservation/drain/finalizer/lifecycle/reclaim claim maintenance rows,
+     especially `acquire_*`, direct `release_*`/`clear_*`, claim heartbeats/error records,
+     and attempt-outcome helpers;
+   - object metadata maintenance helpers such as object ACL, retention, legal hold,
+     object-tag put/delete, object metadata delete, and generation reservation release;
+   - stream/upload maintenance helpers such as stream upload create, stream upload state,
+     stream segment append, stream segment VID floor advance, MPU state changes,
+     completed-upload delete, object-part delete, object-segment delete, and reclaim-row
+     delete helpers.
 
 7. **Storage-node restart coverage.** **Completed for current Slice 1 recovery classes.**
    Add a test that opens a PG through

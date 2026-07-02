@@ -1013,7 +1013,7 @@ impl PgStore {
                 )?;
                 store.release_multipart_completion_reservation_in_open_txn(command)?;
                 for session in &command.stream_uploads {
-                    store.delete_stream_upload_direct(&session.session_id)?;
+                    store.delete_stream_upload_in_open_txn(&session.session_id)?;
                 }
                 store.delete_multipart_upload_if_present_in_open_txn(&command.upload_id)
             },
@@ -1145,7 +1145,7 @@ impl PgStore {
                 store.insert_completed_multipart_upload_in_open_txn(command)?;
                 store.release_multipart_completion_reservation_in_open_txn(command)?;
                 for session in &command.stream_uploads {
-                    store.delete_stream_upload_direct(&session.session_id)?;
+                    store.delete_stream_upload_in_open_txn(&session.session_id)?;
                 }
                 store.delete_multipart_upload_if_present_in_open_txn(&command.upload_id)?;
                 Ok(())
@@ -2120,7 +2120,7 @@ impl PgStore {
                     &command.session_id,
                     StreamUploadState::Aborted,
                 )?;
-                store.delete_stream_upload_direct(&command.session_id)
+                store.delete_stream_upload_in_open_txn(&command.session_id)
             },
         )
     }
@@ -2151,7 +2151,7 @@ impl PgStore {
                     command.part.part_number,
                 )?;
                 store.insert_multipart_part_segments_explicit(&command.segments)?;
-                store.delete_stream_upload_direct(&command.session_id)
+                store.delete_stream_upload_in_open_txn(&command.session_id)
             },
         )
     }
@@ -2781,7 +2781,7 @@ impl PgStore {
                         });
                     }
                     for session in &command.cleanup.stream_uploads {
-                        store.delete_stream_upload_direct(&session.session_id)?;
+                        store.delete_stream_upload_in_open_txn(&session.session_id)?;
                     }
                 }
                 store.delete_multipart_part_segments_by_upload_id_direct(&command.upload_id)?;
@@ -10772,7 +10772,11 @@ impl PgMetadataStore for PgStore {
 
     #[cfg(test)]
     fn delete_stream_upload(&self, session_id: &SessionId) -> Result<(), MetadataError> {
-        self.delete_stream_upload_direct(session_id)
+        self.with_immediate_txn(
+            "delete stream upload (begin txn)",
+            "delete stream upload (commit txn)",
+            |store| store.delete_stream_upload_in_open_txn(session_id),
+        )
     }
 
     fn list_all_stream_uploads(&self) -> Result<Vec<StreamUploadRecord>, MetadataError> {
@@ -11838,7 +11842,10 @@ impl PgStore {
         Ok(())
     }
 
-    fn delete_stream_upload_direct(&self, session_id: &SessionId) -> Result<(), MetadataError> {
+    fn delete_stream_upload_in_open_txn(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<(), MetadataError> {
         self.conn
             .execute(
                 "DELETE FROM stream_uploads WHERE session_id = ?1",
