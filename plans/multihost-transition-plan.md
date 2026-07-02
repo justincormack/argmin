@@ -10360,6 +10360,12 @@ Phase 12.3 progress:
   allocating payload storage, then hands the bounded frame bytes to the
   versioned CRC/identity codec. This is the process-socket IO boundary shape;
   starting real peer listener/client processes remains a subsequent slice.
+- Added a reusable server-side peer frame dispatcher for ordinary Raft RPC and
+  snapshot traffic. It validates the expected peer identity, dispatches the
+  decoded request to the local OpenRaft handle, and returns an identity-framed
+  response. The in-process test network now uses this dispatcher, so the next
+  Unix/process listener can be a bounded frame read plus dispatcher plus framed
+  response write rather than a parallel RPC implementation.
 
 1. define the replicated control-plane state machine:
    - state includes cluster epoch, PG count, PG state, PG acting sets, node

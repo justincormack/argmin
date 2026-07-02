@@ -3991,6 +3991,108 @@ pub fn read_control_plane_raft_peer_transport_frame(
     Ok(frame)
 }
 
+pub async fn handle_control_plane_raft_peer_rpc_frame(
+    raft: &Raft<ControlPlaneRaftTypeConfig, ControlPlaneRaftStateMachine>,
+    frame: &[u8],
+    expected_identity: &ControlPlaneRaftPeerFrameIdentity,
+) -> Result<Vec<u8>, ControlPlaneError> {
+    handle_control_plane_raft_peer_rpc_frame_with_identity(raft, frame, Some(expected_identity))
+        .await
+}
+
+async fn handle_control_plane_raft_peer_rpc_frame_with_identity(
+    raft: &Raft<ControlPlaneRaftTypeConfig, ControlPlaneRaftStateMachine>,
+    frame: &[u8],
+    expected_identity: Option<&ControlPlaneRaftPeerFrameIdentity>,
+) -> Result<Vec<u8>, ControlPlaneError> {
+    let request =
+        ControlPlaneRaftPeerRpcRequest::decode_frame_with_identity(frame, expected_identity)?;
+    let response = match request {
+        ControlPlaneRaftPeerRpcRequest::AppendEntries(request) => {
+            ControlPlaneRaftPeerRpcResponse::AppendEntries(
+                raft.append_entries(request)
+                    .await
+                    .map_err(|error| openraft_remote_error("peer append_entries", error))?,
+            )
+        }
+        ControlPlaneRaftPeerRpcRequest::Vote(request) => ControlPlaneRaftPeerRpcResponse::Vote(
+            raft.vote(request)
+                .await
+                .map_err(|error| openraft_remote_error("peer vote", error))?,
+        ),
+        ControlPlaneRaftPeerRpcRequest::PreVote(request) => ControlPlaneRaftPeerRpcResponse::Vote(
+            raft.pre_vote(request)
+                .await
+                .map_err(|error| openraft_remote_error("peer pre_vote", error))?,
+        ),
+        ControlPlaneRaftPeerRpcRequest::TransferLeader(request) => {
+            ControlPlaneRaftPeerRpcResponse::TransferLeader(
+                raft.handle_transfer_leader(request)
+                    .await
+                    .map_err(|error| openraft_remote_error("peer transfer_leader", error))?,
+            )
+        }
+    };
+    response.encode_frame_with_identity(
+        expected_identity
+            .as_ref()
+            .map(|identity| reverse_raft_peer_frame_identity(identity))
+            .as_ref(),
+    )
+}
+
+pub async fn handle_control_plane_raft_peer_snapshot_frame(
+    raft: &Raft<ControlPlaneRaftTypeConfig, ControlPlaneRaftStateMachine>,
+    frame: &[u8],
+    max_frame_bytes: usize,
+    max_snapshot_bytes: usize,
+    expected_identity: &ControlPlaneRaftPeerFrameIdentity,
+) -> Result<Vec<u8>, ControlPlaneError> {
+    handle_control_plane_raft_peer_snapshot_frame_with_identity(
+        raft,
+        frame,
+        max_frame_bytes,
+        max_snapshot_bytes,
+        Some(expected_identity),
+    )
+    .await
+}
+
+async fn handle_control_plane_raft_peer_snapshot_frame_with_identity(
+    raft: &Raft<ControlPlaneRaftTypeConfig, ControlPlaneRaftStateMachine>,
+    frame: &[u8],
+    max_frame_bytes: usize,
+    max_snapshot_bytes: usize,
+    expected_identity: Option<&ControlPlaneRaftPeerFrameIdentity>,
+) -> Result<Vec<u8>, ControlPlaneError> {
+    let request = ControlPlaneRaftPeerSnapshotRequest::decode_frame_with_identity(
+        frame,
+        max_frame_bytes,
+        max_snapshot_bytes,
+        expected_identity,
+    )?;
+    let response = raft
+        .install_full_snapshot(request.vote, request.snapshot)
+        .await
+        .map_err(|error| openraft_remote_error("peer full_snapshot", error))?;
+    ControlPlaneRaftPeerSnapshotResponse { response }.encode_frame_with_identity(
+        expected_identity
+            .as_ref()
+            .map(|identity| reverse_raft_peer_frame_identity(identity))
+            .as_ref(),
+    )
+}
+
+fn reverse_raft_peer_frame_identity(
+    identity: &ControlPlaneRaftPeerFrameIdentity,
+) -> ControlPlaneRaftPeerFrameIdentity {
+    ControlPlaneRaftPeerFrameIdentity::new(
+        identity.cluster_name.clone(),
+        identity.target,
+        identity.source,
+    )
+}
+
 fn durable_artifact_tmp_path(path: &Path) -> PathBuf {
     let file_name = path
         .file_name()
@@ -6223,17 +6325,6 @@ mod tests {
                 ))))
             })
         }
-
-        fn remote_failure(
-            &self,
-            rpc_name: &'static str,
-            error: impl fmt::Display,
-        ) -> RPCError<ControlPlaneRaftTypeConfig> {
-            RPCError::Network(NetworkError::from_string(format!(
-                "in-memory test raft network {rpc_name} to node {} failed: {error}",
-                self.target
-            )))
-        }
     }
 
     impl fmt::Debug for InMemoryRaftNetwork {
@@ -6267,32 +6358,17 @@ mod tests {
             let encoded = ControlPlaneRaftPeerRpcRequest::AppendEntries(rpc)
                 .encode_frame_with_identity(request_identity.as_ref())
                 .map_err(|error| Self::rpc_protocol_error("append_entries encode", error))?;
-            let ControlPlaneRaftPeerRpcRequest::AppendEntries(decoded) =
-                ControlPlaneRaftPeerRpcRequest::decode_frame_with_identity(
-                    &encoded,
-                    request_identity.as_ref(),
-                )
-                .map_err(|error| Self::rpc_protocol_error("append_entries decode", error))?
-            else {
-                return Err(Self::rpc_protocol_error(
-                    "append_entries decode",
-                    raft_artifact_protocol_error("decoded non-append_entries request frame"),
-                ));
-            };
-            let response = self
-                .target_raft("append_entries")?
-                .append_entries(decoded)
-                .await
-                .map_err(|error| self.remote_failure("append_entries", error))?;
+            let response_frame = handle_control_plane_raft_peer_rpc_frame_with_identity(
+                &self.target_raft("append_entries")?,
+                &encoded,
+                request_identity.as_ref(),
+            )
+            .await
+            .map_err(|error| Self::rpc_protocol_error("append_entries dispatch", error))?;
             let response_identity = self.response_identity()?;
-            let encoded = ControlPlaneRaftPeerRpcResponse::AppendEntries(response)
-                .encode_frame_with_identity(response_identity.as_ref())
-                .map_err(|error| {
-                    Self::rpc_protocol_error("append_entries response encode", error)
-                })?;
             let ControlPlaneRaftPeerRpcResponse::AppendEntries(response) =
                 ControlPlaneRaftPeerRpcResponse::decode_frame_with_identity(
-                    &encoded,
+                    &response_frame,
                     response_identity.as_ref(),
                 )
                 .map_err(|error| {
@@ -6318,30 +6394,17 @@ mod tests {
             let encoded = ControlPlaneRaftPeerRpcRequest::Vote(rpc)
                 .encode_frame_with_identity(request_identity.as_ref())
                 .map_err(|error| Self::rpc_protocol_error("vote encode", error))?;
-            let ControlPlaneRaftPeerRpcRequest::Vote(decoded) =
-                ControlPlaneRaftPeerRpcRequest::decode_frame_with_identity(
-                    &encoded,
-                    request_identity.as_ref(),
-                )
-                .map_err(|error| Self::rpc_protocol_error("vote decode", error))?
-            else {
-                return Err(Self::rpc_protocol_error(
-                    "vote decode",
-                    raft_artifact_protocol_error("decoded non-vote request frame"),
-                ));
-            };
-            let response = self
-                .target_raft("vote")?
-                .vote(decoded)
-                .await
-                .map_err(|error| self.remote_failure("vote", error))?;
+            let response_frame = handle_control_plane_raft_peer_rpc_frame_with_identity(
+                &self.target_raft("vote")?,
+                &encoded,
+                request_identity.as_ref(),
+            )
+            .await
+            .map_err(|error| Self::rpc_protocol_error("vote dispatch", error))?;
             let response_identity = self.response_identity()?;
-            let encoded = ControlPlaneRaftPeerRpcResponse::Vote(response)
-                .encode_frame_with_identity(response_identity.as_ref())
-                .map_err(|error| Self::rpc_protocol_error("vote response encode", error))?;
             let ControlPlaneRaftPeerRpcResponse::Vote(response) =
                 ControlPlaneRaftPeerRpcResponse::decode_frame_with_identity(
-                    &encoded,
+                    &response_frame,
                     response_identity.as_ref(),
                 )
                 .map_err(|error| Self::rpc_protocol_error("vote response decode", error))?
@@ -6365,30 +6428,17 @@ mod tests {
             let encoded = ControlPlaneRaftPeerRpcRequest::PreVote(rpc)
                 .encode_frame_with_identity(request_identity.as_ref())
                 .map_err(|error| Self::rpc_protocol_error("pre_vote encode", error))?;
-            let ControlPlaneRaftPeerRpcRequest::PreVote(decoded) =
-                ControlPlaneRaftPeerRpcRequest::decode_frame_with_identity(
-                    &encoded,
-                    request_identity.as_ref(),
-                )
-                .map_err(|error| Self::rpc_protocol_error("pre_vote decode", error))?
-            else {
-                return Err(Self::rpc_protocol_error(
-                    "pre_vote decode",
-                    raft_artifact_protocol_error("decoded non-pre_vote request frame"),
-                ));
-            };
-            let response = self
-                .target_raft("pre_vote")?
-                .pre_vote(decoded)
-                .await
-                .map_err(|error| self.remote_failure("pre_vote", error))?;
+            let response_frame = handle_control_plane_raft_peer_rpc_frame_with_identity(
+                &self.target_raft("pre_vote")?,
+                &encoded,
+                request_identity.as_ref(),
+            )
+            .await
+            .map_err(|error| Self::rpc_protocol_error("pre_vote dispatch", error))?;
             let response_identity = self.response_identity()?;
-            let encoded = ControlPlaneRaftPeerRpcResponse::Vote(response)
-                .encode_frame_with_identity(response_identity.as_ref())
-                .map_err(|error| Self::rpc_protocol_error("pre_vote response encode", error))?;
             let ControlPlaneRaftPeerRpcResponse::Vote(response) =
                 ControlPlaneRaftPeerRpcResponse::decode_frame_with_identity(
-                    &encoded,
+                    &response_frame,
                     response_identity.as_ref(),
                 )
                 .map_err(|error| Self::rpc_protocol_error("pre_vote response decode", error))?
@@ -6438,31 +6488,18 @@ mod tests {
             let encoded = request
                 .encode_frame_with_identity(request_identity.as_ref())
                 .map_err(|error| Self::streaming_protocol_error("full_snapshot encode", error))?;
-            let decoded = ControlPlaneRaftPeerSnapshotRequest::decode_frame_with_identity(
+            let response_frame = handle_control_plane_raft_peer_snapshot_frame_with_identity(
+                &self.target_raft("full_snapshot")?,
                 &encoded,
                 usize::MAX,
                 max_snapshot_bytes,
                 request_identity.as_ref(),
             )
-            .map_err(|error| Self::streaming_protocol_error("full_snapshot decode", error))?;
-            let response = self
-                .target_raft("full_snapshot")?
-                .install_full_snapshot(decoded.vote, decoded.snapshot)
-                .await
-                .map_err(|error| {
-                    StreamingError::Network(NetworkError::from_string(format!(
-                        "in-memory test raft network full_snapshot to node {} failed: {error}",
-                        self.target
-                    )))
-                })?;
+            .await
+            .map_err(|error| Self::streaming_protocol_error("full_snapshot dispatch", error))?;
             let response_identity = self.snapshot_response_identity()?;
-            let encoded = ControlPlaneRaftPeerSnapshotResponse { response }
-                .encode_frame_with_identity(response_identity.as_ref())
-                .map_err(|error| {
-                    Self::streaming_protocol_error("full_snapshot response encode", error)
-                })?;
             let response = ControlPlaneRaftPeerSnapshotResponse::decode_frame_with_identity(
-                &encoded,
+                &response_frame,
                 response_identity.as_ref(),
             )
             .map_err(|error| {
@@ -6485,32 +6522,17 @@ mod tests {
             let encoded = ControlPlaneRaftPeerRpcRequest::TransferLeader(req)
                 .encode_frame_with_identity(request_identity.as_ref())
                 .map_err(|error| Self::rpc_protocol_error("transfer_leader encode", error))?;
-            let ControlPlaneRaftPeerRpcRequest::TransferLeader(decoded) =
-                ControlPlaneRaftPeerRpcRequest::decode_frame_with_identity(
-                    &encoded,
-                    request_identity.as_ref(),
-                )
-                .map_err(|error| Self::rpc_protocol_error("transfer_leader decode", error))?
-            else {
-                return Err(Self::rpc_protocol_error(
-                    "transfer_leader decode",
-                    raft_artifact_protocol_error("decoded non-transfer_leader request frame"),
-                ));
-            };
-            let response = self
-                .target_raft("transfer_leader")?
-                .handle_transfer_leader(decoded)
-                .await
-                .map_err(|error| self.remote_failure("transfer_leader", error))?;
+            let response_frame = handle_control_plane_raft_peer_rpc_frame_with_identity(
+                &self.target_raft("transfer_leader")?,
+                &encoded,
+                request_identity.as_ref(),
+            )
+            .await
+            .map_err(|error| Self::rpc_protocol_error("transfer_leader dispatch", error))?;
             let response_identity = self.response_identity()?;
-            let encoded = ControlPlaneRaftPeerRpcResponse::TransferLeader(response)
-                .encode_frame_with_identity(response_identity.as_ref())
-                .map_err(|error| {
-                    Self::rpc_protocol_error("transfer_leader response encode", error)
-                })?;
             let ControlPlaneRaftPeerRpcResponse::TransferLeader(response) =
                 ControlPlaneRaftPeerRpcResponse::decode_frame_with_identity(
-                    &encoded,
+                    &response_frame,
                     response_identity.as_ref(),
                 )
                 .map_err(|error| {
