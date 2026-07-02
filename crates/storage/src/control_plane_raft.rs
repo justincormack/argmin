@@ -18,6 +18,7 @@ use openraft::storage::{EntryResponder, IOFlushed, LogState, RaftLogStorage, Raf
 use openraft::type_config::alias::{
     LogIdOf, SnapshotMetaOf, SnapshotOf, StoredMembershipOf, VoteOf,
 };
+use openraft::type_config::TypeConfigExt;
 use openraft::EntryPayload;
 use openraft::LogId;
 use openraft::OptionalSend;
@@ -194,6 +195,13 @@ pub trait ControlPlaneRaftAuthorityNodeLifecycle {
     fn wait_for_applied_index_at_least(
         &self,
         index: u64,
+        timeout: Duration,
+        message: &'static str,
+    ) -> ControlPlaneRaftFuture<'_, Result<(), ControlPlaneError>>;
+
+    fn wait_for_applied_log_id(
+        &self,
+        log_id: LogIdOf<ControlPlaneRaftTypeConfig>,
         timeout: Duration,
         message: &'static str,
     ) -> ControlPlaneRaftFuture<'_, Result<(), ControlPlaneError>>;
@@ -791,6 +799,15 @@ impl ControlPlaneRaftAuthorityNodeLifecycle for ControlPlaneRaftAuthorityNodeLif
     ) -> ControlPlaneRaftFuture<'_, Result<(), ControlPlaneError>> {
         self.inner
             .wait_for_applied_index_at_least(index, timeout, message)
+    }
+
+    fn wait_for_applied_log_id(
+        &self,
+        log_id: LogIdOf<ControlPlaneRaftTypeConfig>,
+        timeout: Duration,
+        message: &'static str,
+    ) -> ControlPlaneRaftFuture<'_, Result<(), ControlPlaneError>> {
+        self.inner.wait_for_applied_log_id(log_id, timeout, message)
     }
 
     fn wait_for_current_leader(
@@ -1519,6 +1536,47 @@ impl ControlPlaneRaftAuthority {
             .map_err(|error| openraft_remote_error("wait-applied-index", error))
     }
 
+    pub async fn wait_for_applied_log_id(
+        &self,
+        log_id: LogIdOf<ControlPlaneRaftTypeConfig>,
+        timeout: Duration,
+        message: &'static str,
+    ) -> Result<(), ControlPlaneError> {
+        ControlPlaneRaftTypeConfig::timeout(timeout, async {
+            loop {
+                let applied = self
+                    .raft
+                    .with_state_machine(|state_machine| {
+                        let applied = state_machine.last_applied();
+                        Box::pin(async move { applied })
+                    })
+                    .await
+                    .map_err(|error| openraft_remote_error("wait-applied-log-id", error))?;
+                if let Some(applied) = applied {
+                    if applied.index() > log_id.index() {
+                        return Ok(());
+                    }
+                    if applied.index() == log_id.index() {
+                        if applied == log_id {
+                            return Ok(());
+                        }
+                        return Err(ControlPlaneError::RpcRemote {
+                            message: format!(
+                                "OpenRaft wait-applied-log-id observed mismatched log id: \
+                                 applied={applied:?}, expected={log_id:?}: {message}"
+                            ),
+                        });
+                    }
+                }
+                ControlPlaneRaftTypeConfig::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .map_err(|_| ControlPlaneError::RpcRemote {
+            message: format!("OpenRaft wait-applied-log-id timed out after {timeout:?}: {message}"),
+        })?
+    }
+
     pub async fn wait_for_current_leader(
         &self,
         leader_id: ControlPlaneRaftNodeId,
@@ -1940,6 +1998,17 @@ impl ControlPlaneRaftAuthorityNodeLifecycle for ControlPlaneRaftAuthority {
                 self, index, timeout, message,
             )
             .await
+        })
+    }
+
+    fn wait_for_applied_log_id(
+        &self,
+        log_id: LogIdOf<ControlPlaneRaftTypeConfig>,
+        timeout: Duration,
+        message: &'static str,
+    ) -> ControlPlaneRaftFuture<'_, Result<(), ControlPlaneError>> {
+        Box::pin(async move {
+            ControlPlaneRaftAuthority::wait_for_applied_log_id(self, log_id, timeout, message).await
         })
     }
 
@@ -5407,6 +5476,14 @@ mod tests {
                     node_id
                 }) if *node_id == 99
             ));
+            authority
+                .wait_for_applied_log_id(
+                    bootstrap_log_id,
+                    Duration::from_secs(1),
+                    "already-applied earlier entry remains reflected",
+                )
+                .await
+                .unwrap();
 
             let (applied_snapshot, (applied_log_id, _applied_membership)) = authority
                 .raft()
@@ -5667,8 +5744,8 @@ mod tests {
                 )
             ));
             expect_bounded_control_plane_raft(
-                lifecycle2.wait_for_applied_index_at_least(
-                    bootstrap.log_id().index(),
+                lifecycle2.wait_for_applied_log_id(
+                    bootstrap.log_id(),
                     Duration::from_secs(1),
                     "explicit handles follower applied bootstrap",
                 ),
@@ -5701,8 +5778,8 @@ mod tests {
             )
             .await;
             expect_bounded_control_plane_raft(
-                lifecycle2.wait_for_applied_index_at_least(
-                    membership_log_id.index(),
+                lifecycle2.wait_for_applied_log_id(
+                    membership_log_id,
                     Duration::from_secs(1),
                     "explicit handles applied voter replacement",
                 ),
@@ -5838,6 +5915,13 @@ mod tests {
             let routed_linearized_handle =
                 ControlPlaneRaftAuthorityHandle::new(Arc::new(routed_client.clone()));
             let routed_linearized_authority = routed_linearized_handle.as_linearized_authority();
+            wait_for_authority_status_matching(
+                &authority1,
+                operation_timeout,
+                "authority capability directory leader serving before bootstrap command",
+                ControlPlaneRaftAuthorityStatus::linearized_authority_serving,
+            )
+            .await;
             let bootstrap = expect_bounded_control_plane_raft(
                 routed_client.submit_control_plane_command(
                     ControlPlaneCommand::BootstrapInitialClusterMap {
@@ -5859,8 +5943,8 @@ mod tests {
                 )
             ));
             expect_bounded_control_plane_raft(
-                follower_node_lifecycle.wait_for_applied_index_at_least(
-                    bootstrap.log_id().index(),
+                follower_node_lifecycle.wait_for_applied_log_id(
+                    bootstrap.log_id(),
                     Duration::from_secs(1),
                     "authority capability directory follower applied bootstrap",
                 ),
@@ -6043,8 +6127,8 @@ mod tests {
             )
             .await;
             expect_bounded_control_plane_raft(
-                follower_node_lifecycle.wait_for_applied_index_at_least(
-                    routed_membership_log_id.index(),
+                follower_node_lifecycle.wait_for_applied_log_id(
+                    routed_membership_log_id,
                     Duration::from_secs(1),
                     "authority capability directory routed voter replacement applied",
                 ),
@@ -6257,8 +6341,8 @@ mod tests {
             ));
 
             authority2
-                .wait_for_applied_index_at_least(
-                    write.log_id().index(),
+                .wait_for_applied_log_id(
+                    write.log_id(),
                     Duration::from_secs(1),
                     "two-node follower applied client write",
                 )
@@ -6329,8 +6413,8 @@ mod tests {
             ));
 
             authority2
-                .wait_for_applied_index_at_least(
-                    rejected.log_id().index(),
+                .wait_for_applied_log_id(
+                    rejected.log_id(),
                     Duration::from_secs(1),
                     "two-node follower applied rejected command",
                 )
@@ -6382,8 +6466,8 @@ mod tests {
                 )
             ));
             authority2
-                .wait_for_applied_index_at_least(
-                    bootstrap.log_id().index(),
+                .wait_for_applied_log_id(
+                    bootstrap.log_id(),
                     Duration::from_secs(1),
                     "new leader candidate applied bootstrap before transfer",
                 )
@@ -6465,8 +6549,8 @@ mod tests {
             assert!(follow_up.log_id().index() > bootstrap.log_id().index());
 
             authority1
-                .wait_for_applied_index_at_least(
-                    follow_up.log_id().index(),
+                .wait_for_applied_log_id(
+                    follow_up.log_id(),
                     Duration::from_secs(1),
                     "old leader follower applied post-transfer command",
                 )
@@ -6545,8 +6629,8 @@ mod tests {
                 )
             ));
             authority2
-                .wait_for_applied_index_at_least(
-                    bootstrap.log_id().index(),
+                .wait_for_applied_log_id(
+                    bootstrap.log_id(),
                     Duration::from_secs(1),
                     "removed voter candidate applied bootstrap before serving",
                 )
@@ -6637,8 +6721,8 @@ mod tests {
             )
             .await;
             authority1
-                .wait_for_applied_index_at_least(
-                    membership_log_id.index(),
+                .wait_for_applied_log_id(
+                    membership_log_id,
                     Duration::from_secs(1),
                     "two-node leader applied membership change",
                 )
@@ -6775,8 +6859,8 @@ mod tests {
                 .await
                 .unwrap();
             authority3
-                .wait_for_applied_index_at_least(
-                    learner_log_id.index(),
+                .wait_for_applied_log_id(
+                    learner_log_id,
                     Duration::from_secs(1),
                     "new learner applied learner membership",
                 )
@@ -6814,16 +6898,16 @@ mod tests {
                 .await
                 .unwrap();
             authority1
-                .wait_for_applied_index_at_least(
-                    promote_log_id.index(),
+                .wait_for_applied_log_id(
+                    promote_log_id,
                     Duration::from_secs(1),
                     "leader applied learner promotion",
                 )
                 .await
                 .unwrap();
             authority3
-                .wait_for_applied_index_at_least(
-                    promote_log_id.index(),
+                .wait_for_applied_log_id(
+                    promote_log_id,
                     Duration::from_secs(1),
                     "promoted learner applied voter membership",
                 )
@@ -6986,8 +7070,8 @@ mod tests {
                 .await
                 .unwrap();
             authority3
-                .wait_for_applied_index_at_least(
-                    promote_log_id.index(),
+                .wait_for_applied_log_id(
+                    promote_log_id,
                     Duration::from_secs(1),
                     "restart candidate applied voter promotion",
                 )
@@ -7147,8 +7231,8 @@ mod tests {
                 )
             ));
             authority2
-                .wait_for_applied_index_at_least(
-                    write.log_id().index(),
+                .wait_for_applied_log_id(
+                    write.log_id(),
                     Duration::from_secs(1),
                     "two-node follower applied before read-index",
                 )
@@ -7226,8 +7310,8 @@ mod tests {
                 )
             ));
             authority3
-                .wait_for_applied_index_at_least(
-                    bootstrap.log_id().index(),
+                .wait_for_applied_log_id(
+                    bootstrap.log_id(),
                     Duration::from_secs(1),
                     "third voter applied bootstrap before restart",
                 )
@@ -7381,8 +7465,8 @@ mod tests {
                 )
             ));
             authority3
-                .wait_for_applied_index_at_least(
-                    bootstrap.log_id().index(),
+                .wait_for_applied_log_id(
+                    bootstrap.log_id(),
                     Duration::from_secs(1),
                     "third voter applied bootstrap before snapshot catch-up restart",
                 )
@@ -7600,16 +7684,16 @@ mod tests {
                 )
             ));
             authority2
-                .wait_for_applied_index_at_least(
-                    bootstrap.log_id().index(),
+                .wait_for_applied_log_id(
+                    bootstrap.log_id(),
                     Duration::from_secs(1),
                     "second voter applied bootstrap before leader restart",
                 )
                 .await
                 .unwrap();
             authority3
-                .wait_for_applied_index_at_least(
-                    bootstrap.log_id().index(),
+                .wait_for_applied_log_id(
+                    bootstrap.log_id(),
                     Duration::from_secs(1),
                     "third voter applied bootstrap before leader restart",
                 )
@@ -7843,16 +7927,16 @@ mod tests {
                 )
             ));
             authority2
-                .wait_for_applied_index_at_least(
-                    bootstrap.log_id().index(),
+                .wait_for_applied_log_id(
+                    bootstrap.log_id(),
                     Duration::from_secs(1),
                     "second voter applied bootstrap before leader loss",
                 )
                 .await
                 .unwrap();
             authority3
-                .wait_for_applied_index_at_least(
-                    bootstrap.log_id().index(),
+                .wait_for_applied_log_id(
+                    bootstrap.log_id(),
                     Duration::from_secs(1),
                     "third voter applied bootstrap before leader loss",
                 )

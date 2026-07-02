@@ -10002,6 +10002,11 @@ Phase 12.1 progress:
   state machine has applied through the committed watermark. The serving flag is
   now derived from those status fields instead of stored separately, so routed
   clients fail closed while a restarted or lagging leader catches up.
+- Extended the node-lifecycle wait boundary with a full OpenRaft log-id
+  applied-through wait. Tests that assert a specific committed entry was
+  reflected now verify the full `(term,node,index)` identity when the applied
+  cursor is exactly at that index, while also accepting later applied indexes
+  because OpenRaft applies committed entries in order.
 
 1. define the replicated control-plane state machine:
    - state includes cluster epoch, PG count, PG state, PG acting sets, node
