@@ -10046,6 +10046,10 @@ Phase 12.1 progress:
   experimental authority now serves `UnixControlPlaneClient::runtime_map_snapshot`
   through OpenRaft read-index and the test asserts the wire-decoded freshness
   proof carries a nonzero Raft log id and the deterministic issued timestamp.
+- Added process-helper coverage for `control-plane-runtime-map-ready` and
+  `control-plane-runtime-map-diagnostics` against the experimental authority.
+  These helpers now read the OpenRaft-backed runtime map through the same Unix
+  RPC path used by scripts/UAT and leave the replicated snapshot unchanged.
 - Added Unix RPC coverage for ordinary placement admin through the experimental
   authority. `UnixControlPlaneClient::set_pg_acting_set` now has a process
   adapter smoke that verifies the replicated command bumps the epoch and leaves

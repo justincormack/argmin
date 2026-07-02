@@ -3118,6 +3118,69 @@ mod tests {
     }
 
     #[test]
+    fn experimental_raft_control_plane_serves_runtime_map_admin_helpers() {
+        let mut harness = experimental_raft_test_harness("runtime-map-admin-helpers-test");
+        let mut config = test_server_config();
+        config.storage_node_sockets = vec![config::ConfiguredStorageNodeSocket {
+            node_id: 1,
+            socket_path: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
+        }];
+        config.storage_pg_ids = vec![12];
+        bootstrap_empty_experimental_raft_control_plane(&mut harness.control_plane, &config)
+            .expect("experimental raft control-plane bootstrap should succeed");
+        let before = harness
+            .control_plane
+            .current_snapshot()
+            .expect("experimental snapshot should read before diagnostic helpers");
+
+        let tmp = short_unix_socket_test_dir("experimental-raft-runtime-map-admin");
+        std::fs::create_dir_all(&tmp).unwrap();
+        let socket_path = tmp.join("control-plane.sock");
+        let ready_server = spawn_experimental_raft_unix_rpc_server(&harness, &socket_path, 31_100);
+        let (ready_epoch, pg_routes, active_serving_pg_routes) =
+            control_plane_runtime_map_ready(&socket_path)
+                .expect("runtime-map ready helper should read experimental raft map");
+        ready_server.join().unwrap();
+
+        assert_eq!(ready_epoch, before.cluster_epoch());
+        assert_eq!(pg_routes, 1);
+        assert_eq!(active_serving_pg_routes, 0);
+
+        std::fs::remove_file(&socket_path).unwrap();
+        let diagnostics_server =
+            spawn_experimental_raft_unix_rpc_server(&harness, &socket_path, 31_200);
+        let diagnostics = control_plane_runtime_map_diagnostics(&socket_path)
+            .expect("runtime-map diagnostics helper should read experimental raft map");
+        diagnostics_server.join().unwrap();
+
+        assert!(
+            diagnostics.contains(&format!("epoch={}", before.cluster_epoch().get())),
+            "{diagnostics}"
+        );
+        assert!(diagnostics.contains("nodes=1"), "{diagnostics}");
+        assert!(diagnostics.contains("pg_routes=1"), "{diagnostics}");
+        assert!(
+            diagnostics.contains("active_serving_pg_routes=0"),
+            "{diagnostics}"
+        );
+        assert!(
+            diagnostics.contains(
+                "node_id=1 incarnation=0 endpoint=/tmp/argmin-experimental-raft-node-1.sock"
+            ),
+            "{diagnostics}"
+        );
+        let after = harness
+            .control_plane
+            .current_snapshot()
+            .expect("experimental snapshot should read after diagnostic helpers");
+        assert_eq!(after, before);
+
+        std::fs::remove_file(&socket_path).unwrap();
+        std::fs::remove_dir_all(&tmp).unwrap();
+        harness.shutdown();
+    }
+
+    #[test]
     fn experimental_raft_control_plane_serves_unix_acting_set_admin() {
         let mut harness = experimental_raft_test_harness("unix-acting-set-admin-test");
         let mut config = test_server_config();
