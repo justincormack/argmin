@@ -699,9 +699,9 @@ when prioritised. They correspond to the remaining findings from the Phase 11 re
     `SetPgActingSetWithMetadataTransferRuntimeMap` mutate control-plane state before
     returning their map and therefore belong with the command-specific check-applied paths
     below.
-  - **Convergent set-style commands:** `SetNodeMembership`, `MarkNodeAvailability`,
-    `SetPgState`, and probably `SetPgActingSet` can be retried only after confirming the
-    apply path is idempotent/no-op when the target value is already current. For
+  - **Convergent set-style commands:** the Unix RPC surface currently exposes only
+    `SetPgActingSet` in this category; `SetNodeMembership`, `MarkNodeAvailability`, and
+    `SetPgState` are local/single-authority and Raft command paths, not live Unix RPCs. For
     `SetPgActingSet`, prefer checking the runtime map for the expected acting set before
     resubmitting, because even logically identical route updates can create noisy extra
     epochs if the apply path is not strictly idempotent. **Status:** the live Unix
@@ -710,16 +710,19 @@ when prioritised. They correspond to the remaining findings from the Phase 11 re
     closed if a current different route is visible. Regressions cover both the already-visible
     success case and the stale retry case where another admin transition wins after the lost
     response.
-  - **Time-based liveness commands:** `RecordNodeHeartbeat` and `ExpireHeartbeatLeases`
-    need bounded retry/reconnect, but with care that retrying the same timestamp/deadline is
-    monotonic and cannot shorten a valid lease or resurrect an expired one. **Status:**
-    the Unix `RefreshNodeHeartbeat` path now retries retryable transport failures within a
+  - **Time-based liveness commands:** the Unix RPC surface exposes `RefreshNodeHeartbeat`,
+    which applies `RecordNodeHeartbeat` and may also run ready-peering completion before
+    returning the refreshed runtime map. `ExpireHeartbeatLeases` is not a Unix RPC. Heartbeat
+    retry/reconnect must be bounded, with care that retrying the same timestamp/deadline is
+    monotonic and cannot shorten a valid lease or resurrect an expired one. **Status:** the
+    Unix `RefreshNodeHeartbeat` path now retries retryable transport failures within a
     bounded deadline capped by the requested lease duration. Repeating a heartbeat inside
     that lease window is monotonic for a live node: it refreshes the same node
     incarnation/endpoint and can extend, but not shorten, the lease. Storage regressions
     inject response loss after the first heartbeat apply and verify both in-window retry
-    returning a later lease deadline and short-lease fail-closed behavior before the generic
-    control-plane retry deadline could resurrect an expired lease.
+    returning a later lease deadline, short-lease fail-closed behavior before the generic
+    control-plane retry deadline could resurrect an expired lease, and ready-peering
+    completion observed after a lost heartbeat response.
   - **Non-idempotent route/provenance transitions:** add explicit check-applied paths for
     `FencePgForMetadataTransfer`, `FencePgForMetadataTransferRuntimeMap`,
     `SetPgActingSetWithMetadataTransfer`,
@@ -758,5 +761,7 @@ when prioritised. They correspond to the remaining findings from the Phase 11 re
   The retry layer should classify transport failures as transient, but mutating admin flows
   must provide command-specific observation predicates that prove whether the lost-response
   command took effect. Tests should inject a response-loss failure after the authority has
-  applied each non-idempotent command, then assert the live admin path observes the applied
-  state and does not submit a second incompatible transition.
+  applied each non-idempotent Unix RPC command, then assert the live admin path observes the
+  applied state and does not submit a second incompatible transition. **Current status:** no
+  remaining Slice 7 gap is named for the live Unix RPC surface; future Raft and local
+  single-authority command retries should be tracked outside this slice.
