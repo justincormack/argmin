@@ -10326,6 +10326,15 @@ Phase 12.3 progress:
   checks. The in-process Raft network maps those typed rejections to OpenRaft
   unreachable/network/streaming errors at the transport edge, with coverage for
   unconfigured targets as a distinct unreachable outcome.
+- Added the first versioned, CRC-protected peer RPC frames for OpenRaft
+  append-entries, vote, pre-vote, append response, and vote response payloads.
+  The codec carries an explicit request/response frame kind, reuses the durable
+  Raft log-id/entry/command encoding, preserves pre-vote as a distinct request
+  tag, bounds append-entry decode allocation, and fails closed on wrong
+  direction, truncation, checksum mismatch, incompatible magic/version,
+  trailing bytes, and unknown tags. Snapshot streaming frames remain separate
+  follow-up work because their transport semantics differ from ordinary request/
+  response frames.
 
 1. define the replicated control-plane state machine:
    - state includes cluster epoch, PG count, PG state, PG acting sets, node

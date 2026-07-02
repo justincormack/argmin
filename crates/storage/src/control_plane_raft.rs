@@ -57,6 +57,103 @@ pub type ControlPlaneRaftLeaderId = LeaderId<ControlPlaneRaftTerm, ControlPlaneR
 pub type ControlPlaneRaftEntry =
     Entry<ControlPlaneRaftLeaderId, ControlPlaneCommand, ControlPlaneRaftNodeId, BasicNode>;
 
+#[derive(Debug, Clone)]
+pub enum ControlPlaneRaftPeerRpcRequest {
+    AppendEntries(AppendEntriesRequest<ControlPlaneRaftTypeConfig>),
+    Vote(VoteRequest<ControlPlaneRaftTypeConfig>),
+    PreVote(VoteRequest<ControlPlaneRaftTypeConfig>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ControlPlaneRaftPeerRpcResponse {
+    AppendEntries(AppendEntriesResponse<ControlPlaneRaftTypeConfig>),
+    Vote(VoteResponse<ControlPlaneRaftTypeConfig>),
+}
+
+impl ControlPlaneRaftPeerRpcRequest {
+    pub fn encode_frame(&self) -> Result<Vec<u8>, ControlPlaneError> {
+        let mut out = Vec::new();
+        out.extend_from_slice(CONTROL_PLANE_RAFT_PEER_RPC_MAGIC);
+        write_raft_u16(&mut out, CONTROL_PLANE_RAFT_PEER_RPC_VERSION);
+        write_raft_u8(&mut out, CONTROL_PLANE_RAFT_PEER_RPC_KIND_REQUEST);
+        match self {
+            Self::AppendEntries(request) => {
+                write_raft_u8(&mut out, CONTROL_PLANE_RAFT_PEER_RPC_REQUEST_APPEND_ENTRIES);
+                write_raft_append_entries_request(&mut out, request)?;
+            }
+            Self::Vote(request) => {
+                write_raft_u8(&mut out, CONTROL_PLANE_RAFT_PEER_RPC_REQUEST_VOTE);
+                write_raft_vote_request(&mut out, request);
+            }
+            Self::PreVote(request) => {
+                write_raft_u8(&mut out, CONTROL_PLANE_RAFT_PEER_RPC_REQUEST_PRE_VOTE);
+                write_raft_vote_request(&mut out, request);
+            }
+        }
+        append_raft_artifact_checksum(&mut out);
+        Ok(out)
+    }
+
+    pub fn decode_frame(bytes: &[u8]) -> Result<Self, ControlPlaneError> {
+        decode_raft_peer_rpc_frame(bytes, CONTROL_PLANE_RAFT_PEER_RPC_KIND_REQUEST, |reader| {
+            match reader.read_u8()? {
+                CONTROL_PLANE_RAFT_PEER_RPC_REQUEST_APPEND_ENTRIES => {
+                    Ok(Self::AppendEntries(reader.read_append_entries_request()?))
+                }
+                CONTROL_PLANE_RAFT_PEER_RPC_REQUEST_VOTE => {
+                    Ok(Self::Vote(reader.read_vote_request()?))
+                }
+                CONTROL_PLANE_RAFT_PEER_RPC_REQUEST_PRE_VOTE => {
+                    Ok(Self::PreVote(reader.read_vote_request()?))
+                }
+                value => Err(raft_artifact_protocol_error(format!(
+                    "unknown control-plane OpenRaft peer RPC request tag {value}"
+                ))),
+            }
+        })
+    }
+}
+
+impl ControlPlaneRaftPeerRpcResponse {
+    pub fn encode_frame(&self) -> Result<Vec<u8>, ControlPlaneError> {
+        let mut out = Vec::new();
+        out.extend_from_slice(CONTROL_PLANE_RAFT_PEER_RPC_MAGIC);
+        write_raft_u16(&mut out, CONTROL_PLANE_RAFT_PEER_RPC_VERSION);
+        write_raft_u8(&mut out, CONTROL_PLANE_RAFT_PEER_RPC_KIND_RESPONSE);
+        match self {
+            Self::AppendEntries(response) => {
+                write_raft_u8(
+                    &mut out,
+                    CONTROL_PLANE_RAFT_PEER_RPC_RESPONSE_APPEND_ENTRIES,
+                );
+                write_raft_append_entries_response(&mut out, response);
+            }
+            Self::Vote(response) => {
+                write_raft_u8(&mut out, CONTROL_PLANE_RAFT_PEER_RPC_RESPONSE_VOTE);
+                write_raft_vote_response(&mut out, response);
+            }
+        }
+        append_raft_artifact_checksum(&mut out);
+        Ok(out)
+    }
+
+    pub fn decode_frame(bytes: &[u8]) -> Result<Self, ControlPlaneError> {
+        decode_raft_peer_rpc_frame(bytes, CONTROL_PLANE_RAFT_PEER_RPC_KIND_RESPONSE, |reader| {
+            match reader.read_u8()? {
+                CONTROL_PLANE_RAFT_PEER_RPC_RESPONSE_APPEND_ENTRIES => {
+                    Ok(Self::AppendEntries(reader.read_append_entries_response()?))
+                }
+                CONTROL_PLANE_RAFT_PEER_RPC_RESPONSE_VOTE => {
+                    Ok(Self::Vote(reader.read_vote_response()?))
+                }
+                value => Err(raft_artifact_protocol_error(format!(
+                    "unknown control-plane OpenRaft peer RPC response tag {value}"
+                ))),
+            }
+        })
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ControlPlaneRaftPeerTransportLimits {
     pub max_append_entries: usize,
@@ -2620,6 +2717,20 @@ pub struct ControlPlaneRaftRestartArtifact {
 const CONTROL_PLANE_RAFT_RESTART_MAGIC: &[u8] = b"ARGMINCPRAFT";
 const CONTROL_PLANE_RAFT_RESTART_VERSION: u16 = 1;
 const CONTROL_PLANE_RAFT_RESTART_CHECKSUM_LEN: usize = 8;
+const CONTROL_PLANE_RAFT_PEER_RPC_MAGIC: &[u8] = b"ARGMINCPRAFTPEER";
+const CONTROL_PLANE_RAFT_PEER_RPC_VERSION: u16 = 1;
+const CONTROL_PLANE_RAFT_PEER_RPC_CHECKSUM_LEN: usize = 8;
+const CONTROL_PLANE_RAFT_PEER_RPC_KIND_REQUEST: u8 = 1;
+const CONTROL_PLANE_RAFT_PEER_RPC_KIND_RESPONSE: u8 = 2;
+const CONTROL_PLANE_RAFT_PEER_RPC_REQUEST_APPEND_ENTRIES: u8 = 1;
+const CONTROL_PLANE_RAFT_PEER_RPC_REQUEST_VOTE: u8 = 2;
+const CONTROL_PLANE_RAFT_PEER_RPC_REQUEST_PRE_VOTE: u8 = 3;
+const CONTROL_PLANE_RAFT_PEER_RPC_RESPONSE_APPEND_ENTRIES: u8 = 1;
+const CONTROL_PLANE_RAFT_PEER_RPC_RESPONSE_VOTE: u8 = 2;
+const CONTROL_PLANE_RAFT_APPEND_ENTRIES_RESPONSE_SUCCESS: u8 = 1;
+const CONTROL_PLANE_RAFT_APPEND_ENTRIES_RESPONSE_PARTIAL_SUCCESS: u8 = 2;
+const CONTROL_PLANE_RAFT_APPEND_ENTRIES_RESPONSE_CONFLICT: u8 = 3;
+const CONTROL_PLANE_RAFT_APPEND_ENTRIES_RESPONSE_HIGHER_VOTE: u8 = 4;
 const RAFT_ENTRY_MIN_LEN: usize = 8 + 8 + 8 + 1;
 const RAFT_MEMBERSHIP_CONFIG_MIN_LEN: usize = 4;
 const RAFT_MEMBERSHIP_NODE_MIN_LEN: usize = 8 + 4;
@@ -3428,6 +3539,57 @@ impl ControlPlaneRaftRestartArtifact {
     }
 }
 
+fn decode_raft_peer_rpc_frame<T>(
+    bytes: &[u8],
+    expected_kind: u8,
+    decode_body: impl FnOnce(&mut RaftArtifactReader<'_>) -> Result<T, ControlPlaneError>,
+) -> Result<T, ControlPlaneError> {
+    let min_len =
+        CONTROL_PLANE_RAFT_PEER_RPC_MAGIC.len() + 2 + 1 + CONTROL_PLANE_RAFT_PEER_RPC_CHECKSUM_LEN;
+    if bytes.len() < min_len {
+        return Err(raft_artifact_protocol_error(
+            "truncated control-plane OpenRaft peer RPC frame",
+        ));
+    }
+    let (body, checksum_bytes) =
+        bytes.split_at(bytes.len() - CONTROL_PLANE_RAFT_PEER_RPC_CHECKSUM_LEN);
+    let expected_checksum = u64::from_be_bytes(
+        checksum_bytes
+            .try_into()
+            .expect("checksum split length is fixed"),
+    );
+    let actual_checksum = raft_artifact_checksum(body);
+    if actual_checksum != expected_checksum {
+        return Err(raft_artifact_protocol_error(format!(
+            "control-plane OpenRaft peer RPC frame checksum mismatch: expected {expected_checksum:#x}, actual {actual_checksum:#x}"
+        )));
+    }
+
+    let mut reader =
+        RaftArtifactReader::with_context(body, "control-plane OpenRaft peer RPC frame");
+    let magic = reader.read_exact(CONTROL_PLANE_RAFT_PEER_RPC_MAGIC.len())?;
+    if magic != CONTROL_PLANE_RAFT_PEER_RPC_MAGIC {
+        return Err(raft_artifact_protocol_error(
+            "invalid control-plane OpenRaft peer RPC frame magic",
+        ));
+    }
+    let version = reader.read_u16()?;
+    if version != CONTROL_PLANE_RAFT_PEER_RPC_VERSION {
+        return Err(raft_artifact_protocol_error(format!(
+            "unsupported control-plane OpenRaft peer RPC frame version {version}"
+        )));
+    }
+    let kind = reader.read_u8()?;
+    if kind != expected_kind {
+        return Err(raft_artifact_protocol_error(format!(
+            "control-plane OpenRaft peer RPC frame kind {kind} does not match expected kind {expected_kind}"
+        )));
+    }
+    let decoded = decode_body(&mut reader)?;
+    reader.finish()?;
+    Ok(decoded)
+}
+
 fn durable_artifact_tmp_path(path: &Path) -> PathBuf {
     let file_name = path
         .file_name()
@@ -3562,6 +3724,63 @@ fn write_raft_snapshot_meta(
     Ok(())
 }
 
+fn write_raft_append_entries_request(
+    out: &mut Vec<u8>,
+    request: &AppendEntriesRequest<ControlPlaneRaftTypeConfig>,
+) -> Result<(), ControlPlaneError> {
+    write_raft_vote(out, request.vote);
+    write_raft_option_log_id(out, request.prev_log_id);
+    write_raft_u32(
+        out,
+        raft_len_as_u32(request.entries.len(), "raft append entries")?,
+    );
+    for entry in &request.entries {
+        write_raft_entry(out, entry)?;
+    }
+    write_raft_option_log_id(out, request.leader_commit);
+    Ok(())
+}
+
+fn write_raft_append_entries_response(
+    out: &mut Vec<u8>,
+    response: &AppendEntriesResponse<ControlPlaneRaftTypeConfig>,
+) {
+    match response {
+        AppendEntriesResponse::Success => {
+            write_raft_u8(out, CONTROL_PLANE_RAFT_APPEND_ENTRIES_RESPONSE_SUCCESS);
+        }
+        AppendEntriesResponse::PartialSuccess(log_id) => {
+            write_raft_u8(
+                out,
+                CONTROL_PLANE_RAFT_APPEND_ENTRIES_RESPONSE_PARTIAL_SUCCESS,
+            );
+            write_raft_option_log_id(out, *log_id);
+        }
+        AppendEntriesResponse::Conflict => {
+            write_raft_u8(out, CONTROL_PLANE_RAFT_APPEND_ENTRIES_RESPONSE_CONFLICT);
+        }
+        AppendEntriesResponse::HigherVote(vote) => {
+            write_raft_u8(out, CONTROL_PLANE_RAFT_APPEND_ENTRIES_RESPONSE_HIGHER_VOTE);
+            write_raft_vote(out, *vote);
+        }
+    }
+}
+
+fn write_raft_vote_request(out: &mut Vec<u8>, request: &VoteRequest<ControlPlaneRaftTypeConfig>) {
+    write_raft_vote(out, request.vote);
+    write_raft_option_log_id(out, request.last_log_id);
+    write_raft_bool(out, request.leadership_transfer);
+}
+
+fn write_raft_vote_response(
+    out: &mut Vec<u8>,
+    response: &VoteResponse<ControlPlaneRaftTypeConfig>,
+) {
+    write_raft_vote(out, response.vote);
+    write_raft_bool(out, response.vote_granted);
+    write_raft_option_log_id(out, response.last_log_id);
+}
+
 fn write_raft_entry(
     out: &mut Vec<u8>,
     entry: &ControlPlaneRaftEntry,
@@ -3580,6 +3799,11 @@ fn write_raft_entry(
         }
     }
     Ok(())
+}
+
+fn write_raft_vote(out: &mut Vec<u8>, vote: VoteOf<ControlPlaneRaftTypeConfig>) {
+    write_raft_leader_id(out, vote.leader_id);
+    write_raft_bool(out, vote.committed);
 }
 
 fn write_raft_stored_membership(
@@ -3622,8 +3846,7 @@ fn write_raft_option_vote(out: &mut Vec<u8>, vote: Option<VoteOf<ControlPlaneRaf
         None => write_raft_u8(out, 0),
         Some(vote) => {
             write_raft_u8(out, 1);
-            write_raft_leader_id(out, vote.leader_id);
-            write_raft_bool(out, vote.committed);
+            write_raft_vote(out, vote);
         }
     }
 }
@@ -3697,11 +3920,20 @@ fn raft_artifact_protocol_error(message: impl Into<String>) -> ControlPlaneError
 struct RaftArtifactReader<'a> {
     payload: &'a [u8],
     offset: usize,
+    context: &'static str,
 }
 
 impl<'a> RaftArtifactReader<'a> {
     fn new(payload: &'a [u8]) -> Self {
-        Self { payload, offset: 0 }
+        Self::with_context(payload, "control-plane OpenRaft durable restart artifact")
+    }
+
+    fn with_context(payload: &'a [u8], context: &'static str) -> Self {
+        Self {
+            payload,
+            offset: 0,
+            context,
+        }
     }
 
     fn finish(&self) -> Result<(), ControlPlaneError> {
@@ -3709,7 +3941,8 @@ impl<'a> RaftArtifactReader<'a> {
             Ok(())
         } else {
             Err(raft_artifact_protocol_error(format!(
-                "control-plane OpenRaft durable restart artifact has {} trailing bytes",
+                "{} has {} trailing bytes",
+                self.context,
                 self.payload.len() - self.offset
             )))
         }
@@ -3717,15 +3950,12 @@ impl<'a> RaftArtifactReader<'a> {
 
     fn read_exact(&mut self, len: usize) -> Result<&'a [u8], ControlPlaneError> {
         let end = self.offset.checked_add(len).ok_or_else(|| {
-            raft_artifact_protocol_error(
-                "control-plane OpenRaft durable restart artifact offset overflow",
-            )
+            raft_artifact_protocol_error(format!("{} offset overflow", self.context))
         })?;
-        let bytes = self.payload.get(self.offset..end).ok_or_else(|| {
-            raft_artifact_protocol_error(
-                "truncated control-plane OpenRaft durable restart artifact",
-            )
-        })?;
+        let bytes = self
+            .payload
+            .get(self.offset..end)
+            .ok_or_else(|| raft_artifact_protocol_error(format!("truncated {}", self.context)))?;
         self.offset = end;
         Ok(bytes)
     }
@@ -3756,7 +3986,8 @@ impl<'a> RaftArtifactReader<'a> {
             0 => Ok(false),
             1 => Ok(true),
             value => Err(raft_artifact_protocol_error(format!(
-                "invalid control-plane OpenRaft durable boolean value {value}"
+                "invalid {} boolean value {value}",
+                self.context
             ))),
         }
     }
@@ -3803,14 +4034,7 @@ impl<'a> RaftArtifactReader<'a> {
     ) -> Result<Option<VoteOf<ControlPlaneRaftTypeConfig>>, ControlPlaneError> {
         match self.read_u8()? {
             0 => Ok(None),
-            1 => {
-                let leader_id = self.read_leader_id()?;
-                let committed = self.read_bool()?;
-                Ok(Some(Vote {
-                    leader_id,
-                    committed,
-                }))
-            }
+            1 => Ok(Some(self.read_vote()?)),
             value => Err(raft_artifact_protocol_error(format!(
                 "invalid control-plane OpenRaft durable optional vote tag {value}"
             ))),
@@ -3827,6 +4051,73 @@ impl<'a> RaftArtifactReader<'a> {
                 "invalid control-plane OpenRaft durable optional log-id tag {value}"
             ))),
         }
+    }
+
+    fn read_append_entries_request(
+        &mut self,
+    ) -> Result<AppendEntriesRequest<ControlPlaneRaftTypeConfig>, ControlPlaneError> {
+        let vote = self.read_vote()?;
+        let prev_log_id = self.read_option_log_id()?;
+        let entry_count = self.read_collection_len("raft append entries", RAFT_ENTRY_MIN_LEN)?;
+        let mut entries = Vec::with_capacity(entry_count);
+        for _ in 0..entry_count {
+            entries.push(self.read_entry()?);
+        }
+        let leader_commit = self.read_option_log_id()?;
+        Ok(AppendEntriesRequest {
+            vote,
+            prev_log_id,
+            entries,
+            leader_commit,
+        })
+    }
+
+    fn read_append_entries_response(
+        &mut self,
+    ) -> Result<AppendEntriesResponse<ControlPlaneRaftTypeConfig>, ControlPlaneError> {
+        match self.read_u8()? {
+            CONTROL_PLANE_RAFT_APPEND_ENTRIES_RESPONSE_SUCCESS => {
+                Ok(AppendEntriesResponse::Success)
+            }
+            CONTROL_PLANE_RAFT_APPEND_ENTRIES_RESPONSE_PARTIAL_SUCCESS => Ok(
+                AppendEntriesResponse::PartialSuccess(self.read_option_log_id()?),
+            ),
+            CONTROL_PLANE_RAFT_APPEND_ENTRIES_RESPONSE_CONFLICT => {
+                Ok(AppendEntriesResponse::Conflict)
+            }
+            CONTROL_PLANE_RAFT_APPEND_ENTRIES_RESPONSE_HIGHER_VOTE => {
+                Ok(AppendEntriesResponse::HigherVote(self.read_vote()?))
+            }
+            value => Err(raft_artifact_protocol_error(format!(
+                "unknown control-plane OpenRaft peer RPC append_entries response tag {value}"
+            ))),
+        }
+    }
+
+    fn read_vote_request(
+        &mut self,
+    ) -> Result<VoteRequest<ControlPlaneRaftTypeConfig>, ControlPlaneError> {
+        let vote = self.read_vote()?;
+        let last_log_id = self.read_option_log_id()?;
+        let leadership_transfer = self.read_bool()?;
+        Ok(VoteRequest {
+            vote,
+            last_log_id,
+            leadership_transfer,
+        })
+    }
+
+    fn read_vote_response(
+        &mut self,
+    ) -> Result<VoteResponse<ControlPlaneRaftTypeConfig>, ControlPlaneError> {
+        let vote = self.read_vote()?;
+        let vote_granted = self.read_bool()?;
+        let last_log_id = self.read_option_log_id()?;
+        Ok(VoteResponse {
+            vote,
+            vote_granted,
+            last_log_id,
+        })
     }
 
     fn read_entry(&mut self) -> Result<ControlPlaneRaftEntry, ControlPlaneError> {
@@ -3931,6 +4222,15 @@ impl<'a> RaftArtifactReader<'a> {
         Ok(LeaderId {
             term: self.read_u64()?,
             node_id: self.read_u64()?,
+        })
+    }
+
+    fn read_vote(&mut self) -> Result<VoteOf<ControlPlaneRaftTypeConfig>, ControlPlaneError> {
+        let leader_id = self.read_leader_id()?;
+        let committed = self.read_bool()?;
+        Ok(Vote {
+            leader_id,
+            committed,
         })
     }
 
@@ -5427,6 +5727,198 @@ mod tests {
                 max_snapshot_bytes: 0,
             },
         )
+    }
+
+    fn refresh_raft_peer_frame_checksum(frame: &mut Vec<u8>) {
+        let checksum_start = frame.len() - CONTROL_PLANE_RAFT_PEER_RPC_CHECKSUM_LEN;
+        frame.truncate(checksum_start);
+        append_raft_artifact_checksum(frame);
+    }
+
+    #[test]
+    fn control_plane_raft_peer_rpc_append_entries_request_frame_round_trips() {
+        let request = AppendEntriesRequest {
+            vote: Vote::<ControlPlaneRaftLeaderId>::new_committed(3, 7),
+            prev_log_id: Some(raft_log_id(3, 7, 4)),
+            entries: vec![normal_entry(
+                3,
+                7,
+                5,
+                ControlPlaneCommand::SetNodeMembership {
+                    node_id: NodeId::new(11),
+                    membership: NodeMembershipState::Active,
+                },
+            )],
+            leader_commit: Some(raft_log_id(3, 7, 5)),
+        };
+        let encoded = ControlPlaneRaftPeerRpcRequest::AppendEntries(request.clone())
+            .encode_frame()
+            .unwrap();
+        let decoded = ControlPlaneRaftPeerRpcRequest::decode_frame(&encoded).unwrap();
+
+        let ControlPlaneRaftPeerRpcRequest::AppendEntries(decoded) = decoded else {
+            panic!("decoded wrong peer RPC request variant");
+        };
+        assert_eq!(decoded.vote, request.vote);
+        assert_eq!(decoded.prev_log_id, request.prev_log_id);
+        assert_eq!(decoded.entries, request.entries);
+        assert_eq!(decoded.leader_commit, request.leader_commit);
+    }
+
+    #[test]
+    fn control_plane_raft_peer_rpc_vote_request_frames_round_trip() {
+        let request = VoteRequest {
+            vote: Vote::<ControlPlaneRaftLeaderId>::new(4, 9),
+            last_log_id: Some(raft_log_id(3, 7, 8)),
+            leadership_transfer: true,
+        };
+        let encoded = ControlPlaneRaftPeerRpcRequest::Vote(request.clone())
+            .encode_frame()
+            .unwrap();
+        let decoded = ControlPlaneRaftPeerRpcRequest::decode_frame(&encoded).unwrap();
+        let ControlPlaneRaftPeerRpcRequest::Vote(decoded) = decoded else {
+            panic!("decoded wrong vote peer RPC request variant");
+        };
+        assert_eq!(decoded, request);
+
+        let encoded = ControlPlaneRaftPeerRpcRequest::PreVote(request.clone())
+            .encode_frame()
+            .unwrap();
+        let decoded = ControlPlaneRaftPeerRpcRequest::decode_frame(&encoded).unwrap();
+        let ControlPlaneRaftPeerRpcRequest::PreVote(decoded) = decoded else {
+            panic!("decoded wrong pre-vote peer RPC request variant");
+        };
+        assert_eq!(decoded, request);
+    }
+
+    #[test]
+    fn control_plane_raft_peer_rpc_response_frames_round_trip() {
+        let append = AppendEntriesResponse::HigherVote(Vote::<ControlPlaneRaftLeaderId>::new(5, 9));
+        let encoded = ControlPlaneRaftPeerRpcResponse::AppendEntries(append.clone())
+            .encode_frame()
+            .unwrap();
+        let decoded = ControlPlaneRaftPeerRpcResponse::decode_frame(&encoded).unwrap();
+        assert_eq!(
+            decoded,
+            ControlPlaneRaftPeerRpcResponse::AppendEntries(append)
+        );
+
+        let vote = VoteResponse {
+            vote: Vote::<ControlPlaneRaftLeaderId>::new_committed(5, 9),
+            vote_granted: true,
+            last_log_id: Some(raft_log_id(5, 9, 12)),
+        };
+        let encoded = ControlPlaneRaftPeerRpcResponse::Vote(vote.clone())
+            .encode_frame()
+            .unwrap();
+        let decoded = ControlPlaneRaftPeerRpcResponse::decode_frame(&encoded).unwrap();
+        assert_eq!(decoded, ControlPlaneRaftPeerRpcResponse::Vote(vote));
+    }
+
+    #[test]
+    fn control_plane_raft_peer_rpc_frames_fail_closed_across_direction() {
+        let request = VoteRequest {
+            vote: Vote::<ControlPlaneRaftLeaderId>::new(4, 9),
+            last_log_id: None,
+            leadership_transfer: false,
+        };
+        let encoded_request = ControlPlaneRaftPeerRpcRequest::Vote(request)
+            .encode_frame()
+            .unwrap();
+        let err = ControlPlaneRaftPeerRpcResponse::decode_frame(&encoded_request).unwrap_err();
+        assert!(matches!(
+            err,
+            ControlPlaneError::CommandDecode { message }
+                if message.contains("does not match expected kind")
+        ));
+
+        let response = VoteResponse {
+            vote: Vote::<ControlPlaneRaftLeaderId>::new(4, 9),
+            vote_granted: false,
+            last_log_id: None,
+        };
+        let encoded_response = ControlPlaneRaftPeerRpcResponse::Vote(response)
+            .encode_frame()
+            .unwrap();
+        let err = ControlPlaneRaftPeerRpcRequest::decode_frame(&encoded_response).unwrap_err();
+        assert!(matches!(
+            err,
+            ControlPlaneError::CommandDecode { message }
+                if message.contains("does not match expected kind")
+        ));
+    }
+
+    #[test]
+    fn control_plane_raft_peer_rpc_frame_decode_fails_closed() {
+        let request = VoteRequest {
+            vote: Vote::<ControlPlaneRaftLeaderId>::new(4, 9),
+            last_log_id: Some(raft_log_id(3, 7, 8)),
+            leadership_transfer: false,
+        };
+        let encoded = ControlPlaneRaftPeerRpcRequest::Vote(request)
+            .encode_frame()
+            .unwrap();
+
+        let err = ControlPlaneRaftPeerRpcRequest::decode_frame(&encoded[..4]).unwrap_err();
+        assert!(matches!(
+            err,
+            ControlPlaneError::CommandDecode { message }
+                if message.contains("truncated control-plane OpenRaft peer RPC frame")
+        ));
+
+        let mut bad_magic = encoded.clone();
+        bad_magic[0] ^= 1;
+        refresh_raft_peer_frame_checksum(&mut bad_magic);
+        let err = ControlPlaneRaftPeerRpcRequest::decode_frame(&bad_magic).unwrap_err();
+        assert!(matches!(
+            err,
+            ControlPlaneError::CommandDecode { message }
+                if message.contains("invalid control-plane OpenRaft peer RPC frame magic")
+        ));
+
+        let mut unsupported_version = encoded.clone();
+        unsupported_version[CONTROL_PLANE_RAFT_PEER_RPC_MAGIC.len() + 1] =
+            CONTROL_PLANE_RAFT_PEER_RPC_VERSION as u8 + 1;
+        refresh_raft_peer_frame_checksum(&mut unsupported_version);
+        let err = ControlPlaneRaftPeerRpcRequest::decode_frame(&unsupported_version).unwrap_err();
+        assert!(matches!(
+            err,
+            ControlPlaneError::CommandDecode { message }
+                if message.contains("unsupported control-plane OpenRaft peer RPC frame version")
+        ));
+
+        let mut bad_checksum = encoded.clone();
+        bad_checksum[CONTROL_PLANE_RAFT_PEER_RPC_MAGIC.len() + 2] ^= 1;
+        let err = ControlPlaneRaftPeerRpcRequest::decode_frame(&bad_checksum).unwrap_err();
+        assert!(matches!(
+            err,
+            ControlPlaneError::CommandDecode { message }
+                if message.contains("control-plane OpenRaft peer RPC frame checksum mismatch")
+        ));
+
+        let mut trailing = encoded.clone();
+        let checksum_start = trailing.len() - CONTROL_PLANE_RAFT_PEER_RPC_CHECKSUM_LEN;
+        trailing.insert(checksum_start, 0);
+        refresh_raft_peer_frame_checksum(&mut trailing);
+        let err = ControlPlaneRaftPeerRpcRequest::decode_frame(&trailing).unwrap_err();
+        assert!(matches!(
+            err,
+            ControlPlaneError::CommandDecode { message }
+                if message.contains("control-plane OpenRaft peer RPC frame has 1 trailing bytes")
+        ));
+
+        let mut unknown_tag = Vec::new();
+        unknown_tag.extend_from_slice(CONTROL_PLANE_RAFT_PEER_RPC_MAGIC);
+        write_raft_u16(&mut unknown_tag, CONTROL_PLANE_RAFT_PEER_RPC_VERSION);
+        write_raft_u8(&mut unknown_tag, CONTROL_PLANE_RAFT_PEER_RPC_KIND_REQUEST);
+        write_raft_u8(&mut unknown_tag, 99);
+        append_raft_artifact_checksum(&mut unknown_tag);
+        let err = ControlPlaneRaftPeerRpcRequest::decode_frame(&unknown_tag).unwrap_err();
+        assert!(matches!(
+            err,
+            ControlPlaneError::CommandDecode { message }
+                if message.contains("unknown control-plane OpenRaft peer RPC request tag 99")
+        ));
     }
 
     #[test]
