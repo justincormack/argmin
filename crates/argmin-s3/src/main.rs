@@ -2660,6 +2660,46 @@ mod tests {
     }
 
     #[test]
+    fn experimental_raft_control_plane_bootstrap_does_not_rewrite_existing_state() {
+        let mut harness = experimental_raft_test_harness("process-bootstrap-idempotence-test");
+        let mut config = test_server_config();
+        config.storage_node_sockets = vec![config::ConfiguredStorageNodeSocket {
+            node_id: 1,
+            socket_path: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
+        }];
+        config.storage_pg_ids = vec![0];
+        bootstrap_empty_experimental_raft_control_plane(&mut harness.control_plane, &config)
+            .expect("experimental raft control-plane bootstrap should succeed");
+        let initial_snapshot = harness
+            .control_plane
+            .current_snapshot()
+            .expect("experimental snapshot should read after bootstrap");
+
+        config.storage_node_sockets = vec![config::ConfiguredStorageNodeSocket {
+            node_id: 2,
+            socket_path: "/tmp/argmin-experimental-raft-node-2.sock".to_string(),
+        }];
+        config.storage_pg_ids = vec![1];
+        bootstrap_empty_experimental_raft_control_plane(&mut harness.control_plane, &config)
+            .expect("experimental raft control-plane bootstrap retry should succeed");
+        let retried_snapshot = harness
+            .control_plane
+            .current_snapshot()
+            .expect("experimental snapshot should read after bootstrap retry");
+
+        assert_eq!(
+            retried_snapshot.cluster_epoch(),
+            initial_snapshot.cluster_epoch()
+        );
+        assert!(retried_snapshot.node(NodeId::new(1)).is_some());
+        assert!(retried_snapshot.node(NodeId::new(2)).is_none());
+        assert!(retried_snapshot.pg(PgId::new(0)).is_some());
+        assert!(retried_snapshot.pg(PgId::new(1)).is_none());
+
+        harness.shutdown();
+    }
+
+    #[test]
     fn experimental_raft_control_plane_heartbeat_completes_ready_peering() {
         let mut harness = experimental_raft_test_harness("heartbeat-peering-test");
         let mut config = test_server_config();

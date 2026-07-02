@@ -10029,6 +10029,10 @@ Phase 12.1 progress:
   incarnation/endpoint epoch bump, a subsequent Peering observation that commits
   `CompleteReadyPgPeerings` through OpenRaft, and the follow-up Active
   heartbeat/runtime-map handoff.
+- Added experimental bootstrap idempotence coverage. Re-running bootstrap with
+  different configured sockets/PGs after the Raft state machine is initialized
+  now proves the existing replicated cluster map is preserved rather than
+  replaced by startup configuration.
 - Added a Unix RPC smoke for the same experimental authority. It serves
   `UnixControlPlaneClient::refresh_node_heartbeat` through the existing
   control-plane wire protocol with deterministic authority timestamps, proving
