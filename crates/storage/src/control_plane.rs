@@ -1,9 +1,9 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::{Read as _, Write as _};
+use std::io::{ErrorKind, Read as _, Write as _};
 use std::num::NonZeroU64;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use placement::NodeId;
 use thiserror::Error;
@@ -21,6 +21,8 @@ pub const MAX_HEARTBEAT_LEASE_MS: u64 = 10_000;
 const CONTROL_PLANE_RPC_MAGIC: &[u8] = b"argmin-control-plane-rpc";
 const CONTROL_PLANE_RPC_MAX_PAYLOAD_LEN: usize = 8 * 1024 * 1024;
 const CONTROL_PLANE_RPC_IO_TIMEOUT: Duration = Duration::from_secs(1);
+const CONTROL_PLANE_RPC_READ_ONLY_RETRY_DEADLINE: Duration = Duration::from_secs(10);
+const CONTROL_PLANE_RPC_READ_ONLY_RETRY_BACKOFF: Duration = Duration::from_millis(50);
 const CONTROL_PLANE_RPC_HEARTBEAT_OBSERVATION_MIN_LEN: usize = 4 + 1 + 8 + 8 + 8 + 1;
 const CONTROL_PLANE_RPC_RUNTIME_NODE_MIN_LEN: usize = 4 + 8 + 4 + 1;
 const CONTROL_PLANE_RPC_PG_ROUTE_MIN_LEN: usize = 8 + 4 + 4 + 1 + 1 + 4 + 1;
@@ -3971,6 +3973,27 @@ impl UnixControlPlaneClient {
         decode_control_plane_rpc_response(response_payload)
     }
 
+    fn send_read_only_request(
+        &self,
+        kind: ControlPlaneRpcKind,
+        payload: &[u8],
+    ) -> Result<Vec<u8>, ControlPlaneError> {
+        debug_assert_eq!(kind, ControlPlaneRpcKind::RuntimeMapSnapshot);
+        let deadline = Instant::now() + CONTROL_PLANE_RPC_READ_ONLY_RETRY_DEADLINE;
+        loop {
+            match self.send_request(kind, payload) {
+                Ok(payload) => return Ok(payload),
+                Err(error)
+                    if error.is_retryable_read_only_rpc_transport_error()
+                        && Instant::now() < deadline =>
+                {
+                    std::thread::sleep(CONTROL_PLANE_RPC_READ_ONLY_RETRY_BACKOFF);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
     pub fn set_pg_acting_set(
         &self,
         pg_id: PgId,
@@ -4093,7 +4116,7 @@ impl ControlPlaneRuntimeMapSource for UnixControlPlaneClient {
         &self,
         _authority_now_ms: u64,
     ) -> Result<ClusterRuntimeMapSnapshot, ControlPlaneError> {
-        let payload = self.send_request(ControlPlaneRpcKind::RuntimeMapSnapshot, &[])?;
+        let payload = self.send_read_only_request(ControlPlaneRpcKind::RuntimeMapSnapshot, &[])?;
         let mut reader = PayloadReader::new(&payload);
         let runtime_map = read_runtime_map_snapshot(&mut reader)?;
         reader.finish()?;
@@ -5799,6 +5822,28 @@ pub enum ControlPlaneError {
 
     #[error("authority incarnation overflow")]
     AuthorityIncarnationOverflow,
+}
+
+impl ControlPlaneError {
+    #[must_use]
+    pub fn is_retryable_read_only_rpc_transport_error(&self) -> bool {
+        let Self::Io { source, .. } = self else {
+            return false;
+        };
+        matches!(
+            source.kind(),
+            ErrorKind::TimedOut
+                | ErrorKind::WouldBlock
+                | ErrorKind::UnexpectedEof
+                | ErrorKind::ConnectionReset
+                | ErrorKind::ConnectionAborted
+                | ErrorKind::BrokenPipe
+                | ErrorKind::Interrupted
+                | ErrorKind::NotConnected
+                | ErrorKind::ConnectionRefused
+                | ErrorKind::NotFound
+        )
+    }
 }
 
 fn next_epoch(epoch: ClusterEpoch) -> Result<ClusterEpoch, ControlPlaneError> {
@@ -9157,6 +9202,45 @@ mod tests {
                 issued_at_ms: 1_001,
             }
         );
+    }
+
+    #[test]
+    fn unix_control_plane_client_retries_read_only_runtime_map_after_lost_response() {
+        let tmp = test_util::tempdir();
+        let socket_path = tmp.path().join("control-plane.sock");
+        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+        authority
+            .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
+            .unwrap();
+        authority
+            .set_pg_acting_set(PgId::new(7), vec![NodeId::new(1)])
+            .unwrap();
+        heartbeat_until_serving_with_endpoint(
+            &mut authority,
+            1,
+            1_000,
+            "/tmp/argmin-node-1.sock".to_owned(),
+        );
+        let expected_epoch = authority.snapshot().cluster_epoch();
+        let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _addr) = listener.accept().unwrap();
+            let request = read_control_plane_unix_request(&mut stream).unwrap();
+            assert_eq!(request.kind, ControlPlaneRpcKind::RuntimeMapSnapshot);
+            drop(stream);
+
+            let (mut stream, _addr) = listener.accept().unwrap();
+            handle_control_plane_unix_stream(&mut authority, &mut stream, 1_001).unwrap();
+        });
+
+        let client = UnixControlPlaneClient::new(&socket_path);
+        let runtime_map = client.runtime_map_snapshot(0).unwrap();
+
+        server.join().unwrap();
+        assert_eq!(runtime_map.cluster_epoch(), expected_epoch);
+        assert_eq!(runtime_map.pg_routes().len(), 1);
+        assert_eq!(runtime_map.pg_routes()[0].pg_id(), PgId::new(7));
     }
 
     #[test]

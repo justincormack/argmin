@@ -683,8 +683,11 @@ when prioritised. They correspond to the remaining findings from the Phase 11 re
 
   Split the work by command semantics:
   - **Read-only RPCs, including read-only runtime-map fetches:** retry/reconnect with
-    bounded backoff and an overall deadline. These do not need check-applied logic. Do not
-    classify an RPC as read-only just because it returns a runtime map:
+    bounded backoff and an overall deadline. These do not need check-applied logic.
+    **Status:** the Unix `RuntimeMapSnapshot` client path now reconnects/retries
+    retryable transport failures within a bounded deadline, with regression coverage for a
+    lost response after request submission. Do not classify an RPC as read-only just
+    because it returns a runtime map:
     `FencePgForMetadataTransferRuntimeMap` and
     `SetPgActingSetWithMetadataTransferRuntimeMap` mutate control-plane state before
     returning their map and therefore belong with the command-specific check-applied paths
