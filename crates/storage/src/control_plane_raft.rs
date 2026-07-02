@@ -1031,7 +1031,6 @@ pub struct ControlPlaneRaftAuthorityStatus {
     effective_learner: bool,
     applied_voter: bool,
     applied_learner: bool,
-    linearized_authority_serving: bool,
     persisted_vote: Option<VoteOf<ControlPlaneRaftTypeConfig>>,
     current_term: Option<ControlPlaneRaftTerm>,
     last_log_id: Option<LogIdOf<ControlPlaneRaftTypeConfig>>,
@@ -1082,6 +1081,7 @@ pub enum ControlPlaneRaftLinearizedAuthorityReadiness {
     Serving,
     NotLocalLeader,
     NotEffectiveVoter,
+    NotAppliedToCommitted,
 }
 
 impl ControlPlaneRaftLinearizedAuthorityReadiness {
@@ -1095,11 +1095,14 @@ impl ControlPlaneRaftLinearizedAuthorityReadiness {
 fn linearized_authority_readiness_from_flags(
     local_leader: bool,
     effective_voter: bool,
+    applied_caught_up_to_committed: bool,
 ) -> ControlPlaneRaftLinearizedAuthorityReadiness {
     if !local_leader {
         ControlPlaneRaftLinearizedAuthorityReadiness::NotLocalLeader
     } else if !effective_voter {
         ControlPlaneRaftLinearizedAuthorityReadiness::NotEffectiveVoter
+    } else if !applied_caught_up_to_committed {
+        ControlPlaneRaftLinearizedAuthorityReadiness::NotAppliedToCommitted
     } else {
         ControlPlaneRaftLinearizedAuthorityReadiness::Serving
     }
@@ -1148,12 +1151,16 @@ impl ControlPlaneRaftAuthorityStatus {
 
     #[must_use]
     pub fn linearized_authority_serving(&self) -> bool {
-        self.linearized_authority_serving
+        self.linearized_authority_readiness().serving()
     }
 
     #[must_use]
     pub fn linearized_authority_readiness(&self) -> ControlPlaneRaftLinearizedAuthorityReadiness {
-        linearized_authority_readiness_from_flags(self.local_leader, self.effective_voter)
+        linearized_authority_readiness_from_flags(
+            self.local_leader,
+            self.effective_voter,
+            self.applied_caught_up_to_committed(),
+        )
     }
 
     #[must_use]
@@ -1228,7 +1235,7 @@ impl ControlPlaneRaftAuthorityStatus {
 
     #[must_use]
     pub fn applied_caught_up_to_committed(&self) -> bool {
-        self.committed_to_applied_index_gap() == Some(0)
+        self.committed.is_some() && self.committed == self.applied
     }
 
     #[must_use]
@@ -1774,8 +1781,6 @@ impl ControlPlaneRaftAuthority {
         let effective_learner = effective_learners.contains(&node_id);
         let applied_voter = applied_voters.contains(&node_id);
         let applied_learner = applied_learners.contains(&node_id);
-        let linearized_authority_serving =
-            linearized_authority_readiness_from_flags(local_leader, effective_voter).serving();
         Ok(ControlPlaneRaftAuthorityStatus {
             node_id,
             current_leader,
@@ -1785,7 +1790,6 @@ impl ControlPlaneRaftAuthority {
             effective_learner,
             applied_voter,
             applied_learner,
-            linearized_authority_serving,
             persisted_vote,
             current_term,
             last_log_id,
@@ -3988,19 +3992,23 @@ mod tests {
     #[test]
     fn control_plane_raft_linearized_authority_readiness_from_flags_is_ordered() {
         assert_eq!(
-            linearized_authority_readiness_from_flags(false, false),
+            linearized_authority_readiness_from_flags(false, false, false),
             ControlPlaneRaftLinearizedAuthorityReadiness::NotLocalLeader
         );
         assert_eq!(
-            linearized_authority_readiness_from_flags(false, true),
+            linearized_authority_readiness_from_flags(false, true, true),
             ControlPlaneRaftLinearizedAuthorityReadiness::NotLocalLeader
         );
         assert_eq!(
-            linearized_authority_readiness_from_flags(true, false),
+            linearized_authority_readiness_from_flags(true, false, true),
             ControlPlaneRaftLinearizedAuthorityReadiness::NotEffectiveVoter
         );
         assert_eq!(
-            linearized_authority_readiness_from_flags(true, true),
+            linearized_authority_readiness_from_flags(true, true, false),
+            ControlPlaneRaftLinearizedAuthorityReadiness::NotAppliedToCommitted
+        );
+        assert_eq!(
+            linearized_authority_readiness_from_flags(true, true, true),
             ControlPlaneRaftLinearizedAuthorityReadiness::Serving
         );
     }
@@ -4009,6 +4017,7 @@ mod tests {
         node_id: ControlPlaneRaftNodeId,
         linearized_authority_serving: bool,
     ) -> ControlPlaneRaftAuthorityStatus {
+        let caught_up_log_id = linearized_authority_serving.then(|| raft_log_id(1, node_id, 1));
         ControlPlaneRaftAuthorityStatus {
             node_id,
             current_leader: linearized_authority_serving.then_some(node_id),
@@ -4022,13 +4031,12 @@ mod tests {
             effective_learner: false,
             applied_voter: linearized_authority_serving,
             applied_learner: false,
-            linearized_authority_serving,
             persisted_vote: None,
             current_term: None,
             last_log_id: None,
             last_purged_log_id: None,
-            committed: None,
-            applied: None,
+            committed: caught_up_log_id,
+            applied: caught_up_log_id,
             current_snapshot: None,
             authority_incarnation: AuthorityIncarnation::INITIAL,
             current_cluster_epoch: ClusterEpoch::INITIAL,
@@ -4099,6 +4107,36 @@ mod tests {
             Err(ControlPlaneError::RpcRemote { message })
                 if message.contains("status key 431 disagrees with reported node 432")
         ));
+
+        let mut lagging_leader = test_authority_status(433, true);
+        lagging_leader.committed = Some(raft_log_id(1, 433, 2));
+        lagging_leader.applied = Some(raft_log_id(1, 433, 1));
+        assert_eq!(
+            lagging_leader.linearized_authority_readiness(),
+            ControlPlaneRaftLinearizedAuthorityReadiness::NotAppliedToCommitted
+        );
+        assert!(!lagging_leader.linearized_authority_serving());
+        let lagging = BTreeMap::from([(433, lagging_leader)]);
+        assert!(matches!(
+            current_serving_authority_node_id(&lagging),
+            Err(ControlPlaneError::RpcRemote { message })
+                if message.contains("no serving raft authority")
+        ));
+
+        let mut same_index_different_term = test_authority_status(434, true);
+        same_index_different_term.committed = Some(raft_log_id(2, 434, 3));
+        same_index_different_term.applied = Some(raft_log_id(1, 434, 3));
+        assert_eq!(
+            same_index_different_term.linearized_authority_readiness(),
+            ControlPlaneRaftLinearizedAuthorityReadiness::NotAppliedToCommitted
+        );
+        assert!(!same_index_different_term.linearized_authority_serving());
+        let same_index_mismatch = BTreeMap::from([(434, same_index_different_term)]);
+        assert!(matches!(
+            current_serving_authority_node_id(&same_index_mismatch),
+            Err(ControlPlaneError::RpcRemote { message })
+                if message.contains("no serving raft authority")
+        ));
     }
 
     async fn wait_for_log_purged_to(
@@ -4141,6 +4179,31 @@ mod tests {
         match ControlPlaneRaftTypeConfig::timeout(timeout, future).await {
             Ok(Ok(_)) => panic!("{message}: unexpectedly succeeded"),
             Ok(Err(error)) => error,
+            Err(_) => panic!("{message}: timed out after {timeout:?}"),
+        }
+    }
+
+    async fn wait_for_authority_status_matching(
+        authority: &ControlPlaneRaftAuthority,
+        timeout: Duration,
+        message: &'static str,
+        predicate: impl Fn(&ControlPlaneRaftAuthorityStatus) -> bool + Sync,
+    ) -> ControlPlaneRaftAuthorityStatus {
+        match ControlPlaneRaftTypeConfig::timeout(timeout, async {
+            loop {
+                let status = authority
+                    .status()
+                    .await
+                    .unwrap_or_else(|error| panic!("{message}: failed to read status: {error:?}"));
+                if predicate(&status) {
+                    return status;
+                }
+                ControlPlaneRaftTypeConfig::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        {
+            Ok(status) => status,
             Err(_) => panic!("{message}: timed out after {timeout:?}"),
         }
     }
@@ -5833,7 +5896,24 @@ mod tests {
             )
             .await;
             let transferred_statuses = expect_bounded_control_plane_raft(
-                status_list_handle.authority_statuses(),
+                async {
+                    for _ in 0..100 {
+                        let statuses = status_list_handle.authority_statuses().await?;
+                        if statuses.get(&412).is_some_and(|status| {
+                            status.current_leader() == Some(412)
+                                && status.local_leader()
+                                && status.applied_caught_up_to_committed()
+                        }) {
+                            return Ok(statuses);
+                        }
+                        ControlPlaneRaftTypeConfig::sleep(Duration::from_millis(10)).await;
+                    }
+                    Err(ControlPlaneError::RpcRemote {
+                        message:
+                            "authority status-list directory transferred leader did not catch up"
+                                .to_string(),
+                    })
+                },
                 operation_timeout,
                 "authority status-list directory statuses after transfer",
             )
@@ -6041,6 +6121,20 @@ mod tests {
                 .unwrap();
             wait_for_local_leader(authority1.raft(), "directory first independent leader").await;
             wait_for_local_leader(authority2.raft(), "directory second independent leader").await;
+            wait_for_authority_status_matching(
+                &authority1,
+                operation_timeout,
+                "directory first independent leader serving",
+                ControlPlaneRaftAuthorityStatus::linearized_authority_serving,
+            )
+            .await;
+            wait_for_authority_status_matching(
+                &authority2,
+                operation_timeout,
+                "directory second independent leader serving",
+                ControlPlaneRaftAuthorityStatus::linearized_authority_serving,
+            )
+            .await;
 
             let directory = InMemoryAuthorityCapabilityDirectory::default();
             directory.register(421, Arc::clone(&authority1));

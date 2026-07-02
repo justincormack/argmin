@@ -9997,6 +9997,11 @@ Phase 12.1 progress:
   admin. The routing handle used by ordinary linearized clients can no longer
   replace voters, add learners, or transfer leadership; those operations route
   through a separate leader-admin directory and routing handle.
+- Tightened raft status readiness so a node is not reported as a serving
+  linearized authority unless it is local leader, an effective voter, and its
+  state machine has applied through the committed watermark. The serving flag is
+  now derived from those status fields instead of stored separately, so routed
+  clients fail closed while a restarted or lagging leader catches up.
 
 1. define the replicated control-plane state machine:
    - state includes cluster epoch, PG count, PG state, PG acting sets, node
