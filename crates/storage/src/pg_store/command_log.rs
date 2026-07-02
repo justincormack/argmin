@@ -2046,11 +2046,18 @@ impl PgStore {
         }))
     }
 
+    /// Remove an epoch-mismatched pending slot during pre-serving recovery.
+    ///
+    /// This must not be called from heartbeat or other serving-time observation
+    /// paths. A normal command can install a future-epoch pending slot before
+    /// apply/record advances the durable replica state to that epoch, and no
+    /// terminal log entry exists during that in-flight window.
     pub(crate) fn clean_epoch_mismatched_orphan_pending_metadata_command_slot(
         &self,
-        node_id: u32,
-        current_epoch: ClusterEpoch,
+        ctx: super::PgStoreRecoveryContext,
     ) -> Result<bool, StoreError> {
+        let node_id = ctx.node_id().as_u32();
+        let current_epoch = self.metadata_command_replica_state()?.cluster_epoch;
         let Some(slot) = self.pending_metadata_command_slot_any_epoch(node_id)? else {
             return Ok(false);
         };
@@ -2450,7 +2457,7 @@ impl PgStore {
         &self,
         ctx: super::PgStoreRecoveryContext,
     ) -> Result<MetadataCommandReplicaState, StoreError> {
-        let node_id = ctx.node_id.as_u32();
+        let node_id = ctx.node_id().as_u32();
         observability::trace_scope!(
             TRACE_TARGET,
             "PgStore::recover",
@@ -2490,10 +2497,7 @@ impl PgStore {
         &self,
         ctx: super::PgStoreRecoveryContext,
     ) -> Result<(), StoreError> {
-        let node_id = ctx.node_id.as_u32();
-        let state = self.metadata_command_replica_state()?;
-        let stored_epoch = state.cluster_epoch;
-        self.clean_epoch_mismatched_orphan_pending_metadata_command_slot(node_id, stored_epoch)?;
+        self.clean_epoch_mismatched_orphan_pending_metadata_command_slot(ctx)?;
         Ok(())
     }
 

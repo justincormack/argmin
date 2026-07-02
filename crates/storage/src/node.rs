@@ -594,7 +594,7 @@ impl SharedStorageNode {
     /// Boundary" guide section. The caller supplies the owning node id; the
     /// recovery epoch is read from each store's own replica state.
     pub fn recover_pg_metadata_command_state(&self, node_id: NodeId) -> Result<(), StoreError> {
-        let ctx = PgStoreRecoveryContext { node_id };
+        let ctx = PgStoreRecoveryContext::for_node(node_id);
         for &pg_id in self.pg_id_list.iter() {
             self.get_pg(pg_id)?.recover(ctx)?;
         }
@@ -610,7 +610,7 @@ impl SharedStorageNode {
         &self,
         node_id: NodeId,
     ) -> Result<(), StoreError> {
-        let ctx = PgStoreRecoveryContext { node_id };
+        let ctx = PgStoreRecoveryContext::for_node(node_id);
         for &pg_id in self.pg_id_list.iter() {
             self.get_pg(pg_id)?
                 .recover_clean_orphan_pending_command_slots(ctx)?;
@@ -1229,27 +1229,17 @@ impl SharedStorageNode {
     ) -> Result<NodePgHeartbeatObservation, StoreError> {
         let pg = self.get_pg(pg_id.get())?;
         let metadata_epoch = pg.metadata_command_replica_state()?.cluster_epoch;
-        let mut metadata_state =
+        let metadata_state =
             pg.metadata_command_replica_state_for_heartbeat(node_id.as_u32(), metadata_epoch)?;
         let pending_slot = pg.pending_metadata_command_slot_any_epoch(node_id.as_u32())?;
-        let mut has_pending_metadata_command = match pending_slot {
-            Some(slot) if slot.id.cluster_epoch() == metadata_epoch => true,
-            Some(_) => {
-                pg.clean_epoch_mismatched_orphan_pending_metadata_command_slot(
-                    node_id.as_u32(),
-                    metadata_epoch,
-                )?;
-                false
-            }
-            None => false,
-        };
-        if has_pending_metadata_command {
-            metadata_state =
-                pg.validate_metadata_command_replay_state(node_id.as_u32(), metadata_epoch)?;
-            has_pending_metadata_command = pg
-                .pending_metadata_command_slot(node_id.as_u32(), metadata_epoch)?
-                .is_some();
-        }
+
+        // Heartbeat is a serving-time observation path. It reports proof and
+        // pending-slot presence, but it must not reconcile or delete pending
+        // slots. A legitimate command can install a future-epoch pending slot
+        // before apply/record advances durable replica state, and terminal
+        // same-epoch slots are also command/recovery cleanup work, not
+        // heartbeat work.
+        let has_pending_metadata_command = pending_slot.is_some();
         Ok(NodePgHeartbeatObservation {
             pg_id,
             state,
@@ -2023,7 +2013,7 @@ mod tests {
     }
 
     #[test]
-    fn shared_node_pg_heartbeat_observation_cleans_epoch_mismatched_orphan_pending_command() {
+    fn shared_node_pg_heartbeat_observation_preserves_epoch_mismatched_pending_command() {
         let tmp = test_util::tempdir();
         let node = SharedStorageNode::open(tmp.path(), &[0]).unwrap();
         let bucket = bucket_name("future-pending-heartbeat");
@@ -2071,16 +2061,18 @@ mod tests {
             observation.metadata_proof.applied_log_index,
             metadata_state.applied_log_index
         );
-        assert!(!observation.has_pending_metadata_command);
+        assert!(observation.has_pending_metadata_command);
         let pg = node.get_pg(0).unwrap();
-        assert!(pg
+        let slot = pg
             .pending_metadata_command_slot_any_epoch(7)
             .unwrap()
-            .is_none());
+            .expect("heartbeat must preserve epoch-mismatched pending slot");
+        assert_eq!(slot.id, command.id());
+        assert_eq!(slot.command_checksum, command.checksum_crc64());
     }
 
     #[test]
-    fn shared_node_pg_heartbeat_observation_cleans_terminal_pending_command() {
+    fn shared_node_pg_heartbeat_observation_preserves_terminal_pending_command() {
         let tmp = test_util::tempdir();
         let node = SharedStorageNode::open(tmp.path(), &[0]).unwrap();
         let bucket = bucket_name("terminal-pending-heartbeat");
@@ -2124,12 +2116,14 @@ mod tests {
             .unwrap();
 
         assert_eq!(observation.metadata_proof.applied_log_index, 1);
-        assert!(!observation.has_pending_metadata_command);
+        assert!(observation.has_pending_metadata_command);
         let pg = node.get_pg(0).unwrap();
-        assert!(pg
+        let slot = pg
             .pending_metadata_command_slot(7, ClusterEpoch::INITIAL)
             .unwrap()
-            .is_none());
+            .expect("heartbeat must preserve terminal pending slot");
+        assert_eq!(slot.id, command.id());
+        assert_eq!(slot.command_checksum, command.checksum_crc64());
     }
 
     #[test]

@@ -1769,9 +1769,9 @@ fn assert_commit_failure_recovers_for_metadata_mutator(
 
     let recovered = PgStore::open(tmp.path(), 1).unwrap();
     recovered
-        .recover(super::super::PgStoreRecoveryContext {
-            node_id: NodeId::new(0),
-        })
+        .recover(super::super::PgStoreRecoveryContext::for_node(NodeId::new(
+            0,
+        )))
         .unwrap_or_else(|err| panic!("{case_name}: recovery failed: {err:?}"));
     let state = assert_pg_recovery_invariants_after_commit_failure(&recovered, case_name);
     assert_pg_accepts_next_command_after_recovery(&recovered, case_name, &state);
@@ -3095,9 +3095,9 @@ fn pg_store_recovery_repairs_cache_only_table_digest_drift() {
     drop(store);
     let recovered = PgStore::open(tmp.path(), 1).unwrap();
     recovered
-        .recover(super::super::PgStoreRecoveryContext {
-            node_id: placement::NodeId::new(0),
-        })
+        .recover(super::super::PgStoreRecoveryContext::for_node(
+            placement::NodeId::new(0),
+        ))
         .unwrap();
     assert!(
         recovered

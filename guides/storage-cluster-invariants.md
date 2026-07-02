@@ -130,12 +130,18 @@ cleanup must precede replay validation, because replay validation reads the
 pending slot through the epoch-checked path and would otherwise reject the
 orphan before the cleanup can run.
 
-Recovery is the primary correctness boundary and the heartbeat-side cleanups are
-defence-in-depth: a crash leftover must not depend on the next heartbeat tick to
-be reconciled. The distinction between fail-closed and reconcile is deliberate:
-corruption is surfaced, crash leftovers are healed idempotently, and a recovered
-store is indistinguishable from one that committed cleanly apart from the
-diagnostic trace. The full recovery contract and its implementation slices live in
+Recovery is the only boundary that may reconcile pending command slots.
+Heartbeat and other serving-time observation paths must not delete or advance
+pending slots: a legitimate command can install a future-epoch pending slot
+before apply/record advances the durable replica state to that epoch, and a
+terminal same-epoch slot is still command/recovery cleanup work. Heartbeat
+therefore reports the durable metadata proof plus whether any pending slot is
+present, and leaves all slot repair to pre-serving recovery or explicit command
+paths. The distinction between fail-closed and reconcile is deliberate:
+corruption is surfaced, crash leftovers are healed idempotently before serving,
+and a recovered store is indistinguishable from one that committed cleanly apart
+from the diagnostic trace. The full recovery contract and its implementation
+slices live in
 [multihost-phase-11-stabilisation-plan.md](../plans/multihost-phase-11-stabilisation-plan.md).
 
 ## StorageCluster Method Matrix

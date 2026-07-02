@@ -406,11 +406,26 @@ static SHARD_TMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 /// orphan pending command slots) and fails closed on command-log or digest
 /// corruption before the store serves. The owning node id is the only external
 /// input: the recovery epoch is read from the store's own replica state, never
-/// supplied by the caller. See the "PG Store Recovery Boundary" section of
+/// supplied by the caller.
+///
+/// This context is intentionally distinct from heartbeat/observation paths:
+/// recovery may mutate PG metadata to repair crash leftovers before serving,
+/// while heartbeat must only report the current proof and pending-slot
+/// presence. See the "PG Store Recovery Boundary" section of
 /// `guides/storage-cluster-invariants.md`.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct PgStoreRecoveryContext {
-    pub node_id: NodeId,
+    node_id: NodeId,
+}
+
+impl PgStoreRecoveryContext {
+    pub(crate) fn for_node(node_id: NodeId) -> Self {
+        Self { node_id }
+    }
+
+    pub(crate) fn node_id(self) -> NodeId {
+        self.node_id
+    }
 }
 
 impl PgStore {
