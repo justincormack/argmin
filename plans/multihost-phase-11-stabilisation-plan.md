@@ -126,8 +126,8 @@ Status summary:
   cover representative generic and hand-written transactions, but the mutator matrix is
   not yet exhaustive.
 - **Remaining Slice 1 work:** finish the digest-affecting mutator inventory, classify or
-  explicitly transaction-wrap single-statement mutators, and add the missing heavier
-  multipart/stream commit-failure cases.
+  explicitly transaction-wrap single-statement mutators, and add any missing cases found by
+  that inventory.
 
 Progress update:
 
@@ -303,13 +303,29 @@ Progress update:
    subresource, `mark_bucket_deleting`, and create multipart upload) plus representative
    hand-written metadata transactions (object metadata put, object generation reservation,
    segmented object put, object-segment reclaim, multipart reclaim, multipart upload
-   delete, and staged multipart part segment upsert). Each case injects a commit failure,
-   reopens and recovers the PG, checks cached-vs-materialised table digests and
-   replica-state digest consistency, asserts no pending slot remains, asserts the PG
-   accepts the next metadata command, and then applies that command. The remaining work is
-   to complete the inventory of digest-affecting mutators, especially single-statement
-   mutators with no explicit transaction and the heavier multipart completion/stream-part
-   transaction paths.
+   delete, committed multipart object-part manifest insertion, full multipart completion,
+   staged multipart part segment upsert, and streamed UploadPart finalization). Each case
+   injects a commit failure, reopens and recovers the PG, checks cached-vs-materialised
+   table digests and replica-state digest consistency, asserts no pending slot remains,
+   asserts the PG accepts the next metadata command, and then applies that command. The
+   remaining work is to complete the inventory of digest-affecting mutators, especially
+   single-statement mutators with no explicit transaction. Those need either explicit
+   classification as SQLite crash-atomic single statements or conversion to explicit
+   transactions if their rollback boundary matters.
+
+   Remaining inventory groups visible from the `PgMetadataStore` surface:
+   - bucket reservation/drain/finalizer/lifecycle/reclaim claim maintenance rows
+     (`acquire_*`, `heartbeat_*`, `release_*`, `clear_*`, and attempt-outcome helpers);
+   - smaller bucket configuration mutators not yet represented by the matrix, such as
+     Object Lock, public access block, ownership controls, ABAC, and delete-subresource
+     variants;
+   - smaller object metadata mutators, such as object ACL, retention, legal hold,
+     object-tag put/delete, object metadata delete, object-version delete, and generation
+     reservation release;
+   - single-statement stream/upload maintenance mutators, such as stream upload create,
+     stream upload state/delete, stream segment append, stream segment publish helpers, MPU
+     state changes, direct MPU part upsert, completed-upload delete, object-part delete,
+     object-segment delete, and reclaim-row delete helpers.
 
 7. **Storage-node restart coverage.** **Completed for current Slice 1 recovery classes.**
    Add a test that opens a PG through
@@ -342,8 +358,8 @@ Progress update:
    digest-affecting mutators and asserts the five post-recovery invariants above,
    including materialised-vs-cached digest agreement and that an epoch-mismatched orphan
    slot does not block recovery. Remaining: make this matrix exhaustive, with explicit
-   coverage or classification for single-statement mutators and heavier multipart/stream
-   commit paths.
+   coverage or classification for single-statement mutators and any remaining mutators
+   found by the inventory.
 6. **Completed:** The reactive heartbeat cleanups (`c5776092`, `791b409c`) remain as a
    defence-in-depth heartbeat-side check but are no longer the primary correctness
    mechanism; this is documented in `guides/storage-cluster-invariants.md`.

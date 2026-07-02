@@ -1839,6 +1839,51 @@ fn test_multipart_part(upload_id: UploadId, part_number: u32) -> MultipartPartRe
     }
 }
 
+fn test_object_part(
+    bucket: BucketName,
+    key: ObjectKey,
+    version_id: VersionId,
+    part_number: u32,
+) -> ObjectPartRecord {
+    ObjectPartRecord {
+        bucket,
+        key,
+        version_id,
+        part_number,
+        size: 64,
+        payload_crc64: 0xabcd + u64::from(part_number),
+        etag: format!("object-part-{part_number}").into_bytes(),
+        etag_kind: EtagKind::Crc64,
+        part_okh: [part_number as u8; 16],
+        part_vid: GenerationId::new(u64::from(part_number) + 30).unwrap(),
+        placement_cluster_epoch: ClusterEpoch::INITIAL,
+        ec_k: 2,
+        ec_m: 1,
+        data_pg_id: part_number,
+        checksum: None,
+    }
+}
+
+fn test_commit_multipart_req(bucket: BucketName, key: ObjectKey) -> CommitMultipartReq {
+    CommitMultipartReq {
+        bucket,
+        key,
+        version_id: VersionId::Null,
+        owner: test_owner(),
+        acl_grants: AclGrants::default(),
+        public_read: false,
+        generation_id: GenerationId::MIN,
+        size: 64,
+        etag_crc64: [0x44, 0, 0, 0, 0, 0, 0, 0],
+        ec: EcShape { k: 2, m: 1 },
+        tags: None,
+        metadata_blob: Some(SerializedMetadataBlob::default()),
+        system_metadata_blob: Some(SerializedSystemMetadataBlob::default()),
+        object_lock: ObjectLockState::default(),
+        encryption: ObjectEncryption::None,
+    }
+}
+
 fn test_multipart_part_segment(
     bucket: BucketName,
     key: ObjectKey,
@@ -2098,6 +2143,52 @@ fn metadata_txn_commit_failure_recovers_representative_mutators() {
     );
 
     assert_commit_failure_recovers_for_metadata_mutator(
+        "commit-object-parts",
+        |_| {},
+        |store| {
+            let bucket = trusted_bucket_name("commit-fail-object-parts");
+            let key = trusted_object_key("object");
+            let part = test_object_part(bucket, key, VersionId::from_u64(1), 1);
+            PgMetadataStore::commit_object_parts(store, std::slice::from_ref(&part))
+        },
+    );
+
+    assert_commit_failure_recovers_for_metadata_mutator(
+        "complete-multipart-commit",
+        |store| {
+            create_probe_bucket_direct(store, &trusted_bucket_name("commit-fail-complete-mpu"));
+            PgMetadataStore::create_multipart_upload(
+                store,
+                &CreateMultipartUploadReq {
+                    upload_id: crate::tests::multipart_upload_id("commit-fail-complete-mpu-upload"),
+                    bucket: trusted_bucket_name("commit-fail-complete-mpu"),
+                    key: trusted_object_key("object"),
+                    tags: None,
+                    metadata_blob: SerializedMetadataBlob::default(),
+                    system_metadata_blob: SerializedSystemMetadataBlob::default(),
+                    initiator: test_owner(),
+                    owner: test_owner(),
+                    acl_grants: AclGrants::default(),
+                    public_read: false,
+                    object_lock: ObjectLockState::default(),
+                    checksum: None,
+                    encryption: ObjectEncryption::None,
+                },
+            )
+            .unwrap();
+        },
+        |store| {
+            let bucket = trusted_bucket_name("commit-fail-complete-mpu");
+            let key = trusted_object_key("object");
+            let upload_id = crate::tests::multipart_upload_id("commit-fail-complete-mpu-upload");
+            let obj = test_commit_multipart_req(bucket.clone(), key.clone());
+            let parts = vec![test_object_part(bucket, key, VersionId::Null, 1)];
+            PgMetadataStore::complete_multipart_commit(store, &upload_id, 1, &obj, &parts)
+                .map(|_| ())
+        },
+    );
+
+    assert_commit_failure_recovers_for_metadata_mutator(
         "upsert-multipart-part-segments",
         |store| {
             create_probe_bucket_direct(store, &trusted_bucket_name("commit-fail-part-segments"));
@@ -2133,6 +2224,62 @@ fn metadata_txn_commit_failure_recovers_representative_mutators() {
             };
             let segments = vec![test_multipart_part_segment(bucket, key, upload_id, 1, 0)];
             PgMetadataStore::upsert_multipart_part_segments(store, &part, &segments).map(|_| ())
+        },
+    );
+
+    assert_commit_failure_recovers_for_metadata_mutator(
+        "commit-stream-part",
+        |store| {
+            create_probe_bucket_direct(store, &trusted_bucket_name("commit-fail-stream-part"));
+            PgMetadataStore::create_multipart_upload(
+                store,
+                &CreateMultipartUploadReq {
+                    upload_id: crate::tests::multipart_upload_id("commit-fail-stream-part-upload"),
+                    bucket: trusted_bucket_name("commit-fail-stream-part"),
+                    key: trusted_object_key("object"),
+                    tags: None,
+                    metadata_blob: SerializedMetadataBlob::default(),
+                    system_metadata_blob: SerializedSystemMetadataBlob::default(),
+                    initiator: test_owner(),
+                    owner: test_owner(),
+                    acl_grants: AclGrants::default(),
+                    public_read: false,
+                    object_lock: ObjectLockState::default(),
+                    checksum: None,
+                    encryption: ObjectEncryption::None,
+                },
+            )
+            .unwrap();
+            PgMetadataStore::create_stream_upload(
+                store,
+                &CreateStreamUploadReq {
+                    session_id: SessionId::try_from("c1".repeat(16)).unwrap(),
+                    bucket: trusted_bucket_name("commit-fail-stream-part"),
+                    key: trusted_object_key("object"),
+                    target: StreamUploadTarget::UploadPart {
+                        upload_id: crate::tests::multipart_upload_id(
+                            "commit-fail-stream-part-upload",
+                        ),
+                        part_number: 1,
+                    },
+                    encryption: ObjectEncryption::None,
+                },
+            )
+            .unwrap();
+        },
+        |store| {
+            let upload_id = crate::tests::multipart_upload_id("commit-fail-stream-part-upload");
+            let bucket = trusted_bucket_name("commit-fail-stream-part");
+            let key = trusted_object_key("object");
+            let part = test_multipart_part(upload_id.clone(), 1);
+            let segments = vec![test_multipart_part_segment(bucket, key, upload_id, 1, 0)];
+            PgMetadataStore::commit_stream_part(
+                store,
+                &SessionId::try_from("c1".repeat(16)).unwrap(),
+                &part,
+                &segments,
+            )
+            .map(|_| ())
         },
     );
 }
