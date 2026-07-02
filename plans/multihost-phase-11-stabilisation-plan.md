@@ -100,11 +100,12 @@ fix is local to one mutator.
 - `StorageNodeServer::bind` (`storage_node_server.rs:964`) — the actual production
   multihost restart path — performs no recovery validation at all. A storage node restarting
   independently serves requests on unvalidated PG state until the first heartbeat tick.
-- A partial open-time cleanup exists but is narrow:
-  `clean_terminal_primary_pending_slot_on_open` (`cluster/local.rs:3868`) and
-  `converge_in_flight_metadata_command_on_open` (`cluster/local.rs:3840`) run only on the
-  **local in-process cluster build** path, only for the **primary** of each PG, only for the
-  **terminal** case, and do **no digest validation**.
+- A partial open-time cleanup existed but was narrow:
+  `clean_terminal_primary_pending_slot_on_open` has now been removed, and terminal pending
+  slots are cleaned by the shared replay validation/recovery path. The remaining
+  `converge_in_flight_metadata_command_on_open` local-cluster path is for genuine in-flight
+  primary commands that need to be applied to every replica before replay validation can
+  prove convergence.
 - `metadata_state_digest_mismatch` (`command_log.rs:3659`) runs only from
   `metadata_command_acceptance` (`:3258`, `:3298`) — i.e. on the command-apply path. It is
   never run at open.
@@ -257,6 +258,15 @@ Progress update:
      still needed for genuine in-flight (non-terminal) commands and is not duplicating
      recovery-pass work.
 
+   Progress update: terminal pending-slot cleanup is now consolidated in
+   `validate_metadata_command_replay_state`/`PgStore::recover`; the old
+   `clean_terminal_primary_pending_slot_on_open` helper has been removed. Local-cluster open
+   still releases command-owned bucket-write reservations for terminal or converged commands
+   before replay validation removes the terminal slot, because reservation rows live on the
+   bucket PG and require the cluster route context. `converge_in_flight_metadata_command_on_open`
+   remains necessary for genuine primary-pending commands that have not yet been applied to
+   every replica.
+
 6. **Crash-recovery property test for every digest-affecting mutator.** Using the
    generalised hook from work item 3, for each metadata-mutating transaction: inject a
    commit failure, reopen the PG through `PgStore::open` then `pg.recover(ctx)`, and assert
@@ -290,8 +300,7 @@ Progress update:
    `record_metadata_command_applied` remains per-replica recording only so partial-fanout
    recovery remains correct.
 4. The local-cluster build path and the storage-node server share one recovery code path;
-   `clean_terminal_primary_pending_slot_on_open` is removed or narrowed to a documented
-   non-recovery responsibility.
+   `clean_terminal_primary_pending_slot_on_open` is removed.
 5. A crash-recovery property test covers every digest-affecting mutator and asserts the
    five post-recovery invariants above, including materialised-vs-cached digest agreement
    and that an epoch-mismatched orphan slot does not block recovery.

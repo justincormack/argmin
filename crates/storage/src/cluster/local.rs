@@ -3886,54 +3886,8 @@ fn validate_metadata_command_replay_state(
                 .expect("validated route primary must be in local node set");
             if command.id().log_index().get() <= primary_state.applied_log_index {
                 release_open_metadata_command_bucket_write_reservation(nodes, pg_routes, command)?;
-                clean_terminal_primary_pending_slot_on_open(
-                    nodes,
-                    pg_id,
-                    primary_node_id,
-                    cluster_epoch,
-                    command,
-                )?;
             }
         }
-    }
-    Ok(())
-}
-
-fn clean_terminal_primary_pending_slot_on_open(
-    nodes: &BTreeMap<NodeId, LocalNodeStore>,
-    pg_id: PgId,
-    primary_node_id: NodeId,
-    cluster_epoch: ClusterEpoch,
-    command: &MetadataCommandEnvelope,
-) -> Result<(), ClusterBuildError> {
-    let primary = nodes
-        .get(&primary_node_id)
-        .expect("validated route primary must be in local node set");
-    primary
-        .metadata_command_client()
-        .remove_pending_metadata_command_slot(pg_id, command)
-        .map_err(|source| ClusterBuildError::OpenLocalNode {
-            node_id: primary_node_id.as_u32(),
-            source,
-        })?;
-    if primary
-        .metadata_command_client()
-        .pending_metadata_command_envelope(pg_id, cluster_epoch)
-        .map_err(|source| ClusterBuildError::OpenLocalNode {
-            node_id: primary_node_id.as_u32(),
-            source,
-        })?
-        .is_some()
-    {
-        return Err(ClusterBuildError::OpenLocalNode {
-            node_id: primary_node_id.as_u32(),
-            source: StoreError::MetadataCommandLogConflict {
-                node_id: primary_node_id.as_u32(),
-                pg_id: pg_id.get(),
-                cluster_epoch,
-                log_index: command.id().log_index().get(),
-            },
-        });
     }
     Ok(())
 }
@@ -4000,13 +3954,6 @@ fn converge_in_flight_metadata_command_on_open(
     }
 
     release_open_metadata_command_bucket_write_reservation(nodes, pg_routes, command)?;
-    clean_terminal_primary_pending_slot_on_open(
-        nodes,
-        pg_id,
-        primary_node_id,
-        cluster_epoch,
-        command,
-    )?;
 
     let mut converged_states = Vec::new();
     for node in nodes.values() {
