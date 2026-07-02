@@ -10024,6 +10024,11 @@ Phase 12.1 progress:
   remain later Phase 12 work. The `ARGMIN_CONTROL_PLANE_EXPERIMENTAL_RAFT`
   flag is temporary spike wiring and must be removed or replaced by the final
   control-plane mode selection once the durable/multi-node Raft path is ready.
+- Extended the experimental process-mode coverage through the storage-node
+  heartbeat refresh path. The adapter smoke now covers the startup
+  incarnation/endpoint epoch bump, a subsequent Peering observation that commits
+  `CompleteReadyPgPeerings` through OpenRaft, and the follow-up Active
+  heartbeat/runtime-map handoff.
 
 1. define the replicated control-plane state machine:
    - state includes cluster epoch, PG count, PG state, PG acting sets, node

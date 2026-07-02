@@ -2557,13 +2557,21 @@ mod tests {
         }
     }
 
-    #[test]
-    fn root_process_check_rejects_effective_uid_zero() {
-        assert_eq!(reject_root_process(0), Err(ROOT_PROCESS_ERROR));
+    struct ExperimentalRaftTestHarness {
+        runtime: tokio::runtime::Runtime,
+        authority: Arc<ControlPlaneRaftAuthority>,
+        control_plane: ExperimentalRaftControlPlane,
     }
 
-    #[test]
-    fn experimental_raft_control_plane_bootstraps_runtime_map() {
+    impl ExperimentalRaftTestHarness {
+        fn shutdown(self) {
+            self.runtime
+                .block_on(self.authority.shutdown())
+                .expect("experimental raft authority should shut down");
+        }
+    }
+
+    fn experimental_raft_test_harness(name: &str) -> ExperimentalRaftTestHarness {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
@@ -2571,10 +2579,7 @@ mod tests {
         let handle = runtime.handle().clone();
         let authority = runtime.block_on(async {
             let authority = ControlPlaneRaftAuthority::new_experimental_single_node_in_memory(
-                format!(
-                    "argmin-s3-experimental-raft-process-test-{}",
-                    std::process::id()
-                ),
+                format!("argmin-s3-experimental-raft-{name}-{}", std::process::id()),
                 1,
             )
             .await
@@ -2593,10 +2598,25 @@ mod tests {
                 .expect("single-node raft should become leader");
             Arc::new(authority)
         });
-        let mut control_plane = ExperimentalRaftControlPlane {
+        let control_plane = ExperimentalRaftControlPlane {
             runtime: handle,
             authority: Arc::clone(&authority),
         };
+        ExperimentalRaftTestHarness {
+            runtime,
+            authority,
+            control_plane,
+        }
+    }
+
+    #[test]
+    fn root_process_check_rejects_effective_uid_zero() {
+        assert_eq!(reject_root_process(0), Err(ROOT_PROCESS_ERROR));
+    }
+
+    #[test]
+    fn experimental_raft_control_plane_bootstraps_runtime_map() {
+        let mut harness = experimental_raft_test_harness("process-bootstrap-test");
         let mut config = test_server_config();
         config.storage_node_sockets = vec![config::ConfiguredStorageNodeSocket {
             node_id: 1,
@@ -2604,9 +2624,10 @@ mod tests {
         }];
         config.storage_pg_ids = vec![0];
 
-        bootstrap_empty_experimental_raft_control_plane(&mut control_plane, &config)
+        bootstrap_empty_experimental_raft_control_plane(&mut harness.control_plane, &config)
             .expect("experimental raft control-plane bootstrap should succeed");
-        let runtime_map = control_plane
+        let runtime_map = harness
+            .control_plane
             .runtime_map_snapshot(10_000)
             .expect("experimental raft runtime map should serve");
         assert_eq!(runtime_map.nodes().len(), 1);
@@ -2618,9 +2639,115 @@ mod tests {
         assert_eq!(runtime_map.pg_routes().len(), 1);
         assert_eq!(runtime_map.pg_routes()[0].pg_id(), PgId::new(0));
 
-        runtime
-            .block_on(authority.shutdown())
-            .expect("experimental raft authority should shut down");
+        harness.shutdown();
+    }
+
+    #[test]
+    fn experimental_raft_control_plane_heartbeat_completes_ready_peering() {
+        let mut harness = experimental_raft_test_harness("heartbeat-peering-test");
+        let mut config = test_server_config();
+        config.storage_node_sockets = vec![config::ConfiguredStorageNodeSocket {
+            node_id: 1,
+            socket_path: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
+        }];
+        config.storage_pg_ids = vec![7];
+        bootstrap_empty_experimental_raft_control_plane(&mut harness.control_plane, &config)
+            .expect("experimental raft control-plane bootstrap should succeed");
+
+        let bootstrap_epoch = harness
+            .control_plane
+            .current_snapshot()
+            .expect("experimental snapshot should read")
+            .cluster_epoch();
+        harness
+            .control_plane
+            .refresh_node_heartbeat(
+                NodeHeartbeat {
+                    node_id: NodeId::new(1),
+                    node_incarnation: 1,
+                    endpoint: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
+                    observed_epoch: bootstrap_epoch,
+                    requested_lease_duration_ms: 500,
+                    cluster_map_history_reference_summary:
+                        storage::PgClusterMapHistoryReferenceSummary::default(),
+                    pg_observations: Vec::new(),
+                },
+                20_000,
+            )
+            .expect("experimental raft startup heartbeat should refresh");
+        let peering_epoch = harness
+            .control_plane
+            .current_snapshot()
+            .expect("experimental snapshot should read after startup heartbeat")
+            .cluster_epoch();
+        let proof = PgMetadataProof::new(42, 0xabc, 0xdef);
+        let peering_refresh = harness
+            .control_plane
+            .refresh_node_heartbeat(
+                NodeHeartbeat {
+                    node_id: NodeId::new(1),
+                    node_incarnation: 1,
+                    endpoint: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
+                    observed_epoch: peering_epoch,
+                    requested_lease_duration_ms: 500,
+                    cluster_map_history_reference_summary:
+                        storage::PgClusterMapHistoryReferenceSummary::default(),
+                    pg_observations: vec![NodePgHeartbeatObservation {
+                        pg_id: PgId::new(7),
+                        state: PgState::Peering,
+                        metadata_proof: proof,
+                        has_pending_metadata_command: false,
+                    }],
+                },
+                20_100,
+            )
+            .expect("experimental raft heartbeat should refresh");
+        assert_eq!(peering_refresh.lease().lease_deadline_ms(), 20_600);
+        let peering_route = &peering_refresh.runtime_map().pg_routes()[0];
+        assert_eq!(peering_route.pg_id(), PgId::new(7));
+        assert_eq!(peering_route.state(), PgState::Active);
+        assert_eq!(peering_route.primary_node_id(), NodeId::new(1));
+        assert_eq!(peering_route.primary_lease_deadline_ms(), Some(20_600));
+
+        let active_snapshot = harness
+            .control_plane
+            .current_snapshot()
+            .expect("experimental snapshot should read after peering completion");
+        let pg = active_snapshot.pg(PgId::new(7)).expect("PG should exist");
+        assert_eq!(pg.state(), PgState::Active);
+        assert_eq!(pg.active_primary(), Some(NodeId::new(1)));
+        assert_eq!(pg.active_metadata_proof(), Some(proof));
+        assert_eq!(pg.active_metadata_proof_epoch(), Some(peering_epoch));
+        let active_epoch = active_snapshot.cluster_epoch();
+
+        let active_refresh = harness
+            .control_plane
+            .refresh_node_heartbeat(
+                NodeHeartbeat {
+                    node_id: NodeId::new(1),
+                    node_incarnation: 1,
+                    endpoint: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
+                    observed_epoch: active_epoch,
+                    requested_lease_duration_ms: 600,
+                    cluster_map_history_reference_summary:
+                        storage::PgClusterMapHistoryReferenceSummary::default(),
+                    pg_observations: vec![NodePgHeartbeatObservation {
+                        pg_id: PgId::new(7),
+                        state: PgState::Active,
+                        metadata_proof: proof,
+                        has_pending_metadata_command: false,
+                    }],
+                },
+                20_200,
+            )
+            .expect("experimental raft active heartbeat should refresh");
+        assert!(active_refresh.lease().serving());
+        assert_eq!(active_refresh.lease().lease_deadline_ms(), 20_800);
+        let active_route = &active_refresh.runtime_map().pg_routes()[0];
+        assert_eq!(active_route.state(), PgState::Active);
+        assert_eq!(active_route.primary_lease_deadline_ms(), Some(20_800));
+
+        harness.shutdown();
     }
 
     #[test]
