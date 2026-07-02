@@ -10075,6 +10075,110 @@ mod tests {
     }
 
     #[test]
+    fn control_plane_raft_durable_restart_artifact_file_ignores_stale_temp_file() {
+        let tmp = test_util::tempdir();
+        let path = tmp.path().join("raft.state");
+        let tmp_path = durable_artifact_tmp_path(&path);
+        let committed_artifact = ControlPlaneRaftRestartArtifact {
+            log_store: ControlPlaneRaftLogStoreRestartArtifact {
+                vote: Some(Vote::<ControlPlaneRaftLeaderId>::new_committed(3, 1)),
+                committed: Some(raft_log_id(3, 1, 1)),
+                entries: vec![bootstrap_membership_entry(1), blank_entry(3, 1, 1)],
+                ..Default::default()
+            },
+            state_machine: state_machine_restart_artifact_with_noops(3, 1, 1),
+        };
+        let stale_temp_artifact = ControlPlaneRaftRestartArtifact {
+            log_store: ControlPlaneRaftLogStoreRestartArtifact {
+                vote: Some(Vote::<ControlPlaneRaftLeaderId>::new_committed(5, 1)),
+                committed: Some(raft_log_id(5, 1, 2)),
+                entries: vec![
+                    bootstrap_membership_entry(1),
+                    blank_entry(5, 1, 1),
+                    blank_entry(5, 1, 2),
+                ],
+                ..Default::default()
+            },
+            state_machine: state_machine_restart_artifact_with_noops(5, 1, 2),
+        };
+
+        committed_artifact.store_durable_artifact(&path).unwrap();
+        std::fs::write(
+            &tmp_path,
+            stale_temp_artifact.encode_durable_artifact().unwrap(),
+        )
+        .unwrap();
+
+        let loaded = ControlPlaneRaftRestartArtifact::load_durable_artifact(&path)
+            .expect("stable durable restart artifact should load despite stale temp file");
+        let (mut loaded_log_store, loaded_state_machine) = loaded.restore().unwrap();
+        ControlPlaneRaftTypeConfig::run(async {
+            assert_eq!(
+                RaftLogStorage::read_committed(&mut loaded_log_store)
+                    .await
+                    .unwrap(),
+                Some(raft_log_id(3, 1, 1))
+            );
+        });
+        assert_eq!(
+            loaded_state_machine.last_applied(),
+            Some(raft_log_id(3, 1, 1))
+        );
+    }
+
+    #[test]
+    fn control_plane_raft_durable_restart_artifact_file_preserves_existing_on_temp_failure() {
+        let tmp = test_util::tempdir();
+        let path = tmp.path().join("raft.state");
+        let tmp_path = durable_artifact_tmp_path(&path);
+        let committed_artifact = ControlPlaneRaftRestartArtifact {
+            log_store: ControlPlaneRaftLogStoreRestartArtifact {
+                vote: Some(Vote::<ControlPlaneRaftLeaderId>::new_committed(3, 1)),
+                committed: Some(raft_log_id(3, 1, 1)),
+                entries: vec![bootstrap_membership_entry(1), blank_entry(3, 1, 1)],
+                ..Default::default()
+            },
+            state_machine: state_machine_restart_artifact_with_noops(3, 1, 1),
+        };
+        let replacement_artifact = ControlPlaneRaftRestartArtifact {
+            log_store: ControlPlaneRaftLogStoreRestartArtifact {
+                vote: Some(Vote::<ControlPlaneRaftLeaderId>::new_committed(5, 1)),
+                committed: Some(raft_log_id(5, 1, 2)),
+                entries: vec![
+                    bootstrap_membership_entry(1),
+                    blank_entry(5, 1, 1),
+                    blank_entry(5, 1, 2),
+                ],
+                ..Default::default()
+            },
+            state_machine: state_machine_restart_artifact_with_noops(5, 1, 2),
+        };
+
+        committed_artifact.store_durable_artifact(&path).unwrap();
+        std::fs::create_dir(&tmp_path).unwrap();
+        assert_error_contains(
+            replacement_artifact.store_durable_artifact(&path),
+            "create control-plane OpenRaft durable restart artifact temp file",
+        );
+
+        let loaded = ControlPlaneRaftRestartArtifact::load_durable_artifact(&path)
+            .expect("previous durable restart artifact should remain after temp-file failure");
+        let (mut loaded_log_store, loaded_state_machine) = loaded.restore().unwrap();
+        ControlPlaneRaftTypeConfig::run(async {
+            assert_eq!(
+                RaftLogStorage::read_committed(&mut loaded_log_store)
+                    .await
+                    .unwrap(),
+                Some(raft_log_id(3, 1, 1))
+            );
+        });
+        assert_eq!(
+            loaded_state_machine.last_applied(),
+            Some(raft_log_id(3, 1, 1))
+        );
+    }
+
+    #[test]
     fn control_plane_raft_durable_restart_artifact_file_rejects_corruption() {
         let tmp = test_util::tempdir();
         let path = tmp.path().join("raft.state");

@@ -10168,7 +10168,10 @@ Phase 12.2 progress:
   artifact can now be stored through a same-directory temp file, `sync_all`,
   atomic rename, and parent-directory sync, and loaded back through the
   checksum/restart-validation decoder. Tests cover nested-directory store/load
-  and corrupt-file rejection.
+  and corrupt-file rejection. Additional file-boundary regressions now verify
+  that stale temp files are ignored on load, and that a temp-file creation
+  failure leaves the previous stable artifact readable instead of clobbering
+  the durable restart point.
 - Added a durable single-node OpenRaft authority constructor for the
   experimental path. It loads and validates the local restart artifact when
   present, restores the OpenRaft log/state-machine pair through the durable
