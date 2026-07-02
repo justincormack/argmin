@@ -425,3 +425,49 @@ when prioritised. They correspond to the remaining findings from the Phase 11 re
   before metadata publish, after pending-command install before apply, after apply before
   response, during cleanup/finalization, and across PG state transitions. This replaces the
   slow, non-deterministic soak discovery of these bugs with fast precise tests.
+
+- **Slice 7: Control-plane RPC retry and command check-applied semantics.** The current
+  Unix control-plane RPC path uses a single one-second read/write timeout on both client and
+  server sides. A transient pause such as a network switch reboot, scheduler stall, or
+  overloaded authority worker can therefore leave the caller unable to distinguish "command
+  was not applied" from "command was applied but the response was lost". Treating all such
+  failures as hard failures makes live admin operations brittle; blindly retrying all
+  commands is also unsafe because some commands advance route/provenance state.
+
+  Split the work by command semantics:
+  - **Read-only RPCs, including read-only runtime-map fetches:** retry/reconnect with
+    bounded backoff and an overall deadline. These do not need check-applied logic. Do not
+    classify an RPC as read-only just because it returns a runtime map:
+    `FencePgForMetadataTransferRuntimeMap` and
+    `SetPgActingSetWithMetadataTransferRuntimeMap` mutate control-plane state before
+    returning their map and therefore belong with the command-specific check-applied paths
+    below.
+  - **Convergent set-style commands:** `SetNodeMembership`, `MarkNodeAvailability`,
+    `SetPgState`, and probably `SetPgActingSet` can be retried only after confirming the
+    apply path is idempotent/no-op when the target value is already current. For
+    `SetPgActingSet`, prefer checking the runtime map for the expected acting set before
+    resubmitting, because even logically identical route updates can create noisy extra
+    epochs if the apply path is not strictly idempotent.
+  - **Time-based liveness commands:** `RecordNodeHeartbeat` and `ExpireHeartbeatLeases`
+    need bounded retry/reconnect, but with care that retrying the same timestamp/deadline is
+    monotonic and cannot shorten a valid lease or resurrect an expired one.
+  - **Non-idempotent route/provenance transitions:** add explicit check-applied paths for
+    `FencePgForMetadataTransfer`, `FencePgForMetadataTransferRuntimeMap`,
+    `SetPgActingSetWithMetadataTransfer`,
+    `SetPgActingSetWithMetadataTransferRuntimeMap`, `CompletePgPeering`, and
+    `CompleteReadyPgPeerings`. On timeout, broken pipe, connection reset, or authority
+    disconnect after submit, re-read the current runtime map and decide whether the intended
+    state is already present:
+    - `FencePgForMetadataTransfer`: PG is already fenced/peering with the expected source
+      route, source lease, and transfer proof.
+    - `SetPgActingSetWithMetadataTransfer`: PG route has the expected acting set and matching
+      metadata-transfer proof.
+    - `CompletePgPeering` / `CompleteReadyPgPeerings`: PG is active with the expected
+      primary, node incarnation, and route/proof state.
+
+  Do not hide these distinctions behind a generic "retry every admin command" wrapper.
+  The retry layer should classify transport failures as transient, but mutating admin flows
+  must provide command-specific observation predicates that prove whether the lost-response
+  command took effect. Tests should inject a response-loss failure after the authority has
+  applied each non-idempotent command, then assert the live admin path observes the applied
+  state and does not submit a second incompatible transition.
