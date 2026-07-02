@@ -9710,6 +9710,71 @@ mod tests {
     }
 
     #[test]
+    fn unix_control_plane_heartbeat_retry_observes_completed_peering_after_lost_response() {
+        let tmp = test_util::tempdir();
+        let socket_path = tmp.path().join("control-plane.sock");
+        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+        authority
+            .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
+            .unwrap();
+        assert!(heartbeat_until_serving(&mut authority, 1, 1_000).serving());
+        authority
+            .set_pg_acting_set(PgId::new(22), vec![NodeId::new(1)])
+            .unwrap();
+        let peering_epoch = authority.snapshot().cluster_epoch();
+        let expected_active_epoch = ClusterEpoch::new(peering_epoch.get() + 1).unwrap();
+        let mut peering_heartbeat = heartbeat_from_record(&authority, 1, peering_epoch, 2_000);
+        peering_heartbeat.pg_observations = vec![NodePgHeartbeatObservation {
+            pg_id: PgId::new(22),
+            state: PgState::Peering,
+            metadata_proof: PgMetadataProof::empty(),
+            has_pending_metadata_command: false,
+        }];
+        let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _addr) = listener.accept().unwrap();
+            let request = read_control_plane_unix_request(&mut stream).unwrap();
+            assert_eq!(request.kind, ControlPlaneRpcKind::RefreshNodeHeartbeat);
+            let response = build_control_plane_unix_response(&mut authority, request, 2_000)
+                .expect("heartbeat refresh should complete peering before response loss");
+            assert_eq!(response.kind, ControlPlaneRpcKind::RefreshNodeHeartbeat);
+            assert_eq!(authority.snapshot().cluster_epoch(), expected_active_epoch);
+            let pg = authority.snapshot().pg(PgId::new(22)).unwrap();
+            assert_eq!(pg.state(), PgState::Active);
+            assert_eq!(pg.active_primary(), Some(NodeId::new(1)));
+            drop(response);
+            drop(stream);
+
+            let (mut stream, _addr) = listener.accept().unwrap();
+            let request = read_control_plane_unix_request(&mut stream).unwrap();
+            assert_eq!(request.kind, ControlPlaneRpcKind::RefreshNodeHeartbeat);
+            respond_control_plane_unix_request(&mut authority, &mut stream, request, 2_050)
+                .unwrap();
+            assert_eq!(
+                authority.snapshot().cluster_epoch(),
+                expected_active_epoch,
+                "retrying the stale heartbeat must not complete peering a second time"
+            );
+        });
+
+        let mut client = UnixControlPlaneClient::new(&socket_path);
+        let refresh = client.refresh_node_heartbeat(peering_heartbeat, 0).unwrap();
+
+        server.join().unwrap();
+        assert_eq!(refresh.lease().lease_deadline_ms(), 2_150);
+        assert_eq!(refresh.runtime_map().cluster_epoch(), expected_active_epoch);
+        let route = refresh
+            .runtime_map()
+            .pg_routes()
+            .iter()
+            .find(|route| route.pg_id() == PgId::new(22))
+            .unwrap();
+        assert_eq!(route.state(), PgState::Active);
+        assert_eq!(route.primary_node_id(), NodeId::new(1));
+    }
+
+    #[test]
     fn unix_control_plane_client_stops_heartbeat_retry_before_lease_window_expires() {
         let tmp = test_util::tempdir();
         let socket_path = tmp.path().join("control-plane.sock");

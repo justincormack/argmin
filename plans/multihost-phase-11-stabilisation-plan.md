@@ -746,7 +746,13 @@ when prioritised. They correspond to the remaining findings from the Phase 11 re
       they observe the expected peering route, acting set, and metadata-transfer proof.
       Storage regressions inject response loss after the authority applies each RPC form.
     - `CompletePgPeering` / `CompleteReadyPgPeerings`: PG is active with the expected
-      primary, node incarnation, and route/proof state.
+      primary, node incarnation, and route/proof state. **Status:** these are not exposed as
+      direct live Unix admin RPCs. `CompleteReadyPgPeerings` can still run inside
+      `RefreshNodeHeartbeat`; a storage regression injects response loss after heartbeat
+      refresh activates a ready Peering PG, then retries the same stale heartbeat and asserts
+      the retry observes the active route without advancing the epoch again. `CompletePgPeering`
+      remains a local/single-authority and Raft command path rather than a Slice 7 Unix RPC
+      response-loss surface.
 
   Do not hide these distinctions behind a generic "retry every admin command" wrapper.
   The retry layer should classify transport failures as transient, but mutating admin flows
