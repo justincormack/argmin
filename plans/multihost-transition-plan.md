@@ -10038,6 +10038,11 @@ Phase 12.1 progress:
   experimental authority now serves `UnixControlPlaneClient::runtime_map_snapshot`
   through OpenRaft read-index and the test asserts the wire-decoded freshness
   proof carries a nonzero Raft log id and the deterministic issued timestamp.
+- Added Unix RPC coverage for the experimental metadata-transfer admin path.
+  The smoke drives a source PG active through Raft heartbeats, fences it through
+  `FencePgForMetadataTransferRuntimeMap`, then installs a destination acting set
+  through `SetPgActingSetWithMetadataTransferRuntimeMap`, proving both admin
+  RPCs cross the process adapter and persist the transfer marker through Raft.
 
 1. define the replicated control-plane state machine:
    - state includes cluster epoch, PG count, PG state, PG acting sets, node
