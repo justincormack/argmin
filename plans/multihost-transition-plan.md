@@ -10222,6 +10222,31 @@ Phase 12.2 progress:
   state file, and verifies the rejected entry remains part of the durable
   applied prefix without mutating control-plane state.
 
+Phase 12.2 closeout:
+
+- Phase 12.2 is complete for the intended single-process, single-node durable
+  OpenRaft authority slice. The experimental control-plane process now starts
+  from a local durable OpenRaft restart artifact, restores vote/log/committed/
+  applied/membership/snapshot/control-plane state before serving, checkpoints
+  after membership initialization, startup catch-up, and every submitted command
+  outcome, and fails closed on corrupt, stale, identity-mismatched, impossible,
+  or non-single-node artifacts for this constructor.
+- The durable artifact has a CRC-protected local frame, explicit OpenRaft
+  metadata preservation, cached snapshot support, replay/snapshot membership
+  validation, same-directory temp-file write with file and parent-directory
+  sync, and tests for restart, compaction/suffix replay, corruption, stale temp
+  files, and failed temp-file creation preserving the previous artifact.
+- Process-level durable restart coverage now spans bootstrap idempotence,
+  committed-ahead startup catch-up, checkpoint failure poisoning, acting-set
+  admin mutation, storage-node heartbeat refresh through Active, metadata-
+  transfer admin/fence/install state, frontend runtime-map refresh over Unix
+  RPC, and deterministic semantic rejection replay without state mutation.
+- Remaining Phase 12 work deliberately starts after this slice: multi-process
+  Raft networking, authenticated control-plane/storage/frontend RPC identity,
+  production cutover from the single-authority path, monotonic-clock and lease-
+  read semantics, upgrade/migration compatibility, and removing or replacing
+  the temporary `ARGMIN_CONTROL_PLANE_EXPERIMENTAL_RAFT` flag.
+
 1. define the replicated control-plane state machine:
    - state includes cluster epoch, PG count, PG state, PG acting sets, node
      membership, node incarnation/endpoint/liveness metadata, retained
