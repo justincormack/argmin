@@ -10203,7 +10203,11 @@ Phase 12.2 progress:
   process adapter path as production. The first restart-after-command test
   mutates a PG acting set through the durable raft process wrapper, shuts down,
   restores from the same `ARGMIN_CONTROL_PLANE_STATE_PATH`, and verifies that
-  bootstrap remains a no-op while the changed acting set is still present.
+  bootstrap remains a no-op while the changed acting set is still present. A
+  second restart-after-command test now drives storage-node heartbeat refresh
+  through Peering to Active, shuts down, restores from the same state file, and
+  verifies that the restored snapshot and runtime map preserve the active
+  primary lease/proof state.
 
 1. define the replicated control-plane state machine:
    - state includes cluster epoch, PG count, PG state, PG acting sets, node
