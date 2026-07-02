@@ -10054,6 +10054,10 @@ Phase 12.1 progress:
   authority. `UnixControlPlaneClient::set_pg_acting_set` now has a process
   adapter smoke that verifies the replicated command bumps the epoch and leaves
   the PG in Peering on the requested acting set.
+- Added process-helper coverage for the ordinary epoch-returning live
+  acting-set admin helper against the experimental authority. The helper now
+  drives the OpenRaft-backed Unix RPC path used by
+  `control-plane-set-pg-acting-set-live`, not only the lower-level client call.
 - Added fail-closed Unix RPC coverage for deterministic command rejection
   through the experimental authority. A malformed acting-set request for an
   unknown node now returns the existing remote control-plane error through the

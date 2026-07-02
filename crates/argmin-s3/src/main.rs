@@ -3232,6 +3232,55 @@ mod tests {
     }
 
     #[test]
+    fn experimental_raft_control_plane_serves_live_acting_set_helper() {
+        let mut harness = experimental_raft_test_harness("live-acting-set-helper-test");
+        let mut config = test_server_config();
+        config.storage_node_sockets = vec![
+            config::ConfiguredStorageNodeSocket {
+                node_id: 1,
+                socket_path: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
+            },
+            config::ConfiguredStorageNodeSocket {
+                node_id: 2,
+                socket_path: "/tmp/argmin-experimental-raft-node-2.sock".to_string(),
+            },
+        ];
+        config.storage_pg_ids = vec![19];
+        bootstrap_empty_experimental_raft_control_plane(&mut harness.control_plane, &config)
+            .expect("experimental raft control-plane bootstrap should succeed");
+        let bootstrap_epoch = harness
+            .control_plane
+            .current_snapshot()
+            .expect("experimental snapshot should read")
+            .cluster_epoch();
+
+        let tmp = short_unix_socket_test_dir("experimental-raft-live-acting-set");
+        std::fs::create_dir_all(&tmp).unwrap();
+        let socket_path = tmp.join("control-plane.sock");
+        let server = spawn_experimental_raft_unix_rpc_server(&harness, &socket_path, 32_050);
+        let changed_epoch =
+            set_control_plane_pg_acting_set_live(&socket_path, PgId::new(19), vec![NodeId::new(2)])
+                .expect("live acting-set helper should succeed");
+        server.join().unwrap();
+
+        assert!(changed_epoch > bootstrap_epoch);
+        let snapshot = harness
+            .control_plane
+            .current_snapshot()
+            .expect("experimental snapshot should read after acting-set helper");
+        assert_eq!(snapshot.cluster_epoch(), changed_epoch);
+        let pg = snapshot
+            .pg(PgId::new(19))
+            .expect("changed PG should remain present");
+        assert_eq!(pg.state(), PgState::Peering);
+        assert_eq!(pg.acting_set(), &[NodeId::new(2)]);
+
+        std::fs::remove_file(&socket_path).unwrap();
+        std::fs::remove_dir_all(&tmp).unwrap();
+        harness.shutdown();
+    }
+
+    #[test]
     fn experimental_raft_control_plane_unix_acting_set_admin_rejects_unknown_node() {
         let mut harness = experimental_raft_test_harness("unix-acting-set-admin-reject-test");
         let mut config = test_server_config();
