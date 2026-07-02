@@ -4983,6 +4983,15 @@ impl StorageCluster {
             .test_install_after_direct_put_metadata_publish_hook(hook)
     }
 
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_install_after_object_metadata_command_publish_hook(
+        &self,
+        hook: Arc<dyn Fn() -> Result<(), ObjectPgActionError> + Send + Sync>,
+    ) -> crate::node::ObjectMetadataCommandPublishTestHookGuard {
+        self.metadata_primary_test_hook_node()
+            .test_install_after_object_metadata_command_publish_hook(hook)
+    }
+
     pub fn place_payload_shards(
         &self,
         data_pg_id: DataPgId,

@@ -111,6 +111,11 @@ pub struct DirectPutMetadataPublishTestHookGuard {
 }
 
 #[cfg(any(test, feature = "test-hooks"))]
+pub struct ObjectMetadataCommandPublishTestHookGuard {
+    scope_id: usize,
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
 impl Drop for BucketLockGuard<'_> {
     fn drop(&mut self) {
         let _ = &self.guard;
@@ -129,6 +134,15 @@ impl Drop for DirectPutMetadataPublishTestHookGuard {
     fn drop(&mut self) {
         let hooks =
             AFTER_DIRECT_PUT_METADATA_PUBLISH_HOOKS.get_or_init(|| Mutex::new(HashMap::new()));
+        hooks.lock().unwrap().remove(&self.scope_id);
+    }
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+impl Drop for ObjectMetadataCommandPublishTestHookGuard {
+    fn drop(&mut self) {
+        let hooks =
+            AFTER_OBJECT_METADATA_COMMAND_PUBLISH_HOOKS.get_or_init(|| Mutex::new(HashMap::new()));
         hooks.lock().unwrap().remove(&self.scope_id);
     }
 }
@@ -157,6 +171,15 @@ type DirectPutMetadataPublishHook = Arc<dyn Fn() -> Result<(), ObjectPgActionErr
 #[cfg(any(test, feature = "test-hooks"))]
 static AFTER_DIRECT_PUT_METADATA_PUBLISH_HOOKS: OnceLock<
     Mutex<HashMap<usize, DirectPutMetadataPublishHook>>,
+> = OnceLock::new();
+
+#[cfg(any(test, feature = "test-hooks"))]
+type ObjectMetadataCommandPublishHook =
+    Arc<dyn Fn() -> Result<(), ObjectPgActionError> + Send + Sync>;
+
+#[cfg(any(test, feature = "test-hooks"))]
+static AFTER_OBJECT_METADATA_COMMAND_PUBLISH_HOOKS: OnceLock<
+    Mutex<HashMap<usize, ObjectMetadataCommandPublishHook>>,
 > = OnceLock::new();
 
 #[cfg(any(test, feature = "test-hooks"))]
@@ -280,6 +303,22 @@ pub(crate) fn maybe_run_after_direct_put_metadata_publish_hook(
     scope_id: usize,
 ) -> Result<(), ObjectPgActionError> {
     let hook = AFTER_DIRECT_PUT_METADATA_PUBLISH_HOOKS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap()
+        .get(&scope_id)
+        .cloned();
+    if let Some(hook) = hook {
+        hook()?;
+    }
+    Ok(())
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+pub(crate) fn maybe_run_after_object_metadata_command_publish_hook(
+    scope_id: usize,
+) -> Result<(), ObjectPgActionError> {
+    let hook = AFTER_OBJECT_METADATA_COMMAND_PUBLISH_HOOKS
         .get_or_init(|| Mutex::new(HashMap::new()))
         .lock()
         .unwrap()
@@ -1189,6 +1228,18 @@ impl SharedStorageNode {
             AFTER_DIRECT_PUT_METADATA_PUBLISH_HOOKS.get_or_init(|| Mutex::new(HashMap::new()));
         hooks.lock().unwrap().insert(scope_id, hook);
         DirectPutMetadataPublishTestHookGuard { scope_id }
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_install_after_object_metadata_command_publish_hook(
+        &self,
+        hook: Arc<dyn Fn() -> Result<(), ObjectPgActionError> + Send + Sync>,
+    ) -> ObjectMetadataCommandPublishTestHookGuard {
+        let scope_id = self.test_hook_scope_id();
+        let hooks =
+            AFTER_OBJECT_METADATA_COMMAND_PUBLISH_HOOKS.get_or_init(|| Mutex::new(HashMap::new()));
+        hooks.lock().unwrap().insert(scope_id, hook);
+        ObjectMetadataCommandPublishTestHookGuard { scope_id }
     }
 
     #[cfg(any(test, feature = "test-hooks"))]

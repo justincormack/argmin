@@ -496,7 +496,7 @@ when prioritised. They correspond to the remaining findings from the Phase 11 re
   | --- | --- | --- | --- |
   | Direct PUT / overwrite | Covered locally at B1/B2, partial-apply/pending-command replay, and exact B3 committed-response-loss retry for both first PUT and overwrite reclaim identity: `S6-DP1`, `S6-DP4`, `S6-DP5`. | Covered locally and through installed Unix clients for stale epoch and control-plane-driven Peering: `S6-DP2`, `S6-DP3`. | No current Slice 6 direct-PUT gap named. |
   | Streaming PutObject | Partially covered: stream session pinning and command-conflict cleanup are named in `S6-SP1`, and storage command retry/finalize cleanup is named in `S6-SP2`. | Covered locally and through installed Unix clients for real-Peering `CommitStreamPut` in `S6-SP4` and `S6-SP5`; remote stale segment append/commit is named in `S6-SP3`. | Add terminal checksum/final chunk failure cleanup and abort cleanup across B1/B2/B4/B5. |
-  | DeleteObject | Covered locally before metadata apply and partial/terminal command replay: `S6-DEL1`, `S6-DEL4`. | Covered locally and through installed Unix clients for stale epoch and real Peering: `S6-DEL2`, `S6-DEL3`. | Add exact B3 committed-delete response-loss/retry coverage. |
+  | DeleteObject | Covered locally before metadata apply, partial/terminal command replay, and exact B3 committed-delete response-loss retry: `S6-DEL1`, `S6-DEL4`, `S6-DEL5`. | Covered locally and through installed Unix clients for stale epoch and real Peering: `S6-DEL2`, `S6-DEL3`. | No current Slice 6 DeleteObject gap named. |
   | Object metadata mutations: tags/legal hold/retention/ACL-shaped path | Covered for tags, legal hold, and retention locally before shared `PutObjectMetadata` apply across an epoch change: `S6-META1`. ACL is the same serialization shape but not named yet. | Covered for shared object-metadata update locally and through installed Unix clients for stale epoch and real Peering: `S6-META2`, `S6-META3`. | Decide whether ACL needs one representative test or remains covered by shared command-shape evidence. |
   | CopyObject destination publish | Covered locally before destination `CommitDirectPutObject` across a runtime-map epoch change: `S6-COPY1`. | Covered locally and through installed Unix clients for real Peering: `S6-COPY2`, `S6-COPY3`. | Add B3 committed-copy response-loss/idempotent retry coverage if missing. |
   | CompleteMultipartUpload | Covered locally before multipart commit apply, matching pending completion, and terminal cleanup after already-recorded completion: `S6-CMP1`, `S6-CMP4`. | Covered locally and through installed Unix clients for stale epoch and real Peering: `S6-CMP2`, `S6-CMP3`. | No current Slice 6 CompleteMultipartUpload gap named. |
@@ -552,6 +552,8 @@ when prioritised. They correspond to the remaining findings from the Phase 11 re
   - `S6-DEL4`: `object_delete_metadata_command_retry_reuses_pending_partial_replica_command`
     and `object_delete_exact_pending_retry_converges_partial_exact_conflict` in
     `crates/storage/src/cluster/local/tests/object_commands.rs`.
+  - `S6-DEL5`: `object_delete_committed_response_loss_retry_returns_missing_without_rerunning_live_delete`
+    in `crates/storage/src/cluster/local/tests/object_commands.rs`.
   - `S6-META1`: `put_object_tags_epoch_change_before_metadata_apply_commits_once_on_pinned_route`,
     `put_object_legal_hold_epoch_change_before_metadata_apply_commits_once_on_pinned_route`,
     and `put_object_retention_epoch_change_before_metadata_apply_commits_once_on_pinned_route`

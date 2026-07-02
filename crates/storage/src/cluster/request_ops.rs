@@ -7769,6 +7769,10 @@ impl super::StorageCluster {
                     )
                     .map_err(ObjectPgActionError::from)?;
                     self.after_object_metadata_command_applied(&command);
+                    #[cfg(any(test, feature = "test-hooks"))]
+                    crate::node::maybe_run_after_object_metadata_command_publish_hook(
+                        self.metadata_primary_test_hook_node().test_hook_scope_id(),
+                    )?;
                     return Ok(());
                 }
                 Err(error) => {

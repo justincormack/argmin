@@ -739,6 +739,92 @@ fn object_delete_exact_pending_retry_converges_partial_exact_conflict() {
 }
 
 #[test]
+fn object_delete_committed_response_loss_retry_returns_missing_without_rerunning_live_delete() {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape).unwrap();
+    let (bucket, key, object_pg, data_pg) = {
+        let topology = map
+            .nodes
+            .get(&NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        bucket_key_with_distinct_object_and_data_pg(topology)
+    };
+    set_route_primary(&mut map, object_pg, NodeId::new(1));
+    set_route_primary(&mut map, data_pg, NodeId::new(2));
+
+    let map = Arc::new(map);
+    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let committed =
+        write_committed_direct_segment_for(&cluster, &bucket, &key, b"delete response loss");
+
+    let _serial = lock_metadata_command_apply_hook_test();
+    let hook_guard =
+        cluster.test_install_after_object_metadata_command_publish_hook(Arc::new(|| {
+            Err(crate::ObjectPgActionError::InvalidRequest {
+                reason: "injected object delete response loss".to_string(),
+            })
+        }));
+
+    let first_err = cluster
+        .delete_current_object_if(&bucket, &key, |stored| {
+            assert!(matches!(stored, Some(crate::StoredObject::Live(_))));
+            Ok::<(), ()>(())
+        })
+        .unwrap_err();
+    assert!(
+        matches!(
+            first_err,
+            crate::ObjectPgActionError::InvalidRequest { ref reason }
+                if reason == "injected object delete response loss"
+        ),
+        "expected injected post-commit object delete response-loss error, got {first_err:?}"
+    );
+    drop(hook_guard);
+
+    let outcome = cluster
+        .delete_current_object_if(&bucket, &key, |stored| {
+            assert!(
+                stored.is_none(),
+                "committed delete retry must not observe the deleted object as live"
+            );
+            Ok::<(), ()>(())
+        })
+        .unwrap()
+        .unwrap();
+
+    assert!(matches!(
+        outcome.deleted,
+        crate::DeletedCurrentObject::Missing
+    ));
+    assert!(pending_metadata_command_for_test(&map, PgId::new(object_pg), &bucket).is_none());
+    assert_clean_metadata_command_stream(&map, &[object_pg]);
+    assert_bucket_write_reservations_released(&map, &bucket);
+    for node_id in node_ids {
+        let pg = map
+            .node(node_id)
+            .unwrap()
+            .storage_node()
+            .get_pg(object_pg)
+            .unwrap();
+        assert!(matches!(
+            crate::PgMetadataStore::get_object_meta(&*pg, &bucket, &key),
+            Err(crate::MetadataError::ObjectNotFound)
+        ));
+        assert!(crate::PgMetadataStore::payload_reclaim_exists(
+            &*pg,
+            &bucket,
+            &key,
+            committed.generation_id
+        )
+        .unwrap());
+    }
+}
+
+#[test]
 fn object_delete_metadata_command_partial_apply_reopens_and_releases_bucket_write_reservation() {
     let _serial = lock_metadata_command_apply_hook_test();
     let tmp = test_util::tempdir();
