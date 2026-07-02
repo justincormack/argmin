@@ -10063,6 +10063,11 @@ Phase 12.1 progress:
   `FencePgForMetadataTransferRuntimeMap`, then installs a destination acting set
   through `SetPgActingSetWithMetadataTransferRuntimeMap`, proving both admin
   RPCs cross the process adapter and persist the transfer marker through Raft.
+- Added process-helper coverage for the epoch-returning live metadata-transfer
+  admin helpers against the experimental authority. The helpers now fence an
+  active source PG and install the transfer-backed destination acting set
+  through OpenRaft-backed Unix RPC, matching the CLI admin path rather than only
+  the lower-level client calls.
 - Added direct experimental Raft coverage for heartbeat lease expiry. The smoke
   first proves a pre-deadline scan is a replicated no-op, then expires the lease
   at the committed deadline and verifies the node becomes unavailable, the lease

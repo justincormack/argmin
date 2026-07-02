@@ -3440,6 +3440,145 @@ mod tests {
     }
 
     #[test]
+    fn experimental_raft_control_plane_serves_metadata_transfer_live_helpers() {
+        let mut harness = experimental_raft_test_harness("transfer-live-helper-test");
+        let mut config = test_server_config();
+        config.storage_node_sockets = vec![
+            config::ConfiguredStorageNodeSocket {
+                node_id: 1,
+                socket_path: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
+            },
+            config::ConfiguredStorageNodeSocket {
+                node_id: 2,
+                socket_path: "/tmp/argmin-experimental-raft-node-2.sock".to_string(),
+            },
+        ];
+        config.storage_pg_ids = vec![14];
+        bootstrap_empty_experimental_raft_control_plane(&mut harness.control_plane, &config)
+            .expect("experimental raft control-plane bootstrap should succeed");
+        harness
+            .control_plane
+            .set_pg_acting_set(PgId::new(14), vec![NodeId::new(1)])
+            .expect("source acting set should install");
+
+        let bootstrap_epoch = harness
+            .control_plane
+            .current_snapshot()
+            .expect("experimental snapshot should read")
+            .cluster_epoch();
+        harness
+            .control_plane
+            .refresh_node_heartbeat(
+                NodeHeartbeat {
+                    node_id: NodeId::new(1),
+                    node_incarnation: 1,
+                    endpoint: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
+                    observed_epoch: bootstrap_epoch,
+                    requested_lease_duration_ms: 500,
+                    cluster_map_history_reference_summary:
+                        storage::PgClusterMapHistoryReferenceSummary::default(),
+                    pg_observations: Vec::new(),
+                },
+                41_000,
+            )
+            .expect("experimental raft startup heartbeat should refresh");
+        let peering_epoch = harness
+            .control_plane
+            .current_snapshot()
+            .expect("experimental snapshot should read after startup heartbeat")
+            .cluster_epoch();
+        let active_proof = PgMetadataProof::new(101, 0xabc, 0xdef);
+        harness
+            .control_plane
+            .refresh_node_heartbeat(
+                NodeHeartbeat {
+                    node_id: NodeId::new(1),
+                    node_incarnation: 1,
+                    endpoint: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
+                    observed_epoch: peering_epoch,
+                    requested_lease_duration_ms: 600,
+                    cluster_map_history_reference_summary:
+                        storage::PgClusterMapHistoryReferenceSummary::default(),
+                    pg_observations: vec![NodePgHeartbeatObservation {
+                        pg_id: PgId::new(14),
+                        state: PgState::Peering,
+                        metadata_proof: active_proof,
+                        has_pending_metadata_command: false,
+                    }],
+                },
+                41_100,
+            )
+            .expect("experimental raft peering heartbeat should refresh");
+        let active_epoch = harness
+            .control_plane
+            .current_snapshot()
+            .expect("experimental snapshot should read after peering completion")
+            .cluster_epoch();
+        harness
+            .control_plane
+            .refresh_node_heartbeat(
+                NodeHeartbeat {
+                    node_id: NodeId::new(1),
+                    node_incarnation: 1,
+                    endpoint: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
+                    observed_epoch: active_epoch,
+                    requested_lease_duration_ms: 700,
+                    cluster_map_history_reference_summary:
+                        storage::PgClusterMapHistoryReferenceSummary::default(),
+                    pg_observations: vec![NodePgHeartbeatObservation {
+                        pg_id: PgId::new(14),
+                        state: PgState::Active,
+                        metadata_proof: active_proof,
+                        has_pending_metadata_command: false,
+                    }],
+                },
+                41_150,
+            )
+            .expect("experimental raft active heartbeat should refresh");
+
+        let tmp = short_unix_socket_test_dir("experimental-raft-transfer-live-helper");
+        std::fs::create_dir_all(&tmp).unwrap();
+        let socket_path = tmp.join("control-plane.sock");
+        let fence_server = spawn_experimental_raft_unix_rpc_server(&harness, &socket_path, 41_200);
+        let fenced_epoch =
+            fence_control_plane_pg_for_metadata_transfer_live(&socket_path, PgId::new(14))
+                .expect("live metadata-transfer fence helper should succeed");
+        fence_server.join().unwrap();
+        assert!(fenced_epoch > active_epoch);
+
+        std::fs::remove_file(&socket_path).unwrap();
+        let transfer = PgMetadataTransferProof::new(active_epoch, active_proof);
+        let install_server =
+            spawn_experimental_raft_unix_rpc_server(&harness, &socket_path, 41_300);
+        let installed_epoch = set_control_plane_pg_acting_set_with_metadata_transfer_live(
+            &socket_path,
+            PgId::new(14),
+            vec![NodeId::new(2)],
+            transfer,
+        )
+        .expect("live metadata-transfer acting-set helper should succeed");
+        install_server.join().unwrap();
+        assert!(installed_epoch > fenced_epoch);
+
+        let snapshot = harness
+            .control_plane
+            .current_snapshot()
+            .expect("experimental snapshot should read after transfer helper install");
+        let pg = snapshot
+            .pg(PgId::new(14))
+            .expect("transferred PG should remain present");
+        assert_eq!(snapshot.cluster_epoch(), installed_epoch);
+        assert_eq!(pg.state(), PgState::Peering);
+        assert_eq!(pg.acting_set(), &[NodeId::new(2)]);
+        assert_eq!(pg.peering_metadata_transfer(), Some(transfer));
+        assert!(!pg.metadata_transfer_fenced());
+
+        std::fs::remove_file(&socket_path).unwrap();
+        std::fs::remove_dir_all(&tmp).unwrap();
+        harness.shutdown();
+    }
+
+    #[test]
     fn root_process_check_accepts_non_root_effective_uid() {
         assert_eq!(reject_root_process(1_000), Ok(()));
     }
