@@ -697,7 +697,12 @@ when prioritised. They correspond to the remaining findings from the Phase 11 re
     apply path is idempotent/no-op when the target value is already current. For
     `SetPgActingSet`, prefer checking the runtime map for the expected acting set before
     resubmitting, because even logically identical route updates can create noisy extra
-    epochs if the apply path is not strictly idempotent.
+    epochs if the apply path is not strictly idempotent. **Status:** the live Unix
+    `SetPgActingSet` path now uses a checked helper that treats response loss after
+    submission as uncertain, observes the runtime map for the target acting set, and fails
+    closed if a current different route is visible. Regressions cover both the already-visible
+    success case and the stale retry case where another admin transition wins after the lost
+    response.
   - **Time-based liveness commands:** `RecordNodeHeartbeat` and `ExpireHeartbeatLeases`
     need bounded retry/reconnect, but with care that retrying the same timestamp/deadline is
     monotonic and cannot shorten a valid lease or resurrect an expired one.
@@ -717,11 +722,11 @@ when prioritised. They correspond to the remaining findings from the Phase 11 re
       regression injects response loss after the first fence apply and asserts the retry is
       the same fence command and does not bump the epoch again.
     - `SetPgActingSetWithMetadataTransfer`: PG route has the expected acting set and matching
-      metadata-transfer proof. **Status:** the Unix
-      `SetPgActingSetWithMetadataTransferRuntimeMap` live-transfer path now treats read-side
-      response loss after request submission as uncertain, then reads the runtime map until it
-      observes the expected peering route, acting set, and metadata-transfer proof. A storage
-      regression injects response loss after the authority applies the command.
+      metadata-transfer proof. **Status:** the Unix `SetPgActingSetWithMetadataTransfer`
+      and `SetPgActingSetWithMetadataTransferRuntimeMap` live paths now treat read-side
+      response loss after request submission as uncertain, then read the runtime map until
+      they observe the expected peering route, acting set, and metadata-transfer proof.
+      Storage regressions inject response loss after the authority applies each RPC form.
     - `CompletePgPeering` / `CompleteReadyPgPeerings`: PG is active with the expected
       primary, node incarnation, and route/proof state.
 

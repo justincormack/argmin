@@ -615,7 +615,7 @@ fn set_control_plane_pg_acting_set_live(
     acting_set: Vec<NodeId>,
 ) -> Result<ClusterEpoch, String> {
     UnixControlPlaneClient::new(socket_path)
-        .set_pg_acting_set(pg_id, acting_set)
+        .set_pg_acting_set_checked(pg_id, acting_set)
         .map_err(|error| format!("failed to set live PG acting set: {error}"))
 }
 
@@ -634,8 +634,19 @@ fn set_control_plane_pg_acting_set_with_metadata_transfer_live(
     acting_set: Vec<NodeId>,
     transfer: PgMetadataTransferProof,
 ) -> Result<ClusterEpoch, String> {
+    let min_cluster_epoch = transfer
+        .source_epoch()
+        .get()
+        .checked_add(1)
+        .and_then(ClusterEpoch::new)
+        .ok_or_else(|| "metadata-transfer destination cluster epoch overflowed".to_owned())?;
     UnixControlPlaneClient::new(socket_path)
-        .set_pg_acting_set_with_metadata_transfer(pg_id, acting_set, transfer)
+        .set_pg_acting_set_with_metadata_transfer_checked(
+            pg_id,
+            acting_set,
+            transfer,
+            min_cluster_epoch,
+        )
         .map_err(|error| {
             format!("failed to set live PG acting set with metadata transfer: {error}")
         })
