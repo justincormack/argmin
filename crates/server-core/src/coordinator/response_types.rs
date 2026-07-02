@@ -444,7 +444,7 @@ pub struct MultipartUploadEntry {
     pub upload_id: UploadId,
     pub initiated: u64,
     pub owner: OwnerIdentity,
-    pub initiator: Option<OwnerIdentity>,
+    pub initiator: OwnerIdentity,
     pub checksum_algorithm: Option<ChecksumAlgorithm>,
     pub checksum_type: Option<ChecksumType>,
 }

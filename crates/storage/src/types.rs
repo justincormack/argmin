@@ -3445,7 +3445,7 @@ pub struct MultipartUploadRecord {
     pub metadata_blob: SerializedMetadataBlob,
     /// Serialized system metadata headers.
     pub system_metadata_blob: SerializedSystemMetadataBlob,
-    pub initiator: Option<OwnerIdentity>,
+    pub initiator: OwnerIdentity,
     pub owner: OwnerIdentity,
     pub acl_grants: AclGrants,
     pub public_read: bool,
@@ -3494,7 +3494,7 @@ pub struct CompletedMultipartUploadRecord {
     pub key: ObjectKey,
     pub completion_order: u64,
     pub completed_at: u64,
-    pub initiator: Option<OwnerIdentity>,
+    pub initiator: OwnerIdentity,
     pub owner: OwnerIdentity,
 }
 
@@ -3643,7 +3643,7 @@ pub struct CreateMultipartUploadReq {
     pub tags: Option<SerializedTagSet>,
     pub metadata_blob: SerializedMetadataBlob,
     pub system_metadata_blob: SerializedSystemMetadataBlob,
-    pub initiator: Option<OwnerIdentity>,
+    pub initiator: OwnerIdentity,
     pub owner: OwnerIdentity,
     pub acl_grants: AclGrants,
     pub public_read: bool,

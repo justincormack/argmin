@@ -7641,7 +7641,7 @@ fn multipart_upload_and_complete_persist_explicit_owner_identity() {
             &upload.upload_id,
         )
         .unwrap();
-    assert_eq!(upload_record.initiator, Some(expected_owner.clone()));
+    assert_eq!(upload_record.initiator, expected_owner.clone());
     assert_eq!(upload_record.owner, expected_owner);
 
     test_helpers::upload_part(
@@ -7762,10 +7762,10 @@ fn create_multipart_upload_bucket_owner_preferred_promotes_bucket_owner_with_ful
         .unwrap();
     assert_eq!(
         upload_record.initiator,
-        Some(OwnerIdentity::new(
+        OwnerIdentity::new(
             writer.principal().to_string(),
             writer.canonical_user_id().clone(),
-        ))
+        )
     );
     assert_eq!(
         upload_record.owner,

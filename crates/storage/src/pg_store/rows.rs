@@ -1077,39 +1077,6 @@ impl PgStore {
         Ok(OwnerIdentity::new(principal, canonical_id))
     }
 
-    pub(super) fn parse_optional_owner_identity(
-        row: &rusqlite::Row<'_>,
-        principal_col: usize,
-        canonical_col: usize,
-        principal_field: &'static str,
-        canonical_field: &'static str,
-    ) -> Result<Option<OwnerIdentity>, rusqlite::Error> {
-        let principal: Option<String> = row.get(principal_col)?;
-        let canonical_raw: Option<String> = row.get(canonical_col)?;
-        match (principal, canonical_raw) {
-            (None, None) => Ok(None),
-            (Some(principal), Some(canonical_raw)) => {
-                if principal.is_empty() {
-                    return Err(rusqlite::Error::FromSqlConversionFailure(
-                        principal_col,
-                        rusqlite::types::Type::Text,
-                        Box::from(format!("invalid empty {principal_field}")),
-                    ));
-                }
-                let canonical_id =
-                    Self::parse_canonical_user_id(canonical_raw, canonical_col, canonical_field)?;
-                Ok(Some(OwnerIdentity::new(principal, canonical_id)))
-            }
-            _ => Err(rusqlite::Error::FromSqlConversionFailure(
-                principal_col,
-                rusqlite::types::Type::Text,
-                Box::from(format!(
-                    "inconsistent optional owner identity for {principal_field}/{canonical_field}"
-                )),
-            )),
-        }
-    }
-
     pub(super) fn parse_acl_grants(
         raw: String,
         col_idx: usize,

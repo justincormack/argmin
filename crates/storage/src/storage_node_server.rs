@@ -771,6 +771,13 @@ pub enum StorageNodeServerError {
     SocketPathExists { path: PathBuf },
     #[error("storage-node data directory {path:?} is already locked")]
     DataDirAlreadyLocked { path: PathBuf },
+    #[error(
+        "storage-node data directory lock for {locked_path:?} cannot be used with {config_path:?}"
+    )]
+    DataDirLockPathMismatch {
+        locked_path: PathBuf,
+        config_path: PathBuf,
+    },
     #[error("storage-node I/O error during {context} for {path:?}: {source}")]
     Io {
         context: &'static str,
@@ -849,6 +856,35 @@ pub struct StorageNodeServer {
     read_handles: Arc<Mutex<StorageNodeReadHandleState>>,
     active_sessions: Arc<StorageNodeActiveSessions>,
     metadata_command_locks: StorageNodeMetadataCommandLocks,
+}
+
+#[derive(Debug)]
+pub struct StorageNodeDataDirGuard {
+    data_dir: PathBuf,
+    lock: StorageNodeDataDirLock,
+}
+
+impl StorageNodeDataDirGuard {
+    pub fn acquire(data_dir: &Path) -> Result<Self, StorageNodeServerError> {
+        let lock = StorageNodeDataDirLock::acquire(data_dir)?;
+        Ok(Self {
+            data_dir: data_dir.to_path_buf(),
+            lock,
+        })
+    }
+
+    fn into_lock_for(
+        self,
+        config_data_dir: &Path,
+    ) -> Result<StorageNodeDataDirLock, StorageNodeServerError> {
+        if self.data_dir != config_data_dir {
+            return Err(StorageNodeServerError::DataDirLockPathMismatch {
+                locked_path: self.data_dir,
+                config_path: config_data_dir.to_path_buf(),
+            });
+        }
+        Ok(self.lock)
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -962,15 +998,24 @@ fn metadata_command_checkpoint_candidates_for_frame(
 
 impl StorageNodeServer {
     pub fn bind(config: StorageNodeProcessConfig) -> Result<Self, StorageNodeServerError> {
+        let data_dir_guard = StorageNodeDataDirGuard::acquire(&config.data_dir)?;
+        Self::bind_with_data_dir_guard(config, data_dir_guard)
+    }
+
+    pub fn bind_with_data_dir_guard(
+        config: StorageNodeProcessConfig,
+        data_dir_guard: StorageNodeDataDirGuard,
+    ) -> Result<Self, StorageNodeServerError> {
         validate_process_config_route_table(&config)?;
         validate_socket_directory(&config.socket_path)?;
-        let data_dir_lock = StorageNodeDataDirLock::acquire(&config.data_dir)?;
+        let data_dir_lock = data_dir_guard.into_lock_for(&config.data_dir)?;
         cleanup_stale_socket_path(&config.socket_path)?;
         let node = SharedStorageNode::open_with_default_ec_shape(
             &config.data_dir,
             &config.pg_ids,
             config.default_ec_shape,
         )?;
+        node.recover_pg_metadata_command_state(config.node_id)?;
         let listener = UnixListener::bind(&config.socket_path).map_err(|source| {
             StorageNodeServerError::Io {
                 context: "bind storage-node socket",
@@ -10927,7 +10972,7 @@ mod tests {
                 false,
             )
             .unwrap();
-            PgMetadataStore::acquire_durable_bucket_write_reservation(
+            let record = PgMetadataStore::acquire_durable_bucket_write_reservation(
                 &*pg,
                 &bucket,
                 "reservation-expired-route-cleanup",
@@ -10938,7 +10983,9 @@ mod tests {
                 Some(20),
                 Some("key=a"),
             )
-            .unwrap()
+            .unwrap();
+            pg.refresh_metadata_command_state_digest().unwrap();
+            record
         };
 
         config.route_map_valid_until_ms = Some(1);
@@ -15299,6 +15346,7 @@ mod tests {
             )
             .unwrap();
             crate::PgMetadataStore::mark_bucket_deleting(&*pg, &bucket).unwrap();
+            pg.refresh_metadata_command_state_digest().unwrap();
         }
 
         private_socket_dir(config.socket_path.parent().unwrap());

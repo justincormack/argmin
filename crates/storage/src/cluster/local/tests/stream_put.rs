@@ -1326,7 +1326,7 @@ fn stream_session_scavenger_does_not_age_abort_upload_part_sessions() {
                         tags: None,
                         metadata_blob: crate::SerializedMetadataBlob::default(),
                         system_metadata_blob: crate::SerializedSystemMetadataBlob::default(),
-                        initiator: Some(crate::OwnerIdentity::from_principal("initiator")),
+                        initiator: crate::OwnerIdentity::from_principal("initiator"),
                         owner: crate::OwnerIdentity::from_principal("owner"),
                         acl_grants: crate::AclGrants::default(),
                         public_read: false,

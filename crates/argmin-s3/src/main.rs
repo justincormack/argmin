@@ -30,8 +30,8 @@ use storage::control_plane::{
     UnixControlPlaneClient,
 };
 use storage::storage_node_server::{
-    advance_storage_node_incarnation, StorageNodeControlPlaneRefreshLoop, StorageNodePgRoute,
-    StorageNodeProcessConfig, StorageNodeServer,
+    advance_storage_node_incarnation, StorageNodeControlPlaneRefreshLoop, StorageNodeDataDirGuard,
+    StorageNodePgRoute, StorageNodeProcessConfig, StorageNodeServer,
 };
 use storage::{
     CanonicalUserId, ClusterEpoch, EcShape, LocalClusterMap,
@@ -1538,18 +1538,30 @@ struct BoundStorageNodeProcess {
     control_plane_node_incarnation: Option<u64>,
 }
 
+type BuiltStorageNodeProcessConfig = (
+    StorageNodeProcessConfig,
+    Option<u64>,
+    Option<StorageNodeDataDirGuard>,
+);
+
 fn bind_storage_node_process(
     config: &ServerConfig,
     ec_config: &EcConfig,
 ) -> BoundStorageNodeProcess {
-    let (storage_config, control_plane_node_incarnation) =
+    let (storage_config, control_plane_node_incarnation, data_dir_guard) =
         build_storage_node_process_config(config, ec_config).unwrap_or_else(|e| {
             eprintln!("storage-node configuration error: {e}");
             std::process::exit(1);
         });
     let node_id = storage_config.node_id;
     let socket_path = storage_config.socket_path.clone();
-    let server = StorageNodeServer::bind(storage_config).unwrap_or_else(|e| {
+    let server = match data_dir_guard {
+        Some(data_dir_guard) => {
+            StorageNodeServer::bind_with_data_dir_guard(storage_config, data_dir_guard)
+        }
+        None => StorageNodeServer::bind(storage_config),
+    }
+    .unwrap_or_else(|e| {
         eprintln!("failed to start storage-node server: {e}");
         std::process::exit(1);
     });
@@ -1609,7 +1621,7 @@ fn maybe_spawn_storage_node_control_plane_refresh_loop(
 fn build_storage_node_process_config(
     config: &ServerConfig,
     ec_config: &EcConfig,
-) -> Result<(StorageNodeProcessConfig, Option<u64>), String> {
+) -> Result<BuiltStorageNodeProcessConfig, String> {
     if let Some(socket_path) = config.control_plane_socket_path.as_deref() {
         return build_control_plane_storage_node_process_config(config, ec_config, socket_path);
     }
@@ -1656,6 +1668,7 @@ fn build_storage_node_process_config(
             historical_pg_routes: Vec::new(),
         },
         None,
+        None,
     ))
 }
 
@@ -1663,7 +1676,7 @@ fn build_control_plane_storage_node_process_config(
     config: &ServerConfig,
     ec_config: &EcConfig,
     control_plane_socket_path: &str,
-) -> Result<(StorageNodeProcessConfig, Option<u64>), String> {
+) -> Result<BuiltStorageNodeProcessConfig, String> {
     let node_id = NodeId::new(
         config
             .storage_node_id
@@ -1677,6 +1690,9 @@ fn build_control_plane_storage_node_process_config(
         "ARGMIN_STORAGE_NODE_SOCKET_PATH is required for storage roles".to_string()
     })?;
     let node_data_dir_path = Path::new(&node_data_dir);
+    let data_dir_guard = StorageNodeDataDirGuard::acquire(node_data_dir_path).map_err(|error| {
+        format!("failed to lock storage node data directory for startup heartbeat: {error}")
+    })?;
     let node_incarnation =
         advance_storage_node_incarnation(node_data_dir_path).map_err(|error| {
             format!("failed to advance storage-node control-plane incarnation: {error}")
@@ -1691,6 +1707,10 @@ fn build_control_plane_storage_node_process_config(
         default_ec_shape,
     )
     .map_err(|error| format!("failed to open storage node for startup heartbeat: {error}"))?;
+    node.recover_pg_metadata_command_state(node_id)
+        .map_err(|error| {
+            format!("failed to recover storage node for startup heartbeat: {error}")
+        })?;
     // Control-plane managed storage nodes learn their current runtime map from
     // this startup heartbeat; the static ARGMIN_STORAGE_CLUSTER_EPOCH belongs
     // only to the legacy no-control-plane path.
@@ -1759,7 +1779,7 @@ fn build_control_plane_storage_node_process_config(
             node_id.as_u32()
         ));
     }
-    Ok((node_config, Some(node_incarnation)))
+    Ok((node_config, Some(node_incarnation), Some(data_dir_guard)))
 }
 
 async fn run_legacy_local_frontend(config: ServerConfig, host_id: String, ec_config: EcConfig) {
@@ -2521,10 +2541,11 @@ mod tests {
         let ec_config = EcConfig::new(4, 2).unwrap();
         let config = test_server_config();
 
-        let (storage_config, control_plane_node_incarnation) =
+        let (storage_config, control_plane_node_incarnation, data_dir_guard) =
             build_storage_node_process_config(&config, &ec_config).unwrap();
 
         assert_eq!(control_plane_node_incarnation, None);
+        assert!(data_dir_guard.is_none());
         assert_eq!(storage_config.node_id, NodeId::new(2));
         assert_eq!(storage_config.cluster_epoch, ClusterEpoch::new(9).unwrap());
         assert_eq!(storage_config.pg_ids, vec![1, 3, 5]);
@@ -3012,15 +3033,17 @@ mod tests {
         config.storage_node_socket_path = Some(endpoint.display().to_string());
         config.control_plane_socket_path = Some(socket_path.display().to_string());
 
-        let (node_config, control_plane_node_incarnation) =
+        let (node_config, control_plane_node_incarnation, data_dir_guard) =
             build_storage_node_process_config(&config, &ec_config).unwrap();
 
         server.join().unwrap();
         assert_eq!(control_plane_node_incarnation, Some(1));
+        assert!(data_dir_guard.is_some());
         assert_eq!(node_config.node_id, NodeId::new(0));
         assert_eq!(node_config.socket_path, endpoint);
         assert_eq!(node_config.pg_ids, vec![0]);
         assert_eq!(node_config.pg_routes[0].state, PgState::Peering);
+        drop(data_dir_guard);
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
@@ -3047,14 +3070,16 @@ mod tests {
         config.storage_node_socket_path = Some(endpoint.display().to_string());
         config.control_plane_socket_path = Some(socket_path.display().to_string());
 
-        let (first_config, first_incarnation) =
+        let (first_config, first_incarnation, first_guard) =
             build_storage_node_process_config(&config, &ec_config).unwrap();
-        let (second_config, second_incarnation) =
+        drop(first_guard);
+        let (second_config, second_incarnation, second_guard) =
             build_storage_node_process_config(&config, &ec_config).unwrap();
 
         let observed_incarnations = server.join().unwrap();
         assert_eq!(first_incarnation, Some(1));
         assert_eq!(second_incarnation, Some(2));
+        assert!(second_guard.is_some());
         assert_eq!(observed_incarnations, vec![1, 2]);
         for node_config in [first_config, second_config] {
             assert_eq!(node_config.node_id, NodeId::new(0));
@@ -3062,6 +3087,7 @@ mod tests {
             assert_eq!(node_config.pg_ids, vec![0]);
             assert_eq!(node_config.pg_routes[0].state, PgState::Peering);
         }
+        drop(second_guard);
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
@@ -3088,15 +3114,17 @@ mod tests {
         config.control_plane_socket_path = Some(socket_path.display().to_string());
         config.control_plane_refresh_interval = std::time::Duration::from_millis(1);
 
-        let (node_config, control_plane_node_incarnation) =
+        let (node_config, control_plane_node_incarnation, data_dir_guard) =
             build_storage_node_process_config(&config, &ec_config).unwrap();
 
         let observed_incarnations = server.join().unwrap();
         assert_eq!(control_plane_node_incarnation, Some(1));
+        assert!(data_dir_guard.is_some());
         assert_eq!(observed_incarnations, vec![1]);
         assert_eq!(node_config.node_id, NodeId::new(0));
         assert_eq!(node_config.socket_path, endpoint);
         assert_eq!(node_config.pg_ids, vec![0]);
+        drop(data_dir_guard);
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }

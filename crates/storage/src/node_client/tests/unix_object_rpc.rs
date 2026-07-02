@@ -15,7 +15,11 @@ fn unix_object_generation_metadata_client_routes_generation_reads() {
         )
         .unwrap();
         let pg = node.get_pg(0).unwrap();
-        PgMetadataStore::reserve_object_generation(&*pg, &bucket, &key, &reservation_id).unwrap()
+        let generation =
+            PgMetadataStore::reserve_object_generation(&*pg, &bucket, &key, &reservation_id)
+                .unwrap();
+        pg.refresh_metadata_command_state_digest().unwrap();
+        generation
     };
     private_socket_dir(config.socket_path.parent().unwrap());
     let server = Arc::new(StorageNodeServer::bind(config.clone()).unwrap());
@@ -142,6 +146,7 @@ fn unix_object_read_metadata_client_loads_subject_and_snapshot() {
             std::slice::from_ref(&segment),
         )
         .unwrap();
+        pg.refresh_metadata_command_state_digest().unwrap();
     }
     private_socket_dir(config.socket_path.parent().unwrap());
     let server = Arc::new(StorageNodeServer::bind(config.clone()).unwrap());
@@ -222,7 +227,7 @@ fn unix_object_mutation_metadata_client_loads_snapshots_and_builds_commands() {
         key: crate::tests::object_key("object-mutation-completed-key"),
         completion_order: 7,
         completed_at: 11,
-        initiator: None,
+        initiator: OwnerIdentity::from_principal("owner"),
         owner: OwnerIdentity::from_principal("owner"),
     };
     let generation_id = GenerationId::new(19).unwrap();
@@ -297,8 +302,8 @@ fn unix_object_mutation_metadata_client_loads_snapshots_and_builds_commands() {
                     completed_upload.completed_at as i64,
                     completed_upload.owner.principal.as_str(),
                     completed_upload.owner.canonical_id.as_str(),
-                    Option::<&str>::None,
-                    Option::<&str>::None,
+                    completed_upload.initiator.principal.as_str(),
+                    completed_upload.initiator.canonical_id.as_str(),
                 ],
             )
             .unwrap();
@@ -642,7 +647,7 @@ fn unix_object_mutation_metadata_client_loads_snapshots_and_builds_commands() {
         tags: None,
         metadata_blob: crate::SerializedMetadataBlob::default(),
         system_metadata_blob: crate::SerializedSystemMetadataBlob::default(),
-        initiator: None,
+        initiator: OwnerIdentity::from_principal("owner"),
         owner: OwnerIdentity::from_principal("owner"),
         acl_grants: AclGrants::default(),
         public_read: false,
@@ -1228,7 +1233,7 @@ fn unix_object_mutation_client_rejects_malformed_multipart_read_responses() {
                 key: crate::tests::object_key("wrong-completed-key"),
                 completion_order: 1,
                 completed_at: 2,
-                initiator: None,
+                initiator: OwnerIdentity::from_principal("owner"),
                 owner: OwnerIdentity::from_principal("owner"),
             }),
             &upload.bucket,
@@ -1270,25 +1275,50 @@ fn unix_object_mutation_client_loads_multipart_upload_over_rpc() {
             false,
         )
         .unwrap();
-        PgMetadataStore::create_multipart_upload(
-            &*pg,
-            &CreateMultipartUploadReq {
-                upload_id: upload_id.clone(),
-                bucket: bucket.clone(),
-                key: key.clone(),
-                tags: None,
-                metadata_blob: SerializedMetadataBlob::default(),
-                system_metadata_blob: SerializedSystemMetadataBlob::default(),
-                initiator: None,
-                owner: OwnerIdentity::from_principal("owner"),
-                acl_grants: AclGrants::default(),
-                public_read: false,
-                object_lock: ObjectLockState::default(),
-                checksum: None,
-                encryption: ObjectEncryption::None,
-            },
-        )
-        .unwrap();
+        pg.refresh_metadata_command_state_digest().unwrap();
+        let create = CreateMultipartUploadReq {
+            upload_id: upload_id.clone(),
+            bucket: bucket.clone(),
+            key: key.clone(),
+            tags: None,
+            metadata_blob: SerializedMetadataBlob::default(),
+            system_metadata_blob: SerializedSystemMetadataBlob::default(),
+            initiator: OwnerIdentity::from_principal("owner"),
+            owner: OwnerIdentity::from_principal("owner"),
+            acl_grants: AclGrants::default(),
+            public_read: false,
+            object_lock: ObjectLockState::default(),
+            checksum: None,
+            encryption: ObjectEncryption::None,
+        };
+        let proof = BucketWriteReservationProof {
+            bucket: bucket.clone(),
+            reservation_id: "reservation-1".to_string(),
+            owner_token: "owner-token".to_string(),
+            cluster_epoch: ClusterEpoch::new(1).unwrap(),
+            bucket_execution_generation: 1,
+            bucket_incarnation_generation: 1,
+            operation_kind: "create-multipart-upload".to_string(),
+            created_at: 123,
+            lease_deadline: None,
+            target_context: Some(key.as_str().to_string()),
+        };
+        let command = MetadataCommandEnvelope::new(
+            MetadataCommandId::new(
+                ClusterEpoch::new(1).unwrap(),
+                PgId::new(0),
+                MetadataCommandLogIndex::new(1).unwrap(),
+            ),
+            MetadataCommandPayload::CreateMultipartUpload(Box::new(
+                CreateMultipartUploadCommand::from_request_with_bucket_write_reservation(
+                    create,
+                    GenerationId::new(1).unwrap(),
+                    123,
+                    proof,
+                ),
+            )),
+        );
+        pg.apply_metadata_command_and_record(7, &command).unwrap();
     }
     private_socket_dir(config.socket_path.parent().unwrap());
     let server = StorageNodeServer::bind(config.clone()).unwrap();
@@ -1329,7 +1359,11 @@ fn unix_direct_put_metadata_client_loads_commit_snapshot() {
         )
         .unwrap();
         let pg = node.get_pg(0).unwrap();
-        PgMetadataStore::reserve_object_generation(&*pg, &bucket, &key, &reservation_id).unwrap()
+        let generation =
+            PgMetadataStore::reserve_object_generation(&*pg, &bucket, &key, &reservation_id)
+                .unwrap();
+        pg.refresh_metadata_command_state_digest().unwrap();
+        generation
     };
     private_socket_dir(config.socket_path.parent().unwrap());
     let server = StorageNodeServer::bind(config.clone()).unwrap();
@@ -1369,7 +1403,11 @@ fn unix_direct_put_metadata_client_builds_commit_command() {
         )
         .unwrap();
         let pg = node.get_pg(0).unwrap();
-        PgMetadataStore::reserve_object_generation(&*pg, &bucket, &key, &reservation_id).unwrap()
+        let generation =
+            PgMetadataStore::reserve_object_generation(&*pg, &bucket, &key, &reservation_id)
+                .unwrap();
+        pg.refresh_metadata_command_state_digest().unwrap();
+        generation
     };
     private_socket_dir(config.socket_path.parent().unwrap());
     let server = Arc::new(StorageNodeServer::bind(config.clone()).unwrap());
@@ -1901,7 +1939,7 @@ fn unix_object_mutation_client_rejects_malformed_stream_part_commit_response() {
         tags: None,
         metadata_blob: SerializedMetadataBlob::default(),
         system_metadata_blob: SerializedSystemMetadataBlob::default(),
-        initiator: None,
+        initiator: OwnerIdentity::from_principal("owner"),
         owner: OwnerIdentity::from_principal("owner"),
         acl_grants: AclGrants::default(),
         public_read: false,
@@ -2247,7 +2285,7 @@ fn unix_object_mutation_client_rejects_malformed_complete_multipart_response() {
             write_sequence: 1,
             completion_order: 2,
             completed_at_millis: 3,
-            initiator: None,
+            initiator: OwnerIdentity::from_principal("owner"),
             last_modified_millis: 3,
             stale_payload: None,
         })),
@@ -2423,7 +2461,7 @@ fn unix_object_mutation_client_rejects_malformed_abort_multipart_response() {
         tags: None,
         metadata_blob: SerializedMetadataBlob::default(),
         system_metadata_blob: SerializedSystemMetadataBlob::default(),
-        initiator: None,
+        initiator: OwnerIdentity::from_principal("owner"),
         owner: OwnerIdentity::from_principal("owner"),
         acl_grants: AclGrants::default(),
         public_read: false,

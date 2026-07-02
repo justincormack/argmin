@@ -328,10 +328,10 @@ fn list_multipart_uploads_reports_stored_owner_and_initiator() {
     );
     assert_eq!(
         result.uploads[0].initiator,
-        Some(OwnerIdentity::new(
+        OwnerIdentity::new(
             writer.principal().to_string(),
             writer.canonical_user_id().clone(),
-        ))
+        )
     );
 }
 

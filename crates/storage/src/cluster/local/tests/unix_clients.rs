@@ -1475,6 +1475,7 @@ fn frontend_unix_cluster_map_history_reference_summary_reads_storage_node_owned_
         };
         pg.record_placed_segment_shard_backfill(&backfill, backfill.request.ec.m, None)
             .unwrap();
+        pg.refresh_metadata_command_state_digest().unwrap();
     }
     let server = StorageNodeServer::bind(server_config).unwrap();
     assert!(remote_data_dir.join(".argmin-storage-node.lock").is_file());
@@ -1687,6 +1688,7 @@ fn frontend_unix_bucket_metadata_mode_reads_bucket_batches_from_storage_node() {
             .unwrap()
             .remove(&bucket)
             .unwrap();
+        remote_pg.refresh_metadata_command_state_digest().unwrap();
         (generation, identity)
     };
     let server = StorageNodeServer::bind(server_config).unwrap();
@@ -2046,6 +2048,7 @@ fn frontend_unix_bucket_write_reservation_mode_uses_storage_node() {
             },
         )
         .unwrap();
+        remote_pg.refresh_metadata_command_state_digest().unwrap();
     }
     let server = StorageNodeServer::bind(server_config.clone()).unwrap();
     assert!(remote_data_dir.join(".argmin-storage-node.lock").is_file());
@@ -2237,6 +2240,7 @@ fn frontend_unix_bucket_snapshot_pair_mode_uses_storage_node() {
             },
         )
         .unwrap();
+        remote_pg.refresh_metadata_command_state_digest().unwrap();
     }
     let server = StorageNodeServer::bind(server_config).unwrap();
     let _server_thread = thread::spawn(move || server.serve_forever().unwrap());
@@ -2331,6 +2335,7 @@ fn frontend_unix_object_mutation_stream_append_reads_route_to_storage_node() {
             .unwrap(),
             GenerationId::new(1).unwrap()
         );
+        remote_pg.refresh_metadata_command_state_digest().unwrap();
     }
     let server_config = StorageNodeProcessConfig {
         node_id,
@@ -5194,7 +5199,7 @@ fn control_plane_peering_unix_upload_part_session_old_primary_fails_closed_witho
         tags: None,
         metadata_blob: crate::SerializedMetadataBlob::default(),
         system_metadata_blob: crate::SerializedSystemMetadataBlob::default(),
-        initiator: Some(crate::OwnerIdentity::from_principal("initiator")),
+        initiator: crate::OwnerIdentity::from_principal("initiator"),
         owner: crate::OwnerIdentity::from_principal("owner"),
         acl_grants: crate::AclGrants::default(),
         public_read: false,
@@ -5528,7 +5533,7 @@ fn control_plane_peering_unix_upload_part_finalize_old_primary_preserves_remote_
         tags: None,
         metadata_blob: crate::SerializedMetadataBlob::default(),
         system_metadata_blob: crate::SerializedSystemMetadataBlob::default(),
-        initiator: Some(crate::OwnerIdentity::from_principal("initiator")),
+        initiator: crate::OwnerIdentity::from_principal("initiator"),
         owner: crate::OwnerIdentity::from_principal("owner"),
         acl_grants: crate::AclGrants::default(),
         public_read: false,
@@ -5991,7 +5996,7 @@ fn control_plane_peering_unix_upload_part_copy_finalize_old_primary_preserves_re
         tags: None,
         metadata_blob: crate::SerializedMetadataBlob::default(),
         system_metadata_blob: crate::SerializedSystemMetadataBlob::default(),
-        initiator: Some(crate::OwnerIdentity::from_principal("initiator")),
+        initiator: crate::OwnerIdentity::from_principal("initiator"),
         owner: crate::OwnerIdentity::from_principal("owner"),
         acl_grants: crate::AclGrants::default(),
         public_read: false,
@@ -6662,7 +6667,7 @@ fn non_current_epoch_unix_upload_part_stream_session_create_fails_closed_without
         tags: None,
         metadata_blob: crate::SerializedMetadataBlob::default(),
         system_metadata_blob: crate::SerializedSystemMetadataBlob::default(),
-        initiator: Some(crate::OwnerIdentity::from_principal("initiator")),
+        initiator: crate::OwnerIdentity::from_principal("initiator"),
         owner: crate::OwnerIdentity::from_principal("owner"),
         acl_grants: crate::AclGrants::default(),
         public_read: false,
@@ -6849,7 +6854,7 @@ fn non_current_epoch_unix_upload_part_stream_finalize_fails_closed_without_remot
         tags: None,
         metadata_blob: crate::SerializedMetadataBlob::default(),
         system_metadata_blob: crate::SerializedSystemMetadataBlob::default(),
-        initiator: Some(crate::OwnerIdentity::from_principal("initiator")),
+        initiator: crate::OwnerIdentity::from_principal("initiator"),
         owner: crate::OwnerIdentity::from_principal("owner"),
         acl_grants: crate::AclGrants::default(),
         public_read: false,
@@ -7119,7 +7124,7 @@ fn non_current_epoch_unix_upload_part_copy_finalize_preserves_copied_staging() {
         tags: None,
         metadata_blob: crate::SerializedMetadataBlob::default(),
         system_metadata_blob: crate::SerializedSystemMetadataBlob::default(),
-        initiator: Some(crate::OwnerIdentity::from_principal("initiator")),
+        initiator: crate::OwnerIdentity::from_principal("initiator"),
         owner: crate::OwnerIdentity::from_principal("owner"),
         acl_grants: crate::AclGrants::default(),
         public_read: false,

@@ -184,7 +184,7 @@ fn test_multipart_upload_record(
         tags: None,
         metadata_blob: SerializedMetadataBlob::default(),
         system_metadata_blob: SerializedSystemMetadataBlob::default(),
-        initiator: None,
+        initiator: OwnerIdentity::from_principal("owner"),
         owner: OwnerIdentity::from_principal("owner"),
         acl_grants: AclGrants::default(),
         public_read: false,

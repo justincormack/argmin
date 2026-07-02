@@ -4521,7 +4521,10 @@ impl PgStore {
         }
     }
 
-    fn metadata_table_digest(&self, table: &MetadataDigestTable) -> Result<u64, StoreError> {
+    pub(super) fn metadata_table_digest(
+        &self,
+        table: &MetadataDigestTable,
+    ) -> Result<u64, StoreError> {
         let stats = self.metadata_table_digest_stats(table)?;
         Ok(metadata_table_digest_from_stats(table, stats))
     }

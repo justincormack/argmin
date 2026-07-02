@@ -1279,6 +1279,7 @@ impl PgStore {
         &self,
         command: &CommitMultipartObjectCommand,
     ) -> Result<(), MetadataError> {
+        let initiator = &command.initiator;
         self.conn
             .execute(
                 "INSERT OR REPLACE INTO completed_multipart_uploads \
@@ -1292,14 +1293,8 @@ impl PgStore {
                     command.completed_at_millis as i64,
                     &command.object.owner.principal,
                     command.object.owner.canonical_id.as_str(),
-                    command
-                        .initiator
-                        .as_ref()
-                        .map(|owner| owner.principal.as_str()),
-                    command
-                        .initiator
-                        .as_ref()
-                        .map(|owner| owner.canonical_id.as_str()),
+                    initiator.principal.as_str(),
+                    initiator.canonical_id.as_str(),
                 ],
             )
             .map_err(|e| MetadataError::Db {
@@ -2467,6 +2462,7 @@ impl PgStore {
         let encryption_type = upload.encryption.encryption_type() as u8;
         let encryption_state = upload.encryption.encode_state();
         let system_metadata_blob = upload.system_metadata_blob.as_slice();
+        let initiator = &upload.initiator;
         self.with_immediate_txn(
             "create multipart upload (begin txn)",
             "create multipart upload (commit txn)",
@@ -2532,10 +2528,8 @@ impl PgStore {
                         system_metadata_blob,
                         upload.owner.principal,
                         upload.owner.canonical_id.as_str(),
-                        upload.initiator.as_ref().map(|owner| owner.principal.as_str()),
-                        upload.initiator
-                            .as_ref()
-                            .map(|owner| owner.canonical_id.as_str()),
+                        initiator.principal.as_str(),
+                        initiator.canonical_id.as_str(),
                         algo,
                         ctype,
                         encryption_type,
@@ -3879,13 +3873,8 @@ impl PgStore {
             )
         })?;
         let owner = Self::parse_owner_identity(row, 5, 6, "owner_principal", "owner_canonical_id")?;
-        let initiator = Self::parse_optional_owner_identity(
-            row,
-            7,
-            8,
-            "initiator_principal",
-            "initiator_canonical_id",
-        )?;
+        let initiator =
+            Self::parse_owner_identity(row, 7, 8, "initiator_principal", "initiator_canonical_id")?;
         Ok(CompletedMultipartUploadRecord {
             upload_id: row.get(0)?,
             bucket: row.get(1)?,
@@ -9340,7 +9329,7 @@ impl PgMetadataStore for PgStore {
                         "owner_principal",
                         "owner_canonical_id",
                     )?;
-                    let initiator = Self::parse_optional_owner_identity(
+                    let initiator = Self::parse_owner_identity(
                         row,
                         10,
                         11,
@@ -9680,7 +9669,7 @@ impl PgMetadataStore for PgStore {
                 };
                 let owner =
                     Self::parse_owner_identity(row, 8, 9, "owner_principal", "owner_canonical_id")?;
-                let initiator = Self::parse_optional_owner_identity(
+                let initiator = Self::parse_owner_identity(
                     row,
                     10,
                     11,
@@ -10694,7 +10683,7 @@ impl PgMetadataStore for PgStore {
 
             // 8. Record this upload as completed so AbortMultipartUpload can
             //    remain idempotently successful for the exact completed upload_id.
-            let (initiator_principal, initiator_canonical_id): (Option<String>, Option<String>) =
+            let (initiator_principal, initiator_canonical_id): (String, String) =
                 self.conn.query_row(
                     "SELECT initiator_principal, initiator_canonical_id \
                      FROM multipart_uploads WHERE upload_id = ?1",

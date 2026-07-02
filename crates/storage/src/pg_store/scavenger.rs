@@ -2810,9 +2810,9 @@ mod tests {
             .execute(
                 "INSERT INTO multipart_uploads \
                  (upload_id, bucket, key, initiated_at, state, metadata_blob, system_metadata_blob, \
-                  owner_principal, owner_canonical_id, acl_grants, public_read, \
-                  object_generation_id, object_lock_legal_hold, encryption_type) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                  owner_principal, owner_canonical_id, initiator_principal, initiator_canonical_id, \
+                  acl_grants, public_read, object_generation_id, object_lock_legal_hold, encryption_type) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
                 rusqlite::params![
                     "u".repeat(128),
                     "bucket",
@@ -2821,6 +2821,8 @@ mod tests {
                     0i64,
                     b"".as_slice(),
                     b"".as_slice(),
+                    "owner",
+                    "c".repeat(32),
                     "owner",
                     "c".repeat(32),
                     "",

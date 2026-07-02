@@ -90,6 +90,7 @@ fn unix_storage_node_client_reads_cluster_map_history_reference_summary() {
         };
         pg.record_placed_segment_shard_backfill(&backfill, backfill.request.ec.m, None)
             .unwrap();
+        pg.refresh_metadata_command_state_digest().unwrap();
     }
     let server = StorageNodeServer::bind(config.clone()).unwrap();
     let server_thread = thread::spawn(move || server.accept_one().unwrap());
@@ -925,21 +926,9 @@ fn unix_storage_node_client_removes_pending_metadata_command_slot_idempotently()
     private_socket_dir(config.socket_path.parent().unwrap());
     let command = test_metadata_command(0, 1);
     let bucket = crate::tests::bucket_name("metadata-rpc-bucket");
-    {
-        let node = SharedStorageNode::open_with_default_ec_shape(
-            &config.data_dir,
-            &config.pg_ids,
-            config.default_ec_shape,
-        )
-        .unwrap();
-        let pg = node.get_pg(0).unwrap();
-        pg.try_insert_pending_metadata_command_slot(7, &command, Some(&bucket))
-            .unwrap();
-        pg.record_metadata_command_abandoned(7, &command).unwrap();
-    }
     let server = StorageNodeServer::bind(config.clone()).unwrap();
     let server_thread = thread::spawn(move || {
-        for _ in 0..2 {
+        for _ in 0..4 {
             server.accept_one().unwrap();
         }
     });
@@ -949,6 +938,15 @@ fn unix_storage_node_client_removes_pending_metadata_command_slot_idempotently()
         config.socket_path.clone(),
     );
 
+    MetadataCommandNodeClient::try_insert_pending_metadata_command_slot(
+        &client,
+        PgId::new(0),
+        &command,
+        Some(&bucket),
+    )
+    .unwrap();
+    MetadataCommandNodeClient::record_metadata_command_abandoned(&client, PgId::new(0), &command)
+        .unwrap();
     assert!(
         MetadataCommandNodeClient::remove_pending_metadata_command_slot(
             &client,

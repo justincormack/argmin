@@ -1162,12 +1162,11 @@ impl HttpFrontend {
                     canonical_id: upload.owner.canonical_id.clone(),
                     display_name: None,
                 };
-                let initiator_identity = upload.initiator.unwrap_or_else(|| upload.owner.clone());
                 let initiator = xml::RenderedCanonicalUser {
-                    canonical_id: initiator_identity.canonical_id.clone(),
+                    canonical_id: upload.initiator.canonical_id.clone(),
                     display_name: self
                         .credentials
-                        .find_account_by_canonical_user_id(&initiator_identity.canonical_id)
+                        .find_account_by_canonical_user_id(&upload.initiator.canonical_id)
                         .map(|account| account.display_name().to_string()),
                 };
                 xml::RenderedMultipartUploadEntry {

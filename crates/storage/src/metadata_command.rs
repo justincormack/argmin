@@ -696,7 +696,7 @@ pub(crate) struct CommitMultipartObjectCommand {
     pub(crate) write_sequence: u64,
     pub(crate) completion_order: u64,
     pub(crate) completed_at_millis: u64,
-    pub(crate) initiator: Option<OwnerIdentity>,
+    pub(crate) initiator: OwnerIdentity,
     pub(crate) last_modified_millis: u64,
     pub(crate) stale_payload: Option<ObjectPayloadReclaimCommand>,
 }
@@ -1437,7 +1437,7 @@ impl<'a> MetadataCommandLogEntryDecoder<'a> {
                 self.read_u64()?;
                 self.read_u64()?;
                 self.read_u64()?;
-                self.skip_optional_owner_identity()?;
+                self.skip_owner_identity()?;
                 self.read_u64()?;
                 self.skip_optional_stale_payload()?;
                 self.skip_required_bucket_write_reservation_proof()
@@ -1630,7 +1630,7 @@ impl<'a> MetadataCommandLogEntryDecoder<'a> {
                         write_sequence: self.read_u64()?,
                         completion_order: self.read_u64()?,
                         completed_at_millis: self.read_u64()?,
-                        initiator: self.read_optional_owner_identity()?,
+                        initiator: self.read_owner_identity()?,
                         last_modified_millis: self.read_u64()?,
                         stale_payload: self.read_optional_stale_payload()?,
                         bucket_write_reservation: self.read_bucket_write_reservation_proof()?,
@@ -2383,7 +2383,7 @@ impl<'a> MetadataCommandLogEntryDecoder<'a> {
         self.skip_optional_str()?;
         self.read_bytes()?;
         self.read_bytes()?;
-        self.skip_optional_owner_identity()?;
+        self.skip_owner_identity()?;
         self.skip_owner_identity()?;
         self.skip_str()?;
         self.skip_bool()?;
@@ -2406,7 +2406,7 @@ impl<'a> MetadataCommandLogEntryDecoder<'a> {
                 .map(SerializedTagSet::new),
             metadata_blob: SerializedMetadataBlob::new(self.read_bytes()?.to_vec()),
             system_metadata_blob: SerializedSystemMetadataBlob::new(self.read_bytes()?.to_vec()),
-            initiator: self.read_optional_owner_identity()?,
+            initiator: self.read_owner_identity()?,
             owner: self.read_owner_identity()?,
             acl_grants: self.read_acl_grants()?,
             public_read: self.read_bool()?,
@@ -2423,7 +2423,7 @@ impl<'a> MetadataCommandLogEntryDecoder<'a> {
         self.skip_str()?;
         self.read_u64()?;
         self.read_u64()?;
-        self.skip_optional_owner_identity()?;
+        self.skip_owner_identity()?;
         self.skip_owner_identity()
     }
 
@@ -2436,7 +2436,7 @@ impl<'a> MetadataCommandLogEntryDecoder<'a> {
             key: self.read_object_key()?,
             completion_order: self.read_u64()?,
             completed_at: self.read_u64()?,
-            initiator: self.read_optional_owner_identity()?,
+            initiator: self.read_owner_identity()?,
             owner: self.read_owner_identity()?,
         })
     }
@@ -2768,18 +2768,6 @@ impl<'a> MetadataCommandLogEntryDecoder<'a> {
             self.read_string("owner principal")?,
             self.read_canonical_user_id()?,
         ))
-    }
-
-    fn skip_optional_owner_identity(&mut self) -> Result<(), String> {
-        self.skip_optional(Self::skip_owner_identity)
-    }
-
-    fn read_optional_owner_identity(&mut self) -> Result<Option<OwnerIdentity>, String> {
-        match self.read_u8()? {
-            0 => Ok(None),
-            1 => self.read_owner_identity().map(Some),
-            tag => Err(format!("invalid optional owner identity tag {tag}")),
-        }
     }
 
     fn skip_optional_multipart_checksum_config(&mut self) -> Result<(), String> {
@@ -3152,14 +3140,7 @@ fn encode_commit_multipart_object(out: &mut Vec<u8>, command: &CommitMultipartOb
     put_u64(out, command.write_sequence);
     put_u64(out, command.completion_order);
     put_u64(out, command.completed_at_millis);
-    match &command.initiator {
-        None => put_u8(out, 0),
-        Some(initiator) => {
-            put_u8(out, 1);
-            put_str(out, &initiator.principal);
-            put_str(out, initiator.canonical_id.as_str());
-        }
-    }
+    encode_owner_identity(out, &command.initiator);
     put_u64(out, command.last_modified_millis);
     match &command.stale_payload {
         None => put_u8(out, 0),
@@ -3329,7 +3310,7 @@ fn encode_completed_multipart_upload(out: &mut Vec<u8>, record: &CompletedMultip
     put_str(out, record.key.as_str());
     put_u64(out, record.completion_order);
     put_u64(out, record.completed_at);
-    encode_optional_owner_identity(out, record.initiator.as_ref());
+    encode_owner_identity(out, &record.initiator);
     encode_owner_identity(out, &record.owner);
 }
 
@@ -3395,7 +3376,7 @@ fn encode_multipart_upload(out: &mut Vec<u8>, upload: &MultipartUploadRecord) {
     encode_optional_str(out, upload.tags.as_ref().map(|tags| tags.as_str()));
     put_bytes(out, upload.metadata_blob.as_slice());
     put_bytes(out, upload.system_metadata_blob.as_slice());
-    encode_optional_owner_identity(out, upload.initiator.as_ref());
+    encode_owner_identity(out, &upload.initiator);
     encode_owner_identity(out, &upload.owner);
     put_str(out, &upload.acl_grants.serialized());
     put_bool(out, upload.public_read);
@@ -3706,16 +3687,6 @@ fn encode_object_encryption(out: &mut Vec<u8>, encryption: &ObjectEncryption) {
 fn encode_owner_identity(out: &mut Vec<u8>, owner: &OwnerIdentity) {
     put_str(out, &owner.principal);
     put_str(out, owner.canonical_id.as_str());
-}
-
-fn encode_optional_owner_identity(out: &mut Vec<u8>, owner: Option<&OwnerIdentity>) {
-    match owner {
-        None => put_u8(out, 0),
-        Some(owner) => {
-            put_u8(out, 1);
-            encode_owner_identity(out, owner);
-        }
-    }
 }
 
 fn encode_optional_multipart_checksum_config(
@@ -4168,7 +4139,7 @@ mod tests {
                 write_sequence: 1,
                 completion_order: 1,
                 completed_at_millis: 2,
-                initiator: None,
+                initiator: OwnerIdentity::from_principal("owner"),
                 last_modified_millis: 2,
                 stale_payload: None,
             })),
@@ -4843,7 +4814,7 @@ mod tests {
             tags: Some(crate::SerializedTagSet::new("<Tagging/>".to_string())),
             metadata_blob: SerializedMetadataBlob::new(vec![1, 2, 3]),
             system_metadata_blob: SerializedSystemMetadataBlob::new(vec![4, 5, 6]),
-            initiator: Some(OwnerIdentity::from_principal("initiator")),
+            initiator: OwnerIdentity::from_principal("initiator"),
             owner: OwnerIdentity::from_principal("owner"),
             acl_grants: AclGrants::default(),
             public_read: true,
@@ -5027,7 +4998,7 @@ mod tests {
                 write_sequence: 43,
                 completion_order: 12,
                 completed_at_millis: 556,
-                initiator: Some(OwnerIdentity::from_principal("initiator")),
+                initiator: OwnerIdentity::from_principal("initiator"),
                 last_modified_millis: 557,
                 stale_payload: Some(multipart_reclaim.clone()),
             })),
@@ -5142,7 +5113,7 @@ mod tests {
                         tags: Some(crate::SerializedTagSet::new("<Tagging/>".to_string())),
                         metadata_blob: SerializedMetadataBlob::new(vec![1, 2, 3]),
                         system_metadata_blob: SerializedSystemMetadataBlob::new(vec![4, 5, 6]),
-                        initiator: Some(OwnerIdentity::from_principal("initiator")),
+                        initiator: OwnerIdentity::from_principal("initiator"),
                         owner: OwnerIdentity::from_principal("owner"),
                         acl_grants: AclGrants::default(),
                         public_read: true,
@@ -5285,7 +5256,7 @@ mod tests {
                         key,
                         completion_order: 12,
                         completed_at: 556,
-                        initiator: Some(OwnerIdentity::from_principal("initiator")),
+                        initiator: OwnerIdentity::from_principal("initiator"),
                         owner: OwnerIdentity::from_principal("owner"),
                     },
                 },
@@ -5323,7 +5294,7 @@ mod tests {
                 0x3acf49df359790d4,
                 0x5531f7e6bf78ef78,
                 0x9b5a7f09485bffb3,
-                0x442711a79ce0147f,
+                0x7b747bca02519f2a,
                 0x903cf2da427ff645,
                 0x22e816661cec7274,
                 0xe7353d51b6609ac8,
@@ -5334,19 +5305,19 @@ mod tests {
                 0x9ce4e01e6a487491,
                 0x0a8d33e1be16239d,
                 0x48fb53d34217c071,
-                0x60d07b32ba40633a,
-                0x5905759308d55e48,
-                0x45131b8e7ccaf13a,
+                0x3ffc0996963172f3,
+                0xc4fe8906783bc00e,
+                0xf608eb73f9631680,
                 0x2d6608601fded1d8,
                 0xe3226a0437ce53d4,
                 0x85aa88f98640917b,
                 0x506bcf86cc513234,
                 0xad26c80659b2eba1,
-                0x5d116b5e94f140e9,
+                0xfda139619dd8392b,
                 0x6c3b4b7d0a8ce150,
                 0x48a90205c35a066d,
                 0xba43f79ea2af20cb,
-                0x13ddd49bdbc91001,
+                0x34daf2b37760757c,
                 0x1946524188e07bbb,
             ]
         );

@@ -981,6 +981,7 @@ fn unix_bucket_write_reservation_client_acquires_validates_and_releases() {
             false,
         )
         .unwrap();
+        pg.refresh_metadata_command_state_digest().unwrap();
     }
     private_socket_dir(config.socket_path.parent().unwrap());
     let server = Arc::new(StorageNodeServer::bind(config.clone()).unwrap());
@@ -1102,6 +1103,7 @@ fn unix_bucket_write_reservation_client_preserves_draining_signal() {
             Some(20),
         )
         .unwrap();
+        pg.refresh_metadata_command_state_digest().unwrap();
     }
     private_socket_dir(config.socket_path.parent().unwrap());
     let server = StorageNodeServer::bind(config.clone()).unwrap();
@@ -1215,9 +1217,11 @@ fn unix_bucket_write_reservation_client_routes_drain_and_finalize_coordination()
         )
         .unwrap();
         PgMetadataStore::mark_bucket_deleting(&*pg, &finalize_bucket).unwrap();
-        PgMetadataStore::head_bucket_raw(&*pg, &finalize_bucket)
+        let generation = PgMetadataStore::head_bucket_raw(&*pg, &finalize_bucket)
             .unwrap()
-            .bucket_incarnation_generation
+            .bucket_incarnation_generation;
+        pg.refresh_metadata_command_state_digest().unwrap();
+        generation
     };
     private_socket_dir(config.socket_path.parent().unwrap());
     let server = Arc::new(StorageNodeServer::bind(config.clone()).unwrap());
@@ -1499,9 +1503,11 @@ fn unix_bucket_write_reservation_client_routes_lifecycle_sweep_coordination() {
             },
         )
         .unwrap();
-        PgMetadataStore::head_bucket_raw(&*pg, &bucket)
+        let generation = PgMetadataStore::head_bucket_raw(&*pg, &bucket)
             .unwrap()
-            .bucket_incarnation_generation
+            .bucket_incarnation_generation;
+        pg.refresh_metadata_command_state_digest().unwrap();
+        generation
     };
     private_socket_dir(config.socket_path.parent().unwrap());
     let server = Arc::new(StorageNodeServer::bind(config.clone()).unwrap());
@@ -1650,6 +1656,7 @@ fn unix_bucket_metadata_client_loads_bucket_snapshot() {
             },
         )
         .unwrap();
+        pg.refresh_metadata_command_state_digest().unwrap();
     }
     private_socket_dir(config.socket_path.parent().unwrap());
     let server = StorageNodeServer::bind(config.clone()).unwrap();
@@ -1739,6 +1746,7 @@ fn unix_bucket_metadata_client_loads_bucket_snapshot_pair() {
             },
         )
         .unwrap();
+        pg.refresh_metadata_command_state_digest().unwrap();
     }
     private_socket_dir(config.socket_path.parent().unwrap());
     let server = StorageNodeServer::bind(config.clone()).unwrap();
@@ -1806,6 +1814,7 @@ fn unix_bucket_metadata_client_builds_completed_multipart_order_command() {
             false,
         )
         .unwrap();
+        pg.refresh_metadata_command_state_digest().unwrap();
     }
     private_socket_dir(config.socket_path.parent().unwrap());
     let server = StorageNodeServer::bind(config.clone()).unwrap();
@@ -1876,6 +1885,7 @@ fn unix_bucket_metadata_client_routes_bucket_control_operations() {
             },
         )
         .unwrap();
+        pg.refresh_metadata_command_state_digest().unwrap();
     }
     private_socket_dir(config.socket_path.parent().unwrap());
     let server = Arc::new(StorageNodeServer::bind(config.clone()).unwrap());
@@ -2017,7 +2027,7 @@ fn unix_bucket_metadata_client_releases_bucket_write_proof() {
             false,
         )
         .unwrap();
-        PgMetadataStore::acquire_durable_bucket_write_reservation(
+        let reservation = PgMetadataStore::acquire_durable_bucket_write_reservation(
             &*pg,
             &bucket,
             "reservation-1",
@@ -2028,7 +2038,9 @@ fn unix_bucket_metadata_client_releases_bucket_write_proof() {
             Some(20),
             Some("key=a"),
         )
-        .unwrap()
+        .unwrap();
+        pg.refresh_metadata_command_state_digest().unwrap();
+        reservation
     };
     private_socket_dir(config.socket_path.parent().unwrap());
     let server = StorageNodeServer::bind(config.clone()).unwrap();
@@ -2085,7 +2097,7 @@ fn unix_bucket_metadata_client_preserves_proof_release_conflict() {
             false,
         )
         .unwrap();
-        PgMetadataStore::acquire_durable_bucket_write_reservation(
+        let reservation = PgMetadataStore::acquire_durable_bucket_write_reservation(
             &*pg,
             &bucket,
             "reservation-1",
@@ -2096,7 +2108,9 @@ fn unix_bucket_metadata_client_preserves_proof_release_conflict() {
             Some(20),
             Some("key=a"),
         )
-        .unwrap()
+        .unwrap();
+        pg.refresh_metadata_command_state_digest().unwrap();
+        reservation
     };
     private_socket_dir(config.socket_path.parent().unwrap());
     let server = StorageNodeServer::bind(config.clone()).unwrap();
@@ -2196,6 +2210,7 @@ fn unix_bucket_metadata_client_rejects_proof_release_wrong_bucket_pg() {
             Some("key=a"),
         )
         .unwrap();
+        pg.refresh_metadata_command_state_digest().unwrap();
         (bucket, correct_pg_id, wrong_pg_id, reservation)
     };
     private_socket_dir(config.socket_path.parent().unwrap());

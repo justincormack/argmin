@@ -1635,6 +1635,15 @@ fn assert_metadata_state_digest_covers_mutation(
 }
 
 fn assert_cached_metadata_digest_matches_materialized(store: &PgStore) {
+    for table in crate::pg_store::command_log::METADATA_DIGEST_TABLES {
+        let cached = store.cached_metadata_table_digest(table).unwrap();
+        let materialized = store.metadata_table_digest(table).unwrap();
+        assert_eq!(
+            cached, materialized,
+            "cached digest for {} should match materialized rows",
+            table.name
+        );
+    }
     let cached = store.cached_metadata_state_digest().unwrap();
     let materialized = store.metadata_state_digest().unwrap();
     assert_eq!(cached, materialized);
@@ -1717,6 +1726,144 @@ fn metadata_digest_cache_tracks_row_changes_incrementally() {
         )
         .unwrap();
     assert_cached_metadata_digest_matches_materialized(&store);
+}
+
+#[test]
+fn metadata_digest_cache_tracks_multipart_upload_create() {
+    let tmp = test_util::tempdir();
+    let store = PgStore::open(tmp.path(), 1).unwrap();
+    let bucket = trusted_bucket_name("digest-mpu-bucket");
+    let key = trusted_object_key("object");
+    PgMetadataStore::create_bucket(
+        &store,
+        &bucket,
+        "owner",
+        &CanonicalUserId::from_principal("owner"),
+        &AclGrants::default(),
+        false,
+        false,
+    )
+    .unwrap();
+    assert_cached_metadata_digest_matches_materialized(&store);
+
+    PgMetadataStore::create_multipart_upload(
+        &store,
+        &CreateMultipartUploadReq {
+            upload_id: crate::tests::multipart_upload_id("digest-mpu-upload"),
+            bucket: bucket.clone(),
+            key,
+            tags: None,
+            metadata_blob: SerializedMetadataBlob::default(),
+            system_metadata_blob: SerializedSystemMetadataBlob::default(),
+            initiator: test_owner(),
+            owner: OwnerIdentity::from_principal("owner"),
+            acl_grants: AclGrants::default(),
+            public_read: false,
+            object_lock: ObjectLockState::default(),
+            checksum: None,
+            encryption: ObjectEncryption::None,
+        },
+    )
+    .unwrap();
+    assert_cached_metadata_digest_matches_materialized(&store);
+}
+
+#[test]
+fn metadata_command_apply_tracks_multipart_upload_create_digest() {
+    let tmp = test_util::tempdir();
+    let store = PgStore::open(tmp.path(), 1).unwrap();
+    let bucket = trusted_bucket_name("digest-mpu-command-bucket");
+    let key = trusted_object_key("object");
+    PgMetadataStore::create_bucket(
+        &store,
+        &bucket,
+        "owner",
+        &CanonicalUserId::from_principal("owner"),
+        &AclGrants::default(),
+        false,
+        false,
+    )
+    .unwrap();
+    store.refresh_metadata_command_state_digest().unwrap();
+
+    let create = CreateMultipartUploadReq {
+        upload_id: crate::tests::multipart_upload_id("digest-mpu-command-upload"),
+        bucket: bucket.clone(),
+        key: key.clone(),
+        tags: None,
+        metadata_blob: SerializedMetadataBlob::default(),
+        system_metadata_blob: SerializedSystemMetadataBlob::default(),
+        initiator: test_owner(),
+        owner: OwnerIdentity::from_principal("owner"),
+        acl_grants: AclGrants::default(),
+        public_read: false,
+        object_lock: ObjectLockState::default(),
+        checksum: None,
+        encryption: ObjectEncryption::None,
+    };
+    let command = MetadataCommandEnvelope::new(
+        MetadataCommandId::new(
+            ClusterEpoch::INITIAL,
+            PgId::new(1),
+            MetadataCommandLogIndex::new(1).unwrap(),
+        ),
+        MetadataCommandPayload::CreateMultipartUpload(Box::new(
+            CreateMultipartUploadCommand::from_request_with_bucket_write_reservation(
+                create,
+                GenerationId::new(1).unwrap(),
+                123,
+                test_bucket_write_reservation_proof(&bucket, &key, "create-multipart-upload"),
+            ),
+        )),
+    );
+    store
+        .apply_metadata_command_and_record(7, &command)
+        .unwrap();
+
+    assert_cached_metadata_digest_matches_materialized(&store);
+    let before_reopen: Vec<(&'static str, u64, u64)> =
+        crate::pg_store::command_log::METADATA_DIGEST_TABLES
+            .iter()
+            .map(|table| {
+                (
+                    table.name,
+                    store.cached_metadata_table_digest(table).unwrap(),
+                    store.metadata_table_digest(table).unwrap(),
+                )
+            })
+            .collect();
+    let state_before_reopen = store.metadata_state_digest().unwrap();
+    store
+        .validate_metadata_command_replay_state(7, ClusterEpoch::INITIAL)
+        .unwrap();
+    drop(store);
+
+    let reopened = PgStore::open(tmp.path(), 1).unwrap();
+    assert_cached_metadata_digest_matches_materialized(&reopened);
+    for (table_name, cached_before, materialized_before) in before_reopen {
+        let table = crate::pg_store::command_log::METADATA_DIGEST_TABLES
+            .iter()
+            .find(|table| table.name == table_name)
+            .unwrap();
+        assert_eq!(
+            cached_before,
+            reopened.cached_metadata_table_digest(table).unwrap(),
+            "cached digest for {table_name} changed across reopen"
+        );
+        assert_eq!(
+            materialized_before,
+            reopened.metadata_table_digest(table).unwrap(),
+            "materialized digest for {table_name} changed across reopen"
+        );
+    }
+    assert_eq!(
+        state_before_reopen,
+        reopened.metadata_state_digest().unwrap(),
+        "materialized state digest changed across reopen"
+    );
+    reopened
+        .validate_metadata_command_replay_state(7, ClusterEpoch::INITIAL)
+        .unwrap();
 }
 
 #[test]
@@ -2051,8 +2198,8 @@ fn insert_digest_multipart_upload(store: &PgStore, upload_id: &UploadId) {
                 b"system".as_slice(),
                 owner.principal.as_str(),
                 owner.canonical_id.as_str(),
-                Option::<&str>::None,
-                Option::<&str>::None,
+                owner.principal.as_str(),
+                owner.canonical_id.as_str(),
                 Option::<u8>::None,
                 Option::<u8>::None,
                 ObjectEncryption::None.encryption_type() as u8,
@@ -3590,7 +3737,7 @@ fn pending_metadata_command_slot_rejects_proofless_create_multipart_upload() {
                     tags: None,
                     metadata_blob: SerializedMetadataBlob::default(),
                     system_metadata_blob: SerializedSystemMetadataBlob::default(),
-                    initiator: Some(OwnerIdentity::from_principal("initiator")),
+                    initiator: OwnerIdentity::from_principal("initiator"),
                     owner: OwnerIdentity::from_principal("owner"),
                     acl_grants: AclGrants::default(),
                     public_read: false,
@@ -4487,8 +4634,8 @@ fn metadata_state_digest_covers_completed_multipart_uploads() {
                         103_i64,
                         owner.principal.as_str(),
                         owner.canonical_id.as_str(),
-                        Option::<&str>::None,
-                        Option::<&str>::None,
+                        owner.principal.as_str(),
+                        owner.canonical_id.as_str(),
                     ],
                 )
                 .unwrap();

@@ -229,7 +229,7 @@ pub(super) struct AuthorizedCreateMultipartUpload {
     pub(super) key: ObjectKey,
     pub(super) tags: Option<String>,
     pub(super) checksum: Option<MultipartChecksumConfig>,
-    pub(super) initiator: Option<OwnerIdentity>,
+    pub(super) initiator: OwnerIdentity,
     pub(super) owner: OwnerIdentity,
     pub(super) acl_grants: AclGrants,
     pub(super) public_read: bool,

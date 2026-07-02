@@ -586,7 +586,7 @@ fn delete_bucket_clears_completed_multipart_upload_records() {
             tags: None,
             metadata_blob: vec![].into(),
             system_metadata_blob: SerializedSystemMetadataBlob::default(),
-            initiator: None,
+            initiator: test_owner(),
             owner: test_owner(),
             acl_grants: AclGrants::default(),
             public_read: false,
@@ -675,7 +675,7 @@ fn list_completed_multipart_upload_records_for_bucket_page_paginates() {
                 tags: None,
                 metadata_blob: vec![].into(),
                 system_metadata_blob: SerializedSystemMetadataBlob::default(),
-                initiator: None,
+                initiator: test_owner(),
                 owner: test_owner(),
                 acl_grants: AclGrants::default(),
                 public_read: false,
@@ -1806,7 +1806,7 @@ fn list_buckets_with_aborting_multipart_uploads_returns_distinct_bucket_names() 
                 bucket: bucket_name(bucket),
                 key: object_key(key),
                 owner: test_owner(),
-                initiator: None,
+                initiator: test_owner(),
                 tags: None,
                 metadata_blob: SerializedMetadataBlob::from(vec![]),
                 system_metadata_blob: SerializedSystemMetadataBlob::from(vec![]),
@@ -1994,7 +1994,7 @@ fn mpu_create_and_get_upload() {
             tags: Some(tags.into()),
             metadata_blob: vec![1, 2, 3].into(),
             system_metadata_blob: SerializedSystemMetadataBlob::default(),
-            initiator: Some(owner_identity("alice")),
+            initiator: owner_identity("alice"),
 
             owner: owner_identity("alice"),
             acl_grants: AclGrants::default(),
@@ -2014,7 +2014,7 @@ fn mpu_create_and_get_upload() {
     assert_eq!(rec.state, UploadState::InProgress);
     assert_eq!(rec.tags.as_deref(), Some(tags));
     assert_eq!(rec.metadata_blob, vec![1, 2, 3].into());
-    assert_eq!(rec.initiator, Some(owner_identity("alice")));
+    assert_eq!(rec.initiator, owner_identity("alice"));
     assert_eq!(rec.owner, owner_identity("alice"));
     assert_eq!(rec.object_generation_id, GenerationId::MIN);
     assert_eq!(
@@ -2037,7 +2037,7 @@ fn mpu_create_upload_with_checksum_fields() {
             tags: None,
             metadata_blob: vec![].into(),
             system_metadata_blob: SerializedSystemMetadataBlob::default(),
-            initiator: None,
+            initiator: test_owner(),
 
             owner: test_owner(),
             acl_grants: AclGrants::default(),
@@ -2075,7 +2075,7 @@ fn mpu_create_upload_with_checksum_fields() {
             tags: None,
             metadata_blob: vec![].into(),
             system_metadata_blob: SerializedSystemMetadataBlob::default(),
-            initiator: None,
+            initiator: test_owner(),
 
             owner: test_owner(),
             acl_grants: AclGrants::default(),
@@ -2102,7 +2102,7 @@ fn mpu_part_checksum_round_trip() {
             tags: None,
             metadata_blob: vec![].into(),
             system_metadata_blob: SerializedSystemMetadataBlob::default(),
-            initiator: None,
+            initiator: test_owner(),
 
             owner: test_owner(),
             acl_grants: AclGrants::default(),
@@ -2245,7 +2245,7 @@ fn mpu_complete_multipart_commit_preserves_checksums() {
             tags: Some(tags.into()),
             metadata_blob: vec![].into(),
             system_metadata_blob: SerializedSystemMetadataBlob::default(),
-            initiator: None,
+            initiator: test_owner(),
 
             owner: test_owner(),
             acl_grants: AclGrants::default(),
@@ -2374,7 +2374,7 @@ fn completed_multipart_tombstone_survives_null_version_overwrite() {
         tags: None,
         metadata_blob: vec![].into(),
         system_metadata_blob: vec![].into(),
-        initiator: Some(test_owner()),
+        initiator: test_owner(),
         owner: test_owner(),
         acl_grants: AclGrants::default(),
         public_read: false,
@@ -2476,7 +2476,7 @@ fn completed_multipart_tombstone_survives_object_version_delete() {
         tags: None,
         metadata_blob: vec![].into(),
         system_metadata_blob: vec![].into(),
-        initiator: Some(test_owner()),
+        initiator: test_owner(),
         owner: test_owner(),
         acl_grants: AclGrants::default(),
         public_read: false,
@@ -2565,7 +2565,7 @@ fn completed_multipart_upload_list_reports_global_completion_orders() {
                 tags: None,
                 metadata_blob: vec![].into(),
                 system_metadata_blob: vec![].into(),
-                initiator: Some(test_owner()),
+                initiator: test_owner(),
                 owner: test_owner(),
                 acl_grants: AclGrants::default(),
                 public_read: false,
@@ -2655,7 +2655,7 @@ fn mpu_set_upload_state_transition() {
             tags: None,
             metadata_blob: vec![].into(),
             system_metadata_blob: SerializedSystemMetadataBlob::default(),
-            initiator: None,
+            initiator: test_owner(),
 
             owner: test_owner(),
             acl_grants: AclGrants::default(),
@@ -2708,7 +2708,7 @@ fn mpu_delete_upload_cascades_parts() {
             tags: None,
             metadata_blob: vec![].into(),
             system_metadata_blob: SerializedSystemMetadataBlob::default(),
-            initiator: None,
+            initiator: test_owner(),
 
             owner: test_owner(),
             acl_grants: AclGrants::default(),
@@ -2781,7 +2781,7 @@ fn mpu_upsert_part_and_get() {
             tags: None,
             metadata_blob: vec![].into(),
             system_metadata_blob: SerializedSystemMetadataBlob::default(),
-            initiator: None,
+            initiator: test_owner(),
 
             owner: test_owner(),
             acl_grants: AclGrants::default(),
@@ -2862,7 +2862,7 @@ fn mpu_list_parts_pagination() {
             tags: None,
             metadata_blob: vec![].into(),
             system_metadata_blob: SerializedSystemMetadataBlob::default(),
-            initiator: None,
+            initiator: test_owner(),
 
             owner: test_owner(),
             acl_grants: AclGrants::default(),
@@ -2960,7 +2960,7 @@ fn mpu_list_uploads_pagination() {
                 tags: None,
                 metadata_blob: vec![].into(),
                 system_metadata_blob: SerializedSystemMetadataBlob::default(),
-                initiator: None,
+                initiator: test_owner(),
 
                 owner: test_owner(),
                 acl_grants: AclGrants::default(),
@@ -3019,7 +3019,7 @@ fn mpu_list_uploads_with_prefix() {
                 tags: None,
                 metadata_blob: vec![].into(),
                 system_metadata_blob: SerializedSystemMetadataBlob::default(),
-                initiator: None,
+                initiator: test_owner(),
 
                 owner: test_owner(),
                 acl_grants: AclGrants::default(),
@@ -3061,7 +3061,7 @@ fn mpu_list_uploads_same_key_multiple_upload_ids() {
                 tags: None,
                 metadata_blob: vec![].into(),
                 system_metadata_blob: SerializedSystemMetadataBlob::default(),
-                initiator: None,
+                initiator: test_owner(),
 
                 owner: test_owner(),
                 acl_grants: AclGrants::default(),
@@ -3118,7 +3118,7 @@ fn mpu_list_uploads_stale_marker_returns_remaining() {
                 tags: None,
                 metadata_blob: vec![].into(),
                 system_metadata_blob: SerializedSystemMetadataBlob::default(),
-                initiator: None,
+                initiator: test_owner(),
 
                 owner: test_owner(),
                 acl_grants: AclGrants::default(),
@@ -3167,7 +3167,7 @@ fn mpu_corrupted_part_okh_returns_error() {
             tags: None,
             metadata_blob: vec![].into(),
             system_metadata_blob: SerializedSystemMetadataBlob::default(),
-            initiator: None,
+            initiator: test_owner(),
 
             owner: test_owner(),
             acl_grants: AclGrants::default(),
@@ -3276,7 +3276,7 @@ fn mpu_get_missing_part_returns_part_not_found() {
             tags: None,
             metadata_blob: vec![].into(),
             system_metadata_blob: SerializedSystemMetadataBlob::default(),
-            initiator: None,
+            initiator: test_owner(),
 
             owner: test_owner(),
             acl_grants: AclGrants::default(),
@@ -3313,7 +3313,7 @@ fn mpu_set_upload_state_rejects_in_progress_target() {
             tags: None,
             metadata_blob: vec![].into(),
             system_metadata_blob: SerializedSystemMetadataBlob::default(),
-            initiator: None,
+            initiator: test_owner(),
 
             owner: test_owner(),
             acl_grants: AclGrants::default(),
@@ -3678,7 +3678,7 @@ fn create_upload(store: &dyn PgMetadataStore, upload_id: &str) {
             tags: None,
             metadata_blob: vec![].into(),
             system_metadata_blob: SerializedSystemMetadataBlob::default(),
-            initiator: None,
+            initiator: test_owner(),
 
             owner: test_owner(),
             acl_grants: AclGrants::default(),
@@ -5740,7 +5740,7 @@ fn upsert_multipart_part_segments_replaces_prior_segments() {
             tags: None,
             metadata_blob: vec![].into(),
             system_metadata_blob: SerializedSystemMetadataBlob::default(),
-            initiator: None,
+            initiator: test_owner(),
 
             owner: test_owner(),
             acl_grants: AclGrants::default(),
@@ -5830,7 +5830,7 @@ fn commit_stream_part_replaces_prior_segments_on_reupload() {
             tags: None,
             metadata_blob: vec![].into(),
             system_metadata_blob: SerializedSystemMetadataBlob::default(),
-            initiator: None,
+            initiator: test_owner(),
 
             owner: test_owner(),
             acl_grants: AclGrants::default(),
@@ -5978,7 +5978,7 @@ fn commit_stream_part_rejects_wrong_upload_id() {
             tags: None,
             metadata_blob: vec![].into(),
             system_metadata_blob: SerializedSystemMetadataBlob::default(),
-            initiator: None,
+            initiator: test_owner(),
 
             owner: test_owner(),
             acl_grants: AclGrants::default(),
@@ -6046,7 +6046,7 @@ fn commit_stream_part_zero_segments_clears_prior() {
             tags: None,
             metadata_blob: vec![].into(),
             system_metadata_blob: SerializedSystemMetadataBlob::default(),
-            initiator: None,
+            initiator: test_owner(),
 
             owner: test_owner(),
             acl_grants: AclGrants::default(),
@@ -6612,7 +6612,7 @@ fn commit_stream_part_rejects_mismatched_segment_part_number() {
             tags: None,
             metadata_blob: vec![].into(),
             system_metadata_blob: SerializedSystemMetadataBlob::default(),
-            initiator: None,
+            initiator: test_owner(),
 
             owner: test_owner(),
             acl_grants: AclGrants::default(),
@@ -6695,7 +6695,7 @@ fn commit_stream_part_rejects_non_staging_segment_version_id() {
             tags: None,
             metadata_blob: vec![].into(),
             system_metadata_blob: SerializedSystemMetadataBlob::default(),
-            initiator: None,
+            initiator: test_owner(),
 
             owner: test_owner(),
             acl_grants: AclGrants::default(),
@@ -7998,7 +7998,7 @@ fn delete_multipart_part_segments_by_upload_id_cleans_up() {
             tags: None,
             metadata_blob: vec![].into(),
             system_metadata_blob: SerializedSystemMetadataBlob::default(),
-            initiator: None,
+            initiator: test_owner(),
 
             owner: test_owner(),
             acl_grants: AclGrants::default(),
@@ -8708,7 +8708,7 @@ fn multipart_upload_object_lock_round_trip_and_commit_copies_state() {
             tags: None,
             metadata_blob: SerializedMetadataBlob::default(),
             system_metadata_blob: SerializedSystemMetadataBlob::default(),
-            initiator: None,
+            initiator: test_owner(),
             owner: test_owner(),
             acl_grants: AclGrants::default(),
             public_read: false,

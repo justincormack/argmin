@@ -13543,7 +13543,7 @@ impl<'a> StorageRpcDecoder<'a> {
             tags: self.read_optional_serialized_tag_set()?,
             metadata_blob: SerializedMetadataBlob::new(self.read_bytes()?.to_vec()),
             system_metadata_blob: SerializedSystemMetadataBlob::new(self.read_bytes()?.to_vec()),
-            initiator: self.read_optional_owner_identity()?,
+            initiator: self.read_owner_identity()?,
             owner: self.read_owner_identity()?,
             acl_grants: self.read_acl_grants()?,
             public_read: self.read_bool()?,
@@ -13551,18 +13551,6 @@ impl<'a> StorageRpcDecoder<'a> {
             checksum: self.read_optional_multipart_checksum_config()?,
             encryption: self.read_object_encryption()?,
         })
-    }
-
-    fn read_optional_owner_identity(
-        &mut self,
-    ) -> Result<Option<OwnerIdentity>, StorageRpcPayloadError> {
-        match self.read_u8()? {
-            0 => Ok(None),
-            1 => Ok(Some(self.read_owner_identity()?)),
-            _ => Err(StorageRpcPayloadError::InvalidObjectMetadataRequest(
-                "invalid optional owner identity tag",
-            )),
-        }
     }
 
     fn read_optional_multipart_checksum_config(
@@ -13693,7 +13681,7 @@ impl<'a> StorageRpcDecoder<'a> {
             tags: self.read_optional_serialized_tag_set()?,
             metadata_blob: SerializedMetadataBlob::new(self.read_bytes()?.to_vec()),
             system_metadata_blob: SerializedSystemMetadataBlob::new(self.read_bytes()?.to_vec()),
-            initiator: self.read_optional_owner_identity()?,
+            initiator: self.read_owner_identity()?,
             owner: self.read_owner_identity()?,
             acl_grants: self.read_acl_grants()?,
             public_read: self.read_bool()?,
@@ -13717,7 +13705,7 @@ impl<'a> StorageRpcDecoder<'a> {
             key: self.read_object_key()?,
             completion_order: self.read_u64()?,
             completed_at: self.read_u64()?,
-            initiator: self.read_optional_owner_identity()?,
+            initiator: self.read_owner_identity()?,
             owner: self.read_owner_identity()?,
         })
     }
@@ -16072,23 +16060,13 @@ fn put_create_multipart_upload_req(out: &mut Vec<u8>, request: &CreateMultipartU
     put_optional_string(out, request.tags.as_ref().map(|tags| tags.as_str()));
     put_bytes(out, request.metadata_blob.as_slice());
     put_bytes(out, request.system_metadata_blob.as_slice());
-    put_optional_owner_identity(out, request.initiator.as_ref());
+    put_owner_identity(out, &request.initiator);
     put_owner_identity(out, &request.owner);
     put_string(out, &request.acl_grants.serialized());
     put_bool(out, request.public_read);
     put_object_lock_state(out, request.object_lock);
     put_optional_multipart_checksum_config(out, request.checksum);
     put_object_encryption(out, &request.encryption);
-}
-
-fn put_optional_owner_identity(out: &mut Vec<u8>, owner: Option<&OwnerIdentity>) {
-    match owner {
-        None => put_u8(out, 0),
-        Some(owner) => {
-            put_u8(out, 1);
-            put_owner_identity(out, owner);
-        }
-    }
 }
 
 fn put_optional_multipart_checksum_config(
@@ -16132,7 +16110,7 @@ fn put_multipart_upload_record(out: &mut Vec<u8>, record: &MultipartUploadRecord
     put_optional_string(out, record.tags.as_ref().map(|tags| tags.as_str()));
     put_bytes(out, record.metadata_blob.as_slice());
     put_bytes(out, record.system_metadata_blob.as_slice());
-    put_optional_owner_identity(out, record.initiator.as_ref());
+    put_owner_identity(out, &record.initiator);
     put_owner_identity(out, &record.owner);
     put_string(out, &record.acl_grants.serialized());
     put_bool(out, record.public_read);
@@ -16151,7 +16129,7 @@ fn put_completed_multipart_upload_record(
     put_string(out, record.key.as_str());
     put_u64(out, record.completion_order);
     put_u64(out, record.completed_at);
-    put_optional_owner_identity(out, record.initiator.as_ref());
+    put_owner_identity(out, &record.initiator);
     put_owner_identity(out, &record.owner);
 }
 

@@ -256,7 +256,7 @@ fn multipart_upload_lifecycle() {
             tags: None,
             metadata_blob: vec![].into(),
             system_metadata_blob: SerializedSystemMetadataBlob::default(),
-            initiator: Some(test_owner()),
+            initiator: test_owner(),
 
             owner: test_owner(),
             acl_grants: AclGrants::default(),
@@ -431,7 +431,7 @@ fn streaming_upload_part_lifecycle() {
             tags: None,
             metadata_blob: vec![].into(),
             system_metadata_blob: SerializedSystemMetadataBlob::default(),
-            initiator: None,
+            initiator: test_owner(),
 
             owner: test_owner(),
             acl_grants: AclGrants::default(),
@@ -902,7 +902,7 @@ fn multipart_abort_cleanup() {
             tags: None,
             metadata_blob: vec![].into(),
             system_metadata_blob: SerializedSystemMetadataBlob::default(),
-            initiator: None,
+            initiator: test_owner(),
 
             owner: test_owner(),
             acl_grants: AclGrants::default(),
@@ -1195,7 +1195,7 @@ fn persistence_complex_state_through_reopen() {
                 tags: None,
                 metadata_blob: vec![].into(),
                 system_metadata_blob: SerializedSystemMetadataBlob::default(),
-                initiator: Some(test_owner()),
+                initiator: test_owner(),
 
                 owner: test_owner(),
                 acl_grants: AclGrants::default(),

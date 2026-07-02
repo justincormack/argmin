@@ -593,10 +593,7 @@ impl SharedStorageNode {
     /// serves any request. See `PgStore::recover` and the "PG Store Recovery
     /// Boundary" guide section. The caller supplies the owning node id; the
     /// recovery epoch is read from each store's own replica state.
-    pub(crate) fn recover_pg_metadata_command_state(
-        &self,
-        node_id: NodeId,
-    ) -> Result<(), StoreError> {
+    pub fn recover_pg_metadata_command_state(&self, node_id: NodeId) -> Result<(), StoreError> {
         let ctx = PgStoreRecoveryContext { node_id };
         for &pg_id in self.pg_id_list.iter() {
             self.get_pg(pg_id)?.recover(ctx)?;

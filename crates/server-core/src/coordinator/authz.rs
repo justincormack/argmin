@@ -427,8 +427,9 @@ impl Coordinator {
         Self::ensure_sse_c_allowed(bucket_info, req.encryption.sse_customer_request().is_some())?;
         let write_encryption = self.resolve_write_encryption(bucket_info, req.encryption)?;
         Self::ensure_put_object_write_acl_supported(bucket_info, &req.acl)?;
-        let initiator = Self::requester_owner_identity(req.object.requester());
         let owner = Self::effective_put_object_owner(bucket_info, req.object.requester(), &req.acl);
+        let initiator =
+            Self::requester_owner_identity(req.object.requester()).unwrap_or_else(|| owner.clone());
         let acl_grants = Self::object_acl_grants_for_put_object(bucket_info, &owner, &req.acl);
         let public_read = Self::acl_grants_public_read(&acl_grants);
         Self::validate_requested_object_lock_state(bucket_info, req.object_lock)?;
@@ -738,9 +739,7 @@ impl Coordinator {
     ) -> bool {
         Self::requester_can_bucket_owner_account_admin(requester, bucket)
             || Self::requester_matches_owner_identity(requester, &upload.owner)
-            || upload.initiator.as_ref().is_some_and(|initiator| {
-                Self::requester_matches_owner_identity(requester, initiator)
-            })
+            || Self::requester_matches_owner_identity(requester, &upload.initiator)
     }
 
     pub(super) fn requester_can_manage_completed_multipart_upload(
@@ -750,9 +749,7 @@ impl Coordinator {
     ) -> bool {
         Self::requester_can_bucket_owner_account_admin(requester, bucket)
             || Self::requester_matches_owner_identity(requester, &upload.owner)
-            || upload.initiator.as_ref().is_some_and(|initiator| {
-                Self::requester_matches_owner_identity(requester, initiator)
-            })
+            || Self::requester_matches_owner_identity(requester, &upload.initiator)
     }
 
     pub(super) fn requester_can_write_multipart_upload(

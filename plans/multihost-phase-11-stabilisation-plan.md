@@ -116,6 +116,29 @@ fix is local to one mutator.
 
 ### Work items
 
+Progress update:
+
+- `PgStore::recover` exists as an opened-store recovery boundary, and both
+  `StorageNodeServer::bind` and the local-cluster builder now call
+  `SharedStorageNode::recover_pg_metadata_command_state(node_id)` before serving PG state.
+  The control-plane-managed storage-node startup heartbeat path also runs the same recovery
+  immediately after its pre-bind `SharedStorageNode` open, before reading heartbeat state.
+  That pre-bind open now happens under a `StorageNodeDataDirGuard` that is transferred into
+  `StorageNodeServer::bind_with_data_dir_guard`, so startup recovery cannot mutate PG state
+  before the storage-node data-dir lock is held.
+- Recovery now repairs cache-only per-table digest drift after replay validation; a focused
+  regression corrupts only `metadata_table_digests`, verifies recovery refreshes the cache,
+  and then applies a later metadata command without tripping dirty cached digest detection.
+- Wiring recovery into `bind` exposed test fixtures and raw SQL setup paths that bypassed
+  command apply and left `metadata_command_replica_state.state_digest` stale. Those fixtures
+  now either use the command-apply path or explicitly refresh the digest after direct raw
+  setup. This is test-only cleanup; production recovery still fails closed on stale digest
+  state.
+- Multipart initiator identity is now required across storage records, metadata commands,
+  RPC payloads, and response/authz structs. The old nullable schema/open-time owner-identity
+  migration and storage-side `None => owner` fallback were removed because they could mutate
+  materialised rows on reopen and make caller semantics unclear.
+
 1. **Define recovery semantics explicitly.** Document, in
    [`guides/storage-cluster-invariants.md`](../guides/storage-cluster-invariants.md), that
    opening a PG store is a recovery boundary and state which anomaly classes fail closed
