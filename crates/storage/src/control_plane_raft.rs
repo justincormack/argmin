@@ -66,6 +66,12 @@ pub struct ControlPlaneRaftPeerFrameIdentity {
     pub target: ControlPlaneRaftNodeId,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ControlPlaneRaftPeerFrameKind {
+    OrdinaryRpc,
+    Snapshot,
+}
+
 impl ControlPlaneRaftPeerFrameIdentity {
     #[must_use]
     pub fn new(
@@ -4442,6 +4448,47 @@ pub async fn handle_control_plane_raft_peer_snapshot_frame(
     .await
 }
 
+pub async fn handle_control_plane_raft_peer_unix_stream(
+    raft: &Raft<ControlPlaneRaftTypeConfig, ControlPlaneRaftStateMachine>,
+    stream: &mut UnixStream,
+    frame_kind: ControlPlaneRaftPeerFrameKind,
+    limits: ControlPlaneRaftPeerTransportLimits,
+    expected_identity: &ControlPlaneRaftPeerFrameIdentity,
+    io_timeout: Duration,
+) -> Result<(), ControlPlaneError> {
+    stream
+        .set_read_timeout(Some(io_timeout))
+        .map_err(|source| ControlPlaneError::Io {
+            context: "set control-plane OpenRaft peer stream read timeout",
+            source,
+        })?;
+    stream
+        .set_write_timeout(Some(io_timeout))
+        .map_err(|source| ControlPlaneError::Io {
+            context: "set control-plane OpenRaft peer stream write timeout",
+            source,
+        })?;
+    let request_frame =
+        read_control_plane_raft_peer_transport_frame(stream, limits.max_frame_bytes)?;
+    let response_frame = match frame_kind {
+        ControlPlaneRaftPeerFrameKind::OrdinaryRpc => {
+            handle_control_plane_raft_peer_rpc_frame(raft, &request_frame, expected_identity)
+                .await?
+        }
+        ControlPlaneRaftPeerFrameKind::Snapshot => {
+            handle_control_plane_raft_peer_snapshot_frame(
+                raft,
+                &request_frame,
+                limits.max_frame_bytes,
+                limits.max_snapshot_bytes,
+                expected_identity,
+            )
+            .await?
+        }
+    };
+    write_control_plane_raft_peer_transport_frame(stream, &response_frame)
+}
+
 async fn handle_control_plane_raft_peer_snapshot_frame_with_identity(
     raft: &Raft<ControlPlaneRaftTypeConfig, ControlPlaneRaftStateMachine>,
     frame: &[u8],
@@ -6164,7 +6211,7 @@ impl RaftStateMachine<ControlPlaneRaftTypeConfig> for ControlPlaneRaftStateMachi
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
     use std::future::Future;
-    use std::os::unix::net::UnixListener;
+    use std::os::unix::net::{UnixListener, UnixStream};
     use std::sync::{
         atomic::{AtomicUsize, Ordering},
         Arc,
@@ -7764,6 +7811,133 @@ mod tests {
             ));
             server.join().unwrap();
             let _ = std::fs::remove_file(socket_path);
+        });
+    }
+
+    #[test]
+    fn control_plane_raft_peer_unix_stream_handler_dispatches_vote() {
+        ControlPlaneRaftTypeConfig::run(async {
+            let authority = ControlPlaneRaftAuthority::new_experimental_single_node_in_memory(
+                "control-plane-raft-unix-peer-handler-vote-test",
+                2,
+            )
+            .await
+            .unwrap();
+            authority
+                .initialize_single_node_membership(2)
+                .await
+                .unwrap();
+            let (mut server_stream, mut client_stream) = UnixStream::pair().unwrap();
+            let limits = ControlPlaneRaftPeerTransportLimits {
+                max_frame_bytes: 4096,
+                max_append_entries: 8,
+                max_append_entries_bytes: 4096,
+                max_snapshot_bytes: 4096,
+            };
+            let request_identity =
+                ControlPlaneRaftPeerFrameIdentity::new("control-plane-raft-unix-handler", 1, 2);
+            let client_identity = request_identity.clone();
+            let client = thread::spawn(move || {
+                let request = ControlPlaneRaftPeerRpcRequest::Vote(VoteRequest {
+                    vote: Vote::<ControlPlaneRaftLeaderId>::new(3, 1),
+                    last_log_id: None,
+                    leadership_transfer: false,
+                });
+                let request_frame = request.encode_frame_for_peer(&client_identity).unwrap();
+                write_control_plane_raft_peer_transport_frame(&mut client_stream, &request_frame)
+                    .unwrap();
+                let response_frame = read_control_plane_raft_peer_transport_frame(
+                    &mut client_stream,
+                    limits.max_frame_bytes,
+                )
+                .unwrap();
+                ControlPlaneRaftPeerRpcResponse::decode_frame_for_peer(
+                    &response_frame,
+                    &reverse_raft_peer_frame_identity(&client_identity),
+                )
+                .unwrap()
+            });
+
+            handle_control_plane_raft_peer_unix_stream(
+                authority.raft(),
+                &mut server_stream,
+                ControlPlaneRaftPeerFrameKind::OrdinaryRpc,
+                limits,
+                &request_identity,
+                Duration::from_secs(1),
+            )
+            .await
+            .unwrap();
+
+            let response = client.join().unwrap();
+            assert!(matches!(response, ControlPlaneRaftPeerRpcResponse::Vote(_)));
+        });
+    }
+
+    #[test]
+    fn control_plane_raft_peer_unix_stream_handler_dispatches_snapshot() {
+        ControlPlaneRaftTypeConfig::run(async {
+            let authority = ControlPlaneRaftAuthority::new_experimental_single_node_in_memory(
+                "control-plane-raft-unix-peer-handler-snapshot-test",
+                2,
+            )
+            .await
+            .unwrap();
+            authority
+                .initialize_single_node_membership(2)
+                .await
+                .unwrap();
+            let mut state_machine = ControlPlaneRaftStateMachine::empty();
+            state_machine
+                .apply_entry(bootstrap_membership_entry(1))
+                .unwrap();
+            let snapshot = state_machine.build_snapshot().unwrap();
+            let (mut server_stream, mut client_stream) = UnixStream::pair().unwrap();
+            let limits = ControlPlaneRaftPeerTransportLimits {
+                max_frame_bytes: 8192,
+                max_append_entries: 8,
+                max_append_entries_bytes: 4096,
+                max_snapshot_bytes: 8192,
+            };
+            let request_identity =
+                ControlPlaneRaftPeerFrameIdentity::new("control-plane-raft-unix-handler", 1, 2);
+            let client_identity = request_identity.clone();
+            let client = thread::spawn(move || {
+                let request = ControlPlaneRaftPeerSnapshotRequest {
+                    vote: Vote::<ControlPlaneRaftLeaderId>::new_committed(3, 1),
+                    snapshot,
+                };
+                let request_frame = request.encode_frame_for_peer(&client_identity).unwrap();
+                write_control_plane_raft_peer_transport_frame(&mut client_stream, &request_frame)
+                    .unwrap();
+                let response_frame = read_control_plane_raft_peer_transport_frame(
+                    &mut client_stream,
+                    limits.max_frame_bytes,
+                )
+                .unwrap();
+                ControlPlaneRaftPeerSnapshotResponse::decode_frame_for_peer(
+                    &response_frame,
+                    &reverse_raft_peer_frame_identity(&client_identity),
+                )
+                .unwrap()
+            });
+
+            handle_control_plane_raft_peer_unix_stream(
+                authority.raft(),
+                &mut server_stream,
+                ControlPlaneRaftPeerFrameKind::Snapshot,
+                limits,
+                &request_identity,
+                Duration::from_secs(1),
+            )
+            .await
+            .unwrap();
+
+            let response = client.join().unwrap();
+            assert_eq!(
+                response.response.vote,
+                Vote::<ControlPlaneRaftLeaderId>::new_committed(3, 1)
+            );
         });
     }
 

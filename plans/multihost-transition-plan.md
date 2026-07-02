@@ -10373,6 +10373,12 @@ Phase 12.3 progress:
   traffic. A focused socket round-trip regression pins request/response
   identity validation for vote RPCs; process listener wiring remains the next
   layer.
+- Added a reusable Unix-stream peer handler for the listener side. The handler
+  sets explicit IO timeouts, reads one bounded peer frame, dispatches either an
+  ordinary Raft RPC or full-snapshot request through the same identity-validating
+  server dispatcher, and writes the framed response. Socket-pair regressions
+  cover both ordinary vote RPC and snapshot dispatch, leaving process accept
+  loop wiring as the next integration layer.
 
 1. define the replicated control-plane state machine:
    - state includes cluster epoch, PG count, PG state, PG acting sets, node
