@@ -10046,6 +10046,10 @@ Phase 12.1 progress:
   authority. `UnixControlPlaneClient::set_pg_acting_set` now has a process
   adapter smoke that verifies the replicated command bumps the epoch and leaves
   the PG in Peering on the requested acting set.
+- Added fail-closed Unix RPC coverage for deterministic command rejection
+  through the experimental authority. A malformed acting-set request for an
+  unknown node now returns the existing remote control-plane error through the
+  process adapter and leaves the replicated snapshot unchanged.
 - Added Unix RPC coverage for the experimental metadata-transfer admin path.
   The smoke drives a source PG active through Raft heartbeats, fences it through
   `FencePgForMetadataTransferRuntimeMap`, then installs a destination acting set
