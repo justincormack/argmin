@@ -10247,6 +10247,58 @@ Phase 12.2 closeout:
   read semantics, upgrade/migration compatibility, and removing or replacing
   the temporary `ARGMIN_CONTROL_PLANE_EXPERIMENTAL_RAFT` flag.
 
+Phase 12.3 proposed scope:
+
+- Move the experimental durable OpenRaft authority from single-process,
+  single-node operation to a multi-process control-plane Raft cluster. Keep the
+  slice experimental and do not cut production traffic over from the existing
+  single-authority path.
+- Define the control-plane Raft peer RPC boundary for OpenRaft append-entries,
+  vote, and install-snapshot traffic. Frames must be bounded, versioned or
+  otherwise fail-closed for incompatible peers, have explicit timeouts, and
+  return typed retry/not-leader/unavailable errors. Peer RPCs must not expose
+  ad hoc state-machine internals across nodes.
+- Run multiple durable OpenRaft authorities as distinct process-level
+  instances. Each control-plane peer has its own Raft node id, durable state
+  path, endpoint, and configured peer set. Startup must reject local durable
+  state whose node id, cluster identity, or membership shape does not match the
+  process configuration.
+- Add the first leader-routed control-plane client behavior over the
+  multi-node cluster. Admin commands should reach the current leader or receive
+  a typed redirect/not-leader result; runtime-map read-index calls should be
+  served only by the current serving leader; followers must not publish
+  authority-bearing runtime maps as current.
+- Exercise replication and failover in tests: bootstrap a three-node
+  experimental control-plane group, commit a command on the leader, verify
+  followers apply it, stop the leader, elect a new leader, commit another
+  command, restart the old leader, and verify it catches up before serving.
+- Exercise restart recovery for both follower and leader roles. Restarted
+  peers must restore vote/log/committed/applied/membership/snapshot state from
+  their own durable artifacts, then rejoin without regressing cluster epoch,
+  node membership, PG acting sets, metadata-transfer markers, or runtime-map
+  freshness proofs.
+- Exercise snapshot transfer over the Raft transport. Force a leader snapshot
+  and compaction point, bring back a lagging follower whose retained log prefix
+  is no longer sufficient, and verify it catches up through install-snapshot
+  plus retained suffix replay.
+- Add identity hooks at the peer boundary, while keeping full production
+  authentication for a later slice if it grows large. A peer must reject a
+  mismatched node id, wrong cluster identity, wrong configured endpoint, or
+  role-inappropriate RPC before trusting the message. Full mTLS or equivalent
+  internal authentication remains Phase 12.4/prod-cutover work if needed.
+- Keep out of scope for 12.3: production cutover, lease-read optimization,
+  full authenticated remote control-plane/storage/frontend RPC security,
+  upgrade/migration compatibility, and removing or replacing
+  `ARGMIN_CONTROL_PLANE_EXPERIMENTAL_RAFT`.
+
+Phase 12.3 exit criteria:
+
+- A three-node experimental durable OpenRaft control-plane cluster can
+  replicate control-plane commands, fail over leadership, restart individual
+  peers, catch up by retained log or installed snapshot, and serve
+  authority-bearing command/read/status operations only through the current
+  leader.
+
 1. define the replicated control-plane state machine:
    - state includes cluster epoch, PG count, PG state, PG acting sets, node
      membership, node incarnation/endpoint/liveness metadata, retained
