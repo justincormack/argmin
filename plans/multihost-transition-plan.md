@@ -10216,7 +10216,11 @@ Phase 12.2 progress:
   durable active-PG artifact and serves the real frontend runtime-map refresh
   loop over the Unix control-plane RPC, proving that startup bootstrap and a
   subsequent refresh-loop pass both read from the restarted durable Raft
-  authority.
+  authority. A rejection-path durable restart test now submits a semantic
+  acting-set admin rejection, verifies the cluster snapshot remains unchanged
+  while the applied/committed Raft cursor advances, restarts from the same
+  state file, and verifies the rejected entry remains part of the durable
+  applied prefix without mutating control-plane state.
 
 1. define the replicated control-plane state machine:
    - state includes cluster epoch, PG count, PG state, PG acting sets, node

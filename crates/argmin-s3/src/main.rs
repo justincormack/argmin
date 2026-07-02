@@ -3828,6 +3828,79 @@ mod tests {
     }
 
     #[test]
+    fn experimental_raft_control_plane_durable_restart_preserves_rejected_admin_entry() {
+        let state_dir = short_unix_socket_test_dir("experimental-raft-durable-reject");
+        let _ = fs::remove_dir_all(&state_dir);
+        fs::create_dir_all(&state_dir).unwrap();
+        let state_path = state_dir.join("control-plane.state");
+        let mut config = test_server_config();
+        config.storage_node_sockets = vec![config::ConfiguredStorageNodeSocket {
+            node_id: 1,
+            socket_path: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
+        }];
+        config.storage_pg_ids = vec![19];
+
+        let mut harness =
+            experimental_raft_durable_test_harness("reject-before-restart", &state_path);
+        bootstrap_empty_experimental_raft_control_plane(&mut harness.control_plane, &config)
+            .expect("durable experimental raft control-plane bootstrap should succeed");
+        let before = harness
+            .control_plane
+            .current_snapshot()
+            .expect("durable experimental snapshot should read before rejected admin command");
+        let before_status = harness
+            .runtime
+            .block_on(harness.authority.status())
+            .expect("durable experimental status should read before rejection");
+        let before_applied_index = before_status
+            .applied_index()
+            .expect("bootstrapped durable authority should have an applied index");
+
+        let error = harness
+            .control_plane
+            .set_pg_acting_set(PgId::new(19), vec![NodeId::new(99)])
+            .expect_err("durable rejected admin command should return the semantic error");
+        assert!(error
+            .to_string()
+            .contains("PG 19 acting set references unknown node 99"));
+        let after = harness
+            .control_plane
+            .current_snapshot()
+            .expect("durable experimental snapshot should read after rejected admin command");
+        assert_eq!(after, before);
+        let after_status = harness
+            .runtime
+            .block_on(harness.authority.status())
+            .expect("durable experimental status should read after rejection");
+        let after_applied_index = after_status
+            .applied_index()
+            .expect("rejected command should still advance the applied index");
+        assert!(after_applied_index > before_applied_index);
+        assert_eq!(after_status.committed_index(), Some(after_applied_index));
+        assert!(state_path.exists());
+        harness.shutdown();
+
+        let mut restarted =
+            experimental_raft_durable_test_harness("reject-after-restart", &state_path);
+        bootstrap_empty_experimental_raft_control_plane(&mut restarted.control_plane, &config)
+            .expect("durable experimental raft control-plane restart bootstrap should be a no-op");
+        let restored = restarted
+            .control_plane
+            .current_snapshot()
+            .expect("durable experimental snapshot should read after rejected-entry restart");
+        assert_eq!(restored, before);
+        let restored_status = restarted
+            .runtime
+            .block_on(restarted.authority.status())
+            .expect("restarted durable experimental status should read");
+        assert_eq!(restored_status.applied_index(), Some(after_applied_index));
+        assert_eq!(restored_status.committed_index(), Some(after_applied_index));
+
+        restarted.shutdown();
+        fs::remove_dir_all(&state_dir).unwrap();
+    }
+
+    #[test]
     fn experimental_raft_control_plane_serves_unix_metadata_transfer_admin() {
         let mut harness = experimental_raft_test_harness("unix-transfer-admin-test");
         let mut config = test_server_config();
