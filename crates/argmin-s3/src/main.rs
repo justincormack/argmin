@@ -2502,8 +2502,8 @@ mod tests {
     use auth::SecretKey;
     use config::SecretConfigValue;
     use storage::control_plane::{
-        handle_control_plane_unix_stream, ControlPlaneHeartbeatSink, NodeHeartbeat,
-        NodeMembershipState, NodePgHeartbeatObservation, PgMetadataProof,
+        handle_control_plane_unix_stream, ControlPlaneHeartbeatSink, NodeAvailabilityState,
+        NodeHeartbeat, NodeMembershipState, NodePgHeartbeatObservation, PgMetadataProof,
     };
 
     fn short_unix_socket_test_dir(name: &str) -> PathBuf {
@@ -2763,6 +2763,135 @@ mod tests {
         let active_route = &active_refresh.runtime_map().pg_routes()[0];
         assert_eq!(active_route.state(), PgState::Active);
         assert_eq!(active_route.primary_lease_deadline_ms(), Some(20_800));
+
+        harness.shutdown();
+    }
+
+    #[test]
+    fn experimental_raft_control_plane_expires_heartbeat_leases() {
+        let mut harness = experimental_raft_test_harness("lease-expiry-test");
+        let mut config = test_server_config();
+        config.storage_node_sockets = vec![config::ConfiguredStorageNodeSocket {
+            node_id: 1,
+            socket_path: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
+        }];
+        config.storage_pg_ids = vec![17];
+        bootstrap_empty_experimental_raft_control_plane(&mut harness.control_plane, &config)
+            .expect("experimental raft control-plane bootstrap should succeed");
+
+        let bootstrap_epoch = harness
+            .control_plane
+            .current_snapshot()
+            .expect("experimental snapshot should read")
+            .cluster_epoch();
+        harness
+            .control_plane
+            .refresh_node_heartbeat(
+                NodeHeartbeat {
+                    node_id: NodeId::new(1),
+                    node_incarnation: 1,
+                    endpoint: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
+                    observed_epoch: bootstrap_epoch,
+                    requested_lease_duration_ms: 500,
+                    cluster_map_history_reference_summary:
+                        storage::PgClusterMapHistoryReferenceSummary::default(),
+                    pg_observations: Vec::new(),
+                },
+                50_000,
+            )
+            .expect("experimental raft startup heartbeat should refresh");
+        let peering_epoch = harness
+            .control_plane
+            .current_snapshot()
+            .expect("experimental snapshot should read after startup heartbeat")
+            .cluster_epoch();
+        let proof = PgMetadataProof::new(92, 0x1234, 0x5678);
+        harness
+            .control_plane
+            .refresh_node_heartbeat(
+                NodeHeartbeat {
+                    node_id: NodeId::new(1),
+                    node_incarnation: 1,
+                    endpoint: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
+                    observed_epoch: peering_epoch,
+                    requested_lease_duration_ms: 600,
+                    cluster_map_history_reference_summary:
+                        storage::PgClusterMapHistoryReferenceSummary::default(),
+                    pg_observations: vec![NodePgHeartbeatObservation {
+                        pg_id: PgId::new(17),
+                        state: PgState::Peering,
+                        metadata_proof: proof,
+                        has_pending_metadata_command: false,
+                    }],
+                },
+                50_100,
+            )
+            .expect("experimental raft peering heartbeat should refresh");
+        let active_epoch = harness
+            .control_plane
+            .current_snapshot()
+            .expect("experimental snapshot should read after peering completion")
+            .cluster_epoch();
+        let active_refresh = harness
+            .control_plane
+            .refresh_node_heartbeat(
+                NodeHeartbeat {
+                    node_id: NodeId::new(1),
+                    node_incarnation: 1,
+                    endpoint: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
+                    observed_epoch: active_epoch,
+                    requested_lease_duration_ms: 700,
+                    cluster_map_history_reference_summary:
+                        storage::PgClusterMapHistoryReferenceSummary::default(),
+                    pg_observations: vec![NodePgHeartbeatObservation {
+                        pg_id: PgId::new(17),
+                        state: PgState::Active,
+                        metadata_proof: proof,
+                        has_pending_metadata_command: false,
+                    }],
+                },
+                50_200,
+            )
+            .expect("experimental raft active heartbeat should refresh");
+        assert_eq!(active_refresh.lease().lease_deadline_ms(), 50_900);
+        let active_snapshot = harness
+            .control_plane
+            .current_snapshot()
+            .expect("experimental active snapshot should read");
+        let active_cluster_epoch = active_snapshot.cluster_epoch();
+        assert_eq!(
+            active_snapshot.pg(PgId::new(17)).unwrap().state(),
+            PgState::Active
+        );
+
+        let no_expiry = harness
+            .control_plane
+            .expire_heartbeat_leases(50_899)
+            .expect("pre-deadline expiry should apply as a no-op");
+        assert_eq!(no_expiry, (active_cluster_epoch, 0, 0));
+
+        let expiry = harness
+            .control_plane
+            .expire_heartbeat_leases(50_900)
+            .expect("deadline expiry should apply through raft");
+        assert!(expiry.0 > active_cluster_epoch);
+        assert_eq!(expiry.1, 1);
+        assert_eq!(expiry.2, 1);
+        let expired_snapshot = harness
+            .control_plane
+            .current_snapshot()
+            .expect("experimental expired snapshot should read");
+        let node = expired_snapshot
+            .node(NodeId::new(1))
+            .expect("expired node should remain recorded");
+        assert_eq!(node.availability(), NodeAvailabilityState::Unavailable);
+        assert_eq!(node.lease_deadline_ms(), None);
+        let pg = expired_snapshot
+            .pg(PgId::new(17))
+            .expect("expired PG should remain recorded");
+        assert_eq!(pg.state(), PgState::Peering);
+        assert_eq!(pg.active_primary(), None);
+        assert_eq!(pg.peering_metadata_proof_floor(), Some(proof));
 
         harness.shutdown();
     }

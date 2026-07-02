@@ -10043,6 +10043,10 @@ Phase 12.1 progress:
   `FencePgForMetadataTransferRuntimeMap`, then installs a destination acting set
   through `SetPgActingSetWithMetadataTransferRuntimeMap`, proving both admin
   RPCs cross the process adapter and persist the transfer marker through Raft.
+- Added direct experimental Raft coverage for heartbeat lease expiry. The smoke
+  first proves a pre-deadline scan is a replicated no-op, then expires the lease
+  at the committed deadline and verifies the node becomes unavailable, the lease
+  is cleared, and the active PG moves back to Peering with its metadata floor.
 
 1. define the replicated control-plane state machine:
    - state includes cluster epoch, PG count, PG state, PG acting sets, node
