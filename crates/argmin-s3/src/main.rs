@@ -2502,8 +2502,8 @@ mod tests {
     use auth::SecretKey;
     use config::SecretConfigValue;
     use storage::control_plane::{
-        ControlPlaneHeartbeatSink, NodeHeartbeat, NodeMembershipState, NodePgHeartbeatObservation,
-        PgMetadataProof,
+        handle_control_plane_unix_stream, ControlPlaneHeartbeatSink, NodeHeartbeat,
+        NodeMembershipState, NodePgHeartbeatObservation, PgMetadataProof,
     };
 
     fn short_unix_socket_test_dir(name: &str) -> PathBuf {
@@ -2607,6 +2607,23 @@ mod tests {
             authority,
             control_plane,
         }
+    }
+
+    fn spawn_experimental_raft_unix_rpc_server(
+        harness: &ExperimentalRaftTestHarness,
+        socket_path: &Path,
+        authority_now_ms: u64,
+    ) -> std::thread::JoinHandle<()> {
+        let listener = std::os::unix::net::UnixListener::bind(socket_path).unwrap();
+        let mut control_plane = ExperimentalRaftControlPlane {
+            runtime: harness.runtime.handle().clone(),
+            authority: Arc::clone(&harness.authority),
+        };
+        std::thread::spawn(move || {
+            let (mut stream, _addr) = listener.accept().unwrap();
+            handle_control_plane_unix_stream(&mut control_plane, &mut stream, authority_now_ms)
+                .unwrap();
+        })
     }
 
     #[test]
@@ -2747,6 +2764,90 @@ mod tests {
         assert_eq!(active_route.state(), PgState::Active);
         assert_eq!(active_route.primary_lease_deadline_ms(), Some(20_800));
 
+        harness.shutdown();
+    }
+
+    #[test]
+    fn experimental_raft_control_plane_serves_unix_heartbeat_refresh() {
+        let mut harness = experimental_raft_test_harness("unix-heartbeat-test");
+        let mut config = test_server_config();
+        config.storage_node_sockets = vec![config::ConfiguredStorageNodeSocket {
+            node_id: 1,
+            socket_path: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
+        }];
+        config.storage_pg_ids = vec![9];
+        bootstrap_empty_experimental_raft_control_plane(&mut harness.control_plane, &config)
+            .expect("experimental raft control-plane bootstrap should succeed");
+
+        let bootstrap_epoch = harness
+            .control_plane
+            .current_snapshot()
+            .expect("experimental snapshot should read")
+            .cluster_epoch();
+        let tmp = short_unix_socket_test_dir("experimental-raft-unix-heartbeat");
+        std::fs::create_dir_all(&tmp).unwrap();
+        let socket_path = tmp.join("control-plane.sock");
+        let startup_server =
+            spawn_experimental_raft_unix_rpc_server(&harness, &socket_path, 30_000);
+        let mut client = UnixControlPlaneClient::new(&socket_path);
+        let startup_refresh = client
+            .refresh_node_heartbeat(
+                NodeHeartbeat {
+                    node_id: NodeId::new(1),
+                    node_incarnation: 1,
+                    endpoint: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
+                    observed_epoch: bootstrap_epoch,
+                    requested_lease_duration_ms: 500,
+                    cluster_map_history_reference_summary:
+                        storage::PgClusterMapHistoryReferenceSummary::default(),
+                    pg_observations: Vec::new(),
+                },
+                0,
+            )
+            .expect("Unix heartbeat refresh should succeed");
+        startup_server.join().unwrap();
+        assert_eq!(startup_refresh.lease().lease_deadline_ms(), 30_500);
+
+        std::fs::remove_file(&socket_path).unwrap();
+        let peering_epoch = harness
+            .control_plane
+            .current_snapshot()
+            .expect("experimental snapshot should read after startup heartbeat")
+            .cluster_epoch();
+        let proof = PgMetadataProof::new(77, 0x123, 0x456);
+        let peering_server =
+            spawn_experimental_raft_unix_rpc_server(&harness, &socket_path, 30_100);
+        let mut client = UnixControlPlaneClient::new(&socket_path);
+        let peering_refresh = client
+            .refresh_node_heartbeat(
+                NodeHeartbeat {
+                    node_id: NodeId::new(1),
+                    node_incarnation: 1,
+                    endpoint: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
+                    observed_epoch: peering_epoch,
+                    requested_lease_duration_ms: 600,
+                    cluster_map_history_reference_summary:
+                        storage::PgClusterMapHistoryReferenceSummary::default(),
+                    pg_observations: vec![NodePgHeartbeatObservation {
+                        pg_id: PgId::new(9),
+                        state: PgState::Peering,
+                        metadata_proof: proof,
+                        has_pending_metadata_command: false,
+                    }],
+                },
+                0,
+            )
+            .expect("Unix Peering heartbeat refresh should succeed");
+        peering_server.join().unwrap();
+        assert_eq!(peering_refresh.lease().lease_deadline_ms(), 30_700);
+        let route = &peering_refresh.runtime_map().pg_routes()[0];
+        assert_eq!(route.pg_id(), PgId::new(9));
+        assert_eq!(route.state(), PgState::Active);
+        assert_eq!(route.primary_node_id(), NodeId::new(1));
+        assert_eq!(route.primary_lease_deadline_ms(), Some(30_700));
+
+        std::fs::remove_file(&socket_path).unwrap();
+        std::fs::remove_dir_all(&tmp).unwrap();
         harness.shutdown();
     }
 

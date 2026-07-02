@@ -10029,6 +10029,11 @@ Phase 12.1 progress:
   incarnation/endpoint epoch bump, a subsequent Peering observation that commits
   `CompleteReadyPgPeerings` through OpenRaft, and the follow-up Active
   heartbeat/runtime-map handoff.
+- Added a Unix RPC smoke for the same experimental authority. It serves
+  `UnixControlPlaneClient::refresh_node_heartbeat` through the existing
+  control-plane wire protocol with deterministic authority timestamps, proving
+  the process-mode adapter works across the actual storage-node/front-end RPC
+  framing rather than only through direct in-process trait calls.
 
 1. define the replicated control-plane state machine:
    - state includes cluster epoch, PG count, PG state, PG acting sets, node
