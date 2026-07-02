@@ -5825,6 +5825,15 @@ mod tests {
         amz_content_sha256: String,
     }
 
+    struct SignedStreamingHeaders {
+        authorization: String,
+        amz_date: String,
+        amz_content_sha256: &'static str,
+        signing_key: [u8; 32],
+        seed_signature: String,
+        scope: String,
+    }
+
     fn sign_headers(
         method: &str,
         uri: &str,
@@ -5894,6 +5903,176 @@ mod tests {
             amz_date: date_long,
             amz_content_sha256: content_sha256,
         }
+    }
+
+    fn sign_streaming_headers(
+        method: &str,
+        uri: &str,
+        host: &str,
+        decoded_content_length: usize,
+        extra_headers: &[(&str, &str)],
+    ) -> SignedStreamingHeaders {
+        let secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let days = secs / 86400;
+        let (year, month, day) = days_to_ymd(days);
+        let time_of_day = secs % 86400;
+        let hour = time_of_day / 3600;
+        let minute = (time_of_day % 3600) / 60;
+        let second = time_of_day % 60;
+        let date_long = format!(
+            "{:04}{:02}{:02}T{:02}{:02}{:02}Z",
+            year, month, day, hour, minute, second
+        );
+        let date_short = &date_long[..8];
+        let content_sha256 = "STREAMING-AWS4-HMAC-SHA256-PAYLOAD";
+        let decoded_content_length = decoded_content_length.to_string();
+        let (path, query) = uri.split_once('?').unwrap_or((uri, ""));
+        let mut signed_header_pairs = vec![
+            ("content-encoding", "aws-chunked"),
+            ("host", host),
+            ("x-amz-content-sha256", content_sha256),
+            ("x-amz-date", date_long.as_str()),
+            (
+                "x-amz-decoded-content-length",
+                decoded_content_length.as_str(),
+            ),
+        ];
+        signed_header_pairs.extend_from_slice(extra_headers);
+        signed_header_pairs.sort_by_key(|(name, _)| *name);
+
+        let signed_headers = signed_header_pairs
+            .iter()
+            .map(|(name, _)| *name)
+            .collect::<Vec<_>>()
+            .join(";");
+        let canonical_headers = canonical_headers(&signed_header_pairs);
+        let canonical_request = canonical_request(
+            method,
+            path,
+            &canonical_query_string(query),
+            &canonical_headers,
+            &signed_headers,
+            content_sha256,
+        );
+        let canonical_hash = sha256_hex(canonical_request.as_bytes());
+        let scope = format!("{}/us-east-1/s3/aws4_request", date_short);
+        let string_to_sign = string_to_sign(&date_long, &scope, &canonical_hash);
+        let signing_key = derive_signing_key(
+            &auth::SecretKey::new(TEST_SECRET_KEY.to_string()),
+            date_short,
+            "us-east-1",
+            "s3",
+        );
+        let signature = hmac_sha256(signing_key.as_ref(), string_to_sign.as_bytes());
+        let seed_signature = hex_encode(signature.as_ref());
+        let authorization = format!(
+            "AWS4-HMAC-SHA256 Credential={}/{}, SignedHeaders={}, Signature={}",
+            TEST_ACCESS_KEY, scope, signed_headers, seed_signature
+        );
+        let mut signing_key_bytes = [0u8; 32];
+        signing_key_bytes.copy_from_slice(signing_key.as_ref());
+
+        SignedStreamingHeaders {
+            authorization,
+            amz_date: date_long,
+            amz_content_sha256: content_sha256,
+            signing_key: signing_key_bytes,
+            seed_signature,
+            scope,
+        }
+    }
+
+    fn chunk_signature(
+        signing_key: &[u8],
+        timestamp: &str,
+        scope: &str,
+        prev_sig: &str,
+        chunk_data: &[u8],
+    ) -> String {
+        let empty_hash = sha256_hex(b"");
+        let chunk_hash = sha256_hex(chunk_data);
+        let string_to_sign = format!(
+            "AWS4-HMAC-SHA256-PAYLOAD\n{timestamp}\n{scope}\n{prev_sig}\n{empty_hash}\n{chunk_hash}"
+        );
+        hex_encode(hmac_sha256(signing_key, string_to_sign.as_bytes()).as_ref())
+    }
+
+    fn build_signed_chunked_body(sign: &SignedStreamingHeaders, data: &[u8]) -> Vec<u8> {
+        let chunk_sig = chunk_signature(
+            &sign.signing_key,
+            &sign.amz_date,
+            &sign.scope,
+            &sign.seed_signature,
+            data,
+        );
+        let terminal_sig = chunk_signature(
+            &sign.signing_key,
+            &sign.amz_date,
+            &sign.scope,
+            &chunk_sig,
+            b"",
+        );
+
+        let mut wire = Vec::new();
+        wire.extend_from_slice(
+            format!("{:x};chunk-signature={chunk_sig}\r\n", data.len()).as_bytes(),
+        );
+        wire.extend_from_slice(data);
+        wire.extend_from_slice(b"\r\n");
+        wire.extend_from_slice(format!("0;chunk-signature={terminal_sig}\r\n\r\n").as_bytes());
+        wire
+    }
+
+    fn build_signed_chunked_body_with_bad_terminal_signature(
+        sign: &SignedStreamingHeaders,
+        data: &[u8],
+    ) -> Vec<u8> {
+        let chunk_sig = chunk_signature(
+            &sign.signing_key,
+            &sign.amz_date,
+            &sign.scope,
+            &sign.seed_signature,
+            data,
+        );
+
+        let mut wire = Vec::new();
+        wire.extend_from_slice(
+            format!("{:x};chunk-signature={chunk_sig}\r\n", data.len()).as_bytes(),
+        );
+        wire.extend_from_slice(data);
+        wire.extend_from_slice(b"\r\n");
+        wire.extend_from_slice(format!("0;chunk-signature={}\r\n\r\n", "0".repeat(64)).as_bytes());
+        wire
+    }
+
+    fn send_raw_http_request(addr: &str, request: &str, body: &[u8]) -> String {
+        let mut stream = StdTcpStream::connect(addr).unwrap();
+        stream.write_all(request.as_bytes()).unwrap();
+        stream.write_all(body).unwrap();
+        read_http_response(&mut stream, Duration::from_secs(5))
+    }
+
+    fn assert_signed_head_not_found(addr: &str, bucket: &str, key: &str) {
+        let uri = format!("/{bucket}/{key}");
+        let signed = sign_headers("HEAD", &uri, addr, &[], &[]);
+        let request = format!(
+            "HEAD {uri} HTTP/1.1\r\n\
+Host: {addr}\r\n\
+Authorization: {}\r\n\
+x-amz-date: {}\r\n\
+x-amz-content-sha256: {}\r\n\
+Connection: close\r\n\r\n",
+            signed.authorization, signed.amz_date, signed.amz_content_sha256
+        );
+        let response = send_raw_http_request(addr, &request, &[]);
+        assert!(
+            response.starts_with("HTTP/1.1 404"),
+            "expected 404 for unpublished object, got: {}",
+            response.lines().next().unwrap_or("")
+        );
     }
 
     fn sign_post_policy_fields(
@@ -6952,6 +7131,107 @@ Connection: close\r\n\r\n",
             0,
             "streaming session leaked after UploadPart bad checksum"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn streaming_put_bad_checksum_aborts_promoted_session() {
+        let tmp = test_util::tempdir();
+        let frontend = setup_frontend(tmp.path());
+        create_test_bucket(&frontend, "mybucket");
+        let (addr, _guard) = start_test_server(Arc::clone(&frontend)).await;
+
+        let body = vec![b'p'; crate::coordinator::INTERNAL_SEGMENT_SIZE + 1];
+        let checksum = "AAAAAA==";
+        let signed = sign_streaming_headers(
+            "PUT",
+            "/mybucket/mykey",
+            &addr,
+            body.len(),
+            &[("x-amz-checksum-crc32", checksum)],
+        );
+        let wire = build_signed_chunked_body(&signed, &body);
+
+        let request = format!(
+            "PUT /mybucket/mykey HTTP/1.1\r\n\
+Host: {addr}\r\n\
+Authorization: {}\r\n\
+x-amz-date: {}\r\n\
+x-amz-content-sha256: {}\r\n\
+content-encoding: aws-chunked\r\n\
+x-amz-decoded-content-length: {}\r\n\
+x-amz-checksum-crc32: {}\r\n\
+Content-Length: {}\r\n\
+Connection: close\r\n\r\n",
+            signed.authorization,
+            signed.amz_date,
+            signed.amz_content_sha256,
+            body.len(),
+            checksum,
+            wire.len()
+        );
+        let response = send_raw_http_request(&addr, &request, &wire);
+
+        assert!(
+            response.starts_with("HTTP/1.1 400"),
+            "expected 400 status, got: {}",
+            response.lines().next().unwrap_or("")
+        );
+        assert!(
+            response.contains("<Code>BadDigest</Code>"),
+            "expected BadDigest body, got: {response}"
+        );
+        assert_eq!(
+            frontend.coordinator.scavenge_stale_sessions(0),
+            0,
+            "streaming session leaked after PutObject bad checksum"
+        );
+        assert_signed_head_not_found(&addr, "mybucket", "mykey");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn streaming_put_bad_terminal_signature_aborts_promoted_session() {
+        let tmp = test_util::tempdir();
+        let frontend = setup_frontend(tmp.path());
+        create_test_bucket(&frontend, "mybucket");
+        let (addr, _guard) = start_test_server(Arc::clone(&frontend)).await;
+
+        let body = vec![b's'; crate::coordinator::INTERNAL_SEGMENT_SIZE + 1];
+        let signed = sign_streaming_headers("PUT", "/mybucket/mykey", &addr, body.len(), &[]);
+        let wire = build_signed_chunked_body_with_bad_terminal_signature(&signed, &body);
+
+        let request = format!(
+            "PUT /mybucket/mykey HTTP/1.1\r\n\
+Host: {addr}\r\n\
+Authorization: {}\r\n\
+x-amz-date: {}\r\n\
+x-amz-content-sha256: {}\r\n\
+content-encoding: aws-chunked\r\n\
+x-amz-decoded-content-length: {}\r\n\
+Content-Length: {}\r\n\
+Connection: close\r\n\r\n",
+            signed.authorization,
+            signed.amz_date,
+            signed.amz_content_sha256,
+            body.len(),
+            wire.len()
+        );
+        let response = send_raw_http_request(&addr, &request, &wire);
+
+        assert!(
+            response.starts_with("HTTP/1.1 403"),
+            "expected 403 status, got: {}",
+            response.lines().next().unwrap_or("")
+        );
+        assert!(
+            response.contains("<Code>SignatureDoesNotMatch</Code>"),
+            "expected SignatureDoesNotMatch body, got: {response}"
+        );
+        assert_eq!(
+            frontend.coordinator.scavenge_stale_sessions(0),
+            0,
+            "streaming session leaked after PutObject bad terminal signature"
+        );
+        assert_signed_head_not_found(&addr, "mybucket", "mykey");
     }
 
     #[tokio::test(flavor = "multi_thread")]
