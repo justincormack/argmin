@@ -10355,6 +10355,11 @@ Phase 12.3 progress:
   response frames, including transfer-leader traffic. This is an identity hook
   for Phase 12.3; authenticated peer credentials/MACs remain later cutover
   work.
+- Added the first reusable stream transport envelope for Raft peer frames: a
+  length-prefixed read/write helper that rejects over-limit frames before
+  allocating payload storage, then hands the bounded frame bytes to the
+  versioned CRC/identity codec. This is the process-socket IO boundary shape;
+  starting real peer listener/client processes remains a subsequent slice.
 
 1. define the replicated control-plane state machine:
    - state includes cluster epoch, PG count, PG state, PG acting sets, node

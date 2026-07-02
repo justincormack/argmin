@@ -3936,6 +3936,61 @@ fn validate_raft_peer_frame_identity(
     Ok(())
 }
 
+pub fn write_control_plane_raft_peer_transport_frame(
+    writer: &mut impl Write,
+    frame: &[u8],
+) -> Result<(), ControlPlaneError> {
+    let frame_len = u32::try_from(frame.len()).map_err(|_| ControlPlaneError::RpcProtocol {
+        message: format!(
+            "control-plane OpenRaft peer transport frame too large: {} bytes",
+            frame.len()
+        ),
+    })?;
+    let mut header = Vec::with_capacity(std::mem::size_of::<u32>());
+    write_raft_u32(&mut header, frame_len);
+    writer
+        .write_all(&header)
+        .and_then(|()| writer.write_all(frame))
+        .map_err(|source| ControlPlaneError::Io {
+            context: "write control-plane OpenRaft peer transport frame",
+            source,
+        })
+}
+
+pub fn read_control_plane_raft_peer_transport_frame(
+    reader: &mut impl Read,
+    max_frame_bytes: usize,
+) -> Result<Vec<u8>, ControlPlaneError> {
+    let mut header = [0; std::mem::size_of::<u32>()];
+    reader
+        .read_exact(&mut header)
+        .map_err(|source| ControlPlaneError::Io {
+            context: "read control-plane OpenRaft peer transport frame header",
+            source,
+        })?;
+    let frame_len = usize::try_from(u32::from_be_bytes(header)).map_err(|_| {
+        ControlPlaneError::RpcProtocol {
+            message: "control-plane OpenRaft peer transport frame length does not fit usize"
+                .to_string(),
+        }
+    })?;
+    if frame_len > max_frame_bytes {
+        return Err(ControlPlaneError::RpcProtocol {
+            message: format!(
+                "control-plane OpenRaft peer transport frame size {frame_len} bytes exceeds limit {max_frame_bytes}"
+            ),
+        });
+    }
+    let mut frame = vec![0; frame_len];
+    reader
+        .read_exact(&mut frame)
+        .map_err(|source| ControlPlaneError::Io {
+            context: "read control-plane OpenRaft peer transport frame payload",
+            source,
+        })?;
+    Ok(frame)
+}
+
 fn durable_artifact_tmp_path(path: &Path) -> PathBuf {
     let file_name = path
         .file_name()
@@ -6910,6 +6965,45 @@ mod tests {
             err,
             ControlPlaneError::CommandDecode { message }
                 if message.contains("missing peer identity")
+        ));
+    }
+
+    #[test]
+    fn control_plane_raft_peer_transport_frame_round_trips() {
+        let identity =
+            ControlPlaneRaftPeerFrameIdentity::new("control-plane-peer-transport-frame", 1, 2);
+        let request = ControlPlaneRaftPeerRpcRequest::Vote(VoteRequest {
+            vote: Vote::<ControlPlaneRaftLeaderId>::new(4, 1),
+            last_log_id: Some(raft_log_id(3, 1, 7)),
+            leadership_transfer: false,
+        });
+        let frame = request.encode_frame_for_peer(&identity).unwrap();
+        let mut transport = Vec::new();
+        write_control_plane_raft_peer_transport_frame(&mut transport, &frame).unwrap();
+
+        let mut cursor = Cursor::new(transport);
+        let decoded_frame =
+            read_control_plane_raft_peer_transport_frame(&mut cursor, frame.len()).unwrap();
+        assert_eq!(decoded_frame, frame);
+        let decoded =
+            ControlPlaneRaftPeerRpcRequest::decode_frame_for_peer(&decoded_frame, &identity)
+                .unwrap();
+        assert!(matches!(decoded, ControlPlaneRaftPeerRpcRequest::Vote(_)));
+    }
+
+    #[test]
+    fn control_plane_raft_peer_transport_frame_rejects_oversized_prefix_before_payload_read() {
+        let max_frame_bytes = 8usize;
+        let mut transport = Vec::new();
+        write_raft_u32(&mut transport, u32::try_from(max_frame_bytes + 1).unwrap());
+        let mut cursor = Cursor::new(transport);
+
+        let err =
+            read_control_plane_raft_peer_transport_frame(&mut cursor, max_frame_bytes).unwrap_err();
+        assert!(matches!(
+            err,
+            ControlPlaneError::RpcProtocol { message }
+                if message.contains("peer transport frame size 9 bytes exceeds limit 8")
         ));
     }
 
