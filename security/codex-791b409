@@ -1,0 +1,256 @@
+Heartbeat can delete active future-epoch pending command
+Link: https://chatgpt.com/codex/cloud/security/findings/a0110af9973c819193fab18b6bbc5ad2?sev=&repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin
+Criticality: low (attack path: low)
+Status: fixed
+
+# Metadata
+Repo: justincormack/argmin
+Commit: 791b409
+Author: justin@specialbusservice.com
+Created: 01/07/2026, 15:22:20
+Assignee: Unassigned
+Signals: Validated, Attack-path
+
+# Summary
+Introduced: the commit replaces the previous stale-epoch error during heartbeat with deletion of epoch-mismatched pending slots. The deletion condition does not prove the slot is orphaned; absence of a terminal log entry is also true for legitimate in-flight commands.
+The new heartbeat path treats any pending metadata command whose stored epoch does not equal the replica state's current durable epoch as an orphan if there is not yet a terminal log entry, and deletes it. However, a normal first metadata command in a newer cluster epoch has exactly this shape while it is in flight: the pending slot is written for the new epoch before apply/record advances metadata_command_replica_state to that epoch. Heartbeat cleanup is not serialized with the higher-level metadata command install/apply critical section, so it can race with a legitimate command between pending-slot insertion and terminal-log recording. If the slot is removed during that window, recovery loses the pending command, a later command may reuse the same next log index, and a crash or partial apply can leave metadata replicas diverged or operations lost.
+
+# Resolution
+Fixed in commit [8bcda43f97e85bc3ad7546b5046a40dd4516251f](https://github.com/justincormack/argmin/commit/8bcda43f97e85bc3ad7546b5046a40dd4516251f) (`Keep heartbeat pending-slot observation read-only`).
+
+Heartbeat is now a read-only observation boundary for pending metadata command slots. `SharedStorageNode::pg_heartbeat_observation` reports the durable metadata proof and whether any pending slot exists, but it no longer deletes epoch-mismatched pending slots, cleans terminal same-epoch slots, or runs replay validation that can mutate pending-slot state.
+
+Pending-slot reconciliation is now explicitly recovery-scoped. `PgStoreRecoveryContext` is an opaque constructor-backed token, and epoch-mismatched orphan cleanup requires that recovery context and derives the stored epoch internally. This makes the type boundary reflect the invariant: pre-serving recovery may repair crash leftovers; heartbeat and other serving-time observation paths must not mutate pending slots.
+
+The storage invariant guide was updated to document this recovery-vs-heartbeat split. Regression coverage now proves heartbeat preserves both epoch-mismatched and terminal pending slots, while recovery still cleans epoch-mismatched orphan slots and terminal pending slots before serving.
+
+# Validation
+## Rubric
+- [x] Locate the introduced heartbeat behavior and verify it compares a pending slot's epoch to durable metadata_command_replica_state rather than to the command's lifecycle.
+- [x] Verify cleanup deletes epoch-mismatched pending slots when no terminal metadata log entry exists.
+- [x] Verify normal metadata command flow can install a pending slot before apply/record advances durable metadata replica state.
+- [x] Dynamically reproduce the in-flight state with a debug Rust test and show heartbeat removes the active pending slot.
+- [x] Attempt compiled-stack validation methods: direct crashing/failing PoC succeeded; valgrind/gdb were unavailable; LLDB debugger trace confirmed false pending flag and None slot.
+## Report
+Validated the finding on commit 791b409c. The heartbeat path reads the durable metadata epoch, then reads a pending slot from any epoch, and if the slot epoch differs it calls cleanup and reports no pending command: crates/storage/src/node.rs:1200-1211. The cleanup function only checks whether a terminal log entry exists; if none exists, it removes the pending slot: crates/storage/src/pg_store/command_log.rs:2049-2077. Metadata command installation writes the pending slot before later apply/record: crates/storage/src/cluster.rs:3918-3950. Apply/record happens later under the metadata-command path: crates/storage/src/cluster/request_ops.rs:1117-1190, and durable replica state is advanced during log-state update/recording in crates/storage/src/pg_store/command_log.rs:3679-3755. I added a targeted Rust unit-test PoC that creates the in-flight shape: durable metadata replica epoch is ClusterEpoch::INITIAL, then a valid pending command slot is inserted for epoch 2. Calling SharedStorageNode::pg_heartbeat_observation deletes that slot. The reproducer fails with: `after heartbeat: has_pending_metadata_command=false, slot_after_present=false` followed by panic `heartbeat lost active future-epoch pending slot`. This demonstrates the cleanup predicate cannot distinguish an orphan from an active future-epoch command before apply/record. I also attempted valgrind/gdb; both were unavailable in the container. LLDB was available and confirmed at the failing assertion that `observation.has_pending_metadata_command = false` and `slot_after = None`.
+
+# Evidence
+crates/storage/src/cluster.rs (L3912 to 3951)
+  Note: Metadata command installation writes the pending slot before the command is applied. The lock used here is local to metadata-command operations and is not taken by the heartbeat cleanup path.
+```
+    fn try_install_pending_metadata_command_for_bucket(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        command: &MetadataCommandEnvelope,
+    ) -> Result<bool, ObjectPgActionError> {
+        self.maybe_run_before_metadata_command_pending_install_hook();
+        Ok(self
+            .try_set_pending_metadata_command_for_bucket(pg_id, bucket, command)
+            .map_err(ObjectPgActionError::from)?
+            .is_some())
+    }
+
+    fn try_set_pending_metadata_command_for_bucket(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        command: &MetadataCommandEnvelope,
+    ) -> Result<Option<()>, StoreError> {
+        let pg_lock = self
+            .local_map
+            .runtime_state()
+            .metadata_command_pg_lock(pg_id);
+        let _pg_guard = pg_lock.lock().unwrap_or_else(|e| e.into_inner());
+        self.try_set_pending_metadata_command_for_bucket_locked(pg_id, bucket, command)
+    }
+
+    fn try_set_pending_metadata_command_for_bucket_locked(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        command: &MetadataCommandEnvelope,
+    ) -> Result<Option<()>, StoreError> {
+        let primary = self
+            .local_map
+            .metadata_pg_primary_node(self.operation_epoch(), pg_id)?;
+        match primary
+            .metadata_command_client()
+            .try_insert_pending_metadata_command_slot(pg_id, command, Some(bucket))
+        {
+```
+
+crates/storage/src/cluster/request_ops.rs (L1117 to 1190)
+  Note: Command application and terminal-log recording happen later under a separate operation path, leaving a race window after pending-slot insertion where heartbeat can see no terminal log entry and delete the active slot.
+```
+        let pg_id = command.id().pg_id();
+        let pg_lock = self
+            .local_map
+            .runtime_state()
+            .metadata_command_pg_lock(pg_id);
+        let _pg_guard = pg_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let mut nodes = self
+            .local_map
+            .metadata_pg_acting_nodes(command.id().cluster_epoch(), pg_id)
+            .map_err(|source| MetadataCommandApplyFailure {
+                applied_nodes: 0,
+                source: source.into(),
+            })?;
+        let primary_node_id = self
+            .local_map
+            .pg_route(pg_id)
+            .expect("validated metadata PG command route must exist")
+            .primary_node_id();
+        if origin_node_id != primary_node_id {
+            return Err(MetadataCommandApplyFailure {
+                applied_nodes: 0,
+                source: StoreError::MetadataCommandFromNonPrimary {
+                    node_id: primary_node_id.as_u32(),
+                    pg_id: pg_id.get(),
+                    cluster_epoch: command.id().cluster_epoch(),
+                    origin_node_id: origin_node_id.as_u32(),
+                    primary_node_id: primary_node_id.as_u32(),
+                }
+                .into(),
+            });
+        }
+        nodes.sort_by_key(|node| node.node_id() != primary_node_id);
+        for (applied_nodes, node) in nodes.into_iter().enumerate() {
+            if node.node_id() == primary_node_id {
+                let primary_critical_section = node
+                    .metadata_command_client()
+                    .open_metadata_command_critical_section(pg_id, command.id().cluster_epoch())
+                    .map_err(|source| MetadataCommandApplyFailure {
+                        applied_nodes,
+                        source: BucketSnapshotLoadError::Store(source),
+                    })?;
+                let metadata_client = primary_critical_section.as_ref();
+                let acceptance = metadata_client
+                    .metadata_command_acceptance(pg_id, command)
+                    .map_err(|source| MetadataCommandApplyFailure {
+                        applied_nodes,
+                        source: BucketSnapshotLoadError::Store(source),
+                    })?;
+                if acceptance == MetadataCommandAcceptance::AlreadyApplied {
+                    metadata_client
+                        .apply_metadata_command_and_record(pg_id, command)
+                        .map_err(|source| MetadataCommandApplyFailure {
+                            applied_nodes,
+                            source,
+                        })?;
+                    continue;
+                }
+                self.validate_metadata_command_bucket_write_reservation(command)
+                    .map_err(|source| MetadataCommandApplyFailure {
+                        applied_nodes,
+                        source,
+                    })?;
+                maybe_run_before_metadata_command_apply_hook(
+                    self.metadata_command_apply_test_hook_scope_id(),
+                    node.node_id(),
+                    command,
+                )
+                .map_err(|source| MetadataCommandApplyFailure {
+                    applied_nodes,
+                    source: source.into(),
+                })?;
+                metadata_client
+                    .apply_metadata_command_and_record(pg_id, command)
+                    .map_err(|source| MetadataCommandApplyFailure {
+```
+
+crates/storage/src/node.rs (L1200 to 1211)
+  Note: Heartbeat compares the pending slot epoch to the durable replica-state epoch and invokes cleanup for any mismatch, even though a legitimate first command in a newer epoch will mismatch until it is applied and recorded.
+```
+        let metadata_epoch = pg.metadata_command_replica_state()?.cluster_epoch;
+        let mut metadata_state =
+            pg.metadata_command_replica_state_for_heartbeat(node_id.as_u32(), metadata_epoch)?;
+        let pending_slot = pg.pending_metadata_command_slot_any_epoch(node_id.as_u32())?;
+        let mut has_pending_metadata_command = match pending_slot {
+            Some(slot) if slot.id.cluster_epoch() == metadata_epoch => true,
+            Some(_) => {
+                pg.clean_epoch_mismatched_orphan_pending_metadata_command_slot(
+                    node_id.as_u32(),
+                    metadata_epoch,
+                )?;
+                false
+```
+
+crates/storage/src/pg_store/command_log.rs (L2049 to 2077)
+  Note: The cleanup routine deletes an epoch-mismatched slot whenever no terminal log entry exists. That condition is insufficient to distinguish an orphan from an active in-flight command that has not reached terminal-log recording yet.
+```
+    pub(crate) fn clean_epoch_mismatched_orphan_pending_metadata_command_slot(
+        &self,
+        node_id: u32,
+        current_epoch: ClusterEpoch,
+    ) -> Result<bool, StoreError> {
+        let Some(slot) = self.pending_metadata_command_slot_any_epoch(node_id)? else {
+            return Ok(false);
+        };
+        if slot.id.cluster_epoch() == current_epoch {
+            return Ok(false);
+        }
+        if self
+            .load_metadata_command_log_entry(
+                "load epoch-mismatched metadata command pending slot terminal entry",
+                slot.id.cluster_epoch(),
+                slot.id.pg_id(),
+                slot.id.log_index(),
+            )?
+            .is_some()
+        {
+            return Err(StoreError::MetadataCommandLogConflict {
+                node_id,
+                pg_id: self.pg_id,
+                cluster_epoch: slot.id.cluster_epoch(),
+                log_index: slot.id.log_index().get(),
+            });
+        }
+        self.remove_pending_metadata_command_slot_exact(node_id, &slot)?;
+        Ok(true)
+```
+
+# Attack-path analysis
+Final: low | Decider: model_decided | Matrix severity: medium | Policy adjusted: medium
+## Rationale
+Adjusted from medium to low for security triage. The code evidence and validation PoC support a real race/correctness bug in the storage metadata layer, but the reachable security attack path is indirect: an attacker cannot directly call the cleanup path over the public API, must already be authorized to generate metadata-changing workload, and must hit a narrow epoch-transition heartbeat race. The impact can be operationally serious for integrity/availability, but there is no demonstrated auth bypass, sensitive data exposure, privilege escalation, RCE, or unauthenticated deletion of other users' data. Therefore probability × security impact is low, while operational reliability priority may remain higher.
+## Likelihood
+high - The bug is proven at unit level and exists in product storage code, but practical attacker exploitation requires valid S3 write authority or public write, a cluster epoch transition, precise heartbeat timing, and often a crash/recovery or follow-on command to realize lasting harm. The vulnerable storage/control-plane paths are internal Unix-socket paths with private-directory checks. | Remote network vector
+## Impact
+medium - If the race occurs, an active metadata command can be removed from the pending slot before terminal-log recording. That can lose operations or create metadata replica divergence after recovery, affecting object-storage integrity and availability. No direct confidentiality breach, privilege escalation, auth bypass, or code execution is evidenced.
+## Assumptions
+- No Kubernetes, cloud IAM, load-balancer, or deployment manifests were found or used; exposure is inferred from repository configuration and runtime code only.
+- The relevant attacker, if any, is an authenticated or otherwise authorized S3 client able to generate metadata-changing bucket/object operations while the storage cluster is undergoing an epoch transition.
+- The storage-node and control-plane sockets are local Unix sockets with private-directory checks, so direct external access to the heartbeat/cleanup path is not assumed.
+- argmin-s3 storage/metadata coordination is running in a cluster or control-plane-managed mode where cluster epochs can advance
+- a legitimate metadata command for a newer cluster epoch is inserted into a pending slot before apply/terminal-log recording advances durable replica state
+- the storage node heartbeat observation runs during that pending-slot-to-record window
+- a client or workload generates metadata-changing operations during the transition; an attacker would need valid credentials or a public-write configuration to influence this workload
+- lasting data loss/divergence generally requires a subsequent crash, recovery, partial apply, or command reuse scenario after the pending slot is removed
+## Path
+S3 client -> HTTP frontend -> pending metadata command(new epoch) -> heartbeat(old durable epoch) -> cleanup deletes slot -> lost operation/divergent metadata
+## Path evidence
+- `crates/storage/src/node.rs:1200-1211` - Heartbeat reads durable metadata_epoch, loads a pending slot from any epoch, and calls cleanup for any epoch mismatch while reporting no pending command.
+- `crates/storage/src/pg_store/command_log.rs:2049-2077` - Cleanup deletes the epoch-mismatched pending slot if no terminal log entry is found, which does not distinguish an orphan from an active in-flight command.
+- `crates/storage/src/cluster.rs:3912-3951` - Metadata command installation writes the pending command slot under metadata_command_pg_lock before later application/recording.
+- `crates/storage/src/cluster/request_ops.rs:1117-1190` - Command application and terminal-log recording occur later on the metadata-command path, leaving a race window after pending-slot insertion.
+- `crates/argmin-s3/src/config.rs:185-212` - Frontend credentials and listen address are environment-configured; default listen address is 127.0.0.1:9000.
+- `crates/argmin-s3/src/main.rs:1995-2008` - The main S3 frontend binds a TCP listener from config.listen_addr, so remote exposure depends on deployment configuration.
+- `crates/storage/src/storage_node_server.rs:964-980` - Storage-node RPC binds a UnixListener rather than a network socket.
+- `crates/storage/src/storage_node_server.rs:10352-10363` - Storage-node socket directory must be private mode 0700, mitigating direct external access to storage RPC.
+- `crates/server-http/src/http/mod.rs:3092-3122` - HTTP requests go through SigV4 authentication handling, with missing auth treated as anonymous and later authorization required by operation policy.
+## Narrative
+The finding is a real in-scope storage-layer race: heartbeat reads the durable metadata epoch, finds any pending metadata slot, and invokes cleanup when the slot epoch differs. The cleanup routine deletes the slot whenever no terminal log entry exists, but legitimate future-epoch commands have exactly that shape before apply/record completes. Metadata command installation and application use metadata-command locking, but the heartbeat cleanup path shown does not take that same higher-level lock. The security significance is limited: this is an internal correctness/integrity/availability issue, not an auth bypass, secret leak, RCE, or direct unauthenticated remote exploit. An attacker would need authorized traffic plus favorable cluster epoch-transition timing to influence it, so security criticality is lower than the operational data-loss risk.
+## Controls
+- SigV4 request authentication
+- bucket/object authorization and public ACL controls
+- default localhost TCP listen address 127.0.0.1:9000
+- optional TLS configuration via ARGMIN_TLS_CERT_PATH/ARGMIN_TLS_KEY_PATH
+- storage-node RPC over Unix sockets
+- private socket directory validation for storage-node and control-plane sockets
+- max connection and max in-flight request limits
+## Blindspots
+- Static-only review did not enumerate all S3 operations that can create MetadataCommandEnvelope instances or measure how frequently epoch transitions occur in production.
+- No deployment manifests were present, so actual internet exposure, TLS termination, load balancers, and multi-node topology are unknown.
+- The provided validation PoC demonstrates the state-machine race directly, but not a full end-to-end remote S3 exploit.
+- Potential multi-tenant blast radius is unclear because the threat model describes the service as effectively single-tenant.
