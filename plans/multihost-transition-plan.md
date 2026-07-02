@@ -10154,6 +10154,14 @@ Phase 12.2 progress:
   serve from them. Tests cover round-trip restore, malformed frames, checksum
   rejection, unknown entry payload tags, invalid index-0 bootstrap entry
   shapes, and committed/applied inconsistency.
+- Extended the durable restart artifact to preserve an optional cached OpenRaft
+  snapshot when that snapshot is exactly at the state machine's applied tip.
+  Decode validates the cached snapshot metadata, membership, snapshot id, and
+  payload against the restored state-machine payload before exposing it through
+  `get_current_snapshot()`. Stale cached snapshots are intentionally dropped
+  during export for now; a future compaction slice must define and test the
+  broader snapshot-plus-retained-suffix contract before persisting older
+  snapshots.
 - Added the first local file boundary for the durable restart artifact. The
   artifact can now be stored through a same-directory temp file, `sync_all`,
   atomic rename, and parent-directory sync, and loaded back through the
