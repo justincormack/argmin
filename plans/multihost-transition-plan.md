@@ -10320,6 +10320,12 @@ Phase 12.3 progress:
   batches, oversized single-entry append payloads, and oversized snapshots. This
   establishes the validation shape for the Phase 12.3 peer RPC boundary; Unix/
   process peer RPC remains the next layer.
+- Lifted that guard into a reusable experimental peer transport policy with
+  typed rejection reasons, so future Unix/process peer RPC can share the same
+  target-node and frame-limit validation instead of duplicating test-only
+  checks. The in-process Raft network maps those typed rejections to OpenRaft
+  unreachable/network/streaming errors at the transport edge, with coverage for
+  unconfigured targets as a distinct unreachable outcome.
 
 1. define the replicated control-plane state machine:
    - state includes cluster epoch, PG count, PG state, PG acting sets, node

@@ -57,6 +57,195 @@ pub type ControlPlaneRaftLeaderId = LeaderId<ControlPlaneRaftTerm, ControlPlaneR
 pub type ControlPlaneRaftEntry =
     Entry<ControlPlaneRaftLeaderId, ControlPlaneCommand, ControlPlaneRaftNodeId, BasicNode>;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ControlPlaneRaftPeerTransportLimits {
+    pub max_append_entries: usize,
+    pub max_append_entries_bytes: usize,
+    pub max_snapshot_bytes: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct ControlPlaneRaftPeerTransportPolicy {
+    cluster_name: String,
+    peers: BTreeMap<ControlPlaneRaftNodeId, BasicNode>,
+    limits: ControlPlaneRaftPeerTransportLimits,
+}
+
+impl ControlPlaneRaftPeerTransportPolicy {
+    #[must_use]
+    pub fn new(
+        cluster_name: impl Into<String>,
+        peers: BTreeMap<ControlPlaneRaftNodeId, BasicNode>,
+        limits: ControlPlaneRaftPeerTransportLimits,
+    ) -> Self {
+        Self {
+            cluster_name: cluster_name.into(),
+            peers,
+            limits,
+        }
+    }
+
+    pub fn validate_target_node(
+        &self,
+        target: ControlPlaneRaftNodeId,
+        node: &BasicNode,
+        rpc_name: &'static str,
+    ) -> Result<(), ControlPlaneRaftPeerTransportRejection> {
+        let expected = self.peers.get(&target).ok_or_else(|| {
+            ControlPlaneRaftPeerTransportRejection::UnknownTarget {
+                cluster_name: self.cluster_name.clone(),
+                target,
+                rpc_name,
+            }
+        })?;
+        if expected == node {
+            Ok(())
+        } else {
+            Err(ControlPlaneRaftPeerTransportRejection::EndpointMismatch {
+                cluster_name: self.cluster_name.clone(),
+                target,
+                rpc_name,
+                expected: expected.addr.clone(),
+                actual: node.addr.clone(),
+            })
+        }
+    }
+
+    pub fn validate_append_entries(
+        &self,
+        target: ControlPlaneRaftNodeId,
+        entries_len: usize,
+        entries_bytes: usize,
+    ) -> Result<(), ControlPlaneRaftPeerTransportRejection> {
+        if entries_len > self.limits.max_append_entries {
+            return Err(
+                ControlPlaneRaftPeerTransportRejection::AppendEntriesBatchTooLarge {
+                    cluster_name: self.cluster_name.clone(),
+                    target,
+                    entries_len,
+                    max_append_entries: self.limits.max_append_entries,
+                },
+            );
+        }
+        if entries_bytes > self.limits.max_append_entries_bytes {
+            return Err(
+                ControlPlaneRaftPeerTransportRejection::AppendEntriesPayloadTooLarge {
+                    cluster_name: self.cluster_name.clone(),
+                    target,
+                    entries_bytes,
+                    max_append_entries_bytes: self.limits.max_append_entries_bytes,
+                },
+            );
+        }
+        Ok(())
+    }
+
+    pub fn validate_snapshot(
+        &self,
+        target: ControlPlaneRaftNodeId,
+        snapshot_bytes: usize,
+    ) -> Result<(), ControlPlaneRaftPeerTransportRejection> {
+        if snapshot_bytes <= self.limits.max_snapshot_bytes {
+            Ok(())
+        } else {
+            Err(ControlPlaneRaftPeerTransportRejection::SnapshotTooLarge {
+                cluster_name: self.cluster_name.clone(),
+                target,
+                snapshot_bytes,
+                max_snapshot_bytes: self.limits.max_snapshot_bytes,
+            })
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ControlPlaneRaftPeerTransportRejection {
+    UnknownTarget {
+        cluster_name: String,
+        target: ControlPlaneRaftNodeId,
+        rpc_name: &'static str,
+    },
+    EndpointMismatch {
+        cluster_name: String,
+        target: ControlPlaneRaftNodeId,
+        rpc_name: &'static str,
+        expected: String,
+        actual: String,
+    },
+    AppendEntriesBatchTooLarge {
+        cluster_name: String,
+        target: ControlPlaneRaftNodeId,
+        entries_len: usize,
+        max_append_entries: usize,
+    },
+    AppendEntriesPayloadTooLarge {
+        cluster_name: String,
+        target: ControlPlaneRaftNodeId,
+        entries_bytes: usize,
+        max_append_entries_bytes: usize,
+    },
+    SnapshotTooLarge {
+        cluster_name: String,
+        target: ControlPlaneRaftNodeId,
+        snapshot_bytes: usize,
+        max_snapshot_bytes: usize,
+    },
+}
+
+impl fmt::Display for ControlPlaneRaftPeerTransportRejection {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnknownTarget {
+                cluster_name,
+                target,
+                rpc_name,
+            } => write!(
+                f,
+                "control-plane raft peer transport cluster {cluster_name} has no configured target node {target} for {rpc_name}",
+            ),
+            Self::EndpointMismatch {
+                cluster_name,
+                target,
+                rpc_name,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "control-plane raft peer transport cluster {cluster_name} rejected {rpc_name} to node {target}: endpoint mismatch, expected {expected}, got {actual}",
+            ),
+            Self::AppendEntriesBatchTooLarge {
+                cluster_name,
+                target,
+                entries_len,
+                max_append_entries,
+            } => write!(
+                f,
+                "control-plane raft peer transport cluster {cluster_name} rejected append_entries to node {target}: {entries_len} entries exceeds limit {max_append_entries}",
+            ),
+            Self::AppendEntriesPayloadTooLarge {
+                cluster_name,
+                target,
+                entries_bytes,
+                max_append_entries_bytes,
+            } => write!(
+                f,
+                "control-plane raft peer transport cluster {cluster_name} rejected append_entries to node {target}: encoded entries payload {entries_bytes} bytes exceeds limit {max_append_entries_bytes}",
+            ),
+            Self::SnapshotTooLarge {
+                cluster_name,
+                target,
+                snapshot_bytes,
+                max_snapshot_bytes,
+            } => write!(
+                f,
+                "control-plane raft peer transport cluster {cluster_name} rejected full_snapshot to node {target}: {snapshot_bytes} bytes exceeds limit {max_snapshot_bytes}",
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ControlPlaneRaftPeerTransportRejection {}
+
 #[derive(Debug)]
 pub enum ControlPlaneRaftApplyResponse {
     Blank,
@@ -4745,75 +4934,6 @@ mod tests {
         }
     }
 
-    #[derive(Debug, Clone)]
-    struct InMemoryRaftPeerTransportPolicy {
-        cluster_name: String,
-        peers: BTreeMap<ControlPlaneRaftNodeId, BasicNode>,
-        max_append_entries: usize,
-        max_append_entries_bytes: usize,
-        max_snapshot_bytes: usize,
-    }
-
-    impl InMemoryRaftPeerTransportPolicy {
-        fn validate_target_node(
-            &self,
-            target: ControlPlaneRaftNodeId,
-            node: &BasicNode,
-            rpc_name: &'static str,
-        ) -> Result<(), RPCError<ControlPlaneRaftTypeConfig>> {
-            let expected = self.peers.get(&target).ok_or_else(|| {
-                RPCError::Unreachable(Unreachable::new(&AnyError::error(format!(
-                    "control-plane raft peer transport cluster {} has no configured target node {target} for {rpc_name}",
-                    self.cluster_name
-                ))))
-            })?;
-            if expected == node {
-                Ok(())
-            } else {
-                Err(RPCError::Network(NetworkError::from_string(format!(
-                    "control-plane raft peer transport cluster {} rejected {rpc_name} to node {target}: endpoint mismatch, expected {}, got {}",
-                    self.cluster_name, expected.addr, node.addr
-                ))))
-            }
-        }
-
-        fn validate_append_entries(
-            &self,
-            target: ControlPlaneRaftNodeId,
-            entries_len: usize,
-            entries_bytes: usize,
-        ) -> Result<(), RPCError<ControlPlaneRaftTypeConfig>> {
-            if entries_len > self.max_append_entries {
-                return Err(RPCError::Network(NetworkError::from_string(format!(
-                    "control-plane raft peer transport cluster {} rejected append_entries to node {target}: {} entries exceeds limit {}",
-                    self.cluster_name, entries_len, self.max_append_entries
-                ))));
-            }
-            if entries_bytes > self.max_append_entries_bytes {
-                return Err(RPCError::Network(NetworkError::from_string(format!(
-                    "control-plane raft peer transport cluster {} rejected append_entries to node {target}: encoded entries payload {} bytes exceeds limit {}",
-                    self.cluster_name, entries_bytes, self.max_append_entries_bytes
-                ))));
-            }
-            Ok(())
-        }
-
-        fn validate_snapshot(
-            &self,
-            target: ControlPlaneRaftNodeId,
-            snapshot_bytes: usize,
-        ) -> Result<(), StreamingError<ControlPlaneRaftTypeConfig>> {
-            if snapshot_bytes <= self.max_snapshot_bytes {
-                Ok(())
-            } else {
-                Err(StreamingError::Network(NetworkError::from_string(format!(
-                    "control-plane raft peer transport cluster {} rejected full_snapshot to node {target}: {} bytes exceeds limit {}",
-                    self.cluster_name, snapshot_bytes, self.max_snapshot_bytes
-                ))))
-            }
-        }
-    }
-
     #[derive(Debug, Clone, Default)]
     struct InMemoryRaftNetworkFactory {
         peers: Arc<
@@ -4824,11 +4944,11 @@ mod tests {
                 >,
             >,
         >,
-        policy: Option<Arc<InMemoryRaftPeerTransportPolicy>>,
+        policy: Option<Arc<ControlPlaneRaftPeerTransportPolicy>>,
     }
 
     impl InMemoryRaftNetworkFactory {
-        fn with_transport_policy(policy: InMemoryRaftPeerTransportPolicy) -> Self {
+        fn with_transport_policy(policy: ControlPlaneRaftPeerTransportPolicy) -> Self {
             Self {
                 peers: Arc::default(),
                 policy: Some(Arc::new(policy)),
@@ -5087,7 +5207,7 @@ mod tests {
                 >,
             >,
         >,
-        policy: Option<Arc<InMemoryRaftPeerTransportPolicy>>,
+        policy: Option<Arc<ControlPlaneRaftPeerTransportPolicy>>,
         target: ControlPlaneRaftNodeId,
         node: BasicNode,
     }
@@ -5120,9 +5240,35 @@ mod tests {
             rpc_name: &'static str,
         ) -> Result<(), RPCError<ControlPlaneRaftTypeConfig>> {
             if let Some(policy) = &self.policy {
-                policy.validate_target_node(self.target, &self.node, rpc_name)?;
+                policy
+                    .validate_target_node(self.target, &self.node, rpc_name)
+                    .map_err(Self::rpc_error_from_transport_rejection)?;
             }
             Ok(())
+        }
+
+        fn rpc_error_from_transport_rejection(
+            rejection: ControlPlaneRaftPeerTransportRejection,
+        ) -> RPCError<ControlPlaneRaftTypeConfig> {
+            let message = rejection.to_string();
+            match rejection {
+                ControlPlaneRaftPeerTransportRejection::UnknownTarget { .. } => {
+                    RPCError::Unreachable(Unreachable::new(&AnyError::error(message)))
+                }
+                _ => RPCError::Network(NetworkError::from_string(message)),
+            }
+        }
+
+        fn streaming_error_from_transport_rejection(
+            rejection: ControlPlaneRaftPeerTransportRejection,
+        ) -> StreamingError<ControlPlaneRaftTypeConfig> {
+            let message = rejection.to_string();
+            match rejection {
+                ControlPlaneRaftPeerTransportRejection::UnknownTarget { .. } => {
+                    StreamingError::Unreachable(Unreachable::new(&AnyError::error(message)))
+                }
+                _ => StreamingError::Network(NetworkError::from_string(message)),
+            }
         }
 
         fn target_raft(
@@ -5176,11 +5322,13 @@ mod tests {
         > {
             self.validate_peer("append_entries")?;
             if let Some(policy) = &self.policy {
-                policy.validate_append_entries(
-                    self.target,
-                    rpc.entries.len(),
-                    Self::encoded_append_entries_payload_len(&rpc.entries)?,
-                )?;
+                policy
+                    .validate_append_entries(
+                        self.target,
+                        rpc.entries.len(),
+                        Self::encoded_append_entries_payload_len(&rpc.entries)?,
+                    )
+                    .map_err(Self::rpc_error_from_transport_rejection)?;
             }
             self.target_raft("append_entries")?
                 .append_entries(rpc)
@@ -5238,7 +5386,9 @@ mod tests {
                     }
                 })?;
             if let Some(policy) = &self.policy {
-                policy.validate_snapshot(self.target, snapshot.snapshot.get_ref().len())?;
+                policy
+                    .validate_snapshot(self.target, snapshot.snapshot.get_ref().len())
+                    .map_err(Self::streaming_error_from_transport_rejection)?;
             }
             self.target_raft("full_snapshot")?
                 .install_full_snapshot(vote, snapshot)
@@ -5267,14 +5417,16 @@ mod tests {
         }
     }
 
-    fn test_peer_transport_policy() -> InMemoryRaftPeerTransportPolicy {
-        InMemoryRaftPeerTransportPolicy {
-            cluster_name: "control-plane-raft-peer-transport-test".to_string(),
-            peers: BTreeMap::from([(1, BasicNode::new("node-1")), (2, BasicNode::new("node-2"))]),
-            max_append_entries: 1,
-            max_append_entries_bytes: 128,
-            max_snapshot_bytes: 0,
-        }
+    fn test_peer_transport_policy() -> ControlPlaneRaftPeerTransportPolicy {
+        ControlPlaneRaftPeerTransportPolicy::new(
+            "control-plane-raft-peer-transport-test",
+            BTreeMap::from([(1, BasicNode::new("node-1")), (2, BasicNode::new("node-2"))]),
+            ControlPlaneRaftPeerTransportLimits {
+                max_append_entries: 1,
+                max_append_entries_bytes: 128,
+                max_snapshot_bytes: 0,
+            },
+        )
     }
 
     #[test]
@@ -5301,6 +5453,32 @@ mod tests {
                     if error.to_string().contains("endpoint mismatch")
                         && error.to_string().contains("expected node-2")
                         && error.to_string().contains("got wrong-node-2")
+            ));
+        });
+    }
+
+    #[test]
+    fn control_plane_raft_peer_transport_rejects_unconfigured_target() {
+        ControlPlaneRaftTypeConfig::run(async {
+            let mut factory =
+                InMemoryRaftNetworkFactory::with_transport_policy(test_peer_transport_policy());
+            let mut network = factory.new_client(3, &BasicNode::new("node-3")).await;
+            let err = network
+                .vote(
+                    VoteRequest {
+                        vote: Vote::<ControlPlaneRaftLeaderId>::new(1, 1),
+                        last_log_id: None,
+                        leadership_transfer: false,
+                    },
+                    RPCOption::new(Duration::from_millis(10)),
+                )
+                .await
+                .unwrap_err();
+
+            assert!(matches!(
+                err,
+                RPCError::Unreachable(error)
+                    if error.to_string().contains("no configured target node 3")
             ));
         });
     }
