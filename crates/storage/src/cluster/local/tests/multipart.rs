@@ -1595,6 +1595,263 @@ fn authorized_multipart_abort_rejects_stale_upload_row() {
 }
 
 #[test]
+fn control_plane_peering_multipart_abort_old_primary_fails_closed_without_mutation() {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let pg_ids = [0, 1, 2, 3];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let mut authority = crate::control_plane::SingleAuthorityControlPlane::open(
+        crate::control_plane::FileControlPlaneStore::new(tmp.path().join("control-plane.state")),
+    )
+    .unwrap();
+    authority
+        .bootstrap_initial_cluster_map(
+            node_ids
+                .iter()
+                .map(|node_id| {
+                    (
+                        *node_id,
+                        tmp.path()
+                            .join("sockets")
+                            .join(format!("abort-node-{}.sock", node_id.as_u32()))
+                            .to_string_lossy()
+                            .into_owned(),
+                    )
+                })
+                .collect(),
+            pg_ids.iter().copied().map(PgId::new).collect(),
+        )
+        .unwrap();
+    let source_epoch = authority.snapshot().cluster_epoch();
+    let source_routes = pg_ids
+        .iter()
+        .map(|pg_id| {
+            let route = authority
+                .snapshot()
+                .reconstructed_pg_route_at_epoch(PgId::new(*pg_id), source_epoch)
+                .unwrap();
+            crate::control_plane::PgRouteSnapshot::reconstructed(
+                route.cluster_epoch(),
+                route.pg_id(),
+                route.primary_node_id(),
+                route.acting_set().to_vec(),
+                PgState::Active,
+            )
+        })
+        .collect::<Vec<_>>();
+    let configs = node_ids
+        .iter()
+        .map(|node_id| {
+            LocalNodeStoreConfig::new(
+                *node_id,
+                tmp.path()
+                    .join("abort-storage")
+                    .join(format!("node-{:04}", node_id.as_u32())),
+            )
+        })
+        .collect::<Vec<_>>();
+    let source_map = Arc::new(
+        LocalClusterMap::open_frontend_with_configs_and_pg_routes(
+            NodeId::new(0),
+            configs.clone(),
+            &pg_ids,
+            ec_shape,
+            source_epoch,
+            source_routes.iter().map(LocalPgRoute::from),
+        )
+        .unwrap(),
+    );
+    let (bucket, key, object_pg) = {
+        let topology = source_map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        let bucket = bucket_for_pg(topology, 1, "multipart-abort-peering-");
+        let object_pg = 2;
+        let key = key_for_object_pg(topology, &bucket, object_pg, "object-");
+        (bucket, key, object_pg)
+    };
+    let source_cluster = crate::StorageCluster::from_local_map(Arc::clone(&source_map)).unwrap();
+    create_test_bucket(&source_cluster, &bucket);
+    let upload_id = upload_id_from_label("peeringabort");
+    let create = crate::CreateMultipartUploadReq {
+        upload_id: upload_id.clone(),
+        bucket: bucket.clone(),
+        key: key.clone(),
+        tags: None,
+        metadata_blob: crate::SerializedMetadataBlob::default(),
+        system_metadata_blob: crate::SerializedSystemMetadataBlob::default(),
+        initiator: crate::OwnerIdentity::from_principal("initiator"),
+        owner: crate::OwnerIdentity::from_principal("owner"),
+        acl_grants: crate::AclGrants::default(),
+        public_read: false,
+        object_lock: crate::ObjectLockState::default(),
+        checksum: None,
+        encryption: crate::ObjectEncryption::None,
+    };
+    source_cluster
+        .create_multipart_upload(
+            &bucket,
+            &key,
+            crate::BucketSnapshotRequest::default(),
+            |_snapshot, existing_object| {
+                assert!(existing_object.is_none());
+                Ok::<_, ()>(((), create.clone()))
+            },
+        )
+        .unwrap()
+        .unwrap();
+    let part_number = 1;
+    let (_shard_keys, uploaded_part, uploaded_segment) = upload_streamed_test_multipart_part(
+        &source_cluster,
+        &bucket,
+        &key,
+        &upload_id,
+        part_number,
+        [0xa6; 16],
+        b"multipart abort peering preserved part payload",
+    );
+    let before_object_pg_proof = source_cluster
+        .test_object_pg_metadata_proof(&bucket, &key)
+        .unwrap();
+    drop(source_cluster);
+    drop(source_map);
+
+    authority
+        .set_pg_acting_set(PgId::new(object_pg), vec![NodeId::new(1), NodeId::new(2)])
+        .unwrap();
+    let current_epoch = authority.snapshot().cluster_epoch();
+    let current_routes = pg_ids
+        .iter()
+        .map(|pg_id| {
+            let route = authority
+                .snapshot()
+                .reconstructed_pg_route_at_epoch(PgId::new(*pg_id), current_epoch)
+                .unwrap();
+            let state = if *pg_id == object_pg {
+                PgState::Peering
+            } else {
+                PgState::Active
+            };
+            crate::control_plane::PgRouteSnapshot::reconstructed(
+                route.cluster_epoch(),
+                route.pg_id(),
+                route.primary_node_id(),
+                route.acting_set().to_vec(),
+                state,
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut current_map = LocalClusterMap::open_frontend_with_configs_and_pg_routes(
+        NodeId::new(0),
+        configs,
+        &pg_ids,
+        ec_shape,
+        current_epoch,
+        current_routes.iter().map(LocalPgRoute::from),
+    )
+    .unwrap();
+    current_map.test_install_historical_pg_routes(source_routes);
+    let current_map = Arc::new(current_map);
+    assert_eq!(
+        current_map.pg_route(PgId::new(object_pg)).unwrap().state(),
+        PgState::Peering,
+        "control-plane acting-set change should put the object PG into Peering"
+    );
+    assert!(
+        !current_map
+            .pg_route(PgId::new(object_pg))
+            .unwrap()
+            .acting_set()
+            .contains(&NodeId::new(0)),
+        "the old source primary should no longer be in the current acting set"
+    );
+
+    let old_primary_cluster = crate::StorageCluster::test_from_local_map_with_epoch(
+        Arc::clone(&current_map),
+        source_epoch,
+    )
+    .unwrap();
+    let err = old_primary_cluster
+        .abort_multipart_upload(&bucket, &key, &upload_id)
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            crate::ObjectPgActionError::Store(StoreError::StaleMetadataOperation {
+                pg_id,
+                operation_epoch,
+                current_epoch: observed_current_epoch,
+            }) if pg_id == object_pg
+                && operation_epoch == source_epoch
+                && observed_current_epoch == current_epoch
+        ),
+        "old-primary multipart abort should fail closed after control-plane Peering transition, got {err:?}"
+    );
+
+    for node_id in node_ids {
+        let pg = current_map
+            .node(node_id)
+            .unwrap()
+            .storage_node()
+            .get_pg(object_pg)
+            .unwrap();
+        let state = pg.metadata_command_replica_state().unwrap();
+        let proof = crate::control_plane::PgMetadataProof::new(
+            state.applied_log_index,
+            state.applied_log_hash,
+            state.state_digest,
+        );
+        assert_eq!(
+            proof, before_object_pg_proof,
+            "old-primary multipart abort must not append an object-PG command on node {node_id:?}"
+        );
+        assert!(
+            pg.pending_metadata_command_envelope(node_id.as_u32(), source_epoch)
+                .unwrap()
+                .is_none(),
+            "old-primary multipart abort must not leave a source-epoch pending command on node {node_id:?}"
+        );
+        assert!(
+            pg.pending_metadata_command_envelope(node_id.as_u32(), current_epoch)
+                .unwrap()
+                .is_none(),
+            "old-primary multipart abort must not leave a current-epoch pending command on node {node_id:?}"
+        );
+        let upload = crate::PgMetadataStore::get_multipart_upload(&*pg, &upload_id).unwrap();
+        assert_eq!(upload.state, crate::UploadState::InProgress);
+        assert_eq!(
+            crate::PgMetadataStore::get_multipart_part(&*pg, &upload_id, part_number).unwrap(),
+            uploaded_part,
+            "old-primary multipart abort must preserve uploaded part row on node {node_id:?}"
+        );
+        assert_eq!(
+            crate::PgMetadataStore::get_all_multipart_part_segments_for_upload(&*pg, &upload_id)
+                .unwrap(),
+            vec![uploaded_segment.clone()],
+            "old-primary multipart abort must preserve uploaded part segment row on node {node_id:?}"
+        );
+    }
+    let bucket_pg = current_map
+        .node(NodeId::new(0))
+        .unwrap()
+        .storage_node()
+        .pg_topology()
+        .bucket_pg_for(&bucket);
+    let bucket_primary = current_map
+        .metadata_pg_primary_node(current_epoch, PgId::new(bucket_pg))
+        .unwrap();
+    let bucket_pg_store = bucket_primary.storage_node().get_pg(bucket_pg).unwrap();
+    assert!(
+        crate::PgMetadataStore::durable_bucket_write_reservations(&*bucket_pg_store, &bucket)
+            .unwrap()
+            .is_empty(),
+        "old-primary multipart abort must not leak a bucket write reservation"
+    );
+}
+
+#[test]
 fn multipart_abort_drains_pending_completion_before_aborting() {
     let tmp = test_util::tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
