@@ -186,6 +186,10 @@ pub type BucketDeleteFinalVisibilityProvenTestHook =
     Arc<dyn Fn() -> Result<(), StoreError> + Send + Sync>;
 
 #[cfg(any(test, feature = "test-hooks"))]
+pub type BucketDeleteReservationWaitReadyTestHook =
+    Arc<dyn Fn() -> Result<(), StoreError> + Send + Sync>;
+
+#[cfg(any(test, feature = "test-hooks"))]
 pub type BucketDeletePostReservationProgressTestHook =
     Arc<dyn Fn(u32) -> Result<(), StoreError> + Send + Sync>;
 
@@ -238,6 +242,11 @@ static BEFORE_BUCKET_DELETE_FINAL_VISIBILITY_HOOKS: OnceLock<
 #[cfg(any(test, feature = "test-hooks"))]
 static AFTER_BUCKET_DELETE_FINAL_VISIBILITY_PROVEN_HOOKS: OnceLock<
     Mutex<HashMap<usize, BucketDeleteFinalVisibilityProvenTestHook>>,
+> = OnceLock::new();
+
+#[cfg(any(test, feature = "test-hooks"))]
+static AFTER_BUCKET_DELETE_RESERVATION_WAIT_READY_HOOKS: OnceLock<
+    Mutex<HashMap<usize, BucketDeleteReservationWaitReadyTestHook>>,
 > = OnceLock::new();
 
 #[cfg(any(test, feature = "test-hooks"))]
@@ -302,6 +311,11 @@ pub struct BucketDeleteFinalVisibilityStartTestHookGuard {
 
 #[cfg(any(test, feature = "test-hooks"))]
 pub struct BucketDeleteFinalVisibilityProvenTestHookGuard {
+    scope_id: usize,
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+pub struct BucketDeleteReservationWaitReadyTestHookGuard {
     scope_id: usize,
 }
 
@@ -412,6 +426,18 @@ impl Drop for BucketDeleteFinalVisibilityStartTestHookGuard {
 impl Drop for BucketDeleteFinalVisibilityProvenTestHookGuard {
     fn drop(&mut self) {
         let hooks = AFTER_BUCKET_DELETE_FINAL_VISIBILITY_PROVEN_HOOKS
+            .get_or_init(|| Mutex::new(HashMap::new()));
+        hooks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.scope_id);
+    }
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+impl Drop for BucketDeleteReservationWaitReadyTestHookGuard {
+    fn drop(&mut self) {
+        let hooks = AFTER_BUCKET_DELETE_RESERVATION_WAIT_READY_HOOKS
             .get_or_init(|| Mutex::new(HashMap::new()));
         hooks
             .lock()
@@ -598,6 +624,22 @@ fn maybe_run_after_bucket_delete_final_visibility_proven_hook(
     _scope_id: usize,
 ) -> Result<(), StoreError> {
     let hook = AFTER_BUCKET_DELETE_FINAL_VISIBILITY_PROVEN_HOOKS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&_scope_id)
+        .cloned();
+    if let Some(hook) = hook {
+        hook()?;
+    }
+    Ok(())
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+fn maybe_run_after_bucket_delete_reservation_wait_ready_hook(
+    _scope_id: usize,
+) -> Result<(), StoreError> {
+    let hook = AFTER_BUCKET_DELETE_RESERVATION_WAIT_READY_HOOKS
         .get_or_init(|| Mutex::new(HashMap::new()))
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -990,6 +1032,20 @@ impl super::StorageCluster {
             .unwrap_or_else(|e| e.into_inner())
             .insert(scope_id, hook);
         BucketDeleteFinalVisibilityProvenTestHookGuard { scope_id }
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_install_after_bucket_delete_reservation_wait_ready_hook(
+        &self,
+        hook: BucketDeleteReservationWaitReadyTestHook,
+    ) -> BucketDeleteReservationWaitReadyTestHookGuard {
+        let scope_id = self.metadata_command_apply_test_hook_scope_id();
+        let slot = AFTER_BUCKET_DELETE_RESERVATION_WAIT_READY_HOOKS
+            .get_or_init(|| Mutex::new(HashMap::new()));
+        slot.lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(scope_id, hook);
+        BucketDeleteReservationWaitReadyTestHookGuard { scope_id }
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
@@ -3964,6 +4020,16 @@ impl super::StorageCluster {
                 record.outcome == BucketDeleteAttemptOutcomeKind::Retryable
                     && record.phase == BucketDeleteAttemptPhase::StreamCleanup
             });
+        let mut can_resume_at_reservation_wait = self
+            .bucket_delete_matching_attempt_outcome(
+                node_store.bucket_write_reservation_client().as_ref(),
+                pg_id,
+                &durable_drain,
+            )?
+            .is_some_and(|record| {
+                record.outcome == BucketDeleteAttemptOutcomeKind::Retryable
+                    && record.phase == BucketDeleteAttemptPhase::ReservationWait
+            });
         let result = (|| loop {
             loop_iteration += 1;
             attempt_phase = BucketDeleteAttemptPhase::Initial;
@@ -4005,6 +4071,7 @@ impl super::StorageCluster {
                 can_resume_at_mark_deleting = false;
                 can_resume_at_final_visibility = false;
                 can_resume_at_stream_cleanup = false;
+                can_resume_at_reservation_wait = false;
                 if self
                     .drain_unrelated_pending_metadata_command_for_bucket_with_work_budget(
                         pg_id,
@@ -4237,7 +4304,15 @@ impl super::StorageCluster {
                             format!("iteration={loop_iteration}"),
                         );
                     } else {
-                        if can_resume_at_stream_cleanup {
+                        if can_resume_at_reservation_wait {
+                            Self::emit_bucket_delete_begin_loop_step(
+                                bucket,
+                                pg_id,
+                                started,
+                                "resume_reservation_wait",
+                                format!("iteration={loop_iteration}"),
+                            );
+                        } else if can_resume_at_stream_cleanup {
                             Self::emit_bucket_delete_begin_loop_step(
                                 bucket,
                                 pg_id,
@@ -4326,74 +4401,93 @@ impl super::StorageCluster {
                                 continue;
                             }
                         }
-                        attempt_phase = BucketDeleteAttemptPhase::StreamCleanup;
-                        Self::emit_bucket_delete_begin_loop_step(
-                            bucket,
-                            pg_id,
-                            started,
-                            "heartbeat_before_stream_cleanup_start",
-                            format!("iteration={loop_iteration}"),
-                        );
-                        durable_drain =
-                            self.heartbeat_durable_bucket_delete_drain(&durable_drain)?;
-                        Self::emit_bucket_delete_begin_loop_step(
-                            bucket,
-                            pg_id,
-                            started,
-                            "heartbeat_before_stream_cleanup_done",
-                            format!("iteration={loop_iteration}"),
-                        );
-                        Self::emit_bucket_delete_begin_loop_step(
-                            bucket,
-                            pg_id,
-                            started,
-                            "stream_cleanup_start",
-                            format!("iteration={loop_iteration}"),
-                        );
-                        attempt_phase = BucketDeleteAttemptPhase::StreamCleanup;
-                        self.record_bucket_delete_attempt_outcome_for_drain_with_client(
-                            node_store.bucket_write_reservation_client().as_ref(),
-                            &durable_drain,
-                            BucketDeleteAttemptOutcomeKind::Retryable,
-                            BucketDeleteAttemptPhase::StreamCleanup,
-                            "stream cleanup started".to_string(),
-                        );
-                        self.record_bucket_delete_post_reservation_next_object_pg_id(
-                            BucketDeleteExactDrainProgress {
-                                client: node_store.bucket_write_reservation_client().as_ref(),
-                                drain: &durable_drain,
-                                phase: BucketDeleteAttemptPhase::StreamCleanup,
-                            },
-                            0,
-                        )?;
-                        can_resume_at_stream_cleanup = true;
-                        match self.cleanup_abandoned_put_object_stream_uploads_for_bucket(bucket)? {
-                            PutObjectStreamUploadCleanup::Live(source) => {
-                                self.record_bucket_delete_attempt_outcome_for_drain_with_client(
-                                    node_store.bucket_write_reservation_client().as_ref(),
-                                    &durable_drain,
-                                    BucketDeleteAttemptOutcomeKind::NotEmpty,
-                                    BucketDeleteAttemptPhase::StreamCleanup,
-                                    format!(
-                                        "live stream blocker during cleanup before reservation wait: {source:?}"
-                                    ),
-                                );
-                                return Err(
-                                    self.bucket_delete_not_empty_error(bucket, pg_id, source)
-                                );
+                        if !can_resume_at_reservation_wait {
+                            attempt_phase = BucketDeleteAttemptPhase::StreamCleanup;
+                            Self::emit_bucket_delete_begin_loop_step(
+                                bucket,
+                                pg_id,
+                                started,
+                                "heartbeat_before_stream_cleanup_start",
+                                format!("iteration={loop_iteration}"),
+                            );
+                            durable_drain =
+                                self.heartbeat_durable_bucket_delete_drain(&durable_drain)?;
+                            Self::emit_bucket_delete_begin_loop_step(
+                                bucket,
+                                pg_id,
+                                started,
+                                "heartbeat_before_stream_cleanup_done",
+                                format!("iteration={loop_iteration}"),
+                            );
+                            Self::emit_bucket_delete_begin_loop_step(
+                                bucket,
+                                pg_id,
+                                started,
+                                "stream_cleanup_start",
+                                format!("iteration={loop_iteration}"),
+                            );
+                            attempt_phase = BucketDeleteAttemptPhase::StreamCleanup;
+                            self.record_bucket_delete_attempt_outcome_for_drain_with_client(
+                                node_store.bucket_write_reservation_client().as_ref(),
+                                &durable_drain,
+                                BucketDeleteAttemptOutcomeKind::Retryable,
+                                BucketDeleteAttemptPhase::StreamCleanup,
+                                "stream cleanup started".to_string(),
+                            );
+                            self.record_bucket_delete_post_reservation_next_object_pg_id(
+                                BucketDeleteExactDrainProgress {
+                                    client: node_store.bucket_write_reservation_client().as_ref(),
+                                    drain: &durable_drain,
+                                    phase: BucketDeleteAttemptPhase::StreamCleanup,
+                                },
+                                0,
+                            )?;
+                            can_resume_at_stream_cleanup = true;
+                            match self
+                                .cleanup_abandoned_put_object_stream_uploads_for_bucket(bucket)?
+                            {
+                                PutObjectStreamUploadCleanup::Live(source) => {
+                                    self.record_bucket_delete_attempt_outcome_for_drain_with_client(
+                                        node_store.bucket_write_reservation_client().as_ref(),
+                                        &durable_drain,
+                                        BucketDeleteAttemptOutcomeKind::NotEmpty,
+                                        BucketDeleteAttemptPhase::StreamCleanup,
+                                        format!(
+                                            "live stream blocker during cleanup before reservation wait: {source:?}"
+                                        ),
+                                    );
+                                    return Err(
+                                        self.bucket_delete_not_empty_error(bucket, pg_id, source)
+                                    );
+                                }
+                                PutObjectStreamUploadCleanup::Aborted { count } => {
+                                    Self::emit_bucket_delete_begin_loop_step(
+                                        bucket,
+                                        pg_id,
+                                        started,
+                                        "stream_cleanup_done",
+                                        format!(
+                                            "iteration={} pass=before_reservation_wait aborted_stream_uploads={}",
+                                            loop_iteration, count
+                                        ),
+                                    );
+                                }
                             }
-                            PutObjectStreamUploadCleanup::Aborted { count } => {
-                                Self::emit_bucket_delete_begin_loop_step(
-                                    bucket,
-                                    pg_id,
-                                    started,
-                                    "stream_cleanup_done",
-                                    format!(
-                                        "iteration={} pass=before_reservation_wait aborted_stream_uploads={}",
-                                        loop_iteration, count
-                                    ),
-                                );
-                            }
+                            attempt_phase = BucketDeleteAttemptPhase::ReservationWait;
+                            self.record_bucket_delete_attempt_outcome_for_drain_with_client(
+                                node_store.bucket_write_reservation_client().as_ref(),
+                                &durable_drain,
+                                BucketDeleteAttemptOutcomeKind::Retryable,
+                                BucketDeleteAttemptPhase::ReservationWait,
+                                "stream cleanup completed before reservation wait".to_string(),
+                            );
+                            can_resume_at_stream_cleanup = false;
+                            can_resume_at_reservation_wait = true;
+                            #[cfg(any(test, feature = "test-hooks"))]
+                            maybe_run_after_bucket_delete_reservation_wait_ready_hook(
+                                self.metadata_command_apply_test_hook_scope_id(),
+                            )
+                            .map_err(BucketWriteDrainError::from)?;
                         }
                         Self::emit_bucket_delete_begin_loop_step(
                             bucket,
@@ -4403,6 +4497,22 @@ impl super::StorageCluster {
                             format!("iteration={loop_iteration}"),
                         );
                         attempt_phase = BucketDeleteAttemptPhase::ReservationWait;
+                        Self::emit_bucket_delete_begin_loop_step(
+                            bucket,
+                            pg_id,
+                            started,
+                            "heartbeat_before_reservation_wait_start",
+                            format!("iteration={loop_iteration}"),
+                        );
+                        durable_drain =
+                            self.heartbeat_durable_bucket_delete_drain(&durable_drain)?;
+                        Self::emit_bucket_delete_begin_loop_step(
+                            bucket,
+                            pg_id,
+                            started,
+                            "heartbeat_before_reservation_wait_done",
+                            format!("iteration={loop_iteration}"),
+                        );
                         self.wait_for_durable_bucket_write_reservations_empty(
                             bucket,
                             started,

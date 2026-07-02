@@ -9167,24 +9167,22 @@ Keep an explicit Phase 11 close-out before treating the phase as soak-clean:
          progress. Remaining work: decide whether finer stream-cleanup
          page/frontier state is needed, or whether the current conservative
          cleanup resume point is enough for soak closure. A route-change-full-
-         restart soak failure showed that the current stream-cleanup cursor is
-         still too coarse for the reservation-wait boundary: a foreground
-         delete can acquire the durable drain, complete the initial exact-PG
-         scan and stream cleanup, then exhaust the begin budget immediately on
-         entering reservation wait. A later same-generation foreground retry can
-         then spend its own budget in authorization/reservation snapshot against
-         the preserved drain, even though the durable attempt is making
-         background progress. Add a durable "stream cleanup completed /
-         reservation wait" phase or equivalent cursor so adopted attempts can
-         skip the already-completed initial scan and stream cleanup, then resume
-         at reservation wait with a fresh budget. Same-generation foreground
-         retries should adopt this in-progress drain before expensive
-         authorization/snapshot polling, rather than treating their own
-         preserved drain as ordinary write-reservation contention. The
-         regression should inject budget exhaustion after stream cleanup but
-         before reservation wait, then assert the next foreground/background
-         adoption resumes at reservation wait and does not redo the initial
-         all-PG scan or stream cleanup.
+         restart soak failure showed that the stream-cleanup cursor was too
+         coarse for the reservation-wait boundary: a foreground delete could
+         acquire the durable drain, complete the initial exact-PG scan and stream
+         cleanup, then exhaust the begin budget immediately on entering
+         reservation wait. A later same-generation foreground retry could then
+         spend its own budget in authorization/reservation snapshot against the
+         preserved drain, even though the durable attempt was making background
+         progress. Status: completed. DeleteBucket now records a retryable
+         `reservation_wait` attempt outcome after the pre-reservation stream
+         cleanup completes. Foreground retries and the background
+         `BucketDeleteBegin` worker can adopt that cursor, skip the completed
+         initial scan and stream cleanup, heartbeat the drain, and resume at
+         reservation wait with a fresh request budget. Storage and coordinator
+         regressions cover this adopted path and assert it still performs the
+         post-reservation object-PG validation before marking the bucket
+         deleting.
          Final-visibility
          adoption now also has coordinator-level reclaim-worker regressions that
          seed durable `final_visibility_check` and `final_visibility_proven`
