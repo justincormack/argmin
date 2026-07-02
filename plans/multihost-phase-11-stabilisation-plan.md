@@ -468,12 +468,69 @@ when prioritised. They correspond to the remaining findings from the Phase 11 re
   transfer source route provenance, imported transfer markers, and restart epoch bumping at
   the parser/runtime boundary.
 
-- **Slice 6: Deterministic fault-injection harness promotion.** Promote the
-  token-scoped deterministic fault gate (Phase 11 work item 11) into the standard
-  verification path for the high partial-state-risk boundaries: after payload shard write
-  before metadata publish, after pending-command install before apply, after apply before
-  response, during cleanup/finalization, and across PG state transitions. This replaces the
-  slow, non-deterministic soak discovery of these bugs with fast precise tests.
+- **Slice 6: Deterministic fault-injection matrix.** The smoke suites are now mostly
+  finding `DeleteBucket`, timeout, retry, and whole-process robustness issues. They are
+  still useful, but they are too slow and non-deterministic to be the primary way we find
+  partial-state correctness bugs in ordinary object/MPU/read paths. Promote the existing
+  token-scoped failpoint machinery into an explicit coverage matrix. Each test should pause
+  exactly one operation at a named boundary, advance the runtime map or PG state, release
+  that operation, and then assert exact metadata, pending-slot, reservation, shard/ack, and
+  visibility outcomes.
+
+  Boundary classes:
+  - **B1: after payload shard write, before metadata publish.** Payload is durable but the
+    object/part metadata command has not been applied.
+  - **B2: after reservation or pending-command install, before metadata apply.** Bucket
+    write proof, drain, or metadata pending slot exists and must be cleaned or completed
+    exactly once.
+  - **B3: after metadata apply, before response/cleanup.** The command committed, but the
+    caller may see a lost response or run cleanup under a newer route.
+  - **B4: cleanup/finalization.** Best-effort cleanup must use retained placement/proof
+    routes and must not leak or delete the wrong generation.
+  - **B5: route/PG state transition.** The operation starts with one route/primary and
+    finishes after a runtime-map refresh, acting-set change, or Peering transition.
+
+  Coverage matrix:
+
+  | Path | Positive crossing coverage | Stale-primary / Peering fail-closed coverage | Remaining Slice 6 gap |
+  | --- | --- | --- | --- |
+  | Direct PUT / overwrite | Believed covered locally at B1/B2: pause after shard write or generation reservation and commit exactly once across a runtime-map epoch change. | Believed covered locally and through installed Unix clients for control-plane-driven Peering: no metadata publish, no leaked bucket-write proof, staged payload cleaned by retained routes. | Inventory exact test names; add B3 lost-response/idempotent-retry coverage if not already covered by command replay tests. |
+  | Streaming PutObject | Needs explicit inventory. This path uses `begin_stream_put`/`CreateStreamUploadReq { target: PutObject }`, segment append, and `finalize_stream_put`/`CommitStreamPut`, rather than the direct PUT publisher. | Needs explicit inventory for stale route/Peering at stream session create, segment append/finalize, committed stream PUT publish, and abort cleanup. | Add or name tests for session creation, segment append, `CommitStreamPut`, terminal checksum/final chunk failure cleanup, and abort cleanup across B1/B2/B4/B5. |
+  | DeleteObject | Believed covered locally before metadata apply across a runtime-map epoch change. | Believed covered locally and through installed Unix clients for stale epoch and real Peering; includes reservation-acquired cleanup regression. | Inventory exact test names; add explicit B3 response-loss/retry shape for committed delete if absent. |
+  | Object metadata mutations: tags/legal hold/retention/ACL-shaped path | Believed covered for tags, legal hold, and retention locally before shared `PutObjectMetadata` apply across an epoch change. ACL is same serialization shape and lower priority. | Believed covered for tags locally and through installed Unix clients for stale epoch and real Peering. | Inventory exact test names; decide whether ACL needs one representative test or remains covered by shared command-shape evidence. |
+  | CopyObject destination publish | Believed covered locally before destination `CommitDirectPutObject` across a runtime-map epoch change. | Believed covered locally and through installed Unix clients for real Peering; source remains unchanged, destination metadata is not published, copied shards/acks are cleaned. | Inventory exact test names; add B3 committed-copy response-loss/idempotent retry coverage if missing. |
+  | CompleteMultipartUpload | Believed covered locally before multipart commit apply across a runtime-map epoch change. | Believed covered locally and through installed Unix clients for stale epoch and real Peering; staged upload and selected part rows are preserved. | Inventory exact test names; add response-loss/idempotent completion retry at B3 if not already pinned elsewhere. |
+  | AbortMultipartUpload | Needs explicit inventory. Abort has its own reservation, pending-command, cleanup, and apply path, so it is a real B2/B4 boundary rather than a variant of complete. | Needs stale route/Peering fail-closed coverage that preserves or deletes upload/part/stream state according to the abort stage and releases any bucket-write proof. | Add or name tests for abort after reservation/pending-command install, abort cleanup across route refresh, and stale-primary abort rejection. |
+  | UploadPart stream finalization | Believed covered locally before `CommitStreamPart` apply across an epoch change, including UploadPartCopy-shaped copied segments. | Believed covered by direct-RPC stale-route rejection and installed Unix stale/Peering paths; active session, staged segments, shard files, and ack rows are preserved. | Inventory exact test names; add B3 committed-part response-loss/retry coverage if missing. |
+  | UploadPart stream-session creation | Believed covered by ordinary command apply/retry tests; local crossing coverage is lower priority because no payload has been staged yet. | Believed covered through direct-RPC and installed Unix stale/Peering paths; no session, segment rows, pending command, or reservation leak. | Inventory exact test names; add a minimal B2 pending-slot/reservation crossing test if the existing command tests do not hit it. |
+  | GET/HEAD payload reads | Believed covered locally after metadata snapshot and by installed-Unix retained-route read: old payload shards are read through stored placement epoch after data-PG route change. | Peering fail-closed coverage believed to exist for object metadata PG Peering. | Inventory exact test names; add an explicit malformed/stale current-route negative where a current-route payload read cannot accidentally succeed after disjoint placement. |
+  | Object and version LIST | Believed covered locally across route-map swaps during listing and pagination, including delimiter/common-prefix continuation; UAT route-change smokes cover process-level retained-list behavior. | Peering fail-closed coverage believed to exist for object metadata PG Peering. | Inventory exact test names; add a deterministic multi-object-PG LIST route-change matrix if pagination coverage does not already span object-PG movement. |
+  | DeleteBucket begin/finalize | Covered by a separate bucket-delete hardening plan and many recent regressions. | Partially covered, but recent soak failures show this is still the largest open correctness/robustness area. | Keep this out of the generic matrix except for shared failpoint API reuse; track durable attempt/adoption/finalizer interleavings in the bucket-delete plan. |
+  | Control-plane PG transitions | Slice 4 covers `open -> mutate -> save -> reload -> continue` for current transitions. | Stale runtime-map and stale authorization fail-closed coverage exists. | Slice 7 handles lost-response/check-applied behavior for mutating control-plane RPCs. |
+
+  Harness requirements:
+  - failpoints must be named and token-scoped; no sleeps or global "next operation" hooks
+    that unrelated tests/background workers can consume;
+  - every pause must be observable by the test before it mutates the route map or PG state;
+  - positive crossing tests must assert exactly one committed metadata command and final
+    user-visible state;
+  - fail-closed tests must assert no visible partial state, no pending command in source or
+    current epochs, no leaked bucket-write reservation/drain, and correct shard/ack cleanup
+    or preservation according to the operation stage;
+  - installed-Unix variants are required for boundaries where RPC command-build/apply or
+    remote cleanup semantics differ from local stores; otherwise local tests are preferred
+    for precision and speed.
+
+  Exit criteria:
+  1. The matrix above is either marked covered with exact test names or has a deliberate
+     open item linked to another plan. Until then, "believed covered" means the old Phase
+     11 notes claim coverage but the tests still need to be named for auditability.
+  2. Ordinary object/MPU/read/list partial-state failures are pinned by deterministic cargo
+     tests rather than waiting for smoke discovery.
+  3. Whole-process route-change smokes remain as integration confidence only; they are not
+     the sole evidence for any high-risk boundary.
+  4. Bucket-delete-specific fault interleavings remain tracked in the bucket-delete
+     hardening work, with only shared failpoint API requirements duplicated here.
 
 - **Slice 7: Control-plane RPC retry and command check-applied semantics.** The current
   Unix control-plane RPC path uses a single one-second read/write timeout on both client and
