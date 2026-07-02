@@ -1765,8 +1765,42 @@ impl LocalClusterMap {
                 LocalNodeStore::new(node_id, canonical_data_dir, Arc::new(storage_node)),
             );
         }
+        // Recovery phase A: clean epoch-mismatched orphan pending command slots
+        // on every node BEFORE the cluster-wide validation below. That
+        // validation reads the pending slot through the epoch-checked path,
+        // which rejects an orphan with `StaleMetadataOperation`; without this
+        // phase a crash-leftover orphan would fail the whole open before full
+        // recovery could clean it. Same-epoch primary pending slots are left
+        // intact for convergence.
+        if validate_local_metadata_command_replay {
+            for (node_id, store) in &nodes {
+                store
+                    .storage_node()
+                    .prepare_pg_metadata_command_recovery(*node_id)
+                    .map_err(|source| ClusterBuildError::OpenLocalNode {
+                        node_id: node_id.as_u32(),
+                        source,
+                    })?;
+            }
+        }
         if validate_local_metadata_command_replay {
             validate_metadata_command_replay_state(&nodes, &pg_routes, &pg_ids, cluster_epoch)?;
+        }
+        // Recovery full pass: now that convergence has completed and same-epoch
+        // pending slots have been used, reconcile any remaining terminal and
+        // orphan slots on every node (including replicas the cluster-wide pass
+        // does not clean) and fail closed on command-log or digest corruption
+        // before the cluster is returned.
+        if validate_local_metadata_command_replay {
+            for (node_id, store) in &nodes {
+                store
+                    .storage_node()
+                    .recover_pg_metadata_command_state(*node_id)
+                    .map_err(|source| ClusterBuildError::OpenLocalNode {
+                        node_id: node_id.as_u32(),
+                        source,
+                    })?;
+            }
         }
 
         let metadata_primary = nodes

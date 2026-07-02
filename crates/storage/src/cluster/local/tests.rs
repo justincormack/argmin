@@ -812,6 +812,39 @@ fn create_bucket_metadata_command(
     )
 }
 
+fn create_bucket_metadata_command_with_epoch(
+    pg_id: PgId,
+    log_index: u64,
+    bucket: crate::BucketName,
+    epoch: ClusterEpoch,
+) -> MetadataCommandEnvelope {
+    let owner = crate::CanonicalUserId::from_principal("owner");
+    let acl_grants = crate::AclGrants::default();
+    let config = crate::CreateBucketConfig {
+        name: bucket.as_str(),
+        owner_principal: "owner",
+        owner_canonical_id: &owner,
+        acl_grants: &acl_grants,
+        public_read: false,
+        public_write: false,
+        versioning: crate::BucketVersioningState::Disabled,
+        object_lock: crate::BucketObjectLockConfig::default(),
+        ownership_controls: crate::BucketOwnershipControls {
+            object_ownership: crate::BucketObjectOwnership::ObjectWriter,
+        },
+    };
+    MetadataCommandEnvelope::new(
+        MetadataCommandId::new(
+            epoch,
+            pg_id,
+            MetadataCommandLogIndex::new(log_index).unwrap(),
+        ),
+        MetadataCommandPayload::CreateBucket(
+            CreateBucketCommand::from_config(&config, 1_234, log_index).unwrap(),
+        ),
+    )
+}
+
 fn create_test_bucket_with_versioning(
     cluster: &crate::StorageCluster,
     bucket: &crate::BucketName,

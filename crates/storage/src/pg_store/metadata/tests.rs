@@ -1933,6 +1933,99 @@ fn metadata_digest_bootstrap_marker_repairs_stale_cache_with_complete_triggers()
     assert!(store.metadata_digest_bootstrap_complete().unwrap());
 }
 
+#[test]
+fn pg_store_recovery_repairs_cache_only_table_digest_drift() {
+    let tmp = test_util::tempdir();
+    let store = PgStore::open(tmp.path(), 1).unwrap();
+    let first_bucket = trusted_bucket_name("cache-drift-first");
+    let first_command = create_bucket_probe_command(store.pg_id, 1, first_bucket.clone(), 1);
+    store
+        .apply_metadata_command_and_record(0, &first_command)
+        .unwrap();
+
+    let state_before_drift = store.metadata_command_replica_state().unwrap();
+    let materialized_before_drift = store.metadata_state_digest().unwrap();
+    assert_eq!(state_before_drift.state_digest, materialized_before_drift);
+    assert!(
+        store
+            .test_metadata_digest_table_mismatches()
+            .unwrap()
+            .is_empty(),
+        "test setup should start with cached table digests matching materialized rows"
+    );
+
+    store
+        .conn
+        .execute(
+            "UPDATE metadata_table_digests \
+             SET table_digest = table_digest + 1, row_hash_sum = row_hash_sum + 1 \
+             WHERE table_name = ?1",
+            params!["buckets"],
+        )
+        .unwrap();
+    assert_eq!(
+        store.metadata_command_replica_state().unwrap().state_digest,
+        materialized_before_drift,
+        "cache-only drift must not change the durable replica-state digest"
+    );
+    assert_eq!(
+        store.metadata_state_digest().unwrap(),
+        materialized_before_drift,
+        "cache-only drift must not change materialized rows"
+    );
+    assert!(
+        !store
+            .test_metadata_digest_table_mismatches()
+            .unwrap()
+            .is_empty(),
+        "test setup must create cached-vs-materialized table digest drift"
+    );
+
+    drop(store);
+    let recovered = PgStore::open(tmp.path(), 1).unwrap();
+    recovered
+        .recover(super::super::PgStoreRecoveryContext {
+            node_id: placement::NodeId::new(0),
+        })
+        .unwrap();
+    assert!(
+        recovered
+            .test_metadata_digest_table_mismatches()
+            .unwrap()
+            .is_empty(),
+        "recovery should refresh cache-only per-table digest drift"
+    );
+    assert_eq!(
+        recovered.cached_metadata_state_digest().unwrap(),
+        recovered.metadata_state_digest().unwrap(),
+        "cached state digest should match materialized rows after recovery"
+    );
+    recovered
+        .metadata_command_replica_state_for_heartbeat(0, ClusterEpoch::INITIAL)
+        .unwrap();
+
+    let second_bucket = trusted_bucket_name("cache-drift-second");
+    let second_command = create_bucket_probe_command(recovered.pg_id, 2, second_bucket.clone(), 2);
+    recovered
+        .metadata_command_acceptance(0, &second_command)
+        .expect("recovery should leave the cached digest clean for the next command");
+    recovered
+        .apply_metadata_command_and_record(0, &second_command)
+        .unwrap();
+    let final_state = recovered.metadata_command_replica_state().unwrap();
+    assert_eq!(
+        final_state.state_digest,
+        recovered.metadata_state_digest().unwrap()
+    );
+    assert!(
+        recovered
+            .test_metadata_digest_table_mismatches()
+            .unwrap()
+            .is_empty(),
+        "later metadata command should not recreate cached table digest drift"
+    );
+}
+
 fn insert_digest_multipart_upload(store: &PgStore, upload_id: &UploadId) {
     let owner = test_owner();
     let bucket = trusted_bucket_name("digest-bucket");

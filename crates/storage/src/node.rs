@@ -29,7 +29,9 @@ use crate::metadata_command::{
     CreateBucketCommand, MetadataCommandEnvelope, MetadataCommandId, MetadataCommandLogIndex,
     MetadataCommandPayload,
 };
-use crate::pg_store::{PgClusterMapHistoryReferenceSummary, PgStore, ScavengerShardFileScan};
+use crate::pg_store::{
+    PgClusterMapHistoryReferenceSummary, PgStore, PgStoreRecoveryContext, ScavengerShardFileScan,
+};
 use crate::pg_topology::PgTopology;
 use crate::traits::{PgMetadataStore, ShardStore, StorageNode};
 #[cfg(test)]
@@ -585,6 +587,38 @@ impl SharedStorageNode {
             summary.merge(pg.cluster_map_history_reference_summary()?);
         }
         Ok(summary)
+    }
+
+    /// Recover every opened PG store on this node after open, before the node
+    /// serves any request. See `PgStore::recover` and the "PG Store Recovery
+    /// Boundary" guide section. The caller supplies the owning node id; the
+    /// recovery epoch is read from each store's own replica state.
+    pub(crate) fn recover_pg_metadata_command_state(
+        &self,
+        node_id: NodeId,
+    ) -> Result<(), StoreError> {
+        let ctx = PgStoreRecoveryContext { node_id };
+        for &pg_id in self.pg_id_list.iter() {
+            self.get_pg(pg_id)?.recover(ctx)?;
+        }
+        Ok(())
+    }
+
+    /// Recovery phase A for clustered open paths: clean epoch-mismatched orphan
+    /// pending command slots on every opened PG. This must run before a
+    /// cluster-wide convergence pass, which would otherwise reject an orphan
+    /// through the epoch-checked pending-slot read before full recovery could
+    /// clean it. Same-epoch primary pending slots are preserved for convergence.
+    pub(crate) fn prepare_pg_metadata_command_recovery(
+        &self,
+        node_id: NodeId,
+    ) -> Result<(), StoreError> {
+        let ctx = PgStoreRecoveryContext { node_id };
+        for &pg_id in self.pg_id_list.iter() {
+            self.get_pg(pg_id)?
+                .recover_clean_orphan_pending_command_slots(ctx)?;
+        }
+        Ok(())
     }
 
     pub fn bucket_pg_id_for(&self, bucket: &BucketName) -> u32 {
@@ -2131,6 +2165,141 @@ mod tests {
                 }
             ),
             "heartbeat proof must not advertise a corrupted replay state: {err:?}"
+        );
+    }
+
+    fn create_bucket_command_for(bucket: &str, epoch: ClusterEpoch) -> MetadataCommandEnvelope {
+        let owner = crate::OwnerIdentity::from_principal("owner");
+        let config = CreateBucketConfig {
+            name: bucket,
+            owner_principal: &owner.principal,
+            owner_canonical_id: &owner.canonical_id,
+            acl_grants: &AclGrants::default(),
+            public_read: false,
+            public_write: false,
+            versioning: BucketVersioningState::Disabled,
+            object_lock: BucketObjectLockConfig::default(),
+            ownership_controls: crate::BucketOwnershipControls {
+                object_ownership: crate::BucketObjectOwnership::ObjectWriter,
+            },
+        };
+        MetadataCommandEnvelope::new(
+            MetadataCommandId::new(
+                epoch,
+                PgId::new(0),
+                MetadataCommandLogIndex::new(1).unwrap(),
+            ),
+            MetadataCommandPayload::CreateBucket(
+                CreateBucketCommand::from_config(&config, 123, 1).unwrap(),
+            ),
+        )
+    }
+
+    #[test]
+    fn shared_node_recover_succeeds_on_clean_store() {
+        let tmp = test_util::tempdir();
+        let node = SharedStorageNode::open(tmp.path(), &[0]).unwrap();
+        node.recover_pg_metadata_command_state(NodeId::new(7))
+            .expect("recovering a freshly opened clean store must succeed");
+    }
+
+    #[test]
+    fn shared_node_recover_cleans_epoch_mismatched_orphan_pending_command() {
+        let tmp = test_util::tempdir();
+        let node = SharedStorageNode::open(tmp.path(), &[0]).unwrap();
+        let bucket = bucket_name("future-pending-recover");
+        let future_epoch = ClusterEpoch::new(2).unwrap();
+        let command = create_bucket_command_for(bucket.as_str(), future_epoch);
+        let metadata_state = {
+            let pg = node.get_pg(0).unwrap();
+            pg.try_insert_pending_metadata_command_slot(7, &command, Some(&bucket))
+                .unwrap();
+            assert!(pg
+                .pending_metadata_command_slot_any_epoch(7)
+                .unwrap()
+                .is_some());
+            pg.metadata_command_replica_state().unwrap()
+        };
+
+        // Recovery must clean the orphan BEFORE replay validation. Otherwise
+        // the epoch-checked pending-slot read inside replay validation would
+        // reject the orphan (StaleMetadataOperation) and recovery would fail
+        // instead of healing.
+        node.recover_pg_metadata_command_state(NodeId::new(7))
+            .expect("recovery must reconcile an epoch-mismatched orphan slot");
+
+        let pg = node.get_pg(0).unwrap();
+        assert!(
+            pg.pending_metadata_command_slot_any_epoch(7)
+                .unwrap()
+                .is_none(),
+            "orphan pending slot must be removed by recovery"
+        );
+        let state = pg.metadata_command_replica_state().unwrap();
+        assert_eq!(state.applied_log_index, metadata_state.applied_log_index);
+    }
+
+    #[test]
+    fn shared_node_recover_cleans_terminal_pending_command() {
+        let tmp = test_util::tempdir();
+        let node = SharedStorageNode::open(tmp.path(), &[0]).unwrap();
+        let bucket = bucket_name("terminal-pending-recover");
+        let command = create_bucket_command_for(bucket.as_str(), ClusterEpoch::INITIAL);
+        {
+            let pg = node.get_pg(0).unwrap();
+            pg.try_insert_pending_metadata_command_slot(7, &command, Some(&bucket))
+                .unwrap();
+            pg.record_metadata_command_applied(7, &command).unwrap();
+            assert!(pg
+                .pending_metadata_command_slot(7, ClusterEpoch::INITIAL)
+                .unwrap()
+                .is_some());
+        }
+
+        node.recover_pg_metadata_command_state(NodeId::new(7))
+            .expect("recovery must reconcile a terminal pending slot");
+
+        let pg = node.get_pg(0).unwrap();
+        assert!(
+            pg.pending_metadata_command_slot(7, ClusterEpoch::INITIAL)
+                .unwrap()
+                .is_none(),
+            "terminal pending slot must be removed by recovery"
+        );
+        let state = pg.metadata_command_replica_state().unwrap();
+        assert_eq!(state.applied_log_index, 1);
+    }
+
+    #[test]
+    fn shared_node_recover_fails_closed_on_corrupted_state_digest() {
+        let tmp = test_util::tempdir();
+        let node = SharedStorageNode::open(tmp.path(), &[0]).unwrap();
+        {
+            let pg = node.get_pg(0).unwrap();
+            pg.connection()
+                .execute(
+                    "UPDATE metadata_command_replica_state \
+                     SET state_digest = state_digest + 1 \
+                     WHERE singleton = 0",
+                    [],
+                )
+                .unwrap();
+        }
+
+        let err = node
+            .recover_pg_metadata_command_state(NodeId::new(7))
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                err,
+                StoreError::MetadataStateDigestMismatch {
+                    node_id: 7,
+                    pg_id: 0,
+                    ..
+                }
+            ),
+            "recovery must fail closed on a corrupted state digest: {err:?}"
         );
     }
 

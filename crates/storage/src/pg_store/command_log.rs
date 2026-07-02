@@ -2383,6 +2383,115 @@ impl PgStore {
         )
     }
 
+    /// Recover this PG store after open before it serves any request.
+    ///
+    /// This is the recovery boundary documented in `guides/storage-cluster-invariants.md`.
+    /// The owning node id comes from the caller (which owns node identity); the
+    /// recovery epoch is read from the store's own replica state and must never
+    /// be supplied externally, since orphan detection compares the pending slot's
+    /// epoch against that stored epoch.
+    ///
+    /// Ordering is load-bearing and mirrors `pg_heartbeat_observation`: the
+    /// epoch-mismatched orphan cleanup runs before replay validation, because
+    /// replay validation reads the pending slot through the epoch-checked path
+    /// and would otherwise reject the orphan before cleanup could run.
+    ///
+    /// Clustered open paths (the local cluster builder) cannot call this directly
+    /// as one shot: the cluster-wide convergence pass needs same-epoch primary
+    /// pending slots intact and would itself reject an orphan through the
+    /// epoch-checked slot read. Those paths call
+    /// [`recover_clean_orphan_pending_command_slots`] before convergence and this
+    /// method after.
+    pub(crate) fn recover(
+        &self,
+        ctx: super::PgStoreRecoveryContext,
+    ) -> Result<MetadataCommandReplicaState, StoreError> {
+        let node_id = ctx.node_id.as_u32();
+        observability::trace_scope!(
+            TRACE_TARGET,
+            "PgStore::recover",
+            "pg_id={} node_id={}",
+            self.pg_id,
+            node_id,
+        );
+        self.recover_clean_orphan_pending_command_slots(ctx)?;
+        // The recovery epoch is the store's own replica-state epoch. An external
+        // authority/config epoch must not be used: orphan detection compares the
+        // slot's epoch against this stored epoch.
+        let state = self.metadata_command_replica_state()?;
+        let stored_epoch = state.cluster_epoch;
+        // Replay validation reconciles terminal pending slots, validates the
+        // command-log hash chain, and verifies the stored state digest against a
+        // full materialised recompute. It fails closed on corruption.
+        let state = self.validate_metadata_command_replay_state(node_id, stored_epoch)?;
+        // Detect cached per-table digest drift that the state-digest check above
+        // cannot see (xor-cancelling drift), and refresh the cached digests from
+        // materialised rows when found so a drifted trigger-maintained cache
+        // cannot poison the next mutation.
+        self.repair_metadata_table_digest_cache_drift(node_id)?;
+        Ok(state)
+    }
+
+    /// Recovery phase A: clean epoch-mismatched orphan pending command slots.
+    ///
+    /// This must run before any cluster-wide replay validation in clustered open
+    /// paths. Cluster-wide validation reads the pending slot through the
+    /// epoch-checked path (`pending_metadata_command_slot`), which returns
+    /// `StaleMetadataOperation` when the slot's epoch differs from the store
+    /// epoch; an orphan would therefore reject the whole open before full
+    /// recovery could clean it. This phase only removes slots whose epoch
+    /// differs from the store's replica-state epoch, so same-epoch primary
+    /// pending slots remain available for convergence.
+    pub(crate) fn recover_clean_orphan_pending_command_slots(
+        &self,
+        ctx: super::PgStoreRecoveryContext,
+    ) -> Result<(), StoreError> {
+        let node_id = ctx.node_id.as_u32();
+        let state = self.metadata_command_replica_state()?;
+        let stored_epoch = state.cluster_epoch;
+        self.clean_epoch_mismatched_orphan_pending_metadata_command_slot(node_id, stored_epoch)?;
+        Ok(())
+    }
+
+    /// Detect per-table cached-vs-materialised digest drift and refresh the
+    /// cached digests when drift is found.
+    ///
+    /// Runs after replay validation has already confirmed the stored state
+    /// digest against a full materialised recompute, so any mismatch here is
+    /// cache-only drift with provably-correct materialised state. The detection
+    /// must run before the refresh: `refresh_all_metadata_table_digests`
+    /// overwrites the cached rows from materialised rows and would destroy the
+    /// drift evidence if run first.
+    fn repair_metadata_table_digest_cache_drift(&self, node_id: u32) -> Result<(), StoreError> {
+        let cached = self.cached_metadata_table_digests()?;
+        let mut drifted_tables: Vec<&'static str> = Vec::new();
+        for table in METADATA_DIGEST_TABLES {
+            let materialised = self.metadata_table_digest(table)?;
+            let Some(&cached_digest) = cached.get(table.name) else {
+                // A missing cached row is itself drift the refresh will repair.
+                drifted_tables.push(table.name);
+                continue;
+            };
+            if cached_digest != materialised {
+                drifted_tables.push(table.name);
+            }
+        }
+        if drifted_tables.is_empty() {
+            return Ok(());
+        }
+        observability::trace_scope!(
+            TRACE_TARGET,
+            "PgStore::recover digest cache drift",
+            "pg_id={} node_id={} drifted_tables={:?}",
+            self.pg_id,
+            node_id,
+            drifted_tables,
+        );
+        self.refresh_all_metadata_table_digests()?;
+        self.mark_metadata_state_digest_clean()?;
+        Ok(())
+    }
+
     pub(crate) fn metadata_command_replica_state_for_heartbeat(
         &self,
         node_id: u32,

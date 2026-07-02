@@ -48,6 +48,7 @@ use crate::metadata_command::{
 use crate::schema::init_pg_schema;
 use crate::traits::{DurableBucketWriteReservationHeartbeat, PgMetadataStore, ShardStore};
 use crate::types::*;
+use placement::NodeId;
 
 const TRACE_TARGET: &str = "storage";
 
@@ -396,6 +397,19 @@ const SQLITE_PROFILE_DISABLED: u64 = u64::MAX;
 const UNCLEAN_METADATA_DIGEST_REVISION: u64 = u64::MAX;
 static SQLITE_PROFILE_THRESHOLD_NANOS: AtomicU64 = AtomicU64::new(SQLITE_PROFILE_DISABLED);
 static SHARD_TMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+/// Inputs required to recover a [`PgStore`] after open.
+///
+/// Recovery reconciles benign crash leftovers (terminal and epoch-mismatched
+/// orphan pending command slots) and fails closed on command-log or digest
+/// corruption before the store serves. The owning node id is the only external
+/// input: the recovery epoch is read from the store's own replica state, never
+/// supplied by the caller. See the "PG Store Recovery Boundary" section of
+/// `guides/storage-cluster-invariants.md`.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PgStoreRecoveryContext {
+    pub node_id: NodeId,
+}
 
 impl PgStore {
     /// Open (or create) a PG store at the given directory.
