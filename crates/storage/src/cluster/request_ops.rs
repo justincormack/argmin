@@ -4901,6 +4901,100 @@ impl super::StorageCluster {
                 );
                 if Self::bucket_delete_begin_error_should_rollback_drain(&error) {
                     self.rollback_durable_bucket_delete_drain(&durable_drain)?;
+                } else if matches!(
+                    error,
+                    BucketWriteDrainError::Store(StoreError::MetadataCommandContention { .. })
+                ) {
+                    match node_store
+                        .bucket_metadata_client()
+                        .head_bucket_raw(pg_id, bucket)
+                    {
+                        Ok(current)
+                            if current.state == BucketState::Deleting
+                                && current.bucket_incarnation_generation
+                                    == current_bucket_incarnation_generation =>
+                        {
+                            match self.pending_metadata_command_for_bucket(pg_id, bucket) {
+                                Ok(None) => {
+                                    let _ = observability::emit_flight_event(
+                                        super::TRACE_TARGET,
+                                        "bucket_delete_begin_retryable_error_observed_deleting",
+                                        format!(
+                                            "bucket={:?} pg_id={} phase={:?} elapsed_us={} error={:?}",
+                                            bucket,
+                                            pg_id.get(),
+                                            attempt_phase,
+                                            started.elapsed().as_micros(),
+                                            error
+                                        ),
+                                    );
+                                    let _ = observability::emit_flight_event(
+                                        super::TRACE_TARGET,
+                                        "bucket_delete_begin_done",
+                                        format!(
+                                            "bucket={:?} pg_id={} elapsed_us={}",
+                                            bucket,
+                                            pg_id.get(),
+                                            started.elapsed().as_micros()
+                                        ),
+                                    );
+                                    return Ok(());
+                                }
+                                Ok(Some(_)) => {}
+                                Err(pending_recheck_error) => {
+                                    let _ = observability::emit_flight_event(
+                                        super::TRACE_TARGET,
+                                        "bucket_delete_begin_retryable_error_pending_recheck_failed",
+                                        format!(
+                                            "bucket={:?} pg_id={} phase={:?} elapsed_us={} original_error={:?} pending_recheck_error={:?}",
+                                            bucket,
+                                            pg_id.get(),
+                                            attempt_phase,
+                                            started.elapsed().as_micros(),
+                                            error,
+                                            pending_recheck_error
+                                        ),
+                                    );
+                                }
+                            }
+                        }
+                        Ok(_) => {}
+                        Err(recheck_error) => {
+                            let _ = observability::emit_flight_event(
+                                super::TRACE_TARGET,
+                                "bucket_delete_begin_retryable_error_deleting_recheck_failed",
+                                format!(
+                                    "bucket={:?} pg_id={} phase={:?} elapsed_us={} original_error={:?} recheck_error={:?}",
+                                    bucket,
+                                    pg_id.get(),
+                                    attempt_phase,
+                                    started.elapsed().as_micros(),
+                                    error,
+                                    recheck_error
+                                ),
+                            );
+                        }
+                    }
+                    self.record_bucket_delete_attempt_outcome_for_drain_with_client(
+                        node_store.bucket_write_reservation_client().as_ref(),
+                        &durable_drain,
+                        BucketDeleteAttemptOutcomeKind::Retryable,
+                        attempt_phase,
+                        format!("retryable begin error: {error:?}"),
+                    );
+                    let _ = observability::event(
+                        super::TRACE_TARGET,
+                        "bucket_delete_begin_preserved_retryable_attempt",
+                        Some(format_args!(
+                            "bucket={:?} pg_id={} drain_id={} error={:?}",
+                            bucket, pg_id, durable_drain.record.drain_id, error
+                        )),
+                    );
+                    self.enqueue_bucket_delete_begin(
+                        bucket,
+                        current_bucket_execution_generation,
+                        current_bucket_incarnation_generation,
+                    );
                 } else {
                     self.record_bucket_delete_attempt_outcome_for_drain_with_client(
                         node_store.bucket_write_reservation_client().as_ref(),

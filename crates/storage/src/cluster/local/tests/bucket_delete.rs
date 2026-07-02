@@ -3504,6 +3504,144 @@ fn begin_bucket_delete_renews_drain_after_final_visibility_proof_before_retryabl
 }
 
 #[test]
+fn begin_bucket_delete_treats_retryable_error_after_concurrent_mark_deleting_as_success() {
+    let _serial = lock_bucket_scoped_hook_test();
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2], ec_shape).unwrap();
+    let bucket = {
+        let topology = map
+            .nodes
+            .get(&NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        bucket_for_pg(topology, 1, "delete-concurrent-mark-success-")
+    };
+    set_route_primary(&mut map, 1, NodeId::new(1));
+
+    let map = Arc::new(map);
+    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let concurrent_cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    create_test_bucket(&cluster, &bucket);
+
+    let hook_ran = Arc::new(AtomicBool::new(false));
+    let hook_ran_for_hook = Arc::clone(&hook_ran);
+    let hook_bucket = bucket.clone();
+    let _proven_hook_guard = cluster.test_install_after_bucket_delete_final_visibility_proven_hook(
+        Arc::new(move || {
+            if hook_ran_for_hook.swap(true, Ordering::SeqCst) {
+                return Ok(());
+            }
+            concurrent_cluster
+                .begin_bucket_delete(&hook_bucket)
+                .expect("concurrent begin should mark the same bucket incarnation deleting");
+            Err(StoreError::MetadataCommandContention {
+                context: "injected retryable error after concurrent mark deleting",
+            })
+        }),
+    );
+
+    cluster
+        .begin_bucket_delete(&bucket)
+        .expect("retryable error after same-incarnation MarkBucketDeleting should be success");
+    assert!(
+        hook_ran.load(Ordering::SeqCst),
+        "test hook should simulate a concurrent MarkBucketDeleting before retryable exit"
+    );
+    assert_eq!(
+        cluster.try_take_reclaim_work(),
+        None,
+        "stale retryable exit should not enqueue begin work after observing Deleting"
+    );
+
+    let bucket_pg_id = PgId::new(cluster.bucket_metadata_pg_id(&bucket));
+    let bucket_pg = map
+        .node(NodeId::new(1))
+        .unwrap()
+        .storage_node()
+        .get_pg(bucket_pg_id.get())
+        .unwrap();
+    let info = crate::PgMetadataStore::head_bucket_raw(&*bucket_pg, &bucket).unwrap();
+    assert_eq!(info.state, crate::BucketState::Deleting);
+    let outcome = crate::PgMetadataStore::bucket_delete_attempt_outcome(&*bucket_pg, &bucket)
+        .unwrap()
+        .expect("successful concurrent mark should record terminal outcome");
+    assert_eq!(
+        outcome.outcome,
+        crate::BucketDeleteAttemptOutcomeKind::MarkDeleting
+    );
+    assert_eq!(outcome.phase, crate::BucketDeleteAttemptPhase::MarkDeleting);
+}
+
+#[test]
+fn begin_bucket_delete_does_not_suppress_route_error_after_concurrent_mark_deleting() {
+    let _serial = lock_bucket_scoped_hook_test();
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2], ec_shape).unwrap();
+    let bucket = {
+        let topology = map
+            .nodes
+            .get(&NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        bucket_for_pg(topology, 1, "delete-route-error-preserved-")
+    };
+    set_route_primary(&mut map, 1, NodeId::new(1));
+
+    let map = Arc::new(map);
+    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    let concurrent_cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    create_test_bucket(&cluster, &bucket);
+
+    let hook_ran = Arc::new(AtomicBool::new(false));
+    let hook_ran_for_hook = Arc::clone(&hook_ran);
+    let hook_bucket = bucket.clone();
+    let _proven_hook_guard = cluster.test_install_after_bucket_delete_final_visibility_proven_hook(
+        Arc::new(move || {
+            if hook_ran_for_hook.swap(true, Ordering::SeqCst) {
+                return Ok(());
+            }
+            concurrent_cluster
+                .begin_bucket_delete(&hook_bucket)
+                .expect("concurrent begin should mark the same bucket incarnation deleting");
+            Err(StoreError::RouteMapExpired {
+                cluster_epoch: ClusterEpoch::INITIAL,
+                valid_until_ms: 1,
+                now_ms: 2,
+            })
+        }),
+    );
+
+    let err = cluster.begin_bucket_delete(&bucket).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            crate::BucketWriteDrainError::Store(StoreError::RouteMapExpired { .. })
+        ),
+        "route errors from the pinned map must not be suppressed by a same-client deleting recheck; got {err:?}"
+    );
+    assert!(
+        hook_ran.load(Ordering::SeqCst),
+        "test hook should simulate a concurrent MarkBucketDeleting before route error"
+    );
+
+    let bucket_pg_id = PgId::new(cluster.bucket_metadata_pg_id(&bucket));
+    let bucket_pg = map
+        .node(NodeId::new(1))
+        .unwrap()
+        .storage_node()
+        .get_pg(bucket_pg_id.get())
+        .unwrap();
+    let info = crate::PgMetadataStore::head_bucket_raw(&*bucket_pg, &bucket).unwrap();
+    assert_eq!(info.state, crate::BucketState::Deleting);
+}
+
+#[test]
 fn begin_bucket_delete_adopts_stream_cleanup_phase_and_revalidates_after_reservations() {
     let _serial = lock_bucket_scoped_hook_test();
     let tmp = test_util::tempdir();
