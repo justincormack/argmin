@@ -121,13 +121,15 @@ Status summary:
 
 - **Completed:** recovery semantics, opened-store recovery invocation, cached-table drift
   detect-and-repair, pending-slot finalization, divergent open-time cleanup consolidation,
-  and storage-node bind coverage for the main recovery classes.
-- **Partially complete:** the generic commit-fault hook and crash-recovery test harness now
-  cover representative generic and hand-written transactions, but the mutator matrix is
-  not yet exhaustive.
-- **Remaining Slice 1 work:** finish the digest-affecting mutator inventory, classify or
-  explicitly transaction-wrap single-statement mutators, and add any missing cases found by
-  that inventory.
+  storage-node bind coverage for the main recovery classes, the generic commit-fault hook,
+  and direct commit-failure coverage for the explicit multi-statement mutator inventory.
+- **Completed:** the remaining digest-affecting `PgMetadataStore` surface has been
+  classified as single SQLite statement maintenance paths or read-before-single-write
+  helpers. These stay under ordinary digest-consistency coverage and do not need the
+  commit-failure hook unless they are later expanded into multi-write transactions.
+- **Remaining Slice 1 work:** no known implementation item remains. Treat future findings
+  as regressions against the completed startup/recovery gate, or reopen this slice if a
+  missed multi-statement mutator is found.
 
 Progress update:
 
@@ -230,8 +232,8 @@ Progress update:
    trigger-body check remains the place to detect the stale-trigger root cause and decide
    whether that should become fail-closed.
 
-3. **Generalise the existing commit-fault hook.** The `fail_next_delete_finalized_bucket_commit`
-   **Partially complete.**
+3. **Generalise the existing commit-fault hook.** **Completed.** The
+   `fail_next_delete_finalized_bucket_commit`
    flag (`pg_store.rs:387`) is a per-mutator test hook. Lift it to a generic
    `fail_next_metadata_txn_commit` hook so the crash-recovery property test (work item 6)
    can inject a commit failure into any digest-affecting transaction, not just finalized
@@ -243,9 +245,9 @@ Progress update:
    delete-finalized hook still exists for its legacy targeted regression, but the generic
    hook now also runs at hand-written metadata transaction commit points in
    `metadata.rs`. Single-statement mutators with no explicit transaction, such as stream
-   upload session create, have no injected commit window yet; they need either explicit
-   classification as crash-atomic single statements or conversion to an explicit
-   transaction if their rollback boundary matters.
+   upload session create, have no injected commit window by design; the Slice 1 inventory
+   now classifies those as SQLite-atomic maintenance paths unless a future change expands
+   them into multiple writes.
 
 4. **Make pending-slot removal transactional at the safe finalization boundary.**
    **Completed.** A first
@@ -287,7 +289,7 @@ Progress update:
    every replica.
 
 6. **Crash-recovery property test for every digest-affecting mutator.**
-   **Partially complete.** Using the
+   **Completed for explicit multi-statement mutators.** Using the
    generalised hook from work item 3, for each metadata-mutating transaction: inject a
    commit failure, reopen the PG through `PgStore::open` then `pg.recover(ctx)`, and assert
    (a) per-table materialised digests match the cached `metadata_table_digests` rows and
@@ -317,7 +319,7 @@ Progress update:
    digest-affecting `PgMetadataStore` methods as single SQLite statement maintenance paths,
    or as read-before-single-write helpers where the pre-write read failure leaves no
    mutation to recover. Those paths do not need the commit-failure hook unless they are
-   later expanded into multiple writes.
+   later expanded into multiple writes. This completes the Slice 1 mutator inventory.
 
    Remaining non-transactional groups to keep under ordinary digest-consistency coverage:
    - bucket reservation/drain/finalizer/lifecycle/reclaim claim maintenance rows,
@@ -357,12 +359,13 @@ Progress update:
    recovery remains correct.
 4. **Completed:** The local-cluster build path and the storage-node server share one
    recovery code path; `clean_terminal_primary_pending_slot_on_open` is removed.
-5. **Partially complete:** A crash-recovery property test covers representative
+5. **Completed:** A crash-recovery property test covers the explicit multi-statement
    digest-affecting mutators and asserts the five post-recovery invariants above,
    including materialised-vs-cached digest agreement and that an epoch-mismatched orphan
-   slot does not block recovery. Remaining: make this matrix exhaustive, with explicit
-   coverage or classification for single-statement mutators and any remaining mutators
-   found by the inventory.
+   slot does not block recovery. The remaining digest-affecting store methods are
+   classified as single SQLite statement maintenance paths or read-before-single-write
+   helpers, so they remain under ordinary digest-consistency coverage rather than the
+   commit-failure hook.
 6. **Completed:** The reactive heartbeat cleanups (`c5776092`, `791b409c`) remain as a
    defence-in-depth heartbeat-side check but are no longer the primary correctness
    mechanism; this is documented in `guides/storage-cluster-invariants.md`.
