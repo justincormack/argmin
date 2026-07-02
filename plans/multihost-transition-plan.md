@@ -10090,6 +10090,39 @@ Phase 12.1 progress:
   lease-read design, and removing or replacing
   `ARGMIN_CONTROL_PLANE_EXPERIMENTAL_RAFT`.
 
+Phase 12.2 proposed scope:
+
+- Move from the in-memory OpenRaft spike to a restart-safe local durable Raft
+  authority. Keep the first slice single-process and single-node so the durable
+  recovery contract is proven before adding process-to-process Raft networking.
+- Define the local durable artifact layout for the OpenRaft log store, vote and
+  term state, committed watermark, membership metadata, and current snapshot.
+  Argmin's command and snapshot codecs remain the application-level durable
+  formats, while OpenRaft metadata remains the consensus identity for
+  `(term,node,index)`, membership, and snapshot last-included log ids.
+- Implement restart-safe authority startup that restores vote, committed,
+  applied, membership, snapshot, and control-plane state before serving
+  read-index runtime maps or writes. Startup must fail closed when artifacts
+  disagree, regress, are truncated, or claim impossible log/snapshot
+  relationships.
+- Persist current snapshots and define the compaction boundary: a log entry may
+  be purged only when the snapshot/committed/applied relationship makes replay
+  from the remaining suffix sufficient. Recovery tests must cover snapshot plus
+  suffix-log startup where the committed prefix has already been removed.
+- Extend the existing `argmin-s3` experimental process tests to run against the
+  durable local authority, including stop/restart checks after bootstrap,
+  storage-node heartbeat refresh, runtime-map refresh, acting-set admin, and
+  metadata-transfer admin changes.
+- Keep multi-process Raft networking, authenticated remote control-plane RPC,
+  production cutover from the single authority, lease-read optimization, and
+  upgrade/migration compatibility out of 12.2. Continue using OpenRaft
+  `ReadIndex` for serving runtime maps until the monotonic-clock and lease-read
+  design is specified.
+- Keep `ARGMIN_CONTROL_PLANE_EXPERIMENTAL_RAFT` temporary during this slice, or
+  replace it with a clearer experimental durable-Raft mode flag if the
+  process-mode selection needs to distinguish in-memory from durable storage.
+  The flag must still be removed or replaced before production cutover.
+
 1. define the replicated control-plane state machine:
    - state includes cluster epoch, PG count, PG state, PG acting sets, node
      membership, node incarnation/endpoint/liveness metadata, retained
