@@ -413,11 +413,6 @@ when prioritised. They correspond to the remaining findings from the Phase 11 re
     to a permanent proptest over the PG state-transition graph (Active<->Peering, transfer
     marker install/clear, floor preservation, restart epoch bump).
 
-- **Slice 5: OpenRaft spike conformance.** Run `openraft::testing::log::suite` against the
-  in-memory spike log store. The plan (`multihost-transition-plan.md` around the Phase 12.1
-  notes) explicitly notes this is not done; it is the canonical suite for the
-  monotonicity/watermark bugs that `caf14a21`, `2c462236`, and `abf7ec65` fixed manually.
-
 - **Slice 6: Deterministic fault-injection harness promotion.** Promote the
   token-scoped deterministic fault gate (Phase 11 work item 11) into the standard
   verification path for the high partial-state-risk boundaries: after payload shard write
