@@ -505,7 +505,7 @@ when prioritised. They correspond to the remaining findings from the Phase 11 re
   | UploadPart stream-session creation | Covered by coordinator route-map pinning, direct B2 pending-slot/reservation reopen convergence, and storage create retry/reservation tests: `S6-UPC1`, `S6-UPC2`. | Covered through installed Unix stale/Peering paths with no session, segment rows, pending command, or reservation leak: `S6-UPC3`. | No current Slice 6 UploadPart stream-session creation gap named. |
   | GET/HEAD payload reads | Covered locally after metadata snapshot and by installed-Unix retained-route read, including a disjoint-placement current-route negative before retained-route success: `S6-READ1`, `S6-READ2`. | Covered for object metadata PG Peering fail-closed: `S6-READ3`. | No current Slice 6 GET/HEAD payload read gap named. |
   | Object and version LIST | Covered locally across route-map swaps during listing and pagination, including delimiter/common-prefix continuation and a deterministic multi-object-PG list crossing: `S6-LIST1`; UAT route-change smokes cover process-level retained-list behavior. | Covered for composite/listing Peering fail-closed at storage level: `S6-LIST2`; read/list object metadata PG Peering fail-closed is also in `S6-READ3`. | No current Slice 6 LIST gap named. |
-  | DeleteBucket begin/finalize | Covered by a separate bucket-delete hardening plan and many recent regressions. | Partially covered, but recent soak failures show this is still the largest open correctness/robustness area. | Keep this out of the generic matrix except for shared failpoint API reuse; track durable attempt/adoption/finalizer interleavings in the bucket-delete plan. |
+  | DeleteBucket begin/finalize | Covered by a separate bucket-delete hardening plan and many recent regressions. Add focused Slice 6 alignment regressions for committed begin response loss, begin route changes, finalizer retained-route cleanup, no-client worker adoption, and terminal not-empty drain cleanup: `S6-BD1` through `S6-BD5`. | Partially covered, but recent soak failures show this is still the largest open correctness/robustness area. | Keep detailed implementation tracking in the bucket-delete plan; this matrix only names the alignment shapes that should exist so DeleteBucket is comparable with ordinary object/MPU paths. |
   | Control-plane PG transitions | Slice 4 covers `open -> mutate -> save -> reload -> continue` for current transitions. | Stale runtime-map and stale authorization fail-closed coverage exists. | Slice 7 handles lost-response/check-applied behavior for mutating control-plane RPCs. |
 
   Evidence inventory:
@@ -669,6 +669,26 @@ when prioritised. They correspond to the remaining findings from the Phase 11 re
   - `S6-LIST2`: `composite_object_listings_fan_out_to_routed_pg_primaries` and
     `composite_bucket_listings_fail_closed_while_any_metadata_pg_is_peering`
     in `crates/storage/src/cluster/local/tests/bucket_commands.rs`.
+  - `S6-BD1`: `begin_bucket_delete_committed_response_loss_retry_observes_deleting`
+    in `crates/storage/src/cluster/local/tests/bucket_delete.rs` covers B3 committed
+    `MarkBucketDeleting` response-loss retry. The first attempt commits
+    `MarkBucketDeleting` and then returns a retryable/lost-response error; retry must
+    observe the same bucket incarnation as already deleting without reapplying against
+    a recreated bucket, and must clear any terminal pending command left by the lost
+    response.
+  - `S6-BD2`: B5 route change during DeleteBucket begin. Pin the old route, advance
+    the runtime map before or during mark-deleting apply, and assert begin either
+    commits exactly once on the retained route or fails closed with the durable
+    attempt preserved for fenced adoption.
+  - `S6-BD3`: B4 finalizer retained-route cleanup. Start from a `Deleting` bucket,
+    move routes before reclaim/finalized-row cleanup, and assert finalization uses
+    the retained bucket generation/proof and cannot affect a recreated bucket.
+  - `S6-BD4`: no-client worker adoption. Durable begin/finalizer work must survive
+    response loss, dequeue, and restart, then continue through the same cursor/adoption
+    state without requiring another client `DeleteBucket`.
+  - `S6-BD5`: terminal not-empty after preserved drain. If adoption reaches a real
+    terminal `BucketNotEmpty`, the preserved drain/fence is cleared or terminally
+    recorded so the bucket is not left artificially write-fenced.
 
   Harness requirements:
   - failpoints must be named and token-scoped; no sleeps or global "next operation" hooks

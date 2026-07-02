@@ -3504,6 +3504,103 @@ fn begin_bucket_delete_renews_drain_after_final_visibility_proof_before_retryabl
 }
 
 #[test]
+fn begin_bucket_delete_committed_response_loss_retry_observes_deleting() {
+    let _serial = lock_metadata_command_apply_hook_test();
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2], ec_shape).unwrap();
+    let bucket = {
+        let topology = map
+            .nodes
+            .get(&NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        bucket_for_pg(topology, 1, "delete-committed-response-loss-")
+    };
+    set_route_primary(&mut map, 1, NodeId::new(1));
+
+    let map = Arc::new(map);
+    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    create_test_bucket(&cluster, &bucket);
+
+    let hook_calls = Arc::new(AtomicUsize::new(0));
+    let hook_calls_for_hook = Arc::clone(&hook_calls);
+    let hook_map = Arc::clone(&map);
+    let hook_bucket = bucket.clone();
+    let _hook_guard = cluster.test_install_before_metadata_command_apply_hook(Arc::new(
+        move |node_id, command| {
+            match command.payload() {
+                MetadataCommandPayload::MarkBucketDeleting(mark)
+                    if mark.bucket_name() == &hook_bucket
+                        && node_id == NodeId::new(0)
+                        && hook_calls_for_hook.fetch_add(1, Ordering::SeqCst) == 0 =>
+                {
+                    for node_id in [NodeId::new(0), NodeId::new(2)] {
+                        let node = hook_map.node(node_id).unwrap().storage_node();
+                        let pg = node.get_pg(command.id().pg_id().get())?;
+                        pg.apply_metadata_command_and_record(node_id.as_u32(), command)
+                            .map_err(|error| match error {
+                                crate::BucketSnapshotLoadError::Store(error) => error,
+                                crate::BucketSnapshotLoadError::Metadata(error) => {
+                                    panic!("manual mark deleting command apply failed: {error}")
+                                }
+                            })?;
+                    }
+                    return Err(StoreError::RouteMapExpired {
+                        cluster_epoch: ClusterEpoch::INITIAL,
+                        valid_until_ms: 0,
+                        now_ms: 1,
+                    });
+                }
+                _ => {}
+            }
+            Ok(())
+        },
+    ));
+
+    let first_err = cluster.begin_bucket_delete(&bucket).unwrap_err();
+    assert!(
+        matches!(
+            first_err,
+            crate::BucketWriteDrainError::Store(StoreError::RouteMapExpired { .. })
+        ),
+        "expected injected post-commit route error, got {first_err:?}"
+    );
+    assert_eq!(
+        hook_calls.load(Ordering::SeqCst),
+        1,
+        "first attempt should inject exactly once after committing MarkBucketDeleting"
+    );
+    assert!(
+        pending_metadata_command_for_test(&map, PgId::new(1), &bucket).is_some(),
+        "response loss after committed MarkBucketDeleting may leave a terminal pending command for retry cleanup"
+    );
+
+    cluster
+        .begin_bucket_delete(&bucket)
+        .expect("retry should observe the committed bucket delete");
+    assert_eq!(
+        hook_calls.load(Ordering::SeqCst),
+        1,
+        "committed retry should not rerun MarkBucketDeleting apply"
+    );
+    assert!(
+        pending_metadata_command_for_test(&map, PgId::new(1), &bucket).is_none(),
+        "committed retry must clear the terminal MarkBucketDeleting pending command"
+    );
+
+    for node_id in node_ids {
+        let node = map.node(node_id).unwrap().storage_node();
+        let pg = node.get_pg(1).unwrap();
+        let info = crate::PgMetadataStore::head_bucket_raw(&*pg, &bucket).unwrap();
+        assert_eq!(info.state, crate::BucketState::Deleting);
+    }
+    assert_clean_metadata_command_stream(&map, &[1]);
+}
+
+#[test]
 fn begin_bucket_delete_treats_retryable_error_after_concurrent_mark_deleting_as_success() {
     let _serial = lock_bucket_scoped_hook_test();
     let tmp = test_util::tempdir();
