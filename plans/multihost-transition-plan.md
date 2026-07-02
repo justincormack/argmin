@@ -10162,6 +10162,11 @@ Phase 12.2 progress:
   during export for now; a future compaction slice must define and test the
   broader snapshot-plus-retained-suffix contract before persisting older
   snapshots.
+- Added durable restart coverage for the first compaction boundary shape:
+  the log can be purged through the cached snapshot/applied boundary while a
+  committed suffix remains retained. Restart restores the cached snapshot,
+  replays the retained suffix to the committed watermark, preserves the purged
+  boundary, and exposes an applied-to-committed status before serving.
 - Added the first local file boundary for the durable restart artifact. The
   artifact can now be stored through a same-directory temp file, `sync_all`,
   atomic rename, and parent-directory sync, and loaded back through the

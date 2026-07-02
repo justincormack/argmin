@@ -10063,6 +10063,100 @@ mod tests {
     }
 
     #[test]
+    fn control_plane_openraft_durable_single_node_replays_suffix_after_snapshot_purge() {
+        ControlPlaneRaftTypeConfig::run(async {
+            let tmp = test_util::tempdir();
+            let path = tmp.path().join("raft.state");
+            let bootstrap_entry = single_node_bootstrap_membership_entry(1);
+            let bootstrap_command = normal_entry(
+                3,
+                1,
+                1,
+                ControlPlaneCommand::BootstrapInitialClusterMap {
+                    nodes: vec![(NodeId::new(1), "/tmp/node-1.sock".to_string())],
+                    pg_ids: vec![PgId::new(1)],
+                },
+            );
+            let suffix_entry_2 = blank_entry(3, 1, 2);
+            let suffix_entry_3 = blank_entry(3, 1, 3);
+
+            let mut log_store = ControlPlaneRaftLogStore::empty();
+            RaftLogStorage::append(
+                &mut log_store,
+                vec![
+                    bootstrap_entry.clone(),
+                    bootstrap_command.clone(),
+                    suffix_entry_2,
+                    suffix_entry_3,
+                ],
+                IOFlushed::noop(),
+            )
+            .await
+            .unwrap();
+            RaftLogStorage::save_vote(
+                &mut log_store,
+                &Vote::<ControlPlaneRaftLeaderId>::new_committed(3, 1),
+            )
+            .await
+            .unwrap();
+            RaftLogStorage::save_committed(&mut log_store, Some(raft_log_id(3, 1, 3)))
+                .await
+                .unwrap();
+            RaftLogStorage::purge(&mut log_store, raft_log_id(3, 1, 1))
+                .await
+                .unwrap();
+
+            let mut state_machine = ControlPlaneRaftStateMachine::empty();
+            state_machine.apply_entry(bootstrap_entry).unwrap();
+            state_machine.apply_entry(bootstrap_command).unwrap();
+            let built_snapshot = state_machine.build_snapshot().unwrap();
+            assert_eq!(built_snapshot.meta.last_log_id, Some(raft_log_id(3, 1, 1)));
+
+            ControlPlaneRaftRestartArtifact::capture(&log_store, &state_machine)
+                .unwrap()
+                .store_durable_artifact(&path)
+                .unwrap();
+
+            let authority = ControlPlaneRaftAuthority::new_experimental_single_node_durable(
+                "control-plane-raft-durable-snapshot-suffix-replay-test",
+                1,
+                &path,
+            )
+            .await
+            .unwrap();
+            authority
+                .wait_for_applied_log_id(
+                    raft_log_id(3, 1, 3),
+                    Duration::from_secs(1),
+                    "durable single-node authority replayed suffix after snapshot purge",
+                )
+                .await
+                .unwrap();
+
+            let status = authority.status().await.unwrap();
+            assert_eq!(status.last_purged_log_id(), Some(raft_log_id(3, 1, 1)));
+            assert_eq!(status.current_snapshot(), Some(raft_log_id(3, 1, 1)));
+            assert_eq!(status.committed(), Some(raft_log_id(3, 1, 3)));
+            assert_eq!(status.applied(), Some(raft_log_id(3, 1, 3)));
+            assert_eq!(status.committed_to_applied_index_gap(), Some(0));
+            assert!(status.applied_caught_up_to_committed());
+
+            let retained_entries = RaftLogReader::try_get_log_entries(&mut log_store, 0..4)
+                .await
+                .unwrap();
+            assert_eq!(
+                retained_entries
+                    .iter()
+                    .map(|entry| entry.log_id)
+                    .collect::<Vec<_>>(),
+                vec![raft_log_id(3, 1, 2), raft_log_id(3, 1, 3)]
+            );
+
+            authority.shutdown().await.unwrap();
+        });
+    }
+
+    #[test]
     fn control_plane_openraft_durable_single_node_rejects_multi_voter_artifact() {
         ControlPlaneRaftTypeConfig::run(async {
             let tmp = test_util::tempdir();
