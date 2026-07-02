@@ -349,6 +349,243 @@ fn direct_put_pending_install_race_keeps_bucket_write_proof_for_retry() {
 }
 
 #[test]
+fn direct_put_committed_response_loss_retry_returns_existing_commit() {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let pg_ids = [0, 1, 2, 3];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &pg_ids, ec_shape).unwrap();
+    let topology = map
+        .node(NodeId::new(0))
+        .unwrap()
+        .storage_node()
+        .pg_topology();
+    let bucket = bucket_for_pg(topology, 1, "direct-put-response-loss-");
+    let key = key_for_object_pg(topology, &bucket, 2, "object-");
+    set_route_primary(&mut map, 1, NodeId::new(1));
+    set_route_primary(&mut map, 2, NodeId::new(1));
+    let map = Arc::new(map);
+    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    create_test_bucket(&cluster, &bucket);
+
+    let reservation_id =
+        crate::SessionId::try_from("53535353535353535353535353535353".to_string()).unwrap();
+    let generation_id = cluster
+        .reserve_put_object_generation(&bucket, &key, &reservation_id)
+        .unwrap();
+    let payload = b"direct put committed response loss retry";
+    let segment_okh = [0xb3; 16];
+    let written = cluster
+        .write_direct_put_segment_payload_shards(
+            &bucket,
+            &key,
+            generation_id,
+            0,
+            &segment_okh,
+            payload,
+        )
+        .unwrap();
+    let commit_req = direct_put_commit_req(
+        &cluster,
+        DirectPutCommitReqFixture {
+            bucket: &bucket,
+            key: &key,
+            reservation_id,
+            generation_id,
+            payload,
+            segment_okh,
+            written: &written,
+        },
+    );
+
+    let _serial = lock_metadata_command_apply_hook_test();
+    let hook_guard = cluster.test_install_after_direct_put_metadata_publish_hook(Arc::new(|| {
+        Err(crate::ObjectPgActionError::InvalidRequest {
+            reason: "injected direct PUT response loss".to_string(),
+        })
+    }));
+
+    let first_err = cluster
+        .commit_direct_put_object_from_payload_shards(&commit_req, &written.written_shards, |_| {
+            Ok::<(), ()>(())
+        })
+        .unwrap_err();
+    assert!(
+        matches!(
+            first_err,
+            crate::ObjectPgActionError::InvalidRequest { ref reason }
+                if reason == "injected direct PUT response loss"
+        ),
+        "expected injected post-commit direct PUT response-loss error, got {first_err:?}"
+    );
+    drop(hook_guard);
+
+    let outcome = cluster
+        .commit_direct_put_object_from_payload_shards(
+            &commit_req,
+            &written.written_shards,
+            |_| -> Result<(), ()> { panic!("committed direct PUT retry must not rerun action") },
+        )
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(outcome.version_id, crate::VersionId::Null);
+    assert_eq!(outcome.live_size, payload.len() as u64);
+    assert!(pending_metadata_command_for_test(&map, PgId::new(2), &bucket).is_none());
+    assert_clean_metadata_command_stream(&map, &[2]);
+    for node_id in node_ids {
+        let pg = map.node(node_id).unwrap().storage_node().get_pg(2).unwrap();
+        let stored = crate::PgMetadataStore::get_object_meta(&*pg, &bucket, &key).unwrap();
+        let live = stored.as_live().expect("direct PUT object should be live");
+        assert_eq!(live.generation_id, generation_id);
+        assert_eq!(live.size, payload.len() as u64);
+    }
+}
+
+#[test]
+fn direct_put_overwrite_committed_response_loss_retry_preserves_reclaim_generation() {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let pg_ids = [0, 1, 2, 3];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &pg_ids, ec_shape).unwrap();
+    let topology = map
+        .node(NodeId::new(0))
+        .unwrap()
+        .storage_node()
+        .pg_topology();
+    let bucket = bucket_for_pg(topology, 1, "direct-put-overwrite-response-loss-");
+    let key = key_for_object_pg(topology, &bucket, 2, "object-");
+    set_route_primary(&mut map, 1, NodeId::new(1));
+    set_route_primary(&mut map, 2, NodeId::new(1));
+    let map = Arc::new(map);
+    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    create_test_bucket(&cluster, &bucket);
+
+    let first_reservation_id =
+        crate::SessionId::try_from("54545454545454545454545454545454".to_string()).unwrap();
+    let first_generation_id = cluster
+        .reserve_put_object_generation(&bucket, &key, &first_reservation_id)
+        .unwrap();
+    let first_payload = b"original direct put object";
+    let first_segment_okh = [0xc4; 16];
+    let first_written = cluster
+        .write_direct_put_segment_payload_shards(
+            &bucket,
+            &key,
+            first_generation_id,
+            0,
+            &first_segment_okh,
+            first_payload,
+        )
+        .unwrap();
+    let first_commit_req = direct_put_commit_req(
+        &cluster,
+        DirectPutCommitReqFixture {
+            bucket: &bucket,
+            key: &key,
+            reservation_id: first_reservation_id,
+            generation_id: first_generation_id,
+            payload: first_payload,
+            segment_okh: first_segment_okh,
+            written: &first_written,
+        },
+    );
+    let first_outcome = cluster
+        .commit_direct_put_object_from_payload_shards(
+            &first_commit_req,
+            &first_written.written_shards,
+            |_| Ok::<(), ()>(()),
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(first_outcome.stale_generation_id, None);
+
+    let overwrite_reservation_id =
+        crate::SessionId::try_from("55555555555555555555555555555555".to_string()).unwrap();
+    let overwrite_generation_id = cluster
+        .reserve_put_object_generation(&bucket, &key, &overwrite_reservation_id)
+        .unwrap();
+    let overwrite_payload = b"replacement direct put object after response loss";
+    let overwrite_segment_okh = [0xc5; 16];
+    let overwrite_written = cluster
+        .write_direct_put_segment_payload_shards(
+            &bucket,
+            &key,
+            overwrite_generation_id,
+            0,
+            &overwrite_segment_okh,
+            overwrite_payload,
+        )
+        .unwrap();
+    let overwrite_commit_req = direct_put_commit_req(
+        &cluster,
+        DirectPutCommitReqFixture {
+            bucket: &bucket,
+            key: &key,
+            reservation_id: overwrite_reservation_id,
+            generation_id: overwrite_generation_id,
+            payload: overwrite_payload,
+            segment_okh: overwrite_segment_okh,
+            written: &overwrite_written,
+        },
+    );
+
+    let _serial = lock_metadata_command_apply_hook_test();
+    let hook_guard = cluster.test_install_after_direct_put_metadata_publish_hook(Arc::new(|| {
+        Err(crate::ObjectPgActionError::InvalidRequest {
+            reason: "injected direct PUT overwrite response loss".to_string(),
+        })
+    }));
+
+    let first_err = cluster
+        .commit_direct_put_object_from_payload_shards(
+            &overwrite_commit_req,
+            &overwrite_written.written_shards,
+            |_| Ok::<(), ()>(()),
+        )
+        .unwrap_err();
+    assert!(
+        matches!(
+            first_err,
+            crate::ObjectPgActionError::InvalidRequest { ref reason }
+                if reason == "injected direct PUT overwrite response loss"
+        ),
+        "expected injected post-commit direct PUT response-loss error, got {first_err:?}"
+    );
+    drop(hook_guard);
+
+    let outcome = cluster
+        .commit_direct_put_object_from_payload_shards(
+            &overwrite_commit_req,
+            &overwrite_written.written_shards,
+            |_| -> Result<(), ()> {
+                panic!("committed direct PUT overwrite retry must not rerun action")
+            },
+        )
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(outcome.version_id, crate::VersionId::Null);
+    assert_eq!(outcome.live_size, overwrite_payload.len() as u64);
+    assert_eq!(outcome.stale_generation_id, Some(first_generation_id));
+    assert!(cluster
+        .payload_reclaim_exists(&bucket, &key, first_generation_id)
+        .unwrap());
+    assert!(pending_metadata_command_for_test(&map, PgId::new(2), &bucket).is_none());
+    assert_clean_metadata_command_stream(&map, &[2]);
+    for node_id in node_ids {
+        let pg = map.node(node_id).unwrap().storage_node().get_pg(2).unwrap();
+        let stored = crate::PgMetadataStore::get_object_meta(&*pg, &bucket, &key).unwrap();
+        let live = stored
+            .as_live()
+            .expect("direct PUT overwrite object should be live");
+        assert_eq!(live.generation_id, overwrite_generation_id);
+        assert_eq!(live.size, overwrite_payload.len() as u64);
+    }
+}
+
+#[test]
 fn stale_direct_put_reservation_cannot_resurrect_deleted_null_version() {
     let tmp = test_util::tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];

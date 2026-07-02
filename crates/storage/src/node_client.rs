@@ -19,10 +19,10 @@ use crate::metadata_command::{
     DeleteObjectVersionCommand, DeleteObjectVersionTarget, InsertDeleteMarkerCommand,
     MarkBucketDeletingCommand, MetadataCommandAcceptance, MetadataCommandEnvelope,
     MetadataCommandId, MetadataCommandLogHashRangeEntry, MetadataCommandLogIndex,
-    MetadataCommandLogRangeEntry, MetadataCommandPayload, MetadataCommandReplicaState,
-    MetadataTransferCommand, ObjectPayloadReclaimCommand, PutBucketAclCommand,
-    PutBucketPropertyCommand, PutBucketSubresourceCommand, PutBucketVersioningCommand,
-    PutObjectMetadataCommand, PutObjectMetadataMutation,
+    MetadataCommandLogRangeEntry, MetadataCommandLogRangeEntryKind, MetadataCommandPayload,
+    MetadataCommandReplicaState, MetadataTransferCommand, ObjectPayloadReclaimCommand,
+    PutBucketAclCommand, PutBucketPropertyCommand, PutBucketSubresourceCommand,
+    PutBucketVersioningCommand, PutObjectMetadataCommand, PutObjectMetadataMutation,
 };
 use crate::node::SharedStorageNode;
 use crate::pg_store::MetadataCommandLogCompactionStatus;
@@ -559,13 +559,52 @@ fn load_stream_part_finalize_snapshot_from_pg(
 
 fn load_direct_put_commit_snapshot_from_pg(
     pg: &crate::PgStore,
+    node_id: NodeId,
     bucket: &BucketName,
     key: &ObjectKey,
     reservation_id: &SessionId,
     generation_id: GenerationId,
 ) -> Result<DirectPutCommitStorageSnapshot, ObjectPgActionError> {
     let reserved_generation =
-        PgMetadataStore::get_object_generation_reservation(pg, bucket, key, reservation_id)?;
+        match PgMetadataStore::get_object_generation_reservation(pg, bucket, key, reservation_id) {
+            Ok(reserved_generation) => reserved_generation,
+            Err(error @ MetadataError::ObjectGenerationReservationNotFound { .. }) => {
+                let current = load_current_object_optional_from_pg(pg, bucket, key)?;
+                if current
+                    .as_ref()
+                    .and_then(StoredObject::as_live)
+                    .is_some_and(|live| live.generation_id == generation_id)
+                {
+                    let existing_etag = current
+                        .as_ref()
+                        .and_then(|stored| stored.as_live().map(|record| record.etag.format()));
+                    let version_id = current
+                        .as_ref()
+                        .expect("matched current direct PUT object must be present")
+                        .version_id();
+                    return Ok(DirectPutCommitStorageSnapshot {
+                        auth_snapshot: DirectPutCommitSnapshot { existing_etag },
+                        committed_segments: Some(PgMetadataStore::get_object_segments(
+                            pg, bucket, key, version_id,
+                        )?),
+                        committed_stale_generation_id:
+                            applied_direct_put_stale_generation_id_from_log(
+                                pg,
+                                node_id,
+                                bucket,
+                                key,
+                                reservation_id,
+                                generation_id,
+                            )?,
+                        current,
+                        stale_payload_source: None,
+                        stale_payload: None,
+                    });
+                }
+                return Err(error.into());
+            }
+            Err(error) => return Err(error.into()),
+        };
     if reserved_generation != generation_id {
         return Err(ObjectPgActionError::InvalidRequest {
             reason: format!(
@@ -585,9 +624,47 @@ fn load_direct_put_commit_snapshot_from_pg(
     Ok(DirectPutCommitStorageSnapshot {
         auth_snapshot: DirectPutCommitSnapshot { existing_etag },
         current,
+        committed_segments: None,
+        committed_stale_generation_id: None,
         stale_payload_source,
         stale_payload,
     })
+}
+
+fn applied_direct_put_stale_generation_id_from_log(
+    pg: &crate::PgStore,
+    node_id: NodeId,
+    bucket: &BucketName,
+    key: &ObjectKey,
+    reservation_id: &SessionId,
+    generation_id: GenerationId,
+) -> Result<Option<GenerationId>, StoreError> {
+    let cluster_epoch = pg.metadata_command_replica_state()?.cluster_epoch;
+    let max_log_index = pg.max_metadata_command_log_index(cluster_epoch)?;
+    let Some(last_log_index) = MetadataCommandLogIndex::new(max_log_index) else {
+        return Ok(None);
+    };
+    let entries = pg.retained_metadata_command_log_entries(
+        node_id.as_u32(),
+        cluster_epoch,
+        MetadataCommandLogIndex::new(1).expect("metadata command log index starts at one"),
+        last_log_index,
+    )?;
+    for entry in entries.into_iter().rev() {
+        let MetadataCommandLogRangeEntryKind::Applied(command) = entry.kind else {
+            continue;
+        };
+        let MetadataCommandPayload::CommitDirectPutObject(commit) = command.payload() else {
+            continue;
+        };
+        if commit.matches_request(bucket, key, reservation_id, generation_id) {
+            return Ok(commit.stale_payload.as_ref().map(|payload| match payload {
+                ObjectPayloadReclaimCommand::Segments(reclaim) => reclaim.generation_id,
+                ObjectPayloadReclaimCommand::Multipart(reclaim) => reclaim.generation_id,
+            }));
+        }
+    }
+    Ok(None)
 }
 
 fn snapshot_upload_part_stream_cleanup_from_pg(

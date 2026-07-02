@@ -3234,6 +3234,8 @@ pub struct DirectPutCommitSnapshot {
 pub struct DirectPutCommitStorageSnapshot {
     pub auth_snapshot: DirectPutCommitSnapshot,
     pub current: Option<StoredObject>,
+    pub committed_segments: Option<Vec<ObjectSegmentRecord>>,
+    pub committed_stale_generation_id: Option<GenerationId>,
     pub(crate) stale_payload_source: Option<StoredObject>,
     pub(crate) stale_payload: Option<crate::metadata_command::ObjectPayloadReclaimCommand>,
 }

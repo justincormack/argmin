@@ -65,8 +65,8 @@ use crate::types::{
     BucketName, BucketWriteDrainRecord, BucketWriteReservationRecord, ClusterEpoch,
     CommitDirectPutObjectReq, CreateStreamUploadReq, DataPgId, DirectPutCommitSnapshot,
     DirectPutWrittenSegment, EcShape, FinalizeDirectPutObjectOutcome, GenerationId,
-    MultipartUploadRecord, ObjectEncryption, ObjectKey, ObjectSegmentRecord, PgId, PgState,
-    PlacedSegmentShardBackfillClaimAcquire, PlacedSegmentShardBackfillClaimRecord,
+    MultipartUploadRecord, ObjectEncryption, ObjectKey, ObjectLayout, ObjectSegmentRecord, PgId,
+    PgState, PlacedSegmentShardBackfillClaimAcquire, PlacedSegmentShardBackfillClaimRecord,
     PlacedSegmentShardBackfillRecord, PlacedSegmentShardBackfillWorkItem,
     PlacedSegmentShardRepairClaimAcquire, PlacedSegmentShardRepairClaimRecord,
     PlacedSegmentShardRepairRecord, PlacedSegmentShardRepairWorkItem,
@@ -79,10 +79,9 @@ use crate::types::{
 };
 #[cfg(test)]
 use crate::types::{
-    MultipartReclaimRecord, ObjectLayout, ObjectSegmentsReclaimRecord,
-    ObjectSegmentsReclaimSegmentRecord, PutLiveObjectReq,
+    MultipartReclaimRecord, ObjectSegmentsReclaimRecord, ObjectSegmentsReclaimSegmentRecord,
+    PutLiveObjectReq,
 };
-#[cfg(test)]
 use crate::ObjectEtag;
 use crate::{BucketSnapshotLoadError, MetadataError, ObjectPgActionError};
 
@@ -6928,6 +6927,10 @@ impl StorageCluster {
                             return Err(error);
                         }
                     };
+                    if let Some(outcome) = Self::committed_direct_put_retry_outcome(req, &snapshot)?
+                    {
+                        return Ok(Ok(outcome));
+                    }
                     match action(snapshot.auth_snapshot.clone()) {
                         Ok(()) => {}
                         Err(error) => {
@@ -7420,6 +7423,85 @@ impl StorageCluster {
             }
             _ => unreachable!("direct put commit pending command kind changed"),
         }
+    }
+
+    fn committed_direct_put_retry_outcome(
+        req: &CommitDirectPutObjectReq,
+        snapshot: &crate::DirectPutCommitStorageSnapshot,
+    ) -> Result<Option<FinalizeDirectPutObjectOutcome>, ObjectPgActionError> {
+        let Some(segments) = snapshot.committed_segments.as_ref() else {
+            return Ok(None);
+        };
+        let Some(live) = snapshot
+            .current
+            .as_ref()
+            .and_then(crate::StoredObject::as_live)
+        else {
+            return Err(ObjectPgActionError::InvalidRequest {
+                reason: "direct PUT committed retry snapshot has segments but no live object"
+                    .to_string(),
+            });
+        };
+        let version_shape_matches = match req.versioning {
+            crate::BucketVersioningState::Enabled => !live.version_id.is_null(),
+            crate::BucketVersioningState::Disabled | crate::BucketVersioningState::Suspended => {
+                live.version_id.is_null()
+            }
+        };
+        let expected_etag = ObjectEtag::single_part(req.etag_crc64);
+        if live.bucket != req.bucket
+            || live.key != req.key
+            || !version_shape_matches
+            || live.owner != req.owner
+            || live.acl_grants != req.acl_grants
+            || live.public_read != req.public_read
+            || live.generation_id != req.generation_id
+            || live.size != req.size
+            || live.etag != expected_etag
+            || live.ec != req.ec
+            || live.layout != ObjectLayout::Standard
+            || live.tags != req.tags
+            || live.metadata_blob.as_ref() != Some(&req.metadata_blob)
+            || live.system_metadata_blob.as_ref() != Some(&req.system_metadata_blob)
+            || live.object_lock != req.object_lock
+            || live.encryption != req.encryption
+        {
+            return Err(ObjectPgActionError::InvalidRequest {
+                reason: "direct PUT committed retry live object does not match request".to_string(),
+            });
+        }
+        if segments.len() != 1 {
+            return Err(ObjectPgActionError::InvalidRequest {
+                reason: "direct PUT committed retry must have exactly one committed segment"
+                    .to_string(),
+            });
+        }
+        let segment = &segments[0];
+        if segment.bucket != req.bucket
+            || segment.key != req.key
+            || segment.version_id != live.version_id
+            || segment.segment_index != req.segment_index
+            || segment.size != req.size
+            || segment.segment_crc64 != req.segment_crc64
+            || segment.segment_okh != req.segment_okh
+            || segment.segment_vid != req.segment_vid
+            || segment.data_pg_id != req.data_pg_id
+            || segment.placement_cluster_epoch != req.bucket_write_reservation.cluster_epoch
+            || segment.ec_k != req.ec.k
+            || segment.ec_m != req.ec.m
+        {
+            return Err(ObjectPgActionError::InvalidRequest {
+                reason: "direct PUT committed retry segment does not match request".to_string(),
+            });
+        }
+        Ok(Some(FinalizeDirectPutObjectOutcome {
+            version_id: live.version_id,
+            encryption: live.encryption.clone(),
+            live_tags: live.tags.clone(),
+            live_size: live.size,
+            live_last_modified: live.last_modified,
+            stale_generation_id: snapshot.committed_stale_generation_id,
+        }))
     }
 
     #[cfg(test)]

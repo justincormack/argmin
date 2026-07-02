@@ -3170,7 +3170,14 @@ impl StorageNodeClient for LocalStorageNodeClient {
         generation_id: GenerationId,
     ) -> Result<DirectPutCommitStorageSnapshot, ObjectPgActionError> {
         let pg = self.storage_node.get_pg(pg_id.get())?;
-        load_direct_put_commit_snapshot_from_pg(&pg, bucket, key, reservation_id, generation_id)
+        load_direct_put_commit_snapshot_from_pg(
+            &pg,
+            self.node_id,
+            bucket,
+            key,
+            reservation_id,
+            generation_id,
+        )
     }
 
     fn build_direct_put_commit_command(
@@ -3180,6 +3187,7 @@ impl StorageNodeClient for LocalStorageNodeClient {
         let pg = self.storage_node.get_pg(request.pg_id.get())?;
         let current = load_direct_put_commit_snapshot_from_pg(
             &pg,
+            self.node_id,
             &request.request.bucket,
             &request.request.key,
             &request.request.generation_reservation_id,

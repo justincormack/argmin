@@ -12475,6 +12475,18 @@ impl<'a> StorageRpcDecoder<'a> {
         ))
     }
 
+    fn read_optional_generation_id(
+        &mut self,
+    ) -> Result<Option<GenerationId>, StorageRpcPayloadError> {
+        match self.read_u8()? {
+            0 => Ok(None),
+            1 => Ok(Some(self.read_generation_id()?)),
+            _ => Err(StorageRpcPayloadError::InvalidDurableClaimToken(
+                "invalid optional generation id tag",
+            )),
+        }
+    }
+
     fn read_optional_payload_reclaim_root(
         &mut self,
     ) -> Result<Option<PayloadReclaimRoot>, StorageRpcPayloadError> {
@@ -13149,14 +13161,40 @@ impl<'a> StorageRpcDecoder<'a> {
     ) -> Result<DirectPutCommitStorageSnapshot, StorageRpcPayloadError> {
         let existing_etag = self.read_optional_string()?;
         let current = self.read_optional_stored_object()?;
+        let committed_segments = self.read_optional_object_segments()?;
+        let committed_stale_generation_id = self.read_optional_generation_id()?;
         let stale_payload_source = self.read_optional_stored_object()?;
         let stale_payload = self.read_optional_object_payload_reclaim()?;
         Ok(DirectPutCommitStorageSnapshot {
             auth_snapshot: crate::DirectPutCommitSnapshot { existing_etag },
             current,
+            committed_segments,
+            committed_stale_generation_id,
             stale_payload_source,
             stale_payload,
         })
+    }
+
+    fn read_optional_object_segments(
+        &mut self,
+    ) -> Result<Option<Vec<ObjectSegmentRecord>>, StorageRpcPayloadError> {
+        match self.read_u8()? {
+            0 => Ok(None),
+            1 => {
+                let segment_count = self.read_bounded_remaining_count(
+                    STORAGE_RPC_MIN_OBJECT_SEGMENT_RECORD_LEN,
+                    "direct PUT committed segment count exceeds payload",
+                )?;
+                let mut segments = Vec::with_capacity(segment_count);
+                for _ in 0..segment_count {
+                    segments.push(self.read_object_segment_record()?);
+                }
+                Ok(Some(segments))
+            }
+            _ => Err(StorageRpcPayloadError::InvalidObjectMetadataRequest(
+                "invalid optional object segments tag",
+            )),
+        }
     }
 
     fn read_optional_object_payload_reclaim(
@@ -15475,8 +15513,36 @@ fn put_direct_put_commit_storage_snapshot(
 ) {
     put_optional_string(out, snapshot.auth_snapshot.existing_etag.as_deref());
     put_optional_stored_object(out, snapshot.current.as_ref());
+    put_optional_object_segments(out, snapshot.committed_segments.as_deref());
+    put_optional_generation_id(out, snapshot.committed_stale_generation_id);
     put_optional_stored_object(out, snapshot.stale_payload_source.as_ref());
     put_optional_object_payload_reclaim(out, snapshot.stale_payload.as_ref());
+}
+
+fn put_optional_generation_id(out: &mut Vec<u8>, generation_id: Option<GenerationId>) {
+    match generation_id {
+        None => put_u8(out, 0),
+        Some(generation_id) => {
+            put_u8(out, 1);
+            put_u64(out, generation_id.get());
+        }
+    }
+}
+
+fn put_optional_object_segments(out: &mut Vec<u8>, segments: Option<&[ObjectSegmentRecord]>) {
+    match segments {
+        None => put_u8(out, 0),
+        Some(segments) => {
+            put_u8(out, 1);
+            put_u32(
+                out,
+                u32::try_from(segments.len()).expect("object segment count must fit in u32"),
+            );
+            for segment in segments {
+                put_object_segment_record(out, segment);
+            }
+        }
+    }
 }
 
 fn put_optional_object_payload_reclaim(
@@ -20399,13 +20465,15 @@ mod tests {
 
     #[test]
     fn direct_put_commit_snapshot_request_and_response_round_trip() {
+        let bucket = BucketName::try_from("bucket").unwrap();
+        let key = ObjectKey::try_from("key").unwrap();
         let request = StorageRpcDirectPutCommitSnapshotRequest {
             object: StorageRpcObjectRequest {
                 node_id: NodeId::new(7),
                 cluster_epoch: ClusterEpoch::INITIAL,
                 pg_id: PgId::new(3),
-                bucket: BucketName::try_from("bucket").unwrap(),
-                key: ObjectKey::try_from("key").unwrap(),
+                bucket: bucket.clone(),
+                key: key.clone(),
             },
             reservation_id: SessionId::try_from("0123456789abcdef0123456789abcdef").unwrap(),
             generation_id: GenerationId::new(9).unwrap(),
@@ -20421,6 +20489,62 @@ mod tests {
                     existing_etag: Some("\"0123456789abcdef\"".to_string()),
                 },
                 current: None,
+                committed_segments: None,
+                committed_stale_generation_id: None,
+                stale_payload_source: None,
+                stale_payload: None,
+            },
+        };
+        let bytes = encode_direct_put_commit_snapshot_response(&response);
+        let decoded = decode_direct_put_commit_snapshot_response(&bytes).unwrap();
+        assert_eq!(decoded, response);
+
+        let owner = OwnerIdentity {
+            principal: "owner".to_string(),
+            canonical_id: CanonicalUserId::from_principal("owner"),
+        };
+        let current = StoredObject::Live(LiveObjectRecord {
+            bucket: bucket.clone(),
+            key: key.clone(),
+            version_id: VersionId::Null,
+            owner,
+            acl_grants: AclGrants::default(),
+            public_read: false,
+            generation_id: GenerationId::new(10).unwrap(),
+            size: 12,
+            etag: ObjectEtag::single_part(55),
+            last_modified: 99,
+            became_noncurrent_at: None,
+            storage_class: StorageClass::Standard,
+            ec: EcShape { k: 4, m: 2 },
+            layout: ObjectLayout::Standard,
+            tags: None,
+            metadata_blob: Some(SerializedMetadataBlob::new(vec![1, 2, 3])),
+            system_metadata_blob: Some(SerializedSystemMetadataBlob::new(vec![4, 5, 6])),
+            object_lock: ObjectLockState::default(),
+            encryption: ObjectEncryption::None,
+        });
+        let response = StorageRpcDirectPutCommitSnapshotResponse {
+            snapshot: DirectPutCommitStorageSnapshot {
+                auth_snapshot: crate::DirectPutCommitSnapshot {
+                    existing_etag: Some("\"0123456789abcdef\"".to_string()),
+                },
+                current: Some(current),
+                committed_segments: Some(vec![ObjectSegmentRecord {
+                    bucket,
+                    key,
+                    version_id: VersionId::Null,
+                    segment_index: 0,
+                    size: 12,
+                    segment_crc64: 55,
+                    segment_okh: [8; 16],
+                    segment_vid: GenerationId::new(10).unwrap(),
+                    data_pg_id: 3,
+                    placement_cluster_epoch: ClusterEpoch::INITIAL,
+                    ec_k: 4,
+                    ec_m: 2,
+                }]),
+                committed_stale_generation_id: Some(GenerationId::new(9).unwrap()),
                 stale_payload_source: None,
                 stale_payload: None,
             },
@@ -20490,6 +20614,8 @@ mod tests {
                     existing_etag: None,
                 },
                 current: None,
+                committed_segments: None,
+                committed_stale_generation_id: None,
                 stale_payload_source: None,
                 stale_payload: None,
             },

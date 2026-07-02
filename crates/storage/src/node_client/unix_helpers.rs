@@ -1856,6 +1856,50 @@ impl UnixStorageNodeClient {
                 "auth snapshot etag does not match current object".to_string(),
             )));
         }
+        if let Some(segments) = snapshot.committed_segments.as_ref() {
+            let Some(current) = snapshot.current.as_ref() else {
+                return Err(ObjectPgActionError::Store(self.rpc_payload_error(
+                    "validate direct PUT commit snapshot response",
+                    "committed segments require current object".to_string(),
+                )));
+            };
+            if current.as_live().is_none() {
+                return Err(ObjectPgActionError::Store(self.rpc_payload_error(
+                    "validate direct PUT commit snapshot response",
+                    "committed segments require live current object".to_string(),
+                )));
+            }
+            for segment in segments {
+                if segment.bucket != *bucket
+                    || segment.key != *key
+                    || segment.version_id != current.version_id()
+                {
+                    return Err(ObjectPgActionError::Store(self.rpc_payload_error(
+                        "validate direct PUT commit snapshot response",
+                        "committed segment identity does not match current object".to_string(),
+                    )));
+                }
+            }
+        } else if snapshot.committed_stale_generation_id.is_some() {
+            return Err(ObjectPgActionError::Store(self.rpc_payload_error(
+                "validate direct PUT commit snapshot response",
+                "committed stale generation requires committed segments".to_string(),
+            )));
+        }
+        if let (Some(stale_generation_id), Some(live)) = (
+            snapshot.committed_stale_generation_id,
+            snapshot
+                .current
+                .as_ref()
+                .and_then(crate::StoredObject::as_live),
+        ) {
+            if stale_generation_id == live.generation_id {
+                return Err(ObjectPgActionError::Store(self.rpc_payload_error(
+                    "validate direct PUT commit snapshot response",
+                    "committed stale generation must not match current live generation".to_string(),
+                )));
+            }
+        }
         if !reclaim_matches_bucket_key(snapshot.stale_payload.as_ref(), bucket, key) {
             return Err(ObjectPgActionError::Store(self.rpc_payload_error(
                 "validate direct PUT commit snapshot response",

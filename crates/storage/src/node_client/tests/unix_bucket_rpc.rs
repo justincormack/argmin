@@ -574,6 +574,8 @@ fn unix_direct_put_snapshot_response_rejects_mismatched_auth_etag() {
             existing_etag: Some("unexpected-etag".to_string()),
         },
         current: None,
+        committed_segments: None,
+        committed_stale_generation_id: None,
         stale_payload_source: None,
         stale_payload: None,
     };
@@ -590,6 +592,8 @@ fn unix_direct_put_snapshot_response_rejects_mismatched_stale_payload_identity()
             existing_etag: None,
         },
         current: None,
+        committed_segments: None,
+        committed_stale_generation_id: None,
         stale_payload_source: None,
         stale_payload: Some(ObjectPayloadReclaimCommand::Segments(
             ObjectSegmentsReclaimRecord {
@@ -614,6 +618,8 @@ fn unix_direct_put_snapshot_response_rejects_stale_payload_without_source() {
             existing_etag: None,
         },
         current: None,
+        committed_segments: None,
+        committed_stale_generation_id: None,
         stale_payload_source: None,
         stale_payload: Some(ObjectPayloadReclaimCommand::Segments(
             ObjectSegmentsReclaimRecord {
@@ -639,6 +645,8 @@ fn unix_direct_put_snapshot_response_rejects_stale_source_without_payload() {
             existing_etag: None,
         },
         current: None,
+        committed_segments: None,
+        committed_stale_generation_id: None,
         stale_payload_source: Some(test_live_stored_object(
             bucket.clone(),
             key.clone(),
@@ -661,6 +669,8 @@ fn unix_direct_put_snapshot_response_rejects_stale_payload_delete_marker_source(
             existing_etag: None,
         },
         current: None,
+        committed_segments: None,
+        committed_stale_generation_id: None,
         stale_payload_source: Some(test_delete_marker_stored_object(
             bucket.clone(),
             key.clone(),
@@ -686,6 +696,8 @@ fn unix_direct_put_snapshot_response_rejects_stale_payload_generation_mismatch()
             existing_etag: None,
         },
         current: None,
+        committed_segments: None,
+        committed_stale_generation_id: None,
         stale_payload_source: Some(test_live_stored_object(
             bucket.clone(),
             key.clone(),
@@ -722,6 +734,8 @@ fn unix_direct_put_snapshot_response_rejects_numbered_stale_source() {
             existing_etag: None,
         },
         current: None,
+        committed_segments: None,
+        committed_stale_generation_id: None,
         stale_payload_source: Some(source),
         stale_payload: Some(test_segments_reclaim(
             bucket.clone(),
@@ -743,6 +757,8 @@ fn unix_direct_put_snapshot_response_rejects_stale_payload_layout_mismatch() {
             existing_etag: None,
         },
         current: None,
+        committed_segments: None,
+        committed_stale_generation_id: None,
         stale_payload_source: Some(test_live_stored_object(
             bucket.clone(),
             key.clone(),
@@ -781,6 +797,8 @@ fn unix_direct_put_snapshot_response_accepts_stale_null_source_under_numbered_cu
             existing_etag: Some(expected_etag),
         },
         current: Some(current),
+        committed_segments: None,
+        committed_stale_generation_id: None,
         stale_payload_source: Some(test_live_stored_object(
             bucket.clone(),
             key.clone(),
