@@ -300,25 +300,28 @@ Progress update:
 
    Progress update: a reusable harness now covers representative generic-transaction
    mutators (`create_bucket`, bucket versioning, bucket ACL, bucket encryption, bucket
-   subresource, `mark_bucket_deleting`, and create multipart upload) plus representative
-   hand-written metadata transactions (object metadata put, object generation reservation,
-   segmented object put, object-segment reclaim, multipart reclaim, multipart upload
-   delete, committed multipart object-part manifest insertion, full multipart completion,
-   staged multipart part segment upsert, and streamed UploadPart finalization). Each case
-   injects a commit failure, reopens and recovers the PG, checks cached-vs-materialised
-   table digests and replica-state digest consistency, asserts no pending slot remains,
-   asserts the PG accepts the next metadata command, and then applies that command. The
-   remaining work is to complete the inventory of digest-affecting mutators, especially
-   single-statement mutators with no explicit transaction. Those need either explicit
-   classification as SQLite crash-atomic single statements or conversion to explicit
-   transactions if their rollback boundary matters.
+   Object Lock, public access block put/delete, ownership controls put/delete, ABAC,
+   bucket subresource, `mark_bucket_deleting`, and create multipart upload), explicit
+   bucket lifecycle transactions (`delete_finalized_bucket`, metadata-command reservation
+   release, expired drain clear, and drain heartbeat), plus representative hand-written
+   metadata transactions (object metadata put, object generation reservation, segmented
+   object put, object-segment reclaim, multipart reclaim, multipart upload delete,
+   committed multipart object-part manifest insertion, full multipart completion, staged
+   multipart part segment upsert, and streamed UploadPart finalization). Each case injects a
+   commit failure, reopens and recovers the PG, checks cached-vs-materialised table digests
+   and replica-state digest consistency, asserts no pending slot remains, asserts the PG
+   accepts the next metadata command, and then applies that command. The remaining work is
+   to complete the inventory of digest-affecting mutators, especially single-statement
+   mutators with no explicit transaction. Those need either explicit classification as
+   SQLite crash-atomic single statements or conversion to explicit transactions if their
+   rollback boundary matters.
 
    Remaining inventory groups visible from the `PgMetadataStore` surface:
-   - bucket reservation/drain/finalizer/lifecycle/reclaim claim maintenance rows
-     (`acquire_*`, `heartbeat_*`, `release_*`, `clear_*`, and attempt-outcome helpers);
-   - smaller bucket configuration mutators not yet represented by the matrix, such as
-     Object Lock, public access block, ownership controls, ABAC, and delete-subresource
-     variants;
+   - single-statement bucket reservation/drain/finalizer/lifecycle/reclaim claim
+     maintenance rows, especially `acquire_*`, direct `release_*`/`clear_*`, claim
+     heartbeats/error records, and attempt-outcome helpers;
+   - smaller bucket configuration mutators not yet represented by the matrix, currently
+     delete-subresource variants;
    - smaller object metadata mutators, such as object ACL, retention, legal hold,
      object-tag put/delete, object metadata delete, object-version delete, and generation
      reservation release;

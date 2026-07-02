@@ -1961,6 +1961,117 @@ fn metadata_txn_commit_failure_recovers_representative_mutators() {
     );
 
     assert_commit_failure_recovers_for_metadata_mutator(
+        "delete-finalized-bucket",
+        |store| {
+            create_probe_bucket_direct(store, &trusted_bucket_name("commit-fail-finalized"));
+            PgMetadataStore::mark_bucket_deleting(
+                store,
+                &trusted_bucket_name("commit-fail-finalized"),
+            )
+            .unwrap();
+        },
+        |store| store.delete_finalized_bucket(&trusted_bucket_name("commit-fail-finalized")),
+    );
+
+    assert_commit_failure_recovers_for_metadata_mutator(
+        "release-metadata-command-bucket-reservation",
+        |store| {
+            create_probe_bucket_direct(store, &trusted_bucket_name("commit-fail-reservation"));
+            PgMetadataStore::acquire_durable_bucket_write_reservation(
+                store,
+                &trusted_bucket_name("commit-fail-reservation"),
+                "reservation-id",
+                "owner-token",
+                ClusterEpoch::INITIAL,
+                "test",
+                10,
+                Some(100),
+                None,
+            )
+            .unwrap();
+        },
+        |store| {
+            let reservation = PgMetadataStore::durable_bucket_write_reservation(
+                store,
+                &trusted_bucket_name("commit-fail-reservation"),
+                "reservation-id",
+            )
+            .unwrap()
+            .expect("test setup should create reservation");
+            PgMetadataStore::release_metadata_command_bucket_write_reservation(
+                store,
+                &reservation.bucket,
+                &reservation.reservation_id,
+                &reservation.owner_token,
+                reservation.cluster_epoch,
+                reservation.bucket_execution_generation,
+                reservation.bucket_incarnation_generation,
+            )
+        },
+    );
+
+    assert_commit_failure_recovers_for_metadata_mutator(
+        "clear-expired-durable-bucket-drain",
+        |store| {
+            create_probe_bucket_direct(store, &trusted_bucket_name("commit-fail-clear-drain"));
+            PgMetadataStore::begin_durable_bucket_write_drain(
+                store,
+                &trusted_bucket_name("commit-fail-clear-drain"),
+                "drain-id",
+                "owner-token",
+                ClusterEpoch::INITIAL,
+                10,
+                Some(20),
+            )
+            .unwrap();
+        },
+        |store| {
+            PgMetadataStore::clear_expired_durable_bucket_write_drain(
+                store,
+                &trusted_bucket_name("commit-fail-clear-drain"),
+                21,
+            )
+            .map(|_| ())
+        },
+    );
+
+    assert_commit_failure_recovers_for_metadata_mutator(
+        "heartbeat-durable-bucket-drain",
+        |store| {
+            create_probe_bucket_direct(store, &trusted_bucket_name("commit-fail-heartbeat-drain"));
+            PgMetadataStore::begin_durable_bucket_write_drain(
+                store,
+                &trusted_bucket_name("commit-fail-heartbeat-drain"),
+                "drain-id",
+                "owner-token",
+                ClusterEpoch::INITIAL,
+                10,
+                Some(30),
+            )
+            .unwrap();
+        },
+        |store| {
+            let drain = PgMetadataStore::durable_bucket_write_drain(
+                store,
+                &trusted_bucket_name("commit-fail-heartbeat-drain"),
+            )
+            .unwrap()
+            .expect("test setup should create drain");
+            PgMetadataStore::heartbeat_durable_bucket_write_drain(
+                store,
+                &drain.bucket,
+                &drain.drain_id,
+                &drain.owner_token,
+                drain.cluster_epoch,
+                drain.bucket_execution_generation,
+                40,
+                20,
+            )
+            .map(|_| ())
+        },
+    );
+
+    assert_commit_failure_recovers_for_metadata_mutator(
         "create-multipart-upload",
         |store| create_probe_bucket_direct(store, &trusted_bucket_name("commit-fail-mpu")),
         |store| {
@@ -1996,6 +2107,120 @@ fn metadata_txn_commit_failure_recovers_representative_mutators() {
                     default_encryption: Some(ManagedEncryptionAlgorithm::Aes256),
                     sse_c_blocked: true,
                 },
+            )
+        },
+    );
+
+    assert_commit_failure_recovers_for_metadata_mutator(
+        "put-bucket-object-lock",
+        |store| {
+            create_probe_bucket_direct(store, &trusted_bucket_name("commit-fail-lock"));
+            PgMetadataStore::put_bucket_versioning(
+                store,
+                &trusted_bucket_name("commit-fail-lock"),
+                BucketVersioningState::Enabled,
+            )
+            .unwrap();
+        },
+        |store| {
+            PgMetadataStore::put_bucket_object_lock(
+                store,
+                &trusted_bucket_name("commit-fail-lock"),
+                BucketObjectLockConfig {
+                    enabled: true,
+                    default_retention: Some(ObjectLockDefaultRetention {
+                        mode: ObjectLockMode::Governance,
+                        period: RetentionPeriod::days(7).unwrap(),
+                    }),
+                },
+            )
+        },
+    );
+
+    assert_commit_failure_recovers_for_metadata_mutator(
+        "put-bucket-public-access-block",
+        |store| create_probe_bucket_direct(store, &trusted_bucket_name("commit-fail-pab")),
+        |store| {
+            PgMetadataStore::put_bucket_public_access_block(
+                store,
+                &trusted_bucket_name("commit-fail-pab"),
+                PublicAccessBlockConfig {
+                    block_public_acls: true,
+                    ignore_public_acls: true,
+                    block_public_policy: true,
+                    restrict_public_buckets: true,
+                },
+            )
+        },
+    );
+
+    assert_commit_failure_recovers_for_metadata_mutator(
+        "delete-bucket-public-access-block",
+        |store| {
+            create_probe_bucket_direct(store, &trusted_bucket_name("commit-fail-delete-pab"));
+            PgMetadataStore::put_bucket_public_access_block(
+                store,
+                &trusted_bucket_name("commit-fail-delete-pab"),
+                PublicAccessBlockConfig {
+                    block_public_acls: true,
+                    ignore_public_acls: false,
+                    block_public_policy: true,
+                    restrict_public_buckets: false,
+                },
+            )
+            .unwrap();
+        },
+        |store| {
+            PgMetadataStore::delete_bucket_public_access_block(
+                store,
+                &trusted_bucket_name("commit-fail-delete-pab"),
+            )
+        },
+    );
+
+    assert_commit_failure_recovers_for_metadata_mutator(
+        "put-bucket-ownership-controls",
+        |store| create_probe_bucket_direct(store, &trusted_bucket_name("commit-fail-ownership")),
+        |store| {
+            PgMetadataStore::put_bucket_ownership_controls(
+                store,
+                &trusted_bucket_name("commit-fail-ownership"),
+                BucketOwnershipControls {
+                    object_ownership: BucketObjectOwnership::BucketOwnerEnforced,
+                },
+            )
+        },
+    );
+
+    assert_commit_failure_recovers_for_metadata_mutator(
+        "delete-bucket-ownership-controls",
+        |store| {
+            create_probe_bucket_direct(store, &trusted_bucket_name("commit-fail-delete-ownership"));
+            PgMetadataStore::put_bucket_ownership_controls(
+                store,
+                &trusted_bucket_name("commit-fail-delete-ownership"),
+                BucketOwnershipControls {
+                    object_ownership: BucketObjectOwnership::BucketOwnerPreferred,
+                },
+            )
+            .unwrap();
+        },
+        |store| {
+            PgMetadataStore::delete_bucket_ownership_controls(
+                store,
+                &trusted_bucket_name("commit-fail-delete-ownership"),
+            )
+        },
+    );
+
+    assert_commit_failure_recovers_for_metadata_mutator(
+        "put-bucket-abac-enabled",
+        |store| create_probe_bucket_direct(store, &trusted_bucket_name("commit-fail-abac")),
+        |store| {
+            PgMetadataStore::put_bucket_abac_enabled(
+                store,
+                &trusted_bucket_name("commit-fail-abac"),
+                true,
             )
         },
     );
