@@ -1,8 +1,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+use std::fs::{self, File};
 use std::future::Future;
-use std::io::{self, Cursor};
+use std::io::{self, Cursor, Read, Write};
 use std::ops::{Bound, RangeBounds};
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
@@ -2702,6 +2704,55 @@ impl ControlPlaneRaftRestartArtifact {
         Ok(artifact)
     }
 
+    pub fn load_durable_artifact(path: &Path) -> Result<Self, ControlPlaneError> {
+        let mut file = File::open(path).map_err(|source| ControlPlaneError::Io {
+            context: "open control-plane OpenRaft durable restart artifact",
+            source,
+        })?;
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)
+            .map_err(|source| ControlPlaneError::Io {
+                context: "read control-plane OpenRaft durable restart artifact",
+                source,
+            })?;
+        Self::decode_durable_artifact(&bytes)
+    }
+
+    pub fn store_durable_artifact(&self, path: &Path) -> Result<(), ControlPlaneError> {
+        let bytes = self.encode_durable_artifact()?;
+        if let Some(parent) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            fs::create_dir_all(parent).map_err(|source| ControlPlaneError::Io {
+                context: "create control-plane OpenRaft durable restart artifact directory",
+                source,
+            })?;
+        }
+        let tmp_path = durable_artifact_tmp_path(path);
+        {
+            let mut file = File::create(&tmp_path).map_err(|source| ControlPlaneError::Io {
+                context: "create control-plane OpenRaft durable restart artifact temp file",
+                source,
+            })?;
+            file.write_all(&bytes)
+                .map_err(|source| ControlPlaneError::Io {
+                    context: "write control-plane OpenRaft durable restart artifact temp file",
+                    source,
+                })?;
+            file.sync_all().map_err(|source| ControlPlaneError::Io {
+                context: "sync control-plane OpenRaft durable restart artifact temp file",
+                source,
+            })?;
+        }
+        fs::rename(&tmp_path, path).map_err(|source| ControlPlaneError::Io {
+            context: "commit control-plane OpenRaft durable restart artifact",
+            source,
+        })?;
+        sync_durable_artifact_parent(path)?;
+        Ok(())
+    }
+
     pub fn restore(
         self,
     ) -> Result<(ControlPlaneRaftLogStore, ControlPlaneRaftStateMachine), io::Error> {
@@ -2791,6 +2842,27 @@ impl ControlPlaneRaftRestartArtifact {
             .find(|entry| entry.log_id.index() == index)
             .map(|entry| entry.log_id)
     }
+}
+
+fn durable_artifact_tmp_path(path: &Path) -> PathBuf {
+    let file_name = path
+        .file_name()
+        .and_then(|file_name| file_name.to_str())
+        .unwrap_or("control-plane-raft.state");
+    path.with_file_name(format!("{file_name}.tmp.{}", std::process::id()))
+}
+
+fn sync_durable_artifact_parent(path: &Path) -> Result<(), ControlPlaneError> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|source| ControlPlaneError::Io {
+            context: "sync control-plane OpenRaft durable restart artifact directory",
+            source,
+        })
 }
 
 fn append_raft_artifact_checksum(out: &mut Vec<u8>) {
@@ -9374,6 +9446,58 @@ mod tests {
                 vec![raft_log_id(0, 1, 0), raft_log_id(3, 1, 1)]
             );
         });
+    }
+
+    #[test]
+    fn control_plane_raft_durable_restart_artifact_file_round_trips() {
+        let tmp = test_util::tempdir();
+        let path = tmp.path().join("control-plane").join("raft.state");
+        let artifact = ControlPlaneRaftRestartArtifact {
+            log_store: ControlPlaneRaftLogStoreRestartArtifact {
+                vote: Some(Vote::<ControlPlaneRaftLeaderId>::new_committed(3, 1)),
+                committed: Some(raft_log_id(3, 1, 1)),
+                entries: vec![bootstrap_membership_entry(1), blank_entry(3, 1, 1)],
+                ..Default::default()
+            },
+            state_machine: state_machine_restart_artifact_with_noops(3, 1, 1),
+        };
+
+        artifact.store_durable_artifact(&path).unwrap();
+        assert!(!durable_artifact_tmp_path(&path).exists());
+
+        let loaded = ControlPlaneRaftRestartArtifact::load_durable_artifact(&path)
+            .expect("stored durable restart artifact should load");
+        let (mut loaded_log_store, loaded_state_machine) = loaded.restore().unwrap();
+        ControlPlaneRaftTypeConfig::run(async {
+            assert_eq!(
+                RaftLogStorage::read_committed(&mut loaded_log_store)
+                    .await
+                    .unwrap(),
+                Some(raft_log_id(3, 1, 1))
+            );
+        });
+        assert_eq!(
+            loaded_state_machine.last_applied(),
+            Some(raft_log_id(3, 1, 1))
+        );
+    }
+
+    #[test]
+    fn control_plane_raft_durable_restart_artifact_file_rejects_corruption() {
+        let tmp = test_util::tempdir();
+        let path = tmp.path().join("raft.state");
+        let artifact = ControlPlaneRaftRestartArtifact {
+            log_store: ControlPlaneRaftLogStoreRestartArtifact::default(),
+            state_machine: ControlPlaneRaftStateMachine::empty().export_restart_artifact(),
+        };
+        let mut encoded = artifact.encode_durable_artifact().unwrap();
+        encoded[CONTROL_PLANE_RAFT_RESTART_MAGIC.len() + 2] ^= 1;
+        std::fs::write(&path, encoded).unwrap();
+
+        assert_error_contains(
+            ControlPlaneRaftRestartArtifact::load_durable_artifact(&path),
+            "checksum mismatch",
+        );
     }
 
     #[test]

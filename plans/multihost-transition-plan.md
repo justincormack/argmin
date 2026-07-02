@@ -10154,6 +10154,11 @@ Phase 12.2 progress:
   serve from them. Tests cover round-trip restore, malformed frames, checksum
   rejection, unknown entry payload tags, invalid index-0 bootstrap entry
   shapes, and committed/applied inconsistency.
+- Added the first local file boundary for the durable restart artifact. The
+  artifact can now be stored through a same-directory temp file, `sync_all`,
+  atomic rename, and parent-directory sync, and loaded back through the
+  checksum/restart-validation decoder. Tests cover nested-directory store/load
+  and corrupt-file rejection.
 
 1. define the replicated control-plane state machine:
    - state includes cluster epoch, PG count, PG state, PG acting sets, node
