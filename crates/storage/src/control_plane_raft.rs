@@ -2890,6 +2890,10 @@ impl ControlPlaneRaftRestartArtifact {
                     control_plane_error_to_io_error("OpenRaft state-machine restart", error)
                 })?;
         Self::validate_log_store_state_machine_pair(&self.log_store, &self.state_machine)?;
+        Self::validate_cached_snapshot_replays_to_state_machine(
+            &self.log_store,
+            &self.state_machine,
+        )?;
         Ok((log_store, state_machine))
     }
 
@@ -3062,6 +3066,121 @@ impl ControlPlaneRaftRestartArtifact {
         Ok(())
     }
 
+    fn validate_cached_snapshot_replays_to_state_machine(
+        log_store: &ControlPlaneRaftLogStoreRestartArtifact,
+        state_machine: &ControlPlaneRaftStateMachineRestartArtifact,
+    ) -> Result<(), io::Error> {
+        let Some(snapshot) = state_machine.current_snapshot.as_ref() else {
+            return Ok(());
+        };
+        if snapshot.meta.last_log_id == state_machine.last_applied {
+            return Ok(());
+        }
+        let Some(target_last_applied) = state_machine.last_applied else {
+            return Err(raft_log_store_error(
+                "cached OpenRaft snapshot is present but state-machine has no applied log id",
+            ));
+        };
+        Self::validate_cached_snapshot_membership_at_boundary(
+            log_store,
+            snapshot,
+            target_last_applied,
+        )?;
+
+        let control_plane_snapshot_log_id = match snapshot.meta.last_log_id {
+            Some(log_id) if is_openraft_bootstrap_log_id(log_id) => None,
+            Some(log_id) => control_plane_log_id_from_raft(log_id)
+                .ok_or_else(|| {
+                    raft_log_store_error(format!(
+                        "invalid cached OpenRaft snapshot last_log_id: {log_id}"
+                    ))
+                })
+                .map(Some)?,
+            None => None,
+        };
+        let mut snapshot_inner = ReplicatedControlPlaneStateMachine::empty();
+        snapshot_inner
+            .install_snapshot_artifact(ControlPlaneSnapshotArtifact::new(
+                control_plane_snapshot_log_id,
+                snapshot.snapshot.get_ref().clone(),
+            ))
+            .map_err(|error| {
+                control_plane_error_to_io_error("OpenRaft cached snapshot replay base", error)
+            })?;
+        let mut replayed = ControlPlaneRaftStateMachine::new(
+            snapshot_inner,
+            snapshot.meta.last_log_id,
+            snapshot.meta.last_membership.clone(),
+        )
+        .map_err(|error| {
+            control_plane_error_to_io_error("OpenRaft cached snapshot replay state", error)
+        })?;
+
+        let next_index = snapshot
+            .meta
+            .last_log_id
+            .map_or(Some(0), |log_id| log_id.index().checked_add(1))
+            .ok_or_else(|| {
+                raft_log_store_error(
+                    "cached OpenRaft snapshot last_log_id cannot be followed by a suffix",
+                )
+            })?;
+        for index in next_index..=target_last_applied.index() {
+            let entry = Self::log_store_artifact_entry_at(log_store, index).ok_or_else(|| {
+                raft_log_store_error(format!(
+                    "cached OpenRaft snapshot cannot replay missing retained suffix entry at index {index}"
+                ))
+            })?;
+            replayed.apply_entry(entry.clone()).map_err(|error| {
+                control_plane_error_to_io_error("OpenRaft cached snapshot suffix replay", error)
+            })?;
+        }
+        if replayed.last_applied != state_machine.last_applied
+            || replayed.last_membership != state_machine.last_membership
+            || replayed.inner.snapshot() != state_machine.inner.snapshot()
+            || replayed.inner.last_applied() != state_machine.inner.last_applied()
+        {
+            return Err(raft_log_store_error(
+                "cached OpenRaft snapshot plus retained suffix does not match state-machine restart payload",
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_cached_snapshot_membership_at_boundary(
+        log_store: &ControlPlaneRaftLogStoreRestartArtifact,
+        snapshot: &SnapshotOf<ControlPlaneRaftTypeConfig>,
+        target_last_applied: LogIdOf<ControlPlaneRaftTypeConfig>,
+    ) -> Result<(), io::Error> {
+        let Some(snapshot_log_id) = snapshot.meta.last_log_id else {
+            return Ok(());
+        };
+        let suffix_has_membership = log_store.entries.iter().any(|entry| {
+            entry.log_id.index() > snapshot_log_id.index()
+                && entry.log_id.index() <= target_last_applied.index()
+                && matches!(&entry.payload, EntryPayload::Membership(_))
+        });
+        if !suffix_has_membership {
+            return Ok(());
+        }
+
+        let Some(expected_membership) =
+            Self::log_store_artifact_membership_at(log_store, snapshot_log_id.index())
+        else {
+            return Err(raft_log_store_error(format!(
+                "cached OpenRaft snapshot membership at {snapshot_log_id} cannot be validated from retained log prefix before membership-changing suffix"
+            )));
+        };
+        if expected_membership.log_id() != snapshot.meta.last_membership.log_id()
+            || expected_membership.membership() != snapshot.meta.last_membership.membership()
+        {
+            return Err(raft_log_store_error(format!(
+                "cached OpenRaft snapshot membership at {snapshot_log_id} does not match retained log prefix"
+            )));
+        }
+        Ok(())
+    }
+
     fn log_store_artifact_log_id_at(
         log_store: &ControlPlaneRaftLogStoreRestartArtifact,
         index: u64,
@@ -3079,6 +3198,44 @@ impl ControlPlaneRaftRestartArtifact {
             .iter()
             .find(|entry| entry.log_id.index() == index)
             .map(|entry| entry.log_id)
+    }
+
+    fn log_store_artifact_entry_at(
+        log_store: &ControlPlaneRaftLogStoreRestartArtifact,
+        index: u64,
+    ) -> Option<&ControlPlaneRaftEntry> {
+        log_store
+            .entries
+            .iter()
+            .find(|entry| entry.log_id.index() == index)
+    }
+
+    fn log_store_artifact_membership_at(
+        log_store: &ControlPlaneRaftLogStoreRestartArtifact,
+        index: u64,
+    ) -> Option<StoredMembershipOf<ControlPlaneRaftTypeConfig>> {
+        if log_store.last_purged_log_id.is_some() {
+            return None;
+        }
+        let mut membership = StoredMembership::default();
+        let mut expected_index = 0;
+        for entry in &log_store.entries {
+            if entry.log_id.index() != expected_index {
+                return None;
+            }
+            if entry.log_id.index() > index {
+                break;
+            }
+            if let EntryPayload::Membership(entry_membership) = &entry.payload {
+                membership = StoredMembership::new(Some(entry.log_id), entry_membership.clone());
+            }
+            expected_index = expected_index.checked_add(1)?;
+        }
+        if expected_index > index {
+            Some(membership)
+        } else {
+            None
+        }
     }
 }
 
@@ -3861,7 +4018,9 @@ impl ControlPlaneRaftStateMachine {
         let current_snapshot = self
             .current_snapshot
             .as_ref()
-            .filter(|snapshot| snapshot.meta.last_log_id == self.last_applied)
+            .filter(|snapshot| {
+                Self::snapshot_at_or_before(snapshot.meta.last_log_id, self.last_applied)
+            })
             .cloned();
         ControlPlaneRaftStateMachineRestartArtifact {
             inner: self.inner.clone(),
@@ -3944,21 +4103,12 @@ impl ControlPlaneRaftStateMachine {
                 ),
             });
         }
-        if snapshot.meta.last_log_id != self.last_applied {
+        if !Self::snapshot_at_or_before(snapshot.meta.last_log_id, self.last_applied) {
             return Err(ControlPlaneError::CommandDecode {
                 message: format!(
-                    "cached OpenRaft snapshot last_log_id {:?} does not match state-machine applied log id {:?}",
+                    "cached OpenRaft snapshot last_log_id {:?} is after state-machine applied log id {:?}",
                     snapshot.meta.last_log_id, self.last_applied
                 ),
-            });
-        }
-        if snapshot.meta.last_membership.log_id() != self.last_membership.log_id()
-            || snapshot.meta.last_membership.membership() != self.last_membership.membership()
-        {
-            return Err(ControlPlaneError::CommandDecode {
-                message:
-                    "cached OpenRaft snapshot membership does not match state-machine membership"
-                        .to_string(),
             });
         }
 
@@ -3967,16 +4117,49 @@ impl ControlPlaneRaftStateMachine {
             control_plane_snapshot_log_id,
             snapshot.snapshot.get_ref().clone(),
         ))?;
-        if snapshot_inner.snapshot() != self.inner.snapshot()
-            || snapshot_inner.last_applied() != self.inner.last_applied()
-        {
+        if snapshot_inner.last_applied() != control_plane_snapshot_log_id {
             return Err(ControlPlaneError::CommandDecode {
-                message:
-                    "cached OpenRaft snapshot payload does not match state-machine restart payload"
-                        .to_string(),
+                message: format!(
+                    "cached OpenRaft snapshot payload last-applied {:?} does not match snapshot metadata {:?}",
+                    snapshot_inner.last_applied(),
+                    control_plane_snapshot_log_id
+                ),
             });
         }
+        if snapshot.meta.last_log_id == self.last_applied {
+            if snapshot.meta.last_membership.log_id() != self.last_membership.log_id()
+                || snapshot.meta.last_membership.membership() != self.last_membership.membership()
+            {
+                return Err(ControlPlaneError::CommandDecode {
+                    message:
+                        "cached OpenRaft snapshot membership does not match state-machine membership"
+                            .to_string(),
+                });
+            }
+            if snapshot_inner.snapshot() != self.inner.snapshot()
+                || snapshot_inner.last_applied() != self.inner.last_applied()
+            {
+                return Err(ControlPlaneError::CommandDecode {
+                    message:
+                        "cached OpenRaft snapshot payload does not match state-machine restart payload"
+                            .to_string(),
+                });
+            }
+        }
         Ok(())
+    }
+
+    fn snapshot_at_or_before(
+        snapshot_log_id: Option<LogIdOf<ControlPlaneRaftTypeConfig>>,
+        last_applied: Option<LogIdOf<ControlPlaneRaftTypeConfig>>,
+    ) -> bool {
+        match (snapshot_log_id, last_applied) {
+            (None, _) => true,
+            (Some(_), None) => false,
+            (Some(snapshot_log_id), Some(last_applied)) => {
+                snapshot_log_id.index() < last_applied.index() || snapshot_log_id == last_applied
+            }
+        }
     }
 
     #[must_use]
@@ -10063,7 +10246,7 @@ mod tests {
     }
 
     #[test]
-    fn control_plane_openraft_durable_single_node_replays_suffix_after_snapshot_purge() {
+    fn control_plane_openraft_durable_single_node_validates_snapshot_suffix_after_purge() {
         ControlPlaneRaftTypeConfig::run(async {
             let tmp = test_util::tempdir();
             let path = tmp.path().join("raft.state");
@@ -10086,8 +10269,8 @@ mod tests {
                 vec![
                     bootstrap_entry.clone(),
                     bootstrap_command.clone(),
-                    suffix_entry_2,
-                    suffix_entry_3,
+                    suffix_entry_2.clone(),
+                    suffix_entry_3.clone(),
                 ],
                 IOFlushed::noop(),
             )
@@ -10111,6 +10294,9 @@ mod tests {
             state_machine.apply_entry(bootstrap_command).unwrap();
             let built_snapshot = state_machine.build_snapshot().unwrap();
             assert_eq!(built_snapshot.meta.last_log_id, Some(raft_log_id(3, 1, 1)));
+            state_machine.apply_entry(suffix_entry_2).unwrap();
+            state_machine.apply_entry(suffix_entry_3).unwrap();
+            assert_eq!(state_machine.last_applied(), Some(raft_log_id(3, 1, 3)));
 
             ControlPlaneRaftRestartArtifact::capture(&log_store, &state_machine)
                 .unwrap()
@@ -10128,7 +10314,7 @@ mod tests {
                 .wait_for_applied_log_id(
                     raft_log_id(3, 1, 3),
                     Duration::from_secs(1),
-                    "durable single-node authority replayed suffix after snapshot purge",
+                    "durable single-node authority restored suffix-validated snapshot",
                 )
                 .await
                 .unwrap();
@@ -10450,6 +10636,89 @@ mod tests {
         };
         let err = state_behind_purged_boundary.restore().unwrap_err();
         assert!(err.to_string().contains("behind purged boundary"));
+
+        let bootstrap_entry = single_node_bootstrap_membership_entry(1);
+        let bootstrap_command = normal_entry(
+            3,
+            1,
+            1,
+            ControlPlaneCommand::BootstrapInitialClusterMap {
+                nodes: vec![(NodeId::new(1), "/tmp/node-1.sock".to_string())],
+                pg_ids: vec![PgId::new(1)],
+            },
+        );
+        let mut state_machine = ControlPlaneRaftStateMachine::empty();
+        state_machine.apply_entry(bootstrap_entry.clone()).unwrap();
+        state_machine
+            .apply_entry(bootstrap_command.clone())
+            .unwrap();
+        state_machine.build_snapshot().unwrap();
+        state_machine.apply_entry(blank_entry(3, 1, 2)).unwrap();
+        let mut artifact = ControlPlaneRaftRestartArtifact {
+            log_store: ControlPlaneRaftLogStoreRestartArtifact {
+                vote: Some(Vote::<ControlPlaneRaftLeaderId>::new_committed(3, 1)),
+                committed: Some(raft_log_id(3, 1, 2)),
+                last_purged_log_id: Some(raft_log_id(3, 1, 1)),
+                entries: vec![normal_entry(
+                    3,
+                    1,
+                    2,
+                    ControlPlaneCommand::MarkNodeAvailability {
+                        node_id: NodeId::new(1),
+                        availability: NodeAvailabilityState::Healthy,
+                    },
+                )],
+            },
+            state_machine: state_machine.export_restart_artifact(),
+        };
+        assert_eq!(
+            artifact
+                .state_machine
+                .current_snapshot
+                .as_ref()
+                .and_then(|snapshot| snapshot.meta.last_log_id),
+            Some(raft_log_id(3, 1, 1))
+        );
+        let err = artifact.clone().restore().unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("cached OpenRaft snapshot plus retained suffix"));
+        artifact.log_store.entries = vec![blank_entry(3, 1, 2)];
+        artifact.clone().restore().unwrap();
+        artifact.log_store.entries = vec![blank_entry(3, 1, 2), membership_entry(3, 1, 3)];
+        artifact.restore().unwrap();
+
+        let mut membership_state_machine = ControlPlaneRaftStateMachine::empty();
+        membership_state_machine
+            .apply_entry(bootstrap_entry.clone())
+            .unwrap();
+        membership_state_machine
+            .apply_entry(bootstrap_command.clone())
+            .unwrap();
+        membership_state_machine.build_snapshot().unwrap();
+        membership_state_machine
+            .apply_entry(membership_entry(3, 1, 2))
+            .unwrap();
+        let mut stale_snapshot_wrong_membership = ControlPlaneRaftRestartArtifact {
+            log_store: ControlPlaneRaftLogStoreRestartArtifact {
+                vote: Some(Vote::<ControlPlaneRaftLeaderId>::new_committed(3, 1)),
+                committed: Some(raft_log_id(3, 1, 2)),
+                last_purged_log_id: Some(raft_log_id(3, 1, 1)),
+                entries: vec![membership_entry(3, 1, 2)],
+            },
+            state_machine: membership_state_machine.export_restart_artifact(),
+        };
+        stale_snapshot_wrong_membership
+            .state_machine
+            .current_snapshot
+            .as_mut()
+            .unwrap()
+            .meta
+            .last_membership = StoredMembership::new(Some(raft_log_id(0, 1, 0)), test_membership());
+        let err = stale_snapshot_wrong_membership.restore().unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("cached OpenRaft snapshot membership"));
     }
 
     #[test]

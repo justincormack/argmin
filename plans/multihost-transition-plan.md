@@ -10155,13 +10155,12 @@ Phase 12.2 progress:
   rejection, unknown entry payload tags, invalid index-0 bootstrap entry
   shapes, and committed/applied inconsistency.
 - Extended the durable restart artifact to preserve an optional cached OpenRaft
-  snapshot when that snapshot is exactly at the state machine's applied tip.
-  Decode validates the cached snapshot metadata, membership, snapshot id, and
-  payload against the restored state-machine payload before exposing it through
-  `get_current_snapshot()`. Stale cached snapshots are intentionally dropped
-  during export for now; a future compaction slice must define and test the
-  broader snapshot-plus-retained-suffix contract before persisting older
-  snapshots.
+  snapshot at or before the state machine's applied tip. Decode validates the
+  cached snapshot metadata, membership, snapshot id, and payload before
+  exposing it through `get_current_snapshot()`. Tip snapshots must match the
+  restored state-machine payload directly; older snapshots are accepted only at
+  the combined artifact boundary when replaying the retained suffix from that
+  snapshot reproduces the authoritative restored state-machine payload.
 - Added durable restart coverage for the first compaction boundary shape:
   the log can be purged through the cached snapshot/applied boundary while a
   committed suffix remains retained. Restart restores the cached snapshot,
