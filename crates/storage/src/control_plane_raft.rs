@@ -366,6 +366,29 @@ fn current_serving_authority_node_id(
     })
 }
 
+fn validate_selected_linearized_authority_status(
+    selected_node_id: ControlPlaneRaftNodeId,
+    status: &ControlPlaneRaftAuthorityStatus,
+) -> Result<(), ControlPlaneError> {
+    if status.node_id() != selected_node_id {
+        return Err(ControlPlaneError::RpcRemote {
+            message: format!(
+                "raft linearized authority directory returned node {} for selected serving node {selected_node_id}",
+                status.node_id()
+            ),
+        });
+    }
+    if !status.linearized_authority_serving() {
+        return Err(ControlPlaneError::RpcRemote {
+            message: format!(
+                "raft linearized authority directory selected node {selected_node_id}, but it is no longer serving: {:?}",
+                status.linearized_authority_readiness()
+            ),
+        });
+    }
+    Ok(())
+}
+
 #[derive(Clone)]
 pub struct ControlPlaneRaftAuthorityBootstrapDirectoryHandle {
     inner: Arc<dyn ControlPlaneRaftAuthorityBootstrapDirectory + Send + Sync>,
@@ -851,7 +874,13 @@ impl ControlPlaneRaftAuthorityRoutingHandle {
     ) -> Result<ControlPlaneRaftAuthorityHandle, ControlPlaneError> {
         let statuses = self.status_list.authority_statuses().await?;
         let node_id = current_serving_authority_node_id(&statuses)?;
-        self.directory.linearized_authority_for_node(node_id).await
+        let authority = self
+            .directory
+            .linearized_authority_for_node(node_id)
+            .await?;
+        let status = authority.status().await?;
+        validate_selected_linearized_authority_status(node_id, &status)?;
+        Ok(authority)
     }
 
     pub async fn submit_control_plane_command(
@@ -3668,6 +3697,21 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
+    struct FixedLinearizedAuthorityDirectory {
+        authority: ControlPlaneRaftAuthorityHandle,
+    }
+
+    impl ControlPlaneRaftLinearizedAuthorityDirectory for FixedLinearizedAuthorityDirectory {
+        fn linearized_authority_for_node(
+            &self,
+            _node_id: ControlPlaneRaftNodeId,
+        ) -> ControlPlaneRaftFuture<'_, Result<ControlPlaneRaftAuthorityHandle, ControlPlaneError>>
+        {
+            Box::pin(std::future::ready(Ok(self.authority.clone())))
+        }
+    }
+
     impl RaftNetworkFactory<ControlPlaneRaftTypeConfig> for InMemoryRaftNetworkFactory {
         type Network = InMemoryRaftNetwork;
 
@@ -6246,6 +6290,63 @@ mod tests {
                 err,
                 ControlPlaneError::RpcRemote { message }
                     if message.contains("multiple serving raft authorities")
+            ));
+
+            authority1.shutdown().await.unwrap();
+            authority2.shutdown().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn control_plane_openraft_routing_rejects_mismatched_linearized_directory_handle() {
+        ControlPlaneRaftTypeConfig::run(async {
+            let operation_timeout = Duration::from_secs(2);
+            let (authority1, authority2) = initialized_two_node_authorities(
+                "control-plane-raft-routing-mismatched-directory-test",
+                451,
+                452,
+            )
+            .await;
+            let authority1 = Arc::new(authority1);
+            let authority2 = Arc::new(authority2);
+            wait_for_authority_status_matching(
+                &authority1,
+                operation_timeout,
+                "mismatched directory selected leader serving",
+                ControlPlaneRaftAuthorityStatus::linearized_authority_serving,
+            )
+            .await;
+
+            let status_directory = InMemoryAuthorityCapabilityDirectory::default();
+            status_directory.register(451, Arc::clone(&authority1));
+            status_directory.register(452, Arc::clone(&authority2));
+            let status_list =
+                ControlPlaneRaftAuthorityStatusListHandle::new(Arc::new(status_directory));
+            let observer_status =
+                ControlPlaneRaftAuthorityStatusHandle::new(Arc::clone(&authority1));
+            let mismatched_directory = FixedLinearizedAuthorityDirectory {
+                authority: ControlPlaneRaftAuthorityHandle::new(Arc::clone(&authority2)),
+            };
+            let routed_client = ControlPlaneRaftAuthorityRoutingHandle::new(
+                observer_status,
+                status_list,
+                ControlPlaneRaftLinearizedAuthorityDirectoryHandle::new(Arc::new(
+                    mismatched_directory,
+                )),
+            );
+
+            let err = expect_bounded_control_plane_raft_error(
+                routed_client.current_serving_linearized_authority(),
+                operation_timeout,
+                "routing handle rejects mismatched linearized directory handle",
+            )
+            .await;
+            assert!(matches!(
+                err,
+                ControlPlaneError::RpcRemote { message }
+                    if message.contains(
+                        "linearized authority directory returned node 452 for selected serving node 451"
+                    )
             ));
 
             authority1.shutdown().await.unwrap();

@@ -10007,6 +10007,11 @@ Phase 12.1 progress:
   reflected now verify the full `(term,node,index)` identity when the applied
   cursor is exactly at that index, while also accepting later applied indexes
   because OpenRaft applies committed entries in order.
+- Tightened routed linearized authority selection so the handle returned by the
+  linearized-authority directory must still report the selected serving node
+  and serving readiness before routed command, read, or status calls use it.
+  A regression now fails closed when a directory returns a different node's
+  linearized authority handle.
 
 1. define the replicated control-plane state machine:
    - state includes cluster epoch, PG count, PG state, PG acting sets, node
