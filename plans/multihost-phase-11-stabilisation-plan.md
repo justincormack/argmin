@@ -378,8 +378,9 @@ Progress update:
   definition at open. Trigger-body verification is part of future versioned upgrade
   support, not current Phase 11 stabilisation, because the project deliberately does not
   support opening older stores yet.
-- Tightening the fenced-transfer source proof floor and the same-epoch digest-only
-  relaxation (tracked as Slice 3).
+- Removing the same-epoch digest-only proof relaxation by making final bucket cleanup a
+  metadata command, tightening imported metadata-transfer proof ordering, and deleting
+  tests that rely on out-of-band digest mutation (tracked as Slice 3).
 - Control-plane open->save->reload transition property tests (tracked as Slice 4).
 
 ## Tracked future slices
@@ -392,18 +393,67 @@ when prioritised. They correspond to the remaining findings from the Phase 11 re
   implemented only as part of a deliberate upgrade-support phase, after legacy format
   cleanup and baseline versioning are in place.
 
-- **Slice 3: Metadata proof-floor tightening.**
-  - The same-epoch digest-only relaxation
-    (`metadata_proof_satisfies_active_primary_observation_floor_impl` at
-    `control_plane.rs:7263`, the `allow_same_epoch_digest_only_progress` branch at `:7274`,
-    gated by `297fe9bb`) masks state-only divergence between replicas that applied the
-    same log. Fold the relaxation behind a narrow, named escape hatch so the audit trail
-    of *why* divergence is allowed is explicit and cannot silently propagate to peering.
-  - `metadata_proof_satisfies_fenced_transfer_source_floor` (`control_plane.rs:7295`)
-    accepts any non-zero-hash different-digest proof when
-    `active_metadata_transfer_imported` is set; tighten it to require log-index ordering.
-  - Add a divergent-replica proptest: apply the same command log to two replicas, inject one
-    out-of-band mutation on one, assert peering completion fails closed.
+- **Slice 3: Remove digest-only metadata proof escape hatches.**
+
+  **Goal:** a metadata proof that changes `state_digest` must also be explained by
+  metadata-command log progress, except for explicitly imported metadata-transfer state with
+  a separately ordered provenance proof. The same-epoch
+  `allow_same_epoch_digest_only_progress` branch should be removed, not narrowed. A digest
+  change at the same `applied_log_index`/`applied_log_hash` is otherwise an uncharacterised
+  out-of-band mutation and should fail closed.
+
+  **Why this matters:** the current relaxation was added to keep peering/transfer moving
+  when final bucket deletion mutates materialised metadata after the logged
+  `MarkBucketDeleting` command. That keeps the system live, but it also creates a generic
+  "same log, different digest" escape hatch. It does not encode the shape of the work that
+  happened, so unrelated divergence can hide behind the same proof rule and becomes hard to
+  verify.
+
+  Work items:
+  - **Final bucket cleanup becomes a metadata command.** Add a terminal command, e.g.
+    `DeleteFinalizedBucket`, after the finalizer proves the bucket is deleting, empty, and
+    reclaimed. Applying that command deletes the finalized bucket metadata rows. It must
+    carry enough bucket identity/generation/delete-execution provenance to be stale-safe
+    across bucket recreation, be idempotent under replay/recovery, and clear/finalize its
+    pending slot through the normal command-log machinery. Once this lands, finalized
+    bucket cleanup advances `applied_log_index`/`applied_log_hash` instead of changing only
+    `state_digest`.
+  - **Remove direct production digest refresh for finalized bucket cleanup.** The current
+    `delete_finalized_bucket` path is the named production exception that refreshes
+    `metadata_command_replica_state.state_digest` without appending a metadata command.
+    Replace production use of that out-of-band cleanup with the terminal command. Any
+    remaining direct helper should be test-only or private recovery scaffolding with a name
+    that makes it impossible to call from serving paths accidentally.
+  - **Tighten imported metadata-transfer proofs.**
+    `metadata_proof_satisfies_fenced_transfer_source_floor` currently accepts a
+    non-zero-hash different-digest proof when `active_metadata_transfer_imported` is set.
+    Keep the imported-transfer case, but require explicit ordering/provenance: the imported
+    proof must be tied to the source route/import epoch and must satisfy log-index/hash
+    ordering rather than relying on "different digest" as evidence.
+  - **Delete test dependencies on digest-only mutation.** Audit tests and fixtures that
+    create same-log/different-digest state by directly mutating materialised metadata or by
+    refreshing digest rows without a command. Convert them to either apply the new terminal
+    metadata command, construct imported-transfer provenance explicitly, or assert that the
+    state is rejected. The remaining tests should not require
+    `allow_same_epoch_digest_only_progress` to pass.
+  - **Remove the relaxation from proof validation.** Delete the
+    `allow_same_epoch_digest_only_progress` branch in
+    `metadata_proof_satisfies_active_primary_observation_floor_impl` and make same-epoch,
+    same-log, different-digest active-primary observations fail closed.
+  - **Add divergent-replica coverage.** Add a property/regression test that applies the same
+    command log to two replicas, injects one out-of-band materialised metadata mutation on
+    one replica, and asserts peering/metadata-transfer proof completion rejects it. Add a
+    positive test showing finalized bucket cleanup now succeeds because the terminal command
+    advances the command log, not because digest-only progress is allowed.
+
+  Exit criteria:
+  1. Production finalized bucket cleanup is represented by a metadata command log entry.
+  2. Imported metadata-transfer digest differences are accepted only with explicit ordered
+     provenance.
+  3. No production proof path accepts same-epoch, same-log, different-digest active-primary
+     observations.
+  4. Tests no longer depend on generic digest-only progress; they either use logged
+     commands, imported-transfer provenance, or expect rejection.
 
 - **Slice 4: Control-plane transition open/save/reload property tests.** The
     `6f9d1605` "second restart fails" bug is the canonical shape: transition code copies
