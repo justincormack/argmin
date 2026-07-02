@@ -1108,6 +1108,128 @@ fn multipart_abort_partial_apply_retry_cleans_uploaded_part_payload() {
 }
 
 #[test]
+fn multipart_abort_committed_response_loss_retry_sees_terminal_abort() {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape).unwrap();
+    let (bucket, key, object_pg, _data_pg) = {
+        let topology = map
+            .nodes
+            .get(&NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        bucket_key_with_distinct_object_and_data_pg(topology)
+    };
+    set_route_primary(&mut map, object_pg, NodeId::new(1));
+
+    let map = Arc::new(map);
+    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    create_test_bucket(&cluster, &bucket);
+    let upload_id = upload_id_from_label("mpuabrtlostresp");
+    let create = crate::CreateMultipartUploadReq {
+        upload_id: upload_id.clone(),
+        bucket: bucket.clone(),
+        key: key.clone(),
+        tags: None,
+        metadata_blob: crate::SerializedMetadataBlob::default(),
+        system_metadata_blob: crate::SerializedSystemMetadataBlob::default(),
+        initiator: crate::OwnerIdentity::from_principal("initiator"),
+        owner: crate::OwnerIdentity::from_principal("owner"),
+        acl_grants: crate::AclGrants::default(),
+        public_read: false,
+        object_lock: crate::ObjectLockState::default(),
+        checksum: None,
+        encryption: crate::ObjectEncryption::None,
+    };
+    cluster
+        .create_multipart_upload(
+            &bucket,
+            &key,
+            crate::BucketSnapshotRequest::default(),
+            |_snapshot, existing_object| {
+                assert!(existing_object.is_none());
+                Ok::<_, ()>(((), create.clone()))
+            },
+        )
+        .unwrap()
+        .unwrap();
+
+    let part_number = 1;
+    let (shard_keys, _uploaded_part, uploaded_segment) = upload_streamed_test_multipart_part(
+        &cluster,
+        &bucket,
+        &key,
+        &upload_id,
+        part_number,
+        [0xAC; 16],
+        b"uploaded part payload for committed abort retry",
+    );
+    let data_pg_id = uploaded_segment.data_pg_id;
+    let part_okh = uploaded_segment.segment_okh;
+    let part_vid = uploaded_segment.segment_vid;
+
+    let _serial = lock_metadata_command_apply_hook_test();
+    let hook_guard =
+        cluster.test_install_after_object_metadata_command_publish_hook(Arc::new(|| {
+            Err(crate::ObjectPgActionError::InvalidRequest {
+                reason: "injected multipart abort response loss".to_string(),
+            })
+        }));
+
+    let first_err = cluster
+        .abort_multipart_upload(&bucket, &key, &upload_id)
+        .unwrap_err();
+    assert!(
+        matches!(
+            first_err,
+            crate::ObjectPgActionError::InvalidRequest { ref reason }
+                if reason == "injected multipart abort response loss"
+        ),
+        "expected injected post-commit multipart abort response-loss error, got {first_err:?}"
+    );
+    drop(hook_guard);
+
+    assert!(pending_metadata_command_for_test(&map, PgId::new(object_pg), &bucket).is_none());
+    assert_bucket_write_reservations_released(&map, &bucket);
+    assert_terminal_multipart_upload_invariants(
+        &map,
+        &node_ids,
+        object_pg,
+        &bucket,
+        &key,
+        &upload_id,
+        TerminalMultipartOutcome::Aborted,
+    );
+    for (shard_index, key) in shard_keys.iter().enumerate() {
+        assert!(
+            !cluster
+                .test_payload_shard_file_exists(
+                    data_pg_id,
+                    ec_shape,
+                    &part_okh,
+                    part_vid,
+                    shard_index as u8
+                )
+                .unwrap(),
+            "committed abort should delete placed shard {key:?} before response loss"
+        );
+    }
+
+    let retried = cluster
+        .abort_multipart_upload(&bucket, &key, &upload_id)
+        .unwrap();
+    assert!(
+        !retried,
+        "storage-level retry after committed abort should observe the terminal NoSuchUpload state"
+    );
+    assert!(pending_metadata_command_for_test(&map, PgId::new(object_pg), &bucket).is_none());
+    assert_bucket_write_reservations_released(&map, &bucket);
+    assert_clean_metadata_command_stream(&map, &[object_pg]);
+}
+
+#[test]
 fn multipart_abort_partial_apply_reopens_and_converges() {
     let _serial = lock_metadata_command_apply_hook_test();
     let tmp = test_util::tempdir();
