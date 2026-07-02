@@ -10299,6 +10299,16 @@ Phase 12.3 exit criteria:
   authority-bearing command/read/status operations only through the current
   leader.
 
+Phase 12.3 progress:
+
+- Added the first reusable peer-transport guard to the in-process OpenRaft test
+  network. It validates configured target endpoints, append-entry batch count,
+  encoded append-entry payload bytes, and snapshot payload bytes before
+  dispatch, with focused regressions for endpoint mismatch, oversized append
+  batches, oversized single-entry append payloads, and oversized snapshots. This
+  establishes the validation shape for the Phase 12.3 peer RPC boundary; Unix/
+  process peer RPC remains the next layer.
+
 1. define the replicated control-plane state machine:
    - state includes cluster epoch, PG count, PG state, PG acting sets, node
      membership, node incarnation/endpoint/liveness metadata, retained
