@@ -372,10 +372,12 @@ Progress update:
 
 ### Out of scope for Slice 1
 
-- SQLite trigger SQL body verification (tracked as Slice 2). The materialised digest scan
-  in work item 2b catches the *symptom* of a stale trigger definition at open; Slice 2
-  catches the *root cause* and enables trusting the cached-table fast path so the
-  materialised scan can be downgraded to a periodic/diagnostic check.
+- SQLite trigger SQL body verification (moved to
+  [`storage-upgrade-versioning-plan.md`](storage-upgrade-versioning-plan.md)). The
+  materialised digest scan in work item 2b catches the *symptom* of a stale trigger
+  definition at open. Trigger-body verification is part of future versioned upgrade
+  support, not current Phase 11 stabilisation, because the project deliberately does not
+  support opening older stores yet.
 - Tightening the fenced-transfer source proof floor and the same-epoch digest-only
   relaxation (tracked as Slice 3).
 - Control-plane open->save->reload transition property tests (tracked as Slice 4).
@@ -385,13 +387,10 @@ Progress update:
 These are recorded here so the backlog is visible; each will be expanded into a full slice
 when prioritised. They correspond to the remaining findings from the Phase 11 review.
 
-- **Slice 2: Trigger SQL body verification.** `metadata_digest_triggers_complete`
-  (`command_log.rs:991`) only checks trigger names in `sqlite_master`. A DB created under
-  an older schema passes the check with triggers that compute row digests from the old
-  column set, silently corrupting every subsequent digest/proof. Store an expected hash of
-  each table's trigger SQL (or a schema-generation tag) and on mismatch drop, recreate, and
-  force a full digest recompute. Add a schema-evolution test that opens a store built under
-  an N-versions-old trigger snapshot.
+- **Moved out:** Trigger SQL body verification now lives in
+  [`storage-upgrade-versioning-plan.md`](storage-upgrade-versioning-plan.md). It should be
+  implemented only as part of a deliberate upgrade-support phase, after legacy format
+  cleanup and baseline versioning are in place.
 
 - **Slice 3: Metadata proof-floor tightening.**
   - The same-epoch digest-only relaxation
