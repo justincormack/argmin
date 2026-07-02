@@ -10342,6 +10342,12 @@ Phase 12.3 progress:
   trusted. Snapshot request decode requires explicit total-frame and snapshot-
   payload byte limits, and rejects over-limit payloads before copying snapshot
   bytes into an owned buffer.
+- Wired the in-process OpenRaft test network through the peer frame codecs for
+  append-entries, vote, pre-vote, and full-snapshot traffic. The test network
+  now encodes outbound peer requests, decodes them as the remote endpoint would,
+  dispatches to the target Raft instance, then encodes and decodes the response
+  before returning it. This keeps the current tests socket-free while exercising
+  the same codec path the later Unix/process peer transport will use.
 
 1. define the replicated control-plane state machine:
    - state includes cluster epoch, PG count, PG state, PG acting sets, node

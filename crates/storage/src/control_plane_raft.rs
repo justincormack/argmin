@@ -5687,6 +5687,24 @@ mod tests {
             }
         }
 
+        fn rpc_protocol_error(
+            context: &'static str,
+            error: ControlPlaneError,
+        ) -> RPCError<ControlPlaneRaftTypeConfig> {
+            RPCError::Network(NetworkError::from_string(format!(
+                "in-memory test raft network {context} peer frame failed: {error:?}"
+            )))
+        }
+
+        fn streaming_protocol_error(
+            context: &'static str,
+            error: ControlPlaneError,
+        ) -> StreamingError<ControlPlaneRaftTypeConfig> {
+            StreamingError::Network(NetworkError::from_string(format!(
+                "in-memory test raft network {context} peer frame failed: {error:?}"
+            )))
+        }
+
         fn target_raft(
             &self,
             rpc_name: &'static str,
@@ -5746,10 +5764,39 @@ mod tests {
                     )
                     .map_err(Self::rpc_error_from_transport_rejection)?;
             }
-            self.target_raft("append_entries")?
-                .append_entries(rpc)
+            let encoded = ControlPlaneRaftPeerRpcRequest::AppendEntries(rpc)
+                .encode_frame()
+                .map_err(|error| Self::rpc_protocol_error("append_entries encode", error))?;
+            let ControlPlaneRaftPeerRpcRequest::AppendEntries(decoded) =
+                ControlPlaneRaftPeerRpcRequest::decode_frame(&encoded)
+                    .map_err(|error| Self::rpc_protocol_error("append_entries decode", error))?
+            else {
+                return Err(Self::rpc_protocol_error(
+                    "append_entries decode",
+                    raft_artifact_protocol_error("decoded non-append_entries request frame"),
+                ));
+            };
+            let response = self
+                .target_raft("append_entries")?
+                .append_entries(decoded)
                 .await
-                .map_err(|error| self.remote_failure("append_entries", error))
+                .map_err(|error| self.remote_failure("append_entries", error))?;
+            let encoded = ControlPlaneRaftPeerRpcResponse::AppendEntries(response)
+                .encode_frame()
+                .map_err(|error| {
+                    Self::rpc_protocol_error("append_entries response encode", error)
+                })?;
+            let ControlPlaneRaftPeerRpcResponse::AppendEntries(response) =
+                ControlPlaneRaftPeerRpcResponse::decode_frame(&encoded).map_err(|error| {
+                    Self::rpc_protocol_error("append_entries response decode", error)
+                })?
+            else {
+                return Err(Self::rpc_protocol_error(
+                    "append_entries response decode",
+                    raft_artifact_protocol_error("decoded non-append_entries response frame"),
+                ));
+            };
+            Ok(response)
         }
 
         async fn vote(
@@ -5759,10 +5806,36 @@ mod tests {
         ) -> Result<VoteResponse<ControlPlaneRaftTypeConfig>, RPCError<ControlPlaneRaftTypeConfig>>
         {
             self.validate_peer("vote")?;
-            self.target_raft("vote")?
-                .vote(rpc)
+            let encoded = ControlPlaneRaftPeerRpcRequest::Vote(rpc)
+                .encode_frame()
+                .map_err(|error| Self::rpc_protocol_error("vote encode", error))?;
+            let ControlPlaneRaftPeerRpcRequest::Vote(decoded) =
+                ControlPlaneRaftPeerRpcRequest::decode_frame(&encoded)
+                    .map_err(|error| Self::rpc_protocol_error("vote decode", error))?
+            else {
+                return Err(Self::rpc_protocol_error(
+                    "vote decode",
+                    raft_artifact_protocol_error("decoded non-vote request frame"),
+                ));
+            };
+            let response = self
+                .target_raft("vote")?
+                .vote(decoded)
                 .await
-                .map_err(|error| self.remote_failure("vote", error))
+                .map_err(|error| self.remote_failure("vote", error))?;
+            let encoded = ControlPlaneRaftPeerRpcResponse::Vote(response)
+                .encode_frame()
+                .map_err(|error| Self::rpc_protocol_error("vote response encode", error))?;
+            let ControlPlaneRaftPeerRpcResponse::Vote(response) =
+                ControlPlaneRaftPeerRpcResponse::decode_frame(&encoded)
+                    .map_err(|error| Self::rpc_protocol_error("vote response decode", error))?
+            else {
+                return Err(Self::rpc_protocol_error(
+                    "vote response decode",
+                    raft_artifact_protocol_error("decoded non-vote response frame"),
+                ));
+            };
+            Ok(response)
         }
 
         async fn pre_vote(
@@ -5772,10 +5845,36 @@ mod tests {
         ) -> Result<VoteResponse<ControlPlaneRaftTypeConfig>, RPCError<ControlPlaneRaftTypeConfig>>
         {
             self.validate_peer("pre_vote")?;
-            self.target_raft("pre_vote")?
-                .pre_vote(rpc)
+            let encoded = ControlPlaneRaftPeerRpcRequest::PreVote(rpc)
+                .encode_frame()
+                .map_err(|error| Self::rpc_protocol_error("pre_vote encode", error))?;
+            let ControlPlaneRaftPeerRpcRequest::PreVote(decoded) =
+                ControlPlaneRaftPeerRpcRequest::decode_frame(&encoded)
+                    .map_err(|error| Self::rpc_protocol_error("pre_vote decode", error))?
+            else {
+                return Err(Self::rpc_protocol_error(
+                    "pre_vote decode",
+                    raft_artifact_protocol_error("decoded non-pre_vote request frame"),
+                ));
+            };
+            let response = self
+                .target_raft("pre_vote")?
+                .pre_vote(decoded)
                 .await
-                .map_err(|error| self.remote_failure("pre_vote", error))
+                .map_err(|error| self.remote_failure("pre_vote", error))?;
+            let encoded = ControlPlaneRaftPeerRpcResponse::Vote(response)
+                .encode_frame()
+                .map_err(|error| Self::rpc_protocol_error("pre_vote response encode", error))?;
+            let ControlPlaneRaftPeerRpcResponse::Vote(response) =
+                ControlPlaneRaftPeerRpcResponse::decode_frame(&encoded)
+                    .map_err(|error| Self::rpc_protocol_error("pre_vote response decode", error))?
+            else {
+                return Err(Self::rpc_protocol_error(
+                    "pre_vote response decode",
+                    raft_artifact_protocol_error("decoded non-vote response frame"),
+                ));
+            };
+            Ok(response)
         }
 
         async fn full_snapshot(
@@ -5806,15 +5905,41 @@ mod tests {
                     .validate_snapshot(self.target, snapshot.snapshot.get_ref().len())
                     .map_err(Self::streaming_error_from_transport_rejection)?;
             }
-            self.target_raft("full_snapshot")?
-                .install_full_snapshot(vote, snapshot)
+            let max_snapshot_bytes = self
+                .policy
+                .as_ref()
+                .map_or(usize::MAX, |policy| policy.limits.max_snapshot_bytes);
+            let request = ControlPlaneRaftPeerSnapshotRequest { vote, snapshot };
+            let encoded = request
+                .encode_frame()
+                .map_err(|error| Self::streaming_protocol_error("full_snapshot encode", error))?;
+            let decoded = ControlPlaneRaftPeerSnapshotRequest::decode_frame(
+                &encoded,
+                usize::MAX,
+                max_snapshot_bytes,
+            )
+            .map_err(|error| Self::streaming_protocol_error("full_snapshot decode", error))?;
+            let response = self
+                .target_raft("full_snapshot")?
+                .install_full_snapshot(decoded.vote, decoded.snapshot)
                 .await
                 .map_err(|error| {
                     StreamingError::Network(NetworkError::from_string(format!(
                         "in-memory test raft network full_snapshot to node {} failed: {error}",
                         self.target
                     )))
-                })
+                })?;
+            let encoded = ControlPlaneRaftPeerSnapshotResponse { response }
+                .encode_frame()
+                .map_err(|error| {
+                    Self::streaming_protocol_error("full_snapshot response encode", error)
+                })?;
+            let response = ControlPlaneRaftPeerSnapshotResponse::decode_frame(&encoded)
+                .map_err(|error| {
+                    Self::streaming_protocol_error("full_snapshot response decode", error)
+                })?
+                .response;
+            Ok(response)
         }
 
         async fn transfer_leader(
