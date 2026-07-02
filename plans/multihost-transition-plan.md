@@ -9978,20 +9978,25 @@ Phase 12.1 progress:
   bootstrap, and node-lifecycle traits directly, so there is no separate
   bootstrap/lifecycle/admin handle that callers can depend on accidentally.
 - Removed the full-service authority directory boundary. Directory lookup now
-  exposes only status-list, bootstrap, node-lifecycle, and routed-authority
-  capabilities; the in-memory test scaffold still registers a full service
-  handle but immediately narrows it before storing lookup entries.
+  exposes only status-list, bootstrap, node-lifecycle, linearized-authority,
+  and leader-routed admin capabilities; the in-memory test scaffold builds
+  those narrow handles directly from concrete OpenRaft authorities before
+  storing lookup entries.
 - Removed the final composed authority service trait and handle. Tests and
   in-memory directory registration now build explicit linearized, status,
-  bootstrap, node-lifecycle, routed-authority, and leader-routed admin handles
+  bootstrap, node-lifecycle, and leader-routed admin handles
   directly from the concrete OpenRaft authority, so no remaining Phase 12
   raft capability hands callers the full command/read/status/admin/bootstrap/
   lifecycle surface by accident.
 - Split status enumeration out of the bootstrap, node-lifecycle, and
-  routed-authority directory traits. Directory capabilities now perform only
+  authority directory traits. Directory capabilities now perform only
   node-id lookup for their own narrow surface, while leader-routing clients take
   an explicit status-list handle when they need to discover the current serving
   authority.
+- Split post-bootstrap routed command/read/status from leader-routed membership
+  admin. The routing handle used by ordinary linearized clients can no longer
+  replace voters, add learners, or transfer leadership; those operations route
+  through a separate leader-admin directory and routing handle.
 
 1. define the replicated control-plane state machine:
    - state includes cluster epoch, PG count, PG state, PG acting sets, node
