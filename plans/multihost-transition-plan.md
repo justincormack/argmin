@@ -10123,6 +10123,19 @@ Phase 12.2 proposed scope:
   process-mode selection needs to distinguish in-memory from durable storage.
   The flag must still be removed or replaced before production cutover.
 
+Phase 12.2 progress:
+
+- Added the first durable restart-artifact frame for the OpenRaft control-plane
+  adapter. The frame has a magic/version header and CRC64 checksum, preserves
+  OpenRaft vote, committed watermark, purged boundary, retained log entries,
+  membership metadata, applied log id, and embeds the existing CRC-protected
+  Argmin control-plane snapshot payload for the replicated state machine.
+  Decode validates the restored log/state-machine pair before returning, so
+  stale or inconsistent durable artifacts fail closed before any authority can
+  serve from them. Tests cover round-trip restore, malformed frames, checksum
+  rejection, unknown entry payload tags, invalid index-0 bootstrap entry
+  shapes, and committed/applied inconsistency.
+
 1. define the replicated control-plane state machine:
    - state includes cluster epoch, PG count, PG state, PG acting sets, node
      membership, node incarnation/endpoint/liveness metadata, retained

@@ -26,6 +26,7 @@ use openraft::type_config::alias::{
 use openraft::type_config::TypeConfigExt;
 use openraft::EntryPayload;
 use openraft::LogId;
+use openraft::Membership;
 use openraft::OptionalSend;
 use openraft::Raft;
 use openraft::RaftLogReader;
@@ -42,8 +43,9 @@ use crate::control_plane::{
     NodeAvailabilityState, NodeMembershipState,
 };
 use crate::control_plane_command::{
-    ControlPlaneCommand, ControlPlaneCommandResponse, ControlPlaneLogId,
-    ControlPlaneSnapshotArtifact, ReplicatedControlPlaneStateMachine,
+    decode_control_plane_command, encode_control_plane_command, ControlPlaneCommand,
+    ControlPlaneCommandResponse, ControlPlaneLogId, ControlPlaneSnapshotArtifact,
+    ReplicatedControlPlaneStateMachine,
 };
 use crate::{ClusterEpoch, PgState};
 
@@ -2346,6 +2348,13 @@ pub struct ControlPlaneRaftRestartArtifact {
     state_machine: ControlPlaneRaftStateMachineRestartArtifact,
 }
 
+const CONTROL_PLANE_RAFT_RESTART_MAGIC: &[u8] = b"ARGMINCPRAFT";
+const CONTROL_PLANE_RAFT_RESTART_VERSION: u16 = 1;
+const CONTROL_PLANE_RAFT_RESTART_CHECKSUM_LEN: usize = 8;
+const RAFT_ENTRY_MIN_LEN: usize = 8 + 8 + 8 + 1;
+const RAFT_MEMBERSHIP_CONFIG_MIN_LEN: usize = 4;
+const RAFT_MEMBERSHIP_NODE_MIN_LEN: usize = 8 + 4;
+
 #[derive(Debug, Default)]
 struct ControlPlaneRaftLogStoreInner {
     vote: Option<VoteOf<ControlPlaneRaftTypeConfig>>,
@@ -2430,6 +2439,9 @@ impl ControlPlaneRaftLogStore {
                 expected_first_index
             )));
         }
+        if expected_first_index == 0 {
+            Self::validate_bootstrap_entry_shape(first)?;
+        }
 
         let mut expected_index = expected_first_index;
         for entry in entries {
@@ -2444,6 +2456,19 @@ impl ControlPlaneRaftLogStore {
             })?;
         }
         Ok(())
+    }
+
+    fn validate_bootstrap_entry_shape(entry: &ControlPlaneRaftEntry) -> Result<(), io::Error> {
+        if is_openraft_bootstrap_log_id(entry.log_id)
+            && matches!(entry.payload, EntryPayload::Membership(_))
+        {
+            return Ok(());
+        }
+        Err(raft_log_store_error(format!(
+            "control-plane OpenRaft log index 0 entry must be bootstrap membership at term 0; got log id {} with payload {}",
+            entry.log_id,
+            raft_entry_payload_name(entry)
+        )))
     }
 
     fn range_start<RB>(range: &RB) -> Result<Option<u64>, io::Error>
@@ -2620,6 +2645,63 @@ impl ControlPlaneRaftRestartArtifact {
         })
     }
 
+    pub fn encode_durable_artifact(&self) -> Result<Vec<u8>, ControlPlaneError> {
+        let mut out = Vec::new();
+        out.extend_from_slice(CONTROL_PLANE_RAFT_RESTART_MAGIC);
+        write_raft_u16(&mut out, CONTROL_PLANE_RAFT_RESTART_VERSION);
+        write_raft_log_store_artifact(&mut out, &self.log_store)?;
+        write_raft_state_machine_artifact(&mut out, &self.state_machine)?;
+        append_raft_artifact_checksum(&mut out);
+        Ok(out)
+    }
+
+    pub fn decode_durable_artifact(bytes: &[u8]) -> Result<Self, ControlPlaneError> {
+        let min_len =
+            CONTROL_PLANE_RAFT_RESTART_MAGIC.len() + 2 + CONTROL_PLANE_RAFT_RESTART_CHECKSUM_LEN;
+        if bytes.len() < min_len {
+            return Err(raft_artifact_protocol_error(
+                "truncated control-plane OpenRaft durable restart artifact",
+            ));
+        }
+        let (body, checksum_bytes) =
+            bytes.split_at(bytes.len() - CONTROL_PLANE_RAFT_RESTART_CHECKSUM_LEN);
+        let expected_checksum = u64::from_be_bytes(
+            checksum_bytes
+                .try_into()
+                .expect("checksum split length is fixed"),
+        );
+        let actual_checksum = raft_artifact_checksum(body);
+        if actual_checksum != expected_checksum {
+            return Err(raft_artifact_protocol_error(format!(
+                "control-plane OpenRaft durable restart artifact checksum mismatch: expected {expected_checksum:#x}, actual {actual_checksum:#x}"
+            )));
+        }
+
+        let mut reader = RaftArtifactReader::new(body);
+        let magic = reader.read_exact(CONTROL_PLANE_RAFT_RESTART_MAGIC.len())?;
+        if magic != CONTROL_PLANE_RAFT_RESTART_MAGIC {
+            return Err(raft_artifact_protocol_error(
+                "invalid control-plane OpenRaft durable restart artifact magic",
+            ));
+        }
+        let version = reader.read_u16()?;
+        if version != CONTROL_PLANE_RAFT_RESTART_VERSION {
+            return Err(raft_artifact_protocol_error(format!(
+                "unsupported control-plane OpenRaft durable restart artifact version {version}"
+            )));
+        }
+        let artifact = Self {
+            log_store: read_raft_log_store_artifact(&mut reader)?,
+            state_machine: read_raft_state_machine_artifact(&mut reader)?,
+        };
+        reader.finish()?;
+        artifact
+            .clone()
+            .restore()
+            .map_err(|error| raft_artifact_protocol_error(error.to_string()))?;
+        Ok(artifact)
+    }
+
     pub fn restore(
         self,
     ) -> Result<(ControlPlaneRaftLogStore, ControlPlaneRaftStateMachine), io::Error> {
@@ -2708,6 +2790,436 @@ impl ControlPlaneRaftRestartArtifact {
             .iter()
             .find(|entry| entry.log_id.index() == index)
             .map(|entry| entry.log_id)
+    }
+}
+
+fn append_raft_artifact_checksum(out: &mut Vec<u8>) {
+    let checksum = raft_artifact_checksum(out);
+    write_raft_u64(out, checksum);
+}
+
+fn raft_artifact_checksum(body: &[u8]) -> u64 {
+    checksum::crc64::checksum(body)
+}
+
+fn write_raft_log_store_artifact(
+    out: &mut Vec<u8>,
+    artifact: &ControlPlaneRaftLogStoreRestartArtifact,
+) -> Result<(), ControlPlaneError> {
+    write_raft_option_vote(out, artifact.vote);
+    write_raft_option_log_id(out, artifact.committed);
+    write_raft_option_log_id(out, artifact.last_purged_log_id);
+    write_raft_u32(
+        out,
+        raft_len_as_u32(artifact.entries.len(), "raft log entries")?,
+    );
+    for entry in &artifact.entries {
+        write_raft_entry(out, entry)?;
+    }
+    Ok(())
+}
+
+fn read_raft_log_store_artifact(
+    reader: &mut RaftArtifactReader<'_>,
+) -> Result<ControlPlaneRaftLogStoreRestartArtifact, ControlPlaneError> {
+    let vote = reader.read_option_vote()?;
+    let committed = reader.read_option_log_id()?;
+    let last_purged_log_id = reader.read_option_log_id()?;
+    let entry_count = reader.read_collection_len("raft log entries", RAFT_ENTRY_MIN_LEN)?;
+    let mut entries = Vec::with_capacity(entry_count);
+    for _ in 0..entry_count {
+        entries.push(reader.read_entry()?);
+    }
+    Ok(ControlPlaneRaftLogStoreRestartArtifact {
+        vote,
+        committed,
+        last_purged_log_id,
+        entries,
+    })
+}
+
+fn write_raft_state_machine_artifact(
+    out: &mut Vec<u8>,
+    artifact: &ControlPlaneRaftStateMachineRestartArtifact,
+) -> Result<(), ControlPlaneError> {
+    write_raft_option_log_id(out, artifact.last_applied);
+    write_raft_stored_membership(out, &artifact.last_membership)?;
+
+    let mut inner = artifact.inner.clone();
+    let snapshot_artifact = inner.build_snapshot_artifact()?;
+    write_raft_bytes(out, snapshot_artifact.payload())?;
+    Ok(())
+}
+
+fn read_raft_state_machine_artifact(
+    reader: &mut RaftArtifactReader<'_>,
+) -> Result<ControlPlaneRaftStateMachineRestartArtifact, ControlPlaneError> {
+    let last_applied = reader.read_option_log_id()?;
+    let last_membership = reader.read_stored_membership()?;
+    let snapshot_payload = reader.read_bytes("raft state-machine snapshot")?.to_vec();
+    let control_plane_last_applied = match last_applied {
+        Some(log_id) if is_openraft_bootstrap_log_id(log_id) => None,
+        Some(log_id) => Some(control_plane_log_id_from_raft(log_id).ok_or_else(|| {
+            raft_artifact_protocol_error(format!(
+                "invalid OpenRaft state-machine durable last-applied log id: {log_id}"
+            ))
+        })?),
+        None => None,
+    };
+    let mut inner = ReplicatedControlPlaneStateMachine::empty();
+    inner.install_snapshot_artifact(ControlPlaneSnapshotArtifact::new(
+        control_plane_last_applied,
+        snapshot_payload,
+    ))?;
+    Ok(ControlPlaneRaftStateMachineRestartArtifact {
+        inner,
+        last_applied,
+        last_membership,
+    })
+}
+
+fn write_raft_entry(
+    out: &mut Vec<u8>,
+    entry: &ControlPlaneRaftEntry,
+) -> Result<(), ControlPlaneError> {
+    write_raft_log_id(out, entry.log_id);
+    match &entry.payload {
+        EntryPayload::Blank => write_raft_u8(out, 0),
+        EntryPayload::Membership(membership) => {
+            write_raft_u8(out, 1);
+            write_raft_membership(out, membership)?;
+        }
+        EntryPayload::Normal(command) => {
+            write_raft_u8(out, 2);
+            let encoded = encode_control_plane_command(command)?;
+            write_raft_bytes(out, &encoded)?;
+        }
+    }
+    Ok(())
+}
+
+fn write_raft_stored_membership(
+    out: &mut Vec<u8>,
+    membership: &StoredMembershipOf<ControlPlaneRaftTypeConfig>,
+) -> Result<(), ControlPlaneError> {
+    write_raft_option_log_id(out, *membership.log_id());
+    write_raft_membership(out, membership.membership())
+}
+
+fn write_raft_membership(
+    out: &mut Vec<u8>,
+    membership: &Membership<ControlPlaneRaftNodeId, BasicNode>,
+) -> Result<(), ControlPlaneError> {
+    let configs = membership.get_joint_config();
+    write_raft_u32(
+        out,
+        raft_len_as_u32(configs.len(), "raft membership configs")?,
+    );
+    for config in configs {
+        write_raft_u32(
+            out,
+            raft_len_as_u32(config.len(), "raft membership config voters")?,
+        );
+        for node_id in config {
+            write_raft_u64(out, *node_id);
+        }
+    }
+    let nodes = membership.nodes().collect::<Vec<_>>();
+    write_raft_u32(out, raft_len_as_u32(nodes.len(), "raft membership nodes")?);
+    for (node_id, node) in nodes {
+        write_raft_u64(out, *node_id);
+        write_raft_string(out, &node.addr)?;
+    }
+    Ok(())
+}
+
+fn write_raft_option_vote(out: &mut Vec<u8>, vote: Option<VoteOf<ControlPlaneRaftTypeConfig>>) {
+    match vote {
+        None => write_raft_u8(out, 0),
+        Some(vote) => {
+            write_raft_u8(out, 1);
+            write_raft_leader_id(out, vote.leader_id);
+            write_raft_bool(out, vote.committed);
+        }
+    }
+}
+
+fn write_raft_option_log_id(
+    out: &mut Vec<u8>,
+    log_id: Option<LogIdOf<ControlPlaneRaftTypeConfig>>,
+) {
+    match log_id {
+        None => write_raft_u8(out, 0),
+        Some(log_id) => {
+            write_raft_u8(out, 1);
+            write_raft_log_id(out, log_id);
+        }
+    }
+}
+
+fn write_raft_log_id(out: &mut Vec<u8>, log_id: LogIdOf<ControlPlaneRaftTypeConfig>) {
+    write_raft_leader_id(out, *log_id.committed_leader_id());
+    write_raft_u64(out, log_id.index());
+}
+
+fn write_raft_leader_id(out: &mut Vec<u8>, leader_id: ControlPlaneRaftLeaderId) {
+    write_raft_u64(out, leader_id.term);
+    write_raft_u64(out, leader_id.node_id);
+}
+
+fn write_raft_bytes(out: &mut Vec<u8>, bytes: &[u8]) -> Result<(), ControlPlaneError> {
+    write_raft_u32(out, raft_len_as_u32(bytes.len(), "raft byte payload")?);
+    out.extend_from_slice(bytes);
+    Ok(())
+}
+
+fn write_raft_string(out: &mut Vec<u8>, value: &str) -> Result<(), ControlPlaneError> {
+    write_raft_u32(out, raft_len_as_u32(value.len(), "raft string")?);
+    out.extend_from_slice(value.as_bytes());
+    Ok(())
+}
+
+fn write_raft_bool(out: &mut Vec<u8>, value: bool) {
+    write_raft_u8(out, u8::from(value));
+}
+
+fn write_raft_u8(out: &mut Vec<u8>, value: u8) {
+    out.push(value);
+}
+
+fn write_raft_u16(out: &mut Vec<u8>, value: u16) {
+    out.extend_from_slice(&value.to_be_bytes());
+}
+
+fn write_raft_u32(out: &mut Vec<u8>, value: u32) {
+    out.extend_from_slice(&value.to_be_bytes());
+}
+
+fn write_raft_u64(out: &mut Vec<u8>, value: u64) {
+    out.extend_from_slice(&value.to_be_bytes());
+}
+
+fn raft_len_as_u32(len: usize, field: &'static str) -> Result<u32, ControlPlaneError> {
+    u32::try_from(len)
+        .map_err(|_| raft_artifact_protocol_error(format!("{field} length {len} exceeds u32::MAX")))
+}
+
+fn raft_artifact_protocol_error(message: impl Into<String>) -> ControlPlaneError {
+    ControlPlaneError::CommandDecode {
+        message: message.into(),
+    }
+}
+
+struct RaftArtifactReader<'a> {
+    payload: &'a [u8],
+    offset: usize,
+}
+
+impl<'a> RaftArtifactReader<'a> {
+    fn new(payload: &'a [u8]) -> Self {
+        Self { payload, offset: 0 }
+    }
+
+    fn finish(&self) -> Result<(), ControlPlaneError> {
+        if self.offset == self.payload.len() {
+            Ok(())
+        } else {
+            Err(raft_artifact_protocol_error(format!(
+                "control-plane OpenRaft durable restart artifact has {} trailing bytes",
+                self.payload.len() - self.offset
+            )))
+        }
+    }
+
+    fn read_exact(&mut self, len: usize) -> Result<&'a [u8], ControlPlaneError> {
+        let end = self.offset.checked_add(len).ok_or_else(|| {
+            raft_artifact_protocol_error(
+                "control-plane OpenRaft durable restart artifact offset overflow",
+            )
+        })?;
+        let bytes = self.payload.get(self.offset..end).ok_or_else(|| {
+            raft_artifact_protocol_error(
+                "truncated control-plane OpenRaft durable restart artifact",
+            )
+        })?;
+        self.offset = end;
+        Ok(bytes)
+    }
+
+    fn read_u8(&mut self) -> Result<u8, ControlPlaneError> {
+        Ok(self.read_exact(1)?[0])
+    }
+
+    fn read_u16(&mut self) -> Result<u16, ControlPlaneError> {
+        let bytes = self.read_exact(2)?;
+        Ok(u16::from_be_bytes([bytes[0], bytes[1]]))
+    }
+
+    fn read_u32(&mut self) -> Result<u32, ControlPlaneError> {
+        let bytes = self.read_exact(4)?;
+        Ok(u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+    }
+
+    fn read_u64(&mut self) -> Result<u64, ControlPlaneError> {
+        let bytes = self.read_exact(8)?;
+        Ok(u64::from_be_bytes([
+            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+        ]))
+    }
+
+    fn read_bool(&mut self) -> Result<bool, ControlPlaneError> {
+        match self.read_u8()? {
+            0 => Ok(false),
+            1 => Ok(true),
+            value => Err(raft_artifact_protocol_error(format!(
+                "invalid control-plane OpenRaft durable boolean value {value}"
+            ))),
+        }
+    }
+
+    fn read_len(&mut self, field: &'static str) -> Result<usize, ControlPlaneError> {
+        usize::try_from(self.read_u32()?)
+            .map_err(|_| raft_artifact_protocol_error(format!("{field} length does not fit usize")))
+    }
+
+    fn read_collection_len(
+        &mut self,
+        field: &'static str,
+        min_item_len: usize,
+    ) -> Result<usize, ControlPlaneError> {
+        assert!(min_item_len > 0);
+        let len = self.read_len(field)?;
+        let max_items = self.remaining_len() / min_item_len;
+        if len > max_items {
+            return Err(raft_artifact_protocol_error(format!(
+                "{field} count {len} exceeds remaining control-plane OpenRaft durable payload capacity {max_items}",
+            )));
+        }
+        Ok(len)
+    }
+
+    fn read_bytes(&mut self, field: &'static str) -> Result<&'a [u8], ControlPlaneError> {
+        let len = self.read_len(field)?;
+        self.read_exact(len)
+    }
+
+    fn read_string(&mut self) -> Result<String, ControlPlaneError> {
+        let bytes = self.read_bytes("raft string")?;
+        std::str::from_utf8(bytes)
+            .map(str::to_owned)
+            .map_err(|source| {
+                raft_artifact_protocol_error(format!(
+                    "control-plane OpenRaft durable string is not UTF-8: {source}"
+                ))
+            })
+    }
+
+    fn read_option_vote(
+        &mut self,
+    ) -> Result<Option<VoteOf<ControlPlaneRaftTypeConfig>>, ControlPlaneError> {
+        match self.read_u8()? {
+            0 => Ok(None),
+            1 => {
+                let leader_id = self.read_leader_id()?;
+                let committed = self.read_bool()?;
+                Ok(Some(Vote {
+                    leader_id,
+                    committed,
+                }))
+            }
+            value => Err(raft_artifact_protocol_error(format!(
+                "invalid control-plane OpenRaft durable optional vote tag {value}"
+            ))),
+        }
+    }
+
+    fn read_option_log_id(
+        &mut self,
+    ) -> Result<Option<LogIdOf<ControlPlaneRaftTypeConfig>>, ControlPlaneError> {
+        match self.read_u8()? {
+            0 => Ok(None),
+            1 => Ok(Some(self.read_log_id()?)),
+            value => Err(raft_artifact_protocol_error(format!(
+                "invalid control-plane OpenRaft durable optional log-id tag {value}"
+            ))),
+        }
+    }
+
+    fn read_entry(&mut self) -> Result<ControlPlaneRaftEntry, ControlPlaneError> {
+        let log_id = self.read_log_id()?;
+        let payload = match self.read_u8()? {
+            0 => EntryPayload::Blank,
+            1 => EntryPayload::Membership(self.read_membership()?),
+            2 => EntryPayload::Normal(decode_control_plane_command(
+                self.read_bytes("raft command payload")?,
+            )?),
+            value => {
+                return Err(raft_artifact_protocol_error(format!(
+                    "unknown control-plane OpenRaft durable entry payload tag {value}"
+                )));
+            }
+        };
+        Ok(Entry { log_id, payload })
+    }
+
+    fn read_stored_membership(
+        &mut self,
+    ) -> Result<StoredMembershipOf<ControlPlaneRaftTypeConfig>, ControlPlaneError> {
+        let log_id = self.read_option_log_id()?;
+        let membership = self.read_membership()?;
+        Ok(StoredMembership::new(log_id, membership))
+    }
+
+    fn read_membership(
+        &mut self,
+    ) -> Result<Membership<ControlPlaneRaftNodeId, BasicNode>, ControlPlaneError> {
+        let config_count =
+            self.read_collection_len("raft membership configs", RAFT_MEMBERSHIP_CONFIG_MIN_LEN)?;
+        let mut configs = Vec::with_capacity(config_count);
+        for _ in 0..config_count {
+            let voter_count = self
+                .read_collection_len("raft membership config voters", std::mem::size_of::<u64>())?;
+            let mut voters = BTreeSet::new();
+            for _ in 0..voter_count {
+                voters.insert(self.read_u64()?);
+            }
+            configs.push(voters);
+        }
+
+        let node_count =
+            self.read_collection_len("raft membership nodes", RAFT_MEMBERSHIP_NODE_MIN_LEN)?;
+        let mut nodes = BTreeMap::new();
+        for _ in 0..node_count {
+            let node_id = self.read_u64()?;
+            let node = BasicNode::new(self.read_string()?);
+            if nodes.insert(node_id, node).is_some() {
+                return Err(raft_artifact_protocol_error(format!(
+                    "duplicate control-plane OpenRaft durable membership node {node_id}"
+                )));
+            }
+        }
+        Membership::new(configs, nodes).map_err(|error| {
+            raft_artifact_protocol_error(format!(
+                "invalid control-plane OpenRaft durable membership: {error}"
+            ))
+        })
+    }
+
+    fn read_log_id(&mut self) -> Result<LogIdOf<ControlPlaneRaftTypeConfig>, ControlPlaneError> {
+        let leader_id = self.read_leader_id()?;
+        let index = self.read_u64()?;
+        Ok(LogId::new(leader_id, index))
+    }
+
+    fn read_leader_id(&mut self) -> Result<ControlPlaneRaftLeaderId, ControlPlaneError> {
+        Ok(LeaderId {
+            term: self.read_u64()?,
+            node_id: self.read_u64()?,
+        })
+    }
+
+    fn remaining_len(&self) -> usize {
+        self.payload.len() - self.offset
     }
 }
 
@@ -2890,6 +3402,14 @@ impl RaftLogStorage<ControlPlaneRaftTypeConfig> for ControlPlaneRaftLogStore {
 
 fn is_openraft_bootstrap_log_id(log_id: LogIdOf<ControlPlaneRaftTypeConfig>) -> bool {
     log_id.index() == 0 && log_id.committed_leader_id().term == 0
+}
+
+fn raft_entry_payload_name(entry: &ControlPlaneRaftEntry) -> &'static str {
+    match &entry.payload {
+        EntryPayload::Blank => "blank",
+        EntryPayload::Membership(_) => "membership",
+        EntryPayload::Normal(_) => "normal",
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -4419,6 +4939,16 @@ mod tests {
             Ok(Ok(_)) => panic!("{message}: unexpectedly succeeded"),
             Ok(Err(error)) => error,
             Err(_) => panic!("{message}: timed out after {timeout:?}"),
+        }
+    }
+
+    fn assert_error_contains<T>(result: Result<T, ControlPlaneError>, expected: &str) {
+        match result {
+            Ok(_) => panic!("expected error containing {expected:?}, got success"),
+            Err(error) => assert!(
+                error.to_string().contains(expected),
+                "expected error {error:?} to contain {expected:?}"
+            ),
         }
     }
 
@@ -8764,6 +9294,196 @@ mod tests {
                 Some(raft_log_id(3, 1, 3))
             );
         });
+    }
+
+    #[test]
+    fn control_plane_raft_durable_restart_artifact_codec_round_trips() {
+        ControlPlaneRaftTypeConfig::run(async {
+            let bootstrap_membership = Membership::new(
+                vec![BTreeSet::from([1])],
+                BTreeMap::from([(1, BasicNode::new("raft-node-1"))]),
+            )
+            .unwrap();
+            let bootstrap_entry = Entry {
+                log_id: raft_log_id(0, 1, 0),
+                payload: EntryPayload::Membership(bootstrap_membership),
+            };
+            let bootstrap_command = ControlPlaneCommand::BootstrapInitialClusterMap {
+                nodes: vec![(NodeId::new(1), "/tmp/node-1.sock".to_string())],
+                pg_ids: vec![PgId::new(1)],
+            };
+            let command_entry = normal_entry(3, 1, 1, bootstrap_command);
+
+            let mut log_store = ControlPlaneRaftLogStore::empty();
+            RaftLogStorage::append(
+                &mut log_store,
+                vec![bootstrap_entry.clone(), command_entry.clone()],
+                IOFlushed::noop(),
+            )
+            .await
+            .unwrap();
+            let vote = Vote::<ControlPlaneRaftLeaderId>::new_committed(3, 1);
+            RaftLogStorage::save_vote(&mut log_store, &vote)
+                .await
+                .unwrap();
+            RaftLogStorage::save_committed(&mut log_store, Some(raft_log_id(3, 1, 1)))
+                .await
+                .unwrap();
+
+            let mut state_machine = ControlPlaneRaftStateMachine::empty();
+            state_machine.apply_entry(bootstrap_entry).unwrap();
+            state_machine.apply_entry(command_entry).unwrap();
+            let expected_snapshot = state_machine.inner().snapshot().clone();
+            let artifact =
+                ControlPlaneRaftRestartArtifact::capture(&log_store, &state_machine).unwrap();
+
+            let encoded = artifact.encode_durable_artifact().unwrap();
+            let decoded = ControlPlaneRaftRestartArtifact::decode_durable_artifact(&encoded)
+                .expect("durable restart artifact should decode");
+            let (mut restored_log_store, restored_state_machine) = decoded.restore().unwrap();
+
+            assert_eq!(
+                RaftLogReader::read_vote(&mut restored_log_store)
+                    .await
+                    .unwrap(),
+                Some(vote)
+            );
+            assert_eq!(
+                RaftLogStorage::read_committed(&mut restored_log_store)
+                    .await
+                    .unwrap(),
+                Some(raft_log_id(3, 1, 1))
+            );
+            assert_eq!(
+                restored_state_machine.last_applied(),
+                Some(raft_log_id(3, 1, 1))
+            );
+            assert_eq!(
+                restored_state_machine.inner().snapshot(),
+                &expected_snapshot
+            );
+            let restored_entries =
+                RaftLogReader::try_get_log_entries(&mut restored_log_store, 0..2)
+                    .await
+                    .unwrap();
+            assert_eq!(
+                restored_entries
+                    .iter()
+                    .map(|entry| entry.log_id)
+                    .collect::<Vec<_>>(),
+                vec![raft_log_id(0, 1, 0), raft_log_id(3, 1, 1)]
+            );
+        });
+    }
+
+    #[test]
+    fn control_plane_raft_durable_restart_artifact_codec_rejects_malformed_frames() {
+        let artifact = ControlPlaneRaftRestartArtifact {
+            log_store: ControlPlaneRaftLogStoreRestartArtifact::default(),
+            state_machine: ControlPlaneRaftStateMachine::empty().export_restart_artifact(),
+        };
+        assert!(matches!(
+            ControlPlaneRaftRestartArtifact::decode_durable_artifact(b"short"),
+            Err(ControlPlaneError::CommandDecode { .. })
+        ));
+
+        let encoded = artifact.encode_durable_artifact().unwrap();
+        let mut bad_magic = encoded.clone();
+        bad_magic[0] ^= 1;
+        bad_magic.truncate(bad_magic.len() - CONTROL_PLANE_RAFT_RESTART_CHECKSUM_LEN);
+        append_raft_artifact_checksum(&mut bad_magic);
+        assert_error_contains(
+            ControlPlaneRaftRestartArtifact::decode_durable_artifact(&bad_magic),
+            "invalid control-plane OpenRaft durable restart artifact magic",
+        );
+
+        let mut unsupported_version = Vec::new();
+        unsupported_version.extend_from_slice(CONTROL_PLANE_RAFT_RESTART_MAGIC);
+        write_raft_u16(
+            &mut unsupported_version,
+            CONTROL_PLANE_RAFT_RESTART_VERSION + 1,
+        );
+        append_raft_artifact_checksum(&mut unsupported_version);
+        assert_error_contains(
+            ControlPlaneRaftRestartArtifact::decode_durable_artifact(&unsupported_version),
+            "unsupported control-plane OpenRaft durable restart artifact version",
+        );
+
+        let mut truncated = encoded.clone();
+        truncated.pop();
+        assert_error_contains(
+            ControlPlaneRaftRestartArtifact::decode_durable_artifact(&truncated),
+            "checksum mismatch",
+        );
+
+        let mut unknown_entry_tag = Vec::new();
+        unknown_entry_tag.extend_from_slice(CONTROL_PLANE_RAFT_RESTART_MAGIC);
+        write_raft_u16(&mut unknown_entry_tag, CONTROL_PLANE_RAFT_RESTART_VERSION);
+        write_raft_option_vote(&mut unknown_entry_tag, None);
+        write_raft_option_log_id(&mut unknown_entry_tag, None);
+        write_raft_option_log_id(&mut unknown_entry_tag, None);
+        write_raft_u32(&mut unknown_entry_tag, 1);
+        write_raft_log_id(&mut unknown_entry_tag, raft_log_id(0, 1, 0));
+        write_raft_u8(&mut unknown_entry_tag, 99);
+        append_raft_artifact_checksum(&mut unknown_entry_tag);
+        assert_error_contains(
+            ControlPlaneRaftRestartArtifact::decode_durable_artifact(&unknown_entry_tag),
+            "unknown control-plane OpenRaft durable entry payload tag 99",
+        );
+
+        let index_zero_blank = ControlPlaneRaftRestartArtifact {
+            log_store: ControlPlaneRaftLogStoreRestartArtifact {
+                entries: vec![blank_entry(0, 1, 0)],
+                ..Default::default()
+            },
+            state_machine: ControlPlaneRaftStateMachine::empty().export_restart_artifact(),
+        }
+        .encode_durable_artifact()
+        .unwrap();
+        assert_error_contains(
+            ControlPlaneRaftRestartArtifact::decode_durable_artifact(&index_zero_blank),
+            "log index 0 entry must be bootstrap membership",
+        );
+
+        let non_bootstrap_index_zero_membership = ControlPlaneRaftRestartArtifact {
+            log_store: ControlPlaneRaftLogStoreRestartArtifact {
+                entries: vec![membership_entry(1, 1, 0)],
+                ..Default::default()
+            },
+            state_machine: ControlPlaneRaftStateMachine::empty().export_restart_artifact(),
+        }
+        .encode_durable_artifact()
+        .unwrap();
+        assert_error_contains(
+            ControlPlaneRaftRestartArtifact::decode_durable_artifact(
+                &non_bootstrap_index_zero_membership,
+            ),
+            "log index 0 entry must be bootstrap membership",
+        );
+    }
+
+    #[test]
+    fn control_plane_raft_durable_restart_artifact_decode_validates_restart_pair() {
+        let artifact = ControlPlaneRaftRestartArtifact {
+            log_store: ControlPlaneRaftLogStoreRestartArtifact {
+                vote: Some(Vote::<ControlPlaneRaftLeaderId>::new_committed(3, 1)),
+                committed: Some(raft_log_id(3, 1, 2)),
+                entries: vec![
+                    bootstrap_membership_entry(1),
+                    blank_entry(3, 1, 1),
+                    blank_entry(3, 1, 2),
+                    blank_entry(3, 1, 3),
+                ],
+                ..Default::default()
+            },
+            state_machine: state_machine_restart_artifact_with_noops(3, 1, 3),
+        };
+        let encoded = artifact.encode_durable_artifact().unwrap();
+
+        assert_error_contains(
+            ControlPlaneRaftRestartArtifact::decode_durable_artifact(&encoded),
+            "after committed restart gate",
+        );
     }
 
     #[test]
