@@ -10171,6 +10171,20 @@ Phase 12.2 progress:
   single-voter membership, while an unpositioned state-machine membership must
   be the canonical empty default, so a valid artifact from another node or a
   multi-voter artifact fails closed before `Raft::new`.
+- Wired the experimental `argmin-s3` control-plane process to use the durable
+  single-node authority at `ARGMIN_CONTROL_PLANE_STATE_PATH` instead of the
+  in-memory spike authority. The process checkpoints the OpenRaft restart
+  artifact after membership initialization and after every submitted command
+  outcome, including deterministic rejections, before returning through the
+  process adapter. Startup now waits for the restored state machine to apply
+  through the committed watermark before bootstrap or RPC service, then
+  checkpoints the caught-up artifact. A process-layer restart test now restores
+  from a committed-ahead artifact and verifies bootstrap does not run against a
+  stale pre-replay snapshot. If checkpointing fails after a command has been
+  committed, the process wrapper now poisons the durable authority and refuses
+  further runtime-map/admin/heartbeat service until restart, preventing the
+  process from continuing on in-memory state that is not present in
+  `ARGMIN_CONTROL_PLANE_STATE_PATH`.
 
 1. define the replicated control-plane state machine:
    - state includes cluster epoch, PG count, PG state, PG acting sets, node

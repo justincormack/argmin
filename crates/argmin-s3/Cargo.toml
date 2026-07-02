@@ -27,3 +27,6 @@ storage = { path = "../storage", default-features = false }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "macros"] }
 tokio-rustls = "0.26"
 rustls = { version = "0.23", features = ["ring"] }
+
+[dev-dependencies]
+storage = { path = "../storage", default-features = false, features = ["test-hooks"] }

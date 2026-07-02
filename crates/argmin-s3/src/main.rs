@@ -1293,6 +1293,8 @@ fn run_control_plane_process(config: &ServerConfig) -> ! {
 struct ExperimentalRaftControlPlane {
     runtime: Handle,
     authority: Arc<ControlPlaneRaftAuthority>,
+    durable_artifact_path: Option<PathBuf>,
+    durable_poison: Option<String>,
 }
 
 impl ExperimentalRaftControlPlane {
@@ -1300,23 +1302,56 @@ impl ExperimentalRaftControlPlane {
         block_on_control_plane_raft(&self.runtime, future)
     }
 
+    fn durable_poison_error(&self) -> Option<ControlPlaneError> {
+        self.durable_poison
+            .as_ref()
+            .map(|message| ControlPlaneError::RpcRemote {
+                message: message.clone(),
+            })
+    }
+
+    fn ensure_not_durably_poisoned(&self) -> Result<(), ControlPlaneError> {
+        if let Some(error) = self.durable_poison_error() {
+            Err(error)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn store_durable_restart_artifact(&self) -> Result<(), ControlPlaneError> {
+        let Some(path) = &self.durable_artifact_path else {
+            return Ok(());
+        };
+        self.block_on(self.authority.store_durable_restart_artifact(path))
+    }
+
     fn submit_raft_command(
-        &self,
+        &mut self,
         command: ControlPlaneCommand,
     ) -> Result<ControlPlaneCommandResponse, ControlPlaneError> {
+        self.ensure_not_durably_poisoned()?;
         let submitted = self.block_on(self.authority.submit_control_plane_command(command))?;
-        match submitted.into_outcome() {
+        let outcome = submitted.into_outcome();
+        if let Err(error) = self.store_durable_restart_artifact() {
+            self.durable_poison = Some(format!(
+                "experimental OpenRaft control-plane durability checkpoint failed after a \
+                 committed command; refusing to serve until restart: {error}"
+            ));
+            return Err(error);
+        }
+        match outcome {
             ControlPlaneRaftCommandOutcome::Applied(response) => Ok(response),
             ControlPlaneRaftCommandOutcome::Rejected(error) => Err(error),
         }
     }
 
     fn current_snapshot(&self) -> Result<ClusterControlSnapshot, ControlPlaneError> {
+        self.ensure_not_durably_poisoned()?;
         self.block_on(self.authority.current_control_plane_snapshot())
     }
 
     fn expire_heartbeat_leases(
-        &self,
+        &mut self,
         now_ms: u64,
     ) -> Result<(ClusterEpoch, usize, usize), ControlPlaneError> {
         let response = self.submit_raft_command(ControlPlaneCommand::ExpireHeartbeatLeases {
@@ -1342,6 +1377,7 @@ impl ControlPlaneRuntimeMapSource for ExperimentalRaftControlPlane {
         &self,
         authority_now_ms: u64,
     ) -> Result<ClusterRuntimeMapSnapshot, ControlPlaneError> {
+        self.ensure_not_durably_poisoned()?;
         self.block_on(
             self.authority
                 .linearized_runtime_map_snapshot(authority_now_ms),
@@ -1453,6 +1489,19 @@ fn block_on_control_plane_raft<F: Future>(runtime: &Handle, future: F) -> F::Out
     }
 }
 
+async fn wait_for_experimental_raft_startup_catch_up(
+    authority: &ControlPlaneRaftAuthority,
+    timeout: Duration,
+    message: &'static str,
+) -> Result<(), ControlPlaneError> {
+    let Some(committed) = authority.status().await?.committed() else {
+        return Ok(());
+    };
+    authority
+        .wait_for_applied_log_id(committed, timeout, message)
+        .await
+}
+
 fn run_experimental_raft_control_plane_process(config: &ServerConfig) -> ! {
     let state_path = config
         .control_plane_state_path
@@ -1475,18 +1524,33 @@ fn run_experimental_raft_control_plane_process(config: &ServerConfig) -> ! {
     let runtime = Handle::current();
     let node_id: ControlPlaneRaftNodeId = 1;
     let authority = block_on_control_plane_raft(&runtime, async {
-        let authority = ControlPlaneRaftAuthority::new_experimental_single_node_in_memory(
+        let authority = ControlPlaneRaftAuthority::new_experimental_single_node_durable(
             format!("argmin-s3-experimental-control-plane-{socket_path}"),
             node_id,
+            Path::new(state_path),
         )
         .await?;
-        authority.initialize_single_node_membership(node_id).await?;
+        if !authority.is_initialized().await? {
+            authority.initialize_single_node_membership(node_id).await?;
+            authority
+                .store_durable_restart_artifact(Path::new(state_path))
+                .await?;
+        }
         authority
             .wait_for_current_leader(
                 node_id,
                 Duration::from_secs(1),
                 "experimental single-node control-plane startup leadership",
             )
+            .await?;
+        wait_for_experimental_raft_startup_catch_up(
+            &authority,
+            Duration::from_secs(1),
+            "experimental single-node control-plane startup committed replay",
+        )
+        .await?;
+        authority
+            .store_durable_restart_artifact(Path::new(state_path))
             .await?;
         Ok::<_, ControlPlaneError>(Arc::new(authority))
     })
@@ -1497,6 +1561,8 @@ fn run_experimental_raft_control_plane_process(config: &ServerConfig) -> ! {
     let mut control_plane = ExperimentalRaftControlPlane {
         runtime,
         authority: Arc::clone(&authority),
+        durable_artifact_path: Some(PathBuf::from(state_path)),
+        durable_poison: None,
     };
     bootstrap_empty_experimental_raft_control_plane(&mut control_plane, config).unwrap_or_else(
         |error| {
@@ -1507,7 +1573,7 @@ fn run_experimental_raft_control_plane_process(config: &ServerConfig) -> ! {
     let authority = Arc::new(Mutex::new(control_plane));
     let active_rpc_workers = Arc::new(AtomicUsize::new(0));
     eprintln!(
-        "argmin-s3 experimental in-memory OpenRaft control-plane manager using lock state {} on {} (raft node {}, lease scan {} ms)",
+        "argmin-s3 experimental durable OpenRaft control-plane manager using state {} on {} (raft node {}, lease scan {} ms)",
         state_path,
         socket_path,
         node_id,
@@ -1532,10 +1598,12 @@ fn run_experimental_raft_control_plane_process(config: &ServerConfig) -> ! {
             }
         }
         let now_ms = storage::clock::current_time_millis();
-        let expiry = authority
-            .lock()
-            .expect("control-plane authority mutex poisoned")
-            .expire_heartbeat_leases(now_ms);
+        let expiry = {
+            let mut authority = authority
+                .lock()
+                .expect("control-plane authority mutex poisoned");
+            authority.expire_heartbeat_leases(now_ms)
+        };
         match expiry {
             Ok((cluster_epoch, expired_nodes, peering_pgs)) if expired_nodes > 0 => {
                 eprintln!(
@@ -2601,6 +2669,8 @@ mod tests {
         let control_plane = ExperimentalRaftControlPlane {
             runtime: handle,
             authority: Arc::clone(&authority),
+            durable_artifact_path: None,
+            durable_poison: None,
         };
         ExperimentalRaftTestHarness {
             runtime,
@@ -2618,6 +2688,8 @@ mod tests {
         let mut control_plane = ExperimentalRaftControlPlane {
             runtime: harness.runtime.handle().clone(),
             authority: Arc::clone(&harness.authority),
+            durable_artifact_path: None,
+            durable_poison: None,
         };
         std::thread::spawn(move || {
             let (mut stream, _addr) = listener.accept().unwrap();
@@ -2657,6 +2729,166 @@ mod tests {
         assert_eq!(runtime_map.pg_routes()[0].pg_id(), PgId::new(0));
 
         harness.shutdown();
+    }
+
+    #[test]
+    fn experimental_raft_control_plane_durable_restart_restores_bootstrap_state() {
+        let state_dir = short_unix_socket_test_dir("experimental-raft-durable-restart");
+        let _ = fs::remove_dir_all(&state_dir);
+        fs::create_dir_all(&state_dir).unwrap();
+        let state_path = state_dir.join("control-plane.state");
+        let storage_nodes = vec![(
+            NodeId::new(1),
+            "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
+        )];
+        let pg_ids = vec![PgId::new(0)];
+        let mut config = test_server_config();
+        config.storage_node_sockets = vec![config::ConfiguredStorageNodeSocket {
+            node_id: 1,
+            socket_path: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
+        }];
+        config.storage_pg_ids = vec![0];
+        let expected =
+            storage::control_plane_raft::ControlPlaneRaftRestartArtifact::store_single_node_committed_ahead_bootstrap_artifact_for_test(
+                &state_path,
+                1,
+                storage_nodes,
+                pg_ids,
+            )
+            .expect("committed-ahead durable raft artifact should be stored");
+        assert!(state_path.exists());
+
+        let restarted_runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("restarted test runtime should build");
+        let handle = restarted_runtime.handle().clone();
+        let authority = restarted_runtime.block_on(async {
+            let authority = ControlPlaneRaftAuthority::new_experimental_single_node_durable(
+                format!(
+                    "argmin-s3-experimental-raft-durable-restart-{}",
+                    std::process::id()
+                ),
+                1,
+                &state_path,
+            )
+            .await
+            .expect("durable experimental raft authority should restore");
+            assert!(authority
+                .is_initialized()
+                .await
+                .expect("restored durable raft initialization status should read"));
+            authority
+                .wait_for_current_leader(
+                    1,
+                    Duration::from_secs(1),
+                    "restarted durable experimental process test leadership",
+                )
+                .await
+                .expect("single-node raft should become leader");
+            wait_for_experimental_raft_startup_catch_up(
+                &authority,
+                Duration::from_secs(1),
+                "restarted durable experimental process test committed replay",
+            )
+            .await
+            .expect("restarted durable raft should apply committed suffix");
+            authority
+                .store_durable_restart_artifact(&state_path)
+                .await
+                .expect("restarted durable raft should checkpoint caught-up state");
+            Arc::new(authority)
+        });
+        let mut control_plane = ExperimentalRaftControlPlane {
+            runtime: handle,
+            authority: Arc::clone(&authority),
+            durable_artifact_path: Some(state_path.clone()),
+            durable_poison: None,
+        };
+        bootstrap_empty_experimental_raft_control_plane(&mut control_plane, &config)
+            .expect("durable experimental raft control-plane bootstrap should succeed");
+        let restarted = control_plane
+            .current_snapshot()
+            .expect("durable experimental snapshot should read after bootstrap");
+        restarted_runtime
+            .block_on(authority.shutdown())
+            .expect("durable experimental raft authority should shut down");
+        assert_eq!(restarted, expected);
+    }
+
+    #[test]
+    fn experimental_raft_control_plane_checkpoint_failure_poisons_durable_authority() {
+        let state_dir = short_unix_socket_test_dir("experimental-raft-checkpoint-poison");
+        let _ = fs::remove_dir_all(&state_dir);
+        fs::create_dir_all(&state_dir).unwrap();
+        let startup_state_path = state_dir.join("startup.state");
+        let invalid_checkpoint_path = state_dir.clone();
+
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime should build");
+        let handle = runtime.handle().clone();
+        let authority = runtime.block_on(async {
+            let authority = ControlPlaneRaftAuthority::new_experimental_single_node_durable(
+                format!(
+                    "argmin-s3-experimental-raft-checkpoint-poison-{}",
+                    std::process::id()
+                ),
+                1,
+                &startup_state_path,
+            )
+            .await
+            .expect("durable experimental raft authority should initialize");
+            authority
+                .initialize_single_node_membership(1)
+                .await
+                .expect("single-node raft membership should initialize");
+            authority
+                .wait_for_current_leader(
+                    1,
+                    Duration::from_secs(1),
+                    "checkpoint poison test leadership",
+                )
+                .await
+                .expect("single-node raft should become leader");
+            Arc::new(authority)
+        });
+        let mut control_plane = ExperimentalRaftControlPlane {
+            runtime: handle,
+            authority: Arc::clone(&authority),
+            durable_artifact_path: Some(invalid_checkpoint_path),
+            durable_poison: None,
+        };
+        let mut config = test_server_config();
+        config.storage_node_sockets = vec![config::ConfiguredStorageNodeSocket {
+            node_id: 1,
+            socket_path: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
+        }];
+        config.storage_pg_ids = vec![0];
+
+        let err = bootstrap_empty_experimental_raft_control_plane(&mut control_plane, &config)
+            .expect_err("checkpoint failure should reject the bootstrap response");
+        assert!(err.contains("durable restart artifact"));
+        assert!(control_plane.durable_poison.is_some());
+
+        let runtime_map_err = ControlPlaneRuntimeMapSource::runtime_map_snapshot(
+            &control_plane,
+            storage::clock::current_time_millis(),
+        )
+        .expect_err("poisoned durable authority should reject runtime-map service");
+        assert!(runtime_map_err
+            .to_string()
+            .contains("durability checkpoint failed"));
+
+        let admin_err = control_plane
+            .set_pg_acting_set(PgId::new(0), vec![NodeId::new(1)])
+            .expect_err("poisoned durable authority should reject admin mutation");
+        assert!(admin_err.to_string().contains("refusing to serve"));
+
+        runtime
+            .block_on(authority.shutdown())
+            .expect("durable experimental raft authority should shut down");
     }
 
     #[test]

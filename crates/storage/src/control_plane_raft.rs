@@ -1809,6 +1809,39 @@ impl ControlPlaneRaftAuthority {
             .map_err(|error| openraft_remote_error("state-machine snapshot read", error))
     }
 
+    pub async fn store_durable_restart_artifact(
+        &self,
+        path: &Path,
+    ) -> Result<(), ControlPlaneError> {
+        let log_store = self
+            .log_store
+            .as_ref()
+            .ok_or_else(|| ControlPlaneError::RpcRemote {
+                message: "OpenRaft durable restart artifact requested without retained log store"
+                    .to_string(),
+            })?;
+        let log_store =
+            log_store
+                .export_restart_artifact()
+                .map_err(|source| ControlPlaneError::Io {
+                    context: "export control-plane OpenRaft durable log-store restart artifact",
+                    source,
+                })?;
+        let state_machine = self
+            .raft
+            .with_state_machine(|state_machine| {
+                let artifact = state_machine.export_restart_artifact();
+                Box::pin(async move { artifact })
+            })
+            .await
+            .map_err(|error| openraft_remote_error("state-machine restart artifact read", error))?;
+        ControlPlaneRaftRestartArtifact {
+            log_store,
+            state_machine,
+        }
+        .store_durable_artifact(path)
+    }
+
     pub async fn status(&self) -> Result<ControlPlaneRaftAuthorityStatus, ControlPlaneError> {
         let node_id = *self.raft.node_id();
         let current_leader = self.raft.current_leader().await;
@@ -2796,6 +2829,55 @@ impl ControlPlaneRaftRestartArtifact {
         })?;
         sync_durable_artifact_parent(path)?;
         Ok(())
+    }
+
+    #[cfg(feature = "test-hooks")]
+    #[doc(hidden)]
+    pub fn store_single_node_committed_ahead_bootstrap_artifact_for_test(
+        path: &Path,
+        node_id: ControlPlaneRaftNodeId,
+        nodes: Vec<(NodeId, String)>,
+        pg_ids: Vec<crate::PgId>,
+    ) -> Result<ClusterControlSnapshot, ControlPlaneError> {
+        let log_id = |term, index| LogId::new(LeaderId { term, node_id }, index);
+        let bootstrap_membership = ControlPlaneRaftEntry {
+            log_id: log_id(0, 0),
+            payload: EntryPayload::Membership(Membership::new_with_defaults(
+                vec![BTreeSet::from([node_id])],
+                [],
+            )),
+        };
+        let blank = ControlPlaneRaftEntry {
+            log_id: log_id(3, 1),
+            payload: EntryPayload::Blank,
+        };
+        let bootstrap_command = ControlPlaneRaftEntry {
+            log_id: log_id(3, 2),
+            payload: EntryPayload::Normal(ControlPlaneCommand::BootstrapInitialClusterMap {
+                nodes,
+                pg_ids,
+            }),
+        };
+
+        let mut state_machine = ControlPlaneRaftStateMachine::empty();
+        state_machine.apply_entry(bootstrap_membership.clone())?;
+        state_machine.apply_entry(blank.clone())?;
+
+        let mut expected_state_machine = state_machine.clone();
+        expected_state_machine.apply_entry(bootstrap_command.clone())?;
+
+        ControlPlaneRaftRestartArtifact {
+            log_store: ControlPlaneRaftLogStoreRestartArtifact {
+                vote: Some(Vote::new_committed(3, node_id)),
+                committed: Some(bootstrap_command.log_id),
+                last_purged_log_id: None,
+                entries: vec![bootstrap_membership, blank, bootstrap_command],
+            },
+            state_machine: state_machine.export_restart_artifact(),
+        }
+        .store_durable_artifact(path)?;
+
+        Ok(expected_state_machine.inner().snapshot().clone())
     }
 
     pub fn restore(
