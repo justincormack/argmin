@@ -10268,6 +10268,18 @@ Phase 12.3 proposed scope:
   a typed redirect/not-leader result; runtime-map read-index calls should be
   served only by the current serving leader; followers must not publish
   authority-bearing runtime maps as current.
+- Define the Raft client retry contract separately from the existing Unix
+  control-plane RPC response-loss wrappers. The current in-process
+  experimental authority does not have a separate Unix response that can be
+  dropped after a command applies, because `submit_raft_command()` receives an
+  explicit applied/rejected outcome from OpenRaft when it returns normally. But
+  read-only Raft operations still need safe retry for transient routing,
+  leader, and catch-up failures; mutating commands must not be blindly retried
+  after ambiguous OpenRaft/client errors unless a command-specific linearized
+  state check proves the intended effect is already present or that submitting
+  remains safe. Time-based commands need bounded retry rules so heartbeat retry
+  cannot resurrect an expired lease and expiry retry cannot reinterpret time in
+  a way that changes semantics.
 - Exercise replication and failover in tests: bootstrap a three-node
   experimental control-plane group, commit a command on the leader, verify
   followers apply it, stop the leader, elect a new leader, commit another
