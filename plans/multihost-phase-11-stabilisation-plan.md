@@ -673,13 +673,20 @@ when prioritised. They correspond to the remaining findings from the Phase 11 re
   4. Bucket-delete-specific fault interleavings remain tracked in the bucket-delete
      hardening work, with only shared failpoint API requirements duplicated here.
 
-- **Slice 7: Control-plane RPC retry and command check-applied semantics.** The current
-  Unix control-plane RPC path uses a single one-second read/write timeout on both client and
-  server sides. A transient pause such as a network switch reboot, scheduler stall, or
+- **Slice 7: Unix control-plane RPC retry and command check-applied semantics.** The current
+  live Unix control-plane RPC path uses a single one-second read/write timeout on both client
+  and server sides. A transient pause such as a network switch reboot, scheduler stall, or
   overloaded authority worker can therefore leave the caller unable to distinguish "command
   was not applied" from "command was applied but the response was lost". Treating all such
   failures as hard failures makes live admin operations brittle; blindly retrying all
   commands is also unsafe because some commands advance route/provenance state.
+
+  Keep this slice scoped to the live Unix RPC surface used by the current Phase 11
+  transition tooling. The experimental OpenRaft control-plane path has different failure
+  boundaries: a normal `client_write` result already returns an applied/rejected command
+  outcome, while ambiguous leader/routing/client failures need Raft-specific check-applied
+  rules before Phase 12 relies on multi-node operation. Track that with the Phase 12 Raft
+  work, not in this Phase 11 Unix RPC slice.
 
   Split the work by command semantics:
   - **Read-only RPCs, including read-only runtime-map fetches:** retry/reconnect with
