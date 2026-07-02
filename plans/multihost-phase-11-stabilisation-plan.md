@@ -494,19 +494,134 @@ when prioritised. They correspond to the remaining findings from the Phase 11 re
 
   | Path | Positive crossing coverage | Stale-primary / Peering fail-closed coverage | Remaining Slice 6 gap |
   | --- | --- | --- | --- |
-  | Direct PUT / overwrite | Believed covered locally at B1/B2: pause after shard write or generation reservation and commit exactly once across a runtime-map epoch change. | Believed covered locally and through installed Unix clients for control-plane-driven Peering: no metadata publish, no leaked bucket-write proof, staged payload cleaned by retained routes. | Inventory exact test names; add B3 lost-response/idempotent-retry coverage if not already covered by command replay tests. |
-  | Streaming PutObject | Needs explicit inventory. This path uses `begin_stream_put`/`CreateStreamUploadReq { target: PutObject }`, segment append, and `finalize_stream_put`/`CommitStreamPut`, rather than the direct PUT publisher. | Needs explicit inventory for stale route/Peering at stream session create, segment append/finalize, committed stream PUT publish, and abort cleanup. | Add or name tests for session creation, segment append, `CommitStreamPut`, terminal checksum/final chunk failure cleanup, and abort cleanup across B1/B2/B4/B5. |
-  | DeleteObject | Believed covered locally before metadata apply across a runtime-map epoch change. | Believed covered locally and through installed Unix clients for stale epoch and real Peering; includes reservation-acquired cleanup regression. | Inventory exact test names; add explicit B3 response-loss/retry shape for committed delete if absent. |
-  | Object metadata mutations: tags/legal hold/retention/ACL-shaped path | Believed covered for tags, legal hold, and retention locally before shared `PutObjectMetadata` apply across an epoch change. ACL is same serialization shape and lower priority. | Believed covered for tags locally and through installed Unix clients for stale epoch and real Peering. | Inventory exact test names; decide whether ACL needs one representative test or remains covered by shared command-shape evidence. |
-  | CopyObject destination publish | Believed covered locally before destination `CommitDirectPutObject` across a runtime-map epoch change. | Believed covered locally and through installed Unix clients for real Peering; source remains unchanged, destination metadata is not published, copied shards/acks are cleaned. | Inventory exact test names; add B3 committed-copy response-loss/idempotent retry coverage if missing. |
-  | CompleteMultipartUpload | Believed covered locally before multipart commit apply across a runtime-map epoch change. | Believed covered locally and through installed Unix clients for stale epoch and real Peering; staged upload and selected part rows are preserved. | Inventory exact test names; add response-loss/idempotent completion retry at B3 if not already pinned elsewhere. |
-  | AbortMultipartUpload | Needs explicit inventory. Abort has its own reservation, pending-command, cleanup, and apply path, so it is a real B2/B4 boundary rather than a variant of complete. | Needs stale route/Peering fail-closed coverage that preserves or deletes upload/part/stream state according to the abort stage and releases any bucket-write proof. | Add or name tests for abort after reservation/pending-command install, abort cleanup across route refresh, and stale-primary abort rejection. |
-  | UploadPart stream finalization | Believed covered locally before `CommitStreamPart` apply across an epoch change, including UploadPartCopy-shaped copied segments. | Believed covered by direct-RPC stale-route rejection and installed Unix stale/Peering paths; active session, staged segments, shard files, and ack rows are preserved. | Inventory exact test names; add B3 committed-part response-loss/retry coverage if missing. |
-  | UploadPart stream-session creation | Believed covered by ordinary command apply/retry tests; local crossing coverage is lower priority because no payload has been staged yet. | Believed covered through direct-RPC and installed Unix stale/Peering paths; no session, segment rows, pending command, or reservation leak. | Inventory exact test names; add a minimal B2 pending-slot/reservation crossing test if the existing command tests do not hit it. |
-  | GET/HEAD payload reads | Believed covered locally after metadata snapshot and by installed-Unix retained-route read: old payload shards are read through stored placement epoch after data-PG route change. | Peering fail-closed coverage believed to exist for object metadata PG Peering. | Inventory exact test names; add an explicit malformed/stale current-route negative where a current-route payload read cannot accidentally succeed after disjoint placement. |
-  | Object and version LIST | Believed covered locally across route-map swaps during listing and pagination, including delimiter/common-prefix continuation; UAT route-change smokes cover process-level retained-list behavior. | Peering fail-closed coverage believed to exist for object metadata PG Peering. | Inventory exact test names; add a deterministic multi-object-PG LIST route-change matrix if pagination coverage does not already span object-PG movement. |
+  | Direct PUT / overwrite | Covered locally at B1/B2: `S6-DP1`. | Covered locally and through installed Unix clients for stale epoch and control-plane-driven Peering: `S6-DP2`, `S6-DP3`. | Add B3 lost-response/idempotent-retry coverage if not already covered by command replay tests. |
+  | Streaming PutObject | Partially covered: stream session pinning and command-conflict cleanup are named in `S6-SP1`, and storage command retry/finalize cleanup is named in `S6-SP2`. | Partially covered for remote segment append/commit stale epoch in `S6-SP3`; no complete real-Peering matrix is named yet for `CommitStreamPut`. | Add explicit route-change/Peering tests for `CommitStreamPut`, terminal checksum/final chunk failure cleanup, and abort cleanup across B1/B2/B4/B5. |
+  | DeleteObject | Covered locally before metadata apply across a runtime-map epoch change: `S6-DEL1`. | Covered locally and through installed Unix clients for stale epoch and real Peering: `S6-DEL2`, `S6-DEL3`. | Add explicit B3 response-loss/retry shape for committed delete if absent. |
+  | Object metadata mutations: tags/legal hold/retention/ACL-shaped path | Covered for tags, legal hold, and retention locally before shared `PutObjectMetadata` apply across an epoch change: `S6-META1`. ACL is the same serialization shape but not named yet. | Covered for shared object-metadata update locally and through installed Unix clients for stale epoch and real Peering: `S6-META2`, `S6-META3`. | Decide whether ACL needs one representative test or remains covered by shared command-shape evidence. |
+  | CopyObject destination publish | Covered locally before destination `CommitDirectPutObject` across a runtime-map epoch change: `S6-COPY1`. | Covered locally and through installed Unix clients for real Peering: `S6-COPY2`, `S6-COPY3`. | Add B3 committed-copy response-loss/idempotent retry coverage if missing. |
+  | CompleteMultipartUpload | Covered locally before multipart commit apply across a runtime-map epoch change: `S6-CMP1`. | Covered locally and through installed Unix clients for stale epoch and real Peering: `S6-CMP2`, `S6-CMP3`. | Add response-loss/idempotent completion retry at B3 if not already pinned elsewhere. |
+  | AbortMultipartUpload | Partially covered for coordinator route-map pinning and command-conflict mapping: `S6-ABORT1`; storage-level partial apply/reopen and cleanup are named in `S6-ABORT2`. | Stale upload-row and multipart-trace stale snapshot coverage exists in `S6-ABORT3`, but no real Peering/installed-Unix abort matrix is named yet. | Add stale-primary/Peering abort rejection that proves upload/part/stream state is preserved or deleted according to abort stage and releases any bucket-write proof. |
+  | UploadPart stream finalization | Covered locally before `CommitStreamPart` apply across an epoch change, including UploadPartCopy-shaped copied segments: `S6-UPF1`; storage retry/finalize cleanup is named in `S6-UPF2`. | Covered by installed Unix stale/Peering paths for UploadPart and UploadPartCopy finalization: `S6-UPF3`. | Add B3 committed-part response-loss/retry coverage if missing. |
+  | UploadPart stream-session creation | Covered by coordinator route-map pinning and storage create retry/reservation tests: `S6-UPC1`, `S6-UPC2`. | Covered through installed Unix stale/Peering paths with no session, segment rows, pending command, or reservation leak: `S6-UPC3`. | Add a minimal B2 pending-slot/reservation crossing test if the existing command tests do not hit it precisely enough. |
+  | GET/HEAD payload reads | Covered locally after metadata snapshot and by installed-Unix retained-route read: `S6-READ1`, `S6-READ2`. | Covered for object metadata PG Peering fail-closed: `S6-READ3`. | Add an explicit malformed/stale current-route negative where a current-route payload read cannot accidentally succeed after disjoint placement. |
+  | Object and version LIST | Covered locally across route-map swaps during listing and pagination, including delimiter/common-prefix continuation: `S6-LIST1`; UAT route-change smokes cover process-level retained-list behavior. | Covered for composite/listing Peering fail-closed at storage level: `S6-LIST2`; read/list object metadata PG Peering fail-closed is also in `S6-READ3`. | Add a deterministic multi-object-PG LIST route-change matrix if pagination coverage does not already span object-PG movement. |
   | DeleteBucket begin/finalize | Covered by a separate bucket-delete hardening plan and many recent regressions. | Partially covered, but recent soak failures show this is still the largest open correctness/robustness area. | Keep this out of the generic matrix except for shared failpoint API reuse; track durable attempt/adoption/finalizer interleavings in the bucket-delete plan. |
   | Control-plane PG transitions | Slice 4 covers `open -> mutate -> save -> reload -> continue` for current transitions. | Stale runtime-map and stale authorization fail-closed coverage exists. | Slice 7 handles lost-response/check-applied behavior for mutating control-plane RPCs. |
+
+  Evidence inventory:
+  - `S6-DP1`: `put_object_epoch_change_before_metadata_apply_commits_once_on_pinned_route`,
+    `overwrite_object_epoch_change_before_metadata_apply_commits_once_on_pinned_route`
+    in `crates/server-core/src/coordinator/core_tests.rs`.
+  - `S6-DP2`: `non_current_epoch_direct_put_commit_fails_closed_and_cleans_unowned_state`,
+    `control_plane_peering_direct_put_old_primary_fails_closed_and_cleans_unowned_state`
+    in `crates/storage/src/cluster/local/tests/direct_put.rs`.
+  - `S6-DP3`: `non_current_epoch_unix_direct_put_commit_fails_closed_and_cleans_remote_state`,
+    `control_plane_peering_unix_direct_put_old_primary_fails_closed_and_cleans_remote_state`
+    in `crates/storage/src/cluster/local/tests/unix_clients.rs`.
+  - `S6-SP1`: `large_put_object_pins_runtime_map_after_stream_session_create`,
+    `stream_put_begin_request_maps_command_log_conflict_to_operation_aborted`,
+    `stream_put_finalize_request_maps_command_log_conflict_to_operation_aborted`,
+    and `stream_abort_request_maps_command_log_conflict_to_operation_aborted`
+    in `crates/server-core/src/coordinator/core_tests.rs`.
+  - `S6-SP2`: `stream_put_create_partial_apply_retry_reuses_existing_session`,
+    `stream_put_finalize_pending_drain_cleans_terminal_stream_session`,
+    `stream_put_finalize_matching_pending_install_race_returns_success`,
+    and `failed_stream_put_finalize_is_scavenged_without_visibility_or_orphans`
+    in `crates/storage/src/cluster/local/tests/stream_commands.rs` and
+    `crates/server-core/src/coordinator/multipart_stateful_tests.rs`.
+  - `S6-SP3`: `non_current_epoch_unix_stream_append_commit_fails_closed_and_cleans_remote_state`
+    in `crates/storage/src/cluster/local/tests/unix_clients.rs`.
+  - `S6-DEL1`: `delete_object_epoch_change_before_metadata_apply_commits_once_on_pinned_route`
+    in `crates/server-core/src/coordinator/core_tests.rs`.
+  - `S6-DEL2`: `non_current_epoch_object_delete_fails_closed_without_mutation`,
+    `control_plane_peering_object_delete_old_primary_fails_closed_without_mutation`
+    in `crates/storage/src/cluster/local/tests/object_commands.rs`.
+  - `S6-DEL3`: `non_current_epoch_unix_object_delete_fails_closed_without_remote_mutation`,
+    `control_plane_peering_unix_object_delete_old_primary_fails_closed_without_remote_mutation`
+    in `crates/storage/src/cluster/local/tests/unix_clients.rs`.
+  - `S6-META1`: `put_object_tags_epoch_change_before_metadata_apply_commits_once_on_pinned_route`,
+    `put_object_legal_hold_epoch_change_before_metadata_apply_commits_once_on_pinned_route`,
+    and `put_object_retention_epoch_change_before_metadata_apply_commits_once_on_pinned_route`
+    in `crates/server-core/src/coordinator/core_tests.rs`.
+  - `S6-META2`: `non_current_epoch_object_metadata_update_fails_closed_without_mutation`,
+    `control_plane_peering_object_metadata_update_old_primary_fails_closed_without_mutation`
+    in `crates/storage/src/cluster/local/tests/object_commands.rs`.
+  - `S6-META3`: `non_current_epoch_unix_object_metadata_update_fails_closed_without_remote_mutation`,
+    `control_plane_peering_unix_object_metadata_old_primary_fails_closed_without_remote_mutation`
+    in `crates/storage/src/cluster/local/tests/unix_clients.rs`.
+  - `S6-COPY1`: `copy_object_epoch_change_before_metadata_apply_commits_once_on_pinned_route`
+    in `crates/server-core/src/coordinator/core_tests.rs`.
+  - `S6-COPY2`: `control_plane_peering_copy_object_destination_old_primary_fails_closed_and_cleans_staging`
+    in `crates/storage/src/cluster/local/tests/direct_put.rs`.
+  - `S6-COPY3`: `control_plane_peering_unix_copy_object_destination_old_primary_cleans_remote_staging`
+    in `crates/storage/src/cluster/local/tests/unix_clients.rs`.
+  - `S6-CMP1`: `complete_multipart_epoch_change_before_metadata_apply_commits_once_on_pinned_route`,
+    `complete_multipart_upload_pins_runtime_map_between_snapshot_and_commit`
+    in `crates/server-core/src/coordinator/core_tests.rs`.
+  - `S6-CMP2`: `non_current_epoch_multipart_completion_fails_closed_without_mutation`,
+    `control_plane_peering_multipart_completion_old_primary_fails_closed_without_mutation`
+    in `crates/storage/src/cluster/local/tests/multipart_completion.rs`.
+  - `S6-CMP3`: `non_current_epoch_unix_multipart_completion_fails_closed_without_remote_mutation`,
+    `control_plane_peering_unix_multipart_completion_old_primary_fails_closed_without_remote_mutation`
+    in `crates/storage/src/cluster/local/tests/unix_clients.rs`.
+  - `S6-ABORT1`: `abort_multipart_upload_pins_runtime_map_after_auth_lookup`,
+    `abort_multipart_upload_pins_runtime_map_after_bucket_summary`,
+    and `abort_multipart_upload_request_maps_command_log_conflict_to_operation_aborted`
+    in `crates/server-core/src/coordinator/core_tests.rs`.
+  - `S6-ABORT2`: `multipart_abort_partial_apply_retry_cleans_uploaded_part_payload`,
+    `multipart_abort_partial_apply_reopens_and_converges`,
+    `multipart_abort_pending_install_conflict_cleans_upload_part_stream_session_and_segments`,
+    and `multipart_abort_zero_apply_leaves_upload_in_progress_before_retry`
+    in `crates/storage/src/cluster/local/tests/multipart.rs`.
+  - `S6-ABORT3`: `authorized_multipart_abort_rejects_stale_upload_row` in
+    `crates/storage/src/cluster/local/tests/multipart.rs`, plus
+    `prop_multipart_trace_preserves_terminal_lifecycle_invariants` and
+    `multipart_trace_exercises_bucket_delete_recreate` in
+    `crates/storage/src/cluster/local/tests/multipart_trace.rs`.
+  - `S6-UPF1`: `upload_part_finalize_epoch_change_before_metadata_apply_commits_once_on_pinned_route`
+    and `upload_part_copy_epoch_change_before_metadata_apply_commits_once_on_pinned_route`
+    in `crates/server-core/src/coordinator/core_tests.rs`.
+  - `S6-UPF2`: `stream_part_finalize_pending_drain_cleans_terminal_stream_session`,
+    `upload_part_stream_finalize_partial_apply_reopens_and_converges`,
+    `upload_part_stream_finalize_finishes_terminal_pending_slot`, and
+    `failed_stream_part_finalize_abort_cleanup_leaves_no_visible_part_or_orphans`
+    in `crates/storage/src/cluster/local/tests/stream_commands.rs` and
+    `crates/server-core/src/coordinator/multipart_stateful_tests.rs`.
+  - `S6-UPF3`: `non_current_epoch_unix_upload_part_stream_finalize_fails_closed_without_remote_mutation`,
+    `non_current_epoch_unix_upload_part_copy_finalize_preserves_copied_staging`,
+    `control_plane_peering_unix_upload_part_finalize_old_primary_preserves_remote_staging`,
+    and `control_plane_peering_unix_upload_part_copy_finalize_old_primary_preserves_remote_staging`
+    in `crates/storage/src/cluster/local/tests/unix_clients.rs`.
+  - `S6-UPC1`: `streaming_upload_part_pins_runtime_map_after_session_create`,
+    `upload_part_copy_pins_runtime_map_after_stream_session_create`, and
+    `upload_part_append_request_maps_command_log_conflict_to_operation_aborted`
+    in `crates/server-core/src/coordinator/core_tests.rs`.
+  - `S6-UPC2`: `upload_part_stream_create_zero_apply_reopens_and_converges`,
+    `begin_upload_part_stream_pending_install_race_reruns_action`, and
+    `begin_upload_part_stream_drains_pending_completion_before_create`
+    in `crates/storage/src/cluster/local/tests/multipart.rs`.
+  - `S6-UPC3`: `non_current_epoch_unix_upload_part_stream_session_create_fails_closed_without_remote_mutation`,
+    `control_plane_peering_unix_upload_part_session_old_primary_fails_closed_without_remote_mutation`
+    in `crates/storage/src/cluster/local/tests/unix_clients.rs`.
+  - `S6-READ1`: `get_object_epoch_change_after_read_snapshot_uses_pinned_route`,
+    `head_object_epoch_change_after_read_snapshot_uses_pinned_route`,
+    and `get_uses_retained_payload_route_over_unix_after_data_pg_move_and_metadata_reads_stay_available`
+    in `crates/server-core/src/coordinator/core_tests.rs`.
+  - `S6-READ2`: `cross_epoch_segment_read_uses_retained_route_over_unix_storage_nodes`
+    in `crates/storage/src/cluster/local/tests/unix_clients.rs`.
+  - `S6-READ3`: `read_and_list_fail_closed_while_object_metadata_pg_is_peering`
+    in `crates/server-core/src/coordinator/core_tests.rs` and
+    `object_read_snapshot_fails_closed_while_metadata_pg_is_peering`
+    in `crates/storage/src/cluster/local/tests/object_read.rs`.
+  - `S6-LIST1`: `list_objects_epoch_change_before_storage_list_uses_pinned_route`,
+    `list_objects_continuation_survives_epoch_change_between_pages`,
+    `list_objects_delimiter_continuation_survives_epoch_change_between_pages`,
+    `list_object_versions_continuation_survives_epoch_change_between_pages`, and
+    `list_object_versions_delimiter_continuation_survives_epoch_change_between_pages`
+    in `crates/server-core/src/coordinator/core_tests.rs`.
+  - `S6-LIST2`: `composite_object_listings_fan_out_to_routed_pg_primaries` and
+    `composite_bucket_listings_fail_closed_while_any_metadata_pg_is_peering`
+    in `crates/storage/src/cluster/local/tests/bucket_commands.rs`.
 
   Harness requirements:
   - failpoints must be named and token-scoped; no sleeps or global "next operation" hooks
@@ -523,8 +638,8 @@ when prioritised. They correspond to the remaining findings from the Phase 11 re
 
   Exit criteria:
   1. The matrix above is either marked covered with exact test names or has a deliberate
-     open item linked to another plan. Until then, "believed covered" means the old Phase
-     11 notes claim coverage but the tests still need to be named for auditability.
+     open item linked to another plan. Rows marked partially covered must identify the
+     missing boundary or route-state shape explicitly.
   2. Ordinary object/MPU/read/list partial-state failures are pinned by deterministic cargo
      tests rather than waiting for smoke discovery.
   3. Whole-process route-change smokes remain as integration confidence only; they are not
