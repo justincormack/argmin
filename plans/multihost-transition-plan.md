@@ -10076,6 +10076,19 @@ Phase 12.1 progress:
   first proves a pre-deadline scan is a replicated no-op, then expires the lease
   at the committed deadline and verifies the node becomes unavailable, the lease
   is cleared, and the active PG moves back to Peering with its metadata floor.
+- Phase 12.1 process-spike closeout: the in-memory OpenRaft path now covers
+  the durable command and snapshot codec, deterministic apply/rejection
+  semantics, in-memory log/state-machine restart gates, OpenRaft initialization
+  and client writes, read-index runtime-map proofs, heartbeat lease expiry,
+  membership changes, routing/status fencing, the temporary
+  `ARGMIN_CONTROL_PLANE_EXPERIMENTAL_RAFT` process flag, and the single-process
+  Unix RPC paths used by storage-node heartbeat refresh, frontend runtime-map
+  refresh, metadata transfer, and acting-set admin helpers. The remaining work
+  is intentionally outside this slice and starts the next Phase 12 work:
+  durable Raft log/snapshot storage, multi-process Raft networking and
+  authenticated control-plane RPC, upgrade/cutover semantics, monotonic-clock
+  lease-read design, and removing or replacing
+  `ARGMIN_CONTROL_PLANE_EXPERIMENTAL_RAFT`.
 
 1. define the replicated control-plane state machine:
    - state includes cluster epoch, PG count, PG state, PG acting sets, node
