@@ -711,7 +711,11 @@ when prioritised. They correspond to the remaining findings from the Phase 11 re
     - `FencePgForMetadataTransfer`: PG is already fenced/peering with the expected source
       route, source lease, and transfer proof.
     - `SetPgActingSetWithMetadataTransfer`: PG route has the expected acting set and matching
-      metadata-transfer proof.
+      metadata-transfer proof. **Status:** the Unix
+      `SetPgActingSetWithMetadataTransferRuntimeMap` live-transfer path now treats read-side
+      response loss after request submission as uncertain, then reads the runtime map until it
+      observes the expected peering route, acting set, and metadata-transfer proof. A storage
+      regression injects response loss after the authority applies the command.
     - `CompletePgPeering` / `CompleteReadyPgPeerings`: PG is active with the expected
       primary, node incarnation, and route/proof state.
 

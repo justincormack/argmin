@@ -903,10 +903,11 @@ fn transfer_control_plane_pg_metadata_live(
                 planned_imported_proof,
             );
             let destination_runtime = control_plane
-                .set_pg_acting_set_with_metadata_transfer_runtime_map(
+                .set_pg_acting_set_with_metadata_transfer_runtime_map_checked(
                     pg_id,
                     acting_set.clone(),
                     transfer,
+                    planned_destination_epoch,
                 )
                 .map_err(|error| {
                     format!("failed to install transfer-backed live PG acting set: {error}")

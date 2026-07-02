@@ -23,6 +23,8 @@ const CONTROL_PLANE_RPC_MAX_PAYLOAD_LEN: usize = 8 * 1024 * 1024;
 const CONTROL_PLANE_RPC_IO_TIMEOUT: Duration = Duration::from_secs(1);
 const CONTROL_PLANE_RPC_READ_ONLY_RETRY_DEADLINE: Duration = Duration::from_secs(10);
 const CONTROL_PLANE_RPC_READ_ONLY_RETRY_BACKOFF: Duration = Duration::from_millis(50);
+const CONTROL_PLANE_RPC_CHECK_APPLIED_DEADLINE: Duration = Duration::from_secs(20);
+const CONTROL_PLANE_RPC_CHECK_APPLIED_BACKOFF: Duration = Duration::from_millis(100);
 const CONTROL_PLANE_RPC_HEARTBEAT_OBSERVATION_MIN_LEN: usize = 4 + 1 + 8 + 8 + 8 + 1;
 const CONTROL_PLANE_RPC_RUNTIME_NODE_MIN_LEN: usize = 4 + 8 + 4 + 1;
 const CONTROL_PLANE_RPC_PG_ROUTE_MIN_LEN: usize = 8 + 4 + 4 + 1 + 1 + 4 + 1;
@@ -3994,6 +3996,49 @@ impl UnixControlPlaneClient {
         }
     }
 
+    fn wait_for_metadata_transfer_install_applied(
+        &self,
+        pg_id: PgId,
+        acting_set: &[NodeId],
+        transfer: PgMetadataTransferProof,
+        min_cluster_epoch: ClusterEpoch,
+        original_error: &ControlPlaneError,
+    ) -> Result<ClusterRuntimeMapSnapshot, ControlPlaneError> {
+        let deadline = Instant::now() + CONTROL_PLANE_RPC_CHECK_APPLIED_DEADLINE;
+        let mut last_observation_error;
+        loop {
+            match self.runtime_map_snapshot(0) {
+                Ok(runtime_map) => {
+                    if metadata_transfer_install_applied(
+                        &runtime_map,
+                        pg_id,
+                        acting_set,
+                        transfer,
+                        min_cluster_epoch,
+                    ) {
+                        return Ok(runtime_map);
+                    }
+                    last_observation_error = None;
+                }
+                Err(error) => {
+                    last_observation_error = Some(error.to_string());
+                }
+            }
+            if Instant::now() >= deadline {
+                let mut message = format!(
+                    "metadata-transfer acting-set install for PG {} was not observable after lost control-plane RPC response: {original_error}",
+                    pg_id.get()
+                );
+                if let Some(error) = last_observation_error {
+                    message.push_str("; last runtime-map observation error: ");
+                    message.push_str(&error);
+                }
+                return Err(ControlPlaneError::RpcUnconfirmed { message });
+            }
+            std::thread::sleep(CONTROL_PLANE_RPC_CHECK_APPLIED_BACKOFF);
+        }
+    }
+
     pub fn set_pg_acting_set(
         &self,
         pg_id: PgId,
@@ -4109,6 +4154,48 @@ impl UnixControlPlaneClient {
         reader.finish()?;
         Ok(runtime_map)
     }
+
+    pub fn set_pg_acting_set_with_metadata_transfer_runtime_map_checked(
+        &self,
+        pg_id: PgId,
+        acting_set: Vec<NodeId>,
+        transfer: PgMetadataTransferProof,
+        min_cluster_epoch: ClusterEpoch,
+    ) -> Result<ClusterRuntimeMapSnapshot, ControlPlaneError> {
+        match self.set_pg_acting_set_with_metadata_transfer_runtime_map(
+            pg_id,
+            acting_set.clone(),
+            transfer,
+        ) {
+            Ok(runtime_map)
+                if metadata_transfer_install_applied(
+                    &runtime_map,
+                    pg_id,
+                    &acting_set,
+                    transfer,
+                    min_cluster_epoch,
+                ) =>
+            {
+                Ok(runtime_map)
+            }
+            Ok(runtime_map) => Err(ControlPlaneError::RpcUnconfirmed {
+                message: format!(
+                    "metadata-transfer acting-set install for PG {} returned runtime map at epoch {} without the expected route/proof",
+                    pg_id.get(),
+                    runtime_map.cluster_epoch().get()
+                ),
+            }),
+            Err(error) if error.is_maybe_applied_control_plane_rpc_response_loss() => self
+                .wait_for_metadata_transfer_install_applied(
+                    pg_id,
+                    &acting_set,
+                    transfer,
+                    min_cluster_epoch,
+                    &error,
+                ),
+            Err(error) => Err(error),
+        }
+    }
 }
 
 impl ControlPlaneRuntimeMapSource for UnixControlPlaneClient {
@@ -4131,6 +4218,28 @@ impl ControlPlaneLinearizedRuntimeMapSource for UnixControlPlaneClient {
     ) -> Result<ClusterRuntimeMapSnapshot, ControlPlaneError> {
         self.runtime_map_snapshot(authority_now_ms)
     }
+}
+
+fn metadata_transfer_install_applied(
+    runtime_map: &ClusterRuntimeMapSnapshot,
+    pg_id: PgId,
+    acting_set: &[NodeId],
+    transfer: PgMetadataTransferProof,
+    min_cluster_epoch: ClusterEpoch,
+) -> bool {
+    if runtime_map.cluster_epoch() < min_cluster_epoch {
+        return false;
+    }
+    runtime_map
+        .pg_routes()
+        .iter()
+        .find(|route| route.pg_id() == pg_id)
+        .is_some_and(|route| {
+            route.cluster_epoch() >= min_cluster_epoch
+                && route.state() == PgState::Peering
+                && route.acting_set() == acting_set
+                && route.peering_metadata_transfer() == Some(transfer)
+        })
 }
 
 impl ControlPlaneHeartbeatRuntimeMapSource for UnixControlPlaneClient {
@@ -5484,6 +5593,9 @@ pub enum ControlPlaneError {
     #[error("control-plane RPC remote error: {message}")]
     RpcRemote { message: String },
 
+    #[error("control-plane RPC applied-state confirmation failed: {message}")]
+    RpcUnconfirmed { message: String },
+
     #[error("invalid {field} state {value:?}")]
     InvalidState { field: &'static str, value: String },
 
@@ -5842,6 +5954,29 @@ impl ControlPlaneError {
                 | ErrorKind::NotConnected
                 | ErrorKind::ConnectionRefused
                 | ErrorKind::NotFound
+        )
+    }
+
+    #[must_use]
+    pub fn is_maybe_applied_control_plane_rpc_response_loss(&self) -> bool {
+        let Self::Io { context, source } = self else {
+            return false;
+        };
+        matches!(
+            *context,
+            "read control-plane RPC magic"
+                | "read control-plane RPC header"
+                | "read control-plane RPC payload"
+        ) && matches!(
+            source.kind(),
+            ErrorKind::TimedOut
+                | ErrorKind::WouldBlock
+                | ErrorKind::UnexpectedEof
+                | ErrorKind::ConnectionReset
+                | ErrorKind::ConnectionAborted
+                | ErrorKind::BrokenPipe
+                | ErrorKind::Interrupted
+                | ErrorKind::NotConnected
         )
     }
 }
@@ -9584,6 +9719,112 @@ mod tests {
         let pg = authority.snapshot().pg(PgId::new(43)).unwrap();
         assert_eq!(pg.peering_metadata_proof_floor(), Some(imported_proof));
         assert_eq!(pg.peering_metadata_transfer(), Some(transfer));
+    }
+
+    #[test]
+    fn unix_control_plane_client_observes_metadata_transfer_install_after_lost_response() {
+        let tmp = test_util::tempdir();
+        let socket_path = tmp.path().join("control-plane.sock");
+        let state_path = tmp.path().join("control-plane.state");
+        let store = FileControlPlaneStore::new(&state_path);
+        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+        for node_id in [1, 2] {
+            authority
+                .set_node_membership(NodeId::new(node_id), NodeMembershipState::Active)
+                .unwrap();
+            assert!(heartbeat_until_serving(&mut authority, node_id, 1_000).serving());
+        }
+        let active_proof = PgMetadataProof::new(9, 10, 11);
+        authority
+            .set_pg_acting_set(PgId::new(43), vec![NodeId::new(1)])
+            .unwrap();
+        heartbeat_with_pg_proof(
+            &mut authority,
+            1,
+            43,
+            PgState::Peering,
+            active_proof,
+            false,
+            2_000,
+        );
+        authority
+            .complete_pg_peering(
+                PgId::new(43),
+                NodeId::new(1),
+                node_incarnation(&authority, 1),
+                2_001,
+            )
+            .unwrap();
+        heartbeat_with_pg_proof(
+            &mut authority,
+            1,
+            43,
+            PgState::Active,
+            active_proof,
+            false,
+            2_002,
+        );
+        let active_epoch = authority.snapshot().cluster_epoch();
+        let expected_transfer_epoch = ClusterEpoch::new(active_epoch.get() + 1).unwrap();
+        let imported_proof = PgMetadataProof::new(9, 12, 11);
+        let transfer = PgMetadataTransferProof::new_with_imported_metadata_proof(
+            active_epoch,
+            active_proof,
+            imported_proof,
+        );
+        let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _addr) = listener.accept().unwrap();
+            let request = read_control_plane_unix_request(&mut stream).unwrap();
+            assert_eq!(
+                request.kind,
+                ControlPlaneRpcKind::SetPgActingSetWithMetadataTransferRuntimeMap
+            );
+            let response = build_control_plane_unix_response(&mut authority, request, 2_003)
+                .expect("metadata-transfer install should apply before response loss");
+            assert_eq!(
+                response.kind,
+                ControlPlaneRpcKind::SetPgActingSetWithMetadataTransferRuntimeMap
+            );
+            drop(response);
+            drop(stream);
+
+            let (mut stream, _addr) = listener.accept().unwrap();
+            let request = read_control_plane_unix_request(&mut stream).unwrap();
+            assert_eq!(request.kind, ControlPlaneRpcKind::RuntimeMapSnapshot);
+            respond_control_plane_unix_request(&mut authority, &mut stream, request, 2_004)
+                .unwrap();
+        });
+
+        let client = UnixControlPlaneClient::new(&socket_path);
+        let runtime_map = client
+            .set_pg_acting_set_with_metadata_transfer_runtime_map_checked(
+                PgId::new(43),
+                vec![NodeId::new(2)],
+                transfer,
+                expected_transfer_epoch,
+            )
+            .unwrap();
+
+        server.join().unwrap();
+        assert_eq!(runtime_map.cluster_epoch(), expected_transfer_epoch);
+        let route = runtime_map
+            .pg_routes()
+            .iter()
+            .find(|route| route.pg_id() == PgId::new(43))
+            .unwrap();
+        assert_eq!(route.cluster_epoch(), expected_transfer_epoch);
+        assert_eq!(route.state(), PgState::Peering);
+        assert_eq!(route.acting_set(), &[NodeId::new(2)]);
+        assert_eq!(route.peering_metadata_transfer(), Some(transfer));
+        assert_eq!(
+            route.peering_metadata_transfer_source_route_epoch(),
+            Some(active_epoch)
+        );
+        assert_eq!(
+            route.peering_metadata_transfer_source_node_id(),
+            Some(NodeId::new(1))
+        );
     }
 
     #[test]
