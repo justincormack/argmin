@@ -10348,6 +10348,13 @@ Phase 12.3 progress:
   dispatches to the target Raft instance, then encodes and decodes the response
   before returning it. This keeps the current tests socket-free while exercising
   the same codec path the later Unix/process peer transport will use.
+- Added an explicit peer-frame identity envelope carrying cluster name, source
+  Raft node id, and target Raft node id. The validating decode path now fails
+  closed on wrong cluster, source, target, or missing identity, and the
+  policy-backed in-process peer transport uses that path for request and
+  response frames, including transfer-leader traffic. This is an identity hook
+  for Phase 12.3; authenticated peer credentials/MACs remain later cutover
+  work.
 
 1. define the replicated control-plane state machine:
    - state includes cluster epoch, PG count, PG state, PG acting sets, node
