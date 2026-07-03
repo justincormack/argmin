@@ -37,8 +37,9 @@ use storage::control_plane_raft::{
     decode_control_plane_raft_peer_request_frame_kind, handle_control_plane_raft_peer_rpc_frame,
     handle_control_plane_raft_peer_snapshot_frame, read_control_plane_raft_peer_transport_frame,
     write_control_plane_raft_peer_transport_frame, ControlPlaneRaftAuthority,
-    ControlPlaneRaftCommandOutcome, ControlPlaneRaftNodeId, ControlPlaneRaftPeerFrameKind,
-    ControlPlaneRaftPeerTransportLimits, ControlPlaneRaftPeerTransportPolicy,
+    ControlPlaneRaftAuthorityStatus, ControlPlaneRaftCommandOutcome, ControlPlaneRaftNodeId,
+    ControlPlaneRaftPeerFrameKind, ControlPlaneRaftPeerTransportLimits,
+    ControlPlaneRaftPeerTransportPolicy,
 };
 use storage::storage_node_server::{
     advance_storage_node_incarnation, StorageNodeControlPlaneRefreshLoop, StorageNodeDataDirGuard,
@@ -1435,7 +1436,44 @@ struct ExperimentalRaftControlPlane {
     authority: Arc<ControlPlaneRaftAuthority>,
     durable_artifact_path: Option<Arc<PathBuf>>,
     durable_checkpoint_lock: Option<Arc<Mutex<()>>>,
+    durable_serving_checkpoint: Mutex<Option<ExperimentalRaftServingCheckpointMarker>>,
+    checkpoint_serving_reads: bool,
     durable_poison: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ExperimentalRaftServingCheckpointMarker {
+    current_leader: Option<ControlPlaneRaftNodeId>,
+    persisted_vote: Option<(u64, ControlPlaneRaftNodeId, bool)>,
+    current_term: Option<u64>,
+    committed: Option<(u64, ControlPlaneRaftNodeId, u64)>,
+    applied: Option<(u64, ControlPlaneRaftNodeId, u64)>,
+}
+
+impl ExperimentalRaftServingCheckpointMarker {
+    fn from_status(status: &ControlPlaneRaftAuthorityStatus) -> Self {
+        Self {
+            current_leader: status.current_leader(),
+            persisted_vote: status
+                .persisted_vote()
+                .map(|vote| (vote.leader_id.term, vote.leader_id.node_id, vote.committed)),
+            current_term: status.current_term(),
+            committed: status.committed().map(|log_id| {
+                (
+                    log_id.leader_id.term,
+                    log_id.leader_id.node_id,
+                    log_id.index(),
+                )
+            }),
+            applied: status.applied().map(|log_id| {
+                (
+                    log_id.leader_id.term,
+                    log_id.leader_id.node_id,
+                    log_id.index(),
+                )
+            }),
+        }
+    }
 }
 
 impl ExperimentalRaftControlPlane {
@@ -1469,6 +1507,43 @@ impl ExperimentalRaftControlPlane {
             path,
             self.durable_checkpoint_lock.as_ref(),
         )
+    }
+
+    fn checkpoint_successful_linearized_read(&self) -> Result<(), ControlPlaneError> {
+        self.ensure_not_durably_poisoned()?;
+        if !self.checkpoint_serving_reads {
+            return Ok(());
+        }
+
+        let status = self.block_on(self.authority.status()).ok();
+        let marker = status
+            .as_ref()
+            .filter(|status| status.linearized_authority_serving())
+            .map(ExperimentalRaftServingCheckpointMarker::from_status);
+        if let Some(marker) = marker {
+            {
+                let checkpointed = self
+                    .durable_serving_checkpoint
+                    .lock()
+                    .expect("experimental OpenRaft serving checkpoint mutex poisoned");
+                if *checkpointed == Some(marker) {
+                    return Ok(());
+                }
+            }
+            self.store_durable_restart_artifact()?;
+            *self
+                .durable_serving_checkpoint
+                .lock()
+                .expect("experimental OpenRaft serving checkpoint mutex poisoned") = Some(marker);
+            return Ok(());
+        }
+
+        self.store_durable_restart_artifact()?;
+        *self
+            .durable_serving_checkpoint
+            .lock()
+            .expect("experimental OpenRaft serving checkpoint mutex poisoned") = None;
+        Ok(())
     }
 
     fn submit_raft_command(
@@ -1524,10 +1599,12 @@ impl ControlPlaneRuntimeMapSource for ExperimentalRaftControlPlane {
         authority_now_ms: u64,
     ) -> Result<ClusterRuntimeMapSnapshot, ControlPlaneError> {
         self.ensure_not_durably_poisoned()?;
-        self.block_on(
+        let snapshot = self.block_on(
             self.authority
                 .linearized_runtime_map_snapshot(authority_now_ms),
-        )
+        )?;
+        self.checkpoint_successful_linearized_read()?;
+        Ok(snapshot)
     }
 }
 
@@ -2152,6 +2229,8 @@ fn run_experimental_raft_control_plane_process(config: &ServerConfig) -> ! {
         authority: Arc::clone(&authority),
         durable_artifact_path: Some(Arc::clone(&durable_artifact_path)),
         durable_checkpoint_lock: Some(Arc::clone(&durable_checkpoint_lock)),
+        durable_serving_checkpoint: Mutex::new(None),
+        checkpoint_serving_reads: multi_node_raft_peer_mode,
         durable_poison: None,
     };
     let should_bootstrap_control_plane_state =
@@ -2392,6 +2471,10 @@ fn spawn_control_plane_rpc_worker(
         let _guard = ControlPlaneRpcWorkerGuard {
             active_rpc_workers: Arc::clone(&active_rpc_workers),
         };
+        if let Err(error) = stream.set_nonblocking(false) {
+            eprintln!("control-plane RPC failed to set blocking mode: {error}");
+            return;
+        }
         if let Err(error) = stream.set_read_timeout(Some(CONTROL_PLANE_RPC_IO_TIMEOUT)) {
             eprintln!("control-plane RPC failed to set read timeout: {error}");
             return;
@@ -3354,6 +3437,8 @@ mod tests {
             authority: Arc::clone(&authority),
             durable_artifact_path: None,
             durable_checkpoint_lock: None,
+            durable_serving_checkpoint: Mutex::new(None),
+            checkpoint_serving_reads: false,
             durable_poison: None,
         };
         ExperimentalRaftTestHarness {
@@ -3423,6 +3508,8 @@ mod tests {
             authority: Arc::clone(&authority),
             durable_artifact_path: Some(Arc::new(state_path.to_path_buf())),
             durable_checkpoint_lock: Some(Arc::new(Mutex::new(()))),
+            durable_serving_checkpoint: Mutex::new(None),
+            checkpoint_serving_reads: false,
             durable_poison: None,
         };
         ExperimentalRaftTestHarness {
@@ -3452,6 +3539,8 @@ mod tests {
             authority: Arc::clone(&harness.authority),
             durable_artifact_path: None,
             durable_checkpoint_lock: None,
+            durable_serving_checkpoint: Mutex::new(None),
+            checkpoint_serving_reads: false,
             durable_poison: None,
         };
         std::thread::spawn(move || {
@@ -3642,6 +3731,8 @@ mod tests {
             authority: Arc::clone(&authority),
             durable_artifact_path: Some(Arc::new(state_path.clone())),
             durable_checkpoint_lock: Some(Arc::new(Mutex::new(()))),
+            durable_serving_checkpoint: Mutex::new(None),
+            checkpoint_serving_reads: false,
             durable_poison: None,
         };
         bootstrap_empty_experimental_raft_control_plane(&mut control_plane, &config)
@@ -3698,6 +3789,8 @@ mod tests {
             authority: Arc::clone(&authority),
             durable_artifact_path: Some(Arc::new(invalid_checkpoint_path)),
             durable_checkpoint_lock: Some(Arc::new(Mutex::new(()))),
+            durable_serving_checkpoint: Mutex::new(None),
+            checkpoint_serving_reads: false,
             durable_poison: None,
         };
         let mut config = test_server_config();

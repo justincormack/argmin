@@ -97,31 +97,32 @@ response. That is safe but expensive. A small fsync'd vote/log WAL remains the
 natural production design, with the full artifact demoted to a compaction
 checkpoint. R3's torn-capture concern is separate and still open.
 
-### R2. HIGH (liveness) — No automatic leader election or leader heartbeats in the production config
+### R2. RESOLVED — No automatic leader election or leader heartbeats in the production config
 
-Leader failure permanently stalls the control plane unless an operator issues
-the experimental election trigger or restarts the seed node. Confirmed.
+Confirmed and fixed for the experimental Unix-peer process path.
 
-- `experimental_raft_config` (`control_plane_raft.rs:2667-2686`) sets
-  `enable_tick/enable_heartbeat/enable_elect` all false; the same config is
-  used by the multi-node constructor `new_experimental_unix_peer_durable`
-  (:2777). No ticks → no election timeouts and no periodic leader heartbeats.
-- The startup election trigger is
-  `maybe_trigger_experimental_raft_seed_election` (main.rs:1658-1680), which
-  runs only on the first-configured peer and only when
-  `current_leader().is_none()`. After a leader crash, followers never observe
-  leader loss, so the condition never fires. A narrow admin path,
-  `control-plane-trigger-raft-election`, can now trigger a surviving node's
-  pre-vote election, wait until it is serving, and checkpoint the resulting
-  vote/term before returning, but that is still explicit operator action, not
-  automatic failover.
-- With `enable_heartbeat=false`, follower committed watermarks advance only
-  on new writes, so follower checkpoints can lag arbitrarily behind cluster
-  commit.
-- Consequence: the Phase 12.3 manual "stop the leader, elect a new leader,
-  commit" smoke now exists, but unattended leader-loss recovery is still not
-  achievable. Read safety is unaffected (ReadIndex does an explicit quorum
-  round); this is availability.
+- The experimental Raft config now has an explicit timer mode. Single-node and
+  deterministic in-memory tests keep manual timers disabled, while
+  `new_experimental_unix_peer_durable` uses automatic timers with OpenRaft
+  tick, heartbeat, and election enabled.
+- The startup seed trigger remains as a deterministic first-leader fast path,
+  but leader loss no longer depends on the explicit
+  `control-plane-trigger-raft-election` admin command. A three-process smoke
+  kills the seed leader, waits for a surviving process to become serving
+  through natural OpenRaft election, commits through that new leader, and
+  verifies follower checkpoint convergence.
+- Natural election also gets the same durability gate as the manual election
+  path: after a successful read-index runtime-map read, the process checkpoints
+  the durable restart artifact before returning the map, even if the node loses
+  leadership before the follow-up status sample. When the node is still
+  serving, the cache marker includes the local serving vote/term and full
+  committed/applied log ids. A node cannot expose a naturally elected
+  linearized authority before its durable restart artifact contains the new
+  committed vote/term.
+
+Residual: this enables timers only for the experimental Unix-peer process
+mode. Deterministic unit/in-process tests intentionally keep manual election
+control to avoid timeout-sensitive test behavior.
 
 ### R3. RESOLVED — Torn checkpoint capture: log store and state machine exported without a barrier
 
@@ -335,12 +336,10 @@ shift.
    is closed. A fsync'd WAL should still replace full-artifact-per-RPC
    durability before production-scale heartbeat and replication traffic.
 2. **DONE — Atomic checkpoint capture + pre-write pair validation (R3).**
-3. **Failover story (R2).** Enable OpenRaft ticks in production config
-   (keeping them disabled in deterministic tests), or extend the manual
-   trigger into an automatic liveness-probe path so every node can elect when
-   the known leader fails for N scan intervals. The explicit
-   kill-leader/manual-elect/commit smoke now exists; the remaining gap is
-   unattended failover and heartbeat-driven follower progress.
+3. **DONE — Failover story (R2).** Unix-peer process mode now enables
+   OpenRaft ticks, heartbeats, and elections while deterministic tests retain
+   manual election control. Process coverage includes abrupt leader loss,
+   natural election, post-failover commit, and follower checkpoint convergence.
 4. **Cheap deterministic time guards (R4).** (a) Re-read the clock after
    acquiring the authority mutex, immediately before constructing each
    command and each runtime-map evaluation. (b) Apply-side monotonic guard:

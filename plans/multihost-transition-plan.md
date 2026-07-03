@@ -10554,6 +10554,16 @@ Phase 12.3 progress:
   committed leader vote, commits a PG acting-set change, and verifies node 103
   checkpoints the command. Timer-driven natural election policy remains open
   12.3 work and should be covered separately from randomized timeout sleeps.
+- Enabled OpenRaft's automatic tick, heartbeat, and election timers for the
+  experimental Unix-peer process authority while keeping single-node and
+  deterministic in-memory tests on manual election control. Added a process
+  smoke that kills the seed leader, waits for a surviving node to become
+  serving through natural election without the admin trigger, commits through
+  the new leader, and verifies follower checkpoint convergence. After a
+  successful read-index runtime-map read, read-only serving now checkpoints a
+  durable restart artifact before returning the map, even if the node loses
+  leadership before the follow-up status sample. When still serving, the cached
+  marker includes the local vote/term and full committed/applied log ids.
 - Closed the immediate Raft peer ack-before-durable safety hole in the
   experimental process boundary. Unix peer workers now read and handle the
   peer request, checkpoint the durable restart artifact, and only then write

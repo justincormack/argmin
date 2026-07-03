@@ -207,6 +207,33 @@ fn run_trigger_raft_election(bin: &Path, socket_path: &Path) -> Output {
         .expect("trigger Raft election helper should run")
 }
 
+fn wait_for_trigger_raft_election(
+    bin: &Path,
+    socket: &Path,
+    test_dir: &Path,
+    children: &mut [&mut ChildGuard],
+) -> Output {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        for child in children.iter_mut() {
+            child.assert_running();
+        }
+        let output = run_trigger_raft_election(bin, socket);
+        if output.status.success() {
+            return output;
+        }
+        if Instant::now() >= deadline {
+            let last_failure = format_admin_failure(output.status, &output);
+            panic!(
+                "control-plane Raft election trigger did not succeed on {}: {last_failure}\n{}",
+                socket.display(),
+                process_logs(test_dir)
+            );
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
 fn wait_for_runtime_map_ready(
     bin: &Path,
     test_dir: &Path,
@@ -678,18 +705,28 @@ fn experimental_raft_triggered_process_election_survives_abrupt_leader_loss() {
 
     node101.stop();
 
-    let candidate_socket = control_socket(test_dir.path(), 102);
-    let election = run_trigger_raft_election(&bin, &candidate_socket);
-    assert!(
-        election.status.success(),
-        "election trigger failed: {}\n{}",
-        format_admin_failure(election.status, &election),
-        process_logs(test_dir.path())
+    let surviving_node_ids = [102, 103];
+    let (candidate_socket, _output) = wait_for_runtime_map_ready(
+        &bin,
+        test_dir.path(),
+        &mut [&mut node102, &mut node103],
+        &surviving_node_ids,
+    );
+    let candidate_id = if candidate_socket == control_socket(test_dir.path(), 102) {
+        102
+    } else {
+        103
+    };
+    wait_for_trigger_raft_election(
+        &bin,
+        &candidate_socket,
+        test_dir.path(),
+        &mut [&mut node102, &mut node103],
     );
     assert!(
-        artifact_has_committed_vote_for_leader(&state_path(test_dir.path(), 102), 102)
-            .expect("node 102 durable artifact should restore after election trigger"),
-        "election trigger returned before checkpointing node 102's committed leader vote\n{}",
+        artifact_has_committed_vote_for_leader(&state_path(test_dir.path(), candidate_id), candidate_id)
+            .expect("candidate durable artifact should restore after election trigger"),
+        "election trigger returned before checkpointing node {candidate_id}'s committed leader vote\n{}",
         process_logs(test_dir.path())
     );
 
@@ -707,11 +744,88 @@ fn experimental_raft_triggered_process_election_survives_abrupt_leader_loss() {
         format_admin_failure(output.status, &output),
         process_logs(test_dir.path())
     );
+    let follower_id = if candidate_id == 102 { 103 } else { 102 };
     wait_for_follower_artifact_pg_acting_set(
-        &state_path(test_dir.path(), 103),
+        &state_path(test_dir.path(), follower_id),
         PgId::new(0),
         &[NodeId::new(1)],
         &mut [&mut node102, &mut node103],
+    );
+}
+
+#[test]
+fn experimental_raft_process_natural_election_survives_abrupt_leader_loss() {
+    let bin = argmin_s3_bin();
+    let test_dir = TestDir::new("experimental-raft-process-natural-election");
+    let cluster_name = format!(
+        "process-natural-election-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after Unix epoch")
+            .as_nanos()
+    );
+    let raft_node_ids = [101, 102, 103];
+    let mut node102 = ChildGuard::spawn(&bin, test_dir.path(), &cluster_name, 102, &raft_node_ids);
+    wait_for_socket_file(&peer_socket(test_dir.path(), 102), &mut node102);
+    let mut node103 = ChildGuard::spawn(&bin, test_dir.path(), &cluster_name, 103, &raft_node_ids);
+    wait_for_socket_file(&peer_socket(test_dir.path(), 103), &mut node103);
+    let mut node101 = ChildGuard::spawn(&bin, test_dir.path(), &cluster_name, 101, &raft_node_ids);
+
+    let old_leader_socket = control_socket(test_dir.path(), 101);
+    wait_for_runtime_map_ready_on(
+        &bin,
+        &old_leader_socket,
+        test_dir.path(),
+        &mut [&mut node101, &mut node102, &mut node103],
+    );
+    wait_for_follower_artifact(
+        &state_path(test_dir.path(), 102),
+        &mut [&mut node101, &mut node102, &mut node103],
+    );
+    wait_for_follower_artifact(
+        &state_path(test_dir.path(), 103),
+        &mut [&mut node101, &mut node102, &mut node103],
+    );
+
+    node101.stop();
+
+    let surviving_node_ids = [102, 103];
+    let (new_leader_socket, _output) = wait_for_runtime_map_ready(
+        &bin,
+        test_dir.path(),
+        &mut [&mut node102, &mut node103],
+        &surviving_node_ids,
+    );
+    let new_leader_id = if new_leader_socket == control_socket(test_dir.path(), 102) {
+        102
+    } else {
+        103
+    };
+    assert!(
+        artifact_has_committed_vote_for_leader(
+            &state_path(test_dir.path(), new_leader_id),
+            new_leader_id,
+        )
+        .expect("new leader durable artifact should restore after natural election"),
+        "natural election served before checkpointing node {new_leader_id}'s committed leader vote\n{}",
+        process_logs(test_dir.path())
+    );
+
+    let output = run_set_pg_acting_set_live(&bin, &new_leader_socket, 0, &[1]);
+    assert!(
+        output.status.success(),
+        "post-natural-election acting-set change failed: {}\n{}",
+        format_admin_failure(output.status, &output),
+        process_logs(test_dir.path())
+    );
+    let follower_id = if new_leader_id == 102 { 103 } else { 102 };
+    let mut children = [&mut node102, &mut node103];
+    wait_for_follower_artifact_pg_acting_set(
+        &state_path(test_dir.path(), follower_id),
+        PgId::new(0),
+        &[NodeId::new(1)],
+        &mut children,
     );
 }
 

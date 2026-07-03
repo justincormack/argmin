@@ -2664,18 +2664,26 @@ impl RaftNetworkV2<ControlPlaneRaftTypeConfig> for ExperimentalSingleNodeRaftNet
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExperimentalRaftTimerMode {
+    Manual,
+    Automatic,
+}
+
 fn experimental_raft_config(
     cluster_name: impl Into<String>,
+    timer_mode: ExperimentalRaftTimerMode,
 ) -> Result<Arc<Config>, ControlPlaneError> {
+    let timers_enabled = matches!(timer_mode, ExperimentalRaftTimerMode::Automatic);
     Ok(Arc::new(
         Config {
             cluster_name: cluster_name.into(),
             heartbeat_interval: 50,
             election_timeout_min: 150,
             election_timeout_max: 300,
-            enable_tick: false,
-            enable_heartbeat: false,
-            enable_elect: false,
+            enable_tick: timers_enabled,
+            enable_heartbeat: timers_enabled,
+            enable_elect: timers_enabled,
             ..Default::default()
         }
         .validate()
@@ -2688,7 +2696,7 @@ fn experimental_raft_config(
 fn experimental_single_node_raft_config(
     cluster_name: impl Into<String>,
 ) -> Result<Arc<Config>, ControlPlaneError> {
-    experimental_raft_config(cluster_name)
+    experimental_raft_config(cluster_name, ExperimentalRaftTimerMode::Manual)
 }
 
 fn restore_experimental_raft_durable_artifact(
@@ -2774,7 +2782,8 @@ impl ControlPlaneRaftAuthority {
         let cluster_name = cluster_name.into();
         peer_policy.validate_cluster_name(&cluster_name)?;
         peer_policy.validate_local_node(node_id)?;
-        let config = experimental_raft_config(cluster_name.clone())?;
+        let config =
+            experimental_raft_config(cluster_name.clone(), ExperimentalRaftTimerMode::Automatic)?;
         let policy_for_restore = peer_policy.clone();
         let (log_store, state_machine) = restore_experimental_raft_durable_artifact(
             &cluster_name,
