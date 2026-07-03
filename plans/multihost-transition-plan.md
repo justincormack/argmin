@@ -10492,6 +10492,19 @@ Phase 12.3 progress:
   catches up and checkpoints the post-transfer command. Natural leader election
   after abrupt leader loss and snapshot-transfer process coverage remain open
   12.3 work.
+- Added process-level snapshot-transfer catch-up coverage for the Unix-peer
+  Raft control-plane path. A narrow experimental admin request,
+  `control-plane-trigger-raft-snapshot-purge`, now forces the current leader to
+  build a snapshot at its applied tip, purge the retained log prefix through the
+  snapshot boundary, and durably checkpoint the resulting restart artifact; the
+  authority boundary rejects the request on non-serving followers so an admin
+  call cannot compact a local follower behind the serving leader. The
+  process smoke stops one follower before a committed command, snapshots and
+  purges that command on the leader, restarts the stale follower, submits a
+  suffix command to trigger catch-up, and verifies the restarted follower's
+  durable artifact contains both the suffix state and an installed cached
+  snapshot at or beyond the purged boundary. Natural leader election after
+  abrupt leader loss remains open 12.3 work.
 
 1. define the replicated control-plane state machine:
    - state includes cluster epoch, PG count, PG state, PG acting sets, node

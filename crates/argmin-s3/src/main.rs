@@ -388,6 +388,37 @@ fn maybe_run_control_plane_admin_command() -> Option<i32> {
         };
     }
 
+    if command == "control-plane-trigger-raft-snapshot-purge" {
+        let Some(path) = args.next() else {
+            eprintln!(
+                "usage: argmin-s3 {} <socket-path>",
+                command.to_string_lossy()
+            );
+            return Some(2);
+        };
+        if args.next().is_some() {
+            eprintln!(
+                "usage: argmin-s3 {} <socket-path>",
+                command.to_string_lossy()
+            );
+            return Some(2);
+        }
+        return match trigger_control_plane_raft_snapshot_and_purge(Path::new(&path)) {
+            Ok(Some(snapshot_index)) => {
+                println!("{snapshot_index}");
+                Some(0)
+            }
+            Ok(None) => {
+                println!("-");
+                Some(0)
+            }
+            Err(error) => {
+                eprintln!("{error}");
+                Some(1)
+            }
+        };
+    }
+
     if command == "control-plane-set-pg-acting-set-with-metadata-transfer-live" {
         let Some(path) = args.next() else {
             eprintln!(
@@ -669,6 +700,14 @@ fn transfer_control_plane_raft_leadership(
     UnixControlPlaneClient::new(socket_path)
         .transfer_raft_leadership_to(node_id)
         .map_err(|error| format!("failed to transfer control-plane Raft leadership: {error}"))
+}
+
+fn trigger_control_plane_raft_snapshot_and_purge(
+    socket_path: &Path,
+) -> Result<Option<u64>, String> {
+    UnixControlPlaneClient::new(socket_path)
+        .trigger_raft_snapshot_and_purge()
+        .map_err(|error| format!("failed to trigger control-plane Raft snapshot purge: {error}"))
 }
 
 fn fence_control_plane_pg_for_metadata_transfer_live(
@@ -1557,6 +1596,19 @@ impl ControlPlaneAdmin for ExperimentalRaftControlPlane {
     ) -> Result<(), ControlPlaneError> {
         self.ensure_not_durably_poisoned()?;
         self.block_on(self.authority.transfer_leadership_to(node_id))
+    }
+
+    fn trigger_raft_snapshot_and_purge(&mut self) -> Result<Option<u64>, ControlPlaneError> {
+        self.ensure_not_durably_poisoned()?;
+        let snapshot_log_id = self.block_on(self.authority.trigger_snapshot_and_purge_applied())?;
+        if let Err(error) = self.store_durable_restart_artifact() {
+            self.durable_poison = Some(format!(
+                "experimental OpenRaft control-plane durability checkpoint failed after a \
+                 snapshot purge; refusing to serve until restart: {error}"
+            ));
+            return Err(error);
+        }
+        Ok(snapshot_log_id.map(|log_id| log_id.index()))
     }
 }
 

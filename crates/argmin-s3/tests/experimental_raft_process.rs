@@ -186,6 +186,14 @@ fn run_transfer_raft_leadership(bin: &Path, socket_path: &Path, node_id: u64) ->
         .expect("transfer Raft leadership helper should run")
 }
 
+fn run_trigger_raft_snapshot_purge(bin: &Path, socket_path: &Path) -> Output {
+    Command::new(bin)
+        .arg("control-plane-trigger-raft-snapshot-purge")
+        .arg(socket_path)
+        .output()
+        .expect("trigger Raft snapshot purge helper should run")
+}
+
 fn wait_for_runtime_map_ready(
     bin: &Path,
     test_dir: &Path,
@@ -298,6 +306,34 @@ fn follower_artifact_pg_has_acting_set(
     Ok(pg.acting_set() == acting_set)
 }
 
+fn follower_artifact_pg_has_acting_set_and_snapshot_index_at_least(
+    path: &Path,
+    pg_id: PgId,
+    acting_set: &[NodeId],
+    min_snapshot_index: u64,
+) -> Result<bool, String> {
+    let artifact = match ControlPlaneRaftRestartArtifact::load_durable_artifact(path) {
+        Ok(artifact) => artifact,
+        Err(error) => return Err(error.to_string()),
+    };
+    let (_log_store, state_machine) = artifact.restore().map_err(|error| error.to_string())?;
+    let snapshot_index = state_machine
+        .current_snapshot()
+        .and_then(|snapshot| snapshot.meta.last_log_id)
+        .map(|log_id| log_id.index());
+    let Some(snapshot_index) = snapshot_index else {
+        return Ok(false);
+    };
+    if snapshot_index < min_snapshot_index {
+        return Ok(false);
+    }
+    let snapshot = state_machine.inner().snapshot();
+    let Some(pg) = snapshot.pg(pg_id) else {
+        return Ok(false);
+    };
+    Ok(pg.acting_set() == acting_set)
+}
+
 fn wait_for_follower_artifact(path: &Path, children: &mut [&mut ChildGuard]) {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
@@ -337,6 +373,43 @@ fn wait_for_follower_artifact_pg_acting_set(
                 "follower durable artifact did not contain PG {} acting set {:?}: {last_error}",
                 pg_id.get(),
                 acting_set
+            );
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn wait_for_follower_artifact_pg_acting_set_from_snapshot(
+    path: &Path,
+    pg_id: PgId,
+    acting_set: &[NodeId],
+    min_snapshot_index: u64,
+    children: &mut [&mut ChildGuard],
+) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        for child in children.iter_mut() {
+            child.assert_running();
+        }
+        let last_error = match follower_artifact_pg_has_acting_set_and_snapshot_index_at_least(
+            path,
+            pg_id,
+            acting_set,
+            min_snapshot_index,
+        ) {
+            Ok(true) => return,
+            Ok(false) => {
+                "artifact restored but did not contain expected PG acting set from snapshot"
+                    .to_string()
+            }
+            Err(error) => error,
+        };
+        if Instant::now() >= deadline {
+            panic!(
+                "follower durable artifact did not contain PG {} acting set {:?} with snapshot index at least {}: {last_error}",
+                pg_id.get(),
+                acting_set,
+                min_snapshot_index
             );
         }
         thread::sleep(Duration::from_millis(50));
@@ -538,5 +611,84 @@ fn experimental_raft_transferred_process_leader_survives_old_leader_loss() {
         PgId::new(0),
         &[NodeId::new(1)],
         &mut [&mut restarted101, &mut node102, &mut node103],
+    );
+}
+
+#[test]
+fn experimental_raft_restarted_process_follower_catches_up_from_leader_snapshot() {
+    let bin = argmin_s3_bin();
+    let test_dir = TestDir::new("experimental-raft-process-snapshot-catchup");
+    let cluster_name = format!(
+        "process-snapshot-catchup-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after Unix epoch")
+            .as_nanos()
+    );
+    let raft_node_ids = [101, 102, 103];
+    let mut node102 = ChildGuard::spawn(&bin, test_dir.path(), &cluster_name, 102, &raft_node_ids);
+    wait_for_socket_file(&peer_socket(test_dir.path(), 102), &mut node102);
+    let mut node103 = ChildGuard::spawn(&bin, test_dir.path(), &cluster_name, 103, &raft_node_ids);
+    wait_for_socket_file(&peer_socket(test_dir.path(), 103), &mut node103);
+    let mut node101 = ChildGuard::spawn(&bin, test_dir.path(), &cluster_name, 101, &raft_node_ids);
+    let leader_control_socket = control_socket(test_dir.path(), 101);
+
+    wait_for_runtime_map_ready_on(
+        &bin,
+        &leader_control_socket,
+        test_dir.path(),
+        &mut [&mut node101, &mut node102, &mut node103],
+    );
+    wait_for_follower_artifact(
+        &state_path(test_dir.path(), 103),
+        &mut [&mut node101, &mut node102, &mut node103],
+    );
+
+    node103.stop();
+    let snapshot_covered_write = run_set_pg_acting_set_live(&bin, &leader_control_socket, 0, &[1]);
+    assert!(
+        snapshot_covered_write.status.success(),
+        "snapshot-covered acting-set change failed: {}\n{}",
+        format_admin_failure(snapshot_covered_write.status, &snapshot_covered_write),
+        process_logs(test_dir.path())
+    );
+    wait_for_follower_artifact_pg_acting_set(
+        &state_path(test_dir.path(), 102),
+        PgId::new(0),
+        &[NodeId::new(1)],
+        &mut [&mut node101, &mut node102],
+    );
+
+    let snapshot_purge = run_trigger_raft_snapshot_purge(&bin, &leader_control_socket);
+    assert!(
+        snapshot_purge.status.success(),
+        "snapshot purge failed: {}\n{}",
+        format_admin_failure(snapshot_purge.status, &snapshot_purge),
+        process_logs(test_dir.path())
+    );
+    let snapshot_index: u64 = String::from_utf8_lossy(&snapshot_purge.stdout)
+        .trim()
+        .parse()
+        .expect("snapshot purge helper should report a snapshot index");
+
+    let mut restarted103 =
+        ChildGuard::spawn(&bin, test_dir.path(), &cluster_name, 103, &raft_node_ids);
+    wait_for_socket_file(&peer_socket(test_dir.path(), 103), &mut restarted103);
+
+    let suffix_write = run_set_pg_acting_set_live(&bin, &leader_control_socket, 0, &[0]);
+    assert!(
+        suffix_write.status.success(),
+        "post-snapshot suffix acting-set change failed: {}\n{}",
+        format_admin_failure(suffix_write.status, &suffix_write),
+        process_logs(test_dir.path())
+    );
+
+    wait_for_follower_artifact_pg_acting_set_from_snapshot(
+        &state_path(test_dir.path(), 103),
+        PgId::new(0),
+        &[NodeId::new(0)],
+        snapshot_index,
+        &mut [&mut node101, &mut node102, &mut restarted103],
     );
 }

@@ -22,6 +22,7 @@ const CONTROL_PLANE_RPC_MAGIC: &[u8] = b"argmin-control-plane-rpc";
 const CONTROL_PLANE_RPC_MAX_PAYLOAD_LEN: usize = 8 * 1024 * 1024;
 const CONTROL_PLANE_RPC_IO_TIMEOUT: Duration = Duration::from_secs(1);
 const CONTROL_PLANE_RPC_LEADERSHIP_TRANSFER_TIMEOUT: Duration = Duration::from_secs(5);
+const CONTROL_PLANE_RPC_SNAPSHOT_PURGE_TIMEOUT: Duration = Duration::from_secs(15);
 const CONTROL_PLANE_RPC_READ_ONLY_RETRY_DEADLINE: Duration = Duration::from_secs(10);
 const CONTROL_PLANE_RPC_READ_ONLY_RETRY_BACKOFF: Duration = Duration::from_millis(50);
 const CONTROL_PLANE_RPC_CHECK_APPLIED_DEADLINE: Duration = Duration::from_secs(20);
@@ -3098,6 +3099,13 @@ pub trait ControlPlaneAdmin {
                 .to_owned(),
         })
     }
+
+    fn trigger_raft_snapshot_and_purge(&mut self) -> Result<Option<u64>, ControlPlaneError> {
+        Err(ControlPlaneError::RpcRemote {
+            message: "control-plane Raft snapshot trigger is not supported by this authority"
+                .to_owned(),
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4515,6 +4523,18 @@ impl UnixControlPlaneClient {
         reader.finish()?;
         Ok(())
     }
+
+    pub fn trigger_raft_snapshot_and_purge(&self) -> Result<Option<u64>, ControlPlaneError> {
+        let payload = self.send_request_with_read_timeout(
+            ControlPlaneRpcKind::TriggerRaftSnapshotAndPurge,
+            &[],
+            CONTROL_PLANE_RPC_SNAPSHOT_PURGE_TIMEOUT,
+        )?;
+        let mut reader = PayloadReader::new(&payload);
+        let snapshot_index = reader.read_option_u64()?;
+        reader.finish()?;
+        Ok(snapshot_index)
+    }
 }
 
 impl ControlPlaneRuntimeMapSource for UnixControlPlaneClient {
@@ -4772,6 +4792,18 @@ where
                 Err(error) => Err(error),
             }
         }
+        ControlPlaneRpcKind::TriggerRaftSnapshotAndPurge => {
+            let reader = PayloadReader::new(&payload);
+            reader.finish()?;
+            match control_plane.trigger_raft_snapshot_and_purge() {
+                Ok(snapshot_index) => {
+                    let mut response = Vec::new();
+                    write_option_u64(&mut response, snapshot_index);
+                    Ok(response)
+                }
+                Err(error) => Err(error),
+            }
+        }
     };
     let payload = encode_control_plane_rpc_response(response)?;
     Ok(ControlPlaneRpcResponse { kind, payload })
@@ -4808,6 +4840,7 @@ enum ControlPlaneRpcKind {
     FencePgForMetadataTransferRuntimeMap = 7,
     TransferRaftLeadership = 8,
     PgRuntimeMapSnapshot = 9,
+    TriggerRaftSnapshotAndPurge = 10,
 }
 
 impl ControlPlaneRpcKind {
@@ -4822,6 +4855,7 @@ impl ControlPlaneRpcKind {
             7 => Ok(Self::FencePgForMetadataTransferRuntimeMap),
             8 => Ok(Self::TransferRaftLeadership),
             9 => Ok(Self::PgRuntimeMapSnapshot),
+            10 => Ok(Self::TriggerRaftSnapshotAndPurge),
             _ => Err(ControlPlaneError::RpcProtocol {
                 message: format!("unknown control-plane RPC kind {value}"),
             }),

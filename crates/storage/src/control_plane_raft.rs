@@ -2890,6 +2890,86 @@ impl ControlPlaneRaftAuthority {
             .map_err(|error| openraft_remote_error("transfer-leader", error))
     }
 
+    pub async fn trigger_snapshot_and_purge_applied(
+        &self,
+    ) -> Result<Option<LogIdOf<ControlPlaneRaftTypeConfig>>, ControlPlaneError> {
+        let status = self.status().await?;
+        if !status.linearized_authority_serving() {
+            return Err(ControlPlaneError::RpcRemote {
+                message: format!(
+                    "OpenRaft snapshot purge requires the current serving authority; node {} is {:?}",
+                    status.node_id(),
+                    status.linearized_authority_readiness()
+                ),
+            });
+        }
+        let Some(applied) = self
+            .raft
+            .with_state_machine(|state_machine| {
+                let applied = state_machine.last_applied();
+                Box::pin(async move { applied })
+            })
+            .await
+            .map_err(|error| openraft_remote_error("snapshot-purge applied read", error))?
+        else {
+            return Ok(None);
+        };
+        let mut snapshot_progress = self.raft.watch_snapshot_progress();
+        self.raft
+            .trigger()
+            .snapshot()
+            .await
+            .map_err(|error| openraft_remote_error("trigger snapshot", error))?;
+        snapshot_progress
+            .wait_until_ge(&Some(applied))
+            .await
+            .map_err(|error| openraft_remote_error("wait snapshot progress", error))?;
+        let snapshot = self
+            .raft
+            .get_snapshot()
+            .await
+            .map_err(|error| openraft_remote_error("get snapshot after trigger", error))?
+            .ok_or_else(|| ControlPlaneError::RpcRemote {
+                message: "OpenRaft snapshot trigger completed without a current snapshot"
+                    .to_string(),
+            })?;
+        let snapshot_log_id =
+            snapshot
+                .meta
+                .last_log_id
+                .ok_or_else(|| ControlPlaneError::RpcRemote {
+                    message: "OpenRaft snapshot trigger produced an empty snapshot".to_string(),
+                })?;
+        self.raft
+            .trigger()
+            .purge_log(snapshot_log_id.index())
+            .await
+            .map_err(|error| openraft_remote_error("trigger snapshot log purge", error))?;
+        if let Some(log_store) = &self.log_store {
+            ControlPlaneRaftTypeConfig::timeout(Duration::from_secs(10), async {
+                loop {
+                    match log_store.last_purged_log_id() {
+                        Ok(Some(purged)) if purged == snapshot_log_id => return Ok(()),
+                        Ok(_) => ControlPlaneRaftTypeConfig::sleep(Duration::from_millis(10)).await,
+                        Err(error) => {
+                            return Err(openraft_remote_error(
+                                "snapshot purge log-store read",
+                                error,
+                            ));
+                        }
+                    }
+                }
+            })
+            .await
+            .map_err(|_| ControlPlaneError::RpcRemote {
+                message: format!(
+                    "OpenRaft snapshot purge did not reach {snapshot_log_id:?} before timeout"
+                ),
+            })??;
+        }
+        Ok(Some(snapshot_log_id))
+    }
+
     pub async fn wait_for_applied_index_at_least(
         &self,
         index: u64,
@@ -11569,6 +11649,66 @@ mod tests {
                 .unwrap();
             assert_eq!(follower_state.0, Some(write.log_id()));
             assert_eq!(follower_state.1, vec![NodeId::new(101), NodeId::new(102)]);
+
+            authority1.shutdown().await.unwrap();
+            authority2.shutdown().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn control_plane_openraft_snapshot_purge_requires_serving_authority() {
+        ControlPlaneRaftTypeConfig::run(async {
+            let (authority1, authority2) = initialized_two_node_authorities(
+                "control-plane-raft-snapshot-purge-serving-test",
+                111,
+                112,
+            )
+            .await;
+
+            let write = authority1
+                .submit_control_plane_command(ControlPlaneCommand::BootstrapInitialClusterMap {
+                    nodes: vec![
+                        (NodeId::new(111), "node-111".to_string()),
+                        (NodeId::new(112), "node-112".to_string()),
+                    ],
+                    pg_ids: vec![PgId::new(0)],
+                })
+                .await
+                .unwrap();
+            assert!(matches!(
+                write.outcome(),
+                ControlPlaneRaftCommandOutcome::Applied(
+                    ControlPlaneCommandResponse::BootstrapInitialClusterMap
+                )
+            ));
+            authority2
+                .wait_for_applied_log_id(
+                    write.log_id(),
+                    Duration::from_secs(1),
+                    "snapshot-purge follower applied bootstrap before rejection",
+                )
+                .await
+                .unwrap();
+
+            let follower_error = authority2
+                .trigger_snapshot_and_purge_applied()
+                .await
+                .unwrap_err();
+            assert!(matches!(
+                follower_error,
+                ControlPlaneError::RpcRemote { message }
+                    if message.contains("requires the current serving authority")
+                        && message.contains("NotLocalLeader")
+            ));
+
+            assert_eq!(
+                authority1
+                    .trigger_snapshot_and_purge_applied()
+                    .await
+                    .unwrap()
+                    .map(|log_id| log_id.index()),
+                Some(write.log_id().index())
+            );
 
             authority1.shutdown().await.unwrap();
             authority2.shutdown().await.unwrap();
