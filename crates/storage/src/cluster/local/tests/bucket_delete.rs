@@ -4306,6 +4306,112 @@ fn begin_bucket_delete_adopts_reservation_wait_phase_without_repeating_initial_s
 }
 
 #[test]
+fn begin_bucket_delete_adopts_post_reservation_phase_after_budget_exhaustion() {
+    let _serial = lock_bucket_scoped_hook_test();
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let pg_ids: Vec<u32> = (0..32).collect();
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &pg_ids, ec_shape).unwrap();
+    let bucket = {
+        let topology = map
+            .nodes
+            .get(&NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        bucket_for_pg(topology, 1, "delete-post-reservation-budget-adopt-")
+    };
+    set_route_primary(&mut map, 1, NodeId::new(1));
+
+    let map = Arc::new(map);
+    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    create_test_bucket(&cluster, &bucket);
+
+    let stage = Arc::new(AtomicUsize::new(0));
+    let post_reservation_retry_seen = Arc::new(AtomicBool::new(false));
+    let stage_for_hook = Arc::clone(&stage);
+    let post_reservation_retry_seen_for_hook = Arc::clone(&post_reservation_retry_seen);
+    let _progress_hook_guard = cluster.test_install_after_bucket_delete_exact_drain_progress_hook(
+        Arc::new(move |phase, next_object_pg_id| {
+            match (stage_for_hook.load(Ordering::SeqCst), phase) {
+                (0, crate::BucketDeleteAttemptPhase::PostReservationObjectDrain)
+                    if next_object_pg_id > 0 =>
+                {
+                    stage_for_hook.store(1, Ordering::SeqCst);
+                    return Err(StoreError::MetadataCommandContention {
+                        context: "bucket delete exact-bucket drain budget exhausted",
+                    });
+                }
+                (1, crate::BucketDeleteAttemptPhase::Initial) => {
+                    return Err(StoreError::Io {
+                        context: "unexpected initial exact-bucket drain after post-reservation budget exhaustion",
+                        source: std::io::Error::other(format!(
+                            "next_object_pg_id={next_object_pg_id}"
+                        )),
+                    });
+                }
+                (1, crate::BucketDeleteAttemptPhase::PostReservationObjectDrain) => {
+                    post_reservation_retry_seen_for_hook.store(true, Ordering::SeqCst);
+                }
+                _ => {}
+            }
+            Ok(())
+        }),
+    );
+
+    let first_err = cluster.begin_bucket_delete(&bucket).unwrap_err();
+    assert!(
+        matches!(
+            first_err,
+            crate::BucketWriteDrainError::Store(StoreError::MetadataCommandContention {
+                context: "bucket delete exact-bucket drain budget exhausted"
+            })
+        ),
+        "first DeleteBucket should preserve the post-reservation budget failure, got {first_err:?}"
+    );
+
+    let bucket_pg = map
+        .node(NodeId::new(1))
+        .unwrap()
+        .storage_node()
+        .get_pg(1)
+        .unwrap();
+    let first_outcome = crate::PgMetadataStore::bucket_delete_attempt_outcome(&*bucket_pg, &bucket)
+        .unwrap()
+        .expect("budget failure should record a retryable attempt outcome");
+    assert_eq!(
+        first_outcome.outcome,
+        crate::BucketDeleteAttemptOutcomeKind::Retryable
+    );
+    assert_eq!(
+        first_outcome.phase,
+        crate::BucketDeleteAttemptPhase::PostReservationObjectDrain
+    );
+    assert!(
+        first_outcome
+            .post_reservation_next_object_pg_id
+            .is_some_and(|next| next > 0),
+        "post-reservation progress should be retained, got {first_outcome:?}"
+    );
+    drop(bucket_pg);
+
+    cluster.begin_bucket_delete(&bucket).unwrap();
+    assert!(
+        post_reservation_retry_seen.load(Ordering::SeqCst),
+        "retry should resume at post-reservation object drain"
+    );
+    let bucket_pg = map
+        .node(NodeId::new(1))
+        .unwrap()
+        .storage_node()
+        .get_pg(1)
+        .unwrap();
+    let info = crate::PgMetadataStore::head_bucket_raw(&*bucket_pg, &bucket).unwrap();
+    assert_eq!(info.state, crate::BucketState::Deleting);
+}
+
+#[test]
 fn begin_bucket_delete_adopted_attempt_clears_drain_on_bucket_not_empty() {
     let _serial = lock_bucket_scoped_hook_test();
     let tmp = test_util::tempdir();

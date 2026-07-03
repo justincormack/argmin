@@ -9220,7 +9220,19 @@ Keep an explicit Phase 11 close-out before treating the phase as soak-clean:
          back as `BucketNotEmpty`; a storage regression holds a reservation,
          verifies the durable blocker detail, releases the reservation, and
          proves the same preserved attempt is adopted and reaches
-         `MarkBucketDeleting`. Remaining
+         `MarkBucketDeleting`. A later route-change-full-restart failure at
+         `8e70c095` showed that budget exhaustion after reservation wait could
+         still lose the useful phase: the post-reservation exact-bucket scan hit
+         the begin budget, the loop immediately retried once more, and the
+         durable outcome was overwritten as `initial`. DeleteBucket now treats
+         exact-bucket drain budget exhaustion as a retryable handoff point
+         without spinning into a fresh loop iteration, records
+         `post_reservation_object_drain` as an adoptable phase, and lets later
+         same-generation foreground/background attempts skip the completed
+         initial scan, stream cleanup, and reservation wait before resuming the
+         post-reservation object-PG proof. A storage regression injects this
+         budget-exhausted context during post-reservation progress and fails if
+         the retry re-enters the initial exact-bucket drain. Remaining
          work is to see from soak whether persistent reservation blockers now
          identify a real stuck write path that needs help/cleanup, or whether
          this closes the generic retryable-pressure failure mode.

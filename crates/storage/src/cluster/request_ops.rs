@@ -46,6 +46,8 @@ const BUCKET_DELETE_EXACT_BUCKET_PENDING_PROBE_PARALLELISM: usize = 8;
 const COMPLETED_MULTIPART_CLEANUP_WORK_BUDGET_MILLIS: u64 = 10_000;
 const BUCKET_DELETE_RESERVATION_DRAIN_WAIT_MILLIS: u64 = 1_000;
 const BUCKET_DELETE_DRAIN_LEASE_MILLIS: u64 = BUCKET_DELETE_BEGIN_WORK_BUDGET_MILLIS + 5_000;
+const BUCKET_DELETE_EXACT_BUCKET_DRAIN_BUDGET_EXHAUSTED_CONTEXT: &str =
+    "bucket delete exact-bucket drain budget exhausted";
 const BUCKET_DELETE_RESERVATION_WAIT_BLOCKED_CONTEXT: &str =
     "bucket delete reservation wait blocked by durable bucket write reservation";
 const LIFECYCLE_SWEEP_ROOT_SCAN_LIMIT_PER_PG: usize = 1_024;
@@ -3448,7 +3450,7 @@ impl super::StorageCluster {
             self.check_bucket_delete_begin_work_budget(
                 bucket,
                 started,
-                "bucket delete exact-bucket drain budget exhausted",
+                BUCKET_DELETE_EXACT_BUCKET_DRAIN_BUDGET_EXHAUSTED_CONTEXT,
             )?;
             if let Some(started) = started {
                 Self::emit_bucket_delete_begin_loop_step(
@@ -3488,7 +3490,7 @@ impl super::StorageCluster {
                 self.check_bucket_delete_begin_work_budget(
                     bucket,
                     started,
-                    "bucket delete exact-bucket drain budget exhausted",
+                    BUCKET_DELETE_EXACT_BUCKET_DRAIN_BUDGET_EXHAUSTED_CONTEXT,
                 )?;
                 if let Some(started) = started {
                     Self::emit_bucket_delete_begin_loop_step(
@@ -3540,7 +3542,7 @@ impl super::StorageCluster {
         self.check_bucket_delete_begin_work_budget(
             bucket,
             started,
-            "bucket delete exact-bucket drain budget exhausted",
+            BUCKET_DELETE_EXACT_BUCKET_DRAIN_BUDGET_EXHAUSTED_CONTEXT,
         )?;
         if let Some(started) = started {
             Self::emit_bucket_delete_begin_loop_step(
@@ -3658,7 +3660,7 @@ impl super::StorageCluster {
         self.check_bucket_delete_begin_work_budget(
             bucket,
             started,
-            "bucket delete exact-bucket drain budget exhausted",
+            BUCKET_DELETE_EXACT_BUCKET_DRAIN_BUDGET_EXHAUSTED_CONTEXT,
         )?;
         Ok(exact_pending)
     }
@@ -4254,6 +4256,16 @@ impl super::StorageCluster {
                 record.outcome == BucketDeleteAttemptOutcomeKind::Retryable
                     && record.phase == BucketDeleteAttemptPhase::ReservationWait
             });
+        let mut can_resume_at_post_reservation_object_drain = self
+            .bucket_delete_matching_attempt_outcome(
+                node_store.bucket_write_reservation_client().as_ref(),
+                pg_id,
+                &durable_drain,
+            )?
+            .is_some_and(|record| {
+                record.outcome == BucketDeleteAttemptOutcomeKind::Retryable
+                    && record.phase == BucketDeleteAttemptPhase::PostReservationObjectDrain
+            });
         let result = (|| loop {
             loop_iteration += 1;
             attempt_phase = BucketDeleteAttemptPhase::Initial;
@@ -4296,6 +4308,7 @@ impl super::StorageCluster {
                 can_resume_at_final_visibility = false;
                 can_resume_at_stream_cleanup = false;
                 can_resume_at_reservation_wait = false;
+                can_resume_at_post_reservation_object_drain = false;
                 if self
                     .drain_unrelated_pending_metadata_command_for_bucket_with_work_budget(
                         pg_id,
@@ -4477,6 +4490,12 @@ impl super::StorageCluster {
                                 }),
                             ) {
                             Ok(()) => {}
+                            Err(error @ BucketWriteDrainError::Store(
+                                StoreError::MetadataCommandContention {
+                                    context:
+                                        BUCKET_DELETE_EXACT_BUCKET_DRAIN_BUDGET_EXHAUSTED_CONTEXT,
+                                },
+                            )) => return Err(error),
                             Err(BucketWriteDrainError::Store(
                                 StoreError::MetadataCommandContention { .. },
                             )) => {
@@ -4529,7 +4548,15 @@ impl super::StorageCluster {
                             format!("iteration={loop_iteration}"),
                         );
                     } else {
-                        if can_resume_at_reservation_wait {
+                        if can_resume_at_post_reservation_object_drain {
+                            Self::emit_bucket_delete_begin_loop_step(
+                                bucket,
+                                pg_id,
+                                started,
+                                "resume_post_reservation_object_drain",
+                                format!("iteration={loop_iteration}"),
+                            );
+                        } else if can_resume_at_reservation_wait {
                             Self::emit_bucket_delete_begin_loop_step(
                                 bucket,
                                 pg_id,
@@ -4570,6 +4597,12 @@ impl super::StorageCluster {
                                     }),
                                 ) {
                                 Ok(()) => {}
+                                Err(error @ BucketWriteDrainError::Store(
+                                    StoreError::MetadataCommandContention {
+                                        context:
+                                            BUCKET_DELETE_EXACT_BUCKET_DRAIN_BUDGET_EXHAUSTED_CONTEXT,
+                                    },
+                                )) => return Err(error),
                                 Err(BucketWriteDrainError::Store(
                                     StoreError::MetadataCommandContention { .. },
                                 )) => {
@@ -4626,7 +4659,9 @@ impl super::StorageCluster {
                                 continue;
                             }
                         }
-                        if !can_resume_at_reservation_wait {
+                        if !can_resume_at_post_reservation_object_drain
+                            && !can_resume_at_reservation_wait
+                        {
                             attempt_phase = BucketDeleteAttemptPhase::StreamCleanup;
                             Self::emit_bucket_delete_begin_loop_step(
                                 bucket,
@@ -4714,44 +4749,46 @@ impl super::StorageCluster {
                             )
                             .map_err(BucketWriteDrainError::from)?;
                         }
-                        Self::emit_bucket_delete_begin_loop_step(
-                            bucket,
-                            pg_id,
-                            started,
-                            "wait_reservations_empty_start",
-                            format!("iteration={loop_iteration}"),
-                        );
-                        attempt_phase = BucketDeleteAttemptPhase::ReservationWait;
-                        Self::emit_bucket_delete_begin_loop_step(
-                            bucket,
-                            pg_id,
-                            started,
-                            "heartbeat_before_reservation_wait_start",
-                            format!("iteration={loop_iteration}"),
-                        );
-                        durable_drain =
-                            self.heartbeat_durable_bucket_delete_drain(&durable_drain)?;
-                        Self::emit_bucket_delete_begin_loop_step(
-                            bucket,
-                            pg_id,
-                            started,
-                            "heartbeat_before_reservation_wait_done",
-                            format!("iteration={loop_iteration}"),
-                        );
-                        self.wait_for_durable_bucket_write_reservations_empty(
-                            bucket,
-                            node_store.bucket_write_reservation_client().as_ref(),
-                            &durable_drain,
-                            started,
-                            &mut work_budget,
-                        )?;
-                        Self::emit_bucket_delete_begin_loop_step(
-                            bucket,
-                            pg_id,
-                            started,
-                            "wait_reservations_empty_done",
-                            format!("iteration={loop_iteration}"),
-                        );
+                        if !can_resume_at_post_reservation_object_drain {
+                            Self::emit_bucket_delete_begin_loop_step(
+                                bucket,
+                                pg_id,
+                                started,
+                                "wait_reservations_empty_start",
+                                format!("iteration={loop_iteration}"),
+                            );
+                            attempt_phase = BucketDeleteAttemptPhase::ReservationWait;
+                            Self::emit_bucket_delete_begin_loop_step(
+                                bucket,
+                                pg_id,
+                                started,
+                                "heartbeat_before_reservation_wait_start",
+                                format!("iteration={loop_iteration}"),
+                            );
+                            durable_drain =
+                                self.heartbeat_durable_bucket_delete_drain(&durable_drain)?;
+                            Self::emit_bucket_delete_begin_loop_step(
+                                bucket,
+                                pg_id,
+                                started,
+                                "heartbeat_before_reservation_wait_done",
+                                format!("iteration={loop_iteration}"),
+                            );
+                            self.wait_for_durable_bucket_write_reservations_empty(
+                                bucket,
+                                node_store.bucket_write_reservation_client().as_ref(),
+                                &durable_drain,
+                                started,
+                                &mut work_budget,
+                            )?;
+                            Self::emit_bucket_delete_begin_loop_step(
+                                bucket,
+                                pg_id,
+                                started,
+                                "wait_reservations_empty_done",
+                                format!("iteration={loop_iteration}"),
+                            );
+                        }
                         Self::emit_bucket_delete_begin_loop_step(
                             bucket,
                             pg_id,
@@ -4775,6 +4812,12 @@ impl super::StorageCluster {
                                 }),
                             ) {
                             Ok(()) => {}
+                            Err(error @ BucketWriteDrainError::Store(
+                                StoreError::MetadataCommandContention {
+                                    context:
+                                        BUCKET_DELETE_EXACT_BUCKET_DRAIN_BUDGET_EXHAUSTED_CONTEXT,
+                                },
+                            )) => return Err(error),
                             Err(BucketWriteDrainError::Store(
                                 StoreError::MetadataCommandContention { .. },
                             )) => {
@@ -4880,6 +4923,12 @@ impl super::StorageCluster {
                                     None,
                                 ) {
                                 Ok(()) => {}
+                                Err(error @ BucketWriteDrainError::Store(
+                                    StoreError::MetadataCommandContention {
+                                        context:
+                                            BUCKET_DELETE_EXACT_BUCKET_DRAIN_BUDGET_EXHAUSTED_CONTEXT,
+                                    },
+                                )) => return Err(error),
                                 Err(BucketWriteDrainError::Store(
                                     StoreError::MetadataCommandContention { .. },
                                 )) => {
