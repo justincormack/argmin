@@ -98,26 +98,29 @@ volume grows anyway; a WAL is the natural fix for both.
 
 ### R2. HIGH (liveness) — No automatic leader election or leader heartbeats in the production config
 
-Leader failure permanently stalls the control plane unless the seed node
-restarts. Confirmed.
+Leader failure permanently stalls the control plane unless an operator issues
+the experimental election trigger or restarts the seed node. Confirmed.
 
 - `experimental_raft_config` (`control_plane_raft.rs:2667-2686`) sets
   `enable_tick/enable_heartbeat/enable_elect` all false; the same config is
   used by the multi-node constructor `new_experimental_unix_peer_durable`
   (:2777). No ticks → no election timeouts and no periodic leader heartbeats.
-- The only election trigger is
+- The startup election trigger is
   `maybe_trigger_experimental_raft_seed_election` (main.rs:1658-1680), which
   runs only on the first-configured peer and only when
   `current_leader().is_none()`. After a leader crash, followers never observe
-  leader loss, so the condition never fires. Recovery requires restarting the
-  seed process or a manual `transfer_leader` — which the dead leader cannot
-  answer.
+  leader loss, so the condition never fires. A narrow admin path,
+  `control-plane-trigger-raft-election`, can now trigger a surviving node's
+  pre-vote election, wait until it is serving, and checkpoint the resulting
+  vote/term before returning, but that is still explicit operator action, not
+  automatic failover.
 - With `enable_heartbeat=false`, follower committed watermarks advance only
   on new writes, so follower checkpoints can lag arbitrarily behind cluster
   commit.
-- Consequence: the Phase 12.3 exit criterion "stop the leader, elect a new
-  leader" is not currently achievable without operator action. Read safety is
-  unaffected (ReadIndex does an explicit quorum round); this is availability.
+- Consequence: the Phase 12.3 manual "stop the leader, elect a new leader,
+  commit" smoke now exists, but unattended leader-loss recovery is still not
+  achievable. Read safety is unaffected (ReadIndex does an explicit quorum
+  round); this is availability.
 
 ### R3. MEDIUM — Torn checkpoint capture: log store and state machine exported without a barrier
 
@@ -322,9 +325,10 @@ shift.
 2. **Atomic checkpoint capture + pre-write pair validation (R3).**
 3. **Failover story (R2).** Enable OpenRaft ticks in production config
    (keeping them disabled in deterministic tests), or extend the manual
-   trigger so every node elects when the known leader fails a liveness probe
-   for N scan intervals. Land the 12.3 kill-leader/elect/commit exit-criterion
-   test now — it currently cannot pass.
+   trigger into an automatic liveness-probe path so every node can elect when
+   the known leader fails for N scan intervals. The explicit
+   kill-leader/manual-elect/commit smoke now exists; the remaining gap is
+   unattended failover and heartbeat-driven follower progress.
 4. **Cheap deterministic time guards (R4).** (a) Re-read the clock after
    acquiring the authority mutex, immediately before constructing each
    command and each runtime-map evaluation. (b) Apply-side monotonic guard:
