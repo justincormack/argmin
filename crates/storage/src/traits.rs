@@ -59,13 +59,12 @@ pub(crate) trait PgMetadataStore {
         public_write: bool,
     ) -> Result<(), MetadataError>;
 
-    /// Delete a bucket row after bucket deletion has been finalized.
+    /// Delete a finalized bucket row directly.
     ///
-    /// This is the explicit finalized-delete exception to command-owned bucket
-    /// mutation: the bucket has already been moved to `Deleting` by a routed
-    /// metadata command, new writes are drained, all PGs have been checked for
-    /// visible data and reclaim roots, and the cluster layer fans out this row
-    /// deletion to the bucket PG acting set.
+    /// Production bucket finalization must use the routed metadata command path
+    /// so command-log progress explains the materialized metadata change. This
+    /// direct helper remains for legacy tests while Slice 3 removes
+    /// digest-only cleanup scaffolding.
     fn delete_finalized_bucket(&self, name: &BucketName) -> Result<(), MetadataError>;
 
     /// Get bucket metadata.

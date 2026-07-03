@@ -50,6 +50,7 @@ const METADATA_COMMAND_DELETE_COMPLETED_MULTIPART_UPLOAD: u16 = 20;
 const METADATA_COMMAND_ADVANCE_COMPLETED_MULTIPART_UPLOAD_SEQUENCE: u16 = 21;
 const METADATA_COMMAND_RESERVE_OBJECT_VERSION: u16 = 22;
 const METADATA_COMMAND_MARK_BUCKET_DELETING: u16 = 23;
+const METADATA_COMMAND_DELETE_FINALIZED_BUCKET: u16 = 24;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct MetadataCommandLogIndex(NonZeroU64);
@@ -281,6 +282,7 @@ pub(crate) enum MetadataCommandPayload {
     PutBucketProperty(PutBucketPropertyCommand),
     PutBucketSubresource(PutBucketSubresourceCommand),
     MarkBucketDeleting(MarkBucketDeletingCommand),
+    DeleteFinalizedBucket(DeleteFinalizedBucketCommand),
     ReserveObjectGeneration(ReserveObjectGenerationCommand),
     ReleaseObjectGeneration(ReleaseObjectGenerationCommand),
     ReserveObjectVersion(ReserveObjectVersionCommand),
@@ -314,6 +316,7 @@ impl MetadataCommandPayload {
             Self::PutBucketProperty(_) => METADATA_COMMAND_PUT_BUCKET_PROPERTY,
             Self::PutBucketSubresource(_) => METADATA_COMMAND_PUT_BUCKET_SUBRESOURCE,
             Self::MarkBucketDeleting(_) => METADATA_COMMAND_MARK_BUCKET_DELETING,
+            Self::DeleteFinalizedBucket(_) => METADATA_COMMAND_DELETE_FINALIZED_BUCKET,
             Self::ReserveObjectGeneration(_) => METADATA_COMMAND_RESERVE_OBJECT_GENERATION,
             Self::ReleaseObjectGeneration(_) => METADATA_COMMAND_RELEASE_OBJECT_GENERATION,
             Self::ReserveObjectVersion(_) => METADATA_COMMAND_RESERVE_OBJECT_VERSION,
@@ -346,6 +349,7 @@ impl MetadataCommandPayload {
             Self::PutBucketProperty(property) => property.bucket_name(),
             Self::PutBucketSubresource(subresource) => &subresource.name,
             Self::MarkBucketDeleting(mark) => mark.bucket_name(),
+            Self::DeleteFinalizedBucket(delete) => &delete.bucket,
             Self::ReserveObjectGeneration(reservation) => &reservation.bucket,
             Self::ReleaseObjectGeneration(release) => &release.bucket,
             Self::ReserveObjectVersion(reservation) => &reservation.bucket,
@@ -375,6 +379,7 @@ fn metadata_command_payload_kind_name(kind_id: u16) -> Option<&'static str> {
         METADATA_COMMAND_PUT_BUCKET_PROPERTY => Some("PutBucketProperty"),
         METADATA_COMMAND_PUT_BUCKET_SUBRESOURCE => Some("PutBucketSubresource"),
         METADATA_COMMAND_MARK_BUCKET_DELETING => Some("MarkBucketDeleting"),
+        METADATA_COMMAND_DELETE_FINALIZED_BUCKET => Some("DeleteFinalizedBucket"),
         METADATA_COMMAND_RESERVE_OBJECT_GENERATION => Some("ReserveObjectGeneration"),
         METADATA_COMMAND_RELEASE_OBJECT_GENERATION => Some("ReleaseObjectGeneration"),
         METADATA_COMMAND_RESERVE_OBJECT_VERSION => Some("ReserveObjectVersion"),
@@ -414,6 +419,27 @@ impl MarkBucketDeletingCommand {
 
     pub(crate) fn bucket_name(&self) -> &BucketName {
         &self.bucket.name
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DeleteFinalizedBucketCommand {
+    pub(crate) bucket: BucketName,
+    pub(crate) bucket_execution_generation: u64,
+    pub(crate) bucket_incarnation_generation: u64,
+}
+
+impl DeleteFinalizedBucketCommand {
+    pub(crate) fn new(
+        bucket: BucketName,
+        bucket_execution_generation: u64,
+        bucket_incarnation_generation: u64,
+    ) -> Self {
+        Self {
+            bucket,
+            bucket_execution_generation,
+            bucket_incarnation_generation,
+        }
     }
 }
 
@@ -1256,6 +1282,9 @@ fn canonical_command_bytes(id: MetadataCommandId, payload: &MetadataCommandPaylo
         MetadataCommandPayload::MarkBucketDeleting(command) => {
             encode_mark_bucket_deleting(&mut out, command);
         }
+        MetadataCommandPayload::DeleteFinalizedBucket(command) => {
+            encode_delete_finalized_bucket(&mut out, command);
+        }
         MetadataCommandPayload::ReserveObjectGeneration(command) => {
             encode_reserve_object_generation(&mut out, command);
         }
@@ -1386,6 +1415,12 @@ impl<'a> MetadataCommandLogEntryDecoder<'a> {
             | METADATA_COMMAND_PUT_BUCKET_VERSIONING
             | METADATA_COMMAND_PUT_BUCKET_ACL
             | METADATA_COMMAND_MARK_BUCKET_DELETING => self.skip_bucket_record(),
+            METADATA_COMMAND_DELETE_FINALIZED_BUCKET => {
+                self.skip_str()?;
+                self.read_u64()?;
+                self.read_u64()?;
+                Ok(())
+            }
             METADATA_COMMAND_PUT_BUCKET_PROPERTY => {
                 self.skip_bucket_record()?;
                 self.read_valid_u8("bucket property effect", 0..=4)
@@ -1570,6 +1605,13 @@ impl<'a> MetadataCommandLogEntryDecoder<'a> {
                 MetadataCommandPayload::MarkBucketDeleting(MarkBucketDeletingCommand {
                     bucket: self.read_bucket_record()?,
                 }),
+            ),
+            METADATA_COMMAND_DELETE_FINALIZED_BUCKET => Ok(
+                MetadataCommandPayload::DeleteFinalizedBucket(DeleteFinalizedBucketCommand::new(
+                    self.read_bucket_name()?,
+                    self.read_u64()?,
+                    self.read_u64()?,
+                )),
             ),
             METADATA_COMMAND_RESERVE_OBJECT_GENERATION => {
                 Ok(MetadataCommandPayload::ReserveObjectGeneration(
@@ -3061,6 +3103,12 @@ fn encode_put_bucket_subresource(out: &mut Vec<u8>, command: &PutBucketSubresour
 
 fn encode_mark_bucket_deleting(out: &mut Vec<u8>, command: &MarkBucketDeletingCommand) {
     encode_bucket_record(out, &command.bucket);
+}
+
+fn encode_delete_finalized_bucket(out: &mut Vec<u8>, command: &DeleteFinalizedBucketCommand) {
+    put_str(out, command.bucket.as_str());
+    put_u64(out, command.bucket_execution_generation);
+    put_u64(out, command.bucket_incarnation_generation);
 }
 
 fn encode_reserve_object_generation(out: &mut Vec<u8>, command: &ReserveObjectGenerationCommand) {
@@ -5248,6 +5296,11 @@ mod tests {
                     ..metadata_object
                 },
             })),
+            MetadataCommandPayload::DeleteFinalizedBucket(DeleteFinalizedBucketCommand::new(
+                bucket.clone(),
+                14,
+                7,
+            )),
             MetadataCommandPayload::DeleteCompletedMultipartUpload(Box::new(
                 DeleteCompletedMultipartUploadCommand {
                     record: CompletedMultipartUploadRecord {
@@ -5317,8 +5370,9 @@ mod tests {
                 0x6c3b4b7d0a8ce150,
                 0x48a90205c35a066d,
                 0xba43f79ea2af20cb,
-                0x34daf2b37760757c,
-                0x1946524188e07bbb,
+                0x0064ce32b63977cd,
+                0xe90eb2bd8985577a,
+                0xedf2c0cac1495b32,
             ]
         );
     }

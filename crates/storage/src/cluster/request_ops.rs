@@ -17,8 +17,8 @@ use super::{
 use crate::metadata_command::{
     BucketPropertyMutation, BucketSubresourceMutation, BucketWriteReservationProof,
     CommitMultipartObjectCommand, CommitStreamPartCommand, DeleteCompletedMultipartUploadCommand,
-    DeleteObjectPayloadReclaimCommand, DeleteObjectVersionTarget, MetadataCommandAcceptance,
-    MetadataCommandEnvelope, MetadataCommandId, MetadataCommandPayload,
+    DeleteFinalizedBucketCommand, DeleteObjectPayloadReclaimCommand, DeleteObjectVersionTarget,
+    MetadataCommandAcceptance, MetadataCommandEnvelope, MetadataCommandId, MetadataCommandPayload,
     ObjectPayloadReclaimClaimProof, ObjectPayloadReclaimCommand, PutObjectMetadataCommand,
     PutObjectMetadataMutation,
 };
@@ -751,6 +751,11 @@ fn metadata_command_apply_test_context(
         MetadataCommandPayload::MarkBucketDeleting(command) => (
             MetadataCommandApplyTestKind::MarkBucketDeleting,
             Some(command.bucket.name.clone()),
+            None,
+        ),
+        MetadataCommandPayload::DeleteFinalizedBucket(command) => (
+            MetadataCommandApplyTestKind::DeleteFinalizedBucket,
+            Some(command.bucket.clone()),
             None,
         ),
         MetadataCommandPayload::AdvanceCompletedMultipartUploadSequence(command) => (
@@ -2062,6 +2067,7 @@ impl super::StorageCluster {
             | MetadataCommandPayload::PutBucketProperty(_)
             | MetadataCommandPayload::PutBucketSubresource(_)
             | MetadataCommandPayload::MarkBucketDeleting(_)
+            | MetadataCommandPayload::DeleteFinalizedBucket(_)
             | MetadataCommandPayload::DeleteCompletedMultipartUpload(_)
             | MetadataCommandPayload::AdvanceCompletedMultipartUploadSequence(_) => self
                 .drain_bucket_pg_pending_metadata_command_with_work_budget(
@@ -2084,75 +2090,141 @@ impl super::StorageCluster {
             "bucket_finalize_delete_start",
             Some(format_args!("bucket={:?} pg_id={}", bucket, pg_id.get())),
         );
-        let mut nodes = self
-            .local_map
-            .metadata_pg_acting_nodes(self.operation_epoch(), pg_id)?;
-        let primary_node_id = self
-            .local_map
-            .pg_route(pg_id)
-            .expect("validated metadata PG delete route must exist")
-            .primary_node_id();
-        nodes.sort_by_key(|node| node.node_id() == primary_node_id);
-
-        for node in nodes {
-            let node_id = node.node_id();
-            match node
-                .bucket_write_reservation_client()
-                .delete_finalized_bucket(pg_id, bucket)
+        let mut work_budget = super::RequestWorkBudget::new(
+            std::time::Duration::from_millis(BUCKET_DELETE_FINALIZE_WORK_BUDGET_MILLIS),
+            None,
+        )
+        .for_operation("bucket_finalize_delete_command")
+        .for_pg(pg_id);
+        loop {
+            work_budget
+                .check("bucket finalized delete command budget exhausted")
+                .map_err(BucketWriteDrainError::Store)?;
+            let (command, clear_pending_on_zero_apply) = if let Some(command) = self
+                .pending_metadata_command_for_bucket(pg_id, bucket)
+                .map_err(BucketWriteDrainError::Store)?
             {
-                Ok(()) => {
-                    let _ = observability::event(
-                        super::TRACE_TARGET,
-                        "bucket_finalize_delete_node_ok",
-                        Some(format_args!(
-                            "bucket={:?} pg_id={} node_id={:?}",
-                            bucket,
-                            pg_id.get(),
-                            node_id
-                        )),
-                    );
-                }
-                Err(BucketWriteDrainError::Metadata(MetadataError::BucketNotFound { .. }))
-                    if node_id == primary_node_id =>
+                if self
+                    .drain_unrelated_pending_metadata_command_for_bucket_with_work_budget(
+                        pg_id,
+                        bucket,
+                        &command,
+                        &mut work_budget,
+                    )
+                    .map_err(bucket_snapshot_error_to_bucket_write_drain_error)?
                 {
-                    let _ = observability::event(
-                        super::TRACE_TARGET,
-                        "bucket_finalize_delete_primary_missing",
-                        Some(format_args!(
-                            "bucket={:?} pg_id={} node_id={:?}",
-                            bucket,
-                            pg_id.get(),
-                            node_id
-                        )),
-                    );
-                    return Ok(BucketDeleteFinalizeOutcome::NotFound);
+                    continue;
                 }
-                Err(BucketWriteDrainError::Metadata(MetadataError::BucketNotFound { .. })) => {
-                    let _ = observability::event(
-                        super::TRACE_TARGET,
-                        "bucket_finalize_delete_replica_missing",
-                        Some(format_args!(
-                            "bucket={:?} pg_id={} node_id={:?}",
+                match command.payload() {
+                    MetadataCommandPayload::DeleteFinalizedBucket(delete)
+                        if delete.bucket == *bucket =>
+                    {
+                        (command, false)
+                    }
+                    MetadataCommandPayload::DeleteFinalizedBucket(_) => {
+                        let _ = self
+                            .drain_bucket_pg_pending_metadata_command_with_work_budget(
+                                pg_id,
+                                &command,
+                                false,
+                                &mut work_budget,
+                            )
+                            .map_err(bucket_snapshot_error_to_bucket_write_drain_error)?;
+                        continue;
+                    }
+                    _ => {
+                        self.drain_pending_metadata_command_pg_slot_with_work_budget(
+                            pg_id,
                             bucket,
-                            pg_id.get(),
-                            node_id
-                        )),
-                    );
+                            &command,
+                            &mut work_budget,
+                        )
+                        .map_err(bucket_snapshot_error_to_bucket_write_drain_error)?;
+                        continue;
+                    }
                 }
-                Err(other) => {
-                    let _ = observability::event(
-                        super::TRACE_TARGET,
-                        "bucket_finalize_delete_node_error",
-                        Some(format_args!(
-                            "bucket={:?} pg_id={} node_id={:?} error={:?}",
-                            bucket,
-                            pg_id.get(),
-                            node_id,
-                            other
-                        )),
-                    );
-                    return Err(other);
+            } else {
+                let primary = self
+                    .local_map
+                    .metadata_pg_primary_node(self.operation_epoch(), pg_id)
+                    .map_err(BucketWriteDrainError::Store)?;
+                let info = match primary
+                    .bucket_metadata_client()
+                    .head_bucket_raw(pg_id, bucket)
+                    .map_err(bucket_snapshot_error_to_bucket_write_drain_error)
+                {
+                    Ok(info) => info,
+                    Err(BucketWriteDrainError::Metadata(MetadataError::BucketNotFound {
+                        ..
+                    })) => {
+                        let _ = observability::event(
+                            super::TRACE_TARGET,
+                            "bucket_finalize_delete_primary_missing",
+                            Some(format_args!("bucket={:?} pg_id={}", bucket, pg_id.get())),
+                        );
+                        return if self.finalized_bucket_deleted_on_acting_set(pg_id, bucket)? {
+                            Ok(BucketDeleteFinalizeOutcome::NotFound)
+                        } else {
+                            Ok(BucketDeleteFinalizeOutcome::Pending)
+                        };
+                    }
+                    Err(other) => return Err(other),
+                };
+                if info.state != BucketState::Deleting {
+                    return Err(BucketWriteDrainError::Metadata(
+                        MetadataError::BucketNotFinalizedForDelete { state: info.state },
+                    ));
                 }
+                let Some(command_id) = self
+                    .next_bucket_metadata_command_id_or_drain_with_work_budget(
+                        pg_id,
+                        bucket,
+                        &mut work_budget,
+                    )
+                    .map_err(bucket_snapshot_error_to_bucket_write_drain_error)?
+                else {
+                    continue;
+                };
+                let command = MetadataCommandEnvelope::new(
+                    command_id,
+                    MetadataCommandPayload::DeleteFinalizedBucket(
+                        DeleteFinalizedBucketCommand::new(
+                            bucket.clone(),
+                            info.bucket_execution_generation,
+                            info.bucket_incarnation_generation,
+                        ),
+                    ),
+                );
+                if !self
+                    .try_set_bucket_pg_pending_command_or_retry_with_work_budget(
+                        pg_id,
+                        bucket,
+                        &command,
+                        &mut work_budget,
+                    )
+                    .map_err(bucket_snapshot_error_to_bucket_write_drain_error)?
+                {
+                    continue;
+                }
+                (command, true)
+            };
+            let outcome = self
+                .finish_pending_metadata_command_to_acting_set_allow_partial_exact_conflict_retry_with_work_budget(
+                    pg_id,
+                    &command,
+                    clear_pending_on_zero_apply,
+                    &mut work_budget,
+                )
+                .map_err(bucket_snapshot_error_to_bucket_write_drain_error)?;
+            if matches!(
+                outcome,
+                FinishPendingMetadataCommandResult::Abandoned
+                    | FinishPendingMetadataCommandResult::RetryPartialExactConflict
+            ) {
+                continue;
+            }
+            if self.finalized_bucket_deleted_on_acting_set(pg_id, bucket)? {
+                break;
             }
         }
         let _ = observability::event(
@@ -2161,6 +2233,37 @@ impl super::StorageCluster {
             Some(format_args!("bucket={:?} pg_id={}", bucket, pg_id.get())),
         );
         Ok(BucketDeleteFinalizeOutcome::Finalized)
+    }
+
+    fn finalized_bucket_deleted_on_acting_set(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+    ) -> Result<bool, BucketWriteDrainError> {
+        let mut found_deleting = false;
+        for node in self
+            .local_map
+            .metadata_pg_acting_nodes(self.operation_epoch(), pg_id)
+            .map_err(BucketWriteDrainError::Store)?
+        {
+            match node
+                .bucket_metadata_client()
+                .head_bucket_raw(pg_id, bucket)
+                .map_err(bucket_snapshot_error_to_bucket_write_drain_error)
+            {
+                Ok(info) if info.state == BucketState::Deleting => {
+                    found_deleting = true;
+                }
+                Ok(info) => {
+                    return Err(BucketWriteDrainError::Metadata(
+                        MetadataError::BucketNotFinalizedForDelete { state: info.state },
+                    ));
+                }
+                Err(BucketWriteDrainError::Metadata(MetadataError::BucketNotFound { .. })) => {}
+                Err(other) => return Err(other),
+            }
+        }
+        Ok(!found_deleting)
     }
 
     pub fn load_bucket_snapshot(
@@ -4174,6 +4277,7 @@ impl super::StorageCluster {
                     | MetadataCommandPayload::PutBucketAcl(_)
                     | MetadataCommandPayload::PutBucketProperty(_)
                     | MetadataCommandPayload::PutBucketSubresource(_)
+                    | MetadataCommandPayload::DeleteFinalizedBucket(_)
                     | MetadataCommandPayload::DeleteCompletedMultipartUpload(_)
                     | MetadataCommandPayload::AdvanceCompletedMultipartUploadSequence(_) => {
                         Self::emit_bucket_delete_begin_loop_step(
@@ -5273,8 +5377,13 @@ impl super::StorageCluster {
                         "bucket_finalize_not_found",
                         Some(format_args!("bucket={:?} pg_id={}", bucket, bucket_pg_id)),
                     );
-                    self.finish_bucket_delete_finalize_work(bucket);
-                    return Ok(BucketDeleteFinalizeOutcome::NotFound);
+                    if self
+                        .finalized_bucket_deleted_on_acting_set(PgId::new(bucket_pg_id), bucket)?
+                    {
+                        self.finish_bucket_delete_finalize_work(bucket);
+                        return Ok(BucketDeleteFinalizeOutcome::NotFound);
+                    }
+                    return Ok(BucketDeleteFinalizeOutcome::Pending);
                 }
                 Err(other) => return Err(bucket_snapshot_error_to_bucket_write_drain_error(other)),
             };

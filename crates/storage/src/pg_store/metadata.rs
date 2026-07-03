@@ -1,4 +1,5 @@
 use super::*;
+use crate::metadata_command::DeleteFinalizedBucketCommand;
 
 fn combined_stream_segment_payload_crc64(segments: &[StreamUploadSegmentRecord]) -> u64 {
     segments
@@ -663,6 +664,9 @@ impl PgStore {
             MetadataCommandPayload::MarkBucketDeleting(mark) => {
                 self.apply_mark_bucket_deleting_command(mark)
             }
+            MetadataCommandPayload::DeleteFinalizedBucket(delete) => {
+                self.apply_delete_finalized_bucket_command(delete)
+            }
             MetadataCommandPayload::AdvanceCompletedMultipartUploadSequence(command) => {
                 self.apply_advance_completed_multipart_upload_sequence_command(command)
             }
@@ -829,6 +833,148 @@ impl PgStore {
             "apply stale mark bucket deleting command",
             "apply conflicting mark bucket deleting command",
         )
+    }
+
+    fn apply_delete_finalized_bucket_command(
+        &self,
+        command: &DeleteFinalizedBucketCommand,
+    ) -> Result<(), MetadataError> {
+        self.delete_finalized_bucket_rows_in_current_txn(
+            &command.bucket,
+            Some((
+                command.bucket_execution_generation,
+                command.bucket_incarnation_generation,
+            )),
+            false,
+        )
+        .map(|_| ())
+    }
+
+    fn delete_finalized_bucket_rows_in_current_txn(
+        &self,
+        name: &BucketName,
+        expected_generations: Option<(u64, u64)>,
+        refresh_command_state_digest: bool,
+    ) -> Result<usize, MetadataError> {
+        let row = self
+            .conn
+            .query_row(
+                "SELECT state, bucket_execution_generation, bucket_incarnation_generation \
+                 FROM buckets WHERE name = ?1",
+                params![name.as_str()],
+                |row| {
+                    Ok((
+                        row.get::<_, u8>(0)?,
+                        row.get::<_, i64>(1)? as u64,
+                        row.get::<_, i64>(2)? as u64,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|source| MetadataError::Db {
+                context: "delete finalized bucket (load state)",
+                source,
+            })?;
+        let Some((state, bucket_execution_generation, bucket_incarnation_generation)) = row else {
+            let _ = observability::event(
+                TRACE_TARGET,
+                "pg_delete_finalized_bucket_missing",
+                Some(format_args!("pg_id={} bucket={:?}", self.pg_id, name)),
+            );
+            return Ok(0);
+        };
+        if let Some((expected_execution, expected_incarnation)) = expected_generations {
+            if bucket_execution_generation != expected_execution
+                || bucket_incarnation_generation != expected_incarnation
+            {
+                let _ = observability::event(
+                    TRACE_TARGET,
+                    "pg_delete_finalized_bucket_stale_generation",
+                    Some(format_args!(
+                        "pg_id={} bucket={:?} expected_execution={} actual_execution={} expected_incarnation={} actual_incarnation={}",
+                        self.pg_id,
+                        name,
+                        expected_execution,
+                        bucket_execution_generation,
+                        expected_incarnation,
+                        bucket_incarnation_generation
+                    )),
+                );
+                return Ok(0);
+            }
+        }
+        let state = BucketState::from_u8(state).ok_or_else(|| MetadataError::Db {
+            context: "delete finalized bucket (invalid bucket state)",
+            source: rusqlite::Error::InvalidQuery,
+        })?;
+        if state != BucketState::Deleting {
+            let _ = observability::event(
+                TRACE_TARGET,
+                "pg_delete_finalized_bucket_wrong_state",
+                Some(format_args!(
+                    "pg_id={} bucket={:?} state={:?}",
+                    self.pg_id, name, state
+                )),
+            );
+            return Err(MetadataError::BucketNotFinalizedForDelete { state });
+        }
+        let deleted = self
+            .conn
+            .execute(
+                "DELETE FROM buckets \
+                 WHERE name = ?1 AND state = ?2 \
+                   AND bucket_execution_generation = ?3 \
+                   AND bucket_incarnation_generation = ?4",
+                params![
+                    name.as_str(),
+                    BucketState::Deleting as u8,
+                    bucket_execution_generation as i64,
+                    bucket_incarnation_generation as i64,
+                ],
+            )
+            .map_err(|source| MetadataError::Db {
+                context: "delete finalized bucket (delete row)",
+                source,
+            })?;
+        if deleted != 0 {
+            self.conn
+                .execute(
+                    "DELETE FROM completed_multipart_uploads WHERE bucket = ?1",
+                    params![name.as_str()],
+                )
+                .map_err(|source| MetadataError::Db {
+                    context: "delete finalized bucket (delete completed MPU records)",
+                    source,
+                })?;
+            self.conn
+                .execute(
+                    "DELETE FROM object_version_counters WHERE bucket = ?1",
+                    params![name.as_str()],
+                )
+                .map_err(|source| MetadataError::Db {
+                    context: "delete finalized bucket (delete version counters)",
+                    source,
+                })?;
+            self.conn
+                .execute(
+                    "DELETE FROM object_write_counters WHERE bucket = ?1",
+                    params![name.as_str()],
+                )
+                .map_err(|source| MetadataError::Db {
+                    context: "delete finalized bucket (delete write counters)",
+                    source,
+                })?;
+            if refresh_command_state_digest {
+                self.refresh_metadata_command_state_digest()
+                    .map_err(|error| {
+                        Self::store_error_as_metadata_db(
+                            "delete finalized bucket (refresh metadata command digest)",
+                            error,
+                        )
+                    })?;
+            }
+        }
+        Ok(deleted)
     }
 
     fn apply_put_bucket_property_command(
@@ -5060,90 +5206,7 @@ impl PgMetadataStore for PgStore {
                 context: "delete finalized bucket (begin txn)",
                 source: e,
             })?;
-        let result = (|| -> Result<usize, MetadataError> {
-            let state = self
-                .conn
-                .query_row(
-                    "SELECT state FROM buckets WHERE name = ?1",
-                    params![name.as_str()],
-                    |row| row.get::<_, u8>(0),
-                )
-                .optional()
-                .map_err(|source| MetadataError::Db {
-                    context: "delete finalized bucket (load state)",
-                    source,
-                })?;
-            let Some(state) = state else {
-                let _ = observability::event(
-                    TRACE_TARGET,
-                    "pg_delete_finalized_bucket_missing",
-                    Some(format_args!("pg_id={} bucket={:?}", self.pg_id, name)),
-                );
-                return Ok(0);
-            };
-            let state = BucketState::from_u8(state).ok_or_else(|| MetadataError::Db {
-                context: "delete finalized bucket (invalid bucket state)",
-                source: rusqlite::Error::InvalidQuery,
-            })?;
-            if state != BucketState::Deleting {
-                let _ = observability::event(
-                    TRACE_TARGET,
-                    "pg_delete_finalized_bucket_wrong_state",
-                    Some(format_args!(
-                        "pg_id={} bucket={:?} state={:?}",
-                        self.pg_id, name, state
-                    )),
-                );
-                return Err(MetadataError::BucketNotFinalizedForDelete { state });
-            }
-            let deleted = self
-                .conn
-                .execute(
-                    "DELETE FROM buckets WHERE name = ?1 AND state = ?2",
-                    params![name.as_str(), BucketState::Deleting as u8],
-                )
-                .map_err(|source| MetadataError::Db {
-                    context: "delete finalized bucket (delete row)",
-                    source,
-                })?;
-            if deleted != 0 {
-                self.conn
-                    .execute(
-                        "DELETE FROM completed_multipart_uploads WHERE bucket = ?1",
-                        params![name.as_str()],
-                    )
-                    .map_err(|source| MetadataError::Db {
-                        context: "delete finalized bucket (delete completed MPU records)",
-                        source,
-                    })?;
-                self.conn
-                    .execute(
-                        "DELETE FROM object_version_counters WHERE bucket = ?1",
-                        params![name.as_str()],
-                    )
-                    .map_err(|source| MetadataError::Db {
-                        context: "delete finalized bucket (delete version counters)",
-                        source,
-                    })?;
-                self.conn
-                    .execute(
-                        "DELETE FROM object_write_counters WHERE bucket = ?1",
-                        params![name.as_str()],
-                    )
-                    .map_err(|source| MetadataError::Db {
-                        context: "delete finalized bucket (delete write counters)",
-                        source,
-                    })?;
-                self.refresh_metadata_command_state_digest()
-                    .map_err(|error| {
-                        Self::store_error_as_metadata_db(
-                            "delete finalized bucket (refresh metadata command digest)",
-                            error,
-                        )
-                    })?;
-            }
-            Ok(deleted)
-        })();
+        let result = self.delete_finalized_bucket_rows_in_current_txn(name, None, true);
         let deleted = match result {
             Ok(deleted) => {
                 #[cfg(test)]

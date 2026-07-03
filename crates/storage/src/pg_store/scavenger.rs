@@ -1357,6 +1357,7 @@ impl PgStore {
             | MetadataCommandPayload::PutBucketProperty(_)
             | MetadataCommandPayload::PutBucketSubresource(_)
             | MetadataCommandPayload::MarkBucketDeleting(_)
+            | MetadataCommandPayload::DeleteFinalizedBucket(_)
             | MetadataCommandPayload::ReserveObjectGeneration(_)
             | MetadataCommandPayload::ReleaseObjectGeneration(_)
             | MetadataCommandPayload::ReserveObjectVersion(_)
