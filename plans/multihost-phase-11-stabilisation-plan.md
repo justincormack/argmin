@@ -420,16 +420,15 @@ when prioritised. They correspond to the remaining findings from the Phase 11 re
     `state_digest`. Initial implementation has added `DeleteFinalizedBucket`, routes
     production finalization through the pending-command fanout, and covers command-log
     advancement plus stale-generation no-op safety. Remaining work in this item is to
-    audit/convert legacy direct-helper tests and any surviving direct production call
-    surfaces.
-  - **Partially complete:** Remove direct production digest refresh for finalized bucket cleanup. The current
-    `delete_finalized_bucket` path is the named production exception that refreshes
-    `metadata_command_replica_state.state_digest` without appending a metadata command.
-    Replace production use of that out-of-band cleanup with the terminal command. Any
-    remaining direct helper should be test-only or private recovery scaffolding with a name
-    that makes it impossible to call from serving paths accidentally. Production bucket
-    finalization now uses the terminal command; the legacy direct helper still exists for
-    tests and must be made test-only/private or removed in the cleanup pass.
+    audit/convert legacy direct-helper tests.
+  - **Completed for production serving paths:** Remove direct production digest refresh for
+    finalized bucket cleanup. The old node-client and Unix RPC
+    `delete_finalized_bucket` surface has been removed, and the underlying direct
+    `PgMetadataStore::delete_finalized_bucket` helper is now test-only. Production bucket
+    finalization uses the terminal command path, so serving code cannot refresh
+    `metadata_command_replica_state.state_digest` for finalized-bucket cleanup without
+    appending a metadata command. Remaining cleanup is to convert or remove legacy tests
+    that still depend on the test-only direct helper.
   - **Tighten imported metadata-transfer proofs.**
     `metadata_proof_satisfies_fenced_transfer_source_floor` currently accepts a
     non-zero-hash different-digest proof when `active_metadata_transfer_imported` is set.

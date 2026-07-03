@@ -853,14 +853,6 @@ impl BucketWriteReservationNodeClient for LocalStorageNodeClient {
         )
     }
 
-    fn delete_finalized_bucket(
-        &self,
-        pg_id: PgId,
-        bucket: &BucketName,
-    ) -> Result<(), BucketWriteDrainError> {
-        <Self as StorageNodeClient>::delete_finalized_bucket(self, pg_id, bucket)
-    }
-
     fn get_bucket_delete_finalize_roots(
         &self,
         pg_id: PgId,
@@ -2024,17 +2016,6 @@ impl StorageNodeClient for LocalStorageNodeClient {
     ) -> Result<BucketInfo, BucketSnapshotLoadError> {
         let pg = self.storage_node.get_pg(pg_id.get())?;
         Ok(PgMetadataStore::head_bucket(&*pg, bucket)?)
-    }
-
-    fn delete_finalized_bucket(
-        &self,
-        pg_id: PgId,
-        bucket: &BucketName,
-    ) -> Result<(), BucketWriteDrainError> {
-        let pg = self.storage_node.get_pg(pg_id.get())?;
-        PgMetadataStore::delete_finalized_bucket(&*pg, bucket)?;
-        pg.refresh_metadata_command_state_digest()?;
-        Ok(())
     }
 
     fn build_create_bucket_command(

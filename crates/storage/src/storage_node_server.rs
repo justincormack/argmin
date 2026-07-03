@@ -106,10 +106,9 @@ use crate::storage_rpc::{
     encode_bucket_delete_attempt_outcome_optional_record_response,
     encode_bucket_delete_begin_roots_response,
     encode_bucket_delete_finalize_claim_optional_record_response,
-    encode_bucket_delete_finalize_roots_response, encode_bucket_delete_finalized_response,
-    encode_bucket_execution_generations_response, encode_bucket_fast_path_identities_response,
-    encode_bucket_info_outcome_response, encode_bucket_list_response,
-    encode_bucket_mark_deleting_command_build_response,
+    encode_bucket_delete_finalize_roots_response, encode_bucket_execution_generations_response,
+    encode_bucket_fast_path_identities_response, encode_bucket_info_outcome_response,
+    encode_bucket_list_response, encode_bucket_mark_deleting_command_build_response,
     encode_bucket_metadata_control_command_build_response, encode_bucket_snapshot_pair_response,
     encode_bucket_snapshot_response, encode_bucket_subresource_get_response,
     encode_bucket_write_drain_begin_response, encode_bucket_write_drain_optional_record_response,
@@ -166,8 +165,7 @@ use crate::storage_rpc::{
     StorageRpcBucketDeleteBeginRootsResponse, StorageRpcBucketDeleteFinalizeClaimAcquireRequest,
     StorageRpcBucketDeleteFinalizeClaimOptionalRecordResponse,
     StorageRpcBucketDeleteFinalizeClaimRecordRequest, StorageRpcBucketDeleteFinalizeRootsRequest,
-    StorageRpcBucketDeleteFinalizeRootsResponse, StorageRpcBucketDeleteFinalizedOutcome,
-    StorageRpcBucketDeleteFinalizedResponse, StorageRpcBucketExecutionGenerationsResponse,
+    StorageRpcBucketDeleteFinalizeRootsResponse, StorageRpcBucketExecutionGenerationsResponse,
     StorageRpcBucketFastPathIdentitiesResponse, StorageRpcBucketInfoOutcome,
     StorageRpcBucketInfoOutcomeResponse, StorageRpcBucketListRequest, StorageRpcBucketListResponse,
     StorageRpcBucketMarkDeletingCommandBuildOutcome,
@@ -293,10 +291,7 @@ use crate::types::{
     PlacedSegmentShardBackfillClaimAcquire, PlacedSegmentShardBackfillClaimRecord,
     PlacedSegmentShardRepairClaimAcquire, PlacedSegmentShardRepairClaimRecord,
 };
-use crate::{
-    BucketName, BucketWriteDrainError, EcShape, NodeId, ObjectPgActionError, ShardKey,
-    ShardLocation,
-};
+use crate::{BucketName, EcShape, NodeId, ObjectPgActionError, ShardKey, ShardLocation};
 
 #[cfg(test)]
 type MetadataCommandBeforeWaitHook = Arc<dyn Fn(PgId) + Send + Sync>;
@@ -1786,15 +1781,6 @@ impl StorageNodeConnectionHandler {
             StorageRpcMessageKind::BucketWriteReservationsList => {
                 match decode_bucket_request(&frame.payload) {
                     Ok(request) => self.bucket_write_reservations_list_response(request),
-                    Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
-                        code: StorageRpcErrorCode::PayloadDecode,
-                        message: error.to_string(),
-                    }),
-                }
-            }
-            StorageRpcMessageKind::BucketDeleteFinalized => {
-                match decode_bucket_request(&frame.payload) {
-                    Ok(request) => self.bucket_delete_finalized_response(request),
                     Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
                         code: StorageRpcErrorCode::PayloadDecode,
                         message: error.to_string(),
@@ -3626,48 +3612,6 @@ impl StorageNodeConnectionHandler {
                 Ok(encode_storage_rpc_success_response(&payload))
             }
             Err(error) => encode_storage_rpc_error_response(&bucket_snapshot_error_response(error)),
-        }
-    }
-
-    fn bucket_delete_finalized_response(
-        &self,
-        request: StorageRpcBucketRequest,
-    ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
-        if let Err(error) =
-            self.validate_pg_route(request.node_id, request.cluster_epoch, request.pg_id)
-        {
-            return encode_storage_rpc_error_response(&error);
-        }
-        if let Err(error) =
-            self.validate_pg_for_bucket(request.pg_id, &request.bucket, "bucket delete finalized")
-        {
-            return encode_storage_rpc_error_response(&error);
-        }
-        let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
-        match BucketWriteReservationNodeClient::delete_finalized_bucket(
-            &local_client,
-            request.pg_id,
-            &request.bucket,
-        ) {
-            Ok(()) => {
-                let payload = encode_bucket_delete_finalized_response(
-                    &StorageRpcBucketDeleteFinalizedResponse {
-                        outcome: StorageRpcBucketDeleteFinalizedOutcome::Deleted,
-                    },
-                )?;
-                Ok(encode_storage_rpc_success_response(&payload))
-            }
-            Err(BucketWriteDrainError::Metadata(MetadataError::BucketNotFound { name })) => {
-                let payload = encode_bucket_delete_finalized_response(
-                    &StorageRpcBucketDeleteFinalizedResponse {
-                        outcome: StorageRpcBucketDeleteFinalizedOutcome::BucketNotFound { name },
-                    },
-                )?;
-                Ok(encode_storage_rpc_success_response(&payload))
-            }
-            Err(error) => {
-                encode_storage_rpc_error_response(&bucket_write_drain_error_response(error))
-            }
         }
     }
 
@@ -10182,21 +10126,6 @@ fn bucket_write_drain_heartbeat_error_response(
             }
         }
         error => bucket_snapshot_error_response(error),
-    }
-}
-
-fn bucket_write_drain_error_response(error: BucketWriteDrainError) -> StorageRpcErrorResponse {
-    match error {
-        BucketWriteDrainError::Store(StoreError::MetadataCommandContention { context }) => {
-            StorageRpcErrorResponse {
-                code: StorageRpcErrorCode::MetadataCommandContention,
-                message: format!("metadata command contention during {context}"),
-            }
-        }
-        error => StorageRpcErrorResponse {
-            code: StorageRpcErrorCode::Internal,
-            message: error.to_string(),
-        },
     }
 }
 

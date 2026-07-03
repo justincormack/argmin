@@ -1243,7 +1243,7 @@ fn unix_bucket_write_reservation_client_routes_drain_and_finalize_coordination()
     };
     private_socket_dir(config.socket_path.parent().unwrap());
     let server = Arc::new(StorageNodeServer::bind(config.clone()).unwrap());
-    let server_threads: Vec<_> = (0..23)
+    let server_threads: Vec<_> = (0..22)
         .map(|_| {
             let server = Arc::clone(&server);
             thread::spawn(move || server.accept_one().unwrap())
@@ -1475,13 +1475,6 @@ fn unix_bucket_write_reservation_client_routes_drain_and_finalize_coordination()
     assert_eq!(roots.len(), 1);
     assert_eq!(roots[0].bucket, finalize_bucket);
 
-    BucketWriteReservationNodeClient::delete_finalized_bucket(
-        &client,
-        PgId::new(0),
-        &finalize_bucket,
-    )
-    .unwrap();
-
     for thread in server_threads {
         thread.join().unwrap();
     }
@@ -1608,36 +1601,6 @@ fn unix_bucket_write_reservation_client_routes_lifecycle_sweep_coordination() {
     for thread in server_threads {
         thread.join().unwrap();
     }
-}
-
-#[test]
-fn unix_bucket_delete_finalized_response_rejects_wrong_not_found_bucket() {
-    let tmp = test_util::tempdir();
-    let client = UnixStorageNodeClient::new(
-        NodeId::new(7),
-        ClusterEpoch::new(1).unwrap(),
-        tmp.path().join("unused.sock"),
-    );
-    let bucket = crate::tests::bucket_name("delete-finalized-not-found-expected");
-    let wrong_bucket = crate::tests::bucket_name("delete-finalized-not-found-wrong");
-
-    let err = client
-        .validate_bucket_delete_finalized_response(
-            StorageRpcBucketDeleteFinalizedResponse {
-                outcome: StorageRpcBucketDeleteFinalizedOutcome::BucketNotFound {
-                    name: wrong_bucket,
-                },
-            },
-            &bucket,
-        )
-        .unwrap_err();
-    assert!(matches!(
-        err,
-        BucketWriteDrainError::Store(StoreError::StorageRpc {
-            operation: "validate bucket delete finalized response",
-            ..
-        })
-    ));
 }
 
 #[test]

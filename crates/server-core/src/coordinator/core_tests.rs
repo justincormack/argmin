@@ -9566,7 +9566,9 @@ fn delete_bucket_route_map_expiry_after_drain_maps_to_operation_aborted() {
     let tmp = test_util::tempdir();
     let bucket = "bucket-delete-mid-expired-route-map";
     let storage_cluster = open_test_storage_cluster(tmp.path(), &[0]);
-    let coord = setup_direct_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
+    let coord = setup_same_process_coordinator_with_storage_cluster_without_background_sweepers(
+        Arc::clone(&storage_cluster),
+    );
     coord
         .create_bucket_for_owner("default-owner", bucket, false)
         .unwrap();

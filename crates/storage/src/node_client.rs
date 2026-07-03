@@ -8,9 +8,7 @@ use std::time::{Duration, Instant};
 use placement::NodeId;
 use s3_types::{AclGrants, BucketVersioningState};
 
-use crate::error::{
-    BucketSnapshotLoadError, BucketWriteDrainError, MetadataError, ObjectPgActionError, StoreError,
-};
+use crate::error::{BucketSnapshotLoadError, MetadataError, ObjectPgActionError, StoreError};
 use crate::metadata_command::{
     AbortMultipartUploadCommand, AdvanceCompletedMultipartUploadSequenceCommand,
     BucketPropertyMutation, BucketRecord, BucketSubresourceMutation, BucketWriteReservationProof,
@@ -33,10 +31,9 @@ use crate::storage_rpc::{
     decode_bucket_delete_attempt_outcome_optional_record_response,
     decode_bucket_delete_begin_roots_response,
     decode_bucket_delete_finalize_claim_optional_record_response,
-    decode_bucket_delete_finalize_roots_response, decode_bucket_delete_finalized_response,
-    decode_bucket_execution_generations_response, decode_bucket_fast_path_identities_response,
-    decode_bucket_info_outcome_response, decode_bucket_list_response,
-    decode_bucket_mark_deleting_command_build_response,
+    decode_bucket_delete_finalize_roots_response, decode_bucket_execution_generations_response,
+    decode_bucket_fast_path_identities_response, decode_bucket_info_outcome_response,
+    decode_bucket_list_response, decode_bucket_mark_deleting_command_build_response,
     decode_bucket_metadata_control_command_build_response, decode_bucket_snapshot_pair_response,
     decode_bucket_snapshot_response, decode_bucket_subresource_get_response,
     decode_bucket_write_drain_begin_response, decode_bucket_write_drain_optional_record_response,
@@ -155,7 +152,6 @@ use crate::storage_rpc::{
     StorageRpcBucketDeleteAttemptOutcomeRecordRequest, StorageRpcBucketDeleteBeginRootsRequest,
     StorageRpcBucketDeleteFinalizeClaimAcquireRequest,
     StorageRpcBucketDeleteFinalizeClaimRecordRequest, StorageRpcBucketDeleteFinalizeRootsRequest,
-    StorageRpcBucketDeleteFinalizedOutcome, StorageRpcBucketDeleteFinalizedResponse,
     StorageRpcBucketInfoOutcome, StorageRpcBucketListRequest,
     StorageRpcBucketMarkDeletingCommandBuildOutcome,
     StorageRpcBucketMarkDeletingCommandBuildRequest,

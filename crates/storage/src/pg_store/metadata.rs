@@ -5192,6 +5192,7 @@ impl PgMetadataStore for PgStore {
         })
     }
 
+    #[cfg(test)]
     fn delete_finalized_bucket(&self, name: &BucketName) -> Result<(), MetadataError> {
         observability::trace_scope!(
             TRACE_TARGET,

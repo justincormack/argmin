@@ -659,7 +659,6 @@ pub(crate) enum StorageRpcMessageKind {
     BucketWriteDrainClear = 81,
     BucketWriteDrainClearExpired = 82,
     BucketWriteReservationsList = 83,
-    BucketDeleteFinalized = 84,
     BucketDeleteFinalizeRoots = 85,
     BucketDeleteFinalizeClaimAcquire = 86,
     BucketDeleteFinalizeClaimRelease = 87,
@@ -931,7 +930,6 @@ impl StorageRpcMessageKind {
             Self::BucketWriteDrainHeartbeat => "bucket write drain heartbeat",
             Self::BucketWriteDrainExists => "bucket write drain exists",
             Self::BucketWriteReservationsList => "bucket write reservations list",
-            Self::BucketDeleteFinalized => "bucket delete finalized",
             Self::BucketDeleteFinalizeRoots => "bucket delete finalize roots",
             Self::BucketDeleteBeginRoots => "bucket delete begin roots",
             Self::BucketDeleteFinalizeClaimGet => "bucket delete finalize claim get",
@@ -1086,7 +1084,6 @@ impl StorageRpcMessageKind {
             81 => Ok(Self::BucketWriteDrainClear),
             82 => Ok(Self::BucketWriteDrainClearExpired),
             83 => Ok(Self::BucketWriteReservationsList),
-            84 => Ok(Self::BucketDeleteFinalized),
             85 => Ok(Self::BucketDeleteFinalizeRoots),
             86 => Ok(Self::BucketDeleteFinalizeClaimAcquire),
             87 => Ok(Self::BucketDeleteFinalizeClaimRelease),
@@ -1379,17 +1376,6 @@ pub(crate) struct StorageRpcBucketDeleteAttemptOutcomeOptionalRecordResponse {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StorageRpcBucketWriteReservationsListResponse {
     pub(crate) records: Vec<BucketWriteReservationRecord>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum StorageRpcBucketDeleteFinalizedOutcome {
-    Deleted,
-    BucketNotFound { name: BucketName },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct StorageRpcBucketDeleteFinalizedResponse {
-    pub(crate) outcome: StorageRpcBucketDeleteFinalizedOutcome,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3717,8 +3703,7 @@ fn message_kind_request_max_payload_len(
         | StorageRpcMessageKind::BucketWriteDrainGet
         | StorageRpcMessageKind::BucketDeleteAttemptOutcomeGet
         | StorageRpcMessageKind::BucketDeleteFinalizeClaimGet
-        | StorageRpcMessageKind::BucketWriteReservationsList
-        | StorageRpcMessageKind::BucketDeleteFinalized => {
+        | StorageRpcMessageKind::BucketWriteReservationsList => {
             STORAGE_RPC_MAX_BUCKET_REQUEST_PAYLOAD_LEN
         }
         StorageRpcMessageKind::BucketDeleteFinalizeRoots => {
@@ -11374,39 +11359,6 @@ pub(crate) fn decode_bucket_write_reservations_list_response(
     }
     decoder.finish()?;
     Ok(StorageRpcBucketWriteReservationsListResponse { records })
-}
-
-pub(crate) fn encode_bucket_delete_finalized_response(
-    response: &StorageRpcBucketDeleteFinalizedResponse,
-) -> Result<Vec<u8>, StorageRpcPayloadError> {
-    let mut out = Vec::new();
-    match &response.outcome {
-        StorageRpcBucketDeleteFinalizedOutcome::Deleted => put_u8(&mut out, 0),
-        StorageRpcBucketDeleteFinalizedOutcome::BucketNotFound { name } => {
-            put_u8(&mut out, 1);
-            put_string(&mut out, name.as_str());
-        }
-    }
-    Ok(out)
-}
-
-pub(crate) fn decode_bucket_delete_finalized_response(
-    bytes: &[u8],
-) -> Result<StorageRpcBucketDeleteFinalizedResponse, StorageRpcPayloadError> {
-    let mut decoder = StorageRpcDecoder::new(bytes);
-    let outcome = match decoder.read_u8()? {
-        0 => StorageRpcBucketDeleteFinalizedOutcome::Deleted,
-        1 => StorageRpcBucketDeleteFinalizedOutcome::BucketNotFound {
-            name: decoder.read_bucket_name()?,
-        },
-        _ => {
-            return Err(StorageRpcPayloadError::InvalidResponseEnvelope(
-                "unknown bucket delete finalized outcome tag",
-            ));
-        }
-    };
-    decoder.finish()?;
-    Ok(StorageRpcBucketDeleteFinalizedResponse { outcome })
 }
 
 pub(crate) fn encode_bucket_pg_request(

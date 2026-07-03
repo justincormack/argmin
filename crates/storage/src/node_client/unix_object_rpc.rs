@@ -887,31 +887,6 @@ impl BucketWriteReservationNodeClient for UnixStorageNodeClient {
         Ok(response.records)
     }
 
-    fn delete_finalized_bucket(
-        &self,
-        pg_id: PgId,
-        bucket: &BucketName,
-    ) -> Result<(), BucketWriteDrainError> {
-        let request = StorageRpcBucketRequest {
-            node_id: self.node_id,
-            cluster_epoch: self.cluster_epoch,
-            pg_id,
-            bucket: bucket.clone(),
-        };
-        let payload = encode_bucket_request(&request);
-        let response = self
-            .rpc_request(StorageRpcMessageKind::BucketDeleteFinalized, payload)
-            .map_err(BucketWriteDrainError::Store)?;
-        let response =
-            decode_bucket_delete_finalized_response(&response).map_err(|error| {
-                BucketWriteDrainError::Store(self.rpc_payload_error(
-                    "decode bucket delete finalized response",
-                    error.to_string(),
-                ))
-            })?;
-        self.validate_bucket_delete_finalized_response(response, bucket)
-    }
-
     fn get_bucket_delete_finalize_roots(
         &self,
         pg_id: PgId,

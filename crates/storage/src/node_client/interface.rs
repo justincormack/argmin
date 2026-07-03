@@ -283,12 +283,6 @@ pub(crate) trait BucketWriteReservationNodeClient: Send + Sync {
         lease_deadline: u64,
     ) -> Result<BucketWriteReservationRecord, BucketSnapshotLoadError>;
 
-    fn delete_finalized_bucket(
-        &self,
-        pg_id: PgId,
-        bucket: &BucketName,
-    ) -> Result<(), BucketWriteDrainError>;
-
     fn get_bucket_delete_finalize_roots(
         &self,
         pg_id: PgId,
@@ -1492,12 +1486,6 @@ pub(crate) trait StorageNodeClient:
         pg_id: PgId,
         bucket: &BucketName,
     ) -> Result<BucketInfo, BucketSnapshotLoadError>;
-
-    fn delete_finalized_bucket(
-        &self,
-        pg_id: PgId,
-        bucket: &BucketName,
-    ) -> Result<(), BucketWriteDrainError>;
 
     fn build_create_bucket_command(
         &self,

@@ -1941,27 +1941,6 @@ impl UnixStorageNodeClient {
         }
     }
 
-    pub(super) fn validate_bucket_delete_finalized_response(
-        &self,
-        response: StorageRpcBucketDeleteFinalizedResponse,
-        bucket: &BucketName,
-    ) -> Result<(), BucketWriteDrainError> {
-        match response.outcome {
-            StorageRpcBucketDeleteFinalizedOutcome::Deleted => Ok(()),
-            StorageRpcBucketDeleteFinalizedOutcome::BucketNotFound { name } if name == *bucket => {
-                Err(BucketWriteDrainError::Metadata(
-                    MetadataError::BucketNotFound { name },
-                ))
-            }
-            StorageRpcBucketDeleteFinalizedOutcome::BucketNotFound { .. } => {
-                Err(BucketWriteDrainError::Store(self.rpc_payload_error(
-                    "validate bucket delete finalized response",
-                    "bucket not found response name does not match request".to_string(),
-                )))
-            }
-        }
-    }
-
     pub(super) fn validate_proof_release_response(
         &self,
         response: &[u8],
