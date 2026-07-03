@@ -7702,13 +7702,16 @@ fn metadata_proof_satisfies_active_primary_observation_floor_impl(
             && observed.applied_log_hash != active_floor.applied_log_hash
             && observed.state_digest != active_floor.state_digest
             && (!active_metadata_transfer_imported
-                || metadata_proof_satisfies_fenced_transfer_source_floor(active_floor, observed))
+                || metadata_proof_satisfies_imported_transfer_local_progress_floor(
+                    active_floor,
+                    observed,
+                ))
     } else {
         false
     }
 }
 
-fn metadata_proof_satisfies_fenced_transfer_source_floor(
+fn metadata_proof_satisfies_imported_transfer_local_progress_floor(
     active_floor: PgMetadataProof,
     observed: PgMetadataProof,
 ) -> bool {
@@ -7722,6 +7725,7 @@ fn metadata_proof_satisfies_fenced_transfer_source_floor(
         // above.
         || (observed != active_floor
             && observed.applied_log_hash != 0
+            && observed.applied_log_hash != active_floor.applied_log_hash
             && observed.state_digest != active_floor.state_digest)
 }
 
@@ -7755,7 +7759,7 @@ fn validate_metadata_transfer_proof(
             metadata_proof_satisfies_active_floor(required_floor, transfer.source_metadata_proof())
         }
         PgState::Peering if metadata_transfer_fenced && metadata_transfer_fence_source_imported => {
-            metadata_proof_satisfies_fenced_transfer_source_floor(
+            metadata_proof_satisfies_imported_transfer_local_progress_floor(
                 required_floor,
                 transfer.source_metadata_proof(),
             )
@@ -8949,53 +8953,73 @@ mod tests {
     }
 
     #[test]
-    fn fenced_transfer_source_floor_accepts_epoch_local_progress() {
+    fn imported_transfer_local_progress_floor_requires_new_log_hash_and_digest() {
         let imported_activation_floor = PgMetadataProof {
             applied_log_index: 42,
             applied_log_hash: 0xabc,
             state_digest: 0xdef,
         };
 
-        assert!(metadata_proof_satisfies_fenced_transfer_source_floor(
-            imported_activation_floor,
-            PgMetadataProof {
-                applied_log_index: 1,
-                applied_log_hash: 0x123,
-                state_digest: 0x456,
-            },
-        ));
-        assert!(metadata_proof_satisfies_fenced_transfer_source_floor(
-            imported_activation_floor,
-            PgMetadataProof {
-                applied_log_index: 42,
-                applied_log_hash: 0x123,
-                state_digest: 0x456,
-            },
-        ));
-        assert!(!metadata_proof_satisfies_fenced_transfer_source_floor(
-            imported_activation_floor,
-            PgMetadataProof {
-                applied_log_index: 41,
-                applied_log_hash: 0,
-                state_digest: 0x456,
-            },
-        ));
-        assert!(!metadata_proof_satisfies_fenced_transfer_source_floor(
-            imported_activation_floor,
-            PgMetadataProof {
-                applied_log_index: 41,
-                applied_log_hash: 0x123,
-                state_digest: 0xdef,
-            },
-        ));
-        assert!(!metadata_proof_satisfies_fenced_transfer_source_floor(
-            imported_activation_floor,
-            PgMetadataProof {
-                applied_log_index: 42,
-                applied_log_hash: 0x123,
-                state_digest: 0xdef,
-            },
-        ));
+        assert!(
+            metadata_proof_satisfies_imported_transfer_local_progress_floor(
+                imported_activation_floor,
+                PgMetadataProof {
+                    applied_log_index: 1,
+                    applied_log_hash: 0x123,
+                    state_digest: 0x456,
+                },
+            )
+        );
+        assert!(
+            metadata_proof_satisfies_imported_transfer_local_progress_floor(
+                imported_activation_floor,
+                PgMetadataProof {
+                    applied_log_index: 42,
+                    applied_log_hash: 0x123,
+                    state_digest: 0x456,
+                },
+            )
+        );
+        assert!(
+            !metadata_proof_satisfies_imported_transfer_local_progress_floor(
+                imported_activation_floor,
+                PgMetadataProof {
+                    applied_log_index: 42,
+                    applied_log_hash: 0xabc,
+                    state_digest: 0xdf0,
+                },
+            )
+        );
+        assert!(
+            !metadata_proof_satisfies_imported_transfer_local_progress_floor(
+                imported_activation_floor,
+                PgMetadataProof {
+                    applied_log_index: 41,
+                    applied_log_hash: 0,
+                    state_digest: 0x456,
+                },
+            )
+        );
+        assert!(
+            !metadata_proof_satisfies_imported_transfer_local_progress_floor(
+                imported_activation_floor,
+                PgMetadataProof {
+                    applied_log_index: 41,
+                    applied_log_hash: 0x123,
+                    state_digest: 0xdef,
+                },
+            )
+        );
+        assert!(
+            !metadata_proof_satisfies_imported_transfer_local_progress_floor(
+                imported_activation_floor,
+                PgMetadataProof {
+                    applied_log_index: 42,
+                    applied_log_hash: 0x123,
+                    state_digest: 0xdef,
+                },
+            )
+        );
     }
 
     #[test]
@@ -9015,6 +9039,11 @@ mod tests {
             applied_log_index: 42,
             applied_log_hash: 0x123,
             state_digest: 0x456,
+        };
+        let same_log_digest_only_proof = PgMetadataProof {
+            applied_log_index: 42,
+            applied_log_hash: 0xabc,
+            state_digest: 0xdf0,
         };
         let malformed_epoch_local_proof = PgMetadataProof {
             applied_log_index: 41,
@@ -9060,6 +9089,13 @@ mod tests {
         assert!(metadata_proof_satisfies_active_primary_observation_floor(
             imported_activation_floor,
             same_index_epoch_local_proof,
+            true,
+            Some(ClusterEpoch::new(7).unwrap()),
+            ClusterEpoch::new(8).unwrap(),
+        ));
+        assert!(!metadata_proof_satisfies_active_primary_observation_floor(
+            imported_activation_floor,
+            same_log_digest_only_proof,
             true,
             Some(ClusterEpoch::new(7).unwrap()),
             ClusterEpoch::new(8).unwrap(),
