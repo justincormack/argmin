@@ -481,6 +481,64 @@ impl ControlPlaneRaftPeerTransportPolicy {
         self.limits
     }
 
+    #[must_use]
+    pub fn cluster_name(&self) -> &str {
+        &self.cluster_name
+    }
+
+    #[must_use]
+    pub fn peers(&self) -> BTreeMap<ControlPlaneRaftNodeId, BasicNode> {
+        self.peers.clone()
+    }
+
+    pub fn validate_local_node(
+        &self,
+        local_node_id: ControlPlaneRaftNodeId,
+    ) -> Result<(), ControlPlaneError> {
+        if self.peers.contains_key(&local_node_id) {
+            return Ok(());
+        }
+        Err(raft_artifact_protocol_error(format!(
+            "control-plane OpenRaft peer transport policy for cluster {:?} does not include local node {local_node_id}",
+            self.cluster_name
+        )))
+    }
+
+    pub fn validate_cluster_name(
+        &self,
+        expected_cluster_name: &str,
+    ) -> Result<(), ControlPlaneError> {
+        if self.cluster_name == expected_cluster_name {
+            return Ok(());
+        }
+        Err(raft_artifact_protocol_error(format!(
+            "control-plane OpenRaft peer transport policy belongs to cluster {:?}, not configured cluster {:?}",
+            self.cluster_name, expected_cluster_name
+        )))
+    }
+
+    pub fn validate_configured_membership(
+        &self,
+        context: &'static str,
+        membership: &Membership<ControlPlaneRaftNodeId, BasicNode>,
+    ) -> Result<(), ControlPlaneError> {
+        let expected = Membership::from(self.peers.clone());
+        if membership == &expected {
+            return Ok(());
+        }
+        let expected_voters = expected.voter_ids().collect::<BTreeSet<_>>();
+        let actual_voters = membership.voter_ids().collect::<BTreeSet<_>>();
+        let actual_learners = membership.learner_ids().collect::<BTreeSet<_>>();
+        let actual_nodes = membership
+            .nodes()
+            .map(|(node_id, node)| (*node_id, node.clone()))
+            .collect::<BTreeMap<_, _>>();
+        Err(raft_artifact_protocol_error(format!(
+            "control-plane OpenRaft durable restart artifact {context} does not match configured peer map for cluster {:?}; expected_voters={expected_voters:?} actual_voters={actual_voters:?} actual_learners={actual_learners:?} expected_nodes={:?} actual_nodes={actual_nodes:?}",
+            self.cluster_name, self.peers
+        )))
+    }
+
     pub fn validate_target_node(
         &self,
         target: ControlPlaneRaftNodeId,
@@ -1154,6 +1212,7 @@ impl SubmittedControlPlaneRaftCommand {
 
 pub struct ControlPlaneRaftAuthority {
     cluster_name: String,
+    node_id: ControlPlaneRaftNodeId,
     raft: Raft<ControlPlaneRaftTypeConfig, ControlPlaneRaftStateMachine>,
     log_store: Option<ControlPlaneRaftLogStore>,
 }
@@ -2605,7 +2664,7 @@ impl RaftNetworkV2<ControlPlaneRaftTypeConfig> for ExperimentalSingleNodeRaftNet
     }
 }
 
-fn experimental_single_node_raft_config(
+fn experimental_raft_config(
     cluster_name: impl Into<String>,
 ) -> Result<Arc<Config>, ControlPlaneError> {
     Ok(Arc::new(
@@ -2621,9 +2680,41 @@ fn experimental_single_node_raft_config(
         }
         .validate()
         .map_err(|error| ControlPlaneError::RpcRemote {
-            message: format!("OpenRaft experimental single-node config failed: {error}"),
+            message: format!("OpenRaft experimental config failed: {error}"),
         })?,
     ))
+}
+
+fn experimental_single_node_raft_config(
+    cluster_name: impl Into<String>,
+) -> Result<Arc<Config>, ControlPlaneError> {
+    experimental_raft_config(cluster_name)
+}
+
+fn restore_experimental_raft_durable_artifact(
+    cluster_name: &str,
+    node_id: ControlPlaneRaftNodeId,
+    artifact_path: &Path,
+    validate_artifact: impl FnOnce(&ControlPlaneRaftRestartArtifact) -> Result<(), ControlPlaneError>,
+) -> Result<(ControlPlaneRaftLogStore, ControlPlaneRaftStateMachine), ControlPlaneError> {
+    match ControlPlaneRaftRestartArtifact::load_durable_artifact(artifact_path) {
+        Ok(artifact) => {
+            artifact.validate_cluster_identity(cluster_name)?;
+            artifact.validate_local_node_identity(node_id)?;
+            validate_artifact(&artifact)?;
+            artifact.restore().map_err(|source| ControlPlaneError::Io {
+                context: "restore control-plane OpenRaft durable restart artifact",
+                source,
+            })
+        }
+        Err(ControlPlaneError::Io { source, .. }) if source.kind() == io::ErrorKind::NotFound => {
+            Ok((
+                ControlPlaneRaftLogStore::empty(),
+                ControlPlaneRaftStateMachine::empty(),
+            ))
+        }
+        Err(error) => Err(error),
+    }
 }
 
 impl ControlPlaneRaftAuthority {
@@ -2653,26 +2744,12 @@ impl ControlPlaneRaftAuthority {
     ) -> Result<Self, ControlPlaneError> {
         let cluster_name = cluster_name.into();
         let config = experimental_single_node_raft_config(cluster_name.clone())?;
-        let (log_store, state_machine) =
-            match ControlPlaneRaftRestartArtifact::load_durable_artifact(artifact_path) {
-                Ok(artifact) => {
-                    artifact.validate_cluster_identity(&cluster_name)?;
-                    artifact.validate_single_node_local_identity(node_id)?;
-                    artifact.restore().map_err(|source| ControlPlaneError::Io {
-                        context: "restore control-plane OpenRaft durable restart artifact",
-                        source,
-                    })?
-                }
-                Err(ControlPlaneError::Io { source, .. })
-                    if source.kind() == io::ErrorKind::NotFound =>
-                {
-                    (
-                        ControlPlaneRaftLogStore::empty(),
-                        ControlPlaneRaftStateMachine::empty(),
-                    )
-                }
-                Err(error) => return Err(error),
-            };
+        let (log_store, state_machine) = restore_experimental_raft_durable_artifact(
+            &cluster_name,
+            node_id,
+            artifact_path,
+            |artifact| artifact.validate_single_node_local_identity(node_id),
+        )?;
         let raft = Raft::<ControlPlaneRaftTypeConfig, ControlPlaneRaftStateMachine>::new(
             node_id,
             config,
@@ -2687,10 +2764,42 @@ impl ControlPlaneRaftAuthority {
         Ok(Self::new_with_log_store(raft, log_store, cluster_name))
     }
 
+    pub async fn new_experimental_unix_peer_durable(
+        cluster_name: impl Into<String>,
+        node_id: ControlPlaneRaftNodeId,
+        artifact_path: &Path,
+        peer_policy: ControlPlaneRaftPeerTransportPolicy,
+        rpc_timeout: Duration,
+    ) -> Result<Self, ControlPlaneError> {
+        let cluster_name = cluster_name.into();
+        peer_policy.validate_cluster_name(&cluster_name)?;
+        peer_policy.validate_local_node(node_id)?;
+        let config = experimental_raft_config(cluster_name.clone())?;
+        let policy_for_restore = peer_policy.clone();
+        let (log_store, state_machine) = restore_experimental_raft_durable_artifact(
+            &cluster_name,
+            node_id,
+            artifact_path,
+            |artifact| artifact.validate_peer_policy_membership(&policy_for_restore),
+        )?;
+        let raft = Raft::<ControlPlaneRaftTypeConfig, ControlPlaneRaftStateMachine>::new(
+            node_id,
+            config,
+            ControlPlaneRaftUnixPeerNetworkFactory::new(node_id, peer_policy, rpc_timeout),
+            log_store.clone(),
+            state_machine,
+        )
+        .await
+        .map_err(|error| openraft_remote_error("new experimental Unix-peer authority", error))?;
+        Ok(Self::new_with_log_store(raft, log_store, cluster_name))
+    }
+
     #[must_use]
     pub fn new(raft: Raft<ControlPlaneRaftTypeConfig, ControlPlaneRaftStateMachine>) -> Self {
+        let node_id = *raft.node_id();
         Self {
             cluster_name: String::new(),
+            node_id,
             raft,
             log_store: None,
         }
@@ -2702,8 +2811,10 @@ impl ControlPlaneRaftAuthority {
         log_store: ControlPlaneRaftLogStore,
         cluster_name: impl Into<String>,
     ) -> Self {
+        let node_id = *raft.node_id();
         Self {
             cluster_name: cluster_name.into(),
+            node_id,
             raft,
             log_store: Some(log_store),
         }
@@ -2902,6 +3013,7 @@ impl ControlPlaneRaftAuthority {
             .map_err(|error| openraft_remote_error("state-machine restart artifact read", error))?;
         ControlPlaneRaftRestartArtifact {
             cluster_name: self.cluster_name.clone(),
+            local_node_id: self.node_id,
             log_store,
             state_machine,
         }
@@ -3491,12 +3603,13 @@ pub struct ControlPlaneRaftLogStoreRestartArtifact {
 #[derive(Debug, Clone)]
 pub struct ControlPlaneRaftRestartArtifact {
     cluster_name: String,
+    local_node_id: ControlPlaneRaftNodeId,
     log_store: ControlPlaneRaftLogStoreRestartArtifact,
     state_machine: ControlPlaneRaftStateMachineRestartArtifact,
 }
 
 const CONTROL_PLANE_RAFT_RESTART_MAGIC: &[u8] = b"ARGMINCPRAFT";
-const CONTROL_PLANE_RAFT_RESTART_VERSION: u16 = 2;
+const CONTROL_PLANE_RAFT_RESTART_VERSION: u16 = 3;
 const CONTROL_PLANE_RAFT_RESTART_CHECKSUM_LEN: usize = 8;
 const CONTROL_PLANE_RAFT_PEER_RPC_MAGIC: &[u8] = b"ARGMINCPRAFTPEER";
 const CONTROL_PLANE_RAFT_PEER_RPC_VERSION: u16 = 1;
@@ -3805,11 +3918,13 @@ impl ControlPlaneRaftLogStoreInner {
 impl ControlPlaneRaftRestartArtifact {
     pub fn capture(
         cluster_name: impl Into<String>,
+        local_node_id: ControlPlaneRaftNodeId,
         log_store: &ControlPlaneRaftLogStore,
         state_machine: &ControlPlaneRaftStateMachine,
     ) -> Result<Self, io::Error> {
         Ok(Self {
             cluster_name: cluster_name.into(),
+            local_node_id,
             log_store: log_store.export_restart_artifact()?,
             state_machine: state_machine.export_restart_artifact(),
         })
@@ -3820,6 +3935,7 @@ impl ControlPlaneRaftRestartArtifact {
         out.extend_from_slice(CONTROL_PLANE_RAFT_RESTART_MAGIC);
         write_raft_u16(&mut out, CONTROL_PLANE_RAFT_RESTART_VERSION);
         write_raft_string(&mut out, &self.cluster_name)?;
+        write_raft_u64(&mut out, self.local_node_id);
         write_raft_log_store_artifact(&mut out, &self.log_store)?;
         write_raft_state_machine_artifact(&mut out, &self.state_machine)?;
         append_raft_artifact_checksum(&mut out);
@@ -3863,6 +3979,7 @@ impl ControlPlaneRaftRestartArtifact {
         }
         let artifact = Self {
             cluster_name: reader.read_string()?,
+            local_node_id: reader.read_u64()?,
             log_store: read_raft_log_store_artifact(&mut reader)?,
             state_machine: read_raft_state_machine_artifact(&mut reader)?,
         };
@@ -3961,6 +4078,7 @@ impl ControlPlaneRaftRestartArtifact {
 
         ControlPlaneRaftRestartArtifact {
             cluster_name: cluster_name.into(),
+            local_node_id: node_id,
             log_store: ControlPlaneRaftLogStoreRestartArtifact {
                 vote: Some(Vote::new_committed(3, node_id)),
                 committed: Some(bootstrap_command.log_id),
@@ -4004,10 +4122,24 @@ impl ControlPlaneRaftRestartArtifact {
         )))
     }
 
+    fn validate_local_node_identity(
+        &self,
+        local_node_id: ControlPlaneRaftNodeId,
+    ) -> Result<(), ControlPlaneError> {
+        if self.local_node_id == local_node_id {
+            return Ok(());
+        }
+        Err(raft_artifact_protocol_error(format!(
+            "control-plane OpenRaft durable restart artifact belongs to local OpenRaft node {}, not configured local node {local_node_id}",
+            self.local_node_id
+        )))
+    }
+
     fn validate_single_node_local_identity(
         &self,
         local_node_id: ControlPlaneRaftNodeId,
     ) -> Result<(), ControlPlaneError> {
+        self.validate_local_node_identity(local_node_id)?;
         if let Some(vote) = self.log_store.vote {
             Self::validate_single_node_leader_id("persisted vote", vote.leader_id, local_node_id)?;
         }
@@ -4056,6 +4188,40 @@ impl ControlPlaneRaftRestartArtifact {
                     "state-machine membership",
                     self.state_machine.last_membership.membership(),
                 )?;
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_peer_policy_membership(
+        &self,
+        peer_policy: &ControlPlaneRaftPeerTransportPolicy,
+    ) -> Result<(), ControlPlaneError> {
+        for entry in &self.log_store.entries {
+            if let EntryPayload::Membership(membership) = &entry.payload {
+                peer_policy.validate_configured_membership("retained log entry", membership)?;
+            }
+        }
+        match self.state_machine.last_membership.log_id() {
+            Some(_) => peer_policy.validate_configured_membership(
+                "state-machine membership",
+                self.state_machine.last_membership.membership(),
+            )?,
+            None => Self::validate_uninitialized_membership(
+                "state-machine membership",
+                self.state_machine.last_membership.membership(),
+            )?,
+        }
+        if let Some(snapshot) = &self.state_machine.current_snapshot {
+            match snapshot.meta.last_membership.log_id() {
+                Some(_) => peer_policy.validate_configured_membership(
+                    "cached snapshot membership",
+                    snapshot.meta.last_membership.membership(),
+                )?,
+                None => Self::validate_uninitialized_membership(
+                    "cached snapshot membership",
+                    snapshot.meta.last_membership.membership(),
+                )?,
             }
         }
         Ok(())
@@ -8753,6 +8919,7 @@ mod tests {
             .unwrap();
         ControlPlaneRaftRestartArtifact {
             cluster_name: authority.cluster_name.clone(),
+            local_node_id: authority.node_id,
             log_store,
             state_machine,
         }
@@ -9040,6 +9207,22 @@ mod tests {
 
     fn test_membership() -> Membership<ControlPlaneRaftNodeId, BasicNode> {
         Membership::new_with_defaults(vec![BTreeSet::from([1, 2])], [])
+    }
+
+    fn policy_membership(
+        policy: &ControlPlaneRaftPeerTransportPolicy,
+    ) -> Membership<ControlPlaneRaftNodeId, BasicNode> {
+        Membership::from(policy.peers())
+    }
+
+    fn policy_bootstrap_membership_entry(
+        node_id: u64,
+        policy: &ControlPlaneRaftPeerTransportPolicy,
+    ) -> ControlPlaneRaftEntry {
+        Entry {
+            log_id: raft_log_id(0, node_id, 0),
+            payload: EntryPayload::Membership(policy_membership(policy)),
+        }
     }
 
     fn replicated_state_machine_with_noops(
@@ -12880,6 +13063,7 @@ mod tests {
 
             let artifact = ControlPlaneRaftRestartArtifact::capture(
                 "test-cluster",
+                1,
                 &log_store,
                 &state_machine,
             )
@@ -12980,6 +13164,7 @@ mod tests {
 
             let artifact = ControlPlaneRaftRestartArtifact::capture(
                 "test-cluster",
+                1,
                 &log_store,
                 &state_machine,
             )
@@ -13357,6 +13542,7 @@ mod tests {
 
             let artifact = ControlPlaneRaftRestartArtifact::capture(
                 "test-cluster",
+                1,
                 &log_store,
                 &state_machine,
             )
@@ -13423,6 +13609,7 @@ mod tests {
             let expected_snapshot = state_machine.inner().snapshot().clone();
             let artifact = ControlPlaneRaftRestartArtifact::capture(
                 "test-cluster",
+                1,
                 &log_store,
                 &state_machine,
             )
@@ -13431,6 +13618,7 @@ mod tests {
             let encoded = artifact.encode_durable_artifact().unwrap();
             let decoded = ControlPlaneRaftRestartArtifact::decode_durable_artifact(&encoded)
                 .expect("durable restart artifact should decode");
+            assert_eq!(decoded.local_node_id, 1);
             let (mut restored_log_store, restored_state_machine) = decoded.restore().unwrap();
 
             assert_eq!(
@@ -13473,6 +13661,7 @@ mod tests {
         let path = tmp.path().join("control-plane").join("raft.state");
         let artifact = ControlPlaneRaftRestartArtifact {
             cluster_name: "test-cluster".to_string(),
+            local_node_id: 1,
             log_store: ControlPlaneRaftLogStoreRestartArtifact {
                 vote: Some(Vote::<ControlPlaneRaftLeaderId>::new_committed(3, 1)),
                 committed: Some(raft_log_id(3, 1, 1)),
@@ -13509,6 +13698,7 @@ mod tests {
         let tmp_path = durable_artifact_tmp_path(&path);
         let committed_artifact = ControlPlaneRaftRestartArtifact {
             cluster_name: "test-cluster".to_string(),
+            local_node_id: 1,
             log_store: ControlPlaneRaftLogStoreRestartArtifact {
                 vote: Some(Vote::<ControlPlaneRaftLeaderId>::new_committed(3, 1)),
                 committed: Some(raft_log_id(3, 1, 1)),
@@ -13519,6 +13709,7 @@ mod tests {
         };
         let stale_temp_artifact = ControlPlaneRaftRestartArtifact {
             cluster_name: "test-cluster".to_string(),
+            local_node_id: 1,
             log_store: ControlPlaneRaftLogStoreRestartArtifact {
                 vote: Some(Vote::<ControlPlaneRaftLeaderId>::new_committed(5, 1)),
                 committed: Some(raft_log_id(5, 1, 2)),
@@ -13563,6 +13754,7 @@ mod tests {
         let tmp_path = durable_artifact_tmp_path(&path);
         let committed_artifact = ControlPlaneRaftRestartArtifact {
             cluster_name: "test-cluster".to_string(),
+            local_node_id: 1,
             log_store: ControlPlaneRaftLogStoreRestartArtifact {
                 vote: Some(Vote::<ControlPlaneRaftLeaderId>::new_committed(3, 1)),
                 committed: Some(raft_log_id(3, 1, 1)),
@@ -13573,6 +13765,7 @@ mod tests {
         };
         let replacement_artifact = ControlPlaneRaftRestartArtifact {
             cluster_name: "test-cluster".to_string(),
+            local_node_id: 1,
             log_store: ControlPlaneRaftLogStoreRestartArtifact {
                 vote: Some(Vote::<ControlPlaneRaftLeaderId>::new_committed(5, 1)),
                 committed: Some(raft_log_id(5, 1, 2)),
@@ -13616,6 +13809,7 @@ mod tests {
         let path = tmp.path().join("raft.state");
         let artifact = ControlPlaneRaftRestartArtifact {
             cluster_name: "test-cluster".to_string(),
+            local_node_id: 1,
             log_store: ControlPlaneRaftLogStoreRestartArtifact::default(),
             state_machine: ControlPlaneRaftStateMachine::empty().export_restart_artifact(),
         };
@@ -13685,7 +13879,7 @@ mod tests {
                 .apply_entry(single_node_bootstrap_membership_entry(1))
                 .unwrap();
             state_machine.apply_entry(blank_entry(3, 1, 1)).unwrap();
-            ControlPlaneRaftRestartArtifact::capture(cluster_name, &log_store, &state_machine)
+            ControlPlaneRaftRestartArtifact::capture(cluster_name, 1, &log_store, &state_machine)
                 .unwrap()
                 .store_durable_artifact(&path)
                 .unwrap();
@@ -13723,6 +13917,7 @@ mod tests {
             let path = tmp.path().join("raft.state");
             let artifact = ControlPlaneRaftRestartArtifact {
                 cluster_name: "old-cluster".to_string(),
+                local_node_id: 1,
                 log_store: ControlPlaneRaftLogStoreRestartArtifact::default(),
                 state_machine: ControlPlaneRaftStateMachine::empty().export_restart_artifact(),
             };
@@ -13780,7 +13975,7 @@ mod tests {
             state_machine.apply_entry(bootstrap_command).unwrap();
             let built_snapshot = state_machine.build_snapshot().unwrap();
             assert_eq!(built_snapshot.meta.last_log_id, Some(raft_log_id(3, 1, 1)));
-            ControlPlaneRaftRestartArtifact::capture(cluster_name, &log_store, &state_machine)
+            ControlPlaneRaftRestartArtifact::capture(cluster_name, 1, &log_store, &state_machine)
                 .unwrap()
                 .store_durable_artifact(&path)
                 .unwrap();
@@ -13862,7 +14057,7 @@ mod tests {
             state_machine.apply_entry(suffix_entry_3).unwrap();
             assert_eq!(state_machine.last_applied(), Some(raft_log_id(3, 1, 3)));
 
-            ControlPlaneRaftRestartArtifact::capture(cluster_name, &log_store, &state_machine)
+            ControlPlaneRaftRestartArtifact::capture(cluster_name, 1, &log_store, &state_machine)
                 .unwrap()
                 .store_durable_artifact(&path)
                 .unwrap();
@@ -13914,6 +14109,7 @@ mod tests {
             let cluster_name = "control-plane-raft-durable-multi-voter-start-test";
             let artifact = ControlPlaneRaftRestartArtifact {
                 cluster_name: cluster_name.to_string(),
+                local_node_id: 1,
                 log_store: ControlPlaneRaftLogStoreRestartArtifact {
                     vote: Some(Vote::<ControlPlaneRaftLeaderId>::new_committed(3, 1)),
                     committed: Some(raft_log_id(3, 1, 1)),
@@ -13955,6 +14151,7 @@ mod tests {
             let cluster_name = "control-plane-raft-durable-unpositioned-multi-voter-start-test";
             let artifact = ControlPlaneRaftRestartArtifact {
                 cluster_name: cluster_name.to_string(),
+                local_node_id: 1,
                 log_store: ControlPlaneRaftLogStoreRestartArtifact {
                     vote: Some(Vote::<ControlPlaneRaftLeaderId>::new_committed(3, 1)),
                     committed: Some(raft_log_id(3, 1, 1)),
@@ -13993,6 +14190,7 @@ mod tests {
             let cluster_name = "control-plane-raft-durable-wrong-node-start-test";
             let artifact = ControlPlaneRaftRestartArtifact {
                 cluster_name: cluster_name.to_string(),
+                local_node_id: 1,
                 log_store: ControlPlaneRaftLogStoreRestartArtifact {
                     vote: Some(Vote::<ControlPlaneRaftLeaderId>::new_committed(3, 1)),
                     committed: Some(raft_log_id(3, 1, 1)),
@@ -14013,7 +14211,161 @@ mod tests {
                     &path,
                 )
                 .await,
-                "belongs to OpenRaft node 1, not local node 2",
+                "belongs to local OpenRaft node 1, not configured local node 2",
+            );
+        });
+    }
+
+    #[test]
+    fn control_plane_openraft_unix_peer_durable_starts_empty_without_artifact() {
+        ControlPlaneRaftTypeConfig::run(async {
+            let tmp = test_util::tempdir();
+            let path = tmp.path().join("missing").join("raft.state");
+            let cluster_name = "control-plane-raft-unix-peer-durable-empty-start-test";
+            let policy = ControlPlaneRaftPeerTransportPolicy::from_peer_endpoints(
+                cluster_name,
+                [
+                    (1, "/tmp/argmin-raft-node-1.sock".to_string()),
+                    (2, "/tmp/argmin-raft-node-2.sock".to_string()),
+                ],
+                ControlPlaneRaftPeerTransportLimits::default(),
+            );
+
+            let authority = ControlPlaneRaftAuthority::new_experimental_unix_peer_durable(
+                cluster_name,
+                1,
+                &path,
+                policy,
+                Duration::from_millis(50),
+            )
+            .await
+            .unwrap();
+
+            assert!(!authority.is_initialized().await.unwrap());
+            let status = authority.status().await.unwrap();
+            assert_eq!(status.node_id(), 1);
+            assert_eq!(status.applied(), None);
+            assert_eq!(status.committed(), None);
+            authority.shutdown().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn control_plane_openraft_unix_peer_durable_rejects_wrong_local_node_artifact() {
+        ControlPlaneRaftTypeConfig::run(async {
+            let tmp = test_util::tempdir();
+            let path = tmp.path().join("raft.state");
+            let cluster_name = "control-plane-raft-unix-peer-durable-wrong-node-test";
+            let artifact = ControlPlaneRaftRestartArtifact {
+                cluster_name: cluster_name.to_string(),
+                local_node_id: 1,
+                log_store: ControlPlaneRaftLogStoreRestartArtifact::default(),
+                state_machine: ControlPlaneRaftStateMachine::empty().export_restart_artifact(),
+            };
+            artifact.store_durable_artifact(&path).unwrap();
+            let policy = ControlPlaneRaftPeerTransportPolicy::from_peer_endpoints(
+                cluster_name,
+                [
+                    (1, "/tmp/argmin-raft-node-1.sock".to_string()),
+                    (2, "/tmp/argmin-raft-node-2.sock".to_string()),
+                ],
+                ControlPlaneRaftPeerTransportLimits::default(),
+            );
+
+            assert_error_contains(
+                ControlPlaneRaftAuthority::new_experimental_unix_peer_durable(
+                    cluster_name,
+                    2,
+                    &path,
+                    policy,
+                    Duration::from_millis(50),
+                )
+                .await,
+                "belongs to local OpenRaft node 1, not configured local node 2",
+            );
+        });
+    }
+
+    #[test]
+    fn control_plane_openraft_unix_peer_durable_rejects_retained_membership_mismatch() {
+        ControlPlaneRaftTypeConfig::run(async {
+            let tmp = test_util::tempdir();
+            let path = tmp.path().join("raft.state");
+            let cluster_name =
+                "control-plane-raft-unix-peer-durable-retained-membership-mismatch-test";
+            let artifact = ControlPlaneRaftRestartArtifact {
+                cluster_name: cluster_name.to_string(),
+                local_node_id: 1,
+                log_store: ControlPlaneRaftLogStoreRestartArtifact {
+                    entries: vec![single_node_bootstrap_membership_entry(1)],
+                    ..Default::default()
+                },
+                state_machine: ControlPlaneRaftStateMachine::empty().export_restart_artifact(),
+            };
+            artifact.store_durable_artifact(&path).unwrap();
+            let policy = ControlPlaneRaftPeerTransportPolicy::from_peer_endpoints(
+                cluster_name,
+                [
+                    (1, "/tmp/argmin-raft-node-1.sock".to_string()),
+                    (2, "/tmp/argmin-raft-node-2.sock".to_string()),
+                ],
+                ControlPlaneRaftPeerTransportLimits::default(),
+            );
+
+            assert_error_contains(
+                ControlPlaneRaftAuthority::new_experimental_unix_peer_durable(
+                    cluster_name,
+                    1,
+                    &path,
+                    policy,
+                    Duration::from_millis(50),
+                )
+                .await,
+                "retained log entry does not match configured peer map",
+            );
+        });
+    }
+
+    #[test]
+    fn control_plane_openraft_unix_peer_durable_rejects_applied_membership_mismatch() {
+        ControlPlaneRaftTypeConfig::run(async {
+            let tmp = test_util::tempdir();
+            let path = tmp.path().join("raft.state");
+            let cluster_name =
+                "control-plane-raft-unix-peer-durable-applied-membership-mismatch-test";
+            let policy = ControlPlaneRaftPeerTransportPolicy::from_peer_endpoints(
+                cluster_name,
+                [
+                    (1, "/tmp/argmin-raft-node-1.sock".to_string()),
+                    (2, "/tmp/argmin-raft-node-2.sock".to_string()),
+                ],
+                ControlPlaneRaftPeerTransportLimits::default(),
+            );
+            let mut state_machine = ControlPlaneRaftStateMachine::empty();
+            state_machine
+                .apply_entry(single_node_bootstrap_membership_entry(1))
+                .unwrap();
+            let artifact = ControlPlaneRaftRestartArtifact {
+                cluster_name: cluster_name.to_string(),
+                local_node_id: 1,
+                log_store: ControlPlaneRaftLogStoreRestartArtifact {
+                    entries: vec![policy_bootstrap_membership_entry(1, &policy)],
+                    ..Default::default()
+                },
+                state_machine: state_machine.export_restart_artifact(),
+            };
+            artifact.store_durable_artifact(&path).unwrap();
+
+            assert_error_contains(
+                ControlPlaneRaftAuthority::new_experimental_unix_peer_durable(
+                    cluster_name,
+                    1,
+                    &path,
+                    policy,
+                    Duration::from_millis(50),
+                )
+                .await,
+                "state-machine membership does not match configured peer map",
             );
         });
     }
@@ -14041,6 +14393,7 @@ mod tests {
     fn control_plane_raft_durable_restart_artifact_codec_rejects_malformed_frames() {
         let artifact = ControlPlaneRaftRestartArtifact {
             cluster_name: "test-cluster".to_string(),
+            local_node_id: 1,
             log_store: ControlPlaneRaftLogStoreRestartArtifact::default(),
             state_machine: ControlPlaneRaftStateMachine::empty().export_restart_artifact(),
         };
@@ -14082,6 +14435,7 @@ mod tests {
         unknown_entry_tag.extend_from_slice(CONTROL_PLANE_RAFT_RESTART_MAGIC);
         write_raft_u16(&mut unknown_entry_tag, CONTROL_PLANE_RAFT_RESTART_VERSION);
         write_raft_string(&mut unknown_entry_tag, "test-cluster").unwrap();
+        write_raft_u64(&mut unknown_entry_tag, 1);
         write_raft_option_vote(&mut unknown_entry_tag, None);
         write_raft_option_log_id(&mut unknown_entry_tag, None);
         write_raft_option_log_id(&mut unknown_entry_tag, None);
@@ -14096,6 +14450,7 @@ mod tests {
 
         let index_zero_blank = ControlPlaneRaftRestartArtifact {
             cluster_name: "test-cluster".to_string(),
+            local_node_id: 1,
             log_store: ControlPlaneRaftLogStoreRestartArtifact {
                 entries: vec![blank_entry(0, 1, 0)],
                 ..Default::default()
@@ -14111,6 +14466,7 @@ mod tests {
 
         let non_bootstrap_index_zero_membership = ControlPlaneRaftRestartArtifact {
             cluster_name: "test-cluster".to_string(),
+            local_node_id: 1,
             log_store: ControlPlaneRaftLogStoreRestartArtifact {
                 entries: vec![membership_entry(1, 1, 0)],
                 ..Default::default()
@@ -14131,6 +14487,7 @@ mod tests {
     fn control_plane_raft_durable_restart_artifact_decode_validates_restart_pair() {
         let artifact = ControlPlaneRaftRestartArtifact {
             cluster_name: "test-cluster".to_string(),
+            local_node_id: 1,
             log_store: ControlPlaneRaftLogStoreRestartArtifact {
                 vote: Some(Vote::<ControlPlaneRaftLeaderId>::new_committed(3, 1)),
                 committed: Some(raft_log_id(3, 1, 2)),
@@ -14167,6 +14524,7 @@ mod tests {
         };
         let applied_after_committed = ControlPlaneRaftRestartArtifact {
             cluster_name: "test-cluster".to_string(),
+            local_node_id: 1,
             log_store: log_committed_through_two.clone(),
             state_machine: state_machine_restart_artifact_with_noops(3, 1, 3),
         };
@@ -14175,6 +14533,7 @@ mod tests {
 
         let missing_committed_gate = ControlPlaneRaftRestartArtifact {
             cluster_name: "test-cluster".to_string(),
+            local_node_id: 1,
             log_store: ControlPlaneRaftLogStoreRestartArtifact {
                 entries: vec![bootstrap_membership_entry(1), blank_entry(3, 1, 1)],
                 ..Default::default()
@@ -14186,6 +14545,7 @@ mod tests {
 
         let applied_unknown_to_log = ControlPlaneRaftRestartArtifact {
             cluster_name: "test-cluster".to_string(),
+            local_node_id: 1,
             log_store: ControlPlaneRaftLogStoreRestartArtifact {
                 vote: Some(Vote::<ControlPlaneRaftLeaderId>::new_committed(3, 1)),
                 committed: Some(raft_log_id(3, 1, 2)),
@@ -14205,6 +14565,7 @@ mod tests {
 
         let state_behind_purged_boundary = ControlPlaneRaftRestartArtifact {
             cluster_name: "test-cluster".to_string(),
+            local_node_id: 1,
             log_store: ControlPlaneRaftLogStoreRestartArtifact {
                 vote: Some(Vote::<ControlPlaneRaftLeaderId>::new_committed(3, 1)),
                 committed: Some(raft_log_id(3, 1, 2)),
@@ -14235,6 +14596,7 @@ mod tests {
         state_machine.apply_entry(blank_entry(3, 1, 2)).unwrap();
         let mut artifact = ControlPlaneRaftRestartArtifact {
             cluster_name: "test-cluster".to_string(),
+            local_node_id: 1,
             log_store: ControlPlaneRaftLogStoreRestartArtifact {
                 vote: Some(Vote::<ControlPlaneRaftLeaderId>::new_committed(3, 1)),
                 committed: Some(raft_log_id(3, 1, 2)),
@@ -14281,6 +14643,7 @@ mod tests {
             .unwrap();
         let mut stale_snapshot_wrong_membership = ControlPlaneRaftRestartArtifact {
             cluster_name: "test-cluster".to_string(),
+            local_node_id: 1,
             log_store: ControlPlaneRaftLogStoreRestartArtifact {
                 vote: Some(Vote::<ControlPlaneRaftLeaderId>::new_committed(3, 1)),
                 committed: Some(raft_log_id(3, 1, 2)),

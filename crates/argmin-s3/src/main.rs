@@ -1550,18 +1550,35 @@ fn build_experimental_raft_peer_transport_policy(
     ))
 }
 
+fn experimental_raft_startup_requires_local_leader(
+    peer_policy: Option<&ControlPlaneRaftPeerTransportPolicy>,
+) -> bool {
+    match peer_policy {
+        Some(policy) => policy.peers().len() == 1,
+        None => true,
+    }
+}
+
+#[cfg(test)]
 fn bind_experimental_raft_peer_listener(
     config: &ServerConfig,
     cluster_name: &str,
     local_node_id: ControlPlaneRaftNodeId,
 ) -> Result<Option<ExperimentalRaftPeerListener>, String> {
+    let policy =
+        build_experimental_raft_peer_transport_policy(config, cluster_name, local_node_id)?;
+    bind_experimental_raft_peer_listener_with_policy(config, policy)
+}
+
+fn bind_experimental_raft_peer_listener_with_policy(
+    config: &ServerConfig,
+    policy: Option<ControlPlaneRaftPeerTransportPolicy>,
+) -> Result<Option<ExperimentalRaftPeerListener>, String> {
     let Some(peer_socket_path) = config.control_plane_raft_peer_socket_path.as_deref() else {
         return Ok(None);
     };
-    let Some(policy) =
-        build_experimental_raft_peer_transport_policy(config, cluster_name, local_node_id)?
-    else {
-        return Ok(None);
+    let Some(policy) = policy else {
+        return Err("configured OpenRaft peer socket is missing peer transport policy".to_string());
     };
     let listener = bind_control_plane_raft_peer_socket(Path::new(peer_socket_path))?;
     Ok(Some(ExperimentalRaftPeerListener {
@@ -1635,30 +1652,53 @@ fn run_experimental_raft_control_plane_process(config: &ServerConfig) -> ! {
         .control_plane_raft_cluster_name
         .clone()
         .unwrap_or_else(|| format!("argmin-s3-experimental-control-plane-{socket_path}"));
+    let raft_peer_policy =
+        build_experimental_raft_peer_transport_policy(config, &cluster_name, node_id)
+            .unwrap_or_else(|error| {
+                eprintln!("{error}");
+                std::process::exit(1);
+            });
     let authority = block_on_control_plane_raft(&runtime, async {
-        let authority = ControlPlaneRaftAuthority::new_experimental_single_node_durable(
-            cluster_name.clone(),
-            node_id,
-            Path::new(state_path),
-        )
-        .await?;
+        let authority = if let Some(policy) = raft_peer_policy.clone() {
+            ControlPlaneRaftAuthority::new_experimental_unix_peer_durable(
+                cluster_name.clone(),
+                node_id,
+                Path::new(state_path),
+                policy,
+                CONTROL_PLANE_RAFT_PEER_RPC_IO_TIMEOUT,
+            )
+            .await?
+        } else {
+            ControlPlaneRaftAuthority::new_experimental_single_node_durable(
+                cluster_name.clone(),
+                node_id,
+                Path::new(state_path),
+            )
+            .await?
+        };
         if !authority.is_initialized().await? {
-            authority.initialize_single_node_membership(node_id).await?;
+            if let Some(policy) = &raft_peer_policy {
+                authority.initialize_membership(policy.peers()).await?;
+            } else {
+                authority.initialize_single_node_membership(node_id).await?;
+            }
             authority
                 .store_durable_restart_artifact(Path::new(state_path))
                 .await?;
         }
-        authority
-            .wait_for_current_leader(
-                node_id,
-                Duration::from_secs(1),
-                "experimental single-node control-plane startup leadership",
-            )
-            .await?;
+        if experimental_raft_startup_requires_local_leader(raft_peer_policy.as_ref()) {
+            authority
+                .wait_for_current_leader(
+                    node_id,
+                    Duration::from_secs(1),
+                    "experimental single-node control-plane startup leadership",
+                )
+                .await?;
+        }
         wait_for_experimental_raft_startup_catch_up(
             &authority,
             Duration::from_secs(1),
-            "experimental single-node control-plane startup committed replay",
+            "experimental control-plane startup committed replay",
         )
         .await?;
         authority
@@ -1670,11 +1710,13 @@ fn run_experimental_raft_control_plane_process(config: &ServerConfig) -> ! {
         eprintln!("failed to initialize experimental OpenRaft control-plane: {error}");
         std::process::exit(1);
     });
-    let raft_peer_listener = bind_experimental_raft_peer_listener(config, &cluster_name, node_id)
-        .unwrap_or_else(|error| {
-            eprintln!("{error}");
-            std::process::exit(1);
-        });
+    let raft_peer_listener =
+        bind_experimental_raft_peer_listener_with_policy(config, raft_peer_policy).unwrap_or_else(
+            |error| {
+                eprintln!("{error}");
+                std::process::exit(1);
+            },
+        );
     let mut control_plane = ExperimentalRaftControlPlane {
         runtime: runtime.clone(),
         authority: Arc::clone(&authority),
@@ -3001,6 +3043,32 @@ mod tests {
         drop(listener);
         fs::remove_file(&peer_socket_path).unwrap();
         fs::remove_dir(&test_dir).unwrap();
+    }
+
+    #[test]
+    fn experimental_raft_startup_leader_wait_tracks_peer_policy_size() {
+        assert!(experimental_raft_startup_requires_local_leader(None));
+
+        let single_node_policy = ControlPlaneRaftPeerTransportPolicy::from_peer_endpoints(
+            "process-peer-startup-leader-wait-test",
+            [(1, "/tmp/argmin-raft-node-1.sock".to_string())],
+            ControlPlaneRaftPeerTransportLimits::default(),
+        );
+        assert!(experimental_raft_startup_requires_local_leader(Some(
+            &single_node_policy
+        )));
+
+        let multi_node_policy = ControlPlaneRaftPeerTransportPolicy::from_peer_endpoints(
+            "process-peer-startup-leader-wait-test",
+            [
+                (1, "/tmp/argmin-raft-node-1.sock".to_string()),
+                (2, "/tmp/argmin-raft-node-2.sock".to_string()),
+            ],
+            ControlPlaneRaftPeerTransportLimits::default(),
+        );
+        assert!(!experimental_raft_startup_requires_local_leader(Some(
+            &multi_node_policy
+        )));
     }
 
     #[test]

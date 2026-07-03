@@ -10422,6 +10422,39 @@ Phase 12.3 progress:
   pins peer-listener binding from config. The remaining 12.3 process work is to
   run the authority with the Unix peer network factory and exercise real
   multi-process replication/failover rather than only the listener boundary.
+- Extended the durable OpenRaft restart artifact with a checksum-protected
+  local Raft node id. Startup now rejects artifacts that belong to a different
+  configured local node before constructing the Raft authority, while the
+  single-node durable constructor keeps its stricter membership/log-shape
+  validation layered on top. This gives the upcoming multi-node durable
+  constructor a direct local-identity guard without relying on single-node-only
+  membership assumptions.
+- Added the first durable Unix-peer authority constructor. It validates the
+  configured peer transport policy against the cluster name and local node id,
+  restores any durable restart artifact through the checksum-protected cluster
+  and local-node identity gates, and constructs OpenRaft with the Unix peer
+  network factory. Focused tests pin empty startup and wrong-local-node
+  rejection; the process path still needs to select this constructor and then
+  exercise real multi-process replication/failover.
+- Switched the experimental control-plane process startup to select the
+  Unix-peer durable authority when a Raft peer socket policy is configured. The
+  process now builds the peer transport policy once, initializes new Raft
+  membership from the configured peer map for that mode, reuses the same policy
+  for the listener identity checks, and keeps the previous single-node durable
+  constructor for deployments without peer socket configuration. Real
+  multi-process replication/failover smoke coverage remains the next 12.3
+  milestone.
+- Tightened the peer-mode durable startup boundary. Unix-peer process startup
+  no longer requires the local process to become leader before binding/serving
+  peer RPCs, so restored followers can rejoin and catch up through ordinary
+  Raft traffic. The Unix-peer durable constructor now also validates retained
+  and applied OpenRaft membership metadata, including endpoint payloads, against
+  the configured peer map before constructing the authority.
+- Clarified the startup split for configured peer sockets: a one-node peer
+  policy, including the local-peer-socket-only test/config shape, still waits
+  for local leadership before bootstrap/client-write paths run; only a
+  multi-node peer policy starts follower-capable without requiring this process
+  to be the current leader.
 
 1. define the replicated control-plane state machine:
    - state includes cluster epoch, PG count, PG state, PG acting sets, node
