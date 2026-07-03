@@ -8949,7 +8949,13 @@ Keep an explicit Phase 11 close-out before treating the phase as soak-clean:
 2. status: partial. Audit foreground work budgets against route-map validity deadlines. Any
    synchronous `DeleteBucket` loop that can run close to the validity window
    must either refresh/retry the whole operation from a fresh storage-cluster
-   snapshot or return a typed retryable response before the map expires;
+   snapshot or return a typed retryable response before the map expires. Soak
+   failures at `167a14cf` show this is still broader than route-map expiry:
+   foreground retries can spend a full request budget in authorization /
+   bucket-write-reservation snapshot before they reach the durable begin
+   adoption point, then spend another budget in `reservation_wait`. The budget
+   audit needs to include pre-begin authorization/snapshot work for a bucket
+   that already has a same-generation preserved delete attempt;
 3. status: open. Prefer whole-operation retry boundaries over mid-operation route-map swaps:
    when authorization and begin-delete are tied to a pinned storage snapshot,
    retry by re-running authorization plus begin-delete with a fresh snapshot and
@@ -9174,7 +9180,7 @@ Keep an explicit Phase 11 close-out before treating the phase as soak-clean:
          reservation wait. A later same-generation foreground retry could then
          spend its own budget in authorization/reservation snapshot against the
          preserved drain, even though the durable attempt was making background
-         progress. Status: completed. DeleteBucket now records a retryable
+         progress. Status: partial. DeleteBucket now records a retryable
          `reservation_wait` attempt outcome after the pre-reservation stream
          cleanup completes. Foreground retries and the background
          `BucketDeleteBegin` worker can adopt that cursor, skip the completed
@@ -9182,7 +9188,17 @@ Keep an explicit Phase 11 close-out before treating the phase as soak-clean:
          reservation wait with a fresh request budget. Storage and coordinator
          regressions cover this adopted path and assert it still performs the
          post-reservation object-PG validation before marking the bucket
-         deleting.
+         deleting. However, route-change-full-restart soak failures at
+         `167a14cf` still hit `bucket_write_reservation_snapshot_retry_budget_exhausted`
+         during authorization/pre-begin work and then
+         `bucket_delete_reservation_wait_begin_budget_exhausted` after adoption,
+         with no public object/MPU blockers and queues eventually draining. The
+         remaining gap is to make the durable attempt visible early enough that
+         foreground authorization/snapshot work can adopt or short-circuit the
+         same-generation preserved attempt, and to make `reservation_wait`
+         convergence prove forward progress rather than returning repeated
+         client-visible `OperationAborted` while the durable attempt is already
+         fenced and resumable.
          Final-visibility
          adoption now also has coordinator-level reclaim-worker regressions that
          seed durable `final_visibility_check` and `final_visibility_proven`
