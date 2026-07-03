@@ -1,0 +1,114 @@
+Heartbeat retry can run past requested lease budget
+Link: https://chatgpt.com/codex/cloud/security/findings/adbbe02b558c81918cbf5657517ff066?sev=&repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin
+Criticality: informational (attack path: ignore)
+Status: fixed
+
+# Metadata
+Repo: justincormack/argmin
+Commit: bb3bb71
+Author: justin@specialbusservice.com
+Created: 03/07/2026, 05:04:24
+Assignee: Unassigned
+Signals: Validated, Attack-path
+
+# Summary
+This commit introduced the retry loop and its budget-checking bug. The previous code sent a heartbeat request once and therefore did not have this specific post-deadline retry behavior.
+The commit adds bounded retry for Unix control-plane heartbeat refreshes, using the requested lease duration as the retry budget. However, after a retryable transport error, the loop checks that the current time is before the deadline, sleeps for min(remaining, backoff), and then immediately starts the next loop iteration. If the remaining time is less than or equal to the backoff, this sleeps until the deadline and then sends another request at or after the deadline. Repeated immediate failures can also lead to a final attempt starting at the lease boundary. That undermines the intended cap and can allow a stale heartbeat retry to be applied after the requested lease window. A robust implementation should recheck the deadline before each send attempt and avoid sleeping all the way to the deadline when another request will be sent afterward.
+
+# Resolution
+Fixed in e3b298c87cb6696c2afc8a9dcf6dd347238909cb (`Bound heartbeat retry by lease budget`).
+
+The fix makes `UnixControlPlaneClient::send_liveness_request` re-check the lease-derived retry deadline before every heartbeat retry send. If the deadline has been reached, it returns the last retryable transport error instead of sending a stale heartbeat. Heartbeat retries now use a short liveness-specific backoff so lost-response recovery can still happen inside the lease window without sleeping all the way to the deadline.
+
+The regression test `unix_control_plane_client_does_not_send_heartbeat_retry_at_lease_deadline` exercises the real `UnixControlPlaneClient::refresh_node_heartbeat` Unix socket path. It starts with the socket absent, binds the listener only after the 50 ms retry budget has expired, and asserts that no retry connection is accepted after that deadline. Adjacent lost-response heartbeat retry tests were also run to confirm valid in-window retries still work.
+
+# Validation
+## Rubric
+- [x] Confirm the heartbeat liveness retry loop has no deadline recheck immediately before each send attempt.
+- [x] Confirm the retry budget is exactly the requested heartbeat lease duration.
+- [x] Exercise the actual UnixControlPlaneClient::refresh_node_heartbeat path, not a standalone model.
+- [x] Force a retryable transport error before the budget expires and make the server available before the budget deadline.
+- [x] Demonstrate the next heartbeat request is accepted at/after the requested budget and applied by the authority, extending the lease.
+## Report
+Validated the finding with a targeted Rust unit-test PoC. Code review confirmed the vulnerable path: crates/storage/src/control_plane.rs:4006-4017 computes deadline once, checks Instant::now() < deadline only after a failed send, sleeps remaining.min(100ms), and then loops directly back to self.send_request without a pre-send deadline check. crates/storage/src/control_plane.rs:4441-4448 derives retry_budget from heartbeat.requested_lease_duration_ms for RefreshNodeHeartbeat. I added a focused PoC test that starts refresh_node_heartbeat while the Unix socket is absent, causing a retryable NotFound transport error; a real Unix listener appears 10ms later, before the 50ms requested lease/retry budget expires. The vulnerable loop sleeps to the deadline and then sends the heartbeat anyway. The server accepted it at ~51-53ms and applied it at modeled authority time 2060ms, extending the lease deadline to Some(2110). The test intentionally asserts the intended invariant that the retry must be accepted before the 50ms budget; it panics on the vulnerable commit. Command output: `BUG: heartbeat retry was accepted at 51.816475ms, at/after the requested 50ms budget, and the authority applied a fresh lease deadline Some(2110)`. I also checked memory/debugger tooling: valgrind and gdb were not installed; lldb was available and running the test under lldb reproduced the same failing assertion, though the process exited before a stopped backtrace could be collected.
+
+# Evidence
+crates/storage/src/control_plane.rs (L4006 to 4017)
+  Note: The deadline is checked only before sleeping; after sleeping up to the remaining budget, the loop retries without rechecking whether the deadline has already been reached.
+```
+        let deadline = Instant::now() + retry_budget;
+        loop {
+            match self.send_request(kind, payload) {
+                Ok(payload) => return Ok(payload),
+                Err(error)
+                    if error.is_retryable_control_plane_rpc_transport_error()
+                        && Instant::now() < deadline =>
+                {
+                    let now = Instant::now();
+                    let remaining = deadline.saturating_duration_since(now);
+                    std::thread::sleep(remaining.min(CONTROL_PLANE_RPC_CHECK_APPLIED_BACKOFF));
+                }
+```
+
+crates/storage/src/control_plane.rs (L4441 to 4448)
+  Note: The retry budget is derived from the heartbeat's requested lease duration, so retrying after this budget violates the intended lease-bound behavior.
+```
+        let mut payload = Vec::new();
+        write_node_heartbeat(&mut payload, &heartbeat)?;
+        let retry_budget = Duration::from_millis(heartbeat.requested_lease_duration_ms);
+        let payload = self.send_liveness_request(
+            ControlPlaneRpcKind::RefreshNodeHeartbeat,
+            &payload,
+            retry_budget,
+        )?;
+```
+
+# Attack-path analysis
+Final: ignore | Decider: model_decided | Matrix severity: ignore | Policy adjusted: ignore
+## Rationale
+Although the retry-deadline bug is real and was validated through the normal UnixControlPlaneClient heartbeat path, the probability × impact does not support a security severity. The path is internal-only over a private local Unix socket, not the public S3 HTTP API. The required preconditions are transient local control-plane transport errors and precise listener availability timing, with no shown attacker control from an in-scope surface. The impact is limited to lease/availability semantics, not compromise of data, identity, or execution. Therefore the original medium rating should be adjusted to ignore for security triage, while still fixing as a reliability/control-plane correctness bug.
+## Likelihood
+low - A remote S3 client cannot directly reach this Unix control-plane client path or control the local socket timing. Exploitation would require local same-host influence over control-plane transport failures or compromising an internal storage-node context, which is outside the normal attacker surface and often already equivalent to high local privilege over the service.
+## Impact
+ignore - The demonstrated effect is an internal stale heartbeat being applied after the requested retry budget, potentially delaying node lease expiry or peering decisions. This is an availability/consistency correctness issue, but no evidence shows unauthorized object read/write/delete, auth bypass, privilege escalation, secret disclosure, RCE, or a cross-boundary security impact.
+## Assumptions
+- Assessment is limited to repository artifacts in /workspace/argmin; no cloud APIs or live deployment were queried.
+- The relevant attacker model is the product threat model: remote or network S3 clients, plus realistic internal/local actors, not a process already running with the same Unix UID as argmin-s3.
+- Unix filesystem permissions are enforced as coded for the control-plane socket directory.
+- The provided validation PoC evidence accurately reflects execution of the normal UnixControlPlaneClient::refresh_node_heartbeat path.
+- control-plane-enabled storage-node deployment using ARGMIN_CONTROL_PLANE_SOCKET_PATH
+- storage node is running its periodic control-plane heartbeat refresh loop
+- a retryable Unix control-plane transport error occurs before the requested lease budget expires
+- the control-plane listener becomes reachable at or just after the heartbeat retry deadline
+- an attacker would need practical influence over local Unix socket availability/timing or equivalent same-host process conditions
+## Path
+StorageNodeRefreshLoop
+  -> UnixControlPlaneClient::refresh_node_heartbeat
+  -> send_liveness_request retry loop
+  -> local Unix control-plane socket
+  -> SingleAuthorityControlPlane::heartbeat
+  -> refreshed lease / delayed expiry
+## Path evidence
+- `crates/storage/src/control_plane.rs:4006-4017` - The retry loop checks Instant::now() < deadline only in the error guard, sleeps for remaining.min(backoff), then loops directly back to send_request without a pre-send deadline check.
+- `crates/storage/src/control_plane.rs:4441-4448` - The heartbeat retry budget is derived from heartbeat.requested_lease_duration_ms and passed to send_liveness_request for RefreshNodeHeartbeat.
+- `crates/storage/src/storage_node_server.rs:1136-1169` - The storage node runs a normal background control-plane refresh loop that calls refresh_and_install_control_plane_runtime_map with the configured requested lease duration.
+- `crates/argmin-s3/src/main.rs:1995-2015` - argmin-s3 wires storage-node heartbeat refresh to UnixControlPlaneClient using the configured control-plane socket path, lease duration, and refresh interval.
+- `crates/argmin-s3/src/main.rs:1789-1863` - The control-plane endpoint is an absolute local Unix socket, and its parent directory is required to be private and owned by the process UID.
+- `crates/storage/src/control_plane.rs:3413-3435` - When a heartbeat is accepted, the authority computes a fresh lease_deadline_ms from authority_now_ms plus the requested lease duration.
+- `crates/storage/src/control_plane.rs:1417-1437` - Lease expiry marks expired nodes unavailable and moves affected placement groups to peering, so a late accepted heartbeat can affect availability/lease semantics.
+- `crates/argmin-s3/src/main.rs:2466-2485` - The S3 frontend binds a TCP listener, but this is separate from the affected local Unix control-plane heartbeat path.
+## Narrative
+The underlying correctness bug is real: the Unix control-plane liveness retry loop computes one deadline, sleeps up to the remaining budget after a retryable error, and then can send a heartbeat without rechecking the deadline. The retry budget is the heartbeat requested lease duration, and validation demonstrated acceptance around 51-53 ms for a 50 ms budget. However, the affected path is an internal storage-node-to-control-plane Unix socket path protected by local filesystem permissions, not the remote S3 HTTP surface. The impact shown is lease/availability semantics, not unauthorized data access, credential compromise, code execution, or authentication bypass. As a security finding, this should be downgraded to ignore/low despite being a real runtime bug.
+## Controls
+- Control-plane RPC is exposed via UnixListener, not a TCP listener.
+- Control-plane socket path must be absolute.
+- Control-plane socket parent directory is created private and validated to have no group/other permissions.
+- Control-plane socket parent directory must be owned by the current UID.
+- argmin-s3 rejects running as root.
+- Heartbeat lease duration is bounded by MAX_HEARTBEAT_LEASE_MS = 10000.
+- S3 frontend authentication uses SigV4, but that control does not mediate this internal heartbeat path.
+## Blindspots
+- No deployment manifests, container files, Kubernetes services, or Terraform were present to confirm real-world exposure.
+- Static review cannot prove all possible operator deployments; a custom deployment could weaken Unix socket filesystem isolation.
+- The validation PoC proves the timing bug but does not demonstrate an external attacker chain or material security impact.
+- Control-plane multihost behavior appears to be evolving; older README text may not fully describe current production use.
