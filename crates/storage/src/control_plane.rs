@@ -8328,7 +8328,8 @@ fn state_parent(path: &Path) -> Option<&Path> {
 mod tests {
     use super::*;
     use crate::metadata_command::{
-        CreateBucketCommand, MetadataCommandEnvelope, MetadataCommandId, MetadataCommandLogIndex,
+        CreateBucketCommand, DeleteFinalizedBucketCommand, MarkBucketDeletingCommand,
+        MetadataCommandEnvelope, MetadataCommandId, MetadataCommandLogIndex,
         MetadataCommandPayload,
     };
     use crate::pg_store::PgStore;
@@ -8565,6 +8566,45 @@ mod tests {
             MetadataCommandPayload::CreateBucket(
                 CreateBucketCommand::from_config(&config, 123, 1).unwrap(),
             ),
+        )
+    }
+
+    fn logged_mark_bucket_deleting_command(
+        store: &PgStore,
+        log_index: u64,
+        bucket: &crate::BucketName,
+    ) -> MetadataCommandEnvelope {
+        let current = store.head_bucket_record_raw(bucket).unwrap();
+        let deleting_generation = store.next_bucket_execution_generation_candidate().unwrap();
+        MetadataCommandEnvelope::new(
+            MetadataCommandId::new(
+                ClusterEpoch::INITIAL,
+                PgId::new(store.pg_id()),
+                MetadataCommandLogIndex::new(log_index).unwrap(),
+            ),
+            MetadataCommandPayload::MarkBucketDeleting(MarkBucketDeletingCommand::from_bucket(
+                current.with_execution_generation(deleting_generation),
+            )),
+        )
+    }
+
+    fn logged_delete_finalized_bucket_command(
+        store: &PgStore,
+        log_index: u64,
+        bucket: &crate::BucketName,
+    ) -> MetadataCommandEnvelope {
+        let deleting = store.head_bucket_record_raw(bucket).unwrap();
+        MetadataCommandEnvelope::new(
+            MetadataCommandId::new(
+                ClusterEpoch::INITIAL,
+                PgId::new(store.pg_id()),
+                MetadataCommandLogIndex::new(log_index).unwrap(),
+            ),
+            MetadataCommandPayload::DeleteFinalizedBucket(DeleteFinalizedBucketCommand::new(
+                bucket.clone(),
+                deleting.bucket_execution_generation,
+                deleting.bucket_incarnation_generation,
+            )),
         )
     }
 
@@ -16670,6 +16710,61 @@ mod tests {
             authority.snapshot().pg(pg_id).unwrap().state(),
             PgState::Peering
         );
+    }
+
+    #[test]
+    fn finalized_bucket_cleanup_proof_progress_requires_logged_command() {
+        let tmp = test_util::tempdir();
+        let pg_id = PgId::new(33);
+        let store = PgStore::open(tmp.path(), pg_id.get()).unwrap();
+        let bucket = bucket_name("finalized-cleanup-proof");
+        let create = logged_create_bucket_command(pg_id, 1, &bucket);
+        store.apply_metadata_command_and_record(1, &create).unwrap();
+        let mark = logged_mark_bucket_deleting_command(&store, 2, &bucket);
+        store.apply_metadata_command_and_record(1, &mark).unwrap();
+        let cleanup_floor = pg_metadata_proof_from_store(&store);
+
+        let digest_only_cleanup = PgMetadataProof::new(
+            cleanup_floor.applied_log_index,
+            cleanup_floor.applied_log_hash,
+            cleanup_floor.state_digest.wrapping_add(1),
+        );
+        let cleanup_floor_epoch = ClusterEpoch::new(7).unwrap();
+        let cleanup_observed_epoch = ClusterEpoch::new(8).unwrap();
+        assert!(!metadata_proof_satisfies_active_primary_observation_floor(
+            cleanup_floor,
+            digest_only_cleanup,
+            Some(MetadataProofProgressProvenance {
+                floor_epoch: cleanup_floor_epoch,
+                kind: MetadataProofProgressKind::LocalEpoch,
+            }),
+            cleanup_observed_epoch,
+        ));
+
+        let delete = logged_delete_finalized_bucket_command(&store, 3, &bucket);
+        store.apply_metadata_command_and_record(1, &delete).unwrap();
+        let logged_cleanup = pg_metadata_proof_from_store(&store);
+        assert!(
+            logged_cleanup.applied_log_index > cleanup_floor.applied_log_index,
+            "finalized cleanup must advance the command-log index"
+        );
+        assert_ne!(
+            logged_cleanup.applied_log_hash, cleanup_floor.applied_log_hash,
+            "finalized cleanup must advance the command-log hash"
+        );
+        assert!(metadata_proof_satisfies_active_primary_observation_floor(
+            cleanup_floor,
+            logged_cleanup,
+            Some(MetadataProofProgressProvenance {
+                floor_epoch: cleanup_floor_epoch,
+                kind: MetadataProofProgressKind::LocalEpoch,
+            }),
+            cleanup_observed_epoch,
+        ));
+        assert!(matches!(
+            store.head_bucket_record_raw(&bucket),
+            Err(crate::MetadataError::BucketNotFound { .. })
+        ));
     }
 
     #[test]

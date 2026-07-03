@@ -452,13 +452,14 @@ when prioritised. They correspond to the remaining findings from the Phase 11 re
     lineage crossing remains separately handled by
     `metadata_proof_satisfies_imported_transfer_local_progress_floor` and explicit
     `MetadataProofProgressProvenance`.
-  - **Partially complete:** Add divergent-replica coverage.
+  - **Completed:** Add divergent-replica coverage.
     `complete_pg_peering_rejects_same_log_divergent_replica_digest` applies the same
     metadata command log to two local PG stores, injects an out-of-band materialised
     metadata mutation on one replica, and asserts peering completion rejects the resulting
-    same-log/different-digest proof. Remaining work is the positive paired test showing
-    finalized bucket cleanup now succeeds because the terminal command advances the command
-    log, not because digest-only progress is allowed.
+    same-log/different-digest proof. `finalized_bucket_cleanup_proof_progress_requires_logged_command`
+    is the positive paired test: digest-only cleanup progress is rejected, while finalized
+    bucket cleanup through `DeleteFinalizedBucket` is accepted because the terminal command
+    advances the command log.
 
   Exit criteria:
   1. Production finalized bucket cleanup is represented by a metadata command log entry.
