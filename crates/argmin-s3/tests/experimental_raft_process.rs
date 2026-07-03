@@ -39,11 +39,18 @@ impl Drop for TestDir {
 }
 
 struct ChildGuard {
-    child: Child,
+    node_id: u64,
+    child: Option<Child>,
 }
 
 impl ChildGuard {
-    fn spawn(bin: &Path, test_dir: &Path, cluster_name: &str, raft_node_id: u64) -> Self {
+    fn spawn(
+        bin: &Path,
+        test_dir: &Path,
+        cluster_name: &str,
+        raft_node_id: u64,
+        peer_node_ids: &[u64],
+    ) -> Self {
         let control_socket = test_dir.join(format!("control-{raft_node_id}.sock"));
         let peer_socket = test_dir.join(format!("raft-{raft_node_id}.sock"));
         let state_path = test_dir.join(format!("control-{raft_node_id}.state"));
@@ -52,11 +59,16 @@ impl ChildGuard {
             .expect("stdout log should be created");
         let stderr = File::create(test_dir.join(format!("node-{raft_node_id}.stderr.log")))
             .expect("stderr log should be created");
-        let peer_sockets = format!(
-            "101={},102={}",
-            test_dir.join("raft-101.sock").display(),
-            test_dir.join("raft-102.sock").display()
-        );
+        let peer_sockets = peer_node_ids
+            .iter()
+            .map(|node_id| {
+                format!(
+                    "{node_id}={}",
+                    test_dir.join(format!("raft-{node_id}.sock")).display()
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
         let storage_node_sockets = format!(
             "0={},1={}",
             test_dir.join("storage-node-0.sock").display(),
@@ -90,22 +102,38 @@ impl ChildGuard {
             .stderr(Stdio::from(stderr))
             .spawn()
             .expect("argmin-s3 control-plane process should start");
-        Self { child }
+        Self {
+            node_id: raft_node_id,
+            child: Some(child),
+        }
     }
 
     fn assert_running(&mut self) {
-        match self.child.try_wait() {
+        let child = self
+            .child
+            .as_mut()
+            .expect("argmin-s3 process should not be checked after stop");
+        match child.try_wait() {
             Ok(None) => {}
-            Ok(Some(status)) => panic!("argmin-s3 process exited early with {status}"),
+            Ok(Some(status)) => panic!(
+                "argmin-s3 process {} exited early with {status}",
+                self.node_id
+            ),
             Err(error) => panic!("argmin-s3 process status should be readable: {error}"),
+        }
+    }
+
+    fn stop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
         }
     }
 }
 
 impl Drop for ChildGuard {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        self.stop();
     }
 }
 
@@ -130,15 +158,35 @@ fn run_runtime_map_ready(bin: &Path, socket_path: &Path) -> Output {
         .expect("runtime-map ready helper should run")
 }
 
+fn run_set_pg_acting_set_live(
+    bin: &Path,
+    socket_path: &Path,
+    pg_id: u32,
+    acting_set: &[u32],
+) -> Output {
+    let mut command = Command::new(bin);
+    command
+        .arg("control-plane-set-pg-acting-set-live")
+        .arg(socket_path)
+        .arg(pg_id.to_string());
+    for node_id in acting_set {
+        command.arg(node_id.to_string());
+    }
+    command
+        .output()
+        .expect("set-pg-acting-set live helper should run")
+}
+
 fn wait_for_runtime_map_ready(
     bin: &Path,
     test_dir: &Path,
     children: &mut [&mut ChildGuard],
+    raft_node_ids: &[u64],
 ) -> (PathBuf, Output) {
-    let control_sockets = [
-        test_dir.join("control-101.sock"),
-        test_dir.join("control-102.sock"),
-    ];
+    let control_sockets = raft_node_ids
+        .iter()
+        .map(|node_id| test_dir.join(format!("control-{node_id}.sock")))
+        .collect::<Vec<_>>();
     let deadline = Instant::now() + Duration::from_secs(10);
     let mut last_failure = String::new();
     loop {
@@ -155,6 +203,33 @@ fn wait_for_runtime_map_ready(
         if Instant::now() >= deadline {
             panic!(
                 "control-plane runtime map did not become ready: {last_failure}\n{}",
+                process_logs(test_dir)
+            );
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn wait_for_runtime_map_ready_on(
+    bin: &Path,
+    socket: &Path,
+    test_dir: &Path,
+    children: &mut [&mut ChildGuard],
+) -> Output {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        for child in children.iter_mut() {
+            child.assert_running();
+        }
+        let output = run_runtime_map_ready(bin, socket);
+        if output.status.success() {
+            return output;
+        }
+        if Instant::now() >= deadline {
+            let last_failure = format_admin_failure(output.status, &output);
+            panic!(
+                "control-plane runtime map did not become ready on {}: {last_failure}\n{}",
+                socket.display(),
                 process_logs(test_dir)
             );
         }
@@ -197,6 +272,23 @@ fn follower_artifact_has_bootstrapped_state(path: &Path) -> Result<bool, String>
         && pg_ids == BTreeSet::from([PgId::new(0)]))
 }
 
+fn follower_artifact_pg_has_acting_set(
+    path: &Path,
+    pg_id: PgId,
+    acting_set: &[NodeId],
+) -> Result<bool, String> {
+    let artifact = match ControlPlaneRaftRestartArtifact::load_durable_artifact(path) {
+        Ok(artifact) => artifact,
+        Err(error) => return Err(error.to_string()),
+    };
+    let (_log_store, state_machine) = artifact.restore().map_err(|error| error.to_string())?;
+    let snapshot = state_machine.inner().snapshot();
+    let Some(pg) = snapshot.pg(pg_id) else {
+        return Ok(false);
+    };
+    Ok(pg.acting_set() == acting_set)
+}
+
 fn wait_for_follower_artifact(path: &Path, children: &mut [&mut ChildGuard]) {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
@@ -215,23 +307,68 @@ fn wait_for_follower_artifact(path: &Path, children: &mut [&mut ChildGuard]) {
     }
 }
 
+fn wait_for_follower_artifact_pg_acting_set(
+    path: &Path,
+    pg_id: PgId,
+    acting_set: &[NodeId],
+    children: &mut [&mut ChildGuard],
+) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        for child in children.iter_mut() {
+            child.assert_running();
+        }
+        let last_error = match follower_artifact_pg_has_acting_set(path, pg_id, acting_set) {
+            Ok(true) => return,
+            Ok(false) => "artifact restored but did not contain expected PG acting set".to_string(),
+            Err(error) => error,
+        };
+        if Instant::now() >= deadline {
+            panic!(
+                "follower durable artifact did not contain PG {} acting set {:?}: {last_error}",
+                pg_id.get(),
+                acting_set
+            );
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
 fn process_logs(test_dir: &Path) -> String {
     let mut out = String::new();
-    for node_id in [101, 102] {
-        for stream in ["stdout", "stderr"] {
-            let path = test_dir.join(format!("node-{node_id}.{stream}.log"));
-            let contents = fs::read_to_string(&path)
-                .unwrap_or_else(|error| format!("<failed to read {}: {error}>", path.display()));
-            out.push_str(&format!(
-                "== {} ==\n{}\n",
-                path.file_name()
-                    .and_then(|name| name.to_str())
-                    .unwrap_or("<unknown log>"),
-                contents
-            ));
-        }
+    let mut log_paths = fs::read_dir(test_dir)
+        .expect("test directory should be readable")
+        .filter_map(|entry| {
+            let path = entry.ok()?.path();
+            let name = path.file_name()?.to_str()?;
+            (name.starts_with("node-") && name.ends_with(".log")).then_some(path)
+        })
+        .collect::<Vec<_>>();
+    log_paths.sort();
+    for path in log_paths {
+        let contents = fs::read_to_string(&path)
+            .unwrap_or_else(|error| format!("<failed to read {}: {error}>", path.display()));
+        out.push_str(&format!(
+            "== {} ==\n{}\n",
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("<unknown log>"),
+            contents
+        ));
     }
     out
+}
+
+fn control_socket(test_dir: &Path, node_id: u64) -> PathBuf {
+    test_dir.join(format!("control-{node_id}.sock"))
+}
+
+fn peer_socket(test_dir: &Path, node_id: u64) -> PathBuf {
+    test_dir.join(format!("raft-{node_id}.sock"))
+}
+
+fn state_path(test_dir: &Path, node_id: u64) -> PathBuf {
+    test_dir.join(format!("control-{node_id}.state"))
 }
 
 #[test]
@@ -246,12 +383,17 @@ fn experimental_raft_two_control_plane_processes_replicate_bootstrap_to_follower
             .expect("system clock should be after Unix epoch")
             .as_nanos()
     );
-    let mut node102 = ChildGuard::spawn(&bin, test_dir.path(), &cluster_name, 102);
-    wait_for_socket_file(&test_dir.path().join("raft-102.sock"), &mut node102);
-    let mut node101 = ChildGuard::spawn(&bin, test_dir.path(), &cluster_name, 101);
+    let raft_node_ids = [101, 102];
+    let mut node102 = ChildGuard::spawn(&bin, test_dir.path(), &cluster_name, 102, &raft_node_ids);
+    wait_for_socket_file(&peer_socket(test_dir.path(), 102), &mut node102);
+    let mut node101 = ChildGuard::spawn(&bin, test_dir.path(), &cluster_name, 101, &raft_node_ids);
 
-    let (leader_socket, output) =
-        wait_for_runtime_map_ready(&bin, test_dir.path(), &mut [&mut node101, &mut node102]);
+    let (leader_socket, output) = wait_for_runtime_map_ready(
+        &bin,
+        test_dir.path(),
+        &mut [&mut node101, &mut node102],
+        &raft_node_ids,
+    );
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
         stdout.split_whitespace().nth(1) == Some("1"),
@@ -260,9 +402,64 @@ fn experimental_raft_two_control_plane_processes_replicate_bootstrap_to_follower
     );
 
     let follower_state = if leader_socket.ends_with("control-101.sock") {
-        test_dir.path().join("control-102.state")
+        state_path(test_dir.path(), 102)
     } else {
-        test_dir.path().join("control-101.state")
+        state_path(test_dir.path(), 101)
     };
     wait_for_follower_artifact(&follower_state, &mut [&mut node101, &mut node102]);
+}
+
+#[test]
+fn experimental_raft_restarted_control_plane_follower_catches_up_process_state() {
+    let bin = argmin_s3_bin();
+    let test_dir = TestDir::new("experimental-raft-process-follower-restart");
+    let cluster_name = format!(
+        "process-follower-restart-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after Unix epoch")
+            .as_nanos()
+    );
+    let raft_node_ids = [101, 102, 103];
+    let mut node102 = ChildGuard::spawn(&bin, test_dir.path(), &cluster_name, 102, &raft_node_ids);
+    wait_for_socket_file(&peer_socket(test_dir.path(), 102), &mut node102);
+    let mut node103 = ChildGuard::spawn(&bin, test_dir.path(), &cluster_name, 103, &raft_node_ids);
+    wait_for_socket_file(&peer_socket(test_dir.path(), 103), &mut node103);
+    let mut node101 = ChildGuard::spawn(&bin, test_dir.path(), &cluster_name, 101, &raft_node_ids);
+    let leader_control_socket = control_socket(test_dir.path(), 101);
+    let output = wait_for_runtime_map_ready_on(
+        &bin,
+        &leader_control_socket,
+        test_dir.path(),
+        &mut [&mut node101, &mut node102, &mut node103],
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.split_whitespace().nth(1) == Some("1"),
+        "ready helper should report one PG route from {}: {stdout}",
+        leader_control_socket.display()
+    );
+    wait_for_follower_artifact(
+        &state_path(test_dir.path(), 103),
+        &mut [&mut node101, &mut node102, &mut node103],
+    );
+
+    node103.stop();
+    let output = run_set_pg_acting_set_live(&bin, &leader_control_socket, 0, &[1]);
+    assert!(
+        output.status.success(),
+        "live acting-set change failed: {}\n{}",
+        format_admin_failure(output.status, &output),
+        process_logs(test_dir.path())
+    );
+
+    let mut restarted103 =
+        ChildGuard::spawn(&bin, test_dir.path(), &cluster_name, 103, &raft_node_ids);
+    wait_for_follower_artifact_pg_acting_set(
+        &state_path(test_dir.path(), 103),
+        PgId::new(0),
+        &[NodeId::new(1)],
+        &mut [&mut node101, &mut node102, &mut restarted103],
+    );
 }

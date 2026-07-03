@@ -10474,6 +10474,13 @@ Phase 12.3 progress:
   follower's durable artifact to prove the bootstrap command was replicated and
   checkpointed through the process boundary. Failover and restarted-peer catchup
   remain the next process-level layer.
+- Extended the real-process Raft smoke to cover restarted follower catchup in a
+  three-process quorum. The test starts two followers plus the deterministic
+  seed leader, waits for bootstrap replication, stops one follower, commits a PG
+  acting-set change while the follower is down, restarts that follower from its
+  durable artifact, and verifies the restarted process catches up and
+  checkpoints the missed command through ordinary Unix peer traffic. Leader
+  failover remains the next process-level layer.
 
 1. define the replicated control-plane state machine:
    - state includes cluster epoch, PG count, PG state, PG acting sets, node
