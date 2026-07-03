@@ -4,6 +4,11 @@ use s3_types::{AclGrants, BucketVersioningState};
 use std::collections::HashMap;
 
 #[cfg(test)]
+use crate::metadata_command::{
+    DeleteFinalizedBucketCommand, MetadataCommandEnvelope, MetadataCommandId,
+    MetadataCommandLogIndex, MetadataCommandPayload,
+};
+#[cfg(test)]
 use crate::{
     BucketEncryptionConfig, BucketObjectLockConfig, BucketOwnershipControls, CreateBucketConfig,
     PublicAccessBlockConfig, PutBucketSubresource,
@@ -70,7 +75,24 @@ impl SharedStorageNode {
     pub fn delete_bucket_metadata(&self, bucket: &BucketName) -> Result<(), BucketWriteDrainError> {
         let pg_id = self.pg_topology.bucket_pg_for(bucket);
         let bucket_pg = self.get_pg(pg_id)?;
-        PgMetadataStore::delete_finalized_bucket(&*bucket_pg, bucket)?;
+        let deleting = PgMetadataStore::head_bucket_record_raw(&*bucket_pg, bucket)?;
+        let state = bucket_pg.metadata_command_replica_state()?;
+        let log_index = MetadataCommandLogIndex::new(state.applied_log_index + 1)
+            .expect("metadata command log index is non-zero");
+        let command = MetadataCommandEnvelope::new(
+            MetadataCommandId::new(ClusterEpoch::INITIAL, PgId::new(pg_id), log_index),
+            MetadataCommandPayload::DeleteFinalizedBucket(DeleteFinalizedBucketCommand::new(
+                bucket.clone(),
+                deleting.bucket_execution_generation,
+                deleting.bucket_incarnation_generation,
+            )),
+        );
+        bucket_pg
+            .apply_metadata_command_and_record(0, &command)
+            .map_err(|error| match error {
+                BucketSnapshotLoadError::Store(error) => BucketWriteDrainError::Store(error),
+                BucketSnapshotLoadError::Metadata(error) => BucketWriteDrainError::Metadata(error),
+            })?;
         Ok(())
     }
 

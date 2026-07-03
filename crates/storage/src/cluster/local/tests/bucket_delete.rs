@@ -1,4 +1,32 @@
 use super::*;
+use crate::metadata_command::DeleteFinalizedBucketCommand;
+
+fn apply_delete_finalized_bucket_command_to_pg(
+    pg: &crate::PgStore,
+    node_id: NodeId,
+    pg_id: PgId,
+    log_index: MetadataCommandLogIndex,
+    bucket: &BucketName,
+) {
+    let deleting = crate::PgMetadataStore::head_bucket_record_raw(pg, bucket).unwrap();
+    let command = MetadataCommandEnvelope::new(
+        MetadataCommandId::new(ClusterEpoch::INITIAL, pg_id, log_index),
+        MetadataCommandPayload::DeleteFinalizedBucket(DeleteFinalizedBucketCommand::new(
+            bucket.clone(),
+            deleting.bucket_execution_generation,
+            deleting.bucket_incarnation_generation,
+        )),
+    );
+    pg.apply_metadata_command_and_record(node_id.as_u32(), &command)
+        .unwrap();
+}
+
+fn delete_bucket_row_for_divergence_test(pg: &crate::PgStore, bucket: &BucketName) {
+    pg.connection()
+        .execute("DELETE FROM buckets WHERE name = ?1", [bucket.as_str()])
+        .unwrap();
+    pg.refresh_metadata_command_state_digest().unwrap();
+}
 
 #[test]
 fn finalized_bucket_delete_clears_pending_versioning_command_for_recreate() {
@@ -571,10 +599,11 @@ fn stale_bucket_finalize_claim_for_deleted_generation_does_not_block_recreated_b
     .expect("old delete generation should be claimable");
     drop(primary_pg);
 
+    let pg_id = PgId::new(1);
+    let delete_log_index = map.test_next_metadata_command_log_index(pg_id);
     for node_id in node_ids {
         let pg = map.node(node_id).unwrap().storage_node().get_pg(1).unwrap();
-        crate::PgMetadataStore::delete_finalized_bucket(&*pg, &bucket)
-            .expect("test should be able to simulate old-generation finalizer row deletion");
+        apply_delete_finalized_bucket_command_to_pg(&pg, node_id, pg_id, delete_log_index, &bucket);
     }
 
     create_test_bucket(&cluster, &bucket);
@@ -1756,16 +1785,17 @@ fn finalized_bucket_delete_fails_closed_on_active_replica() {
 
     let primary_node = map.node(NodeId::new(1)).unwrap().storage_node();
     let primary_pg = primary_node.get_pg(1).unwrap();
-    crate::PgMetadataStore::delete_finalized_bucket(&*primary_pg, &bucket).unwrap();
-    primary_pg.refresh_metadata_command_state_digest().unwrap();
+    delete_bucket_row_for_divergence_test(&primary_pg, &bucket);
     drop(primary_pg);
+
+    let other_deleted_node = map.node(NodeId::new(2)).unwrap().storage_node();
+    let other_deleted_pg = other_deleted_node.get_pg(1).unwrap();
+    delete_bucket_row_for_divergence_test(&other_deleted_pg, &bucket);
+    drop(other_deleted_pg);
 
     let divergent_node = map.node(NodeId::new(0)).unwrap().storage_node();
     let divergent_pg = divergent_node.get_pg(1).unwrap();
-    crate::PgMetadataStore::delete_finalized_bucket(&*divergent_pg, &bucket).unwrap();
-    divergent_pg
-        .refresh_metadata_command_state_digest()
-        .unwrap();
+    delete_bucket_row_for_divergence_test(&divergent_pg, &bucket);
     crate::PgMetadataStore::create_bucket(
         &*divergent_pg,
         &bucket,

@@ -40,6 +40,57 @@ fn create_bucket_probe_command(
     )
 }
 
+fn mark_bucket_deleting_probe_command(
+    store: &PgStore,
+    log_index: u64,
+    bucket: &BucketName,
+) -> MetadataCommandEnvelope {
+    let current = store.head_bucket_record_raw(bucket).unwrap();
+    let deleting_generation = store.next_bucket_execution_generation_candidate().unwrap();
+    MetadataCommandEnvelope::new(
+        MetadataCommandId::new(
+            ClusterEpoch::INITIAL,
+            PgId::new(store.pg_id),
+            MetadataCommandLogIndex::new(log_index).unwrap(),
+        ),
+        MetadataCommandPayload::MarkBucketDeleting(MarkBucketDeletingCommand::from_bucket(
+            current.with_execution_generation(deleting_generation),
+        )),
+    )
+}
+
+fn delete_finalized_bucket_probe_command(
+    store: &PgStore,
+    log_index: u64,
+    bucket: &BucketName,
+) -> MetadataCommandEnvelope {
+    let deleting = store.head_bucket_record_raw(bucket).unwrap();
+    MetadataCommandEnvelope::new(
+        MetadataCommandId::new(
+            ClusterEpoch::INITIAL,
+            PgId::new(store.pg_id),
+            MetadataCommandLogIndex::new(log_index).unwrap(),
+        ),
+        MetadataCommandPayload::DeleteFinalizedBucket(DeleteFinalizedBucketCommand::new(
+            bucket.clone(),
+            deleting.bucket_execution_generation,
+            deleting.bucket_incarnation_generation,
+        )),
+    )
+}
+
+fn apply_delete_finalized_bucket_probe_command(
+    store: &PgStore,
+    node_id: u32,
+    log_index: u64,
+    bucket: &BucketName,
+) -> MetadataCommandReplicaState {
+    let command = delete_finalized_bucket_probe_command(store, log_index, bucket);
+    store
+        .apply_metadata_command_and_record(node_id, &command)
+        .unwrap()
+}
+
 fn rebase_probe_commands(
     cluster_epoch: ClusterEpoch,
     pg_id: PgId,
@@ -1180,10 +1231,12 @@ fn delete_finalized_bucket_clears_finalizer_claim() {
     let store = PgStore::open(tmp.path(), 11).unwrap();
     let bucket_a = trusted_bucket_name("finalize-claim-clear-a");
     let bucket_b = trusted_bucket_name("finalize-claim-clear-b");
-    create_probe_bucket_direct(&store, &bucket_a);
-    create_probe_bucket_direct(&store, &bucket_b);
-
-    store.mark_bucket_deleting(&bucket_a).unwrap();
+    let create_a = create_bucket_probe_command(11, 1, bucket_a.clone(), 1);
+    store
+        .apply_metadata_command_and_record(0, &create_a)
+        .unwrap();
+    let mark_a = mark_bucket_deleting_probe_command(&store, 2, &bucket_a);
+    store.apply_metadata_command_and_record(0, &mark_a).unwrap();
     let deleting_a = store.head_bucket_record_raw(&bucket_a).unwrap();
     store
         .acquire_bucket_delete_finalize_claim(
@@ -1199,7 +1252,7 @@ fn delete_finalized_bucket_clears_finalizer_claim() {
         .unwrap()
         .expect("deleting bucket should be finalizer-claimable");
 
-    store.delete_finalized_bucket(&bucket_a).unwrap();
+    apply_delete_finalized_bucket_probe_command(&store, 0, 3, &bucket_a);
     let released = store
         .release_bucket_delete_finalize_claim(
             &bucket_a,
@@ -1214,7 +1267,12 @@ fn delete_finalized_bucket_clears_finalizer_claim() {
         MetadataError::ReclaimClaimNotFound { .. }
     ));
 
-    store.mark_bucket_deleting(&bucket_b).unwrap();
+    let create_b = create_bucket_probe_command(11, 4, bucket_b.clone(), 4);
+    store
+        .apply_metadata_command_and_record(0, &create_b)
+        .unwrap();
+    let mark_b = mark_bucket_deleting_probe_command(&store, 5, &bucket_b);
+    store.apply_metadata_command_and_record(0, &mark_b).unwrap();
     let deleting_b = store.head_bucket_record_raw(&bucket_b).unwrap();
     assert!(
         store
@@ -1235,55 +1293,6 @@ fn delete_finalized_bucket_clears_finalizer_claim() {
 }
 
 #[test]
-fn delete_finalized_bucket_refreshes_metadata_command_state_digest() {
-    let tmp = test_util::tempdir();
-    let store = PgStore::open(tmp.path(), 11).unwrap();
-    let bucket = trusted_bucket_name("finalize-digest-refresh");
-    let create = create_bucket_probe_command(11, 1, bucket.clone(), 1);
-    store.apply_metadata_command_and_record(0, &create).unwrap();
-
-    let current = store.head_bucket_record_raw(&bucket).unwrap();
-    let deleting_generation = store.next_bucket_execution_generation_candidate().unwrap();
-    let mark = MetadataCommandEnvelope::new(
-        MetadataCommandId::new(
-            ClusterEpoch::INITIAL,
-            PgId::new(11),
-            MetadataCommandLogIndex::new(2).unwrap(),
-        ),
-        MetadataCommandPayload::MarkBucketDeleting(MarkBucketDeletingCommand::from_bucket(
-            current.with_execution_generation(deleting_generation),
-        )),
-    );
-    store.apply_metadata_command_and_record(0, &mark).unwrap();
-
-    let before_delete = store.metadata_command_replica_state().unwrap();
-    store.delete_finalized_bucket(&bucket).unwrap();
-    let after_delete = store.metadata_command_replica_state().unwrap();
-    assert_eq!(
-        after_delete.applied_log_index,
-        before_delete.applied_log_index
-    );
-    assert_eq!(
-        after_delete.applied_log_hash,
-        before_delete.applied_log_hash
-    );
-    assert_eq!(
-        after_delete.state_digest,
-        store.cached_metadata_state_digest().unwrap()
-    );
-    assert_eq!(
-        after_delete.state_digest,
-        store.metadata_state_digest().unwrap()
-    );
-
-    let next = create_bucket_probe_command(11, 3, trusted_bucket_name("finalize-digest-next"), 3);
-    assert_eq!(
-        store.metadata_command_acceptance(0, &next).unwrap(),
-        MetadataCommandAcceptance::Apply
-    );
-}
-
-#[test]
 fn delete_finalized_bucket_command_advances_metadata_command_log() {
     let tmp = test_util::tempdir();
     let store = PgStore::open(tmp.path(), 11).unwrap();
@@ -1291,33 +1300,10 @@ fn delete_finalized_bucket_command_advances_metadata_command_log() {
     let create = create_bucket_probe_command(11, 1, bucket.clone(), 1);
     store.apply_metadata_command_and_record(0, &create).unwrap();
 
-    let current = store.head_bucket_record_raw(&bucket).unwrap();
-    let deleting_generation = store.next_bucket_execution_generation_candidate().unwrap();
-    let mark = MetadataCommandEnvelope::new(
-        MetadataCommandId::new(
-            ClusterEpoch::INITIAL,
-            PgId::new(11),
-            MetadataCommandLogIndex::new(2).unwrap(),
-        ),
-        MetadataCommandPayload::MarkBucketDeleting(MarkBucketDeletingCommand::from_bucket(
-            current.with_execution_generation(deleting_generation),
-        )),
-    );
+    let mark = mark_bucket_deleting_probe_command(&store, 2, &bucket);
     store.apply_metadata_command_and_record(0, &mark).unwrap();
-    let deleting = store.head_bucket_record_raw(&bucket).unwrap();
     let before_delete = store.metadata_command_replica_state().unwrap();
-    let delete = MetadataCommandEnvelope::new(
-        MetadataCommandId::new(
-            ClusterEpoch::INITIAL,
-            PgId::new(11),
-            MetadataCommandLogIndex::new(3).unwrap(),
-        ),
-        MetadataCommandPayload::DeleteFinalizedBucket(DeleteFinalizedBucketCommand::new(
-            bucket.clone(),
-            deleting.bucket_execution_generation,
-            deleting.bucket_incarnation_generation,
-        )),
-    );
+    let delete = delete_finalized_bucket_probe_command(&store, 3, &bucket);
 
     let after_delete = store.apply_metadata_command_and_record(0, &delete).unwrap();
     assert_eq!(after_delete.applied_log_index, 3);
@@ -1347,23 +1333,17 @@ fn stale_delete_finalized_bucket_command_does_not_delete_recreated_bucket() {
     let create = create_bucket_probe_command(11, 1, bucket.clone(), 1);
     store.apply_metadata_command_and_record(0, &create).unwrap();
 
-    let current = store.head_bucket_record_raw(&bucket).unwrap();
-    let deleting_generation = store.next_bucket_execution_generation_candidate().unwrap();
-    let mark = MetadataCommandEnvelope::new(
-        MetadataCommandId::new(
-            ClusterEpoch::INITIAL,
-            PgId::new(11),
-            MetadataCommandLogIndex::new(2).unwrap(),
-        ),
-        MetadataCommandPayload::MarkBucketDeleting(MarkBucketDeletingCommand::from_bucket(
-            current.with_execution_generation(deleting_generation),
-        )),
-    );
+    let mark = mark_bucket_deleting_probe_command(&store, 2, &bucket);
     store.apply_metadata_command_and_record(0, &mark).unwrap();
     let old_deleting = store.head_bucket_record_raw(&bucket).unwrap();
-    store.delete_finalized_bucket(&bucket).unwrap();
+    apply_delete_finalized_bucket_probe_command(&store, 0, 3, &bucket);
 
-    let recreate = create_bucket_probe_command(11, 3, bucket.clone(), deleting_generation + 1);
+    let recreate = create_bucket_probe_command(
+        11,
+        4,
+        bucket.clone(),
+        old_deleting.bucket_execution_generation + 1,
+    );
     store
         .apply_metadata_command_and_record(0, &recreate)
         .unwrap();
@@ -1377,7 +1357,7 @@ fn stale_delete_finalized_bucket_command_does_not_delete_recreated_bucket() {
         MetadataCommandId::new(
             ClusterEpoch::INITIAL,
             PgId::new(11),
-            MetadataCommandLogIndex::new(4).unwrap(),
+            MetadataCommandLogIndex::new(5).unwrap(),
         ),
         MetadataCommandPayload::DeleteFinalizedBucket(DeleteFinalizedBucketCommand::new(
             bucket.clone(),
@@ -1389,30 +1369,19 @@ fn stale_delete_finalized_bucket_command_does_not_delete_recreated_bucket() {
     let after_stale = store
         .apply_metadata_command_and_record(0, &stale_delete)
         .unwrap();
-    assert_eq!(after_stale.applied_log_index, 4);
+    assert_eq!(after_stale.applied_log_index, 5);
     assert_eq!(store.head_bucket_record_raw(&bucket).unwrap(), recreated);
 }
 
 #[test]
-fn delete_finalized_bucket_commit_failure_invalidates_clean_digest_revision() {
+fn delete_finalized_bucket_command_commit_failure_invalidates_clean_digest_revision() {
     let tmp = test_util::tempdir();
     let store = PgStore::open(tmp.path(), 11).unwrap();
-    let bucket = trusted_bucket_name("finalize-digest-rollback");
+    let bucket = trusted_bucket_name("finalize-command-rollback");
     let create = create_bucket_probe_command(11, 1, bucket.clone(), 1);
     store.apply_metadata_command_and_record(0, &create).unwrap();
 
-    let current = store.head_bucket_record_raw(&bucket).unwrap();
-    let deleting_generation = store.next_bucket_execution_generation_candidate().unwrap();
-    let mark = MetadataCommandEnvelope::new(
-        MetadataCommandId::new(
-            ClusterEpoch::INITIAL,
-            PgId::new(11),
-            MetadataCommandLogIndex::new(2).unwrap(),
-        ),
-        MetadataCommandPayload::MarkBucketDeleting(MarkBucketDeletingCommand::from_bucket(
-            current.with_execution_generation(deleting_generation),
-        )),
-    );
+    let mark = mark_bucket_deleting_probe_command(&store, 2, &bucket);
     store.apply_metadata_command_and_record(0, &mark).unwrap();
     store.refresh_metadata_command_state_digest().unwrap();
     assert_ne!(
@@ -1420,14 +1389,15 @@ fn delete_finalized_bucket_commit_failure_invalidates_clean_digest_revision() {
         UNCLEAN_METADATA_DIGEST_REVISION
     );
 
-    store.fail_next_delete_finalized_bucket_commit();
-    let err = store.delete_finalized_bucket(&bucket).unwrap_err();
+    store.fail_next_metadata_txn_commit();
+    let delete = delete_finalized_bucket_probe_command(&store, 3, &bucket);
+    let err = store
+        .apply_metadata_command_and_record(0, &delete)
+        .unwrap_err();
     assert!(matches!(
         err,
-        MetadataError::Db {
-            context: "delete finalized bucket (commit txn)",
-            ..
-        }
+        BucketSnapshotLoadError::Store(_)
+            | BucketSnapshotLoadError::Metadata(MetadataError::Db { .. })
     ));
     assert_eq!(
         store.clean_metadata_digest_revision.load(Ordering::Relaxed),
@@ -2068,19 +2038,6 @@ fn metadata_txn_commit_failure_recovers_representative_mutators() {
         "mark-bucket-deleting",
         |store| create_probe_bucket_direct(store, &trusted_bucket_name("commit-fail-delete")),
         |store| store.mark_bucket_deleting(&trusted_bucket_name("commit-fail-delete")),
-    );
-
-    assert_commit_failure_recovers_for_metadata_mutator(
-        "delete-finalized-bucket",
-        |store| {
-            create_probe_bucket_direct(store, &trusted_bucket_name("commit-fail-finalized"));
-            PgMetadataStore::mark_bucket_deleting(
-                store,
-                &trusted_bucket_name("commit-fail-finalized"),
-            )
-            .unwrap();
-        },
-        |store| store.delete_finalized_bucket(&trusted_bucket_name("commit-fail-finalized")),
     );
 
     assert_commit_failure_recovers_for_metadata_mutator(

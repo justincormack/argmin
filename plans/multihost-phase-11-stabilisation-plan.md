@@ -232,17 +232,15 @@ Progress update:
    trigger-body check remains the place to detect the stale-trigger root cause and decide
    whether that should become fail-closed.
 
-3. **Generalise the existing commit-fault hook.** **Completed.** The
-   `fail_next_delete_finalized_bucket_commit`
-   flag (`pg_store.rs:387`) is a per-mutator test hook. Lift it to a generic
-   `fail_next_metadata_txn_commit` hook so the crash-recovery property test (work item 6)
-   can inject a commit failure into any digest-affecting transaction, not just finalized
-   bucket delete.
+3. **Generalise the existing commit-fault hook.** **Completed.** This replaced the old
+   finalized-bucket-only commit-fault hook with a generic `fail_next_metadata_txn_commit`
+   hook so the crash-recovery property test (work item 6) can inject a commit failure into
+   any digest-affecting transaction.
 
    Progress update: the generic hook now exists on `PgStore` and is consumed by
    `with_immediate_txn` immediately before `COMMIT`. It rolls back, invalidates the clean
    digest revision, and returns the caller's normal commit-context error. The old
-   delete-finalized hook still exists for its legacy targeted regression, but the generic
+   delete-finalized hook has been removed; finalized bucket cleanup regressions now use the generic
    hook now also runs at hand-written metadata transaction commit points in
    `metadata.rs`. Single-statement mutators with no explicit transaction, such as stream
    upload session create, have no injected commit window by design; the Slice 1 inventory
@@ -304,8 +302,8 @@ Progress update:
    mutators (`create_bucket`, bucket versioning, bucket ACL, bucket encryption, bucket
    Object Lock, public access block put/delete, ownership controls put/delete, ABAC,
    bucket subresource put/delete, `mark_bucket_deleting`, and create multipart upload),
-   explicit bucket lifecycle transactions (`delete_finalized_bucket`,
-   metadata-command reservation release, expired drain clear, and drain heartbeat), plus
+   explicit bucket lifecycle transactions (metadata-command reservation release,
+   expired drain clear, and drain heartbeat), plus
    representative hand-written metadata transactions (object metadata put, object-version
    delete, object generation reservation, segmented object put, object-segment reclaim,
    multipart reclaim, multipart upload delete, direct multipart part upsert, committed
@@ -419,16 +417,15 @@ when prioritised. They correspond to the remaining findings from the Phase 11 re
     bucket cleanup advances `applied_log_index`/`applied_log_hash` instead of changing only
     `state_digest`. Initial implementation has added `DeleteFinalizedBucket`, routes
     production finalization through the pending-command fanout, and covers command-log
-    advancement plus stale-generation no-op safety. Remaining work in this item is to
-    audit/convert legacy direct-helper tests.
-  - **Completed for production serving paths:** Remove direct production digest refresh for
-    finalized bucket cleanup. The old node-client and Unix RPC
-    `delete_finalized_bucket` surface has been removed, and the underlying direct
-    `PgMetadataStore::delete_finalized_bucket` helper is now test-only. Production bucket
-    finalization uses the terminal command path, so serving code cannot refresh
-    `metadata_command_replica_state.state_digest` for finalized-bucket cleanup without
-    appending a metadata command. Remaining cleanup is to convert or remove legacy tests
-    that still depend on the test-only direct helper.
+    advancement plus stale-generation no-op safety. Legacy direct-helper tests have been
+    converted to use `DeleteFinalizedBucket` command application, or to explicitly inject
+    invalid out-of-band divergence when testing fail-closed behavior.
+  - **Completed:** Remove direct production digest refresh for finalized bucket cleanup.
+    The old node-client and Unix RPC `delete_finalized_bucket` surface has been removed,
+    and the underlying direct `PgMetadataStore::delete_finalized_bucket` helper has been
+    deleted. Production and test finalization paths now use the terminal command path, so
+    serving code cannot refresh `metadata_command_replica_state.state_digest` for
+    finalized-bucket cleanup without appending a metadata command.
   - **Tighten imported metadata-transfer proofs.**
     `metadata_proof_satisfies_fenced_transfer_source_floor` currently accepts a
     non-zero-hash different-digest proof when `active_metadata_transfer_imported` is set.

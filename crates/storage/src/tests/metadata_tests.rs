@@ -1,4 +1,8 @@
 use super::{bucket_name, multipart_upload_id, object_key, stream_session_id};
+use crate::metadata_command::{
+    DeleteFinalizedBucketCommand, MetadataCommandEnvelope, MetadataCommandId,
+    MetadataCommandLogIndex, MetadataCommandPayload,
+};
 use crate::traits::{PgMetadataStore, ShardStore};
 use crate::types::*;
 use std::num::NonZeroU64;
@@ -394,6 +398,38 @@ fn make_pg_store() -> (test_util::TempDir, crate::PgStore) {
     (dir, store)
 }
 
+fn delete_finalized_bucket_command(
+    store: &crate::PgStore,
+    bucket: &BucketName,
+    log_index: u64,
+) -> MetadataCommandEnvelope {
+    let deleting = store.head_bucket_record_raw(bucket).unwrap();
+    MetadataCommandEnvelope::new(
+        MetadataCommandId::new(
+            ClusterEpoch::INITIAL,
+            PgId::new(0),
+            MetadataCommandLogIndex::new(log_index).unwrap(),
+        ),
+        MetadataCommandPayload::DeleteFinalizedBucket(DeleteFinalizedBucketCommand::new(
+            bucket.clone(),
+            deleting.bucket_execution_generation,
+            deleting.bucket_incarnation_generation,
+        )),
+    )
+}
+
+fn apply_delete_finalized_bucket_command(
+    store: &crate::PgStore,
+    bucket: &BucketName,
+    log_index: u64,
+) {
+    store.refresh_metadata_command_state_digest().unwrap();
+    let command = delete_finalized_bucket_command(store, bucket, log_index);
+    store
+        .apply_metadata_command_and_record(0, &command)
+        .unwrap();
+}
+
 #[test]
 fn file_pg_store_uses_in_memory_temp_store() {
     let (_dir, store) = make_pg_store();
@@ -533,32 +569,22 @@ fn file_bucket_metadata_create_head_list_delete() {
     assert_eq!(owner1[0].name, "alpha");
     assert_eq!(owner1[1].name, "beta");
 
+    store.refresh_metadata_command_state_digest().unwrap();
+    let active_delete = delete_finalized_bucket_command(&store, &bucket_name("alpha"), 1);
     let active_delete_err = store
-        .delete_finalized_bucket(&bucket_name("alpha"))
+        .apply_metadata_command_and_record(0, &active_delete)
         .unwrap_err();
     assert!(matches!(
         active_delete_err,
-        crate::error::MetadataError::BucketNotFinalizedForDelete {
-            state: BucketState::Active
-        }
+        crate::error::BucketSnapshotLoadError::Metadata(
+            crate::error::MetadataError::BucketNotFinalizedForDelete {
+                state: BucketState::Active
+            }
+        )
     ));
     store.mark_bucket_deleting(&bucket_name("alpha")).unwrap();
-    store
-        .delete_finalized_bucket(&bucket_name("alpha"))
-        .unwrap();
+    apply_delete_finalized_bucket_command(&store, &bucket_name("alpha"), 1);
     let err = store.head_bucket(&bucket_name("alpha")).unwrap_err();
-    assert!(matches!(
-        err,
-        crate::error::MetadataError::BucketNotFound { .. }
-    ));
-}
-
-#[test]
-fn file_bucket_metadata_delete_nonexistent() {
-    let (_dir, store) = make_pg_store();
-    let err = store
-        .delete_finalized_bucket(&bucket_name("no-such-bucket"))
-        .unwrap_err();
     assert!(matches!(
         err,
         crate::error::MetadataError::BucketNotFound { .. }
@@ -639,9 +665,7 @@ fn delete_bucket_clears_completed_multipart_upload_records() {
         .unwrap()
         .is_some());
     store.mark_bucket_deleting(&bucket_name("bucket")).unwrap();
-    store
-        .delete_finalized_bucket(&bucket_name("bucket"))
-        .unwrap();
+    apply_delete_finalized_bucket_command(&store, &bucket_name("bucket"), 1);
 
     assert!(store
         .get_completed_multipart_upload(&multipart_upload_id("completed-upload"))
@@ -797,7 +821,7 @@ fn delete_bucket_clears_object_version_counter_records() {
 
     store.delete_object_version(&bucket, &key, v1).unwrap();
     store.mark_bucket_deleting(&bucket).unwrap();
-    store.delete_finalized_bucket(&bucket).unwrap();
+    apply_delete_finalized_bucket_command(&store, &bucket, 1);
     let counter_rows: i64 = store
         .connection()
         .query_row(
@@ -1366,7 +1390,7 @@ fn file_bucket_execution_generation_advances_across_delete_recreate() {
         .unwrap()
         .bucket_execution_generation;
     store.mark_bucket_deleting(&bucket).unwrap();
-    store.delete_finalized_bucket(&bucket).unwrap();
+    apply_delete_finalized_bucket_command(&store, &bucket, 1);
     store
         .create_bucket(
             &bucket,
@@ -1713,9 +1737,7 @@ fn delete_bucket_cascades_bucket_subresources() {
         .unwrap()
         .is_some());
     store.mark_bucket_deleting(&bucket_name("bucket")).unwrap();
-    store
-        .delete_finalized_bucket(&bucket_name("bucket"))
-        .unwrap();
+    apply_delete_finalized_bucket_command(&store, &bucket_name("bucket"), 1);
 
     store
         .create_bucket(

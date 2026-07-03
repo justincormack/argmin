@@ -59,13 +59,6 @@ pub(crate) trait PgMetadataStore {
         public_write: bool,
     ) -> Result<(), MetadataError>;
 
-    /// Test-only direct finalized bucket row remover.
-    ///
-    /// Production bucket finalization must use the routed metadata command path
-    /// so command-log progress explains the materialized metadata change.
-    #[cfg(test)]
-    fn delete_finalized_bucket(&self, name: &BucketName) -> Result<(), MetadataError>;
-
     /// Get bucket metadata.
     fn head_bucket(&self, name: &BucketName) -> Result<BucketInfo, MetadataError>;
 

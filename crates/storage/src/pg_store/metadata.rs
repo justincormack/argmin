@@ -16,12 +16,6 @@ impl PgStore {
             .store(true, Ordering::Relaxed);
     }
 
-    #[cfg(test)]
-    fn fail_next_delete_finalized_bucket_commit(&self) {
-        self.fail_next_delete_finalized_bucket_commit
-            .store(true, Ordering::Relaxed);
-    }
-
     fn store_error_as_metadata_db(context: &'static str, error: StoreError) -> MetadataError {
         match error {
             StoreError::Db { source, .. } => MetadataError::Db { context, source },
@@ -5190,59 +5184,6 @@ impl PgMetadataStore for PgStore {
                 object_ownership: crate::BucketObjectOwnership::ObjectWriter,
             },
         })
-    }
-
-    #[cfg(test)]
-    fn delete_finalized_bucket(&self, name: &BucketName) -> Result<(), MetadataError> {
-        observability::trace_scope!(
-            TRACE_TARGET,
-            "PgStore::delete_finalized_bucket",
-            "pg_id={} bucket={:?}",
-            self.pg_id,
-            name
-        );
-        self.conn
-            .execute_batch("BEGIN IMMEDIATE")
-            .map_err(|e| MetadataError::Db {
-                context: "delete finalized bucket (begin txn)",
-                source: e,
-            })?;
-        let result = self.delete_finalized_bucket_rows_in_current_txn(name, None, true);
-        let deleted = match result {
-            Ok(deleted) => {
-                #[cfg(test)]
-                if self
-                    .fail_next_delete_finalized_bucket_commit
-                    .swap(false, Ordering::Relaxed)
-                {
-                    let _ = self.conn.execute_batch("ROLLBACK");
-                    self.invalidate_clean_metadata_digest_revision();
-                    return Err(MetadataError::Db {
-                        context: "delete finalized bucket (commit txn)",
-                        source: rusqlite::Error::InvalidQuery,
-                    });
-                }
-
-                self.commit_immediate_txn("delete finalized bucket (commit txn)")?;
-                deleted
-            }
-            Err(error) => {
-                let _ = self.conn.execute_batch("ROLLBACK");
-                return Err(error);
-            }
-        };
-        if deleted == 0 {
-            return Err(bucket_not_found(name.as_str()));
-        }
-        let _ = observability::event(
-            TRACE_TARGET,
-            "pg_delete_finalized_bucket_deleted",
-            Some(format_args!(
-                "pg_id={} bucket={:?} deleted={}",
-                self.pg_id, name, deleted
-            )),
-        );
-        Ok(())
     }
 
     fn head_bucket(&self, name: &BucketName) -> Result<BucketInfo, MetadataError> {

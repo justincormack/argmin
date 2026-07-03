@@ -1,4 +1,8 @@
 use super::{bucket_name, multipart_upload_id, object_key, stream_session_id};
+use crate::metadata_command::{
+    DeleteFinalizedBucketCommand, MetadataCommandEnvelope, MetadataCommandId,
+    MetadataCommandLogIndex, MetadataCommandPayload,
+};
 use crate::traits::{PgMetadataStore, ShardStore, StorageNode};
 use crate::types::*;
 use std::num::NonZeroU64;
@@ -872,9 +876,23 @@ fn bucket_deletion_lifecycle() {
     assert!(buckets.is_empty());
 
     // Final delete.
-    store
-        .delete_finalized_bucket(&bucket_name("doomed"))
+    store.refresh_metadata_command_state_digest().unwrap();
+    let deleting = store
+        .head_bucket_record_raw(&bucket_name("doomed"))
         .unwrap();
+    let delete = MetadataCommandEnvelope::new(
+        MetadataCommandId::new(
+            ClusterEpoch::INITIAL,
+            PgId::new(0),
+            MetadataCommandLogIndex::new(1).unwrap(),
+        ),
+        MetadataCommandPayload::DeleteFinalizedBucket(DeleteFinalizedBucketCommand::new(
+            bucket_name("doomed"),
+            deleting.bucket_execution_generation,
+            deleting.bucket_incarnation_generation,
+        )),
+    );
+    store.apply_metadata_command_and_record(0, &delete).unwrap();
 
     // Completely gone.
     let err = store.head_bucket_raw(&bucket_name("doomed")).unwrap_err();

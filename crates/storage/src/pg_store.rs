@@ -387,8 +387,6 @@ pub struct PgStore {
     #[cfg(test)]
     fail_next_metadata_txn_commit: std::sync::atomic::AtomicBool,
     #[cfg(test)]
-    fail_next_delete_finalized_bucket_commit: std::sync::atomic::AtomicBool,
-    #[cfg(test)]
     metadata_command_log_prefix_fast_path_hits: AtomicU64,
     #[cfg(test)]
     metadata_command_log_replay_validation_entries: AtomicU64,
@@ -488,8 +486,6 @@ impl PgStore {
             clean_metadata_digest_revision: AtomicU64::new(UNCLEAN_METADATA_DIGEST_REVISION),
             #[cfg(test)]
             fail_next_metadata_txn_commit: std::sync::atomic::AtomicBool::new(false),
-            #[cfg(test)]
-            fail_next_delete_finalized_bucket_commit: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             metadata_command_log_prefix_fast_path_hits: AtomicU64::new(0),
             #[cfg(test)]
