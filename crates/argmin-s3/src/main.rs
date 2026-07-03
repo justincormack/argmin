@@ -2085,7 +2085,8 @@ fn run_experimental_raft_control_plane_process(config: &ServerConfig) -> ! {
             Arc::clone(&active_raft_peer_rpc_workers),
         )
     });
-    block_on_control_plane_raft(&runtime, async {
+    let initialized_membership = block_on_control_plane_raft(&runtime, async {
+        let mut initialized_membership = false;
         if !authority.is_initialized().await?
             && experimental_raft_startup_initializes_membership(raft_peer_policy.as_ref(), node_id)
         {
@@ -2094,10 +2095,27 @@ fn run_experimental_raft_control_plane_process(config: &ServerConfig) -> ! {
             } else {
                 authority.initialize_single_node_membership(node_id).await?;
             }
-            authority
-                .store_durable_restart_artifact(Path::new(state_path))
-                .await?;
+            initialized_membership = true;
         }
+        Ok::<_, ControlPlaneError>(initialized_membership)
+    })
+    .unwrap_or_else(|error| {
+        eprintln!("failed to initialize experimental OpenRaft control-plane: {error}");
+        std::process::exit(1);
+    });
+    if initialized_membership {
+        store_experimental_raft_durable_restart_artifact(
+            &runtime,
+            &authority,
+            Path::new(state_path),
+            Some(&durable_checkpoint_lock),
+        )
+        .unwrap_or_else(|error| {
+            eprintln!("failed to initialize experimental OpenRaft control-plane: {error}");
+            std::process::exit(1);
+        });
+    }
+    block_on_control_plane_raft(&runtime, async {
         if experimental_raft_startup_requires_local_leader(raft_peer_policy.as_ref()) {
             authority
                 .wait_for_current_leader(
@@ -2113,11 +2131,18 @@ fn run_experimental_raft_control_plane_process(config: &ServerConfig) -> ! {
             "experimental control-plane startup committed replay",
         )
         .await?;
-        authority
-            .store_durable_restart_artifact(Path::new(state_path))
-            .await?;
         Ok::<_, ControlPlaneError>(())
     })
+    .unwrap_or_else(|error| {
+        eprintln!("failed to initialize experimental OpenRaft control-plane: {error}");
+        std::process::exit(1);
+    });
+    store_experimental_raft_durable_restart_artifact(
+        &runtime,
+        &authority,
+        Path::new(state_path),
+        Some(&durable_checkpoint_lock),
+    )
     .unwrap_or_else(|error| {
         eprintln!("failed to initialize experimental OpenRaft control-plane: {error}");
         std::process::exit(1);
@@ -3910,6 +3935,86 @@ mod tests {
             response.is_err(),
             "checkpoint failure must not acknowledge peer RPC before durability"
         );
+
+        harness.shutdown();
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[test]
+    fn experimental_raft_peer_rpc_checkpoint_lock_delays_response() {
+        let harness = experimental_raft_test_harness("peer-checkpoint-lock");
+        let cluster_name = format!(
+            "argmin-s3-experimental-raft-peer-checkpoint-lock-{}",
+            std::process::id()
+        );
+        let policy = ControlPlaneRaftPeerTransportPolicy::from_peer_endpoints(
+            cluster_name.clone(),
+            [(1, "node-1".to_string())],
+            ControlPlaneRaftPeerTransportLimits::default(),
+        );
+        let identity = ControlPlaneRaftPeerFrameIdentity::new(cluster_name, 1, 1);
+        let request = ControlPlaneRaftPeerRpcRequest::Vote(VoteRequest {
+            vote: Vote::<ControlPlaneRaftLeaderId>::new(3, 1),
+            last_log_id: None,
+            leadership_transfer: false,
+        });
+        let request_frame = request
+            .encode_frame_for_peer(&identity)
+            .expect("peer request should encode");
+        let (mut client_stream, mut server_stream) =
+            UnixStream::pair().expect("test UnixStream pair should create");
+        write_control_plane_raft_peer_transport_frame(&mut client_stream, &request_frame)
+            .expect("client should write request frame");
+        client_stream
+            .set_read_timeout(Some(Duration::from_millis(50)))
+            .expect("client stream read timeout should set");
+
+        let state_dir = short_unix_socket_test_dir("experimental-raft-peer-checkpoint-lock");
+        let _ = fs::remove_dir_all(&state_dir);
+        fs::create_dir_all(&state_dir).expect("checkpoint directory should exist");
+        let state_path = state_dir.join("control-plane.state");
+        let checkpoint_lock = Arc::new(Mutex::new(()));
+        let checkpoint_guard = checkpoint_lock
+            .lock()
+            .expect("checkpoint lock should acquire");
+        let runtime_handle = harness.runtime.handle().clone();
+        let authority = Arc::clone(&harness.authority);
+        let worker_lock = Arc::clone(&checkpoint_lock);
+        let worker = thread::spawn(move || {
+            handle_experimental_raft_peer_rpc_before_ack(
+                &runtime_handle,
+                &authority,
+                &mut server_stream,
+                1,
+                &policy,
+                Some(&state_path),
+                Some(&worker_lock),
+            )
+        });
+
+        let blocked_response = read_control_plane_raft_peer_transport_frame(
+            &mut client_stream,
+            ControlPlaneRaftPeerTransportLimits::DEFAULT_MAX_FRAME_BYTES,
+        );
+        assert!(
+            blocked_response.is_err(),
+            "peer RPC must not respond before acquiring the durable checkpoint lock"
+        );
+        drop(checkpoint_guard);
+        let result = worker.join().expect("peer RPC worker should not panic");
+        assert!(
+            result.is_ok(),
+            "peer RPC should complete after checkpoint lock release: {result:?}"
+        );
+
+        client_stream
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .expect("client stream read timeout should update");
+        read_control_plane_raft_peer_transport_frame(
+            &mut client_stream,
+            ControlPlaneRaftPeerTransportLimits::DEFAULT_MAX_FRAME_BYTES,
+        )
+        .expect("peer RPC should respond after durable checkpoint completes");
 
         harness.shutdown();
         let _ = fs::remove_dir_all(&state_dir);
