@@ -10379,6 +10379,12 @@ Phase 12.3 progress:
   server dispatcher, and writes the framed response. Socket-pair regressions
   cover both ordinary vote RPC and snapshot dispatch, leaving process accept
   loop wiring as the next integration layer.
+- Added listener-side request-kind detection for Unix peer frames. The detector
+  validates the peer frame magic, version, and CRC before reading the frame kind,
+  rejects response frames in the request direction, and lets a single bounded
+  stream handler auto-dispatch ordinary Raft RPCs and snapshot install traffic.
+  Socket-pair coverage now pins auto-dispatch for both vote and snapshot frames;
+  process accept loop wiring remains the next layer.
 
 1. define the replicated control-plane state machine:
    - state includes cluster epoch, PG count, PG state, PG acting sets, node
