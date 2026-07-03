@@ -3096,35 +3096,64 @@ impl ControlPlaneRaftAuthority {
         &self,
         path: &Path,
     ) -> Result<(), ControlPlaneError> {
-        let log_store = self
-            .log_store
-            .as_ref()
-            .ok_or_else(|| ControlPlaneError::RpcRemote {
-                message: "OpenRaft durable restart artifact requested without retained log store"
-                    .to_string(),
-            })?;
+        self.capture_durable_restart_artifact()
+            .await?
+            .store_durable_artifact(path)
+    }
+
+    async fn capture_durable_restart_artifact(
+        &self,
+    ) -> Result<ControlPlaneRaftRestartArtifact, ControlPlaneError> {
         let log_store =
-            log_store
-                .export_restart_artifact()
-                .map_err(|source| ControlPlaneError::Io {
-                    context: "export control-plane OpenRaft durable log-store restart artifact",
-                    source,
+            self.log_store
+                .as_ref()
+                .cloned()
+                .ok_or_else(|| ControlPlaneError::RpcRemote {
+                    message:
+                        "OpenRaft durable restart artifact requested without retained log store"
+                            .to_string(),
                 })?;
-        let state_machine = self
-            .raft
-            .with_state_machine(|state_machine| {
-                let artifact = state_machine.export_restart_artifact();
-                Box::pin(async move { artifact })
-            })
-            .await
-            .map_err(|error| openraft_remote_error("state-machine restart artifact read", error))?;
-        ControlPlaneRaftRestartArtifact {
-            cluster_name: self.cluster_name.clone(),
-            local_node_id: self.node_id,
-            log_store,
-            state_machine,
+
+        let mut last_validation_error = None;
+        for _ in 0..CONTROL_PLANE_RAFT_RESTART_CAPTURE_MAX_ATTEMPTS {
+            let state_machine = self
+                .raft
+                .with_state_machine(|state_machine| {
+                    let artifact = state_machine.export_restart_artifact();
+                    Box::pin(async move { artifact })
+                })
+                .await
+                .map_err(|error| {
+                    openraft_remote_error("state-machine restart artifact read", error)
+                })?;
+            let log_store_artifact =
+                log_store
+                    .export_restart_artifact()
+                    .map_err(|source| ControlPlaneError::Io {
+                        context: "export control-plane OpenRaft durable log-store restart artifact",
+                        source,
+                    })?;
+            let artifact = ControlPlaneRaftRestartArtifact {
+                cluster_name: self.cluster_name.clone(),
+                local_node_id: self.node_id,
+                log_store: log_store_artifact,
+                state_machine,
+            };
+            match artifact.validate_restart_pair() {
+                Ok(()) => return Ok(artifact),
+                Err(error) => last_validation_error = Some(error),
+            }
+            ControlPlaneRaftTypeConfig::sleep(Duration::from_millis(1)).await;
         }
-        .store_durable_artifact(path)
+
+        Err(ControlPlaneError::Io {
+            context: "capture consistent control-plane OpenRaft durable restart artifact",
+            source: last_validation_error.unwrap_or_else(|| {
+                raft_log_store_error(
+                    "control-plane OpenRaft restart artifact capture made no validation attempts",
+                )
+            }),
+        })
     }
 
     pub async fn status(&self) -> Result<ControlPlaneRaftAuthorityStatus, ControlPlaneError> {
@@ -3718,6 +3747,7 @@ pub struct ControlPlaneRaftRestartArtifact {
 const CONTROL_PLANE_RAFT_RESTART_MAGIC: &[u8] = b"ARGMINCPRAFT";
 const CONTROL_PLANE_RAFT_RESTART_VERSION: u16 = 3;
 const CONTROL_PLANE_RAFT_RESTART_CHECKSUM_LEN: usize = 8;
+const CONTROL_PLANE_RAFT_RESTART_CAPTURE_MAX_ATTEMPTS: usize = 16;
 const CONTROL_PLANE_RAFT_PEER_RPC_MAGIC: &[u8] = b"ARGMINCPRAFTPEER";
 const CONTROL_PLANE_RAFT_PEER_RPC_VERSION: u16 = 1;
 const CONTROL_PLANE_RAFT_PEER_RPC_CHECKSUM_LEN: usize = 8;
@@ -4029,12 +4059,14 @@ impl ControlPlaneRaftRestartArtifact {
         log_store: &ControlPlaneRaftLogStore,
         state_machine: &ControlPlaneRaftStateMachine,
     ) -> Result<Self, io::Error> {
-        Ok(Self {
+        let artifact = Self {
             cluster_name: cluster_name.into(),
             local_node_id,
             log_store: log_store.export_restart_artifact()?,
             state_machine: state_machine.export_restart_artifact(),
-        })
+        };
+        artifact.validate_restart_pair()?;
+        Ok(artifact)
     }
 
     pub fn encode_durable_artifact(&self) -> Result<Vec<u8>, ControlPlaneError> {
@@ -4113,6 +4145,11 @@ impl ControlPlaneRaftRestartArtifact {
     }
 
     pub fn store_durable_artifact(&self, path: &Path) -> Result<(), ControlPlaneError> {
+        self.validate_restart_pair()
+            .map_err(|source| ControlPlaneError::Io {
+                context: "validate control-plane OpenRaft durable restart artifact",
+                source,
+            })?;
         let bytes = self.encode_durable_artifact()?;
         if let Some(parent) = path
             .parent()
@@ -4145,6 +4182,10 @@ impl ControlPlaneRaftRestartArtifact {
         })?;
         sync_durable_artifact_parent(path)?;
         Ok(())
+    }
+
+    fn validate_restart_pair(&self) -> Result<(), io::Error> {
+        Self::validate_log_store_state_machine_pair(&self.log_store, &self.state_machine)
     }
 
     #[cfg(feature = "test-hooks")]
@@ -14166,6 +14207,107 @@ mod tests {
             loaded_state_machine.last_applied(),
             Some(raft_log_id(3, 1, 1))
         );
+    }
+
+    #[test]
+    fn control_plane_raft_durable_restart_artifact_store_rejects_inconsistent_pair_before_overwrite(
+    ) {
+        let tmp = test_util::tempdir();
+        let path = tmp.path().join("raft.state");
+        let tmp_path = durable_artifact_tmp_path(&path);
+        let committed_artifact = ControlPlaneRaftRestartArtifact {
+            cluster_name: "test-cluster".to_string(),
+            local_node_id: 1,
+            log_store: ControlPlaneRaftLogStoreRestartArtifact {
+                vote: Some(Vote::<ControlPlaneRaftLeaderId>::new_committed(3, 1)),
+                committed: Some(raft_log_id(3, 1, 1)),
+                entries: vec![bootstrap_membership_entry(1), blank_entry(3, 1, 1)],
+                ..Default::default()
+            },
+            state_machine: state_machine_restart_artifact_with_noops(3, 1, 1),
+        };
+        let torn_artifact = ControlPlaneRaftRestartArtifact {
+            cluster_name: "test-cluster".to_string(),
+            local_node_id: 1,
+            log_store: ControlPlaneRaftLogStoreRestartArtifact {
+                vote: Some(Vote::<ControlPlaneRaftLeaderId>::new_committed(3, 1)),
+                committed: Some(raft_log_id(3, 1, 1)),
+                entries: vec![
+                    bootstrap_membership_entry(1),
+                    blank_entry(3, 1, 1),
+                    blank_entry(3, 1, 2),
+                ],
+                ..Default::default()
+            },
+            state_machine: state_machine_restart_artifact_with_noops(3, 1, 2),
+        };
+
+        committed_artifact.store_durable_artifact(&path).unwrap();
+        assert_error_contains(
+            torn_artifact.store_durable_artifact(&path),
+            "validate control-plane OpenRaft durable restart artifact",
+        );
+        assert!(!tmp_path.exists());
+
+        let loaded = ControlPlaneRaftRestartArtifact::load_durable_artifact(&path).expect(
+            "previous durable restart artifact should remain after pair validation failure",
+        );
+        let (mut loaded_log_store, loaded_state_machine) = loaded.restore().unwrap();
+        ControlPlaneRaftTypeConfig::run(async {
+            assert_eq!(
+                RaftLogStorage::read_committed(&mut loaded_log_store)
+                    .await
+                    .unwrap(),
+                Some(raft_log_id(3, 1, 1))
+            );
+        });
+        assert_eq!(
+            loaded_state_machine.last_applied(),
+            Some(raft_log_id(3, 1, 1))
+        );
+    }
+
+    #[test]
+    fn control_plane_raft_durable_restart_artifact_capture_rejects_inconsistent_pair() {
+        ControlPlaneRaftTypeConfig::run(async {
+            let mut log_store = ControlPlaneRaftLogStore::empty();
+            RaftLogStorage::append(
+                &mut log_store,
+                vec![
+                    bootstrap_membership_entry(1),
+                    blank_entry(3, 1, 1),
+                    blank_entry(3, 1, 2),
+                ],
+                IOFlushed::noop(),
+            )
+            .await
+            .unwrap();
+            RaftLogStorage::save_vote(
+                &mut log_store,
+                &Vote::<ControlPlaneRaftLeaderId>::new_committed(3, 1),
+            )
+            .await
+            .unwrap();
+            RaftLogStorage::save_committed(&mut log_store, Some(raft_log_id(3, 1, 1)))
+                .await
+                .unwrap();
+
+            let mut state_machine = ControlPlaneRaftStateMachine::empty();
+            state_machine
+                .apply_entry(bootstrap_membership_entry(1))
+                .unwrap();
+            state_machine.apply_entry(blank_entry(3, 1, 1)).unwrap();
+            state_machine.apply_entry(blank_entry(3, 1, 2)).unwrap();
+
+            let err = ControlPlaneRaftRestartArtifact::capture(
+                "test-cluster",
+                1,
+                &log_store,
+                &state_machine,
+            )
+            .unwrap_err();
+            assert!(err.to_string().contains("after committed restart gate"));
+        });
     }
 
     #[test]
