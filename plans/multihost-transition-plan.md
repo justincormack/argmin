@@ -10395,6 +10395,17 @@ Phase 12.3 progress:
   startup for the next slice. The durable OpenRaft restart artifact now carries
   the configured cluster name under checksum and startup rejects artifacts whose
   cluster identity does not match the process configuration.
+- Added the first process peer-listener wiring for experimental OpenRaft
+  control-plane peers. A configured local peer socket is bound with the same
+  private-directory and stale-socket checks as the existing control-plane Unix
+  RPC socket, accepted connections run through the reusable bounded
+  length-prefix/CRC/identity peer-frame handler, and incoming frames must carry
+  a configured source node, the local target node, and the configured cluster
+  identity before dispatch. Focused storage tests cover configured-source
+  acceptance and unknown-source rejection, and the process test coverage now
+  pins peer-listener binding from config. The remaining 12.3 process work is to
+  run the authority with the Unix peer network factory and exercise real
+  multi-process replication/failover rather than only the listener boundary.
 
 1. define the replicated control-plane state machine:
    - state includes cluster epoch, PG count, PG state, PG acting sets, node

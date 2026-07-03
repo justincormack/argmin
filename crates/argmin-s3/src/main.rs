@@ -33,7 +33,9 @@ use storage::control_plane::{
 };
 use storage::control_plane_command::{ControlPlaneCommand, ControlPlaneCommandResponse};
 use storage::control_plane_raft::{
-    ControlPlaneRaftAuthority, ControlPlaneRaftCommandOutcome, ControlPlaneRaftNodeId,
+    handle_control_plane_raft_peer_unix_stream_from_configured_peer, ControlPlaneRaftAuthority,
+    ControlPlaneRaftCommandOutcome, ControlPlaneRaftNodeId, ControlPlaneRaftPeerTransportLimits,
+    ControlPlaneRaftPeerTransportPolicy,
 };
 use storage::storage_node_server::{
     advance_storage_node_incarnation, StorageNodeControlPlaneRefreshLoop, StorageNodeDataDirGuard,
@@ -57,6 +59,8 @@ const LOCK_NB: i32 = 4;
 const CONTROL_PLANE_ACCEPT_BATCH_LIMIT: usize = 32;
 const CONTROL_PLANE_RPC_WORKER_LIMIT: usize = 64;
 const CONTROL_PLANE_RPC_IO_TIMEOUT: Duration = Duration::from_secs(1);
+const CONTROL_PLANE_RAFT_PEER_RPC_WORKER_LIMIT: usize = 64;
+const CONTROL_PLANE_RAFT_PEER_RPC_IO_TIMEOUT: Duration = Duration::from_secs(1);
 
 extern "C" {
     fn flock(fd: i32, operation: i32) -> i32;
@@ -1515,6 +1519,97 @@ async fn wait_for_experimental_raft_startup_catch_up(
         .await
 }
 
+struct ExperimentalRaftPeerListener {
+    listener: UnixListener,
+    policy: Arc<ControlPlaneRaftPeerTransportPolicy>,
+}
+
+fn build_experimental_raft_peer_transport_policy(
+    config: &ServerConfig,
+    cluster_name: &str,
+    local_node_id: ControlPlaneRaftNodeId,
+) -> Result<Option<ControlPlaneRaftPeerTransportPolicy>, String> {
+    let Some(local_peer_socket_path) = config.control_plane_raft_peer_socket_path.as_deref() else {
+        return Ok(None);
+    };
+    let peer_endpoints: Vec<_> = if config.control_plane_raft_peer_sockets.is_empty() {
+        vec![(local_node_id, local_peer_socket_path.to_string())]
+    } else {
+        config
+            .control_plane_raft_peer_sockets
+            .iter()
+            .map(|entry| (entry.node_id, entry.socket_path.clone()))
+            .collect()
+    };
+    Ok(Some(
+        ControlPlaneRaftPeerTransportPolicy::from_peer_endpoints(
+            cluster_name.to_string(),
+            peer_endpoints,
+            ControlPlaneRaftPeerTransportLimits::default(),
+        ),
+    ))
+}
+
+fn bind_experimental_raft_peer_listener(
+    config: &ServerConfig,
+    cluster_name: &str,
+    local_node_id: ControlPlaneRaftNodeId,
+) -> Result<Option<ExperimentalRaftPeerListener>, String> {
+    let Some(peer_socket_path) = config.control_plane_raft_peer_socket_path.as_deref() else {
+        return Ok(None);
+    };
+    let Some(policy) =
+        build_experimental_raft_peer_transport_policy(config, cluster_name, local_node_id)?
+    else {
+        return Ok(None);
+    };
+    let listener = bind_control_plane_raft_peer_socket(Path::new(peer_socket_path))?;
+    Ok(Some(ExperimentalRaftPeerListener {
+        listener,
+        policy: Arc::new(policy),
+    }))
+}
+
+fn spawn_experimental_raft_peer_rpc_worker(
+    stream: UnixStream,
+    runtime: Handle,
+    authority: Arc<ControlPlaneRaftAuthority>,
+    local_node_id: ControlPlaneRaftNodeId,
+    policy: Arc<ControlPlaneRaftPeerTransportPolicy>,
+    active_workers: Arc<AtomicUsize>,
+) {
+    match active_workers.fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+        (active < CONTROL_PLANE_RAFT_PEER_RPC_WORKER_LIMIT).then_some(active + 1)
+    }) {
+        Ok(_) => {}
+        Err(_) => {
+            eprintln!(
+                "experimental OpenRaft control-plane peer RPC rejected: worker limit {} reached",
+                CONTROL_PLANE_RAFT_PEER_RPC_WORKER_LIMIT
+            );
+            return;
+        }
+    }
+
+    thread::spawn(move || {
+        let mut stream = stream;
+        let result = block_on_control_plane_raft(&runtime, async {
+            handle_control_plane_raft_peer_unix_stream_from_configured_peer(
+                authority.raft(),
+                &mut stream,
+                local_node_id,
+                &policy,
+                CONTROL_PLANE_RAFT_PEER_RPC_IO_TIMEOUT,
+            )
+            .await
+        });
+        if let Err(error) = result {
+            eprintln!("experimental OpenRaft control-plane peer RPC failed: {error}");
+        }
+        active_workers.fetch_sub(1, Ordering::AcqRel);
+    });
+}
+
 fn run_experimental_raft_control_plane_process(config: &ServerConfig) -> ! {
     let state_path = config
         .control_plane_state_path
@@ -1542,7 +1637,7 @@ fn run_experimental_raft_control_plane_process(config: &ServerConfig) -> ! {
         .unwrap_or_else(|| format!("argmin-s3-experimental-control-plane-{socket_path}"));
     let authority = block_on_control_plane_raft(&runtime, async {
         let authority = ControlPlaneRaftAuthority::new_experimental_single_node_durable(
-            cluster_name,
+            cluster_name.clone(),
             node_id,
             Path::new(state_path),
         )
@@ -1575,8 +1670,13 @@ fn run_experimental_raft_control_plane_process(config: &ServerConfig) -> ! {
         eprintln!("failed to initialize experimental OpenRaft control-plane: {error}");
         std::process::exit(1);
     });
+    let raft_peer_listener = bind_experimental_raft_peer_listener(config, &cluster_name, node_id)
+        .unwrap_or_else(|error| {
+            eprintln!("{error}");
+            std::process::exit(1);
+        });
     let mut control_plane = ExperimentalRaftControlPlane {
-        runtime,
+        runtime: runtime.clone(),
         authority: Arc::clone(&authority),
         durable_artifact_path: Some(PathBuf::from(state_path)),
         durable_poison: None,
@@ -1587,8 +1687,10 @@ fn run_experimental_raft_control_plane_process(config: &ServerConfig) -> ! {
             std::process::exit(1);
         },
     );
+    let raft_authority = Arc::clone(&authority);
     let authority = Arc::new(Mutex::new(control_plane));
     let active_rpc_workers = Arc::new(AtomicUsize::new(0));
+    let active_raft_peer_rpc_workers = Arc::new(AtomicUsize::new(0));
     let raft_peer_socket_path = config
         .control_plane_raft_peer_socket_path
         .as_deref()
@@ -1617,6 +1719,27 @@ fn run_experimental_raft_control_plane_process(config: &ServerConfig) -> ! {
                 Err(error) => {
                     eprintln!("control-plane socket accept failed: {error}");
                     std::process::exit(1);
+                }
+            }
+        }
+        if let Some(raft_peer_listener) = &raft_peer_listener {
+            for _ in 0..CONTROL_PLANE_ACCEPT_BATCH_LIMIT {
+                match raft_peer_listener.listener.accept() {
+                    Ok((stream, _addr)) => {
+                        spawn_experimental_raft_peer_rpc_worker(
+                            stream,
+                            runtime.clone(),
+                            Arc::clone(&raft_authority),
+                            node_id,
+                            Arc::clone(&raft_peer_listener.policy),
+                            Arc::clone(&active_raft_peer_rpc_workers),
+                        );
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                    Err(error) => {
+                        eprintln!("control-plane OpenRaft peer socket accept failed: {error}");
+                        std::process::exit(1);
+                    }
                 }
             }
         }
@@ -1798,21 +1921,32 @@ impl Drop for ControlPlaneRpcWorkerGuard {
 }
 
 fn bind_control_plane_socket(socket_path: &Path) -> Result<UnixListener, String> {
+    bind_control_plane_unix_socket(socket_path, "ARGMIN_CONTROL_PLANE_SOCKET_PATH")
+}
+
+fn bind_control_plane_raft_peer_socket(socket_path: &Path) -> Result<UnixListener, String> {
+    bind_control_plane_unix_socket(socket_path, "ARGMIN_CONTROL_PLANE_RAFT_PEER_SOCKET_PATH")
+}
+
+fn bind_control_plane_unix_socket(
+    socket_path: &Path,
+    config_name: &'static str,
+) -> Result<UnixListener, String> {
     if !socket_path.is_absolute() {
         return Err(format!(
-            "ARGMIN_CONTROL_PLANE_SOCKET_PATH {} must be absolute",
+            "{config_name} {} must be absolute",
             socket_path.display()
         ));
     }
     let parent = socket_path.parent().ok_or_else(|| {
         format!(
-            "ARGMIN_CONTROL_PLANE_SOCKET_PATH {} is missing a parent directory",
+            "{config_name} {} is missing a parent directory",
             socket_path.display()
         )
     })?;
     socket_path.file_name().ok_or_else(|| {
         format!(
-            "ARGMIN_CONTROL_PLANE_SOCKET_PATH {} is missing a file name",
+            "{config_name} {} is missing a file name",
             socket_path.display()
         )
     })?;
@@ -2839,6 +2973,34 @@ mod tests {
         assert_eq!(runtime_map.pg_routes()[0].pg_id(), PgId::new(0));
 
         harness.shutdown();
+    }
+
+    #[test]
+    fn experimental_raft_control_plane_binds_configured_peer_listener() {
+        let test_dir = short_unix_socket_test_dir("raft-peer-listener");
+        let _ = fs::remove_dir_all(&test_dir);
+        let peer_socket_path = test_dir.join("control-plane-raft-peer.sock");
+        let peer_socket = peer_socket_path.display().to_string();
+        let mut config = test_server_config();
+        config.control_plane_experimental_raft = true;
+        config.control_plane_raft_cluster_name = Some("process-peer-listener-test".to_string());
+        config.control_plane_raft_node_id = Some(1);
+        config.control_plane_raft_peer_socket_path = Some(peer_socket.clone());
+        config.control_plane_raft_peer_sockets =
+            vec![config::ConfiguredControlPlaneRaftPeerSocket {
+                node_id: 1,
+                socket_path: peer_socket,
+            }];
+
+        let listener =
+            bind_experimental_raft_peer_listener(&config, "process-peer-listener-test", 1)
+                .expect("peer listener should bind")
+                .expect("configured peer listener should be present");
+
+        assert!(peer_socket_path.exists());
+        drop(listener);
+        fs::remove_file(&peer_socket_path).unwrap();
+        fs::remove_dir(&test_dir).unwrap();
     }
 
     #[test]

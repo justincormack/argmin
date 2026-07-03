@@ -421,6 +421,24 @@ pub struct ControlPlaneRaftPeerTransportLimits {
     pub max_snapshot_bytes: usize,
 }
 
+impl ControlPlaneRaftPeerTransportLimits {
+    pub const DEFAULT_MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
+    pub const DEFAULT_MAX_APPEND_ENTRIES: usize = 256;
+    pub const DEFAULT_MAX_APPEND_ENTRIES_BYTES: usize = 8 * 1024 * 1024;
+    pub const DEFAULT_MAX_SNAPSHOT_BYTES: usize = 16 * 1024 * 1024;
+}
+
+impl Default for ControlPlaneRaftPeerTransportLimits {
+    fn default() -> Self {
+        Self {
+            max_frame_bytes: Self::DEFAULT_MAX_FRAME_BYTES,
+            max_append_entries: Self::DEFAULT_MAX_APPEND_ENTRIES,
+            max_append_entries_bytes: Self::DEFAULT_MAX_APPEND_ENTRIES_BYTES,
+            max_snapshot_bytes: Self::DEFAULT_MAX_SNAPSHOT_BYTES,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ControlPlaneRaftPeerTransportPolicy {
     cluster_name: String,
@@ -440,6 +458,27 @@ impl ControlPlaneRaftPeerTransportPolicy {
             peers,
             limits,
         }
+    }
+
+    #[must_use]
+    pub fn from_peer_endpoints(
+        cluster_name: impl Into<String>,
+        peers: impl IntoIterator<Item = (ControlPlaneRaftNodeId, String)>,
+        limits: ControlPlaneRaftPeerTransportLimits,
+    ) -> Self {
+        Self::new(
+            cluster_name,
+            peers
+                .into_iter()
+                .map(|(node_id, endpoint)| (node_id, BasicNode::new(endpoint)))
+                .collect(),
+            limits,
+        )
+    }
+
+    #[must_use]
+    pub fn limits(&self) -> ControlPlaneRaftPeerTransportLimits {
+        self.limits
     }
 
     pub fn validate_target_node(
@@ -493,6 +532,40 @@ impl ControlPlaneRaftPeerTransportPolicy {
         ))
     }
 
+    pub fn validate_incoming_frame_identity(
+        &self,
+        identity: &ControlPlaneRaftPeerFrameIdentity,
+        local_node_id: ControlPlaneRaftNodeId,
+    ) -> Result<(), ControlPlaneRaftPeerTransportRejection> {
+        if identity.cluster_name != self.cluster_name {
+            return Err(ControlPlaneRaftPeerTransportRejection::ClusterMismatch {
+                expected: self.cluster_name.clone(),
+                actual: identity.cluster_name.clone(),
+            });
+        }
+        if identity.target != local_node_id {
+            return Err(ControlPlaneRaftPeerTransportRejection::UnexpectedTarget {
+                cluster_name: self.cluster_name.clone(),
+                expected: local_node_id,
+                actual: identity.target,
+            });
+        }
+        if !self.peers.contains_key(&identity.source) {
+            return Err(ControlPlaneRaftPeerTransportRejection::UnknownSource {
+                cluster_name: self.cluster_name.clone(),
+                source: identity.source,
+            });
+        }
+        if !self.peers.contains_key(&identity.target) {
+            return Err(ControlPlaneRaftPeerTransportRejection::UnknownTarget {
+                cluster_name: self.cluster_name.clone(),
+                target: identity.target,
+                rpc_name: "peer_frame",
+            });
+        }
+        Ok(())
+    }
+
     pub fn validate_append_entries(
         &self,
         target: ControlPlaneRaftNodeId,
@@ -542,6 +615,10 @@ impl ControlPlaneRaftPeerTransportPolicy {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ControlPlaneRaftPeerTransportRejection {
+    ClusterMismatch {
+        expected: String,
+        actual: String,
+    },
     UnknownSource {
         cluster_name: String,
         source: ControlPlaneRaftNodeId,
@@ -557,6 +634,11 @@ pub enum ControlPlaneRaftPeerTransportRejection {
         rpc_name: &'static str,
         expected: String,
         actual: String,
+    },
+    UnexpectedTarget {
+        cluster_name: String,
+        expected: ControlPlaneRaftNodeId,
+        actual: ControlPlaneRaftNodeId,
     },
     AppendEntriesBatchTooLarge {
         cluster_name: String,
@@ -581,6 +663,10 @@ pub enum ControlPlaneRaftPeerTransportRejection {
 impl fmt::Display for ControlPlaneRaftPeerTransportRejection {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::ClusterMismatch { expected, actual } => write!(
+                f,
+                "control-plane raft peer transport cluster identity mismatch: expected {expected}, got {actual}",
+            ),
             Self::UnknownSource {
                 cluster_name,
                 source,
@@ -605,6 +691,14 @@ impl fmt::Display for ControlPlaneRaftPeerTransportRejection {
             } => write!(
                 f,
                 "control-plane raft peer transport cluster {cluster_name} rejected {rpc_name} to node {target}: endpoint mismatch, expected {expected}, got {actual}",
+            ),
+            Self::UnexpectedTarget {
+                cluster_name,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "control-plane raft peer transport cluster {cluster_name} rejected incoming peer frame: expected target node {expected}, got {actual}",
             ),
             Self::AppendEntriesBatchTooLarge {
                 cluster_name,
@@ -4334,6 +4428,36 @@ pub fn decode_control_plane_raft_peer_request_frame_kind(
     }
 }
 
+pub fn decode_control_plane_raft_peer_request_frame_identity(
+    bytes: &[u8],
+) -> Result<ControlPlaneRaftPeerFrameIdentity, ControlPlaneError> {
+    let mut reader = raft_peer_rpc_frame_reader(bytes)?;
+    match reader.read_u8()? {
+        CONTROL_PLANE_RAFT_PEER_RPC_KIND_REQUEST
+        | CONTROL_PLANE_RAFT_PEER_RPC_KIND_SNAPSHOT_REQUEST => {}
+        CONTROL_PLANE_RAFT_PEER_RPC_KIND_RESPONSE => {
+            return Err(raft_artifact_protocol_error(
+                "control-plane OpenRaft peer RPC response frame cannot be handled as a request",
+            ));
+        }
+        CONTROL_PLANE_RAFT_PEER_RPC_KIND_SNAPSHOT_RESPONSE => {
+            return Err(raft_artifact_protocol_error(
+                "control-plane OpenRaft peer snapshot response frame cannot be handled as a request",
+            ));
+        }
+        kind => {
+            return Err(raft_artifact_protocol_error(format!(
+                "unknown control-plane OpenRaft peer RPC frame kind {kind}"
+            )));
+        }
+    }
+    reader.read_peer_frame_identity()?.ok_or_else(|| {
+        raft_artifact_protocol_error(
+            "control-plane OpenRaft peer RPC frame is missing peer identity",
+        )
+    })
+}
+
 fn write_raft_peer_frame_identity(
     out: &mut Vec<u8>,
     identity: Option<&ControlPlaneRaftPeerFrameIdentity>,
@@ -4564,6 +4688,45 @@ pub async fn handle_control_plane_raft_peer_unix_stream_detecting_frame_kind(
         frame_kind,
         limits,
         expected_identity,
+    )
+    .await
+}
+
+pub async fn handle_control_plane_raft_peer_unix_stream_from_configured_peer(
+    raft: &Raft<ControlPlaneRaftTypeConfig, ControlPlaneRaftStateMachine>,
+    stream: &mut UnixStream,
+    local_node_id: ControlPlaneRaftNodeId,
+    policy: &ControlPlaneRaftPeerTransportPolicy,
+    io_timeout: Duration,
+) -> Result<(), ControlPlaneError> {
+    stream
+        .set_read_timeout(Some(io_timeout))
+        .map_err(|source| ControlPlaneError::Io {
+            context: "set control-plane OpenRaft peer stream read timeout",
+            source,
+        })?;
+    stream
+        .set_write_timeout(Some(io_timeout))
+        .map_err(|source| ControlPlaneError::Io {
+            context: "set control-plane OpenRaft peer stream write timeout",
+            source,
+        })?;
+    let request_frame =
+        read_control_plane_raft_peer_transport_frame(stream, policy.limits().max_frame_bytes)?;
+    let frame_kind = decode_control_plane_raft_peer_request_frame_kind(&request_frame)?;
+    let identity = decode_control_plane_raft_peer_request_frame_identity(&request_frame)?;
+    policy
+        .validate_incoming_frame_identity(&identity, local_node_id)
+        .map_err(|error| ControlPlaneError::RpcProtocol {
+            message: error.to_string(),
+        })?;
+    handle_control_plane_raft_peer_unix_request_frame(
+        raft,
+        stream,
+        &request_frame,
+        frame_kind,
+        policy.limits(),
+        &identity,
     )
     .await
 }
@@ -8140,6 +8303,140 @@ mod tests {
 
             let response = client.join().unwrap();
             assert!(matches!(response, ControlPlaneRaftPeerRpcResponse::Vote(_)));
+        });
+    }
+
+    #[test]
+    fn control_plane_raft_peer_unix_stream_handler_accepts_configured_source() {
+        ControlPlaneRaftTypeConfig::run(async {
+            let source_node_id = 7_025;
+            let target_node_id = 7_026;
+            let cluster_name = "control-plane-raft-unix-configured-handler";
+            let authority = ControlPlaneRaftAuthority::new_experimental_single_node_in_memory(
+                cluster_name,
+                target_node_id,
+            )
+            .await
+            .unwrap();
+            authority
+                .initialize_single_node_membership(target_node_id)
+                .await
+                .unwrap();
+            let (mut server_stream, mut client_stream) = UnixStream::pair().unwrap();
+            let limits = ControlPlaneRaftPeerTransportLimits {
+                max_frame_bytes: 4096,
+                max_append_entries: 8,
+                max_append_entries_bytes: 4096,
+                max_snapshot_bytes: 4096,
+            };
+            let policy = ControlPlaneRaftPeerTransportPolicy::from_peer_endpoints(
+                cluster_name,
+                [
+                    (source_node_id, "source.sock".to_string()),
+                    (target_node_id, "target.sock".to_string()),
+                ],
+                limits,
+            );
+            let request_identity = ControlPlaneRaftPeerFrameIdentity::new(
+                cluster_name,
+                source_node_id,
+                target_node_id,
+            );
+            let client_identity = request_identity.clone();
+            let client = thread::spawn(move || {
+                let request = ControlPlaneRaftPeerRpcRequest::Vote(VoteRequest {
+                    vote: Vote::<ControlPlaneRaftLeaderId>::new(3, source_node_id),
+                    last_log_id: None,
+                    leadership_transfer: false,
+                });
+                let request_frame = request.encode_frame_for_peer(&client_identity).unwrap();
+                write_control_plane_raft_peer_transport_frame(&mut client_stream, &request_frame)
+                    .unwrap();
+                let response_frame = read_control_plane_raft_peer_transport_frame(
+                    &mut client_stream,
+                    limits.max_frame_bytes,
+                )
+                .unwrap();
+                ControlPlaneRaftPeerRpcResponse::decode_frame_for_peer(
+                    &response_frame,
+                    &reverse_raft_peer_frame_identity(&client_identity),
+                )
+                .unwrap()
+            });
+
+            handle_control_plane_raft_peer_unix_stream_from_configured_peer(
+                authority.raft(),
+                &mut server_stream,
+                target_node_id,
+                &policy,
+                Duration::from_secs(1),
+            )
+            .await
+            .unwrap();
+
+            let response = client.join().unwrap();
+            assert!(matches!(response, ControlPlaneRaftPeerRpcResponse::Vote(_)));
+        });
+    }
+
+    #[test]
+    fn control_plane_raft_peer_unix_stream_handler_rejects_unconfigured_source() {
+        ControlPlaneRaftTypeConfig::run(async {
+            let source_node_id = 7_027;
+            let target_node_id = 7_028;
+            let cluster_name = "control-plane-raft-unix-configured-handler-reject";
+            let authority = ControlPlaneRaftAuthority::new_experimental_single_node_in_memory(
+                cluster_name,
+                target_node_id,
+            )
+            .await
+            .unwrap();
+            let (mut server_stream, mut client_stream) = UnixStream::pair().unwrap();
+            let limits = ControlPlaneRaftPeerTransportLimits {
+                max_frame_bytes: 4096,
+                max_append_entries: 8,
+                max_append_entries_bytes: 4096,
+                max_snapshot_bytes: 4096,
+            };
+            let policy = ControlPlaneRaftPeerTransportPolicy::from_peer_endpoints(
+                cluster_name,
+                [(target_node_id, "target.sock".to_string())],
+                limits,
+            );
+            let client = thread::spawn(move || {
+                let request = ControlPlaneRaftPeerRpcRequest::Vote(VoteRequest {
+                    vote: Vote::<ControlPlaneRaftLeaderId>::new(3, source_node_id),
+                    last_log_id: None,
+                    leadership_transfer: false,
+                });
+                let request_frame = request
+                    .encode_frame_for_peer(&ControlPlaneRaftPeerFrameIdentity::new(
+                        cluster_name,
+                        source_node_id,
+                        target_node_id,
+                    ))
+                    .unwrap();
+                write_control_plane_raft_peer_transport_frame(&mut client_stream, &request_frame)
+                    .unwrap();
+            });
+
+            let err = handle_control_plane_raft_peer_unix_stream_from_configured_peer(
+                authority.raft(),
+                &mut server_stream,
+                target_node_id,
+                &policy,
+                Duration::from_secs(1),
+            )
+            .await
+            .unwrap_err();
+
+            assert!(matches!(
+                err,
+                ControlPlaneError::RpcProtocol { message }
+                    if message.contains("no configured source node")
+                        && message.contains(&source_node_id.to_string())
+            ));
+            client.join().unwrap();
         });
     }
 
