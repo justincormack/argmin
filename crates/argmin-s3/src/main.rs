@@ -1535,10 +1535,14 @@ fn run_experimental_raft_control_plane_process(config: &ServerConfig) -> ! {
     });
 
     let runtime = Handle::current();
-    let node_id: ControlPlaneRaftNodeId = 1;
+    let node_id: ControlPlaneRaftNodeId = config.control_plane_raft_node_id.unwrap_or(1);
+    let cluster_name = config
+        .control_plane_raft_cluster_name
+        .clone()
+        .unwrap_or_else(|| format!("argmin-s3-experimental-control-plane-{socket_path}"));
     let authority = block_on_control_plane_raft(&runtime, async {
         let authority = ControlPlaneRaftAuthority::new_experimental_single_node_durable(
-            format!("argmin-s3-experimental-control-plane-{socket_path}"),
+            cluster_name,
             node_id,
             Path::new(state_path),
         )
@@ -1585,11 +1589,17 @@ fn run_experimental_raft_control_plane_process(config: &ServerConfig) -> ! {
     );
     let authority = Arc::new(Mutex::new(control_plane));
     let active_rpc_workers = Arc::new(AtomicUsize::new(0));
+    let raft_peer_socket_path = config
+        .control_plane_raft_peer_socket_path
+        .as_deref()
+        .unwrap_or("-");
     eprintln!(
-        "argmin-s3 experimental durable OpenRaft control-plane manager using state {} on {} (raft node {}, lease scan {} ms)",
+        "argmin-s3 experimental durable OpenRaft control-plane manager using state {} on {} (raft node {}, peer socket {}, configured peers {}, lease scan {} ms)",
         state_path,
         socket_path,
         node_id,
+        raft_peer_socket_path,
+        config.control_plane_raft_peer_sockets.len(),
         config.control_plane_lease_scan_interval.as_millis()
     );
 
@@ -2613,6 +2623,10 @@ mod tests {
             control_plane_state_path: None,
             control_plane_socket_path: None,
             control_plane_experimental_raft: false,
+            control_plane_raft_cluster_name: None,
+            control_plane_raft_node_id: None,
+            control_plane_raft_peer_socket_path: None,
+            control_plane_raft_peer_sockets: Vec::new(),
             control_plane_lease_scan_interval: std::time::Duration::from_millis(250),
             control_plane_refresh_interval: std::time::Duration::from_millis(250),
             control_plane_heartbeat_lease_duration: std::time::Duration::from_millis(1000),
@@ -2844,9 +2858,14 @@ mod tests {
             socket_path: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
         }];
         config.storage_pg_ids = vec![0];
+        let cluster_name = format!(
+            "argmin-s3-experimental-raft-durable-restart-{}",
+            std::process::id()
+        );
         let expected =
             storage::control_plane_raft::ControlPlaneRaftRestartArtifact::store_single_node_committed_ahead_bootstrap_artifact_for_test(
                 &state_path,
+                cluster_name.clone(),
                 1,
                 storage_nodes,
                 pg_ids,
@@ -2861,10 +2880,7 @@ mod tests {
         let handle = restarted_runtime.handle().clone();
         let authority = restarted_runtime.block_on(async {
             let authority = ControlPlaneRaftAuthority::new_experimental_single_node_durable(
-                format!(
-                    "argmin-s3-experimental-raft-durable-restart-{}",
-                    std::process::id()
-                ),
+                cluster_name,
                 1,
                 &state_path,
             )
@@ -3148,8 +3164,7 @@ mod tests {
         }];
         config.storage_pg_ids = vec![7];
 
-        let mut harness =
-            experimental_raft_durable_test_harness("heartbeat-before-restart", &state_path);
+        let mut harness = experimental_raft_durable_test_harness("heartbeat-restart", &state_path);
         bootstrap_empty_experimental_raft_control_plane(&mut harness.control_plane, &config)
             .expect("durable experimental raft control-plane bootstrap should succeed");
 
@@ -3243,7 +3258,7 @@ mod tests {
         harness.shutdown();
 
         let mut restarted =
-            experimental_raft_durable_test_harness("heartbeat-after-restart", &state_path);
+            experimental_raft_durable_test_harness("heartbeat-restart", &state_path);
         bootstrap_empty_experimental_raft_control_plane(&mut restarted.control_plane, &config)
             .expect("durable experimental raft control-plane restart bootstrap should be a no-op");
         let restored = restarted
@@ -3802,8 +3817,7 @@ mod tests {
         ];
         config.storage_pg_ids = vec![19];
 
-        let mut harness =
-            experimental_raft_durable_test_harness("acting-set-before-restart", &state_path);
+        let mut harness = experimental_raft_durable_test_harness("acting-set-restart", &state_path);
         bootstrap_empty_experimental_raft_control_plane(&mut harness.control_plane, &config)
             .expect("durable experimental raft control-plane bootstrap should succeed");
         let changed = harness
@@ -3820,7 +3834,7 @@ mod tests {
         harness.shutdown();
 
         let mut restarted =
-            experimental_raft_durable_test_harness("acting-set-after-restart", &state_path);
+            experimental_raft_durable_test_harness("acting-set-restart", &state_path);
         bootstrap_empty_experimental_raft_control_plane(&mut restarted.control_plane, &config)
             .expect("durable experimental raft control-plane restart bootstrap should be a no-op");
         let restored = restarted
@@ -3852,8 +3866,7 @@ mod tests {
         }];
         config.storage_pg_ids = vec![19];
 
-        let mut harness =
-            experimental_raft_durable_test_harness("reject-before-restart", &state_path);
+        let mut harness = experimental_raft_durable_test_harness("reject-restart", &state_path);
         bootstrap_empty_experimental_raft_control_plane(&mut harness.control_plane, &config)
             .expect("durable experimental raft control-plane bootstrap should succeed");
         let before = harness
@@ -3892,8 +3905,7 @@ mod tests {
         assert!(state_path.exists());
         harness.shutdown();
 
-        let mut restarted =
-            experimental_raft_durable_test_harness("reject-after-restart", &state_path);
+        let mut restarted = experimental_raft_durable_test_harness("reject-restart", &state_path);
         bootstrap_empty_experimental_raft_control_plane(&mut restarted.control_plane, &config)
             .expect("durable experimental raft control-plane restart bootstrap should be a no-op");
         let restored = restarted
@@ -4097,8 +4109,7 @@ mod tests {
         ];
         config.storage_pg_ids = vec![13];
 
-        let mut harness =
-            experimental_raft_durable_test_harness("transfer-before-restart", &state_path);
+        let mut harness = experimental_raft_durable_test_harness("transfer-restart", &state_path);
         bootstrap_empty_experimental_raft_control_plane(&mut harness.control_plane, &config)
             .expect("durable experimental raft control-plane bootstrap should succeed");
         harness
@@ -4230,8 +4241,7 @@ mod tests {
         assert!(state_path.exists());
         harness.shutdown();
 
-        let mut restarted =
-            experimental_raft_durable_test_harness("transfer-after-restart", &state_path);
+        let mut restarted = experimental_raft_durable_test_harness("transfer-restart", &state_path);
         bootstrap_empty_experimental_raft_control_plane(&mut restarted.control_plane, &config)
             .expect("durable experimental raft control-plane restart bootstrap should be a no-op");
         let restored = restarted
@@ -5197,7 +5207,7 @@ mod tests {
         control_plane_config.storage_pg_ids = vec![0];
 
         let mut harness =
-            experimental_raft_durable_test_harness("runtime-refresh-before-restart", &state_path);
+            experimental_raft_durable_test_harness("runtime-refresh-restart", &state_path);
         bootstrap_empty_experimental_raft_control_plane(
             &mut harness.control_plane,
             &control_plane_config,
@@ -5279,7 +5289,7 @@ mod tests {
         harness.shutdown();
 
         let mut restarted =
-            experimental_raft_durable_test_harness("runtime-refresh-after-restart", &state_path);
+            experimental_raft_durable_test_harness("runtime-refresh-restart", &state_path);
         bootstrap_empty_experimental_raft_control_plane(
             &mut restarted.control_plane,
             &control_plane_config,

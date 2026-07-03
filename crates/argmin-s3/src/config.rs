@@ -37,6 +37,12 @@ pub(crate) struct ConfiguredStorageNodeSocket {
     pub(crate) socket_path: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ConfiguredControlPlaneRaftPeerSocket {
+    pub(crate) node_id: u64,
+    pub(crate) socket_path: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ConfiguredCredentialProfile {
     Standard,
@@ -93,6 +99,10 @@ pub(crate) struct ServerConfig {
     pub(crate) control_plane_state_path: Option<String>,
     pub(crate) control_plane_socket_path: Option<String>,
     pub(crate) control_plane_experimental_raft: bool,
+    pub(crate) control_plane_raft_cluster_name: Option<String>,
+    pub(crate) control_plane_raft_node_id: Option<u64>,
+    pub(crate) control_plane_raft_peer_socket_path: Option<String>,
+    pub(crate) control_plane_raft_peer_sockets: Vec<ConfiguredControlPlaneRaftPeerSocket>,
     pub(crate) control_plane_lease_scan_interval: Duration,
     pub(crate) control_plane_refresh_interval: Duration,
     pub(crate) control_plane_heartbeat_lease_duration: Duration,
@@ -137,6 +147,10 @@ impl ServerConfig {
     ///   `ARGMIN_CONTROL_PLANE_STATE_PATH` (required for control-plane role)
     ///   `ARGMIN_CONTROL_PLANE_SOCKET_PATH` (required for control-plane role, optional dynamic route source for frontend/storage roles)
     ///   `ARGMIN_CONTROL_PLANE_EXPERIMENTAL_RAFT` (false)
+    ///   `ARGMIN_CONTROL_PLANE_RAFT_CLUSTER_NAME` (optional experimental Raft cluster identity)
+    ///   `ARGMIN_CONTROL_PLANE_RAFT_NODE_ID` (1 when experimental Raft is enabled)
+    ///   `ARGMIN_CONTROL_PLANE_RAFT_PEER_SOCKET_PATH` (optional local experimental Raft peer socket)
+    ///   `ARGMIN_CONTROL_PLANE_RAFT_PEER_SOCKETS` (`node_id=/absolute/socket,...`, optional experimental Raft peer map)
     ///   `ARGMIN_CONTROL_PLANE_LEASE_SCAN_MS` (250)
     ///   `ARGMIN_CONTROL_PLANE_REFRESH_MS` (250)
     ///   `ARGMIN_CONTROL_PLANE_HEARTBEAT_LEASE_MS` (1000)
@@ -297,6 +311,18 @@ impl ServerConfig {
             Some(value) => parse_bool_env("ARGMIN_CONTROL_PLANE_EXPERIMENTAL_RAFT", &value)?,
             None => false,
         };
+        let control_plane_raft_cluster_name = get("ARGMIN_CONTROL_PLANE_RAFT_CLUSTER_NAME");
+        let control_plane_raft_node_id = match get("ARGMIN_CONTROL_PLANE_RAFT_NODE_ID") {
+            Some(value) => {
+                let node_id = value
+                    .parse::<u64>()
+                    .map_err(|e| format!("invalid ARGMIN_CONTROL_PLANE_RAFT_NODE_ID: {e}"))?;
+                Some(node_id)
+            }
+            None if control_plane_experimental_raft => Some(1),
+            None => None,
+        };
+        let control_plane_raft_peer_socket_path = get("ARGMIN_CONTROL_PLANE_RAFT_PEER_SOCKET_PATH");
         let control_plane_lease_scan_ms: u64 = get("ARGMIN_CONTROL_PLANE_LEASE_SCAN_MS")
             .unwrap_or_else(|| "250".to_string())
             .parse()
@@ -345,6 +371,8 @@ impl ServerConfig {
             local_node_count,
             process_role.uses_remote_frontend_routing() && control_plane_socket_path.is_none(),
         )?;
+        let control_plane_raft_peer_sockets =
+            parse_control_plane_raft_peer_sockets(get("ARGMIN_CONTROL_PLANE_RAFT_PEER_SOCKETS"))?;
         if process_role.has_storage_node() {
             let storage_node_id = storage_node_id.ok_or_else(|| {
                 "ARGMIN_STORAGE_NODE_ID is required for storage roles".to_string()
@@ -423,6 +451,76 @@ impl ServerConfig {
             return Err(
                 "ARGMIN_CONTROL_PLANE_SOCKET_PATH is required for control-plane role".to_string(),
             );
+        }
+        if !control_plane_experimental_raft
+            && (control_plane_raft_cluster_name.is_some()
+                || control_plane_raft_node_id.is_some()
+                || control_plane_raft_peer_socket_path.is_some()
+                || !control_plane_raft_peer_sockets.is_empty())
+        {
+            return Err(
+                "ARGMIN_CONTROL_PLANE_RAFT_* requires ARGMIN_CONTROL_PLANE_EXPERIMENTAL_RAFT"
+                    .to_string(),
+            );
+        }
+        if let Some(cluster_name) = &control_plane_raft_cluster_name {
+            if cluster_name.is_empty() || !cluster_name.bytes().all(|b| b.is_ascii_graphic()) {
+                return Err(
+                    "ARGMIN_CONTROL_PLANE_RAFT_CLUSTER_NAME must be non-empty and contain only printable non-space ASCII"
+                        .to_string(),
+                );
+            }
+        }
+        if let Some(node_id) = control_plane_raft_node_id {
+            if node_id == 0 {
+                return Err("ARGMIN_CONTROL_PLANE_RAFT_NODE_ID must be > 0".to_string());
+            }
+        }
+        if let Some(peer_socket_path) = &control_plane_raft_peer_socket_path {
+            if peer_socket_path.is_empty() {
+                return Err(
+                    "ARGMIN_CONTROL_PLANE_RAFT_PEER_SOCKET_PATH must not be empty".to_string(),
+                );
+            }
+            if !Path::new(peer_socket_path).is_absolute() {
+                return Err(
+                    "ARGMIN_CONTROL_PLANE_RAFT_PEER_SOCKET_PATH must use an absolute socket path"
+                        .to_string(),
+                );
+            }
+        }
+        if !control_plane_raft_peer_sockets.is_empty() {
+            let local_node_id = control_plane_raft_node_id.expect(
+                "experimental raft node id is set when experimental raft config is enabled",
+            );
+            let local_peer_socket_path = control_plane_raft_peer_socket_path.as_deref().ok_or_else(
+                || {
+                    "ARGMIN_CONTROL_PLANE_RAFT_PEER_SOCKET_PATH is required when ARGMIN_CONTROL_PLANE_RAFT_PEER_SOCKETS is set"
+                        .to_string()
+                },
+            )?;
+            let configured_local_socket_path = control_plane_raft_peer_sockets
+                .iter()
+                .find(|entry| entry.node_id == local_node_id)
+                .map(|entry| entry.socket_path.as_str())
+                .ok_or_else(|| {
+                    format!(
+                        "ARGMIN_CONTROL_PLANE_RAFT_PEER_SOCKETS must include local Raft node id {local_node_id}"
+                    )
+                })?;
+            let configured_local_socket_path = canonical_control_plane_raft_peer_socket_path(
+                local_node_id,
+                configured_local_socket_path,
+            )?;
+            let local_peer_socket_path = canonical_control_plane_raft_peer_socket_path(
+                local_node_id,
+                local_peer_socket_path,
+            )?;
+            if configured_local_socket_path != local_peer_socket_path {
+                return Err(format!(
+                    "ARGMIN_CONTROL_PLANE_RAFT_PEER_SOCKETS entry for local Raft node {local_node_id} must match ARGMIN_CONTROL_PLANE_RAFT_PEER_SOCKET_PATH"
+                ));
+            }
         }
         if control_plane_lease_scan_interval.is_zero() {
             return Err("ARGMIN_CONTROL_PLANE_LEASE_SCAN_MS must be > 0".to_string());
@@ -505,6 +603,10 @@ impl ServerConfig {
             control_plane_state_path,
             control_plane_socket_path,
             control_plane_experimental_raft,
+            control_plane_raft_cluster_name,
+            control_plane_raft_node_id,
+            control_plane_raft_peer_socket_path,
+            control_plane_raft_peer_sockets,
             control_plane_lease_scan_interval,
             control_plane_refresh_interval,
             control_plane_heartbeat_lease_duration,
@@ -668,6 +770,74 @@ fn parse_storage_node_sockets(
     Ok(entries)
 }
 
+fn parse_control_plane_raft_peer_sockets(
+    value: Option<String>,
+) -> Result<Vec<ConfiguredControlPlaneRaftPeerSocket>, String> {
+    let Some(value) = value else {
+        return Ok(Vec::new());
+    };
+    if value.trim().is_empty() {
+        return Err("ARGMIN_CONTROL_PLANE_RAFT_PEER_SOCKETS must not be empty".to_string());
+    }
+
+    let mut by_node = HashMap::<u64, String>::new();
+    let mut socket_paths = HashSet::<PathBuf>::new();
+    for raw in value.split(',') {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return Err(
+                "ARGMIN_CONTROL_PLANE_RAFT_PEER_SOCKETS contains an empty entry".to_string(),
+            );
+        }
+        let (raw_node_id, raw_socket_path) = trimmed.split_once('=').ok_or_else(|| {
+            format!(
+                "ARGMIN_CONTROL_PLANE_RAFT_PEER_SOCKETS entry {trimmed:?} must be node_id=/absolute/socket"
+            )
+        })?;
+        let node_id: u64 = raw_node_id.trim().parse().map_err(|e| {
+            format!("invalid ARGMIN_CONTROL_PLANE_RAFT_PEER_SOCKETS node id {raw_node_id:?}: {e}")
+        })?;
+        if node_id == 0 {
+            return Err("ARGMIN_CONTROL_PLANE_RAFT_PEER_SOCKETS node id must be > 0".to_string());
+        }
+        let socket_path = raw_socket_path.trim();
+        if socket_path.is_empty() {
+            return Err(format!(
+                "ARGMIN_CONTROL_PLANE_RAFT_PEER_SOCKETS entry for node {node_id} has an empty socket path"
+            ));
+        }
+        if !Path::new(socket_path).is_absolute() {
+            return Err(format!(
+                "ARGMIN_CONTROL_PLANE_RAFT_PEER_SOCKETS entry for node {node_id} must use an absolute socket path"
+            ));
+        }
+        let canonical_socket_path =
+            canonical_control_plane_raft_peer_socket_path(node_id, socket_path)?;
+        if by_node.insert(node_id, socket_path.to_string()).is_some() {
+            return Err(format!(
+                "ARGMIN_CONTROL_PLANE_RAFT_PEER_SOCKETS contains duplicate node id {node_id}"
+            ));
+        }
+        if !socket_paths.insert(canonical_socket_path) {
+            return Err(format!(
+                "ARGMIN_CONTROL_PLANE_RAFT_PEER_SOCKETS contains duplicate socket path {socket_path:?}"
+            ));
+        }
+    }
+
+    let mut entries: Vec<ConfiguredControlPlaneRaftPeerSocket> = by_node
+        .into_iter()
+        .map(
+            |(node_id, socket_path)| ConfiguredControlPlaneRaftPeerSocket {
+                node_id,
+                socket_path,
+            },
+        )
+        .collect();
+    entries.sort_by_key(|entry| entry.node_id);
+    Ok(entries)
+}
+
 fn canonical_storage_node_socket_path(node_id: u32, socket_path: &str) -> Result<PathBuf, String> {
     let path = Path::new(socket_path);
     let parent = path.parent().ok_or_else(|| {
@@ -679,6 +849,27 @@ fn canonical_storage_node_socket_path(node_id: u32, socket_path: &str) -> Result
     let canonical_parent = parent.canonicalize().map_err(|e| {
         format!(
             "ARGMIN_STORAGE_NODE_SOCKETS parent for node {node_id} could not be canonicalized: {e}"
+        )
+    })?;
+    Ok(canonical_parent.join(file_name))
+}
+
+fn canonical_control_plane_raft_peer_socket_path(
+    node_id: u64,
+    socket_path: &str,
+) -> Result<PathBuf, String> {
+    let path = Path::new(socket_path);
+    let parent = path.parent().ok_or_else(|| {
+        format!(
+            "ARGMIN_CONTROL_PLANE_RAFT_PEER_SOCKETS entry for node {node_id} is missing a parent"
+        )
+    })?;
+    let file_name = path.file_name().ok_or_else(|| {
+        format!("ARGMIN_CONTROL_PLANE_RAFT_PEER_SOCKETS entry for node {node_id} is missing a file name")
+    })?;
+    let canonical_parent = parent.canonicalize().map_err(|e| {
+        format!(
+            "ARGMIN_CONTROL_PLANE_RAFT_PEER_SOCKETS parent for node {node_id} could not be canonicalized: {e}"
         )
     })?;
     Ok(canonical_parent.join(file_name))
@@ -916,6 +1107,10 @@ mod tests {
         assert_eq!(cfg.control_plane_state_path, None);
         assert_eq!(cfg.control_plane_socket_path, None);
         assert!(!cfg.control_plane_experimental_raft);
+        assert_eq!(cfg.control_plane_raft_cluster_name, None);
+        assert_eq!(cfg.control_plane_raft_node_id, None);
+        assert_eq!(cfg.control_plane_raft_peer_socket_path, None);
+        assert!(cfg.control_plane_raft_peer_sockets.is_empty());
         assert_eq!(
             cfg.control_plane_lease_scan_interval,
             Duration::from_millis(250)
@@ -970,6 +1165,16 @@ mod tests {
             ),
             ("ARGMIN_CONTROL_PLANE_LEASE_SCAN_MS", "125"),
             ("ARGMIN_CONTROL_PLANE_EXPERIMENTAL_RAFT", "true"),
+            ("ARGMIN_CONTROL_PLANE_RAFT_CLUSTER_NAME", "raft-control"),
+            ("ARGMIN_CONTROL_PLANE_RAFT_NODE_ID", "7"),
+            (
+                "ARGMIN_CONTROL_PLANE_RAFT_PEER_SOCKET_PATH",
+                "/tmp/control-plane-raft-7.sock",
+            ),
+            (
+                "ARGMIN_CONTROL_PLANE_RAFT_PEER_SOCKETS",
+                "8=/tmp/control-plane-raft-8.sock,7=/tmp/control-plane-raft-7.sock",
+            ),
             ("ARGMIN_CONTROL_PLANE_REFRESH_MS", "200"),
             ("ARGMIN_CONTROL_PLANE_HEARTBEAT_LEASE_MS", "900"),
             ("ARGMIN_LOCAL_NODE_COUNT", "12"),
@@ -994,6 +1199,28 @@ mod tests {
             Some("/tmp/control-plane.sock")
         );
         assert!(cfg.control_plane_experimental_raft);
+        assert_eq!(
+            cfg.control_plane_raft_cluster_name.as_deref(),
+            Some("raft-control")
+        );
+        assert_eq!(cfg.control_plane_raft_node_id, Some(7));
+        assert_eq!(
+            cfg.control_plane_raft_peer_socket_path.as_deref(),
+            Some("/tmp/control-plane-raft-7.sock")
+        );
+        assert_eq!(
+            cfg.control_plane_raft_peer_sockets,
+            vec![
+                ConfiguredControlPlaneRaftPeerSocket {
+                    node_id: 7,
+                    socket_path: "/tmp/control-plane-raft-7.sock".to_string(),
+                },
+                ConfiguredControlPlaneRaftPeerSocket {
+                    node_id: 8,
+                    socket_path: "/tmp/control-plane-raft-8.sock".to_string(),
+                },
+            ]
+        );
         assert_eq!(
             cfg.control_plane_lease_scan_interval,
             Duration::from_millis(125)
@@ -1193,6 +1420,155 @@ mod tests {
             Some("/tmp/argmin-control-plane.sock")
         );
         assert!(cfg.storage_node_sockets.is_empty());
+    }
+
+    #[test]
+    fn experimental_raft_control_plane_defaults_local_node_id() {
+        let cfg = ServerConfig::from_lookup(make_env(&[
+            ("ARGMIN_PROCESS_ROLE", "control-plane"),
+            ("ARGMIN_CONTROL_PLANE_STATE_PATH", "/tmp/argmin-cp.state"),
+            ("ARGMIN_CONTROL_PLANE_SOCKET_PATH", "/tmp/argmin-cp.sock"),
+            ("ARGMIN_CONTROL_PLANE_EXPERIMENTAL_RAFT", "true"),
+        ]))
+        .unwrap();
+
+        assert!(cfg.control_plane_experimental_raft);
+        assert_eq!(cfg.control_plane_raft_node_id, Some(1));
+        assert_eq!(cfg.control_plane_raft_cluster_name, None);
+        assert_eq!(cfg.control_plane_raft_peer_socket_path, None);
+        assert!(cfg.control_plane_raft_peer_sockets.is_empty());
+    }
+
+    #[test]
+    fn experimental_raft_control_plane_parses_peer_socket_map() {
+        let cfg = ServerConfig::from_lookup(make_env(&[
+            ("ARGMIN_PROCESS_ROLE", "control-plane"),
+            ("ARGMIN_CONTROL_PLANE_STATE_PATH", "/tmp/argmin-cp.state"),
+            ("ARGMIN_CONTROL_PLANE_SOCKET_PATH", "/tmp/argmin-cp.sock"),
+            ("ARGMIN_CONTROL_PLANE_EXPERIMENTAL_RAFT", "true"),
+            ("ARGMIN_CONTROL_PLANE_RAFT_CLUSTER_NAME", "raft-cluster-a"),
+            ("ARGMIN_CONTROL_PLANE_RAFT_NODE_ID", "11"),
+            (
+                "ARGMIN_CONTROL_PLANE_RAFT_PEER_SOCKET_PATH",
+                "/tmp/argmin-cp-raft-11.sock",
+            ),
+            (
+                "ARGMIN_CONTROL_PLANE_RAFT_PEER_SOCKETS",
+                "12=/tmp/argmin-cp-raft-12.sock,11=/tmp/argmin-cp-raft-11.sock",
+            ),
+        ]))
+        .unwrap();
+
+        assert_eq!(
+            cfg.control_plane_raft_cluster_name.as_deref(),
+            Some("raft-cluster-a")
+        );
+        assert_eq!(cfg.control_plane_raft_node_id, Some(11));
+        assert_eq!(
+            cfg.control_plane_raft_peer_socket_path.as_deref(),
+            Some("/tmp/argmin-cp-raft-11.sock")
+        );
+        assert_eq!(
+            cfg.control_plane_raft_peer_sockets,
+            vec![
+                ConfiguredControlPlaneRaftPeerSocket {
+                    node_id: 11,
+                    socket_path: "/tmp/argmin-cp-raft-11.sock".to_string(),
+                },
+                ConfiguredControlPlaneRaftPeerSocket {
+                    node_id: 12,
+                    socket_path: "/tmp/argmin-cp-raft-12.sock".to_string(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn experimental_raft_control_plane_rejects_config_without_flag() {
+        let err = ServerConfig::from_lookup(make_env(&[
+            ("ARGMIN_PROCESS_ROLE", "control-plane"),
+            ("ARGMIN_CONTROL_PLANE_STATE_PATH", "/tmp/argmin-cp.state"),
+            ("ARGMIN_CONTROL_PLANE_SOCKET_PATH", "/tmp/argmin-cp.sock"),
+            ("ARGMIN_CONTROL_PLANE_RAFT_NODE_ID", "11"),
+        ]))
+        .unwrap_err();
+
+        assert!(err.contains("ARGMIN_CONTROL_PLANE_RAFT_*"));
+    }
+
+    #[test]
+    fn experimental_raft_control_plane_rejects_invalid_peer_config() {
+        let err = ServerConfig::from_lookup(make_env(&[
+            ("ARGMIN_PROCESS_ROLE", "control-plane"),
+            ("ARGMIN_CONTROL_PLANE_STATE_PATH", "/tmp/argmin-cp.state"),
+            ("ARGMIN_CONTROL_PLANE_SOCKET_PATH", "/tmp/argmin-cp.sock"),
+            ("ARGMIN_CONTROL_PLANE_EXPERIMENTAL_RAFT", "true"),
+            ("ARGMIN_CONTROL_PLANE_RAFT_NODE_ID", "0"),
+        ]))
+        .unwrap_err();
+        assert!(err.contains("ARGMIN_CONTROL_PLANE_RAFT_NODE_ID must be > 0"));
+
+        let err = ServerConfig::from_lookup(make_env(&[
+            ("ARGMIN_PROCESS_ROLE", "control-plane"),
+            ("ARGMIN_CONTROL_PLANE_STATE_PATH", "/tmp/argmin-cp.state"),
+            ("ARGMIN_CONTROL_PLANE_SOCKET_PATH", "/tmp/argmin-cp.sock"),
+            ("ARGMIN_CONTROL_PLANE_EXPERIMENTAL_RAFT", "true"),
+            (
+                "ARGMIN_CONTROL_PLANE_RAFT_PEER_SOCKET_PATH",
+                "relative.sock",
+            ),
+        ]))
+        .unwrap_err();
+        assert!(err.contains("absolute socket path"));
+
+        let err = ServerConfig::from_lookup(make_env(&[
+            ("ARGMIN_PROCESS_ROLE", "control-plane"),
+            ("ARGMIN_CONTROL_PLANE_STATE_PATH", "/tmp/argmin-cp.state"),
+            ("ARGMIN_CONTROL_PLANE_SOCKET_PATH", "/tmp/argmin-cp.sock"),
+            ("ARGMIN_CONTROL_PLANE_EXPERIMENTAL_RAFT", "true"),
+            (
+                "ARGMIN_CONTROL_PLANE_RAFT_PEER_SOCKETS",
+                "1=/tmp/argmin-cp-raft-1.sock",
+            ),
+        ]))
+        .unwrap_err();
+        assert!(err.contains("ARGMIN_CONTROL_PLANE_RAFT_PEER_SOCKET_PATH is required"));
+
+        let err = ServerConfig::from_lookup(make_env(&[
+            ("ARGMIN_PROCESS_ROLE", "control-plane"),
+            ("ARGMIN_CONTROL_PLANE_STATE_PATH", "/tmp/argmin-cp.state"),
+            ("ARGMIN_CONTROL_PLANE_SOCKET_PATH", "/tmp/argmin-cp.sock"),
+            ("ARGMIN_CONTROL_PLANE_EXPERIMENTAL_RAFT", "true"),
+            ("ARGMIN_CONTROL_PLANE_RAFT_NODE_ID", "11"),
+            (
+                "ARGMIN_CONTROL_PLANE_RAFT_PEER_SOCKET_PATH",
+                "/tmp/argmin-cp-raft-11.sock",
+            ),
+            (
+                "ARGMIN_CONTROL_PLANE_RAFT_PEER_SOCKETS",
+                "12=/tmp/argmin-cp-raft-12.sock",
+            ),
+        ]))
+        .unwrap_err();
+        assert!(err.contains("must include local Raft node id 11"));
+
+        let err = ServerConfig::from_lookup(make_env(&[
+            ("ARGMIN_PROCESS_ROLE", "control-plane"),
+            ("ARGMIN_CONTROL_PLANE_STATE_PATH", "/tmp/argmin-cp.state"),
+            ("ARGMIN_CONTROL_PLANE_SOCKET_PATH", "/tmp/argmin-cp.sock"),
+            ("ARGMIN_CONTROL_PLANE_EXPERIMENTAL_RAFT", "true"),
+            ("ARGMIN_CONTROL_PLANE_RAFT_NODE_ID", "11"),
+            (
+                "ARGMIN_CONTROL_PLANE_RAFT_PEER_SOCKET_PATH",
+                "/tmp/argmin-cp-raft-11.sock",
+            ),
+            (
+                "ARGMIN_CONTROL_PLANE_RAFT_PEER_SOCKETS",
+                "11=/tmp/argmin-cp-raft-other.sock",
+            ),
+        ]))
+        .unwrap_err();
+        assert!(err.contains("must match ARGMIN_CONTROL_PLANE_RAFT_PEER_SOCKET_PATH"));
     }
 
     #[test]

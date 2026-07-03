@@ -1059,6 +1059,7 @@ impl SubmittedControlPlaneRaftCommand {
 }
 
 pub struct ControlPlaneRaftAuthority {
+    cluster_name: String,
     raft: Raft<ControlPlaneRaftTypeConfig, ControlPlaneRaftStateMachine>,
     log_store: Option<ControlPlaneRaftLogStore>,
 }
@@ -2536,7 +2537,8 @@ impl ControlPlaneRaftAuthority {
         cluster_name: impl Into<String>,
         node_id: ControlPlaneRaftNodeId,
     ) -> Result<Self, ControlPlaneError> {
-        let config = experimental_single_node_raft_config(cluster_name)?;
+        let cluster_name = cluster_name.into();
+        let config = experimental_single_node_raft_config(cluster_name.clone())?;
         let log_store = ControlPlaneRaftLogStore::empty();
         let raft = Raft::<ControlPlaneRaftTypeConfig, ControlPlaneRaftStateMachine>::new(
             node_id,
@@ -2547,7 +2549,7 @@ impl ControlPlaneRaftAuthority {
         )
         .await
         .map_err(|error| openraft_remote_error("new experimental single-node authority", error))?;
-        Ok(Self::new_with_log_store(raft, log_store))
+        Ok(Self::new_with_log_store(raft, log_store, cluster_name))
     }
 
     pub async fn new_experimental_single_node_durable(
@@ -2555,10 +2557,12 @@ impl ControlPlaneRaftAuthority {
         node_id: ControlPlaneRaftNodeId,
         artifact_path: &Path,
     ) -> Result<Self, ControlPlaneError> {
-        let config = experimental_single_node_raft_config(cluster_name)?;
+        let cluster_name = cluster_name.into();
+        let config = experimental_single_node_raft_config(cluster_name.clone())?;
         let (log_store, state_machine) =
             match ControlPlaneRaftRestartArtifact::load_durable_artifact(artifact_path) {
                 Ok(artifact) => {
+                    artifact.validate_cluster_identity(&cluster_name)?;
                     artifact.validate_single_node_local_identity(node_id)?;
                     artifact.restore().map_err(|source| ControlPlaneError::Io {
                         context: "restore control-plane OpenRaft durable restart artifact",
@@ -2586,12 +2590,13 @@ impl ControlPlaneRaftAuthority {
         .map_err(|error| {
             openraft_remote_error("new experimental durable single-node authority", error)
         })?;
-        Ok(Self::new_with_log_store(raft, log_store))
+        Ok(Self::new_with_log_store(raft, log_store, cluster_name))
     }
 
     #[must_use]
     pub fn new(raft: Raft<ControlPlaneRaftTypeConfig, ControlPlaneRaftStateMachine>) -> Self {
         Self {
+            cluster_name: String::new(),
             raft,
             log_store: None,
         }
@@ -2601,8 +2606,10 @@ impl ControlPlaneRaftAuthority {
     pub fn new_with_log_store(
         raft: Raft<ControlPlaneRaftTypeConfig, ControlPlaneRaftStateMachine>,
         log_store: ControlPlaneRaftLogStore,
+        cluster_name: impl Into<String>,
     ) -> Self {
         Self {
+            cluster_name: cluster_name.into(),
             raft,
             log_store: Some(log_store),
         }
@@ -2800,6 +2807,7 @@ impl ControlPlaneRaftAuthority {
             .await
             .map_err(|error| openraft_remote_error("state-machine restart artifact read", error))?;
         ControlPlaneRaftRestartArtifact {
+            cluster_name: self.cluster_name.clone(),
             log_store,
             state_machine,
         }
@@ -3388,12 +3396,13 @@ pub struct ControlPlaneRaftLogStoreRestartArtifact {
 
 #[derive(Debug, Clone)]
 pub struct ControlPlaneRaftRestartArtifact {
+    cluster_name: String,
     log_store: ControlPlaneRaftLogStoreRestartArtifact,
     state_machine: ControlPlaneRaftStateMachineRestartArtifact,
 }
 
 const CONTROL_PLANE_RAFT_RESTART_MAGIC: &[u8] = b"ARGMINCPRAFT";
-const CONTROL_PLANE_RAFT_RESTART_VERSION: u16 = 1;
+const CONTROL_PLANE_RAFT_RESTART_VERSION: u16 = 2;
 const CONTROL_PLANE_RAFT_RESTART_CHECKSUM_LEN: usize = 8;
 const CONTROL_PLANE_RAFT_PEER_RPC_MAGIC: &[u8] = b"ARGMINCPRAFTPEER";
 const CONTROL_PLANE_RAFT_PEER_RPC_VERSION: u16 = 1;
@@ -3701,10 +3710,12 @@ impl ControlPlaneRaftLogStoreInner {
 
 impl ControlPlaneRaftRestartArtifact {
     pub fn capture(
+        cluster_name: impl Into<String>,
         log_store: &ControlPlaneRaftLogStore,
         state_machine: &ControlPlaneRaftStateMachine,
     ) -> Result<Self, io::Error> {
         Ok(Self {
+            cluster_name: cluster_name.into(),
             log_store: log_store.export_restart_artifact()?,
             state_machine: state_machine.export_restart_artifact(),
         })
@@ -3714,6 +3725,7 @@ impl ControlPlaneRaftRestartArtifact {
         let mut out = Vec::new();
         out.extend_from_slice(CONTROL_PLANE_RAFT_RESTART_MAGIC);
         write_raft_u16(&mut out, CONTROL_PLANE_RAFT_RESTART_VERSION);
+        write_raft_string(&mut out, &self.cluster_name)?;
         write_raft_log_store_artifact(&mut out, &self.log_store)?;
         write_raft_state_machine_artifact(&mut out, &self.state_machine)?;
         append_raft_artifact_checksum(&mut out);
@@ -3756,6 +3768,7 @@ impl ControlPlaneRaftRestartArtifact {
             )));
         }
         let artifact = Self {
+            cluster_name: reader.read_string()?,
             log_store: read_raft_log_store_artifact(&mut reader)?,
             state_machine: read_raft_state_machine_artifact(&mut reader)?,
         };
@@ -3820,6 +3833,7 @@ impl ControlPlaneRaftRestartArtifact {
     #[doc(hidden)]
     pub fn store_single_node_committed_ahead_bootstrap_artifact_for_test(
         path: &Path,
+        cluster_name: impl Into<String>,
         node_id: ControlPlaneRaftNodeId,
         nodes: Vec<(NodeId, String)>,
         pg_ids: Vec<crate::PgId>,
@@ -3852,6 +3866,7 @@ impl ControlPlaneRaftRestartArtifact {
         expected_state_machine.apply_entry(bootstrap_command.clone())?;
 
         ControlPlaneRaftRestartArtifact {
+            cluster_name: cluster_name.into(),
             log_store: ControlPlaneRaftLogStoreRestartArtifact {
                 vote: Some(Vote::new_committed(3, node_id)),
                 committed: Some(bootstrap_command.log_id),
@@ -3880,6 +3895,19 @@ impl ControlPlaneRaftRestartArtifact {
             &self.state_machine,
         )?;
         Ok((log_store, state_machine))
+    }
+
+    fn validate_cluster_identity(
+        &self,
+        expected_cluster_name: &str,
+    ) -> Result<(), ControlPlaneError> {
+        if self.cluster_name == expected_cluster_name {
+            return Ok(());
+        }
+        Err(raft_artifact_protocol_error(format!(
+            "control-plane OpenRaft durable restart artifact belongs to cluster {:?}, not configured cluster {:?}",
+            self.cluster_name, expected_cluster_name
+        )))
     }
 
     fn validate_single_node_local_identity(
@@ -8380,10 +8408,17 @@ mod tests {
         network.register(node1, raft1.clone());
         network.register(node2, raft2.clone());
         network.register(node3, raft3.clone());
-        let authority1 =
-            ControlPlaneRaftAuthority::new_with_log_store(raft1, leader_log_store.clone());
+        let authority1 = ControlPlaneRaftAuthority::new_with_log_store(
+            raft1,
+            leader_log_store.clone(),
+            "test-cluster",
+        );
         let authority2 = ControlPlaneRaftAuthority::new(raft2);
-        let authority3 = ControlPlaneRaftAuthority::new_with_log_store(raft3, log_store3.clone());
+        let authority3 = ControlPlaneRaftAuthority::new_with_log_store(
+            raft3,
+            log_store3.clone(),
+            "test-cluster",
+        );
 
         authority1
             .initialize_membership(BTreeMap::from([
@@ -8420,6 +8455,7 @@ mod tests {
             .await
             .unwrap();
         ControlPlaneRaftRestartArtifact {
+            cluster_name: authority.cluster_name.clone(),
             log_store,
             state_machine,
         }
@@ -9788,7 +9824,11 @@ mod tests {
             .await
             .unwrap();
 
-            let authority = ControlPlaneRaftAuthority::new_with_log_store(raft, log_store.clone());
+            let authority = ControlPlaneRaftAuthority::new_with_log_store(
+                raft,
+                log_store.clone(),
+                "test-cluster",
+            );
             authority
                 .initialize_membership(BTreeMap::from([(1, BasicNode::new("node-1"))]))
                 .await
@@ -9826,7 +9866,8 @@ mod tests {
             .await
             .unwrap();
 
-            let authority = ControlPlaneRaftAuthority::new_with_log_store(raft, log_store);
+            let authority =
+                ControlPlaneRaftAuthority::new_with_log_store(raft, log_store, "test-cluster");
             authority
                 .initialize_membership(BTreeMap::from([(1, BasicNode::new("node-1"))]))
                 .await
@@ -11504,8 +11545,11 @@ mod tests {
             network.register(623, raft3.clone());
             let authority1 = ControlPlaneRaftAuthority::new(raft1);
             let authority2 = ControlPlaneRaftAuthority::new(raft2);
-            let authority3 =
-                ControlPlaneRaftAuthority::new_with_log_store(raft3, log_store3.clone());
+            let authority3 = ControlPlaneRaftAuthority::new_with_log_store(
+                raft3,
+                log_store3.clone(),
+                "test-cluster",
+            );
 
             authority1
                 .initialize_membership(BTreeMap::from([
@@ -11603,6 +11647,7 @@ mod tests {
             let restarted_authority = ControlPlaneRaftAuthority::new_with_log_store(
                 restarted_raft,
                 restored_log_store_for_status,
+                "test-cluster",
             );
 
             let restarted_status = restarted_authority.status().await.unwrap();
@@ -11847,6 +11892,7 @@ mod tests {
             let restarted_authority = ControlPlaneRaftAuthority::new_with_log_store(
                 restarted_raft,
                 restored_log_store_for_status,
+                "test-cluster",
             );
 
             let catch_up_trigger = authority1
@@ -12050,6 +12096,7 @@ mod tests {
             let restarted_authority = ControlPlaneRaftAuthority::new_with_log_store(
                 restarted_raft,
                 restored_log_store_for_status,
+                "test-cluster",
             );
             authority1
                 .raft()
@@ -12220,6 +12267,7 @@ mod tests {
             let restarted_authority = ControlPlaneRaftAuthority::new_with_log_store(
                 restarted_raft,
                 restored_log_store_for_status,
+                "test-cluster",
             );
             restarted_authority
                 .wait_for_current_leader(
@@ -12533,8 +12581,12 @@ mod tests {
                 .unwrap();
             state_machine.apply_entry(blank_entry(3, 1, 1)).unwrap();
 
-            let artifact =
-                ControlPlaneRaftRestartArtifact::capture(&log_store, &state_machine).unwrap();
+            let artifact = ControlPlaneRaftRestartArtifact::capture(
+                "test-cluster",
+                &log_store,
+                &state_machine,
+            )
+            .unwrap();
             let (mut restored_log_store, restored_state_machine) = artifact.restore().unwrap();
             assert_eq!(
                 restored_state_machine.last_applied(),
@@ -12629,8 +12681,12 @@ mod tests {
                 .apply_entry(bootstrap_membership_entry(1))
                 .unwrap();
 
-            let artifact =
-                ControlPlaneRaftRestartArtifact::capture(&log_store, &state_machine).unwrap();
+            let artifact = ControlPlaneRaftRestartArtifact::capture(
+                "test-cluster",
+                &log_store,
+                &state_machine,
+            )
+            .unwrap();
             let (_, restored_state_machine) = artifact.restore().unwrap();
             let raft = Raft::<ControlPlaneRaftTypeConfig, ControlPlaneRaftStateMachine>::new(
                 1,
@@ -12756,7 +12812,8 @@ mod tests {
             assert_eq!(applied_state.0, Some(raft_log_id(3, 1, 2)));
             assert_eq!(applied_state.1, vec![NodeId::new(1)]);
 
-            let authority = ControlPlaneRaftAuthority::new_with_log_store(raft, log_store);
+            let authority =
+                ControlPlaneRaftAuthority::new_with_log_store(raft, log_store, "test-cluster");
             let status = authority.status().await.unwrap();
             assert_eq!(status.last_purged_index(), Some(2));
             assert_eq!(status.committed_index(), Some(2));
@@ -13001,8 +13058,12 @@ mod tests {
             state_machine.apply_entry(blank_entry(3, 1, 1)).unwrap();
             state_machine.apply_entry(blank_entry(3, 1, 2)).unwrap();
 
-            let artifact =
-                ControlPlaneRaftRestartArtifact::capture(&log_store, &state_machine).unwrap();
+            let artifact = ControlPlaneRaftRestartArtifact::capture(
+                "test-cluster",
+                &log_store,
+                &state_machine,
+            )
+            .unwrap();
             let (mut restored_log_store, mut restored_state_machine) = artifact.restore().unwrap();
 
             assert_eq!(
@@ -13063,8 +13124,12 @@ mod tests {
             state_machine.apply_entry(bootstrap_entry).unwrap();
             state_machine.apply_entry(command_entry).unwrap();
             let expected_snapshot = state_machine.inner().snapshot().clone();
-            let artifact =
-                ControlPlaneRaftRestartArtifact::capture(&log_store, &state_machine).unwrap();
+            let artifact = ControlPlaneRaftRestartArtifact::capture(
+                "test-cluster",
+                &log_store,
+                &state_machine,
+            )
+            .unwrap();
 
             let encoded = artifact.encode_durable_artifact().unwrap();
             let decoded = ControlPlaneRaftRestartArtifact::decode_durable_artifact(&encoded)
@@ -13110,6 +13175,7 @@ mod tests {
         let tmp = test_util::tempdir();
         let path = tmp.path().join("control-plane").join("raft.state");
         let artifact = ControlPlaneRaftRestartArtifact {
+            cluster_name: "test-cluster".to_string(),
             log_store: ControlPlaneRaftLogStoreRestartArtifact {
                 vote: Some(Vote::<ControlPlaneRaftLeaderId>::new_committed(3, 1)),
                 committed: Some(raft_log_id(3, 1, 1)),
@@ -13145,6 +13211,7 @@ mod tests {
         let path = tmp.path().join("raft.state");
         let tmp_path = durable_artifact_tmp_path(&path);
         let committed_artifact = ControlPlaneRaftRestartArtifact {
+            cluster_name: "test-cluster".to_string(),
             log_store: ControlPlaneRaftLogStoreRestartArtifact {
                 vote: Some(Vote::<ControlPlaneRaftLeaderId>::new_committed(3, 1)),
                 committed: Some(raft_log_id(3, 1, 1)),
@@ -13154,6 +13221,7 @@ mod tests {
             state_machine: state_machine_restart_artifact_with_noops(3, 1, 1),
         };
         let stale_temp_artifact = ControlPlaneRaftRestartArtifact {
+            cluster_name: "test-cluster".to_string(),
             log_store: ControlPlaneRaftLogStoreRestartArtifact {
                 vote: Some(Vote::<ControlPlaneRaftLeaderId>::new_committed(5, 1)),
                 committed: Some(raft_log_id(5, 1, 2)),
@@ -13197,6 +13265,7 @@ mod tests {
         let path = tmp.path().join("raft.state");
         let tmp_path = durable_artifact_tmp_path(&path);
         let committed_artifact = ControlPlaneRaftRestartArtifact {
+            cluster_name: "test-cluster".to_string(),
             log_store: ControlPlaneRaftLogStoreRestartArtifact {
                 vote: Some(Vote::<ControlPlaneRaftLeaderId>::new_committed(3, 1)),
                 committed: Some(raft_log_id(3, 1, 1)),
@@ -13206,6 +13275,7 @@ mod tests {
             state_machine: state_machine_restart_artifact_with_noops(3, 1, 1),
         };
         let replacement_artifact = ControlPlaneRaftRestartArtifact {
+            cluster_name: "test-cluster".to_string(),
             log_store: ControlPlaneRaftLogStoreRestartArtifact {
                 vote: Some(Vote::<ControlPlaneRaftLeaderId>::new_committed(5, 1)),
                 committed: Some(raft_log_id(5, 1, 2)),
@@ -13248,6 +13318,7 @@ mod tests {
         let tmp = test_util::tempdir();
         let path = tmp.path().join("raft.state");
         let artifact = ControlPlaneRaftRestartArtifact {
+            cluster_name: "test-cluster".to_string(),
             log_store: ControlPlaneRaftLogStoreRestartArtifact::default(),
             state_machine: ControlPlaneRaftStateMachine::empty().export_restart_artifact(),
         };
@@ -13287,6 +13358,7 @@ mod tests {
         ControlPlaneRaftTypeConfig::run(async {
             let tmp = test_util::tempdir();
             let path = tmp.path().join("raft.state");
+            let cluster_name = "control-plane-raft-durable-restore-test";
 
             let mut log_store = ControlPlaneRaftLogStore::empty();
             RaftLogStorage::append(
@@ -13316,13 +13388,13 @@ mod tests {
                 .apply_entry(single_node_bootstrap_membership_entry(1))
                 .unwrap();
             state_machine.apply_entry(blank_entry(3, 1, 1)).unwrap();
-            ControlPlaneRaftRestartArtifact::capture(&log_store, &state_machine)
+            ControlPlaneRaftRestartArtifact::capture(cluster_name, &log_store, &state_machine)
                 .unwrap()
                 .store_durable_artifact(&path)
                 .unwrap();
 
             let authority = ControlPlaneRaftAuthority::new_experimental_single_node_durable(
-                "control-plane-raft-durable-restore-test",
+                cluster_name,
                 1,
                 &path,
             )
@@ -13348,10 +13420,35 @@ mod tests {
     }
 
     #[test]
+    fn control_plane_openraft_durable_single_node_rejects_wrong_cluster_artifact() {
+        ControlPlaneRaftTypeConfig::run(async {
+            let tmp = test_util::tempdir();
+            let path = tmp.path().join("raft.state");
+            let artifact = ControlPlaneRaftRestartArtifact {
+                cluster_name: "old-cluster".to_string(),
+                log_store: ControlPlaneRaftLogStoreRestartArtifact::default(),
+                state_machine: ControlPlaneRaftStateMachine::empty().export_restart_artifact(),
+            };
+            artifact.store_durable_artifact(&path).unwrap();
+
+            assert_error_contains(
+                ControlPlaneRaftAuthority::new_experimental_single_node_durable(
+                    "new-cluster",
+                    1,
+                    &path,
+                )
+                .await,
+                "belongs to cluster \"old-cluster\", not configured cluster \"new-cluster\"",
+            );
+        });
+    }
+
+    #[test]
     fn control_plane_openraft_durable_single_node_restores_current_snapshot_cache() {
         ControlPlaneRaftTypeConfig::run(async {
             let tmp = test_util::tempdir();
             let path = tmp.path().join("raft.state");
+            let cluster_name = "control-plane-raft-durable-current-snapshot-cache-test";
             let bootstrap_entry = single_node_bootstrap_membership_entry(1);
             let bootstrap_command = normal_entry(
                 3,
@@ -13386,13 +13483,13 @@ mod tests {
             state_machine.apply_entry(bootstrap_command).unwrap();
             let built_snapshot = state_machine.build_snapshot().unwrap();
             assert_eq!(built_snapshot.meta.last_log_id, Some(raft_log_id(3, 1, 1)));
-            ControlPlaneRaftRestartArtifact::capture(&log_store, &state_machine)
+            ControlPlaneRaftRestartArtifact::capture(cluster_name, &log_store, &state_machine)
                 .unwrap()
                 .store_durable_artifact(&path)
                 .unwrap();
 
             let authority = ControlPlaneRaftAuthority::new_experimental_single_node_durable(
-                "control-plane-raft-durable-current-snapshot-cache-test",
+                cluster_name,
                 1,
                 &path,
             )
@@ -13419,6 +13516,7 @@ mod tests {
         ControlPlaneRaftTypeConfig::run(async {
             let tmp = test_util::tempdir();
             let path = tmp.path().join("raft.state");
+            let cluster_name = "control-plane-raft-durable-snapshot-suffix-replay-test";
             let bootstrap_entry = single_node_bootstrap_membership_entry(1);
             let bootstrap_command = normal_entry(
                 3,
@@ -13467,13 +13565,13 @@ mod tests {
             state_machine.apply_entry(suffix_entry_3).unwrap();
             assert_eq!(state_machine.last_applied(), Some(raft_log_id(3, 1, 3)));
 
-            ControlPlaneRaftRestartArtifact::capture(&log_store, &state_machine)
+            ControlPlaneRaftRestartArtifact::capture(cluster_name, &log_store, &state_machine)
                 .unwrap()
                 .store_durable_artifact(&path)
                 .unwrap();
 
             let authority = ControlPlaneRaftAuthority::new_experimental_single_node_durable(
-                "control-plane-raft-durable-snapshot-suffix-replay-test",
+                cluster_name,
                 1,
                 &path,
             )
@@ -13516,7 +13614,9 @@ mod tests {
         ControlPlaneRaftTypeConfig::run(async {
             let tmp = test_util::tempdir();
             let path = tmp.path().join("raft.state");
+            let cluster_name = "control-plane-raft-durable-multi-voter-start-test";
             let artifact = ControlPlaneRaftRestartArtifact {
+                cluster_name: cluster_name.to_string(),
                 log_store: ControlPlaneRaftLogStoreRestartArtifact {
                     vote: Some(Vote::<ControlPlaneRaftLeaderId>::new_committed(3, 1)),
                     committed: Some(raft_log_id(3, 1, 1)),
@@ -13540,7 +13640,7 @@ mod tests {
 
             assert_error_contains(
                 ControlPlaneRaftAuthority::new_experimental_single_node_durable(
-                    "control-plane-raft-durable-multi-voter-start-test",
+                    cluster_name,
                     1,
                     &path,
                 )
@@ -13555,7 +13655,9 @@ mod tests {
         ControlPlaneRaftTypeConfig::run(async {
             let tmp = test_util::tempdir();
             let path = tmp.path().join("raft.state");
+            let cluster_name = "control-plane-raft-durable-unpositioned-multi-voter-start-test";
             let artifact = ControlPlaneRaftRestartArtifact {
+                cluster_name: cluster_name.to_string(),
                 log_store: ControlPlaneRaftLogStoreRestartArtifact {
                     vote: Some(Vote::<ControlPlaneRaftLeaderId>::new_committed(3, 1)),
                     committed: Some(raft_log_id(3, 1, 1)),
@@ -13576,7 +13678,7 @@ mod tests {
 
             assert_error_contains(
                 ControlPlaneRaftAuthority::new_experimental_single_node_durable(
-                    "control-plane-raft-durable-unpositioned-multi-voter-start-test",
+                    cluster_name,
                     1,
                     &path,
                 )
@@ -13591,7 +13693,9 @@ mod tests {
         ControlPlaneRaftTypeConfig::run(async {
             let tmp = test_util::tempdir();
             let path = tmp.path().join("raft.state");
+            let cluster_name = "control-plane-raft-durable-wrong-node-start-test";
             let artifact = ControlPlaneRaftRestartArtifact {
+                cluster_name: cluster_name.to_string(),
                 log_store: ControlPlaneRaftLogStoreRestartArtifact {
                     vote: Some(Vote::<ControlPlaneRaftLeaderId>::new_committed(3, 1)),
                     committed: Some(raft_log_id(3, 1, 1)),
@@ -13607,7 +13711,7 @@ mod tests {
 
             assert_error_contains(
                 ControlPlaneRaftAuthority::new_experimental_single_node_durable(
-                    "control-plane-raft-durable-wrong-node-start-test",
+                    cluster_name,
                     2,
                     &path,
                 )
@@ -13639,6 +13743,7 @@ mod tests {
     #[test]
     fn control_plane_raft_durable_restart_artifact_codec_rejects_malformed_frames() {
         let artifact = ControlPlaneRaftRestartArtifact {
+            cluster_name: "test-cluster".to_string(),
             log_store: ControlPlaneRaftLogStoreRestartArtifact::default(),
             state_machine: ControlPlaneRaftStateMachine::empty().export_restart_artifact(),
         };
@@ -13679,6 +13784,7 @@ mod tests {
         let mut unknown_entry_tag = Vec::new();
         unknown_entry_tag.extend_from_slice(CONTROL_PLANE_RAFT_RESTART_MAGIC);
         write_raft_u16(&mut unknown_entry_tag, CONTROL_PLANE_RAFT_RESTART_VERSION);
+        write_raft_string(&mut unknown_entry_tag, "test-cluster").unwrap();
         write_raft_option_vote(&mut unknown_entry_tag, None);
         write_raft_option_log_id(&mut unknown_entry_tag, None);
         write_raft_option_log_id(&mut unknown_entry_tag, None);
@@ -13692,6 +13798,7 @@ mod tests {
         );
 
         let index_zero_blank = ControlPlaneRaftRestartArtifact {
+            cluster_name: "test-cluster".to_string(),
             log_store: ControlPlaneRaftLogStoreRestartArtifact {
                 entries: vec![blank_entry(0, 1, 0)],
                 ..Default::default()
@@ -13706,6 +13813,7 @@ mod tests {
         );
 
         let non_bootstrap_index_zero_membership = ControlPlaneRaftRestartArtifact {
+            cluster_name: "test-cluster".to_string(),
             log_store: ControlPlaneRaftLogStoreRestartArtifact {
                 entries: vec![membership_entry(1, 1, 0)],
                 ..Default::default()
@@ -13725,6 +13833,7 @@ mod tests {
     #[test]
     fn control_plane_raft_durable_restart_artifact_decode_validates_restart_pair() {
         let artifact = ControlPlaneRaftRestartArtifact {
+            cluster_name: "test-cluster".to_string(),
             log_store: ControlPlaneRaftLogStoreRestartArtifact {
                 vote: Some(Vote::<ControlPlaneRaftLeaderId>::new_committed(3, 1)),
                 committed: Some(raft_log_id(3, 1, 2)),
@@ -13760,6 +13869,7 @@ mod tests {
             ..Default::default()
         };
         let applied_after_committed = ControlPlaneRaftRestartArtifact {
+            cluster_name: "test-cluster".to_string(),
             log_store: log_committed_through_two.clone(),
             state_machine: state_machine_restart_artifact_with_noops(3, 1, 3),
         };
@@ -13767,6 +13877,7 @@ mod tests {
         assert!(err.to_string().contains("after committed restart gate"));
 
         let missing_committed_gate = ControlPlaneRaftRestartArtifact {
+            cluster_name: "test-cluster".to_string(),
             log_store: ControlPlaneRaftLogStoreRestartArtifact {
                 entries: vec![bootstrap_membership_entry(1), blank_entry(3, 1, 1)],
                 ..Default::default()
@@ -13777,6 +13888,7 @@ mod tests {
         assert!(err.to_string().contains("no committed restart gate"));
 
         let applied_unknown_to_log = ControlPlaneRaftRestartArtifact {
+            cluster_name: "test-cluster".to_string(),
             log_store: ControlPlaneRaftLogStoreRestartArtifact {
                 vote: Some(Vote::<ControlPlaneRaftLeaderId>::new_committed(3, 1)),
                 committed: Some(raft_log_id(3, 1, 2)),
@@ -13795,6 +13907,7 @@ mod tests {
             .contains("is not retained or purged in the log store"));
 
         let state_behind_purged_boundary = ControlPlaneRaftRestartArtifact {
+            cluster_name: "test-cluster".to_string(),
             log_store: ControlPlaneRaftLogStoreRestartArtifact {
                 vote: Some(Vote::<ControlPlaneRaftLeaderId>::new_committed(3, 1)),
                 committed: Some(raft_log_id(3, 1, 2)),
@@ -13824,6 +13937,7 @@ mod tests {
         state_machine.build_snapshot().unwrap();
         state_machine.apply_entry(blank_entry(3, 1, 2)).unwrap();
         let mut artifact = ControlPlaneRaftRestartArtifact {
+            cluster_name: "test-cluster".to_string(),
             log_store: ControlPlaneRaftLogStoreRestartArtifact {
                 vote: Some(Vote::<ControlPlaneRaftLeaderId>::new_committed(3, 1)),
                 committed: Some(raft_log_id(3, 1, 2)),
@@ -13869,6 +13983,7 @@ mod tests {
             .apply_entry(membership_entry(3, 1, 2))
             .unwrap();
         let mut stale_snapshot_wrong_membership = ControlPlaneRaftRestartArtifact {
+            cluster_name: "test-cluster".to_string(),
             log_store: ControlPlaneRaftLogStoreRestartArtifact {
                 vote: Some(Vote::<ControlPlaneRaftLeaderId>::new_committed(3, 1)),
                 committed: Some(raft_log_id(3, 1, 2)),

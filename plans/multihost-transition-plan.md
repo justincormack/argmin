@@ -10385,6 +10385,16 @@ Phase 12.3 progress:
   stream handler auto-dispatch ordinary Raft RPCs and snapshot install traffic.
   Socket-pair coverage now pins auto-dispatch for both vote and snapshot frames;
   process accept loop wiring remains the next layer.
+- Added the first process configuration boundary for experimental multi-node
+  Raft control-plane peers. The control-plane config now parses an explicit
+  Raft cluster name, local Raft node id, local peer socket path, and configured
+  peer socket map, with fail-closed validation for non-experimental use,
+  invalid node ids, relative paths, missing local peer entries, and mismatched
+  local socket identity. The existing single-node experimental process path now
+  honors the configured cluster name and node id while leaving peer listener
+  startup for the next slice. The durable OpenRaft restart artifact now carries
+  the configured cluster name under checksum and startup rejects artifacts whose
+  cluster identity does not match the process configuration.
 
 1. define the replicated control-plane state machine:
    - state includes cluster epoch, PG count, PG state, PG acting sets, node
