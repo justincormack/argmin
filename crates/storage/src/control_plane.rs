@@ -8327,6 +8327,12 @@ fn state_parent(path: &Path) -> Option<&Path> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::metadata_command::{
+        CreateBucketCommand, MetadataCommandEnvelope, MetadataCommandId, MetadataCommandLogIndex,
+        MetadataCommandPayload,
+    };
+    use crate::pg_store::PgStore;
+    use crate::traits::PgMetadataStore;
     use proptest::prelude::*;
     use std::cell::Cell;
     use std::sync::{
@@ -8525,6 +8531,50 @@ mod tests {
             .node(NodeId::new(node_id))
             .unwrap()
             .node_incarnation()
+    }
+
+    fn bucket_name(name: &str) -> crate::BucketName {
+        crate::BucketName::try_from(name).expect("test bucket names must be valid")
+    }
+
+    fn logged_create_bucket_command(
+        pg_id: PgId,
+        log_index: u64,
+        bucket: &crate::BucketName,
+    ) -> MetadataCommandEnvelope {
+        let owner = crate::OwnerIdentity::from_principal("owner");
+        let config = crate::CreateBucketConfig {
+            name: bucket.as_str(),
+            owner_principal: &owner.principal,
+            owner_canonical_id: &owner.canonical_id,
+            acl_grants: &crate::AclGrants::default(),
+            public_read: false,
+            public_write: false,
+            versioning: crate::BucketVersioningState::Disabled,
+            object_lock: crate::BucketObjectLockConfig::default(),
+            ownership_controls: crate::BucketOwnershipControls {
+                object_ownership: crate::BucketObjectOwnership::ObjectWriter,
+            },
+        };
+        MetadataCommandEnvelope::new(
+            MetadataCommandId::new(
+                ClusterEpoch::INITIAL,
+                pg_id,
+                MetadataCommandLogIndex::new(log_index).unwrap(),
+            ),
+            MetadataCommandPayload::CreateBucket(
+                CreateBucketCommand::from_config(&config, 123, 1).unwrap(),
+            ),
+        )
+    }
+
+    fn pg_metadata_proof_from_store(store: &PgStore) -> PgMetadataProof {
+        let state = store.metadata_command_replica_state().unwrap();
+        PgMetadataProof::new(
+            state.applied_log_index,
+            state.applied_log_hash,
+            state.state_digest,
+        )
     }
 
     fn placed_segment_shard_repair_work_item_for_runtime_refresh(
@@ -16537,6 +16587,89 @@ mod tests {
         let persisted_pg = persisted.pg(PgId::new(19)).unwrap();
         assert_eq!(persisted_pg.active_primary(), Some(NodeId::new(1)));
         assert_eq!(persisted_pg.active_metadata_proof(), Some(matching_proof));
+    }
+
+    #[test]
+    fn complete_pg_peering_rejects_same_log_divergent_replica_digest() {
+        let tmp = test_util::tempdir();
+        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+        for node_id in [1, 2] {
+            authority
+                .set_node_membership(NodeId::new(node_id), NodeMembershipState::Active)
+                .unwrap();
+            assert!(heartbeat_until_serving(&mut authority, node_id, 1_000).serving());
+        }
+        let pg_id = PgId::new(32);
+        authority
+            .set_pg_acting_set(pg_id, vec![NodeId::new(1), NodeId::new(2)])
+            .unwrap();
+
+        let node_one_pg = PgStore::open(&tmp.path().join("node-1-pg"), pg_id.get()).unwrap();
+        let node_two_pg = PgStore::open(&tmp.path().join("node-2-pg"), pg_id.get()).unwrap();
+        let bucket = bucket_name("divergent-replica-source");
+        let create = logged_create_bucket_command(pg_id, 1, &bucket);
+        node_one_pg
+            .apply_metadata_command_and_record(1, &create)
+            .unwrap();
+        node_two_pg
+            .apply_metadata_command_and_record(2, &create)
+            .unwrap();
+        let primary_proof = pg_metadata_proof_from_store(&node_one_pg);
+        assert_eq!(primary_proof, pg_metadata_proof_from_store(&node_two_pg));
+
+        node_two_pg
+            .put_bucket_versioning(&bucket, crate::BucketVersioningState::Enabled)
+            .unwrap();
+        node_two_pg.refresh_metadata_command_state_digest().unwrap();
+        let divergent_proof = pg_metadata_proof_from_store(&node_two_pg);
+        assert_eq!(
+            divergent_proof.applied_log_index,
+            primary_proof.applied_log_index
+        );
+        assert_eq!(
+            divergent_proof.applied_log_hash,
+            primary_proof.applied_log_hash
+        );
+        assert_ne!(divergent_proof.state_digest, primary_proof.state_digest);
+
+        heartbeat_with_pg_proof(
+            &mut authority,
+            1,
+            pg_id.get(),
+            PgState::Peering,
+            primary_proof,
+            false,
+            2_000,
+        );
+        heartbeat_with_pg_proof(
+            &mut authority,
+            2,
+            pg_id.get(),
+            PgState::Peering,
+            divergent_proof,
+            false,
+            2_001,
+        );
+        assert!(matches!(
+            authority.complete_pg_peering(
+                pg_id,
+                NodeId::new(1),
+                node_incarnation(&authority, 1),
+                2_010,
+            ),
+            Err(ControlPlaneError::PgPeeringMetadataProofMismatch {
+                pg_id: 32,
+                node_id: 2,
+                expected,
+                actual,
+                ..
+            }) if expected == primary_proof && actual == divergent_proof
+        ));
+        assert_eq!(
+            authority.snapshot().pg(pg_id).unwrap().state(),
+            PgState::Peering
+        );
     }
 
     #[test]
