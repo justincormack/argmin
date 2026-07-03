@@ -419,6 +419,33 @@ fn maybe_run_control_plane_admin_command() -> Option<i32> {
         };
     }
 
+    if command == "control-plane-trigger-raft-election" {
+        let Some(path) = args.next() else {
+            eprintln!(
+                "usage: argmin-s3 {} <socket-path>",
+                command.to_string_lossy()
+            );
+            return Some(2);
+        };
+        if args.next().is_some() {
+            eprintln!(
+                "usage: argmin-s3 {} <socket-path>",
+                command.to_string_lossy()
+            );
+            return Some(2);
+        }
+        return match trigger_control_plane_raft_election(Path::new(&path)) {
+            Ok(()) => {
+                eprintln!("control-plane triggered Raft election");
+                Some(0)
+            }
+            Err(error) => {
+                eprintln!("{error}");
+                Some(1)
+            }
+        };
+    }
+
     if command == "control-plane-set-pg-acting-set-with-metadata-transfer-live" {
         let Some(path) = args.next() else {
             eprintln!(
@@ -708,6 +735,12 @@ fn trigger_control_plane_raft_snapshot_and_purge(
     UnixControlPlaneClient::new(socket_path)
         .trigger_raft_snapshot_and_purge()
         .map_err(|error| format!("failed to trigger control-plane Raft snapshot purge: {error}"))
+}
+
+fn trigger_control_plane_raft_election(socket_path: &Path) -> Result<(), String> {
+    UnixControlPlaneClient::new(socket_path)
+        .trigger_raft_election()
+        .map_err(|error| format!("failed to trigger control-plane Raft election: {error}"))
 }
 
 fn fence_control_plane_pg_for_metadata_transfer_live(
@@ -1609,6 +1642,22 @@ impl ControlPlaneAdmin for ExperimentalRaftControlPlane {
             return Err(error);
         }
         Ok(snapshot_log_id.map(|log_id| log_id.index()))
+    }
+
+    fn trigger_raft_election(&mut self) -> Result<(), ControlPlaneError> {
+        self.ensure_not_durably_poisoned()?;
+        self.block_on(
+            self.authority
+                .trigger_pre_vote_election_until_serving(Duration::from_secs(10)),
+        )?;
+        if let Err(error) = self.store_durable_restart_artifact() {
+            self.durable_poison = Some(format!(
+                "experimental OpenRaft control-plane durability checkpoint failed after an \
+                 election trigger; refusing to serve until restart: {error}"
+            ));
+            return Err(error);
+        }
+        Ok(())
     }
 }
 

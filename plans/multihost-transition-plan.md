@@ -10530,6 +10530,18 @@ Phase 12.3 progress:
   durable artifact contains both the suffix state and an installed cached
   snapshot at or beyond the purged boundary. Natural leader election after
   abrupt leader loss remains open 12.3 work.
+- Added deterministic abrupt-leader-loss election coverage without enabling
+  timer-driven election in tests. A narrow experimental admin request,
+  `control-plane-trigger-raft-election`, asks a surviving process to run an
+  OpenRaft pre-vote election, waits until that local authority is serving, then
+  durably checkpoints the post-election artifact. The command reuses the
+  existing linearized readiness checks before serving. The
+  process smoke starts a three-node group, waits for node 101 to lead, kills it
+  abruptly, triggers election through node 102, waits for node 102 to become
+  the serving authority, verifies node 102's durable artifact contains its
+  committed leader vote, commits a PG acting-set change, and verifies node 103
+  checkpoints the command. Timer-driven natural election policy remains open
+  12.3 work and should be covered separately from randomized timeout sleeps.
 
 1. define the replicated control-plane state machine:
    - state includes cluster epoch, PG count, PG state, PG acting sets, node

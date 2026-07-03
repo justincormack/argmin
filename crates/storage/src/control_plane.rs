@@ -3106,6 +3106,13 @@ pub trait ControlPlaneAdmin {
                 .to_owned(),
         })
     }
+
+    fn trigger_raft_election(&mut self) -> Result<(), ControlPlaneError> {
+        Err(ControlPlaneError::RpcRemote {
+            message: "control-plane Raft election trigger is not supported by this authority"
+                .to_owned(),
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4535,6 +4542,17 @@ impl UnixControlPlaneClient {
         reader.finish()?;
         Ok(snapshot_index)
     }
+
+    pub fn trigger_raft_election(&self) -> Result<(), ControlPlaneError> {
+        let payload = self.send_request_with_read_timeout(
+            ControlPlaneRpcKind::TriggerRaftElection,
+            &[],
+            CONTROL_PLANE_RPC_LEADERSHIP_TRANSFER_TIMEOUT,
+        )?;
+        let reader = PayloadReader::new(&payload);
+        reader.finish()?;
+        Ok(())
+    }
 }
 
 impl ControlPlaneRuntimeMapSource for UnixControlPlaneClient {
@@ -4804,6 +4822,14 @@ where
                 Err(error) => Err(error),
             }
         }
+        ControlPlaneRpcKind::TriggerRaftElection => {
+            let reader = PayloadReader::new(&payload);
+            reader.finish()?;
+            match control_plane.trigger_raft_election() {
+                Ok(()) => Ok(Vec::new()),
+                Err(error) => Err(error),
+            }
+        }
     };
     let payload = encode_control_plane_rpc_response(response)?;
     Ok(ControlPlaneRpcResponse { kind, payload })
@@ -4841,6 +4867,7 @@ enum ControlPlaneRpcKind {
     TransferRaftLeadership = 8,
     PgRuntimeMapSnapshot = 9,
     TriggerRaftSnapshotAndPurge = 10,
+    TriggerRaftElection = 11,
 }
 
 impl ControlPlaneRpcKind {
@@ -4856,6 +4883,7 @@ impl ControlPlaneRpcKind {
             8 => Ok(Self::TransferRaftLeadership),
             9 => Ok(Self::PgRuntimeMapSnapshot),
             10 => Ok(Self::TriggerRaftSnapshotAndPurge),
+            11 => Ok(Self::TriggerRaftElection),
             _ => Err(ControlPlaneError::RpcProtocol {
                 message: format!("unknown control-plane RPC kind {value}"),
             }),

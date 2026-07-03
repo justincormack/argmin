@@ -3,6 +3,7 @@ use std::fs::{self, File};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Output, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -14,13 +15,14 @@ struct TestDir {
 }
 
 impl TestDir {
-    fn new(name: &str) -> Self {
+    fn new(_name: &str) -> Self {
+        static NEXT_TEST_DIR_ID: AtomicU64 = AtomicU64::new(0);
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("system clock should be after Unix epoch")
             .as_nanos();
-        let path =
-            std::env::temp_dir().join(format!("argmin-s3-{name}-{}-{now}", std::process::id()));
+        let id = NEXT_TEST_DIR_ID.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!("a3rt-{}-{id}-{now:x}", std::process::id()));
         fs::create_dir_all(&path).expect("test directory should be created");
         fs::set_permissions(&path, fs::Permissions::from_mode(0o700))
             .expect("test directory should be private");
@@ -40,6 +42,7 @@ impl Drop for TestDir {
 
 struct ChildGuard {
     node_id: u64,
+    test_dir: PathBuf,
     child: Option<Child>,
 }
 
@@ -104,6 +107,7 @@ impl ChildGuard {
             .expect("argmin-s3 control-plane process should start");
         Self {
             node_id: raft_node_id,
+            test_dir: test_dir.to_path_buf(),
             child: Some(child),
         }
     }
@@ -116,8 +120,9 @@ impl ChildGuard {
         match child.try_wait() {
             Ok(None) => {}
             Ok(Some(status)) => panic!(
-                "argmin-s3 process {} exited early with {status}",
-                self.node_id
+                "argmin-s3 process {} exited early with {status}\n{}",
+                self.node_id,
+                process_logs(&self.test_dir)
             ),
             Err(error) => panic!("argmin-s3 process status should be readable: {error}"),
         }
@@ -192,6 +197,14 @@ fn run_trigger_raft_snapshot_purge(bin: &Path, socket_path: &Path) -> Output {
         .arg(socket_path)
         .output()
         .expect("trigger Raft snapshot purge helper should run")
+}
+
+fn run_trigger_raft_election(bin: &Path, socket_path: &Path) -> Output {
+    Command::new(bin)
+        .arg("control-plane-trigger-raft-election")
+        .arg(socket_path)
+        .output()
+        .expect("trigger Raft election helper should run")
 }
 
 fn wait_for_runtime_map_ready(
@@ -287,6 +300,20 @@ fn follower_artifact_has_bootstrapped_state(path: &Path) -> Result<bool, String>
     let pg_ids: BTreeSet<_> = snapshot.pgs().map(|pg| pg.pg_id()).collect();
     Ok(node_ids == BTreeSet::from([NodeId::new(0), NodeId::new(1)])
         && pg_ids == BTreeSet::from([PgId::new(0)]))
+}
+
+fn artifact_has_committed_vote_for_leader(path: &Path, leader_id: u64) -> Result<bool, String> {
+    let artifact = match ControlPlaneRaftRestartArtifact::load_durable_artifact(path) {
+        Ok(artifact) => artifact,
+        Err(error) => return Err(error.to_string()),
+    };
+    let (log_store, _state_machine) = artifact.restore().map_err(|error| error.to_string())?;
+    let vote = log_store
+        .persisted_vote()
+        .map_err(|error| error.to_string())?;
+    Ok(vote.is_some_and(|vote| {
+        vote.committed && vote.leader_id.node_id == leader_id && vote.leader_id.term > 0
+    }))
 }
 
 fn follower_artifact_pg_has_acting_set(
@@ -611,6 +638,80 @@ fn experimental_raft_transferred_process_leader_survives_old_leader_loss() {
         PgId::new(0),
         &[NodeId::new(1)],
         &mut [&mut restarted101, &mut node102, &mut node103],
+    );
+}
+
+#[test]
+fn experimental_raft_triggered_process_election_survives_abrupt_leader_loss() {
+    let bin = argmin_s3_bin();
+    let test_dir = TestDir::new("experimental-raft-process-triggered-election");
+    let cluster_name = format!(
+        "process-triggered-election-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after Unix epoch")
+            .as_nanos()
+    );
+    let raft_node_ids = [101, 102, 103];
+    let mut node102 = ChildGuard::spawn(&bin, test_dir.path(), &cluster_name, 102, &raft_node_ids);
+    wait_for_socket_file(&peer_socket(test_dir.path(), 102), &mut node102);
+    let mut node103 = ChildGuard::spawn(&bin, test_dir.path(), &cluster_name, 103, &raft_node_ids);
+    wait_for_socket_file(&peer_socket(test_dir.path(), 103), &mut node103);
+    let mut node101 = ChildGuard::spawn(&bin, test_dir.path(), &cluster_name, 101, &raft_node_ids);
+
+    let old_leader_socket = control_socket(test_dir.path(), 101);
+    wait_for_runtime_map_ready_on(
+        &bin,
+        &old_leader_socket,
+        test_dir.path(),
+        &mut [&mut node101, &mut node102, &mut node103],
+    );
+    wait_for_follower_artifact(
+        &state_path(test_dir.path(), 102),
+        &mut [&mut node101, &mut node102, &mut node103],
+    );
+    wait_for_follower_artifact(
+        &state_path(test_dir.path(), 103),
+        &mut [&mut node101, &mut node102, &mut node103],
+    );
+
+    node101.stop();
+
+    let candidate_socket = control_socket(test_dir.path(), 102);
+    let election = run_trigger_raft_election(&bin, &candidate_socket);
+    assert!(
+        election.status.success(),
+        "election trigger failed: {}\n{}",
+        format_admin_failure(election.status, &election),
+        process_logs(test_dir.path())
+    );
+    assert!(
+        artifact_has_committed_vote_for_leader(&state_path(test_dir.path(), 102), 102)
+            .expect("node 102 durable artifact should restore after election trigger"),
+        "election trigger returned before checkpointing node 102's committed leader vote\n{}",
+        process_logs(test_dir.path())
+    );
+
+    wait_for_runtime_map_ready_on(
+        &bin,
+        &candidate_socket,
+        test_dir.path(),
+        &mut [&mut node102, &mut node103],
+    );
+
+    let output = run_set_pg_acting_set_live(&bin, &candidate_socket, 0, &[1]);
+    assert!(
+        output.status.success(),
+        "post-election acting-set change failed: {}\n{}",
+        format_admin_failure(output.status, &output),
+        process_logs(test_dir.path())
+    );
+    wait_for_follower_artifact_pg_acting_set(
+        &state_path(test_dir.path(), 103),
+        PgId::new(0),
+        &[NodeId::new(1)],
+        &mut [&mut node102, &mut node103],
     );
 }
 

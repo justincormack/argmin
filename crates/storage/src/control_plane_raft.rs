@@ -2890,6 +2890,33 @@ impl ControlPlaneRaftAuthority {
             .map_err(|error| openraft_remote_error("transfer-leader", error))
     }
 
+    pub async fn trigger_pre_vote_election_until_serving(
+        &self,
+        timeout: Duration,
+    ) -> Result<(), ControlPlaneError> {
+        self.raft
+            .trigger()
+            .elect(true)
+            .await
+            .map_err(|error| openraft_remote_error("trigger-election", error))?;
+        ControlPlaneRaftTypeConfig::timeout(timeout, async {
+            loop {
+                let status = self.status().await?;
+                if status.linearized_authority_serving() {
+                    return Ok(());
+                }
+                ControlPlaneRaftTypeConfig::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .map_err(|_| ControlPlaneError::RpcRemote {
+            message: format!(
+                "OpenRaft election trigger did not make node {} serving before timeout",
+                self.node_id
+            ),
+        })?
+    }
+
     pub async fn trigger_snapshot_and_purge_applied(
         &self,
     ) -> Result<Option<LogIdOf<ControlPlaneRaftTypeConfig>>, ControlPlaneError> {
