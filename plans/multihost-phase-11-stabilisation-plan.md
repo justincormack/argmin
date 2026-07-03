@@ -826,15 +826,14 @@ when prioritised. They correspond to the remaining findings from the Phase 11 re
       response loss after request submission as uncertain, then read the runtime map until
       they observe the expected peering route, acting set, and metadata-transfer proof.
       Storage regressions inject response loss after the authority applies each RPC form.
-      **Residual gap from soak at `167a14cf`:** the current check-applied helper observes
-      the target PG by asking for a full serving runtime map. A metadata-transfer
-      acting-set install can therefore fail confirmation even after the target command may
-      have applied if an unrelated PG is temporarily not serving, as seen with
-      `PG 0 has no serving primary in cluster epoch 599`. The observation predicate for a
-      target-PG metadata-transfer transition should not require every unrelated PG to have
-      a serving primary; add a targeted control-plane observation/read path or otherwise
-      make runtime-map confirmation tolerant of unrelated transient non-serving PGs while
-      still validating the target route/proof.
+      The check-applied helper now uses a PG-scoped `PgRuntimeMapSnapshot` read, so target
+      metadata-transfer confirmation reconstructs and validates only the target PG route
+      and same-PG history. It no longer fails because an unrelated PG is temporarily not
+      serving, which was the soak failure shape at `167a14cf` (`PG 0 has no serving primary
+      in cluster epoch 599`). A regression injects response loss after metadata-transfer
+      install, proves a full serving runtime-map read would fail because an unrelated
+      active PG lease expired, and then confirms the target transfer through the PG-scoped
+      read without resubmitting the command.
     - `CompletePgPeering` / `CompleteReadyPgPeerings`: PG is active with the expected
       primary, node incarnation, and route/proof state. **Status:** these are not exposed as
       direct live Unix admin RPCs. `CompleteReadyPgPeerings` can still run inside
@@ -850,6 +849,5 @@ when prioritised. They correspond to the remaining findings from the Phase 11 re
   command took effect. Tests should inject a response-loss failure after the authority has
   applied each non-idempotent Unix RPC command, then assert the live admin path observes the
   applied state and does not submit a second incompatible transition. **Current status:**
-  the remaining named Slice 7 Unix gap is target-PG metadata-transfer check-applied
-  observation when the whole runtime map is not globally serving. Future Raft and local
+  complete for the current Phase 11 live Unix RPC surface. Future Raft and local
   single-authority command retries should be tracked outside this slice.

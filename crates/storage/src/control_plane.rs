@@ -575,6 +575,26 @@ impl ClusterControlSnapshot {
         )
     }
 
+    pub fn reconstructed_runtime_map_for_pg(
+        &self,
+        pg_id: PgId,
+    ) -> Result<ClusterRuntimeMapSnapshot, ControlPlaneError> {
+        let record = self
+            .pg(pg_id)
+            .ok_or(ControlPlaneError::UnknownPg { pg_id: pg_id.get() })?;
+        let route =
+            reconstruct_pg_route_from_record(self.cluster_epoch, pg_id, record, |node_id| {
+                self.nodes.contains_key(&node_id)
+            })?;
+        self.runtime_map_from_pg_routes_with_history(
+            vec![route],
+            self.historical_pg_routes_for_runtime_map_pg(pg_id)?,
+            RuntimeMapFreshnessProof::Reconstructed {
+                authority_incarnation: self.authority_incarnation,
+            },
+        )
+    }
+
     pub fn runtime_map_for_storage_node_refresh(
         &self,
         now_ms: u64,
@@ -596,6 +616,19 @@ impl ClusterControlSnapshot {
         freshness_proof: RuntimeMapFreshnessProof,
     ) -> Result<ClusterRuntimeMapSnapshot, ControlPlaneError> {
         let historical_pg_routes = self.historical_pg_routes_for_runtime_map()?;
+        self.runtime_map_from_pg_routes_with_history(
+            pg_routes,
+            historical_pg_routes,
+            freshness_proof,
+        )
+    }
+
+    fn runtime_map_from_pg_routes_with_history(
+        &self,
+        pg_routes: Vec<PgRouteSnapshot>,
+        historical_pg_routes: Vec<PgRouteSnapshot>,
+        freshness_proof: RuntimeMapFreshnessProof,
+    ) -> Result<ClusterRuntimeMapSnapshot, ControlPlaneError> {
         let mut routed_node_ids = BTreeSet::new();
         for route in &pg_routes {
             routed_node_ids.extend(route.acting_set().iter().copied());
@@ -645,6 +678,19 @@ impl ClusterControlSnapshot {
         for history in &self.history {
             for pg in history.pgs() {
                 routes.push(history.reconstructed_pg_route(pg.pg_id())?);
+            }
+        }
+        Ok(routes)
+    }
+
+    fn historical_pg_routes_for_runtime_map_pg(
+        &self,
+        pg_id: PgId,
+    ) -> Result<Vec<PgRouteSnapshot>, ControlPlaneError> {
+        let mut routes = Vec::new();
+        for history in &self.history {
+            if history.pg(pg_id).is_some() {
+                routes.push(history.reconstructed_pg_route(pg_id)?);
             }
         }
         Ok(routes)
@@ -2955,6 +3001,22 @@ pub trait ControlPlaneRuntimeMapSource {
         &self,
         authority_now_ms: u64,
     ) -> Result<ClusterRuntimeMapSnapshot, ControlPlaneError>;
+
+    fn pg_runtime_map_snapshot(
+        &self,
+        pg_id: PgId,
+        authority_now_ms: u64,
+    ) -> Result<ClusterRuntimeMapSnapshot, ControlPlaneError> {
+        let runtime_map = self.runtime_map_snapshot(authority_now_ms)?;
+        if runtime_map
+            .pg_routes()
+            .iter()
+            .any(|route| route.pg_id() == pg_id)
+        {
+            return Ok(runtime_map);
+        }
+        Err(ControlPlaneError::UnknownPg { pg_id: pg_id.get() })
+    }
 }
 
 pub trait ControlPlaneLinearizedCommandSink {
@@ -3852,6 +3914,14 @@ impl<S: ControlPlaneStore> ControlPlaneRuntimeMapSource for SingleAuthorityContr
     ) -> Result<ClusterRuntimeMapSnapshot, ControlPlaneError> {
         self.snapshot.runtime_map(authority_now_ms)
     }
+
+    fn pg_runtime_map_snapshot(
+        &self,
+        pg_id: PgId,
+        _authority_now_ms: u64,
+    ) -> Result<ClusterRuntimeMapSnapshot, ControlPlaneError> {
+        self.snapshot.reconstructed_runtime_map_for_pg(pg_id)
+    }
 }
 
 impl<S: ControlPlaneStore> ControlPlaneLinearizedCommandSink for SingleAuthorityControlPlane<S> {
@@ -4010,7 +4080,10 @@ impl UnixControlPlaneClient {
         kind: ControlPlaneRpcKind,
         payload: &[u8],
     ) -> Result<Vec<u8>, ControlPlaneError> {
-        debug_assert_eq!(kind, ControlPlaneRpcKind::RuntimeMapSnapshot);
+        debug_assert!(matches!(
+            kind,
+            ControlPlaneRpcKind::RuntimeMapSnapshot | ControlPlaneRpcKind::PgRuntimeMapSnapshot
+        ));
         let deadline = Instant::now() + CONTROL_PLANE_RPC_READ_ONLY_RETRY_DEADLINE;
         loop {
             match self.send_request(kind, payload) {
@@ -4070,7 +4143,7 @@ impl UnixControlPlaneClient {
         let deadline = Instant::now() + CONTROL_PLANE_RPC_CHECK_APPLIED_DEADLINE;
         let mut last_observation_error;
         loop {
-            match self.runtime_map_snapshot(0) {
+            match self.pg_runtime_map_snapshot(pg_id, 0) {
                 Ok(runtime_map) => {
                     if metadata_transfer_install_applied(
                         &runtime_map,
@@ -4373,6 +4446,21 @@ impl UnixControlPlaneClient {
         Ok(runtime_map)
     }
 
+    pub fn pg_runtime_map_snapshot(
+        &self,
+        pg_id: PgId,
+        _authority_now_ms: u64,
+    ) -> Result<ClusterRuntimeMapSnapshot, ControlPlaneError> {
+        let mut payload = Vec::new();
+        write_pg_id_request(&mut payload, pg_id);
+        let payload =
+            self.send_read_only_request(ControlPlaneRpcKind::PgRuntimeMapSnapshot, &payload)?;
+        let mut reader = PayloadReader::new(&payload);
+        let runtime_map = read_runtime_map_snapshot(&mut reader)?;
+        reader.finish()?;
+        Ok(runtime_map)
+    }
+
     pub fn set_pg_acting_set_with_metadata_transfer_runtime_map_checked(
         &self,
         pg_id: PgId,
@@ -4439,6 +4527,14 @@ impl ControlPlaneRuntimeMapSource for UnixControlPlaneClient {
         let runtime_map = read_runtime_map_snapshot(&mut reader)?;
         reader.finish()?;
         Ok(runtime_map)
+    }
+
+    fn pg_runtime_map_snapshot(
+        &self,
+        pg_id: PgId,
+        authority_now_ms: u64,
+    ) -> Result<ClusterRuntimeMapSnapshot, ControlPlaneError> {
+        UnixControlPlaneClient::pg_runtime_map_snapshot(self, pg_id, authority_now_ms)
     }
 }
 
@@ -4560,6 +4656,19 @@ where
                 Err(error) => Err(error),
             }
         }
+        ControlPlaneRpcKind::PgRuntimeMapSnapshot => {
+            let mut reader = PayloadReader::new(&payload);
+            let pg_id = read_pg_id_request(&mut reader)?;
+            reader.finish()?;
+            match control_plane.pg_runtime_map_snapshot(pg_id, authority_now_ms) {
+                Ok(snapshot) => {
+                    let mut response = Vec::new();
+                    write_runtime_map_snapshot(&mut response, &snapshot)?;
+                    Ok(response)
+                }
+                Err(error) => Err(error),
+            }
+        }
         ControlPlaneRpcKind::RefreshNodeHeartbeat => {
             let mut reader = PayloadReader::new(&payload);
             let heartbeat = read_node_heartbeat(&mut reader)?;
@@ -4609,7 +4718,7 @@ where
                 .and_then(|fenced| {
                     let (snapshot, source_primary_lease_deadline_ms) = fenced.into_parts();
                     snapshot
-                        .reconstructed_runtime_map()
+                        .reconstructed_runtime_map_for_pg(pg_id)
                         .map(|runtime_map| (runtime_map, source_primary_lease_deadline_ms))
                 }) {
                 Ok((snapshot, source_primary_lease_deadline_ms)) => {
@@ -4644,7 +4753,7 @@ where
             reader.finish()?;
             match control_plane
                 .set_pg_acting_set_with_metadata_transfer(pg_id, acting_set, transfer)
-                .and_then(|snapshot| snapshot.reconstructed_runtime_map())
+                .and_then(|snapshot| snapshot.reconstructed_runtime_map_for_pg(pg_id))
             {
                 Ok(snapshot) => {
                     let mut response = Vec::new();
@@ -4698,6 +4807,7 @@ enum ControlPlaneRpcKind {
     SetPgActingSetWithMetadataTransferRuntimeMap = 6,
     FencePgForMetadataTransferRuntimeMap = 7,
     TransferRaftLeadership = 8,
+    PgRuntimeMapSnapshot = 9,
 }
 
 impl ControlPlaneRpcKind {
@@ -4711,6 +4821,7 @@ impl ControlPlaneRpcKind {
             6 => Ok(Self::SetPgActingSetWithMetadataTransferRuntimeMap),
             7 => Ok(Self::FencePgForMetadataTransferRuntimeMap),
             8 => Ok(Self::TransferRaftLeadership),
+            9 => Ok(Self::PgRuntimeMapSnapshot),
             _ => Err(ControlPlaneError::RpcProtocol {
                 message: format!("unknown control-plane RPC kind {value}"),
             }),
@@ -10617,7 +10728,10 @@ mod tests {
 
             let (mut stream, _addr) = listener.accept().unwrap();
             let request = read_control_plane_unix_request(&mut stream).unwrap();
-            assert_eq!(request.kind, ControlPlaneRpcKind::RuntimeMapSnapshot);
+            assert_eq!(request.kind, ControlPlaneRpcKind::PgRuntimeMapSnapshot);
+            let mut reader = PayloadReader::new(&request.payload);
+            assert_eq!(read_pg_id_request(&mut reader).unwrap(), PgId::new(43));
+            reader.finish().unwrap();
             respond_control_plane_unix_request(&mut authority, &mut stream, request, 2_004)
                 .unwrap();
         });
@@ -10703,6 +10817,7 @@ mod tests {
 
         server.join().unwrap();
         assert!(runtime_map.cluster_epoch() > active_epoch);
+        assert_eq!(runtime_map.pg_routes().len(), 1);
         let route = runtime_map
             .pg_routes()
             .iter()
@@ -10768,6 +10883,36 @@ mod tests {
             false,
             2_002,
         );
+        let unrelated_proof = PgMetadataProof::new(17, 18, 19);
+        authority
+            .set_pg_acting_set(PgId::new(44), vec![NodeId::new(1)])
+            .unwrap();
+        heartbeat_with_pg_proof(
+            &mut authority,
+            1,
+            44,
+            PgState::Peering,
+            unrelated_proof,
+            false,
+            2_010,
+        );
+        authority
+            .complete_pg_peering(
+                PgId::new(44),
+                NodeId::new(1),
+                node_incarnation(&authority, 1),
+                2_011,
+            )
+            .unwrap();
+        heartbeat_with_pg_proof(
+            &mut authority,
+            1,
+            44,
+            PgState::Active,
+            unrelated_proof,
+            false,
+            2_012,
+        );
         let active_epoch = authority.snapshot().cluster_epoch();
         let expected_transfer_epoch = ClusterEpoch::new(active_epoch.get() + 1).unwrap();
         let imported_proof = PgMetadataProof::new(9, 12, 11);
@@ -10795,8 +10940,15 @@ mod tests {
 
             let (mut stream, _addr) = listener.accept().unwrap();
             let request = read_control_plane_unix_request(&mut stream).unwrap();
-            assert_eq!(request.kind, ControlPlaneRpcKind::RuntimeMapSnapshot);
-            respond_control_plane_unix_request(&mut authority, &mut stream, request, 2_004)
+            assert_eq!(request.kind, ControlPlaneRpcKind::PgRuntimeMapSnapshot);
+            let mut reader = PayloadReader::new(&request.payload);
+            assert_eq!(read_pg_id_request(&mut reader).unwrap(), PgId::new(43));
+            reader.finish().unwrap();
+            assert!(matches!(
+                authority.runtime_map_snapshot(2_200),
+                Err(ControlPlaneError::PgHasNoServingPrimary { pg_id: 44, .. })
+            ));
+            respond_control_plane_unix_request(&mut authority, &mut stream, request, 2_200)
                 .unwrap();
         });
 
@@ -10812,6 +10964,7 @@ mod tests {
 
         server.join().unwrap();
         assert_eq!(runtime_map.cluster_epoch(), expected_transfer_epoch);
+        assert_eq!(runtime_map.pg_routes().len(), 1);
         let route = runtime_map
             .pg_routes()
             .iter()
