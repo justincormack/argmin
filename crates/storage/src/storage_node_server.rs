@@ -12649,7 +12649,7 @@ mod tests {
     }
 
     #[test]
-    fn storage_node_server_bind_cleans_terminal_pending_metadata_command() {
+    fn storage_node_server_bind_preserves_terminal_pending_metadata_command() {
         let tmp = test_util::tempdir();
         let config = test_config(&tmp);
         let bucket = crate::tests::bucket_name("bind-terminal-pending");
@@ -12700,8 +12700,8 @@ mod tests {
         assert!(
             pg.pending_metadata_command_slot(7, ClusterEpoch::new(1).unwrap())
                 .unwrap()
-                .is_none(),
-            "bind recovery should clean terminal pending metadata commands"
+                .is_some(),
+            "bind recovery has no acting-set evidence and must preserve terminal pending metadata commands"
         );
         assert!(pg.head_bucket_record_raw(&bucket).is_ok());
     }

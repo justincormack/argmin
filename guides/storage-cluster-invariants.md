@@ -114,9 +114,6 @@ does not serve:
 
 Reconcile (benign crash leftovers). Recovery repairs the state and continues:
 
-- a *terminal* pending command slot: a slot whose command is already present in
-  the command log, left behind when a crash occurs between apply and slot
-  removal;
 - an *epoch-mismatched orphan* pending command slot: a slot whose epoch differs
   from the stored replica state epoch, for example a command prepared under an
   epoch that has since advanced and will never be applied.
@@ -125,24 +122,29 @@ Reconcile (benign crash leftovers). Recovery repairs the state and continues:
   rows, recovery refreshes `metadata_table_digests` from those rows so stale
   cached table digests cannot poison the next mutation.
 
-The two slot reconciliations are order-dependent: the epoch-mismatched orphan
-cleanup must precede replay validation, because replay validation reads the
-pending slot through the epoch-checked path and would otherwise reject the
-orphan before the cleanup can run.
+Terminal pending command slots are different: a terminal slot proves this
+replica recorded the command, but does not by itself prove that the acting set
+converged. Local node recovery and heartbeat must therefore preserve terminal
+slots. Cluster-level recovery, or an explicit command path that owns the
+pending command, may remove a terminal slot only after it has acting-set
+evidence or equivalent command-specific convergence proof.
 
-Recovery is the only boundary that may reconcile pending command slots.
+The orphan cleanup is order-dependent: epoch-mismatched orphan cleanup must
+precede replay validation, because replay validation reads the pending slot
+through the epoch-checked path and would otherwise reject the orphan before
+cleanup can run.
+
 Heartbeat and other serving-time observation paths must not delete or advance
 pending slots: a legitimate command can install a future-epoch pending slot
 before apply/record advances the durable replica state to that epoch, and a
-terminal same-epoch slot is still command/recovery cleanup work. Heartbeat
+terminal same-epoch slot still needs acting-set cleanup evidence. Heartbeat
 therefore reports the durable metadata proof plus whether any pending slot is
-present, and leaves all slot repair to pre-serving recovery or explicit command
-paths. The distinction between fail-closed and reconcile is deliberate:
-corruption is surfaced, crash leftovers are healed idempotently before serving,
-and a recovered store is indistinguishable from one that committed cleanly apart
-from the diagnostic trace. The full recovery contract and its implementation
-slices live in
-[multihost-phase-11-stabilisation-plan.md](../plans/multihost-phase-11-stabilisation-plan.md).
+present. The distinction between fail-closed, local reconcile, and
+cluster-level terminal cleanup is deliberate: corruption is surfaced, local
+crash leftovers that are provably orphaned are healed idempotently before
+serving, and ambiguous terminal evidence remains visible until a convergence
+path consumes it. The full recovery contract and its implementation slices live in
+[multihost-phase-11-stabilisation-plan.md](../plans/completed/multihost-phase-11-stabilisation-plan.md).
 
 ## StorageCluster Method Matrix
 

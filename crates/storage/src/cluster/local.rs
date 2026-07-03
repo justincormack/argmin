@@ -3886,9 +3886,34 @@ fn validate_metadata_command_replay_state(
                 .expect("validated route primary must be in local node set");
             if command.id().log_index().get() <= primary_state.applied_log_index {
                 release_open_metadata_command_bucket_write_reservation(nodes, pg_routes, command)?;
+                clean_converged_primary_terminal_pending_slot(
+                    nodes,
+                    pg_id,
+                    primary_node_id,
+                    command,
+                )?;
             }
         }
     }
+    Ok(())
+}
+
+fn clean_converged_primary_terminal_pending_slot(
+    nodes: &BTreeMap<NodeId, LocalNodeStore>,
+    pg_id: PgId,
+    primary_node_id: NodeId,
+    command: &MetadataCommandEnvelope,
+) -> Result<(), ClusterBuildError> {
+    let primary = nodes
+        .get(&primary_node_id)
+        .expect("validated route primary must be in local node set");
+    primary
+        .metadata_command_client()
+        .remove_pending_metadata_command_slot(pg_id, command)
+        .map_err(|source| ClusterBuildError::OpenLocalNode {
+            node_id: primary_node_id.as_u32(),
+            source,
+        })?;
     Ok(())
 }
 

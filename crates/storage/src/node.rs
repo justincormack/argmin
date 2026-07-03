@@ -2282,7 +2282,7 @@ mod tests {
     }
 
     #[test]
-    fn shared_node_recover_cleans_terminal_pending_command() {
+    fn shared_node_recover_preserves_terminal_pending_command() {
         let tmp = test_util::tempdir();
         let node = SharedStorageNode::open(tmp.path(), &[0]).unwrap();
         let bucket = bucket_name("terminal-pending-recover");
@@ -2299,15 +2299,14 @@ mod tests {
         }
 
         node.recover_pg_metadata_command_state(NodeId::new(7))
-            .expect("recovery must reconcile a terminal pending slot");
+            .expect("recovery must validate a terminal pending slot");
 
         let pg = node.get_pg(0).unwrap();
-        assert!(
-            pg.pending_metadata_command_slot(7, ClusterEpoch::INITIAL)
-                .unwrap()
-                .is_none(),
-            "terminal pending slot must be removed by recovery"
-        );
+        let slot = pg
+            .pending_metadata_command_slot(7, ClusterEpoch::INITIAL)
+            .unwrap()
+            .expect("local recovery must preserve terminal pending slot until acting-set evidence");
+        assert_eq!(slot.id, command.id());
         let state = pg.metadata_command_replica_state().unwrap();
         assert_eq!(state.applied_log_index, 1);
     }

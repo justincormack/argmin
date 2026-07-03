@@ -4871,6 +4871,31 @@ fn terminal_pending_metadata_command_slot_is_cleaned_on_validation() {
 }
 
 #[test]
+fn pg_store_recover_preserves_terminal_pending_metadata_command_slot() {
+    let tmp = test_util::tempdir();
+    let store = PgStore::open(tmp.path(), 1).unwrap();
+    let bucket = trusted_bucket_name("recover-terminal-pending-slot");
+    let command = create_bucket_probe_command(1, 1, bucket.clone(), 1);
+    store
+        .try_insert_pending_metadata_command_slot(0, &command, Some(&bucket))
+        .unwrap();
+    store.record_metadata_command_applied(0, &command).unwrap();
+
+    let state = store
+        .recover(super::super::PgStoreRecoveryContext::for_node(NodeId::new(
+            0,
+        )))
+        .unwrap();
+    assert_eq!(state.applied_log_index, 1);
+    let slot = store
+        .pending_metadata_command_slot(0, ClusterEpoch::INITIAL)
+        .unwrap()
+        .expect("local recovery must preserve terminal pending slot until acting-set evidence");
+    assert_eq!(slot.id, command.id());
+    assert_eq!(slot.command_checksum, command.checksum_crc64());
+}
+
+#[test]
 fn pending_slot_finalization_rejects_mismatched_scope_bucket() {
     let tmp = test_util::tempdir();
     let store = PgStore::open(tmp.path(), 1).unwrap();

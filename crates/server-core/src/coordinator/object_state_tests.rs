@@ -6,7 +6,7 @@ use crate::conditional::{ReadCondition, SpecificEtag, WriteCondition};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Barrier, Mutex, MutexGuard};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 struct MultipartMetadataRaceSync {
     snapshot_reached: Arc<Barrier>,
@@ -5640,36 +5640,34 @@ fn put_object_retrying_operation_aborted(
     coord: &Coordinator,
     req: &PutObjectRequest<'_>,
 ) -> Result<PutObjectResult, ServerError> {
-    const MAX_ATTEMPTS: usize = 20;
+    let deadline = Instant::now() + Duration::from_secs(5);
 
-    for attempt in 0..MAX_ATTEMPTS {
+    loop {
         match test_helpers::put_object(coord, req) {
             Ok(result) => return Ok(result),
-            Err(ServerError::OperationAborted) if attempt + 1 < MAX_ATTEMPTS => {
-                thread::sleep(Duration::from_millis(1));
+            Err(ServerError::OperationAborted) if Instant::now() < deadline => {
+                thread::sleep(Duration::from_millis(5));
             }
             Err(error) => return Err(error),
         }
     }
-    unreachable!("retry loop must return on final attempt")
 }
 
 fn delete_object_retrying_operation_aborted(
     coord: &Coordinator,
     req: &DeleteObjectRequest<'_>,
 ) -> Result<DeleteObjectResult, ServerError> {
-    const MAX_ATTEMPTS: usize = 20;
+    let deadline = Instant::now() + Duration::from_secs(5);
 
-    for attempt in 0..MAX_ATTEMPTS {
+    loop {
         match coord.delete_object(req) {
             Ok(result) => return Ok(result),
-            Err(ServerError::OperationAborted) if attempt + 1 < MAX_ATTEMPTS => {
-                thread::sleep(Duration::from_millis(1));
+            Err(ServerError::OperationAborted) if Instant::now() < deadline => {
+                thread::sleep(Duration::from_millis(5));
             }
             Err(error) => return Err(error),
         }
     }
-    unreachable!("retry loop must return on final attempt")
 }
 
 #[test]

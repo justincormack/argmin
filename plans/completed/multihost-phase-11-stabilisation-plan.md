@@ -101,8 +101,10 @@ fix is local to one mutator.
   multihost restart path — performs no recovery validation at all. A storage node restarting
   independently serves requests on unvalidated PG state until the first heartbeat tick.
 - A partial open-time cleanup existed but was narrow:
-  `clean_terminal_primary_pending_slot_on_open` has now been removed, and terminal pending
-  slots are cleaned by the shared replay validation/recovery path. The remaining
+  `clean_terminal_primary_pending_slot_on_open` has now been removed. Local
+  `PgStore::recover` preserves terminal pending slots because a single replica cannot prove
+  acting-set convergence. Terminal cleanup remains valid only through explicit command
+  cleanup or cluster-level recovery after convergence proof. The remaining
   `converge_in_flight_metadata_command_on_open` local-cluster path is for genuine in-flight
   primary commands that need to be applied to every replica before replay validation can
   prove convergence.
@@ -111,9 +113,10 @@ fix is local to one mutator.
   never run at open.
 - `record_metadata_command_applied` (`command_log.rs:3303`) inserts into
   `metadata_command_log` and advances replica state but does **not** remove the matching
-  pending slot; removal is left to callers (`remove_pending_metadata_command_slot` at
-  `:2201`) or to reactive reconciliation. Any crash between apply and removal orphans a
-  terminal slot.
+  pending slot. The completed model makes that removal explicit at command-owned cleanup
+  boundaries (`remove_pending_metadata_command_slot` at `:2201`) or cluster-level recovery
+  with acting-set convergence evidence. Any crash between apply and removal can leave a
+  terminal slot that local recovery and heartbeat must preserve.
 
 ### Work items
 
@@ -156,11 +159,12 @@ Progress update:
 
 1. **Define recovery semantics explicitly.** **Completed.** Document, in
    [`guides/storage-cluster-invariants.md`](../guides/storage-cluster-invariants.md), that
-   opening a PG store is a recovery boundary and state which anomaly classes fail closed
-   (possible corruption: hash-chain break, digest mismatch, forked log) versus which are
-   reconciled (benign crash leftovers: terminal pending slot, epoch-mismatched orphan
-   slot). The heartbeat path currently reconciles silently; recovery should make this
-   distinction deliberately.
+   opening a PG store plus explicit recovery is a validation boundary and state which
+   anomaly classes fail closed (possible corruption: hash-chain break, digest mismatch,
+   forked log) versus which are locally recoverable (benign crash leftovers such as
+   epoch-mismatched orphan slots). Same-epoch terminal pending slots are preserved by local
+   recovery and by heartbeat/observation paths; clearing them requires explicit command
+   cleanup or cluster-level acting-set convergence evidence.
 
 2. **Recovery is a method on an opened store, invoked by node-identity-owning callers.**
    **Completed.**
@@ -193,11 +197,12 @@ Progress update:
       epoch. Running validation first would error out on an epoch-mismatched orphan before
       this cleanup could run, so the orphan would never be reconciled and recovery would fail
       rather than heal;
-   3. run `validate_metadata_command_replay_state` with
-      `PendingMetadataCommandSlotCleanup::CleanTerminal` (`command_log.rs:2362`) to
-      reconcile terminal pending slots and validate the command-log hash chain. This step
-      also performs the materialised digest verification (see work item 2b);
-   4. assert that any surviving pending slot references a live, in-order log entry.
+   3. run replay validation with terminal-slot preservation to validate the command-log hash
+      chain and perform the materialised digest verification (see work item 2b). A local
+      replica cannot prove acting-set convergence, so it must not clean same-epoch terminal
+      pending slots here;
+   4. preserve any surviving same-epoch pending slot for explicit command cleanup or a
+      cluster-level recovery path with acting-set convergence evidence.
 
 2b. **Cached-table refresh and per-table diagnostics on top of replay validation.**
    **Completed for Slice 1.** Replay
@@ -260,15 +265,16 @@ Progress update:
    - make `remove_pending_metadata_command_slot` transactional, with an exact full-identity
      match (`cluster_epoch + pg_id + log_index + command_checksum + command_bytes +
      scope_bucket`) and a terminal log-entry check before removal;
-   - continue using recovery validation (`CleanTerminal`) to reconcile terminal slots left
-     by crashes before this explicit cleanup point.
+   - use recovery validation with terminal cleanup only after the caller has acting-set
+     convergence evidence; local node recovery must preserve terminal slots so it cannot erase
+     partial-fanout evidence.
 
    This keeps the legitimate "applied on some/all replicas but still pending on the primary"
    intermediate state representable, while tightening the actual cleanup operation.
 
-5. **Consolidate the divergent open-time cleanups.** **Completed.** Once
-   `PgStore::recover` reconciles
-   terminal and orphan slots for every role and every caller:
+5. **Consolidate the divergent open-time cleanups.** **Completed.** Once local
+   `PgStore::recover` validates replay state while preserving terminal slots and
+   cluster-level recovery performs terminal cleanup with convergence evidence:
    - delete `clean_terminal_primary_pending_slot_on_open` (`cluster/local.rs:3868`) and
      fold its bucket-write-reservation release into the recovery pass (or a documented
      successor), so the local-cluster build and the storage-node server no longer have
@@ -277,13 +283,14 @@ Progress update:
      still needed for genuine in-flight (non-terminal) commands and is not duplicating
      recovery-pass work.
 
-   Progress update: terminal pending-slot cleanup is now consolidated in
-   `validate_metadata_command_replay_state`/`PgStore::recover`; the old
+   Progress update: terminal pending-slot cleanup is now consolidated at callers that have
+   convergence proof, not in local `PgStore::recover`; the old
    `clean_terminal_primary_pending_slot_on_open` helper has been removed. Local-cluster open
    still releases command-owned bucket-write reservations for terminal or converged commands
-   before replay validation removes the terminal slot, because reservation rows live on the
-   bucket PG and require the cluster route context. `converge_in_flight_metadata_command_on_open`
-   remains necessary for genuine primary-pending commands that have not yet been applied to
+   before convergence-proven replay validation removes the terminal slot, because reservation
+   rows live on the bucket PG and require the cluster route context.
+   `converge_in_flight_metadata_command_on_open` remains necessary for genuine primary-pending
+   commands that have not yet been applied to
    every replica.
 
 6. **Crash-recovery property test for every digest-affecting mutator.**
@@ -332,12 +339,12 @@ Progress update:
 
 7. **Storage-node restart coverage.** **Completed for current Slice 1 recovery classes.**
    Add a test that opens a PG through
-   `StorageNodeServer::bind` (the production restart path), after a crash that orphans a
-   terminal slot and a commit-failed transaction, and asserts the server does not serve a
-   read until recovery has reconciled the state. This pins the path that currently has zero
+   `StorageNodeServer::bind` (the production restart path), after a crash that leaves a
+   terminal slot and a commit-failed transaction, and asserts bind validates replay state
+   without erasing terminal slot evidence. This pins the path that previously had zero
    recovery.
 
-   Progress update: `StorageNodeServer::bind` now has direct regressions for cleaning a
+   Progress update: `StorageNodeServer::bind` now has direct regressions for preserving a
    terminal pending metadata command during bind recovery and for failing closed on a
    corrupted metadata state digest before serving. Bind also has a direct regression for
    repairing cache-only per-table digest drift before serving, so the production restart
@@ -346,9 +353,11 @@ Progress update:
 ### Exit criteria
 
 1. **Completed:** `PgStore::recover(&self, PgStoreRecoveryContext { node_id })` reconciles
-   epoch-mismatched orphan and terminal pending slots (in that order) and fails closed on
-   materialised-digest or hash-chain mismatch. `PgStore::open` stays raw; recovery is
-   invoked by node-identity-owning callers, not threaded through `SharedStorageNode::open`.
+   epoch-mismatched orphan slots, preserves same-epoch terminal pending slots, and fails
+   closed on materialised-digest or hash-chain mismatch. Terminal pending-slot cleanup
+   requires explicit command cleanup or cluster-level acting-set convergence evidence.
+   `PgStore::open` stays raw; recovery is invoked by node-identity-owning callers, not
+   threaded through `SharedStorageNode::open`.
 2. **Completed:** `StorageNodeServer::bind` and the local-cluster builder both call
    `recover` per PG with their node id, so a restarted storage node never serves on an
    unvalidated PG.
@@ -364,9 +373,10 @@ Progress update:
    classified as single SQLite statement maintenance paths or read-before-single-write
    helpers, so they remain under ordinary digest-consistency coverage rather than the
    commit-failure hook.
-6. **Completed:** The reactive heartbeat cleanups (`c5776092`, `791b409c`) remain as a
-   defence-in-depth heartbeat-side check but are no longer the primary correctness
-   mechanism; this is documented in `guides/storage-cluster-invariants.md`.
+6. **Completed:** Heartbeat and other observation paths no longer mutate terminal pending
+   slot state. They validate and report state only; pending-slot cleanup is performed by
+   explicit command cleanup or cluster-level recovery with acting-set convergence evidence,
+   as documented in `guides/storage-cluster-invariants.md`.
 
 ### Out of scope for Slice 1
 

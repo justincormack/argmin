@@ -2447,12 +2447,11 @@ impl PgStore {
     /// replay validation reads the pending slot through the epoch-checked path
     /// and would otherwise reject the orphan before cleanup could run.
     ///
-    /// Clustered open paths (the local cluster builder) cannot call this directly
-    /// as one shot: the cluster-wide convergence pass needs same-epoch primary
-    /// pending slots intact and would itself reject an orphan through the
-    /// epoch-checked slot read. Those paths call
-    /// [`recover_clean_orphan_pending_command_slots`] before convergence and this
-    /// method after.
+    /// This local recovery boundary deliberately preserves same-epoch terminal
+    /// pending slots. A terminal slot proves only that this replica recorded the
+    /// command; it does not prove the acting set converged. Callers that have
+    /// topology context may use [`validate_metadata_command_replay_state`] after
+    /// proving convergence to remove terminal slots.
     pub(crate) fn recover(
         &self,
         ctx: super::PgStoreRecoveryContext,
@@ -2471,10 +2470,13 @@ impl PgStore {
         // slot's epoch against this stored epoch.
         let state = self.metadata_command_replica_state()?;
         let stored_epoch = state.cluster_epoch;
-        // Replay validation reconciles terminal pending slots, validates the
-        // command-log hash chain, and verifies the stored state digest against a
-        // full materialised recompute. It fails closed on corruption.
-        let state = self.validate_metadata_command_replay_state(node_id, stored_epoch)?;
+        // Replay validation preserves same-epoch terminal pending slots here:
+        // local recovery has no acting-set evidence, so erasing the slot could
+        // hide partial fanout from cluster-level recovery.
+        let state = self.validate_metadata_command_replay_state_preserving_pending_slot(
+            node_id,
+            stored_epoch,
+        )?;
         // Detect cached per-table digest drift that the state-digest check above
         // cannot see (xor-cancelling drift), and refresh the cached digests from
         // materialised rows when found so a drifted trigger-maintained cache

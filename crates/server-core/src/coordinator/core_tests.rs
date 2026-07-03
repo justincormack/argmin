@@ -9556,8 +9556,13 @@ fn delete_bucket_authorization_adopts_active_preserved_attempt_without_drain_wai
     delete_bucket_test(&coord, bucket)
         .expect("DeleteBucket should authorize and adopt the preserved active attempt");
 
-    let info = storage_cluster.test_head_bucket_raw(&bucket_name).unwrap();
-    assert_eq!(info.state, storage::BucketState::Deleting);
+    match storage_cluster.test_head_bucket_raw(&bucket_name) {
+        Ok(info) => assert_eq!(info.state, storage::BucketState::Deleting),
+        Err(storage::BucketSnapshotLoadError::Metadata(
+            storage::MetadataError::BucketNotFound { .. },
+        )) => {}
+        Err(err) => panic!("unexpected bucket state after adopted delete: {err:?}"),
+    }
 }
 
 #[test]

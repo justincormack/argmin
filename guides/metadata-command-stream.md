@@ -97,7 +97,8 @@ For a new metadata mutation:
 4. Apply the command to the required acting-set replicas in log order.
 5. Record the applied command log entry or abandoned tombstone durably.
 6. Mark the slot terminal and remove it only after the terminal durable record
-   is visible enough for retry/recovery.
+   is visible enough for retry/recovery and acting-set convergence has been
+   proven, or an explicit command path owns an equivalent cleanup proof.
 
 Any process routed to the same PG primary must observe the same unresolved
 slot. Retrying through a different coordinator must therefore converge the same
