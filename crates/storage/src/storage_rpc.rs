@@ -703,6 +703,7 @@ pub(crate) enum StorageRpcMessageKind {
     BucketDeleteAttemptOutcomeGet = 157,
     BucketDeleteBeginRoots = 158,
     BucketDeleteFinalizeClaimGet = 159,
+    BucketDeleteFinalizeCompletedMultipartProgress = 161,
     BucketWriteDrainHeartbeat = 124,
     MetadataCommandRetainedLogHashes = 125,
     MetadataCommandRetainedLogEntries = 126,
@@ -935,6 +936,9 @@ impl StorageRpcMessageKind {
             Self::BucketDeleteFinalizeClaimGet => "bucket delete finalize claim get",
             Self::BucketDeleteFinalizeClaimAcquire => "bucket delete finalize claim acquire",
             Self::BucketDeleteFinalizeClaimRelease => "bucket delete finalize claim release",
+            Self::BucketDeleteFinalizeCompletedMultipartProgress => {
+                "bucket delete finalize completed multipart progress"
+            }
             Self::BucketMetadataControlPendingMatch => "bucket metadata control pending match",
             Self::BucketMetadataControlCommandBuild => "bucket metadata control command build",
             Self::BucketSubresourceGet => "bucket subresource get",
@@ -1128,6 +1132,7 @@ impl StorageRpcMessageKind {
             158 => Ok(Self::BucketDeleteBeginRoots),
             159 => Ok(Self::BucketDeleteFinalizeClaimGet),
             160 => Ok(Self::ObjectPayloadReclaimClaimGet),
+            161 => Ok(Self::BucketDeleteFinalizeCompletedMultipartProgress),
             124 => Ok(Self::BucketWriteDrainHeartbeat),
             125 => Ok(Self::MetadataCommandRetainedLogHashes),
             126 => Ok(Self::MetadataCommandRetainedLogEntries),
@@ -1425,6 +1430,18 @@ pub(crate) struct StorageRpcBucketDeleteFinalizeClaimRecordRequest {
     pub(crate) cluster_epoch: ClusterEpoch,
     pub(crate) pg_id: PgId,
     pub(crate) record: BucketDeleteFinalizeClaimRecord,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StorageRpcBucketDeleteFinalizeCompletedMultipartProgressRequest {
+    pub(crate) bucket: StorageRpcBucketRequest,
+    pub(crate) bucket_incarnation_generation: u64,
+    pub(crate) next_pg_index: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StorageRpcBucketDeleteFinalizeCompletedMultipartProgressResponse {
+    pub(crate) next_pg_index: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3717,6 +3734,9 @@ fn message_kind_request_max_payload_len(
         }
         StorageRpcMessageKind::BucketDeleteFinalizeClaimRelease => {
             STORAGE_RPC_MAX_BUCKET_DELETE_FINALIZE_CLAIM_RECORD_PAYLOAD_LEN
+        }
+        StorageRpcMessageKind::BucketDeleteFinalizeCompletedMultipartProgress => {
+            STORAGE_RPC_MAX_BUCKET_REQUEST_PAYLOAD_LEN + 16
         }
         StorageRpcMessageKind::BucketMetadataControlPendingMatch
         | StorageRpcMessageKind::BucketMetadataControlCommandBuild
@@ -11689,6 +11709,51 @@ pub(crate) fn decode_bucket_delete_finalize_claim_record_request(
         pg_id,
         record,
     })
+}
+
+pub(crate) fn encode_bucket_delete_finalize_completed_multipart_progress_request(
+    request: &StorageRpcBucketDeleteFinalizeCompletedMultipartProgressRequest,
+) -> Vec<u8> {
+    let mut out = encode_bucket_request(&request.bucket);
+    put_u64(&mut out, request.bucket_incarnation_generation);
+    put_u32(&mut out, request.next_pg_index);
+    out
+}
+
+pub(crate) fn decode_bucket_delete_finalize_completed_multipart_progress_request(
+    bytes: &[u8],
+) -> Result<StorageRpcBucketDeleteFinalizeCompletedMultipartProgressRequest, StorageRpcPayloadError>
+{
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let bucket = decoder.read_bucket_request()?;
+    let bucket_incarnation_generation = decoder.read_u64()?;
+    let next_pg_index = decoder.read_u32()?;
+    decoder.finish()?;
+    Ok(
+        StorageRpcBucketDeleteFinalizeCompletedMultipartProgressRequest {
+            bucket,
+            bucket_incarnation_generation,
+            next_pg_index,
+        },
+    )
+}
+
+pub(crate) fn encode_bucket_delete_finalize_completed_multipart_progress_response(
+    response: &StorageRpcBucketDeleteFinalizeCompletedMultipartProgressResponse,
+) -> Vec<u8> {
+    let mut out = Vec::new();
+    put_u32(&mut out, response.next_pg_index);
+    out
+}
+
+pub(crate) fn decode_bucket_delete_finalize_completed_multipart_progress_response(
+    bytes: &[u8],
+) -> Result<StorageRpcBucketDeleteFinalizeCompletedMultipartProgressResponse, StorageRpcPayloadError>
+{
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let next_pg_index = decoder.read_u32()?;
+    decoder.finish()?;
+    Ok(StorageRpcBucketDeleteFinalizeCompletedMultipartProgressResponse { next_pg_index })
 }
 
 pub(crate) fn encode_optional_checksum_metadata(checksum: Option<&ChecksumBytes>) -> Vec<u8> {

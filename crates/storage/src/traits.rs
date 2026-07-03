@@ -645,6 +645,14 @@ pub(crate) trait PgMetadataStore {
         &self,
     ) -> Result<Option<BucketDeleteFinalizeClaimRecord>, MetadataError>;
 
+    /// Advance completed-MPU cleanup progress for one deleting bucket incarnation.
+    fn record_bucket_delete_finalize_completed_multipart_next_pg_index(
+        &self,
+        bucket: &BucketName,
+        bucket_incarnation_generation: u64,
+        next_pg_index: u32,
+    ) -> Result<u32, MetadataError>;
+
     /// Acquire a durable lifecycle sweep claim for one bucket incarnation.
     #[allow(clippy::too_many_arguments)]
     fn acquire_lifecycle_sweep_claim(

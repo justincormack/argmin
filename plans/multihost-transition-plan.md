@@ -9355,6 +9355,14 @@ Status update:
   until command construction. The storage regression advances logical time
   during an adopted pre-mark proof and verifies the original drain identity is
   preserved while its lease is extended before the bucket reaches `Deleting`.
+- Bucket-delete finalization now records completed-MPU cleanup progress on the
+  Deleting bucket row. After a metadata PG has been fully scanned and its
+  completed multipart tombstones are removed or drained, the finalizer advances
+  `bucket_delete_finalize_completed_multipart_next_pg_index`; retrying after route
+  expiry or work-budget exhaustion resumes at that cursor over the canonical
+  sorted metadata-PG list instead of re-scanning already-proven-clear metadata
+  PGs. The cursor is fenced by bucket incarnation and disappears with the bucket
+  row when finalization commits.
 - Remaining close-out work is concentrated in deterministic interleaving tests,
   cleanup/runtime-state diagnostics, process-local state continuity across
   refresh/restart, and checking whether any foreground loops still need an

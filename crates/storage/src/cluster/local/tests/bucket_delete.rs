@@ -28,6 +28,50 @@ fn delete_bucket_row_for_divergence_test(pg: &crate::PgStore, bucket: &BucketNam
     pg.refresh_metadata_command_state_digest().unwrap();
 }
 
+fn bucket_delete_finalize_completed_multipart_next_pg_index(
+    pg: &crate::PgStore,
+    bucket: &BucketName,
+) -> u32 {
+    pg.connection()
+        .query_row(
+            "SELECT bucket_delete_finalize_completed_multipart_next_pg_index \
+             FROM buckets WHERE name = ?1",
+            [bucket.as_str()],
+            |row| row.get(0),
+        )
+        .unwrap()
+}
+
+fn seed_orphan_completed_multipart_cleanup_root(
+    pg: &crate::PgStore,
+    bucket: &BucketName,
+    key: &crate::ObjectKey,
+    upload_id: &crate::UploadId,
+    completion_order: u64,
+) {
+    let canonical_id = crate::CanonicalUserId::from_principal("owner");
+    pg.connection()
+        .execute(
+            "INSERT OR REPLACE INTO completed_multipart_uploads \
+             (upload_id, bucket, key, completion_order, completed_at, owner_principal, \
+              owner_canonical_id, initiator_principal, initiator_canonical_id) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            rusqlite::params![
+                upload_id.as_str(),
+                bucket,
+                key,
+                i64::try_from(completion_order).unwrap(),
+                i64::try_from(completion_order).unwrap(),
+                "owner",
+                canonical_id.as_str(),
+                "owner",
+                canonical_id.as_str(),
+            ],
+        )
+        .unwrap();
+    pg.refresh_metadata_command_state_digest().unwrap();
+}
+
 #[test]
 fn finalized_bucket_delete_clears_pending_versioning_command_for_recreate() {
     let tmp = test_util::tempdir();
@@ -2503,6 +2547,166 @@ fn bucket_delete_and_finalize_fan_out_to_routed_pg_primaries() {
             .unwrap()
             .is_none(),
         "finalization should prune routed completed-upload tombstones"
+    );
+}
+
+#[test]
+fn bucket_finalize_completed_multipart_cleanup_resumes_after_recorded_sparse_pg_cursor() {
+    let _serial = lock_metadata_command_apply_hook_test();
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[5, 0, 2], ec_shape).unwrap();
+    let (bucket, low_key, high_key) = {
+        let topology = map
+            .nodes
+            .get(&NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        let bucket = bucket_for_pg(topology, 2, "delete-finalize-mpu-progress-");
+        let low_key = key_for_object_pg(topology, &bucket, 0, "low-");
+        let high_key = key_for_object_pg(topology, &bucket, 5, "high-");
+        (bucket, low_key, high_key)
+    };
+    {
+        let topology = map
+            .nodes
+            .get(&NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        assert_eq!(topology.bucket_pg_for(&bucket), 2);
+        assert_eq!(topology.object_pg_for(&bucket, &low_key), 0);
+        assert_eq!(topology.object_pg_for(&bucket, &high_key), 5);
+    }
+    set_route_primary(&mut map, 2, NodeId::new(1));
+    set_route_primary(&mut map, 5, NodeId::new(2));
+
+    let map = Arc::new(map);
+    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    create_test_bucket(&cluster, &bucket);
+    cluster.begin_bucket_delete(&bucket).unwrap();
+
+    let low_upload = upload_id_from_label("finalizeMpuProgressLow");
+    let high_upload = upload_id_from_label("finalizeMpuProgressHigh");
+    {
+        let low_pg = map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .get_pg(0)
+            .unwrap();
+        crate::PgMetadataStore::delete_object_meta(&*low_pg, &bucket, &low_key).unwrap();
+        seed_orphan_completed_multipart_cleanup_root(&low_pg, &bucket, &low_key, &low_upload, 1);
+    }
+    {
+        let high_pg = map
+            .node(NodeId::new(2))
+            .unwrap()
+            .storage_node()
+            .get_pg(5)
+            .unwrap();
+        crate::PgMetadataStore::delete_object_meta(&*high_pg, &bucket, &high_key).unwrap();
+        seed_orphan_completed_multipart_cleanup_root(&high_pg, &bucket, &high_key, &high_upload, 2);
+        assert!(
+            crate::PgMetadataStore::get_completed_multipart_upload(&*high_pg, &high_upload)
+                .unwrap()
+                .is_some(),
+            "test setup should leave the high-PG completed MPU record before finalization"
+        );
+    }
+
+    let fail_once = Arc::new(AtomicBool::new(true));
+    let fail_once_for_hook = Arc::clone(&fail_once);
+    let fail_guard = cluster.test_install_before_bucket_delete_completed_multipart_cleanup_pg_hook(
+        Arc::new(move |pg_id| {
+            if pg_id == 5 && fail_once_for_hook.swap(false, Ordering::SeqCst) {
+                return Err(StoreError::RouteMapExpired {
+                    cluster_epoch: ClusterEpoch::INITIAL,
+                    valid_until_ms: 0,
+                    now_ms: 1,
+                });
+            }
+            Ok(())
+        }),
+    );
+
+    let err = cluster.try_finalize_bucket_delete(&bucket).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            crate::BucketWriteDrainError::Store(StoreError::RouteMapExpired { .. })
+        ),
+        "expected injected route expiry during high-PG completed MPU cleanup, got {err:?}"
+    );
+    drop(fail_guard);
+
+    {
+        let bucket_pg = map
+            .node(NodeId::new(1))
+            .unwrap()
+            .storage_node()
+            .get_pg(2)
+            .unwrap();
+        assert_eq!(
+            bucket_delete_finalize_completed_multipart_next_pg_index(&bucket_pg, &bucket),
+            2,
+            "failed finalizer attempt should record the next canonical sorted metadata PG index"
+        );
+    }
+    {
+        let low_pg = map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .get_pg(0)
+            .unwrap();
+        assert!(
+            crate::PgMetadataStore::get_completed_multipart_upload(&*low_pg, &low_upload)
+                .unwrap()
+                .is_none(),
+            "first attempt should delete the lower-PG completed MPU record"
+        );
+    }
+    {
+        let high_pg = map
+            .node(NodeId::new(2))
+            .unwrap()
+            .storage_node()
+            .get_pg(5)
+            .unwrap();
+        assert!(
+            crate::PgMetadataStore::get_completed_multipart_upload(&*high_pg, &high_upload)
+                .unwrap()
+                .is_some(),
+            "injected failure should leave the high-PG completed MPU record for retry"
+        );
+    }
+
+    let saw_retry_pg5 = Arc::new(AtomicBool::new(false));
+    let saw_retry_pg5_for_hook = Arc::clone(&saw_retry_pg5);
+    let scan_guard = cluster.test_install_before_bucket_delete_completed_multipart_cleanup_pg_hook(
+        Arc::new(move |pg_id| {
+            assert!(
+                pg_id >= 5,
+                "retry should resume at recorded completed-MPU cursor index, got PG {pg_id}"
+            );
+            if pg_id == 5 {
+                saw_retry_pg5_for_hook.store(true, Ordering::SeqCst);
+            }
+            Ok(())
+        }),
+    );
+
+    assert_eq!(
+        cluster.try_finalize_bucket_delete(&bucket).unwrap(),
+        crate::BucketDeleteFinalizeOutcome::Finalized
+    );
+    drop(scan_guard);
+    assert!(
+        saw_retry_pg5.load(Ordering::SeqCst),
+        "retry should scan the remaining completed MPU PG"
     );
 }
 

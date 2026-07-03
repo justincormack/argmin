@@ -205,6 +205,10 @@ pub type BucketDeleteExactDrainProgressTestHook =
 pub type BucketDeleteExactDrainStartTestHook =
     Arc<dyn Fn(bool, u32) -> Result<(), StoreError> + Send + Sync>;
 
+#[cfg(any(test, feature = "test-hooks"))]
+pub type BucketDeleteCompletedMultipartCleanupPgTestHook =
+    Arc<dyn Fn(u32) -> Result<(), StoreError> + Send + Sync>;
+
 #[cfg(test)]
 type CompletedMultipartOrderCommandIdTestHook = Arc<dyn Fn() + Send + Sync>;
 
@@ -266,6 +270,11 @@ static AFTER_BUCKET_DELETE_EXACT_DRAIN_PROGRESS_HOOKS: OnceLock<
 #[cfg(any(test, feature = "test-hooks"))]
 static BEFORE_BUCKET_DELETE_EXACT_DRAIN_HOOKS: OnceLock<
     Mutex<HashMap<usize, BucketDeleteExactDrainStartTestHook>>,
+> = OnceLock::new();
+
+#[cfg(any(test, feature = "test-hooks"))]
+static BEFORE_BUCKET_DELETE_COMPLETED_MULTIPART_CLEANUP_PG_HOOKS: OnceLock<
+    Mutex<HashMap<usize, BucketDeleteCompletedMultipartCleanupPgTestHook>>,
 > = OnceLock::new();
 
 #[cfg(test)]
@@ -335,6 +344,11 @@ pub struct BucketDeleteExactDrainProgressTestHookGuard {
 
 #[cfg(any(test, feature = "test-hooks"))]
 pub struct BucketDeleteExactDrainStartTestHookGuard {
+    scope_id: usize,
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+pub struct BucketDeleteCompletedMultipartCleanupPgTestHookGuard {
     scope_id: usize,
 }
 
@@ -479,6 +493,18 @@ impl Drop for BucketDeleteExactDrainStartTestHookGuard {
     fn drop(&mut self) {
         let hooks =
             BEFORE_BUCKET_DELETE_EXACT_DRAIN_HOOKS.get_or_init(|| Mutex::new(HashMap::new()));
+        hooks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.scope_id);
+    }
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+impl Drop for BucketDeleteCompletedMultipartCleanupPgTestHookGuard {
+    fn drop(&mut self) {
+        let hooks = BEFORE_BUCKET_DELETE_COMPLETED_MULTIPART_CLEANUP_PG_HOOKS
+            .get_or_init(|| Mutex::new(HashMap::new()));
         hooks
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -704,6 +730,23 @@ fn maybe_run_before_bucket_delete_exact_drain_hook(
         .cloned();
     if let Some(hook) = hook {
         hook(_has_progress, _next_object_pg_id)?;
+    }
+    Ok(())
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+fn maybe_run_before_bucket_delete_completed_multipart_cleanup_pg_hook(
+    _scope_id: usize,
+    _pg_id: u32,
+) -> Result<(), StoreError> {
+    let hook = BEFORE_BUCKET_DELETE_COMPLETED_MULTIPART_CLEANUP_PG_HOOKS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&_scope_id)
+        .cloned();
+    if let Some(hook) = hook {
+        hook(_pg_id)?;
     }
     Ok(())
 }
@@ -1097,6 +1140,20 @@ impl super::StorageCluster {
             .unwrap_or_else(|e| e.into_inner())
             .insert(scope_id, hook);
         BucketDeleteExactDrainStartTestHookGuard { scope_id }
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_install_before_bucket_delete_completed_multipart_cleanup_pg_hook(
+        &self,
+        hook: BucketDeleteCompletedMultipartCleanupPgTestHook,
+    ) -> BucketDeleteCompletedMultipartCleanupPgTestHookGuard {
+        let scope_id = self.metadata_command_apply_test_hook_scope_id();
+        let slot = BEFORE_BUCKET_DELETE_COMPLETED_MULTIPART_CLEANUP_PG_HOOKS
+            .get_or_init(|| Mutex::new(HashMap::new()));
+        slot.lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(scope_id, hook);
+        BucketDeleteCompletedMultipartCleanupPgTestHookGuard { scope_id }
     }
 
     #[cfg(test)]
@@ -5635,8 +5692,12 @@ impl super::StorageCluster {
         )
         .for_operation("bucket_delete_finalize")
         .for_pg(PgId::new(bucket_pg_id));
-        let result =
-            self.try_finalize_bucket_delete_claimed(bucket, bucket_pg_id, &mut work_budget);
+        let result = self.try_finalize_bucket_delete_claimed(
+            bucket,
+            bucket_pg_id,
+            bucket_incarnation_generation,
+            &mut work_budget,
+        );
         match result {
             Ok(
                 outcome @ (BucketDeleteFinalizeOutcome::Finalized
@@ -5686,6 +5747,7 @@ impl super::StorageCluster {
         &self,
         bucket: &BucketName,
         bucket_pg_id: u32,
+        bucket_incarnation_generation: u64,
         work_budget: &mut super::RequestWorkBudget,
     ) -> Result<BucketDeleteFinalizeOutcome, BucketWriteDrainError> {
         loop {
@@ -5768,7 +5830,12 @@ impl super::StorageCluster {
             return Ok(BucketDeleteFinalizeOutcome::Pending);
         }
 
-        self.delete_completed_multipart_uploads_for_bucket(bucket, work_budget)?;
+        self.delete_completed_multipart_uploads_for_bucket(
+            bucket,
+            bucket_pg_id,
+            bucket_incarnation_generation,
+            work_budget,
+        )?;
 
         self.delete_bucket_from_acting_set(PgId::new(bucket_pg_id), bucket)
     }
@@ -5886,9 +5953,54 @@ impl super::StorageCluster {
     fn delete_completed_multipart_uploads_for_bucket(
         &self,
         bucket: &BucketName,
+        bucket_pg_id: u32,
+        bucket_incarnation_generation: u64,
         work_budget: &mut super::RequestWorkBudget,
     ) -> Result<(), BucketWriteDrainError> {
-        for raw_pg_id in self.metadata_pg_ids() {
+        let mut metadata_pg_ids = self.metadata_pg_ids();
+        metadata_pg_ids.sort_unstable();
+        let metadata_pg_count = u32::try_from(metadata_pg_ids.len()).map_err(|_| {
+            BucketWriteDrainError::Store(StoreError::StorageRpc {
+                node_id: 0,
+                operation: "bucket delete finalize completed multipart cleanup",
+                code: StorageRpcErrorCode::Internal,
+                message: "metadata PG count exceeds u32".to_string(),
+            })
+        })?;
+        let mut next_pg_index = self
+            .record_bucket_delete_finalize_completed_multipart_next_pg_index(
+                bucket,
+                bucket_pg_id,
+                bucket_incarnation_generation,
+                0,
+            )?;
+        if next_pg_index > metadata_pg_count {
+            return Err(BucketWriteDrainError::Store(StoreError::StorageRpc {
+                node_id: 0,
+                operation: "bucket delete finalize completed multipart cleanup",
+                code: StorageRpcErrorCode::Internal,
+                message: format!(
+                    "completed multipart cleanup cursor {next_pg_index} exceeds metadata PG count {metadata_pg_count}"
+                ),
+            }));
+        }
+
+        let start_pg_index = usize::try_from(next_pg_index).map_err(|source| {
+            BucketWriteDrainError::Store(StoreError::StorageRpc {
+                node_id: 0,
+                operation: "bucket delete finalize completed multipart cleanup",
+                code: StorageRpcErrorCode::Internal,
+                message: format!(
+                    "completed multipart cleanup cursor {next_pg_index} does not fit usize: {source}"
+                ),
+            })
+        })?;
+        for (pg_index, raw_pg_id) in metadata_pg_ids.into_iter().enumerate().skip(start_pg_index) {
+            #[cfg(any(test, feature = "test-hooks"))]
+            maybe_run_before_bucket_delete_completed_multipart_cleanup_pg_hook(
+                self.metadata_command_apply_test_hook_scope_id(),
+                raw_pg_id,
+            )?;
             let pg_id = PgId::new(raw_pg_id);
             let node = self
                 .local_map
@@ -5938,8 +6050,54 @@ impl super::StorageCluster {
                     None => break,
                 }
             }
+            next_pg_index = self.record_bucket_delete_finalize_completed_multipart_next_pg_index(
+                bucket,
+                bucket_pg_id,
+                bucket_incarnation_generation,
+                u32::try_from(pg_index + 1).map_err(|source| {
+                    BucketWriteDrainError::Store(StoreError::StorageRpc {
+                        node_id: 0,
+                        operation: "bucket delete finalize completed multipart cleanup",
+                        code: StorageRpcErrorCode::Internal,
+                        message: format!(
+                            "completed multipart cleanup next PG index does not fit u32: {source}"
+                        ),
+                    })
+                })?,
+            )?;
+            if next_pg_index > metadata_pg_count {
+                return Err(BucketWriteDrainError::Store(StoreError::StorageRpc {
+                    node_id: 0,
+                    operation: "bucket delete finalize completed multipart cleanup",
+                    code: StorageRpcErrorCode::Internal,
+                    message: format!(
+                        "completed multipart cleanup cursor {next_pg_index} exceeds metadata PG count {metadata_pg_count}"
+                    ),
+                }));
+            }
         }
         Ok(())
+    }
+
+    fn record_bucket_delete_finalize_completed_multipart_next_pg_index(
+        &self,
+        bucket: &BucketName,
+        bucket_pg_id: u32,
+        bucket_incarnation_generation: u64,
+        next_pg_index: u32,
+    ) -> Result<u32, BucketWriteDrainError> {
+        let bucket_store = self
+            .local_map
+            .metadata_pg_primary_node(self.operation_epoch(), PgId::new(bucket_pg_id))?;
+        bucket_store
+            .bucket_write_reservation_client()
+            .record_bucket_delete_finalize_completed_multipart_next_pg_index(
+                PgId::new(bucket_pg_id),
+                bucket,
+                bucket_incarnation_generation,
+                next_pg_index,
+            )
+            .map_err(bucket_snapshot_error_to_bucket_write_drain_error)
     }
 
     fn completed_multipart_upload_records_for_bucket<E>(

@@ -8703,6 +8703,74 @@ impl PgMetadataStore for PgStore {
         )
     }
 
+    fn record_bucket_delete_finalize_completed_multipart_next_pg_index(
+        &self,
+        bucket: &BucketName,
+        bucket_incarnation_generation: u64,
+        next_pg_index: u32,
+    ) -> Result<u32, MetadataError> {
+        let bucket_incarnation_generation =
+            i64::try_from(bucket_incarnation_generation).map_err(|source| MetadataError::Db {
+                context: "record bucket delete finalize completed MPU progress incarnation",
+                source: rusqlite::Error::ToSqlConversionFailure(Box::new(source)),
+            })?;
+        let next_pg_index = i64::from(next_pg_index);
+        self.with_immediate_txn(
+            "record bucket delete finalize completed MPU progress (begin txn)",
+            "record bucket delete finalize completed MPU progress (commit txn)",
+            |store| {
+                let updated = store
+                    .conn
+                    .execute(
+                        "UPDATE buckets \
+                         SET bucket_delete_finalize_completed_multipart_next_pg_index = CASE \
+                               WHEN bucket_delete_finalize_completed_multipart_next_pg_index < ?3 THEN ?3 \
+                               ELSE bucket_delete_finalize_completed_multipart_next_pg_index \
+                             END \
+                         WHERE name = ?1 AND bucket_incarnation_generation = ?2 AND state = ?4",
+                        params![
+                            bucket,
+                            bucket_incarnation_generation,
+                            next_pg_index,
+                            BucketState::Deleting as u8,
+                        ],
+                    )
+                    .map_err(|source| MetadataError::Db {
+                        context: "record bucket delete finalize completed MPU progress",
+                        source,
+                    })?;
+                if updated == 0 {
+                    return Err(bucket_not_found(bucket.as_str()));
+                }
+                let stored: i64 = store
+                    .conn
+                    .query_row(
+                        "SELECT bucket_delete_finalize_completed_multipart_next_pg_index \
+                         FROM buckets \
+                         WHERE name = ?1 AND bucket_incarnation_generation = ?2 AND state = ?3",
+                        params![
+                            bucket,
+                            bucket_incarnation_generation,
+                            BucketState::Deleting as u8,
+                        ],
+                        |row| row.get(0),
+                    )
+                    .map_err(|source| MetadataError::Db {
+                        context: "load bucket delete finalize completed MPU progress",
+                        source,
+                    })?;
+                u32::try_from(stored).map_err(|source| MetadataError::Db {
+                    context: "parse bucket delete finalize completed MPU progress",
+                    source: rusqlite::Error::FromSqlConversionFailure(
+                        0,
+                        rusqlite::types::Type::Integer,
+                        Box::new(source),
+                    ),
+                })
+            },
+        )
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn acquire_lifecycle_sweep_claim(
         &self,

@@ -324,6 +324,14 @@ pub(crate) trait BucketWriteReservationNodeClient: Send + Sync {
         bucket: &BucketName,
     ) -> Result<Option<BucketDeleteFinalizeClaimRecord>, BucketSnapshotLoadError>;
 
+    fn record_bucket_delete_finalize_completed_multipart_next_pg_index(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        bucket_incarnation_generation: u64,
+        next_pg_index: u32,
+    ) -> Result<u32, BucketSnapshotLoadError>;
+
     fn get_lifecycle_sweep_roots(
         &self,
         pg_id: PgId,
@@ -1945,6 +1953,14 @@ pub(crate) trait StorageNodeClient:
         pg_id: PgId,
         bucket: &BucketName,
     ) -> Result<Option<BucketDeleteFinalizeClaimRecord>, BucketSnapshotLoadError>;
+
+    fn record_bucket_delete_finalize_completed_multipart_next_pg_index(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        bucket_incarnation_generation: u64,
+        next_pg_index: u32,
+    ) -> Result<u32, BucketSnapshotLoadError>;
 
     fn get_lifecycle_sweep_roots(
         &self,

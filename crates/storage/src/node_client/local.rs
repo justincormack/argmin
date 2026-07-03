@@ -920,6 +920,22 @@ impl BucketWriteReservationNodeClient for LocalStorageNodeClient {
         <Self as StorageNodeClient>::bucket_delete_finalize_claim(self, pg_id, bucket)
     }
 
+    fn record_bucket_delete_finalize_completed_multipart_next_pg_index(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        bucket_incarnation_generation: u64,
+        next_pg_index: u32,
+    ) -> Result<u32, BucketSnapshotLoadError> {
+        <Self as StorageNodeClient>::record_bucket_delete_finalize_completed_multipart_next_pg_index(
+            self,
+            pg_id,
+            bucket,
+            bucket_incarnation_generation,
+            next_pg_index,
+        )
+    }
+
     fn get_lifecycle_sweep_roots(
         &self,
         pg_id: PgId,
@@ -3844,6 +3860,24 @@ impl StorageNodeClient for LocalStorageNodeClient {
     ) -> Result<Option<BucketDeleteFinalizeClaimRecord>, BucketSnapshotLoadError> {
         let pg = self.storage_node.get_pg(pg_id.get())?;
         Ok(PgMetadataStore::bucket_delete_finalize_claim(&*pg)?)
+    }
+
+    fn record_bucket_delete_finalize_completed_multipart_next_pg_index(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        bucket_incarnation_generation: u64,
+        next_pg_index: u32,
+    ) -> Result<u32, BucketSnapshotLoadError> {
+        let pg = self.storage_node.get_pg(pg_id.get())?;
+        Ok(
+            PgMetadataStore::record_bucket_delete_finalize_completed_multipart_next_pg_index(
+                &*pg,
+                bucket,
+                bucket_incarnation_generation,
+                next_pg_index,
+            )?,
+        )
     }
 
     fn get_lifecycle_sweep_roots(

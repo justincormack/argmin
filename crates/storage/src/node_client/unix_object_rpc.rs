@@ -1082,6 +1082,45 @@ impl BucketWriteReservationNodeClient for UnixStorageNodeClient {
         Ok(response.record)
     }
 
+    fn record_bucket_delete_finalize_completed_multipart_next_pg_index(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        bucket_incarnation_generation: u64,
+        next_pg_index: u32,
+    ) -> Result<u32, BucketSnapshotLoadError> {
+        let request = StorageRpcBucketDeleteFinalizeCompletedMultipartProgressRequest {
+            bucket: StorageRpcBucketRequest {
+                node_id: self.node_id,
+                cluster_epoch: self.cluster_epoch,
+                pg_id,
+                bucket: bucket.clone(),
+            },
+            bucket_incarnation_generation,
+            next_pg_index,
+        };
+        let payload = encode_bucket_delete_finalize_completed_multipart_progress_request(&request);
+        let response = self.rpc_request_bucket_snapshot(
+            StorageRpcMessageKind::BucketDeleteFinalizeCompletedMultipartProgress,
+            payload,
+        )?;
+        let response =
+            decode_bucket_delete_finalize_completed_multipart_progress_response(&response)
+                .map_err(|error| {
+                    BucketSnapshotLoadError::Store(self.rpc_payload_error(
+                        "decode bucket delete finalize completed multipart progress response",
+                        error.to_string(),
+                    ))
+                })?;
+        if response.next_pg_index < next_pg_index {
+            return Err(BucketSnapshotLoadError::Store(self.rpc_payload_error(
+                "validate bucket delete finalize completed multipart progress response",
+                "progress response regressed requested cursor".to_string(),
+            )));
+        }
+        Ok(response.next_pg_index)
+    }
+
     fn get_lifecycle_sweep_roots(
         &self,
         pg_id: PgId,

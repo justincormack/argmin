@@ -40,6 +40,7 @@ use crate::storage_rpc::{
     decode_bucket_delete_attempt_outcome_record_request, decode_bucket_delete_begin_roots_request,
     decode_bucket_delete_finalize_claim_acquire_request,
     decode_bucket_delete_finalize_claim_record_request,
+    decode_bucket_delete_finalize_completed_multipart_progress_request,
     decode_bucket_delete_finalize_roots_request, decode_bucket_list_request,
     decode_bucket_mark_deleting_command_build_request,
     decode_bucket_metadata_control_command_build_request,
@@ -106,6 +107,7 @@ use crate::storage_rpc::{
     encode_bucket_delete_attempt_outcome_optional_record_response,
     encode_bucket_delete_begin_roots_response,
     encode_bucket_delete_finalize_claim_optional_record_response,
+    encode_bucket_delete_finalize_completed_multipart_progress_response,
     encode_bucket_delete_finalize_roots_response, encode_bucket_execution_generations_response,
     encode_bucket_fast_path_identities_response, encode_bucket_info_outcome_response,
     encode_bucket_list_response, encode_bucket_mark_deleting_command_build_response,
@@ -164,11 +166,13 @@ use crate::storage_rpc::{
     StorageRpcBucketDeleteAttemptOutcomeRecordRequest, StorageRpcBucketDeleteBeginRootsRequest,
     StorageRpcBucketDeleteBeginRootsResponse, StorageRpcBucketDeleteFinalizeClaimAcquireRequest,
     StorageRpcBucketDeleteFinalizeClaimOptionalRecordResponse,
-    StorageRpcBucketDeleteFinalizeClaimRecordRequest, StorageRpcBucketDeleteFinalizeRootsRequest,
-    StorageRpcBucketDeleteFinalizeRootsResponse, StorageRpcBucketExecutionGenerationsResponse,
-    StorageRpcBucketFastPathIdentitiesResponse, StorageRpcBucketInfoOutcome,
-    StorageRpcBucketInfoOutcomeResponse, StorageRpcBucketListRequest, StorageRpcBucketListResponse,
-    StorageRpcBucketMarkDeletingCommandBuildOutcome,
+    StorageRpcBucketDeleteFinalizeClaimRecordRequest,
+    StorageRpcBucketDeleteFinalizeCompletedMultipartProgressRequest,
+    StorageRpcBucketDeleteFinalizeCompletedMultipartProgressResponse,
+    StorageRpcBucketDeleteFinalizeRootsRequest, StorageRpcBucketDeleteFinalizeRootsResponse,
+    StorageRpcBucketExecutionGenerationsResponse, StorageRpcBucketFastPathIdentitiesResponse,
+    StorageRpcBucketInfoOutcome, StorageRpcBucketInfoOutcomeResponse, StorageRpcBucketListRequest,
+    StorageRpcBucketListResponse, StorageRpcBucketMarkDeletingCommandBuildOutcome,
     StorageRpcBucketMarkDeletingCommandBuildRequest,
     StorageRpcBucketMarkDeletingCommandBuildResponse,
     StorageRpcBucketMetadataControlCommandBuildRequest,
@@ -1826,6 +1830,19 @@ impl StorageNodeConnectionHandler {
             StorageRpcMessageKind::BucketDeleteFinalizeClaimRelease => {
                 match decode_bucket_delete_finalize_claim_record_request(&frame.payload) {
                     Ok(request) => self.bucket_delete_finalize_claim_release_response(request),
+                    Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
+                        code: StorageRpcErrorCode::PayloadDecode,
+                        message: error.to_string(),
+                    }),
+                }
+            }
+            StorageRpcMessageKind::BucketDeleteFinalizeCompletedMultipartProgress => {
+                match decode_bucket_delete_finalize_completed_multipart_progress_request(
+                    &frame.payload,
+                ) {
+                    Ok(request) => {
+                        self.bucket_delete_finalize_completed_multipart_progress_response(request)
+                    }
                     Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
                         code: StorageRpcErrorCode::PayloadDecode,
                         message: error.to_string(),
@@ -3778,6 +3795,44 @@ impl StorageNodeConnectionHandler {
             &request.record,
         ) {
             Ok(()) => Ok(encode_storage_rpc_success_response(&[])),
+            Err(error) => encode_storage_rpc_error_response(&bucket_snapshot_error_response(error)),
+        }
+    }
+
+    fn bucket_delete_finalize_completed_multipart_progress_response(
+        &self,
+        request: StorageRpcBucketDeleteFinalizeCompletedMultipartProgressRequest,
+    ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
+        if let Err(error) = self.validate_pg_route_for_cleanup(
+            request.bucket.node_id,
+            request.bucket.cluster_epoch,
+            request.bucket.pg_id,
+        ) {
+            return encode_storage_rpc_error_response(&error);
+        }
+        if let Err(error) = self.validate_primary_pg_for_bucket(
+            request.bucket.pg_id,
+            &request.bucket.bucket,
+            "bucket delete finalize completed multipart progress",
+        ) {
+            return encode_storage_rpc_error_response(&error);
+        }
+        let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
+        match BucketWriteReservationNodeClient::record_bucket_delete_finalize_completed_multipart_next_pg_index(
+            &local_client,
+            request.bucket.pg_id,
+            &request.bucket.bucket,
+            request.bucket_incarnation_generation,
+            request.next_pg_index,
+        ) {
+            Ok(next_pg_index) => {
+                let payload = encode_bucket_delete_finalize_completed_multipart_progress_response(
+                    &StorageRpcBucketDeleteFinalizeCompletedMultipartProgressResponse {
+                        next_pg_index,
+                    },
+                );
+                Ok(encode_storage_rpc_success_response(&payload))
+            }
             Err(error) => encode_storage_rpc_error_response(&bucket_snapshot_error_response(error)),
         }
     }
