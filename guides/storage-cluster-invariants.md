@@ -114,9 +114,12 @@ does not serve:
 
 Reconcile (benign crash leftovers). Recovery repairs the state and continues:
 
-- an *epoch-mismatched orphan* pending command slot: a slot whose epoch differs
-  from the stored replica state epoch, for example a command prepared under an
-  epoch that has since advanced and will never be applied.
+- an older-epoch orphan pending command slot: a slot whose epoch is behind the
+  stored replica state epoch, for example a command prepared under an epoch
+  that has since advanced and will never be applied. Future-epoch pending slots
+  are not locally recoverable because they can be in-flight first commands for
+  that future epoch; recovery fails closed and leaves them durable until a
+  cluster-level convergence path has acting-set evidence.
 - cache-only per-table digest drift: after replay validation proves
   `metadata_command_replica_state.state_digest` still matches the materialised
   rows, recovery refreshes `metadata_table_digests` from those rows so stale
@@ -129,10 +132,9 @@ slots. Cluster-level recovery, or an explicit command path that owns the
 pending command, may remove a terminal slot only after it has acting-set
 evidence or equivalent command-specific convergence proof.
 
-The orphan cleanup is order-dependent: epoch-mismatched orphan cleanup must
-precede replay validation, because replay validation reads the pending slot
-through the epoch-checked path and would otherwise reject the orphan before
-cleanup can run.
+The orphan cleanup is order-dependent: older-epoch orphan cleanup must precede
+replay validation, because replay validation reads the pending slot through the
+epoch-checked path and would otherwise reject the orphan before cleanup can run.
 
 Heartbeat and other serving-time observation paths must not delete or advance
 pending slots: a legitimate command can install a future-epoch pending slot

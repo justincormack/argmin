@@ -82,12 +82,15 @@ crash. Three recent fixes show the gap:
 - `c5776092`: the heartbeat read a pending command slot that had already been applied (a
   *terminal* slot) and reported `has_pending_metadata_command: true` forever, sticking the
   PG in `Peering`.
-- `791b409c`: the heartbeat read a pending slot from a *different* (stale) epoch and again
-  reported a phantom pending command.
+- `791b409c`: the heartbeat read a pending slot from a *different* epoch and again reported
+  a phantom pending command.
 
-Both pending-slot fixes are in `crates/storage/src/node.rs::pg_heartbeat_observation`
-(around `node.rs:1200`) — they are reactive, heartbeat-only cleanups. The `c828f3a5` digest
-fix is local to one mutator.
+Those pending-slot failures showed that heartbeat/observation was the wrong boundary for
+repair. The final invariant is that heartbeat remains read-only: local pre-serving recovery
+may clean only older-epoch orphan pending slots, same-epoch terminal slots are preserved
+until explicit command or cluster-level convergence cleanup, and future-epoch pending slots
+fail closed because they can be in-flight first commands for that future epoch. The
+`c828f3a5` digest fix was local to one mutator and motivated the broader recovery gate.
 
 ### Current state (verified at `62ecf6b6`)
 
@@ -161,10 +164,10 @@ Progress update:
    [`guides/storage-cluster-invariants.md`](../guides/storage-cluster-invariants.md), that
    opening a PG store plus explicit recovery is a validation boundary and state which
    anomaly classes fail closed (possible corruption: hash-chain break, digest mismatch,
-   forked log) versus which are locally recoverable (benign crash leftovers such as
-   epoch-mismatched orphan slots). Same-epoch terminal pending slots are preserved by local
-   recovery and by heartbeat/observation paths; clearing them requires explicit command
-   cleanup or cluster-level acting-set convergence evidence.
+   forked log, or future-epoch pending-slot ambiguity) versus which are locally recoverable
+   (benign crash leftovers such as older-epoch orphan slots). Same-epoch terminal pending
+   slots are preserved by local recovery and by heartbeat/observation paths; clearing them
+   requires explicit command cleanup or cluster-level acting-set convergence evidence.
 
 2. **Recovery is a method on an opened store, invoked by node-identity-owning callers.**
    **Completed.**
@@ -186,17 +189,19 @@ Progress update:
    - `PgStore::open` and `SharedStorageNode::open` stay raw (no recovery, no node_id).
 
    Per opened PG, `recover` runs, in immediate transactions and in this order. The order is
-   load-bearing and mirrors the heartbeat path (`node.rs:1203-1217`), which already solves
-   the sequencing hazard that affects the naive order:
+   load-bearing and deliberately differs from heartbeat/observation paths, which must not
+   mutate pending slots:
    1. read the stored replica epoch from `metadata_command_replica_state().cluster_epoch`;
-   2. run `clean_epoch_mismatched_orphan_pending_metadata_command_slot(node_id, stored_epoch)`
-      (`command_log.rs:2049`). This **must** precede replay validation:
+   2. run older-epoch orphan pending-slot cleanup
+      (`clean_epoch_mismatched_orphan_pending_metadata_command_slot`, `command_log.rs:2049`).
+      This **must** precede replay validation:
       `validate_metadata_command_replay_state_with_pending_cleanup` calls the epoch-checked
       `pending_metadata_command_slot(node_id, cluster_epoch)` at `command_log.rs:2856`,
       which returns `StaleMetadataOperation` when the slot's epoch differs from the stored
-      epoch. Running validation first would error out on an epoch-mismatched orphan before
-      this cleanup could run, so the orphan would never be reconciled and recovery would fail
-      rather than heal;
+      epoch. Running validation first would error out on an older-epoch orphan before this
+      cleanup could run, so the orphan would never be reconciled and recovery would fail
+      rather than heal. Future-epoch slots are not cleaned here; they fail closed and remain
+      durable until a cluster-level convergence path can inspect acting-set evidence;
    3. run replay validation with terminal-slot preservation to validate the command-log hash
       chain and perform the materialised digest verification (see work item 2b). A local
       replica cannot prove acting-set convergence, so it must not clean same-epoch terminal
@@ -353,9 +358,10 @@ Progress update:
 ### Exit criteria
 
 1. **Completed:** `PgStore::recover(&self, PgStoreRecoveryContext { node_id })` reconciles
-   epoch-mismatched orphan slots, preserves same-epoch terminal pending slots, and fails
-   closed on materialised-digest or hash-chain mismatch. Terminal pending-slot cleanup
-   requires explicit command cleanup or cluster-level acting-set convergence evidence.
+   older-epoch orphan slots, preserves same-epoch terminal pending slots, and fails closed
+   on future-epoch pending slots, materialised-digest mismatch, or hash-chain mismatch.
+   Terminal pending-slot cleanup requires explicit command cleanup or cluster-level
+   acting-set convergence evidence.
    `PgStore::open` stays raw; recovery is invoked by node-identity-owning callers, not
    threaded through `SharedStorageNode::open`.
 2. **Completed:** `StorageNodeServer::bind` and the local-cluster builder both call
@@ -368,8 +374,9 @@ Progress update:
    recovery code path; `clean_terminal_primary_pending_slot_on_open` is removed.
 5. **Completed:** A crash-recovery property test covers the explicit multi-statement
    digest-affecting mutators and asserts the five post-recovery invariants above,
-   including materialised-vs-cached digest agreement and that an epoch-mismatched orphan
-   slot does not block recovery. The remaining digest-affecting store methods are
+   including materialised-vs-cached digest agreement, that an older-epoch orphan slot does
+   not block recovery, and that future-epoch pending slots fail closed instead of being
+   erased locally. The remaining digest-affecting store methods are
    classified as single SQLite statement maintenance paths or read-before-single-write
    helpers, so they remain under ordinary digest-consistency coverage rather than the
    commit-failure hook.

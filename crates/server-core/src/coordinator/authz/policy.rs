@@ -62,6 +62,7 @@ pub(super) fn load_bucket_tags_for_policy_action(
         .map_err(|error| match error {
             storage::BucketSnapshotLoadError::Store(
                 storage::StoreError::MetadataCommandLogConflict { .. }
+                | storage::StoreError::MetadataCommandLogGap { .. }
                 | storage::StoreError::MetadataCommandPendingConflict { .. },
             ) => ServerError::OperationAborted,
             storage::BucketSnapshotLoadError::Store(error) => super::super::map_store_error(error),

@@ -9277,12 +9277,12 @@ Status update:
   for bucket-delete finalization using a stale metadata route. The finalizer
   command-contention regression remains in place.
 - A route-change-full-restart soak failure showed storage-node heartbeat refresh
-  can wedge when a future-epoch metadata pending slot survives without a local
-  terminal log entry while the durable replica state remains at an older epoch.
-  Heartbeat now detects and removes only those epoch-mismatched orphan pending
-  slots before reporting the node's durable proof; if a local terminal log entry
-  exists for the slot, the node still fails closed instead of silently ignoring
-  the log.
+  can wedge when an epoch-mismatched metadata pending slot survives. This is now
+  split by direction and by recovery boundary: heartbeat remains read-only and
+  only reports pending-slot presence; local pre-serving recovery removes
+  older-epoch orphan pending slots, while future-epoch pending slots fail closed
+  and remain durable because they can represent in-flight first commands for the
+  future epoch.
 - `DeleteBucket` begin/finalize foreground loops now explicitly check the pinned
   route map validity deadline at their loop gates, so a route map that expires
   while cleanup is in progress returns a typed retryable route-map expiry

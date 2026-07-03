@@ -400,11 +400,12 @@ static SHARD_TMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// Inputs required to recover a [`PgStore`] after open.
 ///
-/// Recovery reconciles benign crash leftovers (terminal and epoch-mismatched
-/// orphan pending command slots) and fails closed on command-log or digest
-/// corruption before the store serves. The owning node id is the only external
-/// input: the recovery epoch is read from the store's own replica state, never
-/// supplied by the caller.
+/// Recovery reconciles benign crash leftovers that can be proven locally
+/// (older-epoch orphan pending command slots and cache-only digest drift) and
+/// fails closed on command-log, digest, or future-epoch pending-slot ambiguity
+/// before the store serves. The owning node id is the only external input: the
+/// recovery epoch is read from the store's own replica state, never supplied by
+/// the caller.
 ///
 /// This context is intentionally distinct from heartbeat/observation paths:
 /// recovery may mutate PG metadata to repair crash leftovers before serving,

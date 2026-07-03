@@ -888,7 +888,7 @@ fn reclaim_worker_follows_runtime_map_refresh_for_bucket_finalize() {
         .create_bucket_for_owner("default-owner", "bucket", false)
         .unwrap();
 
-    install_same_store_next_epoch_runtime_map(&handle, &initial, tmp.path());
+    install_same_store_same_epoch_runtime_map(&handle, &initial, tmp.path());
     thread::sleep(Duration::from_millis(250));
 
     delete_bucket_test(&coord, "bucket").unwrap();
@@ -1830,6 +1830,60 @@ fn install_same_store_next_epoch_runtime_map(
         node_root,
         NodeId::new(0),
     );
+}
+
+fn install_same_store_same_epoch_runtime_map(
+    handle: &StorageClusterRuntimeMapHandle,
+    initial: &Arc<StorageCluster>,
+    node_root: &std::path::Path,
+) {
+    let node_count = u32::from(initial.default_payload_ec_shape().k)
+        + u32::from(initial.default_payload_ec_shape().m);
+    let configs = (0..node_count)
+        .map(|node_id| {
+            LocalNodeStoreConfig::new(
+                NodeId::new(node_id),
+                node_root.join(format!("node-{node_id:04}")),
+            )
+        })
+        .collect::<Vec<_>>();
+    let routes = initial
+        .local_pg_routes()
+        .map(|route| {
+            let route = storage::control_plane::PgRouteSnapshot::reconstructed(
+                route.cluster_epoch(),
+                route.pg_id(),
+                route.primary_node_id(),
+                route.acting_set().to_vec(),
+                route.state(),
+            );
+            LocalPgRoute::from(&route)
+        })
+        .collect::<Vec<_>>();
+    let historical_routes = initial
+        .local_pg_routes()
+        .map(|route| {
+            storage::control_plane::PgRouteSnapshot::reconstructed(
+                route.cluster_epoch(),
+                route.pg_id(),
+                route.primary_node_id(),
+                route.acting_set().to_vec(),
+                route.state(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut candidate_map = LocalClusterMap::open_frontend_with_configs_and_pg_routes(
+        NodeId::new(0),
+        configs,
+        initial.test_pg_ids(),
+        initial.default_payload_ec_shape(),
+        initial.cluster_epoch(),
+        routes,
+    )
+    .unwrap();
+    candidate_map.test_install_historical_pg_routes(historical_routes);
+    let candidate = StorageCluster::from_local_map(Arc::new(candidate_map)).unwrap();
+    handle.install(candidate).unwrap();
 }
 
 fn install_same_store_next_epoch_runtime_map_with_primary(

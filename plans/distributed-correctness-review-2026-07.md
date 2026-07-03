@@ -726,6 +726,12 @@ Plausible, narrow window.
 - Fix shape: distinguish slot-epoch-behind-store (true orphan) from
   slot-epoch-ahead-of-store (possible in-flight next-epoch command; needs
   acting-set evidence before deletion).
+- Status update: local recovery now makes this direction-aware. Pending slots
+  from older epochs remain locally cleanable as orphans, but future-epoch
+  pending slots fail closed and remain durable instead of being erased without
+  acting-set evidence. Focused PgStore regressions cover both directions, and
+  the local-cluster reopen regression now asserts that a future-epoch slot is
+  rejected rather than silently cleaned.
 
 ### MD5. MEDIUM — `PRAGMA synchronous=NORMAL` under WAL makes acked commands and pending slots non-durable across power loss
 
@@ -1207,9 +1213,10 @@ closes this.
    mutation; monotonic epoch guard in `PgStore` rejecting `command_epoch <
    replica_state.cluster_epoch` and the server/codec assertion that
    `request.cluster_epoch == command.id().cluster_epoch()` are implemented.
-   Remaining follow-ups: gate forward epoch adoption on an explicit
-   transfer/epoch-transition token (MD3/CL3), and direction-aware orphan
-   cleanup (MD4).
+   Remaining follow-up: gate forward epoch adoption on an explicit
+   transfer/epoch-transition token (MD3/CL3). Direction-aware orphan cleanup
+   (MD4) is implemented locally by cleaning only older-epoch slots and failing
+   closed on future-epoch slots.
 7. I/O deadlines on the storage RPC layer (client connect/read/write; server
    per-frame read and response write) mirroring the Raft transport, plus a
    lease/deadline on the server-side metadata-command critical section

@@ -2246,27 +2246,33 @@ mod tests {
     }
 
     #[test]
-    fn shared_node_recover_cleans_epoch_mismatched_orphan_pending_command() {
+    fn shared_node_recover_cleans_older_epoch_orphan_pending_command() {
         let tmp = test_util::tempdir();
         let node = SharedStorageNode::open(tmp.path(), &[0]).unwrap();
-        let bucket = bucket_name("future-pending-recover");
-        let future_epoch = ClusterEpoch::new(2).unwrap();
-        let command = create_bucket_command_for(bucket.as_str(), future_epoch);
+        let newer_epoch = ClusterEpoch::new(2).unwrap();
+        let newer_bucket = bucket_name("newer-state-recover");
+        let newer_command = create_bucket_command_for(newer_bucket.as_str(), newer_epoch);
+        let old_bucket = bucket_name("old-pending-recover");
+        let old_command = create_bucket_command_for(old_bucket.as_str(), ClusterEpoch::INITIAL);
         let metadata_state = {
             let pg = node.get_pg(0).unwrap();
-            pg.try_insert_pending_metadata_command_slot(7, &command, Some(&bucket))
+            pg.apply_metadata_command_and_record(7, &newer_command)
+                .unwrap();
+            let metadata_state = pg.metadata_command_replica_state().unwrap();
+            assert_eq!(metadata_state.cluster_epoch, newer_epoch);
+            pg.try_insert_pending_metadata_command_slot(7, &old_command, Some(&old_bucket))
                 .unwrap();
             assert!(pg
                 .pending_metadata_command_slot_any_epoch(7)
                 .unwrap()
                 .is_some());
-            pg.metadata_command_replica_state().unwrap()
+            metadata_state
         };
 
-        // Recovery must clean the orphan BEFORE replay validation. Otherwise
-        // the epoch-checked pending-slot read inside replay validation would
-        // reject the orphan (StaleMetadataOperation) and recovery would fail
-        // instead of healing.
+        // Recovery may clean epoch-mismatched orphans only when the slot is
+        // older than the store's replica-state epoch. A future-epoch slot can
+        // still be an in-flight first command for that epoch and must fail
+        // closed without acting-set evidence.
         node.recover_pg_metadata_command_state(NodeId::new(7))
             .expect("recovery must reconcile an epoch-mismatched orphan slot");
 
@@ -2279,6 +2285,7 @@ mod tests {
         );
         let state = pg.metadata_command_replica_state().unwrap();
         assert_eq!(state.applied_log_index, metadata_state.applied_log_index);
+        assert_eq!(state.cluster_epoch, metadata_state.cluster_epoch);
     }
 
     #[test]

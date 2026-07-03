@@ -962,6 +962,7 @@ impl Coordinator {
             .map_err(|error| match error {
                 storage::BucketSnapshotLoadError::Store(
                     storage::StoreError::MetadataCommandLogConflict { .. }
+                    | storage::StoreError::MetadataCommandLogGap { .. }
                     | storage::StoreError::MetadataCommandPendingConflict { .. },
                 ) => ServerError::OperationAborted,
                 storage::BucketSnapshotLoadError::Store(other) => super::map_store_error(other),

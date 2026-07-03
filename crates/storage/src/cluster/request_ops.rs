@@ -9601,13 +9601,18 @@ impl super::StorageCluster {
     }
 
     pub fn enqueue_durable_reclaim_work(&self) {
-        self.enqueue_durable_reclaim_work_excluding(&HashSet::new(), &HashSet::new());
+        self.enqueue_durable_reclaim_work_excluding(
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashSet::new(),
+        );
     }
 
     pub fn enqueue_durable_reclaim_work_excluding(
         &self,
         excluded_object_payload_roots: &HashSet<(BucketName, ObjectKey, GenerationId)>,
         excluded_bucket_delete_begin_roots: &HashSet<BucketDeleteBeginRoot>,
+        excluded_bucket_delete_finalize_roots: &HashSet<BucketName>,
     ) {
         if self.operation_epoch() != self.cluster_epoch() {
             return;
@@ -9616,7 +9621,9 @@ impl super::StorageCluster {
         self.enqueue_durable_bucket_delete_begin_roots_excluding(
             excluded_bucket_delete_begin_roots,
         );
-        self.enqueue_durable_bucket_delete_finalize_roots();
+        self.enqueue_durable_bucket_delete_finalize_roots_excluding(
+            excluded_bucket_delete_finalize_roots,
+        );
     }
 
     pub fn wait_for_reclaim_work(&self, stop: &AtomicBool) -> Option<ReclaimWorkItem> {
@@ -10117,8 +10124,16 @@ impl super::StorageCluster {
         scan
     }
 
+    #[cfg(test)]
     pub(crate) fn enqueue_durable_bucket_delete_finalize_roots(
         &self,
+    ) -> DurableBucketDeleteFinalizeScan {
+        self.enqueue_durable_bucket_delete_finalize_roots_excluding(&HashSet::new())
+    }
+
+    pub(crate) fn enqueue_durable_bucket_delete_finalize_roots_excluding(
+        &self,
+        excluded_bucket_delete_finalize_roots: &HashSet<BucketName>,
     ) -> DurableBucketDeleteFinalizeScan {
         if self.operation_epoch() != self.cluster_epoch() {
             return DurableBucketDeleteFinalizeScan::default();
@@ -10160,6 +10175,9 @@ impl super::StorageCluster {
                 }
             };
             for root in roots {
+                if excluded_bucket_delete_finalize_roots.contains(&root.bucket) {
+                    continue;
+                }
                 self.enqueue_bucket_delete_finalize(&root.bucket);
                 scan.queued += 1;
             }

@@ -442,6 +442,7 @@ impl<'a> BucketHandleLoader<'a> {
         match error {
             storage::BucketSnapshotLoadError::Store(
                 storage::StoreError::MetadataCommandLogConflict { .. }
+                | storage::StoreError::MetadataCommandLogGap { .. }
                 | storage::StoreError::MetadataCommandPendingConflict { .. },
             ) => ServerError::OperationAborted,
             storage::BucketSnapshotLoadError::Store(error) => super::map_store_error(error),

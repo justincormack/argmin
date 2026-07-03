@@ -49,6 +49,7 @@ impl Coordinator {
         match error {
             storage::ObjectPgActionError::Store(
                 storage::StoreError::MetadataCommandLogConflict { .. }
+                | storage::StoreError::MetadataCommandLogGap { .. }
                 | storage::StoreError::MetadataCommandPendingConflict { .. },
             ) => ServerError::OperationAborted,
             storage::ObjectPgActionError::Metadata(ref error)

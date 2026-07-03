@@ -2051,7 +2051,10 @@ impl PgStore {
     /// This must not be called from heartbeat or other serving-time observation
     /// paths. A normal command can install a future-epoch pending slot before
     /// apply/record advances the durable replica state to that epoch, and no
-    /// terminal log entry exists during that in-flight window.
+    /// terminal log entry exists during that in-flight window. Only slots from
+    /// older epochs are locally cleanable; future-epoch slots need cluster-level
+    /// acting-set evidence before any recovery path can classify them as
+    /// abandoned.
     pub(crate) fn clean_epoch_mismatched_orphan_pending_metadata_command_slot(
         &self,
         ctx: super::PgStoreRecoveryContext,
@@ -2063,6 +2066,14 @@ impl PgStore {
         };
         if slot.id.cluster_epoch() == current_epoch {
             return Ok(false);
+        }
+        if slot.id.cluster_epoch() > current_epoch {
+            return Err(StoreError::MetadataCommandLogConflict {
+                node_id,
+                pg_id: self.pg_id,
+                cluster_epoch: slot.id.cluster_epoch(),
+                log_index: slot.id.log_index().get(),
+            });
         }
         if self
             .load_metadata_command_log_entry(
@@ -2442,10 +2453,10 @@ impl PgStore {
     /// be supplied externally, since orphan detection compares the pending slot's
     /// epoch against that stored epoch.
     ///
-    /// Ordering is load-bearing and mirrors `pg_heartbeat_observation`: the
-    /// epoch-mismatched orphan cleanup runs before replay validation, because
-    /// replay validation reads the pending slot through the epoch-checked path
-    /// and would otherwise reject the orphan before cleanup could run.
+    /// Ordering is load-bearing: older-epoch orphan cleanup runs before replay
+    /// validation, because replay validation reads the pending slot through the
+    /// epoch-checked path and would otherwise reject that locally cleanable
+    /// orphan before cleanup could run.
     ///
     /// This local recovery boundary deliberately preserves same-epoch terminal
     /// pending slots. A terminal slot proves only that this replica recorded the
@@ -2485,16 +2496,18 @@ impl PgStore {
         Ok(state)
     }
 
-    /// Recovery phase A: clean epoch-mismatched orphan pending command slots.
+    /// Recovery phase A: clean older-epoch orphan pending command slots.
     ///
     /// This must run before any cluster-wide replay validation in clustered open
     /// paths. Cluster-wide validation reads the pending slot through the
     /// epoch-checked path (`pending_metadata_command_slot`), which returns
     /// `StaleMetadataOperation` when the slot's epoch differs from the store
-    /// epoch; an orphan would therefore reject the whole open before full
-    /// recovery could clean it. This phase only removes slots whose epoch
-    /// differs from the store's replica-state epoch, so same-epoch primary
-    /// pending slots remain available for convergence.
+    /// epoch; an older-epoch orphan would therefore reject the whole open before
+    /// full recovery could clean it. This phase only removes slots whose epoch
+    /// is older than the store's replica-state epoch. Same-epoch primary
+    /// pending slots remain available for convergence, and future-epoch slots
+    /// fail closed because they may be in-flight first commands for that future
+    /// epoch.
     pub(crate) fn recover_clean_orphan_pending_command_slots(
         &self,
         ctx: super::PgStoreRecoveryContext,

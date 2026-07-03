@@ -3586,6 +3586,101 @@ fn metadata_command_apply_rejects_stale_epoch_without_rewinding_replica_state() 
 }
 
 #[test]
+fn recovery_cleans_only_older_epoch_pending_slot() {
+    let tmp = test_util::tempdir();
+    let store = PgStore::open(tmp.path(), 1).unwrap();
+    let first = create_bucket_probe_command(1, 1, trusted_bucket_name("old-slot-first"), 1);
+    store.apply_metadata_command_and_record(0, &first).unwrap();
+
+    let epoch_two = ClusterEpoch::new(2).unwrap();
+    let epoch_two_command = rebase_probe_commands(
+        epoch_two,
+        PgId::new(1),
+        &[create_bucket_probe_command(
+            1,
+            1,
+            trusted_bucket_name("old-slot-epoch-two"),
+            2,
+        )],
+    )
+    .pop()
+    .unwrap();
+    store
+        .apply_metadata_command_and_record(0, &epoch_two_command)
+        .unwrap();
+    let epoch_two_state = store.metadata_command_replica_state().unwrap();
+    assert_eq!(epoch_two_state.cluster_epoch, epoch_two);
+
+    let old_bucket = trusted_bucket_name("old-slot-pending");
+    let old_slot = create_bucket_probe_command(1, 2, old_bucket.clone(), 3);
+    store
+        .try_insert_pending_metadata_command_slot(0, &old_slot, Some(&old_bucket))
+        .unwrap();
+    assert!(store
+        .pending_metadata_command_slot_any_epoch(0)
+        .unwrap()
+        .is_some());
+
+    store
+        .recover_clean_orphan_pending_command_slots(super::super::PgStoreRecoveryContext::for_node(
+            NodeId::new(0),
+        ))
+        .unwrap();
+    assert!(store
+        .pending_metadata_command_slot_any_epoch(0)
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        store.metadata_command_replica_state().unwrap(),
+        epoch_two_state
+    );
+}
+
+#[test]
+fn recovery_rejects_future_epoch_pending_slot_without_cleanup() {
+    let tmp = test_util::tempdir();
+    let store = PgStore::open(tmp.path(), 1).unwrap();
+    let future_epoch = ClusterEpoch::new(2).unwrap();
+    let future_bucket = trusted_bucket_name("future-slot-pending");
+    let future_slot = rebase_probe_commands(
+        future_epoch,
+        PgId::new(1),
+        &[create_bucket_probe_command(1, 1, future_bucket.clone(), 1)],
+    )
+    .pop()
+    .unwrap();
+    store
+        .try_insert_pending_metadata_command_slot(0, &future_slot, Some(&future_bucket))
+        .unwrap();
+
+    let err = store
+        .recover_clean_orphan_pending_command_slots(super::super::PgStoreRecoveryContext::for_node(
+            NodeId::new(0),
+        ))
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            StoreError::MetadataCommandLogConflict {
+                node_id: 0,
+                pg_id: 1,
+                cluster_epoch,
+                log_index: 1,
+            } if cluster_epoch == future_epoch
+        ),
+        "future-epoch pending slot must fail closed, got {err:?}"
+    );
+    let stored = store
+        .pending_metadata_command_slot_any_epoch(0)
+        .unwrap()
+        .expect("future-epoch pending slot must remain durable");
+    assert_eq!(stored.id, future_slot.id());
+    assert_eq!(stored.command_checksum, future_slot.checksum_crc64());
+    assert_eq!(stored.command_bytes, future_slot.command_bytes());
+    assert_eq!(stored.scope_bucket, Some(future_bucket));
+}
+
+#[test]
 fn metadata_command_acceptance_rejects_missing_already_applied_log_entry() {
     let tmp = test_util::tempdir();
     let store = PgStore::open(tmp.path(), 1).unwrap();

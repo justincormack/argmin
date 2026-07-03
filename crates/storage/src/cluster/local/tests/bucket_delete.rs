@@ -269,10 +269,17 @@ fn finalized_bucket_delete_after_reopen_does_not_need_begin_waiter() {
     };
     set_route_primary(&mut map, 1, NodeId::new(1));
 
+    {
+        let map = Arc::new(map);
+        let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+        create_test_bucket(&cluster, &bucket);
+        cluster.begin_bucket_delete(&bucket).unwrap();
+    }
+
+    let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2], ec_shape).unwrap();
+    set_route_primary(&mut map, 1, NodeId::new(1));
     let map = Arc::new(map);
     let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
-    create_test_bucket(&cluster, &bucket);
-    cluster.begin_bucket_delete(&bucket).unwrap();
     assert_clean_metadata_command_stream(&map, &[1]);
     drop(cluster);
     drop(map);
@@ -346,6 +353,44 @@ fn durable_bucket_finalize_scan_recovers_lost_local_queue_after_reopen() {
         crate::BucketDeleteFinalizeOutcome::Finalized
     );
     assert_clean_metadata_command_stream(&reopened, &[1]);
+}
+
+#[test]
+fn durable_bucket_finalize_scan_skips_excluded_bucket() {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2], ec_shape).unwrap();
+    let bucket = {
+        let topology = map
+            .nodes
+            .get(&NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        bucket_for_pg(topology, 1, "delete-finalize-excluded-")
+    };
+    set_route_primary(&mut map, 1, NodeId::new(1));
+    let map = Arc::new(map);
+    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    create_test_bucket(&cluster, &bucket);
+    cluster.begin_bucket_delete(&bucket).unwrap();
+
+    let excluded = std::collections::HashSet::from([bucket.clone()]);
+    let scan = cluster.enqueue_durable_bucket_delete_finalize_roots_excluding(&excluded);
+    assert_eq!(scan.errors, 0);
+    assert_eq!(scan.queued, 0);
+    assert_eq!(cluster.try_take_reclaim_work(), None);
+
+    let scan = cluster
+        .enqueue_durable_bucket_delete_finalize_roots_excluding(&std::collections::HashSet::new());
+    assert_eq!(scan.errors, 0);
+    assert_eq!(scan.queued, 1);
+    assert!(matches!(
+        cluster.try_take_reclaim_work(),
+        Some(crate::ReclaimWorkItem::BucketDelete(queued_bucket))
+            if queued_bucket == bucket
+    ));
 }
 
 #[test]

@@ -7266,7 +7266,7 @@ fn direct_put_action_failure_does_not_reserve_object_version() {
 }
 
 #[test]
-fn local_cluster_reopen_cleans_epoch_mismatched_orphan_pending_slot() {
+fn local_cluster_reopen_rejects_future_epoch_pending_slot() {
     let tmp = test_util::tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
     let ec_shape = EcShape { k: 2, m: 1 };
@@ -7283,9 +7283,10 @@ fn local_cluster_reopen_cleans_epoch_mismatched_orphan_pending_slot() {
         .unwrap()
         .node_id();
 
-    // Inject a pending slot at a future epoch on the primary, simulating a
-    // crash leftover whose epoch can never be satisfied: the store's replica
-    // state remains at the initial epoch, so the slot's epoch will never match.
+    // Inject a pending slot at a future epoch on the primary. This can be an
+    // in-flight first command of a newer epoch if the primary crashes before
+    // recording locally, so local open-time recovery must not classify it as a
+    // cleanable orphan without acting-set evidence.
     let future_epoch = ClusterEpoch::new(2).unwrap();
     let command = create_bucket_metadata_command_with_epoch(pg_id, 1, bucket.clone(), future_epoch);
     {
@@ -7306,19 +7307,9 @@ fn local_cluster_reopen_cleans_epoch_mismatched_orphan_pending_slot() {
     }
     drop(map);
 
-    // Reopen must succeed. Without recovery phase A running before the
-    // cluster-wide replay validation, the epoch-checked pending-slot read would
-    // reject this orphan with `StaleMetadataOperation` and fail the whole open.
-    let reopened = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1], ec_shape)
-        .expect("reopen must clean epoch-mismatched orphan pending slot");
-    let primary = reopened
-        .metadata_pg_primary_node(ClusterEpoch::INITIAL, pg_id)
-        .unwrap();
-    let pg = primary.storage_node().get_pg(pg_id.get()).unwrap();
+    let err = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1], ec_shape).unwrap_err();
     assert!(
-        pg.pending_metadata_command_slot_any_epoch(primary_node_id.as_u32())
-            .unwrap()
-            .is_none(),
-        "orphan pending slot must be removed by open-time recovery"
+        format!("{err:?}").contains("MetadataCommandLogConflict"),
+        "future-epoch pending slot should fail closed, got {err:?}"
     );
 }
