@@ -46,6 +46,8 @@ const BUCKET_DELETE_EXACT_BUCKET_PENDING_PROBE_PARALLELISM: usize = 8;
 const COMPLETED_MULTIPART_CLEANUP_WORK_BUDGET_MILLIS: u64 = 10_000;
 const BUCKET_DELETE_RESERVATION_DRAIN_WAIT_MILLIS: u64 = 1_000;
 const BUCKET_DELETE_DRAIN_LEASE_MILLIS: u64 = BUCKET_DELETE_BEGIN_WORK_BUDGET_MILLIS + 5_000;
+const BUCKET_DELETE_RESERVATION_WAIT_BLOCKED_CONTEXT: &str =
+    "bucket delete reservation wait blocked by durable bucket write reservation";
 const LIFECYCLE_SWEEP_ROOT_SCAN_LIMIT_PER_PG: usize = 1_024;
 const OBJECT_READ_SNAPSHOT_STALE_RETRY_LIMIT: usize = 16;
 const METADATA_COMMAND_APPLY_RETRY_BUDGET_MILLIS: u64 = 10_000;
@@ -3163,16 +3165,13 @@ impl super::StorageCluster {
     fn wait_for_durable_bucket_write_reservations_empty(
         &self,
         bucket: &BucketName,
+        client: &dyn BucketWriteReservationNodeClient,
+        drain: &super::DurableBucketWriteDrain,
         delete_started: std::time::Instant,
         work_budget: &mut super::RequestWorkBudget,
     ) -> Result<(), BucketWriteDrainError> {
         let started = std::time::Instant::now();
         loop {
-            self.check_bucket_delete_begin_work_budget(
-                bucket,
-                Some(delete_started),
-                "bucket delete reservation wait begin budget exhausted",
-            )?;
             let pg_id = self.bucket_metadata_pg_id(bucket);
             let node = self
                 .local_map
@@ -3184,26 +3183,51 @@ impl super::StorageCluster {
             if reservations.is_empty() {
                 return Ok(());
             }
+            if let Err(error) = self.check_bucket_delete_begin_work_budget(
+                bucket,
+                Some(delete_started),
+                "bucket delete reservation wait begin budget exhausted",
+            ) {
+                self.record_bucket_delete_reservation_wait_blocker(
+                    client,
+                    drain,
+                    &reservations,
+                    "begin budget exhausted",
+                );
+                let _ = error;
+                return Err(bucket_snapshot_error_to_bucket_write_drain_error(
+                    conflicting_pending_metadata_command(
+                        BUCKET_DELETE_RESERVATION_WAIT_BLOCKED_CONTEXT,
+                    ),
+                ));
+            }
             if started.elapsed()
                 >= std::time::Duration::from_millis(BUCKET_DELETE_RESERVATION_DRAIN_WAIT_MILLIS)
             {
-                let first = reservations
-                    .first()
-                    .expect("non-empty reservations should have a first record");
                 let _ = observability::event(
                     super::TRACE_TARGET,
                     "bucket_delete_reservation_wait_timeout",
                     Some(format_args!(
-                        "bucket={:?} pg_id={} reservations={} first_reservation_id={} first_operation_kind={} first_target_context={:?}",
+                        "bucket={:?} pg_id={} {}",
                         bucket,
                         pg_id,
-                        reservations.len(),
-                        first.reservation_id,
-                        first.operation_kind,
-                        first.target_context
+                        Self::bucket_delete_reservation_wait_blocker_detail(
+                            &reservations,
+                            "timeout",
+                        )
                     )),
                 );
-                return Err(MetadataError::BucketNotEmpty.into());
+                self.record_bucket_delete_reservation_wait_blocker(
+                    client,
+                    drain,
+                    &reservations,
+                    "timeout",
+                );
+                return Err(bucket_snapshot_error_to_bucket_write_drain_error(
+                    conflicting_pending_metadata_command(
+                        BUCKET_DELETE_RESERVATION_WAIT_BLOCKED_CONTEXT,
+                    ),
+                ));
             }
             self.drain_pending_object_metadata_commands_for_exact_bucket_on_all_pgs_with_budget(
                 bucket,
@@ -3214,6 +3238,45 @@ impl super::StorageCluster {
             crate::node::maybe_run_bucket_write_drain_wait_hook(bucket);
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
+    }
+
+    fn record_bucket_delete_reservation_wait_blocker(
+        &self,
+        client: &dyn BucketWriteReservationNodeClient,
+        drain: &super::DurableBucketWriteDrain,
+        reservations: &[BucketWriteReservationRecord],
+        reason: &'static str,
+    ) {
+        self.record_bucket_delete_attempt_outcome_for_drain_with_client(
+            client,
+            drain,
+            BucketDeleteAttemptOutcomeKind::Retryable,
+            BucketDeleteAttemptPhase::ReservationWait,
+            Self::bucket_delete_reservation_wait_blocker_detail(reservations, reason),
+        );
+    }
+
+    fn bucket_delete_reservation_wait_blocker_detail(
+        reservations: &[BucketWriteReservationRecord],
+        reason: &'static str,
+    ) -> String {
+        let now = crate::clock::current_time_millis();
+        let first = reservations
+            .first()
+            .expect("reservation-wait blocker detail requires at least one reservation");
+        let first_lease_state = match first.lease_deadline {
+            Some(deadline) if deadline <= now => "expired",
+            Some(_) => "live",
+            None => "none",
+        };
+        format!(
+            "reservation wait {reason}: reservations={} first_reservation_id={} first_operation_kind={} first_target_context={:?} first_lease_state={}",
+            reservations.len(),
+            first.reservation_id,
+            first.operation_kind,
+            first.target_context,
+            first_lease_state
+        )
     }
 
     pub(super) fn stream_upload_has_live_bucket_write_reservation(
@@ -4677,6 +4740,8 @@ impl super::StorageCluster {
                         );
                         self.wait_for_durable_bucket_write_reservations_empty(
                             bucket,
+                            node_store.bucket_write_reservation_client().as_ref(),
+                            &durable_drain,
                             started,
                             &mut work_budget,
                         )?;
@@ -5159,6 +5224,12 @@ impl super::StorageCluster {
                 Ok(())
             }
             Err(error) => {
+                let reservation_wait_blocker_already_recorded = matches!(
+                    error,
+                    BucketWriteDrainError::Store(StoreError::MetadataCommandContention {
+                        context: BUCKET_DELETE_RESERVATION_WAIT_BLOCKED_CONTEXT,
+                    })
+                );
                 let _ = observability::emit_flight_event(
                     super::TRACE_TARGET,
                     "bucket_delete_begin_failed",
@@ -5247,13 +5318,15 @@ impl super::StorageCluster {
                             );
                         }
                     }
-                    self.record_bucket_delete_attempt_outcome_for_drain_with_client(
-                        node_store.bucket_write_reservation_client().as_ref(),
-                        &durable_drain,
-                        BucketDeleteAttemptOutcomeKind::Retryable,
-                        attempt_phase,
-                        format!("retryable begin error: {error:?}"),
-                    );
+                    if !reservation_wait_blocker_already_recorded {
+                        self.record_bucket_delete_attempt_outcome_for_drain_with_client(
+                            node_store.bucket_write_reservation_client().as_ref(),
+                            &durable_drain,
+                            BucketDeleteAttemptOutcomeKind::Retryable,
+                            attempt_phase,
+                            format!("retryable begin error: {error:?}"),
+                        );
+                    }
                     let _ = observability::event(
                         super::TRACE_TARGET,
                         "bucket_delete_begin_preserved_retryable_attempt",
@@ -5268,13 +5341,15 @@ impl super::StorageCluster {
                         current_bucket_incarnation_generation,
                     );
                 } else {
-                    self.record_bucket_delete_attempt_outcome_for_drain_with_client(
-                        node_store.bucket_write_reservation_client().as_ref(),
-                        &durable_drain,
-                        BucketDeleteAttemptOutcomeKind::Retryable,
-                        attempt_phase,
-                        format!("retryable begin error: {error:?}"),
-                    );
+                    if !reservation_wait_blocker_already_recorded {
+                        self.record_bucket_delete_attempt_outcome_for_drain_with_client(
+                            node_store.bucket_write_reservation_client().as_ref(),
+                            &durable_drain,
+                            BucketDeleteAttemptOutcomeKind::Retryable,
+                            attempt_phase,
+                            format!("retryable begin error: {error:?}"),
+                        );
+                    }
                     let _ = observability::event(
                         super::TRACE_TARGET,
                         "bucket_delete_begin_preserved_retryable_attempt",

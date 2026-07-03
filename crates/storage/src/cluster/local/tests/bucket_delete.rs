@@ -2804,7 +2804,7 @@ fn begin_bucket_delete_waits_for_durable_reservation_and_post_drains_visible_wri
 }
 
 #[test]
-fn begin_bucket_delete_bounds_orphaned_durable_reservation_wait() {
+fn begin_bucket_delete_records_reservation_wait_blocker_and_adopts_after_release() {
     let tmp = test_util::tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
     let ec_shape = EcShape { k: 2, m: 1 };
@@ -2840,9 +2840,9 @@ fn begin_bucket_delete_bounds_orphaned_durable_reservation_wait() {
     assert!(
         matches!(
             err,
-            crate::BucketWriteDrainError::Metadata(crate::MetadataError::BucketNotEmpty)
+            crate::BucketWriteDrainError::Store(StoreError::MetadataCommandContention { .. })
         ),
-        "orphaned durable reservation should make DeleteBucket retryable, got {err:?}"
+        "blocked durable reservation should make DeleteBucket retryable, got {err:?}"
     );
     let bucket_pg = map
         .node(NodeId::new(1))
@@ -2853,8 +2853,8 @@ fn begin_bucket_delete_bounds_orphaned_durable_reservation_wait() {
     assert!(
         crate::PgMetadataStore::durable_bucket_write_drain(&*bucket_pg, &bucket)
             .unwrap()
-            .is_none(),
-        "failed DeleteBucket should clear its temporary durable drain"
+            .is_some(),
+        "retryable reservation-wait failure should preserve the durable drain"
     );
     assert_eq!(
         crate::PgMetadataStore::durable_bucket_write_reservations(&*bucket_pg, &bucket)
@@ -2863,12 +2863,55 @@ fn begin_bucket_delete_bounds_orphaned_durable_reservation_wait() {
         1,
         "DeleteBucket must not silently drop another operation's durable reservation"
     );
+    let outcome = crate::PgMetadataStore::bucket_delete_attempt_outcome(&*bucket_pg, &bucket)
+        .unwrap()
+        .expect("reservation-wait blocker should be recorded durably");
+    assert_eq!(
+        outcome.outcome,
+        crate::BucketDeleteAttemptOutcomeKind::Retryable
+    );
+    assert_eq!(
+        outcome.phase,
+        crate::BucketDeleteAttemptPhase::ReservationWait
+    );
+    assert!(
+        outcome.detail.contains("reservation wait timeout"),
+        "unexpected reservation-wait detail: {}",
+        outcome.detail
+    );
+    assert!(
+        outcome.detail.contains("reservations=1")
+            && outcome
+                .detail
+                .contains("first_operation_kind=test-orphaned-write")
+            && outcome
+                .detail
+                .contains("first_target_context=Some(\"orphaned-key\")"),
+        "reservation-wait detail should identify the blocking reservation: {}",
+        outcome.detail
+    );
     drop(bucket_pg);
 
     cluster
         .release_durable_bucket_write_reservation(reservation)
         .unwrap();
     cluster.begin_bucket_delete(&bucket).unwrap();
+    let bucket_pg = map
+        .node(NodeId::new(1))
+        .unwrap()
+        .storage_node()
+        .get_pg(1)
+        .unwrap();
+    let info = crate::PgMetadataStore::head_bucket_raw(&*bucket_pg, &bucket).unwrap();
+    assert_eq!(info.state, crate::BucketState::Deleting);
+    let outcome = crate::PgMetadataStore::bucket_delete_attempt_outcome(&*bucket_pg, &bucket)
+        .unwrap()
+        .expect("adopted retry should record terminal outcome");
+    assert_eq!(
+        outcome.outcome,
+        crate::BucketDeleteAttemptOutcomeKind::MarkDeleting
+    );
+    assert_eq!(outcome.phase, crate::BucketDeleteAttemptPhase::MarkDeleting);
 }
 
 #[test]

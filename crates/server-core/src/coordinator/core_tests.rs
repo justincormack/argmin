@@ -976,6 +976,10 @@ fn reclaim_worker_retries_bucket_delete_begin_after_early_route_map_failure() {
 
 #[test]
 fn bucket_delete_begin_marks_deleting_on_retained_route_after_runtime_map_primary_move() {
+    let _storage_serial = STORAGE_TEST_HOOK_SERIAL
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap();
     let tmp = test_util::tempdir();
     let bucket = trusted_bucket_name("bucket-delete-begin-retained-route");
     let initial = open_test_storage_cluster(tmp.path(), &[0, 1, 2]);

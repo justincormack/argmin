@@ -9211,10 +9211,19 @@ Keep an explicit Phase 11 close-out before treating the phase as soak-clean:
          bucket-write-drain wait hook fatal, proving the retry reaches adoption
          without spending its budget behind its own preserved drain; a storage
          regression proves active raw authorization is withheld until older
-         bucket writes drain. Remaining
-         work is to make `reservation_wait` convergence itself expose durable
-         progress or a concrete blocker instead of repeatedly surfacing generic
-         retryable pressure when reservations persist.
+         bucket writes drain. `reservation_wait` now records the concrete
+         blocking bucket-write reservation before returning retryable pressure:
+         the durable attempt row stays in phase `reservation_wait` and includes
+         the reservation count, first reservation id, operation kind, target
+         context, and lease state. The wait timeout now preserves the active
+         delete attempt as retryable contention rather than rolling the drain
+         back as `BucketNotEmpty`; a storage regression holds a reservation,
+         verifies the durable blocker detail, releases the reservation, and
+         proves the same preserved attempt is adopted and reaches
+         `MarkBucketDeleting`. Remaining
+         work is to see from soak whether persistent reservation blockers now
+         identify a real stuck write path that needs help/cleanup, or whether
+         this closes the generic retryable-pressure failure mode.
          Final-visibility
          adoption now also has coordinator-level reclaim-worker regressions that
          seed durable `final_visibility_check` and `final_visibility_proven`
