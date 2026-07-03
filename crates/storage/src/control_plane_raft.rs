@@ -6647,7 +6647,7 @@ mod tests {
     use std::future::Future;
     use std::os::unix::net::{UnixListener, UnixStream};
     use std::sync::{
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc,
     };
     use std::thread;
@@ -7457,6 +7457,75 @@ mod tests {
         ))
     }
 
+    struct TestUnixPeerListener {
+        socket_path: PathBuf,
+        stop: Arc<AtomicBool>,
+        worker: Option<thread::JoinHandle<()>>,
+    }
+
+    impl TestUnixPeerListener {
+        fn spawn(
+            socket_path: PathBuf,
+            authority: Arc<ControlPlaneRaftAuthority>,
+            local_node_id: ControlPlaneRaftNodeId,
+            policy: ControlPlaneRaftPeerTransportPolicy,
+        ) -> Self {
+            let _ = std::fs::remove_file(&socket_path);
+            let listener = UnixListener::bind(&socket_path).unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let stop = Arc::new(AtomicBool::new(false));
+            let worker_stop = Arc::clone(&stop);
+            let worker_socket_path = socket_path.clone();
+            let policy = Arc::new(policy);
+            let worker = thread::spawn(move || {
+                while !worker_stop.load(Ordering::Acquire) {
+                    match listener.accept() {
+                        Ok((mut stream, _)) => {
+                            let result = ControlPlaneRaftTypeConfig::run(async {
+                                handle_control_plane_raft_peer_unix_stream_from_configured_peer(
+                                    authority.raft(),
+                                    &mut stream,
+                                    local_node_id,
+                                    &policy,
+                                    Duration::from_secs(1),
+                                )
+                                .await
+                            });
+                            if let Err(error) = result {
+                                eprintln!(
+                                    "test OpenRaft Unix peer listener {local_node_id} failed: {error}"
+                                );
+                            }
+                        }
+                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                            thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(error) => panic!(
+                            "test OpenRaft Unix peer listener {local_node_id} accept failed: {error}"
+                        ),
+                    }
+                }
+                let _ = std::fs::remove_file(worker_socket_path);
+            });
+
+            Self {
+                socket_path,
+                stop,
+                worker: Some(worker),
+            }
+        }
+    }
+
+    impl Drop for TestUnixPeerListener {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Release);
+            let _ = UnixStream::connect(&self.socket_path);
+            if let Some(worker) = self.worker.take() {
+                worker.join().unwrap();
+            }
+        }
+    }
+
     #[test]
     fn control_plane_raft_peer_rpc_append_entries_request_frame_round_trips() {
         let request = AppendEntriesRequest {
@@ -8133,6 +8202,118 @@ mod tests {
             );
             server.join().unwrap();
             let _ = std::fs::remove_file(socket_path);
+        });
+    }
+
+    #[test]
+    fn control_plane_openraft_unix_peer_two_node_client_write_replicates_to_follower() {
+        ControlPlaneRaftTypeConfig::run(async {
+            let tmp = test_util::tempdir();
+            let node1_socket = raft_unix_socket_path("two-node-replication-node-1");
+            let node2_socket = raft_unix_socket_path("two-node-replication-node-2");
+            let cluster_name = "control-plane-raft-unix-peer-two-node-replication-test";
+            let policy = ControlPlaneRaftPeerTransportPolicy::from_peer_endpoints(
+                cluster_name,
+                [
+                    (1, node1_socket.display().to_string()),
+                    (2, node2_socket.display().to_string()),
+                ],
+                ControlPlaneRaftPeerTransportLimits::default(),
+            );
+            let authority1 = Arc::new(
+                ControlPlaneRaftAuthority::new_experimental_unix_peer_durable(
+                    cluster_name,
+                    1,
+                    &tmp.path().join("node-1.state"),
+                    policy.clone(),
+                    Duration::from_secs(1),
+                )
+                .await
+                .unwrap(),
+            );
+            let authority2 = Arc::new(
+                ControlPlaneRaftAuthority::new_experimental_unix_peer_durable(
+                    cluster_name,
+                    2,
+                    &tmp.path().join("node-2.state"),
+                    policy.clone(),
+                    Duration::from_secs(1),
+                )
+                .await
+                .unwrap(),
+            );
+            let listener1 = TestUnixPeerListener::spawn(
+                node1_socket,
+                Arc::clone(&authority1),
+                1,
+                policy.clone(),
+            );
+            let listener2 = TestUnixPeerListener::spawn(
+                node2_socket,
+                Arc::clone(&authority2),
+                2,
+                policy.clone(),
+            );
+
+            authority1
+                .initialize_membership(policy.peers())
+                .await
+                .unwrap();
+            authority1
+                .wait_for_current_leader(
+                    1,
+                    Duration::from_secs(1),
+                    "Unix-peer two-node initialized leadership",
+                )
+                .await
+                .unwrap();
+
+            let write = authority1
+                .submit_control_plane_command(ControlPlaneCommand::BootstrapInitialClusterMap {
+                    nodes: vec![
+                        (NodeId::new(1), "node-1".to_string()),
+                        (NodeId::new(2), "node-2".to_string()),
+                    ],
+                    pg_ids: vec![PgId::new(0)],
+                })
+                .await
+                .unwrap();
+            assert!(matches!(
+                write.outcome(),
+                ControlPlaneRaftCommandOutcome::Applied(
+                    ControlPlaneCommandResponse::BootstrapInitialClusterMap
+                )
+            ));
+
+            authority2
+                .wait_for_applied_log_id(
+                    write.log_id(),
+                    Duration::from_secs(1),
+                    "Unix-peer two-node follower applied client write",
+                )
+                .await
+                .unwrap();
+            let follower_state = authority2
+                .raft()
+                .with_state_machine(|state_machine| {
+                    let last_applied = state_machine.last_applied();
+                    let node_ids = state_machine
+                        .inner()
+                        .snapshot()
+                        .nodes()
+                        .map(|node| node.node_id())
+                        .collect::<Vec<_>>();
+                    Box::pin(async move { (last_applied, node_ids) })
+                })
+                .await
+                .unwrap();
+            assert_eq!(follower_state.0, Some(write.log_id()));
+            assert_eq!(follower_state.1, vec![NodeId::new(1), NodeId::new(2)]);
+
+            drop(listener1);
+            drop(listener2);
+            authority1.shutdown().await.unwrap();
+            authority2.shutdown().await.unwrap();
         });
     }
 

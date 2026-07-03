@@ -10455,6 +10455,13 @@ Phase 12.3 progress:
   for local leadership before bootstrap/client-write paths run; only a
   multi-node peer policy starts follower-capable without requiring this process
   to be the current leader.
+- Added the first end-to-end OpenRaft replication smoke over the Unix peer
+  transport. The test starts two durable experimental authorities with real
+  Unix peer sockets, serves incoming peer frames through the same configured
+  listener handler as the process path, initializes a two-voter membership,
+  commits a control-plane command on the leader, and proves the follower applies
+  the committed command through the socket transport. Full process supervision
+  and failover remain the next layer.
 
 1. define the replicated control-plane state machine:
    - state includes cluster epoch, PG count, PG state, PG acting sets, node
