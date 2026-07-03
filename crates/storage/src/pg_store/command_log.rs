@@ -3466,6 +3466,8 @@ impl PgStore {
                 actual_digest,
             });
         }
+        let state = self.metadata_command_replica_state()?;
+        self.validate_metadata_command_record_position(node_id, command, &state)?;
 
         let Some(entry) = self.load_metadata_command_log_entry(
             "load metadata command log entry",
@@ -3474,6 +3476,9 @@ impl PgStore {
             command.id().log_index(),
         )?
         else {
+            if !Self::metadata_command_is_next_record_position(command, &state) {
+                return Err(self.metadata_command_log_conflict(node_id, command));
+            }
             return Ok(MetadataCommandAcceptance::Apply);
         };
         if self.metadata_command_log_entry_matches(node_id, command, &entry, false)? {
@@ -3506,6 +3511,8 @@ impl PgStore {
                 actual_digest,
             });
         }
+        let state = self.metadata_command_replica_state()?;
+        self.validate_metadata_command_record_position(node_id, command, &state)?;
         let Some(entry) = self.load_metadata_command_log_entry(
             "load metadata command abandon log entry",
             command.id().cluster_epoch(),
@@ -3513,6 +3520,9 @@ impl PgStore {
             command.id().log_index(),
         )?
         else {
+            if !Self::metadata_command_is_next_record_position(command, &state) {
+                return Err(self.metadata_command_log_conflict(node_id, command));
+            }
             return Ok(MetadataCommandAcceptance::Apply);
         };
         if self.metadata_command_log_entry_matches(node_id, command, &entry, true)? {
@@ -3541,6 +3551,60 @@ impl PgStore {
         self.metadata_command_log_entry_matches(node_id, command, &entry, true)
     }
 
+    fn validate_metadata_command_record_position(
+        &self,
+        node_id: u32,
+        command: &MetadataCommandEnvelope,
+        state: &MetadataCommandReplicaState,
+    ) -> Result<(), StoreError> {
+        let command_epoch = command.id().cluster_epoch();
+        if command_epoch < state.cluster_epoch {
+            return Err(StoreError::StaleMetadataCommand {
+                node_id,
+                pg_id: self.pg_id,
+                command_epoch,
+                current_epoch: state.cluster_epoch,
+            });
+        }
+
+        let log_index = command.id().log_index().get();
+        let expected_log_index = if command_epoch == state.cluster_epoch {
+            state
+                .applied_log_index
+                .checked_add(1)
+                .expect("metadata command log index overflow")
+        } else {
+            1
+        };
+        if log_index > expected_log_index {
+            return Err(StoreError::MetadataCommandLogGap {
+                node_id,
+                pg_id: self.pg_id,
+                cluster_epoch: command_epoch,
+                log_index,
+                expected_log_index,
+            });
+        }
+        Ok(())
+    }
+
+    fn metadata_command_is_next_record_position(
+        command: &MetadataCommandEnvelope,
+        state: &MetadataCommandReplicaState,
+    ) -> bool {
+        let command_epoch = command.id().cluster_epoch();
+        let log_index = command.id().log_index().get();
+        let expected_log_index = if command_epoch == state.cluster_epoch {
+            state
+                .applied_log_index
+                .checked_add(1)
+                .expect("metadata command log index overflow")
+        } else {
+            1
+        };
+        log_index == expected_log_index
+    }
+
     #[cfg(test)]
     pub(crate) fn record_metadata_command_applied(
         &self,
@@ -3563,6 +3627,21 @@ impl PgStore {
                 target_pg_id: self.pg_id,
                 cluster_epoch: command.id().cluster_epoch(),
             });
+        }
+        let state = self.metadata_command_replica_state()?;
+        self.validate_metadata_command_record_position(node_id, command, &state)?;
+        if command.id().cluster_epoch() == state.cluster_epoch
+            && command.id().log_index().get() <= state.applied_log_index
+            && self
+                .load_metadata_command_log_entry(
+                    "load already-applied metadata command log entry",
+                    command.id().cluster_epoch(),
+                    command.id().pg_id(),
+                    command.id().log_index(),
+                )?
+                .is_none()
+        {
+            return Err(self.metadata_command_log_conflict(node_id, command));
         }
         let command_bytes = command.command_bytes();
         let inserted = self.execute_cached(
@@ -3648,6 +3727,21 @@ impl PgStore {
                 target_pg_id: self.pg_id,
                 cluster_epoch: command.id().cluster_epoch(),
             });
+        }
+        let state = self.metadata_command_replica_state()?;
+        self.validate_metadata_command_record_position(node_id, command, &state)?;
+        if command.id().cluster_epoch() == state.cluster_epoch
+            && command.id().log_index().get() <= state.applied_log_index
+            && self
+                .load_metadata_command_log_entry(
+                    "load already-abandoned metadata command log entry",
+                    command.id().cluster_epoch(),
+                    command.id().pg_id(),
+                    command.id().log_index(),
+                )?
+                .is_none()
+        {
+            return Err(self.metadata_command_log_conflict(node_id, command));
         }
         let command_bytes = command.abandoned_log_bytes();
         let command_checksum = command.abandoned_log_checksum_crc64();
@@ -3885,6 +3979,14 @@ impl PgStore {
     ) -> Result<MetadataCommandRecordResult, StoreError> {
         let mut state = self.metadata_command_replica_state()?;
         if state.cluster_epoch != cluster_epoch {
+            if cluster_epoch < state.cluster_epoch {
+                return Err(StoreError::StaleMetadataCommand {
+                    node_id,
+                    pg_id: self.pg_id,
+                    command_epoch: cluster_epoch,
+                    current_epoch: state.cluster_epoch,
+                });
+            }
             let base_state_digest = state.state_digest;
             self.refresh_all_metadata_table_digests()?;
             state = MetadataCommandReplicaState {

@@ -8344,6 +8344,9 @@ impl StorageNodeConnectionHandler {
         request: StorageRpcMetadataCommandRequest,
         allowed_states: &[PgState],
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
+        if let Err(error) = validate_metadata_command_request_epoch(&request) {
+            return encode_storage_rpc_error_response(&error);
+        }
         if let Err(error) = self.validate_pg_route_with_allowed_states(
             request.node_id,
             request.cluster_epoch,
@@ -8508,6 +8511,9 @@ impl StorageNodeConnectionHandler {
         session: &StorageNodeSession<'_>,
         request: StorageRpcMetadataCommandRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
+        if let Err(error) = validate_metadata_command_request_epoch(&request) {
+            return encode_storage_rpc_error_response(&error);
+        }
         if let Err(error) =
             self.validate_pg_route(request.node_id, request.cluster_epoch, request.pg_id)
         {
@@ -8560,6 +8566,9 @@ impl StorageNodeConnectionHandler {
         session: &StorageNodeSession<'_>,
         request: StorageRpcMetadataCommandRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
+        if let Err(error) = validate_metadata_command_request_epoch(&request) {
+            return encode_storage_rpc_error_response(&error);
+        }
         if let Err(error) =
             self.validate_pg_route(request.node_id, request.cluster_epoch, request.pg_id)
         {
@@ -10048,6 +10057,23 @@ fn validate_placed_segment_shard_backfill_claim_route_epoch(
             pg_id: pg_id.get(),
             operation_epoch: claim.cluster_epoch,
             current_epoch: route_epoch,
+        });
+    }
+    Ok(())
+}
+
+fn validate_metadata_command_request_epoch(
+    request: &StorageRpcMetadataCommandRequest,
+) -> Result<(), StorageRpcErrorResponse> {
+    let command_epoch = request.command.id().cluster_epoch();
+    if command_epoch != request.cluster_epoch {
+        return Err(StorageRpcErrorResponse {
+            code: StorageRpcErrorCode::PayloadDecode,
+            message: format!(
+                "metadata command epoch {} does not match request route epoch {}",
+                command_epoch.get(),
+                request.cluster_epoch.get()
+            ),
         });
     }
     Ok(())
@@ -15538,6 +15564,31 @@ mod tests {
             .unwrap()
             .unwrap_err();
         assert_eq!(error.code, StorageRpcErrorCode::StaleShardLocation);
+    }
+
+    #[test]
+    fn metadata_command_rpc_rejects_command_epoch_mismatch_before_acceptance() {
+        let request = StorageRpcMetadataCommandRequest {
+            node_id: NodeId::new(7),
+            cluster_epoch: ClusterEpoch::new(1).unwrap(),
+            pg_id: PgId::new(0),
+            command: MetadataCommandEnvelope::new(
+                MetadataCommandId::new(
+                    ClusterEpoch::new(2).unwrap(),
+                    PgId::new(0),
+                    MetadataCommandLogIndex::new(1).unwrap(),
+                ),
+                test_metadata_command(0, 1).payload().clone(),
+            ),
+        };
+
+        let error = validate_metadata_command_request_epoch(&request).unwrap_err();
+        assert_eq!(error.code, StorageRpcErrorCode::PayloadDecode);
+        assert!(error.message.contains("does not match request route epoch"));
+        assert!(matches!(
+            encode_metadata_command_request(&request),
+            Err(crate::storage_rpc::StorageRpcPayloadError::MetadataCommandRouteMismatch(_))
+        ));
     }
 
     #[test]

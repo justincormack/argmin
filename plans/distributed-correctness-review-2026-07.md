@@ -671,6 +671,12 @@ marking).
   tail without matching materialized state "is not recoverable and must fail
   closed"; the online path both creates that unrecoverable durable state and
   masks it in-process.
+- Status update: PgStore command acceptance/recording now rejects a fresh
+  non-contiguous log index before materialized metadata rows are mutated, and
+  the storage RPC codec/handler reject route epoch vs embedded command epoch
+  disagreement. Focused regressions cover gap-index apply rollback, stale
+  epoch rejection, and the RPC epoch boundary. This closes the concrete MD2
+  sparse-apply/digest-mask path.
 
 ### MD3. MEDIUM — No epoch fence at the PgStore layer; recording a command under a different epoch silently resets — including rewinding — the replica chain
 
@@ -691,6 +697,12 @@ reachability analysis.)
   route-map validity expires; any lease/clock bug lets a stale primary rewind
   a replica. Nothing legitimate ever needs a rewind (transfer paths install
   state through dedicated fenced entry points, `command_log.rs:1172-1579`).
+- Status update: PgStore now rejects `command_epoch <
+  replica_state.cluster_epoch` both at acceptance and at replica-state
+  advancement, so stale commands cannot rewind the durable replica chain.
+  Forward epoch adoption is still allowed for the first command in the new
+  epoch; making that require an explicit epoch-transition/transfer token
+  remains a follow-up.
 
 ### MD4. MEDIUM — Epoch-mismatched orphan cleanup can delete a future-epoch in-flight command's slot after nonzero replica apply
 
@@ -1191,11 +1203,13 @@ closes this.
    flip cannot ship silently.
 6. Contiguity enforcement at record time (`log_index == applied_log_index +
    1` unless the entry already exists) and fix the not-advanced
-   clean-revision marking (MD2); monotonic epoch guard in `PgStore` rejecting
-   `command_epoch < replica_state.cluster_epoch` with forward adoption gated
-   on an explicit transfer/epoch-transition token (MD3/CL3), plus a server
-   assert `request.cluster_epoch == command.id().cluster_epoch()`;
-   direction-aware orphan cleanup (MD4).
+   clean-revision marking (MD2) is implemented by rejecting the gap before
+   mutation; monotonic epoch guard in `PgStore` rejecting `command_epoch <
+   replica_state.cluster_epoch` and the server/codec assertion that
+   `request.cluster_epoch == command.id().cluster_epoch()` are implemented.
+   Remaining follow-ups: gate forward epoch adoption on an explicit
+   transfer/epoch-transition token (MD3/CL3), and direction-aware orphan
+   cleanup (MD4).
 7. I/O deadlines on the storage RPC layer (client connect/read/write; server
    per-frame read and response write) mirroring the Raft transport, plus a
    lease/deadline on the server-side metadata-command critical section

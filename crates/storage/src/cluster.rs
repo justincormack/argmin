@@ -10980,6 +10980,7 @@ fn metadata_command_checkpoint_record_error_kind(error: &StoreError) -> &'static
         StoreError::MetadataCommandWrongPg { .. } => "metadata_command_wrong_pg",
         StoreError::MetadataCommandFromNonPrimary { .. } => "metadata_command_from_non_primary",
         StoreError::MetadataCommandLogConflict { .. } => "metadata_command_log_conflict",
+        StoreError::MetadataCommandLogGap { .. } => "metadata_command_log_gap",
         StoreError::MetadataCommandPendingConflict { .. } => "metadata_command_pending_conflict",
         StoreError::StaleShardOperation { .. } => "stale_shard_operation",
         StoreError::StaleShardLocation { .. } => "stale_shard_location",

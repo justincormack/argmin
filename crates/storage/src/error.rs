@@ -180,6 +180,17 @@ pub enum StoreError {
     },
 
     #[error(
+        "metadata command for local node {node_id} PG {pg_id} epoch {cluster_epoch} has non-contiguous log index {log_index}, expected {expected_log_index}"
+    )]
+    MetadataCommandLogGap {
+        node_id: u32,
+        pg_id: u32,
+        cluster_epoch: ClusterEpoch,
+        log_index: u64,
+        expected_log_index: u64,
+    },
+
+    #[error(
         "metadata command pending slot for PG {pg_id} epoch {cluster_epoch} already contains log index {existing_log_index}, cannot install log index {candidate_log_index}"
     )]
     MetadataCommandPendingConflict {

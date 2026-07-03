@@ -3470,6 +3470,175 @@ fn metadata_command_apply_and_record_rolls_back_log_on_metadata_failure() {
 }
 
 #[test]
+fn metadata_command_acceptance_rejects_non_contiguous_log_index_before_mutation() {
+    let tmp = test_util::tempdir();
+    let store = PgStore::open(tmp.path(), 1).unwrap();
+    let first_bucket = trusted_bucket_name("contiguous-first");
+    let gap_bucket = trusted_bucket_name("contiguous-gap");
+    let first = create_bucket_probe_command(1, 1, first_bucket, 1);
+    let gap = create_bucket_probe_command(1, 3, gap_bucket.clone(), 2);
+
+    store.apply_metadata_command_and_record(0, &first).unwrap();
+
+    let acceptance_error = store.metadata_command_acceptance(0, &gap).unwrap_err();
+    assert!(
+        matches!(
+            acceptance_error,
+            StoreError::MetadataCommandLogGap {
+                node_id: 0,
+                pg_id: 1,
+                cluster_epoch,
+                log_index: 3,
+                expected_log_index: 2,
+            } if cluster_epoch == ClusterEpoch::INITIAL
+        ),
+        "expected non-contiguous command rejection, got {acceptance_error:?}"
+    );
+
+    let apply_error = store
+        .apply_metadata_command_and_record(0, &gap)
+        .unwrap_err();
+    assert!(
+        matches!(
+            apply_error,
+            BucketSnapshotLoadError::Store(StoreError::MetadataCommandLogGap {
+                node_id: 0,
+                pg_id: 1,
+                cluster_epoch,
+                log_index: 3,
+                expected_log_index: 2,
+            }) if cluster_epoch == ClusterEpoch::INITIAL
+        ),
+        "expected apply to fail before mutation, got {apply_error:?}"
+    );
+    assert!(
+        matches!(
+            store.head_bucket_raw(&gap_bucket).unwrap_err(),
+            MetadataError::BucketNotFound { .. }
+        ),
+        "gap command must not create materialized bucket rows"
+    );
+    let gap_log_count: u64 = store
+        .conn
+        .query_row(
+            "SELECT COUNT(*) FROM metadata_command_log WHERE log_index = 3",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(gap_log_count, 0, "gap command must not insert a log row");
+    let state = store.metadata_command_replica_state().unwrap();
+    assert_eq!(state.cluster_epoch, ClusterEpoch::INITIAL);
+    assert_eq!(state.applied_log_index, 1);
+}
+
+#[test]
+fn metadata_command_apply_rejects_stale_epoch_without_rewinding_replica_state() {
+    let tmp = test_util::tempdir();
+    let store = PgStore::open(tmp.path(), 1).unwrap();
+    let first = create_bucket_probe_command(1, 1, trusted_bucket_name("epoch-first"), 1);
+    store.apply_metadata_command_and_record(0, &first).unwrap();
+
+    let epoch_two = ClusterEpoch::new(2).unwrap();
+    let epoch_two_bucket = trusted_bucket_name("epoch-two");
+    let epoch_two_command = rebase_probe_commands(
+        epoch_two,
+        PgId::new(1),
+        &[create_bucket_probe_command(1, 1, epoch_two_bucket, 2)],
+    )
+    .pop()
+    .unwrap();
+    store
+        .apply_metadata_command_and_record(0, &epoch_two_command)
+        .unwrap();
+    let epoch_two_state = store.metadata_command_replica_state().unwrap();
+    assert_eq!(epoch_two_state.cluster_epoch, epoch_two);
+    assert_eq!(epoch_two_state.applied_log_index, 1);
+
+    let stale_bucket = trusted_bucket_name("epoch-stale");
+    let stale = create_bucket_probe_command(1, 2, stale_bucket.clone(), 3);
+    let err = store
+        .apply_metadata_command_and_record(0, &stale)
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            BucketSnapshotLoadError::Store(StoreError::StaleMetadataCommand {
+                node_id: 0,
+                pg_id: 1,
+                command_epoch,
+                current_epoch,
+            }) if command_epoch == ClusterEpoch::INITIAL && current_epoch == epoch_two
+        ),
+        "expected stale epoch command rejection, got {err:?}"
+    );
+    assert!(
+        matches!(
+            store.head_bucket_raw(&stale_bucket).unwrap_err(),
+            MetadataError::BucketNotFound { .. }
+        ),
+        "stale epoch command must not mutate materialized rows"
+    );
+    assert_eq!(
+        store.metadata_command_replica_state().unwrap(),
+        epoch_two_state
+    );
+}
+
+#[test]
+fn metadata_command_acceptance_rejects_missing_already_applied_log_entry() {
+    let tmp = test_util::tempdir();
+    let store = PgStore::open(tmp.path(), 1).unwrap();
+    let first_bucket = trusted_bucket_name("missing-old-first");
+    let second_bucket = trusted_bucket_name("missing-old-second");
+    let first = create_bucket_probe_command(1, 1, first_bucket.clone(), 1);
+    let second = create_bucket_probe_command(1, 2, second_bucket, 2);
+
+    store.apply_metadata_command_and_record(0, &first).unwrap();
+    store.apply_metadata_command_and_record(0, &second).unwrap();
+    store
+        .conn
+        .execute(
+            "DELETE FROM metadata_command_log WHERE cluster_epoch = ?1 AND pg_id = ?2 AND log_index = ?3",
+            params![ClusterEpoch::INITIAL.get() as i64, 1_i64, 1_i64],
+        )
+        .unwrap();
+
+    let acceptance_error = store.metadata_command_acceptance(0, &first).unwrap_err();
+    assert!(
+        matches!(
+            acceptance_error,
+            StoreError::MetadataCommandLogConflict {
+                node_id: 0,
+                pg_id: 1,
+                cluster_epoch: ClusterEpoch::INITIAL,
+                log_index: 1,
+            }
+        ),
+        "missing old log row must fail closed, got {acceptance_error:?}"
+    );
+    let apply_error = store
+        .apply_metadata_command_and_record(0, &first)
+        .unwrap_err();
+    assert!(
+        matches!(
+            apply_error,
+            BucketSnapshotLoadError::Store(StoreError::MetadataCommandLogConflict {
+                node_id: 0,
+                pg_id: 1,
+                cluster_epoch: ClusterEpoch::INITIAL,
+                log_index: 1,
+            })
+        ),
+        "missing old log row must fail before reapplying, got {apply_error:?}"
+    );
+    let state = store.metadata_command_replica_state().unwrap();
+    assert_eq!(state.applied_log_index, 2);
+    let info = store.head_bucket_raw(&first_bucket).unwrap();
+    assert_eq!(info.name, first_bucket);
+}
+
+#[test]
 fn retained_metadata_command_log_entries_returns_applied_payloads() {
     let tmp = test_util::tempdir();
     let store = PgStore::open(tmp.path(), 1).unwrap();
@@ -5445,7 +5614,7 @@ fn metadata_command_log_prefix_rejects_row_key_and_kind_mismatch() {
             ],
         )
         .unwrap();
-    let next_command = create_bucket_probe_command(1, 2, trusted_bucket_name("next"), 1);
+    let next_command = create_bucket_probe_command(1, 1, trusted_bucket_name("next"), 1);
     let err = store
         .record_metadata_command_applied(0, &next_command)
         .unwrap_err();
@@ -5476,7 +5645,7 @@ fn metadata_command_log_prefix_rejects_row_key_and_kind_mismatch() {
             ],
         )
         .unwrap();
-    let next_command = create_bucket_probe_command(1, 2, trusted_bucket_name("next"), 1);
+    let next_command = create_bucket_probe_command(1, 1, trusted_bucket_name("applied"), 1);
     let err = store
         .record_metadata_command_applied(0, &next_command)
         .unwrap_err();
@@ -5514,7 +5683,7 @@ fn metadata_command_log_prefix_rejects_malformed_applied_bytes() {
             ],
         )
         .unwrap();
-    let next_command = create_bucket_probe_command(1, 2, trusted_bucket_name("next"), 1);
+    let next_command = create_bucket_probe_command(1, 1, trusted_bucket_name("malformed"), 1);
     let err = store
         .record_metadata_command_applied(0, &next_command)
         .unwrap_err();

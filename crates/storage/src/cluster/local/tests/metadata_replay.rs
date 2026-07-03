@@ -1100,7 +1100,7 @@ fn metadata_command_apply_validates_origin_and_duplicate_conflict_without_mutati
 }
 
 #[test]
-fn metadata_command_apply_accepts_unseen_lower_index_after_higher_index() {
+fn metadata_command_apply_rejects_unseen_higher_index_without_mutation() {
     let tmp = test_util::tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
     let ec_shape = EcShape { k: 2, m: 1 };
@@ -1119,16 +1119,31 @@ fn metadata_command_apply_accepts_unseen_lower_index_after_higher_index() {
     let earlier_command = create_bucket_metadata_command(PgId::new(1), 1, earlier_bucket.clone());
     let later_command = create_bucket_metadata_command(PgId::new(1), 2, later_bucket.clone());
 
-    cluster
+    let err = cluster
         .test_apply_metadata_command_to_acting_set_from_origin(NodeId::new(1), &later_command)
-        .unwrap();
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            crate::BucketSnapshotLoadError::Store(StoreError::MetadataCommandLogGap {
+                node_id: 1,
+                pg_id: 1,
+                cluster_epoch: ClusterEpoch::INITIAL,
+                log_index: 2,
+                expected_log_index: 1,
+            })
+        ),
+        "expected non-contiguous metadata command to fail closed, got {err:?}"
+    );
     for node_id in node_ids {
         let pg = map.node(node_id).unwrap().storage_node().get_pg(1).unwrap();
         let state = pg.metadata_command_replica_state().unwrap();
         assert_eq!(state.applied_log_index, 0);
         assert_eq!(state.applied_log_hash, 0);
-        let later = crate::PgMetadataStore::head_bucket(&*pg, &later_bucket).unwrap();
-        assert_eq!(later.name, later_bucket);
+        assert!(matches!(
+            crate::PgMetadataStore::head_bucket(&*pg, &later_bucket),
+            Err(crate::MetadataError::BucketNotFound { .. })
+        ));
     }
 
     cluster
@@ -1142,22 +1157,17 @@ fn metadata_command_apply_accepts_unseen_lower_index_after_higher_index() {
         0,
         earlier_command.checksum_crc64(),
     );
-    let second_hash = metadata_command_log_hash(
-        ClusterEpoch::INITIAL,
-        PgId::new(1),
-        MetadataCommandLogIndex::new(2).unwrap(),
-        first_hash,
-        later_command.checksum_crc64(),
-    );
     for node_id in node_ids {
         let pg = map.node(node_id).unwrap().storage_node().get_pg(1).unwrap();
         let state = pg.metadata_command_replica_state().unwrap();
-        assert_eq!(state.applied_log_index, 2);
-        assert_eq!(state.applied_log_hash, second_hash);
+        assert_eq!(state.applied_log_index, 1);
+        assert_eq!(state.applied_log_hash, first_hash);
         let earlier = crate::PgMetadataStore::head_bucket(&*pg, &earlier_bucket).unwrap();
         assert_eq!(earlier.name, earlier_bucket);
-        let later = crate::PgMetadataStore::head_bucket(&*pg, &later_bucket).unwrap();
-        assert_eq!(later.name, later_bucket);
+        assert!(matches!(
+            crate::PgMetadataStore::head_bucket(&*pg, &later_bucket),
+            Err(crate::MetadataError::BucketNotFound { .. })
+        ));
     }
 }
 
