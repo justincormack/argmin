@@ -938,8 +938,10 @@ impl ClusterControlSnapshot {
                     if !metadata_proof_satisfies_active_primary_observation_floor(
                         expected,
                         observation.metadata_proof,
-                        pg.active_metadata_transfer_imported,
-                        pg.active_metadata_proof_epoch,
+                        metadata_proof_progress_provenance(
+                            pg.active_metadata_transfer_imported,
+                            pg.active_metadata_proof_epoch,
+                        ),
                         observation.observed_epoch,
                     ) {
                         return Err(format!(
@@ -1389,8 +1391,10 @@ impl ControlPlaneCommandStateMachine for ClusterControlSnapshot {
                     if metadata_proof_satisfies_active_primary_observation_floor(
                         current_proof,
                         observation.metadata_proof,
-                        pg.active_metadata_transfer_imported,
-                        pg.active_metadata_proof_epoch,
+                        metadata_proof_progress_provenance(
+                            pg.active_metadata_transfer_imported,
+                            pg.active_metadata_proof_epoch,
+                        ),
                         heartbeat.observed_epoch,
                     ) && observation.metadata_proof != current_proof
                     {
@@ -1594,30 +1598,37 @@ impl ControlPlaneCommandStateMachine for ClusterControlSnapshot {
                 let metadata_transfer_fenced = record.metadata_transfer_fenced;
                 let metadata_transfer_fence_source_imported =
                     record.metadata_transfer_fence_source_imported;
-                let required_floor = match state {
-                    PgState::Active => record.active_metadata_proof.ok_or(
-                        ControlPlaneError::ActivePgMissingMetadataProof { pg_id: pg_id.get() },
-                    )?,
-                    PgState::Peering => record.peering_metadata_proof_floor.ok_or(
-                        ControlPlaneError::PgMetadataMigrationRequiresTransfer {
-                            pg_id: pg_id.get(),
-                        },
-                    )?,
+                let (required_floor, required_floor_epoch) = match state {
+                    PgState::Active => (
+                        record.active_metadata_proof.ok_or(
+                            ControlPlaneError::ActivePgMissingMetadataProof { pg_id: pg_id.get() },
+                        )?,
+                        record.active_metadata_proof_epoch,
+                    ),
+                    PgState::Peering => (
+                        record.peering_metadata_proof_floor.ok_or(
+                            ControlPlaneError::PgMetadataMigrationRequiresTransfer {
+                                pg_id: pg_id.get(),
+                            },
+                        )?,
+                        record.peering_metadata_proof_floor_epoch,
+                    ),
                     _ => {
                         return Err(ControlPlaneError::PgMetadataMigrationRequiresTransfer {
                             pg_id: pg_id.get(),
                         });
                     }
                 };
-                validate_metadata_transfer_proof(
-                    self,
+                validate_metadata_transfer_proof(MetadataTransferProofValidation {
+                    snapshot: self,
                     pg_id,
                     state,
                     metadata_transfer_fenced,
                     metadata_transfer_fence_source_imported,
                     required_floor,
+                    required_floor_epoch,
                     transfer,
-                )?;
+                })?;
                 let source_route_epoch = self.cluster_epoch;
                 let source_node_id =
                     match state {
@@ -6662,8 +6673,10 @@ fn validate_current_pg_observations(
                 if !metadata_proof_satisfies_active_primary_observation_floor(
                     expected,
                     observation.metadata_proof,
-                    pg.active_metadata_transfer_imported,
-                    pg.active_metadata_proof_epoch,
+                    metadata_proof_progress_provenance(
+                        pg.active_metadata_transfer_imported,
+                        pg.active_metadata_proof_epoch,
+                    ),
                     observation.observed_epoch,
                 ) {
                     return Err(parse_error(
@@ -7500,8 +7513,10 @@ fn validate_pg_heartbeat_observations(
             if !metadata_proof_satisfies_active_primary_observation_floor(
                 expected,
                 observation.metadata_proof,
-                pg.active_metadata_transfer_imported,
-                pg.active_metadata_proof_epoch,
+                metadata_proof_progress_provenance(
+                    pg.active_metadata_transfer_imported,
+                    pg.active_metadata_proof_epoch,
+                ),
                 snapshot.cluster_epoch,
             ) {
                 return Err(ControlPlaneError::PgActiveMetadataProofMismatch {
@@ -7653,18 +7668,42 @@ fn metadata_proof_satisfies_active_observation_floor(
     metadata_proof_satisfies_active_floor(active_floor, observed)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MetadataProofProgressKind {
+    LocalEpoch,
+    ImportedTransfer,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MetadataProofProgressProvenance {
+    floor_epoch: ClusterEpoch,
+    kind: MetadataProofProgressKind,
+}
+
+fn metadata_proof_progress_provenance(
+    imported_transfer: bool,
+    floor_epoch: Option<ClusterEpoch>,
+) -> Option<MetadataProofProgressProvenance> {
+    floor_epoch.map(|floor_epoch| MetadataProofProgressProvenance {
+        floor_epoch,
+        kind: if imported_transfer {
+            MetadataProofProgressKind::ImportedTransfer
+        } else {
+            MetadataProofProgressKind::LocalEpoch
+        },
+    })
+}
+
 fn metadata_proof_satisfies_active_primary_observation_floor(
     active_floor: PgMetadataProof,
     observed: PgMetadataProof,
-    active_metadata_transfer_imported: bool,
-    active_floor_epoch: Option<ClusterEpoch>,
+    progress_provenance: Option<MetadataProofProgressProvenance>,
     observed_epoch: ClusterEpoch,
 ) -> bool {
     metadata_proof_satisfies_active_primary_observation_floor_impl(
         active_floor,
         observed,
-        active_metadata_transfer_imported,
-        active_floor_epoch,
+        progress_provenance,
         observed_epoch,
     )
 }
@@ -7672,15 +7711,13 @@ fn metadata_proof_satisfies_active_primary_observation_floor(
 fn metadata_proof_satisfies_peering_proof_floor(
     active_floor: PgMetadataProof,
     observed: PgMetadataProof,
-    active_metadata_transfer_imported: bool,
-    active_floor_epoch: Option<ClusterEpoch>,
+    progress_provenance: Option<MetadataProofProgressProvenance>,
     observed_epoch: ClusterEpoch,
 ) -> bool {
     metadata_proof_satisfies_active_primary_observation_floor_impl(
         active_floor,
         observed,
-        active_metadata_transfer_imported,
-        active_floor_epoch,
+        progress_provenance,
         observed_epoch,
     )
 }
@@ -7688,24 +7725,27 @@ fn metadata_proof_satisfies_peering_proof_floor(
 fn metadata_proof_satisfies_active_primary_observation_floor_impl(
     active_floor: PgMetadataProof,
     observed: PgMetadataProof,
-    active_metadata_transfer_imported: bool,
-    active_floor_epoch: Option<ClusterEpoch>,
+    progress_provenance: Option<MetadataProofProgressProvenance>,
     observed_epoch: ClusterEpoch,
 ) -> bool {
     if metadata_proof_satisfies_active_floor(active_floor, observed) {
         return true;
     }
-    if let Some(active_floor_epoch) = active_floor_epoch {
-        active_floor_epoch < observed_epoch
+    if let Some(progress_provenance) = progress_provenance {
+        progress_provenance.floor_epoch < observed_epoch
             && observed != active_floor
             && observed.applied_log_hash != 0
             && observed.applied_log_hash != active_floor.applied_log_hash
             && observed.state_digest != active_floor.state_digest
-            && (!active_metadata_transfer_imported
-                || metadata_proof_satisfies_imported_transfer_local_progress_floor(
-                    active_floor,
-                    observed,
-                ))
+            && match progress_provenance.kind {
+                MetadataProofProgressKind::LocalEpoch => true,
+                MetadataProofProgressKind::ImportedTransfer => {
+                    metadata_proof_satisfies_imported_transfer_local_progress_floor(
+                        active_floor,
+                        observed,
+                    )
+                }
+            }
     } else {
         false
     }
@@ -7729,15 +7769,30 @@ fn metadata_proof_satisfies_imported_transfer_local_progress_floor(
             && observed.state_digest != active_floor.state_digest)
 }
 
-fn validate_metadata_transfer_proof(
-    snapshot: &ClusterControlSnapshot,
+struct MetadataTransferProofValidation<'a> {
+    snapshot: &'a ClusterControlSnapshot,
     pg_id: PgId,
     state: PgState,
     metadata_transfer_fenced: bool,
     metadata_transfer_fence_source_imported: bool,
     required_floor: PgMetadataProof,
+    required_floor_epoch: Option<ClusterEpoch>,
     transfer: PgMetadataTransferProof,
+}
+
+fn validate_metadata_transfer_proof(
+    validation: MetadataTransferProofValidation<'_>,
 ) -> Result<(), ControlPlaneError> {
+    let MetadataTransferProofValidation {
+        snapshot,
+        pg_id,
+        state,
+        metadata_transfer_fenced,
+        metadata_transfer_fence_source_imported,
+        required_floor,
+        required_floor_epoch,
+        transfer,
+    } = validation;
     if transfer.source_epoch() > snapshot.cluster_epoch {
         return Err(ControlPlaneError::PgMetadataTransferSourceEpochInFuture {
             pg_id: pg_id.get(),
@@ -7759,10 +7814,17 @@ fn validate_metadata_transfer_proof(
             metadata_proof_satisfies_active_floor(required_floor, transfer.source_metadata_proof())
         }
         PgState::Peering if metadata_transfer_fenced && metadata_transfer_fence_source_imported => {
-            metadata_proof_satisfies_imported_transfer_local_progress_floor(
-                required_floor,
-                transfer.source_metadata_proof(),
-            )
+            required_floor_epoch.is_some_and(|floor_epoch| {
+                metadata_proof_satisfies_peering_proof_floor(
+                    required_floor,
+                    transfer.source_metadata_proof(),
+                    Some(MetadataProofProgressProvenance {
+                        floor_epoch,
+                        kind: MetadataProofProgressKind::ImportedTransfer,
+                    }),
+                    transfer.source_epoch(),
+                )
+            })
         }
         PgState::Peering if metadata_transfer_fenced => {
             metadata_proof_satisfies_active_floor(required_floor, transfer.source_metadata_proof())
@@ -7810,8 +7872,10 @@ fn validate_authoritative_metadata_migration_source(
             metadata_proof_satisfies_active_primary_observation_floor(
                 active_floor,
                 observation.metadata_proof,
-                record.active_metadata_transfer_imported,
-                record.active_metadata_proof_epoch,
+                metadata_proof_progress_provenance(
+                    record.active_metadata_transfer_imported,
+                    record.active_metadata_proof_epoch,
+                ),
                 observation.observed_epoch,
             )
         } else {
@@ -7901,8 +7965,14 @@ fn validate_peering_metadata_proof_floor(
             metadata_proof_satisfies_peering_proof_floor(
                 expected,
                 actual,
-                floor.imported,
-                Some(floor_epoch),
+                Some(MetadataProofProgressProvenance {
+                    floor_epoch,
+                    kind: if floor.imported {
+                        MetadataProofProgressKind::ImportedTransfer
+                    } else {
+                        MetadataProofProgressKind::LocalEpoch
+                    },
+                }),
                 cluster_epoch,
             )
         })
@@ -7947,8 +8017,7 @@ fn primary_has_current_pg_state(
                         metadata_proof_satisfies_active_primary_observation_floor(
                             expected,
                             observation.metadata_proof,
-                            imported,
-                            expected_epoch,
+                            metadata_proof_progress_provenance(imported, expected_epoch),
                             observation.observed_epoch,
                         )
                     }))
@@ -8004,8 +8073,10 @@ fn validate_pg_primary_active_observation(
     if !metadata_proof_satisfies_active_primary_observation_floor(
         expected_proof,
         observation.metadata_proof,
-        pg.active_metadata_transfer_imported,
-        pg.active_metadata_proof_epoch,
+        metadata_proof_progress_provenance(
+            pg.active_metadata_transfer_imported,
+            pg.active_metadata_proof_epoch,
+        ),
         observation.observed_epoch,
     ) {
         return Err(ControlPlaneError::PgActiveMetadataProofMismatch {
@@ -9029,6 +9100,14 @@ mod tests {
             applied_log_hash: 0xabc,
             state_digest: 0xdef,
         };
+        let local_epoch_progress = Some(MetadataProofProgressProvenance {
+            floor_epoch: ClusterEpoch::new(7).unwrap(),
+            kind: MetadataProofProgressKind::LocalEpoch,
+        });
+        let imported_transfer_progress = Some(MetadataProofProgressProvenance {
+            floor_epoch: ClusterEpoch::new(7).unwrap(),
+            kind: MetadataProofProgressKind::ImportedTransfer,
+        });
 
         let lower_epoch_local_proof = PgMetadataProof {
             applied_log_index: 1,
@@ -9054,64 +9133,61 @@ mod tests {
         assert!(!metadata_proof_satisfies_active_primary_observation_floor(
             imported_activation_floor,
             lower_epoch_local_proof,
-            false,
-            Some(ClusterEpoch::new(7).unwrap()),
+            local_epoch_progress,
             ClusterEpoch::new(7).unwrap(),
         ));
         assert!(!metadata_proof_satisfies_active_primary_observation_floor(
             imported_activation_floor,
             lower_epoch_local_proof,
-            true,
-            Some(ClusterEpoch::new(7).unwrap()),
+            imported_transfer_progress,
             ClusterEpoch::new(7).unwrap(),
         ));
         assert!(metadata_proof_satisfies_active_primary_observation_floor(
             imported_activation_floor,
             lower_epoch_local_proof,
-            true,
-            Some(ClusterEpoch::new(7).unwrap()),
+            imported_transfer_progress,
+            ClusterEpoch::new(8).unwrap(),
+        ));
+        assert!(!metadata_proof_satisfies_active_primary_observation_floor(
+            imported_activation_floor,
+            lower_epoch_local_proof,
+            None,
             ClusterEpoch::new(8).unwrap(),
         ));
         assert!(!metadata_proof_satisfies_active_primary_observation_floor(
             imported_activation_floor,
             same_index_epoch_local_proof,
-            false,
-            Some(ClusterEpoch::new(7).unwrap()),
+            local_epoch_progress,
             ClusterEpoch::new(7).unwrap(),
         ));
         assert!(metadata_proof_satisfies_active_primary_observation_floor(
             imported_activation_floor,
             same_index_epoch_local_proof,
-            false,
-            Some(ClusterEpoch::new(7).unwrap()),
+            local_epoch_progress,
             ClusterEpoch::new(8).unwrap(),
         ));
         assert!(metadata_proof_satisfies_active_primary_observation_floor(
             imported_activation_floor,
             same_index_epoch_local_proof,
-            true,
-            Some(ClusterEpoch::new(7).unwrap()),
+            imported_transfer_progress,
             ClusterEpoch::new(8).unwrap(),
         ));
         assert!(!metadata_proof_satisfies_active_primary_observation_floor(
             imported_activation_floor,
             same_log_digest_only_proof,
-            true,
-            Some(ClusterEpoch::new(7).unwrap()),
+            imported_transfer_progress,
             ClusterEpoch::new(8).unwrap(),
         ));
         assert!(!metadata_proof_satisfies_active_primary_observation_floor(
             imported_activation_floor,
             same_index_epoch_local_proof,
-            true,
-            Some(ClusterEpoch::new(7).unwrap()),
+            imported_transfer_progress,
             ClusterEpoch::new(7).unwrap(),
         ));
         assert!(!metadata_proof_satisfies_active_primary_observation_floor(
             imported_activation_floor,
             malformed_epoch_local_proof,
-            true,
-            Some(ClusterEpoch::new(7).unwrap()),
+            imported_transfer_progress,
             ClusterEpoch::new(7).unwrap(),
         ));
     }
@@ -9142,22 +9218,25 @@ mod tests {
         assert!(!metadata_proof_satisfies_active_primary_observation_floor(
             active_floor,
             digest_only_progress,
-            false,
-            Some(ClusterEpoch::new(7).unwrap()),
+            Some(MetadataProofProgressProvenance {
+                floor_epoch: ClusterEpoch::new(7).unwrap(),
+                kind: MetadataProofProgressKind::LocalEpoch,
+            }),
             ClusterEpoch::new(7).unwrap(),
         ));
         assert!(!metadata_proof_satisfies_active_primary_observation_floor(
             active_floor,
             digest_only_progress,
-            false,
             None,
             ClusterEpoch::new(7).unwrap(),
         ));
         assert!(!metadata_proof_satisfies_active_primary_observation_floor(
             active_floor,
             divergent_log_hash,
-            false,
-            Some(ClusterEpoch::new(7).unwrap()),
+            Some(MetadataProofProgressProvenance {
+                floor_epoch: ClusterEpoch::new(7).unwrap(),
+                kind: MetadataProofProgressKind::LocalEpoch,
+            }),
             ClusterEpoch::new(7).unwrap(),
         ));
         assert!(!metadata_proof_satisfies_active_primary_observation_floor(
@@ -9167,8 +9246,10 @@ mod tests {
                 state_digest: 0xdef,
             },
             zero_hash_digest_only_progress,
-            false,
-            Some(ClusterEpoch::new(7).unwrap()),
+            Some(MetadataProofProgressProvenance {
+                floor_epoch: ClusterEpoch::new(7).unwrap(),
+                kind: MetadataProofProgressKind::LocalEpoch,
+            }),
             ClusterEpoch::new(7).unwrap(),
         ));
     }

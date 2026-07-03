@@ -426,15 +426,15 @@ when prioritised. They correspond to the remaining findings from the Phase 11 re
     deleted. Production and test finalization paths now use the terminal command path, so
     serving code cannot refresh `metadata_command_replica_state.state_digest` for
     finalized-bucket cleanup without appending a metadata command.
-  - **Partially complete:** Tighten imported metadata-transfer proofs.
+  - **Completed:** Tighten imported metadata-transfer proofs.
     The broad helper has been renamed to
     `metadata_proof_satisfies_imported_transfer_local_progress_floor` and now requires a
     nonzero command-log hash that differs from the imported floor as well as a changed
     digest. This preserves legitimate source/destination lineage crossing for imported
-    transfer state, while rejecting same-log digest-only progress. Remaining work is to
-    make the source route/import epoch provenance explicit in the predicate inputs instead
-    of relying only on the surrounding `active_metadata_transfer_imported` /
-    `metadata_transfer_fence_source_imported` caller state.
+    transfer state, while rejecting same-log digest-only progress. The active-primary,
+    peering-floor, and fenced-transfer proof predicates now take explicit
+    `MetadataProofProgressProvenance` carrying the floor epoch and whether the progress is
+    ordinary local-epoch progress or imported-transfer lineage crossing.
   - **Partially complete:** Delete test dependencies on digest-only mutation. Audit tests and fixtures that
     create same-log/different-digest state by directly mutating materialised metadata or by
     refreshing digest rows without a command. Convert them to either apply the new terminal
@@ -450,8 +450,8 @@ when prioritised. They correspond to the remaining findings from the Phase 11 re
     different-digest active-primary observations now fail closed, including across a later
     control-plane epoch unless the command-log hash also changed. Imported metadata-transfer
     lineage crossing remains separately handled by
-    `metadata_proof_satisfies_imported_transfer_local_progress_floor` and still needs the
-    explicit provenance tightening above.
+    `metadata_proof_satisfies_imported_transfer_local_progress_floor` and explicit
+    `MetadataProofProgressProvenance`.
   - **Add divergent-replica coverage.** Add a property/regression test that applies the same
     command log to two replicas, injects one out-of-band materialised metadata mutation on
     one replica, and asserts peering/metadata-transfer proof completion rejects it. Add a
