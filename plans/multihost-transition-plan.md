@@ -10462,6 +10462,18 @@ Phase 12.3 progress:
   commits a control-plane command on the leader, and proves the follower applies
   the committed command through the socket transport. Full process supervision
   and failover remain the next layer.
+- Added the first real `argmin-s3` process-supervision smoke for the Unix-peer
+  Raft control-plane mode. The process wrapper now starts the peer listener
+  before fresh membership initialization, seeds multi-node Raft membership only
+  from the deterministic lowest configured peer, retries control-plane-state
+  bootstrap only from a locally serving leader, skips leader-only maintenance on
+  followers, and serializes durable restart-artifact checkpoints across both the
+  normal control-plane RPC path and peer AppendEntries/snapshot traffic. The
+  smoke starts two `argmin-s3` control-plane processes, waits for the serving
+  control socket to expose the bootstrapped runtime map, and restores the
+  follower's durable artifact to prove the bootstrap command was replicated and
+  checkpointed through the process boundary. Failover and restarted-peer catchup
+  remain the next process-level layer.
 
 1. define the replicated control-plane state machine:
    - state includes cluster epoch, PG count, PG state, PG acting sets, node

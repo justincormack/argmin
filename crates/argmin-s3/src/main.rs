@@ -1310,7 +1310,8 @@ fn run_control_plane_process(config: &ServerConfig) -> ! {
 struct ExperimentalRaftControlPlane {
     runtime: Handle,
     authority: Arc<ControlPlaneRaftAuthority>,
-    durable_artifact_path: Option<PathBuf>,
+    durable_artifact_path: Option<Arc<PathBuf>>,
+    durable_checkpoint_lock: Option<Arc<Mutex<()>>>,
     durable_poison: Option<String>,
 }
 
@@ -1339,7 +1340,12 @@ impl ExperimentalRaftControlPlane {
         let Some(path) = &self.durable_artifact_path else {
             return Ok(());
         };
-        self.block_on(self.authority.store_durable_restart_artifact(path))
+        store_experimental_raft_durable_restart_artifact(
+            &self.runtime,
+            &self.authority,
+            path,
+            self.durable_checkpoint_lock.as_ref(),
+        )
     }
 
     fn submit_raft_command(
@@ -1559,6 +1565,64 @@ fn experimental_raft_startup_requires_local_leader(
     }
 }
 
+fn experimental_raft_startup_bootstrap_requires_local_serving(
+    peer_policy: Option<&ControlPlaneRaftPeerTransportPolicy>,
+) -> bool {
+    peer_policy.is_some_and(|policy| policy.peers().len() > 1)
+}
+
+fn experimental_raft_startup_initializes_membership(
+    peer_policy: Option<&ControlPlaneRaftPeerTransportPolicy>,
+    local_node_id: ControlPlaneRaftNodeId,
+) -> bool {
+    match peer_policy {
+        Some(policy) if policy.peers().len() > 1 => {
+            policy.peers().keys().next().copied() == Some(local_node_id)
+        }
+        _ => true,
+    }
+}
+
+async fn experimental_raft_local_authority_serving_within(
+    authority: &ControlPlaneRaftAuthority,
+    timeout: Duration,
+) -> Result<bool, ControlPlaneError> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if authority.status().await?.linearized_authority_serving() {
+            return Ok(true);
+        }
+        if Instant::now() >= deadline {
+            return Ok(false);
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+async fn maybe_trigger_experimental_raft_seed_election(
+    authority: &ControlPlaneRaftAuthority,
+    peer_policy: Option<&ControlPlaneRaftPeerTransportPolicy>,
+    local_node_id: ControlPlaneRaftNodeId,
+) -> Result<(), ControlPlaneError> {
+    if !experimental_raft_startup_initializes_membership(peer_policy, local_node_id) {
+        return Ok(());
+    }
+    if peer_policy.is_none_or(|policy| policy.peers().len() <= 1) {
+        return Ok(());
+    }
+    if authority.status().await?.current_leader().is_some() {
+        return Ok(());
+    }
+    authority
+        .raft()
+        .trigger()
+        .elect(true)
+        .await
+        .map_err(|error| ControlPlaneError::RpcRemote {
+            message: format!("OpenRaft startup election trigger failed: {error:?}"),
+        })
+}
+
 #[cfg(test)]
 fn bind_experimental_raft_peer_listener(
     config: &ServerConfig,
@@ -1587,14 +1651,30 @@ fn bind_experimental_raft_peer_listener_with_policy(
     }))
 }
 
-fn spawn_experimental_raft_peer_rpc_worker(
-    stream: UnixStream,
+#[derive(Clone)]
+struct ExperimentalRaftPeerRpcWorkerContext {
     runtime: Handle,
     authority: Arc<ControlPlaneRaftAuthority>,
     local_node_id: ControlPlaneRaftNodeId,
     policy: Arc<ControlPlaneRaftPeerTransportPolicy>,
+    durable_artifact_path: Option<Arc<PathBuf>>,
+    durable_checkpoint_lock: Option<Arc<Mutex<()>>>,
     active_workers: Arc<AtomicUsize>,
+}
+
+fn spawn_experimental_raft_peer_rpc_worker(
+    stream: UnixStream,
+    context: ExperimentalRaftPeerRpcWorkerContext,
 ) {
+    let ExperimentalRaftPeerRpcWorkerContext {
+        runtime,
+        authority,
+        local_node_id,
+        policy,
+        durable_artifact_path,
+        durable_checkpoint_lock,
+        active_workers,
+    } = context;
     match active_workers.fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
         (active < CONTROL_PLANE_RAFT_PEER_RPC_WORKER_LIMIT).then_some(active + 1)
     }) {
@@ -1620,11 +1700,74 @@ fn spawn_experimental_raft_peer_rpc_worker(
             )
             .await
         });
+        if let Some(path) = durable_artifact_path.as_deref() {
+            if let Err(error) = store_experimental_raft_durable_restart_artifact(
+                &runtime,
+                &authority,
+                path,
+                durable_checkpoint_lock.as_ref(),
+            ) {
+                eprintln!(
+                    "experimental OpenRaft control-plane durability checkpoint failed after peer RPC; exiting to avoid serving volatile committed state: {error}"
+                );
+                std::process::exit(1);
+            }
+        }
         if let Err(error) = result {
             eprintln!("experimental OpenRaft control-plane peer RPC failed: {error}");
         }
         active_workers.fetch_sub(1, Ordering::AcqRel);
     });
+}
+
+fn spawn_experimental_raft_peer_listener_loop(
+    listener: ExperimentalRaftPeerListener,
+    runtime: Handle,
+    authority: Arc<ControlPlaneRaftAuthority>,
+    local_node_id: ControlPlaneRaftNodeId,
+    durable_artifact_path: Arc<PathBuf>,
+    durable_checkpoint_lock: Arc<Mutex<()>>,
+    active_workers: Arc<AtomicUsize>,
+) -> thread::JoinHandle<()> {
+    thread::spawn(move || loop {
+        for _ in 0..CONTROL_PLANE_ACCEPT_BATCH_LIMIT {
+            match listener.listener.accept() {
+                Ok((stream, _addr)) => {
+                    spawn_experimental_raft_peer_rpc_worker(
+                        stream,
+                        ExperimentalRaftPeerRpcWorkerContext {
+                            runtime: runtime.clone(),
+                            authority: Arc::clone(&authority),
+                            local_node_id,
+                            policy: Arc::clone(&listener.policy),
+                            durable_artifact_path: Some(Arc::clone(&durable_artifact_path)),
+                            durable_checkpoint_lock: Some(Arc::clone(&durable_checkpoint_lock)),
+                            active_workers: Arc::clone(&active_workers),
+                        },
+                    );
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                Err(error) => {
+                    eprintln!("control-plane OpenRaft peer socket accept failed: {error}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        thread::sleep(Duration::from_millis(1));
+    })
+}
+
+fn store_experimental_raft_durable_restart_artifact(
+    runtime: &Handle,
+    authority: &ControlPlaneRaftAuthority,
+    path: &Path,
+    durable_checkpoint_lock: Option<&Arc<Mutex<()>>>,
+) -> Result<(), ControlPlaneError> {
+    let _guard = durable_checkpoint_lock.map(|lock| {
+        lock.lock()
+            .expect("experimental OpenRaft durable checkpoint mutex poisoned")
+    });
+    block_on_control_plane_raft(runtime, authority.store_durable_restart_artifact(path))
 }
 
 fn run_experimental_raft_control_plane_process(config: &ServerConfig) -> ! {
@@ -1658,6 +1801,8 @@ fn run_experimental_raft_control_plane_process(config: &ServerConfig) -> ! {
                 eprintln!("{error}");
                 std::process::exit(1);
             });
+    let durable_checkpoint_lock = Arc::new(Mutex::new(()));
+    let durable_artifact_path = Arc::new(PathBuf::from(state_path));
     let authority = block_on_control_plane_raft(&runtime, async {
         let authority = if let Some(policy) = raft_peer_policy.clone() {
             ControlPlaneRaftAuthority::new_experimental_unix_peer_durable(
@@ -1676,7 +1821,37 @@ fn run_experimental_raft_control_plane_process(config: &ServerConfig) -> ! {
             )
             .await?
         };
-        if !authority.is_initialized().await? {
+        Ok::<_, ControlPlaneError>(Arc::new(authority))
+    })
+    .unwrap_or_else(|error| {
+        eprintln!("failed to initialize experimental OpenRaft control-plane: {error}");
+        std::process::exit(1);
+    });
+    let raft_peer_listener =
+        bind_experimental_raft_peer_listener_with_policy(config, raft_peer_policy.clone())
+            .unwrap_or_else(|error| {
+                eprintln!("{error}");
+                std::process::exit(1);
+            });
+    let active_raft_peer_rpc_workers = Arc::new(AtomicUsize::new(0));
+    let multi_node_raft_peer_mode = raft_peer_policy
+        .as_ref()
+        .is_some_and(|policy| policy.peers().len() > 1);
+    let _raft_peer_listener_loop = raft_peer_listener.map(|listener| {
+        spawn_experimental_raft_peer_listener_loop(
+            listener,
+            runtime.clone(),
+            Arc::clone(&authority),
+            node_id,
+            Arc::clone(&durable_artifact_path),
+            Arc::clone(&durable_checkpoint_lock),
+            Arc::clone(&active_raft_peer_rpc_workers),
+        )
+    });
+    block_on_control_plane_raft(&runtime, async {
+        if !authority.is_initialized().await?
+            && experimental_raft_startup_initializes_membership(raft_peer_policy.as_ref(), node_id)
+        {
             if let Some(policy) = &raft_peer_policy {
                 authority.initialize_membership(policy.peers()).await?;
             } else {
@@ -1704,35 +1879,45 @@ fn run_experimental_raft_control_plane_process(config: &ServerConfig) -> ! {
         authority
             .store_durable_restart_artifact(Path::new(state_path))
             .await?;
-        Ok::<_, ControlPlaneError>(Arc::new(authority))
+        Ok::<_, ControlPlaneError>(())
     })
     .unwrap_or_else(|error| {
         eprintln!("failed to initialize experimental OpenRaft control-plane: {error}");
         std::process::exit(1);
     });
-    let raft_peer_listener =
-        bind_experimental_raft_peer_listener_with_policy(config, raft_peer_policy).unwrap_or_else(
-            |error| {
-                eprintln!("{error}");
-                std::process::exit(1);
-            },
-        );
     let mut control_plane = ExperimentalRaftControlPlane {
         runtime: runtime.clone(),
         authority: Arc::clone(&authority),
-        durable_artifact_path: Some(PathBuf::from(state_path)),
+        durable_artifact_path: Some(Arc::clone(&durable_artifact_path)),
+        durable_checkpoint_lock: Some(Arc::clone(&durable_checkpoint_lock)),
         durable_poison: None,
     };
-    bootstrap_empty_experimental_raft_control_plane(&mut control_plane, config).unwrap_or_else(
-        |error| {
-            eprintln!("failed to bootstrap experimental OpenRaft control-plane state: {error}");
+    let should_bootstrap_control_plane_state =
+        if experimental_raft_startup_bootstrap_requires_local_serving(raft_peer_policy.as_ref()) {
+            block_on_control_plane_raft(&runtime, async {
+                experimental_raft_local_authority_serving_within(&authority, Duration::from_secs(1))
+                    .await
+        })
+        .unwrap_or_else(|error| {
+            eprintln!(
+                "failed to determine experimental OpenRaft control-plane bootstrap leadership: {error}"
+            );
             std::process::exit(1);
-        },
-    );
+        })
+        } else {
+            true
+        };
+    if should_bootstrap_control_plane_state {
+        bootstrap_empty_experimental_raft_control_plane(&mut control_plane, config).unwrap_or_else(
+            |error| {
+                eprintln!("failed to bootstrap experimental OpenRaft control-plane state: {error}");
+                std::process::exit(1);
+            },
+        );
+    }
     let raft_authority = Arc::clone(&authority);
     let authority = Arc::new(Mutex::new(control_plane));
     let active_rpc_workers = Arc::new(AtomicUsize::new(0));
-    let active_raft_peer_rpc_workers = Arc::new(AtomicUsize::new(0));
     let raft_peer_socket_path = config
         .control_plane_raft_peer_socket_path
         .as_deref()
@@ -1764,33 +1949,51 @@ fn run_experimental_raft_control_plane_process(config: &ServerConfig) -> ! {
                 }
             }
         }
-        if let Some(raft_peer_listener) = &raft_peer_listener {
-            for _ in 0..CONTROL_PLANE_ACCEPT_BATCH_LIMIT {
-                match raft_peer_listener.listener.accept() {
-                    Ok((stream, _addr)) => {
-                        spawn_experimental_raft_peer_rpc_worker(
-                            stream,
-                            runtime.clone(),
-                            Arc::clone(&raft_authority),
-                            node_id,
-                            Arc::clone(&raft_peer_listener.policy),
-                            Arc::clone(&active_raft_peer_rpc_workers),
-                        );
-                    }
-                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
-                    Err(error) => {
-                        eprintln!("control-plane OpenRaft peer socket accept failed: {error}");
-                        std::process::exit(1);
-                    }
-                }
-            }
-        }
         let now_ms = storage::clock::current_time_millis();
-        let expiry = {
+        if multi_node_raft_peer_mode {
+            block_on_control_plane_raft(&runtime, async {
+                maybe_trigger_experimental_raft_seed_election(
+                    &raft_authority,
+                    raft_peer_policy.as_ref(),
+                    node_id,
+                )
+                .await
+            })
+            .unwrap_or_else(|error| {
+                eprintln!("experimental OpenRaft control-plane election trigger failed: {error}");
+                std::process::exit(1);
+            });
+        }
+        let local_raft_authority_serving = if multi_node_raft_peer_mode {
+            block_on_control_plane_raft(&runtime, async {
+                raft_authority
+                    .status()
+                    .await
+                    .map(|status| status.linearized_authority_serving())
+            })
+            .unwrap_or_else(|error| {
+                eprintln!("experimental OpenRaft control-plane status check failed: {error}");
+                std::process::exit(1);
+            })
+        } else {
+            true
+        };
+        let expiry = if local_raft_authority_serving {
             let mut authority = authority
                 .lock()
                 .expect("control-plane authority mutex poisoned");
+            if multi_node_raft_peer_mode {
+                bootstrap_empty_experimental_raft_control_plane(&mut authority, config)
+                    .unwrap_or_else(|error| {
+                        eprintln!(
+                            "failed to bootstrap experimental OpenRaft control-plane state: {error}"
+                        );
+                        std::process::exit(1);
+                    });
+            }
             authority.expire_heartbeat_leases(now_ms)
+        } else {
+            Ok((ClusterEpoch::INITIAL, 0, 0))
         };
         match expiry {
             Ok((cluster_epoch, expired_nodes, peering_pgs)) if expired_nodes > 0 => {
@@ -2873,6 +3076,7 @@ mod tests {
             runtime: handle,
             authority: Arc::clone(&authority),
             durable_artifact_path: None,
+            durable_checkpoint_lock: None,
             durable_poison: None,
         };
         ExperimentalRaftTestHarness {
@@ -2940,7 +3144,8 @@ mod tests {
         let control_plane = ExperimentalRaftControlPlane {
             runtime: handle,
             authority: Arc::clone(&authority),
-            durable_artifact_path: Some(state_path.to_path_buf()),
+            durable_artifact_path: Some(Arc::new(state_path.to_path_buf())),
+            durable_checkpoint_lock: Some(Arc::new(Mutex::new(()))),
             durable_poison: None,
         };
         ExperimentalRaftTestHarness {
@@ -2969,6 +3174,7 @@ mod tests {
             runtime: harness.runtime.handle().clone(),
             authority: Arc::clone(&harness.authority),
             durable_artifact_path: None,
+            durable_checkpoint_lock: None,
             durable_poison: None,
         };
         std::thread::spawn(move || {
@@ -3048,6 +3254,7 @@ mod tests {
     #[test]
     fn experimental_raft_startup_leader_wait_tracks_peer_policy_size() {
         assert!(experimental_raft_startup_requires_local_leader(None));
+        assert!(experimental_raft_startup_initializes_membership(None, 1));
 
         let single_node_policy = ControlPlaneRaftPeerTransportPolicy::from_peer_endpoints(
             "process-peer-startup-leader-wait-test",
@@ -3057,6 +3264,10 @@ mod tests {
         assert!(experimental_raft_startup_requires_local_leader(Some(
             &single_node_policy
         )));
+        assert!(experimental_raft_startup_initializes_membership(
+            Some(&single_node_policy),
+            1
+        ));
 
         let multi_node_policy = ControlPlaneRaftPeerTransportPolicy::from_peer_endpoints(
             "process-peer-startup-leader-wait-test",
@@ -3069,6 +3280,14 @@ mod tests {
         assert!(!experimental_raft_startup_requires_local_leader(Some(
             &multi_node_policy
         )));
+        assert!(experimental_raft_startup_initializes_membership(
+            Some(&multi_node_policy),
+            1
+        ));
+        assert!(!experimental_raft_startup_initializes_membership(
+            Some(&multi_node_policy),
+            2
+        ));
     }
 
     #[test]
@@ -3144,7 +3363,8 @@ mod tests {
         let mut control_plane = ExperimentalRaftControlPlane {
             runtime: handle,
             authority: Arc::clone(&authority),
-            durable_artifact_path: Some(state_path.clone()),
+            durable_artifact_path: Some(Arc::new(state_path.clone())),
+            durable_checkpoint_lock: Some(Arc::new(Mutex::new(()))),
             durable_poison: None,
         };
         bootstrap_empty_experimental_raft_control_plane(&mut control_plane, &config)
@@ -3199,7 +3419,8 @@ mod tests {
         let mut control_plane = ExperimentalRaftControlPlane {
             runtime: handle,
             authority: Arc::clone(&authority),
-            durable_artifact_path: Some(invalid_checkpoint_path),
+            durable_artifact_path: Some(Arc::new(invalid_checkpoint_path)),
+            durable_checkpoint_lock: Some(Arc::new(Mutex::new(()))),
             durable_poison: None,
         };
         let mut config = test_server_config();
