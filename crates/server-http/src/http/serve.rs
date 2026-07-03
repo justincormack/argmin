@@ -5646,8 +5646,17 @@ mod tests {
     }
 
     fn read_http_response(stream: &mut StdTcpStream, timeout: Duration) -> String {
+        read_http_response_with_header_stop(stream, timeout, None)
+    }
+
+    fn read_http_response_with_header_stop(
+        stream: &mut StdTcpStream,
+        timeout: Duration,
+        stop_writer: Option<&AtomicBool>,
+    ) -> String {
         let mut buf = Vec::with_capacity(8192);
         let mut tmp = [0u8; 4096];
+        let mut headers_seen = false;
         stream
             .set_read_timeout(Some(timeout))
             .expect("set read timeout");
@@ -5663,6 +5672,12 @@ mod tests {
 
             let text = String::from_utf8_lossy(&buf);
             if let Some(header_end) = text.find("\r\n\r\n") {
+                if !headers_seen {
+                    headers_seen = true;
+                    if let Some(stop_writer) = stop_writer {
+                        stop_writer.store(true, Ordering::Relaxed);
+                    }
+                }
                 let headers = &text[..header_end];
                 if response_body_complete(&buf, header_end, headers) {
                     break;
@@ -5690,11 +5705,16 @@ mod tests {
 
         let bytes_sent = Arc::new(AtomicUsize::new(0));
         let bytes_sent_writer = Arc::clone(&bytes_sent);
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_writer = Arc::clone(&stop);
         let body_chunk = vec![b'x'; WRITE_CHUNK_BYTES];
         let writer_handle = std::thread::spawn(move || {
             writer.write_all(request_head.as_bytes()).unwrap();
             let chunk_count = total_body_bytes / WRITE_CHUNK_BYTES;
             for _ in 0..chunk_count {
+                if stop_writer.load(Ordering::Relaxed) {
+                    break;
+                }
                 match writer.write_all(&body_chunk) {
                     Ok(()) => {
                         bytes_sent_writer.fetch_add(WRITE_CHUNK_BYTES, Ordering::Relaxed);
@@ -5705,7 +5725,9 @@ mod tests {
             }
         });
 
-        let response = read_http_response(&mut stream, RESPONSE_TIMEOUT);
+        let response =
+            read_http_response_with_header_stop(&mut stream, RESPONSE_TIMEOUT, Some(&stop));
+        stop.store(true, Ordering::Relaxed);
         writer_handle.join().unwrap();
         (response, bytes_sent.load(Ordering::Relaxed))
     }
@@ -5747,7 +5769,8 @@ mod tests {
             }
         });
 
-        let response = read_http_response(&mut stream, RESPONSE_TIMEOUT);
+        let response =
+            read_http_response_with_header_stop(&mut stream, RESPONSE_TIMEOUT, Some(&stop));
         stop.store(true, Ordering::Relaxed);
         writer_handle.join().unwrap();
         (response, bytes_sent.load(Ordering::Relaxed))
@@ -5772,12 +5795,17 @@ mod tests {
 
         let bytes_sent = Arc::new(AtomicUsize::new(0));
         let bytes_sent_writer = Arc::clone(&bytes_sent);
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_writer = Arc::clone(&stop);
         let body_chunk = vec![b'x'; WRITE_CHUNK_BYTES];
         let writer_handle = std::thread::spawn(move || {
             writer.write_all(request_head.as_bytes()).unwrap();
             writer.write_all(&file_prefix).unwrap();
             let mut remaining = total_file_bytes;
             while remaining > 0 {
+                if stop_writer.load(Ordering::Relaxed) {
+                    return;
+                }
                 let next = remaining.min(WRITE_CHUNK_BYTES);
                 match writer.write_all(&body_chunk[..next]) {
                     Ok(()) => {
@@ -5791,7 +5819,9 @@ mod tests {
             let _ = writer.write_all(&file_suffix);
         });
 
-        let response = read_http_response(&mut stream, RESPONSE_TIMEOUT);
+        let response =
+            read_http_response_with_header_stop(&mut stream, RESPONSE_TIMEOUT, Some(&stop));
+        stop.store(true, Ordering::Relaxed);
         writer_handle.join().unwrap();
         (response, bytes_sent.load(Ordering::Relaxed))
     }
