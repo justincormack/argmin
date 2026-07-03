@@ -127,6 +127,8 @@ pub(super) fn metadata_error_is_command_contention(error: &storage::MetadataErro
 fn store_error_is_retryable_contention(error: &storage::StoreError) -> bool {
     match error {
         storage::StoreError::MetadataCommandContention { .. }
+        | storage::StoreError::MetadataCommandLogConflict { .. }
+        | storage::StoreError::MetadataCommandLogGap { .. }
         | storage::StoreError::StalePayloadOperation { .. }
         | storage::StoreError::StaleMetadataCommand { .. }
         | storage::StoreError::StaleMetadataPrimaryBridge { .. }

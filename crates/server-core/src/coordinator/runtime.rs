@@ -601,20 +601,22 @@ impl ReclaimSweeper {
                 let mut deferred_bucket_delete_begin_roots: HashSet<BucketDeleteBeginRoot> =
                     HashSet::new();
                 let mut next_durable_scan_at = Instant::now();
-                let mut pending_work = None;
+                let mut pending_work: Option<(Arc<StorageCluster>, ReclaimWorkItem)> = None;
                 while !worker_stop.load(Ordering::SeqCst) {
                     let worker_node = storage_handle.current();
-                    let current_runtime = runtime.with_storage_node(Arc::clone(&worker_node));
-                    let admission = background_work_admission_for(&worker_node);
                     enqueue_durable_reclaim_work_if_due(
                         &worker_node,
                         &deferred_object_payload_reclaim_roots,
                         &deferred_bucket_delete_begin_roots,
                         &mut next_durable_scan_at,
                     );
-                    let Some(work) = pending_work
+                    let Some((worker_node, work)) = pending_work
                         .take()
-                        .or_else(|| worker_node.try_take_reclaim_work())
+                        .or_else(|| {
+                            worker_node
+                                .try_take_reclaim_work()
+                                .map(|work| (Arc::clone(&worker_node), work))
+                        })
                         .or_else(|| {
                             if deferred_object_payload_reclaim.is_empty()
                                 && deferred_bucket_delete_begin.is_empty()
@@ -627,28 +629,42 @@ impl ReclaimSweeper {
                                 &deferred_bucket_delete_begin_roots,
                                 &mut next_durable_scan_at,
                             );
-                            worker_node.try_take_reclaim_work().or_else(|| {
-                                if let Some(root) = deferred_object_payload_reclaim.pop_front() {
-                                    deferred_object_payload_reclaim_roots.remove(&root);
-                                    return Some(ReclaimWorkItem::ObjectPayload(root));
-                                }
-                                deferred_bucket_delete_begin.pop_front().map(|root| {
-                                    deferred_bucket_delete_begin_roots.remove(&root);
-                                    ReclaimWorkItem::BucketDeleteBegin(root)
+                            worker_node
+                                .try_take_reclaim_work()
+                                .map(|work| (Arc::clone(&worker_node), work))
+                                .or_else(|| {
+                                    if let Some(root) = deferred_object_payload_reclaim.pop_front()
+                                    {
+                                        deferred_object_payload_reclaim_roots.remove(&root);
+                                        return Some((
+                                            Arc::clone(&worker_node),
+                                            ReclaimWorkItem::ObjectPayload(root),
+                                        ));
+                                    }
+                                    deferred_bucket_delete_begin.pop_front().map(|root| {
+                                        deferred_bucket_delete_begin_roots.remove(&root);
+                                        (
+                                            Arc::clone(&worker_node),
+                                            ReclaimWorkItem::BucketDeleteBegin(root),
+                                        )
+                                    })
                                 })
-                            })
                         })
-                        .or_else(|| worker_node.wait_for_reclaim_work(&worker_stop))
+                        .or_else(|| {
+                            wait_for_runtime_map_reclaim_work(&storage_handle, &worker_stop)
+                        })
                     else {
                         if worker_stop.load(Ordering::SeqCst) {
                             break;
                         }
                         continue;
                     };
+                    let current_runtime = runtime.with_storage_node(Arc::clone(&worker_node));
+                    let admission = background_work_admission_for(&worker_node);
                     let Some(_cleanup_permit) =
                         admission.try_acquire(BackgroundWorkClass::ReclaimCleanup)
                     else {
-                        pending_work = Some(work);
+                        pending_work = Some((worker_node, work));
                         std::thread::sleep(OBJECT_PAYLOAD_RECLAIM_PG_RETRY_COOLDOWN);
                         continue;
                     };
@@ -790,7 +806,7 @@ impl ReclaimSweeper {
                             &mut next_durable_scan_at,
                         );
                         if let Some(work) = worker_node.try_take_reclaim_work() {
-                            pending_work = Some(work);
+                            pending_work = Some((Arc::clone(&worker_node), work));
                         } else if let Some(sleep_for) = shortest_retry_sleep(
                             earliest_object_payload_reclaim_retry_sleep(
                                 &worker_node,
@@ -824,6 +840,19 @@ impl ReclaimSweeper {
             handle: None,
         }
     }
+}
+
+fn wait_for_runtime_map_reclaim_work(
+    storage_handle: &StorageClusterRuntimeMapHandle,
+    stop: &AtomicBool,
+) -> Option<(Arc<StorageCluster>, ReclaimWorkItem)> {
+    while !stop.load(Ordering::SeqCst) {
+        let worker_node = storage_handle.current();
+        if let Some(work) = worker_node.wait_for_reclaim_work_poll(stop) {
+            return Some((worker_node, work));
+        }
+    }
+    None
 }
 
 impl Drop for LifecycleSweeper {

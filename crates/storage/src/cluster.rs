@@ -4242,6 +4242,21 @@ impl StorageCluster {
         self.local_map.pg_routes()
     }
 
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_clone_with_pg_routes(
+        &self,
+        cluster_epoch: ClusterEpoch,
+        pg_routes: impl IntoIterator<Item = PgRouteSnapshot>,
+        historical_pg_routes: impl IntoIterator<Item = PgRouteSnapshot>,
+    ) -> Result<Arc<Self>, ClusterBuildError> {
+        let local_map = self.local_map.test_clone_with_pg_routes(
+            cluster_epoch,
+            pg_routes,
+            historical_pg_routes,
+        )?;
+        Self::from_local_map(Arc::new(local_map))
+    }
+
     pub fn reconstructed_pg_route_at_epoch(
         &self,
         pg_id: PgId,

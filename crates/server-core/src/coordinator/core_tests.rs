@@ -1835,33 +1835,24 @@ fn install_same_store_next_epoch_runtime_map(
 fn install_same_store_next_epoch_runtime_map_with_primary(
     handle: &StorageClusterRuntimeMapHandle,
     initial: &Arc<StorageCluster>,
-    node_root: &std::path::Path,
+    _node_root: &std::path::Path,
     primary_node_id: NodeId,
 ) {
     let node_count = u32::from(initial.default_payload_ec_shape().k)
         + u32::from(initial.default_payload_ec_shape().m);
-    let configs = (0..node_count)
-        .map(|node_id| {
-            LocalNodeStoreConfig::new(
-                NodeId::new(node_id),
-                node_root.join(format!("node-{node_id:04}")),
-            )
-        })
-        .collect::<Vec<_>>();
     let next_epoch = ClusterEpoch::new(initial.cluster_epoch().get() + 1).unwrap();
     let acting_set = (0..node_count).map(NodeId::new).collect::<Vec<_>>();
     let routes = initial
         .test_pg_ids()
         .iter()
         .map(|pg_id| {
-            let route = storage::control_plane::PgRouteSnapshot::reconstructed(
+            storage::control_plane::PgRouteSnapshot::reconstructed(
                 next_epoch,
                 PgId::new(*pg_id),
                 primary_node_id,
                 acting_set.clone(),
                 PgState::Active,
-            );
-            LocalPgRoute::from(&route)
+            )
         })
         .collect::<Vec<_>>();
     let historical_routes = initial
@@ -1876,17 +1867,9 @@ fn install_same_store_next_epoch_runtime_map_with_primary(
             )
         })
         .collect::<Vec<_>>();
-    let mut candidate_map = LocalClusterMap::open_frontend_with_configs_and_pg_routes(
-        NodeId::new(0),
-        configs,
-        initial.test_pg_ids(),
-        initial.default_payload_ec_shape(),
-        next_epoch,
-        routes,
-    )
-    .unwrap();
-    candidate_map.test_install_historical_pg_routes(historical_routes);
-    let candidate = StorageCluster::from_local_map(Arc::new(candidate_map)).unwrap();
+    let candidate = initial
+        .test_clone_with_pg_routes(next_epoch, routes, historical_routes)
+        .unwrap();
     handle.install(candidate).unwrap();
 }
 
@@ -5149,6 +5132,13 @@ fn storage_rpc_resource_exhaustion_maps_to_slow_down() {
         }),
         ServerError::OperationAborted
     ));
+    assert_maps_to_operation_aborted(storage::StoreError::MetadataCommandLogGap {
+        node_id: 1,
+        pg_id: 2,
+        cluster_epoch: storage::ClusterEpoch::INITIAL,
+        log_index: 5,
+        expected_log_index: 4,
+    });
     assert_maps_to_operation_aborted(storage::StoreError::StalePayloadOperation {
         pg_id: 2,
         operation_epoch: storage::ClusterEpoch::INITIAL,

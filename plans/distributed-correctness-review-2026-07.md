@@ -123,30 +123,30 @@ the experimental election trigger or restarts the seed node. Confirmed.
   achievable. Read safety is unaffected (ReadIndex does an explicit quorum
   round); this is availability.
 
-### R3. MEDIUM — Torn checkpoint capture: log store and state machine exported without a barrier
+### R3. RESOLVED — Torn checkpoint capture: log store and state machine exported without a barrier
 
-A concurrent apply between the two exports produces an artifact that fails
-its own restore validation, bricking the node at next restart. Confirmed
-race; occurrence plausible under multi-node load.
+Confirmed and fixed for the current full-artifact checkpoint path.
 
-- `store_durable_restart_artifact` exports the log store first
-  (`control_plane_raft.rs:2992-3005`) and the state machine later via
-  `with_state_machine` (:3006-3013). Up to 64 peer RPC workers (main.rs:62,
-  :1734-1736) can append/commit/apply in between; the
-  `durable_checkpoint_lock` (main.rs:1860) serializes checkpoints against
-  each other but not against Raft progress.
-- `encode_durable_artifact` performs no pair validation (:3933-3943);
-  `decode_durable_artifact` does (:3986-3990 →
-  `validate_log_store_state_machine_pair` :4284-4340) — so the torn artifact
-  atomically replaces the last good one (:4008-4041) and is discovered only
-  at restart, which fails closed (main.rs:1882-1885). Fail-closed, not state
-  loss — but the natural operator workaround (delete the artifact) converts
-  it into R1/R7 territory.
+- `capture_durable_restart_artifact` now captures the state-machine artifact
+  before exporting the log store. If Raft advances concurrently, the later log
+  export may be ahead of the captured state, which restart can replay from the
+  retained committed suffix. The dangerous reverse shape — state ahead of the
+  exported log/committed gate — is rejected by pair validation and retried.
+- `store_durable_artifact` validates
+  `validate_log_store_state_machine_pair` before encoding or replacing the
+  durable artifact, so a torn or otherwise inconsistent pair cannot overwrite
+  the last good checkpoint.
+- Coverage:
+  `control_plane_raft_durable_restart_artifact_capture_allows_log_ahead_of_state_machine`
+  pins the replayable state-first/log-later capture shape,
+  `control_plane_raft_durable_restart_artifact_capture_rejects_inconsistent_pair`
+  pins the invalid state-ahead shape, and
+  `control_plane_raft_durable_restart_artifact_store_rejects_inconsistent_pair_before_overwrite`
+  proves a bad artifact does not replace the previous durable file.
 
-Fix shape: capture the log-store export inside the same `with_state_machine`
-critical section, or export/compare/retry on motion; and run
-`validate_log_store_state_machine_pair` before writing so a torn capture can
-never replace a good artifact.
+Residual: this still uses full-artifact checkpoints. R1's WAL follow-up should
+replace this with a smaller fsync'd vote/log durability path before production
+scale, but the R3 torn-capture restart brick is closed.
 
 ### R4. MEDIUM — Lease semantics ride on an unguarded, non-monotonic wall clock read at propose time
 
@@ -334,7 +334,7 @@ shift.
    The process path now checkpoints before ack, so the immediate safety blocker
    is closed. A fsync'd WAL should still replace full-artifact-per-RPC
    durability before production-scale heartbeat and replication traffic.
-2. **Atomic checkpoint capture + pre-write pair validation (R3).**
+2. **DONE — Atomic checkpoint capture + pre-write pair validation (R3).**
 3. **Failover story (R2).** Enable OpenRaft ticks in production config
    (keeping them disabled in deterministic tests), or extend the manual
    trigger into an automatic liveness-probe path so every node can elect when

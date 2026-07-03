@@ -465,6 +465,7 @@ impl LocalUnixObjectListingMetadataNodeClientConfig {
     }
 }
 
+#[derive(Clone)]
 pub struct LocalNodeStore {
     node_id: NodeId,
     data_dir: PathBuf,
@@ -1681,6 +1682,45 @@ impl LocalClusterMap {
     pub(crate) fn inherit_process_local_state_from(&mut self, previous: &Self) {
         self.runtime_state = Arc::clone(&previous.runtime_state);
         self.process_local_registry_key = previous.process_local_registry_key;
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_clone_with_pg_routes(
+        &self,
+        cluster_epoch: ClusterEpoch,
+        pg_routes: impl IntoIterator<Item = PgRouteSnapshot>,
+        historical_pg_routes: impl IntoIterator<Item = PgRouteSnapshot>,
+    ) -> Result<Self, ClusterBuildError> {
+        let node_ids = self.nodes.keys().copied().collect::<BTreeSet<_>>();
+        let pg_ids = self
+            .pg_ids
+            .iter()
+            .map(|pg_id| PgId::new(*pg_id))
+            .collect::<Vec<_>>();
+        let pg_routes = build_validated_pg_routes(
+            cluster_epoch,
+            &node_ids,
+            &pg_ids,
+            pg_routes
+                .into_iter()
+                .map(|route| LocalPgRoute::from(&route)),
+        )?;
+        Ok(Self {
+            epoch: cluster_epoch,
+            route_map_valid_until_ms: encode_route_map_valid_until_ms(None),
+            metadata_primary_node_id: self.metadata_primary_node_id,
+            nodes: self.nodes.clone(),
+            pg_ids: self.pg_ids.clone(),
+            pg_topology: self.pg_topology.clone(),
+            default_ec_shape: self.default_ec_shape,
+            pg_routes,
+            historical_pg_routes: historical_pg_routes
+                .into_iter()
+                .map(|route| ((route.cluster_epoch(), route.pg_id()), route))
+                .collect(),
+            runtime_state: Arc::clone(&self.runtime_state),
+            process_local_registry_key: self.process_local_registry_key,
+        })
     }
 
     fn open_with_configs_inner(

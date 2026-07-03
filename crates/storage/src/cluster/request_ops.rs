@@ -9636,6 +9636,16 @@ impl super::StorageCluster {
         None
     }
 
+    pub fn wait_for_reclaim_work_poll(&self, stop: &AtomicBool) -> Option<ReclaimWorkItem> {
+        if self.operation_epoch() != self.cluster_epoch() {
+            return None;
+        }
+        self.enqueue_durable_reclaim_work();
+        self.local_map
+            .runtime_state()
+            .wait_for_reclaim_work_poll(stop)
+    }
+
     pub fn wake_reclaim_workers(&self) {
         if self.operation_epoch() != self.cluster_epoch() {
             return;

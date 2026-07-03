@@ -3116,6 +3116,10 @@ impl ControlPlaneRaftAuthority {
 
         let mut last_validation_error = None;
         for _ in 0..CONTROL_PLANE_RAFT_RESTART_CAPTURE_MAX_ATTEMPTS {
+            // Capture the state machine first. If Raft advances concurrently,
+            // the later log-store export may be ahead, which restart can
+            // replay. The reverse order could persist state that the exported
+            // log cannot prove.
             let state_machine = self
                 .raft
                 .with_state_machine(|state_machine| {
@@ -14550,6 +14554,71 @@ mod tests {
             )
             .unwrap_err();
             assert!(err.to_string().contains("after committed restart gate"));
+        });
+    }
+
+    #[test]
+    fn control_plane_raft_durable_restart_artifact_capture_allows_log_ahead_of_state_machine() {
+        ControlPlaneRaftTypeConfig::run(async {
+            let mut log_store = ControlPlaneRaftLogStore::empty();
+            RaftLogStorage::append(
+                &mut log_store,
+                vec![
+                    bootstrap_membership_entry(1),
+                    blank_entry(3, 1, 1),
+                    blank_entry(3, 1, 2),
+                ],
+                IOFlushed::noop(),
+            )
+            .await
+            .unwrap();
+            RaftLogStorage::save_vote(
+                &mut log_store,
+                &Vote::<ControlPlaneRaftLeaderId>::new_committed(3, 1),
+            )
+            .await
+            .unwrap();
+            RaftLogStorage::save_committed(&mut log_store, Some(raft_log_id(3, 1, 2)))
+                .await
+                .unwrap();
+
+            let mut state_machine = ControlPlaneRaftStateMachine::empty();
+            state_machine
+                .apply_entry(bootstrap_membership_entry(1))
+                .unwrap();
+            state_machine.apply_entry(blank_entry(3, 1, 1)).unwrap();
+
+            let artifact = ControlPlaneRaftRestartArtifact::capture(
+                "test-cluster",
+                1,
+                &log_store,
+                &state_machine,
+            )
+            .expect("log-ahead restart artifact should be replayable");
+            assert_eq!(
+                artifact.state_machine.last_applied,
+                Some(raft_log_id(3, 1, 1))
+            );
+            assert_eq!(artifact.log_store.committed, Some(raft_log_id(3, 1, 2)));
+
+            let (mut restored_log_store, mut restored_state_machine) = artifact.restore().unwrap();
+            assert_eq!(
+                RaftLogStorage::read_committed(&mut restored_log_store)
+                    .await
+                    .unwrap(),
+                Some(raft_log_id(3, 1, 2))
+            );
+            assert_eq!(
+                restored_state_machine.last_applied(),
+                Some(raft_log_id(3, 1, 1))
+            );
+            restored_state_machine
+                .apply_entry(blank_entry(3, 1, 2))
+                .unwrap();
+            assert_eq!(
+                restored_state_machine.last_applied(),
+                Some(raft_log_id(3, 1, 2))
+            );
         });
     }
 

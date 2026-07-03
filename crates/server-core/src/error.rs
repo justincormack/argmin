@@ -588,6 +588,7 @@ fn store_error_diagnostic_cause_label(error: &StoreError) -> &'static str {
         StoreError::PgNotActive { .. } => "pg_not_active",
         StoreError::ShardPgNotActive { .. } => "shard_pg_not_active",
         StoreError::MetadataCommandLogConflict { .. } => "metadata_command_log_conflict",
+        StoreError::MetadataCommandLogGap { .. } => "metadata_command_log_gap",
         StoreError::MetadataCommandPendingConflict { .. } => "metadata_command_pending_conflict",
         StoreError::MetadataCommandContention { .. } => "metadata_command_contention",
         StoreError::MetadataTransferEmpty { .. } => "metadata_transfer_empty",
@@ -825,6 +826,15 @@ mod tests {
             log_conflict.diagnostic_cause_label(),
             "metadata_command_log_conflict"
         );
+
+        let log_gap = ServerError::Store(StoreError::MetadataCommandLogGap {
+            node_id: 1,
+            pg_id: 2,
+            cluster_epoch: storage::ClusterEpoch::INITIAL,
+            log_index: 5,
+            expected_log_index: 4,
+        });
+        assert_eq!(log_gap.diagnostic_cause_label(), "metadata_command_log_gap");
 
         let pending_conflict = ServerError::Store(StoreError::MetadataCommandPendingConflict {
             pg_id: 2,
