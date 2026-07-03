@@ -408,7 +408,7 @@ when prioritised. They correspond to the remaining findings from the Phase 11 re
   verify.
 
   Work items:
-  - **Partially complete:** Final bucket cleanup becomes a metadata command. Add a terminal command, e.g.
+  - **Completed:** Final bucket cleanup becomes a metadata command. Add a terminal command, e.g.
     `DeleteFinalizedBucket`, after the finalizer proves the bucket is deleting, empty, and
     reclaimed. Applying that command deletes the finalized bucket metadata rows. It must
     carry enough bucket identity/generation/delete-execution provenance to be stale-safe
@@ -432,16 +432,23 @@ when prioritised. They correspond to the remaining findings from the Phase 11 re
     Keep the imported-transfer case, but require explicit ordering/provenance: the imported
     proof must be tied to the source route/import epoch and must satisfy log-index/hash
     ordering rather than relying on "different digest" as evidence.
-  - **Delete test dependencies on digest-only mutation.** Audit tests and fixtures that
+  - **Partially complete:** Delete test dependencies on digest-only mutation. Audit tests and fixtures that
     create same-log/different-digest state by directly mutating materialised metadata or by
     refreshing digest rows without a command. Convert them to either apply the new terminal
     metadata command, construct imported-transfer provenance explicitly, or assert that the
     state is rejected. The remaining tests should not require
-    `allow_same_epoch_digest_only_progress` to pass.
-  - **Remove the relaxation from proof validation.** Delete the
-    `allow_same_epoch_digest_only_progress` branch in
-    `metadata_proof_satisfies_active_primary_observation_floor_impl` and make same-epoch,
-    same-log, different-digest active-primary observations fail closed.
+    `allow_same_epoch_digest_only_progress` to pass. The active-primary predicate and
+    heartbeat tests now assert that same-log/different-digest cleanup progress is rejected
+    instead of promoted; normal later-epoch progress is still accepted only when the
+    command-log hash changes.
+  - **Completed for same-log active-primary observations:** Remove the relaxation from
+    proof validation. The `allow_same_epoch_digest_only_progress` branch has been deleted
+    from `metadata_proof_satisfies_active_primary_observation_floor_impl`; same-log,
+    different-digest active-primary observations now fail closed, including across a later
+    control-plane epoch unless the command-log hash also changed. Imported metadata-transfer
+    lineage crossing remains separately handled by
+    `metadata_proof_satisfies_fenced_transfer_source_floor` and still needs the explicit
+    provenance tightening above.
   - **Add divergent-replica coverage.** Add a property/regression test that applies the same
     command log to two replicas, injects one out-of-band materialised metadata mutation on
     one replica, and asserts peering/metadata-transfer proof completion rejects it. Add a

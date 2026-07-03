@@ -7666,7 +7666,6 @@ fn metadata_proof_satisfies_active_primary_observation_floor(
         active_metadata_transfer_imported,
         active_floor_epoch,
         observed_epoch,
-        true,
     )
 }
 
@@ -7683,7 +7682,6 @@ fn metadata_proof_satisfies_peering_proof_floor(
         active_metadata_transfer_imported,
         active_floor_epoch,
         observed_epoch,
-        false,
     )
 }
 
@@ -7693,24 +7691,15 @@ fn metadata_proof_satisfies_active_primary_observation_floor_impl(
     active_metadata_transfer_imported: bool,
     active_floor_epoch: Option<ClusterEpoch>,
     observed_epoch: ClusterEpoch,
-    allow_same_epoch_digest_only_progress: bool,
 ) -> bool {
     if metadata_proof_satisfies_active_floor(active_floor, observed) {
-        return true;
-    }
-    if allow_same_epoch_digest_only_progress
-        && active_floor_epoch == Some(observed_epoch)
-        && observed.applied_log_index == active_floor.applied_log_index
-        && observed.applied_log_hash == active_floor.applied_log_hash
-        && observed.applied_log_hash != 0
-        && observed.state_digest != active_floor.state_digest
-    {
         return true;
     }
     if let Some(active_floor_epoch) = active_floor_epoch {
         active_floor_epoch < observed_epoch
             && observed != active_floor
             && observed.applied_log_hash != 0
+            && observed.applied_log_hash != active_floor.applied_log_hash
             && observed.state_digest != active_floor.state_digest
             && (!active_metadata_transfer_imported
                 || metadata_proof_satisfies_fenced_transfer_source_floor(active_floor, observed))
@@ -9068,6 +9057,13 @@ mod tests {
             Some(ClusterEpoch::new(7).unwrap()),
             ClusterEpoch::new(8).unwrap(),
         ));
+        assert!(metadata_proof_satisfies_active_primary_observation_floor(
+            imported_activation_floor,
+            same_index_epoch_local_proof,
+            true,
+            Some(ClusterEpoch::new(7).unwrap()),
+            ClusterEpoch::new(8).unwrap(),
+        ));
         assert!(!metadata_proof_satisfies_active_primary_observation_floor(
             imported_activation_floor,
             same_index_epoch_local_proof,
@@ -9085,7 +9081,7 @@ mod tests {
     }
 
     #[test]
-    fn active_primary_observation_floor_accepts_same_epoch_digest_only_progress() {
+    fn active_primary_observation_floor_rejects_same_epoch_digest_only_progress() {
         let active_floor = PgMetadataProof {
             applied_log_index: 42,
             applied_log_hash: 0xabc,
@@ -9107,7 +9103,7 @@ mod tests {
             state_digest: 0xdf0,
         };
 
-        assert!(metadata_proof_satisfies_active_primary_observation_floor(
+        assert!(!metadata_proof_satisfies_active_primary_observation_floor(
             active_floor,
             digest_only_progress,
             false,
@@ -13805,7 +13801,7 @@ mod tests {
     }
 
     #[test]
-    fn active_primary_heartbeat_accepts_digest_only_cleanup_progress() {
+    fn active_primary_heartbeat_does_not_promote_digest_only_cleanup_progress() {
         let tmp = test_util::tempdir();
         let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
         let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
@@ -13849,6 +13845,11 @@ mod tests {
             has_pending_metadata_command: false,
         }];
         authority.heartbeat(active_heartbeat, 2_020).unwrap();
+        let accepted_proof_epoch = authority
+            .snapshot()
+            .pg(PgId::new(22))
+            .unwrap()
+            .active_metadata_proof_epoch();
 
         let cleanup_proof = PgMetadataProof {
             applied_log_index: accepted_proof.applied_log_index,
@@ -13863,14 +13864,20 @@ mod tests {
             metadata_proof: cleanup_proof,
             has_pending_metadata_command: false,
         }];
-        authority.heartbeat(cleanup_heartbeat, 2_030).unwrap();
+        assert!(matches!(
+            authority.heartbeat(cleanup_heartbeat, 2_030),
+            Err(ControlPlaneError::PgActiveMetadataProofMismatch {
+                pg_id: 22,
+                node_id: 1,
+                expected,
+                actual,
+                ..
+            }) if expected == accepted_proof && actual == cleanup_proof
+        ));
 
         let pg = authority.snapshot().pg(PgId::new(22)).unwrap();
-        assert_eq!(pg.active_metadata_proof(), Some(cleanup_proof));
-        assert_eq!(
-            pg.active_metadata_proof_epoch(),
-            Some(authority.snapshot().cluster_epoch())
-        );
+        assert_eq!(pg.active_metadata_proof(), Some(accepted_proof));
+        assert_eq!(pg.active_metadata_proof_epoch(), accepted_proof_epoch);
         assert!(authority
             .snapshot()
             .runtime_map_for_storage_node_refresh(2_031, NodeId::new(1))
