@@ -25,6 +25,7 @@ const CONTROL_PLANE_RPC_READ_ONLY_RETRY_DEADLINE: Duration = Duration::from_secs
 const CONTROL_PLANE_RPC_READ_ONLY_RETRY_BACKOFF: Duration = Duration::from_millis(50);
 const CONTROL_PLANE_RPC_CHECK_APPLIED_DEADLINE: Duration = Duration::from_secs(20);
 const CONTROL_PLANE_RPC_CHECK_APPLIED_BACKOFF: Duration = Duration::from_millis(100);
+const CONTROL_PLANE_RPC_LIVENESS_RETRY_BACKOFF: Duration = Duration::from_millis(10);
 const CONTROL_PLANE_RPC_HEARTBEAT_OBSERVATION_MIN_LEN: usize = 4 + 1 + 8 + 8 + 8 + 1;
 const CONTROL_PLANE_RPC_RUNTIME_NODE_MIN_LEN: usize = 4 + 8 + 4 + 1;
 const CONTROL_PLANE_RPC_PG_ROUTE_MIN_LEN: usize = 8 + 4 + 4 + 1 + 1 + 4 + 1;
@@ -4004,16 +4005,25 @@ impl UnixControlPlaneClient {
     ) -> Result<Vec<u8>, ControlPlaneError> {
         debug_assert_eq!(kind, ControlPlaneRpcKind::RefreshNodeHeartbeat);
         let deadline = Instant::now() + retry_budget;
+        let mut retry_started = false;
+        let mut last_retryable_error = None;
         loop {
+            if retry_started && Instant::now() >= deadline {
+                return Err(last_retryable_error
+                    .take()
+                    .expect("heartbeat retry deadline reached after retryable error"));
+            }
             match self.send_request(kind, payload) {
                 Ok(payload) => return Ok(payload),
-                Err(error)
-                    if error.is_retryable_control_plane_rpc_transport_error()
-                        && Instant::now() < deadline =>
-                {
+                Err(error) if error.is_retryable_control_plane_rpc_transport_error() => {
                     let now = Instant::now();
+                    if now >= deadline {
+                        return Err(error);
+                    }
                     let remaining = deadline.saturating_duration_since(now);
-                    std::thread::sleep(remaining.min(CONTROL_PLANE_RPC_CHECK_APPLIED_BACKOFF));
+                    retry_started = true;
+                    last_retryable_error = Some(error);
+                    std::thread::sleep(remaining.min(CONTROL_PLANE_RPC_LIVENESS_RETRY_BACKOFF));
                 }
                 Err(error) => return Err(error),
             }
@@ -9832,6 +9842,65 @@ mod tests {
                 || source.kind() == ErrorKind::NotFound
                 || source.kind() == ErrorKind::UnexpectedEof
                 || source.kind() == ErrorKind::ConnectionReset));
+    }
+
+    #[test]
+    fn unix_control_plane_client_does_not_send_heartbeat_retry_at_lease_deadline() {
+        let tmp = test_util::tempdir();
+        let socket_path = tmp.path().join("control-plane.sock");
+        let server_socket_path = socket_path.clone();
+        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+        authority
+            .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
+            .unwrap();
+        authority
+            .set_pg_acting_set(PgId::new(7), vec![NodeId::new(1)])
+            .unwrap();
+        let heartbeat_epoch = authority.snapshot().cluster_epoch();
+        let server = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(75));
+            let listener = std::os::unix::net::UnixListener::bind(server_socket_path).unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let accept_deadline = Instant::now() + Duration::from_millis(75);
+            loop {
+                match listener.accept() {
+                    Ok((_stream, _addr)) => return true,
+                    Err(error)
+                        if error.kind() == ErrorKind::WouldBlock
+                            && Instant::now() < accept_deadline =>
+                    {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    Err(error) if error.kind() == ErrorKind::WouldBlock => return false,
+                    Err(error) => panic!("accept heartbeat retry: {error}"),
+                }
+            }
+        });
+
+        let mut client = UnixControlPlaneClient::new(&socket_path);
+        let refresh = client.refresh_node_heartbeat(
+            NodeHeartbeat {
+                node_id: NodeId::new(1),
+                node_incarnation: 42,
+                endpoint: "/tmp/argmin-node-1.sock".to_owned(),
+                observed_epoch: heartbeat_epoch,
+                requested_lease_duration_ms: 50,
+                cluster_map_history_reference_summary: PgClusterMapHistoryReferenceSummary {
+                    oldest_live_placement_epoch: Some(heartbeat_epoch),
+                    oldest_durable_backfill_epoch: None,
+                },
+                pg_observations: Vec::new(),
+            },
+            0,
+        );
+        let accepted_retry_after_deadline = server.join().unwrap();
+
+        assert!(!accepted_retry_after_deadline);
+        let error = refresh.unwrap_err();
+        assert!(matches!(error, ControlPlaneError::Io { source, .. }
+            if source.kind() == ErrorKind::ConnectionRefused
+                || source.kind() == ErrorKind::NotFound));
     }
 
     #[test]
