@@ -11164,7 +11164,24 @@ mod tests {
             assert_eq!(linearized_directory_status.node_id(), 412);
             assert!(linearized_directory_status.linearized_authority_serving());
             let routed_client_serving_authority = expect_bounded_control_plane_raft(
-                routed_client.current_serving_linearized_authority(),
+                async {
+                    for _ in 0..100 {
+                        match routed_client.current_serving_linearized_authority().await {
+                            Ok(authority) => return Ok(authority),
+                            Err(ControlPlaneError::RpcRemote { message })
+                                if message.contains("no serving raft authority") =>
+                            {
+                                ControlPlaneRaftTypeConfig::sleep(Duration::from_millis(10)).await;
+                            }
+                            Err(error) => return Err(error),
+                        }
+                    }
+                    Err(ControlPlaneError::RpcRemote {
+                        message:
+                            "authority routing handle current serving authority did not converge"
+                                .to_string(),
+                    })
+                },
                 operation_timeout,
                 "authority routing handle current serving linearized authority",
             )

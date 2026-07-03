@@ -177,6 +177,15 @@ fn run_set_pg_acting_set_live(
         .expect("set-pg-acting-set live helper should run")
 }
 
+fn run_transfer_raft_leadership(bin: &Path, socket_path: &Path, node_id: u64) -> Output {
+    Command::new(bin)
+        .arg("control-plane-transfer-raft-leadership")
+        .arg(socket_path)
+        .arg(node_id.to_string())
+        .output()
+        .expect("transfer Raft leadership helper should run")
+}
+
 fn wait_for_runtime_map_ready(
     bin: &Path,
     test_dir: &Path,
@@ -461,5 +470,73 @@ fn experimental_raft_restarted_control_plane_follower_catches_up_process_state()
         PgId::new(0),
         &[NodeId::new(1)],
         &mut [&mut node101, &mut node102, &mut restarted103],
+    );
+}
+
+#[test]
+fn experimental_raft_transferred_process_leader_survives_old_leader_loss() {
+    let bin = argmin_s3_bin();
+    let test_dir = TestDir::new("experimental-raft-process-transferred-leader");
+    let cluster_name = format!(
+        "process-transferred-leader-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after Unix epoch")
+            .as_nanos()
+    );
+    let raft_node_ids = [101, 102, 103];
+    let mut node102 = ChildGuard::spawn(&bin, test_dir.path(), &cluster_name, 102, &raft_node_ids);
+    wait_for_socket_file(&peer_socket(test_dir.path(), 102), &mut node102);
+    let mut node103 = ChildGuard::spawn(&bin, test_dir.path(), &cluster_name, 103, &raft_node_ids);
+    wait_for_socket_file(&peer_socket(test_dir.path(), 103), &mut node103);
+    let mut node101 = ChildGuard::spawn(&bin, test_dir.path(), &cluster_name, 101, &raft_node_ids);
+
+    let old_leader_socket = control_socket(test_dir.path(), 101);
+    wait_for_runtime_map_ready_on(
+        &bin,
+        &old_leader_socket,
+        test_dir.path(),
+        &mut [&mut node101, &mut node102, &mut node103],
+    );
+
+    let transfer = run_transfer_raft_leadership(&bin, &old_leader_socket, 102);
+    assert!(
+        transfer.status.success(),
+        "leadership transfer failed: {}\n{}",
+        format_admin_failure(transfer.status, &transfer),
+        process_logs(test_dir.path())
+    );
+
+    let new_leader_socket = control_socket(test_dir.path(), 102);
+    wait_for_runtime_map_ready_on(
+        &bin,
+        &new_leader_socket,
+        test_dir.path(),
+        &mut [&mut node101, &mut node102, &mut node103],
+    );
+
+    node101.stop();
+    let output = run_set_pg_acting_set_live(&bin, &new_leader_socket, 0, &[1]);
+    assert!(
+        output.status.success(),
+        "post-transfer acting-set change failed: {}\n{}",
+        format_admin_failure(output.status, &output),
+        process_logs(test_dir.path())
+    );
+    wait_for_follower_artifact_pg_acting_set(
+        &state_path(test_dir.path(), 103),
+        PgId::new(0),
+        &[NodeId::new(1)],
+        &mut [&mut node102, &mut node103],
+    );
+
+    let mut restarted101 =
+        ChildGuard::spawn(&bin, test_dir.path(), &cluster_name, 101, &raft_node_ids);
+    wait_for_follower_artifact_pg_acting_set(
+        &state_path(test_dir.path(), 101),
+        PgId::new(0),
+        &[NodeId::new(1)],
+        &mut [&mut restarted101, &mut node102, &mut node103],
     );
 }

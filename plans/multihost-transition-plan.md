@@ -10481,6 +10481,17 @@ Phase 12.3 progress:
   durable artifact, and verifies the restarted process catches up and
   checkpoints the missed command through ordinary Unix peer traffic. Leader
   failover remains the next process-level layer.
+- Added a deterministic process-level Raft leadership-transfer/failover smoke.
+  The control-plane Unix RPC surface now has a narrow experimental Raft
+  leadership-transfer admin request, exposed through
+  `control-plane-transfer-raft-leadership`, so the process test can move
+  leadership from the seed process to a known surviving voter without relying
+  on timer-driven election. The smoke transfers leadership from node 101 to
+  node 102, verifies node 102 serves the runtime map, stops node 101, commits a
+  PG acting-set change through node 102, then restarts node 101 and verifies it
+  catches up and checkpoints the post-transfer command. Natural leader election
+  after abrupt leader loss and snapshot-transfer process coverage remain open
+  12.3 work.
 
 1. define the replicated control-plane state machine:
    - state includes cluster epoch, PG count, PG state, PG acting sets, node

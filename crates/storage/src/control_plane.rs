@@ -21,6 +21,7 @@ pub const MAX_HEARTBEAT_LEASE_MS: u64 = 10_000;
 const CONTROL_PLANE_RPC_MAGIC: &[u8] = b"argmin-control-plane-rpc";
 const CONTROL_PLANE_RPC_MAX_PAYLOAD_LEN: usize = 8 * 1024 * 1024;
 const CONTROL_PLANE_RPC_IO_TIMEOUT: Duration = Duration::from_secs(1);
+const CONTROL_PLANE_RPC_LEADERSHIP_TRANSFER_TIMEOUT: Duration = Duration::from_secs(5);
 const CONTROL_PLANE_RPC_READ_ONLY_RETRY_DEADLINE: Duration = Duration::from_secs(10);
 const CONTROL_PLANE_RPC_READ_ONLY_RETRY_BACKOFF: Duration = Duration::from_millis(50);
 const CONTROL_PLANE_RPC_CHECK_APPLIED_DEADLINE: Duration = Duration::from_secs(20);
@@ -3027,6 +3028,14 @@ pub trait ControlPlaneAdmin {
         acting_set: Vec<NodeId>,
         transfer: PgMetadataTransferProof,
     ) -> Result<ClusterControlSnapshot, ControlPlaneError>;
+
+    fn transfer_raft_leadership_to(&mut self, node_id: u64) -> Result<(), ControlPlaneError> {
+        let _ = node_id;
+        Err(ControlPlaneError::RpcRemote {
+            message: "control-plane Raft leadership transfer is not supported by this authority"
+                .to_owned(),
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3957,13 +3966,22 @@ impl UnixControlPlaneClient {
         kind: ControlPlaneRpcKind,
         payload: &[u8],
     ) -> Result<Vec<u8>, ControlPlaneError> {
+        self.send_request_with_read_timeout(kind, payload, CONTROL_PLANE_RPC_IO_TIMEOUT)
+    }
+
+    fn send_request_with_read_timeout(
+        &self,
+        kind: ControlPlaneRpcKind,
+        payload: &[u8],
+        read_timeout: Duration,
+    ) -> Result<Vec<u8>, ControlPlaneError> {
         let mut stream =
             UnixStream::connect(&self.socket_path).map_err(|source| ControlPlaneError::Io {
                 context: "connect control-plane socket",
                 source,
             })?;
         stream
-            .set_read_timeout(Some(CONTROL_PLANE_RPC_IO_TIMEOUT))
+            .set_read_timeout(Some(read_timeout))
             .map_err(|source| ControlPlaneError::Io {
                 context: "set control-plane client read timeout",
                 source,
@@ -4396,6 +4414,19 @@ impl UnixControlPlaneClient {
             Err(error) => Err(error),
         }
     }
+
+    pub fn transfer_raft_leadership_to(&self, node_id: u64) -> Result<(), ControlPlaneError> {
+        let mut payload = Vec::new();
+        write_u64(&mut payload, node_id);
+        let payload = self.send_request_with_read_timeout(
+            ControlPlaneRpcKind::TransferRaftLeadership,
+            &payload,
+            CONTROL_PLANE_RPC_LEADERSHIP_TRANSFER_TIMEOUT,
+        )?;
+        let reader = PayloadReader::new(&payload);
+        reader.finish()?;
+        Ok(())
+    }
 }
 
 impl ControlPlaneRuntimeMapSource for UnixControlPlaneClient {
@@ -4623,6 +4654,15 @@ where
                 Err(error) => Err(error),
             }
         }
+        ControlPlaneRpcKind::TransferRaftLeadership => {
+            let mut reader = PayloadReader::new(&payload);
+            let node_id = reader.read_u64()?;
+            reader.finish()?;
+            match control_plane.transfer_raft_leadership_to(node_id) {
+                Ok(()) => Ok(Vec::new()),
+                Err(error) => Err(error),
+            }
+        }
     };
     let payload = encode_control_plane_rpc_response(response)?;
     Ok(ControlPlaneRpcResponse { kind, payload })
@@ -4657,6 +4697,7 @@ enum ControlPlaneRpcKind {
     FencePgForMetadataTransfer = 5,
     SetPgActingSetWithMetadataTransferRuntimeMap = 6,
     FencePgForMetadataTransferRuntimeMap = 7,
+    TransferRaftLeadership = 8,
 }
 
 impl ControlPlaneRpcKind {
@@ -4669,6 +4710,7 @@ impl ControlPlaneRpcKind {
             5 => Ok(Self::FencePgForMetadataTransfer),
             6 => Ok(Self::SetPgActingSetWithMetadataTransferRuntimeMap),
             7 => Ok(Self::FencePgForMetadataTransferRuntimeMap),
+            8 => Ok(Self::TransferRaftLeadership),
             _ => Err(ControlPlaneError::RpcProtocol {
                 message: format!("unknown control-plane RPC kind {value}"),
             }),

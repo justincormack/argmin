@@ -349,6 +349,45 @@ fn maybe_run_control_plane_admin_command() -> Option<i32> {
         };
     }
 
+    if command == "control-plane-transfer-raft-leadership" {
+        let Some(path) = args.next() else {
+            eprintln!(
+                "usage: argmin-s3 {} <socket-path> <raft-node-id>",
+                command.to_string_lossy()
+            );
+            return Some(2);
+        };
+        let Some(node_id) = args.next().and_then(|arg| {
+            arg.to_string_lossy()
+                .parse::<ControlPlaneRaftNodeId>()
+                .ok()
+                .filter(|node_id| *node_id != 0)
+        }) else {
+            eprintln!(
+                "usage: argmin-s3 {} <socket-path> <raft-node-id>",
+                command.to_string_lossy()
+            );
+            return Some(2);
+        };
+        if args.next().is_some() {
+            eprintln!(
+                "usage: argmin-s3 {} <socket-path> <raft-node-id>",
+                command.to_string_lossy()
+            );
+            return Some(2);
+        }
+        return match transfer_control_plane_raft_leadership(Path::new(&path), node_id) {
+            Ok(()) => {
+                eprintln!("control-plane transferred Raft leadership to node {node_id}");
+                Some(0)
+            }
+            Err(error) => {
+                eprintln!("{error}");
+                Some(1)
+            }
+        };
+    }
+
     if command == "control-plane-set-pg-acting-set-with-metadata-transfer-live" {
         let Some(path) = args.next() else {
             eprintln!(
@@ -621,6 +660,15 @@ fn set_control_plane_pg_acting_set_live(
     UnixControlPlaneClient::new(socket_path)
         .set_pg_acting_set_checked(pg_id, acting_set)
         .map_err(|error| format!("failed to set live PG acting set: {error}"))
+}
+
+fn transfer_control_plane_raft_leadership(
+    socket_path: &Path,
+    node_id: ControlPlaneRaftNodeId,
+) -> Result<(), String> {
+    UnixControlPlaneClient::new(socket_path)
+        .transfer_raft_leadership_to(node_id)
+        .map_err(|error| format!("failed to transfer control-plane Raft leadership: {error}"))
 }
 
 fn fence_control_plane_pg_for_metadata_transfer_live(
@@ -1501,6 +1549,14 @@ impl ControlPlaneAdmin for ExperimentalRaftControlPlane {
             transfer,
         })?;
         self.current_snapshot()
+    }
+
+    fn transfer_raft_leadership_to(
+        &mut self,
+        node_id: ControlPlaneRaftNodeId,
+    ) -> Result<(), ControlPlaneError> {
+        self.ensure_not_durably_poisoned()?;
+        self.block_on(self.authority.transfer_leadership_to(node_id))
     }
 }
 
