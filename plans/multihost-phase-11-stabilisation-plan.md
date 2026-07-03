@@ -391,7 +391,7 @@ when prioritised. They correspond to the remaining findings from the Phase 11 re
   implemented only as part of a deliberate upgrade-support phase, after legacy format
   cleanup and baseline versioning are in place.
 
-- **Slice 3: Remove digest-only metadata proof escape hatches.**
+- **Slice 3: Remove digest-only metadata proof escape hatches.** **Completed.**
 
   **Goal:** a metadata proof that changes `state_digest` must also be explained by
   metadata-command log progress, except for explicitly imported metadata-transfer state with
@@ -435,15 +435,13 @@ when prioritised. They correspond to the remaining findings from the Phase 11 re
     peering-floor, and fenced-transfer proof predicates now take explicit
     `MetadataProofProgressProvenance` carrying the floor epoch and whether the progress is
     ordinary local-epoch progress or imported-transfer lineage crossing.
-  - **Partially complete:** Delete test dependencies on digest-only mutation. Audit tests and fixtures that
-    create same-log/different-digest state by directly mutating materialised metadata or by
-    refreshing digest rows without a command. Convert them to either apply the new terminal
-    metadata command, construct imported-transfer provenance explicitly, or assert that the
-    state is rejected. The remaining tests should not require
-    `allow_same_epoch_digest_only_progress` to pass. The active-primary predicate and
-    heartbeat tests now assert that same-log/different-digest cleanup progress is rejected
-    instead of promoted; normal later-epoch progress is still accepted only when the
-    command-log hash changes.
+  - **Completed:** Delete test dependencies on digest-only mutation. Tests and fixtures that
+    cover same-log/different-digest state now either apply the new terminal metadata
+    command, construct imported-transfer provenance explicitly, or assert that the state is
+    rejected. No test requires `allow_same_epoch_digest_only_progress` to pass. The
+    active-primary predicate and heartbeat tests now assert that same-log/different-digest
+    cleanup progress is rejected instead of promoted; normal later-epoch progress is still
+    accepted only when the command-log hash changes.
   - **Completed for same-log active-primary observations:** Remove the relaxation from
     proof validation. The `allow_same_epoch_digest_only_progress` branch has been deleted
     from `metadata_proof_satisfies_active_primary_observation_floor_impl`; same-log,
@@ -469,6 +467,7 @@ when prioritised. They correspond to the remaining findings from the Phase 11 re
      observations.
   4. Tests no longer depend on generic digest-only progress; they either use logged
      commands, imported-transfer provenance, or expect rejection.
+  Status: complete.
 
 - **Slice 4: Control-plane transition open/save/reload property tests.** **Completed for
   the current Phase 11 PG transition graph.** The `6f9d1605` "second restart fails" bug is
