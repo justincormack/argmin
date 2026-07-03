@@ -1,0 +1,191 @@
+Raft startup checkpoint race can crash control plane
+Link: https://chatgpt.com/codex/cloud/security/findings/95d9673556348191972641d0c51d4fda?sev=&repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin
+Criticality: medium (attack path: medium)
+Status: fixed
+
+# Metadata
+Repo: justincormack/argmin
+Commit: 2b4ea5d
+Author: justin@specialbusservice.com
+Created: 03/07/2026, 15:57:27
+Assignee: Unassigned
+Signals: Security, Validated, Attack-path
+
+# Summary
+Introduced bug: the commit added concurrent peer-RPC checkpointing and starts accepting peer RPCs before startup checkpointing, but did not route the startup checkpoint calls through the same serialization helper.
+This change moves the experimental Raft peer listener into its own thread and starts it before the initialization block finishes. Peer RPC workers now checkpoint the durable restart artifact after handling a peer stream, using a new mutex. However, the startup path still calls authority.store_durable_restart_artifact(...) directly and does not take that mutex. Since the durable artifact writer uses a deterministic temp path based only on the destination file name and process ID, a peer RPC checkpoint and a startup checkpoint in the same process can concurrently create/truncate/write/rename the same temp file. A local process that can access the peer Unix socket, or a configured peer during multi-node startup, can trigger this race. The likely impact is control-plane process termination from a failed checkpoint rename or a restart artifact that later fails validation, causing availability loss for the experimental Raft control plane.
+
+# Resolution
+Fixed by commit dcaa70c85b637900917bdc7721e5f1c80197f6ab
+(https://github.com/justincormack/argmin/commit/dcaa70c85b637900917bdc7721e5f1c80197f6ab).
+
+The fix routes experimental Raft startup durable checkpoints through the same
+`durable_checkpoint_lock` helper used by peer RPC checkpointing, so startup and
+peer-RPC checkpoints cannot concurrently write the same deterministic temporary
+artifact path. Regression coverage was added to prove a peer RPC response is not
+written while the durable checkpoint lock is held.
+
+# Validation
+## Rubric
+- [x] Confirm peer listener/worker path can checkpoint after peer RPC while the process is still starting.
+- [x] Confirm peer-RPC checkpoint calls are serialized only when routed through the new durable_checkpoint_lock helper.
+- [x] Confirm startup checkpoint calls bypass that helper/lock after the peer listener is already active.
+- [x] Confirm durable artifact writes use a same-process deterministic temp path and non-atomic create/write/sync/rename sequence vulnerable to concurrent writers.
+- [x] Produce a bounded dynamic reproduction against the real code path showing checkpoint rename failure and process termination.
+## Report
+Validated the finding at commit 2b4ea5d0683b075d83fa943de7540bba318544ce. Code review confirms the race shape: peer workers call the serialized helper and exit on checkpoint failure at crates/argmin-s3/src/main.rs:1703-1713; the helper takes durable_checkpoint_lock at crates/argmin-s3/src/main.rs:1760-1770; the peer listener is started before startup checkpointing at crates/argmin-s3/src/main.rs:1840-1850; startup still calls authority.store_durable_restart_artifact directly without that lock at crates/argmin-s3/src/main.rs:1860-1862 and 1879-1881. The durable writer uses File::create/write/sync then fs::rename on a temp path at crates/storage/src/control_plane_raft.rs:4019-4035, and that temp path is deterministic per destination basename and process id at crates/storage/src/control_plane_raft.rs:4961-4967. Dynamic validation succeeded twice. First, an integration PoC using the real ControlPlaneRaftRestartArtifact writer concurrently failed reliably: `cargo test -p storage --features test-hooks --test durable_race_poc -- --nocapture` exited 101 with multiple panics on `Io { context: "commit control-plane OpenRaft durable restart artifact", source: Os { code: 2, kind: NotFound, message: "No such file or directory" } }`. Second, an end-to-end process probe built and launched the real argmin-s3 binary as user nobody, waited for the experimental Raft peer Unix socket, and flooded it during startup. It reproduced the production failure mode on attempt 0: `experimental OpenRaft control-plane durability checkpoint failed after peer RPC; exiting to avoid serving volatile committed state: commit control-plane OpenRaft durable restart artifact: No such file or directory (os error 2)`. Valgrind was attempted but is not installed in the container. LLDB was available and a breakpoint/backtrace at Rust panic was captured in the artifacts.
+
+# Evidence
+crates/argmin-s3/src/main.rs (L1703 to 1709)
+  Note: Peer RPC workers now checkpoint the durable artifact after each peer stream and use the new checkpoint lock.
+```
+        if let Some(path) = durable_artifact_path.as_deref() {
+            if let Err(error) = store_experimental_raft_durable_restart_artifact(
+                &runtime,
+                &authority,
+                path,
+                durable_checkpoint_lock.as_ref(),
+            ) {
+```
+
+crates/argmin-s3/src/main.rs (L1760 to 1770)
+  Note: The helper serializes checkpoints with durable_checkpoint_lock, but only callers using this helper are protected.
+```
+fn store_experimental_raft_durable_restart_artifact(
+    runtime: &Handle,
+    authority: &ControlPlaneRaftAuthority,
+    path: &Path,
+    durable_checkpoint_lock: Option<&Arc<Mutex<()>>>,
+) -> Result<(), ControlPlaneError> {
+    let _guard = durable_checkpoint_lock.map(|lock| {
+        lock.lock()
+            .expect("experimental OpenRaft durable checkpoint mutex poisoned")
+    });
+    block_on_control_plane_raft(runtime, authority.store_durable_restart_artifact(path))
+```
+
+crates/argmin-s3/src/main.rs (L1840 to 1850)
+  Note: The peer listener thread is started before startup initialization and checkpointing have completed, so peer workers can run concurrently with startup checkpoint writes.
+```
+    let _raft_peer_listener_loop = raft_peer_listener.map(|listener| {
+        spawn_experimental_raft_peer_listener_loop(
+            listener,
+            runtime.clone(),
+            Arc::clone(&authority),
+            node_id,
+            Arc::clone(&durable_artifact_path),
+            Arc::clone(&durable_checkpoint_lock),
+            Arc::clone(&active_raft_peer_rpc_workers),
+        )
+    });
+```
+
+crates/argmin-s3/src/main.rs (L1851 to 1862)
+  Note: The startup membership checkpoint calls authority.store_durable_restart_artifact directly instead of taking durable_checkpoint_lock.
+```
+    block_on_control_plane_raft(&runtime, async {
+        if !authority.is_initialized().await?
+            && experimental_raft_startup_initializes_membership(raft_peer_policy.as_ref(), node_id)
+        {
+            if let Some(policy) = &raft_peer_policy {
+                authority.initialize_membership(policy.peers()).await?;
+            } else {
+                authority.initialize_single_node_membership(node_id).await?;
+            }
+            authority
+                .store_durable_restart_artifact(Path::new(state_path))
+                .await?;
+```
+
+crates/argmin-s3/src/main.rs (L1879 to 1881)
+  Note: A second startup checkpoint also bypasses the checkpoint serialization helper while the peer listener is already active.
+```
+        authority
+            .store_durable_restart_artifact(Path::new(state_path))
+            .await?;
+```
+
+crates/storage/src/control_plane_raft.rs (L4019 to 4035)
+  Note: Durable artifact writes use a fixed temp path and rename it into place; concurrent writers in the same process can clobber or remove each other's temp file.
+```
+        let tmp_path = durable_artifact_tmp_path(path);
+        {
+            let mut file = File::create(&tmp_path).map_err(|source| ControlPlaneError::Io {
+                context: "create control-plane OpenRaft durable restart artifact temp file",
+                source,
+            })?;
+            file.write_all(&bytes)
+                .map_err(|source| ControlPlaneError::Io {
+                    context: "write control-plane OpenRaft durable restart artifact temp file",
+                    source,
+                })?;
+            file.sync_all().map_err(|source| ControlPlaneError::Io {
+                context: "sync control-plane OpenRaft durable restart artifact temp file",
+                source,
+            })?;
+        }
+        fs::rename(&tmp_path, path).map_err(|source| ControlPlaneError::Io {
+```
+
+crates/storage/src/control_plane_raft.rs (L4961 to 4967)
+  Note: The temp artifact path is deterministic per process, so concurrent checkpoints for the same state path share the same temp file.
+```
+fn durable_artifact_tmp_path(path: &Path) -> PathBuf {
+    let file_name = path
+        .file_name()
+        .and_then(|file_name| file_name.to_str())
+        .unwrap_or("control-plane-raft.state");
+    path.with_file_name(format!("{file_name}.tmp.{}", std::process::id()))
+}
+```
+
+# Attack-path analysis
+Final: medium | Decider: model_decided | Matrix severity: ignore | Policy adjusted: ignore
+## Rationale
+Kept at medium. The race is real and validated: peer workers can checkpoint after an attacker-controlled peer stream, startup checkpointing bypasses the same lock, and the durable writer uses a deterministic temp path, producing a demonstrated process exit on rename failure. The impact is high availability for the experimental control plane, but the attack surface is not public: it requires explicit experimental configuration and access to a private Unix-domain peer socket or a configured peer during startup. Those constraints prevent high/critical classification, while the reproducible control-plane crash supports medium rather than ignore/low.
+## Likelihood
+low - The bug is reliably triggerable once positioned, and validation reproduced process termination through the real binary. However, practical reachability is narrow because experimental Raft is off by default, the entrypoint is a private local Unix socket, and exploitation must occur during startup or from a configured peer/local same-user context.
+## Impact
+medium - Successful exploitation can terminate the experimental Raft control-plane process or leave a restart artifact that later fails validation. This is an availability impact on one service/control-plane instance; no code execution, credential disclosure, object-data read/write bypass, or cross-tenant compromise is evidenced.
+## Assumptions
+- The vulnerable mode is only present when the experimental OpenRaft control-plane configuration is enabled and a Raft peer Unix socket is configured.
+- An attacker must either run as a local process able to connect to the private peer Unix socket, or control/compromise a configured peer process that can send peer RPC traffic during startup.
+- No cloud, Kubernetes, or deployment manifests in the repository were used to infer broader exposure.
+- ARGMIN_CONTROL_PLANE_EXPERIMENTAL_RAFT=true
+- ARGMIN_CONTROL_PLANE_RAFT_PEER_SOCKET_PATH configured
+- attacker can connect to the local Unix peer socket or operate as a configured peer
+- connection occurs during the startup window while direct startup checkpointing is running
+## Path
+local/configured peer -> Raft peer Unix socket -> peer RPC worker checkpoint
+                                      \-> startup checkpoint without same lock
+peer checkpoint + startup checkpoint -> shared tmp file -> rename/I/O failure -> control-plane exit
+## Path evidence
+- `crates/argmin-s3/src/config.rs:149-153` - Experimental Raft control-plane and peer socket settings are explicit environment-controlled runtime configuration.
+- `crates/argmin-s3/src/config.rs:310-325` - Experimental Raft is disabled by default and peer socket path is only read from configuration.
+- `crates/argmin-s3/src/config.rs:455-463` - Raft-specific settings require ARGMIN_CONTROL_PLANE_EXPERIMENTAL_RAFT, limiting exposure to explicit experimental deployments.
+- `crates/argmin-s3/src/main.rs:1691-1713` - Peer RPC worker handles an accepted Unix stream, then checkpoints the durable artifact and exits the process if checkpointing fails.
+- `crates/argmin-s3/src/main.rs:1760-1770` - The new checkpoint helper serializes only callers that use durable_checkpoint_lock.
+- `crates/argmin-s3/src/main.rs:1840-1850` - The peer listener is spawned before the subsequent startup initialization checkpoint sequence finishes.
+- `crates/argmin-s3/src/main.rs:1851-1862` - The first startup checkpoint calls authority.store_durable_restart_artifact directly and bypasses the peer checkpoint mutex.
+- `crates/argmin-s3/src/main.rs:1879-1881` - A later startup checkpoint also directly calls the durable artifact writer without taking the shared mutex.
+- `crates/storage/src/control_plane_raft.rs:4019-4036` - Durable artifact writes create, write, sync, and rename a temp file; concurrent writers to the same temp path can interfere.
+- `crates/storage/src/control_plane_raft.rs:4961-4967` - The temp artifact path is deterministic per destination basename and process ID, so concurrent same-process checkpoints share it.
+- `crates/argmin-s3/src/main.rs:2172-2226` - The peer listener is a Unix-domain socket, not a public TCP listener.
+- `crates/argmin-s3/src/main.rs:2230-2250` - Socket parent directory must be private and owned by the process UID, reducing reachability to same-user/local or configured peer contexts.
+- `crates/storage/src/control_plane_raft.rs:4861-4888` - Incoming peer streams are parsed as configured-peer RPC frames with timeouts and identity validation, but this does not prevent a reachable peer from triggering post-RPC checkpointing.
+## Narrative
+The finding is a real runtime availability bug in the experimental OpenRaft control plane. Peer RPC workers checkpoint the durable restart artifact after handling a stream and use a new mutex, but the startup path starts the peer listener before initialization finishes and then calls authority.store_durable_restart_artifact directly without that mutex. The storage writer uses File::create/write/sync followed by fs::rename on a deterministic temp path derived only from the destination basename and process ID. Therefore, a local process or configured peer that can reach the private peer Unix socket can race a peer checkpoint with a startup checkpoint and cause a failed rename; the worker path exits the process on checkpoint failure. Exposure is constrained: the feature is experimental, disabled by default, and the socket directory is required to be private. This supports medium availability severity rather than high or critical.
+## Controls
+- Experimental feature flag required
+- Local Unix-domain socket rather than public TCP exposure
+- Socket directory must be private, non-world/group-accessible, and owned by process UID
+- Peer frame identity validation
+- Peer stream read/write timeouts
+- Peer frame size limits
+- Peer RPC worker limit
+- Missing control: startup durable checkpoints do not use the same mutex as peer checkpoints
+## Blindspots
+- Static repository review found no deployment manifests showing whether operators expose or share the peer socket directory in practice.
+- No cloud or runtime environment APIs were queried, so actual production exposure cannot be confirmed.
+- The assessment relies on provided validation evidence for dynamic exploitability; this attack-path review only rechecked repository artifacts.
+- The broader trust model for configured Raft peers is not fully documented, so whether a malicious peer is considered an in-scope attacker may vary by deployment.
