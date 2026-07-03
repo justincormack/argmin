@@ -9198,7 +9198,23 @@ Keep an explicit Phase 11 close-out before treating the phase as soak-clean:
          same-generation preserved attempt, and to make `reservation_wait`
          convergence prove forward progress rather than returning repeated
          client-visible `OperationAborted` while the durable attempt is already
-         fenced and resumable.
+         fenced and resumable. Status: partial. Foreground DeleteBucket
+         authorization now treats retryable write-snapshot contention as a
+         possible active delete attempt, but only loads the raw bucket row after
+         storage has proved that a live same-generation durable delete drain
+         exists, pre-drain bucket write reservations are empty, and there is no
+         unrelated pending bucket command. It then authorizes against that
+         drained/fenced active bucket and reaches
+         `begin_bucket_delete_if_current` where the existing generation fence
+         and reservation-wait adoption logic advance the attempt. A coordinator
+         regression seeds a `reservation_wait` attempt and makes the normal
+         bucket-write-drain wait hook fatal, proving the retry reaches adoption
+         without spending its budget behind its own preserved drain; a storage
+         regression proves active raw authorization is withheld until older
+         bucket writes drain. Remaining
+         work is to make `reservation_wait` convergence itself expose durable
+         progress or a concrete blocker instead of repeatedly surfacing generic
+         retryable pressure when reservations persist.
          Final-visibility
          adoption now also has coordinator-level reclaim-worker regressions that
          seed durable `final_visibility_check` and `final_visibility_proven`

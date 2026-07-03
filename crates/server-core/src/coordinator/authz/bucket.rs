@@ -106,7 +106,14 @@ impl Coordinator {
             Self::requester_can_bucket_owner_account_admin,
         ) {
             Ok(bucket) => bucket,
-            Err(ServerError::OperationAborted) => return Err(ServerError::OperationAborted),
+            Err(ServerError::OperationAborted) => {
+                if let Some(authorized) =
+                    self.authorize_delete_bucket_from_active_attempt_snapshot(storage_node, req)?
+                {
+                    return Ok(authorized);
+                }
+                return Err(ServerError::OperationAborted);
+            }
             Err(ServerError::BucketNotFound { name }) => {
                 if let Some(authorized) =
                     self.authorize_delete_bucket_from_raw_snapshot(storage_node, req)?
@@ -146,11 +153,44 @@ impl Coordinator {
         // DeleteBucket itself installs or observes the bucket write drain. Once
         // the drain has marked the bucket Deleting, normal bucket snapshots hide
         // it as not found, but an idempotent retry must still be able to reach
-        // begin_bucket_delete where AlreadyDeleting is handled. Do not use this
-        // raw-snapshot path for active buckets: OperationAborted from normal
-        // write-snapshot authorization can also mean unrelated metadata command
-        // contention, and there is no later auth revalidation after this method
-        // returns only the bucket name.
+        // begin_bucket_delete where AlreadyDeleting is handled.
+        self.authorize_delete_bucket_loaded_snapshot(snapshot, req, request)
+            .map(Some)
+    }
+
+    fn authorize_delete_bucket_from_active_attempt_snapshot(
+        &self,
+        storage_node: &Arc<StorageCluster>,
+        req: &BucketRequest<'_>,
+    ) -> Result<Option<AuthorizedDeleteBucket>, ServerError> {
+        let request = BucketHandleRequest::new()
+            .requiring_policy_view()
+            .requiring_bucket_tags_if_abac_enabled();
+        let Some(snapshot) = storage_node
+            .load_active_bucket_delete_attempt_authorization_snapshot(
+                req.name_typed(),
+                request.resolve_to_storage_request(),
+            )
+            .map_err(BucketHandleLoader::map_bucket_snapshot_error)?
+        else {
+            return Ok(None);
+        };
+
+        // The storage proof only returns an Active snapshot after the preserved
+        // DeleteBucket drain is live, same-generation, has drained older bucket
+        // writes, and has no unrelated pending bucket command. That makes the
+        // raw policy/tag view stable enough to authorize this retry before it
+        // re-enters begin_bucket_delete_if_current.
+        self.authorize_delete_bucket_loaded_snapshot(snapshot, req, request)
+            .map(Some)
+    }
+
+    fn authorize_delete_bucket_loaded_snapshot(
+        &self,
+        snapshot: storage::BucketSnapshot,
+        req: &BucketRequest<'_>,
+        request: BucketHandleRequest,
+    ) -> Result<AuthorizedDeleteBucket, ServerError> {
         let bucket = self
             .bucket_handle_loader()
             .load_bucket_handle_from_snapshot(snapshot, req.expected_bucket_owner(), request)?;
@@ -169,11 +209,11 @@ impl Coordinator {
             return Err(ServerError::AccessDenied);
         }
 
-        Ok(Some(AuthorizedDeleteBucket {
+        Ok(AuthorizedDeleteBucket {
             name: bucket.bucket().name.clone(),
             bucket_execution_generation: bucket.bucket_execution_generation(),
             bucket_incarnation_generation: bucket.bucket_incarnation_generation(),
-        }))
+        })
     }
 
     pub(in crate::coordinator) fn authorize_put_bucket_cors_with_storage_node(

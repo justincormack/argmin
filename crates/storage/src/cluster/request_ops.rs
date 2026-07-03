@@ -2286,8 +2286,9 @@ impl super::StorageCluster {
     /// snapshots intentionally hide it as not found, but an idempotent retry
     /// still needs enough metadata to perform authorization and reach
     /// `begin_bucket_delete`, where `AlreadyDeleting` is handled. Callers must
-    /// only accept this raw snapshot for an already-`Deleting` bucket; an active
-    /// bucket still requires the normal bucket-write-reserved snapshot.
+    /// only accept this raw snapshot for an already-`Deleting` bucket; use
+    /// `load_active_bucket_delete_attempt_authorization_snapshot` for the
+    /// narrower active-bucket preserved-attempt path.
     pub fn load_bucket_delete_authorization_snapshot(
         &self,
         bucket: &BucketName,
@@ -2336,6 +2337,63 @@ impl super::StorageCluster {
             lifecycle,
             cors,
         })
+    }
+
+    /// Load a raw Active-bucket authorization snapshot only after proving that
+    /// a preserved DeleteBucket attempt has become a stable write fence.
+    ///
+    /// The ordering matters: older bucket-write reservations must be drained
+    /// before reading policy/tag authorization inputs. Once the live drain is in
+    /// place and the reservation list is empty, new bucket writes cannot acquire
+    /// a reservation and older writes cannot commit after the snapshot.
+    pub fn load_active_bucket_delete_attempt_authorization_snapshot(
+        &self,
+        bucket: &BucketName,
+        request: BucketSnapshotRequest,
+    ) -> Result<Option<BucketSnapshot>, BucketSnapshotLoadError> {
+        let pg_id = PgId::new(self.bucket_metadata_pg_id(bucket));
+        let node = self
+            .local_map
+            .metadata_pg_primary_node(self.operation_epoch(), pg_id)?;
+        let reservation_client = node.bucket_write_reservation_client();
+        let Some(drain) = reservation_client.durable_bucket_write_drain(pg_id, bucket)? else {
+            return Ok(None);
+        };
+        if drain
+            .lease_deadline
+            .is_none_or(|deadline| deadline <= crate::clock::current_time_millis())
+        {
+            return Ok(None);
+        }
+        if !reservation_client
+            .durable_bucket_write_reservations(pg_id, bucket)?
+            .is_empty()
+        {
+            return Ok(None);
+        }
+        let pending = self.pending_metadata_command_for_bucket(pg_id, bucket)?;
+        if pending.is_some_and(|command| {
+            !matches!(
+                command.payload(),
+                MetadataCommandPayload::MarkBucketDeleting(mark) if mark.bucket_name() == bucket
+            )
+        }) {
+            return Ok(None);
+        }
+
+        let snapshot = match self.load_bucket_delete_authorization_snapshot(bucket, request) {
+            Ok(snapshot) => snapshot,
+            Err(BucketSnapshotLoadError::Metadata(MetadataError::BucketNotFound { .. })) => {
+                return Ok(None);
+            }
+            Err(error) => return Err(error),
+        };
+        if snapshot.bucket.state != BucketState::Active
+            || snapshot.bucket.bucket_execution_generation != drain.bucket_execution_generation
+        {
+            return Ok(None);
+        }
+        Ok(Some(snapshot))
     }
 
     fn load_bucket_delete_authorization_subresource(

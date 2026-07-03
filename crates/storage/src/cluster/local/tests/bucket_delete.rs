@@ -4101,6 +4101,63 @@ fn begin_bucket_delete_records_reservation_wait_phase_after_stream_cleanup() {
 }
 
 #[test]
+fn active_delete_attempt_authorization_snapshot_requires_drained_bucket_writes() {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2], ec_shape).unwrap();
+    let bucket = {
+        let topology = map
+            .nodes
+            .get(&NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        bucket_for_pg(topology, 1, "delete-active-auth-drain-")
+    };
+    set_route_primary(&mut map, 1, NodeId::new(1));
+
+    let map = Arc::new(map);
+    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    create_test_bucket(&cluster, &bucket);
+    let reservation = cluster
+        .acquire_durable_bucket_write_reservation(&bucket, "held-policy-write", None)
+        .unwrap();
+    cluster
+        .test_seed_bucket_delete_attempt_outcome(
+            &bucket,
+            crate::BucketDeleteAttemptOutcomeKind::Retryable,
+            crate::BucketDeleteAttemptPhase::ReservationWait,
+            "seeded reservation-wait attempt".to_string(),
+            None,
+        )
+        .unwrap();
+
+    let snapshot = cluster
+        .load_active_bucket_delete_attempt_authorization_snapshot(
+            &bucket,
+            crate::BucketSnapshotRequest::default(),
+        )
+        .unwrap();
+    assert!(
+        snapshot.is_none(),
+        "active DeleteBucket raw auth must wait until pre-drain bucket writes are gone"
+    );
+
+    cluster
+        .release_durable_bucket_write_reservation(reservation)
+        .unwrap();
+    let snapshot = cluster
+        .load_active_bucket_delete_attempt_authorization_snapshot(
+            &bucket,
+            crate::BucketSnapshotRequest::default(),
+        )
+        .unwrap()
+        .expect("drained active DeleteBucket attempt should expose a stable auth snapshot");
+    assert_eq!(snapshot.bucket.state, crate::BucketState::Active);
+}
+
+#[test]
 fn begin_bucket_delete_adopts_reservation_wait_phase_without_repeating_initial_scan() {
     let _serial = lock_bucket_scoped_hook_test();
     let tmp = test_util::tempdir();

@@ -9518,6 +9518,45 @@ fn delete_bucket_authorizes_idempotent_retry_while_deleting() {
 }
 
 #[test]
+fn delete_bucket_authorization_adopts_active_preserved_attempt_without_drain_wait() {
+    let tmp = test_util::tempdir();
+    let bucket = "bucket-delete-active-attempt-auth";
+    let storage_cluster = open_test_storage_cluster(tmp.path(), &[0, 1, 2]);
+    let coord = setup_direct_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
+    coord
+        .create_bucket_for_owner("default-owner", bucket, false)
+        .unwrap();
+    let bucket_name = trusted_bucket_name(bucket);
+    storage_cluster
+        .test_seed_bucket_delete_attempt_outcome(
+            &bucket_name,
+            storage::BucketDeleteAttemptOutcomeKind::Retryable,
+            storage::BucketDeleteAttemptPhase::ReservationWait,
+            "seeded reservation-wait attempt for auth adoption".to_string(),
+            None,
+        )
+        .unwrap();
+
+    let _serial = STORAGE_TEST_HOOK_SERIAL
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap();
+    let _hook_guard = install_bucket_scoped_test_hooks(BucketScopedTestHooks {
+        target: Some(bucket_name.clone()),
+        before_bucket_write_drain_wait: Some(Arc::new(|| {
+            panic!("DeleteBucket authorization should not wait behind its own preserved attempt");
+        })),
+        ..BucketScopedTestHooks::default()
+    });
+
+    delete_bucket_test(&coord, bucket)
+        .expect("DeleteBucket should authorize and adopt the preserved active attempt");
+
+    let info = storage_cluster.test_head_bucket_raw(&bucket_name).unwrap();
+    assert_eq!(info.state, storage::BucketState::Deleting);
+}
+
+#[test]
 fn delete_bucket_expired_route_map_maps_to_operation_aborted() {
     let tmp = test_util::tempdir();
     let bucket = "bucket-delete-expired-route-map";
