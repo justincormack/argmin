@@ -10542,6 +10542,14 @@ Phase 12.3 progress:
   committed leader vote, commits a PG acting-set change, and verifies node 103
   checkpoints the command. Timer-driven natural election policy remains open
   12.3 work and should be covered separately from randomized timeout sleeps.
+- Closed the immediate Raft peer ack-before-durable safety hole in the
+  experimental process boundary. Unix peer workers now read and handle the
+  peer request, checkpoint the durable restart artifact, and only then write
+  the response frame; checkpoint failure exits before acknowledging volatile
+  vote/log/snapshot state. A regression exercises a peer RPC whose checkpoint
+  target fails and verifies no response frame is written. The longer-term WAL
+  design remains open as a cost/performance replacement for full
+  artifact-per-peer-RPC checkpoints.
 
 1. define the replicated control-plane state machine:
    - state includes cluster epoch, PG count, PG state, PG acting sets, node

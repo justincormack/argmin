@@ -60,20 +60,22 @@ restart artifacts, peer transport, authority wrappers, read-index path),
 
 ## Findings
 
-### R1. CRITICAL — Raft protocol acks (vote / append-entries) are sent to peers before the durability checkpoint
+### R1. RESOLVED-SAFETY / FOLLOW-UP — Raft protocol acks must not be sent before durability
 
-Enables double-voting (split brain) and loss of client-acknowledged committed
-entries in multi-node mode. Confirmed.
+Original finding: peer vote / append-entries responses were sent before the
+durability checkpoint, enabling double-voting (split brain) and loss of
+client-acknowledged committed entries in multi-node mode. Confirmed at review
+time.
 
 - The log store is purely in-memory; `append()` reports entries flushed
   immediately (`control_plane_raft.rs:5828-5851`, `callback.io_completed(Ok(()))`
   at :5849) and `save_vote` is memory-only (:5802-5810). OpenRaft therefore
   treats votes/appends as persisted the moment they land in RAM.
-- The peer RPC worker writes the response frame inside stream handling
-  (`control_plane_raft.rs:4900-4924`) and only afterwards runs the durability
-  checkpoint (`crates/argmin-s3/src/main.rs:1747-1776`: handler at :1750,
-  checkpoint at :1759-1770). The `exit(1)` on checkpoint failure (:1769)
-  fires after the ack has already left the socket.
+- Status update: the process peer RPC worker now reads and handles the request,
+  checkpoints the durable restart artifact, and only then writes the response
+  frame. A checkpoint failure exits before any peer ack is written. This closes
+  the current process-mode ack-before-durable safety hole for vote, append,
+  transfer-leader, and snapshot frames.
 - Scenario A (split brain): follower F grants a vote in term 5, responds,
   crashes before checkpoint, restarts from an artifact with a term-4 vote,
   and grants a second vote in term 5 to a different candidate. Two leaders in
@@ -86,15 +88,14 @@ entries in multi-node mode. Confirmed.
   is silently rolled back and L's copy truncated on rejoin.
 - Single-node mode is not affected: submit → outcome → checkpoint → respond
   ordering is correct there (see R-OK1).
-- Existing tests only cover happy-path replication
-  (`crates/argmin-s3/tests/experimental_raft_process.rs:301-344`), never a
-  crash inside the ack→checkpoint window.
+- Regression coverage now includes a peer RPC checkpoint-failure case that
+  verifies no response frame is written before durability succeeds, plus the
+  existing real-process replication/failover smokes.
 
-Fix shape: persist before ack on the peer path — at minimum for vote and
-append-entries frames — or make `save_vote`/`append` genuinely durable via a
-small fsync'd WAL, demoting the full artifact to a compaction checkpoint. The
-full-artifact-per-RPC design will not survive cost analysis once heartbeat
-volume grows anyway; a WAL is the natural fix for both.
+Follow-up: the fix uses a full restart-artifact checkpoint before each peer
+response. That is safe but expensive. A small fsync'd vote/log WAL remains the
+natural production design, with the full artifact demoted to a compaction
+checkpoint. R3's torn-capture concern is separate and still open.
 
 ### R2. HIGH (liveness) — No automatic leader election or leader heartbeats in the production config
 
@@ -255,14 +256,13 @@ bounds it. Inconsistent rather than unsafe.
   term logic; transfer-leader and snapshot frames carry votes and are
   validated by `handle_transfer_leader`/`install_full_snapshot` term checks.
 
-### R10. LOW — Process exits on transient conditions in the serving loop
+### R10. LOW — Process exits on some transient conditions in the serving loop
 
-Losing leadership between the serving check (main.rs:2023-2036) and the
-`ExpireHeartbeatLeases` submit turns a routine `ForwardToLeader` error into
-`exit(1)` (:2064-2067); a concurrently-committed bootstrap race similarly
-exits via `bootstrap_empty_experimental_raft_control_plane` error mapping
-(:2042-2048). Availability only, but in multi-node mode leadership churn will
-crash-loop managers.
+Status update: losing leadership between the serving check and the
+`ExpireHeartbeatLeases` submit is now treated as benign leadership churn for
+that scan iteration instead of `exit(1)`. A concurrently-committed bootstrap
+race can still exit via `bootstrap_empty_experimental_raft_control_plane`
+error mapping (:2042-2048). Availability only.
 
 ### R11. INFO — Pinned alpha consensus dependency
 
@@ -319,9 +319,10 @@ shift.
 
 ## Raft hardening recommendations
 
-1. **Persist before ack on the peer path (R1 — hard blocker for 12.3
-   multi-node).** Fsync'd vote/log WAL; artifact becomes a compaction
-   checkpoint.
+1. **Replace full peer-response checkpoints with a vote/log WAL (R1 follow-up).**
+   The process path now checkpoints before ack, so the immediate safety blocker
+   is closed. A fsync'd WAL should still replace full-artifact-per-RPC
+   durability before production-scale heartbeat and replication traffic.
 2. **Atomic checkpoint capture + pre-write pair validation (R3).**
 3. **Failover story (R2).** Enable OpenRaft ticks in production config
    (keeping them disabled in deterministic tests), or extend the manual
@@ -351,13 +352,13 @@ shift.
    accept subset-consistent evolutions of the configured map.
 8. **Gate the peer socket on poison (R8)** via a shared flag checked in
    `spawn_experimental_raft_peer_rpc_worker`.
-9. **Smaller items:** do not `exit(1)` on `ForwardToLeader` from the
-   lease-expiry submit (R10); convert the peer network to nonblocking/tokio
-   I/O or a dedicated blocking pool with a connect timeout (R9); canonicalize
-   the snapshot text parser if artifact bytes are ever compared (R-OK4
-   caveat). Run `openraft::testing::log::suite` against the guarded log store
-   (currently skipped because the store is deliberately stricter than the
-   generic baseline; document the deviations if the suite cannot pass).
+9. **Smaller items:** finish the remaining bootstrap-race transient-exit case
+   (R10); convert the peer network to nonblocking/tokio I/O or a dedicated
+   blocking pool with a connect timeout (R9); canonicalize the snapshot text
+   parser if artifact bytes are ever compared (R-OK4 caveat). Run
+   `openraft::testing::log::suite` against the guarded log store (currently
+   skipped because the store is deliberately stricter than the generic
+   baseline; document the deviations if the suite cannot pass).
 
 ---
 
