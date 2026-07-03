@@ -6046,11 +6046,17 @@ impl RaftLogStorage<ControlPlaneRaftTypeConfig> for ControlPlaneRaftLogStore {
             }
         }
         if inner.committed.is_none() {
-            return Err(raft_log_store_error(format!(
-                "cannot purge control-plane OpenRaft log to {log_id}; no committed restart gate"
-            )));
+            if inner.entries.is_empty() && inner.last_purged_log_id.is_none() {
+                Self::validate_vote_covers_committed(inner.vote, log_id)?;
+                inner.committed = Some(log_id);
+            } else {
+                return Err(raft_log_store_error(format!(
+                    "cannot purge control-plane OpenRaft log to {log_id}; no committed restart gate"
+                )));
+            }
+        } else {
+            Self::validate_vote_covers_committed(inner.vote, log_id)?;
         }
-        Self::validate_vote_covers_committed(inner.vote, log_id)?;
         inner.entries.retain(|index, _| *index > log_id.index());
         inner.last_purged_log_id = Some(log_id);
         if inner
@@ -10619,6 +10625,41 @@ mod tests {
     }
 
     #[test]
+    fn control_plane_raft_log_store_allows_empty_snapshot_purge_to_establish_committed_gate() {
+        ControlPlaneRaftTypeConfig::run(async {
+            let mut store = ControlPlaneRaftLogStore::empty();
+            let snapshot_log_id = raft_log_id(3, 1, 7);
+
+            let err = RaftLogStorage::purge(&mut store, snapshot_log_id)
+                .await
+                .unwrap_err();
+            assert!(err.to_string().contains("missing vote state"));
+
+            let vote = Vote::<ControlPlaneRaftLeaderId>::new_committed(3, 1);
+            RaftLogStorage::save_vote(&mut store, &vote).await.unwrap();
+            RaftLogStorage::purge(&mut store, snapshot_log_id)
+                .await
+                .unwrap();
+            let log_state = RaftLogStorage::get_log_state(&mut store).await.unwrap();
+            assert_eq!(log_state.last_purged_log_id, Some(snapshot_log_id));
+            assert_eq!(log_state.last_log_id, Some(snapshot_log_id));
+            assert_eq!(
+                RaftLogStorage::read_committed(&mut store).await.unwrap(),
+                Some(snapshot_log_id)
+            );
+
+            let err = RaftLogStorage::purge(&mut store, raft_log_id(4, 1, 8))
+                .await
+                .unwrap_err();
+            assert!(err.to_string().contains("does not cover"));
+            assert_eq!(
+                RaftLogStorage::read_committed(&mut store).await.unwrap(),
+                Some(snapshot_log_id)
+            );
+        });
+    }
+
+    #[test]
     fn control_plane_openraft_single_node_initialize_uses_bootstrap_membership() {
         ControlPlaneRaftTypeConfig::run(async {
             let mut log_store = ControlPlaneRaftLogStore::empty();
@@ -13063,6 +13104,208 @@ mod tests {
             authority1.shutdown().await.unwrap();
             authority2.shutdown().await.unwrap();
             restarted_authority.shutdown().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn control_plane_openraft_fresh_follower_catches_up_from_leader_snapshot() {
+        ControlPlaneRaftTypeConfig::run(async {
+            let ThreeVoterAuthorityFixture {
+                network,
+                config,
+                leader_log_store,
+                third_log_store: _,
+                authority1,
+                authority2,
+                authority3,
+            } = initialized_three_node_voter_authorities_with_config(
+                test_raft_config_with_log_reversion(
+                    "control-plane-raft-fresh-follower-snapshot-catch-up-test",
+                    Some(true),
+                ),
+                1201,
+                1202,
+                1203,
+            )
+            .await;
+
+            let bootstrap = authority1
+                .submit_control_plane_command(ControlPlaneCommand::BootstrapInitialClusterMap {
+                    nodes: vec![
+                        (NodeId::new(1201), "node-1201".to_string()),
+                        (NodeId::new(1202), "node-1202".to_string()),
+                        (NodeId::new(1203), "node-1203".to_string()),
+                    ],
+                    pg_ids: vec![PgId::new(0)],
+                })
+                .await
+                .unwrap();
+            assert!(matches!(
+                bootstrap.outcome(),
+                ControlPlaneRaftCommandOutcome::Applied(
+                    ControlPlaneCommandResponse::BootstrapInitialClusterMap
+                )
+            ));
+            authority3
+                .wait_for_applied_log_id(
+                    bootstrap.log_id(),
+                    Duration::from_secs(1),
+                    "third voter applied bootstrap before losing local state",
+                )
+                .await
+                .unwrap();
+
+            let offline_write = authority1
+                .submit_control_plane_command(ControlPlaneCommand::MarkNodeAvailability {
+                    node_id: NodeId::new(1202),
+                    availability: NodeAvailabilityState::Unavailable,
+                })
+                .await
+                .unwrap();
+            assert!(matches!(
+                offline_write.outcome(),
+                ControlPlaneRaftCommandOutcome::Applied(
+                    ControlPlaneCommandResponse::MarkNodeAvailability
+                )
+            ));
+            authority2
+                .wait_for_applied_index_at_least(
+                    offline_write.log_id().index(),
+                    Duration::from_secs(1),
+                    "second voter applied command before leader snapshot purge",
+                )
+                .await
+                .unwrap();
+            authority3
+                .wait_for_applied_index_at_least(
+                    offline_write.log_id().index(),
+                    Duration::from_secs(1),
+                    "third voter applied command before losing local state",
+                )
+                .await
+                .unwrap();
+
+            let mut snapshot_progress = authority1.raft().watch_snapshot_progress();
+            authority1.raft().trigger().snapshot().await.unwrap();
+            snapshot_progress
+                .wait_until_ge(&Some(offline_write.log_id()))
+                .await
+                .unwrap();
+            let leader_snapshot = authority1.raft().get_snapshot().await.unwrap().unwrap();
+            assert_eq!(
+                leader_snapshot.meta.last_log_id,
+                Some(offline_write.log_id())
+            );
+
+            authority1
+                .raft()
+                .trigger()
+                .purge_log(offline_write.log_id().index())
+                .await
+                .unwrap();
+            wait_for_log_purged_to(
+                &leader_log_store,
+                offline_write.log_id(),
+                "leader purged log prefix before fresh follower rejoin",
+            )
+            .await;
+
+            authority3.shutdown().await.unwrap();
+            network.unregister(1203);
+
+            let fresh_log_store = ControlPlaneRaftLogStore::empty();
+            let fresh_raft = Raft::<ControlPlaneRaftTypeConfig, ControlPlaneRaftStateMachine>::new(
+                1203,
+                config,
+                network.clone(),
+                fresh_log_store.clone(),
+                ControlPlaneRaftStateMachine::empty(),
+            )
+            .await
+            .unwrap();
+            network.register(1203, fresh_raft.clone());
+            let fresh_authority = ControlPlaneRaftAuthority::new_with_log_store(
+                fresh_raft,
+                fresh_log_store.clone(),
+                "test-cluster",
+            );
+            authority1
+                .raft()
+                .trigger()
+                .allow_next_revert(&1203, true)
+                .await
+                .unwrap()
+                .unwrap();
+
+            let catch_up_trigger = authority1
+                .submit_control_plane_command(ControlPlaneCommand::MarkNodeAvailability {
+                    node_id: NodeId::new(1203),
+                    availability: NodeAvailabilityState::Unavailable,
+                })
+                .await
+                .unwrap();
+            assert!(matches!(
+                catch_up_trigger.outcome(),
+                ControlPlaneRaftCommandOutcome::Applied(
+                    ControlPlaneCommandResponse::MarkNodeAvailability
+                )
+            ));
+
+            fresh_authority
+                .wait_for_applied_index_at_least(
+                    catch_up_trigger.log_id().index(),
+                    Duration::from_secs(1),
+                    "fresh third voter caught up through leader snapshot",
+                )
+                .await
+                .unwrap();
+            let fresh_status = fresh_authority.status().await.unwrap();
+            assert_eq!(fresh_status.applied(), Some(catch_up_trigger.log_id()));
+            assert_eq!(
+                fresh_status.last_purged_log_id(),
+                Some(offline_write.log_id())
+            );
+            assert_eq!(
+                fresh_status.current_snapshot(),
+                Some(offline_write.log_id())
+            );
+            assert_eq!(
+                RaftLogStorage::read_committed(&mut fresh_log_store.clone())
+                    .await
+                    .unwrap(),
+                Some(catch_up_trigger.log_id())
+            );
+
+            let fresh_state = fresh_authority
+                .raft()
+                .with_state_machine(|state_machine| {
+                    let snapshot_log_id = state_machine
+                        .current_snapshot()
+                        .and_then(|snapshot| snapshot.meta.last_log_id);
+                    let snapshot = state_machine.inner().snapshot();
+                    let node1202_availability = snapshot
+                        .node(NodeId::new(1202))
+                        .map(|node| node.availability());
+                    let node1203_availability = snapshot
+                        .node(NodeId::new(1203))
+                        .map(|node| node.availability());
+                    Box::pin(async move {
+                        (
+                            snapshot_log_id,
+                            node1202_availability,
+                            node1203_availability,
+                        )
+                    })
+                })
+                .await
+                .unwrap();
+            assert_eq!(fresh_state.0, Some(offline_write.log_id()));
+            assert_eq!(fresh_state.1, Some(NodeAvailabilityState::Unavailable));
+            assert_eq!(fresh_state.2, Some(NodeAvailabilityState::Unavailable));
+
+            authority1.shutdown().await.unwrap();
+            authority2.shutdown().await.unwrap();
+            fresh_authority.shutdown().await.unwrap();
         });
     }
 

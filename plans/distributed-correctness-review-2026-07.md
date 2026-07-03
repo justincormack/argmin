@@ -180,9 +180,9 @@ Confirmed mechanics; exploitability depends on clock discipline.
   committed-timestamp high-water check at apply, which would be cheap and
   deterministic.
 
-### R5. MEDIUM — Fresh-follower snapshot install can violate the log store's own invariants
+### R5. RESOLVED — Fresh-follower snapshot install can violate the log store's own invariants
 
-Plausible; needs testing.
+Confirmed and fixed.
 
 - `purge()` errors with "no committed restart gate" if `committed` is `None`
   (`control_plane_raft.rs:5900-5904`), and `save_committed` requires the
@@ -197,6 +197,17 @@ Plausible; needs testing.
   treats it as fatal. The existing follower-snapshot-catch-up test
   (:12650-12800) restores from an artifact that already has a committed gate,
   so this path is uncovered. Fail-closed (node cannot join), not state loss.
+- Fixed by allowing `purge()` to establish the committed restart gate only for
+  the one fresh empty-log snapshot-install shape: no existing committed gate,
+  no retained entries, no previous purged boundary, and a persisted vote that
+  covers the snapshot log id. Non-empty logs still reject purge without an
+  existing committed gate.
+- Coverage added:
+  `control_plane_raft_log_store_allows_empty_snapshot_purge_to_establish_committed_gate`
+  pins the narrow log-store rule, and
+  `control_plane_openraft_fresh_follower_catches_up_from_leader_snapshot`
+  exercises a voter that loses all local state after the leader snapshots and
+  purges, then rejoins via `install_full_snapshot`.
 
 ### R6. MEDIUM-LOW — Any membership change bricks restart in peer mode
 
@@ -342,10 +353,10 @@ shift.
    previously existed" tripwire (sentinel file, or peers cross-checking
    authority incarnation on rejoin) so an empty restart of a known member
    fails closed instead of silently voting fresh.
-6. **Cover the fresh-follower snapshot path (R5).** Leader purges, brand-new
-   empty peer joins via `install_full_snapshot`. If the purge/`save_committed`
-   invariants fire, relax them for snapshot install (allow purge to establish
-   the committed gate at the snapshot log id when `committed=None`).
+6. **DONE — Cover the fresh-follower snapshot path (R5).** Leader purges,
+   brand-new empty peer joins via `install_full_snapshot`; `purge()` now
+   establishes the committed gate only for the fresh empty-log snapshot-install
+   shape.
 7. **Membership-change restart coverage (R6).** Either reject
    `replace_voters`/`add_learner` in peer mode until config-driven membership
    evolution is designed, or relax `validate_peer_policy_membership` to
