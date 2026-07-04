@@ -3413,6 +3413,10 @@ impl HttpFrontend {
                 .find(|(k, _)| k.eq_ignore_ascii_case(name))
                 .map(|(_, v)| v.as_str())
         };
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
 
         let post_auth = if [
             "x-amz-algorithm",
@@ -3428,21 +3432,29 @@ impl HttpFrontend {
                 reason: "missing x-amz-algorithm".to_string(),
             })?;
             auth::authenticate_post_sigv4(
-                algo,
-                field("x-amz-credential").ok_or_else(|| ServerError::InvalidRequest {
-                    reason: "missing x-amz-credential".to_string(),
-                })?,
-                field("x-amz-date").ok_or_else(|| ServerError::InvalidRequest {
-                    reason: "missing x-amz-date".to_string(),
-                })?,
-                field("policy").ok_or_else(|| ServerError::InvalidRequest {
-                    reason: "missing policy".to_string(),
-                })?,
-                field("x-amz-signature").ok_or_else(|| ServerError::InvalidRequest {
-                    reason: "missing x-amz-signature".to_string(),
-                })?,
+                auth::PostSigV4Request {
+                    algorithm: algo,
+                    credential: field("x-amz-credential").ok_or_else(|| {
+                        ServerError::InvalidRequest {
+                            reason: "missing x-amz-credential".to_string(),
+                        }
+                    })?,
+                    date: field("x-amz-date").ok_or_else(|| ServerError::InvalidRequest {
+                        reason: "missing x-amz-date".to_string(),
+                    })?,
+                    policy_b64: field("policy").ok_or_else(|| ServerError::InvalidRequest {
+                        reason: "missing policy".to_string(),
+                    })?,
+                    signature_hex: field("x-amz-signature").ok_or_else(|| {
+                        ServerError::InvalidRequest {
+                            reason: "missing x-amz-signature".to_string(),
+                        }
+                    })?,
+                    security_token: field("x-amz-security-token"),
+                },
                 &self.credentials,
                 auth::ExpectedCredentialScope::new(None, "s3"),
+                now,
             )
             .map_err(ServerError::Auth)?
         } else {
@@ -3467,10 +3479,6 @@ impl HttpFrontend {
         self.enforce_bucket_region_raw(bucket, effective_auth)?;
 
         let post_policy = if let Some(policy_b64) = field("policy") {
-            let now = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs();
             let mut field_pairs: Vec<(&str, &str)> = form_fields
                 .iter()
                 .filter(|(k, _)| !k.eq_ignore_ascii_case("key"))

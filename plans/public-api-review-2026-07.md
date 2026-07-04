@@ -54,15 +54,21 @@ steps it performs.
   unsigned `x-amz-content-sha256` header, so the implementation preserves that
   presigned-specific exception.
 
-- [ ] **A2. POST SigV4 skips credential-expiry and session-token validation
+- [x] **A2. POST SigV4 skips credential-expiry and security-token rejection
   entirely.** `authenticate_post_sigv4` (`crates/auth/src/post.rs:56-124`)
-  never calls `validate_record_token_and_expiry` (request.rs:552-582) and does
-  not take a timestamp. Header path calls it at request.rs:304-308, presigned
-  at request.rs:459-464. An expired or session-token-bound credential
-  authenticates POST uploads with no token. The sole call site
+  did not validate credential expiry, did not receive a timestamp, and did not
+  reject a supplied POST Object security-token form field. Header and presigned
+  auth already apply expiry validation and reject token inputs for Argmin's
+  supported static credentials. The sole call site
   (`crates/server-http/src/http/mod.rs:3430-3446`) does not compensate. Fix:
   add `now_epoch_secs` and the security-token form field to
-  `authenticate_post_sigv4` and run the same validation.
+  `authenticate_post_sigv4` and run the same static-credential validation.
+  Completed with AWS oracle coverage for the static-credential POST Object
+  case: an unexpected `x-amz-security-token` form field returns
+  `InvalidToken`. Argmin does not implement STS or temporary session
+  credentials, so stored session-token support was removed from
+  `CredentialRecord`; only credential-expiry checks remain as a local
+  credential property.
 
 - [ ] **A3. `now_epoch_secs == 0` is a sentinel that disables expiry checks,
   and production can produce it.** `request.rs:557-559` skips credential

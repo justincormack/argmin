@@ -690,7 +690,6 @@ mod tests {
             secret_key: SecretKey::new("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".to_string()),
             account: s3_types::AccountIdentity::from_principal("u1"),
             authorization_profile: crate::AuthorizationProfile::Standard,
-            session_token: None,
             expires_at_epoch_secs: None,
             enabled: false,
         });

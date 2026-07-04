@@ -139,7 +139,6 @@ fn add_configured_credential(credentials: &mut CredentialStore, credential: &Con
             credential.display_name.clone(),
         ),
         authorization_profile: authorization_profile(credential.authorization_profile),
-        session_token: None,
         expires_at_epoch_secs: None,
         enabled: true,
     });
@@ -157,7 +156,6 @@ fn build_credential_store(config: &ServerConfig) -> CredentialStore {
         secret_key: config.secret_access_key.clone(),
         account,
         authorization_profile: auth::AuthorizationProfile::OwnerAccountAdmin,
-        session_token: None,
         expires_at_epoch_secs: None,
         enabled: true,
     });

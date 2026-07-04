@@ -27,7 +27,6 @@ pub use s3_types::AccountIdentity;
 use subtle::ConstantTimeEq;
 
 pub(crate) const MAX_ACCESS_KEY_ID_LEN: usize = 128;
-pub(crate) const MAX_SESSION_TOKEN_LEN: usize = 4096;
 pub(crate) const MAX_AUTHORIZATION_HEADER_LEN: usize = 8192;
 pub(crate) const MAX_PRESIGNED_QUERY_LEN: usize = 16384;
 pub(crate) const MAX_CREDENTIAL_LEN: usize = 2048;
@@ -66,7 +65,7 @@ pub use credential::{
 pub use error::AuthError;
 pub use post::{
     authenticate_post_sigv4, prepare_post_policy, validate_post_policy,
-    validate_prepared_post_policy_size, ExpectedCredentialScope, PostPolicyError,
+    validate_prepared_post_policy_size, ExpectedCredentialScope, PostPolicyError, PostSigV4Request,
     PreparedPostPolicy,
 };
 pub use request::{

@@ -42,17 +42,12 @@ pub struct CredentialRecord {
     pub secret_key: SecretKey,
     pub account: AccountIdentity,
     pub authorization_profile: AuthorizationProfile,
-    pub session_token: Option<String>,
     pub expires_at_epoch_secs: Option<u64>,
     pub enabled: bool,
 }
 
 impl std::fmt::Debug for CredentialRecord {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let session_token = self
-            .session_token
-            .as_ref()
-            .map(|_| observability::redacted("session_token"));
         f.debug_struct("CredentialRecord")
             .field(
                 "access_key_id",
@@ -61,7 +56,6 @@ impl std::fmt::Debug for CredentialRecord {
             .field("secret_key", &self.secret_key)
             .field("account", &self.account)
             .field("authorization_profile", &self.authorization_profile)
-            .field("session_token", &session_token)
             .field("expires_at_epoch_secs", &self.expires_at_epoch_secs)
             .field("enabled", &self.enabled)
             .finish()
@@ -164,7 +158,7 @@ impl CredentialStore {
 
     /// Add a basic static credential pair.
     ///
-    /// Principal defaults to the access key ID, with no session token or expiry.
+    /// Principal defaults to the access key ID, with no expiry.
     pub fn add(&mut self, access_key_id: String, secret_key: SecretKey) {
         let account = AccountIdentity::from_principal(access_key_id.clone());
         self.add_record(CredentialRecord {
@@ -172,7 +166,6 @@ impl CredentialStore {
             secret_key,
             account,
             authorization_profile: AuthorizationProfile::Standard,
-            session_token: None,
             expires_at_epoch_secs: None,
             enabled: true,
         });
@@ -247,14 +240,12 @@ mod tests {
                 "User 123",
             ),
             authorization_profile: AuthorizationProfile::Standard,
-            session_token: Some("token".into()),
             expires_at_epoch_secs: Some(1234),
             enabled: true,
         });
         let record = store.get_record("AKID").unwrap();
         assert_eq!(record.account.principal(), "user-123");
         assert_eq!(record.account.display_name(), "User 123");
-        assert_eq!(record.session_token.as_deref(), Some("token"));
         assert_eq!(record.expires_at_epoch_secs, Some(1234));
     }
 
@@ -319,16 +310,13 @@ mod tests {
             secret_key: SecretKey::new("super-secret".into()),
             account: AccountIdentity::from_principal("user-123"),
             authorization_profile: AuthorizationProfile::Standard,
-            session_token: Some("token-value".into()),
             expires_at_epoch_secs: Some(1234),
             enabled: true,
         };
         let debug = format!("{record:?}");
         assert!(debug.contains(r#""AK\r\nID""#));
         assert!(debug.contains("<redacted:secret_key>"));
-        assert!(debug.contains("<redacted:session_token>"));
         assert!(!debug.contains("super-secret"));
-        assert!(!debug.contains("token-value"));
 
         let scope = CredentialScope {
             access_key_id: "AK\nID".into(),

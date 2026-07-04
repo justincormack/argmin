@@ -4,7 +4,7 @@
 /// `policy`, `x-amz-signature`
 use crate::credential::{parse_credential_scope_ref, CredentialStore};
 use crate::error::AuthError;
-use crate::request::{AuthContext, AuthMode};
+use crate::request::{validate_static_record_token_and_expiry, AuthContext, AuthMode};
 use crate::sigv4;
 
 const TRACE_TARGET: &str = "auth";
@@ -49,32 +49,41 @@ impl PreparedPostPolicy {
     }
 }
 
+/// SigV4 POST Object form authentication fields.
+#[derive(Clone, Copy, Debug)]
+pub struct PostSigV4Request<'a> {
+    pub algorithm: &'a str,
+    pub credential: &'a str,
+    pub date: &'a str,
+    pub policy_b64: &'a str,
+    pub signature_hex: &'a str,
+    pub security_token: Option<&'a str>,
+}
+
 /// Authenticate a POST Object request using SigV4 form fields.
 ///
 /// SigV4 POST signs the base64-encoded policy directly (no canonical request).
 /// Returns `Ok(AuthContext)` on success.
 pub fn authenticate_post_sigv4(
-    algorithm: &str,
-    credential: &str,
-    date: &str,
-    policy_b64: &str,
-    signature_hex: &str,
+    request: PostSigV4Request<'_>,
     store: &CredentialStore,
     expected_scope: ExpectedCredentialScope<'_>,
+    now_epoch_secs: u64,
 ) -> Result<AuthContext, AuthError> {
     observability::trace_scope!(
         TRACE_TARGET,
         "authenticate_post_sigv4",
         "algorithm={} credential={}",
-        algorithm,
+        request.algorithm,
         observability::redacted("sigv4_credential")
     );
     // Validate algorithm
-    if algorithm != "AWS4-HMAC-SHA256" {
+    if request.algorithm != "AWS4-HMAC-SHA256" {
         return Err(AuthError::MalformedAuth);
     }
 
-    let credential = parse_credential_scope_ref(credential).ok_or(AuthError::MalformedAuth)?;
+    let credential =
+        parse_credential_scope_ref(request.credential).ok_or(AuthError::MalformedAuth)?;
     if expected_scope
         .region
         .is_some_and(|region| credential.region != region)
@@ -85,7 +94,7 @@ pub fn authenticate_post_sigv4(
         });
     }
 
-    if !crate::canonical::amz_date_matches_date_stamp(date, credential.date) {
+    if !crate::canonical::amz_date_matches_date_stamp(request.date, credential.date) {
         return Err(AuthError::MalformedAuth);
     }
 
@@ -96,6 +105,7 @@ pub fn authenticate_post_sigv4(
     if !record.enabled {
         return Err(AuthError::UnknownAccessKey);
     }
+    validate_static_record_token_and_expiry(record, request.security_token, now_epoch_secs)?;
 
     // Derive signing key and compute expected signature
     let signing_key = sigv4::derive_signing_key(
@@ -104,11 +114,11 @@ pub fn authenticate_post_sigv4(
         credential.region,
         credential.service,
     );
-    let expected_sig = sigv4::hmac_sha256(signing_key.as_ref(), policy_b64.as_bytes());
+    let expected_sig = sigv4::hmac_sha256(signing_key.as_ref(), request.policy_b64.as_bytes());
     let expected_hex = sigv4::hex_encode(expected_sig.as_ref());
 
     // Constant-time comparison to prevent timing attacks on signature values.
-    if !crate::constant_time_eq(expected_hex.as_bytes(), signature_hex.as_bytes()) {
+    if !crate::constant_time_eq(expected_hex.as_bytes(), request.signature_hex.as_bytes()) {
         return Err(AuthError::SignatureMismatch);
     }
 
@@ -447,6 +457,44 @@ mod tests {
         store
     }
 
+    fn authenticate_post_sigv4(
+        algorithm: &str,
+        credential: &str,
+        date: &str,
+        policy_b64: &str,
+        signature_hex: &str,
+        store: &CredentialStore,
+        expected_scope: ExpectedCredentialScope<'_>,
+    ) -> Result<AuthContext, AuthError> {
+        super::authenticate_post_sigv4(
+            PostSigV4Request {
+                algorithm,
+                credential,
+                date,
+                policy_b64,
+                signature_hex,
+                security_token: None,
+            },
+            store,
+            expected_scope,
+            0,
+        )
+    }
+
+    fn signed_test_policy() -> (String, String) {
+        let policy_b64 =
+            "eyJleHBpcmF0aW9uIjoiMjAzMC0wMS0wMVQwMDowMDowMFoiLCJjb25kaXRpb25zIjpbXX0=".to_string();
+        let signing_key = crate::sigv4::derive_signing_key(
+            &SecretKey::new("testSecretKey456".to_string()),
+            "20250101",
+            "us-east-1",
+            "s3",
+        );
+        let sig = crate::sigv4::hmac_sha256(signing_key.as_ref(), policy_b64.as_bytes());
+        let sig_hex = crate::sigv4::hex_encode(sig.as_ref());
+        (policy_b64, sig_hex)
+    }
+
     #[test]
     fn check_expiration_future() {
         assert!(check_expiration("2099-12-31T23:59:59Z", 0).is_ok());
@@ -508,31 +556,71 @@ mod tests {
     #[test]
     fn sigv4_post_valid() {
         let store = test_store();
-        let policy_b64 = "eyJleHBpcmF0aW9uIjoiMjAzMC0wMS0wMVQwMDowMDowMFoiLCJjb25kaXRpb25zIjpbXX0=";
+        let (policy_b64, sig_hex) = signed_test_policy();
         let date = "20250101T000000Z";
         let credential = "testAccessKey123/20250101/us-east-1/s3/aws4_request";
-
-        // Compute expected signature
-        let signing_key = crate::sigv4::derive_signing_key(
-            &SecretKey::new("testSecretKey456".to_string()),
-            "20250101",
-            "us-east-1",
-            "s3",
-        );
-        let sig = crate::sigv4::hmac_sha256(signing_key.as_ref(), policy_b64.as_bytes());
-        let sig_hex = crate::sigv4::hex_encode(sig.as_ref());
 
         let ctx = authenticate_post_sigv4(
             "AWS4-HMAC-SHA256",
             credential,
             date,
-            policy_b64,
+            &policy_b64,
             &sig_hex,
             &store,
             ExpectedCredentialScope::new(None, "s3"),
         )
         .unwrap();
         assert_eq!(ctx.access_key_id.as_deref(), Some("testAccessKey123"));
+    }
+
+    #[test]
+    fn sigv4_post_unexpected_security_token() {
+        let store = test_store();
+        let (policy_b64, sig_hex) = signed_test_policy();
+        let err = super::authenticate_post_sigv4(
+            PostSigV4Request {
+                algorithm: "AWS4-HMAC-SHA256",
+                credential: "testAccessKey123/20250101/us-east-1/s3/aws4_request",
+                date: "20250101T000000Z",
+                policy_b64: &policy_b64,
+                signature_hex: &sig_hex,
+                security_token: Some("unexpected"),
+            },
+            &store,
+            ExpectedCredentialScope::new(None, "s3"),
+            0,
+        )
+        .unwrap_err();
+        assert!(matches!(err, AuthError::UnexpectedSecurityToken { .. }));
+    }
+
+    #[test]
+    fn sigv4_post_expired_token() {
+        let mut store = CredentialStore::new();
+        store.add_record(crate::credential::CredentialRecord {
+            access_key_id: "testAccessKey123".to_string(),
+            secret_key: SecretKey::new("testSecretKey456".to_string()),
+            account: AccountIdentity::from_principal("u1"),
+            authorization_profile: crate::AuthorizationProfile::Standard,
+            expires_at_epoch_secs: Some(100),
+            enabled: true,
+        });
+        let (policy_b64, sig_hex) = signed_test_policy();
+        let err = super::authenticate_post_sigv4(
+            PostSigV4Request {
+                algorithm: "AWS4-HMAC-SHA256",
+                credential: "testAccessKey123/20250101/us-east-1/s3/aws4_request",
+                date: "20250101T000000Z",
+                policy_b64: &policy_b64,
+                signature_hex: &sig_hex,
+                security_token: None,
+            },
+            &store,
+            ExpectedCredentialScope::new(None, "s3"),
+            101,
+        )
+        .unwrap_err();
+        assert!(matches!(err, AuthError::ExpiredToken));
     }
 
     #[test]
@@ -1316,7 +1404,6 @@ mod tests {
             secret_key: SecretKey::new("secret".to_string()),
             account: AccountIdentity::from_principal("p"),
             authorization_profile: crate::AuthorizationProfile::Standard,
-            session_token: None,
             expires_at_epoch_secs: None,
             enabled: false,
         });

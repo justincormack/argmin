@@ -7,8 +7,8 @@ use auth::credential::SecretKey;
 use auth::sigv4::{derive_signing_key, parse_auth_header};
 use aws_credential_types::Credentials;
 use aws_sigv4::http_request::{
-    sign, PayloadChecksumKind, PercentEncodingMode, SessionTokenMode, SignableBody,
-    SignableRequest, SignatureLocation, SigningSettings, UriPathNormalizationMode,
+    sign, PayloadChecksumKind, PercentEncodingMode, SignableBody, SignableRequest,
+    SignatureLocation, SigningSettings, UriPathNormalizationMode,
 };
 use aws_sigv4::sign::v4;
 use aws_smithy_runtime_api::client::identity::Identity;
@@ -39,8 +39,6 @@ fn aws_signing_settings() -> SigningSettings {
     settings.payload_checksum_kind = PayloadChecksumKind::XAmzSha256;
     settings.signature_location = SignatureLocation::Headers;
     settings.uri_path_normalization_mode = UriPathNormalizationMode::Disabled;
-    settings.session_token_mode = SessionTokenMode::Include;
-    settings.session_token_name_override = None;
     settings
 }
 

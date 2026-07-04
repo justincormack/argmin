@@ -14,8 +14,8 @@ use crate::sigv4::{
     derive_signing_key, parse_auth_header, unsigned_required_headers, verify_request_record,
 };
 use crate::{
-    MAX_AUTHORIZATION_HEADER_LEN, MAX_PRESIGNED_QUERY_LEN, MAX_SESSION_TOKEN_LEN,
-    MAX_SIGNED_HEADERS_LEN, MAX_SIGNED_HEADER_COUNT,
+    MAX_AUTHORIZATION_HEADER_LEN, MAX_PRESIGNED_QUERY_LEN, MAX_SIGNED_HEADERS_LEN,
+    MAX_SIGNED_HEADER_COUNT,
 };
 
 const TRACE_TARGET: &str = "auth";
@@ -303,7 +303,7 @@ fn authenticate_header<H: HeaderSource + ?Sized>(
         store,
     )?;
 
-    validate_record_token_and_expiry(
+    validate_static_record_token_and_expiry(
         record,
         headers.first_value("x-amz-security-token"),
         now_epoch_secs,
@@ -466,7 +466,7 @@ fn authenticate_presigned<H: HeaderSource + ?Sized>(
         return Err(AuthError::UnknownAccessKey);
     }
     let token = query_param_lossy(query_string, "X-Amz-Security-Token");
-    validate_record_token_and_expiry(record, token.as_deref(), now_epoch_secs)?;
+    validate_static_record_token_and_expiry(record, token.as_deref(), now_epoch_secs)?;
 
     let signed_header_pairs = collect_signed_headers(&signed_headers, headers)?;
     let canonical_hdrs = canonical_headers(&signed_header_pairs);
@@ -561,7 +561,7 @@ where
     Ok(out)
 }
 
-fn validate_record_token_and_expiry(
+pub(crate) fn validate_static_record_token_and_expiry(
     record: &crate::credential::CredentialRecord,
     request_token: Option<&str>,
     now_epoch_secs: u64,
@@ -572,19 +572,7 @@ fn validate_record_token_and_expiry(
         }
     }
 
-    if let Some(expected_token) = record.session_token.as_deref() {
-        if request_token.is_some_and(|t| t.len() > MAX_SESSION_TOKEN_LEN) {
-            return Err(AuthError::InvalidToken);
-        }
-        // Constant-time comparison to prevent timing attacks on session tokens.
-        let matches = match request_token {
-            Some(t) => crate::constant_time_eq(t.as_bytes(), expected_token.as_bytes()),
-            None => false,
-        };
-        if !matches {
-            return Err(AuthError::InvalidToken);
-        }
-    } else if let Some(token) = request_token {
+    if let Some(token) = request_token {
         return Err(AuthError::UnexpectedSecurityToken {
             token: token.to_string(),
         });
@@ -1037,7 +1025,6 @@ mod tests {
             secret_key: SecretKey::new("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".to_string()),
             account: account("u1"),
             authorization_profile: crate::AuthorizationProfile::Standard,
-            session_token: Some("expected".to_string()),
             expires_at_epoch_secs: None,
             enabled: true,
         });
@@ -1072,7 +1059,6 @@ mod tests {
             secret_key: SecretKey::new("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".to_string()),
             account: account("u1"),
             authorization_profile: crate::AuthorizationProfile::Standard,
-            session_token: None,
             expires_at_epoch_secs: Some(5),
             enabled: true,
         });
@@ -1544,7 +1530,6 @@ mod tests {
             secret_key: SecretKey::new("secret".to_string()),
             account: account("p"),
             authorization_profile: crate::AuthorizationProfile::Standard,
-            session_token: None,
             expires_at_epoch_secs: None,
             enabled: false,
         });
@@ -1587,67 +1572,41 @@ mod tests {
         assert!(matches!(err, AuthError::UnknownAccessKey));
     }
 
-    // ── validate_record_token_and_expiry ──────────────────────────────
+    // ── validate_static_record_token_and_expiry ───────────────────────
 
     #[test]
-    fn token_valid_match() {
+    fn unexpected_token_rejected_for_static_credential() {
         let record = CredentialRecord {
             access_key_id: "AKID".to_string(),
             secret_key: SecretKey::new("s".to_string()),
             account: account("p"),
             authorization_profile: crate::AuthorizationProfile::Standard,
-            session_token: Some("tok123".to_string()),
             expires_at_epoch_secs: None,
             enabled: true,
         };
-        validate_record_token_and_expiry(&record, Some("tok123"), 0).unwrap();
-    }
-
-    #[test]
-    fn token_mismatch() {
-        let record = CredentialRecord {
-            access_key_id: "AKID".to_string(),
-            secret_key: SecretKey::new("s".to_string()),
-            account: account("p"),
-            authorization_profile: crate::AuthorizationProfile::Standard,
-            session_token: Some("expected".to_string()),
-            expires_at_epoch_secs: None,
-            enabled: true,
-        };
-        let err = validate_record_token_and_expiry(&record, Some("wrong"), 0).unwrap_err();
-        assert!(matches!(err, AuthError::InvalidToken));
-    }
-
-    #[test]
-    fn token_missing_when_required() {
-        let record = CredentialRecord {
-            access_key_id: "AKID".to_string(),
-            secret_key: SecretKey::new("s".to_string()),
-            account: account("p"),
-            authorization_profile: crate::AuthorizationProfile::Standard,
-            session_token: Some("expected".to_string()),
-            expires_at_epoch_secs: None,
-            enabled: true,
-        };
-        let err = validate_record_token_and_expiry(&record, None, 0).unwrap_err();
-        assert!(matches!(err, AuthError::InvalidToken));
-    }
-
-    #[test]
-    fn unexpected_token_when_not_required() {
-        let record = CredentialRecord {
-            access_key_id: "AKID".to_string(),
-            secret_key: SecretKey::new("s".to_string()),
-            account: account("p"),
-            authorization_profile: crate::AuthorizationProfile::Standard,
-            session_token: None,
-            expires_at_epoch_secs: None,
-            enabled: true,
-        };
-        let err = validate_record_token_and_expiry(&record, Some("unexpected"), 0).unwrap_err();
+        let err =
+            validate_static_record_token_and_expiry(&record, Some("unexpected"), 0).unwrap_err();
         assert!(matches!(
             err,
             AuthError::UnexpectedSecurityToken { token } if token == "unexpected"
+        ));
+    }
+
+    #[test]
+    fn overlong_unexpected_token_rejected_like_other_static_credential_tokens() {
+        let record = CredentialRecord {
+            access_key_id: "AKID".to_string(),
+            secret_key: SecretKey::new("s".to_string()),
+            account: account("p"),
+            authorization_profile: crate::AuthorizationProfile::Standard,
+            expires_at_epoch_secs: None,
+            enabled: true,
+        };
+        let token = "x".repeat(4097);
+        let err = validate_static_record_token_and_expiry(&record, Some(&token), 0).unwrap_err();
+        assert!(matches!(
+            err,
+            AuthError::UnexpectedSecurityToken { token: returned } if returned == token
         ));
     }
 
@@ -1658,12 +1617,11 @@ mod tests {
             secret_key: SecretKey::new("s".to_string()),
             account: account("p"),
             authorization_profile: crate::AuthorizationProfile::Standard,
-            session_token: None,
             expires_at_epoch_secs: Some(5),
             enabled: true,
         };
         // now_epoch_secs == 0 skips expiry check
-        validate_record_token_and_expiry(&record, None, 0).unwrap();
+        validate_static_record_token_and_expiry(&record, None, 0).unwrap();
     }
 
     #[test]
@@ -1673,11 +1631,10 @@ mod tests {
             secret_key: SecretKey::new("s".to_string()),
             account: account("p"),
             authorization_profile: crate::AuthorizationProfile::Standard,
-            session_token: None,
             expires_at_epoch_secs: None,
             enabled: true,
         };
-        validate_record_token_and_expiry(&record, None, 100).unwrap();
+        validate_static_record_token_and_expiry(&record, None, 100).unwrap();
     }
 
     #[test]
@@ -1687,11 +1644,10 @@ mod tests {
             secret_key: SecretKey::new("s".to_string()),
             account: account("p"),
             authorization_profile: crate::AuthorizationProfile::Standard,
-            session_token: None,
             expires_at_epoch_secs: Some(100),
             enabled: true,
         };
-        validate_record_token_and_expiry(&record, None, 100).unwrap();
+        validate_static_record_token_and_expiry(&record, None, 100).unwrap();
     }
 
     // ── Helper function unit tests ────────────────────────────────────
@@ -1924,74 +1880,16 @@ mod tests {
         assert_eq!(ctx.mode, AuthMode::HeaderSigV4);
     }
 
-    // ── Presigned: security token in query string ─────────────────────
+    // ── Presigned: static credentials reject security token in query ───
 
     #[test]
-    fn presigned_security_token_in_query() {
+    fn presigned_security_token_in_query_rejected_for_static_credential() {
         let mut store = CredentialStore::new();
         store.add_record(CredentialRecord {
             access_key_id: "AKIAIOSFODNN7EXAMPLE".to_string(),
             secret_key: SecretKey::new("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".to_string()),
             account: account("u1"),
             authorization_profile: crate::AuthorizationProfile::Standard,
-            session_token: Some("session-token-123".to_string()),
-            expires_at_epoch_secs: None,
-            enabled: true,
-        });
-        let base_query = "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIAIOSFODNN7EXAMPLE%2F20240201%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Date=20240201T120000Z&X-Amz-Expires=900&X-Amz-Security-Token=session-token-123&X-Amz-SignedHeaders=host";
-        let headers = [("host", "examplebucket.s3.amazonaws.com")];
-        let query_for_sig = canonical_query_string(base_query);
-        let canonical_req = canonical_request(
-            "GET",
-            "/hello.txt",
-            &query_for_sig,
-            "host:examplebucket.s3.amazonaws.com\n",
-            "host",
-            "UNSIGNED-PAYLOAD",
-        );
-        let canonical_hash = sha256_hex(canonical_req.as_bytes());
-        let scope = "20240201/us-east-1/s3/aws4_request";
-        let sts = string_to_sign("20240201T120000Z", scope, &canonical_hash);
-        let key = crate::sigv4::derive_signing_key(
-            &SecretKey::new("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".to_string()),
-            "20240201",
-            "us-east-1",
-            "s3",
-        );
-        let sig = hex_encode_lower(
-            hmac::sign(
-                &hmac::Key::new(hmac::HMAC_SHA256, key.as_ref()),
-                sts.as_bytes(),
-            )
-            .as_ref(),
-        );
-        let full_query = format!("{base_query}&X-Amz-Signature={sig}");
-        let ctx = authenticate_request(
-            "GET",
-            "/hello.txt",
-            &full_query,
-            &headers,
-            b"",
-            &store,
-            Some("us-east-1"),
-            "s3",
-            parse_amz_date("20240201T120500Z").unwrap(),
-        )
-        .unwrap();
-        assert_eq!(ctx.mode, AuthMode::PresignedSigV4);
-    }
-
-    // ── Presigned: token mismatch via query ───────────────────────────
-
-    #[test]
-    fn presigned_token_mismatch_in_query() {
-        let mut store = CredentialStore::new();
-        store.add_record(CredentialRecord {
-            access_key_id: "AKIAIOSFODNN7EXAMPLE".to_string(),
-            secret_key: SecretKey::new("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".to_string()),
-            account: account("u1"),
-            authorization_profile: crate::AuthorizationProfile::Standard,
-            session_token: Some("expected-token".to_string()),
             expires_at_epoch_secs: None,
             enabled: true,
         });
@@ -2009,7 +1907,10 @@ mod tests {
             0,
         )
         .unwrap_err();
-        assert!(matches!(err, AuthError::InvalidToken));
+        assert!(matches!(
+            err,
+            AuthError::UnexpectedSecurityToken { token } if token == "wrong-token"
+        ));
     }
 
     // ── Presigned: expired token ──────────────────────────────────────
@@ -2022,7 +1923,6 @@ mod tests {
             secret_key: SecretKey::new("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".to_string()),
             account: account("u1"),
             authorization_profile: crate::AuthorizationProfile::Standard,
-            session_token: None,
             expires_at_epoch_secs: Some(100),
             enabled: true,
         });

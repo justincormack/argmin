@@ -195,7 +195,6 @@ impl TestServer {
                         "test-account",
                     ),
                     authorization_profile: auth::AuthorizationProfile::OwnerAccountAdmin,
-                    session_token: None,
                     expires_at_epoch_secs: None,
                     enabled: true,
                 });
@@ -208,7 +207,6 @@ impl TestServer {
                         "test-account-limited",
                     ),
                     authorization_profile: auth::AuthorizationProfile::Standard,
-                    session_token: None,
                     expires_at_epoch_secs: None,
                     enabled: true,
                 });
@@ -221,7 +219,6 @@ impl TestServer {
                         "test-account-root",
                     ),
                     authorization_profile: auth::AuthorizationProfile::OwnerAccountAdmin,
-                    session_token: None,
                     expires_at_epoch_secs: None,
                     enabled: true,
                 });
@@ -234,7 +231,6 @@ impl TestServer {
                         "alt-account",
                     ),
                     authorization_profile: auth::AuthorizationProfile::OwnerAccountAdmin,
-                    session_token: None,
                     expires_at_epoch_secs: None,
                     enabled: true,
                 });

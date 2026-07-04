@@ -30,6 +30,25 @@ corresponding error.
 
 ## Behavior notes
 
+### STS and temporary session credentials are not implemented
+
+Argmin currently supports static S3 access key credentials only. It does not
+implement STS endpoints or temporary session credentials, and credential records
+do not carry an expected session token.
+
+For static credentials, supplied security-token inputs are still rejected with
+AWS-compatible S3 errors:
+
+- a signed `x-amz-security-token` header, presigned
+  `X-Amz-Security-Token` query parameter, or POST Object
+  `x-amz-security-token` form field is rejected with `InvalidToken`
+- an unsigned `x-amz-security-token` header is rejected by the general SigV4
+  `x-amz-*` signing rule with `HeadersNotSigned`
+
+Tests for temporary credential authentication should not be added until Argmin
+has real temporary credential support. AWS-backed compatibility tests should
+instead pin how S3 rejects token inputs supplied with static credentials.
+
 ### Delete-then-recreate bucket name reuse may require retry
 
 `DeleteBucket` should not be treated as proof that the same bucket name is

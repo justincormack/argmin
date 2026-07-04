@@ -394,6 +394,19 @@ fn assert_error_code(body: &str, code: &str) {
     );
 }
 
+fn assert_invalid_token_response(status: u16, body: &str) {
+    assert_eq!(status, 400, "expected 400, got {status} body={body}");
+    assert_error_code(body, "InvalidToken");
+    assert!(
+        body.contains("The provided token is malformed or otherwise invalid."),
+        "expected InvalidToken message, got: {body}"
+    );
+}
+
+fn append_security_token_field(fields: &mut Vec<(String, String)>, token: &str) {
+    fields.push(("x-amz-security-token".to_string(), token.to_string()));
+}
+
 async fn wait_for_put_object_access_denied(client: &aws_sdk_s3::Client, bucket: &str, key: &str) {
     for attempt in 0..20 {
         let result = client
@@ -483,6 +496,56 @@ fn test_post_object_sigv4_credential_service_must_be_s3() {
         let (status, body) = post_object(&bucket, &field_refs, b"wrong service", "test.txt");
         assert_eq!(status, 400, "expected 400, got {status} body={body}");
         assert_error_code(&body, "InvalidArgument");
+
+        s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
+    });
+}
+
+#[test]
+fn test_post_object_sigv4_unexpected_security_token_rejected() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+        let key = "post-unexpected-security-token";
+        let token = "unexpected-post-security-token";
+        let mut fields = sigv4_fields(
+            &bucket,
+            key,
+            &[serde_json::json!({"x-amz-security-token": token})],
+        );
+        append_security_token_field(&mut fields, token);
+        let field_refs: Vec<(&str, &str)> = fields
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+
+        let (status, body) = post_object(&bucket, &field_refs, b"unexpected token", "test.txt");
+        assert_invalid_token_response(status, &body);
+
+        s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
+    });
+}
+
+#[test]
+fn test_post_object_sigv4_overlong_unexpected_security_token_rejected() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+        let key = "post-overlong-unexpected-security-token";
+        let token = "x".repeat(4097);
+        let mut fields = sigv4_fields(
+            &bucket,
+            key,
+            &[serde_json::json!({"x-amz-security-token": token.as_str()})],
+        );
+        append_security_token_field(&mut fields, &token);
+        let field_refs: Vec<(&str, &str)> = fields
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+
+        let (status, body) = post_object(&bucket, &field_refs, b"unexpected token", "test.txt");
+        assert_invalid_token_response(status, &body);
 
         s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
     });
