@@ -36,6 +36,10 @@ impl UnixStorageNodeClient {
             context: "connect storage-node read-handle RPC socket",
             source,
         })?;
+        configure_storage_rpc_stream_timeout(
+            &stream,
+            "configure storage-node read-handle RPC socket timeout",
+        )?;
         Ok(UnixStorageNodeReadHandleSession {
             node_id: self.node_id,
             stream,
@@ -54,6 +58,10 @@ impl UnixStorageNodeClient {
             context: "connect storage-node metadata command RPC socket",
             source,
         })?;
+        configure_storage_rpc_stream_timeout(
+            &stream,
+            "configure storage-node metadata command RPC socket timeout",
+        )?;
         let session = UnixStorageNodeMetadataCommandSession {
             node_id: self.node_id,
             cluster_epoch: self.cluster_epoch,
@@ -138,10 +146,10 @@ impl UnixStorageNodeReadHandleSession {
             payload,
         };
         write_storage_rpc_frame_to(&mut self.stream, &request).map_err(|error| {
-            self.rpc_payload_error("write read-handle RPC request", error.to_string())
+            storage_rpc_stream_error(self.node_id, "write read-handle RPC request", error)
         })?;
         let response = read_storage_rpc_frame_from(&mut self.stream).map_err(|error| {
-            self.rpc_payload_error("read read-handle RPC response", error.to_string())
+            storage_rpc_stream_error(self.node_id, "read read-handle RPC response", error)
         })?;
         if response.request_id != request_id || response.kind != kind {
             return Err(self.rpc_payload_error(
@@ -233,15 +241,17 @@ impl UnixStorageNodeMetadataCommandSession {
             payload,
         };
         write_storage_rpc_frame_to(&mut inner.stream, &request).map_err(|error| {
-            self.rpc_payload_error(
+            storage_rpc_stream_error(
+                self.node_id,
                 "write metadata command session RPC request",
-                error.to_string(),
+                error,
             )
         })?;
         let response = read_storage_rpc_frame_from(&mut inner.stream).map_err(|error| {
-            self.rpc_payload_error(
+            storage_rpc_stream_error(
+                self.node_id,
                 "read metadata command session RPC response",
-                error.to_string(),
+                error,
             )
         })?;
         if response.request_id != request_id || response.kind != kind {
@@ -278,19 +288,13 @@ impl UnixStorageNodeMetadataCommandSession {
         }
     }
 
-    fn release_metadata_command_pg_lock(&self) -> Result<(), StoreError> {
-        let pg_id = {
-            let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-            if inner.released {
-                return Ok(());
-            }
-            inner.pg_id
-        };
-        let payload = self.encode_metadata_command_state_request(pg_id);
-        self.rpc_request(StorageRpcMessageKind::MetadataCommandPgLockRelease, payload)?;
+    fn close_metadata_command_pg_lock_on_drop(&self) {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if inner.released {
+            return;
+        }
+        let _ = inner.stream.shutdown(std::net::Shutdown::Both);
         inner.released = true;
-        Ok(())
     }
 
     fn metadata_command_acceptance_request(
@@ -420,7 +424,7 @@ impl UnixStorageNodeMetadataCommandSession {
 }
 impl Drop for UnixStorageNodeMetadataCommandSession {
     fn drop(&mut self) {
-        let _ = self.release_metadata_command_pg_lock();
+        self.close_metadata_command_pg_lock_on_drop();
     }
 }
 impl MetadataCommandNodeClient for UnixStorageNodeMetadataCommandSession {

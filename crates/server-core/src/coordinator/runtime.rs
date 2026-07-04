@@ -1782,7 +1782,7 @@ fn run_one_placed_segment_shard_backfill(
                 Err(error) => {
                     emit_shard_backfill_event(
                         Some(claim.work_item.request.data_pg_id),
-                        "complete_failed",
+                        shard_backfill_completion_error_event(&error),
                         shard_backfill_queue_depth(storage_cluster),
                         None,
                     );
@@ -1871,12 +1871,21 @@ fn shard_backfill_error_is_stale_retry(error: &StoreError) -> bool {
     }
 }
 
+fn shard_backfill_completion_error_event(error: &StoreError) -> &'static str {
+    if shard_backfill_error_is_stale_retry(error) {
+        "complete_stale"
+    } else {
+        "complete_failed"
+    }
+}
+
 fn shard_backfill_remote_error_is_stale_retry(code: storage::StorageRpcErrorCode) -> bool {
     matches!(
         code,
         storage::StorageRpcErrorCode::StaleShardLocation
             | storage::StorageRpcErrorCode::InactivePgRoute
             | storage::StorageRpcErrorCode::NonActingSetAccess
+            | storage::StorageRpcErrorCode::TransportTimeout
             | storage::StorageRpcErrorCode::WrongClusterEpoch
     )
 }
@@ -3259,6 +3268,31 @@ mod tests {
             }
         ));
         assert!(!shard_backfill_error_is_stale_retry(&StoreError::NotFound));
+    }
+
+    #[test]
+    fn shard_backfill_completion_error_classifies_stale_as_non_hard() {
+        assert_eq!(
+            shard_backfill_completion_error_event(&StoreError::StalePayloadOperation {
+                pg_id: 7,
+                operation_epoch: storage::ClusterEpoch::INITIAL,
+                current_epoch: storage::ClusterEpoch::new(2).unwrap(),
+            }),
+            "complete_stale"
+        );
+        assert_eq!(
+            shard_backfill_completion_error_event(&StoreError::NotFound),
+            "complete_failed"
+        );
+        assert_eq!(
+            shard_backfill_completion_error_event(&StoreError::StorageRpc {
+                node_id: 2,
+                operation: "complete placed segment shard backfill claim",
+                code: storage::StorageRpcErrorCode::TransportTimeout,
+                message: "storage RPC stream I/O error: timed out".to_string(),
+            }),
+            "complete_stale"
+        );
     }
 
     #[test]

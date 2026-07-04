@@ -49,6 +49,123 @@ fn unix_storage_node_client_writes_deletes_and_validates_ack_rows() {
 }
 
 #[test]
+fn unix_storage_node_client_times_out_waiting_for_response() {
+    let tmp = test_util::tempdir();
+    let config = test_config(&tmp);
+    private_socket_dir(config.socket_path.parent().unwrap());
+    let listener = UnixListener::bind(&config.socket_path).unwrap();
+    let server_thread = thread::spawn(move || {
+        let (_stream, _) = listener.accept().unwrap();
+        thread::sleep(STORAGE_RPC_CLIENT_RESPONSE_TIMEOUT + Duration::from_millis(250));
+    });
+    let client = UnixStorageNodeClient::new(
+        config.node_id,
+        config.cluster_epoch,
+        config.socket_path.clone(),
+    );
+    let key = ShardKey::new(&[0x56; 16], 12, 0);
+    let started = Instant::now();
+    let err = client
+        .read_placed_shard(
+            DataPgId::new(PgId::new(0)),
+            &key,
+            WriteAck {
+                stored_size: 1,
+                crc64: 2,
+            },
+        )
+        .unwrap_err();
+    assert!(
+        started.elapsed() < STORAGE_RPC_CLIENT_RESPONSE_TIMEOUT + Duration::from_secs(2),
+        "storage RPC read should time out promptly"
+    );
+    assert!(matches!(
+        err,
+        StoreError::StorageRpc {
+            operation: "read storage RPC response",
+            code: StorageRpcErrorCode::TransportTimeout,
+            ..
+        }
+    ));
+    server_thread.join().unwrap();
+}
+
+#[test]
+fn unix_storage_node_metadata_session_times_out_waiting_for_response() {
+    let tmp = test_util::tempdir();
+    let config = test_config(&tmp);
+    private_socket_dir(config.socket_path.parent().unwrap());
+    let listener = UnixListener::bind(&config.socket_path).unwrap();
+    let server_thread = thread::spawn(move || {
+        let (_stream, _) = listener.accept().unwrap();
+        thread::sleep(STORAGE_RPC_CLIENT_RESPONSE_TIMEOUT + Duration::from_millis(250));
+    });
+    let client = UnixStorageNodeClient::new(
+        config.node_id,
+        config.cluster_epoch,
+        config.socket_path.clone(),
+    );
+    let started = Instant::now();
+    let err = match client.open_metadata_command_critical_section(PgId::new(0)) {
+        Ok(_) => panic!("metadata-command session unexpectedly opened without a response"),
+        Err(error) => error,
+    };
+    assert!(
+        started.elapsed() < STORAGE_RPC_CLIENT_RESPONSE_TIMEOUT + Duration::from_secs(2),
+        "metadata-command RPC read should time out promptly"
+    );
+    assert!(matches!(
+        err,
+        StoreError::StorageRpc {
+            operation: "read metadata command session RPC response",
+            code: StorageRpcErrorCode::TransportTimeout,
+            ..
+        }
+    ));
+    server_thread.join().unwrap();
+}
+
+#[test]
+fn metadata_command_session_drop_closes_without_release_round_trip() {
+    let tmp = test_util::tempdir();
+    let config = test_config(&tmp);
+    private_socket_dir(config.socket_path.parent().unwrap());
+    let listener = UnixListener::bind(&config.socket_path).unwrap();
+    let server_thread = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let acquire = read_storage_rpc_frame_from(&mut stream).unwrap();
+        assert_eq!(
+            acquire.kind,
+            StorageRpcMessageKind::MetadataCommandPgLockAcquire
+        );
+        let acquire_response = StorageRpcFrame {
+            request_id: acquire.request_id,
+            kind: acquire.kind,
+            payload: encode_storage_rpc_success_response(&[]),
+        };
+        write_storage_rpc_frame_to(&mut stream, &acquire_response).unwrap();
+        let started = Instant::now();
+        let err = read_storage_rpc_frame_from(&mut stream).unwrap_err();
+        assert!(
+            started.elapsed() < STORAGE_RPC_CLIENT_RESPONSE_TIMEOUT,
+            "drop should close the stream instead of waiting for release response"
+        );
+        assert!(matches!(err, StorageRpcStreamError::Io(_)));
+    });
+    {
+        let client = UnixStorageNodeClient::new(
+            config.node_id,
+            config.cluster_epoch,
+            config.socket_path.clone(),
+        );
+        let _session = client
+            .open_metadata_command_critical_section(PgId::new(0))
+            .unwrap();
+    }
+    server_thread.join().unwrap();
+}
+
+#[test]
 fn unix_storage_node_client_reads_cluster_map_history_reference_summary() {
     let tmp = test_util::tempdir();
     let config = test_config(&tmp);
@@ -1210,17 +1327,10 @@ fn metadata_command_session_result_from_fake_response<R>(
         };
         write_storage_rpc_frame_to(&mut stream, &response).unwrap();
 
-        let release = read_storage_rpc_frame_from(&mut stream).unwrap();
-        assert_eq!(
-            release.kind,
-            StorageRpcMessageKind::MetadataCommandPgLockRelease
-        );
-        let release_response = StorageRpcFrame {
-            request_id: release.request_id,
-            kind: release.kind,
-            payload: encode_storage_rpc_success_response(&[]),
-        };
-        write_storage_rpc_frame_to(&mut stream, &release_response).unwrap();
+        assert!(matches!(
+            read_storage_rpc_frame_from(&mut stream),
+            Err(StorageRpcStreamError::Io(_))
+        ));
     });
     let client =
         UnixStorageNodeClient::new(NodeId::new(7), ClusterEpoch::new(1).unwrap(), socket_path);
@@ -2344,6 +2454,49 @@ fn unix_storage_node_metadata_session_admission_exhausts_before_connect() {
             ref message,
         } if message.contains("admission limit 1")
     ));
+}
+
+#[test]
+fn unix_storage_node_metadata_session_lock_contention_returns_typed_error() {
+    let tmp = test_util::tempdir();
+    let config = test_config(&tmp);
+    private_socket_dir(config.socket_path.parent().unwrap());
+    let server = Arc::new(StorageNodeServer::bind(config.clone()).unwrap());
+    let client = UnixStorageNodeClient::new(
+        config.node_id,
+        config.cluster_epoch,
+        config.socket_path.clone(),
+    );
+    let owner_server = Arc::clone(&server);
+    let owner_thread = thread::spawn(move || owner_server.accept_one().unwrap());
+    let owner = client
+        .open_metadata_command_critical_section(PgId::new(0))
+        .unwrap();
+
+    let waiter_server = Arc::clone(&server);
+    let waiter_thread = thread::spawn(move || waiter_server.accept_one().unwrap());
+    let started = Instant::now();
+    let err = match client.open_metadata_command_critical_section(PgId::new(0)) {
+        Ok(_) => panic!("contended metadata-command session unexpectedly acquired the PG lock"),
+        Err(error) => error,
+    };
+
+    assert!(
+        started.elapsed() < STORAGE_RPC_CLIENT_RESPONSE_TIMEOUT + Duration::from_secs(1),
+        "metadata-command lock contention should return before the Unix client response timeout"
+    );
+    assert!(matches!(
+        err,
+        StoreError::StorageRpc {
+            node_id: 7,
+            operation: "metadata command PG lock acquire",
+            code: StorageRpcErrorCode::MetadataCommandContention,
+            ..
+        }
+    ));
+    waiter_thread.join().unwrap();
+    drop(owner);
+    owner_thread.join().unwrap();
 }
 
 #[test]

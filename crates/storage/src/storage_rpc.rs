@@ -74,6 +74,12 @@ use std::num::NonZeroU32;
 const STORAGE_RPC_FRAME_MAGIC: &[u8] = b"argmin-storage-rpc-frame";
 pub(crate) const STORAGE_RPC_FRAME_ENCODING_VERSION: u16 = 1;
 pub(crate) const STORAGE_RPC_MAX_PAYLOAD_LEN: usize = 64 * 1024 * 1024;
+pub(crate) const STORAGE_RPC_CLIENT_RESPONSE_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(1);
+pub(crate) const STORAGE_RPC_CLIENT_WRITE_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(1);
+pub(crate) const STORAGE_RPC_SERVER_IDLE_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(1);
 const STORAGE_RPC_EMPTY_REQUEST_PAYLOAD_LEN: usize = 0;
 pub(crate) const STORAGE_RPC_MAX_READ_OPERATION_ID_LEN: usize = 256;
 pub(crate) const STORAGE_RPC_MAX_READ_HANDLE_LOCATIONS: usize = 1024;
@@ -751,6 +757,7 @@ pub enum StorageRpcErrorCode {
     BucketWriteReservationNotFound = 19,
     MetadataCommandContention = 20,
     MetadataTransferHistoricalRouteActive = 21,
+    TransportTimeout = 22,
 }
 
 impl StorageRpcErrorCode {
@@ -777,6 +784,7 @@ impl StorageRpcErrorCode {
             19 => Ok(Self::BucketWriteReservationNotFound),
             20 => Ok(Self::MetadataCommandContention),
             21 => Ok(Self::MetadataTransferHistoricalRouteActive),
+            22 => Ok(Self::TransportTimeout),
             _ => Err(StorageRpcPayloadError::InvalidResponseEnvelope(
                 "unknown storage RPC error code",
             )),

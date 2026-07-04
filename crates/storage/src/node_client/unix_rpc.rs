@@ -1425,6 +1425,7 @@ impl UnixStorageNodeClient {
                 });
             }
         };
+        configure_storage_rpc_stream_timeout(&stream, "configure storage-node RPC socket timeout")?;
         let request = StorageRpcFrame {
             request_id,
             kind,
@@ -1445,7 +1446,11 @@ impl UnixStorageNodeClient {
                     ),
                 );
             }
-            return Err(self.rpc_payload_error("write storage RPC request", error.to_string()));
+            return Err(storage_rpc_stream_error(
+                self.node_id,
+                "write storage RPC request",
+                error,
+            ));
         }
         if trace_rpc_lifecycle {
             let _ = observability::emit_flight_event(
@@ -1492,7 +1497,11 @@ impl UnixStorageNodeClient {
                         ),
                     );
                 }
-                return Err(self.rpc_payload_error("read storage RPC response", error.to_string()));
+                return Err(storage_rpc_stream_error(
+                    self.node_id,
+                    "read storage RPC response",
+                    error,
+                ));
             }
         };
         if response.request_id != request_id || response.kind != kind {

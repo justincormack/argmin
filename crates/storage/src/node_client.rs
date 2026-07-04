@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::io;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -225,12 +226,14 @@ use crate::storage_rpc::{
     StorageRpcScavengerObservationRecordRequest, StorageRpcShardAckBatchRequest,
     StorageRpcShardAckItem, StorageRpcShardAckItemRequest, StorageRpcShardDeleteRequest,
     StorageRpcShardReadRangeRequest, StorageRpcShardReadRequest, StorageRpcShardWriteRequest,
-    StorageRpcStreamPartCommitCommandBuildRequest, StorageRpcStreamPartFinalizeSnapshotRequest,
-    StorageRpcStreamPutCommitCommandBuildRequest, StorageRpcStreamPutFinalizeSnapshotRequest,
-    StorageRpcStreamSegmentAppendPrepareOutcome, StorageRpcStreamSegmentAppendPrepareRequest,
-    StorageRpcStreamUploadMatchRequest, StorageRpcStreamUploadSegmentsOutcome,
-    StorageRpcStreamUploadSessionOutcome, StorageRpcStreamUploadSessionRequest,
-    StorageRpcStreamUploadsListRequest, StorageRpcStreamUploadsPgListRequest,
+    StorageRpcStreamError, StorageRpcStreamPartCommitCommandBuildRequest,
+    StorageRpcStreamPartFinalizeSnapshotRequest, StorageRpcStreamPutCommitCommandBuildRequest,
+    StorageRpcStreamPutFinalizeSnapshotRequest, StorageRpcStreamSegmentAppendPrepareOutcome,
+    StorageRpcStreamSegmentAppendPrepareRequest, StorageRpcStreamUploadMatchRequest,
+    StorageRpcStreamUploadSegmentsOutcome, StorageRpcStreamUploadSessionOutcome,
+    StorageRpcStreamUploadSessionRequest, StorageRpcStreamUploadsListRequest,
+    StorageRpcStreamUploadsPgListRequest, STORAGE_RPC_CLIENT_RESPONSE_TIMEOUT,
+    STORAGE_RPC_CLIENT_WRITE_TIMEOUT,
 };
 use crate::traits::{DurableBucketWriteReservationHeartbeat, PgMetadataStore, ShardStore};
 #[cfg(test)]
@@ -294,6 +297,19 @@ pub(crate) use unix_admission::{
     UNIX_STORAGE_NODE_MIN_RPC_ADMISSION_LIMIT,
 };
 
+fn configure_storage_rpc_stream_timeout(
+    stream: &UnixStream,
+    context: &'static str,
+) -> Result<(), StoreError> {
+    stream
+        .set_read_timeout(Some(STORAGE_RPC_CLIENT_RESPONSE_TIMEOUT))
+        .map_err(|source| StoreError::Io { context, source })?;
+    stream
+        .set_write_timeout(Some(STORAGE_RPC_CLIENT_WRITE_TIMEOUT))
+        .map_err(|source| StoreError::Io { context, source })?;
+    Ok(())
+}
+
 fn storage_rpc_response_error(
     node_id: NodeId,
     kind: StorageRpcMessageKind,
@@ -317,6 +333,30 @@ fn storage_rpc_response_error(
             code,
             message: error.message,
         },
+    }
+}
+
+fn storage_rpc_stream_error(
+    node_id: NodeId,
+    operation: &'static str,
+    error: StorageRpcStreamError,
+) -> StoreError {
+    let code = match &error {
+        StorageRpcStreamError::Io(source)
+            if matches!(
+                source.kind(),
+                io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+            ) =>
+        {
+            StorageRpcErrorCode::TransportTimeout
+        }
+        _ => StorageRpcErrorCode::PayloadDecode,
+    };
+    StoreError::StorageRpc {
+        node_id: node_id.as_u32(),
+        operation,
+        code,
+        message: error.to_string(),
     }
 }
 

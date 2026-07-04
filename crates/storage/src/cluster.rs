@@ -11074,6 +11074,7 @@ fn metadata_command_checkpoint_record_storage_rpc_error_kind(
         StorageRpcErrorCode::MetadataTransferHistoricalRouteActive => {
             "storage_rpc_metadata_transfer_historical_route_active"
         }
+        StorageRpcErrorCode::TransportTimeout => "storage_rpc_transport_timeout",
     }
 }
 
@@ -11293,6 +11294,7 @@ fn storage_rpc_code_is_retryable_pg_route_error(code: StorageRpcErrorCode) -> bo
             | StorageRpcErrorCode::NonActingSetAccess
             | StorageRpcErrorCode::WrongClusterEpoch
             | StorageRpcErrorCode::MetadataCommandContention
+            | StorageRpcErrorCode::TransportTimeout
     )
 }
 

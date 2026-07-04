@@ -5259,6 +5259,12 @@ fn storage_rpc_resource_exhaustion_maps_to_slow_down() {
         code: storage::StorageRpcErrorCode::MetadataCommandContention,
         message: "metadata command contention during bucket delete begin".to_string(),
     });
+    assert_maps_to_operation_aborted(storage::StoreError::StorageRpc {
+        node_id: 1,
+        operation: "read storage RPC response",
+        code: storage::StorageRpcErrorCode::TransportTimeout,
+        message: "storage RPC stream I/O error: timed out".to_string(),
+    });
     assert_maps_to_operation_aborted(storage::StoreError::ShardStore {
         node_id: 1,
         pg_id: 2,

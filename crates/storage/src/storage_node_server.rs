@@ -286,8 +286,9 @@ use crate::storage_rpc::{
     StorageRpcStreamUploadSegmentsResponse, StorageRpcStreamUploadSessionOutcome,
     StorageRpcStreamUploadSessionRequest, StorageRpcStreamUploadSessionResponse,
     StorageRpcStreamUploadsListRequest, StorageRpcStreamUploadsListResponse,
-    StorageRpcStreamUploadsPgListRequest, STORAGE_RPC_FRAME_ENCODING_VERSION,
-    STORAGE_RPC_MAX_METADATA_COMMAND_CHECKPOINT_CANDIDATES, STORAGE_RPC_MAX_PAYLOAD_LEN,
+    StorageRpcStreamUploadsPgListRequest, STORAGE_RPC_CLIENT_WRITE_TIMEOUT,
+    STORAGE_RPC_FRAME_ENCODING_VERSION, STORAGE_RPC_MAX_METADATA_COMMAND_CHECKPOINT_CANDIDATES,
+    STORAGE_RPC_MAX_PAYLOAD_LEN, STORAGE_RPC_SERVER_IDLE_TIMEOUT,
 };
 use crate::traits::ShardStore;
 use crate::types::{BucketState, ClusterEpoch, GenerationId, PgId, PgState, SessionId, WriteAck};
@@ -1052,6 +1053,13 @@ impl StorageNodeServer {
                     path: self.config_snapshot().socket_path,
                     source,
                 })?;
+        configure_storage_node_rpc_stream_timeout(&stream).map_err(|source| {
+            StorageNodeServerError::Io {
+                context: "configure storage-node accepted socket timeout",
+                path: self.config_snapshot().socket_path,
+                source,
+            }
+        })?;
         let mut handler = self.connection_handler();
         handler.handle_session(&mut stream, session_guard)
     }
@@ -1265,6 +1273,13 @@ impl StorageNodeServer {
                     path: self.config_snapshot().socket_path,
                     source,
                 })?;
+        configure_storage_node_rpc_stream_timeout(&stream).map_err(|source| {
+            StorageNodeServerError::Io {
+                context: "configure storage-node accepted socket timeout",
+                path: self.config_snapshot().socket_path,
+                source,
+            }
+        })?;
         let mut handler = self.connection_handler();
         thread::spawn(move || {
             if let Err(error) = handler.handle_session(&mut stream, session_guard) {
@@ -1314,9 +1329,10 @@ struct StorageNodeMetadataCommandLocks {
     state: Arc<StorageNodeMetadataCommandLockState>,
 }
 
-const METADATA_COMMAND_LOCK_WAIT_DIAGNOSTIC_AFTER: Duration = Duration::from_secs(1);
-const METADATA_COMMAND_LOCK_WAIT_DIAGNOSTIC_INTERVAL: Duration = Duration::from_secs(5);
-const METADATA_COMMAND_LOCK_WAIT_POLL_INTERVAL: Duration = Duration::from_millis(250);
+const METADATA_COMMAND_LOCK_WAIT_DIAGNOSTIC_AFTER: Duration = Duration::from_millis(250);
+const METADATA_COMMAND_LOCK_WAIT_DIAGNOSTIC_INTERVAL: Duration = Duration::from_millis(250);
+const METADATA_COMMAND_LOCK_WAIT_POLL_INTERVAL: Duration = Duration::from_millis(50);
+const METADATA_COMMAND_LOCK_WAIT_TIMEOUT: Duration = Duration::from_millis(500);
 
 #[derive(Clone, Copy, Debug)]
 struct StorageNodeMetadataCommandLockContext {
@@ -1347,7 +1363,17 @@ impl StorageNodeMetadataCommandLocks {
         node_id: NodeId,
         pg_id: PgId,
         context: Option<StorageNodeMetadataCommandLockContext>,
-    ) -> StorageNodeMetadataCommandGuard {
+    ) -> Result<StorageNodeMetadataCommandGuard, StorageRpcErrorResponse> {
+        self.acquire_with_timeout(node_id, pg_id, context, METADATA_COMMAND_LOCK_WAIT_TIMEOUT)
+    }
+
+    fn acquire_with_timeout(
+        &self,
+        node_id: NodeId,
+        pg_id: PgId,
+        context: Option<StorageNodeMetadataCommandLockContext>,
+        wait_timeout: Duration,
+    ) -> Result<StorageNodeMetadataCommandGuard, StorageRpcErrorResponse> {
         let started_at = Instant::now();
         let mut next_diagnostic_at = started_at + METADATA_COMMAND_LOCK_WAIT_DIAGNOSTIC_AFTER;
         let mut waited = false;
@@ -1362,11 +1388,27 @@ impl StorageNodeMetadataCommandLocks {
                 .unwrap_or_else(|e| e.into_inner())
                 .clone();
             let now = Instant::now();
+            let waited_for = now.saturating_duration_since(started_at);
+            if waited_for >= wait_timeout {
+                drop(held);
+                emit_metadata_command_lock_wait_diagnostic(
+                    node_id, pg_id, context, holder, waited_for,
+                );
+                return Err(StorageRpcErrorResponse {
+                    code: StorageRpcErrorCode::MetadataCommandContention,
+                    message: format!(
+                        "metadata command lock wait for PG {} exceeded {}ms",
+                        pg_id.get(),
+                        wait_timeout.as_millis()
+                    ),
+                });
+            }
             if now >= next_diagnostic_at {
                 next_diagnostic_at = now + METADATA_COMMAND_LOCK_WAIT_DIAGNOSTIC_INTERVAL;
-                let waited = started_at.elapsed();
                 drop(held);
-                emit_metadata_command_lock_wait_diagnostic(node_id, pg_id, context, holder, waited);
+                emit_metadata_command_lock_wait_diagnostic(
+                    node_id, pg_id, context, holder, waited_for,
+                );
                 held = self.state.held.lock().unwrap_or_else(|e| e.into_inner());
                 continue;
             }
@@ -1379,10 +1421,17 @@ impl StorageNodeMetadataCommandLocks {
             if !held.contains_key(&pg_id) {
                 continue;
             }
+            let remaining = wait_timeout
+                .checked_sub(Instant::now().saturating_duration_since(started_at))
+                .unwrap_or_default();
+            if remaining.is_zero() {
+                continue;
+            }
+            let wait_interval = METADATA_COMMAND_LOCK_WAIT_POLL_INTERVAL.min(remaining);
             let (next_held, _) = self
                 .state
                 .available
-                .wait_timeout(held, METADATA_COMMAND_LOCK_WAIT_POLL_INTERVAL)
+                .wait_timeout(held, wait_interval)
                 .unwrap_or_else(|e| e.into_inner());
             held = next_held;
         }
@@ -1405,11 +1454,11 @@ impl StorageNodeMetadataCommandLocks {
                 current_started_at: Some(Instant::now()),
             },
         );
-        StorageNodeMetadataCommandGuard {
+        Ok(StorageNodeMetadataCommandGuard {
             locks: self.clone(),
             pg_id,
             released: false,
-        }
+        })
     }
 
     fn update_context(&self, pg_id: PgId, context: Option<StorageNodeMetadataCommandLockContext>) {
@@ -1520,6 +1569,15 @@ struct StorageNodeConnectionHandler {
     metadata_command_locks: StorageNodeMetadataCommandLocks,
 }
 
+macro_rules! metadata_command_pg_guard_or_return {
+    ($handler:expr, $session:expr, $pg_id:expr) => {
+        match $handler.metadata_command_pg_guard($session, $pg_id) {
+            Ok(guard) => guard,
+            Err(error) => return encode_storage_rpc_error_response(&error),
+        }
+    };
+}
+
 impl StorageNodeConnectionHandler {
     fn refresh_config_snapshot(&mut self) {
         self.config = self
@@ -1533,15 +1591,15 @@ impl StorageNodeConnectionHandler {
         &self,
         session: &StorageNodeSession,
         pg_id: PgId,
-    ) -> Option<StorageNodeMetadataCommandGuard> {
+    ) -> Result<Option<StorageNodeMetadataCommandGuard>, StorageRpcErrorResponse> {
         if session.holds_metadata_command_pg_lock(pg_id) {
-            None
+            Ok(None)
         } else {
-            Some(self.metadata_command_locks.acquire(
+            Ok(Some(self.metadata_command_locks.acquire(
                 self.config.node_id,
                 pg_id,
                 session.current_rpc_context(),
-            ))
+            )?))
         }
     }
 
@@ -1560,6 +1618,8 @@ impl StorageNodeConnectionHandler {
                         io::ErrorKind::UnexpectedEof
                             | io::ErrorKind::ConnectionReset
                             | io::ErrorKind::BrokenPipe
+                            | io::ErrorKind::TimedOut
+                            | io::ErrorKind::WouldBlock
                     ) =>
                 {
                     return Ok(());
@@ -7552,7 +7612,7 @@ impl StorageNodeConnectionHandler {
         ) {
             return encode_storage_rpc_error_response(&error);
         }
-        let _pg_guard = self.metadata_command_pg_guard(session, request.pg_id);
+        let _pg_guard = metadata_command_pg_guard_or_return!(self, session, request.pg_id);
         let response = match self
             .node
             .get_pg(request.pg_id.get())
@@ -7581,7 +7641,7 @@ impl StorageNodeConnectionHandler {
         ) {
             return encode_storage_rpc_error_response(&error);
         }
-        let _pg_guard = self.metadata_command_pg_guard(session, request.pg_id);
+        let _pg_guard = metadata_command_pg_guard_or_return!(self, session, request.pg_id);
         let response = match self
             .node
             .get_pg(request.pg_id.get())
@@ -7610,7 +7670,7 @@ impl StorageNodeConnectionHandler {
         ) {
             return encode_storage_rpc_error_response(&error);
         }
-        let _pg_guard = self.metadata_command_pg_guard(session, request.pg_id);
+        let _pg_guard = metadata_command_pg_guard_or_return!(self, session, request.pg_id);
         let response = match self.node.get_pg(request.pg_id.get()).and_then(|pg| {
             pg.retained_metadata_command_log_hashes(
                 self.config.node_id.as_u32(),
@@ -7664,7 +7724,7 @@ impl StorageNodeConnectionHandler {
         ) {
             return encode_storage_rpc_error_response(&error);
         }
-        let _pg_guard = self.metadata_command_pg_guard(session, request.pg_id);
+        let _pg_guard = metadata_command_pg_guard_or_return!(self, session, request.pg_id);
         let response = match self.node.get_pg(request.pg_id.get()).and_then(|pg| {
             pg.retained_metadata_command_log_entries(
                 self.config.node_id.as_u32(),
@@ -7722,7 +7782,7 @@ impl StorageNodeConnectionHandler {
                 message: "metadata command min log index must not be zero".to_string(),
             });
         };
-        let _pg_guard = self.metadata_command_pg_guard(session, request.pg_id);
+        let _pg_guard = metadata_command_pg_guard_or_return!(self, session, request.pg_id);
         let response = match self.node.get_pg(request.pg_id.get()) {
             Ok(pg) => {
                 match self.next_metadata_command_id_from_pg(request.pg_id, &pg, min_log_index) {
@@ -7815,7 +7875,7 @@ impl StorageNodeConnectionHandler {
         ) {
             return encode_storage_rpc_error_response(&error);
         }
-        let _pg_guard = self.metadata_command_pg_guard(session, request.pg_id);
+        let _pg_guard = metadata_command_pg_guard_or_return!(self, session, request.pg_id);
         let response = match self.node.get_pg(request.pg_id.get()).and_then(|pg| {
             pg.pending_metadata_command_envelope(
                 self.config.node_id.as_u32(),
@@ -7846,7 +7906,7 @@ impl StorageNodeConnectionHandler {
         ) {
             return encode_storage_rpc_error_response(&error);
         }
-        let _pg_guard = self.metadata_command_pg_guard(session, request.pg_id);
+        let _pg_guard = metadata_command_pg_guard_or_return!(self, session, request.pg_id);
         let response = match self.node.get_pg(request.pg_id.get()).and_then(|pg| {
             if preserve_pending_slot {
                 pg.validate_metadata_command_replay_state_preserving_pending_slot(
@@ -7883,7 +7943,7 @@ impl StorageNodeConnectionHandler {
         ) {
             return encode_storage_rpc_error_response(&error);
         }
-        let _pg_guard = self.metadata_command_pg_guard(session, request.pg_id);
+        let _pg_guard = metadata_command_pg_guard_or_return!(self, session, request.pg_id);
         let response = match self
             .node
             .get_pg(request.pg_id.get())
@@ -7913,7 +7973,7 @@ impl StorageNodeConnectionHandler {
         ) {
             return encode_storage_rpc_error_response(&error);
         }
-        let _pg_guard = self.metadata_command_pg_guard(session, request.pg_id);
+        let _pg_guard = metadata_command_pg_guard_or_return!(self, session, request.pg_id);
         let response = match self.node.get_pg(request.pg_id.get()).and_then(|pg| {
             pg.metadata_command_checkpoint(request.node_id.as_u32(), request.cluster_epoch)
         }) {
@@ -7947,7 +8007,7 @@ impl StorageNodeConnectionHandler {
         {
             return encode_storage_rpc_error_response(&error);
         }
-        let _pg_guard = self.metadata_command_pg_guard(session, request.pg_id);
+        let _pg_guard = metadata_command_pg_guard_or_return!(self, session, request.pg_id);
         let response = match self.node.get_pg(request.pg_id.get()).and_then(|pg| {
             pg.record_current_metadata_command_checkpoint(
                 request.node_id.as_u32(),
@@ -7986,7 +8046,7 @@ impl StorageNodeConnectionHandler {
         {
             return encode_storage_rpc_error_response(&error);
         }
-        let _pg_guard = self.metadata_command_pg_guard(session, request.pg_id);
+        let _pg_guard = metadata_command_pg_guard_or_return!(self, session, request.pg_id);
         let response = match self
             .node
             .get_pg(request.pg_id.get())
@@ -8015,7 +8075,7 @@ impl StorageNodeConnectionHandler {
         ) {
             return encode_storage_rpc_error_response(&error);
         }
-        let _pg_guard = self.metadata_command_pg_guard(session, request.pg_id);
+        let _pg_guard = metadata_command_pg_guard_or_return!(self, session, request.pg_id);
         let response = match self.node.get_pg(request.pg_id.get()).and_then(|pg| {
             let checkpoints = metadata_command_checkpoint_candidates_for_frame(
                 &pg,
@@ -8053,7 +8113,7 @@ impl StorageNodeConnectionHandler {
         ) {
             return encode_storage_rpc_error_response(&error);
         }
-        let _pg_guard = self.metadata_command_pg_guard(session, request.pg_id);
+        let _pg_guard = metadata_command_pg_guard_or_return!(self, session, request.pg_id);
         let response = match self.node.get_pg(request.pg_id.get()).and_then(|pg| {
             pg.adopt_metadata_transfer_state_from_rebased_commands(
                 request.node_id.as_u32(),
@@ -8085,7 +8145,7 @@ impl StorageNodeConnectionHandler {
         ) {
             return encode_storage_rpc_error_response(&error);
         }
-        let _pg_guard = self.metadata_command_pg_guard(session, request.pg_id);
+        let _pg_guard = metadata_command_pg_guard_or_return!(self, session, request.pg_id);
         let response = match self.node.get_pg(request.pg_id.get()).and_then(|pg| {
             pg.initialize_metadata_transfer_empty_state(
                 request.node_id.as_u32(),
@@ -8116,7 +8176,7 @@ impl StorageNodeConnectionHandler {
         ) {
             return encode_storage_rpc_error_response(&error);
         }
-        let _pg_guard = self.metadata_command_pg_guard(session, request.pg_id);
+        let _pg_guard = metadata_command_pg_guard_or_return!(self, session, request.pg_id);
         let response = match self.node.get_pg(request.pg_id.get()).and_then(|pg| {
             pg.initialize_metadata_transfer_matching_state(
                 request.node_id.as_u32(),
@@ -8150,7 +8210,7 @@ impl StorageNodeConnectionHandler {
         ) {
             return encode_storage_rpc_error_response(&error);
         }
-        let _pg_guard = self.metadata_command_pg_guard(session, request.pg_id);
+        let _pg_guard = metadata_command_pg_guard_or_return!(self, session, request.pg_id);
         let response = match self.node.get_pg(request.pg_id.get()).and_then(|pg| {
             pg.install_metadata_transfer_checkpoint_base(
                 request.node_id.as_u32(),
@@ -8179,7 +8239,7 @@ impl StorageNodeConnectionHandler {
         {
             return encode_storage_rpc_error_response(&error);
         }
-        let _pg_guard = self.metadata_command_pg_guard(session, request.pg_id);
+        let _pg_guard = metadata_command_pg_guard_or_return!(self, session, request.pg_id);
         let response = match self.node.get_pg(request.pg_id.get()).and_then(|pg| {
             pg.applied_metadata_command_log_entry_hashes(
                 self.config.node_id.as_u32(),
@@ -8234,7 +8294,7 @@ impl StorageNodeConnectionHandler {
         {
             return encode_storage_rpc_error_response(&error);
         }
-        let _pg_guard = self.metadata_command_pg_guard(session, request.pg_id);
+        let _pg_guard = metadata_command_pg_guard_or_return!(self, session, request.pg_id);
         let response = match self.node.get_pg(request.pg_id.get()).and_then(|pg| {
             pg.has_matching_applied_metadata_command_log_entry(
                 self.config.node_id.as_u32(),
@@ -8290,7 +8350,7 @@ impl StorageNodeConnectionHandler {
         {
             return encode_storage_rpc_error_response(&error);
         }
-        let _pg_guard = self.metadata_command_pg_guard(session, request.pg_id);
+        let _pg_guard = metadata_command_pg_guard_or_return!(self, session, request.pg_id);
         let response = match self.node.get_pg(request.pg_id.get()).and_then(|pg| {
             pg.metadata_command_abandoned(self.config.node_id.as_u32(), &request.command)
         }) {
@@ -8342,7 +8402,7 @@ impl StorageNodeConnectionHandler {
         {
             return encode_storage_rpc_error_response(&error);
         }
-        let _pg_guard = self.metadata_command_pg_guard(session, request.pg_id);
+        let _pg_guard = metadata_command_pg_guard_or_return!(self, session, request.pg_id);
         let response = match self.node.get_pg(request.pg_id.get()).and_then(|pg| {
             pg.record_metadata_command_abandoned(self.config.node_id.as_u32(), &request.command)
         }) {
@@ -8425,7 +8485,7 @@ impl StorageNodeConnectionHandler {
         ) {
             return encode_storage_rpc_error_response(&error);
         }
-        let _pg_guard = self.metadata_command_pg_guard(session, request.pg_id);
+        let _pg_guard = metadata_command_pg_guard_or_return!(self, session, request.pg_id);
         let response = match self.node.get_pg(request.pg_id.get()) {
             Ok(pg) => match pg
                 .apply_metadata_command_and_record(self.config.node_id.as_u32(), &request.command)
@@ -8589,7 +8649,7 @@ impl StorageNodeConnectionHandler {
         {
             return encode_storage_rpc_error_response(&error);
         }
-        let _pg_guard = self.metadata_command_pg_guard(session, request.pg_id);
+        let _pg_guard = metadata_command_pg_guard_or_return!(self, session, request.pg_id);
         let response = match self.node.get_pg(request.pg_id.get()).and_then(|pg| {
             pg.metadata_command_acceptance(self.config.node_id.as_u32(), &request.command)
         }) {
@@ -8644,7 +8704,7 @@ impl StorageNodeConnectionHandler {
         {
             return encode_storage_rpc_error_response(&error);
         }
-        let _pg_guard = self.metadata_command_pg_guard(session, request.pg_id);
+        let _pg_guard = metadata_command_pg_guard_or_return!(self, session, request.pg_id);
         let response = match self.node.get_pg(request.pg_id.get()).and_then(|pg| {
             pg.metadata_command_abandon_acceptance(self.config.node_id.as_u32(), &request.command)
         }) {
@@ -8707,7 +8767,7 @@ impl StorageNodeConnectionHandler {
             }
         }
         let canonical_scope_bucket = request.command.bucket_name().clone();
-        let _pg_guard = self.metadata_command_pg_guard(session, request.pg_id);
+        let _pg_guard = metadata_command_pg_guard_or_return!(self, session, request.pg_id);
         let response = match self.node.get_pg(request.pg_id.get()).and_then(|pg| {
             pg.try_insert_pending_metadata_command_slot(
                 self.config.node_id.as_u32(),
@@ -8805,7 +8865,7 @@ impl StorageNodeConnectionHandler {
             });
         }
         let canonical_scope_bucket = request.command.bucket_name().clone();
-        let _pg_guard = self.metadata_command_pg_guard(session, request.pg_id);
+        let _pg_guard = metadata_command_pg_guard_or_return!(self, session, request.pg_id);
         let response = match self.node.get_pg(request.pg_id.get()).and_then(|pg| {
             let inserted = pg.try_insert_bucket_control_pending_metadata_command_slot(
                 self.config.node_id.as_u32(),
@@ -8876,7 +8936,7 @@ impl StorageNodeConnectionHandler {
         {
             return encode_storage_rpc_error_response(&error);
         }
-        let _pg_guard = self.metadata_command_pg_guard(session, request.pg_id);
+        let _pg_guard = metadata_command_pg_guard_or_return!(self, session, request.pg_id);
         let response = match self.node.get_pg(request.pg_id.get()).and_then(|pg| {
             pg.remove_pending_metadata_command_slot(self.config.node_id.as_u32(), &request.command)
         }) {
@@ -8961,7 +9021,7 @@ impl StorageNodeConnectionHandler {
             .scope_bucket
             .as_ref()
             .map(|_| request.replacement.bucket_name().clone());
-        let _pg_guard = self.metadata_command_pg_guard(session, request.pg_id);
+        let _pg_guard = metadata_command_pg_guard_or_return!(self, session, request.pg_id);
         let response = match self.node.get_pg(request.pg_id.get()).and_then(|pg| {
             pg.replace_pending_metadata_command_slot_for_reissue(
                 self.config.node_id.as_u32(),
@@ -8996,12 +9056,14 @@ impl StorageNodeConnectionHandler {
         {
             return encode_storage_rpc_error_response(&error);
         }
-        session.acquire_metadata_command_pg_lock(
+        if let Err(error) = session.acquire_metadata_command_pg_lock(
             &self.metadata_command_locks,
             self.config.node_id,
             request.pg_id,
             session.current_rpc_context(),
-        );
+        ) {
+            return encode_storage_rpc_error_response(&error);
+        }
         Ok(encode_storage_rpc_success_response(&[]))
     }
 
@@ -9985,12 +10047,13 @@ impl StorageNodeSession {
         node_id: NodeId,
         pg_id: PgId,
         context: Option<StorageNodeMetadataCommandLockContext>,
-    ) {
+    ) -> Result<(), StorageRpcErrorResponse> {
         if self.metadata_command_guards.contains_key(&pg_id) {
-            return;
+            return Ok(());
         }
-        let guard = locks.acquire(node_id, pg_id, context);
+        let guard = locks.acquire(node_id, pg_id, context)?;
         self.metadata_command_guards.insert(pg_id, guard);
+        Ok(())
     }
 
     fn release_metadata_command_pg_lock(&mut self, pg_id: PgId) {
@@ -10080,6 +10143,12 @@ impl Drop for StorageNodeSession {
 struct SessionReadHandle {
     entries: Vec<(ShardLocation, ShardKey)>,
     is_acquired: bool,
+}
+
+fn configure_storage_node_rpc_stream_timeout(stream: &UnixStream) -> io::Result<()> {
+    stream.set_read_timeout(Some(STORAGE_RPC_SERVER_IDLE_TIMEOUT))?;
+    stream.set_write_timeout(Some(STORAGE_RPC_CLIENT_WRITE_TIMEOUT))?;
+    Ok(())
 }
 
 fn rpc_stream_error(error: StorageRpcStreamError) -> StorageNodeServerError {
@@ -10950,12 +11019,14 @@ mod tests {
         let server = StorageNodeServer::bind(config.clone()).unwrap();
         let handler = server.connection_handler();
         let mut session = StorageNodeSession::new(Arc::clone(&server.read_handles));
-        session.acquire_metadata_command_pg_lock(
-            &server.metadata_command_locks,
-            config.node_id,
-            PgId::new(0),
-            None,
-        );
+        session
+            .acquire_metadata_command_pg_lock(
+                &server.metadata_command_locks,
+                config.node_id,
+                PgId::new(0),
+                None,
+            )
+            .unwrap();
         assert!(session.holds_metadata_command_pg_lock(PgId::new(0)));
 
         let request = StorageRpcMetadataCommandStateRequest {
@@ -11844,7 +11915,7 @@ mod tests {
     fn metadata_command_lock_wait_emits_diagnostic() {
         let locks = StorageNodeMetadataCommandLocks::default();
         let pg_id = PgId::new(0);
-        let first = locks.acquire(NodeId::new(7), pg_id, None);
+        let first = locks.acquire(NodeId::new(7), pg_id, None).unwrap();
         let before = observability::metrics_snapshot();
         let (wait_tx, wait_rx) = mpsc::channel();
         locks.set_before_wait_hook(Arc::new(move |actual_pg_id| {
@@ -11859,7 +11930,7 @@ mod tests {
                     "trace-metadata-command-lock-wait".to_string(),
                     "request-metadata-command-lock-wait".to_string(),
                 ));
-            let _guard = waiting_locks.acquire(NodeId::new(7), pg_id, None);
+            let _guard = waiting_locks.acquire(NodeId::new(7), pg_id, None).unwrap();
         });
 
         wait_rx
@@ -11887,17 +11958,43 @@ mod tests {
     }
 
     #[test]
+    fn metadata_command_lock_wait_times_out_with_contention_error() {
+        let locks = StorageNodeMetadataCommandLocks::default();
+        let pg_id = PgId::new(0);
+        let _first = locks.acquire(NodeId::new(7), pg_id, None).unwrap();
+        let started = Instant::now();
+        let err = match locks.acquire_with_timeout(
+            NodeId::new(7),
+            pg_id,
+            None,
+            Duration::from_millis(25),
+        ) {
+            Ok(_) => panic!("metadata-command lock acquisition should time out"),
+            Err(error) => error,
+        };
+
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "metadata-command lock wait should return a bounded contention error"
+        );
+        assert_eq!(err.code, StorageRpcErrorCode::MetadataCommandContention);
+        assert!(err.message.contains("metadata command lock wait"));
+    }
+
+    #[test]
     fn metadata_command_lock_wait_emits_blocked_holder_diagnostic() {
         let locks = StorageNodeMetadataCommandLocks::default();
         let pg_id = PgId::new(0);
-        let first = locks.acquire(
-            NodeId::new(7),
-            pg_id,
-            Some(StorageNodeMetadataCommandLockContext {
-                request_id: 41,
-                kind: StorageRpcMessageKind::MetadataCommandPgLockAcquire,
-            }),
-        );
+        let first = locks
+            .acquire(
+                NodeId::new(7),
+                pg_id,
+                Some(StorageNodeMetadataCommandLockContext {
+                    request_id: 41,
+                    kind: StorageRpcMessageKind::MetadataCommandPgLockAcquire,
+                }),
+            )
+            .unwrap();
         locks.update_context(
             pg_id,
             Some(StorageNodeMetadataCommandLockContext {
@@ -11918,14 +12015,17 @@ mod tests {
                     "trace-metadata-command-lock-blocked".to_string(),
                     "request-metadata-command-lock-blocked".to_string(),
                 ));
-            let _guard = waiting_locks.acquire(
-                NodeId::new(7),
-                pg_id,
-                Some(StorageNodeMetadataCommandLockContext {
-                    request_id: 42,
-                    kind: StorageRpcMessageKind::MetadataCommandPendingEnvelope,
-                }),
-            );
+            let _guard = waiting_locks
+                .acquire_with_timeout(
+                    NodeId::new(7),
+                    pg_id,
+                    Some(StorageNodeMetadataCommandLockContext {
+                        request_id: 42,
+                        kind: StorageRpcMessageKind::MetadataCommandPendingEnvelope,
+                    }),
+                    Duration::from_secs(2),
+                )
+                .unwrap();
         });
 
         wait_rx
@@ -12375,6 +12475,24 @@ mod tests {
         let health = decode_health_response(&health_payload).unwrap();
         assert_eq!(health.node_id, NodeId::new(7));
         assert_eq!(health.cluster_epoch, ClusterEpoch::new(1).unwrap());
+    }
+
+    #[test]
+    fn storage_node_server_drops_idle_rpc_session_after_timeout() {
+        let tmp = test_util::tempdir();
+        let config = test_config(&tmp);
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let server = StorageNodeServer::bind(config.clone()).unwrap();
+        let socket_path = config.socket_path.clone();
+        let started = Instant::now();
+        let join = thread::spawn(move || server.accept_one().unwrap());
+
+        let _client = UnixStream::connect(socket_path).unwrap();
+        join.join().unwrap();
+        assert!(
+            started.elapsed() < STORAGE_RPC_SERVER_IDLE_TIMEOUT + Duration::from_secs(2),
+            "idle storage RPC session should be closed by server timeout"
+        );
     }
 
     #[test]

@@ -1265,6 +1265,8 @@ fn store_error_is_transient_route_refresh_for_metadata_transfer(error: &StoreErr
         StoreError::StorageRpc { code, .. } => {
             *code == StorageRpcErrorCode::StaleShardLocation
                 || *code == StorageRpcErrorCode::MetadataTransferHistoricalRouteActive
+                || *code == StorageRpcErrorCode::MetadataCommandContention
+                || *code == StorageRpcErrorCode::TransportTimeout
         }
         StoreError::ShardStore { source, .. } => {
             store_error_is_transient_route_refresh_for_metadata_transfer(source)
@@ -1276,21 +1278,13 @@ fn store_error_is_transient_route_refresh_for_metadata_transfer(error: &StoreErr
 fn control_plane_runtime_map_ready(
     socket_path: &Path,
 ) -> Result<(ClusterEpoch, usize, usize), String> {
-    let runtime_map = UnixControlPlaneClient::new(socket_path)
-        .runtime_map_snapshot(storage::clock::current_time_millis())
+    let status = UnixControlPlaneClient::new(socket_path)
+        .runtime_map_status(storage::clock::current_time_millis())
         .map_err(|error| format!("control-plane runtime map is not ready: {error}"))?;
-    let pg_routes = runtime_map.pg_routes().len();
-    let active_serving_pg_routes = runtime_map
-        .pg_routes()
-        .iter()
-        .filter(|route| {
-            route.state() == PgState::Active && route.primary_lease_deadline_ms().is_some()
-        })
-        .count();
     Ok((
-        runtime_map.cluster_epoch(),
-        pg_routes,
-        active_serving_pg_routes,
+        status.cluster_epoch(),
+        status.pg_routes(),
+        status.active_serving_pg_routes(),
     ))
 }
 
@@ -6299,6 +6293,30 @@ mod tests {
             operation: "metadata command replica state",
             code: StorageRpcErrorCode::MetadataTransferHistoricalRouteActive,
             message: "historical peering inspection for PG 0 at epoch 28 requires Peering route, got active".to_string(),
+        });
+
+        assert!(metadata_transfer_error_is_transient_route_refresh(&error));
+    }
+
+    #[test]
+    fn metadata_transfer_retry_treats_transport_timeout_as_transient() {
+        let error = PgMetadataTransferError::Store(StoreError::StorageRpc {
+            node_id: 0,
+            operation: "read storage RPC response",
+            code: StorageRpcErrorCode::TransportTimeout,
+            message: "storage RPC stream I/O error: timed out".to_string(),
+        });
+
+        assert!(metadata_transfer_error_is_transient_route_refresh(&error));
+    }
+
+    #[test]
+    fn metadata_transfer_retry_treats_metadata_command_contention_as_transient() {
+        let error = PgMetadataTransferError::Store(StoreError::StorageRpc {
+            node_id: 2,
+            operation: "metadata command pending envelope",
+            code: StorageRpcErrorCode::MetadataCommandContention,
+            message: "metadata command lock wait for PG 9 exceeded 500ms".to_string(),
         });
 
         assert!(metadata_transfer_error_is_transient_route_refresh(&error));

@@ -605,9 +605,12 @@ Confirmed.
   route differs from the requested acting set, preventing a stale retry from
   clobbering a later admin transition. Metadata-transfer fence/install
   helpers use operation-specific observability predicates rather than treating
-  any successful runtime-map response as confirmation. The remaining
-  follow-up is the stronger CAS-style `expected_cluster_epoch` request field,
-  tracked in the hardening plan.
+  any successful runtime-map response as confirmation. Those response-loss
+  confirmation probes keep a bounded but longer read timeout than ordinary
+  control-plane RPCs, so a slow proof observation does not turn an already
+  applied command into `RpcUnconfirmed`. The remaining follow-up is the
+  stronger CAS-style `expected_cluster_epoch` request field, tracked in the
+  hardening plan.
 
 ### CP9. LOW — Single-writer enforcement is external to the library
 
@@ -1063,7 +1066,7 @@ action error to win.
 
 ## 2d. Storage RPC layer and node client/server boundary
 
-### RPC1. HIGH — No timeout anywhere on storage RPC sockets, combined with an unbounded server-side PG-lock wait
+### RPC1. RESOLVED — Storage RPC sockets and metadata-command lock waits are bounded
 
 A wedged (alive but stuck) client can fence a PG indefinitely and absorb node
 capacity. Confirmed.
@@ -1087,6 +1090,30 @@ capacity. Confirmed.
   an entire node's mutation capacity with no typed overload and no recovery
   short of killing a process. The 10.9 gate bounded admission waits but not
   in-RPC waits.
+- Status update: fixed by applying read/write deadlines to one-shot Unix
+  storage RPC sockets, persistent read-handle sessions, persistent
+  metadata-command sessions, and accepted server-side sockets, using separate
+  client-response, write, and server-idle budgets rather than one shared
+  timeout. The metadata-command PG lock wait is intentionally shorter than the
+  Unix client response timeout, so clients observe typed
+  `MetadataCommandContention` rather than a socket timeout. The server treats
+  idle socket timeout as session closure, so session-owned read handles and
+  metadata-command guards are dropped through the normal connection cleanup
+  path. Client-side socket read/write timeouts are classified as typed
+  `TransportTimeout` storage RPC errors and mapped as retryable transport
+  pressure, not payload/protocol decode failures. Focused regressions cover
+  one-shot and metadata-command session client response timeouts, server
+  idle-session timeout, metadata-command lock wait timeout, and the end-to-end
+  Unix client contention path.
+- Follow-up soak fix: long metadata-PG migration runs exposed that
+  control-plane runtime-map responses could grow with retained historical PG
+  routes until 1s readers disconnected and the authority logged `Broken pipe`.
+  Storage-node heartbeat refreshes now include only historical routes at or
+  above the node's reported history floor plus explicit metadata-transfer
+  source routes required by current peering proofs. The UAT readiness/admin
+  check uses a compact runtime-map status RPC instead of repeatedly fetching
+  the full historical map. Full runtime-map snapshots still export retained
+  history for consumers that need route reconstruction.
 
 ### RPC2. RESOLVED — Epoch validation now uses a refreshed per-frame config snapshot
 
@@ -1193,7 +1220,7 @@ while 1024 sessions hold fds, ECONNABORTED) terminates the accept loop while
 the process keeps holding the data-dir lock — node-down with no
 crash/restart signal. Retry with backoff for transient errno classes.
 
-### RPC8. LOW — Session-object drop performs an untimed blocking RPC
+### RPC8. RESOLVED — Metadata-command session Drop no longer performs an RPC
 
 `Drop for UnixStorageNodeMetadataCommandSession` →
 `release_metadata_command_pg_lock` → write + blocking read on the session
@@ -1202,6 +1229,11 @@ stuck-but-alive server blocks the dropping thread inside `Drop`, including on
 unwind paths. Disconnect alone already releases the server-side lock; make
 the Drop RPC best-effort with a short timeout or replace it with a plain
 close.
+- Status update: fixed by removing the blocking release round trip from
+  `Drop`. Dropping a metadata-command session now shuts down the Unix stream,
+  letting the storage-node session cleanup release the guard. A focused Unix
+  RPC regression verifies the server sees connection closure rather than a
+  release frame and that Drop returns promptly.
 
 ### RPC9. LOW — Multi-process client admission can exceed the server session cap with unbounded queuing
 
@@ -1308,8 +1340,12 @@ closes this.
    per-frame read and response write) mirroring the Raft transport, plus a
    lease/deadline on the server-side metadata-command critical section
    (frames on the session count as renewal; expiry drops the session) —
-   closes RPC1/RPC8/RPC9 together. **DONE:** per-frame config read for epoch
-   validation (RPC2).
+   closes RPC1/RPC8 and reduces the unbounded-wait portion of RPC9. **DONE:**
+   per-frame config read for epoch validation (RPC2), storage-RPC socket
+   deadlines, non-blocking metadata-command session Drop, and bounded
+   metadata-command PG lock acquisition. **OPEN:** RPC9 still needs a
+   deferred framed overload/backlog protocol for multi-process admission
+   fairness.
 8. Wire the peering catch-up path into the control plane — primary chosen as
    the serving node with the longest verified chain, explicit unacked-suffix
    abandonment rule for `ReplicaAheadOfPrimary` — or at minimum emit an
