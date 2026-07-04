@@ -3865,7 +3865,14 @@ fn observe_deadline_range(
 #[derive(Debug, Clone, Default)]
 pub struct ControlPlaneRaftLogStore {
     inner: Arc<Mutex<ControlPlaneRaftLogStoreInner>>,
+    wal: Option<Arc<ControlPlaneRaftWalFile>>,
 }
+
+#[cfg(test)]
+static CONTROL_PLANE_RAFT_WAL_FAIL_NEXT_FILE_SYNC: Mutex<Option<PathBuf>> = Mutex::new(None);
+
+#[cfg(test)]
+static CONTROL_PLANE_RAFT_WAL_FAIL_NEXT_PARENT_SYNC: Mutex<Option<PathBuf>> = Mutex::new(None);
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ControlPlaneRaftLogStoreRestartArtifact {
@@ -3904,6 +3911,23 @@ pub struct ControlPlaneRaftWalFile {
     path: PathBuf,
     cluster_name: String,
     local_node_id: ControlPlaneRaftNodeId,
+}
+
+#[derive(Debug)]
+enum ControlPlaneRaftWalAppendError {
+    BeforeReplayableRecord(ControlPlaneError),
+    AmbiguousRecordMayExist(ControlPlaneError),
+    ReplayableRecordMayExist(ControlPlaneError),
+}
+
+impl ControlPlaneRaftWalAppendError {
+    fn into_control_plane_error(self) -> ControlPlaneError {
+        match self {
+            Self::BeforeReplayableRecord(error)
+            | Self::AmbiguousRecordMayExist(error)
+            | Self::ReplayableRecordMayExist(error) => error,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3952,12 +3976,13 @@ const RAFT_ENTRY_MIN_LEN: usize = 8 + 8 + 8 + 1;
 const RAFT_MEMBERSHIP_CONFIG_MIN_LEN: usize = 4;
 const RAFT_MEMBERSHIP_NODE_MIN_LEN: usize = 8 + 4;
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 struct ControlPlaneRaftLogStoreInner {
     vote: Option<VoteOf<ControlPlaneRaftTypeConfig>>,
     committed: Option<LogIdOf<ControlPlaneRaftTypeConfig>>,
     last_purged_log_id: Option<LogIdOf<ControlPlaneRaftTypeConfig>>,
     entries: BTreeMap<u64, ControlPlaneRaftEntry>,
+    poisoned: Option<String>,
 }
 
 impl ControlPlaneRaftLogStore {
@@ -3991,11 +4016,32 @@ impl ControlPlaneRaftLogStore {
     pub fn from_restart_artifact(
         artifact: ControlPlaneRaftLogStoreRestartArtifact,
     ) -> Result<Self, io::Error> {
+        Self::from_restart_artifact_inner(artifact, None)
+    }
+
+    pub fn from_restart_artifact_with_wal_file(
+        artifact: ControlPlaneRaftLogStoreRestartArtifact,
+        wal: ControlPlaneRaftWalFile,
+    ) -> Result<Self, ControlPlaneError> {
+        let replayed = wal.replay_log_store_artifact(&artifact)?;
+        Self::from_restart_artifact_inner(replayed, Some(Arc::new(wal))).map_err(|source| {
+            ControlPlaneError::Io {
+                context: "restore control-plane OpenRaft WAL-backed log store",
+                source,
+            }
+        })
+    }
+
+    fn from_restart_artifact_inner(
+        artifact: ControlPlaneRaftLogStoreRestartArtifact,
+        wal: Option<Arc<ControlPlaneRaftWalFile>>,
+    ) -> Result<Self, io::Error> {
         let mut inner = ControlPlaneRaftLogStoreInner {
             vote: artifact.vote,
             committed: None,
             last_purged_log_id: artifact.last_purged_log_id,
             entries: BTreeMap::new(),
+            poisoned: None,
         };
         Self::validate_contiguous_append(&inner, &artifact.entries)?;
         for entry in artifact.entries {
@@ -4006,13 +4052,21 @@ impl ControlPlaneRaftLogStore {
         Self::validate_purged_boundary_has_committed(&inner)?;
         Ok(Self {
             inner: Arc::new(Mutex::new(inner)),
+            wal,
         })
     }
 
     fn lock(&self) -> Result<MutexGuard<'_, ControlPlaneRaftLogStoreInner>, io::Error> {
-        self.inner
+        let inner = self
+            .inner
             .lock()
-            .map_err(|_| io::Error::other("control-plane OpenRaft log store lock poisoned"))
+            .map_err(|_| io::Error::other("control-plane OpenRaft log store lock poisoned"))?;
+        if let Some(reason) = &inner.poisoned {
+            return Err(io::Error::other(format!(
+                "control-plane OpenRaft WAL-backed log store poisoned: {reason}"
+            )));
+        }
+        Ok(inner)
     }
 
     fn validate_contiguous_append(
@@ -4317,6 +4371,50 @@ impl ControlPlaneRaftLogStore {
         }
         Ok(())
     }
+
+    fn apply_record(
+        &self,
+        inner: &mut ControlPlaneRaftLogStoreInner,
+        record: &ControlPlaneRaftWalRecord,
+    ) -> Result<(), io::Error> {
+        let mut candidate = inner.clone();
+        record.apply_to_log_store_inner(&mut candidate)?;
+        if let Some(wal) = &self.wal {
+            if let Err(error) = wal.append_record_for_log_store(record) {
+                match error {
+                    ControlPlaneRaftWalAppendError::BeforeReplayableRecord(error) => {
+                        return Err(control_plane_error_to_io_error(
+                            "append OpenRaft WAL record",
+                            error,
+                        ));
+                    }
+                    ControlPlaneRaftWalAppendError::AmbiguousRecordMayExist(error) => {
+                        let message = error.to_string();
+                        inner.poisoned = Some(format!(
+                            "ambiguous WAL append after frame write before file sync: {message}"
+                        ));
+                        return Err(control_plane_error_to_io_error(
+                            "append OpenRaft WAL record after ambiguous record write",
+                            error,
+                        ));
+                    }
+                    ControlPlaneRaftWalAppendError::ReplayableRecordMayExist(error) => {
+                        *inner = candidate;
+                        let message = error.to_string();
+                        inner.poisoned = Some(format!(
+                            "WAL append failed after file sync; restart required to reconcile durable state: {message}"
+                        ));
+                        return Err(control_plane_error_to_io_error(
+                            "append OpenRaft WAL record after replayable record write",
+                            error,
+                        ));
+                    }
+                }
+            }
+        }
+        *inner = candidate;
+        Ok(())
+    }
 }
 
 impl ControlPlaneRaftLogStoreInner {
@@ -4495,23 +4593,35 @@ impl ControlPlaneRaftWalFile {
         &self,
         record: &ControlPlaneRaftWalRecord,
     ) -> Result<(), ControlPlaneError> {
+        self.append_record_for_log_store(record)
+            .map_err(ControlPlaneRaftWalAppendError::into_control_plane_error)
+    }
+
+    fn append_record_for_log_store(
+        &self,
+        record: &ControlPlaneRaftWalRecord,
+    ) -> Result<(), ControlPlaneRaftWalAppendError> {
         let frame = ControlPlaneRaftWalFrame::new(
             self.cluster_name.clone(),
             self.local_node_id,
             record.clone(),
         )
-        .encode_frame()?;
-        let frame_len = raft_len_as_u32(frame.len(), "control-plane OpenRaft WAL frame")?;
+        .encode_frame()
+        .map_err(ControlPlaneRaftWalAppendError::BeforeReplayableRecord)?;
+        let frame_len = raft_len_as_u32(frame.len(), "control-plane OpenRaft WAL frame")
+            .map_err(ControlPlaneRaftWalAppendError::BeforeReplayableRecord)?;
 
         if let Some(parent) = self
             .path
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
         {
-            fs::create_dir_all(parent).map_err(|source| ControlPlaneError::Io {
-                context: "create control-plane OpenRaft WAL directory",
-                source,
-            })?;
+            fs::create_dir_all(parent)
+                .map_err(|source| ControlPlaneError::Io {
+                    context: "create control-plane OpenRaft WAL directory",
+                    source,
+                })
+                .map_err(ControlPlaneRaftWalAppendError::BeforeReplayableRecord)?;
         }
 
         let mut file = OpenOptions::new()
@@ -4521,22 +4631,30 @@ impl ControlPlaneRaftWalFile {
             .map_err(|source| ControlPlaneError::Io {
                 context: "open control-plane OpenRaft WAL for append",
                 source,
-            })?;
+            })
+            .map_err(ControlPlaneRaftWalAppendError::BeforeReplayableRecord)?;
         file.write_all(&frame_len.to_be_bytes())
             .map_err(|source| ControlPlaneError::Io {
                 context: "write control-plane OpenRaft WAL frame length",
                 source,
-            })?;
+            })
+            .map_err(ControlPlaneRaftWalAppendError::BeforeReplayableRecord)?;
         file.write_all(&frame)
             .map_err(|source| ControlPlaneError::Io {
                 context: "write control-plane OpenRaft WAL frame",
                 source,
-            })?;
-        file.sync_all().map_err(|source| ControlPlaneError::Io {
-            context: "sync control-plane OpenRaft WAL",
-            source,
-        })?;
-        sync_control_plane_raft_wal_parent(&self.path)?;
+            })
+            .map_err(ControlPlaneRaftWalAppendError::BeforeReplayableRecord)?;
+        inject_control_plane_raft_wal_file_sync_failure(&self.path)
+            .map_err(ControlPlaneRaftWalAppendError::AmbiguousRecordMayExist)?;
+        file.sync_all()
+            .map_err(|source| ControlPlaneError::Io {
+                context: "sync control-plane OpenRaft WAL",
+                source,
+            })
+            .map_err(ControlPlaneRaftWalAppendError::AmbiguousRecordMayExist)?;
+        sync_control_plane_raft_wal_parent(&self.path)
+            .map_err(ControlPlaneRaftWalAppendError::ReplayableRecordMayExist)?;
         Ok(())
     }
 
@@ -5878,7 +5996,42 @@ fn sync_durable_artifact_parent(path: &Path) -> Result<(), ControlPlaneError> {
         })
 }
 
+fn inject_control_plane_raft_wal_file_sync_failure(path: &Path) -> Result<(), ControlPlaneError> {
+    #[cfg(test)]
+    {
+        let mut injected_path = CONTROL_PLANE_RAFT_WAL_FAIL_NEXT_FILE_SYNC
+            .lock()
+            .expect("test WAL file-sync fault lock should not be poisoned");
+        if injected_path.as_deref() == Some(path) {
+            *injected_path = None;
+            return Err(ControlPlaneError::Io {
+                context: "sync control-plane OpenRaft WAL",
+                source: io::Error::other("injected control-plane OpenRaft WAL sync failure"),
+            });
+        }
+    }
+
+    let _ = path;
+    Ok(())
+}
+
 fn sync_control_plane_raft_wal_parent(path: &Path) -> Result<(), ControlPlaneError> {
+    #[cfg(test)]
+    {
+        let mut injected_path = CONTROL_PLANE_RAFT_WAL_FAIL_NEXT_PARENT_SYNC
+            .lock()
+            .expect("test WAL parent-sync fault lock should not be poisoned");
+        if injected_path.as_deref() == Some(path) {
+            *injected_path = None;
+            return Err(ControlPlaneError::Io {
+                context: "sync control-plane OpenRaft WAL directory",
+                source: io::Error::other(
+                    "injected control-plane OpenRaft WAL directory sync failure",
+                ),
+            });
+        }
+    }
+
     let parent = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -6780,7 +6933,7 @@ impl RaftLogStorage<ControlPlaneRaftTypeConfig> for ControlPlaneRaftLogStore {
         vote: &VoteOf<ControlPlaneRaftTypeConfig>,
     ) -> Result<(), io::Error> {
         let mut inner = self.lock()?;
-        Self::save_vote_inner(&mut inner, *vote)
+        self.apply_record(&mut inner, &ControlPlaneRaftWalRecord::SaveVote(*vote))
     }
 
     async fn save_committed(
@@ -6788,7 +6941,10 @@ impl RaftLogStorage<ControlPlaneRaftTypeConfig> for ControlPlaneRaftLogStore {
         committed: Option<LogIdOf<ControlPlaneRaftTypeConfig>>,
     ) -> Result<(), io::Error> {
         let mut inner = self.lock()?;
-        Self::save_committed_inner(&mut inner, committed)
+        self.apply_record(
+            &mut inner,
+            &ControlPlaneRaftWalRecord::SaveCommitted(committed),
+        )
     }
 
     async fn read_committed(
@@ -6809,7 +6965,9 @@ impl RaftLogStorage<ControlPlaneRaftTypeConfig> for ControlPlaneRaftLogStore {
         let entries = entries.into_iter().collect::<Vec<_>>();
         {
             let mut inner = self.lock()?;
-            if let Err(error) = Self::append_inner(&mut inner, entries) {
+            if let Err(error) =
+                self.apply_record(&mut inner, &ControlPlaneRaftWalRecord::Append(entries))
+            {
                 let message = error.to_string();
                 callback.io_completed(Err(raft_log_store_error(message.clone())));
                 return Err(raft_log_store_error(message));
@@ -6824,7 +6982,10 @@ impl RaftLogStorage<ControlPlaneRaftTypeConfig> for ControlPlaneRaftLogStore {
         last_log_id: Option<LogIdOf<ControlPlaneRaftTypeConfig>>,
     ) -> Result<(), io::Error> {
         let mut inner = self.lock()?;
-        Self::truncate_after_inner(&mut inner, last_log_id)
+        self.apply_record(
+            &mut inner,
+            &ControlPlaneRaftWalRecord::TruncateAfter(last_log_id),
+        )
     }
 
     async fn purge(
@@ -6832,7 +6993,7 @@ impl RaftLogStorage<ControlPlaneRaftTypeConfig> for ControlPlaneRaftLogStore {
         log_id: LogIdOf<ControlPlaneRaftTypeConfig>,
     ) -> Result<(), io::Error> {
         let mut inner = self.lock()?;
-        Self::purge_inner(&mut inner, log_id)
+        self.apply_record(&mut inner, &ControlPlaneRaftWalRecord::Purge(log_id))
     }
 }
 
@@ -10766,6 +10927,213 @@ mod tests {
             .expect("retained WAL prefix should replay");
         assert_eq!(replayed, expected);
         assert_eq!(fs::metadata(&path).unwrap().len(), clean_len as u64);
+    }
+
+    #[test]
+    fn control_plane_raft_wal_backed_log_store_persists_live_mutations_for_replay() {
+        ControlPlaneRaftTypeConfig::run(async {
+            let tmp = test_util::tempdir();
+            let wal = ControlPlaneRaftWalFile::new(tmp.path().join("raft.wal"), "test-cluster", 1);
+            let base = ControlPlaneRaftLogStoreRestartArtifact::default();
+            let mut live = ControlPlaneRaftLogStore::from_restart_artifact_with_wal_file(
+                base.clone(),
+                wal.clone(),
+            )
+            .expect("WAL-backed log store should initialize");
+
+            RaftLogStorage::append(
+                &mut live,
+                vec![bootstrap_membership_entry(1), blank_entry(3, 1, 1)],
+                IOFlushed::noop(),
+            )
+            .await
+            .unwrap();
+            RaftLogStorage::save_vote(
+                &mut live,
+                &Vote::<ControlPlaneRaftLeaderId>::new_committed(3, 1),
+            )
+            .await
+            .unwrap();
+            RaftLogStorage::save_committed(&mut live, Some(raft_log_id(3, 1, 1)))
+                .await
+                .unwrap();
+            RaftLogStorage::append(&mut live, vec![blank_entry(3, 1, 2)], IOFlushed::noop())
+                .await
+                .unwrap();
+            RaftLogStorage::save_committed(&mut live, Some(raft_log_id(3, 1, 2)))
+                .await
+                .unwrap();
+            RaftLogStorage::purge(&mut live, raft_log_id(3, 1, 1))
+                .await
+                .unwrap();
+            RaftLogStorage::truncate_after(&mut live, Some(raft_log_id(3, 1, 2)))
+                .await
+                .unwrap();
+
+            let replayed = ControlPlaneRaftLogStore::from_restart_artifact_with_wal_file(base, wal)
+                .expect("WAL-backed restart should replay live mutations")
+                .export_restart_artifact()
+                .unwrap();
+            assert_eq!(replayed, live.export_restart_artifact().unwrap());
+        });
+    }
+
+    #[test]
+    fn control_plane_raft_wal_backed_log_store_failure_does_not_publish_mutation() {
+        ControlPlaneRaftTypeConfig::run(async {
+            let tmp = test_util::tempdir();
+            let parent = tmp.path().join("wal-parent");
+            fs::create_dir(&parent).unwrap();
+            let wal_path = parent.join("raft.wal");
+            let wal = ControlPlaneRaftWalFile::new(&wal_path, "test-cluster", 1);
+            let mut store = ControlPlaneRaftLogStore::from_restart_artifact_with_wal_file(
+                ControlPlaneRaftLogStoreRestartArtifact::default(),
+                wal,
+            )
+            .expect("missing WAL under existing directory should initialize");
+            fs::remove_dir(&parent).unwrap();
+            fs::write(&parent, b"not a directory").unwrap();
+
+            let err = RaftLogStorage::append(
+                &mut store,
+                vec![bootstrap_membership_entry(1)],
+                IOFlushed::noop(),
+            )
+            .await
+            .expect_err("WAL append failure should reject log-store mutation");
+            assert!(
+                err.to_string().contains("append OpenRaft WAL record"),
+                "unexpected WAL append error: {err:?}"
+            );
+            assert_eq!(
+                store.export_restart_artifact().unwrap(),
+                ControlPlaneRaftLogStoreRestartArtifact::default()
+            );
+        });
+    }
+
+    #[test]
+    fn control_plane_raft_wal_backed_log_store_file_sync_error_poisons_without_publishing() {
+        ControlPlaneRaftTypeConfig::run(async {
+            let tmp = test_util::tempdir();
+            let wal_path = tmp.path().join("raft.wal");
+            let wal = ControlPlaneRaftWalFile::new(&wal_path, "test-cluster", 1);
+            let base = ControlPlaneRaftLogStoreRestartArtifact::default();
+            let mut store = ControlPlaneRaftLogStore::from_restart_artifact_with_wal_file(
+                base.clone(),
+                wal.clone(),
+            )
+            .expect("WAL-backed log store should initialize");
+
+            *CONTROL_PLANE_RAFT_WAL_FAIL_NEXT_FILE_SYNC
+                .lock()
+                .expect("test WAL file-sync fault lock should not be poisoned") =
+                Some(wal_path.clone());
+            let err = RaftLogStorage::append(
+                &mut store,
+                vec![bootstrap_membership_entry(1)],
+                IOFlushed::noop(),
+            )
+            .await
+            .expect_err("ambiguous WAL sync failure should return an error");
+            assert!(
+                err.to_string()
+                    .contains("append OpenRaft WAL record after ambiguous record write"),
+                "unexpected WAL append error: {err:?}"
+            );
+
+            let err = store
+                .export_restart_artifact()
+                .expect_err("ambiguous WAL sync failure should poison the live log store");
+            assert!(
+                err.to_string()
+                    .contains("control-plane OpenRaft WAL-backed log store poisoned"),
+                "unexpected poison error: {err:?}"
+            );
+            let inner = store
+                .inner
+                .lock()
+                .expect("test should be able to inspect poisoned log store");
+            assert_eq!(inner.vote, base.vote);
+            assert_eq!(inner.committed, base.committed);
+            assert_eq!(inner.last_purged_log_id, base.last_purged_log_id);
+            assert!(inner.entries.is_empty());
+            assert!(
+                inner
+                    .poisoned
+                    .as_deref()
+                    .is_some_and(|reason| reason.contains("ambiguous WAL append")),
+                "unexpected poison reason: {:?}",
+                inner.poisoned
+            );
+        });
+    }
+
+    #[test]
+    fn control_plane_raft_wal_backed_log_store_parent_sync_error_publishes_then_poisons() {
+        ControlPlaneRaftTypeConfig::run(async {
+            let tmp = test_util::tempdir();
+            let wal_path = tmp.path().join("raft.wal");
+            let wal = ControlPlaneRaftWalFile::new(&wal_path, "test-cluster", 1);
+            let base = ControlPlaneRaftLogStoreRestartArtifact::default();
+            let mut store = ControlPlaneRaftLogStore::from_restart_artifact_with_wal_file(
+                base.clone(),
+                wal.clone(),
+            )
+            .expect("WAL-backed log store should initialize");
+
+            *CONTROL_PLANE_RAFT_WAL_FAIL_NEXT_PARENT_SYNC
+                .lock()
+                .expect("test WAL parent-sync fault lock should not be poisoned") =
+                Some(wal_path.clone());
+            let err = RaftLogStorage::append(
+                &mut store,
+                vec![bootstrap_membership_entry(1)],
+                IOFlushed::noop(),
+            )
+            .await
+            .expect_err("post-write WAL sync failure should still return an error");
+            assert!(
+                err.to_string()
+                    .contains("append OpenRaft WAL record after replayable record write"),
+                "unexpected WAL append error: {err:?}"
+            );
+
+            let err = store
+                .export_restart_artifact()
+                .expect_err("post-file-sync failure should poison the live log store");
+            assert!(
+                err.to_string()
+                    .contains("control-plane OpenRaft WAL-backed log store poisoned"),
+                "unexpected poison error: {err:?}"
+            );
+            let live_artifact = {
+                let inner = store
+                    .inner
+                    .lock()
+                    .expect("test should be able to inspect poisoned log store");
+                assert!(
+                    inner
+                        .poisoned
+                        .as_deref()
+                        .is_some_and(|reason| reason.contains("WAL append failed after file sync")),
+                    "unexpected poison reason: {:?}",
+                    inner.poisoned
+                );
+                ControlPlaneRaftLogStoreRestartArtifact {
+                    vote: inner.vote,
+                    committed: inner.committed,
+                    last_purged_log_id: inner.last_purged_log_id,
+                    entries: inner.entries.values().cloned().collect(),
+                }
+            };
+            assert_ne!(live_artifact, base);
+            let replayed = ControlPlaneRaftLogStore::from_restart_artifact_with_wal_file(base, wal)
+                .expect("replayable WAL record should be restored after post-write error")
+                .export_restart_artifact()
+                .unwrap();
+            assert_eq!(live_artifact, replayed);
+        });
     }
 
     #[test]

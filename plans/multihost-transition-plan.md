@@ -10763,6 +10763,19 @@ Phase 12.4 progress:
   complete frames fail closed. This is still a storage-level primitive: the
   live peer RPC acknowledgement path has not yet switched from full restart
   artifact checkpoints to WAL-only fsync.
+- Wired the WAL file into an optional live `ControlPlaneRaftLogStore` mode.
+  WAL-backed vote/log/commit/truncate/purge mutations now validate on a cloned
+  candidate state, fsync the WAL record, and only then publish the candidate
+  into memory. The failure boundary is explicit: pre-frame failures reject
+  without changing memory, ambiguous post-write/pre-file-sync failures poison
+  the live WAL-backed store without publishing, and post-file-sync parent-sync
+  failures publish the candidate and then poison the store so callers cannot
+  retry against a state that restart may replay differently. Tests prove live
+  WAL-backed mutations replay to the same restart artifact, path-scoped
+  fail-closed pre-record and file-sync fault injection, and the replayable
+  parent-sync failure path. The process peer-response path still remains on
+  full restart-artifact checkpoint-before-response until crash/fault injection
+  proves WAL-only acknowledgements end to end.
 
 1. define the replicated control-plane state machine:
    - state includes cluster epoch, PG count, PG state, PG acting sets, node
