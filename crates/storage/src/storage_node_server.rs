@@ -847,7 +847,7 @@ pub fn validate_storage_node_process_configs(
 }
 
 pub struct StorageNodeServer {
-    config: RwLock<StorageNodeProcessConfig>,
+    config: Arc<RwLock<Arc<StorageNodeProcessConfig>>>,
     _data_dir_lock: StorageNodeDataDirLock,
     control_plane_incarnation_lock: Mutex<()>,
     _node: Arc<SharedStorageNode>,
@@ -1023,7 +1023,7 @@ impl StorageNodeServer {
             }
         })?;
         Ok(Self {
-            config: RwLock::new(config),
+            config: Arc::new(RwLock::new(Arc::new(config))),
             _data_dir_lock: data_dir_lock,
             control_plane_incarnation_lock: Mutex::new(()),
             _node: Arc::new(node),
@@ -1052,8 +1052,8 @@ impl StorageNodeServer {
                     path: self.config_snapshot().socket_path,
                     source,
                 })?;
-        self.connection_handler()
-            .handle_session(&mut stream, session_guard)
+        let mut handler = self.connection_handler();
+        handler.handle_session(&mut stream, session_guard)
     }
 
     pub fn serve_forever(&self) -> Result<(), StorageNodeServerError> {
@@ -1251,7 +1251,7 @@ impl StorageNodeServer {
                 candidate: next_config.route_map_valid_until_ms,
             });
         }
-        *current_config = next_config;
+        *current_config = Arc::new(next_config);
         Ok(())
     }
 
@@ -1265,7 +1265,7 @@ impl StorageNodeServer {
                     path: self.config_snapshot().socket_path,
                     source,
                 })?;
-        let handler = self.connection_handler();
+        let mut handler = self.connection_handler();
         thread::spawn(move || {
             if let Err(error) = handler.handle_session(&mut stream, session_guard) {
                 eprintln!("storage-node connection failed: {error}");
@@ -1276,7 +1276,8 @@ impl StorageNodeServer {
 
     fn connection_handler(&self) -> StorageNodeConnectionHandler {
         StorageNodeConnectionHandler {
-            config: self.config_snapshot(),
+            config: self.config_snapshot_arc(),
+            config_source: Arc::clone(&self.config),
             node: Arc::clone(&self._node),
             read_handles: Arc::clone(&self.read_handles),
             metadata_command_locks: self.metadata_command_locks.clone(),
@@ -1284,6 +1285,10 @@ impl StorageNodeServer {
     }
 
     fn config_snapshot(&self) -> StorageNodeProcessConfig {
+        self.config_snapshot_arc().as_ref().clone()
+    }
+
+    fn config_snapshot_arc(&self) -> Arc<StorageNodeProcessConfig> {
         self.config
             .read()
             .unwrap_or_else(|e| e.into_inner())
@@ -1508,16 +1513,25 @@ impl Drop for StorageNodeMetadataCommandGuard {
 
 #[derive(Clone)]
 struct StorageNodeConnectionHandler {
-    config: StorageNodeProcessConfig,
+    config: Arc<StorageNodeProcessConfig>,
+    config_source: Arc<RwLock<Arc<StorageNodeProcessConfig>>>,
     node: Arc<SharedStorageNode>,
     read_handles: Arc<Mutex<StorageNodeReadHandleState>>,
     metadata_command_locks: StorageNodeMetadataCommandLocks,
 }
 
 impl StorageNodeConnectionHandler {
+    fn refresh_config_snapshot(&mut self) {
+        self.config = self
+            .config_source
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+    }
+
     fn metadata_command_pg_guard(
         &self,
-        session: &StorageNodeSession<'_>,
+        session: &StorageNodeSession,
         pg_id: PgId,
     ) -> Option<StorageNodeMetadataCommandGuard> {
         if session.holds_metadata_command_pg_lock(pg_id) {
@@ -1532,11 +1546,11 @@ impl StorageNodeConnectionHandler {
     }
 
     fn handle_session(
-        &self,
+        &mut self,
         stream: &mut UnixStream,
         _session_guard: StorageNodeActiveSessionGuard,
     ) -> Result<(), StorageNodeServerError> {
-        let mut session = StorageNodeSession::new(&self.read_handles);
+        let mut session = StorageNodeSession::new(Arc::clone(&self.read_handles));
         loop {
             let frame = match read_storage_rpc_request_frame_from(stream) {
                 Ok(frame) => frame,
@@ -1552,6 +1566,7 @@ impl StorageNodeConnectionHandler {
                 }
                 Err(error) => return Err(rpc_stream_error(error)),
             };
+            self.refresh_config_snapshot();
             let _rpc_trace = observability::AttachedTrace::new(storage_node_rpc_trace_context(
                 self.config.node_id,
                 frame.request_id,
@@ -1618,7 +1633,7 @@ impl StorageNodeConnectionHandler {
 
     fn dispatch_frame(
         &self,
-        session: &mut StorageNodeSession<'_>,
+        session: &mut StorageNodeSession,
         frame: &StorageRpcFrame,
     ) -> Result<StorageRpcFrame, StorageNodeServerError> {
         let payload = match frame.kind {
@@ -3067,7 +3082,7 @@ impl StorageNodeConnectionHandler {
 
     fn read_handles_acquire_response(
         &self,
-        session: &mut StorageNodeSession<'_>,
+        session: &mut StorageNodeSession,
         request: StorageRpcReadHandleAcquireRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
         if let Err(error) = self.validate_shard_locations(&request.locations) {
@@ -3088,7 +3103,7 @@ impl StorageNodeConnectionHandler {
 
     fn read_handles_release_response(
         &self,
-        session: &mut StorageNodeSession<'_>,
+        session: &mut StorageNodeSession,
         request: StorageRpcReadHandleReleaseRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
         session.release_read_handles(&request.read_operation_id);
@@ -7527,7 +7542,7 @@ impl StorageNodeConnectionHandler {
 
     fn metadata_command_replica_state_response(
         &self,
-        session: &StorageNodeSession<'_>,
+        session: &StorageNodeSession,
         request: StorageRpcMetadataCommandStateRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
         if let Err(error) = self.validate_pg_route_for_metadata_transfer_inspection(
@@ -7556,7 +7571,7 @@ impl StorageNodeConnectionHandler {
 
     fn metadata_command_max_log_index_response(
         &self,
-        session: &StorageNodeSession<'_>,
+        session: &StorageNodeSession,
         request: StorageRpcMetadataCommandStateRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
         if let Err(error) = self.validate_pg_route_for_metadata_transfer_inspection(
@@ -7585,7 +7600,7 @@ impl StorageNodeConnectionHandler {
 
     fn metadata_command_log_hash_range_response(
         &self,
-        session: &StorageNodeSession<'_>,
+        session: &StorageNodeSession,
         request: StorageRpcMetadataCommandLogHashRangeRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
         if let Err(error) = self.validate_pg_route_for_metadata_log_read(
@@ -7639,7 +7654,7 @@ impl StorageNodeConnectionHandler {
 
     fn metadata_command_log_entry_range_response(
         &self,
-        session: &StorageNodeSession<'_>,
+        session: &StorageNodeSession,
         request: StorageRpcMetadataCommandLogHashRangeRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
         if let Err(error) = self.validate_pg_route_for_metadata_log_read(
@@ -7693,7 +7708,7 @@ impl StorageNodeConnectionHandler {
 
     fn metadata_command_next_id_response(
         &self,
-        session: &StorageNodeSession<'_>,
+        session: &StorageNodeSession,
         request: StorageRpcMetadataCommandNextIdRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
         if let Err(error) =
@@ -7790,7 +7805,7 @@ impl StorageNodeConnectionHandler {
 
     fn metadata_command_pending_envelope_response(
         &self,
-        session: &StorageNodeSession<'_>,
+        session: &StorageNodeSession,
         request: StorageRpcMetadataCommandStateRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
         if let Err(error) = self.validate_pg_route_for_metadata_log_read(
@@ -7820,7 +7835,7 @@ impl StorageNodeConnectionHandler {
 
     fn metadata_command_validate_replay_state_response(
         &self,
-        session: &StorageNodeSession<'_>,
+        session: &StorageNodeSession,
         request: StorageRpcMetadataCommandStateRequest,
         preserve_pending_slot: bool,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
@@ -7858,7 +7873,7 @@ impl StorageNodeConnectionHandler {
 
     fn metadata_command_replica_state_can_initialize_response(
         &self,
-        session: &StorageNodeSession<'_>,
+        session: &StorageNodeSession,
         request: StorageRpcMetadataCommandStateRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
         if let Err(error) = self.validate_pg_route_for_peering_inspection(
@@ -7888,7 +7903,7 @@ impl StorageNodeConnectionHandler {
 
     fn metadata_command_checkpoint_response(
         &self,
-        session: &StorageNodeSession<'_>,
+        session: &StorageNodeSession,
         request: StorageRpcMetadataCommandStateRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
         if let Err(error) = self.validate_pg_route_for_peering_inspection(
@@ -7919,7 +7934,7 @@ impl StorageNodeConnectionHandler {
 
     fn metadata_command_checkpoint_record_current_response(
         &self,
-        session: &StorageNodeSession<'_>,
+        session: &StorageNodeSession,
         request: StorageRpcMetadataCommandStateRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
         if let Err(error) =
@@ -7959,7 +7974,7 @@ impl StorageNodeConnectionHandler {
 
     fn metadata_command_log_compact_response(
         &self,
-        session: &StorageNodeSession<'_>,
+        session: &StorageNodeSession,
         request: StorageRpcMetadataCommandStateRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
         if let Err(error) =
@@ -7990,7 +8005,7 @@ impl StorageNodeConnectionHandler {
 
     fn metadata_command_checkpoint_candidates_response(
         &self,
-        session: &StorageNodeSession<'_>,
+        session: &StorageNodeSession,
         request: StorageRpcMetadataCommandCheckpointCandidatesRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
         if let Err(error) = self.validate_pg_route_for_metadata_log_read(
@@ -8028,7 +8043,7 @@ impl StorageNodeConnectionHandler {
 
     fn metadata_command_transfer_state_adopt_response(
         &self,
-        session: &StorageNodeSession<'_>,
+        session: &StorageNodeSession,
         request: StorageRpcMetadataCommandTransferAdoptRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
         if let Err(error) = self.validate_pg_route_for_peering_inspection(
@@ -8060,7 +8075,7 @@ impl StorageNodeConnectionHandler {
 
     fn metadata_command_transfer_empty_state_initialize_response(
         &self,
-        session: &StorageNodeSession<'_>,
+        session: &StorageNodeSession,
         request: StorageRpcMetadataCommandTransferEmptyStateRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
         if let Err(error) = self.validate_pg_route_for_peering_inspection(
@@ -8091,7 +8106,7 @@ impl StorageNodeConnectionHandler {
 
     fn metadata_command_transfer_matching_state_initialize_response(
         &self,
-        session: &StorageNodeSession<'_>,
+        session: &StorageNodeSession,
         request: StorageRpcMetadataCommandTransferMatchingStateRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
         if let Err(error) = self.validate_pg_route_for_peering_inspection(
@@ -8124,7 +8139,7 @@ impl StorageNodeConnectionHandler {
 
     fn metadata_command_transfer_checkpoint_base_install_response(
         &self,
-        session: &StorageNodeSession<'_>,
+        session: &StorageNodeSession,
         request: StorageRpcMetadataCommandTransferCheckpointBaseRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
         if let Err(error) = self.validate_pg_route_with_allowed_states(
@@ -8156,7 +8171,7 @@ impl StorageNodeConnectionHandler {
 
     fn metadata_command_applied_hashes_response(
         &self,
-        session: &StorageNodeSession<'_>,
+        session: &StorageNodeSession,
         request: StorageRpcMetadataCommandRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
         if let Err(error) =
@@ -8211,7 +8226,7 @@ impl StorageNodeConnectionHandler {
 
     fn metadata_command_matching_applied_response(
         &self,
-        session: &StorageNodeSession<'_>,
+        session: &StorageNodeSession,
         request: StorageRpcMetadataCommandMatchingAppliedRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
         if let Err(error) =
@@ -8267,7 +8282,7 @@ impl StorageNodeConnectionHandler {
 
     fn metadata_command_abandoned_response(
         &self,
-        session: &StorageNodeSession<'_>,
+        session: &StorageNodeSession,
         request: StorageRpcMetadataCommandRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
         if let Err(error) =
@@ -8319,7 +8334,7 @@ impl StorageNodeConnectionHandler {
 
     fn metadata_command_record_abandoned_response(
         &self,
-        session: &StorageNodeSession<'_>,
+        session: &StorageNodeSession,
         request: StorageRpcMetadataCommandRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
         if let Err(error) =
@@ -8371,7 +8386,7 @@ impl StorageNodeConnectionHandler {
 
     fn metadata_command_apply_and_record_response(
         &self,
-        session: &StorageNodeSession<'_>,
+        session: &StorageNodeSession,
         request: StorageRpcMetadataCommandRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
         self.metadata_command_apply_and_record_response_with_allowed_states(
@@ -8383,7 +8398,7 @@ impl StorageNodeConnectionHandler {
 
     fn metadata_command_peering_replay_apply_and_record_response(
         &self,
-        session: &StorageNodeSession<'_>,
+        session: &StorageNodeSession,
         request: StorageRpcMetadataCommandRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
         self.metadata_command_apply_and_record_response_with_allowed_states(
@@ -8395,7 +8410,7 @@ impl StorageNodeConnectionHandler {
 
     fn metadata_command_apply_and_record_response_with_allowed_states(
         &self,
-        session: &StorageNodeSession<'_>,
+        session: &StorageNodeSession,
         request: StorageRpcMetadataCommandRequest,
         allowed_states: &[PgState],
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
@@ -8563,7 +8578,7 @@ impl StorageNodeConnectionHandler {
 
     fn metadata_command_acceptance_response(
         &self,
-        session: &StorageNodeSession<'_>,
+        session: &StorageNodeSession,
         request: StorageRpcMetadataCommandRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
         if let Err(error) = validate_metadata_command_request_epoch(&request) {
@@ -8618,7 +8633,7 @@ impl StorageNodeConnectionHandler {
 
     fn metadata_command_abandon_acceptance_response(
         &self,
-        session: &StorageNodeSession<'_>,
+        session: &StorageNodeSession,
         request: StorageRpcMetadataCommandRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
         if let Err(error) = validate_metadata_command_request_epoch(&request) {
@@ -8673,7 +8688,7 @@ impl StorageNodeConnectionHandler {
 
     fn metadata_command_pending_slot_insert_response(
         &self,
-        session: &StorageNodeSession<'_>,
+        session: &StorageNodeSession,
         request: StorageRpcMetadataCommandPendingSlotRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
         if let Err(error) =
@@ -8766,7 +8781,7 @@ impl StorageNodeConnectionHandler {
 
     fn metadata_command_bucket_control_pending_slot_insert_response(
         &self,
-        session: &StorageNodeSession<'_>,
+        session: &StorageNodeSession,
         request: StorageRpcMetadataCommandPendingSlotRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
         if let Err(error) =
@@ -8853,7 +8868,7 @@ impl StorageNodeConnectionHandler {
 
     fn metadata_command_pending_slot_remove_response(
         &self,
-        session: &StorageNodeSession<'_>,
+        session: &StorageNodeSession,
         request: StorageRpcMetadataCommandRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
         if let Err(error) =
@@ -8924,7 +8939,7 @@ impl StorageNodeConnectionHandler {
 
     fn metadata_command_pending_slot_replace_response(
         &self,
-        session: &StorageNodeSession<'_>,
+        session: &StorageNodeSession,
         request: StorageRpcMetadataCommandPendingSlotReplaceRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
         if let Err(error) =
@@ -8968,7 +8983,7 @@ impl StorageNodeConnectionHandler {
 
     fn metadata_command_pg_lock_acquire_response(
         &self,
-        session: &mut StorageNodeSession<'_>,
+        session: &mut StorageNodeSession,
         request: StorageRpcMetadataCommandStateRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
         if let Err(error) =
@@ -8992,7 +9007,7 @@ impl StorageNodeConnectionHandler {
 
     fn metadata_command_pg_lock_release_response(
         &self,
-        session: &mut StorageNodeSession<'_>,
+        session: &mut StorageNodeSession,
         request: StorageRpcMetadataCommandStateRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
         if let Err(error) = self.validate_pg_route_for_cleanup(
@@ -9921,15 +9936,15 @@ impl Ord for ReadHandleShardKey {
     }
 }
 
-struct StorageNodeSession<'a> {
-    shared_handles: &'a Mutex<StorageNodeReadHandleState>,
+struct StorageNodeSession {
+    shared_handles: Arc<Mutex<StorageNodeReadHandleState>>,
     read_operations: BTreeMap<String, SessionReadHandle>,
     metadata_command_guards: BTreeMap<PgId, StorageNodeMetadataCommandGuard>,
     current_rpc_context: Option<StorageNodeMetadataCommandLockContext>,
 }
 
-impl<'a> StorageNodeSession<'a> {
-    fn new(shared_handles: &'a Mutex<StorageNodeReadHandleState>) -> Self {
+impl StorageNodeSession {
+    fn new(shared_handles: Arc<Mutex<StorageNodeReadHandleState>>) -> Self {
         Self {
             shared_handles,
             read_operations: BTreeMap::new(),
@@ -10046,7 +10061,7 @@ impl<'a> StorageNodeSession<'a> {
     }
 }
 
-impl Drop for StorageNodeSession<'_> {
+impl Drop for StorageNodeSession {
     fn drop(&mut self) {
         let mut shared_handles = self
             .shared_handles
@@ -10934,7 +10949,7 @@ mod tests {
         private_socket_dir(config.socket_path.parent().unwrap());
         let server = StorageNodeServer::bind(config.clone()).unwrap();
         let handler = server.connection_handler();
-        let mut session = StorageNodeSession::new(&server.read_handles);
+        let mut session = StorageNodeSession::new(Arc::clone(&server.read_handles));
         session.acquire_metadata_command_pg_lock(
             &server.metadata_command_locks,
             config.node_id,
@@ -12352,6 +12367,86 @@ mod tests {
         let health = decode_health_response(&health_payload).unwrap();
         assert_eq!(health.node_id, NodeId::new(7));
         assert_eq!(health.cluster_epoch, ClusterEpoch::new(1).unwrap());
+    }
+
+    #[test]
+    fn storage_node_connection_refreshes_config_for_each_frame() {
+        let tmp = test_util::tempdir();
+        let config = test_config(&tmp);
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let server = Arc::new(StorageNodeServer::bind(config.clone()).unwrap());
+        let server_for_thread = Arc::clone(&server);
+        let socket_path = config.socket_path.clone();
+        let join = thread::spawn(move || server_for_thread.accept_one().unwrap());
+
+        let mut client = UnixStream::connect(socket_path).unwrap();
+        let first = send_frame(&mut client, 1, StorageRpcMessageKind::Health, Vec::new());
+        let first_payload = decode_storage_rpc_response_payload(&first.payload)
+            .unwrap()
+            .unwrap();
+        let first_health = decode_health_response(&first_payload).unwrap();
+        assert_eq!(first_health.cluster_epoch, ClusterEpoch::new(1).unwrap());
+
+        let mut next_config = config.clone();
+        next_config.cluster_epoch = ClusterEpoch::new(2).unwrap();
+        next_config.pg_routes[0].cluster_epoch = next_config.cluster_epoch;
+        server
+            .install_control_plane_runtime_config(next_config)
+            .unwrap();
+
+        let second = send_frame(&mut client, 2, StorageRpcMessageKind::Health, Vec::new());
+        let second_payload = decode_storage_rpc_response_payload(&second.payload)
+            .unwrap()
+            .unwrap();
+        let second_health = decode_health_response(&second_payload).unwrap();
+        assert_eq!(second_health.cluster_epoch, ClusterEpoch::new(2).unwrap());
+
+        let stale_read_acquire = send_frame(
+            &mut client,
+            3,
+            StorageRpcMessageKind::ReadHandlesAcquire,
+            read_handle_acquire_payload("stale-read", test_location(1, 0, 7)),
+        );
+        let stale_error = decode_storage_rpc_response_payload(&stale_read_acquire.payload)
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(stale_error.code, StorageRpcErrorCode::StaleShardLocation);
+        assert!(stale_error
+            .message
+            .contains("does not match storage-node epoch 2"));
+        assert_eq!(server.read_handle_count(test_location(1, 0, 7)), 0);
+
+        drop(client);
+        join.join().unwrap();
+    }
+
+    #[test]
+    fn storage_node_connection_route_validation_uses_refreshed_config() {
+        let tmp = test_util::tempdir();
+        let config = test_config(&tmp);
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let server = StorageNodeServer::bind(config.clone()).unwrap();
+        let mut handler = server.connection_handler();
+
+        handler
+            .validate_pg_route(config.node_id, config.cluster_epoch, PgId::new(0))
+            .unwrap();
+
+        let mut next_config = config.clone();
+        next_config.cluster_epoch = ClusterEpoch::new(2).unwrap();
+        next_config.pg_routes[0].cluster_epoch = next_config.cluster_epoch;
+        server
+            .install_control_plane_runtime_config(next_config)
+            .unwrap();
+        handler.refresh_config_snapshot();
+
+        let error = handler
+            .validate_pg_route(config.node_id, config.cluster_epoch, PgId::new(0))
+            .unwrap_err();
+        assert_eq!(error.code, StorageRpcErrorCode::StaleShardLocation);
+        assert!(error
+            .message
+            .contains("does not match storage-node epoch 2"));
     }
 
     #[test]
@@ -15378,7 +15473,7 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         let handler_for_thread = handler.clone();
         let join = thread::spawn(move || {
-            let session = StorageNodeSession::new(&handler_for_thread.read_handles);
+            let session = StorageNodeSession::new(Arc::clone(&handler_for_thread.read_handles));
             let response = handler_for_thread
                 .metadata_command_pending_slot_insert_response(&session, request)
                 .unwrap();
@@ -16047,8 +16142,8 @@ mod tests {
 
     #[test]
     fn storage_node_session_rejects_read_operation_count_over_limit() {
-        let shared_handles = Mutex::new(StorageNodeReadHandleState::default());
-        let mut session = StorageNodeSession::new(&shared_handles);
+        let shared_handles = Arc::new(Mutex::new(StorageNodeReadHandleState::default()));
+        let mut session = StorageNodeSession::new(Arc::clone(&shared_handles));
         let location = test_location(1, 0, 7);
 
         for i in 0..STORAGE_NODE_MAX_READ_OPERATIONS_PER_SESSION {

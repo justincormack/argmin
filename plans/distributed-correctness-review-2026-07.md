@@ -44,10 +44,10 @@ treating as a design item, not just a bug list:
    invert, that is a process gap as much as a code bug.
 4. **Fail-closed machinery with bypass seams.** The digest gate can be masked
    by the clean-revision cache (MD2); freshness proofs are minted but no
-   production consumer checks them (CP4); epoch fencing validates against a
-   per-connection snapshot (RPC2); the peering catch-up path is dead code
-   (CL2). Each fail-closed mechanism needs a test proving it cannot be
-   bypassed, not just that it fires.
+   production consumer checks them (CP4); the peering catch-up path is dead
+   code (CL2). RPC2's per-connection snapshot bypass is now fixed with
+   per-frame config refresh. Each fail-closed mechanism needs a test proving
+   it cannot be bypassed, not just that it fires.
 
 ---
 
@@ -1043,7 +1043,7 @@ capacity. Confirmed.
   short of killing a process. The 10.9 gate bounded admission waits but not
   in-RPC waits.
 
-### RPC2. HIGH entering Phase 11 (medium today) — Epoch validation runs against a per-connection config snapshot
+### RPC2. RESOLVED — Epoch validation now uses a refreshed per-frame config snapshot
 
 A node keeps accepting mutations for an epoch it already knows is superseded.
 Confirmed (verified directly).
@@ -1065,6 +1065,15 @@ Confirmed (verified directly).
 - Fix is cheap: re-read the current config per frame (an `Arc` swap read, not
   a clone per frame) instead of per connection, keeping the per-connection
   snapshot only for fields that must stay pinned per session.
+- Status update: fixed by storing the storage-node runtime config as an
+  `Arc<StorageNodeProcessConfig>` behind the refresh lock and having
+  connection handlers refresh by cloning that `Arc` before dispatching each
+  RPC frame. Existing session state remains connection-scoped, but route and
+  epoch validation now sees the latest installed runtime map without cloning
+  route tables on the hot path. Regression coverage keeps a single Unix
+  connection open across a runtime-map refresh, verifies the second health
+  frame reports the new epoch, and verifies an old-epoch read-handle acquire
+  on that same socket is rejected without acquiring a read handle.
 
 ### RPC3. MEDIUM — Remote shard corruption/absence classification for EC reconstruction depends on matching error `Display` strings inside a generic `Internal` code
 
@@ -1185,7 +1194,8 @@ closes this.
   `storage_node_server.rs:9207-9284`); PG-primary-only ops validate
   `route.primary_node_id` plus server-side re-derivation of the
   bucket/object→PG mapping (:9425-9467). The server does not trust client
-  routing (modulo RPC2's snapshot staleness).
+  routing, and RPC2 now refreshes storage-node runtime config before each RPC
+  frame is dispatched.
 - **Shard write ack is after durability:** `write_shard_file_durable_if_absent`
   fdatasyncs the temp file, hard-links into place, fsyncs the parent dir, and
   is exact-idempotent — same-bytes retry returns the same ack; different
@@ -1247,8 +1257,8 @@ closes this.
    per-frame read and response write) mirroring the Raft transport, plus a
    lease/deadline on the server-side metadata-command critical section
    (frames on the session count as renewal; expiry drops the session) —
-   closes RPC1/RPC8/RPC9 together. Per-frame config read for epoch validation
-   (RPC2).
+   closes RPC1/RPC8/RPC9 together. **DONE:** per-frame config read for epoch
+   validation (RPC2).
 8. Wire the peering catch-up path into the control plane — primary chosen as
    the serving node with the longest verified chain, explicit unacked-suffix
    abandonment rule for `ReplicaAheadOfPrimary` — or at minimum emit an
