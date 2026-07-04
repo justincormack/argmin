@@ -271,6 +271,7 @@ fn client_error_message(err: &ServerError) -> String {
         | ServerError::InvalidURI { reason }
         | ServerError::InvalidBucketName { reason }
         | ServerError::MalformedPolicy { reason }
+        | ServerError::InvalidPolicyDocument { reason }
         | ServerError::MalformedXML { reason }
         | ServerError::MalformedPOSTRequest { reason }
         | ServerError::MalformedChunkedBody { reason }
@@ -648,6 +649,15 @@ impl S3Response {
             ServerError::InvalidRedirectLocation { .. } => {
                 let body = xml::error_xml_with_host_id(
                     err.s3_error_code(),
+                    &client_error_message(err),
+                    request_id,
+                    host_id,
+                );
+                Self::new(400).chunked_xml_body(body)
+            }
+            ServerError::InvalidPolicyDocument { .. } => {
+                let body = xml::error_xml_with_host_id(
+                    "InvalidPolicyDocument",
                     &client_error_message(err),
                     request_id,
                     host_id,

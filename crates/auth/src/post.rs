@@ -150,6 +150,8 @@ pub fn authenticate_post_sigv4(
 pub enum PostPolicyError {
     #[error("malformed policy: {0}")]
     Malformed(&'static str),
+    #[error("{0}")]
+    InvalidDocument(String),
     #[error("policy expired")]
     Expired,
     #[error("policy condition failed: {condition}")]
@@ -219,71 +221,89 @@ fn parse_post_policy(
                 }
             }
         } else if let Some(arr) = condition.as_array() {
-            // Validate content-length-range arg count before the len==3 check
-            if let Some(op) = arr.first().and_then(|v| v.as_str()) {
-                if op == "content-length-range" && arr.len() != 3 {
-                    return Err(PostPolicyError::Malformed(
-                        "content-length-range requires exactly 2 arguments",
-                    ));
-                }
-            }
-            if arr.len() == 3 {
-                let op = arr[0].as_str().ok_or(PostPolicyError::Malformed(
+            let op = arr
+                .first()
+                .and_then(|v| v.as_str())
+                .ok_or(PostPolicyError::Malformed(
                     "condition operator must be string",
                 ))?;
-                if op.eq_ignore_ascii_case("starts-with") {
-                    let field_ref = arr[1].as_str().ok_or(PostPolicyError::Malformed(
-                        "starts-with field must be string",
-                    ))?;
-                    let prefix = arr[2].as_str().ok_or(PostPolicyError::Malformed(
-                        "starts-with prefix must be string",
-                    ))?;
-                    let field_name = field_ref
-                        .strip_prefix('$')
-                        .ok_or(PostPolicyError::Malformed(
-                            "field reference must start with $",
-                        ))?
-                        .to_ascii_lowercase();
-                    parsed_conditions.push(PostPolicyCondition::StartsWith {
-                        field: field_name,
-                        prefix: prefix.to_string(),
-                    });
-                } else if op.eq_ignore_ascii_case("eq") {
-                    let field_ref = arr[1]
-                        .as_str()
-                        .ok_or(PostPolicyError::Malformed("eq field must be string"))?;
-                    let expected = arr[2]
-                        .as_str()
-                        .ok_or(PostPolicyError::Malformed("eq value must be string"))?;
-                    let field_name = field_ref
-                        .strip_prefix('$')
-                        .ok_or(PostPolicyError::Malformed(
-                            "field reference must start with $",
-                        ))?
-                        .to_ascii_lowercase();
-                    parsed_conditions.push(PostPolicyCondition::Eq {
-                        field: field_name,
-                        expected: expected.to_string(),
-                    });
-                } else if op == "content-length-range" {
-                    // Reject negative values (as_i64 check) and non-integer values
-                    let min_i = arr[1].as_i64().ok_or(PostPolicyError::Malformed(
-                        "content-length-range min must be integer",
-                    ))?;
-                    let max_i = arr[2].as_i64().ok_or(PostPolicyError::Malformed(
-                        "content-length-range max must be integer",
-                    ))?;
-                    if min_i < 0 || max_i < 0 {
-                        return Err(PostPolicyError::Malformed(
-                            "content-length-range values must be non-negative",
-                        ));
-                    }
-                    parsed_conditions.push(PostPolicyCondition::ContentLengthRange {
-                        min: min_i as u64,
-                        max: max_i as u64,
-                    });
+            if op.eq_ignore_ascii_case("starts-with") {
+                if arr.len() != 3 {
+                    return Err(PostPolicyError::InvalidDocument(
+                        "Invalid Policy: Invalid starts-with: wrong number of arguments."
+                            .to_string(),
+                    ));
                 }
+                let field_ref = arr[1].as_str().ok_or(PostPolicyError::Malformed(
+                    "starts-with field must be string",
+                ))?;
+                let prefix = arr[2].as_str().ok_or(PostPolicyError::Malformed(
+                    "starts-with prefix must be string",
+                ))?;
+                let field_name = field_ref
+                    .strip_prefix('$')
+                    .ok_or(PostPolicyError::Malformed(
+                        "field reference must start with $",
+                    ))?
+                    .to_ascii_lowercase();
+                parsed_conditions.push(PostPolicyCondition::StartsWith {
+                    field: field_name,
+                    prefix: prefix.to_string(),
+                });
+            } else if op.eq_ignore_ascii_case("eq") {
+                if arr.len() != 3 {
+                    return Err(PostPolicyError::InvalidDocument(
+                        "Invalid Policy: Invalid Eq: wrong number of arguments.".to_string(),
+                    ));
+                }
+                let field_ref = arr[1]
+                    .as_str()
+                    .ok_or(PostPolicyError::Malformed("eq field must be string"))?;
+                let expected = arr[2]
+                    .as_str()
+                    .ok_or(PostPolicyError::Malformed("eq value must be string"))?;
+                let field_name = field_ref
+                    .strip_prefix('$')
+                    .ok_or(PostPolicyError::Malformed(
+                        "field reference must start with $",
+                    ))?
+                    .to_ascii_lowercase();
+                parsed_conditions.push(PostPolicyCondition::Eq {
+                    field: field_name,
+                    expected: expected.to_string(),
+                });
+            } else if op == "content-length-range" {
+                if arr.len() != 3 {
+                    return Err(PostPolicyError::InvalidDocument(
+                        "Invalid Policy: Invalid content-length-range: wrong number of arguments."
+                            .to_string(),
+                    ));
+                }
+                // Reject negative values (as_i64 check) and non-integer values
+                let min_i = arr[1].as_i64().ok_or(PostPolicyError::Malformed(
+                    "content-length-range min must be integer",
+                ))?;
+                let max_i = arr[2].as_i64().ok_or(PostPolicyError::Malformed(
+                    "content-length-range max must be integer",
+                ))?;
+                if min_i < 0 || max_i < 0 {
+                    return Err(PostPolicyError::Malformed(
+                        "content-length-range values must be non-negative",
+                    ));
+                }
+                parsed_conditions.push(PostPolicyCondition::ContentLengthRange {
+                    min: min_i as u64,
+                    max: max_i as u64,
+                });
+            } else {
+                return Err(PostPolicyError::InvalidDocument(format!(
+                    "Invalid Policy: Invalid Condition: unknown operation '{op}'."
+                )));
             }
+        } else {
+            return Err(PostPolicyError::InvalidDocument(
+                "Invalid Policy: Invalid condition test: must be a List or Object.".to_string(),
+            ));
         }
     }
 
@@ -1087,13 +1107,18 @@ mod tests {
     }
 
     #[test]
-    fn policy_non_three_element_array_condition_ignored() {
-        // Non content-length-range array conditions with len != 3 are ignored.
+    fn policy_short_starts_with_array_condition_is_invalid_document() {
         let b64 = future_policy_b64(&[
             serde_json::json!({"bucket": "b"}),
             serde_json::json!(["starts-with", "$key"]),
         ]);
-        validate_post_policy(&b64, &[], 0, "b", 0).unwrap();
+        let err = validate_post_policy(&b64, &[], 0, "b", 0).unwrap_err();
+        assert_eq!(
+            err,
+            PostPolicyError::InvalidDocument(
+                "Invalid Policy: Invalid starts-with: wrong number of arguments.".to_string()
+            )
+        );
     }
 
     #[test]
@@ -1160,6 +1185,36 @@ mod tests {
             err,
             PostPolicyError::Malformed("field reference must start with $")
         ));
+    }
+
+    #[test]
+    fn policy_short_eq_array_condition_is_invalid_document() {
+        let b64 = future_policy_b64(&[
+            serde_json::json!({"bucket": "b"}),
+            serde_json::json!(["eq", "$key"]),
+        ]);
+        let err = validate_post_policy(&b64, &[], 0, "b", 0).unwrap_err();
+        assert_eq!(
+            err,
+            PostPolicyError::InvalidDocument(
+                "Invalid Policy: Invalid Eq: wrong number of arguments.".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn policy_long_eq_array_condition_is_invalid_document() {
+        let b64 = future_policy_b64(&[
+            serde_json::json!({"bucket": "b"}),
+            serde_json::json!(["eq", "$key", "val", "extra"]),
+        ]);
+        let err = validate_post_policy(&b64, &[], 0, "b", 0).unwrap_err();
+        assert_eq!(
+            err,
+            PostPolicyError::InvalidDocument(
+                "Invalid Policy: Invalid Eq: wrong number of arguments.".to_string()
+            )
+        );
     }
 
     // ── content-length-range ──────────────────────────────────────────
@@ -1264,10 +1319,13 @@ mod tests {
             serde_json::json!(["content-length-range", 0]),
         ]);
         let err = validate_post_policy(&b64, &[], 0, "b", 0).unwrap_err();
-        assert!(matches!(
+        assert_eq!(
             err,
-            PostPolicyError::Malformed("content-length-range requires exactly 2 arguments")
-        ));
+            PostPolicyError::InvalidDocument(
+                "Invalid Policy: Invalid content-length-range: wrong number of arguments."
+                    .to_string()
+            )
+        );
     }
 
     #[test]
@@ -1505,27 +1563,35 @@ mod tests {
         validate_post_policy(&b64, &form_fields, 0, "b", 0).unwrap();
     }
 
-    // ── Unknown operator in 3-element array is silently ignored ───────
+    // ── Invalid condition forms ───────────────────────────────────────
 
     #[test]
-    fn policy_unknown_operator_ignored() {
+    fn policy_unknown_operator_is_invalid_document() {
         let b64 = future_policy_b64(&[
             serde_json::json!({"bucket": "b"}),
             serde_json::json!(["unknown-op", "$key", "val"]),
         ]);
-        // The unknown op is skipped, but "key" form field has no covering condition
-        // so it should fail if present
-        validate_post_policy(&b64, &[], 0, "b", 0).unwrap();
+        let err = validate_post_policy(&b64, &[], 0, "b", 0).unwrap_err();
+        assert_eq!(
+            err,
+            PostPolicyError::InvalidDocument(
+                "Invalid Policy: Invalid Condition: unknown operation 'unknown-op'.".to_string()
+            )
+        );
     }
 
-    // ── Condition that is neither object nor array is silently ignored ─
-
     #[test]
-    fn policy_scalar_condition_ignored() {
+    fn policy_scalar_condition_is_invalid_document() {
         let b64 = future_policy_b64(&[
             serde_json::json!({"bucket": "b"}),
             serde_json::json!("just a string"),
         ]);
-        validate_post_policy(&b64, &[], 0, "b", 0).unwrap();
+        let err = validate_post_policy(&b64, &[], 0, "b", 0).unwrap_err();
+        assert_eq!(
+            err,
+            PostPolicyError::InvalidDocument(
+                "Invalid Policy: Invalid condition test: must be a List or Object.".to_string()
+            )
+        );
     }
 }

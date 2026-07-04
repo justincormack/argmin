@@ -403,6 +403,23 @@ fn assert_invalid_token_response(status: u16, body: &str) {
     );
 }
 
+fn assert_invalid_policy_document_response(status: u16, body: &str, message: &str) {
+    assert_eq!(status, 400, "expected 400, got {status} body={body}");
+    assert_error_code(body, "InvalidPolicyDocument");
+    assert!(
+        body.contains(&format!("<Message>{message}</Message>")),
+        "expected InvalidPolicyDocument message {message:?}, got: {body}"
+    );
+    assert!(
+        body.contains("<RequestId>") && body.contains("<HostId>"),
+        "expected AWS error shape with RequestId and HostId, got: {body}"
+    );
+    assert!(
+        !body.contains("<Resource>"),
+        "InvalidPolicyDocument response should omit Resource, got: {body}"
+    );
+}
+
 fn append_security_token_field(fields: &mut Vec<(String, String)>, token: &str) {
     fields.push(("x-amz-security-token".to_string(), token.to_string()));
 }
@@ -2925,43 +2942,176 @@ fn test_post_object_missing_content_length_argument() {
         let bucket = setup_bucket().await;
         let key = "post-bad-clr";
 
-        let (short_date, full_date) = current_dates();
-        let secret = CTX.secret_key();
-        let access_key = CTX.access_key();
-        let region = CTX.region();
-        let credential = format!("{}/{}/{}/s3/aws4_request", access_key, short_date, region);
-
-        // Malformed content-length-range with only 1 argument
-        let policy_b64 = make_policy_raw(
-            &epoch_to_iso8601(
-                SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap()
-                    .as_secs()
-                    + 3600,
-            ),
-            &[
-                serde_json::json!({"bucket": bucket}),
-                serde_json::json!({"key": key}),
-                serde_json::json!(["content-length-range", 0]),
-            ],
+        let (status, body) = post_object_with_malformed_policy_condition(
+            &bucket,
+            key,
+            serde_json::json!(["content-length-range", 0]),
         );
-        let signature = sign_policy_v4(&policy_b64, secret, &short_date, region);
+        assert_invalid_policy_document_response(
+            status,
+            &body,
+            "Invalid Policy: Invalid content-length-range: wrong number of arguments.",
+        );
 
-        let fields: Vec<(&str, &str)> = vec![
-            ("key", key),
-            ("x-amz-algorithm", "AWS4-HMAC-SHA256"),
-            ("x-amz-credential", &credential),
-            ("x-amz-date", &full_date),
-            ("policy", &policy_b64),
-            ("x-amz-signature", &signature),
-        ];
+        s3_tests::delete_bucket_retrying_operation_aborted(CTX.client(), &bucket).await;
+    });
+}
 
-        let (status, _) = post_object(&bucket, &fields, b"data", "test.txt");
-        assert_eq!(
-            status, 400,
-            "expected 400 for malformed content-length-range, got {}",
-            status
+#[test]
+fn test_post_object_policy_long_content_length_range_condition() {
+    s3_tests::run(async {
+        let bucket = setup_bucket().await;
+        let key = "post-long-clr";
+
+        let (status, body) = post_object_with_malformed_policy_condition(
+            &bucket,
+            key,
+            serde_json::json!(["content-length-range", 0, 1024, 2048]),
+        );
+        assert_invalid_policy_document_response(
+            status,
+            &body,
+            "Invalid Policy: Invalid content-length-range: wrong number of arguments.",
+        );
+
+        s3_tests::delete_bucket_retrying_operation_aborted(CTX.client(), &bucket).await;
+    });
+}
+
+fn post_object_with_malformed_policy_condition(
+    bucket: &str,
+    key: &str,
+    condition: serde_json::Value,
+) -> (u16, String) {
+    let fields = sigv4_fields(bucket, key, &[condition]);
+    let field_refs: Vec<(&str, &str)> = fields
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+
+    post_object(bucket, &field_refs, b"data", "test.txt")
+}
+
+#[test]
+fn test_post_object_policy_short_starts_with_condition() {
+    s3_tests::run(async {
+        let bucket = setup_bucket().await;
+        let key = "post-short-starts-with";
+
+        let (status, body) = post_object_with_malformed_policy_condition(
+            &bucket,
+            key,
+            serde_json::json!(["starts-with", "$key"]),
+        );
+        assert_invalid_policy_document_response(
+            status,
+            &body,
+            "Invalid Policy: Invalid starts-with: wrong number of arguments.",
+        );
+
+        s3_tests::delete_bucket_retrying_operation_aborted(CTX.client(), &bucket).await;
+    });
+}
+
+#[test]
+fn test_post_object_policy_long_starts_with_condition() {
+    s3_tests::run(async {
+        let bucket = setup_bucket().await;
+        let key = "post-long-starts-with";
+
+        let (status, body) = post_object_with_malformed_policy_condition(
+            &bucket,
+            key,
+            serde_json::json!(["starts-with", "$key", "post-", "extra"]),
+        );
+        assert_invalid_policy_document_response(
+            status,
+            &body,
+            "Invalid Policy: Invalid starts-with: wrong number of arguments.",
+        );
+
+        s3_tests::delete_bucket_retrying_operation_aborted(CTX.client(), &bucket).await;
+    });
+}
+
+#[test]
+fn test_post_object_policy_short_eq_condition() {
+    s3_tests::run(async {
+        let bucket = setup_bucket().await;
+        let key = "post-short-eq";
+
+        let (status, body) = post_object_with_malformed_policy_condition(
+            &bucket,
+            key,
+            serde_json::json!(["eq", "$key"]),
+        );
+        assert_invalid_policy_document_response(
+            status,
+            &body,
+            "Invalid Policy: Invalid Eq: wrong number of arguments.",
+        );
+
+        s3_tests::delete_bucket_retrying_operation_aborted(CTX.client(), &bucket).await;
+    });
+}
+
+#[test]
+fn test_post_object_policy_long_eq_condition() {
+    s3_tests::run(async {
+        let bucket = setup_bucket().await;
+        let key = "post-long-eq";
+
+        let (status, body) = post_object_with_malformed_policy_condition(
+            &bucket,
+            key,
+            serde_json::json!(["eq", "$key", "post-long-eq", "extra"]),
+        );
+        assert_invalid_policy_document_response(
+            status,
+            &body,
+            "Invalid Policy: Invalid Eq: wrong number of arguments.",
+        );
+
+        s3_tests::delete_bucket_retrying_operation_aborted(CTX.client(), &bucket).await;
+    });
+}
+
+#[test]
+fn test_post_object_policy_unknown_operator_condition() {
+    s3_tests::run(async {
+        let bucket = setup_bucket().await;
+        let key = "post-unknown-operator";
+
+        let (status, body) = post_object_with_malformed_policy_condition(
+            &bucket,
+            key,
+            serde_json::json!(["unknown-op", "$key", "post-"]),
+        );
+        assert_invalid_policy_document_response(
+            status,
+            &body,
+            "Invalid Policy: Invalid Condition: unknown operation 'unknown-op'.",
+        );
+
+        s3_tests::delete_bucket_retrying_operation_aborted(CTX.client(), &bucket).await;
+    });
+}
+
+#[test]
+fn test_post_object_policy_scalar_condition() {
+    s3_tests::run(async {
+        let bucket = setup_bucket().await;
+        let key = "post-scalar-condition";
+
+        let (status, body) = post_object_with_malformed_policy_condition(
+            &bucket,
+            key,
+            serde_json::json!("just a string"),
+        );
+        assert_invalid_policy_document_response(
+            status,
+            &body,
+            "Invalid Policy: Invalid condition test: must be a List or Object.",
         );
 
         s3_tests::delete_bucket_retrying_operation_aborted(CTX.client(), &bucket).await;

@@ -137,11 +137,15 @@ steps it performs.
   `auth::authenticate_request` as the single header-auth skew enforcement
   path.
 
-- [ ] **A10. POST policy parser silently drops malformed/unknown conditions.**
+- [x] **A10. POST policy parser silently drops malformed/unknown conditions.**
   post.rs:202-268 — array conditions with wrong arity and unknown operators
   are ignored (tests codify this); AWS rejects invalid policy documents. A
   signed constraint like a short `["starts-with","$key"]` vanishes without
-  error. Fix: return `Malformed` for unrecognized/short array conditions.
+  error. Completed by adding AWS-facing POST Object oracle tests for wrong
+  arity `starts-with`, `eq`, and `content-length-range` conditions, unknown
+  operators, and scalar conditions. AWS returns `400 InvalidPolicyDocument`
+  with `RequestId` and `HostId` and no `Resource`, so the parser now rejects
+  those condition forms and the HTTP layer renders the AWS-shaped error family.
 
 ## Bugs — storage
 

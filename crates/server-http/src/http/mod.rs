@@ -3674,6 +3674,9 @@ impl HttpFrontend {
 
     fn map_post_policy_error(error: auth::PostPolicyError) -> ServerError {
         match error {
+            auth::PostPolicyError::InvalidDocument(reason) => {
+                ServerError::InvalidPolicyDocument { reason }
+            }
             auth::PostPolicyError::Malformed(_) => ServerError::InvalidRequest {
                 reason: error.to_string(),
             },

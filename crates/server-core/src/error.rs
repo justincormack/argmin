@@ -176,6 +176,9 @@ pub enum ServerError {
     #[error("malformed policy: {reason}")]
     MalformedPolicy { reason: String },
 
+    #[error("invalid policy document: {reason}")]
+    InvalidPolicyDocument { reason: String },
+
     #[error("ownership controls not found: {bucket}")]
     OwnershipControlsNotFound { bucket: String },
 
@@ -442,6 +445,7 @@ impl ServerError {
             Self::NoSuchBucketPolicy { .. } => "NoSuchBucketPolicy",
             Self::NoSuchLifecycleConfiguration { .. } => "NoSuchLifecycleConfiguration",
             Self::MalformedPolicy { .. } => "MalformedPolicy",
+            Self::InvalidPolicyDocument { .. } => "InvalidPolicyDocument",
             Self::OwnershipControlsNotFound { .. } => "OwnershipControlsNotFoundError",
             Self::ObjectLockConfigurationNotFound { .. } => "ObjectLockConfigurationNotFoundError",
             Self::ServerSideEncryptionConfigurationNotFound { .. } => {
@@ -538,7 +542,7 @@ impl ServerError {
             Self::NoSuchPublicAccessBlockConfiguration { .. }
             | Self::NoSuchBucketPolicy { .. }
             | Self::NoSuchLifecycleConfiguration { .. } => 404,
-            Self::MalformedPolicy { .. } => 400,
+            Self::MalformedPolicy { .. } | Self::InvalidPolicyDocument { .. } => 400,
             Self::OwnershipControlsNotFound { .. } => 404,
             Self::ObjectLockConfigurationNotFound { .. } => 404,
             Self::ServerSideEncryptionConfigurationNotFound { .. } => 404,
