@@ -412,6 +412,19 @@ where
     ))
 }
 
+fn parse_put_object_request_metadata<'a, I>(
+    headers: I,
+) -> Result<(MetadataBlob, SystemMetadata), ServerError>
+where
+    I: IntoIterator<Item = (&'a str, &'a str)>,
+{
+    parse_request_metadata(
+        headers
+            .into_iter()
+            .filter(|(name, _)| !name.eq_ignore_ascii_case("x-amz-checksum-algorithm")),
+    )
+}
+
 fn parse_version_id(req: &S3Request) -> Result<Option<VersionId>, ServerError> {
     parse_optional_version_id(req.query_param_lossy("versionId"), "versionId")
 }
@@ -1464,11 +1477,7 @@ impl HttpFrontend {
                             // Parse checksum algorithm if present.
                             replace_checksum_algo = match req.header("x-amz-checksum-algorithm") {
                                 None => None,
-                                Some(v) => Some(ChecksumAlgorithm::parse(v).ok_or_else(|| {
-                                    ServerError::InvalidArgument {
-                                        reason: format!("unsupported checksum algorithm: {v}"),
-                                    }
-                                })?),
+                                Some(v) => Some(parse_checksum_algorithm_header_value(v)?),
                             };
 
                             MetadataDirective::Replace {
@@ -1576,7 +1585,7 @@ impl HttpFrontend {
                     let request_headers: Vec<(&str, &str)> = req.header_iter().collect();
                     validate_write_request_header_section_size(&request_headers)?;
                     let (metadata_blob, system_metadata) =
-                        parse_request_metadata(request_headers.iter().copied())?;
+                        parse_put_object_request_metadata(request_headers.iter().copied())?;
                     let cond = write_condition_from_headers(req)?;
                     let requester = Self::requester_from_auth(auth);
                     let acl = parse_put_object_write_acl(req)?;
@@ -2025,7 +2034,7 @@ impl HttpFrontend {
                 Ok(S3Response::delete_objects(&result, quiet))
             }
             S3Operation::PutBucketVersioning { bucket } => {
-                validate_request_checksum_headers(req, true, false)?;
+                validate_request_checksum_headers(req, true, false, true)?;
                 let versioning_state = xml::parse_versioning_config_xml(&req.body)?;
                 let requester = Self::requester_from_auth(auth);
                 self.coordinator.put_bucket_versioning(
@@ -2072,7 +2081,7 @@ impl HttpFrontend {
                 Ok(S3Response::get_bucket_object_lock_configuration(config))
             }
             S3Operation::PutBucketEncryption { bucket } => {
-                validate_request_checksum_headers(req, true, false)?;
+                validate_request_checksum_headers(req, true, false, true)?;
                 let config = xml::parse_bucket_encryption_xml(&req.body)?;
                 let requester = Self::requester_from_auth(auth);
                 self.coordinator.put_bucket_encryption(
@@ -2321,7 +2330,7 @@ impl HttpFrontend {
                 Ok(S3Response::get_object_legal_hold(legal_hold))
             }
             S3Operation::PutObjectTagging { bucket, key } => {
-                validate_request_checksum_headers(req, true, false)?;
+                validate_request_checksum_headers(req, true, false, true)?;
                 let vid = parse_version_id(req)?;
                 let tags = xml::TagSet::parse_tagging_xml(&req.body, 10)?;
                 let tags_xml = tags.to_xml();
@@ -2389,7 +2398,7 @@ impl HttpFrontend {
                 ))
             }
             S3Operation::PutObjectAcl { bucket, key } => {
-                validate_request_checksum_headers(req, true, false)?;
+                validate_request_checksum_headers(req, true, false, true)?;
                 let version_id = parse_version_id(req)?;
                 let requester = Self::requester_from_auth(auth);
                 let result_version_id = if req.header("x-amz-acl").is_some() {
@@ -2440,7 +2449,7 @@ impl HttpFrontend {
                 Ok(S3Response::put_object_acl(result_version_id))
             }
             S3Operation::PutBucketPublicAccessBlock { bucket } => {
-                validate_request_checksum_headers(req, true, false)?;
+                validate_request_checksum_headers(req, true, false, true)?;
                 let config = xml::parse_public_access_block_xml(&req.body)?;
                 let requester = Self::requester_from_auth(auth);
                 self.coordinator.put_bucket_public_access_block(
@@ -2479,7 +2488,7 @@ impl HttpFrontend {
                 Ok(S3Response::delete_bucket_public_access_block())
             }
             S3Operation::PutBucketOwnershipControls { bucket } => {
-                validate_request_checksum_headers(req, true, false)?;
+                validate_request_checksum_headers(req, true, false, true)?;
                 let value = xml::parse_ownership_controls_xml(&req.body)?;
                 let requester = Self::requester_from_auth(auth);
                 self.coordinator.put_bucket_ownership_controls(
@@ -2518,7 +2527,7 @@ impl HttpFrontend {
                 Ok(S3Response::delete_bucket_ownership_controls())
             }
             S3Operation::PutBucketPolicy { bucket } => {
-                validate_request_checksum_headers(req, true, false)?;
+                validate_request_checksum_headers(req, true, false, true)?;
                 let policy =
                     std::str::from_utf8(&req.body).map_err(|_| ServerError::InvalidArgument {
                         reason: "invalid UTF-8 in bucket policy JSON body".to_string(),
@@ -2633,7 +2642,7 @@ impl HttpFrontend {
                     },
                 };
                 self.coordinator.validate_put_bucket_acl_request(&acl_req)?;
-                validate_request_checksum_headers(req, true, false)?;
+                validate_request_checksum_headers(req, true, false, true)?;
                 self.coordinator.put_bucket_acl(&acl_req)?;
                 Ok(S3Response::put_bucket_acl())
             }
@@ -2652,11 +2661,7 @@ impl HttpFrontend {
                 // Parse optional checksum algorithm/type headers.
                 let checksum_algorithm = match req.header("x-amz-checksum-algorithm") {
                     None => None,
-                    Some(v) => Some(ChecksumAlgorithm::parse(v).ok_or_else(|| {
-                        ServerError::InvalidArgument {
-                            reason: format!("unsupported checksum algorithm: {v}"),
-                        }
-                    })?),
+                    Some(v) => Some(parse_checksum_algorithm_header_value(v)?),
                 };
                 let checksum_type = match req.header("x-amz-checksum-type") {
                     None => None,
@@ -3820,7 +3825,7 @@ impl HttpFrontend {
         reject_directory_bucket_only_object_features(req)?;
 
         let object_lock = parse_object_lock_headers(req)?;
-        let checksum_state = validate_request_checksum_headers(req, false, true)?;
+        let checksum_state = validate_request_checksum_headers(req, false, true, true)?;
         if object_lock.retention.is_some()
             && !checksum_state.has_content_md5
             && !checksum_state.has_checksum_header
@@ -3869,7 +3874,7 @@ impl HttpFrontend {
         let request_headers: Vec<(&str, &str)> = req.header_iter().collect();
         validate_write_request_header_section_size(&request_headers)?;
         let (metadata_blob, mut system_metadata) =
-            parse_request_metadata(request_headers.iter().copied())?;
+            parse_put_object_request_metadata(request_headers.iter().copied())?;
         if uses_aws_chunked_transport {
             system_metadata.strip_aws_chunked_content_encoding()?;
         }
@@ -4168,7 +4173,7 @@ impl HttpFrontend {
         let auth = self.authenticate_with_payload_check(req, false, true)?;
         self.enforce_bucket_region_raw(bucket, &auth)?;
 
-        validate_request_checksum_headers(req, false, false)?;
+        validate_request_checksum_headers(req, false, false, false)?;
         let content_md5 = ContentMd5Claim::from_request(req)?;
         let claimed_checksum = extract_checksum_header(req)?;
         let sse_customer_request = parse_sse_customer_request(req)?;
@@ -5347,23 +5352,84 @@ struct RequestChecksumState {
     has_trailing_checksum: bool,
 }
 
-fn has_trailing_checksum(req: &S3Request) -> bool {
-    req.header("x-amz-trailer").is_some_and(|value| {
+fn trailing_checksum_algorithm(req: &S3Request) -> Option<ChecksumAlgorithm> {
+    req.header("x-amz-trailer").and_then(|value| {
         value
             .split(',')
-            .any(|name| checksum_algo_from_header(name.trim()).is_some())
+            .find_map(|name| checksum_algo_from_header(name.trim()))
     })
+}
+
+fn parse_checksum_algorithm_value(value: &str) -> Option<ChecksumAlgorithm> {
+    ChecksumAlgorithm::ALL
+        .into_iter()
+        .find(|algorithm| value.eq_ignore_ascii_case(algorithm.as_str()))
+}
+
+const UNSUPPORTED_CHECKSUM_ALGORITHM_MESSAGE: &str = "Checksum algorithm provided is unsupported. Please try again with any of the valid types: [CRC32, CRC32C, CRC64NVME, MD5, SHA1, SHA256, SHA512, XXHASH128, XXHASH3, XXHASH64]";
+
+fn parse_checksum_algorithm_header_value(value: &str) -> Result<ChecksumAlgorithm, ServerError> {
+    parse_checksum_algorithm_value(value).ok_or_else(|| ServerError::InvalidRequest {
+        reason: UNSUPPORTED_CHECKSUM_ALGORITHM_MESSAGE.to_string(),
+    })
+}
+
+fn validate_sdk_checksum_algorithm(
+    req: &S3Request,
+    checksum_header_algorithm: Option<ChecksumAlgorithm>,
+    trailing_checksum_algorithm: Option<ChecksumAlgorithm>,
+) -> Result<(), ServerError> {
+    let sdk_header = "x-amz-sdk-checksum-algorithm";
+    if header_count(req, sdk_header) > 1 {
+        return Err(ServerError::InvalidRequest {
+            reason: format!("duplicate header: {sdk_header}"),
+        });
+    }
+    let Some(declared) = req.header(sdk_header) else {
+        return Ok(());
+    };
+    let Some(actual) = checksum_header_algorithm.or(trailing_checksum_algorithm) else {
+        return Err(ServerError::InvalidRequest {
+            reason:
+                "x-amz-sdk-checksum-algorithm specified, but no corresponding x-amz-checksum-* or x-amz-trailer headers were found."
+                    .to_string(),
+        });
+    };
+    let Some(declared_algorithm) = parse_checksum_algorithm_value(declared) else {
+        return Err(ServerError::InvalidRequest {
+            reason: "Value for x-amz-sdk-checksum-algorithm header is invalid.".to_string(),
+        });
+    };
+    if declared_algorithm != actual {
+        return Err(ServerError::InvalidRequest {
+            reason: "Value for x-amz-sdk-checksum-algorithm header is invalid.".to_string(),
+        });
+    }
+    Ok(())
 }
 
 fn validate_request_checksum_headers(
     req: &S3Request,
     verify_body: bool,
     allow_trailing_checksum: bool,
+    validate_sdk_algorithm: bool,
 ) -> Result<RequestChecksumState, ServerError> {
     let has_content_md5 = req.header("content-md5").is_some();
     let checksum_header = extract_encoded_checksum_header(req)?;
     let has_checksum_header = checksum_header.is_some();
-    let has_trailing_checksum = allow_trailing_checksum && has_trailing_checksum(req);
+    let trailing_checksum_algorithm = allow_trailing_checksum
+        .then(|| trailing_checksum_algorithm(req))
+        .flatten();
+    let has_trailing_checksum = trailing_checksum_algorithm.is_some();
+    if validate_sdk_algorithm {
+        validate_sdk_checksum_algorithm(
+            req,
+            checksum_header
+                .as_ref()
+                .map(EncodedChecksumClaim::algorithm),
+            trailing_checksum_algorithm,
+        )?;
+    }
 
     if verify_body {
         validate_content_md5(req)?;
@@ -5383,7 +5449,7 @@ fn require_request_checksum(
     req: &S3Request,
     requirement: RequestChecksumRequirement,
 ) -> Result<RequestChecksumState, ServerError> {
-    let state = validate_request_checksum_headers(req, true, false)?;
+    let state = validate_request_checksum_headers(req, true, false, true)?;
     match requirement {
         RequestChecksumRequirement::Optional => Ok(state),
         RequestChecksumRequirement::ContentMd5OrChecksumHeader => {
@@ -5424,8 +5490,8 @@ fn checksum_algo_from_header(header: &str) -> Option<ChecksumAlgorithm> {
 /// Validate checksum headers on `PutObject`.
 ///
 /// Enforces that at most one checksum header is present, validates base64
-/// format/length, and if `x-amz-checksum-algorithm` is set it must match
-/// the provided checksum header.
+/// format/length, and verifies the provided checksum against the body when
+/// requested.
 ///
 /// When `verify_body` is true, also computes the actual checksum from
 /// `req.body` and returns `BadDigest` on mismatch. Pass `false` for
@@ -5433,7 +5499,6 @@ fn checksum_algo_from_header(header: &str) -> Option<ChecksumAlgorithm> {
 fn validate_checksum_headers(req: &S3Request, verify_body: bool) -> Result<(), ServerError> {
     use base64::Engine;
 
-    let algo_header = req.header("x-amz-checksum-algorithm");
     let mut found_algo: Option<&str> = None;
 
     for &(algo, header) in CHECKSUM_HEADERS {
@@ -5445,17 +5510,6 @@ fn validate_checksum_headers(req: &S3Request, verify_body: bool) -> Result<(), S
                 });
             }
             found_algo = Some(algo);
-
-            // If x-amz-checksum-algorithm is set, it must match this header
-            if let Some(declared) = algo_header {
-                if !declared.eq_ignore_ascii_case(algo) {
-                    return Err(ServerError::InvalidRequest {
-                        reason: format!(
-                            "checksum algorithm mismatch: header says {declared} but got {algo}"
-                        ),
-                    });
-                }
-            }
 
             let algorithm =
                 ChecksumAlgorithm::parse(algo).expect("CHECKSUM_HEADERS uses known algorithms");
@@ -5498,16 +5552,9 @@ fn header_count(req: &S3Request, name: &str) -> usize {
 /// Shared validation for all checksum-header consumers. Rejects if:
 /// - multiple distinct checksum value headers are present (e.g. crc32 + sha256)
 /// - the same checksum header appears more than once
-/// - `x-amz-checksum-algorithm` contradicts the value header's algorithm
 fn extract_encoded_checksum_header(
     req: &S3Request,
 ) -> Result<Option<EncodedChecksumClaim>, ServerError> {
-    if header_count(req, "x-amz-checksum-algorithm") > 1 {
-        return Err(ServerError::InvalidRequest {
-            reason: "duplicate header: x-amz-checksum-algorithm".into(),
-        });
-    }
-    let algo_header = req.header("x-amz-checksum-algorithm");
     let mut found: Option<EncodedChecksumClaim> = None;
     for &(algo_name, header) in CHECKSUM_HEADERS {
         if let Some(claimed) = req.header(header) {
@@ -5522,16 +5569,6 @@ fn extract_encoded_checksum_header(
                 return Err(ServerError::InvalidRequest {
                     reason: format!("duplicate header: {header}"),
                 });
-            }
-            // Cross-check x-amz-checksum-algorithm if present.
-            if let Some(declared) = algo_header {
-                if !declared.eq_ignore_ascii_case(algo_name) {
-                    return Err(ServerError::InvalidRequest {
-                        reason: format!(
-                            "checksum algorithm mismatch: header says {declared} but got {algo_name}"
-                        ),
-                    });
-                }
             }
             // CHECKSUM_HEADERS uses known-good algo names.
             let algo = ChecksumAlgorithm::parse(algo_name).unwrap();
@@ -8748,7 +8785,10 @@ mod tests {
 
     fn checksum_header_pairs(body: &[u8]) -> Vec<(String, String)> {
         vec![
-            ("x-amz-checksum-algorithm".to_string(), "CRC32".to_string()),
+            (
+                "x-amz-sdk-checksum-algorithm".to_string(),
+                "CRC32".to_string(),
+            ),
             (
                 "x-amz-checksum-crc32".to_string(),
                 checksum_crc32_value(body),
@@ -9518,7 +9558,10 @@ mod tests {
             http::Method::PUT,
             "",
             "lifecycle",
-            vec![("x-amz-checksum-algorithm".to_string(), "CRC32".to_string())],
+            vec![(
+                "x-amz-sdk-checksum-algorithm".to_string(),
+                "CRC32".to_string(),
+            )],
             br#"<LifecycleConfiguration><Rule><ID>rule1</ID><Filter><Prefix>logs/</Prefix></Filter><Status>Enabled</Status><Expiration><Days>30</Days></Expiration></Rule></LifecycleConfiguration>"#.to_vec(),
         );
         match fe.dispatch_routed(
@@ -9531,7 +9574,7 @@ mod tests {
             Err(ServerError::InvalidRequest { reason }) => {
                 assert_eq!(
                     reason,
-                    "Missing required header for this request: Content-MD5"
+                    "x-amz-sdk-checksum-algorithm specified, but no corresponding x-amz-checksum-* or x-amz-trailer headers were found."
                 );
             }
             Err(e) => panic!("expected InvalidRequest, got {e:?}"),
@@ -10017,7 +10060,7 @@ mod tests {
     }
 
     #[test]
-    fn complete_multipart_algorithm_header_contradicts_value_header() {
+    fn complete_multipart_ignores_checksum_algorithm_mismatch() {
         let tmp = test_util::tempdir();
         let fe = setup_frontend(tmp.path());
         create_test_bucket(&fe.coordinator, "mybucket");
@@ -10032,7 +10075,8 @@ mod tests {
             "",
             &format!("uploadId={upload_id}"),
             vec![
-                // Algorithm header says SHA256 but value header is CRC32.
+                // CompleteMultipartUpload uses the concrete checksum header
+                // name, not x-amz-checksum-algorithm, to identify the value.
                 ("x-amz-checksum-algorithm".to_string(), "SHA256".to_string()),
                 ("x-amz-checksum-crc32".to_string(), "AAAAAA==".to_string()),
             ],
@@ -10042,11 +10086,7 @@ mod tests {
             bucket: test_bucket_name("mybucket"),
             key: "k".to_string(),
         };
-        match fe.dispatch_routed(&req, &test_auth(), op) {
-            Err(ServerError::InvalidRequest { .. }) => {}
-            Err(e) => panic!("expected InvalidRequest, got {e:?}"),
-            Ok(_) => panic!("expected error, got Ok"),
-        }
+        fe.dispatch_routed(&req, &test_auth(), op).unwrap();
     }
 
     #[test]
@@ -10082,7 +10122,7 @@ mod tests {
     }
 
     #[test]
-    fn complete_multipart_duplicate_checksum_algorithm_header_rejected() {
+    fn complete_multipart_ignores_checksum_algorithm_header() {
         let tmp = test_util::tempdir();
         let fe = setup_frontend(tmp.path());
         create_test_bucket(&fe.coordinator, "mybucket");
@@ -10107,11 +10147,7 @@ mod tests {
             bucket: test_bucket_name("mybucket"),
             key: "k".to_string(),
         };
-        match fe.dispatch_routed(&req, &test_auth(), op) {
-            Err(ServerError::InvalidRequest { .. }) => {}
-            Err(e) => panic!("expected InvalidRequest, got {e:?}"),
-            Ok(_) => panic!("expected error, got Ok"),
-        }
+        fe.dispatch_routed(&req, &test_auth(), op).unwrap();
     }
 
     #[test]
@@ -10714,8 +10750,10 @@ mod tests {
             key: "k".to_string(),
         };
         match fe.dispatch_routed(&req, &test_auth(), op) {
-            Err(ServerError::InvalidArgument { .. }) => {}
-            Err(e) => panic!("expected InvalidArgument, got {e:?}"),
+            Err(ServerError::InvalidRequest { reason }) => {
+                assert_eq!(reason, UNSUPPORTED_CHECKSUM_ALGORITHM_MESSAGE);
+            }
+            Err(e) => panic!("expected InvalidRequest, got {e:?}"),
             Ok(_) => panic!("expected error, got Ok"),
         }
     }

@@ -208,31 +208,35 @@ steps it performs.
 
 ## Bugs — checksum handling (cross-crate)
 
-- [ ] **K1. Three tolerances for `x-amz-checksum-algorithm`, producing
-  header-order-dependent silent metadata loss.**
-  `ChecksumAlgorithm::parse` is strict uppercase
-  (`crates/checksum/src/types.rs:51`); server-http PutObject validation
-  compares case-insensitively (`crates/server-http/src/http/mod.rs:5449`);
-  `SystemMetadata::from_header_iter` silently assigns `None` on unparseable
-  values (`crates/server-core/src/system_metadata.rs:164`) and can clobber an
-  algorithm already set from a value header depending on `HeaderMap` iteration
-  order (system_metadata.rs:163-181), which is not guaranteed — a mispaired
-  (algorithm, value) can be stored as object metadata. CreateMultipartUpload
-  parses strictly and errors (mod.rs:2671). Fix: make
-  `ChecksumAlgorithm::parse` the single source of truth (pick strict or
-  case-insensitive once); make `from_header_iter` error on unparseable
-  algorithm and on algorithm/value mismatch, independent of header order.
+- [x] **K1. Checksum algorithm headers were modeled against the wrong wire
+  header.** AWS-pinned tests showed that PutObject uses
+  `x-amz-sdk-checksum-algorithm` to declare the SDK-selected algorithm and
+  requires a corresponding concrete `x-amz-checksum-*` value header or
+  `x-amz-trailer`. A mismatched or invalid SDK header returns 400
+  `InvalidRequest` with HostId/no Resource XML; lowercase SDK values are
+  accepted. The literal `x-amz-checksum-algorithm` is ignored for PutObject
+  metadata/value matching and must not affect stored checksum metadata, but is
+  real for CreateMultipartUpload and CopyObject replacement checksum selection,
+  where lowercase values are accepted and unsupported values return AWS's 400
+  `InvalidRequest` unsupported-algorithm message. Fixed in
+  `crates/server-http/src/http/mod.rs` and response shaping in
+  `crates/server-http/src/http/response.rs`, with s3-test coverage in
+  `crates/s3-tests/tests/checksums.rs`.
 
-- [ ] **K2. `ChecksumAlgorithm::requires_multipart_create_algorithm` has zero
-  call sites — enforcement lost in churn.** `crates/checksum/src/types.rs:143`
-  encodes the AWS rule that MD5/XXHash/SHA512 must be declared on
-  CreateMultipartUpload; the UploadPart finalize path explicitly accepts a
-  part-supplied algorithm on an upload created without one
-  (`crates/server-core/src/coordinator/multipart.rs:1104`,
-  `(None, Some(part_algo)) => Some(part_algo)`). The sibling helper for the
-  Complete side is consumed (multipart.rs:695). Fix: enforce in the
-  `(None, Some(part_algo))` arm, or delete the helper if divergence is
-  intentional. Add a conformance test either way.
+- [x] **K2. Multipart checksum create-algorithm requirement needed AWS
+  clarification.** AWS-pinned tests showed the UploadPart
+  `(None, Some(part_algo))` path is intentional: a new-algorithm part checksum
+  can be accepted even when CreateMultipartUpload omitted a checksum algorithm,
+  but CompleteMultipartUpload does not store it and part checksum elements fail
+  as `InvalidPart`. CompleteMultipartUpload object checksum headers are
+  family-sensitive: legacy `CRC32`/`CRC32C`/`SHA1`/`SHA256` headers are accepted
+  but ignored and not stored when Create omitted the algorithm, while new
+  `MD5`/`SHA512`/`XXHASH64`/`XXHASH3`/`XXHASH128` headers return AWS-shaped
+  400 `InvalidRequest` with message `Checksum Type mismatch occurred, expected
+  checksum Type: null, actual checksum Type: <algo>`. Fixed local error text
+  and response shape in `crates/server-core/src/coordinator/multipart.rs` and
+  `crates/server-http/src/http/response.rs`; expanded s3-test coverage in
+  `crates/s3-tests/tests/checksums.rs`.
 
 - [ ] **K3. `CHECKSUM_HEADERS` in server-http hand-duplicates
   `ChecksumAlgorithm::ALL` + `header_name()`**

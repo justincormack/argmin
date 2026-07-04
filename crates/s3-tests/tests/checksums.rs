@@ -61,6 +61,26 @@ fn assert_error_code(body: &str, code: &str) {
     );
 }
 
+fn assert_error_message(body: &str, message: &str) {
+    let expected = format!("<Message>{}</Message>", message);
+    assert!(
+        body.contains(&expected),
+        "expected {expected} in body: {body}",
+    );
+}
+
+fn assert_auth_error_response_shape(body: &str) {
+    assert!(
+        body.contains("<RequestId>"),
+        "expected RequestId in body: {body}"
+    );
+    assert!(body.contains("<HostId>"), "expected HostId in body: {body}");
+    assert!(
+        !body.contains("<Resource>"),
+        "expected no Resource element in body: {body}"
+    );
+}
+
 fn sha256_hex(data: &[u8]) -> String {
     let d = ring::digest::digest(&ring::digest::SHA256, data);
     d.as_ref().iter().map(|b| format!("{b:02x}")).collect()
@@ -221,6 +241,55 @@ fn checksum_base64(algo: LocalChecksumAlgorithm, data: &[u8]) -> String {
     encode_base64(checksum::compute_checksum(algo, data).bytes())
 }
 
+async fn raw_put_object_with_checksum_headers(
+    bucket: &str,
+    key: &str,
+    body: &[u8],
+    headers: &[(&str, String)],
+) -> s3_tests::RawResponse {
+    let url = s3_tests::object_url(CTX.endpoint(), bucket, key, None);
+    send_signed_request(
+        "PUT",
+        &url,
+        body,
+        headers.iter().map(|(k, v)| (*k, v.as_str())),
+    )
+}
+
+async fn assert_stored_crc32_full_object_checksum(bucket: &str, key: &str, expected: &str) {
+    let client = CTX.client();
+    let head = client
+        .head_object()
+        .bucket(bucket)
+        .key(key)
+        .checksum_mode(ChecksumMode::Enabled)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(head.checksum_crc32(), Some(expected));
+    assert!(
+        head.checksum_sha256().is_none(),
+        "ignored x-amz-checksum-algorithm must not change stored checksum algorithm"
+    );
+    assert_eq!(head.checksum_type(), Some(&ChecksumType::FullObject));
+
+    let attrs = client
+        .get_object_attributes()
+        .bucket(bucket)
+        .key(key)
+        .object_attributes(ObjectAttributes::Checksum)
+        .send()
+        .await
+        .unwrap();
+    let checksum = attrs.checksum().expect("expected Checksum attributes");
+    assert_eq!(checksum.checksum_crc32(), Some(expected));
+    assert!(
+        checksum.checksum_sha256().is_none(),
+        "ignored x-amz-checksum-algorithm must not change stored checksum attributes"
+    );
+    assert_eq!(checksum.checksum_type(), Some(&ChecksumType::FullObject));
+}
+
 fn composite_checksum_base64(algo: LocalChecksumAlgorithm, part_checksums: &[String]) -> String {
     use base64::Engine;
 
@@ -252,6 +321,14 @@ fn bare_composite_checksum(value: &str) -> &str {
         .unwrap_or(value)
 }
 
+fn xml_text<'a>(body: &'a str, tag: &str) -> Option<&'a str> {
+    let start_tag = format!("<{tag}>");
+    let end_tag = format!("</{tag}>");
+    let start = body.find(&start_tag)? + start_tag.len();
+    let end = body[start..].find(&end_tag)? + start;
+    Some(&body[start..end])
+}
+
 fn checksum_xml_element_name(algo: &ChecksumAlgorithm) -> &'static str {
     if *algo == ChecksumAlgorithm::Crc32 {
         "ChecksumCRC32"
@@ -273,6 +350,32 @@ fn checksum_xml_element_name(algo: &ChecksumAlgorithm) -> &'static str {
         "ChecksumXXHASH3"
     } else if *algo == ChecksumAlgorithm::Xxhash128 {
         "ChecksumXXHASH128"
+    } else {
+        panic!("unsupported checksum algorithm: {algo:?}")
+    }
+}
+
+fn checksum_header_name(algo: &ChecksumAlgorithm) -> &'static str {
+    if *algo == ChecksumAlgorithm::Crc32 {
+        "x-amz-checksum-crc32"
+    } else if *algo == ChecksumAlgorithm::Crc32C {
+        "x-amz-checksum-crc32c"
+    } else if *algo == ChecksumAlgorithm::Sha1 {
+        "x-amz-checksum-sha1"
+    } else if *algo == ChecksumAlgorithm::Sha256 {
+        "x-amz-checksum-sha256"
+    } else if *algo == ChecksumAlgorithm::Crc64Nvme {
+        "x-amz-checksum-crc64nvme"
+    } else if *algo == ChecksumAlgorithm::Md5 {
+        "x-amz-checksum-md5"
+    } else if *algo == ChecksumAlgorithm::Sha512 {
+        "x-amz-checksum-sha512"
+    } else if *algo == ChecksumAlgorithm::Xxhash64 {
+        "x-amz-checksum-xxhash64"
+    } else if *algo == ChecksumAlgorithm::Xxhash3 {
+        "x-amz-checksum-xxhash3"
+    } else if *algo == ChecksumAlgorithm::Xxhash128 {
+        "x-amz-checksum-xxhash128"
     } else {
         panic!("unsupported checksum algorithm: {algo:?}")
     }
@@ -305,6 +408,430 @@ const CRC64NVME_1K_A: &str = "Qeh8oXvGiSo=";
 
 /// MD5 of 1024 × 'A', base64-encoded.
 const MD5_1K_A: &str = "1HsSe8LeLWh93ILaw1TEFQ==";
+
+const UNSUPPORTED_CHECKSUM_ALGORITHM_MESSAGE: &str = "Checksum algorithm provided is unsupported. Please try again with any of the valid types: [CRC32, CRC32C, CRC64NVME, MD5, SHA1, SHA256, SHA512, XXHASH128, XXHASH3, XXHASH64]";
+const SDK_CHECKSUM_MISSING_VALUE_MESSAGE: &str =
+    "x-amz-sdk-checksum-algorithm specified, but no corresponding x-amz-checksum-* or x-amz-trailer headers were found.";
+const SDK_CHECKSUM_INVALID_VALUE_MESSAGE: &str =
+    "Value for x-amz-sdk-checksum-algorithm header is invalid.";
+
+#[test]
+fn test_put_object_checksum_algorithm_lowercase_value() {
+    s3_tests::run(async {
+        let bucket = setup_bucket().await;
+        let key = "lowercase-checksum-algorithm";
+        let body = b"checksum algorithm lowercase oracle";
+        let crc32 = checksum_base64(LocalChecksumAlgorithm::Crc32, body);
+        let response = raw_put_object_with_checksum_headers(
+            &bucket,
+            key,
+            body,
+            &[
+                ("x-amz-checksum-algorithm", "crc32".to_string()),
+                ("x-amz-checksum-crc32", crc32.clone()),
+            ],
+        )
+        .await;
+        assert_eq!(response.status, 200, "response: {response:?}");
+        assert_eq!(
+            response_header(&response.headers, "x-amz-checksum-crc32"),
+            Some("iNxRQw==")
+        );
+        assert_eq!(
+            response_header(&response.headers, "x-amz-checksum-type"),
+            Some("FULL_OBJECT")
+        );
+        assert_stored_crc32_full_object_checksum(&bucket, key, &crc32).await;
+        cleanup(&bucket, &[key]).await;
+    });
+}
+
+#[test]
+fn test_put_object_checksum_algorithm_mismatch() {
+    s3_tests::run(async {
+        let bucket = setup_bucket().await;
+        let key = "mismatched-checksum-algorithm";
+        let body = b"checksum algorithm mismatch oracle";
+        let crc32 = checksum_base64(LocalChecksumAlgorithm::Crc32, body);
+        let response = raw_put_object_with_checksum_headers(
+            &bucket,
+            key,
+            body,
+            &[
+                ("x-amz-checksum-algorithm", "SHA256".to_string()),
+                ("x-amz-checksum-crc32", crc32.clone()),
+            ],
+        )
+        .await;
+        assert_eq!(response.status, 200, "response: {response:?}");
+        assert_eq!(
+            response_header(&response.headers, "x-amz-checksum-crc32"),
+            Some("bo1dLQ==")
+        );
+        assert_eq!(
+            response_header(&response.headers, "x-amz-checksum-type"),
+            Some("FULL_OBJECT")
+        );
+        assert_stored_crc32_full_object_checksum(&bucket, key, &crc32).await;
+        cleanup(&bucket, &[key]).await;
+    });
+}
+
+#[test]
+fn test_put_object_invalid_checksum_algorithm_with_value() {
+    s3_tests::run(async {
+        let bucket = setup_bucket().await;
+        let key = "invalid-checksum-algorithm-with-value";
+        let body = b"invalid checksum algorithm with value oracle";
+        let crc32 = checksum_base64(LocalChecksumAlgorithm::Crc32, body);
+        let response = raw_put_object_with_checksum_headers(
+            &bucket,
+            key,
+            body,
+            &[
+                ("x-amz-checksum-algorithm", "BOGUS".to_string()),
+                ("x-amz-checksum-crc32", crc32.clone()),
+            ],
+        )
+        .await;
+        assert_eq!(response.status, 200, "response: {response:?}");
+        assert_eq!(
+            response_header(&response.headers, "x-amz-checksum-crc32"),
+            Some("SN9Ohg==")
+        );
+        assert_eq!(
+            response_header(&response.headers, "x-amz-checksum-type"),
+            Some("FULL_OBJECT")
+        );
+        assert_stored_crc32_full_object_checksum(&bucket, key, &crc32).await;
+        cleanup(&bucket, &[key]).await;
+    });
+}
+
+#[test]
+fn test_put_object_invalid_checksum_algorithm_without_value() {
+    s3_tests::run(async {
+        let bucket = setup_bucket().await;
+        let key = "invalid-checksum-algorithm-without-value";
+        let body = b"invalid checksum algorithm without value oracle";
+        let response = raw_put_object_with_checksum_headers(
+            &bucket,
+            key,
+            body,
+            &[("x-amz-checksum-algorithm", "BOGUS".to_string())],
+        )
+        .await;
+        assert_eq!(response.status, 200, "response: {response:?}");
+        assert_eq!(
+            response_header(&response.headers, "x-amz-checksum-crc64nvme"),
+            Some("jX8PKk+4oBM=")
+        );
+        assert_eq!(
+            response_header(&response.headers, "x-amz-checksum-type"),
+            Some("FULL_OBJECT")
+        );
+        cleanup(&bucket, &[key]).await;
+    });
+}
+
+#[test]
+fn test_put_object_sdk_checksum_algorithm_with_matching_value() {
+    s3_tests::run(async {
+        let bucket = setup_bucket().await;
+        let key = "sdk-checksum-algorithm-with-matching-value";
+        let body = b"sdk checksum algorithm with matching value oracle";
+        let crc32 = checksum_base64(LocalChecksumAlgorithm::Crc32, body);
+        let response = raw_put_object_with_checksum_headers(
+            &bucket,
+            key,
+            body,
+            &[
+                ("x-amz-sdk-checksum-algorithm", "CRC32".to_string()),
+                ("x-amz-checksum-crc32", crc32),
+            ],
+        )
+        .await;
+        assert_eq!(response.status, 200, "response: {response:?}");
+        assert_eq!(
+            response_header(&response.headers, "x-amz-checksum-crc32"),
+            Some("23SgOw==")
+        );
+        assert_eq!(
+            response_header(&response.headers, "x-amz-checksum-type"),
+            Some("FULL_OBJECT")
+        );
+        cleanup(&bucket, &[key]).await;
+    });
+}
+
+#[test]
+fn test_put_object_sdk_checksum_algorithm_lowercase_value() {
+    s3_tests::run(async {
+        let bucket = setup_bucket().await;
+        let key = "sdk-checksum-algorithm-lowercase-value";
+        let body = b"sdk checksum algorithm lowercase value oracle";
+        let crc32 = checksum_base64(LocalChecksumAlgorithm::Crc32, body);
+        let response = raw_put_object_with_checksum_headers(
+            &bucket,
+            key,
+            body,
+            &[
+                ("x-amz-sdk-checksum-algorithm", "crc32".to_string()),
+                ("x-amz-checksum-crc32", crc32),
+            ],
+        )
+        .await;
+        assert_eq!(response.status, 200, "response: {response:?}");
+        assert_eq!(
+            response_header(&response.headers, "x-amz-checksum-crc32"),
+            Some("0R8J1Q==")
+        );
+        assert_eq!(
+            response_header(&response.headers, "x-amz-checksum-type"),
+            Some("FULL_OBJECT")
+        );
+        cleanup(&bucket, &[key]).await;
+    });
+}
+
+#[test]
+fn test_put_object_sdk_checksum_algorithm_mismatched_value() {
+    s3_tests::run(async {
+        let bucket = setup_bucket().await;
+        let key = "sdk-checksum-algorithm-mismatched-value";
+        let body = b"sdk checksum algorithm mismatched value oracle";
+        let crc32 = checksum_base64(LocalChecksumAlgorithm::Crc32, body);
+        let response = raw_put_object_with_checksum_headers(
+            &bucket,
+            key,
+            body,
+            &[
+                ("x-amz-sdk-checksum-algorithm", "SHA256".to_string()),
+                ("x-amz-checksum-crc32", crc32),
+            ],
+        )
+        .await;
+        assert_eq!(response.status, 400, "response: {response:?}");
+        assert_error_code(&response.body, "InvalidRequest");
+        assert_error_message(&response.body, SDK_CHECKSUM_INVALID_VALUE_MESSAGE);
+        assert_auth_error_response_shape(&response.body);
+        cleanup(&bucket, &[key]).await;
+    });
+}
+
+#[test]
+fn test_put_object_invalid_sdk_checksum_algorithm_with_value() {
+    s3_tests::run(async {
+        let bucket = setup_bucket().await;
+        let key = "invalid-sdk-checksum-algorithm-with-value";
+        let body = b"invalid sdk checksum algorithm with value oracle";
+        let crc32 = checksum_base64(LocalChecksumAlgorithm::Crc32, body);
+        let response = raw_put_object_with_checksum_headers(
+            &bucket,
+            key,
+            body,
+            &[
+                ("x-amz-sdk-checksum-algorithm", "BOGUS".to_string()),
+                ("x-amz-checksum-crc32", crc32),
+            ],
+        )
+        .await;
+        assert_eq!(response.status, 400, "response: {response:?}");
+        assert_error_code(&response.body, "InvalidRequest");
+        assert_error_message(&response.body, SDK_CHECKSUM_INVALID_VALUE_MESSAGE);
+        assert_auth_error_response_shape(&response.body);
+        cleanup(&bucket, &[key]).await;
+    });
+}
+
+#[test]
+fn test_put_object_sdk_checksum_algorithm_without_value() {
+    s3_tests::run(async {
+        let bucket = setup_bucket().await;
+        let key = "sdk-checksum-algorithm-without-value";
+        let body = b"sdk checksum algorithm without value oracle";
+        let response = raw_put_object_with_checksum_headers(
+            &bucket,
+            key,
+            body,
+            &[("x-amz-sdk-checksum-algorithm", "CRC32".to_string())],
+        )
+        .await;
+        assert_eq!(response.status, 400, "response: {response:?}");
+        assert_error_code(&response.body, "InvalidRequest");
+        assert_error_message(&response.body, SDK_CHECKSUM_MISSING_VALUE_MESSAGE);
+        assert_auth_error_response_shape(&response.body);
+        cleanup(&bucket, &[key]).await;
+    });
+}
+
+#[test]
+fn test_put_object_invalid_sdk_checksum_algorithm_without_value() {
+    s3_tests::run(async {
+        let bucket = setup_bucket().await;
+        let key = "invalid-sdk-checksum-algorithm-without-value";
+        let body = b"invalid sdk checksum algorithm without value oracle";
+        let response = raw_put_object_with_checksum_headers(
+            &bucket,
+            key,
+            body,
+            &[("x-amz-sdk-checksum-algorithm", "BOGUS".to_string())],
+        )
+        .await;
+        assert_eq!(response.status, 400, "response: {response:?}");
+        assert_error_code(&response.body, "InvalidRequest");
+        assert_error_message(&response.body, SDK_CHECKSUM_MISSING_VALUE_MESSAGE);
+        assert_auth_error_response_shape(&response.body);
+        cleanup(&bucket, &[key]).await;
+    });
+}
+
+#[test]
+fn test_create_multipart_checksum_algorithm_lowercase() {
+    s3_tests::run(async {
+        let bucket = setup_bucket().await;
+        let key = "create-multipart-lowercase-checksum-algorithm";
+        let url = s3_tests::object_url(CTX.endpoint(), &bucket, key, Some("uploads"));
+        let response =
+            send_signed_request("POST", &url, &[], [("x-amz-checksum-algorithm", "crc32")]);
+        if response.status == 200 {
+            let upload_id = xml_text(&response.body, "UploadId").expect("UploadId in response");
+            CTX.client()
+                .abort_multipart_upload()
+                .bucket(&bucket)
+                .key(key)
+                .upload_id(upload_id)
+                .send()
+                .await
+                .unwrap();
+        }
+        assert_eq!(response.status, 200, "response: {response:?}");
+        assert_eq!(
+            response_header(&response.headers, "x-amz-checksum-algorithm"),
+            Some("CRC32")
+        );
+        assert_eq!(
+            response_header(&response.headers, "x-amz-checksum-type"),
+            Some("COMPOSITE")
+        );
+        cleanup(&bucket, &[key]).await;
+    });
+}
+
+#[test]
+fn test_create_multipart_invalid_checksum_algorithm() {
+    s3_tests::run(async {
+        let bucket = setup_bucket().await;
+        let key = "create-multipart-invalid-checksum-algorithm";
+        let url = s3_tests::object_url(CTX.endpoint(), &bucket, key, Some("uploads"));
+        let response =
+            send_signed_request("POST", &url, &[], [("x-amz-checksum-algorithm", "BOGUS")]);
+        if response.status == 200 {
+            let upload_id = xml_text(&response.body, "UploadId").expect("UploadId in response");
+            CTX.client()
+                .abort_multipart_upload()
+                .bucket(&bucket)
+                .key(key)
+                .upload_id(upload_id)
+                .send()
+                .await
+                .unwrap();
+        }
+        assert_eq!(response.status, 400, "response: {response:?}");
+        assert_error_code(&response.body, "InvalidRequest");
+        assert!(
+            response
+                .body
+                .contains(UNSUPPORTED_CHECKSUM_ALGORITHM_MESSAGE),
+            "body: {}",
+            response.body
+        );
+        assert_auth_error_response_shape(&response.body);
+        cleanup(&bucket, &[key]).await;
+    });
+}
+
+#[test]
+fn test_copy_object_replace_checksum_algorithm_lowercase() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+        let source_key = "copy-source-lowercase-checksum-algorithm";
+        let destination_key = "copy-destination-lowercase-checksum-algorithm";
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key(source_key)
+            .body(ByteStream::from_static(
+                b"copy checksum algorithm lowercase oracle",
+            ))
+            .send()
+            .await
+            .unwrap();
+        let url = s3_tests::object_url(CTX.endpoint(), &bucket, destination_key, None);
+        let copy_source = format!("/{bucket}/{source_key}");
+        let response = send_signed_request(
+            "PUT",
+            &url,
+            &[],
+            [
+                ("x-amz-copy-source", copy_source.as_str()),
+                ("x-amz-metadata-directive", "REPLACE"),
+                ("x-amz-checksum-algorithm", "crc32"),
+            ],
+        );
+        assert_eq!(response.status, 200, "response: {response:?}");
+        assert_eq!(xml_text(&response.body, "ChecksumCRC32"), Some("mYg1AA=="));
+        assert_eq!(
+            xml_text(&response.body, "ChecksumType"),
+            Some("FULL_OBJECT")
+        );
+        cleanup(&bucket, &[source_key, destination_key]).await;
+    });
+}
+
+#[test]
+fn test_copy_object_replace_invalid_checksum_algorithm() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+        let source_key = "copy-source-invalid-checksum-algorithm";
+        let destination_key = "copy-destination-invalid-checksum-algorithm";
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key(source_key)
+            .body(ByteStream::from_static(
+                b"copy checksum algorithm invalid oracle",
+            ))
+            .send()
+            .await
+            .unwrap();
+        let url = s3_tests::object_url(CTX.endpoint(), &bucket, destination_key, None);
+        let copy_source = format!("/{bucket}/{source_key}");
+        let response = send_signed_request(
+            "PUT",
+            &url,
+            &[],
+            [
+                ("x-amz-copy-source", copy_source.as_str()),
+                ("x-amz-metadata-directive", "REPLACE"),
+                ("x-amz-checksum-algorithm", "BOGUS"),
+            ],
+        );
+        assert_eq!(response.status, 400, "response: {response:?}");
+        assert_error_code(&response.body, "InvalidRequest");
+        assert!(
+            response
+                .body
+                .contains(UNSUPPORTED_CHECKSUM_ALGORITHM_MESSAGE),
+            "body: {}",
+            response.body
+        );
+        assert_auth_error_response_shape(&response.body);
+        cleanup(&bucket, &[source_key, destination_key]).await;
+    });
+}
 
 // ── test_object_checksum_sha256 ─────────────────────────────────────
 
@@ -1065,56 +1592,83 @@ fn test_complete_multipart_legacy_object_checksum_without_create_algorithm_is_ig
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = setup_bucket().await;
-        let key = "mpu-complete-legacy-checksum-without-create";
         let part_body = b"legacy object checksum header";
+        let cases = [
+            (
+                "crc32",
+                ChecksumAlgorithm::Crc32,
+                LocalChecksumAlgorithm::Crc32,
+            ),
+            (
+                "crc32c",
+                ChecksumAlgorithm::Crc32C,
+                LocalChecksumAlgorithm::Crc32c,
+            ),
+            (
+                "sha1",
+                ChecksumAlgorithm::Sha1,
+                LocalChecksumAlgorithm::Sha1,
+            ),
+            (
+                "sha256",
+                ChecksumAlgorithm::Sha256,
+                LocalChecksumAlgorithm::Sha256,
+            ),
+        ];
+        let mut keys = Vec::new();
 
-        let create = client
-            .create_multipart_upload()
-            .bucket(&bucket)
-            .key(key)
-            .send()
-            .await
-            .unwrap();
-        let upload_id = create.upload_id().unwrap().to_string();
+        for (name, aws_algo, local_algo) in cases {
+            let key = format!("mpu-complete-legacy-checksum-without-create-{name}");
+            keys.push(key.clone());
+            let create = client
+                .create_multipart_upload()
+                .bucket(&bucket)
+                .key(&key)
+                .send()
+                .await
+                .unwrap();
+            let upload_id = create.upload_id().unwrap().to_string();
 
-        let part = client
-            .upload_part()
-            .bucket(&bucket)
-            .key(key)
-            .upload_id(&upload_id)
-            .part_number(1)
-            .body(ByteStream::from(part_body.to_vec()))
-            .send()
-            .await
-            .unwrap();
-        let etag = part.e_tag().unwrap();
+            let part = client
+                .upload_part()
+                .bucket(&bucket)
+                .key(&key)
+                .upload_id(&upload_id)
+                .part_number(1)
+                .body(ByteStream::from(part_body.to_vec()))
+                .send()
+                .await
+                .unwrap();
+            let etag = part.e_tag().unwrap();
 
-        let url = multipart_complete_url(&bucket, key, &upload_id);
-        let body = format!(
-            "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{etag}</ETag></Part></CompleteMultipartUpload>"
-        );
-        let wrong_sha256 = encode_base64(&[0u8; 32]);
-        let (status, body_text) = send_signed_post(
-            &url,
-            body.as_bytes(),
-            &[("x-amz-checksum-sha256", wrong_sha256.as_str())],
-        );
-        assert_eq!(status, 200, "body: {body_text}");
+            let url = multipart_complete_url(&bucket, &key, &upload_id);
+            let body = format!(
+                "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{etag}</ETag></Part></CompleteMultipartUpload>"
+            );
+            let checksum = checksum_base64(local_algo, part_body);
+            let (status, body_text) = send_signed_post(
+                &url,
+                body.as_bytes(),
+                &[(checksum_header_name(&aws_algo), checksum.as_str())],
+            );
+            assert_eq!(status, 200, "body: {body_text}");
 
-        let head = client
-            .head_object()
-            .bucket(&bucket)
-            .key(key)
-            .checksum_mode(ChecksumMode::Enabled)
-            .send()
-            .await
-            .unwrap();
-        assert!(
-            head.checksum_sha256().is_none(),
-            "unconfigured legacy complete checksum header must not be stored"
-        );
+            let head = client
+                .head_object()
+                .bucket(&bucket)
+                .key(&key)
+                .checksum_mode(ChecksumMode::Enabled)
+                .send()
+                .await
+                .unwrap();
+            assert!(
+                get_cksum_from_head(&head, &aws_algo).is_none(),
+                "unconfigured legacy complete checksum header must not be stored for {name}"
+            );
+        }
 
-        cleanup(&bucket, &[key]).await;
+        let key_refs = keys.iter().map(String::as_str).collect::<Vec<_>>();
+        cleanup(&bucket, &key_refs).await;
     });
 }
 
@@ -1123,50 +1677,82 @@ fn test_complete_multipart_new_object_checksum_without_create_algorithm_rejected
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = setup_bucket().await;
-        let key = "mpu-complete-new-checksum-without-create";
         let part_body = b"new object checksum header";
+        let cases = [
+            ("md5", ChecksumAlgorithm::Md5, LocalChecksumAlgorithm::Md5),
+            (
+                "sha512",
+                ChecksumAlgorithm::Sha512,
+                LocalChecksumAlgorithm::Sha512,
+            ),
+            (
+                "xxhash64",
+                ChecksumAlgorithm::Xxhash64,
+                LocalChecksumAlgorithm::XxHash64,
+            ),
+            (
+                "xxhash3",
+                ChecksumAlgorithm::Xxhash3,
+                LocalChecksumAlgorithm::XxHash3,
+            ),
+            (
+                "xxhash128",
+                ChecksumAlgorithm::Xxhash128,
+                LocalChecksumAlgorithm::XxHash128,
+            ),
+        ];
 
-        let create = client
-            .create_multipart_upload()
-            .bucket(&bucket)
-            .key(key)
-            .send()
-            .await
-            .unwrap();
-        let upload_id = create.upload_id().unwrap().to_string();
+        for (name, aws_algo, local_algo) in cases {
+            let key = format!("mpu-complete-new-checksum-without-create-{name}");
+            let create = client
+                .create_multipart_upload()
+                .bucket(&bucket)
+                .key(&key)
+                .send()
+                .await
+                .unwrap();
+            let upload_id = create.upload_id().unwrap().to_string();
 
-        let part = client
-            .upload_part()
-            .bucket(&bucket)
-            .key(key)
-            .upload_id(&upload_id)
-            .part_number(1)
-            .body(ByteStream::from(part_body.to_vec()))
-            .send()
-            .await
-            .unwrap();
-        let etag = part.e_tag().unwrap();
+            let part = client
+                .upload_part()
+                .bucket(&bucket)
+                .key(&key)
+                .upload_id(&upload_id)
+                .part_number(1)
+                .body(ByteStream::from(part_body.to_vec()))
+                .send()
+                .await
+                .unwrap();
+            let etag = part.e_tag().unwrap();
 
-        let url = multipart_complete_url(&bucket, key, &upload_id);
-        let body = format!(
-            "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{etag}</ETag></Part></CompleteMultipartUpload>"
-        );
-        let sha512 = encode_base64(&[0u8; 64]);
-        let (status, body_text) = send_signed_post(
-            &url,
-            body.as_bytes(),
-            &[("x-amz-checksum-sha512", sha512.as_str())],
-        );
-        assert_eq!(status, 400, "body: {body_text}");
-        assert_error_code(&body_text, "InvalidRequest");
+            let url = multipart_complete_url(&bucket, &key, &upload_id);
+            let body = format!(
+                "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{etag}</ETag></Part></CompleteMultipartUpload>"
+            );
+            let checksum = checksum_base64(local_algo, part_body);
+            let (status, body_text) = send_signed_post(
+                &url,
+                body.as_bytes(),
+                &[(checksum_header_name(&aws_algo), checksum.as_str())],
+            );
+            assert_eq!(status, 400, "body: {body_text}");
+            assert_error_code(&body_text, "InvalidRequest");
+            assert_error_message(
+                &body_text,
+                &format!(
+                    "Checksum Type mismatch occurred, expected checksum Type: null, actual checksum Type: {name}"
+                ),
+            );
+            assert_auth_error_response_shape(&body_text);
 
-        let _ = client
-            .abort_multipart_upload()
-            .bucket(&bucket)
-            .key(key)
-            .upload_id(&upload_id)
-            .send()
-            .await;
+            let _ = client
+                .abort_multipart_upload()
+                .bucket(&bucket)
+                .key(&key)
+                .upload_id(&upload_id)
+                .send()
+                .await;
+        }
         cleanup(&bucket, &[]).await;
     });
 }

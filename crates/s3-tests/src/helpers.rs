@@ -1054,7 +1054,10 @@ pub fn content_md5_header(body: &[u8]) -> (String, String) {
 /// Build a CRC32-based SDK checksum header set for the request body.
 pub fn sdk_checksum_headers(body: &[u8]) -> Vec<(String, String)> {
     vec![
-        ("x-amz-checksum-algorithm".to_string(), "CRC32".to_string()),
+        (
+            "x-amz-sdk-checksum-algorithm".to_string(),
+            "CRC32".to_string(),
+        ),
         ("x-amz-checksum-crc32".to_string(), crc32_b64(body)),
     ]
 }

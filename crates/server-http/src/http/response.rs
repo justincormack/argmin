@@ -25,6 +25,22 @@ use super::xml;
 const TEST_REQUEST_ID: &str = "request-id";
 #[cfg(test)]
 const TEST_HOST_ID: &str = "host-id";
+const SDK_CHECKSUM_MISSING_VALUE_MESSAGE: &str =
+    "x-amz-sdk-checksum-algorithm specified, but no corresponding x-amz-checksum-* or x-amz-trailer headers were found.";
+const SDK_CHECKSUM_INVALID_VALUE_MESSAGE: &str =
+    "Value for x-amz-sdk-checksum-algorithm header is invalid.";
+const UNSUPPORTED_CHECKSUM_ALGORITHM_MESSAGE: &str = "Checksum algorithm provided is unsupported. Please try again with any of the valid types: [CRC32, CRC32C, CRC64NVME, MD5, SHA1, SHA256, SHA512, XXHASH128, XXHASH3, XXHASH64]";
+
+fn is_host_id_invalid_request(reason: &str) -> bool {
+    matches!(
+        reason,
+        SDK_CHECKSUM_MISSING_VALUE_MESSAGE
+            | SDK_CHECKSUM_INVALID_VALUE_MESSAGE
+            | UNSUPPORTED_CHECKSUM_ALGORITHM_MESSAGE
+    ) || reason.starts_with(
+        "Checksum Type mismatch occurred, expected checksum Type: null, actual checksum Type: ",
+    )
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WireResponseIds {
@@ -658,6 +674,15 @@ impl S3Response {
             ServerError::InvalidPolicyDocument { .. } => {
                 let body = xml::error_xml_with_host_id(
                     "InvalidPolicyDocument",
+                    &client_error_message(err),
+                    request_id,
+                    host_id,
+                );
+                Self::new(400).chunked_xml_body(body)
+            }
+            ServerError::InvalidRequest { reason } if is_host_id_invalid_request(reason) => {
+                let body = xml::error_xml_with_host_id(
+                    "InvalidRequest",
                     &client_error_message(err),
                     request_id,
                     host_id,
