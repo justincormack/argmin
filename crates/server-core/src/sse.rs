@@ -493,9 +493,7 @@ pub fn validate_sse_customer_read(
     request: &SseCustomerRequest,
 ) -> Result<SseCustomerResponseHeaders, ServerError> {
     if state.validator_key_id != validator.key_id {
-        return Err(ServerError::InvalidRequest {
-            reason: "SSE-C validator key for object is not available".to_string(),
-        });
+        return Err(sse_customer_validator_key_unavailable());
     }
     let actual = compute_validator_hmac(validator, &state.validator_salt, request.customer_key());
     if !constant_time_eq(&state.validator_hmac, &actual) {
@@ -688,10 +686,7 @@ fn validate_sse_customer_write(
     request: &SseCustomerRequest,
 ) -> Result<SseCustomerResponseHeaders, ServerError> {
     if state.validator_key_id != validator.key_id {
-        return Err(ServerError::InvalidRequest {
-            reason: "The provided encryption parameters did not match the ones used originally."
-                .to_string(),
-        });
+        return Err(sse_customer_validator_key_unavailable());
     }
     let actual = compute_validator_hmac(validator, &state.validator_salt, request.customer_key());
     if !constant_time_eq(&state.validator_hmac, &actual) {
@@ -701,6 +696,12 @@ fn validate_sse_customer_write(
         });
     }
     Ok(request.response_headers())
+}
+
+fn sse_customer_validator_key_unavailable() -> ServerError {
+    ServerError::InternalError {
+        reason: "SSE-C validator key for object is not available".to_string(),
+    }
 }
 
 pub(crate) fn decrypt_sse_customer_segment(
@@ -1095,6 +1096,13 @@ mod tests {
         }
     }
 
+    fn missing_validator() -> SseCustomerValidatorConfig {
+        SseCustomerValidatorConfig {
+            key_id: 2,
+            validator_key: [9u8; 32],
+        }
+    }
+
     fn managed_key_provider() -> StaticManagedKeyProvider {
         StaticManagedKeyProvider::single(ManagedWrappingKeyConfig {
             key_id: 7,
@@ -1145,6 +1153,28 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, ServerError::AccessDenied));
+    }
+
+    #[test]
+    fn sse_c_missing_validator_key_is_internal_error() {
+        let req = request();
+        let validator = validator();
+        let ctx = prepare_sse_customer_write(&validator, &req).unwrap();
+        let ObjectEncryption::SseCustomer(state) = ctx.encryption() else {
+            panic!("expected SSE-C object state");
+        };
+        let ciphertext = ctx.encrypt_segment(0, b"abc").unwrap();
+        let err = decrypt_sse_customer_segment(
+            &missing_validator(),
+            state,
+            &req,
+            SseCustomerSegmentScope::object(),
+            0,
+            &ciphertext,
+            3,
+        )
+        .unwrap_err();
+        assert!(matches!(err, ServerError::InternalError { .. }));
     }
 
     #[test]
@@ -1216,6 +1246,24 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, ServerError::InvalidRequest { .. }));
+    }
+
+    #[test]
+    fn sse_c_resume_write_missing_validator_key_is_internal_error() {
+        let req = request();
+        let validator = validator();
+        let ctx = prepare_sse_customer_write(&validator, &req).unwrap();
+        let ObjectEncryption::SseCustomer(state) = ctx.encryption() else {
+            panic!("expected SSE-C object state");
+        };
+        let err = resume_sse_customer_write(
+            &missing_validator(),
+            state,
+            &req,
+            SseCustomerSegmentScope::multipart_part(1).unwrap(),
+        )
+        .unwrap_err();
+        assert!(matches!(err, ServerError::InternalError { .. }));
     }
 
     #[test]

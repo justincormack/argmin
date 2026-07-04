@@ -361,12 +361,15 @@ steps it performs.
   read-specific `InvalidPartNumber` error and AWS-shaped response while leaving
   CompleteMultipartUpload `InvalidPart` semantics unchanged.
 
-- [ ] **H7. SSE-C validator-key-unavailable reported as client 400.**
+- [x] **H7. SSE-C validator-key-unavailable reported as client 400.**
   `server-core/src/sse.rs:495-499` returns `InvalidRequest` when the server no
   longer holds the validator key (rotation/operational fault); genuine wrong
   key correctly gets `AccessDenied` (sse.rs:502). Write-resume path
   (sse.rs:685-702) maps the same condition to a different 400 message. Fix:
-  map key-unavailable to a 500-class error; unify read/write messages.
+  map key-unavailable to a 500-class error; unify read/write messages. This is
+  not AWS-oracle testable because it requires stored SSE-C metadata whose
+  validator key id is no longer configured locally. Added unit coverage for
+  both read and write-resume paths; wrong customer keys remain client errors.
 
 - [ ] **H8. Copy-source `versionId` never percent-decoded, unlike bucket and
   key.** `server-http/src/http/request.rs:387-416` (pinned by test at
