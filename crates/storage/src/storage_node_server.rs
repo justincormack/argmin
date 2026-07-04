@@ -408,7 +408,10 @@ impl StorageNodeProcessConfig {
     pub fn from_runtime_map_refresh(
         current: &StorageNodeProcessConfig,
         runtime_map: &ClusterRuntimeMapSnapshot,
+        history_reference_summary: crate::PgClusterMapHistoryReferenceSummary,
     ) -> Result<Self, StorageNodeServerError> {
+        let protected_historical_route_keys =
+            metadata_transfer_source_route_keys_for_refresh(runtime_map);
         let mut next = Self::from_runtime_map(
             current.node_id,
             current.data_dir.clone(),
@@ -432,7 +435,12 @@ impl StorageNodeProcessConfig {
                 historical_pg_routes.insert((route.cluster_epoch, route.pg_id), route.clone());
             }
         }
-        next.historical_pg_routes = historical_pg_routes.into_values().collect();
+        next.historical_pg_routes = prune_refresh_historical_pg_routes(
+            historical_pg_routes,
+            current.cluster_epoch,
+            history_reference_summary,
+            &protected_historical_route_keys,
+        );
         Ok(next)
     }
 
@@ -523,6 +531,46 @@ impl StorageNodeProcessConfig {
         )
         .map_err(StorageNodeServerError::from)
     }
+}
+
+fn prune_refresh_historical_pg_routes(
+    historical_pg_routes: BTreeMap<(ClusterEpoch, u32), StorageNodePgRoute>,
+    fallback_floor: ClusterEpoch,
+    history_reference_summary: crate::PgClusterMapHistoryReferenceSummary,
+    protected_historical_route_keys: &BTreeSet<(ClusterEpoch, u32)>,
+) -> Vec<StorageNodePgRoute> {
+    let referenced_floor = history_reference_summary
+        .oldest_required_epoch()
+        .filter(|epoch| *epoch < fallback_floor);
+    let retention_floor = referenced_floor.unwrap_or(fallback_floor);
+    let mut retained = BTreeMap::new();
+    let mut predecessor_by_pg = BTreeMap::<u32, StorageNodePgRoute>::new();
+    for ((epoch, pg_id), route) in historical_pg_routes {
+        if epoch >= retention_floor || protected_historical_route_keys.contains(&(epoch, pg_id)) {
+            retained.insert((epoch, pg_id), route);
+        } else if referenced_floor.is_some() {
+            predecessor_by_pg.insert(pg_id, route);
+        }
+    }
+    for route in predecessor_by_pg.into_values() {
+        retained.insert((route.cluster_epoch, route.pg_id), route);
+    }
+    retained.into_values().collect()
+}
+
+fn metadata_transfer_source_route_keys_for_refresh(
+    runtime_map: &ClusterRuntimeMapSnapshot,
+) -> BTreeSet<(ClusterEpoch, u32)> {
+    runtime_map
+        .pg_routes()
+        .iter()
+        .chain(runtime_map.historical_pg_routes())
+        .filter_map(|route| {
+            route
+                .peering_metadata_transfer_source_route_epoch()
+                .map(|source_epoch| (source_epoch, route.pg_id().get()))
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1136,13 +1184,17 @@ impl StorageNodeServer {
     ) -> Result<StorageNodeControlPlaneRefresh, StorageNodeServerError> {
         let heartbeat =
             self.control_plane_heartbeat(node_incarnation, requested_lease_duration_ms)?;
+        let history_reference_summary = heartbeat.cluster_map_history_reference_summary;
         let refresh = control_plane
             .refresh_node_heartbeat(heartbeat, authority_now_ms)
             .map_err(StorageNodeServerError::from)?;
         let (lease, runtime_map) = refresh.into_parts();
         let current_config = self.config_snapshot();
-        let next_config =
-            StorageNodeProcessConfig::from_runtime_map_refresh(&current_config, &runtime_map)?;
+        let next_config = StorageNodeProcessConfig::from_runtime_map_refresh(
+            &current_config,
+            &runtime_map,
+            history_reference_summary,
+        )?;
         next_config.validate_runtime_refresh_from(&current_config)?;
         Ok(StorageNodeControlPlaneRefresh {
             lease,
@@ -11880,8 +11932,15 @@ mod tests {
             .iter()
             .any(|route| route.cluster_epoch() == retained_epoch));
 
-        let next = StorageNodeProcessConfig::from_runtime_map_refresh(&current, &delta_runtime_map)
-            .unwrap();
+        let next = StorageNodeProcessConfig::from_runtime_map_refresh(
+            &current,
+            &delta_runtime_map,
+            crate::PgClusterMapHistoryReferenceSummary {
+                oldest_live_placement_epoch: Some(retained_epoch),
+                oldest_durable_backfill_epoch: None,
+            },
+        )
+        .unwrap();
         assert!(next
             .historical_pg_routes
             .iter()
@@ -11889,6 +11948,336 @@ mod tests {
         assert!(next.historical_pg_routes.iter().any(|route| {
             route.cluster_epoch == current_runtime_map.cluster_epoch() && route.pg_id == pg_id.get()
         }));
+    }
+
+    #[test]
+    fn storage_node_refresh_config_prunes_unreferenced_history_growth() {
+        let tmp = test_util::tempdir();
+        let node_id = NodeId::new(7);
+        let pg_id = PgId::new(0);
+        let socket_path = tmp.path().join("sock").join("storage.sock");
+        private_socket_dir(socket_path.parent().unwrap());
+        let mut authority = SingleAuthorityControlPlane::open(FileControlPlaneStore::new(
+            tmp.path().join("control-plane.state"),
+        ))
+        .unwrap();
+        authority
+            .set_node_membership(node_id, NodeMembershipState::Active)
+            .unwrap();
+        let first = authority
+            .heartbeat(
+                NodeHeartbeat {
+                    node_id,
+                    node_incarnation: 12,
+                    endpoint: socket_path.to_str().unwrap().to_owned(),
+                    observed_epoch: authority.snapshot().cluster_epoch(),
+                    requested_lease_duration_ms: 1_000,
+                    cluster_map_history_reference_summary:
+                        crate::PgClusterMapHistoryReferenceSummary::default(),
+                    pg_observations: Vec::new(),
+                },
+                1_000,
+            )
+            .unwrap();
+        authority
+            .heartbeat(
+                NodeHeartbeat {
+                    node_id,
+                    node_incarnation: 12,
+                    endpoint: socket_path.to_str().unwrap().to_owned(),
+                    observed_epoch: first.cluster_epoch(),
+                    requested_lease_duration_ms: 1_000,
+                    cluster_map_history_reference_summary:
+                        crate::PgClusterMapHistoryReferenceSummary::default(),
+                    pg_observations: Vec::new(),
+                },
+                1_001,
+            )
+            .unwrap();
+        authority.set_pg_acting_set(pg_id, vec![node_id]).unwrap();
+
+        let runtime_map = authority.snapshot().runtime_map(1_002).unwrap();
+        let mut current = StorageNodeProcessConfig::from_runtime_map(
+            node_id,
+            tmp.path().join("node"),
+            EcShape { k: 1, m: 0 },
+            &runtime_map,
+        )
+        .unwrap();
+        for step in 0_u32..8 {
+            authority
+                .set_node_membership(NodeId::new(100 + step), NodeMembershipState::Active)
+                .unwrap();
+            let delta_runtime_map = authority
+                .snapshot()
+                .runtime_map_for_storage_node_refresh(
+                    2_000 + u64::from(step),
+                    node_id,
+                    current.cluster_epoch,
+                )
+                .unwrap();
+            current = StorageNodeProcessConfig::from_runtime_map_refresh(
+                &current,
+                &delta_runtime_map,
+                crate::PgClusterMapHistoryReferenceSummary::default(),
+            )
+            .unwrap();
+            assert_eq!(
+                current.historical_pg_routes.len(),
+                current.pg_routes.len(),
+                "unreferenced local history should retain only the previous current route set"
+            );
+        }
+    }
+
+    #[test]
+    fn storage_node_refresh_config_keeps_predecessor_for_retained_floor() {
+        let tmp = test_util::tempdir();
+        let node_id = NodeId::new(7);
+        let pg_id = PgId::new(0);
+        let socket_path = tmp.path().join("sock").join("storage.sock");
+        private_socket_dir(socket_path.parent().unwrap());
+        let mut authority = SingleAuthorityControlPlane::open(FileControlPlaneStore::new(
+            tmp.path().join("control-plane.state"),
+        ))
+        .unwrap();
+        authority
+            .set_node_membership(node_id, NodeMembershipState::Active)
+            .unwrap();
+        let first = authority
+            .heartbeat(
+                NodeHeartbeat {
+                    node_id,
+                    node_incarnation: 12,
+                    endpoint: socket_path.to_str().unwrap().to_owned(),
+                    observed_epoch: authority.snapshot().cluster_epoch(),
+                    requested_lease_duration_ms: 1_000,
+                    cluster_map_history_reference_summary:
+                        crate::PgClusterMapHistoryReferenceSummary::default(),
+                    pg_observations: Vec::new(),
+                },
+                1_000,
+            )
+            .unwrap();
+        authority
+            .heartbeat(
+                NodeHeartbeat {
+                    node_id,
+                    node_incarnation: 12,
+                    endpoint: socket_path.to_str().unwrap().to_owned(),
+                    observed_epoch: first.cluster_epoch(),
+                    requested_lease_duration_ms: 1_000,
+                    cluster_map_history_reference_summary:
+                        crate::PgClusterMapHistoryReferenceSummary::default(),
+                    pg_observations: Vec::new(),
+                },
+                1_001,
+            )
+            .unwrap();
+        authority.set_pg_acting_set(pg_id, vec![node_id]).unwrap();
+        for step in 0_u32..10 {
+            authority
+                .set_node_membership(NodeId::new(200 + step), NodeMembershipState::Active)
+                .unwrap();
+        }
+
+        let runtime_map = authority.snapshot().runtime_map(1_100).unwrap();
+        let mut current = StorageNodeProcessConfig::from_runtime_map(
+            node_id,
+            tmp.path().join("node"),
+            EcShape { k: 1, m: 0 },
+            &runtime_map,
+        )
+        .unwrap();
+        for raw_epoch in [2, 4, 6, 8] {
+            let cluster_epoch = ClusterEpoch::new(raw_epoch).unwrap();
+            current.historical_pg_routes.push(StorageNodePgRoute {
+                pg_id: pg_id.get(),
+                cluster_epoch,
+                state: PgState::Active,
+                primary_node_id: node_id,
+                acting_set: vec![node_id],
+            });
+        }
+
+        authority
+            .set_node_membership(NodeId::new(250), NodeMembershipState::Active)
+            .unwrap();
+        let delta_runtime_map = authority
+            .snapshot()
+            .runtime_map_for_storage_node_refresh(1_200, node_id, current.cluster_epoch)
+            .unwrap();
+        let next = StorageNodeProcessConfig::from_runtime_map_refresh(
+            &current,
+            &delta_runtime_map,
+            crate::PgClusterMapHistoryReferenceSummary {
+                oldest_live_placement_epoch: Some(ClusterEpoch::new(5).unwrap()),
+                oldest_durable_backfill_epoch: None,
+            },
+        )
+        .unwrap();
+        let retained_epochs: Vec<u64> = next
+            .historical_pg_routes
+            .iter()
+            .filter(|route| route.pg_id == pg_id.get())
+            .map(|route| route.cluster_epoch.get())
+            .collect();
+
+        assert!(!retained_epochs.contains(&2));
+        assert!(retained_epochs.contains(&4));
+        assert!(retained_epochs.contains(&6));
+        assert!(retained_epochs.contains(&8));
+        assert!(retained_epochs.contains(&current.cluster_epoch.get()));
+    }
+
+    #[test]
+    fn storage_node_refresh_config_keeps_metadata_transfer_source_route_epoch() {
+        let tmp = test_util::tempdir();
+        let node_id = NodeId::new(7);
+        let destination_node_id = NodeId::new(8);
+        let pg_id = PgId::new(0);
+        let socket_path = tmp.path().join("sock").join("storage.sock");
+        let destination_socket_path = tmp.path().join("sock").join("storage-8.sock");
+        private_socket_dir(socket_path.parent().unwrap());
+        let mut authority = SingleAuthorityControlPlane::open(FileControlPlaneStore::new(
+            tmp.path().join("control-plane.state"),
+        ))
+        .unwrap();
+        for (idx, (heartbeat_node_id, heartbeat_socket_path)) in [
+            (node_id, socket_path.clone()),
+            (destination_node_id, destination_socket_path),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let heartbeat_at_ms = 1_000 + idx as u64 * 2;
+            authority
+                .set_node_membership(heartbeat_node_id, NodeMembershipState::Active)
+                .unwrap();
+            let first = authority
+                .heartbeat(
+                    NodeHeartbeat {
+                        node_id: heartbeat_node_id,
+                        node_incarnation: 12,
+                        endpoint: heartbeat_socket_path.to_str().unwrap().to_owned(),
+                        observed_epoch: authority.snapshot().cluster_epoch(),
+                        requested_lease_duration_ms: 1_000,
+                        cluster_map_history_reference_summary:
+                            crate::PgClusterMapHistoryReferenceSummary::default(),
+                        pg_observations: Vec::new(),
+                    },
+                    heartbeat_at_ms,
+                )
+                .unwrap();
+            authority
+                .heartbeat(
+                    NodeHeartbeat {
+                        node_id: heartbeat_node_id,
+                        node_incarnation: 12,
+                        endpoint: heartbeat_socket_path.to_str().unwrap().to_owned(),
+                        observed_epoch: first.cluster_epoch(),
+                        requested_lease_duration_ms: 1_000,
+                        cluster_map_history_reference_summary:
+                            crate::PgClusterMapHistoryReferenceSummary::default(),
+                        pg_observations: Vec::new(),
+                    },
+                    heartbeat_at_ms + 1,
+                )
+                .unwrap();
+        }
+        authority.set_pg_acting_set(pg_id, vec![node_id]).unwrap();
+        let active_proof = crate::control_plane::PgMetadataProof::new(9, 10, 11);
+        let peering_epoch = authority.snapshot().cluster_epoch();
+        authority
+            .heartbeat(
+                NodeHeartbeat {
+                    node_id,
+                    node_incarnation: 12,
+                    endpoint: socket_path.to_str().unwrap().to_owned(),
+                    observed_epoch: peering_epoch,
+                    requested_lease_duration_ms: 1_000,
+                    cluster_map_history_reference_summary:
+                        crate::PgClusterMapHistoryReferenceSummary::default(),
+                    pg_observations: vec![crate::control_plane::NodePgHeartbeatObservation {
+                        pg_id,
+                        state: PgState::Peering,
+                        metadata_proof: active_proof,
+                        has_pending_metadata_command: false,
+                    }],
+                },
+                2_000,
+            )
+            .unwrap();
+        authority
+            .complete_pg_peering(pg_id, node_id, 12, 2_001)
+            .unwrap();
+        let source_epoch = authority.snapshot().cluster_epoch();
+        authority
+            .heartbeat(
+                NodeHeartbeat {
+                    node_id,
+                    node_incarnation: 12,
+                    endpoint: socket_path.to_str().unwrap().to_owned(),
+                    observed_epoch: source_epoch,
+                    requested_lease_duration_ms: 1_000,
+                    cluster_map_history_reference_summary:
+                        crate::PgClusterMapHistoryReferenceSummary::default(),
+                    pg_observations: vec![crate::control_plane::NodePgHeartbeatObservation {
+                        pg_id,
+                        state: PgState::Active,
+                        metadata_proof: active_proof,
+                        has_pending_metadata_command: false,
+                    }],
+                },
+                2_002,
+            )
+            .unwrap();
+        authority
+            .set_pg_acting_set_with_metadata_transfer(
+                pg_id,
+                vec![destination_node_id],
+                crate::control_plane::PgMetadataTransferProof::new(source_epoch, active_proof),
+            )
+            .unwrap();
+
+        let runtime_map = authority.snapshot().runtime_map(2_003).unwrap();
+        let mut current = StorageNodeProcessConfig::from_runtime_map(
+            node_id,
+            tmp.path().join("node"),
+            EcShape { k: 1, m: 0 },
+            &runtime_map,
+        )
+        .unwrap();
+        assert!(current
+            .historical_pg_routes
+            .iter()
+            .any(|route| route.pg_id == pg_id.get() && route.cluster_epoch == source_epoch));
+        for step in 0_u32..8 {
+            authority
+                .set_node_membership(NodeId::new(300 + step), NodeMembershipState::Active)
+                .unwrap();
+        }
+
+        let delta_runtime_map = authority
+            .snapshot()
+            .runtime_map_for_storage_node_refresh(3_000, node_id, current.cluster_epoch)
+            .unwrap();
+        assert!(delta_runtime_map
+            .pg_routes()
+            .iter()
+            .any(|route| route.pg_id() == pg_id
+                && route.peering_metadata_transfer_source_route_epoch() == Some(source_epoch)));
+        current = StorageNodeProcessConfig::from_runtime_map_refresh(
+            &current,
+            &delta_runtime_map,
+            crate::PgClusterMapHistoryReferenceSummary::default(),
+        )
+        .unwrap();
+
+        assert!(current
+            .historical_pg_routes
+            .iter()
+            .any(|route| route.pg_id == pg_id.get() && route.cluster_epoch == source_epoch));
     }
 
     #[test]
