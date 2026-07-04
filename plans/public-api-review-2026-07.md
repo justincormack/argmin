@@ -130,11 +130,12 @@ steps it performs.
   validation preserve the auth path's AWS error family instead of converting
   every late region mismatch into `AuthorizationHeaderMalformed`.
 
-- [ ] **A9. Clock-skew rule implemented twice.**
-  `crates/server-http/src/http/mod.rs:318-339` (`enforce_sigv4_time_skew`)
-  duplicates `request.rs:283-288`; both run on every header-auth request and
-  neither covers presigned (A4). Fix: delete the server-http copy once
-  ordering requirements are confirmed.
+- [x] **A9. Clock-skew rule implemented twice.** AWS oracle confirms header
+  SigV4 stale past/future dates return 403 `RequestTimeTooSkewed`, and stale
+  tampered `x-amz-date` is rejected for skew before signature mismatch.
+  Completed by deleting the server-http pre-auth copy and keeping
+  `auth::authenticate_request` as the single header-auth skew enforcement
+  path.
 
 - [ ] **A10. POST policy parser silently drops malformed/unknown conditions.**
   post.rs:202-268 — array conditions with wrong arity and unknown operators

@@ -2560,7 +2560,6 @@ pub fn fuzz_conditional_header_entrypoints(inputs: ConditionalFuzzInputs<'_>) {
         return;
     };
 
-    let _ = crate::http::enforce_sigv4_time_skew(&req, 1_700_000_000);
     let _ = crate::http::conditional::read_condition_from_headers(&req);
     let _ = crate::http::conditional::write_condition_from_headers(&req);
     let _ = crate::http::conditional::delete_condition_from_headers(&req);
