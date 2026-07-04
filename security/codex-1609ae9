@@ -1,0 +1,157 @@
+Partial WAL write errors leave live log unrecoverable
+Link: https://chatgpt.com/codex/cloud/security/findings/34b11d6110a481919a0fe710c07da271?sev=&repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin
+Criticality: informational (attack path: ignore)
+Status: fixed
+
+# Metadata
+Repo: justincormack/argmin
+Commit: 1609ae9
+Author: justin@specialbusservice.com
+Created: 04/07/2026, 18:09:46
+Assignee: Unassigned
+Signals: Validated, Attack-path
+
+# Summary
+Bug introduced. The new failure taxonomy correctly poisons on fsync failures, but it does not treat write_all errors after the file is opened as ambiguous even though partial bytes may already have been written. The safe behavior would be to poison the WAL-backed store, or otherwise repair/truncate the WAL tail, after any failed write attempt that may have modified the file.
+In append_record_for_log_store, both length-prefix and frame write_all failures are mapped to BeforeReplayableRecord. However, std::io::Write::write_all can return an error after the underlying file has accepted a partial write. In the new WAL-backed log-store path, BeforeReplayableRecord causes apply_record to return an error without poisoning the store and without truncating the partial WAL tail. If the process continues and later WAL appends succeed, those later records are appended after the torn bytes and their corresponding mutations are published in memory. On restart, replay stops at or errors on the torn record before reaching later records, causing durable state loss or restart failure for the WAL-backed log store. This affects the newly added optional WAL-backed mode; the main durable control-plane path in the checked code still appears to use full restart artifacts rather than this new mode.
+
+# Resolution
+Fixed in commit `80337741 Poison Raft WAL after partial write errors`.
+
+The fix changes WAL length-prefix and frame `write_all` failures after the WAL file has been opened from `BeforeReplayableRecord` to `AmbiguousRecordMayExist`. That routes possible partial writes through the existing live-store poison path, preventing later WAL appends from being accepted after a torn tail. A regression test, `control_plane_raft_wal_partial_write_failure_is_ambiguous`, uses a writer that accepts a partial prefix and then fails to pin the classification.
+
+Verification for the fix:
+- `cargo fmt`
+- `cargo nextest run -p storage control_plane_raft_wal_partial_write_failure_is_ambiguous control_plane_raft_wal_backed_log_store_file_sync_error_poisons_without_publishing`
+- `cargo nextest run -p storage control_plane_raft`
+- `git diff --check`
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings`
+
+# Validation
+## Rubric
+- [x] Confirm write_all errors after opening the WAL are classified as BeforeReplayableRecord rather than ambiguous/poisoning.
+- [x] Confirm apply_record handles BeforeReplayableRecord by returning an error without setting the WAL-backed store poison state or repairing/truncating the WAL.
+- [x] Dynamically force a real partial write_all failure in the actual WAL append path, not just by manually corrupting a file.
+- [x] Confirm the process can continue and a later WAL-backed mutation is accepted and published live after the torn WAL tail.
+- [x] Confirm restart replay cannot reach the later valid record and instead fails/truncates at the torn/corrupt frame.
+## Report
+Validated the finding with a targeted Rust unit-test PoC plus LLDB trace. The relevant code maps both WAL length-prefix and frame write_all failures to ControlPlaneRaftWalAppendError::BeforeReplayableRecord at crates/storage/src/control_plane_raft.rs:4636-4647. In apply_record, that variant returns an error at crates/storage/src/control_plane_raft.rs:4383-4390 without setting inner.poisoned and without truncating the WAL. Replay is sequential and either truncates only incomplete tails or errors on corrupt complete-looking frames before reaching later bytes at crates/storage/src/control_plane_raft.rs:4705-4738.
+
+PoC added a Linux-only unit test validation_wal_partial_write_error_leaves_unpoisoned_torn_tail. It uses RLIMIT_FSIZE to make the real WAL File::write_all(&frame) write exactly one frame byte after the 4-byte length prefix, then fail with EFBIG. The test then proves: (1) WAL file length is clean_len + 4 + 1, so a partial write occurred; (2) store.export_restart_artifact() still succeeds immediately afterward, proving the WAL-backed store was not poisoned; (3) a later RaftLogStorage::save_vote succeeds and is published live; (4) restart through ControlPlaneRaftLogStore::from_restart_artifact_with_wal_file fails with 'control-plane OpenRaft WAL frame checksum mismatch', proving the later valid record appended after the torn bytes is unreachable.
+
+Command output: `cargo test -p storage validation_wal_partial_write_error_leaves_unpoisoned_torn_tail -- --nocapture` => `test control_plane_raft::tests::validation_wal_partial_write_error_leaves_unpoisoned_torn_tail ... ok` and `1 passed`.
+
+Debugger evidence: LLDB breakpoint at control_plane_raft.rs:4386 stopped inside ControlPlaneRaftLogStore::apply_record on the BeforeReplayableRecord return path. Backtrace showed apply_record -> RaftLogStorage::save_vote -> validation_wal_partial_write_error_leaves_unpoisoned_torn_tail at the partial write failure point, confirming the real failing write path takes the non-poisoning branch. Valgrind and gdb were not installed in the container; LLDB was available and used. No memory-safety crash is expected because this is a durability/restart consistency bug, not a process-crash bug.
+
+# Evidence
+crates/storage/src/control_plane_raft.rs (L4383 to 4390)
+  Note: BeforeReplayableRecord returns an error without publishing the candidate mutation, but also without poisoning the live WAL-backed store or repairing a possible partial WAL write.
+```
+            if let Err(error) = wal.append_record_for_log_store(record) {
+                match error {
+                    ControlPlaneRaftWalAppendError::BeforeReplayableRecord(error) => {
+                        return Err(control_plane_error_to_io_error(
+                            "append OpenRaft WAL record",
+                            error,
+                        ));
+                    }
+```
+
+crates/storage/src/control_plane_raft.rs (L4636 to 4647)
+  Note: Both write_all failures are classified as BeforeReplayableRecord, even though a partial length prefix or partial frame may already have been appended to the WAL.
+```
+        file.write_all(&frame_len.to_be_bytes())
+            .map_err(|source| ControlPlaneError::Io {
+                context: "write control-plane OpenRaft WAL frame length",
+                source,
+            })
+            .map_err(ControlPlaneRaftWalAppendError::BeforeReplayableRecord)?;
+        file.write_all(&frame)
+            .map_err(|source| ControlPlaneError::Io {
+                context: "write control-plane OpenRaft WAL frame",
+                source,
+            })
+            .map_err(ControlPlaneRaftWalAppendError::BeforeReplayableRecord)?;
+```
+
+crates/storage/src/control_plane_raft.rs (L4705 to 4738)
+  Note: Replay processes the WAL sequentially and truncates or errors at a torn/corrupt frame, so any later valid records appended after a partial failed write may be lost or made unreachable on restart.
+```
+        while offset < bytes.len() {
+            let record_start = offset;
+            let remaining = bytes.len() - offset;
+            if remaining < CONTROL_PLANE_RAFT_WAL_FILE_FRAME_LEN {
+                return Ok(ControlPlaneRaftWalFileRecords {
+                    records,
+                    clean_len: clean_len as u64,
+                    truncated_tail: true,
+                });
+            }
+            let frame_len = u32::from_be_bytes(
+                bytes[offset..offset + CONTROL_PLANE_RAFT_WAL_FILE_FRAME_LEN]
+                    .try_into()
+                    .expect("WAL frame length prefix has fixed width"),
+            ) as usize;
+            offset += CONTROL_PLANE_RAFT_WAL_FILE_FRAME_LEN;
+            if frame_len == 0 {
+                return Err(raft_artifact_protocol_error(
+                    "zero-length control-plane OpenRaft WAL frame",
+                ));
+            }
+            let Some(frame_end) = offset.checked_add(frame_len) else {
+                return Err(raft_artifact_protocol_error(
+                    "control-plane OpenRaft WAL frame length overflows usize",
+                ));
+            };
+            if frame_end > bytes.len() {
+                return Ok(ControlPlaneRaftWalFileRecords {
+                    records,
+                    clean_len: record_start as u64,
+                    truncated_tail: true,
+                });
+            }
+            let frame = ControlPlaneRaftWalFrame::decode_frame(&bytes[offset..frame_end])?;
+```
+
+# Attack-path analysis
+Final: ignore | Decider: model_decided | Matrix severity: ignore | Policy adjusted: ignore
+## Rationale
+Downgraded from medium to ignore for security triage. The underlying bug is validated and should be fixed as a durability issue, but probability × impact does not support a security finding: the affected WAL-backed log-store path is optional and not wired into the argmin-s3 durable control-plane process found in main.rs; experimental Raft is disabled by default; control-plane/Raft communication is internal Unix-socket based; and exploitation requires a local partial filesystem write fault rather than attacker-controlled network input. The demonstrated effect is restart inconsistency/state loss for the same service instance, not unauthorized access or compromise.
+## Likelihood
+ignore - No attacker-controlled remote or authenticated S3 input path to the affected WAL append behavior was found. Triggering requires an internal optional WAL-backed store plus a local filesystem partial-write fault, which is not an in-scope attacker capability under the supplied threat model.
+## Impact
+ignore - If the optional WAL-backed path is manually used, the impact can be control-plane durability loss or restart failure after a local partial filesystem write. That is operationally significant for reliability but does not by itself provide unauthorized access, code execution, privilege escalation, sensitive data disclosure, or cross-tenant tampering. The main product path in this checkout does not appear to use the WAL-backed mode.
+## Assumptions
+- Assessment is limited to repository artifacts in /workspace/argmin; no cloud APIs or runtime deployment inspection were used.
+- The project threat model treats the main externally relevant surface as the argmin-s3 HTTP S3-compatible service plus internal Unix-socket control-plane/storage coordination.
+- Host OS and filesystem permissions are trusted per the supplied threat model; unprivileged local filesystem tampering is not considered an in-scope attacker capability.
+- A caller must construct a WAL-backed ControlPlaneRaftLogStore via ControlPlaneRaftLogStore::from_restart_artifact_with_wal_file; current argmin-s3 process wiring did not show such use outside tests/library API.
+- The filesystem must accept a partial append and then return an error from write_all on the WAL length prefix or frame.
+- The same process must continue operating, later append valid WAL records after the torn bytes, and then restart/replay the WAL.
+## Path
+Local/internal Raft op -> partial WAL write fault -> non-poisoning BeforeReplayableRecord -> later records appended -> restart replay failure/state loss
+## Path evidence
+- `crates/storage/src/control_plane_raft.rs:4636-4647` - Both WAL length-prefix and frame write_all failures are mapped to BeforeReplayableRecord, even though write_all can fail after a partial append.
+- `crates/storage/src/control_plane_raft.rs:4382-4390` - apply_record returns on BeforeReplayableRecord without setting inner.poisoned and without truncating or repairing the WAL tail.
+- `crates/storage/src/control_plane_raft.rs:4705-4738` - Replay is sequential and stops/truncates/errors on torn or corrupt frames before later appended records can be applied.
+- `crates/storage/src/control_plane_raft.rs:4022-4032` - WAL-backed log-store construction is a distinct optional code path via from_restart_artifact_with_wal_file.
+- `crates/argmin-s3/src/main.rs:2207-2223` - The argmin-s3 experimental durable control-plane process constructs durable Raft authorities without passing a ControlPlaneRaftWalFile.
+- `crates/storage/src/control_plane_raft.rs:2840-2857` - Single-node durable Raft restore uses restore_experimental_raft_durable_artifact and a full restart artifact, not the WAL-backed restore path.
+- `crates/storage/src/control_plane_raft.rs:2873-2885` - Unix-peer durable Raft restore also uses restore_experimental_raft_durable_artifact rather than WAL-backed replay.
+- `crates/argmin-s3/src/config.rs:149-153` - Experimental Raft is explicitly environment-gated and defaults to false.
+- `crates/argmin-s3/src/config.rs:457-464` - Raft-specific configuration is rejected unless ARGMIN_CONTROL_PLANE_EXPERIMENTAL_RAFT is enabled.
+- `crates/argmin-s3/src/main.rs:2706-2727` - Control-plane Unix socket directories are required to be private and owned by the current uid, reducing external exposure of control-plane RPC.
+## Narrative
+The validation finding is technically correct: the WAL append path maps length-prefix and frame write_all failures to BeforeReplayableRecord, and apply_record handles that variant by returning an error without poisoning the store or repairing the WAL tail. Sequential replay can then stop or error at torn bytes before later valid records. Static attack-path review did not find this WAL-backed mode wired into the main argmin-s3 durable control-plane process; the product path uses full durable restart artifacts, and experimental Raft is disabled by default and internal/Unix-socket oriented. The issue is therefore best treated as a real reliability/durability bug, not a reachable security vulnerability under the provided threat model.
+## Controls
+- SigV4 authentication is used for S3 HTTP requests.
+- Experimental Raft control-plane mode is disabled by default.
+- Current argmin-s3 durable Raft wiring uses full restart artifacts rather than the optional WAL-backed log-store path.
+- Control-plane and Raft peer process communication uses Unix sockets with private directory validation.
+- HTTP server has max connection and max in-flight request admission controls and header/read timeouts.
+- Secrets are supplied by environment variables and debug formatting redacts configured secret wrapper values.
+## Blindspots
+- Static review cannot prove that downstream users of the storage crate do not instantiate ControlPlaneRaftWalFile themselves.
+- No deployment manifests were present, so exposure is inferred from code defaults rather than production infrastructure.
+- The validation PoC was accepted as prior evidence; this attack-path pass did not rerun tests.
+- Future commits may wire the WAL-backed mode into production configuration, which would change reachability and operational impact.
