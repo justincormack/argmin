@@ -2270,6 +2270,12 @@ pub struct ControlPlaneRaftAuthorityStatus {
     durable_wal_backed: bool,
     durable_wal_clean_len: Option<u64>,
     durable_wal_poisoned: Option<String>,
+    durable_last_vote: Option<VoteOf<ControlPlaneRaftTypeConfig>>,
+    durable_last_log_id: Option<LogIdOf<ControlPlaneRaftTypeConfig>>,
+    durable_last_purged_log_id: Option<LogIdOf<ControlPlaneRaftTypeConfig>>,
+    durable_committed: Option<LogIdOf<ControlPlaneRaftTypeConfig>>,
+    durable_applied: Option<LogIdOf<ControlPlaneRaftTypeConfig>>,
+    durable_timestamp_high_water_ms: Option<u64>,
     authority_incarnation: AuthorityIncarnation,
     current_cluster_epoch: ClusterEpoch,
     retained_history_count: usize,
@@ -2468,6 +2474,36 @@ impl ControlPlaneRaftAuthorityStatus {
     #[must_use]
     pub fn durable_wal_poisoned(&self) -> Option<&str> {
         self.durable_wal_poisoned.as_deref()
+    }
+
+    #[must_use]
+    pub fn durable_last_vote(&self) -> Option<VoteOf<ControlPlaneRaftTypeConfig>> {
+        self.durable_last_vote
+    }
+
+    #[must_use]
+    pub fn durable_last_log_id(&self) -> Option<LogIdOf<ControlPlaneRaftTypeConfig>> {
+        self.durable_last_log_id
+    }
+
+    #[must_use]
+    pub fn durable_last_purged_log_id(&self) -> Option<LogIdOf<ControlPlaneRaftTypeConfig>> {
+        self.durable_last_purged_log_id
+    }
+
+    #[must_use]
+    pub fn durable_committed(&self) -> Option<LogIdOf<ControlPlaneRaftTypeConfig>> {
+        self.durable_committed
+    }
+
+    #[must_use]
+    pub fn durable_applied(&self) -> Option<LogIdOf<ControlPlaneRaftTypeConfig>> {
+        self.durable_applied
+    }
+
+    #[must_use]
+    pub fn durable_timestamp_high_water_ms(&self) -> Option<u64> {
+        self.durable_timestamp_high_water_ms
     }
 
     #[must_use]
@@ -3426,10 +3462,18 @@ impl ControlPlaneRaftAuthority {
             .transpose()
             .map_err(|error| openraft_remote_error("status log-store read", error))?;
         let persisted_vote = log_store_status.as_ref().and_then(|status| status.vote);
+        let durable_last_vote = persisted_vote;
         let current_term = persisted_vote.map(|vote| vote.leader_id.term);
+        let durable_last_log_id = log_store_status
+            .as_ref()
+            .and_then(|status| status.last_log_id);
+        let durable_committed = log_store_status
+            .as_ref()
+            .and_then(|status| status.committed);
         let last_purged_log_id = log_store_status
             .as_ref()
             .and_then(|status| status.last_purged_log_id);
+        let durable_last_purged_log_id = last_purged_log_id;
         let durability_status = log_store_status.as_ref().map(|status| &status.durability);
         let durable_wal_backed = durability_status
             .as_ref()
@@ -3469,6 +3513,7 @@ impl ControlPlaneRaftAuthority {
         let (
             applied,
             current_snapshot,
+            durable_timestamp_high_water_ms,
             authority_incarnation,
             current_cluster_epoch,
             retained_history_count,
@@ -3510,6 +3555,7 @@ impl ControlPlaneRaftAuthority {
                     .current_snapshot()
                     .and_then(|snapshot| snapshot.meta.last_log_id);
                 let snapshot = state_machine.inner().snapshot();
+                let durable_timestamp_high_water_ms = snapshot.max_committed_timestamp_ms();
                 let authority_incarnation = snapshot.authority_incarnation();
                 let current_cluster_epoch = snapshot.cluster_epoch();
                 let retained_history_count = snapshot.cluster_map_history().len();
@@ -3611,6 +3657,7 @@ impl ControlPlaneRaftAuthority {
                     (
                         last_applied,
                         current_snapshot,
+                        durable_timestamp_high_water_ms,
                         authority_incarnation,
                         current_cluster_epoch,
                         retained_history_count,
@@ -3673,6 +3720,12 @@ impl ControlPlaneRaftAuthority {
             durable_wal_backed,
             durable_wal_clean_len,
             durable_wal_poisoned,
+            durable_last_vote,
+            durable_last_log_id,
+            durable_last_purged_log_id,
+            durable_committed,
+            durable_applied: applied,
+            durable_timestamp_high_water_ms,
             authority_incarnation,
             current_cluster_epoch,
             retained_history_count,
@@ -4124,6 +4177,8 @@ struct ControlPlaneRaftLogStoreDurabilityStatus {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ControlPlaneRaftLogStoreStatusSnapshot {
     vote: Option<VoteOf<ControlPlaneRaftTypeConfig>>,
+    committed: Option<LogIdOf<ControlPlaneRaftTypeConfig>>,
+    last_log_id: Option<LogIdOf<ControlPlaneRaftTypeConfig>>,
     last_purged_log_id: Option<LogIdOf<ControlPlaneRaftTypeConfig>>,
     durability: ControlPlaneRaftLogStoreDurabilityStatus,
 }
@@ -4181,13 +4236,15 @@ impl ControlPlaneRaftLogStore {
     }
 
     fn status_snapshot(&self) -> Result<ControlPlaneRaftLogStoreStatusSnapshot, io::Error> {
-        let (vote, last_purged_log_id, wal_backed, wal_poisoned) = {
+        let (vote, committed, last_log_id, last_purged_log_id, wal_backed, wal_poisoned) = {
             let inner = self
                 .inner
                 .lock()
                 .map_err(|_| io::Error::other("control-plane OpenRaft log store lock poisoned"))?;
             (
                 inner.vote,
+                inner.committed,
+                inner.last_log_id(),
                 inner.last_purged_log_id,
                 self.wal.is_some(),
                 inner.poisoned.clone(),
@@ -4204,6 +4261,8 @@ impl ControlPlaneRaftLogStore {
         };
         Ok(ControlPlaneRaftLogStoreStatusSnapshot {
             vote,
+            committed,
+            last_log_id,
             last_purged_log_id,
             durability: ControlPlaneRaftLogStoreDurabilityStatus {
                 wal_backed,
@@ -10631,6 +10690,12 @@ mod tests {
             durable_wal_backed: false,
             durable_wal_clean_len: None,
             durable_wal_poisoned: None,
+            durable_last_vote: None,
+            durable_last_log_id: None,
+            durable_last_purged_log_id: None,
+            durable_committed: None,
+            durable_applied: caught_up_log_id,
+            durable_timestamp_high_water_ms: None,
             authority_incarnation: AuthorityIncarnation::INITIAL,
             current_cluster_epoch: ClusterEpoch::INITIAL,
             retained_history_count: 0,
@@ -11558,18 +11623,33 @@ mod tests {
             assert!(initial_status.durable_wal_backed());
             assert_eq!(initial_status.durable_wal_clean_len(), Some(0));
             assert_eq!(initial_status.durable_wal_poisoned(), None);
+            assert_eq!(initial_status.durable_last_vote(), None);
+            assert_eq!(initial_status.durable_last_log_id(), None);
+            assert_eq!(initial_status.durable_last_purged_log_id(), None);
+            assert_eq!(initial_status.durable_committed(), None);
+            assert_eq!(initial_status.durable_applied(), None);
+            assert_eq!(initial_status.durable_timestamp_high_water_ms(), None);
 
             let mut shared_log_store = authority
                 .log_store
                 .as_ref()
                 .expect("authority should retain WAL-backed log store")
                 .clone();
-            RaftLogStorage::save_vote(
+            let vote = Vote::<ControlPlaneRaftLeaderId>::new(3, 1);
+            RaftLogStorage::save_vote(&mut shared_log_store, &vote)
+                .await
+                .unwrap();
+            let bootstrap_log_id = raft_log_id(0, 1, 0);
+            RaftLogStorage::append(
                 &mut shared_log_store,
-                &Vote::<ControlPlaneRaftLeaderId>::new(3, 1),
+                vec![bootstrap_membership_entry(1)],
+                IOFlushed::noop(),
             )
             .await
             .unwrap();
+            RaftLogStorage::save_committed(&mut shared_log_store, Some(bootstrap_log_id))
+                .await
+                .unwrap();
 
             let status = authority.status().await.unwrap();
             assert!(status.durable_wal_backed());
@@ -11578,6 +11658,12 @@ mod tests {
                 "WAL-backed authority status should report a positive clean WAL length after a durable mutation: {status:?}"
             );
             assert_eq!(status.durable_wal_poisoned(), None);
+            assert_eq!(status.durable_last_vote(), Some(vote));
+            assert_eq!(status.durable_last_log_id(), Some(bootstrap_log_id));
+            assert_eq!(status.durable_last_purged_log_id(), None);
+            assert_eq!(status.durable_committed(), Some(bootstrap_log_id));
+            assert_eq!(status.durable_applied(), None);
+            assert_eq!(status.durable_timestamp_high_water_ms(), None);
 
             *CONTROL_PLANE_RAFT_WAL_FAIL_NEXT_FILE_SYNC
                 .lock()
@@ -11602,6 +11688,13 @@ mod tests {
                     .is_some_and(|reason| reason.contains("ambiguous WAL append")),
                 "poisoned authority status should expose WAL poison reason: {poisoned_status:?}"
             );
+            assert_eq!(poisoned_status.durable_last_vote(), Some(vote));
+            assert_eq!(
+                poisoned_status.durable_last_log_id(),
+                Some(bootstrap_log_id)
+            );
+            assert_eq!(poisoned_status.durable_committed(), Some(bootstrap_log_id));
+            assert_eq!(poisoned_status.durable_applied(), None);
 
             authority.shutdown().await.unwrap();
         });
@@ -12948,6 +13041,12 @@ mod tests {
             assert_eq!(status.applied_index(), Some(rejected_log_id.index()));
             assert_eq!(status.current_snapshot(), None);
             assert_eq!(status.current_snapshot_index(), None);
+            assert_eq!(status.durable_last_vote(), Some(persisted_vote));
+            assert_eq!(status.durable_last_log_id(), Some(rejected_log_id));
+            assert_eq!(status.durable_last_purged_log_id(), None);
+            assert_eq!(status.durable_committed(), Some(rejected_log_id));
+            assert_eq!(status.durable_applied(), Some(rejected_log_id));
+            assert_eq!(status.durable_timestamp_high_water_ms(), Some(12_000));
             assert_eq!(status.committed_to_applied_index_gap(), Some(0));
             assert_eq!(status.last_log_to_committed_index_gap(), Some(0));
             assert!(status.applied_caught_up_to_committed());

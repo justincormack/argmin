@@ -10816,12 +10816,15 @@ Phase 12.4 progress:
   checkpoint-unchanged tests still read artifact-only state.
 - Started the replicated-authority durability observability slice. The
   OpenRaft authority status now reports whether its retained log store is
-  WAL-backed, the current clean WAL length while healthy, and any WAL poison
-  reason without requiring access to raw log-store internals. Tests cover both a
-  healthy WAL-backed authority and an authority with a poisoned WAL-backed store
-  so operators can distinguish "not WAL-backed", "healthy with clean bytes",
-  and "poisoned after an ambiguous durability failure" through the public status
-  surface.
+  WAL-backed, the current clean WAL length while healthy, any WAL poison reason,
+  the durable vote, retained last-log and purged log ids, durable committed log
+  id, current applied log id, and the replicated timestamp high-water without
+  requiring access to raw log-store internals. Tests cover both a healthy
+  WAL-backed authority and an authority with a poisoned WAL-backed store so
+  operators can distinguish "not WAL-backed", "healthy with clean bytes", and
+  "poisoned after an ambiguous durability failure" through the public status
+  surface, while a real applied-command status test pins the durable
+  vote/log/commit/applied/timestamp fields.
 
 1. define the replicated control-plane state machine:
    - state includes cluster epoch, PG count, PG state, PG acting sets, node
