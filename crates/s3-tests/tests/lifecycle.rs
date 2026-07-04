@@ -1233,6 +1233,47 @@ fn test_bucket_lifecycle_raw_get_returns_canonical_xml() {
 }
 
 #[test]
+fn test_bucket_lifecycle_raw_get_empty_filter_returns_canonical_xml() {
+    s3_tests::run(async {
+        let bucket = unique_bucket();
+        create_bucket_in_test_region(&bucket).await;
+
+        let body = br#"
+            <LifecycleConfiguration>
+                <Rule>
+                    <ID>whole-bucket</ID>
+                    <Filter/>
+                    <Status>Enabled</Status>
+                    <Expiration><Days>30</Days></Expiration>
+                </Rule>
+            </LifecycleConfiguration>
+        "#;
+
+        let parsed = s3_types::parse_lifecycle_configuration_xml(body)
+            .expect("test lifecycle XML should parse");
+        let expected = s3_types::render_lifecycle_configuration_xml(&parsed);
+
+        let url = format!("{}/{}?lifecycle", CTX.endpoint(), bucket);
+        let put = send_signed_request("PUT", &url, body, [content_md5_header(body)]);
+        assert_eq!(
+            put.status, 200,
+            "unexpected lifecycle PUT body: {}",
+            put.body
+        );
+
+        let get = send_signed_request("GET", &url, b"", std::iter::empty::<(String, String)>());
+        cleanup_bucket(&bucket).await;
+
+        assert_eq!(
+            get.status, 200,
+            "unexpected lifecycle GET body: {}",
+            get.body
+        );
+        assert_eq!(get.body, expected);
+    });
+}
+
+#[test]
 fn test_put_bucket_lifecycle_rejects_mixed_filter_and_legacy_prefix() {
     s3_tests::run(async {
         assert_invalid_lifecycle_put_rejected_with_message(

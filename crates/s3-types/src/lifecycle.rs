@@ -247,6 +247,13 @@ fn render_filter(xml: &mut String, filter: &LifecycleRuleFilter) {
         return;
     }
 
+    let has_concrete_predicate =
+        filter.prefix.is_some() || !filter.tags.is_empty() || filter.has_size_filter();
+    if !has_concrete_predicate {
+        xml.push_str("<Filter/>");
+        return;
+    }
+
     xml.push_str("<Filter>");
     let simple_prefix_only =
         filter.prefix.is_some() && filter.tags.is_empty() && !filter.has_size_filter();
@@ -261,9 +268,7 @@ fn render_filter(xml: &mut String, filter: &LifecycleRuleFilter) {
         && filter.object_size_greater_than.is_none()
         && filter.object_size_less_than.is_some();
 
-    if !filter.has_scope() || filter.explicit_filter && !filter.has_scope() {
-        // Empty Filter applies to the whole bucket.
-    } else if simple_prefix_only {
+    if simple_prefix_only {
         xml.push_str("<Prefix>");
         xml.push_str(&xml_escape(filter.prefix.as_deref().unwrap_or("")));
         xml.push_str("</Prefix>");
@@ -1286,6 +1291,10 @@ mod tests {
         assert!(config.rules[0].filter.explicit_filter);
         assert!(config.rules[0].filter.prefix.is_none());
         assert!(config.rules[0].filter.tags.is_empty());
+        assert_eq!(
+            render_lifecycle_configuration_xml(&config),
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<LifecycleConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Rule><Filter/><Status>Enabled</Status><Expiration><ExpiredObjectDeleteMarker>true</ExpiredObjectDeleteMarker></Expiration></Rule></LifecycleConfiguration>"
+        );
     }
 
     #[test]

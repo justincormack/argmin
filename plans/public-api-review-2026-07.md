@@ -297,7 +297,7 @@ steps it performs.
   public write callers convert `If-Match` with no existing object to
   `ObjectNotFound` before calling it.
 
-- [ ] **H3. Lifecycle `render_filter` dead guard: empty `<Filter/>` renders
+- [x] **H3. Lifecycle `render_filter` dead guard: empty `<Filter/>` renders
   as `<Filter><And></And></Filter>`.** `crates/s3-types/src/lifecycle.rs:264`
   — the condition `!filter.has_scope() || filter.explicit_filter &&
   !filter.has_scope()` is provably always false at that point (has_scope()
@@ -305,11 +305,12 @@ steps it performs.
   when explicit_filter || tags || size-filter holds). Since PutBucketLifecycle
   stores the rendered canonical XML (`server-http/src/http/mod.rs:2231`), a
   client PUTting `<Filter/>` gets the non-canonical `<And></And>` form back
-  from GetBucketLifecycleConfiguration — a form AWS never emits. Round-trip
-  tests only cover the legacy-Prefix path. Fix: replace the condition with a
-  check for absence of concrete predicates
-  (`prefix.is_none() && tags.is_empty() && !has_size_filter()`); add a
-  round-trip test for empty explicit filters.
+  from GetBucketLifecycleConfiguration — a form AWS never emits. Added
+  `test_bucket_lifecycle_raw_get_empty_filter_returns_canonical_xml` and
+  verified against AWS that the canonical response preserves the self-closing
+  `<Filter/>` shape. Fixed `render_filter` to check for absence of concrete
+  predicates (`prefix.is_none() && tags.is_empty() && !has_size_filter()`) and
+  emit `<Filter/>`; added local renderer coverage in `s3-types`.
 
 - [ ] **H4. `NewerNoncurrentVersions` validation predicate contradicts its
   error message.** `lifecycle.rs:413-417` — message says "requires an explicit
