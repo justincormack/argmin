@@ -21,6 +21,10 @@ It also moves the former Phase 11 Slice 2 trigger-SQL-body work here: stale trig
 definitions are an upgrade correctness problem, not a current stabilisation task, because
 there should not be any supported legacy triggers yet.
 
+Topology resize is tracked separately in `storage-topology-resize-plan.md`. Some durable
+format/version decisions will be prerequisites for resize, but resize also changes live
+placement semantics and needs its own topology-generation design.
+
 ## Current Policy
 
 - No migration compatibility is required for existing deployments.
@@ -207,6 +211,9 @@ Requirements and open questions:
 - How are feature gates represented in the control plane?
 - Can metadata PG schema upgrades happen independently per PG, or must the whole cluster be
   quiesced?
+- How does rolling binary upgrade interact with topology resize? See
+  `storage-topology-resize-plan.md`; a cluster should not run resize operations across
+  binaries that disagree on placement-generation semantics.
 - What is the rollback story after a node has written a newer format?
 
 Until these are answered, do not add rolling-upgrade compatibility code.

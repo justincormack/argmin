@@ -201,10 +201,16 @@ steps it performs.
 - [ ] **S5. MPU-cleanup resume cursor is a positional index, not a PG id.**
   `delete_completed_multipart_uploads_for_bucket`
   (`cluster/request_ops.rs:~5953`, commit 69470e83) persists `next_pg_index`
-  into the call-time-sorted `metadata_pg_ids()`. If the metadata PG set
-  changes between crash and resume, the index silently re-targets different
-  PGs, skipping cleanup on some. Fix: persist the last-completed `PgId` and
-  resume from `> pg_id`.
+  into the call-time-sorted `metadata_pg_ids()`. The current implementation
+  sorts the PG list and has sparse-PG regression coverage, so this is not a
+  current bug while the configured PG set is fixed for the cluster lifetime.
+  It is a real topology-resize hazard: if the metadata PG set changes between
+  crash and resume, the index silently re-targets different PGs, skipping
+  cleanup on some. Track this under
+  `plans/storage-topology-resize-plan.md` H5. A resize-safe fix should persist
+  a semantic cursor such as last-completed `PgId` plus topology generation, or
+  make the cleanup phase generation-scoped and restartable from zero when the
+  PG set changes.
 
 ## Bugs — checksum handling (cross-crate)
 
