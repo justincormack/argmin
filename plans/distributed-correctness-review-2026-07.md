@@ -88,9 +88,11 @@ time.
   is silently rolled back and L's copy truncated on rejoin.
 - Single-node mode is not affected: submit → outcome → checkpoint → respond
   ordering is correct there (see R-OK1).
-- Regression coverage now includes a peer RPC checkpoint-failure case that
-  verifies no response frame is written before durability succeeds, plus the
-  existing real-process replication/failover smokes.
+- Regression coverage now includes peer RPC checkpoint-failure and checkpoint
+  pause cases. The pause coverage proves a vote can be volatile while the
+  response is still blocked, proves no response frame is written before the
+  durable artifact contains that vote, and proves a poison flip before ack
+  still suppresses the response.
 
 Follow-up: the fix uses a full restart-artifact checkpoint before each peer
 response. That is safe but expensive. A small fsync'd vote/log WAL remains the
@@ -376,12 +378,14 @@ shift.
    `RecordNodeHeartbeat` also rejects per-node lease-deadline regression.
    These guards are pure functions of committed state, so deterministic replay
    is preserved.
-5. **Fault-injection tests for the ack→checkpoint window (R1).**
-   Deterministic pause hook between response write and checkpoint + SIGKILL;
-   assert refusal to double-vote and acked-state survival. The local "state
-   previously existed" tripwire from R7 is now in place via the durable
-   sidecar sentinel; peer authority-incarnation cross-checking remains deferred
-   to the later production rejoin/membership slice.
+5. **DONE — Fault-injection tests for the peer ack durability window (R1).**
+   Deterministic checkpoint-pause coverage now asserts that a peer vote can be
+   volatile while the client remains unacknowledged, that no response is
+   released until the durable artifact contains the vote, and that poison before
+   ack writes no response. The local "state previously existed" tripwire from
+   R7 is also in place via the durable sidecar sentinel; peer
+   authority-incarnation cross-checking remains deferred to the later production
+   rejoin/membership slice.
 6. **DONE — Cover the fresh-follower snapshot path (R5).** Leader purges,
    brand-new empty peer joins via `install_full_snapshot`; `purge()` now
    establishes the committed gate only for the fresh empty-log snapshot-install

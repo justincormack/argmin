@@ -718,13 +718,18 @@ fn experimental_raft_transferred_process_leader_survives_old_leader_loss() {
         process_logs(test_dir.path())
     );
 
-    let new_leader_socket = control_socket(test_dir.path(), 102);
-    wait_for_runtime_map_ready_on(
+    let surviving_node_ids = [102, 103];
+    let (new_leader_socket, _output) = wait_for_runtime_map_ready(
         &bin,
-        &new_leader_socket,
         test_dir.path(),
         &mut [&mut node101, &mut node102, &mut node103],
+        &surviving_node_ids,
     );
+    let new_leader_id = if new_leader_socket == control_socket(test_dir.path(), 102) {
+        102
+    } else {
+        103
+    };
 
     node101.stop();
     let output = run_set_pg_acting_set_live(&bin, &new_leader_socket, 0, &[1]);
@@ -734,8 +739,9 @@ fn experimental_raft_transferred_process_leader_survives_old_leader_loss() {
         format_admin_failure(output.status, &output),
         process_logs(test_dir.path())
     );
+    let follower_id = if new_leader_id == 102 { 103 } else { 102 };
     wait_for_follower_artifact_pg_acting_set(
-        &state_path(test_dir.path(), 103),
+        &state_path(test_dir.path(), follower_id),
         PgId::new(0),
         &[NodeId::new(1)],
         &mut [&mut node102, &mut node103],

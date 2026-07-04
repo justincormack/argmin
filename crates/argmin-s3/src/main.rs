@@ -3434,6 +3434,40 @@ mod tests {
         ControlPlaneRaftLeaderId, ControlPlaneRaftPeerFrameIdentity, ControlPlaneRaftPeerRpcRequest,
     };
 
+    fn durable_raft_artifact_vote(path: &Path) -> Option<Vote<ControlPlaneRaftLeaderId>> {
+        let artifact =
+            storage::control_plane_raft::ControlPlaneRaftRestartArtifact::load_durable_artifact(
+                path,
+            )
+            .ok()?;
+        let (log_store, _state_machine) = artifact.restore().ok()?;
+        log_store.persisted_vote().ok().flatten()
+    }
+
+    fn wait_for_experimental_raft_vote(
+        runtime: &Handle,
+        authority: &ControlPlaneRaftAuthority,
+        expected_vote: Vote<ControlPlaneRaftLeaderId>,
+        message: &'static str,
+    ) {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            let status = runtime
+                .block_on(authority.status())
+                .expect("experimental OpenRaft authority status should read");
+            if status.persisted_vote() == Some(expected_vote) {
+                return;
+            }
+            if Instant::now() >= deadline {
+                panic!(
+                    "{message}: expected vote {expected_vote:?}, got {:?}",
+                    status.persisted_vote()
+                );
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
     fn short_unix_socket_test_dir(name: &str) -> PathBuf {
         Path::new("/tmp").join(format!("as3-{}-{name}", std::process::id()))
     }
@@ -3529,6 +3563,43 @@ mod tests {
                 .await
                 .expect("single-node raft should become leader");
             Arc::new(authority)
+        });
+        let control_plane = ExperimentalRaftControlPlane {
+            runtime: handle,
+            authority: Arc::clone(&authority),
+            durable_artifact_path: None,
+            durable_checkpoint_lock: None,
+            durable_serving_checkpoint: Mutex::new(None),
+            checkpoint_serving_reads: false,
+            resample_authority_time: false,
+            durable_poison: None,
+            durable_poison_gate: Arc::new(AtomicBool::new(false)),
+        };
+        ExperimentalRaftTestHarness {
+            runtime,
+            authority,
+            control_plane,
+        }
+    }
+
+    fn experimental_raft_uninitialized_test_harness(name: &str) -> ExperimentalRaftTestHarness {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime should build");
+        let handle = runtime.handle().clone();
+        let authority = runtime.block_on(async {
+            Arc::new(
+                ControlPlaneRaftAuthority::new_experimental_single_node_in_memory(
+                    format!(
+                        "argmin-s3-experimental-raft-uninitialized-{name}-{}",
+                        std::process::id()
+                    ),
+                    1,
+                )
+                .await
+                .expect("experimental raft authority should initialize"),
+            )
         });
         let control_plane = ExperimentalRaftControlPlane {
             runtime: handle,
@@ -4421,6 +4492,7 @@ mod tests {
         let authority = Arc::clone(&harness.authority);
         let worker_lock = Arc::clone(&checkpoint_lock);
         let worker_poison_gate = Arc::clone(&poison_gate);
+        let worker_state_path = state_path.clone();
         let worker = thread::spawn(move || {
             handle_experimental_raft_peer_rpc_before_ack(
                 &runtime_handle,
@@ -4429,7 +4501,7 @@ mod tests {
                 1,
                 &policy,
                 ExperimentalRaftPeerRpcDurability {
-                    artifact_path: Some(&state_path),
+                    artifact_path: Some(&worker_state_path),
                     checkpoint_lock: Some(&worker_lock),
                     poison_gate: Some(worker_poison_gate.as_ref()),
                 },
@@ -4462,6 +4534,210 @@ mod tests {
         assert!(
             response.is_err(),
             "peer RPC must not acknowledge after durable poison flips"
+        );
+
+        harness.shutdown();
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[test]
+    fn experimental_raft_peer_vote_response_waits_until_vote_is_durable() {
+        let harness = experimental_raft_uninitialized_test_harness("peer-vote-durable-before-ack");
+        let cluster_name = format!(
+            "argmin-s3-experimental-raft-peer-vote-durable-before-ack-{}",
+            std::process::id()
+        );
+        let policy = ControlPlaneRaftPeerTransportPolicy::from_peer_endpoints(
+            cluster_name.clone(),
+            [(1, "node-1".to_string())],
+            ControlPlaneRaftPeerTransportLimits::default(),
+        );
+        let identity = ControlPlaneRaftPeerFrameIdentity::new(cluster_name, 1, 1);
+        let expected_vote = Vote::<ControlPlaneRaftLeaderId>::new(3, 1);
+        let request = ControlPlaneRaftPeerRpcRequest::Vote(VoteRequest {
+            vote: expected_vote,
+            last_log_id: None,
+            leadership_transfer: false,
+        });
+        let request_frame = request
+            .encode_frame_for_peer(&identity)
+            .expect("peer request should encode");
+        let (mut client_stream, mut server_stream) =
+            UnixStream::pair().expect("test UnixStream pair should create");
+        write_control_plane_raft_peer_transport_frame(&mut client_stream, &request_frame)
+            .expect("client should write request frame");
+        client_stream
+            .set_read_timeout(Some(Duration::from_millis(50)))
+            .expect("client stream read timeout should set");
+
+        let state_dir = short_unix_socket_test_dir("experimental-raft-peer-vote-durable");
+        let _ = fs::remove_dir_all(&state_dir);
+        fs::create_dir_all(&state_dir).expect("checkpoint directory should exist");
+        let state_path = state_dir.join("control-plane.state");
+        let checkpoint_lock = Arc::new(Mutex::new(()));
+        let checkpoint_guard = checkpoint_lock
+            .lock()
+            .expect("checkpoint lock should acquire");
+        let runtime_handle = harness.runtime.handle().clone();
+        let authority = Arc::clone(&harness.authority);
+        let worker_lock = Arc::clone(&checkpoint_lock);
+        let worker_state_path = state_path.clone();
+        let worker = thread::spawn(move || {
+            handle_experimental_raft_peer_rpc_before_ack(
+                &runtime_handle,
+                &authority,
+                &mut server_stream,
+                1,
+                &policy,
+                ExperimentalRaftPeerRpcDurability {
+                    artifact_path: Some(&worker_state_path),
+                    checkpoint_lock: Some(&worker_lock),
+                    poison_gate: None,
+                },
+            )
+        });
+
+        let blocked_response = read_control_plane_raft_peer_transport_frame(
+            &mut client_stream,
+            ControlPlaneRaftPeerTransportLimits::DEFAULT_MAX_FRAME_BYTES,
+        );
+        assert!(
+            blocked_response.is_err(),
+            "peer vote RPC must not respond before durable checkpoint completes"
+        );
+        wait_for_experimental_raft_vote(
+            harness.runtime.handle(),
+            &harness.authority,
+            expected_vote,
+            "peer vote should be volatile before checkpoint lock release",
+        );
+        assert_eq!(
+            durable_raft_artifact_vote(&state_path),
+            None,
+            "checkpoint lock should keep the volatile peer vote out of the artifact"
+        );
+
+        drop(checkpoint_guard);
+        let result = worker.join().expect("peer RPC worker should not panic");
+        assert!(
+            result.is_ok(),
+            "peer vote RPC should complete after checkpoint lock release: {result:?}"
+        );
+        assert_eq!(
+            durable_raft_artifact_vote(&state_path),
+            Some(expected_vote),
+            "peer response is released only after the durable artifact contains the vote"
+        );
+
+        client_stream
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .expect("client stream read timeout should update");
+        read_control_plane_raft_peer_transport_frame(
+            &mut client_stream,
+            ControlPlaneRaftPeerTransportLimits::DEFAULT_MAX_FRAME_BYTES,
+        )
+        .expect("peer vote RPC should respond after durable checkpoint completes");
+
+        harness.shutdown();
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[test]
+    fn experimental_raft_peer_vote_poison_before_ack_writes_no_response_after_checkpoint() {
+        let harness = experimental_raft_uninitialized_test_harness("peer-vote-poison-before-ack");
+        let cluster_name = format!(
+            "argmin-s3-experimental-raft-peer-vote-poison-before-ack-{}",
+            std::process::id()
+        );
+        let policy = ControlPlaneRaftPeerTransportPolicy::from_peer_endpoints(
+            cluster_name.clone(),
+            [(1, "node-1".to_string())],
+            ControlPlaneRaftPeerTransportLimits::default(),
+        );
+        let identity = ControlPlaneRaftPeerFrameIdentity::new(cluster_name, 1, 1);
+        let expected_vote = Vote::<ControlPlaneRaftLeaderId>::new(3, 1);
+        let request = ControlPlaneRaftPeerRpcRequest::Vote(VoteRequest {
+            vote: expected_vote,
+            last_log_id: None,
+            leadership_transfer: false,
+        });
+        let request_frame = request
+            .encode_frame_for_peer(&identity)
+            .expect("peer request should encode");
+        let (mut client_stream, mut server_stream) =
+            UnixStream::pair().expect("test UnixStream pair should create");
+        write_control_plane_raft_peer_transport_frame(&mut client_stream, &request_frame)
+            .expect("client should write request frame");
+        client_stream
+            .set_read_timeout(Some(Duration::from_millis(50)))
+            .expect("client stream read timeout should set");
+
+        let state_dir = short_unix_socket_test_dir("experimental-raft-peer-vote-poison");
+        let _ = fs::remove_dir_all(&state_dir);
+        fs::create_dir_all(&state_dir).expect("checkpoint directory should exist");
+        let state_path = state_dir.join("control-plane.state");
+        let checkpoint_lock = Arc::new(Mutex::new(()));
+        let checkpoint_guard = checkpoint_lock
+            .lock()
+            .expect("checkpoint lock should acquire");
+        let poison_gate = Arc::new(AtomicBool::new(false));
+        let runtime_handle = harness.runtime.handle().clone();
+        let authority = Arc::clone(&harness.authority);
+        let worker_lock = Arc::clone(&checkpoint_lock);
+        let worker_poison_gate = Arc::clone(&poison_gate);
+        let worker_state_path = state_path.clone();
+        let worker = thread::spawn(move || {
+            handle_experimental_raft_peer_rpc_before_ack(
+                &runtime_handle,
+                &authority,
+                &mut server_stream,
+                1,
+                &policy,
+                ExperimentalRaftPeerRpcDurability {
+                    artifact_path: Some(&worker_state_path),
+                    checkpoint_lock: Some(&worker_lock),
+                    poison_gate: Some(worker_poison_gate.as_ref()),
+                },
+            )
+        });
+
+        let blocked_response = read_control_plane_raft_peer_transport_frame(
+            &mut client_stream,
+            ControlPlaneRaftPeerTransportLimits::DEFAULT_MAX_FRAME_BYTES,
+        );
+        assert!(
+            blocked_response.is_err(),
+            "peer vote RPC must not respond before durable checkpoint completes"
+        );
+        wait_for_experimental_raft_vote(
+            harness.runtime.handle(),
+            &harness.authority,
+            expected_vote,
+            "peer vote should be volatile before checkpoint lock release",
+        );
+        poison_gate.store(true, Ordering::Release);
+        drop(checkpoint_guard);
+        let result = worker.join().expect("peer RPC worker should not panic");
+        assert!(
+            matches!(result, Err(ExperimentalRaftPeerRpcWorkerError::PeerRpc(_))),
+            "peer vote RPC should fail closed after poison flips before ack: {result:?}"
+        );
+        assert_eq!(
+            durable_raft_artifact_vote(&state_path),
+            Some(expected_vote),
+            "poison before ack still leaves the volatile vote durably checkpointed"
+        );
+
+        client_stream
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .expect("client stream read timeout should update");
+        let response = read_control_plane_raft_peer_transport_frame(
+            &mut client_stream,
+            ControlPlaneRaftPeerTransportLimits::DEFAULT_MAX_FRAME_BYTES,
+        );
+        assert!(
+            response.is_err(),
+            "poisoned peer vote RPC must not acknowledge after checkpoint"
         );
 
         harness.shutdown();
@@ -4508,6 +4784,7 @@ mod tests {
         let runtime_handle = harness.runtime.handle().clone();
         let authority = Arc::clone(&harness.authority);
         let worker_lock = Arc::clone(&checkpoint_lock);
+        let worker_state_path = state_path.clone();
         let worker = thread::spawn(move || {
             handle_experimental_raft_peer_rpc_before_ack(
                 &runtime_handle,
@@ -4516,7 +4793,7 @@ mod tests {
                 1,
                 &policy,
                 ExperimentalRaftPeerRpcDurability {
-                    artifact_path: Some(&state_path),
+                    artifact_path: Some(&worker_state_path),
                     checkpoint_lock: Some(&worker_lock),
                     poison_gate: None,
                 },

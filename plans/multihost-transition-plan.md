@@ -10593,9 +10593,11 @@ Phase 12.3 progress:
   experimental process boundary. Unix peer workers now read and handle the
   peer request, checkpoint the durable restart artifact, and only then write
   the response frame; checkpoint failure exits before acknowledging volatile
-  vote/log/snapshot state. A regression exercises a peer RPC whose checkpoint
-  target fails and verifies no response frame is written. The longer-term WAL
-  design remains open as a cost/performance replacement for full
+  vote/log/snapshot state. Regressions exercise a peer RPC whose checkpoint
+  target fails, a checkpoint-pause window where the vote is volatile but still
+  unacknowledged, the durable artifact gaining that vote before the response is
+  released, and a poison-before-ack path that writes no response. The
+  longer-term WAL design remains open as a cost/performance replacement for full
   artifact-per-peer-RPC checkpoints.
 - Closed the cheap R4 stale-time guard for Phase 12.3 process paths. The
   single-authority and experimental Raft control-plane loops now sample
