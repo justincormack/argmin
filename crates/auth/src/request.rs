@@ -10,7 +10,9 @@ use crate::canonical::{
 };
 use crate::credential::{parse_credential_scope_ref, CredentialStore};
 use crate::error::AuthError;
-use crate::sigv4::{derive_signing_key, parse_auth_header, verify_request_record};
+use crate::sigv4::{
+    derive_signing_key, parse_auth_header, unsigned_required_headers, verify_request_record,
+};
 use crate::{
     MAX_AUTHORIZATION_HEADER_LEN, MAX_PRESIGNED_QUERY_LEN, MAX_SESSION_TOKEN_LEN,
     MAX_SIGNED_HEADERS_LEN, MAX_SIGNED_HEADER_COUNT,
@@ -450,24 +452,21 @@ fn authenticate_presigned<H: HeaderSource + ?Sized>(
     // AWS treats malformed-looking presigned signature values as a signature
     // mismatch rather than rejecting them at query parsing time.
 
+    let unsigned_headers = presigned_unsigned_required_headers(&signed_headers, headers);
+    if !unsigned_headers.is_empty() {
+        return Err(AuthError::UnsignedHeaders {
+            headers: unsigned_headers,
+        });
+    }
+
     let record = store
         .get_record(credential.access_key_id)
         .ok_or(AuthError::UnknownAccessKey)?;
     if !record.enabled {
         return Err(AuthError::UnknownAccessKey);
     }
-    let token = query_param_lossy(query_string, "X-Amz-Security-Token").or_else(|| {
-        headers
-            .first_value("x-amz-security-token")
-            .map(Cow::Borrowed)
-    });
+    let token = query_param_lossy(query_string, "X-Amz-Security-Token");
     validate_record_token_and_expiry(record, token.as_deref(), now_epoch_secs)?;
-
-    if headers.first_value("host").is_some() && !signed_headers.contains(&"host") {
-        return Err(AuthError::UnsignedHeaders {
-            headers: vec!["host".to_string()],
-        });
-    }
 
     let signed_header_pairs = collect_signed_headers(&signed_headers, headers)?;
     let canonical_hdrs = canonical_headers(&signed_header_pairs);
@@ -520,6 +519,19 @@ fn authenticate_presigned<H: HeaderSource + ?Sized>(
         signing_region: Some(credential.region.to_owned()),
         streaming: None,
     })
+}
+
+fn presigned_unsigned_required_headers<H, S>(signed_headers: &[S], headers: &H) -> Vec<String>
+where
+    H: HeaderSource + ?Sized,
+    S: AsRef<str>,
+{
+    let mut unsigned_headers = unsigned_required_headers(signed_headers, headers);
+    // AWS treats an unsigned x-amz-content-sha256 on presigned URLs as part of
+    // signature verification, producing SignatureDoesNotMatch rather than
+    // HeadersNotSigned. Other unsigned x-amz-* headers are rejected directly.
+    unsigned_headers.retain(|header| header != "x-amz-content-sha256");
+    unsigned_headers
 }
 
 fn collect_signed_headers<'a, H, S>(
@@ -2084,6 +2096,78 @@ mod tests {
             err,
             AuthError::UnsignedHeaders { headers } if headers == ["host"]
         ));
+    }
+
+    #[test]
+    fn presigned_unsigned_amz_header_rejected() {
+        let store = example_store();
+        let query = "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIAIOSFODNN7EXAMPLE%2F20240201%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Date=20240201T120000Z&X-Amz-Expires=900&X-Amz-SignedHeaders=host&X-Amz-Signature=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let headers = [("host", "example.com"), ("x-amz-meta-unsigned", "value")];
+        let err = authenticate_request(
+            "GET",
+            "/",
+            query,
+            &headers,
+            b"",
+            &store,
+            Some("us-east-1"),
+            "s3",
+            0,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            AuthError::UnsignedHeaders { headers } if headers == ["x-amz-meta-unsigned"]
+        ));
+    }
+
+    #[test]
+    fn presigned_unsigned_security_token_header_rejected() {
+        let store = example_store();
+        let query = "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIAIOSFODNN7EXAMPLE%2F20240201%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Date=20240201T120000Z&X-Amz-Expires=900&X-Amz-SignedHeaders=host&X-Amz-Signature=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let headers = [("host", "example.com"), ("x-amz-security-token", "token")];
+        let err = authenticate_request(
+            "GET",
+            "/",
+            query,
+            &headers,
+            b"",
+            &store,
+            Some("us-east-1"),
+            "s3",
+            0,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            AuthError::UnsignedHeaders { headers } if headers == ["x-amz-security-token"]
+        ));
+    }
+
+    #[test]
+    fn presigned_unsigned_content_sha256_is_signature_mismatch() {
+        let store = example_store();
+        let query = "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIAIOSFODNN7EXAMPLE%2F20240201%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Date=20240201T120000Z&X-Amz-Expires=900&X-Amz-SignedHeaders=host&X-Amz-Signature=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let headers = [
+            ("host", "example.com"),
+            (
+                "x-amz-content-sha256",
+                "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            ),
+        ];
+        let err = authenticate_request(
+            "GET",
+            "/",
+            query,
+            &headers,
+            b"",
+            &store,
+            Some("us-east-1"),
+            "s3",
+            0,
+        )
+        .unwrap_err();
+        assert!(matches!(err, AuthError::SignatureMismatch));
     }
 
     #[test]

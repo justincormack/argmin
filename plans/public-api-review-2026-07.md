@@ -35,7 +35,7 @@ The three SigV4 entry points (header / presigned / POST) have drifted; each
 gap is a hole. The header path is the most complete; the other two are missing
 steps it performs.
 
-- [ ] **A1. Presigned path does not reject unsigned `x-amz-*` headers.**
+- [x] **A1. Presigned path does not reject unsigned `x-amz-*` headers.**
   Header path enforces via `unsigned_required_headers()`
   (`crates/auth/src/sigv4.rs:101-125`) that `host` and every `x-amz-*` header
   present are signed. `authenticate_presigned`
@@ -48,6 +48,11 @@ steps it performs.
   `unsigned_required_headers` in `authenticate_presigned`; accept the session
   token only from the (signed) query parameter. Mirror test
   `verify_request_unsigned_amz_header` (sigv4.rs:717) for the presigned path.
+  Completed with AWS oracle coverage for unsigned `x-amz-meta-*`,
+  `x-amz-acl`, and `x-amz-security-token` presigned requests. AWS returns
+  `HeadersNotSigned` for those, but returns `SignatureDoesNotMatch` for an
+  unsigned `x-amz-content-sha256` header, so the implementation preserves that
+  presigned-specific exception.
 
 - [ ] **A2. POST SigV4 skips credential-expiry and session-token validation
   entirely.** `authenticate_post_sigv4` (`crates/auth/src/post.rs:56-124`)

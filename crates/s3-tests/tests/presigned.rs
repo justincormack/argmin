@@ -279,6 +279,110 @@ fn test_header_sigv4_unsigned_amz_header_reports_headers_not_signed() {
 }
 
 #[test]
+fn test_presigned_sigv4_unsigned_amz_header_reports_headers_not_signed() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+        let body = b"presigned sigv4 unsigned amz header";
+
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key("unsigned-amz-presigned-auth")
+            .body(ByteStream::from_static(body))
+            .send()
+            .await
+            .unwrap();
+
+        let presigned = presign_object(
+            "GET",
+            &bucket,
+            "unsigned-amz-presigned-auth",
+            None,
+            Duration::from_secs(900),
+            NO_HEADERS,
+            None,
+        );
+
+        let mut response = with_presigned_headers!(agent().get(presigned.uri()), presigned)
+            .header("x-amz-meta-unsigned", "value")
+            .call()
+            .expect("transport error");
+        let status = response.status().as_u16();
+        let body = response.body_mut().read_to_string().unwrap_or_default();
+        assert_headers_not_signed_error(status, &body, "x-amz-meta-unsigned");
+
+        cleanup(&bucket, &["unsigned-amz-presigned-auth"]).await;
+    });
+}
+
+#[test]
+fn test_presigned_sigv4_unsigned_security_token_reports_headers_not_signed() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+        let body = b"presigned sigv4 unsigned security token";
+
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key("unsigned-token-presigned-auth")
+            .body(ByteStream::from_static(body))
+            .send()
+            .await
+            .unwrap();
+
+        let presigned = presign_object(
+            "GET",
+            &bucket,
+            "unsigned-token-presigned-auth",
+            None,
+            Duration::from_secs(900),
+            NO_HEADERS,
+            None,
+        );
+
+        let mut response = with_presigned_headers!(agent().get(presigned.uri()), presigned)
+            .header("x-amz-security-token", "unsigned-token")
+            .call()
+            .expect("transport error");
+        let status = response.status().as_u16();
+        let body = response.body_mut().read_to_string().unwrap_or_default();
+        assert_headers_not_signed_error(status, &body, "x-amz-security-token");
+
+        cleanup(&bucket, &["unsigned-token-presigned-auth"]).await;
+    });
+}
+
+#[test]
+fn test_presigned_sigv4_unsigned_acl_header_reports_headers_not_signed() {
+    s3_tests::run(async {
+        let bucket = setup_bucket().await;
+        let body = b"presigned sigv4 unsigned acl header";
+
+        let presigned = presign_object(
+            "PUT",
+            &bucket,
+            "unsigned-acl-presigned-auth",
+            None,
+            Duration::from_secs(900),
+            NO_HEADERS,
+            None,
+        );
+
+        let mut response = with_presigned_headers!(agent().put(presigned.uri()), presigned)
+            .header("x-amz-acl", "private")
+            .send(&body[..])
+            .expect("transport error");
+        let status = response.status().as_u16();
+        let body = response.body_mut().read_to_string().unwrap_or_default();
+        assert_headers_not_signed_error(status, &body, "x-amz-acl");
+
+        cleanup(&bucket, &["unsigned-acl-presigned-auth"]).await;
+    });
+}
+
+#[test]
 fn test_presigned_sigv4_unsigned_amz_content_sha256_mismatches_signature() {
     s3_tests::run(async {
         let client = CTX.client();
