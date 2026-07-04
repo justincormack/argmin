@@ -318,6 +318,9 @@ fn client_error_message(err: &ServerError) -> String {
             "head on delete marker version not allowed".to_string()
         }
         ServerError::InvalidRange { .. } => "invalid range".to_string(),
+        ServerError::InvalidPartNumber { .. } => {
+            "The requested partnumber is not satisfiable".to_string()
+        }
         ServerError::PreconditionFailed => "precondition failed".to_string(),
         ServerError::NotModified { .. } => "not modified".to_string(),
         ServerError::SlowDown => "Please reduce your request rate.".to_string(),
@@ -764,6 +767,22 @@ impl S3Response {
                     host_id,
                 );
                 Self::new(400).chunked_xml_body(body)
+            }
+            ServerError::InvalidRange { total_size } => {
+                let body = xml::invalid_range_error_xml(*total_size, request_id, host_id);
+                Self::new(416).chunked_xml_body(body)
+            }
+            ServerError::InvalidPartNumber {
+                part_number,
+                parts_count,
+            } => {
+                let body = xml::invalid_part_number_error_xml(
+                    *part_number,
+                    *parts_count,
+                    request_id,
+                    host_id,
+                );
+                Self::new(416).chunked_xml_body(body)
             }
             ServerError::Auth(auth::AuthError::InvalidQueryCredentialRegion {
                 expected_region,
@@ -1381,25 +1400,32 @@ impl S3Response {
 
     /// Build a 416 Range Not Satisfiable response.
     #[must_use]
-    pub fn range_not_satisfiable(_total_size: u64) -> Self {
+    pub fn range_not_satisfiable(total_size: u64, host_id: &str) -> Self {
         let request_id = current_request_id();
-        let body = xml::error_xml(
-            "InvalidRange",
-            "The requested range is not satisfiable",
-            "",
-            &request_id,
-        );
+        let body = xml::invalid_range_error_xml(total_size, &request_id, host_id);
         Self::new(416).chunked_xml_body(body)
     }
 
     /// Build a 416 Range Not Satisfiable response with explicit wire IDs.
     #[must_use]
-    pub fn range_not_satisfiable_with_ids(_total_size: u64, wire_ids: &WireResponseIds) -> Self {
-        let body = xml::error_xml(
-            "InvalidRange",
-            "The requested range is not satisfiable",
-            "",
+    pub fn range_not_satisfiable_with_ids(total_size: u64, wire_ids: &WireResponseIds) -> Self {
+        let body =
+            xml::invalid_range_error_xml(total_size, wire_ids.request_id(), wire_ids.host_id());
+        Self::new(416).chunked_xml_body(body)
+    }
+
+    /// Build a 416 unsatisfiable object `partNumber` response.
+    #[must_use]
+    pub fn invalid_part_number(
+        part_number: u32,
+        parts_count: u32,
+        wire_ids: &WireResponseIds,
+    ) -> Self {
+        let body = xml::invalid_part_number_error_xml(
+            part_number,
+            parts_count,
             wire_ids.request_id(),
+            wire_ids.host_id(),
         );
         Self::new(416).chunked_xml_body(body)
     }
@@ -3576,6 +3602,38 @@ mod tests {
         assert!(body.contains("<Size>2049</Size>"));
         assert!(body.contains("<MaxSizeAllowed>2048</MaxSizeAllowed>"));
         assert!(body.contains("<HostId>"));
+        assert!(!body.contains("<Resource>"));
+    }
+
+    #[test]
+    fn invalid_range_error_response_includes_actual_object_size() {
+        let err = ServerError::InvalidRange { total_size: 26 };
+        let resp = S3Response::error(&err, "/bucket/key", TEST_HOST_ID);
+        assert_eq!(resp.status_code, 416);
+        let body = String::from_utf8(resp.into_test_body_bytes().unwrap()).unwrap();
+        assert!(body.contains("<Code>InvalidRange</Code>"));
+        assert!(body.contains("<Message>The requested range is not satisfiable</Message>"));
+        assert!(body.contains("<ActualObjectSize>26</ActualObjectSize>"));
+        assert!(body.contains("<RequestId>request-id</RequestId>"));
+        assert!(body.contains("<HostId>host-id</HostId>"));
+        assert!(!body.contains("<Resource>"));
+    }
+
+    #[test]
+    fn invalid_part_number_error_response_includes_part_counts() {
+        let err = ServerError::InvalidPartNumber {
+            part_number: 5,
+            parts_count: 4,
+        };
+        let resp = S3Response::error(&err, "/bucket/key", TEST_HOST_ID);
+        assert_eq!(resp.status_code, 416);
+        let body = String::from_utf8(resp.into_test_body_bytes().unwrap()).unwrap();
+        assert!(body.contains("<Code>InvalidPartNumber</Code>"));
+        assert!(body.contains("<Message>The requested partnumber is not satisfiable</Message>"));
+        assert!(body.contains("<PartNumberRequested>5</PartNumberRequested>"));
+        assert!(body.contains("<ActualPartCount>4</ActualPartCount>"));
+        assert!(body.contains("<RequestId>request-id</RequestId>"));
+        assert!(body.contains("<HostId>host-id</HostId>"));
         assert!(!body.contains("<Resource>"));
     }
 

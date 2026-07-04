@@ -251,7 +251,10 @@ impl Coordinator {
             let part = obj_parts
                 .iter()
                 .find(|p| p.record.part_number == part_number)
-                .ok_or(ServerError::InvalidPart { part_number })?;
+                .ok_or_else(|| ServerError::InvalidPartNumber {
+                    part_number,
+                    parts_count: obj_parts.len() as u32,
+                })?;
 
             let part_start = part.object_offset_start as u64;
             let part_end = part_start + part.record.size.saturating_sub(1);
@@ -328,7 +331,10 @@ impl Coordinator {
             })
         } else {
             if part_number != 1 {
-                return Err(ServerError::InvalidPart { part_number });
+                return Err(ServerError::InvalidPartNumber {
+                    part_number,
+                    parts_count: 1,
+                });
             }
 
             let etag_crc = record.etag.crc64();
@@ -474,7 +480,10 @@ impl Coordinator {
             let part_index = obj_parts
                 .iter()
                 .position(|p| p.part_number == part_number)
-                .ok_or(ServerError::InvalidPart { part_number })?;
+                .ok_or_else(|| ServerError::InvalidPartNumber {
+                    part_number,
+                    parts_count: obj_parts.len() as u32,
+                })?;
             let part = &obj_parts[part_index];
             let part_start = obj_parts[..part_index].iter().map(|p| p.size).sum::<u64>();
             let part_end = part_start + part.size.saturating_sub(1);
@@ -524,7 +533,10 @@ impl Coordinator {
             })
         } else {
             if part_number != 1 {
-                return Err(ServerError::InvalidPart { part_number });
+                return Err(ServerError::InvalidPartNumber {
+                    part_number,
+                    parts_count: 1,
+                });
             }
             let lifecycle_expiration = if emit_lifecycle_expiration {
                 self.current_object_lifecycle_expiration_with_storage_node(

@@ -1663,9 +1663,8 @@ impl HttpFrontend {
                             bucket, key, vid, part_number
                         )),
                     );
-                    let result = self
-                        .coordinator
-                        .get_object_part(&crate::coordinator::GetObjectPartRequest {
+                    let result = self.coordinator.get_object_part(
+                        &crate::coordinator::GetObjectPartRequest {
                             object: object_version_request(
                                 &bucket,
                                 &key,
@@ -1676,13 +1675,8 @@ impl HttpFrontend {
                             part_number,
                             cond: &cond,
                             sse_customer: sse_customer.as_ref(),
-                        })
-                        .map_err(|e| match e {
-                            ServerError::InvalidPart { .. } => {
-                                ServerError::InvalidRange { total_size: 0 }
-                            }
-                            other => other,
-                        })?;
+                        },
+                    )?;
                     let tags = result.tags.clone();
                     let mut resp = S3Response::get_object_part(result);
                     apply_response_overrides(&mut resp, req);
@@ -1842,9 +1836,8 @@ impl HttpFrontend {
                             bucket, key, vid, part_number
                         )),
                     );
-                    let result = self
-                        .coordinator
-                        .head_object_part(&crate::coordinator::GetObjectPartRequest {
+                    let result = self.coordinator.head_object_part(
+                        &crate::coordinator::GetObjectPartRequest {
                             object: object_version_request(
                                 &bucket,
                                 &key,
@@ -1855,13 +1848,8 @@ impl HttpFrontend {
                             part_number,
                             cond: &cond,
                             sse_customer: sse_customer.as_ref(),
-                        })
-                        .map_err(|e| match e {
-                            ServerError::InvalidPart { .. } => {
-                                ServerError::InvalidRange { total_size: 0 }
-                            }
-                            other => other,
-                        })?;
+                        },
+                    )?;
                     let mut resp = S3Response::head_object_part(&result);
                     if let Some(tags_xml) = &result.tags {
                         add_tagging_count_header(&mut resp, tags_xml)?;
@@ -11279,15 +11267,18 @@ mod tests {
             None,
         );
 
-        // partNumber=99 on a 3-part object → 416 InvalidRange
+        // partNumber=99 on a 3-part object → 416 InvalidPartNumber
         let req = make_req("partNumber=99");
         let op = S3Operation::GetObject {
             bucket: test_bucket_name("mybucket"),
             key: "k".to_string(),
         };
         match fe.dispatch_routed(&req, &test_auth(), op) {
-            Err(ServerError::InvalidRange { .. }) => {}
-            Err(e) => panic!("expected InvalidRange, got {e:?}"),
+            Err(ServerError::InvalidPartNumber {
+                part_number: 99,
+                parts_count: 3,
+            }) => {}
+            Err(e) => panic!("expected InvalidPartNumber, got {e:?}"),
             Ok(_) => panic!("expected error, got Ok"),
         }
     }
@@ -11383,15 +11374,18 @@ mod tests {
         };
         fe.dispatch_routed(&req, &test_auth(), op).unwrap();
 
-        // partNumber=2 on non-multipart → 416 InvalidRange
+        // partNumber=2 on non-multipart → 416 InvalidPartNumber
         let req = make_req("partNumber=2");
         let op = S3Operation::GetObject {
             bucket: test_bucket_name("mybucket"),
             key: "k".to_string(),
         };
         match fe.dispatch_routed(&req, &test_auth(), op) {
-            Err(ServerError::InvalidRange { .. }) => {}
-            Err(e) => panic!("expected InvalidRange, got {e:?}"),
+            Err(ServerError::InvalidPartNumber {
+                part_number: 2,
+                parts_count: 1,
+            }) => {}
+            Err(e) => panic!("expected InvalidPartNumber, got {e:?}"),
             Ok(_) => panic!("expected error, got Ok"),
         }
     }

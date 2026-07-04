@@ -118,6 +118,9 @@ pub enum ServerError {
     #[error("invalid range")]
     InvalidRange { total_size: u64 },
 
+    #[error("invalid part number")]
+    InvalidPartNumber { part_number: u32, parts_count: u32 },
+
     #[error("precondition failed")]
     PreconditionFailed,
 
@@ -432,6 +435,7 @@ impl ServerError {
                 "MethodNotAllowed"
             }
             Self::InvalidRange { .. } => "InvalidRange",
+            Self::InvalidPartNumber { .. } => "InvalidPartNumber",
             Self::SlowDown => "SlowDown",
             Self::BadDigest | Self::ChecksumDigestMismatch { .. } => "BadDigest",
             Self::InvalidDigest => "InvalidDigest",
@@ -580,7 +584,7 @@ impl ServerError {
             | Self::MetadataTooLargeDetailed { .. }
             | Self::RequestHeaderSectionTooLarge => 400,
             Self::MethodNotAllowed | Self::HeadDeleteMarkerMethodNotAllowed { .. } => 405,
-            Self::InvalidRange { .. } => 416,
+            Self::InvalidRange { .. } | Self::InvalidPartNumber { .. } => 416,
             Self::PreconditionFailed | Self::UploadPartCopyPreconditionFailed { .. } => 412,
             Self::NotModified { .. } => 304,
             Self::SlowDown => 503,
@@ -1168,9 +1172,26 @@ mod tests {
     }
 
     #[test]
+    fn s3_error_code_invalid_part_number() {
+        let err = ServerError::InvalidPartNumber {
+            part_number: 5,
+            parts_count: 4,
+        };
+        assert_eq!(err.s3_error_code(), "InvalidPartNumber");
+    }
+
+    #[test]
     fn http_status_416() {
         assert_eq!(
             ServerError::InvalidRange { total_size: 100 }.http_status(),
+            416
+        );
+        assert_eq!(
+            ServerError::InvalidPartNumber {
+                part_number: 5,
+                parts_count: 4,
+            }
+            .http_status(),
             416
         );
     }

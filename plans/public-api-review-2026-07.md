@@ -345,14 +345,21 @@ steps it performs.
   `EtagMatchList` literal-token behavior instead of an impossible public write
   condition.
 
-- [ ] **H6. Two different 416 bodies, and `total_size` computed then
+- [x] **H6. Two different 416 bodies, and `total_size` computed then
   dropped.** `range_not_satisfiable{,_with_ids}` ignores its `_total_size`
   parameter (`server-http/src/http/response.rs:1209-1235`); the GET/HEAD
   partNumber path maps `InvalidPart` → `InvalidRange { total_size: 0 }` →
   generic `error_xml` (mod.rs:1687-1692, 1866-1871; response.rs:267, 715-722);
   core carefully computes `InvalidRange { total_size: record.size }`
   (read.rs:869-872) that is never rendered. AWS includes `<ActualObjectSize>`.
-  Fix: one 416 builder rendering ActualObjectSize from total_size.
+  Fix: one 416 builder rendering ActualObjectSize from total_size. AWS-pinned
+  the details first: unsatisfiable byte `Range` returns `InvalidRange` with
+  `<ActualObjectSize>`, `RequestId`, and `HostId` and no `Resource`, including
+  for zero-byte objects. The `partNumber` branch is distinct from the original
+  diagnosis: AWS returns 416 `InvalidPartNumber` with
+  `<PartNumberRequested>` and `<ActualPartCount>`, not `InvalidRange`. Added a
+  read-specific `InvalidPartNumber` error and AWS-shaped response while leaving
+  CompleteMultipartUpload `InvalidPart` semantics unchanged.
 
 - [ ] **H7. SSE-C validator-key-unavailable reported as client 400.**
   `server-core/src/sse.rs:495-499` returns `InvalidRequest` when the server no

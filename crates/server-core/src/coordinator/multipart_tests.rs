@@ -5064,7 +5064,7 @@ fn head_object_part_non_multipart() {
     assert_eq!(result.parts_count, 1);
     assert_eq!(result.metadata.get("x-amz-meta-foo"), Some("bar"));
 
-    // partNumber=2 on non-multipart object returns InvalidPart.
+    // partNumber=2 on non-multipart object returns the object-read partNumber error.
     let err = coord
         .head_object_part(&GetObjectPartRequest {
             sse_customer: None,
@@ -5079,7 +5079,13 @@ fn head_object_part_non_multipart() {
             cond: &ReadCondition::default(),
         })
         .unwrap_err();
-    assert!(matches!(err, ServerError::InvalidPart { part_number: 2 }));
+    assert!(matches!(
+        err,
+        ServerError::InvalidPartNumber {
+            part_number: 2,
+            parts_count: 1
+        }
+    ));
 }
 
 #[test]

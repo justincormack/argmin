@@ -90,6 +90,49 @@ pub fn error_xml_with_host_id(
     )
 }
 
+/// Format an unsatisfiable byte range error response XML.
+#[must_use]
+pub fn invalid_range_error_xml(total_size: u64, request_id: &str, host_id: &str) -> String {
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+         <Error>\
+         <Code>InvalidRange</Code>\
+         <Message>The requested range is not satisfiable</Message>\
+         <ActualObjectSize>{}</ActualObjectSize>\
+         <RequestId>{}</RequestId>\
+         <HostId>{}</HostId>\
+         </Error>",
+        total_size,
+        xml_escape(request_id),
+        xml_escape(host_id),
+    )
+}
+
+/// Format an unsatisfiable object `partNumber` error response XML.
+#[must_use]
+pub fn invalid_part_number_error_xml(
+    part_number: u32,
+    parts_count: u32,
+    request_id: &str,
+    host_id: &str,
+) -> String {
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+         <Error>\
+         <Code>InvalidPartNumber</Code>\
+         <Message>The requested partnumber is not satisfiable</Message>\
+         <PartNumberRequested>{}</PartNumberRequested>\
+         <ActualPartCount>{}</ActualPartCount>\
+         <RequestId>{}</RequestId>\
+         <HostId>{}</HostId>\
+         </Error>",
+        part_number,
+        parts_count,
+        xml_escape(request_id),
+        xml_escape(host_id),
+    )
+}
+
 /// Format an S3 `RequestHeaderSectionTooLarge` error response.
 #[must_use]
 pub fn request_header_section_too_large_error_xml(

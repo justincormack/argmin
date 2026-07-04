@@ -6,6 +6,29 @@ fn agent() -> s3_tests::Agent {
     s3_tests::test_agent()
 }
 
+fn assert_invalid_range_body_shape(body: &str, actual_object_size: u64) {
+    assert!(body.contains("<Code>InvalidRange</Code>"), "body: {body}");
+    assert!(
+        body.contains("<Message>The requested range is not satisfiable</Message>"),
+        "body: {body}"
+    );
+    assert!(
+        body.contains(&format!(
+            "<ActualObjectSize>{actual_object_size}</ActualObjectSize>"
+        )),
+        "body: {body}"
+    );
+    assert!(
+        body.contains("<RequestId>"),
+        "expected RequestId in body: {body}"
+    );
+    assert!(body.contains("<HostId>"), "expected HostId in body: {body}");
+    assert!(
+        !body.contains("<Resource>"),
+        "expected no Resource element in body: {body}"
+    );
+}
+
 async fn cleanup(bucket: &str, keys: &[&str]) {
     let client = CTX.client();
     for key in keys {
@@ -86,7 +109,7 @@ fn test_range_get_unsatisfiable_response_headers_and_body() {
         let body = resp.body_mut().read_to_string().unwrap_or_default();
         assert_eq!(resp.status().as_u16(), 416);
         assert!(resp.headers().get("Content-Range").is_none());
-        assert!(body.contains("<Code>InvalidRange</Code>"), "body: {body}");
+        assert_invalid_range_body_shape(&body, 26);
 
         cleanup(&bucket, &[&key]).await;
     });
@@ -291,7 +314,7 @@ fn test_range_get_empty_object_is_unsatisfiable() {
         let body = resp.body_mut().read_to_string().unwrap_or_default();
         assert_eq!(resp.status().as_u16(), 416);
         assert!(resp.headers().get("Content-Range").is_none());
-        assert!(body.contains("<Code>InvalidRange</Code>"), "body: {body}");
+        assert_invalid_range_body_shape(&body, 0);
 
         cleanup(&bucket, &[&key]).await;
     });

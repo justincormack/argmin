@@ -35,6 +35,42 @@ fn external_test_mode() -> bool {
     std::env::var_os("S3_TEST_ENDPOINT").is_some()
 }
 
+fn assert_invalid_part_number_body_shape(
+    body: &str,
+    part_number_requested: u32,
+    actual_part_count: u32,
+) {
+    assert!(
+        body.contains("<Code>InvalidPartNumber</Code>"),
+        "body: {body}"
+    );
+    assert!(
+        body.contains("<Message>The requested partnumber is not satisfiable</Message>"),
+        "body: {body}"
+    );
+    assert!(
+        body.contains(&format!(
+            "<PartNumberRequested>{part_number_requested}</PartNumberRequested>"
+        )),
+        "body: {body}"
+    );
+    assert!(
+        body.contains(&format!(
+            "<ActualPartCount>{actual_part_count}</ActualPartCount>"
+        )),
+        "body: {body}"
+    );
+    assert!(
+        body.contains("<RequestId>"),
+        "expected RequestId in body: {body}"
+    );
+    assert!(body.contains("<HostId>"), "expected HostId in body: {body}");
+    assert!(
+        !body.contains("<Resource>"),
+        "expected no Resource element in body: {body}"
+    );
+}
+
 struct SlowUploadPartBody {
     remaining: usize,
     first_frame_sent: Arc<AtomicBool>,
@@ -3316,6 +3352,24 @@ fn test_multipart_get_part() {
             .await;
         assert_eq!(err_status(&result), 416);
 
+        let raw = send_signed_request(
+            "GET",
+            &object_url(
+                CTX.endpoint(),
+                &bucket,
+                key,
+                Some(&format!("partNumber={}", part_count + 1)),
+            ),
+            b"",
+            std::iter::empty::<(&str, &str)>(),
+        );
+        assert_eq!(raw.status, 416, "unexpected raw GET body: {}", raw.body);
+        assert_invalid_part_number_body_shape(
+            &raw.body,
+            (part_count + 1) as u32,
+            part_count as u32,
+        );
+
         // Out-of-range partNumber on HEAD → same error
         let result = client
             .head_object()
@@ -3341,7 +3395,7 @@ fn test_non_multipart_get_part() {
             put_object_retrying_operation_aborted(client, &bucket, key, b"body".to_vec()).await;
         let etag = resp.e_tag().unwrap().to_string();
 
-        // GET PartNumber > 1 → 416 Range Not Satisfiable (AWS behavior)
+        // GET PartNumber > 1 → 416 InvalidPartNumber (AWS behavior)
         let result = client
             .get_object()
             .bucket(&bucket)
@@ -3350,6 +3404,15 @@ fn test_non_multipart_get_part() {
             .send_retrying_operation_aborted("S3 operation during multipart test")
             .await;
         assert_eq!(err_status(&result), 416);
+
+        let raw = send_signed_request(
+            "GET",
+            &object_url(CTX.endpoint(), &bucket, key, Some("partNumber=2")),
+            b"",
+            std::iter::empty::<(&str, &str)>(),
+        );
+        assert_eq!(raw.status, 416, "unexpected raw GET body: {}", raw.body);
+        assert_invalid_part_number_body_shape(&raw.body, 2, 1);
 
         // HEAD PartNumber > 1 → same error
         let result = client
