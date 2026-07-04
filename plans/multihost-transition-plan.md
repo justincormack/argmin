@@ -10580,6 +10580,13 @@ Phase 12.3 progress:
   left for a later Phase 12 membership/cutover slice where committed
   membership, endpoint identity, durable config, and restart validation must
   move together.
+- Closed the Raft peer-socket durable-poison gate. The experimental process
+  now shares an atomic poison flag between client/admin checkpointing paths and
+  peer RPC workers. Peer workers reject before dispatch if the authority is
+  already poisoned, re-check after frame decode and identity validation before
+  OpenRaft dispatch, and re-check before writing a response, so a peer RPC
+  blocked on request I/O or behind the durable checkpoint lock cannot mutate or
+  acknowledge after another path has poisoned the process.
 - Closed the immediate Raft peer ack-before-durable safety hole in the
   experimental process boundary. Unix peer workers now read and handle the
   peer request, checkpoint the durable restart artifact, and only then write

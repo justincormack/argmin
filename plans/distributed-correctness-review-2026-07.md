@@ -252,6 +252,14 @@ it: a durably-poisoned node keeps voting/replicating until the next
 lease-scan tick hits the poison and exits (:2050, :2064-2067). Window is one
 scan interval; each peer RPC's own checkpoint-failure `exit(1)` further
 bounds it. Inconsistent rather than unsafe.
+- Fixed by adding a shared durable-poison gate for the experimental Raft peer
+  listener/worker path. Client-facing checkpoint failures now set both the
+  detailed poison message and an atomic peer gate; peer workers reject before
+  dispatch when the gate is already set, re-check after frame decode and
+  identity validation immediately before OpenRaft dispatch, and re-check
+  before writing a response so a worker blocked on I/O or the durable
+  checkpoint lock cannot mutate or acknowledge after another path poisons the
+  authority.
 
 ### R9. LOW — Peer identity envelope is assertion, not authentication; blocking I/O in async network
 
@@ -365,8 +373,8 @@ shift.
 7. **DONE — Membership-change restart coverage (R6).** Unix-peer durable
    authorities reject `replace_voters`/`add_learner` in static peer mode until
    config-driven membership evolution is designed.
-8. **Gate the peer socket on poison (R8)** via a shared flag checked in
-   `spawn_experimental_raft_peer_rpc_worker`.
+8. **DONE — Gate the peer socket on poison (R8).** A shared atomic poison
+   flag is checked before peer dispatch and again before peer response write.
 9. **Smaller items:** finish the remaining bootstrap-race transient-exit case
    (R10); convert the peer network to nonblocking/tokio I/O or a dedicated
    blocking pool with a connect timeout (R9); canonicalize the snapshot text

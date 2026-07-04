@@ -9,7 +9,7 @@ use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::{
-    atomic::{AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
     Arc, Mutex,
 };
 use std::thread;
@@ -38,8 +38,8 @@ use storage::control_plane_raft::{
     handle_control_plane_raft_peer_snapshot_frame, read_control_plane_raft_peer_transport_frame,
     write_control_plane_raft_peer_transport_frame, ControlPlaneRaftAuthority,
     ControlPlaneRaftAuthorityStatus, ControlPlaneRaftCommandOutcome, ControlPlaneRaftNodeId,
-    ControlPlaneRaftPeerFrameKind, ControlPlaneRaftPeerTransportLimits,
-    ControlPlaneRaftPeerTransportPolicy,
+    ControlPlaneRaftPeerFrameIdentity, ControlPlaneRaftPeerFrameKind,
+    ControlPlaneRaftPeerTransportLimits, ControlPlaneRaftPeerTransportPolicy,
 };
 use storage::storage_node_server::{
     advance_storage_node_incarnation, StorageNodeControlPlaneRefreshLoop, StorageNodeDataDirGuard,
@@ -1437,6 +1437,7 @@ struct ExperimentalRaftControlPlane {
     durable_serving_checkpoint: Mutex<Option<ExperimentalRaftServingCheckpointMarker>>,
     checkpoint_serving_reads: bool,
     durable_poison: Option<String>,
+    durable_poison_gate: Arc<AtomicBool>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1493,6 +1494,11 @@ impl ExperimentalRaftControlPlane {
         } else {
             Ok(())
         }
+    }
+
+    fn poison_durable_authority(&mut self, message: String) {
+        self.durable_poison = Some(message);
+        self.durable_poison_gate.store(true, Ordering::Release);
     }
 
     fn store_durable_restart_artifact(&self) -> Result<(), ControlPlaneError> {
@@ -1552,7 +1558,7 @@ impl ExperimentalRaftControlPlane {
         let submitted = self.block_on(self.authority.submit_control_plane_command(command))?;
         let outcome = submitted.into_outcome();
         if let Err(error) = self.store_durable_restart_artifact() {
-            self.durable_poison = Some(format!(
+            self.poison_durable_authority(format!(
                 "experimental OpenRaft control-plane durability checkpoint failed after a \
                  committed command; refusing to serve until restart: {error}"
             ));
@@ -1713,7 +1719,7 @@ impl ControlPlaneAdmin for ExperimentalRaftControlPlane {
         self.ensure_not_durably_poisoned()?;
         let snapshot_log_id = self.block_on(self.authority.trigger_snapshot_and_purge_applied())?;
         if let Err(error) = self.store_durable_restart_artifact() {
-            self.durable_poison = Some(format!(
+            self.poison_durable_authority(format!(
                 "experimental OpenRaft control-plane durability checkpoint failed after a \
                  snapshot purge; refusing to serve until restart: {error}"
             ));
@@ -1729,7 +1735,7 @@ impl ControlPlaneAdmin for ExperimentalRaftControlPlane {
                 .trigger_pre_vote_election_until_serving(Duration::from_secs(10)),
         )?;
         if let Err(error) = self.store_durable_restart_artifact() {
-            self.durable_poison = Some(format!(
+            self.poison_durable_authority(format!(
                 "experimental OpenRaft control-plane durability checkpoint failed after an \
                  election trigger; refusing to serve until restart: {error}"
             ));
@@ -1892,9 +1898,38 @@ struct ExperimentalRaftPeerRpcWorkerContext {
     authority: Arc<ControlPlaneRaftAuthority>,
     local_node_id: ControlPlaneRaftNodeId,
     policy: Arc<ControlPlaneRaftPeerTransportPolicy>,
-    durable_artifact_path: Option<Arc<PathBuf>>,
-    durable_checkpoint_lock: Option<Arc<Mutex<()>>>,
+    durability: Option<ExperimentalRaftPeerDurabilityContext>,
     active_workers: Arc<AtomicUsize>,
+}
+
+#[derive(Clone)]
+struct ExperimentalRaftPeerDurabilityContext {
+    artifact_path: Arc<PathBuf>,
+    checkpoint_lock: Arc<Mutex<()>>,
+    poison_gate: Arc<AtomicBool>,
+}
+
+#[derive(Clone, Copy)]
+struct ExperimentalRaftPeerRpcDurability<'a> {
+    artifact_path: Option<&'a Path>,
+    checkpoint_lock: Option<&'a Arc<Mutex<()>>>,
+    poison_gate: Option<&'a AtomicBool>,
+}
+
+impl<'a> ExperimentalRaftPeerRpcDurability<'a> {
+    const NONE: Self = Self {
+        artifact_path: None,
+        checkpoint_lock: None,
+        poison_gate: None,
+    };
+
+    fn from_context(context: &'a ExperimentalRaftPeerDurabilityContext) -> Self {
+        Self {
+            artifact_path: Some(context.artifact_path.as_path()),
+            checkpoint_lock: Some(&context.checkpoint_lock),
+            poison_gate: Some(context.poison_gate.as_ref()),
+        }
+    }
 }
 
 fn spawn_experimental_raft_peer_rpc_worker(
@@ -1906,10 +1941,18 @@ fn spawn_experimental_raft_peer_rpc_worker(
         authority,
         local_node_id,
         policy,
-        durable_artifact_path,
-        durable_checkpoint_lock,
+        durability,
         active_workers,
     } = context;
+    if durability
+        .as_ref()
+        .is_some_and(|durability| durability.poison_gate.load(Ordering::Acquire))
+    {
+        eprintln!(
+            "experimental OpenRaft control-plane peer RPC rejected: durable authority is poisoned"
+        );
+        return;
+    }
     match active_workers.fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
         (active < CONTROL_PLANE_RAFT_PEER_RPC_WORKER_LIMIT).then_some(active + 1)
     }) {
@@ -1925,14 +1968,18 @@ fn spawn_experimental_raft_peer_rpc_worker(
 
     thread::spawn(move || {
         let mut stream = stream;
+        let rpc_durability = durability
+            .as_ref()
+            .map_or(ExperimentalRaftPeerRpcDurability::NONE, |durability| {
+                ExperimentalRaftPeerRpcDurability::from_context(durability)
+            });
         match handle_experimental_raft_peer_rpc_before_ack(
             &runtime,
             &authority,
             &mut stream,
             local_node_id,
             &policy,
-            durable_artifact_path.as_deref().map(PathBuf::as_path),
-            durable_checkpoint_lock.as_ref(),
+            rpc_durability,
         ) {
             Ok(()) => {}
             Err(ExperimentalRaftPeerRpcWorkerError::PeerRpc(error)) => {
@@ -1961,9 +2008,9 @@ fn handle_experimental_raft_peer_rpc_before_ack(
     stream: &mut UnixStream,
     local_node_id: ControlPlaneRaftNodeId,
     policy: &ControlPlaneRaftPeerTransportPolicy,
-    durable_artifact_path: Option<&Path>,
-    durable_checkpoint_lock: Option<&Arc<Mutex<()>>>,
+    durability: ExperimentalRaftPeerRpcDurability<'_>,
 ) -> Result<(), ExperimentalRaftPeerRpcWorkerError> {
+    ensure_experimental_raft_peer_not_durably_poisoned(durability.poison_gate)?;
     stream
         .set_read_timeout(Some(CONTROL_PLANE_RAFT_PEER_RPC_IO_TIMEOUT))
         .map_err(|source| ControlPlaneError::Io {
@@ -1993,43 +2040,75 @@ fn handle_experimental_raft_peer_rpc_before_ack(
         })
         .map_err(ExperimentalRaftPeerRpcWorkerError::PeerRpc)?;
 
+    let response_frame = handle_experimental_raft_peer_rpc_validated_frame_before_ack(
+        runtime,
+        authority,
+        &request_frame,
+        frame_kind,
+        &identity,
+        policy,
+        durability,
+    )?;
+
+    write_control_plane_raft_peer_transport_frame(stream, &response_frame)
+        .map_err(ExperimentalRaftPeerRpcWorkerError::PeerRpc)
+}
+
+fn handle_experimental_raft_peer_rpc_validated_frame_before_ack(
+    runtime: &Handle,
+    authority: &ControlPlaneRaftAuthority,
+    request_frame: &[u8],
+    frame_kind: ControlPlaneRaftPeerFrameKind,
+    identity: &ControlPlaneRaftPeerFrameIdentity,
+    policy: &ControlPlaneRaftPeerTransportPolicy,
+    durability: ExperimentalRaftPeerRpcDurability<'_>,
+) -> Result<Vec<u8>, ExperimentalRaftPeerRpcWorkerError> {
+    ensure_experimental_raft_peer_not_durably_poisoned(durability.poison_gate)?;
     let response_frame = block_on_control_plane_raft(runtime, async {
         match frame_kind {
             ControlPlaneRaftPeerFrameKind::OrdinaryRpc => {
-                handle_control_plane_raft_peer_rpc_frame(
-                    authority.raft(),
-                    &request_frame,
-                    &identity,
-                )
-                .await
+                handle_control_plane_raft_peer_rpc_frame(authority.raft(), request_frame, identity)
+                    .await
             }
             ControlPlaneRaftPeerFrameKind::Snapshot => {
                 handle_control_plane_raft_peer_snapshot_frame(
                     authority.raft(),
-                    &request_frame,
+                    request_frame,
                     policy.limits().max_frame_bytes,
                     policy.limits().max_snapshot_bytes,
-                    &identity,
+                    identity,
                 )
                 .await
             }
         }
     });
 
-    if let Some(path) = durable_artifact_path {
+    if let Some(path) = durability.artifact_path {
         if let Err(error) = store_experimental_raft_durable_restart_artifact(
             runtime,
             authority,
             path,
-            durable_checkpoint_lock,
+            durability.checkpoint_lock,
         ) {
             return Err(ExperimentalRaftPeerRpcWorkerError::Checkpoint(error));
         }
     }
 
-    let response_frame = response_frame.map_err(ExperimentalRaftPeerRpcWorkerError::PeerRpc)?;
-    write_control_plane_raft_peer_transport_frame(stream, &response_frame)
-        .map_err(ExperimentalRaftPeerRpcWorkerError::PeerRpc)
+    ensure_experimental_raft_peer_not_durably_poisoned(durability.poison_gate)?;
+    response_frame.map_err(ExperimentalRaftPeerRpcWorkerError::PeerRpc)
+}
+
+fn ensure_experimental_raft_peer_not_durably_poisoned(
+    durable_poison_gate: Option<&AtomicBool>,
+) -> Result<(), ExperimentalRaftPeerRpcWorkerError> {
+    if durable_poison_gate.is_some_and(|gate| gate.load(Ordering::Acquire)) {
+        return Err(ExperimentalRaftPeerRpcWorkerError::PeerRpc(
+            ControlPlaneError::RpcRemote {
+                message: "experimental OpenRaft control-plane durable authority is poisoned; refusing peer RPC until restart".to_string(),
+            },
+        ));
+    }
+    Ok(())
 }
 
 fn spawn_experimental_raft_peer_listener_loop(
@@ -2037,8 +2116,7 @@ fn spawn_experimental_raft_peer_listener_loop(
     runtime: Handle,
     authority: Arc<ControlPlaneRaftAuthority>,
     local_node_id: ControlPlaneRaftNodeId,
-    durable_artifact_path: Arc<PathBuf>,
-    durable_checkpoint_lock: Arc<Mutex<()>>,
+    durability: ExperimentalRaftPeerDurabilityContext,
     active_workers: Arc<AtomicUsize>,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || loop {
@@ -2052,8 +2130,7 @@ fn spawn_experimental_raft_peer_listener_loop(
                             authority: Arc::clone(&authority),
                             local_node_id,
                             policy: Arc::clone(&listener.policy),
-                            durable_artifact_path: Some(Arc::clone(&durable_artifact_path)),
-                            durable_checkpoint_lock: Some(Arc::clone(&durable_checkpoint_lock)),
+                            durability: Some(durability.clone()),
                             active_workers: Arc::clone(&active_workers),
                         },
                     );
@@ -2146,6 +2223,7 @@ fn run_experimental_raft_control_plane_process(config: &ServerConfig) -> ! {
                 std::process::exit(1);
             });
     let active_raft_peer_rpc_workers = Arc::new(AtomicUsize::new(0));
+    let durable_poison_gate = Arc::new(AtomicBool::new(false));
     let multi_node_raft_peer_mode = raft_peer_policy
         .as_ref()
         .is_some_and(|policy| policy.peers().len() > 1);
@@ -2155,8 +2233,11 @@ fn run_experimental_raft_control_plane_process(config: &ServerConfig) -> ! {
             runtime.clone(),
             Arc::clone(&authority),
             node_id,
-            Arc::clone(&durable_artifact_path),
-            Arc::clone(&durable_checkpoint_lock),
+            ExperimentalRaftPeerDurabilityContext {
+                artifact_path: Arc::clone(&durable_artifact_path),
+                checkpoint_lock: Arc::clone(&durable_checkpoint_lock),
+                poison_gate: Arc::clone(&durable_poison_gate),
+            },
             Arc::clone(&active_raft_peer_rpc_workers),
         )
     });
@@ -2230,6 +2311,7 @@ fn run_experimental_raft_control_plane_process(config: &ServerConfig) -> ! {
         durable_serving_checkpoint: Mutex::new(None),
         checkpoint_serving_reads: multi_node_raft_peer_mode,
         durable_poison: None,
+        durable_poison_gate: Arc::clone(&durable_poison_gate),
     };
     let should_bootstrap_control_plane_state =
         if experimental_raft_startup_bootstrap_requires_local_serving(raft_peer_policy.as_ref()) {
@@ -3438,6 +3520,7 @@ mod tests {
             durable_serving_checkpoint: Mutex::new(None),
             checkpoint_serving_reads: false,
             durable_poison: None,
+            durable_poison_gate: Arc::new(AtomicBool::new(false)),
         };
         ExperimentalRaftTestHarness {
             runtime,
@@ -3509,6 +3592,7 @@ mod tests {
             durable_serving_checkpoint: Mutex::new(None),
             checkpoint_serving_reads: false,
             durable_poison: None,
+            durable_poison_gate: Arc::new(AtomicBool::new(false)),
         };
         ExperimentalRaftTestHarness {
             runtime,
@@ -3540,6 +3624,7 @@ mod tests {
             durable_serving_checkpoint: Mutex::new(None),
             checkpoint_serving_reads: false,
             durable_poison: None,
+            durable_poison_gate: Arc::new(AtomicBool::new(false)),
         };
         std::thread::spawn(move || {
             for request_index in 0..request_count {
@@ -3732,6 +3817,7 @@ mod tests {
             durable_serving_checkpoint: Mutex::new(None),
             checkpoint_serving_reads: false,
             durable_poison: None,
+            durable_poison_gate: Arc::new(AtomicBool::new(false)),
         };
         bootstrap_empty_experimental_raft_control_plane(&mut control_plane, &config)
             .expect("durable experimental raft control-plane bootstrap should succeed");
@@ -3790,6 +3876,7 @@ mod tests {
             durable_serving_checkpoint: Mutex::new(None),
             checkpoint_serving_reads: false,
             durable_poison: None,
+            durable_poison_gate: Arc::new(AtomicBool::new(false)),
         };
         let mut config = test_server_config();
         config.storage_node_sockets = vec![config::ConfiguredStorageNodeSocket {
@@ -3802,6 +3889,7 @@ mod tests {
             .expect_err("checkpoint failure should reject the bootstrap response");
         assert!(err.contains("durable restart artifact"));
         assert!(control_plane.durable_poison.is_some());
+        assert!(control_plane.durable_poison_gate.load(Ordering::Acquire));
 
         let runtime_map_err = ControlPlaneRuntimeMapSource::runtime_map_snapshot(
             &control_plane,
@@ -4006,8 +4094,11 @@ mod tests {
             &mut server_stream,
             1,
             &policy,
-            Some(&state_dir),
-            None,
+            ExperimentalRaftPeerRpcDurability {
+                artifact_path: Some(&state_dir),
+                checkpoint_lock: None,
+                poison_gate: None,
+            },
         );
         assert!(
             matches!(
@@ -4025,6 +4116,218 @@ mod tests {
         assert!(
             response.is_err(),
             "checkpoint failure must not acknowledge peer RPC before durability"
+        );
+
+        harness.shutdown();
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[test]
+    fn experimental_raft_peer_rpc_rejects_durable_poison_before_dispatch() {
+        let harness = experimental_raft_test_harness("peer-poison-before-dispatch");
+        let cluster_name = format!(
+            "argmin-s3-experimental-raft-peer-poison-before-dispatch-{}",
+            std::process::id()
+        );
+        let policy = ControlPlaneRaftPeerTransportPolicy::from_peer_endpoints(
+            cluster_name.clone(),
+            [(1, "node-1".to_string())],
+            ControlPlaneRaftPeerTransportLimits::default(),
+        );
+        let identity = ControlPlaneRaftPeerFrameIdentity::new(cluster_name, 1, 1);
+        let request = ControlPlaneRaftPeerRpcRequest::Vote(VoteRequest {
+            vote: Vote::<ControlPlaneRaftLeaderId>::new(3, 1),
+            last_log_id: None,
+            leadership_transfer: false,
+        });
+        let request_frame = request
+            .encode_frame_for_peer(&identity)
+            .expect("peer request should encode");
+        let (mut client_stream, mut server_stream) =
+            UnixStream::pair().expect("test UnixStream pair should create");
+        write_control_plane_raft_peer_transport_frame(&mut client_stream, &request_frame)
+            .expect("client should write request frame");
+        let poison_gate = AtomicBool::new(true);
+        let runtime_handle = harness.runtime.handle().clone();
+
+        let result = handle_experimental_raft_peer_rpc_before_ack(
+            &runtime_handle,
+            &harness.authority,
+            &mut server_stream,
+            1,
+            &policy,
+            ExperimentalRaftPeerRpcDurability {
+                artifact_path: None,
+                checkpoint_lock: None,
+                poison_gate: Some(&poison_gate),
+            },
+        );
+        assert!(
+            matches!(result, Err(ExperimentalRaftPeerRpcWorkerError::PeerRpc(_))),
+            "poisoned peer RPC should fail before dispatch: {result:?}"
+        );
+        drop(server_stream);
+
+        let response = read_control_plane_raft_peer_transport_frame(
+            &mut client_stream,
+            ControlPlaneRaftPeerTransportLimits::DEFAULT_MAX_FRAME_BYTES,
+        );
+        assert!(
+            response.is_err(),
+            "poisoned peer RPC must not write a response"
+        );
+
+        harness.shutdown();
+    }
+
+    #[test]
+    fn experimental_raft_peer_rpc_rejects_durable_poison_after_validation_before_dispatch() {
+        let harness = experimental_raft_test_harness("peer-poison-after-validation");
+        let cluster_name = format!(
+            "argmin-s3-experimental-raft-peer-poison-after-validation-{}",
+            std::process::id()
+        );
+        let policy = ControlPlaneRaftPeerTransportPolicy::from_peer_endpoints(
+            cluster_name.clone(),
+            [(1, "node-1".to_string())],
+            ControlPlaneRaftPeerTransportLimits::default(),
+        );
+        let identity = ControlPlaneRaftPeerFrameIdentity::new(cluster_name, 1, 1);
+        let request = ControlPlaneRaftPeerRpcRequest::Vote(VoteRequest {
+            vote: Vote::<ControlPlaneRaftLeaderId>::new(3, 1),
+            last_log_id: None,
+            leadership_transfer: false,
+        });
+        let request_frame = request
+            .encode_frame_for_peer(&identity)
+            .expect("peer request should encode");
+        let frame_kind = decode_control_plane_raft_peer_request_frame_kind(&request_frame)
+            .expect("request kind should decode");
+        let decoded_identity =
+            decode_control_plane_raft_peer_request_frame_identity(&request_frame)
+                .expect("request identity should decode");
+        policy
+            .validate_incoming_frame_identity(&decoded_identity, 1)
+            .expect("request identity should validate");
+        let before_status = harness
+            .runtime
+            .block_on(harness.authority.status())
+            .expect("status should read before poisoned dispatch");
+        let poison_gate = AtomicBool::new(true);
+
+        let result = handle_experimental_raft_peer_rpc_validated_frame_before_ack(
+            harness.runtime.handle(),
+            &harness.authority,
+            &request_frame,
+            frame_kind,
+            &decoded_identity,
+            &policy,
+            ExperimentalRaftPeerRpcDurability {
+                artifact_path: None,
+                checkpoint_lock: None,
+                poison_gate: Some(&poison_gate),
+            },
+        );
+        assert!(
+            matches!(result, Err(ExperimentalRaftPeerRpcWorkerError::PeerRpc(_))),
+            "poisoned validated peer RPC should fail before OpenRaft dispatch: {result:?}"
+        );
+        let after_status = harness
+            .runtime
+            .block_on(harness.authority.status())
+            .expect("status should read after poisoned dispatch");
+        assert_eq!(
+            after_status.persisted_vote(),
+            before_status.persisted_vote(),
+            "poisoned validated peer RPC must not mutate the Raft vote"
+        );
+
+        harness.shutdown();
+    }
+
+    #[test]
+    fn experimental_raft_peer_rpc_poison_before_ack_writes_no_response() {
+        let harness = experimental_raft_test_harness("peer-poison-before-ack");
+        let cluster_name = format!(
+            "argmin-s3-experimental-raft-peer-poison-before-ack-{}",
+            std::process::id()
+        );
+        let policy = ControlPlaneRaftPeerTransportPolicy::from_peer_endpoints(
+            cluster_name.clone(),
+            [(1, "node-1".to_string())],
+            ControlPlaneRaftPeerTransportLimits::default(),
+        );
+        let identity = ControlPlaneRaftPeerFrameIdentity::new(cluster_name, 1, 1);
+        let request = ControlPlaneRaftPeerRpcRequest::Vote(VoteRequest {
+            vote: Vote::<ControlPlaneRaftLeaderId>::new(3, 1),
+            last_log_id: None,
+            leadership_transfer: false,
+        });
+        let request_frame = request
+            .encode_frame_for_peer(&identity)
+            .expect("peer request should encode");
+        let (mut client_stream, mut server_stream) =
+            UnixStream::pair().expect("test UnixStream pair should create");
+        write_control_plane_raft_peer_transport_frame(&mut client_stream, &request_frame)
+            .expect("client should write request frame");
+        client_stream
+            .set_read_timeout(Some(Duration::from_millis(50)))
+            .expect("client stream read timeout should set");
+
+        let state_dir = short_unix_socket_test_dir("experimental-raft-peer-poison-before-ack");
+        let _ = fs::remove_dir_all(&state_dir);
+        fs::create_dir_all(&state_dir).expect("checkpoint directory should exist");
+        let state_path = state_dir.join("control-plane.state");
+        let checkpoint_lock = Arc::new(Mutex::new(()));
+        let checkpoint_guard = checkpoint_lock
+            .lock()
+            .expect("checkpoint lock should acquire");
+        let poison_gate = Arc::new(AtomicBool::new(false));
+        let runtime_handle = harness.runtime.handle().clone();
+        let authority = Arc::clone(&harness.authority);
+        let worker_lock = Arc::clone(&checkpoint_lock);
+        let worker_poison_gate = Arc::clone(&poison_gate);
+        let worker = thread::spawn(move || {
+            handle_experimental_raft_peer_rpc_before_ack(
+                &runtime_handle,
+                &authority,
+                &mut server_stream,
+                1,
+                &policy,
+                ExperimentalRaftPeerRpcDurability {
+                    artifact_path: Some(&state_path),
+                    checkpoint_lock: Some(&worker_lock),
+                    poison_gate: Some(worker_poison_gate.as_ref()),
+                },
+            )
+        });
+
+        let blocked_response = read_control_plane_raft_peer_transport_frame(
+            &mut client_stream,
+            ControlPlaneRaftPeerTransportLimits::DEFAULT_MAX_FRAME_BYTES,
+        );
+        assert!(
+            blocked_response.is_err(),
+            "peer RPC must not respond before durable checkpoint completes"
+        );
+        poison_gate.store(true, Ordering::Release);
+        drop(checkpoint_guard);
+        let result = worker.join().expect("peer RPC worker should not panic");
+        assert!(
+            matches!(result, Err(ExperimentalRaftPeerRpcWorkerError::PeerRpc(_))),
+            "peer RPC should fail closed after poison flips before ack: {result:?}"
+        );
+
+        client_stream
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .expect("client stream read timeout should update");
+        let response = read_control_plane_raft_peer_transport_frame(
+            &mut client_stream,
+            ControlPlaneRaftPeerTransportLimits::DEFAULT_MAX_FRAME_BYTES,
+        );
+        assert!(
+            response.is_err(),
+            "peer RPC must not acknowledge after durable poison flips"
         );
 
         harness.shutdown();
@@ -4078,8 +4381,11 @@ mod tests {
                 &mut server_stream,
                 1,
                 &policy,
-                Some(&state_path),
-                Some(&worker_lock),
+                ExperimentalRaftPeerRpcDurability {
+                    artifact_path: Some(&state_path),
+                    checkpoint_lock: Some(&worker_lock),
+                    poison_gate: None,
+                },
             )
         });
 
