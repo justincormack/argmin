@@ -349,11 +349,11 @@ shift.
   `last_applied` and are pure functions of (state, command)
   (`control_plane_command.rs:744-758`; raft mapping
   `control_plane_raft.rs:6231-6247`); replay equivalence pinned by tests.
-  Command codec is canonical/total with strict bounds. One caveat: the
-  snapshot *text* parser accepts non-canonical byte forms of equal states
-  (uppercase hex, `+`/zero-padded ints, last-wins duplicate keys —
-  `control_plane.rs:8424-8430`, :6561-6577), which cannot diverge state but
-  breaks byte-comparison of artifacts.
+  Command codec is canonical/total with strict bounds. The snapshot text
+  formatter now prunes/sorts history before writing, and the parser rejects
+  non-canonical byte forms by requiring a successful parse to reformat to the
+  exact input bytes, closing the previous uppercase-hex/zero-padded/reordered
+  equivalent-state caveat.
 - **R-OK5 — Dual authority:** the experimental branch never returns
   (main.rs:1277-1280); both modes take the same exclusive `flock` on the
   state path (:171-229, :1290, :1838); flag toggling fails closed in both
@@ -400,10 +400,10 @@ shift.
    config-driven membership evolution is designed.
 8. **DONE — Gate the peer socket on poison (R8).** A shared atomic poison
    flag is checked before peer dispatch and again before peer response write.
-9. **Smaller items:** canonicalize the snapshot text parser if artifact bytes
-   are ever compared (R-OK4 caveat). The guarded log-store audit now runs the
-   compatible `openraft::testing::log::suite` cases and documents the upstream
-   deviations: OpenRaft's generic suite still uses a synthetic blank
+9. **DONE — Smaller parser/conformance items:** the snapshot text parser now
+   accepts only canonical formatter bytes. The guarded log-store audit now runs
+   the compatible `openraft::testing::log::suite` cases and documents the
+   upstream deviations: OpenRaft's generic suite still uses a synthetic blank
    `(term=0,index=0)` entry, while Argmin accepts only the real bootstrap
    membership entry there, and Argmin rejects purge/truncate shapes that would
    cross or erase the committed restart watermark.

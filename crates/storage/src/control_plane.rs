@@ -6540,7 +6540,11 @@ pub(crate) fn format_snapshot(snapshot: &ClusterControlSnapshot) -> String {
         "max_committed_timestamp_ms={}\n",
         option_u64(snapshot.max_committed_timestamp_ms)
     ));
-    for history in &snapshot.history {
+    let mut history_records = snapshot.history.clone();
+    let protection =
+        required_cluster_map_history_protection(snapshot.pgs.values(), snapshot.nodes.values());
+    prune_cluster_map_history(&mut history_records, &protection);
+    for history in &history_records {
         out.push_str(&format!(
             "history={},{}\n",
             history.cluster_epoch.get(),
@@ -6888,7 +6892,7 @@ pub(crate) fn parse_snapshot(contents: &str) -> Result<ClusterControlSnapshot, C
     let protection = required_cluster_map_history_protection(pgs.values(), nodes.values());
     prune_cluster_map_history(&mut history, &protection);
     validate_required_cluster_map_history(&history, &pgs, &nodes, cluster_epoch)?;
-    Ok(ClusterControlSnapshot {
+    let snapshot = ClusterControlSnapshot {
         authority_incarnation: authority_incarnation
             .ok_or_else(|| parse_error(0, "missing authority incarnation"))?,
         cluster_epoch,
@@ -6896,7 +6900,14 @@ pub(crate) fn parse_snapshot(contents: &str) -> Result<ClusterControlSnapshot, C
         pgs,
         max_committed_timestamp_ms,
         history,
-    })
+    };
+    if format_snapshot(&snapshot) != contents {
+        return Err(parse_error(
+            0,
+            "control-plane state must use canonical snapshot encoding",
+        ));
+    }
+    Ok(snapshot)
 }
 
 struct ParsedHistoryRecord {
@@ -8650,6 +8661,62 @@ mod tests {
             },
         );
         snapshot
+    }
+
+    fn canonical_snapshot_with_node() -> ClusterControlSnapshot {
+        let mut snapshot = ClusterControlSnapshot::empty();
+        snapshot.max_committed_timestamp_ms = Some(123);
+        let mut node = NodeControlRecord::new(NodeId::new(1), NodeMembershipState::Active);
+        node.availability = NodeAvailabilityState::Healthy;
+        node.node_incarnation = 11;
+        node.endpoint = "node-1.sock".to_owned();
+        node.last_observed_epoch = Some(ClusterEpoch::INITIAL);
+        node.last_heartbeat_ms = Some(100);
+        node.lease_deadline_ms = Some(200);
+        snapshot.nodes.insert(node.node_id, node);
+        snapshot
+    }
+
+    #[test]
+    fn parse_snapshot_round_trips_canonical_snapshot_bytes() {
+        let snapshot = canonical_snapshot_with_node();
+        let contents = format_snapshot(&snapshot);
+
+        let parsed = parse_snapshot(&contents).unwrap();
+
+        assert_eq!(parsed, snapshot);
+        assert_eq!(format_snapshot(&parsed), contents);
+    }
+
+    #[test]
+    fn parse_snapshot_rejects_noncanonical_equivalent_bytes() {
+        let canonical = format_snapshot(&canonical_snapshot_with_node());
+        let without_trailing_newline = canonical.trim_end_matches('\n').to_owned();
+        let zero_padded_epoch = canonical.replace("cluster_epoch=1\n", "cluster_epoch=01\n");
+        let uppercase_hex = canonical.replace("6e6f64652d312e736f636b", "6E6F64652D312E736F636B");
+        let duplicate_cluster_epoch =
+            canonical.replace("cluster_epoch=1\n", "cluster_epoch=1\ncluster_epoch=1\n");
+        let reordered_max_timestamp = canonical.replace(
+            "cluster_epoch=1\nmax_committed_timestamp_ms=123\n",
+            "max_committed_timestamp_ms=123\ncluster_epoch=1\n",
+        );
+
+        for (label, contents) in [
+            ("missing trailing newline", without_trailing_newline),
+            ("zero-padded integer", zero_padded_epoch),
+            ("uppercase hex", uppercase_hex),
+            ("duplicate top-level key", duplicate_cluster_epoch),
+            ("reordered top-level key", reordered_max_timestamp),
+        ] {
+            assert!(
+                matches!(
+                    parse_snapshot(&contents),
+                    Err(ControlPlaneError::Parse { message, .. })
+                        if message == "control-plane state must use canonical snapshot encoding"
+                ),
+                "{label} should be rejected as non-canonical"
+            );
+        }
     }
 
     fn heartbeat(node_id: u32, observed_epoch: ClusterEpoch, _now_ms: u64) -> NodeHeartbeat {
@@ -12961,9 +13028,9 @@ mod tests {
             &path,
             concat!(
                 "version=12\n",
-                "max_committed_timestamp_ms=-\n",
                 "authority_incarnation=1\n",
                 "cluster_epoch=2\n",
+                "max_committed_timestamp_ms=-\n",
                 "node=1,active,healthy,11,2,100,200,-,6e6f64652d312e736f636b\n",
                 "node_pg=1,7,active,2,100,10,20,30,0\n",
                 "pg=7,active,1,1,9,10,11,-,-,-,-,-,-,-,-,-,-,-,-,0,0,-,0,2,-,0\n",
