@@ -1,6 +1,8 @@
 #![no_main]
 
-use auth::{authenticate_post_sigv4, ExpectedCredentialScope, PostSigV4Request};
+use auth::{
+    authenticate_post_sigv4, ExpectedCredentialScope, ExpectedSigningRegion, PostSigV4Request,
+};
 use base64::Engine;
 use libfuzzer_sys::fuzz_target;
 
@@ -26,7 +28,7 @@ fuzz_target!(|data: &[u8]| {
             security_token: None,
         },
         &store,
-        ExpectedCredentialScope::new(None, "s3"),
+        ExpectedCredentialScope::new(ExpectedSigningRegion::DeferredToBucketRouting, "s3"),
         1_700_000_000,
     );
 

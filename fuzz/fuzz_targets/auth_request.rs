@@ -35,7 +35,7 @@ fuzz_target!(|data: &[u8]| {
         &header_auth,
         data,
         &store,
-        Some("us-east-1"),
+        auth::ExpectedSigningRegion::ExactEndpointRegion("us-east-1"),
         "s3",
         1_700_000_000,
     );
@@ -56,7 +56,7 @@ fuzz_target!(|data: &[u8]| {
         &presigned_headers,
         data,
         &store,
-        Some("us-east-1"),
+        auth::ExpectedSigningRegion::ExactEndpointRegion("us-east-1"),
         "s3",
         1_700_000_000,
     );

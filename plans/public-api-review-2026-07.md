@@ -386,14 +386,20 @@ sweeps so the next drift is a compile error.
 
 ### P1. `Option` parameters where `None` silently weakens semantics
 
-- [ ] `authenticate_request(..., expected_region: Option<&str>)`
-  (`auth/src/request.rs:178-188`) and `ExpectedCredentialScope::new`
-  (`auth/src/post.rs:27-37`): `None` skips the scope check; server-http passes
-  `None` for every bucket-named operation relying on `enforce_bucket_region`
-  afterward, which itself returns `Ok(())` for missing buckets
-  (mod.rs:3177, 3191-3209). Fix: `enum ExpectedRegion<'a> { Exact(&'a str),
-  DeferredToBucketRouting }` used by both entry points; have
-  `authenticate_request` take `ExpectedCredentialScope` like POST does.
+- [x] Auth scope APIs used `Option` to mean "skip region validation":
+  `authenticate_request` and `ExpectedCredentialScope::new` both treated
+  `None` as no scope check. Completed by introducing
+  `ExpectedSigningRegion::{ExactEndpointRegion, DeferredToBucketRouting}` and
+  using that type from both header/presigned request auth and POST Object auth.
+  This keeps S3 bucket-routing policy in server-http while making the auth API
+  explicit.
+- [ ] Deferred bucket-region validation is AWS-visible and separate from the
+  auth API shape: server-http passes deferred scope for bucket-named
+  operations, then relies on `enforce_bucket_region`, which returns `Ok(())`
+  for missing buckets (`server-http/src/http/mod.rs:3177, 3191-3209`). AWS-pin
+  existing-bucket vs missing-bucket behavior for header, presigned, and POST
+  auth before changing this path; A8 already pins the per-auth-family error
+  shape for wrong scope.
 - [ ] `route_map_valid_until_ms: Option<u64>` is fail-open — `None` means
   valid forever (`storage/src/storage_node_server.rs:411-427`, mirrored
   cluster.rs:3872-3878). Fix: required deadline or

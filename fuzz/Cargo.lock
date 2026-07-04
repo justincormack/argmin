@@ -1154,6 +1154,7 @@ dependencies = [
  "rusqlite",
  "s3-types",
  "thiserror",
+ "tokio",
 ]
 
 [[package]]

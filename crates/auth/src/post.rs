@@ -4,7 +4,9 @@
 /// `policy`, `x-amz-signature`
 use crate::credential::{parse_credential_scope_ref, CredentialStore};
 use crate::error::AuthError;
-use crate::request::{validate_static_record_token_and_expiry, AuthContext, AuthMode};
+use crate::request::{
+    validate_static_record_token_and_expiry, AuthContext, AuthMode, ExpectedSigningRegion,
+};
 use crate::sigv4;
 
 const TRACE_TARGET: &str = "auth";
@@ -25,13 +27,13 @@ pub struct PreparedPostPolicy {
 
 #[derive(Clone, Copy, Debug)]
 pub struct ExpectedCredentialScope<'a> {
-    region: Option<&'a str>,
+    region: ExpectedSigningRegion<'a>,
     service: &'a str,
 }
 
 impl<'a> ExpectedCredentialScope<'a> {
     #[must_use]
-    pub fn new(region: Option<&'a str>, service: &'a str) -> Self {
+    pub fn new(region: ExpectedSigningRegion<'a>, service: &'a str) -> Self {
         Self { region, service }
     }
 }
@@ -84,7 +86,7 @@ pub fn authenticate_post_sigv4(
 
     let credential =
         parse_credential_scope_ref(request.credential).ok_or(AuthError::MalformedAuth)?;
-    if let Some(region) = expected_scope.region {
+    if let Some(region) = expected_scope.region.exact() {
         if credential.region != region {
             return Err(AuthError::InvalidCredentialScopeRegion {
                 param: "X-Amz-Credential",
@@ -596,7 +598,7 @@ mod tests {
             &policy_b64,
             &sig_hex,
             &store,
-            ExpectedCredentialScope::new(None, "s3"),
+            ExpectedCredentialScope::new(ExpectedSigningRegion::DeferredToBucketRouting, "s3"),
         )
         .unwrap();
         assert_eq!(ctx.mode, AuthMode::PostSigV4);
@@ -617,7 +619,7 @@ mod tests {
                 security_token: Some("unexpected"),
             },
             &store,
-            ExpectedCredentialScope::new(None, "s3"),
+            ExpectedCredentialScope::new(ExpectedSigningRegion::DeferredToBucketRouting, "s3"),
             0,
         )
         .unwrap_err();
@@ -646,7 +648,7 @@ mod tests {
                 security_token: None,
             },
             &store,
-            ExpectedCredentialScope::new(None, "s3"),
+            ExpectedCredentialScope::new(ExpectedSigningRegion::DeferredToBucketRouting, "s3"),
             101,
         )
         .unwrap_err();
@@ -663,7 +665,7 @@ mod tests {
             "policy",
             "sig",
             &store,
-            ExpectedCredentialScope::new(None, "s3"),
+            ExpectedCredentialScope::new(ExpectedSigningRegion::DeferredToBucketRouting, "s3"),
         )
         .unwrap_err();
         assert!(matches!(err, AuthError::MalformedAuth));
@@ -679,7 +681,7 @@ mod tests {
             "policy",
             "sig",
             &store,
-            ExpectedCredentialScope::new(None, "s3"),
+            ExpectedCredentialScope::new(ExpectedSigningRegion::DeferredToBucketRouting, "s3"),
         )
         .unwrap_err();
         assert!(matches!(err, AuthError::MalformedAuth));
@@ -695,7 +697,7 @@ mod tests {
             "policy",
             "sig",
             &store,
-            ExpectedCredentialScope::new(None, "s3"),
+            ExpectedCredentialScope::new(ExpectedSigningRegion::DeferredToBucketRouting, "s3"),
         )
         .unwrap_err();
         assert!(matches!(err, AuthError::MalformedAuth));
@@ -711,7 +713,7 @@ mod tests {
             "policy",
             "sig",
             &store,
-            ExpectedCredentialScope::new(None, "s3"),
+            ExpectedCredentialScope::new(ExpectedSigningRegion::DeferredToBucketRouting, "s3"),
         )
         .unwrap_err();
         assert!(matches!(err, AuthError::UnknownAccessKey));
@@ -727,7 +729,7 @@ mod tests {
             "policy",
             "0000000000000000000000000000000000000000000000000000000000000000",
             &store,
-            ExpectedCredentialScope::new(None, "s3"),
+            ExpectedCredentialScope::new(ExpectedSigningRegion::DeferredToBucketRouting, "s3"),
         )
         .unwrap_err();
         assert!(matches!(err, AuthError::SignatureMismatch));
@@ -753,7 +755,7 @@ mod tests {
             policy_b64,
             &sig_hex,
             &store,
-            ExpectedCredentialScope::new(None, "s3"),
+            ExpectedCredentialScope::new(ExpectedSigningRegion::DeferredToBucketRouting, "s3"),
         )
         .unwrap_err();
         assert!(matches!(
@@ -787,7 +789,10 @@ mod tests {
             policy_b64,
             &sig_hex,
             &store,
-            ExpectedCredentialScope::new(Some("us-east-1"), "s3"),
+            ExpectedCredentialScope::new(
+                ExpectedSigningRegion::ExactEndpointRegion("us-east-1"),
+                "s3",
+            ),
         )
         .unwrap_err();
         assert!(matches!(
@@ -1398,7 +1403,7 @@ mod tests {
             "policy",
             "sig",
             &store,
-            ExpectedCredentialScope::new(None, "s3"),
+            ExpectedCredentialScope::new(ExpectedSigningRegion::DeferredToBucketRouting, "s3"),
         )
         .unwrap_err();
         assert!(matches!(err, AuthError::MalformedAuth));
@@ -1414,7 +1419,7 @@ mod tests {
             "policy",
             "sig",
             &store,
-            ExpectedCredentialScope::new(None, "s3"),
+            ExpectedCredentialScope::new(ExpectedSigningRegion::DeferredToBucketRouting, "s3"),
         )
         .unwrap_err();
         assert!(matches!(err, AuthError::MalformedAuth));
@@ -1432,7 +1437,7 @@ mod tests {
             "policy",
             "sig",
             &store,
-            ExpectedCredentialScope::new(None, "s3"),
+            ExpectedCredentialScope::new(ExpectedSigningRegion::DeferredToBucketRouting, "s3"),
         )
         .unwrap_err();
         assert!(matches!(err, AuthError::MalformedAuth));
@@ -1448,7 +1453,7 @@ mod tests {
             "policy",
             "sig",
             &store,
-            ExpectedCredentialScope::new(None, "s3"),
+            ExpectedCredentialScope::new(ExpectedSigningRegion::DeferredToBucketRouting, "s3"),
         )
         .unwrap_err();
         assert!(matches!(err, AuthError::MalformedAuth));
@@ -1464,7 +1469,7 @@ mod tests {
             "policy",
             "sig",
             &store,
-            ExpectedCredentialScope::new(None, "s3"),
+            ExpectedCredentialScope::new(ExpectedSigningRegion::DeferredToBucketRouting, "s3"),
         )
         .unwrap_err();
         assert!(matches!(err, AuthError::MalformedAuth));
@@ -1488,7 +1493,7 @@ mod tests {
             "policy",
             "sig",
             &store,
-            ExpectedCredentialScope::new(None, "s3"),
+            ExpectedCredentialScope::new(ExpectedSigningRegion::DeferredToBucketRouting, "s3"),
         )
         .unwrap_err();
         assert!(matches!(err, AuthError::UnknownAccessKey));

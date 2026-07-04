@@ -29,6 +29,26 @@ pub enum AuthMode {
     Anonymous,
 }
 
+/// Expected SigV4 signing region for credential-scope validation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExpectedSigningRegion<'a> {
+    /// The request is authenticated at a regional endpoint and must use that
+    /// endpoint's region in the SigV4 credential scope.
+    ExactEndpointRegion(&'a str),
+    /// A bucket-aware caller will compare the signing region after
+    /// authentication, once S3 routing and missing-bucket semantics are known.
+    DeferredToBucketRouting,
+}
+
+impl<'a> ExpectedSigningRegion<'a> {
+    pub(crate) fn exact(self) -> Option<&'a str> {
+        match self {
+            Self::ExactEndpointRegion(region) => Some(region),
+            Self::DeferredToBucketRouting => None,
+        }
+    }
+}
+
 /// Signing context needed for verifying aws-chunked streaming signatures.
 #[derive(Clone, PartialEq, Eq)]
 pub struct StreamingSigningContext {
@@ -174,9 +194,9 @@ impl HeaderSource for [(String, String)] {
 
 /// Authenticate a SigV4 request and return identity context.
 ///
-/// Pass `Some(region)` for normal request authentication.
-/// Pass `None` only when a higher-level caller will validate the SigV4 region
-/// after authentication, such as bucket-aware endpoint routing.
+/// Pass `ExactEndpointRegion(region)` for normal request authentication. Pass
+/// `DeferredToBucketRouting` only when a higher-level caller will validate the
+/// SigV4 region after authentication, such as bucket-aware endpoint routing.
 #[allow(clippy::too_many_arguments)]
 pub fn authenticate_request<H: HeaderSource + ?Sized>(
     method: &str,
@@ -185,7 +205,7 @@ pub fn authenticate_request<H: HeaderSource + ?Sized>(
     headers: &H,
     body: &[u8],
     store: &CredentialStore,
-    expected_region: Option<&str>,
+    expected_region: ExpectedSigningRegion<'_>,
     expected_service: &str,
     now_epoch_secs: u64,
 ) -> Result<AuthContext, AuthError> {
@@ -272,13 +292,15 @@ fn authenticate_header<H: HeaderSource + ?Sized>(
     headers: &H,
     body: &[u8],
     store: &CredentialStore,
-    expected_region: Option<&str>,
+    expected_region: ExpectedSigningRegion<'_>,
     expected_service: &str,
     now_epoch_secs: u64,
     auth_header: &str,
 ) -> Result<AuthContext, AuthError> {
     let parsed = parse_auth_header(auth_header)?;
-    if expected_region.is_some_and(|region| parsed.credential.region != region)
+    if expected_region
+        .exact()
+        .is_some_and(|region| parsed.credential.region != region)
         || parsed.credential.service != expected_service
     {
         return Err(AuthError::MalformedAuth);
@@ -360,7 +382,7 @@ fn authenticate_presigned<H: HeaderSource + ?Sized>(
     headers: &H,
     _body: &[u8],
     store: &CredentialStore,
-    expected_region: Option<&str>,
+    expected_region: ExpectedSigningRegion<'_>,
     expected_service: &str,
     now_epoch_secs: u64,
 ) -> Result<AuthContext, AuthError> {
@@ -384,7 +406,7 @@ fn authenticate_presigned<H: HeaderSource + ?Sized>(
             param: "X-Amz-Credential",
         },
     )?;
-    if let Some(region) = expected_region {
+    if let Some(region) = expected_region.exact() {
         if credential.region != region {
             return Err(AuthError::InvalidQueryCredentialRegion {
                 param: "X-Amz-Credential",
@@ -710,7 +732,7 @@ mod tests {
             &headers,
             b"",
             &store,
-            Some("us-east-1"),
+            ExpectedSigningRegion::ExactEndpointRegion("us-east-1"),
             "s3",
             aws_example_time(),
         )
@@ -732,7 +754,7 @@ mod tests {
             &headers,
             b"",
             &store,
-            Some("us-east-1"),
+            ExpectedSigningRegion::ExactEndpointRegion("us-east-1"),
             "s3",
             aws_example_time() + crate::SIGV4_CLOCK_SKEW_SECS + 1,
         )
@@ -751,7 +773,7 @@ mod tests {
             &headers,
             b"",
             &store,
-            Some("us-east-1"),
+            ExpectedSigningRegion::ExactEndpointRegion("us-east-1"),
             "s3",
             0,
         )
@@ -770,7 +792,7 @@ mod tests {
             &headers,
             b"",
             &store,
-            Some("us-east-1"),
+            ExpectedSigningRegion::ExactEndpointRegion("us-east-1"),
             "s3",
             aws_example_time() - crate::SIGV4_CLOCK_SKEW_SECS - 1,
         )
@@ -789,7 +811,7 @@ mod tests {
             &headers,
             b"",
             &store,
-            Some("us-east-1"),
+            ExpectedSigningRegion::ExactEndpointRegion("us-east-1"),
             "s3",
             aws_example_time() + crate::SIGV4_CLOCK_SKEW_SECS,
         )
@@ -807,7 +829,7 @@ mod tests {
             &headers,
             b"",
             &store,
-            Some("us-east-1"),
+            ExpectedSigningRegion::ExactEndpointRegion("us-east-1"),
             "s3",
             aws_example_time(),
         )
@@ -829,7 +851,7 @@ mod tests {
             &headers,
             b"",
             &store,
-            Some("us-east-1"),
+            ExpectedSigningRegion::ExactEndpointRegion("us-east-1"),
             "s3",
             aws_example_time(),
         )
@@ -876,7 +898,7 @@ mod tests {
             &headers,
             b"",
             &store,
-            Some("us-east-1"),
+            ExpectedSigningRegion::ExactEndpointRegion("us-east-1"),
             "s3",
             parse_amz_date("20240201T120500Z").unwrap(),
         )
@@ -931,7 +953,7 @@ mod tests {
             &headers,
             b"",
             &store,
-            Some("us-east-1"),
+            ExpectedSigningRegion::ExactEndpointRegion("us-east-1"),
             "s3",
             parse_amz_date("20240201T120500Z").unwrap(),
         )
@@ -978,7 +1000,7 @@ mod tests {
             &headers,
             b"",
             &store,
-            Some("us-east-1"),
+            ExpectedSigningRegion::ExactEndpointRegion("us-east-1"),
             "s3",
             parse_amz_date("20240201T120500Z").unwrap(),
         )
@@ -1025,7 +1047,7 @@ mod tests {
             &headers,
             b"",
             &store,
-            Some("us-east-1"),
+            ExpectedSigningRegion::ExactEndpointRegion("us-east-1"),
             "s3",
             parse_amz_date("20240201T120500Z").unwrap(),
         )
@@ -1044,7 +1066,7 @@ mod tests {
             &headers,
             b"",
             &store,
-            Some("us-east-1"),
+            ExpectedSigningRegion::ExactEndpointRegion("us-east-1"),
             "s3",
             aws_example_time(),
         )
@@ -1069,7 +1091,7 @@ mod tests {
             &headers,
             b"",
             &store,
-            Some("us-east-1"),
+            ExpectedSigningRegion::ExactEndpointRegion("us-east-1"),
             "s3",
             parse_amz_date("20240201T120500Z").unwrap(),
         )
@@ -1104,7 +1126,7 @@ mod tests {
             &headers,
             b"",
             &store,
-            Some("us-east-1"),
+            ExpectedSigningRegion::ExactEndpointRegion("us-east-1"),
             "s3",
             aws_example_time(),
         )
@@ -1137,7 +1159,7 @@ mod tests {
             &headers,
             b"",
             &store,
-            Some("us-east-1"),
+            ExpectedSigningRegion::ExactEndpointRegion("us-east-1"),
             "s3",
             aws_example_time(),
         )
@@ -1158,7 +1180,7 @@ mod tests {
             &headers,
             b"",
             &store,
-            Some("us-east-1"),
+            ExpectedSigningRegion::ExactEndpointRegion("us-east-1"),
             "s3",
             aws_example_time(),
         )
@@ -1180,7 +1202,7 @@ mod tests {
             &headers,
             b"",
             &store,
-            Some("us-east-1"),
+            ExpectedSigningRegion::ExactEndpointRegion("us-east-1"),
             "s3",
             aws_example_time(),
         )
@@ -1207,7 +1229,7 @@ mod tests {
             &headers,
             b"",
             &store,
-            Some("us-east-1"),
+            ExpectedSigningRegion::ExactEndpointRegion("us-east-1"),
             "s3",
             presigned_example_time(),
         )
@@ -1232,7 +1254,7 @@ mod tests {
             &headers,
             b"",
             &store,
-            Some("us-east-1"),
+            ExpectedSigningRegion::ExactEndpointRegion("us-east-1"),
             "s3",
             presigned_example_time(),
         )
@@ -1257,7 +1279,7 @@ mod tests {
             &headers,
             b"",
             &store,
-            Some("us-east-1"),
+            ExpectedSigningRegion::ExactEndpointRegion("us-east-1"),
             "s3",
             presigned_example_time(),
         )
@@ -1282,7 +1304,7 @@ mod tests {
             &headers,
             b"",
             &store,
-            Some("us-east-1"),
+            ExpectedSigningRegion::ExactEndpointRegion("us-east-1"),
             "s3",
             presigned_example_time(),
         )
@@ -1309,7 +1331,7 @@ mod tests {
             &headers,
             b"",
             &store,
-            Some("us-east-1"),
+            ExpectedSigningRegion::ExactEndpointRegion("us-east-1"),
             "s3",
             0,
         )
@@ -1338,7 +1360,7 @@ mod tests {
             &headers,
             b"",
             &store,
-            Some("us-east-1"),
+            ExpectedSigningRegion::ExactEndpointRegion("us-east-1"),
             "s3",
             0,
         )
@@ -1367,7 +1389,7 @@ mod tests {
             &headers,
             b"",
             &store,
-            Some("us-east-1"),
+            ExpectedSigningRegion::ExactEndpointRegion("us-east-1"),
             "s3",
             0,
         )
@@ -1394,7 +1416,7 @@ mod tests {
             &headers,
             b"",
             &store,
-            Some("us-east-1"),
+            ExpectedSigningRegion::ExactEndpointRegion("us-east-1"),
             "s3",
             0,
         )
@@ -1421,7 +1443,7 @@ mod tests {
             &headers,
             b"",
             &store,
-            Some("us-east-1"),
+            ExpectedSigningRegion::ExactEndpointRegion("us-east-1"),
             "s3",
             0,
         )
@@ -1448,7 +1470,7 @@ mod tests {
             &headers,
             b"",
             &store,
-            Some("us-east-1"),
+            ExpectedSigningRegion::ExactEndpointRegion("us-east-1"),
             "s3",
             0,
         )
@@ -1475,7 +1497,7 @@ mod tests {
             &headers,
             b"",
             &store,
-            Some("us-east-1"),
+            ExpectedSigningRegion::ExactEndpointRegion("us-east-1"),
             "s3",
             presigned_example_time(),
         )
@@ -1497,7 +1519,7 @@ mod tests {
             &headers,
             b"",
             &store,
-            Some("us-east-1"),
+            ExpectedSigningRegion::ExactEndpointRegion("us-east-1"),
             "s3",
             presigned_example_time(),
         )
@@ -1522,7 +1544,7 @@ mod tests {
             &headers,
             b"",
             &store,
-            Some("us-east-1"),
+            ExpectedSigningRegion::ExactEndpointRegion("us-east-1"),
             "s3",
             presigned_example_time(),
         )
@@ -1547,7 +1569,7 @@ mod tests {
             &headers,
             b"",
             &store,
-            Some("us-east-1"),
+            ExpectedSigningRegion::ExactEndpointRegion("us-east-1"),
             "s3",
             0,
         )
@@ -1572,7 +1594,7 @@ mod tests {
             &headers,
             b"",
             &store,
-            Some("us-east-1"),
+            ExpectedSigningRegion::ExactEndpointRegion("us-east-1"),
             "s3",
             presigned_example_time(),
         )
@@ -1607,7 +1629,7 @@ mod tests {
             &headers,
             b"",
             &store,
-            Some("us-east-1"),
+            ExpectedSigningRegion::ExactEndpointRegion("us-east-1"),
             "s3",
             presigned_example_time(),
         )
@@ -1629,7 +1651,7 @@ mod tests {
             &headers,
             b"",
             &store,
-            Some("us-east-1"),
+            ExpectedSigningRegion::ExactEndpointRegion("us-east-1"),
             "s3",
             presigned_example_time(),
         )
@@ -1869,7 +1891,7 @@ mod tests {
             &headers_with_auth,
             b"",
             &store,
-            Some("us-east-1"),
+            ExpectedSigningRegion::ExactEndpointRegion("us-east-1"),
             "s3",
             aws_example_time(),
         )
@@ -1935,7 +1957,7 @@ mod tests {
             &headers_with_auth,
             body,
             &store,
-            Some("us-east-1"),
+            ExpectedSigningRegion::ExactEndpointRegion("us-east-1"),
             "s3",
             aws_example_time(),
         )
@@ -1966,7 +1988,7 @@ mod tests {
             &headers,
             b"",
             &store,
-            Some("us-east-1"),
+            ExpectedSigningRegion::ExactEndpointRegion("us-east-1"),
             "s3",
             presigned_example_time(),
         )
@@ -1999,7 +2021,7 @@ mod tests {
             &headers,
             b"",
             &store,
-            Some("us-east-1"),
+            ExpectedSigningRegion::ExactEndpointRegion("us-east-1"),
             "s3",
             presigned_example_time(),
         )
@@ -2022,7 +2044,7 @@ mod tests {
             &headers,
             b"",
             &store,
-            Some("us-east-1"),
+            ExpectedSigningRegion::ExactEndpointRegion("us-east-1"),
             "s3",
             presigned_example_time(),
         )
@@ -2051,7 +2073,7 @@ mod tests {
             &headers,
             b"",
             &store,
-            Some("us-east-1"),
+            ExpectedSigningRegion::ExactEndpointRegion("us-east-1"),
             "s3",
             presigned_example_time(),
         )
@@ -2074,7 +2096,7 @@ mod tests {
             &headers,
             b"",
             &store,
-            Some("us-east-1"),
+            ExpectedSigningRegion::ExactEndpointRegion("us-east-1"),
             "s3",
             presigned_example_time(),
         )
@@ -2097,7 +2119,7 @@ mod tests {
             &headers,
             b"",
             &store,
-            Some("us-east-1"),
+            ExpectedSigningRegion::ExactEndpointRegion("us-east-1"),
             "s3",
             presigned_example_time(),
         )
@@ -2126,7 +2148,7 @@ mod tests {
             &headers,
             b"",
             &store,
-            Some("us-east-1"),
+            ExpectedSigningRegion::ExactEndpointRegion("us-east-1"),
             "s3",
             presigned_example_time(),
         )
@@ -2146,7 +2168,7 @@ mod tests {
             &headers,
             b"",
             &store,
-            Some("us-east-1"),
+            ExpectedSigningRegion::ExactEndpointRegion("us-east-1"),
             "s3",
             presigned_example_time(),
         )
@@ -2169,7 +2191,7 @@ mod tests {
             &headers,
             b"",
             &store,
-            Some("us-east-1"),
+            ExpectedSigningRegion::ExactEndpointRegion("us-east-1"),
             "s3",
             presigned_example_time(),
         )
@@ -2197,7 +2219,7 @@ mod tests {
             &headers,
             b"",
             &store,
-            Some("us-east-1"),
+            ExpectedSigningRegion::ExactEndpointRegion("us-east-1"),
             "s3",
             0,
         )
@@ -2222,7 +2244,7 @@ mod tests {
             &headers,
             b"",
             &store,
-            Some("us-east-1"),
+            ExpectedSigningRegion::ExactEndpointRegion("us-east-1"),
             "s3",
             0,
         )
@@ -2247,7 +2269,7 @@ mod tests {
             &headers,
             b"",
             &store,
-            Some("us-east-1"),
+            ExpectedSigningRegion::ExactEndpointRegion("us-east-1"),
             "s3",
             0,
         )

@@ -3070,7 +3070,7 @@ impl HttpFrontend {
                 &req.header_source(),
                 &req.body,
                 &self.credentials,
-                None,
+                auth::ExpectedSigningRegion::DeferredToBucketRouting,
                 "s3",
                 now,
             )
@@ -3082,7 +3082,7 @@ impl HttpFrontend {
                 &req.header_source(),
                 &req.body,
                 &self.credentials,
-                Some(self.coordinator.region()),
+                auth::ExpectedSigningRegion::ExactEndpointRegion(self.coordinator.region()),
                 "s3",
                 now,
             )
@@ -3437,7 +3437,10 @@ impl HttpFrontend {
                     security_token: field("x-amz-security-token"),
                 },
                 &self.credentials,
-                auth::ExpectedCredentialScope::new(Some(self.coordinator.region()), "s3"),
+                auth::ExpectedCredentialScope::new(
+                    auth::ExpectedSigningRegion::ExactEndpointRegion(self.coordinator.region()),
+                    "s3",
+                ),
                 now,
             )
             .map_err(ServerError::Auth)?

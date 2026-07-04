@@ -69,7 +69,8 @@ pub use post::{
     PreparedPostPolicy,
 };
 pub use request::{
-    authenticate_request, AuthContext, AuthMode, HeaderSource, StreamingSigningContext,
+    authenticate_request, AuthContext, AuthMode, ExpectedSigningRegion, HeaderSource,
+    StreamingSigningContext,
 };
 pub use sigv4::{parse_auth_header, verify_request, SigV4Auth};
 
