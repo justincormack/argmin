@@ -17,9 +17,10 @@ use aws_sdk_s3::operation::put_bucket_lifecycle_configuration::{
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{
     BlockedEncryptionTypes, BucketCannedAcl, BucketLifecycleConfiguration,
-    BucketLocationConstraint, CreateBucketConfiguration, Delete, DeletedObject, EncryptionType,
-    Error as DeleteObjectError, ObjectIdentifier, ObjectOwnership, ServerSideEncryption,
-    ServerSideEncryptionByDefault, ServerSideEncryptionConfiguration, ServerSideEncryptionRule,
+    BucketLocationConstraint, BucketVersioningStatus, CreateBucketConfiguration, Delete,
+    DeletedObject, EncryptionType, Error as DeleteObjectError, ObjectIdentifier, ObjectOwnership,
+    ServerSideEncryption, ServerSideEncryptionByDefault, ServerSideEncryptionConfiguration,
+    ServerSideEncryptionRule, VersioningConfiguration,
 };
 use aws_sdk_s3::Client;
 use base64::Engine;
@@ -2111,6 +2112,21 @@ pub async fn wait_for_versioned_writes_visible(client: &Client, bucket: &str) {
         "versioned writes did not become visible for {bucket}: {}",
         last_error.unwrap_or_else(|| "no attempts completed".to_string())
     );
+}
+
+pub async fn enable_bucket_versioning(client: &Client, bucket: &str) {
+    client
+        .put_bucket_versioning()
+        .bucket(bucket)
+        .versioning_configuration(
+            VersioningConfiguration::builder()
+                .status(BucketVersioningStatus::Enabled)
+                .build(),
+        )
+        .send_retrying_operation_aborted("enable bucket versioning")
+        .await
+        .unwrap();
+    wait_for_versioned_writes_visible(client, bucket).await;
 }
 
 async fn cleanup_versioning_readiness_key(client: &Client, bucket: &str) {

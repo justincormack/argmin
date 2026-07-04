@@ -13,7 +13,7 @@ pub use helpers::{
     create_public_bucket, create_public_write_bucket, delete_all_and_bucket,
     delete_bucket_retrying_operation_aborted, delete_object_retrying_operation_aborted,
     delete_objects_retrying_operation_aborted, delete_objects_with_md5,
-    disable_bucket_public_access_block, enable_bucket_sse_c, err_status,
+    disable_bucket_public_access_block, enable_bucket_sse_c, enable_bucket_versioning, err_status,
     expected_raw_bucket_location_constraint, get_object_body_retrying_operation_aborted,
     is_sdk_stream_disconnect, is_sdk_stream_disconnect_or_status, object_url, presign_url,
     presign_url_with_credentials, presign_url_without_host_signed_header,

@@ -4,7 +4,8 @@ use aws_sdk_s3::types::{
     BucketVersioningStatus, CompletedMultipartUpload, CompletedPart, VersioningConfiguration,
 };
 use s3_tests::{
-    cleanup_versioned_bucket, err_status, unique_bucket, SendRetryingOperationAborted, CTX,
+    assert_s3_err_code, cleanup_versioned_bucket, err_status, unique_bucket,
+    SendRetryingOperationAborted, CTX,
 };
 use serde_json::json;
 use std::time::{Duration, Instant};
@@ -1240,17 +1241,7 @@ fn test_complete_multipart_ifnonmatch_current_object_in_versioned_bucket() {
         let client = CTX.client();
         let bucket = unique_bucket();
         s3_tests::create_bucket(client, &bucket).await.unwrap();
-        client
-            .put_bucket_versioning()
-            .bucket(&bucket)
-            .versioning_configuration(
-                VersioningConfiguration::builder()
-                    .status(BucketVersioningStatus::Enabled)
-                    .build(),
-            )
-            .send_retrying_operation_aborted("put conditional bucket versioning")
-            .await
-            .unwrap();
+        s3_tests::enable_bucket_versioning(client, &bucket).await;
 
         let first = put_object_result_retrying_operation_aborted(
             "put first versioned conditional object",
@@ -1320,17 +1311,7 @@ fn test_complete_multipart_ifmatch_current_object_in_versioned_bucket() {
         let client = CTX.client();
         let bucket = unique_bucket();
         s3_tests::create_bucket(client, &bucket).await.unwrap();
-        client
-            .put_bucket_versioning()
-            .bucket(&bucket)
-            .versioning_configuration(
-                VersioningConfiguration::builder()
-                    .status(BucketVersioningStatus::Enabled)
-                    .build(),
-            )
-            .send_retrying_operation_aborted("put conditional bucket versioning")
-            .await
-            .unwrap();
+        s3_tests::enable_bucket_versioning(client, &bucket).await;
 
         let first = put_object_result_retrying_operation_aborted(
             "put first versioned conditional object",
@@ -1488,6 +1469,79 @@ fn test_delete_object_ifmatch_failed() {
         assert_eq!(&data[..], b"hello");
 
         cleanup(&bucket, &["obj"]).await;
+    });
+}
+
+#[test]
+fn test_delete_object_ifmatch_nonexistent_returns_no_such_key() {
+    s3_tests::run(async {
+        let bucket = setup_bucket().await;
+
+        let result = CTX
+            .client()
+            .delete_object()
+            .bucket(&bucket)
+            .key("nonexistent")
+            .if_match("\"0000000000000000\"")
+            .send_retrying_operation_aborted("delete conditional missing object")
+            .await;
+        assert_eq!(err_status(&result), 404);
+        assert_s3_err_code(&result, "NoSuchKey");
+
+        cleanup(&bucket, &[]).await;
+    });
+}
+
+#[test]
+fn test_delete_object_ifmatch_versioned_nonexistent_returns_no_such_key() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
+        s3_tests::enable_bucket_versioning(client, &bucket).await;
+
+        let result = client
+            .delete_object()
+            .bucket(&bucket)
+            .key("nonexistent")
+            .if_match("\"0000000000000000\"")
+            .send_retrying_operation_aborted("delete conditional missing versioned object")
+            .await;
+        assert_eq!(err_status(&result), 404);
+        assert_s3_err_code(&result, "NoSuchKey");
+
+        cleanup_versioned_bucket(client, &bucket).await;
+    });
+}
+
+#[test]
+fn test_delete_object_ifmatch_current_delete_marker_returns_no_such_key() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
+        s3_tests::enable_bucket_versioning(client, &bucket).await;
+
+        put_object(&bucket, "obj", b"hello").await;
+        client
+            .delete_object()
+            .bucket(&bucket)
+            .key("obj")
+            .send_retrying_operation_aborted("create current delete marker")
+            .await
+            .unwrap();
+
+        let result = client
+            .delete_object()
+            .bucket(&bucket)
+            .key("obj")
+            .if_match("\"0000000000000000\"")
+            .send_retrying_operation_aborted("delete conditional current delete marker")
+            .await;
+        assert_eq!(err_status(&result), 404);
+        assert_s3_err_code(&result, "NoSuchKey");
+
+        cleanup_versioned_bucket(client, &bucket).await;
     });
 }
 

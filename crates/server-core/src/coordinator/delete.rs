@@ -49,7 +49,12 @@ impl Coordinator {
                         if !cond.is_empty() {
                             let record = match stored {
                                 Some(StoredObject::Live(record)) => record,
-                                _ => return Err(ServerError::PreconditionFailed),
+                                _ => {
+                                    return Err(ServerError::ObjectNotFound {
+                                        bucket: bucket.as_str().to_string(),
+                                        key: key.as_str().to_string(),
+                                    });
+                                }
                             };
                             let etag_str = record.etag.format();
                             check_delete_conditions(cond, &etag_str)?;
@@ -239,7 +244,12 @@ impl Coordinator {
                             if !cond.is_empty() {
                                 let record = match stored {
                                     Some(StoredObject::Live(record)) => record,
-                                    _ => return Err(ServerError::PreconditionFailed),
+                                    _ => {
+                                        return Err(ServerError::ObjectNotFound {
+                                            bucket: bucket.as_str().to_string(),
+                                            key: key.as_str().to_string(),
+                                        });
+                                    }
                                 };
                                 let etag_str = record.etag.format();
                                 check_delete_conditions(cond, &etag_str)?;

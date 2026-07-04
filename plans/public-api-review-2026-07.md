@@ -274,14 +274,24 @@ steps it performs.
   hooks. Fix: use `ServerError::InternalError`; delete the two closures in
   favor of the free function.
 
-- [ ] **H2. `If-Match` against a missing object returns 412; AWS documents
-  404 for conditional writes/deletes on nonexistent objects.**
-  `crates/server-core/src/conditional.rs:279-289` and conditional delete at
-  `coordinator/delete.rs:49-56`. Behavior is deliberate (test
-  `write_if_match_nonexistent_returns_412`) but no diff test pins either
-  answer. Fix: confirm with a diff test against AWS, then return
-  `ObjectNotFound` for the object-absent case (keep 412 for etag mismatch on
-  a live object).
+- [x] **H2. `If-Match` against a missing object returns 412; AWS returns 404
+  for conditional writes/deletes on nonexistent objects.** The original finding
+  missed existing public `s3-tests` coverage for write paths:
+  `test_put_object_ifmatch_nonexisted_failed` and
+  `test_complete_multipart_ifmatch_nonexisted_failed` already pin 404
+  `NoSuchKey` locally and against AWS. The real gap was `DeleteObject` with
+  `If-Match` on a missing current object: added
+  `test_delete_object_ifmatch_nonexistent_returns_no_such_key`,
+  `test_delete_object_ifmatch_versioned_nonexistent_returns_no_such_key`, and
+  `test_delete_object_ifmatch_current_delete_marker_returns_no_such_key`,
+  verified them against AWS, and fixed both conditional delete paths in
+  `coordinator/delete.rs` to return `ObjectNotFound` when the current object is
+  absent/non-live while preserving 412 for ETag mismatch on a live object. The
+  versioned tests use the shared versioning helper that waits for versioned
+  writes to converge. The lower-level
+  `check_write_conditions(None)` unit remains an internal helper behavior;
+  public write callers convert `If-Match` with no existing object to
+  `ObjectNotFound` before calling it.
 
 - [ ] **H3. Lifecycle `render_filter` dead guard: empty `<Filter/>` renders
   as `<Filter><And></And></Filter>`.** `crates/s3-types/src/lifecycle.rs:264`
