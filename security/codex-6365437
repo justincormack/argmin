@@ -1,0 +1,129 @@
+Refresh merge retains historical routes without pruning
+Link: https://chatgpt.com/codex/cloud/security/findings/24829dec7bd08191b45b4786a3827108?sev=&repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin
+Criticality: informational (attack path: ignore)
+Status: fixed
+
+# Metadata
+Repo: justincormack/argmin
+Commit: 6365437
+Author: justin@specialbusservice.com
+Created: 04/07/2026, 18:11:06
+Assignee: Unassigned
+Signals: Validated, Attack-path
+
+# Summary
+Introduced: the new refresh merge preserves historical routes indefinitely and adds the previous current route set on every epoch advance without any pruning policy.
+The new StorageNodeProcessConfig::from_runtime_map_refresh method is intended to merge the bounded control-plane delta with locally retained history. However, it copies every existing historical route with an epoch older than the next epoch, adds every current route when advancing epochs, and then adds the new response history. There is no limit, history floor check, or consultation of the node's actual cluster-map history reference summary to discard routes that are no longer referenced by local shard/backfill state. As a result, a long-running node that experiences many cluster epoch changes can accumulate one historical route per PG per epoch indefinitely in its in-memory process config. This partially defeats the intent of bounding refresh history and can cause increasing memory/CPU overhead because configs are cloned and installed during refreshes. The issue appears to be an internal availability/correctness bug rather than an externally exploitable S3 security vulnerability.
+
+# Resolution
+Fixed in commit `84eb8013 Bound storage-node refresh history retention`.
+
+The storage-node runtime-map refresh merge now takes the node's `PgClusterMapHistoryReferenceSummary` from the same heartbeat used for the control-plane refresh. After merging local retained history, the previous current route set, and the bounded control-plane delta, it prunes historical routes by the actual local retention requirement:
+
+- if the node has no durable route-history reference, only the previous current route set is retained for refresh continuity;
+- if the node has a durable reference floor, routes at or after that floor are retained, plus the latest predecessor route per PG so change-point reconstruction at the floor remains valid;
+- exact metadata-transfer source-route epochs from the control-plane refresh are protected separately, so in-progress metadata-transfer retries keep the historical peering route required by storage-node transfer inspection.
+
+The fix added regressions for repeated epoch churn with bounded retained history, retained-floor predecessor preservation, and metadata-transfer source-route retention. The storage-node server test group passed with these cases (`cargo nextest run -p storage storage_node_server::tests`), and `cargo check -p storage` passed.
+
+# Validation
+## Rubric
+- [x] Confirm the introduced refresh path is actually used during storage-node control-plane refresh (storage_node_server.rs:1143-1145).
+- [x] Confirm from_runtime_map_refresh preserves existing local historical_pg_routes and adds the previous current route on every epoch advance without consulting a retention floor or size bound (storage_node_server.rs:420-435).
+- [x] Confirm the control-plane refresh response itself is bounded by observed_epoch/floor logic, so growth is caused by the local merge rather than an unbounded response (control_plane.rs:747-763).
+- [x] Dynamically reproduce repeated epoch advances where delta_history remains bounded but retained_history grows linearly in StorageNodeProcessConfig.
+- [x] Attempt crash, valgrind/ASan, and debugger validation before finalizing: direct PoC produced no crash as expected; valgrind unavailable; ASan unavailable on stable toolchain; LLDB run reproduced the growth.
+## Report
+Validated the finding as a reproducible storage-node refresh history growth bug, not a memory-safety crash. Key code evidence: crates/storage/src/storage_node_server.rs:408-435 implements StorageNodeProcessConfig::from_runtime_map_refresh. It copies every current.historical_pg_routes entry older than next.cluster_epoch at lines 420-424, adds every current pg_route when current.cluster_epoch < next.cluster_epoch at lines 425-429, then adds next.historical_pg_routes at lines 430-434, and installs the merged values without a size bound or floor-based pruning at line 435. Runtime refresh uses this helper at crates/storage/src/storage_node_server.rs:1143-1145. The only subsequent validation at crates/storage/src/storage_node_server.rs:461-489 checks node_id/data_dir/ec_shape/socket_path and does not prune history. The control plane side does bound the response by observed epoch: crates/storage/src/control_plane.rs:747-751 computes response_floor from observed_epoch, and lines 753-763 include only history at or above that floor. I added a targeted integration PoC at crates/storage/tests/refresh_history_growth.rs. It advances the cluster epoch 8 times while requesting each storage-node refresh from the node's immediately previous observed epoch. The control-plane delta remains bounded at delta_history=1 each time, but StorageNodeProcessConfig::from_runtime_map_refresh retains one route for every previous epoch. Cargo test output: step=1 retained_history=1 ... step=8 retained_history=8; final_retained_history=8 retained_epochs=[4, 5, 6, 7, 8, 9, 10, 11]. This confirms linear unbounded accumulation across refreshes despite bounded deltas. Direct crash was attempted via the PoC and no crash occurred, which is expected for this availability/resource-growth issue. Valgrind was unavailable in the container, and Rust ASan could not be enabled because the installed stable toolchain rejects -Z sanitizer=address. I also ran the PoC under LLDB non-interactively; it reproduced the same growth and exited normally.
+
+# Evidence
+crates/storage/src/storage_node_server.rs (L1143 to 1146)
+  Note: Runtime-map refresh now uses the new merging helper, so the unbounded retained-history behavior is exercised on control-plane refresh.
+```
+        let current_config = self.config_snapshot();
+        let next_config =
+            StorageNodeProcessConfig::from_runtime_map_refresh(&current_config, &runtime_map)?;
+        next_config.validate_runtime_refresh_from(&current_config)?;
+```
+
+crates/storage/src/storage_node_server.rs (L408 to 435)
+  Note: The new refresh merge copies all existing historical routes, adds all current routes when the epoch advances, and then adds the response history, but has no pruning based on the node's actual retained-history floor or any size bound.
+```
+    pub fn from_runtime_map_refresh(
+        current: &StorageNodeProcessConfig,
+        runtime_map: &ClusterRuntimeMapSnapshot,
+    ) -> Result<Self, StorageNodeServerError> {
+        let mut next = Self::from_runtime_map(
+            current.node_id,
+            current.data_dir.clone(),
+            current.default_ec_shape,
+            runtime_map,
+        )?;
+
+        let mut historical_pg_routes = BTreeMap::new();
+        for route in &current.historical_pg_routes {
+            if route.cluster_epoch < next.cluster_epoch {
+                historical_pg_routes.insert((route.cluster_epoch, route.pg_id), route.clone());
+            }
+        }
+        if current.cluster_epoch < next.cluster_epoch {
+            for route in &current.pg_routes {
+                historical_pg_routes.insert((route.cluster_epoch, route.pg_id), route.clone());
+            }
+        }
+        for route in &next.historical_pg_routes {
+            if route.cluster_epoch < next.cluster_epoch {
+                historical_pg_routes.insert((route.cluster_epoch, route.pg_id), route.clone());
+            }
+        }
+        next.historical_pg_routes = historical_pg_routes.into_values().collect();
+```
+
+# Attack-path analysis
+Final: ignore | Decider: model_decided | Matrix severity: ignore | Policy adjusted: ignore
+## Rationale
+Probability × impact does not support treating this as a security vulnerability. The code evidence and PoC support a real unbounded-history availability bug, but the attack surface is an internal storage-node/control-plane refresh path over private Unix sockets, not the public S3 HTTP API. Exploitation by a realistic in-scope attacker was not shown, and the impact is limited to gradual memory/CPU overhead without data exposure, auth bypass, privilege escalation, or code execution. Therefore the security criticality should be adjusted from low to ignore while preserving the issue as an engineering correctness/availability defect.
+## Likelihood
+ignore - An in-scope S3 client does not control the internal runtime-map refresh input. Triggering meaningful growth requires internal control-plane epoch churn or local/same-UID control-plane influence, which is outside the stated attacker model and protected by private Unix-socket directories.
+## Impact
+ignore - Validated impact is resource growth and possible availability degradation on a long-running storage node. There is no demonstrated confidentiality, integrity, identity, code-execution, or tenant-boundary impact.
+## Assumptions
+- Static assessment is limited to repository artifacts; no cloud APIs or runtime deployment state were queried.
+- The relevant in-scope attacker for the main product threat model is an S3 HTTP client, not a same-UID local process or control-plane operator.
+- No Kubernetes, Terraform, Docker, or ingress manifests were found in the checkout to override the default/local exposure model.
+- storage-node or combined process role using a control-plane runtime-map refresh loop
+- repeated cluster epoch advances over time
+- ability to cause or influence control-plane topology/history churn, or benign long-running operational churn
+## Path
+Local/control-plane authority or cluster churn
+  -> control-plane runtime-map refresh
+  -> storage-node from_runtime_map_refresh()
+  -> unpruned historical_pg_routes
+  -> memory/CPU overhead
+
+Public S3 HTTP clients: no evidenced edge into this path.
+## Path evidence
+- `crates/storage/src/storage_node_server.rs:408-435` - Refresh merge preserves all current.historical_pg_routes older than the next epoch, adds prior current pg_routes on epoch advance, and assigns the merged collection without pruning or a size bound.
+- `crates/storage/src/storage_node_server.rs:461-489` - Post-merge validation checks node identity, data directory, EC shape, and socket path, but does not prune or bound historical routes.
+- `crates/storage/src/storage_node_server.rs:1138-1146` - The storage-node control-plane refresh path calls from_runtime_map_refresh and validates the resulting config.
+- `crates/storage/src/control_plane.rs:747-789` - Control-plane storage-node refresh history is bounded by observed epoch/history floor and required transfer keys, indicating the unbounded growth is introduced by the local merge, not an unbounded response.
+- `crates/storage/src/storage_node_server.rs:1036-1050` - Storage-node server binds a UnixListener at the configured storage-node socket path rather than exposing this RPC path over a public TCP port.
+- `crates/storage/src/storage_node_server.rs:10584-10608` - Storage-node socket parent directory must be private mode 0700, limiting reachability to the service user/local filesystem permissions.
+- `crates/argmin-s3/src/main.rs:1345-1390` - Control-plane process also binds and accepts on a configured Unix socket, supporting an internal-local control-plane exposure model.
+- `crates/argmin-s3/src/config.rs:185-227` - Frontend credentials and S3 wrapping keys are environment configured only for frontend roles; listen address defaults to 127.0.0.1:9000 and is distinct from the internal storage-node refresh path.
+- `README.md:27-46` - Documentation requires running as a non-root user and lists the default S3 listen address and storage-node role configuration.
+- `README.md:161-164` - Documentation describes the multihost/storage path as intended for local development/tests while the distributed path is being built.
+## Narrative
+The finding is a real internal availability bug: from_runtime_map_refresh merges every existing historical route older than the next epoch, adds the previous current route set on epoch advance, and installs the merged map without a floor or size bound. Runtime refresh uses this helper. However, the relevant path is the storage-node control-plane refresh over Unix sockets, not the public S3 HTTP API. The control-plane response itself applies an observed-epoch/floor filter, and socket access is local/private. The validation PoC demonstrates linear retained-history growth, but no crash, auth bypass, data exposure, privilege escalation, or external attacker reachability. This should be tracked as a correctness/availability defect, not a security vulnerability under the stated threat model.
+## Controls
+- storage-node RPC uses Unix sockets rather than public TCP
+- storage-node socket parent directory must be mode 0700
+- control-plane socket directory is validated as private and owned by the service UID
+- argmin-s3 exits if run as root
+- S3 HTTP operations use configured SigV4 credentials, but no S3-to-refresh exploit path is evidenced
+- HTTP listener defaults to loopback 127.0.0.1:9000
+## Blindspots
+- No deployment manifests or service definitions were present to confirm real-world listener exposure or filesystem permissions.
+- Static analysis did not exhaustively prove that no future HTTP operation can indirectly cause control-plane epoch churn, but no such path was evidenced in the reviewed artifacts.
+- The validation PoC demonstrated bounded-step growth, not production-scale exhaustion or crash.
+- README role descriptions may lag newer distributed-control-plane code, so operational maturity of these roles is somewhat uncertain.
