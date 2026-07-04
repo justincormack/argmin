@@ -4650,7 +4650,7 @@ impl ControlPlaneRaftLogStore {
                     ControlPlaneRaftWalAppendError::AmbiguousRecordMayExist(error) => {
                         let message = error.to_string();
                         inner.poisoned = Some(format!(
-                            "ambiguous WAL append after frame write before file sync: {message}"
+                            "ambiguous WAL append after WAL write before file sync: {message}"
                         ));
                         return Err(control_plane_error_to_io_error(
                             "append OpenRaft WAL record after ambiguous record write",
@@ -4892,18 +4892,16 @@ impl ControlPlaneRaftWalFile {
                 source,
             })
             .map_err(ControlPlaneRaftWalAppendError::BeforeReplayableRecord)?;
-        file.write_all(&frame_len.to_be_bytes())
-            .map_err(|source| ControlPlaneError::Io {
-                context: "write control-plane OpenRaft WAL frame length",
-                source,
-            })
-            .map_err(ControlPlaneRaftWalAppendError::BeforeReplayableRecord)?;
-        file.write_all(&frame)
-            .map_err(|source| ControlPlaneError::Io {
-                context: "write control-plane OpenRaft WAL frame",
-                source,
-            })
-            .map_err(ControlPlaneRaftWalAppendError::BeforeReplayableRecord)?;
+        write_control_plane_raft_wal_bytes(
+            &mut file,
+            &frame_len.to_be_bytes(),
+            "write control-plane OpenRaft WAL frame length",
+        )?;
+        write_control_plane_raft_wal_bytes(
+            &mut file,
+            &frame,
+            "write control-plane OpenRaft WAL frame",
+        )?;
         inject_control_plane_raft_wal_file_sync_failure(&self.path)
             .map_err(ControlPlaneRaftWalAppendError::AmbiguousRecordMayExist)?;
         file.sync_all()
@@ -5061,6 +5059,17 @@ impl ControlPlaneRaftWalFile {
         sync_control_plane_raft_wal_parent(&self.path)?;
         Ok(())
     }
+}
+
+fn write_control_plane_raft_wal_bytes(
+    writer: &mut impl Write,
+    bytes: &[u8],
+    context: &'static str,
+) -> Result<(), ControlPlaneRaftWalAppendError> {
+    writer
+        .write_all(bytes)
+        .map_err(|source| ControlPlaneError::Io { context, source })
+        .map_err(ControlPlaneRaftWalAppendError::AmbiguousRecordMayExist)
 }
 
 impl ControlPlaneRaftRestartArtifact {
@@ -10986,6 +10995,48 @@ mod tests {
                 .unwrap(),
         ) as usize;
         start + CONTROL_PLANE_RAFT_WAL_FILE_FRAME_LEN + frame_len
+    }
+
+    struct PartialFailWriter {
+        fail_after: usize,
+        written: Vec<u8>,
+    }
+
+    impl Write for PartialFailWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            if self.written.len() >= self.fail_after {
+                return Err(io::Error::other("injected partial WAL write failure"));
+            }
+            let write_len = (self.fail_after - self.written.len()).min(buf.len());
+            self.written.extend_from_slice(&buf[..write_len]);
+            Ok(write_len)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn control_plane_raft_wal_partial_write_failure_is_ambiguous() {
+        let mut writer = PartialFailWriter {
+            fail_after: 2,
+            written: Vec::new(),
+        };
+        let err = write_control_plane_raft_wal_bytes(
+            &mut writer,
+            b"abcdef",
+            "write test control-plane OpenRaft WAL bytes",
+        )
+        .expect_err("partial WAL write failure should be ambiguous");
+        assert!(
+            matches!(
+                err,
+                ControlPlaneRaftWalAppendError::AmbiguousRecordMayExist(_)
+            ),
+            "partial WAL write failure should poison through the ambiguous append path: {err:?}"
+        );
+        assert_eq!(writer.written, b"ab");
     }
 
     #[test]
