@@ -265,14 +265,18 @@ steps it performs.
 
 ## Bugs — server layer
 
-- [ ] **H1. Internal failures returned as 400 `InvalidRequest` instead of
+- [x] **H1. Internal failures returned as 400 `InvalidRequest` instead of
   500.** `internal_error_response` (`crates/server-http/src/http/serve.rs:4874`,
   copy-pasted as closures at serve.rs:2632 and serve.rs:2979) wraps
   `ServerError::InvalidRequest { reason: "internal error" }` → HTTP 400. The
   blocking-handler-panic path (serve.rs:939) hits this, so genuine server
   faults are invisible to 5xx alerting and the `panic_on_500`/`abort_on_500`
-  hooks. Fix: use `ServerError::InternalError`; delete the two closures in
-  favor of the free function.
+  hooks. Fixed `internal_error_response` to use `ServerError::InternalError`
+  and routed the streaming POST, streaming PUT, and streaming UploadPart
+  join-error paths through the shared helper. Added local response coverage for
+  the helper to pin 500 `InternalError` and the generic internal-error message;
+  this is not an AWS oracle case because it covers server-internal panics/join
+  failures rather than a client-reachable S3 semantic.
 
 - [x] **H2. `If-Match` against a missing object returns 412; AWS returns 404
   for conditional writes/deletes on nonexistent objects.** The original finding

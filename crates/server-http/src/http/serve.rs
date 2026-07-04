@@ -986,15 +986,7 @@ async fn handle(
         frontend.handle_s3_request(&s3req, &wire_ids_for_blocking)
     })
     .await
-    .unwrap_or_else(|_| {
-        S3Response::error_with_ids(
-            &ServerError::InvalidRequest {
-                reason: "internal error".to_string(),
-            },
-            "",
-            &wire_ids,
-        )
-    });
+    .unwrap_or_else(|_| internal_error_response(&wire_ids));
 
     Ok(s3_response_to_hyper(
         resp,
@@ -2628,15 +2620,6 @@ async fn handle_streaming_post_object(
 ) -> S3Response {
     let idle_timeout = state.config.body_idle_timeout;
     let error_response = |err: &ServerError| S3Response::error_with_ids(err, "", &wire_ids);
-    let internal_error_response = || {
-        S3Response::error_with_ids(
-            &ServerError::InvalidRequest {
-                reason: "internal error".to_string(),
-            },
-            "",
-            &wire_ids,
-        )
-    };
 
     let req_arc = Arc::new(s3req);
 
@@ -2760,7 +2743,7 @@ async fn handle_streaming_post_object(
                                         )
                                         .await;
                                     }
-                                    Err(_) => return internal_error_response(),
+                                    Err(_) => return internal_error_response(&wire_ids),
                                 }
                             }
                             PostMultipartEvent::FileChunk(data) => {
@@ -2844,7 +2827,7 @@ async fn handle_streaming_post_object(
                                         }
                                         Err(_) => {
                                             abort_streaming_post_object(&state, c).await;
-                                            return internal_error_response();
+                                            return internal_error_response(&wire_ids);
                                         }
                                     }
                                 }
@@ -2920,7 +2903,7 @@ async fn handle_streaming_post_object(
             }
             Err(_) => {
                 abort_streaming_post_object(&state, &ctx).await;
-                return internal_error_response();
+                return internal_error_response(&wire_ids);
             }
         }
     }
@@ -2952,7 +2935,7 @@ async fn handle_streaming_post_object(
         }
         Err(_) => {
             abort_streaming_post_object(&state, &ctx).await;
-            internal_error_response()
+            internal_error_response(&wire_ids)
         }
     }
 }
@@ -2975,15 +2958,6 @@ async fn handle_streaming_put(
 ) -> S3Response {
     let idle_timeout = state.config.body_idle_timeout;
     let error_response = |err: &ServerError| S3Response::error_with_ids(err, "", &wire_ids);
-    let internal_error_response = || {
-        S3Response::error_with_ids(
-            &ServerError::InvalidRequest {
-                reason: "internal error".to_string(),
-            },
-            "",
-            &wire_ids,
-        )
-    };
     let mut body = body;
 
     let state2 = Arc::clone(&state);
@@ -3024,16 +2998,15 @@ async fn handle_streaming_put(
             .await
         }
         Err(_) => {
+            let err = internal_error();
             return finish_streaming_prepare_failure(
-                internal_error_response(),
-                &ServerError::InvalidRequest {
-                    reason: "internal error".to_string(),
-                },
+                internal_error_response(&wire_ids),
+                &err,
                 has_auth_attempt,
                 &mut body,
                 idle_timeout,
             )
-            .await
+            .await;
         }
     };
     // Build chunked decoder if needed.
@@ -3259,7 +3232,7 @@ async fn handle_streaming_put(
         {
             Ok(Ok(resp)) => resp,
             Ok(Err(err)) => error_response(&err),
-            Err(_) => internal_error_response(),
+            Err(_) => internal_error_response(&wire_ids),
         };
     }
 
@@ -3372,7 +3345,7 @@ async fn handle_streaming_put(
         }
         Err(_) => {
             abort_streaming(&state, &ctx, Some(active_session_id)).await;
-            internal_error_response()
+            internal_error_response(&wire_ids)
         }
     }
 }
@@ -3830,15 +3803,6 @@ async fn handle_streaming_part(
 ) -> S3Response {
     let idle_timeout = state.config.body_idle_timeout;
     let error_response = |err: &ServerError| S3Response::error_with_ids(err, "", &wire_ids);
-    let internal_error_response = || {
-        S3Response::error_with_ids(
-            &ServerError::InvalidRequest {
-                reason: "internal error".to_string(),
-            },
-            "",
-            &wire_ids,
-        )
-    };
     let mut body = body;
     let abort_guard = StreamingAbortGuard::new(&state);
 
@@ -3887,16 +3851,15 @@ async fn handle_streaming_part(
             .await
         }
         Err(_) => {
+            let err = internal_error();
             return finish_streaming_prepare_failure(
-                internal_error_response(),
-                &ServerError::InvalidRequest {
-                    reason: "internal error".to_string(),
-                },
+                internal_error_response(&wire_ids),
+                &err,
                 has_auth_attempt,
                 &mut body,
                 idle_timeout,
             )
-            .await
+            .await;
         }
     };
     if trailing_hasher.is_none() {
@@ -4225,7 +4188,7 @@ async fn handle_streaming_part(
                     None,
                 );
                 abort_streaming_part_ctx(&state, &ctx).await;
-                return internal_error_response();
+                return internal_error_response(&wire_ids);
             }
         }
     }
@@ -4349,7 +4312,7 @@ async fn handle_streaming_part(
                 Some(segment_index + u32::from(had_tail)),
             );
             abort_streaming_part_ctx(&state, &ctx).await;
-            internal_error_response()
+            internal_error_response(&wire_ids)
         }
     }
 }
@@ -4870,14 +4833,14 @@ fn error_response(err: &ServerError, wire_ids: &WireResponseIds) -> S3Response {
     S3Response::error_with_ids(err, "", wire_ids)
 }
 
+fn internal_error() -> ServerError {
+    ServerError::InternalError {
+        reason: "internal error".to_string(),
+    }
+}
+
 fn internal_error_response(wire_ids: &WireResponseIds) -> S3Response {
-    S3Response::error_with_ids(
-        &ServerError::InvalidRequest {
-            reason: "internal error".to_string(),
-        },
-        "",
-        wire_ids,
-    )
+    S3Response::error_with_ids(&internal_error(), "", wire_ids)
 }
 
 #[cfg(test)]
@@ -4925,6 +4888,18 @@ mod tests {
         fn drop(&mut self) {
             self.0.abort();
         }
+    }
+
+    #[test]
+    fn internal_error_response_is_500_internal_error() {
+        let resp = internal_error_response(&WireResponseIds::new("request-id", "host-id"));
+
+        assert_eq!(resp.status_code, 500);
+        let body = String::from_utf8(resp.into_test_body_bytes().unwrap()).unwrap();
+        assert!(body.contains("<Code>InternalError</Code>"));
+        assert!(
+            body.contains("<Message>We encountered an internal error. Please try again.</Message>")
+        );
     }
 
     #[test]
