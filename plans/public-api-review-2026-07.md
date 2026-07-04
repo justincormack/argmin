@@ -238,7 +238,7 @@ steps it performs.
   `crates/server-http/src/http/response.rs`; expanded s3-test coverage in
   `crates/s3-tests/tests/checksums.rs`.
 
-- [ ] **K3. `CHECKSUM_HEADERS` in server-http hand-duplicates
+- [x] **K3. `CHECKSUM_HEADERS` in server-http hand-duplicates
   `ChecksumAlgorithm::ALL` + `header_name()`**
   (`crates/server-http/src/http/mod.rs:4918-4929`, with
   `parse(algo).expect(...)` at mod.rs:5459). A new algorithm in the checksum
@@ -248,7 +248,12 @@ steps it performs.
   `extract_encoded_checksum_header` (mod.rs:5500-5539), does not reject
   duplicate same-name checksum headers. Fix: build the table from
   `ChecksumAlgorithm::ALL`; have `validate_checksum_headers` delegate so both
-  paths share duplicate-header and format rules.
+  paths share duplicate-header and format rules. Fixed
+  `crates/server-http/src/http/mod.rs` to derive checksum headers from
+  `ChecksumAlgorithm::ALL`, remove the string-to-enum parse/expect paths, and
+  route `validate_checksum_headers` through `extract_encoded_checksum_header`
+  plus `ChecksumClaim::from_base64`. Added local coverage for all algorithms
+  and duplicate same-name checksum headers.
 
 - [x] **K4. Multipart complete path split the validated
   `MultipartChecksumConfig` back into two independent `Option`s.** Fixed

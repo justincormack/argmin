@@ -1623,7 +1623,7 @@ impl HttpFrontend {
                             })?;
                     let mut resp = S3Response::put_object(&result);
                     apply_sse_customer_write_response_headers(&mut resp, sse_customer.as_ref());
-                    for &(_, header) in CHECKSUM_HEADERS {
+                    for (_, header) in checksum_headers() {
                         if let Some(value) = req.header(header) {
                             resp.headers.push((header.to_string(), value.to_string()));
                         }
@@ -3888,7 +3888,7 @@ impl HttpFrontend {
 
         // Collect checksum response headers to echo back in the response.
         let mut checksum_response: Vec<(String, String)> = Vec::new();
-        for &(_, header) in CHECKSUM_HEADERS {
+        for (_, header) in checksum_headers() {
             if let Some(val) = req.header(header) {
                 checksum_response.push((header.to_string(), val.to_string()));
             }
@@ -4181,7 +4181,7 @@ impl HttpFrontend {
         let expected_bucket_owner = expected_bucket_owner(req).map(str::to_string);
 
         let mut checksum_response: Vec<(String, String)> = Vec::new();
-        for &(_, header) in CHECKSUM_HEADERS {
+        for (_, header) in checksum_headers() {
             if let Some(val) = req.header(header) {
                 checksum_response.push((header.to_string(), val.to_string()));
             }
@@ -4920,20 +4920,12 @@ fn parse_requested_max_keys<S: AsRef<str>>(raw: Option<S>) -> Result<u32, Server
     parse_u32_or_default(raw, 1000, "invalid max-keys")
 }
 
-/// Apply response-* query parameter overrides to a GET response.
-/// Checksum algorithm names and the corresponding header names.
-const CHECKSUM_HEADERS: &[(&str, &str)] = &[
-    ("SHA256", "x-amz-checksum-sha256"),
-    ("CRC64NVME", "x-amz-checksum-crc64nvme"),
-    ("CRC32", "x-amz-checksum-crc32"),
-    ("CRC32C", "x-amz-checksum-crc32c"),
-    ("SHA1", "x-amz-checksum-sha1"),
-    ("MD5", "x-amz-checksum-md5"),
-    ("XXHASH64", "x-amz-checksum-xxhash64"),
-    ("XXHASH3", "x-amz-checksum-xxhash3"),
-    ("XXHASH128", "x-amz-checksum-xxhash128"),
-    ("SHA512", "x-amz-checksum-sha512"),
-];
+/// Checksum algorithms and their corresponding `x-amz-checksum-*` value headers.
+fn checksum_headers() -> impl Iterator<Item = (ChecksumAlgorithm, &'static str)> {
+    ChecksumAlgorithm::ALL
+        .into_iter()
+        .map(|algorithm| (algorithm, algorithm.header_name()))
+}
 
 const SSE_C_ALGORITHM_HEADER: &str = "x-amz-server-side-encryption-customer-algorithm";
 const SSE_C_KEY_HEADER: &str = "x-amz-server-side-encryption-customer-key";
@@ -5057,7 +5049,7 @@ fn post_checksum_claim_from_fields(
     let declared_algorithm = parse_form_field_once(form_fields, "x-amz-checksum-algorithm")?;
     let mut claim: Option<ChecksumClaim> = None;
 
-    for &(algorithm_name, header) in CHECKSUM_HEADERS {
+    for (algorithm, header) in checksum_headers() {
         let Some(value) = parse_form_field_once(form_fields, header)? else {
             continue;
         };
@@ -5067,6 +5059,7 @@ fn post_checksum_claim_from_fields(
             });
         }
         if let Some(declared) = declared_algorithm {
+            let algorithm_name = algorithm.as_str();
             if !declared.eq_ignore_ascii_case(algorithm_name) {
                 return Err(ServerError::InvalidRequest {
                     reason: format!(
@@ -5075,8 +5068,6 @@ fn post_checksum_claim_from_fields(
                 });
             }
         }
-        let algorithm = ChecksumAlgorithm::parse(algorithm_name)
-            .expect("CHECKSUM_HEADERS uses known algorithms");
         claim = Some(ChecksumClaim::from_base64(algorithm, value)?);
     }
 
@@ -5499,44 +5490,25 @@ fn checksum_algo_from_header(header: &str) -> Option<ChecksumAlgorithm> {
 fn validate_checksum_headers(req: &S3Request, verify_body: bool) -> Result<(), ServerError> {
     use base64::Engine;
 
-    let mut found_algo: Option<&str> = None;
+    let Some(claim) = extract_encoded_checksum_header(req)? else {
+        return Ok(());
+    };
 
-    for &(algo, header) in CHECKSUM_HEADERS {
-        if let Some(claimed) = req.header(header) {
-            // Reject multiple checksum headers
-            if found_algo.is_some() {
-                return Err(ServerError::InvalidRequest {
-                    reason: "only one checksum header may be specified".into(),
-                });
-            }
-            found_algo = Some(algo);
+    let algorithm = claim.algorithm();
+    let header = algorithm.header_name();
+    ChecksumClaim::from_base64(algorithm, claim.encoded_value()).map_err(|_| {
+        ServerError::InvalidRequest {
+            reason: format!("Value for {header} header is invalid."),
+        }
+    })?;
 
-            let algorithm =
-                ChecksumAlgorithm::parse(algo).expect("CHECKSUM_HEADERS uses known algorithms");
-            let expected_len = algorithm.expected_byte_length();
-
-            // Validate checksum value format (base64 decodes to correct length).
-            let decoded_bytes = base64::engine::general_purpose::STANDARD
-                .decode(claimed)
-                .ok();
-            match decoded_bytes {
-                Some(ref bytes) if bytes.len() == expected_len => {}
-                _ => {
-                    return Err(ServerError::InvalidRequest {
-                        reason: format!("Value for {header} header is invalid."),
-                    });
-                }
-            }
-
-            if verify_body {
-                let actual = checksum::compute_checksum(algorithm, &req.body);
-                let actual_b64 = base64::engine::general_purpose::STANDARD.encode(actual.bytes());
-                if claimed != actual_b64 {
-                    return Err(ServerError::ChecksumDigestMismatch {
-                        algorithm: algo.to_string(),
-                    });
-                }
-            }
+    if verify_body {
+        let actual = checksum::compute_checksum(algorithm, &req.body);
+        let actual_b64 = base64::engine::general_purpose::STANDARD.encode(actual.bytes());
+        if claim.encoded_value() != actual_b64 {
+            return Err(ServerError::ChecksumDigestMismatch {
+                algorithm: algorithm.as_str().to_string(),
+            });
         }
     }
     Ok(())
@@ -5556,7 +5528,7 @@ fn extract_encoded_checksum_header(
     req: &S3Request,
 ) -> Result<Option<EncodedChecksumClaim>, ServerError> {
     let mut found: Option<EncodedChecksumClaim> = None;
-    for &(algo_name, header) in CHECKSUM_HEADERS {
+    for (algo, header) in checksum_headers() {
         if let Some(claimed) = req.header(header) {
             if found.is_some() {
                 return Err(ServerError::InvalidRequest {
@@ -5570,8 +5542,6 @@ fn extract_encoded_checksum_header(
                     reason: format!("duplicate header: {header}"),
                 });
             }
-            // CHECKSUM_HEADERS uses known-good algo names.
-            let algo = ChecksumAlgorithm::parse(algo_name).unwrap();
             found = Some(EncodedChecksumClaim::new(algo, claimed.to_string()));
         }
     }
@@ -10966,17 +10936,11 @@ mod tests {
     }
 
     #[test]
-    fn validate_checksum_headers_accepts_new_algorithms() {
+    fn validate_checksum_headers_accepts_all_algorithms() {
         use base64::Engine;
 
         let body = b"new checksum algorithms";
-        for algorithm in [
-            ChecksumAlgorithm::Md5,
-            ChecksumAlgorithm::XxHash64,
-            ChecksumAlgorithm::XxHash3,
-            ChecksumAlgorithm::XxHash128,
-            ChecksumAlgorithm::Sha512,
-        ] {
+        for algorithm in ChecksumAlgorithm::ALL {
             let checksum = checksum::compute_checksum(algorithm, body);
             let encoded = base64::engine::general_purpose::STANDARD.encode(checksum.bytes());
             let req = new_req(
@@ -10987,6 +10951,33 @@ mod tests {
                 body.to_vec(),
             );
             validate_checksum_headers(&req, true).unwrap();
+        }
+    }
+
+    #[test]
+    fn validate_checksum_headers_rejects_duplicate_same_header() {
+        use base64::Engine;
+
+        let body = b"duplicate checksum header";
+        let algorithm = ChecksumAlgorithm::Crc32;
+        let checksum = checksum::compute_checksum(algorithm, body);
+        let encoded = base64::engine::general_purpose::STANDARD.encode(checksum.bytes());
+        let req = new_req(
+            http::Method::PUT,
+            "",
+            "",
+            vec![
+                (algorithm.header_name().to_string(), encoded.clone()),
+                (algorithm.header_name().to_string(), encoded),
+            ],
+            body.to_vec(),
+        );
+
+        match validate_checksum_headers(&req, true) {
+            Err(ServerError::InvalidRequest { reason }) => {
+                assert_eq!(reason, "duplicate header: x-amz-checksum-crc32");
+            }
+            other => panic!("expected duplicate header rejection, got {other:?}"),
         }
     }
 
