@@ -9588,8 +9588,12 @@ Phase 12.1 progress:
   watermark that the local log cannot actually prove. This is intentionally
   stricter than OpenRaft's generic log-store conformance baseline, which permits
   operations such as `truncate_after(None)` in cases where Argmin has already
-  recorded a committed restart gate; the current spike does not run
-  `openraft::testing::log::suite` against this guarded in-memory store.
+  recorded a committed restart gate. The current spike now runs the compatible
+  `openraft::testing::log::suite` cases against this guarded in-memory store and
+  documents the deliberate deviations: OpenRaft's suite still feeds a synthetic
+  blank `(term=0,index=0)` entry, while Argmin accepts only the actual bootstrap
+  membership entry there, and Argmin rejects purge/truncate operations that
+  would cross or erase the committed restart watermark.
 - Tightened the in-memory OpenRaft log store's durable-vote boundary.
   `save_vote` now rejects vote regression according to OpenRaft's `Vote`
   partial-order contract, including lower terms, lower same-term leader ids,

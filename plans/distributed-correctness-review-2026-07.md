@@ -401,10 +401,12 @@ shift.
 8. **DONE — Gate the peer socket on poison (R8).** A shared atomic poison
    flag is checked before peer dispatch and again before peer response write.
 9. **Smaller items:** canonicalize the snapshot text parser if artifact bytes
-   are ever compared (R-OK4 caveat). Run
-   `openraft::testing::log::suite` against the guarded log store (currently
-   skipped because the store is deliberately stricter than the generic
-   baseline; document the deviations if the suite cannot pass).
+   are ever compared (R-OK4 caveat). The guarded log-store audit now runs the
+   compatible `openraft::testing::log::suite` cases and documents the upstream
+   deviations: OpenRaft's generic suite still uses a synthetic blank
+   `(term=0,index=0)` entry, while Argmin accepts only the real bootstrap
+   membership entry there, and Argmin rejects purge/truncate shapes that would
+   cross or erase the committed restart watermark.
 
 ---
 
@@ -1355,9 +1357,10 @@ closes this.
   multi-process harness with a nemesis doing kill/restart, clock steps, and
   admin transitions (member-out during traffic would have surfaced CL1).
   Elle-style checking on a key→version projection.
-- **OpenRaft conformance and gap tests.** Run
-  `openraft::testing::log::suite` against the guarded log store (document
-  deliberate deviations if it cannot pass); add fresh-follower-joins-via-
+- **OpenRaft conformance and gap tests.** Keep the guarded log-store
+  compatibility harness that runs the upstream suite cases which match
+  Argmin's bootstrap and restart-watermark model, and keep local regressions
+  for the deliberately stricter deviations. Add fresh-follower-joins-via-
   snapshot (R5) coverage; keep the R6 static-peer reconfiguration rejection
   regression in the Unix-peer durable boundary; add the ack→checkpoint crash
   tests (R1).

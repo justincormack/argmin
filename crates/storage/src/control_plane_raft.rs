@@ -7115,14 +7115,47 @@ mod tests {
         AppendEntriesRequest, AppendEntriesResponse, SnapshotResponse, TransferLeaderRequest,
         TransferLeaderResponse, VoteRequest, VoteResponse,
     };
+    use openraft::testing::log::{StoreBuilder, Suite as OpenRaftLogSuite};
     use openraft::type_config::TypeConfigExt;
-    use openraft::{AnyError, Config, Membership, Raft, ReadPolicy};
+    use openraft::{AnyError, Config, Membership, Raft, ReadPolicy, StorageError};
 
     use crate::control_plane::{
         ClusterControlSnapshot, NodeAvailabilityState, NodeHeartbeat, RuntimeMapFreshnessProof,
     };
     use crate::types::PgId;
     use crate::PgClusterMapHistoryReferenceSummary;
+
+    type ControlPlaneOpenRaftLogSuite = OpenRaftLogSuite<
+        ControlPlaneRaftTypeConfig,
+        ControlPlaneRaftLogStore,
+        ControlPlaneRaftStateMachine,
+        ControlPlaneOpenRaftSuiteBuilder,
+        (),
+    >;
+
+    #[derive(Debug, Clone, Copy, Default)]
+    struct ControlPlaneOpenRaftSuiteBuilder;
+
+    impl
+        StoreBuilder<
+            ControlPlaneRaftTypeConfig,
+            ControlPlaneRaftLogStore,
+            ControlPlaneRaftStateMachine,
+        > for ControlPlaneOpenRaftSuiteBuilder
+    {
+        async fn build(
+            &self,
+        ) -> Result<
+            ((), ControlPlaneRaftLogStore, ControlPlaneRaftStateMachine),
+            StorageError<ControlPlaneRaftTypeConfig>,
+        > {
+            Ok((
+                (),
+                ControlPlaneRaftLogStore::empty(),
+                ControlPlaneRaftStateMachine::empty(),
+            ))
+        }
+    }
 
     #[derive(Debug, Clone, Copy, Default)]
     struct UnreachableRaftNetworkFactory;
@@ -10681,6 +10714,91 @@ mod tests {
                 .map(|log_id| (log_id.term(), log_id.index())),
             Some((1, 3))
         );
+    }
+
+    #[test]
+    fn control_plane_raft_openraft_log_suite_compatible_cases_pass() {
+        ControlPlaneRaftTypeConfig::run(async {
+            async fn suite_pair() -> (ControlPlaneRaftLogStore, ControlPlaneRaftStateMachine) {
+                let (_, log_store, state_machine) =
+                    ControlPlaneOpenRaftSuiteBuilder.build().await.unwrap();
+                (log_store, state_machine)
+            }
+
+            let (log_store, state_machine) = suite_pair().await;
+            ControlPlaneOpenRaftLogSuite::last_membership_in_log_initial(log_store, state_machine)
+                .await
+                .unwrap();
+
+            let (log_store, state_machine) = suite_pair().await;
+            ControlPlaneOpenRaftLogSuite::get_membership_initial(log_store, state_machine)
+                .await
+                .unwrap();
+
+            let (log_store, state_machine) = suite_pair().await;
+            ControlPlaneOpenRaftLogSuite::get_membership_from_empty_log_and_sm(
+                log_store,
+                state_machine,
+            )
+            .await
+            .unwrap();
+
+            let (log_store, state_machine) = suite_pair().await;
+            ControlPlaneOpenRaftLogSuite::get_initial_state_membership_from_empty_log_and_sm(
+                log_store,
+                state_machine,
+            )
+            .await
+            .unwrap();
+
+            let (log_store, state_machine) = suite_pair().await;
+            ControlPlaneOpenRaftLogSuite::get_initial_state_membership_from_log_insm_is_smaller(
+                log_store,
+                state_machine,
+            )
+            .await
+            .unwrap();
+
+            let (log_store, state_machine) = suite_pair().await;
+            ControlPlaneOpenRaftLogSuite::get_initial_state_without_init(log_store, state_machine)
+                .await
+                .unwrap();
+
+            let (log_store, state_machine) = suite_pair().await;
+            ControlPlaneOpenRaftLogSuite::initial_logs(log_store, state_machine)
+                .await
+                .unwrap();
+
+            let (log_store, state_machine) = suite_pair().await;
+            ControlPlaneOpenRaftLogSuite::save_vote(log_store, state_machine)
+                .await
+                .unwrap();
+
+            let (log_store, state_machine) = suite_pair().await;
+            ControlPlaneOpenRaftLogSuite::snapshot_meta(log_store, state_machine)
+                .await
+                .unwrap();
+
+            let (log_store, state_machine) = suite_pair().await;
+            ControlPlaneOpenRaftLogSuite::snapshot_meta_optional(log_store, state_machine)
+                .await
+                .unwrap();
+        });
+    }
+
+    #[test]
+    fn control_plane_raft_openraft_log_suite_documents_index_zero_deviation() {
+        ControlPlaneRaftTypeConfig::run(async {
+            let (_, log_store, state_machine) =
+                ControlPlaneOpenRaftSuiteBuilder.build().await.unwrap();
+            let err = ControlPlaneOpenRaftLogSuite::get_log_state(log_store, state_machine)
+                .await
+                .unwrap_err();
+
+            assert!(err
+                .to_string()
+                .contains("log index 0 entry must be bootstrap membership"));
+        });
     }
 
     #[test]
