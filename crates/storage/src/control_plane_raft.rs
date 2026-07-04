@@ -4933,6 +4933,14 @@ impl ControlPlaneRaftWalFile {
 }
 
 impl ControlPlaneRaftRestartArtifact {
+    pub fn cluster_name(&self) -> &str {
+        &self.cluster_name
+    }
+
+    pub fn local_node_id(&self) -> ControlPlaneRaftNodeId {
+        self.local_node_id
+    }
+
     pub fn capture(
         cluster_name: impl Into<String>,
         local_node_id: ControlPlaneRaftNodeId,

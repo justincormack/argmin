@@ -1919,7 +1919,7 @@ struct ExperimentalRaftPeerRpcWorkerContext {
 
 #[derive(Clone)]
 struct ExperimentalRaftPeerDurabilityContext {
-    artifact_path: Arc<PathBuf>,
+    artifact_path: Option<Arc<PathBuf>>,
     checkpoint_lock: Arc<Mutex<()>>,
     poison_gate: Arc<AtomicBool>,
 }
@@ -1929,6 +1929,7 @@ struct ExperimentalRaftPeerRpcDurability<'a> {
     artifact_path: Option<&'a Path>,
     checkpoint_lock: Option<&'a Arc<Mutex<()>>>,
     poison_gate: Option<&'a AtomicBool>,
+    checkpoint_ordinary_rpc: bool,
 }
 
 impl<'a> ExperimentalRaftPeerRpcDurability<'a> {
@@ -1936,13 +1937,15 @@ impl<'a> ExperimentalRaftPeerRpcDurability<'a> {
         artifact_path: None,
         checkpoint_lock: None,
         poison_gate: None,
+        checkpoint_ordinary_rpc: false,
     };
 
     fn from_context(context: &'a ExperimentalRaftPeerDurabilityContext) -> Self {
         Self {
-            artifact_path: Some(context.artifact_path.as_path()),
+            artifact_path: context.artifact_path.as_deref().map(PathBuf::as_path),
             checkpoint_lock: Some(&context.checkpoint_lock),
             poison_gate: Some(context.poison_gate.as_ref()),
+            checkpoint_ordinary_rpc: false,
         }
     }
 }
@@ -2098,7 +2101,18 @@ fn handle_experimental_raft_peer_rpc_validated_frame_before_ack(
         }
     });
 
-    if let Some(path) = durability.artifact_path {
+    let checkpoint_before_response = durability.checkpoint_ordinary_rpc
+        || matches!(frame_kind, ControlPlaneRaftPeerFrameKind::Snapshot);
+    if checkpoint_before_response {
+        let Some(path) = durability.artifact_path else {
+            return Err(ExperimentalRaftPeerRpcWorkerError::Checkpoint(
+                ControlPlaneError::RpcRemote {
+                    message:
+                        "experimental OpenRaft peer RPC requires durable checkpoint path before response"
+                            .to_string(),
+                },
+            ));
+        };
         if let Err(error) = store_experimental_raft_durable_restart_artifact(
             runtime,
             authority,
@@ -2252,7 +2266,7 @@ fn run_experimental_raft_control_plane_process(config: &ServerConfig) -> ! {
             Arc::clone(&authority),
             node_id,
             ExperimentalRaftPeerDurabilityContext {
-                artifact_path: Arc::clone(&durable_artifact_path),
+                artifact_path: Some(Arc::clone(&durable_artifact_path)),
                 checkpoint_lock: Arc::clone(&durable_checkpoint_lock),
                 poison_gate: Arc::clone(&durable_poison_gate),
             },
@@ -3473,6 +3487,26 @@ mod tests {
         log_store.persisted_vote().ok().flatten()
     }
 
+    fn durable_raft_artifact_vote_with_wal(
+        path: &Path,
+        cluster_name: &str,
+        node_id: ControlPlaneRaftNodeId,
+    ) -> Option<Vote<ControlPlaneRaftLeaderId>> {
+        let artifact =
+            storage::control_plane_raft::ControlPlaneRaftRestartArtifact::load_durable_artifact(
+                path,
+            )
+            .ok()?;
+        let (log_store, _state_machine) = artifact
+            .restore_with_wal_file(storage::control_plane_raft::ControlPlaneRaftWalFile::new(
+                durable_artifact_wal_path(path),
+                cluster_name,
+                node_id,
+            ))
+            .ok()?;
+        log_store.persisted_vote().ok().flatten()
+    }
+
     fn wait_for_experimental_raft_vote(
         runtime: &Handle,
         authority: &ControlPlaneRaftAuthority,
@@ -4371,6 +4405,7 @@ mod tests {
                 artifact_path: Some(&state_dir),
                 checkpoint_lock: None,
                 poison_gate: None,
+                checkpoint_ordinary_rpc: true,
             },
         );
         assert!(
@@ -4433,6 +4468,7 @@ mod tests {
                 artifact_path: None,
                 checkpoint_lock: None,
                 poison_gate: Some(&poison_gate),
+                checkpoint_ordinary_rpc: false,
             },
         );
         assert!(
@@ -4499,6 +4535,7 @@ mod tests {
                 artifact_path: None,
                 checkpoint_lock: None,
                 poison_gate: Some(&poison_gate),
+                checkpoint_ordinary_rpc: false,
             },
         );
         assert!(
@@ -4572,6 +4609,7 @@ mod tests {
                     artifact_path: Some(&worker_state_path),
                     checkpoint_lock: Some(&worker_lock),
                     poison_gate: Some(worker_poison_gate.as_ref()),
+                    checkpoint_ordinary_rpc: true,
                 },
             )
         });
@@ -4661,6 +4699,7 @@ mod tests {
                     artifact_path: Some(&worker_state_path),
                     checkpoint_lock: Some(&worker_lock),
                     poison_gate: None,
+                    checkpoint_ordinary_rpc: true,
                 },
             )
         });
@@ -4707,6 +4746,102 @@ mod tests {
         .expect("peer vote RPC should respond after durable checkpoint completes");
 
         harness.shutdown();
+        let _ = fs::remove_dir_all(&state_dir);
+    }
+
+    #[test]
+    fn experimental_raft_peer_vote_response_can_ack_after_wal_without_artifact_checkpoint() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime should build");
+        let state_dir = short_unix_socket_test_dir("experimental-raft-peer-wal-ack");
+        let _ = fs::remove_dir_all(&state_dir);
+        fs::create_dir_all(&state_dir).expect("durable test directory should exist");
+        let state_path = state_dir.join("control-plane.state");
+        let wal_path = durable_artifact_wal_path(&state_path);
+        let cluster_name = format!(
+            "argmin-s3-experimental-raft-peer-wal-ack-{}",
+            std::process::id()
+        );
+        let authority = runtime.block_on(async {
+            let authority =
+                ControlPlaneRaftAuthority::new_experimental_single_node_durable_with_wal(
+                    cluster_name.clone(),
+                    1,
+                    &state_path,
+                    &wal_path,
+                )
+                .await
+                .expect("WAL-backed durable authority should initialize");
+            authority
+                .store_durable_restart_artifact(&state_path)
+                .await
+                .expect("uninitialized WAL-backed raft should checkpoint initial artifact");
+            Arc::new(authority)
+        });
+        let artifact_vote_before = durable_raft_artifact_vote(&state_path);
+
+        let policy = ControlPlaneRaftPeerTransportPolicy::from_peer_endpoints(
+            cluster_name.clone(),
+            [(1, "node-1".to_string())],
+            ControlPlaneRaftPeerTransportLimits::default(),
+        );
+        let identity = ControlPlaneRaftPeerFrameIdentity::new(cluster_name.clone(), 1, 1);
+        let expected_vote = Vote::<ControlPlaneRaftLeaderId>::new(3, 1);
+        let request = ControlPlaneRaftPeerRpcRequest::Vote(VoteRequest {
+            vote: expected_vote,
+            last_log_id: None,
+            leadership_transfer: false,
+        });
+        let request_frame = request
+            .encode_frame_for_peer(&identity)
+            .expect("peer request should encode");
+        let (mut client_stream, mut server_stream) =
+            UnixStream::pair().expect("test UnixStream pair should create");
+        write_control_plane_raft_peer_transport_frame(&mut client_stream, &request_frame)
+            .expect("client should write request frame");
+
+        let result = handle_experimental_raft_peer_rpc_before_ack(
+            runtime.handle(),
+            &authority,
+            &mut server_stream,
+            1,
+            &policy,
+            ExperimentalRaftPeerRpcDurability {
+                artifact_path: None,
+                checkpoint_lock: None,
+                poison_gate: None,
+                checkpoint_ordinary_rpc: false,
+            },
+        );
+        assert!(
+            result.is_ok(),
+            "peer RPC should acknowledge after WAL durability without artifact checkpoint: {result:?}"
+        );
+        let response = read_control_plane_raft_peer_transport_frame(
+            &mut client_stream,
+            ControlPlaneRaftPeerTransportLimits::DEFAULT_MAX_FRAME_BYTES,
+        )
+        .expect("peer RPC should write a response frame");
+        assert!(
+            !response.is_empty(),
+            "peer RPC response frame should be non-empty"
+        );
+        assert_eq!(
+            durable_raft_artifact_vote(&state_path),
+            artifact_vote_before,
+            "peer RPC without artifact checkpoint must not rewrite the checkpoint artifact"
+        );
+        assert_eq!(
+            durable_raft_artifact_vote_with_wal(&state_path, &cluster_name, 1),
+            Some(expected_vote),
+            "artifact plus WAL replay should observe the acknowledged peer vote"
+        );
+
+        runtime
+            .block_on(authority.shutdown())
+            .expect("WAL-backed authority should shut down");
         let _ = fs::remove_dir_all(&state_dir);
     }
 
@@ -4765,6 +4900,7 @@ mod tests {
                     artifact_path: Some(&worker_state_path),
                     checkpoint_lock: Some(&worker_lock),
                     poison_gate: Some(worker_poison_gate.as_ref()),
+                    checkpoint_ordinary_rpc: true,
                 },
             )
         });
@@ -4864,6 +5000,7 @@ mod tests {
                     artifact_path: Some(&worker_state_path),
                     checkpoint_lock: Some(&worker_lock),
                     poison_gate: None,
+                    checkpoint_ordinary_rpc: true,
                 },
             )
         });

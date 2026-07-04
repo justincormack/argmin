@@ -10803,6 +10803,17 @@ Phase 12.4 progress:
   OpenRaft startup catches the state machine up and checkpoints the resulting PG
   acting-set change. This closes the main coverage gap before replacing
   peer-response full artifact checkpoints with WAL fsync acknowledgements.
+- Added handler-level peer RPC coverage for WAL-only acknowledgement. A
+  WAL-backed durable authority now receives a real vote frame through the peer
+  RPC handler with artifact checkpointing disabled, returns a response, leaves
+  the checkpoint artifact unchanged, and proves artifact-plus-WAL replay sees
+  the acknowledged vote. The process peer listener now uses that WAL-backed
+  acknowledgement boundary for ordinary peer RPCs instead of forcing a full
+  restart-artifact checkpoint before every append/vote response. Snapshot peer
+  RPCs still checkpoint the state-machine artifact before response until snapshot
+  installs have their own durable state-machine journal. Process restart probes
+  that observe follower state now restore artifact-plus-WAL state, while explicit
+  checkpoint-unchanged tests still read artifact-only state.
 
 1. define the replicated control-plane state machine:
    - state includes cluster epoch, PG count, PG state, PG acting sets, node
