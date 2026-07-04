@@ -382,8 +382,7 @@ pub(crate) fn percent_decode_lossy(s: &str) -> Cow<'_, str> {
 /// Parse the `x-amz-copy-source` header value into `(bucket, key, version_id)`.
 ///
 /// Accepts `[/]bucket/key[?versionId=...]`. Strips optional leading `/`.
-/// Both bucket and key are percent-decoded. Returns the raw `versionId`
-/// query-parameter value (if present) as-is.
+/// Bucket, key, and `versionId` query-parameter value are percent-decoded.
 pub(crate) fn parse_copy_source(
     header: &str,
 ) -> Result<(String, ObjectKey, Option<String>), ServerError> {
@@ -398,7 +397,10 @@ pub(crate) fn parse_copy_source(
     let (s, version_id) = match s.find('?') {
         Some(pos) => {
             let query = &s[pos + 1..];
-            let vid = query_param_raw(query, "versionId").map(std::string::ToString::to_string);
+            let vid = query_param_raw(query, "versionId")
+                .map(percent_decode_strict)
+                .transpose()
+                .map_err(|_| invalid_copy_source())?;
             (&s[..pos], vid)
         }
         None => (s, None),
@@ -532,12 +534,12 @@ mod tests {
     }
 
     #[test]
-    fn parse_copy_source_extracts_raw_version_id_via_shared_query_parser() {
+    fn parse_copy_source_percent_decodes_version_id() {
         let (bucket, key, version_id) =
             parse_copy_source("/bucket/key?partNumber=1&versionId=abc%2Fdef").unwrap();
         assert_eq!(bucket.as_str(), "bucket");
         assert_eq!(key.as_str(), "key");
-        assert_eq!(version_id.as_deref(), Some("abc%2Fdef"));
+        assert_eq!(version_id.as_deref(), Some("abc/def"));
     }
 
     #[test]

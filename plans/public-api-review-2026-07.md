@@ -371,10 +371,13 @@ steps it performs.
   validator key id is no longer configured locally. Added unit coverage for
   both read and write-resume paths; wrong customer keys remain client errors.
 
-- [ ] **H8. Copy-source `versionId` never percent-decoded, unlike bucket and
+- [x] **H8. Copy-source `versionId` never percent-decoded, unlike bucket and
   key.** `server-http/src/http/request.rs:387-416` (pinned by test at
   535-541), consumed raw at mod.rs:234-240. Fix: decode with the same
-  `percent_decode_strict`.
+  `percent_decode_strict`. AWS-pinned first with CopyObject against a versioned
+  source where the first byte of `versionId` is percent-encoded in
+  `x-amz-copy-source`; AWS decodes it and copies that exact version. Local
+  parser now strictly percent-decodes copy-source `versionId`.
 
 ## Pattern sweeps
 

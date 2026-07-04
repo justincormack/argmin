@@ -29,6 +29,16 @@ fn assert_raw_s3_error(response: &s3_tests::RawResponse, status: u16, code: &str
     );
 }
 
+fn percent_encode_first_byte(value: &str) -> String {
+    let (first, rest) = value
+        .as_bytes()
+        .split_first()
+        .expect("version id must not be empty");
+    let mut encoded = format!("%{:02X}", *first);
+    encoded.extend(url::form_urlencoded::byte_serialize(rest));
+    encoded
+}
+
 /// Put an object and return its ETag (quoted, as returned by S3).
 async fn put_object(bucket: &str, key: &str, body: &'static [u8]) -> String {
     let resp = retrying_operation_aborted("put copy source object", || async move {
@@ -755,6 +765,68 @@ fn test_object_copy_versioned_url_encoding() {
 
         // Verify destination exists
         head_object_eventually_after_copy(client, &bucket, dst_key).await;
+
+        cleanup_versioned_bucket(client, &bucket).await;
+    });
+}
+
+#[test]
+fn test_object_copy_source_version_id_percent_decoded() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+        s3_tests::enable_bucket_versioning(client, &bucket).await;
+
+        let src_key = "version-id-percent-source";
+        let dst_key = "version-id-percent-destination";
+        retrying_operation_aborted("put versioned copy source object", || async {
+            client
+                .put_object()
+                .bucket(&bucket)
+                .key(src_key)
+                .body(ByteStream::from_static(b"percent-version-first"))
+                .send()
+                .await
+        })
+        .await;
+
+        let resp = client
+            .head_object()
+            .bucket(&bucket)
+            .key(src_key)
+            .send_retrying_operation_aborted("head versioned copy source object")
+            .await
+            .unwrap();
+        let version_id = resp.version_id().expect("source version id").to_string();
+        assert_ne!(version_id, "null");
+
+        retrying_operation_aborted("put newer versioned copy source object", || async {
+            client
+                .put_object()
+                .bucket(&bucket)
+                .key(src_key)
+                .body(ByteStream::from_static(b"percent-version-latest"))
+                .send()
+                .await
+        })
+        .await;
+
+        let copy_source = format!(
+            "{bucket}/{src_key}?versionId={}",
+            percent_encode_first_byte(&version_id)
+        );
+        client
+            .copy_object()
+            .bucket(&bucket)
+            .key(dst_key)
+            .copy_source(copy_source)
+            .send_retrying_operation_aborted("copy object with percent-encoded source versionId")
+            .await
+            .unwrap();
+
+        let resp = get_object_eventually_after_copy(client, &bucket, dst_key).await;
+        let body = resp.body.collect().await.unwrap().into_bytes();
+        assert_eq!(&body[..], b"percent-version-first");
 
         cleanup_versioned_bucket(client, &bucket).await;
     });
