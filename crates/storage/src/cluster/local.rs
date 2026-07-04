@@ -2657,9 +2657,14 @@ impl LocalClusterMap {
                 )
             });
         }
-        self.historical_pg_routes
-            .get(&(cluster_epoch, pg_id))
-            .cloned()
+        let mut route = self
+            .historical_pg_routes
+            .range(..=(cluster_epoch, pg_id))
+            .rev()
+            .find(|((_, route_pg_id), _)| *route_pg_id == pg_id)
+            .map(|(_, route)| route.clone())?;
+        route = route.with_cluster_epoch(cluster_epoch);
+        Some(route)
     }
 
     #[cfg(any(test, feature = "test-hooks"))]

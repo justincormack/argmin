@@ -1101,23 +1101,25 @@ fn completed_metadata_transfer_live_summary(
 ) -> Result<Option<MetadataTransferLiveSummary>, String> {
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {
-        let runtime_map =
-            match control_plane.runtime_map_snapshot(storage::clock::current_time_millis()) {
-                Ok(runtime_map) => runtime_map,
-                Err(error) => {
-                    let message = error.to_string();
-                    if control_plane_runtime_map_not_ready_for_serving(&message) {
-                        if Instant::now() >= deadline {
-                            return Ok(None);
-                        }
-                        thread::sleep(Duration::from_millis(100));
-                        continue;
+        let runtime_map = match control_plane
+            .pg_runtime_map_snapshot(pg_id, storage::clock::current_time_millis())
+        {
+            Ok(runtime_map) => runtime_map,
+            Err(error) => {
+                let message = error.to_string();
+                if control_plane_runtime_map_not_ready_for_serving(&message) {
+                    if Instant::now() >= deadline {
+                        return Ok(None);
                     }
-                    return Err(format!(
-                    "failed to fetch control-plane runtime map before metadata transfer: {error}"
-                ));
+                    thread::sleep(Duration::from_millis(100));
+                    continue;
                 }
-            };
+                return Err(format!(
+                    "failed to fetch control-plane PG {} runtime map before metadata transfer: {error}",
+                    pg_id.get()
+                ));
+            }
+        };
         let Some(route) = runtime_map
             .pg_routes()
             .iter()
@@ -1211,7 +1213,7 @@ fn control_plane_pg_active_with_acting_set(
     min_cluster_epoch: ClusterEpoch,
 ) -> Result<bool, String> {
     let runtime_map =
-        match control_plane.runtime_map_snapshot(storage::clock::current_time_millis()) {
+        match control_plane.pg_runtime_map_snapshot(pg_id, storage::clock::current_time_millis()) {
             Ok(runtime_map) => runtime_map,
             Err(error) => {
                 let message = error.to_string();
@@ -1219,7 +1221,8 @@ fn control_plane_pg_active_with_acting_set(
                     return Ok(false);
                 }
                 return Err(format!(
-                    "failed to verify live PG metadata transfer state: {error}"
+                    "failed to verify live PG {} metadata transfer state: {error}",
+                    pg_id.get()
                 ));
             }
         };
@@ -6357,6 +6360,41 @@ mod tests {
     }
 
     #[test]
+    fn metadata_transfer_active_check_uses_pg_scoped_runtime_map() {
+        let tmp = short_unix_socket_test_dir("mpg");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let socket_path = tmp.join("cp.sock");
+        let endpoint = tmp.join("n0.sock");
+        let server = serve_control_plane_with_active_pg_and_unserved_pg(
+            socket_path.clone(),
+            NodeId::new(0),
+            endpoint.display().to_string(),
+            2,
+        );
+        let control_plane = UnixControlPlaneClient::new(socket_path);
+
+        let full_map_error = control_plane.runtime_map_snapshot(2_000).unwrap_err();
+        assert!(
+            control_plane_runtime_map_not_ready_for_serving(&full_map_error.to_string()),
+            "expected unrelated PG to make full runtime map fail, got {full_map_error}"
+        );
+        assert!(
+            control_plane_pg_active_with_acting_set(
+                &control_plane,
+                PgId::new(0),
+                &[NodeId::new(0)],
+                ClusterEpoch::new(1).unwrap(),
+            )
+            .unwrap(),
+            "target PG should be confirmable without requiring unrelated PGs to serve"
+        );
+
+        server.join().unwrap();
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
     fn frontend_startup_retries_transient_control_plane_runtime_map_errors() {
         assert!(frontend_control_plane_startup_error_is_retryable(
             "failed to fetch control-plane runtime map from /tmp/control-plane.sock: control-plane RPC remote error: PG 1 has no serving primary in cluster epoch 35"
@@ -6771,6 +6809,131 @@ mod tests {
             }
             let (mut stream, _addr) = listener.accept().unwrap();
             handle_control_plane_unix_stream(&mut authority, &mut stream, 1_006).unwrap();
+        })
+    }
+
+    fn serve_control_plane_with_active_pg_and_unserved_pg(
+        socket_path: PathBuf,
+        node_id: NodeId,
+        endpoint: String,
+        request_count: usize,
+    ) -> std::thread::JoinHandle<()> {
+        let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+        std::thread::spawn(move || {
+            use storage::control_plane::{
+                handle_control_plane_unix_stream, ControlPlaneHeartbeatSink, NodeHeartbeat,
+                NodeMembershipState,
+            };
+
+            let state_path = socket_path.with_extension("state");
+            let store = FileControlPlaneStore::new(state_path);
+            let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+            let unserved_node_id = NodeId::new(node_id.as_u32() + 1);
+            authority
+                .set_node_membership(node_id, NodeMembershipState::Active)
+                .unwrap();
+            authority
+                .set_node_membership(unserved_node_id, NodeMembershipState::Active)
+                .unwrap();
+            authority
+                .set_pg_acting_set(PgId::new(0), vec![node_id])
+                .unwrap();
+            for now_ms in 1_000..1_004 {
+                let observed_epoch = authority.snapshot().cluster_epoch();
+                let lease = authority
+                    .submit_node_heartbeat(
+                        NodeHeartbeat {
+                            node_id,
+                            node_incarnation: 1,
+                            endpoint: endpoint.clone(),
+                            observed_epoch,
+                            requested_lease_duration_ms: 1_000,
+                            cluster_map_history_reference_summary:
+                                storage::PgClusterMapHistoryReferenceSummary::default(),
+                            pg_observations: vec![NodePgHeartbeatObservation {
+                                pg_id: PgId::new(0),
+                                state: PgState::Peering,
+                                metadata_proof: PgMetadataProof::empty(),
+                                has_pending_metadata_command: false,
+                            }],
+                        },
+                        now_ms,
+                    )
+                    .unwrap();
+                if lease.serving() {
+                    break;
+                }
+                assert!(now_ms < 1_003, "authority did not grant serving lease");
+            }
+            authority
+                .complete_pg_peering(PgId::new(0), node_id, 1, 1_001)
+                .unwrap();
+            authority
+                .set_pg_acting_set(PgId::new(1), vec![unserved_node_id])
+                .unwrap();
+            for now_ms in 1_002..1_006 {
+                let observed_epoch = authority.snapshot().cluster_epoch();
+                let lease = authority
+                    .submit_node_heartbeat(
+                        NodeHeartbeat {
+                            node_id: unserved_node_id,
+                            node_incarnation: 1,
+                            endpoint: format!("{endpoint}.unserved"),
+                            observed_epoch,
+                            requested_lease_duration_ms: 1_000,
+                            cluster_map_history_reference_summary:
+                                storage::PgClusterMapHistoryReferenceSummary::default(),
+                            pg_observations: vec![NodePgHeartbeatObservation {
+                                pg_id: PgId::new(1),
+                                state: PgState::Peering,
+                                metadata_proof: PgMetadataProof::empty(),
+                                has_pending_metadata_command: false,
+                            }],
+                        },
+                        now_ms,
+                    )
+                    .unwrap();
+                if lease.serving() {
+                    break;
+                }
+                assert!(
+                    now_ms < 1_005,
+                    "authority did not grant unrelated PG serving lease"
+                );
+            }
+            authority
+                .complete_pg_peering(PgId::new(1), unserved_node_id, 1, 1_006)
+                .unwrap();
+            authority
+                .submit_node_heartbeat(
+                    NodeHeartbeat {
+                        node_id,
+                        node_incarnation: 1,
+                        endpoint,
+                        observed_epoch: authority.snapshot().cluster_epoch(),
+                        requested_lease_duration_ms: 1_000,
+                        cluster_map_history_reference_summary:
+                            storage::PgClusterMapHistoryReferenceSummary::default(),
+                        pg_observations: vec![NodePgHeartbeatObservation {
+                            pg_id: PgId::new(0),
+                            state: PgState::Active,
+                            metadata_proof: PgMetadataProof::empty(),
+                            has_pending_metadata_command: false,
+                        }],
+                    },
+                    1_007,
+                )
+                .unwrap();
+
+            for request_index in 0..request_count {
+                let (mut stream, _addr) = listener.accept().unwrap();
+                handle_control_plane_unix_stream(
+                    &mut authority,
+                    &mut stream,
+                    1_008 + u64::try_from(request_index).unwrap(),
+                )
+                .unwrap();
+            }
         })
     }
 

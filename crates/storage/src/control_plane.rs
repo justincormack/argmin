@@ -749,16 +749,24 @@ impl ClusterControlSnapshot {
         } else {
             Some(floor_epoch.map_or(observed_epoch, |floor| floor.max(observed_epoch)))
         };
+        let mut previous_routes: BTreeMap<PgId, PgRouteSnapshot> = BTreeMap::new();
 
         for history in &self.history {
             if response_floor.is_some_and(|floor| history.cluster_epoch() >= floor) {
                 for pg in history.pgs() {
-                    add_required_historical_route_key(
-                        &mut required_keys,
-                        &mut pending_keys,
-                        history.cluster_epoch(),
-                        pg.pg_id(),
-                    );
+                    let route = history.reconstructed_pg_route(pg.pg_id())?;
+                    let route_changed = previous_routes
+                        .get(&pg.pg_id())
+                        .is_none_or(|previous| !pg_route_configuration_eq(previous, &route));
+                    if route_changed {
+                        add_required_historical_route_key(
+                            &mut required_keys,
+                            &mut pending_keys,
+                            history.cluster_epoch(),
+                            pg.pg_id(),
+                        );
+                    }
+                    previous_routes.insert(pg.pg_id(), route);
                 }
             }
         }
@@ -2462,6 +2470,13 @@ impl PgRouteSnapshot {
         route.primary_lease_deadline_ms = None;
         route
     }
+
+    #[must_use]
+    pub fn with_cluster_epoch(&self, cluster_epoch: ClusterEpoch) -> Self {
+        let mut route = self.clone();
+        route.cluster_epoch = cluster_epoch;
+        route
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2612,11 +2627,15 @@ impl ClusterRuntimeMapSnapshot {
                 .map(PgRouteSnapshot::without_serving_authority)
                 .ok_or(ControlPlaneError::UnknownPg { pg_id: pg_id.get() });
         }
-        self.historical_pg_routes
+        let mut route = self
+            .historical_pg_routes
             .iter()
-            .find(|route| route.cluster_epoch == cluster_epoch && route.pg_id == pg_id)
+            .filter(|route| route.pg_id == pg_id && route.cluster_epoch <= cluster_epoch)
+            .max_by_key(|route| route.cluster_epoch)
             .cloned()
-            .ok_or(ControlPlaneError::UnknownClusterMapEpoch { cluster_epoch })
+            .ok_or(ControlPlaneError::UnknownClusterMapEpoch { cluster_epoch })?;
+        route.cluster_epoch = cluster_epoch;
+        Ok(route)
     }
 
     pub fn runtime_map_at_epoch(
@@ -2626,15 +2645,11 @@ impl ClusterRuntimeMapSnapshot {
         if cluster_epoch == self.cluster_epoch {
             return Ok(self.clone());
         }
-        let pg_routes: Vec<_> = self
-            .historical_pg_routes
+        let pg_routes = self
+            .pg_routes
             .iter()
-            .filter(|route| route.cluster_epoch == cluster_epoch)
-            .cloned()
-            .collect();
-        if pg_routes.is_empty() {
-            return Err(ControlPlaneError::UnknownClusterMapEpoch { cluster_epoch });
-        }
+            .map(|route| self.reconstructed_pg_route_at_epoch(route.pg_id(), cluster_epoch))
+            .collect::<Result<Vec<_>, _>>()?;
         Ok(Self {
             cluster_epoch,
             valid_until_ms: None,
@@ -2755,6 +2770,18 @@ fn add_required_historical_route_key(
     if required_keys.insert((cluster_epoch, pg_id)) {
         pending_keys.push((cluster_epoch, pg_id));
     }
+}
+
+fn pg_route_configuration_eq(left: &PgRouteSnapshot, right: &PgRouteSnapshot) -> bool {
+    left.pg_id() == right.pg_id()
+        && left.primary_node_id() == right.primary_node_id()
+        && left.acting_set() == right.acting_set()
+        && left.state() == right.state()
+        && left.peering_metadata_transfer() == right.peering_metadata_transfer()
+        && left.peering_metadata_transfer_source_route_epoch()
+            == right.peering_metadata_transfer_source_route_epoch()
+        && left.peering_metadata_transfer_source_node_id()
+            == right.peering_metadata_transfer_source_node_id()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -5774,14 +5801,16 @@ fn validate_runtime_map_transfer_sources(
                 ),
             });
         }
-        let source_route = runtime_map_route_at_epoch(snapshot, route.pg_id(), source_route_epoch)
-            .ok_or_else(|| ControlPlaneError::RpcProtocol {
-                message: format!(
-                    "runtime map route for PG {} references missing metadata transfer source route epoch {}",
-                    route.pg_id().get(),
-                    source_route_epoch.get()
-                ),
-            })?;
+        let source_route =
+            runtime_map_route_at_epoch(snapshot, route.pg_id(), source_route_epoch).ok_or_else(
+                || ControlPlaneError::RpcProtocol {
+                    message: format!(
+                        "runtime map route for PG {} references missing metadata transfer source route epoch {}",
+                        route.pg_id().get(),
+                        source_route_epoch.get()
+                    ),
+                },
+            )?;
         if source_route.primary_node_id() != source_node_id {
             return Err(ControlPlaneError::RpcProtocol {
                 message: format!(
@@ -5801,17 +5830,17 @@ fn runtime_map_route_at_epoch(
     snapshot: &ClusterRuntimeMapSnapshot,
     pg_id: PgId,
     cluster_epoch: ClusterEpoch,
-) -> Option<&PgRouteSnapshot> {
+) -> Option<PgRouteSnapshot> {
     if cluster_epoch == snapshot.cluster_epoch() {
         snapshot
             .pg_routes()
             .iter()
             .find(|route| route.pg_id() == pg_id)
+            .map(PgRouteSnapshot::without_serving_authority)
     } else {
         snapshot
-            .historical_pg_routes()
-            .iter()
-            .find(|route| route.cluster_epoch() == cluster_epoch && route.pg_id() == pg_id)
+            .reconstructed_pg_route_at_epoch(pg_id, cluster_epoch)
+            .ok()
     }
 }
 
@@ -15614,6 +15643,7 @@ mod tests {
             .snapshot()
             .runtime_map_for_storage_node_refresh(2_000, NodeId::new(1), ClusterEpoch::INITIAL)
             .unwrap();
+        assert_eq!(bootstrap_refresh.historical_pg_routes().len(), 1);
         assert!(bootstrap_refresh
             .historical_pg_routes()
             .iter()
@@ -15623,6 +15653,7 @@ mod tests {
             .snapshot()
             .runtime_map_for_storage_node_refresh(2_000, NodeId::new(1), observed_epoch)
             .unwrap();
+        assert_eq!(running_refresh.historical_pg_routes().len(), 1);
         assert!(running_refresh
             .historical_pg_routes()
             .iter()

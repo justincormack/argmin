@@ -1111,17 +1111,22 @@ capacity. Confirmed.
   routes until 1s readers disconnected and the authority logged `Broken pipe`.
   The first fix limited storage-node heartbeat refreshes to the reported
   history floor, but soak runs still hit large responses when a long-lived
-  node had an old durable shard/backfill floor. The refresh response is now
-  shaped by the heartbeat's observed epoch: startup heartbeats at
-  `ClusterEpoch::INITIAL` still receive the durable floor bootstrap history,
-  while steady-state refreshes receive only route-history delta from the
-  node's observed epoch plus explicit metadata-transfer source routes required
-  by current peering proofs. Storage-node config refresh merges that delta
-  with locally retained history so old shard/backfill references are not
-  forgotten. The UAT readiness/admin check uses a compact runtime-map status
-  RPC instead of repeatedly fetching the full historical map. Full runtime-map
-  snapshots still export retained history for consumers that need route
-  reconstruction.
+  node had an old durable shard/backfill floor, and restart/bootstrap paths
+  could still request thousands of unchanged per-PG historical routes. The
+  refresh response is now shaped as compact route history: the first retained
+  epoch in the response acts as the base for each PG, later epochs include
+  only PG routes whose placement/peering configuration changed, and explicit
+  metadata-transfer source routes are still included for current peering
+  proofs. Storage-node config refresh merges that compact delta with locally
+  retained history so old shard/backfill references are not forgotten. Runtime
+  map reconstruction now resolves a historical route as the latest retained
+  route at or before the requested epoch, then stamps it with the requested
+  epoch for operation fencing. The UAT readiness/admin check uses a compact
+  runtime-map status RPC instead of repeatedly fetching the full historical
+  map, and the metadata-transfer completion/import-retry probes use the
+  existing PG-scoped runtime-map RPC instead of full-map fetches. Full
+  runtime-map snapshots still export retained history for consumers that need
+  route reconstruction.
 
 ### RPC2. RESOLVED — Epoch validation now uses a refreshed per-frame config snapshot
 
