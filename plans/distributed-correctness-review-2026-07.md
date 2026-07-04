@@ -284,11 +284,13 @@ bounds it. Inconsistent rather than unsafe.
   `control_plane_raft.rs:593-625` checks set membership only). The plan
   defers authentication (12.4) and filesystem permissions are the boundary;
   noted for completeness.
-- The Unix peer network uses blocking `std::os::unix::net::UnixStream`
-  connect/read/write directly inside `async` RaftNetworkV2 methods
-  (:984-1066) with a 1s timeout (main.rs:63); under a multi-thread tokio
-  runtime this stalls worker threads per in-flight RPC (liveness under
-  partition, not correctness).
+- Blocking Unix peer transport I/O is now offloaded from the async
+  `RaftNetworkV2` methods onto Tokio's blocking pool. The transport still uses
+  bounded `std::os::unix::net::UnixStream` connect/read/write with explicit
+  socket timeouts, but stalled peers no longer occupy the async runtime worker
+  that is polling the Raft network future. A regression pins this by racing a
+  stalled peer read against an async runtime sleep, then confirming the RPC
+  fails as `Unreachable` on the configured read timeout.
 - Otherwise the RPC boundary held up: connect-per-RPC (no connection reuse →
   no request/response cross-matching), length-prefix bounds before allocation
   (:4694-4726), CRC + magic + version + direction + trailing-byte rejection
@@ -398,9 +400,8 @@ shift.
    config-driven membership evolution is designed.
 8. **DONE — Gate the peer socket on poison (R8).** A shared atomic poison
    flag is checked before peer dispatch and again before peer response write.
-9. **Smaller items:** convert the peer network to nonblocking/tokio I/O or a
-   dedicated blocking pool with a connect timeout (R9); canonicalize the
-   snapshot text parser if artifact bytes are ever compared (R-OK4 caveat). Run
+9. **Smaller items:** canonicalize the snapshot text parser if artifact bytes
+   are ever compared (R-OK4 caveat). Run
    `openraft::testing::log::suite` against the guarded log store (currently
    skipped because the store is deliberately stricter than the generic
    baseline; document the deviations if the suite cannot pass).

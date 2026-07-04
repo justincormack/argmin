@@ -2372,6 +2372,7 @@ dependencies = [
  "s3-types",
  "test-util",
  "thiserror",
+ "tokio",
 ]
 
 [[package]]

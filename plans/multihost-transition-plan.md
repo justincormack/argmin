@@ -10623,6 +10623,13 @@ Phase 12.3 progress:
   still fails closed. This complements the earlier lease-expiry leadership-
   churn handling and removes the remaining documented serving-loop transient
   exit in Phase 12.3.
+- Closed the R9 peer-network blocking-I/O liveness item. Unix peer transport
+  still uses the existing bounded `std::os::unix::net::UnixStream` frame path
+  and explicit socket timeouts, but the OpenRaft `RaftNetworkV2` methods now
+  run connect/read/write exchanges on Tokio's blocking pool instead of the
+  async runtime worker. A stalled-peer regression proves an async runtime sleep
+  continues while the peer read waits for its timeout, then the RPC fails as an
+  unreachable peer. Peer authentication remains deferred to Phase 12.4.
 
 1. define the replicated control-plane state machine:
    - state includes cluster epoch, PG count, PG state, PG acting sets, node

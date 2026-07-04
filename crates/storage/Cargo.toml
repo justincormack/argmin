@@ -19,6 +19,7 @@ rapidhash = "4.4"
 ring = "0.17"
 rusqlite = { version = "0.33", features = ["bundled", "functions", "trace"] }
 thiserror = "2"
+tokio = { version = "1", features = ["rt"] }
 
 [dev-dependencies]
 test-util = { path = "../test-util" }
