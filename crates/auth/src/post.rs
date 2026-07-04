@@ -123,7 +123,7 @@ pub fn authenticate_post_sigv4(
     }
 
     Ok(AuthContext {
-        mode: AuthMode::HeaderSigV4,
+        mode: AuthMode::PostSigV4,
         access_key_id: Some(credential.access_key_id.to_string()),
         account: Some(record.account.clone()),
         authorization_profile: record.authorization_profile,
@@ -570,6 +570,7 @@ mod tests {
             ExpectedCredentialScope::new(None, "s3"),
         )
         .unwrap();
+        assert_eq!(ctx.mode, AuthMode::PostSigV4);
         assert_eq!(ctx.access_key_id.as_deref(), Some("testAccessKey123"));
     }
 

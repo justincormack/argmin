@@ -112,9 +112,13 @@ steps it performs.
   verification when present. Completed by tightening AWS-facing s3-tests; no
   auth code change is needed.
 
-- [ ] **A7. POST auth reports `AuthMode::HeaderSigV4`** (post.rs:116), so
-  downstream `AuthMode` matches cannot distinguish POST auth. Fix: add
-  `AuthMode::PostSigV4`.
+- [x] **A7. POST auth reports `AuthMode::HeaderSigV4`.** Downgraded from an
+  AWS-visible auth bug to an internal API-correctness issue: current
+  production consumers only distinguish anonymous from authenticated POST auth
+  and do not branch on `HeaderSigV4`, so no downstream AWS behavior divergence
+  was identified. Completed by adding `AuthMode::PostSigV4` and returning it
+  from POST authentication so future downstream matches cannot accidentally
+  treat POST Object auth as canonical header auth.
 
 - [ ] **A8. Region/scope mismatch yields three different error variants by
   path.** Header: `MalformedAuth` → `AuthorizationHeaderMalformed`; presigned:

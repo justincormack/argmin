@@ -24,6 +24,7 @@ const TRACE_TARGET: &str = "auth";
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuthMode {
     HeaderSigV4,
+    PostSigV4,
     PresignedSigV4,
     Anonymous,
 }
