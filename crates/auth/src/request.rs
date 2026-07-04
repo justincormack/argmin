@@ -567,7 +567,7 @@ pub(crate) fn validate_static_record_token_and_expiry(
     now_epoch_secs: u64,
 ) -> Result<(), AuthError> {
     if let Some(expiry) = record.expires_at_epoch_secs {
-        if now_epoch_secs != 0 && now_epoch_secs > expiry {
+        if now_epoch_secs > expiry {
             return Err(AuthError::ExpiredToken);
         }
     }
@@ -1611,7 +1611,7 @@ mod tests {
     }
 
     #[test]
-    fn expiry_not_checked_when_now_zero() {
+    fn epoch_time_before_future_expiry_is_not_expired() {
         let record = CredentialRecord {
             access_key_id: "AKID".to_string(),
             secret_key: SecretKey::new("s".to_string()),
@@ -1620,7 +1620,6 @@ mod tests {
             expires_at_epoch_secs: Some(5),
             enabled: true,
         };
-        // now_epoch_secs == 0 skips expiry check
         validate_static_record_token_and_expiry(&record, None, 0).unwrap();
     }
 

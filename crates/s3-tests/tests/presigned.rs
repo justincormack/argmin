@@ -1,6 +1,9 @@
 use std::time::Duration;
 
+use auth::canonical::{canonical_query_string, canonical_request, string_to_sign};
+use auth::credential::SecretKey;
 use aws_sdk_s3::primitives::ByteStream;
+use ring::hmac;
 use s3_tests::{
     create_public_bucket, object_url, presign_url_with_credentials,
     presign_url_without_host_signed_header, send_signed_request_with_unsigned_headers,
@@ -180,6 +183,77 @@ fn assert_signature_does_not_match(status: u16, body: &str) {
         body.contains("<Code>SignatureDoesNotMatch</Code>"),
         "expected SignatureDoesNotMatch response, got: {body}"
     );
+}
+
+fn presign_object_with_fixed_amz_date(
+    credentials: SignedRequestCredentials<'_>,
+    method: &str,
+    bucket: &str,
+    key: &str,
+    expires: Duration,
+    amz_date: &str,
+) -> String {
+    let date_stamp = &amz_date[..8];
+    let url = object_url(CTX.endpoint(), bucket, key, None);
+    let parsed = url::Url::parse(&url).expect("parse object URL");
+    let path = parsed.path();
+    let host = parsed
+        .host_str()
+        .map(|host| {
+            if let Some(port) = parsed.port() {
+                format!("{host}:{port}")
+            } else {
+                host.to_string()
+            }
+        })
+        .expect("object URL has host");
+    let signed_headers = "host";
+    let canonical_headers = format!("host:{host}\n");
+    let credential = format!(
+        "{}/{}/{}/s3/aws4_request",
+        credentials.access_key, date_stamp, credentials.region
+    );
+    let raw_query = [
+        "X-Amz-Algorithm=AWS4-HMAC-SHA256".to_string(),
+        format!("X-Amz-Credential={credential}"),
+        format!("X-Amz-Date={amz_date}"),
+        format!("X-Amz-Expires={}", expires.as_secs()),
+        format!("X-Amz-SignedHeaders={signed_headers}"),
+    ]
+    .join("&");
+    let canonical_query = canonical_query_string(&raw_query);
+    let canonical_request = canonical_request(
+        method,
+        path,
+        &canonical_query,
+        &canonical_headers,
+        signed_headers,
+        "UNSIGNED-PAYLOAD",
+    );
+    let scope = format!("{date_stamp}/{}/s3/aws4_request", credentials.region);
+    let string_to_sign =
+        string_to_sign(amz_date, &scope, &sha256_hex(canonical_request.as_bytes()));
+    let signing_key = auth::sigv4::derive_signing_key(
+        &SecretKey::new(credentials.secret_key.to_string()),
+        date_stamp,
+        credentials.region,
+        "s3",
+    );
+    let signature = hmac::sign(
+        &hmac::Key::new(hmac::HMAC_SHA256, signing_key.as_ref()),
+        string_to_sign.as_bytes(),
+    )
+    .as_ref()
+    .iter()
+    .map(|byte| format!("{byte:02x}"))
+    .collect::<String>();
+
+    format!(
+        "{}{}?{}&X-Amz-Signature={signature}",
+        parsed.origin().ascii_serialization(),
+        path,
+        canonical_query
+    )
 }
 
 #[test]
@@ -1460,6 +1534,42 @@ fn test_object_raw_get_x_amz_expires_out_range_zero() {
         let _ = resp.body_mut().read_to_string();
         // Zero expires means immediately expired → auth expiry
         assert_eq!(status, 403, "expected 403 for zero expires, got {}", status);
+
+        cleanup(&bucket, &["obj"]).await;
+    });
+}
+
+#[test]
+fn test_object_raw_get_x_amz_epoch_date_is_expired() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key("obj")
+            .body(ByteStream::from_static(b"data"))
+            .send()
+            .await
+            .unwrap();
+
+        let presigned_url = presign_object_with_fixed_amz_date(
+            primary_credentials(),
+            "GET",
+            &bucket,
+            "obj",
+            Duration::from_secs(1),
+            "19700101T000000Z",
+        );
+
+        let mut resp = agent().get(&presigned_url).call().expect("transport error");
+        let status = resp.status().as_u16();
+        let _ = resp.body_mut().read_to_string();
+        assert_eq!(
+            status, 403,
+            "expected 403 for epoch-dated presigned URL, got {status}"
+        );
 
         cleanup(&bucket, &["obj"]).await;
     });

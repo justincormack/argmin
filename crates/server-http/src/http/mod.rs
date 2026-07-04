@@ -338,6 +338,13 @@ pub(crate) fn enforce_sigv4_time_skew(req: &S3Request, now: u64) -> Result<(), S
     Ok(())
 }
 
+fn current_auth_epoch_secs() -> Result<u64, ServerError> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| ServerError::Auth(auth::AuthError::RequestExpired))
+        .map(|duration| duration.as_secs())
+}
+
 #[doc(hidden)]
 pub fn fuzz_upload_id_query_entrypoints(
     multipart_query: &str,
@@ -3083,10 +3090,7 @@ impl HttpFrontend {
         verify_payload_hash: bool,
         defer_region_check: bool,
     ) -> Result<AuthContext, ServerError> {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
+        let now = current_auth_epoch_secs()?;
 
         enforce_sigv4_time_skew(req, now)?;
 
@@ -3413,10 +3417,7 @@ impl HttpFrontend {
                 .find(|(k, _)| k.eq_ignore_ascii_case(name))
                 .map(|(_, v)| v.as_str())
         };
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
+        let now = current_auth_epoch_secs()?;
 
         let post_auth = if [
             "x-amz-algorithm",

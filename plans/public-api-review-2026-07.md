@@ -70,16 +70,18 @@ steps it performs.
   `CredentialRecord`; only credential-expiry checks remain as a local
   credential property.
 
-- [ ] **A3. `now_epoch_secs == 0` is a sentinel that disables expiry checks,
-  and production can produce it.** `request.rs:557-559` skips credential
-  expiry when `now == 0` (deliberate, test `expiry_not_checked_when_now_zero`);
-  presigned expiry (request.rs:442) also never fires at `now == 0`.
-  server-http computes now with
+- [x] **A3. `now_epoch_secs == 0` is a sentinel that disables expiry checks,
+  and production can produce it.** `request.rs:557-559` skipped credential
+  expiry when `now == 0`, and presigned expiry (request.rs:442) also did not
+  fire for epoch-dated requests if the server timestamp had defaulted to `0`.
+  server-http computed now with
   `SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default()`
   (`crates/server-http/src/http/mod.rs:3086-3090`) — a broken clock yields
-  exactly the sentinel. Fix: remove the sentinel; take an always-meaningful
-  timestamp (newtype `EpochSeconds` or `NonZeroU64`); make tests pass real
-  timestamps.
+  exactly the sentinel. Completed by treating `0` as a normal Unix-epoch
+  timestamp in auth validation and making server-http auth timestamp
+  acquisition fail closed instead of defaulting clock errors to `0`. Added AWS
+  oracle coverage proving an epoch-dated presigned URL is rejected rather than
+  accepted.
 
 - [ ] **A4. Presigned path has no future-skew check.** Header auth rejects
   `|now - x-amz-date| > 900s` both directions (request.rs:283-288); presigned
