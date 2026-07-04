@@ -2267,6 +2267,9 @@ pub struct ControlPlaneRaftAuthorityStatus {
     committed: Option<LogIdOf<ControlPlaneRaftTypeConfig>>,
     applied: Option<LogIdOf<ControlPlaneRaftTypeConfig>>,
     current_snapshot: Option<LogIdOf<ControlPlaneRaftTypeConfig>>,
+    durable_wal_backed: bool,
+    durable_wal_clean_len: Option<u64>,
+    durable_wal_poisoned: Option<String>,
     authority_incarnation: AuthorityIncarnation,
     current_cluster_epoch: ClusterEpoch,
     retained_history_count: usize,
@@ -2450,6 +2453,21 @@ impl ControlPlaneRaftAuthorityStatus {
     #[must_use]
     pub fn current_snapshot_index(&self) -> Option<u64> {
         self.current_snapshot.map(|log_id| log_id.index())
+    }
+
+    #[must_use]
+    pub fn durable_wal_backed(&self) -> bool {
+        self.durable_wal_backed
+    }
+
+    #[must_use]
+    pub fn durable_wal_clean_len(&self) -> Option<u64> {
+        self.durable_wal_clean_len
+    }
+
+    #[must_use]
+    pub fn durable_wal_poisoned(&self) -> Option<&str> {
+        self.durable_wal_poisoned.as_deref()
     }
 
     #[must_use]
@@ -3401,21 +3419,25 @@ impl ControlPlaneRaftAuthority {
     pub async fn status(&self) -> Result<ControlPlaneRaftAuthorityStatus, ControlPlaneError> {
         let node_id = *self.raft.node_id();
         let current_leader = self.raft.current_leader().await;
-        let persisted_vote = self
+        let log_store_status = self
             .log_store
             .as_ref()
-            .map(ControlPlaneRaftLogStore::persisted_vote)
+            .map(ControlPlaneRaftLogStore::status_snapshot)
             .transpose()
-            .map_err(|error| openraft_remote_error("status log-store vote read", error))?
-            .flatten();
+            .map_err(|error| openraft_remote_error("status log-store read", error))?;
+        let persisted_vote = log_store_status.as_ref().and_then(|status| status.vote);
         let current_term = persisted_vote.map(|vote| vote.leader_id.term);
-        let last_purged_log_id = self
-            .log_store
+        let last_purged_log_id = log_store_status
             .as_ref()
-            .map(ControlPlaneRaftLogStore::last_purged_log_id)
-            .transpose()
-            .map_err(|error| openraft_remote_error("status log-store read", error))?
-            .flatten();
+            .and_then(|status| status.last_purged_log_id);
+        let durability_status = log_store_status.as_ref().map(|status| &status.durability);
+        let durable_wal_backed = durability_status
+            .as_ref()
+            .is_some_and(|status| status.wal_backed);
+        let durable_wal_clean_len = durability_status
+            .as_ref()
+            .and_then(|status| status.wal_clean_len);
+        let durable_wal_poisoned = durability_status.and_then(|status| status.wal_poisoned.clone());
         let (
             last_log_id,
             committed,
@@ -3648,6 +3670,9 @@ impl ControlPlaneRaftAuthority {
             committed,
             applied,
             current_snapshot,
+            durable_wal_backed,
+            durable_wal_clean_len,
+            durable_wal_poisoned,
             authority_incarnation,
             current_cluster_epoch,
             retained_history_count,
@@ -4089,6 +4114,20 @@ struct ControlPlaneRaftLogStoreInner {
     poisoned: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ControlPlaneRaftLogStoreDurabilityStatus {
+    wal_backed: bool,
+    wal_clean_len: Option<u64>,
+    wal_poisoned: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ControlPlaneRaftLogStoreStatusSnapshot {
+    vote: Option<VoteOf<ControlPlaneRaftTypeConfig>>,
+    last_purged_log_id: Option<LogIdOf<ControlPlaneRaftTypeConfig>>,
+    durability: ControlPlaneRaftLogStoreDurabilityStatus,
+}
+
 impl ControlPlaneRaftLogStore {
     #[must_use]
     pub fn empty() -> Self {
@@ -4139,6 +4178,39 @@ impl ControlPlaneRaftLogStore {
 
     pub fn persisted_vote(&self) -> Result<Option<VoteOf<ControlPlaneRaftTypeConfig>>, io::Error> {
         Ok(self.lock()?.vote)
+    }
+
+    fn status_snapshot(&self) -> Result<ControlPlaneRaftLogStoreStatusSnapshot, io::Error> {
+        let (vote, last_purged_log_id, wal_backed, wal_poisoned) = {
+            let inner = self
+                .inner
+                .lock()
+                .map_err(|_| io::Error::other("control-plane OpenRaft log store lock poisoned"))?;
+            (
+                inner.vote,
+                inner.last_purged_log_id,
+                self.wal.is_some(),
+                inner.poisoned.clone(),
+            )
+        };
+        let wal_clean_len = match (&self.wal, &wal_poisoned) {
+            (Some(wal), None) => Some(wal.clean_len().map_err(|error| {
+                control_plane_error_to_io_error(
+                    "read control-plane OpenRaft WAL clean length for status",
+                    error,
+                )
+            })?),
+            (Some(_), Some(_)) | (None, _) => None,
+        };
+        Ok(ControlPlaneRaftLogStoreStatusSnapshot {
+            vote,
+            last_purged_log_id,
+            durability: ControlPlaneRaftLogStoreDurabilityStatus {
+                wal_backed,
+                wal_clean_len,
+                wal_poisoned,
+            },
+        })
     }
 
     pub fn from_restart_artifact(
@@ -10556,6 +10628,9 @@ mod tests {
             committed: caught_up_log_id,
             applied: caught_up_log_id,
             current_snapshot: None,
+            durable_wal_backed: false,
+            durable_wal_clean_len: None,
+            durable_wal_poisoned: None,
             authority_incarnation: AuthorityIncarnation::INITIAL,
             current_cluster_epoch: ClusterEpoch::INITIAL,
             retained_history_count: 0,
@@ -11272,6 +11347,16 @@ mod tests {
                 .export_restart_artifact()
                 .unwrap();
             assert_eq!(replayed, live.export_restart_artifact().unwrap());
+            let durability = live
+                .status_snapshot()
+                .expect("WAL-backed log store status should be observable")
+                .durability;
+            assert!(durability.wal_backed);
+            assert!(
+                durability.wal_clean_len.is_some_and(|len| len > 0),
+                "WAL-backed log store should report a positive clean WAL length after mutations: {durability:?}"
+            );
+            assert_eq!(durability.wal_poisoned, None);
         });
     }
 
@@ -11363,6 +11448,20 @@ mod tests {
                 "unexpected poison reason: {:?}",
                 inner.poisoned
             );
+            drop(inner);
+            let durability = store
+                .status_snapshot()
+                .expect("poisoned WAL-backed log store status should remain observable")
+                .durability;
+            assert!(durability.wal_backed);
+            assert_eq!(durability.wal_clean_len, None);
+            assert!(
+                durability
+                    .wal_poisoned
+                    .as_deref()
+                    .is_some_and(|reason| reason.contains("ambiguous WAL append")),
+                "unexpected durability poison reason: {durability:?}"
+            );
         });
     }
 
@@ -11430,6 +11529,81 @@ mod tests {
                 .export_restart_artifact()
                 .unwrap();
             assert_eq!(live_artifact, replayed);
+        });
+    }
+
+    #[test]
+    fn control_plane_raft_status_reports_wal_durability() {
+        ControlPlaneRaftTypeConfig::run(async {
+            let tmp = test_util::tempdir();
+            let wal_path = tmp.path().join("raft.wal");
+            let log_store = ControlPlaneRaftLogStore::from_restart_artifact_with_wal_file(
+                ControlPlaneRaftLogStoreRestartArtifact::default(),
+                ControlPlaneRaftWalFile::new(&wal_path, "test-cluster", 1),
+            )
+            .expect("WAL-backed log store should initialize");
+            let raft = Raft::<ControlPlaneRaftTypeConfig, ControlPlaneRaftStateMachine>::new(
+                1,
+                test_raft_config("control-plane-raft-wal-status-test"),
+                UnreachableRaftNetworkFactory,
+                log_store.clone(),
+                ControlPlaneRaftStateMachine::empty(),
+            )
+            .await
+            .unwrap();
+            let authority =
+                ControlPlaneRaftAuthority::new_with_log_store(raft, log_store, "test-cluster");
+
+            let initial_status = authority.status().await.unwrap();
+            assert!(initial_status.durable_wal_backed());
+            assert_eq!(initial_status.durable_wal_clean_len(), Some(0));
+            assert_eq!(initial_status.durable_wal_poisoned(), None);
+
+            let mut shared_log_store = authority
+                .log_store
+                .as_ref()
+                .expect("authority should retain WAL-backed log store")
+                .clone();
+            RaftLogStorage::save_vote(
+                &mut shared_log_store,
+                &Vote::<ControlPlaneRaftLeaderId>::new(3, 1),
+            )
+            .await
+            .unwrap();
+
+            let status = authority.status().await.unwrap();
+            assert!(status.durable_wal_backed());
+            assert!(
+                status.durable_wal_clean_len().is_some_and(|len| len > 0),
+                "WAL-backed authority status should report a positive clean WAL length after a durable mutation: {status:?}"
+            );
+            assert_eq!(status.durable_wal_poisoned(), None);
+
+            *CONTROL_PLANE_RAFT_WAL_FAIL_NEXT_FILE_SYNC
+                .lock()
+                .expect("test WAL file-sync fault lock should not be poisoned") =
+                Some(wal_path.clone());
+            RaftLogStorage::save_vote(
+                &mut shared_log_store,
+                &Vote::<ControlPlaneRaftLeaderId>::new(4, 1),
+            )
+            .await
+            .expect_err("ambiguous WAL sync failure should poison the log store");
+
+            let poisoned_status = authority
+                .status()
+                .await
+                .expect("authority status should remain available after WAL poison");
+            assert!(poisoned_status.durable_wal_backed());
+            assert_eq!(poisoned_status.durable_wal_clean_len(), None);
+            assert!(
+                poisoned_status
+                    .durable_wal_poisoned()
+                    .is_some_and(|reason| reason.contains("ambiguous WAL append")),
+                "poisoned authority status should expose WAL poison reason: {poisoned_status:?}"
+            );
+
+            authority.shutdown().await.unwrap();
         });
     }
 

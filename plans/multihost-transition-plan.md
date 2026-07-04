@@ -10814,6 +10814,14 @@ Phase 12.4 progress:
   installs have their own durable state-machine journal. Process restart probes
   that observe follower state now restore artifact-plus-WAL state, while explicit
   checkpoint-unchanged tests still read artifact-only state.
+- Started the replicated-authority durability observability slice. The
+  OpenRaft authority status now reports whether its retained log store is
+  WAL-backed, the current clean WAL length while healthy, and any WAL poison
+  reason without requiring access to raw log-store internals. Tests cover both a
+  healthy WAL-backed authority and an authority with a poisoned WAL-backed store
+  so operators can distinguish "not WAL-backed", "healthy with clean bytes",
+  and "poisoned after an ambiguous durability failure" through the public status
+  surface.
 
 1. define the replicated control-plane state machine:
    - state includes cluster epoch, PG count, PG state, PG acting sets, node
