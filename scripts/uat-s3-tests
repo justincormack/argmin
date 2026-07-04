@@ -907,6 +907,104 @@ sample_frontend_metrics() {
     curl -k -sS "$endpoint/__argmin/debug/metrics" >"$output_path"
 }
 
+print_storage_node_log_tails() {
+    if [[ -z "${logs_dir:-}" || ! -d "$logs_dir" ]]; then
+        return 0
+    fi
+
+    local log_path
+    while IFS= read -r -d '' log_path; do
+        echo "== argmin-s3 UAT storage-node log tail: $log_path ==" >&2
+        tail -n 80 "$log_path" >&2 || true
+    done < <(find "$logs_dir" -maxdepth 1 -type f -name 'storage-node-*.log' -print0 2>/dev/null | sort -z)
+}
+
+print_shard_backfill_sqlite_debug() {
+    if [[ -z "${data_dir:-}" || ! -d "$data_dir" ]]; then
+        return 0
+    fi
+    if ! command -v sqlite3 >/dev/null 2>&1; then
+        echo "== argmin-s3 UAT shard backfill sqlite debug skipped: sqlite3 not found ==" >&2
+        return 0
+    fi
+
+    local printed_header=0
+    local db_path
+    while IFS= read -r -d '' db_path; do
+        local rel_path="${db_path#$data_dir/}"
+        local node_id="unknown"
+        local pg_id="unknown"
+        if [[ "$rel_path" =~ ^storage-node-([0-9]+)/pg-([0-9]+)/metadata\.db$ ]]; then
+            node_id="$((10#${BASH_REMATCH[1]}))"
+            pg_id="${BASH_REMATCH[2]}"
+        fi
+
+        local summary
+        summary="$(sqlite3 "$db_path" <<SQL 2>/dev/null || true
+.mode tabs
+SELECT 'pending_slot', '$node_id', '$pg_id',
+       cluster_epoch, pg_id, log_index, command_checksum, length(command_bytes), COALESCE(scope_bucket, '')
+FROM metadata_command_pending_slot
+LIMIT 1;
+SELECT 'replica_state', '$node_id', '$pg_id',
+       cluster_epoch, applied_log_index
+FROM metadata_command_replica_state
+LIMIT 1;
+SELECT 'backfill', '$node_id', '$pg_id',
+       data_pg_id, source_cluster_epoch, desired_cluster_epoch, remaining_tolerance,
+       CASE WHEN claim_id IS NULL THEN 0 ELSE 1 END,
+       COALESCE(cluster_epoch, -1), COALESCE(lease_deadline, -1), attempt_count,
+       COALESCE(next_attempt_after, -1), substr(COALESCE(last_error, ''), 1, 160)
+FROM placed_segment_shard_backfills
+ORDER BY data_pg_id, source_cluster_epoch, desired_cluster_epoch, segment_vid
+LIMIT 40;
+SQL
+)"
+        if [[ -n "$summary" ]]; then
+            if ((printed_header == 0)); then
+                echo "== argmin-s3 UAT shard backfill sqlite snapshot ==" >&2
+                echo "columns: kind node_id metadata_pg_id details..." >&2
+                printed_header=1
+            fi
+            printf '%s\n' "$summary" >&2
+        fi
+
+        if grep -q '^pending_slot' <<<"$summary"; then
+            echo "== argmin-s3 UAT metadata command log tail: node=$node_id pg=$pg_id ==" >&2
+            sqlite3 "$db_path" <<SQL >&2 2>/dev/null || true
+.mode tabs
+SELECT cluster_epoch, pg_id, log_index, command_checksum, length(command_bytes), abandoned
+FROM metadata_command_log
+ORDER BY cluster_epoch DESC, log_index DESC
+LIMIT 5;
+SQL
+        fi
+    done < <(find "$data_dir" -path '*/pg-*/metadata.db' -type f -print0 2>/dev/null | sort -z)
+}
+
+print_shard_backfill_debug() {
+    local metrics_path="$1"
+
+    echo "== argmin-s3 UAT shard backfill failure diagnostics ==" >&2
+    print_control_plane_runtime_map_diagnostics
+    if [[ -s "$metrics_path" ]]; then
+        echo "shard_backfill_top event" >&2
+        latest_metric_family_top "$metrics_path" shard_backfill_event_by_pg_total 20 >&2 || true
+        echo "metadata_pending_slot_top action" >&2
+        latest_metric_family_top "$metrics_path" metadata_command_pending_slot_action_by_pg_command_total 20 >&2 || true
+        echo "metadata_recovery_top admission" >&2
+        latest_metric_family_top "$metrics_path" metadata_command_recovery_admission_by_pg_command_total 20 >&2 || true
+        echo "metadata_recovery_top outcome" >&2
+        latest_metric_family_top "$metrics_path" metadata_command_recovery_outcome_by_pg_command_total 20 >&2 || true
+        echo "storage_rpc_top errors" >&2
+        latest_metric_family_top "$metrics_path" storage_rpc_error_by_node_total 20 >&2 || true
+        echo "background_work_top admission" >&2
+        latest_metric_family_top "$metrics_path" background_work_admission_by_class_total 20 >&2 || true
+    fi
+    print_shard_backfill_sqlite_debug
+    print_storage_node_log_tails
+}
+
 local_debug_endpoint_enabled() {
     case "$uat_local_debug_endpoint" in
         1|true|TRUE|True|yes|YES|Yes|on|ON|On)
@@ -1077,6 +1175,7 @@ wait_for_shard_backfill_completion_metrics() {
             pg_completed="$(latest_metric_family_label_sum "$metrics_path" shard_backfill_event_by_pg_total pg_id "$target_pg_id" event complete_succeeded)"
         fi
         if ((candidate_failed > max_candidate_failed || scan_error > max_scan_error || complete_failed > max_complete_failed || failed > max_failed || record_error_failed > max_record_error_failed)); then
+            print_shard_backfill_debug "$metrics_path"
             cat "$metrics_path" >&2 || true
             die "shard backfill worker hard-failure metrics increased: candidate_failed=$candidate_failed scan_error=$scan_error complete_failed=$complete_failed failed=$failed record_error_failed=$record_error_failed"
         fi
@@ -1085,6 +1184,7 @@ wait_for_shard_backfill_completion_metrics() {
             return 0
         fi
         if (($(date +%s) - start >= deadline_seconds)); then
+            print_shard_backfill_debug "$metrics_path"
             cat "$metrics_path" >&2 || true
             die "timed out waiting for shard backfill completion metrics"
         fi
