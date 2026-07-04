@@ -3519,14 +3519,17 @@ fn begin_bucket_delete_records_final_visibility_phase_before_mark_command() {
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
     let ec_shape = EcShape { k: 2, m: 1 };
     let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2], ec_shape).unwrap();
-    let bucket = {
+    let (bucket, pg_count) = {
         let topology = map
             .nodes
             .get(&NodeId::new(0))
             .unwrap()
             .storage_node()
             .pg_topology();
-        bucket_for_pg(topology, 1, "delete-final-visibility-phase-")
+        (
+            bucket_for_pg(topology, 1, "delete-final-visibility-phase-"),
+            topology.pg_count(),
+        )
     };
     set_route_primary(&mut map, 1, NodeId::new(1));
 
@@ -3559,8 +3562,8 @@ fn begin_bucket_delete_records_final_visibility_phase_before_mark_command() {
             );
             assert_eq!(
                 outcome.post_reservation_next_object_pg_id,
-                Some(0),
-                "final visibility progress should preserve the pre-cleanup frontier reset"
+                Some(pg_count),
+                "final visibility progress should restore the terminal post-reservation frontier after stream cleanup"
             );
         }));
 
@@ -4942,6 +4945,107 @@ fn post_reservation_exact_bucket_frontier_resumes_after_recorded_pg() {
 }
 
 #[test]
+fn begin_bucket_delete_adopts_completed_post_reservation_frontier_without_rescan() {
+    let _serial = lock_bucket_scoped_hook_test();
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let pg_ids = vec![0, 2, 5, 31];
+    let terminal_post_reservation_next_object_pg_id = 32;
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &pg_ids, ec_shape).unwrap();
+    let bucket = {
+        let topology = map
+            .nodes
+            .get(&NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        bucket_for_pg(topology, 2, "delete-terminal-progress-adopt-")
+    };
+    set_route_primary(&mut map, 2, NodeId::new(1));
+
+    let map = Arc::new(map);
+    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    create_test_bucket(&cluster, &bucket);
+    let initial_bucket = {
+        let bucket_pg = map
+            .node(NodeId::new(1))
+            .unwrap()
+            .storage_node()
+            .get_pg(2)
+            .unwrap();
+        crate::PgMetadataStore::head_bucket_raw(&*bucket_pg, &bucket).unwrap()
+    };
+    let drain = match cluster.begin_durable_bucket_delete_drain(&bucket).unwrap() {
+        crate::cluster::DurableBucketDeleteDrainBegin::Acquired(drain) => drain,
+        crate::cluster::DurableBucketDeleteDrainBegin::AlreadyDeleting => {
+            panic!("fresh active bucket should acquire delete drain")
+        }
+    };
+
+    let bucket_pg = map
+        .node(NodeId::new(1))
+        .unwrap()
+        .storage_node()
+        .get_pg(2)
+        .unwrap();
+    crate::PgMetadataStore::record_bucket_delete_attempt_outcome(
+        &*bucket_pg,
+        &crate::BucketDeleteAttemptOutcomeRecord {
+            bucket: bucket.clone(),
+            drain_id: drain.record.drain_id.clone(),
+            cluster_epoch: drain.record.cluster_epoch,
+            bucket_execution_generation: drain.record.bucket_execution_generation,
+            outcome: crate::BucketDeleteAttemptOutcomeKind::Retryable,
+            phase: crate::BucketDeleteAttemptPhase::PostReservationObjectDrain,
+            detail: "terminal post-reservation scan already completed".to_string(),
+            post_reservation_next_object_pg_id: Some(terminal_post_reservation_next_object_pg_id),
+            updated_at: crate::clock::current_time_millis(),
+        },
+    )
+    .unwrap();
+    drop(bucket_pg);
+
+    let saw_terminal_resume = Arc::new(AtomicBool::new(false));
+    let saw_terminal_resume_for_hook = Arc::clone(&saw_terminal_resume);
+    let _exact_drain_hook_guard = cluster.test_install_before_bucket_delete_exact_drain_hook(
+        Arc::new(move |has_progress, next_object_pg_id| {
+            assert!(
+                has_progress,
+                "adopted post-reservation attempt should use stored progress"
+            );
+            assert_eq!(
+                next_object_pg_id, terminal_post_reservation_next_object_pg_id,
+                "terminal post-reservation cursor must be one past the highest PG id, not the PG count"
+            );
+            saw_terminal_resume_for_hook.store(true, Ordering::SeqCst);
+            Ok(())
+        }),
+    );
+
+    cluster
+        .begin_bucket_delete_if_current(
+            &bucket,
+            initial_bucket.bucket_execution_generation,
+            initial_bucket.bucket_incarnation_generation,
+        )
+        .unwrap();
+
+    assert!(
+        saw_terminal_resume.load(Ordering::SeqCst),
+        "DeleteBucket retry should observe the terminal post-reservation frontier"
+    );
+    let bucket_pg = map
+        .node(NodeId::new(1))
+        .unwrap()
+        .storage_node()
+        .get_pg(2)
+        .unwrap();
+    let info = crate::PgMetadataStore::head_bucket_raw(&*bucket_pg, &bucket).unwrap();
+    assert_eq!(info.state, crate::BucketState::Deleting);
+}
+
+#[test]
 fn begin_bucket_delete_adopts_preserved_post_reservation_frontier() {
     let _serial = lock_bucket_scoped_hook_test();
     let tmp = test_util::tempdir();
@@ -5379,8 +5483,8 @@ fn begin_bucket_delete_adopts_preserved_initial_frontier_then_resets_before_stre
     );
     assert_eq!(
         outcome.post_reservation_next_object_pg_id,
-        Some(0),
-        "stream cleanup reset should be preserved in the final outcome"
+        Some(pg_count),
+        "terminal post-reservation frontier should be restored after stream cleanup completes"
     );
     assert_eq!(outcome.drain_id, preserved_drain.drain_id);
 }

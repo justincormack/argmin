@@ -1197,6 +1197,13 @@ impl super::StorageCluster {
         self.local_map.pg_ids().to_vec()
     }
 
+    fn terminal_bucket_delete_post_reservation_next_object_pg_id(&self) -> u32 {
+        self.metadata_pg_ids()
+            .into_iter()
+            .max()
+            .map_or(0, |pg_id| pg_id.saturating_add(1))
+    }
+
     #[cfg(any(test, feature = "test-hooks"))]
     fn metadata_pg(&self, pg_id: u32) -> Result<MutexGuard<'_, PgStore>, StoreError> {
         let node = self
@@ -4898,15 +4905,8 @@ impl super::StorageCluster {
                                 loop_iteration
                             ),
                         );
-                        let post_reservation_progress = BucketDeleteExactDrainProgress {
-                            client: node_store.bucket_write_reservation_client().as_ref(),
-                            drain: &durable_drain,
-                            phase: BucketDeleteAttemptPhase::PostReservationObjectDrain,
-                        };
-                        self.record_bucket_delete_post_reservation_next_object_pg_id(
-                            post_reservation_progress,
-                            0,
-                        )?;
+                        let terminal_post_reservation_next_object_pg_id =
+                            self.terminal_bucket_delete_post_reservation_next_object_pg_id();
                         attempt_phase = BucketDeleteAttemptPhase::StreamCleanup;
                         Self::emit_bucket_delete_begin_loop_step(
                             bucket,
@@ -4932,6 +4932,21 @@ impl super::StorageCluster {
                             format!("iteration={} pass=before_visibility_check", loop_iteration),
                         );
                         attempt_phase = BucketDeleteAttemptPhase::StreamCleanup;
+                        self.record_bucket_delete_attempt_outcome_for_drain_with_client(
+                            node_store.bucket_write_reservation_client().as_ref(),
+                            &durable_drain,
+                            BucketDeleteAttemptOutcomeKind::Retryable,
+                            BucketDeleteAttemptPhase::StreamCleanup,
+                            "stream cleanup started before visibility check".to_string(),
+                        );
+                        self.record_bucket_delete_post_reservation_next_object_pg_id(
+                            BucketDeleteExactDrainProgress {
+                                client: node_store.bucket_write_reservation_client().as_ref(),
+                                drain: &durable_drain,
+                                phase: BucketDeleteAttemptPhase::StreamCleanup,
+                            },
+                            0,
+                        )?;
                         let aborted_stream_uploads = match self
                             .cleanup_abandoned_put_object_stream_uploads_for_bucket(bucket)?
                         {
@@ -5010,6 +5025,14 @@ impl super::StorageCluster {
                                 ),
                             );
                         }
+                        self.record_bucket_delete_post_reservation_next_object_pg_id(
+                            BucketDeleteExactDrainProgress {
+                                client: node_store.bucket_write_reservation_client().as_ref(),
+                                drain: &durable_drain,
+                                phase: BucketDeleteAttemptPhase::StreamCleanup,
+                            },
+                            terminal_post_reservation_next_object_pg_id,
+                        )?;
                         Self::emit_bucket_delete_begin_loop_step(
                             bucket,
                             pg_id,
