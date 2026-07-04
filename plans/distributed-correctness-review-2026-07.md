@@ -601,9 +601,10 @@ Confirmed.
   these unambiguous.
 - Status update: checked control-plane RPC helpers no longer blindly
   resubmit after an ambiguous response loss. `set_pg_acting_set_checked`
-  observes the current runtime map and returns `RpcUnconfirmed` if the current
-  route differs from the requested acting set, preventing a stale retry from
-  clobbering a later admin transition. Metadata-transfer fence/install
+  observes the current target-PG runtime-map snapshot and returns
+  `RpcUnconfirmed` if that route differs from the requested acting set,
+  preventing a stale retry from clobbering a later admin transition without
+  requiring unrelated PGs to be serving. Metadata-transfer fence/install
   helpers use operation-specific observability predicates rather than treating
   any successful runtime-map response as confirmation. Those response-loss
   confirmation probes keep a bounded but longer read timeout than ordinary
