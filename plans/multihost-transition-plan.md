@@ -10616,6 +10616,13 @@ Phase 12.3 progress:
   startup fails closed before constructing OpenRaft state. A process smoke
   deletes only a follower's artifact after it has persisted replicated state
   and verifies restart exits instead of voting fresh.
+- Closed the R10 bootstrap-race transient-exit case. The experimental Raft
+  bootstrap helper now treats `BootstrapRequiresEmptyState` and transient
+  forward-to-leader errors as benign only after a follow-up snapshot proves
+  another authority already initialized the control-plane state; empty state
+  still fails closed. This complements the earlier lease-expiry leadership-
+  churn handling and removes the remaining documented serving-loop transient
+  exit in Phase 12.3.
 
 1. define the replicated control-plane state machine:
    - state includes cluster epoch, PG count, PG state, PG acting sets, node

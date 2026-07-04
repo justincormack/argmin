@@ -298,13 +298,16 @@ bounds it. Inconsistent rather than unsafe.
   term logic; transfer-leader and snapshot frames carry votes and are
   validated by `handle_transfer_leader`/`install_full_snapshot` term checks.
 
-### R10. LOW — Process exits on some transient conditions in the serving loop
+### R10. RESOLVED — Process exits on some transient conditions in the serving loop
 
 Status update: losing leadership between the serving check and the
 `ExpireHeartbeatLeases` submit is now treated as benign leadership churn for
-that scan iteration instead of `exit(1)`. A concurrently-committed bootstrap
-race can still exit via `bootstrap_empty_experimental_raft_control_plane`
-error mapping (:2042-2048). Availability only.
+that scan iteration instead of `exit(1)`. The remaining
+concurrently-committed bootstrap race is also closed: if
+`BootstrapInitialClusterMap` returns the deterministic
+`BootstrapRequiresEmptyState` rejection, or a transient forward-to-leader
+error, the process performs a follow-up snapshot read and treats the error as
+benign only if bootstrap state is now present. Empty state still fails closed.
 
 ### R11. INFO — Pinned alpha consensus dependency
 
@@ -395,10 +398,9 @@ shift.
    config-driven membership evolution is designed.
 8. **DONE — Gate the peer socket on poison (R8).** A shared atomic poison
    flag is checked before peer dispatch and again before peer response write.
-9. **Smaller items:** finish the remaining bootstrap-race transient-exit case
-   (R10); convert the peer network to nonblocking/tokio I/O or a dedicated
-   blocking pool with a connect timeout (R9); canonicalize the snapshot text
-   parser if artifact bytes are ever compared (R-OK4 caveat). Run
+9. **Smaller items:** convert the peer network to nonblocking/tokio I/O or a
+   dedicated blocking pool with a connect timeout (R9); canonicalize the
+   snapshot text parser if artifact bytes are ever compared (R-OK4 caveat). Run
    `openraft::testing::log::suite` against the guarded log store (currently
    skipped because the store is deliberately stricter than the generic
    baseline; document the deviations if the suite cannot pass).

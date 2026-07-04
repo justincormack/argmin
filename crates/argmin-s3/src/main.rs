@@ -2467,13 +2467,7 @@ fn bootstrap_empty_experimental_raft_control_plane(
     authority: &mut ExperimentalRaftControlPlane,
     config: &ServerConfig,
 ) -> Result<(), String> {
-    if authority
-        .current_snapshot()
-        .map_err(|error| error.to_string())?
-        .nodes()
-        .next()
-        .is_some()
-    {
+    if experimental_raft_control_plane_has_bootstrap_state(authority)? {
         return Ok(());
     }
     if config.storage_node_sockets.is_empty() {
@@ -2492,9 +2486,16 @@ fn bootstrap_empty_experimental_raft_control_plane(
         .map(storage::PgId::new)
         .collect();
     let node_count = nodes.len();
-    authority
+    match authority
         .submit_raft_command(ControlPlaneCommand::BootstrapInitialClusterMap { nodes, pg_ids })
-        .map_err(|error| error.to_string())?;
+    {
+        Ok(_) => {}
+        Err(error)
+            if experimental_raft_bootstrap_submit_error_was_concurrent_success(
+                authority, &error,
+            )? => {}
+        Err(error) => return Err(error.to_string()),
+    }
     let epoch = authority
         .current_snapshot()
         .map_err(|error| error.to_string())?
@@ -2506,6 +2507,34 @@ fn bootstrap_empty_experimental_raft_control_plane(
         epoch
     );
     Ok(())
+}
+
+fn experimental_raft_control_plane_has_bootstrap_state(
+    authority: &ExperimentalRaftControlPlane,
+) -> Result<bool, String> {
+    Ok(authority
+        .current_snapshot()
+        .map_err(|error| error.to_string())?
+        .nodes()
+        .next()
+        .is_some())
+}
+
+fn experimental_raft_bootstrap_submit_error_was_concurrent_success(
+    authority: &ExperimentalRaftControlPlane,
+    error: &ControlPlaneError,
+) -> Result<bool, String> {
+    Ok(
+        experimental_raft_bootstrap_submit_error_can_be_concurrent_success(error)
+            && experimental_raft_control_plane_has_bootstrap_state(authority)?,
+    )
+}
+
+fn experimental_raft_bootstrap_submit_error_can_be_concurrent_success(
+    error: &ControlPlaneError,
+) -> bool {
+    matches!(error, ControlPlaneError::BootstrapRequiresEmptyState)
+        || experimental_raft_error_is_forward_to_leader(error)
 }
 
 fn bootstrap_empty_control_plane(
@@ -4040,6 +4069,45 @@ mod tests {
         assert!(retried_snapshot.node(NodeId::new(2)).is_none());
         assert!(retried_snapshot.pg(PgId::new(0)).is_some());
         assert!(retried_snapshot.pg(PgId::new(1)).is_none());
+
+        harness.shutdown();
+    }
+
+    #[test]
+    fn experimental_raft_bootstrap_concurrent_success_requires_initialized_state() {
+        let harness = experimental_raft_test_harness("bootstrap-concurrent-empty-test");
+        assert!(
+            !experimental_raft_bootstrap_submit_error_was_concurrent_success(
+                &harness.control_plane,
+                &ControlPlaneError::BootstrapRequiresEmptyState,
+            )
+            .expect("empty experimental raft control-plane snapshot should read"),
+            "potentially benign bootstrap rejection must not be accepted while state is empty"
+        );
+
+        harness.shutdown();
+    }
+
+    #[test]
+    fn experimental_raft_bootstrap_concurrent_success_is_idempotent_after_state_exists() {
+        let mut harness = experimental_raft_test_harness("bootstrap-concurrent-success-test");
+        let mut config = test_server_config();
+        config.storage_node_sockets = vec![config::ConfiguredStorageNodeSocket {
+            node_id: 1,
+            socket_path: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
+        }];
+        config.storage_pg_ids = vec![0];
+        bootstrap_empty_experimental_raft_control_plane(&mut harness.control_plane, &config)
+            .expect("experimental raft control-plane bootstrap should succeed");
+
+        assert!(
+            experimental_raft_bootstrap_submit_error_was_concurrent_success(
+                &harness.control_plane,
+                &ControlPlaneError::BootstrapRequiresEmptyState,
+            )
+            .expect("bootstrapped experimental raft control-plane snapshot should read"),
+            "potentially benign bootstrap rejection is accepted only after state exists"
+        );
 
         harness.shutdown();
     }
