@@ -102,12 +102,15 @@ steps it performs.
   `PresignedRequestExpired`, mapping it to `AccessDenied`, and routing it
   through the AccessDenied-shaped response formatter.
 
-- [ ] **A6. Presigned body-hash selection uses unsigned header values,
-  contradicting its own comment.** `request.rs:476-483` — comment says use
-  `x-amz-content-sha256` "as a signed header"; code uses it whenever present.
-  An SDK adding the real hash as an unsigned header to a URL signed with
-  `UNSIGNED-PAYLOAD` gets a spurious `SignatureMismatch`. Fix: use the header
-  value only when it is in `signed_headers`.
+- [x] **A6. Presigned body-hash selection uses unsigned header values.**
+  AWS oracle: an unsigned `x-amz-content-sha256: UNSIGNED-PAYLOAD` header on a
+  URL signed with `UNSIGNED-PAYLOAD` is accepted, while an unsigned real
+  payload hash on that same shape returns `SignatureDoesNotMatch` rather than
+  `HeadersNotSigned`. The existing request path already matches this
+  value-sensitive behavior by excluding `x-amz-content-sha256` from generic
+  unsigned-header rejection and using its value in canonical request
+  verification when present. Completed by tightening AWS-facing s3-tests; no
+  auth code change is needed.
 
 - [ ] **A7. POST auth reports `AuthMode::HeaderSigV4`** (post.rs:116), so
   downstream `AuthMode` matches cannot distinguish POST auth. Fix: add

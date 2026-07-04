@@ -472,7 +472,7 @@ fn test_presigned_sigv4_unsigned_amz_content_sha256_mismatches_signature() {
             .await
             .unwrap();
 
-        let payload_hash = sha256_hex(b"");
+        let payload_hash = sha256_hex(body);
         let presigned = presign_object(
             "GET",
             &bucket,
@@ -492,6 +492,50 @@ fn test_presigned_sigv4_unsigned_amz_content_sha256_mismatches_signature() {
         assert_signature_does_not_match(status, &body);
 
         cleanup(&bucket, &["unsigned-amz-presigned-auth"]).await;
+    });
+}
+
+#[test]
+fn test_presigned_sigv4_unsigned_amz_content_sha256_unsigned_payload_is_accepted() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+        let body = b"presigned sigv4 unsigned payload header";
+
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key("unsigned-payload-amz-presigned-auth")
+            .body(ByteStream::from_static(body))
+            .send()
+            .await
+            .unwrap();
+
+        let presigned = presign_object(
+            "GET",
+            &bucket,
+            "unsigned-payload-amz-presigned-auth",
+            None,
+            Duration::from_secs(900),
+            NO_HEADERS,
+            None,
+        );
+
+        let mut response = with_presigned_headers!(agent().get(presigned.uri()), presigned)
+            .header("x-amz-content-sha256", "UNSIGNED-PAYLOAD")
+            .call()
+            .expect("transport error");
+        let status = response.status().as_u16();
+        let response_body = response.body_mut().read_to_vec().unwrap();
+        assert_eq!(
+            status,
+            200,
+            "expected 200 for unsigned x-amz-content-sha256=UNSIGNED-PAYLOAD, got {status}: {}",
+            String::from_utf8_lossy(&response_body)
+        );
+        assert_eq!(response_body, body);
+
+        cleanup(&bucket, &["unsigned-payload-amz-presigned-auth"]).await;
     });
 }
 

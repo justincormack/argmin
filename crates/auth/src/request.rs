@@ -475,10 +475,10 @@ fn authenticate_presigned<H: HeaderSource + ?Sized>(
     let canonical_hdrs = canonical_headers(&signed_header_pairs);
     let signed_headers_joined = signed_headers.join(";");
     let canonical_qs = canonical_query_string(&query_without_signature(query_string));
-    // If the request includes x-amz-content-sha256 as a signed header, use
-    // its value (allows presigned PUTs with a known body hash). Otherwise
-    // default to UNSIGNED-PAYLOAD (the common case for presigned URLs where
-    // the body is unknown at signing time).
+    // AWS treats x-amz-content-sha256 as a presigned payload-hash override
+    // even when it is not listed in X-Amz-SignedHeaders: UNSIGNED-PAYLOAD is
+    // accepted, while another value participates in signature verification.
+    // Other unsigned x-amz-* headers are rejected before this point.
     let body_hash = match headers.first_value("x-amz-content-sha256") {
         Some(hash) => Cow::Borrowed(hash),
         None => Cow::Borrowed("UNSIGNED-PAYLOAD"),
