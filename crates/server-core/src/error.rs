@@ -381,7 +381,9 @@ impl ServerError {
             }
             Self::Auth(
                 auth::AuthError::UnsupportedAuthType
-                | auth::AuthError::InvalidCredentialScope { .. },
+                | auth::AuthError::InvalidCredentialScope { .. }
+                | auth::AuthError::InvalidCredentialScopeRegion { .. }
+                | auth::AuthError::InvalidCredentialScopeService { .. },
             ) => "InvalidArgument",
             Self::Auth(auth::AuthError::UnknownAccessKey) => "InvalidAccessKeyId",
             Self::Auth(auth::AuthError::DuplicateAuthorizationHeader) => "NotImplemented",
@@ -394,6 +396,10 @@ impl ServerError {
             Self::Auth(auth::AuthError::InvalidQueryParam { .. }) => {
                 "AuthorizationQueryParametersError"
             }
+            Self::Auth(
+                auth::AuthError::InvalidQueryCredentialRegion { .. }
+                | auth::AuthError::InvalidQueryCredentialService { .. },
+            ) => "AuthorizationQueryParametersError",
             Self::Auth(auth::AuthError::MissingQueryParam { .. }) => {
                 "AuthorizationQueryParametersError"
             }
@@ -495,7 +501,11 @@ impl ServerError {
                 auth::AuthError::MalformedAuth
                 | auth::AuthError::UnsupportedAuthType
                 | auth::AuthError::InvalidCredentialScope { .. }
+                | auth::AuthError::InvalidCredentialScopeRegion { .. }
+                | auth::AuthError::InvalidCredentialScopeService { .. }
                 | auth::AuthError::InvalidQueryParam { .. }
+                | auth::AuthError::InvalidQueryCredentialRegion { .. }
+                | auth::AuthError::InvalidQueryCredentialService { .. }
                 | auth::AuthError::MissingQueryParam { .. },
             ) => 400,
             Self::Auth(auth::AuthError::UnexpectedSecurityToken { .. }) => 400,

@@ -384,14 +384,20 @@ fn authenticate_presigned<H: HeaderSource + ?Sized>(
             param: "X-Amz-Credential",
         },
     )?;
-    if expected_region.is_some_and(|region| credential.region != region) {
-        return Err(AuthError::InvalidQueryParam {
-            param: "X-Amz-Credential",
-        });
+    if let Some(region) = expected_region {
+        if credential.region != region {
+            return Err(AuthError::InvalidQueryCredentialRegion {
+                param: "X-Amz-Credential",
+                provided_region: credential.region.to_string(),
+                expected_region: region.to_string(),
+            });
+        }
     }
     if credential.service != expected_service {
-        return Err(AuthError::InvalidQueryParam {
+        return Err(AuthError::InvalidQueryCredentialService {
             param: "X-Amz-Credential",
+            provided_service: credential.service.to_string(),
+            expected_service: expected_service.to_string(),
         });
     }
 
@@ -1310,9 +1316,11 @@ mod tests {
         .unwrap_err();
         assert!(matches!(
             err,
-            AuthError::InvalidQueryParam {
-                param: "X-Amz-Credential"
-            }
+            AuthError::InvalidQueryCredentialRegion {
+                param: "X-Amz-Credential",
+                provided_region,
+                expected_region,
+            } if provided_region == "eu-west-1" && expected_region == "us-east-1"
         ));
     }
 
@@ -1337,9 +1345,11 @@ mod tests {
         .unwrap_err();
         assert!(matches!(
             err,
-            AuthError::InvalidQueryParam {
-                param: "X-Amz-Credential"
-            }
+            AuthError::InvalidQueryCredentialService {
+                param: "X-Amz-Credential",
+                provided_service,
+                expected_service,
+            } if provided_service == "iam" && expected_service == "s3"
         ));
     }
 

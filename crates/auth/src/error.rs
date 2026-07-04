@@ -11,8 +11,34 @@ pub enum AuthError {
     MissingQueryParam { param: &'static str },
     #[error("invalid query auth parameter: {param}")]
     InvalidQueryParam { param: &'static str },
+    #[error("invalid query credential region: {param}")]
+    InvalidQueryCredentialRegion {
+        param: &'static str,
+        provided_region: String,
+        expected_region: String,
+    },
+    #[error("invalid query credential service: {param}")]
+    InvalidQueryCredentialService {
+        param: &'static str,
+        provided_service: String,
+        expected_service: String,
+    },
     #[error("invalid credential scope: {param}")]
     InvalidCredentialScope { param: &'static str },
+    #[error("invalid credential scope region: {param}")]
+    InvalidCredentialScopeRegion {
+        param: &'static str,
+        credential: String,
+        provided_region: String,
+        expected_region: String,
+    },
+    #[error("invalid credential scope service: {param}")]
+    InvalidCredentialScopeService {
+        param: &'static str,
+        credential: String,
+        provided_service: String,
+        expected_service: String,
+    },
     #[error("unknown access key id")]
     UnknownAccessKey,
     #[error("duplicate Authorization header")]
@@ -53,9 +79,67 @@ impl std::fmt::Debug for AuthError {
                 .debug_struct("InvalidQueryParam")
                 .field("param", &param)
                 .finish(),
+            Self::InvalidQueryCredentialRegion {
+                param,
+                provided_region,
+                expected_region,
+            } => f
+                .debug_struct("InvalidQueryCredentialRegion")
+                .field("param", &param)
+                .field("provided_region", &observability::escaped(provided_region))
+                .field("expected_region", &observability::escaped(expected_region))
+                .finish(),
+            Self::InvalidQueryCredentialService {
+                param,
+                provided_service,
+                expected_service,
+            } => f
+                .debug_struct("InvalidQueryCredentialService")
+                .field("param", &param)
+                .field(
+                    "provided_service",
+                    &observability::escaped(provided_service),
+                )
+                .field(
+                    "expected_service",
+                    &observability::escaped(expected_service),
+                )
+                .finish(),
             Self::InvalidCredentialScope { param } => f
                 .debug_struct("InvalidCredentialScope")
                 .field("param", &param)
+                .finish(),
+            Self::InvalidCredentialScopeRegion {
+                param,
+                credential,
+                provided_region,
+                expected_region,
+            } => f
+                .debug_struct("InvalidCredentialScopeRegion")
+                .field("param", &param)
+                .field("credential", &observability::redacted("sigv4_credential"))
+                .field("credential_len", &credential.len())
+                .field("provided_region", &observability::escaped(provided_region))
+                .field("expected_region", &observability::escaped(expected_region))
+                .finish(),
+            Self::InvalidCredentialScopeService {
+                param,
+                credential,
+                provided_service,
+                expected_service,
+            } => f
+                .debug_struct("InvalidCredentialScopeService")
+                .field("param", &param)
+                .field("credential", &observability::redacted("sigv4_credential"))
+                .field("credential_len", &credential.len())
+                .field(
+                    "provided_service",
+                    &observability::escaped(provided_service),
+                )
+                .field(
+                    "expected_service",
+                    &observability::escaped(expected_service),
+                )
                 .finish(),
             Self::UnknownAccessKey => f.write_str("UnknownAccessKey"),
             Self::DuplicateAuthorizationHeader => f.write_str("DuplicateAuthorizationHeader"),

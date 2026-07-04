@@ -84,13 +84,22 @@ pub fn authenticate_post_sigv4(
 
     let credential =
         parse_credential_scope_ref(request.credential).ok_or(AuthError::MalformedAuth)?;
-    if expected_scope
-        .region
-        .is_some_and(|region| credential.region != region)
-        || credential.service != expected_scope.service
-    {
-        return Err(AuthError::InvalidCredentialScope {
+    if let Some(region) = expected_scope.region {
+        if credential.region != region {
+            return Err(AuthError::InvalidCredentialScopeRegion {
+                param: "X-Amz-Credential",
+                credential: request.credential.to_string(),
+                provided_region: credential.region.to_string(),
+                expected_region: region.to_string(),
+            });
+        }
+    }
+    if credential.service != expected_scope.service {
+        return Err(AuthError::InvalidCredentialScopeService {
             param: "X-Amz-Credential",
+            credential: request.credential.to_string(),
+            provided_service: credential.service.to_string(),
+            expected_service: expected_scope.service.to_string(),
         });
     }
 
@@ -729,9 +738,12 @@ mod tests {
         .unwrap_err();
         assert!(matches!(
             err,
-            AuthError::InvalidCredentialScope {
-                param: "X-Amz-Credential"
-            }
+            AuthError::InvalidCredentialScopeService {
+                param: "X-Amz-Credential",
+                provided_service,
+                expected_service,
+                ..
+            } if provided_service == "execute-api" && expected_service == "s3"
         ));
     }
 
@@ -760,9 +772,12 @@ mod tests {
         .unwrap_err();
         assert!(matches!(
             err,
-            AuthError::InvalidCredentialScope {
-                param: "X-Amz-Credential"
-            }
+            AuthError::InvalidCredentialScopeRegion {
+                param: "X-Amz-Credential",
+                provided_region,
+                expected_region,
+                ..
+            } if provided_region == "us-west-2" && expected_region == "us-east-1"
         ));
     }
 

@@ -3207,10 +3207,25 @@ impl HttpFrontend {
         if !self.coordinator.bucket_exists(bucket)? {
             return Ok(());
         }
-        Err(ServerError::WrongRegion {
-            provided_region: signing_region.to_string(),
-            expected_region: self.coordinator.region().to_string(),
-        })
+        match auth.mode {
+            AuthMode::HeaderSigV4 => Err(ServerError::WrongRegion {
+                provided_region: signing_region.to_string(),
+                expected_region: self.coordinator.region().to_string(),
+            }),
+            AuthMode::PresignedSigV4 => Err(ServerError::Auth(
+                auth::AuthError::InvalidQueryCredentialRegion {
+                    param: "X-Amz-Credential",
+                    provided_region: signing_region.to_string(),
+                    expected_region: self.coordinator.region().to_string(),
+                },
+            )),
+            AuthMode::PostSigV4 => {
+                Err(ServerError::Auth(auth::AuthError::InvalidCredentialScope {
+                    param: "X-Amz-Credential",
+                }))
+            }
+            AuthMode::Anonymous => Ok(()),
+        }
     }
 
     fn enforce_bucket_region_raw(
@@ -3454,7 +3469,7 @@ impl HttpFrontend {
                     security_token: field("x-amz-security-token"),
                 },
                 &self.credentials,
-                auth::ExpectedCredentialScope::new(None, "s3"),
+                auth::ExpectedCredentialScope::new(Some(self.coordinator.region()), "s3"),
                 now,
             )
             .map_err(ServerError::Auth)?
@@ -9807,7 +9822,7 @@ mod tests {
     }
 
     #[test]
-    fn prepare_streaming_post_object_wrong_region_takes_precedence_over_policy_denial() {
+    fn prepare_streaming_post_object_wrong_region_returns_post_scope_error_before_policy_denial() {
         let tmp = test_util::tempdir();
         let mut fe = setup_frontend(tmp.path());
         fe.credentials.add(
@@ -9835,15 +9850,16 @@ mod tests {
         );
 
         match fe.prepare_streaming_post_object(&req, "mybucket", &fields, Some("upload.txt")) {
-            Err(ServerError::WrongRegion {
+            Err(ServerError::Auth(auth::AuthError::InvalidCredentialScopeRegion {
                 provided_region,
                 expected_region,
-            }) => {
+                ..
+            })) => {
                 assert_eq!(provided_region, "us-west-2");
                 assert_eq!(expected_region, "us-east-1");
             }
-            Err(err) => panic!("expected WrongRegion, got {err:?}"),
-            Ok(_) => panic!("expected WrongRegion, got Ok"),
+            Err(err) => panic!("expected InvalidCredentialScopeRegion, got {err:?}"),
+            Ok(_) => panic!("expected InvalidCredentialScopeRegion, got Ok"),
         }
 
         assert_eq!(

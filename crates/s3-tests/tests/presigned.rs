@@ -61,6 +61,30 @@ fn sha256_hex(data: &[u8]) -> String {
     auth::canonical::sha256_hex(data)
 }
 
+fn days_to_ymd(days: u64) -> (u64, u64, u64) {
+    let z = days + 719468;
+    let era = z / 146097;
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    (y, m, d)
+}
+
+fn format_amz_date(epoch_secs: u64) -> String {
+    let days = epoch_secs / 86_400;
+    let seconds = epoch_secs % 86_400;
+    let (year, month, day) = days_to_ymd(days);
+    let hour = seconds / 3_600;
+    let minute = (seconds % 3_600) / 60;
+    let second = seconds % 60;
+    format!("{year:04}{month:02}{day:02}T{hour:02}{minute:02}{second:02}Z")
+}
+
 fn primary_credentials() -> SignedRequestCredentials<'static> {
     SignedRequestCredentials {
         access_key: CTX.access_key(),
@@ -238,6 +262,82 @@ fn presign_object_with_fixed_amz_date(
         date_stamp,
         credentials.region,
         "s3",
+    );
+    let signature = hmac::sign(
+        &hmac::Key::new(hmac::HMAC_SHA256, signing_key.as_ref()),
+        string_to_sign.as_bytes(),
+    )
+    .as_ref()
+    .iter()
+    .map(|byte| format!("{byte:02x}"))
+    .collect::<String>();
+
+    format!(
+        "{}{}?{}&X-Amz-Signature={signature}",
+        parsed.origin().ascii_serialization(),
+        path,
+        canonical_query
+    )
+}
+
+fn presign_object_with_credential_scope(
+    method: &str,
+    bucket: &str,
+    key: &str,
+    region: &str,
+    service: &str,
+) -> String {
+    let url = object_url(CTX.endpoint(), bucket, key, None);
+    let parsed = url::Url::parse(&url).expect("parse object URL");
+    let path = parsed.path();
+    let host = parsed
+        .host_str()
+        .map(|host| {
+            if let Some(port) = parsed.port() {
+                format!("{host}:{port}")
+            } else {
+                host.to_string()
+            }
+        })
+        .expect("object URL has host");
+    let expires = Duration::from_secs(900);
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let amz_date = format_amz_date(secs);
+    let date_stamp = &amz_date[..8];
+    let signed_headers = "host";
+    let canonical_headers = format!("host:{host}\n");
+    let credential = format!(
+        "{}/{date_stamp}/{region}/{service}/aws4_request",
+        CTX.access_key()
+    );
+    let raw_query = [
+        "X-Amz-Algorithm=AWS4-HMAC-SHA256".to_string(),
+        format!("X-Amz-Credential={credential}"),
+        format!("X-Amz-Date={amz_date}"),
+        format!("X-Amz-Expires={}", expires.as_secs()),
+        format!("X-Amz-SignedHeaders={signed_headers}"),
+    ]
+    .join("&");
+    let canonical_query = canonical_query_string(&raw_query);
+    let canonical_request = canonical_request(
+        method,
+        path,
+        &canonical_query,
+        &canonical_headers,
+        signed_headers,
+        "UNSIGNED-PAYLOAD",
+    );
+    let scope = format!("{date_stamp}/{region}/{service}/aws4_request");
+    let string_to_sign =
+        string_to_sign(&amz_date, &scope, &sha256_hex(canonical_request.as_bytes()));
+    let signing_key = auth::sigv4::derive_signing_key(
+        &SecretKey::new(CTX.secret_key().to_string()),
+        date_stamp,
+        region,
+        service,
     );
     let signature = hmac::sign(
         &hmac::Key::new(hmac::HMAC_SHA256, signing_key.as_ref()),
@@ -536,6 +636,94 @@ fn test_presigned_sigv4_unsigned_amz_content_sha256_unsigned_payload_is_accepted
         assert_eq!(response_body, body);
 
         cleanup(&bucket, &["unsigned-payload-amz-presigned-auth"]).await;
+    });
+}
+
+#[test]
+fn test_presigned_sigv4_wrong_region_scope_returns_query_parameters_error() {
+    s3_tests::run(async {
+        let bucket = setup_bucket().await;
+        let wrong_region = if CTX.region() == "us-east-1" {
+            "us-west-2"
+        } else {
+            "us-east-1"
+        };
+        let presigned = presign_object_with_credential_scope(
+            "GET",
+            &bucket,
+            "wrong-region-scope",
+            wrong_region,
+            "s3",
+        );
+
+        let mut response = agent().get(&presigned).call().expect("transport error");
+        let status = response.status().as_u16();
+        let body = response.body_mut().read_to_string().unwrap();
+        assert_eq!(status, 400, "expected 400, got {status}: {body}");
+        assert!(
+            body.contains("<Code>AuthorizationQueryParametersError</Code>"),
+            "expected AuthorizationQueryParametersError response, got: {body}"
+        );
+        assert!(
+            body.contains(&format!(
+                "<Message>Error parsing the X-Amz-Credential parameter; the region '{wrong_region}' is wrong; expecting '{}'</Message>",
+                CTX.region()
+            )),
+            "expected wrong-region credential message, got: {body}"
+        );
+        assert!(
+            body.contains(&format!("<Region>{}</Region>", CTX.region())),
+            "expected Region element, got: {body}"
+        );
+        assert!(
+            body.contains("<RequestId>") && body.contains("<HostId>"),
+            "expected RequestId and HostId, got: {body}"
+        );
+        assert!(
+            !body.contains("<Resource>"),
+            "did not expect Resource element, got: {body}"
+        );
+
+        cleanup(&bucket, &[]).await;
+    });
+}
+
+#[test]
+fn test_presigned_sigv4_wrong_service_scope_returns_query_parameters_error() {
+    s3_tests::run(async {
+        let bucket = setup_bucket().await;
+        let presigned = presign_object_with_credential_scope(
+            "GET",
+            &bucket,
+            "wrong-service-scope",
+            CTX.region(),
+            "execute-api",
+        );
+
+        let mut response = agent().get(&presigned).call().expect("transport error");
+        let status = response.status().as_u16();
+        let body = response.body_mut().read_to_string().unwrap();
+        assert_eq!(status, 400, "expected 400, got {status}: {body}");
+        assert!(
+            body.contains("<Code>AuthorizationQueryParametersError</Code>"),
+            "expected AuthorizationQueryParametersError response, got: {body}"
+        );
+        assert!(
+            body.contains(
+                "<Message>Error parsing the X-Amz-Credential parameter; incorrect service \"execute-api\". This endpoint belongs to \"s3\".</Message>"
+            ),
+            "expected wrong-service credential message, got: {body}"
+        );
+        assert!(
+            body.contains("<RequestId>") && body.contains("<HostId>"),
+            "expected RequestId and HostId, got: {body}"
+        );
+        assert!(
+            !body.contains("<Resource>") && !body.contains("<Region>"),
+            "did not expect Resource or Region element, got: {body}"
+        );
+
+        cleanup(&bucket, &[]).await;
     });
 }
 

@@ -202,9 +202,35 @@ fn client_error_message(err: &ServerError) -> String {
         ServerError::Auth(auth::AuthError::InvalidQueryParam { param }) => {
             format!("invalid query auth parameter: {param}")
         }
+        ServerError::Auth(auth::AuthError::InvalidQueryCredentialRegion {
+            provided_region,
+            expected_region,
+            ..
+        }) => format!(
+            "Error parsing the X-Amz-Credential parameter; the region '{provided_region}' is wrong; expecting '{expected_region}'"
+        ),
+        ServerError::Auth(auth::AuthError::InvalidQueryCredentialService {
+            provided_service,
+            expected_service,
+            ..
+        }) => format!(
+            "Error parsing the X-Amz-Credential parameter; incorrect service \"{provided_service}\". This endpoint belongs to \"{expected_service}\"."
+        ),
         ServerError::Auth(auth::AuthError::InvalidCredentialScope { param }) => {
             format!("invalid credential scope: {param}")
         }
+        ServerError::Auth(auth::AuthError::InvalidCredentialScopeRegion {
+            provided_region,
+            expected_region,
+            ..
+        }) => format!("the region '{provided_region}' is wrong; expecting '{expected_region}'"),
+        ServerError::Auth(auth::AuthError::InvalidCredentialScopeService {
+            provided_service,
+            expected_service,
+            ..
+        }) => format!(
+            "incorrect service \"{provided_service}\". This endpoint belongs to \"{expected_service}\"."
+        ),
         ServerError::Auth(auth::AuthError::UnknownAccessKey) => {
             "unknown access key id".to_string()
         }
@@ -678,6 +704,90 @@ impl S3Response {
                     &client_error_message(err),
                     request_id,
                     host_id,
+                );
+                Self::new(400).chunked_xml_body(body)
+            }
+            ServerError::Auth(auth::AuthError::InvalidQueryCredentialRegion {
+                expected_region,
+                ..
+            }) => {
+                let body = format!(
+                    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+                     <Error>\
+                     <Code>AuthorizationQueryParametersError</Code>\
+                     <Message>{}</Message>\
+                     <Region>{}</Region>\
+                     <RequestId>{}</RequestId>\
+                     <HostId>{}</HostId>\
+                     </Error>",
+                    xml::xml_escape_text(&client_error_message(err)),
+                    xml::xml_escape(expected_region),
+                    xml::xml_escape(request_id),
+                    xml::xml_escape(host_id),
+                );
+                Self::new(400).chunked_xml_body(body)
+            }
+            ServerError::Auth(auth::AuthError::InvalidQueryCredentialService { .. }) => {
+                let body = format!(
+                    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+                     <Error>\
+                     <Code>AuthorizationQueryParametersError</Code>\
+                     <Message>{}</Message>\
+                     <RequestId>{}</RequestId>\
+                     <HostId>{}</HostId>\
+                     </Error>",
+                    xml::xml_escape_text(&client_error_message(err)),
+                    xml::xml_escape(request_id),
+                    xml::xml_escape(host_id),
+                );
+                Self::new(400).chunked_xml_body(body)
+            }
+            ServerError::Auth(auth::AuthError::InvalidCredentialScopeRegion {
+                param,
+                credential,
+                expected_region,
+                ..
+            }) => {
+                let body = format!(
+                    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+                     <Error>\
+                     <Code>InvalidArgument</Code>\
+                     <Message>{}</Message>\
+                     <ArgumentName>{}</ArgumentName>\
+                     <ArgumentValue>{}</ArgumentValue>\
+                     <Region>{}</Region>\
+                     <RequestId>{}</RequestId>\
+                     <HostId>{}</HostId>\
+                     </Error>",
+                    xml::xml_escape_text(&client_error_message(err)),
+                    xml::xml_escape(param),
+                    xml::xml_escape(credential),
+                    xml::xml_escape(expected_region),
+                    xml::xml_escape(request_id),
+                    xml::xml_escape(host_id),
+                );
+                Self::new(400).chunked_xml_body(body)
+            }
+            ServerError::Auth(auth::AuthError::InvalidCredentialScopeService {
+                param,
+                credential,
+                ..
+            }) => {
+                let body = format!(
+                    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+                     <Error>\
+                     <Code>InvalidArgument</Code>\
+                     <Message>{}</Message>\
+                     <ArgumentName>{}</ArgumentName>\
+                     <ArgumentValue>{}</ArgumentValue>\
+                     <RequestId>{}</RequestId>\
+                     <HostId>{}</HostId>\
+                     </Error>",
+                    xml::xml_escape_text(&client_error_message(err)),
+                    xml::xml_escape(param),
+                    xml::xml_escape(credential),
+                    xml::xml_escape(request_id),
+                    xml::xml_escape(host_id),
                 );
                 Self::new(400).chunked_xml_body(body)
             }

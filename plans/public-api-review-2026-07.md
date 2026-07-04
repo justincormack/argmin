@@ -120,12 +120,15 @@ steps it performs.
   from POST authentication so future downstream matches cannot accidentally
   treat POST Object auth as canonical header auth.
 
-- [ ] **A8. Region/scope mismatch yields three different error variants by
-  path.** Header: `MalformedAuth` → `AuthorizationHeaderMalformed`; presigned:
-  `InvalidQueryParam` → `AuthorizationQueryParametersError`; POST:
-  `InvalidCredentialScope` → `InvalidArgument` (post.rs:78-86,
-  error.rs:383-385). Verify POST behavior against AWS and collapse if
-  possible.
+- [x] **A8. Region/scope mismatch yields path-specific AWS errors.** AWS
+  oracle confirms the three SigV4 surfaces are intentionally different:
+  header auth wrong region/service returns 400 `AuthorizationHeaderMalformed`,
+  presigned wrong region/service returns 400
+  `AuthorizationQueryParametersError`, and POST Object wrong region/service
+  returns 400 `InvalidArgument`. Completed by adding AWS-facing presigned and
+  POST Object scope mismatch tests and by making deferred bucket-region
+  validation preserve the auth path's AWS error family instead of converting
+  every late region mismatch into `AuthorizationHeaderMalformed`.
 
 - [ ] **A9. Clock-skew rule implemented twice.**
   `crates/server-http/src/http/mod.rs:318-339` (`enforce_sigv4_time_skew`)

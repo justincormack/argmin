@@ -492,10 +492,95 @@ fn test_post_object_sigv4_credential_service_must_be_s3() {
             .iter()
             .map(|(k, v)| (k.as_str(), v.as_str()))
             .collect();
+        let credential = fields
+            .iter()
+            .find(|(name, _)| name == "x-amz-credential")
+            .map(|(_, value)| value.as_str())
+            .expect("credential field");
 
         let (status, body) = post_object(&bucket, &field_refs, b"wrong service", "test.txt");
         assert_eq!(status, 400, "expected 400, got {status} body={body}");
         assert_error_code(&body, "InvalidArgument");
+        assert!(
+            body.contains(
+                "<Message>incorrect service \"execute-api\". This endpoint belongs to \"s3\".</Message>"
+            ),
+            "expected wrong-service credential message, got: {body}"
+        );
+        assert!(
+            body.contains("<ArgumentName>X-Amz-Credential</ArgumentName>")
+                && body.contains(&format!("<ArgumentValue>{credential}</ArgumentValue>")),
+            "expected POST credential argument details, got: {body}"
+        );
+        assert!(
+            body.contains("<RequestId>") && body.contains("<HostId>"),
+            "expected RequestId and HostId, got: {body}"
+        );
+        assert!(
+            !body.contains("<Resource>") && !body.contains("<Region>"),
+            "did not expect Resource or Region element, got: {body}"
+        );
+
+        s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
+    });
+}
+
+#[test]
+fn test_post_object_sigv4_credential_region_must_match_bucket_region() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+        let key = "post-wrong-region";
+        let wrong_region = if CTX.region() == "us-east-1" {
+            "us-west-2"
+        } else {
+            "us-east-1"
+        };
+        let fields = sigv4_fields_for_credentials(
+            CTX.access_key(),
+            CTX.secret_key(),
+            wrong_region,
+            &bucket,
+            key,
+            &[],
+        );
+        let field_refs: Vec<(&str, &str)> = fields
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        let credential = fields
+            .iter()
+            .find(|(name, _)| name == "x-amz-credential")
+            .map(|(_, value)| value.as_str())
+            .expect("credential field");
+
+        let (status, body) = post_object(&bucket, &field_refs, b"wrong region", "test.txt");
+        assert_eq!(status, 400, "expected 400, got {status} body={body}");
+        assert_error_code(&body, "InvalidArgument");
+        assert!(
+            body.contains(&format!(
+                "<Message>the region '{wrong_region}' is wrong; expecting '{}'</Message>",
+                CTX.region()
+            )),
+            "expected wrong-region credential message, got: {body}"
+        );
+        assert!(
+            body.contains("<ArgumentName>X-Amz-Credential</ArgumentName>")
+                && body.contains(&format!("<ArgumentValue>{credential}</ArgumentValue>")),
+            "expected POST credential argument details, got: {body}"
+        );
+        assert!(
+            body.contains(&format!("<Region>{}</Region>", CTX.region())),
+            "expected Region element, got: {body}"
+        );
+        assert!(
+            body.contains("<RequestId>") && body.contains("<HostId>"),
+            "expected RequestId and HostId, got: {body}"
+        );
+        assert!(
+            !body.contains("<Resource>"),
+            "did not expect Resource element, got: {body}"
+        );
 
         s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
     });
