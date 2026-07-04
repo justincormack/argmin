@@ -59,6 +59,9 @@ pub enum ServerError {
     #[error("invalid argument: {reason}")]
     InvalidArgument { reason: String },
 
+    #[error("duplicate checksum header: {header}")]
+    DuplicateChecksumHeader { header: String, value: String },
+
     #[error("invalid redirect location: {reason}")]
     InvalidRedirectLocation { reason: String },
 
@@ -411,7 +414,9 @@ impl ServerError {
             Self::NotModified { .. } => "NotModified",
             Self::InvalidRequest { .. } => "InvalidRequest",
             Self::BadRequest { .. } => "BadRequest",
-            Self::InvalidArgument { .. } => "InvalidArgument",
+            Self::InvalidArgument { .. } | Self::DuplicateChecksumHeader { .. } => {
+                "InvalidArgument"
+            }
             Self::InvalidRedirectLocation { .. } => "InvalidRedirectLocation",
             Self::UnexpectedContent => "UnexpectedContent",
             Self::InvalidURI { .. } => "InvalidURI",
@@ -518,6 +523,7 @@ impl ServerError {
             Self::InvalidRequest { .. }
             | Self::BadRequest { .. }
             | Self::InvalidArgument { .. }
+            | Self::DuplicateChecksumHeader { .. }
             | Self::InvalidRedirectLocation { .. }
             | Self::UnexpectedContent
             | Self::InvalidURI { .. }

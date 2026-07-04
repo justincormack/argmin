@@ -5519,6 +5519,12 @@ fn header_count(req: &S3Request, name: &str) -> usize {
     req.header_count(name)
 }
 
+fn first_duplicate_header_value<'a>(req: &'a S3Request, name: &str) -> Option<&'a str> {
+    req.headers.get_all(name).iter().nth(1).map(|value| {
+        std::str::from_utf8(value.as_bytes()).expect("S3Request stores only validated UTF-8")
+    })
+}
+
 /// Extract a checksum header as an encoded typed claim.
 ///
 /// Shared validation for all checksum-header consumers. Rejects if:
@@ -5538,8 +5544,11 @@ fn extract_encoded_checksum_header(
             // Reject duplicate same-name headers (req.header returns only
             // the first, so a second with a different value would be silent).
             if header_count(req, header) > 1 {
-                return Err(ServerError::InvalidRequest {
-                    reason: format!("duplicate header: {header}"),
+                return Err(ServerError::DuplicateChecksumHeader {
+                    header: header.to_string(),
+                    value: first_duplicate_header_value(req, header)
+                        .unwrap_or(claimed)
+                        .to_string(),
                 });
             }
             found = Some(EncodedChecksumClaim::new(algo, claimed.to_string()));
@@ -10085,8 +10094,11 @@ mod tests {
             key: "k".to_string(),
         };
         match fe.dispatch_routed(&req, &test_auth(), op) {
-            Err(ServerError::InvalidRequest { .. }) => {}
-            Err(e) => panic!("expected InvalidRequest, got {e:?}"),
+            Err(ServerError::DuplicateChecksumHeader { header, value }) => {
+                assert_eq!(header, "x-amz-checksum-crc32");
+                assert_eq!(value, "BBBBBB==");
+            }
+            Err(e) => panic!("expected DuplicateChecksumHeader, got {e:?}"),
             Ok(_) => panic!("expected error, got Ok"),
         }
     }
@@ -10968,14 +10980,15 @@ mod tests {
             "",
             vec![
                 (algorithm.header_name().to_string(), encoded.clone()),
-                (algorithm.header_name().to_string(), encoded),
+                (algorithm.header_name().to_string(), "AAAAAA==".to_string()),
             ],
             body.to_vec(),
         );
 
         match validate_checksum_headers(&req, true) {
-            Err(ServerError::InvalidRequest { reason }) => {
-                assert_eq!(reason, "duplicate header: x-amz-checksum-crc32");
+            Err(ServerError::DuplicateChecksumHeader { header, value }) => {
+                assert_eq!(header, "x-amz-checksum-crc32");
+                assert_eq!(value, "AAAAAA==");
             }
             other => panic!("expected duplicate header rejection, got {other:?}"),
         }

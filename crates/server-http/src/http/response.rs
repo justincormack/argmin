@@ -293,6 +293,7 @@ fn client_error_message(err: &ServerError) -> String {
         | ServerError::MalformedChunkedBody { reason }
         | ServerError::MalformedTrailerError { reason }
         | ServerError::InvalidTag { reason } => reason.clone(),
+        ServerError::DuplicateChecksumHeader { .. } => "Only one value may be specified.".to_string(),
         ServerError::UnexpectedContent => "This request does not support content".to_string(),
         ServerError::KeyTooLongError {
             size,
@@ -631,6 +632,25 @@ impl S3Response {
                      <HostId>{}</HostId>\
                      </Error>",
                     xml::xml_escape_text(&client_error_message(err)),
+                    xml::xml_escape(value),
+                    xml::xml_escape(request_id),
+                    xml::xml_escape(host_id),
+                );
+                Self::new(400).chunked_xml_body(body)
+            }
+            ServerError::DuplicateChecksumHeader { header, value } => {
+                let body = format!(
+                    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+                     <Error>\
+                     <Code>InvalidArgument</Code>\
+                     <Message>{}</Message>\
+                     <ArgumentName>{}</ArgumentName>\
+                     <ArgumentValue>{}</ArgumentValue>\
+                     <RequestId>{}</RequestId>\
+                     <HostId>{}</HostId>\
+                     </Error>",
+                    xml::xml_escape_text(&client_error_message(err)),
+                    xml::xml_escape(header),
                     xml::xml_escape(value),
                     xml::xml_escape(request_id),
                     xml::xml_escape(host_id),

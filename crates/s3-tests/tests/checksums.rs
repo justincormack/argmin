@@ -69,6 +69,22 @@ fn assert_error_message(body: &str, message: &str) {
     );
 }
 
+fn assert_error_argument_name(body: &str, argument_name: &str) {
+    let expected = format!("<ArgumentName>{}</ArgumentName>", argument_name);
+    assert!(
+        body.contains(&expected),
+        "expected {expected} in body: {body}",
+    );
+}
+
+fn assert_error_argument_value(body: &str, argument_value: &str) {
+    let expected = format!("<ArgumentValue>{}</ArgumentValue>", argument_value);
+    assert!(
+        body.contains(&expected),
+        "expected {expected} in body: {body}",
+    );
+}
+
 fn assert_auth_error_response_shape(body: &str) {
     assert!(
         body.contains("<RequestId>"),
@@ -254,6 +270,107 @@ async fn raw_put_object_with_checksum_headers(
         body,
         headers.iter().map(|(k, v)| (*k, v.as_str())),
     )
+}
+
+async fn raw_put_object_with_duplicate_signed_checksum_headers(
+    bucket: &str,
+    key: &str,
+    body: &[u8],
+    checksum_header: &str,
+    checksum_values: &[&str],
+) -> s3_tests::RawResponse {
+    assert!(checksum_values.len() > 1);
+    let url = s3_tests::object_url(CTX.endpoint(), bucket, key, None);
+    let parsed = url::Url::parse(&url).expect("parse object URL");
+    let path = parsed.path();
+    let query = normalize_query(parsed.query().unwrap_or(""));
+    let agent = s3_tests::test_agent();
+
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let amz_date = format_amz_date(secs);
+    let date_stamp = &amz_date[..8];
+    let payload_hash = sha256_hex(body);
+    let host = parsed
+        .host_str()
+        .map(|host| {
+            if let Some(port) = parsed.port() {
+                format!("{host}:{port}")
+            } else {
+                host.to_string()
+            }
+        })
+        .expect("object URL has host");
+    let checksum_header = checksum_header.to_ascii_lowercase();
+
+    let mut canonical_headers = [
+        ("host".to_string(), host.clone()),
+        ("x-amz-content-sha256".to_string(), payload_hash.clone()),
+        ("x-amz-date".to_string(), amz_date.clone()),
+        (checksum_header.clone(), checksum_values.join(",")),
+    ];
+    canonical_headers.sort_by(|a, b| a.0.cmp(&b.0));
+    let signed_headers = canonical_headers
+        .iter()
+        .map(|(name, _)| name.as_str())
+        .collect::<Vec<_>>()
+        .join(";");
+    let canonical_headers_text = canonical_headers
+        .iter()
+        .map(|(name, value)| format!("{name}:{value}\n"))
+        .collect::<String>();
+    let canonical_request =
+        format!("PUT\n{path}\n{query}\n{canonical_headers_text}\n{signed_headers}\n{payload_hash}");
+    let credential_scope = format!("{date_stamp}/{}/s3/aws4_request", CTX.region());
+    let string_to_sign = format!(
+        "AWS4-HMAC-SHA256\n{amz_date}\n{credential_scope}\n{}",
+        sha256_hex(canonical_request.as_bytes())
+    );
+    let k_date = hmac_sha256(
+        format!("AWS4{}", CTX.secret_key()).as_bytes(),
+        date_stamp.as_bytes(),
+    );
+    let k_region = hmac_sha256(&k_date, CTX.region().as_bytes());
+    let k_service = hmac_sha256(&k_region, b"s3");
+    let k_signing = hmac_sha256(&k_service, b"aws4_request");
+    let signature = hmac_sha256(&k_signing, string_to_sign.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let authorization = format!(
+        "AWS4-HMAC-SHA256 Credential={}/{credential_scope}, SignedHeaders={signed_headers}, Signature={signature}",
+        CTX.access_key()
+    );
+
+    let mut request = agent
+        .put(&url)
+        .header("Authorization", &authorization)
+        .header("x-amz-date", &amz_date)
+        .header("x-amz-content-sha256", &payload_hash);
+    for checksum_value in checksum_values {
+        request = request.header(&checksum_header, *checksum_value);
+    }
+    let mut response = request.send(body).expect("transport error");
+    let status = response.status().as_u16();
+    let headers = response
+        .headers()
+        .iter()
+        .map(|(k, v)| {
+            (
+                k.as_str().to_string(),
+                v.to_str().unwrap_or_default().to_string(),
+            )
+        })
+        .collect();
+    let body = response.body_mut().read_to_string().unwrap_or_default();
+    s3_tests::RawResponse {
+        status,
+        headers,
+        body,
+        body_read_error: None,
+    }
 }
 
 async fn assert_stored_crc32_full_object_checksum(bucket: &str, key: &str, expected: &str) {
@@ -530,6 +647,88 @@ fn test_put_object_invalid_checksum_algorithm_without_value() {
             response_header(&response.headers, "x-amz-checksum-type"),
             Some("FULL_OBJECT")
         );
+        cleanup(&bucket, &[key]).await;
+    });
+}
+
+#[test]
+fn test_put_object_duplicate_checksum_header() {
+    s3_tests::run(async {
+        let bucket = setup_bucket().await;
+        let key = "duplicate-checksum-header";
+        let body = b"duplicate checksum header oracle";
+        let crc32 = checksum_base64(LocalChecksumAlgorithm::Crc32, body);
+        let response = raw_put_object_with_duplicate_signed_checksum_headers(
+            &bucket,
+            key,
+            body,
+            "x-amz-checksum-crc32",
+            &[&crc32, &crc32],
+        )
+        .await;
+        assert_eq!(response.status, 400, "response: {response:?}");
+        assert_error_code(&response.body, "InvalidArgument");
+        assert_error_message(&response.body, "Only one value may be specified.");
+        assert_error_argument_name(&response.body, "x-amz-checksum-crc32");
+        assert_error_argument_value(&response.body, &crc32);
+        assert_auth_error_response_shape(&response.body);
+        cleanup(&bucket, &[key]).await;
+    });
+}
+
+#[test]
+fn test_put_object_duplicate_checksum_header_reports_second_value() {
+    s3_tests::run(async {
+        let bucket = setup_bucket().await;
+        let key = "duplicate-checksum-header-distinct-values";
+        let body = b"duplicate checksum header distinct value oracle";
+        let first_crc32 = checksum_base64(LocalChecksumAlgorithm::Crc32, body);
+        let second_crc32 = checksum_base64(LocalChecksumAlgorithm::Crc32, b"different checksum");
+        assert_ne!(first_crc32, second_crc32);
+        let response = raw_put_object_with_duplicate_signed_checksum_headers(
+            &bucket,
+            key,
+            body,
+            "x-amz-checksum-crc32",
+            &[&first_crc32, &second_crc32],
+        )
+        .await;
+        assert_eq!(response.status, 400, "response: {response:?}");
+        assert_error_code(&response.body, "InvalidArgument");
+        assert_error_message(&response.body, "Only one value may be specified.");
+        assert_error_argument_name(&response.body, "x-amz-checksum-crc32");
+        assert_error_argument_value(&response.body, &second_crc32);
+        assert_auth_error_response_shape(&response.body);
+        cleanup(&bucket, &[key]).await;
+    });
+}
+
+#[test]
+fn test_put_object_duplicate_checksum_header_reports_first_duplicate_value() {
+    s3_tests::run(async {
+        let bucket = setup_bucket().await;
+        let key = "duplicate-checksum-header-three-values";
+        let body = b"duplicate checksum header three value oracle";
+        let first_crc32 = checksum_base64(LocalChecksumAlgorithm::Crc32, body);
+        let second_crc32 = checksum_base64(LocalChecksumAlgorithm::Crc32, b"second checksum");
+        let third_crc32 = checksum_base64(LocalChecksumAlgorithm::Crc32, b"third checksum");
+        assert_ne!(first_crc32, second_crc32);
+        assert_ne!(first_crc32, third_crc32);
+        assert_ne!(second_crc32, third_crc32);
+        let response = raw_put_object_with_duplicate_signed_checksum_headers(
+            &bucket,
+            key,
+            body,
+            "x-amz-checksum-crc32",
+            &[&first_crc32, &second_crc32, &third_crc32],
+        )
+        .await;
+        assert_eq!(response.status, 400, "response: {response:?}");
+        assert_error_code(&response.body, "InvalidArgument");
+        assert_error_message(&response.body, "Only one value may be specified.");
+        assert_error_argument_name(&response.body, "x-amz-checksum-crc32");
+        assert_error_argument_value(&response.body, &second_crc32);
+        assert_auth_error_response_shape(&response.body);
         cleanup(&bucket, &[key]).await;
     });
 }
