@@ -10788,6 +10788,13 @@ Phase 12.4 progress:
   The process still checkpoints the full restart artifact before external
   responses; replacing those checkpoints with WAL-only acknowledgements and
   adding physical WAL compaction remain later 12.4 work.
+- Added process-level restart coverage for post-checkpoint WAL suffix recovery.
+  The `argmin-s3` experimental Raft process test now appends a valid committed
+  vote record after the durable artifact checkpoint, proves artifact-only
+  restore does not see it while artifact-plus-WAL restore does, restarts the
+  real process, and verifies the replayed vote is checkpointed back into the
+  durable artifact. This pins the production startup path before moving peer
+  responses from full artifact checkpoints to WAL fsync.
 
 1. define the replicated control-plane state machine:
    - state includes cluster epoch, PG count, PG state, PG acting sets, node
