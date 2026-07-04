@@ -542,7 +542,7 @@ Confirmed behavior; requires a prior replication fault to matter.
   floor is an ancestor of the observed proof. The `928f2b77` regression
   covers same-log divergence, not ahead-of-floor divergence.
 
-### CP8. LOW-MEDIUM — Admin acting-set/fence RPCs carry no expected-epoch precondition; response-loss confirmation is observational
+### CP8. RESOLVED / FOLLOW-UP — Admin acting-set/fence RPC response-loss confirmation is no longer observational
 
 Confirmed.
 
@@ -554,6 +554,15 @@ Confirmed.
   transfer orchestrator partially compensates (main.rs:979-986 plans the
   exact destination epoch). A CAS-style `expected_cluster_epoch` would make
   these unambiguous.
+- Status update: checked control-plane RPC helpers no longer blindly
+  resubmit after an ambiguous response loss. `set_pg_acting_set_checked`
+  observes the current runtime map and returns `RpcUnconfirmed` if the current
+  route differs from the requested acting set, preventing a stale retry from
+  clobbering a later admin transition. Metadata-transfer fence/install
+  helpers use operation-specific observability predicates rather than treating
+  any successful runtime-map response as confirmation. The remaining
+  follow-up is the stronger CAS-style `expected_cluster_epoch` request field,
+  tracked in the hardening plan.
 
 ### CP9. LOW — Single-writer enforcement is external to the library
 
@@ -606,7 +615,7 @@ regressing `last_observed_epoch` triggers exactly this).
 
 ## 2b. Metadata replication, command log, PG store recovery
 
-### MD1. HIGH — Normal fanout is now primary-FIRST, contradicting the documented primary-last model that makes local terminal-slot cleanup safe
+### MD1. RESOLVED — Terminal pending cleanup no longer relies on primary-last fanout
 
 Combined with bind-path recovery, this destroys convergence evidence.
 Confirmed (verified directly: sort key, commit, guide text, recovery mode).
@@ -644,8 +653,19 @@ Confirmed (verified directly: sort key, commit, guide text, recovery mode).
 - Not acknowledged-write loss (the mid-fanout crash never acks the client);
   it converts a designed-convergeable state into a repair-required state and
   violates a written invariant.
+- Status update: fixed by keeping the current primary-first fanout but
+  removing the unsafe local cleanup dependency on primary-last ordering.
+  `PgStore::recover` and storage-node bind recovery now preserve same-epoch
+  terminal pending slots because a single replica cannot prove acting-set
+  convergence. Terminal pending-slot cleanup is now command-owned or
+  cluster-level after explicit acting-set evidence. Final bucket deletion was
+  moved behind a replicated `DeleteFinalizedBucket` metadata command so that
+  final cleanup is logged instead of relying on digest-only local repair.
+  Regression coverage pins bind recovery preserving terminal slots, heartbeat
+  observation remaining non-mutating, and divergent/finalized replica cleanup
+  requiring acting-set evidence.
 
-### MD2. HIGH — A gap-index (non-contiguous) command apply commits divergent materialized state and then disables the in-process digest fail-closed gate
+### MD2. RESOLVED — Gap-index command apply is rejected before mutation
 
 Confirmed (verified directly: no contiguity check; post-mutation revision
 marking).
@@ -682,7 +702,7 @@ marking).
   epoch rejection, and the RPC epoch boundary. This closes the concrete MD2
   sparse-apply/digest-mask path.
 
-### MD3. MEDIUM — No epoch fence at the PgStore layer; recording a command under a different epoch silently resets — including rewinding — the replica chain
+### MD3. RESOLVED / FOLLOW-UP — PgStore rejects stale command epochs before chain rewind
 
 Confirmed mechanism; exploit window depends on lease discipline. (Same
 finding reached independently from the routing side; see CL3 for the
@@ -708,7 +728,7 @@ reachability analysis.)
   epoch; making that require an explicit epoch-transition/transfer token
   remains a follow-up.
 
-### MD4. MEDIUM — Epoch-mismatched orphan cleanup can delete a future-epoch in-flight command's slot after nonzero replica apply
+### MD4. RESOLVED — Future-epoch orphan cleanup now fails closed
 
 Plausible, narrow window.
 
@@ -881,7 +901,7 @@ Confirmed.
   converge; the PG serves nothing, forever, and nothing surfaces why. Data is
   safe (the extra entry was unacked); availability is not.
 
-### CL3. MEDIUM — `PgStore` epoch-reset reachability (companion to MD3)
+### CL3. RESOLVED — Storage RPC and PgStore now fence stale command epochs
 
 Confirmed code; reachability plausible.
 
@@ -901,6 +921,11 @@ Confirmed code; reachability plausible.
 - Consequence when hit: replica-state epoch regression and cross-epoch log
   interleaving on one node → divergence → CL2 wedge, or fail-closed digest
   mismatch. Cheap to fix; pure defense-in-depth today.
+- Status update: fixed with the MD3 hardening. The storage RPC encode/decode
+  boundary now rejects route epoch vs embedded command epoch disagreement, and
+  PgStore rejects stale command epochs before replica-state advancement. A
+  stale client cannot use a current-epoch RPC envelope to apply an older
+  command and rewind the replica chain.
 
 ### CL4. MEDIUM — Lease fencing compares authority-issued deadlines against local wall clocks with zero skew margin
 
@@ -1203,24 +1228,21 @@ closes this.
    margin before successor activation (CP2, CL4), and extend the
    deposed-primary lease fence from metadata transfer to all Active-exit
    transitions (CL1). This one design closes the whole dual-primary family.
-5. Restore a coherent fanout/recovery contract (MD1): either revert to
-   primary-last (re-solving the reissue-locking problem `a9013451` addressed
-   some other way, e.g. holding the primary critical section across the whole
-   fanout) or keep primary-first and make bind-path recovery use
-   `PreserveTerminal` unless a single-node acting set is provable, leaving
-   terminal-slot cleanup to a path with acting-set evidence. Update both
-   guides in the same change and add a test pinning the ordering so the next
-   flip cannot ship silently.
-6. Contiguity enforcement at record time (`log_index == applied_log_index +
-   1` unless the entry already exists) and fix the not-advanced
-   clean-revision marking (MD2) is implemented by rejecting the gap before
-   mutation; monotonic epoch guard in `PgStore` rejecting `command_epoch <
-   replica_state.cluster_epoch` and the server/codec assertion that
-   `request.cluster_epoch == command.id().cluster_epoch()` are implemented.
-   Remaining follow-up: gate forward epoch adoption on an explicit
-   transfer/epoch-transition token (MD3/CL3). Direction-aware orphan cleanup
-   (MD4) is implemented locally by cleaning only older-epoch slots and failing
-   closed on future-epoch slots.
+5. **DONE — Restore a coherent fanout/recovery contract (MD1).** The chosen
+   route was to keep primary-first fanout and remove the unsafe local cleanup
+   dependency on primary-last ordering: bind/local recovery preserves
+   same-epoch terminal slots, and cleanup requires command ownership or
+   cluster-level acting-set evidence. Guides and regressions now pin this
+   boundary.
+6. **DONE / FOLLOW-UP — Contiguity and stale-epoch fences (MD2/MD3/MD4/CL3).**
+   Contiguity enforcement at record time (`log_index == applied_log_index + 1`
+   unless the entry already exists) rejects the gap before mutation, fixing
+   the not-advanced clean-revision masking path (MD2). `PgStore` rejects
+   `command_epoch < replica_state.cluster_epoch`, and the server/codec assert
+   `request.cluster_epoch == command.id().cluster_epoch()` (MD3/CL3).
+   Direction-aware orphan cleanup cleans only older-epoch slots and fails
+   closed on future-epoch slots (MD4). Remaining follow-up: gate forward epoch
+   adoption on an explicit transfer/epoch-transition token.
 7. I/O deadlines on the storage RPC layer (client connect/read/write; server
    per-frame read and response write) mirroring the Raft transport, plus a
    lease/deadline on the server-side metadata-command critical section
