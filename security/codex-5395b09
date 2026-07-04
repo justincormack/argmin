@@ -1,0 +1,220 @@
+Storage RPC idle timeout can drop active read handles
+Link: https://chatgpt.com/codex/cloud/security/findings/1a710c85ec6c8191a287aeb9a351c2c4?sev=&repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin
+Criticality: medium (attack path: medium)
+Status: fixed
+
+# Metadata
+Repo: justincormack/argmin
+Commit: 5395b09
+Author: justin@specialbusservice.com
+Created: 04/07/2026, 16:06:29
+Assignee: Unassigned
+Signals: Security, Validated, Attack-path
+
+# Summary
+Introduced: the new idle timeout is applied too broadly to long-lived sessions that hold read handles. The timeout bounds idle socket resource use, but it also invalidates the lease semantics of read-handle sessions.
+Storage read handles are acquired before reading placed segment shards and released only after the shard reads finish. They prevent shard deletion/reclaim while a read is in progress. This commit applies STORAGE_RPC_SERVER_IDLE_TIMEOUT to every accepted storage-node RPC stream and treats read timeouts as a clean session close. When the timed-out session is dropped, StorageNodeSession releases all acquired read handles. Because a read-handle session normally sends no frames while the protected shard data is being read through separate RPCs, any read taking more than the 1-second idle timeout can lose its deletion fence early. A concurrent delete/reclaim can then proceed against shards that are still being read, or the later explicit release can fail because the server closed the session, causing avoidable GET/read failures. This is primarily an availability/integrity-of-read race rather than an authentication or confidentiality issue.
+
+# Resolution
+Fixed in commit [1685dc06834c20c9ee3da784fb1c97537698d1a4](https://github.com/justincormack/argmin/commit/1685dc06834c20c9ee3da784fb1c97537698d1a4) (`Preserve storage read handles across idle timeout`).
+
+The storage-node RPC idle-timeout path now distinguishes clean disconnects from idle read timeouts. TimedOut/WouldBlock on a session that holds acquired read handles no longer drops the session and releases the read fences, so long shard reads remain protected until the client sends the normal ReadHandlesRelease frame or disconnects.
+
+The preservation is intentionally limited to read-handle-only sessions. If an idle session also holds metadata-command PG locks, timeout cleanup still closes the session so metadata-command locks cannot be kept alive by acquiring an unrelated read handle. Regression coverage now proves both sides of the boundary: active read handles survive idle timeout until explicit release, while mixed read-handle plus metadata-lock sessions are closed and release their locks on timeout.
+
+Validation for the fix included `cargo nextest run -p storage storage_node_server::tests` and `cargo check -p storage`.
+
+# Validation
+## Rubric
+- [x] Confirm the commit applies a short server idle timeout to all accepted storage-node RPC streams.
+- [x] Confirm timeout/WOULDBLOCK on the request stream is treated as normal session close rather than preserving leases.
+- [x] Confirm StorageNodeSession owns acquired read handles and releases them on Drop.
+- [x] Confirm shard deletion/reclaim fencing depends on active read-handle counts.
+- [x] Dynamically reproduce: acquire a handle over a live RPC session, observe delete blocked before timeout, observe session Drop releases the handle after idle timeout, and observe delete allowed before explicit client release.
+## Report
+Validated the finding as a semantic race/lease violation, not a memory-corruption crash. Key code evidence: STORAGE_RPC_SERVER_IDLE_TIMEOUT is 1s in crates/storage/src/storage_rpc.rs:81-82; accepted storage-node RPC sockets get that timeout in crates/storage/src/storage_node_server.rs:1056-1064 and :1276-1284; handle_session treats TimedOut/WouldBlock as a clean session close at crates/storage/src/storage_node_server.rs:1613-1625; StorageNodeSession::drop releases all acquired read handles at crates/storage/src/storage_node_server.rs:10127-10138; deletion is blocked only while handle_counts has an entry at crates/storage/src/storage_node_server.rs:9911-9929 and the delete path calls it at :9096-9105. The real read path acquires read handles, then performs shard reads via separate calls before release in crates/storage/src/cluster.rs:10033-10069, so the read-handle RPC session can be idle during shard I/O. I added a targeted unit PoC using the actual StorageNodeServer and UnixStream RPC path. It acquires a read handle, confirms try_begin_delete returns ResourceExhausted while server.read_handle_count is 1, sleeps STORAGE_RPC_SERVER_IDLE_TIMEOUT + 300ms without sending ReadHandlesRelease, then confirms handle count is 0 and try_begin_delete succeeds while the client still has not explicitly released. Command output: cargo test -p storage poc_idle_timeout_releases_active_read_handle_and_allows_delete -- --nocapture => 1 passed in 1.51s. LLDB trace captured the ordering: first breakpoint at StorageNodeReadHandleState::try_begin_delete from the PoC active-delete check; then breakpoint at StorageNodeSession::drop line 10135 calling shared_handles.release from handle_session/accept_one after timeout; then another try_begin_delete from the PoC after timeout, with the test passing. Direct native crash is not expected for this availability/integrity race. Valgrind was attempted but is unavailable in the container: bash: command not found: valgrind.
+
+# Evidence
+crates/storage/src/cluster.rs (L10033 to 10069)
+  Note: The read path acquires read handles, then performs shard reads before explicitly releasing them. During those shard reads the handle session can be idle and hit the new timeout.
+```
+        let mut read_handles = match self
+            .local_map
+            .acquire_payload_shard_read_handles(self.operation_epoch(), &handle_entries)
+        {
+            Ok(read_handles) => read_handles,
+            Err(error) => {
+                placed_segment_recoverable_shard_error(error)?;
+                return Ok(false);
+            }
+        };
+
+        for (shard_index, (location, shard_key, ack)) in direct_shards.iter().enumerate() {
+            let start = shard_index * shard_size;
+            let end = start + shard_size;
+            if let Err(error) =
+                self.maybe_run_before_placed_payload_shard_read_hook(*location, shard_key)
+            {
+                read_handles.release().map_err(shard_io_error_to_store)?;
+                placed_segment_recoverable_shard_error(error)?;
+                return Ok(false);
+            }
+            match self.local_map.read_payload_shard_into_without_handle(
+                self.operation_epoch(),
+                *location,
+                shard_key,
+                *ack,
+                &mut dst[start..end],
+            ) {
+                Ok(()) => {}
+                Err(error) => {
+                    read_handles.release().map_err(shard_io_error_to_store)?;
+                    placed_segment_recoverable_shard_error(error)?;
+                    return Ok(false);
+                }
+            }
+        }
+        read_handles.release().map_err(shard_io_error_to_store)?;
+```
+
+crates/storage/src/storage_node_server.rs (L10127 to 10138)
+  Note: Dropping a StorageNodeSession releases all acquired read handles, so an idle timeout releases read fences.
+```
+impl Drop for StorageNodeSession {
+    fn drop(&mut self) {
+        let mut shared_handles = self
+            .shared_handles
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        for existing in self.read_operations.values_mut() {
+            if existing.is_acquired {
+                shared_handles.release(&existing.entries);
+                existing.is_acquired = false;
+            }
+        }
+```
+
+crates/storage/src/storage_node_server.rs (L1048 to 1064)
+  Note: Accepted storage-node RPC sockets now have the timeout configured before handling the session.
+```
+        let (mut stream, _) =
+            self.listener
+                .accept()
+                .map_err(|source| StorageNodeServerError::Io {
+                    context: "accept storage-node connection",
+                    path: self.config_snapshot().socket_path,
+                    source,
+                })?;
+        configure_storage_node_rpc_stream_timeout(&stream).map_err(|source| {
+            StorageNodeServerError::Io {
+                context: "configure storage-node accepted socket timeout",
+                path: self.config_snapshot().socket_path,
+                source,
+            }
+        })?;
+        let mut handler = self.connection_handler();
+        handler.handle_session(&mut stream, session_guard)
+```
+
+crates/storage/src/storage_node_server.rs (L1613 to 1625)
+  Note: A timed-out read from the RPC stream is treated as a normal session close, which drops session state.
+```
+            let frame = match read_storage_rpc_request_frame_from(stream) {
+                Ok(frame) => frame,
+                Err(StorageRpcStreamError::Io(error))
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::UnexpectedEof
+                            | io::ErrorKind::ConnectionReset
+                            | io::ErrorKind::BrokenPipe
+                            | io::ErrorKind::TimedOut
+                            | io::ErrorKind::WouldBlock
+                    ) =>
+                {
+                    return Ok(());
+```
+
+crates/storage/src/storage_node_server.rs (L9911 to 9921)
+  Note: Read handles are the mechanism preventing shard deletion while a read is active; premature release removes this protection.
+```
+    fn try_begin_delete(
+        &mut self,
+        location: ShardLocation,
+        shard_key: &ShardKey,
+    ) -> Result<(), StorageRpcErrorResponse> {
+        let key = ReadHandleShardKey::new(location, shard_key);
+        if self.handle_counts.get(&key).copied().unwrap_or(0) > 0 {
+            return Err(resource_exhausted_response(format!(
+                "shard {:?} at {:?} has active read handles",
+                shard_key, location
+            )));
+```
+
+crates/storage/src/storage_rpc.rs (L77 to 82)
+  Note: Introduces a 1-second storage RPC client/server timeout, including the server idle timeout that is too short for sessions holding read handles.
+```
+pub(crate) const STORAGE_RPC_CLIENT_RESPONSE_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(1);
+pub(crate) const STORAGE_RPC_CLIENT_WRITE_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(1);
+pub(crate) const STORAGE_RPC_SERVER_IDLE_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(1);
+```
+
+# Attack-path analysis
+Final: medium | Decider: model_decided | Matrix severity: medium | Policy adjusted: medium
+## Rationale
+Retain medium severity. Static evidence and the executable validation PoC support that the bug is real and in the main product read/delete path: storage-node RPC sessions time out after 1 second, timeouts are treated as clean close, StorageNodeSession::drop releases read handles, and deletion checks only active handle_counts. The issue is reachable from S3 GET/read flows through HttpFrontend and Coordinator, with a concurrent DeleteObject/reclaim side path. However, the impact is limited to availability and integrity of active reads; there is no auth bypass, confidentiality exposure, privilege escalation, or arbitrary code execution. Preconditions are nontrivial: authorized or otherwise permitted S3 access, a read longer than the timeout, and overlapping reclaim/delete pressure. These factors rule out high/critical, but the validated race against storage correctness justifies medium rather than ignore/low.
+## Likelihood
+high - The vulnerable path is reachable through normal S3 object reads, but exploitation requires a long or slow read exceeding a 1-second internal timeout plus overlapping delete/reclaim timing. The direct RPC surface is a Unix socket, not an exposed network port, and normal S3 authz still applies. | Remote network vector
+## Impact
+medium - Premature release of read handles can allow shard delete/reclaim while a GET/read is still using the shard. This can cause read failures or integrity-of-read races for affected objects. It does not bypass authentication, expose data, grant code execution, or permit unauthorized deletion; deletion/reclaim must otherwise be authorized or triggered by normal lifecycle/background processing.
+## Assumptions
+- The normal product deployment is the argmin-s3 runtime, optionally split into frontend and storage-node roles.
+- A realistic external attacker is an authenticated S3 client, or an anonymous client only where a bucket is intentionally public.
+- The storage-node RPC socket itself is a local Unix socket and is not directly internet-exposed; external reachability is through S3 GET/DELETE and background reclaim flows.
+- The race becomes practically observable when shard reads or reconstruction take longer than the 1-second storage RPC idle timeout and deletion/reclaim overlaps with the read.
+- S3 frontend process role serving HTTP/HTTPS
+- valid SigV4 credentials or object/bucket permissions sufficient for the relevant read/delete operations
+- object read path that acquires storage-node read handles
+- read or shard I/O lasting longer than STORAGE_RPC_SERVER_IDLE_TIMEOUT
+- concurrent delete/reclaim attempt against the same shard/object generation
+## Path
+S3 client -> HttpFrontend(auth) -> Coordinator ReadHandle -> StorageCluster shard read -> Unix RPC ReadHandlesAcquire -> idle >1s -> session timeout/drop -> read handles released -> concurrent delete/reclaim -> GET/read failure
+## Path evidence
+- `crates/argmin-s3/src/config.rs:133-138` - argmin-s3 is configured as the S3 server; credentials are required and default listen address is 127.0.0.1:9000.
+- `crates/argmin-s3/src/main.rs:3333-3410` - main product binds the configured TCP listener and starts the HTTP/HTTPS frontend service.
+- `crates/server-http/src/http/mod.rs:880-889` - non-OPTIONS S3 operations go through HttpFrontend authentication before dispatch.
+- `crates/server-http/src/http/mod.rs:1741-1756` - S3 GetObject dispatch reaches coordinator.get_object and returns a streaming object response.
+- `crates/server-http/src/http/mod.rs:1801-1814` - S3 DeleteObject dispatch reaches coordinator.delete_object, forming the concurrent delete/reclaim side of the race.
+- `crates/server-core/src/coordinator/read_core.rs:579-589` - ReadHandle creation acquires object payload leases for the shard locations used by the read.
+- `crates/server-core/src/coordinator/read_core.rs:753-765` - ReadHandle::next_chunk is the normal streaming read path that later loads segment data.
+- `crates/server-core/src/coordinator/runtime.rs:2876-2896` - Coordinator read runtime calls StorageCluster::read_segment_payload_stored_bytes_at_placement_epoch_into to load segment payload data.
+- `crates/storage/src/cluster.rs:10029-10069` - StorageCluster acquires shard read handles before shard reads and releases them only after read_payload_shard_into_without_handle completes.
+- `crates/storage/src/cluster/local.rs:3559-3587` - Local cluster groups shard entries by node and acquires read handles via the node's shard_read_handle_client.
+- `crates/storage/src/node_client/unix_sessions.rs:84-126` - Unix storage-node client sends ReadHandlesAcquire and ReadHandlesRelease RPC frames for the read-handle session.
+- `crates/storage/src/node_client/unix_sessions.rs:1492-1503` - The Unix read-handle lease keeps a read-handle session open; if the server closes it, release semantics can fail or be premature.
+- `crates/storage/src/storage_rpc.rs:77-82` - The introduced STORAGE_RPC_SERVER_IDLE_TIMEOUT is only 1 second.
+- `crates/storage/src/storage_node_server.rs:1056-1064` - Accepted storage-node RPC streams are configured with the idle timeout before session handling.
+- `crates/storage/src/storage_node_server.rs:1613-1625` - TimedOut and WouldBlock from the RPC stream are treated as clean session close, causing session state to be dropped.
+- `crates/storage/src/storage_node_server.rs:10127-10138` - Dropping StorageNodeSession releases all acquired read handles.
+- `crates/storage/src/storage_node_server.rs:9911-9924` - Deletion is blocked only when handle_counts shows active read handles; premature release removes the protection.
+- `crates/storage/src/storage_node_server.rs:6838-6845` - Shard delete path obtains the read-handle-aware delete fence before deleting the shard file.
+- `crates/argmin-s3/src/main.rs:75-88` - Control: the process rejects root execution and expects a dedicated non-root user.
+- `crates/auth/src/credential.rs:17-36` - SecretKey debug output is redacted, supporting secret-handling controls.
+## Narrative
+The finding is a real in-scope runtime vulnerability at medium severity. The production S3 frontend authenticates requests and dispatches GetObject/DeleteObject operations. The read path creates ReadHandle objects and ultimately reads segment payloads from StorageCluster. The storage cluster acquires per-shard read handles before reading direct shards and only explicitly releases them after shard I/O. However, accepted storage-node RPC streams are configured with a 1-second idle timeout, and handle_session treats TimedOut/WouldBlock as a clean close. Dropping the session releases all acquired read handles. Deletion is blocked only while handle_counts is nonzero, so a timeout can remove the fence before the read completes. The validated executable PoC showed this sequence on the real UnixStream RPC path. Impact is availability/integrity of active reads, not auth bypass, code execution, or confidentiality loss.
+## Controls
+- SigV4 authentication on non-OPTIONS S3 requests
+- Coordinator bucket/object authorization before GetObject/DeleteObject
+- Default listen address is loopback 127.0.0.1:9000 unless configured otherwise
+- Optional direct HTTPS via ARGMIN_TLS_CERT_PATH and ARGMIN_TLS_KEY_PATH
+- Connection and in-flight request admission limits
+- Storage-node RPC admission limits and wait timeouts
+- Process refuses to run as root
+- Secret values are wrapped/redacted in Debug implementations
+## Blindspots
+- No deployment manifests, load balancers, container definitions, or Kubernetes service accounts were present, so actual internet exposure and runtime identity cannot be confirmed statically.
+- The exact real-world trigger rate depends on object size, shard size, disk latency, erasure-code recovery behavior, and background reclaim scheduling.
+- Static review cannot prove all authorization policy combinations that may allow a low-privilege client to combine GET with DELETE/reclaim on shared objects.
+- The validation PoC exercised the real Unix RPC path but used a targeted unit scenario rather than a full end-to-end HTTP GET/DeleteObject workload.
