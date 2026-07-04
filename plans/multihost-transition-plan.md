@@ -10663,6 +10663,79 @@ Phase 12.3 closeout:
   single-authority path, and remove or replace
   `ARGMIN_CONTROL_PLANE_EXPERIMENTAL_RAFT`.
 
+Phase 12.4 proposed scope:
+
+- Move the experimental multi-process OpenRaft control-plane path from
+  "correct but expensive" durability to a production-shaped local durability
+  model. Replace full restart-artifact checkpoint-before-each-peer-response
+  with an fsync'd vote/log/commit WAL that can acknowledge Raft peer RPCs after
+  the exact updated consensus metadata is durable, while keeping the full
+  restart artifact as a compacted checkpoint/snapshot product. Recovery must
+  reconstruct the same OpenRaft vote, retained log, committed/purged
+  watermarks, membership, cached snapshot, and Argmin state-machine snapshot
+  from WAL plus the latest artifact.
+- Close the monotonic-clock and lease-read design for the replicated authority.
+  Define the authority clock source, restart high-water behavior, skew budget,
+  and relationship between committed command timestamps, heartbeat lease
+  deadlines, expiry commands, runtime-map read freshness, and successor
+  activation. The design must keep apply deterministic, reject committed time
+  regression, avoid reviving expired leases after leader failover or local clock
+  rollback, and document the remaining operational clock assumptions.
+- Add authenticated peer identity for the Raft control-plane transport. The
+  Phase 12.3 identity envelope proves cluster/source/target fields match the
+  configured peer map, but any process with socket access can still claim those
+  fields. Phase 12.4 should add a production-shaped credential or MAC boundary
+  for peer frames, bind credentials to the configured cluster/node identity,
+  fail closed on missing/stale/wrong credentials, and preserve the existing
+  bounded/versioned/CRC frame checks.
+- Harden the external control-plane client retry contract for the Raft path.
+  Read-only operations may retry transient not-leader/routing/catch-up errors
+  after a fresh linearized read. Mutating operations must not retry ambiguous
+  OpenRaft/client failures blindly; each admin command that can be retried must
+  have an explicit command-specific confirmation predicate over a linearized
+  snapshot, or otherwise fail closed and require the caller to resubmit with a
+  new observation.
+- Add process-level crash and restart fault injection around the new WAL and
+  clock boundaries. Required crash points include vote persisted before ack,
+  append persisted before ack, commit watermark persisted, artifact compaction
+  during WAL replay, peer response write after WAL fsync, and leader election
+  after local clock regression. Tests should prove no double-vote, no
+  acknowledged committed command loss, no stale runtime-map serving, and no
+  lease resurrection beyond the explicit skew budget.
+- Improve operator and test observability for the replicated authority:
+  expose WAL/artifact generation, last durable vote, last durable committed and
+  applied log ids, last durable authority timestamp high-water, peer-auth
+  failures, retry-confirmation outcomes, and poison reasons through the
+  existing status/debug surfaces. These diagnostics should be available without
+  granting access to raw state-machine internals.
+- Keep out of scope for 12.4: production cutover from the single-authority
+  path, dynamic configured peer-policy/membership evolution, remote storage or
+  frontend authentication beyond the control-plane Raft peer boundary, upgrade
+  compatibility for pre-release artifacts, and removing
+  `ARGMIN_CONTROL_PLANE_EXPERIMENTAL_RAFT`.
+
+Phase 12.4 exit criteria:
+
+- A three-node experimental durable OpenRaft control-plane cluster can survive
+  process crashes at WAL/artifact/peer-response fault-injection points without
+  double-voting, losing acknowledged committed commands, or serving stale
+  runtime maps after restart.
+- Peer Raft RPCs require authenticated configured peer identity in addition to
+  the Phase 12.3 cluster/source/target envelope, and malformed or unauthenticated
+  frames fail closed before OpenRaft dispatch.
+- Lease and runtime-map freshness semantics are documented and covered by
+  skew/regression tests: committed timestamps are monotonic, heartbeat leases do
+  not regress or resurrect across restart/failover, and successor activation
+  respects the chosen skew margin.
+- The Raft control-plane path has a documented retry/confirmation contract with
+  focused tests for read retry, mutating-command ambiguous failure handling, and
+  time-based command retry bounds.
+- The replicated authority status/debug surface exposes the durability and
+  safety diagnostics named in this scope: WAL/artifact generation, last durable
+  vote, last durable committed and applied log ids, last durable authority
+  timestamp high-water, peer-auth failures, retry-confirmation outcomes, and
+  poison reasons.
+
 1. define the replicated control-plane state machine:
    - state includes cluster epoch, PG count, PG state, PG acting sets, node
      membership, node incarnation/endpoint/liveness metadata, retained
