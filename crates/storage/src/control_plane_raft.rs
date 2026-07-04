@@ -1215,6 +1215,7 @@ pub struct ControlPlaneRaftAuthority {
     node_id: ControlPlaneRaftNodeId,
     raft: Raft<ControlPlaneRaftTypeConfig, ControlPlaneRaftStateMachine>,
     log_store: Option<ControlPlaneRaftLogStore>,
+    static_peer_policy: Option<ControlPlaneRaftPeerTransportPolicy>,
 }
 
 pub type ControlPlaneRaftFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -2794,13 +2795,18 @@ impl ControlPlaneRaftAuthority {
         let raft = Raft::<ControlPlaneRaftTypeConfig, ControlPlaneRaftStateMachine>::new(
             node_id,
             config,
-            ControlPlaneRaftUnixPeerNetworkFactory::new(node_id, peer_policy, rpc_timeout),
+            ControlPlaneRaftUnixPeerNetworkFactory::new(node_id, peer_policy.clone(), rpc_timeout),
             log_store.clone(),
             state_machine,
         )
         .await
         .map_err(|error| openraft_remote_error("new experimental Unix-peer authority", error))?;
-        Ok(Self::new_with_log_store(raft, log_store, cluster_name))
+        Ok(Self::new_with_log_store_and_static_peer_policy(
+            raft,
+            log_store,
+            cluster_name,
+            peer_policy,
+        ))
     }
 
     #[must_use]
@@ -2811,6 +2817,7 @@ impl ControlPlaneRaftAuthority {
             node_id,
             raft,
             log_store: None,
+            static_peer_policy: None,
         }
     }
 
@@ -2826,6 +2833,24 @@ impl ControlPlaneRaftAuthority {
             node_id,
             raft,
             log_store: Some(log_store),
+            static_peer_policy: None,
+        }
+    }
+
+    #[must_use]
+    fn new_with_log_store_and_static_peer_policy(
+        raft: Raft<ControlPlaneRaftTypeConfig, ControlPlaneRaftStateMachine>,
+        log_store: ControlPlaneRaftLogStore,
+        cluster_name: impl Into<String>,
+        peer_policy: ControlPlaneRaftPeerTransportPolicy,
+    ) -> Self {
+        let node_id = *raft.node_id();
+        Self {
+            cluster_name: cluster_name.into(),
+            node_id,
+            raft,
+            log_store: Some(log_store),
+            static_peer_policy: Some(peer_policy),
         }
     }
 
@@ -2866,6 +2891,7 @@ impl ControlPlaneRaftAuthority {
         voters: BTreeSet<ControlPlaneRaftNodeId>,
         retain_removed_voters_as_learners: bool,
     ) -> Result<LogIdOf<ControlPlaneRaftTypeConfig>, ControlPlaneError> {
+        self.reject_static_peer_reconfiguration("change-membership")?;
         let response = self
             .raft
             .change_membership(voters, retain_removed_voters_as_learners)
@@ -2880,12 +2906,28 @@ impl ControlPlaneRaftAuthority {
         node: BasicNode,
         wait_for_catch_up: bool,
     ) -> Result<LogIdOf<ControlPlaneRaftTypeConfig>, ControlPlaneError> {
+        self.reject_static_peer_reconfiguration("add-learner")?;
         let response = self
             .raft
             .add_learner(node_id, node, wait_for_catch_up)
             .await
             .map_err(|error| openraft_remote_error("add-learner", error))?;
         Ok(response.log_id)
+    }
+
+    fn reject_static_peer_reconfiguration(
+        &self,
+        operation: &'static str,
+    ) -> Result<(), ControlPlaneError> {
+        if let Some(peer_policy) = &self.static_peer_policy {
+            return Err(ControlPlaneError::RpcRemote {
+                message: format!(
+                    "OpenRaft {operation} is not supported for static configured peer policy in cluster {:?}; dynamic control-plane membership reconfiguration is outside Phase 12.3",
+                    peer_policy.cluster_name()
+                ),
+            });
+        }
+        Ok(())
     }
 
     pub async fn transfer_leadership_to(
@@ -15195,6 +15237,46 @@ mod tests {
                 .await,
                 "state-machine membership does not match configured peer map",
             );
+        });
+    }
+
+    #[test]
+    fn control_plane_openraft_unix_peer_durable_rejects_static_peer_reconfiguration() {
+        ControlPlaneRaftTypeConfig::run(async {
+            let tmp = test_util::tempdir();
+            let path = tmp.path().join("missing").join("raft.state");
+            let cluster_name = "control-plane-raft-unix-peer-durable-static-reconfiguration-test";
+            let policy = ControlPlaneRaftPeerTransportPolicy::from_peer_endpoints(
+                cluster_name,
+                [
+                    (1, "/tmp/argmin-raft-node-1.sock".to_string()),
+                    (2, "/tmp/argmin-raft-node-2.sock".to_string()),
+                ],
+                ControlPlaneRaftPeerTransportLimits::default(),
+            );
+
+            let authority = ControlPlaneRaftAuthority::new_experimental_unix_peer_durable(
+                cluster_name,
+                1,
+                &path,
+                policy,
+                Duration::from_millis(50),
+            )
+            .await
+            .unwrap();
+
+            assert_error_contains(
+                authority.replace_voters(BTreeSet::from([1]), false).await,
+                "change-membership is not supported for static configured peer policy",
+            );
+            assert_error_contains(
+                authority
+                    .add_learner(3, BasicNode::new("/tmp/argmin-raft-node-3.sock"), false)
+                    .await,
+                "add-learner is not supported for static configured peer policy",
+            );
+
+            authority.shutdown().await.unwrap();
         });
     }
 

@@ -10361,8 +10361,8 @@ Phase 12.3 proposed scope:
   internal authentication remains Phase 12.4/prod-cutover work if needed.
 - Keep out of scope for 12.3: production cutover, lease-read optimization,
   full authenticated remote control-plane/storage/frontend RPC security,
-  upgrade/migration compatibility, and removing or replacing
-  `ARGMIN_CONTROL_PLANE_EXPERIMENTAL_RAFT`.
+  upgrade/migration compatibility, dynamic configured peer-policy updates, and
+  removing or replacing `ARGMIN_CONTROL_PLANE_EXPERIMENTAL_RAFT`.
 
 Phase 12.3 exit criteria:
 
@@ -10572,6 +10572,14 @@ Phase 12.3 progress:
   durable restart artifact before returning the map, even if the node loses
   leadership before the follow-up status sample. When still serving, the cached
   marker includes the local vote/term and full committed/applied log ids.
+- Closed the Phase 12.3 static peer-policy membership gap. Unix-peer durable
+  authorities now retain their configured peer policy and reject
+  `replace_voters`/`add_learner` before calling OpenRaft, preventing live admin
+  calls from committing membership entries that the static restart validator
+  would reject on the next boot. Dynamic configured peer-policy evolution is
+  left for a later Phase 12 membership/cutover slice where committed
+  membership, endpoint identity, durable config, and restart validation must
+  move together.
 - Closed the immediate Raft peer ack-before-durable safety hole in the
   experimental process boundary. Unix peer workers now read and handle the
   peer request, checkpoint the durable restart artifact, and only then write

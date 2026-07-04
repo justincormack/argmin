@@ -226,6 +226,12 @@ Confirmed.
   fails closed. Learner membership likewise never matches. Acceptable only if
   membership change is out of scope for 12.3, but the APIs are live and
   nothing prevents calling them.
+- Fixed for Phase 12.3 by making Unix-peer durable authorities remember their
+  static configured peer policy and reject `replace_voters`/`add_learner`
+  before calling OpenRaft. Dynamic configured peer-policy evolution remains a
+  later Phase 12 production-cutover/membership slice, where committed
+  membership changes must update durable config identity and restart
+  validation together.
 
 ### R7. LOW — Missing artifact silently starts fresh
 
@@ -356,10 +362,9 @@ shift.
    brand-new empty peer joins via `install_full_snapshot`; `purge()` now
    establishes the committed gate only for the fresh empty-log snapshot-install
    shape.
-7. **Membership-change restart coverage (R6).** Either reject
-   `replace_voters`/`add_learner` in peer mode until config-driven membership
-   evolution is designed, or relax `validate_peer_policy_membership` to
-   accept subset-consistent evolutions of the configured map.
+7. **DONE — Membership-change restart coverage (R6).** Unix-peer durable
+   authorities reject `replace_voters`/`add_learner` in static peer mode until
+   config-driven membership evolution is designed.
 8. **Gate the peer socket on poison (R8)** via a shared flag checked in
    `spawn_experimental_raft_peer_rpc_worker`.
 9. **Smaller items:** finish the remaining bootstrap-race transient-exit case
@@ -1290,8 +1295,9 @@ closes this.
 - **OpenRaft conformance and gap tests.** Run
   `openraft::testing::log::suite` against the guarded log store (document
   deliberate deviations if it cannot pass); add fresh-follower-joins-via-
-  snapshot (R5) and membership-change-restart (R6) cases; add the
-  ack→checkpoint crash tests (R1).
+  snapshot (R5) coverage; keep the R6 static-peer reconfiguration rejection
+  regression in the Unix-peer durable boundary; add the ack→checkpoint crash
+  tests (R1).
 - **Invariant-drift protection.** For each load-bearing guide invariant
   (fanout order, recovery classification, proof-floor rules), add either a
   test named after the guide section or a debug assertion. MD1 is the proof
