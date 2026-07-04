@@ -97,7 +97,8 @@ time.
 Follow-up: the fix uses a full restart-artifact checkpoint before each peer
 response. That is safe but expensive. A small fsync'd vote/log WAL remains the
 natural production design, with the full artifact demoted to a compaction
-checkpoint. R3's torn-capture concern is separate and still open.
+checkpoint. R3's torn-capture concern is closed for the current full-artifact
+checkpoint path.
 
 ### R2. RESOLVED — No automatic leader election or leader heartbeats in the production config
 
@@ -151,10 +152,11 @@ Residual: this still uses full-artifact checkpoints. R1's WAL follow-up should
 replace this with a smaller fsync'd vote/log durability path before production
 scale, but the R3 torn-capture restart brick is closed.
 
-### R4. MEDIUM — Lease semantics ride on an unguarded, non-monotonic wall clock read at propose time
+### R4. MEDIUM — Lease semantics still need a monotonic-clock design
 
-No replicated time high-water mark; stale-clock and stale-read windows exist.
-Confirmed mechanics; exploitability depends on clock discipline.
+The immediate stale-time guardrails are in place, but the broader
+monotonic-clock lease design is still deferred. Confirmed mechanics;
+exploitability depends on clock discipline.
 
 - Clock source is `SystemTime::now()` (`crates/storage/src/clock.rs:57-66`,
   returns 0 before epoch via `unwrap_or_default`). Expiry commands are
@@ -178,17 +180,18 @@ Confirmed mechanics; exploitability depends on clock discipline.
     primary.
   - A new leader with a slow clock can propose peering completions/expiries
     that treat actually-expired leases as live (`control_plane.rs:7751-7756`).
-- The plan defers "monotonic-clock lease-read design" past 12.3; flagged
-  because the current code has no propose-time guard at all — not even a
-  committed-timestamp high-water check at apply, which would be cheap and
-  deterministic.
-- R4a progress: process-level control-plane request/maintenance paths now
+- R4a/R4b progress: process-level control-plane request/maintenance paths now
   re-read the authority clock only after acquiring the serializing authority
   mutex, immediately before constructing lease-expiry, heartbeat, and runtime-
   map read commands/evaluations. The experimental Raft process wrapper opts
   into that production resampling while tests can keep deterministic supplied
-  timestamps. This narrows stale-time windows but does not solve the remaining
-  R4 monotonic-clock / replicated timestamp high-water design.
+  timestamps. The replicated control-plane snapshot now carries
+  `max_committed_timestamp_ms`, timestamp-bearing apply paths reject committed
+  timestamp regressions, and heartbeats reject per-node lease-deadline
+  regression. This narrows stale-time windows and prevents deterministic
+  replay regression, but it does not solve the remaining R4 monotonic-clock /
+  lease-read design: cross-process skew policy, restart clock discipline, and
+  explicit successor-activation skew margins remain future work.
 
 ### R5. RESOLVED — Fresh-follower snapshot install can violate the log store's own invariants
 
@@ -365,6 +368,15 @@ shift.
   format mismatch.
 
 ## Raft hardening recommendations
+
+Phase 12.3 closeout: the experimental multi-process OpenRaft control-plane
+slice now satisfies its stated exit criteria. Three-node process coverage
+exercises durable peer startup, command replication, leader-routed
+command/read/status service, leadership transfer, abrupt leader loss with
+natural election, follower restart catch-up, and snapshot-transfer catch-up.
+The remaining items below are either production-scale replacements for safe
+but expensive 12.3 mechanisms, or deliberately deferred production-cutover
+work.
 
 1. **Replace full peer-response checkpoints with a vote/log WAL (R1 follow-up).**
    The process path now checkpoints before ack, so the immediate safety blocker
@@ -1250,16 +1262,22 @@ closes this.
 
 # Hardening plan
 
-## Tier 0 — before further Phase 12.3 work
+## Production follow-up after Phase 12.3 closeout
 
-1. Persist-before-ack on the Raft peer path (R1): fsync'd vote/log WAL,
-   artifact demoted to compaction checkpoint. Deterministic
-   pause-then-SIGKILL test between response write and checkpoint asserting no
-   double-vote and no acked-entry loss.
-2. Failover story (R2): enable ticks in production config (disabled in
-   deterministic tests) or per-node liveness-probe-driven election; land the
-   kill-leader/elect/commit exit-criterion test now.
-3. Atomic checkpoint capture + pre-write pair validation (R3).
+1. R1 production durability follow-up: replace full peer-response
+   restart-artifact checkpoints with an fsync'd vote/log WAL, demoting the
+   full artifact to a compaction checkpoint. The current 12.3 process path is
+   safe because peer responses are withheld until a durable checkpoint
+   succeeds; the WAL is the production-scale replacement for that expensive
+   safe path. Keep the deterministic pause/failure coverage for the
+   no-double-vote and no-acked-entry-loss boundary.
+2. R2 is closed for the experimental Unix-peer process path: OpenRaft timers,
+   heartbeats, and natural elections are enabled there, while deterministic
+   unit/in-process tests keep manual election control.
+3. R3 is closed for the current full-artifact checkpoint path: checkpoint
+   capture is state-first/log-later, and pre-write pair validation rejects
+   state-ahead or otherwise inconsistent restart artifacts before replacing the
+   last good checkpoint.
 
 ## Tier 1 — Phase 11 production path (live today)
 

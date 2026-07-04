@@ -10385,8 +10385,8 @@ Phase 12.3 progress:
   encoded append-entry payload bytes, and snapshot payload bytes before
   dispatch, with focused regressions for endpoint mismatch, oversized append
   batches, oversized single-entry append payloads, and oversized snapshots. This
-  establishes the validation shape for the Phase 12.3 peer RPC boundary; Unix/
-  process peer RPC remains the next layer.
+  established the validation shape for the Phase 12.3 peer RPC boundary; later
+  slices applied it to Unix/process peer RPC.
 - Lifted that guard into a reusable experimental peer transport policy with
   typed rejection reasons, so future Unix/process peer RPC can share the same
   target-node and frame-limit validation instead of duplicating test-only
@@ -10438,8 +10438,8 @@ Phase 12.3 progress:
   IO helper, explicit read/write timeouts, and OpenRaft network/streaming error
   mapping for append-entries, vote, pre-vote, snapshot, and transfer-leader
   traffic. A focused socket round-trip regression pins request/response
-  identity validation for vote RPCs; process listener wiring remains the next
-  layer.
+  identity validation for vote RPCs; later slices added process listener
+  wiring.
 - Added a reusable Unix-stream peer handler for the listener side. The handler
   sets explicit IO timeouts, reads one bounded peer frame, dispatches either an
   ordinary Raft RPC or full-snapshot request through the same identity-validating
@@ -10451,7 +10451,7 @@ Phase 12.3 progress:
   rejects response frames in the request direction, and lets a single bounded
   stream handler auto-dispatch ordinary Raft RPCs and snapshot install traffic.
   Socket-pair coverage now pins auto-dispatch for both vote and snapshot frames;
-  process accept loop wiring remains the next layer.
+  later slices added process accept-loop wiring.
 - Added the first process configuration boundary for experimental multi-node
   Raft control-plane peers. The control-plane config now parses an explicit
   Raft cluster name, local Raft node id, local peer socket path, and configured
@@ -10470,9 +10470,9 @@ Phase 12.3 progress:
   a configured source node, the local target node, and the configured cluster
   identity before dispatch. Focused storage tests cover configured-source
   acceptance and unknown-source rejection, and the process test coverage now
-  pins peer-listener binding from config. The remaining 12.3 process work is to
-  run the authority with the Unix peer network factory and exercise real
-  multi-process replication/failover rather than only the listener boundary.
+  pins peer-listener binding from config. Later 12.3 slices ran the authority
+  with the Unix peer network factory and exercised real multi-process
+  replication/failover rather than only the listener boundary.
 - Extended the durable OpenRaft restart artifact with a checksum-protected
   local Raft node id. Startup now rejects artifacts that belong to a different
   configured local node before constructing the Raft authority, while the
@@ -10485,16 +10485,15 @@ Phase 12.3 progress:
   restores any durable restart artifact through the checksum-protected cluster
   and local-node identity gates, and constructs OpenRaft with the Unix peer
   network factory. Focused tests pin empty startup and wrong-local-node
-  rejection; the process path still needs to select this constructor and then
-  exercise real multi-process replication/failover.
+  rejection; later slices selected this constructor from the process path and
+  exercised real multi-process replication/failover.
 - Switched the experimental control-plane process startup to select the
   Unix-peer durable authority when a Raft peer socket policy is configured. The
   process now builds the peer transport policy once, initializes new Raft
   membership from the configured peer map for that mode, reuses the same policy
   for the listener identity checks, and keeps the previous single-node durable
-  constructor for deployments without peer socket configuration. Real
-  multi-process replication/failover smoke coverage remains the next 12.3
-  milestone.
+  constructor for deployments without peer socket configuration. Later 12.3
+  slices added real multi-process replication/failover smoke coverage.
 - Tightened the peer-mode durable startup boundary. Unix-peer process startup
   no longer requires the local process to become leader before binding/serving
   peer RPCs, so restored followers can rejoin and catch up through ordinary
@@ -10511,8 +10510,8 @@ Phase 12.3 progress:
   Unix peer sockets, serves incoming peer frames through the same configured
   listener handler as the process path, initializes a two-voter membership,
   commits a control-plane command on the leader, and proves the follower applies
-  the committed command through the socket transport. Full process supervision
-  and failover remain the next layer.
+  the committed command through the socket transport. Later 12.3 slices added
+  full process supervision and failover coverage.
 - Added the first real `argmin-s3` process-supervision smoke for the Unix-peer
   Raft control-plane mode. The process wrapper now starts the peer listener
   before fresh membership initialization, seeds multi-node Raft membership only
@@ -10523,15 +10522,15 @@ Phase 12.3 progress:
   smoke starts two `argmin-s3` control-plane processes, waits for the serving
   control socket to expose the bootstrapped runtime map, and restores the
   follower's durable artifact to prove the bootstrap command was replicated and
-  checkpointed through the process boundary. Failover and restarted-peer catchup
-  remain the next process-level layer.
+  checkpointed through the process boundary. Later 12.3 slices added failover
+  and restarted-peer catchup coverage.
 - Extended the real-process Raft smoke to cover restarted follower catchup in a
   three-process quorum. The test starts two followers plus the deterministic
   seed leader, waits for bootstrap replication, stops one follower, commits a PG
   acting-set change while the follower is down, restarts that follower from its
   durable artifact, and verifies the restarted process catches up and
-  checkpoints the missed command through ordinary Unix peer traffic. Leader
-  failover remains the next process-level layer.
+  checkpoints the missed command through ordinary Unix peer traffic. Later
+  12.3 slices added leader failover coverage.
 - Added a deterministic process-level Raft leadership-transfer/failover smoke.
   The control-plane Unix RPC surface now has a narrow experimental Raft
   leadership-transfer admin request, exposed through
@@ -10540,9 +10539,9 @@ Phase 12.3 progress:
   on timer-driven election. The smoke transfers leadership from node 101 to
   node 102, verifies node 102 serves the runtime map, stops node 101, commits a
   PG acting-set change through node 102, then restarts node 101 and verifies it
-  catches up and checkpoints the post-transfer command. Natural leader election
-  after abrupt leader loss and snapshot-transfer process coverage remain open
-  12.3 work.
+  catches up and checkpoints the post-transfer command. Later 12.3 slices added
+  natural leader election after abrupt leader loss and snapshot-transfer process
+  coverage.
 - Added process-level snapshot-transfer catch-up coverage for the Unix-peer
   Raft control-plane path. A narrow experimental admin request,
   `control-plane-trigger-raft-snapshot-purge`, now forces the current leader to
@@ -10554,8 +10553,8 @@ Phase 12.3 progress:
   purges that command on the leader, restarts the stale follower, submits a
   suffix command to trigger catch-up, and verifies the restarted follower's
   durable artifact contains both the suffix state and an installed cached
-  snapshot at or beyond the purged boundary. Natural leader election after
-  abrupt leader loss remains open 12.3 work.
+  snapshot at or beyond the purged boundary. Later 12.3 slices added natural
+  leader election after abrupt leader loss.
 - Added deterministic abrupt-leader-loss election coverage without enabling
   timer-driven election in tests. A narrow experimental admin request,
   `control-plane-trigger-raft-election`, asks a surviving process to run an
@@ -10566,8 +10565,8 @@ Phase 12.3 progress:
   abruptly, triggers election through node 102, waits for node 102 to become
   the serving authority, verifies node 102's durable artifact contains its
   committed leader vote, commits a PG acting-set change, and verifies node 103
-  checkpoints the command. Timer-driven natural election policy remains open
-  12.3 work and should be covered separately from randomized timeout sleeps.
+  checkpoints the command. Later 12.3 slices enabled timer-driven natural
+  election policy and covered it separately from randomized timeout sleeps.
 - Enabled OpenRaft's automatic tick, heartbeat, and election timers for the
   experimental Unix-peer process authority while keeping single-node and
   deterministic in-memory tests on manual election control. Added a process
@@ -10634,6 +10633,35 @@ Phase 12.3 progress:
   async runtime worker. A stalled-peer regression proves an async runtime sleep
   continues while the peer read waits for its timeout, then the RPC fails as an
   unreachable peer. Peer authentication remains deferred to Phase 12.4.
+
+Phase 12.3 closeout:
+
+- Phase 12.3 is complete for the intended experimental multi-process durable
+  OpenRaft control-plane slice. The experimental process mode can run distinct
+  Raft peers with per-node durable restart artifacts, identity-framed Unix peer
+  RPC, bounded/versioned/CRC-protected append/vote/pre-vote/transfer/snapshot
+  frames, typed timeout/unreachable handling, and startup validation for
+  cluster identity, local node identity, and static peer-policy membership.
+- The exit criteria are covered by process and storage tests: commands
+  replicate over Unix peer sockets, followers checkpoint replicated state,
+  restarted followers catch up through retained logs, leadership can transfer,
+  abrupt leader loss elects a new serving authority through OpenRaft timers,
+  the new leader can commit, stale leaders/followers do not serve
+  authority-bearing runtime maps, and a lagging follower can catch up through
+  installed snapshot plus suffix replay after leader compaction.
+- The Raft process boundary is safe for the experimental slice: client/admin
+  checkpoint failures poison the authority, peer workers check poison before
+  dispatch and before response write, peer responses are withheld until a
+  durable restart-artifact checkpoint succeeds, natural-election read service
+  checkpoints the serving vote/term before returning a read-index runtime map,
+  and missing-artifact restarts fail closed through the sidecar sentinel.
+- Known deferred work is intentionally outside 12.3: replace full
+  peer-response checkpoints with a fsync'd vote/log WAL before production
+  scale, complete the monotonic-clock and lease-read design, add authenticated
+  peer identity for non-local or production transports, design dynamic
+  configured peer-policy evolution, cut production traffic over from the
+  single-authority path, and remove or replace
+  `ARGMIN_CONTROL_PLANE_EXPERIMENTAL_RAFT`.
 
 1. define the replicated control-plane state machine:
    - state includes cluster epoch, PG count, PG state, PG acting sets, node
