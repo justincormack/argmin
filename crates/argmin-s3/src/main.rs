@@ -1635,7 +1635,14 @@ impl ControlPlaneHeartbeatRuntimeMapSource for ExperimentalRaftControlPlane {
         let lease_deadline_ms = authority_now_ms
             .checked_add(requested_lease_duration_ms)
             .ok_or(ControlPlaneError::LeaseDeadlineOverflow)?;
-        let pre_record_epoch = self.current_snapshot()?.cluster_epoch();
+        let pre_record_snapshot = self.current_snapshot()?;
+        let lease_deadline_ms = pre_record_snapshot
+            .node(node_id)
+            .and_then(|node| node.lease_deadline_ms())
+            .map_or(lease_deadline_ms, |current_lease_deadline_ms| {
+                current_lease_deadline_ms.max(lease_deadline_ms)
+            });
+        let pre_record_epoch = pre_record_snapshot.cluster_epoch();
         self.submit_raft_command(ControlPlaneCommand::RecordNodeHeartbeat {
             heartbeat,
             heartbeat_at_ms: authority_now_ms,
@@ -4115,6 +4122,77 @@ mod tests {
     }
 
     #[test]
+    fn experimental_raft_control_plane_heartbeat_clamps_shorter_requested_lease() {
+        let mut harness = experimental_raft_test_harness("heartbeat-lease-clamp-test");
+        let mut config = test_server_config();
+        config.storage_node_sockets = vec![config::ConfiguredStorageNodeSocket {
+            node_id: 1,
+            socket_path: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
+        }];
+        config.storage_pg_ids = vec![7];
+        bootstrap_empty_experimental_raft_control_plane(&mut harness.control_plane, &config)
+            .expect("experimental raft control-plane bootstrap should succeed");
+
+        let bootstrap_epoch = harness
+            .control_plane
+            .current_snapshot()
+            .expect("experimental snapshot should read")
+            .cluster_epoch();
+        let first = harness
+            .control_plane
+            .refresh_node_heartbeat(
+                NodeHeartbeat {
+                    node_id: NodeId::new(1),
+                    node_incarnation: 1,
+                    endpoint: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
+                    observed_epoch: bootstrap_epoch,
+                    requested_lease_duration_ms: 1_000,
+                    cluster_map_history_reference_summary:
+                        storage::PgClusterMapHistoryReferenceSummary::default(),
+                    pg_observations: Vec::new(),
+                },
+                40_000,
+            )
+            .expect("experimental raft initial heartbeat should refresh");
+        assert_eq!(first.lease().lease_deadline_ms(), 41_000);
+
+        let refreshed_epoch = harness
+            .control_plane
+            .current_snapshot()
+            .expect("experimental snapshot should read after initial heartbeat")
+            .cluster_epoch();
+        let shortened = harness
+            .control_plane
+            .refresh_node_heartbeat(
+                NodeHeartbeat {
+                    node_id: NodeId::new(1),
+                    node_incarnation: 1,
+                    endpoint: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
+                    observed_epoch: refreshed_epoch,
+                    requested_lease_duration_ms: 100,
+                    cluster_map_history_reference_summary:
+                        storage::PgClusterMapHistoryReferenceSummary::default(),
+                    pg_observations: Vec::new(),
+                },
+                40_100,
+            )
+            .expect("experimental raft heartbeat should preserve longer existing lease");
+        assert_eq!(shortened.lease().lease_deadline_ms(), 41_000);
+        assert_eq!(
+            harness
+                .control_plane
+                .current_snapshot()
+                .expect("experimental snapshot should read after shortened heartbeat")
+                .node(NodeId::new(1))
+                .expect("node should exist")
+                .lease_deadline_ms(),
+            Some(41_000)
+        );
+
+        harness.shutdown();
+    }
+
+    #[test]
     fn experimental_raft_peer_rpc_checkpoint_failure_writes_no_response() {
         let harness = experimental_raft_test_harness("peer-checkpoint-before-ack");
         let cluster_name = format!(
@@ -5164,7 +5242,8 @@ mod tests {
         let tmp = short_unix_socket_test_dir("experimental-raft-live-acting-set");
         std::fs::create_dir_all(&tmp).unwrap();
         let socket_path = tmp.join("control-plane.sock");
-        let server = spawn_experimental_raft_unix_rpc_server(&harness, &socket_path, 32_050);
+        let server =
+            spawn_experimental_raft_unix_rpc_server_requests(&harness, &socket_path, 32_050, 2);
         let changed_epoch =
             set_control_plane_pg_acting_set_live(&socket_path, PgId::new(19), vec![NodeId::new(2)])
                 .expect("live acting-set helper should succeed");

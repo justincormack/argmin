@@ -23,6 +23,7 @@ const CONTROL_PLANE_RPC_MAX_PAYLOAD_LEN: usize = 8 * 1024 * 1024;
 const CONTROL_PLANE_RPC_IO_TIMEOUT: Duration = Duration::from_secs(1);
 const CONTROL_PLANE_RPC_LEADERSHIP_TRANSFER_TIMEOUT: Duration = Duration::from_secs(15);
 const CONTROL_PLANE_RPC_SNAPSHOT_PURGE_TIMEOUT: Duration = Duration::from_secs(15);
+const CURRENT_CONTROL_PLANE_STATE_VERSION: u64 = 12;
 const CONTROL_PLANE_RPC_READ_ONLY_RETRY_DEADLINE: Duration = Duration::from_secs(10);
 const CONTROL_PLANE_RPC_READ_ONLY_RETRY_BACKOFF: Duration = Duration::from_millis(50);
 const CONTROL_PLANE_RPC_CHECK_APPLIED_DEADLINE: Duration = Duration::from_secs(20);
@@ -238,6 +239,7 @@ impl NodeControlRecord {
 pub struct ClusterControlSnapshot {
     authority_incarnation: AuthorityIncarnation,
     cluster_epoch: ClusterEpoch,
+    max_committed_timestamp_ms: Option<u64>,
     nodes: BTreeMap<NodeId, NodeControlRecord>,
     pgs: BTreeMap<PgId, PgControlRecord>,
     history: Vec<ClusterMapHistoryRecord>,
@@ -248,6 +250,7 @@ impl ClusterControlSnapshot {
         Self {
             authority_incarnation: AuthorityIncarnation::INITIAL,
             cluster_epoch: ClusterEpoch::INITIAL,
+            max_committed_timestamp_ms: None,
             nodes: BTreeMap::new(),
             pgs: BTreeMap::new(),
             history: Vec::new(),
@@ -262,6 +265,11 @@ impl ClusterControlSnapshot {
     #[must_use]
     pub fn cluster_epoch(&self) -> ClusterEpoch {
         self.cluster_epoch
+    }
+
+    #[must_use]
+    pub fn max_committed_timestamp_ms(&self) -> Option<u64> {
+        self.max_committed_timestamp_ms
     }
 
     #[must_use]
@@ -731,6 +739,27 @@ impl ClusterControlSnapshot {
             record.pg_observations.clear();
         }
         Ok(())
+    }
+
+    fn validate_committed_timestamp(&self, timestamp_ms: u64) -> Result<(), ControlPlaneError> {
+        if let Some(max_committed_timestamp_ms) = self.max_committed_timestamp_ms {
+            if timestamp_ms < max_committed_timestamp_ms {
+                return Err(ControlPlaneError::CommittedTimestampRegression {
+                    timestamp_ms,
+                    max_committed_timestamp_ms,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn record_committed_timestamp(&mut self, timestamp_ms: u64) -> bool {
+        let previous = self.max_committed_timestamp_ms;
+        self.max_committed_timestamp_ms = Some(match previous {
+            Some(max_committed_timestamp_ms) => max_committed_timestamp_ms.max(timestamp_ms),
+            None => timestamp_ms,
+        });
+        self.max_committed_timestamp_ms != previous
     }
 
     #[cfg(any(test, debug_assertions))]
@@ -1270,21 +1299,9 @@ impl ControlPlaneCommandStateMachine for ClusterControlSnapshot {
                         max_ms: MAX_HEARTBEAT_LEASE_MS,
                     });
                 }
-                // Commit heartbeat_at_ms so command replay is deterministic;
-                // replicated monotonic-clock authority is tracked in the
-                // Phase 12 plan.
                 let expected_lease_deadline_ms = heartbeat_at_ms
                     .checked_add(heartbeat.requested_lease_duration_ms)
                     .ok_or(ControlPlaneError::LeaseDeadlineOverflow)?;
-                if lease_deadline_ms != expected_lease_deadline_ms {
-                    return Err(ControlPlaneError::LeaseDeadlineMismatch {
-                        node_id: heartbeat.node_id.as_u32(),
-                        heartbeat_at_ms,
-                        requested_ms: heartbeat.requested_lease_duration_ms,
-                        expected_deadline_ms: expected_lease_deadline_ms,
-                        actual_deadline_ms: lease_deadline_ms,
-                    });
-                }
                 let current_epoch = self.cluster_epoch;
                 let record =
                     self.nodes
@@ -1292,6 +1309,31 @@ impl ControlPlaneCommandStateMachine for ClusterControlSnapshot {
                         .ok_or(ControlPlaneError::UnknownNode {
                             node_id: heartbeat.node_id.as_u32(),
                         })?;
+                self.validate_committed_timestamp(heartbeat_at_ms)?;
+                let committed_lease_deadline_ms = record.lease_deadline_ms.map_or(
+                    expected_lease_deadline_ms,
+                    |current_lease_deadline_ms| {
+                        current_lease_deadline_ms.max(expected_lease_deadline_ms)
+                    },
+                );
+                if let Some(current_lease_deadline_ms) = record.lease_deadline_ms {
+                    if lease_deadline_ms < current_lease_deadline_ms {
+                        return Err(ControlPlaneError::NodeLeaseDeadlineRegression {
+                            node_id: heartbeat.node_id.as_u32(),
+                            current_lease_deadline_ms,
+                            requested_lease_deadline_ms: lease_deadline_ms,
+                        });
+                    }
+                }
+                if lease_deadline_ms != committed_lease_deadline_ms {
+                    return Err(ControlPlaneError::LeaseDeadlineMismatch {
+                        node_id: heartbeat.node_id.as_u32(),
+                        heartbeat_at_ms,
+                        requested_ms: heartbeat.requested_lease_duration_ms,
+                        expected_deadline_ms: committed_lease_deadline_ms,
+                        actual_deadline_ms: lease_deadline_ms,
+                    });
+                }
                 if matches!(
                     record.membership,
                     NodeMembershipState::Out | NodeMembershipState::Removed
@@ -1322,6 +1364,7 @@ impl ControlPlaneCommandStateMachine for ClusterControlSnapshot {
                         current_epoch,
                     )?;
                     let mut next_snapshot = self.clone();
+                    next_snapshot.record_committed_timestamp(heartbeat_at_ms);
                     let mut epoch_changed = false;
                     let mut affected_node = None;
                     {
@@ -1370,6 +1413,7 @@ impl ControlPlaneCommandStateMachine for ClusterControlSnapshot {
                 let mut epoch_changed = false;
                 let mut affected_node = None;
                 let mut next_snapshot = self.clone();
+                next_snapshot.record_committed_timestamp(heartbeat_at_ms);
                 {
                     let record = next_snapshot
                         .nodes
@@ -1465,7 +1509,9 @@ impl ControlPlaneCommandStateMachine for ClusterControlSnapshot {
                 ))
             }
             ControlPlaneCommand::ExpireHeartbeatLeases { expire_at_ms } => {
+                self.validate_committed_timestamp(expire_at_ms)?;
                 let mut next_snapshot = self.clone();
+                let timestamp_changed = next_snapshot.record_committed_timestamp(expire_at_ms);
                 let mut expired_nodes = Vec::new();
                 for record in next_snapshot.nodes.values_mut() {
                     if matches!(
@@ -1492,7 +1538,7 @@ impl ControlPlaneCommandStateMachine for ClusterControlSnapshot {
                     next_snapshot.bump_epoch()?;
                     peering_pgs
                 };
-                let changed = !expired_nodes.is_empty();
+                let changed = timestamp_changed || !expired_nodes.is_empty();
                 Ok(applied_control_plane_command(
                     self,
                     next_snapshot,
@@ -1906,6 +1952,7 @@ impl ControlPlaneCommandStateMachine for ClusterControlSnapshot {
                 node_incarnation,
                 complete_at_ms,
             } => {
+                self.validate_committed_timestamp(complete_at_ms)?;
                 let record = self
                     .pg(pg_id)
                     .ok_or(ControlPlaneError::UnknownPg { pg_id: pg_id.get() })?;
@@ -1924,11 +1971,13 @@ impl ControlPlaneCommandStateMachine for ClusterControlSnapshot {
                 )?;
                 if record.state == PgState::Active {
                     if record.active_primary == Some(primary) {
+                        let mut next_snapshot = self.clone();
+                        let changed = next_snapshot.record_committed_timestamp(complete_at_ms);
                         return Ok(applied_control_plane_command(
                             self,
-                            self.clone(),
+                            next_snapshot,
                             ControlPlaneCommandResponse::CompletePgPeering,
-                            false,
+                            changed,
                         ));
                     }
                     return Err(ControlPlaneError::PgNotPeering {
@@ -1976,6 +2025,7 @@ impl ControlPlaneCommandStateMachine for ClusterControlSnapshot {
                 let active_metadata_proof_epoch = self.cluster_epoch;
 
                 let mut next_snapshot = self.clone();
+                next_snapshot.record_committed_timestamp(complete_at_ms);
                 let record = next_snapshot
                     .pgs
                     .get_mut(&pg_id)
@@ -2008,12 +2058,15 @@ impl ControlPlaneCommandStateMachine for ClusterControlSnapshot {
                 ))
             }
             ControlPlaneCommand::CompleteReadyPgPeerings { ready_at_ms, ready } => {
+                self.validate_committed_timestamp(ready_at_ms)?;
                 if ready.is_empty() {
+                    let mut next_snapshot = self.clone();
+                    let changed = next_snapshot.record_committed_timestamp(ready_at_ms);
                     return Ok(applied_control_plane_command(
                         self,
-                        self.clone(),
+                        next_snapshot,
                         ControlPlaneCommandResponse::CompleteReadyPgPeerings,
-                        false,
+                        changed,
                     ));
                 }
 
@@ -2090,6 +2143,7 @@ impl ControlPlaneCommandStateMachine for ClusterControlSnapshot {
                 }
 
                 let mut next_snapshot = self.clone();
+                next_snapshot.record_committed_timestamp(ready_at_ms);
                 for completion in &ready {
                     let record = next_snapshot
                         .pgs
@@ -3525,6 +3579,13 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
         let lease_deadline_ms = authority_now_ms
             .checked_add(heartbeat.requested_lease_duration_ms)
             .ok_or(ControlPlaneError::LeaseDeadlineOverflow)?;
+        let lease_deadline_ms = self
+            .snapshot
+            .node(heartbeat.node_id)
+            .and_then(NodeControlRecord::lease_deadline_ms)
+            .map_or(lease_deadline_ms, |current_lease_deadline_ms| {
+                current_lease_deadline_ms.max(lease_deadline_ms)
+            });
         let observed_epoch = heartbeat.observed_epoch;
         let current_epoch = self.snapshot.cluster_epoch;
         let node_id = heartbeat.node_id;
@@ -4237,8 +4298,10 @@ impl UnixControlPlaneClient {
         &self,
         pg_id: PgId,
         acting_set: &[NodeId],
+        pre_update_epoch: Option<ClusterEpoch>,
     ) -> Result<ClusterEpoch, ControlPlaneError> {
         let deadline = Instant::now() + CONTROL_PLANE_RPC_CHECK_APPLIED_DEADLINE;
+        let mut last_unconfirmed_message = None;
         loop {
             match self.runtime_map_snapshot(0) {
                 Ok(runtime_map) => {
@@ -4247,33 +4310,48 @@ impl UnixControlPlaneClient {
                         .iter()
                         .find(|route| route.pg_id() == pg_id)
                     else {
-                        return Err(ControlPlaneError::RpcUnconfirmed {
-                            message: format!(
-                                "PG {} acting-set update was not confirmed after lost control-plane RPC response: current runtime map has no route for PG",
-                                pg_id.get()
-                            ),
-                        });
+                        last_unconfirmed_message = Some(format!(
+                            "PG {} acting-set update was not confirmed after lost control-plane RPC response: current runtime map has no route for PG",
+                            pg_id.get()
+                        ));
+                        if Instant::now() >= deadline {
+                            return Err(ControlPlaneError::RpcUnconfirmed {
+                                message: last_unconfirmed_message
+                                    .expect("missing route message was recorded"),
+                            });
+                        }
+                        std::thread::sleep(CONTROL_PLANE_RPC_CHECK_APPLIED_BACKOFF);
+                        continue;
                     };
                     if route.acting_set() == acting_set {
                         return Ok(route.cluster_epoch());
                     }
-                    return Err(ControlPlaneError::RpcUnconfirmed {
-                        message: format!(
+                    let message = format!(
                             "PG {} acting-set update was not confirmed after lost control-plane RPC response: current route at epoch {} has acting set {:?}, expected {:?}",
                             pg_id.get(),
                             route.cluster_epoch().get(),
                             route.acting_set(),
                             acting_set
-                        ),
-                    });
+                        );
+                    if pre_update_epoch.is_some_and(|epoch| route.cluster_epoch() > epoch) {
+                        return Err(ControlPlaneError::RpcUnconfirmed { message });
+                    }
+                    last_unconfirmed_message = Some(message);
+                    if Instant::now() >= deadline {
+                        return Err(ControlPlaneError::RpcUnconfirmed {
+                            message: last_unconfirmed_message
+                                .expect("mismatched route message was recorded"),
+                        });
+                    }
+                    std::thread::sleep(CONTROL_PLANE_RPC_CHECK_APPLIED_BACKOFF);
                 }
                 Err(error) if error.is_maybe_applied_control_plane_rpc_response_loss() => {
                     if Instant::now() >= deadline {
                         return Err(ControlPlaneError::RpcUnconfirmed {
-                            message: format!(
+                            message: last_unconfirmed_message.unwrap_or_else(|| format!(
                                 "PG {} acting-set update was not confirmed after lost control-plane RPC response; runtime-map observation failed: {error}",
                                 pg_id.get()
-                            ),
+                            )),
                         });
                     }
                     std::thread::sleep(CONTROL_PLANE_RPC_CHECK_APPLIED_BACKOFF);
@@ -4306,11 +4384,17 @@ impl UnixControlPlaneClient {
         pg_id: PgId,
         acting_set: Vec<NodeId>,
     ) -> Result<ClusterEpoch, ControlPlaneError> {
+        let pre_update_epoch = self.runtime_map_snapshot(0).ok().and_then(|runtime_map| {
+            runtime_map
+                .pg_routes()
+                .iter()
+                .find(|route| route.pg_id() == pg_id)
+                .map(|route| route.cluster_epoch())
+        });
         match self.set_pg_acting_set(pg_id, acting_set.clone()) {
             Ok(cluster_epoch) => Ok(cluster_epoch),
-            Err(error) if error.is_maybe_applied_control_plane_rpc_response_loss() => {
-                self.retry_set_pg_acting_set_after_response_loss(pg_id, &acting_set)
-            }
+            Err(error) if error.is_maybe_applied_control_plane_rpc_response_loss() => self
+                .retry_set_pg_acting_set_after_response_loss(pg_id, &acting_set, pre_update_epoch),
             Err(error) => Err(error),
         }
     }
@@ -6350,6 +6434,23 @@ pub enum ControlPlaneError {
     LeaseDeadlineOverflow,
 
     #[error(
+        "committed timestamp {timestamp_ms}ms regressed below previous maximum {max_committed_timestamp_ms}ms"
+    )]
+    CommittedTimestampRegression {
+        timestamp_ms: u64,
+        max_committed_timestamp_ms: u64,
+    },
+
+    #[error(
+        "node {node_id} heartbeat lease deadline {requested_lease_deadline_ms}ms regressed below current deadline {current_lease_deadline_ms}ms"
+    )]
+    NodeLeaseDeadlineRegression {
+        node_id: u32,
+        current_lease_deadline_ms: u64,
+        requested_lease_deadline_ms: u64,
+    },
+
+    #[error(
         "node {node_id} heartbeat lease deadline {actual_deadline_ms} does not match heartbeat time {heartbeat_at_ms} plus requested duration {requested_ms}ms; expected {expected_deadline_ms}"
     )]
     LeaseDeadlineMismatch {
@@ -6429,12 +6530,16 @@ fn next_epoch(epoch: ClusterEpoch) -> Result<ClusterEpoch, ControlPlaneError> {
 
 pub(crate) fn format_snapshot(snapshot: &ClusterControlSnapshot) -> String {
     let mut out = String::new();
-    out.push_str("version=11\n");
+    out.push_str(&format!("version={CURRENT_CONTROL_PLANE_STATE_VERSION}\n"));
     out.push_str(&format!(
         "authority_incarnation={}\n",
         snapshot.authority_incarnation.get()
     ));
     out.push_str(&format!("cluster_epoch={}\n", snapshot.cluster_epoch.get()));
+    out.push_str(&format!(
+        "max_committed_timestamp_ms={}\n",
+        option_u64(snapshot.max_committed_timestamp_ms)
+    ));
     for history in &snapshot.history {
         out.push_str(&format!(
             "history={},{}\n",
@@ -6612,6 +6717,8 @@ pub(crate) fn parse_snapshot(contents: &str) -> Result<ClusterControlSnapshot, C
     let mut version = None;
     let mut authority_incarnation = None;
     let mut cluster_epoch = None;
+    let mut max_committed_timestamp_ms = None;
+    let mut max_committed_timestamp_seen = false;
     let mut nodes = BTreeMap::new();
     let mut pgs = BTreeMap::new();
     let mut pg_lines = BTreeMap::new();
@@ -6624,7 +6731,14 @@ pub(crate) fn parse_snapshot(contents: &str) -> Result<ClusterControlSnapshot, C
             continue;
         }
         if let Some(value) = line.strip_prefix("version=") {
-            version = Some(parse_u64(line_number, value, "version")?);
+            let parsed_version = parse_u64(line_number, value, "version")?;
+            if parsed_version != CURRENT_CONTROL_PLANE_STATE_VERSION {
+                return Err(parse_error(
+                    line_number,
+                    "missing or unsupported control-plane state version",
+                ));
+            }
+            version = Some(parsed_version);
         } else if let Some(value) = line.strip_prefix("authority_incarnation=") {
             authority_incarnation = Some(
                 AuthorityIncarnation::new(parse_u64(line_number, value, "authority_incarnation")?)
@@ -6637,13 +6751,26 @@ pub(crate) fn parse_snapshot(contents: &str) -> Result<ClusterControlSnapshot, C
                 ClusterEpoch::new(parse_u64(line_number, value, "cluster_epoch")?)
                     .ok_or_else(|| parse_error(line_number, "cluster epoch must be nonzero"))?,
             );
-        } else if let Some(value) = line.strip_prefix("history=") {
-            if version == Some(2) {
+        } else if let Some(value) = line.strip_prefix("max_committed_timestamp_ms=") {
+            if max_committed_timestamp_seen {
                 return Err(parse_error(
                     line_number,
-                    "history records require control-plane state version 3",
+                    "duplicate max committed timestamp",
                 ));
             }
+            max_committed_timestamp_seen = true;
+            let state_version = version.ok_or_else(|| {
+                parse_error(line_number, "version must precede max committed timestamp")
+            })?;
+            if state_version != CURRENT_CONTROL_PLANE_STATE_VERSION {
+                return Err(parse_error(
+                    line_number,
+                    "max committed timestamp requires current control-plane state version",
+                ));
+            }
+            max_committed_timestamp_ms =
+                parse_option_u64(line_number, value, "max committed timestamp")?;
+        } else if let Some(value) = line.strip_prefix("history=") {
             let record = parse_history_record(line_number, value)?;
             if history
                 .insert(
@@ -6655,12 +6782,6 @@ pub(crate) fn parse_snapshot(contents: &str) -> Result<ClusterControlSnapshot, C
                 return Err(parse_error(line_number, "duplicate history record"));
             }
         } else if let Some(value) = line.strip_prefix("history_node=") {
-            if version == Some(2) {
-                return Err(parse_error(
-                    line_number,
-                    "history records require control-plane state version 3",
-                ));
-            }
             let (epoch, record) = parse_history_node_record(line_number, value)?;
             let history_record = history
                 .get_mut(&epoch)
@@ -6671,15 +6792,9 @@ pub(crate) fn parse_snapshot(contents: &str) -> Result<ClusterControlSnapshot, C
                 return Err(parse_error(line_number, "duplicate history node record"));
             }
         } else if let Some(value) = line.strip_prefix("history_node_pg=") {
-            let state_version = version.ok_or_else(|| {
+            version.ok_or_else(|| {
                 parse_error(line_number, "version must precede PG observation records")
             })?;
-            if state_version < 8 {
-                return Err(parse_error(
-                    line_number,
-                    "control-plane state version 8 required",
-                ));
-            }
             let (epoch, node_id, observation) = parse_history_node_pg_record(line_number, value)?;
             let history_record = history.get_mut(&epoch).ok_or_else(|| {
                 parse_error(line_number, "history node PG references unknown epoch")
@@ -6706,21 +6821,9 @@ pub(crate) fn parse_snapshot(contents: &str) -> Result<ClusterControlSnapshot, C
                 .node_pg_lines
                 .insert((node_id, observation.pg_id), line_number);
         } else if let Some(value) = line.strip_prefix("history_pg=") {
-            if version == Some(2) {
-                return Err(parse_error(
-                    line_number,
-                    "history records require control-plane state version 3",
-                ));
-            }
-            let state_version = version.ok_or_else(|| {
+            version.ok_or_else(|| {
                 parse_error(line_number, "version must precede history PG records")
             })?;
-            if state_version < 8 {
-                return Err(parse_error(
-                    line_number,
-                    "control-plane state version 8 required",
-                ));
-            }
             let (epoch, record) = parse_history_pg_record(line_number, value)?;
             let history_record = history
                 .get_mut(&epoch)
@@ -6737,15 +6840,9 @@ pub(crate) fn parse_snapshot(contents: &str) -> Result<ClusterControlSnapshot, C
                 return Err(parse_error(line_number, "duplicate node record"));
             }
         } else if let Some(value) = line.strip_prefix("node_pg=") {
-            let state_version = version.ok_or_else(|| {
+            version.ok_or_else(|| {
                 parse_error(line_number, "version must precede PG observation records")
             })?;
-            if state_version < 8 {
-                return Err(parse_error(
-                    line_number,
-                    "control-plane state version 8 required",
-                ));
-            }
             let (node_id, observation) = parse_node_pg_record(line_number, value)?;
             let node = nodes
                 .get_mut(&node_id)
@@ -6759,14 +6856,7 @@ pub(crate) fn parse_snapshot(contents: &str) -> Result<ClusterControlSnapshot, C
             }
             node_pg_lines.insert((node_id, observation.pg_id), line_number);
         } else if let Some(value) = line.strip_prefix("pg=") {
-            let state_version = version
-                .ok_or_else(|| parse_error(line_number, "version must precede PG records"))?;
-            if state_version < 8 {
-                return Err(parse_error(
-                    line_number,
-                    "control-plane state version 8 required",
-                ));
-            }
+            version.ok_or_else(|| parse_error(line_number, "version must precede PG records"))?;
             let record = parse_pg_record(line_number, value)?;
             let pg_id = record.pg_id;
             if pgs.insert(pg_id, record).is_some() {
@@ -6780,11 +6870,14 @@ pub(crate) fn parse_snapshot(contents: &str) -> Result<ClusterControlSnapshot, C
 
     let version = version
         .ok_or_else(|| parse_error(0, "missing or unsupported control-plane state version"))?;
-    if !(8..=11).contains(&version) {
+    if version != CURRENT_CONTROL_PLANE_STATE_VERSION {
         return Err(parse_error(
             0,
             "missing or unsupported control-plane state version",
         ));
+    }
+    if !max_committed_timestamp_seen {
+        return Err(parse_error(0, "missing max committed timestamp"));
     }
     let cluster_epoch = cluster_epoch.ok_or_else(|| parse_error(0, "missing cluster epoch"))?;
     validate_current_pgs(&pgs, &pg_lines, &nodes, cluster_epoch)?;
@@ -6801,6 +6894,7 @@ pub(crate) fn parse_snapshot(contents: &str) -> Result<ClusterControlSnapshot, C
         cluster_epoch,
         nodes,
         pgs,
+        max_committed_timestamp_ms,
         history,
     })
 }
@@ -7161,22 +7255,8 @@ fn parse_node_record(line: usize, value: &str) -> Result<NodeControlRecord, Cont
 
 fn parse_pg_record(line: usize, value: &str) -> Result<PgControlRecord, ControlPlaneError> {
     let fields: Vec<&str> = value.split(',').collect();
-    if fields.len() != 7
-        && fields.len() != 10
-        && fields.len() != 14
-        && fields.len() != 17
-        && fields.len() != 18
-        && fields.len() != 19
-        && fields.len() != 20
-        && fields.len() != 21
-        && fields.len() != 23
-        && fields.len() != 24
-        && fields.len() != 26
-    {
-        return Err(parse_error(
-            line,
-            "PG record must have seven, ten, fourteen, seventeen, eighteen, nineteen, twenty, twenty-one, twenty-three, twenty-four, or twenty-six fields",
-        ));
+    if fields.len() != 26 {
+        return Err(parse_error(line, "PG record must have twenty-six fields"));
     }
     let pg_id = PgId::new(parse_u32(line, fields[0], "PG id")?);
     let state = pg_state_from_str(fields[1])?;
@@ -8589,6 +8669,10 @@ mod tests {
         node_id: u32,
         now_ms: u64,
     ) -> HeartbeatLease {
+        let now_ms = authority
+            .snapshot()
+            .max_committed_timestamp_ms()
+            .map_or(now_ms, |timestamp_ms| timestamp_ms.max(now_ms));
         let first = authority
             .heartbeat(
                 heartbeat(node_id, authority.snapshot().cluster_epoch(), now_ms),
@@ -8613,6 +8697,10 @@ mod tests {
         now_ms: u64,
         endpoint: String,
     ) -> HeartbeatLease {
+        let now_ms = authority
+            .snapshot()
+            .max_committed_timestamp_ms()
+            .map_or(now_ms, |timestamp_ms| timestamp_ms.max(now_ms));
         let mut heartbeat = heartbeat(node_id, authority.snapshot().cluster_epoch(), now_ms);
         heartbeat.endpoint = endpoint;
         let first = authority.heartbeat(heartbeat, now_ms).unwrap();
@@ -8657,6 +8745,10 @@ mod tests {
         state: PgState,
         now_ms: u64,
     ) -> HeartbeatLease {
+        let now_ms = authority
+            .snapshot()
+            .max_committed_timestamp_ms()
+            .map_or(now_ms, |timestamp_ms| timestamp_ms.max(now_ms));
         let mut heartbeat = heartbeat_from_record(
             authority,
             node_id,
@@ -8681,6 +8773,10 @@ mod tests {
         has_pending_metadata_command: bool,
         now_ms: u64,
     ) -> HeartbeatLease {
+        let now_ms = authority
+            .snapshot()
+            .max_committed_timestamp_ms()
+            .map_or(now_ms, |timestamp_ms| timestamp_ms.max(now_ms));
         let mut heartbeat = heartbeat_from_record(
             authority,
             node_id,
@@ -10380,6 +10476,13 @@ mod tests {
         let server = std::thread::spawn(move || {
             let (mut stream, _addr) = listener.accept().unwrap();
             let request = read_control_plane_unix_request(&mut stream).unwrap();
+            assert_eq!(request.kind, ControlPlaneRpcKind::RuntimeMapSnapshot);
+            respond_control_plane_unix_request(&mut authority, &mut stream, request, 1_999)
+                .unwrap();
+            assert_eq!(authority.snapshot().cluster_epoch(), previous_epoch);
+
+            let (mut stream, _addr) = listener.accept().unwrap();
+            let request = read_control_plane_unix_request(&mut stream).unwrap();
             assert_eq!(request.kind, ControlPlaneRpcKind::SetPgActingSet);
             let response = build_control_plane_unix_response(&mut authority, request, 2_000)
                 .expect("acting-set update should apply before response loss");
@@ -10425,6 +10528,13 @@ mod tests {
         let first_update_epoch = ClusterEpoch::new(original_epoch.get() + 1).unwrap();
         let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
         let server = std::thread::spawn(move || {
+            let (mut stream, _addr) = listener.accept().unwrap();
+            let request = read_control_plane_unix_request(&mut stream).unwrap();
+            assert_eq!(request.kind, ControlPlaneRpcKind::RuntimeMapSnapshot);
+            respond_control_plane_unix_request(&mut authority, &mut stream, request, 1_999)
+                .unwrap();
+            assert_eq!(authority.snapshot().cluster_epoch(), original_epoch);
+
             let (mut stream, _addr) = listener.accept().unwrap();
             let request = read_control_plane_unix_request(&mut stream).unwrap();
             assert_eq!(request.kind, ControlPlaneRpcKind::SetPgActingSet);
@@ -10670,14 +10780,14 @@ mod tests {
             PgState::Peering,
             active_proof,
             false,
-            2_000,
+            10_003,
         );
         authority
             .complete_pg_peering(
                 PgId::new(43),
                 NodeId::new(1),
                 node_incarnation(&authority, 1),
-                2_001,
+                10_004,
             )
             .unwrap();
         heartbeat_with_pg_proof(
@@ -10687,14 +10797,14 @@ mod tests {
             PgState::Active,
             active_proof,
             false,
-            2_002,
+            10_005,
         );
         let active_epoch = authority.snapshot().cluster_epoch();
         let transfer = PgMetadataTransferProof::new(active_epoch, PgMetadataProof::new(10, 12, 13));
         let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
         let server = std::thread::spawn(move || {
             let (mut stream, _addr) = listener.accept().unwrap();
-            handle_control_plane_unix_stream(&mut authority, &mut stream, 2_003).unwrap();
+            handle_control_plane_unix_stream(&mut authority, &mut stream, 10_006).unwrap();
         });
 
         let client = UnixControlPlaneClient::new(&socket_path);
@@ -11738,10 +11848,18 @@ mod tests {
                 1_000,
             )
             .unwrap();
+        assert_eq!(
+            store.load().unwrap().unwrap().max_committed_timestamp_ms(),
+            Some(1_000)
+        );
 
         let restarted = SingleAuthorityControlPlane::open(store).unwrap();
         assert!(restarted.snapshot().authority_incarnation() > first_lease.authority_incarnation());
         assert!(restarted.snapshot().cluster_epoch() > first_lease.cluster_epoch());
+        assert_eq!(
+            restarted.snapshot().max_committed_timestamp_ms(),
+            Some(1_000)
+        );
     }
 
     #[test]
@@ -11775,6 +11893,23 @@ mod tests {
             SingleAuthorityControlPlane::open(store),
             Err(ControlPlaneError::Parse { message, .. })
                 if message == "missing or unsupported control-plane state version"
+        ));
+    }
+
+    #[test]
+    fn file_backed_authority_rejects_current_state_missing_timestamp_high_water() {
+        let tmp = test_util::tempdir();
+        let path = tmp.path().join("control-plane.state");
+        std::fs::write(
+            &path,
+            "version=12\nauthority_incarnation=1\ncluster_epoch=1\n",
+        )
+        .unwrap();
+        let store = FileControlPlaneStore::new(path);
+        assert!(matches!(
+            SingleAuthorityControlPlane::open(store),
+            Err(ControlPlaneError::Parse { message, .. })
+                if message == "missing max committed timestamp"
         ));
     }
 
@@ -12245,14 +12380,19 @@ mod tests {
             .cluster_map_at_epoch(missing_intermediate_epoch)
             .is_none());
         let current_epoch = authority.snapshot().cluster_epoch();
-        let mut stale_range_heartbeat = heartbeat_from_record(&authority, 1, current_epoch, 20_000);
+        let heartbeat_at_ms = authority
+            .snapshot()
+            .max_committed_timestamp_ms()
+            .unwrap_or(20_000);
+        let mut stale_range_heartbeat =
+            heartbeat_from_record(&authority, 1, current_epoch, heartbeat_at_ms);
         stale_range_heartbeat.cluster_map_history_reference_summary =
             PgClusterMapHistoryReferenceSummary {
                 oldest_live_placement_epoch: Some(source_epoch),
                 oldest_durable_backfill_epoch: None,
             };
         let error = authority
-            .heartbeat(stale_range_heartbeat, 20_000)
+            .heartbeat(stale_range_heartbeat, heartbeat_at_ms)
             .unwrap_err();
         assert!(matches!(
             error,
@@ -12528,7 +12668,13 @@ mod tests {
         let path = tmp.path().join("control-plane.state");
         std::fs::write(
             &path,
-            "version=11\nauthority_incarnation=1\ncluster_epoch=1\npg=7,peering,1:1,-,-,-,-\n",
+            concat!(
+                "version=12\n",
+                "max_committed_timestamp_ms=-\n",
+                "authority_incarnation=1\n",
+                "cluster_epoch=1\n",
+                "pg=7,peering,1:1,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,0,0,-,0,-,-,0\n",
+            ),
         )
         .unwrap();
         let store = FileControlPlaneStore::new(path);
@@ -12546,11 +12692,12 @@ mod tests {
         std::fs::write(
             &path,
             concat!(
-                "version=11\n",
+                "version=12\n",
+                "max_committed_timestamp_ms=-\n",
                 "authority_incarnation=1\n",
                 "cluster_epoch=2\n",
                 "node=1,active,healthy,11,2,100,200,-,6e6f64652d312e736f636b\n",
-                "pg=7,active,1:99,1,1,2,3\n",
+                "pg=7,active,1:99,1,1,2,3,-,-,-,-,-,-,-,-,-,-,-,-,0,0,-,0,2,-,0\n",
             ),
         )
         .unwrap();
@@ -12569,11 +12716,12 @@ mod tests {
         std::fs::write(
             &path,
             concat!(
-                "version=11\n",
+                "version=12\n",
+                "max_committed_timestamp_ms=-\n",
                 "authority_incarnation=1\n",
                 "cluster_epoch=2\n",
                 "node=1,active,healthy,11,2,100,200,-,6e6f64652d312e736f636b\n",
-                "pg=7,peering,1,-,-,-,-,9,10,11,3,9,10,11\n",
+                "pg=7,peering,1,-,-,-,-,9,10,11,3,9,10,11,-,-,-,2,1,0,0,-,0,-,-,0\n",
             ),
         )
         .unwrap();
@@ -12593,7 +12741,8 @@ mod tests {
         std::fs::write(
             &path,
             concat!(
-                "version=11\n",
+                "version=12\n",
+                "max_committed_timestamp_ms=-\n",
                 "authority_incarnation=1\n",
                 "cluster_epoch=2\n",
                 "node=1,active,healthy,11,2,100,200,-,6e6f64652d312e736f636b\n",
@@ -12634,7 +12783,13 @@ mod tests {
         let path = tmp.path().join("control-plane.state");
         std::fs::write(
             &path,
-            "version=11\nauthority_incarnation=1\ncluster_epoch=2\nhistory=2,1\n",
+            concat!(
+                "version=12\n",
+                "max_committed_timestamp_ms=-\n",
+                "authority_incarnation=1\n",
+                "cluster_epoch=2\n",
+                "history=2,1\n",
+            ),
         )
         .unwrap();
         let store = FileControlPlaneStore::new(path);
@@ -12652,12 +12807,13 @@ mod tests {
         std::fs::write(
             &path,
             concat!(
-                "version=11\n",
+                "version=12\n",
+                "max_committed_timestamp_ms=-\n",
                 "authority_incarnation=1\n",
                 "cluster_epoch=3\n",
                 "history=2,1\n",
                 "history_node=2,1,active,healthy,11,2,100,200,-,6e6f64652d312e736f636b\n",
-                "history_pg=2,7,peering,1:2,-,-,-,-\n",
+                "history_pg=2,7,peering,1:2,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,0,0,-,0,-,-,0\n",
             ),
         )
         .unwrap();
@@ -12676,12 +12832,13 @@ mod tests {
         std::fs::write(
             &path,
             concat!(
-                "version=11\n",
+                "version=12\n",
+                "max_committed_timestamp_ms=-\n",
                 "authority_incarnation=1\n",
                 "cluster_epoch=4\n",
                 "history=2,1\n",
                 "history_node=2,1,active,healthy,11,2,100,200,-,6e6f64652d312e736f636b\n",
-                "history_pg=2,7,peering,1,-,-,-,-,9,10,11,3,9,10,11\n",
+                "history_pg=2,7,peering,1,-,-,-,-,9,10,11,3,9,10,11,-,-,-,2,1,0,0,-,0,-,-,0\n",
                 "node=1,active,healthy,11,4,100,200,-,6e6f64652d312e736f636b\n",
             ),
         )
@@ -12715,7 +12872,7 @@ mod tests {
         assert!(matches!(
             SingleAuthorityControlPlane::open(store),
             Err(ControlPlaneError::Parse { message, .. })
-                if message == "control-plane state version 8 required"
+                if message == "missing or unsupported control-plane state version"
         ));
     }
 
@@ -12726,13 +12883,14 @@ mod tests {
         std::fs::write(
             &path,
             concat!(
-                "version=11\n",
+                "version=12\n",
+                "max_committed_timestamp_ms=-\n",
                 "authority_incarnation=1\n",
                 "cluster_epoch=2\n",
                 "node=1,active,healthy,11,2,100,200,-,6e6f64652d312e736f636b\n",
                 "node=2,active,healthy,12,2,100,200,-,6e6f64652d322e736f636b\n",
                 "node_pg=2,7,peering,2,100,0,0,0,0\n",
-                "pg=7,peering,1,-,-,-,-\n",
+                "pg=7,peering,1,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,0,0,-,0,-,-,0\n",
             ),
         )
         .unwrap();
@@ -12751,12 +12909,13 @@ mod tests {
         std::fs::write(
             &path,
             concat!(
-                "version=11\n",
+                "version=12\n",
+                "max_committed_timestamp_ms=-\n",
                 "authority_incarnation=1\n",
                 "cluster_epoch=3\n",
                 "node=1,active,healthy,11,3,100,200,-,6e6f64652d312e736f636b\n",
                 "node_pg=1,7,peering,2,100,0,0,0,0\n",
-                "pg=7,peering,1,-,-,-,-\n",
+                "pg=7,peering,1,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,0,0,-,0,-,-,0\n",
             ),
         )
         .unwrap();
@@ -12775,12 +12934,13 @@ mod tests {
         std::fs::write(
             &path,
             concat!(
-                "version=11\n",
+                "version=12\n",
+                "max_committed_timestamp_ms=-\n",
                 "authority_incarnation=1\n",
                 "cluster_epoch=2\n",
                 "node=1,active,healthy,11,2,100,200,-,6e6f64652d312e736f636b\n",
                 "node_pg=1,7,active,2,100,9,10,12,0\n",
-                "pg=7,active,1,1,9,10,11\n",
+                "pg=7,active,1,1,9,10,11,-,-,-,-,-,-,-,-,-,-,-,-,0,0,-,0,2,-,0\n",
             ),
         )
         .unwrap();
@@ -12800,12 +12960,13 @@ mod tests {
         std::fs::write(
             &path,
             concat!(
-                "version=11\n",
+                "version=12\n",
+                "max_committed_timestamp_ms=-\n",
                 "authority_incarnation=1\n",
                 "cluster_epoch=2\n",
                 "node=1,active,healthy,11,2,100,200,-,6e6f64652d312e736f636b\n",
                 "node_pg=1,7,active,2,100,10,20,30,0\n",
-                "pg=7,active,1,1,9,10,11\n",
+                "pg=7,active,1,1,9,10,11,-,-,-,-,-,-,-,-,-,-,-,-,0,0,-,0,2,-,0\n",
             ),
         )
         .unwrap();
@@ -12839,12 +13000,13 @@ mod tests {
         std::fs::write(
             &path,
             concat!(
-                "version=11\n",
+                "version=12\n",
+                "max_committed_timestamp_ms=-\n",
                 "authority_incarnation=1\n",
                 "cluster_epoch=2\n",
                 "node=1,active,healthy,11,2,100,200,-,6e6f64652d312e736f636b\n",
                 "node_pg=1,7,active,2,100,9,10,11,1\n",
-                "pg=7,active,1,1,9,10,11\n",
+                "pg=7,active,1,1,9,10,11,-,-,-,-,-,-,-,-,-,-,-,-,0,0,-,0,2,-,0\n",
             ),
         )
         .unwrap();
@@ -13374,6 +13536,7 @@ mod tests {
         );
         let snapshot = applied.snapshot();
         assert_eq!(snapshot.cluster_epoch(), before.cluster_epoch());
+        assert_eq!(snapshot.max_committed_timestamp_ms(), Some(2_000));
         let record = snapshot.node(NodeId::new(1)).unwrap();
         assert_eq!(record.last_observed_epoch(), Some(observed_epoch));
         assert_eq!(record.last_heartbeat_ms(), Some(2_000));
@@ -13420,6 +13583,7 @@ mod tests {
         let snapshot = applied.snapshot();
         assert!(applied.changed());
         assert_eq!(snapshot.cluster_epoch(), before.cluster_epoch());
+        assert_eq!(snapshot.max_committed_timestamp_ms(), Some(2_000));
         let record = snapshot.node(NodeId::new(1)).unwrap();
         assert_eq!(record.last_observed_epoch(), Some(stale_epoch));
         assert_eq!(record.last_heartbeat_ms(), Some(2_000));
@@ -13529,6 +13693,68 @@ mod tests {
     }
 
     #[test]
+    fn record_node_heartbeat_command_rejects_committed_timestamp_regression() {
+        let tmp = test_util::tempdir();
+        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+        authority
+            .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
+            .unwrap();
+        assert!(heartbeat_until_serving(&mut authority, 1, 1_000).serving());
+
+        let before = authority.snapshot().clone();
+        let heartbeat = heartbeat_from_record(&authority, 1, before.cluster_epoch(), 999);
+        let error = before
+            .apply_control_plane_command(ControlPlaneCommand::RecordNodeHeartbeat {
+                heartbeat,
+                heartbeat_at_ms: 999,
+                lease_deadline_ms: 1_099,
+            })
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ControlPlaneError::CommittedTimestampRegression {
+                timestamp_ms: 999,
+                max_committed_timestamp_ms: 1_001,
+            }
+        ));
+        assert_eq!(authority.snapshot(), &before);
+    }
+
+    #[test]
+    fn record_node_heartbeat_command_rejects_lease_deadline_regression() {
+        let tmp = test_util::tempdir();
+        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+        authority
+            .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
+            .unwrap();
+        assert!(heartbeat_until_serving(&mut authority, 1, 1_000).serving());
+
+        let before = authority.snapshot().clone();
+        let mut heartbeat = heartbeat_from_record(&authority, 1, before.cluster_epoch(), 1_001);
+        heartbeat.requested_lease_duration_ms = 50;
+        let error = before
+            .apply_control_plane_command(ControlPlaneCommand::RecordNodeHeartbeat {
+                heartbeat,
+                heartbeat_at_ms: 1_001,
+                lease_deadline_ms: 1_051,
+            })
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ControlPlaneError::NodeLeaseDeadlineRegression {
+                node_id: 1,
+                current_lease_deadline_ms: 1_101,
+                requested_lease_deadline_ms: 1_051,
+            }
+        ));
+        assert_eq!(authority.snapshot(), &before);
+    }
+
+    #[test]
     fn expire_heartbeat_leases_command_replays_with_committed_expiry_time() {
         let tmp = test_util::tempdir();
         let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
@@ -13569,7 +13795,7 @@ mod tests {
                 expire_at_ms: 1_099,
             })
             .unwrap();
-        assert!(!not_yet_expired.changed());
+        assert!(not_yet_expired.changed());
         assert_eq!(
             not_yet_expired.response(),
             &ControlPlaneCommandResponse::ExpireHeartbeatLeases {
@@ -13577,7 +13803,9 @@ mod tests {
                 peering_pgs: Vec::new(),
             }
         );
-        assert_eq!(not_yet_expired.snapshot(), &before);
+        let mut expected_not_yet_expired = before.clone();
+        expected_not_yet_expired.record_committed_timestamp(1_099);
+        assert_eq!(not_yet_expired.snapshot(), &expected_not_yet_expired);
 
         let applied = before
             .apply_control_plane_command(ControlPlaneCommand::ExpireHeartbeatLeases {
@@ -13616,6 +13844,34 @@ mod tests {
             applied.snapshot().cluster_epoch(),
             ClusterEpoch::new(before.cluster_epoch().get() + 1).unwrap()
         );
+        assert_eq!(applied.snapshot().max_committed_timestamp_ms(), Some(1_130));
+    }
+
+    #[test]
+    fn expire_heartbeat_leases_command_rejects_committed_timestamp_regression() {
+        let tmp = test_util::tempdir();
+        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+        authority
+            .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
+            .unwrap();
+        assert!(heartbeat_until_serving(&mut authority, 1, 1_000).serving());
+
+        let before = authority.snapshot().clone();
+        let error = before
+            .apply_control_plane_command(ControlPlaneCommand::ExpireHeartbeatLeases {
+                expire_at_ms: 999,
+            })
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ControlPlaneError::CommittedTimestampRegression {
+                timestamp_ms: 999,
+                max_committed_timestamp_ms: 1_001,
+            }
+        ));
+        assert_eq!(authority.snapshot(), &before);
     }
 
     #[test]
@@ -13654,6 +13910,7 @@ mod tests {
             applied.snapshot().cluster_epoch(),
             ClusterEpoch::new(before.cluster_epoch().get() + 1).unwrap()
         );
+        assert_eq!(applied.snapshot().max_committed_timestamp_ms(), Some(1_011));
     }
 
     #[test]
@@ -15288,26 +15545,8 @@ mod tests {
         let handle = crate::StorageClusterRuntimeMapHandle::new(Arc::clone(&current_cluster));
         let current_valid_until = current_cluster.route_map_valid_until_ms().unwrap();
 
-        let mut shorter_lease = heartbeat_from_record(
-            &authority,
-            1,
-            authority.snapshot().cluster_epoch(),
-            current_valid_until - 20,
-        );
-        shorter_lease.requested_lease_duration_ms = 10;
-        shorter_lease.pg_observations = vec![NodePgHeartbeatObservation {
-            pg_id: PgId::new(31),
-            state: PgState::Active,
-            metadata_proof: PgMetadataProof::empty(),
-            has_pending_metadata_command: false,
-        }];
-        authority
-            .heartbeat(shorter_lease, current_valid_until - 20)
-            .unwrap();
-        let stale_map = authority
-            .snapshot()
-            .runtime_map(current_valid_until - 19)
-            .unwrap();
+        let mut stale_map = current_map.clone();
+        stale_map.valid_until_ms = Some(current_valid_until - 10);
         let stale_cluster = crate::StorageCluster::from_runtime_map(
             NodeId::new(1),
             &stale_map,
@@ -16246,16 +16485,15 @@ mod tests {
         let mut shorter_lease =
             heartbeat_from_record(&authority, 1, authority.snapshot().cluster_epoch(), 152);
         shorter_lease.requested_lease_duration_ms = 5;
-        authority.heartbeat(shorter_lease, 152).unwrap();
+        let refreshed = authority.heartbeat(shorter_lease, 152).unwrap();
+        assert_eq!(
+            refreshed.lease_deadline_ms(),
+            authorized.lease_deadline_ms()
+        );
         assert!(authorized.lease_deadline_ms() > 157);
-        assert!(matches!(
-            authority.validate_node_service_authorization(&authorized, 157),
-            Err(ControlPlaneError::NodeLeaseExpired {
-                node_id: 1,
-                lease_deadline_ms: Some(157),
-                ..
-            })
-        ));
+        authority
+            .validate_node_service_authorization(&authorized, 157)
+            .unwrap();
     }
 
     #[test]
@@ -16631,16 +16869,15 @@ mod tests {
             metadata_proof: PgMetadataProof::empty(),
             has_pending_metadata_command: false,
         }];
-        authority.heartbeat(shorter_lease, 3_061).unwrap();
+        let refreshed = authority.heartbeat(shorter_lease, 3_061).unwrap();
+        assert_eq!(
+            refreshed.lease_deadline_ms(),
+            authorization.lease_deadline_ms()
+        );
         assert!(authorization.lease_deadline_ms() > 3_066);
-        assert!(matches!(
-            authority.validate_pg_operation_authorization(&authorization, 3_066),
-            Err(ControlPlaneError::NodeLeaseExpired {
-                node_id: 1,
-                lease_deadline_ms: Some(3_066),
-                ..
-            })
-        ));
+        authority
+            .validate_pg_operation_authorization(&authorization, 3_066)
+            .unwrap();
 
         assert!(matches!(
             authority.validate_pg_operation_authorization(
@@ -17467,6 +17704,35 @@ mod tests {
         assert_eq!(pg.active_primary(), Some(NodeId::new(1)));
         assert_eq!(pg.active_metadata_proof(), Some(observed_proof));
         assert_eq!(pg.active_metadata_proof_epoch(), Some(peering_epoch));
+        assert_eq!(applied.snapshot().max_committed_timestamp_ms(), Some(2_010));
+    }
+
+    #[test]
+    fn complete_ready_pg_peerings_command_rejects_committed_timestamp_regression() {
+        let tmp = test_util::tempdir();
+        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+        authority
+            .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
+            .unwrap();
+        assert!(heartbeat_until_serving(&mut authority, 1, 2_000).serving());
+
+        let before = authority.snapshot().clone();
+        let error = before
+            .apply_control_plane_command(ControlPlaneCommand::CompleteReadyPgPeerings {
+                ready_at_ms: 1_999,
+                ready: Vec::new(),
+            })
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ControlPlaneError::CommittedTimestampRegression {
+                timestamp_ms: 1_999,
+                max_committed_timestamp_ms: 2_001,
+            }
+        ));
+        assert_eq!(authority.snapshot(), &before);
     }
 
     #[test]
@@ -18651,17 +18917,17 @@ mod tests {
         heartbeat_with_pg_observation(&mut authority, 1, 9, PgState::Active, 1_011);
         authority
             .heartbeat(
-                heartbeat_from_record(&authority, 2, authority.snapshot().cluster_epoch(), 1_012),
-                1_012,
+                heartbeat_from_record(&authority, 2, authority.snapshot().cluster_epoch(), 1_051),
+                1_051,
             )
             .unwrap();
         assert_eq!(
-            authority.serving_pg_primary(PgId::new(9), 1_012),
+            authority.serving_pg_primary(PgId::new(9), 1_051),
             Some(NodeId::new(1))
         );
 
         let before_expiry_epoch = authority.snapshot().cluster_epoch();
-        let expiry = authority.expire_heartbeat_leases(1_112).unwrap();
+        let expiry = authority.expire_heartbeat_leases(1_152).unwrap();
         assert_eq!(expiry.expired_nodes(), &[NodeId::new(1), NodeId::new(2)]);
         assert_eq!(expiry.peering_pgs(), &[PgId::new(9)]);
         assert!(expiry.cluster_epoch() > before_expiry_epoch);
@@ -20638,7 +20904,8 @@ mod tests {
         }
         let imported_activation_floor = PgMetadataProof::new(9, 10, 11);
         let epoch_local_source_proof = PgMetadataProof::new(2, 12, 13);
-        for pg_id in [42, 43] {
+        for (idx, pg_id) in [42, 43].into_iter().enumerate() {
+            let base_ms = 10_000 + (idx as u64 * 100);
             authority
                 .set_pg_acting_set(PgId::new(pg_id), vec![NodeId::new(1)])
                 .unwrap();
@@ -20649,14 +20916,14 @@ mod tests {
                 PgState::Peering,
                 imported_activation_floor,
                 false,
-                10_010 + u64::from(pg_id),
+                base_ms + 10,
             );
             authority
                 .complete_pg_peering(
                     PgId::new(pg_id),
                     NodeId::new(1),
                     node_incarnation(&authority, 1),
-                    10_020 + u64::from(pg_id),
+                    base_ms + 20,
                 )
                 .unwrap();
             heartbeat_with_pg_proof(
@@ -20666,7 +20933,7 @@ mod tests {
                 PgState::Active,
                 imported_activation_floor,
                 false,
-                10_030 + u64::from(pg_id),
+                base_ms + 30,
             );
         }
 

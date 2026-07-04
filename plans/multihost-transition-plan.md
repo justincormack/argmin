@@ -7072,7 +7072,9 @@ Status:
   before persisting `Active`.
 - Added bounded cluster-map history retention to the single-authority control
   snapshot. Epoch-changing commits and authority restarts durably retain the
-  previous map before exposing the new epoch, old `version=2` state still loads,
+  previous map before exposing the new epoch, current-version snapshots fail
+  closed if the replicated timestamp high-water is missing, legacy snapshot
+  versions are rejected rather than migrated,
   and history is pruned to a fixed recent window for stale-route diagnostics and
   future cross-epoch fault-injection checks.
 - Tightened heartbeat-driven epoch changes so node incarnation changes, endpoint
@@ -10731,14 +10733,17 @@ Phase 12.3 progress:
    - lease-read/read-index freshness, storage-node heartbeat lease deadlines,
      frontend runtime-map freshness, and metadata-transfer source lease waits
      must state their clock-skew assumptions and restart behavior explicitly;
-   - `RecordNodeHeartbeat` currently commits `heartbeat_at_ms` and
-     `lease_deadline_ms` for deterministic replay and validates their internal
-     relationship. `ExpireHeartbeatLeases` commits the expiry timestamp used
-     to decide which leases become unavailable, and single-PG peering
-     completion commits the timestamp used for lease/proof validation. Phase 12
-     must still define how a replicated leader chooses and bounds these
-     timestamps across leader changes, restarts, clock jumps, and stale
-     lease-read/read-index publication;
+   - `RecordNodeHeartbeat` commits `heartbeat_at_ms` and `lease_deadline_ms`
+     for deterministic replay and validates their internal relationship.
+     `ExpireHeartbeatLeases` commits the expiry timestamp used to decide which
+     leases become unavailable, and peering completion commits the timestamp
+     used for lease/proof validation. Phase 12.3 added a replicated
+     `max_committed_timestamp_ms` high-water to the control-plane snapshot:
+     timestamp-bearing apply paths reject regressions, and heartbeat apply also
+     rejects per-node lease-deadline regression. Phase 12 must still define how
+     a replicated leader chooses and bounds these timestamps across leader
+     changes, restarts, clock jumps, and stale lease-read/read-index
+     publication;
    - after control-plane restart or leader change, any leader-local lease state
      that is not committed must be treated as expired until re-established
      through the consensus protocol;

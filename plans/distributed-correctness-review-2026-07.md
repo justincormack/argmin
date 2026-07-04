@@ -361,12 +361,14 @@ shift.
    OpenRaft ticks, heartbeats, and elections while deterministic tests retain
    manual election control. Process coverage includes abrupt leader loss,
    natural election, post-failover commit, and follower checkpoint convergence.
-4. **Cheap deterministic time guards (R4).** (a) Re-read the clock after
-   acquiring the authority mutex, immediately before constructing each
-   command and each runtime-map evaluation. (b) Apply-side monotonic guard:
-   reject/clamp `RecordNodeHeartbeat` regressions and keep a replicated
-   `max_committed_timestamp_ms` that `ExpireHeartbeatLeases` may not regress.
-   Both are pure functions of committed state, so determinism is preserved.
+4. **DONE — Cheap deterministic time guards (R4).** Process paths now re-read
+   the monotonic clock after acquiring the authority mutex, immediately before
+   constructing heartbeat, lease-expiry, and runtime-map operations. The
+   replicated control-plane snapshot now carries `max_committed_timestamp_ms`;
+   timestamp-bearing apply paths reject committed timestamp regressions, and
+   `RecordNodeHeartbeat` also rejects per-node lease-deadline regression.
+   These guards are pure functions of committed state, so deterministic replay
+   is preserved.
 5. **Fault-injection tests for the ack→checkpoint window (R1, R7).**
    Deterministic pause hook between response write and checkpoint + SIGKILL;
    assert refusal to double-vote and acked-state survival. Add a "state

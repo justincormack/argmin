@@ -11384,10 +11384,14 @@ mod tests {
             tmp.path().join("control-plane.state"),
         ))
         .unwrap();
-        for (heartbeat_node_id, heartbeat_socket_path) in [
+        for (idx, (heartbeat_node_id, heartbeat_socket_path)) in [
             (node_id, socket_path.clone()),
             (acting_node_id, acting_socket_path),
-        ] {
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let heartbeat_at_ms = 1_000 + (idx as u64 * 2);
             authority
                 .set_node_membership(heartbeat_node_id, NodeMembershipState::Active)
                 .unwrap();
@@ -11403,7 +11407,7 @@ mod tests {
                             crate::PgClusterMapHistoryReferenceSummary::default(),
                         pg_observations: Vec::new(),
                     },
-                    1_000,
+                    heartbeat_at_ms,
                 )
                 .unwrap();
             authority
@@ -11418,7 +11422,7 @@ mod tests {
                             crate::PgClusterMapHistoryReferenceSummary::default(),
                         pg_observations: Vec::new(),
                     },
-                    1_001,
+                    heartbeat_at_ms + 1,
                 )
                 .unwrap();
         }
@@ -11427,13 +11431,17 @@ mod tests {
             .set_pg_acting_set(pg_id, vec![acting_node_id])
             .unwrap();
         let observed_epoch = authority.snapshot().cluster_epoch();
-        for (heartbeat_node_id, heartbeat_socket_path) in [
+        for (idx, (heartbeat_node_id, heartbeat_socket_path)) in [
             (node_id, socket_path.clone()),
             (
                 acting_node_id,
                 tmp.path().join("sock").join("storage-8.sock"),
             ),
-        ] {
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let heartbeat_at_ms = 1_004 + idx as u64;
             authority
                 .heartbeat(
                     NodeHeartbeat {
@@ -11446,12 +11454,12 @@ mod tests {
                             crate::PgClusterMapHistoryReferenceSummary::default(),
                         pg_observations: Vec::new(),
                     },
-                    1_002,
+                    heartbeat_at_ms,
                 )
                 .unwrap();
         }
 
-        let runtime_map = authority.snapshot().runtime_map(1_003).unwrap();
+        let runtime_map = authority.snapshot().runtime_map(1_006).unwrap();
         let config = StorageNodeProcessConfig::from_runtime_map(
             node_id,
             tmp.path().join("node"),

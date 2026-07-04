@@ -59,10 +59,10 @@ Known audit targets:
     make caller semantics explicit, require the field at construction/storage/RPC
     boundaries, and reject absent data instead of filling it later.
 - Control-plane state parsing that still accepts version ranges or has per-version branches.
-  - `control_plane.rs` currently formats `version=11` but parses a range of older versions.
-    Before the supported-upgrade cutoff, every older parser branch is legacy and must be
-    removed. Tests should use current-format fixtures plus unsupported-version rejection
-    cases, not retained old-version parsers.
+  - The control-plane snapshot parser now rejects non-current versions and requires
+    current-format fields such as `max_committed_timestamp_ms`. Keep tests on
+    current-format fixtures plus unsupported-version rejection cases, not retained
+    old-version parsers.
 - Open-time cleanup that mutates state to compensate for older layouts.
   - Current startup/recovery repair should be for crash leftovers in the current format, not
     schema migration.
