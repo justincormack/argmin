@@ -3867,7 +3867,7 @@ pub struct ControlPlaneRaftLogStore {
     inner: Arc<Mutex<ControlPlaneRaftLogStoreInner>>,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct ControlPlaneRaftLogStoreRestartArtifact {
     vote: Option<VoteOf<ControlPlaneRaftTypeConfig>>,
     committed: Option<LogIdOf<ControlPlaneRaftTypeConfig>>,
@@ -3883,6 +3883,22 @@ pub struct ControlPlaneRaftRestartArtifact {
     state_machine: ControlPlaneRaftStateMachineRestartArtifact,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum ControlPlaneRaftWalRecord {
+    SaveVote(VoteOf<ControlPlaneRaftTypeConfig>),
+    Append(Vec<ControlPlaneRaftEntry>),
+    SaveCommitted(Option<LogIdOf<ControlPlaneRaftTypeConfig>>),
+    TruncateAfter(Option<LogIdOf<ControlPlaneRaftTypeConfig>>),
+    Purge(LogIdOf<ControlPlaneRaftTypeConfig>),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ControlPlaneRaftWalFrame {
+    cluster_name: String,
+    local_node_id: ControlPlaneRaftNodeId,
+    record: ControlPlaneRaftWalRecord,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ControlPlaneRaftRestartSentinel {
     cluster_name: String,
@@ -3895,6 +3911,14 @@ const CONTROL_PLANE_RAFT_RESTART_CHECKSUM_LEN: usize = 8;
 const CONTROL_PLANE_RAFT_RESTART_SENTINEL_MAGIC: &[u8] = b"ARGMINCPRAFTSEEN";
 const CONTROL_PLANE_RAFT_RESTART_SENTINEL_VERSION: u16 = 1;
 const CONTROL_PLANE_RAFT_RESTART_CAPTURE_MAX_ATTEMPTS: usize = 16;
+const CONTROL_PLANE_RAFT_WAL_MAGIC: &[u8] = b"ARGMINCPRAFTWAL";
+const CONTROL_PLANE_RAFT_WAL_VERSION: u16 = 1;
+const CONTROL_PLANE_RAFT_WAL_CHECKSUM_LEN: usize = 8;
+const CONTROL_PLANE_RAFT_WAL_RECORD_SAVE_VOTE: u8 = 1;
+const CONTROL_PLANE_RAFT_WAL_RECORD_APPEND: u8 = 2;
+const CONTROL_PLANE_RAFT_WAL_RECORD_SAVE_COMMITTED: u8 = 3;
+const CONTROL_PLANE_RAFT_WAL_RECORD_TRUNCATE_AFTER: u8 = 4;
+const CONTROL_PLANE_RAFT_WAL_RECORD_PURGE: u8 = 5;
 const CONTROL_PLANE_RAFT_PEER_RPC_MAGIC: &[u8] = b"ARGMINCPRAFTPEER";
 const CONTROL_PLANE_RAFT_PEER_RPC_VERSION: u16 = 1;
 const CONTROL_PLANE_RAFT_PEER_RPC_CHECKSUM_LEN: usize = 8;
@@ -4188,6 +4212,103 @@ impl ControlPlaneRaftLogStore {
             "control-plane OpenRaft purged boundary {last_purged_log_id} is after committed log id {committed}"
         )))
     }
+
+    fn save_vote_inner(
+        inner: &mut ControlPlaneRaftLogStoreInner,
+        vote: VoteOf<ControlPlaneRaftTypeConfig>,
+    ) -> Result<(), io::Error> {
+        Self::validate_vote_update(inner, vote)?;
+        inner.vote = Some(vote);
+        Ok(())
+    }
+
+    fn save_committed_inner(
+        inner: &mut ControlPlaneRaftLogStoreInner,
+        committed: Option<LogIdOf<ControlPlaneRaftTypeConfig>>,
+    ) -> Result<(), io::Error> {
+        Self::validate_committed_update(inner, committed)?;
+        inner.committed = committed;
+        Ok(())
+    }
+
+    fn append_inner(
+        inner: &mut ControlPlaneRaftLogStoreInner,
+        entries: Vec<ControlPlaneRaftEntry>,
+    ) -> Result<(), io::Error> {
+        Self::validate_contiguous_append(inner, &entries)?;
+        for entry in entries {
+            inner.entries.insert(entry.log_id.index(), entry);
+        }
+        Ok(())
+    }
+
+    fn truncate_after_inner(
+        inner: &mut ControlPlaneRaftLogStoreInner,
+        last_log_id: Option<LogIdOf<ControlPlaneRaftTypeConfig>>,
+    ) -> Result<(), io::Error> {
+        if let Some(committed) = inner.committed {
+            match last_log_id {
+                Some(last_log_id) if last_log_id.index() >= committed.index() => {}
+                Some(last_log_id) => {
+                    return Err(raft_log_store_error(format!(
+                        "cannot truncate control-plane OpenRaft log after {last_log_id}; committed log id is {committed}"
+                    )));
+                }
+                None => {
+                    return Err(raft_log_store_error(format!(
+                        "cannot clear control-plane OpenRaft log; committed log id is {committed}"
+                    )));
+                }
+            }
+        }
+        let Some(last_log_id) = last_log_id else {
+            inner.entries.clear();
+            return Ok(());
+        };
+
+        Self::validate_known_log_id(inner, "truncate after", last_log_id)?;
+        inner
+            .entries
+            .retain(|index, _| *index <= last_log_id.index());
+        Ok(())
+    }
+
+    fn purge_inner(
+        inner: &mut ControlPlaneRaftLogStoreInner,
+        log_id: LogIdOf<ControlPlaneRaftTypeConfig>,
+    ) -> Result<(), io::Error> {
+        if let Some(last_purged_log_id) = inner.last_purged_log_id {
+            if log_id.index() <= last_purged_log_id.index() {
+                if log_id == last_purged_log_id {
+                    return Ok(());
+                }
+                return Err(raft_log_store_error(format!(
+                    "cannot repurge control-plane OpenRaft log to {log_id}; current purged boundary is {last_purged_log_id}"
+                )));
+            }
+        }
+        if inner.committed.is_none() {
+            if inner.entries.is_empty() && inner.last_purged_log_id.is_none() {
+                Self::validate_vote_covers_committed(inner.vote, log_id)?;
+                inner.committed = Some(log_id);
+            } else {
+                return Err(raft_log_store_error(format!(
+                    "cannot purge control-plane OpenRaft log to {log_id}; no committed restart gate"
+                )));
+            }
+        } else {
+            Self::validate_vote_covers_committed(inner.vote, log_id)?;
+        }
+        inner.entries.retain(|index, _| *index > log_id.index());
+        inner.last_purged_log_id = Some(log_id);
+        if inner
+            .committed
+            .is_some_and(|committed| committed.index() < log_id.index())
+        {
+            inner.committed = Some(log_id);
+        }
+        Ok(())
+    }
 }
 
 impl ControlPlaneRaftLogStoreInner {
@@ -4196,6 +4317,145 @@ impl ControlPlaneRaftLogStoreInner {
             .last_key_value()
             .map(|(_, entry)| entry.log_id)
             .or(self.last_purged_log_id)
+    }
+}
+
+impl ControlPlaneRaftLogStoreRestartArtifact {
+    pub fn replay_wal_records(
+        &self,
+        records: &[ControlPlaneRaftWalRecord],
+    ) -> Result<Self, io::Error> {
+        let store = ControlPlaneRaftLogStore::from_restart_artifact(self.clone())?;
+        {
+            let mut inner = store.lock()?;
+            for record in records {
+                record.apply_to_log_store_inner(&mut inner)?;
+            }
+        }
+        store.export_restart_artifact()
+    }
+}
+
+impl ControlPlaneRaftWalRecord {
+    fn apply_to_log_store_inner(
+        &self,
+        inner: &mut ControlPlaneRaftLogStoreInner,
+    ) -> Result<(), io::Error> {
+        match self {
+            Self::SaveVote(vote) => ControlPlaneRaftLogStore::save_vote_inner(inner, *vote),
+            Self::Append(entries) => ControlPlaneRaftLogStore::append_inner(inner, entries.clone()),
+            Self::SaveCommitted(committed) => {
+                ControlPlaneRaftLogStore::save_committed_inner(inner, *committed)
+            }
+            Self::TruncateAfter(last_log_id) => {
+                ControlPlaneRaftLogStore::truncate_after_inner(inner, *last_log_id)
+            }
+            Self::Purge(log_id) => ControlPlaneRaftLogStore::purge_inner(inner, *log_id),
+        }
+    }
+}
+
+impl ControlPlaneRaftWalFrame {
+    pub fn new(
+        cluster_name: impl Into<String>,
+        local_node_id: ControlPlaneRaftNodeId,
+        record: ControlPlaneRaftWalRecord,
+    ) -> Self {
+        Self {
+            cluster_name: cluster_name.into(),
+            local_node_id,
+            record,
+        }
+    }
+
+    pub fn cluster_name(&self) -> &str {
+        &self.cluster_name
+    }
+
+    pub fn local_node_id(&self) -> ControlPlaneRaftNodeId {
+        self.local_node_id
+    }
+
+    pub fn record(&self) -> &ControlPlaneRaftWalRecord {
+        &self.record
+    }
+
+    pub fn into_record(self) -> ControlPlaneRaftWalRecord {
+        self.record
+    }
+
+    pub fn encode_frame(&self) -> Result<Vec<u8>, ControlPlaneError> {
+        let mut out = Vec::new();
+        out.extend_from_slice(CONTROL_PLANE_RAFT_WAL_MAGIC);
+        write_raft_u16(&mut out, CONTROL_PLANE_RAFT_WAL_VERSION);
+        write_raft_string(&mut out, &self.cluster_name)?;
+        write_raft_u64(&mut out, self.local_node_id);
+        write_raft_wal_record(&mut out, &self.record)?;
+        append_raft_artifact_checksum(&mut out);
+        Ok(out)
+    }
+
+    pub fn decode_frame(bytes: &[u8]) -> Result<Self, ControlPlaneError> {
+        let min_len = CONTROL_PLANE_RAFT_WAL_MAGIC.len() + 2 + CONTROL_PLANE_RAFT_WAL_CHECKSUM_LEN;
+        if bytes.len() < min_len {
+            return Err(raft_artifact_protocol_error(
+                "truncated control-plane OpenRaft WAL frame",
+            ));
+        }
+        let (body, checksum_bytes) =
+            bytes.split_at(bytes.len() - CONTROL_PLANE_RAFT_WAL_CHECKSUM_LEN);
+        let expected_checksum = u64::from_be_bytes(
+            checksum_bytes
+                .try_into()
+                .expect("checksum split length is fixed"),
+        );
+        let actual_checksum = raft_artifact_checksum(body);
+        if actual_checksum != expected_checksum {
+            return Err(raft_artifact_protocol_error(format!(
+                "control-plane OpenRaft WAL frame checksum mismatch: expected {expected_checksum:#x}, actual {actual_checksum:#x}"
+            )));
+        }
+
+        let mut reader = RaftArtifactReader::with_context(body, "control-plane OpenRaft WAL frame");
+        let magic = reader.read_exact(CONTROL_PLANE_RAFT_WAL_MAGIC.len())?;
+        if magic != CONTROL_PLANE_RAFT_WAL_MAGIC {
+            return Err(raft_artifact_protocol_error(
+                "invalid control-plane OpenRaft WAL frame magic",
+            ));
+        }
+        let version = reader.read_u16()?;
+        if version != CONTROL_PLANE_RAFT_WAL_VERSION {
+            return Err(raft_artifact_protocol_error(format!(
+                "unsupported control-plane OpenRaft WAL frame version {version}"
+            )));
+        }
+        let frame = Self {
+            cluster_name: reader.read_string()?,
+            local_node_id: reader.read_u64()?,
+            record: reader.read_wal_record()?,
+        };
+        reader.finish()?;
+        Ok(frame)
+    }
+
+    pub fn validate_identity(
+        &self,
+        cluster_name: &str,
+        local_node_id: ControlPlaneRaftNodeId,
+    ) -> Result<(), ControlPlaneError> {
+        if self.cluster_name != cluster_name {
+            return Err(raft_artifact_protocol_error(format!(
+                "control-plane OpenRaft WAL frame belongs to cluster {:?}, not configured cluster {:?}",
+                self.cluster_name, cluster_name
+            )));
+        }
+        if self.local_node_id != local_node_id {
+            return Err(raft_artifact_protocol_error(format!(
+                "control-plane OpenRaft WAL frame belongs to local OpenRaft node {}, not configured local node {local_node_id}",
+                self.local_node_id
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -5470,6 +5730,41 @@ fn read_raft_log_store_artifact(
     })
 }
 
+fn write_raft_wal_record(
+    out: &mut Vec<u8>,
+    record: &ControlPlaneRaftWalRecord,
+) -> Result<(), ControlPlaneError> {
+    match record {
+        ControlPlaneRaftWalRecord::SaveVote(vote) => {
+            write_raft_u8(out, CONTROL_PLANE_RAFT_WAL_RECORD_SAVE_VOTE);
+            write_raft_vote(out, *vote);
+        }
+        ControlPlaneRaftWalRecord::Append(entries) => {
+            write_raft_u8(out, CONTROL_PLANE_RAFT_WAL_RECORD_APPEND);
+            write_raft_u32(
+                out,
+                raft_len_as_u32(entries.len(), "raft WAL append entries")?,
+            );
+            for entry in entries {
+                write_raft_entry(out, entry)?;
+            }
+        }
+        ControlPlaneRaftWalRecord::SaveCommitted(committed) => {
+            write_raft_u8(out, CONTROL_PLANE_RAFT_WAL_RECORD_SAVE_COMMITTED);
+            write_raft_option_log_id(out, *committed);
+        }
+        ControlPlaneRaftWalRecord::TruncateAfter(last_log_id) => {
+            write_raft_u8(out, CONTROL_PLANE_RAFT_WAL_RECORD_TRUNCATE_AFTER);
+            write_raft_option_log_id(out, *last_log_id);
+        }
+        ControlPlaneRaftWalRecord::Purge(log_id) => {
+            write_raft_u8(out, CONTROL_PLANE_RAFT_WAL_RECORD_PURGE);
+            write_raft_log_id(out, *log_id);
+        }
+    }
+    Ok(())
+}
+
 fn write_raft_state_machine_artifact(
     out: &mut Vec<u8>,
     artifact: &ControlPlaneRaftStateMachineRestartArtifact,
@@ -5990,6 +6285,35 @@ impl<'a> RaftArtifactReader<'a> {
         })
     }
 
+    fn read_wal_record(&mut self) -> Result<ControlPlaneRaftWalRecord, ControlPlaneError> {
+        match self.read_u8()? {
+            CONTROL_PLANE_RAFT_WAL_RECORD_SAVE_VOTE => {
+                Ok(ControlPlaneRaftWalRecord::SaveVote(self.read_vote()?))
+            }
+            CONTROL_PLANE_RAFT_WAL_RECORD_APPEND => {
+                let entry_count =
+                    self.read_collection_len("raft WAL append entries", RAFT_ENTRY_MIN_LEN)?;
+                let mut entries = Vec::with_capacity(entry_count);
+                for _ in 0..entry_count {
+                    entries.push(self.read_entry()?);
+                }
+                Ok(ControlPlaneRaftWalRecord::Append(entries))
+            }
+            CONTROL_PLANE_RAFT_WAL_RECORD_SAVE_COMMITTED => Ok(
+                ControlPlaneRaftWalRecord::SaveCommitted(self.read_option_log_id()?),
+            ),
+            CONTROL_PLANE_RAFT_WAL_RECORD_TRUNCATE_AFTER => Ok(
+                ControlPlaneRaftWalRecord::TruncateAfter(self.read_option_log_id()?),
+            ),
+            CONTROL_PLANE_RAFT_WAL_RECORD_PURGE => {
+                Ok(ControlPlaneRaftWalRecord::Purge(self.read_log_id()?))
+            }
+            value => Err(raft_artifact_protocol_error(format!(
+                "unknown control-plane OpenRaft WAL record tag {value}"
+            ))),
+        }
+    }
+
     fn read_transfer_leader_request(
         &mut self,
     ) -> Result<TransferLeaderRequest<ControlPlaneRaftTypeConfig>, ControlPlaneError> {
@@ -6250,9 +6574,7 @@ impl RaftLogStorage<ControlPlaneRaftTypeConfig> for ControlPlaneRaftLogStore {
         vote: &VoteOf<ControlPlaneRaftTypeConfig>,
     ) -> Result<(), io::Error> {
         let mut inner = self.lock()?;
-        Self::validate_vote_update(&inner, *vote)?;
-        inner.vote = Some(*vote);
-        Ok(())
+        Self::save_vote_inner(&mut inner, *vote)
     }
 
     async fn save_committed(
@@ -6260,9 +6582,7 @@ impl RaftLogStorage<ControlPlaneRaftTypeConfig> for ControlPlaneRaftLogStore {
         committed: Option<LogIdOf<ControlPlaneRaftTypeConfig>>,
     ) -> Result<(), io::Error> {
         let mut inner = self.lock()?;
-        Self::validate_committed_update(&inner, committed)?;
-        inner.committed = committed;
-        Ok(())
+        Self::save_committed_inner(&mut inner, committed)
     }
 
     async fn read_committed(
@@ -6283,13 +6603,10 @@ impl RaftLogStorage<ControlPlaneRaftTypeConfig> for ControlPlaneRaftLogStore {
         let entries = entries.into_iter().collect::<Vec<_>>();
         {
             let mut inner = self.lock()?;
-            if let Err(error) = Self::validate_contiguous_append(&inner, &entries) {
+            if let Err(error) = Self::append_inner(&mut inner, entries) {
                 let message = error.to_string();
                 callback.io_completed(Err(raft_log_store_error(message.clone())));
                 return Err(raft_log_store_error(message));
-            }
-            for entry in entries {
-                inner.entries.insert(entry.log_id.index(), entry);
             }
         }
         callback.io_completed(Ok(()));
@@ -6301,31 +6618,7 @@ impl RaftLogStorage<ControlPlaneRaftTypeConfig> for ControlPlaneRaftLogStore {
         last_log_id: Option<LogIdOf<ControlPlaneRaftTypeConfig>>,
     ) -> Result<(), io::Error> {
         let mut inner = self.lock()?;
-        if let Some(committed) = inner.committed {
-            match last_log_id {
-                Some(last_log_id) if last_log_id.index() >= committed.index() => {}
-                Some(last_log_id) => {
-                    return Err(raft_log_store_error(format!(
-                        "cannot truncate control-plane OpenRaft log after {last_log_id}; committed log id is {committed}"
-                    )));
-                }
-                None => {
-                    return Err(raft_log_store_error(format!(
-                        "cannot clear control-plane OpenRaft log; committed log id is {committed}"
-                    )));
-                }
-            }
-        }
-        let Some(last_log_id) = last_log_id else {
-            inner.entries.clear();
-            return Ok(());
-        };
-
-        Self::validate_known_log_id(&inner, "truncate after", last_log_id)?;
-        inner
-            .entries
-            .retain(|index, _| *index <= last_log_id.index());
-        Ok(())
+        Self::truncate_after_inner(&mut inner, last_log_id)
     }
 
     async fn purge(
@@ -6333,37 +6626,7 @@ impl RaftLogStorage<ControlPlaneRaftTypeConfig> for ControlPlaneRaftLogStore {
         log_id: LogIdOf<ControlPlaneRaftTypeConfig>,
     ) -> Result<(), io::Error> {
         let mut inner = self.lock()?;
-        if let Some(last_purged_log_id) = inner.last_purged_log_id {
-            if log_id.index() <= last_purged_log_id.index() {
-                if log_id == last_purged_log_id {
-                    return Ok(());
-                }
-                return Err(raft_log_store_error(format!(
-                    "cannot repurge control-plane OpenRaft log to {log_id}; current purged boundary is {last_purged_log_id}"
-                )));
-            }
-        }
-        if inner.committed.is_none() {
-            if inner.entries.is_empty() && inner.last_purged_log_id.is_none() {
-                Self::validate_vote_covers_committed(inner.vote, log_id)?;
-                inner.committed = Some(log_id);
-            } else {
-                return Err(raft_log_store_error(format!(
-                    "cannot purge control-plane OpenRaft log to {log_id}; no committed restart gate"
-                )));
-            }
-        } else {
-            Self::validate_vote_covers_committed(inner.vote, log_id)?;
-        }
-        inner.entries.retain(|index, _| *index > log_id.index());
-        inner.last_purged_log_id = Some(log_id);
-        if inner
-            .committed
-            .is_some_and(|committed| committed.index() < log_id.index())
-        {
-            inner.committed = Some(log_id);
-        }
-        Ok(())
+        Self::purge_inner(&mut inner, log_id)
     }
 }
 
@@ -9979,6 +10242,193 @@ mod tests {
             last_membership: StoredMembership::default(),
             current_snapshot: None,
         }
+    }
+
+    fn refresh_raft_wal_frame_checksum(frame: &mut Vec<u8>) {
+        let checksum_start = frame.len() - CONTROL_PLANE_RAFT_WAL_CHECKSUM_LEN;
+        frame.truncate(checksum_start);
+        append_raft_artifact_checksum(frame);
+    }
+
+    #[test]
+    fn control_plane_raft_wal_frame_codec_round_trips_records() {
+        let records = vec![
+            ControlPlaneRaftWalRecord::SaveVote(Vote::<ControlPlaneRaftLeaderId>::new_committed(
+                3, 1,
+            )),
+            ControlPlaneRaftWalRecord::Append(vec![
+                bootstrap_membership_entry(1),
+                blank_entry(3, 1, 1),
+            ]),
+            ControlPlaneRaftWalRecord::SaveCommitted(Some(raft_log_id(3, 1, 1))),
+            ControlPlaneRaftWalRecord::TruncateAfter(Some(raft_log_id(3, 1, 1))),
+            ControlPlaneRaftWalRecord::Purge(raft_log_id(3, 1, 1)),
+        ];
+
+        for record in records {
+            let frame = ControlPlaneRaftWalFrame::new("test-cluster", 1, record.clone());
+            let encoded = frame.encode_frame().expect("WAL frame should encode");
+            let decoded =
+                ControlPlaneRaftWalFrame::decode_frame(&encoded).expect("WAL frame should decode");
+            assert_eq!(decoded.cluster_name(), "test-cluster");
+            assert_eq!(decoded.local_node_id(), 1);
+            assert_eq!(decoded.record(), &record);
+            decoded
+                .validate_identity("test-cluster", 1)
+                .expect("WAL frame identity should match");
+        }
+    }
+
+    #[test]
+    fn control_plane_raft_wal_frame_rejects_malformed_frames() {
+        assert_error_contains(
+            ControlPlaneRaftWalFrame::decode_frame(b"short"),
+            "truncated control-plane OpenRaft WAL frame",
+        );
+
+        let frame = ControlPlaneRaftWalFrame::new(
+            "test-cluster",
+            1,
+            ControlPlaneRaftWalRecord::SaveVote(Vote::<ControlPlaneRaftLeaderId>::new_committed(
+                3, 1,
+            )),
+        );
+        let encoded = frame.encode_frame().unwrap();
+
+        let mut bad_magic = encoded.clone();
+        bad_magic[0] ^= 0xff;
+        refresh_raft_wal_frame_checksum(&mut bad_magic);
+        assert_error_contains(
+            ControlPlaneRaftWalFrame::decode_frame(&bad_magic),
+            "invalid control-plane OpenRaft WAL frame magic",
+        );
+
+        let mut unsupported_version = encoded.clone();
+        unsupported_version[CONTROL_PLANE_RAFT_WAL_MAGIC.len() + 1] =
+            unsupported_version[CONTROL_PLANE_RAFT_WAL_MAGIC.len() + 1].wrapping_add(1);
+        refresh_raft_wal_frame_checksum(&mut unsupported_version);
+        assert_error_contains(
+            ControlPlaneRaftWalFrame::decode_frame(&unsupported_version),
+            "unsupported control-plane OpenRaft WAL frame version",
+        );
+
+        let mut bad_checksum = encoded.clone();
+        let last = bad_checksum
+            .last_mut()
+            .expect("encoded WAL frame should include checksum");
+        *last ^= 0xff;
+        assert_error_contains(
+            ControlPlaneRaftWalFrame::decode_frame(&bad_checksum),
+            "control-plane OpenRaft WAL frame checksum mismatch",
+        );
+
+        let mut trailing = encoded.clone();
+        let checksum_start = trailing.len() - CONTROL_PLANE_RAFT_WAL_CHECKSUM_LEN;
+        trailing.insert(checksum_start, 0);
+        refresh_raft_wal_frame_checksum(&mut trailing);
+        assert_error_contains(
+            ControlPlaneRaftWalFrame::decode_frame(&trailing),
+            "control-plane OpenRaft WAL frame has 1 trailing bytes",
+        );
+
+        let mut unknown_record = encoded;
+        let record_tag_offset = CONTROL_PLANE_RAFT_WAL_MAGIC.len()
+            + 2
+            + 4
+            + "test-cluster".len()
+            + std::mem::size_of::<u64>();
+        unknown_record[record_tag_offset] = 99;
+        refresh_raft_wal_frame_checksum(&mut unknown_record);
+        assert_error_contains(
+            ControlPlaneRaftWalFrame::decode_frame(&unknown_record),
+            "unknown control-plane OpenRaft WAL record tag",
+        );
+    }
+
+    #[test]
+    fn control_plane_raft_wal_frame_validates_identity() {
+        let frame = ControlPlaneRaftWalFrame::new(
+            "test-cluster",
+            1,
+            ControlPlaneRaftWalRecord::SaveVote(Vote::<ControlPlaneRaftLeaderId>::new_committed(
+                3, 1,
+            )),
+        );
+        assert_error_contains(
+            frame.validate_identity("other-cluster", 1),
+            "control-plane OpenRaft WAL frame belongs to cluster",
+        );
+        assert_error_contains(
+            frame.validate_identity("test-cluster", 2),
+            "control-plane OpenRaft WAL frame belongs to local OpenRaft node",
+        );
+    }
+
+    #[test]
+    fn control_plane_raft_wal_replay_matches_live_log_store_mutations() {
+        ControlPlaneRaftTypeConfig::run(async {
+            let records = vec![
+                ControlPlaneRaftWalRecord::Append(vec![
+                    bootstrap_membership_entry(1),
+                    blank_entry(3, 1, 1),
+                ]),
+                ControlPlaneRaftWalRecord::SaveVote(
+                    Vote::<ControlPlaneRaftLeaderId>::new_committed(3, 1),
+                ),
+                ControlPlaneRaftWalRecord::SaveCommitted(Some(raft_log_id(3, 1, 1))),
+                ControlPlaneRaftWalRecord::Append(vec![blank_entry(3, 1, 2), blank_entry(3, 1, 3)]),
+                ControlPlaneRaftWalRecord::SaveCommitted(Some(raft_log_id(3, 1, 3))),
+                ControlPlaneRaftWalRecord::Purge(raft_log_id(3, 1, 2)),
+                ControlPlaneRaftWalRecord::TruncateAfter(Some(raft_log_id(3, 1, 3))),
+            ];
+
+            let mut live = ControlPlaneRaftLogStore::empty();
+            for record in &records {
+                match record {
+                    ControlPlaneRaftWalRecord::SaveVote(vote) => {
+                        RaftLogStorage::save_vote(&mut live, vote).await.unwrap();
+                    }
+                    ControlPlaneRaftWalRecord::Append(entries) => {
+                        RaftLogStorage::append(&mut live, entries.clone(), IOFlushed::noop())
+                            .await
+                            .unwrap();
+                    }
+                    ControlPlaneRaftWalRecord::SaveCommitted(committed) => {
+                        RaftLogStorage::save_committed(&mut live, *committed)
+                            .await
+                            .unwrap();
+                    }
+                    ControlPlaneRaftWalRecord::TruncateAfter(last_log_id) => {
+                        RaftLogStorage::truncate_after(&mut live, *last_log_id)
+                            .await
+                            .unwrap();
+                    }
+                    ControlPlaneRaftWalRecord::Purge(log_id) => {
+                        RaftLogStorage::purge(&mut live, *log_id).await.unwrap();
+                    }
+                }
+            }
+
+            let replayed = ControlPlaneRaftLogStoreRestartArtifact::default()
+                .replay_wal_records(&records)
+                .expect("WAL replay should reconstruct log store");
+            assert_eq!(replayed, live.export_restart_artifact().unwrap());
+        });
+    }
+
+    #[test]
+    fn control_plane_raft_wal_replay_rejects_invalid_sequence() {
+        let records = vec![ControlPlaneRaftWalRecord::Append(vec![blank_entry(
+            3, 1, 1,
+        )])];
+        let err = ControlPlaneRaftLogStoreRestartArtifact::default()
+            .replay_wal_records(&records)
+            .expect_err("WAL replay should reject append holes");
+        assert!(
+            err.to_string()
+                .contains("control-plane OpenRaft append starts at index 1, expected 0"),
+            "unexpected WAL replay error: {err:?}"
+        );
     }
 
     #[test]

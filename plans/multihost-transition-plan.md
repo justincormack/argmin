@@ -10736,6 +10736,26 @@ Phase 12.4 exit criteria:
   timestamp high-water, peer-auth failures, retry-confirmation outcomes, and
   poison reasons.
 
+Phase 12.4 progress:
+
+- Added the first standalone OpenRaft local WAL frame codec for the
+  control-plane Raft log store. The frame carries cluster identity, local Raft
+  node id, one log-store mutation record, and a CRC-protected versioned payload
+  using the same canonical vote/log-id/entry encoding as the durable restart
+  artifact. Supported records cover vote persistence, append batches, committed
+  watermark updates, truncation, and purge boundaries.
+- Added offline WAL replay against `ControlPlaneRaftLogStoreRestartArtifact`.
+  Replay applies WAL records through the same synchronous validation/mutation
+  helpers used by the live OpenRaft `RaftLogStorage` implementation, so WAL
+  recovery and live mutation share append-contiguity, vote-regression,
+  committed-watermark, truncate, purge, and bootstrap-index-zero rules.
+  Focused tests cover frame round-trip, malformed frame rejection, identity
+  mismatch rejection, replay equivalence with live log-store mutations, and
+  fail-closed replay of an invalid append sequence. The process peer-ack path
+  still uses the safe full-artifact checkpoint-before-response path; switching
+  acknowledgements to WAL fsync is a later 12.4 slice after file append/replay
+  and crash-fault injection land.
+
 1. define the replicated control-plane state machine:
    - state includes cluster epoch, PG count, PG state, PG acting sets, node
      membership, node incarnation/endpoint/liveness metadata, retained
