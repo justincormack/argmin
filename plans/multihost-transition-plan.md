@@ -10776,6 +10776,18 @@ Phase 12.4 progress:
   parent-sync failure path. The process peer-response path still remains on
   full restart-artifact checkpoint-before-response until crash/fault injection
   proves WAL-only acknowledgements end to end.
+- Integrated the WAL-backed log store into the experimental durable process
+  constructors. Each durable restart artifact now records a checkpoint WAL
+  replay offset, and process startup derives a sibling `.wal` path from the
+  configured state artifact. Restart restores the checkpointed log-store and
+  state-machine artifact, then replays only WAL records after the artifact's
+  recorded clean offset. This makes a crash after a full checkpoint but before
+  physical WAL cleanup safe: old WAL bytes are skipped by offset instead of
+  being replayed as duplicate or stale log-store mutations. Fresh startup still
+  fails closed if a non-empty WAL exists without a durable artifact/sentinel.
+  The process still checkpoints the full restart artifact before external
+  responses; replacing those checkpoints with WAL-only acknowledgements and
+  adding physical WAL compaction remain later 12.4 work.
 
 1. define the replicated control-plane state machine:
    - state includes cluster epoch, PG count, PG state, PG acting sets, node

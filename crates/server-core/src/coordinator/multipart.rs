@@ -44,10 +44,10 @@ use crate::system_metadata::SystemMetadata;
 
 const COMPLETE_MULTIPART_STALE_COMMIT_RETRIES: usize = 1;
 
-fn complete_multipart_part_checksum<'a>(
-    part: &'a MultipartPartRecord,
+fn complete_multipart_part_checksum(
+    part: &MultipartPartRecord,
     checksum_type: ChecksumType,
-) -> Result<&'a ChecksumBytes, ServerError> {
+) -> Result<&ChecksumBytes, ServerError> {
     part.checksum
         .as_ref()
         .ok_or_else(|| ServerError::InvalidRequest {

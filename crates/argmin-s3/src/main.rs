@@ -34,11 +34,11 @@ use storage::control_plane::{
 use storage::control_plane_command::{ControlPlaneCommand, ControlPlaneCommandResponse};
 use storage::control_plane_raft::{
     decode_control_plane_raft_peer_request_frame_identity,
-    decode_control_plane_raft_peer_request_frame_kind, handle_control_plane_raft_peer_rpc_frame,
-    handle_control_plane_raft_peer_snapshot_frame, read_control_plane_raft_peer_transport_frame,
-    write_control_plane_raft_peer_transport_frame, ControlPlaneRaftAuthority,
-    ControlPlaneRaftAuthorityStatus, ControlPlaneRaftCommandOutcome, ControlPlaneRaftNodeId,
-    ControlPlaneRaftPeerFrameIdentity, ControlPlaneRaftPeerFrameKind,
+    decode_control_plane_raft_peer_request_frame_kind, durable_artifact_wal_path,
+    handle_control_plane_raft_peer_rpc_frame, handle_control_plane_raft_peer_snapshot_frame,
+    read_control_plane_raft_peer_transport_frame, write_control_plane_raft_peer_transport_frame,
+    ControlPlaneRaftAuthority, ControlPlaneRaftAuthorityStatus, ControlPlaneRaftCommandOutcome,
+    ControlPlaneRaftNodeId, ControlPlaneRaftPeerFrameIdentity, ControlPlaneRaftPeerFrameKind,
     ControlPlaneRaftPeerTransportLimits, ControlPlaneRaftPeerTransportPolicy,
 };
 use storage::storage_node_server::{
@@ -2204,21 +2204,24 @@ fn run_experimental_raft_control_plane_process(config: &ServerConfig) -> ! {
             });
     let durable_checkpoint_lock = Arc::new(Mutex::new(()));
     let durable_artifact_path = Arc::new(PathBuf::from(state_path));
+    let durable_wal_path = durable_artifact_wal_path(&durable_artifact_path);
     let authority = block_on_control_plane_raft(&runtime, async {
         let authority = if let Some(policy) = raft_peer_policy.clone() {
-            ControlPlaneRaftAuthority::new_experimental_unix_peer_durable(
+            ControlPlaneRaftAuthority::new_experimental_unix_peer_durable_with_wal(
                 cluster_name.clone(),
                 node_id,
                 Path::new(state_path),
+                &durable_wal_path,
                 policy,
                 CONTROL_PLANE_RAFT_PEER_RPC_IO_TIMEOUT,
             )
             .await?
         } else {
-            ControlPlaneRaftAuthority::new_experimental_single_node_durable(
+            ControlPlaneRaftAuthority::new_experimental_single_node_durable_with_wal(
                 cluster_name.clone(),
                 node_id,
                 Path::new(state_path),
+                &durable_wal_path,
             )
             .await?
         };
