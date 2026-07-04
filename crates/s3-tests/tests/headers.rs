@@ -4,7 +4,7 @@ use auth::canonical::{canonical_query_string, uri_encode};
 use aws_sdk_s3::primitives::ByteStream;
 use base64::Engine;
 use ring::{digest, hmac};
-use s3_tests::{unique_bucket, CTX};
+use s3_tests::{unique_account_regional_bucket, unique_bucket, CTX};
 use s3_types::requires_sigv4;
 
 // ── Helpers ─────────────────────────────────────────────────────────────
@@ -1494,6 +1494,61 @@ fn test_put_wrong_region() {
         assert_eq!(bucket_region.as_deref(), Some(CTX.region()));
         assert!(rbody.contains(&format!("<Region>{}</Region>", CTX.region())));
         cleanup(&bucket, &[]).await;
+    });
+}
+
+#[test]
+fn test_missing_account_regional_bucket_wrong_region_returns_header_malformed() {
+    s3_tests::run(async {
+        let bucket = unique_account_regional_bucket();
+        let path = format!("/{bucket}");
+        let wrong_region = if CTX.region() == "us-east-1" {
+            "us-west-2"
+        } else {
+            "us-east-1"
+        };
+        let s = Signer::new("GET", &path)
+            .body_hash(&sha256_hex(b""))
+            .region(wrong_region)
+            .sign();
+        let url = format!("{}{}", CTX.endpoint(), path);
+        let mut resp = agent()
+            .get(&url)
+            .header("Authorization", &s.authorization)
+            .header("x-amz-date", &s.amz_date)
+            .header("x-amz-content-sha256", &s.amz_content_sha256)
+            .call()
+            .expect("transport error");
+        let status = resp.status().as_u16();
+        let bucket_region = resp
+            .headers()
+            .get("x-amz-bucket-region")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
+        let body = resp.body_mut().read_to_string().unwrap();
+
+        assert_eq!(status, 400, "expected 400, got {status}: {body}");
+        assert_error_code(&body, "AuthorizationHeaderMalformed");
+        assert_eq!(bucket_region.as_deref(), None);
+        assert!(
+            body.contains(&format!(
+                "<Message>The authorization header is malformed; the region '{wrong_region}' is wrong; expecting '{}'</Message>",
+                CTX.region()
+            )),
+            "expected wrong-region credential message, got: {body}"
+        );
+        assert!(
+            body.contains(&format!("<Region>{}</Region>", CTX.region())),
+            "expected Region element, got: {body}"
+        );
+        assert!(
+            body.contains("<RequestId>") && body.contains("<HostId>"),
+            "expected RequestId and HostId, got: {body}"
+        );
+        assert!(
+            !body.contains("<Resource>"),
+            "did not expect Resource element, got: {body}"
+        );
     });
 }
 

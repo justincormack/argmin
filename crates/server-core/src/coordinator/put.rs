@@ -4,11 +4,6 @@ use storage::{
 };
 
 use super::bucket_handles::{BucketHandleLoader, BucketHandleRequest};
-#[cfg(test)]
-use super::{
-    maybe_run_bucket_write_handle_loaded_hook, should_probe_direct_put_commit,
-    should_probe_finalize_stream_put_commit,
-};
 use super::{
     ActiveWriteEncryption, AppendStreamPutRequest, AuthorizePutObjectRequest,
     AuthorizedFinalizeStreamPutRequest, AuthorizedPutObjectCommitRequest, AuthorizedPutObjectWrite,
@@ -239,7 +234,7 @@ impl Coordinator {
                         bucket_write_reservation: proof,
                     };
                     #[cfg(test)]
-                    if should_probe_direct_put_commit(authorized.bucket()) {
+                    if self.should_probe_direct_put_commit(authorized.bucket()) {
                         let object_pg_ready = match storage_node
                             .try_probe_object_pg_available(
                                 authorized.bucket_typed(),
@@ -418,7 +413,7 @@ impl Coordinator {
                             request,
                         )?;
                     #[cfg(test)]
-                    maybe_run_bucket_write_handle_loaded_hook(
+                    self.maybe_run_bucket_write_handle_loaded_hook(
                         req.object.bucket.name_typed().as_str(),
                     );
                     let authorized_write = self.authorize_put_object_write_with_existing_object(
@@ -694,7 +689,7 @@ impl Coordinator {
                 let resolved_object_lock =
                     Self::resolve_new_object_lock_state(&bucket_info, req.requested_object_lock)?;
                 #[cfg(test)]
-                if should_probe_finalize_stream_put_commit(req.object.bucket_name()) {
+                if self.should_probe_finalize_stream_put_commit(req.object.bucket_name()) {
                     let object_pg_ready = storage_node
                         .try_probe_object_pg_available(
                             req.object.bucket_name_typed(),

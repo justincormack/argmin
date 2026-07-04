@@ -24,8 +24,8 @@ pub use helpers::{
     send_signed_request_to_endpoint_for_service_with_credentials,
     send_signed_request_with_credentials, send_signed_request_with_unsigned_headers,
     send_signed_request_without_host_signed_header, sse_c_header_values, test_sse_c_key,
-    unique_bucket, wait_for_versioned_writes_visible, PresignedRequest, RawResponse,
-    SendRetryingOperationAborted, SignedRequestCredentials,
+    unique_account_regional_bucket, unique_bucket, wait_for_versioned_writes_visible,
+    PresignedRequest, RawResponse, SendRetryingOperationAborted, SignedRequestCredentials,
 };
 pub use post_form::{
     post_object_raw_to_test_endpoint_with_headers, post_object_to_test_endpoint,

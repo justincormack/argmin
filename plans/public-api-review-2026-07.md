@@ -393,13 +393,17 @@ sweeps so the next drift is a compile error.
   using that type from both header/presigned request auth and POST Object auth.
   This keeps S3 bucket-routing policy in server-http while making the auth API
   explicit.
-- [ ] Deferred bucket-region validation is AWS-visible and separate from the
+- [x] Deferred bucket-region validation is AWS-visible and separate from the
   auth API shape: server-http passes deferred scope for bucket-named
   operations, then relies on `enforce_bucket_region`, which returns `Ok(())`
-  for missing buckets (`server-http/src/http/mod.rs:3177, 3191-3209`). AWS-pin
-  existing-bucket vs missing-bucket behavior for header, presigned, and POST
-  auth before changing this path; A8 already pins the per-auth-family error
-  shape for wrong scope.
+  for missing buckets (`server-http/src/http/mod.rs:3177, 3191-3209`). A8
+  already pinned existing-bucket wrong-region behavior for header, presigned,
+  and POST auth. Completed by adding account-regional missing-bucket AWS oracle
+  coverage for header and presigned auth: AWS still validates the
+  credential-scope region before bucket lookup, returning the auth-family
+  wrong-region error rather than `NoSuchBucket`. POST Object is not on the
+  deferred request-auth path; it still validates against the endpoint signing
+  region during POST authentication.
 - [ ] `route_map_valid_until_ms: Option<u64>` is fail-open — `None` means
   valid forever (`storage/src/storage_node_server.rs:411-427`, mirrored
   cluster.rs:3872-3878). Fix: required deadline or

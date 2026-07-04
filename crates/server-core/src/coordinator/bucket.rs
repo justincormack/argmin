@@ -9,10 +9,7 @@ use storage::{
 };
 
 #[cfg(test)]
-use super::{
-    maybe_run_bucket_mutation_storage_node_capture_hook, should_probe_bucket_mutation_write,
-    trusted_bucket_name,
-};
+use super::trusted_bucket_name;
 use super::{
     AuthorizedDeleteBucket, AuthorizedHeadBucket, AuthorizedListBuckets, AuthorizedPutBucketAcl,
     BucketCreateOutcome, BucketRequest, BucketSummary, BucketTagControlRequest, Coordinator,
@@ -1024,11 +1021,11 @@ impl Coordinator {
         );
         let storage_node = self.storage_node();
         #[cfg(test)]
-        maybe_run_bucket_mutation_storage_node_capture_hook(req.bucket.name.as_str());
+        self.maybe_run_bucket_mutation_storage_node_capture_hook(req.bucket.name.as_str());
         let authorized =
             self.authorize_put_bucket_lifecycle_with_storage_node(&storage_node, req)?;
         #[cfg(test)]
-        if should_probe_bucket_mutation_write(authorized.bucket.as_str()) {
+        if self.should_probe_bucket_mutation_write(authorized.bucket.as_str()) {
             let bucket_pg_ready = storage_node
                 .try_probe_bucket_pg_available(&authorized.bucket)
                 .map_err(Self::map_bucket_snapshot_load_error)?;
@@ -1241,7 +1238,7 @@ impl Coordinator {
         authorized: &AuthorizedPutBucketAcl,
     ) -> Result<(), ServerError> {
         #[cfg(test)]
-        if should_probe_bucket_mutation_write(authorized.bucket.as_str()) {
+        if self.should_probe_bucket_mutation_write(authorized.bucket.as_str()) {
             let bucket_pg_ready = storage_node
                 .try_probe_bucket_pg_available(&authorized.bucket)
                 .map_err(Self::map_bucket_snapshot_load_error)?;

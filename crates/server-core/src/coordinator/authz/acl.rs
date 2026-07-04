@@ -153,7 +153,7 @@ impl Coordinator {
         let bucket_policy = self.cached_bucket_policy_for_loaded_handle(&bucket_handle)?;
         let bucket_tags = Self::loaded_bucket_tags_for_policy(&bucket_handle)?;
         #[cfg(test)]
-        if should_probe_delete_object_lookup(bucket.as_str()) {
+        if self.should_probe_delete_object_lookup(bucket.as_str()) {
             let object_pg_ready = storage_node
                 .try_probe_object_pg_available(bucket, key)
                 .map_err(Self::map_object_pg_action_error)?;
@@ -914,7 +914,7 @@ impl Coordinator {
             req.version_id,
         )?;
         #[cfg(test)]
-        if should_probe_object_read_snapshot(bucket.bucket().name.as_str()) {
+        if self.should_probe_object_read_snapshot(bucket.bucket().name.as_str()) {
             let object_pg_ready = storage_node
                 .try_probe_object_pg_available(&bucket.bucket().name, req.key)
                 .map_err(|error| {

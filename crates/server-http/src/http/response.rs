@@ -280,6 +280,7 @@ fn client_error_message(err: &ServerError) -> String {
         ServerError::WrongRegion {
             provided_region,
             expected_region,
+            ..
         } => format!(
             "The authorization header is malformed; the region '{provided_region}' is wrong; expecting '{expected_region}'"
         ),
@@ -664,7 +665,9 @@ impl S3Response {
                 Self::new(400).chunked_xml_body(body)
             }
             ServerError::WrongRegion {
-                expected_region, ..
+                expected_region,
+                bucket_region_header,
+                ..
             } => {
                 let body = xml::error_xml_with_region(
                     "AuthorizationHeaderMalformed",
@@ -673,9 +676,11 @@ impl S3Response {
                     host_id,
                     expected_region,
                 );
-                Self::new(400)
-                    .header("x-amz-bucket-region", expected_region)
-                    .chunked_xml_body(body)
+                let mut response = Self::new(400);
+                if *bucket_region_header {
+                    response = response.header("x-amz-bucket-region", expected_region);
+                }
+                response.chunked_xml_body(body)
             }
             ServerError::InvalidBucketNamespace {
                 bucket_namespace, ..
@@ -3191,6 +3196,7 @@ mod tests {
         let err = ServerError::WrongRegion {
             provided_region: "us-east-1".to_string(),
             expected_region: "us-west-2".to_string(),
+            bucket_region_header: true,
         };
         let resp = S3Response::error(&err, "/bucket/key", TEST_HOST_ID);
         assert_eq!(resp.status_code, 400);

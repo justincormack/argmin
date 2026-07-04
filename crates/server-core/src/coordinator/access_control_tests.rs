@@ -12,9 +12,10 @@ enum SamePgProgressEvent {
     CompletedEarly,
 }
 
-fn run_same_pg_bucket_write_handle_progress_test<T: Send + 'static>(
+fn run_same_pg_bucket_write_handle_progress_test<T: Send>(
+    coord: &Coordinator,
     bucket: &str,
-    action: impl FnOnce() -> T + Send + 'static,
+    action: impl FnOnce() -> T + Send,
 ) -> T {
     let _serial = BUCKET_WRITE_HANDLE_TEST_SERIAL
         .get_or_init(|| Mutex::new(()))
@@ -24,7 +25,7 @@ fn run_same_pg_bucket_write_handle_progress_test<T: Send + 'static>(
     let progress_seen = Arc::new(AtomicBool::new(false));
     let event_tx_hook = event_tx.clone();
     let progress_seen_hook = Arc::clone(&progress_seen);
-    let _hook_guard = install_bucket_write_handle_test_hooks(BucketWriteHandleTestHooks {
+    let _hook_guard = coord.install_bucket_write_handle_test_hooks(BucketWriteHandleTestHooks {
         bucket: Some(bucket.to_string()),
         after_loaded: Some(Arc::new(move || {
             progress_seen_hook.store(true, Ordering::SeqCst);
@@ -35,21 +36,24 @@ fn run_same_pg_bucket_write_handle_progress_test<T: Send + 'static>(
     let (tx, rx) = mpsc::channel();
     let event_tx_complete = event_tx.clone();
     let progress_seen_complete = Arc::clone(&progress_seen);
-    let handle = thread::spawn(move || {
-        let res = action();
-        if !progress_seen_complete.load(Ordering::SeqCst) {
-            let _ = event_tx_complete.send(SamePgProgressEvent::CompletedEarly);
-        }
-        tx.send(res).unwrap();
-    });
+    thread::scope(|scope| {
+        let handle = scope.spawn(move || {
+            let res = action();
+            if !progress_seen_complete.load(Ordering::SeqCst) {
+                let _ = event_tx_complete.send(SamePgProgressEvent::CompletedEarly);
+            }
+            tx.send(res).unwrap();
+        });
 
-    assert_eq!(event_rx.recv().unwrap(), SamePgProgressEvent::Progress);
-    let res = rx.recv().unwrap();
-    handle.join().unwrap();
-    res
+        assert_eq!(event_rx.recv().unwrap(), SamePgProgressEvent::Progress);
+        let res = rx.recv().unwrap();
+        handle.join().unwrap();
+        res
+    })
 }
 
 fn run_same_pg_probe_test<T>(
+    coord: &Coordinator,
     bucket: &str,
     mut hooks: BucketWriteHandleTestHooks,
     action: impl FnOnce() -> T,
@@ -59,7 +63,7 @@ fn run_same_pg_probe_test<T>(
         .lock()
         .unwrap();
     hooks.bucket = Some(bucket.to_string());
-    let _hook_guard = install_bucket_write_handle_test_hooks(hooks);
+    let _hook_guard = coord.install_bucket_write_handle_test_hooks(hooks);
     action()
 }
 
@@ -3898,12 +3902,13 @@ fn put_object_bucket_lifecycle_same_pg_completes_without_deadlock() {
     .unwrap();
 
     let version_id = run_same_pg_probe_test(
+        &coord,
         bucket,
         BucketWriteHandleTestHooks {
             probe_direct_put_commit: true,
             ..BucketWriteHandleTestHooks::default()
         },
-        move || {
+        || {
             test_helpers::put_object(
                 &coord,
                 &PutObjectRequest {
@@ -3949,12 +3954,13 @@ fn put_object_bucket_policy_same_pg_completes_without_deadlock() {
     .unwrap();
 
     let version_id = run_same_pg_probe_test(
+        &coord,
         bucket,
         BucketWriteHandleTestHooks {
             probe_direct_put_commit: true,
             ..BucketWriteHandleTestHooks::default()
         },
-        move || {
+        || {
             test_helpers::put_object(
                 &coord,
                 &PutObjectRequest {
@@ -4006,7 +4012,7 @@ fn create_multipart_upload_bucket_lifecycle_same_pg_completes_without_deadlock()
     )
     .unwrap();
 
-    let has_abort_header = run_same_pg_bucket_write_handle_progress_test(bucket, move || {
+    let has_abort_header = run_same_pg_bucket_write_handle_progress_test(&coord, bucket, || {
         coord
             .create_multipart_upload(&CreateMultipartUploadRequest {
                 object: object_request_with_expected_owner(
@@ -4087,12 +4093,13 @@ fn begin_stream_part_bucket_policy_and_abac_same_pg_completes_without_deadlock()
         .unwrap();
 
     let checksum_algorithm = run_same_pg_probe_test(
+        &coord,
         bucket,
         BucketWriteHandleTestHooks {
             probe_begin_stream_part_session: true,
             ..BucketWriteHandleTestHooks::default()
         },
-        move || {
+        || {
             coord
                 .begin_stream_part(&BeginStreamPartRequest {
                     upload: multipart_object_request_with_expected_owner(
@@ -4142,12 +4149,13 @@ fn finalize_stream_part_reupload_same_pg_completes_without_deadlock() {
         .unwrap();
 
     let (etag_a, etag_b) = run_same_pg_probe_test(
+        &coord,
         bucket,
         BucketWriteHandleTestHooks {
             probe_finalize_stream_part_commit: true,
             ..BucketWriteHandleTestHooks::default()
         },
-        move || -> Result<(String, String), ServerError> {
+        || -> Result<(String, String), ServerError> {
             let session_a = coord
                 .begin_stream_part(&BeginStreamPartRequest {
                     upload: multipart_object_request_with_expected_owner(
@@ -4256,7 +4264,7 @@ fn begin_stream_put_bucket_policy_and_abac_same_pg_completes_without_deadlock() 
     )
     .unwrap();
 
-    let session_id = run_same_pg_bucket_write_handle_progress_test(bucket, move || {
+    let session_id = run_same_pg_bucket_write_handle_progress_test(&coord, bucket, || {
         coord
             .begin_stream_put(&AuthorizePutObjectRequest {
                 object: object_request_with_expected_owner(
@@ -4322,12 +4330,13 @@ fn finalize_stream_put_bucket_lifecycle_same_pg_completes_without_deadlock() {
         .unwrap();
 
     let version_id = run_same_pg_probe_test(
+        &coord,
         bucket,
         BucketWriteHandleTestHooks {
             probe_finalize_stream_put_commit: true,
             ..BucketWriteHandleTestHooks::default()
         },
-        move || {
+        || {
             coord
                 .finalize_stream_put(&FinalizeStreamPutRequest {
                     object: object_request(bucket, "logs/key", test_helpers::requester("owner-a")),
@@ -4368,12 +4377,13 @@ fn put_bucket_lifecycle_bucket_policy_same_pg_completes_without_deadlock() {
     .unwrap();
 
     run_same_pg_probe_test(
+        &coord,
         bucket,
         BucketWriteHandleTestHooks {
             probe_bucket_mutation_write: true,
             ..BucketWriteHandleTestHooks::default()
         },
-        move || {
+        || {
             put_bucket_lifecycle_test(
                 &coord,
                 bucket,
@@ -4411,12 +4421,13 @@ fn put_bucket_acl_bucket_policy_same_pg_completes_without_deadlock() {
     .unwrap();
 
     run_same_pg_probe_test(
+        &coord,
         bucket,
         BucketWriteHandleTestHooks {
             probe_bucket_mutation_write: true,
             ..BucketWriteHandleTestHooks::default()
         },
-        move || {
+        || {
             coord.put_bucket_acl(&PutBucketAclRequest {
                 bucket: bucket_request_with_expected_owner(
                     bucket,
@@ -4471,12 +4482,13 @@ fn get_object_bucket_policy_same_pg_completes_without_deadlock() {
     .unwrap();
 
     let body = run_same_pg_probe_test(
+        &reader,
         bucket,
         BucketWriteHandleTestHooks {
             probe_object_read_snapshot: true,
             ..BucketWriteHandleTestHooks::default()
         },
-        move || {
+        || {
             reader
                 .get_object(&GetObjectRequest {
                     sse_customer: None,
@@ -4537,12 +4549,13 @@ fn get_object_tagging_bucket_policy_same_pg_completes_without_deadlock() {
     .unwrap();
 
     let tags = run_same_pg_probe_test(
+        &reader,
         bucket,
         BucketWriteHandleTestHooks {
             probe_object_metadata_access: true,
             ..BucketWriteHandleTestHooks::default()
         },
-        move || {
+        || {
             get_object_tags_test(
                 &reader,
                 bucket,
@@ -4598,12 +4611,13 @@ fn put_object_tagging_bucket_policy_same_pg_completes_without_deadlock() {
     .unwrap();
 
     run_same_pg_probe_test(
+        &coord,
         bucket,
         BucketWriteHandleTestHooks {
             probe_object_metadata_access: true,
             ..BucketWriteHandleTestHooks::default()
         },
-        move || {
+        || {
             put_object_tags_test(
                 &coord,
                 bucket,
@@ -4682,12 +4696,13 @@ fn get_object_retention_bucket_policy_same_pg_completes_without_deadlock() {
     .unwrap();
 
     let fetched = run_same_pg_probe_test(
+        &reader,
         bucket,
         BucketWriteHandleTestHooks {
             probe_object_metadata_access: true,
             ..BucketWriteHandleTestHooks::default()
         },
-        move || {
+        || {
             get_object_retention_test(
                 &reader,
                 bucket,
@@ -4762,12 +4777,13 @@ fn delete_object_object_lock_bucket_policy_same_pg_completes_without_deadlock() 
         .unwrap();
 
     let err = run_same_pg_probe_test(
+        &deleter,
         bucket,
         BucketWriteHandleTestHooks {
             probe_delete_object_lookup: true,
             ..BucketWriteHandleTestHooks::default()
         },
-        move || {
+        || {
             deleter.delete_object(&DeleteObjectRequest {
                 object: object_version_request_with_expected_owner(
                     bucket,

@@ -81,6 +81,24 @@ pub fn unique_bucket() -> String {
     format!("{}{pid}-{:016x}-{n}", bucket_prefix(), *BUCKET_NAMESPACE)
 }
 
+/// Generate a unique account-regional bucket name for this account and region.
+///
+/// The bucket is not created. Tests use this for AWS-facing missing-bucket
+/// probes where a global namespace collision would make the oracle flaky.
+pub fn unique_account_regional_bucket() -> String {
+    let n = BUCKET_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let suffix = format!("-{}-{}-an", CTX.account_id(), CTX.region());
+    let max_prefix_len = 63usize
+        .checked_sub(suffix.len())
+        .expect("account-regional bucket suffix must fit in S3 bucket name length");
+    let prefix = format!("{}ar{:016x}{n:x}", bucket_prefix(), *BUCKET_NAMESPACE);
+    assert!(
+        prefix.len() <= max_prefix_len,
+        "S3_TEST_BUCKET_PREFIX is too long for account-regional test bucket names: prefix {prefix:?}, suffix {suffix:?}"
+    );
+    format!("{prefix}{suffix}")
+}
+
 /// Configure bucket-level Public Access Block to allow public ACL and policy tests.
 ///
 /// This only affects the bucket-level setting. Account-level or org-level block

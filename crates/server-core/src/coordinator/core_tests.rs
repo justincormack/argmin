@@ -726,7 +726,7 @@ fn object_metadata_pins_runtime_map_after_policy_context_load() {
         .get_or_init(|| Mutex::new(()))
         .lock()
         .unwrap();
-    let _hook_guard = install_bucket_write_handle_test_hooks(BucketWriteHandleTestHooks {
+    let _hook_guard = coord.install_bucket_write_handle_test_hooks(BucketWriteHandleTestHooks {
         bucket: Some("bucket".to_string()),
         after_object_metadata_policy_context: Some(Arc::new(move || {
             hook_handle.install(Arc::clone(&candidate)).unwrap();
@@ -796,7 +796,7 @@ fn delete_object_pins_runtime_map_after_authorization() {
         .get_or_init(|| Mutex::new(()))
         .lock()
         .unwrap();
-    let _hook_guard = install_bucket_write_handle_test_hooks(BucketWriteHandleTestHooks {
+    let _hook_guard = coord.install_bucket_write_handle_test_hooks(BucketWriteHandleTestHooks {
         bucket: Some("bucket".to_string()),
         after_loaded: Some(Arc::new(move || {
             hook_handle.install(Arc::clone(&candidate)).unwrap();
@@ -857,7 +857,7 @@ fn delete_bucket_pins_runtime_map_after_authorization() {
         .get_or_init(|| Mutex::new(()))
         .lock()
         .unwrap();
-    let _hook_guard = install_bucket_write_handle_test_hooks(BucketWriteHandleTestHooks {
+    let _hook_guard = coord.install_bucket_write_handle_test_hooks(BucketWriteHandleTestHooks {
         bucket: Some("bucket".to_string()),
         after_loaded: Some(Arc::new(move || {
             hook_handle.install(Arc::clone(&candidate)).unwrap();
@@ -1537,7 +1537,7 @@ fn bucket_subresource_write_pins_runtime_map_after_authorization() {
         .get_or_init(|| Mutex::new(()))
         .lock()
         .unwrap();
-    let _hook_guard = install_bucket_write_handle_test_hooks(BucketWriteHandleTestHooks {
+    let _hook_guard = coord.install_bucket_write_handle_test_hooks(BucketWriteHandleTestHooks {
         bucket: Some("bucket".to_string()),
         after_loaded: Some(Arc::new(move || {
             hook_handle.install(Arc::clone(&candidate)).unwrap();
@@ -1585,7 +1585,7 @@ fn bucket_subresource_write_pins_runtime_map_before_authorization() {
         .get_or_init(|| Mutex::new(()))
         .lock()
         .unwrap();
-    let _hook_guard = install_bucket_write_handle_test_hooks(BucketWriteHandleTestHooks {
+    let _hook_guard = coord.install_bucket_write_handle_test_hooks(BucketWriteHandleTestHooks {
         bucket: Some("bucket".to_string()),
         after_bucket_mutation_storage_node_capture: Some(Arc::new(move || {
             hook_handle.install(Arc::clone(&candidate)).unwrap();
@@ -1716,7 +1716,7 @@ fn put_object_pins_runtime_map_after_bucket_write_reservation() {
         .get_or_init(|| Mutex::new(()))
         .lock()
         .unwrap();
-    let _hook_guard = install_bucket_write_handle_test_hooks(BucketWriteHandleTestHooks {
+    let _hook_guard = coord.install_bucket_write_handle_test_hooks(BucketWriteHandleTestHooks {
         bucket: Some(bucket.to_string()),
         after_loaded: Some(Arc::new(move || {
             hook_handle.install(Arc::clone(&candidate)).unwrap();
@@ -4380,7 +4380,7 @@ fn large_put_object_pins_runtime_map_after_stream_session_create() {
         .get_or_init(|| Mutex::new(()))
         .lock()
         .unwrap();
-    let _hook_guard = install_bucket_write_handle_test_hooks(BucketWriteHandleTestHooks {
+    let _hook_guard = coord.install_bucket_write_handle_test_hooks(BucketWriteHandleTestHooks {
         bucket: Some(bucket.to_string()),
         after_loaded: Some(Arc::new(move || {
             hook_handle.install(Arc::clone(&candidate)).unwrap();
@@ -4467,13 +4467,14 @@ fn streaming_upload_part_pins_runtime_map_after_session_create() {
         .lock()
         .unwrap();
     let session = {
-        let _hook_guard = install_bucket_write_handle_test_hooks(BucketWriteHandleTestHooks {
-            bucket: Some(bucket.to_string()),
-            after_loaded: Some(Arc::new(move || {
-                hook_handle.install(Arc::clone(&candidate)).unwrap();
-            })),
-            ..BucketWriteHandleTestHooks::default()
-        });
+        let _hook_guard =
+            coord.install_bucket_write_handle_test_hooks(BucketWriteHandleTestHooks {
+                bucket: Some(bucket.to_string()),
+                after_loaded: Some(Arc::new(move || {
+                    hook_handle.install(Arc::clone(&candidate)).unwrap();
+                })),
+                ..BucketWriteHandleTestHooks::default()
+            });
 
         coord
             .begin_stream_part_with_storage_node(
@@ -9372,7 +9373,7 @@ fn put_object_does_not_wait_for_bucket_lock() {
         ..BucketScopedTestHooks::default()
     });
     let _write_handle_hook_guard =
-        install_bucket_write_handle_test_hooks(BucketWriteHandleTestHooks {
+        writer.install_bucket_write_handle_test_hooks(BucketWriteHandleTestHooks {
             bucket: Some(bucket.to_string()),
             after_loaded: Some(Arc::new(move || {
                 let _ = event_tx.send(LockWaitEvent::Progress);
@@ -9445,7 +9446,7 @@ fn create_multipart_upload_does_not_wait_for_bucket_lock() {
         ..BucketScopedTestHooks::default()
     });
     let _write_handle_hook_guard =
-        install_bucket_write_handle_test_hooks(BucketWriteHandleTestHooks {
+        creator.install_bucket_write_handle_test_hooks(BucketWriteHandleTestHooks {
             bucket: Some(bucket.to_string()),
             after_loaded: Some(Arc::new(move || {
                 let _ = event_tx.send(LockWaitEvent::Progress);
@@ -12282,7 +12283,7 @@ fn complete_multipart_upload_does_not_wait_for_bucket_lock() {
         ..BucketScopedTestHooks::default()
     });
     let _write_handle_hook_guard =
-        install_bucket_write_handle_test_hooks(BucketWriteHandleTestHooks {
+        completer.install_bucket_write_handle_test_hooks(BucketWriteHandleTestHooks {
             bucket: Some(bucket.to_string()),
             after_loaded: Some(Arc::new(move || {
                 let _ = event_tx.send(LockWaitEvent::Progress);

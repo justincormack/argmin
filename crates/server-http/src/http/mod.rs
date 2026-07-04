@@ -3172,13 +3172,11 @@ impl HttpFrontend {
         if signing_region == self.coordinator.region() {
             return Ok(());
         }
-        if !self.coordinator.bucket_exists(bucket)? {
-            return Ok(());
-        }
         match auth.mode {
             AuthMode::HeaderSigV4 => Err(ServerError::WrongRegion {
                 provided_region: signing_region.to_string(),
                 expected_region: self.coordinator.region().to_string(),
+                bucket_region_header: self.coordinator.bucket_exists(bucket)?,
             }),
             AuthMode::PresignedSigV4 => Err(ServerError::Auth(
                 auth::AuthError::InvalidQueryCredentialRegion {
@@ -6512,16 +6510,18 @@ mod tests {
             Err(ServerError::WrongRegion {
                 provided_region,
                 expected_region,
+                bucket_region_header,
             }) => {
                 assert_eq!(provided_region, "us-west-2");
                 assert_eq!(expected_region, "us-east-1");
+                assert!(bucket_region_header);
             }
             other => panic!("expected WrongRegion, got {other:?}"),
         }
     }
 
     #[test]
-    fn bucket_region_mismatch_is_ignored_for_missing_bucket() {
+    fn bucket_region_mismatch_returns_wrong_region_without_header_for_missing_bucket() {
         let tmp = test_util::tempdir();
         let fe = setup_frontend(tmp.path());
 
@@ -6535,14 +6535,24 @@ mod tests {
             streaming: None,
         };
 
-        fe.enforce_bucket_region_for_operation(
+        match fe.enforce_bucket_region_for_operation(
             &S3Operation::PutObject {
                 bucket: test_bucket_name("missing"),
                 key: "key".to_string(),
             },
             &auth,
-        )
-        .unwrap();
+        ) {
+            Err(ServerError::WrongRegion {
+                provided_region,
+                expected_region,
+                bucket_region_header,
+            }) => {
+                assert_eq!(provided_region, "us-west-2");
+                assert_eq!(expected_region, "us-east-1");
+                assert!(!bucket_region_header);
+            }
+            other => panic!("expected WrongRegion, got {other:?}"),
+        }
     }
 
     #[test]

@@ -8,7 +8,7 @@ use s3_tests::{
     create_public_bucket, object_url, presign_url_with_credentials,
     presign_url_without_host_signed_header, send_signed_request_with_unsigned_headers,
     send_signed_request_without_host_signed_header, sse_c_header_values, test_sse_c_key,
-    unique_bucket, PresignedRequest, SignedRequestCredentials, CTX,
+    unique_account_regional_bucket, unique_bucket, PresignedRequest, SignedRequestCredentials, CTX,
 };
 
 const NO_HEADERS: [(&str, &str); 0] = [];
@@ -685,6 +685,56 @@ fn test_presigned_sigv4_wrong_region_scope_returns_query_parameters_error() {
         );
 
         cleanup(&bucket, &[]).await;
+    });
+}
+
+#[test]
+fn test_presigned_sigv4_missing_account_regional_bucket_wrong_region_returns_query_parameters_error(
+) {
+    s3_tests::run(async {
+        let bucket = unique_account_regional_bucket();
+        let wrong_region = if CTX.region() == "us-east-1" {
+            "us-west-2"
+        } else {
+            "us-east-1"
+        };
+        let presigned =
+            presign_object_with_credential_scope("GET", &bucket, "missing-key", wrong_region, "s3");
+
+        let mut response = agent().get(&presigned).call().expect("transport error");
+        let status = response.status().as_u16();
+        let bucket_region = response
+            .headers()
+            .get("x-amz-bucket-region")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
+        let body = response.body_mut().read_to_string().unwrap();
+
+        assert_eq!(status, 400, "expected 400, got {status}: {body}");
+        assert!(
+            body.contains("<Code>AuthorizationQueryParametersError</Code>"),
+            "expected AuthorizationQueryParametersError response, got: {body}"
+        );
+        assert_eq!(bucket_region.as_deref(), None);
+        assert!(
+            body.contains(&format!(
+                "<Message>Error parsing the X-Amz-Credential parameter; the region '{wrong_region}' is wrong; expecting '{}'</Message>",
+                CTX.region()
+            )),
+            "expected wrong-region credential message, got: {body}"
+        );
+        assert!(
+            body.contains(&format!("<Region>{}</Region>", CTX.region())),
+            "expected Region element, got: {body}"
+        );
+        assert!(
+            body.contains("<RequestId>") && body.contains("<HostId>"),
+            "expected RequestId and HostId, got: {body}"
+        );
+        assert!(
+            !body.contains("<Resource>"),
+            "did not expect Resource element, got: {body}"
+        );
     });
 }
 

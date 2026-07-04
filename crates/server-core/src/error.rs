@@ -48,6 +48,7 @@ pub enum ServerError {
     WrongRegion {
         provided_region: String,
         expected_region: String,
+        bucket_region_header: bool,
     },
 
     #[error("invalid request: {reason}")]
@@ -997,6 +998,7 @@ mod tests {
         let err = ServerError::WrongRegion {
             provided_region: "us-east-1".to_string(),
             expected_region: "us-west-2".to_string(),
+            bucket_region_header: true,
         };
         assert_eq!(err.s3_error_code(), "AuthorizationHeaderMalformed");
     }
@@ -1045,6 +1047,7 @@ mod tests {
             ServerError::WrongRegion {
                 provided_region: "us-east-1".to_string(),
                 expected_region: "us-west-2".to_string(),
+                bucket_region_header: true,
             }
             .http_status(),
             400

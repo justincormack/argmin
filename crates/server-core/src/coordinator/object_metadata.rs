@@ -5,8 +5,6 @@ use s3_types::{
 use storage::{BucketName, ObjectKey, ObjectLockState, StorageCluster};
 
 use super::authz::BucketPolicyAccess;
-#[cfg(test)]
-use super::{maybe_run_object_metadata_policy_context_hook, should_probe_object_metadata_access};
 use super::{
     BucketSummary, Coordinator, GetObjectAclResult, ObjectVersionRequest, PutObjectAclInput,
     PutObjectAclRequest, PutObjectLegalHoldRequest, PutObjectRetentionRequest,
@@ -45,7 +43,7 @@ impl Coordinator {
             bucket_tags,
         };
         #[cfg(test)]
-        maybe_run_object_metadata_policy_context_hook(bucket.as_str());
+        self.maybe_run_object_metadata_policy_context_hook(bucket.as_str());
         Ok(context)
     }
 
@@ -297,7 +295,7 @@ impl Coordinator {
         let can_discover_missing =
             Self::requester_can_bucket_owner_account_admin(req.object.requester(), &bucket_info);
         #[cfg(test)]
-        if should_probe_object_metadata_access(bucket.as_str()) {
+        if self.should_probe_object_metadata_access(bucket.as_str()) {
             let object_pg_ready = storage_node
                 .try_probe_object_pg_available(bucket, key)
                 .map_err(|error| {
@@ -451,7 +449,7 @@ impl Coordinator {
         let can_discover_missing =
             Self::requester_can_bucket_owner_account_admin(req.object.requester(), &bucket_info);
         #[cfg(test)]
-        if should_probe_object_metadata_access(bucket.as_str()) {
+        if self.should_probe_object_metadata_access(bucket.as_str()) {
             let object_pg_ready = storage_node
                 .try_probe_object_pg_available(bucket, key)
                 .map_err(|error| {
@@ -632,7 +630,7 @@ impl Coordinator {
         let can_discover_missing =
             Self::requester_can_bucket_owner_account_admin(req.object.requester(), &bucket_info);
         #[cfg(test)]
-        if should_probe_object_metadata_access(bucket.as_str()) {
+        if self.should_probe_object_metadata_access(bucket.as_str()) {
             let object_pg_ready = storage_node
                 .try_probe_object_pg_available(bucket, key)
                 .map_err(|error| {

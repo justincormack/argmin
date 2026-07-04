@@ -118,8 +118,6 @@ pub(super) struct BucketWriteHandleTestHooks {
     pub(super) probe_delete_object_lookup: bool,
 }
 
-pub(super) static BUCKET_WRITE_HANDLE_TEST_HOOKS: OnceLock<Mutex<BucketWriteHandleTestHooks>> =
-    OnceLock::new();
 pub(super) static BUCKET_WRITE_HANDLE_TEST_SERIAL: OnceLock<Mutex<()>> = OnceLock::new();
 
 #[derive(Default, Clone)]
@@ -167,7 +165,9 @@ pub(super) struct BucketPolicyLoadTestHookGuard;
 
 pub(super) struct BucketFastPathIdentityLoadErrorTestHookGuard;
 
-pub(super) struct BucketWriteHandleTestHookGuard;
+pub(super) struct BucketWriteHandleTestHookGuard {
+    hooks: Arc<Mutex<BucketWriteHandleTestHooks>>,
+}
 
 pub(super) struct ListObjectsTestHookGuard;
 
@@ -189,9 +189,7 @@ impl Drop for BucketPolicyLoadTestHookGuard {
 
 impl Drop for BucketWriteHandleTestHookGuard {
     fn drop(&mut self) {
-        let hooks = BUCKET_WRITE_HANDLE_TEST_HOOKS
-            .get_or_init(|| Mutex::new(BucketWriteHandleTestHooks::default()));
-        *hooks.lock().unwrap() = BucketWriteHandleTestHooks::default();
+        *self.hooks.lock().unwrap() = BucketWriteHandleTestHooks::default();
     }
 }
 
@@ -256,13 +254,20 @@ pub(super) fn install_bucket_fast_path_identity_load_error_test_hook(
     BucketFastPathIdentityLoadErrorTestHookGuard
 }
 
-pub(super) fn install_bucket_write_handle_test_hooks(
-    hooks: BucketWriteHandleTestHooks,
-) -> BucketWriteHandleTestHookGuard {
-    let slot = BUCKET_WRITE_HANDLE_TEST_HOOKS
-        .get_or_init(|| Mutex::new(BucketWriteHandleTestHooks::default()));
-    *slot.lock().unwrap() = hooks;
-    BucketWriteHandleTestHookGuard
+impl Coordinator {
+    pub(super) fn install_bucket_write_handle_test_hooks(
+        &self,
+        hooks: BucketWriteHandleTestHooks,
+    ) -> BucketWriteHandleTestHookGuard {
+        *self
+            .shared_caches
+            .bucket_write_handle_test_hooks
+            .lock()
+            .unwrap() = hooks;
+        BucketWriteHandleTestHookGuard {
+            hooks: Arc::clone(&self.shared_caches.bucket_write_handle_test_hooks),
+        }
+    }
 }
 
 pub(super) fn install_list_objects_test_hooks(
@@ -528,41 +533,46 @@ pub(super) fn should_fail_bucket_fast_path_identity_load(bucket: &str) -> bool {
         .is_some_and(|target| target == bucket)
 }
 
-pub(super) fn maybe_run_bucket_write_handle_loaded_hook(bucket: &str) {
-    let hooks = BUCKET_WRITE_HANDLE_TEST_HOOKS
-        .get_or_init(|| Mutex::new(BucketWriteHandleTestHooks::default()))
-        .lock()
-        .unwrap()
-        .clone();
-    if hooks.bucket.as_ref().is_some_and(|target| target == bucket) {
-        if let Some(hook) = hooks.after_loaded {
-            hook();
+impl Coordinator {
+    pub(super) fn maybe_run_bucket_write_handle_loaded_hook(&self, bucket: &str) {
+        let hooks = self
+            .shared_caches
+            .bucket_write_handle_test_hooks
+            .lock()
+            .unwrap()
+            .clone();
+        if hooks.bucket.as_ref().is_some_and(|target| target == bucket) {
+            if let Some(hook) = hooks.after_loaded {
+                hook();
+            }
         }
     }
-}
 
-pub(super) fn maybe_run_bucket_mutation_storage_node_capture_hook(bucket: &str) {
-    let hooks = BUCKET_WRITE_HANDLE_TEST_HOOKS
-        .get_or_init(|| Mutex::new(BucketWriteHandleTestHooks::default()))
-        .lock()
-        .unwrap()
-        .clone();
-    if hooks.bucket.as_ref().is_some_and(|target| target == bucket) {
-        if let Some(hook) = hooks.after_bucket_mutation_storage_node_capture {
-            hook();
+    pub(super) fn maybe_run_bucket_mutation_storage_node_capture_hook(&self, bucket: &str) {
+        let hooks = self
+            .shared_caches
+            .bucket_write_handle_test_hooks
+            .lock()
+            .unwrap()
+            .clone();
+        if hooks.bucket.as_ref().is_some_and(|target| target == bucket) {
+            if let Some(hook) = hooks.after_bucket_mutation_storage_node_capture {
+                hook();
+            }
         }
     }
-}
 
-pub(super) fn maybe_run_object_metadata_policy_context_hook(bucket: &str) {
-    let hooks = BUCKET_WRITE_HANDLE_TEST_HOOKS
-        .get_or_init(|| Mutex::new(BucketWriteHandleTestHooks::default()))
-        .lock()
-        .unwrap()
-        .clone();
-    if hooks.bucket.as_ref().is_some_and(|target| target == bucket) {
-        if let Some(hook) = hooks.after_object_metadata_policy_context {
-            hook();
+    pub(super) fn maybe_run_object_metadata_policy_context_hook(&self, bucket: &str) {
+        let hooks = self
+            .shared_caches
+            .bucket_write_handle_test_hooks
+            .lock()
+            .unwrap()
+            .clone();
+        if hooks.bucket.as_ref().is_some_and(|target| target == bucket) {
+            if let Some(hook) = hooks.after_object_metadata_policy_context {
+                hook();
+            }
         }
     }
 }
@@ -580,49 +590,60 @@ pub(super) fn maybe_run_list_objects_before_storage_hook(bucket: &str) {
     }
 }
 
-fn bucket_write_handle_test_hooks_for(bucket: &str) -> BucketWriteHandleTestHooks {
-    let hooks = BUCKET_WRITE_HANDLE_TEST_HOOKS
-        .get_or_init(|| Mutex::new(BucketWriteHandleTestHooks::default()))
-        .lock()
-        .unwrap()
-        .clone();
-    if hooks.bucket.as_ref().is_some_and(|target| target == bucket) {
-        hooks
-    } else {
-        BucketWriteHandleTestHooks::default()
+impl Coordinator {
+    fn bucket_write_handle_test_hooks_for(&self, bucket: &str) -> BucketWriteHandleTestHooks {
+        let hooks = self
+            .shared_caches
+            .bucket_write_handle_test_hooks
+            .lock()
+            .unwrap()
+            .clone();
+        if hooks.bucket.as_ref().is_some_and(|target| target == bucket) {
+            hooks
+        } else {
+            BucketWriteHandleTestHooks::default()
+        }
     }
-}
 
-pub(super) fn should_probe_direct_put_commit(bucket: &str) -> bool {
-    bucket_write_handle_test_hooks_for(bucket).probe_direct_put_commit
-}
+    pub(super) fn should_probe_direct_put_commit(&self, bucket: &str) -> bool {
+        self.bucket_write_handle_test_hooks_for(bucket)
+            .probe_direct_put_commit
+    }
 
-pub(super) fn should_probe_begin_stream_part_session(bucket: &str) -> bool {
-    bucket_write_handle_test_hooks_for(bucket).probe_begin_stream_part_session
-}
+    pub(super) fn should_probe_begin_stream_part_session(&self, bucket: &str) -> bool {
+        self.bucket_write_handle_test_hooks_for(bucket)
+            .probe_begin_stream_part_session
+    }
 
-pub(super) fn should_probe_finalize_stream_put_commit(bucket: &str) -> bool {
-    bucket_write_handle_test_hooks_for(bucket).probe_finalize_stream_put_commit
-}
+    pub(super) fn should_probe_finalize_stream_put_commit(&self, bucket: &str) -> bool {
+        self.bucket_write_handle_test_hooks_for(bucket)
+            .probe_finalize_stream_put_commit
+    }
 
-pub(super) fn should_probe_finalize_stream_part_commit(bucket: &str) -> bool {
-    bucket_write_handle_test_hooks_for(bucket).probe_finalize_stream_part_commit
-}
+    pub(super) fn should_probe_finalize_stream_part_commit(&self, bucket: &str) -> bool {
+        self.bucket_write_handle_test_hooks_for(bucket)
+            .probe_finalize_stream_part_commit
+    }
 
-pub(super) fn should_probe_bucket_mutation_write(bucket: &str) -> bool {
-    bucket_write_handle_test_hooks_for(bucket).probe_bucket_mutation_write
-}
+    pub(super) fn should_probe_bucket_mutation_write(&self, bucket: &str) -> bool {
+        self.bucket_write_handle_test_hooks_for(bucket)
+            .probe_bucket_mutation_write
+    }
 
-pub(super) fn should_probe_object_read_snapshot(bucket: &str) -> bool {
-    bucket_write_handle_test_hooks_for(bucket).probe_object_read_snapshot
-}
+    pub(super) fn should_probe_object_read_snapshot(&self, bucket: &str) -> bool {
+        self.bucket_write_handle_test_hooks_for(bucket)
+            .probe_object_read_snapshot
+    }
 
-pub(super) fn should_probe_object_metadata_access(bucket: &str) -> bool {
-    bucket_write_handle_test_hooks_for(bucket).probe_object_metadata_access
-}
+    pub(super) fn should_probe_object_metadata_access(&self, bucket: &str) -> bool {
+        self.bucket_write_handle_test_hooks_for(bucket)
+            .probe_object_metadata_access
+    }
 
-pub(super) fn should_probe_delete_object_lookup(bucket: &str) -> bool {
-    bucket_write_handle_test_hooks_for(bucket).probe_delete_object_lookup
+    pub(super) fn should_probe_delete_object_lookup(&self, bucket: &str) -> bool {
+        self.bucket_write_handle_test_hooks_for(bucket)
+            .probe_delete_object_lookup
+    }
 }
 
 pub(super) fn should_probe_multipart_complete_auth_lookup(bucket: &str, key: &str) -> bool {

@@ -70,8 +70,7 @@ use super::Coordinator;
 use super::{
     maybe_run_abort_multipart_auth_lookup_hook, maybe_run_abort_multipart_bucket_summary_hook,
     maybe_run_bucket_policy_fast_path_hook, maybe_run_bucket_policy_storage_load_hook,
-    maybe_run_bucket_write_handle_loaded_hook, should_probe_delete_object_lookup,
-    should_probe_multipart_complete_auth_lookup, should_probe_object_read_snapshot,
+    should_probe_multipart_complete_auth_lookup,
 };
 use crate::error::ServerError;
 use crate::sse::{SseCustomerRequest, SseCustomerSegmentScope};
@@ -1687,7 +1686,9 @@ impl Coordinator {
                             request,
                         )?;
                     #[cfg(test)]
-                    maybe_run_bucket_write_handle_loaded_hook(req.bucket_name_typed().as_str());
+                    self.maybe_run_bucket_write_handle_loaded_hook(
+                        req.bucket_name_typed().as_str(),
+                    );
                     action(bucket)
                 },
             )
@@ -1723,7 +1724,9 @@ impl Coordinator {
                         }
                     };
                     #[cfg(test)]
-                    maybe_run_bucket_write_handle_loaded_hook(req.bucket_name_typed().as_str());
+                    self.maybe_run_bucket_write_handle_loaded_hook(
+                        req.bucket_name_typed().as_str(),
+                    );
                     Ok(action(bucket, proof))
                 },
             )

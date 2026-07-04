@@ -29,11 +29,6 @@ use super::{
 };
 #[cfg(test)]
 use super::{
-    maybe_run_bucket_write_handle_loaded_hook, should_probe_begin_stream_part_session,
-    should_probe_finalize_stream_part_commit,
-};
-#[cfg(test)]
-use super::{
     maybe_run_multipart_complete_pre_commit_hook, maybe_run_multipart_complete_snapshot_hook,
 };
 use crate::checksum_claim::ChecksumClaim;
@@ -301,7 +296,7 @@ impl Coordinator {
             let mut proof_transferred_to_command = false;
             let result = (|| {
                 #[cfg(test)]
-                if should_probe_begin_stream_part_session(req.upload.bucket_name()) {
+                if self.should_probe_begin_stream_part_session(req.upload.bucket_name()) {
                     let object_pg_ready = storage_node
                         .try_probe_object_pg_available(
                             req.upload.bucket_name_typed(),
@@ -422,7 +417,7 @@ impl Coordinator {
                             request,
                         )?;
                     #[cfg(test)]
-                    maybe_run_bucket_write_handle_loaded_hook(
+                    self.maybe_run_bucket_write_handle_loaded_hook(
                         req.object.bucket.name_typed().as_str(),
                     );
                     let authorized = self.authorize_create_multipart_upload_with_existing_object(
@@ -1016,7 +1011,7 @@ impl Coordinator {
         let claimed_checksum = req.claimed_checksum;
         let computed_checksum = req.computed_checksum;
         #[cfg(test)]
-        if should_probe_finalize_stream_part_commit(req.upload.bucket_name()) {
+        if self.should_probe_finalize_stream_part_commit(req.upload.bucket_name()) {
             let object_pg_ready = storage_node
                 .try_probe_object_pg_available(
                     req.upload.bucket_name_typed(),
