@@ -29,7 +29,8 @@ const CONTROL_PLANE_RPC_READ_ONLY_RETRY_BACKOFF: Duration = Duration::from_milli
 const CONTROL_PLANE_RPC_CHECK_APPLIED_DEADLINE: Duration = Duration::from_secs(20);
 const CONTROL_PLANE_RPC_CHECK_APPLIED_BACKOFF: Duration = Duration::from_millis(100);
 const CONTROL_PLANE_RPC_CHECK_APPLIED_IO_TIMEOUT: Duration = Duration::from_secs(5);
-const CONTROL_PLANE_RPC_LIVENESS_RETRY_BACKOFF: Duration = Duration::from_millis(10);
+const CONTROL_PLANE_RPC_LIVENESS_IO_TIMEOUT: Duration = Duration::from_secs(5);
+const CONTROL_PLANE_RPC_LIVENESS_RETRY_BACKOFF: Duration = Duration::from_millis(100);
 const CONTROL_PLANE_RPC_HEARTBEAT_OBSERVATION_MIN_LEN: usize = 4 + 1 + 8 + 8 + 8 + 1;
 const CONTROL_PLANE_RPC_RUNTIME_NODE_MIN_LEN: usize = 4 + 8 + 4 + 1;
 const CONTROL_PLANE_RPC_PG_ROUTE_MIN_LEN: usize = 8 + 4 + 4 + 1 + 1 + 4 + 1;
@@ -4411,6 +4412,11 @@ impl UnixControlPlaneClient {
         retry_budget: Duration,
     ) -> Result<Vec<u8>, ControlPlaneError> {
         debug_assert_eq!(kind, ControlPlaneRpcKind::RefreshNodeHeartbeat);
+        if retry_budget.is_zero() {
+            return Err(ControlPlaneError::RpcUnconfirmed {
+                message: "heartbeat retry budget is exhausted before the first request".to_owned(),
+            });
+        }
         let deadline = Instant::now() + retry_budget;
         let mut retry_started = false;
         let mut last_retryable_error = None;
@@ -4420,7 +4426,19 @@ impl UnixControlPlaneClient {
                     .take()
                     .expect("heartbeat retry deadline reached after retryable error"));
             }
-            match self.send_request(kind, payload) {
+            let now = Instant::now();
+            let remaining = deadline.saturating_duration_since(now);
+            if remaining.is_zero() {
+                return match last_retryable_error.take() {
+                    Some(error) => Err(error),
+                    None => Err(ControlPlaneError::RpcUnconfirmed {
+                        message: "heartbeat retry budget expired before the first request"
+                            .to_owned(),
+                    }),
+                };
+            }
+            let read_timeout = remaining.min(CONTROL_PLANE_RPC_LIVENESS_IO_TIMEOUT);
+            match self.send_request_with_read_timeout(kind, payload, read_timeout) {
                 Ok(payload) => return Ok(payload),
                 Err(error) if error.is_retryable_control_plane_rpc_transport_error() => {
                     let now = Instant::now();
@@ -4430,7 +4448,10 @@ impl UnixControlPlaneClient {
                     let remaining = deadline.saturating_duration_since(now);
                     retry_started = true;
                     last_retryable_error = Some(error);
-                    std::thread::sleep(remaining.min(CONTROL_PLANE_RPC_LIVENESS_RETRY_BACKOFF));
+                    let retry_sleep = CONTROL_PLANE_RPC_LIVENESS_RETRY_BACKOFF.min(remaining / 2);
+                    if !retry_sleep.is_zero() {
+                        std::thread::sleep(retry_sleep);
+                    }
                 }
                 Err(error) => return Err(error),
             }
@@ -4982,6 +5003,9 @@ impl ControlPlaneHeartbeatRuntimeMapSource for UnixControlPlaneClient {
         heartbeat: NodeHeartbeat,
         _authority_now_ms: u64,
     ) -> Result<ControlPlaneHeartbeatRefresh, ControlPlaneError> {
+        if heartbeat.requested_lease_duration_ms == 0 {
+            return Err(ControlPlaneError::InvalidLeaseDuration);
+        }
         let mut payload = Vec::new();
         write_node_heartbeat(&mut payload, &heartbeat)?;
         let retry_budget = Duration::from_millis(heartbeat.requested_lease_duration_ms);
@@ -10614,6 +10638,102 @@ mod tests {
 
         server.join().unwrap();
         assert_eq!(refresh.lease().lease_deadline_ms(), 2_150);
+        assert_eq!(
+            refresh.runtime_map().nodes()[0].endpoint(),
+            "/tmp/argmin-node-1.sock"
+        );
+    }
+
+    #[test]
+    fn unix_control_plane_client_rejects_zero_heartbeat_lease_without_panicking() {
+        let tmp = test_util::tempdir();
+        let socket_path = tmp.path().join("control-plane.sock");
+        let mut client = UnixControlPlaneClient::new(&socket_path);
+        let mut heartbeat = heartbeat(1, ClusterEpoch::new(1).unwrap(), 0);
+        heartbeat.requested_lease_duration_ms = 0;
+
+        let error = client.refresh_node_heartbeat(heartbeat, 0).unwrap_err();
+
+        assert!(matches!(error, ControlPlaneError::InvalidLeaseDuration));
+    }
+
+    #[test]
+    fn unix_control_plane_client_reports_exhausted_liveness_budget_without_panicking() {
+        let tmp = test_util::tempdir();
+        let socket_path = tmp.path().join("control-plane.sock");
+        let client = UnixControlPlaneClient::new(&socket_path);
+
+        let error = client
+            .send_liveness_request(
+                ControlPlaneRpcKind::RefreshNodeHeartbeat,
+                &[],
+                Duration::ZERO,
+            )
+            .unwrap_err();
+
+        assert!(matches!(error, ControlPlaneError::RpcUnconfirmed { .. }));
+    }
+
+    #[test]
+    fn unix_control_plane_client_waits_for_slow_heartbeat_response_within_lease() {
+        let tmp = test_util::tempdir();
+        let socket_path = tmp.path().join("control-plane.sock");
+        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+        authority
+            .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
+            .unwrap();
+        authority
+            .set_pg_acting_set(PgId::new(7), vec![NodeId::new(1)])
+            .unwrap();
+        let heartbeat_epoch = authority.snapshot().cluster_epoch();
+        let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _addr) = listener.accept().unwrap();
+            let request = read_control_plane_unix_request(&mut stream).unwrap();
+            assert_eq!(request.kind, ControlPlaneRpcKind::RefreshNodeHeartbeat);
+            std::thread::sleep(CONTROL_PLANE_RPC_IO_TIMEOUT + Duration::from_millis(200));
+            respond_control_plane_unix_request(&mut authority, &mut stream, request, 2_000)
+                .unwrap();
+
+            listener.set_nonblocking(true).unwrap();
+            let retry_probe_deadline = Instant::now() + Duration::from_millis(100);
+            loop {
+                match listener.accept() {
+                    Ok((_stream, _addr)) => panic!("heartbeat client retried before slow response"),
+                    Err(error)
+                        if error.kind() == ErrorKind::WouldBlock
+                            && Instant::now() < retry_probe_deadline =>
+                    {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    Err(error) if error.kind() == ErrorKind::WouldBlock => break,
+                    Err(error) => panic!("accept heartbeat retry probe: {error}"),
+                }
+            }
+        });
+
+        let mut client = UnixControlPlaneClient::new(&socket_path);
+        let refresh = client
+            .refresh_node_heartbeat(
+                NodeHeartbeat {
+                    node_id: NodeId::new(1),
+                    node_incarnation: 42,
+                    endpoint: "/tmp/argmin-node-1.sock".to_owned(),
+                    observed_epoch: heartbeat_epoch,
+                    requested_lease_duration_ms: 3_000,
+                    cluster_map_history_reference_summary: PgClusterMapHistoryReferenceSummary {
+                        oldest_live_placement_epoch: Some(heartbeat_epoch),
+                        oldest_durable_backfill_epoch: None,
+                    },
+                    pg_observations: Vec::new(),
+                },
+                0,
+            )
+            .unwrap();
+
+        server.join().unwrap();
+        assert_eq!(refresh.lease().lease_deadline_ms(), 5_000);
         assert_eq!(
             refresh.runtime_map().nodes()[0].endpoint(),
             "/tmp/argmin-node-1.sock"
