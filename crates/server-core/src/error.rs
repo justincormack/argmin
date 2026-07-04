@@ -387,6 +387,7 @@ impl ServerError {
             Self::Auth(auth::AuthError::DuplicateAuthorizationHeader) => "NotImplemented",
             Self::Auth(auth::AuthError::SignatureMismatch) => "SignatureDoesNotMatch",
             Self::Auth(auth::AuthError::RequestExpired) => "RequestTimeTooSkewed",
+            Self::Auth(auth::AuthError::PresignedRequestExpired) => "AccessDenied",
             Self::Auth(auth::AuthError::ExpiredToken) => "ExpiredToken",
             Self::Auth(auth::AuthError::InvalidToken)
             | Self::Auth(auth::AuthError::UnexpectedSecurityToken { .. }) => "InvalidToken",
@@ -945,6 +946,12 @@ mod tests {
     fn s3_error_code_auth_expired() {
         let err = ServerError::Auth(auth::AuthError::RequestExpired);
         assert_eq!(err.s3_error_code(), "RequestTimeTooSkewed");
+    }
+
+    #[test]
+    fn s3_error_code_auth_presigned_expired() {
+        let err = ServerError::Auth(auth::AuthError::PresignedRequestExpired);
+        assert_eq!(err.s3_error_code(), "AccessDenied");
     }
 
     #[test]

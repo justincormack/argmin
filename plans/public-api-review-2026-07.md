@@ -92,12 +92,15 @@ steps it performs.
   `request_epoch > now + SIGV4_CLOCK_SKEW_SECS` in `authenticate_presigned`
   with a presigned-specific auth error that renders the AWS response shape.
 
-- [ ] **A5. One `AuthError::RequestExpired` conflates two AWS errors.**
+- [x] **A5. One `AuthError::RequestExpired` conflates two AWS errors.**
   Produced for header clock skew (request.rs:287) and presigned expiry
   (request.rs:443); mapped unconditionally to `RequestTimeTooSkewed`
-  (`crates/server-core/src/error.rs:389`). AWS returns `RequestTimeTooSkewed`
-  for skew but `AccessDenied` ("Request has expired") for expired presigned
-  URLs. Fix: split the variant and the mapping.
+  (`crates/server-core/src/error.rs:389`). AWS oracle: an epoch-dated
+  presigned URL returns 403 AccessDenied with message `Request has expired`,
+  `RequestId` and `HostId`, and no `Resource` element, while header skew
+  remains `RequestTimeTooSkewed`. Completed by splitting presigned expiry into
+  `PresignedRequestExpired`, mapping it to `AccessDenied`, and routing it
+  through the AccessDenied-shaped response formatter.
 
 - [ ] **A6. Presigned body-hash selection uses unsigned header values,
   contradicting its own comment.** `request.rs:476-483` — comment says use

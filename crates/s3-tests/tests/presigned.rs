@@ -1565,10 +1565,30 @@ fn test_object_raw_get_x_amz_epoch_date_is_expired() {
 
         let mut resp = agent().get(&presigned_url).call().expect("transport error");
         let status = resp.status().as_u16();
-        let _ = resp.body_mut().read_to_string();
+        let body = resp.body_mut().read_to_string().unwrap();
         assert_eq!(
             status, 403,
-            "expected 403 for epoch-dated presigned URL, got {status}"
+            "expected 403 for epoch-dated presigned URL, got {status}: {body}"
+        );
+        assert!(
+            body.contains("<Code>AccessDenied</Code>"),
+            "expected AccessDenied response, got: {body}"
+        );
+        assert!(
+            body.contains("<Message>Request has expired</Message>"),
+            "expected expired response, got: {body}"
+        );
+        assert!(
+            body.contains("<RequestId>"),
+            "expected RequestId in expired response, got: {body}"
+        );
+        assert!(
+            body.contains("<HostId>"),
+            "expected HostId in expired response, got: {body}"
+        );
+        assert!(
+            !body.contains("<Resource>"),
+            "expected no Resource element in expired response, got: {body}"
         );
 
         cleanup(&bucket, &["obj"]).await;

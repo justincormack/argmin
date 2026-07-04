@@ -223,6 +223,9 @@ fn client_error_message(err: &ServerError) -> String {
         ServerError::Auth(auth::AuthError::RequestExpired) => {
             "request timestamp is too far from server time".to_string()
         }
+        ServerError::Auth(auth::AuthError::PresignedRequestExpired) => {
+            "Request has expired".to_string()
+        }
         ServerError::Auth(auth::AuthError::RequestNotYetValid) => {
             "Request is not yet valid".to_string()
         }
@@ -451,7 +454,8 @@ impl S3Response {
             }
             ServerError::AccessDenied
             | ServerError::Auth(auth::AuthError::MissingAuth)
-            | ServerError::Auth(auth::AuthError::AccessDenied) => {
+            | ServerError::Auth(auth::AuthError::AccessDenied)
+            | ServerError::Auth(auth::AuthError::PresignedRequestExpired) => {
                 let body = xml::error_xml_with_host_id(
                     "AccessDenied",
                     &client_error_message(err),
@@ -3429,6 +3433,20 @@ mod tests {
         assert_eq!(find_header(&resp, "Content-Length"), None);
         let body = String::from_utf8(resp.into_test_body_bytes().unwrap()).unwrap();
         assert!(body.contains("AccessDenied"));
+    }
+
+    #[test]
+    fn presigned_expired_error_response_uses_access_denied_shape() {
+        let err = ServerError::Auth(auth::AuthError::PresignedRequestExpired);
+        let wire_ids = WireResponseIds::new("2VG1X5NNMZ52HKC0", TEST_HOST_ID);
+        let resp = S3Response::error_with_ids(&err, "/bucket/key", &wire_ids);
+        assert_eq!(resp.status_code, 403);
+        let body = String::from_utf8(resp.into_test_body_bytes().unwrap()).unwrap();
+        assert!(body.contains("<Code>AccessDenied</Code>"));
+        assert!(body.contains("<Message>Request has expired</Message>"));
+        assert!(body.contains("<RequestId>2VG1X5NNMZ52HKC0</RequestId>"));
+        assert!(body.contains("<HostId>host-id</HostId>"));
+        assert!(!body.contains("<Resource>"));
     }
 
     #[test]

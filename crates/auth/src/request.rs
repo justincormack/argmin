@@ -445,7 +445,7 @@ fn authenticate_presigned<H: HeaderSource + ?Sized>(
         return Err(AuthError::RequestNotYetValid);
     }
     if expires == 0 || now_epoch_secs > request_epoch.saturating_add(expires) {
-        return Err(AuthError::RequestExpired);
+        return Err(AuthError::PresignedRequestExpired);
     }
 
     let signature =
@@ -976,7 +976,7 @@ mod tests {
             parse_amz_date("20240201T120500Z").unwrap(),
         )
         .unwrap_err();
-        assert!(matches!(err, AuthError::RequestExpired));
+        assert!(matches!(err, AuthError::PresignedRequestExpired));
     }
 
     #[test]
@@ -1469,7 +1469,7 @@ mod tests {
             presigned_example_time(),
         )
         .unwrap_err();
-        assert!(matches!(err, AuthError::RequestExpired));
+        assert!(matches!(err, AuthError::PresignedRequestExpired));
     }
 
     // ── Presigned: missing individual params ──────────────────────────
