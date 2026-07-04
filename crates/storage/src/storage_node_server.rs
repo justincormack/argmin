@@ -1697,10 +1697,21 @@ impl StorageNodeConnectionHandler {
                         io::ErrorKind::UnexpectedEof
                             | io::ErrorKind::ConnectionReset
                             | io::ErrorKind::BrokenPipe
-                            | io::ErrorKind::TimedOut
-                            | io::ErrorKind::WouldBlock
                     ) =>
                 {
+                    return Ok(());
+                }
+                Err(StorageRpcStreamError::Io(error))
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+                    ) =>
+                {
+                    if session.has_acquired_read_handles()
+                        && !session.has_metadata_command_pg_locks()
+                    {
+                        continue;
+                    }
                     return Ok(());
                 }
                 Err(error) => return Err(rpc_stream_error(error)),
@@ -10106,6 +10117,10 @@ impl StorageNodeSession {
         self.metadata_command_guards.contains_key(&pg_id)
     }
 
+    fn has_metadata_command_pg_locks(&self) -> bool {
+        !self.metadata_command_guards.is_empty()
+    }
+
     fn update_metadata_command_lock_context(
         &self,
         locks: &StorageNodeMetadataCommandLocks,
@@ -10137,6 +10152,12 @@ impl StorageNodeSession {
 
     fn release_metadata_command_pg_lock(&mut self, pg_id: PgId) {
         self.metadata_command_guards.remove(&pg_id);
+    }
+
+    fn has_acquired_read_handles(&self) -> bool {
+        self.read_operations
+            .values()
+            .any(|existing| existing.is_acquired)
     }
 
     fn acquire_read_handles(
@@ -13166,6 +13187,116 @@ mod tests {
         assert_eq!(handles.count(location), 1);
         handles.release(&[(location, shard_key)]);
         assert_eq!(handles.count(location), 0);
+    }
+
+    #[test]
+    fn storage_node_server_idle_timeout_preserves_active_read_handles_until_release() {
+        let tmp = test_util::tempdir();
+        let config = test_config(&tmp);
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let server = Arc::new(StorageNodeServer::bind(config.clone()).unwrap());
+        let server_for_thread = Arc::clone(&server);
+        let socket_path = config.socket_path.clone();
+        let join = thread::spawn(move || server_for_thread.accept_one().unwrap());
+        let location = test_location(1, 0, 7);
+        let shard_key = test_shard_key(location.shard_index().get());
+
+        let mut client = UnixStream::connect(socket_path).unwrap();
+        let response = send_frame(
+            &mut client,
+            7,
+            StorageRpcMessageKind::ReadHandlesAcquire,
+            read_handle_acquire_payload("read-op", location),
+        );
+        decode_storage_rpc_response_payload(&response.payload)
+            .unwrap()
+            .unwrap();
+        assert_eq!(server.read_handle_count(location), 1);
+
+        thread::sleep(STORAGE_RPC_SERVER_IDLE_TIMEOUT + Duration::from_millis(200));
+        assert_eq!(
+            server.read_handle_count(location),
+            1,
+            "server idle timeout must not release active read handles"
+        );
+        let delete_error = server
+            .read_handles
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .try_begin_delete(location, &shard_key)
+            .unwrap_err();
+        assert_eq!(delete_error.code, StorageRpcErrorCode::ResourceExhausted);
+
+        let release = send_frame(
+            &mut client,
+            8,
+            StorageRpcMessageKind::ReadHandlesRelease,
+            read_handle_release_payload("read-op"),
+        );
+        decode_storage_rpc_response_payload(&release.payload)
+            .unwrap()
+            .unwrap();
+        wait_for_read_handle_count(&server, location, 0);
+        drop(client);
+        join.join().unwrap();
+    }
+
+    #[test]
+    fn storage_node_server_idle_timeout_closes_session_with_read_handles_and_metadata_lock() {
+        let tmp = test_util::tempdir();
+        let config = test_config(&tmp);
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let server = Arc::new(StorageNodeServer::bind(config.clone()).unwrap());
+        let server_for_first = Arc::clone(&server);
+        let socket_path = config.socket_path.clone();
+        let first = thread::spawn(move || server_for_first.accept_one().unwrap());
+        let metadata_request = StorageRpcMetadataCommandStateRequest {
+            node_id: config.node_id,
+            cluster_epoch: config.cluster_epoch,
+            pg_id: PgId::new(0),
+        };
+        let metadata_payload = encode_metadata_command_state_request(&metadata_request);
+        let location = test_location(1, 0, 7);
+
+        let mut client = UnixStream::connect(&socket_path).unwrap();
+        let metadata_acquire = send_frame(
+            &mut client,
+            7,
+            StorageRpcMessageKind::MetadataCommandPgLockAcquire,
+            metadata_payload.clone(),
+        );
+        decode_storage_rpc_response_payload(&metadata_acquire.payload)
+            .unwrap()
+            .unwrap();
+        let read_acquire = send_frame(
+            &mut client,
+            8,
+            StorageRpcMessageKind::ReadHandlesAcquire,
+            read_handle_acquire_payload("read-op", location),
+        );
+        decode_storage_rpc_response_payload(&read_acquire.payload)
+            .unwrap()
+            .unwrap();
+        assert_eq!(server.read_handle_count(location), 1);
+
+        first.join().unwrap();
+        wait_for_read_handle_count(&server, location, 0);
+
+        let server_for_second = Arc::clone(&server);
+        let second = thread::spawn(move || server_for_second.accept_one().unwrap());
+        let mut second_client = UnixStream::connect(socket_path).unwrap();
+        let reacquire = send_frame(
+            &mut second_client,
+            9,
+            StorageRpcMessageKind::MetadataCommandPgLockAcquire,
+            metadata_payload,
+        );
+        decode_storage_rpc_response_payload(&reacquire.payload)
+            .unwrap()
+            .unwrap();
+        drop(client);
+        drop(second_client);
+        second.join().unwrap();
     }
 
     #[test]
