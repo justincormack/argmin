@@ -317,12 +317,20 @@ steps it performs.
   lifecycle filter" but the predicate `!rule.filter.has_scope()` also passes a
   legacy `<Prefix>` rule. Decide intent and align predicate + message.
 
-- [ ] **H5. Quoted-star `If-Match` semantics disagree between core and HTTP
+- [x] **H5. Quoted-star `If-Match` semantics disagree between core and HTTP
   layers.** Core docs + test say `If-Match: "*"` is a specific etag → 412
   (`server-core/src/conditional.rs:31-35, 562-568`); the HTTP layer returns
   501 `NotImplemented` (`server-http/src/http/conditional.rs:62-67`, test at
   161-165). The two test suites pin contradictory semantics; one layer's
-  behavior is dead code. Pick one and delete the other's special-casing.
+  behavior is dead code. This finding was stale/misframed for public behavior:
+  `s3-tests` already pin AWS `PutObject If-Match: "\"*\""` as 501, and
+  `./scripts/aws-tests --test conditional ifmatch -- --nocapture` confirmed the
+  full conditional `ifmatch` slice. Added AWS-pinned CopyObject destination
+  coverage for quoted-star `If-Match`, which also returns 501. The core parser
+  still correctly treats quoted star as a literal ETag token for read/delete
+  matching, so the misleading core write-condition unit was rewritten to test
+  `EtagMatchList` literal-token behavior instead of an impossible public write
+  condition.
 
 - [ ] **H6. Two different 416 bodies, and `total_size` computed then
   dropped.** `range_not_satisfiable{,_with_ids}` ignores its `_total_size`

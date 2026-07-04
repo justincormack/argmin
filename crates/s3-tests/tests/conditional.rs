@@ -2024,6 +2024,28 @@ fn test_copy_object_ifmatch_wildcard_not_implemented() {
 }
 
 #[test]
+fn test_copy_object_ifmatch_quoted_star_not_implemented() {
+    s3_tests::run(async {
+        let bucket = setup_bucket().await;
+        put_object(&bucket, "src", b"source data").await;
+        put_object(&bucket, "dst", b"old dst").await;
+
+        let result = CTX
+            .client()
+            .copy_object()
+            .bucket(&bucket)
+            .key("dst")
+            .copy_source(format!("{}/src", bucket))
+            .if_match("\"*\"")
+            .send_retrying_operation_aborted("copy conditional object")
+            .await;
+        assert_eq!(err_status(&result), 501);
+
+        cleanup(&bucket, &["src", "dst"]).await;
+    });
+}
+
+#[test]
 fn test_copy_object_ifnonematch_specific_not_implemented() {
     s3_tests::run(async {
         let bucket = setup_bucket().await;

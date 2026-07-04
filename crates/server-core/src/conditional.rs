@@ -559,12 +559,10 @@ mod tests {
     }
 
     #[test]
-    fn write_if_match_quoted_star_is_specific_not_wildcard() {
-        let etag = SpecificEtag::new("\"*\"".to_string()).unwrap();
-        assert_eq!(etag.as_str(), "*");
-        let cond = WriteCondition::IfMatch(etag);
-        let err = check_write_conditions(&cond, Some(&test_etag())).unwrap_err();
-        assert!(matches!(err, ServerError::PreconditionFailed));
+    fn quoted_star_etag_match_token_is_specific_not_wildcard() {
+        let list = EtagMatchList::from_header_value("\"*\"");
+        assert!(!list.matches(&test_etag()));
+        assert!(list.matches("*"));
     }
 
     #[test]
