@@ -609,6 +609,7 @@ impl ClusterControlSnapshot {
         &self,
         now_ms: u64,
         refreshing_node_id: NodeId,
+        refreshing_node_observed_epoch: ClusterEpoch,
     ) -> Result<ClusterRuntimeMapSnapshot, ControlPlaneError> {
         let pg_routes = self.pg_routes_for_storage_node_refresh(now_ms, refreshing_node_id)?;
         let history_floor = self
@@ -617,8 +618,11 @@ impl ClusterControlSnapshot {
                 node_id: refreshing_node_id.as_u32(),
             })?
             .cluster_map_history_floor_epoch();
-        let historical_pg_routes =
-            self.historical_pg_routes_for_storage_node_refresh(history_floor, &pg_routes)?;
+        let historical_pg_routes = self.historical_pg_routes_for_storage_node_refresh(
+            history_floor,
+            refreshing_node_observed_epoch,
+            &pg_routes,
+        )?;
         self.runtime_map_from_pg_routes_with_history_and_extra_nodes(
             pg_routes,
             historical_pg_routes,
@@ -735,13 +739,19 @@ impl ClusterControlSnapshot {
     fn historical_pg_routes_for_storage_node_refresh(
         &self,
         floor_epoch: Option<ClusterEpoch>,
+        observed_epoch: ClusterEpoch,
         current_routes: &[PgRouteSnapshot],
     ) -> Result<Vec<PgRouteSnapshot>, ControlPlaneError> {
         let mut required_keys = BTreeSet::new();
         let mut pending_keys = Vec::new();
+        let response_floor = if observed_epoch == ClusterEpoch::INITIAL {
+            floor_epoch
+        } else {
+            Some(floor_epoch.map_or(observed_epoch, |floor| floor.max(observed_epoch)))
+        };
 
         for history in &self.history {
-            if floor_epoch.is_some_and(|floor| history.cluster_epoch() >= floor) {
+            if response_floor.is_some_and(|floor| history.cluster_epoch() >= floor) {
                 for pg in history.pgs() {
                     add_required_historical_route_key(
                         &mut required_keys,
@@ -4128,6 +4138,7 @@ impl<S: ControlPlaneStore> ControlPlaneHeartbeatRuntimeMapSource
         authority_now_ms: u64,
     ) -> Result<ControlPlaneHeartbeatRefresh, ControlPlaneError> {
         let node_id = heartbeat.node_id;
+        let observed_epoch = heartbeat.observed_epoch;
         let mut lease = self.heartbeat(heartbeat, authority_now_ms)?;
         let just_activated_pgs: BTreeSet<PgId> = self
             .complete_ready_pg_peerings(authority_now_ms)?
@@ -4136,9 +4147,11 @@ impl<S: ControlPlaneStore> ControlPlaneHeartbeatRuntimeMapSource
         if !just_activated_pgs.is_empty() {
             lease = self.current_heartbeat_lease_for_node(node_id, authority_now_ms)?;
         }
-        let runtime_map = self
-            .snapshot
-            .runtime_map_for_storage_node_refresh(authority_now_ms, node_id)?;
+        let runtime_map = self.snapshot.runtime_map_for_storage_node_refresh(
+            authority_now_ms,
+            node_id,
+            observed_epoch,
+        )?;
         Ok(ControlPlaneHeartbeatRefresh { lease, runtime_map })
     }
 }
@@ -15005,7 +15018,7 @@ mod tests {
             .is_ok());
         assert!(authority
             .snapshot()
-            .runtime_map_for_storage_node_refresh(2_031, NodeId::new(1))
+            .runtime_map_for_storage_node_refresh(2_031, NodeId::new(1), ClusterEpoch::INITIAL)
             .is_ok());
         assert!(authority
             .authorize_pg_operation(
@@ -15047,7 +15060,7 @@ mod tests {
         assert!(matches!(
             authority
                 .snapshot()
-                .runtime_map_for_storage_node_refresh(2_032, NodeId::new(1)),
+                .runtime_map_for_storage_node_refresh(2_032, NodeId::new(1), ClusterEpoch::INITIAL),
             Err(ControlPlaneError::PgActiveMetadataProofMismatch {
                 pg_id: 22,
                 node_id: 1,
@@ -15155,7 +15168,7 @@ mod tests {
         assert_eq!(pg.active_metadata_proof_epoch(), accepted_proof_epoch);
         assert!(authority
             .snapshot()
-            .runtime_map_for_storage_node_refresh(2_031, NodeId::new(1))
+            .runtime_map_for_storage_node_refresh(2_031, NodeId::new(1), ClusterEpoch::INITIAL)
             .is_ok());
     }
 
@@ -15226,7 +15239,7 @@ mod tests {
             .is_err());
         let non_primary_runtime_map = authority
             .snapshot()
-            .runtime_map_for_storage_node_refresh(2_030, NodeId::new(2))
+            .runtime_map_for_storage_node_refresh(2_030, NodeId::new(2), ClusterEpoch::INITIAL)
             .unwrap();
         let route = non_primary_runtime_map
             .pg_routes()
@@ -15551,7 +15564,7 @@ mod tests {
 
         let filtered_runtime_map = authority
             .snapshot()
-            .runtime_map_for_storage_node_refresh(2_003, NodeId::new(2))
+            .runtime_map_for_storage_node_refresh(2_003, NodeId::new(2), ClusterEpoch::INITIAL)
             .unwrap();
         assert_eq!(filtered_runtime_map.historical_pg_routes().len(), 1);
         let source_route = filtered_runtime_map
@@ -15563,6 +15576,65 @@ mod tests {
                 .reconstructed_pg_route_at_epoch(PgId::new(31), unrelated_history_epoch,),
             Err(ControlPlaneError::UnknownClusterMapEpoch { .. })
         ));
+    }
+
+    #[test]
+    fn storage_node_refresh_history_uses_observed_epoch_for_running_node() {
+        let tmp = test_util::tempdir();
+        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+        authority
+            .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
+            .unwrap();
+        authority
+            .set_pg_acting_set(PgId::new(30), vec![NodeId::new(1)])
+            .unwrap();
+        assert!(heartbeat_until_serving(&mut authority, 1, 1_000).serving());
+        let protected_epoch = authority.snapshot().cluster_epoch();
+        let mut floor_heartbeat = heartbeat_from_record(&authority, 1, protected_epoch, 1_100);
+        floor_heartbeat.cluster_map_history_reference_summary =
+            PgClusterMapHistoryReferenceSummary {
+                oldest_live_placement_epoch: Some(protected_epoch),
+                oldest_durable_backfill_epoch: None,
+            };
+        assert!(authority
+            .heartbeat(floor_heartbeat, 1_100)
+            .unwrap()
+            .serving());
+
+        for node_id in 10..18 {
+            authority
+                .set_node_membership(NodeId::new(node_id), NodeMembershipState::Active)
+                .unwrap();
+        }
+        let current_epoch = authority.snapshot().cluster_epoch();
+        let observed_epoch = ClusterEpoch::new(current_epoch.get() - 2).unwrap();
+
+        let bootstrap_refresh = authority
+            .snapshot()
+            .runtime_map_for_storage_node_refresh(2_000, NodeId::new(1), ClusterEpoch::INITIAL)
+            .unwrap();
+        assert!(bootstrap_refresh
+            .historical_pg_routes()
+            .iter()
+            .any(|route| route.cluster_epoch() == protected_epoch));
+
+        let running_refresh = authority
+            .snapshot()
+            .runtime_map_for_storage_node_refresh(2_000, NodeId::new(1), observed_epoch)
+            .unwrap();
+        assert!(running_refresh
+            .historical_pg_routes()
+            .iter()
+            .all(|route| route.cluster_epoch() >= observed_epoch));
+        assert!(running_refresh
+            .historical_pg_routes()
+            .iter()
+            .any(|route| route.cluster_epoch() == observed_epoch));
+        assert!(!running_refresh
+            .historical_pg_routes()
+            .iter()
+            .any(|route| route.cluster_epoch() == protected_epoch));
     }
 
     #[test]
@@ -15582,7 +15654,7 @@ mod tests {
 
         let runtime_map = authority
             .snapshot()
-            .runtime_map_for_storage_node_refresh(2_000, NodeId::new(2))
+            .runtime_map_for_storage_node_refresh(2_000, NodeId::new(2), ClusterEpoch::INITIAL)
             .unwrap();
 
         assert!(runtime_map

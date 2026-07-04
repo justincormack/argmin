@@ -1109,12 +1109,19 @@ capacity. Confirmed.
 - Follow-up soak fix: long metadata-PG migration runs exposed that
   control-plane runtime-map responses could grow with retained historical PG
   routes until 1s readers disconnected and the authority logged `Broken pipe`.
-  Storage-node heartbeat refreshes now include only historical routes at or
-  above the node's reported history floor plus explicit metadata-transfer
-  source routes required by current peering proofs. The UAT readiness/admin
-  check uses a compact runtime-map status RPC instead of repeatedly fetching
-  the full historical map. Full runtime-map snapshots still export retained
-  history for consumers that need route reconstruction.
+  The first fix limited storage-node heartbeat refreshes to the reported
+  history floor, but soak runs still hit large responses when a long-lived
+  node had an old durable shard/backfill floor. The refresh response is now
+  shaped by the heartbeat's observed epoch: startup heartbeats at
+  `ClusterEpoch::INITIAL` still receive the durable floor bootstrap history,
+  while steady-state refreshes receive only route-history delta from the
+  node's observed epoch plus explicit metadata-transfer source routes required
+  by current peering proofs. Storage-node config refresh merges that delta
+  with locally retained history so old shard/backfill references are not
+  forgotten. The UAT readiness/admin check uses a compact runtime-map status
+  RPC instead of repeatedly fetching the full historical map. Full runtime-map
+  snapshots still export retained history for consumers that need route
+  reconstruction.
 
 ### RPC2. RESOLVED — Epoch validation now uses a refreshed per-frame config snapshot
 

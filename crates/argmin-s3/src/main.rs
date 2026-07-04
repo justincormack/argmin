@@ -1662,7 +1662,7 @@ impl ControlPlaneHeartbeatRuntimeMapSource for ExperimentalRaftControlPlane {
         }
         let runtime_map = self
             .current_snapshot()?
-            .runtime_map_for_storage_node_refresh(authority_now_ms, node_id)?;
+            .runtime_map_for_storage_node_refresh(authority_now_ms, node_id, observed_epoch)?;
         Ok(ControlPlaneHeartbeatRefresh::new(lease, runtime_map))
     }
 }
