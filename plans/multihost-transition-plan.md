@@ -10795,6 +10795,14 @@ Phase 12.4 progress:
   real process, and verifies the replayed vote is checkpointed back into the
   durable artifact. This pins the production startup path before moving peer
   responses from full artifact checkpoints to WAL fsync.
+- Extended the process-level WAL suffix restart coverage from vote-only replay
+  to a committed command suffix. The new test appends a post-checkpoint vote,
+  normal control-plane command entry, and committed watermark directly into the
+  WAL, proves artifact-plus-WAL restore sees the committed suffix while the
+  checkpoint artifact alone does not, restarts the real process, and verifies
+  OpenRaft startup catches the state machine up and checkpoints the resulting PG
+  acting-set change. This closes the main coverage gap before replacing
+  peer-response full artifact checkpoints with WAL fsync acknowledgements.
 
 1. define the replicated control-plane state machine:
    - state includes cluster epoch, PG count, PG state, PG acting sets, node

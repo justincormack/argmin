@@ -7,10 +7,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use openraft::Vote;
+use openraft::impls::leader_id_adv::LeaderId;
+use openraft::impls::Entry;
+use openraft::storage::RaftLogStorage;
+use openraft::{EntryPayload, LogId, Vote};
+use storage::control_plane_command::ControlPlaneCommand;
 use storage::control_plane_raft::{
-    durable_artifact_wal_path, ControlPlaneRaftLeaderId, ControlPlaneRaftRestartArtifact,
-    ControlPlaneRaftWalFile, ControlPlaneRaftWalRecord,
+    durable_artifact_wal_path, ControlPlaneRaftEntry, ControlPlaneRaftLeaderId,
+    ControlPlaneRaftRestartArtifact, ControlPlaneRaftWalFile, ControlPlaneRaftWalRecord,
 };
 use storage::{NodeId, PgId};
 
@@ -385,6 +389,44 @@ fn artifact_persisted_vote_with_wal(
         .persisted_vote()
         .map_err(|error| error.to_string())?;
     Ok(vote.map(persisted_vote_summary))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PersistedLogStateSummary {
+    last_log_id: Option<LogId<ControlPlaneRaftLeaderId>>,
+    committed: Option<LogId<ControlPlaneRaftLeaderId>>,
+}
+
+fn artifact_log_state_with_wal(
+    path: &Path,
+    cluster_name: &str,
+    node_id: u64,
+) -> Result<PersistedLogStateSummary, String> {
+    let artifact = match ControlPlaneRaftRestartArtifact::load_durable_artifact(path) {
+        Ok(artifact) => artifact,
+        Err(error) => return Err(error.to_string()),
+    };
+    let (mut log_store, _state_machine) = artifact
+        .restore_with_wal_file(ControlPlaneRaftWalFile::new(
+            durable_artifact_wal_path(path),
+            cluster_name,
+            node_id,
+        ))
+        .map_err(|error| error.to_string())?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| error.to_string())?;
+    let log_state = runtime
+        .block_on(RaftLogStorage::get_log_state(&mut log_store))
+        .map_err(|error| error.to_string())?;
+    let committed = runtime
+        .block_on(RaftLogStorage::read_committed(&mut log_store))
+        .map_err(|error| error.to_string())?;
+    Ok(PersistedLogStateSummary {
+        last_log_id: log_state.last_log_id,
+        committed,
+    })
 }
 
 fn follower_artifact_pg_has_acting_set(
@@ -776,6 +818,101 @@ fn experimental_raft_process_restart_replays_post_checkpoint_wal_suffix() {
         &state_path,
         101,
         injected_term,
+        &mut [&mut restarted101],
+    );
+}
+
+#[test]
+fn experimental_raft_process_restart_replays_post_checkpoint_wal_command_suffix() {
+    let bin = argmin_s3_bin();
+    let test_dir = TestDir::new("experimental-raft-process-wal-command-suffix");
+    let cluster_name = format!(
+        "process-wal-command-suffix-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after Unix epoch")
+            .as_nanos()
+    );
+    let raft_node_ids = [101];
+    let mut node101 = ChildGuard::spawn(&bin, test_dir.path(), &cluster_name, 101, &raft_node_ids);
+    wait_for_socket_file(&peer_socket(test_dir.path(), 101), &mut node101);
+
+    let control_socket = control_socket(test_dir.path(), 101);
+    wait_for_runtime_map_ready_on(&bin, &control_socket, test_dir.path(), &mut [&mut node101]);
+    let state_path = state_path(test_dir.path(), 101);
+    let vote_before_restart = artifact_persisted_vote_with_wal(&state_path, &cluster_name, 101)
+        .expect("artifact plus WAL should restore before WAL command suffix injection")
+        .expect("bootstrapped process should persist a vote");
+    let log_state_before_restart = artifact_log_state_with_wal(&state_path, &cluster_name, 101)
+        .expect("artifact plus WAL should expose log state before suffix injection");
+    let last_log_id = log_state_before_restart
+        .last_log_id
+        .expect("bootstrapped process should have a retained log tip");
+
+    node101.stop();
+
+    assert!(
+        !follower_artifact_pg_has_acting_set(&state_path, PgId::new(0), &[NodeId::new(1)])
+            .expect("artifact should restore before WAL command suffix injection"),
+        "checkpoint artifact should not already contain the injected acting-set change"
+    );
+
+    let command_term = vote_before_restart.term + 1_000;
+    let command_log_id = LogId::new(
+        LeaderId {
+            term: command_term,
+            node_id: 101,
+        },
+        last_log_id.index() + 1,
+    );
+    let command_entry: ControlPlaneRaftEntry = Entry {
+        log_id: command_log_id,
+        payload: EntryPayload::Normal(ControlPlaneCommand::SetPgActingSet {
+            pg_id: PgId::new(0),
+            acting_set: vec![NodeId::new(1)],
+        }),
+    };
+    let wal = ControlPlaneRaftWalFile::new(wal_path(test_dir.path(), 101), &cluster_name, 101);
+    wal.append_record(&ControlPlaneRaftWalRecord::SaveVote(Vote::<
+        ControlPlaneRaftLeaderId,
+    >::new_committed(
+        command_term, 101
+    )))
+    .expect("test should append a post-checkpoint WAL vote record");
+    wal.append_record(&ControlPlaneRaftWalRecord::Append(vec![command_entry]))
+        .expect("test should append a post-checkpoint WAL command entry");
+    wal.append_record(&ControlPlaneRaftWalRecord::SaveCommitted(Some(
+        command_log_id,
+    )))
+    .expect("test should append a post-checkpoint WAL committed watermark");
+
+    assert!(
+        !follower_artifact_pg_has_acting_set(&state_path, PgId::new(0), &[NodeId::new(1)])
+            .expect("artifact should still restore after WAL command suffix injection"),
+        "WAL suffix injection must not rewrite the checkpoint artifact"
+    );
+    assert_eq!(
+        artifact_log_state_with_wal(&state_path, &cluster_name, 101)
+            .expect("artifact plus WAL should restore log state after command suffix injection")
+            .committed,
+        Some(command_log_id),
+        "artifact plus WAL restore should observe the injected committed command suffix"
+    );
+
+    let mut restarted101 =
+        ChildGuard::spawn(&bin, test_dir.path(), &cluster_name, 101, &raft_node_ids);
+    wait_for_socket_file(&peer_socket(test_dir.path(), 101), &mut restarted101);
+    wait_for_runtime_map_ready_on(
+        &bin,
+        &control_socket,
+        test_dir.path(),
+        &mut [&mut restarted101],
+    );
+    wait_for_follower_artifact_pg_acting_set(
+        &state_path,
+        PgId::new(0),
+        &[NodeId::new(1)],
         &mut [&mut restarted101],
     );
 }
