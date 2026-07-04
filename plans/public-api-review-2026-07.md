@@ -23,7 +23,8 @@ Open. Nothing in this plan has been fixed yet.
 Suggested order of attack:
 1. Auth path gaps (A1-A4) — small, well-localized, each with an existing
    header-path test to mirror.
-2. Storage lease deadline (S1) and the schema migration policy decision (S2).
+2. Storage lease deadline (S1). S2 was invalidated by the documented
+   no-upgrade policy.
 3. Unify checksum-algorithm parsing (K1) and make `from_header_iter` fail
    closed — kills two findings at once.
 4. The mechanical sweeps (patterns P1-P6) — churn-proofing that turns the next
@@ -167,15 +168,13 @@ steps it performs.
   layers (`traits.rs:96-107`, node_client layers, `pg_store/metadata.rs:5372`)
   and/or add a reaper analogous to the drain one.
 
-- [ ] **S2. New `buckets` column added without a migration.** Commit 69470e83
-  added `bucket_delete_finalize_completed_multipart_next_pg_index` only inside
-  `CREATE TABLE IF NOT EXISTS buckets` (`schema.rs:571`). A pre-existing
-  database hits "no such column" in every bucket-delete finalize
-  (`pg_store/metadata.rs:8703+`). Siblings `completed_multipart_upload_sequence`
-  and `bucket_abac_enabled` (schema.rs:570,572) share the gap, while other
-  columns do get idempotent ALTERs (schema.rs:849-867, 909, 957-984). Fix: add
-  the ALTERs, and decide/document the schema-compat policy once (pre-release
-  wipes vs migrations).
+- [x] **S2. Invalid: new `buckets` column added without a migration.** This
+  finding assumed pre-alpha stores are upgraded in place. They are not:
+  `plans/storage-upgrade-versioning-plan.md` documents the explicit no-upgrade
+  policy, and `guides/threat_model.md` states older database schemas are not
+  supported until a future stability point. Do not add idempotent `ALTER`s for
+  this. Existing speculative baseline migrations should be audited and removed
+  under Phase 0 of the storage upgrade/versioning plan.
 
 - [ ] **S3. `CompleteReadyPgPeerings` skips the node-service authorization
   its single-item twin enforces.** `CompletePgPeering` carries
