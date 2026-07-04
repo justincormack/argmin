@@ -83,12 +83,14 @@ steps it performs.
   oracle coverage proving an epoch-dated presigned URL is rejected rather than
   accepted.
 
-- [ ] **A4. Presigned path has no future-skew check.** Header auth rejects
+- [x] **A4. Presigned path has no future-skew check.** Header auth rejects
   `|now - x-amz-date| > 900s` both directions (request.rs:283-288); presigned
-  checks only expiry (request.rs:429-444), so an `X-Amz-Date` a year in the
-  future is accepted immediately and stays valid until then + expires. AWS
-  returns 403 AccessDenied ("request is not valid yet"). Fix: reject when
-  `request_epoch > now + SIGV4_CLOCK_SKEW_SECS` in `authenticate_presigned`.
+  checked only expiry (request.rs:429-444), so an `X-Amz-Date` in the future
+  was accepted immediately and stayed valid until then + expires. AWS oracle:
+  a presigned URL dated `21000101T000000Z` returns 403 AccessDenied with
+  message `Request is not yet valid`. Completed by rejecting
+  `request_epoch > now + SIGV4_CLOCK_SKEW_SECS` in `authenticate_presigned`
+  with a presigned-specific auth error that renders the AWS response shape.
 
 - [ ] **A5. One `AuthError::RequestExpired` conflates two AWS errors.**
   Produced for header clock skew (request.rs:287) and presigned expiry

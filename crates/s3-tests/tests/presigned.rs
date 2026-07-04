@@ -1576,6 +1576,50 @@ fn test_object_raw_get_x_amz_epoch_date_is_expired() {
 }
 
 #[test]
+fn test_object_raw_get_x_amz_future_date_is_not_valid_yet() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key("obj")
+            .body(ByteStream::from_static(b"data"))
+            .send()
+            .await
+            .unwrap();
+
+        let presigned_url = presign_object_with_fixed_amz_date(
+            primary_credentials(),
+            "GET",
+            &bucket,
+            "obj",
+            Duration::from_secs(900),
+            "21000101T000000Z",
+        );
+
+        let mut resp = agent().get(&presigned_url).call().expect("transport error");
+        let status = resp.status().as_u16();
+        let body = resp.body_mut().read_to_string().unwrap();
+        assert_eq!(
+            status, 403,
+            "expected 403 for future-dated presigned URL, got {status}: {body}"
+        );
+        assert!(
+            body.contains("<Code>AccessDenied</Code>"),
+            "expected AccessDenied response, got: {body}"
+        );
+        assert!(
+            body.contains("<Message>Request is not yet valid</Message>"),
+            "expected not-yet-valid response, got: {body}"
+        );
+
+        cleanup(&bucket, &["obj"]).await;
+    });
+}
+
+#[test]
 fn test_object_raw_put_authenticated_expired() {
     s3_tests::run(async {
         let bucket = setup_bucket().await;

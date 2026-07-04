@@ -31,6 +31,8 @@ pub enum AuthError {
     MissingSignedHeader { header: String },
     #[error("request timestamp is too far from server time")]
     RequestExpired,
+    #[error("Request is not yet valid")]
+    RequestNotYetValid,
     #[error("there were headers present in the request which were not signed")]
     UnsignedHeaders { headers: Vec<String> },
 }
@@ -68,6 +70,7 @@ impl std::fmt::Debug for AuthError {
                 .field("header", &observability::escaped(header))
                 .finish(),
             Self::RequestExpired => f.write_str("RequestExpired"),
+            Self::RequestNotYetValid => f.write_str("RequestNotYetValid"),
             Self::UnsignedHeaders { headers } => {
                 let headers: Vec<_> = headers
                     .iter()

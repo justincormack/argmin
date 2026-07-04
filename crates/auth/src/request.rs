@@ -441,6 +441,9 @@ fn authenticate_presigned<H: HeaderSource + ?Sized>(
             param: "X-Amz-Expires",
         });
     }
+    if request_epoch > now_epoch_secs.saturating_add(crate::SIGV4_CLOCK_SKEW_SECS) {
+        return Err(AuthError::RequestNotYetValid);
+    }
     if expires == 0 || now_epoch_secs > request_epoch.saturating_add(expires) {
         return Err(AuthError::RequestExpired);
     }
@@ -673,6 +676,10 @@ mod tests {
 
     fn aws_example_time() -> u64 {
         parse_amz_date("20130524T000000Z").unwrap()
+    }
+
+    fn presigned_example_time() -> u64 {
+        parse_amz_date("20240201T120500Z").unwrap()
     }
 
     fn aws_example_signed_headers() -> [(&'static str, &'static str); 5] {
@@ -973,6 +980,53 @@ mod tests {
     }
 
     #[test]
+    fn authenticate_presigned_rejects_future_skew() {
+        let store = example_store();
+        let query = "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIAIOSFODNN7EXAMPLE%2F20240201%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Date=20240201T122001Z&X-Amz-Expires=900&X-Amz-SignedHeaders=host";
+        let headers = [("host", "examplebucket.s3.amazonaws.com")];
+        let query_for_sig = canonical_query_string(query);
+        let canonical_req = canonical_request(
+            "GET",
+            "/hello.txt",
+            &query_for_sig,
+            "host:examplebucket.s3.amazonaws.com\n",
+            "host",
+            "UNSIGNED-PAYLOAD",
+        );
+        let canonical_hash = sha256_hex(canonical_req.as_bytes());
+        let scope = "20240201/us-east-1/s3/aws4_request";
+        let sts = string_to_sign("20240201T122001Z", scope, &canonical_hash);
+        let key = derive_signing_key(
+            &SecretKey::new("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".to_string()),
+            "20240201",
+            "us-east-1",
+            "s3",
+        );
+        let sig = hex_encode_lower(
+            hmac::sign(
+                &hmac::Key::new(hmac::HMAC_SHA256, key.as_ref()),
+                sts.as_bytes(),
+            )
+            .as_ref(),
+        );
+
+        let full_query = format!("{query}&X-Amz-Signature={sig}");
+        let err = authenticate_request(
+            "GET",
+            "/hello.txt",
+            &full_query,
+            &headers,
+            b"",
+            &store,
+            Some("us-east-1"),
+            "s3",
+            parse_amz_date("20240201T120500Z").unwrap(),
+        )
+        .unwrap_err();
+        assert!(matches!(err, AuthError::RequestNotYetValid));
+    }
+
+    #[test]
     fn authenticate_presigned_missing_param() {
         let store = example_store();
         let headers = [("host", "examplebucket.s3.amazonaws.com")];
@@ -1148,7 +1202,7 @@ mod tests {
             &store,
             Some("us-east-1"),
             "s3",
-            0,
+            presigned_example_time(),
         )
         .unwrap_err();
         assert!(matches!(
@@ -1173,7 +1227,7 @@ mod tests {
             &store,
             Some("us-east-1"),
             "s3",
-            0,
+            presigned_example_time(),
         )
         .unwrap_err();
         assert!(matches!(
@@ -1198,7 +1252,7 @@ mod tests {
             &store,
             Some("us-east-1"),
             "s3",
-            0,
+            presigned_example_time(),
         )
         .unwrap_err();
         assert!(matches!(
@@ -1223,7 +1277,7 @@ mod tests {
             &store,
             Some("us-east-1"),
             "s3",
-            0,
+            presigned_example_time(),
         )
         .unwrap_err();
         assert!(matches!(
@@ -1412,7 +1466,7 @@ mod tests {
             &store,
             Some("us-east-1"),
             "s3",
-            0,
+            presigned_example_time(),
         )
         .unwrap_err();
         assert!(matches!(err, AuthError::RequestExpired));
@@ -1434,7 +1488,7 @@ mod tests {
             &store,
             Some("us-east-1"),
             "s3",
-            0,
+            presigned_example_time(),
         )
         .unwrap_err();
         assert!(matches!(
@@ -1459,7 +1513,7 @@ mod tests {
             &store,
             Some("us-east-1"),
             "s3",
-            0,
+            presigned_example_time(),
         )
         .unwrap_err();
         assert!(matches!(
@@ -1509,7 +1563,7 @@ mod tests {
             &store,
             Some("us-east-1"),
             "s3",
-            0,
+            presigned_example_time(),
         )
         .unwrap_err();
         assert!(matches!(
@@ -1544,7 +1598,7 @@ mod tests {
             &store,
             Some("us-east-1"),
             "s3",
-            0,
+            presigned_example_time(),
         )
         .unwrap_err();
         assert!(matches!(err, AuthError::UnknownAccessKey));
@@ -1566,7 +1620,7 @@ mod tests {
             &store,
             Some("us-east-1"),
             "s3",
-            0,
+            presigned_example_time(),
         )
         .unwrap_err();
         assert!(matches!(err, AuthError::UnknownAccessKey));
@@ -1903,7 +1957,7 @@ mod tests {
             &store,
             Some("us-east-1"),
             "s3",
-            0,
+            presigned_example_time(),
         )
         .unwrap_err();
         assert!(matches!(
@@ -1936,7 +1990,7 @@ mod tests {
             &store,
             Some("us-east-1"),
             "s3",
-            200,
+            presigned_example_time(),
         )
         .unwrap_err();
         assert!(matches!(err, AuthError::ExpiredToken));
@@ -1959,7 +2013,7 @@ mod tests {
             &store,
             Some("us-east-1"),
             "s3",
-            0,
+            presigned_example_time(),
         )
         .unwrap_err();
         assert!(matches!(
@@ -1988,7 +2042,7 @@ mod tests {
             &store,
             Some("us-east-1"),
             "s3",
-            0,
+            presigned_example_time(),
         )
         .unwrap_err();
         assert!(matches!(
@@ -2011,7 +2065,7 @@ mod tests {
             &store,
             Some("us-east-1"),
             "s3",
-            0,
+            presigned_example_time(),
         )
         .unwrap_err();
         assert!(matches!(
@@ -2034,7 +2088,7 @@ mod tests {
             &store,
             Some("us-east-1"),
             "s3",
-            0,
+            presigned_example_time(),
         )
         .unwrap_err();
         assert!(matches!(
@@ -2063,7 +2117,7 @@ mod tests {
             &store,
             Some("us-east-1"),
             "s3",
-            0,
+            presigned_example_time(),
         )
         .unwrap_err();
         assert!(matches!(err, AuthError::SignatureMismatch));
@@ -2083,7 +2137,7 @@ mod tests {
             &store,
             Some("us-east-1"),
             "s3",
-            0,
+            presigned_example_time(),
         )
         .unwrap_err();
         assert!(matches!(
@@ -2106,7 +2160,7 @@ mod tests {
             &store,
             Some("us-east-1"),
             "s3",
-            0,
+            presigned_example_time(),
         )
         .unwrap_err();
         assert!(matches!(

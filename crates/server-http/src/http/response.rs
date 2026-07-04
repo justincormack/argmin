@@ -223,6 +223,9 @@ fn client_error_message(err: &ServerError) -> String {
         ServerError::Auth(auth::AuthError::RequestExpired) => {
             "request timestamp is too far from server time".to_string()
         }
+        ServerError::Auth(auth::AuthError::RequestNotYetValid) => {
+            "Request is not yet valid".to_string()
+        }
         ServerError::Auth(auth::AuthError::UnsignedHeaders { .. }) => {
             "There were headers present in the request which were not signed".to_string()
         }
