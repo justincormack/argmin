@@ -10755,6 +10755,14 @@ Phase 12.4 progress:
   still uses the safe full-artifact checkpoint-before-response path; switching
   acknowledgements to WAL fsync is a later 12.4 slice after file append/replay
   and crash-fault injection land.
+- Added the first file-backed OpenRaft WAL append/replay helper. The disk
+  format is a sequence of length-prefixed CRC-protected WAL frames, fsync'd on
+  append and bound to the configured cluster/local Raft node identity during
+  replay. Recovery from a missing WAL is an empty replay; a torn final frame is
+  truncated back to the last clean record; identity mismatches and corrupt
+  complete frames fail closed. This is still a storage-level primitive: the
+  live peer RPC acknowledgement path has not yet switched from full restart
+  artifact checkpoints to WAL-only fsync.
 
 1. define the replicated control-plane state machine:
    - state includes cluster epoch, PG count, PG state, PG acting sets, node
