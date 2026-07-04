@@ -318,10 +318,17 @@ steps it performs.
   predicates (`prefix.is_none() && tags.is_empty() && !has_size_filter()`) and
   emit `<Filter/>`; added local renderer coverage in `s3-types`.
 
-- [ ] **H4. `NewerNoncurrentVersions` validation predicate contradicts its
+- [x] **H4. `NewerNoncurrentVersions` validation predicate contradicts its
   error message.** `lifecycle.rs:413-417` — message says "requires an explicit
   lifecycle filter" but the predicate `!rule.filter.has_scope()` also passes a
-  legacy `<Prefix>` rule. Decide intent and align predicate + message.
+  legacy `<Prefix>` rule. AWS-pinned the ambiguous cases: explicit
+  `<Filter><Prefix>...</Prefix></Filter>` and empty `<Filter/>` with
+  `NewerNoncurrentVersions` are accepted, while legacy top-level `<Prefix>` with
+  `NewerNoncurrentVersions` is rejected as `InvalidRequest` with message
+  `NewerNoncurrentVersions element can only be used in Lifecycle V2.` Updated
+  validation to preserve the existing no-filter `MalformedXML` path while
+  rejecting the legacy-prefix V1 form with the AWS-shaped error, including the
+  AWS response XML shape (`RequestId` and `HostId`, no `Resource`).
 
 - [x] **H5. Quoted-star `If-Match` semantics disagree between core and HTTP
   layers.** Core docs + test say `If-Match: "*"` is a specific etag → 412

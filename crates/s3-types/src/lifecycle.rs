@@ -415,7 +415,13 @@ fn validate_configuration(rules: &[LifecycleRule]) -> Result<(), LifecycleConfig
         }
 
         if let Some(noncurrent) = &rule.noncurrent_version_expiration {
-            if noncurrent.newer_noncurrent_versions.is_some() && !rule.filter.has_scope() {
+            if noncurrent.newer_noncurrent_versions.is_some() && !rule.filter.explicit_filter {
+                if rule.filter.has_scope() {
+                    return Err(LifecycleConfigError::InvalidRequest {
+                        reason: "NewerNoncurrentVersions element can only be used in Lifecycle V2."
+                            .to_string(),
+                    });
+                }
                 return Err(LifecycleConfigError::MalformedXml {
                     reason: "NewerNoncurrentVersions requires an explicit lifecycle filter"
                         .to_string(),
@@ -1672,6 +1678,57 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, LifecycleConfigError::MalformedXml { .. }));
+    }
+
+    #[test]
+    fn rejects_newer_noncurrent_versions_with_legacy_prefix() {
+        let err = parse_lifecycle_configuration_xml(
+            b"<LifecycleConfiguration>\
+                <Rule>\
+                    <Prefix>logs/</Prefix>\
+                    <Status>Enabled</Status>\
+                    <NoncurrentVersionExpiration>\
+                        <NoncurrentDays>1</NoncurrentDays>\
+                        <NewerNoncurrentVersions>2</NewerNoncurrentVersions>\
+                    </NoncurrentVersionExpiration>\
+                </Rule>\
+            </LifecycleConfiguration>",
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            LifecycleConfigError::InvalidRequest {
+                reason: "NewerNoncurrentVersions element can only be used in Lifecycle V2."
+                    .to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn accepts_newer_noncurrent_versions_with_explicit_filter() {
+        let config = parse_lifecycle_configuration_xml(
+            b"<LifecycleConfiguration>\
+                <Rule>\
+                    <Filter><Prefix>logs/</Prefix></Filter>\
+                    <Status>Enabled</Status>\
+                    <NoncurrentVersionExpiration>\
+                        <NoncurrentDays>1</NoncurrentDays>\
+                        <NewerNoncurrentVersions>2</NewerNoncurrentVersions>\
+                    </NoncurrentVersionExpiration>\
+                </Rule>\
+                <Rule>\
+                    <Filter/>\
+                    <Status>Enabled</Status>\
+                    <NoncurrentVersionExpiration>\
+                        <NoncurrentDays>1</NoncurrentDays>\
+                        <NewerNoncurrentVersions>2</NewerNoncurrentVersions>\
+                    </NoncurrentVersionExpiration>\
+                </Rule>\
+            </LifecycleConfiguration>",
+        )
+        .unwrap();
+        assert_eq!(config.rules.len(), 2);
+        assert!(config.rules.iter().all(|rule| rule.filter.explicit_filter));
     }
 
     #[test]

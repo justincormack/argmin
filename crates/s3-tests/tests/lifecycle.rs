@@ -84,6 +84,18 @@ fn assert_error_message(body: &str, message: &str) {
     );
 }
 
+fn assert_error_shape_has_host_id_without_resource(body: &str) {
+    assert!(
+        body.contains("<RequestId>"),
+        "expected RequestId in body: {body}"
+    );
+    assert!(body.contains("<HostId>"), "expected HostId in body: {body}");
+    assert!(
+        !body.contains("<Resource>"),
+        "expected no Resource element in body: {body}"
+    );
+}
+
 fn assert_lifecycle_expiration_header(expiration: Option<&str>, rule_id: &str) {
     let expiration = expiration.expect("expected x-amz-expiration header");
     assert!(
@@ -394,6 +406,55 @@ async fn assert_invalid_lifecycle_put_rejected_with_message(
     );
     assert_error_code(&response_body, expected_code);
     assert_error_message(&response_body, expected_message);
+}
+
+async fn assert_invalid_lifecycle_put_rejected_with_host_id_shape(
+    body: &str,
+    expected_code: &str,
+    expected_message: &str,
+) {
+    let bucket = unique_bucket();
+    create_bucket_in_test_region(&bucket).await;
+
+    let url = format!("{}/{}?lifecycle", CTX.endpoint(), bucket);
+    let (status, response_body) = send_signed_put(&url, body.as_bytes(), true);
+
+    cleanup_bucket(&bucket).await;
+
+    assert_eq!(
+        status, 400,
+        "expected lifecycle PUT to fail, got status {status} body {response_body}"
+    );
+    assert_error_code(&response_body, expected_code);
+    assert_error_message(&response_body, expected_message);
+    assert_error_shape_has_host_id_without_resource(&response_body);
+}
+
+async fn assert_raw_lifecycle_put_round_trips(body: &[u8]) {
+    let bucket = unique_bucket();
+    create_bucket_in_test_region(&bucket).await;
+
+    let parsed =
+        s3_types::parse_lifecycle_configuration_xml(body).expect("test lifecycle XML should parse");
+    let expected = s3_types::render_lifecycle_configuration_xml(&parsed);
+
+    let url = format!("{}/{}?lifecycle", CTX.endpoint(), bucket);
+    let put = send_signed_request("PUT", &url, body, [content_md5_header(body)]);
+    assert_eq!(
+        put.status, 200,
+        "unexpected lifecycle PUT body: {}",
+        put.body
+    );
+
+    let get = send_signed_request("GET", &url, b"", std::iter::empty::<(String, String)>());
+    cleanup_bucket(&bucket).await;
+
+    assert_eq!(
+        get.status, 200,
+        "unexpected lifecycle GET body: {}",
+        get.body
+    );
+    assert_eq!(get.body, expected);
 }
 
 #[test]
@@ -707,6 +768,73 @@ fn test_put_bucket_lifecycle_rejects_newer_noncurrent_versions_without_filter() 
                 </Rule>\
             </LifecycleConfiguration>";
         assert_invalid_lifecycle_put_rejected(body, "MalformedXML").await;
+    });
+}
+
+#[test]
+fn test_put_bucket_lifecycle_accepts_newer_noncurrent_versions_with_filter_prefix() {
+    s3_tests::run(async {
+        assert_raw_lifecycle_put_round_trips(
+            br#"
+                <LifecycleConfiguration>
+                    <Rule>
+                        <ID>retain-filter-prefix</ID>
+                        <Filter><Prefix>logs/</Prefix></Filter>
+                        <Status>Enabled</Status>
+                        <NoncurrentVersionExpiration>
+                            <NoncurrentDays>1</NoncurrentDays>
+                            <NewerNoncurrentVersions>1</NewerNoncurrentVersions>
+                        </NoncurrentVersionExpiration>
+                    </Rule>
+                </LifecycleConfiguration>
+            "#,
+        )
+        .await;
+    });
+}
+
+#[test]
+fn test_put_bucket_lifecycle_accepts_newer_noncurrent_versions_with_empty_filter() {
+    s3_tests::run(async {
+        assert_raw_lifecycle_put_round_trips(
+            br#"
+                <LifecycleConfiguration>
+                    <Rule>
+                        <ID>retain-empty-filter</ID>
+                        <Filter/>
+                        <Status>Enabled</Status>
+                        <NoncurrentVersionExpiration>
+                            <NoncurrentDays>1</NoncurrentDays>
+                            <NewerNoncurrentVersions>1</NewerNoncurrentVersions>
+                        </NoncurrentVersionExpiration>
+                    </Rule>
+                </LifecycleConfiguration>
+            "#,
+        )
+        .await;
+    });
+}
+
+#[test]
+fn test_put_bucket_lifecycle_rejects_newer_noncurrent_versions_with_legacy_prefix() {
+    s3_tests::run(async {
+        let body = "<LifecycleConfiguration>\
+                <Rule>\
+                    <ID>retain-legacy-prefix</ID>\
+                    <Prefix>logs/</Prefix>\
+                    <Status>Enabled</Status>\
+                    <NoncurrentVersionExpiration>\
+                        <NoncurrentDays>1</NoncurrentDays>\
+                        <NewerNoncurrentVersions>1</NewerNoncurrentVersions>\
+                    </NoncurrentVersionExpiration>\
+                </Rule>\
+            </LifecycleConfiguration>";
+        assert_invalid_lifecycle_put_rejected_with_host_id_shape(
+            body,
+            "InvalidRequest",
+            "NewerNoncurrentVersions element can only be used in Lifecycle V2.",
+        )
+        .await;
     });
 }
 
