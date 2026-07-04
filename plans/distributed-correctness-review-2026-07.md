@@ -180,6 +180,13 @@ Confirmed mechanics; exploitability depends on clock discipline.
   because the current code has no propose-time guard at all — not even a
   committed-timestamp high-water check at apply, which would be cheap and
   deterministic.
+- R4a progress: process-level control-plane request/maintenance paths now
+  re-read the authority clock only after acquiring the serializing authority
+  mutex, immediately before constructing lease-expiry, heartbeat, and runtime-
+  map read commands/evaluations. The experimental Raft process wrapper opts
+  into that production resampling while tests can keep deterministic supplied
+  timestamps. This narrows stale-time windows but does not solve the remaining
+  R4 monotonic-clock / replicated timestamp high-water design.
 
 ### R5. RESOLVED — Fresh-follower snapshot install can violate the log store's own invariants
 

@@ -1405,11 +1405,10 @@ fn run_control_plane_process(config: &ServerConfig) -> ! {
                 }
             }
         }
-        let now_ms = storage::clock::current_time_millis();
         let expiry = authority
             .lock()
             .expect("control-plane authority mutex poisoned")
-            .expire_heartbeat_leases(now_ms);
+            .expire_heartbeat_leases(storage::clock::current_time_millis());
         match expiry {
             Ok(expiry) if !expiry.expired_nodes().is_empty() => {
                 eprintln!(
@@ -1436,6 +1435,7 @@ struct ExperimentalRaftControlPlane {
     durable_checkpoint_lock: Option<Arc<Mutex<()>>>,
     durable_serving_checkpoint: Mutex<Option<ExperimentalRaftServingCheckpointMarker>>,
     checkpoint_serving_reads: bool,
+    resample_authority_time: bool,
     durable_poison: Option<String>,
     durable_poison_gate: Arc<AtomicBool>,
 }
@@ -1478,6 +1478,14 @@ impl ExperimentalRaftServingCheckpointMarker {
 impl ExperimentalRaftControlPlane {
     fn block_on<F: Future>(&self, future: F) -> F::Output {
         block_on_control_plane_raft(&self.runtime, future)
+    }
+
+    fn authority_now_ms(&self, supplied_now_ms: u64) -> u64 {
+        if self.resample_authority_time {
+            storage::clock::current_time_millis()
+        } else {
+            supplied_now_ms
+        }
     }
 
     fn durable_poison_error(&self) -> Option<ControlPlaneError> {
@@ -1579,6 +1587,7 @@ impl ExperimentalRaftControlPlane {
         &mut self,
         now_ms: u64,
     ) -> Result<(ClusterEpoch, usize, usize), ControlPlaneError> {
+        let now_ms = self.authority_now_ms(now_ms);
         let response = self.submit_raft_command(ControlPlaneCommand::ExpireHeartbeatLeases {
             expire_at_ms: now_ms,
         })?;
@@ -1603,6 +1612,7 @@ impl ControlPlaneRuntimeMapSource for ExperimentalRaftControlPlane {
         authority_now_ms: u64,
     ) -> Result<ClusterRuntimeMapSnapshot, ControlPlaneError> {
         self.ensure_not_durably_poisoned()?;
+        let authority_now_ms = self.authority_now_ms(authority_now_ms);
         let snapshot = self.block_on(
             self.authority
                 .linearized_runtime_map_snapshot(authority_now_ms),
@@ -1618,6 +1628,7 @@ impl ControlPlaneHeartbeatRuntimeMapSource for ExperimentalRaftControlPlane {
         heartbeat: storage::control_plane::NodeHeartbeat,
         authority_now_ms: u64,
     ) -> Result<ControlPlaneHeartbeatRefresh, ControlPlaneError> {
+        let authority_now_ms = self.authority_now_ms(authority_now_ms);
         let node_id = heartbeat.node_id;
         let observed_epoch = heartbeat.observed_epoch;
         let requested_lease_duration_ms = heartbeat.requested_lease_duration_ms;
@@ -2310,6 +2321,7 @@ fn run_experimental_raft_control_plane_process(config: &ServerConfig) -> ! {
         durable_checkpoint_lock: Some(Arc::clone(&durable_checkpoint_lock)),
         durable_serving_checkpoint: Mutex::new(None),
         checkpoint_serving_reads: multi_node_raft_peer_mode,
+        resample_authority_time: true,
         durable_poison: None,
         durable_poison_gate: Arc::clone(&durable_poison_gate),
     };
@@ -2370,7 +2382,6 @@ fn run_experimental_raft_control_plane_process(config: &ServerConfig) -> ! {
                 }
             }
         }
-        let now_ms = storage::clock::current_time_millis();
         if multi_node_raft_peer_mode {
             block_on_control_plane_raft(&runtime, async {
                 maybe_trigger_experimental_raft_seed_election(
@@ -2412,7 +2423,7 @@ fn run_experimental_raft_control_plane_process(config: &ServerConfig) -> ! {
                         std::process::exit(1);
                     });
             }
-            authority.expire_heartbeat_leases(now_ms)
+            authority.expire_heartbeat_leases(storage::clock::current_time_millis())
         } else {
             Ok((ClusterEpoch::INITIAL, 0, 0))
         };
@@ -2570,11 +2581,11 @@ fn spawn_control_plane_rpc_worker(
                 return;
             }
         };
-        let now_ms = storage::clock::current_time_millis();
         let response = {
             let mut authority = authority
                 .lock()
                 .expect("control-plane authority mutex poisoned");
+            let now_ms = storage::clock::current_time_millis();
             build_control_plane_unix_response(&mut *authority, request, now_ms)
         };
         let response = match response {
@@ -3519,6 +3530,7 @@ mod tests {
             durable_checkpoint_lock: None,
             durable_serving_checkpoint: Mutex::new(None),
             checkpoint_serving_reads: false,
+            resample_authority_time: false,
             durable_poison: None,
             durable_poison_gate: Arc::new(AtomicBool::new(false)),
         };
@@ -3591,6 +3603,7 @@ mod tests {
             durable_checkpoint_lock: Some(Arc::new(Mutex::new(()))),
             durable_serving_checkpoint: Mutex::new(None),
             checkpoint_serving_reads: false,
+            resample_authority_time: false,
             durable_poison: None,
             durable_poison_gate: Arc::new(AtomicBool::new(false)),
         };
@@ -3623,6 +3636,7 @@ mod tests {
             durable_checkpoint_lock: None,
             durable_serving_checkpoint: Mutex::new(None),
             checkpoint_serving_reads: false,
+            resample_authority_time: false,
             durable_poison: None,
             durable_poison_gate: Arc::new(AtomicBool::new(false)),
         };
@@ -3816,6 +3830,7 @@ mod tests {
             durable_checkpoint_lock: Some(Arc::new(Mutex::new(()))),
             durable_serving_checkpoint: Mutex::new(None),
             checkpoint_serving_reads: false,
+            resample_authority_time: false,
             durable_poison: None,
             durable_poison_gate: Arc::new(AtomicBool::new(false)),
         };
@@ -3875,6 +3890,7 @@ mod tests {
             durable_checkpoint_lock: Some(Arc::new(Mutex::new(()))),
             durable_serving_checkpoint: Mutex::new(None),
             checkpoint_serving_reads: false,
+            resample_authority_time: false,
             durable_poison: None,
             durable_poison_gate: Arc::new(AtomicBool::new(false)),
         };
@@ -4054,6 +4070,46 @@ mod tests {
         let active_route = &active_refresh.runtime_map().pg_routes()[0];
         assert_eq!(active_route.state(), PgState::Active);
         assert_eq!(active_route.primary_lease_deadline_ms(), Some(20_800));
+
+        harness.shutdown();
+    }
+
+    #[test]
+    fn experimental_raft_control_plane_resamples_heartbeat_time_when_enabled() {
+        let mut harness = experimental_raft_test_harness("heartbeat-resample-test");
+        let mut config = test_server_config();
+        config.storage_node_sockets = vec![config::ConfiguredStorageNodeSocket {
+            node_id: 1,
+            socket_path: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
+        }];
+        config.storage_pg_ids = vec![7];
+        bootstrap_empty_experimental_raft_control_plane(&mut harness.control_plane, &config)
+            .expect("experimental raft control-plane bootstrap should succeed");
+        harness.control_plane.resample_authority_time = true;
+
+        let bootstrap_epoch = harness
+            .control_plane
+            .current_snapshot()
+            .expect("experimental snapshot should read")
+            .cluster_epoch();
+        let refresh = storage::clock::with_time_override(30_000, || {
+            harness.control_plane.refresh_node_heartbeat(
+                NodeHeartbeat {
+                    node_id: NodeId::new(1),
+                    node_incarnation: 1,
+                    endpoint: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
+                    observed_epoch: bootstrap_epoch,
+                    requested_lease_duration_ms: 500,
+                    cluster_map_history_reference_summary:
+                        storage::PgClusterMapHistoryReferenceSummary::default(),
+                    pg_observations: Vec::new(),
+                },
+                20_000,
+            )
+        })
+        .expect("experimental raft heartbeat should refresh");
+
+        assert_eq!(refresh.lease().lease_deadline_ms(), 30_500);
 
         harness.shutdown();
     }
@@ -4674,6 +4730,115 @@ mod tests {
         assert_eq!(pg.state(), PgState::Peering);
         assert_eq!(pg.active_primary(), None);
         assert_eq!(pg.peering_metadata_proof_floor(), Some(proof));
+
+        harness.shutdown();
+    }
+
+    #[test]
+    fn experimental_raft_control_plane_resamples_expiry_time_when_enabled() {
+        let mut harness = experimental_raft_test_harness("lease-expiry-resample-test");
+        let mut config = test_server_config();
+        config.storage_node_sockets = vec![config::ConfiguredStorageNodeSocket {
+            node_id: 1,
+            socket_path: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
+        }];
+        config.storage_pg_ids = vec![17];
+        bootstrap_empty_experimental_raft_control_plane(&mut harness.control_plane, &config)
+            .expect("experimental raft control-plane bootstrap should succeed");
+
+        let bootstrap_epoch = harness
+            .control_plane
+            .current_snapshot()
+            .expect("experimental snapshot should read")
+            .cluster_epoch();
+        harness
+            .control_plane
+            .refresh_node_heartbeat(
+                NodeHeartbeat {
+                    node_id: NodeId::new(1),
+                    node_incarnation: 1,
+                    endpoint: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
+                    observed_epoch: bootstrap_epoch,
+                    requested_lease_duration_ms: 500,
+                    cluster_map_history_reference_summary:
+                        storage::PgClusterMapHistoryReferenceSummary::default(),
+                    pg_observations: Vec::new(),
+                },
+                50_000,
+            )
+            .expect("experimental raft startup heartbeat should refresh");
+        let peering_epoch = harness
+            .control_plane
+            .current_snapshot()
+            .expect("experimental snapshot should read after startup heartbeat")
+            .cluster_epoch();
+        let proof = PgMetadataProof::new(92, 0x1234, 0x5678);
+        harness
+            .control_plane
+            .refresh_node_heartbeat(
+                NodeHeartbeat {
+                    node_id: NodeId::new(1),
+                    node_incarnation: 1,
+                    endpoint: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
+                    observed_epoch: peering_epoch,
+                    requested_lease_duration_ms: 600,
+                    cluster_map_history_reference_summary:
+                        storage::PgClusterMapHistoryReferenceSummary::default(),
+                    pg_observations: vec![NodePgHeartbeatObservation {
+                        pg_id: PgId::new(17),
+                        state: PgState::Peering,
+                        metadata_proof: proof,
+                        has_pending_metadata_command: false,
+                    }],
+                },
+                50_100,
+            )
+            .expect("experimental raft peering heartbeat should refresh");
+        let active_epoch = harness
+            .control_plane
+            .current_snapshot()
+            .expect("experimental snapshot should read after peering completion")
+            .cluster_epoch();
+        harness
+            .control_plane
+            .refresh_node_heartbeat(
+                NodeHeartbeat {
+                    node_id: NodeId::new(1),
+                    node_incarnation: 1,
+                    endpoint: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
+                    observed_epoch: active_epoch,
+                    requested_lease_duration_ms: 700,
+                    cluster_map_history_reference_summary:
+                        storage::PgClusterMapHistoryReferenceSummary::default(),
+                    pg_observations: vec![NodePgHeartbeatObservation {
+                        pg_id: PgId::new(17),
+                        state: PgState::Active,
+                        metadata_proof: proof,
+                        has_pending_metadata_command: false,
+                    }],
+                },
+                50_200,
+            )
+            .expect("experimental raft active heartbeat should refresh");
+        harness.control_plane.resample_authority_time = true;
+
+        let expiry = storage::clock::with_time_override(50_900, || {
+            harness.control_plane.expire_heartbeat_leases(50_000)
+        })
+        .expect("deadline expiry should use resampled time");
+        assert_eq!(expiry.1, 1);
+        assert_eq!(expiry.2, 1);
+        let expired_snapshot = harness
+            .control_plane
+            .current_snapshot()
+            .expect("experimental expired snapshot should read");
+        assert_eq!(
+            expired_snapshot
+                .node(NodeId::new(1))
+                .expect("expired node should remain recorded")
+                .availability(),
+            NodeAvailabilityState::Unavailable
+        );
 
         harness.shutdown();
     }

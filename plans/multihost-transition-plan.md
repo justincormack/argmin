@@ -10595,6 +10595,15 @@ Phase 12.3 progress:
   target fails and verifies no response frame is written. The longer-term WAL
   design remains open as a cost/performance replacement for full
   artifact-per-peer-RPC checkpoints.
+- Closed the cheap R4 stale-time guard for Phase 12.3 process paths. The
+  single-authority and experimental Raft control-plane loops now sample
+  `current_time_millis()` under the authority mutex immediately before lease
+  expiry, and Unix control-plane request workers sample under the same mutex
+  immediately before request dispatch. The production experimental Raft wrapper
+  also re-samples authority time at heartbeat, expiry, and linearized runtime-
+  map boundaries; deterministic tests keep explicit supplied timestamps unless
+  they opt into production resampling. The full monotonic-clock and replicated
+  lease timestamp design remains later Phase 12 work.
 
 1. define the replicated control-plane state machine:
    - state includes cluster epoch, PG count, PG state, PG acting sets, node
