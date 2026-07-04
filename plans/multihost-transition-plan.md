@@ -10606,6 +10606,14 @@ Phase 12.3 progress:
   map boundaries; deterministic tests keep explicit supplied timestamps unless
   they opt into production resampling. The full monotonic-clock and replicated
   lease timestamp design remains later Phase 12 work.
+- Closed the R7 missing-artifact restart tripwire for Phase 12.3. Durable
+  experimental OpenRaft checkpoints now write a sidecar sentinel that records
+  the cluster name and local Raft node id. Startup is fresh only when both the
+  restart artifact and sentinel are absent; if the sentinel remains but the
+  artifact is missing, or if either identity mismatches the current config,
+  startup fails closed before constructing OpenRaft state. A process smoke
+  deletes only a follower's artifact after it has persisted replicated state
+  and verifies restart exits instead of voting fresh.
 
 1. define the replicated control-plane state machine:
    - state includes cluster epoch, PG count, PG state, PG acting sets, node

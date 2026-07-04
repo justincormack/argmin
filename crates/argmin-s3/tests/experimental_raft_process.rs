@@ -507,6 +507,39 @@ fn state_path(test_dir: &Path, node_id: u64) -> PathBuf {
     test_dir.join(format!("control-{node_id}.state"))
 }
 
+fn state_sentinel_path(test_dir: &Path, node_id: u64) -> PathBuf {
+    let state_path = state_path(test_dir, node_id);
+    let file_name = state_path
+        .file_name()
+        .and_then(|file_name| file_name.to_str())
+        .expect("state path should have UTF-8 file name");
+    state_path.with_file_name(format!("{file_name}.sentinel"))
+}
+
+fn wait_for_process_exit(child: &mut ChildGuard, timeout: Duration) -> ExitStatus {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let process = child
+            .child
+            .as_mut()
+            .expect("argmin-s3 process should not be checked after stop");
+        match process.try_wait() {
+            Ok(Some(status)) => return status,
+            Ok(None) => {}
+            Err(error) => panic!("argmin-s3 process status should be readable: {error}"),
+        }
+        if Instant::now() >= deadline {
+            panic!(
+                "argmin-s3 process {} did not exit within {:?}\n{}",
+                child.node_id,
+                timeout,
+                process_logs(&child.test_dir)
+            );
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
 #[test]
 fn experimental_raft_two_control_plane_processes_replicate_bootstrap_to_follower_artifact() {
     let bin = argmin_s3_bin();
@@ -543,6 +576,56 @@ fn experimental_raft_two_control_plane_processes_replicate_bootstrap_to_follower
         state_path(test_dir.path(), 101)
     };
     wait_for_follower_artifact(&follower_state, &mut [&mut node101, &mut node102]);
+}
+
+#[test]
+fn experimental_raft_process_rejects_missing_artifact_after_state_existed() {
+    let bin = argmin_s3_bin();
+    let test_dir = TestDir::new("experimental-raft-process-missing-artifact");
+    let cluster_name = format!(
+        "process-missing-artifact-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after Unix epoch")
+            .as_nanos()
+    );
+    let raft_node_ids = [101, 102];
+    let mut node102 = ChildGuard::spawn(&bin, test_dir.path(), &cluster_name, 102, &raft_node_ids);
+    wait_for_socket_file(&peer_socket(test_dir.path(), 102), &mut node102);
+    let mut node101 = ChildGuard::spawn(&bin, test_dir.path(), &cluster_name, 101, &raft_node_ids);
+
+    let (_leader_socket, _output) = wait_for_runtime_map_ready(
+        &bin,
+        test_dir.path(),
+        &mut [&mut node101, &mut node102],
+        &raft_node_ids,
+    );
+    wait_for_follower_artifact(
+        &state_path(test_dir.path(), 102),
+        &mut [&mut node101, &mut node102],
+    );
+    assert!(
+        state_sentinel_path(test_dir.path(), 102).exists(),
+        "node 102 should persist a state-existed sentinel"
+    );
+
+    node102.stop();
+    fs::remove_file(state_path(test_dir.path(), 102))
+        .expect("test should delete only the durable artifact, not the sentinel");
+
+    let mut restarted102 =
+        ChildGuard::spawn(&bin, test_dir.path(), &cluster_name, 102, &raft_node_ids);
+    let status = wait_for_process_exit(&mut restarted102, Duration::from_secs(5));
+    assert!(
+        !status.success(),
+        "restart without artifact should fail closed, got {status}"
+    );
+    let logs = process_logs(test_dir.path());
+    assert!(
+        logs.contains("is missing but sentinel"),
+        "restart failure should mention sentinel guard:\n{logs}"
+    );
 }
 
 #[test]

@@ -248,6 +248,13 @@ hazard (persisted vote gone). Confirmed by design
 (`control_plane_raft.rs:2710-2716`, bootstrap at main.rs:1907-1919,
 :2073-2116). No "state previously existed" tripwire (sentinel lock file, or
 peer cross-check of authority incarnation on rejoin).
+- Fixed for Phase 12.3 by adding a durable sidecar sentinel next to the
+  experimental OpenRaft restart artifact. Fresh startup is allowed only when
+  both artifact and sentinel are absent; an existing sentinel with a missing
+  artifact fails closed, and artifact/sentinel cluster or local-node identity
+  mismatches are rejected before constructing OpenRaft state. Peer
+  incarnation cross-checks remain part of a later production rejoin/membership
+  slice.
 
 ### R8. LOW — Poison does not gate the Raft peer socket
 
@@ -369,12 +376,12 @@ shift.
    `RecordNodeHeartbeat` also rejects per-node lease-deadline regression.
    These guards are pure functions of committed state, so deterministic replay
    is preserved.
-5. **Fault-injection tests for the ack→checkpoint window (R1, R7).**
+5. **Fault-injection tests for the ack→checkpoint window (R1).**
    Deterministic pause hook between response write and checkpoint + SIGKILL;
-   assert refusal to double-vote and acked-state survival. Add a "state
-   previously existed" tripwire (sentinel file, or peers cross-checking
-   authority incarnation on rejoin) so an empty restart of a known member
-   fails closed instead of silently voting fresh.
+   assert refusal to double-vote and acked-state survival. The local "state
+   previously existed" tripwire from R7 is now in place via the durable
+   sidecar sentinel; peer authority-incarnation cross-checking remains deferred
+   to the later production rejoin/membership slice.
 6. **DONE — Cover the fresh-follower snapshot path (R5).** Leader purges,
    brand-new empty peer joins via `install_full_snapshot`; `purge()` now
    establishes the committed gate only for the fresh empty-log snapshot-install

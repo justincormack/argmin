@@ -2706,8 +2706,23 @@ fn restore_experimental_raft_durable_artifact(
     artifact_path: &Path,
     validate_artifact: impl FnOnce(&ControlPlaneRaftRestartArtifact) -> Result<(), ControlPlaneError>,
 ) -> Result<(ControlPlaneRaftLogStore, ControlPlaneRaftStateMachine), ControlPlaneError> {
+    let sentinel_path = durable_artifact_sentinel_path(artifact_path);
     match ControlPlaneRaftRestartArtifact::load_durable_artifact(artifact_path) {
         Ok(artifact) => {
+            let sentinel = ControlPlaneRaftRestartSentinel::load_durable_sentinel(&sentinel_path)
+                .map_err(|error| match error {
+                    ControlPlaneError::Io { source, .. }
+                        if source.kind() == io::ErrorKind::NotFound =>
+                    {
+                        raft_artifact_protocol_error(format!(
+                            "control-plane OpenRaft durable restart sentinel {} is missing for existing artifact {}",
+                            sentinel_path.display(),
+                            artifact_path.display()
+                        ))
+                    }
+                    other => other,
+                })?;
+            sentinel.validate_identity(cluster_name, node_id)?;
             artifact.validate_cluster_identity(cluster_name)?;
             artifact.validate_local_node_identity(node_id)?;
             validate_artifact(&artifact)?;
@@ -2717,6 +2732,21 @@ fn restore_experimental_raft_durable_artifact(
             })
         }
         Err(ControlPlaneError::Io { source, .. }) if source.kind() == io::ErrorKind::NotFound => {
+            match ControlPlaneRaftRestartSentinel::load_durable_sentinel(&sentinel_path) {
+                Ok(sentinel) => {
+                    sentinel.validate_identity(cluster_name, node_id)?;
+                    return Err(raft_artifact_protocol_error(format!(
+                        "control-plane OpenRaft durable restart artifact {} is missing but sentinel {} records existing state for cluster {:?} node {}",
+                        artifact_path.display(),
+                        sentinel_path.display(),
+                        sentinel.cluster_name,
+                        sentinel.local_node_id
+                    )));
+                }
+                Err(ControlPlaneError::Io { source, .. })
+                    if source.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
             Ok((
                 ControlPlaneRaftLogStore::empty(),
                 ControlPlaneRaftStateMachine::empty(),
@@ -3799,9 +3829,17 @@ pub struct ControlPlaneRaftRestartArtifact {
     state_machine: ControlPlaneRaftStateMachineRestartArtifact,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ControlPlaneRaftRestartSentinel {
+    cluster_name: String,
+    local_node_id: ControlPlaneRaftNodeId,
+}
+
 const CONTROL_PLANE_RAFT_RESTART_MAGIC: &[u8] = b"ARGMINCPRAFT";
 const CONTROL_PLANE_RAFT_RESTART_VERSION: u16 = 3;
 const CONTROL_PLANE_RAFT_RESTART_CHECKSUM_LEN: usize = 8;
+const CONTROL_PLANE_RAFT_RESTART_SENTINEL_MAGIC: &[u8] = b"ARGMINCPRAFTSEEN";
+const CONTROL_PLANE_RAFT_RESTART_SENTINEL_VERSION: u16 = 1;
 const CONTROL_PLANE_RAFT_RESTART_CAPTURE_MAX_ATTEMPTS: usize = 16;
 const CONTROL_PLANE_RAFT_PEER_RPC_MAGIC: &[u8] = b"ARGMINCPRAFTPEER";
 const CONTROL_PLANE_RAFT_PEER_RPC_VERSION: u16 = 1;
@@ -4205,6 +4243,17 @@ impl ControlPlaneRaftRestartArtifact {
                 context: "validate control-plane OpenRaft durable restart artifact",
                 source,
             })?;
+        let sentinel_path = durable_artifact_sentinel_path(path);
+        match ControlPlaneRaftRestartSentinel::load_durable_sentinel(&sentinel_path) {
+            Ok(sentinel) => {
+                sentinel.validate_identity(&self.cluster_name, self.local_node_id)?;
+            }
+            Err(ControlPlaneError::Io { source, .. })
+                if source.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        ControlPlaneRaftRestartSentinel::for_artifact(self)
+            .store_durable_sentinel(&sentinel_path)?;
         let bytes = self.encode_durable_artifact()?;
         if let Some(parent) = path
             .parent()
@@ -4715,6 +4764,138 @@ impl ControlPlaneRaftRestartArtifact {
     }
 }
 
+impl ControlPlaneRaftRestartSentinel {
+    fn for_artifact(artifact: &ControlPlaneRaftRestartArtifact) -> Self {
+        Self {
+            cluster_name: artifact.cluster_name.clone(),
+            local_node_id: artifact.local_node_id,
+        }
+    }
+
+    fn validate_identity(
+        &self,
+        expected_cluster_name: &str,
+        expected_local_node_id: ControlPlaneRaftNodeId,
+    ) -> Result<(), ControlPlaneError> {
+        if self.cluster_name != expected_cluster_name {
+            return Err(raft_artifact_protocol_error(format!(
+                "control-plane OpenRaft durable restart sentinel belongs to cluster {:?}, not configured cluster {:?}",
+                self.cluster_name, expected_cluster_name
+            )));
+        }
+        if self.local_node_id != expected_local_node_id {
+            return Err(raft_artifact_protocol_error(format!(
+                "control-plane OpenRaft durable restart sentinel belongs to local OpenRaft node {}, not configured local node {expected_local_node_id}",
+                self.local_node_id
+            )));
+        }
+        Ok(())
+    }
+
+    fn encode_durable_sentinel(&self) -> Result<Vec<u8>, ControlPlaneError> {
+        let mut out = Vec::new();
+        out.extend_from_slice(CONTROL_PLANE_RAFT_RESTART_SENTINEL_MAGIC);
+        write_raft_u16(&mut out, CONTROL_PLANE_RAFT_RESTART_SENTINEL_VERSION);
+        write_raft_string(&mut out, &self.cluster_name)?;
+        write_raft_u64(&mut out, self.local_node_id);
+        append_raft_artifact_checksum(&mut out);
+        Ok(out)
+    }
+
+    fn decode_durable_sentinel(bytes: &[u8]) -> Result<Self, ControlPlaneError> {
+        let min_len = CONTROL_PLANE_RAFT_RESTART_SENTINEL_MAGIC.len()
+            + 2
+            + CONTROL_PLANE_RAFT_RESTART_CHECKSUM_LEN;
+        if bytes.len() < min_len {
+            return Err(raft_artifact_protocol_error(
+                "truncated control-plane OpenRaft durable restart sentinel",
+            ));
+        }
+        let (body, checksum_bytes) =
+            bytes.split_at(bytes.len() - CONTROL_PLANE_RAFT_RESTART_CHECKSUM_LEN);
+        let expected_checksum = u64::from_be_bytes(
+            checksum_bytes
+                .try_into()
+                .expect("checksum split length is fixed"),
+        );
+        let actual_checksum = raft_artifact_checksum(body);
+        if actual_checksum != expected_checksum {
+            return Err(raft_artifact_protocol_error(format!(
+                "control-plane OpenRaft durable restart sentinel checksum mismatch: expected {expected_checksum:#x}, actual {actual_checksum:#x}"
+            )));
+        }
+
+        let mut reader = RaftArtifactReader::new(body);
+        let magic = reader.read_exact(CONTROL_PLANE_RAFT_RESTART_SENTINEL_MAGIC.len())?;
+        if magic != CONTROL_PLANE_RAFT_RESTART_SENTINEL_MAGIC {
+            return Err(raft_artifact_protocol_error(
+                "invalid control-plane OpenRaft durable restart sentinel magic",
+            ));
+        }
+        let version = reader.read_u16()?;
+        if version != CONTROL_PLANE_RAFT_RESTART_SENTINEL_VERSION {
+            return Err(raft_artifact_protocol_error(format!(
+                "unsupported control-plane OpenRaft durable restart sentinel version {version}"
+            )));
+        }
+        let sentinel = Self {
+            cluster_name: reader.read_string()?,
+            local_node_id: reader.read_u64()?,
+        };
+        reader.finish()?;
+        Ok(sentinel)
+    }
+
+    fn load_durable_sentinel(path: &Path) -> Result<Self, ControlPlaneError> {
+        let mut file = File::open(path).map_err(|source| ControlPlaneError::Io {
+            context: "open control-plane OpenRaft durable restart sentinel",
+            source,
+        })?;
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)
+            .map_err(|source| ControlPlaneError::Io {
+                context: "read control-plane OpenRaft durable restart sentinel",
+                source,
+            })?;
+        Self::decode_durable_sentinel(&bytes)
+    }
+
+    fn store_durable_sentinel(&self, path: &Path) -> Result<(), ControlPlaneError> {
+        let bytes = self.encode_durable_sentinel()?;
+        if let Some(parent) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            fs::create_dir_all(parent).map_err(|source| ControlPlaneError::Io {
+                context: "create control-plane OpenRaft durable restart sentinel directory",
+                source,
+            })?;
+        }
+        let tmp_path = durable_artifact_tmp_path(path);
+        {
+            let mut file = File::create(&tmp_path).map_err(|source| ControlPlaneError::Io {
+                context: "create control-plane OpenRaft durable restart sentinel temp file",
+                source,
+            })?;
+            file.write_all(&bytes)
+                .map_err(|source| ControlPlaneError::Io {
+                    context: "write control-plane OpenRaft durable restart sentinel temp file",
+                    source,
+                })?;
+            file.sync_all().map_err(|source| ControlPlaneError::Io {
+                context: "sync control-plane OpenRaft durable restart sentinel temp file",
+                source,
+            })?;
+        }
+        fs::rename(&tmp_path, path).map_err(|source| ControlPlaneError::Io {
+            context: "commit control-plane OpenRaft durable restart sentinel",
+            source,
+        })?;
+        sync_durable_artifact_parent(path)?;
+        Ok(())
+    }
+}
+
 fn decode_raft_peer_rpc_frame<T>(
     bytes: &[u8],
     expected_kind: u8,
@@ -5167,6 +5348,14 @@ fn durable_artifact_tmp_path(path: &Path) -> PathBuf {
         .and_then(|file_name| file_name.to_str())
         .unwrap_or("control-plane-raft.state");
     path.with_file_name(format!("{file_name}.tmp.{}", std::process::id()))
+}
+
+fn durable_artifact_sentinel_path(path: &Path) -> PathBuf {
+    let file_name = path
+        .file_name()
+        .and_then(|file_name| file_name.to_str())
+        .unwrap_or("control-plane-raft.state");
+    path.with_file_name(format!("{file_name}.sentinel"))
 }
 
 fn sync_durable_artifact_parent(path: &Path) -> Result<(), ControlPlaneError> {
@@ -14694,6 +14883,60 @@ mod tests {
     }
 
     #[test]
+    fn control_plane_raft_durable_restart_sentinel_round_trips_with_artifact() {
+        let tmp = test_util::tempdir();
+        let path = tmp.path().join("raft.state");
+        let sentinel_path = durable_artifact_sentinel_path(&path);
+        let artifact = ControlPlaneRaftRestartArtifact {
+            cluster_name: "test-cluster".to_string(),
+            local_node_id: 1,
+            log_store: ControlPlaneRaftLogStoreRestartArtifact::default(),
+            state_machine: ControlPlaneRaftStateMachine::empty().export_restart_artifact(),
+        };
+
+        artifact.store_durable_artifact(&path).unwrap();
+
+        let sentinel = ControlPlaneRaftRestartSentinel::load_durable_sentinel(&sentinel_path)
+            .expect("durable sentinel should be written with artifact");
+        assert_eq!(
+            sentinel,
+            ControlPlaneRaftRestartSentinel {
+                cluster_name: "test-cluster".to_string(),
+                local_node_id: 1,
+            }
+        );
+        let loaded = ControlPlaneRaftRestartArtifact::load_durable_artifact(&path)
+            .expect("stored durable restart artifact should load");
+        assert_eq!(loaded.cluster_name, "test-cluster");
+        assert_eq!(loaded.local_node_id, 1);
+    }
+
+    #[test]
+    fn control_plane_raft_durable_restart_artifact_store_rejects_mismatched_sentinel() {
+        let tmp = test_util::tempdir();
+        let path = tmp.path().join("raft.state");
+        let sentinel_path = durable_artifact_sentinel_path(&path);
+        ControlPlaneRaftRestartSentinel {
+            cluster_name: "old-cluster".to_string(),
+            local_node_id: 1,
+        }
+        .store_durable_sentinel(&sentinel_path)
+        .unwrap();
+        let artifact = ControlPlaneRaftRestartArtifact {
+            cluster_name: "new-cluster".to_string(),
+            local_node_id: 1,
+            log_store: ControlPlaneRaftLogStoreRestartArtifact::default(),
+            state_machine: ControlPlaneRaftStateMachine::empty().export_restart_artifact(),
+        };
+
+        assert_error_contains(
+            artifact.store_durable_artifact(&path),
+            "durable restart sentinel belongs to cluster \"old-cluster\"",
+        );
+        assert!(!path.exists());
+    }
+
+    #[test]
     fn control_plane_openraft_durable_single_node_starts_empty_without_artifact() {
         ControlPlaneRaftTypeConfig::run(async {
             let tmp = test_util::tempdir();
@@ -14711,6 +14954,89 @@ mod tests {
             assert_eq!(status.applied(), None);
             assert_eq!(status.committed(), None);
             assert_eq!(status.persisted_vote(), None);
+            assert!(!durable_artifact_sentinel_path(&path).exists());
+        });
+    }
+
+    #[test]
+    fn control_plane_openraft_durable_single_node_rejects_missing_artifact_with_sentinel() {
+        ControlPlaneRaftTypeConfig::run(async {
+            let tmp = test_util::tempdir();
+            let path = tmp.path().join("raft.state");
+            ControlPlaneRaftRestartSentinel {
+                cluster_name: "control-plane-raft-missing-artifact-sentinel-test".to_string(),
+                local_node_id: 1,
+            }
+            .store_durable_sentinel(&durable_artifact_sentinel_path(&path))
+            .unwrap();
+
+            assert_error_contains(
+                ControlPlaneRaftAuthority::new_experimental_single_node_durable(
+                    "control-plane-raft-missing-artifact-sentinel-test",
+                    1,
+                    &path,
+                )
+                .await,
+                "is missing but sentinel",
+            );
+        });
+    }
+
+    #[test]
+    fn control_plane_openraft_durable_single_node_rejects_artifact_without_sentinel() {
+        ControlPlaneRaftTypeConfig::run(async {
+            let tmp = test_util::tempdir();
+            let path = tmp.path().join("raft.state");
+            let cluster_name = "control-plane-raft-artifact-without-sentinel-test";
+            let artifact = ControlPlaneRaftRestartArtifact {
+                cluster_name: cluster_name.to_string(),
+                local_node_id: 1,
+                log_store: ControlPlaneRaftLogStoreRestartArtifact::default(),
+                state_machine: ControlPlaneRaftStateMachine::empty().export_restart_artifact(),
+            };
+            std::fs::write(&path, artifact.encode_durable_artifact().unwrap()).unwrap();
+
+            assert_error_contains(
+                ControlPlaneRaftAuthority::new_experimental_single_node_durable(
+                    cluster_name,
+                    1,
+                    &path,
+                )
+                .await,
+                "is missing for existing artifact",
+            );
+        });
+    }
+
+    #[test]
+    fn control_plane_openraft_durable_single_node_rejects_wrong_sentinel_identity() {
+        ControlPlaneRaftTypeConfig::run(async {
+            let tmp = test_util::tempdir();
+            let path = tmp.path().join("raft.state");
+            let cluster_name = "control-plane-raft-wrong-sentinel-test";
+            let artifact = ControlPlaneRaftRestartArtifact {
+                cluster_name: cluster_name.to_string(),
+                local_node_id: 1,
+                log_store: ControlPlaneRaftLogStoreRestartArtifact::default(),
+                state_machine: ControlPlaneRaftStateMachine::empty().export_restart_artifact(),
+            };
+            artifact.store_durable_artifact(&path).unwrap();
+            ControlPlaneRaftRestartSentinel {
+                cluster_name: cluster_name.to_string(),
+                local_node_id: 2,
+            }
+            .store_durable_sentinel(&durable_artifact_sentinel_path(&path))
+            .unwrap();
+
+            assert_error_contains(
+                ControlPlaneRaftAuthority::new_experimental_single_node_durable(
+                    cluster_name,
+                    1,
+                    &path,
+                )
+                .await,
+                "durable restart sentinel belongs to local OpenRaft node 2",
+            );
         });
     }
 
@@ -15117,6 +15443,41 @@ mod tests {
             assert_eq!(status.applied(), None);
             assert_eq!(status.committed(), None);
             authority.shutdown().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn control_plane_openraft_unix_peer_durable_rejects_missing_artifact_with_sentinel() {
+        ControlPlaneRaftTypeConfig::run(async {
+            let tmp = test_util::tempdir();
+            let path = tmp.path().join("raft.state");
+            let cluster_name = "control-plane-raft-unix-peer-missing-artifact-sentinel-test";
+            let policy = ControlPlaneRaftPeerTransportPolicy::from_peer_endpoints(
+                cluster_name,
+                [
+                    (1, "/tmp/argmin-raft-node-1.sock".to_string()),
+                    (2, "/tmp/argmin-raft-node-2.sock".to_string()),
+                ],
+                ControlPlaneRaftPeerTransportLimits::default(),
+            );
+            ControlPlaneRaftRestartSentinel {
+                cluster_name: cluster_name.to_string(),
+                local_node_id: 1,
+            }
+            .store_durable_sentinel(&durable_artifact_sentinel_path(&path))
+            .unwrap();
+
+            assert_error_contains(
+                ControlPlaneRaftAuthority::new_experimental_unix_peer_durable(
+                    cluster_name,
+                    1,
+                    &path,
+                    policy,
+                    Duration::from_millis(50),
+                )
+                .await,
+                "is missing but sentinel",
+            );
         });
     }
 
