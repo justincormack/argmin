@@ -250,12 +250,13 @@ steps it performs.
   `ChecksumAlgorithm::ALL`; have `validate_checksum_headers` delegate so both
   paths share duplicate-header and format rules.
 
-- [ ] **K4. Multipart complete path splits the validated
-  `MultipartChecksumConfig` back into two independent `Option`s** and
-  re-derives the invalid-combination rule a third time as an `InternalError`
-  arm (`crates/server-core/src/coordinator/multipart.rs:454-455, 579,
-  660-674`). The config type was designed to prevent exactly this. Fix: pass
-  the config through intact.
+- [x] **K4. Multipart complete path split the validated
+  `MultipartChecksumConfig` back into two independent `Option`s.** Fixed
+  `crates/server-core/src/coordinator/multipart.rs` to carry the validated
+  config through CompleteMultipartUpload and compute the checksum from that
+  config directly. The previous impossible invalid-combination `InternalError`
+  arm is now an unreachable `MultipartChecksumConfig` invariant inside the
+  checksum computation helper.
 
 ## Bugs — server layer
 

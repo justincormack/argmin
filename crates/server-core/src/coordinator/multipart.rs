@@ -44,6 +44,99 @@ use crate::system_metadata::SystemMetadata;
 
 const COMPLETE_MULTIPART_STALE_COMMIT_RETRIES: usize = 1;
 
+fn complete_multipart_part_checksum<'a>(
+    part: &'a MultipartPartRecord,
+    checksum_type: ChecksumType,
+) -> Result<&'a ChecksumBytes, ServerError> {
+    part.checksum
+        .as_ref()
+        .ok_or_else(|| ServerError::InvalidRequest {
+            reason: format!(
+                "{} checksum requires all parts to have checksums",
+                checksum_type.as_str()
+            ),
+        })
+}
+
+fn complete_multipart_checksum_value(
+    config: MultipartChecksumConfig,
+    part_records: &[MultipartPartRecord],
+) -> Result<String, ServerError> {
+    use base64::Engine;
+
+    let b64 = base64::engine::general_purpose::STANDARD;
+    let algorithm = config.algorithm();
+    match config.checksum_type() {
+        ChecksumType::Composite => {
+            let mut concat = Vec::new();
+            for part in part_records {
+                concat.extend_from_slice(
+                    complete_multipart_part_checksum(part, ChecksumType::Composite)?.as_slice(),
+                );
+            }
+            let hash = compute_checksum(algorithm, &concat);
+            Ok(format!(
+                "{}-{}",
+                b64.encode(hash.bytes()),
+                part_records.len()
+            ))
+        }
+        ChecksumType::FullObject => match algorithm {
+            ChecksumAlgorithm::Crc32 => {
+                let mut combined: u32 = 0;
+                for part in part_records {
+                    let bytes = complete_multipart_part_checksum(part, ChecksumType::FullObject)?;
+                    let part_crc =
+                        u32::from_be_bytes(bytes.as_slice().try_into().map_err(|_| {
+                            ServerError::InvalidRequest {
+                                reason: "invalid CRC32 checksum length".to_string(),
+                            }
+                        })?);
+                    combined = checksum::crc32::combine(combined, part_crc, part.size);
+                }
+                Ok(b64.encode(combined.to_be_bytes()))
+            }
+            ChecksumAlgorithm::Crc32c => {
+                let mut combined: u32 = 0;
+                for part in part_records {
+                    let bytes = complete_multipart_part_checksum(part, ChecksumType::FullObject)?;
+                    let part_crc =
+                        u32::from_be_bytes(bytes.as_slice().try_into().map_err(|_| {
+                            ServerError::InvalidRequest {
+                                reason: "invalid CRC32C checksum length".to_string(),
+                            }
+                        })?);
+                    combined = checksum::crc32c::combine(combined, part_crc, part.size);
+                }
+                Ok(b64.encode(combined.to_be_bytes()))
+            }
+            ChecksumAlgorithm::Crc64nvme => {
+                let mut combined: u64 = 0;
+                for part in part_records {
+                    let bytes = complete_multipart_part_checksum(part, ChecksumType::FullObject)?;
+                    let part_crc =
+                        u64::from_be_bytes(bytes.as_slice().try_into().map_err(|_| {
+                            ServerError::InvalidRequest {
+                                reason: "invalid CRC64NVME checksum length".to_string(),
+                            }
+                        })?);
+                    combined = checksum::crc64::combine(combined, part_crc, part.size);
+                }
+                Ok(b64.encode(combined.to_be_bytes()))
+            }
+            ChecksumAlgorithm::Sha1
+            | ChecksumAlgorithm::Sha256
+            | ChecksumAlgorithm::Md5
+            | ChecksumAlgorithm::XxHash64
+            | ChecksumAlgorithm::XxHash3
+            | ChecksumAlgorithm::XxHash128
+            | ChecksumAlgorithm::Sha512 => {
+                unreachable!("MultipartChecksumConfig rejects non-CRC FULL_OBJECT checksums")
+            }
+        },
+    }
+}
+
 impl Coordinator {
     pub(super) fn map_object_pg_action_error(error: storage::ObjectPgActionError) -> ServerError {
         match error {
@@ -451,19 +544,18 @@ impl Coordinator {
                 check_write_conditions(req.cond, existing_etag)?;
             }
 
-            let checksum_algo = upload.checksum.map(MultipartChecksumConfig::algorithm);
-            let checksum_type = upload.checksum.map(MultipartChecksumConfig::checksum_type);
+            let checksum_config = upload.checksum;
 
             let mut part_records: Vec<MultipartPartRecord> =
                 Vec::with_capacity(completion_snapshot.part_records.len());
             for (cp, part) in parts.iter().zip(completion_snapshot.part_records) {
-                if let (Some(upload_algo), Some(ChecksumType::Composite), None) =
-                    (checksum_algo, checksum_type, cp.checksum.as_ref())
-                {
-                    return Err(ServerError::CompleteMultipartMissingPartChecksum {
-                        algorithm: upload_algo.as_str().to_ascii_lowercase(),
-                        part_number: cp.part_number,
-                    });
+                if let Some(config) = checksum_config {
+                    if config.checksum_type() == ChecksumType::Composite && cp.checksum.is_none() {
+                        return Err(ServerError::CompleteMultipartMissingPartChecksum {
+                            algorithm: config.algorithm().as_str().to_ascii_lowercase(),
+                            part_number: cp.part_number,
+                        });
+                    }
                 }
 
                 let stored_etag = etag_bytes_to_crc64(&part.etag)
@@ -476,7 +568,8 @@ impl Coordinator {
                 }
 
                 if let Some(ref claim) = cp.checksum {
-                    if let Some(upload_algo) = checksum_algo {
+                    if let Some(config) = checksum_config {
+                        let upload_algo = config.algorithm();
                         if claim.algorithm() != upload_algo {
                             return Err(ServerError::InvalidRequest {
                                 reason: format!(
@@ -576,111 +669,12 @@ impl Coordinator {
                 }
             }
 
-            let checksum_value = if let (Some(algo), Some(ctype)) = (checksum_algo, checksum_type) {
-                use base64::Engine;
-                let b64 = base64::engine::general_purpose::STANDARD;
-                match ctype {
-                    ChecksumType::Composite => {
-                        let mut concat = Vec::new();
-                        for part in &part_records {
-                            match &part.checksum {
-                                Some(bytes) => concat.extend_from_slice(bytes.as_slice()),
-                                None => {
-                                    return Err(ServerError::InvalidRequest {
-                                    reason:
-                                        "COMPOSITE checksum requires all parts to have checksums"
-                                            .to_string(),
-                                });
-                                }
-                            }
-                        }
-                        let hash = compute_checksum(algo, &concat);
-                        Some(format!(
-                            "{}-{}",
-                            b64.encode(hash.bytes()),
-                            part_records.len()
-                        ))
-                    }
-                    ChecksumType::FullObject => match algo {
-                        ChecksumAlgorithm::Crc32 => {
-                            let mut combined: u32 = 0;
-                            for part in &part_records {
-                                let bytes = part.checksum.as_ref().ok_or_else(|| {
-                                ServerError::InvalidRequest {
-                                    reason: "FULL_OBJECT checksum requires all parts to have checksums"
-                                        .to_string(),
-                                }
-                            })?;
-                                let part_crc =
-                                    u32::from_be_bytes(bytes.as_slice().try_into().map_err(
-                                        |_| ServerError::InvalidRequest {
-                                            reason: "invalid CRC32 checksum length".to_string(),
-                                        },
-                                    )?);
-                                combined = checksum::crc32::combine(combined, part_crc, part.size);
-                            }
-                            Some(b64.encode(combined.to_be_bytes()))
-                        }
-                        ChecksumAlgorithm::Crc32c => {
-                            let mut combined: u32 = 0;
-                            for part in &part_records {
-                                let bytes = part.checksum.as_ref().ok_or_else(|| {
-                                ServerError::InvalidRequest {
-                                    reason: "FULL_OBJECT checksum requires all parts to have checksums"
-                                        .to_string(),
-                                }
-                            })?;
-                                let part_crc =
-                                    u32::from_be_bytes(bytes.as_slice().try_into().map_err(
-                                        |_| ServerError::InvalidRequest {
-                                            reason: "invalid CRC32C checksum length".to_string(),
-                                        },
-                                    )?);
-                                combined = checksum::crc32c::combine(combined, part_crc, part.size);
-                            }
-                            Some(b64.encode(combined.to_be_bytes()))
-                        }
-                        ChecksumAlgorithm::Crc64nvme => {
-                            let mut combined: u64 = 0;
-                            for part in &part_records {
-                                let bytes = part.checksum.as_ref().ok_or_else(|| {
-                                ServerError::InvalidRequest {
-                                    reason: "FULL_OBJECT checksum requires all parts to have checksums"
-                                        .to_string(),
-                                }
-                            })?;
-                                let part_crc =
-                                    u64::from_be_bytes(bytes.as_slice().try_into().map_err(
-                                        |_| ServerError::InvalidRequest {
-                                            reason: "invalid CRC64NVME checksum length".to_string(),
-                                        },
-                                    )?);
-                                combined = checksum::crc64::combine(combined, part_crc, part.size);
-                            }
-                            Some(b64.encode(combined.to_be_bytes()))
-                        }
-                        ChecksumAlgorithm::Sha1
-                        | ChecksumAlgorithm::Sha256
-                        | ChecksumAlgorithm::Md5
-                        | ChecksumAlgorithm::XxHash64
-                        | ChecksumAlgorithm::XxHash3
-                        | ChecksumAlgorithm::XxHash128
-                        | ChecksumAlgorithm::Sha512 => {
-                            return Err(ServerError::InternalError {
-                                reason: format!(
-                                    "FULL_OBJECT checksum type is not supported for {}",
-                                    algo.as_str()
-                                ),
-                            });
-                        }
-                    },
-                }
-            } else {
-                None
-            };
+            let checksum_value = checksum_config
+                .map(|config| complete_multipart_checksum_value(config, &part_records))
+                .transpose()?;
 
             if let Some(claimed) = claimed_checksum {
-                match checksum_algo {
+                match checksum_config.map(MultipartChecksumConfig::algorithm) {
                     Some(upload_algo) if claimed.algorithm() != upload_algo => {
                         return Err(ServerError::InvalidRequest {
                             reason: format!(
@@ -715,8 +709,12 @@ impl Coordinator {
 
             let mut system_metadata =
                 SystemMetadata::deserialize(upload.system_metadata_blob.as_slice())?;
-            if let (Some(algo), Some(ref val)) = (checksum_algo, &checksum_value) {
-                system_metadata.set_checksum(algo, checksum_type, val.clone());
+            if let (Some(config), Some(ref val)) = (checksum_config, &checksum_value) {
+                system_metadata.set_checksum(
+                    config.algorithm(),
+                    Some(config.checksum_type()),
+                    val.clone(),
+                );
             }
             self.ensure_write_encryption_supported(&upload.encryption)?;
             let (system_metadata_bytes, final_encryption) = Self::prepare_stored_system_metadata(
@@ -788,8 +786,8 @@ impl Coordinator {
                 etag: etag_str,
                 version_id,
                 managed_encryption,
-                checksum_algorithm: checksum_algo,
-                checksum_type,
+                checksum_algorithm: checksum_config.map(MultipartChecksumConfig::algorithm),
+                checksum_type: checksum_config.map(MultipartChecksumConfig::checksum_type),
                 checksum_value,
                 lifecycle_expiration,
             });
