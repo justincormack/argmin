@@ -1,6 +1,6 @@
 #![no_main]
 
-use auth::{authenticate_post_sigv4, ExpectedCredentialScope};
+use auth::{authenticate_post_sigv4, ExpectedCredentialScope, PostSigV4Request};
 use base64::Engine;
 use libfuzzer_sys::fuzz_target;
 
@@ -17,13 +17,17 @@ fuzz_target!(|data: &[u8]| {
 
     let raw_policy_b64 = base64::engine::general_purpose::STANDARD.encode(data);
     let _ = authenticate_post_sigv4(
-        &algorithm,
-        &credential,
-        &date,
-        &raw_policy_b64,
-        &signature,
+        PostSigV4Request {
+            algorithm: &algorithm,
+            credential: &credential,
+            date: &date,
+            policy_b64: &raw_policy_b64,
+            signature_hex: &signature,
+            security_token: None,
+        },
         &store,
         ExpectedCredentialScope::new(None, "s3"),
+        1_700_000_000,
     );
 
     let generated_policy = serde_json::json!({
