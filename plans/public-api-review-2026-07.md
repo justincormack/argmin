@@ -48,7 +48,7 @@ steps it performs.
   `authenticate_header_unsigned_security_token_rejected`). Fix: call
   `unsigned_required_headers` in `authenticate_presigned`; accept the session
   token only from the (signed) query parameter. Mirror test
-  `verify_request_unsigned_amz_header` (sigv4.rs:717) for the presigned path.
+  `authenticate_header_unsigned_amz_header` for the presigned path.
   Completed with AWS oracle coverage for unsigned `x-amz-meta-*`,
   `x-amz-acl`, and `x-amz-security-token` presigned requests. AWS returns
   `HeadersNotSigned` for those, but returns `SignatureDoesNotMatch` for an
@@ -507,9 +507,12 @@ sweeps so the next drift is a compile error.
   surface, and make the raw source-lease runtime-map helper internal to the
   checked wrapper. The in-process authority fence remains as the operation
   executed by the checked runtime-map RPC.
-- [ ] auth: `pub verify_request` (sigv4.rs:156-170, re-exported lib.rs:75) is
+- [x] auth: `pub verify_request` (sigv4.rs:156-170, re-exported lib.rs:75) is
   an attractive-but-incomplete verification door (no skew/expiry/token/scope)
-  with zero external callers. Demote to `pub(crate)`.
+  with zero external callers. Resolution: delete the public wrapper and
+  re-export; the internal verifier remains `verify_request_record` behind
+  `authenticate_request`. Existing SigV4 request tests now exercise
+  `authenticate_request` rather than the partial verifier.
 - [ ] auth: private, dead `combine_decisions` (deny-wins collapse,
   `bucket_policy/evaluator.rs:137-151`) while server-core hand-rolls the
   three-way match at `authz/policy.rs:499-519` and `authz/modern.rs:889-931`.

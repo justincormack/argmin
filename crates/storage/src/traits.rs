@@ -133,13 +133,7 @@ pub(crate) trait PgMetadataStore {
     #[allow(dead_code)]
     fn release_durable_bucket_write_reservation(
         &self,
-        name: &BucketName,
-        reservation_id: &str,
-        owner_token: &str,
-        cluster_epoch: ClusterEpoch,
-        bucket_execution_generation: u64,
-        bucket_incarnation_generation: u64,
-        lease_deadline: u64,
+        record: &BucketWriteReservationRecord,
     ) -> Result<(), MetadataError>;
 
     /// Release a metadata-command bucket write proof.
@@ -154,13 +148,7 @@ pub(crate) trait PgMetadataStore {
     /// only an existing row with different identity is a conflict.
     fn release_metadata_command_bucket_write_reservation(
         &self,
-        name: &BucketName,
-        reservation_id: &str,
-        owner_token: &str,
-        cluster_epoch: ClusterEpoch,
-        bucket_execution_generation: u64,
-        bucket_incarnation_generation: u64,
-        lease_deadline: u64,
+        proof: &crate::BucketWriteReservationProof,
     ) -> Result<(), MetadataError>;
 
     /// Begin a durable bucket write drain for one bucket incarnation.

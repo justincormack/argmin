@@ -8247,16 +8247,10 @@ fn durable_bucket_write_reservation_requires_exact_identity() {
         crate::error::MetadataError::BucketWriteReservationConflict { .. }
     ));
 
+    let mut stale_reservation = reservation.clone();
+    stale_reservation.owner_token = "owner-token-2".to_string();
     let stale_release = store
-        .release_durable_bucket_write_reservation(
-            &bucket,
-            "reservation-1",
-            "owner-token-2",
-            ClusterEpoch::INITIAL,
-            reservation.bucket_execution_generation,
-            reservation.bucket_incarnation_generation,
-            reservation.lease_deadline,
-        )
+        .release_durable_bucket_write_reservation(&stale_reservation)
         .unwrap_err();
     assert!(matches!(
         stale_release,
@@ -8271,15 +8265,7 @@ fn durable_bucket_write_reservation_requires_exact_identity() {
     );
 
     store
-        .release_durable_bucket_write_reservation(
-            &bucket,
-            "reservation-1",
-            "owner-token-1",
-            ClusterEpoch::INITIAL,
-            reservation.bucket_execution_generation,
-            reservation.bucket_incarnation_generation,
-            reservation.lease_deadline,
-        )
+        .release_durable_bucket_write_reservation(&reservation)
         .unwrap();
     assert!(store
         .durable_bucket_write_reservation(&bucket, "reservation-1")
@@ -8332,15 +8318,7 @@ fn durable_bucket_write_reservation_release_requires_current_lease_deadline() {
     assert_eq!(renewed.lease_deadline, 40);
 
     let stale_release = store
-        .release_durable_bucket_write_reservation(
-            &bucket,
-            &reservation.reservation_id,
-            &reservation.owner_token,
-            reservation.cluster_epoch,
-            reservation.bucket_execution_generation,
-            reservation.bucket_incarnation_generation,
-            reservation.lease_deadline,
-        )
+        .release_durable_bucket_write_reservation(&reservation)
         .unwrap_err();
     assert!(matches!(
         stale_release,

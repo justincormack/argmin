@@ -141,34 +141,6 @@ pub fn derive_signing_key(
     hmac_sha256(k_service.as_ref(), b"aws4_request")
 }
 
-/// Verify a SigV4-signed request.
-///
-/// Parameters:
-/// - `method`: HTTP method
-/// - `uri`: Request URI path
-/// - `query_string`: Raw query string (after '?')
-/// - `headers`: All request headers as (lowercase-name, value) pairs
-/// - `body_hash`: SHA-256 hex hash of the request body
-/// - `auth`: Parsed Authorization header
-/// - `store`: Credential store for looking up secret keys
-///
-/// Returns the access key ID on success.
-pub fn verify_request<H: HeaderSource + ?Sized>(
-    method: &str,
-    uri: &str,
-    query_string: &str,
-    headers: &H,
-    body_hash: &str,
-    auth: &SigV4Auth,
-    store: &CredentialStore,
-) -> Result<String, AuthError> {
-    Ok(
-        verify_request_record(method, uri, query_string, headers, body_hash, auth, store)?
-            .access_key_id
-            .clone(),
-    )
-}
-
 pub(crate) fn verify_request_record<'a, H: HeaderSource + ?Sized>(
     method: &str,
     uri: &str,
@@ -283,6 +255,8 @@ const HEX_LOWER: &[u8; 16] = b"0123456789abcdef";
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::canonical::parse_amz_date;
+    use crate::request::{authenticate_request, AuthContext, AuthMode, ExpectedSigningRegion};
 
     fn example_store() -> CredentialStore {
         let mut store = CredentialStore::new();
@@ -291,6 +265,41 @@ mod tests {
             SecretKey::new("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".to_string()),
         );
         store
+    }
+
+    fn aws_example_time() -> u64 {
+        parse_amz_date("20130524T000000Z").unwrap()
+    }
+
+    fn with_auth_header<'a>(
+        auth_header: &'a str,
+        headers: &'a [(&'a str, &'a str)],
+    ) -> Vec<(&'a str, &'a str)> {
+        let mut with_auth = Vec::with_capacity(headers.len() + 1);
+        with_auth.push(("authorization", auth_header));
+        with_auth.extend_from_slice(headers);
+        with_auth
+    }
+
+    fn authenticate_header_for_test(
+        method: &str,
+        uri: &str,
+        query_string: &str,
+        headers: &[(&str, &str)],
+        body: &[u8],
+        store: &CredentialStore,
+    ) -> Result<AuthContext, AuthError> {
+        authenticate_request(
+            method,
+            uri,
+            query_string,
+            headers,
+            body,
+            store,
+            ExpectedSigningRegion::ExactEndpointRegion("us-east-1"),
+            "s3",
+            aws_example_time(),
+        )
     }
 
     #[test]
@@ -367,34 +376,25 @@ mod tests {
         let method = "GET";
         let uri = "/test.txt";
         let query_string = "";
+        let body_hash = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
         let headers = [
             ("host", "examplebucket.s3.amazonaws.com"),
             ("range", "bytes=0-9"),
-            (
-                "x-amz-content-sha256",
-                "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-            ),
+            ("x-amz-content-sha256", body_hash),
             ("x-amz-date", "20130524T000000Z"),
         ];
-        let body_hash = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 
         let auth_header = "AWS4-HMAC-SHA256 \
             Credential=AKIAIOSFODNN7EXAMPLE/20130524/us-east-1/s3/aws4_request, \
             SignedHeaders=host;range;x-amz-content-sha256;x-amz-date, \
             Signature=f0e8bdb87c964420e857bd35b5d6ed310bd44f0170aba48dd91039c6036bdb41";
 
-        let auth = parse_auth_header(auth_header).unwrap();
-        let result = verify_request(
-            method,
-            uri,
-            query_string,
-            &headers,
-            body_hash,
-            &auth,
-            &store,
-        );
+        let headers = with_auth_header(auth_header, &headers);
+        let result = authenticate_header_for_test(method, uri, query_string, &headers, b"", &store);
         assert!(result.is_ok(), "verify failed: {:?}", result.err());
-        assert_eq!(result.unwrap(), "AKIAIOSFODNN7EXAMPLE");
+        let ctx = result.unwrap();
+        assert_eq!(ctx.mode, AuthMode::HeaderSigV4);
+        assert_eq!(ctx.access_key_id.as_deref(), Some("AKIAIOSFODNN7EXAMPLE"));
     }
 
     // AWS SigV4 test: PUT object
@@ -419,16 +419,8 @@ mod tests {
             SignedHeaders=date;host;x-amz-content-sha256;x-amz-date;x-amz-storage-class, \
             Signature=98ad721746da40c64f1a55b78f14c238d841ea1380cd77a1b5971af0ece108bd";
 
-        let auth = parse_auth_header(auth_header).unwrap();
-        let result = verify_request(
-            method,
-            uri,
-            query_string,
-            &headers,
-            body_hash,
-            &auth,
-            &store,
-        );
+        let headers = with_auth_header(auth_header, &headers);
+        let result = authenticate_header_for_test(method, uri, query_string, &headers, b"", &store);
         assert!(result.is_ok(), "verify failed: {:?}", result.err());
     }
 
@@ -452,16 +444,8 @@ mod tests {
             SignedHeaders=host;x-amz-content-sha256;x-amz-date, \
             Signature=fea454ca298b7da1c68078a5d1bdbfbbe0d65c699e0f91ac7a200a0136783543";
 
-        let auth = parse_auth_header(auth_header).unwrap();
-        let result = verify_request(
-            method,
-            uri,
-            query_string,
-            &headers,
-            body_hash,
-            &auth,
-            &store,
-        );
+        let headers = with_auth_header(auth_header, &headers);
+        let result = authenticate_header_for_test(method, uri, query_string, &headers, b"", &store);
         assert!(result.is_ok(), "verify failed: {:?}", result.err());
     }
 
@@ -483,8 +467,8 @@ mod tests {
             SignedHeaders=host;x-amz-content-sha256;x-amz-date, \
             Signature=0000000000000000000000000000000000000000000000000000000000000000";
 
-        let auth = parse_auth_header(auth_header).unwrap();
-        let result = verify_request(method, uri, "", &headers, body_hash, &auth, &store);
+        let headers = with_auth_header(auth_header, &headers);
+        let result = authenticate_header_for_test(method, uri, "", &headers, b"", &store);
         assert!(matches!(result, Err(AuthError::SignatureMismatch)));
     }
 
@@ -535,13 +519,12 @@ mod tests {
     }
 
     #[test]
-    fn verify_request_missing_host_header() {
+    fn authenticate_header_missing_host_header() {
         let store = example_store();
         let auth_header = "AWS4-HMAC-SHA256 \
             Credential=AKIAIOSFODNN7EXAMPLE/20130524/us-east-1/s3/aws4_request, \
             SignedHeaders=host;x-amz-content-sha256;x-amz-date, \
             Signature=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-        let auth = parse_auth_header(auth_header).unwrap();
         // Provide x-amz-date and x-amz-content-sha256 but NOT host
         let headers = [
             (
@@ -550,15 +533,8 @@ mod tests {
             ),
             ("x-amz-date", "20130524T000000Z"),
         ];
-        let result = verify_request(
-            "GET",
-            "/",
-            "",
-            &headers,
-            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-            &auth,
-            &store,
-        );
+        let headers = with_auth_header(auth_header, &headers);
+        let result = authenticate_header_for_test("GET", "/", "", &headers, b"", &store);
         assert!(matches!(
             result,
             Err(AuthError::MissingSignedHeader { header }) if header == "host"
@@ -566,13 +542,12 @@ mod tests {
     }
 
     #[test]
-    fn verify_request_missing_amz_date_header() {
+    fn authenticate_header_missing_amz_date_header() {
         let store = example_store();
         let auth_header = "AWS4-HMAC-SHA256 \
             Credential=AKIAIOSFODNN7EXAMPLE/20130524/us-east-1/s3/aws4_request, \
             SignedHeaders=host;x-amz-content-sha256;x-amz-date, \
             Signature=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-        let auth = parse_auth_header(auth_header).unwrap();
         // Provide host and x-amz-content-sha256 but NOT x-amz-date
         let headers = [
             ("host", "example.com"),
@@ -581,15 +556,8 @@ mod tests {
                 "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
             ),
         ];
-        let result = verify_request(
-            "GET",
-            "/",
-            "",
-            &headers,
-            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-            &auth,
-            &store,
-        );
+        let headers = with_auth_header(auth_header, &headers);
+        let result = authenticate_header_for_test("GET", "/", "", &headers, b"", &store);
         assert!(matches!(
             result,
             Err(AuthError::MissingSignedHeader { header }) if header == "x-amz-date"
@@ -597,24 +565,16 @@ mod tests {
     }
 
     #[test]
-    fn verify_request_missing_content_sha256_header() {
+    fn authenticate_header_missing_content_sha256_header() {
         let store = example_store();
         let auth_header = "AWS4-HMAC-SHA256 \
             Credential=AKIAIOSFODNN7EXAMPLE/20130524/us-east-1/s3/aws4_request, \
             SignedHeaders=host;x-amz-content-sha256;x-amz-date, \
             Signature=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-        let auth = parse_auth_header(auth_header).unwrap();
         // Provide host and x-amz-date but NOT x-amz-content-sha256
         let headers = [("host", "example.com"), ("x-amz-date", "20130524T000000Z")];
-        let result = verify_request(
-            "GET",
-            "/",
-            "",
-            &headers,
-            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-            &auth,
-            &store,
-        );
+        let headers = with_auth_header(auth_header, &headers);
+        let result = authenticate_header_for_test("GET", "/", "", &headers, b"", &store);
         assert!(matches!(
             result,
             Err(AuthError::MissingSignedHeader { header }) if header == "x-amz-content-sha256"
@@ -622,13 +582,12 @@ mod tests {
     }
 
     #[test]
-    fn verify_request_rejects_credential_date_mismatch() {
+    fn authenticate_header_rejects_credential_date_mismatch() {
         let store = example_store();
         let auth_header = "AWS4-HMAC-SHA256 \
             Credential=AKIAIOSFODNN7EXAMPLE/20130525/us-east-1/s3/aws4_request, \
             SignedHeaders=host;range;x-amz-content-sha256;x-amz-date, \
             Signature=f0e8bdb87c964420e857bd35b5d6ed310bd44f0170aba48dd91039c6036bdb41";
-        let auth = parse_auth_header(auth_header).unwrap();
         let headers = [
             ("host", "examplebucket.s3.amazonaws.com"),
             ("range", "bytes=0-9"),
@@ -638,26 +597,18 @@ mod tests {
             ),
             ("x-amz-date", "20130524T000000Z"),
         ];
-        let result = verify_request(
-            "GET",
-            "/test.txt",
-            "",
-            &headers,
-            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-            &auth,
-            &store,
-        );
+        let headers = with_auth_header(auth_header, &headers);
+        let result = authenticate_header_for_test("GET", "/test.txt", "", &headers, b"", &store);
         assert!(matches!(result, Err(AuthError::MalformedAuth)));
     }
 
     #[test]
-    fn verify_request_missing_optional_header_is_rejected() {
+    fn authenticate_header_missing_optional_header_is_rejected() {
         let store = example_store();
         let auth_header = "AWS4-HMAC-SHA256 \
             Credential=AKIAIOSFODNN7EXAMPLE/20130524/us-east-1/s3/aws4_request, \
             SignedHeaders=host;x-amz-content-sha256;x-amz-date;x-custom-header, \
             Signature=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-        let auth = parse_auth_header(auth_header).unwrap();
         let headers = [
             ("host", "example.com"),
             (
@@ -665,17 +616,10 @@ mod tests {
                 "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
             ),
             ("x-amz-date", "20130524T000000Z"),
-            // x-custom-header is NOT present — should be skipped, not an error
+            // x-custom-header is signed but not present.
         ];
-        let result = verify_request(
-            "GET",
-            "/",
-            "",
-            &headers,
-            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-            &auth,
-            &store,
-        );
+        let headers = with_auth_header(auth_header, &headers);
+        let result = authenticate_header_for_test("GET", "/", "", &headers, b"", &store);
         assert!(matches!(
             result,
             Err(AuthError::MissingSignedHeader { header }) if header == "x-custom-header"
@@ -683,7 +627,7 @@ mod tests {
     }
 
     #[test]
-    fn verify_request_disabled_key() {
+    fn authenticate_header_disabled_key() {
         let mut store = CredentialStore::new();
         store.add_record(crate::credential::CredentialRecord {
             access_key_id: "AKIAIOSFODNN7EXAMPLE".to_string(),
@@ -697,29 +641,20 @@ mod tests {
             Credential=AKIAIOSFODNN7EXAMPLE/20130524/us-east-1/s3/aws4_request, \
             SignedHeaders=host;x-amz-date, \
             Signature=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-        let auth = parse_auth_header(auth_header).unwrap();
         let headers = [("host", "example.com"), ("x-amz-date", "20130524T000000Z")];
-        let result = verify_request(
-            "GET",
-            "/",
-            "",
-            &headers,
-            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-            &auth,
-            &store,
-        );
+        let headers = with_auth_header(auth_header, &headers);
+        let result = authenticate_header_for_test("GET", "/", "", &headers, b"", &store);
         let err = result.unwrap_err();
         assert_eq!(err.to_string(), AuthError::UnknownAccessKey.to_string());
     }
 
     #[test]
-    fn verify_request_unsigned_amz_header() {
+    fn authenticate_header_unsigned_amz_header() {
         let store = example_store();
         let auth_header = "AWS4-HMAC-SHA256 \
             Credential=AKIAIOSFODNN7EXAMPLE/20130524/us-east-1/s3/aws4_request, \
             SignedHeaders=host;x-amz-content-sha256;x-amz-date, \
             Signature=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-        let auth = parse_auth_header(auth_header).unwrap();
         // x-amz-meta-custom is present but not in SignedHeaders
         let headers = [
             ("host", "example.com"),
@@ -730,26 +665,18 @@ mod tests {
             ("x-amz-date", "20130524T000000Z"),
             ("x-amz-meta-custom", "value"),
         ];
-        let result = verify_request(
-            "GET",
-            "/",
-            "",
-            &headers,
-            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-            &auth,
-            &store,
-        );
+        let headers = with_auth_header(auth_header, &headers);
+        let result = authenticate_header_for_test("GET", "/", "", &headers, b"", &store);
         assert!(matches!(result, Err(AuthError::UnsignedHeaders { .. })));
     }
 
     #[test]
-    fn verify_request_unsigned_host_header() {
+    fn authenticate_header_unsigned_host_header() {
         let store = example_store();
         let auth_header = "AWS4-HMAC-SHA256 \
             Credential=AKIAIOSFODNN7EXAMPLE/20130524/us-east-1/s3/aws4_request, \
             SignedHeaders=x-amz-content-sha256;x-amz-date, \
             Signature=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-        let auth = parse_auth_header(auth_header).unwrap();
         let headers = [
             ("host", "example.com"),
             (
@@ -758,15 +685,8 @@ mod tests {
             ),
             ("x-amz-date", "20130524T000000Z"),
         ];
-        let result = verify_request(
-            "GET",
-            "/",
-            "",
-            &headers,
-            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-            &auth,
-            &store,
-        );
+        let headers = with_auth_header(auth_header, &headers);
+        let result = authenticate_header_for_test("GET", "/", "", &headers, b"", &store);
         assert!(matches!(
             result,
             Err(AuthError::UnsignedHeaders { headers }) if headers == ["host"]
@@ -774,13 +694,12 @@ mod tests {
     }
 
     #[test]
-    fn verify_request_duplicate_unsigned_amz_header() {
+    fn authenticate_header_duplicate_unsigned_amz_header() {
         let store = example_store();
         let auth_header = "AWS4-HMAC-SHA256 \
             Credential=AKIAIOSFODNN7EXAMPLE/20130524/us-east-1/s3/aws4_request, \
             SignedHeaders=host;x-amz-content-sha256;x-amz-date, \
             Signature=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-        let auth = parse_auth_header(auth_header).unwrap();
         // Two instances of the same unsigned x-amz header — should only appear once in error
         let headers = [
             ("host", "example.com"),
@@ -792,15 +711,8 @@ mod tests {
             ("x-amz-meta-custom", "val1"),
             ("x-amz-meta-custom", "val2"),
         ];
-        let result = verify_request(
-            "GET",
-            "/",
-            "",
-            &headers,
-            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-            &auth,
-            &store,
-        );
+        let headers = with_auth_header(auth_header, &headers);
+        let result = authenticate_header_for_test("GET", "/", "", &headers, b"", &store);
         let err = result.unwrap_err();
         let debug = format!("{err:?}");
         // The duplicated header should only be reported once.
@@ -817,17 +729,9 @@ mod tests {
             SignedHeaders=host;x-amz-date, \
             Signature=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
-        let auth = parse_auth_header(auth_header).unwrap();
         let headers = [("host", "example.com"), ("x-amz-date", "20130524T000000Z")];
-        let result = verify_request(
-            "GET",
-            "/",
-            "",
-            &headers,
-            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-            &auth,
-            &store,
-        );
+        let headers = with_auth_header(auth_header, &headers);
+        let result = authenticate_header_for_test("GET", "/", "", &headers, b"", &store);
         assert!(matches!(result, Err(AuthError::UnknownAccessKey)));
     }
 

@@ -2065,16 +2065,8 @@ fn metadata_txn_commit_failure_recovers_representative_mutators() {
             )
             .unwrap()
             .expect("test setup should create reservation");
-            PgMetadataStore::release_metadata_command_bucket_write_reservation(
-                store,
-                &reservation.bucket,
-                &reservation.reservation_id,
-                &reservation.owner_token,
-                reservation.cluster_epoch,
-                reservation.bucket_execution_generation,
-                reservation.bucket_incarnation_generation,
-                reservation.lease_deadline,
-            )
+            let proof = crate::BucketWriteReservationProof::from(&reservation);
+            PgMetadataStore::release_metadata_command_bucket_write_reservation(store, &proof)
         },
     );
 
@@ -6588,15 +6580,7 @@ fn durable_bucket_write_coordination_does_not_dirty_metadata_command_state() {
     );
 
     store
-        .release_durable_bucket_write_reservation(
-            &bucket,
-            "reservation-1",
-            "owner-token-1",
-            ClusterEpoch::INITIAL,
-            reservation.bucket_execution_generation,
-            reservation.bucket_incarnation_generation,
-            reservation.lease_deadline,
-        )
+        .release_durable_bucket_write_reservation(&reservation)
         .unwrap();
     assert_eq!(
         store
@@ -6662,16 +6646,9 @@ fn metadata_command_bucket_write_release_is_idempotent_after_cleanup() {
         )
         .unwrap();
 
+    let proof = crate::BucketWriteReservationProof::from(&reservation);
     store
-        .release_metadata_command_bucket_write_reservation(
-            &bucket,
-            "reservation-1",
-            "owner-token-1",
-            ClusterEpoch::INITIAL,
-            reservation.bucket_execution_generation,
-            reservation.bucket_incarnation_generation,
-            reservation.lease_deadline,
-        )
+        .release_metadata_command_bucket_write_reservation(&proof)
         .unwrap();
     assert!(store
         .durable_bucket_write_reservation(&bucket, "reservation-1")
@@ -6679,16 +6656,54 @@ fn metadata_command_bucket_write_release_is_idempotent_after_cleanup() {
         .is_none());
 
     store
-        .release_metadata_command_bucket_write_reservation(
+        .release_metadata_command_bucket_write_reservation(&proof)
+        .unwrap();
+}
+
+#[test]
+fn metadata_command_bucket_write_release_allows_heartbeated_lease() {
+    let tmp = test_util::tempdir();
+    let store = PgStore::open(tmp.path(), 1).unwrap();
+    let bucket = trusted_bucket_name("metadata-command-release-heartbeated");
+    create_probe_bucket_direct(&store, &bucket);
+
+    let reservation = store
+        .acquire_durable_bucket_write_reservation(
             &bucket,
             "reservation-1",
             "owner-token-1",
             ClusterEpoch::INITIAL,
-            reservation.bucket_execution_generation,
-            reservation.bucket_incarnation_generation,
-            reservation.lease_deadline,
+            "put-object",
+            1,
+            10,
+            Some("key=a"),
         )
         .unwrap();
+    let proof = crate::BucketWriteReservationProof::from(&reservation);
+
+    store
+        .heartbeat_durable_bucket_write_reservation(
+            crate::traits::DurableBucketWriteReservationHeartbeat {
+                name: &bucket,
+                reservation_id: &reservation.reservation_id,
+                owner_token: &reservation.owner_token,
+                cluster_epoch: reservation.cluster_epoch,
+                bucket_execution_generation: reservation.bucket_execution_generation,
+                bucket_incarnation_generation: reservation.bucket_incarnation_generation,
+                current_lease_deadline: reservation.lease_deadline,
+                lease_deadline: 20,
+                now: 2,
+            },
+        )
+        .unwrap();
+
+    store
+        .release_metadata_command_bucket_write_reservation(&proof)
+        .unwrap();
+    assert!(store
+        .durable_bucket_write_reservation(&bucket, "reservation-1")
+        .unwrap()
+        .is_none());
 }
 
 #[test]

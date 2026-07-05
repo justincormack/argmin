@@ -72,7 +72,7 @@ pub use request::{
     authenticate_request, AuthContext, AuthMode, ExpectedSigningRegion, HeaderSource,
     StreamingSigningContext,
 };
-pub use sigv4::{parse_auth_header, verify_request, SigV4Auth};
+pub use sigv4::{parse_auth_header, SigV4Auth};
 
 #[cfg(test)]
 mod tests {

@@ -5581,14 +5581,14 @@ impl PgMetadataStore for PgStore {
 
     fn release_durable_bucket_write_reservation(
         &self,
-        name: &BucketName,
-        reservation_id: &str,
-        owner_token: &str,
-        cluster_epoch: ClusterEpoch,
-        bucket_execution_generation: u64,
-        bucket_incarnation_generation: u64,
-        lease_deadline: u64,
+        record: &BucketWriteReservationRecord,
     ) -> Result<(), MetadataError> {
+        let name = &record.bucket;
+        let reservation_id = record.reservation_id.as_str();
+        let owner_token = record.owner_token.as_str();
+        let cluster_epoch = record.cluster_epoch;
+        let bucket_execution_generation = record.bucket_execution_generation;
+        let bucket_incarnation_generation = record.bucket_incarnation_generation;
         let generation =
             i64::try_from(bucket_execution_generation).map_err(|source| MetadataError::Db {
                 context: "release durable bucket write reservation generation",
@@ -5599,10 +5599,11 @@ impl PgMetadataStore for PgStore {
                 context: "release durable bucket write reservation incarnation",
                 source: rusqlite::Error::ToSqlConversionFailure(Box::new(source)),
             })?;
-        let lease_deadline = i64::try_from(lease_deadline).map_err(|source| MetadataError::Db {
-            context: "release durable bucket write reservation lease deadline",
-            source: rusqlite::Error::ToSqlConversionFailure(Box::new(source)),
-        })?;
+        let lease_deadline =
+            i64::try_from(record.lease_deadline).map_err(|source| MetadataError::Db {
+                context: "release durable bucket write reservation lease deadline",
+                source: rusqlite::Error::ToSqlConversionFailure(Box::new(source)),
+            })?;
         let deleted = self
             .conn
             .execute(
@@ -5636,28 +5637,10 @@ impl PgMetadataStore for PgStore {
 
     fn release_metadata_command_bucket_write_reservation(
         &self,
-        name: &BucketName,
-        reservation_id: &str,
-        owner_token: &str,
-        cluster_epoch: ClusterEpoch,
-        bucket_execution_generation: u64,
-        bucket_incarnation_generation: u64,
-        lease_deadline: u64,
+        proof: &BucketWriteReservationProof,
     ) -> Result<(), MetadataError> {
-        let generation =
-            i64::try_from(bucket_execution_generation).map_err(|source| MetadataError::Db {
-                context: "release metadata command bucket write reservation generation",
-                source: rusqlite::Error::ToSqlConversionFailure(Box::new(source)),
-            })?;
-        let incarnation =
-            i64::try_from(bucket_incarnation_generation).map_err(|source| MetadataError::Db {
-                context: "release metadata command bucket write reservation incarnation",
-                source: rusqlite::Error::ToSqlConversionFailure(Box::new(source)),
-            })?;
-        let lease_deadline = i64::try_from(lease_deadline).map_err(|source| MetadataError::Db {
-            context: "release metadata command bucket write reservation lease deadline",
-            source: rusqlite::Error::ToSqlConversionFailure(Box::new(source)),
-        })?;
+        let name = &proof.bucket;
+        let reservation_id = proof.reservation_id.as_str();
 
         self.conn
             .execute_batch("BEGIN IMMEDIATE")
@@ -5666,57 +5649,72 @@ impl PgMetadataStore for PgStore {
                 source,
             })?;
 
-        let result = (|| {
-            let existing = self.durable_bucket_write_reservation(name, reservation_id)?;
-            match existing {
-                Some(record)
-                    if record.owner_token == owner_token
-                        && record.cluster_epoch == cluster_epoch
-                        && record.bucket_execution_generation == bucket_execution_generation
-                        && record.bucket_incarnation_generation
-                            == bucket_incarnation_generation
-                        && record.lease_deadline as i64 == lease_deadline =>
-                {
-                    let deleted = self
-                        .conn
-                        .execute(
-                            "DELETE FROM bucket_write_reservations \
+        let result =
+            (|| {
+                let existing = self.durable_bucket_write_reservation(name, reservation_id)?;
+                match existing {
+                    Some(record) if proof.matches_record(&record) => {
+                        let generation = i64::try_from(record.bucket_execution_generation)
+                            .map_err(|source| MetadataError::Db {
+                                context:
+                                    "release metadata command bucket write reservation generation",
+                                source: rusqlite::Error::ToSqlConversionFailure(Box::new(source)),
+                            })?;
+                        let incarnation = i64::try_from(record.bucket_incarnation_generation)
+                            .map_err(|source| MetadataError::Db {
+                                context:
+                                    "release metadata command bucket write reservation incarnation",
+                                source: rusqlite::Error::ToSqlConversionFailure(Box::new(source)),
+                            })?;
+                        let lease_deadline =
+                            i64::try_from(record.lease_deadline).map_err(|source| {
+                                MetadataError::Db {
+                            context:
+                                "release metadata command bucket write reservation lease deadline",
+                            source: rusqlite::Error::ToSqlConversionFailure(Box::new(source)),
+                        }
+                            })?;
+                        let deleted = self
+                            .conn
+                            .execute(
+                                "DELETE FROM bucket_write_reservations \
                              WHERE bucket_name = ?1 AND reservation_id = ?2 \
                                AND owner_token = ?3 AND cluster_epoch = ?4 \
                                AND bucket_execution_generation = ?5 \
                                AND bucket_incarnation_generation = ?6 \
                                AND lease_deadline = ?7",
-                            params![
-                                name.as_str(),
-                                reservation_id,
-                                owner_token,
-                                cluster_epoch.get(),
-                                generation,
-                                incarnation,
-                                lease_deadline,
-                            ],
-                        )
-                        .map_err(|source| MetadataError::Db {
-                            context: "release metadata command durable bucket write reservation",
-                            source,
-                        })?;
-                    if deleted != 1 {
+                                params![
+                                    name.as_str(),
+                                    reservation_id,
+                                    record.owner_token,
+                                    record.cluster_epoch.get(),
+                                    generation,
+                                    incarnation,
+                                    lease_deadline,
+                                ],
+                            )
+                            .map_err(|source| MetadataError::Db {
+                                context:
+                                    "release metadata command durable bucket write reservation",
+                                source,
+                            })?;
+                        if deleted != 1 {
+                            return Err(MetadataError::BucketWriteReservationConflict {
+                                reservation_id: reservation_id.to_string(),
+                            });
+                        }
+                    }
+                    Some(_) => {
                         return Err(MetadataError::BucketWriteReservationConflict {
                             reservation_id: reservation_id.to_string(),
                         });
                     }
+                    None => {
+                        return Ok(());
+                    }
                 }
-                Some(_) => {
-                    return Err(MetadataError::BucketWriteReservationConflict {
-                        reservation_id: reservation_id.to_string(),
-                    });
-                }
-                None => {
-                    return Ok(());
-                }
-            }
-            Ok(())
-        })();
+                Ok(())
+            })();
 
         match result {
             Ok(()) => self

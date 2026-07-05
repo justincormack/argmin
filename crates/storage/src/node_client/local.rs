@@ -1835,14 +1835,7 @@ impl StorageNodeClient for LocalStorageNodeClient {
     ) -> Result<(), BucketSnapshotLoadError> {
         let pg = self.storage_node.get_pg(pg_id.get())?;
         Ok(PgMetadataStore::release_durable_bucket_write_reservation(
-            &*pg,
-            &record.bucket,
-            &record.reservation_id,
-            &record.owner_token,
-            record.cluster_epoch,
-            record.bucket_execution_generation,
-            record.bucket_incarnation_generation,
-            record.lease_deadline,
+            &*pg, record,
         )?)
     }
 
@@ -1864,18 +1857,7 @@ impl StorageNodeClient for LocalStorageNodeClient {
                 .into());
             }
         }
-        Ok(
-            PgMetadataStore::release_metadata_command_bucket_write_reservation(
-                &*pg,
-                &proof.bucket,
-                &proof.reservation_id,
-                &proof.owner_token,
-                proof.cluster_epoch,
-                proof.bucket_execution_generation,
-                proof.bucket_incarnation_generation,
-                proof.lease_deadline,
-            )?,
-        )
+        Ok(PgMetadataStore::release_metadata_command_bucket_write_reservation(&*pg, proof)?)
     }
 
     fn begin_durable_bucket_write_drain(

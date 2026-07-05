@@ -1716,17 +1716,15 @@ fn bucket_delete_treats_conflicting_stream_reservation_proof_as_abandoned() {
         .storage_node()
         .get_pg(1)
         .unwrap();
-    crate::PgMetadataStore::release_durable_bucket_write_reservation(
+    let proof_record = crate::PgMetadataStore::durable_bucket_write_reservation(
         &*bucket_pg,
         &bucket,
         &proof.reservation_id,
-        &proof.owner_token,
-        proof.cluster_epoch,
-        proof.bucket_execution_generation,
-        proof.bucket_incarnation_generation,
-        proof.lease_deadline,
     )
-    .unwrap();
+    .unwrap()
+    .expect("stream proof should still have a durable bucket write reservation");
+    crate::PgMetadataStore::release_durable_bucket_write_reservation(&*bucket_pg, &proof_record)
+        .unwrap();
     let mismatched_record = crate::PgMetadataStore::acquire_durable_bucket_write_reservation(
         &*bucket_pg,
         &bucket,
@@ -1761,13 +1759,7 @@ fn bucket_delete_treats_conflicting_stream_reservation_proof_as_abandoned() {
                     .unwrap();
                 crate::PgMetadataStore::release_durable_bucket_write_reservation(
                     &*bucket_pg,
-                    &hook_bucket,
-                    &hook_record.reservation_id,
-                    &hook_record.owner_token,
-                    hook_record.cluster_epoch,
-                    hook_record.bucket_execution_generation,
-                    hook_record.bucket_incarnation_generation,
-                    hook_record.lease_deadline,
+                    &hook_record,
                 )
                 .unwrap();
             })),
