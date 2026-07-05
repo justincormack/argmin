@@ -17,9 +17,10 @@ use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
 use tokio_rustls::TlsAcceptor;
 
+#[cfg(any(test, feature = "local-debug-endpoints"))]
+use super::request::percent_decode_strict;
 use super::request::{
-    parse_upload_part_query, percent_decode_strict, S3Request, TransportSecurity,
-    MAX_BUFFERED_CONTROL_BODY_SIZE,
+    parse_upload_part_query, S3Request, TransportSecurity, MAX_BUFFERED_CONTROL_BODY_SIZE,
 };
 use super::response::{S3Response, WireResponseIds};
 use super::router::{route, S3Operation};
@@ -28,10 +29,12 @@ use super::{HttpFrontend, S3HyperBody};
 use crate::coordinator::MAX_OBJECT_SIZE;
 use crate::error::ServerError;
 use server_core::metadata_blob::USER_METADATA_SIZE_LIMIT;
+#[cfg(any(test, feature = "local-debug-endpoints"))]
 use storage::{
     BucketDeleteAttemptOutcomeKind, BucketDeleteAttemptPhase, BucketDeleteDebugSnapshot,
-    BucketName, BucketState, PgId, SessionId,
+    BucketState, PgId,
 };
+use storage::{BucketName, SessionId};
 
 const TRACE_TARGET: &str = "server_http";
 const MAX_STREAMING_POST_PART_HEADER_BYTES: usize = 8 * 1024;
@@ -688,6 +691,7 @@ async fn handle(
         )),
     );
 
+    #[cfg(any(test, feature = "local-debug-endpoints"))]
     if state.config.local_debug_endpoint {
         if let Some(resp) = local_debug_response(&state, req.method(), req.uri().path()) {
             return Ok(s3_response_to_hyper(
@@ -997,6 +1001,7 @@ async fn handle(
     ))
 }
 
+#[cfg(any(test, feature = "local-debug-endpoints"))]
 fn local_debug_response(
     state: &Arc<ServerState>,
     method: &http::Method,
@@ -1129,6 +1134,7 @@ fn local_debug_response(
     }
 }
 
+#[cfg(any(test, feature = "local-debug-endpoints"))]
 fn local_debug_text_response(status_code: u16, body: String) -> S3Response {
     S3Response {
         status_code,
@@ -1145,6 +1151,7 @@ fn local_debug_text_response(status_code: u16, body: String) -> S3Response {
     }
 }
 
+#[cfg(any(test, feature = "local-debug-endpoints"))]
 fn local_debug_bucket_delete_attempt_body(snapshot: &BucketDeleteDebugSnapshot) -> String {
     use std::fmt::Write as _;
 
@@ -1370,6 +1377,7 @@ fn local_debug_bucket_delete_attempt_body(snapshot: &BucketDeleteDebugSnapshot) 
     body
 }
 
+#[cfg(any(test, feature = "local-debug-endpoints"))]
 fn local_debug_bucket_state(state: BucketState) -> &'static str {
     match state {
         BucketState::Active => "active",
@@ -1377,22 +1385,27 @@ fn local_debug_bucket_state(state: BucketState) -> &'static str {
     }
 }
 
+#[cfg(any(test, feature = "local-debug-endpoints"))]
 fn local_debug_optional_u32(value: Option<u32>) -> String {
     value.map_or_else(|| "none".to_string(), |value| value.to_string())
 }
 
+#[cfg(any(test, feature = "local-debug-endpoints"))]
 fn local_debug_optional_u64(value: Option<u64>) -> String {
     value.map_or_else(|| "none".to_string(), |value| value.to_string())
 }
 
+#[cfg(any(test, feature = "local-debug-endpoints"))]
 fn local_debug_optional_usize(value: Option<usize>) -> String {
     value.map_or_else(|| "none".to_string(), |value| value.to_string())
 }
 
+#[cfg(any(test, feature = "local-debug-endpoints"))]
 fn local_debug_optional_generation_id(value: Option<storage::GenerationId>) -> String {
     value.map_or_else(|| "none".to_string(), |value| value.get().to_string())
 }
 
+#[cfg(any(test, feature = "local-debug-endpoints"))]
 fn local_debug_object_version_kind(
     kind: storage::BucketDeleteDebugObjectVersionKind,
 ) -> &'static str {
@@ -1402,6 +1415,7 @@ fn local_debug_object_version_kind(
     }
 }
 
+#[cfg(any(test, feature = "local-debug-endpoints"))]
 fn local_debug_optional_object_layout(value: Option<storage::ObjectLayout>) -> String {
     match value {
         None => "none".to_string(),
@@ -1412,6 +1426,7 @@ fn local_debug_optional_object_layout(value: Option<storage::ObjectLayout>) -> S
     }
 }
 
+#[cfg(any(test, feature = "local-debug-endpoints"))]
 fn local_debug_optional_reclaim_kind(
     value: Option<storage::ObjectPayloadReclaimKind>,
 ) -> &'static str {
@@ -1422,6 +1437,7 @@ fn local_debug_optional_reclaim_kind(
     }
 }
 
+#[cfg(any(test, feature = "local-debug-endpoints"))]
 fn local_debug_bucket_delete_attempt_outcome(
     outcome: BucketDeleteAttemptOutcomeKind,
 ) -> &'static str {
@@ -1433,6 +1449,7 @@ fn local_debug_bucket_delete_attempt_outcome(
     }
 }
 
+#[cfg(any(test, feature = "local-debug-endpoints"))]
 fn local_debug_bucket_delete_attempt_phase(phase: BucketDeleteAttemptPhase) -> &'static str {
     match phase {
         BucketDeleteAttemptPhase::Initial => "initial",
@@ -1445,6 +1462,7 @@ fn local_debug_bucket_delete_attempt_phase(phase: BucketDeleteAttemptPhase) -> &
     }
 }
 
+#[cfg(any(test, feature = "local-debug-endpoints"))]
 fn local_debug_metrics_body(state: &Arc<ServerState>) -> String {
     use std::fmt::Write as _;
 
@@ -1815,10 +1833,12 @@ fn local_debug_metrics_body(state: &Arc<ServerState>) -> String {
     body
 }
 
+#[cfg(any(test, feature = "local-debug-endpoints"))]
 fn debug_metric_optional_pg_id_label(pg_id: Option<u32>) -> String {
     pg_id.map_or_else(|| "unknown".to_string(), |pg_id| pg_id.to_string())
 }
 
+#[cfg(any(test, feature = "local-debug-endpoints"))]
 fn debug_metric_label_value(value: &str) -> String {
     let mut escaped = String::with_capacity(value.len());
     for ch in value.chars() {

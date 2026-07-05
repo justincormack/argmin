@@ -8,6 +8,8 @@ use std::time::Duration;
 use storage::control_plane::MAX_HEARTBEAT_LEASE_MS;
 use storage::LocalUnixStorageNodeClientConfig;
 
+const LOCAL_DEBUG_ENDPOINT_COMPILED_IN: bool = cfg!(any(test, feature = "local-debug-endpoints"));
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ProcessRole {
     LegacyLocal,
@@ -164,7 +166,8 @@ impl ServerConfig {
     ///   `ARGMIN_STREAM_READ_CHUNK_SIZE` (8388608)
     ///   `ARGMIN_PANIC_ON_500` (false)
     ///   `ARGMIN_ABORT_ON_500` (false)
-    ///   `ARGMIN_LOCAL_DEBUG_ENDPOINT` (false, requires loopback listen addr)
+    ///   `ARGMIN_LOCAL_DEBUG_ENDPOINT` (false, requires test or
+    ///   local-debug-endpoints build and loopback listen addr)
     ///
     /// UAT-only optional credentials for running `s3-tests` against the
     /// standalone binary:
@@ -355,6 +358,12 @@ impl ServerConfig {
             Some(value) => parse_bool_env("ARGMIN_LOCAL_DEBUG_ENDPOINT", &value)?,
             None => false,
         };
+        if local_debug_endpoint && !LOCAL_DEBUG_ENDPOINT_COMPILED_IN {
+            return Err(
+                "ARGMIN_LOCAL_DEBUG_ENDPOINT requires a test build or the local-debug-endpoints feature"
+                    .to_string(),
+            );
+        }
 
         if pg_count == 0 {
             return Err("ARGMIN_PG_COUNT must be > 0".to_string());

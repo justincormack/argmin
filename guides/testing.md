@@ -219,12 +219,18 @@ The UAT wrapper and embedded local `s3-tests` server enable abort-on-500 so
 hidden 500s fail the whole local test process at the point the server produces
 the internal error.
 
-The UAT wrapper also enables the loopback-only local debug endpoint on the
-frontend process by default. On any UAT failure it asks
+The UAT wrapper also enables the local debug endpoint on the frontend process
+by default for binaries it builds itself, and builds those spawned `argmin-s3`
+binaries with the non-default `local-debug-endpoints` feature when doing so.
+`--binary` runs default to the endpoint disabled unless
+`ARGMIN_LOCAL_DEBUG_ENDPOINT` is set explicitly, because the wrapper cannot add
+features to an already-built binary. A default production build rejects
+`ARGMIN_LOCAL_DEBUG_ENDPOINT=1` at startup; feature-enabled test builds still
+require a loopback frontend listener. On any UAT failure it asks
 `POST /__argmin/debug/flight-recorder/dump` to write the bounded, redacted
 flight recorder to the frontend log before the process group is stopped. This
 keeps intermittent full-suite races diagnosable without exposing debug state on
-non-loopback production listeners. It also sets
+production binaries or non-loopback listeners. It also sets
 `ARGMIN_METADATA_COMMAND_CONFLICT_DIAGNOSTICS=1` for the UAT process group so
 frontend and storage-node metadata-command conflicts are visible in retained
 logs without making ordinary production contention noisy.

@@ -33,6 +33,7 @@ Options:
                          metadata-pg-migration, metadata-pg-migration-failover,
                          cleanup-versioned-stress
   --binary PATH          Run an already-built argmin-s3-compatible binary
+                         (local debug endpoint defaults off unless explicitly enabled)
   --release              Use a release argmin-s3 binary
   --no-cleanup           Keep the temporary data directory after the run
   -h, --help             Show this help
@@ -342,7 +343,13 @@ export ARGMIN_EC_M="${ARGMIN_EC_M:-2}"
 export ARGMIN_LOCAL_NODE_COUNT="${ARGMIN_LOCAL_NODE_COUNT:-$((ARGMIN_EC_K + ARGMIN_EC_M))}"
 export ARGMIN_PG_COUNT="${ARGMIN_PG_COUNT:-16}"
 export ARGMIN_STORAGE_CLUSTER_EPOCH="${ARGMIN_STORAGE_CLUSTER_EPOCH:-1}"
-uat_local_debug_endpoint="${ARGMIN_LOCAL_DEBUG_ENDPOINT:-1}"
+if [[ -n "${ARGMIN_LOCAL_DEBUG_ENDPOINT+x}" ]]; then
+    uat_local_debug_endpoint="$ARGMIN_LOCAL_DEBUG_ENDPOINT"
+elif [[ -n "$server_binary" ]]; then
+    uat_local_debug_endpoint=0
+else
+    uat_local_debug_endpoint=1
+fi
 
 if [[ -n "${S3_TEST_TRACE:-}" && -z "${ARGMIN_TRACE:-}" ]]; then
     export ARGMIN_TRACE="$S3_TEST_TRACE"
@@ -1744,6 +1751,9 @@ elif [[ "$topology" == "multihost" ]]; then
     if [[ -n "${ARGMIN_TRACE:-}" || -n "${ARGMIN_TRACE_FILE:-}" ]]; then
         build_cmd+=(--features deep-tracing)
     fi
+    if local_debug_endpoint_enabled; then
+        build_cmd+=(--features local-debug-endpoints)
+    fi
     if ((release)); then
         build_cmd+=(--release)
         built_binary="$ROOT/target/release/argmin-s3"
@@ -1758,6 +1768,9 @@ else
     server_cmd=(cargo run -p argmin-s3)
     if [[ -n "${ARGMIN_TRACE:-}" || -n "${ARGMIN_TRACE_FILE:-}" ]]; then
         server_cmd+=(--features deep-tracing)
+    fi
+    if local_debug_endpoint_enabled; then
+        server_cmd+=(--features local-debug-endpoints)
     fi
     if ((release)); then
         server_cmd+=(--release)

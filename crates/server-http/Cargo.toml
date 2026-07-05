@@ -8,6 +8,7 @@ name = "server_http"
 path = "src/lib.rs"
 
 [features]
+local-debug-endpoints = []
 deep-tracing = [
     "auth/deep-tracing",
     "ec/deep-tracing",
