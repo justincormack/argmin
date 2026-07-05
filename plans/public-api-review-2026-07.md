@@ -421,12 +421,13 @@ sweeps so the next drift is a compile error.
   wrong-region error rather than `NoSuchBucket`. POST Object is not on the
   deferred request-auth path; it still validates against the endpoint signing
   region during POST authentication.
-- [ ] Observability `timeout_us: Option<u128>` on
-  `RequestAdmissionSummary`/`StorageRpcAdmissionSummary`
-  (`observability/src/lib.rs:1301, 1493`): every workspace caller passes
-  `Some`; on timeout emitters `None` renders "timed out after 0us" via
-  `unwrap_or_default()` (lib.rs:2264, 2279, 3222, 3235). Fix: plain
-  `u128`/`Duration`.
+- [x] Observability formerly had `timeout_us: Option<u128>` on
+  `RequestAdmissionSummary`/`StorageRpcAdmissionSummary`: every workspace
+  caller passed `Some`; on timeout emitters `None` rendered "timed out after 0us" via
+  `unwrap_or_default()` (lib.rs:2264, 2279, 3222, 3235). Completed by
+  splitting each admission summary into wait and timeout variants. Wait
+  events now have no timeout field, while timeout events require a plain
+  `timeout_us: u128`.
 - [ ] `begin_bucket_delete` (unguarded, `Option<(u64,u64)>` identity) vs
   `begin_bucket_delete_if_current` (`cluster/request_ops.rs:3947, 3951`):
   production only uses the guarded one; `None` identity is a logic error for

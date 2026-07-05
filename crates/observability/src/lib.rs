@@ -1293,12 +1293,20 @@ pub struct RequestStartSummary<'a> {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct RequestAdmissionSummary<'a> {
+pub struct RequestAdmissionWaitSummary<'a> {
     pub method: &'a str,
     pub path: &'a str,
     pub query: QuerySummary,
     pub wait_us: u128,
-    pub timeout_us: Option<u128>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RequestAdmissionTimeoutSummary<'a> {
+    pub method: &'a str,
+    pub path: &'a str,
+    pub query: QuerySummary,
+    pub wait_us: u128,
+    pub timeout_us: u128,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1485,12 +1493,20 @@ pub struct StorageRpcErrorSummary<'a> {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct StorageRpcAdmissionSummary<'a> {
+pub struct StorageRpcAdmissionWaitSummary<'a> {
     pub node_id: u32,
     pub rpc_kind: &'a str,
     pub admission_class: &'a str,
     pub wait_us: u128,
-    pub timeout_us: Option<u128>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StorageRpcAdmissionTimeoutSummary<'a> {
+    pub node_id: u32,
+    pub rpc_kind: &'a str,
+    pub admission_class: &'a str,
+    pub wait_us: u128,
+    pub timeout_us: u128,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2208,7 +2224,7 @@ fn saturating_u128_to_u64(value: u128) -> u64 {
 pub fn emit_request_admission_wait(
     context: &TraceContext,
     target: &'static str,
-    summary: RequestAdmissionSummary<'_>,
+    summary: RequestAdmissionWaitSummary<'_>,
 ) -> bool {
     REQUEST_ADMISSION_WAIT_TOTAL.fetch_add(1, Ordering::Relaxed);
     REQUEST_ADMISSION_WAIT_US_TOTAL
@@ -2246,7 +2262,7 @@ pub fn emit_request_admission_wait(
 pub fn emit_request_admission_timeout(
     context: &TraceContext,
     target: &'static str,
-    summary: RequestAdmissionSummary<'_>,
+    summary: RequestAdmissionTimeoutSummary<'_>,
 ) -> bool {
     REQUEST_ADMISSION_TIMEOUT_TOTAL.fetch_add(1, Ordering::Relaxed);
     record_flight_event(
@@ -2261,7 +2277,7 @@ pub fn emit_request_admission_timeout(
             summary.query.param_count(),
             summary.query.has_sigv4_params(),
             summary.wait_us,
-            summary.timeout_us.unwrap_or_default()
+            summary.timeout_us
         )),
     );
     event_in_context(
@@ -2276,7 +2292,7 @@ pub fn emit_request_admission_timeout(
             summary.query.param_count(),
             summary.query.has_sigv4_params(),
             summary.wait_us,
-            summary.timeout_us.unwrap_or_default()
+            summary.timeout_us
         )),
     )
 }
@@ -3173,7 +3189,7 @@ pub fn emit_storage_rpc_admission_attempt() {
 
 pub fn emit_storage_rpc_admission_wait(
     target: &'static str,
-    summary: StorageRpcAdmissionSummary<'_>,
+    summary: StorageRpcAdmissionWaitSummary<'_>,
 ) -> bool {
     STORAGE_RPC_ADMISSION_WAIT_TOTAL.fetch_add(1, Ordering::Relaxed);
     STORAGE_RPC_ADMISSION_WAIT_US_TOTAL
@@ -3203,7 +3219,7 @@ pub fn emit_storage_rpc_admission_wait(
 
 pub fn emit_storage_rpc_admission_timeout(
     target: &'static str,
-    summary: StorageRpcAdmissionSummary<'_>,
+    summary: StorageRpcAdmissionTimeoutSummary<'_>,
 ) -> bool {
     STORAGE_RPC_ADMISSION_TIMEOUT_TOTAL.fetch_add(1, Ordering::Relaxed);
     let Some(context) = current_context() else {
@@ -3219,7 +3235,7 @@ pub fn emit_storage_rpc_admission_timeout(
             summary.rpc_kind,
             summary.admission_class,
             summary.wait_us,
-            summary.timeout_us.unwrap_or_default()
+            summary.timeout_us
         ),
     );
     event_in_context(
@@ -3232,7 +3248,7 @@ pub fn emit_storage_rpc_admission_timeout(
             summary.rpc_kind,
             summary.admission_class,
             summary.wait_us,
-            summary.timeout_us.unwrap_or_default()
+            summary.timeout_us
         )),
     )
 }
@@ -3652,44 +3668,42 @@ mod tests {
         emit_request_admission_wait(
             &ctx,
             "server_http",
-            RequestAdmissionSummary {
+            RequestAdmissionWaitSummary {
                 method: "PUT",
                 path: "/bucket/key",
                 query: query_summary("X-Amz-Signature=secret"),
                 wait_us: 123,
-                timeout_us: Some(5_000_000),
             },
         );
         emit_request_admission_timeout(
             &ctx,
             "server_http",
-            RequestAdmissionSummary {
+            RequestAdmissionTimeoutSummary {
                 method: "PUT",
                 path: "/bucket/key",
                 query: query_summary("X-Amz-Signature=secret"),
                 wait_us: 5_000_000,
-                timeout_us: Some(5_000_000),
+                timeout_us: 5_000_000,
             },
         );
         emit_storage_rpc_admission_attempt();
         emit_storage_rpc_admission_wait(
             "storage_node_client",
-            StorageRpcAdmissionSummary {
+            StorageRpcAdmissionWaitSummary {
                 node_id: 7,
                 rpc_kind: "shard write",
                 admission_class: "progress",
                 wait_us: 456,
-                timeout_us: Some(5_000_000),
             },
         );
         emit_storage_rpc_admission_timeout(
             "storage_node_client",
-            StorageRpcAdmissionSummary {
+            StorageRpcAdmissionTimeoutSummary {
                 node_id: 7,
                 rpc_kind: "shard write",
                 admission_class: "progress",
                 wait_us: 5_000_000,
-                timeout_us: Some(5_000_000),
+                timeout_us: 5_000_000,
             },
         );
         emit_bucket_lock_wait_exceeded(&ctx, "storage", &"bucket", 3, 1_500);
@@ -4567,16 +4581,22 @@ mod tests {
             "trace-admission-redaction".to_string(),
             "request-admission-redaction".to_string(),
         );
-        let summary = RequestAdmissionSummary {
+        let wait_summary = RequestAdmissionWaitSummary {
             method: "PUT",
             path: "/secret-bucket/secret-key",
             query: query_summary("X-Amz-Signature=secret&partNumber=1"),
             wait_us: 42_000,
-            timeout_us: Some(5_000_000),
+        };
+        let timeout_summary = RequestAdmissionTimeoutSummary {
+            method: "PUT",
+            path: "/secret-bucket/secret-key",
+            query: query_summary("X-Amz-Signature=secret&partNumber=1"),
+            wait_us: 42_000,
+            timeout_us: 5_000_000,
         };
 
-        emit_request_admission_wait(&ctx, "server_http", summary);
-        emit_request_admission_timeout(&ctx, "server_http", summary);
+        emit_request_admission_wait(&ctx, "server_http", wait_summary);
+        emit_request_admission_timeout(&ctx, "server_http", timeout_summary);
 
         let records = flight_recorder_snapshot();
         for event in ["request_admission_wait", "request_admission_timeout"] {

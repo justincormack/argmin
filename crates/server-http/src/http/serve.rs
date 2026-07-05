@@ -725,12 +725,11 @@ async fn handle(
                 let _ = observability::emit_request_admission_wait(
                     &response_trace.context,
                     TRACE_TARGET,
-                    observability::RequestAdmissionSummary {
+                    observability::RequestAdmissionWaitSummary {
                         method: response_trace.method.as_str(),
                         path: response_trace.path.as_str(),
                         query: response_trace.query,
                         wait_us,
-                        timeout_us: Some(state.config.request_wait_timeout.as_micros()),
                     },
                 );
             }
@@ -741,12 +740,12 @@ async fn handle(
             let _ = observability::emit_request_admission_timeout(
                 &response_trace.context,
                 TRACE_TARGET,
-                observability::RequestAdmissionSummary {
+                observability::RequestAdmissionTimeoutSummary {
                     method: response_trace.method.as_str(),
                     path: response_trace.path.as_str(),
                     query: response_trace.query,
                     wait_us,
-                    timeout_us: Some(state.config.request_wait_timeout.as_micros()),
+                    timeout_us: state.config.request_wait_timeout.as_micros(),
                 },
             );
             let resp = S3Response::error_with_ids(&ServerError::SlowDown, "", &wire_ids);

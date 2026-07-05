@@ -1537,12 +1537,11 @@ impl UnixStorageNodeClient {
                 if wait_us > 0 {
                     let _ = observability::emit_storage_rpc_admission_wait(
                         "storage_node_client",
-                        observability::StorageRpcAdmissionSummary {
+                        observability::StorageRpcAdmissionWaitSummary {
                             node_id: self.node_id.as_u32(),
                             rpc_kind: kind.operation_name(),
                             admission_class: class.as_str(),
                             wait_us,
-                            timeout_us: Some(wait_timeout.as_micros()),
                         },
                     );
                 }
@@ -1551,12 +1550,12 @@ impl UnixStorageNodeClient {
             UnixStorageNodeRpcAdmissionAcquire::TimedOut { wait_us } => {
                 let _ = observability::emit_storage_rpc_admission_timeout(
                     "storage_node_client",
-                    observability::StorageRpcAdmissionSummary {
+                    observability::StorageRpcAdmissionTimeoutSummary {
                         node_id: self.node_id.as_u32(),
                         rpc_kind: kind.operation_name(),
                         admission_class: class.as_str(),
                         wait_us,
-                        timeout_us: Some(wait_timeout.as_micros()),
+                        timeout_us: wait_timeout.as_micros(),
                     },
                 );
                 Err(StoreError::StorageRpcResourceExhausted {
