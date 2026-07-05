@@ -1,0 +1,179 @@
+Encoded copy-source versionId can bypass copy-source policy checks
+Link: https://chatgpt.com/codex/cloud/security/findings/578c1fc3b640819189f1b2825872c636?sev=&repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin&sort=date_desc
+Criticality: medium (attack path: medium)
+Status: invalid
+
+# Metadata
+Repo: justincormack/argmin
+Commit: 03b4603
+Author: justin@specialbusservice.com
+Created: 04/07/2026, 22:42:43
+Assignee: Unassigned
+Signals: Security, Validated, Attack-path
+
+# Summary
+A security-relevant authorization mismatch was introduced. The interoperability fix correctly decodes the versionId for CopyObject and UploadPartCopy source resolution, but it did not normalize the value used for s3:x-amz-copy-source bucket-policy condition evaluation. The policy engine still evaluates the raw header, so equivalent percent-encoded versionId values can select a denied/restricted version without matching the policy condition intended for that decoded source.
+After this change, a copy request such as x-amz-copy-source: bucket/key?versionId=%31%32%33 is resolved and copied as versionId 123. However, the destination write policy context still receives the original raw header string. Bucket policies using s3:x-amz-copy-source conditions therefore compare against the encoded form, while the storage read uses the decoded version. This can let an authenticated requester with otherwise sufficient source-read and destination-write fallback permissions bypass explicit copy-source guardrails that match or deny a particular raw versionId spelling, by percent-encoding bytes in the versionId.
+
+# Validation
+## Rubric
+- [x] Confirm `x-amz-copy-source` parser percent-decodes `versionId` before source resolution.
+- [x] Confirm decoded `versionId` is converted to typed `VersionId` used for source object selection.
+- [x] Confirm CopyObject/UploadPartCopy policy context still receives the original raw copy-source header.
+- [x] Confirm bucket-policy condition key `s3:x-amz-copy-source` evaluates that raw policy-context field directly.
+- [x] Dynamically demonstrate an explicit deny matching decoded `src/key?versionId=1` blocks the decoded spelling but is bypassed by raw encoded `src/key?versionId=%31` while copying source version `1`.
+## Report
+Validated the authorization mismatch. Key code evidence: `crates/server-http/src/http/request.rs:396-404` extracts `versionId` and applies `percent_decode_strict`; existing test `request.rs:537-542` confirms `%2F` is decoded. `crates/server-http/src/http/mod.rs:231-240` converts that decoded string into typed `VersionId`, which selects the source version. However, CopyObject builds policy context with the raw header via `Some(copy_source)` at `http/mod.rs:1525-1532`, and UploadPartCopy similarly uses `PutObjectPolicyContext::new(Some(copy_source), ...)` at `http/mod.rs:2764-2771`. The policy path forwards this raw value with `.with_copy_source(input.policy_context.copy_source)` at `crates/server-core/src/coordinator/authz/policy.rs:123-124`; `s3:x-amz-copy-source` is supported at `crates/auth/src/bucket_policy/condition_key.rs:172-177` and resolved directly from `request.copy_source()` at `condition_key.rs:375-377`.
+
+Dynamic PoC: I added a targeted server-core test `poc_copy_object_encoded_versionid_bypasses_copy_source_deny`. It creates source version `1`, sets a destination bucket policy explicitly denying `s3:x-amz-copy-source == src/key?versionId=1`, verifies a decoded policy-context spelling is denied, then performs the same copy using typed source version `1` but raw policy context `src/key?versionId=%31`. The copy succeeds and the destination body is asserted to be `forbidden-version`, proving the encoded spelling bypassed the deny while selecting the denied version. Command output: `POC decoded_source=src/key?versionId=1; encoded_source=src/key?versionId=%31; selected_version=1`, `POC encoded copy succeeded; destination version=null`, `test ... ok`.
+
+Commands run: `cargo test -p server-http parse_copy_source_percent_decodes_version_id -- --nocapture` passed; `cargo test -p server-core poc_copy_object_encoded_versionid_bypasses_copy_source_deny -- --nocapture` passed. Crash/valgrind attempts: this is an authorization logic flaw, not a memory-safety crash; the direct PoC did not crash. `valgrind --version` returned `command not found`. Debugger validation: LLDB was run non-interactively against the debug test binary, stopped at `access_control_tests.rs:8651` in the PoC test, showed the test stack, continued, and the PoC passed with the bypass output.
+
+# Evidence
+crates/auth/src/bucket_policy/condition_key.rs (L172 to 177)
+  Note: s3:x-amz-copy-source is a supported condition key for non-GET actions, making the raw-versus-decoded mismatch security-relevant for copy authorization policies.
+```
+    ConditionKeyResolver {
+        key: KeyMatch::Exact("s3:x-amz-copy-source"),
+        operator_support: OperatorSupport::AnyEvaluable,
+        input: None,
+        resolve: resolve_copy_source,
+        evaluable_for_action: None,
+```
+
+crates/auth/src/bucket_policy/condition_key.rs (L375 to 377)
+  Note: The condition resolver returns the stored copy_source field directly, so it evaluates the raw header spelling rather than the decoded source actually copied.
+```
+fn resolve_copy_source<'a>(request: &PolicyRequest<'a>, _param: &str) -> ResolvedValue<'a> {
+    request_field_to_resolved(request.copy_source())
+}
+```
+
+crates/server-core/src/coordinator/authz/policy.rs (L120 to 125)
+  Note: The raw policy_context.copy_source value is forwarded into bucket-policy evaluation for s3:x-amz-copy-source conditions.
+```
+        input.action,
+        input.bucket_tags,
+    ))
+    .with_request_object_tags(input.request_object_tags)
+    .with_copy_source(input.policy_context.copy_source)
+    .with_metadata_directive(input.policy_context.metadata_directive)
+```
+
+crates/server-http/src/http/mod.rs (L1525 to 1532)
+  Note: CopyObject authorization policy context is built with Some(copy_source), the original raw x-amz-copy-source header, not the normalized/decoded source used for the actual copy.
+```
+                    let policy_context = put_object_policy_context_from_request(
+                        req,
+                        replace_tags_xml.as_deref(),
+                        Some(copy_source),
+                        directive.policy_condition_value(),
+                        acl.policy_condition_value(),
+                        destination_managed_encryption,
+                    );
+```
+
+crates/server-http/src/http/mod.rs (L231 to 240)
+  Note: The decoded versionId string from parse_copy_source is parsed into the VersionId that controls which source version is read.
+```
+fn parse_copy_source_header(
+    copy_source: &str,
+) -> Result<(BucketName, ObjectKey, Option<VersionId>), ServerError> {
+    let (src_bucket_raw, src_key, src_version_id_str) = request::parse_copy_source(copy_source)?;
+    let src_bucket =
+        BucketName::try_from(src_bucket_raw.clone()).map_err(|_| ServerError::BucketNotFound {
+            name: src_bucket_raw,
+        })?;
+    let src_version_id = parse_optional_version_id(src_version_id_str, "versionId in copy source")?;
+    Ok((src_bucket, src_key, src_version_id))
+```
+
+crates/server-http/src/http/mod.rs (L2754 to 2770)
+  Note: UploadPartCopy similarly uses the decoded versionId for the actual source while passing the raw copy_source header to PutObjectPolicyContext.
+```
+                        source: CopySource::new(
+                            src_bucket,
+                            src_key,
+                            src_version_id,
+                            &src_cond,
+                            expected_source_bucket_owner(req),
+                        ),
+                        upload: multipart_object_request(
+                            &bucket,
+                            &key,
+                            upload_id,
+                            requester,
+                            expected_bucket_owner,
+                        )?,
+                        part_number,
+                        copy_source_range,
+                        policy_context: PutObjectPolicyContext::new(Some(copy_source), None, None),
+```
+
+crates/server-http/src/http/request.rs (L396 to 404)
+  Note: The changed parser percent-decodes the copy-source versionId before it is later converted to a typed VersionId used for selecting the source object version.
+```
+    // Extract ?versionId=... query string
+    let (s, version_id) = match s.find('?') {
+        Some(pos) => {
+            let query = &s[pos + 1..];
+            let vid = query_param_raw(query, "versionId")
+                .map(percent_decode_strict)
+                .transpose()
+                .map_err(|_| invalid_copy_source())?;
+            (&s[..pos], vid)
+```
+
+# Attack-path analysis
+Final: medium | Decider: model_decided | Matrix severity: medium | Policy adjusted: medium
+## Rationale
+Kept at medium. The finding is validated and reachable through the production S3 HTTP API: attacker-controlled x-amz-copy-source is decoded for storage selection in request.rs/mod.rs while raw copy_source is passed to policy evaluation in server-core/auth. This creates a real authorization mismatch confirmed by the described executable PoC. It should not be raised to high or critical because exploitation requires authentication, an affected s3:x-amz-copy-source policy, versioned source objects, and fallback source-read/destination-write permissions; the demonstrated impact is a constrained copy-source policy bypass rather than unauthenticated private object access, account takeover, code execution, or broad cross-tenant compromise.
+## Likelihood
+high - For an affected deployment the exploit is simple: change the x-amz-copy-source versionId spelling to a percent-encoded equivalent. However, practical exploitation depends on a specific bucket-policy pattern, object versioning, and an authenticated principal with sufficient underlying source-read and destination-write permissions. | Remote network vector
+## Impact
+medium - The bug can bypass explicit copy-source policy guardrails and allow an authenticated user to copy a source object version that a destination bucket policy intended to deny. The impact is meaningful authorization-policy bypass and data integrity/control violation, but it is narrow: it requires valid credentials and fallback permissions and does not by itself grant unauthenticated access, broad tenant compromise, RCE, or direct credential exposure.
+## Assumptions
+- The analyzed commit is the checked-out HEAD at /workspace/argmin.
+- No Kubernetes, Terraform, Docker Compose, or other deployment manifests were present in the repository checkout, so exposure is inferred from application configuration only.
+- The vulnerable path matters when an operator uses bucket policies with s3:x-amz-copy-source conditions to constrain CopyObject or UploadPartCopy by versionId.
+- The attacker is an authenticated S3 API client with enough fallback source-read and destination-write permissions for the copy operation except for the intended copy-source policy guardrail.
+- Valid SigV4 credentials or other accepted authenticated request context
+- A reachable argmin-s3 HTTP frontend
+- A source object version selected through x-amz-copy-source ?versionId=...
+- A destination bucket policy using s3:x-amz-copy-source conditions that expects the decoded/unencoded versionId spelling
+- Underlying source-read and destination-write permissions that are not otherwise denied
+## Path
+Authenticated client
+  -> x-amz-copy-source: src/key?versionId=%31
+  -> parser decodes versionId to 1 for CopySource
+  -> policy context still stores raw %31
+  -> s3:x-amz-copy-source deny for versionId=1 does not match
+  -> copy of decoded version 1 succeeds
+## Path evidence
+- `crates/argmin-s3/Cargo.toml:1-8` - Defines the production argmin-s3 binary, confirming the affected HTTP server code is part of the main application.
+- `crates/argmin-s3/src/config.rs:201-208` - Frontend credentials and encryption key material are loaded from environment variables; no secret values are present in the repository evidence.
+- `crates/argmin-s3/src/config.rs:227-229` - The TCP listen address is configurable through ARGMIN_LISTEN_ADDR and defaults to 127.0.0.1:9000; TLS cert/key paths are optional env-driven configuration.
+- `crates/argmin-s3/src/main.rs:3353-3366` - The production server binds a TcpListener on the configured listen address and builds optional TLS support.
+- `crates/server-http/src/http/mod.rs:856-914` - The HTTP frontend routes requests, authenticates non-OPTIONS operations, and dispatches authenticated requests to S3 operation handling.
+- `crates/server-http/src/http/mod.rs:1446-1448` - A PutObject request with x-amz-copy-source enters the CopyObject path and parses the attacker-controlled copy-source header.
+- `crates/server-http/src/http/request.rs:396-404` - parse_copy_source extracts the versionId query parameter and applies percent_decode_strict, creating the decoded versionId used for source selection.
+- `crates/server-http/src/http/mod.rs:231-240` - parse_copy_source_header converts the decoded versionId string into a typed VersionId that controls which source object version is read.
+- `crates/server-http/src/http/mod.rs:1525-1532` - CopyObject constructs destination write policy context with Some(copy_source), preserving the raw x-amz-copy-source header rather than the normalized source.
+- `crates/server-http/src/http/mod.rs:2754-2770` - UploadPartCopy similarly uses the decoded src_version_id for CopySource but passes the raw copy_source into PutObjectPolicyContext.
+- `crates/server-core/src/coordinator/authz/policy.rs:120-125` - The raw policy_context.copy_source field is forwarded into bucket-policy request construction.
+- `crates/auth/src/bucket_policy/condition_key.rs:172-177` - s3:x-amz-copy-source is a supported bucket-policy condition key.
+- `crates/auth/src/bucket_policy/condition_key.rs:375-377` - The copy-source condition resolver returns request.copy_source directly, so policy evaluation sees the raw header spelling.
+## Narrative
+This is a real, in-scope authorization flaw. The production HTTP frontend accepts CopyObject and UploadPartCopy through the S3 API, authenticates the request, and then parses x-amz-copy-source. The parser percent-decodes the versionId and parse_copy_source_header converts that decoded value into the typed VersionId used by CopySource. However, the destination write policy context receives Some(copy_source), the original raw header. server-core forwards that raw policy_context.copy_source to bucket-policy evaluation, and the s3:x-amz-copy-source resolver returns it directly. Therefore a request such as versionId=%31 can select decoded version 1 while policy conditions compare against the raw %31 spelling. The validation PoC described for this commit demonstrated an explicit deny on src/key?versionId=1 blocking the decoded spelling but not the encoded spelling, while the encoded request still copied version 1. Severity remains medium: exploitation is remote and low-complexity for an authenticated S3 client in an affected policy configuration, but it requires valid credentials, source-read and destination-write permissions, and reliance on copy-source policy conditions; it is not an unauthenticated read/write bypass or code execution.
+## Controls
+- SigV4 request authentication before non-OPTIONS S3 operation dispatch
+- Bucket-policy authorization including s3:x-amz-copy-source condition support
+- Configurable TCP bind address with default 127.0.0.1:9000
+- Optional TLS via ARGMIN_TLS_CERT_PATH and ARGMIN_TLS_KEY_PATH
+- Connection and in-flight request limits in the HTTP serve layer
+- SecretConfigValue redacts secret configuration values from Debug output
+## Blindspots
+- No deployment manifests were present, so actual public exposure, load balancer type, and network placement could not be determined statically.
+- The repository does not reveal whether real operators commonly use s3:x-amz-copy-source conditions with versionId guardrails.
+- Static analysis cannot confirm runtime bucket policies or object-versioning configurations in deployed environments.
+- The validation PoC was provided from an earlier stage; this attack-path review used repository artifacts for corroborating code evidence.

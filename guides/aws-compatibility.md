@@ -179,6 +179,38 @@ Source with the contradictory note:
 
 - https://docs.aws.amazon.com/AmazonS3/latest/userguide/conditional-writes-enforce.html
 
+### Bucket-policy `s3:x-amz-copy-source` uses the raw header spelling
+
+Live AWS evaluates `s3:x-amz-copy-source` bucket-policy conditions against the
+raw `x-amz-copy-source` header value. Source resolution still parses and
+percent-decodes the source path and `versionId` where applicable. The
+percent-encoded key-path case and the percent-encoded `versionId` case are the
+same AWS rule: policy matching sees the raw header spelling, but the copy
+operation uses the decoded source.
+
+Policy authors should not rely on canonical decoded spellings as deny
+guardrails for equivalent percent-encoded header spellings. For example, a
+deny that matches `{bucket}/private/*` does not match
+`{bucket}/%70rivate/...`, and a deny that matches
+`{bucket}/key?versionId=1` does not match
+`{bucket}/key?versionId=%31`, even though AWS resolves the same source key or
+source version for the copy operation.
+
+This is a deny-list hazard, not an allow-list hazard. A policy that allows only
+the canonical raw spelling does not also allow an equivalent percent-encoded
+spelling, so the encoded request fails unless some other statement permits it.
+For copy-source restrictions, use an allow pattern for the accepted raw header
+spelling instead of a deny pattern over one canonical decoded form. AWS's
+conditional-write examples follow this allow-style pattern, although the
+documentation does not call out that deny policies are unsafe for equivalent
+copy-source encodings.
+
+The AWS-pinned coverage is in:
+
+- `test_bucket_policy_copy_source_condition_percent_encoded_unreserved_bypasses_canonical_deny`
+- `test_bucket_policy_copy_source_percent_encoded_versionid_bypasses_canonical_deny`
+- `test_bucket_policy_upload_part_copy_percent_encoded_versionid_bypasses_canonical_deny`
+
 ### `aws:RequestTag/*` on S3 Control `UntagResource`
 
 AWS's S3 service authorization reference lists `aws:TagKeys` for

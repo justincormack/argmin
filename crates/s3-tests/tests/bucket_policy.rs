@@ -42,6 +42,23 @@ fn require_https_endpoint() {
     );
 }
 
+fn percent_encode_first_byte(value: &str) -> String {
+    let (first, rest) = value
+        .as_bytes()
+        .split_first()
+        .expect("value must not be empty");
+    let mut encoded = format!("%{:02X}", *first);
+    encoded.extend(url::form_urlencoded::byte_serialize(rest));
+    encoded
+}
+
+fn copy_part_etag_from_body(body: &str) -> &str {
+    body.split_once("<ETag>")
+        .and_then(|(_, rest)| rest.split_once("</ETag>"))
+        .map(|(etag, _)| etag)
+        .unwrap_or_else(|| panic!("UploadPartCopy response should include ETag: {body}"))
+}
+
 macro_rules! with_sse_c_headers {
     ($op:expr, $algorithm:expr, $key_b64:expr, $key_md5_b64:expr) => {{
         $op.customize().mutate_request({
@@ -12153,6 +12170,282 @@ fn test_bucket_policy_copy_source_condition_percent_encoded_unreserved_bypasses_
 
         cleanup_with_client(client, &dst_bucket, &["copied", "canonical-denied"]).await;
         cleanup_with_client(client, &src_bucket, &["private/foo"]).await;
+    });
+}
+
+#[test]
+fn test_bucket_policy_copy_source_percent_encoded_versionid_bypasses_canonical_deny() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let src_bucket = unique_bucket();
+        let dst_bucket = unique_bucket();
+        s3_tests::create_bucket(client, &src_bucket).await.unwrap();
+        s3_tests::create_bucket(client, &dst_bucket).await.unwrap();
+        s3_tests::enable_bucket_versioning(client, &src_bucket).await;
+
+        let src_key = "versioned/source";
+        let first_put = s3_tests::put_object_retrying_operation_aborted(
+            client,
+            &src_bucket,
+            src_key,
+            b"denied-version".to_vec(),
+        )
+        .await;
+        let first_version_id = first_put
+            .version_id()
+            .expect("versioned put should return version id")
+            .to_string();
+        assert_ne!(first_version_id, "null");
+
+        s3_tests::put_object_retrying_operation_aborted(
+            client,
+            &src_bucket,
+            src_key,
+            b"latest-version".to_vec(),
+        )
+        .await;
+
+        let canonical_copy_source = format!("{src_bucket}/{src_key}?versionId={first_version_id}");
+        client
+            .put_bucket_policy()
+            .bucket(&dst_bucket)
+            .policy(
+                json!({
+                    "Version": "2012-10-17",
+                    "Statement": [{
+                        "Effect": "Deny",
+                        "Principal": "*",
+                        "Action": "s3:PutObject",
+                        "Resource": bucket_wildcard_resource(&dst_bucket),
+                        "Condition": {
+                            "StringEquals": {
+                                "s3:x-amz-copy-source": canonical_copy_source
+                            }
+                        }
+                    }]
+                })
+                .to_string(),
+            )
+            .send_retrying_operation_aborted("put versionId copy-source deny bucket policy")
+            .await
+            .unwrap();
+
+        let canonical_dst_url = object_url(
+            CTX.endpoint(),
+            &dst_bucket,
+            "canonical-version-denied",
+            None,
+        );
+        eventually_result_matches(
+            "CopyObject denied with canonical versionId copy-source header",
+            20,
+            std::time::Duration::from_millis(200),
+            || {
+                let canonical_dst_url = canonical_dst_url.clone();
+                let canonical_copy_source = canonical_copy_source.clone();
+                async move {
+                    Ok::<_, std::convert::Infallible>(send_signed_request(
+                        "PUT",
+                        &canonical_dst_url,
+                        b"",
+                        [("x-amz-copy-source", canonical_copy_source.as_str())],
+                    ))
+                }
+            },
+            |result| result.as_ref().is_ok_and(|response| response.status == 403),
+        )
+        .await;
+
+        let encoded_dst_key = "encoded-version-copied";
+        let encoded_dst_url = object_url(CTX.endpoint(), &dst_bucket, encoded_dst_key, None);
+        let encoded_copy_source = format!(
+            "{src_bucket}/{src_key}?versionId={}",
+            percent_encode_first_byte(&first_version_id)
+        );
+        let response = send_signed_request(
+            "PUT",
+            &encoded_dst_url,
+            b"",
+            [("x-amz-copy-source", encoded_copy_source.as_str())],
+        );
+        assert_eq!(
+            response.status, 200,
+            "expected encoded versionId copy-source spelling to bypass canonical deny, got {} body={}",
+            response.status, response.body
+        );
+
+        let copied = s3_tests::get_object_body_retrying_operation_aborted(
+            client,
+            &dst_bucket,
+            encoded_dst_key,
+            None,
+            "get copied object after encoded versionId copy-source deny bypass",
+        )
+        .await;
+        assert_eq!(copied.as_slice(), b"denied-version");
+
+        cleanup_with_client(
+            client,
+            &dst_bucket,
+            &[encoded_dst_key, "canonical-version-denied"],
+        )
+        .await;
+        cleanup_versioned_bucket(client, &src_bucket).await;
+    });
+}
+
+#[test]
+fn test_bucket_policy_upload_part_copy_percent_encoded_versionid_bypasses_canonical_deny() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let src_bucket = unique_bucket();
+        let dst_bucket = unique_bucket();
+        s3_tests::create_bucket(client, &src_bucket).await.unwrap();
+        s3_tests::create_bucket(client, &dst_bucket).await.unwrap();
+        s3_tests::enable_bucket_versioning(client, &src_bucket).await;
+
+        let src_key = "versioned/source";
+        let first_put = s3_tests::put_object_retrying_operation_aborted(
+            client,
+            &src_bucket,
+            src_key,
+            b"denied-version".to_vec(),
+        )
+        .await;
+        let first_version_id = first_put
+            .version_id()
+            .expect("versioned put should return version id")
+            .to_string();
+        assert_ne!(first_version_id, "null");
+
+        s3_tests::put_object_retrying_operation_aborted(
+            client,
+            &src_bucket,
+            src_key,
+            b"latest-version".to_vec(),
+        )
+        .await;
+
+        let canonical_copy_source = format!("{src_bucket}/{src_key}?versionId={first_version_id}");
+        client
+            .put_bucket_policy()
+            .bucket(&dst_bucket)
+            .policy(
+                json!({
+                    "Version": "2012-10-17",
+                    "Statement": [{
+                        "Effect": "Deny",
+                        "Principal": "*",
+                        "Action": "s3:PutObject",
+                        "Resource": bucket_wildcard_resource(&dst_bucket),
+                        "Condition": {
+                            "StringEquals": {
+                                "s3:x-amz-copy-source": canonical_copy_source
+                            }
+                        }
+                    }]
+                })
+                .to_string(),
+            )
+            .send_retrying_operation_aborted(
+                "put versionId upload-part-copy-source deny bucket policy",
+            )
+            .await
+            .unwrap();
+
+        let canonical_key = "canonical-version-denied";
+        let canonical_upload = eventually_ok(
+            "CreateMultipartUpload for canonical UploadPartCopy versionId denial",
+            || {
+                client
+                    .create_multipart_upload()
+                    .bucket(&dst_bucket)
+                    .key(canonical_key)
+                    .send_retrying_operation_aborted(
+                        "create canonical-denied upload-part-copy destination upload",
+                    )
+            },
+        )
+        .await;
+        let canonical_upload_id = canonical_upload.upload_id().unwrap().to_string();
+        let canonical_url = object_url(
+            CTX.endpoint(),
+            &dst_bucket,
+            canonical_key,
+            Some(&format!("partNumber=1&uploadId={canonical_upload_id}")),
+        );
+        eventually_result_matches(
+            "UploadPartCopy denied with canonical versionId copy-source header",
+            20,
+            std::time::Duration::from_millis(200),
+            || {
+                let canonical_url = canonical_url.clone();
+                let canonical_copy_source = canonical_copy_source.clone();
+                async move {
+                    Ok::<_, std::convert::Infallible>(send_signed_request(
+                        "PUT",
+                        &canonical_url,
+                        b"",
+                        [("x-amz-copy-source", canonical_copy_source.as_str())],
+                    ))
+                }
+            },
+            |result| result.as_ref().is_ok_and(|response| response.status == 403),
+        )
+        .await;
+
+        let encoded_key = "encoded-version-copied";
+        let encoded_upload = eventually_ok(
+            "CreateMultipartUpload for encoded UploadPartCopy versionId copy",
+            || {
+                client
+                    .create_multipart_upload()
+                    .bucket(&dst_bucket)
+                    .key(encoded_key)
+                    .send_retrying_operation_aborted(
+                        "create encoded upload-part-copy destination upload",
+                    )
+            },
+        )
+        .await;
+        let encoded_upload_id = encoded_upload.upload_id().unwrap().to_string();
+        let encoded_url = object_url(
+            CTX.endpoint(),
+            &dst_bucket,
+            encoded_key,
+            Some(&format!("partNumber=1&uploadId={encoded_upload_id}")),
+        );
+        let encoded_copy_source = format!(
+            "{src_bucket}/{src_key}?versionId={}",
+            percent_encode_first_byte(&first_version_id)
+        );
+        let response = send_signed_request(
+            "PUT",
+            &encoded_url,
+            b"",
+            [("x-amz-copy-source", encoded_copy_source.as_str())],
+        );
+        assert_eq!(
+            response.status, 200,
+            "expected encoded versionId UploadPartCopy spelling to bypass canonical deny, got {} body={}",
+            response.status, response.body
+        );
+        let etag = copy_part_etag_from_body(&response.body).to_string();
+        complete_single_part_upload(client, &dst_bucket, encoded_key, &encoded_upload_id, &etag)
+            .await;
+
+        let copied = s3_tests::get_object_body_retrying_operation_aborted(
+            client,
+            &dst_bucket,
+            encoded_key,
+            None,
+            "get completed object after encoded versionId upload-part-copy deny bypass",
+        )
+        .await;
+        assert_eq!(copied.as_slice(), b"denied-version");
+
+        cleanup_with_client(client, &dst_bucket, &[encoded_key, canonical_key]).await;
+        cleanup_versioned_bucket(client, &src_bucket).await;
     });
 }
 
