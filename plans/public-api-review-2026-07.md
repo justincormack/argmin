@@ -473,15 +473,17 @@ sweeps so the next drift is a compile error.
   release path, and `BucketWriteReservationProof::matches_record` documents
   that it deliberately skips mutable `lease_deadline` because freshness is
   checked separately from proof identity.
-- [ ] `SystemMetadata::from_headers` / `from_pairs` are byte-identical
+- [x] `SystemMetadata::from_headers` / `from_pairs` are byte-identical
   (`system_metadata.rs:114-116, 186-188`) while `MetadataBlob`'s same-named
   pair differ materially: `MetadataBlob::from_pairs` skips the
   `has_invalid_header_bytes` header-injection guard and Latin-1
   reinterpretation that `from_headers` performs, its doc is wrong (claims no
   lowercasing; code lowercases), and `set()` enforces the key rule with
   `assert!` where `from_pairs` returns `Err`
-  (`metadata_blob.rs:76-89, 263-297`). Fix: single validation path; fix doc;
-  make `set` fallible; drop the redundant SystemMetadata alias.
+  (`metadata_blob.rs:76-89, 263-297`). Resolution: remove the redundant
+  `SystemMetadata::from_pairs` alias and the divergent `MetadataBlob::from_pairs`
+  / unused `set` APIs. Existing tests now use the production `from_headers`
+  constructors, so request-shape metadata parsing has a single validation path.
 - [ ] `MultipartObjectRequest`: `new`/`new_typed`, `from_object`/
   `from_object_typed`, `upload_id`/`upload_id_typed` are byte-identical
   duplicates that muddy the `_typed` convention

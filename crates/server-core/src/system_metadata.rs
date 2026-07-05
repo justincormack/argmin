@@ -183,10 +183,6 @@ impl SystemMetadata {
         Ok(out)
     }
 
-    pub fn from_pairs(pairs: &[(&str, &str)]) -> Result<Self, ServerError> {
-        Self::from_header_iter(pairs.iter().copied())
-    }
-
     #[must_use]
     pub fn content_type(&self) -> Option<&ContentType> {
         self.content_type.as_ref()

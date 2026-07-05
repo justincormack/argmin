@@ -259,43 +259,6 @@ impl MetadataBlob {
             .map(|e| e.value.as_str())
     }
 
-    /// Set a metadata key-value pair, replacing any existing entry with the same key.
-    pub fn set(&mut self, key: &str, value: &str) {
-        let lower = key.to_ascii_lowercase();
-        assert!(
-            lower.starts_with("x-amz-meta-"),
-            "MetadataBlob only accepts x-amz-meta-* keys"
-        );
-        if let Some(entry) = self.entries.iter_mut().find(|e| e.key == lower) {
-            entry.value = value.to_string();
-        } else {
-            self.entries.push(MetadataEntry {
-                key: lower,
-                value: value.to_string(),
-            });
-        }
-    }
-
-    /// Build a metadata blob from raw key-value pairs without header filtering.
-    /// Unlike `from_headers`, this does not filter by STORED_HEADERS or
-    /// lowercase keys — pairs are stored exactly as given.
-    pub fn from_pairs(pairs: &[(&str, &str)]) -> Result<Self, ServerError> {
-        let mut entries = Vec::with_capacity(pairs.len());
-        for (k, v) in pairs {
-            let lower = k.to_ascii_lowercase();
-            if !lower.starts_with("x-amz-meta-") {
-                return Err(ServerError::InvalidRequest {
-                    reason: "MetadataBlob only accepts x-amz-meta-* keys".to_string(),
-                });
-            }
-            entries.push(MetadataEntry {
-                key: lower,
-                value: v.to_string(),
-            });
-        }
-        Ok(Self { entries })
-    }
-
     /// Return the number of entries.
     pub fn len(&self) -> usize {
         self.entries.len()

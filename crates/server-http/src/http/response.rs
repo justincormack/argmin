@@ -2297,7 +2297,7 @@ mod tests {
     use s3_types::{AclGrant, AclGrantee, AclGrants, AclPermission};
 
     fn system_metadata(headers: &[(&str, &str)]) -> SystemMetadata {
-        SystemMetadata::from_pairs(headers).expect("test system metadata pairs must be valid")
+        SystemMetadata::from_headers(headers).expect("test system metadata headers must be valid")
     }
 
     fn find_header<'a>(resp: &'a S3Response, name: &str) -> Option<&'a str> {
@@ -2635,8 +2635,8 @@ mod tests {
         let result = GetObjectResult {
             sse_customer: None,
             body: ReadHandle::from_buffered_bytes(vec![]),
-            metadata: MetadataBlob::from_pairs(&[("x-amz-meta-author", "alice")])
-                .expect("test metadata pairs must be valid"),
+            metadata: MetadataBlob::from_headers(&[("x-amz-meta-author", "alice")])
+                .expect("test metadata headers must be valid"),
             system_metadata: SystemMetadata::new(),
             object_lock: s3_types::ObjectLockState::default(),
             etag: "\"e\"".into(),
@@ -2928,8 +2928,8 @@ mod tests {
     fn head_object_with_amz_meta() {
         let result = HeadObjectResult {
             sse_customer: None,
-            metadata: MetadataBlob::from_pairs(&[("x-amz-meta-tag", "value")])
-                .expect("test metadata pairs must be valid"),
+            metadata: MetadataBlob::from_headers(&[("x-amz-meta-tag", "value")])
+                .expect("test metadata headers must be valid"),
             system_metadata: SystemMetadata::new(),
             object_lock: s3_types::ObjectLockState::default(),
             etag: "\"e\"".into(),
