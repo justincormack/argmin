@@ -488,6 +488,7 @@ impl S3Response {
             ServerError::AccessDenied
             | ServerError::Auth(auth::AuthError::MissingAuth)
             | ServerError::Auth(auth::AuthError::AccessDenied)
+            | ServerError::Auth(auth::AuthError::RequestNotYetValid)
             | ServerError::Auth(auth::AuthError::PresignedRequestExpired) => {
                 let body = xml::error_xml_with_host_id(
                     "AccessDenied",

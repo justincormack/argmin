@@ -1916,6 +1916,18 @@ fn test_object_raw_get_x_amz_future_date_is_not_valid_yet() {
             body.contains("<Message>Request is not yet valid</Message>"),
             "expected not-yet-valid response, got: {body}"
         );
+        assert!(
+            body.contains("<RequestId>"),
+            "expected RequestId in not-yet-valid response, got: {body}"
+        );
+        assert!(
+            body.contains("<HostId>"),
+            "expected HostId in not-yet-valid response, got: {body}"
+        );
+        assert!(
+            !body.contains("<Resource>"),
+            "expected no Resource element in not-yet-valid response, got: {body}"
+        );
 
         cleanup(&bucket, &["obj"]).await;
     });

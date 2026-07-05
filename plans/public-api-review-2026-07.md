@@ -121,13 +121,16 @@ Remaining order of attack:
   preserve the typed variant, and the HTTP formatter routes that variant
   directly to the HostId-shaped InvalidRequest XML.
 
-- [ ] **RR5. `RequestNotYetValid` response shape unpinned and inconsistent
+- [x] **RR5. `RequestNotYetValid` response shape unpinned and inconsistent
   with its sibling.** The A4 variant falls through to the default formatter
   (`response.rs:914-921`: emits `<Resource>`, no `<HostId>`) — the opposite
   shape of `PresignedRequestExpired` (`response.rs:506-517`: HostId, no
   Resource). The oracle test (`presigned.rs:1881`) asserts only code and
   message. AWS-pin the shape and route through the AccessDenied formatter if
-  confirmed.
+  confirmed. Fixed by tightening the AWS-facing presigned future-date test to
+  assert `RequestId`, `HostId`, and no `Resource`; AWS confirmed that shape.
+  Local `RequestNotYetValid` now routes through the same HostId-shaped
+  `AccessDenied` formatter as `PresignedRequestExpired`.
 
 - [ ] **RR6. Dead `AuthError::InvalidToken`.**
   `crates/auth/src/error.rs:51` is no longer constructed anywhere in
