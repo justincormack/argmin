@@ -74,6 +74,97 @@ for the current local security suite.
 | --- | --- | --- | --- |
 | `security/codex-d9e6a71` UAT forced-overload env data directory can be deleted after passing run | fixed | `bash -n scripts/uat-forced-overload` | Informational local tooling issue; env-provided forced-overload data dirs are now treated as caller-owned like `--data-dir`. |
 
+## Backlog Sync: Regression Path Mapping Needed
+
+These rows restore one-row-per-finding coverage for findings whose exact local
+regression command still needs to be mapped or tightened.
+
+| Finding | Status | Local deterministic path | Notes |
+| --- | --- | --- | --- |
+| `security/codex-0243d93` Active PG proof floor bypass permits divergent metadata | accepted-risk | triage needed | Inventory catch-up row; verify whether a focused regression or accepted-risk rationale should be linked. |
+| `security/codex-05a0abb` Streaming part race can wedge multipart metadata | fixed | triage needed | Inventory catch-up row; map the focused multipart/stream-session regression. |
+| `security/codex-0659760` Restart DoS after 128 metadata commands | fixed | triage needed | Inventory catch-up row; map the focused restart/metadata command regression. |
+| `security/codex-09407f8` Mismatched heartbeat epochs can poison node liveness | fixed | triage needed | Inventory catch-up row; map the focused control-plane heartbeat regression. |
+| `security/codex-0c4a217` Suffix metadata transfer mutates empty destinations | fixed | triage needed | Inventory catch-up row; map the focused metadata-transfer regression. |
+| `security/codex-116a5c6` Range reads now verify whole multipart parts causing DoS | fixed | triage needed | Inventory catch-up row; map the focused ranged-read regression. |
+| `security/codex-15c6b67` Condvar wait can miss notifications, hanging bucket drains | invalid | triage needed | Inventory catch-up row; verify whether no regression is needed beyond the invalid disposition. |
+| `security/codex-1609ae9` Partial WAL write errors leave live log unrecoverable | fixed | triage needed | Inventory catch-up row; map the focused WAL recovery regression. |
+| `security/codex-1b18e25` Metadata reissue can spin on replica-only log conflicts | fixed | triage needed | Inventory catch-up row; map the focused metadata reissue regression. |
+| `security/codex-1e3ab33` Repair RPC rejects valid records without CRC | fixed | triage needed | Inventory catch-up row; map the focused repair RPC regression. |
+| `security/codex-22d83bb` POST Object bypasses conditional write bucket policies | invalid | triage needed | Inventory catch-up row; verify the AWS-pinned invalid disposition and local coverage. |
+| `security/codex-251c254` Unchecked RPC counts allow control-plane DoS | fixed | triage needed | Inventory catch-up row; map the focused RPC count regression. |
+| `security/codex-25a204e` Multipart RPC validation misses part data placement | fixed | triage needed | Inventory catch-up row; map the focused multipart RPC validation regression. |
+| `security/codex-29c799b` RPC frame caps undercount bucket-delete record size | fixed | triage needed | Inventory catch-up row; map the focused RPC frame-size regression. |
+| `security/codex-2b4ea5d` Raft startup checkpoint race can crash control plane | fixed | triage needed | Inventory catch-up row; map the focused raft startup regression. |
+| `security/codex-2eb67fe` Stale bucket-finalizer claim can stall bucket deletion cleanup | fixed | triage needed | Inventory catch-up row; map the focused bucket-finalizer regression. |
+| `security/codex-30090c8` PG proof epoch stamping can reject valid writes after epoch bump | fixed | triage needed | Inventory catch-up row; map the focused PG proof regression. |
+| `security/codex-301ea7d` Restart can persist stale PG observations and brick state | fixed | triage needed | Inventory catch-up row; map the focused restart/control-plane regression. |
+| `security/codex-36785d9` Unpaginated cleanup RPC can disable upload cleanup | fixed | triage needed | Inventory catch-up row; map the focused cleanup RPC regression. |
+| `security/codex-43fa580` Bucket tag conditions ignored when ABAC disabled allow deny bypass | invalid | triage needed | Inventory catch-up row; verify the invalid disposition and bucket-tag condition coverage. |
+| `security/codex-44ecc43` Remote write reservations use local bucket snapshots | fixed | triage needed | Inventory catch-up row; map the focused remote write-reservation regression. |
+| `security/codex-477547d` ListObjectVersions delimiter can scan unbounded prefixes | fixed | triage needed | Inventory catch-up row; map the focused bounded-listing regression. |
+| `security/codex-513501e` PG-scoped clear can drop unrelated pending metadata | fixed | triage needed | Inventory catch-up row; map the focused pending metadata command regression. |
+| `security/codex-5395b09` Storage RPC idle timeout can drop active read handles | fixed | triage needed | Inventory catch-up row; map the focused storage RPC idle-timeout regression. |
+| `security/codex-5e7f1f0` Remote frontend leaves deleted object data unreclaimed | stale | triage needed | Inventory catch-up row; verify stale disposition and reclaim coverage. |
+| `security/codex-6365437` Refresh merge retains historical routes without pruning | fixed | triage needed | Inventory catch-up row; map the focused route-history pruning regression. |
+| `security/codex-67175e5` POST Object conditional-policy bypass allows overwrites | invalid | triage needed | Inventory catch-up row; verify the AWS-pinned invalid disposition and POST policy coverage. |
+| `security/codex-6d53602` Production Raft WAL failpoint can terminate the server | fixed | triage needed | Inventory catch-up row; map the focused production failpoint regression. |
+| `security/codex-7094731` Panic possible when stripping aws-chunked Content-Encoding | fixed | triage needed | Inventory catch-up row; map the focused aws-chunked header regression. |
+| `security/codex-73c6e74` HeadBucket can ignore ListBucket list-parameter Deny conditions | fixed | triage needed | Inventory catch-up row; map the focused HeadBucket/ListBucket policy regression. |
+| `security/codex-73c8762` Racy metadata log allocation can wedge a PG | fixed | triage needed | Inventory catch-up row; map the focused metadata log allocation regression. |
+| `security/codex-753ed86` Direct PUT cleanup bypass on pending-visibility error | fixed | triage needed | Inventory catch-up row; map the focused direct PUT cleanup regression. |
+| `security/codex-78b6e3a` Metadata transfer import rejects remote peering routes | fixed | triage needed | Inventory catch-up row; map the focused metadata-transfer import regression. |
+| `security/codex-791b409` Heartbeat can delete active future-epoch pending command | fixed | triage needed | Inventory catch-up row; map the focused heartbeat/pending-command regression. |
+| `security/codex-79ac4af` Upgrade path can persist unparsable peering PG state | fixed | triage needed | Inventory catch-up row; map the focused upgrade/peering-state regression. |
+| `security/codex-79babf8` Metadata transfer retry can persist invalid control-plane state | fixed | triage needed | Inventory catch-up row; map the focused metadata-transfer retry regression. |
+| `security/codex-7b06030` RPC bulk reservation can self-throttle object reads | fixed | triage needed | Inventory catch-up row; map the focused RPC admission regression. |
+| `security/codex-877cf17` Heartbeat proof validation can cause unbounded replay DoS | fixed | triage needed | Inventory catch-up row; map the focused heartbeat proof regression. |
+| `security/codex-897b622` Unbounded shard repair queue can exhaust memory | fixed | triage needed | Inventory catch-up row; map the focused shard-repair queue regression. |
+| `security/codex-8c99921` DeleteBucket retry can delete a recreated bucket | fixed | triage needed | Inventory catch-up row; map the focused DeleteBucket identity regression. |
+| `security/codex-9123ccc` Invalid active-primary metadata proofs are silently accepted | fixed | triage needed | Inventory catch-up row; map the focused metadata proof validation regression. |
+| `security/codex-918c9cb` Live metadata transfer can race in-flight writes | fixed | triage needed | Inventory catch-up row; map the focused live-transfer race regression. |
+| `security/codex-91b73a8` Shard repair worker exits after first idle timeout | fixed | triage needed | Inventory catch-up row; map the focused shard-repair worker regression. |
+| `security/codex-9adf249` Multipart completion ignores legacy checksum headers | invalid | triage needed | Inventory catch-up row; verify the AWS-pinned invalid disposition and checksum coverage. |
+| `security/codex-9f35406` Control-plane nodes can self-issue unbounded leases | fixed | triage needed | Inventory catch-up row; map the focused lease budget regression. |
+| `security/codex-a139d61` Reissue bypasses divergent metadata log check | fixed | triage needed | Inventory catch-up row; map the focused metadata reissue regression. |
+| `security/codex-a22ce27` Partial version reservations can make versioned keys unwritable | fixed | triage needed | Inventory catch-up row; map the focused version reservation regression. |
+| `security/codex-a23b565` Periodic shard audit can stall storage operations | fixed | triage needed | Inventory catch-up row; map the focused shard audit regression. |
+| `security/codex-a8379c1` Non-reserving version IDs can race object commits | fixed | triage needed | Inventory catch-up row; map the focused version ID reservation regression. |
+| `security/codex-aa6f5a6` Ignore-case policy operators only fold ASCII | fixed | triage needed | Inventory catch-up row; map the focused bucket-policy operator regression. |
+| `security/codex-ac07f23` Bucket tags read before TagResource authorization | fixed | triage needed | Inventory catch-up row; map the focused TagResource authorization regression. |
+| `security/codex-ad5f27b` MPU sequence drain can skip object cleanup hooks | fixed | triage needed | Inventory catch-up row; map the focused MPU sequence drain regression. |
+| `security/codex-ae34427` In-flight recovery can serve stale authorization metadata | fixed | triage needed | Inventory catch-up row; map the focused recovery authorization regression. |
+| `security/codex-afb03c8` Unbounded Raft WAL reread enables control-plane DoS | fixed | triage needed | Inventory catch-up row; map the focused raft WAL boundedness regression. |
+| `security/codex-b2d322a` Write reservation released before writes, enabling delete races | fixed | triage needed | Inventory catch-up row; map the focused write-reservation regression. |
+| `security/codex-b54587c` Durable reclaim scans can be starved by queued work | fixed | triage needed | Inventory catch-up row; map the focused durable reclaim scan regression. |
+| `security/codex-b54e267` Multipart completion retry can return false NoSuchUpload | fixed | triage needed | Inventory catch-up row; map the focused multipart completion retry regression. |
+| `security/codex-b6c176a` PutObject does not pin runtime map during uploads | fixed | triage needed | Inventory catch-up row; map the focused runtime-map pinning regression. |
+| `security/codex-baf8625` Quoted star If-Match becomes wildcard on writes | fixed | triage needed | Inventory catch-up row; map the focused conditional-write regression. |
+| `security/codex-bb3bb71` Heartbeat retry can run past requested lease budget | fixed | triage needed | Inventory catch-up row; map the focused heartbeat lease-budget regression. |
+| `security/codex-bd031dc` Multipart create can leak bucket write reservations on DB errors | fixed | triage needed | Inventory catch-up row; map the focused multipart create cleanup regression. |
+| `security/codex-c82e89d` Raft status scans entire WAL on every status check | fixed | triage needed | Inventory catch-up row; map the focused raft status boundedness regression. |
+| `security/codex-cb7f7ea` Unbounded read-handle session state enables local DoS | fixed | triage needed | Inventory catch-up row; map the focused read-handle session regression. |
+| `security/codex-d1d93d0` Raw copy-source policy checks permit encoded bypasses | invalid | triage needed | Inventory catch-up row; verify the AWS-pinned invalid disposition and copy-source policy coverage. |
+| `security/codex-d2b4839` Active writes can block bucket ACL and property changes | fixed | triage needed | Inventory catch-up row; map the focused active-write blocking regression. |
+| `security/codex-d4fe45c` Active PG primary can change without peering | fixed | triage needed | Inventory catch-up row; map the focused PG primary transition regression. |
+| `security/codex-d8be5fb` Active PG handoff can strand the primary without a route map | fixed | triage needed | Inventory catch-up row; map the focused PG handoff regression. |
+| `security/codex-e3b65ca` WAL replay bypasses static Raft peer membership validation | fixed | triage needed | Inventory catch-up row; map the focused raft membership validation regression. |
+| `security/codex-e4dbc96` Unbounded metadata command cache enables memory DoS | resolved | triage needed | Inventory catch-up row; map the focused metadata command cache regression. |
+| `security/codex-e77fe33` Unverified metadata digest is trusted after restart | fixed | triage needed | Inventory catch-up row; map the focused metadata digest restart regression. |
+| `security/codex-ea51c5e` Stale lifecycle metadata can delete recreated-bucket objects | fixed | triage needed | Inventory catch-up row; map the focused lifecycle/recreated-bucket regression. |
+| `security/codex-ed52d24` Stream session cleanup can be starved by cleanup admission | fixed | triage needed | Inventory catch-up row; map the focused stream-session cleanup regression. |
+| `security/codex-f153313` Active PG proof fencing causes post-write heartbeat DoS | fixed | triage needed | Inventory catch-up row; map the focused PG proof heartbeat regression. |
+| `security/codex-f504bfa` Dynamic frontend routes expire without refresh | fixed | triage needed | Inventory catch-up row; map the focused frontend route refresh regression. |
+| `security/codex-fa2a075` ListParts metadata read happens before auth check | fixed | triage needed | Inventory catch-up row; map the focused ListParts authorization-order regression. |
+| `security/codex-fe54c42` Shared cleanup admission can starve background cleanup | fixed | triage needed | Inventory catch-up row; map the focused cleanup admission regression. |
+| `security/minimax-632837-l1` Responses do not set X-Content-Type-Options or other browser-side security headers | accepted-risk | triage needed | Inventory catch-up row; verify accepted-risk rationale and any transport coverage. |
+| `security/minimax-632837-l2` ServerError::InvalidRequest reason fields are passed through to client error responses | invalid | triage needed | Inventory catch-up row; verify invalid disposition and error sanitization coverage. |
+| `security/minimax-632837-m1` Streaming PUT chunked decoder has no per-chunk size cap, only outer body timeout | fixed | triage needed | Inventory catch-up row; map the focused chunked decoder boundedness regression. |
+| `security/minimax-632837-m2` Aws-chunked per-chunk signature comparison uses non-constant-time equality | fixed | triage needed | Inventory catch-up row; map the focused chunk-signature comparison regression. |
+| `security/minimax-632837-m3` Header-signed SigV4 requests do not validate the request timestamp against server time | fixed | triage needed | Inventory catch-up row; map the focused SigV4 date-skew regression. |
+| `security/minimax-632837-m4` Data directory creation relies on umask for permissions rather than an explicit chmod | fixed | triage needed | Inventory catch-up row; map the focused data-directory permissions regression. |
+| `security/minimax-632837-m5` Storage-node socket directory validation has a TOCTOU window and does not check setuid/setgid/sticky bits | fixed | triage needed | Inventory catch-up row; map the focused socket-directory validation regression. |
+
 ## Integrity, Checksums, and Low-Level Implementation
 
 | Finding | Status | Local deterministic path | Notes |
