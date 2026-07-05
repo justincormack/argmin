@@ -1,0 +1,346 @@
+Unbounded Raft WAL reread enables control-plane DoS
+Link: https://chatgpt.com/codex/cloud/security/findings/fdfeca5bb61c8191a321d76700b3dd3e?sev=&repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin&sort=date_desc
+Criticality: medium (attack path: medium)
+Status: fixed
+
+# Metadata
+Repo: justincormack/argmin
+Commit: afb03c8
+Author: justin@specialbusservice.com
+Created: 04/07/2026, 22:07:59
+Assignee: Unassigned
+Signals: Security, Validated, Attack-path
+
+# Summary
+Introduced an availability bug by enabling the WAL-backed durable process without bounding, compacting, or incrementally tracking WAL length. The problematic primitive existed before, but this commit made it part of the live durable control-plane path and added the full-WAL scan on checkpoint.
+The new WAL-backed constructors are now used by the control-plane process. Each Raft log-store mutation appends another WAL frame, and control-plane commands checkpoint the durable restart artifact before returning. During checkpoint capture, the new wal_replay_offset is computed with wal.clean_len(), which calls read_records() and read_records_from(0). That implementation reads the entire WAL file into memory and decodes all frames from the beginning just to find the clean length. The commit does not add any compaction or truncation of checkpointed WAL bytes; truncation is only used for torn tails during replay. As a result, repeated control-plane mutations such as storage-node heartbeat updates can grow the WAL without bound, and every later checkpoint performs O(total WAL size) disk I/O, allocation, checksum work, and frame decoding while holding the log-store lock. A low-privileged local/internal actor that can send control-plane traffic can therefore consume disk and CPU/memory until the experimental control plane becomes unavailable.
+
+# Resolution
+Fixed by commit 855bd471 (`Bound durable Raft peer RPC WAL acknowledgements`).
+
+The durable process path now keeps ordinary Raft peer RPC responses on the checkpoint-before-response boundary and compacts the acknowledged WAL suffix before releasing the response. The default durable peer RPC context checkpoints append/vote state into the restart artifact, and the regression verifies that a vote response is returned only after the durable artifact contains the vote and the WAL clean length has been compacted back to the base offset. WAL-only replay remains covered only for the pre-response crash case: if the process exits after WAL fsync but before checkpoint/ack, artifact-plus-WAL recovery still restores the mutation.
+
+Phase 12.4 plan text was also corrected to remove the stale WAL-only acknowledgement direction and record the bounded checkpoint/compaction contract for ordinary durable peer RPCs.
+
+# Validation
+## Rubric
+- [x] Confirm the commit enables WAL-backed durable control-plane constructors in the live argmin-s3 path.
+- [x] Confirm reachable control-plane mutations, including heartbeat refreshes, submit Raft commands and checkpoint durable restart artifacts before returning.
+- [x] Confirm each WAL-backed log-store mutation appends another frame without checkpoint-driven compaction/truncation.
+- [x] Confirm checkpoint export computes wal_replay_offset through wal.clean_len(), and clean_len reads/decodes the entire WAL from offset 0 while the log-store lock is held.
+- [x] Dynamically reproduce O(total WAL size) checkpoint cost and resource-exhaustion behavior with a valid WAL-backed log store; attempt crash/valgrind/debugger validation where feasible.
+## Report
+Validated the finding against commit afb03c8d085652bdb051b658f429c6d410503f95. Code review confirmed the live experimental control-plane now uses WAL-backed durable constructors in crates/argmin-s3/src/main.rs:2205-2225. Control-plane command submission checkpoints before returning at crates/argmin-s3/src/main.rs:1555-1568, and node heartbeat refreshes submit a repeatable Raft command at crates/argmin-s3/src/main.rs:1620-1644. On the storage side, checkpoint capture calls ControlPlaneRaftRestartArtifact::capture() -> export_restart_artifact_with_wal_replay_offset() at crates/storage/src/control_plane_raft.rs:4935-4944, which locks the log store and calls wal.clean_len() at lines 4105-4120. WAL mutation appends a new length-prefixed frame to the file with OpenOptions::append and fsync at lines 4728-4787. clean_len() calls read_records() -> read_records_from(0) at lines 4814-4821; read_records_from opens the WAL and read_to_end()s the whole file into a Vec at lines 4825-4852, then loops over all frames decoding and validating them at lines 4864-4910. The only truncation found is for a torn tail during replay at lines 4789-4812, not checkpoint compaction.
+
+Dynamic PoC: I built /workspace/argmin-validation-poc, which writes valid ControlPlaneRaftWalFrame SaveVote records, restores a WAL-backed ControlPlaneRaftLogStore, then calls ControlPlaneRaftRestartArtifact::capture(). Scaling output from artifacts/logs/scaling.log shows checkpoint time growing with total WAL bytes while the durable artifact size stays constant: 2.12 MB WAL -> capture 16/7 ms; 21.2 MB WAL -> capture 186/76 ms; 106 MB WAL -> capture 779/757 ms. This reproduces the O(total WAL size) checkpoint behavior.
+
+Availability impact was also demonstrated with a bounded memory limit: `(ulimit -v 80000; ... 50000 2048 1)` produced `Error: Io { context: "read control-plane OpenRaft WAL", source: Kind(OutOfMemory) }`, showing the full-WAL allocation can make durable restore/checkpoint operations fail under memory pressure.
+
+Debugger validation: gdb/rust-gdb was unavailable because gdb is not installed, but rust-lldb succeeded. The breakpoint at `storage::control_plane_raft::ControlPlaneRaftWalFile::read_records_from` first hit replay, then after continuing hit the checkpoint path with stack: read_records_from(control_plane_raft.rs:4826) -> read_records(control_plane_raft.rs:4815) -> clean_len(control_plane_raft.rs:4819) -> export_restart_artifact_with_wal_replay_offset(control_plane_raft.rs:4111) -> ControlPlaneRaftRestartArtifact::capture(control_plane_raft.rs:4943) -> PoC main. This confirms the suspected full-WAL scan is on checkpoint capture.
+
+Crash/valgrind attempts: no memory-safety crash is expected for this availability bug. A direct resource-exhaustion attempt under ulimit caused a controlled OutOfMemory I/O error rather than a process crash. valgrind is not installed in the container (`bash: valgrind: command not found`). LLDB was used for the required debugger trace.
+
+# Evidence
+crates/argmin-s3/src/main.rs (L1555 to 1568)
+  Note: Every submitted control-plane command stores a durable restart artifact before returning, so the WAL clean-length scan is on the command path.
+```
+    fn submit_raft_command(
+        &mut self,
+        command: ControlPlaneCommand,
+    ) -> Result<ControlPlaneCommandResponse, ControlPlaneError> {
+        self.ensure_not_durably_poisoned()?;
+        let submitted = self.block_on(self.authority.submit_control_plane_command(command))?;
+        let outcome = submitted.into_outcome();
+        if let Err(error) = self.store_durable_restart_artifact() {
+            self.poison_durable_authority(format!(
+                "experimental OpenRaft control-plane durability checkpoint failed after a \
+                 committed command; refusing to serve until restart: {error}"
+            ));
+            return Err(error);
+        }
+```
+
+crates/argmin-s3/src/main.rs (L1620 to 1644)
+  Note: Storage-node heartbeat refreshes submit Raft commands, providing a repeatable way to drive WAL appends and checkpoints.
+```
+    fn refresh_node_heartbeat(
+        &mut self,
+        heartbeat: storage::control_plane::NodeHeartbeat,
+        authority_now_ms: u64,
+    ) -> Result<ControlPlaneHeartbeatRefresh, ControlPlaneError> {
+        let authority_now_ms = self.authority_now_ms(authority_now_ms);
+        let node_id = heartbeat.node_id;
+        let observed_epoch = heartbeat.observed_epoch;
+        let requested_lease_duration_ms = heartbeat.requested_lease_duration_ms;
+        let lease_deadline_ms = authority_now_ms
+            .checked_add(requested_lease_duration_ms)
+            .ok_or(ControlPlaneError::LeaseDeadlineOverflow)?;
+        let pre_record_snapshot = self.current_snapshot()?;
+        let lease_deadline_ms = pre_record_snapshot
+            .node(node_id)
+            .and_then(|node| node.lease_deadline_ms())
+            .map_or(lease_deadline_ms, |current_lease_deadline_ms| {
+                current_lease_deadline_ms.max(lease_deadline_ms)
+            });
+        let pre_record_epoch = pre_record_snapshot.cluster_epoch();
+        self.submit_raft_command(ControlPlaneCommand::RecordNodeHeartbeat {
+            heartbeat,
+            heartbeat_at_ms: authority_now_ms,
+            lease_deadline_ms,
+        })?;
+```
+
+crates/argmin-s3/src/main.rs (L2205 to 2225)
+  Note: This commit enables the WAL-backed durable constructors for the live experimental control-plane process.
+```
+    let durable_checkpoint_lock = Arc::new(Mutex::new(()));
+    let durable_artifact_path = Arc::new(PathBuf::from(state_path));
+    let durable_wal_path = durable_artifact_wal_path(&durable_artifact_path);
+    let authority = block_on_control_plane_raft(&runtime, async {
+        let authority = if let Some(policy) = raft_peer_policy.clone() {
+            ControlPlaneRaftAuthority::new_experimental_unix_peer_durable_with_wal(
+                cluster_name.clone(),
+                node_id,
+                Path::new(state_path),
+                &durable_wal_path,
+                policy,
+                CONTROL_PLANE_RAFT_PEER_RPC_IO_TIMEOUT,
+            )
+            .await?
+        } else {
+            ControlPlaneRaftAuthority::new_experimental_single_node_durable_with_wal(
+                cluster_name.clone(),
+                node_id,
+                Path::new(state_path),
+                &durable_wal_path,
+            )
+```
+
+crates/storage/src/control_plane_raft.rs (L4105 to 4120)
+  Note: Checkpoint export computes wal_replay_offset by calling wal.clean_len(), tying artifact capture to WAL scanning.
+```
+    fn export_restart_artifact_with_wal_replay_offset(
+        &self,
+    ) -> Result<(ControlPlaneRaftLogStoreRestartArtifact, u64), io::Error> {
+        let inner = self.lock()?;
+        let artifact = Self::restart_artifact_from_inner(&inner);
+        let wal_replay_offset = if let Some(wal) = &self.wal {
+            wal.clean_len().map_err(|error| {
+                control_plane_error_to_io_error(
+                    "read control-plane OpenRaft WAL clean length while exporting log store",
+                    error,
+                )
+            })?
+        } else {
+            0
+        };
+        Ok((artifact, wal_replay_offset))
+```
+
+crates/storage/src/control_plane_raft.rs (L4730 to 4787)
+  Note: Each WAL-backed log-store mutation appends a new fsynced frame to the WAL; there is no checkpoint compaction here.
+```
+        record: &ControlPlaneRaftWalRecord,
+    ) -> Result<(), ControlPlaneRaftWalAppendError> {
+        let frame = ControlPlaneRaftWalFrame::new(
+            self.cluster_name.clone(),
+            self.local_node_id,
+            record.clone(),
+        )
+        .encode_frame()
+        .map_err(ControlPlaneRaftWalAppendError::BeforeReplayableRecord)?;
+        let frame_len = raft_len_as_u32(frame.len(), "control-plane OpenRaft WAL frame")
+            .map_err(ControlPlaneRaftWalAppendError::BeforeReplayableRecord)?;
+
+        if let Some(parent) = self
+            .path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            fs::create_dir_all(parent)
+                .map_err(|source| ControlPlaneError::Io {
+                    context: "create control-plane OpenRaft WAL directory",
+                    source,
+                })
+                .map_err(ControlPlaneRaftWalAppendError::BeforeReplayableRecord)?;
+        }
+
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)
+            .map_err(|source| ControlPlaneError::Io {
+                context: "open control-plane OpenRaft WAL for append",
+                source,
+            })
+            .map_err(ControlPlaneRaftWalAppendError::BeforeReplayableRecord)?;
+        file.write_all(&frame_len.to_be_bytes())
+            .map_err(|source| ControlPlaneError::Io {
+                context: "write control-plane OpenRaft WAL frame length",
+                source,
+            })
+            .map_err(ControlPlaneRaftWalAppendError::BeforeReplayableRecord)?;
+        file.write_all(&frame)
+            .map_err(|source| ControlPlaneError::Io {
+                context: "write control-plane OpenRaft WAL frame",
+                source,
+            })
+            .map_err(ControlPlaneRaftWalAppendError::BeforeReplayableRecord)?;
+        inject_control_plane_raft_wal_file_sync_failure(&self.path)
+            .map_err(ControlPlaneRaftWalAppendError::AmbiguousRecordMayExist)?;
+        file.sync_all()
+            .map_err(|source| ControlPlaneError::Io {
+                context: "sync control-plane OpenRaft WAL",
+                source,
+            })
+            .map_err(ControlPlaneRaftWalAppendError::AmbiguousRecordMayExist)?;
+        sync_control_plane_raft_wal_parent(&self.path)
+            .map_err(ControlPlaneRaftWalAppendError::ReplayableRecordMayExist)?;
+        Ok(())
+    }
+```
+
+crates/storage/src/control_plane_raft.rs (L4814 to 4852)
+  Note: clean_len() calls read_records(), which opens the WAL and reads the entire file into memory from offset 0.
+```
+    fn read_records(&self) -> Result<ControlPlaneRaftWalFileRecords, ControlPlaneError> {
+        self.read_records_from(0)
+    }
+
+    pub fn clean_len(&self) -> Result<u64, ControlPlaneError> {
+        Ok(self.read_records()?.clean_len)
+    }
+
+    fn read_records_from(
+        &self,
+        replay_offset: u64,
+    ) -> Result<ControlPlaneRaftWalFileRecords, ControlPlaneError> {
+        let mut file = match File::open(&self.path) {
+            Ok(file) => file,
+            Err(source) if source.kind() == io::ErrorKind::NotFound => {
+                if replay_offset != 0 {
+                    return Err(raft_artifact_protocol_error(format!(
+                        "control-plane OpenRaft WAL replay offset {replay_offset} has no WAL file"
+                    )));
+                }
+                return Ok(ControlPlaneRaftWalFileRecords {
+                    records: Vec::new(),
+                    clean_len: 0,
+                    truncated_tail: false,
+                });
+            }
+            Err(source) => {
+                return Err(ControlPlaneError::Io {
+                    context: "open control-plane OpenRaft WAL for replay",
+                    source,
+                });
+            }
+        };
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)
+            .map_err(|source| ControlPlaneError::Io {
+                context: "read control-plane OpenRaft WAL",
+                source,
+            })?;
+```
+
+crates/storage/src/control_plane_raft.rs (L4864 to 4910)
+  Note: The full WAL contents are decoded frame-by-frame to compute clean_len, making each checkpoint O(total WAL size).
+```
+        let mut records = Vec::new();
+        let mut offset = replay_offset;
+        let mut clean_len = replay_offset;
+        while offset < bytes.len() {
+            let record_start = offset;
+            let remaining = bytes.len() - offset;
+            if remaining < CONTROL_PLANE_RAFT_WAL_FILE_FRAME_LEN {
+                return Ok(ControlPlaneRaftWalFileRecords {
+                    records,
+                    clean_len: clean_len as u64,
+                    truncated_tail: true,
+                });
+            }
+            let frame_len = u32::from_be_bytes(
+                bytes[offset..offset + CONTROL_PLANE_RAFT_WAL_FILE_FRAME_LEN]
+                    .try_into()
+                    .expect("WAL frame length prefix has fixed width"),
+            ) as usize;
+            offset += CONTROL_PLANE_RAFT_WAL_FILE_FRAME_LEN;
+            if frame_len == 0 {
+                return Err(raft_artifact_protocol_error(
+                    "zero-length control-plane OpenRaft WAL frame",
+                ));
+            }
+            let Some(frame_end) = offset.checked_add(frame_len) else {
+                return Err(raft_artifact_protocol_error(
+                    "control-plane OpenRaft WAL frame length overflows usize",
+                ));
+            };
+            if frame_end > bytes.len() {
+                return Ok(ControlPlaneRaftWalFileRecords {
+                    records,
+                    clean_len: record_start as u64,
+                    truncated_tail: true,
+                });
+            }
+            let frame = ControlPlaneRaftWalFrame::decode_frame(&bytes[offset..frame_end])?;
+            frame.validate_identity(&self.cluster_name, self.local_node_id)?;
+            records.push(frame.into_record());
+            offset = frame_end;
+            clean_len = offset;
+        }
+        Ok(ControlPlaneRaftWalFileRecords {
+            records,
+            clean_len: clean_len as u64,
+            truncated_tail: false,
+        })
+```
+
+# Attack-path analysis
+Final: medium | Decider: model_decided | Matrix severity: low | Policy adjusted: low
+## Rationale
+Keep medium. The code evidence supports the core bug: WAL-backed control-plane mutations append frames, and each checkpoint computes clean_len by rereading and decoding the entire WAL from offset 0. The path is reachable through normal internal control-plane RPC such as RefreshNodeHeartbeat, and validation evidence demonstrated O(total WAL size) checkpoint scaling plus memory-pressure failure. However, this is not public network exposure: it requires experimental Raft mode and access to a private Unix control-plane socket or a configured storage-node role. The impact is availability of the control plane, not C/I, auth bypass, RCE, or credential compromise, so high/critical would be overstated.
+## Likelihood
+medium - Exploitation is straightforward once the attacker can send control-plane traffic, but the vulnerable endpoint is a private Unix socket in an experimental, opt-in control-plane mode rather than an internet-exposed S3 API. Filesystem permissions and deployment topology are meaningful preconditions.
+## Impact
+medium - Repeated accepted control-plane mutations can grow the WAL without bound and make later checkpoints perform full-file reads, allocation, and decoding while checkpointing. This can exhaust disk or cause sustained CPU/memory/I/O pressure, making the experimental control-plane unavailable. No confidentiality, integrity, code execution, or identity compromise was identified.
+## Assumptions
+- The affected deployment has ARGMIN_PROCESS_ROLE=control-plane and ARGMIN_CONTROL_PLANE_EXPERIMENTAL_RAFT=true.
+- The attacker is an internal/local actor able to connect to the configured control-plane Unix socket, or controls/compromises a configured storage-node component that legitimately sends heartbeats.
+- Filesystem permissions on the control-plane socket directory are the main access boundary; the repository does not show a separate application-level authentication mechanism for control-plane Unix RPC.
+- experimental Raft control-plane mode enabled
+- control-plane state path and Unix socket configured
+- attacker can send accepted control-plane RPCs such as RefreshNodeHeartbeat
+- repeated log-store mutations are generated over time
+## Path
+actor/storage-node -> Unix control-plane RPC -> RefreshNodeHeartbeat -> Raft command -> WAL append + checkpoint -> clean_len full WAL scan -> control-plane DoS
+## Path evidence
+- `crates/argmin-s3/src/config.rs:308-313` - Experimental Raft control-plane mode is explicitly configuration-gated and defaults to false.
+- `crates/argmin-s3/src/config.rs:445-462` - Control-plane role requires configured state and socket paths, and Raft-specific configuration requires experimental Raft mode.
+- `crates/argmin-s3/src/main.rs:1345-1348` - The product control-plane runtime dispatches to the experimental Raft control-plane when enabled.
+- `crates/argmin-s3/src/main.rs:2180-2225` - The experimental control-plane binds the Unix socket and constructs WAL-backed durable Raft authority instances.
+- `crates/argmin-s3/src/main.rs:2678-2728` - The control-plane socket is protected by private directory ownership/mode checks, confirming local/internal rather than public exposure.
+- `crates/storage/src/control_plane.rs:4999-5058` - The Unix control-plane RPC path decodes requests and routes RefreshNodeHeartbeat to refresh_node_heartbeat.
+- `crates/argmin-s3/src/main.rs:1619-1644` - Heartbeat refresh submits a RecordNodeHeartbeat Raft command, providing a repeatable mutation path.
+- `crates/argmin-s3/src/main.rs:1555-1568` - Every submitted Raft command stores a durable restart artifact before returning.
+- `crates/storage/src/control_plane_raft.rs:4728-4787` - Each WAL-backed log-store mutation appends and fsyncs a length-prefixed WAL frame.
+- `crates/storage/src/control_plane_raft.rs:4935-4944` - Checkpoint capture calls export_restart_artifact_with_wal_replay_offset.
+- `crates/storage/src/control_plane_raft.rs:4105-4120` - Checkpoint export computes wal_replay_offset by calling wal.clean_len().
+- `crates/storage/src/control_plane_raft.rs:4814-4852` - clean_len calls read_records_from(0), which reads the entire WAL file into memory.
+- `crates/storage/src/control_plane_raft.rs:4864-4910` - The entire WAL is decoded frame by frame to compute clean_len, making each checkpoint O(total WAL size).
+- `crates/argmin-s3/src/main.rs:2872-2895` - Storage-node control-plane refresh loop uses UnixControlPlaneClient to send periodic heartbeats to the control-plane socket.
+- `README.md:34-43` - Service mapping: S3 frontend defaults to 127.0.0.1:9000 with optional TLS, but this finding is on the separate internal Unix control-plane surface.
+## Narrative
+This is a real availability bug in an in-scope but non-default experimental control-plane runtime path. The argmin-s3 binary supports a control-plane process role and an experimental Raft mode. In that mode the constructor uses WAL-backed durable Raft state. The Unix RPC handler accepts RefreshNodeHeartbeat and dispatches it into ExperimentalRaftControlPlane::refresh_node_heartbeat, which submits a Raft command. submit_raft_command checkpoints the durable restart artifact before returning. On the storage side, checkpoint capture calls export_restart_artifact_with_wal_replay_offset, which calls wal.clean_len(); clean_len calls read_records_from(0), reads the whole WAL into a Vec, then decodes and validates every frame. WAL mutation appends a new fsynced frame, and no checkpoint compaction/truncation was found except torn-tail truncation during replay. Earlier validation included an executable PoC showing checkpoint time increasing with total WAL size and an OutOfMemory error under a bounded memory limit. Severity remains medium: impact can be significant control-plane availability loss, but reachability is internal/local, requires experimental mode, and does not affect confidentiality, integrity, or identity.
+## Controls
+- ARGMIN_CONTROL_PLANE_EXPERIMENTAL_RAFT flag defaults false
+- control-plane role requires explicit state and Unix socket paths
+- control-plane socket directory must be owned by the process uid and not group/world accessible
+- Unix RPC worker limit of 64
+- control-plane RPC read/write timeouts
+- not reachable from the public S3 HTTP listener
+## Blindspots
+- No deployment manifests or IaC were found in the repository to prove how often the experimental control-plane is enabled in real deployments.
+- Static review cannot verify runtime filesystem ownership/mode choices beyond the code-enforced private socket directory checks.
+- The executable validation PoC exercised the WAL/checkpoint behavior directly; the end-to-end Unix RPC attack path is inferred from static dispatch evidence.
+- Operational mitigations such as systemd sandboxing, disk quotas, cgroups, or external process supervision are not visible in the repository.
