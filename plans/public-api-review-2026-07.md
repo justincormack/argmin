@@ -140,13 +140,19 @@ Remaining order of attack:
   and removing stale mappings/tests; static credential token inputs continue
   to return S3 `InvalidToken` through the live `UnexpectedSecurityToken` path.
 
-- [ ] **RR7. Presigned path accepts a signed `x-amz-security-token` header
+- [x] **RR7. Presigned path accepts a signed `x-amz-security-token` header
   without rejection.** Header auth rejects any `x-amz-security-token` header,
   signed or not (`request.rs:329-333`); presigned auth checks only the query
   parameter (`request.rs:500-501`), so a token header listed in
   `X-Amz-SignedHeaders` passes the unsigned-header check and merely
   participates in the signature. Not exploitable with static credentials,
-  but it is residual path drift with no test pinning it.
+  but it is residual path drift with no test pinning it. Fixed by adding an
+  AWS-facing presigned GET test for a signed `x-amz-security-token` header on
+  static credentials: AWS returns `400 InvalidToken`, includes the standard
+  malformed-token message and echoed token, includes `RequestId`/`HostId`, and
+  omits `Resource`. Presigned auth now rejects a signed token header through
+  the same `UnexpectedSecurityToken` path as token query parameters and
+  header-auth token inputs.
 
 - [ ] **RR8. `route_map_validity_regressed` duplicated verbatim** at
   `storage/src/cluster.rs:1325` and `storage/src/storage_node_server.rs:11148`

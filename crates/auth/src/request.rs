@@ -498,7 +498,16 @@ fn authenticate_presigned<H: HeaderSource + ?Sized>(
         return Err(AuthError::UnknownAccessKey);
     }
     let token = query_param_lossy(query_string, "X-Amz-Security-Token");
-    validate_static_record_token_and_expiry(record, token.as_deref(), now_epoch_secs)?;
+    let signed_header_token = signed_headers
+        .iter()
+        .any(|signed_header| signed_header == &"x-amz-security-token")
+        .then(|| headers.first_value("x-amz-security-token"))
+        .flatten();
+    validate_static_record_token_and_expiry(
+        record,
+        token.as_deref().or(signed_header_token),
+        now_epoch_secs,
+    )?;
 
     let signed_header_pairs = collect_signed_headers(&signed_headers, headers)?;
     let canonical_hdrs = canonical_headers(&signed_header_pairs);
@@ -1996,6 +2005,29 @@ mod tests {
         assert!(matches!(
             err,
             AuthError::UnexpectedSecurityToken { token } if token == "wrong-token"
+        ));
+    }
+
+    #[test]
+    fn presigned_signed_security_token_header_rejected_for_static_credential() {
+        let store = example_store();
+        let query = "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIAIOSFODNN7EXAMPLE%2F20240201%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Date=20240201T120000Z&X-Amz-Expires=900&X-Amz-SignedHeaders=host%3Bx-amz-security-token&X-Amz-Signature=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let headers = [("host", "example.com"), ("x-amz-security-token", "token")];
+        let err = authenticate_request(
+            "GET",
+            "/",
+            query,
+            &headers,
+            b"",
+            &store,
+            ExpectedSigningRegion::ExactEndpointRegion("us-east-1"),
+            "s3",
+            presigned_example_time(),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            AuthError::UnexpectedSecurityToken { token } if token == "token"
         ));
     }
 

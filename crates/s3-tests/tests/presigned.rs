@@ -201,6 +201,30 @@ fn assert_headers_not_signed_error(status: u16, body: &str, expected_headers: &s
     );
 }
 
+fn assert_invalid_token_error(status: u16, body: &str, token: &str) {
+    assert_eq!(status, 400, "expected 400, got {status}: {body}");
+    assert!(
+        body.contains("<Code>InvalidToken</Code>"),
+        "expected InvalidToken response, got: {body}"
+    );
+    assert!(
+        body.contains("<Message>The provided token is malformed or otherwise invalid.</Message>"),
+        "expected InvalidToken message, got: {body}"
+    );
+    assert!(
+        body.contains(&format!("<Token-0>{token}</Token-0>")),
+        "expected echoed token, got: {body}"
+    );
+    assert!(
+        body.contains("<RequestId>") && body.contains("<HostId>"),
+        "expected AWS error shape with RequestId and HostId, got: {body}"
+    );
+    assert!(
+        !body.contains("<Resource>"),
+        "expected InvalidToken shape without Resource, got: {body}"
+    );
+}
+
 fn assert_signature_does_not_match(status: u16, body: &str) {
     assert_eq!(status, 403, "expected 403, got {status}: {body}");
     assert!(
@@ -525,6 +549,45 @@ fn test_presigned_sigv4_unsigned_security_token_reports_headers_not_signed() {
         assert_headers_not_signed_error(status, &body, "x-amz-security-token");
 
         cleanup(&bucket, &["unsigned-token-presigned-auth"]).await;
+    });
+}
+
+#[test]
+fn test_presigned_sigv4_signed_security_token_rejected_for_static_credentials() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+        let key = "signed-token-presigned-auth";
+        let body = b"presigned sigv4 signed security token";
+
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key(key)
+            .body(ByteStream::from_static(body))
+            .send()
+            .await
+            .unwrap();
+
+        let token = "signed-token-causes-400";
+        let presigned = presign_object(
+            "GET",
+            &bucket,
+            key,
+            None,
+            Duration::from_secs(900),
+            [("x-amz-security-token", token)],
+            None,
+        );
+
+        let mut response = with_presigned_headers!(agent().get(presigned.uri()), presigned)
+            .call()
+            .expect("transport error");
+        let status = response.status().as_u16();
+        let body = response.body_mut().read_to_string().unwrap_or_default();
+        assert_invalid_token_error(status, &body, token);
+
+        cleanup(&bucket, &[key]).await;
     });
 }
 
