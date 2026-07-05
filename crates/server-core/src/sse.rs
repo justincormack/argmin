@@ -376,8 +376,6 @@ impl fmt::Debug for ManagedEncryptionWriteContext {
     }
 }
 
-pub type SseS3WriteContext = ManagedEncryptionWriteContext;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct SseCustomerSegmentScope(u16);
 
@@ -635,49 +633,6 @@ pub fn decrypt_managed_encryption_checksum(
         MANAGED_CHECKSUM_AAD,
         MANAGED_ENCRYPTION_LABEL,
     )
-}
-
-#[cfg_attr(not(test), allow(dead_code))]
-pub fn prepare_sse_s3_write(
-    provider: &impl ManagedKeyProvider,
-) -> Result<ManagedEncryptionWriteContext, ServerError> {
-    prepare_managed_encryption_write(provider)
-}
-
-#[cfg_attr(not(test), allow(dead_code))]
-pub(crate) fn resume_sse_s3_write(
-    provider: &impl ManagedKeyProvider,
-    state: &SseS3ObjectState,
-    segment_scope: SseCustomerSegmentScope,
-) -> Result<ManagedEncryptionWriteContext, ServerError> {
-    resume_managed_encryption_write(provider, state, segment_scope)
-}
-
-#[cfg_attr(not(test), allow(dead_code))]
-pub(crate) fn decrypt_sse_s3_segment(
-    provider: &impl ManagedKeyProvider,
-    state: &SseS3ObjectState,
-    segment_scope: SseCustomerSegmentScope,
-    segment_index: u32,
-    ciphertext: &[u8],
-    plaintext_len: usize,
-) -> Result<Vec<u8>, ServerError> {
-    decrypt_managed_encryption_segment(
-        provider,
-        state,
-        segment_scope,
-        segment_index,
-        ciphertext,
-        plaintext_len,
-    )
-}
-
-#[cfg_attr(not(test), allow(dead_code))]
-pub fn decrypt_sse_s3_checksum(
-    provider: &impl ManagedKeyProvider,
-    state: &SseS3ObjectState,
-) -> Result<Option<ObjectChecksumMetadata>, ServerError> {
-    decrypt_managed_encryption_checksum(provider, state)
 }
 
 fn validate_sse_customer_write(
@@ -1291,12 +1246,12 @@ mod tests {
     #[test]
     fn sse_s3_round_trip() {
         let provider = managed_key_provider();
-        let ctx = prepare_sse_s3_write(&provider).unwrap();
+        let ctx = prepare_managed_encryption_write(&provider).unwrap();
         let ObjectEncryption::SseS3(state) = ctx.encryption() else {
             panic!("expected SSE-S3 object state");
         };
         let ciphertext = ctx.encrypt_segment(4, b"hello sse-s3").unwrap();
-        let plaintext = decrypt_sse_s3_segment(
+        let plaintext = decrypt_managed_encryption_segment(
             &provider,
             state,
             SseCustomerSegmentScope::object(),
@@ -1311,18 +1266,18 @@ mod tests {
     #[test]
     fn sse_s3_resume_write_round_trip() {
         let provider = managed_key_provider();
-        let initial = prepare_sse_s3_write(&provider).unwrap();
+        let initial = prepare_managed_encryption_write(&provider).unwrap();
         let ObjectEncryption::SseS3(state) = initial.encryption() else {
             panic!("expected SSE-S3 object state");
         };
-        let resumed = resume_sse_s3_write(
+        let resumed = resume_managed_encryption_write(
             &provider,
             state,
             SseCustomerSegmentScope::multipart_part(2).unwrap(),
         )
         .unwrap();
         let ciphertext = resumed.encrypt_segment(1, b"part-data").unwrap();
-        let plaintext = decrypt_sse_s3_segment(
+        let plaintext = decrypt_managed_encryption_segment(
             &provider,
             state,
             SseCustomerSegmentScope::multipart_part(2).unwrap(),
@@ -1337,7 +1292,7 @@ mod tests {
     #[test]
     fn sse_s3_checksum_metadata_round_trip() {
         let provider = managed_key_provider();
-        let ctx = prepare_sse_s3_write(&provider).unwrap();
+        let ctx = prepare_managed_encryption_write(&provider).unwrap();
         let checksum = ObjectChecksumMetadata::new(
             ChecksumAlgorithm::Sha256,
             Some(ChecksumType::FullObject),
@@ -1348,7 +1303,7 @@ mod tests {
             panic!("expected SSE-S3 object state");
         };
         assert!(!state.encrypted_checksum_metadata.is_empty());
-        let decrypted = decrypt_sse_s3_checksum(&provider, &state)
+        let decrypted = decrypt_managed_encryption_checksum(&provider, &state)
             .unwrap()
             .expect("expected checksum metadata");
         assert_eq!(decrypted, checksum);
@@ -1453,7 +1408,7 @@ mod tests {
     #[test]
     fn sse_s3_missing_wrapping_key_fails() {
         let provider = managed_key_provider();
-        let ctx = prepare_sse_s3_write(&provider).unwrap();
+        let ctx = prepare_managed_encryption_write(&provider).unwrap();
         let ObjectEncryption::SseS3(state) = ctx.encryption() else {
             panic!("expected SSE-S3 object state");
         };
@@ -1462,7 +1417,7 @@ mod tests {
             key_id: 8,
             wrapping_key: [12u8; 32],
         });
-        let err = decrypt_sse_s3_segment(
+        let err = decrypt_managed_encryption_segment(
             &missing_provider,
             state,
             SseCustomerSegmentScope::object(),
@@ -1497,7 +1452,7 @@ mod tests {
         assert!(!ctx_debug.contains("wrapped_dek"));
 
         let provider = managed_key_provider();
-        let managed = prepare_sse_s3_write(&provider).unwrap();
+        let managed = prepare_managed_encryption_write(&provider).unwrap();
         let managed_debug = format!("{managed:?}");
         assert!(managed_debug.contains("ManagedEncryptionWriteContext"));
         assert!(managed_debug.contains("managed"));

@@ -490,9 +490,11 @@ sweeps so the next drift is a compile error.
   (`coordinator/request_types.rs:1028-1093`). Resolution: delete the aliases
   and update call sites to use `new`, `from_object`, and `upload_id`, which
   already take and return typed `UploadId` values.
-- [ ] Dead SSE-S3 alias layer: `SseS3WriteContext` + four `sse_s3_*` fns only
+- [x] Dead SSE-S3 alias layer: `SseS3WriteContext` + four `sse_s3_*` fns only
   tests call (`sse.rs:379, 643-683`). Migrate tests to `managed_encryption`
-  names, delete.
+  names, delete. Resolution: remove the alias type and wrapper functions, and
+  update the SSE-S3 behavior tests to call the managed-encryption helpers
+  directly.
 - [ ] Control-plane `_checked` siblings exist for the acting-set mutators but
   not `fence_pg_for_metadata_transfer` (`control_plane.rs:4318` vs
   4286/4304/4346/4376/4392/4419/4441/4479) — no idempotent retry story for
