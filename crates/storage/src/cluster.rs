@@ -552,7 +552,7 @@ fn pending_command_completes_stream_session(
 ) -> bool {
     match command.payload() {
         MetadataCommandPayload::CommitDirectPutObject(commit) => {
-            commit.matches_request(bucket, key, session_id, commit.object.generation_id)
+            commit.matches_stream_session(bucket, key, session_id)
         }
         MetadataCommandPayload::AbortStreamUpload(abort) => {
             abort.bucket == *bucket && abort.key == *key && abort.session_id == *session_id

@@ -694,6 +694,17 @@ pub(crate) struct CommitDirectPutObjectCommand {
 }
 
 impl CommitDirectPutObjectCommand {
+    pub(crate) fn matches_stream_session(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        session_id: &SessionId,
+    ) -> bool {
+        self.object.bucket == *bucket
+            && self.object.key == *key
+            && self.generation_reservation_id == *session_id
+    }
+
     pub(crate) fn matches_request(
         &self,
         bucket: &BucketName,
@@ -4078,6 +4089,60 @@ mod tests {
         assert!(
             decode_metadata_command_log_entry_header(&proofless_bytes).is_err(),
             "proofless direct PUT command bytes must fail applied-row validation"
+        );
+    }
+
+    #[test]
+    fn direct_put_stream_session_match_ignores_object_generation() {
+        let bucket = BucketName::try_from("direct-stream-session-match").unwrap();
+        let key = ObjectKey::try_from("key").unwrap();
+        let session_id = SessionId::try_from("54".repeat(16)).unwrap();
+        let generation_id = GenerationId::new(10).unwrap();
+        let proof = BucketWriteReservationProof {
+            bucket: bucket.clone(),
+            reservation_id: "direct-stream-session-reservation".to_string(),
+            owner_token: "owner-token".to_string(),
+            cluster_epoch: ClusterEpoch::INITIAL,
+            bucket_execution_generation: 7,
+            bucket_incarnation_generation: 7,
+            operation_kind: "direct-put-commit".to_string(),
+            created_at: 10,
+            lease_deadline: 20,
+            target_context: Some(key.as_str().to_string()),
+        };
+        let command = CommitDirectPutObjectCommand {
+            object: PutLiveObjectReq {
+                bucket: bucket.clone(),
+                key: key.clone(),
+                version_id: VersionId::Null,
+                owner: OwnerIdentity::from_principal("owner"),
+                acl_grants: AclGrants::default(),
+                public_read: false,
+                generation_id,
+                size: 0,
+                etag: ObjectEtag::single_part(0),
+                ec: EcShape { k: 2, m: 1 },
+                layout: ObjectLayout::Standard,
+                tags: None,
+                metadata_blob: Some(SerializedMetadataBlob::default()),
+                system_metadata_blob: Some(SerializedSystemMetadataBlob::default()),
+                object_lock: ObjectLockState::default(),
+                encryption: ObjectEncryption::None,
+            },
+            segments: Vec::new(),
+            generation_reservation_id: session_id.clone(),
+            write_sequence: 1,
+            last_modified_millis: 2,
+            stale_payload: None,
+            bucket_write_reservation: proof,
+            stream_create_bucket_write_reservation: None,
+        };
+        let other_generation_id = GenerationId::new(generation_id.get() + 1).unwrap();
+
+        assert!(command.matches_stream_session(&bucket, &key, &session_id));
+        assert!(
+            !command.matches_request(&bucket, &key, &session_id, other_generation_id),
+            "request matching must still include object generation"
         );
     }
 

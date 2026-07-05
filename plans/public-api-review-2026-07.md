@@ -199,14 +199,16 @@ steps it performs.
   `PgNotPeering`. The control-plane command encoding baseline was bumped
   because pre-alpha stores are not upgrade-supported yet.
 
-- [ ] **S4. Tautological `matches_request` argument neutralizes the
+- [x] **S4. Tautological `matches_request` argument neutralizes the
   generation check.** `cluster.rs:553-555` passes
   `commit.object.generation_id` as the generation argument to
   `commit.matches_request(...)`, making the comparison in
   `metadata_command.rs:697-709` vacuously true. Sibling caller
   `node_client.rs:659` passes a real request generation. Fix: split into
   `matches_session(...)` and `matches_request(..., GenerationId)` so
-  "don't-care" must be explicit.
+  "don't-care" must be explicit. Resolution: direct PUT commands now have an
+  explicit `matches_stream_session` helper for pending stream terminalization;
+  request/retry paths continue to use generation-aware `matches_request`.
 
 - [ ] **S5. MPU-cleanup resume cursor is a positional index, not a PG id.**
   `delete_completed_multipart_uploads_for_bucket`
