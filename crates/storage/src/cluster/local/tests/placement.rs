@@ -326,7 +326,7 @@ fn expired_route_maps_reject_payload_placement_and_shard_io() {
     let ec_shape = SharedStorageNode::DEFAULT_EC_SHAPE;
     let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0], ec_shape).unwrap();
     let data_pg_id = DataPgId::new(PgId::new(0));
-    map.test_set_route_map_valid_until_ms(Some(
+    map.test_set_route_map_validity(RouteMapValidity::Until(
         crate::clock::current_time_millis().saturating_add(60_000),
     ));
 
@@ -344,7 +344,7 @@ fn expired_route_maps_reject_payload_placement_and_shard_io() {
     );
 
     let expired_at = crate::clock::current_time_millis();
-    map.test_set_route_map_valid_until_ms(Some(expired_at));
+    map.test_set_route_map_validity(RouteMapValidity::Until(expired_at));
     let err = map
         .place_payload_shards(ClusterEpoch::INITIAL, data_pg_id, ec_shape, b"payload-key")
         .unwrap_err();

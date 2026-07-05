@@ -3457,7 +3457,7 @@ impl super::StorageCluster {
             .bucket_write_reservation_client()
             .validate_bucket_write_reservation_proof(pg_id, proof)
         {
-            Ok(()) => Ok(true),
+            Ok(()) => self.refresh_stream_upload_bucket_write_reservation(upload, proof),
             Err(BucketSnapshotLoadError::Metadata(
                 MetadataError::BucketWriteReservationNotFound { .. },
             )) => Ok(false),
@@ -3489,6 +3489,9 @@ impl super::StorageCluster {
             return Ok(false);
         };
         let renewed = BucketWriteReservationProof::from(&current);
+        if *proof == renewed {
+            return Ok(true);
+        }
         self.object_mutation_metadata_primary_client(&upload.bucket, &upload.key)
             .map_err(BucketWriteDrainError::Store)?
             .update_stream_upload_bucket_write_reservation(

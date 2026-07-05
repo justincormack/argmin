@@ -71,8 +71,8 @@ use crate::types::{
     PlacedSegmentShardBackfillRecord, PlacedSegmentShardBackfillWorkItem,
     PlacedSegmentShardRepairClaimAcquire, PlacedSegmentShardRepairClaimRecord,
     PlacedSegmentShardRepairRecord, PlacedSegmentShardRepairWorkItem,
-    PrepareStreamUploadSegmentAppendReq, SegmentStoredBytesRequest, SessionId, ShardIndex,
-    ShardKey, ShardScavengerObservation, ShardScavengerObservationKey,
+    PrepareStreamUploadSegmentAppendReq, RouteMapValidity, SegmentStoredBytesRequest, SessionId,
+    ShardIndex, ShardKey, ShardScavengerObservation, ShardScavengerObservationKey,
     ShardScavengerObservationReason, ShardScavengerObservationRecord,
     ShardScavengerPayloadReference, ShardScavengerPlacedShardSetReference,
     StreamUploadCommandRecord, StreamUploadRecord, StreamUploadSegmentRecord, StreamUploadState,
@@ -1061,7 +1061,7 @@ pub struct StorageClusterRuntimeMapHandle {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StorageClusterRuntimeMapRefreshLoopSuccess {
     pub cluster_epoch: ClusterEpoch,
-    pub route_map_valid_until_ms: Option<u64>,
+    pub route_map_validity: RouteMapValidity,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -1147,7 +1147,7 @@ impl StorageClusterRuntimeMapHandle {
             });
         }
         if candidate.cluster_epoch() == current.cluster_epoch() {
-            let candidate_valid_until = candidate.route_map_valid_until_ms();
+            let candidate_validity = candidate.route_map_validity();
             let mut generations = self
                 .same_epoch_generations
                 .lock()
@@ -1159,7 +1159,7 @@ impl StorageClusterRuntimeMapHandle {
                     return false;
                 };
                 if generation.cluster_epoch() == candidate.cluster_epoch() {
-                    generation.extend_route_map_valid_until_ms(candidate_valid_until);
+                    generation.extend_route_map_validity(candidate_validity);
                     true
                 } else {
                     false
@@ -1289,7 +1289,7 @@ impl StorageClusterRuntimeMapHandle {
                             status.last_success =
                                 Some(StorageClusterRuntimeMapRefreshLoopSuccess {
                                     cluster_epoch: cluster.cluster_epoch(),
-                                    route_map_valid_until_ms: cluster.route_map_valid_until_ms(),
+                                    route_map_validity: cluster.route_map_validity(),
                                 });
                             status.last_error = None;
                         }
@@ -1325,6 +1325,7 @@ impl StorageClusterRuntimeMapHandle {
 fn route_map_validity_regressed(current: Option<u64>, candidate: Option<u64>) -> bool {
     match (current, candidate) {
         (Some(current), Some(candidate)) => candidate < current,
+        (Some(_), None) => true,
         _ => false,
     }
 }
@@ -3866,8 +3867,12 @@ impl StorageCluster {
         self.local_map.route_map_valid_until_ms()
     }
 
-    fn extend_route_map_valid_until_ms(&self, candidate: Option<u64>) {
-        self.local_map.extend_route_map_valid_until_ms(candidate);
+    pub fn route_map_validity(&self) -> RouteMapValidity {
+        self.local_map.route_map_validity()
+    }
+
+    fn extend_route_map_validity(&self, candidate: RouteMapValidity) {
+        self.local_map.extend_route_map_validity(candidate);
     }
 
     pub fn is_route_map_valid_at(&self, now_ms: u64) -> bool {

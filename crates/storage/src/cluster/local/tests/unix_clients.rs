@@ -502,7 +502,7 @@ fn unix_shard_clients_route_payload_io_and_ack_rows_to_storage_node() {
     let server_config = StorageNodeProcessConfig {
         node_id: NodeId::new(1),
         cluster_epoch: ClusterEpoch::INITIAL,
-        route_map_valid_until_ms: None,
+        route_map_validity: RouteMapValidity::Forever,
         data_dir: tmp.path().join("remote-node-1"),
         default_ec_shape: ec_shape,
         pg_ids: vec![0],
@@ -694,7 +694,7 @@ fn frontend_unix_shard_mode_uses_storage_node_owned_data_dir() {
     let server_config = StorageNodeProcessConfig {
         node_id: NodeId::new(1),
         cluster_epoch: ClusterEpoch::INITIAL,
-        route_map_valid_until_ms: None,
+        route_map_validity: RouteMapValidity::Forever,
         data_dir: remote_data_dir.clone(),
         default_ec_shape: ec_shape,
         pg_ids: vec![0],
@@ -763,7 +763,7 @@ fn frontend_unix_metadata_command_mode_uses_storage_node_owned_data_dir() {
     let server_config = StorageNodeProcessConfig {
         node_id,
         cluster_epoch: ClusterEpoch::INITIAL,
-        route_map_valid_until_ms: None,
+        route_map_validity: RouteMapValidity::Forever,
         data_dir: remote_data_dir.clone(),
         default_ec_shape: ec_shape,
         pg_ids: vec![0],
@@ -869,7 +869,7 @@ fn peering_replay_catches_up_replicas_through_unix_storage_clients() {
         server_configs.push(StorageNodeProcessConfig {
             node_id,
             cluster_epoch: ClusterEpoch::INITIAL,
-            route_map_valid_until_ms: None,
+            route_map_validity: RouteMapValidity::Forever,
             data_dir,
             default_ec_shape: ec_shape,
             pg_ids: vec![1],
@@ -940,7 +940,7 @@ fn frontend_unix_bucket_metadata_mode_creates_bucket_on_storage_node() {
     let server_config = StorageNodeProcessConfig {
         node_id,
         cluster_epoch: ClusterEpoch::INITIAL,
-        route_map_valid_until_ms: None,
+        route_map_validity: RouteMapValidity::Forever,
         data_dir: remote_data_dir.clone(),
         default_ec_shape: ec_shape,
         pg_ids: vec![0],
@@ -1034,7 +1034,7 @@ fn frontend_unix_reclaim_and_bucket_finalize_resume_from_storage_node_owned_rows
     let server_config = StorageNodeProcessConfig {
         node_id,
         cluster_epoch: ClusterEpoch::INITIAL,
-        route_map_valid_until_ms: None,
+        route_map_validity: RouteMapValidity::Forever,
         data_dir: remote_data_dir.clone(),
         default_ec_shape: ec_shape,
         pg_ids: vec![0],
@@ -1177,7 +1177,7 @@ fn frontend_unix_lifecycle_claims_resume_from_storage_node_owned_rows() {
     let server_config = StorageNodeProcessConfig {
         node_id,
         cluster_epoch: ClusterEpoch::INITIAL,
-        route_map_valid_until_ms: None,
+        route_map_validity: RouteMapValidity::Forever,
         data_dir: remote_data_dir.clone(),
         default_ec_shape: ec_shape,
         pg_ids: vec![0],
@@ -1311,7 +1311,7 @@ fn frontend_unix_stream_session_scavenger_lists_storage_node_owned_rows() {
     let server_config = StorageNodeProcessConfig {
         node_id,
         cluster_epoch: ClusterEpoch::INITIAL,
-        route_map_valid_until_ms: None,
+        route_map_validity: RouteMapValidity::Forever,
         data_dir: remote_data_dir.clone(),
         default_ec_shape: ec_shape,
         pg_ids: vec![0],
@@ -1425,7 +1425,7 @@ fn frontend_unix_cluster_map_history_reference_summary_reads_storage_node_owned_
     let server_config = StorageNodeProcessConfig {
         node_id,
         cluster_epoch: ClusterEpoch::INITIAL,
-        route_map_valid_until_ms: None,
+        route_map_validity: RouteMapValidity::Forever,
         data_dir: remote_data_dir.clone(),
         default_ec_shape: ec_shape,
         pg_ids: vec![0],
@@ -1540,7 +1540,7 @@ fn frontend_unix_stream_session_scavenger_rejects_wrong_pg_rows() {
     let server_config = StorageNodeProcessConfig {
         node_id,
         cluster_epoch: ClusterEpoch::INITIAL,
-        route_map_valid_until_ms: None,
+        route_map_validity: RouteMapValidity::Forever,
         data_dir: remote_data_dir.clone(),
         default_ec_shape: ec_shape,
         pg_ids: vec![0, 1],
@@ -1633,7 +1633,7 @@ fn frontend_unix_bucket_metadata_mode_reads_bucket_batches_from_storage_node() {
     let server_config = StorageNodeProcessConfig {
         node_id,
         cluster_epoch: ClusterEpoch::INITIAL,
-        route_map_valid_until_ms: None,
+        route_map_validity: RouteMapValidity::Forever,
         data_dir: remote_data_dir.clone(),
         default_ec_shape: ec_shape,
         pg_ids: vec![0],
@@ -1824,7 +1824,7 @@ fn frontend_unix_object_generation_mode_reserves_on_storage_node() {
     let server_config = StorageNodeProcessConfig {
         node_id,
         cluster_epoch: ClusterEpoch::INITIAL,
-        route_map_valid_until_ms: None,
+        route_map_validity: RouteMapValidity::Forever,
         data_dir: remote_data_dir.clone(),
         default_ec_shape: ec_shape,
         pg_ids: vec![0],
@@ -1920,7 +1920,7 @@ fn frontend_unix_object_version_mode_reserves_on_storage_node() {
     let server_config = StorageNodeProcessConfig {
         node_id,
         cluster_epoch: ClusterEpoch::INITIAL,
-        route_map_valid_until_ms: None,
+        route_map_validity: RouteMapValidity::Forever,
         data_dir: remote_data_dir.clone(),
         default_ec_shape: ec_shape,
         pg_ids: vec![0],
@@ -2005,7 +2005,7 @@ fn frontend_unix_bucket_write_reservation_mode_uses_storage_node() {
     let server_config = StorageNodeProcessConfig {
         node_id,
         cluster_epoch: ClusterEpoch::INITIAL,
-        route_map_valid_until_ms: None,
+        route_map_validity: RouteMapValidity::Forever,
         data_dir: remote_data_dir.clone(),
         default_ec_shape: ec_shape,
         pg_ids: vec![0],
@@ -2184,7 +2184,7 @@ fn frontend_unix_bucket_snapshot_pair_mode_uses_storage_node() {
     let server_config = StorageNodeProcessConfig {
         node_id,
         cluster_epoch: ClusterEpoch::INITIAL,
-        route_map_valid_until_ms: None,
+        route_map_validity: RouteMapValidity::Forever,
         data_dir: remote_data_dir.clone(),
         default_ec_shape: ec_shape,
         pg_ids: vec![0],
@@ -2342,7 +2342,7 @@ fn frontend_unix_object_mutation_stream_append_reads_route_to_storage_node() {
     let server_config = StorageNodeProcessConfig {
         node_id,
         cluster_epoch: ClusterEpoch::INITIAL,
-        route_map_valid_until_ms: None,
+        route_map_validity: RouteMapValidity::Forever,
         data_dir: remote_data_dir,
         default_ec_shape: ec_shape,
         pg_ids: vec![0],
@@ -2436,7 +2436,7 @@ fn frontend_unix_object_generation_loser_retries_stale_generation() {
     let server_config = StorageNodeProcessConfig {
         node_id,
         cluster_epoch: ClusterEpoch::INITIAL,
-        route_map_valid_until_ms: None,
+        route_map_validity: RouteMapValidity::Forever,
         data_dir: remote_data_dir.clone(),
         default_ec_shape: ec_shape,
         pg_ids: vec![0],
@@ -2568,7 +2568,7 @@ fn frontend_unix_object_generation_loser_retries_rpc_reservation_conflict() {
     let server_config = StorageNodeProcessConfig {
         node_id,
         cluster_epoch: ClusterEpoch::INITIAL,
-        route_map_valid_until_ms: None,
+        route_map_validity: RouteMapValidity::Forever,
         data_dir: remote_data_dir.clone(),
         default_ec_shape: ec_shape,
         pg_ids: vec![0],
@@ -3111,7 +3111,7 @@ fn direct_put_publishes_after_remote_shard_io_and_ack_validation() {
         server_configs.push(StorageNodeProcessConfig {
             node_id,
             cluster_epoch: ClusterEpoch::INITIAL,
-            route_map_valid_until_ms: None,
+            route_map_validity: RouteMapValidity::Forever,
             data_dir: tmp.path().join(format!("remote-node-{}", node_id.as_u32())),
             default_ec_shape: ec_shape,
             pg_ids: vec![0],
@@ -3246,7 +3246,7 @@ fn non_current_epoch_unix_direct_put_commit_fails_closed_and_cleans_remote_state
         server_configs.push(StorageNodeProcessConfig {
             node_id,
             cluster_epoch: current_epoch,
-            route_map_valid_until_ms: None,
+            route_map_validity: RouteMapValidity::Forever,
             data_dir: tmp
                 .path()
                 .join(format!("remote-stale-direct-put-{}", node_id.as_u32())),
@@ -3599,7 +3599,7 @@ fn control_plane_peering_unix_direct_put_old_primary_fails_closed_and_cleans_rem
         server_configs.push(StorageNodeProcessConfig {
             node_id: node_config.node_id,
             cluster_epoch: current_epoch,
-            route_map_valid_until_ms: None,
+            route_map_validity: RouteMapValidity::Forever,
             data_dir: node_config.data_dir.clone(),
             default_ec_shape: ec_shape,
             pg_ids: pg_ids.to_vec(),
@@ -3983,7 +3983,7 @@ fn control_plane_peering_unix_copy_object_destination_old_primary_cleans_remote_
         server_configs.push(StorageNodeProcessConfig {
             node_id: node_config.node_id,
             cluster_epoch: current_epoch,
-            route_map_valid_until_ms: None,
+            route_map_validity: RouteMapValidity::Forever,
             data_dir: node_config.data_dir.clone(),
             default_ec_shape: ec_shape,
             pg_ids: pg_ids.to_vec(),
@@ -4340,7 +4340,7 @@ fn control_plane_peering_unix_object_delete_old_primary_fails_closed_without_rem
         server_configs.push(StorageNodeProcessConfig {
             node_id: node_config.node_id,
             cluster_epoch: current_epoch,
-            route_map_valid_until_ms: None,
+            route_map_validity: RouteMapValidity::Forever,
             data_dir: node_config.data_dir.clone(),
             default_ec_shape: ec_shape,
             pg_ids: pg_ids.to_vec(),
@@ -4636,7 +4636,7 @@ fn control_plane_peering_unix_object_metadata_old_primary_fails_closed_without_r
         server_configs.push(StorageNodeProcessConfig {
             node_id: node_config.node_id,
             cluster_epoch: current_epoch,
-            route_map_valid_until_ms: None,
+            route_map_validity: RouteMapValidity::Forever,
             data_dir: node_config.data_dir.clone(),
             default_ec_shape: ec_shape,
             pg_ids: pg_ids.to_vec(),
@@ -4935,7 +4935,7 @@ fn control_plane_peering_unix_multipart_completion_old_primary_fails_closed_with
         server_configs.push(StorageNodeProcessConfig {
             node_id: node_config.node_id,
             cluster_epoch: current_epoch,
-            route_map_valid_until_ms: None,
+            route_map_validity: RouteMapValidity::Forever,
             data_dir: node_config.data_dir.clone(),
             default_ec_shape: ec_shape,
             pg_ids: pg_ids.to_vec(),
@@ -5259,7 +5259,7 @@ fn control_plane_peering_unix_multipart_abort_old_primary_fails_closed_without_r
         server_configs.push(StorageNodeProcessConfig {
             node_id: node_config.node_id,
             cluster_epoch: current_epoch,
-            route_map_valid_until_ms: None,
+            route_map_validity: RouteMapValidity::Forever,
             data_dir: node_config.data_dir.clone(),
             default_ec_shape: ec_shape,
             pg_ids: pg_ids.to_vec(),
@@ -5589,7 +5589,7 @@ fn control_plane_peering_unix_upload_part_session_old_primary_fails_closed_witho
         server_configs.push(StorageNodeProcessConfig {
             node_id: node_config.node_id,
             cluster_epoch: current_epoch,
-            route_map_valid_until_ms: None,
+            route_map_validity: RouteMapValidity::Forever,
             data_dir: node_config.data_dir.clone(),
             default_ec_shape: ec_shape,
             pg_ids: pg_ids.to_vec(),
@@ -6001,7 +6001,7 @@ fn control_plane_peering_unix_upload_part_finalize_old_primary_preserves_remote_
         server_configs.push(StorageNodeProcessConfig {
             node_id: node_config.node_id,
             cluster_epoch: current_epoch,
-            route_map_valid_until_ms: None,
+            route_map_validity: RouteMapValidity::Forever,
             data_dir: node_config.data_dir.clone(),
             default_ec_shape: ec_shape,
             pg_ids: pg_ids.to_vec(),
@@ -6443,7 +6443,7 @@ fn control_plane_peering_unix_stream_put_finalize_old_primary_preserves_remote_s
         server_configs.push(StorageNodeProcessConfig {
             node_id: node_config.node_id,
             cluster_epoch: current_epoch,
-            route_map_valid_until_ms: None,
+            route_map_validity: RouteMapValidity::Forever,
             data_dir: node_config.data_dir.clone(),
             default_ec_shape: ec_shape,
             pg_ids: pg_ids.to_vec(),
@@ -6915,7 +6915,7 @@ fn control_plane_peering_unix_upload_part_copy_finalize_old_primary_preserves_re
         server_configs.push(StorageNodeProcessConfig {
             node_id: node_config.node_id,
             cluster_epoch: current_epoch,
-            route_map_valid_until_ms: None,
+            route_map_validity: RouteMapValidity::Forever,
             data_dir: node_config.data_dir.clone(),
             default_ec_shape: ec_shape,
             pg_ids: pg_ids.to_vec(),
@@ -7176,7 +7176,7 @@ fn non_current_epoch_unix_stream_append_commit_fails_closed_and_cleans_remote_st
         server_configs.push(StorageNodeProcessConfig {
             node_id,
             cluster_epoch: current_epoch,
-            route_map_valid_until_ms: None,
+            route_map_validity: RouteMapValidity::Forever,
             data_dir: tmp
                 .path()
                 .join(format!("remote-stale-stream-append-{}", node_id.as_u32())),
@@ -7377,7 +7377,7 @@ fn non_current_epoch_unix_upload_part_stream_session_create_fails_closed_without
         server_configs.push(StorageNodeProcessConfig {
             node_id,
             cluster_epoch: current_epoch,
-            route_map_valid_until_ms: None,
+            route_map_validity: RouteMapValidity::Forever,
             data_dir: tmp.path().join(format!(
                 "remote-stale-upload-part-session-{}",
                 node_id.as_u32()
@@ -7564,7 +7564,7 @@ fn non_current_epoch_unix_upload_part_stream_finalize_fails_closed_without_remot
         server_configs.push(StorageNodeProcessConfig {
             node_id,
             cluster_epoch: current_epoch,
-            route_map_valid_until_ms: None,
+            route_map_validity: RouteMapValidity::Forever,
             data_dir: tmp.path().join(format!(
                 "remote-stale-upload-part-finalize-{}",
                 node_id.as_u32()
@@ -7834,7 +7834,7 @@ fn non_current_epoch_unix_upload_part_copy_finalize_preserves_copied_staging() {
         server_configs.push(StorageNodeProcessConfig {
             node_id,
             cluster_epoch: current_epoch,
-            route_map_valid_until_ms: None,
+            route_map_validity: RouteMapValidity::Forever,
             data_dir: tmp.path().join(format!(
                 "remote-stale-upload-part-copy-finalize-{}",
                 node_id.as_u32()
@@ -8122,7 +8122,7 @@ fn non_current_epoch_unix_multipart_completion_fails_closed_without_remote_mutat
         server_configs.push(StorageNodeProcessConfig {
             node_id,
             cluster_epoch: current_epoch,
-            route_map_valid_until_ms: None,
+            route_map_validity: RouteMapValidity::Forever,
             data_dir: tmp.path().join(format!(
                 "remote-stale-multipart-completion-{}",
                 node_id.as_u32()
@@ -8282,7 +8282,7 @@ fn non_current_epoch_unix_object_metadata_update_fails_closed_without_remote_mut
         server_configs.push(StorageNodeProcessConfig {
             node_id,
             cluster_epoch: current_epoch,
-            route_map_valid_until_ms: None,
+            route_map_validity: RouteMapValidity::Forever,
             data_dir: tmp
                 .path()
                 .join(format!("remote-stale-object-metadata-{}", node_id.as_u32())),
@@ -8437,7 +8437,7 @@ fn non_current_epoch_unix_object_delete_fails_closed_without_remote_mutation() {
         server_configs.push(StorageNodeProcessConfig {
             node_id,
             cluster_epoch: current_epoch,
-            route_map_valid_until_ms: None,
+            route_map_validity: RouteMapValidity::Forever,
             data_dir: tmp
                 .path()
                 .join(format!("remote-stale-object-delete-{}", node_id.as_u32())),
@@ -8582,7 +8582,7 @@ fn historical_payload_shard_inspection_can_route_to_unix_storage_node_client() {
         StorageNodeServer::bind(StorageNodeProcessConfig {
             node_id: target_node,
             cluster_epoch: ClusterEpoch::INITIAL,
-            route_map_valid_until_ms: None,
+            route_map_validity: RouteMapValidity::Forever,
             data_dir: remote_data_dir,
             default_ec_shape: ec_shape,
             pg_ids: vec![data_pg_id.get()],
@@ -8681,7 +8681,7 @@ fn cross_epoch_segment_read_uses_retained_route_over_unix_storage_nodes() {
         server_configs.push(StorageNodeProcessConfig {
             node_id,
             cluster_epoch: current_epoch,
-            route_map_valid_until_ms: None,
+            route_map_validity: RouteMapValidity::Forever,
             data_dir: tmp
                 .path()
                 .join(format!("cross-epoch-read-remote-{}", node_id.as_u32())),
@@ -8814,7 +8814,7 @@ fn remote_shard_files_without_ack_rows_are_not_publishable() {
         server_configs.push(StorageNodeProcessConfig {
             node_id,
             cluster_epoch: ClusterEpoch::INITIAL,
-            route_map_valid_until_ms: None,
+            route_map_validity: RouteMapValidity::Forever,
             data_dir: tmp
                 .path()
                 .join(format!("remote-node-missing-ack-{}", node_id.as_u32())),
@@ -8961,7 +8961,7 @@ fn remote_shard_ack_rows_on_wrong_node_are_not_publishable() {
         server_configs.push(StorageNodeProcessConfig {
             node_id,
             cluster_epoch: ClusterEpoch::INITIAL,
-            route_map_valid_until_ms: None,
+            route_map_validity: RouteMapValidity::Forever,
             data_dir: tmp
                 .path()
                 .join(format!("remote-node-wrong-ack-{}", node_id.as_u32())),

@@ -224,7 +224,7 @@ steps it performs.
   make the cleanup phase generation-scoped and restartable from zero when the
   PG set changes.
 
-- [ ] **S6. Route-map validity is a storage routing freshness contract, not a
+- [x] **S6. Route-map validity is a storage routing freshness contract, not a
   generic option cleanup.** `route_map_valid_until_ms: Option<u64>` uses
   `None` to mean "valid forever" in both storage-node serving config
   (`storage/src/storage_node_server.rs:322, 451-463`) and frontend/local
@@ -240,6 +240,24 @@ steps it performs.
   an explicit `RouteMapValidity::{Forever, Until(u64)}` and then constrain
   `Forever` to the static/local topology constructors or other deliberately
   unbounded modes.
+
+  **Status:** fixed. Route-map validity is now modeled as
+  `RouteMapValidity::{Forever, Until(u64)}` in runtime-map snapshots,
+  storage-node process config, local cluster maps, and refresh-loop status.
+  Current-format storage-node runtime config serializes this explicitly as
+  `route_map_validity forever` or `route_map_validity until <ms>` and no
+  longer accepts the legacy `valid_until none` spelling. Test fixtures now
+  construct `Forever`/`Until` directly instead of passing `None` through
+  helper APIs. Control-plane-issued runtime maps are always bounded: active
+  maps use the minimum primary lease deadline, non-serving maps without a
+  lease-bearing route get a bounded fallback freshness window rather than an
+  immediate expiry, and reconstructed historical views preserve the source
+  snapshot validity instead of inventing an unbounded map. Refresh/install
+  paths reject same-epoch `Until -> Forever` regressions, while same-epoch
+  refresh propagation can still bound previously pinned static/local
+  generations when an authoritative bounded map is installed. The
+  `valid_until_ms()` accessors remain only as deadline projections for
+  diagnostics and error payloads.
 
 ## Bugs — checksum handling (cross-crate)
 

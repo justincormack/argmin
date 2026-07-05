@@ -12,7 +12,7 @@ use crate::control_plane_command::{
     AppliedControlPlaneCommand, ControlPlaneCommand, ControlPlaneCommandResponse,
     ControlPlaneCommandStateMachine, ControlPlaneLogId, ReadyPgPeeringCompletion,
 };
-use crate::{ClusterEpoch, PgClusterMapHistoryReferenceSummary, PgId, PgState};
+use crate::{ClusterEpoch, PgClusterMapHistoryReferenceSummary, PgId, PgState, RouteMapValidity};
 
 // PG backfill can lag a burst of placement changes; retain enough recent
 // snapshots that scanner references can still reconstruct historical routes.
@@ -38,6 +38,10 @@ const CONTROL_PLANE_RPC_ACTING_SET_NODE_MIN_LEN: usize = 4;
 const CONTROL_PLANE_RPC_RUNTIME_MAP_PROOF_SINGLE_AUTHORITY: u8 = 1;
 const CONTROL_PLANE_RPC_RUNTIME_MAP_PROOF_RECONSTRUCTED: u8 = 2;
 const CONTROL_PLANE_RPC_RUNTIME_MAP_PROOF_READ_INDEX: u8 = 3;
+
+fn non_serving_runtime_map_validity(now_ms: u64) -> RouteMapValidity {
+    RouteMapValidity::Until(now_ms.saturating_add(MAX_HEARTBEAT_LEASE_MS))
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct AuthorityIncarnation(NonZeroU64);
@@ -567,35 +571,17 @@ impl ClusterControlSnapshot {
         freshness_proof: RuntimeMapFreshnessProof,
     ) -> Result<ClusterRuntimeMapSnapshot, ControlPlaneError> {
         let pg_routes = self.pg_routes(now_ms)?;
-        self.runtime_map_from_pg_routes(pg_routes, freshness_proof)
-    }
-
-    pub fn reconstructed_runtime_map(
-        &self,
-    ) -> Result<ClusterRuntimeMapSnapshot, ControlPlaneError> {
-        let pg_routes: Result<Vec<_>, _> = self
-            .pgs
-            .values()
-            .map(|record| {
-                reconstruct_pg_route_from_record(
-                    self.cluster_epoch,
-                    record.pg_id,
-                    record,
-                    |node_id| self.nodes.contains_key(&node_id),
-                )
-            })
-            .collect();
         self.runtime_map_from_pg_routes(
-            pg_routes?,
-            RuntimeMapFreshnessProof::Reconstructed {
-                authority_incarnation: self.authority_incarnation,
-            },
+            pg_routes,
+            freshness_proof,
+            non_serving_runtime_map_validity(now_ms),
         )
     }
 
-    pub fn reconstructed_runtime_map_for_pg(
+    fn reconstructed_runtime_map_for_pg_with_fallback_validity(
         &self,
         pg_id: PgId,
+        fallback_validity: RouteMapValidity,
     ) -> Result<ClusterRuntimeMapSnapshot, ControlPlaneError> {
         let record = self
             .pg(pg_id)
@@ -610,6 +596,7 @@ impl ClusterControlSnapshot {
             RuntimeMapFreshnessProof::Reconstructed {
                 authority_incarnation: self.authority_incarnation,
             },
+            fallback_validity,
         )
     }
 
@@ -640,6 +627,7 @@ impl ClusterControlSnapshot {
                 issued_at_ms: now_ms,
             },
             [refreshing_node_id],
+            non_serving_runtime_map_validity(now_ms),
         )
     }
 
@@ -647,12 +635,14 @@ impl ClusterControlSnapshot {
         &self,
         pg_routes: Vec<PgRouteSnapshot>,
         freshness_proof: RuntimeMapFreshnessProof,
+        fallback_validity: RouteMapValidity,
     ) -> Result<ClusterRuntimeMapSnapshot, ControlPlaneError> {
         let historical_pg_routes = self.historical_pg_routes_for_runtime_map()?;
         self.runtime_map_from_pg_routes_with_history(
             pg_routes,
             historical_pg_routes,
             freshness_proof,
+            fallback_validity,
         )
     }
 
@@ -661,12 +651,14 @@ impl ClusterControlSnapshot {
         pg_routes: Vec<PgRouteSnapshot>,
         historical_pg_routes: Vec<PgRouteSnapshot>,
         freshness_proof: RuntimeMapFreshnessProof,
+        fallback_validity: RouteMapValidity,
     ) -> Result<ClusterRuntimeMapSnapshot, ControlPlaneError> {
         self.runtime_map_from_pg_routes_with_history_and_extra_nodes(
             pg_routes,
             historical_pg_routes,
             freshness_proof,
             [],
+            fallback_validity,
         )
     }
 
@@ -676,6 +668,7 @@ impl ClusterControlSnapshot {
         historical_pg_routes: Vec<PgRouteSnapshot>,
         freshness_proof: RuntimeMapFreshnessProof,
         extra_node_ids: impl IntoIterator<Item = NodeId>,
+        fallback_validity: RouteMapValidity,
     ) -> Result<ClusterRuntimeMapSnapshot, ControlPlaneError> {
         let mut routed_node_ids = BTreeSet::new();
         for route in &pg_routes {
@@ -706,13 +699,14 @@ impl ClusterControlSnapshot {
                 cluster_map_history_floor_epoch: node.cluster_map_history_floor_epoch(),
             });
         }
-        let valid_until_ms = pg_routes
+        let validity = pg_routes
             .iter()
             .filter_map(PgRouteSnapshot::primary_lease_deadline_ms)
-            .min();
+            .min()
+            .map_or(fallback_validity, RouteMapValidity::Until);
         Ok(ClusterRuntimeMapSnapshot {
             cluster_epoch: self.cluster_epoch,
-            valid_until_ms,
+            validity,
             freshness_proof,
             nodes,
             pg_routes,
@@ -2625,7 +2619,7 @@ impl RuntimeMapFreshnessProof {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClusterRuntimeMapSnapshot {
     cluster_epoch: ClusterEpoch,
-    valid_until_ms: Option<u64>,
+    validity: RouteMapValidity,
     freshness_proof: RuntimeMapFreshnessProof,
     nodes: Vec<NodeRouteSnapshot>,
     pg_routes: Vec<PgRouteSnapshot>,
@@ -2640,7 +2634,12 @@ impl ClusterRuntimeMapSnapshot {
 
     #[must_use]
     pub fn valid_until_ms(&self) -> Option<u64> {
-        self.valid_until_ms
+        self.validity.valid_until_ms()
+    }
+
+    #[must_use]
+    pub fn validity(&self) -> RouteMapValidity {
+        self.validity
     }
 
     #[must_use]
@@ -2701,7 +2700,7 @@ impl ClusterRuntimeMapSnapshot {
             .collect::<Result<Vec<_>, _>>()?;
         Ok(Self {
             cluster_epoch,
-            valid_until_ms: None,
+            validity: self.validity,
             freshness_proof: RuntimeMapFreshnessProof::Reconstructed {
                 authority_incarnation: self.freshness_proof.authority_incarnation(),
             },
@@ -4280,9 +4279,13 @@ impl<S: ControlPlaneStore> ControlPlaneRuntimeMapSource for SingleAuthorityContr
     fn pg_runtime_map_snapshot(
         &self,
         pg_id: PgId,
-        _authority_now_ms: u64,
+        authority_now_ms: u64,
     ) -> Result<ClusterRuntimeMapSnapshot, ControlPlaneError> {
-        self.snapshot.reconstructed_runtime_map_for_pg(pg_id)
+        self.snapshot
+            .reconstructed_runtime_map_for_pg_with_fallback_validity(
+                pg_id,
+                non_serving_runtime_map_validity(authority_now_ms),
+            )
     }
 }
 
@@ -5176,7 +5179,10 @@ where
                 .and_then(|fenced| {
                     let (snapshot, source_primary_lease_deadline_ms) = fenced.into_parts();
                     snapshot
-                        .reconstructed_runtime_map_for_pg(pg_id)
+                        .reconstructed_runtime_map_for_pg_with_fallback_validity(
+                            pg_id,
+                            non_serving_runtime_map_validity(authority_now_ms),
+                        )
                         .map(|runtime_map| (runtime_map, source_primary_lease_deadline_ms))
                 }) {
                 Ok((snapshot, source_primary_lease_deadline_ms)) => {
@@ -5211,8 +5217,12 @@ where
             reader.finish()?;
             match control_plane
                 .set_pg_acting_set_with_metadata_transfer(pg_id, acting_set, transfer)
-                .and_then(|snapshot| snapshot.reconstructed_runtime_map_for_pg(pg_id))
-            {
+                .and_then(|snapshot| {
+                    snapshot.reconstructed_runtime_map_for_pg_with_fallback_validity(
+                        pg_id,
+                        non_serving_runtime_map_validity(authority_now_ms),
+                    )
+                }) {
                 Ok(snapshot) => {
                     let mut response = Vec::new();
                     write_runtime_map_snapshot(&mut response, &snapshot)?;
@@ -5770,7 +5780,7 @@ fn read_runtime_map_snapshot(
     let historical_pg_routes = read_pg_route_snapshots(reader, "historical PG routes")?;
     let snapshot = ClusterRuntimeMapSnapshot {
         cluster_epoch,
-        valid_until_ms,
+        validity: RouteMapValidity::from_valid_until_ms(valid_until_ms),
         freshness_proof,
         nodes,
         pg_routes,
@@ -10494,6 +10504,42 @@ mod tests {
     }
 
     #[test]
+    fn unix_control_plane_client_fetches_pg_runtime_map_with_bounded_non_serving_validity() {
+        let tmp = test_util::tempdir();
+        let socket_path = tmp.path().join("control-plane.sock");
+        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+        for node_id in [1, 2] {
+            authority
+                .set_node_membership(NodeId::new(node_id), NodeMembershipState::Active)
+                .unwrap();
+            assert!(heartbeat_until_serving(&mut authority, node_id, 1_000).serving());
+        }
+        authority
+            .set_pg_acting_set(PgId::new(7), vec![NodeId::new(2), NodeId::new(1)])
+            .unwrap();
+        let expected_epoch = authority.snapshot().cluster_epoch();
+        let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _addr) = listener.accept().unwrap();
+            handle_control_plane_unix_stream(&mut authority, &mut stream, 1_234).unwrap();
+        });
+
+        let client = UnixControlPlaneClient::new(&socket_path);
+        let runtime_map = client.pg_runtime_map_snapshot(PgId::new(7), 0).unwrap();
+
+        server.join().unwrap();
+        assert_eq!(runtime_map.cluster_epoch(), expected_epoch);
+        assert_eq!(
+            runtime_map.valid_until_ms(),
+            Some(1_234 + MAX_HEARTBEAT_LEASE_MS)
+        );
+        assert_eq!(runtime_map.pg_routes().len(), 1);
+        assert_eq!(runtime_map.pg_routes()[0].state(), PgState::Peering);
+        assert_eq!(runtime_map.pg_routes()[0].primary_lease_deadline_ms(), None);
+    }
+
+    #[test]
     fn unix_control_plane_client_retries_read_only_runtime_map_after_lost_response() {
         let tmp = test_util::tempdir();
         let socket_path = tmp.path().join("control-plane.sock");
@@ -11249,6 +11295,10 @@ mod tests {
         server.join().unwrap();
         assert!(peering_epoch > active_epoch);
         assert_eq!(source_primary_lease_deadline_ms, Some(2_102));
+        assert_eq!(
+            runtime_map.valid_until_ms(),
+            Some(2_003 + MAX_HEARTBEAT_LEASE_MS)
+        );
         let route = runtime_map
             .pg_routes()
             .iter()
@@ -11680,6 +11730,10 @@ mod tests {
 
         server.join().unwrap();
         assert!(runtime_map.cluster_epoch() > active_epoch);
+        assert_eq!(
+            runtime_map.valid_until_ms(),
+            Some(2_003 + MAX_HEARTBEAT_LEASE_MS)
+        );
         assert_eq!(runtime_map.pg_routes().len(), 1);
         let route = runtime_map
             .pg_routes()
@@ -12539,7 +12593,7 @@ mod tests {
     ) -> ClusterRuntimeMapSnapshot {
         ClusterRuntimeMapSnapshot {
             cluster_epoch: ClusterEpoch::INITIAL,
-            valid_until_ms: None,
+            validity: RouteMapValidity::Forever,
             freshness_proof,
             nodes: Vec::new(),
             pg_routes: Vec::new(),
@@ -12550,7 +12604,7 @@ mod tests {
     fn runtime_map_test_snapshot_with_active_route() -> ClusterRuntimeMapSnapshot {
         ClusterRuntimeMapSnapshot {
             cluster_epoch: ClusterEpoch::INITIAL,
-            valid_until_ms: Some(12_345),
+            validity: RouteMapValidity::Until(12_345),
             freshness_proof: RuntimeMapFreshnessProof::SingleAuthority {
                 authority_incarnation: AuthorityIncarnation::INITIAL,
                 issued_at_ms: 12_000,
@@ -12584,7 +12638,7 @@ mod tests {
         let destination_epoch = ClusterEpoch::new(source_epoch.get() + 1).unwrap();
         let source_route = snapshot.pg_routes[0].without_serving_authority();
         snapshot.cluster_epoch = destination_epoch;
-        snapshot.valid_until_ms = None;
+        snapshot.validity = RouteMapValidity::Forever;
         snapshot.freshness_proof = RuntimeMapFreshnessProof::SingleAuthority {
             authority_incarnation: AuthorityIncarnation::INITIAL,
             issued_at_ms: 12_001,
@@ -15637,7 +15691,10 @@ mod tests {
             runtime_map.cluster_epoch(),
             authority.snapshot().cluster_epoch()
         );
-        assert_eq!(runtime_map.valid_until_ms(), None);
+        assert_eq!(
+            runtime_map.valid_until_ms(),
+            Some(1_001 + MAX_HEARTBEAT_LEASE_MS)
+        );
         assert_eq!(runtime_map.pg_routes().len(), 1);
         let route = &runtime_map.pg_routes()[0];
         assert_eq!(route.pg_id(), PgId::new(25));
@@ -15658,6 +15715,34 @@ mod tests {
             runtime_map.nodes()[0].node_incarnation(),
             node_incarnation(&authority, 1)
         );
+    }
+
+    #[test]
+    fn pg_runtime_map_snapshot_uses_bounded_non_serving_validity() {
+        let tmp = test_util::tempdir();
+        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+        for node_id in [1, 2] {
+            authority
+                .set_node_membership(NodeId::new(node_id), NodeMembershipState::Active)
+                .unwrap();
+            assert!(heartbeat_until_serving(&mut authority, node_id, 1_000).serving());
+        }
+        authority
+            .set_pg_acting_set(PgId::new(25), vec![NodeId::new(2), NodeId::new(1)])
+            .unwrap();
+
+        let runtime_map =
+            ControlPlaneRuntimeMapSource::pg_runtime_map_snapshot(&authority, PgId::new(25), 1_234)
+                .unwrap();
+
+        assert_eq!(
+            runtime_map.valid_until_ms(),
+            Some(1_234 + MAX_HEARTBEAT_LEASE_MS)
+        );
+        assert_eq!(runtime_map.pg_routes().len(), 1);
+        assert_eq!(runtime_map.pg_routes()[0].state(), PgState::Peering);
+        assert_eq!(runtime_map.pg_routes()[0].primary_lease_deadline_ms(), None);
     }
 
     #[test]
@@ -16274,7 +16359,10 @@ mod tests {
             cluster.local_pg_route(PgId::new(31)).unwrap().state(),
             PgState::Peering
         );
-        assert_eq!(cluster.route_map_valid_until_ms(), None);
+        assert_eq!(
+            cluster.route_map_valid_until_ms(),
+            Some(2_001 + MAX_HEARTBEAT_LEASE_MS)
+        );
 
         authority
             .complete_pg_peering(
@@ -16653,7 +16741,7 @@ mod tests {
         let current_valid_until = current_cluster.route_map_valid_until_ms().unwrap();
 
         let mut stale_map = current_map.clone();
-        stale_map.valid_until_ms = Some(current_valid_until - 10);
+        stale_map.validity = RouteMapValidity::Until(current_valid_until - 10);
         let stale_cluster = crate::StorageCluster::from_runtime_map(
             NodeId::new(1),
             &stale_map,
@@ -16680,6 +16768,26 @@ mod tests {
             handle.current().route_map_valid_until_ms(),
             Some(current_valid_until)
         );
+
+        let mut unbounded_map = current_map.clone();
+        unbounded_map.validity = RouteMapValidity::Forever;
+        let unbounded_cluster = crate::StorageCluster::from_runtime_map(
+            NodeId::new(1),
+            &unbounded_map,
+            crate::EcShape { k: 1, m: 0 },
+        )
+        .unwrap();
+        assert!(matches!(
+            handle.install(unbounded_cluster),
+            Err(crate::cluster::StorageClusterRuntimeMapRefreshError::ValidityRegression {
+                current,
+                candidate,
+            }) if current == Some(current_valid_until) && candidate.is_none()
+        ));
+        assert_eq!(
+            handle.current().route_map_valid_until_ms(),
+            Some(current_valid_until)
+        );
     }
 
     #[test]
@@ -16698,7 +16806,7 @@ mod tests {
             crate::EcShape { k: 1, m: 0 },
             ClusterEpoch::INITIAL,
             [crate::cluster::LocalPgRoute::from(&route)],
-            Some(1_000),
+            RouteMapValidity::Until(1_000),
         )
         .unwrap();
         let pinned_cluster = crate::StorageCluster::test_from_local_map_with_epoch(
@@ -16714,7 +16822,7 @@ mod tests {
             crate::EcShape { k: 1, m: 0 },
             ClusterEpoch::INITIAL,
             [crate::cluster::LocalPgRoute::from(&route)],
-            Some(2_000),
+            RouteMapValidity::Until(2_000),
         )
         .unwrap();
         let candidate_cluster = crate::StorageCluster::test_from_local_map_with_epoch(
@@ -16739,7 +16847,7 @@ mod tests {
             crate::EcShape { k: 1, m: 0 },
             ClusterEpoch::INITIAL,
             [crate::cluster::LocalPgRoute::from(&route)],
-            Some(3_000),
+            RouteMapValidity::Until(3_000),
         )
         .unwrap();
         let second_candidate_cluster = crate::StorageCluster::test_from_local_map_with_epoch(
@@ -16777,7 +16885,7 @@ mod tests {
             crate::EcShape { k: 1, m: 0 },
             ClusterEpoch::INITIAL,
             [crate::cluster::LocalPgRoute::from(&initial_route)],
-            Some(1_000),
+            RouteMapValidity::Until(1_000),
         )
         .unwrap();
         let pinned_cluster = crate::StorageCluster::test_from_local_map_with_epoch(
@@ -16801,7 +16909,7 @@ mod tests {
             crate::EcShape { k: 1, m: 0 },
             next_epoch,
             [crate::cluster::LocalPgRoute::from(&next_route)],
-            Some(3_000),
+            RouteMapValidity::Until(3_000),
         )
         .unwrap();
         let candidate_cluster = crate::StorageCluster::test_from_local_map_with_epoch(
@@ -16875,6 +16983,10 @@ mod tests {
         handle.install(active_cluster).unwrap();
         assert_eq!(
             handle.current().route_map_valid_until_ms(),
+            active_map.valid_until_ms()
+        );
+        assert_eq!(
+            unbounded_cluster.route_map_valid_until_ms(),
             active_map.valid_until_ms()
         );
     }
@@ -16952,7 +17064,7 @@ mod tests {
             refresh_loop.status().last_success,
             Some(crate::StorageClusterRuntimeMapRefreshLoopSuccess {
                 cluster_epoch: expected_runtime_map.cluster_epoch(),
-                route_map_valid_until_ms: expected_runtime_map.valid_until_ms(),
+                route_map_validity: expected_runtime_map.validity(),
             })
         );
 

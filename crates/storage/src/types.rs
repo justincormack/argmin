@@ -2576,6 +2576,39 @@ pub struct BucketDeleteDebugPayloadReclaimRootError {
     pub detail: String,
 }
 
+/// Validity contract for a route map snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RouteMapValidity {
+    Forever,
+    Until(u64),
+}
+
+impl RouteMapValidity {
+    #[must_use]
+    pub fn from_valid_until_ms(valid_until_ms: Option<u64>) -> Self {
+        match valid_until_ms {
+            Some(valid_until_ms) => Self::Until(valid_until_ms),
+            None => Self::Forever,
+        }
+    }
+
+    #[must_use]
+    pub fn valid_until_ms(self) -> Option<u64> {
+        match self {
+            Self::Forever => None,
+            Self::Until(valid_until_ms) => Some(valid_until_ms),
+        }
+    }
+
+    #[must_use]
+    pub fn is_valid_at(self, now_ms: u64) -> bool {
+        match self {
+            Self::Forever => true,
+            Self::Until(valid_until_ms) => valid_until_ms > now_ms,
+        }
+    }
+}
+
 /// Durable object-payload reclaim worker claim fields included in local-debug output.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BucketDeleteDebugPayloadReclaimClaim {

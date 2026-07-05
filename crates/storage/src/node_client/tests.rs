@@ -22,13 +22,13 @@ use crate::types::{
     DeleteMarkerRecord, EtagKind, ObjectEncryption, ObjectLockState, SerializedMetadataBlob,
     SerializedSystemMetadataBlob, SerializedTagSet, StorageClass, StreamUploadPartSnapshot,
 };
-use crate::CompletedMultipartUploadRecord;
+use crate::{CompletedMultipartUploadRecord, RouteMapValidity};
 
 fn test_config(tmp: &test_util::TempDir) -> StorageNodeProcessConfig {
     StorageNodeProcessConfig {
         node_id: NodeId::new(7),
         cluster_epoch: ClusterEpoch::new(1).unwrap(),
-        route_map_valid_until_ms: None,
+        route_map_validity: RouteMapValidity::Forever,
         data_dir: tmp.path().join("node"),
         default_ec_shape: EcShape { k: 4, m: 2 },
         pg_ids: vec![0],

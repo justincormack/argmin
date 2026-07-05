@@ -21,8 +21,8 @@ use storage::{
     install_bucket_scoped_test_hooks, BucketScopedTestHooks, ClusterEpoch, LocalClusterMap,
     LocalNodeStoreConfig, LocalPgRoute, LocalUnixStorageNodeClientConfig,
     MetadataCommandApplyTestKind, NodeId, PgId, PgState, PlacedSegmentShardBackfillWorkItem,
-    SegmentStoredBytesRequest, ShardScavengerObservationReason, SharedStorageNode, StorageCluster,
-    StorageClusterRuntimeMapHandle,
+    RouteMapValidity, SegmentStoredBytesRequest, ShardScavengerObservationReason,
+    SharedStorageNode, StorageCluster, StorageClusterRuntimeMapHandle,
 };
 
 const TEST_EVENT_TIMEOUT: Duration = Duration::from_secs(2);
@@ -437,7 +437,7 @@ fn shard_backfill_worker_executes_remote_storage_node_work() {
         let server_config = StorageNodeProcessConfig {
             node_id: config.node_id(),
             cluster_epoch: desired_route.cluster_epoch(),
-            route_map_valid_until_ms: None,
+            route_map_validity: RouteMapValidity::Forever,
             data_dir: config.data_dir().to_path_buf(),
             default_ec_shape: ec_shape,
             pg_ids: vec![pg_id.get()],
@@ -927,7 +927,11 @@ fn reclaim_worker_retries_bucket_delete_begin_after_early_route_map_failure() {
         .unwrap();
     let bucket_identity = initial.test_head_bucket_raw(&bucket).unwrap();
 
-    let expired = same_store_cluster_with_route_map_validity(&initial, tmp.path(), Some(1));
+    let expired = same_store_cluster_with_route_map_validity(
+        &initial,
+        tmp.path(),
+        RouteMapValidity::Until(1),
+    );
     let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&expired));
     let _coord = setup_coordinator_with_only_reclaim_worker(handle.clone(), Arc::clone(&expired));
 
@@ -1470,7 +1474,11 @@ fn reclaim_worker_drops_stale_bucket_delete_begin_after_bucket_recreate() {
         .unwrap();
     let old_identity = initial.test_head_bucket_raw(&bucket).unwrap();
 
-    let expired = same_store_cluster_with_route_map_validity(&initial, tmp.path(), Some(1));
+    let expired = same_store_cluster_with_route_map_validity(
+        &initial,
+        tmp.path(),
+        RouteMapValidity::Until(1),
+    );
     let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&expired));
     let _coord = setup_coordinator_with_only_reclaim_worker(handle.clone(), Arc::clone(&expired));
 
@@ -1934,7 +1942,7 @@ fn install_same_store_next_epoch_runtime_map_with_primary(
 fn same_store_cluster_with_route_map_validity(
     initial: &Arc<StorageCluster>,
     node_root: &std::path::Path,
-    route_map_valid_until_ms: Option<u64>,
+    route_map_validity: RouteMapValidity,
 ) -> Arc<StorageCluster> {
     let node_count = u32::from(initial.default_payload_ec_shape().k)
         + u32::from(initial.default_payload_ec_shape().m);
@@ -1968,7 +1976,7 @@ fn same_store_cluster_with_route_map_validity(
         routes,
     )
     .unwrap();
-    local_map.test_set_route_map_valid_until_ms(route_map_valid_until_ms);
+    local_map.test_set_route_map_validity(route_map_validity);
     StorageCluster::from_local_map(Arc::new(local_map)).unwrap()
 }
 
@@ -3873,7 +3881,7 @@ fn get_uses_retained_payload_route_over_unix_after_data_pg_move_and_metadata_rea
         let server_config = StorageNodeProcessConfig {
             node_id: config.node_id(),
             cluster_epoch: next_epoch,
-            route_map_valid_until_ms: None,
+            route_map_validity: RouteMapValidity::Forever,
             data_dir: config.data_dir().to_path_buf(),
             default_ec_shape: ec_shape,
             pg_ids: pg_ids.clone(),
@@ -7553,8 +7561,11 @@ fn bucket_delete_finalizer_expired_route_map_maps_to_operation_aborted() {
     delete_bucket_test(&coord, "bucket").unwrap();
 
     let bucket = trusted_bucket_name("bucket");
-    let expired_cluster =
-        same_store_cluster_with_route_map_validity(&storage_cluster, tmp.path(), Some(1));
+    let expired_cluster = same_store_cluster_with_route_map_validity(
+        &storage_cluster,
+        tmp.path(),
+        RouteMapValidity::Until(1),
+    );
     let expired_coord =
         setup_same_process_coordinator_with_storage_cluster_without_background_sweepers(
             expired_cluster,
@@ -7584,8 +7595,11 @@ fn bucket_delete_finalizer_route_map_expiry_after_claim_releases_claim() {
 
     let bucket_name = trusted_bucket_name(bucket);
     let valid_until = storage::clock::wall_time_millis().saturating_add(250);
-    let expiring_cluster =
-        same_store_cluster_with_route_map_validity(&storage_cluster, tmp.path(), Some(valid_until));
+    let expiring_cluster = same_store_cluster_with_route_map_validity(
+        &storage_cluster,
+        tmp.path(),
+        RouteMapValidity::Until(valid_until),
+    );
     let expiring_coord =
         setup_same_process_coordinator_with_storage_cluster_without_background_sweepers(
             expiring_cluster,
@@ -9634,8 +9648,11 @@ fn delete_bucket_expired_route_map_maps_to_operation_aborted() {
         .create_bucket_for_owner("default-owner", bucket, false)
         .unwrap();
 
-    let expired_cluster =
-        same_store_cluster_with_route_map_validity(&storage_cluster, tmp.path(), Some(1));
+    let expired_cluster = same_store_cluster_with_route_map_validity(
+        &storage_cluster,
+        tmp.path(),
+        RouteMapValidity::Until(1),
+    );
     let expired_coord = setup_direct_coordinator_with_storage_cluster(expired_cluster);
     let err = delete_bucket_test(&expired_coord, bucket).unwrap_err();
     assert!(matches!(err, ServerError::OperationAborted), "{err:?}");
@@ -9683,8 +9700,11 @@ fn delete_bucket_route_map_expiry_after_drain_maps_to_operation_aborted() {
         .unwrap();
 
     let valid_until = storage::clock::wall_time_millis().saturating_add(250);
-    let expiring_cluster =
-        same_store_cluster_with_route_map_validity(&storage_cluster, tmp.path(), Some(valid_until));
+    let expiring_cluster = same_store_cluster_with_route_map_validity(
+        &storage_cluster,
+        tmp.path(),
+        RouteMapValidity::Until(valid_until),
+    );
     let expiring_coord =
         setup_same_process_coordinator_with_storage_cluster_without_background_sweepers(
             expiring_cluster,

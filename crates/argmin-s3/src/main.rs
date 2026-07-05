@@ -48,8 +48,9 @@ use storage::storage_node_server::{
 use storage::{
     CanonicalUserId, ClusterEpoch, EcShape, LocalClusterMap,
     LocalUnixStorageNodeClientAdmissionSettings, LocalUnixStorageNodeClientConfig, NodeId, PgId,
-    PgMetadataTransferArtifact, PgMetadataTransferError, PgState, SharedStorageNode,
-    StorageCluster, StorageClusterRuntimeMapHandle, StorageRpcErrorCode, StoreError,
+    PgMetadataTransferArtifact, PgMetadataTransferError, PgState, RouteMapValidity,
+    SharedStorageNode, StorageCluster, StorageClusterRuntimeMapHandle, StorageRpcErrorCode,
+    StoreError,
 };
 use tokio::net::TcpListener;
 use tokio::runtime::Handle;
@@ -2966,7 +2967,7 @@ fn build_storage_node_process_config(
         StorageNodeProcessConfig {
             node_id,
             cluster_epoch,
-            route_map_valid_until_ms: None,
+            route_map_validity: RouteMapValidity::Forever,
             data_dir: Path::new(&node_data_dir).to_path_buf(),
             default_ec_shape: EcShape {
                 k: ec_config.data_shards,

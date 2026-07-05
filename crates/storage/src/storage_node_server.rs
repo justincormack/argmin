@@ -300,7 +300,9 @@ use crate::types::{
     PlacedSegmentShardBackfillClaimAcquire, PlacedSegmentShardBackfillClaimRecord,
     PlacedSegmentShardRepairClaimAcquire, PlacedSegmentShardRepairClaimRecord,
 };
-use crate::{BucketName, EcShape, NodeId, ObjectPgActionError, ShardKey, ShardLocation};
+use crate::{
+    BucketName, EcShape, NodeId, ObjectPgActionError, RouteMapValidity, ShardKey, ShardLocation,
+};
 
 #[cfg(test)]
 type MetadataCommandBeforeWaitHook = Arc<dyn Fn(PgId) + Send + Sync>;
@@ -323,7 +325,7 @@ extern "C" {
 pub struct StorageNodeProcessConfig {
     pub node_id: NodeId,
     pub cluster_epoch: ClusterEpoch,
-    pub route_map_valid_until_ms: Option<u64>,
+    pub route_map_validity: RouteMapValidity,
     pub data_dir: PathBuf,
     pub default_ec_shape: EcShape,
     pub pg_ids: Vec<u32>,
@@ -401,7 +403,7 @@ impl StorageNodeProcessConfig {
         Ok(Self {
             node_id,
             cluster_epoch: runtime_map.cluster_epoch(),
-            route_map_valid_until_ms: runtime_map.valid_until_ms(),
+            route_map_validity: runtime_map.validity(),
             data_dir: data_dir.into(),
             default_ec_shape,
             pg_ids,
@@ -451,17 +453,16 @@ impl StorageNodeProcessConfig {
     }
 
     pub fn route_map_valid_until_ms(&self) -> Option<u64> {
-        self.route_map_valid_until_ms
+        self.route_map_validity.valid_until_ms()
     }
 
     pub fn is_route_map_valid_at(&self, now_ms: u64) -> bool {
-        self.route_map_valid_until_ms
-            .is_none_or(|valid_until_ms| valid_until_ms > now_ms)
+        self.route_map_validity.is_valid_at(now_ms)
     }
 
     pub fn require_route_map_valid_at(&self, now_ms: u64) -> Result<(), StorageNodeServerError> {
-        match self.route_map_valid_until_ms {
-            Some(valid_until_ms) if valid_until_ms <= now_ms => {
+        match self.route_map_validity {
+            RouteMapValidity::Until(valid_until_ms) if valid_until_ms <= now_ms => {
                 Err(StorageNodeServerError::RouteMapExpired {
                     cluster_epoch: self.cluster_epoch,
                     valid_until_ms,
@@ -653,9 +654,11 @@ fn encode_control_plane_runtime_config(config: &StorageNodeProcessConfig) -> Str
     out.push_str("argmin-storage-node-runtime-config-v1\n");
     out.push_str(&format!("node_id {}\n", config.node_id.as_u32()));
     out.push_str(&format!("cluster_epoch {}\n", config.cluster_epoch.get()));
-    match config.route_map_valid_until_ms {
-        Some(valid_until_ms) => out.push_str(&format!("valid_until {valid_until_ms}\n")),
-        None => out.push_str("valid_until none\n"),
+    match config.route_map_validity {
+        RouteMapValidity::Forever => out.push_str("route_map_validity forever\n"),
+        RouteMapValidity::Until(valid_until_ms) => {
+            out.push_str(&format!("route_map_validity until {valid_until_ms}\n"));
+        }
     }
     out.push_str(&format!(
         "ec_shape {} {}\n",
@@ -711,7 +714,7 @@ fn decode_control_plane_runtime_config(
     }
     let node_id = NodeId::new(parse_labeled_u32(path, lines.next(), "node_id")?);
     let cluster_epoch = parse_labeled_cluster_epoch(path, lines.next(), "cluster_epoch")?;
-    let route_map_valid_until_ms = parse_labeled_optional_u64(path, lines.next(), "valid_until")?;
+    let route_map_validity = parse_labeled_route_map_validity(path, lines.next())?;
     let stored_ec_shape = parse_labeled_ec_shape(path, lines.next(), "ec_shape")?;
     if stored_ec_shape != default_ec_shape {
         return Err(runtime_config_invalid(
@@ -740,7 +743,7 @@ fn decode_control_plane_runtime_config(
     Ok(StorageNodeProcessConfig {
         node_id,
         cluster_epoch,
-        route_map_valid_until_ms,
+        route_map_validity,
         data_dir,
         default_ec_shape,
         pg_ids,
@@ -825,20 +828,6 @@ fn parse_labeled_cluster_epoch(
     })
 }
 
-fn parse_labeled_optional_u64(
-    path: &Path,
-    line: Option<&str>,
-    label: &str,
-) -> Result<Option<u64>, StorageNodeServerError> {
-    parse_labeled_field(path, line, label, |path, value| {
-        if value == "none" {
-            Ok(None)
-        } else {
-            parse_u64_field(path, value, label).map(Some)
-        }
-    })
-}
-
 fn parse_labeled_ec_shape(
     path: &Path,
     line: Option<&str>,
@@ -866,6 +855,24 @@ fn parse_labeled_hex_path(
     parse_labeled_field(path, line, label, |path, value| {
         decode_hex_path(path, value)
     })
+}
+
+fn parse_labeled_route_map_validity(
+    path: &Path,
+    line: Option<&str>,
+) -> Result<RouteMapValidity, StorageNodeServerError> {
+    let line = line.ok_or_else(|| runtime_config_invalid(path, "missing route_map_validity"))?;
+    let fields: Vec<_> = line.split_whitespace().collect();
+    match fields.as_slice() {
+        ["route_map_validity", "forever"] => Ok(RouteMapValidity::Forever),
+        ["route_map_validity", "until", valid_until_ms] => {
+            parse_u64_field(path, valid_until_ms, "route_map_validity").map(RouteMapValidity::Until)
+        }
+        _ => Err(runtime_config_invalid(
+            path,
+            "invalid route_map_validity line",
+        )),
+    }
 }
 
 fn parse_labeled_field<T>(
@@ -1774,13 +1781,13 @@ impl StorageNodeServer {
         }
         if next_config.cluster_epoch == current_config.cluster_epoch
             && route_map_validity_regressed(
-                current_config.route_map_valid_until_ms,
-                next_config.route_map_valid_until_ms,
+                current_config.route_map_valid_until_ms(),
+                next_config.route_map_valid_until_ms(),
             )
         {
             return Err(StorageNodeServerError::RuntimeRefreshValidityRegression {
-                current: current_config.route_map_valid_until_ms,
-                candidate: next_config.route_map_valid_until_ms,
+                current: current_config.route_map_valid_until_ms(),
+                candidate: next_config.route_map_valid_until_ms(),
             });
         }
         next_config.persist_control_plane_runtime_config()?;
@@ -9877,7 +9884,7 @@ impl StorageNodeConnectionHandler {
             });
         }
         let now_ms = crate::clock::current_time_millis();
-        if let Some(valid_until_ms) = self.config.route_map_valid_until_ms {
+        if let Some(valid_until_ms) = self.config.route_map_valid_until_ms() {
             if valid_until_ms <= now_ms {
                 return Err(StorageRpcErrorResponse {
                     code: StorageRpcErrorCode::StaleShardLocation,
@@ -9954,7 +9961,7 @@ impl StorageNodeConnectionHandler {
             });
         }
         let now_ms = crate::clock::current_time_millis();
-        if let Some(valid_until_ms) = self.config.route_map_valid_until_ms {
+        if let Some(valid_until_ms) = self.config.route_map_valid_until_ms() {
             if valid_until_ms <= now_ms {
                 return Err(StorageRpcErrorResponse {
                     code: StorageRpcErrorCode::StaleShardLocation,
@@ -11141,6 +11148,7 @@ fn validate_process_config_route_table(
 fn route_map_validity_regressed(current: Option<u64>, candidate: Option<u64>) -> bool {
     match (current, candidate) {
         (Some(current), Some(candidate)) => candidate < current,
+        (Some(_), None) => true,
         _ => false,
     }
 }
@@ -11444,7 +11452,7 @@ mod tests {
         StorageNodeProcessConfig {
             node_id: NodeId::new(7),
             cluster_epoch: ClusterEpoch::new(1).unwrap(),
-            route_map_valid_until_ms: None,
+            route_map_validity: RouteMapValidity::Forever,
             data_dir: tmp.path().join("node"),
             default_ec_shape: EcShape { k: 4, m: 2 },
             pg_ids: vec![0],
@@ -11476,10 +11484,7 @@ mod tests {
     ) {
         assert_eq!(actual.node_id, expected.node_id);
         assert_eq!(actual.cluster_epoch, expected.cluster_epoch);
-        assert_eq!(
-            actual.route_map_valid_until_ms,
-            expected.route_map_valid_until_ms
-        );
+        assert_eq!(actual.route_map_validity, expected.route_map_validity);
         assert_eq!(actual.data_dir, expected.data_dir);
         assert_eq!(actual.default_ec_shape, expected.default_ec_shape);
         assert_eq!(actual.pg_ids, expected.pg_ids);
@@ -11493,7 +11498,7 @@ mod tests {
         let tmp = test_util::tempdir();
         let mut config = test_config(&tmp);
         config.cluster_epoch = ClusterEpoch::new(9).unwrap();
-        config.route_map_valid_until_ms = Some(12_345);
+        config.route_map_validity = RouteMapValidity::Until(12_345);
         config.pg_ids = vec![0, 2];
         config.pg_routes = vec![
             StorageNodePgRoute {
@@ -11549,7 +11554,7 @@ mod tests {
         let server = StorageNodeServer::bind(config.clone()).unwrap();
 
         config.cluster_epoch = ClusterEpoch::new(2).unwrap();
-        config.route_map_valid_until_ms = Some(10_000);
+        config.route_map_validity = RouteMapValidity::Until(10_000);
         config.pg_routes[0].cluster_epoch = config.cluster_epoch;
         config.historical_pg_routes.push(StorageNodePgRoute {
             pg_id: 0,
@@ -11674,7 +11679,7 @@ mod tests {
     fn storage_node_process_config_preserves_route_map_validity() {
         let tmp = test_util::tempdir();
         let mut config = test_config(&tmp);
-        config.route_map_valid_until_ms = Some(1_500);
+        config.route_map_validity = RouteMapValidity::Until(1_500);
 
         assert_eq!(config.route_map_valid_until_ms(), Some(1_500));
         assert!(config.is_route_map_valid_at(1_499));
@@ -11692,7 +11697,7 @@ mod tests {
     fn storage_node_server_rejects_expired_route_map_for_serving_rpc() {
         let tmp = test_util::tempdir();
         let mut config = test_config(&tmp);
-        config.route_map_valid_until_ms = Some(1);
+        config.route_map_validity = RouteMapValidity::Until(1);
         private_socket_dir(config.socket_path.parent().unwrap());
         let server = StorageNodeServer::bind(config.clone()).unwrap();
         let error = server
@@ -11709,7 +11714,7 @@ mod tests {
     fn metadata_command_pg_lock_release_allows_expired_route_map_cleanup() {
         let tmp = test_util::tempdir();
         let mut config = test_config(&tmp);
-        config.route_map_valid_until_ms = Some(1);
+        config.route_map_validity = RouteMapValidity::Until(1);
         private_socket_dir(config.socket_path.parent().unwrap());
         let server = StorageNodeServer::bind(config.clone()).unwrap();
         let handler = server.connection_handler();
@@ -11779,7 +11784,7 @@ mod tests {
             record
         };
 
-        config.route_map_valid_until_ms = Some(1);
+        config.route_map_validity = RouteMapValidity::Until(1);
         private_socket_dir(config.socket_path.parent().unwrap());
         let server = StorageNodeServer::bind(config.clone()).unwrap();
         let handler = server.connection_handler();
@@ -11817,7 +11822,7 @@ mod tests {
         let current = test_config(&tmp);
         let mut candidate = current.clone();
         candidate.cluster_epoch = ClusterEpoch::new(2).unwrap();
-        candidate.route_map_valid_until_ms = Some(3_000);
+        candidate.route_map_validity = RouteMapValidity::Until(3_000);
         candidate.pg_ids = vec![0, 1];
         candidate.pg_routes.push(StorageNodePgRoute {
             pg_id: 1,
@@ -11933,11 +11938,11 @@ mod tests {
     fn storage_node_runtime_config_install_rejects_same_epoch_validity_regression() {
         let tmp = test_util::tempdir();
         let mut config = test_config(&tmp);
-        config.route_map_valid_until_ms = Some(5_000);
+        config.route_map_validity = RouteMapValidity::Until(5_000);
         private_socket_dir(config.socket_path.parent().unwrap());
         let server = StorageNodeServer::bind(config.clone()).unwrap();
         let mut stale = config.clone();
-        stale.route_map_valid_until_ms = Some(4_000);
+        stale.route_map_validity = RouteMapValidity::Until(4_000);
 
         assert!(matches!(
             server.install_control_plane_runtime_config(stale),
@@ -11946,17 +11951,27 @@ mod tests {
                 candidate: Some(4_000),
             })
         ));
+
+        let mut unbounded = config.clone();
+        unbounded.route_map_validity = RouteMapValidity::Forever;
+        assert!(matches!(
+            server.install_control_plane_runtime_config(unbounded),
+            Err(StorageNodeServerError::RuntimeRefreshValidityRegression {
+                current: Some(5_000),
+                candidate: None,
+            })
+        ));
     }
 
     #[test]
     fn storage_node_runtime_config_install_accepts_bounded_authoritative_refresh() {
         let tmp = test_util::tempdir();
         let mut config = test_config(&tmp);
-        config.route_map_valid_until_ms = None;
+        config.route_map_validity = RouteMapValidity::Forever;
         private_socket_dir(config.socket_path.parent().unwrap());
         let server = StorageNodeServer::bind(config.clone()).unwrap();
         let mut authoritative = config.clone();
-        authoritative.route_map_valid_until_ms = Some(5_000);
+        authoritative.route_map_validity = RouteMapValidity::Until(5_000);
 
         server
             .install_control_plane_runtime_config(authoritative)
@@ -11971,7 +11986,7 @@ mod tests {
     fn expired_route_map_rejects_new_work_but_allows_cleanup_route_validation() {
         let tmp = test_util::tempdir();
         let mut config = test_config(&tmp);
-        config.route_map_valid_until_ms = Some(1);
+        config.route_map_validity = RouteMapValidity::Until(1);
         private_socket_dir(config.socket_path.parent().unwrap());
         let server = StorageNodeServer::bind(config.clone()).unwrap();
         let handler = server.connection_handler();
@@ -12146,6 +12161,7 @@ mod tests {
         let socket_path = tmp.path().join("sock").join("storage-7.sock");
         let acting_socket_path = tmp.path().join("sock").join("storage-8.sock");
         private_socket_dir(socket_path.parent().unwrap());
+        let base_time_ms = crate::clock::current_time_millis();
         let mut authority = SingleAuthorityControlPlane::open(FileControlPlaneStore::new(
             tmp.path().join("control-plane.state"),
         ))
@@ -12157,7 +12173,7 @@ mod tests {
         .into_iter()
         .enumerate()
         {
-            let heartbeat_at_ms = 1_000 + (idx as u64 * 2);
+            let heartbeat_at_ms = base_time_ms + (idx as u64 * 2);
             authority
                 .set_node_membership(heartbeat_node_id, NodeMembershipState::Active)
                 .unwrap();
@@ -12168,7 +12184,7 @@ mod tests {
                         node_incarnation: 12,
                         endpoint: heartbeat_socket_path.to_str().unwrap().to_owned(),
                         observed_epoch: authority.snapshot().cluster_epoch(),
-                        requested_lease_duration_ms: 1_000,
+                        requested_lease_duration_ms: crate::control_plane::MAX_HEARTBEAT_LEASE_MS,
                         cluster_map_history_reference_summary:
                             crate::PgClusterMapHistoryReferenceSummary::default(),
                         pg_observations: Vec::new(),
@@ -12183,7 +12199,7 @@ mod tests {
                         node_incarnation: 12,
                         endpoint: heartbeat_socket_path.to_str().unwrap().to_owned(),
                         observed_epoch: first.cluster_epoch(),
-                        requested_lease_duration_ms: 1_000,
+                        requested_lease_duration_ms: crate::control_plane::MAX_HEARTBEAT_LEASE_MS,
                         cluster_map_history_reference_summary:
                             crate::PgClusterMapHistoryReferenceSummary::default(),
                         pg_observations: Vec::new(),
@@ -12207,7 +12223,7 @@ mod tests {
         .into_iter()
         .enumerate()
         {
-            let heartbeat_at_ms = 1_004 + idx as u64;
+            let heartbeat_at_ms = base_time_ms + 4 + idx as u64;
             authority
                 .heartbeat(
                     NodeHeartbeat {
@@ -12215,7 +12231,7 @@ mod tests {
                         node_incarnation: 12,
                         endpoint: heartbeat_socket_path.to_str().unwrap().to_owned(),
                         observed_epoch,
-                        requested_lease_duration_ms: 1_000,
+                        requested_lease_duration_ms: crate::control_plane::MAX_HEARTBEAT_LEASE_MS,
                         cluster_map_history_reference_summary:
                             crate::PgClusterMapHistoryReferenceSummary::default(),
                         pg_observations: Vec::new(),
@@ -12225,7 +12241,7 @@ mod tests {
                 .unwrap();
         }
 
-        let runtime_map = authority.snapshot().runtime_map(1_006).unwrap();
+        let runtime_map = authority.snapshot().runtime_map(base_time_ms + 6).unwrap();
         let config = StorageNodeProcessConfig::from_runtime_map(
             node_id,
             tmp.path().join("node"),
@@ -12400,7 +12416,7 @@ mod tests {
         )
         .unwrap();
         let mut config = config;
-        config.route_map_valid_until_ms = Some(1);
+        config.route_map_validity = RouteMapValidity::Until(1);
         let server = StorageNodeServer::bind(config.clone()).unwrap();
         let stale_error = server
             .connection_handler()
@@ -12953,7 +12969,7 @@ mod tests {
         )
         .unwrap();
         let mut config = config;
-        config.route_map_valid_until_ms = Some(1);
+        config.route_map_validity = RouteMapValidity::Until(1);
         let server = Arc::new(StorageNodeServer::bind(config).unwrap());
         let now = Arc::new(AtomicU64::new(1_003));
         let loop_now = Arc::clone(&now);
@@ -13002,7 +13018,7 @@ mod tests {
         let config = StorageNodeProcessConfig {
             node_id,
             cluster_epoch: ClusterEpoch::INITIAL,
-            route_map_valid_until_ms: None,
+            route_map_validity: RouteMapValidity::Forever,
             data_dir: tmp.path().join("node"),
             default_ec_shape: EcShape { k: 1, m: 0 },
             pg_ids: vec![0],
