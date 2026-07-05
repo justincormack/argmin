@@ -10655,25 +10655,24 @@ Phase 12.3 closeout:
   durable restart-artifact checkpoint succeeds, natural-election read service
   checkpoints the serving vote/term before returning a read-index runtime map,
   and missing-artifact restarts fail closed through the sidecar sentinel.
-- Known deferred work is intentionally outside 12.3: replace full
-  peer-response checkpoints with a fsync'd vote/log WAL before production
-  scale, complete the monotonic-clock and lease-read design, add authenticated
-  peer identity for non-local or production transports, design dynamic
-  configured peer-policy evolution, cut production traffic over from the
-  single-authority path, and remove or replace
-  `ARGMIN_CONTROL_PLANE_EXPERIMENTAL_RAFT`.
+- Known deferred work is intentionally outside 12.3: add a bounded durable
+  vote/log WAL plus checkpoint compaction model for production scale, complete
+  the monotonic-clock and lease-read design, add authenticated peer identity for
+  non-local or production transports, design dynamic configured peer-policy
+  evolution, cut production traffic over from the single-authority path, and
+  remove or replace `ARGMIN_CONTROL_PLANE_EXPERIMENTAL_RAFT`.
 
 Phase 12.4 proposed scope:
 
 - Move the experimental multi-process OpenRaft control-plane path from
   "correct but expensive" durability to a production-shaped local durability
-  model. Replace full restart-artifact checkpoint-before-each-peer-response
-  with an fsync'd vote/log/commit WAL that can acknowledge Raft peer RPCs after
-  the exact updated consensus metadata is durable, while keeping the full
-  restart artifact as a compacted checkpoint/snapshot product. Recovery must
-  reconstruct the same OpenRaft vote, retained log, committed/purged
-  watermarks, membership, cached snapshot, and Argmin state-machine snapshot
-  from WAL plus the latest artifact.
+  model. Add an fsync'd vote/log/commit WAL for crash recovery, keep ordinary
+  durable peer RPCs on checkpoint-before-response until the acknowledged WAL
+  suffix is compacted or otherwise bounded, and keep the full restart artifact
+  as the compacted checkpoint/snapshot product. Recovery must reconstruct the
+  same OpenRaft vote, retained log, committed/purged watermarks, membership,
+  cached snapshot, and Argmin state-machine snapshot from WAL plus the latest
+  artifact.
 - Close the monotonic-clock and lease-read design for the replicated authority.
   Define the authority clock source, restart high-water behavior, skew budget,
   and relationship between committed command timestamps, heartbeat lease
@@ -10752,17 +10751,17 @@ Phase 12.4 progress:
   Focused tests cover frame round-trip, malformed frame rejection, identity
   mismatch rejection, replay equivalence with live log-store mutations, and
   fail-closed replay of an invalid append sequence. The process peer-ack path
-  still uses the safe full-artifact checkpoint-before-response path; switching
-  acknowledgements to WAL fsync is a later 12.4 slice after file append/replay
-  and crash-fault injection land.
+  still uses the safe full-artifact checkpoint-before-response path; later 12.4
+  WAL work must keep acknowledged suffixes bounded rather than acknowledge
+  ordinary durable peer RPCs on WAL fsync alone.
 - Added the first file-backed OpenRaft WAL append/replay helper. The disk
   format is a sequence of length-prefixed CRC-protected WAL frames, fsync'd on
   append and bound to the configured cluster/local Raft node identity during
   replay. Recovery from a missing WAL is an empty replay; a torn final frame is
   truncated back to the last clean record; identity mismatches and corrupt
-  complete frames fail closed. This is still a storage-level primitive: the
-  live peer RPC acknowledgement path has not yet switched from full restart
-  artifact checkpoints to WAL-only fsync.
+  complete frames fail closed. This is still a storage-level primitive: live
+  durable peer RPC acknowledgement remains checkpoint-before-response so
+  acknowledged WAL suffixes are compacted or otherwise bounded.
 - Wired the WAL file into an optional live `ControlPlaneRaftLogStore` mode.
   WAL-backed vote/log/commit/truncate/purge mutations now validate on a cloned
   candidate state, fsync the WAL record, and only then publish the candidate
@@ -10773,9 +10772,10 @@ Phase 12.4 progress:
   retry against a state that restart may replay differently. Tests prove live
   WAL-backed mutations replay to the same restart artifact, path-scoped
   fail-closed pre-record and file-sync fault injection, and the replayable
-  parent-sync failure path. The process peer-response path still remains on
-  full restart-artifact checkpoint-before-response until crash/fault injection
-  proves WAL-only acknowledgements end to end.
+  parent-sync failure path. The process peer-response path remains on full
+  restart-artifact checkpoint-before-response for ordinary durable peer RPCs;
+  WAL crash/fault injection proves pre-response crash recovery, not normal
+  WAL-only acknowledgement.
 - Integrated the WAL-backed log store into the experimental durable process
   constructors. Each durable restart artifact now records a checkpoint WAL
   replay offset, and process startup derives a sibling `.wal` path from the
@@ -10786,34 +10786,31 @@ Phase 12.4 progress:
   being replayed as duplicate or stale log-store mutations. Fresh startup still
   fails closed if a non-empty WAL exists without a durable artifact/sentinel.
   The process still checkpoints the full restart artifact before external
-  responses; replacing those checkpoints with WAL-only acknowledgements and
-  adding physical WAL compaction remain later 12.4 work.
+  responses until the relevant WAL suffix is compacted or otherwise bounded.
 - Added process-level restart coverage for post-checkpoint WAL suffix recovery.
   The `argmin-s3` experimental Raft process test now appends a valid committed
   vote record after the durable artifact checkpoint, proves artifact-only
   restore does not see it while artifact-plus-WAL restore does, restarts the
   real process, and verifies the replayed vote is checkpointed back into the
-  durable artifact. This pins the production startup path before moving peer
-  responses from full artifact checkpoints to WAL fsync.
+  durable artifact. This pins the production startup path for crashes that
+  happen before the ordinary peer-response checkpoint/ack boundary.
 - Extended the process-level WAL suffix restart coverage from vote-only replay
   to a committed command suffix. The new test appends a post-checkpoint vote,
   normal control-plane command entry, and committed watermark directly into the
   WAL, proves artifact-plus-WAL restore sees the committed suffix while the
   checkpoint artifact alone does not, restarts the real process, and verifies
   OpenRaft startup catches the state machine up and checkpoints the resulting PG
-  acting-set change. This closes the main coverage gap before replacing
-  peer-response full artifact checkpoints with WAL fsync acknowledgements.
-- Added handler-level peer RPC coverage for WAL-only acknowledgement. A
-  WAL-backed durable authority now receives a real vote frame through the peer
-  RPC handler with artifact checkpointing disabled, returns a response, leaves
-  the checkpoint artifact unchanged, and proves artifact-plus-WAL replay sees
-  the acknowledged vote. The process peer listener now uses that WAL-backed
-  acknowledgement boundary for ordinary peer RPCs instead of forcing a full
-  restart-artifact checkpoint before every append/vote response. Snapshot peer
-  RPCs still checkpoint the state-machine artifact before response until snapshot
-  installs have their own durable state-machine journal. Process restart probes
-  that observe follower state now restore artifact-plus-WAL state, while explicit
-  checkpoint-unchanged tests still read artifact-only state.
+  acting-set change.
+- Added handler-level peer RPC coverage for the durable acknowledgement
+  boundary. An earlier WAL-only peer-ack shape proved artifact-plus-WAL replay
+  could recover an acknowledged vote without rewriting the checkpoint artifact;
+  the final Phase 12.4 direction keeps ordinary durable peer RPCs on the
+  checkpoint-before-response path so the WAL suffix is compacted before
+  acknowledgement. Snapshot peer RPCs also checkpoint the state-machine artifact
+  before response until snapshot installs have their own durable state-machine
+  journal. Process restart probes that observe follower state restore
+  artifact-plus-WAL state, while explicit checkpoint tests read artifact-only
+  state where that is the contract under test.
 - Started the replicated-authority durability observability slice. The
   OpenRaft authority status now reports whether its retained log store is
   WAL-backed, the current WAL base offset and clean WAL length while healthy,
@@ -10833,8 +10830,8 @@ Phase 12.4 progress:
   artifact-plus-compacted-WAL restore, and authority checkpointing that removes
   the checkpointed prefix while exposing the resulting base offset through the
   replicated authority status surface.
-- Started process-level WAL crash/fault injection for the WAL-only peer ack
-  boundary. An env-gated test failpoint now exits after a WAL record and its
+- Started process-level WAL crash/fault injection for the pre-response peer RPC
+  crash boundary. An env-gated test failpoint now exits after a WAL record and its
   parent directory are synced, before the peer RPC response can be written. A
   three-process regression restarts a follower with that failpoint, commits a
   real leader-to-follower log-store mutation through the surviving quorum, proves the
@@ -10842,6 +10839,14 @@ Phase 12.4 progress:
   artifact-plus-WAL recovery sees the unacknowledged-but-fsynced mutation, and
   then restarts the follower normally to catch up through the recovered WAL
   state.
+- Bounded ordinary durable peer RPC WAL growth by making the live durable peer
+  context checkpoint and compact append/vote RPCs before acknowledgement. A
+  regression now uses the default process durability context for a vote request
+  and proves the response is released only after the vote is present in the
+  durable restart artifact and the WAL clean length has been compacted back to
+  its base offset. The remaining WAL-only crash test stays in place as a
+  pre-response crash guarantee: if the process exits after fsync but before the
+  checkpoint/response, artifact-plus-WAL replay still recovers the mutation.
 
 1. define the replicated control-plane state machine:
    - state includes cluster epoch, PG count, PG state, PG acting sets, node
