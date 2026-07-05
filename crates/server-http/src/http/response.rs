@@ -238,7 +238,6 @@ fn client_error_message(err: &ServerError) -> String {
             "A header you provided implies functionality that is not implemented".to_string()
         }
         ServerError::Auth(auth::AuthError::SignatureMismatch) => "signature mismatch".to_string(),
-        ServerError::Auth(auth::AuthError::InvalidToken) => "invalid session token".to_string(),
         ServerError::Auth(auth::AuthError::UnexpectedSecurityToken { .. }) => {
             "The provided token is malformed or otherwise invalid.".to_string()
         }

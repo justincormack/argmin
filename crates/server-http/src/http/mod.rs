@@ -936,10 +936,9 @@ impl HttpFrontend {
         let add_bucket_region_for_token_error = actual_cors_bucket.is_some()
             && matches!(
                 &result,
-                Err(ServerError::Auth(auth::AuthError::InvalidToken))
-                    | Err(ServerError::Auth(
-                        auth::AuthError::UnexpectedSecurityToken { .. }
-                    ))
+                Err(ServerError::Auth(
+                    auth::AuthError::UnexpectedSecurityToken { .. }
+                ))
             );
 
         let mut resp = {

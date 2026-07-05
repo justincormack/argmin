@@ -132,11 +132,13 @@ Remaining order of attack:
   Local `RequestNotYetValid` now routes through the same HostId-shaped
   `AccessDenied` formatter as `PresignedRequestExpired`.
 
-- [ ] **RR6. Dead `AuthError::InvalidToken`.**
+- [x] **RR6. Dead `AuthError::InvalidToken`.**
   `crates/auth/src/error.rs:51` is no longer constructed anywhere in
   production code since the session-token removal (A2) — only mapped
   (`server-core/src/error.rs:404`) and matched. Either a producer is missing
-  or the variant should be deleted.
+  or the variant should be deleted. Fixed by deleting the dead auth variant
+  and removing stale mappings/tests; static credential token inputs continue
+  to return S3 `InvalidToken` through the live `UnexpectedSecurityToken` path.
 
 - [ ] **RR7. Presigned path accepts a signed `x-amz-security-token` header
   without rejection.** Header auth rejects any `x-amz-security-token` header,

@@ -404,8 +404,7 @@ impl ServerError {
             Self::Auth(auth::AuthError::RequestExpired) => "RequestTimeTooSkewed",
             Self::Auth(auth::AuthError::PresignedRequestExpired) => "AccessDenied",
             Self::Auth(auth::AuthError::ExpiredToken) => "ExpiredToken",
-            Self::Auth(auth::AuthError::InvalidToken)
-            | Self::Auth(auth::AuthError::UnexpectedSecurityToken { .. }) => "InvalidToken",
+            Self::Auth(auth::AuthError::UnexpectedSecurityToken { .. }) => "InvalidToken",
             Self::Auth(auth::AuthError::InvalidQueryParam { .. }) => {
                 "AuthorizationQueryParametersError"
             }
@@ -1005,12 +1004,6 @@ mod tests {
             bucket_region_header: true,
         };
         assert_eq!(err.s3_error_code(), "AuthorizationHeaderMalformed");
-    }
-
-    #[test]
-    fn s3_error_code_auth_invalid_token() {
-        let err = ServerError::Auth(auth::AuthError::InvalidToken);
-        assert_eq!(err.s3_error_code(), "InvalidToken");
     }
 
     #[test]

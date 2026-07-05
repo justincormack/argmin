@@ -47,8 +47,6 @@ pub enum AuthError {
     AccessDenied,
     #[error("signature mismatch")]
     SignatureMismatch,
-    #[error("invalid session token")]
-    InvalidToken,
     #[error("unexpected security token")]
     UnexpectedSecurityToken { token: String },
     #[error("token expired")]
@@ -145,7 +143,6 @@ impl std::fmt::Debug for AuthError {
             Self::DuplicateAuthorizationHeader => f.write_str("DuplicateAuthorizationHeader"),
             Self::AccessDenied => f.write_str("AccessDenied"),
             Self::SignatureMismatch => f.write_str("SignatureMismatch"),
-            Self::InvalidToken => f.write_str("InvalidToken"),
             Self::UnexpectedSecurityToken { .. } => f
                 .debug_struct("UnexpectedSecurityToken")
                 .field("token", &observability::redacted("security_token"))
