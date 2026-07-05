@@ -1,0 +1,226 @@
+WAL replay bypasses static Raft peer membership validation
+Link: https://chatgpt.com/codex/cloud/security/findings/36068f88b3dc819192b508c55bd2f864?sev=&repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin&sort=date_desc
+Criticality: medium (attack path: medium)
+Status: fixed
+
+# Metadata
+Repo: justincormack/argmin
+Commit: e3b65ca
+Author: justin@specialbusservice.com
+Created: 04/07/2026, 22:43:51
+Assignee: Unassigned
+Signals: Security, Validated, Attack-path
+
+# Summary
+Introduced: the commit creates an acknowledged WAL-only durability path for ordinary peer RPCs, but the WAL replay path does not apply the same static peer membership validation that is applied to checkpoint artifacts.
+The commit changes production peer RPC durability so ordinary RPCs do not write a full restart-artifact checkpoint before responding; only snapshot RPCs still force that checkpoint. This relies on replaying the WAL after restart. However, the durable Unix-peer startup path calls the peer-policy validation callback on the base restart artifact before WAL replay, then restore_with_wal_file replays WAL records and only validates log/state-machine consistency. The static peer policy validation that rejects retained/applied/cached membership mismatches is not re-run on the WAL-replayed log store. Because static peer reconfiguration is explicitly disabled for configured peer policies, this creates a bypass for membership entries that exist only in the post-checkpoint WAL suffix. A crafted or compromised peer RPC source could persist a membership change in the WAL, receive an acknowledgment under the new WAL-only ordinary-RPC path, and after restart have that membership restored without the configured peer-map validation that an artifact checkpoint would have received.
+
+# Resolution
+Fixed in commit edeb57e15cd25452962313e6607bfa472467f304:
+https://github.com/justincormack/argmin/commit/edeb57e15cd25452962313e6607bfa472467f304
+
+The durable Unix-peer restore path now replays the WAL suffix into a candidate restart artifact and re-runs the configured peer-policy membership validator before constructing live OpenRaft stores. This applies the same static peer-map checks to WAL-replayed retained membership entries that already applied to the base checkpoint artifact.
+
+Regression coverage was added with `control_plane_openraft_unix_peer_durable_rejects_wal_membership_mismatch`, which stores a peer-policy-compatible base artifact, appends a WAL-only membership entry that does not match the configured peer map, and proves `new_experimental_unix_peer_durable_with_wal` fails closed before serving.
+
+Validation for the fix passed:
+- `cargo fmt`
+- `cargo nextest run -p storage control_plane_openraft_unix_peer_durable_rejects`
+- `cargo nextest run -p storage control_plane_raft`
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings`
+- `cargo nextest run` full suite: 6253 passed
+
+# Validation
+## Rubric
+- [x] Confirm ordinary peer RPC durability can acknowledge WAL-only state without writing a checkpoint artifact before response.
+- [x] Confirm durable Unix-peer startup applies the configured peer-policy validator only to the base checkpoint artifact before WAL replay.
+- [x] Demonstrate a WAL suffix can contain a membership entry that the configured peer policy would reject.
+- [x] Demonstrate startup with `new_experimental_unix_peer_durable_with_wal` succeeds and restores that WAL-only unauthorized membership entry.
+- [x] Confirm control behavior: checkpoint artifact membership mismatches and static peer reconfiguration are rejected, showing this is a WAL-replay-specific bypass.
+## Report
+Validated the finding as a logical durability/restart policy bypass. The commit sets production peer RPC durability to WAL-only for ordinary RPCs: `crates/argmin-s3/src/main.rs:1943-1949` sets `checkpoint_ordinary_rpc: false`, and `crates/argmin-s3/src/main.rs:2104-2127` checkpoints only when `checkpoint_ordinary_rpc` is true or the frame is a Snapshot, so ordinary AppendEntries/Vote RPC handling can respond without a checkpoint artifact. On durable Unix-peer startup, `new_experimental_unix_peer_durable_inner` passes the static peer-policy validator at `crates/storage/src/control_plane_raft.rs:2975-2980`, but `restore_experimental_raft_durable_artifact` invokes it on the base artifact before WAL replay at `crates/storage/src/control_plane_raft.rs:2781-2784`, then calls `artifact.restore_with_wal_file(...)` at `2784-2789`. `restore_with_wal_file` replays the WAL at `5169-5170` and only runs log/state-machine and cached snapshot consistency checks at `5171-5185`; it does not call `validate_peer_policy_membership`, whose checks for retained log entries, state-machine membership, and cached snapshot membership are at `5285-5316`. Static peer reconfiguration is intended to be disallowed at `3076-3082`.
+
+I added a targeted unit-test PoC `poc_unix_peer_durable_wal_membership_suffix_bypasses_peer_policy_validation` in `crates/storage/src/control_plane_raft.rs:17311-17393`. It creates a configured peer policy for nodes `[1,2]`, stores a checkpoint artifact whose retained membership matches that policy, appends a WAL-only membership entry for `[1]`, first proves that `[1]` is rejected by `policy.validate_configured_membership`, then starts `ControlPlaneRaftAuthority::new_experimental_unix_peer_durable_with_wal`. Startup succeeds, the unauthorized WAL-only membership entry is present in the restored log, and reconstructing an artifact from that restored log shows that re-running `validate_peer_policy_membership` would reject it as `retained log entry does not match configured peer map`.
+
+Dynamic result: `cargo test -p storage poc_unix_peer_durable_wal_membership_suffix_bypasses_peer_policy_validation -- --nocapture` produced `running 1 test ... ok ... 1 passed`. Control result: `cargo test -p storage control_plane_openraft_unix_peer_durable_rejects -- --nocapture` produced 5 passing tests, including rejection of checkpoint retained/applied membership mismatches and static peer reconfiguration. This confirms the difference is specifically WAL-suffix replay after checkpoint validation.
+
+Debugger evidence: non-interactive LLDB breakpoints showed the startup chain: stopped at `control_plane_raft.rs:2783` on `validate_artifact(&artifact)?`, continued to `2784` immediately after validation before WAL handling, then stopped at `ControlPlaneRaftRestartArtifact::restore_with_wal_file` at `5169`, called from `restore_experimental_raft_durable_artifact` at `2785`, via `new_experimental_unix_peer_durable_with_wal`. This confirms peer-policy validation happens before WAL replay and is not re-run afterward. Valgrind/gdb were unavailable in the container; ASan was attempted but Rust stable rejected `-Z sanitizer=address`. No memory-safety crash is expected because this is a logic/policy validation bypass.
+
+# Evidence
+crates/argmin-s3/src/main.rs (L1943 to 1949)
+  Note: Production durability contexts now set checkpoint_ordinary_rpc to false, so ordinary peer RPCs use the WAL-only acknowledgment path.
+```
+    fn from_context(context: &'a ExperimentalRaftPeerDurabilityContext) -> Self {
+        Self {
+            artifact_path: context.artifact_path.as_deref().map(PathBuf::as_path),
+            checkpoint_lock: Some(&context.checkpoint_lock),
+            poison_gate: Some(context.poison_gate.as_ref()),
+            checkpoint_ordinary_rpc: false,
+        }
+```
+
+crates/argmin-s3/src/main.rs (L2104 to 2127)
+  Note: The handler checkpoints before response only when checkpoint_ordinary_rpc is true or for snapshot frames; ordinary AppendEntries/Vote RPCs can now be acknowledged without an artifact checkpoint.
+```
+    let checkpoint_before_response = durability.checkpoint_ordinary_rpc
+        || matches!(frame_kind, ControlPlaneRaftPeerFrameKind::Snapshot);
+    if checkpoint_before_response {
+        let Some(path) = durability.artifact_path else {
+            return Err(ExperimentalRaftPeerRpcWorkerError::Checkpoint(
+                ControlPlaneError::RpcRemote {
+                    message:
+                        "experimental OpenRaft peer RPC requires durable checkpoint path before response"
+                            .to_string(),
+                },
+            ));
+        };
+        if let Err(error) = store_experimental_raft_durable_restart_artifact(
+            runtime,
+            authority,
+            path,
+            durability.checkpoint_lock,
+        ) {
+            return Err(ExperimentalRaftPeerRpcWorkerError::Checkpoint(error));
+        }
+    }
+
+    ensure_experimental_raft_peer_not_durably_poisoned(durability.poison_gate)?;
+    response_frame.map_err(ExperimentalRaftPeerRpcWorkerError::PeerRpc)
+```
+
+crates/storage/src/control_plane_raft.rs (L2781 to 2789)
+  Note: Startup validates the loaded artifact against the configured peer policy before WAL replay, then restores with the WAL.
+```
+            artifact.validate_cluster_identity(cluster_name)?;
+            artifact.validate_local_node_identity(node_id)?;
+            validate_artifact(&artifact)?;
+            if let Some(wal_path) = wal_path {
+                artifact.restore_with_wal_file(ControlPlaneRaftWalFile::new(
+                    wal_path,
+                    cluster_name,
+                    node_id,
+                ))
+```
+
+crates/storage/src/control_plane_raft.rs (L3076 to 3082)
+  Note: Static peer reconfiguration is intended to be rejected for configured peer-policy clusters, making acceptance of WAL-only membership changes a policy bypass.
+```
+    pub async fn replace_voters(
+        &self,
+        voters: BTreeSet<ControlPlaneRaftNodeId>,
+        retain_removed_voters_as_learners: bool,
+    ) -> Result<LogIdOf<ControlPlaneRaftTypeConfig>, ControlPlaneError> {
+        self.reject_static_peer_reconfiguration("change-membership")?;
+        let response = self
+```
+
+crates/storage/src/control_plane_raft.rs (L5165 to 5185)
+  Note: restore_with_wal_file replays WAL records and validates log/state-machine consistency, but does not re-run the configured peer-policy membership validation on the replayed log store.
+```
+    pub fn restore_with_wal_file(
+        self,
+        wal: ControlPlaneRaftWalFile,
+    ) -> Result<(ControlPlaneRaftLogStore, ControlPlaneRaftStateMachine), ControlPlaneError> {
+        let log_store_artifact =
+            wal.replay_log_store_artifact_from(&self.log_store, self.wal_replay_offset)?;
+        Self::validate_log_store_state_machine_pair(&log_store_artifact, &self.state_machine)
+            .map_err(|source| ControlPlaneError::Io {
+                context:
+                    "validate control-plane OpenRaft durable restart artifact after WAL replay",
+                source,
+            })?;
+        Self::validate_cached_snapshot_replays_to_state_machine(
+            &log_store_artifact,
+            &self.state_machine,
+        )
+        .map_err(|source| ControlPlaneError::Io {
+            context: "validate control-plane OpenRaft cached snapshot after WAL replay",
+            source,
+        })?;
+        let log_store = ControlPlaneRaftLogStore::from_restart_artifact_inner(
+```
+
+crates/storage/src/control_plane_raft.rs (L5285 to 5316)
+  Note: The peer-policy membership validation checks retained log entries, state-machine membership, and cached snapshot membership, but it is only applied to the base artifact in the startup path.
+```
+    fn validate_peer_policy_membership(
+        &self,
+        peer_policy: &ControlPlaneRaftPeerTransportPolicy,
+    ) -> Result<(), ControlPlaneError> {
+        for entry in &self.log_store.entries {
+            if let EntryPayload::Membership(membership) = &entry.payload {
+                peer_policy.validate_configured_membership("retained log entry", membership)?;
+            }
+        }
+        match self.state_machine.last_membership.log_id() {
+            Some(_) => peer_policy.validate_configured_membership(
+                "state-machine membership",
+                self.state_machine.last_membership.membership(),
+            )?,
+            None => Self::validate_uninitialized_membership(
+                "state-machine membership",
+                self.state_machine.last_membership.membership(),
+            )?,
+        }
+        if let Some(snapshot) = &self.state_machine.current_snapshot {
+            match snapshot.meta.last_membership.log_id() {
+                Some(_) => peer_policy.validate_configured_membership(
+                    "cached snapshot membership",
+                    snapshot.meta.last_membership.membership(),
+                )?,
+                None => Self::validate_uninitialized_membership(
+                    "cached snapshot membership",
+                    snapshot.meta.last_membership.membership(),
+                )?,
+            }
+        }
+        Ok(())
+```
+
+# Attack-path analysis
+Final: medium | Decider: model_decided | Matrix severity: ignore | Policy adjusted: ignore
+## Rationale
+Keep medium. The bug is validated and security-relevant because it bypasses an explicit static peer membership policy during durable restart, with executable validation evidence showing a WAL-only membership suffix can survive where a checkpoint membership mismatch is rejected. However, it is not high/critical because the vulnerable surface is internal/private Unix Raft peer RPC in optional experimental control-plane mode, not the public S3 HTTP API; exploitation requires a configured or compromised peer/local same-privilege actor, valid OpenRaft RPC crafting, and restart. The impact is control-plane integrity/availability, not direct data exfiltration, RCE, or public authentication bypass.
+## Likelihood
+low - The affected path is optional experimental Raft mode and the entrypoint is a private Unix peer socket. A realistic attacker needs internal peer compromise or same-privilege local socket access, valid frame crafting, and a restart timing condition.
+## Impact
+high - Successful exploitation can violate configured static Raft peer membership after restart, potentially changing control-plane quorum or causing availability/integrity failure. It does not directly expose S3 object data, leak credentials, or execute code.
+## Assumptions
+- The deployment enables ARGMIN_CONTROL_PLANE_EXPERIMENTAL_RAFT and configures durable Unix-peer Raft operation.
+- A static configured Raft peer policy is intended to be authoritative for membership.
+- The attacker can access the Raft peer RPC surface as a configured peer, compromised peer process, or local same-privilege process able to connect to the private Unix socket.
+- A restart occurs after an ordinary peer RPC persists a WAL-only membership entry but before a full checkpoint artifact is written.
+- The crafted ordinary Raft RPC is accepted by OpenRaft protocol checks sufficiently to persist the membership entry in the WAL.
+- experimental Raft control-plane enabled
+- durable Unix peer mode with WAL file
+- static peer map configured
+- access to internal Raft peer Unix socket or compromise of a configured peer
+- valid/crafted ordinary Raft peer frame
+- service restart after WAL persistence
+## Path
+Attacker/peer -> Unix Raft RPC -> ordinary AppendEntries -> WAL-only ack -> restart -> validate checkpoint only -> replay WAL suffix -> unauthorized membership
+## Path evidence
+- `crates/argmin-s3/src/config.rs:149-153` - Experimental Raft and peer socket configuration are documented environment-driven runtime features.
+- `crates/argmin-s3/src/main.rs:1943-1949` - Durable production peer RPC context sets checkpoint_ordinary_rpc: false.
+- `crates/argmin-s3/src/main.rs:2028-2060` - Peer RPC handler reads attacker/peer-controlled frames and validates only configured frame identity before dispatch.
+- `crates/argmin-s3/src/main.rs:2104-2127` - Checkpoint before response is required only for snapshots or when checkpoint_ordinary_rpc is true, leaving ordinary RPCs on the WAL-only ack path.
+- `crates/argmin-s3/src/main.rs:2695-2745` - Control-plane Unix socket directories must be private and owned by the service UID, limiting exposure to local/internal actors.
+- `crates/storage/src/control_plane_raft.rs:2781-2789` - Startup validates the base artifact before calling restore_with_wal_file for WAL replay.
+- `crates/storage/src/control_plane_raft.rs:2975-2980` - The static peer-policy validator is passed into durable Unix-peer startup, but only for artifact validation.
+- `crates/storage/src/control_plane_raft.rs:3076-3082` - Static peer reconfiguration is intentionally rejected for configured peer-policy clusters.
+- `crates/storage/src/control_plane_raft.rs:5165-5185` - WAL replay validates log/state-machine and cached snapshot consistency but does not re-run configured peer-policy membership validation.
+- `crates/storage/src/control_plane_raft.rs:5285-5316` - validate_peer_policy_membership contains the missing checks for retained log entries, state-machine membership, and cached snapshot membership.
+## Narrative
+The finding is real in the repository code. Production durable peer RPC context sets checkpoint_ordinary_rpc to false, so ordinary Raft peer RPCs can be acknowledged after WAL persistence without a full restart-artifact checkpoint. The durable Unix-peer startup path validates the configured static peer policy only against the base artifact, then replays the WAL. restore_with_wal_file validates log/state-machine consistency but does not call validate_peer_policy_membership on the replayed log. Static peer reconfiguration APIs are explicitly rejected, so accepting a WAL-only membership change after restart bypasses that intended control. Reachability is limited: the vulnerable surface is an internal/private Unix peer socket in optional experimental Raft mode, not the public S3 HTTP API. Exploitation therefore likely requires a compromised configured peer or same-privilege local socket access, plus valid Raft frame crafting and a restart. Impact is meaningful control-plane integrity/availability compromise, but not direct object-data disclosure, RCE, or internet-reachable auth bypass.
+## Controls
+- ARGMIN_CONTROL_PLANE_EXPERIMENTAL_RAFT is non-default
+- Raft peer transport uses Unix domain sockets, not a public TCP listener
+- socket parent directory must be private and service-UID owned
+- configured peer policy validates cluster/source/target frame identity before dispatch
+- static peer reconfiguration APIs reject change-membership and add-learner
+- WAL frame/checksum and log/state-machine consistency validation exist, but peer-policy membership validation is missing after WAL replay
+## Blindspots
+- Static review did not observe deployment manifests or real production socket placement/permissions.
+- The prior executable PoC is unit-level validation, not a full external multi-process Unix-socket exploit in this stage.
+- Exact OpenRaft term/leadership preconditions for a non-leader configured peer to persist a malicious membership entry were not fully modeled.
+- No cloud APIs or runtime infrastructure were queried, per scope.
