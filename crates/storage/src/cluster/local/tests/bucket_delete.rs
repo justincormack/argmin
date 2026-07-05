@@ -3238,6 +3238,69 @@ fn begin_bucket_delete_records_reservation_wait_blocker_and_adopts_after_release
 }
 
 #[test]
+fn begin_bucket_delete_reaps_expired_durable_write_reservation() {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2], ec_shape).unwrap();
+    let bucket = {
+        let topology = map
+            .nodes
+            .get(&NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        bucket_for_pg(topology, 1, "delete-expired-reservation-")
+    };
+    set_route_primary(&mut map, 1, NodeId::new(1));
+
+    let map = Arc::new(map);
+    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    create_test_bucket(&cluster, &bucket);
+    let bucket_pg = map
+        .node(NodeId::new(1))
+        .unwrap()
+        .storage_node()
+        .get_pg(1)
+        .unwrap();
+    crate::PgMetadataStore::acquire_durable_bucket_write_reservation(
+        &*bucket_pg,
+        &bucket,
+        "expired-reservation",
+        "expired-owner",
+        ClusterEpoch::INITIAL,
+        "test-expired-write",
+        1,
+        2,
+        Some("expired-key"),
+    )
+    .unwrap();
+    drop(bucket_pg);
+
+    cluster
+        .test_begin_bucket_delete_if_current(&bucket)
+        .expect("expired durable reservation should be reaped during DeleteBucket");
+    let bucket_pg = map
+        .node(NodeId::new(1))
+        .unwrap()
+        .storage_node()
+        .get_pg(1)
+        .unwrap();
+    assert!(
+        crate::PgMetadataStore::durable_bucket_write_reservations(&*bucket_pg, &bucket)
+            .unwrap()
+            .is_empty(),
+        "expired durable write reservation should be removed"
+    );
+    assert!(matches!(
+        crate::PgMetadataStore::head_bucket_raw(&*bucket_pg, &bucket)
+            .unwrap()
+            .state,
+        crate::BucketState::Deleting
+    ));
+}
+
+#[test]
 fn begin_bucket_delete_bounds_active_delete_drain_wait() {
     let tmp = test_util::tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];

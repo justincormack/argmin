@@ -53,11 +53,12 @@ const BUCKET_DELETE_RESERVATION_WAIT_BLOCKED_CONTEXT: &str =
 const LIFECYCLE_SWEEP_ROOT_SCAN_LIMIT_PER_PG: usize = 1_024;
 const OBJECT_READ_SNAPSHOT_STALE_RETRY_LIMIT: usize = 16;
 const METADATA_COMMAND_APPLY_RETRY_BUDGET_MILLIS: u64 = 10_000;
+const BUCKET_WRITE_RESERVATION_LEASE_MILLIS: u64 = 15_000;
 // HTTP streaming PutObject heartbeats active sessions every 10s. Keep the
 // durable create reservation only slightly longer than that so abandoned
 // sessions stop blocking DeleteBucket well before common 30s client attempt
 // timeouts, while still allowing one delayed heartbeat under contention.
-const PUT_OBJECT_STREAM_CREATE_LEASE_MILLIS: u64 = 15_000;
+const PUT_OBJECT_STREAM_CREATE_LEASE_MILLIS: u64 = BUCKET_WRITE_RESERVATION_LEASE_MILLIS;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct DurableObjectPayloadReclaimScan {
@@ -2669,7 +2670,7 @@ impl super::StorageCluster {
                 self.operation_epoch(),
                 operation_kind,
                 crate::clock::current_time_millis(),
-                None,
+                self.bucket_write_reservation_lease_deadline(),
                 target_context,
             )?;
         Ok(super::DurableBucketWriteReservation {
@@ -2701,7 +2702,7 @@ impl super::StorageCluster {
                 self.operation_epoch(),
                 operation_kind,
                 crate::clock::current_time_millis(),
-                None,
+                self.bucket_write_reservation_lease_deadline(),
                 target_context,
             )?;
         Ok(super::DurableBucketWriteReservation {
@@ -2732,7 +2733,7 @@ impl super::StorageCluster {
                 self.operation_epoch(),
                 "put-object-stream-create",
                 crate::clock::current_time_millis(),
-                Some(self.put_object_stream_create_lease_deadline()),
+                self.put_object_stream_create_lease_deadline(),
                 Some(key.as_str()),
             )?;
         Ok(super::DurableBucketWriteReservation {
@@ -2744,6 +2745,10 @@ impl super::StorageCluster {
 
     pub(super) fn put_object_stream_create_lease_deadline(&self) -> u64 {
         crate::clock::current_time_millis().saturating_add(PUT_OBJECT_STREAM_CREATE_LEASE_MILLIS)
+    }
+
+    pub(super) fn bucket_write_reservation_lease_deadline(&self) -> u64 {
+        crate::clock::current_time_millis().saturating_add(BUCKET_WRITE_RESERVATION_LEASE_MILLIS)
     }
 
     pub fn heartbeat_put_object_stream_session(
@@ -2761,23 +2766,65 @@ impl super::StorageCluster {
                 reason: "stream session is not a PutObject session".to_string(),
             });
         }
-        let Some(proof) = upload.bucket_write_reservation.as_ref() else {
+        let Some(stored_proof) = upload.bucket_write_reservation.as_ref() else {
             return Err(ObjectPgActionError::InvalidRequest {
                 reason: "PutObject stream session is missing bucket write proof".to_string(),
             });
         };
+        let mut proof = stored_proof.clone();
         let pg_id = PgId::new(self.bucket_metadata_pg_id(&proof.bucket));
         let node = self
             .local_map
             .metadata_pg_primary_node(self.operation_epoch(), pg_id)
             .map_err(ObjectPgActionError::from)?;
-        node.bucket_write_reservation_client()
+        let renewed = node
+            .bucket_write_reservation_client()
             .heartbeat_durable_bucket_write_reservation(
                 pg_id,
-                proof,
+                &proof,
                 self.put_object_stream_create_lease_deadline(),
-            )
-            .map_err(super::bucket_snapshot_error_to_object_pg_action_error)?;
+            );
+        let renewed = match renewed {
+            Ok(record) => record,
+            Err(BucketSnapshotLoadError::Metadata(
+                MetadataError::BucketWriteReservationConflict { .. },
+            )) => {
+                let Some(refreshed) = self
+                    .refresh_stream_upload_bucket_write_reservation_for_object_action(
+                        &upload, &proof,
+                    )?
+                else {
+                    return Err(ObjectPgActionError::Metadata(
+                        MetadataError::BucketWriteReservationConflict {
+                            reservation_id: proof.reservation_id.clone(),
+                        },
+                    ));
+                };
+                proof = refreshed;
+                node.bucket_write_reservation_client()
+                    .heartbeat_durable_bucket_write_reservation(
+                        pg_id,
+                        &proof,
+                        self.put_object_stream_create_lease_deadline(),
+                    )
+                    .map_err(super::bucket_snapshot_error_to_object_pg_action_error)?
+            }
+            Err(error) => {
+                return Err(super::bucket_snapshot_error_to_object_pg_action_error(
+                    error,
+                ))
+            }
+        };
+        let renewed_proof = BucketWriteReservationProof::from(&renewed);
+        self.object_mutation_metadata_primary_client(bucket, key)?
+            .update_stream_upload_bucket_write_reservation(
+                object_pg_id,
+                bucket,
+                key,
+                session_id,
+                &proof,
+                &renewed_proof,
+            )?;
         Ok(())
     }
 
@@ -3261,6 +3308,41 @@ impl super::StorageCluster {
                 .bucket_write_reservation_client()
                 .durable_bucket_write_reservations(PgId::new(pg_id), bucket)
                 .map_err(bucket_snapshot_error_to_bucket_write_drain_error)?;
+            let now = crate::clock::current_time_millis();
+            let expired: Vec<_> = reservations
+                .iter()
+                .filter(|reservation| reservation.lease_deadline <= now)
+                .cloned()
+                .collect();
+            if !expired.is_empty() {
+                for reservation in expired {
+                    match node
+                        .bucket_write_reservation_client()
+                        .release_durable_bucket_write_reservation(PgId::new(pg_id), &reservation)
+                    {
+                        Ok(()) => {
+                            let _ = observability::event(
+                                super::TRACE_TARGET,
+                                "bucket_write_expired_reservation_release",
+                                Some(format_args!(
+                                    "bucket={:?} pg_id={} reservation_id={} operation_kind={}",
+                                    bucket,
+                                    pg_id,
+                                    reservation.reservation_id,
+                                    reservation.operation_kind
+                                )),
+                            );
+                        }
+                        Err(BucketSnapshotLoadError::Metadata(
+                            MetadataError::BucketWriteReservationNotFound { .. },
+                        )) => {}
+                        Err(error) => {
+                            return Err(bucket_snapshot_error_to_bucket_write_drain_error(error));
+                        }
+                    }
+                }
+                continue;
+            }
             if reservations.is_empty() {
                 return Ok(());
             }
@@ -3345,10 +3427,10 @@ impl super::StorageCluster {
         let first = reservations
             .first()
             .expect("reservation-wait blocker detail requires at least one reservation");
-        let first_lease_state = match first.lease_deadline {
-            Some(deadline) if deadline <= now => "expired",
-            Some(_) => "live",
-            None => "none",
+        let first_lease_state = if first.lease_deadline <= now {
+            "expired"
+        } else {
+            "live"
         };
         format!(
             "reservation wait {reason}: reservations={} first_reservation_id={} first_operation_kind={} first_target_context={:?} first_lease_state={}",
@@ -3381,9 +3463,94 @@ impl super::StorageCluster {
             )) => Ok(false),
             Err(BucketSnapshotLoadError::Metadata(
                 MetadataError::BucketWriteReservationConflict { .. },
-            )) => Ok(false),
+            )) => self.refresh_stream_upload_bucket_write_reservation(upload, proof),
             Err(error) => Err(bucket_snapshot_error_to_bucket_write_drain_error(error)),
         }
+    }
+
+    fn refresh_stream_upload_bucket_write_reservation(
+        &self,
+        upload: &StreamUploadRecord,
+        proof: &BucketWriteReservationProof,
+    ) -> Result<bool, BucketWriteDrainError> {
+        let pg_id = PgId::new(self.bucket_metadata_pg_id(&proof.bucket));
+        let node = self
+            .local_map
+            .metadata_pg_primary_node(self.operation_epoch(), pg_id)?;
+        let now = crate::clock::current_time_millis();
+        let reservations = node
+            .bucket_write_reservation_client()
+            .durable_bucket_write_reservations(pg_id, &proof.bucket)
+            .map_err(bucket_snapshot_error_to_bucket_write_drain_error)?;
+        let Some(current) = reservations.into_iter().find(|record| {
+            Self::bucket_write_reservation_stable_identity_matches(proof, record)
+                && record.lease_deadline > now
+        }) else {
+            return Ok(false);
+        };
+        let renewed = BucketWriteReservationProof::from(&current);
+        self.object_mutation_metadata_primary_client(&upload.bucket, &upload.key)
+            .map_err(BucketWriteDrainError::Store)?
+            .update_stream_upload_bucket_write_reservation(
+                PgId::new(self.object_metadata_pg_id(&upload.bucket, &upload.key)),
+                &upload.bucket,
+                &upload.key,
+                &upload.session_id,
+                proof,
+                &renewed,
+            )
+            .map_err(super::object_pg_action_error_to_bucket_snapshot_error)
+            .map_err(bucket_snapshot_error_to_bucket_write_drain_error)?;
+        Ok(true)
+    }
+
+    fn refresh_stream_upload_bucket_write_reservation_for_object_action(
+        &self,
+        upload: &StreamUploadRecord,
+        proof: &BucketWriteReservationProof,
+    ) -> Result<Option<BucketWriteReservationProof>, ObjectPgActionError> {
+        let pg_id = PgId::new(self.bucket_metadata_pg_id(&proof.bucket));
+        let node = self
+            .local_map
+            .metadata_pg_primary_node(self.operation_epoch(), pg_id)
+            .map_err(ObjectPgActionError::from)?;
+        let now = crate::clock::current_time_millis();
+        let reservations = node
+            .bucket_write_reservation_client()
+            .durable_bucket_write_reservations(pg_id, &proof.bucket)
+            .map_err(super::bucket_snapshot_error_to_object_pg_action_error)?;
+        let Some(current) = reservations.into_iter().find(|record| {
+            Self::bucket_write_reservation_stable_identity_matches(proof, record)
+                && record.lease_deadline > now
+        }) else {
+            return Ok(None);
+        };
+        let renewed = BucketWriteReservationProof::from(&current);
+        self.object_mutation_metadata_primary_client(&upload.bucket, &upload.key)?
+            .update_stream_upload_bucket_write_reservation(
+                PgId::new(self.object_metadata_pg_id(&upload.bucket, &upload.key)),
+                &upload.bucket,
+                &upload.key,
+                &upload.session_id,
+                proof,
+                &renewed,
+            )?;
+        Ok(Some(renewed))
+    }
+
+    fn bucket_write_reservation_stable_identity_matches(
+        proof: &BucketWriteReservationProof,
+        record: &BucketWriteReservationRecord,
+    ) -> bool {
+        proof.bucket == record.bucket
+            && proof.reservation_id == record.reservation_id
+            && proof.owner_token == record.owner_token
+            && proof.cluster_epoch == record.cluster_epoch
+            && proof.bucket_execution_generation == record.bucket_execution_generation
+            && proof.bucket_incarnation_generation == record.bucket_incarnation_generation
+            && proof.operation_kind == record.operation_kind
+            && proof.created_at == record.created_at
+            && proof.target_context == record.target_context
     }
 
     fn active_put_object_stream_upload_source(

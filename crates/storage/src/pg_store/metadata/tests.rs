@@ -137,7 +137,7 @@ fn test_bucket_write_reservation_proof(
         bucket_incarnation_generation: 1,
         operation_kind: operation_kind.to_string(),
         created_at: 1,
-        lease_deadline: Some(2),
+        lease_deadline: 2,
         target_context: Some(key.as_str().to_string()),
     }
 }
@@ -2052,7 +2052,7 @@ fn metadata_txn_commit_failure_recovers_representative_mutators() {
                 ClusterEpoch::INITIAL,
                 "test",
                 10,
-                Some(100),
+                100,
                 None,
             )
             .unwrap();
@@ -2073,6 +2073,7 @@ fn metadata_txn_commit_failure_recovers_representative_mutators() {
                 reservation.cluster_epoch,
                 reservation.bucket_execution_generation,
                 reservation.bucket_incarnation_generation,
+                reservation.lease_deadline,
             )
         },
     );
@@ -4920,7 +4921,7 @@ fn pending_metadata_command_slot_rejects_huge_repeated_count_before_allocation()
         bucket_incarnation_generation: 1,
         operation_kind: "direct-put-commit".to_string(),
         created_at: 1,
-        lease_deadline: Some(2),
+        lease_deadline: 2,
         target_context: Some(key.as_str().to_string()),
     };
     let command = MetadataCommandEnvelope::new(
@@ -5014,7 +5015,7 @@ fn pending_metadata_command_slot_rejects_proofless_create_multipart_upload() {
         bucket_incarnation_generation: 1,
         operation_kind: "create-multipart-upload".to_string(),
         created_at: 2,
-        lease_deadline: None,
+        lease_deadline: 3,
         target_context: Some(key.as_str().to_string()),
     };
     let command = MetadataCommandEnvelope::new(
@@ -6128,7 +6129,7 @@ fn abort_multipart_command_accepts_lagging_stream_allocator_floor() {
         bucket_incarnation_generation: 1,
         operation_kind: "abort-multipart-upload".to_string(),
         created_at: 456,
-        lease_deadline: None,
+        lease_deadline: 789,
         target_context: Some(upload.key.as_str().to_string()),
     };
     let command = AbortMultipartUploadCommand {
@@ -6574,7 +6575,7 @@ fn durable_bucket_write_coordination_does_not_dirty_metadata_command_state() {
             ClusterEpoch::INITIAL,
             "put-object",
             1,
-            Some(2),
+            2,
             Some("key=a"),
         )
         .unwrap();
@@ -6594,6 +6595,7 @@ fn durable_bucket_write_coordination_does_not_dirty_metadata_command_state() {
             ClusterEpoch::INITIAL,
             reservation.bucket_execution_generation,
             reservation.bucket_incarnation_generation,
+            reservation.lease_deadline,
         )
         .unwrap();
     assert_eq!(
@@ -6988,7 +6990,7 @@ fn already_applied_direct_put_command_cleans_terminal_staging_on_apply() {
                 bucket_incarnation_generation: 1,
                 operation_kind: "direct-put-commit".to_string(),
                 created_at: 1,
-                lease_deadline: Some(2),
+                lease_deadline: 2,
                 target_context: Some(key.as_str().to_string()),
             },
             stream_create_bucket_write_reservation: None,
@@ -7227,7 +7229,7 @@ fn direct_put_terminal_cleanup_command_with_write_sequence(
                 bucket_incarnation_generation: 1,
                 operation_kind: "direct-put-commit".to_string(),
                 created_at: 1,
-                lease_deadline: Some(2),
+                lease_deadline: 2,
                 target_context: Some(key.as_str().to_string()),
             },
             stream_create_bucket_write_reservation: None,

@@ -102,9 +102,11 @@ use crate::storage_rpc::{
     decode_shard_read_request, decode_shard_write_request,
     decode_stream_part_commit_command_build_request, decode_stream_part_finalize_snapshot_request,
     decode_stream_put_commit_command_build_request, decode_stream_put_finalize_snapshot_request,
-    decode_stream_segment_append_prepare_request, decode_stream_upload_match_request,
-    decode_stream_upload_session_request, decode_stream_uploads_list_request,
-    decode_stream_uploads_pg_list_request, encode_abort_multipart_cleanup_response,
+    decode_stream_segment_append_prepare_request,
+    decode_stream_upload_bucket_write_reservation_update_request,
+    decode_stream_upload_match_request, decode_stream_upload_session_request,
+    decode_stream_uploads_list_request, decode_stream_uploads_pg_list_request,
+    encode_abort_multipart_cleanup_response,
     encode_bucket_delete_attempt_outcome_optional_record_response,
     encode_bucket_delete_begin_roots_response,
     encode_bucket_delete_finalize_claim_optional_record_response,
@@ -282,7 +284,8 @@ use crate::storage_rpc::{
     StorageRpcStreamPartFinalizeSnapshotResponse, StorageRpcStreamPutCommitCommandBuildRequest,
     StorageRpcStreamPutFinalizeSnapshotRequest, StorageRpcStreamPutFinalizeSnapshotResponse,
     StorageRpcStreamSegmentAppendPrepareOutcome, StorageRpcStreamSegmentAppendPrepareRequest,
-    StorageRpcStreamSegmentAppendPrepareResponse, StorageRpcStreamUploadMatchRequest,
+    StorageRpcStreamSegmentAppendPrepareResponse,
+    StorageRpcStreamUploadBucketWriteReservationUpdateRequest, StorageRpcStreamUploadMatchRequest,
     StorageRpcStreamUploadMatchResponse, StorageRpcStreamUploadSegmentsOutcome,
     StorageRpcStreamUploadSegmentsResponse, StorageRpcStreamUploadSessionOutcome,
     StorageRpcStreamUploadSessionRequest, StorageRpcStreamUploadSessionResponse,
@@ -2674,6 +2677,17 @@ impl StorageNodeConnectionHandler {
             StorageRpcMessageKind::ObjectStreamUploadSessionLoad => {
                 match decode_stream_upload_session_request(&frame.payload) {
                     Ok(request) => self.stream_upload_session_response(request),
+                    Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
+                        code: StorageRpcErrorCode::PayloadDecode,
+                        message: error.to_string(),
+                    }),
+                }
+            }
+            StorageRpcMessageKind::ObjectStreamUploadBucketWriteReservationUpdate => {
+                match decode_stream_upload_bucket_write_reservation_update_request(&frame.payload) {
+                    Ok(request) => {
+                        self.stream_upload_bucket_write_reservation_update_response(request)
+                    }
                     Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
                         code: StorageRpcErrorCode::PayloadDecode,
                         message: error.to_string(),
@@ -5320,6 +5334,40 @@ impl StorageNodeConnectionHandler {
                 outcome,
             });
         Ok(encode_storage_rpc_success_response(&payload))
+    }
+
+    fn stream_upload_bucket_write_reservation_update_response(
+        &self,
+        request: StorageRpcStreamUploadBucketWriteReservationUpdateRequest,
+    ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
+        if let Err(error) = self.validate_pg_route(
+            request.object.node_id,
+            request.object.cluster_epoch,
+            request.object.pg_id,
+        ) {
+            return encode_storage_rpc_error_response(&error);
+        }
+        if let Err(error) = self.validate_primary_pg_for_object(
+            request.object.pg_id,
+            &request.object.bucket,
+            &request.object.key,
+            "stream upload bucket write reservation update",
+        ) {
+            return encode_storage_rpc_error_response(&error);
+        }
+        let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
+        match ObjectMutationMetadataNodeClient::update_stream_upload_bucket_write_reservation(
+            &local_client,
+            request.object.pg_id,
+            &request.object.bucket,
+            &request.object.key,
+            &request.session_id,
+            &request.current,
+            &request.renewed,
+        ) {
+            Ok(()) => Ok(encode_storage_rpc_success_response(&[])),
+            Err(error) => encode_storage_rpc_error_response(&object_pg_error_response(error)),
+        }
     }
 
     fn stream_upload_segments_response(
@@ -11723,7 +11771,7 @@ mod tests {
                 config.cluster_epoch,
                 "put-object",
                 10,
-                Some(20),
+                20,
                 Some("key=a"),
             )
             .unwrap();
@@ -13346,7 +13394,7 @@ mod tests {
             bucket_incarnation_generation: 1,
             operation_kind: "storage-node-rpc-test".to_string(),
             created_at: 1,
-            lease_deadline: None,
+            lease_deadline: 20,
             target_context: Some(key.as_str().to_string()),
         }
     }

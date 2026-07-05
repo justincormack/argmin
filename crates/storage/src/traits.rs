@@ -36,7 +36,9 @@ pub(crate) struct DurableBucketWriteReservationHeartbeat<'a> {
     pub cluster_epoch: ClusterEpoch,
     pub bucket_execution_generation: u64,
     pub bucket_incarnation_generation: u64,
+    pub current_lease_deadline: u64,
     pub lease_deadline: u64,
+    pub now: u64,
 }
 
 /// Per-PG object metadata store.
@@ -97,7 +99,7 @@ pub(crate) trait PgMetadataStore {
         cluster_epoch: ClusterEpoch,
         operation_kind: &str,
         created_at: u64,
-        lease_deadline: Option<u64>,
+        lease_deadline: u64,
         target_context: Option<&str>,
     ) -> Result<BucketWriteReservationRecord, MetadataError>;
 
@@ -133,6 +135,7 @@ pub(crate) trait PgMetadataStore {
         cluster_epoch: ClusterEpoch,
         bucket_execution_generation: u64,
         bucket_incarnation_generation: u64,
+        lease_deadline: u64,
     ) -> Result<(), MetadataError>;
 
     /// Release a metadata-command bucket write proof.
@@ -149,6 +152,7 @@ pub(crate) trait PgMetadataStore {
         cluster_epoch: ClusterEpoch,
         bucket_execution_generation: u64,
         bucket_incarnation_generation: u64,
+        lease_deadline: u64,
     ) -> Result<(), MetadataError>;
 
     /// Begin a durable bucket write drain for one bucket incarnation.
@@ -870,6 +874,15 @@ pub(crate) trait PgMetadataStore {
         &self,
         session_id: &SessionId,
     ) -> Result<StreamUploadRecord, MetadataError>;
+
+    /// Update the stored bucket-write proof for a live stream session after
+    /// its durable reservation lease has been renewed.
+    fn update_stream_upload_bucket_write_reservation(
+        &self,
+        session_id: &SessionId,
+        current: &crate::BucketWriteReservationProof,
+        renewed: &crate::BucketWriteReservationProof,
+    ) -> Result<(), MetadataError>;
 
     /// Allocate a durable, per-session stream segment payload generation.
     fn allocate_stream_segment_vid(

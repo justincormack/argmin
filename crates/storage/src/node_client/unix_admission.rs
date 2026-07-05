@@ -544,6 +544,7 @@ pub(crate) fn storage_rpc_admission_class(
         | StorageRpcMessageKind::ObjectMultipartCompletionSnapshotLoad
         | StorageRpcMessageKind::ObjectMultipartCompletionPreflightLoad
         | StorageRpcMessageKind::ObjectCompletedMultipartUploadsList
+        | StorageRpcMessageKind::ObjectStreamUploadBucketWriteReservationUpdate
         | StorageRpcMessageKind::BucketWriteDrainBegin
         | StorageRpcMessageKind::BucketWriteDrainClear
         | StorageRpcMessageKind::BucketWriteDrainClearExpired

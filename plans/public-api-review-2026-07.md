@@ -150,23 +150,28 @@ steps it performs.
 
 ## Bugs — storage
 
-- [ ] **S1. Bucket write reservations acquired with `lease_deadline: None`
-  are immortal and permanently wedge DeleteBucket.** The general acquire paths
-  pass `None` (`crates/storage/src/cluster/request_ops.rs:2642-2683`, also
-  2550/2602); only stream-create passes `Some` (request_ops.rs:2713).
-  Validation only expires a reservation `if lease_deadline.is_some_and(...)`
-  (`node_client/local.rs:1798-1806`). There is no reaper for reservation rows
+- [x] **S1. Fixed: bucket write reservations acquired with `lease_deadline: None`
+  were immortal and could permanently wedge DeleteBucket.** The old general
+  acquire paths passed `None` (`crates/storage/src/cluster/request_ops.rs:2642-2683`,
+  also 2550/2602); only stream-create passed `Some` (request_ops.rs:2713).
+  Validation only expired a reservation `if lease_deadline.is_some_and(...)`
+  (`node_client/local.rs:1798-1806`). There was no reaper for reservation rows
   (contrast `clear_expired_durable_bucket_write_drain`,
   `pg_store/metadata.rs:5828-5919`) and no startup/recovery cleanup.
   `DurableBucketWriteReservation` has no `Drop` releasing the row. DeleteBucket
-  waits for the reservation list to empty
-  (`request_ops.rs:3224-3299`); an orphaned `None`-lease row (crash or panic
-  unwind between acquire and release) makes every DeleteBucket for that bucket
-  fail forever. Contradicts `guides/bucket-write-drain.md` ("Each reservation
-  must include ... lease deadline"; "Release, reap, and apply-time
-  validation"). Fix: make `lease_deadline: u64` required through all four
-  layers (`traits.rs:96-107`, node_client layers, `pg_store/metadata.rs:5372`)
-  and/or add a reaper analogous to the drain one.
+  waited for the reservation list to empty (`request_ops.rs:3224-3299`); an
+  orphaned `None`-lease row (crash or panic unwind between acquire and release)
+  made every DeleteBucket for that bucket fail forever. This contradicted
+  `guides/bucket-write-drain.md` ("Each reservation must include ... lease
+  deadline"; "Release, reap, and apply-time validation").
+
+  Resolution: bucket write reservation records and proofs now carry a required
+  `lease_deadline: u64`, the SQLite schema rejects `NULL` deadlines for
+  `bucket_write_reservations`, the local/Unix/RPC acquire paths require a
+  concrete deadline, proof matching includes the deadline, and DeleteBucket
+  reservation wait releases exact expired reservation rows before deciding the
+  bucket is blocked. Added a local-cluster regression covering an unreleased
+  expired durable reservation being reaped during DeleteBucket.
 
 - [x] **S2. Invalid: new `buckets` column added without a migration.** This
   finding assumed pre-alpha stores are upgraded in place. They are not:

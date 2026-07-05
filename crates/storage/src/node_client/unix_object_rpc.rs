@@ -265,7 +265,7 @@ fn unix_storage_node_acquire_durable_bucket_write_reservation_with_admission_cla
     cluster_epoch: ClusterEpoch,
     operation_kind: &str,
     created_at: u64,
-    lease_deadline: Option<u64>,
+    lease_deadline: u64,
     target_context: Option<&str>,
     class: UnixStorageNodeRpcAdmissionClass,
 ) -> Result<BucketWriteReservationRecord, BucketSnapshotLoadError> {
@@ -469,7 +469,7 @@ impl BucketWriteReservationNodeClient for UnixStorageNodeClient {
         cluster_epoch: ClusterEpoch,
         operation_kind: &str,
         created_at: u64,
-        lease_deadline: Option<u64>,
+        lease_deadline: u64,
         target_context: Option<&str>,
     ) -> Result<BucketWriteReservationRecord, BucketSnapshotLoadError> {
         unix_storage_node_acquire_durable_bucket_write_reservation_with_admission_class(
@@ -496,7 +496,7 @@ impl BucketWriteReservationNodeClient for UnixStorageNodeClient {
         cluster_epoch: ClusterEpoch,
         operation_kind: &str,
         created_at: u64,
-        lease_deadline: Option<u64>,
+        lease_deadline: u64,
         target_context: Option<&str>,
     ) -> Result<BucketWriteReservationRecord, BucketSnapshotLoadError> {
         unix_storage_node_acquire_durable_bucket_write_reservation_with_admission_class(
@@ -585,7 +585,9 @@ impl BucketWriteReservationNodeClient for UnixStorageNodeClient {
                 )));
             }
         };
-        if !proof.matches_record(&record) || record.lease_deadline != Some(lease_deadline) {
+        let mut previous_identity = record.clone();
+        previous_identity.lease_deadline = proof.lease_deadline;
+        if !proof.matches_record(&previous_identity) || record.lease_deadline != lease_deadline {
             return Err(BucketSnapshotLoadError::Store(self.rpc_payload_error(
                 "validate bucket write reservation heartbeat response",
                 "heartbeat response identity does not match request".to_string(),
@@ -2802,6 +2804,38 @@ impl ObjectMutationMetadataNodeClient for UnixStorageNodeClient {
             session_id,
         )?;
         Ok(response.snapshot)
+    }
+
+    fn update_stream_upload_bucket_write_reservation(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        session_id: &SessionId,
+        current: &BucketWriteReservationProof,
+        renewed: &BucketWriteReservationProof,
+    ) -> Result<(), ObjectPgActionError> {
+        let request = StorageRpcStreamUploadBucketWriteReservationUpdateRequest {
+            object: self.object_request(pg_id, bucket, key),
+            session_id: session_id.clone(),
+            current: current.clone(),
+            renewed: renewed.clone(),
+        };
+        let payload = encode_stream_upload_bucket_write_reservation_update_request(&request);
+        let response = self
+            .rpc_request(
+                StorageRpcMessageKind::ObjectStreamUploadBucketWriteReservationUpdate,
+                payload,
+            )
+            .map_err(ObjectPgActionError::Store)?;
+        self.validate_empty_bucket_write_reservation_response(
+            "decode stream upload bucket write reservation update response",
+            &response,
+        )
+        .map_err(|error| match error {
+            BucketSnapshotLoadError::Store(error) => ObjectPgActionError::Store(error),
+            BucketSnapshotLoadError::Metadata(error) => ObjectPgActionError::Metadata(error),
+        })
     }
 
     fn build_stream_put_commit_command(

@@ -8203,7 +8203,7 @@ fn durable_bucket_write_reservation_requires_exact_identity() {
             ClusterEpoch::INITIAL,
             "put-object",
             10,
-            Some(20),
+            20,
             Some("key=a"),
         )
         .unwrap();
@@ -8213,7 +8213,7 @@ fn durable_bucket_write_reservation_requires_exact_identity() {
     assert_eq!(reservation.cluster_epoch, ClusterEpoch::INITIAL);
     assert_eq!(reservation.operation_kind, "put-object");
     assert_eq!(reservation.created_at, 10);
-    assert_eq!(reservation.lease_deadline, Some(20));
+    assert_eq!(reservation.lease_deadline, 20);
     assert_eq!(reservation.target_context.as_deref(), Some("key=a"));
 
     let duplicate = store
@@ -8224,7 +8224,7 @@ fn durable_bucket_write_reservation_requires_exact_identity() {
             ClusterEpoch::INITIAL,
             "put-object",
             10,
-            Some(20),
+            20,
             Some("key=a"),
         )
         .unwrap();
@@ -8238,7 +8238,7 @@ fn durable_bucket_write_reservation_requires_exact_identity() {
             ClusterEpoch::INITIAL,
             "put-object",
             10,
-            Some(20),
+            20,
             Some("key=a"),
         )
         .unwrap_err();
@@ -8255,6 +8255,7 @@ fn durable_bucket_write_reservation_requires_exact_identity() {
             ClusterEpoch::INITIAL,
             reservation.bucket_execution_generation,
             reservation.bucket_incarnation_generation,
+            reservation.lease_deadline,
         )
         .unwrap_err();
     assert!(matches!(
@@ -8277,12 +8278,138 @@ fn durable_bucket_write_reservation_requires_exact_identity() {
             ClusterEpoch::INITIAL,
             reservation.bucket_execution_generation,
             reservation.bucket_incarnation_generation,
+            reservation.lease_deadline,
         )
         .unwrap();
     assert!(store
         .durable_bucket_write_reservation(&bucket, "reservation-1")
         .unwrap()
         .is_none());
+}
+
+#[test]
+fn durable_bucket_write_reservation_release_requires_current_lease_deadline() {
+    let (_dir, store) = make_pg_store();
+    let bucket = bucket_name("mybucket");
+    store
+        .create_bucket(
+            &bucket,
+            "owner",
+            &CanonicalUserId::from_principal("owner"),
+            &AclGrants::default(),
+            false,
+            false,
+        )
+        .unwrap();
+
+    let reservation = store
+        .acquire_durable_bucket_write_reservation(
+            &bucket,
+            "reservation-1",
+            "owner-token-1",
+            ClusterEpoch::INITIAL,
+            "put-object",
+            10,
+            20,
+            Some("key=a"),
+        )
+        .unwrap();
+    let renewed = store
+        .heartbeat_durable_bucket_write_reservation(
+            crate::traits::DurableBucketWriteReservationHeartbeat {
+                name: &bucket,
+                reservation_id: &reservation.reservation_id,
+                owner_token: &reservation.owner_token,
+                cluster_epoch: reservation.cluster_epoch,
+                bucket_execution_generation: reservation.bucket_execution_generation,
+                bucket_incarnation_generation: reservation.bucket_incarnation_generation,
+                current_lease_deadline: reservation.lease_deadline,
+                lease_deadline: 40,
+                now: 19,
+            },
+        )
+        .unwrap();
+    assert_eq!(renewed.lease_deadline, 40);
+
+    let stale_release = store
+        .release_durable_bucket_write_reservation(
+            &bucket,
+            &reservation.reservation_id,
+            &reservation.owner_token,
+            reservation.cluster_epoch,
+            reservation.bucket_execution_generation,
+            reservation.bucket_incarnation_generation,
+            reservation.lease_deadline,
+        )
+        .unwrap_err();
+    assert!(matches!(
+        stale_release,
+        crate::error::MetadataError::BucketWriteReservationNotFound { .. }
+    ));
+    assert_eq!(
+        store
+            .durable_bucket_write_reservation(&bucket, &reservation.reservation_id)
+            .unwrap()
+            .unwrap()
+            .lease_deadline,
+        renewed.lease_deadline
+    );
+}
+
+#[test]
+fn durable_bucket_write_reservation_heartbeat_rejects_expired_current_lease() {
+    let (_dir, store) = make_pg_store();
+    let bucket = bucket_name("mybucket");
+    store
+        .create_bucket(
+            &bucket,
+            "owner",
+            &CanonicalUserId::from_principal("owner"),
+            &AclGrants::default(),
+            false,
+            false,
+        )
+        .unwrap();
+
+    let reservation = store
+        .acquire_durable_bucket_write_reservation(
+            &bucket,
+            "reservation-1",
+            "owner-token-1",
+            ClusterEpoch::INITIAL,
+            "put-object",
+            10,
+            20,
+            Some("key=a"),
+        )
+        .unwrap();
+    let heartbeat = store
+        .heartbeat_durable_bucket_write_reservation(
+            crate::traits::DurableBucketWriteReservationHeartbeat {
+                name: &bucket,
+                reservation_id: &reservation.reservation_id,
+                owner_token: &reservation.owner_token,
+                cluster_epoch: reservation.cluster_epoch,
+                bucket_execution_generation: reservation.bucket_execution_generation,
+                bucket_incarnation_generation: reservation.bucket_incarnation_generation,
+                current_lease_deadline: reservation.lease_deadline,
+                lease_deadline: 40,
+                now: reservation.lease_deadline,
+            },
+        )
+        .unwrap_err();
+    assert!(matches!(
+        heartbeat,
+        crate::error::MetadataError::BucketWriteReservationNotFound { .. }
+    ));
+    assert_eq!(
+        store
+            .durable_bucket_write_reservation(&bucket, &reservation.reservation_id)
+            .unwrap()
+            .unwrap()
+            .lease_deadline,
+        reservation.lease_deadline
+    );
 }
 
 #[test]
@@ -8353,7 +8480,7 @@ fn durable_bucket_write_drain_blocks_reservations_and_requires_exact_identity() 
             ClusterEpoch::INITIAL,
             "put-object",
             50,
-            None,
+            60,
             None,
         )
         .unwrap_err();
@@ -8399,7 +8526,7 @@ fn durable_bucket_write_drain_blocks_reservations_and_requires_exact_identity() 
             ClusterEpoch::INITIAL,
             "put-object",
             50,
-            None,
+            60,
             None,
         )
         .unwrap();

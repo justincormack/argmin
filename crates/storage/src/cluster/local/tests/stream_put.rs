@@ -1154,6 +1154,202 @@ fn old_empty_put_object_stream_with_live_proof_blocks_bucket_delete() {
 }
 
 #[test]
+fn stream_put_heartbeat_updates_persisted_bucket_write_proof() {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let pg_ids = [0, 1, 2, 3];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &pg_ids, ec_shape).unwrap();
+    let topology = map
+        .node(NodeId::new(0))
+        .unwrap()
+        .storage_node()
+        .pg_topology();
+    let bucket = bucket_for_pg(topology, 1, "stream-heartbeat-proof-");
+    let key = key_for_object_pg(topology, &bucket, 2, "object-");
+    set_route_primary(&mut map, 1, NodeId::new(1));
+    set_route_primary(&mut map, 2, NodeId::new(2));
+
+    let map = Arc::new(map);
+    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    create_test_bucket(&cluster, &bucket);
+    let session_id =
+        crate::SessionId::try_from("acacacacacacacacacacacacacacacac".to_string()).unwrap();
+    crate::clock::with_time_override(1_000, || {
+        cluster
+            .create_put_object_stream_session_record(
+                &bucket,
+                &key,
+                &session_id,
+                crate::ObjectEncryption::None,
+            )
+            .unwrap();
+    });
+
+    let object_pg = || {
+        map.metadata_pg_primary_node(ClusterEpoch::INITIAL, PgId::new(2))
+            .unwrap()
+            .storage_node()
+            .get_pg(2)
+            .unwrap()
+    };
+    let initial_proof = crate::PgMetadataStore::get_stream_upload(&*object_pg(), &session_id)
+        .unwrap()
+        .bucket_write_reservation
+        .expect("stream session should carry initial bucket write proof");
+    let original_command = crate::metadata_command::CreateStreamUploadCommand {
+        session: crate::StreamUploadCommandRecord {
+            session_id: session_id.clone(),
+            bucket: bucket.clone(),
+            key: key.clone(),
+            target: crate::StreamUploadTarget::PutObject,
+            state: crate::StreamUploadState::InProgress,
+            created_at: 1_000,
+            encryption: crate::ObjectEncryption::None,
+        },
+        initial_next_segment_vid: crate::GenerationId::MIN,
+        bucket_write_reservation: initial_proof.clone(),
+    };
+
+    crate::clock::with_time_override(5_000, || {
+        cluster
+            .heartbeat_put_object_stream_session(&bucket, &key, &session_id)
+            .unwrap();
+    });
+    let first_renewed = crate::PgMetadataStore::get_stream_upload(&*object_pg(), &session_id)
+        .unwrap()
+        .bucket_write_reservation
+        .expect("heartbeat should preserve bucket write proof");
+    assert!(
+        first_renewed.lease_deadline > initial_proof.lease_deadline,
+        "stream row proof deadline should advance with durable reservation heartbeat"
+    );
+
+    crate::clock::with_time_override(6_000, || {
+        cluster
+            .heartbeat_put_object_stream_session(&bucket, &key, &session_id)
+            .unwrap();
+    });
+    let second_renewed = crate::PgMetadataStore::get_stream_upload(&*object_pg(), &session_id)
+        .unwrap()
+        .bucket_write_reservation
+        .expect("second heartbeat should preserve bucket write proof");
+    assert!(
+        second_renewed.lease_deadline > first_renewed.lease_deadline,
+        "subsequent heartbeat should use the renewed stream row proof"
+    );
+    let create = crate::CreateStreamUploadReq {
+        session_id: session_id.clone(),
+        bucket: bucket.clone(),
+        key: key.clone(),
+        target: crate::StreamUploadTarget::PutObject,
+        encryption: crate::ObjectEncryption::None,
+    };
+    assert!(
+        cluster
+            .object_mutation_metadata_primary_client(&bucket, &key)
+            .unwrap()
+            .matching_stream_upload_exists(PgId::new(2), &create, Some(&original_command),)
+            .unwrap(),
+        "stream create idempotency should ignore the mutable proof lease deadline"
+    );
+}
+
+#[test]
+fn bucket_delete_refreshes_stale_stream_proof_for_live_heartbeated_reservation() {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let pg_ids = [0, 1, 2, 3];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &pg_ids, ec_shape).unwrap();
+    let topology = map
+        .node(NodeId::new(0))
+        .unwrap()
+        .storage_node()
+        .pg_topology();
+    let bucket = bucket_for_pg(topology, 1, "stale-live-stream-delete-");
+    let key = key_for_object_pg(topology, &bucket, 2, "object-");
+    set_route_primary(&mut map, 1, NodeId::new(1));
+    set_route_primary(&mut map, 2, NodeId::new(2));
+
+    let map = Arc::new(map);
+    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    create_test_bucket(&cluster, &bucket);
+    let session_id =
+        crate::SessionId::try_from("adadadadadadadadadadadadadadadad".to_string()).unwrap();
+    crate::clock::with_time_override(1_000, || {
+        cluster
+            .create_put_object_stream_session_record(
+                &bucket,
+                &key,
+                &session_id,
+                crate::ObjectEncryption::None,
+            )
+            .unwrap();
+    });
+
+    let object_pg = map
+        .metadata_pg_primary_node(ClusterEpoch::INITIAL, PgId::new(2))
+        .unwrap()
+        .storage_node()
+        .get_pg(2)
+        .unwrap();
+    let stale_proof = crate::PgMetadataStore::get_stream_upload(&*object_pg, &session_id)
+        .unwrap()
+        .bucket_write_reservation
+        .expect("stream session should carry initial bucket write proof");
+    drop(object_pg);
+
+    let bucket_pg = map
+        .metadata_pg_primary_node(ClusterEpoch::INITIAL, PgId::new(1))
+        .unwrap()
+        .storage_node()
+        .get_pg(1)
+        .unwrap();
+    let renewed = crate::PgMetadataStore::heartbeat_durable_bucket_write_reservation(
+        &*bucket_pg,
+        crate::traits::DurableBucketWriteReservationHeartbeat {
+            name: &bucket,
+            reservation_id: &stale_proof.reservation_id,
+            owner_token: &stale_proof.owner_token,
+            cluster_epoch: stale_proof.cluster_epoch,
+            bucket_execution_generation: stale_proof.bucket_execution_generation,
+            bucket_incarnation_generation: stale_proof.bucket_incarnation_generation,
+            current_lease_deadline: stale_proof.lease_deadline,
+            lease_deadline: 30_000,
+            now: 2_000,
+        },
+    )
+    .unwrap();
+    drop(bucket_pg);
+
+    crate::clock::with_time_override(5_000, || {
+        let err = cluster
+            .test_begin_bucket_delete_if_current(&bucket)
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                crate::BucketWriteDrainError::Metadata(crate::MetadataError::BucketNotEmpty)
+            ),
+            "DeleteBucket must treat stale stream proof with live renewed reservation as a blocker: {err:?}"
+        );
+    });
+
+    let object_pg = map
+        .metadata_pg_primary_node(ClusterEpoch::INITIAL, PgId::new(2))
+        .unwrap()
+        .storage_node()
+        .get_pg(2)
+        .unwrap();
+    let refreshed = crate::PgMetadataStore::get_stream_upload(&*object_pg, &session_id)
+        .unwrap()
+        .bucket_write_reservation
+        .expect("DeleteBucket live check should refresh stream proof");
+    assert_eq!(refreshed.lease_deadline, renewed.lease_deadline);
+}
+
+#[test]
 fn expired_put_object_stream_proof_allows_bucket_delete_cleanup() {
     let tmp = test_util::tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
@@ -1528,6 +1724,7 @@ fn bucket_delete_treats_conflicting_stream_reservation_proof_as_abandoned() {
         proof.cluster_epoch,
         proof.bucket_execution_generation,
         proof.bucket_incarnation_generation,
+        proof.lease_deadline,
     )
     .unwrap();
     let mismatched_record = crate::PgMetadataStore::acquire_durable_bucket_write_reservation(
@@ -1570,6 +1767,7 @@ fn bucket_delete_treats_conflicting_stream_reservation_proof_as_abandoned() {
                     hook_record.cluster_epoch,
                     hook_record.bucket_execution_generation,
                     hook_record.bucket_incarnation_generation,
+                    hook_record.lease_deadline,
                 )
                 .unwrap();
             })),

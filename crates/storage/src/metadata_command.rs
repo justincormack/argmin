@@ -935,7 +935,7 @@ pub struct BucketWriteReservationProof {
     pub(crate) bucket_incarnation_generation: u64,
     pub(crate) operation_kind: String,
     pub(crate) created_at: u64,
-    pub(crate) lease_deadline: Option<u64>,
+    pub(crate) lease_deadline: u64,
     pub(crate) target_context: Option<String>,
 }
 
@@ -966,6 +966,7 @@ impl BucketWriteReservationProof {
             && self.bucket_incarnation_generation == record.bucket_incarnation_generation
             && self.operation_kind == record.operation_kind
             && self.created_at == record.created_at
+            && self.lease_deadline == record.lease_deadline
             && self.target_context == record.target_context
     }
 }
@@ -2321,7 +2322,7 @@ impl<'a> MetadataCommandLogEntryDecoder<'a> {
         self.read_u64()?;
         self.skip_str()?;
         self.read_u64()?;
-        self.skip_optional(|decoder| decoder.read_u64().map(|_| ()))?;
+        self.read_u64()?;
         self.skip_optional(Self::skip_str)
     }
 
@@ -2845,7 +2846,7 @@ impl<'a> MetadataCommandLogEntryDecoder<'a> {
             bucket_incarnation_generation: self.read_u64()?,
             operation_kind: self.read_string("bucket write reservation operation kind")?,
             created_at: self.read_u64()?,
-            lease_deadline: self.read_optional_u64_value()?,
+            lease_deadline: self.read_u64()?,
             target_context: self.read_optional_string("bucket write reservation target")?,
         })
     }
@@ -3800,7 +3801,7 @@ fn encode_bucket_write_reservation_proof(out: &mut Vec<u8>, proof: &BucketWriteR
     put_u64(out, proof.bucket_incarnation_generation);
     put_str(out, &proof.operation_kind);
     put_u64(out, proof.created_at);
-    encode_optional_u64(out, proof.lease_deadline);
+    put_u64(out, proof.lease_deadline);
     encode_optional_string(out, proof.target_context.as_deref());
 }
 
@@ -4021,7 +4022,7 @@ mod tests {
             bucket_incarnation_generation: 7,
             operation_kind: "direct-put-commit".to_string(),
             created_at: 10,
-            lease_deadline: Some(20),
+            lease_deadline: 20,
             target_context: Some(key.as_str().to_string()),
         };
         let command = MetadataCommandEnvelope::new(
@@ -4091,7 +4092,7 @@ mod tests {
             bucket_incarnation_generation: 7,
             operation_kind: "put-object-stream-create".to_string(),
             created_at: 10,
-            lease_deadline: Some(20),
+            lease_deadline: 20,
             target_context: Some(key.as_str().to_string()),
         };
         let command = MetadataCommandEnvelope::new(
@@ -4144,7 +4145,7 @@ mod tests {
             bucket_incarnation_generation: 7,
             operation_kind: "complete-multipart-upload".to_string(),
             created_at: 10,
-            lease_deadline: Some(20),
+            lease_deadline: 20,
             target_context: Some(key.as_str().to_string()),
         };
         let parts_count = std::num::NonZeroU32::new(1).unwrap();
@@ -4222,7 +4223,7 @@ mod tests {
             bucket_incarnation_generation: 7,
             operation_kind: "put-object-metadata".to_string(),
             created_at: 10,
-            lease_deadline: Some(20),
+            lease_deadline: 20,
             target_context: Some(key.as_str().to_string()),
         };
         let command = MetadataCommandEnvelope::new(
@@ -4286,7 +4287,7 @@ mod tests {
             bucket_incarnation_generation: 7,
             operation_kind: "delete-object-version".to_string(),
             created_at: 10,
-            lease_deadline: Some(20),
+            lease_deadline: 20,
             target_context: Some(key.as_str().to_string()),
         };
         let command = MetadataCommandEnvelope::new(
@@ -4333,7 +4334,7 @@ mod tests {
             bucket_incarnation_generation: 7,
             operation_kind: "insert-delete-marker".to_string(),
             created_at: 10,
-            lease_deadline: Some(20),
+            lease_deadline: 20,
             target_context: Some(key.as_str().to_string()),
         };
         let command = MetadataCommandEnvelope::new(
@@ -4967,7 +4968,7 @@ mod tests {
             bucket_incarnation_generation: 9,
             operation_kind: "direct-put-commit".to_string(),
             created_at: 444,
-            lease_deadline: Some(555),
+            lease_deadline: 555,
             target_context: Some(key.as_str().to_string()),
         };
         let segment_reclaim_claim = ObjectPayloadReclaimClaimProof {
@@ -5345,31 +5346,31 @@ mod tests {
                 0x5fc3fd9935e6b23a,
                 0x56db6be41cc9a89c,
                 0x3acf49df359790d4,
-                0x5531f7e6bf78ef78,
-                0x9b5a7f09485bffb3,
-                0x7b747bca02519f2a,
-                0x903cf2da427ff645,
-                0x22e816661cec7274,
-                0xe7353d51b6609ac8,
-                0x58f5eb1a4f60971b,
-                0xef0bd51e556f76ef,
-                0x6ad75e4de92c2dcb,
-                0x70d5502b442bdef6,
-                0x9ce4e01e6a487491,
-                0x0a8d33e1be16239d,
-                0x48fb53d34217c071,
-                0x3ffc0996963172f3,
-                0xc4fe8906783bc00e,
-                0xf608eb73f9631680,
-                0x2d6608601fded1d8,
-                0xe3226a0437ce53d4,
-                0x85aa88f98640917b,
+                0x0cb6bb404ef4656f,
+                0x8bd4d497a7b4d97a,
+                0x9ba51e11e7657215,
+                0xf9892eeff816b2dd,
+                0xf21cb0547df33874,
+                0x0ca679e24ed84eef,
+                0x66acbb29fe56f0b2,
+                0xa05e22c8dd1f61dc,
+                0x1ca0b069a2818373,
+                0xf5f5816be8b7139b,
+                0x60ef674331e12342,
+                0x24db3cbfda0adf5d,
+                0x78ed7de4e9c019bf,
+                0x8357e4c966d0ea8d,
+                0xbb8b5b593db93b48,
+                0x1550723e75021689,
+                0x601d5126589d6456,
+                0xc895b52e824f1f43,
+                0x98b7bdf59d79d117,
                 0x506bcf86cc513234,
                 0xad26c80659b2eba1,
-                0xfda139619dd8392b,
+                0x73f91e66bbbe0007,
                 0x6c3b4b7d0a8ce150,
                 0x48a90205c35a066d,
-                0xba43f79ea2af20cb,
+                0x5cdc2de0c4471422,
                 0x0064ce32b63977cd,
                 0xe90eb2bd8985577a,
                 0xedf2c0cac1495b32,

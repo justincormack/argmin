@@ -2422,7 +2422,7 @@ pub struct BucketWriteReservationRecord {
     pub bucket_incarnation_generation: u64,
     pub operation_kind: String,
     pub created_at: u64,
-    pub lease_deadline: Option<u64>,
+    pub lease_deadline: u64,
     pub target_context: Option<String>,
 }
 

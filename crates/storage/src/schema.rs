@@ -598,7 +598,7 @@ CREATE TABLE IF NOT EXISTS bucket_write_reservations (
     bucket_incarnation_generation INTEGER NOT NULL CHECK (bucket_incarnation_generation >= 0),
     operation_kind   TEXT NOT NULL CHECK (length(operation_kind) BETWEEN 1 AND 64),
     created_at       INTEGER NOT NULL CHECK (created_at >= 0),
-    lease_deadline   INTEGER CHECK (lease_deadline IS NULL OR lease_deadline >= 0),
+    lease_deadline   INTEGER NOT NULL CHECK (lease_deadline >= 0),
     target_context   TEXT,
     PRIMARY KEY (bucket_name, reservation_id),
     FOREIGN KEY (bucket_name) REFERENCES buckets(name) ON DELETE CASCADE

@@ -74,7 +74,7 @@ fn upload_part_stream_upload_match_accepts_existing_row_without_create_proof() {
         bucket_incarnation_generation: 1,
         operation_kind: "upload-part-stream-create".to_string(),
         created_at: 10,
-        lease_deadline: None,
+        lease_deadline: 20,
         target_context: Some(key.as_str().to_string()),
     };
     let command =
@@ -166,7 +166,7 @@ fn test_bucket_write_reservation_proof(
         bucket_incarnation_generation: 1,
         operation_kind: "object-mutation-test".to_string(),
         created_at: 1,
-        lease_deadline: None,
+        lease_deadline: 20,
         target_context: Some(key.as_str().to_string()),
     }
 }

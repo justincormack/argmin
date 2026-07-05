@@ -396,6 +396,9 @@ const STORAGE_RPC_MAX_STREAM_PART_FINALIZE_SNAPSHOT_REQUEST_PAYLOAD_LEN: usize =
     STORAGE_RPC_MAX_STREAM_PUT_FINALIZE_SNAPSHOT_REQUEST_PAYLOAD_LEN + 4 + UPLOAD_ID_LEN + 4;
 const STORAGE_RPC_MAX_STREAM_UPLOAD_SESSION_REQUEST_PAYLOAD_LEN: usize =
     STORAGE_RPC_MAX_OBJECT_GENERATION_REQUEST_PAYLOAD_LEN + 4 + SESSION_ID_LEN;
+const STORAGE_RPC_MAX_STREAM_UPLOAD_BUCKET_WRITE_RESERVATION_UPDATE_PAYLOAD_LEN: usize =
+    STORAGE_RPC_MAX_STREAM_UPLOAD_SESSION_REQUEST_PAYLOAD_LEN
+        + (2 * STORAGE_RPC_MAX_BUCKET_WRITE_RESERVATION_PROOF_PAYLOAD_LEN);
 const STORAGE_RPC_MAX_STREAM_UPLOAD_SEGMENTS_REQUEST_PAYLOAD_LEN: usize =
     STORAGE_RPC_MAX_STREAM_UPLOAD_SESSION_REQUEST_PAYLOAD_LEN;
 const STORAGE_RPC_MAX_STREAM_SEGMENT_APPEND_PREPARE_REQUEST_PAYLOAD_LEN: usize =
@@ -661,6 +664,7 @@ pub(crate) enum StorageRpcMessageKind {
     ObjectStreamUploadSessionLoad = 77,
     ObjectStreamUploadSegmentsLoad = 78,
     ObjectStreamSegmentAppendPrepare = 79,
+    ObjectStreamUploadBucketWriteReservationUpdate = 84,
     BucketWriteDrainBegin = 80,
     BucketWriteDrainClear = 81,
     BucketWriteDrainClearExpired = 82,
@@ -930,6 +934,9 @@ impl StorageRpcMessageKind {
             Self::ObjectStreamUploadSessionLoad => "object stream upload session load",
             Self::ObjectStreamUploadSegmentsLoad => "object stream upload segments load",
             Self::ObjectStreamSegmentAppendPrepare => "object stream segment append prepare",
+            Self::ObjectStreamUploadBucketWriteReservationUpdate => {
+                "object stream upload bucket write reservation update"
+            }
             Self::BucketWriteDrainBegin => "bucket write drain begin",
             Self::BucketWriteDrainClear => "bucket write drain clear",
             Self::BucketWriteDrainClearExpired => "bucket write drain clear expired",
@@ -1092,6 +1099,7 @@ impl StorageRpcMessageKind {
             77 => Ok(Self::ObjectStreamUploadSessionLoad),
             78 => Ok(Self::ObjectStreamUploadSegmentsLoad),
             79 => Ok(Self::ObjectStreamSegmentAppendPrepare),
+            84 => Ok(Self::ObjectStreamUploadBucketWriteReservationUpdate),
             80 => Ok(Self::BucketWriteDrainBegin),
             81 => Ok(Self::BucketWriteDrainClear),
             82 => Ok(Self::BucketWriteDrainClearExpired),
@@ -1820,6 +1828,14 @@ pub(crate) struct StorageRpcStreamUploadMatchResponse {
 pub(crate) struct StorageRpcStreamUploadSessionRequest {
     pub(crate) object: StorageRpcObjectRequest,
     pub(crate) session_id: SessionId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StorageRpcStreamUploadBucketWriteReservationUpdateRequest {
+    pub(crate) object: StorageRpcObjectRequest,
+    pub(crate) session_id: SessionId,
+    pub(crate) current: BucketWriteReservationProof,
+    pub(crate) renewed: BucketWriteReservationProof,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3156,7 +3172,7 @@ pub(crate) struct StorageRpcBucketWriteReservationAcquireRequest {
     pub(crate) owner_token: String,
     pub(crate) operation_kind: String,
     pub(crate) created_at: u64,
-    pub(crate) lease_deadline: Option<u64>,
+    pub(crate) lease_deadline: u64,
     pub(crate) target_context: Option<String>,
 }
 
@@ -3618,6 +3634,9 @@ fn message_kind_request_max_payload_len(
         }
         StorageRpcMessageKind::ObjectStreamUploadSessionLoad => {
             STORAGE_RPC_MAX_STREAM_UPLOAD_SESSION_REQUEST_PAYLOAD_LEN
+        }
+        StorageRpcMessageKind::ObjectStreamUploadBucketWriteReservationUpdate => {
+            STORAGE_RPC_MAX_STREAM_UPLOAD_BUCKET_WRITE_RESERVATION_UPDATE_PAYLOAD_LEN
         }
         StorageRpcMessageKind::ObjectStreamUploadsList => {
             STORAGE_RPC_MAX_STREAM_UPLOADS_LIST_REQUEST_PAYLOAD_LEN
@@ -5400,6 +5419,35 @@ pub(crate) fn decode_stream_upload_session_request(
     let session_id = decoder.read_session_id()?;
     decoder.finish()?;
     Ok(StorageRpcStreamUploadSessionRequest { object, session_id })
+}
+
+pub(crate) fn encode_stream_upload_bucket_write_reservation_update_request(
+    request: &StorageRpcStreamUploadBucketWriteReservationUpdateRequest,
+) -> Vec<u8> {
+    let mut out = encode_stream_upload_session_request(&StorageRpcStreamUploadSessionRequest {
+        object: request.object.clone(),
+        session_id: request.session_id.clone(),
+    });
+    put_bucket_write_reservation_proof(&mut out, &request.current);
+    put_bucket_write_reservation_proof(&mut out, &request.renewed);
+    out
+}
+
+pub(crate) fn decode_stream_upload_bucket_write_reservation_update_request(
+    bytes: &[u8],
+) -> Result<StorageRpcStreamUploadBucketWriteReservationUpdateRequest, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let object = decoder.read_rpc_object_request()?;
+    let session_id = decoder.read_session_id()?;
+    let current = decoder.read_bucket_write_reservation_proof()?;
+    let renewed = decoder.read_bucket_write_reservation_proof()?;
+    decoder.finish()?;
+    Ok(StorageRpcStreamUploadBucketWriteReservationUpdateRequest {
+        object,
+        session_id,
+        current,
+        renewed,
+    })
 }
 
 pub(crate) fn encode_stream_upload_session_response(
@@ -10865,7 +10913,7 @@ pub(crate) fn encode_bucket_write_reservation_acquire_request(
     put_string(&mut out, &request.owner_token);
     put_string(&mut out, &request.operation_kind);
     put_u64(&mut out, request.created_at);
-    put_optional_u64(&mut out, request.lease_deadline);
+    put_u64(&mut out, request.lease_deadline);
     put_optional_string(&mut out, request.target_context.as_deref());
     Ok(out)
 }
@@ -10899,7 +10947,7 @@ pub(crate) fn decode_bucket_write_reservation_acquire_request(
         ),
     )?;
     let created_at = decoder.read_u64()?;
-    let lease_deadline = decoder.read_optional_u64()?;
+    let lease_deadline = decoder.read_u64()?;
     let target_context = decoder.read_optional_string_with_limit(
         STORAGE_RPC_MAX_BUCKET_WRITE_TARGET_CONTEXT_LEN,
         StorageRpcPayloadError::InvalidBucketWriteReservationProof(
@@ -12659,7 +12707,7 @@ impl<'a> StorageRpcDecoder<'a> {
             ),
         )?;
         let created_at = self.read_u64()?;
-        let lease_deadline = self.read_optional_u64()?;
+        let lease_deadline = self.read_u64()?;
         let target_context = self.read_optional_string_with_limit(
             STORAGE_RPC_MAX_BUCKET_WRITE_TARGET_CONTEXT_LEN,
             StorageRpcPayloadError::InvalidBucketWriteReservationProof(
@@ -15218,7 +15266,7 @@ fn put_bucket_write_reservation_proof(out: &mut Vec<u8>, proof: &BucketWriteRese
     put_u64(out, proof.bucket_incarnation_generation);
     put_string(out, &proof.operation_kind);
     put_u64(out, proof.created_at);
-    put_optional_u64(out, proof.lease_deadline);
+    put_u64(out, proof.lease_deadline);
     put_optional_string(out, proof.target_context.as_deref());
 }
 
@@ -15231,7 +15279,7 @@ fn put_bucket_write_reservation_record(out: &mut Vec<u8>, record: &BucketWriteRe
     put_u64(out, record.bucket_incarnation_generation);
     put_string(out, &record.operation_kind);
     put_u64(out, record.created_at);
-    put_optional_u64(out, record.lease_deadline);
+    put_u64(out, record.lease_deadline);
     put_optional_string(out, record.target_context.as_deref());
 }
 
@@ -20086,7 +20134,7 @@ mod tests {
             owner_token: "owner-token-1".to_string(),
             operation_kind: "put-object".to_string(),
             created_at: 10,
-            lease_deadline: Some(20),
+            lease_deadline: 20,
             target_context: Some("key=a".to_string()),
         };
         let bytes = encode_bucket_write_reservation_acquire_request(&acquire).unwrap();
@@ -20597,7 +20645,7 @@ mod tests {
             bucket_incarnation_generation: 1,
             operation_kind: "direct-put".to_string(),
             created_at: 123,
-            lease_deadline: None,
+            lease_deadline: 130,
             target_context: Some("key".to_string()),
         };
         let commit = CommitDirectPutObjectReq {
@@ -20931,7 +20979,7 @@ mod tests {
             bucket_incarnation_generation: 37,
             operation_kind: "put-object".to_string(),
             created_at: 41,
-            lease_deadline: Some(43),
+            lease_deadline: 43,
             target_context: Some("key/context".to_string()),
         }
     }

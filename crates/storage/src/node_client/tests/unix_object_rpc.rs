@@ -348,7 +348,7 @@ fn unix_object_mutation_metadata_client_loads_snapshots_and_builds_commands() {
         bucket_incarnation_generation: 1,
         operation_kind: "object-mutation-test".to_string(),
         created_at: 1,
-        lease_deadline: None,
+        lease_deadline: 20,
         target_context: Some(key.as_str().to_string()),
     };
 
@@ -1300,7 +1300,7 @@ fn unix_object_mutation_client_loads_multipart_upload_over_rpc() {
             bucket_incarnation_generation: 1,
             operation_kind: "create-multipart-upload".to_string(),
             created_at: 123,
-            lease_deadline: None,
+            lease_deadline: 200,
             target_context: Some(key.as_str().to_string()),
         };
         let command = MetadataCommandEnvelope::new(
@@ -1430,7 +1430,7 @@ fn unix_direct_put_metadata_client_builds_commit_command() {
         bucket_incarnation_generation: 1,
         operation_kind: "direct-put".to_string(),
         created_at: 123,
-        lease_deadline: None,
+        lease_deadline: 200,
         target_context: Some(key.as_str().to_string()),
     };
     let request = CommitDirectPutObjectReq {

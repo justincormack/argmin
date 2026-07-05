@@ -2051,8 +2051,7 @@ impl PgStore {
             bucket_write_reservation.map(|proof| proof.bucket_incarnation_generation as i64);
         let operation_kind = bucket_write_reservation.map(|proof| proof.operation_kind.as_str());
         let created_at = bucket_write_reservation.map(|proof| proof.created_at as i64);
-        let lease_deadline = bucket_write_reservation
-            .and_then(|proof| proof.lease_deadline.map(|value| value as i64));
+        let lease_deadline = bucket_write_reservation.map(|proof| proof.lease_deadline as i64);
         let target_context =
             bucket_write_reservation.and_then(|proof| proof.target_context.as_deref());
         self.conn
@@ -4674,7 +4673,7 @@ fn bucket_write_reservation_from_row(
     let bucket_execution_generation_raw: i64 = row.get(4)?;
     let bucket_incarnation_generation_raw: i64 = row.get(5)?;
     let created_at_raw: i64 = row.get(7)?;
-    let lease_deadline_raw: Option<i64> = row.get(8)?;
+    let lease_deadline_raw: i64 = row.get(8)?;
     Ok(BucketWriteReservationRecord {
         bucket: BucketName::new(bucket_raw).map_err(|error| {
             rusqlite::Error::FromSqlConversionFailure(
@@ -4725,7 +4724,13 @@ fn bucket_write_reservation_from_row(
                 Box::from(format!("invalid created_at: {created_at_raw}")),
             )
         })?,
-        lease_deadline: PgStore::parse_optional_u64(lease_deadline_raw, 8, "lease_deadline")?,
+        lease_deadline: u64::try_from(lease_deadline_raw).map_err(|_| {
+            rusqlite::Error::FromSqlConversionFailure(
+                8,
+                rusqlite::types::Type::Integer,
+                Box::from(format!("invalid lease_deadline: {lease_deadline_raw}")),
+            )
+        })?,
         target_context: row.get(9)?,
     })
 }
@@ -5377,20 +5382,17 @@ impl PgMetadataStore for PgStore {
         cluster_epoch: ClusterEpoch,
         operation_kind: &str,
         created_at: u64,
-        lease_deadline: Option<u64>,
+        lease_deadline: u64,
         target_context: Option<&str>,
     ) -> Result<BucketWriteReservationRecord, MetadataError> {
         let created_at = i64::try_from(created_at).map_err(|source| MetadataError::Db {
             context: "acquire durable bucket write reservation created_at",
             source: rusqlite::Error::ToSqlConversionFailure(Box::new(source)),
         })?;
-        let lease_deadline = lease_deadline
-            .map(i64::try_from)
-            .transpose()
-            .map_err(|source| MetadataError::Db {
-                context: "acquire durable bucket write reservation lease_deadline",
-                source: rusqlite::Error::ToSqlConversionFailure(Box::new(source)),
-            })?;
+        let lease_deadline = i64::try_from(lease_deadline).map_err(|source| MetadataError::Db {
+            context: "acquire durable bucket write reservation lease_deadline",
+            source: rusqlite::Error::ToSqlConversionFailure(Box::new(source)),
+        })?;
         let inserted = self
             .conn
             .execute(
@@ -5429,7 +5431,7 @@ impl PgMetadataStore for PgStore {
                     && existing.cluster_epoch == cluster_epoch
                     && existing.operation_kind == operation_kind
                     && existing.created_at == created_at as u64
-                    && existing.lease_deadline == lease_deadline.map(|deadline| deadline as u64)
+                    && existing.lease_deadline == lease_deadline as u64
                     && existing.target_context.as_deref() == target_context
                 {
                     return Ok(existing);
@@ -5529,15 +5531,27 @@ impl PgMetadataStore for PgStore {
                 context: "heartbeat durable bucket write reservation lease deadline",
                 source: rusqlite::Error::ToSqlConversionFailure(Box::new(source)),
             })?;
+        let current_lease_deadline =
+            i64::try_from(heartbeat.current_lease_deadline).map_err(|source| {
+                MetadataError::Db {
+                    context: "heartbeat durable bucket write reservation current lease deadline",
+                    source: rusqlite::Error::ToSqlConversionFailure(Box::new(source)),
+                }
+            })?;
+        let now = i64::try_from(heartbeat.now).map_err(|source| MetadataError::Db {
+            context: "heartbeat durable bucket write reservation now",
+            source: rusqlite::Error::ToSqlConversionFailure(Box::new(source)),
+        })?;
         let updated = self
             .conn
             .execute(
                 "UPDATE bucket_write_reservations \
-                 SET lease_deadline = ?7 \
+                 SET lease_deadline = ?8 \
                  WHERE bucket_name = ?1 AND reservation_id = ?2 \
                    AND owner_token = ?3 AND cluster_epoch = ?4 \
                    AND bucket_execution_generation = ?5 \
-                   AND bucket_incarnation_generation = ?6",
+                   AND bucket_incarnation_generation = ?6 \
+                   AND lease_deadline = ?7 AND lease_deadline > ?9",
                 params![
                     heartbeat.name.as_str(),
                     heartbeat.reservation_id,
@@ -5545,7 +5559,9 @@ impl PgMetadataStore for PgStore {
                     heartbeat.cluster_epoch.get(),
                     generation,
                     incarnation,
+                    current_lease_deadline,
                     lease_deadline,
+                    now,
                 ],
             )
             .map_err(|source| MetadataError::Db {
@@ -5571,6 +5587,7 @@ impl PgMetadataStore for PgStore {
         cluster_epoch: ClusterEpoch,
         bucket_execution_generation: u64,
         bucket_incarnation_generation: u64,
+        lease_deadline: u64,
     ) -> Result<(), MetadataError> {
         let generation =
             i64::try_from(bucket_execution_generation).map_err(|source| MetadataError::Db {
@@ -5582,6 +5599,10 @@ impl PgMetadataStore for PgStore {
                 context: "release durable bucket write reservation incarnation",
                 source: rusqlite::Error::ToSqlConversionFailure(Box::new(source)),
             })?;
+        let lease_deadline = i64::try_from(lease_deadline).map_err(|source| MetadataError::Db {
+            context: "release durable bucket write reservation lease deadline",
+            source: rusqlite::Error::ToSqlConversionFailure(Box::new(source)),
+        })?;
         let deleted = self
             .conn
             .execute(
@@ -5589,7 +5610,8 @@ impl PgMetadataStore for PgStore {
                  WHERE bucket_name = ?1 AND reservation_id = ?2 \
                    AND owner_token = ?3 AND cluster_epoch = ?4 \
                    AND bucket_execution_generation = ?5 \
-                   AND bucket_incarnation_generation = ?6",
+                   AND bucket_incarnation_generation = ?6 \
+                   AND lease_deadline = ?7",
                 params![
                     name.as_str(),
                     reservation_id,
@@ -5597,6 +5619,7 @@ impl PgMetadataStore for PgStore {
                     cluster_epoch.get(),
                     generation,
                     incarnation,
+                    lease_deadline,
                 ],
             )
             .map_err(|source| MetadataError::Db {
@@ -5619,6 +5642,7 @@ impl PgMetadataStore for PgStore {
         cluster_epoch: ClusterEpoch,
         bucket_execution_generation: u64,
         bucket_incarnation_generation: u64,
+        lease_deadline: u64,
     ) -> Result<(), MetadataError> {
         let generation =
             i64::try_from(bucket_execution_generation).map_err(|source| MetadataError::Db {
@@ -5630,6 +5654,10 @@ impl PgMetadataStore for PgStore {
                 context: "release metadata command bucket write reservation incarnation",
                 source: rusqlite::Error::ToSqlConversionFailure(Box::new(source)),
             })?;
+        let lease_deadline = i64::try_from(lease_deadline).map_err(|source| MetadataError::Db {
+            context: "release metadata command bucket write reservation lease deadline",
+            source: rusqlite::Error::ToSqlConversionFailure(Box::new(source)),
+        })?;
 
         self.conn
             .execute_batch("BEGIN IMMEDIATE")
@@ -5646,7 +5674,8 @@ impl PgMetadataStore for PgStore {
                         && record.cluster_epoch == cluster_epoch
                         && record.bucket_execution_generation == bucket_execution_generation
                         && record.bucket_incarnation_generation
-                            == bucket_incarnation_generation =>
+                            == bucket_incarnation_generation
+                        && record.lease_deadline as i64 == lease_deadline =>
                 {
                     let deleted = self
                         .conn
@@ -5655,7 +5684,8 @@ impl PgMetadataStore for PgStore {
                              WHERE bucket_name = ?1 AND reservation_id = ?2 \
                                AND owner_token = ?3 AND cluster_epoch = ?4 \
                                AND bucket_execution_generation = ?5 \
-                               AND bucket_incarnation_generation = ?6",
+                               AND bucket_incarnation_generation = ?6 \
+                               AND lease_deadline = ?7",
                             params![
                                 name.as_str(),
                                 reservation_id,
@@ -5663,6 +5693,7 @@ impl PgMetadataStore for PgStore {
                                 cluster_epoch.get(),
                                 generation,
                                 incarnation,
+                                lease_deadline,
                             ],
                         )
                         .map_err(|source| MetadataError::Db {
@@ -9294,7 +9325,7 @@ impl PgMetadataStore for PgStore {
                 bucket_incarnation_generation: 1,
                 operation_kind: "create-multipart-upload".to_string(),
                 created_at: PgStore::now_millis(),
-                lease_deadline: None,
+                lease_deadline: PgStore::now_millis().saturating_add(1_000),
                 target_context: Some(req.key.as_str().to_string()),
             },
         );
@@ -10801,6 +10832,102 @@ impl PgMetadataStore for PgStore {
             .ok_or_else(|| MetadataError::StreamSessionNotFound {
                 session_id: session_id.as_str().to_owned(),
             })
+    }
+
+    fn update_stream_upload_bucket_write_reservation(
+        &self,
+        session_id: &SessionId,
+        current: &BucketWriteReservationProof,
+        renewed: &BucketWriteReservationProof,
+    ) -> Result<(), MetadataError> {
+        if current.bucket != renewed.bucket
+            || current.reservation_id != renewed.reservation_id
+            || current.owner_token != renewed.owner_token
+            || current.cluster_epoch != renewed.cluster_epoch
+            || current.bucket_execution_generation != renewed.bucket_execution_generation
+            || current.bucket_incarnation_generation != renewed.bucket_incarnation_generation
+            || current.operation_kind != renewed.operation_kind
+            || current.created_at != renewed.created_at
+            || current.target_context != renewed.target_context
+        {
+            return Err(MetadataError::BucketWriteReservationConflict {
+                reservation_id: current.reservation_id.clone(),
+            });
+        }
+
+        let current_cluster_epoch =
+            i64::try_from(current.cluster_epoch.get()).map_err(|source| MetadataError::Db {
+                context: "update stream upload bucket write reservation current cluster epoch",
+                source: rusqlite::Error::ToSqlConversionFailure(Box::new(source)),
+            })?;
+        let current_execution_generation = i64::try_from(current.bucket_execution_generation)
+            .map_err(|source| MetadataError::Db {
+                context:
+                    "update stream upload bucket write reservation current execution generation",
+                source: rusqlite::Error::ToSqlConversionFailure(Box::new(source)),
+            })?;
+        let current_incarnation_generation = i64::try_from(current.bucket_incarnation_generation)
+            .map_err(|source| MetadataError::Db {
+            context: "update stream upload bucket write reservation current incarnation generation",
+            source: rusqlite::Error::ToSqlConversionFailure(Box::new(source)),
+        })?;
+        let current_created_at =
+            i64::try_from(current.created_at).map_err(|source| MetadataError::Db {
+                context: "update stream upload bucket write reservation current created_at",
+                source: rusqlite::Error::ToSqlConversionFailure(Box::new(source)),
+            })?;
+        let current_lease_deadline =
+            i64::try_from(current.lease_deadline).map_err(|source| MetadataError::Db {
+                context: "update stream upload bucket write reservation current lease deadline",
+                source: rusqlite::Error::ToSqlConversionFailure(Box::new(source)),
+            })?;
+        let renewed_lease_deadline =
+            i64::try_from(renewed.lease_deadline).map_err(|source| MetadataError::Db {
+                context: "update stream upload bucket write reservation renewed lease deadline",
+                source: rusqlite::Error::ToSqlConversionFailure(Box::new(source)),
+            })?;
+        let updated = self
+            .conn
+            .execute(
+                "UPDATE stream_uploads \
+                 SET bucket_write_lease_deadline = ?12 \
+                 WHERE session_id = ?1 AND state = ?2 \
+                   AND bucket = ?3 \
+                   AND bucket_write_reservation_id = ?4 \
+                   AND bucket_write_owner_token = ?5 \
+                   AND bucket_write_cluster_epoch = ?6 \
+                   AND bucket_write_execution_generation = ?7 \
+                   AND bucket_write_incarnation_generation = ?8 \
+                   AND bucket_write_operation_kind = ?9 \
+                   AND bucket_write_created_at = ?10 \
+                   AND bucket_write_lease_deadline = ?11 \
+                   AND bucket_write_target_context IS ?13",
+                params![
+                    session_id.as_str(),
+                    StreamUploadState::InProgress as u8,
+                    current.bucket.as_str(),
+                    current.reservation_id.as_str(),
+                    current.owner_token.as_str(),
+                    current_cluster_epoch,
+                    current_execution_generation,
+                    current_incarnation_generation,
+                    current.operation_kind.as_str(),
+                    current_created_at,
+                    current_lease_deadline,
+                    renewed_lease_deadline,
+                    current.target_context.as_deref(),
+                ],
+            )
+            .map_err(|source| MetadataError::Db {
+                context: "update stream upload bucket write reservation",
+                source,
+            })?;
+        if updated == 0 {
+            return Err(MetadataError::BucketWriteReservationConflict {
+                reservation_id: current.reservation_id.clone(),
+            });
+        }
+        Ok(())
     }
 
     fn allocate_stream_segment_vid(

@@ -232,7 +232,7 @@ fn parse_stream_upload_bucket_write_reservation(
         bucket_incarnation_generation: row.get::<_, i64>(15)? as u64,
         operation_kind: row.get(16)?,
         created_at: row.get::<_, i64>(17)? as u64,
-        lease_deadline: row.get::<_, Option<i64>>(18)?.map(|value| value as u64),
+        lease_deadline: row.get::<_, i64>(18)? as u64,
         target_context: row.get(19)?,
     }))
 }
@@ -243,10 +243,33 @@ fn stream_upload_bucket_write_reservation_matches_command(
 ) -> bool {
     match command.session.target {
         StreamUploadTarget::PutObject => {
-            existing.bucket_write_reservation.as_ref() == Some(&command.bucket_write_reservation)
+            existing
+                .bucket_write_reservation
+                .as_ref()
+                .is_some_and(|proof| {
+                    bucket_write_reservation_stable_identity_matches(
+                        proof,
+                        &command.bucket_write_reservation,
+                    )
+                })
         }
         StreamUploadTarget::UploadPart { .. } => existing.bucket_write_reservation.is_none(),
     }
+}
+
+fn bucket_write_reservation_stable_identity_matches(
+    left: &BucketWriteReservationProof,
+    right: &BucketWriteReservationProof,
+) -> bool {
+    left.bucket == right.bucket
+        && left.reservation_id == right.reservation_id
+        && left.owner_token == right.owner_token
+        && left.cluster_epoch == right.cluster_epoch
+        && left.bucket_execution_generation == right.bucket_execution_generation
+        && left.bucket_incarnation_generation == right.bucket_incarnation_generation
+        && left.operation_kind == right.operation_kind
+        && left.created_at == right.created_at
+        && left.target_context == right.target_context
 }
 
 /// Part segment rows use a sentinel version_id during staging (pre-CompleteMultipartUpload).

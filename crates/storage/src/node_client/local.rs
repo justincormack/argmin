@@ -733,7 +733,7 @@ impl BucketWriteReservationNodeClient for LocalStorageNodeClient {
         cluster_epoch: ClusterEpoch,
         operation_kind: &str,
         created_at: u64,
-        lease_deadline: Option<u64>,
+        lease_deadline: u64,
         target_context: Option<&str>,
     ) -> Result<BucketWriteReservationRecord, BucketSnapshotLoadError> {
         <Self as StorageNodeClient>::acquire_durable_bucket_write_reservation(
@@ -1462,6 +1462,20 @@ impl ObjectMutationMetadataNodeClient for LocalStorageNodeClient {
         )
     }
 
+    fn update_stream_upload_bucket_write_reservation(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        session_id: &SessionId,
+        current: &BucketWriteReservationProof,
+        renewed: &BucketWriteReservationProof,
+    ) -> Result<(), ObjectPgActionError> {
+        <Self as StorageNodeClient>::update_stream_upload_bucket_write_reservation(
+            self, pg_id, bucket, key, session_id, current, renewed,
+        )
+    }
+
     fn build_stream_put_commit_command(
         &self,
         request: BuildStreamPutCommitCommandReq<'_>,
@@ -1755,7 +1769,7 @@ impl StorageNodeClient for LocalStorageNodeClient {
         cluster_epoch: ClusterEpoch,
         operation_kind: &str,
         created_at: u64,
-        lease_deadline: Option<u64>,
+        lease_deadline: u64,
         target_context: Option<&str>,
     ) -> Result<BucketWriteReservationRecord, BucketSnapshotLoadError> {
         let pg = self.storage_node.get_pg(pg_id.get())?;
@@ -1795,10 +1809,7 @@ impl StorageNodeClient for LocalStorageNodeClient {
             }
             .into());
         }
-        if record
-            .lease_deadline
-            .is_some_and(|deadline| deadline <= crate::clock::current_time_millis())
-        {
+        if record.lease_deadline <= crate::clock::current_time_millis() {
             return Err(MetadataError::BucketWriteReservationConflict {
                 reservation_id: proof.reservation_id.clone(),
             }
@@ -1831,6 +1842,7 @@ impl StorageNodeClient for LocalStorageNodeClient {
             record.cluster_epoch,
             record.bucket_execution_generation,
             record.bucket_incarnation_generation,
+            record.lease_deadline,
         )?)
     }
 
@@ -1861,6 +1873,7 @@ impl StorageNodeClient for LocalStorageNodeClient {
                 proof.cluster_epoch,
                 proof.bucket_execution_generation,
                 proof.bucket_incarnation_generation,
+                proof.lease_deadline,
             )?,
         )
     }
@@ -1961,7 +1974,9 @@ impl StorageNodeClient for LocalStorageNodeClient {
                 cluster_epoch: proof.cluster_epoch,
                 bucket_execution_generation: proof.bucket_execution_generation,
                 bucket_incarnation_generation: proof.bucket_incarnation_generation,
+                current_lease_deadline: proof.lease_deadline,
                 lease_deadline,
+                now: crate::clock::current_time_millis(),
             },
         )?)
     }
@@ -3285,6 +3300,30 @@ impl StorageNodeClient for LocalStorageNodeClient {
     ) -> Result<StreamPutFinalizeStorageSnapshot, ObjectPgActionError> {
         let pg = self.storage_node.get_pg(pg_id.get())?;
         load_stream_put_finalize_snapshot_from_pg(&pg, bucket, key, session_id)
+    }
+
+    fn update_stream_upload_bucket_write_reservation(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        session_id: &SessionId,
+        current: &BucketWriteReservationProof,
+        renewed: &BucketWriteReservationProof,
+    ) -> Result<(), ObjectPgActionError> {
+        let pg = self.storage_node.get_pg(pg_id.get())?;
+        let session = PgMetadataStore::get_stream_upload(&*pg, session_id)?;
+        if session.bucket != *bucket || session.key != *key {
+            return Err(MetadataError::StreamSessionNotFound {
+                session_id: session_id.as_str().to_string(),
+            }
+            .into());
+        }
+        Ok(
+            PgMetadataStore::update_stream_upload_bucket_write_reservation(
+                &*pg, session_id, current, renewed,
+            )?,
+        )
     }
 
     fn build_stream_put_commit_command(

@@ -190,7 +190,7 @@ pub(crate) trait BucketWriteReservationNodeClient: Send + Sync {
         cluster_epoch: ClusterEpoch,
         operation_kind: &str,
         created_at: u64,
-        lease_deadline: Option<u64>,
+        lease_deadline: u64,
         target_context: Option<&str>,
     ) -> Result<BucketWriteReservationRecord, BucketSnapshotLoadError>;
 
@@ -204,7 +204,7 @@ pub(crate) trait BucketWriteReservationNodeClient: Send + Sync {
         cluster_epoch: ClusterEpoch,
         operation_kind: &str,
         created_at: u64,
-        lease_deadline: Option<u64>,
+        lease_deadline: u64,
         target_context: Option<&str>,
     ) -> Result<BucketWriteReservationRecord, BucketSnapshotLoadError> {
         self.acquire_durable_bucket_write_reservation(
@@ -688,6 +688,16 @@ pub(crate) trait ObjectMutationMetadataNodeClient: Send + Sync {
         key: &ObjectKey,
         session_id: &SessionId,
     ) -> Result<StreamPutFinalizeStorageSnapshot, ObjectPgActionError>;
+
+    fn update_stream_upload_bucket_write_reservation(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        session_id: &SessionId,
+        current: &BucketWriteReservationProof,
+        renewed: &BucketWriteReservationProof,
+    ) -> Result<(), ObjectPgActionError>;
 
     fn build_stream_put_commit_command(
         &self,
@@ -1401,7 +1411,7 @@ pub(crate) trait StorageNodeClient:
         cluster_epoch: ClusterEpoch,
         operation_kind: &str,
         created_at: u64,
-        lease_deadline: Option<u64>,
+        lease_deadline: u64,
         target_context: Option<&str>,
     ) -> Result<BucketWriteReservationRecord, BucketSnapshotLoadError>;
 
@@ -1840,6 +1850,16 @@ pub(crate) trait StorageNodeClient:
         key: &ObjectKey,
         session_id: &SessionId,
     ) -> Result<StreamPutFinalizeStorageSnapshot, ObjectPgActionError>;
+
+    fn update_stream_upload_bucket_write_reservation(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        session_id: &SessionId,
+        current: &crate::BucketWriteReservationProof,
+        renewed: &crate::BucketWriteReservationProof,
+    ) -> Result<(), ObjectPgActionError>;
 
     fn build_stream_put_commit_command(
         &self,

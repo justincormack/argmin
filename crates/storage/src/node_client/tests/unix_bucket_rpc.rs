@@ -1025,7 +1025,7 @@ fn unix_bucket_write_reservation_client_acquires_validates_and_releases() {
         ClusterEpoch::new(1).unwrap(),
         "put-object",
         10,
-        Some(lease_deadline),
+        lease_deadline,
         Some("key=a"),
     )
     .unwrap();
@@ -1060,7 +1060,7 @@ fn unix_bucket_write_reservation_client_acquires_validates_and_releases() {
         renewed_deadline,
     )
     .unwrap();
-    assert_eq!(renewed.lease_deadline, Some(renewed_deadline));
+    assert_eq!(renewed.lease_deadline, renewed_deadline);
     BucketWriteReservationNodeClient::release_durable_bucket_write_reservation(
         &client,
         PgId::new(0),
@@ -1141,7 +1141,7 @@ fn unix_bucket_write_reservation_client_preserves_draining_signal() {
         ClusterEpoch::new(1).unwrap(),
         "put-object",
         30,
-        Some(40),
+        40,
         Some("key=a"),
     )
     .unwrap_err();
@@ -1175,7 +1175,7 @@ fn unix_bucket_write_reservation_client_preserves_bucket_not_found() {
         ClusterEpoch::new(1).unwrap(),
         "put-object",
         30,
-        Some(40),
+        40,
         Some("key=a"),
     )
     .unwrap_err();
@@ -1220,7 +1220,7 @@ fn unix_bucket_write_reservation_client_routes_drain_and_finalize_coordination()
             ClusterEpoch::new(1).unwrap(),
             "put-object",
             10,
-            Some(20),
+            20,
             Some("key=a"),
         )
         .unwrap();
@@ -2016,7 +2016,7 @@ fn unix_bucket_metadata_client_releases_bucket_write_proof() {
             ClusterEpoch::new(1).unwrap(),
             "put-object",
             10,
-            Some(20),
+            20,
             Some("key=a"),
         )
         .unwrap();
@@ -2086,7 +2086,7 @@ fn unix_bucket_metadata_client_preserves_proof_release_conflict() {
             ClusterEpoch::new(1).unwrap(),
             "put-object",
             10,
-            Some(20),
+            20,
             Some("key=a"),
         )
         .unwrap();
@@ -2187,7 +2187,7 @@ fn unix_bucket_metadata_client_rejects_proof_release_wrong_bucket_pg() {
             ClusterEpoch::new(1).unwrap(),
             "put-object",
             10,
-            Some(20),
+            20,
             Some("key=a"),
         )
         .unwrap();
@@ -2272,7 +2272,7 @@ fn unix_bucket_metadata_client_rejects_proof_release_on_non_primary() {
             ClusterEpoch::new(1).unwrap(),
             "put-object",
             10,
-            Some(20),
+            20,
             Some("key=a"),
         )
         .unwrap()

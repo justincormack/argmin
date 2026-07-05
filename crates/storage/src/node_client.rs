@@ -147,9 +147,11 @@ use crate::storage_rpc::{
     encode_shard_read_request, encode_shard_write_request,
     encode_stream_part_commit_command_build_request, encode_stream_part_finalize_snapshot_request,
     encode_stream_put_commit_command_build_request, encode_stream_put_finalize_snapshot_request,
-    encode_stream_segment_append_prepare_request, encode_stream_upload_match_request,
-    encode_stream_upload_session_request, encode_stream_uploads_list_request,
-    encode_stream_uploads_pg_list_request, read_storage_rpc_frame_from, write_storage_rpc_frame_to,
+    encode_stream_segment_append_prepare_request,
+    encode_stream_upload_bucket_write_reservation_update_request,
+    encode_stream_upload_match_request, encode_stream_upload_session_request,
+    encode_stream_uploads_list_request, encode_stream_uploads_pg_list_request,
+    read_storage_rpc_frame_from, write_storage_rpc_frame_to,
     StorageRpcAbortMultipartCleanupRequest, StorageRpcAbortMultipartCommandBuildRequest,
     StorageRpcAuthorizedAbortMultipartCommandBuildRequest, StorageRpcBucketBatchRequest,
     StorageRpcBucketDeleteAttemptOutcomeRecordRequest, StorageRpcBucketDeleteBeginRootsRequest,
@@ -229,7 +231,8 @@ use crate::storage_rpc::{
     StorageRpcStreamError, StorageRpcStreamPartCommitCommandBuildRequest,
     StorageRpcStreamPartFinalizeSnapshotRequest, StorageRpcStreamPutCommitCommandBuildRequest,
     StorageRpcStreamPutFinalizeSnapshotRequest, StorageRpcStreamSegmentAppendPrepareOutcome,
-    StorageRpcStreamSegmentAppendPrepareRequest, StorageRpcStreamUploadMatchRequest,
+    StorageRpcStreamSegmentAppendPrepareRequest,
+    StorageRpcStreamUploadBucketWriteReservationUpdateRequest, StorageRpcStreamUploadMatchRequest,
     StorageRpcStreamUploadSegmentsOutcome, StorageRpcStreamUploadSessionOutcome,
     StorageRpcStreamUploadSessionRequest, StorageRpcStreamUploadsListRequest,
     StorageRpcStreamUploadsPgListRequest, STORAGE_RPC_CLIENT_RESPONSE_TIMEOUT,
@@ -467,10 +470,33 @@ fn stream_upload_bucket_write_reservation_matches_command(
 ) -> bool {
     match create.session.target {
         StreamUploadTarget::PutObject => {
-            existing.bucket_write_reservation.as_ref() == Some(&create.bucket_write_reservation)
+            existing
+                .bucket_write_reservation
+                .as_ref()
+                .is_some_and(|proof| {
+                    bucket_write_reservation_stable_identity_matches(
+                        proof,
+                        &create.bucket_write_reservation,
+                    )
+                })
         }
         StreamUploadTarget::UploadPart { .. } => existing.bucket_write_reservation.is_none(),
     }
+}
+
+fn bucket_write_reservation_stable_identity_matches(
+    left: &BucketWriteReservationProof,
+    right: &BucketWriteReservationProof,
+) -> bool {
+    left.bucket == right.bucket
+        && left.reservation_id == right.reservation_id
+        && left.owner_token == right.owner_token
+        && left.cluster_epoch == right.cluster_epoch
+        && left.bucket_execution_generation == right.bucket_execution_generation
+        && left.bucket_incarnation_generation == right.bucket_incarnation_generation
+        && left.operation_kind == right.operation_kind
+        && left.created_at == right.created_at
+        && left.target_context == right.target_context
 }
 
 fn multipart_upload_matches_command(
