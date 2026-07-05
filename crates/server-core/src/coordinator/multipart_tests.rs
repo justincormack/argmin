@@ -6083,6 +6083,91 @@ fn complete_multipart_ignores_legacy_object_checksum_header_without_upload_algor
 }
 
 #[test]
+fn complete_multipart_unconfigured_crc64nvme_checksum_is_stored() {
+    use base64::Engine;
+
+    let b64 = base64::engine::general_purpose::STANDARD;
+    let tmp = test_util::tempdir();
+    let coord = setup_coordinator(tmp.path());
+    coord
+        .create_bucket_for_owner("default-owner", "bucket", false)
+        .unwrap();
+
+    let data = b"only part";
+    let (upload_id, parts) = create_upload_with_parts(&coord, "bucket", "key", &[(1, data)]);
+    let expected = b64.encode(checksum::crc64::checksum(data).to_be_bytes());
+    let claimed_checksum =
+        EncodedChecksumClaim::new(ChecksumAlgorithm::Crc64nvme, expected.clone());
+
+    let result = coord
+        .complete_multipart_upload(&CompleteMultipartUploadRequest {
+            upload: multipart_object_request_with_expected_owner(
+                "bucket",
+                "key",
+                &upload_id,
+                test_requester(),
+                None,
+            ),
+            parts: &parts,
+            claimed_checksum: Some(&claimed_checksum),
+            expected_object_size: None,
+            cond: &WriteCondition::default(),
+            sse_customer: None,
+        })
+        .unwrap();
+
+    assert_eq!(
+        result.checksum_algorithm,
+        Some(ChecksumAlgorithm::Crc64nvme)
+    );
+    assert_eq!(result.checksum_type, Some(ChecksumType::FullObject));
+    assert_eq!(result.checksum_value, Some(expected));
+}
+
+#[test]
+fn complete_multipart_unconfigured_crc64nvme_checksum_ignores_claimed_value() {
+    use base64::Engine;
+
+    let b64 = base64::engine::general_purpose::STANDARD;
+    let tmp = test_util::tempdir();
+    let coord = setup_coordinator(tmp.path());
+    coord
+        .create_bucket_for_owner("default-owner", "bucket", false)
+        .unwrap();
+
+    let data = b"only part";
+    let (upload_id, parts) = create_upload_with_parts(&coord, "bucket", "key", &[(1, data)]);
+    let expected = b64.encode(checksum::crc64::checksum(data).to_be_bytes());
+    let wrong_checksum = b64.encode([0u8; 8]);
+    assert_ne!(wrong_checksum, expected);
+    let claimed_checksum = EncodedChecksumClaim::new(ChecksumAlgorithm::Crc64nvme, wrong_checksum);
+
+    let result = coord
+        .complete_multipart_upload(&CompleteMultipartUploadRequest {
+            upload: multipart_object_request_with_expected_owner(
+                "bucket",
+                "key",
+                &upload_id,
+                test_requester(),
+                None,
+            ),
+            parts: &parts,
+            claimed_checksum: Some(&claimed_checksum),
+            expected_object_size: None,
+            cond: &WriteCondition::default(),
+            sse_customer: None,
+        })
+        .unwrap();
+
+    assert_eq!(
+        result.checksum_algorithm,
+        Some(ChecksumAlgorithm::Crc64nvme)
+    );
+    assert_eq!(result.checksum_type, Some(ChecksumType::FullObject));
+    assert_eq!(result.checksum_value, Some(expected));
+}
+
+#[test]
 fn complete_multipart_rejects_new_object_checksum_header_without_upload_algorithm() {
     use base64::Engine;
 

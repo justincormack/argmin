@@ -137,22 +137,20 @@ impl ChecksumAlgorithm {
         }
     }
 
-    /// AWS requires these algorithms to be declared on CreateMultipartUpload
-    /// before they may be used for multipart part or object checksums.
-    #[must_use]
-    pub fn requires_multipart_create_algorithm(self) -> bool {
-        matches!(
-            self,
-            Self::Md5 | Self::XxHash64 | Self::XxHash3 | Self::XxHash128 | Self::Sha512
-        )
-    }
-
     /// Algorithms whose CompleteMultipartUpload checksum header is accepted
     /// but ignored when the multipart upload was not created with an
     /// algorithm.
     #[must_use]
     pub fn accepts_unconfigured_complete_multipart_header(self) -> bool {
         matches!(self, Self::Crc32 | Self::Crc32c | Self::Sha1 | Self::Sha256)
+    }
+
+    /// Algorithms whose CompleteMultipartUpload checksum header is accepted
+    /// without a CreateMultipartUpload algorithm and causes S3 to compute and
+    /// store a full-object checksum.
+    #[must_use]
+    pub fn stores_unconfigured_complete_multipart_header(self) -> bool {
+        matches!(self, Self::Crc64nvme)
     }
 }
 

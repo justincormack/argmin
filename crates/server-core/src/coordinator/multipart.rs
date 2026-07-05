@@ -108,13 +108,15 @@ fn complete_multipart_checksum_value(
             ChecksumAlgorithm::Crc64nvme => {
                 let mut combined: u64 = 0;
                 for part in part_records {
-                    let bytes = complete_multipart_part_checksum(part, ChecksumType::FullObject)?;
-                    let part_crc =
+                    let part_crc = if let Some(bytes) = part.checksum.as_ref() {
                         u64::from_be_bytes(bytes.as_slice().try_into().map_err(|_| {
                             ServerError::InvalidRequest {
                                 reason: "invalid CRC64NVME checksum length".to_string(),
                             }
-                        })?);
+                        })?)
+                    } else {
+                        part.payload_crc64
+                    };
                     combined = checksum::crc64::combine(combined, part_crc, part.size);
                 }
                 Ok(b64.encode(combined.to_be_bytes()))
@@ -540,6 +542,20 @@ impl Coordinator {
             }
 
             let checksum_config = upload.checksum;
+            let stores_unconfigured_crc64nvme_checksum = checksum_config.is_none()
+                && claimed_checksum.is_some_and(|claimed| {
+                    claimed
+                        .algorithm()
+                        .stores_unconfigured_complete_multipart_header()
+                });
+            let effective_checksum_config = if stores_unconfigured_crc64nvme_checksum {
+                Some(MultipartChecksumConfig::new(
+                    ChecksumAlgorithm::Crc64nvme,
+                    Some(ChecksumType::FullObject),
+                )?)
+            } else {
+                checksum_config
+            };
 
             let mut part_records: Vec<MultipartPartRecord> =
                 Vec::with_capacity(completion_snapshot.part_records.len());
@@ -664,7 +680,7 @@ impl Coordinator {
                 }
             }
 
-            let checksum_value = checksum_config
+            let checksum_value = effective_checksum_config
                 .map(|config| complete_multipart_checksum_value(config, &part_records))
                 .transpose()?;
 
@@ -682,6 +698,9 @@ impl Coordinator {
                     None if claimed
                         .algorithm()
                         .accepts_unconfigured_complete_multipart_header() => {}
+                    None if claimed
+                        .algorithm()
+                        .stores_unconfigured_complete_multipart_header() => {}
                     None => {
                         return Err(ServerError::InvalidRequest {
                             reason: format!(
@@ -693,18 +712,20 @@ impl Coordinator {
                     _ => {}
                 }
                 claimed.validate_complete_multipart_header_value()?;
-                if let Some(ref computed) = checksum_value {
-                    if computed != claimed.encoded_value() {
-                        return Err(ServerError::ChecksumDigestMismatch {
-                            algorithm: claimed.algorithm().as_str().to_ascii_lowercase(),
-                        });
+                if !stores_unconfigured_crc64nvme_checksum {
+                    if let Some(ref computed) = checksum_value {
+                        if computed != claimed.encoded_value() {
+                            return Err(ServerError::ChecksumDigestMismatch {
+                                algorithm: claimed.algorithm().as_str().to_ascii_lowercase(),
+                            });
+                        }
                     }
                 }
             }
 
             let mut system_metadata =
                 SystemMetadata::deserialize(upload.system_metadata_blob.as_slice())?;
-            if let (Some(config), Some(ref val)) = (checksum_config, &checksum_value) {
+            if let (Some(config), Some(ref val)) = (effective_checksum_config, &checksum_value) {
                 system_metadata.set_checksum(
                     config.algorithm(),
                     Some(config.checksum_type()),
@@ -781,8 +802,10 @@ impl Coordinator {
                 etag: etag_str,
                 version_id,
                 managed_encryption,
-                checksum_algorithm: checksum_config.map(MultipartChecksumConfig::algorithm),
-                checksum_type: checksum_config.map(MultipartChecksumConfig::checksum_type),
+                checksum_algorithm: effective_checksum_config
+                    .map(MultipartChecksumConfig::algorithm),
+                checksum_type: effective_checksum_config
+                    .map(MultipartChecksumConfig::checksum_type),
                 checksum_value,
                 lifecycle_expiration,
             });

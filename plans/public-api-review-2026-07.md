@@ -28,13 +28,8 @@ and remain valid; their line references have been updated in place to current
 HEAD where they had drifted.
 
 Remaining order of attack:
-1. RR1 (reopened K1 core): make `SystemMetadata::from_header_iter` fail closed
-   and validate CreateMultipartUpload checksum value headers — the one live
-   bug found by the re-review.
-2. RR2: pin the CRC64NVME unconfigured-Complete edge against AWS and resolve
-   the still-dead `requires_multipart_create_algorithm`.
-3. The small fix-introduced items in the re-review section (RR3-RR16).
-4. The remaining pattern sweeps (P3 tail, P4-P6) and smaller items.
+1. The small fix-introduced items in the re-review section (RR3-RR16).
+2. The remaining pattern sweeps (P3 tail, P4-P6) and smaller items.
 
 ## Re-review 2026-07-05 — reopened and new items
 
@@ -71,7 +66,7 @@ Remaining order of attack:
   without an algorithm, and a concrete checksum value header does not override a
   valid CreateMultipartUpload `x-amz-checksum-algorithm`.
 
-- [ ] **RR2. CRC64NVME unconfigured-Complete edge untested against AWS, and
+- [x] **RR2. CRC64NVME unconfigured-Complete edge untested against AWS, and
   `requires_multipart_create_algorithm` is still dead code.** K2's fix wired
   the Complete-side predicate (`accepts_unconfigured_complete_multipart_header`)
   but `requires_multipart_create_algorithm` (`crates/checksum/src/types.rs:143-148`)
@@ -81,7 +76,18 @@ Remaining order of attack:
   (`multipart.rs:671-694`); oracle tests cover the legacy-ignored and
   new-rejected families but not crc64nvme, and since CRC64NVME is AWS's
   default full-object algorithm this edge plausibly diverges. Fix: AWS-pin
-  the crc64nvme case, then wire or delete the dead predicate.
+  the crc64nvme case, then wire or delete the dead predicate. Fixed by
+  AWS-pinning that unconfigured CompleteMultipartUpload with
+  `x-amz-checksum-crc64nvme` succeeds, computes and stores the real
+  CRC64NVME `FULL_OBJECT` checksum, and ignores the supplied header value if
+  it is a validly encoded mismatch. Local completion now uses that behavior
+  for CRC64NVME only, while legacy algorithms remain accepted-and-ignored and
+  newer non-CRC64 algorithms remain rejected. The dead
+  `requires_multipart_create_algorithm` predicate was deleted. Added the
+  matching PutObject oracle from the same AWS default-checksum rule: a
+  PutObject with no checksum headers returns and stores a CRC64NVME
+  `FULL_OBJECT` checksum, and an ignored literal `x-amz-checksum-algorithm`
+  without a concrete checksum value follows the same default-storage path.
 
 - [ ] **RR3. H6 residual: "one 416 builder" not achieved; two dead pub
   builders left behind.** Behavior is correct and AWS-pinned, but there are
@@ -474,9 +480,14 @@ steps it performs.
   checksum Type: null, actual checksum Type: <algo>`. Fixed local error text
   and response shape in `crates/server-core/src/coordinator/multipart.rs` and
   `crates/server-http/src/http/response.rs`; expanded s3-test coverage in
-  `crates/s3-tests/tests/checksums.rs`. Re-review 2026-07-05: verified, but
-  `requires_multipart_create_algorithm` remains dead code and the CRC64NVME
-  edge is unpinned — tracked as RR2.
+  `crates/s3-tests/tests/checksums.rs`. Re-review 2026-07-05: RR2 verified
+  that CRC64NVME is a separate AWS behavior: an unconfigured
+  CompleteMultipartUpload with `x-amz-checksum-crc64nvme` computes and stores
+  the real full-object checksum, even if the supplied header value is a valid
+  mismatch. The same AWS default-checksum rule is now pinned for PutObject:
+  no checksum headers returns and stores CRC64NVME `FULL_OBJECT`, and an
+  ignored literal `x-amz-checksum-algorithm` without a concrete checksum value
+  takes the same stored-default path.
 
 - [x] **K3. `CHECKSUM_HEADERS` in server-http hand-duplicates
   `ChecksumAlgorithm::ALL` + `header_name()`**

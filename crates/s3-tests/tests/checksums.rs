@@ -407,6 +407,32 @@ async fn assert_stored_crc32_full_object_checksum(bucket: &str, key: &str, expec
     assert_eq!(checksum.checksum_type(), Some(&ChecksumType::FullObject));
 }
 
+async fn assert_stored_crc64nvme_full_object_checksum(bucket: &str, key: &str, expected: &str) {
+    let client = CTX.client();
+    let head = client
+        .head_object()
+        .bucket(bucket)
+        .key(key)
+        .checksum_mode(ChecksumMode::Enabled)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(head.checksum_crc64_nvme(), Some(expected));
+    assert_eq!(head.checksum_type(), Some(&ChecksumType::FullObject));
+
+    let attrs = client
+        .get_object_attributes()
+        .bucket(bucket)
+        .key(key)
+        .object_attributes(ObjectAttributes::Checksum)
+        .send()
+        .await
+        .unwrap();
+    let checksum = attrs.checksum().expect("expected Checksum attributes");
+    assert_eq!(checksum.checksum_crc64_nvme(), Some(expected));
+    assert_eq!(checksum.checksum_type(), Some(&ChecksumType::FullObject));
+}
+
 async fn assert_no_stored_sha256_checksum(bucket: &str, key: &str, context: &str) {
     let client = CTX.client();
     let head = client
@@ -601,6 +627,28 @@ const SDK_CHECKSUM_INVALID_VALUE_MESSAGE: &str =
     "Value for x-amz-sdk-checksum-algorithm header is invalid.";
 
 #[test]
+fn test_put_object_without_checksum_headers_defaults_crc64nvme() {
+    s3_tests::run(async {
+        let bucket = setup_bucket().await;
+        let key = "put-object-without-checksum-headers-defaults-crc64nvme";
+        let body = b"put object default crc64nvme oracle";
+        let expected = checksum_base64(LocalChecksumAlgorithm::Crc64nvme, body);
+        let response = raw_put_object_with_checksum_headers(&bucket, key, body, &[]).await;
+        assert_eq!(response.status, 200, "response: {response:?}");
+        assert_eq!(
+            response_header(&response.headers, "x-amz-checksum-crc64nvme"),
+            Some(expected.as_str())
+        );
+        assert_eq!(
+            response_header(&response.headers, "x-amz-checksum-type"),
+            Some("FULL_OBJECT")
+        );
+        assert_stored_crc64nvme_full_object_checksum(&bucket, key, &expected).await;
+        cleanup(&bucket, &[key]).await;
+    });
+}
+
+#[test]
 fn test_put_object_checksum_algorithm_lowercase_value() {
     s3_tests::run(async {
         let bucket = setup_bucket().await;
@@ -699,6 +747,7 @@ fn test_put_object_invalid_checksum_algorithm_without_value() {
         let bucket = setup_bucket().await;
         let key = "invalid-checksum-algorithm-without-value";
         let body = b"invalid checksum algorithm without value oracle";
+        let expected = checksum_base64(LocalChecksumAlgorithm::Crc64nvme, body);
         let response = raw_put_object_with_checksum_headers(
             &bucket,
             key,
@@ -709,12 +758,13 @@ fn test_put_object_invalid_checksum_algorithm_without_value() {
         assert_eq!(response.status, 200, "response: {response:?}");
         assert_eq!(
             response_header(&response.headers, "x-amz-checksum-crc64nvme"),
-            Some("jX8PKk+4oBM=")
+            Some(expected.as_str())
         );
         assert_eq!(
             response_header(&response.headers, "x-amz-checksum-type"),
             Some("FULL_OBJECT")
         );
+        assert_stored_crc64nvme_full_object_checksum(&bucket, key, &expected).await;
         cleanup(&bucket, &[key]).await;
     });
 }
@@ -2116,6 +2166,170 @@ fn test_complete_multipart_new_object_checksum_without_create_algorithm_rejected
                 .await;
         }
         cleanup(&bucket, &[]).await;
+    });
+}
+
+#[test]
+fn test_complete_multipart_unconfigured_crc64nvme_checksum_is_stored() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+        let key = "mpu-complete-crc64nvme-checksum-without-create";
+        let part_body = b"crc64nvme object checksum header";
+
+        let create = client
+            .create_multipart_upload()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap();
+        let upload_id = create.upload_id().unwrap().to_string();
+
+        let part = client
+            .upload_part()
+            .bucket(&bucket)
+            .key(key)
+            .upload_id(&upload_id)
+            .part_number(1)
+            .body(ByteStream::from(part_body.to_vec()))
+            .send()
+            .await
+            .unwrap();
+        let etag = part.e_tag().unwrap();
+
+        let url = multipart_complete_url(&bucket, key, &upload_id);
+        let body = format!(
+            "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{etag}</ETag></Part></CompleteMultipartUpload>"
+        );
+        let expected = checksum_base64(LocalChecksumAlgorithm::Crc64nvme, part_body);
+        let (status, body_text) = send_signed_post(
+            &url,
+            body.as_bytes(),
+            &[(
+                checksum_header_name(&ChecksumAlgorithm::Crc64Nvme),
+                expected.as_str(),
+            )],
+        );
+        assert_eq!(status, 200, "body: {body_text}");
+        assert!(
+            body_text.contains(&format!(
+                "<ChecksumCRC64NVME>{expected}</ChecksumCRC64NVME>"
+            )),
+            "CompleteMultipartUpload response missing CRC64NVME checksum {expected}: {body_text}"
+        );
+        assert!(
+            body_text.contains("<ChecksumType>FULL_OBJECT</ChecksumType>"),
+            "CompleteMultipartUpload response missing FULL_OBJECT type: {body_text}"
+        );
+
+        let head = client
+            .head_object()
+            .bucket(&bucket)
+            .key(key)
+            .checksum_mode(ChecksumMode::Enabled)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            get_cksum_from_head(&head, &ChecksumAlgorithm::Crc64Nvme),
+            Some(expected.clone()),
+            "HeadObject checksum mismatch"
+        );
+        assert_eq!(head.checksum_type(), Some(&ChecksumType::FullObject));
+
+        let attrs = client
+            .get_object_attributes()
+            .bucket(&bucket)
+            .key(key)
+            .object_attributes(ObjectAttributes::Checksum)
+            .send()
+            .await
+            .unwrap();
+        let checksum = attrs.checksum().expect("expected Checksum attributes");
+        assert_eq!(
+            get_cksum_from_checksum(checksum, &ChecksumAlgorithm::Crc64Nvme),
+            Some(expected),
+            "GetObjectAttributes checksum mismatch"
+        );
+        assert_eq!(checksum.checksum_type(), Some(&ChecksumType::FullObject));
+
+        cleanup(&bucket, &[key]).await;
+    });
+}
+
+#[test]
+fn test_complete_multipart_unconfigured_crc64nvme_mismatch_is_computed() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+        let key = "mpu-complete-crc64nvme-checksum-without-create-mismatch";
+        let part_body = b"crc64nvme object checksum mismatch";
+
+        let create = client
+            .create_multipart_upload()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap();
+        let upload_id = create.upload_id().unwrap().to_string();
+
+        let part = client
+            .upload_part()
+            .bucket(&bucket)
+            .key(key)
+            .upload_id(&upload_id)
+            .part_number(1)
+            .body(ByteStream::from(part_body.to_vec()))
+            .send()
+            .await
+            .unwrap();
+        let etag = part.e_tag().unwrap();
+
+        let url = multipart_complete_url(&bucket, key, &upload_id);
+        let body = format!(
+            "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{etag}</ETag></Part></CompleteMultipartUpload>"
+        );
+        let wrong_checksum = encode_base64(&[0u8; 8]);
+        let expected = checksum_base64(LocalChecksumAlgorithm::Crc64nvme, part_body);
+        assert_ne!(wrong_checksum, expected);
+        let (status, body_text) = send_signed_post(
+            &url,
+            body.as_bytes(),
+            &[(
+                checksum_header_name(&ChecksumAlgorithm::Crc64Nvme),
+                wrong_checksum.as_str(),
+            )],
+        );
+        assert_eq!(status, 200, "body: {body_text}");
+        assert!(
+            body_text.contains(&format!(
+                "<ChecksumCRC64NVME>{expected}</ChecksumCRC64NVME>"
+            )),
+            "CompleteMultipartUpload response missing computed CRC64NVME checksum {expected}: {body_text}"
+        );
+        assert!(
+            body_text.contains("<ChecksumType>FULL_OBJECT</ChecksumType>"),
+            "CompleteMultipartUpload response missing FULL_OBJECT type: {body_text}"
+        );
+
+        let head = client
+            .head_object()
+            .bucket(&bucket)
+            .key(key)
+            .checksum_mode(ChecksumMode::Enabled)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            get_cksum_from_head(&head, &ChecksumAlgorithm::Crc64Nvme),
+            Some(expected),
+            "HeadObject checksum mismatch"
+        );
+        assert_eq!(head.checksum_type(), Some(&ChecksumType::FullObject));
+
+        cleanup(&bucket, &[key]).await;
     });
 }
 
