@@ -79,6 +79,10 @@ fn checksum_algorithm_from_header_name(name: &str) -> Option<ChecksumAlgorithm> 
     ChecksumAlgorithm::from_header_name(name)
 }
 
+pub fn is_checksum_value_header_name(name: &str) -> bool {
+    checksum_algorithm_from_header_name(&name.to_ascii_lowercase()).is_some()
+}
+
 pub fn is_system_metadata_header_name(name: &str) -> bool {
     matches!(
         name,
@@ -120,9 +124,9 @@ impl SystemMetadata {
         I: IntoIterator<Item = (&'a str, &'a str)>,
     {
         let mut out = Self::new();
-        let mut checksum_algorithm = None;
+        let mut declared_checksum_algorithm = None;
         let mut checksum_type = None;
-        let mut checksum_value = None;
+        let mut checksum_value = None::<(ChecksumAlgorithm, String)>;
 
         for (name, value) in headers {
             let lower = name.to_ascii_lowercase();
@@ -161,22 +165,39 @@ impl SystemMetadata {
                         })?);
                 }
                 "x-amz-checksum-algorithm" => {
-                    checksum_algorithm = ChecksumAlgorithm::parse(value);
+                    declared_checksum_algorithm =
+                        Some(ChecksumAlgorithm::parse(value).ok_or_else(|| {
+                            ServerError::InvalidRequest {
+                                reason: format!("invalid checksum algorithm: {value}"),
+                            }
+                        })?);
                 }
                 "x-amz-checksum-type" => {
                     checksum_type = ChecksumType::parse(value);
                 }
                 _ if lower.starts_with("x-amz-checksum-") => {
                     if let Some(algo) = checksum_algorithm_from_header_name(&lower) {
-                        checksum_algorithm = Some(algo);
-                        checksum_value = Some(value.to_string());
+                        checksum_value = Some((algo, value.to_string()));
                     }
                 }
                 _ => {}
             }
         }
 
-        if let (Some(algorithm), Some(value)) = (checksum_algorithm, checksum_value) {
+        if let (Some(declared), Some((actual, _))) = (declared_checksum_algorithm, &checksum_value)
+        {
+            if declared != *actual {
+                return Err(ServerError::InvalidRequest {
+                    reason: format!(
+                        "checksum algorithm {} does not match checksum header {}",
+                        declared.as_str(),
+                        actual.header_name()
+                    ),
+                });
+            }
+        }
+
+        if let Some((algorithm, value)) = checksum_value {
             out.checksum = Some(ObjectChecksumMetadata::new(algorithm, checksum_type, value));
         }
 
@@ -635,6 +656,45 @@ mod tests {
         assert_eq!(checksum.algorithm(), ChecksumAlgorithm::Sha256);
         assert_eq!(checksum.checksum_type(), Some(ChecksumType::FullObject));
         assert_eq!(checksum.value(), "abc");
+    }
+
+    #[test]
+    fn from_headers_rejects_invalid_checksum_algorithm() {
+        let err = SystemMetadata::from_headers(&[
+            ("X-Amz-Checksum-Algorithm", "BOGUS"),
+            ("X-Amz-Checksum-Sha256", "abc"),
+        ])
+        .unwrap_err();
+        assert!(matches!(err, ServerError::InvalidRequest { .. }));
+    }
+
+    #[test]
+    fn from_headers_rejects_checksum_algorithm_value_mismatch() {
+        let err = SystemMetadata::from_headers(&[
+            ("X-Amz-Checksum-Crc32", "abc"),
+            ("X-Amz-Checksum-Algorithm", "SHA256"),
+        ])
+        .unwrap_err();
+        assert!(matches!(err, ServerError::InvalidRequest { .. }));
+    }
+
+    #[test]
+    fn from_headers_checksum_algorithm_value_match_is_order_independent() {
+        for headers in [
+            [
+                ("X-Amz-Checksum-Algorithm", "SHA256"),
+                ("X-Amz-Checksum-Sha256", "abc"),
+            ],
+            [
+                ("X-Amz-Checksum-Sha256", "abc"),
+                ("X-Amz-Checksum-Algorithm", "SHA256"),
+            ],
+        ] {
+            let metadata = SystemMetadata::from_headers(&headers).unwrap();
+            let checksum = metadata.checksum().unwrap();
+            assert_eq!(checksum.algorithm(), ChecksumAlgorithm::Sha256);
+            assert_eq!(checksum.value(), "abc");
+        }
     }
 
     #[test]

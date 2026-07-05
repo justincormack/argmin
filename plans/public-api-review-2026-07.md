@@ -40,7 +40,7 @@ Remaining order of attack:
 
 ### Reopened
 
-- [ ] **RR1. K1 core gap: `SystemMetadata::from_header_iter` was masked, not
+- [x] **RR1. K1 core gap: `SystemMetadata::from_header_iter` was masked, not
   fixed — live bug on CreateMultipartUpload.** The K1 resolution fixed the
   HTTP layer but never made the core parser fail closed.
   `crates/server-core/src/system_metadata.rs:118-184` is still
@@ -62,7 +62,14 @@ Remaining order of attack:
   a concrete checksum value header on CreateMultipartUpload. Fix: make
   `from_header_iter` return an error on unparseable algorithm and on
   algorithm/value mispairing, independent of header order, and add the
-  CreateMultipartUpload test.
+  CreateMultipartUpload test. Fixed by making `SystemMetadata::from_header_iter`
+  reject invalid literal checksum algorithms and literal/value algorithm
+  mismatches, and by filtering checksum selection/value headers before metadata
+  parsing on CreateMultipartUpload and CopyObject REPLACE. Added AWS-facing
+  tests proving PutObject does not store literal `x-amz-checksum-algorithm`,
+  CreateMultipartUpload accepts but ignores concrete checksum value headers
+  without an algorithm, and a concrete checksum value header does not override a
+  valid CreateMultipartUpload `x-amz-checksum-algorithm`.
 
 - [ ] **RR2. CRC64NVME unconfigured-Complete edge untested against AWS, and
   `requires_multipart_create_algorithm` is still dead code.** K2's fix wired

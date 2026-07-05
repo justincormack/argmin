@@ -54,7 +54,9 @@ use s3_types::{
 use server_core::sse::{
     SseCustomerRequest, SseCustomerWriteContext, SSE_CUSTOMER_ALGORITHM, SSE_C_CUSTOMER_KEY_LEN,
 };
-use server_core::system_metadata::{is_system_metadata_header_name, SystemMetadata};
+use server_core::system_metadata::{
+    is_checksum_value_header_name, is_system_metadata_header_name, SystemMetadata,
+};
 use storage::{
     BucketName, ManagedEncryptionAlgorithm, ObjectKey, SessionId, StorageCluster, UploadId,
 };
@@ -423,6 +425,19 @@ where
             .into_iter()
             .filter(|(name, _)| !name.eq_ignore_ascii_case("x-amz-checksum-algorithm")),
     )
+}
+
+fn parse_request_metadata_without_checksum_headers<'a, I>(
+    headers: I,
+) -> Result<(MetadataBlob, SystemMetadata), ServerError>
+where
+    I: IntoIterator<Item = (&'a str, &'a str)>,
+{
+    parse_request_metadata(headers.into_iter().filter(|(name, _)| {
+        !name.eq_ignore_ascii_case("x-amz-checksum-algorithm")
+            && !name.eq_ignore_ascii_case("x-amz-checksum-type")
+            && !is_checksum_value_header_name(name)
+    }))
 }
 
 fn parse_version_id(req: &S3Request) -> Result<Option<VersionId>, ServerError> {
@@ -1468,9 +1483,10 @@ impl HttpFrontend {
                     let replace_checksum_algo;
                     let directive = match req.header("x-amz-metadata-directive") {
                         Some(d) if d.eq_ignore_ascii_case("REPLACE") => {
-                            let (blob, mut system_metadata) =
-                                parse_request_metadata(request_headers.iter().copied())?;
-                            system_metadata.strip_checksum_values();
+                            let (blob, system_metadata) =
+                                parse_request_metadata_without_checksum_headers(
+                                    request_headers.iter().copied(),
+                                )?;
                             replace_metadata = blob;
                             replace_system_metadata = system_metadata;
 
@@ -2643,8 +2659,9 @@ impl HttpFrontend {
                     .map(SseCustomerRequest::response_headers);
                 let request_headers: Vec<(&str, &str)> = req.header_iter().collect();
                 validate_write_request_header_section_size(&request_headers)?;
-                let (metadata, system_metadata) =
-                    parse_request_metadata(request_headers.iter().copied())?;
+                let (metadata, system_metadata) = parse_request_metadata_without_checksum_headers(
+                    request_headers.iter().copied(),
+                )?;
 
                 // Parse optional checksum algorithm/type headers.
                 let checksum_algorithm = match req.header("x-amz-checksum-algorithm") {

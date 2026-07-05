@@ -407,6 +407,74 @@ async fn assert_stored_crc32_full_object_checksum(bucket: &str, key: &str, expec
     assert_eq!(checksum.checksum_type(), Some(&ChecksumType::FullObject));
 }
 
+async fn assert_no_stored_sha256_checksum(bucket: &str, key: &str, context: &str) {
+    let client = CTX.client();
+    let head = client
+        .head_object()
+        .bucket(bucket)
+        .key(key)
+        .checksum_mode(ChecksumMode::Enabled)
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        head.checksum_sha256().is_none(),
+        "{context}: concrete or literal SHA256 checksum header must not be stored on HeadObject"
+    );
+
+    let attrs = client
+        .get_object_attributes()
+        .bucket(bucket)
+        .key(key)
+        .object_attributes(ObjectAttributes::Checksum)
+        .send()
+        .await
+        .unwrap();
+    if let Some(checksum) = attrs.checksum() {
+        assert!(
+            checksum.checksum_sha256().is_none(),
+            "{context}: concrete or literal SHA256 checksum header must not be stored on GetObjectAttributes"
+        );
+    }
+}
+
+async fn complete_single_part_upload_without_checksum(
+    bucket: &str,
+    key: &str,
+    upload_id: &str,
+    body: Vec<u8>,
+) {
+    let client = CTX.client();
+    let part = client
+        .upload_part()
+        .bucket(bucket)
+        .key(key)
+        .upload_id(upload_id)
+        .part_number(1)
+        .body(ByteStream::from(body))
+        .send()
+        .await
+        .unwrap();
+    client
+        .complete_multipart_upload()
+        .bucket(bucket)
+        .key(key)
+        .upload_id(upload_id)
+        .multipart_upload(
+            CompletedMultipartUpload::builder()
+                .parts(
+                    CompletedPart::builder()
+                        .e_tag(part.e_tag().unwrap())
+                        .part_number(1)
+                        .build(),
+                )
+                .build(),
+        )
+        .send()
+        .await
+        .unwrap();
+}
+
 fn composite_checksum_base64(algo: LocalChecksumAlgorithm, part_checksums: &[String]) -> String {
     use base64::Engine;
 
@@ -647,6 +715,25 @@ fn test_put_object_invalid_checksum_algorithm_without_value() {
             response_header(&response.headers, "x-amz-checksum-type"),
             Some("FULL_OBJECT")
         );
+        cleanup(&bucket, &[key]).await;
+    });
+}
+
+#[test]
+fn test_put_object_checksum_algorithm_literal_only_not_stored_as_checksum() {
+    s3_tests::run(async {
+        let bucket = setup_bucket().await;
+        let key = "checksum-algorithm-literal-only-not-stored";
+        let body = b"checksum algorithm literal only oracle";
+        let response = raw_put_object_with_checksum_headers(
+            &bucket,
+            key,
+            body,
+            &[("x-amz-checksum-algorithm", "SHA256".to_string())],
+        )
+        .await;
+        assert_eq!(response.status, 200, "response: {response:?}");
+        assert_no_stored_sha256_checksum(&bucket, key, "PutObject x-amz-checksum-algorithm").await;
         cleanup(&bucket, &[key]).await;
     });
 }
@@ -947,6 +1034,82 @@ fn test_create_multipart_invalid_checksum_algorithm() {
         );
         assert_auth_error_response_shape(&response.body);
         cleanup(&bucket, &[key]).await;
+    });
+}
+
+#[test]
+fn test_create_multipart_concrete_checksum_header_without_algorithm_is_ignored() {
+    s3_tests::run(async {
+        let bucket = setup_bucket().await;
+        let key = "create-multipart-concrete-checksum-without-algorithm";
+        let url = s3_tests::object_url(CTX.endpoint(), &bucket, key, Some("uploads"));
+        let response = send_signed_request(
+            "POST",
+            &url,
+            &[],
+            [("x-amz-checksum-sha256", "not-even-base64")],
+        );
+        assert_eq!(response.status, 200, "response: {response:?}");
+        assert_eq!(
+            response_header(&response.headers, "x-amz-checksum-algorithm"),
+            None
+        );
+        assert_eq!(
+            response_header(&response.headers, "x-amz-checksum-type"),
+            None
+        );
+        let upload_id = xml_text(&response.body, "UploadId").expect("UploadId in response");
+        complete_single_part_upload_without_checksum(
+            &bucket,
+            key,
+            upload_id,
+            vec![b'A'; PART_SIZE],
+        )
+        .await;
+        assert_no_stored_sha256_checksum(
+            &bucket,
+            key,
+            "CreateMultipartUpload concrete checksum without algorithm",
+        )
+        .await;
+        cleanup(&bucket, &[key]).await;
+    });
+}
+
+#[test]
+fn test_create_multipart_concrete_checksum_header_does_not_override_algorithm() {
+    s3_tests::run(async {
+        let bucket = setup_bucket().await;
+        let key = "create-multipart-concrete-checksum-with-algorithm";
+        let url = s3_tests::object_url(CTX.endpoint(), &bucket, key, Some("uploads"));
+        let response = send_signed_request(
+            "POST",
+            &url,
+            &[],
+            [
+                ("x-amz-checksum-algorithm", "CRC32"),
+                ("x-amz-checksum-sha256", "not-even-base64"),
+            ],
+        );
+        assert_eq!(response.status, 200, "response: {response:?}");
+        assert_eq!(
+            response_header(&response.headers, "x-amz-checksum-algorithm"),
+            Some("CRC32")
+        );
+        assert_eq!(
+            response_header(&response.headers, "x-amz-checksum-type"),
+            Some("COMPOSITE")
+        );
+        let upload_id = xml_text(&response.body, "UploadId").expect("UploadId in response");
+        CTX.client()
+            .abort_multipart_upload()
+            .bucket(&bucket)
+            .key(key)
+            .upload_id(upload_id)
+            .send()
+            .await
+            .unwrap();
+        cleanup(&bucket, &[]).await;
     });
 }
 
