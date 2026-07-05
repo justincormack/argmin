@@ -479,7 +479,7 @@ impl Coordinator {
                 version_id: src_version_id,
                 expected_bucket_owner: req.source.expected_bucket_owner(),
                 policy_action: Self::get_object_policy_action(src_version_id),
-                existing_object_tags_mode: ExistingObjectTagsMode::Unavailable,
+                existing_object_tags_mode: ExistingObjectTagsMode::NotEvaluable,
             },
         )?;
 

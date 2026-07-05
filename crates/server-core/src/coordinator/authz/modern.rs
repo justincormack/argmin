@@ -861,10 +861,11 @@ fn bucket_policy_decision_for_put_object_action_modern(
         policy_context: *policy_context,
         policy,
         existing_object_tags: auth::bucket_policy::ExistingObjectTags::Unavailable,
+        existing_object_tags_not_evaluable: true,
         bucket_tags: &bucket_tags,
         request_object_tags: &request_object_tags,
         version_id: version_id.as_deref(),
-    });
+    })?;
     Ok(policy.evaluate(&policy_request))
 }
 
@@ -1163,7 +1164,7 @@ pub(in crate::coordinator) fn read_object_authorization_with_bucket_policy(
                 object,
                 action,
                 policy,
-                ExistingObjectTagsMode::Unavailable,
+                ExistingObjectTagsMode::NotEvaluable,
             )?;
             Ok(combine_modern_read_authorization(read, attrs))
         }

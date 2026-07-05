@@ -18,6 +18,7 @@ pub(super) struct ObjectPolicyRequestInput<'a> {
     pub(super) policy_context: PutObjectPolicyContext<'a>,
     pub(super) policy: &'a auth::BucketPolicy,
     pub(super) existing_object_tags: auth::bucket_policy::ExistingObjectTags<'a>,
+    pub(super) existing_object_tags_not_evaluable: bool,
     pub(super) bucket_tags: &'a [auth::PolicyTag<'a>],
     pub(super) request_object_tags: &'a [auth::PolicyTag<'a>],
     pub(super) version_id: Option<&'a str>,
@@ -26,7 +27,9 @@ pub(super) struct ObjectPolicyRequestInput<'a> {
 struct BucketPolicyRequestInput<'a> {
     requester: &'a Requester,
     bucket_name: &'a str,
+    bucket_abac_enabled: bool,
     action: auth::PolicyAction,
+    policy: &'a auth::BucketPolicy,
     bucket_tags: auth::bucket_policy::BucketTags<'a>,
     request_tags: Option<&'a [auth::PolicyTag<'a>]>,
     policy_context: Option<PutObjectPolicyContext<'a>>,
@@ -105,8 +108,32 @@ fn bucket_tag_input_for_policy_action<'a>(
 
 pub(super) fn object_policy_request<'a>(
     input: ObjectPolicyRequestInput<'a>,
-) -> auth::PolicyRequest<'a> {
-    auth::PolicyRequest::for_object(
+) -> Result<auth::PolicyRequest<'a>, ServerError> {
+    let existing_object_tags_required = input
+        .policy
+        .requires_existing_object_tags_for_action(input.action);
+    let existing_object_tags_unavailable = matches!(
+        input.existing_object_tags,
+        auth::bucket_policy::ExistingObjectTags::Unavailable
+    );
+    if existing_object_tags_required
+        && existing_object_tags_unavailable
+        && !input.existing_object_tags_not_evaluable
+    {
+        return Err(required_policy_input_unavailable_error(
+            input.action,
+            "existing object tags",
+        ));
+    }
+    debug_assert!(
+        !(existing_object_tags_required
+            && existing_object_tags_unavailable
+            && !input.existing_object_tags_not_evaluable),
+        "bucket policy request for {:?} requires existing object tags",
+        input.action
+    );
+
+    Ok(auth::PolicyRequest::for_object(
         input.action,
         input.bucket_name,
         input.key,
@@ -139,10 +166,45 @@ pub(super) fn object_policy_request<'a>(
     .with_if_match(input.policy_context.if_match)
     .with_if_none_match(input.policy_context.if_none_match)
     .with_object_creation_operation(input.policy_context.object_creation_operation)
-    .with_version_id(input.version_id)
+    .with_version_id(input.version_id))
 }
 
-fn bucket_policy_request<'a>(input: BucketPolicyRequestInput<'a>) -> auth::PolicyRequest<'a> {
+fn bucket_policy_request<'a>(
+    input: BucketPolicyRequestInput<'a>,
+) -> Result<auth::PolicyRequest<'a>, ServerError> {
+    let bucket_tags_required =
+        input.bucket_abac_enabled && input.policy.requires_bucket_tags_for_action(input.action);
+    let bucket_tags_unavailable = matches!(
+        input.bucket_tags,
+        auth::bucket_policy::BucketTags::Unavailable
+    );
+    if bucket_tags_required && bucket_tags_unavailable {
+        return Err(required_policy_input_unavailable_error(
+            input.action,
+            "bucket tags",
+        ));
+    }
+    debug_assert!(
+        !(bucket_tags_required && bucket_tags_unavailable),
+        "bucket policy request for {:?} requires bucket tags",
+        input.action
+    );
+
+    let request_tags_required = input
+        .policy
+        .requires_request_object_tags_for_action(input.action);
+    if request_tags_required && input.request_tags.is_none() {
+        return Err(required_policy_input_unavailable_error(
+            input.action,
+            "request tags",
+        ));
+    }
+    debug_assert!(
+        !(request_tags_required && input.request_tags.is_none()),
+        "bucket policy request for {:?} requires request tags",
+        input.action
+    );
+
     let mut request = auth::PolicyRequest::for_bucket(
         input.action,
         input.bucket_name,
@@ -171,7 +233,15 @@ fn bucket_policy_request<'a>(input: BucketPolicyRequestInput<'a>) -> auth::Polic
             .with_object_ownership(policy_context.object_ownership);
     }
 
-    request
+    Ok(request)
+}
+
+fn required_policy_input_unavailable_error(action: auth::PolicyAction, input: &str) -> ServerError {
+    ServerError::InternalError {
+        reason: format!(
+            "bucket policy request builder missing required {input} input for {action:?}"
+        ),
+    }
 }
 
 pub(super) fn bucket_tags_for_policy_request(
@@ -224,7 +294,9 @@ pub(super) fn evaluate_bucket_policy_for_object_request(
     let existing_tags_required = context
         .policy
         .requires_existing_object_tags_for_action(context.action);
-    let existing_tags = if existing_tags_required {
+    let existing_tags = if existing_tags_required
+        && matches!(existing_object_tags_mode, ExistingObjectTagsMode::Available)
+    {
         Some(Coordinator::parse_policy_existing_object_tags(object)?)
     } else {
         None
@@ -265,10 +337,14 @@ pub(super) fn evaluate_bucket_policy_for_object_request(
         policy_context: context.policy_context,
         policy: context.policy,
         existing_object_tags,
+        existing_object_tags_not_evaluable: matches!(
+            existing_object_tags_mode,
+            ExistingObjectTagsMode::NotEvaluable
+        ),
         bucket_tags: &bucket_tags,
         request_object_tags: &request_object_tags,
         version_id: version_id.as_deref(),
-    });
+    })?;
     Ok(context.policy.evaluate(&policy_request))
 }
 
@@ -295,10 +371,11 @@ pub(super) fn bucket_policy_decision_for_key(
         policy_context: request.policy_context,
         policy,
         existing_object_tags: auth::bucket_policy::ExistingObjectTags::Unavailable,
+        existing_object_tags_not_evaluable: true,
         bucket_tags: &bucket_tags,
         request_object_tags: &no_request_object_tags,
         version_id: version_id.as_deref(),
-    });
+    })?;
     Ok(policy.evaluate(&policy_request))
 }
 
@@ -331,7 +408,9 @@ pub(super) fn bucket_policy_decision_for_bucket_loaded_with_tags(
     let request = bucket_policy_request(BucketPolicyRequestInput {
         requester,
         bucket_name: bucket.name.as_str(),
+        bucket_abac_enabled: bucket.bucket_abac_enabled,
         action,
+        policy,
         bucket_tags: if bucket_tags_available {
             auth::bucket_policy::BucketTags::Available(&bucket_tags)
         } else {
@@ -340,7 +419,7 @@ pub(super) fn bucket_policy_decision_for_bucket_loaded_with_tags(
         request_tags: None,
         policy_context: None,
         requested_max_keys: None,
-    });
+    })?;
     Ok(policy.evaluate(&request))
 }
 
@@ -394,7 +473,9 @@ pub(super) fn bucket_policy_decision_for_loaded_handle_with_context(
     let request = bucket_policy_request(BucketPolicyRequestInput {
         requester,
         bucket_name: bucket.bucket().name.as_str(),
+        bucket_abac_enabled: bucket.bucket().bucket_abac_enabled,
         action,
+        policy,
         bucket_tags: if bucket_tags_available {
             auth::bucket_policy::BucketTags::Available(&bucket_tags)
         } else {
@@ -403,7 +484,7 @@ pub(super) fn bucket_policy_decision_for_loaded_handle_with_context(
         request_tags: Some(&request_tags),
         policy_context: Some(policy_context),
         requested_max_keys: requested_max_keys.as_deref(),
-    });
+    })?;
     Ok(policy.evaluate(&request))
 }
 
@@ -438,10 +519,11 @@ pub(super) fn bucket_policy_decision_for_put_object_action(
         policy_context: request.policy_context,
         policy,
         existing_object_tags: auth::bucket_policy::ExistingObjectTags::Unavailable,
+        existing_object_tags_not_evaluable: true,
         bucket_tags: &bucket_tags,
         request_object_tags: &request_object_tags,
         version_id: version_id.as_deref(),
-    });
+    })?;
     Ok(policy.evaluate(&policy_request))
 }
 
@@ -683,5 +765,183 @@ pub(super) fn object_policy_decision(
             ExistingObjectTagsMode::Available,
         ),
         ObjectPolicyTarget::MissingKey(key) => bucket_policy_decision_for_key(coord, request, key),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn requester() -> Requester {
+        Requester::authenticated(s3_types::AccountIdentity::from_principal(
+            "arn:aws:iam::111122223333:user/requester",
+        ))
+    }
+
+    fn parse_policy(body: &str) -> auth::BucketPolicy {
+        auth::parse_bucket_policy(body).unwrap()
+    }
+
+    fn assert_required_input_error(error: ServerError, input: &str, action: auth::PolicyAction) {
+        match error {
+            ServerError::InternalError { reason } => {
+                assert!(
+                    reason.contains(input),
+                    "reason {reason:?} should mention {input}"
+                );
+                assert!(
+                    reason.contains(&format!("{action:?}")),
+                    "reason {reason:?} should mention {action:?}"
+                );
+            }
+            other => panic!("expected InternalError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn object_policy_request_rejects_missing_required_existing_object_tags() {
+        let requester = requester();
+        let policy = parse_policy(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::bucket/*","Condition":{"StringEquals":{"s3:ExistingObjectTag/security":"private"}}}]}"#,
+        );
+
+        let error = object_policy_request(ObjectPolicyRequestInput {
+            requester: &requester,
+            bucket_name: "bucket",
+            bucket_abac_enabled: false,
+            key: "key",
+            action: auth::PolicyAction::GetObject,
+            policy_context: PutObjectPolicyContext::default(),
+            policy: &policy,
+            existing_object_tags: auth::bucket_policy::ExistingObjectTags::Unavailable,
+            existing_object_tags_not_evaluable: false,
+            bucket_tags: &[],
+            request_object_tags: &[],
+            version_id: None,
+        })
+        .unwrap_err();
+
+        assert_required_input_error(error, "existing object tags", auth::PolicyAction::GetObject);
+    }
+
+    #[test]
+    fn object_policy_request_allows_not_evaluable_required_existing_object_tags() {
+        let requester = requester();
+        let policy = parse_policy(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::bucket/*","Condition":{"StringEquals":{"s3:ExistingObjectTag/security":"private"}}}]}"#,
+        );
+
+        let request = object_policy_request(ObjectPolicyRequestInput {
+            requester: &requester,
+            bucket_name: "bucket",
+            bucket_abac_enabled: false,
+            key: "key",
+            action: auth::PolicyAction::GetObject,
+            policy_context: PutObjectPolicyContext::default(),
+            policy: &policy,
+            existing_object_tags: auth::bucket_policy::ExistingObjectTags::Unavailable,
+            existing_object_tags_not_evaluable: true,
+            bucket_tags: &[],
+            request_object_tags: &[],
+            version_id: None,
+        })
+        .unwrap();
+
+        assert_eq!(policy.evaluate(&request), auth::PolicyEvaluation::NoMatch);
+    }
+
+    #[test]
+    fn object_policy_request_allows_accepted_but_not_evaluable_existing_object_tags() {
+        let requester = requester();
+        let policy = parse_policy(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Principal":"*","Action":"s3:GetObjectAttributes","Resource":"arn:aws:s3:::bucket/*","Condition":{"StringEquals":{"s3:ExistingObjectTag/security":"private"}}}]}"#,
+        );
+
+        let request = object_policy_request(ObjectPolicyRequestInput {
+            requester: &requester,
+            bucket_name: "bucket",
+            bucket_abac_enabled: false,
+            key: "key",
+            action: auth::PolicyAction::GetObjectAttributes,
+            policy_context: PutObjectPolicyContext::default(),
+            policy: &policy,
+            existing_object_tags: auth::bucket_policy::ExistingObjectTags::Unavailable,
+            existing_object_tags_not_evaluable: false,
+            bucket_tags: &[],
+            request_object_tags: &[],
+            version_id: None,
+        })
+        .unwrap();
+
+        assert_eq!(policy.evaluate(&request), auth::PolicyEvaluation::NoMatch);
+    }
+
+    #[test]
+    fn bucket_policy_request_rejects_missing_required_bucket_tags_when_abac_enabled() {
+        let requester = requester();
+        let policy = parse_policy(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Principal":"*","Action":"s3:GetBucketTagging","Resource":"arn:aws:s3:::bucket","Condition":{"StringEquals":{"s3:BucketTag/security":"private"}}}]}"#,
+        );
+
+        let error = bucket_policy_request(BucketPolicyRequestInput {
+            requester: &requester,
+            bucket_name: "bucket",
+            bucket_abac_enabled: true,
+            action: auth::PolicyAction::GetBucketTagging,
+            policy: &policy,
+            bucket_tags: auth::bucket_policy::BucketTags::Unavailable,
+            request_tags: None,
+            policy_context: None,
+            requested_max_keys: None,
+        })
+        .unwrap_err();
+
+        assert_required_input_error(error, "bucket tags", auth::PolicyAction::GetBucketTagging);
+    }
+
+    #[test]
+    fn bucket_policy_request_allows_unavailable_bucket_tags_when_abac_disabled() {
+        let requester = requester();
+        let policy = parse_policy(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Principal":"*","Action":"s3:GetBucketTagging","Resource":"arn:aws:s3:::bucket","Condition":{"StringEquals":{"s3:BucketTag/security":"private"}}}]}"#,
+        );
+
+        let request = bucket_policy_request(BucketPolicyRequestInput {
+            requester: &requester,
+            bucket_name: "bucket",
+            bucket_abac_enabled: false,
+            action: auth::PolicyAction::GetBucketTagging,
+            policy: &policy,
+            bucket_tags: auth::bucket_policy::BucketTags::Unavailable,
+            request_tags: None,
+            policy_context: None,
+            requested_max_keys: None,
+        })
+        .unwrap();
+
+        assert_eq!(policy.evaluate(&request), auth::PolicyEvaluation::NoMatch);
+    }
+
+    #[test]
+    fn bucket_policy_request_rejects_missing_required_request_tags() {
+        let requester = requester();
+        let policy = parse_policy(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Principal":"*","Action":"s3:TagResource","Resource":"arn:aws:s3:::bucket","Condition":{"StringEquals":{"aws:RequestTag/security":"private"}}}]}"#,
+        );
+
+        let error = bucket_policy_request(BucketPolicyRequestInput {
+            requester: &requester,
+            bucket_name: "bucket",
+            bucket_abac_enabled: false,
+            action: auth::PolicyAction::TagResource,
+            policy: &policy,
+            bucket_tags: auth::bucket_policy::BucketTags::Unavailable,
+            request_tags: None,
+            policy_context: None,
+            requested_max_keys: None,
+        })
+        .unwrap_err();
+
+        assert_required_input_error(error, "request tags", auth::PolicyAction::TagResource);
     }
 }

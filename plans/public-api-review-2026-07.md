@@ -435,14 +435,22 @@ sweeps so the next drift is a compile error.
   guarded API take a named `BucketIdentityGenerations` struct, and switching
   tests to either call a test helper that reads the current identity then calls
   the guarded API, or pass an explicit saved identity in stale-retry cases.
-- [ ] Bucket policy: `InputUnavailable` conditions silently skip Deny
-  statements (fail-open) while `Unsupported` correctly fails closed
-  (`auth/src/bucket_policy.rs:794-802`). server-core compensates by
-  pre-consulting `requires_existing_object_tags_for_action`
-  (`server-core/src/coordinator/authz/policy.rs:226-236`) but the protocol is
-  convention, not type-enforced. Fix: treat `InputUnavailable` like
-  `Unsupported` for Deny, or make builders take the inputs the parsed policy
-  declares it needs.
+- [x] Bucket policy: `InputUnavailable` is an AWS-semantics state, not
+  itself a correctness bug. The evaluator intentionally treats unavailable
+  inputs as nonoperative for both Allow and Deny so that accepted-but-not-
+  evaluable conditions stay AWS-compatible, for example
+  `s3:ExistingObjectTag/*` on `GetObjectAttributes`. The remaining P1 risk is
+  production wiring: a caller can still build a `PolicyRequest` with an
+  unavailable input even when the parsed policy declares that input is required
+  for this action. Current server-core callers mostly compensate by
+  pre-consulting `requires_*_for_action`, and the modern BOE bucket-tag path
+  already returns an internal error if required preloaded tags are missing, but
+  this convention is not uniformly type-enforced. Fix: keep evaluator semantics
+  unchanged; make production request builders return a controlled internal
+  error when `policy.requires_*_for_action(action)` is true but the supplied
+  input is unavailable, add debug assertions at the invariant boundary, and add
+  mechanical coverage for every legacy/modern call path plus the intentional
+  accepted-but-not-evaluable cases.
 
 ### P2. Duplicate entry points that drifted
 

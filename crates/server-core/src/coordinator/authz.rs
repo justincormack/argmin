@@ -154,6 +154,7 @@ struct BucketPolicyActionAuthorization<'a> {
 enum ExistingObjectTagsMode {
     Available,
     Unavailable,
+    NotEvaluable,
 }
 
 struct CopySourceReadSnapshotRequest<'a> {
@@ -1257,7 +1258,7 @@ impl Coordinator {
                 policy,
             },
             object,
-            ExistingObjectTagsMode::Unavailable,
+            ExistingObjectTagsMode::NotEvaluable,
             || Self::requester_can_read_object(requester, bucket, object),
         )
     }
@@ -1460,13 +1461,20 @@ impl Coordinator {
                 Self::effective_public_write(access.bucket),
             )
         };
-        let can_put_object = self.requester_can_put_object_action_with_bucket_policy(
-            BucketPolicyActionAuthorization {
-                request: access.request(auth::PolicyAction::PutObject, policy_context),
-                default_allowed,
-            },
-            key,
-        )?;
+        let put_object_request = access.request(auth::PolicyAction::PutObject, policy_context);
+        let can_put_object = if let Some(object) = existing_object {
+            self.requester_can_object_action_with_bucket_policy(put_object_request, object, || {
+                default_allowed
+            })?
+        } else {
+            self.requester_can_put_object_action_with_bucket_policy(
+                BucketPolicyActionAuthorization {
+                    request: put_object_request,
+                    default_allowed,
+                },
+                key,
+            )?
+        };
         if !can_put_object {
             return Ok(false);
         }
@@ -1489,16 +1497,23 @@ impl Coordinator {
             return Ok(true);
         }
 
-        self.requester_can_put_object_action_with_bucket_policy(
-            BucketPolicyActionAuthorization {
-                request: access.request(auth::PolicyAction::PutObjectTagging, policy_context),
-                default_allowed: Self::requester_can_bucket_owner_account_admin(
-                    access.requester,
-                    access.bucket,
-                ),
-            },
-            key,
-        )
+        let put_tagging_default_allowed =
+            Self::requester_can_bucket_owner_account_admin(access.requester, access.bucket);
+        let put_tagging_request =
+            access.request(auth::PolicyAction::PutObjectTagging, policy_context);
+        if let Some(object) = existing_object {
+            self.requester_can_object_action_with_bucket_policy(put_tagging_request, object, || {
+                put_tagging_default_allowed
+            })
+        } else {
+            self.requester_can_put_object_action_with_bucket_policy(
+                BucketPolicyActionAuthorization {
+                    request: put_tagging_request,
+                    default_allowed: put_tagging_default_allowed,
+                },
+                key,
+            )
+        }
     }
 
     fn requester_can_bucket_action_with_preloaded_tags_with_bucket_policy(
