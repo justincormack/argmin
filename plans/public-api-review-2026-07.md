@@ -181,7 +181,7 @@ steps it performs.
   this. Existing speculative baseline migrations should be audited and removed
   under Phase 0 of the storage upgrade/versioning plan.
 
-- [ ] **S3. `CompleteReadyPgPeerings` skips the node-service authorization
+- [x] **S3. `CompleteReadyPgPeerings` skips the node-service authorization
   its single-item twin enforces.** `CompletePgPeering` carries
   `node_incarnation` and calls `authorize_node_service_for_snapshot`
   (`control_plane.rs:1903-1924`); the batch apply (control_plane.rs:2010-2126)
@@ -192,7 +192,12 @@ steps it performs.
   already-Active-same-primary; batch rejects with `PgNotPeering`. Fix: add
   `node_incarnation` per completion and authorize (bump command version), or
   document why leader-derived batches deliberately skip it; align replay
-  behavior.
+  behavior. Resolution: `ReadyPgPeeringCompletion` now carries
+  `node_incarnation`, `CompleteReadyPgPeerings` authorizes each completion with
+  the same node-service lease/incarnation boundary as `CompletePgPeering`, and
+  exact Active replays are treated as no-op completions instead of
+  `PgNotPeering`. The control-plane command encoding baseline was bumped
+  because pre-alpha stores are not upgrade-supported yet.
 
 - [ ] **S4. Tautological `matches_request` argument neutralizes the
   generation check.** `cluster.rs:553-555` passes

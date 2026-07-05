@@ -6657,7 +6657,7 @@ fn metadata_command_bucket_write_release_is_idempotent_after_cleanup() {
             ClusterEpoch::INITIAL,
             "put-object",
             1,
-            Some(2),
+            2,
             Some("key=a"),
         )
         .unwrap();
@@ -6670,6 +6670,7 @@ fn metadata_command_bucket_write_release_is_idempotent_after_cleanup() {
             ClusterEpoch::INITIAL,
             reservation.bucket_execution_generation,
             reservation.bucket_incarnation_generation,
+            reservation.lease_deadline,
         )
         .unwrap();
     assert!(store
@@ -6685,6 +6686,7 @@ fn metadata_command_bucket_write_release_is_idempotent_after_cleanup() {
             ClusterEpoch::INITIAL,
             reservation.bucket_execution_generation,
             reservation.bucket_incarnation_generation,
+            reservation.lease_deadline,
         )
         .unwrap();
 }

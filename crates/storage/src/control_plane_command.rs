@@ -8,7 +8,7 @@ use crate::{ClusterEpoch, PgClusterMapHistoryReferenceSummary};
 use placement::NodeId;
 
 const CONTROL_PLANE_COMMAND_MAGIC: &[u8; 8] = b"ARGCPCMD";
-const CONTROL_PLANE_COMMAND_VERSION: u16 = 1;
+const CONTROL_PLANE_COMMAND_VERSION: u16 = 2;
 const CONTROL_PLANE_COMMAND_CHECKSUM_LEN: usize = 8;
 const CONTROL_PLANE_SNAPSHOT_MAGIC: &[u8; 8] = b"ARGCPSNP";
 const CONTROL_PLANE_SNAPSHOT_VERSION: u16 = 1;
@@ -17,7 +17,7 @@ const CONTROL_PLANE_COMMAND_BOOTSTRAP_NODE_MIN_LEN: usize = 8;
 const CONTROL_PLANE_COMMAND_ACTING_SET_NODE_MIN_LEN: usize = 4;
 const CONTROL_PLANE_COMMAND_PG_MIN_LEN: usize = 4;
 const CONTROL_PLANE_COMMAND_HEARTBEAT_OBSERVATION_MIN_LEN: usize = 30;
-const CONTROL_PLANE_COMMAND_READY_PG_MIN_LEN: usize = 40;
+const CONTROL_PLANE_COMMAND_READY_PG_MIN_LEN: usize = 48;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ControlPlaneCommand {
@@ -160,6 +160,7 @@ impl std::fmt::Display for ControlPlaneCommand {
 pub struct ReadyPgPeeringCompletion {
     pub pg_id: PgId,
     pub primary: NodeId,
+    pub node_incarnation: u64,
     pub active_metadata_proof: PgMetadataProof,
     pub active_metadata_proof_epoch: ClusterEpoch,
 }
@@ -257,6 +258,7 @@ pub fn encode_control_plane_command(
             for completion in ready {
                 write_u32(&mut out, completion.pg_id.get());
                 write_u32(&mut out, completion.primary.as_u32());
+                write_u64(&mut out, completion.node_incarnation);
                 write_pg_metadata_proof(&mut out, completion.active_metadata_proof);
                 write_u64(&mut out, completion.active_metadata_proof_epoch.get());
             }
@@ -377,6 +379,7 @@ pub fn decode_control_plane_command(
                 ready.push(ReadyPgPeeringCompletion {
                     pg_id: PgId::new(reader.read_u32()?),
                     primary: NodeId::new(reader.read_u32()?),
+                    node_incarnation: reader.read_u64()?,
                     active_metadata_proof: read_pg_metadata_proof(&mut reader)?,
                     active_metadata_proof_epoch: read_cluster_epoch(
                         &mut reader,
@@ -1367,6 +1370,7 @@ mod tests {
                 ready: vec![ReadyPgPeeringCompletion {
                     pg_id: PgId::new(3),
                     primary: NodeId::new(1),
+                    node_incarnation: 12,
                     active_metadata_proof: proof,
                     active_metadata_proof_epoch: ClusterEpoch::new(13).unwrap(),
                 }],
@@ -1556,8 +1560,8 @@ mod tests {
     fn control_plane_command_codec_rejects_incompatible_or_malformed_payloads() {
         assert_decode_error_contains(b"not a command", "truncated");
 
-        let encoded = command_frame_with_version(2, 5, |body| write_u64(body, 1_000));
-        assert_decode_error_contains(&encoded, "unsupported control-plane command version 2");
+        let encoded = command_frame_with_version(1, 5, |body| write_u64(body, 1_000));
+        assert_decode_error_contains(&encoded, "unsupported control-plane command version 1");
 
         let mut encoded = encode_control_plane_command(&ControlPlaneCommand::SetPgState {
             pg_id: PgId::new(7),
