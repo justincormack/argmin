@@ -2040,6 +2040,16 @@ fn unix_bucket_metadata_client_releases_bucket_write_proof() {
         .unwrap();
     server_thread.join().unwrap();
 
+    let server = StorageNodeServer::bind(config.clone()).unwrap();
+    let server_thread = thread::spawn(move || server.accept_one().unwrap());
+    client
+        .release_metadata_command_bucket_write_reservation(
+            PgId::new(0),
+            &BucketWriteReservationProof::from(&reservation),
+        )
+        .unwrap();
+    server_thread.join().unwrap();
+
     let node = SharedStorageNode::open_with_default_ec_shape(
         &config.data_dir,
         &config.pg_ids,

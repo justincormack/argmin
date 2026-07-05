@@ -461,15 +461,18 @@ sweeps so the next drift is a compile error.
 
 (A1-A9 above are the worst case. Remaining instances:)
 
-- [ ] Two reservation-release APIs with opposite not-found semantics:
+- [x] Two reservation-release APIs with opposite not-found semantics:
   `release_durable_bucket_write_reservation` errors on 0 rows
   (`pg_store/metadata.rs:5606-5610`);
   `release_metadata_command_bucket_write_reservation` returns `Ok`
-  (metadata.rs:5683-5685). Unify or document (e.g. return
-  `enum Released { Deleted, AlreadyGone }`). Also document that
-  `BucketWriteReservationProof::matches_record` deliberately skips
-  `lease_deadline` (`metadata_command.rs:960-970`) — it looks like an
-  omission.
+  (metadata.rs:5683-5685). Resolution: keep the split because the durable
+  release is a live owner release where missing rows indicate stale/conflicting
+  ownership, while metadata-command release is terminal command cleanup that
+  must be idempotent under replay/recovery. The trait docs now state both
+  contracts, store and Unix RPC tests pin the idempotent metadata-command
+  release path, and `BucketWriteReservationProof::matches_record` documents
+  that it deliberately skips mutable `lease_deadline` because freshness is
+  checked separately from proof identity.
 - [ ] `SystemMetadata::from_headers` / `from_pairs` are byte-identical
   (`system_metadata.rs:114-116, 186-188`) while `MetadataBlob`'s same-named
   pair differ materially: `MetadataBlob::from_pairs` skips the

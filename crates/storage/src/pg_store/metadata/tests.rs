@@ -6643,6 +6643,53 @@ fn durable_bucket_write_coordination_does_not_dirty_metadata_command_state() {
 }
 
 #[test]
+fn metadata_command_bucket_write_release_is_idempotent_after_cleanup() {
+    let tmp = test_util::tempdir();
+    let store = PgStore::open(tmp.path(), 1).unwrap();
+    let bucket = trusted_bucket_name("metadata-command-release-idempotent");
+    create_probe_bucket_direct(&store, &bucket);
+
+    let reservation = store
+        .acquire_durable_bucket_write_reservation(
+            &bucket,
+            "reservation-1",
+            "owner-token-1",
+            ClusterEpoch::INITIAL,
+            "put-object",
+            1,
+            Some(2),
+            Some("key=a"),
+        )
+        .unwrap();
+
+    store
+        .release_metadata_command_bucket_write_reservation(
+            &bucket,
+            "reservation-1",
+            "owner-token-1",
+            ClusterEpoch::INITIAL,
+            reservation.bucket_execution_generation,
+            reservation.bucket_incarnation_generation,
+        )
+        .unwrap();
+    assert!(store
+        .durable_bucket_write_reservation(&bucket, "reservation-1")
+        .unwrap()
+        .is_none());
+
+    store
+        .release_metadata_command_bucket_write_reservation(
+            &bucket,
+            "reservation-1",
+            "owner-token-1",
+            ClusterEpoch::INITIAL,
+            reservation.bucket_execution_generation,
+            reservation.bucket_incarnation_generation,
+        )
+        .unwrap();
+}
+
+#[test]
 fn bucket_execution_generation_candidate_advances_only_on_command_apply() {
     let tmp = test_util::tempdir();
     let store = PgStore::open(tmp.path(), 1).unwrap();

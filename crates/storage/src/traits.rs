@@ -125,7 +125,11 @@ pub(crate) trait PgMetadataStore {
         heartbeat: DurableBucketWriteReservationHeartbeat<'_>,
     ) -> Result<BucketWriteReservationRecord, MetadataError>;
 
-    /// Release a durable bucket write reservation by exact identity.
+    /// Release a live durable bucket write reservation by exact identity.
+    ///
+    /// A missing row is an error here: live callers should only release a
+    /// reservation they still own, so zero deleted rows indicates a stale,
+    /// conflicting, or double release.
     #[allow(dead_code)]
     fn release_durable_bucket_write_reservation(
         &self,
@@ -144,6 +148,10 @@ pub(crate) trait PgMetadataStore {
     /// bucket write reservation into the metadata command stream. It releases
     /// the durable reservation row in one PG transaction so a terminal command
     /// cannot lose its retry driver while leaving the bucket fenced.
+    ///
+    /// A missing row is success here. Metadata command completion and recovery
+    /// cleanup may replay after an earlier attempt already deleted the row;
+    /// only an existing row with different identity is a conflict.
     fn release_metadata_command_bucket_write_reservation(
         &self,
         name: &BucketName,

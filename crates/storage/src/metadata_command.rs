@@ -958,6 +958,9 @@ impl From<&BucketWriteReservationRecord> for BucketWriteReservationProof {
 
 impl BucketWriteReservationProof {
     pub(crate) fn matches_record(&self, record: &BucketWriteReservationRecord) -> bool {
+        // The lease deadline is mutable heartbeat state, not stable proof
+        // identity. Callers that need freshness validate the deadline
+        // separately after matching the stable reservation fields.
         self.bucket == record.bucket
             && self.reservation_id == record.reservation_id
             && self.owner_token == record.owner_token
