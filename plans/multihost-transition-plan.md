@@ -10847,6 +10847,12 @@ Phase 12.4 progress:
   its base offset. The remaining WAL-only crash test stays in place as a
   pre-response crash guarantee: if the process exits after fsync but before the
   checkpoint/response, artifact-plus-WAL replay still recovers the mutation.
+- Removed retained-WAL frame replay from the replicated-authority status hot
+  path. WAL-backed status now reads only the CRC-protected file header and file
+  length to report base/clean offsets, while checkpoint/restart replay still
+  decodes and validates frames. A regression corrupts a middle WAL frame and
+  proves status remains cheap/available while replay fails closed on the same
+  corruption.
 
 1. define the replicated control-plane state machine:
    - state includes cluster epoch, PG count, PG state, PG acting sets, node
