@@ -1106,8 +1106,7 @@ fn completed_metadata_transfer_live_summary(
         {
             Ok(runtime_map) => runtime_map,
             Err(error) => {
-                let message = error.to_string();
-                if control_plane_runtime_map_not_ready_for_serving(&message) {
+                if control_plane_metadata_transfer_observation_error_is_retryable(&error) {
                     if Instant::now() >= deadline {
                         return Ok(None);
                     }
@@ -1216,8 +1215,7 @@ fn control_plane_pg_active_with_acting_set(
         match control_plane.pg_runtime_map_snapshot(pg_id, storage::clock::current_time_millis()) {
             Ok(runtime_map) => runtime_map,
             Err(error) => {
-                let message = error.to_string();
-                if control_plane_runtime_map_not_ready_for_serving(&message) {
+                if control_plane_metadata_transfer_observation_error_is_retryable(&error) {
                     return Ok(false);
                 }
                 return Err(format!(
@@ -1246,6 +1244,13 @@ fn control_plane_runtime_map_not_ready_for_serving(message: &str) -> bool {
             && message.contains(" has not reported active state in cluster epoch "))
         || (message.contains(" reported unresolved pending metadata command for PG ")
             && message.contains(" in cluster epoch "))
+}
+
+fn control_plane_metadata_transfer_observation_error_is_retryable(
+    error: &ControlPlaneError,
+) -> bool {
+    error.is_retryable_read_only_rpc_transport_error()
+        || control_plane_runtime_map_not_ready_for_serving(&error.to_string())
 }
 
 fn metadata_transfer_error_is_transient_route_refresh(error: &PgMetadataTransferError) -> bool {
@@ -1627,12 +1632,15 @@ impl ControlPlaneHeartbeatRuntimeMapSource for ExperimentalRaftControlPlane {
     ) -> Result<ControlPlaneHeartbeatRefresh, ControlPlaneError> {
         let authority_now_ms = self.authority_now_ms(authority_now_ms);
         let node_id = heartbeat.node_id;
-        let observed_epoch = heartbeat.observed_epoch;
+        let requested_observed_epoch = heartbeat.observed_epoch;
         let requested_lease_duration_ms = heartbeat.requested_lease_duration_ms;
         let lease_deadline_ms = authority_now_ms
             .checked_add(requested_lease_duration_ms)
             .ok_or(ControlPlaneError::LeaseDeadlineOverflow)?;
         let pre_record_snapshot = self.current_snapshot()?;
+        let previous_observed_epoch = pre_record_snapshot
+            .node(node_id)
+            .and_then(|node| node.last_observed_epoch());
         let lease_deadline_ms = pre_record_snapshot
             .node(node_id)
             .and_then(|node| node.lease_deadline_ms())
@@ -1648,7 +1656,7 @@ impl ControlPlaneHeartbeatRuntimeMapSource for ExperimentalRaftControlPlane {
         let snapshot = self.current_snapshot()?;
         let mut lease = snapshot.heartbeat_lease_after_record(
             node_id,
-            observed_epoch,
+            requested_observed_epoch,
             pre_record_epoch,
             lease_deadline_ms,
             authority_now_ms,
@@ -1663,6 +1671,14 @@ impl ControlPlaneHeartbeatRuntimeMapSource for ExperimentalRaftControlPlane {
                 .current_snapshot()?
                 .current_heartbeat_lease_for_node(node_id, authority_now_ms)?;
         }
+        let current_snapshot = self.current_snapshot()?;
+        let current_epoch = current_snapshot.cluster_epoch();
+        let observed_epoch = [Some(requested_observed_epoch), previous_observed_epoch]
+            .into_iter()
+            .flatten()
+            .filter(|observed_epoch| *observed_epoch <= current_epoch)
+            .max()
+            .unwrap_or(requested_observed_epoch);
         let runtime_map = self
             .current_snapshot()?
             .runtime_map_for_storage_node_refresh(authority_now_ms, node_id, observed_epoch)?;
@@ -3006,10 +3022,17 @@ fn build_control_plane_storage_node_process_config(
         .map_err(|error| {
             format!("failed to recover storage node for startup heartbeat: {error}")
         })?;
-    // Control-plane managed storage nodes learn their current runtime map from
-    // this startup heartbeat; the static ARGMIN_STORAGE_CLUSTER_EPOCH belongs
-    // only to the legacy no-control-plane path.
-    let observed_epoch = ClusterEpoch::INITIAL;
+    // Control-plane managed storage nodes learn their runtime map from the
+    // control plane. On restart, use the last locally installed runtime config
+    // as the heartbeat baseline so the authority can return a bounded delta
+    // instead of replaying all history since the oldest durable placement.
+    let startup_runtime_config = StorageNodeProcessConfig::load_control_plane_runtime_config(
+        node_data_dir_path,
+        node_id,
+        default_ec_shape,
+        configured_socket_path,
+    )
+    .map_err(|error| format!("failed to load storage-node startup runtime config: {error}"))?;
     let lease_ms = u64::try_from(config.control_plane_heartbeat_lease_duration.as_millis())
         .map_err(|_| "ARGMIN_CONTROL_PLANE_HEARTBEAT_LEASE_MS is too large".to_string())?;
     let retry_deadline = control_plane_startup_retry_deadline(config);
@@ -3018,16 +3041,25 @@ fn build_control_plane_storage_node_process_config(
     let mut attempts = 0_u32;
     let refresh = loop {
         attempts = attempts.saturating_add(1);
-        let heartbeat = node
-            .control_plane_heartbeat(
-                node_id,
-                node_incarnation,
-                configured_socket_path,
-                observed_epoch,
-                lease_ms,
-                std::iter::empty(),
-            )
-            .map_err(|error| format!("failed to build storage-node startup heartbeat: {error}"))?;
+        let heartbeat = match startup_runtime_config.as_ref() {
+            Some(runtime_config) => runtime_config
+                .control_plane_heartbeat(&node, node_incarnation, lease_ms)
+                .map_err(|error| {
+                    format!("failed to build storage-node startup heartbeat: {error}")
+                })?,
+            None => node
+                .control_plane_heartbeat(
+                    node_id,
+                    node_incarnation,
+                    configured_socket_path,
+                    ClusterEpoch::INITIAL,
+                    lease_ms,
+                    std::iter::empty(),
+                )
+                .map_err(|error| {
+                    format!("failed to build storage-node startup heartbeat: {error}")
+                })?,
+        };
         match UnixControlPlaneClient::new(control_plane_socket_path)
             .refresh_node_heartbeat(heartbeat, storage::clock::current_time_millis())
             .map_err(|error| {
@@ -3059,12 +3091,28 @@ fn build_control_plane_storage_node_process_config(
         }
     };
     let (_lease, runtime_map) = refresh.into_parts();
-    let node_config = StorageNodeProcessConfig::from_runtime_map(
-        node_id,
-        node_data_dir_path.to_path_buf(),
-        default_ec_shape,
-        &runtime_map,
-    )
+    let node_config = match startup_runtime_config.as_ref() {
+        Some(runtime_config) => {
+            let history_reference_summary =
+                node.cluster_map_history_reference_summary()
+                    .map_err(|error| {
+                        format!(
+                        "failed to read storage-node startup history reference summary: {error}"
+                    )
+                    })?;
+            StorageNodeProcessConfig::from_runtime_map_refresh(
+                runtime_config,
+                &runtime_map,
+                history_reference_summary,
+            )
+        }
+        None => StorageNodeProcessConfig::from_runtime_map(
+            node_id,
+            node_data_dir_path.to_path_buf(),
+            default_ec_shape,
+            &runtime_map,
+        ),
+    }
     .map_err(|error| error.to_string())?;
     if node_config.socket_path != Path::new(configured_socket_path) {
         return Err(format!(
@@ -3074,6 +3122,11 @@ fn build_control_plane_storage_node_process_config(
             node_id.as_u32()
         ));
     }
+    node_config
+        .persist_control_plane_runtime_config()
+        .map_err(|error| {
+            format!("failed to persist storage-node startup runtime config: {error}")
+        })?;
     Ok((node_config, Some(node_incarnation), Some(data_dir_guard)))
 }
 
@@ -4361,6 +4414,125 @@ mod tests {
                 .lease_deadline_ms(),
             Some(41_000)
         );
+
+        harness.shutdown();
+    }
+
+    #[test]
+    fn experimental_raft_restart_refresh_uses_control_plane_last_observed_epoch() {
+        let mut harness = experimental_raft_test_harness("restart-observed-epoch-test");
+        let mut config = test_server_config();
+        config.storage_node_sockets = vec![config::ConfiguredStorageNodeSocket {
+            node_id: 1,
+            socket_path: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
+        }];
+        config.storage_pg_ids = vec![30];
+        bootstrap_empty_experimental_raft_control_plane(&mut harness.control_plane, &config)
+            .expect("experimental raft control-plane bootstrap should succeed");
+
+        let bootstrap_epoch = harness
+            .control_plane
+            .current_snapshot()
+            .expect("experimental snapshot should read")
+            .cluster_epoch();
+        harness
+            .control_plane
+            .refresh_node_heartbeat(
+                NodeHeartbeat {
+                    node_id: NodeId::new(1),
+                    node_incarnation: 1,
+                    endpoint: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
+                    observed_epoch: bootstrap_epoch,
+                    requested_lease_duration_ms: 1_000,
+                    cluster_map_history_reference_summary:
+                        storage::PgClusterMapHistoryReferenceSummary::default(),
+                    pg_observations: Vec::new(),
+                },
+                60_000,
+            )
+            .expect("experimental raft startup heartbeat should refresh");
+        let protected_epoch = harness
+            .control_plane
+            .current_snapshot()
+            .expect("experimental snapshot should read after startup")
+            .cluster_epoch();
+        let protected_floor = storage::PgClusterMapHistoryReferenceSummary {
+            oldest_live_placement_epoch: Some(protected_epoch),
+            oldest_durable_backfill_epoch: None,
+        };
+        for node_id in 10..18 {
+            harness
+                .control_plane
+                .submit_raft_command(ControlPlaneCommand::SetNodeMembership {
+                    node_id: NodeId::new(node_id),
+                    membership: NodeMembershipState::Active,
+                })
+                .expect("experimental raft node membership should update");
+        }
+        let observed_epoch = harness
+            .control_plane
+            .current_snapshot()
+            .expect("experimental snapshot should read after churn")
+            .cluster_epoch();
+        harness
+            .control_plane
+            .refresh_node_heartbeat(
+                NodeHeartbeat {
+                    node_id: NodeId::new(1),
+                    node_incarnation: 1,
+                    endpoint: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
+                    observed_epoch,
+                    requested_lease_duration_ms: 1_000,
+                    cluster_map_history_reference_summary: protected_floor,
+                    pg_observations: Vec::new(),
+                },
+                61_000,
+            )
+            .expect("experimental raft observed heartbeat should refresh");
+
+        let restart_heartbeat = NodeHeartbeat {
+            node_id: NodeId::new(1),
+            node_incarnation: 2,
+            endpoint: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
+            observed_epoch: ClusterEpoch::INITIAL,
+            requested_lease_duration_ms: 1_000,
+            cluster_map_history_reference_summary: protected_floor,
+            pg_observations: Vec::new(),
+        };
+        harness
+            .control_plane
+            .submit_raft_command(ControlPlaneCommand::RecordNodeHeartbeat {
+                heartbeat: restart_heartbeat.clone(),
+                heartbeat_at_ms: 62_000,
+                lease_deadline_ms: 63_000,
+            })
+            .expect("lost experimental raft restart heartbeat response should still apply");
+        assert_eq!(
+            harness
+                .control_plane
+                .current_snapshot()
+                .expect("experimental snapshot should read after lost heartbeat")
+                .node(NodeId::new(1))
+                .and_then(|node| node.last_observed_epoch()),
+            Some(observed_epoch),
+            "stale restart heartbeat must not regress stored observed epoch"
+        );
+
+        let restart_refresh = harness
+            .control_plane
+            .refresh_node_heartbeat(restart_heartbeat, 63_000)
+            .expect("experimental raft restart heartbeat should refresh");
+
+        assert!(restart_refresh
+            .runtime_map()
+            .historical_pg_routes()
+            .iter()
+            .all(|route| route.cluster_epoch() >= observed_epoch));
+        assert!(!restart_refresh
+            .runtime_map()
+            .historical_pg_routes()
+            .iter()
+            .any(|route| route.cluster_epoch() == protected_epoch));
 
         harness.shutdown();
     }
@@ -6479,21 +6651,51 @@ mod tests {
 
     #[test]
     fn metadata_transfer_active_check_treats_incomplete_runtime_map_as_retryable() {
-        assert!(control_plane_runtime_map_not_ready_for_serving(
-            "control-plane RPC remote error: PG 1 has no serving primary in cluster epoch 26"
+        assert!(
+            control_plane_metadata_transfer_observation_error_is_retryable(
+                &ControlPlaneError::RpcRemote {
+                    message: "PG 1 has no serving primary in cluster epoch 26".to_string(),
+                }
+            )
+        );
+        assert!(
+            control_plane_metadata_transfer_observation_error_is_retryable(
+                &ControlPlaneError::RpcRemote {
+                    message:
+                        "PG 0 primary node 2 has not reported active state in cluster epoch 31"
+                            .to_string(),
+                }
+            )
+        );
+        assert!(control_plane_metadata_transfer_observation_error_is_retryable(
+            &ControlPlaneError::RpcRemote {
+                message:
+                    "node 1 reported unresolved pending metadata command for PG 27 in cluster epoch 83"
+                        .to_string(),
+            }
         ));
-        assert!(control_plane_runtime_map_not_ready_for_serving(
-            "control-plane RPC remote error: PG 0 primary node 2 has not reported active state in cluster epoch 31"
-        ));
-        assert!(control_plane_runtime_map_not_ready_for_serving(
-            "control-plane RPC remote error: node 1 reported unresolved pending metadata command for PG 27 in cluster epoch 83"
-        ));
-        assert!(control_plane_runtime_map_not_ready_for_serving(
-            "control-plane runtime map has no routed PGs"
-        ));
-        assert!(!control_plane_runtime_map_not_ready_for_serving(
-            "control-plane RPC remote error: unknown PG 99"
-        ));
+        assert!(
+            control_plane_metadata_transfer_observation_error_is_retryable(
+                &ControlPlaneError::RpcRemote {
+                    message: "control-plane runtime map has no routed PGs".to_string(),
+                }
+            )
+        );
+        assert!(
+            control_plane_metadata_transfer_observation_error_is_retryable(
+                &ControlPlaneError::Io {
+                    context: "read control-plane RPC magic",
+                    source: io::Error::from(io::ErrorKind::WouldBlock),
+                }
+            )
+        );
+        assert!(
+            !control_plane_metadata_transfer_observation_error_is_retryable(
+                &ControlPlaneError::RpcRemote {
+                    message: "unknown PG 99".to_string(),
+                }
+            )
+        );
     }
 
     #[test]

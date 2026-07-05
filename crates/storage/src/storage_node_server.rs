@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::os::fd::AsRawFd;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -364,6 +365,8 @@ impl StorageNodeControlPlaneRefresh {
 }
 
 impl StorageNodeProcessConfig {
+    const CONTROL_PLANE_RUNTIME_CONFIG_FILE: &'static str = "control-plane-runtime-config-v1";
+
     pub fn from_runtime_map(
         node_id: NodeId,
         data_dir: impl Into<PathBuf>,
@@ -497,6 +500,71 @@ impl StorageNodeProcessConfig {
         Ok(())
     }
 
+    pub fn load_control_plane_runtime_config(
+        data_dir: impl AsRef<Path>,
+        node_id: NodeId,
+        default_ec_shape: EcShape,
+        socket_path: impl AsRef<Path>,
+    ) -> Result<Option<Self>, StorageNodeServerError> {
+        let data_dir = data_dir.as_ref();
+        let path = control_plane_runtime_config_path(data_dir);
+        let raw = match fs::read_to_string(&path) {
+            Ok(raw) => raw,
+            Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(source) => return Err(StorageNodeServerError::RuntimeConfigRead { path, source }),
+        };
+        let config = decode_control_plane_runtime_config(
+            &path,
+            data_dir.to_path_buf(),
+            default_ec_shape,
+            &raw,
+        )?;
+        if config.node_id != node_id {
+            return Err(StorageNodeServerError::RuntimeConfigInvalid {
+                path,
+                message: format!(
+                    "runtime config node {} does not match expected node {}",
+                    config.node_id.as_u32(),
+                    node_id.as_u32()
+                ),
+            });
+        }
+        if config.socket_path != socket_path.as_ref() {
+            return Err(StorageNodeServerError::RuntimeConfigInvalid {
+                path,
+                message: format!(
+                    "runtime config socket path {:?} does not match expected {:?}",
+                    config.socket_path,
+                    socket_path.as_ref()
+                ),
+            });
+        }
+        validate_process_config_route_table(&config)?;
+        Ok(Some(config))
+    }
+
+    pub fn persist_control_plane_runtime_config(&self) -> Result<(), StorageNodeServerError> {
+        prepare_private_data_dir(&self.data_dir).map_err(|source| {
+            StorageNodeServerError::RuntimeConfigWrite {
+                path: self.data_dir.clone(),
+                source,
+            }
+        })?;
+        let path = control_plane_runtime_config_path(&self.data_dir);
+        let tmp_path = path.with_extension("tmp");
+        let contents = encode_control_plane_runtime_config(self);
+        fs::write(&tmp_path, contents).map_err(|source| {
+            StorageNodeServerError::RuntimeConfigWrite {
+                path: tmp_path.clone(),
+                source,
+            }
+        })?;
+        fs::rename(&tmp_path, &path).map_err(|source| StorageNodeServerError::RuntimeConfigWrite {
+            path: path.clone(),
+            source,
+        })
+    }
+
     pub fn control_plane_heartbeat(
         &self,
         node: &SharedStorageNode,
@@ -571,6 +639,366 @@ fn metadata_transfer_source_route_keys_for_refresh(
                 .map(|source_epoch| (source_epoch, route.pg_id().get()))
         })
         .collect()
+}
+
+fn control_plane_runtime_config_path(data_dir: &Path) -> PathBuf {
+    data_dir.join(StorageNodeProcessConfig::CONTROL_PLANE_RUNTIME_CONFIG_FILE)
+}
+
+fn encode_control_plane_runtime_config(config: &StorageNodeProcessConfig) -> String {
+    let mut out = String::new();
+    out.push_str("argmin-storage-node-runtime-config-v1\n");
+    out.push_str(&format!("node_id {}\n", config.node_id.as_u32()));
+    out.push_str(&format!("cluster_epoch {}\n", config.cluster_epoch.get()));
+    match config.route_map_valid_until_ms {
+        Some(valid_until_ms) => out.push_str(&format!("valid_until {valid_until_ms}\n")),
+        None => out.push_str("valid_until none\n"),
+    }
+    out.push_str(&format!(
+        "ec_shape {} {}\n",
+        config.default_ec_shape.k, config.default_ec_shape.m
+    ));
+    out.push_str(&format!(
+        "socket_path {}\n",
+        hex_encode_path(&config.socket_path)
+    ));
+    out.push_str(&format!("pg_ids {}\n", config.pg_ids.len()));
+    for pg_id in &config.pg_ids {
+        out.push_str(&format!("{pg_id}\n"));
+    }
+    encode_storage_node_routes(&mut out, "pg_routes", &config.pg_routes);
+    encode_storage_node_routes(
+        &mut out,
+        "historical_pg_routes",
+        &config.historical_pg_routes,
+    );
+    out
+}
+
+fn encode_storage_node_routes(out: &mut String, label: &str, routes: &[StorageNodePgRoute]) {
+    out.push_str(&format!("{label} {}\n", routes.len()));
+    for route in routes {
+        out.push_str(&format!(
+            "{} {} {} {} {}",
+            route.pg_id,
+            route.cluster_epoch.get(),
+            pg_state_code(route.state),
+            route.primary_node_id.as_u32(),
+            route.acting_set.len()
+        ));
+        for node_id in &route.acting_set {
+            out.push_str(&format!(" {}", node_id.as_u32()));
+        }
+        out.push('\n');
+    }
+}
+
+fn decode_control_plane_runtime_config(
+    path: &Path,
+    data_dir: PathBuf,
+    default_ec_shape: EcShape,
+    raw: &str,
+) -> Result<StorageNodeProcessConfig, StorageNodeServerError> {
+    let mut lines = raw.lines();
+    let magic = lines
+        .next()
+        .ok_or_else(|| runtime_config_invalid(path, "empty config"))?;
+    if magic != "argmin-storage-node-runtime-config-v1" {
+        return Err(runtime_config_invalid(path, "invalid magic"));
+    }
+    let node_id = NodeId::new(parse_labeled_u32(path, lines.next(), "node_id")?);
+    let cluster_epoch = parse_labeled_cluster_epoch(path, lines.next(), "cluster_epoch")?;
+    let route_map_valid_until_ms = parse_labeled_optional_u64(path, lines.next(), "valid_until")?;
+    let stored_ec_shape = parse_labeled_ec_shape(path, lines.next(), "ec_shape")?;
+    if stored_ec_shape != default_ec_shape {
+        return Err(runtime_config_invalid(
+            path,
+            format!(
+                "stored EC shape {:?} does not match expected {:?}",
+                stored_ec_shape, default_ec_shape
+            ),
+        ));
+    }
+    let socket_path = parse_labeled_hex_path(path, lines.next(), "socket_path")?;
+    let pg_id_count = parse_labeled_usize(path, lines.next(), "pg_ids")?;
+    let mut pg_ids = Vec::with_capacity(pg_id_count);
+    for _ in 0..pg_id_count {
+        let line = lines
+            .next()
+            .ok_or_else(|| runtime_config_invalid(path, "missing PG id"))?;
+        pg_ids.push(parse_u32_field(path, line, "PG id")?);
+    }
+    let pg_routes = decode_storage_node_routes(path, &mut lines, "pg_routes")?;
+    let historical_pg_routes =
+        decode_storage_node_routes(path, &mut lines, "historical_pg_routes")?;
+    if lines.next().is_some() {
+        return Err(runtime_config_invalid(path, "trailing data"));
+    }
+    Ok(StorageNodeProcessConfig {
+        node_id,
+        cluster_epoch,
+        route_map_valid_until_ms,
+        data_dir,
+        default_ec_shape,
+        pg_ids,
+        socket_path,
+        pg_routes,
+        historical_pg_routes,
+    })
+}
+
+fn decode_storage_node_routes<'a>(
+    path: &Path,
+    lines: &mut impl Iterator<Item = &'a str>,
+    label: &str,
+) -> Result<Vec<StorageNodePgRoute>, StorageNodeServerError> {
+    let count = parse_labeled_usize(path, lines.next(), label)?;
+    let mut routes = Vec::with_capacity(count);
+    for _ in 0..count {
+        let line = lines
+            .next()
+            .ok_or_else(|| runtime_config_invalid(path, format!("missing {label} route")))?;
+        let fields: Vec<_> = line.split_whitespace().collect();
+        if fields.len() < 5 {
+            return Err(runtime_config_invalid(
+                path,
+                format!("{label} route has too few fields"),
+            ));
+        }
+        let acting_len = parse_usize_field(path, fields[4], "acting set length")?;
+        if fields.len() != 5 + acting_len {
+            return Err(runtime_config_invalid(
+                path,
+                format!("{label} route acting set length mismatch"),
+            ));
+        }
+        let mut acting_set = Vec::with_capacity(acting_len);
+        for field in &fields[5..] {
+            acting_set.push(NodeId::new(parse_u32_field(
+                path,
+                field,
+                "acting set node",
+            )?));
+        }
+        routes.push(StorageNodePgRoute {
+            pg_id: parse_u32_field(path, fields[0], "route PG id")?,
+            cluster_epoch: parse_cluster_epoch_field(path, fields[1], "route cluster epoch")?,
+            state: pg_state_from_code(parse_u8_field(path, fields[2], "route PG state")?)
+                .ok_or_else(|| runtime_config_invalid(path, "invalid route PG state"))?,
+            primary_node_id: NodeId::new(parse_u32_field(path, fields[3], "primary node")?),
+            acting_set,
+        });
+    }
+    Ok(routes)
+}
+
+fn parse_labeled_u32(
+    path: &Path,
+    line: Option<&str>,
+    label: &str,
+) -> Result<u32, StorageNodeServerError> {
+    parse_labeled_field(path, line, label, |path, value| {
+        parse_u32_field(path, value, label)
+    })
+}
+
+fn parse_labeled_usize(
+    path: &Path,
+    line: Option<&str>,
+    label: &str,
+) -> Result<usize, StorageNodeServerError> {
+    parse_labeled_field(path, line, label, |path, value| {
+        parse_usize_field(path, value, label)
+    })
+}
+
+fn parse_labeled_cluster_epoch(
+    path: &Path,
+    line: Option<&str>,
+    label: &str,
+) -> Result<ClusterEpoch, StorageNodeServerError> {
+    parse_labeled_field(path, line, label, |path, value| {
+        parse_cluster_epoch_field(path, value, label)
+    })
+}
+
+fn parse_labeled_optional_u64(
+    path: &Path,
+    line: Option<&str>,
+    label: &str,
+) -> Result<Option<u64>, StorageNodeServerError> {
+    parse_labeled_field(path, line, label, |path, value| {
+        if value == "none" {
+            Ok(None)
+        } else {
+            parse_u64_field(path, value, label).map(Some)
+        }
+    })
+}
+
+fn parse_labeled_ec_shape(
+    path: &Path,
+    line: Option<&str>,
+    label: &str,
+) -> Result<EcShape, StorageNodeServerError> {
+    let line = line.ok_or_else(|| runtime_config_invalid(path, format!("missing {label}")))?;
+    let fields: Vec<_> = line.split_whitespace().collect();
+    if fields.len() != 3 || fields[0] != label {
+        return Err(runtime_config_invalid(
+            path,
+            format!("invalid {label} line"),
+        ));
+    }
+    Ok(EcShape {
+        k: parse_u8_field(path, fields[1], "EC data shards")?,
+        m: parse_u8_field(path, fields[2], "EC parity shards")?,
+    })
+}
+
+fn parse_labeled_hex_path(
+    path: &Path,
+    line: Option<&str>,
+    label: &str,
+) -> Result<PathBuf, StorageNodeServerError> {
+    parse_labeled_field(path, line, label, |path, value| {
+        decode_hex_path(path, value)
+    })
+}
+
+fn parse_labeled_field<T>(
+    path: &Path,
+    line: Option<&str>,
+    label: &str,
+    parse: impl FnOnce(&Path, &str) -> Result<T, StorageNodeServerError>,
+) -> Result<T, StorageNodeServerError> {
+    let line = line.ok_or_else(|| runtime_config_invalid(path, format!("missing {label}")))?;
+    let mut fields = line.split_whitespace();
+    if fields.next() != Some(label) {
+        return Err(runtime_config_invalid(
+            path,
+            format!("invalid {label} line"),
+        ));
+    }
+    let value = fields
+        .next()
+        .ok_or_else(|| runtime_config_invalid(path, format!("missing {label} value")))?;
+    if fields.next().is_some() {
+        return Err(runtime_config_invalid(
+            path,
+            format!("extra {label} fields"),
+        ));
+    }
+    parse(path, value)
+}
+
+fn parse_u8_field(path: &Path, value: &str, field: &str) -> Result<u8, StorageNodeServerError> {
+    value
+        .parse::<u8>()
+        .map_err(|_| runtime_config_invalid(path, format!("invalid {field}")))
+}
+
+fn parse_u32_field(path: &Path, value: &str, field: &str) -> Result<u32, StorageNodeServerError> {
+    value
+        .parse::<u32>()
+        .map_err(|_| runtime_config_invalid(path, format!("invalid {field}")))
+}
+
+fn parse_u64_field(path: &Path, value: &str, field: &str) -> Result<u64, StorageNodeServerError> {
+    value
+        .parse::<u64>()
+        .map_err(|_| runtime_config_invalid(path, format!("invalid {field}")))
+}
+
+fn parse_usize_field(
+    path: &Path,
+    value: &str,
+    field: &str,
+) -> Result<usize, StorageNodeServerError> {
+    value
+        .parse::<usize>()
+        .map_err(|_| runtime_config_invalid(path, format!("invalid {field}")))
+}
+
+fn parse_cluster_epoch_field(
+    path: &Path,
+    value: &str,
+    field: &str,
+) -> Result<ClusterEpoch, StorageNodeServerError> {
+    ClusterEpoch::new(parse_u64_field(path, value, field)?)
+        .ok_or_else(|| runtime_config_invalid(path, format!("{field} must not be zero")))
+}
+
+fn runtime_config_invalid(path: &Path, message: impl Into<String>) -> StorageNodeServerError {
+    StorageNodeServerError::RuntimeConfigInvalid {
+        path: path.to_path_buf(),
+        message: message.into(),
+    }
+}
+
+fn pg_state_code(state: PgState) -> u8 {
+    match state {
+        PgState::Active => 1,
+        PgState::Peering => 2,
+        PgState::Degraded => 3,
+        PgState::Backfilling => 4,
+        PgState::Inconsistent => 5,
+    }
+}
+
+fn pg_state_from_code(code: u8) -> Option<PgState> {
+    match code {
+        1 => Some(PgState::Active),
+        2 => Some(PgState::Peering),
+        3 => Some(PgState::Degraded),
+        4 => Some(PgState::Backfilling),
+        5 => Some(PgState::Inconsistent),
+        _ => None,
+    }
+}
+
+fn hex_encode_path(path: &Path) -> String {
+    hex_encode(path.as_os_str().as_bytes())
+}
+
+fn decode_hex_path(path: &Path, value: &str) -> Result<PathBuf, StorageNodeServerError> {
+    let bytes = hex_decode(path, value)?;
+    let os = std::ffi::OsString::from_vec(bytes);
+    Ok(PathBuf::from(os))
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
+}
+
+fn hex_decode(path: &Path, value: &str) -> Result<Vec<u8>, StorageNodeServerError> {
+    if !value.len().is_multiple_of(2) {
+        return Err(runtime_config_invalid(path, "hex field has odd length"));
+    }
+    let mut out = Vec::with_capacity(value.len() / 2);
+    let bytes = value.as_bytes();
+    for pair in bytes.chunks_exact(2) {
+        let high =
+            hex_value(pair[0]).ok_or_else(|| runtime_config_invalid(path, "invalid hex field"))?;
+        let low =
+            hex_value(pair[1]).ok_or_else(|| runtime_config_invalid(path, "invalid hex field"))?;
+        out.push((high << 4) | low);
+    }
+    Ok(out)
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -813,6 +1241,20 @@ pub enum StorageNodeServerError {
     },
     #[error("storage-node control-plane refresh loop interval must be non-zero")]
     ControlPlaneRefreshLoopZeroInterval,
+    #[error("read storage-node control-plane runtime config {path:?}")]
+    RuntimeConfigRead {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+    #[error("write storage-node control-plane runtime config {path:?}")]
+    RuntimeConfigWrite {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+    #[error("invalid storage-node control-plane runtime config {path:?}: {message}")]
+    RuntimeConfigInvalid { path: PathBuf, message: String },
     #[error("spawn storage-node control-plane refresh loop")]
     ControlPlaneRefreshLoopSpawn {
         #[source]
@@ -1338,6 +1780,7 @@ impl StorageNodeServer {
                 candidate: next_config.route_map_valid_until_ms,
             });
         }
+        next_config.persist_control_plane_runtime_config()?;
         *current_config = Arc::new(next_config);
         Ok(())
     }
@@ -10977,6 +11420,110 @@ mod tests {
             primary_node_id: NodeId::new(7),
             acting_set: vec![NodeId::new(7)],
         }
+    }
+
+    fn assert_storage_node_process_config_eq(
+        actual: &StorageNodeProcessConfig,
+        expected: &StorageNodeProcessConfig,
+    ) {
+        assert_eq!(actual.node_id, expected.node_id);
+        assert_eq!(actual.cluster_epoch, expected.cluster_epoch);
+        assert_eq!(
+            actual.route_map_valid_until_ms,
+            expected.route_map_valid_until_ms
+        );
+        assert_eq!(actual.data_dir, expected.data_dir);
+        assert_eq!(actual.default_ec_shape, expected.default_ec_shape);
+        assert_eq!(actual.pg_ids, expected.pg_ids);
+        assert_eq!(actual.socket_path, expected.socket_path);
+        assert_eq!(actual.pg_routes, expected.pg_routes);
+        assert_eq!(actual.historical_pg_routes, expected.historical_pg_routes);
+    }
+
+    #[test]
+    fn storage_node_control_plane_runtime_config_round_trips() {
+        let tmp = test_util::tempdir();
+        let mut config = test_config(&tmp);
+        config.cluster_epoch = ClusterEpoch::new(9).unwrap();
+        config.route_map_valid_until_ms = Some(12_345);
+        config.pg_ids = vec![0, 2];
+        config.pg_routes = vec![
+            StorageNodePgRoute {
+                pg_id: 0,
+                cluster_epoch: ClusterEpoch::new(9).unwrap(),
+                state: PgState::Active,
+                primary_node_id: NodeId::new(7),
+                acting_set: vec![NodeId::new(7), NodeId::new(8)],
+            },
+            StorageNodePgRoute {
+                pg_id: 2,
+                cluster_epoch: ClusterEpoch::new(9).unwrap(),
+                state: PgState::Peering,
+                primary_node_id: NodeId::new(8),
+                acting_set: vec![NodeId::new(8), NodeId::new(7)],
+            },
+        ];
+        config.historical_pg_routes = vec![
+            StorageNodePgRoute {
+                pg_id: 0,
+                cluster_epoch: ClusterEpoch::new(3).unwrap(),
+                state: PgState::Active,
+                primary_node_id: NodeId::new(7),
+                acting_set: vec![NodeId::new(7), NodeId::new(8)],
+            },
+            StorageNodePgRoute {
+                pg_id: 2,
+                cluster_epoch: ClusterEpoch::new(6).unwrap(),
+                state: PgState::Peering,
+                primary_node_id: NodeId::new(8),
+                acting_set: vec![NodeId::new(8), NodeId::new(7)],
+            },
+        ];
+
+        config.persist_control_plane_runtime_config().unwrap();
+        let loaded = StorageNodeProcessConfig::load_control_plane_runtime_config(
+            &config.data_dir,
+            config.node_id,
+            config.default_ec_shape,
+            &config.socket_path,
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_storage_node_process_config_eq(&loaded, &config);
+    }
+
+    #[test]
+    fn storage_node_runtime_refresh_persists_control_plane_runtime_config() {
+        let tmp = test_util::tempdir();
+        let mut config = test_config(&tmp);
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let server = StorageNodeServer::bind(config.clone()).unwrap();
+
+        config.cluster_epoch = ClusterEpoch::new(2).unwrap();
+        config.route_map_valid_until_ms = Some(10_000);
+        config.pg_routes[0].cluster_epoch = config.cluster_epoch;
+        config.historical_pg_routes.push(StorageNodePgRoute {
+            pg_id: 0,
+            cluster_epoch: ClusterEpoch::new(1).unwrap(),
+            state: PgState::Active,
+            primary_node_id: NodeId::new(7),
+            acting_set: vec![NodeId::new(7)],
+        });
+
+        server
+            .install_control_plane_runtime_config(config.clone())
+            .unwrap();
+        let loaded = StorageNodeProcessConfig::load_control_plane_runtime_config(
+            &config.data_dir,
+            config.node_id,
+            config.default_ec_shape,
+            &config.socket_path,
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_storage_node_process_config_eq(&loaded, &config);
     }
 
     #[test]

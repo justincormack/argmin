@@ -204,6 +204,13 @@ impl NodeControlRecord {
         self.last_observed_epoch
     }
 
+    fn record_observed_epoch(&mut self, observed_epoch: ClusterEpoch) {
+        self.last_observed_epoch = Some(
+            self.last_observed_epoch
+                .map_or(observed_epoch, |previous| previous.max(observed_epoch)),
+        );
+    }
+
     #[must_use]
     pub fn last_heartbeat_ms(&self) -> Option<u64> {
         self.last_heartbeat_ms
@@ -623,6 +630,7 @@ impl ClusterControlSnapshot {
             history_floor,
             refreshing_node_observed_epoch,
             &pg_routes,
+            refreshing_node_id,
         )?;
         self.runtime_map_from_pg_routes_with_history_and_extra_nodes(
             pg_routes,
@@ -742,6 +750,7 @@ impl ClusterControlSnapshot {
         floor_epoch: Option<ClusterEpoch>,
         observed_epoch: ClusterEpoch,
         current_routes: &[PgRouteSnapshot],
+        refreshing_node_id: NodeId,
     ) -> Result<Vec<PgRouteSnapshot>, ControlPlaneError> {
         let mut required_keys = BTreeSet::new();
         let mut pending_keys = Vec::new();
@@ -756,6 +765,10 @@ impl ClusterControlSnapshot {
             if response_floor.is_some_and(|floor| history.cluster_epoch() >= floor) {
                 for pg in history.pgs() {
                     let route = history.reconstructed_pg_route(pg.pg_id())?;
+                    if !storage_node_refresh_needs_historical_route(&route, refreshing_node_id) {
+                        previous_routes.insert(pg.pg_id(), route);
+                        continue;
+                    }
                     let route_changed = previous_routes
                         .get(&pg.pg_id())
                         .is_none_or(|previous| !pg_route_configuration_eq(previous, &route));
@@ -1490,7 +1503,7 @@ impl ControlPlaneCommandStateMachine for ClusterControlSnapshot {
                             epoch_changed = true;
                             affected_node = Some(heartbeat.node_id);
                         }
-                        record.last_observed_epoch = Some(heartbeat.observed_epoch);
+                        record.record_observed_epoch(heartbeat.observed_epoch);
                         record.last_heartbeat_ms = Some(heartbeat_at_ms);
                         record.lease_deadline_ms = Some(lease_deadline_ms);
                         record.cluster_map_history_floor_epoch = heartbeat
@@ -1542,7 +1555,7 @@ impl ControlPlaneCommandStateMachine for ClusterControlSnapshot {
                         epoch_changed = true;
                         affected_node = Some(heartbeat.node_id);
                     }
-                    record.last_observed_epoch = Some(heartbeat.observed_epoch);
+                    record.record_observed_epoch(heartbeat.observed_epoch);
                     record.last_heartbeat_ms = Some(heartbeat_at_ms);
                     record.lease_deadline_ms = Some(lease_deadline_ms);
                     record.cluster_map_history_floor_epoch = heartbeat
@@ -2771,6 +2784,14 @@ fn add_required_historical_route_key(
     if required_keys.insert((cluster_epoch, pg_id)) {
         pending_keys.push((cluster_epoch, pg_id));
     }
+}
+
+fn storage_node_refresh_needs_historical_route(
+    route: &PgRouteSnapshot,
+    refreshing_node_id: NodeId,
+) -> bool {
+    route.acting_set().contains(&refreshing_node_id)
+        || route.peering_metadata_transfer_source_node_id() == Some(refreshing_node_id)
 }
 
 fn pg_route_configuration_eq(left: &PgRouteSnapshot, right: &PgRouteSnapshot) -> bool {
@@ -4166,7 +4187,11 @@ impl<S: ControlPlaneStore> ControlPlaneHeartbeatRuntimeMapSource
         authority_now_ms: u64,
     ) -> Result<ControlPlaneHeartbeatRefresh, ControlPlaneError> {
         let node_id = heartbeat.node_id;
-        let observed_epoch = heartbeat.observed_epoch;
+        let requested_observed_epoch = heartbeat.observed_epoch;
+        let previous_observed_epoch = self
+            .snapshot
+            .node(node_id)
+            .and_then(NodeControlRecord::last_observed_epoch);
         let mut lease = self.heartbeat(heartbeat, authority_now_ms)?;
         let just_activated_pgs: BTreeSet<PgId> = self
             .complete_ready_pg_peerings(authority_now_ms)?
@@ -4175,6 +4200,13 @@ impl<S: ControlPlaneStore> ControlPlaneHeartbeatRuntimeMapSource
         if !just_activated_pgs.is_empty() {
             lease = self.current_heartbeat_lease_for_node(node_id, authority_now_ms)?;
         }
+        let current_epoch = self.snapshot.cluster_epoch();
+        let observed_epoch = [Some(requested_observed_epoch), previous_observed_epoch]
+            .into_iter()
+            .flatten()
+            .filter(|observed_epoch| *observed_epoch <= current_epoch)
+            .max()
+            .unwrap_or(requested_observed_epoch);
         let runtime_map = self.snapshot.runtime_map_for_storage_node_refresh(
             authority_now_ms,
             node_id,
@@ -5015,7 +5047,7 @@ impl ControlPlaneHeartbeatRuntimeMapSource for UnixControlPlaneClient {
             retry_budget,
         )?;
         let mut reader = PayloadReader::new(&payload);
-        let lease = read_heartbeat_lease(&mut reader)?;
+        let lease = read_heartbeat_lease_summary(&mut reader)?;
         let runtime_map = read_runtime_map_snapshot(&mut reader)?;
         reader.finish()?;
         Ok(ControlPlaneHeartbeatRefresh { lease, runtime_map })
@@ -5108,7 +5140,7 @@ where
             match control_plane.refresh_node_heartbeat(heartbeat, authority_now_ms) {
                 Ok(refresh) => {
                     let mut response = Vec::new();
-                    write_heartbeat_lease(&mut response, refresh.lease())?;
+                    write_heartbeat_lease_summary(&mut response, refresh.lease());
                     write_runtime_map_snapshot(&mut response, refresh.runtime_map())?;
                     Ok(response)
                 }
@@ -5568,19 +5600,15 @@ fn read_pg_acting_set_with_metadata_transfer_request(
     ))
 }
 
-fn write_heartbeat_lease(
-    out: &mut Vec<u8>,
-    lease: &HeartbeatLease,
-) -> Result<(), ControlPlaneError> {
+fn write_heartbeat_lease_summary(out: &mut Vec<u8>, lease: &HeartbeatLease) {
     write_u64(out, lease.authority_incarnation().get());
     write_u64(out, lease.cluster_epoch().get());
     write_u32(out, lease.node_id().as_u32());
     write_u64(out, lease.lease_deadline_ms());
     write_u8(out, u8::from(lease.serving()));
-    write_string(out, &format_snapshot(lease.snapshot()))
 }
 
-fn read_heartbeat_lease(
+fn read_heartbeat_lease_summary(
     reader: &mut PayloadReader<'_>,
 ) -> Result<HeartbeatLease, ControlPlaneError> {
     let authority_incarnation = AuthorityIncarnation::new(reader.read_u64()?).ok_or_else(|| {
@@ -5592,14 +5620,13 @@ fn read_heartbeat_lease(
     let node_id = NodeId::new(reader.read_u32()?);
     let lease_deadline_ms = reader.read_u64()?;
     let serving = reader.read_bool()?;
-    let snapshot = parse_snapshot(reader.read_string()?)?;
     Ok(HeartbeatLease {
         authority_incarnation,
         cluster_epoch,
         node_id,
         lease_deadline_ms,
         serving,
-        snapshot,
+        snapshot: ClusterControlSnapshot::empty(),
     })
 }
 
@@ -11909,6 +11936,50 @@ mod tests {
     }
 
     #[test]
+    fn refresh_node_heartbeat_rpc_response_omits_control_snapshot_body() {
+        let tmp = test_util::tempdir();
+        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+        authority
+            .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
+            .unwrap();
+        heartbeat_until_serving_with_endpoint(&mut authority, 1, 1_000, "node-1.sock".to_owned());
+        for node_id in 100..300 {
+            authority
+                .set_node_membership(NodeId::new(node_id), NodeMembershipState::Active)
+                .unwrap();
+        }
+        let formatted_snapshot_len = format_snapshot(authority.snapshot()).len();
+        assert!(
+            formatted_snapshot_len > 10_000,
+            "test setup should build a nontrivial snapshot"
+        );
+        let heartbeat =
+            heartbeat_from_record(&authority, 1, authority.snapshot().cluster_epoch(), 2_000);
+        let mut payload = Vec::new();
+        write_node_heartbeat(&mut payload, &heartbeat).unwrap();
+        let request = ControlPlaneRpcRequest {
+            kind: ControlPlaneRpcKind::RefreshNodeHeartbeat,
+            payload,
+        };
+
+        let response = build_control_plane_unix_response(&mut authority, request, 2_000).unwrap();
+
+        assert_eq!(response.kind, ControlPlaneRpcKind::RefreshNodeHeartbeat);
+        assert!(
+            response.payload.len() < formatted_snapshot_len / 4,
+            "heartbeat response should carry compact lease metadata, not the full control-plane snapshot"
+        );
+        let response_payload = decode_control_plane_rpc_response(response.payload).unwrap();
+        let mut reader = PayloadReader::new(&response_payload);
+        let lease = read_heartbeat_lease_summary(&mut reader).unwrap();
+        let runtime_map = read_runtime_map_snapshot(&mut reader).unwrap();
+        reader.finish().unwrap();
+        assert_eq!(lease.node_id(), NodeId::new(1));
+        assert_eq!(lease.cluster_epoch(), runtime_map.cluster_epoch());
+    }
+
+    #[test]
     fn control_plane_rpc_rejects_corrupted_payload_checksum() {
         let (mut writer, mut reader) = UnixStream::pair().unwrap();
         let payload = b"not a valid request";
@@ -15728,6 +15799,79 @@ mod tests {
     }
 
     #[test]
+    fn storage_node_refresh_filters_unrelated_history_behind_old_storage_floor() {
+        let tmp = test_util::tempdir();
+        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+        for node_id in [1, 2, 3] {
+            authority
+                .set_node_membership(NodeId::new(node_id), NodeMembershipState::Active)
+                .unwrap();
+            assert!(heartbeat_until_serving(&mut authority, node_id, 1_000).serving());
+        }
+
+        authority
+            .set_pg_acting_set(PgId::new(30), vec![NodeId::new(1)])
+            .unwrap();
+        let protected_epoch = authority.snapshot().cluster_epoch();
+        let mut floor_heartbeat = heartbeat_from_record(&authority, 1, protected_epoch, 1_100);
+        floor_heartbeat.cluster_map_history_reference_summary =
+            PgClusterMapHistoryReferenceSummary {
+                oldest_live_placement_epoch: Some(protected_epoch),
+                oldest_durable_backfill_epoch: None,
+            };
+        assert!(authority
+            .heartbeat(floor_heartbeat, 1_100)
+            .unwrap()
+            .serving());
+
+        for raw_pg_id in 100..120 {
+            authority
+                .set_pg_acting_set(PgId::new(raw_pg_id), vec![NodeId::new(2)])
+                .unwrap();
+        }
+        for round in 0..20 {
+            let node_id = if round % 2 == 0 {
+                NodeId::new(3)
+            } else {
+                NodeId::new(2)
+            };
+            for raw_pg_id in 100..120 {
+                authority
+                    .set_pg_acting_set(PgId::new(raw_pg_id), vec![node_id])
+                    .unwrap();
+            }
+        }
+
+        let filtered_runtime_map = authority
+            .snapshot()
+            .runtime_map_for_storage_node_refresh(2_000, NodeId::new(1), ClusterEpoch::INITIAL)
+            .unwrap();
+        assert!(filtered_runtime_map
+            .historical_pg_routes()
+            .iter()
+            .all(|route| route.acting_set().contains(&NodeId::new(1))));
+        assert!(filtered_runtime_map
+            .historical_pg_routes()
+            .iter()
+            .any(
+                |route| route.pg_id() == PgId::new(30) && route.cluster_epoch() == protected_epoch
+            ));
+        assert!(!filtered_runtime_map
+            .historical_pg_routes()
+            .iter()
+            .any(|route| (100..120).contains(&route.pg_id().get())));
+
+        let mut encoded = Vec::new();
+        write_runtime_map_snapshot(&mut encoded, &filtered_runtime_map).unwrap();
+        assert!(
+            encoded.len() < CONTROL_PLANE_RPC_MAX_PAYLOAD_LEN / 8,
+            "storage-node refresh retained too much unrelated route history: {} bytes",
+            encoded.len()
+        );
+    }
+
+    #[test]
     fn storage_node_refresh_history_uses_observed_epoch_for_running_node() {
         let tmp = test_util::tempdir();
         let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
@@ -15783,6 +15927,86 @@ mod tests {
             .iter()
             .any(|route| route.cluster_epoch() == observed_epoch));
         assert!(!running_refresh
+            .historical_pg_routes()
+            .iter()
+            .any(|route| route.cluster_epoch() == protected_epoch));
+    }
+
+    #[test]
+    fn storage_node_restart_refresh_uses_control_plane_last_observed_epoch() {
+        let tmp = test_util::tempdir();
+        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+        authority
+            .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
+            .unwrap();
+        authority
+            .set_pg_acting_set(PgId::new(30), vec![NodeId::new(1)])
+            .unwrap();
+        assert!(heartbeat_until_serving(&mut authority, 1, 1_000).serving());
+        let protected_epoch = authority.snapshot().cluster_epoch();
+        let mut floor_heartbeat = heartbeat_from_record(&authority, 1, protected_epoch, 1_100);
+        floor_heartbeat.cluster_map_history_reference_summary =
+            PgClusterMapHistoryReferenceSummary {
+                oldest_live_placement_epoch: Some(protected_epoch),
+                oldest_durable_backfill_epoch: None,
+            };
+        assert!(authority
+            .heartbeat(floor_heartbeat, 1_100)
+            .unwrap()
+            .serving());
+
+        for node_id in 10..18 {
+            authority
+                .set_node_membership(NodeId::new(node_id), NodeMembershipState::Active)
+                .unwrap();
+        }
+        let observed_epoch = authority.snapshot().cluster_epoch();
+        let mut observed_heartbeat = heartbeat_from_record(&authority, 1, observed_epoch, 2_000);
+        observed_heartbeat.cluster_map_history_reference_summary =
+            PgClusterMapHistoryReferenceSummary {
+                oldest_live_placement_epoch: Some(protected_epoch),
+                oldest_durable_backfill_epoch: None,
+            };
+        assert!(authority
+            .heartbeat(observed_heartbeat, 2_000)
+            .unwrap()
+            .serving());
+        assert_eq!(
+            authority
+                .snapshot()
+                .node(NodeId::new(1))
+                .and_then(NodeControlRecord::last_observed_epoch),
+            Some(observed_epoch)
+        );
+
+        let mut restart_heartbeat =
+            heartbeat_from_record(&authority, 1, ClusterEpoch::INITIAL, 2_100);
+        restart_heartbeat.cluster_map_history_reference_summary =
+            PgClusterMapHistoryReferenceSummary {
+                oldest_live_placement_epoch: Some(protected_epoch),
+                oldest_durable_backfill_epoch: None,
+            };
+        authority
+            .heartbeat(restart_heartbeat.clone(), 2_100)
+            .expect("lost restart heartbeat response should still apply");
+        assert_eq!(
+            authority
+                .snapshot()
+                .node(NodeId::new(1))
+                .and_then(NodeControlRecord::last_observed_epoch),
+            Some(observed_epoch),
+            "stale restart heartbeat must not regress stored observed epoch"
+        );
+        let refresh = authority
+            .refresh_node_heartbeat(restart_heartbeat, 2_200)
+            .unwrap();
+        let (_lease, runtime_map) = refresh.into_parts();
+        assert!(runtime_map
+            .historical_pg_routes()
+            .iter()
+            .all(|route| route.cluster_epoch() >= observed_epoch));
+        assert!(!runtime_map
             .historical_pg_routes()
             .iter()
             .any(|route| route.cluster_epoch() == protected_epoch));
