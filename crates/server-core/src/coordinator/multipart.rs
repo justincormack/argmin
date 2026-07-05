@@ -702,7 +702,7 @@ impl Coordinator {
                         .algorithm()
                         .stores_unconfigured_complete_multipart_header() => {}
                     None => {
-                        return Err(ServerError::InvalidRequest {
+                        return Err(ServerError::InvalidRequestHostId {
                             reason: format!(
                                 "Checksum Type mismatch occurred, expected checksum Type: null, actual checksum Type: {}",
                                 claimed.algorithm().as_str().to_ascii_lowercase(),

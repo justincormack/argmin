@@ -9,6 +9,9 @@ pub enum LifecycleConfigError {
     #[error("invalid request: {reason}")]
     InvalidRequest { reason: String },
 
+    #[error("invalid request: {reason}")]
+    InvalidRequestHostId { reason: String },
+
     #[error("invalid argument: {reason}")]
     InvalidArgument { reason: String },
 
@@ -417,7 +420,7 @@ fn validate_configuration(rules: &[LifecycleRule]) -> Result<(), LifecycleConfig
         if let Some(noncurrent) = &rule.noncurrent_version_expiration {
             if noncurrent.newer_noncurrent_versions.is_some() && !rule.filter.explicit_filter {
                 if rule.filter.has_scope() {
-                    return Err(LifecycleConfigError::InvalidRequest {
+                    return Err(LifecycleConfigError::InvalidRequestHostId {
                         reason: "NewerNoncurrentVersions element can only be used in Lifecycle V2."
                             .to_string(),
                     });
@@ -1697,7 +1700,7 @@ mod tests {
         .unwrap_err();
         assert_eq!(
             err,
-            LifecycleConfigError::InvalidRequest {
+            LifecycleConfigError::InvalidRequestHostId {
                 reason: "NewerNoncurrentVersions element can only be used in Lifecycle V2."
                     .to_string()
             }

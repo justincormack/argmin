@@ -6200,8 +6200,8 @@ fn complete_multipart_rejects_new_object_checksum_header_without_upload_algorith
         .unwrap_err();
 
     assert!(
-        matches!(err, ServerError::InvalidRequest { .. }),
-        "expected InvalidRequest for unconfigured SHA512 complete checksum header, got {err:?}"
+        matches!(err, ServerError::InvalidRequestHostId { .. }),
+        "expected InvalidRequestHostId for unconfigured SHA512 complete checksum header, got {err:?}"
     );
 }
 

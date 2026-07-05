@@ -105,7 +105,7 @@ Remaining order of attack:
 
 ### New findings from fix verification
 
-- [ ] **RR4. Response XML shape dispatched by string equality on message
+- [x] **RR4. Response XML shape dispatched by string equality on message
   literals duplicated across three crates.** `response.rs:36-46`
   (`is_host_id_invalid_request`) selects HostId-vs-Resource shape by exact
   message-string match against literals duplicated by value in
@@ -113,7 +113,13 @@ Remaining order of attack:
   `server-core/src/coordinator/multipart.rs:688` (prefix match), and
   `s3-types/src/lifecycle.rs:421`. Drift in any producer silently degrades
   the response to the Resource-shaped XML; only end-to-end s3-tests would
-  catch it. Fix: shared constants or a typed shape flag on the error.
+  catch it. Fix: shared constants or a typed shape flag on the error. Fixed
+  by replacing the response formatter string match with typed
+  `InvalidRequestHostId` errors. SDK checksum validation, unsupported checksum
+  algorithm, unconfigured CompleteMultipartUpload checksum-type mismatch, and
+  the lifecycle V1/NewerNoncurrentVersions parser case now construct or
+  preserve the typed variant, and the HTTP formatter routes that variant
+  directly to the HostId-shaped InvalidRequest XML.
 
 - [ ] **RR5. `RequestNotYetValid` response shape unpinned and inconsistent
   with its sibling.** The A4 variant falls through to the default formatter

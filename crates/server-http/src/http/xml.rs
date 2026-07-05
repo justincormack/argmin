@@ -2370,6 +2370,9 @@ pub fn parse_bucket_lifecycle_configuration_xml(
     s3_types::parse_lifecycle_configuration_xml(data).map_err(|error| match error {
         LifecycleConfigError::MalformedXml { reason } => ServerError::MalformedXML { reason },
         LifecycleConfigError::InvalidRequest { reason } => ServerError::InvalidRequest { reason },
+        LifecycleConfigError::InvalidRequestHostId { reason } => {
+            ServerError::InvalidRequestHostId { reason }
+        }
         LifecycleConfigError::InvalidArgument { reason } => ServerError::InvalidArgument { reason },
         LifecycleConfigError::NotImplemented { feature } => ServerError::NotImplemented { feature },
     })

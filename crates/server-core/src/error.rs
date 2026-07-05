@@ -54,6 +54,9 @@ pub enum ServerError {
     #[error("invalid request: {reason}")]
     InvalidRequest { reason: String },
 
+    #[error("invalid request: {reason}")]
+    InvalidRequestHostId { reason: String },
+
     #[error("bad request: {reason}")]
     BadRequest { reason: String },
 
@@ -416,7 +419,7 @@ impl ServerError {
             Self::Auth(_) => "AccessDenied",
             Self::PreconditionFailed => "PreconditionFailed",
             Self::NotModified { .. } => "NotModified",
-            Self::InvalidRequest { .. } => "InvalidRequest",
+            Self::InvalidRequest { .. } | Self::InvalidRequestHostId { .. } => "InvalidRequest",
             Self::BadRequest { .. } => "BadRequest",
             Self::InvalidArgument { .. } | Self::DuplicateChecksumHeader { .. } => {
                 "InvalidArgument"
@@ -526,6 +529,7 @@ impl ServerError {
             Self::Auth(auth::AuthError::DuplicateAuthorizationHeader) => 501,
             Self::Auth(_) => 403,
             Self::InvalidRequest { .. }
+            | Self::InvalidRequestHostId { .. }
             | Self::BadRequest { .. }
             | Self::InvalidArgument { .. }
             | Self::DuplicateChecksumHeader { .. }

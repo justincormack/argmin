@@ -752,6 +752,9 @@ impl Coordinator {
                 LifecycleConfigError::InvalidRequest { reason } => {
                     ServerError::InvalidRequest { reason }
                 }
+                LifecycleConfigError::InvalidRequestHostId { reason } => {
+                    ServerError::InvalidRequestHostId { reason }
+                }
                 LifecycleConfigError::InvalidArgument { reason } => {
                     ServerError::InvalidArgument { reason }
                 }

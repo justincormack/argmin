@@ -5353,7 +5353,7 @@ fn parse_checksum_algorithm_value(value: &str) -> Option<ChecksumAlgorithm> {
 const UNSUPPORTED_CHECKSUM_ALGORITHM_MESSAGE: &str = "Checksum algorithm provided is unsupported. Please try again with any of the valid types: [CRC32, CRC32C, CRC64NVME, MD5, SHA1, SHA256, SHA512, XXHASH128, XXHASH3, XXHASH64]";
 
 fn parse_checksum_algorithm_header_value(value: &str) -> Result<ChecksumAlgorithm, ServerError> {
-    parse_checksum_algorithm_value(value).ok_or_else(|| ServerError::InvalidRequest {
+    parse_checksum_algorithm_value(value).ok_or_else(|| ServerError::InvalidRequestHostId {
         reason: UNSUPPORTED_CHECKSUM_ALGORITHM_MESSAGE.to_string(),
     })
 }
@@ -5373,19 +5373,19 @@ fn validate_sdk_checksum_algorithm(
         return Ok(());
     };
     let Some(actual) = checksum_header_algorithm.or(trailing_checksum_algorithm) else {
-        return Err(ServerError::InvalidRequest {
+        return Err(ServerError::InvalidRequestHostId {
             reason:
                 "x-amz-sdk-checksum-algorithm specified, but no corresponding x-amz-checksum-* or x-amz-trailer headers were found."
                     .to_string(),
         });
     };
     let Some(declared_algorithm) = parse_checksum_algorithm_value(declared) else {
-        return Err(ServerError::InvalidRequest {
+        return Err(ServerError::InvalidRequestHostId {
             reason: "Value for x-amz-sdk-checksum-algorithm header is invalid.".to_string(),
         });
     };
     if declared_algorithm != actual {
-        return Err(ServerError::InvalidRequest {
+        return Err(ServerError::InvalidRequestHostId {
             reason: "Value for x-amz-sdk-checksum-algorithm header is invalid.".to_string(),
         });
     }
@@ -9555,13 +9555,13 @@ mod tests {
                 bucket: test_bucket_name("mybucket"),
             },
         ) {
-            Err(ServerError::InvalidRequest { reason }) => {
+            Err(ServerError::InvalidRequestHostId { reason }) => {
                 assert_eq!(
                     reason,
                     "x-amz-sdk-checksum-algorithm specified, but no corresponding x-amz-checksum-* or x-amz-trailer headers were found."
                 );
             }
-            Err(e) => panic!("expected InvalidRequest, got {e:?}"),
+            Err(e) => panic!("expected InvalidRequestHostId, got {e:?}"),
             Ok(_) => panic!("expected error, got Ok"),
         }
     }
@@ -10737,10 +10737,10 @@ mod tests {
             key: "k".to_string(),
         };
         match fe.dispatch_routed(&req, &test_auth(), op) {
-            Err(ServerError::InvalidRequest { reason }) => {
+            Err(ServerError::InvalidRequestHostId { reason }) => {
                 assert_eq!(reason, UNSUPPORTED_CHECKSUM_ALGORITHM_MESSAGE);
             }
-            Err(e) => panic!("expected InvalidRequest, got {e:?}"),
+            Err(e) => panic!("expected InvalidRequestHostId, got {e:?}"),
             Ok(_) => panic!("expected error, got Ok"),
         }
     }
