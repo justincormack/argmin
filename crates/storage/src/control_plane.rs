@@ -4691,34 +4691,6 @@ impl UnixControlPlaneClient {
         }
     }
 
-    pub fn fence_pg_for_metadata_transfer(
-        &self,
-        pg_id: PgId,
-    ) -> Result<ClusterEpoch, ControlPlaneError> {
-        let mut payload = Vec::new();
-        write_pg_id_request(&mut payload, pg_id);
-        let payload =
-            self.send_request(ControlPlaneRpcKind::FencePgForMetadataTransfer, &payload)?;
-        let mut reader = PayloadReader::new(&payload);
-        let raw_cluster_epoch = reader.read_u64()?;
-        let cluster_epoch =
-            ClusterEpoch::new(raw_cluster_epoch).ok_or_else(|| ControlPlaneError::RpcProtocol {
-                message: format!("invalid cluster epoch {raw_cluster_epoch}"),
-            })?;
-        reader.finish()?;
-        Ok(cluster_epoch)
-    }
-
-    pub fn fence_pg_for_metadata_transfer_runtime_map(
-        &self,
-        pg_id: PgId,
-    ) -> Result<ClusterRuntimeMapSnapshot, ControlPlaneError> {
-        Ok(self
-            .fence_pg_for_metadata_transfer_runtime_map_with_source_lease(pg_id)?
-            .into_parts()
-            .0)
-    }
-
     pub fn fence_pg_for_metadata_transfer_runtime_map_checked(
         &self,
         pg_id: PgId,
@@ -4729,7 +4701,7 @@ impl UnixControlPlaneClient {
             .0)
     }
 
-    pub fn fence_pg_for_metadata_transfer_runtime_map_with_source_lease(
+    fn fence_pg_for_metadata_transfer_runtime_map_with_source_lease(
         &self,
         pg_id: PgId,
     ) -> Result<FencedPgMetadataTransferRuntimeMap, ControlPlaneError> {
@@ -5160,19 +5132,6 @@ where
                 Err(error) => Err(error),
             }
         }
-        ControlPlaneRpcKind::FencePgForMetadataTransfer => {
-            let mut reader = PayloadReader::new(&payload);
-            let pg_id = read_pg_id_request(&mut reader)?;
-            reader.finish()?;
-            match control_plane.fence_pg_for_metadata_transfer(pg_id) {
-                Ok(snapshot) => {
-                    let mut response = Vec::new();
-                    write_u64(&mut response, snapshot.cluster_epoch().get());
-                    Ok(response)
-                }
-                Err(error) => Err(error),
-            }
-        }
         ControlPlaneRpcKind::FencePgForMetadataTransferRuntimeMap => {
             let mut reader = PayloadReader::new(&payload);
             let pg_id = read_pg_id_request(&mut reader)?;
@@ -5287,7 +5246,6 @@ enum ControlPlaneRpcKind {
     RefreshNodeHeartbeat = 2,
     SetPgActingSet = 3,
     SetPgActingSetWithMetadataTransfer = 4,
-    FencePgForMetadataTransfer = 5,
     SetPgActingSetWithMetadataTransferRuntimeMap = 6,
     FencePgForMetadataTransferRuntimeMap = 7,
     TransferRaftLeadership = 8,
@@ -5304,7 +5262,6 @@ impl ControlPlaneRpcKind {
             2 => Ok(Self::RefreshNodeHeartbeat),
             3 => Ok(Self::SetPgActingSet),
             4 => Ok(Self::SetPgActingSetWithMetadataTransfer),
-            5 => Ok(Self::FencePgForMetadataTransfer),
             6 => Ok(Self::SetPgActingSetWithMetadataTransferRuntimeMap),
             7 => Ok(Self::FencePgForMetadataTransferRuntimeMap),
             8 => Ok(Self::TransferRaftLeadership),

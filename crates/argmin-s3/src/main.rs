@@ -6183,7 +6183,7 @@ mod tests {
         let fence_server = spawn_experimental_raft_unix_rpc_server(&harness, &socket_path, 40_300);
         let client = UnixControlPlaneClient::new(&socket_path);
         let fenced = client
-            .fence_pg_for_metadata_transfer_runtime_map_with_source_lease(PgId::new(13))
+            .fence_pg_for_metadata_transfer_runtime_map_with_source_lease_checked(PgId::new(13))
             .expect("Unix metadata-transfer fence should succeed");
         fence_server.join().unwrap();
         assert_eq!(fenced.source_primary_lease_deadline_ms(), Some(40_900));

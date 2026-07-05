@@ -495,10 +495,13 @@ sweeps so the next drift is a compile error.
   names, delete. Resolution: remove the alias type and wrapper functions, and
   update the SSE-S3 behavior tests to call the managed-encryption helpers
   directly.
-- [ ] Control-plane `_checked` siblings exist for the acting-set mutators but
-  not `fence_pg_for_metadata_transfer` (`control_plane.rs:4318` vs
-  4286/4304/4346/4376/4392/4419/4441/4479) — no idempotent retry story for
-  the plain fence.
+- [x] Control-plane `_checked` siblings exist for the acting-set mutators but
+  the epoch-only Unix `fence_pg_for_metadata_transfer` path had no idempotent
+  retry story. Resolution: keep the existing checked runtime-map fence as the
+  supported Unix client API, remove the unsafe epoch-only Unix client/RPC
+  surface, and make the raw source-lease runtime-map helper internal to the
+  checked wrapper. The in-process authority fence remains as the operation
+  executed by the checked runtime-map RPC.
 - [ ] auth: `pub verify_request` (sigv4.rs:156-170, re-exported lib.rs:75) is
   an attractive-but-incomplete verification door (no skew/expiry/token/scope)
   with zero external callers. Demote to `pub(crate)`.
