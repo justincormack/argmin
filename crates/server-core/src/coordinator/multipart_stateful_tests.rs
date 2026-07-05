@@ -44,8 +44,8 @@ fn setup_coordinator(dir: &Path) -> Coordinator {
 fn open_test_storage_cluster(dir: &Path, pg_ids: &[u32]) -> Arc<StorageCluster> {
     let ec_config = ec::EcConfig::default();
     let ec_shape = storage::EcShape {
-        k: ec_config.data_shards,
-        m: ec_config.parity_shards,
+        k: ec_config.data_shards(),
+        m: ec_config.parity_shards(),
     };
     let node_count = u32::from(ec_shape.k) + u32::from(ec_shape.m);
     let node_ids: Vec<_> = (0..node_count).map(storage::NodeId::new).collect();

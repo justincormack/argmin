@@ -1190,14 +1190,14 @@ fn buffered_put_exact_segment_skips_stream_session_rows() {
 #[test]
 fn encode_parity_scratch_covers_max_sse_c_segment() {
     let ec_config = EcConfig::default();
-    let k = ec_config.data_shards as usize;
-    let m = ec_config.parity_shards as usize;
+    let k = ec_config.data_shards() as usize;
+    let m = ec_config.parity_shards() as usize;
     let padded = (INTERNAL_SEGMENT_SIZE + SSE_C_SEGMENT_TAG_LEN).div_ceil(k) * k;
     let expected = (padded / k) * m;
     assert_eq!(
         encode_parity_scratch_len(storage::EcShape {
-            k: ec_config.data_shards,
-            m: ec_config.parity_shards,
+            k: ec_config.data_shards(),
+            m: ec_config.parity_shards(),
         }),
         expected
     );

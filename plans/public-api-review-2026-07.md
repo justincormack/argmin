@@ -548,12 +548,13 @@ sweeps so the next drift is a compile error.
 No live bug in any of these (all current callers use the constructors), but
 each is one refactor away from a panic:
 
-- [ ] `EcConfig` pub fields (`ec/src/codec.rs:13-18`): `k=0` panics in
+- [x] `EcConfig` pub fields (`crates/ec/src/codec.rs:13-18`): `k=0` panics in
   encode/verify/reconstruct (codec.rs:332, 416, 568); `k+m > 32` overruns the
   fixed 32×32 stack matrices in `reconstruct_shards`
-  (`ec/src/reconstruct.rs:18-26`). `ErasureCodec::new` returns `Result` but
-  has no failure path (codec.rs:254-284) — validating the config there makes
-  the `Result` honest and closes the hole.
+  (`crates/ec/src/reconstruct.rs:18-26`). `ErasureCodec::new` returns `Result`
+  but had no failure path (codec.rs:254-284). Resolution: make the fields
+  private, add read-only accessors, and defensively revalidate in
+  `ErasureCodec::new`.
 - [ ] `PlacementConfig.total_shards` pub field (`placement/src/config.rs:7`):
   bypasses `new()` validation; `Placer::place` then writes past `MAX_SHARDS`
   stack arrays (placer.rs:133, 206) — out-of-bounds panic in the hot path.

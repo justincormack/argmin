@@ -12,9 +12,9 @@ pub const MAX_TOTAL_SHARDS: usize = 32;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EcConfig {
     /// k: number of data shards.
-    pub data_shards: u8,
+    data_shards: u8,
     /// m: number of parity shards.
-    pub parity_shards: u8,
+    parity_shards: u8,
 }
 
 impl EcConfig {
@@ -27,6 +27,19 @@ impl EcConfig {
             data_shards,
             parity_shards
         );
+        Self::validate_parts(data_shards, parity_shards)?;
+        Ok(Self {
+            data_shards,
+            parity_shards,
+        })
+    }
+
+    fn validate(self) -> Result<Self, EcError> {
+        Self::validate_parts(self.data_shards, self.parity_shards)?;
+        Ok(self)
+    }
+
+    fn validate_parts(data_shards: u8, parity_shards: u8) -> Result<(), EcError> {
         if data_shards == 0 {
             return Err(EcError::InvalidConfig {
                 reason: "data_shards must be >= 1",
@@ -38,18 +51,29 @@ impl EcConfig {
                 reason: "data_shards + parity_shards exceeds MAX_TOTAL_SHARDS",
             });
         }
-        Ok(Self {
-            data_shards,
-            parity_shards,
-        })
+        Ok(())
+    }
+
+    /// Number of data shards (k).
+    #[must_use]
+    pub const fn data_shards(self) -> u8 {
+        self.data_shards
+    }
+
+    /// Number of parity shards (m).
+    #[must_use]
+    pub const fn parity_shards(self) -> u8 {
+        self.parity_shards
     }
 
     /// Total number of shards (k + m).
-    pub fn total_shards(self) -> usize {
+    #[must_use]
+    pub const fn total_shards(self) -> usize {
         self.data_shards as usize + self.parity_shards as usize
     }
 
     /// Storage overhead multiplier, e.g. (4,2) → 1.5.
+    #[must_use]
     pub fn overhead(self) -> f64 {
         self.total_shards() as f64 / self.data_shards as f64
     }
@@ -252,6 +276,7 @@ impl ErasureCodec {
     ///
     /// ZONE_INIT: allocates.
     pub fn new(config: EcConfig) -> Result<Self, EcError> {
+        let config = config.validate()?;
         observability::trace_scope!(
             TRACE_TARGET,
             "ErasureCodec::new",

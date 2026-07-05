@@ -2970,8 +2970,8 @@ fn build_storage_node_process_config(
             route_map_validity: RouteMapValidity::Forever,
             data_dir: Path::new(&node_data_dir).to_path_buf(),
             default_ec_shape: EcShape {
-                k: ec_config.data_shards,
-                m: ec_config.parity_shards,
+                k: ec_config.data_shards(),
+                m: ec_config.parity_shards(),
             },
             pg_ids,
             socket_path: Path::new(&socket_path).to_path_buf(),
@@ -3010,8 +3010,8 @@ fn build_control_plane_storage_node_process_config(
             format!("failed to advance storage-node control-plane incarnation: {error}")
         })?;
     let default_ec_shape = EcShape {
-        k: ec_config.data_shards,
-        m: ec_config.parity_shards,
+        k: ec_config.data_shards(),
+        m: ec_config.parity_shards(),
     };
     let node = SharedStorageNode::open_with_default_ec_shape(
         node_data_dir_path,
@@ -3135,8 +3135,8 @@ async fn run_legacy_local_frontend(config: ServerConfig, host_id: String, ec_con
     let pg_ids: Vec<u32> = (0..config.pg_count).collect();
     let data_dir = Path::new(&config.data_dir);
     let ec_shape = storage::EcShape {
-        k: ec_config.data_shards,
-        m: ec_config.parity_shards,
+        k: ec_config.data_shards(),
+        m: ec_config.parity_shards(),
     };
 
     let node_ids: Vec<NodeId> = (0..config.local_node_count).map(NodeId::new).collect();
@@ -3258,8 +3258,8 @@ fn build_remote_frontend_storage_cluster(
     let cluster_epoch = ClusterEpoch::new(config.storage_cluster_epoch)
         .ok_or_else(|| "ARGMIN_STORAGE_CLUSTER_EPOCH must be > 0".to_string())?;
     let ec_shape = storage::EcShape {
-        k: ec_config.data_shards,
-        m: ec_config.parity_shards,
+        k: ec_config.data_shards(),
+        m: ec_config.parity_shards(),
     };
     let node_ids: Vec<NodeId> = (0..config.local_node_count).map(NodeId::new).collect();
     let mut local_map = LocalClusterMap::open_frontend_topology_only_with_epoch(
@@ -3333,8 +3333,8 @@ fn build_frontend_storage_cluster_from_runtime_map(
         metadata_primary_node_id,
         runtime_map,
         EcShape {
-            k: ec_config.data_shards,
-            m: ec_config.parity_shards,
+            k: ec_config.data_shards(),
+            m: ec_config.parity_shards(),
         },
         unix_storage_node_client_admission_settings(config),
     )

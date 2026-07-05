@@ -343,8 +343,8 @@ pub(crate) fn open_test_storage_cluster(dir: &Path, pg_ids: &[u32]) -> Arc<Stora
         dir,
         pg_ids,
         storage::EcShape {
-            k: ec_config.data_shards,
-            m: ec_config.parity_shards,
+            k: ec_config.data_shards(),
+            m: ec_config.parity_shards(),
         },
     )
 }
@@ -361,7 +361,7 @@ pub(crate) fn open_test_storage_cluster_with_ec_shape(
 }
 
 pub(crate) fn backend_supports_parity_recovery() -> bool {
-    EcConfig::default().parity_shards > 0
+    EcConfig::default().parity_shards() > 0
 }
 
 pub(crate) fn test_sse_customer_request() -> SseCustomerRequest {

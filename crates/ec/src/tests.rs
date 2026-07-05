@@ -19,7 +19,7 @@ fn encode(codec: &ErasureCodec, data: &[Vec<u8>]) -> Vec<Vec<u8>> {
 }
 
 fn encode_with_backend(codec: &ErasureCodec, data: &[Vec<u8>], backend: Backend) -> Vec<Vec<u8>> {
-    let m = codec.config().parity_shards as usize;
+    let m = codec.config().parity_shards() as usize;
     let shard_size = data[0].len();
     let mut parity: Vec<Vec<u8>> = (0..m).map(|_| vec![0u8; shard_size]).collect();
     let data_refs: Vec<&[u8]> = data.iter().map(|v| v.as_slice()).collect();
@@ -197,8 +197,8 @@ fn encode_all_zeros_gives_zero_parity() {
 #[test]
 fn zero_parity_codec_construction() {
     let codec = ErasureCodec::new(EcConfig::new(4, 0).unwrap()).unwrap();
-    assert_eq!(codec.config().data_shards, 4);
-    assert_eq!(codec.config().parity_shards, 0);
+    assert_eq!(codec.config().data_shards(), 4);
+    assert_eq!(codec.config().parity_shards(), 0);
     assert_eq!(codec.verify_scratch_size(1024), 0);
 }
 
