@@ -1,6 +1,7 @@
 use std::collections::BTreeSet;
 use std::fs::{self, File};
 use std::os::unix::fs::PermissionsExt;
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Output, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -9,12 +10,15 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use openraft::impls::leader_id_adv::LeaderId;
 use openraft::impls::Entry;
+use openraft::raft::AppendEntriesRequest;
 use openraft::storage::{RaftLogReader, RaftLogStorage};
 use openraft::{EntryPayload, LogId, Vote};
 use storage::control_plane_command::ControlPlaneCommand;
 use storage::control_plane_raft::{
-    durable_artifact_wal_path, ControlPlaneRaftEntry, ControlPlaneRaftLeaderId,
-    ControlPlaneRaftRestartArtifact, ControlPlaneRaftWalFile, ControlPlaneRaftWalRecord,
+    durable_artifact_wal_path, write_control_plane_raft_peer_transport_frame,
+    ControlPlaneRaftEntry, ControlPlaneRaftLeaderId, ControlPlaneRaftPeerFrameIdentity,
+    ControlPlaneRaftPeerRpcRequest, ControlPlaneRaftRestartArtifact, ControlPlaneRaftWalFile,
+    ControlPlaneRaftWalRecord,
 };
 use storage::{NodeId, PgId};
 
@@ -82,7 +86,11 @@ impl ChildGuard {
     ) -> Self {
         let control_socket = test_dir.join(format!("control-{raft_node_id}.sock"));
         let peer_socket = test_dir.join(format!("raft-{raft_node_id}.sock"));
-        let state_path = test_dir.join(format!("control-{raft_node_id}.state"));
+        let state_dir = state_dir(test_dir, raft_node_id);
+        fs::create_dir_all(&state_dir).expect("state directory should be created");
+        fs::set_permissions(&state_dir, fs::Permissions::from_mode(0o700))
+            .expect("state directory permissions should be tightened");
+        let state_path = state_dir.join("control.state");
         let data_dir = test_dir.join(format!("data-{raft_node_id}"));
         let stdout = File::create(test_dir.join(format!("node-{raft_node_id}.stdout.log")))
             .expect("stdout log should be created");
@@ -481,25 +489,6 @@ struct PersistedLogStateSummary {
     committed: Option<LogId<ControlPlaneRaftLeaderId>>,
 }
 
-fn persisted_log_state_advanced(
-    before: &PersistedLogStateSummary,
-    after: &PersistedLogStateSummary,
-) -> bool {
-    option_log_id_advanced(before.last_log_id, after.last_log_id)
-        || option_log_id_advanced(before.committed, after.committed)
-}
-
-fn option_log_id_advanced(
-    before: Option<LogId<ControlPlaneRaftLeaderId>>,
-    after: Option<LogId<ControlPlaneRaftLeaderId>>,
-) -> bool {
-    match (before, after) {
-        (None, Some(_)) => true,
-        (Some(before), Some(after)) => after > before,
-        _ => false,
-    }
-}
-
 fn artifact_log_state_with_wal(
     path: &Path,
     cluster_name: &str,
@@ -754,12 +743,16 @@ fn control_socket(test_dir: &Path, node_id: u64) -> PathBuf {
     test_dir.join(format!("control-{node_id}.sock"))
 }
 
+fn state_dir(test_dir: &Path, node_id: u64) -> PathBuf {
+    test_dir.join(format!("state-{node_id}"))
+}
+
 fn peer_socket(test_dir: &Path, node_id: u64) -> PathBuf {
     test_dir.join(format!("raft-{node_id}.sock"))
 }
 
 fn state_path(test_dir: &Path, node_id: u64) -> PathBuf {
-    test_dir.join(format!("control-{node_id}.state"))
+    state_dir(test_dir, node_id).join("control.state")
 }
 
 fn wal_path(test_dir: &Path, node_id: u64) -> PathBuf {
@@ -991,28 +984,9 @@ fn experimental_raft_process_peer_wal_crash_after_sync_before_response_recovers_
 
     node103.stop();
     let follower_peer_socket = peer_socket(test_dir.path(), 103);
-    let wal_crash_arm_path = test_dir.path().join("node-103-peer-wal-crash-armed");
     let _ = fs::remove_file(&follower_peer_socket);
-    let _ = fs::remove_file(&wal_crash_arm_path);
-    let mut restarted103 = ChildGuard::spawn_with_extra_env(
-        &bin,
-        test_dir.path(),
-        &cluster_name,
-        103,
-        &raft_node_ids,
-        &[
-            (
-                "ARGMIN_EXPERIMENTAL_RAFT_EXIT_AFTER_PEER_WAL_BEFORE_RESPONSE",
-                "1",
-            ),
-            (
-                "ARGMIN_EXPERIMENTAL_RAFT_EXIT_AFTER_PEER_WAL_BEFORE_RESPONSE_ARMED_PATH",
-                wal_crash_arm_path
-                    .to_str()
-                    .expect("test arm path should be valid UTF-8"),
-            ),
-        ],
-    );
+    let mut restarted103 =
+        ChildGuard::spawn(&bin, test_dir.path(), &cluster_name, 103, &raft_node_ids);
     wait_for_socket_file(&follower_peer_socket, &mut restarted103);
     wait_for_child_stderr_log_contains(
         &mut restarted103,
@@ -1026,21 +1000,64 @@ fn experimental_raft_process_peer_wal_crash_after_sync_before_response_recovers_
             || follower_log_before_crash.committed.is_some(),
         "bootstrapped follower should expose retained log state before crash: {follower_log_before_crash:?}"
     );
+    let follower_vote_before_crash =
+        artifact_persisted_vote_with_wal(&follower_state_path, &cluster_name, 103)
+            .expect("follower artifact plus WAL should expose vote before crash")
+            .expect("bootstrapped follower should persist a vote before crash");
+    assert!(
+        follower_vote_before_crash.committed,
+        "bootstrapped follower should persist a committed vote before direct append: {follower_vote_before_crash:?}"
+    );
+    let prev_log_id = follower_log_before_crash
+        .last_log_id
+        .expect("bootstrapped follower should have a log tip before append");
+    let appended_log_id = LogId::new(
+        *prev_log_id.committed_leader_id(),
+        prev_log_id
+            .index()
+            .checked_add(1)
+            .expect("test log index should advance"),
+    );
+    let append_request = AppendEntriesRequest {
+        vote: Vote::<ControlPlaneRaftLeaderId>::new_committed(
+            follower_vote_before_crash.term,
+            follower_vote_before_crash.node_id,
+        ),
+        prev_log_id: Some(prev_log_id),
+        entries: vec![Entry {
+            log_id: appended_log_id,
+            payload: EntryPayload::Normal(ControlPlaneCommand::SetPgActingSet {
+                pg_id: PgId::new(0),
+                acting_set: vec![NodeId::new(1)],
+            }),
+        }],
+        leader_commit: follower_log_before_crash.committed,
+    };
+    let append_frame = ControlPlaneRaftPeerRpcRequest::AppendEntries(append_request)
+        .encode_frame_for_peer(&ControlPlaneRaftPeerFrameIdentity::new(
+            cluster_name.clone(),
+            101,
+            103,
+        ))
+        .expect("append request should encode");
     let artifact_bytes_before_crash = fs::read(&follower_state_path)
         .expect("follower checkpoint artifact should read before crash");
-    File::create(&wal_crash_arm_path).expect("peer WAL crash arm file should be created");
+    let follower_state_dir = state_dir(test_dir.path(), 103);
+    fs::set_permissions(&follower_state_dir, fs::Permissions::from_mode(0o500))
+        .expect("follower state directory should be made checkpoint-unwritable");
 
-    let output = run_set_pg_acting_set_live(&bin, &leader_control_socket, 0, &[1]);
-    assert!(
-        output.status.success(),
-        "live acting-set change should commit through surviving quorum after follower crash: {}\n{}",
-        format_admin_failure(output.status, &output),
-        process_logs(test_dir.path())
-    );
+    let mut peer_stream =
+        UnixStream::connect(&follower_peer_socket).expect("follower peer socket should connect");
+    write_control_plane_raft_peer_transport_frame(&mut peer_stream, &append_frame)
+        .expect("append frame should be written to follower peer socket");
+    drop(peer_stream);
+
     let status = wait_for_process_exit(&mut restarted103, Duration::from_secs(5));
+    fs::set_permissions(&follower_state_dir, fs::Permissions::from_mode(0o700))
+        .expect("follower state directory permissions should be restored after crash");
     assert!(
         !status.success(),
-        "follower should exit at injected post-WAL/pre-response crash point"
+        "follower should exit after failing the checkpoint-before-peer-response path"
     );
     assert_eq!(
         fs::read(&follower_state_path)
@@ -1051,18 +1068,25 @@ fn experimental_raft_process_peer_wal_crash_after_sync_before_response_recovers_
     let follower_log_after_crash =
         artifact_log_state_with_wal(&follower_state_path, &cluster_name, 103)
             .expect("artifact plus WAL should restore after peer append crash");
-    assert!(
-        persisted_log_state_advanced(&follower_log_before_crash, &follower_log_after_crash),
-        "artifact plus WAL must recover the unacknowledged-but-fsynced follower mutation; before={follower_log_before_crash:?} after={follower_log_after_crash:?}"
+    assert_eq!(
+        follower_log_after_crash.last_log_id,
+        Some(appended_log_id),
+        "artifact plus WAL must recover the unacknowledged-but-fsynced follower append; before={follower_log_before_crash:?} after={follower_log_after_crash:?}"
     );
 
     let mut recovered103 =
         ChildGuard::spawn(&bin, test_dir.path(), &cluster_name, 103, &raft_node_ids);
-    wait_for_follower_artifact_pg_acting_set(
-        &follower_state_path,
-        PgId::new(0),
-        &[NodeId::new(1)],
-        &mut [&mut node101, &mut node102, &mut recovered103],
+    wait_for_socket_file(&follower_peer_socket, &mut recovered103);
+    wait_for_child_stderr_log_contains(
+        &mut recovered103,
+        "argmin-s3 experimental durable OpenRaft control-plane manager using state",
+    );
+    assert_eq!(
+        artifact_log_state_with_wal(&follower_state_path, &cluster_name, 103)
+            .expect("recovered follower artifact plus WAL should expose log state")
+            .last_log_id,
+        Some(appended_log_id),
+        "recovered follower should retain the WAL-restored unacknowledged append"
     );
 }
 

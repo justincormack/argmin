@@ -7,10 +7,7 @@ use std::ops::{Bound, RangeBounds};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::{
-    atomic::{AtomicUsize, Ordering},
-    Arc, Mutex, MutexGuard,
-};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use futures_util::{Stream, StreamExt};
@@ -4157,11 +4154,6 @@ const CONTROL_PLANE_RAFT_WAL_RECORD_APPEND: u8 = 2;
 const CONTROL_PLANE_RAFT_WAL_RECORD_SAVE_COMMITTED: u8 = 3;
 const CONTROL_PLANE_RAFT_WAL_RECORD_TRUNCATE_AFTER: u8 = 4;
 const CONTROL_PLANE_RAFT_WAL_RECORD_PURGE: u8 = 5;
-const CONTROL_PLANE_RAFT_EXIT_AFTER_WAL_FILE_SYNC_ENV: &str =
-    "ARGMIN_EXPERIMENTAL_RAFT_EXIT_AFTER_PEER_WAL_BEFORE_RESPONSE";
-const CONTROL_PLANE_RAFT_EXIT_AFTER_WAL_FILE_SYNC_ARMED_PATH_ENV: &str =
-    "ARGMIN_EXPERIMENTAL_RAFT_EXIT_AFTER_PEER_WAL_BEFORE_RESPONSE_ARMED_PATH";
-static CONTROL_PLANE_RAFT_EXIT_AFTER_WAL_FILE_SYNC_ARM_COUNT: AtomicUsize = AtomicUsize::new(0);
 const CONTROL_PLANE_RAFT_PEER_RPC_MAGIC: &[u8] = b"ARGMINCPRAFTPEER";
 const CONTROL_PLANE_RAFT_PEER_RPC_VERSION: u16 = 1;
 const CONTROL_PLANE_RAFT_PEER_RPC_CHECKSUM_LEN: usize = 8;
@@ -4970,7 +4962,6 @@ impl ControlPlaneRaftWalFile {
             .map_err(ControlPlaneRaftWalAppendError::AmbiguousRecordMayExist)?;
         sync_control_plane_raft_wal_parent(&self.path)
             .map_err(ControlPlaneRaftWalAppendError::ReplayableRecordMayExist)?;
-        maybe_exit_after_control_plane_raft_wal_file_sync();
         Ok(())
     }
 
@@ -5405,41 +5396,6 @@ impl ControlPlaneRaftWalFile {
     fn file_header_len() -> usize {
         CONTROL_PLANE_RAFT_WAL_FILE_MAGIC.len() + 2 + 8 + CONTROL_PLANE_RAFT_WAL_CHECKSUM_LEN
     }
-}
-
-#[derive(Debug)]
-#[must_use]
-pub struct ControlPlaneRaftWalFileSyncExitGuard;
-
-pub fn arm_control_plane_raft_peer_wal_sync_exit() -> ControlPlaneRaftWalFileSyncExitGuard {
-    CONTROL_PLANE_RAFT_EXIT_AFTER_WAL_FILE_SYNC_ARM_COUNT.fetch_add(1, Ordering::AcqRel);
-    ControlPlaneRaftWalFileSyncExitGuard
-}
-
-impl Drop for ControlPlaneRaftWalFileSyncExitGuard {
-    fn drop(&mut self) {
-        CONTROL_PLANE_RAFT_EXIT_AFTER_WAL_FILE_SYNC_ARM_COUNT.fetch_sub(1, Ordering::AcqRel);
-    }
-}
-
-fn maybe_exit_after_control_plane_raft_wal_file_sync() {
-    if std::env::var_os(CONTROL_PLANE_RAFT_EXIT_AFTER_WAL_FILE_SYNC_ENV).is_some()
-        && CONTROL_PLANE_RAFT_EXIT_AFTER_WAL_FILE_SYNC_ARM_COUNT.load(Ordering::Acquire) > 0
-        && control_plane_raft_wal_file_sync_exit_is_test_armed()
-    {
-        eprintln!(
-            "experimental OpenRaft control-plane exiting after WAL durability before response"
-        );
-        std::process::exit(1);
-    }
-}
-
-fn control_plane_raft_wal_file_sync_exit_is_test_armed() -> bool {
-    let Some(path) = std::env::var_os(CONTROL_PLANE_RAFT_EXIT_AFTER_WAL_FILE_SYNC_ARMED_PATH_ENV)
-    else {
-        return true;
-    };
-    Path::new(&path).exists()
 }
 
 fn write_control_plane_raft_wal_bytes(
