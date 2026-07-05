@@ -18,17 +18,180 @@ smaller per-crate items.
 
 ## Status
 
-Open. Nothing in this plan has been fixed yet.
+In progress. A1-A10, S1-S4, S6, K1-K4, H1-H8, all of P1/P2, and the first two
+P3 items are marked done. A re-review on 2026-07-05 verified the closed items
+against the code (auth crate unit tests pass; storage/ec/placement cargo check
+clean): 38 of ~40 closed items are fully verified, two are partial (K1, H6 —
+reopened below), and the verification surfaced a set of new findings, mostly
+introduced by the fix work itself. All still-open items below were re-checked
+and remain valid; their line references have been updated in place to current
+HEAD where they had drifted.
 
-Suggested order of attack:
-1. Auth path gaps (A1-A4) — small, well-localized, each with an existing
-   header-path test to mirror.
-2. Storage lease deadline (S1). S2 was invalidated by the documented
-   no-upgrade policy.
-3. Unify checksum-algorithm parsing (K1) and make `from_header_iter` fail
-   closed — kills two findings at once.
-4. The mechanical sweeps (patterns P1-P6) — churn-proofing that turns the next
-   drift into a compile error instead of a review finding.
+Remaining order of attack:
+1. RR1 (reopened K1 core): make `SystemMetadata::from_header_iter` fail closed
+   and validate CreateMultipartUpload checksum value headers — the one live
+   bug found by the re-review.
+2. RR2: pin the CRC64NVME unconfigured-Complete edge against AWS and resolve
+   the still-dead `requires_multipart_create_algorithm`.
+3. The small fix-introduced items in the re-review section (RR3-RR16).
+4. The remaining pattern sweeps (P3 tail, P4-P6) and smaller items.
+
+## Re-review 2026-07-05 — reopened and new items
+
+### Reopened
+
+- [ ] **RR1. K1 core gap: `SystemMetadata::from_header_iter` was masked, not
+  fixed — live bug on CreateMultipartUpload.** The K1 resolution fixed the
+  HTTP layer but never made the core parser fail closed.
+  `crates/server-core/src/system_metadata.rs:118-184` is still
+  order-dependent and silent: a literal `x-amz-checksum-algorithm` header
+  overwrites the algorithm derived from a concrete `x-amz-checksum-*` value
+  header (mispair), and an unparseable value silently resets it to `None`.
+  Server-http masks this on three of four call sites (PutObject filters the
+  header at `mod.rs:421-426`; CopyObject REPLACE calls `strip_checksum_values`
+  at `mod.rs:1473`; POST builds headers from an allowlist at
+  `mod.rs:3482-3509`) — but the CreateMultipartUpload arm
+  (`mod.rs:2637-2647`) feeds raw request headers through with no
+  checksum-value validation at all. Verified consequence: an arbitrary,
+  not-even-base64 `x-amz-checksum-sha256` value on CreateMultipartUpload is
+  stored verbatim in the upload's system metadata
+  (`coordinator/multipart.rs:397`), survives CompleteMultipartUpload when the
+  upload has no checksum config (`multipart.rs:705-713` only overwrites when
+  config is `Some`), is kept by `prepare_stored_system_metadata`
+  (`object_state.rs:154-156`), and is served back on GET/HEAD. No test sends
+  a concrete checksum value header on CreateMultipartUpload. Fix: make
+  `from_header_iter` return an error on unparseable algorithm and on
+  algorithm/value mispairing, independent of header order, and add the
+  CreateMultipartUpload test.
+
+- [ ] **RR2. CRC64NVME unconfigured-Complete edge untested against AWS, and
+  `requires_multipart_create_algorithm` is still dead code.** K2's fix wired
+  the Complete-side predicate (`accepts_unconfigured_complete_multipart_header`)
+  but `requires_multipart_create_algorithm` (`crates/checksum/src/types.rs:143-148`)
+  still has zero call sites — neither used nor deleted. CRC64NVME sits in
+  neither family predicate, so an unconfigured CompleteMultipartUpload with
+  `x-amz-checksum-crc64nvme` falls into the reject arm
+  (`multipart.rs:671-694`); oracle tests cover the legacy-ignored and
+  new-rejected families but not crc64nvme, and since CRC64NVME is AWS's
+  default full-object algorithm this edge plausibly diverges. Fix: AWS-pin
+  the crc64nvme case, then wire or delete the dead predicate.
+
+- [ ] **RR3. H6 residual: "one 416 builder" not achieved; two dead pub
+  builders left behind.** Behavior is correct and AWS-pinned, but there are
+  still three live 416-producing paths, two byte-identical (conversion arms
+  `response.rs:776, 780`; `range_not_satisfiable_with_ids` `response.rs:1416`,
+  reachable only via the redundant explicit catch at `mod.rs:1722-1726` that
+  a bare `?` would replicate). Dead code introduced by the fix:
+  `S3Response::invalid_part_number` (`response.rs:1424`) — the purpose-built
+  builder was never wired in — and `range_not_satisfiable`
+  (`response.rs:1408`, stamps the literal `"request-id"`), both pub with zero
+  callers. Consolidate to one builder, delete the dead pair.
+
+### New findings from fix verification
+
+- [ ] **RR4. Response XML shape dispatched by string equality on message
+  literals duplicated across three crates.** `response.rs:36-46`
+  (`is_host_id_invalid_request`) selects HostId-vs-Resource shape by exact
+  message-string match against literals duplicated by value in
+  `server-http/src/http/mod.rs:5349/5374/5380/5385`,
+  `server-core/src/coordinator/multipart.rs:688` (prefix match), and
+  `s3-types/src/lifecycle.rs:421`. Drift in any producer silently degrades
+  the response to the Resource-shaped XML; only end-to-end s3-tests would
+  catch it. Fix: shared constants or a typed shape flag on the error.
+
+- [ ] **RR5. `RequestNotYetValid` response shape unpinned and inconsistent
+  with its sibling.** The A4 variant falls through to the default formatter
+  (`response.rs:914-921`: emits `<Resource>`, no `<HostId>`) — the opposite
+  shape of `PresignedRequestExpired` (`response.rs:506-517`: HostId, no
+  Resource). The oracle test (`presigned.rs:1881`) asserts only code and
+  message. AWS-pin the shape and route through the AccessDenied formatter if
+  confirmed.
+
+- [ ] **RR6. Dead `AuthError::InvalidToken`.**
+  `crates/auth/src/error.rs:51` is no longer constructed anywhere in
+  production code since the session-token removal (A2) — only mapped
+  (`server-core/src/error.rs:404`) and matched. Either a producer is missing
+  or the variant should be deleted.
+
+- [ ] **RR7. Presigned path accepts a signed `x-amz-security-token` header
+  without rejection.** Header auth rejects any `x-amz-security-token` header,
+  signed or not (`request.rs:329-333`); presigned auth checks only the query
+  parameter (`request.rs:500-501`), so a token header listed in
+  `X-Amz-SignedHeaders` passes the unsigned-header check and merely
+  participates in the signature. Not exploitable with static credentials,
+  but it is residual path drift with no test pinning it.
+
+- [ ] **RR8. `route_map_validity_regressed` duplicated verbatim** at
+  `storage/src/cluster.rs:1325` and `storage/src/storage_node_server.rs:11148`
+  — a fresh instance of the P2 duplicate-entry-point pattern created by the
+  S6 fix. Both copies also operate on `Option<u64>` projections rather than
+  `RouteMapValidity` itself, keeping non-diagnostic Option plumbing alive.
+  Consolidate into one helper taking the enum.
+
+- [ ] **RR9. Bucket write *drains* still have the pre-S1 shape.**
+  `begin_durable_bucket_write_drain` takes `lease_deadline: Option<u64>`
+  through trait and RPC (`traits.rs:163`, `storage_rpc.rs:1342`), and
+  `clear_expired_durable_bucket_write_drain` only clears deadline-bearing
+  rows (`traits.rs:190-192`) — a `None` drain row would be unreapable, the
+  exact latent pattern S1 removed for reservations. All production callers
+  pass `Some` today (`request_ops.rs:2958-2968`). Make the deadline required,
+  matching S1.
+
+- [ ] **RR10. Single/batch peering validation scaffolding still duplicated.**
+  S3's fix shares the authorization/proof helpers, but the surrounding
+  ~50 lines of validation (acting-set membership, deterministic-primary,
+  Peering-state, fence checks) are duplicated between the `CompletePgPeering`
+  arm (`control_plane.rs:2068-2178`) and the batch arm (`:2179-2278`).
+  Identical today; can drift again. Extract a shared per-completion
+  validation fn.
+
+- [ ] **RR11. `Forever` encoded as a `u64::MAX` sentinel** in the route-map
+  validity atomic (`cluster/local.rs:44-58`), making `Until(u64::MAX)`
+  indistinguishable from `Forever`. Behaviorally harmless; add a doc note or
+  debug_assert so the sentinel is pinned intentional.
+
+- [ ] **RR12. `now_millis` in `server-core/src/conditional.rs:14-19` still
+  uses `unwrap_or_default()`** — a broken clock makes
+  If-Modified-Since/If-Unmodified-Since evaluate against epoch 0. Same
+  pattern A3 removed from auth; fail closed or thread the timestamp in.
+
+- [ ] **RR13. Unreachable `AuthMode::PostSigV4` arm in
+  `enforce_bucket_region`** (`mod.rs:3188-3192`): POST always authenticates
+  with `ExactEndpointRegion`, so the arm can never fire, and its
+  `InvalidCredentialScope` fallback is weaker than the in-auth errors. Add a
+  comment (or make it unreachable explicitly) so a future POST-deferral
+  doesn't silently take the weak path.
+
+- [ ] **RR14. Runtime-map validity wire format still permits `Forever`, and
+  boundedness is same-epoch-checked only.** Control-plane RPC decode accepts
+  an optional deadline (`control_plane.rs:5763, 5783` via
+  `from_valid_until_ms(read_option_u64())`), and the epoch-increase refresh
+  path has no boundedness check (`storage_node_server.rs:1782` covers same
+  epoch only). Current control plane cannot issue `Forever` (all constructors
+  bounded), so this is defense-in-depth: reject unbounded maps from
+  authoritative sources at decode, or document why they are tolerated.
+
+- [ ] **RR15. Raft WAL surface (new since the original review) — minor
+  pattern-class items.** Overall disciplined (private fields, typed errors,
+  fully bounds-checked decode of persisted bytes; no hostile-input panics
+  found). Items: `ControlPlaneRaftWalFile::new(path: impl Into<PathBuf>,
+  cluster_name: impl Into<String>, node_id)` (`control_plane_raft.rs:4876`) —
+  a `String` satisfies both leading params, transposition compiles;
+  restore-path durability carried by name only (`from_restart_artifact` vs
+  `_with_wal_file` share an inner fn where `wal: None` silently yields a
+  non-durable log store, `:4310-4329`, `apply_record` skips persistence on
+  `None` at `:4676`); dual replay entry points
+  (`replay_log_store_artifact{,_from}`, `:4968/:4975`); confusable bare
+  `Option<u64>` returns `durable_wal_base_offset()`/`durable_wal_clean_len()`
+  (`:2470/:2475`).
+
+- [ ] **RR16. Cosmetic leftovers.** Test name
+  `finalize_stream_put_rejects_mismatched_sse_s3_write_context`
+  (`multipart_tests.rs:6832`) references the deleted SSE-S3 alias concept;
+  s3-tests copy helper form-urlencodes `versionId` (`helpers.rs:1849-1854`,
+  `+` for space) while the parser strict-percent-decodes — inert today since
+  version ids contain no spaces; small duplicated non-internal
+  `error_response` closures remain in serve.rs (e.g. `:2979`).
 
 ## Bugs — auth (security)
 
@@ -168,10 +331,15 @@ steps it performs.
   Resolution: bucket write reservation records and proofs now carry a required
   `lease_deadline: u64`, the SQLite schema rejects `NULL` deadlines for
   `bucket_write_reservations`, the local/Unix/RPC acquire paths require a
-  concrete deadline, proof matching includes the deadline, and DeleteBucket
-  reservation wait releases exact expired reservation rows before deciding the
-  bucket is blocked. Added a local-cluster regression covering an unreleased
-  expired durable reservation being reaped during DeleteBucket.
+  concrete deadline, and DeleteBucket reservation wait releases exact expired
+  reservation rows before deciding the bucket is blocked. Proof matching
+  (`matches_record`, metadata_command.rs:971-984) deliberately excludes the
+  mutable `lease_deadline` — freshness is checked separately and the heartbeat
+  CAS is the only deadline-inclusive match — see the documented contract under
+  P2. Added a local-cluster regression covering an unreleased expired durable
+  reservation being reaped during DeleteBucket. Re-review 2026-07-05: verified;
+  deadlines are bounded (now + 15s lease, no `u64::MAX`). The *drain* API kept
+  the old optional-deadline shape — tracked as RR9.
 
 - [x] **S2. Invalid: new `buckets` column added without a migration.** This
   finding assumed pre-alpha stores are upgraded in place. They are not:
@@ -197,7 +365,10 @@ steps it performs.
   the same node-service lease/incarnation boundary as `CompletePgPeering`, and
   exact Active replays are treated as no-op completions instead of
   `PgNotPeering`. The control-plane command encoding baseline was bumped
-  because pre-alpha stores are not upgrade-supported yet.
+  because pre-alpha stores are not upgrade-supported yet. Re-review
+  2026-07-05: verified — both paths call the same
+  `authorize_node_service_for_snapshot`; the surrounding validation
+  scaffolding is still duplicated between the single and batch arms (RR10).
 
 - [x] **S4. Tautological `matches_request` argument neutralizes the
   generation check.** `cluster.rs:553-555` passes
@@ -212,8 +383,10 @@ steps it performs.
 
 - [ ] **S5. MPU-cleanup resume cursor is a positional index, not a PG id.**
   `delete_completed_multipart_uploads_for_bucket`
-  (`cluster/request_ops.rs:~5953`, commit 69470e83) persists `next_pg_index`
-  into the call-time-sorted `metadata_pg_ids()`. The current implementation
+  (`cluster/request_ops.rs:6178-6196`) persists `next_pg_index`
+  into the call-time-sorted `metadata_pg_ids()`. Since the review a bounds
+  check was added (errors if cursor > metadata PG count), but the resize
+  re-targeting hazard is unchanged. The current implementation
   sorts the PG list and has sparse-PG regression coverage, so this is not a
   current bug while the configured PG set is fixed for the cluster lifetime.
   It is a real topology-resize hazard: if the metadata PG set changes between
@@ -257,7 +430,9 @@ steps it performs.
   refresh propagation can still bound previously pinned static/local
   generations when an authoritative bounded map is installed. The
   `valid_until_ms()` accessors remain only as deadline projections for
-  diagnostics and error payloads.
+  diagnostics and error payloads. Re-review 2026-07-05: verified; residuals
+  tracked as RR8 (duplicated `route_map_validity_regressed`), RR11
+  (`u64::MAX` sentinel), and RR14 (wire-format `Forever` tolerance).
 
 ## Bugs — checksum handling (cross-crate)
 
@@ -274,7 +449,10 @@ steps it performs.
   `InvalidRequest` unsupported-algorithm message. Fixed in
   `crates/server-http/src/http/mod.rs` and response shaping in
   `crates/server-http/src/http/response.rs`, with s3-test coverage in
-  `crates/s3-tests/tests/checksums.rs`.
+  `crates/s3-tests/tests/checksums.rs`. Re-review 2026-07-05: the HTTP-layer
+  fix is verified, but the core `from_header_iter` fail-closed directive was
+  not implemented and the CreateMultipartUpload call site is unprotected —
+  reopened as RR1.
 
 - [x] **K2. Multipart checksum create-algorithm requirement needed AWS
   clarification.** AWS-pinned tests showed the UploadPart
@@ -289,7 +467,9 @@ steps it performs.
   checksum Type: null, actual checksum Type: <algo>`. Fixed local error text
   and response shape in `crates/server-core/src/coordinator/multipart.rs` and
   `crates/server-http/src/http/response.rs`; expanded s3-test coverage in
-  `crates/s3-tests/tests/checksums.rs`.
+  `crates/s3-tests/tests/checksums.rs`. Re-review 2026-07-05: verified, but
+  `requires_multipart_create_algorithm` remains dead code and the CRC64NVME
+  edge is unpinned — tracked as RR2.
 
 - [x] **K3. `CHECKSUM_HEADERS` in server-http hand-duplicates
   `ChecksumAlgorithm::ALL` + `header_name()`**
@@ -406,7 +586,9 @@ steps it performs.
   diagnosis: AWS returns 416 `InvalidPartNumber` with
   `<PartNumberRequested>` and `<ActualPartCount>`, not `InvalidRange`. Added a
   read-specific `InvalidPartNumber` error and AWS-shaped response while leaving
-  CompleteMultipartUpload `InvalidPart` semantics unchanged.
+  CompleteMultipartUpload `InvalidPart` semantics unchanged. Re-review
+  2026-07-05: behavior verified, but the single-builder consolidation did not
+  happen and two dead pub builders were left behind — residual tracked as RR3.
 
 - [x] **H7. SSE-C validator-key-unavailable reported as client 400.**
   `server-core/src/sse.rs:495-499` returns `InvalidRequest` when the server no
@@ -561,76 +743,88 @@ each is one refactor away from a panic:
   Resolution: make the field private, change `new(total_shards)` to take
   `usize`, add a read-only accessor, defensively revalidate in `Placer::new`,
   and remove the lossy `as u8` from the storage placement caller.
-- [ ] `StorageNodeProcessConfig`: 9 pub fields whose consistency is enforced
-  only by the separate `validate_storage_node_process_configs`
-  (`storage_node_server.rs:318, 803`). Private fields + validating
+- [ ] `StorageNodeProcessConfig`: still 9 pub fields (now including
+  `route_map_validity: RouteMapValidity` after S6) whose consistency is
+  enforced only by the separate `validate_storage_node_process_configs`
+  (`storage_node_server.rs:325-335, 1335`). Private fields + validating
   constructor.
 - [ ] `SseCustomerRequest::with_algorithm` accepts any string, breaking the
   AES256 pin that `new()` establishes (`sse.rs:54-57`); validation lives only
-  in server-http. Drop it or make it fallible.
+  in server-http (callers `mod.rs:5005, 5117`). Drop it or make it fallible.
 - [ ] `WriteEncryptionRequest::from_request_parts` has
   `unreachable!` on conflicting SSE-C+SSE-S3 inputs
-  (`coordinator/request_types.rs:317-329`) — invariant enforced in a
+  (`coordinator/request_types.rs:317-326`) — invariant enforced in a
   different crate, 5 call sites; with `abort_on_500` a future mistake is a
   process abort. Return `Err(InvalidArgument)`.
 - [ ] `LifecycleRuleFilter` pub fields permit states the parser never
-  produces (legacy rule with tags) which render as V2 `<Filter>`. Constructor
-  or doc note on `explicit_filter`.
+  produces (legacy rule with tags) which render as V2 `<Filter>`
+  (`s3-types/src/lifecycle.rs:37-43`). Constructor or doc note on
+  `explicit_filter`.
 
 ### P4. Positional same-typed parameters
 
 - [ ] Claim acquire fns take 3 consecutive `u64` timestamps + 2 `&str` tokens
-  (`cluster.rs:8788 acquire_placed_segment_shard_repair_claim`,
-  `cluster.rs:9149 acquire_next_placed_segment_shard_backfill_claim`);
+  (`cluster.rs:8794-8802 acquire_placed_segment_shard_repair_claim`,
+  `cluster.rs:9155-9162 acquire_next_placed_segment_shard_backfill_claim`);
   consumers pass `now_ms` in two of the three slots
-  (`server-core/src/coordinator/runtime.rs:1376, 1684`). The params structs
-  already exist (`types.rs:1593 PlacedSegmentShardRepairClaimAcquire`,
+  (`server-core/src/coordinator/runtime.rs`). The params structs already
+  exist (`types.rs:1593 PlacedSegmentShardRepairClaimAcquire`,
   `types.rs:1638`) — use them in the signatures.
-- [ ] `acquire_durable_bucket_write_reservation`: 9 positional params
-  repeated across four layers (`traits.rs:96-107`, `node_client/local.rs:
-  1749-1760`, interface, `pg_store/metadata.rs:5372-5382`); the same trait's
-  heartbeat API already uses a params struct. Introduce the acquire struct
-  (natural place to make `lease_deadline` required per S1).
-- [ ] `PgMetadataProof::new(u64, u64, u64)` (`control_plane.rs:2859`) —
+- [ ] `acquire_durable_bucket_write_reservation`: still positional across all
+  layers (`traits.rs:94-104`, `node_client/local.rs:727, 1763`,
+  `pg_store/metadata.rs:5377-5387`); the S1 fix made `lease_deadline` a
+  required `u64` but kept the positional list, so `created_at`/`lease_deadline`
+  are now two adjacent bare `u64`s — the transposition hazard is marginally
+  worse. The same trait's heartbeat API already uses a params struct.
+  Introduce the acquire struct.
+- [ ] `PgMetadataProof::new(u64, u64, u64)` (`control_plane.rs:3106`) —
   index/hash/digest transposition compiles silently and poisons peering-proof
   comparison. Named-field construction only, or newtypes.
 - [ ] `TraceContext::from_ids(String, String)` (`observability/src/lib.rs:39`)
   — trace/request id swap risk at wire boundaries.
 - [ ] `put_bucket_acl_and_load_info(..., public_read: bool, public_write:
-  bool)` (`request_ops.rs:6460`) and `with_rpc_admission(Duration, Duration)`
-  (`cluster/local.rs:154-160`) — adjacent same-typed pairs; low priority (no
-  bare-literal call sites today).
-- [ ] Metrics render site pairs ~115 name strings positionally with ~115
-  `u64`s (`server-http/src/http/serve.rs:1474-1620`); tests check presence,
-  not values, so a transposition mislabels metrics silently.
+  bool)` (`request_ops.rs:6668-6674`) and `with_rpc_admission(usize,
+  Duration, Duration)` (`cluster/local.rs:158-164`) — adjacent same-typed
+  pairs; low priority (no bare-literal call sites today). Partially
+  mitigated: a struct-taking `with_rpc_admission_settings` variant now exists
+  (`local.rs:174`) but the positional variant remains.
+- [ ] Metrics render site pairs ~100+ name strings positionally with values
+  in one giant `concat!` (`server-http/src/http/serve.rs:1466+`); tests check
+  presence, not values, so a transposition mislabels metrics silently.
   `bucket_lock_wait_exceeded_total` is deliberately excluded from export
-  (test serve.rs:5202) with no documentation why. Fix: observability exposes
-  `MetricsSnapshot::iter_named() -> impl Iterator<Item = (&'static str, u64)>`
-  (or a macro generating struct + names together).
+  (test serve.rs:5195) with no documentation why. Mitigated but not fixed:
+  the whole endpoint is now behind
+  `cfg(any(test, feature = "local-debug-endpoints"))`. Fix: observability
+  exposes `MetricsSnapshot::iter_named() -> impl Iterator<Item = (&'static
+  str, u64)>` (or a macro generating struct + names together).
 
 ### P5. Canonical tokens duplicated across crates / stringly-typed dispatch
 
 - [ ] Observability dimension keys are `&'static str` matched with silent
-  `_ => {}` fallthrough (`lib.rs:2284-2315, 1748-1759`): stream-upload
-  `phase`, storage-rpc `admission_class`, background-work `event`. Live
-  instance: server-http emits phase `"finalize_started"` which matches no arm
-  — counter silently never updates. Fix: `enum StreamUploadPhase` /
-  `StorageRpcAdmissionClass` / `BackgroundWorkEvent` in observability (storage
-  already has a private class enum mirroring the list — move it), match
-  exhaustively.
+  `_ => {}` fallthrough (`lib.rs:1764-1790, 2317-2331, 3111-3125`):
+  stream-upload `phase`, storage-rpc `admission_class`, background-work
+  `event`. Live instance still live at re-review: server-http emits phase
+  `"finalize_started"` (`serve.rs:4251`) which matches no arm — counter
+  silently never updates. Fix: `enum StreamUploadPhase` /
+  `StorageRpcAdmissionClass` / `BackgroundWorkEvent` in observability
+  (storage still keeps its private class enum in
+  `node_client/unix_admission.rs` — move it), match exhaustively.
 - [ ] `VersionId` has `Display` in s3-types but its inverse parser lives in
   server-http and is lossier (`mod.rs:128-137` accepts `versionId=0` as the
-  null version, which Display never produces). Fix: `impl FromStr for
-  VersionId` in s3-types accepting `"null"` and `>= 1` only.
+  null version via `from_u64(0)`, `s3-types/lib.rs:493-497`, which Display
+  (:525) never produces). Fix: `impl FromStr for VersionId` in s3-types
+  accepting `"null"` and `>= 1` only.
 - [ ] `BucketNamespace::as_header_value` has no parse counterpart —
   server-http matches `"global"`/`"account-regional"` literals
-  (mod.rs:509-510 vs s3-types lib.rs:250-255). `BucketVersioningState` has
+  (mod.rs:506-507 vs s3-types lib.rs:250-254). `BucketVersioningState` has
   `from_u8` but no `as_str`/`parse`; `"Enabled"`/`"Suspended"` are literals in
-  `xml.rs:1441-1442`. Add the missing halves.
-- [ ] auth helper triplication: `hex_encode` ×3, `percent_decode` ×2,
-  `hex_val` ×2 across sigv4.rs/canonical.rs/request.rs; and
-  `server-core/src/sse.rs:779` re-implements `constant_time_eq` verbatim
-  instead of using `auth::constant_time_eq`. Consolidate.
+  `xml.rs:1484-1485`. Add the missing halves.
+- [ ] auth helper triplication: `hex_encode` ×3 (`sigv4.rs:244`,
+  `canonical.rs:442`, `request.rs:672`), `percent_decode` ×2
+  (`canonical.rs:176`, `request.rs:642`), `hex_val` ×2 (`canonical.rs:194`,
+  `request.rs:663`); and `server-core/src/sse.rs:735` re-implements
+  `constant_time_eq` verbatim instead of using `auth::constant_time_eq`
+  (`auth/src/lib.rs:43`). Consolidate.
 
 ### P6. Error-type islands and wrong-blame mappings
 
@@ -640,16 +834,19 @@ each is one refactor away from a panic:
   (`pg_topology.rs:57`, consumers `.unwrap()`/`.expect()` it);
   `SseCustomerObjectState::decode`/`SseS3ObjectState::decode ->
   Result<_, String>` (`storage/src/types.rs:948, 1073`); `validate ->
-  Result<(), &'static str>` (types.rs:3067); `RawChecksum::new`/
-  `ChecksumBytes::new -> Result<_, &'static str>` (`checksum/src/types.rs:298,
+  Result<(), &'static str>` (types.rs:3100); `RawChecksum::new`/
+  `ChecksumBytes::new -> Result<_, &'static str>` (`checksum/src/types.rs:301,
   340`, callers all discard the message);
   `SseCustomerValidatorConfig::from_base64`/`ManagedWrappingKeyConfig::
-  from_base64 -> Result<_, String>` (`sse.rs:112, 147`). Fix: small typed
-  error enums throughout.
+  from_base64 -> Result<_, String>` (`sse.rs:112, 147`). Grew at re-review:
+  new instance `ObjectEncryptionState::decode -> Result<_, String>`
+  (`storage/src/types.rs:1200-1203`). Fix: small typed error enums
+  throughout.
 - [ ] `parse_bucket_policy` doesn't enforce its own exported
-  `MAX_BUCKET_POLICY_BYTES` (`bucket_policy.rs:9, 1170`); only server-core
-  enforces it, against the normalized output not the raw input
-  (`authz/bucket.rs:545`). Check length first in `parse_bucket_policy`.
+  `MAX_BUCKET_POLICY_BYTES` (`bucket_policy.rs:8, 1169-1175`); only
+  server-core enforces it, against the normalized output not the raw input
+  (`coordinator/authz/bucket.rs:545`). Check length first in
+  `parse_bucket_policy`.
 
 ## Smaller items
 
@@ -660,52 +857,64 @@ each is one refactor away from a panic:
   floats on semver; any drift in hash/Unit53/log tables silently strands every
   existing shard. Fix: golden-vector test (fixed cluster + keys → expected
   NodeId sequences, committed) in the placement crate.
-- [ ] **Deterministic-log tables have no checked-in generator.** The 30-row
-  corpus touches ≤30 of 363 fast-path table indices; a corrupted
-  `INVERSE[i]`/`LOG_INV[i]` pair yields silently wrong but self-consistent
-  scores. (Behaviorally verified healthy today: 2M random inputs within 1 ulp
-  of `f64::ln`, monotonic.) Fix: check in the generator or a build-time check;
-  extend the corpus to cover every table index (~400 rows, mechanical).
+- [ ] **Deterministic-log corpus does not cover all table indices.**
+  Substantially addressed since the review: generator/check scripts are now
+  checked in (`scripts/placement-log-core-math` emit/check against a local
+  CORE-MATH checkout, `scripts/check-log-hotspots`) and
+  `deterministic_log_tables.rs:1-5` documents exact upstream provenance.
+  Remaining gap: the committed corpus
+  (`crates/placement/testdata/log_u53_reference.tsv`) is still ~30 rows,
+  touching ≤30 of 363 fast-path table indices; a corrupted
+  `INVERSE[i]`/`LOG_INV[i]` pair still yields silently wrong but
+  self-consistent scores. Fix: extend the corpus to cover every table index
+  (~400 rows, mechanical via the checked-in generator).
 - [ ] `rack_cap` doc says "default max = m" but m=0 makes every placement
-  fail with `ConstraintUnsatisfiable` (`constraint.rs:76-80`,
-  demonstrated by placer.rs:490-512). Document `max >= 1` or reject 0.
+  fail with `ConstraintUnsatisfiable` (`constraint.rs:76-84`,
+  demonstrated by placer.rs test). Document `max >= 1` or reject 0.
 - [ ] Documented zero-alloc contract is false for keys > 516 bytes
-  (`hash.rs:26-29` heap fallback per node per call; zero-alloc tests only use
-  short keys). Document the limit at `place()` or pre-hash long keys.
-- [ ] Module-visibility mix (dual paths to every type except `Placer`,
-  lib.rs:1-13); `MAX_SHARDS` load-bearing but `pub(crate)` (lib.rs:17);
-  `PlacementError` variants carry raw `u32` despite `NodeId` existing
-  (config.rs:28-31).
+  (`hash.rs:8` STACK_KEY_LIMIT, heap `Vec` fallback ~:25-29; `placer.rs:98`
+  still documents "no heap allocation"; zero-alloc tests only use short
+  keys). Document the limit at `place()` or pre-hash long keys.
+- [ ] Module-visibility mix — partially reduced at re-review (placer/hash/
+  deterministic_log are now private): cluster/config/constraint/topology
+  still have dual paths (lib.rs:1-13); `MAX_SHARDS` load-bearing but
+  `pub(crate)` (lib.rs:17); `PlacementError` variants carry raw `u32` despite
+  `NodeId` existing (config.rs:44, 47).
 
 ### Observability
 
 - [ ] Raw inc/dec counter pairs are pub where RAII guards should be:
   `emit_background_work_admission_event` wraps the stored atomic to
-  `u64::MAX` on unpaired `"finished"` (`lib.rs:3095-3108`; same for
-  `storage_rpc_admission_class_acquired/_released`, lib.rs:1703-1715);
+  `u64::MAX` on unpaired `"finished"` (`lib.rs:3115-3123`; same for
+  `storage_rpc_admission_class_acquired/_released`, lib.rs:1719, 1726);
   correctness currently rests on consumer `Drop` impls. Expose guards (as
-  already done for `inflight_requests_guard`, lib.rs:1692) and make the raw
+  already done for `inflight_requests_guard`, lib.rs:1708) and make the raw
   pair non-pub.
 - [ ] `configure`/`configure_with_options` silently no-op on second call
-  (bool discarded by sole caller, s3-tests/server.rs:410); lazily-created
+  (bool discarded by sole caller, s3-tests/server.rs:406); lazily-created
   `TRACE_SINK` means late configure leaves earlier lines in the env sink
-  (lib.rs:3265-3283). Log rejected re-configure; document call-before-first-
+  (lib.rs:3281-3299). Log rejected re-configure; document call-before-first-
   event.
 - [ ] Dimension tables silently stop recording new label combinations at
-  capacity 512 (lib.rs:556-571 + 8 siblings). Add a
-  `dimension_overflow_total` counter.
+  capacity 512 — grew at re-review: now 14 tables share the silent cap (was
+  ~9), including the new checkpoint-record-error and background-work
+  dimensions. Add a `dimension_overflow_total` counter.
 - [ ] Three context conventions in one API (explicit `&TraceContext` vs
-  thread-local with silent flight-record skip vs plain `event()` with no
-  flight record: lib.rs:1954, 2406, 3071, 3240). Pick one; always write the
-  flight record (crash-dump channel).
-- [ ] `emit_metadata_command_checkpoint_record_error` is the only error
-  emitter without a `*_TOTAL` counter (lib.rs:3071-3088).
+  thread-local with silent flight-record skip, e.g. lib.rs:3127-3130, vs
+  plain `event()` with no flight record, e.g. lib.rs:3097). Pick one; always
+  write the flight record (crash-dump channel).
+- [x] `emit_metadata_command_checkpoint_record_error` was the only error
+  emitter without a counter. Fixed incidentally since the review: it now
+  increments a labeled dimension counter
+  (`increment_metadata_command_checkpoint_record_error_dimension`,
+  lib.rs:761, called at lib.rs:3091). No plain `*_TOTAL`, but the substance
+  is addressed.
 - [ ] Idiom: all `emit_*` return an always-discarded `bool`; µs fields mix
   `u128`/`u64` with `saturating_u128_to_u64` sprinkled at use sites;
-  `MetricsSnapshot` is `Copy` at ~976 bytes and passed by value; 4846-line
-  single file with ~2000 lines of doubled emit boilerplate whose format
-  strings have already drifted once (`emit_reclaim_queue_action`,
-  lib.rs:2753-2778).
+  `MetricsSnapshot` is still `Copy`, passed by value, and has grown more
+  fields since the review (lib.rs:1528-1529); 4,866-line single file with
+  ~2000 lines of doubled emit boilerplate whose format strings have already
+  drifted once (`emit_reclaim_queue_action`).
 
 ### Storage misc
 
@@ -715,18 +924,22 @@ each is one refactor away from a panic:
   `AdvanceCompletedMultipartUploadSequence` carry none and `AbortStreamUpload`
   only an `Option` (`metadata_command.rs:692-1100`). Add a one-line doc
   comment per command stating which admission authority covers it.
-- [ ] `ReserveObjectVersionCommand::matches_request` ignores `version_id`
-  while the Delete twin compares it (`metadata_command.rs:679-681` vs
-  844-851); safe only under the coordinator's version-allocation-under-lock
+- [ ] `ReserveObjectGenerationCommand::matches_request` (renamed from
+  `ReserveObjectVersionCommand` since the review; finding applies verbatim)
+  has a `generation_id` field but `matches_request` ignores it, matching on
+  `reservation_id` (`metadata_command.rs:602, 627-634`) while
+  `DeleteObjectVersionCommand::matches_request` compares `version_id`
+  (:854-861); safe only under the coordinator's version-allocation-under-lock
   invariant (guides/object-concurrency.md #7) which lives in another crate.
   Document the cross-crate assumption at the impl.
-- [ ] Lock-poisoning policy split three ways (recover / panic / panic) across
-  cluster.rs hot paths, test-hook installers, and storage_node_server.rs.
-  Also server-http `mod.rs:4552` unwraps where server-core deliberately
-  recovers (`coordinator.rs:77-79, 210-216`) — one panic while holding that
-  write guard poisons the session and cascades into H1's 400 path. Pick one
-  policy (e.g. a `lock_recovering` helper).
-- [ ] `wall_time_millis` silently returns 0 pre-epoch (`clock.rs:57-62`) —
+- [ ] Lock-poisoning policy split three ways (recover / panic / panic):
+  cluster.rs hook installers `.lock().unwrap()` (:671, :688, :705, :722,
+  :4868...) vs `into_inner` recoveries elsewhere in cluster.rs, and
+  storage_node_server.rs panics. Also server-http `mod.rs:4548` unwraps where
+  server-core deliberately recovers (`coordinator.rs:78`) — one panic while
+  holding that write guard poisons the session. Pick one policy (e.g. a
+  `lock_recovering` helper).
+- [ ] `wall_time_millis` silently returns 0 pre-epoch (`clock.rs:57-63`) —
   flows into created_at/lease math as 1970 (compare A3); `with_time_override`
   (clock.rs:19) is exported without test gating. Gate behind `test-hooks`.
 - [ ] Wildcard re-exports `pub use s3_types::lifecycle::*` and
@@ -734,34 +947,38 @@ each is one refactor away from a panic:
   Enumerate.
 - [ ] Panics reachable from pub API worth restructuring or doc-noting:
   checkpoint-proof `.expect()` in the peering import path
-  (cluster.rs:3293, 3311 — the code touched by "Close Raft checkpoint capture
+  (cluster.rs:3295, 3313 — the code touched by "Close Raft checkpoint capture
   race"); `unwrap`/`unreachable!` in EC reconstruction read/backfill paths
-  (cluster.rs:9493-10172); deliberate fail-fast `panic!` on invalid snapshots
-  (control_plane.rs:2143, 3360, 3883) is fine but undocumented while
-  `clippy::missing_panics_doc` is allowed crate-wide.
+  (~48 sites in cluster.rs); deliberate fail-fast `panic!` on invalid
+  snapshots (control_plane.rs:2347, 3667, 4197) is fine but undocumented
+  while `clippy::missing_panics_doc` is allowed crate-wide.
 
 ### Test-only footguns left pub
 
 - [ ] server-http response builders that stamp the literal `"request-id"`
-  into responses: `range_not_satisfiable`, `precondition_failed`, `forbidden`,
-  `error` (`response.rs:381-383, 1210, 1468, 1939, 1960`). Mark `#[cfg(test)]`
-  or delete in favor of `_with_ids` + `WireResponseIds::for_test()`.
+  into responses: `TEST_REQUEST_ID` (`response.rs:25` — only `TEST_HOST_ID`
+  is `#[cfg(test)]`), `range_not_satisfiable` (:1408, also dead — see RR3),
+  `precondition_failed` (:1674), `forbidden` (:2144), `error` (:2165). Mark
+  `#[cfg(test)]` or delete in favor of `_with_ids` +
+  `WireResponseIds::for_test()`.
 - [ ] auth: `StreamingSigningContext`/`AuthContext` derive `PartialEq, Eq`
-  over key material (request.rs:30, 57) — non-constant-time `==` on secrets;
+  over key material (request.rs:53, 80) — non-constant-time `==` on secrets;
   only tests use it. Drop or gate. Also `AuthContext` allows invalid
   anonymous/authenticated field combinations — an enum would remove the
-  `Option`s (request.rs; consumers unwrap ad hoc).
-- [ ] Minor idiom: no `#[must_use]` in ec pub API vs pervasive use in sibling
-  crates; `clippy::must_use_candidate` globally allowed in server-core while
-  hand-annotating; infallible `bucket_request` returns `Result`
-  (mod.rs:243-253); `xml_escape`/`xml_unescape` asymmetric on `'`;
+  `Option`s (request.rs:82-89; consumers unwrap ad hoc).
+- [ ] Minor idiom: `clippy::must_use_candidate` globally allowed in
+  server-core while hand-annotating (the ec `#[must_use]` gap is largely
+  moot since the P3 privatization added annotated accessors); infallible
+  `bucket_request` returns `Result` (mod.rs:243-253);
+  `xml_escape`/`xml_unescape` asymmetric on `'` (lifecycle.rs unescape
+  handles `&apos;`, escape never emits it; same in server-http xml.rs);
   dead `MAX_PRINCIPAL_LEN` (s3-types lib.rs:11); `ChecksumHasher` derives
-  nothing while the CRC hashers derive Clone+Debug, and `finalize` receiver
-  semantics differ within the crate; `RawChecksum::MAX_LEN` duplicated
-  privately (types.rs:295 vs 337); `derive_signing_key` copies the secret
-  into a transient heap String with no zeroization (sigv4.rs:137);
-  streaming request types disagree on owned vs borrowed bucket/key
-  (`request_types.rs:809-829`).
+  nothing (hash.rs:8) while the CRC hashers derive Clone+Copy+Debug
+  (crc32.rs:136), and `finalize` receiver semantics differ within the crate;
+  `RawChecksum::MAX_LEN` duplicated privately (types.rs:295 vs 337);
+  `derive_signing_key` copies the secret into a transient heap String with
+  no zeroization (sigv4.rs:137); streaming request types disagree on owned
+  vs borrowed bucket/key (`request_types.rs:808-830`).
 
 ## Verified non-issues (for future review efficiency)
 
@@ -790,12 +1007,15 @@ each is one refactor away from a panic:
 Not reviewed; worth a follow-up pass:
 - `server-http/src/http/xml.rs` serializers and `chunked.rs` aws-chunked
   decoder (grep-surveyed only).
-- `control_plane.rs` / `control_plane_raft.rs` implementation bodies (pub
-  surface and peering apply/publish paths only), `peering.rs`,
-  `storage_rpc.rs` internals (pub(crate)).
+- `control_plane.rs` implementation bodies (pub surface and peering
+  apply/publish paths only), `peering.rs`, `storage_rpc.rs` internals
+  (pub(crate)). The raft WAL surface in `control_plane_raft.rs` got a
+  pattern-class pass at the 2026-07-05 re-review (results: RR15); its
+  implementation bodies remain unreviewed.
 - auth `condition_op.rs`/`condition_key.rs` per-operator bodies (dispatch
   verified only).
-- AWS-behavior claims in H2 and H6 rest on documentation knowledge — pin with
-  diff tests before changing behavior.
+- ~~AWS-behavior claims in H2 and H6~~ — resolved: both were AWS-pinned
+  during the fix work.
 - Deterministic-log DInt64 arithmetic not verified bit-level against upstream
-  CORE-MATH C.
+  CORE-MATH C (the checked-in `scripts/placement-log-core-math` check covers
+  the corpus rows only).
