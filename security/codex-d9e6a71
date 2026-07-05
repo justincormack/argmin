@@ -1,0 +1,109 @@
+UAT env data directory can be deleted after passing run
+Link: https://chatgpt.com/codex/cloud/security/findings/b221c9e0f5108191a6e19cb4d2ea471c?sev=&repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin&sort=date_desc
+Criticality: informational (attack path: ignore)
+Status: fixed
+
+# Metadata
+Repo: justincormack/argmin
+Commit: d9e6a71
+Author: justin@specialbusservice.com
+Created: 15/06/2026, 10:45:27
+Assignee: Unassigned
+Signals: Validated, Attack-path
+
+# Summary
+Introduced a local data-loss bug in the newly added scripts/uat-forced-overload wrapper. Environment-provided data directories are treated as generated temporary directories for cleanup, unlike directories passed with --data-dir.
+The script initializes data_dir from ARGMIN_FORCED_OVERLOAD_DATA_DIR while leaving cleanup enabled and caller_data_dir unset. The explicit --data-dir option correctly marks the directory as caller-owned and disables cleanup, but the environment-variable path does not get the same treatment. As a result, if a developer or CI job runs the wrapper with ARGMIN_FORCED_OVERLOAD_DATA_DIR pointing at an existing directory, a successful run reaches the final cleanup block and executes rm -rf on that directory. This is local/destructive test-wrapper behavior, not a production S3 server vulnerability or remotely exploitable issue.
+
+# Resolution
+Fixed in commit [`f3ac7f8ea96781ec3667a2b4f54841283ccb739f`](https://github.com/justincormack/argmin/commit/f3ac7f8ea96781ec3667a2b4f54841283ccb739f).
+
+The fix makes `ARGMIN_FORCED_OVERLOAD_DATA_DIR` follow the same ownership semantics as `--data-dir`: when the environment variable supplies a data directory, `scripts/uat-forced-overload` now sets `caller_data_dir=1` and `cleanup=0` before parsing other options. Generated temporary directories are still cleaned up after a passing run, but caller-provided directories from either CLI or environment are preserved. The script usage text now documents `ARGMIN_FORCED_OVERLOAD_DATA_DIR` as a caller-owned data directory.
+
+# Validation
+## Rubric
+- [x] Confirm ARGMIN_FORCED_OVERLOAD_DATA_DIR initializes data_dir while cleanup remains enabled and caller_data_dir remains 0.
+- [x] Confirm --data-dir marks the directory caller-owned and disables cleanup.
+- [x] Confirm an environment-provided data_dir is used directly, not converted into a generated temporary directory.
+- [x] Drive the wrapper through a successful validation path with minimal controlled UAT output.
+- [x] Observe deletion of an existing env-provided directory and contrast with preservation of a --data-dir directory.
+## Report
+Validated the finding. Relevant code confirms the ownership mismatch: scripts/uat-forced-overload:59 initializes data_dir from ARGMIN_FORCED_OVERLOAD_DATA_DIR, while lines 60-61 leave cleanup=1 and caller_data_dir=0. In contrast, scripts/uat-forced-overload:71-75 handles --data-dir by setting caller_data_dir=1 and cleanup=0. Lines 127-130 only create a mktemp directory when data_dir is empty, so an env-provided path is used directly. Lines 281-283 delete data_dir after a successful validation whenever cleanup is enabled and caller_data_dir is 0. I reproduced this with a controlled stub for ./scripts/uat-s3-tests that emitted passing metrics, allowing the real wrapper to reach its success cleanup path. Command output showed: victim=/tmp/argmin-env-data.h2QQiM, status=0, victim_exists=no, sentinel_exists=no, and bash xtrace showed '+ rm -rf /tmp/argmin-env-data.h2QQiM'. I also ran the same success path with --data-dir; output showed victim_exists=yes and sentinel_exists=yes, with xtrace showing caller_data_dir=1 and cleanup=0, confirming the CLI option is safe while the environment-variable path is not. Crash/ASan reproduction is not applicable because this is a Bash data-loss bug on a successful path, not a memory-safety crash. Valgrind and gdb were checked and unavailable/not applicable in the container; bash -x was used as the non-interactive execution trace.
+
+# Evidence
+scripts/uat-forced-overload (L127 to 130)
+  Note: A temporary directory is only created when data_dir is empty; an environment-provided existing path is used directly.
+```
+if [[ -z "$data_dir" ]]; then
+    data_dir="$(mktemp -d "${TMPDIR:-/tmp}/argmin-s3-forced-overload.XXXXXX")"
+fi
+mkdir -p "$data_dir"
+```
+
+scripts/uat-forced-overload (L281 to 283)
+  Note: On successful validation, cleanup deletes data_dir whenever caller_data_dir is still 0, which includes paths supplied via ARGMIN_FORCED_OVERLOAD_DATA_DIR.
+```
+echo "forced-overload validation passed"
+if ((cleanup)) && ((caller_data_dir == 0)); then
+    rm -rf "$data_dir"
+```
+
+scripts/uat-forced-overload (L59 to 61)
+  Note: data_dir can be initialized from ARGMIN_FORCED_OVERLOAD_DATA_DIR, but cleanup remains enabled and caller_data_dir remains 0.
+```
+data_dir="${ARGMIN_FORCED_OVERLOAD_DATA_DIR:-}"
+cleanup=1
+caller_data_dir=0
+```
+
+scripts/uat-forced-overload (L71 to 75)
+  Note: The explicit --data-dir option correctly marks the path as caller-owned and disables cleanup, highlighting the missing equivalent handling for the environment variable.
+```
+        --data-dir)
+            [[ $# -ge 2 ]] || die "--data-dir requires a value"
+            data_dir="$2"
+            caller_data_dir=1
+            cleanup=0
+```
+
+# Attack-path analysis
+Final: ignore | Decider: model_decided | Matrix severity: ignore | Policy adjusted: ignore
+## Rationale
+The code defect is validated but it is not an in-scope security vulnerability. Evidence shows the issue is confined to scripts/uat-forced-overload, a testing wrapper documented in guides/testing.md and backed by scripts/uat-s3-tests with UAT-only credentials. The destructive sink at scripts/uat-forced-overload:281-283 is reachable only after a local/CI runner chooses ARGMIN_FORCED_OVERLOAD_DATA_DIR and the validation succeeds. There is no public network exposure, no service identity privilege, no remote attacker-controlled input, and no cross-boundary impact. Probability and security impact are therefore both out of scope for the production S3 threat model.
+## Likelihood
+ignore - A realistic external S3/HTTP attacker cannot reach this path. Triggering it requires local or CI environment control plus a successful UAT run. Without a workflow exposing those controls to untrusted users, exploitability is outside the project threat model.
+## Impact
+ignore - The bug can cause local data loss for a directory selected by the same user or CI runner executing the wrapper. It does not bypass authentication, expose object data, modify production storage through a remote API, escalate privileges, or cross a security boundary.
+## Assumptions
+- The repository checkout at /workspace/argmin reflects the analyzed commit.
+- The relevant in-scope attacker for this project is an S3/HTTP client or operator-facing deployment actor, not a user who already controls a developer shell or CI job environment.
+- No CI workflow or deployment manifest in the inspected checkout automatically exposes scripts/uat-forced-overload to untrusted users.
+- Ability to run the local developer/UAT wrapper scripts/uat-forced-overload
+- Ability to set ARGMIN_FORCED_OVERLOAD_DATA_DIR to an existing directory writable by the runner
+- The UAT run must reach the successful validation path
+## Path
+Local/CI env control
+  -> ARGMIN_FORCED_OVERLOAD_DATA_DIR existing path
+  -> cleanup=1 and caller_data_dir=0
+  -> successful forced-overload UAT
+  -> rm -rf "$data_dir"
+## Path evidence
+- `scripts/uat-forced-overload:9-15` - Usage text identifies the affected component as a constrained UAT validation wrapper rather than the production S3 server entrypoint.
+- `scripts/uat-forced-overload:59-61` - data_dir is initialized from ARGMIN_FORCED_OVERLOAD_DATA_DIR while cleanup remains enabled and caller_data_dir remains 0.
+- `scripts/uat-forced-overload:71-75` - The explicit --data-dir option correctly treats the path as caller-owned by setting caller_data_dir=1 and cleanup=0.
+- `scripts/uat-forced-overload:127-130` - A temporary directory is created only when data_dir is empty, so an environment-provided directory is used directly.
+- `scripts/uat-forced-overload:281-283` - On successful validation, the cleanup block deletes data_dir when cleanup is enabled and caller_data_dir is 0.
+- `scripts/uat-s3-tests:9-12` - The underlying script is also a UAT helper and starts argmin-s3 with UAT-only test credentials.
+- `guides/testing.md:193-205` - Project documentation presents scripts/uat-forced-overload as a testing/validation gate.
+## Narrative
+The reported bug is real: scripts/uat-forced-overload reads ARGMIN_FORCED_OVERLOAD_DATA_DIR into data_dir while leaving cleanup enabled and caller_data_dir unset, and later deletes data_dir after a successful validation. The explicit --data-dir path avoids this by marking the directory caller-owned and disabling cleanup. However, this is a local developer/UAT script, not the production argmin-s3 HTTP service. Exploitation requires control over the local process environment and only deletes files writable by that same local runner. There is no evidence of public ingress, cloud identity privilege, remote S3 API reachability, or cross-boundary impact. For security criticality, this should be ignored/out of scope rather than treated as a production vulnerability.
+## Controls
+- Developer-only UAT wrapper, not production runtime
+- No public ingress or load balancer artifact found for this path
+- UAT helper defaults to loopback testing behavior
+- --data-dir already disables cleanup for explicit caller-owned paths
+- Failure paths retain the data directory; deletion requires successful validation
+## Blindspots
+- Static review cannot prove that no downstream consumer wires this script into a CI workflow with untrusted environment input.
+- No cloud APIs were queried, so actual deployed CI/CD settings or runner filesystem permissions were not verified.
+- The validation PoC demonstrates local deletion, but not a remote or privilege-crossing exploit path.

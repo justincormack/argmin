@@ -68,6 +68,12 @@ for the current local security suite.
 | `security/codex-90f9972` Tracing logs presigned URL queries and credentials | fixed | `./scripts/security-tests redaction` | Covered by redaction regressions for auth and observability surfaces. |
 | `security/codex-a413960` SQLite error details now leak in S3 error responses | fixed | `./scripts/security-tests redaction` | Covered by server-http sanitization regressions. |
 
+## Local Tooling
+
+| Finding | Status | Local deterministic path | Notes |
+| --- | --- | --- | --- |
+| `security/codex-d9e6a71` UAT forced-overload env data directory can be deleted after passing run | fixed | `bash -n scripts/uat-forced-overload` | Informational local tooling issue; env-provided forced-overload data dirs are now treated as caller-owned like `--data-dir`. |
+
 ## Integrity, Checksums, and Low-Level Implementation
 
 | Finding | Status | Local deterministic path | Notes |
