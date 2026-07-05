@@ -51,10 +51,12 @@ impl Placer {
         map: &ClusterMap,
         constraint: PlacementConstraint,
     ) -> Result<Self, PlacementError> {
+        let config = config.validate()?;
         let active = map.active_node_count();
-        if active < config.total_shards as usize {
+        let total_shards = config.total_shards();
+        if active < total_shards {
             return Err(PlacementError::TooFewNodes {
-                shards: config.total_shards as usize,
+                shards: total_shards,
                 nodes: active,
             });
         }
@@ -80,7 +82,7 @@ impl Placer {
     /// Assign total_shards nodes to shards for the given key.
     ///
     /// `key`:  arbitrary bytes — object key, PG id, etc. May be empty.
-    /// `out`:  caller-allocated; length must equal config.total_shards.
+    /// `out`:  caller-allocated; length must equal config.total_shards().
     ///         On success, out[i] is the NodeId for shard i.
     ///
     /// **Output ordering**: the mapping of nodes to shard indices is determined
@@ -95,7 +97,7 @@ impl Placer {
     ///
     /// ZONE_HOT: no heap allocation. admit must not allocate.
     pub fn place(&self, key: &[u8], out: &mut [NodeId]) -> Result<(), PlacementError> {
-        let total = self.config.total_shards as usize;
+        let total = self.config.total_shards();
 
         if out.len() != total {
             return Err(PlacementError::OutputLengthMismatch {

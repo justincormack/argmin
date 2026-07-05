@@ -4,18 +4,34 @@ use thiserror::Error;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PlacementConfig {
     /// Total shards to place per stripe (k + m in EC terms).
-    pub total_shards: u8,
+    total_shards: usize,
 }
 
 impl PlacementConfig {
     /// Create a new PlacementConfig.
     ///
     /// Returns Err(InvalidTotalShards) if total_shards == 0 or total_shards > MAX_SHARDS (32).
-    pub fn new(total_shards: u8) -> Result<Self, PlacementError> {
-        if total_shards == 0 || total_shards as usize > crate::MAX_SHARDS {
+    pub fn new(total_shards: usize) -> Result<Self, PlacementError> {
+        Self::validate_total_shards(total_shards)?;
+        Ok(PlacementConfig { total_shards })
+    }
+
+    pub(crate) fn validate(self) -> Result<Self, PlacementError> {
+        Self::validate_total_shards(self.total_shards)?;
+        Ok(self)
+    }
+
+    fn validate_total_shards(total_shards: usize) -> Result<(), PlacementError> {
+        if total_shards == 0 || total_shards > crate::MAX_SHARDS {
             return Err(PlacementError::InvalidTotalShards);
         }
-        Ok(PlacementConfig { total_shards })
+        Ok(())
+    }
+
+    /// Total shards to place per stripe.
+    #[must_use]
+    pub const fn total_shards(self) -> usize {
+        self.total_shards
     }
 }
 

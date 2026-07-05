@@ -32,7 +32,7 @@ fn build_cluster(node_count: u32, rack_count: u32, weight: f64) -> ClusterMap {
 }
 
 fn place_once(placer: &Placer, key: &[u8]) -> Vec<NodeId> {
-    let n = placer.config().total_shards as usize;
+    let n = placer.config().total_shards();
     let mut out = vec![NodeId::new(0); n];
     placer.place(key, &mut out).unwrap();
     out
@@ -115,7 +115,7 @@ fn no_duplicates_when_total_equals_node_count() {
     let node_count = 8u32;
     let map = build_cluster(node_count, 4, 1.0);
     let placer = Placer::new(
-        PlacementConfig::new(node_count as u8).unwrap(),
+        PlacementConfig::new(node_count as usize).unwrap(),
         &map,
         PlacementConstraint::none(),
     )
@@ -325,7 +325,7 @@ fn no_constraint_fills_all_slots() {
     let node_count = 8u32;
     let map = build_cluster(node_count, 1, 1.0); // all in same rack
     let placer = Placer::new(
-        PlacementConfig::new(node_count as u8).unwrap(),
+        PlacementConfig::new(node_count as usize).unwrap(),
         &map,
         PlacementConstraint::none(),
     )
@@ -617,7 +617,7 @@ mod prop_tests {
             key in proptest::collection::vec(any::<u8>(), 0..=64),
         ) {
             let rack_count = rack_count.min(node_count);
-            let total_shards = total_shards.min(node_count as u8);
+            let total_shards = usize::from(total_shards.min(node_count as u8));
 
             let nodes: Vec<NodeInfo> = (0..node_count)
                 .map(|i| node(i, i % rack_count, 1.0))
@@ -625,7 +625,9 @@ mod prop_tests {
             let map = ClusterMap::new(&nodes).unwrap();
 
             // Set cap high enough to always be satisfiable
-            let max_per_rack = (total_shards as u32).div_ceil(rack_count) as usize;
+            let max_per_rack = u32::try_from(total_shards)
+                .unwrap()
+                .div_ceil(rack_count) as usize;
 
             let placer = match Placer::new(
                 PlacementConfig::new(total_shards).unwrap(),
@@ -636,7 +638,7 @@ mod prop_tests {
                 Err(_) => return Ok(()), // skip if can't build placer
             };
 
-            let mut out = vec![NodeId::new(0); total_shards as usize];
+            let mut out = vec![NodeId::new(0); total_shards];
             match placer.place(&key, &mut out) {
                 Ok(()) => {
                     // No duplicates

@@ -4439,7 +4439,7 @@ fn local_payload_placer(
     ec_shape: EcShape,
 ) -> Result<placement::Placer, ClusterBuildError> {
     let ec_config = ec_config_for_shape(ec_shape)?;
-    let placement_config = placement::PlacementConfig::new(ec_config.total_shards() as u8)
+    let placement_config = placement::PlacementConfig::new(ec_config.total_shards())
         .map_err(|error| invalid_ec_shape_error(ec_shape, error))?;
     placement::Placer::new(placement_config, placement_map, PlacementConstraint::none())
         .map_err(|error| placement_error_for_shape(ec_shape, error))

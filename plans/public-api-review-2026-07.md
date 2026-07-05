@@ -555,11 +555,12 @@ each is one refactor away from a panic:
   but had no failure path (codec.rs:254-284). Resolution: make the fields
   private, add read-only accessors, and defensively revalidate in
   `ErasureCodec::new`.
-- [ ] `PlacementConfig.total_shards` pub field (`placement/src/config.rs:7`):
+- [x] `PlacementConfig.total_shards` pub field (`crates/placement/src/config.rs:7`):
   bypasses `new()` validation; `Placer::place` then writes past `MAX_SHARDS`
   stack arrays (placer.rs:133, 206) — out-of-bounds panic in the hot path.
-  Make the field private (also: `new(total_shards: u8)` forces a lossy
-  `as u8` at the consumer, local.rs:4425 — take usize and validate).
+  Resolution: make the field private, change `new(total_shards)` to take
+  `usize`, add a read-only accessor, defensively revalidate in `Placer::new`,
+  and remove the lossy `as u8` from the storage placement caller.
 - [ ] `StorageNodeProcessConfig`: 9 pub fields whose consistency is enforced
   only by the separate `validate_storage_node_process_configs`
   (`storage_node_server.rs:318, 803`). Private fields + validating
