@@ -726,6 +726,30 @@ fn process_logs(test_dir: &Path) -> String {
     out
 }
 
+fn wait_for_child_stderr_log_contains(child: &mut ChildGuard, needle: &str) {
+    let log_path = child
+        .test_dir
+        .join(format!("node-{}.stderr.log", child.node_id));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        child.assert_running();
+        let log = fs::read_to_string(&log_path)
+            .unwrap_or_else(|error| format!("<failed to read {}: {error}>", log_path.display()));
+        if log.contains(needle) {
+            return;
+        }
+        if Instant::now() >= deadline {
+            panic!(
+                "process log {} did not contain {needle:?}\n{}\n{}",
+                log_path.display(),
+                log,
+                process_logs(&child.test_dir)
+            );
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
 fn control_socket(test_dir: &Path, node_id: u64) -> PathBuf {
     test_dir.join(format!("control-{node_id}.sock"))
 }
@@ -967,19 +991,33 @@ fn experimental_raft_process_peer_wal_crash_after_sync_before_response_recovers_
 
     node103.stop();
     let follower_peer_socket = peer_socket(test_dir.path(), 103);
+    let wal_crash_arm_path = test_dir.path().join("node-103-peer-wal-crash-armed");
     let _ = fs::remove_file(&follower_peer_socket);
+    let _ = fs::remove_file(&wal_crash_arm_path);
     let mut restarted103 = ChildGuard::spawn_with_extra_env(
         &bin,
         test_dir.path(),
         &cluster_name,
         103,
         &raft_node_ids,
-        &[(
-            "ARGMIN_EXPERIMENTAL_RAFT_EXIT_AFTER_PEER_WAL_BEFORE_RESPONSE",
-            "1",
-        )],
+        &[
+            (
+                "ARGMIN_EXPERIMENTAL_RAFT_EXIT_AFTER_PEER_WAL_BEFORE_RESPONSE",
+                "1",
+            ),
+            (
+                "ARGMIN_EXPERIMENTAL_RAFT_EXIT_AFTER_PEER_WAL_BEFORE_RESPONSE_ARMED_PATH",
+                wal_crash_arm_path
+                    .to_str()
+                    .expect("test arm path should be valid UTF-8"),
+            ),
+        ],
     );
     wait_for_socket_file(&follower_peer_socket, &mut restarted103);
+    wait_for_child_stderr_log_contains(
+        &mut restarted103,
+        "argmin-s3 experimental durable OpenRaft control-plane manager using state",
+    );
     let follower_log_before_crash =
         artifact_log_state_with_wal(&follower_state_path, &cluster_name, 103)
             .expect("follower artifact plus WAL should expose log state before crash");
@@ -990,6 +1028,7 @@ fn experimental_raft_process_peer_wal_crash_after_sync_before_response_recovers_
     );
     let artifact_bytes_before_crash = fs::read(&follower_state_path)
         .expect("follower checkpoint artifact should read before crash");
+    File::create(&wal_crash_arm_path).expect("peer WAL crash arm file should be created");
 
     let output = run_set_pg_acting_set_live(&bin, &leader_control_socket, 0, &[1]);
     assert!(

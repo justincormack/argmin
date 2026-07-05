@@ -33,6 +33,7 @@ use storage::control_plane::{
 };
 use storage::control_plane_command::{ControlPlaneCommand, ControlPlaneCommandResponse};
 use storage::control_plane_raft::{
+    arm_control_plane_raft_peer_wal_sync_exit,
     decode_control_plane_raft_peer_request_frame_identity,
     decode_control_plane_raft_peer_request_frame_kind, durable_artifact_wal_path,
     handle_control_plane_raft_peer_rpc_frame, handle_control_plane_raft_peer_snapshot_frame,
@@ -2098,6 +2099,7 @@ fn handle_experimental_raft_peer_rpc_validated_frame_before_ack(
     durability: ExperimentalRaftPeerRpcDurability<'_>,
 ) -> Result<Vec<u8>, ExperimentalRaftPeerRpcWorkerError> {
     ensure_experimental_raft_peer_not_durably_poisoned(durability.poison_gate)?;
+    let _wal_exit_guard = arm_control_plane_raft_peer_wal_sync_exit();
     let response_frame = block_on_control_plane_raft(runtime, async {
         match frame_kind {
             ControlPlaneRaftPeerFrameKind::OrdinaryRpc => {
