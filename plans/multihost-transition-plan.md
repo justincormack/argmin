@@ -6686,10 +6686,11 @@ Status: complete.
   asserting bucket names are not included.
 - Continued the permanent diagnostics slice by adding an explicit local debug
   endpoint gate. `ARGMIN_LOCAL_DEBUG_ENDPOINT` is disabled by default and is
-  compiled only for tests or binaries built with the non-default
-  `local-debug-endpoints` feature. Feature-enabled builds accept it only for
-  frontend roles listening on loopback socket addresses, and it exposes only
-  bounded counter snapshots over HTTP. The flight-recorder trigger is
+  compiled only for tests or debug binaries built with the non-default
+  `local-debug-endpoints` feature; release builds with that feature are
+  rejected. Feature-enabled debug builds accept it only for frontend roles
+  listening on loopback socket addresses, and it exposes only bounded counter
+  snapshots over HTTP. The flight-recorder trigger is
   `POST /__argmin/debug/flight-recorder/dump`; it dumps the already-redacted
   bounded ring to stderr rather than returning request/RPC details, headers,
   bucket/key names, payload context, or SSE-C material in the HTTP response.

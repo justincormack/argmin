@@ -69,13 +69,14 @@ Completed:
   - `metadata_command_session_wait_total`
 - `ARGMIN_LOCAL_DEBUG_ENDPOINT` exposes `metrics_snapshot()` through
   `GET /__argmin/debug/metrics` for explicit local debugging only. The endpoint
-  is compiled only for tests or binaries built with the non-default
-  `local-debug-endpoints` feature. Feature-enabled builds still require a
-  loopback frontend listener. The companion flight-recorder trigger is a `POST`
-  that dumps the bounded, redacted ring to stderr instead of returning recorder
-  details over HTTP. The standalone UAT wrapper builds spawned binaries with
-  the feature when local debug is enabled, enables the endpoint for the
-  frontend, and requests the dump before teardown on failed runs so intermittent
+  is compiled only for tests or debug binaries built with the non-default
+  `local-debug-endpoints` feature; release builds with that feature are
+  rejected. Feature-enabled debug builds still require a loopback frontend
+  listener. The companion flight-recorder trigger is a `POST` that dumps the
+  bounded, redacted ring to stderr instead of returning recorder details over
+  HTTP. The standalone UAT wrapper builds spawned debug binaries with the
+  feature when local debug is enabled, enables the endpoint for the frontend,
+  and requests the dump before teardown on failed runs so intermittent
   full-suite races retain request-error and metadata-command conflict context.
 - `argmin-s3` installs a process-wide panic hook after configuration loads, so
   frontend, storage-node, and legacy-local panics dump the same bounded,

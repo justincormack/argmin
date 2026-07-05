@@ -15,6 +15,11 @@
     clippy::unused_self
 )]
 
+#[cfg(all(feature = "local-debug-endpoints", not(debug_assertions), not(test)))]
+compile_error!(
+    "local-debug-endpoints is only for test/debug builds and must not be enabled in release builds"
+);
+
 pub mod cors;
 pub mod http;
 

@@ -345,7 +345,7 @@ export ARGMIN_PG_COUNT="${ARGMIN_PG_COUNT:-16}"
 export ARGMIN_STORAGE_CLUSTER_EPOCH="${ARGMIN_STORAGE_CLUSTER_EPOCH:-1}"
 if [[ -n "${ARGMIN_LOCAL_DEBUG_ENDPOINT+x}" ]]; then
     uat_local_debug_endpoint="$ARGMIN_LOCAL_DEBUG_ENDPOINT"
-elif [[ -n "$server_binary" ]]; then
+elif [[ -n "$server_binary" || "$release" -eq 1 ]]; then
     uat_local_debug_endpoint=0
 else
     uat_local_debug_endpoint=1
@@ -1022,6 +1022,19 @@ local_debug_endpoint_enabled() {
             ;;
     esac
 }
+
+if [[ -n "$smoke" && -n "$server_binary" ]]; then
+    die "--smoke cannot be combined with --binary; smoke runs require script-built debug binaries"
+fi
+if [[ -n "$smoke" && "$release" -eq 1 ]]; then
+    die "--smoke cannot be combined with --release; smoke runs require debug binaries"
+fi
+if [[ -n "$smoke" ]] && ! local_debug_endpoint_enabled; then
+    die "--smoke requires ARGMIN_LOCAL_DEBUG_ENDPOINT to be enabled"
+fi
+if [[ "$release" -eq 1 ]] && local_debug_endpoint_enabled; then
+    die "--release cannot be combined with ARGMIN_LOCAL_DEBUG_ENDPOINT=1"
+fi
 
 print_bucket_delete_attempt_debug() {
     local bucket="$1"

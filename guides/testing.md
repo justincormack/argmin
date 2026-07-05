@@ -190,6 +190,11 @@ Example full acceptance run:
 ./scripts/uat-s3-tests --release
 ```
 
+`--release` and `--binary` are for the ordinary external `s3-tests` acceptance
+path. UAT smoke modes use debug metrics and local debug hooks, so they must use
+the script-built debug binary and intentionally reject `--release` and
+`--binary`.
+
 Strict forced-overload validation uses the same standalone UAT topology but
 intentionally constrains storage-node RPC admission. It is a boundedness gate,
 not a throughput benchmark:
@@ -220,13 +225,14 @@ hidden 500s fail the whole local test process at the point the server produces
 the internal error.
 
 The UAT wrapper also enables the local debug endpoint on the frontend process
-by default for binaries it builds itself, and builds those spawned `argmin-s3`
-binaries with the non-default `local-debug-endpoints` feature when doing so.
-`--binary` runs default to the endpoint disabled unless
-`ARGMIN_LOCAL_DEBUG_ENDPOINT` is set explicitly, because the wrapper cannot add
-features to an already-built binary. A default production build rejects
-`ARGMIN_LOCAL_DEBUG_ENDPOINT=1` at startup; feature-enabled test builds still
-require a loopback frontend listener. On any UAT failure it asks
+by default for debug binaries it builds itself, and builds those spawned
+`argmin-s3` binaries with the non-default `local-debug-endpoints` feature when
+doing so. `--release` and `--binary` runs default to the endpoint disabled
+because release builds must not include the feature and the wrapper cannot add
+features to an already-built binary. Smoke runs that depend on debug metrics or
+hooks reject `--release` and `--binary`. A default production build rejects
+`ARGMIN_LOCAL_DEBUG_ENDPOINT=1` at startup; feature-enabled test/debug builds
+still require a loopback frontend listener. On any UAT failure it asks
 `POST /__argmin/debug/flight-recorder/dump` to write the bounded, redacted
 flight recorder to the frontend log before the process group is stopped. This
 keeps intermittent full-suite races diagnosable without exposing debug state on

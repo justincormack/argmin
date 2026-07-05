@@ -22,6 +22,14 @@ cargo build -p argmin-s3 --release
 This builds the production server binary without pulling in the full workspace
 test harness dependency set. The binary is at `target/release/argmin-s3`.
 
+Do not use `--all-features` for production artifacts. The normal production
+release build uses the default feature set. Optional features are diagnostic:
+
+| Feature | Production use |
+|---|---|
+| `deep-tracing` | Diagnostic tracing only; not part of the normal production build |
+| `local-debug-endpoints` | UAT/debug-only local diagnostics; release builds with this feature are rejected |
+
 ## Run
 
 `argmin-s3` must run as a dedicated non-root user. The binary exits at startup
