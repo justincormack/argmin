@@ -212,6 +212,23 @@ steps it performs.
   make the cleanup phase generation-scoped and restartable from zero when the
   PG set changes.
 
+- [ ] **S6. Route-map validity is a storage routing freshness contract, not a
+  generic option cleanup.** `route_map_valid_until_ms: Option<u64>` uses
+  `None` to mean "valid forever" in both storage-node serving config
+  (`storage/src/storage_node_server.rs:322, 451-463`) and frontend/local
+  cluster maps (`storage/src/cluster/local.rs:1869-1905`). This affects
+  distributed-storage safety rather than AWS-visible request semantics:
+  metadata primary/replica routing, metadata command acceptance, payload
+  placement, shard IO, bucket-delete begin/finalize loops, and storage-node
+  RPC route validation all use the deadline to stop trusting stale routes.
+  Control-plane runtime maps set the deadline from the minimum active primary
+  lease deadline (`storage/src/control_plane.rs:701-704`), while static/local
+  topology paths intentionally construct unbounded maps (for example
+  `argmin-s3/src/main.rs:2950-2954`). Fix: replace the implicit `Option` with
+  an explicit `RouteMapValidity::{Forever, Until(u64)}` and then constrain
+  `Forever` to the static/local topology constructors or other deliberately
+  unbounded modes.
+
 ## Bugs — checksum handling (cross-crate)
 
 - [x] **K1. Checksum algorithm headers were modeled against the wrong wire
@@ -404,10 +421,6 @@ sweeps so the next drift is a compile error.
   wrong-region error rather than `NoSuchBucket`. POST Object is not on the
   deferred request-auth path; it still validates against the endpoint signing
   region during POST authentication.
-- [ ] `route_map_valid_until_ms: Option<u64>` is fail-open — `None` means
-  valid forever (`storage/src/storage_node_server.rs:411-427`, mirrored
-  cluster.rs:3872-3878). Fix: required deadline or
-  `enum RouteMapValidity { Forever, Until(u64) }`.
 - [ ] Observability `timeout_us: Option<u128>` on
   `RequestAdmissionSummary`/`StorageRpcAdmissionSummary`
   (`observability/src/lib.rs:1301, 1493`): every workspace caller passes
