@@ -1,0 +1,238 @@
+Raft status scans entire WAL on every status check
+Link: https://chatgpt.com/codex/cloud/security/findings/de8abaaec6608191b65f6aea523c1dab?sev=&repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin&sort=date_desc
+Criticality: medium (attack path: medium)
+Status: fixed
+
+# Metadata
+Repo: justincormack/argmin
+Commit: c82e89d
+Author: justin@specialbusservice.com
+Created: 04/07/2026, 22:43:41
+Assignee: Unassigned
+Signals: Security, Validated, Attack-path
+
+# Summary
+Introduced. The commit added WAL durability fields to status and computes `durable_wal_clean_len` by calling `wal.clean_len()` from the status path. That helper performs a full read and decode of the WAL, and status is used in a periodic production loop.
+The new `ControlPlaneRaftLogStore::status_snapshot` calls `wal.clean_len()` whenever the WAL-backed log store is healthy. `clean_len()` delegates to `read_records()`, which opens the WAL, reads the entire file into memory, and decodes every frame. This changes `ControlPlaneRaftAuthority::status()` from a cheap in-memory snapshot into a full WAL replay scan. In the multi-node experimental Raft control-plane process, `raft_authority.status()` is called on every lease-scan loop to decide whether the local authority is serving. Since the WAL grows with Raft/control-plane mutations and heartbeats, a peer or local control-plane client that can drive WAL growth can make each status check consume increasing CPU and memory, potentially blocking or crashing the control-plane process. Even without malicious input, a long-running cluster can degrade as the WAL grows.
+
+# Resolution
+Fixed in commit `4c4ec2039deceaaac7e55eef249b8e5b7261da38` (`Avoid WAL replay in Raft status`).
+
+The fix removes retained-WAL frame replay from the authority status hot path. `ControlPlaneRaftLogStore::status_snapshot()` now obtains WAL status offsets by reading only the CRC-protected file header and the filesystem file length, instead of calling `wal.clean_len()` and decoding every retained WAL frame. Checkpoint and restart replay paths still validate retained WAL frames normally.
+
+Regression coverage corrupts a middle WAL frame and proves `status_snapshot()` still succeeds without decoding retained frames, while strict WAL replay fails closed on the corruption.
+
+Verification for the fix:
+- `cargo fmt`
+- `cargo nextest run -p storage control_plane_raft_wal_status_offsets_do_not_decode_frames control_plane_raft_wal_file_rejects_corrupt_middle_frame control_plane_raft_authority_checkpoint_compacts_wal_prefix control_plane_raft_status_reports_wal_durability`
+- `cargo clippy -p storage --all-targets --all-features -- -D warnings`
+- `cargo nextest run -p storage control_plane_raft`
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings`
+- `cargo nextest run` (`6252 passed`)
+
+# Validation
+## Rubric
+- [x] Confirm ControlPlaneRaftAuthority::status reaches log-store status_snapshot.
+- [x] Confirm status_snapshot invokes wal.clean_len for healthy WAL-backed stores.
+- [x] Confirm clean_len performs full WAL read and frame decode rather than metadata lookup.
+- [x] Confirm production multi-node lease loop periodically calls raft_authority.status.
+- [x] Dynamically demonstrate the real API has WAL-size-dependent CPU/memory behavior and trace the status -> clean_len chain with a debugger; direct crash/valgrind/ASan were attempted first where feasible.
+## Report
+Validated the finding. Code review showed the status path now calls the WAL clean-length computation: ControlPlaneRaftAuthority::status maps log_store to ControlPlaneRaftLogStore::status_snapshot at crates/storage/src/control_plane_raft.rs:3422-3427; status_snapshot calls wal.clean_len() when WAL-backed and unpoisoned at lines 4196-4202; clean_len delegates to read_records at lines 4890-4891; read_records_from allocates a Vec, file.read_to_end(&mut bytes), then decodes frames in a loop at lines 4919-4974. The production loop calls raft_authority.status() on every multi-node lease scan and sleeps for control_plane_lease_scan_interval at crates/argmin-s3/src/main.rs:2420-2427 and 2467. A debugger trace on the existing status test confirmed the runtime call chain: frame #0 ControlPlaneRaftWalFile::clean_len at control_plane_raft.rs:4891, frame #1 ControlPlaneRaftLogStore::status_snapshot at control_plane_raft.rs:4197, frame #4 ControlPlaneRaftAuthority::status async closure at control_plane_raft.rs:3425. A second lldb trace stopped in read_records_from at line 4919 immediately before read_to_end, with frames clean_len -> read_records -> read_records_from. Dynamic PoC results on valid WAL files showed linear cost: 10,000 valid frames / 710,000 bytes took elapsed_ms=27 with VmHWM_kB=3816; 1,000,000 valid frames / 71,000,000 bytes took elapsed_ms=2720 with VmHWM_kB=110940. A low-memory sparse WAL stress under ulimit -v 131072 on a 512 MiB WAL returned Err(Io { context: read control-plane OpenRaft WAL, source: Kind(OutOfMemory) }), confirming the full-file read can hit memory limits. Direct crash was attempted but Rust read_to_end returned an OOM error instead of SIGABRT in this environment; valgrind was unavailable and ASan required nightly Rust, so debugger plus real API performance measurements were used.
+
+# Evidence
+crates/argmin-s3/src/main.rs (L2420 to 2467)
+  Note: In multi-node Raft mode, the control-plane main loop calls `status()` every lease-scan interval, so the expensive WAL scan is performed periodically in production.
+```
+        let local_raft_authority_serving = if multi_node_raft_peer_mode {
+            block_on_control_plane_raft(&runtime, async {
+                raft_authority
+                    .status()
+                    .await
+                    .map(|status| status.linearized_authority_serving())
+            })
+            .unwrap_or_else(|error| {
+                eprintln!("experimental OpenRaft control-plane status check failed: {error}");
+                std::process::exit(1);
+            })
+        } else {
+            true
+        };
+        let expiry = if local_raft_authority_serving {
+            let mut authority = authority
+                .lock()
+                .expect("control-plane authority mutex poisoned");
+            if multi_node_raft_peer_mode {
+                bootstrap_empty_experimental_raft_control_plane(&mut authority, config)
+                    .unwrap_or_else(|error| {
+                        eprintln!(
+                            "failed to bootstrap experimental OpenRaft control-plane state: {error}"
+                        );
+                        std::process::exit(1);
+                    });
+            }
+            authority.expire_heartbeat_leases(storage::clock::current_time_millis())
+        } else {
+            Ok((ClusterEpoch::INITIAL, 0, 0))
+        };
+        match expiry {
+            Ok((cluster_epoch, expired_nodes, peering_pgs)) if expired_nodes > 0 => {
+                eprintln!(
+                    "experimental OpenRaft control-plane expired {} node leases at epoch {} and moved {} PGs to peering",
+                    expired_nodes,
+                    cluster_epoch,
+                    peering_pgs
+                );
+            }
+            Ok(_) => {}
+            Err(error) if experimental_raft_error_is_forward_to_leader(&error) => {}
+            Err(error) => {
+                eprintln!("experimental OpenRaft control-plane lease expiry failed: {error}");
+                std::process::exit(1);
+            }
+        }
+        thread::sleep(config.control_plane_lease_scan_interval);
+```
+
+crates/storage/src/control_plane_raft.rs (L3422 to 3427)
+  Note: Authority status now obtains a log-store status snapshot, putting the new WAL clean-length computation on the public status path.
+```
+        let log_store_status = self
+            .log_store
+            .as_ref()
+            .map(ControlPlaneRaftLogStore::status_snapshot)
+            .transpose()
+            .map_err(|error| openraft_remote_error("status log-store read", error))?;
+```
+
+crates/storage/src/control_plane_raft.rs (L4196 to 4202)
+  Note: The newly added status snapshot computes `wal_clean_len` by calling `wal.clean_len()` whenever the WAL is healthy.
+```
+        let wal_clean_len = match (&self.wal, &wal_poisoned) {
+            (Some(wal), None) => Some(wal.clean_len().map_err(|error| {
+                control_plane_error_to_io_error(
+                    "read control-plane OpenRaft WAL clean length for status",
+                    error,
+                )
+            })?),
+```
+
+crates/storage/src/control_plane_raft.rs (L4890 to 4891)
+  Note: `clean_len()` is implemented by reading/parsing WAL records rather than using a cached offset or metadata length.
+```
+    pub fn clean_len(&self) -> Result<u64, ControlPlaneError> {
+        Ok(self.read_records()?.clean_len)
+```
+
+crates/storage/src/control_plane_raft.rs (L4919 to 4974)
+  Note: The WAL read path reads the entire WAL into memory and decodes every frame, making the new status field O(WAL size) in memory and CPU.
+```
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)
+            .map_err(|source| ControlPlaneError::Io {
+                context: "read control-plane OpenRaft WAL",
+                source,
+            })?;
+
+        let replay_offset = usize::try_from(replay_offset).map_err(|_| {
+            raft_artifact_protocol_error("control-plane OpenRaft WAL replay offset exceeds usize")
+        })?;
+        if replay_offset > bytes.len() {
+            return Err(raft_artifact_protocol_error(format!(
+                "control-plane OpenRaft WAL replay offset {replay_offset} exceeds WAL length {}",
+                bytes.len()
+            )));
+        }
+
+        let mut records = Vec::new();
+        let mut offset = replay_offset;
+        let mut clean_len = replay_offset;
+        while offset < bytes.len() {
+            let record_start = offset;
+            let remaining = bytes.len() - offset;
+            if remaining < CONTROL_PLANE_RAFT_WAL_FILE_FRAME_LEN {
+                return Ok(ControlPlaneRaftWalFileRecords {
+                    records,
+                    clean_len: clean_len as u64,
+                    truncated_tail: true,
+                });
+            }
+            let frame_len = u32::from_be_bytes(
+                bytes[offset..offset + CONTROL_PLANE_RAFT_WAL_FILE_FRAME_LEN]
+                    .try_into()
+                    .expect("WAL frame length prefix has fixed width"),
+            ) as usize;
+            offset += CONTROL_PLANE_RAFT_WAL_FILE_FRAME_LEN;
+            if frame_len == 0 {
+                return Err(raft_artifact_protocol_error(
+                    "zero-length control-plane OpenRaft WAL frame",
+                ));
+            }
+            let Some(frame_end) = offset.checked_add(frame_len) else {
+                return Err(raft_artifact_protocol_error(
+                    "control-plane OpenRaft WAL frame length overflows usize",
+                ));
+            };
+            if frame_end > bytes.len() {
+                return Ok(ControlPlaneRaftWalFileRecords {
+                    records,
+                    clean_len: record_start as u64,
+                    truncated_tail: true,
+                });
+            }
+            let frame = ControlPlaneRaftWalFrame::decode_frame(&bytes[offset..frame_end])?;
+            frame.validate_identity(&self.cluster_name, self.local_node_id)?;
+            records.push(frame.into_record());
+```
+
+# Attack-path analysis
+Final: medium | Decider: model_decided | Matrix severity: ignore | Policy adjusted: ignore
+## Rationale
+Kept as medium. The code evidence supports the bug: status() reaches status_snapshot(), which calls wal.clean_len(), which fully reads and decodes the WAL. The status path is periodically executed in the multi-node control-plane lease-scan loop, so WAL growth can cause recurring CPU/memory exhaustion and possibly process exit. However, the affected surface is experimental, disabled by default, and exposed through private Unix-domain internal control-plane/Raft interfaces rather than unauthenticated public HTTP. This supports a meaningful availability issue but not high/critical severity.
+## Likelihood
+low - Exploitation is not reachable from the normal public S3 HTTP surface in the reviewed code. It requires an experimental multi-node Raft deployment plus an internal actor capable of submitting/replicating control-plane activity or otherwise growing the Raft WAL. Those preconditions make broad exploitation unlikely, but the path is plausible for a compromised or malicious internal peer/storage node.
+## Impact
+medium - The vulnerable path can consume CPU and memory proportional to the entire WAL on every periodic status check. Validation evidence described linear runtime/memory growth and an OOM read error under a memory limit. In the manager loop, a status error exits the control-plane process, so impact can be control-plane availability loss. It does not directly expose data, bypass authentication, or execute code.
+## Assumptions
+- The affected deployment enables ARGMIN_CONTROL_PLANE_EXPERIMENTAL_RAFT and configures a multi-node Raft peer set.
+- A realistic attacker is an internal/control-plane actor: a configured Raft peer, compromised storage node, or local process with access to the private Unix-domain control-plane or Raft peer socket.
+- Public S3 HTTP clients are not assumed to have direct access to this Raft status path unless another bug or deployment choice exposes the internal sockets.
+- control-plane process role
+- ARGMIN_CONTROL_PLANE_EXPERIMENTAL_RAFT=true
+- multi-node Raft peer mode with more than one configured peer
+- healthy WAL-backed Raft log store
+- attacker can cause Raft/control-plane mutations or heartbeats that append WAL records
+## Path
+Internal peer/storage node
+  -> Raft/control-plane command/heartbeat
+  -> WAL grows
+  -> periodic lease-scan raft_authority.status()
+  -> status_snapshot() calls wal.clean_len()
+  -> read_to_end() + decode every WAL frame
+  -> control-plane slowdown/OOM/error exit
+## Path evidence
+- `crates/storage/src/control_plane_raft.rs:3419-3427` - ControlPlaneRaftAuthority::status() calls ControlPlaneRaftLogStore::status_snapshot(), placing log-store/WAL status computation on the authority status path.
+- `crates/storage/src/control_plane_raft.rs:4183-4202` - status_snapshot() calls wal.clean_len() whenever a WAL exists and is not poisoned.
+- `crates/storage/src/control_plane_raft.rs:4890-4891` - clean_len() is implemented by reading WAL records instead of using cached metadata.
+- `crates/storage/src/control_plane_raft.rs:4919-4974` - read_records_from() reads the entire WAL into a Vec and decodes every frame, creating O(WAL size) memory and CPU cost.
+- `crates/argmin-s3/src/main.rs:2406-2467` - In multi-node Raft mode the control-plane manager calls raft_authority.status() on each lease-scan loop and exits on status check failure.
+- `crates/argmin-s3/src/config.rs:306-330` - Experimental Raft is disabled by default; the lease-scan interval defaults to 250 ms when enabled.
+- `crates/argmin-s3/src/config.rs:455-463` - Raft-specific configuration requires ARGMIN_CONTROL_PLANE_EXPERIMENTAL_RAFT, confirming this path is feature-gated/experimental.
+- `crates/argmin-s3/src/main.rs:2695-2749` - Control-plane Unix socket directories are created/validated as private and owner-only, limiting direct exposure.
+- `crates/argmin-s3/src/main.rs:2031-2059` - Raft peer RPC handling applies timeouts and validates incoming peer frame identity before dispatching, but this does not bound WAL-status scanning cost.
+- `crates/storage/src/control_plane_raft.rs:4575-4584` - Log-store record application appends records to the WAL when WAL-backed, establishing the WAL growth source.
+## Narrative
+The finding is real for experimental multi-node Raft deployments. status() obtains a log-store status snapshot; status_snapshot() computes wal_clean_len by calling wal.clean_len(); clean_len delegates to read_records(); read_records_from opens the WAL, read_to_end()s it into memory, then decodes frames in a loop. The argmin-s3 control-plane manager calls raft_authority.status() every lease-scan interval in multi-node Raft mode and exits on status error. WAL records are appended for log-store records, so an internal peer/storage-control actor that can drive Raft/control-plane mutations can make later periodic status checks increasingly expensive. Severity remains medium: impact is meaningful availability loss of the control-plane process, but reachability is limited to an experimental, disabled-by-default, internal Unix-socket/Raft-peer surface rather than unauthenticated public HTTP.
+## Controls
+- ARGMIN_CONTROL_PLANE_EXPERIMENTAL_RAFT feature/config gate
+- Control-plane and Raft peer interfaces use Unix-domain sockets, not public TCP listeners in the reviewed code
+- Socket parent directory must be private and owned by the process uid
+- Raft peer frames validate configured cluster/node identity
+- Peer RPC worker limit and 1-second I/O timeouts
+- Default HTTP listener is 127.0.0.1:9000 and is separate from the vulnerable control-plane status path
+- No repository IaC/ingress artifact found exposing the control-plane socket publicly
+## Blindspots
+- Static review only; no deployment manifests or runtime socket permissions were available to verify real-world exposure.
+- The provided validation evidence demonstrates resource growth but does not prove public HTTP reachability.
+- Actual impact depends on WAL compaction/checkpoint behavior, operator memory limits, and how control-plane unavailability affects a deployed cluster.
+- Peer identity validation appears non-cryptographic in the reviewed path; local socket filesystem permissions and deployment topology determine whether untrusted local users can connect.
