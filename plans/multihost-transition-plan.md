@@ -10833,15 +10833,14 @@ Phase 12.4 progress:
   artifact-plus-compacted-WAL restore, and authority checkpointing that removes
   the checkpointed prefix while exposing the resulting base offset through the
   replicated authority status surface.
-- Started process-level WAL crash/fault injection for the pre-response peer RPC
-  crash boundary. An env-gated test failpoint now exits after a WAL record and its
-  parent directory are synced, before the peer RPC response can be written. A
-  three-process regression restarts a follower with that failpoint, commits a
-  real leader-to-follower log-store mutation through the surviving quorum, proves the
-  follower exits before rewriting the checkpoint artifact, proves
-  artifact-plus-WAL recovery sees the unacknowledged-but-fsynced mutation, and
-  then restarts the follower normally to catch up through the recovered WAL
-  state.
+- Added process-level coverage for the pre-response peer RPC crash/failure
+  boundary without a production failpoint. A three-process regression restarts a
+  follower, sends a direct peer append, makes only that follower's state
+  directory unwritable, and exercises the ordinary checkpoint-before-response
+  failure path. The test proves the follower exits before rewriting the
+  checkpoint artifact, proves artifact-plus-WAL recovery sees the
+  unacknowledged-but-fsynced append, and then restarts the follower normally to
+  retain the recovered WAL state.
 - Bounded ordinary durable peer RPC WAL growth by making the live durable peer
   context checkpoint and compact append/vote RPCs before acknowledgement. A
   regression now uses the default process durability context for a vote request
