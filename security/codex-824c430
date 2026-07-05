@@ -1,0 +1,249 @@
+Debug checkpoint endpoint bypasses admission controls
+Link: https://chatgpt.com/codex/cloud/security/findings/6c72ccef45c88191806a9abbba8e1af5?sev=&repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin&sort=date_desc
+Criticality: medium (attack path: medium)
+Status: fixed
+
+# Metadata
+Repo: justincormack/argmin
+Commit: 824c430
+Author: justin@specialbusservice.com
+Created: 29/06/2026, 11:24:33
+Assignee: Unassigned
+Signals: Security, Validated, Attack-path
+
+# Summary
+Introduced: a state-mutating debug endpoint was added to the pre-admission local_debug_response path. The storage checkpoint/compaction routine itself is legitimate maintenance functionality, but exposing it through this unauthenticated bypass path creates an availability risk.
+When ARGMIN_LOCAL_DEBUG_ENDPOINT is enabled, handle() dispatches /__argmin/debug/* requests before acquiring the request semaphore. This commit adds POST /__argmin/debug/metadata-checkpoint/record/<pg_id> to that bypass path. Unlike the existing metrics endpoint, the new endpoint performs synchronous storage work: it records a metadata command checkpoint and attempts log compaction for the requested PG. A local unauthenticated client can repeatedly invoke this endpoint to force disk/SQLite/RPC-heavy checkpoint and compaction work outside max_inflight_requests backpressure, potentially starving Tokio workers or the storage node and causing denial of service. The endpoint is disabled by default and the argmin-s3 binary restricts it to loopback listeners, which limits exploitability, but the new mutating operation is still exposed without authentication or admission control whenever the debug endpoint is enabled.
+
+# Resolution
+Fixed for production/release builds by the local-debug endpoint hardening commits:
+
+- `45497afe` gates local debug route dispatch and helper code behind `cfg(any(test, feature = "local-debug-endpoints"))`, and rejects `ARGMIN_LOCAL_DEBUG_ENDPOINT=1` at startup unless the binary was compiled with that non-production support.
+- `73a36bcd` makes `local-debug-endpoints` a debug/test-only feature by adding a release-build `compile_error!`, and updates UAT smoke handling so debug-hook smokes cannot be run against release or externally supplied binaries.
+
+The metadata-checkpoint debug endpoint remains a deliberate debug/test diagnostic hook, but it is no longer a production or release-build path. Production default builds reject the environment variable before startup, and release builds cannot be produced with the debug endpoint feature.
+
+# Validation
+## Rubric
+- [x] Confirm local debug dispatch occurs before max_inflight/request semaphore admission.
+- [x] Confirm POST /__argmin/debug/metadata-checkpoint/record/<pg_id> is exposed in local_debug_response without SigV4/operator authentication.
+- [x] Confirm the endpoint invokes state-mutating metadata checkpoint and compaction storage functionality.
+- [x] Dynamically reproduce the endpoint with request admission slots set to 0, proving admission bypass.
+- [x] Confirm environmental exposure limits: disabled by default and loopback-only in the argmin-s3 binary when enabled.
+## Report
+Validated the finding at commit 824c430176dd0ab6e2bb3a5fa73a6c093340469c. The HTTP handler checks state.config.local_debug_endpoint and calls local_debug_response at crates/server-http/src/http/serve.rs:687-696 before request admission is acquired at crates/server-http/src/http/serve.rs:710-715. The POST /__argmin/debug/metadata-checkpoint/record/<pg_id> branch in local_debug_response parses the pg_id and directly invokes storage_node_for_request().record_current_metadata_command_checkpoint_for_pg(pg_id) at crates/server-http/src/http/serve.rs:1037-1053, with no SigV4 or other authorization checks in that path. The called storage method at crates/storage/src/cluster.rs:4373-4424 records a metadata checkpoint and calls compact_metadata_command_log_for_checkpoint_record after success, confirming state-mutating maintenance work. Dynamic validation: the existing targeted test `cargo test -p server-http local_debug_metadata_checkpoint_record_endpoint_bypasses_request_admission -- --nocapture` passed, proving the endpoint is reachable even when request_slots=0. I added a temporary PoC test that creates a bucket to populate metadata, starts the real HTTP server with local_debug_endpoint=true and zero request admission slots, then sends an unauthenticated local HTTP POST. It returned HTTP/1.1 200 with `pg_id=0 scanned=1 recorded=1 ... compacted=1 compaction_deleted_entries=1`, proving the debug endpoint triggers checkpoint recording and compaction despite bypassing admission. Debugger validation with LLDB broke at `storage::cluster::StorageCluster::record_current_metadata_command_checkpoint_for_pg` and showed the stack `handle at serve.rs:688 -> local_debug_response at serve.rs:1053 -> record_current_metadata_command_checkpoint_for_pg at cluster.rs:4377`, confirming the pre-admission debug path reaches the mutating storage routine. Crash reproduction is not applicable because this is an availability/admission-control design flaw rather than a memory-safety crash. Valgrind was unavailable in the container and Rust ASan required nightly-only -Z flags, so those methods could not be used. Exposure limits were also confirmed in code: ARGMIN_LOCAL_DEBUG_ENDPOINT defaults false at crates/argmin-s3/src/config.rs:322-325 and the argmin-s3 binary requires a loopback listener when enabled at crates/argmin-s3/src/config.rs:444-460.
+
+# Evidence
+crates/argmin-s3/src/config.rs (L322 to 325)
+  Note: The debug endpoint is disabled by default, limiting exposure unless ARGMIN_LOCAL_DEBUG_ENDPOINT is explicitly enabled.
+```
+        let local_debug_endpoint = match get("ARGMIN_LOCAL_DEBUG_ENDPOINT") {
+            Some(value) => parse_bool_env("ARGMIN_LOCAL_DEBUG_ENDPOINT", &value)?,
+            None => false,
+        };
+```
+
+crates/argmin-s3/src/config.rs (L444 to 460)
+  Note: The binary restricts the debug endpoint to frontend roles on loopback listeners, reducing this to a local attack surface in the standard binary configuration.
+```
+        if local_debug_endpoint {
+            if !process_role.has_frontend() {
+                return Err(
+                    "ARGMIN_LOCAL_DEBUG_ENDPOINT requires a frontend process role".to_string(),
+                );
+            }
+            let listen_socket_addr: SocketAddr = listen_addr.parse().map_err(|e| {
+                format!(
+                    "ARGMIN_LOCAL_DEBUG_ENDPOINT requires ARGMIN_LISTEN_ADDR to be a loopback socket address: {e}"
+                )
+            })?;
+            if !listen_socket_addr.ip().is_loopback() {
+                return Err(
+                    "ARGMIN_LOCAL_DEBUG_ENDPOINT requires ARGMIN_LISTEN_ADDR to be loopback"
+                        .to_string(),
+                );
+            }
+```
+
+crates/server-http/src/http/serve.rs (L1037 to 1053)
+  Note: The new unauthenticated POST debug endpoint parses a PG id and directly invokes metadata checkpoint recording from the pre-admission debug handler.
+```
+        (&http::Method::POST, path)
+            if path.starts_with("/__argmin/debug/metadata-checkpoint/record/") =>
+        {
+            let raw_pg_id = path.trim_start_matches("/__argmin/debug/metadata-checkpoint/record/");
+            let Some(pg_id) = raw_pg_id.parse::<u32>().ok().map(PgId::new) else {
+                return Some(local_debug_text_response(
+                    400,
+                    "invalid pg id\n".to_string(),
+                ));
+            };
+            let result = state
+                .pool
+                .first()
+                .expect("server has at least one frontend")
+                .coordinator
+                .storage_node_for_request()
+                .record_current_metadata_command_checkpoint_for_pg(pg_id);
+```
+
+crates/server-http/src/http/serve.rs (L1054 to 1085)
+  Note: The endpoint returns the maintenance result directly to the caller and does not require SigV4 authentication or any separate operator authorization.
+```
+            match result {
+                Ok(summary) => {
+                    let status_code = if summary.compaction_failed == 0 && summary.failed == 0 {
+                        200
+                    } else {
+                        409
+                    };
+                    Some(local_debug_text_response(
+                        status_code,
+                        format!(
+                            "pg_id={} scanned={} recorded={} already_current={} skipped_cadence={} skipped_inactive={} skipped_empty={} skipped_stale_epoch={} compacted={} compaction_deleted_entries={} compaction_noop={} compaction_no_checkpoint={} compaction_pending={} compaction_failed={} failed={} limit_reached={}\n",
+                            pg_id.get(),
+                            summary.scanned,
+                            summary.recorded,
+                            summary.already_current,
+                            summary.skipped_cadence,
+                            summary.skipped_inactive,
+                            summary.skipped_empty,
+                            summary.skipped_stale_epoch,
+                            summary.compacted,
+                            summary.compaction_deleted_entries,
+                            summary.compaction_noop,
+                            summary.compaction_no_checkpoint,
+                            summary.compaction_pending,
+                            summary.compaction_failed,
+                            summary.failed,
+                            summary.limit_reached
+                        ),
+                    ))
+                }
+                Err(error) => Some(local_debug_text_response(409, format!("{error}\n"))),
+            }
+```
+
+crates/server-http/src/http/serve.rs (L687 to 696)
+  Note: Local debug requests are handled and returned before the normal request admission semaphore is acquired, so debug handlers bypass max_inflight_requests backpressure.
+```
+    if state.config.local_debug_endpoint {
+        if let Some(resp) = local_debug_response(&state, req.method(), req.uri().path()) {
+            return Ok(s3_response_to_hyper(
+                resp,
+                None,
+                state.config.stream_read_chunk_size,
+                state.config.panic_on_500,
+                state.config.abort_on_500,
+                response_trace,
+            ));
+```
+
+crates/server-http/src/http/serve.rs (L710 to 715)
+  Note: The request semaphore that normally bounds concurrent request processing is acquired only after the local-debug dispatch path.
+```
+    // Acquire request permit before body collection to bound memory.
+    let admission_started_at = Instant::now();
+    let req_permit = match tokio::time::timeout(
+        state.config.request_wait_timeout,
+        Arc::clone(&state.request_semaphore).acquire_owned(),
+    )
+```
+
+crates/storage/src/cluster.rs (L4373 to 4424)
+  Note: The invoked storage method records a current metadata checkpoint and then runs metadata command-log compaction, which is mutating and potentially disk/RPC intensive.
+```
+    pub fn record_current_metadata_command_checkpoint_for_pg(
+        &self,
+        pg_id: PgId,
+    ) -> Result<MetadataCommandCheckpointRecordSummary, StoreError> {
+        let mut summary = MetadataCommandCheckpointRecordSummary::default();
+        let route = self
+            .local_pg_route(pg_id)
+            .ok_or_else(|| StoreError::ClusterPgNotFound {
+                pg_id: pg_id.get(),
+                cluster_epoch: self.operation_epoch(),
+            })?;
+        summary.scanned += 1;
+        if route.state() != PgState::Active {
+            return Err(StoreError::PgNotActive {
+                pg_id: pg_id.get(),
+                cluster_epoch: route.cluster_epoch(),
+                state: route.state(),
+            });
+        }
+        let primary_node = self
+            .local_map
+            .metadata_pg_primary_node(self.operation_epoch(), pg_id)?;
+        let metadata_client = primary_node.metadata_command_client();
+        let state = metadata_client.metadata_command_replica_state(pg_id)?;
+        if state.cluster_epoch != route.cluster_epoch() {
+            return Err(StoreError::StaleMetadataRoute {
+                pg_id: pg_id.get(),
+                route_epoch: state.cluster_epoch,
+                current_epoch: route.cluster_epoch(),
+            });
+        }
+        if state.applied_log_index == 0 && state.applied_log_hash == 0 {
+            summary.skipped_empty += 1;
+            return Ok(summary);
+        }
+        match metadata_client.record_current_metadata_command_checkpoint(pg_id, state.cluster_epoch)
+        {
+            Ok(_) => {
+                summary.recorded += 1;
+                compact_metadata_command_log_for_checkpoint_record(
+                    metadata_client.as_ref(),
+                    pg_id,
+                    state.cluster_epoch,
+                    &mut summary,
+                );
+            }
+            Err(error) => {
+                note_metadata_command_checkpoint_record_error(pg_id, "failed", &error);
+                return Err(error);
+            }
+        }
+        Ok(summary)
+```
+
+# Attack-path analysis
+Final: medium | Decider: model_decided | Matrix severity: ignore | Policy adjusted: ignore
+## Rationale
+Kept at medium. The code and validation evidence support a real runtime vulnerability: the debug endpoint is unauthenticated, pre-admission, and reaches mutating storage checkpoint/compaction code. However, the exploit path is localhost-only in the standard binary and requires ARGMIN_LOCAL_DEBUG_ENDPOINT to be explicitly enabled, so it should not be rated high or critical. The most credible impact is service-level availability degradation rather than confidentiality compromise, account takeover, or remote arbitrary code execution.
+## Likelihood
+low - Exploitation is straightforward once reachable because it is an unauthenticated HTTP POST with attacker-controlled pg_id, and validation demonstrated it bypasses admission. Likelihood is reduced substantially because the endpoint is disabled by default and the standard binary restricts it to loopback listeners, requiring local or colocated access.
+## Impact
+medium - Impact is primarily availability: unauthenticated local clients can force synchronous checkpoint and compaction work in the storage layer outside configured request backpressure. There is also minor internal metadata integrity impact because checkpoint/retention metadata is mutated, but no evidence of object data disclosure, credential compromise, RCE, or permanent data loss.
+## Assumptions
+- The standard argmin-s3 binary and its environment-driven configuration are representative of production/runtime deployments.
+- A realistic attacker for this path is an unprivileged local process, local user, colocated workload, or other entity able to connect to the same host/network namespace loopback listener.
+- No external cloud APIs or runtime deployment state were queried; exposure is inferred from repository code and configuration defaults.
+- ARGMIN_LOCAL_DEBUG_ENDPOINT=true
+- argmin-s3 process role includes a frontend
+- standard argmin-s3 configuration must bind ARGMIN_LISTEN_ADDR to a loopback socket when the debug endpoint is enabled
+- attacker can send HTTP requests from the local host or same network namespace
+## Path
+Local attacker -> 127.0.0.1:9000 HTTP -> /__argmin/debug/metadata-checkpoint/record/<pg_id> -> local_debug_response before semaphore/auth -> StorageCluster checkpoint -> command-log compaction -> service availability impact
+## Path evidence
+- `crates/server-http/src/http/serve.rs:687-696` - local_debug_response is dispatched and returned before normal admission/backpressure handling
+- `crates/server-http/src/http/serve.rs:710-715` - normal request semaphore acquisition occurs only after the debug dispatch path
+- `crates/server-http/src/http/serve.rs:1037-1053` - unauthenticated POST debug endpoint parses pg_id from the path and calls the storage checkpoint routine
+- `crates/server-http/src/http/serve.rs:1054-1085` - endpoint returns the maintenance result directly without an authorization check
+- `crates/storage/src/cluster.rs:4373-4424` - called storage routine records a metadata checkpoint and invokes command-log compaction
+- `crates/argmin-s3/src/config.rs:322-325` - ARGMIN_LOCAL_DEBUG_ENDPOINT defaults to false
+- `crates/argmin-s3/src/config.rs:444-461` - standard binary requires frontend role and loopback listener when the debug endpoint is enabled
+- `crates/argmin-s3/src/config.rs:211` - default listener is 127.0.0.1:9000
+- `crates/argmin-s3/src/main.rs:1995-2002` - argmin-s3 binds the configured TCP listener used by the HTTP service
+- `crates/server-http/src/http/serve.rs:4866-4898` - in-repository async test demonstrates the debug endpoint succeeds with request slots set to 0, proving admission bypass reachability
+## Narrative
+The finding is real and in-scope. In serve.rs, local debug requests are handled at lines 687-696 before the request semaphore is acquired at lines 710-715. The added POST /__argmin/debug/metadata-checkpoint/record/<pg_id> branch parses attacker-controlled path input and directly calls record_current_metadata_command_checkpoint_for_pg() without SigV4 or operator authorization. The storage method records checkpoint state and invokes metadata command-log compaction, confirming a mutating storage path. Exposure is materially limited: ARGMIN_LOCAL_DEBUG_ENDPOINT defaults to false, and argmin-s3 rejects enabling it unless the listener is loopback. Therefore this is not a remote internet auth bypass or data-exfiltration issue, but it remains a plausible local availability/admission-control vulnerability when the debug endpoint is intentionally enabled.
+## Controls
+- ARGMIN_LOCAL_DEBUG_ENDPOINT feature/configuration flag disables the endpoint by default
+- argmin-s3 enforces loopback ARGMIN_LISTEN_ADDR when local debug is enabled
+- normal S3 requests use SigV4 authentication, but this local debug path does not
+- normal requests use max_inflight_requests semaphore, but this endpoint is handled before that semaphore
+## Blindspots
+- No Kubernetes, Terraform, Docker Compose, or ingress manifests were found in the checkout, so deployment exposure beyond code defaults could not be verified.
+- Static analysis cannot quantify how much repeated checkpoint/compaction calls degrade performance in a real production dataset.
+- The temporary validation PoC output was supplied by the earlier validation stage; this attack-path pass relied on repository artifacts and did not rerun long dynamic tests.

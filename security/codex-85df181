@@ -1,0 +1,219 @@
+Unauthenticated local debug leaks bucket metadata
+Link: https://chatgpt.com/codex/cloud/security/findings/35c756d4159c8191ac9530b6b36b0afe?sev=&repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin&sort=date_desc
+Criticality: medium (attack path: medium)
+Status: fixed
+
+# Metadata
+Repo: justincormack/argmin
+Commit: 85df181
+Author: justin@specialbusservice.com
+Created: 01/07/2026, 16:46:05
+Assignee: Unassigned
+Signals: Security, Validated, Attack-path
+
+# Summary
+Introduced. The pre-existing local debug endpoint was already unauthenticated, but this commit newly routes the bucket-delete debug path to bucket_delete_debug_snapshot and formats bucket row and pending command details into the HTTP response. That expands the unauthenticated information disclosure from delete-attempt status to private bucket metadata and possibly unrelated bucket names in the same metadata PG.
+When ARGMIN_LOCAL_DEBUG_ENDPOINT is enabled, requests under /__argmin/debug/ are handled before the normal S3 authentication and request-admission path. This commit changes the bucket-delete debug endpoint from returning only the durable delete-attempt outcome to returning a broader BucketDeleteDebugSnapshot. The snapshot now performs a raw bucket lookup and exposes whether a bucket row exists, its lifecycle state and generation counters, durable write-drain details, and the current pending metadata command's target_bucket. Because the endpoint accepts an arbitrary bucket name from the URL and does not authenticate the requester, any local process able to reach the loopback listener can confirm guessed private bucket names and, while a pending command exists for the bucket PG, may learn another bucket name from target_bucket even if it did not request that bucket. The endpoint is disabled by default and configuration restricts it to loopback listeners, so this does not expose object data or credentials to the network by default, but it is still a confidentiality regression for deployments enabling local debug diagnostics.
+
+# Resolution
+Fixed for production/release builds by the local-debug endpoint hardening commits:
+
+- `45497afe` gates local debug route dispatch and helper code behind `cfg(any(test, feature = "local-debug-endpoints"))`, and rejects `ARGMIN_LOCAL_DEBUG_ENDPOINT=1` at startup unless the binary was compiled with that non-production support.
+- `73a36bcd` makes `local-debug-endpoints` a debug/test-only feature by adding a release-build `compile_error!`, and updates UAT smoke handling so debug-hook smokes cannot be run against release or externally supplied binaries.
+
+The bucket-delete debug snapshot remains available in explicit debug/test builds for diagnostics, but release artifacts cannot include or enable the unauthenticated debug route. Production default builds reject the environment variable before startup.
+
+# Validation
+## Rubric
+- [x] Confirm the local debug endpoint is opt-in but handled before normal S3 authentication/request admission.
+- [x] Confirm the bucket-delete debug route accepts an arbitrary bucket name from the URL without credentials and calls the new snapshot API.
+- [x] Confirm the snapshot includes newly exposed bucket-row state/generation data, durable drain details, and pending metadata command target bucket; confirm pending-command lookup is PG-scoped rather than bucket-filtered.
+- [x] Dynamically reproduce an unauthenticated HTTP response that distinguishes an existing private bucket from a missing bucket and returns lifecycle/generation metadata.
+- [x] Verify scope-limiting configuration facts: disabled by default and constrained to loopback when enabled.
+## Report
+Validated the finding. Direct crash testing was not applicable because the suspected issue is a confidentiality/information-disclosure regression, not memory corruption; the dynamic PoC completed successfully without crashing. Valgrind was attempted but unavailable in the container (`bash: command not found: valgrind`). I then reproduced the unauthenticated HTTP disclosure and captured a debugger trace.
+
+Evidence:
+1. `crates/server-http/src/http/serve.rs:691-699` checks `state.config.local_debug_endpoint` and returns `local_debug_response(...)` before continuing into the normal S3 request path. This is before the later request/auth handling.
+2. `crates/server-http/src/http/serve.rs:1041-1068` accepts `GET /__argmin/debug/bucket-delete-attempt/<bucket>`, percent-decodes an arbitrary bucket name, and calls `storage.bucket_delete_debug_snapshot(&bucket)`.
+3. `crates/storage/src/cluster/request_ops.rs:11660-11705` reads raw bucket-row data, durable write-drain data, pending metadata command data, and delete-attempt outcome into `BucketDeleteDebugSnapshot`.
+4. `crates/storage/src/cluster.rs:4085-4097` shows `pending_metadata_command_for_bucket` ignores its `bucket` argument (`let _ = bucket;`) and returns the pending command envelope for the whole PG, supporting the suspected unrelated-`target_bucket` disclosure condition.
+5. `crates/server-http/src/http/serve.rs:1168-1209` formats `bucket_row=present/absent`, `state`, generation counters, drain metadata, and `pending_metadata_command ... target_bucket=...` into the HTTP body.
+6. A targeted in-process HTTP PoC enabled `local_debug_endpoint`, created `secret-private-bucket`, and sent raw TCP HTTP requests with no `Authorization` header. Output for an existing bucket included `HTTP/1.1 200 OK`, `bucket="secret-private-bucket"`, `bucket_row=present state=active bucket_execution_generation=1 bucket_incarnation_generation=1`. Output for a missing bucket included `HTTP/1.1 200 OK` and `bucket_row=absent`, demonstrating a bucket-existence oracle and metadata disclosure.
+7. LLDB breakpoint trace confirmed the runtime call chain: `local_debug_bucket_delete_attempt_body` at `serve.rs:1160` <- `local_debug_response` at `serve.rs:1066` <- `handle` at `serve.rs:692`, matching the pre-auth local debug path.
+
+Scope/mitigations verified: `ServeConfig::default` sets `local_debug_endpoint: false` at `serve.rs:204`; `ARGMIN_LOCAL_DEBUG_ENDPOINT` defaults false at `crates/argmin-s3/src/config.rs:322-325`; when enabled, config enforces a loopback frontend listener at `config.rs:444-459`. These mitigations limit exposure but do not negate the unauthenticated local disclosure when the diagnostic endpoint is enabled.
+
+# Evidence
+crates/server-http/src/http/serve.rs (L1041 to 1068)
+  Note: The unauthenticated debug route accepts an arbitrary bucket name from the URL and now calls bucket_delete_debug_snapshot, returning its contents directly in the HTTP response.
+```
+        (&http::Method::GET, path)
+            if path.starts_with("/__argmin/debug/bucket-delete-attempt/") =>
+        {
+            let raw_bucket = path.trim_start_matches("/__argmin/debug/bucket-delete-attempt/");
+            let bucket = match percent_decode_strict(raw_bucket)
+                .ok()
+                .and_then(|bucket| BucketName::try_from(bucket).ok())
+            {
+                Some(bucket) => bucket,
+                None => {
+                    return Some(local_debug_text_response(
+                        400,
+                        "invalid bucket\n".to_string(),
+                    ));
+                }
+            };
+            let storage = state
+                .pool
+                .first()
+                .expect("server has at least one frontend")
+                .coordinator
+                .storage_node_for_request();
+            match storage.bucket_delete_debug_snapshot(&bucket) {
+                Ok(snapshot) => Some(local_debug_text_response(
+                    200,
+                    local_debug_bucket_delete_attempt_body(&snapshot),
+                )),
+                Err(error) => Some(local_debug_text_response(409, format!("{error:?}\n"))),
+```
+
+crates/server-http/src/http/serve.rs (L1168 to 1209)
+  Note: The debug response formats bucket_row=present/absent, lifecycle state, generation counters, durable drain metadata, and target_bucket into the unauthenticated response body.
+```
+    match &snapshot.bucket_row {
+        Some(row) => {
+            writeln!(
+                &mut body,
+                "bucket_row=present state={} bucket_execution_generation={} bucket_incarnation_generation={}",
+                local_debug_bucket_state(row.state),
+                row.bucket_execution_generation,
+                row.bucket_incarnation_generation,
+            )
+            .expect("write to String");
+        }
+        None => body.push_str("bucket_row=absent\n"),
+    }
+
+    match &snapshot.durable_write_drain {
+        Some(drain) => {
+            writeln!(
+                &mut body,
+                "durable_write_drain=present drain_id={:?} cluster_epoch={} bucket_execution_generation={} created_at={} lease_deadline={}",
+                drain.drain_id,
+                drain.cluster_epoch.get(),
+                drain.bucket_execution_generation,
+                drain.created_at,
+                local_debug_optional_u64(drain.lease_deadline),
+            )
+            .expect("write to String");
+        }
+        None => body.push_str("durable_write_drain=absent\n"),
+    }
+
+    match &snapshot.pending_metadata_command {
+        Some(command) => {
+            writeln!(
+                &mut body,
+                "pending_metadata_command=present kind={} target_bucket={:?} matches_bucket={} cluster_epoch={} pg_id={} log_index={}",
+                command.kind,
+                command.target_bucket.as_str(),
+                command.matches_bucket,
+                command.cluster_epoch.get(),
+                command.pg_id,
+                command.log_index,
+            )
+```
+
+crates/server-http/src/http/serve.rs (L691 to 699)
+  Note: Local debug responses are returned before the normal S3 request/authentication path, so debug endpoint data is unauthenticated when the feature is enabled.
+```
+    if state.config.local_debug_endpoint {
+        if let Some(resp) = local_debug_response(&state, req.method(), req.uri().path()) {
+            return Ok(s3_response_to_hyper(
+                resp,
+                None,
+                state.config.stream_read_chunk_size,
+                state.config.panic_on_500,
+                state.config.abort_on_500,
+                response_trace,
+```
+
+crates/storage/src/cluster/request_ops.rs (L11660 to 11689)
+  Note: The new snapshot fetches raw bucket-row existence/state/generation data and captures the pending metadata command's target_bucket, which can disclose private bucket metadata.
+```
+        let bucket_row = match node.bucket_metadata_client().head_bucket_raw(pg_id, bucket) {
+            Ok(info) => Some(BucketDeleteDebugBucketRow {
+                state: info.state,
+                bucket_execution_generation: info.bucket_execution_generation,
+                bucket_incarnation_generation: info.bucket_incarnation_generation,
+            }),
+            Err(BucketSnapshotLoadError::Metadata(MetadataError::BucketNotFound { .. })) => None,
+            Err(error) => return Err(error),
+        };
+
+        let durable_write_drain = node
+            .bucket_write_reservation_client()
+            .durable_bucket_write_drain(pg_id, bucket)?
+            .map(|record| BucketDeleteDebugDrain {
+                drain_id: record.drain_id,
+                cluster_epoch: record.cluster_epoch,
+                bucket_execution_generation: record.bucket_execution_generation,
+                created_at: record.created_at,
+                lease_deadline: record.lease_deadline,
+            });
+
+        let pending_metadata_command = self
+            .pending_metadata_command_for_bucket(pg_id, bucket)?
+            .map(|command| {
+                let id = command.id();
+                let target_bucket = command.bucket_name().clone();
+                BucketDeleteDebugPendingCommand {
+                    kind: command.payload().kind_name(),
+                    matches_bucket: target_bucket == *bucket,
+                    target_bucket,
+```
+
+# Attack-path analysis
+Final: medium | Decider: model_decided | Matrix severity: ignore | Policy adjusted: ignore
+## Rationale
+Kept at medium. The vulnerability is real and validated through the normal HTTP listener: the debug path is pre-auth, attacker-controlled bucket names reach storage snapshot code, and the response discloses private bucket metadata. However, severity is bounded by strong exposure mitigations and limited impact: ARGMIN_LOCAL_DEBUG_ENDPOINT defaults off, the binary enforces a loopback listener when enabled, and the disclosure is metadata/names rather than object data, credentials, integrity modification, or availability loss.
+## Likelihood
+low - Exploitation is simple once reachable and requires no application credentials, but it requires a non-default debug flag and local loopback access. Config rejects non-loopback listeners for this mode, and no public deployment manifests were found.
+## Impact
+medium - The endpoint can reveal private bucket existence, lifecycle state, generation counters, drain metadata, and potentially another bucket name from a pending metadata command. It does not expose object payloads, access keys, signing secrets, write/delete capability, or code execution.
+## Assumptions
+- The attacker is an unprivileged local process or user able to connect to the loopback listener on the host where argmin-s3 is running.
+- Operators have explicitly enabled ARGMIN_LOCAL_DEBUG_ENDPOINT; repository defaults leave it disabled.
+- The static checkout does not include production deployment manifests, so exposure is assessed from application configuration code and README defaults.
+- ARGMIN_LOCAL_DEBUG_ENDPOINT=true
+- frontend process role
+- ARGMIN_LISTEN_ADDR is loopback, as enforced by config
+- attacker can reach the local loopback listener
+- attacker can supply or guess a bucket name in the debug URL
+## Path
+Local process --GET no auth--> 127.0.0.1:9000 --pre-auth debug route--> bucket_delete_debug_snapshot --> bucket_row/state/generations/target_bucket disclosed
+## Path evidence
+- `crates/server-http/src/http/serve.rs:691-699` - local_debug_response is checked and returned before the normal S3 request/admission/authentication path.
+- `crates/server-http/src/http/serve.rs:1041-1068` - The unauthenticated debug route accepts an arbitrary URL bucket name and calls bucket_delete_debug_snapshot, returning its formatted body.
+- `crates/storage/src/cluster/request_ops.rs:11655-11714` - bucket_delete_debug_snapshot reads raw bucket-row existence/state/generation data, durable write-drain metadata, pending metadata command data, and delete-attempt outcome.
+- `crates/storage/src/cluster.rs:4085-4097` - pending_metadata_command_for_bucket ignores the bucket parameter and returns the pending command envelope for the placement group, enabling unrelated target_bucket disclosure conditions.
+- `crates/server-http/src/http/serve.rs:1160-1235` - The local debug response formats bucket_row present/absent, state, generation counters, durable drain metadata, pending_metadata_command target_bucket, and delete-attempt outcome into plaintext HTTP.
+- `crates/server-http/src/http/serve.rs:198-205` - ServeConfig default sets local_debug_endpoint to false, limiting default exposure.
+- `crates/argmin-s3/src/config.rs:322-325` - ARGMIN_LOCAL_DEBUG_ENDPOINT defaults to false unless explicitly enabled.
+- `crates/argmin-s3/src/config.rs:444-459` - When local debug is enabled, binary configuration requires a frontend role and a loopback listen address.
+- `crates/argmin-s3/src/main.rs:1996-2051` - The production binary binds ARGMIN_LISTEN_ADDR and passes local_debug_endpoint into the HTTP serve configuration.
+- `crates/server-http/src/http/mod.rs:3095-3130` - Normal S3 request handling authenticates via authenticate_request, showing the debug branch bypasses the standard auth flow.
+## Narrative
+The finding is valid. In the runtime HTTP server, local debug handling executes before normal S3 authentication. When ARGMIN_LOCAL_DEBUG_ENDPOINT is enabled, an unauthenticated GET to /__argmin/debug/bucket-delete-attempt/<bucket> accepts an attacker-controlled bucket name and returns a snapshot containing bucket row presence/state/generation counters, durable write-drain data, delete-attempt data, and pending metadata command target_bucket. Validation evidence included an in-process HTTP PoC with no Authorization header that distinguished an existing private bucket from a missing bucket. The exposure is materially limited because the endpoint is disabled by default and config enforces loopback-only listeners when it is enabled, so this is local information disclosure rather than remote object-data or credential compromise.
+## Controls
+- ARGMIN_LOCAL_DEBUG_ENDPOINT feature flag is disabled by default
+- Configuration enforces loopback ARGMIN_LISTEN_ADDR when local debug is enabled
+- Normal S3 API uses SigV4 authentication, but this debug route is handled before that path
+- No repository deployment manifests prove public ingress or load balancer exposure
+- Connection/request timeout and concurrency controls exist for the service, but they do not authenticate the debug response
+## Blindspots
+- Static repository review found no Kubernetes, Docker, reverse-proxy, or load-balancer manifests to confirm real-world exposure.
+- Actual operator use of ARGMIN_LOCAL_DEBUG_ENDPOINT in production cannot be determined from the checkout.
+- Static analysis cannot enumerate all data that may appear in attempt_outcome detail strings at runtime beyond the code paths inspected and validation evidence.
+- Validation PoC was referenced from the prior stage rather than re-executed during this static attack-path pass.

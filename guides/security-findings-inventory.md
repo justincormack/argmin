@@ -68,6 +68,17 @@ for the current local security suite.
 | `security/codex-90f9972` Tracing logs presigned URL queries and credentials | fixed | `./scripts/security-tests redaction` | Covered by redaction regressions for auth and observability surfaces. |
 | `security/codex-a413960` SQLite error details now leak in S3 error responses | fixed | `./scripts/security-tests redaction` | Covered by server-http sanitization regressions. |
 
+## Local Debug Endpoints
+
+| Finding | Status | Local deterministic path | Notes |
+| --- | --- | --- | --- |
+| `security/codex-93c65d7` Unauthenticated local debug endpoints bypass S3 auth | fixed in `45497afe`, `73a36bcd` | `cargo check -p argmin-s3 --features local-debug-endpoints`; `cargo build -p argmin-s3 --release --features local-debug-endpoints` must fail | Local debug routes are compiled only for tests or the explicit feature; production default binaries reject `ARGMIN_LOCAL_DEBUG_ENDPOINT=1`, and release builds cannot include the feature. |
+| `security/codex-824c430` Debug checkpoint endpoint bypasses admission controls | fixed in `45497afe`, `73a36bcd` | `cargo check -p argmin-s3 --features local-debug-endpoints`; `cargo build -p argmin-s3 --release --features local-debug-endpoints` must fail | Mutating debug checkpoint route remains a debug/test diagnostic hook only; it is unavailable in production/release artifacts. |
+| `security/codex-85df181` Unauthenticated local debug leaks bucket metadata | fixed in `45497afe`, `73a36bcd` | `cargo check -p argmin-s3 --features local-debug-endpoints`; `cargo build -p argmin-s3 --release --features local-debug-endpoints` must fail | Bucket-delete debug snapshot output remains available only in explicit debug/test builds and cannot be enabled in production default or release builds. |
+| `security/codex-680cc00` Debug endpoint leaks private object metadata | fixed in `45497afe`, `73a36bcd` | `cargo check -p argmin-s3 --features local-debug-endpoints`; `cargo build -p argmin-s3 --release --features local-debug-endpoints` must fail | Object-version debug samples remain available only in explicit debug/test builds and cannot be enabled in production default or release builds. |
+| `security/codex-91a5cfe` Local debug endpoint leaks object keys | fixed in `45497afe`, `73a36bcd` | `cargo check -p argmin-s3 --features local-debug-endpoints`; `cargo build -p argmin-s3 --release --features local-debug-endpoints` must fail | Payload-reclaim-root key output remains available only in explicit debug/test builds and cannot be enabled in production default or release builds. |
+| `security/codex-7e9d95d` Loopback debug endpoint leaks cross-bucket reclaim metadata | fixed in `45497afe`, `73a36bcd` | `cargo check -p argmin-s3 --features local-debug-endpoints`; `cargo build -p argmin-s3 --release --features local-debug-endpoints` must fail | Reclaim-claim debug output remains available only in explicit debug/test builds and cannot be enabled in production default or release builds. |
+
 ## Local Tooling
 
 | Finding | Status | Local deterministic path | Notes |

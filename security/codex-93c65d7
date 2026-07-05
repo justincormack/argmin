@@ -1,0 +1,164 @@
+Unauthenticated local debug endpoints bypass S3 auth
+Link: https://chatgpt.com/codex/cloud/security/findings/931395534bf08191aec9cf5bf3a4d1c2?sev=&repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin&sort=date_desc
+Criticality: medium (attack path: medium)
+Status: fixed
+
+# Metadata
+Repo: justincormack/argmin
+Commit: 93c65d7
+Author: justin@specialbusservice.com
+Created: 08/06/2026, 20:14:51
+Assignee: Unassigned
+Signals: Security, Validated, Attack-path
+
+# Summary
+Introduced: the commit creates unauthenticated diagnostics endpoints and relies only on a loopback bind-address configuration check rather than per-request admin authentication or a separate protected diagnostics listener.
+The new local debug handling is executed at the start of request handling, before the normal request semaphore, S3 request parsing, routing, and SigV4 authentication. The only production guard is startup validation that ARGMIN_LISTEN_ADDR parses as a loopback SocketAddr when ARGMIN_LOCAL_DEBUG_ENDPOINT is enabled. That does not provide admin authentication and does not prove that the effective HTTP client is local/admin in deployments where a reverse proxy forwards public traffic to a loopback backend, or where an untrusted local process can connect to loopback. The GET metrics endpoint leaks internal service health and error counters, and the POST flight-recorder endpoint lets an unauthenticated caller force bounded but potentially repeated stderr dumps. The HTTP response does not directly return object data, credentials, request headers, or flight-recorder contents, and the feature is disabled by default, so impact is limited.
+
+# Resolution
+Fixed for production/release builds by the local-debug endpoint hardening commits:
+
+- `45497afe` gates local debug route dispatch and helper code behind `cfg(any(test, feature = "local-debug-endpoints"))`, and rejects `ARGMIN_LOCAL_DEBUG_ENDPOINT=1` at startup unless the binary was compiled with that non-production support.
+- `73a36bcd` makes `local-debug-endpoints` a debug/test-only feature by adding a release-build `compile_error!`, and updates UAT smoke handling so debug-hook smokes cannot be run against release or externally supplied binaries.
+
+The metrics and flight-recorder debug endpoints remain unauthenticated in explicit debug/test builds where they are used by diagnostics and UAT smoke tests, but release artifacts cannot include or enable these routes. Production default builds reject the environment variable before startup.
+
+# Validation
+## Rubric
+- [x] Confirm enabling guard is only frontend-role plus loopback listen address, with no admin credential or per-request auth requirement.
+- [x] Confirm argmin-s3 propagates ARGMIN_LOCAL_DEBUG_ENDPOINT into server-http ServeConfig.
+- [x] Confirm request handler checks local_debug_endpoint and returns debug responses before semaphore admission, S3 parsing, routing, and authentication.
+- [x] Confirm unauthenticated GET metrics and POST flight-recorder dump are reachable when enabled, while a normal unauthenticated S3 request is denied.
+- [x] Confirm feature is disabled by default and non-loopback listeners are rejected, limiting but not eliminating exposure.
+## Report
+Validated the finding. I built and exercised the checked-out commit 93c65d758807d51e1149d69d507402c090299157. Code review confirmed that the production enablement guard only checks frontend role and that ARGMIN_LISTEN_ADDR parses to a loopback SocketAddr: crates/argmin-s3/src/config.rs:308-324. argmin-s3 then passes config.local_debug_endpoint directly into server-http: crates/argmin-s3/src/main.rs:393-398. In request handling, the local debug check occurs at crates/server-http/src/http/serve.rs:663-672 and returns immediately with no request permit; the normal request-admission and S3 parsing path starts afterward at serve.rs:676 onward, and normal S3 authentication is later in HttpFrontend::handle_s3_request at crates/server-http/src/http/mod.rs:872-880. The debug endpoint implementation returns metrics for GET /__argmin/debug/metrics and triggers observability::dump_flight_recorder_to_stderr for POST /__argmin/debug/flight-recorder/dump at crates/server-http/src/http/serve.rs:909-935; metric names are formatted at serve.rs:957-983. Dynamic reproduction against the actual argmin-s3 binary: with ARGMIN_LOCAL_DEBUG_ENDPOINT=true and ARGMIN_LISTEN_ADDR=127.0.0.1:19080, an HTTP request with no Authorization header returned HTTP/1.1 200 OK and metrics including inflight_requests, request_error_total, storage_rpc_error_total, metadata_command_conflict_total. An unauthenticated POST to /__argmin/debug/flight-recorder/dump returned HTTP/1.1 204 No Content and server stderr contained == argmin flight recorder dump reason="local-debug-endpoint" records=1 ==. For contrast, an unauthenticated normal S3 GET / returned HTTP/1.1 403 Forbidden AccessDenied. Startup guard behavior was also confirmed: ARGMIN_LOCAL_DEBUG_ENDPOINT=true with ARGMIN_LISTEN_ADDR=0.0.0.0:19081 exited with rc=1 and configuration error: ARGMIN_LOCAL_DEBUG_ENDPOINT requires ARGMIN_LISTEN_ADDR to be loopback. Targeted tests also passed: cargo test -p server-http local_debug -- --nocapture showed 3 passed, including local_debug_metrics_endpoint_bypasses_request_admission and the POST-only dump test; cargo test -p argmin-s3 local_debug_endpoint -- --nocapture showed 4 passed for default-disabled, loopback-accepted, non-loopback-rejected, and storage-node-only-rejected cases. I attempted crash/memory tooling as required: the debug build and PoC did not crash, which is expected for this authorization/diagnostics exposure; valgrind was unavailable in the container (rc=127, command not found); Rust ASan required nightly (-Z sanitizer=address rejected by stable rustc). I used lldb non-interactively and set a breakpoint on local_debug_response; the debugger stopped at crates/server-http/src/http/serve.rs:910 with backtrace frame #1 at handle serve.rs:664, proving the debug request enters the bypass branch before the later normal path. This validates the suspected issue: when the feature is enabled, any client that can reach the loopback listener, including an untrusted local process or traffic forwarded by a reverse proxy, can access diagnostics without S3 credentials or separate admin authentication. Impact matches the finding: the HTTP response leaks internal counters and POST causes bounded stderr flight-recorder dumping, but it does not directly return object contents, credentials, headers, or recorder contents.
+
+# Evidence
+crates/argmin-s3/src/config.rs (L308 to 324)
+  Note: The only production guard for enabling the feature is a startup check that the configured listen address is loopback; no admin credential or per-request authorization is required.
+```
+        if local_debug_endpoint {
+            if !process_role.has_frontend() {
+                return Err(
+                    "ARGMIN_LOCAL_DEBUG_ENDPOINT requires a frontend process role".to_string(),
+                );
+            }
+            let listen_socket_addr: SocketAddr = listen_addr.parse().map_err(|e| {
+                format!(
+                    "ARGMIN_LOCAL_DEBUG_ENDPOINT requires ARGMIN_LISTEN_ADDR to be a loopback socket address: {e}"
+                )
+            })?;
+            if !listen_socket_addr.ip().is_loopback() {
+                return Err(
+                    "ARGMIN_LOCAL_DEBUG_ENDPOINT requires ARGMIN_LISTEN_ADDR to be loopback"
+                        .to_string(),
+                );
+            }
+```
+
+crates/argmin-s3/src/main.rs (L393 to 398)
+  Note: The argmin-s3 binary passes the local_debug_endpoint flag directly into the HTTP server configuration.
+```
+    let serve_config = server_http::http::serve::ServeConfig {
+        stream_read_chunk_size: config.stream_read_chunk_size,
+        panic_on_500: config.panic_on_500,
+        abort_on_500: config.abort_on_500,
+        local_debug_endpoint: config.local_debug_endpoint,
+        ..server_http::http::serve::ServeConfig::default()
+```
+
+crates/server-http/src/http/serve.rs (L663 to 672)
+  Note: Debug requests are handled before normal request admission, S3 parsing, routing, and SigV4 authentication, and the response is returned without an in-flight request permit.
+```
+    if state.config.local_debug_endpoint {
+        if let Some(resp) = local_debug_response(req.method(), req.uri().path()) {
+            return Ok(s3_response_to_hyper(
+                resp,
+                None,
+                state.config.stream_read_chunk_size,
+                state.config.panic_on_500,
+                state.config.abort_on_500,
+                response_trace,
+            ));
+```
+
+crates/server-http/src/http/serve.rs (L909 to 935)
+  Note: The unauthenticated debug endpoints expose metrics over GET and allow POST callers to trigger a flight-recorder dump to stderr.
+```
+fn local_debug_response(method: &http::Method, path: &str) -> Option<S3Response> {
+    match (method, path) {
+        (&http::Method::GET, "/__argmin/debug/metrics") => {
+            let body = local_debug_metrics_body();
+            Some(S3Response {
+                status_code: 200,
+                headers: vec![
+                    (
+                        "Content-Type".to_string(),
+                        "text/plain; charset=utf-8".to_string(),
+                    ),
+                    ("Content-Length".to_string(), body.len().to_string()),
+                ],
+                body: body.into_bytes(),
+                stream: None,
+                error_diagnostic: None,
+            })
+        }
+        (&http::Method::POST, "/__argmin/debug/flight-recorder/dump") => {
+            observability::dump_flight_recorder_to_stderr("local-debug-endpoint");
+            Some(S3Response {
+                status_code: 204,
+                headers: Vec::new(),
+                body: Vec::new(),
+                stream: None,
+                error_diagnostic: None,
+            })
+```
+
+# Attack-path analysis
+Final: medium | Decider: model_decided | Matrix severity: low | Policy adjusted: low
+## Rationale
+Severity is kept at medium. The issue is a real, reachable production-runtime auth bypass for diagnostics in argmin-s3: config.rs only gates enablement by frontend role and loopback bind address, main.rs propagates the flag, and serve.rs returns debug responses before normal SigV4 authentication. The attack path is meaningful for local attackers or proxy-forwarded deployments and the provided validation PoC exercised the normal binary with unauthenticated 200/204 responses. It does not justify high or critical because the feature is disabled by default, direct exposure is constrained to loopback by startup validation, repository artifacts do not prove an internet-facing ingress, and the demonstrated impact is limited to operational metrics disclosure and bounded stderr dump triggering rather than object data, credential exposure, privileged state change, RCE, or durable data loss.
+## Likelihood
+medium - Exploitation is trivial once reachable because no credentials or authorization headers are required, and validation evidence demonstrated unauthenticated GET/POST behavior. However, exploitation requires the non-default debug flag and loopback reachability or a deployment proxy forwarding to the loopback listener, and no repo manifest proves broad public exposure.
+## Impact
+medium - Impact is limited but security-relevant: unauthenticated callers can read service health/error counters and can force repeated flight-recorder dumps to stderr, potentially increasing log volume or operational noise. The endpoints do not directly disclose object data, S3 credentials, request headers, or the flight-recorder contents over HTTP, and do not allow object modification.
+## Assumptions
+- The attacker cannot change process environment variables, but can send HTTP requests to any listener or reverse-proxy path exposed by the operator.
+- ARGMIN_LOCAL_DEBUG_ENDPOINT is disabled by default; exploitation requires an operator to enable it.
+- No repository IaC, Kubernetes manifests, load balancer definitions, or compose files were present to prove internet exposure.
+- The loopback guard prevents direct non-loopback binding when the feature is enabled, but it does not authenticate the effective HTTP client and cannot prevent reverse proxies or untrusted local processes from reaching the loopback listener.
+- ARGMIN_LOCAL_DEBUG_ENDPOINT set to a truthy value
+- argmin-s3 running in a frontend-capable process role
+- ARGMIN_LISTEN_ADDR parses to a loopback SocketAddr
+- attacker can connect to the loopback listener directly, or through a proxy that forwards requests to it
+## Path
+Attacker
+  -> argmin-s3 listener/proxy
+  -> local_debug_endpoint enabled
+  -> early local_debug_response branch
+  -> GET metrics counters OR POST stderr flight-recorder dump
+  -> SigV4/authz path not reached
+## Path evidence
+- `crates/argmin-s3/src/config.rs:93-110` - Configuration comments show ARGMIN_LISTEN_ADDR defaults to 127.0.0.1:9000 and ARGMIN_LOCAL_DEBUG_ENDPOINT defaults to false.
+- `crates/argmin-s3/src/config.rs:232-235` - ARGMIN_LOCAL_DEBUG_ENDPOINT is parsed from the environment and defaults to false when unset.
+- `crates/argmin-s3/src/config.rs:308-324` - The only production enablement guard requires a frontend-capable role and a loopback listen address; it does not require an admin token or per-request authorization.
+- `crates/argmin-s3/src/main.rs:355-358` - argmin-s3 binds its TCP listener to the configured ARGMIN_LISTEN_ADDR.
+- `crates/argmin-s3/src/main.rs:393-398` - argmin-s3 passes config.local_debug_endpoint directly into server-http ServeConfig.
+- `crates/server-http/src/http/serve.rs:663-672` - The request handler returns a debug response before the request semaphore, S3 parsing/routing, and normal authentication flow.
+- `crates/server-http/src/http/serve.rs:909-935` - The unauthenticated debug endpoint implementation returns metrics over GET and invokes dump_flight_recorder_to_stderr over POST.
+- `crates/server-http/src/http/serve.rs:957-983` - The metrics response includes internal operational counters such as inflight requests, request errors, storage RPC errors, and metadata conflicts.
+- `crates/server-http/src/http/mod.rs:872-880` - Normal S3 authentication occurs later in HttpFrontend::authenticate, after request parsing/operation routing; the debug branch does not reach this path.
+## Narrative
+The finding is real and in scope. ARGMIN_LOCAL_DEBUG_ENDPOINT is an environment-controlled production option that defaults to false and is only startup-guarded by frontend role plus loopback ARGMIN_LISTEN_ADDR. argmin-s3 passes the flag into server-http. server-http then checks local_debug_endpoint at the start of request handling and returns matching debug responses before request admission and before the later S3 authentication path. The debug implementation returns plaintext metrics for GET /__argmin/debug/metrics and triggers observability::dump_flight_recorder_to_stderr for POST /__argmin/debug/flight-recorder/dump. This is an authentication bypass for diagnostics, not for object data: the HTTP response exposes operational counters and can cause bounded stderr dump work/log output, but does not directly return stored objects, credentials, headers, or recorder contents. Because the feature is disabled by default and direct binding is restricted to loopback, there is no repository evidence of default public internet exposure; however, exploitation is straightforward for any local process or deployment path that forwards traffic to the loopback backend.
+## Controls
+- ARGMIN_LOCAL_DEBUG_ENDPOINT defaults to false
+- Startup validation rejects non-loopback ARGMIN_LISTEN_ADDR when local debug endpoint is enabled
+- Startup validation requires a frontend-capable process role
+- Normal S3 operations use SigV4 authentication, but debug paths bypass it
+- Debug branch is before max_inflight_requests admission; general connection limits may still apply
+- No repository IaC or ingress artifacts prove public exposure
+## Blindspots
+- Static repository review found no Docker, Kubernetes, Terraform, compose, ingress, or load balancer artifacts, so real deployment exposure could not be proven.
+- No cloud APIs were called; cloud IAM, firewall, and reverse-proxy configuration are unknown.
+- The practical availability impact of repeated flight-recorder dumps depends on production logging configuration, stderr collection, log rotation, and host resource limits not present in the repository.
+- Whether untrusted local users/processes are in scope depends on deployment assumptions; the repository threat model primarily trusts the host OS but also recognizes local/internal deployments.

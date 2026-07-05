@@ -1,0 +1,237 @@
+Local debug endpoint leaks object keys
+Link: https://chatgpt.com/codex/cloud/security/findings/c6f77f56bd54819185815cde13199bcc?sev=&repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin&sort=date_desc
+Criticality: low (attack path: low)
+Status: fixed
+
+# Metadata
+Repo: justincormack/argmin
+Commit: 91a5cfe
+Author: justin@specialbusservice.com
+Created: 01/07/2026, 14:26:46
+Assignee: Unassigned
+Signals: Security, Validated, Attack-path
+
+# Summary
+Introduced: the new debug snapshot fields collect payload reclaim root object keys and the debug body prints those keys over the unauthenticated local debug endpoint.
+When ARGMIN_LOCAL_DEBUG_ENDPOINT is enabled, requests to /__argmin/debug/bucket-delete-attempt/<bucket> are handled before normal S3 authentication. This commit adds payload reclaim roots to that response and formats root.key directly into the HTTP body. Object keys can be sensitive metadata, and the existing ServeConfig documentation explicitly says these local debug endpoints do not return keys. The binary configuration limits this endpoint to loopback listeners and it is disabled by default, so the practical exposure is limited to deployments that intentionally enable the local debug endpoint and to local users/processes or any proxy that exposes the loopback service. Still, this is a security regression because an unauthenticated caller can learn private object key names for reclaim-blocked objects in a bucket.
+
+# Resolution
+Fixed for production/release builds by the local-debug endpoint hardening commits:
+
+- `45497afe` gates local debug route dispatch and helper code behind `cfg(any(test, feature = "local-debug-endpoints"))`, and rejects `ARGMIN_LOCAL_DEBUG_ENDPOINT=1` at startup unless the binary was compiled with that non-production support.
+- `73a36bcd` makes `local-debug-endpoints` a debug/test-only feature by adding a release-build `compile_error!`, and updates UAT smoke handling so debug-hook smokes cannot be run against release or externally supplied binaries.
+
+The payload-reclaim-root debug output remains available in explicit debug/test builds for diagnostics, but release artifacts cannot include or enable the unauthenticated debug route. Production default builds reject the environment variable before startup.
+
+# Validation
+## Rubric
+- [x] Confirm the local debug endpoint documentation/configuration promises no keys and is disabled/loopback-limited by default.
+- [x] Confirm local debug handling occurs before normal S3 request handling/authentication when enabled.
+- [x] Confirm the bucket-delete-attempt route returns a debug snapshot body for a bucket path.
+- [x] Confirm the commit added payload reclaim root collection that copies `root.key` into the debug snapshot.
+- [x] Confirm the HTTP debug body formatter prints the copied key, with dynamic test/debugger evidence.
+## Report
+Validated the finding against commit 91a5cfe77605f0562415397e0e09392f54f0ab84. This is an information disclosure, so a crash is not expected; I still built the Rust test binary with debuginfo and ran targeted tests. Direct dynamic check: `RUSTFLAGS='-C debuginfo=2' cargo test -p server-http local_debug_bucket_delete_attempt_body_formats_populated_record -- --nocapture` passed. The test constructs a `BucketDeleteDebugSnapshot` with `key: ObjectKey::try_from("root-key\none")` at crates/server-http/src/http/serve.rs:5183-5186, calls `local_debug_bucket_delete_attempt_body` at serve.rs:5205, and asserts the returned body contains `payload_reclaim_root index=0 object_pg_id=4 key="root-key\none" generation_id=99` at serve.rs:5236-5241. Debugger validation: lldb breakpoint hit `server_http::http::serve::local_debug_bucket_delete_attempt_body` at serve.rs:1160 with a backtrace from `local_debug_bucket_delete_attempt_body_formats_populated_record` at serve.rs:5205. Endpoint/auth path: `handle` returns `local_debug_response` before normal request handling when `local_debug_endpoint` is enabled at serve.rs:691-700. The bucket-delete debug route is `GET /__argmin/debug/bucket-delete-attempt/<bucket>` and returns `local_debug_bucket_delete_attempt_body(&snapshot)` at serve.rs:1041-1067. The debug formatter emits `root.key.as_str()` directly in the HTTP body at serve.rs:1240-1255. Storage population copies `root.key` from `get_bucket_payload_reclaim_root` into `BucketDeleteDebugPayloadReclaimRoot` at crates/storage/src/cluster/request_ops.rs:11781-11810, and the type explicitly contains `pub key: ObjectKey` at crates/storage/src/types.rs:2532-2537. A second targeted test, `local_debug_metadata_checkpoint_record_endpoint_bypasses_request_admission`, passed and demonstrates enabled local debug endpoints accept a raw HTTP request without S3 auth headers, expecting HTTP 200 at serve.rs:5273-5298. The documentation says these endpoints do not return keys at serve.rs:186-192, so the new payload reclaim root output violates that contract. Scope is limited: argmin-s3 requires the endpoint be enabled and bound to loopback at crates/argmin-s3/src/config.rs:444-460. Valgrind was attempted but unavailable (`valgrind: command not found`); rust-gdb was unavailable because `gdb` is not installed, but lldb worked.
+
+# Evidence
+crates/argmin-s3/src/config.rs (L444 to 460)
+  Note: The main binary mitigates exposure by requiring the debug endpoint to be bound to a loopback address when enabled, limiting but not eliminating the unauthenticated local disclosure.
+```
+        if local_debug_endpoint {
+            if !process_role.has_frontend() {
+                return Err(
+                    "ARGMIN_LOCAL_DEBUG_ENDPOINT requires a frontend process role".to_string(),
+                );
+            }
+            let listen_socket_addr: SocketAddr = listen_addr.parse().map_err(|e| {
+                format!(
+                    "ARGMIN_LOCAL_DEBUG_ENDPOINT requires ARGMIN_LISTEN_ADDR to be a loopback socket address: {e}"
+                )
+            })?;
+            if !listen_socket_addr.ip().is_loopback() {
+                return Err(
+                    "ARGMIN_LOCAL_DEBUG_ENDPOINT requires ARGMIN_LISTEN_ADDR to be loopback"
+                        .to_string(),
+                );
+            }
+```
+
+crates/server-http/src/http/serve.rs (L1041 to 1068)
+  Note: The bucket-delete-attempt debug endpoint accepts a bucket name and returns the debug snapshot body without authentication.
+```
+        (&http::Method::GET, path)
+            if path.starts_with("/__argmin/debug/bucket-delete-attempt/") =>
+        {
+            let raw_bucket = path.trim_start_matches("/__argmin/debug/bucket-delete-attempt/");
+            let bucket = match percent_decode_strict(raw_bucket)
+                .ok()
+                .and_then(|bucket| BucketName::try_from(bucket).ok())
+            {
+                Some(bucket) => bucket,
+                None => {
+                    return Some(local_debug_text_response(
+                        400,
+                        "invalid bucket\n".to_string(),
+                    ));
+                }
+            };
+            let storage = state
+                .pool
+                .first()
+                .expect("server has at least one frontend")
+                .coordinator
+                .storage_node_for_request();
+            match storage.bucket_delete_debug_snapshot(&bucket) {
+                Ok(snapshot) => Some(local_debug_text_response(
+                    200,
+                    local_debug_bucket_delete_attempt_body(&snapshot),
+                )),
+                Err(error) => Some(local_debug_text_response(409, format!("{error:?}\n"))),
+```
+
+crates/server-http/src/http/serve.rs (L1240 to 1255)
+  Note: The response body now prints each payload reclaim root's object key, disclosing object key metadata to debug endpoint callers.
+```
+    writeln!(
+        &mut body,
+        "payload_reclaim_roots_count={}",
+        snapshot.payload_reclaim_roots.len()
+    )
+    .expect("write to String");
+    for (index, root) in snapshot.payload_reclaim_roots.iter().enumerate() {
+        writeln!(
+            &mut body,
+            "payload_reclaim_root index={} object_pg_id={} key={:?} generation_id={}",
+            index,
+            root.object_pg_id,
+            root.key.as_str(),
+            root.generation_id.get(),
+        )
+        .expect("write to String");
+```
+
+crates/server-http/src/http/serve.rs (L186 to 192)
+  Note: The local debug endpoint is documented as operator-only and specifically says it does not return keys, which the commit now violates.
+```
+    /// Enable local operator-only diagnostics endpoints.
+    ///
+    /// The binary config only permits this on loopback listeners. The endpoints
+    /// expose bounded counters and an explicit flight-recorder stderr dump
+    /// trigger; they do not return request headers, payload bytes, keys, or
+    /// recorder details over HTTP.
+    pub local_debug_endpoint: bool,
+```
+
+crates/server-http/src/http/serve.rs (L691 to 700)
+  Note: Local debug responses are returned before the normal authenticated S3 request handling path, so debug callers do not need S3 credentials.
+```
+    if state.config.local_debug_endpoint {
+        if let Some(resp) = local_debug_response(&state, req.method(), req.uri().path()) {
+            return Ok(s3_response_to_hyper(
+                resp,
+                None,
+                state.config.stream_read_chunk_size,
+                state.config.panic_on_500,
+                state.config.abort_on_500,
+                response_trace,
+            ));
+```
+
+crates/storage/src/cluster/request_ops.rs (L11764 to 11810)
+  Note: The new snapshot population scans payload reclaim roots and copies root.key into the debug snapshot.
+```
+        let mut payload_reclaim_roots = Vec::new();
+        let mut payload_reclaim_root_errors = Vec::new();
+        for raw_pg_id in self.metadata_pg_ids() {
+            let object_pg_id = PgId::new(raw_pg_id);
+            let node = match self
+                .local_map
+                .metadata_pg_primary_node(self.operation_epoch(), object_pg_id)
+            {
+                Ok(node) => node,
+                Err(error) => {
+                    payload_reclaim_root_errors.push(BucketDeleteDebugPayloadReclaimRootError {
+                        object_pg_id: raw_pg_id,
+                        detail: error.to_string(),
+                    });
+                    continue;
+                }
+            };
+            let root = match node
+                .object_mutation_metadata_client()
+                .get_bucket_payload_reclaim_root(object_pg_id, bucket)
+            {
+                Ok(Some(root)) => root,
+                Ok(None) => continue,
+                Err(error) => {
+                    payload_reclaim_root_errors.push(BucketDeleteDebugPayloadReclaimRootError {
+                        object_pg_id: raw_pg_id,
+                        detail: error.to_string(),
+                    });
+                    continue;
+                }
+            };
+            if let Err(error) = self.validate_bucket_payload_reclaim_root_for_pg(
+                object_pg_id,
+                &root,
+                node.node_id(),
+            ) {
+                payload_reclaim_root_errors.push(BucketDeleteDebugPayloadReclaimRootError {
+                    object_pg_id: raw_pg_id,
+                    detail: error.to_string(),
+                });
+                continue;
+            }
+            payload_reclaim_roots.push(BucketDeleteDebugPayloadReclaimRoot {
+                object_pg_id: raw_pg_id,
+                key: root.key,
+                generation_id: root.generation_id,
+            });
+```
+
+# Attack-path analysis
+Final: low | Decider: model_decided | Matrix severity: ignore | Policy adjusted: ignore
+## Rationale
+Kept at low. The finding is valid and in the main runtime: unauthenticated local debug handling precedes normal S3 authentication, and the debug body now prints ObjectKey values. However, probability and blast radius are limited by explicit controls: ARGMIN_LOCAL_DEBUG_ENDPOINT defaults false, argmin-s3 requires a frontend role, and config rejects non-loopback listen addresses for this mode. The impact is limited information disclosure of object key names for specific reclaim-blocked objects, with no object payload, credential, identity, or integrity compromise shown.
+## Likelihood
+low - Exploitation is straightforward once reachable, but the endpoint is disabled by default and the main binary enforces loopback-only binding when it is enabled. A remote attacker would need an additional proxy or deployment mistake.
+## Impact
+low - The disclosed data is object key metadata for payload reclaim roots, not object contents, secret keys, authentication tokens, or write/delete capability. Object keys can still be sensitive because they may encode user IDs, paths, names, or business metadata.
+## Assumptions
+- The main production artifact is the argmin-s3 binary from crates/argmin-s3.
+- A realistic attacker for this issue is an unprivileged local user/process on the same host, or a remote user only if an operator or proxy exposes the loopback-bound service.
+- Object keys may contain sensitive business or user metadata even when object payloads are not disclosed.
+- No repository IaC or deployment manifest was found that publicly exposes this debug endpoint.
+- ARGMIN_LOCAL_DEBUG_ENDPOINT enabled
+- argmin-s3 process role includes a frontend
+- listener is reachable on loopback or exposed by a local proxy/misconfiguration
+- bucket has payload reclaim roots that include object keys
+## Path
+Local caller -> loopback argmin-s3 -> pre-auth /__argmin/debug/bucket-delete-attempt/<bucket> -> storage snapshot -> object key names in response
+## Path evidence
+- `crates/argmin-s3/Cargo.toml:6-8` - Declares argmin-s3 as a production binary, placing the affected config and HTTP server path in product runtime scope.
+- `crates/server-http/src/http/serve.rs:186-192` - Documentation says local debug endpoints are operator-only and do not return keys.
+- `crates/server-http/src/http/serve.rs:691-700` - When local_debug_endpoint is enabled, local_debug_response is returned before the normal S3 request handling/authentication path.
+- `crates/server-http/src/http/serve.rs:1041-1068` - Defines GET /__argmin/debug/bucket-delete-attempt/<bucket>, parses an attacker-controlled bucket path component, and returns local_debug_bucket_delete_attempt_body.
+- `crates/storage/src/cluster/request_ops.rs:11781-11810` - Retrieves bucket payload reclaim roots and copies root.key into the debug snapshot data structure.
+- `crates/storage/src/types.rs:2532-2537` - The debug snapshot type explicitly contains pub key: ObjectKey.
+- `crates/server-http/src/http/serve.rs:1240-1255` - The formatter emits root.key.as_str() into the plaintext HTTP response body.
+- `crates/argmin-s3/src/config.rs:126-151` - Configuration documentation shows the default listen address is 127.0.0.1:9000 and ARGMIN_LOCAL_DEBUG_ENDPOINT defaults false.
+- `crates/argmin-s3/src/config.rs:322-324` - Config parsing defaults local_debug_endpoint to false unless ARGMIN_LOCAL_DEBUG_ENDPOINT is set.
+- `crates/argmin-s3/src/config.rs:444-460` - Mitigation: when local debug is enabled, config requires a frontend process role and rejects non-loopback ARGMIN_LISTEN_ADDR.
+- `crates/argmin-s3/src/main.rs:1996-2052` - The binary binds the configured TCP listener and passes config.local_debug_endpoint into server-http ServeConfig.
+- `crates/server-http/src/http/serve.rs:5142-5241` - Existing test constructs a snapshot with an ObjectKey and asserts the formatted body contains the key value.
+- `crates/server-http/src/http/serve.rs:5274-5298` - Existing test demonstrates an enabled local debug endpoint accepts a raw HTTP request without S3 auth headers.
+## Narrative
+This is a real but low-severity security regression. The main argmin-s3 binary passes local_debug_endpoint into server-http, and the handler returns local debug responses before the normal S3 authentication path. The bucket-delete-attempt debug route accepts a bucket name and returns a text snapshot. The new storage snapshot population copies root.key into BucketDeleteDebugPayloadReclaimRoot, and the formatter writes root.key.as_str() directly into the HTTP body. That contradicts the ServeConfig documentation saying local debug endpoints do not return keys. Reachability is constrained: ARGMIN_LOCAL_DEBUG_ENDPOINT defaults false, the binary requires a frontend role, and config rejects non-loopback listen addresses when the debug endpoint is enabled. Therefore the practical attacker is local or someone who can reach a mistakenly proxied loopback service, and the impact is disclosure of object key metadata rather than object payloads or credentials.
+## Controls
+- flag: ARGMIN_LOCAL_DEBUG_ENDPOINT defaults to false
+- network: argmin-s3 rejects non-loopback listen addresses when local debug is enabled
+- role check: local debug requires a frontend process role
+- authn gap: local debug responses are evaluated before normal S3 SigV4 authentication
+- deployment: no repository IaC ingress, load balancer, or Kubernetes manifest exposing this endpoint was found
+## Blindspots
+- Static repository review cannot confirm how real deployments set ARGMIN_LOCAL_DEBUG_ENDPOINT.
+- No deployment manifests were present to prove whether operators proxy loopback debug paths externally.
+- The exact sensitivity of object key names is application-dependent.
+- The validation evidence demonstrates formatter leakage and unauthenticated debug reachability, but not a full live bucket-delete-attempt end-to-end deployment with real reclaim roots.

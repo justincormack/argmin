@@ -1,0 +1,210 @@
+Loopback debug endpoint leaks cross-bucket reclaim metadata
+Link: https://chatgpt.com/codex/cloud/security/findings/801728f5735c819192ecf73df0d7ca88?sev=&repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin&sort=date_desc
+Criticality: low (attack path: low)
+Status: fixed
+
+# Metadata
+Repo: justincormack/argmin
+Commit: 7e9d95d
+Author: justin@specialbusservice.com
+Created: 01/07/2026, 13:56:22
+Assignee: Unassigned
+Signals: Security, Validated, Attack-path
+
+# Summary
+Introduced: the commit added unfiltered collection and output of object-payload reclaim claims to the bucket-delete local debug response. Existing bucket-scoped samples and reclaim roots were filtered by the requested bucket, but the new claim path returns the singleton active claim on each object PG regardless of bucket and only annotates matches_bucket=false after copying the sensitive metadata.
+The bucket-delete debug endpoint is intended to diagnose a named bucket, but the new claim collection calls object_payload_reclaim_claim(object_pg_id) for each object metadata PG and pushes any active claim into the snapshot even when claim.bucket differs from the requested bucket. The response then prints the claim bucket, key, generation id, claim id, timing fields, and last_error. Because the debug endpoint is handled before normal S3 authentication and can be queried for an arbitrary valid bucket name, a local caller can learn active reclaim work identities for unrelated buckets. The production config limits this endpoint to an explicit opt-in loopback listener and the owner token is not printed, so the impact is limited to metadata disclosure in deployments that enable the debug endpoint.
+
+# Resolution
+Fixed for production/release builds by the local-debug endpoint hardening commits:
+
+- `45497afe` gates local debug route dispatch and helper code behind `cfg(any(test, feature = "local-debug-endpoints"))`, and rejects `ARGMIN_LOCAL_DEBUG_ENDPOINT=1` at startup unless the binary was compiled with that non-production support.
+- `73a36bcd` makes `local-debug-endpoints` a debug/test-only feature by adding a release-build `compile_error!`, and updates UAT smoke handling so debug-hook smokes cannot be run against release or externally supplied binaries.
+
+The reclaim-claim debug output remains available in explicit debug/test builds for diagnostics, but release artifacts cannot include or enable the unauthenticated debug route. Production default builds reject the environment variable before startup.
+
+# Validation
+## Rubric
+- [x] Confirm the debug endpoint is reachable before normal S3 authentication when explicitly enabled.
+- [x] Confirm the bucket-delete debug route accepts a caller-controlled bucket and builds a debug snapshot for it.
+- [x] Confirm the newly added payload-reclaim-claim collection reads PG-wide singleton claims without filtering by the requested bucket.
+- [x] Confirm copied claim data includes bucket/key/generation/claim/timing/error metadata and is printed in the local debug response even for `matches_bucket=false`.
+- [x] Dynamically reproduce the issue with a targeted test that observes an unrelated bucket's active claim in another bucket's debug snapshot.
+## Report
+Validated the finding. This is an information-disclosure bug, not a memory-corruption/crash bug, so the strongest validation was a targeted Rust unit-test PoC plus code-path review. Crash/ASan/Valgrind/debugger attempts: the PoC test ran successfully without crashing; ASan build attempt failed because the stable toolchain rejects `-Z sanitizer=address`; Valgrind is not installed; gdb is not installed.
+
+Evidence:
+1. The local debug route is evaluated before the normal S3 request/authentication path: `crates/server-http/src/http/serve.rs:691-700`. A targeted existing test using a raw unauthenticated HTTP GET passed: `cargo test -p server-http local_debug_bucket_delete_attempt_endpoint_returns_absent_record -- --nocapture` => `test ... ok`.
+2. The bucket-delete debug route accepts the caller-supplied bucket from `/__argmin/debug/bucket-delete-attempt/<bucket>` and calls `storage.bucket_delete_debug_snapshot(&bucket)`: `crates/server-http/src/http/serve.rs:1041-1067`.
+3. In `bucket_delete_debug_snapshot`, object version samples are bucket-scoped, but the new claim path loops over metadata PGs and calls `object_payload_reclaim_claim(object_pg_id)` without passing the requested bucket. It then pushes the claim and only annotates `matches_bucket: claim.bucket == *bucket`: `crates/storage/src/cluster/request_ops.rs:11831-11850`.
+4. The underlying PgStore query returns the singleton active object-payload reclaim claim for the PG with no bucket predicate: `crates/storage/src/pg_store/metadata.rs:8400-8410`; the trait describes it as the active claim on the metadata PG: `crates/storage/src/traits.rs:562-568`.
+5. The debug response formatter prints sensitive claim metadata including bucket, key, generation id, claim id, timing/lease fields, attempt count, and last_error even when `matches_bucket=false`: `crates/server-http/src/http/serve.rs:1317-1341`.
+6. I added and ran a targeted PoC unit test, `bucket_delete_debug_snapshot_exposes_unrelated_payload_reclaim_claim`, which creates an active payload reclaim claim for one bucket, calls `StorageCluster::bucket_delete_debug_snapshot()` for a different bucket while the claim is active, and asserts the snapshot includes the unrelated claim with `matches_bucket == false`. Command output: `running 1 test ... bucket_delete_debug_snapshot_exposes_unrelated_payload_reclaim_claim ... ok`. This confirms the unfiltered disclosure behavior against the actual storage implementation.
+
+# Evidence
+crates/argmin-s3/src/config.rs (L444 to 460)
+  Note: Configuration requires the debug endpoint to be explicitly enabled and bound to loopback, which limits but does not remove the metadata disclosure impact.
+```
+        if local_debug_endpoint {
+            if !process_role.has_frontend() {
+                return Err(
+                    "ARGMIN_LOCAL_DEBUG_ENDPOINT requires a frontend process role".to_string(),
+                );
+            }
+            let listen_socket_addr: SocketAddr = listen_addr.parse().map_err(|e| {
+                format!(
+                    "ARGMIN_LOCAL_DEBUG_ENDPOINT requires ARGMIN_LISTEN_ADDR to be a loopback socket address: {e}"
+                )
+            })?;
+            if !listen_socket_addr.ip().is_loopback() {
+                return Err(
+                    "ARGMIN_LOCAL_DEBUG_ENDPOINT requires ARGMIN_LISTEN_ADDR to be loopback"
+                        .to_string(),
+                );
+            }
+```
+
+crates/server-http/src/http/serve.rs (L1041 to 1067)
+  Note: The bucket-delete debug route accepts a caller-supplied bucket name and returns the generated debug snapshot body.
+```
+        (&http::Method::GET, path)
+            if path.starts_with("/__argmin/debug/bucket-delete-attempt/") =>
+        {
+            let raw_bucket = path.trim_start_matches("/__argmin/debug/bucket-delete-attempt/");
+            let bucket = match percent_decode_strict(raw_bucket)
+                .ok()
+                .and_then(|bucket| BucketName::try_from(bucket).ok())
+            {
+                Some(bucket) => bucket,
+                None => {
+                    return Some(local_debug_text_response(
+                        400,
+                        "invalid bucket\n".to_string(),
+                    ));
+                }
+            };
+            let storage = state
+                .pool
+                .first()
+                .expect("server has at least one frontend")
+                .coordinator
+                .storage_node_for_request();
+            match storage.bucket_delete_debug_snapshot(&bucket) {
+                Ok(snapshot) => Some(local_debug_text_response(
+                    200,
+                    local_debug_bucket_delete_attempt_body(&snapshot),
+                )),
+```
+
+crates/server-http/src/http/serve.rs (L1317 to 1341)
+  Note: The response prints the unfiltered claim's bucket name, object key, generation id, claim id, lease information, attempt count, and last_error.
+```
+    writeln!(
+        &mut body,
+        "payload_reclaim_claims_count={}",
+        snapshot.payload_reclaim_claims.len()
+    )
+    .expect("write to String");
+    for (index, claim) in snapshot.payload_reclaim_claims.iter().enumerate() {
+        writeln!(
+            &mut body,
+            "payload_reclaim_claim index={} object_pg_id={} bucket={:?} matches_bucket={} bucket_incarnation_generation={} key={:?} generation_id={} reclaim_kind={} claim_id={:?} cluster_epoch={} claimed_at={} lease_deadline={} attempt_count={} last_error={}",
+            index,
+            claim.object_pg_id,
+            claim.bucket.as_str(),
+            claim.matches_bucket,
+            claim.bucket_incarnation_generation,
+            claim.key.as_str(),
+            claim.generation_id.get(),
+            local_debug_optional_reclaim_kind(Some(claim.reclaim_kind)),
+            claim.claim_id,
+            claim.cluster_epoch.get(),
+            claim.claimed_at,
+            local_debug_optional_u64(claim.lease_deadline),
+            claim.attempt_count,
+            observability::escaped(claim.last_error.as_deref().unwrap_or("")),
+        )
+```
+
+crates/server-http/src/http/serve.rs (L691 to 699)
+  Note: The local debug response is served before the normal authenticated S3 request path, so enabled debug routes do not require SigV4 authentication.
+```
+    if state.config.local_debug_endpoint {
+        if let Some(resp) = local_debug_response(&state, req.method(), req.uri().path()) {
+            return Ok(s3_response_to_hyper(
+                resp,
+                None,
+                state.config.stream_read_chunk_size,
+                state.config.panic_on_500,
+                state.config.abort_on_500,
+                response_trace,
+```
+
+crates/storage/src/cluster/request_ops.rs (L11831 to 11850)
+  Note: The new code loads any active reclaim claim for each object PG without passing or enforcing the requested bucket, then copies bucket/key/claim metadata even when matches_bucket is false.
+```
+            match node
+                .object_mutation_metadata_client()
+                .object_payload_reclaim_claim(object_pg_id)
+            {
+                Ok(Some(claim)) => {
+                    payload_reclaim_claims.push(BucketDeleteDebugPayloadReclaimClaim {
+                        object_pg_id: raw_pg_id,
+                        matches_bucket: claim.bucket == *bucket,
+                        bucket: claim.bucket,
+                        bucket_incarnation_generation: claim.bucket_incarnation_generation,
+                        key: claim.key,
+                        generation_id: claim.generation_id,
+                        reclaim_kind: claim.reclaim_kind,
+                        claim_id: claim.claim_id,
+                        cluster_epoch: claim.cluster_epoch,
+                        claimed_at: claim.claimed_at,
+                        lease_deadline: claim.lease_deadline,
+                        attempt_count: claim.attempt_count,
+                        last_error: claim.last_error,
+                    });
+```
+
+# Attack-path analysis
+Final: low | Decider: model_decided | Matrix severity: ignore | Policy adjusted: ignore
+## Rationale
+The finding is valid and in-scope for the runtime service, but the assigned low severity is appropriate. Evidence shows the debug path is pre-auth and the storage/query path is missing requested-bucket filtering, so the disclosure is real. However, ARGMIN_LOCAL_DEBUG_ENDPOINT defaults to false and enabling it requires the frontend listen address to be loopback. The disclosed information is metadata about active reclaim work for unrelated buckets, not object payloads, credentials, signing keys, or an integrity-changing capability. Probability and impact are both constrained, so this should not be elevated above low.
+## Likelihood
+low - Exploitation requires the debug endpoint to be explicitly enabled and reachable only on loopback; a remote internet attacker cannot reach it under the repository's startup validation. A local process or same network namespace actor can trigger it with a simple unauthenticated GET if active reclaim claims exist.
+## Impact
+low - The bug can disclose cross-bucket operational metadata such as bucket names, object keys, generation ids, reclaim claim ids, timing/lease data, attempt counts, and last_error. It does not disclose object contents, access keys, owner tokens, or allow modification/deletion.
+## Assumptions
+- The vulnerable endpoint is only reachable when ARGMIN_LOCAL_DEBUG_ENDPOINT is explicitly enabled.
+- The configuration validation is used in production startup, so enabling the endpoint requires ARGMIN_LISTEN_ADDR to parse as a loopback socket address.
+- A realistic attacker for this path is a local process/user or same network-namespace process able to connect to the loopback listener, not an arbitrary internet client.
+- No deployment manifests were present in the repository checkout to prove external ingress, load balancer, or container network exposure.
+- ARGMIN_LOCAL_DEBUG_ENDPOINT=true
+- frontend process role enabled
+- ARGMIN_LISTEN_ADDR bound to loopback
+- attacker can connect to the local listener
+- there is at least one active object-payload reclaim claim for another bucket
+## Path
+Local caller -> loopback argmin-s3 HTTP -> pre-auth debug route -> unfiltered reclaim claim lookup -> unrelated bucket/key metadata in response
+## Path evidence
+- `crates/argmin-s3/src/config.rs:126-151` - Configuration comments show ARGMIN_LISTEN_ADDR defaults to 127.0.0.1:9000 and ARGMIN_LOCAL_DEBUG_ENDPOINT defaults to false.
+- `crates/argmin-s3/src/config.rs:322-325` - ARGMIN_LOCAL_DEBUG_ENDPOINT is parsed from environment and defaults to false.
+- `crates/argmin-s3/src/config.rs:444-460` - If local debug is enabled, startup requires a frontend role and requires ARGMIN_LISTEN_ADDR to be loopback.
+- `crates/server-http/src/http/serve.rs:691-700` - Local debug responses are returned before the normal S3 request path, so these routes bypass SigV4 authentication when enabled.
+- `crates/server-http/src/http/mod.rs:3092-3112` - Normal S3 request authentication happens later through authenticate_request, after the serve-layer debug short-circuit.
+- `crates/server-http/src/http/serve.rs:1041-1067` - The vulnerable debug route accepts a bucket from the path and returns the bucket_delete_debug_snapshot body.
+- `crates/storage/src/cluster/request_ops.rs:11831-11850` - The snapshot code calls object_payload_reclaim_claim(object_pg_id) without passing the requested bucket and stores claim.bucket, claim.key, generation, claim id, timing, lease, attempt count, and last_error even when matches_bucket is false.
+- `crates/storage/src/pg_store/metadata.rs:8400-8410` - The underlying query selects the singleton active reclaim claim for the PG with no bucket predicate.
+- `crates/server-http/src/http/serve.rs:1317-1341` - The local debug response prints the unfiltered payload_reclaim_claim fields, including bucket and key.
+## Narrative
+This is a real, reachable information disclosure in the runtime product when the opt-in local debug endpoint is enabled. The HTTP serve path checks local_debug_endpoint and returns debug responses before normal request handling and SigV4 authentication. The bucket-delete debug route accepts a bucket name from the URL and calls bucket_delete_debug_snapshot. In the new reclaim-claim path, the storage code calls object_payload_reclaim_claim(object_pg_id) with no requested-bucket parameter, copies the returned claim, and only annotates matches_bucket. The response formatter then prints the claim bucket, key, generation id, claim id, timing, lease, attempt, and last_error fields. The impact is limited because configuration defaults the debug endpoint off and rejects non-loopback listen addresses when enabled, and the leaked data is operational object metadata rather than object contents or credentials.
+## Controls
+- ARGMIN_LOCAL_DEBUG_ENDPOINT defaults false
+- loopback-only listener enforced when local debug is enabled
+- normal S3 SigV4 authentication exists but is bypassed by the local debug route
+- no owner token or access secret is printed in the debug formatter
+- process is intended to run as non-root
+## Blindspots
+- No Kubernetes, Docker Compose, Terraform, or other deployment manifests were found to validate whether an operator could accidentally proxy the loopback debug listener externally.
+- Static review cannot determine how often production operators enable ARGMIN_LOCAL_DEBUG_ENDPOINT.
+- Static review cannot determine the sensitivity of bucket names/object keys or the frequency of active object-payload reclaim claims in real deployments.
+- Validation evidence relied on a targeted unit-test PoC from the prior stage rather than an end-to-end live deployment in this attack-path stage.

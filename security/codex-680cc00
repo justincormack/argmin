@@ -1,0 +1,252 @@
+Debug endpoint leaks private object metadata
+Link: https://chatgpt.com/codex/cloud/security/findings/e422693cfcd88191a73136940fe1f020?sev=&repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin&sort=date_desc
+Criticality: low (attack path: low)
+Status: fixed
+
+# Metadata
+Repo: justincormack/argmin
+Commit: 680cc00
+Author: justin@specialbusservice.com
+Created: 01/07/2026, 14:28:38
+Assignee: Unassigned
+Signals: Security, Validated, Attack-path
+
+# Summary
+Introduced: the patch newly lists object versions inside bucket_delete_debug_snapshot and returns those samples in the unauthenticated debug HTTP response. Existing debug endpoints were already unauthenticated/local-only, but this change broadens the disclosed data to live object keys and object-version metadata.
+When ARGMIN_LOCAL_DEBUG_ENDPOINT is enabled, requests under /__argmin/debug/ are handled before the normal S3 request/authentication path. The bucket-delete-attempt endpoint accepts only a bucket name from the path and calls storage.bucket_delete_debug_snapshot without SigV4 authentication or owner authorization. This commit adds per-object-PG object-version sampling to that snapshot and formats the sampled key and metadata into the HTTP response. As a result, any local process able to reach the debug listener can query /__argmin/debug/bucket-delete-attempt/<bucket> and learn up to one object key/version sample per metadata PG for private buckets, even when it has no S3 credentials. The binary config limits this endpoint to loopback listeners and it is disabled by default, so the impact is limited, but it still exposes protected bucket-listing metadata once the diagnostic endpoint is enabled.
+
+# Resolution
+Fixed for production/release builds by the local-debug endpoint hardening commits:
+
+- `45497afe` gates local debug route dispatch and helper code behind `cfg(any(test, feature = "local-debug-endpoints"))`, and rejects `ARGMIN_LOCAL_DEBUG_ENDPOINT=1` at startup unless the binary was compiled with that non-production support.
+- `73a36bcd` makes `local-debug-endpoints` a debug/test-only feature by adding a release-build `compile_error!`, and updates UAT smoke handling so debug-hook smokes cannot be run against release or externally supplied binaries.
+
+The bucket-delete debug endpoint can still disclose this diagnostic data in explicit debug/test builds with `local-debug-endpoints`, but release artifacts cannot include or enable the route. Production default builds reject the environment variable before startup.
+
+# Validation
+## Rubric
+- [x] Confirm the local debug endpoint is optional but handled before normal S3 authentication/authorization.
+- [x] Confirm /__argmin/debug/bucket-delete-attempt/<bucket> accepts only a bucket name and performs no credential or owner check.
+- [x] Confirm the new snapshot code enumerates object-version metadata for the requested bucket.
+- [x] Confirm the HTTP debug response serializes object keys and version metadata.
+- [x] Demonstrate with a real local HTTP request lacking Authorization that private object metadata is returned; note loopback/disabled-by-default mitigation.
+## Report
+Validated the finding. Rubric-guided review confirmed the local debug handler is invoked before normal S3 processing/authentication at crates/server-http/src/http/serve.rs:691-700. The bucket-delete-attempt debug route parses only the bucket name from the URL and calls storage.bucket_delete_debug_snapshot without SigV4 or owner checks at crates/server-http/src/http/serve.rs:1041-1067. The commit-added storage code scans object versions with max_keys=1 per metadata PG at crates/storage/src/cluster/request_ops.rs:11775-11815 and converts StoredObject rows into samples containing key, version_id, generation_id, size, layout, and timestamps at crates/storage/src/cluster/request_ops.rs:11899-11926. The HTTP body formatter emits those fields, including key={:?}, at crates/server-http/src/http/serve.rs:1240-1261. I added a targeted PoC unit test that creates a private bucket/object, enables ServeConfig.local_debug_endpoint, starts the local HTTP server with zero normal request slots, and sends a raw GET /__argmin/debug/bucket-delete-attempt/debug-leak-bucket request with no Authorization or x-amz-* signing headers. The test passed and printed a 200 OK response containing object_version_sample index=0 object_pg_id=0 kind=live key="private-object-key" version_id=null generation_id=1 size=11 layout=standard. This is concrete evidence that an unauthenticated local caller can learn live object key/version metadata when the debug endpoint is enabled. Direct crash attempt was not applicable and the PoC exited status=0 because this is an information disclosure, not a memory-safety crash. valgrind was unavailable in the container. I also ran lldb non-interactively and set a breakpoint at local_debug_response; the backtrace showed handle() calling local_debug_response at serve.rs:692 before normal request processing, with the debug path as the request path. The lldb-induced pause caused the test to timeout after continuing, but the debugger trace still confirmed the pre-auth call chain. Impact is limited by config: crates/argmin-s3/src/config.rs:444-460 requires ARGMIN_LOCAL_DEBUG_ENDPOINT to use a frontend role and loopback listen address, but it does not authenticate local callers.
+
+# Evidence
+crates/argmin-s3/src/config.rs (L444 to 460)
+  Note: This mitigates impact by requiring the binary debug endpoint to use a loopback listener, but it does not authenticate local callers.
+```
+        if local_debug_endpoint {
+            if !process_role.has_frontend() {
+                return Err(
+                    "ARGMIN_LOCAL_DEBUG_ENDPOINT requires a frontend process role".to_string(),
+                );
+            }
+            let listen_socket_addr: SocketAddr = listen_addr.parse().map_err(|e| {
+                format!(
+                    "ARGMIN_LOCAL_DEBUG_ENDPOINT requires ARGMIN_LISTEN_ADDR to be a loopback socket address: {e}"
+                )
+            })?;
+            if !listen_socket_addr.ip().is_loopback() {
+                return Err(
+                    "ARGMIN_LOCAL_DEBUG_ENDPOINT requires ARGMIN_LISTEN_ADDR to be loopback"
+                        .to_string(),
+                );
+            }
+```
+
+crates/server-http/src/http/serve.rs (L1041 to 1067)
+  Note: The bucket-delete-attempt debug endpoint takes a bucket name from the path and returns a debug snapshot without checking S3 credentials or bucket ownership.
+```
+        (&http::Method::GET, path)
+            if path.starts_with("/__argmin/debug/bucket-delete-attempt/") =>
+        {
+            let raw_bucket = path.trim_start_matches("/__argmin/debug/bucket-delete-attempt/");
+            let bucket = match percent_decode_strict(raw_bucket)
+                .ok()
+                .and_then(|bucket| BucketName::try_from(bucket).ok())
+            {
+                Some(bucket) => bucket,
+                None => {
+                    return Some(local_debug_text_response(
+                        400,
+                        "invalid bucket\n".to_string(),
+                    ));
+                }
+            };
+            let storage = state
+                .pool
+                .first()
+                .expect("server has at least one frontend")
+                .coordinator
+                .storage_node_for_request();
+            match storage.bucket_delete_debug_snapshot(&bucket) {
+                Ok(snapshot) => Some(local_debug_text_response(
+                    200,
+                    local_debug_bucket_delete_attempt_body(&snapshot),
+                )),
+```
+
+crates/server-http/src/http/serve.rs (L1240 to 1261)
+  Note: The unauthenticated debug response formats and returns the sampled object key and object-version metadata.
+```
+    writeln!(
+        &mut body,
+        "object_version_samples_count={}",
+        snapshot.object_version_samples.len()
+    )
+    .expect("write to String");
+    for (index, sample) in snapshot.object_version_samples.iter().enumerate() {
+        writeln!(
+            &mut body,
+            "object_version_sample index={} object_pg_id={} kind={} key={:?} version_id={} generation_id={} size={} layout={} last_modified={} became_noncurrent_at={}",
+            index,
+            sample.object_pg_id,
+            local_debug_object_version_kind(sample.kind),
+            sample.key.as_str(),
+            sample.version_id,
+            local_debug_optional_generation_id(sample.generation_id),
+            local_debug_optional_u64(sample.size),
+            local_debug_optional_object_layout(sample.layout),
+            sample.last_modified,
+            local_debug_optional_u64(sample.became_noncurrent_at),
+        )
+        .expect("write to String");
+```
+
+crates/server-http/src/http/serve.rs (L691 to 700)
+  Note: Local debug requests are returned directly before the normal S3 authentication/authorization path.
+```
+    if state.config.local_debug_endpoint {
+        if let Some(resp) = local_debug_response(&state, req.method(), req.uri().path()) {
+            return Ok(s3_response_to_hyper(
+                resp,
+                None,
+                state.config.stream_read_chunk_size,
+                state.config.panic_on_500,
+                state.config.abort_on_500,
+                response_trace,
+            ));
+```
+
+crates/storage/src/cluster/request_ops.rs (L11775 to 11815)
+  Note: The new code gathers one object-version sample per metadata PG for the requested bucket.
+```
+        let mut object_version_samples = Vec::new();
+        let mut object_version_sample_errors = Vec::new();
+        let mut payload_reclaim_roots = Vec::new();
+        let mut payload_reclaim_root_errors = Vec::new();
+        for raw_pg_id in self.metadata_pg_ids() {
+            let object_pg_id = PgId::new(raw_pg_id);
+            let node = match self
+                .local_map
+                .metadata_pg_primary_node(self.operation_epoch(), object_pg_id)
+            {
+                Ok(node) => node,
+                Err(error) => {
+                    let detail = error.to_string();
+                    object_version_sample_errors.push(BucketDeleteDebugObjectVersionSampleError {
+                        object_pg_id: raw_pg_id,
+                        detail: detail.clone(),
+                    });
+                    payload_reclaim_root_errors.push(BucketDeleteDebugPayloadReclaimRootError {
+                        object_pg_id: raw_pg_id,
+                        detail,
+                    });
+                    continue;
+                }
+            };
+            match node
+                .object_listing_metadata_client()
+                .list_object_versions_page(
+                    object_pg_id,
+                    &ListObjectVersionsReq {
+                        bucket: bucket.clone(),
+                        prefix: None,
+                        key_marker: None,
+                        version_id_marker: None,
+                        start_at: None,
+                        max_keys: 1,
+                    },
+                ) {
+                Ok(resp) => {
+                    if let Some(stored) = resp.versions.into_iter().next() {
+                        object_version_samples
+                            .push(Self::bucket_delete_debug_object_sample(raw_pg_id, stored));
+```
+
+crates/storage/src/cluster/request_ops.rs (L11899 to 11926)
+  Note: The sampled debug records include object keys, version IDs, generation IDs, size, layout, and timestamps.
+```
+    fn bucket_delete_debug_object_sample(
+        object_pg_id: u32,
+        stored: StoredObject,
+    ) -> BucketDeleteDebugObjectVersionSample {
+        match stored {
+            StoredObject::Live(record) => BucketDeleteDebugObjectVersionSample {
+                object_pg_id,
+                kind: BucketDeleteDebugObjectVersionKind::Live,
+                key: record.key,
+                version_id: record.version_id,
+                generation_id: Some(record.generation_id),
+                size: Some(record.size),
+                layout: Some(record.layout),
+                last_modified: record.last_modified,
+                became_noncurrent_at: record.became_noncurrent_at,
+            },
+            StoredObject::DeleteMarker(record) => BucketDeleteDebugObjectVersionSample {
+                object_pg_id,
+                kind: BucketDeleteDebugObjectVersionKind::DeleteMarker,
+                key: record.key,
+                version_id: record.version_id,
+                generation_id: None,
+                size: None,
+                layout: None,
+                last_modified: record.last_modified,
+                became_noncurrent_at: None,
+            },
+        }
+```
+
+# Attack-path analysis
+Final: low | Decider: model_decided | Matrix severity: ignore | Policy adjusted: ignore
+## Rationale
+No severity increase is warranted. Evidence supports a real missing-authz information disclosure in main runtime code, and the validation PoC demonstrates unauthenticated local retrieval of a private object key and metadata. However, probability and blast radius are limited: ARGMIN_LOCAL_DEBUG_ENDPOINT defaults to false, config enforces a loopback listen address and frontend role when enabled, and the disclosed data is sampled object metadata rather than object contents or secrets. This fits low severity in the project threat model rather than medium/high.
+## Likelihood
+low - Exploitation is straightforward once the debug endpoint is enabled, but it is disabled by default and constrained to a loopback listener, so an attacker generally needs local process access on the host or an equivalent local pivot.
+## Impact
+low - The issue exposes private bucket listing/object-version metadata to an unauthenticated local caller, but not object payloads, credentials, arbitrary files, or write/delete capabilities.
+## Assumptions
+- The attacker is an untrusted local process or local user able to connect to the loopback listener when ARGMIN_LOCAL_DEBUG_ENDPOINT is enabled.
+- The target bucket name is known or guessable and contains at least one object version in one or more metadata placement groups.
+- No cloud APIs or live deployment state were queried; conclusions are based on repository code and the provided validation evidence.
+- argmin-s3 frontend process role
+- ARGMIN_LOCAL_DEBUG_ENDPOINT enabled
+- ARGMIN_LISTEN_ADDR bound to a loopback address
+- local attacker process can connect to the listener
+- target bucket name supplied in the path
+## Path
+Local process -> loopback listener -> pre-auth debug route -> storage snapshot -> object key/version metadata leak
+## Path evidence
+- `crates/server-http/src/http/serve.rs:691-700` - local_debug_response is checked and returned before normal S3 request processing and authentication.
+- `crates/server-http/src/http/serve.rs:1009-1067` - The debug route handles GET /__argmin/debug/bucket-delete-attempt/<bucket>, parses only the bucket name, and calls bucket_delete_debug_snapshot without checking credentials or ownership.
+- `crates/server-http/src/http/mod.rs:3095-3108` - Normal S3 request authentication uses authenticate_request later in the standard request path, demonstrating the debug path bypasses the usual auth boundary when returned early.
+- `crates/storage/src/cluster/request_ops.rs:11775-11815` - The storage snapshot code enumerates metadata placement groups and calls list_object_versions_page with max_keys=1 for the requested bucket.
+- `crates/storage/src/cluster/request_ops.rs:11899-11926` - The sampled object-version record includes object key, version_id, generation_id, size, layout, and timestamps.
+- `crates/server-http/src/http/serve.rs:1240-1261` - The debug HTTP response formats and returns object_version_sample fields including key, version ID, size, layout, and timestamps.
+- `crates/argmin-s3/src/config.rs:322-325` - ARGMIN_LOCAL_DEBUG_ENDPOINT defaults to false, limiting default exposure.
+- `crates/argmin-s3/src/config.rs:444-460` - When enabled, the debug endpoint requires a frontend role and rejects non-loopback listen addresses, limiting network reachability.
+- `crates/argmin-s3/src/main.rs:1996-2051` - The main binary binds the configured TCP listener and passes local_debug_endpoint into ServeConfig, confirming this is runtime product behavior.
+## Narrative
+The finding is real and in scope. The argmin-s3 HTTP handler dispatches local debug requests before the normal S3 authentication path. The bucket-delete-attempt debug endpoint accepts a bucket name from the URL and calls storage.bucket_delete_debug_snapshot without SigV4 authentication or owner authorization. The snapshot code samples object versions with max_keys=1 per metadata PG, converts StoredObject records into structures containing key and version metadata, and the HTTP formatter emits those fields. Provided validation included an executable PoC showing a 200 OK unauthenticated local request returning key="private-object-key" and related metadata. Severity remains low because the endpoint is disabled by default, the binary requires loopback binding when enabled, exploitation requires local reachability, and the leak is object-listing metadata rather than object payloads or credentials.
+## Controls
+- ARGMIN_LOCAL_DEBUG_ENDPOINT defaults to disabled
+- ARGMIN_LOCAL_DEBUG_ENDPOINT requires frontend process role
+- ARGMIN_LOCAL_DEBUG_ENDPOINT requires ARGMIN_LISTEN_ADDR to be loopback
+- Normal S3 SigV4 authentication and authorization exist but are bypassed for the matched local debug path
+- No repository deployment manifests or load balancer ingress were found in the checkout
+## Blindspots
+- Static review did not inspect a live deployment, so actual operator use of ARGMIN_LOCAL_DEBUG_ENDPOINT is unknown.
+- No Kubernetes, Docker Compose, Ingress, or load balancer manifests were present to confirm external exposure or network policy.
+- Static analysis cannot rule out local SSRF or proxy chains in a specific deployment that could make loopback-only services reachable remotely.
