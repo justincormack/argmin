@@ -1902,6 +1902,27 @@ impl LocalClusterMap {
         }
     }
 
+    pub(crate) fn cap_route_map_validity(&self, candidate: RouteMapValidity) {
+        let candidate = candidate
+            .valid_until_ms()
+            .unwrap_or(ROUTE_MAP_VALID_UNTIL_UNBOUNDED);
+        let mut current = self.route_map_validity.load(Ordering::Acquire);
+        loop {
+            if current <= candidate {
+                return;
+            }
+            match self.route_map_validity.compare_exchange_weak(
+                current,
+                candidate,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return,
+                Err(observed) => current = observed,
+            }
+        }
+    }
+
     pub fn is_route_map_valid_at(&self, now_ms: u64) -> bool {
         self.route_map_validity().is_valid_at(now_ms)
     }
@@ -3051,6 +3072,56 @@ impl LocalClusterMap {
         })
     }
 
+    pub(crate) fn metadata_pg_primary_node_for_metadata_command_recovery(
+        &self,
+        operation_epoch: ClusterEpoch,
+        pg_id: PgId,
+    ) -> Result<&LocalNodeStore, StoreError> {
+        if operation_epoch != self.epoch {
+            return Err(StoreError::StaleMetadataOperation {
+                pg_id: pg_id.get(),
+                operation_epoch,
+                current_epoch: self.epoch,
+            });
+        }
+
+        let route = self
+            .pg_routes
+            .get(&pg_id)
+            .ok_or(StoreError::ClusterPgNotFound {
+                pg_id: pg_id.get(),
+                cluster_epoch: self.epoch,
+            })?;
+        if route.cluster_epoch() != self.epoch {
+            return Err(StoreError::StaleMetadataRoute {
+                pg_id: pg_id.get(),
+                route_epoch: route.cluster_epoch(),
+                current_epoch: self.epoch,
+            });
+        }
+        if !route.is_active() {
+            return Err(StoreError::PgNotActive {
+                pg_id: pg_id.get(),
+                cluster_epoch: self.epoch,
+                state: route.state(),
+            });
+        }
+        let node_id = route.primary_node_id();
+        if !route.contains_node(node_id) {
+            return Err(StoreError::NodeNotInActingSet {
+                node_id: node_id.as_u32(),
+                pg_id: pg_id.get(),
+                cluster_epoch: self.epoch,
+            });
+        }
+
+        self.nodes.get(&node_id).ok_or(StoreError::NodeNotFound {
+            node_id: node_id.as_u32(),
+            pg_id: pg_id.get(),
+            cluster_epoch: self.epoch,
+        })
+    }
+
     pub(crate) fn metadata_pg_primary_node_at_retained_epoch(
         &self,
         operation_epoch: ClusterEpoch,
@@ -3106,6 +3177,19 @@ impl LocalClusterMap {
         )
     }
 
+    pub(crate) fn metadata_pg_acting_nodes_for_metadata_command_recovery(
+        &self,
+        operation_epoch: ClusterEpoch,
+        pg_id: PgId,
+    ) -> Result<Vec<&LocalNodeStore>, StoreError> {
+        self.metadata_pg_acting_nodes_with_allowed_states_and_validity(
+            operation_epoch,
+            pg_id,
+            &[PgState::Active],
+            false,
+        )
+    }
+
     pub(crate) fn metadata_pg_acting_nodes_for_peering_inspection(
         &self,
         operation_epoch: ClusterEpoch,
@@ -3136,6 +3220,21 @@ impl LocalClusterMap {
         pg_id: PgId,
         allowed_states: &[PgState],
     ) -> Result<Vec<&LocalNodeStore>, StoreError> {
+        self.metadata_pg_acting_nodes_with_allowed_states_and_validity(
+            operation_epoch,
+            pg_id,
+            allowed_states,
+            true,
+        )
+    }
+
+    fn metadata_pg_acting_nodes_with_allowed_states_and_validity(
+        &self,
+        operation_epoch: ClusterEpoch,
+        pg_id: PgId,
+        allowed_states: &[PgState],
+        require_validity: bool,
+    ) -> Result<Vec<&LocalNodeStore>, StoreError> {
         if operation_epoch != self.epoch {
             return Err(StoreError::StaleMetadataOperation {
                 pg_id: pg_id.get(),
@@ -3143,7 +3242,9 @@ impl LocalClusterMap {
                 current_epoch: self.epoch,
             });
         }
-        self.require_route_map_valid_now()?;
+        if require_validity {
+            self.require_route_map_valid_now()?;
+        }
 
         let route = self
             .pg_routes
@@ -3194,6 +3295,39 @@ impl LocalClusterMap {
         target_pg_id: PgId,
         command: &MetadataCommandEnvelope,
     ) -> Result<MetadataCommandAcceptance, StoreError> {
+        self.validate_metadata_command_for_replica_with_route_validity(
+            origin_node_id,
+            target_node_id,
+            target_pg_id,
+            command,
+            true,
+        )
+    }
+
+    pub(crate) fn validate_metadata_command_for_replica_for_metadata_command_recovery(
+        &self,
+        origin_node_id: NodeId,
+        target_node_id: NodeId,
+        target_pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+    ) -> Result<MetadataCommandAcceptance, StoreError> {
+        self.validate_metadata_command_for_replica_with_route_validity(
+            origin_node_id,
+            target_node_id,
+            target_pg_id,
+            command,
+            false,
+        )
+    }
+
+    fn validate_metadata_command_for_replica_with_route_validity(
+        &self,
+        origin_node_id: NodeId,
+        target_node_id: NodeId,
+        target_pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+        require_validity: bool,
+    ) -> Result<MetadataCommandAcceptance, StoreError> {
         let command_pg_id = command.id().pg_id();
         if command_pg_id != target_pg_id {
             return Err(StoreError::MetadataCommandWrongPg {
@@ -3213,7 +3347,9 @@ impl LocalClusterMap {
                 current_epoch: self.epoch,
             });
         }
-        self.require_route_map_valid_now()?;
+        if require_validity {
+            self.require_route_map_valid_now()?;
+        }
 
         let route = self
             .pg_routes

@@ -1242,9 +1242,7 @@ pub enum StorageNodeServerError {
         current: ClusterEpoch,
         candidate: ClusterEpoch,
     },
-    #[error(
-        "storage-node runtime refresh reduced same-epoch route-map validity from {current:?} to {candidate:?}"
-    )]
+    #[error("storage-node runtime refresh removed bounded same-epoch route-map validity from {current:?} to {candidate:?}")]
     RuntimeRefreshValidityRegression {
         current: Option<u64>,
         candidate: Option<u64>,
@@ -8822,9 +8820,11 @@ impl StorageNodeConnectionHandler {
         session: &StorageNodeSession,
         request: StorageRpcMetadataCommandRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
-        if let Err(error) =
-            self.validate_pg_route(request.node_id, request.cluster_epoch, request.pg_id)
-        {
+        if let Err(error) = self.validate_pg_route_for_metadata_command_recovery(
+            request.node_id,
+            request.cluster_epoch,
+            request.pg_id,
+        ) {
             return encode_storage_rpc_error_response(&error);
         }
         let _pg_guard = metadata_command_pg_guard_or_return!(self, session, request.pg_id);
@@ -8877,9 +8877,11 @@ impl StorageNodeConnectionHandler {
         session: &StorageNodeSession,
         request: StorageRpcMetadataCommandMatchingAppliedRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
-        if let Err(error) =
-            self.validate_pg_route(request.node_id, request.cluster_epoch, request.pg_id)
-        {
+        if let Err(error) = self.validate_pg_route_for_metadata_command_recovery(
+            request.node_id,
+            request.cluster_epoch,
+            request.pg_id,
+        ) {
             return encode_storage_rpc_error_response(&error);
         }
         let _pg_guard = metadata_command_pg_guard_or_return!(self, session, request.pg_id);
@@ -8933,9 +8935,11 @@ impl StorageNodeConnectionHandler {
         session: &StorageNodeSession,
         request: StorageRpcMetadataCommandRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
-        if let Err(error) =
-            self.validate_pg_route(request.node_id, request.cluster_epoch, request.pg_id)
-        {
+        if let Err(error) = self.validate_pg_route_for_metadata_command_recovery(
+            request.node_id,
+            request.cluster_epoch,
+            request.pg_id,
+        ) {
             return encode_storage_rpc_error_response(&error);
         }
         let _pg_guard = metadata_command_pg_guard_or_return!(self, session, request.pg_id);
@@ -8985,9 +8989,11 @@ impl StorageNodeConnectionHandler {
         session: &StorageNodeSession,
         request: StorageRpcMetadataCommandRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
-        if let Err(error) =
-            self.validate_pg_route(request.node_id, request.cluster_epoch, request.pg_id)
-        {
+        if let Err(error) = self.validate_pg_route_for_metadata_command_recovery(
+            request.node_id,
+            request.cluster_epoch,
+            request.pg_id,
+        ) {
             return encode_storage_rpc_error_response(&error);
         }
         let _pg_guard = metadata_command_pg_guard_or_return!(self, session, request.pg_id);
@@ -9065,12 +9071,21 @@ impl StorageNodeConnectionHandler {
         if let Err(error) = validate_metadata_command_request_epoch(&request) {
             return encode_storage_rpc_error_response(&error);
         }
-        if let Err(error) = self.validate_pg_route_with_allowed_states(
-            request.node_id,
-            request.cluster_epoch,
-            request.pg_id,
-            allowed_states,
-        ) {
+        let route_validation = if allowed_states == [PgState::Active] {
+            self.validate_pg_route_for_metadata_command_recovery(
+                request.node_id,
+                request.cluster_epoch,
+                request.pg_id,
+            )
+        } else {
+            self.validate_pg_route_with_allowed_states(
+                request.node_id,
+                request.cluster_epoch,
+                request.pg_id,
+                allowed_states,
+            )
+        };
+        if let Err(error) = route_validation {
             return encode_storage_rpc_error_response(&error);
         }
         let _pg_guard = metadata_command_pg_guard_or_return!(self, session, request.pg_id);
@@ -9232,9 +9247,11 @@ impl StorageNodeConnectionHandler {
         if let Err(error) = validate_metadata_command_request_epoch(&request) {
             return encode_storage_rpc_error_response(&error);
         }
-        if let Err(error) =
-            self.validate_pg_route(request.node_id, request.cluster_epoch, request.pg_id)
-        {
+        if let Err(error) = self.validate_pg_route_for_metadata_command_recovery(
+            request.node_id,
+            request.cluster_epoch,
+            request.pg_id,
+        ) {
             return encode_storage_rpc_error_response(&error);
         }
         let _pg_guard = metadata_command_pg_guard_or_return!(self, session, request.pg_id);
@@ -9287,9 +9304,11 @@ impl StorageNodeConnectionHandler {
         if let Err(error) = validate_metadata_command_request_epoch(&request) {
             return encode_storage_rpc_error_response(&error);
         }
-        if let Err(error) =
-            self.validate_pg_route(request.node_id, request.cluster_epoch, request.pg_id)
-        {
+        if let Err(error) = self.validate_pg_route_for_metadata_command_recovery(
+            request.node_id,
+            request.cluster_epoch,
+            request.pg_id,
+        ) {
             return encode_storage_rpc_error_response(&error);
         }
         let _pg_guard = metadata_command_pg_guard_or_return!(self, session, request.pg_id);
@@ -9519,9 +9538,11 @@ impl StorageNodeConnectionHandler {
         session: &StorageNodeSession,
         request: StorageRpcMetadataCommandRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
-        if let Err(error) =
-            self.validate_pg_route(request.node_id, request.cluster_epoch, request.pg_id)
-        {
+        if let Err(error) = self.validate_pg_route_for_metadata_command_recovery(
+            request.node_id,
+            request.cluster_epoch,
+            request.pg_id,
+        ) {
             return encode_storage_rpc_error_response(&error);
         }
         let _pg_guard = metadata_command_pg_guard_or_return!(self, session, request.pg_id);
@@ -9757,6 +9778,24 @@ impl StorageNodeConnectionHandler {
         )
     }
 
+    fn validate_pg_route_for_metadata_command_recovery(
+        &self,
+        node_id: NodeId,
+        cluster_epoch: ClusterEpoch,
+        pg_id: PgId,
+    ) -> Result<(), StorageRpcErrorResponse> {
+        match self.validate_pg_route(node_id, cluster_epoch, pg_id) {
+            Ok(()) => Ok(()),
+            Err(_) if cluster_epoch < self.config.cluster_epoch => self
+                .validate_historical_active_pg_route_for_metadata_command_recovery(
+                    node_id,
+                    cluster_epoch,
+                    pg_id,
+                ),
+            Err(error) => Err(error),
+        }
+    }
+
     fn validate_pg_route_for_peering_inspection(
         &self,
         node_id: NodeId,
@@ -9848,6 +9887,80 @@ impl StorageNodeConnectionHandler {
                 message: format!(
                     "storage node {} is not in acting set for PG {raw_pg_id}",
                     self.config.node_id.as_u32()
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    fn validate_historical_active_pg_route_for_metadata_command_recovery(
+        &self,
+        node_id: NodeId,
+        cluster_epoch: ClusterEpoch,
+        pg_id: PgId,
+    ) -> Result<(), StorageRpcErrorResponse> {
+        if node_id != self.config.node_id {
+            return Err(StorageRpcErrorResponse {
+                code: StorageRpcErrorCode::UnknownNode,
+                message: format!(
+                    "request targets node {}, but this storage node is {}",
+                    node_id.as_u32(),
+                    self.config.node_id.as_u32()
+                ),
+            });
+        }
+        let raw_pg_id = pg_id.get();
+        let Some(active_route) = self
+            .config
+            .historical_pg_routes
+            .iter()
+            .find(|route| route.pg_id == raw_pg_id && route.cluster_epoch == cluster_epoch)
+        else {
+            return Err(StorageRpcErrorResponse {
+                code: StorageRpcErrorCode::StaleShardLocation,
+                message: format!(
+                    "PG {raw_pg_id} route for historical metadata command epoch {} is not retained",
+                    cluster_epoch.get()
+                ),
+            });
+        };
+        if active_route.state != PgState::Active {
+            return Err(StorageRpcErrorResponse {
+                code: StorageRpcErrorCode::InactivePgRoute,
+                message: format!(
+                    "historical metadata command recovery for PG {raw_pg_id} at epoch {} requires Active route, got {}",
+                    cluster_epoch.get(),
+                    active_route.state
+                ),
+            });
+        }
+        if !active_route.acting_set.contains(&self.config.node_id) {
+            return Err(StorageRpcErrorResponse {
+                code: StorageRpcErrorCode::NonActingSetAccess,
+                message: format!(
+                    "storage node {} is not in acting set for PG {raw_pg_id}",
+                    self.config.node_id.as_u32()
+                ),
+            });
+        }
+        let has_current_or_retained_peering =
+            self.config.pg_routes.iter().any(|route| {
+                route.pg_id == raw_pg_id
+                    && route.cluster_epoch >= cluster_epoch
+                    && route.state == PgState::Peering
+                    && route.acting_set.contains(&self.config.node_id)
+            }) || self.config.historical_pg_routes.iter().any(|route| {
+                route.pg_id == raw_pg_id
+                    && route.cluster_epoch >= cluster_epoch
+                    && route.state == PgState::Peering
+                    && route.acting_set.contains(&self.config.node_id)
+            });
+        if !has_current_or_retained_peering {
+            return Err(StorageRpcErrorResponse {
+                code: StorageRpcErrorCode::InactivePgRoute,
+                message: format!(
+                    "historical metadata command recovery for PG {raw_pg_id} at epoch {} requires a retained Peering route",
+                    cluster_epoch.get()
                 ),
             });
         }
@@ -11146,11 +11259,7 @@ fn validate_process_config_route_table(
 }
 
 fn route_map_validity_regressed(current: Option<u64>, candidate: Option<u64>) -> bool {
-    match (current, candidate) {
-        (Some(current), Some(candidate)) => candidate < current,
-        (Some(_), None) => true,
-        _ => false,
-    }
+    current.is_some() && candidate.is_none()
 }
 
 fn validate_socket_directory(socket_path: &Path) -> Result<(), StorageNodeServerError> {
@@ -11935,22 +12044,12 @@ mod tests {
     }
 
     #[test]
-    fn storage_node_runtime_config_install_rejects_same_epoch_validity_regression() {
+    fn storage_node_runtime_config_install_rejects_same_epoch_unbounded_validity_regression() {
         let tmp = test_util::tempdir();
         let mut config = test_config(&tmp);
         config.route_map_validity = RouteMapValidity::Until(5_000);
         private_socket_dir(config.socket_path.parent().unwrap());
         let server = StorageNodeServer::bind(config.clone()).unwrap();
-        let mut stale = config.clone();
-        stale.route_map_validity = RouteMapValidity::Until(4_000);
-
-        assert!(matches!(
-            server.install_control_plane_runtime_config(stale),
-            Err(StorageNodeServerError::RuntimeRefreshValidityRegression {
-                current: Some(5_000),
-                candidate: Some(4_000),
-            })
-        ));
 
         let mut unbounded = config.clone();
         unbounded.route_map_validity = RouteMapValidity::Forever;
@@ -11961,6 +12060,25 @@ mod tests {
                 candidate: None,
             })
         ));
+    }
+
+    #[test]
+    fn storage_node_runtime_config_install_accepts_same_epoch_shorter_bounded_validity() {
+        let tmp = test_util::tempdir();
+        let mut config = test_config(&tmp);
+        config.route_map_validity = RouteMapValidity::Until(5_000);
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let server = StorageNodeServer::bind(config.clone()).unwrap();
+        let mut shorter = config;
+        shorter.route_map_validity = RouteMapValidity::Until(4_000);
+
+        server
+            .install_control_plane_runtime_config(shorter)
+            .unwrap();
+        assert_eq!(
+            server.config_snapshot().route_map_valid_until_ms(),
+            Some(4_000)
+        );
     }
 
     #[test]
@@ -15956,6 +16074,80 @@ mod tests {
             error.code,
             StorageRpcErrorCode::MetadataTransferHistoricalRouteActive
         );
+    }
+
+    #[test]
+    fn storage_node_server_allows_historical_active_metadata_command_recovery_while_peering() {
+        let tmp = test_util::tempdir();
+        let mut config = test_config(&tmp);
+        let source_route_epoch = ClusterEpoch::new(1).unwrap();
+        let current_epoch = ClusterEpoch::new(4).unwrap();
+        config.cluster_epoch = current_epoch;
+        config.pg_routes[0].cluster_epoch = current_epoch;
+        config.pg_routes[0].state = PgState::Peering;
+        config.historical_pg_routes.push(StorageNodePgRoute {
+            pg_id: 0,
+            cluster_epoch: source_route_epoch,
+            state: PgState::Active,
+            primary_node_id: NodeId::new(7),
+            acting_set: vec![NodeId::new(7)],
+        });
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let command = test_metadata_command(0, 1);
+        let socket_path = config.socket_path.clone();
+        let server = StorageNodeServer::bind(config.clone()).unwrap();
+        let join = thread::spawn(move || server.accept_one().unwrap());
+
+        let mut client = UnixStream::connect(socket_path).unwrap();
+        let insert_response = send_frame(
+            &mut client,
+            1,
+            StorageRpcMessageKind::MetadataCommandPendingSlotInsert,
+            encode_metadata_command_pending_slot_request(
+                &StorageRpcMetadataCommandPendingSlotRequest {
+                    node_id: NodeId::new(7),
+                    cluster_epoch: source_route_epoch,
+                    pg_id: PgId::new(0),
+                    command: command.clone(),
+                    scope_bucket: Some(command.bucket_name().clone()),
+                },
+            )
+            .unwrap(),
+        );
+        let apply_response = send_frame(
+            &mut client,
+            2,
+            StorageRpcMessageKind::MetadataCommandApplyAndRecord,
+            encode_metadata_command_request(&StorageRpcMetadataCommandRequest {
+                node_id: NodeId::new(7),
+                cluster_epoch: source_route_epoch,
+                pg_id: PgId::new(0),
+                command,
+            })
+            .unwrap(),
+        );
+        drop(client);
+        join.join().unwrap();
+
+        let insert_error = decode_storage_rpc_response_payload(&insert_response.payload)
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(insert_error.code, StorageRpcErrorCode::StaleShardLocation);
+
+        let apply_payload = decode_storage_rpc_response_payload(&apply_response.payload)
+            .unwrap()
+            .unwrap();
+        let applied = decode_metadata_command_state_outcome_response(&apply_payload).unwrap();
+        assert!(matches!(
+            applied.outcome,
+            StorageRpcMetadataCommandStateOutcome::State(
+                crate::metadata_command::MetadataCommandReplicaState {
+                    cluster_epoch,
+                    applied_log_index: 1,
+                    ..
+                }
+            ) if cluster_epoch == source_route_epoch
+        ));
     }
 
     #[test]

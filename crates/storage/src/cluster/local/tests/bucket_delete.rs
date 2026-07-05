@@ -6440,3 +6440,99 @@ fn begin_bucket_delete_recovers_expired_durable_drain_after_reopen() {
     );
     assert_clean_metadata_command_stream(&reopened, &[1]);
 }
+
+#[test]
+fn pending_delete_finalized_bucket_recovery_uses_expired_active_route() {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1], ec_shape).unwrap();
+    let bucket = {
+        let topology = map
+            .nodes
+            .get(&NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        bucket_for_pg(topology, 1, "pending-finalized-recovery-")
+    };
+    let map = Arc::new(map);
+    let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+    create_test_bucket(&cluster, &bucket);
+    cluster
+        .test_begin_bucket_delete_if_current(&bucket)
+        .unwrap();
+
+    let pg_id = PgId::new(1);
+    let primary = map
+        .metadata_pg_primary_node(ClusterEpoch::INITIAL, pg_id)
+        .unwrap();
+    let primary_pg = primary.storage_node().get_pg(pg_id.get()).unwrap();
+    let deleting = crate::PgMetadataStore::head_bucket_record_raw(&*primary_pg, &bucket).unwrap();
+    assert_eq!(deleting.state, crate::BucketState::Deleting);
+    let command_log_index = primary_pg
+        .metadata_command_replica_state()
+        .unwrap()
+        .applied_log_index
+        .checked_add(1)
+        .and_then(MetadataCommandLogIndex::new)
+        .unwrap();
+    let command = MetadataCommandEnvelope::new(
+        MetadataCommandId::new(ClusterEpoch::INITIAL, pg_id, command_log_index),
+        MetadataCommandPayload::DeleteFinalizedBucket(DeleteFinalizedBucketCommand::new(
+            bucket.clone(),
+            deleting.bucket_execution_generation,
+            deleting.bucket_incarnation_generation,
+        )),
+    );
+    primary_pg
+        .try_insert_pending_metadata_command_slot(
+            primary.node_id().as_u32(),
+            &command,
+            Some(&bucket),
+        )
+        .unwrap();
+    drop(primary_pg);
+
+    map.cap_route_map_validity(RouteMapValidity::Until(0));
+    assert!(
+        matches!(
+            cluster.pending_metadata_command_for_bucket(pg_id, &bucket),
+            Err(StoreError::RouteMapExpired { .. })
+        ),
+        "normal pending-command reads must still reject an expired route map"
+    );
+
+    let drained = cluster
+        .drain_pending_metadata_commands_for_current_map()
+        .unwrap();
+    assert_eq!(drained, 1);
+
+    let primary = map
+        .metadata_pg_primary_node_for_metadata_command_recovery(ClusterEpoch::INITIAL, pg_id)
+        .unwrap();
+    let primary_pg = primary.storage_node().get_pg(pg_id.get()).unwrap();
+    assert!(
+        primary_pg
+            .pending_metadata_command_envelope(primary.node_id().as_u32(), ClusterEpoch::INITIAL)
+            .unwrap()
+            .is_none(),
+        "recovery should clear the exact pending finalizer slot"
+    );
+    drop(primary_pg);
+    for node_id in node_ids {
+        let pg = map
+            .node(node_id)
+            .unwrap()
+            .storage_node()
+            .get_pg(pg_id.get())
+            .unwrap();
+        assert!(
+            matches!(
+                crate::PgMetadataStore::head_bucket_record_raw(&*pg, &bucket),
+                Err(crate::MetadataError::BucketNotFound { .. })
+            ),
+            "DeleteFinalizedBucket should be applied on node {node_id:?}"
+        );
+    }
+}

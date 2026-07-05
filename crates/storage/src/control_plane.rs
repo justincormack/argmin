@@ -16708,7 +16708,7 @@ mod tests {
     }
 
     #[test]
-    fn storage_cluster_runtime_map_handle_rejects_same_epoch_validity_regression() {
+    fn storage_cluster_runtime_map_handle_rejects_same_epoch_unbounded_validity_regression() {
         let tmp = test_util::tempdir();
         let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
         let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
@@ -16740,35 +16740,6 @@ mod tests {
         let handle = crate::StorageClusterRuntimeMapHandle::new(Arc::clone(&current_cluster));
         let current_valid_until = current_cluster.route_map_valid_until_ms().unwrap();
 
-        let mut stale_map = current_map.clone();
-        stale_map.validity = RouteMapValidity::Until(current_valid_until - 10);
-        let stale_cluster = crate::StorageCluster::from_runtime_map(
-            NodeId::new(1),
-            &stale_map,
-            crate::EcShape { k: 1, m: 0 },
-        )
-        .unwrap();
-        assert_eq!(
-            stale_cluster.cluster_epoch(),
-            current_cluster.cluster_epoch()
-        );
-        assert!(
-            stale_cluster.route_map_valid_until_ms() < current_cluster.route_map_valid_until_ms()
-        );
-
-        assert!(matches!(
-            handle.install(stale_cluster),
-            Err(crate::cluster::StorageClusterRuntimeMapRefreshError::ValidityRegression {
-                current,
-                candidate,
-            }) if current == current_cluster.route_map_valid_until_ms()
-                && candidate == stale_map.valid_until_ms()
-        ));
-        assert_eq!(
-            handle.current().route_map_valid_until_ms(),
-            Some(current_valid_until)
-        );
-
         let mut unbounded_map = current_map.clone();
         unbounded_map.validity = RouteMapValidity::Forever;
         let unbounded_cluster = crate::StorageCluster::from_runtime_map(
@@ -16788,6 +16759,30 @@ mod tests {
             handle.current().route_map_valid_until_ms(),
             Some(current_valid_until)
         );
+    }
+
+    #[test]
+    fn storage_cluster_runtime_map_handle_accepts_same_epoch_shorter_bounded_validity() {
+        let mut current_map = runtime_map_test_snapshot_with_active_route();
+        current_map.validity = RouteMapValidity::Until(5_000);
+        let current_cluster = crate::StorageCluster::from_runtime_map(
+            NodeId::new(1),
+            &current_map,
+            crate::EcShape { k: 1, m: 0 },
+        )
+        .unwrap();
+        let handle = crate::StorageClusterRuntimeMapHandle::new(current_cluster);
+        let mut shorter_map = current_map.clone();
+        shorter_map.validity = RouteMapValidity::Until(4_000);
+        let shorter_cluster = crate::StorageCluster::from_runtime_map(
+            NodeId::new(1),
+            &shorter_map,
+            crate::EcShape { k: 1, m: 0 },
+        )
+        .unwrap();
+
+        handle.install(shorter_cluster).unwrap();
+        assert_eq!(handle.current().route_map_valid_until_ms(), Some(4_000));
     }
 
     #[test]

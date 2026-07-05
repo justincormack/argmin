@@ -1029,7 +1029,7 @@ pub enum StorageClusterRuntimeMapRefreshError {
         candidate: ClusterEpoch,
     },
     #[error(
-        "refreshed runtime map reduced same-epoch route-map validity from {current:?} to {candidate:?}"
+        "refreshed runtime map removed bounded same-epoch route-map validity from {current:?} to {candidate:?}"
     )]
     ValidityRegression {
         current: Option<u64>,
@@ -1152,14 +1152,28 @@ impl StorageClusterRuntimeMapHandle {
                 .same_epoch_generations
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            // Same-epoch refreshes only extend the control-plane lease. Requests
-            // that pinned an older generation must see that extension too.
+            // Same-epoch authoritative refreshes update the control-plane
+            // lease for all pinned generations. Requests that pinned an older
+            // generation must see both lease extensions and bounded shrinks.
             generations.retain(|generation| {
                 let Some(generation) = generation.upgrade() else {
                     return false;
                 };
                 if generation.cluster_epoch() == candidate.cluster_epoch() {
-                    generation.extend_route_map_validity(candidate_validity);
+                    match (
+                        generation.route_map_valid_until_ms(),
+                        candidate_validity.valid_until_ms(),
+                    ) {
+                        (Some(current), Some(candidate)) if candidate < current => {
+                            generation.cap_route_map_validity(candidate_validity);
+                        }
+                        (None, Some(_)) => {
+                            generation.cap_route_map_validity(candidate_validity);
+                        }
+                        _ => {
+                            generation.extend_route_map_validity(candidate_validity);
+                        }
+                    }
                     true
                 } else {
                     false
@@ -1176,6 +1190,26 @@ impl StorageClusterRuntimeMapHandle {
         }
         *current = candidate;
         Ok(())
+    }
+
+    fn expire_same_epoch_generations(&self, now_ms: u64) {
+        let current_epoch = self.current().cluster_epoch();
+        let expiry = RouteMapValidity::Until(now_ms);
+        let mut generations = self
+            .same_epoch_generations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        generations.retain(|generation| {
+            let Some(generation) = generation.upgrade() else {
+                return false;
+            };
+            if generation.cluster_epoch() == current_epoch {
+                generation.cap_route_map_validity(expiry);
+                true
+            } else {
+                false
+            }
+        });
     }
 
     pub fn refresh_from_control_plane_runtime_map(
@@ -1268,16 +1302,23 @@ impl StorageClusterRuntimeMapHandle {
         let handle = thread::Builder::new()
             .name("argmin-storage-cluster-control-plane-refresh".to_string())
             .spawn(move || loop {
+                let now_ms = authority_now_ms();
                 let result = match admission_settings {
                     Some(admission_settings) => self
                         .refresh_from_control_plane_runtime_map_with_unix_storage_node_clients(
                             &control_plane,
-                            authority_now_ms(),
+                            now_ms,
                             admission_settings,
                         ),
-                    None => self
-                        .refresh_from_control_plane_runtime_map(&control_plane, authority_now_ms()),
+                    None => self.refresh_from_control_plane_runtime_map(&control_plane, now_ms),
                 };
+                let recovery_result = result.as_ref().err().map(|error| {
+                    if runtime_map_refresh_error_requires_current_map_invalidation(error) {
+                        self.expire_same_epoch_generations(now_ms);
+                    }
+                    self.current()
+                        .drain_pending_metadata_commands_for_current_map()
+                });
                 {
                     let mut status = worker_status
                         .lock()
@@ -1295,7 +1336,21 @@ impl StorageClusterRuntimeMapHandle {
                         }
                         Err(error) => {
                             status.failures += 1;
-                            status.last_error = Some(error.to_string());
+                            let mut error = error.to_string();
+                            match recovery_result {
+                                Some(Ok(drained)) if drained > 0 => {
+                                    error.push_str(&format!(
+                                        "; drained {drained} pending metadata command(s) from current map"
+                                    ));
+                                }
+                                Some(Err(recovery_error)) => {
+                                    error.push_str(&format!(
+                                        "; pending metadata command recovery failed: {recovery_error}"
+                                    ));
+                                }
+                                _ => {}
+                            }
+                            status.last_error = Some(error);
                         }
                     }
                 }
@@ -1323,10 +1378,124 @@ impl StorageClusterRuntimeMapHandle {
 }
 
 fn route_map_validity_regressed(current: Option<u64>, candidate: Option<u64>) -> bool {
-    match (current, candidate) {
-        (Some(current), Some(candidate)) => candidate < current,
-        (Some(_), None) => true,
+    current.is_some() && candidate.is_none()
+}
+
+fn runtime_map_refresh_error_requires_current_map_invalidation(
+    error: &StorageClusterRuntimeMapRefreshError,
+) -> bool {
+    match error {
+        StorageClusterRuntimeMapRefreshError::ControlPlane(
+            ControlPlaneError::PgPeeringPendingMetadataCommand { .. },
+        ) => true,
+        StorageClusterRuntimeMapRefreshError::ControlPlane(ControlPlaneError::RpcRemote {
+            message,
+        }) => message.contains("reported unresolved pending metadata command"),
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod runtime_map_refresh_invalidation_tests {
+    use super::*;
+
+    fn active_test_cluster(validity: RouteMapValidity) -> Arc<StorageCluster> {
+        let route = PgRouteSnapshot::reconstructed(
+            ClusterEpoch::INITIAL,
+            PgId::new(31),
+            NodeId::new(1),
+            vec![NodeId::new(1)],
+            PgState::Active,
+        );
+        let local_map = LocalClusterMap::open_frontend_topology_only_with_pg_routes_and_validity(
+            NodeId::new(1),
+            [NodeId::new(1)],
+            &[31],
+            EcShape { k: 1, m: 0 },
+            ClusterEpoch::INITIAL,
+            [LocalPgRoute::from(&route)],
+            validity,
+        )
+        .unwrap();
+        StorageCluster::test_from_local_map_with_epoch(Arc::new(local_map), ClusterEpoch::INITIAL)
+            .unwrap()
+    }
+
+    #[test]
+    fn authoritative_pending_metadata_refresh_failure_expires_same_epoch_generations() {
+        let pinned = active_test_cluster(RouteMapValidity::Until(10_000));
+        let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&pinned));
+        let current = handle.current();
+
+        handle.expire_same_epoch_generations(5_000);
+
+        assert_eq!(pinned.route_map_valid_until_ms(), Some(5_000));
+        assert_eq!(current.route_map_valid_until_ms(), Some(5_000));
+        assert_eq!(handle.current().route_map_valid_until_ms(), Some(5_000));
+        assert!(matches!(
+            handle.current().require_route_map_valid_at(5_000),
+            Err(StoreError::RouteMapExpired {
+                cluster_epoch,
+                valid_until_ms: 5_000,
+                now_ms: 5_000,
+            }) if cluster_epoch == ClusterEpoch::INITIAL
+        ));
+    }
+
+    #[test]
+    fn same_epoch_install_shrinks_pinned_generation_validity() {
+        let pinned = active_test_cluster(RouteMapValidity::Until(5_000));
+        let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&pinned));
+        let old_current = handle.current();
+        let candidate = active_test_cluster(RouteMapValidity::Until(4_000));
+
+        handle.install(Arc::clone(&candidate)).unwrap();
+
+        assert_eq!(pinned.route_map_valid_until_ms(), Some(4_000));
+        assert_eq!(old_current.route_map_valid_until_ms(), Some(4_000));
+        assert_eq!(candidate.route_map_valid_until_ms(), Some(4_000));
+        assert_eq!(handle.current().route_map_valid_until_ms(), Some(4_000));
+        assert!(matches!(
+            pinned.require_route_map_valid_at(4_000),
+            Err(StoreError::RouteMapExpired {
+                cluster_epoch,
+                valid_until_ms: 4_000,
+                now_ms: 4_000,
+            }) if cluster_epoch == ClusterEpoch::INITIAL
+        ));
+    }
+
+    #[test]
+    fn authoritative_pending_metadata_refresh_failure_predicate_is_narrow() {
+        assert!(runtime_map_refresh_error_requires_current_map_invalidation(
+            &StorageClusterRuntimeMapRefreshError::ControlPlane(
+                ControlPlaneError::PgPeeringPendingMetadataCommand {
+                    pg_id: 31,
+                    node_id: 1,
+                    cluster_epoch: ClusterEpoch::INITIAL,
+                },
+            ),
+        ));
+        assert!(runtime_map_refresh_error_requires_current_map_invalidation(
+            &StorageClusterRuntimeMapRefreshError::ControlPlane(ControlPlaneError::RpcRemote {
+                message: "node 1 reported unresolved pending metadata command for PG 31 in cluster epoch 1".to_string(),
+            }),
+        ));
+        assert!(
+            !runtime_map_refresh_error_requires_current_map_invalidation(
+                &StorageClusterRuntimeMapRefreshError::ControlPlane(ControlPlaneError::RpcRemote {
+                    message: "connect timeout".to_string(),
+                }),
+            )
+        );
+        assert!(
+            !runtime_map_refresh_error_requires_current_map_invalidation(
+                &StorageClusterRuntimeMapRefreshError::ControlPlane(ControlPlaneError::Io {
+                    context: "connect control-plane RPC socket",
+                    source: io::Error::new(io::ErrorKind::TimedOut, "timeout"),
+                }),
+            )
+        );
     }
 }
 
@@ -3875,6 +4044,10 @@ impl StorageCluster {
         self.local_map.extend_route_map_validity(candidate);
     }
 
+    fn cap_route_map_validity(&self, candidate: RouteMapValidity) {
+        self.local_map.cap_route_map_validity(candidate);
+    }
+
     pub fn is_route_map_valid_at(&self, now_ms: u64) -> bool {
         self.local_map.is_route_map_valid_at(now_ms)
     }
@@ -4103,6 +4276,33 @@ impl StorageCluster {
             .pending_metadata_command_envelope(pg_id, self.operation_epoch())
     }
 
+    fn drain_pending_metadata_commands_for_current_map(
+        &self,
+    ) -> Result<usize, ObjectPgActionError> {
+        let mut drained = 0usize;
+        for raw_pg_id in self.local_map.pg_ids() {
+            let pg_id = PgId::new(*raw_pg_id);
+            let primary = self
+                .local_map
+                .metadata_pg_primary_node_for_metadata_command_recovery(
+                    self.operation_epoch(),
+                    pg_id,
+                )
+                .map_err(ObjectPgActionError::Store)?;
+            let Some(command) = primary
+                .metadata_command_client()
+                .pending_metadata_command_envelope(pg_id, self.operation_epoch())
+                .map_err(ObjectPgActionError::Store)?
+            else {
+                continue;
+            };
+            let _outcome =
+                self.drain_pending_metadata_command_with_recovery_gate(pg_id, &command)?;
+            drained += 1;
+        }
+        Ok(drained)
+    }
+
     fn remove_pending_metadata_command_for_bucket(
         &self,
         pg_id: PgId,
@@ -4112,6 +4312,24 @@ impl StorageCluster {
         let primary = self
             .local_map
             .metadata_pg_primary_node(self.operation_epoch(), pg_id)?;
+        let _ = bucket;
+        primary
+            .metadata_command_client()
+            .remove_pending_metadata_command_slot(pg_id, command)
+    }
+
+    fn remove_pending_metadata_command_for_bucket_recovery(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        command: &MetadataCommandEnvelope,
+    ) -> Result<bool, StoreError> {
+        let primary = self
+            .local_map
+            .metadata_pg_primary_node_for_metadata_command_recovery(
+                self.operation_epoch(),
+                pg_id,
+            )?;
         let _ = bucket;
         primary
             .metadata_command_client()
@@ -5885,7 +6103,7 @@ impl StorageCluster {
         if Self::metadata_command_is_bucket_pg_command(command) {
             let outcome = match work_budget {
                 Some(work_budget) => self
-                    .finish_pending_metadata_command_to_acting_set_allow_partial_exact_conflict_retry_with_work_budget(
+                    .finish_pending_metadata_command_to_acting_set_for_recovery_with_work_budget(
                         pg_id,
                         command,
                         false,
@@ -5897,7 +6115,7 @@ impl StorageCluster {
                         RequestWorkBudget::new(BUCKET_WRITE_DRAIN_RETRY_BUDGET, None)
                             .for_operation("metadata_command_apply_partial_retry")
                             .for_pg(pg_id);
-                    self.finish_pending_metadata_command_to_acting_set_allow_partial_exact_conflict_retry_with_work_budget(
+                    self.finish_pending_metadata_command_to_acting_set_for_recovery_with_work_budget(
                         pg_id,
                         command,
                         false,
