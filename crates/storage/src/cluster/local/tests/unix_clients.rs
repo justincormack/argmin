@@ -1090,7 +1090,9 @@ fn frontend_unix_reclaim_and_bucket_finalize_resume_from_storage_node_owned_rows
     assert!(first_cluster
         .payload_reclaim_exists(&bucket, &key, committed.generation_id)
         .unwrap());
-    first_cluster.begin_bucket_delete(&bucket).unwrap();
+    first_cluster
+        .test_begin_bucket_delete_if_current(&bucket)
+        .unwrap();
     drop(first_cluster);
     drop(first_map);
 

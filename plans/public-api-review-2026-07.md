@@ -428,12 +428,13 @@ sweeps so the next drift is a compile error.
   splitting each admission summary into wait and timeout variants. Wait
   events now have no timeout field, while timeout events require a plain
   `timeout_us: u128`.
-- [ ] `begin_bucket_delete` (unguarded, `Option<(u64,u64)>` identity) vs
+- [x] `begin_bucket_delete` (unguarded, `Option<(u64,u64)>` identity) vs
   `begin_bucket_delete_if_current` (`cluster/request_ops.rs:3947, 3951`):
-  production only uses the guarded one; `None` identity is a logic error for
-  production callers. Fix: gate the unguarded variant behind
-  `#[cfg(any(test, feature = "test-hooks"))]`; replace the `(u64, u64)` tuple
-  with a named `BucketIdentityGenerations` struct.
+  production only used the guarded one; `None` identity was a logic error for
+  production callers. Completed by removing the unguarded variant, making the
+  guarded API take a named `BucketIdentityGenerations` struct, and switching
+  tests to either call a test helper that reads the current identity then calls
+  the guarded API, or pass an explicit saved identity in stale-retry cases.
 - [ ] Bucket policy: `InputUnavailable` conditions silently skip Deny
   statements (fail-open) while `Unsupported` correctly fails closed
   (`auth/src/bucket_policy.rs:794-802`). server-core compensates by

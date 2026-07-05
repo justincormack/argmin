@@ -574,7 +574,7 @@ fn delete_recreate_multipart_trace_bucket(
     bucket: &crate::BucketName,
 ) -> TestCaseResult {
     cluster
-        .begin_bucket_delete(bucket)
+        .test_begin_bucket_delete_if_current(bucket)
         .map_err(|err| TestCaseError::fail(format!("{err:?}")))?;
     let outcome = cluster
         .try_finalize_bucket_delete(bucket)

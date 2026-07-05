@@ -440,8 +440,10 @@ impl Coordinator {
         );
         if let Err(err) = storage_node.begin_bucket_delete_if_current(
             &name,
-            bucket_execution_generation,
-            bucket_incarnation_generation,
+            storage::cluster::BucketIdentityGenerations {
+                bucket_execution_generation,
+                bucket_incarnation_generation,
+            },
         ) {
             let _ = observability::emit_flight_event(
                 TRACE_TARGET,

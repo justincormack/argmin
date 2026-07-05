@@ -855,8 +855,12 @@ impl ReclaimSweeper {
                             } else {
                                 match current_runtime.storage_node.begin_bucket_delete_if_current(
                                     &root.bucket,
-                                    root.bucket_execution_generation,
-                                    root.bucket_incarnation_generation,
+                                    storage::cluster::BucketIdentityGenerations {
+                                        bucket_execution_generation: root
+                                            .bucket_execution_generation,
+                                        bucket_incarnation_generation: root
+                                            .bucket_incarnation_generation,
+                                    },
                                 ) {
                                     Ok(()) => {
                                         bucket_delete_begin_retry_after.remove(&root);

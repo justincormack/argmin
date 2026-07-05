@@ -1018,7 +1018,7 @@ fn bucket_delete_begin_marks_deleting_on_retained_route_after_runtime_map_primar
     );
 
     initial
-        .begin_bucket_delete(&bucket)
+        .test_begin_bucket_delete_if_current(&bucket)
         .expect("pinned DeleteBucket begin should commit on retained route after runtime-map move");
     assert!(
         installed_next_epoch.load(Ordering::SeqCst),
@@ -1091,7 +1091,9 @@ fn reclaim_worker_adopts_bucket_delete_begin_after_partial_frontier() {
     let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&initial));
     let _coord = setup_coordinator_with_only_reclaim_worker(handle, Arc::clone(&initial));
 
-    let err = initial.begin_bucket_delete(&bucket).unwrap_err();
+    let err = initial
+        .test_begin_bucket_delete_if_current(&bucket)
+        .unwrap_err();
     assert!(
         matches!(
             err,
@@ -1479,7 +1481,9 @@ fn reclaim_worker_drops_stale_bucket_delete_begin_after_bucket_recreate() {
     );
     thread::sleep(Duration::from_millis(350));
 
-    initial.begin_bucket_delete(&bucket).unwrap();
+    initial
+        .test_begin_bucket_delete_if_current(&bucket)
+        .unwrap();
     delete_bucket_metadata_or_accept_reclaim_worker_finalize(&initial, &bucket);
     direct_coord
         .create_bucket_for_owner("new-owner", bucket.as_str(), false)
@@ -9560,13 +9564,17 @@ fn delete_bucket_authorizes_idempotent_retry_while_deleting() {
     let tmp = test_util::tempdir();
     let bucket = "bucket-delete-idempotent-auth";
     let storage_cluster = open_test_storage_cluster(tmp.path(), &[0]);
-    let coord = setup_direct_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
+    let coord = setup_same_process_coordinator_with_storage_cluster_without_background_sweepers(
+        Arc::clone(&storage_cluster),
+    );
     coord
         .create_bucket_for_owner("default-owner", bucket, false)
         .unwrap();
 
     let bucket_name = trusted_bucket_name(bucket);
-    storage_cluster.begin_bucket_delete(&bucket_name).unwrap();
+    storage_cluster
+        .test_begin_bucket_delete_if_current(&bucket_name)
+        .unwrap();
 
     delete_bucket_test(&coord, bucket)
         .expect("idempotent DeleteBucket retry should authorize while bucket delete drain exists");
@@ -9646,7 +9654,9 @@ fn delete_bucket_stale_metadata_route_maps_to_operation_aborted() {
     let bucket_name = trusted_bucket_name(bucket);
     let stale_cluster =
         same_epoch_cluster_with_stale_current_pg_routes(&storage_cluster, tmp.path());
-    let storage_err = stale_cluster.begin_bucket_delete(&bucket_name).unwrap_err();
+    let storage_err = stale_cluster
+        .test_begin_bucket_delete_if_current(&bucket_name)
+        .unwrap_err();
     assert!(
         matches!(
             storage_err,
@@ -9714,7 +9724,9 @@ fn delete_bucket_stale_raw_authorization_does_not_delete_recreated_bucket() {
         .unwrap();
 
     let bucket_name = trusted_bucket_name(bucket);
-    storage_cluster.begin_bucket_delete(&bucket_name).unwrap();
+    storage_cluster
+        .test_begin_bucket_delete_if_current(&bucket_name)
+        .unwrap();
     let stale_authorized = coord
         .authorize_delete_bucket(&bucket_request_with_expected_owner(
             bucket,
@@ -9738,8 +9750,10 @@ fn delete_bucket_stale_raw_authorization_does_not_delete_recreated_bucket() {
     let err = storage_cluster
         .begin_bucket_delete_if_current(
             &stale_authorized.name,
-            stale_authorized.bucket_execution_generation,
-            stale_authorized.bucket_incarnation_generation,
+            storage::cluster::BucketIdentityGenerations {
+                bucket_execution_generation: stale_authorized.bucket_execution_generation,
+                bucket_incarnation_generation: stale_authorized.bucket_incarnation_generation,
+            },
         )
         .unwrap_err();
     assert!(
@@ -11527,7 +11541,9 @@ fn head_object_rejects_old_incarnation_fast_path_after_delete_recreate() {
         Some(true)
     );
 
-    storage_cluster.begin_bucket_delete(&bucket_name).unwrap();
+    storage_cluster
+        .test_begin_bucket_delete_if_current(&bucket_name)
+        .unwrap();
     delete_bucket_metadata_or_accept_reclaim_worker_finalize(&storage_cluster, &bucket_name);
     let recreated_owner = CanonicalUserId::from_principal("777788889999");
     storage_cluster
@@ -11852,7 +11868,9 @@ fn bucket_fast_path_watcher_observes_direct_storage_delete_recreate() {
         Some(true)
     );
 
-    storage_cluster.begin_bucket_delete(&bucket_name).unwrap();
+    storage_cluster
+        .test_begin_bucket_delete_if_current(&bucket_name)
+        .unwrap();
     delete_bucket_metadata_or_accept_reclaim_worker_finalize(&storage_cluster, &bucket_name);
     let recreated_owner = CanonicalUserId::from_principal("777788889999");
     storage_cluster
@@ -11961,7 +11979,9 @@ fn bucket_fast_path_watcher_recovers_after_observing_missing_bucket_before_recre
         "BOE read should warm cache"
     );
 
-    storage_cluster.begin_bucket_delete(&bucket_name).unwrap();
+    storage_cluster
+        .test_begin_bucket_delete_if_current(&bucket_name)
+        .unwrap();
     delete_bucket_metadata_or_accept_reclaim_worker_finalize(&storage_cluster, &bucket_name);
 
     let start = std::time::Instant::now();

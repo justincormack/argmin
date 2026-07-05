@@ -141,7 +141,9 @@ fn finalized_bucket_delete_clears_pending_versioning_command_for_recreate() {
             .bucket_execution_generation
     };
 
-    cluster.begin_bucket_delete(&bucket).unwrap();
+    cluster
+        .test_begin_bucket_delete_if_current(&bucket)
+        .unwrap();
     assert_eq!(
         cluster.try_finalize_bucket_delete(&bucket).unwrap(),
         crate::BucketDeleteFinalizeOutcome::Finalized
@@ -231,7 +233,9 @@ fn finalized_bucket_delete_removes_replicated_create_rows() {
         .bucket_execution_generation;
     assert!(pre_delete_generation > created_generation);
 
-    cluster.begin_bucket_delete(&bucket).unwrap();
+    cluster
+        .test_begin_bucket_delete_if_current(&bucket)
+        .unwrap();
     let deleting_generation = map
         .node(NodeId::new(1))
         .unwrap()
@@ -317,7 +321,9 @@ fn finalized_bucket_delete_after_reopen_does_not_need_begin_waiter() {
         let map = Arc::new(map);
         let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
         create_test_bucket(&cluster, &bucket);
-        cluster.begin_bucket_delete(&bucket).unwrap();
+        cluster
+            .test_begin_bucket_delete_if_current(&bucket)
+            .unwrap();
     }
 
     let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2], ec_shape).unwrap();
@@ -370,7 +376,9 @@ fn durable_bucket_finalize_scan_recovers_lost_local_queue_after_reopen() {
         let map = Arc::new(map);
         let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
         create_test_bucket(&cluster, &bucket);
-        cluster.begin_bucket_delete(&bucket).unwrap();
+        cluster
+            .test_begin_bucket_delete_if_current(&bucket)
+            .unwrap();
         bucket
     };
 
@@ -418,7 +426,9 @@ fn durable_bucket_finalize_scan_skips_excluded_bucket() {
     let map = Arc::new(map);
     let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&cluster, &bucket);
-    cluster.begin_bucket_delete(&bucket).unwrap();
+    cluster
+        .test_begin_bucket_delete_if_current(&bucket)
+        .unwrap();
 
     let excluded = std::collections::HashSet::from([bucket.clone()]);
     let scan = cluster.enqueue_durable_bucket_delete_finalize_roots_excluding(&excluded);
@@ -464,7 +474,9 @@ fn durable_bucket_finalize_scan_prioritizes_expired_claimed_bucket() {
     let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&cluster, &bucket_a);
     create_test_bucket(&cluster, &bucket_b);
-    cluster.begin_bucket_delete(&bucket_b).unwrap();
+    cluster
+        .test_begin_bucket_delete_if_current(&bucket_b)
+        .unwrap();
 
     let primary_pg = map
         .node(NodeId::new(1))
@@ -489,7 +501,9 @@ fn durable_bucket_finalize_scan_prioritizes_expired_claimed_bucket() {
     .expect("later bucket should be claimable");
     drop(primary_pg);
 
-    cluster.begin_bucket_delete(&bucket_a).unwrap();
+    cluster
+        .test_begin_bucket_delete_if_current(&bucket_a)
+        .unwrap();
 
     let scan = crate::clock::with_time_override(21, || {
         cluster.enqueue_durable_bucket_delete_finalize_roots()
@@ -542,7 +556,9 @@ fn durable_bucket_finalize_scan_continues_after_unavailable_pg() {
     let map = Arc::new(map);
     let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&cluster, &bucket);
-    cluster.begin_bucket_delete(&bucket).unwrap();
+    cluster
+        .test_begin_bucket_delete_if_current(&bucket)
+        .unwrap();
     drop(cluster);
 
     let mut map = Arc::try_unwrap(map).expect("test should hold the only map reference");
@@ -585,7 +601,9 @@ fn bucket_finalize_durable_claim_blocks_second_worker_until_released() {
     let map = Arc::new(map);
     let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&cluster, &bucket);
-    cluster.begin_bucket_delete(&bucket).unwrap();
+    cluster
+        .test_begin_bucket_delete_if_current(&bucket)
+        .unwrap();
 
     let primary_pg = map
         .node(NodeId::new(1))
@@ -663,7 +681,9 @@ fn stale_bucket_finalize_claim_for_deleted_generation_does_not_block_recreated_b
     let map = Arc::new(map);
     let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&cluster, &bucket);
-    cluster.begin_bucket_delete(&bucket).unwrap();
+    cluster
+        .test_begin_bucket_delete_if_current(&bucket)
+        .unwrap();
 
     let primary_pg = map
         .node(NodeId::new(1))
@@ -702,7 +722,9 @@ fn stale_bucket_finalize_claim_for_deleted_generation_does_not_block_recreated_b
         "recreated bucket must have a distinct incarnation"
     );
 
-    cluster.begin_bucket_delete(&bucket).unwrap();
+    cluster
+        .test_begin_bucket_delete_if_current(&bucket)
+        .unwrap();
     assert_eq!(
         cluster.try_finalize_bucket_delete(&bucket).unwrap(),
         crate::BucketDeleteFinalizeOutcome::Finalized,
@@ -734,13 +756,17 @@ fn finalized_bucket_delete_releases_finalizer_claim_for_next_same_pg_bucket() {
     create_test_bucket(&cluster, &bucket_a);
     create_test_bucket(&cluster, &bucket_b);
 
-    cluster.begin_bucket_delete(&bucket_a).unwrap();
+    cluster
+        .test_begin_bucket_delete_if_current(&bucket_a)
+        .unwrap();
     assert_eq!(
         cluster.try_finalize_bucket_delete(&bucket_a).unwrap(),
         crate::BucketDeleteFinalizeOutcome::Finalized
     );
 
-    cluster.begin_bucket_delete(&bucket_b).unwrap();
+    cluster
+        .test_begin_bucket_delete_if_current(&bucket_b)
+        .unwrap();
     assert_eq!(
             cluster.try_finalize_bucket_delete(&bucket_b).unwrap(),
             crate::BucketDeleteFinalizeOutcome::Finalized,
@@ -796,7 +822,9 @@ fn finalized_bucket_delete_waits_for_reclaim_then_finalizes_after_worker_progres
         "object delete should leave payload reclaim metadata"
     );
 
-    cluster.begin_bucket_delete(&bucket).unwrap();
+    cluster
+        .test_begin_bucket_delete_if_current(&bucket)
+        .unwrap();
     assert_eq!(
         cluster.try_finalize_bucket_delete(&bucket).unwrap(),
         crate::BucketDeleteFinalizeOutcome::Pending,
@@ -845,7 +873,9 @@ fn finalized_bucket_delete_ignores_volatile_read_lease_without_reclaim_root() {
         .unwrap();
     assert_eq!(cluster.bucket_object_payload_lease_count(&bucket), 1);
 
-    cluster.begin_bucket_delete(&bucket).unwrap();
+    cluster
+        .test_begin_bucket_delete_if_current(&bucket)
+        .unwrap();
     assert_eq!(
         cluster.try_finalize_bucket_delete(&bucket).unwrap(),
         crate::BucketDeleteFinalizeOutcome::Finalized,
@@ -880,7 +910,9 @@ fn finalized_bucket_delete_preserves_unrelated_same_pg_pending_command() {
     let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&cluster, &deleting_bucket);
     create_test_bucket(&cluster, &pending_bucket);
-    cluster.begin_bucket_delete(&deleting_bucket).unwrap();
+    cluster
+        .test_begin_bucket_delete_if_current(&deleting_bucket)
+        .unwrap();
 
     let pg_id = PgId::new(1);
     let pending_log_index = map.test_next_metadata_command_log_index(pg_id);
@@ -955,6 +987,9 @@ fn begin_bucket_delete_retries_when_pending_slot_wins_before_command_id() {
     let map = Arc::new(map);
     let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&cluster, &bucket);
+    let bucket_identity = crate::cluster::BucketIdentityGenerations::from_bucket_info(
+        &cluster.head_bucket_info(&bucket).unwrap(),
+    );
 
     let pg_id = PgId::new(1);
     let initial_bucket = cluster.test_head_bucket_raw(&bucket).unwrap();
@@ -989,7 +1024,9 @@ fn begin_bucket_delete_retries_when_pending_slot_wins_before_command_id() {
             insert_pending_metadata_command_for_test(&hook_map, pg_id, &hook_bucket, &command);
         }));
 
-    let err = cluster.begin_bucket_delete(&bucket).unwrap_err();
+    let err = cluster
+        .begin_bucket_delete_if_current(&bucket, bucket_identity)
+        .unwrap_err();
     assert!(
             matches!(
                 err,
@@ -1027,7 +1064,12 @@ fn begin_bucket_delete_retries_when_pending_slot_wins_before_command_id() {
         )),
         "retryable preserved DeleteBucket begin should queue background resume work"
     );
-    cluster.begin_bucket_delete(&bucket).unwrap();
+    let refreshed_bucket_identity = crate::cluster::BucketIdentityGenerations::from_bucket_info(
+        &cluster.head_bucket_info(&bucket).unwrap(),
+    );
+    cluster
+        .begin_bucket_delete_if_current(&bucket, refreshed_bucket_identity)
+        .unwrap();
     {
         let pg = map
             .node(NodeId::new(1))
@@ -1084,6 +1126,9 @@ fn begin_bucket_delete_retries_after_partial_mark_deleting_conflict() {
     let map = Arc::new(map);
     let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&cluster, &bucket);
+    let bucket_identity = crate::cluster::BucketIdentityGenerations::from_bucket_info(
+        &cluster.head_bucket_info(&bucket).unwrap(),
+    );
 
     let pg_id = PgId::new(1);
     let hook_ran = Arc::new(AtomicBool::new(false));
@@ -1121,7 +1166,9 @@ fn begin_bucket_delete_retries_after_partial_mark_deleting_conflict() {
         },
     ));
 
-    let err = cluster.begin_bucket_delete(&bucket).unwrap_err();
+    let err = cluster
+        .begin_bucket_delete_if_current(&bucket, bucket_identity)
+        .unwrap_err();
     assert!(
         matches!(
             err,
@@ -1129,7 +1176,9 @@ fn begin_bucket_delete_retries_after_partial_mark_deleting_conflict() {
         ),
         "partial exact mark deleting conflict should ask the caller to retry, got {err:?}"
     );
-    cluster.begin_bucket_delete(&bucket).unwrap();
+    cluster
+        .begin_bucket_delete_if_current(&bucket, bucket_identity)
+        .unwrap();
 
     assert!(
         hook_ran.load(Ordering::SeqCst),
@@ -1220,7 +1269,9 @@ fn begin_bucket_delete_reissues_stale_duplicate_mark_deleting_index() {
         &stale_delete_command,
     );
 
-    cluster.begin_bucket_delete(&delete_bucket).unwrap();
+    cluster
+        .test_begin_bucket_delete_if_current(&delete_bucket)
+        .unwrap();
 
     assert!(
         pending_metadata_command_for_test(&map, pg_id, &delete_bucket).is_none(),
@@ -1378,7 +1429,9 @@ fn begin_bucket_delete_reissue_waits_for_primary_last_apply_window() {
     );
     assert_eq!(replacement.payload(), stale_delete_command.payload());
 
-    cluster.begin_bucket_delete(&delete_bucket).unwrap();
+    cluster
+        .test_begin_bucket_delete_if_current(&delete_bucket)
+        .unwrap();
 
     for node_id in node_ids {
         let pg = map
@@ -1472,7 +1525,9 @@ fn begin_bucket_delete_retries_after_partial_object_pg_drain_conflict() {
         },
     ));
 
-    cluster.begin_bucket_delete(&bucket).unwrap();
+    cluster
+        .test_begin_bucket_delete_if_current(&bucket)
+        .unwrap();
 
     assert!(
         hook_ran.load(Ordering::SeqCst),
@@ -1565,7 +1620,9 @@ fn begin_bucket_delete_skips_unrelated_all_pg_drain_slot() {
         &pending_command,
     );
 
-    cluster.begin_bucket_delete(&bucket).unwrap();
+    cluster
+        .test_begin_bucket_delete_if_current(&bucket)
+        .unwrap();
 
     assert!(
         pending_metadata_command_for_test(&map, pending_pg_id, &pending_bucket).is_some(),
@@ -1648,7 +1705,9 @@ fn begin_bucket_delete_fails_closed_on_divergent_same_index_after_partial_apply(
         },
     ));
 
-    let err = cluster.begin_bucket_delete(&bucket).unwrap_err();
+    let err = cluster
+        .test_begin_bucket_delete_if_current(&bucket)
+        .unwrap_err();
 
     assert!(
         injected.load(Ordering::SeqCst),
@@ -1870,7 +1929,9 @@ fn finalized_bucket_delete_fails_closed_on_active_replica() {
     let map = Arc::new(map);
     let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&cluster, &bucket);
-    cluster.begin_bucket_delete(&bucket).unwrap();
+    cluster
+        .test_begin_bucket_delete_if_current(&bucket)
+        .unwrap();
 
     let primary_node = map.node(NodeId::new(1)).unwrap().storage_node();
     let primary_pg = primary_node.get_pg(1).unwrap();
@@ -2451,7 +2512,9 @@ fn bucket_delete_and_finalize_fan_out_to_routed_pg_primaries() {
     let bridge_node = map.node(NodeId::new(0)).unwrap().storage_node();
     assert!(bridge_node.test_get_object_meta(&bucket, &live_key).is_ok());
 
-    let err = cluster.begin_bucket_delete(&bucket).unwrap_err();
+    let err = cluster
+        .test_begin_bucket_delete_if_current(&bucket)
+        .unwrap_err();
     assert!(
         matches!(
             err,
@@ -2505,7 +2568,12 @@ fn bucket_delete_and_finalize_fan_out_to_routed_pg_primaries() {
     .is_some());
     drop(node_two_pg);
 
-    cluster.begin_bucket_delete(&bucket).unwrap();
+    let bucket_identity = crate::cluster::BucketIdentityGenerations::from_bucket_info(
+        &cluster.head_bucket_info(&bucket).unwrap(),
+    );
+    cluster
+        .test_begin_bucket_delete_if_current(&bucket)
+        .unwrap();
     {
         let bucket_pg = map
             .node(NodeId::new(1))
@@ -2528,7 +2596,7 @@ fn bucket_delete_and_finalize_fan_out_to_routed_pg_primaries() {
         "durable delete-drain conflict must observe terminal Deleting as idempotent success"
     );
     cluster
-        .begin_bucket_delete(&bucket)
+        .begin_bucket_delete_if_current(&bucket, bucket_identity)
         .expect("retrying DeleteBucket after MarkBucketDeleting should be idempotent");
     assert_eq!(
         cluster.try_finalize_bucket_delete(&bucket).unwrap(),
@@ -2586,7 +2654,9 @@ fn bucket_finalize_completed_multipart_cleanup_resumes_after_recorded_sparse_pg_
     let map = Arc::new(map);
     let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&cluster, &bucket);
-    cluster.begin_bucket_delete(&bucket).unwrap();
+    cluster
+        .test_begin_bucket_delete_if_current(&bucket)
+        .unwrap();
 
     let low_upload = upload_id_from_label("finalizeMpuProgressLow");
     let high_upload = upload_id_from_label("finalizeMpuProgressHigh");
@@ -2971,7 +3041,7 @@ fn begin_bucket_delete_waits_for_durable_reservation_and_post_drains_visible_wri
             *lock.lock().unwrap() = true;
             cv.notify_all();
         }
-        delete_cluster.begin_bucket_delete(&delete_bucket)
+        delete_cluster.test_begin_bucket_delete_if_current(&delete_bucket)
     });
 
     {
@@ -3081,7 +3151,9 @@ fn begin_bucket_delete_records_reservation_wait_blocker_and_adopts_after_release
         .unwrap();
 
     let started = std::time::Instant::now();
-    let err = cluster.begin_bucket_delete(&bucket).unwrap_err();
+    let err = cluster
+        .test_begin_bucket_delete_if_current(&bucket)
+        .unwrap_err();
     assert!(
         started.elapsed() < Duration::from_secs(5),
         "DeleteBucket should not wait indefinitely for an orphaned durable reservation"
@@ -3144,7 +3216,9 @@ fn begin_bucket_delete_records_reservation_wait_blocker_and_adopts_after_release
     cluster
         .release_durable_bucket_write_reservation(reservation)
         .unwrap();
-    cluster.begin_bucket_delete(&bucket).unwrap();
+    cluster
+        .test_begin_bucket_delete_if_current(&bucket)
+        .unwrap();
     let bucket_pg = map
         .node(NodeId::new(1))
         .unwrap()
@@ -3202,7 +3276,9 @@ fn begin_bucket_delete_bounds_active_delete_drain_wait() {
     drop(bucket_pg);
 
     let started = std::time::Instant::now();
-    let err = cluster.begin_bucket_delete(&bucket).unwrap_err();
+    let err = cluster
+        .test_begin_bucket_delete_if_current(&bucket)
+        .unwrap_err();
     assert!(
         started.elapsed() < Duration::from_secs(15),
         "DeleteBucket should not wait indefinitely behind another active delete drain"
@@ -3287,7 +3363,7 @@ fn begin_bucket_delete_adopts_active_delete_drain_after_reopen() {
             },
         ));
     reopened_cluster
-        .begin_bucket_delete(&bucket)
+        .test_begin_bucket_delete_if_current(&bucket)
         .expect("DeleteBucket should adopt and complete an active pre-mark drain after reopen");
     assert!(
         advanced_during_proof.load(Ordering::SeqCst),
@@ -3567,7 +3643,9 @@ fn begin_bucket_delete_records_final_visibility_phase_before_mark_command() {
             );
         }));
 
-    cluster.begin_bucket_delete(&bucket).unwrap();
+    cluster
+        .test_begin_bucket_delete_if_current(&bucket)
+        .unwrap();
     assert!(
         hook_ran.load(Ordering::SeqCst),
         "test hook should observe the attempt before MarkBucketDeleting id allocation"
@@ -3656,7 +3734,9 @@ fn begin_bucket_delete_adopts_final_visibility_phase_without_repeating_post_rese
             },
         ));
 
-    cluster.begin_bucket_delete(&bucket).unwrap();
+    cluster
+        .test_begin_bucket_delete_if_current(&bucket)
+        .unwrap();
     assert!(
         !post_reservation_scan_ran.load(Ordering::SeqCst),
         "final-visibility adoption should not repeat the post-reservation scan"
@@ -3743,7 +3823,9 @@ fn begin_bucket_delete_adopts_final_visibility_proven_without_repeating_visibili
             })
         }));
 
-    cluster.begin_bucket_delete(&bucket).unwrap();
+    cluster
+        .test_begin_bucket_delete_if_current(&bucket)
+        .unwrap();
     assert!(
         !visibility_check_ran.load(Ordering::SeqCst),
         "final-visibility-proven adoption should not repeat the visibility scan"
@@ -3805,7 +3887,9 @@ fn begin_bucket_delete_renews_drain_after_final_visibility_proof_before_retryabl
             })
         }));
 
-    let err = cluster.begin_bucket_delete(&bucket).unwrap_err();
+    let err = cluster
+        .test_begin_bucket_delete_if_current(&bucket)
+        .unwrap_err();
     assert!(
         matches!(
             err,
@@ -3863,7 +3947,7 @@ fn begin_bucket_delete_renews_drain_after_final_visibility_proof_before_retryabl
         }));
 
     cluster
-        .begin_bucket_delete(&bucket)
+        .test_begin_bucket_delete_if_current(&bucket)
         .expect("retry should adopt the preserved final-visibility proof");
     assert!(
         !visibility_reran.load(Ordering::SeqCst),
@@ -3922,7 +4006,9 @@ fn begin_bucket_delete_route_expiry_after_final_visibility_preserves_for_fenced_
             })
         }));
 
-    let err = cluster.begin_bucket_delete(&bucket).unwrap_err();
+    let err = cluster
+        .test_begin_bucket_delete_if_current(&bucket)
+        .unwrap_err();
     assert!(
         matches!(
             err,
@@ -3979,8 +4065,10 @@ fn begin_bucket_delete_route_expiry_after_final_visibility_preserves_for_fenced_
     cluster
         .begin_bucket_delete_if_current(
             &resume_root.bucket,
-            resume_root.bucket_execution_generation,
-            resume_root.bucket_incarnation_generation,
+            crate::cluster::BucketIdentityGenerations {
+                bucket_execution_generation: resume_root.bucket_execution_generation,
+                bucket_incarnation_generation: resume_root.bucket_incarnation_generation,
+            },
         )
         .expect("fenced retry should adopt the preserved route-expired attempt");
 
@@ -4027,6 +4115,9 @@ fn begin_bucket_delete_committed_response_loss_retry_observes_deleting() {
     let map = Arc::new(map);
     let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&cluster, &bucket);
+    let bucket_identity = crate::cluster::BucketIdentityGenerations::from_bucket_info(
+        &cluster.head_bucket_info(&bucket).unwrap(),
+    );
 
     let hook_calls = Arc::new(AtomicUsize::new(0));
     let hook_calls_for_hook = Arc::clone(&hook_calls);
@@ -4063,7 +4154,9 @@ fn begin_bucket_delete_committed_response_loss_retry_observes_deleting() {
         },
     ));
 
-    let first_err = cluster.begin_bucket_delete(&bucket).unwrap_err();
+    let first_err = cluster
+        .begin_bucket_delete_if_current(&bucket, bucket_identity)
+        .unwrap_err();
     assert!(
         matches!(
             first_err,
@@ -4082,7 +4175,7 @@ fn begin_bucket_delete_committed_response_loss_retry_observes_deleting() {
     );
 
     cluster
-        .begin_bucket_delete(&bucket)
+        .begin_bucket_delete_if_current(&bucket, bucket_identity)
         .expect("retry should observe the committed bucket delete");
     assert_eq!(
         hook_calls.load(Ordering::SeqCst),
@@ -4135,7 +4228,7 @@ fn begin_bucket_delete_treats_retryable_error_after_concurrent_mark_deleting_as_
                 return Ok(());
             }
             concurrent_cluster
-                .begin_bucket_delete(&hook_bucket)
+                .test_begin_bucket_delete_if_current(&hook_bucket)
                 .expect("concurrent begin should mark the same bucket incarnation deleting");
             Err(StoreError::MetadataCommandContention {
                 context: "injected retryable error after concurrent mark deleting",
@@ -4144,7 +4237,7 @@ fn begin_bucket_delete_treats_retryable_error_after_concurrent_mark_deleting_as_
     );
 
     cluster
-        .begin_bucket_delete(&bucket)
+        .test_begin_bucket_delete_if_current(&bucket)
         .expect("retryable error after same-incarnation MarkBucketDeleting should be success");
     assert!(
         hook_ran.load(Ordering::SeqCst),
@@ -4207,7 +4300,7 @@ fn begin_bucket_delete_does_not_suppress_route_error_after_concurrent_mark_delet
                 return Ok(());
             }
             concurrent_cluster
-                .begin_bucket_delete(&hook_bucket)
+                .test_begin_bucket_delete_if_current(&hook_bucket)
                 .expect("concurrent begin should mark the same bucket incarnation deleting");
             Err(StoreError::RouteMapExpired {
                 cluster_epoch: ClusterEpoch::INITIAL,
@@ -4217,7 +4310,9 @@ fn begin_bucket_delete_does_not_suppress_route_error_after_concurrent_mark_delet
         }),
     );
 
-    let err = cluster.begin_bucket_delete(&bucket).unwrap_err();
+    let err = cluster
+        .test_begin_bucket_delete_if_current(&bucket)
+        .unwrap_err();
     assert!(
         matches!(
             err,
@@ -4303,7 +4398,9 @@ fn begin_bucket_delete_adopts_stream_cleanup_phase_and_revalidates_after_reserva
             },
         ));
 
-    cluster.begin_bucket_delete(&bucket).unwrap();
+    cluster
+        .test_begin_bucket_delete_if_current(&bucket)
+        .unwrap();
     assert!(
         post_reservation_scan_ran.load(Ordering::SeqCst),
         "stream-cleanup adoption must still revalidate the post-reservation object-PG drain"
@@ -4381,7 +4478,9 @@ fn begin_bucket_delete_records_reservation_wait_phase_after_stream_cleanup() {
             })
         }));
 
-    let err = cluster.begin_bucket_delete(&bucket).unwrap_err();
+    let err = cluster
+        .test_begin_bucket_delete_if_current(&bucket)
+        .unwrap_err();
     assert!(
         matches!(
             err,
@@ -4529,7 +4628,9 @@ fn begin_bucket_delete_adopts_reservation_wait_phase_without_repeating_initial_s
             },
         ));
 
-    cluster.begin_bucket_delete(&bucket).unwrap();
+    cluster
+        .test_begin_bucket_delete_if_current(&bucket)
+        .unwrap();
     assert!(
         !initial_scan_ran.load(Ordering::SeqCst),
         "reservation-wait adoption must skip the initial pre-cleanup exact-bucket drain"
@@ -4612,7 +4713,9 @@ fn begin_bucket_delete_adopts_post_reservation_phase_after_budget_exhaustion() {
         }),
     );
 
-    let first_err = cluster.begin_bucket_delete(&bucket).unwrap_err();
+    let first_err = cluster
+        .test_begin_bucket_delete_if_current(&bucket)
+        .unwrap_err();
     assert!(
         matches!(
             first_err,
@@ -4648,7 +4751,9 @@ fn begin_bucket_delete_adopts_post_reservation_phase_after_budget_exhaustion() {
     );
     drop(bucket_pg);
 
-    cluster.begin_bucket_delete(&bucket).unwrap();
+    cluster
+        .test_begin_bucket_delete_if_current(&bucket)
+        .unwrap();
     assert!(
         post_reservation_retry_seen.load(Ordering::SeqCst),
         "retry should resume at post-reservation object drain"
@@ -4726,7 +4831,9 @@ fn begin_bucket_delete_adopted_attempt_clears_drain_on_bucket_not_empty() {
     .unwrap();
     drop(bucket_pg);
 
-    let err = cluster.begin_bucket_delete(&bucket).unwrap_err();
+    let err = cluster
+        .test_begin_bucket_delete_if_current(&bucket)
+        .unwrap_err();
     assert!(
         matches!(
             err,
@@ -5026,8 +5133,10 @@ fn begin_bucket_delete_adopts_completed_post_reservation_frontier_without_rescan
     cluster
         .begin_bucket_delete_if_current(
             &bucket,
-            initial_bucket.bucket_execution_generation,
-            initial_bucket.bucket_incarnation_generation,
+            crate::cluster::BucketIdentityGenerations {
+                bucket_execution_generation: initial_bucket.bucket_execution_generation,
+                bucket_incarnation_generation: initial_bucket.bucket_incarnation_generation,
+            },
         )
         .unwrap();
 
@@ -5133,8 +5242,9 @@ fn begin_bucket_delete_adopts_preserved_post_reservation_frontier() {
 
     let delete_cluster = Arc::clone(&cluster);
     let delete_bucket = bucket.clone();
-    let delete_thread =
-        std::thread::spawn(move || delete_cluster.begin_bucket_delete(&delete_bucket));
+    let delete_thread = std::thread::spawn(move || {
+        delete_cluster.test_begin_bucket_delete_if_current(&delete_bucket)
+    });
 
     {
         let (lock, cv) = &*delete_waiting;
@@ -5256,8 +5366,10 @@ fn begin_bucket_delete_adopts_preserved_post_reservation_frontier() {
     cluster
         .begin_bucket_delete_if_current(
             &resume_root.bucket,
-            resume_root.bucket_execution_generation,
-            resume_root.bucket_incarnation_generation,
+            crate::cluster::BucketIdentityGenerations {
+                bucket_execution_generation: resume_root.bucket_execution_generation,
+                bucket_incarnation_generation: resume_root.bucket_incarnation_generation,
+            },
         )
         .unwrap();
 
@@ -5361,7 +5473,9 @@ fn begin_bucket_delete_adopts_preserved_initial_frontier_then_resets_before_stre
         }),
     );
 
-    let first_err = cluster.begin_bucket_delete(&bucket).unwrap_err();
+    let first_err = cluster
+        .test_begin_bucket_delete_if_current(&bucket)
+        .unwrap_err();
     assert!(
         matches!(
             first_err,
@@ -5429,7 +5543,9 @@ fn begin_bucket_delete_adopts_preserved_initial_frontier_then_resets_before_stre
     );
     insert_pending_metadata_command_for_test(&map, later_pg_id, &bucket, &later_command);
 
-    let second_err = cluster.begin_bucket_delete(&bucket).unwrap_err();
+    let second_err = cluster
+        .test_begin_bucket_delete_if_current(&bucket)
+        .unwrap_err();
     assert!(
         matches!(
             second_err,
@@ -5454,8 +5570,10 @@ fn begin_bucket_delete_adopts_preserved_initial_frontier_then_resets_before_stre
     cluster
         .begin_bucket_delete_if_current(
             &bucket,
-            initial_bucket.bucket_execution_generation,
-            initial_bucket.bucket_incarnation_generation,
+            crate::cluster::BucketIdentityGenerations {
+                bucket_execution_generation: initial_bucket.bucket_execution_generation,
+                bucket_incarnation_generation: initial_bucket.bucket_incarnation_generation,
+            },
         )
         .unwrap();
     assert!(
@@ -5548,7 +5666,9 @@ fn begin_bucket_delete_drains_pending_delete_marker_before_emptiness_decision() 
     drop(object_pg);
     insert_pending_metadata_command_for_test(&map, pg_id, &bucket, &command);
 
-    let err = cluster.begin_bucket_delete(&bucket).unwrap_err();
+    let err = cluster
+        .test_begin_bucket_delete_if_current(&bucket)
+        .unwrap_err();
     assert!(
         matches!(
             err,
@@ -5673,7 +5793,9 @@ fn begin_bucket_delete_drains_pending_specific_version_delete_that_empties_bucke
     drop(object_pg);
     insert_pending_metadata_command_for_test(&map, pg_id, &bucket, &command);
 
-    cluster.begin_bucket_delete(&bucket).unwrap();
+    cluster
+        .test_begin_bucket_delete_if_current(&bucket)
+        .unwrap();
 
     assert!(pending_metadata_command_for_test(&map, pg_id, &bucket).is_none());
     assert_bucket_write_reservations_released(&map, &bucket);
@@ -5791,7 +5913,9 @@ fn begin_bucket_delete_drains_pending_lifecycle_current_expiry_marker() {
         "partial lifecycle current expiry command should remain pending"
     );
 
-    let err = cluster.begin_bucket_delete(&bucket).unwrap_err();
+    let err = cluster
+        .test_begin_bucket_delete_if_current(&bucket)
+        .unwrap_err();
     assert!(
         matches!(
             err,
@@ -5916,7 +6040,9 @@ fn begin_bucket_delete_drains_pending_lifecycle_noncurrent_expiry() {
         "partial lifecycle noncurrent expiry command should remain pending"
     );
 
-    let err = cluster.begin_bucket_delete(&bucket).unwrap_err();
+    let err = cluster
+        .test_begin_bucket_delete_if_current(&bucket)
+        .unwrap_err();
     assert!(
             matches!(
                 err,
@@ -6052,7 +6178,9 @@ fn begin_bucket_delete_drains_pending_lifecycle_expired_delete_marker_cleanup() 
         "partial lifecycle delete-marker cleanup command should remain pending"
     );
 
-    let err = cluster.begin_bucket_delete(&bucket).unwrap_err();
+    let err = cluster
+        .test_begin_bucket_delete_if_current(&bucket)
+        .unwrap_err();
     assert!(
             matches!(
                 err,
@@ -6105,7 +6233,9 @@ fn stale_delete_drain_identity_cannot_clear_recreated_bucket_drain() {
     let map = Arc::new(map);
     let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&cluster, &bucket);
-    cluster.begin_bucket_delete(&bucket).unwrap();
+    cluster
+        .test_begin_bucket_delete_if_current(&bucket)
+        .unwrap();
 
     let old_drain = {
         let node = map.node(NodeId::new(1)).unwrap().storage_node();
@@ -6213,7 +6343,9 @@ fn begin_bucket_delete_recovers_expired_durable_drain_after_reopen() {
     let reopened =
         Arc::new(LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1], ec_shape).unwrap());
     let reopened_cluster = crate::StorageCluster::from_local_map(Arc::clone(&reopened)).unwrap();
-    reopened_cluster.begin_bucket_delete(&bucket).unwrap();
+    reopened_cluster
+        .test_begin_bucket_delete_if_current(&bucket)
+        .unwrap();
 
     {
         let pg = reopened

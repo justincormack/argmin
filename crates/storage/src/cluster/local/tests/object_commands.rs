@@ -1994,7 +1994,7 @@ fn lifecycle_current_expiration_stops_after_bucket_recreate_before_proof() {
                     .reclaim_object_payload_if_unleased(&hook_bucket, &hook_key, old_generation_id)
                     .expect("test should reclaim the old payload");
                 hook_cluster
-                    .begin_bucket_delete(&hook_bucket)
+                    .test_begin_bucket_delete_if_current(&hook_bucket)
                     .expect("test should begin old bucket delete");
                 assert_eq!(
                     hook_cluster
@@ -2103,7 +2103,7 @@ fn lifecycle_current_expiration_stops_after_bucket_recreate_before_context_load(
                     .reclaim_object_payload_if_unleased(&hook_bucket, &hook_key, old_generation_id)
                     .expect("test should reclaim the old payload");
                 hook_cluster
-                    .begin_bucket_delete(&hook_bucket)
+                    .test_begin_bucket_delete_if_current(&hook_bucket)
                     .expect("test should begin old bucket delete");
                 assert_eq!(
                     hook_cluster

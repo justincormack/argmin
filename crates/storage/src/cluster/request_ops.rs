@@ -77,6 +77,21 @@ pub(crate) struct DurableBucketDeleteBeginScan {
     pub errors: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BucketIdentityGenerations {
+    pub bucket_execution_generation: u64,
+    pub bucket_incarnation_generation: u64,
+}
+
+impl BucketIdentityGenerations {
+    pub fn from_bucket_info(bucket_info: &BucketInfo) -> Self {
+        Self {
+            bucket_execution_generation: bucket_info.bucket_execution_generation,
+            bucket_incarnation_generation: bucket_info.bucket_incarnation_generation,
+        }
+    }
+}
+
 const LIFECYCLE_SWEEP_CLAIM_LEASE_MILLIS: u64 = 60_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3951,26 +3966,18 @@ impl super::StorageCluster {
         })
     }
 
-    pub fn begin_bucket_delete(&self, bucket: &BucketName) -> Result<(), BucketWriteDrainError> {
-        self.begin_bucket_delete_inner(bucket, None)
-    }
-
     pub fn begin_bucket_delete_if_current(
         &self,
         bucket: &BucketName,
-        bucket_execution_generation: u64,
-        bucket_incarnation_generation: u64,
+        bucket_identity: BucketIdentityGenerations,
     ) -> Result<(), BucketWriteDrainError> {
-        self.begin_bucket_delete_inner(
-            bucket,
-            Some((bucket_execution_generation, bucket_incarnation_generation)),
-        )
+        self.begin_bucket_delete_inner(bucket, bucket_identity)
     }
 
     fn begin_bucket_delete_inner(
         &self,
         bucket: &BucketName,
-        expected_bucket_identity: Option<(u64, u64)>,
+        expected_bucket_identity: BucketIdentityGenerations,
     ) -> Result<(), BucketWriteDrainError> {
         let started = std::time::Instant::now();
         let pg_id = PgId::new(self.bucket_metadata_pg_id(bucket));
@@ -4047,19 +4054,15 @@ impl super::StorageCluster {
                     return Err(bucket_snapshot_error_to_bucket_write_drain_error(error));
                 }
             };
-            if let Some((expected_execution, expected_incarnation)) = expected_bucket_identity {
-                if current.bucket_execution_generation != expected_execution
-                    || current.bucket_incarnation_generation != expected_incarnation
+            if current.state == BucketState::Deleting {
+                if current.bucket_incarnation_generation
+                    != expected_bucket_identity.bucket_incarnation_generation
                 {
                     return Err(StoreError::MetadataCommandContention {
                         context: "stale delete bucket authorization",
                     }
                     .into());
                 }
-            }
-            current_bucket_execution_generation = current.bucket_execution_generation;
-            current_bucket_incarnation_generation = current.bucket_incarnation_generation;
-            if current.state == BucketState::Deleting {
                 if let Some(command) = self
                     .pending_metadata_command_for_bucket(pg_id, bucket)
                     .map_err(BucketWriteDrainError::from)?
@@ -4104,6 +4107,18 @@ impl super::StorageCluster {
                 );
                 return Ok(());
             }
+            if current.bucket_execution_generation
+                != expected_bucket_identity.bucket_execution_generation
+                || current.bucket_incarnation_generation
+                    != expected_bucket_identity.bucket_incarnation_generation
+            {
+                return Err(StoreError::MetadataCommandContention {
+                    context: "stale delete bucket authorization",
+                }
+                .into());
+            }
+            current_bucket_execution_generation = current.bucket_execution_generation;
+            current_bucket_incarnation_generation = current.bucket_incarnation_generation;
         }
         let stream_check_started = std::time::Instant::now();
         let _ = observability::emit_flight_event(
@@ -12669,6 +12684,20 @@ impl super::StorageCluster {
             .test_head_bucket_raw(bucket)
     }
 
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_begin_bucket_delete_if_current(
+        &self,
+        bucket: &BucketName,
+    ) -> Result<(), BucketWriteDrainError> {
+        let bucket_info = self
+            .head_bucket_info(bucket)
+            .map_err(bucket_snapshot_error_to_bucket_write_drain_error)?;
+        self.begin_bucket_delete_if_current(
+            bucket,
+            BucketIdentityGenerations::from_bucket_info(&bucket_info),
+        )
+    }
+
     pub fn bucket_delete_attempt_outcome(
         &self,
         bucket: &BucketName,
@@ -13217,7 +13246,7 @@ impl super::StorageCluster {
         let _ = self
             .create_bucket_with_config_and_load_info(&create)
             .map_err(bucket_snapshot_error_to_bucket_write_drain_error)?;
-        self.begin_bucket_delete(bucket)
+        self.test_begin_bucket_delete_if_current(bucket)
     }
 
     #[cfg(any(test, feature = "test-hooks"))]

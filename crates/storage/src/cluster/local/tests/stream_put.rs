@@ -906,7 +906,9 @@ fn successful_streamed_overwrites_do_not_block_bucket_delete_after_object_cleanu
         outcome.deleted,
         crate::DeletedCurrentObject::Live { .. }
     ));
-    cluster.begin_bucket_delete(&bucket).unwrap();
+    cluster
+        .test_begin_bucket_delete_if_current(&bucket)
+        .unwrap();
 }
 
 #[test]
@@ -959,7 +961,7 @@ fn abandoned_put_object_stream_upload_does_not_block_bucket_delete() {
     }
 
     cluster
-        .begin_bucket_delete(&bucket)
+        .test_begin_bucket_delete_if_current(&bucket)
         .expect("abandoned direct PUT stream staging must not make bucket non-empty");
 
     for node_id in node_ids {
@@ -1028,7 +1030,9 @@ fn active_put_object_stream_upload_blocks_bucket_delete() {
         }
     };
 
-    let err = cluster.begin_bucket_delete(&bucket).unwrap_err();
+    let err = cluster
+        .test_begin_bucket_delete_if_current(&bucket)
+        .unwrap_err();
     assert!(
         matches!(
             err,
@@ -1066,7 +1070,9 @@ fn active_put_object_stream_upload_blocks_bucket_delete() {
     cluster
         .abort_stream_upload_session(&bucket, &key, &session_id)
         .unwrap();
-    cluster.begin_bucket_delete(&bucket).unwrap();
+    cluster
+        .test_begin_bucket_delete_if_current(&bucket)
+        .unwrap();
 }
 
 #[test]
@@ -1104,7 +1110,9 @@ fn old_empty_put_object_stream_with_live_proof_blocks_bucket_delete() {
         .test_force_stream_upload_created_at(&bucket, &key, &session_id, 0)
         .unwrap();
 
-    let err = cluster.begin_bucket_delete(&bucket).unwrap_err();
+    let err = cluster
+        .test_begin_bucket_delete_if_current(&bucket)
+        .unwrap_err();
     assert!(
         matches!(
             err,
@@ -1181,7 +1189,7 @@ fn expired_put_object_stream_proof_allows_bucket_delete_cleanup() {
 
     crate::clock::with_time_override(62_000, || {
         cluster
-            .begin_bucket_delete(&bucket)
+            .test_begin_bucket_delete_if_current(&bucket)
             .expect("expired direct PUT stream proof should be abandoned cleanup");
     });
 
@@ -1430,7 +1438,9 @@ fn active_put_object_stream_upload_blocks_bucket_delete_from_independent_fronten
         )
         .unwrap();
 
-    let err = deleting_frontend.begin_bucket_delete(&bucket).unwrap_err();
+    let err = deleting_frontend
+        .test_begin_bucket_delete_if_current(&bucket)
+        .unwrap_err();
     assert!(
             matches!(
                 err,
@@ -1452,7 +1462,9 @@ fn active_put_object_stream_upload_blocks_bucket_delete_from_independent_fronten
     writer_frontend
         .abort_stream_upload_session(&bucket, &key, &session_id)
         .unwrap();
-    deleting_frontend.begin_bucket_delete(&bucket).unwrap();
+    deleting_frontend
+        .test_begin_bucket_delete_if_current(&bucket)
+        .unwrap();
 }
 
 #[test]
@@ -1565,7 +1577,7 @@ fn bucket_delete_treats_conflicting_stream_reservation_proof_as_abandoned() {
         });
 
     cluster
-        .begin_bucket_delete(&bucket)
+        .test_begin_bucket_delete_if_current(&bucket)
         .expect("stale/conflicting stream proof must not keep bucket non-empty");
     assert!(
         released_mismatch.load(Ordering::SeqCst),
@@ -1652,7 +1664,7 @@ fn bucket_delete_stream_cleanup_tolerates_concurrent_missing_session() {
     }));
 
     cluster
-        .begin_bucket_delete(&bucket)
+        .test_begin_bucket_delete_if_current(&bucket)
         .expect("DeleteBucket cleanup should tolerate a concurrently aborted stream session");
     assert!(removed.load(Ordering::SeqCst));
 
@@ -1707,7 +1719,9 @@ fn bucket_delete_stream_cleanup_rejects_wrong_pg_stream_row() {
         pg.refresh_metadata_command_state_digest().unwrap();
     }
 
-    let err = cluster.begin_bucket_delete(&bucket).unwrap_err();
+    let err = cluster
+        .test_begin_bucket_delete_if_current(&bucket)
+        .unwrap_err();
     assert!(
         matches!(
             err,
