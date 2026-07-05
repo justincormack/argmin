@@ -513,10 +513,15 @@ sweeps so the next drift is a compile error.
   re-export; the internal verifier remains `verify_request_record` behind
   `authenticate_request`. Existing SigV4 request tests now exercise
   `authenticate_request` rather than the partial verifier.
-- [ ] auth: private, dead `combine_decisions` (deny-wins collapse,
+- [x] auth: private, dead `combine_decisions` (deny-wins collapse,
   `bucket_policy/evaluator.rs:137-151`) while server-core hand-rolls the
   three-way match at `authz/policy.rs:499-519` and `authz/modern.rs:889-931`.
-  Export it and migrate consumers.
+  Resolution: delete the unused evaluator seam instead of exporting it.
+  Server-core's authorization paths also apply S3 ownership, public-policy,
+  fallback, and root-principal rules, so the dead helper was not a drop-in
+  production abstraction. Future IAM work can refer back to
+  `plans/completed/bucket-policy-evaluator-structure-plan.md` for the old
+  design sketch when a real second policy source exists.
 
 ### P3. Validating constructors bypassed by public fields
 

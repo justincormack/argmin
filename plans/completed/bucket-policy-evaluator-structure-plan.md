@@ -3,10 +3,17 @@
 Status: completed
 
 Phase 1 (condition operator table), phase 2 (condition-key resolver), and
-phase 3 (`PolicyEvaluator` seam with `PolicyDecision` and combinator) have
-landed under `crates/auth/src/bucket_policy/{condition_op,condition_key,evaluator}.rs`.
+phase 3 (`PolicyEvaluator` seam with `PolicyDecision` and combinator)
+originally landed under
+`crates/auth/src/bucket_policy/{condition_op,condition_key,evaluator}.rs`.
 Phase 4 was always marked as a handoff to the IAM plan and is out of scope
 for this plan.
+
+Post-completion note: the unused phase 3 evaluator seam was later removed by
+the public API review because it stayed dead and risked becoming stale. Keep
+this plan as reference material for future IAM work, but reintroduce a policy
+composition abstraction only when there is a real second policy source to wire
+through production authorization.
 
 ## Scope
 
