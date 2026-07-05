@@ -10683,13 +10683,17 @@ Phase 12.4 proposed scope:
   activation. The design must keep apply deterministic, reject committed time
   regression, avoid reviving expired leases after leader failover or local clock
   rollback, and document the remaining operational clock assumptions.
-- Add authenticated peer identity for the Raft control-plane transport. The
-  Phase 12.3 identity envelope proves cluster/source/target fields match the
-  configured peer map, but any process with socket access can still claim those
-  fields. Phase 12.4 should add a production-shaped credential or MAC boundary
-  for peer frames, bind credentials to the configured cluster/node identity,
-  fail closed on missing/stale/wrong credentials, and preserve the existing
-  bounded/versioned/CRC frame checks.
+- Add the shared internal control-plane identity/auth foundation described in
+  [control-plane-auth-identity-plan.md](control-plane-auth-identity-plan.md),
+  and enforce it first on the Raft control-plane peer transport. The Phase 12.3
+  identity envelope proves cluster/source/target fields match the configured
+  peer map, but any process with socket access can still claim those fields.
+  Phase 12.4 should add a production-shaped credential or MAC boundary for Raft
+  peer frames, bind credentials to the configured cluster/node identity, fail
+  closed on missing/stale/wrong credentials, and preserve the existing
+  bounded/versioned/CRC frame checks. The design must not be Raft-specific:
+  storage-node heartbeat/refresh, frontend runtime-map reads, and admin
+  control-plane RPCs should consume the same foundation in later slices.
 - Harden the external control-plane client retry contract for the Raft path.
   Read-only operations may retry transient not-leader/routing/catch-up errors
   after a fresh linearized read. Mutating operations must not retry ambiguous
@@ -10711,8 +10715,9 @@ Phase 12.4 proposed scope:
   existing status/debug surfaces. These diagnostics should be available without
   granting access to raw state-machine internals.
 - Keep out of scope for 12.4: production cutover from the single-authority
-  path, dynamic configured peer-policy/membership evolution, remote storage or
-  frontend authentication beyond the control-plane Raft peer boundary, upgrade
+  path, dynamic configured peer-policy/membership evolution, full enforcement
+  of the shared auth foundation on storage-node, frontend, and admin
+  control-plane RPCs beyond the first Raft peer transport target, upgrade
   compatibility for pre-release artifacts, and removing
   `ARGMIN_CONTROL_PLANE_EXPERIMENTAL_RAFT`.
 
@@ -10722,9 +10727,10 @@ Phase 12.4 exit criteria:
   process crashes at WAL/artifact/peer-response fault-injection points without
   double-voting, losing acknowledged committed commands, or serving stale
   runtime maps after restart.
-- Peer Raft RPCs require authenticated configured peer identity in addition to
-  the Phase 12.3 cluster/source/target envelope, and malformed or unauthenticated
-  frames fail closed before OpenRaft dispatch.
+- The shared internal control-plane identity/auth foundation is documented and
+  implemented far enough for Raft peer RPCs to require authenticated configured
+  peer identity in addition to the Phase 12.3 cluster/source/target envelope;
+  malformed or unauthenticated frames fail closed before OpenRaft dispatch.
 - Lease and runtime-map freshness semantics are documented and covered by
   skew/regression tests: committed timestamps are monotonic, heartbeat leases do
   not regress or resurrect across restart/failover, and successor activation
