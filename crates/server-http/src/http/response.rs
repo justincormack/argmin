@@ -1403,38 +1403,6 @@ impl S3Response {
             .streaming_body(result.body, result.part_size)
     }
 
-    /// Build a 416 Range Not Satisfiable response.
-    #[must_use]
-    pub fn range_not_satisfiable(total_size: u64, host_id: &str) -> Self {
-        let request_id = current_request_id();
-        let body = xml::invalid_range_error_xml(total_size, &request_id, host_id);
-        Self::new(416).chunked_xml_body(body)
-    }
-
-    /// Build a 416 Range Not Satisfiable response with explicit wire IDs.
-    #[must_use]
-    pub fn range_not_satisfiable_with_ids(total_size: u64, wire_ids: &WireResponseIds) -> Self {
-        let body =
-            xml::invalid_range_error_xml(total_size, wire_ids.request_id(), wire_ids.host_id());
-        Self::new(416).chunked_xml_body(body)
-    }
-
-    /// Build a 416 unsatisfiable object `partNumber` response.
-    #[must_use]
-    pub fn invalid_part_number(
-        part_number: u32,
-        parts_count: u32,
-        wire_ids: &WireResponseIds,
-    ) -> Self {
-        let body = xml::invalid_part_number_error_xml(
-            part_number,
-            parts_count,
-            wire_ids.request_id(),
-            wire_ids.host_id(),
-        );
-        Self::new(416).chunked_xml_body(body)
-    }
-
     /// Build a response for `DeleteObject` (204 No Content).
     #[must_use]
     pub fn delete_object(result: &DeleteObjectResult) -> Self {

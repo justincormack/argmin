@@ -1654,10 +1654,6 @@ impl HttpFrontend {
                 let cond = read_condition_from_headers(req);
                 let vid = parse_version_id(req)?;
                 let requester = Self::requester_from_auth(auth);
-                let wire_ids = WireResponseIds::new(
-                    current_trace_context().request_id(),
-                    self.host_id.clone(),
-                );
                 #[cfg(feature = "deep-tracing")]
                 let trace = current_trace_context();
                 if let Some(pn_str) = req.query_param_lossy("partNumber") {
@@ -1713,7 +1709,7 @@ impl HttpFrontend {
                                     bucket, key, vid, range_header, byte_range
                                 )),
                             );
-                            match self.coordinator.get_object_range(
+                            let result = self.coordinator.get_object_range(
                                 &crate::coordinator::GetObjectRangeRequest {
                                     object: object_version_request(
                                         &bucket,
@@ -1726,22 +1722,13 @@ impl HttpFrontend {
                                     cond: &cond,
                                     sse_customer: sse_customer.as_ref(),
                                 },
-                            ) {
-                                Ok(result) => {
-                                    let tags = result.tags.clone();
-                                    let mut resp = S3Response::get_object_range(result);
-                                    if let Some(tags_xml) = tags {
-                                        add_tagging_count_header(&mut resp, &tags_xml)?;
-                                    }
-                                    Ok(resp)
-                                }
-                                Err(ServerError::InvalidRange { total_size }) => {
-                                    Ok(S3Response::range_not_satisfiable_with_ids(
-                                        total_size, &wire_ids,
-                                    ))
-                                }
-                                Err(e) => Err(e),
+                            )?;
+                            let tags = result.tags.clone();
+                            let mut resp = S3Response::get_object_range(result);
+                            if let Some(tags_xml) = tags {
+                                add_tagging_count_header(&mut resp, &tags_xml)?;
                             }
+                            Ok(resp)
                         }
                         Err(_) => {
                             #[cfg(feature = "deep-tracing")]

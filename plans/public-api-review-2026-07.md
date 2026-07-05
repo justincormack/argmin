@@ -89,7 +89,7 @@ Remaining order of attack:
   `FULL_OBJECT` checksum, and an ignored literal `x-amz-checksum-algorithm`
   without a concrete checksum value follows the same default-storage path.
 
-- [ ] **RR3. H6 residual: "one 416 builder" not achieved; two dead pub
+- [x] **RR3. H6 residual: "one 416 builder" not achieved; two dead pub
   builders left behind.** Behavior is correct and AWS-pinned, but there are
   still three live 416-producing paths, two byte-identical (conversion arms
   `response.rs:776, 780`; `range_not_satisfiable_with_ids` `response.rs:1416`,
@@ -98,7 +98,10 @@ Remaining order of attack:
   `S3Response::invalid_part_number` (`response.rs:1424`) — the purpose-built
   builder was never wired in — and `range_not_satisfiable`
   (`response.rs:1408`, stamps the literal `"request-id"`), both pub with zero
-  callers. Consolidate to one builder, delete the dead pair.
+  callers. Consolidate to one builder, delete the dead pair. Fixed by routing
+  the GetObject range branch through the normal `ServerError::InvalidRange`
+  conversion and deleting the redundant public 416 builders; the existing
+  `S3Response::error` conversion is now the single HTTP 416 formatter.
 
 ### New findings from fix verification
 
@@ -975,9 +978,8 @@ each is one refactor away from a panic:
 
 - [ ] server-http response builders that stamp the literal `"request-id"`
   into responses: `TEST_REQUEST_ID` (`response.rs:25` — only `TEST_HOST_ID`
-  is `#[cfg(test)]`), `range_not_satisfiable` (:1408, also dead — see RR3),
-  `precondition_failed` (:1674), `forbidden` (:2144), `error` (:2165). Mark
-  `#[cfg(test)]` or delete in favor of `_with_ids` +
+  is `#[cfg(test)]`), `precondition_failed` (:1674), `forbidden` (:2144),
+  `error` (:2165). Mark `#[cfg(test)]` or delete in favor of `_with_ids` +
   `WireResponseIds::for_test()`.
 - [ ] auth: `StreamingSigningContext`/`AuthContext` derive `PartialEq, Eq`
   over key material (request.rs:53, 80) — non-constant-time `==` on secrets;
