@@ -1,0 +1,117 @@
+Production Raft WAL failpoint can terminate the server
+Link: https://chatgpt.com/codex/cloud/security/findings/6d80900b1f148191b0804c9ccca16e8c?sev=&repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin&sort=date_desc
+Criticality: informational (attack path: ignore)
+Status: fixed
+
+# Metadata
+Repo: justincormack/argmin
+Commit: 6d53602
+Author: justin@specialbusservice.com
+Created: 05/07/2026, 10:36:44
+Assignee: Unassigned
+Signals: Validated, Attack-path
+
+# Summary
+Introduced a production-reachable crash/failpoint in non-test code. It should be gated behind a test-only/process-test feature, debug-only configuration, or parsed as an explicit opt-in value unavailable in normal deployments.
+The new process-level crash injection is not limited to tests or debug builds. `ControlPlaneRaftWalFile::append_record_for_log_store` now calls `maybe_exit_after_control_plane_raft_wal_file_sync()` after syncing the WAL file and its parent directory. That helper checks for `ARGMIN_EXPERIMENTAL_RAFT_EXIT_AFTER_PEER_WAL_BEFORE_RESPONSE` and unconditionally calls `std::process::exit(1)` if the variable exists, regardless of its value. This means a production binary launched with that environment variable, even set to `0` or an empty string, will terminate on Raft WAL appends. This is primarily a reliability/operational crash hazard rather than a remotely exploitable security vulnerability because the attacker would need control over the service environment or an operator would need to deploy with the hidden failpoint enabled.
+
+# Resolution
+Fixed in commit [dc7944fdc8df53850bd407780f0de78ace2c85b6](https://github.com/justincormack/argmin/commit/dc7944fdc8df53850bd407780f0de78ace2c85b6) (`Remove raft WAL process failpoint`).
+
+The production-reachable WAL-sync exit hook and its environment-variable trigger were removed from `crates/storage/src/control_plane_raft.rs`, and the peer RPC worker no longer arms any WAL crash guard. The process coverage was rewritten to use normal production behavior: the test makes the restarted follower's state directory unwritable, sends a direct peer append, verifies checkpoint-before-response fails, and then proves the unacknowledged append is recoverable through the ordinary artifact-plus-WAL path. No feature gate or production failpoint remains.
+
+# Validation
+## Rubric
+- [x] Identify the failpoint environment variable and confirm it is not test/debug-gated in the changed storage code.
+- [x] Confirm the public WAL append path reaches the failpoint after file and parent-directory sync.
+- [x] Build a debug target with symbols and verify a baseline WAL append succeeds without the environment variable.
+- [x] Reproduce process termination when the environment variable is present, including value `0` and an empty value.
+- [x] Attempt dynamic diagnostics beyond the crash: Valgrind/ASan availability checked, and LLDB backtrace captured to prove the call chain.
+## Report
+Validated. The failpoint is in non-test storage code: `crates/storage/src/control_plane_raft.rs:4158-4159` defines `ARGMIN_EXPERIMENTAL_RAFT_EXIT_AFTER_PEER_WAL_BEFORE_RESPONSE`; `append_record_for_log_store` writes and syncs the WAL, syncs the parent, then calls `maybe_exit_after_control_plane_raft_wal_file_sync()` at `crates/storage/src/control_plane_raft.rs:4957-4967`; the helper checks only `std::env::var_os(...).is_some()` and calls `std::process::exit(1)` at `crates/storage/src/control_plane_raft.rs:5366-5372`. I built the Rust debug target with symbols via Cargo and created a minimal storage example that directly uses the public `ControlPlaneRaftWalFile::append_record` API. Baseline without the env var exited 0 and printed `after append_record`. With `ARGMIN_EXPERIMENTAL_RAFT_EXIT_AFTER_PEER_WAL_BEFORE_RESPONSE=0`, the same binary exited 1 before returning from `append_record` and printed `experimental OpenRaft control-plane exiting after WAL durability before response`. With the env var present but empty, the built binary also exited 1. I attempted Valgrind, but it is not installed in the container (`bash: command not found: valgrind`); ASan via `-Z sanitizer` is unavailable on the stable toolchain. I also captured an LLDB trace: breakpoint at `maybe_exit_after_control_plane_raft_wal_file_sync` was hit, with stack `wal_exit_poc::main` -> `ControlPlaneRaftWalFile::append_record` at line 4899 -> `append_record_for_log_store` at line 4967 -> `maybe_exit_after_control_plane_raft_wal_file_sync` at line 5367. This confirms the process-level exit is reachable through the WAL append path and is controlled solely by environment-variable presence, including value `0`.
+
+# Evidence
+crates/storage/src/control_plane_raft.rs (L4158 to 4159)
+  Note: Defines the environment variable that enables the crash failpoint in production code.
+```
+const CONTROL_PLANE_RAFT_EXIT_AFTER_WAL_FILE_SYNC_ENV: &str =
+    "ARGMIN_EXPERIMENTAL_RAFT_EXIT_AFTER_PEER_WAL_BEFORE_RESPONSE";
+```
+
+crates/storage/src/control_plane_raft.rs (L4957 to 4968)
+  Note: The WAL append path calls the new failpoint after the WAL and parent directory have been synced, so any Raft WAL write can trigger process termination.
+```
+        inject_control_plane_raft_wal_file_sync_failure(&self.path)
+            .map_err(ControlPlaneRaftWalAppendError::AmbiguousRecordMayExist)?;
+        file.sync_all()
+            .map_err(|source| ControlPlaneError::Io {
+                context: "sync control-plane OpenRaft WAL",
+                source,
+            })
+            .map_err(ControlPlaneRaftWalAppendError::AmbiguousRecordMayExist)?;
+        sync_control_plane_raft_wal_parent(&self.path)
+            .map_err(ControlPlaneRaftWalAppendError::ReplayableRecordMayExist)?;
+        maybe_exit_after_control_plane_raft_wal_file_sync();
+        Ok(())
+```
+
+crates/storage/src/control_plane_raft.rs (L5366 to 5372)
+  Note: The helper checks only for variable presence and then calls std::process::exit(1), with no test/debug gating and no boolean parsing.
+```
+fn maybe_exit_after_control_plane_raft_wal_file_sync() {
+    if std::env::var_os(CONTROL_PLANE_RAFT_EXIT_AFTER_WAL_FILE_SYNC_ENV).is_some() {
+        eprintln!(
+            "experimental OpenRaft control-plane exiting after WAL durability before response"
+        );
+        std::process::exit(1);
+    }
+```
+
+# Attack-path analysis
+Final: ignore | Decider: model_decided | Matrix severity: ignore | Policy adjusted: ignore
+## Rationale
+The code behavior is real and production-reachable in an experimental Raft control-plane configuration, but it is not a substantive security vulnerability under the stated threat model. The decisive trigger is process environment-variable presence, not attacker-controlled network input. Even if triggered, the demonstrated effect is a single-service crash/availability incident, not auth bypass, data exposure, privilege escalation, or RCE. Therefore security criticality is adjusted from low operational severity to ignore for vulnerability triage.
+## Likelihood
+low - An in-scope network attacker cannot set the process environment. Exploitation requires deployer/local environment control or a production deployment that accidentally includes a hidden experimental failpoint variable.
+## Impact
+low - With the failpoint variable present, a Raft WAL append terminates the process after durable sync, causing availability loss for that service instance. The evidence does not show confidentiality, integrity, identity, or code-execution impact.
+## Assumptions
+- Process environment variables are controlled by the deployer or local service manager, not by unauthenticated S3 clients.
+- Host filesystem permissions and Unix-socket directories are trusted as stated in the project threat model.
+- No repository deployment manifests were present to show this failpoint environment variable is set by default in production.
+- argmin-s3 is launched with ARGMIN_CONTROL_PLANE_EXPERIMENTAL_RAFT enabled and a durable Raft WAL path
+- ARGMIN_EXPERIMENTAL_RAFT_EXIT_AFTER_PEER_WAL_BEFORE_RESPONSE is present in the process environment, even if set to 0 or empty
+- a control-plane Raft WAL append occurs after startup
+## Path
+Deployment env control
+  -> experimental Raft control-plane
+  -> WAL append after fsync
+  -> failpoint checks env presence
+  -> process exits(1)
+## Path evidence
+- `crates/storage/src/control_plane_raft.rs:4158-4159` - Defines the environment variable whose presence enables the crash failpoint.
+- `crates/storage/src/control_plane_raft.rs:4684-4685` - The Raft log store applies records by appending them to the configured WAL.
+- `crates/storage/src/control_plane_raft.rs:4957-4967` - The WAL append path syncs the WAL and parent directory, then calls the failpoint helper before returning.
+- `crates/storage/src/control_plane_raft.rs:5366-5372` - The helper checks only for environment-variable presence and calls std::process::exit(1).
+- `crates/argmin-s3/src/config.rs:149` - Experimental Raft control-plane mode is documented as disabled by default.
+- `crates/argmin-s3/src/config.rs:310-313` - Configuration parses ARGMIN_CONTROL_PLANE_EXPERIMENTAL_RAFT with a default of false.
+- `crates/argmin-s3/src/main.rs:2240-2258` - When experimental Raft is enabled, the control-plane runtime constructs a durable Raft authority with a WAL.
+- `crates/argmin-s3/src/main.rs:2688-2718` - Control-plane Unix sockets require absolute configured paths and create missing parent directories with private permissions.
+- `crates/argmin-s3/src/main.rs:2749-2763` - Control-plane socket directories are rejected unless private and owned by the current UID.
+- `crates/argmin-s3/src/main.rs:233-237` - The main process rejects running as root, reducing privilege impact of a crash/restart loop.
+- `crates/argmin-s3/src/main.rs:3406-3414` - The S3 HTTP service binds to the configured listen address at runtime; no deployment ingress was found in the repository.
+- `README.md:31-43` - Documented runtime configuration is environment-variable based, with required S3/SSE secrets and default listen address 127.0.0.1:9000.
+## Narrative
+The report is accurate as an operational bug: production storage code defines a hidden environment variable, the Raft WAL append path calls a helper after file and parent-directory sync, and the helper exits the process whenever the variable is present. Validation demonstrated exit with values 0 and empty. The issue is not a meaningful external security vulnerability because exploitation requires privileged control of the service environment or a deployment mistake; network S3 clients cannot set that environment variable. Impact is single-service availability loss in an experimental, non-default Raft control-plane configuration, with no demonstrated data disclosure, auth bypass, privilege escalation, or code execution.
+## Controls
+- SigV4 authentication is used for S3 requests via configured access keys.
+- Control-plane and Raft peer communication uses Unix sockets under private owner-only directories.
+- ARGMIN_CONTROL_PLANE_EXPERIMENTAL_RAFT defaults to false.
+- The process refuses to run as root.
+- HTTP listener defaults to 127.0.0.1:9000; TLS is optional via configured certificate/key paths.
+- Connection and in-flight request limits exist for the HTTP server, but they do not mitigate this environment-gated exit.
+## Blindspots
+- Static repository review found no Docker/Kubernetes/Terraform manifests, so actual production environment variables and exposure could not be verified.
+- No cloud APIs were called and no runtime deployment was inspected.
+- The validation PoC proves the WAL API crash path but does not demonstrate an external client setting the required environment variable.
+- Multi-node Raft operational blast radius depends on deployment topology not present in the repository.
