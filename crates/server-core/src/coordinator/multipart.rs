@@ -317,7 +317,7 @@ impl Coordinator {
                         storage::BeginUploadPartStreamSessionReq {
                             bucket: req.upload.bucket_name_typed().clone(),
                             key: req.upload.key_typed().clone(),
-                            upload_id: req.upload.upload_id_typed().clone(),
+                            upload_id: req.upload.upload_id().clone(),
                             part_number: req.part_number,
                             session_id: session_id.clone(),
                             bucket_write_reservation: proof.clone(),
@@ -1004,7 +1004,7 @@ impl Coordinator {
         let bucket = req.upload.bucket_name();
         let key = req.upload.key();
         let session_id = req.session_id;
-        let upload_id = req.upload.upload_id_typed();
+        let upload_id = req.upload.upload_id();
         let part_number = req.part_number;
         let crc64 = req.crc64;
         let total_size = req.total_size;

@@ -484,10 +484,12 @@ sweeps so the next drift is a compile error.
   `SystemMetadata::from_pairs` alias and the divergent `MetadataBlob::from_pairs`
   / unused `set` APIs. Existing tests now use the production `from_headers`
   constructors, so request-shape metadata parsing has a single validation path.
-- [ ] `MultipartObjectRequest`: `new`/`new_typed`, `from_object`/
+- [x] `MultipartObjectRequest`: `new`/`new_typed`, `from_object`/
   `from_object_typed`, `upload_id`/`upload_id_typed` are byte-identical
   duplicates that muddy the `_typed` convention
-  (`coordinator/request_types.rs:1028-1093`). Delete the aliases.
+  (`coordinator/request_types.rs:1028-1093`). Resolution: delete the aliases
+  and update call sites to use `new`, `from_object`, and `upload_id`, which
+  already take and return typed `UploadId` values.
 - [ ] Dead SSE-S3 alias layer: `SseS3WriteContext` + four `sse_s3_*` fns only
   tests call (`sse.rs:379, 643-683`). Migrate tests to `managed_encryption`
   names, delete.

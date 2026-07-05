@@ -4184,7 +4184,7 @@ impl HttpFrontend {
             requester.clone(),
             expected_bucket_owner.as_deref(),
         )?;
-        let binding_upload_id = upload.upload_id_typed().clone();
+        let binding_upload_id = upload.upload_id().clone();
         let binding_bucket = upload.object.bucket.name.clone();
         let binding_key = upload.object.key.clone();
         let storage_node = self.coordinator.storage_node_for_request();
@@ -4303,7 +4303,7 @@ impl HttpFrontend {
         let result = self.coordinator.finalize_stream_part_with_storage_node(
             &ctx.storage_node,
             FinalizeStreamPartRequest {
-                upload: MultipartObjectRequest::new_typed(
+                upload: MultipartObjectRequest::new(
                     ctx.bucket().clone(),
                     ctx.key().clone(),
                     ctx.upload_id().clone(),

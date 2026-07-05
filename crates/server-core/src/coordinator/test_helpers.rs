@@ -38,7 +38,7 @@ pub fn upload_part(
     req: &UploadPartRequest<'_>,
 ) -> Result<UploadPartResult, ServerError> {
     let storage_node = coord.storage_node_for_request();
-    let upload_id = req.upload.upload_id_typed().clone();
+    let upload_id = req.upload.upload_id().clone();
     let session = coord.begin_stream_part_with_storage_node(
         &storage_node,
         &BeginStreamPartRequest {
@@ -63,7 +63,7 @@ pub fn upload_part(
                 &AppendStreamPartRequest {
                     bucket: req.upload.object.bucket.name_typed().clone(),
                     key: req.upload.object.key_typed().clone(),
-                    upload_id: req.upload.upload_id_typed(),
+                    upload_id: req.upload.upload_id(),
                     session_id,
                     part_number: req.part_number,
                     segment_index: idx as u32,

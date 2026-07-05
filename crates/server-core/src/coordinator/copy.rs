@@ -573,7 +573,7 @@ impl Coordinator {
             self.finalize_stream_part_with_storage_node(
                 &storage_node,
                 FinalizeStreamPartRequest {
-                    upload: MultipartObjectRequest::new_typed(
+                    upload: MultipartObjectRequest::new(
                         bucket.clone(),
                         key.clone(),
                         upload_id.clone(),

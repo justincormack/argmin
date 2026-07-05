@@ -217,7 +217,7 @@ impl Coordinator {
         let src_version_id = req.source.version_id;
         let dst_bucket = req.upload.bucket_name_typed();
         let dst_key = req.upload.key_typed();
-        let upload_id = req.upload.upload_id_typed();
+        let upload_id = req.upload.upload_id();
         let part_number = req.part_number;
         let requester = req.upload.requester();
         let policy_context = req
@@ -292,7 +292,7 @@ impl Coordinator {
     ) -> Result<AuthorizedBeginStreamPart, ServerError> {
         let bucket = req.upload.bucket_name_typed();
         let key = req.upload.key_typed();
-        let upload_id = req.upload.upload_id_typed();
+        let upload_id = req.upload.upload_id();
         let part_number = req.part_number;
         let policy_context = req.effective_policy_context();
         let bucket_info = ValidatedBucket(bucket_handle.bucket().clone());
@@ -351,7 +351,7 @@ impl Coordinator {
     ) -> Result<AuthorizedCompleteMultipartUpload, ServerError> {
         let bucket = req.upload.bucket_name_typed();
         let key = req.upload.key_typed();
-        let upload_id = req.upload.upload_id_typed();
+        let upload_id = req.upload.upload_id();
         let bucket_info = ValidatedBucket(bucket_handle.bucket().clone());
         let modern_bucket_info = ModernBucketSummary::from(&*bucket_info);
         let modern_bucket = BoeBucketSummary::assume_boe(&modern_bucket_info);

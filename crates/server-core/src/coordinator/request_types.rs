@@ -1043,23 +1043,6 @@ impl<'a> MultipartObjectRequest<'a> {
         Self { object, upload_id }
     }
 
-    pub fn from_object_typed(object: ObjectRequest<'a>, upload_id: UploadId) -> Self {
-        Self { object, upload_id }
-    }
-
-    pub fn new_typed(
-        bucket: BucketName,
-        key: ObjectKey,
-        upload_id: UploadId,
-        requester: Requester,
-        expected_bucket_owner: Option<&'a str>,
-    ) -> Self {
-        Self::from_object_typed(
-            ObjectRequest::new(bucket, key, requester, expected_bucket_owner),
-            upload_id,
-        )
-    }
-
     pub fn object(&self) -> &ObjectRequest<'a> {
         &self.object
     }
@@ -1085,10 +1068,6 @@ impl<'a> MultipartObjectRequest<'a> {
     }
 
     pub fn upload_id(&self) -> &UploadId {
-        &self.upload_id
-    }
-
-    pub fn upload_id_typed(&self) -> &UploadId {
         &self.upload_id
     }
 

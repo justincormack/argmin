@@ -549,7 +549,7 @@ impl Coordinator {
         let src_version_id = req.source.version_id;
         let dst_bucket = req.upload.bucket_name_typed();
         let dst_key = req.upload.key_typed();
-        let upload_id = req.upload.upload_id_typed();
+        let upload_id = req.upload.upload_id();
         let part_number = req.part_number;
         let requester = req.upload.requester();
         let policy_context = req
@@ -622,7 +622,7 @@ impl Coordinator {
     ) -> Result<AuthorizedBeginStreamPart, ServerError> {
         let bucket = req.upload.bucket_name_typed();
         let key = req.upload.key_typed();
-        let upload_id = req.upload.upload_id_typed();
+        let upload_id = req.upload.upload_id();
         let part_number = req.part_number;
         let policy_context = req.effective_policy_context();
         let bucket_info = ValidatedBucket(bucket_handle.bucket().clone());
@@ -676,7 +676,7 @@ impl Coordinator {
     ) -> Result<AuthorizedBeginStreamPart, ServerError> {
         let bucket = req.upload.bucket_name_typed();
         let key = req.upload.key_typed();
-        let upload_id = req.upload.upload_id_typed();
+        let upload_id = req.upload.upload_id();
         let request = BucketHandleRequest::new()
             .requiring_policy_view()
             .requiring_bucket_tags_if_abac_enabled();
@@ -697,7 +697,7 @@ impl Coordinator {
     ) -> Result<AuthorizedCompleteMultipartUpload, ServerError> {
         let bucket = req.upload.bucket_name_typed();
         let key = req.upload.key_typed();
-        let upload_id = req.upload.upload_id_typed();
+        let upload_id = req.upload.upload_id();
         let bucket_info = ValidatedBucket(bucket_handle.bucket().clone());
         let bucket_policy = self.cached_bucket_policy_for_loaded_handle(&bucket_handle)?;
         let bucket_tags = Self::loaded_bucket_tags_for_policy(&bucket_handle)?;
@@ -771,7 +771,7 @@ impl Coordinator {
     ) -> Result<AuthorizedAbortMultipartUpload, ServerError> {
         let bucket = req.object.bucket_name_typed();
         let key = req.object.key_typed();
-        let upload_id = req.upload_id_typed();
+        let upload_id = req.upload_id();
         let bucket_info = self.checked_active_bucket_summary_for_storage_node(
             storage_node,
             bucket,
@@ -837,7 +837,7 @@ impl Coordinator {
     ) -> Result<AuthorizedListParts, ServerError> {
         let bucket = req.upload.bucket_name_typed();
         let key = req.upload.key_typed();
-        let upload_id = req.upload.upload_id_typed();
+        let upload_id = req.upload.upload_id();
         let bucket_info =
             self.checked_active_bucket_summary_for(bucket, req.expected_bucket_owner())?;
         match self
