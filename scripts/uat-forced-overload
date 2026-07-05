@@ -28,6 +28,7 @@ Environment knobs:
   ARGMIN_FORCED_OVERLOAD_RPC_CONTROL_WAIT_MS       default: 250
   ARGMIN_FORCED_OVERLOAD_MAX_INFLIGHT_REQUESTS     default: 32
   ARGMIN_FORCED_OVERLOAD_TIMEOUT_SECS              default: 30
+  ARGMIN_FORCED_OVERLOAD_DATA_DIR                  caller-owned data directory
   ARGMIN_FORCED_OVERLOAD_REQUIRE_STORAGE_RPC_WAIT  default: 1
   ARGMIN_FORCED_OVERLOAD_ALLOW_RETRYABLE_FAILURE   default: 0
 
@@ -59,6 +60,10 @@ as_int() {
 data_dir="${ARGMIN_FORCED_OVERLOAD_DATA_DIR:-}"
 cleanup=1
 caller_data_dir=0
+if [[ -n "$data_dir" ]]; then
+    caller_data_dir=1
+    cleanup=0
+fi
 listen_addr=""
 bucket_prefix=""
 timeout_secs="${ARGMIN_FORCED_OVERLOAD_TIMEOUT_SECS:-30}"
