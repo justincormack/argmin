@@ -4155,6 +4155,8 @@ const CONTROL_PLANE_RAFT_WAL_RECORD_APPEND: u8 = 2;
 const CONTROL_PLANE_RAFT_WAL_RECORD_SAVE_COMMITTED: u8 = 3;
 const CONTROL_PLANE_RAFT_WAL_RECORD_TRUNCATE_AFTER: u8 = 4;
 const CONTROL_PLANE_RAFT_WAL_RECORD_PURGE: u8 = 5;
+const CONTROL_PLANE_RAFT_EXIT_AFTER_WAL_FILE_SYNC_ENV: &str =
+    "ARGMIN_EXPERIMENTAL_RAFT_EXIT_AFTER_PEER_WAL_BEFORE_RESPONSE";
 const CONTROL_PLANE_RAFT_PEER_RPC_MAGIC: &[u8] = b"ARGMINCPRAFTPEER";
 const CONTROL_PLANE_RAFT_PEER_RPC_VERSION: u16 = 1;
 const CONTROL_PLANE_RAFT_PEER_RPC_CHECKSUM_LEN: usize = 8;
@@ -4962,6 +4964,7 @@ impl ControlPlaneRaftWalFile {
             .map_err(ControlPlaneRaftWalAppendError::AmbiguousRecordMayExist)?;
         sync_control_plane_raft_wal_parent(&self.path)
             .map_err(ControlPlaneRaftWalAppendError::ReplayableRecordMayExist)?;
+        maybe_exit_after_control_plane_raft_wal_file_sync();
         Ok(())
     }
 
@@ -5357,6 +5360,15 @@ impl ControlPlaneRaftWalFile {
 
     fn file_header_len() -> usize {
         CONTROL_PLANE_RAFT_WAL_FILE_MAGIC.len() + 2 + 8 + CONTROL_PLANE_RAFT_WAL_CHECKSUM_LEN
+    }
+}
+
+fn maybe_exit_after_control_plane_raft_wal_file_sync() {
+    if std::env::var_os(CONTROL_PLANE_RAFT_EXIT_AFTER_WAL_FILE_SYNC_ENV).is_some() {
+        eprintln!(
+            "experimental OpenRaft control-plane exiting after WAL durability before response"
+        );
+        std::process::exit(1);
     }
 }
 
@@ -11729,9 +11741,12 @@ mod tests {
             let (wal_base_offset, _) =
                 ControlPlaneRaftWalFile::decode_file_header(&compacted_bytes).unwrap();
             assert_eq!(wal_base_offset, artifact.wal_replay_offset);
-            assert_eq!(
-                wal.clean_len()
-                    .expect("compacted WAL clean length should read"),
+            let compacted_clean_len = wal
+                .clean_len()
+                .expect("compacted WAL clean length should read");
+            assert!(
+                compacted_clean_len >= artifact.wal_replay_offset,
+                "compacted WAL clean length {compacted_clean_len} should not precede checkpoint replay offset {}",
                 artifact.wal_replay_offset
             );
             let status = authority.status().await.unwrap();
@@ -11739,10 +11754,7 @@ mod tests {
                 status.durable_wal_base_offset(),
                 Some(artifact.wal_replay_offset)
             );
-            assert_eq!(
-                status.durable_wal_clean_len(),
-                Some(artifact.wal_replay_offset)
-            );
+            assert_eq!(status.durable_wal_clean_len(), Some(compacted_clean_len));
             artifact
                 .restore_with_wal_file(ControlPlaneRaftWalFile::new(&wal_path, "test-cluster", 1))
                 .expect("checkpoint artifact should restore after WAL compaction");

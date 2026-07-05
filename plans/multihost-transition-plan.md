@@ -10833,6 +10833,15 @@ Phase 12.4 progress:
   artifact-plus-compacted-WAL restore, and authority checkpointing that removes
   the checkpointed prefix while exposing the resulting base offset through the
   replicated authority status surface.
+- Started process-level WAL crash/fault injection for the WAL-only peer ack
+  boundary. An env-gated test failpoint now exits after a WAL record and its
+  parent directory are synced, before the peer RPC response can be written. A
+  three-process regression restarts a follower with that failpoint, commits a
+  real leader-to-follower log-store mutation through the surviving quorum, proves the
+  follower exits before rewriting the checkpoint artifact, proves
+  artifact-plus-WAL recovery sees the unacknowledged-but-fsynced mutation, and
+  then restarts the follower normally to catch up through the recovered WAL
+  state.
 
 1. define the replicated control-plane state machine:
    - state includes cluster epoch, PG count, PG state, PG acting sets, node
