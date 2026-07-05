@@ -10853,6 +10853,12 @@ Phase 12.4 progress:
   decodes and validates frames. A regression corrupts a middle WAL frame and
   proves status remains cheap/available while replay fails closed on the same
   corruption.
+- Hardened configured peer-policy validation across artifact-plus-WAL restore.
+  Durable Unix-peer startup now validates the base checkpoint artifact, replays
+  the WAL suffix into a candidate restart artifact, and re-runs the same static
+  peer membership validator before constructing the live OpenRaft stores. A
+  regression appends a WAL-only membership entry that does not match the
+  configured peer map and proves startup fails closed.
 
 1. define the replicated control-plane state machine:
    - state includes cluster epoch, PG count, PG state, PG acting sets, node

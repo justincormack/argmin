@@ -2819,7 +2819,7 @@ fn restore_experimental_raft_durable_artifact(
     node_id: ControlPlaneRaftNodeId,
     artifact_path: &Path,
     wal_path: Option<&Path>,
-    validate_artifact: impl FnOnce(&ControlPlaneRaftRestartArtifact) -> Result<(), ControlPlaneError>,
+    validate_artifact: impl Fn(&ControlPlaneRaftRestartArtifact) -> Result<(), ControlPlaneError>,
 ) -> Result<(ControlPlaneRaftLogStore, ControlPlaneRaftStateMachine), ControlPlaneError> {
     let sentinel_path = durable_artifact_sentinel_path(artifact_path);
     match ControlPlaneRaftRestartArtifact::load_durable_artifact(artifact_path) {
@@ -2842,11 +2842,10 @@ fn restore_experimental_raft_durable_artifact(
             artifact.validate_local_node_identity(node_id)?;
             validate_artifact(&artifact)?;
             if let Some(wal_path) = wal_path {
-                artifact.restore_with_wal_file(ControlPlaneRaftWalFile::new(
-                    wal_path,
-                    cluster_name,
-                    node_id,
-                ))
+                artifact.restore_with_wal_file_validated(
+                    ControlPlaneRaftWalFile::new(wal_path, cluster_name, node_id),
+                    validate_artifact,
+                )
             } else {
                 artifact.restore().map_err(|source| ControlPlaneError::Io {
                     context: "restore control-plane OpenRaft durable restart artifact",
@@ -5656,6 +5655,16 @@ impl ControlPlaneRaftRestartArtifact {
         self,
         wal: ControlPlaneRaftWalFile,
     ) -> Result<(ControlPlaneRaftLogStore, ControlPlaneRaftStateMachine), ControlPlaneError> {
+        self.restore_with_wal_file_validated(wal, |_| Ok(()))
+    }
+
+    fn restore_with_wal_file_validated(
+        self,
+        wal: ControlPlaneRaftWalFile,
+        validate_replayed_artifact: impl FnOnce(
+            &ControlPlaneRaftRestartArtifact,
+        ) -> Result<(), ControlPlaneError>,
+    ) -> Result<(ControlPlaneRaftLogStore, ControlPlaneRaftStateMachine), ControlPlaneError> {
         let log_store_artifact =
             wal.replay_log_store_artifact_from(&self.log_store, self.wal_replay_offset)?;
         Self::validate_log_store_state_machine_pair(&log_store_artifact, &self.state_machine)
@@ -5672,6 +5681,14 @@ impl ControlPlaneRaftRestartArtifact {
             context: "validate control-plane OpenRaft cached snapshot after WAL replay",
             source,
         })?;
+        let replayed_artifact = ControlPlaneRaftRestartArtifact {
+            cluster_name: self.cluster_name,
+            local_node_id: self.local_node_id,
+            wal_replay_offset: self.wal_replay_offset,
+            log_store: log_store_artifact.clone(),
+            state_machine: self.state_machine.clone(),
+        };
+        validate_replayed_artifact(&replayed_artifact)?;
         let log_store = ControlPlaneRaftLogStore::from_restart_artifact_inner(
             log_store_artifact,
             Some(Arc::new(wal)),
@@ -5680,11 +5697,15 @@ impl ControlPlaneRaftRestartArtifact {
             context: "restore control-plane OpenRaft WAL-backed log store",
             source,
         })?;
-        let state_machine = ControlPlaneRaftStateMachine::from_restart_artifact(self.state_machine)
-            .map_err(|error| ControlPlaneError::Io {
-                context: "restore control-plane OpenRaft state machine restart artifact",
-                source: control_plane_error_to_io_error("OpenRaft state-machine restart", error),
-            })?;
+        let state_machine =
+            ControlPlaneRaftStateMachine::from_restart_artifact(replayed_artifact.state_machine)
+                .map_err(|error| ControlPlaneError::Io {
+                    context: "restore control-plane OpenRaft state machine restart artifact",
+                    source: control_plane_error_to_io_error(
+                        "OpenRaft state-machine restart",
+                        error,
+                    ),
+                })?;
         Ok((log_store, state_machine))
     }
 
@@ -18148,6 +18169,54 @@ mod tests {
                     cluster_name,
                     1,
                     &path,
+                    policy,
+                    Duration::from_millis(50),
+                )
+                .await,
+                "retained log entry does not match configured peer map",
+            );
+        });
+    }
+
+    #[test]
+    fn control_plane_openraft_unix_peer_durable_rejects_wal_membership_mismatch() {
+        ControlPlaneRaftTypeConfig::run(async {
+            let tmp = test_util::tempdir();
+            let path = tmp.path().join("raft.state");
+            let wal_path = tmp.path().join("raft.wal");
+            let cluster_name = "control-plane-raft-unix-peer-durable-wal-membership-mismatch-test";
+            let policy = ControlPlaneRaftPeerTransportPolicy::from_peer_endpoints(
+                cluster_name,
+                [
+                    (1, "/tmp/argmin-raft-node-1.sock".to_string()),
+                    (2, "/tmp/argmin-raft-node-2.sock".to_string()),
+                ],
+                ControlPlaneRaftPeerTransportLimits::default(),
+            );
+            let artifact = ControlPlaneRaftRestartArtifact {
+                cluster_name: cluster_name.to_string(),
+                local_node_id: 1,
+                wal_replay_offset: 0,
+                log_store: ControlPlaneRaftLogStoreRestartArtifact {
+                    entries: vec![policy_bootstrap_membership_entry(1, &policy)],
+                    ..Default::default()
+                },
+                state_machine: ControlPlaneRaftStateMachine::empty().export_restart_artifact(),
+            };
+            artifact.store_durable_artifact(&path).unwrap();
+
+            let wal = ControlPlaneRaftWalFile::new(&wal_path, cluster_name, 1);
+            wal.append_record(&ControlPlaneRaftWalRecord::Append(vec![
+                single_node_membership_entry(3, 1, 1),
+            ]))
+            .expect("WAL-only membership suffix should persist");
+
+            assert_error_contains(
+                ControlPlaneRaftAuthority::new_experimental_unix_peer_durable_with_wal(
+                    cluster_name,
+                    1,
+                    &path,
+                    &wal_path,
                     policy,
                     Duration::from_millis(50),
                 )
