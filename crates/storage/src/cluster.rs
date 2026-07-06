@@ -1136,10 +1136,9 @@ impl StorageClusterRuntimeMapHandle {
             });
         }
         if candidate.cluster_epoch() == current.cluster_epoch()
-            && route_map_validity_regressed(
-                current.route_map_valid_until_ms(),
-                candidate.route_map_valid_until_ms(),
-            )
+            && current
+                .route_map_validity()
+                .regresses_to(candidate.route_map_validity())
         {
             return Err(StorageClusterRuntimeMapRefreshError::ValidityRegression {
                 current: current.route_map_valid_until_ms(),
@@ -1375,10 +1374,6 @@ impl StorageClusterRuntimeMapHandle {
             handle: Some(handle),
         })
     }
-}
-
-fn route_map_validity_regressed(current: Option<u64>, candidate: Option<u64>) -> bool {
-    current.is_some() && candidate.is_none()
 }
 
 fn runtime_map_refresh_error_requires_current_map_invalidation(

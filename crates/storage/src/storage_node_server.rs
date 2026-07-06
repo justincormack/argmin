@@ -1778,10 +1778,9 @@ impl StorageNodeServer {
             });
         }
         if next_config.cluster_epoch == current_config.cluster_epoch
-            && route_map_validity_regressed(
-                current_config.route_map_valid_until_ms(),
-                next_config.route_map_valid_until_ms(),
-            )
+            && current_config
+                .route_map_validity
+                .regresses_to(next_config.route_map_validity)
         {
             return Err(StorageNodeServerError::RuntimeRefreshValidityRegression {
                 current: current_config.route_map_valid_until_ms(),
@@ -11256,10 +11255,6 @@ fn validate_process_config_route_table(
         }
     }
     Ok(())
-}
-
-fn route_map_validity_regressed(current: Option<u64>, candidate: Option<u64>) -> bool {
-    current.is_some() && candidate.is_none()
 }
 
 fn validate_socket_directory(socket_path: &Path) -> Result<(), StorageNodeServerError> {

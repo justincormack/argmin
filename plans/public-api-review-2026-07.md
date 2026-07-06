@@ -154,12 +154,16 @@ Remaining order of attack:
   the same `UnexpectedSecurityToken` path as token query parameters and
   header-auth token inputs.
 
-- [ ] **RR8. `route_map_validity_regressed` duplicated verbatim** at
+- [x] **RR8. `route_map_validity_regressed` duplicated verbatim** at
   `storage/src/cluster.rs:1325` and `storage/src/storage_node_server.rs:11148`
   — a fresh instance of the P2 duplicate-entry-point pattern created by the
   S6 fix. Both copies also operate on `Option<u64>` projections rather than
   `RouteMapValidity` itself, keeping non-diagnostic Option plumbing alive.
-  Consolidate into one helper taking the enum.
+  Consolidate into one helper taking the enum. Fixed by moving the regression
+  predicate onto `RouteMapValidity::regresses_to`, with current semantics that
+  `Until(_) -> Forever` is a refresh regression while bounded shrinks are
+  permitted, and using that helper from both frontend and storage-node runtime
+  map install paths.
 
 - [ ] **RR9. Bucket write *drains* still have the pre-S1 shape.**
   `begin_durable_bucket_write_drain` takes `lease_deadline: Option<u64>`
@@ -468,9 +472,10 @@ steps it performs.
   refresh propagation can still bound previously pinned static/local
   generations when an authoritative bounded map is installed. The
   `valid_until_ms()` accessors remain only as deadline projections for
-  diagnostics and error payloads. Re-review 2026-07-05: verified; residuals
-  tracked as RR8 (duplicated `route_map_validity_regressed`), RR11
-  (`u64::MAX` sentinel), and RR14 (wire-format `Forever` tolerance).
+  diagnostics and error payloads. Re-review 2026-07-05: verified; remaining
+  residuals tracked as RR11 (`u64::MAX` sentinel) and RR14 (wire-format
+  `Forever` tolerance). RR8 removed the duplicated route-map validity
+  regression helper.
 
 ## Bugs — checksum handling (cross-crate)
 
