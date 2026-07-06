@@ -2443,7 +2443,7 @@ pub struct BucketWriteDrainRecord {
     pub bucket_execution_generation: u64,
     pub state: BucketWriteDrainState,
     pub created_at: u64,
-    pub lease_deadline: Option<u64>,
+    pub lease_deadline: u64,
 }
 
 /// Maximum stored diagnostic detail for a durable DeleteBucket attempt outcome.
@@ -2501,7 +2501,7 @@ pub struct BucketDeleteDebugDrain {
     pub cluster_epoch: ClusterEpoch,
     pub bucket_execution_generation: u64,
     pub created_at: u64,
-    pub lease_deadline: Option<u64>,
+    pub lease_deadline: u64,
 }
 
 /// Durable bucket-delete finalizer claim fields included in local-debug output.

@@ -654,7 +654,7 @@ impl BucketWriteReservationNodeClient for UnixStorageNodeClient {
         owner_token: &str,
         cluster_epoch: ClusterEpoch,
         created_at: u64,
-        lease_deadline: Option<u64>,
+        lease_deadline: u64,
     ) -> Result<BucketWriteDrainRecord, BucketSnapshotLoadError> {
         let request = StorageRpcBucketWriteDrainBeginRequest {
             bucket: StorageRpcBucketRequest {
@@ -842,7 +842,7 @@ impl BucketWriteReservationNodeClient for UnixStorageNodeClient {
             || renewed.owner_token != record.owner_token
             || renewed.cluster_epoch != record.cluster_epoch
             || renewed.bucket_execution_generation != record.bucket_execution_generation
-            || renewed.lease_deadline != Some(lease_deadline)
+            || renewed.lease_deadline != lease_deadline
         {
             return Err(BucketSnapshotLoadError::Store(self.rpc_payload_error(
                 "validate bucket write drain heartbeat response",

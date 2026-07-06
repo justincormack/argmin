@@ -1760,7 +1760,7 @@ fn begin_bucket_delete_partial_mark_deleting_reopens_and_converges() {
             "delete-mark-reopen-owner",
             crate::ClusterEpoch::INITIAL,
             now,
-            None,
+            now.saturating_add(30_000),
         )
         .unwrap();
         let current =
@@ -3301,7 +3301,7 @@ fn begin_bucket_delete_reaps_expired_durable_write_reservation() {
 }
 
 #[test]
-fn begin_bucket_delete_bounds_active_delete_drain_wait() {
+fn begin_bucket_delete_adopts_live_same_generation_delete_drain() {
     let tmp = test_util::tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
     let ec_shape = EcShape { k: 2, m: 1 };
@@ -3333,25 +3333,17 @@ fn begin_bucket_delete_bounds_active_delete_drain_wait() {
         "other-delete-owner",
         crate::ClusterEpoch::INITIAL,
         crate::clock::current_time_millis(),
-        None,
+        crate::clock::current_time_millis().saturating_add(30_000),
     )
     .unwrap();
     drop(bucket_pg);
 
-    let started = std::time::Instant::now();
-    let err = cluster
+    cluster
         .test_begin_bucket_delete_if_current(&bucket)
-        .unwrap_err();
+        .unwrap();
     assert!(
-        started.elapsed() < Duration::from_secs(15),
-        "DeleteBucket should not wait indefinitely behind another active delete drain"
-    );
-    assert!(
-        matches!(
-            err,
-            crate::BucketWriteDrainError::Store(StoreError::MetadataCommandContention { .. })
-        ),
-        "active delete drain should make DeleteBucket return retryable contention, got {err:?}"
+        drain.lease_deadline > crate::clock::current_time_millis(),
+        "test must seed a live delete drain"
     );
     let bucket_pg = map
         .node(NodeId::new(1))
@@ -3365,15 +3357,14 @@ fn begin_bucket_delete_bounds_active_delete_drain_wait() {
             .as_ref()
             .map(|record| record.drain_id.as_str()),
         Some(drain.drain_id.as_str()),
-        "DeleteBucket must not clear another caller's active delete drain"
+        "DeleteBucket should adopt the live same-generation delete drain"
     );
-    assert_eq!(
+    assert!(matches!(
         crate::PgMetadataStore::head_bucket_raw(&*bucket_pg, &bucket)
             .unwrap()
             .state,
-        crate::BucketState::Active,
-        "timed out DeleteBucket begin must leave the bucket active"
-    );
+        crate::BucketState::Deleting
+    ));
 }
 
 #[test]
@@ -3403,10 +3394,7 @@ fn begin_bucket_delete_adopts_active_delete_drain_after_reopen() {
             panic!("fresh active bucket should acquire delete drain")
         }
     };
-    let original_deadline = drain
-        .record
-        .lease_deadline
-        .expect("delete drains should carry a recovery lease deadline");
+    let original_deadline = drain.record.lease_deadline;
     clock.set(12_000);
     drop(cluster);
     drop(map);
@@ -3449,7 +3437,7 @@ fn begin_bucket_delete_adopts_active_delete_drain_after_reopen() {
     );
     let renewed_deadline = crate::PgMetadataStore::durable_bucket_write_drain(&*bucket_pg, &bucket)
         .unwrap()
-        .and_then(|record| record.lease_deadline)
+        .map(|record| record.lease_deadline)
         .expect("adopted delete drain should remain leased until finalization");
     assert!(
         renewed_deadline > original_deadline,
@@ -3530,7 +3518,7 @@ fn durable_scan_skips_live_and_queues_expired_delete_begin_drain_after_reopen() 
             "expired-delete-begin-scan-owner",
             crate::ClusterEpoch::INITIAL,
             now.saturating_sub(10),
-            Some(now.saturating_sub(1)),
+            now.saturating_sub(1),
         )
         .unwrap()
     };
@@ -3608,7 +3596,7 @@ fn durable_scan_paginates_past_excluded_delete_begin_drains() {
             "expired-delete-begin-page-owner",
             crate::ClusterEpoch::INITIAL,
             now.saturating_sub(10),
-            Some(now.saturating_sub(1)),
+            now.saturating_sub(1),
         )
         .unwrap();
         drains.push(drain);
@@ -3980,9 +3968,7 @@ fn begin_bucket_delete_renews_drain_after_final_visibility_proof_before_retryabl
     let preserved_drain = crate::PgMetadataStore::durable_bucket_write_drain(&*bucket_pg, &bucket)
         .unwrap()
         .expect("retryable final visibility proof should preserve the delete drain");
-    let preserved_deadline = preserved_drain
-        .lease_deadline
-        .expect("preserved delete drain should remain leased");
+    let preserved_deadline = preserved_drain.lease_deadline;
     assert!(
         preserved_deadline > 20_000,
         "final visibility proof should renew the drain for a later retry; deadline={preserved_deadline}"
@@ -6396,7 +6382,7 @@ fn begin_bucket_delete_recovers_expired_durable_drain_after_reopen() {
             "dead-delete-owner",
             crate::ClusterEpoch::INITIAL,
             now.saturating_sub(10),
-            Some(now.saturating_sub(1)),
+            now.saturating_sub(1),
         )
         .unwrap();
     }

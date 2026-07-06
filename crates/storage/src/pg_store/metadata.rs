@@ -4744,7 +4744,7 @@ fn bucket_write_drain_from_row(
     let bucket_execution_generation_raw: i64 = row.get(4)?;
     let state_raw: i64 = row.get(5)?;
     let created_at_raw: i64 = row.get(6)?;
-    let lease_deadline_raw: Option<i64> = row.get(7)?;
+    let lease_deadline_raw: i64 = row.get(7)?;
     let state = match state_raw {
         0 => BucketWriteDrainState::Draining,
         _ => {
@@ -4794,7 +4794,13 @@ fn bucket_write_drain_from_row(
                 Box::from(format!("invalid created_at: {created_at_raw}")),
             )
         })?,
-        lease_deadline: PgStore::parse_optional_u64(lease_deadline_raw, 7, "lease_deadline")?,
+        lease_deadline: u64::try_from(lease_deadline_raw).map_err(|_| {
+            rusqlite::Error::FromSqlConversionFailure(
+                7,
+                rusqlite::types::Type::Integer,
+                Box::from(format!("invalid lease_deadline: {lease_deadline_raw}")),
+            )
+        })?,
     })
 }
 
@@ -5733,19 +5739,16 @@ impl PgMetadataStore for PgStore {
         owner_token: &str,
         cluster_epoch: ClusterEpoch,
         created_at: u64,
-        lease_deadline: Option<u64>,
+        lease_deadline: u64,
     ) -> Result<BucketWriteDrainRecord, MetadataError> {
         let created_at = i64::try_from(created_at).map_err(|source| MetadataError::Db {
             context: "begin durable bucket write drain created_at",
             source: rusqlite::Error::ToSqlConversionFailure(Box::new(source)),
         })?;
-        let lease_deadline = lease_deadline
-            .map(i64::try_from)
-            .transpose()
-            .map_err(|source| MetadataError::Db {
-                context: "begin durable bucket write drain lease_deadline",
-                source: rusqlite::Error::ToSqlConversionFailure(Box::new(source)),
-            })?;
+        let lease_deadline = i64::try_from(lease_deadline).map_err(|source| MetadataError::Db {
+            context: "begin durable bucket write drain lease_deadline",
+            source: rusqlite::Error::ToSqlConversionFailure(Box::new(source)),
+        })?;
         let inserted = self
             .conn
             .execute(
@@ -5777,7 +5780,7 @@ impl PgMetadataStore for PgStore {
                     && existing.owner_token == owner_token
                     && existing.cluster_epoch == cluster_epoch
                     && existing.created_at == created_at as u64
-                    && existing.lease_deadline == lease_deadline.map(|deadline| deadline as u64)
+                    && existing.lease_deadline == lease_deadline as u64
                 {
                     return Ok(existing);
                 }
@@ -5822,24 +5825,31 @@ impl PgMetadataStore for PgStore {
         owner_token: &str,
         cluster_epoch: ClusterEpoch,
         bucket_execution_generation: u64,
+        lease_deadline: u64,
     ) -> Result<(), MetadataError> {
         let generation =
             i64::try_from(bucket_execution_generation).map_err(|source| MetadataError::Db {
                 context: "clear durable bucket write drain generation",
                 source: rusqlite::Error::ToSqlConversionFailure(Box::new(source)),
             })?;
+        let lease_deadline = i64::try_from(lease_deadline).map_err(|source| MetadataError::Db {
+            context: "clear durable bucket write drain lease deadline",
+            source: rusqlite::Error::ToSqlConversionFailure(Box::new(source)),
+        })?;
         let deleted = self
             .conn
             .execute(
                 "DELETE FROM bucket_write_drains \
                  WHERE bucket_name = ?1 AND drain_id = ?2 AND owner_token = ?3 \
-                   AND cluster_epoch = ?4 AND bucket_execution_generation = ?5",
+                   AND cluster_epoch = ?4 AND bucket_execution_generation = ?5 \
+                   AND lease_deadline = ?6",
                 params![
                     name.as_str(),
                     drain_id,
                     owner_token,
                     cluster_epoch.get(),
-                    generation
+                    generation,
+                    lease_deadline
                 ],
             )
             .map_err(|source| MetadataError::Db {
@@ -5889,11 +5899,8 @@ impl PgMetadataStore for PgStore {
             }) else {
                 return Ok(None);
             };
-            let Some(lease_deadline) = record.lease_deadline else {
-                return Ok(None);
-            };
             let lease_deadline =
-                i64::try_from(lease_deadline).map_err(|source| MetadataError::Db {
+                i64::try_from(record.lease_deadline).map_err(|source| MetadataError::Db {
                     context: "clear expired durable bucket write drain lease deadline",
                     source: rusqlite::Error::ToSqlConversionFailure(Box::new(source)),
                 })?;
@@ -5912,7 +5919,7 @@ impl PgMetadataStore for PgStore {
                     "DELETE FROM bucket_write_drains \
                      WHERE bucket_name = ?1 AND drain_id = ?2 AND owner_token = ?3 \
                        AND cluster_epoch = ?4 AND bucket_execution_generation = ?5 \
-                       AND lease_deadline IS NOT NULL AND lease_deadline <= ?6",
+                       AND lease_deadline <= ?6",
                     params![
                         name.as_str(),
                         &record.drain_id,
@@ -6007,12 +6014,7 @@ impl PgMetadataStore for PgStore {
                     drain_id: drain_id.to_string(),
                 });
             }
-            let Some(current_deadline) = record.lease_deadline else {
-                return Err(MetadataError::BucketWriteDrainConflict {
-                    drain_id: drain_id.to_string(),
-                });
-            };
-            if i64::try_from(current_deadline).map_err(|source| MetadataError::Db {
+            if i64::try_from(record.lease_deadline).map_err(|source| MetadataError::Db {
                 context: "heartbeat durable bucket write drain current lease deadline",
                 source: rusqlite::Error::ToSqlConversionFailure(Box::new(source)),
             })? <= now
@@ -6036,7 +6038,7 @@ impl PgMetadataStore for PgStore {
                      SET lease_deadline = ?6 \
                      WHERE bucket_name = ?1 AND drain_id = ?2 AND owner_token = ?3 \
                        AND cluster_epoch = ?4 AND bucket_execution_generation = ?5 \
-                       AND lease_deadline IS NOT NULL AND lease_deadline > ?7",
+                       AND lease_deadline > ?7",
                     params![
                         name.as_str(),
                         drain_id,

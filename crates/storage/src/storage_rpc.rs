@@ -448,7 +448,7 @@ const STORAGE_RPC_BUCKET_WRITE_DRAIN_RECORD_MAX_LEN: usize = STORAGE_RPC_MAX_BUC
     + 8
     + 1
     + 8
-    + 9;
+    + 8;
 const STORAGE_RPC_MAX_BUCKET_WRITE_DRAIN_BEGIN_PAYLOAD_LEN: usize =
     STORAGE_RPC_MAX_BUCKET_REQUEST_PAYLOAD_LEN
         + 4
@@ -456,7 +456,7 @@ const STORAGE_RPC_MAX_BUCKET_WRITE_DRAIN_BEGIN_PAYLOAD_LEN: usize =
         + 4
         + STORAGE_RPC_MAX_BUCKET_WRITE_OWNER_TOKEN_LEN
         + 8
-        + 9;
+        + 8;
 const STORAGE_RPC_MAX_BUCKET_WRITE_DRAIN_RECORD_PAYLOAD_LEN: usize =
     STORAGE_RPC_MAX_METADATA_COMMAND_STATE_PAYLOAD_LEN
         + STORAGE_RPC_BUCKET_WRITE_DRAIN_RECORD_MAX_LEN;
@@ -1339,7 +1339,7 @@ pub(crate) struct StorageRpcBucketWriteDrainBeginRequest {
     pub(crate) drain_id: String,
     pub(crate) owner_token: String,
     pub(crate) created_at: u64,
-    pub(crate) lease_deadline: Option<u64>,
+    pub(crate) lease_deadline: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -11126,7 +11126,7 @@ pub(crate) fn encode_bucket_write_drain_begin_request(
     put_string(&mut out, &request.drain_id);
     put_string(&mut out, &request.owner_token);
     put_u64(&mut out, request.created_at);
-    put_optional_u64(&mut out, request.lease_deadline);
+    put_u64(&mut out, request.lease_deadline);
     Ok(out)
 }
 
@@ -11148,7 +11148,7 @@ pub(crate) fn decode_bucket_write_drain_begin_request(
         ),
     )?;
     let created_at = decoder.read_u64()?;
-    let lease_deadline = decoder.read_optional_u64()?;
+    let lease_deadline = decoder.read_u64()?;
     decoder.finish()?;
     validate_bucket_write_drain_identity(&drain_id, &owner_token)?;
     Ok(StorageRpcBucketWriteDrainBeginRequest {
@@ -12775,7 +12775,7 @@ impl<'a> StorageRpcDecoder<'a> {
             }
         };
         let created_at = self.read_u64()?;
-        let lease_deadline = self.read_optional_u64()?;
+        let lease_deadline = self.read_u64()?;
         Ok(BucketWriteDrainRecord {
             bucket,
             drain_id,
@@ -15296,7 +15296,7 @@ fn put_bucket_write_drain_record(out: &mut Vec<u8>, record: &BucketWriteDrainRec
         },
     );
     put_u64(out, record.created_at);
-    put_optional_u64(out, record.lease_deadline);
+    put_u64(out, record.lease_deadline);
 }
 
 fn put_bucket_delete_attempt_outcome_record(
@@ -19293,7 +19293,7 @@ mod tests {
                     bucket_execution_generation: 3,
                     state: BucketWriteDrainState::Draining,
                     created_at: 4,
-                    lease_deadline: Some(5),
+                    lease_deadline: 5,
                 },
             })
             .unwrap();

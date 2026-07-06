@@ -299,7 +299,7 @@ fn cluster_bucket_write_snapshot_clears_expired_active_delete_drain() {
             "abandoned-delete-owner",
             crate::ClusterEpoch::INITIAL,
             now.saturating_sub(10),
-            Some(now.saturating_sub(1)),
+            now.saturating_sub(1),
         )
         .unwrap();
     }

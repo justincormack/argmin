@@ -165,14 +165,17 @@ Remaining order of attack:
   permitted, and using that helper from both frontend and storage-node runtime
   map install paths.
 
-- [ ] **RR9. Bucket write *drains* still have the pre-S1 shape.**
+- [x] **RR9. Bucket write *drains* still have the pre-S1 shape.**
   `begin_durable_bucket_write_drain` takes `lease_deadline: Option<u64>`
   through trait and RPC (`traits.rs:163`, `storage_rpc.rs:1342`), and
   `clear_expired_durable_bucket_write_drain` only clears deadline-bearing
   rows (`traits.rs:190-192`) — a `None` drain row would be unreapable, the
   exact latent pattern S1 removed for reservations. All production callers
   pass `Some` today (`request_ops.rs:2958-2968`). Make the deadline required,
-  matching S1.
+  matching S1. Fixed by making `BucketWriteDrainRecord.lease_deadline`,
+  `begin_durable_bucket_write_drain`, and the Unix RPC drain-begin request use
+  a required `u64`, serializing drain records with a required deadline, and
+  making the SQLite `bucket_write_drains.lease_deadline` column `NOT NULL`.
 
 - [ ] **RR10. Single/batch peering validation scaffolding still duplicated.**
   S3's fix shares the authorization/proof helpers, but the surrounding

@@ -388,7 +388,7 @@ fn lifecycle_sweep_claim_rejects_deleting_or_drained_bucket() {
             "delete-owner",
             ClusterEpoch::INITIAL,
             10,
-            Some(30),
+            30,
         )
         .unwrap();
 
@@ -443,7 +443,7 @@ fn bucket_delete_attempt_outcome_records_last_state() {
             "delete-owner",
             ClusterEpoch::INITIAL,
             10,
-            Some(100),
+            100,
         )
         .unwrap();
     let first = BucketDeleteAttemptOutcomeRecord {
@@ -493,7 +493,7 @@ fn bucket_write_drain_heartbeat_fences_stale_delete_owner() {
             "delete-owner",
             ClusterEpoch::INITIAL,
             10,
-            Some(100),
+            100,
         )
         .unwrap();
     let renewed = store
@@ -507,7 +507,27 @@ fn bucket_write_drain_heartbeat_fences_stale_delete_owner() {
             50,
         )
         .unwrap();
-    assert_eq!(renewed.lease_deadline, Some(200));
+    assert_eq!(renewed.lease_deadline, 200);
+    let stale_clear = store.clear_durable_bucket_write_drain(
+        &bucket,
+        &record.drain_id,
+        &record.owner_token,
+        record.cluster_epoch,
+        record.bucket_execution_generation,
+        record.lease_deadline,
+    );
+    assert!(matches!(
+        stale_clear,
+        Err(MetadataError::BucketWriteDrainNotFound { .. })
+    ));
+    assert_eq!(
+        store
+            .durable_bucket_write_drain(&bucket)
+            .unwrap()
+            .map(|drain| drain.lease_deadline),
+        Some(200),
+        "stale clear must not remove a renewed live delete drain"
+    );
 
     let wrong_owner = store
         .heartbeat_durable_bucket_write_drain(
@@ -532,7 +552,7 @@ fn bucket_write_drain_heartbeat_fences_stale_delete_owner() {
             "delete-owner",
             ClusterEpoch::INITIAL,
             10,
-            Some(20),
+            20,
         )
         .unwrap();
     let expired_heartbeat = store
@@ -2081,7 +2101,7 @@ fn metadata_txn_commit_failure_recovers_representative_mutators() {
                 "owner-token",
                 ClusterEpoch::INITIAL,
                 10,
-                Some(20),
+                20,
             )
             .unwrap();
         },
@@ -2106,7 +2126,7 @@ fn metadata_txn_commit_failure_recovers_representative_mutators() {
                 "owner-token",
                 ClusterEpoch::INITIAL,
                 10,
-                Some(30),
+                30,
             )
             .unwrap();
         },
@@ -6597,7 +6617,7 @@ fn durable_bucket_write_coordination_does_not_dirty_metadata_command_state() {
             "owner-token-1",
             ClusterEpoch::INITIAL,
             3,
-            Some(4),
+            4,
         )
         .unwrap();
     assert_eq!(
@@ -6615,6 +6635,7 @@ fn durable_bucket_write_coordination_does_not_dirty_metadata_command_state() {
             "owner-token-1",
             ClusterEpoch::INITIAL,
             drain.bucket_execution_generation,
+            drain.lease_deadline,
         )
         .unwrap();
     assert_eq!(

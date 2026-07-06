@@ -1118,7 +1118,7 @@ fn unix_bucket_write_reservation_client_preserves_draining_signal() {
             "drain-owner-remote-1",
             ClusterEpoch::new(1).unwrap(),
             10,
-            Some(20),
+            20,
         )
         .unwrap();
         pg.refresh_metadata_command_state_digest().unwrap();
@@ -1272,7 +1272,7 @@ fn unix_bucket_write_reservation_client_routes_drain_and_finalize_coordination()
         "drain-owner-rpc-1",
         ClusterEpoch::new(1).unwrap(),
         30,
-        Some(40),
+        40,
     )
     .unwrap();
     assert_eq!(drain.bucket, bucket);
@@ -1328,7 +1328,7 @@ fn unix_bucket_write_reservation_client_routes_drain_and_finalize_coordination()
         "expired-drain-owner-rpc-1",
         ClusterEpoch::new(1).unwrap(),
         50,
-        Some(55),
+        55,
     )
     .unwrap();
     let expired = BucketWriteReservationNodeClient::clear_expired_durable_bucket_write_drain(
@@ -1349,7 +1349,7 @@ fn unix_bucket_write_reservation_client_routes_drain_and_finalize_coordination()
         "active-begin-drain-owner-rpc-1",
         ClusterEpoch::new(1).unwrap(),
         61,
-        Some(120),
+        120,
     )
     .unwrap();
     let begin_roots = BucketWriteReservationNodeClient::get_bucket_delete_begin_roots(
@@ -1376,7 +1376,7 @@ fn unix_bucket_write_reservation_client_routes_drain_and_finalize_coordination()
         "expired-begin-drain-owner-rpc-1",
         ClusterEpoch::new(1).unwrap(),
         61,
-        Some(80),
+        80,
     )
     .unwrap();
     let begin_roots = BucketWriteReservationNodeClient::get_bucket_delete_begin_roots(

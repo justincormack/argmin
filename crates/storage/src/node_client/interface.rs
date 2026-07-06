@@ -247,7 +247,7 @@ pub(crate) trait BucketWriteReservationNodeClient: Send + Sync {
         owner_token: &str,
         cluster_epoch: ClusterEpoch,
         created_at: u64,
-        lease_deadline: Option<u64>,
+        lease_deadline: u64,
     ) -> Result<BucketWriteDrainRecord, BucketSnapshotLoadError>;
 
     fn clear_durable_bucket_write_drain(
@@ -1442,7 +1442,7 @@ pub(crate) trait StorageNodeClient:
         owner_token: &str,
         cluster_epoch: ClusterEpoch,
         created_at: u64,
-        lease_deadline: Option<u64>,
+        lease_deadline: u64,
     ) -> Result<BucketWriteDrainRecord, BucketSnapshotLoadError>;
 
     fn clear_durable_bucket_write_drain(

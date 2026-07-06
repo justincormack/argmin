@@ -614,7 +614,7 @@ CREATE TABLE IF NOT EXISTS bucket_write_drains (
     bucket_execution_generation INTEGER NOT NULL CHECK (bucket_execution_generation >= 0),
     state            INTEGER NOT NULL CHECK (state IN (0)),
     created_at       INTEGER NOT NULL CHECK (created_at >= 0),
-    lease_deadline   INTEGER CHECK (lease_deadline IS NULL OR lease_deadline >= 0),
+    lease_deadline   INTEGER NOT NULL CHECK (lease_deadline >= 0),
     FOREIGN KEY (bucket_name) REFERENCES buckets(name) ON DELETE CASCADE
 )";
 

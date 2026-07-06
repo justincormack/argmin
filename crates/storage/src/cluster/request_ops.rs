@@ -2695,10 +2695,7 @@ impl super::StorageCluster {
         let Some(drain) = reservation_client.durable_bucket_write_drain(pg_id, bucket)? else {
             return Ok(None);
         };
-        if drain
-            .lease_deadline
-            .is_none_or(|deadline| deadline <= crate::clock::current_time_millis())
-        {
+        if drain.lease_deadline <= crate::clock::current_time_millis() {
             return Ok(None);
         }
         if !reservation_client
@@ -3217,7 +3214,7 @@ impl super::StorageCluster {
                     &owner_token,
                     self.operation_epoch(),
                     now,
-                    Some(lease_deadline),
+                    lease_deadline,
                 ) {
                 Ok(record) => {
                     return Ok(super::DurableBucketDeleteDrainBegin::Acquired(
@@ -3258,8 +3255,7 @@ impl super::StorageCluster {
                             Ok(current)
                                 if current.state == BucketState::Active
                                     && current.bucket_execution_generation
-                                        == existing.bucket_execution_generation
-                                    && existing.lease_deadline.is_some() =>
+                                        == existing.bucket_execution_generation =>
                             {
                                 let _ = observability::event(
                                     super::TRACE_TARGET,
@@ -4572,9 +4568,7 @@ impl super::StorageCluster {
                     .durable_bucket_write_drain(pg_id, bucket)
                     .map_err(bucket_snapshot_error_to_bucket_write_drain_error)?
                 {
-                    if existing.bucket_execution_generation == current_bucket_execution_generation
-                        && existing.lease_deadline.is_some()
-                    {
+                    if existing.bucket_execution_generation == current_bucket_execution_generation {
                         self.record_bucket_delete_attempt_outcome_with_client(
                             node_store.bucket_write_reservation_client().as_ref(),
                             pg_id,

@@ -160,7 +160,7 @@ pub(crate) trait PgMetadataStore {
         owner_token: &str,
         cluster_epoch: ClusterEpoch,
         created_at: u64,
-        lease_deadline: Option<u64>,
+        lease_deadline: u64,
     ) -> Result<BucketWriteDrainRecord, MetadataError>;
 
     /// Read a durable bucket write-drain record.
@@ -179,12 +179,13 @@ pub(crate) trait PgMetadataStore {
         owner_token: &str,
         cluster_epoch: ClusterEpoch,
         bucket_execution_generation: u64,
+        lease_deadline: u64,
     ) -> Result<(), MetadataError>;
 
     /// Atomically clear an expired durable drain for an active bucket.
     ///
-    /// Returns the cleared record when the drain's lease deadline is present
-    /// and not later than `now`. Non-expired and missing drains return `Ok(None)`.
+    /// Returns the cleared record when the drain's lease deadline is not later
+    /// than `now`. Non-expired and missing drains return `Ok(None)`.
     #[allow(dead_code)]
     fn clear_expired_durable_bucket_write_drain(
         &self,

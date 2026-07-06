@@ -8412,7 +8412,7 @@ fn durable_bucket_write_drain_blocks_reservations_and_requires_exact_identity() 
             "owner-token-1",
             ClusterEpoch::INITIAL,
             30,
-            Some(40),
+            40,
         )
         .unwrap();
     assert_eq!(drain.bucket, bucket);
@@ -8421,7 +8421,7 @@ fn durable_bucket_write_drain_blocks_reservations_and_requires_exact_identity() 
     assert_eq!(drain.cluster_epoch, ClusterEpoch::INITIAL);
     assert_eq!(drain.state, BucketWriteDrainState::Draining);
     assert_eq!(drain.created_at, 30);
-    assert_eq!(drain.lease_deadline, Some(40));
+    assert_eq!(drain.lease_deadline, 40);
 
     let duplicate = store
         .begin_durable_bucket_write_drain(
@@ -8430,7 +8430,7 @@ fn durable_bucket_write_drain_blocks_reservations_and_requires_exact_identity() 
             "owner-token-1",
             ClusterEpoch::INITIAL,
             30,
-            Some(40),
+            40,
         )
         .unwrap();
     assert_eq!(duplicate, drain);
@@ -8442,7 +8442,7 @@ fn durable_bucket_write_drain_blocks_reservations_and_requires_exact_identity() 
             "owner-token-1",
             ClusterEpoch::INITIAL,
             30,
-            Some(40),
+            40,
         )
         .unwrap_err();
     assert!(matches!(
@@ -8474,6 +8474,7 @@ fn durable_bucket_write_drain_blocks_reservations_and_requires_exact_identity() 
             "owner-token-2",
             ClusterEpoch::INITIAL,
             drain.bucket_execution_generation,
+            drain.lease_deadline,
         )
         .unwrap_err();
     assert!(matches!(
@@ -8492,6 +8493,7 @@ fn durable_bucket_write_drain_blocks_reservations_and_requires_exact_identity() 
             "owner-token-1",
             ClusterEpoch::INITIAL,
             drain.bucket_execution_generation,
+            drain.lease_deadline,
         )
         .unwrap();
     assert!(store.durable_bucket_write_drain(&bucket).unwrap().is_none());

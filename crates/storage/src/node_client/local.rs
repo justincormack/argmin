@@ -784,7 +784,7 @@ impl BucketWriteReservationNodeClient for LocalStorageNodeClient {
         owner_token: &str,
         cluster_epoch: ClusterEpoch,
         created_at: u64,
-        lease_deadline: Option<u64>,
+        lease_deadline: u64,
     ) -> Result<BucketWriteDrainRecord, BucketSnapshotLoadError> {
         <Self as StorageNodeClient>::begin_durable_bucket_write_drain(
             self,
@@ -1868,7 +1868,7 @@ impl StorageNodeClient for LocalStorageNodeClient {
         owner_token: &str,
         cluster_epoch: ClusterEpoch,
         created_at: u64,
-        lease_deadline: Option<u64>,
+        lease_deadline: u64,
     ) -> Result<BucketWriteDrainRecord, BucketSnapshotLoadError> {
         let pg = self.storage_node.get_pg(pg_id.get())?;
         Ok(PgMetadataStore::begin_durable_bucket_write_drain(
@@ -1895,6 +1895,7 @@ impl StorageNodeClient for LocalStorageNodeClient {
             &record.owner_token,
             record.cluster_epoch,
             record.bucket_execution_generation,
+            record.lease_deadline,
         )?)
     }
 
