@@ -6,8 +6,10 @@ use aws_sdk_s3::types::{
 use checksum::ChecksumAlgorithm as LocalChecksumAlgorithm;
 use ring::hmac;
 use s3_tests::{
-    assert_s3_err_code, cleanup_versioned_bucket, err_status, retrying_operation_aborted,
-    send_signed_request, unique_bucket, SendRetryingOperationAborted, CTX,
+    assert_s3_err_code, cleanup_versioned_bucket, err_status, raw_object_with,
+    retrying_operation_aborted, send_signed_request,
+    shape::{assert_shape, error_response_headers, expected_error, shape},
+    unique_bucket, SendRetryingOperationAborted, CTX,
 };
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -3483,3 +3485,98 @@ fn checksum_crc32(data: &[u8]) -> String {
 }
 
 // GetObjectAttributes checksum tests moved to object_attributes.rs
+
+// ── Response shapes ─────────────────────────────────────────────────
+
+#[test]
+fn test_put_object_bad_inline_checksum_error_shape() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
+
+        let response = raw_object_with(
+            "PUT",
+            &bucket,
+            "shape-bad-inline-checksum.txt",
+            b"hello streaming checksum",
+            &[("x-amz-checksum-crc32", "AAAA/w==")],
+        );
+        assert_shape(
+            "PutObject bad inline checksum",
+            &response,
+            &shape().status(400).headers(error_response_headers()).body(
+                expected_error::with_host_id(
+                    "BadDigest",
+                    "The CRC32 you specified did not match the calculated checksum.",
+                ),
+            ),
+        );
+
+        s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
+    });
+}
+
+#[test]
+fn test_checksum_mode_object_response_shape() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
+        let key = "shape-checksum-mode.txt";
+
+        raw_object_with(
+            "PUT",
+            &bucket,
+            key,
+            b"checksum-mode-body",
+            &[("Content-Type", "application/octet-stream")],
+        );
+
+        let get_head_headers = [
+            ("etag", "{etag}"),
+            ("last-modified", "{http_date}"),
+            ("accept-ranges", "bytes"),
+            ("content-type", "application/octet-stream"),
+            ("x-amz-checksum-crc64nvme", "dmtRIDonanA="),
+            ("x-amz-checksum-type", "FULL_OBJECT"),
+            ("x-amz-server-side-encryption", "AES256"),
+            ("content-length", "18"),
+            ("x-amz-request-id", "{request_id}"),
+            ("x-amz-id-2", "{host_id}"),
+        ];
+        let get = raw_object_with(
+            "GET",
+            &bucket,
+            key,
+            b"",
+            &[("x-amz-checksum-mode", "ENABLED")],
+        );
+        let get_captures = assert_shape(
+            "GetObject checksum mode",
+            &get,
+            &shape()
+                .status(200)
+                .headers(get_head_headers)
+                .body("checksum-mode-body"),
+        );
+        let head = raw_object_with(
+            "HEAD",
+            &bucket,
+            key,
+            b"",
+            &[("x-amz-checksum-mode", "ENABLED")],
+        );
+        let head_captures = assert_shape(
+            "HeadObject checksum mode",
+            &head,
+            &shape().status(200).headers(get_head_headers).body_empty(),
+        );
+        assert_eq!(get_captures["etag"], head_captures["etag"]);
+
+        s3_tests::delete_object_retrying_operation_aborted(client, &bucket, key)
+            .await
+            .expect("delete shape fixture");
+        s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
+    });
+}

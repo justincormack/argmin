@@ -1882,3 +1882,66 @@ fn test_put_duplicate_authorization() {
         cleanup(&bucket, &[]).await;
     });
 }
+
+// ── System metadata raw round-trip shapes ───────────────────────────
+
+#[test]
+fn test_system_metadata_headers_round_trip_raw_values_shape() {
+    s3_tests::run(async {
+        let bucket = setup_bucket().await;
+        // Raw values with commas and quotes must round-trip verbatim; SDK
+        // clients would split some of these, so this must stay raw HTTP.
+        let cases: &[(&str, &str)] = &[
+            ("cache-control", "max-age=60,private"),
+            ("content-disposition", "attachment;filename=\"report.pdf\""),
+            ("content-encoding", "gzip,br"),
+            ("content-language", "en-US,fr-CA"),
+            ("content-type", "text/plain;charset=utf-8"),
+            ("expires", "Mon, 15 Jan 2024 12:30:45 GMT"),
+        ];
+
+        for (index, (name, value)) in cases.iter().enumerate() {
+            let key = format!("raw-header-roundtrip-{index}");
+            let put = s3_tests::raw_object_with(
+                "PUT",
+                &bucket,
+                &key,
+                b"header-roundtrip-body",
+                &[(name, value)],
+            );
+            assert_eq!(put.status, 200, "roundtrip PUT[{name}] failed: {put:?}");
+
+            let mut expected = vec![
+                ("etag", "{etag}"),
+                ("content-length", "21"),
+                ("last-modified", "{http_date}"),
+                ("accept-ranges", "bytes"),
+                ("x-amz-server-side-encryption", "AES256"),
+                ("x-amz-request-id", "{request_id}"),
+                ("x-amz-id-2", "{host_id}"),
+                (name, value),
+            ];
+            if *name != "content-type" {
+                expected.push(("content-type", "binary/octet-stream"));
+            }
+            let head = s3_tests::raw_object("HEAD", &bucket, &key);
+            assert_shape(
+                &format!("HeadObject raw system metadata [{name}]"),
+                &head,
+                &shape().status(200).headers(expected).body_empty(),
+            );
+        }
+
+        for index in 0..6 {
+            let key = format!("raw-header-roundtrip-{index}");
+            let _ = CTX
+                .client()
+                .delete_object()
+                .bucket(&bucket)
+                .key(&key)
+                .send()
+                .await;
+        }
+        cleanup(&bucket, &[]).await;
+    });
+}

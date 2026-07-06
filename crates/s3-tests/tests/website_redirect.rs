@@ -5,7 +5,9 @@ use aws_sdk_s3::types::{
     VersioningConfiguration,
 };
 use s3_tests::{
-    assert_s3_err_code, object_url, post_object_raw_to_test_endpoint_with_headers,
+    assert_s3_err_code, object_url, post_object_raw_to_test_endpoint_with_headers, raw_object,
+    raw_object_with,
+    shape::{assert_shape, error_response_headers, expected_error, shape},
     sigv4_post_fields_for_credentials, unique_bucket, SendRetryingOperationAborted, CTX,
 };
 use std::time::Duration;
@@ -306,7 +308,17 @@ fn test_put_object_website_redirect_without_leading_slash_rejected() {
             [("x-amz-website-redirect-location", "docs/landing.html")],
         );
 
-        assert_raw_s3_error_code(&response, 400, "InvalidRedirectLocation");
+        assert_shape(
+            "PutObject invalid website redirect",
+            &response,
+            &shape().status(400).headers(error_response_headers()).body(
+                expected_error::with_host_id(
+                    "InvalidRedirectLocation",
+                    "The website redirect location must have a prefix of 'http://' or \
+                     'https://' or '/'.",
+                ),
+            ),
+        );
 
         let head = CTX
             .client()
@@ -914,5 +926,102 @@ fn test_versioned_objects_surface_redirect_metadata_per_version() {
         assert_eq!(&v1_body[..], b"version-one");
 
         s3_tests::cleanup_versioned_bucket(CTX.client(), &bucket).await;
+    });
+}
+
+// ── Response shapes ─────────────────────────────────────────────────
+
+#[test]
+fn test_website_redirect_object_response_shape() {
+    s3_tests::run(async {
+        let bucket = setup_bucket().await;
+        let key = "shape-redirect-object.txt";
+        let redirect = "/docs/landing.html";
+
+        let put = raw_object_with(
+            "PUT",
+            &bucket,
+            key,
+            b"redirect-body",
+            &[(WEBSITE_REDIRECT_HEADER_NAME, redirect)],
+        );
+        let put_captures = assert_shape(
+            "PutObject website redirect shape",
+            &put,
+            &shape()
+                .status(200)
+                .headers([
+                    ("etag", "{etag}"),
+                    ("x-amz-checksum-crc64nvme", "cBUtz9ezcS8="),
+                    ("x-amz-checksum-type", "FULL_OBJECT"),
+                    ("x-amz-server-side-encryption", "AES256"),
+                    ("x-amz-request-id", "{request_id}"),
+                    ("x-amz-id-2", "{host_id}"),
+                    ("content-length", "0"),
+                ])
+                .body_empty(),
+        );
+
+        let get_head_headers = [
+            ("etag", "{etag}"),
+            ("last-modified", "{http_date}"),
+            ("accept-ranges", "bytes"),
+            ("content-type", "binary/octet-stream"),
+            (WEBSITE_REDIRECT_HEADER_NAME, redirect),
+            ("x-amz-server-side-encryption", "AES256"),
+            ("content-length", "13"),
+            ("x-amz-request-id", "{request_id}"),
+            ("x-amz-id-2", "{host_id}"),
+        ];
+        let get = raw_object("GET", &bucket, key);
+        let get_captures = assert_shape(
+            "GetObject website redirect shape",
+            &get,
+            &shape()
+                .status(200)
+                .headers(get_head_headers)
+                .body("redirect-body"),
+        );
+        let head = raw_object("HEAD", &bucket, key);
+        let head_captures = assert_shape(
+            "HeadObject website redirect shape",
+            &head,
+            &shape().status(200).headers(get_head_headers).body_empty(),
+        );
+        assert_eq!(put_captures["etag"], get_captures["etag"]);
+        assert_eq!(put_captures["etag"], head_captures["etag"]);
+
+        cleanup_object_and_bucket(&bucket, key).await;
+    });
+}
+
+#[test]
+fn test_website_redirect_metadata_too_large_error_shape() {
+    s3_tests::run(async {
+        let bucket = setup_bucket().await;
+        // One byte over the aggregate system-metadata limit, counting the
+        // header name.
+        let redirect_len = SYSTEM_METADATA_SIZE_LIMIT - WEBSITE_REDIRECT_HEADER_NAME.len() + 1;
+        let redirect = format!("/{}", "r".repeat(redirect_len - 1));
+
+        let response = raw_object_with(
+            "PUT",
+            &bucket,
+            "shape-redirect-metadata-too-large.txt",
+            b"redirect-too-large-body",
+            &[(WEBSITE_REDIRECT_HEADER_NAME, redirect.as_str())],
+        );
+        assert_shape(
+            "PutObject website redirect metadata too large",
+            &response,
+            &shape().status(400).headers(error_response_headers()).body(
+                expected_error::metadata_too_large(
+                    SYSTEM_METADATA_SIZE_LIMIT + 1,
+                    SYSTEM_METADATA_SIZE_LIMIT,
+                ),
+            ),
+        );
+
+        cleanup_bucket(&bucket).await;
     });
 }

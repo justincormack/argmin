@@ -784,6 +784,10 @@ pub mod expected_error {
     pub fn metadata_too_large(size: usize, max_size_allowed: usize) -> String {
         xml::metadata_too_large_error_xml(size, max_size_allowed, REQUEST_ID, HOST_ID)
     }
+
+    pub fn request_header_section_too_large(max_size_allowed: usize) -> String {
+        xml::request_header_section_too_large_error_xml(max_size_allowed, REQUEST_ID, HOST_ID)
+    }
 }
 
 #[cfg(test)]
@@ -1087,6 +1091,14 @@ mod tests {
              <Message>The requested range is not satisfiable</Message>\
              <ActualObjectSize>1024</ActualObjectSize><RequestId>{request_id}</RequestId>\
              <HostId>{host_id}</HostId></Error>"
+        );
+        assert_eq!(
+            expected_error::request_header_section_too_large(8192),
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error>\
+             <Code>RequestHeaderSectionTooLarge</Code>\
+             <Message>Your request header section exceeds the maximum allowed size.</Message>\
+             <MaxSizeAllowed>8192</MaxSizeAllowed>\
+             <RequestId>{request_id}</RequestId><HostId>{host_id}</HostId></Error>"
         );
         assert_eq!(
             expected_error::metadata_too_large(3000, 2048),

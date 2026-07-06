@@ -1,6 +1,8 @@
 use aws_sdk_s3::types::{BucketVersioningStatus, VersioningConfiguration};
 use s3_tests::{
-    cleanup_versioned_bucket, err_status, unique_bucket, SendRetryingOperationAborted, CTX,
+    cleanup_versioned_bucket, err_status, raw_object_query, raw_object_with,
+    shape::{assert_shape, shape},
+    unique_bucket, SendRetryingOperationAborted, CTX,
 };
 
 async fn setup_bucket() -> String {
@@ -284,5 +286,81 @@ fn test_range_get_specific_version_returns_expected_slice_and_version_id() {
         assert_eq!(&data[..], b"cdef");
 
         cleanup_versioned_bucket(client, &bucket).await;
+    });
+}
+
+// ── Response shapes ─────────────────────────────────────────────────
+
+#[test]
+fn test_range_and_override_response_shape() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
+        let key = "shape-range.txt";
+
+        let put = raw_object_with(
+            "PUT",
+            &bucket,
+            key,
+            b"abcdefghij",
+            &[("Content-Type", "application/octet-stream")],
+        );
+        assert_eq!(put.status, 200, "range fixture PUT failed: {put:?}");
+
+        let range = raw_object_with("GET", &bucket, key, b"", &[("Range", "bytes=2-5")]);
+        let range_captures = assert_shape(
+            "GetObject range",
+            &range,
+            &shape()
+                .status(206)
+                .headers([
+                    ("etag", "{etag}"),
+                    ("last-modified", "{http_date}"),
+                    ("accept-ranges", "bytes"),
+                    ("content-range", "bytes 2-5/10"),
+                    ("content-type", "application/octet-stream"),
+                    ("x-amz-server-side-encryption", "AES256"),
+                    ("content-length", "4"),
+                    ("x-amz-request-id", "{request_id}"),
+                    ("x-amz-id-2", "{host_id}"),
+                ])
+                .body("cdef"),
+        );
+
+        let overrides = raw_object_query(
+            "GET",
+            &bucket,
+            key,
+            "response-content-type=text%2Fhtml\
+             &response-content-disposition=attachment%3B%20filename%3D%22override.txt%22",
+        );
+        let override_captures = assert_shape(
+            "GetObject response overrides",
+            &overrides,
+            &shape()
+                .status(200)
+                .headers([
+                    ("etag", "{etag}"),
+                    ("last-modified", "{http_date}"),
+                    ("accept-ranges", "bytes"),
+                    ("content-type", "text/html"),
+                    (
+                        "content-disposition",
+                        "attachment; filename=\"override.txt\"",
+                    ),
+                    ("x-amz-server-side-encryption", "AES256"),
+                    ("content-length", "10"),
+                    ("x-amz-request-id", "{request_id}"),
+                    ("x-amz-id-2", "{host_id}"),
+                ])
+                .body("abcdefghij"),
+        );
+        assert_eq!(range_captures["etag"], override_captures["etag"]);
+
+        s3_tests::delete_object_retrying_operation_aborted(client, &bucket, key)
+            .await
+            .expect("delete shape fixture");
+        s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
     });
 }

@@ -6,8 +6,9 @@ use aws_sdk_s3::types::{
 use s3_tests::{
     assert_s3_err_code, cleanup_versioned_bucket, content_md5_header, copy_source_with_version,
     delete_bucket_retrying_operation_aborted, delete_objects_retrying_operation_aborted,
-    err_status, get_object_body_retrying_operation_aborted, raw_bucket, send_signed_request,
-    shape::{assert_shape, chunked_response_headers, shape},
+    err_status, get_object_body_retrying_operation_aborted, raw_bucket, raw_object,
+    raw_object_query, send_signed_request,
+    shape::{assert_shape, chunked_response_headers, id_headers, shape},
     unique_bucket, RawResponse, SendRetryingOperationAborted, CTX,
 };
 use tokio::time::{sleep, Duration};
@@ -2391,6 +2392,118 @@ fn test_get_bucket_versioning_response_shape() {
                      xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Status>Enabled</Status>\
                      </VersioningConfiguration>",
                 ),
+        );
+
+        cleanup_versioned_bucket(client, &bucket).await;
+    });
+}
+
+// ── Versioned object response shapes ────────────────────────────────
+
+#[test]
+fn test_versioned_object_response_shape() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
+        s3_tests::enable_bucket_versioning(client, &bucket).await;
+        let key = "shape-versioned.txt";
+
+        let put = s3_tests::put_object_retrying_operation_aborted(
+            client,
+            &bucket,
+            key,
+            b"versioned-body".to_vec(),
+        )
+        .await;
+        let version = put.version_id().expect("version id").to_string();
+
+        let expected_headers = [
+            ("etag", "{etag}"),
+            ("last-modified", "{http_date}"),
+            ("accept-ranges", "bytes"),
+            ("x-amz-version-id", "{version_id}"),
+            ("content-type", "application/octet-stream"),
+            ("x-amz-server-side-encryption", "AES256"),
+            ("content-length", "14"),
+            ("x-amz-request-id", "{request_id}"),
+            ("x-amz-id-2", "{host_id}"),
+        ];
+
+        for (operation, method, query, expect_body) in [
+            ("GetObject current version", "GET", None, true),
+            ("HeadObject current version", "HEAD", None, false),
+            ("GetObject explicit version", "GET", Some(&version), true),
+            ("HeadObject explicit version", "HEAD", Some(&version), false),
+        ] {
+            let response = match query {
+                Some(version) => {
+                    raw_object_query(method, &bucket, key, &format!("versionId={version}"))
+                }
+                None => raw_object(method, &bucket, key),
+            };
+            let mut spec = shape()
+                .status(200)
+                .headers(expected_headers)
+                .sub("version_id", version.as_str());
+            spec = if expect_body {
+                spec.body("versioned-body")
+            } else {
+                spec.body_empty()
+            };
+            assert_shape(operation, &response, &spec);
+        }
+
+        cleanup_versioned_bucket(client, &bucket).await;
+    });
+}
+
+#[test]
+fn test_delete_object_versioned_response_shape() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
+        s3_tests::enable_bucket_versioning(client, &bucket).await;
+        let key = "shape-delete.txt";
+
+        s3_tests::put_object_retrying_operation_aborted(
+            client,
+            &bucket,
+            key,
+            b"delete-shape".to_vec(),
+        )
+        .await;
+
+        let delete_current = raw_object("DELETE", &bucket, key);
+        let marker_captures = assert_shape(
+            "DeleteObject current version",
+            &delete_current,
+            &shape()
+                .status(204)
+                .headers(id_headers())
+                .header("x-amz-version-id", "{version_id}")
+                .header("x-amz-delete-marker", "true")
+                .body_empty(),
+        );
+        let marker_version = marker_captures["version_id"].clone();
+
+        let delete_marker = raw_object_query(
+            "DELETE",
+            &bucket,
+            key,
+            &format!("versionId={marker_version}"),
+        );
+        assert_shape(
+            "DeleteObject delete marker version",
+            &delete_marker,
+            &shape()
+                .status(204)
+                .headers(id_headers())
+                .header("x-amz-version-id", "{version_id}")
+                .header("x-amz-delete-marker", "true")
+                .sub("version_id", marker_version.as_str())
+                .body_empty(),
         );
 
         cleanup_versioned_bucket(client, &bucket).await;

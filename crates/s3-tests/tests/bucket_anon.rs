@@ -1,4 +1,8 @@
-use s3_tests::{unique_bucket, CTX};
+use s3_tests::{
+    raw_anonymous,
+    shape::{assert_shape, error_response_headers, expected_error, shape},
+    unique_bucket, CTX,
+};
 
 /// Build an agent that returns all HTTP responses (including 4xx/5xx) as Ok.
 fn agent() -> s3_tests::Agent {
@@ -37,19 +41,13 @@ fn test_anon_get_object_private_bucket_fail() {
         )
         .await;
 
-        let url = format!("{}/{}/obj", CTX.endpoint(), bucket);
-        let mut resp = agent().get(&url).call().expect("transport error");
-        let status = resp.status().as_u16();
-        let body = resp.body_mut().read_to_string().unwrap();
-        assert_eq!(
-            status, 403,
-            "expected 403 for anon GET on private bucket, got {}",
-            status
-        );
-        assert!(
-            body.contains("<Code>AccessDenied</Code>"),
-            "expected AccessDenied in body: {}",
-            body
+        let response = raw_anonymous("GET", &bucket, "obj", None);
+        assert_shape(
+            "anonymous GetObject on private bucket",
+            &response,
+            &shape().status(403).headers(error_response_headers()).body(
+                expected_error::with_host_id("AccessDenied", "Access Denied"),
+            ),
         );
 
         cleanup(&bucket, &["obj"]).await;

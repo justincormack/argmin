@@ -1011,16 +1011,23 @@ fn test_object_metadata_too_large() {
         let bucket = setup_bucket().await;
         let oversized = "m".repeat(3000);
 
-        let result = client
-            .put_object()
-            .bucket(&bucket)
-            .key("metadata-too-large")
-            .metadata("mint-test", oversized)
-            .body(ByteStream::from_static(b""))
-            .send()
-            .await;
-        assert_eq!(err_status(&result), 400);
-        assert_s3_err_code(&result, "MetadataTooLarge");
+        // 3000 bytes of value plus "mint-test" (the x-amz-meta- prefix does
+        // not count towards the metadata size limit).
+        let response = raw_object_with(
+            "PUT",
+            &bucket,
+            "metadata-too-large",
+            b"",
+            &[("x-amz-meta-mint-test", oversized.as_str())],
+        );
+        assert_shape(
+            "PutObject user metadata too large",
+            &response,
+            &shape()
+                .status(400)
+                .headers(error_response_headers())
+                .body(expected_error::metadata_too_large(3009, 2048)),
+        );
 
         s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
     });
@@ -1033,16 +1040,22 @@ fn test_object_system_metadata_too_large() {
         let bucket = setup_bucket().await;
         let oversized = "d".repeat(3000);
 
-        let result = client
-            .put_object()
-            .bucket(&bucket)
-            .key("system-metadata-too-large")
-            .content_disposition(oversized)
-            .body(ByteStream::from_static(b""))
-            .send()
-            .await;
-        assert_eq!(err_status(&result), 400);
-        assert_s3_err_code(&result, "MetadataTooLarge");
+        // 3000 bytes of value plus "content-disposition" counts as 3019.
+        let response = raw_object_with(
+            "PUT",
+            &bucket,
+            "system-metadata-too-large",
+            b"",
+            &[("Content-Disposition", oversized.as_str())],
+        );
+        assert_shape(
+            "PutObject system metadata too large",
+            &response,
+            &shape()
+                .status(400)
+                .headers(error_response_headers())
+                .body(expected_error::metadata_too_large(3019, 2048)),
+        );
 
         s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
     });
@@ -1053,21 +1066,21 @@ fn test_put_object_rejects_request_header_section_over_limit() {
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = setup_bucket().await;
-        let url = format!("{}/{bucket}/header-section-too-large", CTX.endpoint());
-        let response = send_signed_request(
+        let padding = "p".repeat(9000);
+        let response = raw_object_with(
             "PUT",
-            &url,
+            &bucket,
+            "header-section-too-large",
             b"",
-            vec![("x-test-padding".to_string(), "p".repeat(9000))],
+            &[("x-test-padding", padding.as_str())],
         );
-
-        assert_eq!(response.status, 400, "unexpected body: {}", response.body);
-        assert!(
-            response
-                .body
-                .contains("<Code>RequestHeaderSectionTooLarge</Code>"),
-            "unexpected body: {}",
-            response.body
+        assert_shape(
+            "PutObject header section too large",
+            &response,
+            &shape()
+                .status(400)
+                .headers(error_response_headers())
+                .body(expected_error::request_header_section_too_large(8192)),
         );
 
         let keys: Vec<String> = Vec::new();

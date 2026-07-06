@@ -1391,6 +1391,42 @@ pub fn raw_bucket(method: &str, bucket: &str, query: Option<&str>) -> RawRespons
     )
 }
 
+/// Send an unauthenticated raw request against the shared test endpoint.
+pub fn raw_anonymous(method: &str, bucket: &str, key: &str, query: Option<&str>) -> RawResponse {
+    let url = raw_request_url(bucket, key, query);
+    let agent = crate::test_agent();
+    let builder = match method {
+        "GET" => agent.get(&url),
+        "HEAD" => agent.head(&url),
+        "DELETE" => agent.delete(&url),
+        other => panic!("raw_anonymous does not support method {other}"),
+    };
+    let mut response = builder.call().expect("anonymous request transport error");
+    let headers = response
+        .headers()
+        .iter()
+        .map(|(name, value)| {
+            (
+                name.as_str().to_string(),
+                value
+                    .to_str()
+                    .expect("response header is valid utf-8")
+                    .to_string(),
+            )
+        })
+        .collect();
+    let (body, body_read_error) = match response.body_mut().read_to_string() {
+        Ok(body) => (body, None),
+        Err(err) => (String::new(), Some(err.to_string())),
+    };
+    RawResponse {
+        status: response.status().as_u16(),
+        headers,
+        body,
+        body_read_error,
+    }
+}
+
 /// Send a raw signed S3 request and preserve response metadata if the response
 /// body races with an early server-side connection close.
 pub fn send_signed_request_allow_response_body_error<K, V, I>(

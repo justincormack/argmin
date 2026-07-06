@@ -233,7 +233,18 @@ batch, deleting each diff test once its shape coverage is subsumed. Batches
    404. Shape helpers gained the header-set vocabulary `id_headers` /
    `chunked_response_headers` / `xml_response_headers`.
 2. object CRUD, range/override, checksum-mode, website-redirect and
-   metadata/header-limit errors
+   metadata/header-limit errors — DONE: thirteen diff tests converted
+   (13 golden tests across website_redirect, object_crud, checksums,
+   headers, range, bucket_anon, and versioning), all AWS-validated
+   first try, thirteen diff tests deleted. In-place upgrades:
+   metadata/system-metadata/header-section limit tests in object_crud
+   (now pin exact Size/MaxSizeAllowed), the invalid-redirect rejection
+   in website_redirect, and the anonymous AccessDenied test in
+   bucket_anon. New helpers: `raw_anonymous` raw request and
+   `expected_error::request_header_section_too_large`. Versioned-object
+   tests pin `{version_id}` from the SDK PUT across GET/HEAD
+   current/explicit, and the delete-marker version from the DELETE
+   response captures.
 3. SSE-C success and error shapes
 4. multipart success shapes and completion/part errors, upload-part-copy
 5. object lock (bucket config, retention, legal hold) — needs the
