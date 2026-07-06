@@ -2072,109 +2072,65 @@ impl ControlPlaneCommandStateMachine for ClusterControlSnapshot {
                 complete_at_ms,
             } => {
                 self.validate_committed_timestamp(complete_at_ms)?;
-                let record = self
-                    .pg(pg_id)
-                    .ok_or(ControlPlaneError::UnknownPg { pg_id: pg_id.get() })?;
-                if !record.acting_set.contains(&primary) {
-                    return Err(ControlPlaneError::PgPrimaryNotInActingSet {
-                        pg_id: pg_id.get(),
-                        node_id: primary.as_u32(),
-                    });
-                }
-                authorize_node_service_for_snapshot(
-                    self,
+                let validated = validate_pg_peering_completion(PgPeeringCompletionValidation {
+                    snapshot: self,
+                    pg_id,
                     primary,
                     node_incarnation,
-                    self.cluster_epoch,
-                    complete_at_ms,
-                )?;
-                if record.state == PgState::Active {
-                    if record.active_primary == Some(primary) {
+                    completed_at_ms: complete_at_ms,
+                    expected: None,
+                })?;
+                match validated {
+                    ValidatedPgPeeringCompletion::AlreadyActive => {
                         let mut next_snapshot = self.clone();
                         let changed = next_snapshot.record_committed_timestamp(complete_at_ms);
-                        return Ok(applied_control_plane_command(
+                        Ok(applied_control_plane_command(
                             self,
                             next_snapshot,
                             ControlPlaneCommandResponse::CompletePgPeering,
                             changed,
-                        ));
+                        ))
                     }
-                    return Err(ControlPlaneError::PgNotPeering {
-                        pg_id: pg_id.get(),
-                        cluster_epoch: self.cluster_epoch,
-                        state: record.state,
-                    });
+                    ValidatedPgPeeringCompletion::Complete {
+                        active_metadata_proof,
+                        active_metadata_proof_epoch,
+                    } => {
+                        let mut next_snapshot = self.clone();
+                        next_snapshot.record_committed_timestamp(complete_at_ms);
+                        let record = next_snapshot
+                            .pgs
+                            .get_mut(&pg_id)
+                            .expect("PG record validated before peering completion");
+                        let active_metadata_transfer_imported =
+                            record.peering_metadata_transfer.is_some();
+                        record.state = PgState::Active;
+                        record.active_primary = Some(primary);
+                        record.active_metadata_proof = Some(active_metadata_proof);
+                        record.active_metadata_transfer_imported =
+                            active_metadata_transfer_imported;
+                        record.peering_metadata_proof_floor = None;
+                        record.peering_metadata_proof_floor_epoch = None;
+                        record.peering_metadata_proof_floor_imported = false;
+                        record.peering_metadata_transfer = None;
+                        record.peering_metadata_transfer_source_route_epoch = None;
+                        record.peering_metadata_transfer_source_node_id = None;
+                        record.metadata_transfer_fenced = false;
+                        record.metadata_transfer_fence_source_lease_deadline_ms = None;
+                        record.metadata_transfer_fence_source_imported = false;
+                        next_snapshot.bump_epoch()?;
+                        next_snapshot
+                            .pgs
+                            .get_mut(&pg_id)
+                            .expect("PG record activated before epoch bump")
+                            .active_metadata_proof_epoch = Some(active_metadata_proof_epoch);
+                        Ok(applied_control_plane_command(
+                            self,
+                            next_snapshot,
+                            ControlPlaneCommandResponse::CompletePgPeering,
+                            true,
+                        ))
+                    }
                 }
-                if deterministic_pg_primary_for_snapshot(self, record.acting_set(), complete_at_ms)
-                    != Some(primary)
-                {
-                    return Err(ControlPlaneError::PgPrimaryNotServingCurrentEpoch {
-                        pg_id: pg_id.get(),
-                        node_id: primary.as_u32(),
-                    });
-                }
-                if record.state != PgState::Peering {
-                    return Err(ControlPlaneError::PgNotPeering {
-                        pg_id: pg_id.get(),
-                        cluster_epoch: self.cluster_epoch,
-                        state: record.state,
-                    });
-                }
-                if record.metadata_transfer_fenced {
-                    return Err(
-                        ControlPlaneError::PgMetadataTransferFenceRequiresTransferInstall {
-                            pg_id: pg_id.get(),
-                        },
-                    );
-                }
-                let active_metadata_proof = validate_pg_peering_observations(
-                    self,
-                    pg_id,
-                    record.acting_set(),
-                    complete_at_ms,
-                )?;
-                validate_peering_metadata_proof_floor(
-                    self.cluster_epoch,
-                    pg_id,
-                    primary,
-                    record.peering_metadata_proof_floor_context(),
-                    record.peering_metadata_transfer,
-                    active_metadata_proof,
-                )?;
-                let active_metadata_proof_epoch = self.cluster_epoch;
-
-                let mut next_snapshot = self.clone();
-                next_snapshot.record_committed_timestamp(complete_at_ms);
-                let record = next_snapshot
-                    .pgs
-                    .get_mut(&pg_id)
-                    .expect("PG record validated before peering completion");
-                let active_metadata_transfer_imported = record.peering_metadata_transfer.is_some();
-                record.state = PgState::Active;
-                record.active_primary = Some(primary);
-                record.active_metadata_proof = Some(active_metadata_proof);
-                record.active_metadata_transfer_imported = active_metadata_transfer_imported;
-                record.peering_metadata_proof_floor = None;
-                record.peering_metadata_proof_floor_epoch = None;
-                record.peering_metadata_proof_floor_imported = false;
-                record.peering_metadata_transfer = None;
-                record.peering_metadata_transfer_source_route_epoch = None;
-                record.peering_metadata_transfer_source_node_id = None;
-                record.metadata_transfer_fenced = false;
-                record.metadata_transfer_fence_source_lease_deadline_ms = None;
-                record.metadata_transfer_fence_source_imported = false;
-                next_snapshot.bump_epoch()?;
-                next_snapshot
-                    .pgs
-                    .get_mut(&pg_id)
-                    .expect("PG record activated before epoch bump")
-                    .active_metadata_proof_epoch = Some(active_metadata_proof_epoch);
-                Ok(applied_control_plane_command(
-                    self,
-                    next_snapshot,
-                    ControlPlaneCommandResponse::CompletePgPeering,
-                    true,
-                ))
             }
             ControlPlaneCommand::CompleteReadyPgPeerings { ready_at_ms, ready } => {
                 self.validate_committed_timestamp(ready_at_ms)?;
@@ -2196,86 +2152,17 @@ impl ControlPlaneCommandStateMachine for ClusterControlSnapshot {
                             pg_id: completion.pg_id.get(),
                         });
                     }
-                    let record = self
-                        .pg(completion.pg_id)
-                        .ok_or(ControlPlaneError::UnknownPg {
-                            pg_id: completion.pg_id.get(),
-                        })?;
-                    if !record.acting_set.contains(&completion.primary) {
-                        return Err(ControlPlaneError::PgPrimaryNotInActingSet {
-                            pg_id: completion.pg_id.get(),
-                            node_id: completion.primary.as_u32(),
-                        });
-                    }
-                    authorize_node_service_for_snapshot(
-                        self,
-                        completion.primary,
-                        completion.node_incarnation,
-                        self.cluster_epoch,
-                        ready_at_ms,
-                    )?;
-                    if record.state == PgState::Active {
-                        if record.active_primary == Some(completion.primary) {
-                            continue;
-                        }
-                        return Err(ControlPlaneError::PgNotPeering {
-                            pg_id: completion.pg_id.get(),
-                            cluster_epoch: self.cluster_epoch,
-                            state: record.state,
-                        });
-                    }
-                    if deterministic_pg_primary_for_snapshot(self, record.acting_set(), ready_at_ms)
-                        != Some(completion.primary)
-                    {
-                        return Err(ControlPlaneError::PgPrimaryNotServingCurrentEpoch {
-                            pg_id: completion.pg_id.get(),
-                            node_id: completion.primary.as_u32(),
-                        });
-                    }
-                    if record.state != PgState::Peering {
-                        return Err(ControlPlaneError::PgNotPeering {
-                            pg_id: completion.pg_id.get(),
-                            cluster_epoch: self.cluster_epoch,
-                            state: record.state,
-                        });
-                    }
-                    if record.metadata_transfer_fenced {
-                        return Err(
-                            ControlPlaneError::PgMetadataTransferFenceRequiresTransferInstall {
-                                pg_id: completion.pg_id.get(),
-                            },
-                        );
-                    }
-                    if completion.active_metadata_proof_epoch != self.cluster_epoch {
-                        return Err(ControlPlaneError::PgPeeringMetadataProofEpochMismatch {
-                            pg_id: completion.pg_id.get(),
-                            expected: self.cluster_epoch,
-                            actual: completion.active_metadata_proof_epoch,
-                        });
-                    }
-                    let observed_metadata_proof = validate_pg_peering_observations(
-                        self,
-                        completion.pg_id,
-                        record.acting_set(),
-                        ready_at_ms,
-                    )?;
-                    if observed_metadata_proof != completion.active_metadata_proof {
-                        return Err(ControlPlaneError::PgPeeringMetadataProofMismatch {
-                            pg_id: completion.pg_id.get(),
-                            node_id: completion.primary.as_u32(),
-                            cluster_epoch: self.cluster_epoch,
-                            expected: observed_metadata_proof,
-                            actual: completion.active_metadata_proof,
-                        });
-                    }
-                    validate_peering_metadata_proof_floor(
-                        self.cluster_epoch,
-                        completion.pg_id,
-                        completion.primary,
-                        record.peering_metadata_proof_floor_context(),
-                        record.peering_metadata_transfer,
-                        completion.active_metadata_proof,
-                    )?;
+                    validate_pg_peering_completion(PgPeeringCompletionValidation {
+                        snapshot: self,
+                        pg_id: completion.pg_id,
+                        primary: completion.primary,
+                        node_incarnation: completion.node_incarnation,
+                        completed_at_ms: ready_at_ms,
+                        expected: Some(ExpectedPgPeeringCompletion {
+                            active_metadata_proof: completion.active_metadata_proof,
+                            active_metadata_proof_epoch: completion.active_metadata_proof_epoch,
+                        }),
+                    })?;
                 }
 
                 let mut next_snapshot = self.clone();
@@ -8258,6 +8145,129 @@ fn validate_storage_cluster_map_history_floor_at_epoch(
         );
     }
     Ok(())
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ExpectedPgPeeringCompletion {
+    active_metadata_proof: PgMetadataProof,
+    active_metadata_proof_epoch: ClusterEpoch,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PgPeeringCompletionValidation<'a> {
+    snapshot: &'a ClusterControlSnapshot,
+    pg_id: PgId,
+    primary: NodeId,
+    node_incarnation: u64,
+    completed_at_ms: u64,
+    expected: Option<ExpectedPgPeeringCompletion>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ValidatedPgPeeringCompletion {
+    AlreadyActive,
+    Complete {
+        active_metadata_proof: PgMetadataProof,
+        active_metadata_proof_epoch: ClusterEpoch,
+    },
+}
+
+fn validate_pg_peering_completion(
+    validation: PgPeeringCompletionValidation<'_>,
+) -> Result<ValidatedPgPeeringCompletion, ControlPlaneError> {
+    let PgPeeringCompletionValidation {
+        snapshot,
+        pg_id,
+        primary,
+        node_incarnation,
+        completed_at_ms,
+        expected,
+    } = validation;
+    let record = snapshot
+        .pg(pg_id)
+        .ok_or(ControlPlaneError::UnknownPg { pg_id: pg_id.get() })?;
+    if !record.acting_set.contains(&primary) {
+        return Err(ControlPlaneError::PgPrimaryNotInActingSet {
+            pg_id: pg_id.get(),
+            node_id: primary.as_u32(),
+        });
+    }
+    authorize_node_service_for_snapshot(
+        snapshot,
+        primary,
+        node_incarnation,
+        snapshot.cluster_epoch,
+        completed_at_ms,
+    )?;
+    if record.state == PgState::Active {
+        if record.active_primary == Some(primary) {
+            return Ok(ValidatedPgPeeringCompletion::AlreadyActive);
+        }
+        return Err(ControlPlaneError::PgNotPeering {
+            pg_id: pg_id.get(),
+            cluster_epoch: snapshot.cluster_epoch,
+            state: record.state,
+        });
+    }
+    if deterministic_pg_primary_for_snapshot(snapshot, record.acting_set(), completed_at_ms)
+        != Some(primary)
+    {
+        return Err(ControlPlaneError::PgPrimaryNotServingCurrentEpoch {
+            pg_id: pg_id.get(),
+            node_id: primary.as_u32(),
+        });
+    }
+    if record.state != PgState::Peering {
+        return Err(ControlPlaneError::PgNotPeering {
+            pg_id: pg_id.get(),
+            cluster_epoch: snapshot.cluster_epoch,
+            state: record.state,
+        });
+    }
+    if record.metadata_transfer_fenced {
+        return Err(
+            ControlPlaneError::PgMetadataTransferFenceRequiresTransferInstall {
+                pg_id: pg_id.get(),
+            },
+        );
+    }
+    if let Some(expected) = expected {
+        if expected.active_metadata_proof_epoch != snapshot.cluster_epoch {
+            return Err(ControlPlaneError::PgPeeringMetadataProofEpochMismatch {
+                pg_id: pg_id.get(),
+                expected: snapshot.cluster_epoch,
+                actual: expected.active_metadata_proof_epoch,
+            });
+        }
+    }
+    let observed_metadata_proof =
+        validate_pg_peering_observations(snapshot, pg_id, record.acting_set(), completed_at_ms)?;
+    let active_metadata_proof = if let Some(expected) = expected {
+        if observed_metadata_proof != expected.active_metadata_proof {
+            return Err(ControlPlaneError::PgPeeringMetadataProofMismatch {
+                pg_id: pg_id.get(),
+                node_id: primary.as_u32(),
+                cluster_epoch: snapshot.cluster_epoch,
+                expected: observed_metadata_proof,
+                actual: expected.active_metadata_proof,
+            });
+        }
+        expected.active_metadata_proof
+    } else {
+        observed_metadata_proof
+    };
+    validate_peering_metadata_proof_floor(
+        snapshot.cluster_epoch,
+        pg_id,
+        primary,
+        record.peering_metadata_proof_floor_context(),
+        record.peering_metadata_transfer,
+        active_metadata_proof,
+    )?;
+    Ok(ValidatedPgPeeringCompletion::Complete {
+        active_metadata_proof,
+        active_metadata_proof_epoch: snapshot.cluster_epoch,
+    })
 }
 
 fn validate_pg_peering_observations(

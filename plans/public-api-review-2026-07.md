@@ -177,13 +177,17 @@ Remaining order of attack:
   a required `u64`, serializing drain records with a required deadline, and
   making the SQLite `bucket_write_drains.lease_deadline` column `NOT NULL`.
 
-- [ ] **RR10. Single/batch peering validation scaffolding still duplicated.**
+- [x] **RR10. Single/batch peering validation scaffolding still duplicated.**
   S3's fix shares the authorization/proof helpers, but the surrounding
   ~50 lines of validation (acting-set membership, deterministic-primary,
   Peering-state, fence checks) are duplicated between the `CompletePgPeering`
   arm (`control_plane.rs:2068-2178`) and the batch arm (`:2179-2278`).
-  Identical today; can drift again. Extract a shared per-completion
-  validation fn.
+  Identical today; can drift again. Fixed by routing both command arms through
+  a shared per-completion validator that owns the common acting-set,
+  authorization, Active replay, deterministic-primary, Peering-state, fence,
+  observation, and proof-floor checks. The batch arm keeps only its
+  duplicate-PG check and its claimed proof/epoch matching as command-specific
+  behavior.
 
 - [ ] **RR11. `Forever` encoded as a `u64::MAX` sentinel** in the route-map
   validity atomic (`cluster/local.rs:44-58`), making `Until(u64::MAX)`
