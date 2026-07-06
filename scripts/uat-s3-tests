@@ -739,24 +739,39 @@ wait_for_control_plane_runtime_map_ready() {
     while true; do
         local map_status
         if map_status="$("${server_cmd[@]}" control-plane-runtime-map-ready "$control_plane_socket_path" 2>/dev/null)"; then
-            local runtime_epoch
-            local pg_routes
-            local active_serving_pg_routes
-            read -r runtime_epoch pg_routes active_serving_pg_routes <<<"$map_status"
-            if [[ "$runtime_epoch" =~ ^[0-9]+$ && "$pg_routes" =~ ^[0-9]+$ && "$active_serving_pg_routes" =~ ^[0-9]+$ ]] \
-                && ((runtime_epoch >= min_epoch && pg_routes == ARGMIN_PG_COUNT && active_serving_pg_routes == ARGMIN_PG_COUNT)); then
-                echo "== argmin-s3 UAT control-plane runtime map ready at epoch $runtime_epoch with $active_serving_pg_routes/$pg_routes serving PG routes =="
-                control_plane_runtime_map_ready_epoch="$runtime_epoch"
+            if control_plane_runtime_map_status_ready "$map_status" "$min_epoch"; then
                 return 0
             fi
         fi
         if (($(date +%s) - start >= deadline_seconds)); then
-            "${server_cmd[@]}" control-plane-runtime-map-ready "$control_plane_socket_path" >&2 || true
+            local final_map_status
+            if final_map_status="$("${server_cmd[@]}" control-plane-runtime-map-ready "$control_plane_socket_path" 2>&1)"; then
+                if control_plane_runtime_map_status_ready "$final_map_status" "$min_epoch"; then
+                    return 0
+                fi
+            fi
+            printf '%s\n' "$final_map_status" >&2
             tail -n 120 "$control_plane_state_path" >&2 || true
-            die "timed out waiting for control-plane runtime map readiness"
+            die "timed out waiting for control-plane runtime map readiness at or after epoch $min_epoch"
         fi
         sleep 0.1
     done
+}
+
+control_plane_runtime_map_status_ready() {
+    local map_status="$1"
+    local min_epoch="$2"
+    local runtime_epoch
+    local pg_routes
+    local active_serving_pg_routes
+    read -r runtime_epoch pg_routes active_serving_pg_routes <<<"$map_status"
+    if [[ "$runtime_epoch" =~ ^[0-9]+$ && "$pg_routes" =~ ^[0-9]+$ && "$active_serving_pg_routes" =~ ^[0-9]+$ ]] \
+        && ((runtime_epoch >= min_epoch && pg_routes == ARGMIN_PG_COUNT && active_serving_pg_routes == ARGMIN_PG_COUNT)); then
+        echo "== argmin-s3 UAT control-plane runtime map ready at epoch $runtime_epoch with $active_serving_pg_routes/$pg_routes serving PG routes =="
+        control_plane_runtime_map_ready_epoch="$runtime_epoch"
+        return 0
+    fi
+    return 1
 }
 
 print_control_plane_runtime_map_diagnostics() {

@@ -1288,7 +1288,7 @@ fn control_plane_runtime_map_ready(
     socket_path: &Path,
 ) -> Result<(ClusterEpoch, usize, usize), String> {
     let status = UnixControlPlaneClient::new(socket_path)
-        .runtime_map_status(storage::clock::current_time_millis())
+        .runtime_map_status_with_check_applied_timeout()
         .map_err(|error| format!("control-plane runtime map is not ready: {error}"))?;
     Ok((
         status.cluster_epoch(),

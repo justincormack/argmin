@@ -4353,14 +4353,6 @@ impl UnixControlPlaneClient {
         decode_control_plane_rpc_response(response_payload)
     }
 
-    fn send_read_only_request(
-        &self,
-        kind: ControlPlaneRpcKind,
-        payload: &[u8],
-    ) -> Result<Vec<u8>, ControlPlaneError> {
-        self.send_read_only_request_with_read_timeout(kind, payload, CONTROL_PLANE_RPC_IO_TIMEOUT)
-    }
-
     fn send_read_only_request_with_read_timeout(
         &self,
         kind: ControlPlaneRpcKind,
@@ -4543,7 +4535,11 @@ impl UnixControlPlaneClient {
         let deadline = Instant::now() + CONTROL_PLANE_RPC_CHECK_APPLIED_DEADLINE;
         let mut last_unconfirmed_message = None;
         loop {
-            match self.pg_runtime_map_snapshot(pg_id, 0) {
+            match self.pg_runtime_map_snapshot_with_read_timeout(
+                pg_id,
+                0,
+                CONTROL_PLANE_RPC_CHECK_APPLIED_IO_TIMEOUT,
+            ) {
                 Ok(runtime_map) => {
                     let Some(route) = runtime_map
                         .pg_routes()
@@ -4560,6 +4556,15 @@ impl UnixControlPlaneClient {
                                     .expect("missing route message was recorded"),
                             });
                         }
+                        if pre_update_epoch.is_none() {
+                            match self.set_pg_acting_set(pg_id, acting_set.to_vec()) {
+                                Ok(cluster_epoch) => return Ok(cluster_epoch),
+                                Err(error)
+                                    if error.is_maybe_applied_control_plane_rpc_response_loss() => {
+                                }
+                                Err(error) => return Err(error),
+                            }
+                        }
                         std::thread::sleep(CONTROL_PLANE_RPC_CHECK_APPLIED_BACKOFF);
                         continue;
                     };
@@ -4575,6 +4580,14 @@ impl UnixControlPlaneClient {
                         );
                     if pre_update_epoch.is_some_and(|epoch| route.cluster_epoch() > epoch) {
                         return Err(ControlPlaneError::RpcUnconfirmed { message });
+                    }
+                    if pre_update_epoch == Some(route.cluster_epoch()) {
+                        match self.set_pg_acting_set(pg_id, acting_set.to_vec()) {
+                            Ok(cluster_epoch) => return Ok(cluster_epoch),
+                            Err(error)
+                                if error.is_maybe_applied_control_plane_rpc_response_loss() => {}
+                            Err(error) => return Err(error),
+                        }
                     }
                     last_unconfirmed_message = Some(message);
                     if Instant::now() >= deadline {
@@ -4883,22 +4896,14 @@ impl ControlPlaneRuntimeMapSource for UnixControlPlaneClient {
         &self,
         _authority_now_ms: u64,
     ) -> Result<ClusterRuntimeMapSnapshot, ControlPlaneError> {
-        let payload = self.send_read_only_request(ControlPlaneRpcKind::RuntimeMapSnapshot, &[])?;
-        let mut reader = PayloadReader::new(&payload);
-        let runtime_map = read_runtime_map_snapshot(&mut reader)?;
-        reader.finish()?;
-        Ok(runtime_map)
+        self.runtime_map_snapshot_with_read_timeout(CONTROL_PLANE_RPC_CHECK_APPLIED_IO_TIMEOUT)
     }
 
     fn runtime_map_status(
         &self,
         _authority_now_ms: u64,
     ) -> Result<ControlPlaneRuntimeMapStatus, ControlPlaneError> {
-        let payload = self.send_read_only_request(ControlPlaneRpcKind::RuntimeMapStatus, &[])?;
-        let mut reader = PayloadReader::new(&payload);
-        let status = read_runtime_map_status(&mut reader)?;
-        reader.finish()?;
-        Ok(status)
+        self.runtime_map_status_with_read_timeout(CONTROL_PLANE_RPC_IO_TIMEOUT)
     }
 
     fn pg_runtime_map_snapshot(
@@ -4907,6 +4912,44 @@ impl ControlPlaneRuntimeMapSource for UnixControlPlaneClient {
         authority_now_ms: u64,
     ) -> Result<ClusterRuntimeMapSnapshot, ControlPlaneError> {
         UnixControlPlaneClient::pg_runtime_map_snapshot(self, pg_id, authority_now_ms)
+    }
+}
+
+impl UnixControlPlaneClient {
+    fn runtime_map_snapshot_with_read_timeout(
+        &self,
+        read_timeout: Duration,
+    ) -> Result<ClusterRuntimeMapSnapshot, ControlPlaneError> {
+        let payload = self.send_read_only_request_with_read_timeout(
+            ControlPlaneRpcKind::RuntimeMapSnapshot,
+            &[],
+            read_timeout,
+        )?;
+        let mut reader = PayloadReader::new(&payload);
+        let runtime_map = read_runtime_map_snapshot(&mut reader)?;
+        reader.finish()?;
+        Ok(runtime_map)
+    }
+
+    pub fn runtime_map_status_with_check_applied_timeout(
+        &self,
+    ) -> Result<ControlPlaneRuntimeMapStatus, ControlPlaneError> {
+        self.runtime_map_status_with_read_timeout(CONTROL_PLANE_RPC_CHECK_APPLIED_IO_TIMEOUT)
+    }
+
+    fn runtime_map_status_with_read_timeout(
+        &self,
+        read_timeout: Duration,
+    ) -> Result<ControlPlaneRuntimeMapStatus, ControlPlaneError> {
+        let payload = self.send_read_only_request_with_read_timeout(
+            ControlPlaneRpcKind::RuntimeMapStatus,
+            &[],
+            read_timeout,
+        )?;
+        let mut reader = PayloadReader::new(&payload);
+        let status = read_runtime_map_status(&mut reader)?;
+        reader.finish()?;
+        Ok(status)
     }
 }
 
@@ -11136,6 +11179,125 @@ mod tests {
     }
 
     #[test]
+    fn unix_control_plane_client_retries_pg_acting_set_when_lost_request_did_not_apply() {
+        let tmp = test_util::tempdir();
+        let socket_path = tmp.path().join("control-plane.sock");
+        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+        for node_id in [1, 2] {
+            authority
+                .set_node_membership(NodeId::new(node_id), NodeMembershipState::Active)
+                .unwrap();
+            assert!(heartbeat_until_serving(&mut authority, node_id, 1_000).serving());
+        }
+        authority
+            .set_pg_acting_set(PgId::new(7), vec![NodeId::new(1)])
+            .unwrap();
+        let previous_epoch = authority.snapshot().cluster_epoch();
+        let expected_epoch = ClusterEpoch::new(previous_epoch.get() + 1).unwrap();
+        let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _addr) = listener.accept().unwrap();
+            let request = read_control_plane_unix_request(&mut stream).unwrap();
+            assert_eq!(request.kind, ControlPlaneRpcKind::PgRuntimeMapSnapshot);
+            respond_control_plane_unix_request(&mut authority, &mut stream, request, 1_999)
+                .unwrap();
+            assert_eq!(authority.snapshot().cluster_epoch(), previous_epoch);
+
+            let (mut stream, _addr) = listener.accept().unwrap();
+            let request = read_control_plane_unix_request(&mut stream).unwrap();
+            assert_eq!(request.kind, ControlPlaneRpcKind::SetPgActingSet);
+            drop(request);
+            drop(stream);
+            assert_eq!(
+                authority.snapshot().cluster_epoch(),
+                previous_epoch,
+                "first request is lost before apply"
+            );
+
+            let (mut stream, _addr) = listener.accept().unwrap();
+            let request = read_control_plane_unix_request(&mut stream).unwrap();
+            assert_eq!(request.kind, ControlPlaneRpcKind::PgRuntimeMapSnapshot);
+            respond_control_plane_unix_request(&mut authority, &mut stream, request, 2_001)
+                .unwrap();
+            assert_eq!(
+                authority.snapshot().cluster_epoch(),
+                previous_epoch,
+                "observation should still see the pre-command route"
+            );
+
+            let (mut stream, _addr) = listener.accept().unwrap();
+            let request = read_control_plane_unix_request(&mut stream).unwrap();
+            assert_eq!(request.kind, ControlPlaneRpcKind::SetPgActingSet);
+            respond_control_plane_unix_request(&mut authority, &mut stream, request, 2_002)
+                .unwrap();
+            assert_eq!(authority.snapshot().cluster_epoch(), expected_epoch);
+        });
+
+        let client = UnixControlPlaneClient::new(&socket_path);
+        let cluster_epoch = client
+            .set_pg_acting_set_checked(PgId::new(7), vec![NodeId::new(1), NodeId::new(2)])
+            .unwrap();
+
+        server.join().unwrap();
+        assert_eq!(cluster_epoch, expected_epoch);
+    }
+
+    #[test]
+    fn unix_control_plane_client_uses_check_applied_timeout_for_pg_acting_set_observation() {
+        let tmp = test_util::tempdir();
+        let socket_path = tmp.path().join("control-plane.sock");
+        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+        for node_id in [1, 2] {
+            authority
+                .set_node_membership(NodeId::new(node_id), NodeMembershipState::Active)
+                .unwrap();
+            assert!(heartbeat_until_serving(&mut authority, node_id, 1_000).serving());
+        }
+        authority
+            .set_pg_acting_set(PgId::new(7), vec![NodeId::new(1)])
+            .unwrap();
+        let previous_epoch = authority.snapshot().cluster_epoch();
+        let expected_epoch = ClusterEpoch::new(previous_epoch.get() + 1).unwrap();
+        let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _addr) = listener.accept().unwrap();
+            let request = read_control_plane_unix_request(&mut stream).unwrap();
+            assert_eq!(request.kind, ControlPlaneRpcKind::PgRuntimeMapSnapshot);
+            respond_control_plane_unix_request(&mut authority, &mut stream, request, 1_999)
+                .unwrap();
+            assert_eq!(authority.snapshot().cluster_epoch(), previous_epoch);
+
+            let (mut stream, _addr) = listener.accept().unwrap();
+            let request = read_control_plane_unix_request(&mut stream).unwrap();
+            assert_eq!(request.kind, ControlPlaneRpcKind::SetPgActingSet);
+            let response = build_control_plane_unix_response(&mut authority, request, 2_000)
+                .expect("acting-set update should apply before response loss");
+            assert_eq!(response.kind, ControlPlaneRpcKind::SetPgActingSet);
+            assert_eq!(authority.snapshot().cluster_epoch(), expected_epoch);
+            drop(response);
+            drop(stream);
+
+            let (mut stream, _addr) = listener.accept().unwrap();
+            let request = read_control_plane_unix_request(&mut stream).unwrap();
+            assert_eq!(request.kind, ControlPlaneRpcKind::PgRuntimeMapSnapshot);
+            std::thread::sleep(CONTROL_PLANE_RPC_IO_TIMEOUT + Duration::from_millis(250));
+            respond_control_plane_unix_request(&mut authority, &mut stream, request, 2_001)
+                .unwrap();
+            assert_eq!(authority.snapshot().cluster_epoch(), expected_epoch);
+        });
+
+        let client = UnixControlPlaneClient::new(&socket_path);
+        let cluster_epoch = client
+            .set_pg_acting_set_checked(PgId::new(7), vec![NodeId::new(1), NodeId::new(2)])
+            .unwrap();
+
+        server.join().unwrap();
+        assert_eq!(cluster_epoch, expected_epoch);
+    }
+
+    #[test]
     fn unix_control_plane_client_confirms_pg_acting_set_with_unrelated_non_serving_pg() {
         let tmp = test_util::tempdir();
         let socket_path = tmp.path().join("control-plane.sock");
@@ -12034,6 +12196,96 @@ mod tests {
         assert_eq!(status.cluster_epoch(), expected_epoch);
         assert_eq!(status.pg_routes(), 1);
         assert_eq!(status.active_serving_pg_routes(), 1);
+    }
+
+    #[test]
+    fn unix_control_plane_client_runtime_map_status_check_applied_timeout_allows_slow_response() {
+        let tmp = test_util::tempdir();
+        let socket_path = tmp.path().join("control-plane.sock");
+        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+        authority
+            .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
+            .unwrap();
+        assert!(heartbeat_until_serving(&mut authority, 1, 1_000).serving());
+        let proof = PgMetadataProof::new(9, 10, 11);
+        authority
+            .set_pg_acting_set(PgId::new(7), vec![NodeId::new(1)])
+            .unwrap();
+        heartbeat_with_pg_proof(&mut authority, 1, 7, PgState::Peering, proof, false, 2_000);
+        authority
+            .complete_pg_peering(
+                PgId::new(7),
+                NodeId::new(1),
+                node_incarnation(&authority, 1),
+                2_001,
+            )
+            .unwrap();
+        heartbeat_with_pg_proof(&mut authority, 1, 7, PgState::Active, proof, false, 2_002);
+        let expected_epoch = authority.snapshot().cluster_epoch();
+        let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _addr) = listener.accept().unwrap();
+            let request = read_control_plane_unix_request(&mut stream).unwrap();
+            assert_eq!(request.kind, ControlPlaneRpcKind::RuntimeMapStatus);
+            std::thread::sleep(CONTROL_PLANE_RPC_IO_TIMEOUT + Duration::from_millis(250));
+            respond_control_plane_unix_request(&mut authority, &mut stream, request, 2_003)
+                .unwrap();
+        });
+
+        let client = UnixControlPlaneClient::new(&socket_path);
+        let status = client
+            .runtime_map_status_with_check_applied_timeout()
+            .unwrap();
+
+        server.join().unwrap();
+        assert_eq!(status.cluster_epoch(), expected_epoch);
+        assert_eq!(status.pg_routes(), 1);
+        assert_eq!(status.active_serving_pg_routes(), 1);
+    }
+
+    #[test]
+    fn unix_control_plane_client_runtime_map_snapshot_allows_slow_full_response() {
+        let tmp = test_util::tempdir();
+        let socket_path = tmp.path().join("control-plane.sock");
+        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+        authority
+            .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
+            .unwrap();
+        assert!(heartbeat_until_serving(&mut authority, 1, 1_000).serving());
+        let proof = PgMetadataProof::new(9, 10, 11);
+        authority
+            .set_pg_acting_set(PgId::new(7), vec![NodeId::new(1)])
+            .unwrap();
+        heartbeat_with_pg_proof(&mut authority, 1, 7, PgState::Peering, proof, false, 2_000);
+        authority
+            .complete_pg_peering(
+                PgId::new(7),
+                NodeId::new(1),
+                node_incarnation(&authority, 1),
+                2_001,
+            )
+            .unwrap();
+        heartbeat_with_pg_proof(&mut authority, 1, 7, PgState::Active, proof, false, 2_002);
+        let expected_epoch = authority.snapshot().cluster_epoch();
+        let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _addr) = listener.accept().unwrap();
+            let request = read_control_plane_unix_request(&mut stream).unwrap();
+            assert_eq!(request.kind, ControlPlaneRpcKind::RuntimeMapSnapshot);
+            std::thread::sleep(CONTROL_PLANE_RPC_IO_TIMEOUT + Duration::from_millis(250));
+            respond_control_plane_unix_request(&mut authority, &mut stream, request, 2_003)
+                .unwrap();
+        });
+
+        let client = UnixControlPlaneClient::new(&socket_path);
+        let runtime_map = client.runtime_map_snapshot(2_003).unwrap();
+
+        server.join().unwrap();
+        assert_eq!(runtime_map.cluster_epoch(), expected_epoch);
+        assert_eq!(runtime_map.pg_routes().len(), 1);
+        assert_eq!(runtime_map.pg_routes()[0].state(), PgState::Active);
     }
 
     #[test]
