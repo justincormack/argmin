@@ -1,7 +1,9 @@
 use aws_sdk_s3::types::EncodingType;
 use s3_tests::{
     assert_s3_err_code, create_objects, create_objects_with_keys, delete_all_and_bucket,
-    err_status, send_signed_request, unique_bucket, SendRetryingOperationAborted, CTX,
+    err_status, raw_bucket, send_signed_request,
+    shape::{assert_shape, error_response_headers, expected_error, shape},
+    unique_bucket, SendRetryingOperationAborted, CTX,
 };
 use std::time::Duration;
 
@@ -131,6 +133,22 @@ async fn head_object_eventually_after_versioning_enable(
 }
 
 // ── Empty / basic ───────────────────────────────────────────────────
+
+#[test]
+fn test_list_objects_v2_no_such_bucket_error_shape() {
+    s3_tests::run(async {
+        let missing_bucket = unique_bucket();
+        let response = raw_bucket("GET", &missing_bucket, Some("list-type=2"));
+        assert_shape(
+            "ListObjectsV2 missing bucket",
+            &response,
+            &shape()
+                .status(404)
+                .headers(error_response_headers())
+                .body(expected_error::no_such_bucket(&missing_bucket)),
+        );
+    });
+}
 
 #[test]
 fn test_bucket_list_empty() {

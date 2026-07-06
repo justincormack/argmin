@@ -4,7 +4,10 @@ use auth::canonical::{canonical_query_string, uri_encode};
 use aws_sdk_s3::primitives::ByteStream;
 use base64::Engine;
 use ring::{digest, hmac};
-use s3_tests::{unique_account_regional_bucket, unique_bucket, CTX};
+use s3_tests::{
+    shape::{assert_shape, error_response_headers, expected_error, shape},
+    unique_account_regional_bucket, unique_bucket, SignedRequestCredentials, CTX,
+};
 use s3_types::requires_sigv4;
 
 // ── Helpers ─────────────────────────────────────────────────────────────
@@ -1484,35 +1487,41 @@ fn test_put_bad_credential_scope() {
 fn test_put_wrong_region() {
     s3_tests::run(async {
         let bucket = setup_bucket().await;
-        let path = format!("/{bucket}");
         let wrong_region = if CTX.region() == "us-east-1" {
             "us-west-2"
         } else {
             "us-east-1"
         };
-        let s = Signer::new("GET", &path)
-            .body_hash(&sha256_hex(b""))
-            .region(wrong_region)
-            .sign();
-        let url = format!("{}{}", CTX.endpoint(), path);
-        let mut resp = agent()
-            .get(&url)
-            .header("Authorization", &s.authorization)
-            .header("x-amz-date", &s.amz_date)
-            .header("x-amz-content-sha256", &s.amz_content_sha256)
-            .call()
-            .expect("transport error");
-        let status = resp.status().as_u16();
-        let bucket_region = resp
-            .headers()
-            .get("x-amz-bucket-region")
-            .and_then(|value| value.to_str().ok())
-            .map(str::to_string);
-        let rbody = resp.body_mut().read_to_string().unwrap();
-        assert_eq!(status, 400, "expected 400, got {}", status);
-        assert_error_code(&rbody, "AuthorizationHeaderMalformed");
-        assert_eq!(bucket_region.as_deref(), Some(CTX.region()));
-        assert!(rbody.contains(&format!("<Region>{}</Region>", CTX.region())));
+        let response = s3_tests::send_signed_request_with_credentials(
+            "GET",
+            &format!("{}/{}", CTX.endpoint(), bucket),
+            b"",
+            std::iter::empty::<(&str, &str)>(),
+            SignedRequestCredentials {
+                access_key: CTX.access_key(),
+                secret_key: CTX.secret_key(),
+                region: wrong_region,
+                tls_ca_pem: CTX.tls_ca_pem(),
+            },
+        );
+        let expected_message = format!(
+            "The authorization header is malformed; the region '{wrong_region}' is wrong; \
+             expecting '{}'",
+            CTX.region()
+        );
+        assert_shape(
+            "GetBucket wrong signing region",
+            &response,
+            &shape()
+                .status(400)
+                .headers(error_response_headers())
+                .header("x-amz-bucket-region", CTX.region())
+                .body(expected_error::with_region(
+                    "AuthorizationHeaderMalformed",
+                    &expected_message,
+                    CTX.region(),
+                )),
+        );
         cleanup(&bucket, &[]).await;
     });
 }
@@ -1692,32 +1701,22 @@ fn test_unexpected_security_token_on_static_credentials_returns_bad_request() {
         let put = signed_put(&bucket, key, b"token check body");
         assert_eq!(put.0, 200, "expected setup PUT to succeed, got {}", put.0);
 
-        let url = format!("{}/{}/{}", CTX.endpoint(), bucket, key);
-        let response = s3_tests::send_signed_request(
+        let response = s3_tests::raw_object_with(
             "GET",
-            &url,
+            &bucket,
+            key,
             b"",
-            [("x-amz-security-token", "bad-token-causes-400")],
+            &[("x-amz-security-token", "bad-token-causes-400")],
         );
-        assert_eq!(
-            response.status, 400,
-            "expected 400, got {}",
-            response.status
-        );
-        assert_error_code(&response.body, "InvalidToken");
-        assert!(
-            response.body.contains(
-                "<Message>The provided token is malformed or otherwise invalid.</Message>"
+        assert_shape(
+            "GetObject with unexpected security token",
+            &response,
+            &shape().status(400).headers(error_response_headers()).body(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>InvalidToken</Code>\
+                     <Message>The provided token is malformed or otherwise invalid.</Message>\
+                     <Token-0>bad-token-causes-400</Token-0>\
+                     <RequestId>{request_id}</RequestId><HostId>{host_id}</HostId></Error>",
             ),
-            "expected InvalidToken message, got: {}",
-            response.body
-        );
-        assert!(
-            response
-                .body
-                .contains("<Token-0>bad-token-causes-400</Token-0>"),
-            "expected echoed token, got: {}",
-            response.body
         );
 
         cleanup(&bucket, &[key]).await;

@@ -153,7 +153,7 @@ for these few cases, not an endpoint switch.
 
 ## Phases
 
-### Phase 1 — helpers
+### Phase 1 — helpers (DONE)
 
 - add `crates/s3-tests/src/shape.rs` with normalisation, id-shape checks,
   expectation builder, body-template matcher, unordered-block comparator
@@ -162,7 +162,7 @@ for these few cases, not an endpoint switch.
   `xml_tag_text` / `response_header_value` / id-shape predicates; the new
   module becomes the single home
 
-### Phase 2 — pilot batch
+### Phase 2 — pilot batch (DONE)
 
 Convert a small representative slice to prove ergonomics before mass
 conversion:
@@ -177,6 +177,29 @@ conversion:
 Rule for all conversions: when an existing s3-test already covers the
 behaviour, **upgrade its assertions in place** rather than adding a
 parallel test — the point is to remove dual coverage, not relocate it.
+
+Pilot outcome:
+
+- converted: `test_object_read_not_exist` (object_crud),
+  `test_list_objects_v2_no_such_bucket_error_shape` (bucket_list, new),
+  `test_put_wrong_region` and
+  `test_unexpected_security_token_on_static_credentials_returns_bad_request`
+  (headers), `test_put_get_head_object_response_shape` (object_crud, new);
+  all validated against AWS via targeted `./scripts/aws-tests` runs
+- helper change from the pilot: `assert_shape` returns its placeholder
+  captures (and `assert_shape_one_of` the matched index plus captures) so
+  tests can pin cross-response consistency, e.g. the same `{etag}` across
+  PUT/GET/HEAD of one object
+- the pilot's AWS run immediately found real drift: AWS no longer sends
+  `x-amz-bucket-region` on the signed-header `InvalidToken` error (it did
+  when d69f1dff modelled it in April 2026). The server behaviour was
+  removed to match current AWS. This is the failure mode the golden tests
+  are designed to catch on every AWS run, where diff-tests only caught it
+  when someone ran them.
+- deterministic response values are pinned literally where the diff tests
+  compared them: `x-amz-checksum-crc64nvme` of a fixed body,
+  `x-amz-checksum-type: FULL_OBJECT`, `x-amz-server-side-encryption:
+  AES256`, `content-length`
 
 ### Phase 3 — convert `response_shape.rs` in themed batches
 

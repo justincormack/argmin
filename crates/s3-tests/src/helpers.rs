@@ -1336,6 +1336,61 @@ where
     )
 }
 
+fn raw_request_url(bucket: &str, key: &str, query: Option<&str>) -> String {
+    if key.is_empty() {
+        match query {
+            Some(query) => format!("{}/{bucket}?{query}", CTX.endpoint()),
+            None => format!("{}/{bucket}", CTX.endpoint()),
+        }
+    } else {
+        object_url(CTX.endpoint(), bucket, key, query)
+    }
+}
+
+/// Send a bodyless raw signed object request with the primary credentials.
+pub fn raw_object(method: &str, bucket: &str, key: &str) -> RawResponse {
+    raw_object_with(method, bucket, key, b"", &[])
+}
+
+/// Send a bodyless raw signed object request with a query string, e.g. an
+/// object subresource such as `tagging`.
+pub fn raw_object_query(method: &str, bucket: &str, key: &str, query: &str) -> RawResponse {
+    send_signed_request(
+        method,
+        &raw_request_url(bucket, key, Some(query)),
+        b"",
+        std::iter::empty::<(&str, &str)>(),
+    )
+}
+
+/// Send a raw signed object request with a body and extra headers.
+pub fn raw_object_with(
+    method: &str,
+    bucket: &str,
+    key: &str,
+    body: &[u8],
+    extra_headers: &[(&str, &str)],
+) -> RawResponse {
+    send_signed_request(
+        method,
+        &raw_request_url(bucket, key, None),
+        body,
+        extra_headers.iter().copied(),
+    )
+}
+
+/// Send a bodyless raw signed bucket-level request with the primary
+/// credentials, optionally with a query string, e.g. `list-type=2` or a
+/// subresource such as `versioning`.
+pub fn raw_bucket(method: &str, bucket: &str, query: Option<&str>) -> RawResponse {
+    send_signed_request(
+        method,
+        &raw_request_url(bucket, "", query),
+        b"",
+        std::iter::empty::<(&str, &str)>(),
+    )
+}
+
 /// Send a raw signed S3 request and preserve response metadata if the response
 /// body races with an early server-side connection close.
 pub fn send_signed_request_allow_response_body_error<K, V, I>(

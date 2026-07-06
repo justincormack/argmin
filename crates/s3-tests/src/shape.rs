@@ -467,7 +467,11 @@ impl ShapeSpec {
             .collect()
     }
 
-    fn check(&self, operation: &str, response: &RawResponse) -> Result<(), String> {
+    fn check(
+        &self,
+        operation: &str,
+        response: &RawResponse,
+    ) -> Result<BTreeMap<String, String>, String> {
         if let Some(read_error) = &response.body_read_error {
             return Err(format!(
                 "{operation}: response body read error: {read_error}"
@@ -517,7 +521,7 @@ impl ShapeSpec {
                 }
             }
         }
-        Ok(())
+        Ok(captures)
     }
 
     fn check_headers(
@@ -597,30 +601,46 @@ impl ShapeSpec {
 
 /// Assert a response matches the expectation, with the standard wire-ID
 /// invariants (ID shapes, XML/header ID equality) checked as well.
-pub fn assert_shape(operation: &str, response: &RawResponse, spec: &ShapeSpec) {
-    if let Err(message) = spec.check(operation, response) {
-        panic!("{message}");
+///
+/// Returns the placeholder captures so tests can pin consistency across
+/// responses, e.g. the same `{etag}` from PUT, GET, and HEAD of one object.
+pub fn assert_shape(
+    operation: &str,
+    response: &RawResponse,
+    spec: &ShapeSpec,
+) -> BTreeMap<String, String> {
+    match spec.check(operation, response) {
+        Ok(captures) => {
+            assert_response_id_shapes(operation, response);
+            assert_error_ids_match_headers(operation, response);
+            captures
+        }
+        Err(message) => panic!("{message}"),
     }
-    assert_response_id_shapes(operation, response);
-    assert_error_ids_match_headers(operation, response);
 }
 
 /// Assert a response matches one of several expectations. Only for behavior
 /// where a divergence is documented in `guides/aws-compatibility.md`: the
 /// same alternatives are accepted against every endpoint, never selected by
 /// endpoint.
-pub fn assert_shape_one_of(operation: &str, response: &RawResponse, specs: &[ShapeSpec]) {
+///
+/// Returns the index of the matching alternative and its captures.
+pub fn assert_shape_one_of(
+    operation: &str,
+    response: &RawResponse,
+    specs: &[ShapeSpec],
+) -> (usize, BTreeMap<String, String>) {
     assert!(
         !specs.is_empty(),
         "{operation}: no shape alternatives given"
     );
     let mut failures = Vec::new();
-    for spec in specs {
+    for (index, spec) in specs.iter().enumerate() {
         match spec.check(operation, response) {
-            Ok(()) => {
+            Ok(captures) => {
                 assert_response_id_shapes(operation, response);
                 assert_error_ids_match_headers(operation, response);
-                return;
+                return (index, captures);
             }
             Err(message) => failures.push(message),
         }

@@ -1,8 +1,10 @@
 use aws_sdk_s3::primitives::ByteStream;
 use ring::{digest, hmac};
 use s3_tests::{
-    assert_s3_err_code, delete_all_and_bucket, err_status, send_signed_request, unique_bucket,
-    SendRetryingOperationAborted, CTX,
+    assert_s3_err_code, delete_all_and_bucket, err_status, raw_object, raw_object_with,
+    send_signed_request,
+    shape::{assert_shape, error_response_headers, expected_error, shape},
+    unique_bucket, SendRetryingOperationAborted, CTX,
 };
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -406,15 +408,108 @@ fn test_object_read_not_exist() {
         let client = CTX.client();
         let bucket = setup_bucket().await;
 
-        let result = client
-            .get_object()
-            .bucket(&bucket)
-            .key("no-such-key")
-            .send()
-            .await;
-        assert_eq!(err_status(&result), 404);
+        let response = raw_object("GET", &bucket, "no-such-key");
+        assert_shape(
+            "GetObject missing key",
+            &response,
+            &shape()
+                .status(404)
+                .headers(error_response_headers())
+                .body(expected_error::no_such_key("no-such-key")),
+        );
 
         s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
+    });
+}
+
+#[test]
+fn test_put_get_head_object_response_shape() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+        let key = "shape-object.txt";
+        let body = b"response-shape-body";
+
+        let put = raw_object_with(
+            "PUT",
+            &bucket,
+            key,
+            body,
+            &[
+                ("Content-Type", "text/plain"),
+                ("Content-Encoding", "gzip"),
+                (
+                    "Content-Disposition",
+                    "attachment; filename=\"shape-object.txt\"",
+                ),
+                ("Content-Language", "en-US"),
+                ("Cache-Control", "max-age=60"),
+                ("x-amz-meta-author", "alice"),
+            ],
+        );
+        let put_captures = assert_shape(
+            "PutObject shape",
+            &put,
+            &shape()
+                .status(200)
+                .headers([
+                    ("etag", "{etag}"),
+                    ("x-amz-checksum-crc64nvme", "1F3PqQNotl4="),
+                    ("x-amz-checksum-type", "FULL_OBJECT"),
+                    ("x-amz-server-side-encryption", "AES256"),
+                    ("x-amz-request-id", "{request_id}"),
+                    ("x-amz-id-2", "{host_id}"),
+                    ("content-length", "0"),
+                ])
+                .body_empty(),
+        );
+
+        let get_head_headers = [
+            ("etag", "{etag}"),
+            ("last-modified", "{http_date}"),
+            ("accept-ranges", "bytes"),
+            ("content-type", "text/plain"),
+            ("content-encoding", "gzip"),
+            ("cache-control", "max-age=60"),
+            (
+                "content-disposition",
+                "attachment; filename=\"shape-object.txt\"",
+            ),
+            ("content-language", "en-US"),
+            ("x-amz-meta-author", "alice"),
+            ("x-amz-server-side-encryption", "AES256"),
+            ("content-length", "19"),
+            ("x-amz-request-id", "{request_id}"),
+            ("x-amz-id-2", "{host_id}"),
+        ];
+
+        let get = raw_object("GET", &bucket, key);
+        let get_captures = assert_shape(
+            "GetObject shape",
+            &get,
+            &shape()
+                .status(200)
+                .headers(get_head_headers)
+                .body("response-shape-body"),
+        );
+
+        let head = raw_object("HEAD", &bucket, key);
+        let head_captures = assert_shape(
+            "HeadObject shape",
+            &head,
+            &shape().status(200).headers(get_head_headers).body_empty(),
+        );
+
+        assert_eq!(
+            put_captures["etag"], get_captures["etag"],
+            "GetObject ETag differs from PutObject ETag"
+        );
+        assert_eq!(
+            put_captures["etag"], head_captures["etag"],
+            "HeadObject ETag differs from PutObject ETag"
+        );
+
+        delete_all_and_bucket(client, &bucket, &[key.to_string()]).await;
     });
 }
 
