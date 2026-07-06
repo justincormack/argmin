@@ -720,6 +720,35 @@ mod tests {
         parse_amz_date("20240201T120500Z").unwrap()
     }
 
+    fn sign_test_presigned_query(method: &str, path: &str, query: &str, host: &str) -> String {
+        let query_for_sig = canonical_query_string(query);
+        let canonical_req = canonical_request(
+            method,
+            path,
+            &query_for_sig,
+            &format!("host:{host}\n"),
+            "host",
+            "UNSIGNED-PAYLOAD",
+        );
+        let canonical_hash = sha256_hex(canonical_req.as_bytes());
+        let scope = "20240201/us-east-1/s3/aws4_request";
+        let sts = string_to_sign("20240201T120000Z", scope, &canonical_hash);
+        let key = derive_signing_key(
+            &SecretKey::new("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".to_string()),
+            "20240201",
+            "us-east-1",
+            "s3",
+        );
+        let sig = hex_encode_lower(
+            hmac::sign(
+                &hmac::Key::new(hmac::HMAC_SHA256, key.as_ref()),
+                sts.as_bytes(),
+            )
+            .as_ref(),
+        );
+        format!("{query}&X-Amz-Signature={sig}")
+    }
+
     fn aws_example_signed_headers() -> [(&'static str, &'static str); 5] {
         [
             ("authorization", "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20130524/us-east-1/s3/aws4_request, SignedHeaders=host;range;x-amz-content-sha256;x-amz-date, Signature=f0e8bdb87c964420e857bd35b5d6ed310bd44f0170aba48dd91039c6036bdb41"),
@@ -2038,12 +2067,17 @@ mod tests {
             expires_at_epoch_secs: Some(100),
             enabled: true,
         });
-        let query = "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIAIOSFODNN7EXAMPLE%2F20240201%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Date=20240201T120000Z&X-Amz-Expires=900&X-Amz-SignedHeaders=host&X-Amz-Signature=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let query = sign_test_presigned_query(
+            "GET",
+            "/",
+            "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIAIOSFODNN7EXAMPLE%2F20240201%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Date=20240201T120000Z&X-Amz-Expires=900&X-Amz-SignedHeaders=host",
+            "example.com",
+        );
         let headers = [("host", "example.com")];
         let err = authenticate_request(
             "GET",
             "/",
-            query,
+            &query,
             &headers,
             b"",
             &store,
