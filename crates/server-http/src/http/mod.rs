@@ -3189,9 +3189,20 @@ impl HttpFrontend {
                 },
             )),
             AuthMode::PostSigV4 => {
-                Err(ServerError::Auth(auth::AuthError::InvalidCredentialScope {
-                    param: "X-Amz-Credential",
-                }))
+                // POST form credentials are authenticated with
+                // ExactEndpointRegion before AuthContext is built. Reaching
+                // this deferred bucket-region check would mean a future
+                // refactor bypassed the AWS-shaped POST scope validation.
+                debug_assert_eq!(
+                    signing_region,
+                    self.coordinator.region(),
+                    "POST SigV4 region mismatch must be rejected during form credential validation"
+                );
+                Err(ServerError::InternalError {
+                    reason:
+                        "POST SigV4 reached deferred bucket-region check after credential validation"
+                            .to_string(),
+                })
             }
             AuthMode::Anonymous => Ok(()),
         }

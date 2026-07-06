@@ -188,12 +188,17 @@ Remaining order of attack:
   If-Modified-Since/If-Unmodified-Since evaluate against epoch 0. Same
   pattern A3 removed from auth; fail closed or thread the timestamp in.
 
-- [ ] **RR13. Unreachable `AuthMode::PostSigV4` arm in
+- [x] **RR13. Unreachable `AuthMode::PostSigV4` arm in
   `enforce_bucket_region`** (`mod.rs:3188-3192`): POST always authenticates
   with `ExactEndpointRegion`, so the arm can never fire, and its
   `InvalidCredentialScope` fallback is weaker than the in-auth errors. Add a
   comment (or make it unreachable explicitly) so a future POST-deferral
-  doesn't silently take the weak path.
+  doesn't silently take the weak path. Fixed by documenting the invariant in
+  `enforce_bucket_region`: POST SigV4 form credentials must reject wrong
+  regions during form authentication, before `AuthContext` construction. If a
+  future refactor violates that invariant, the branch debug-asserts and
+  returns `InternalError` instead of fabricating a weak or incomplete S3
+  credential-scope response.
 
 - [ ] **RR14. Runtime-map validity wire format still permits `Forever`, and
   boundedness is same-epoch-checked only.** Control-plane RPC decode accepts
