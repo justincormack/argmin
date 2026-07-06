@@ -5,18 +5,8 @@
 ///
 /// This module contains only the condition types and their evaluation — no
 /// HTTP parsing. Header extraction lives in the HTTP/frontend crate.
-use std::time::{SystemTime, UNIX_EPOCH};
-
 use crate::error::ServerError;
 use crate::etag::parse_etag;
-
-/// Return the current time in milliseconds since the Unix epoch.
-fn now_millis() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
-}
 
 /// Conditions for read operations (GET, HEAD, Range GET).
 #[derive(Debug, Default)]
@@ -243,7 +233,9 @@ pub fn check_read_conditions(
     // Compare at second precision since HTTP dates have no sub-second component.
     if cond.if_none_match.is_none() {
         if let Some(since) = cond.if_modified_since {
-            if since <= now_millis() && last_modified / 1000 <= since / 1000 {
+            if since <= storage::clock::current_time_millis()
+                && last_modified / 1000 <= since / 1000
+            {
                 return Err(ServerError::NotModified {
                     etag: etag.to_string(),
                     last_modified,
@@ -356,7 +348,9 @@ pub fn check_copy_source_conditions(
     // Compare at second precision since HTTP dates have no sub-second component.
     if cond.if_none_match.is_none() {
         if let Some(since) = cond.if_modified_since {
-            if since <= now_millis() && last_modified / 1000 <= since / 1000 {
+            if since <= storage::clock::current_time_millis()
+                && last_modified / 1000 <= since / 1000
+            {
                 return Err(ServerError::PreconditionFailed);
             }
         }
@@ -480,12 +474,13 @@ mod tests {
     #[test]
     fn read_if_modified_since_future_ignored() {
         // Per RFC 7232 §3.3: future dates must be ignored → Ok
-        let future = now_millis() + 60_000;
         let cond = ReadCondition {
-            if_modified_since: Some(future),
+            if_modified_since: Some(70_000),
             ..Default::default()
         };
-        assert!(check_read_conditions(&cond, &test_etag(), 1000).is_ok());
+        storage::clock::with_time_override(10_000, || {
+            assert!(check_read_conditions(&cond, &test_etag(), 1000).is_ok());
+        });
     }
 
     #[test]
@@ -798,6 +793,18 @@ mod tests {
         // Object last_modified (1000) <= since (2000) → 412 (not 304)
         let err = check_copy_source_conditions(&cond, &test_etag(), 1000).unwrap_err();
         assert!(matches!(err, ServerError::PreconditionFailed));
+    }
+
+    #[test]
+    fn copy_source_if_modified_since_future_ignored() {
+        // Per RFC 7232 §3.3: future dates must be ignored → Ok
+        let cond = ReadCondition {
+            if_modified_since: Some(70_000),
+            ..Default::default()
+        };
+        storage::clock::with_time_override(10_000, || {
+            assert!(check_copy_source_conditions(&cond, &test_etag(), 1000).is_ok());
+        });
     }
 
     #[test]

@@ -198,10 +198,22 @@ Remaining order of attack:
   rejecting the reserved sentinel during RPC/runtime-config decode, and keeping
   a debug assertion at the local atomic encoding boundary.
 
-- [ ] **RR12. `now_millis` in `server-core/src/conditional.rs:14-19` still
-  uses `unwrap_or_default()`** — a broken clock makes
-  If-Modified-Since/If-Unmodified-Since evaluate against epoch 0. Same
-  pattern A3 removed from auth; fail closed or thread the timestamp in.
+- [x] **RR12. Conditional date evaluation bypasses the shared clock
+  abstraction** (`server-core/src/conditional.rs:14-19`). The current private
+  `now_millis` helper uses `SystemTime` directly and maps pre-epoch clock
+  errors to epoch 0 with `unwrap_or_default()`. The affected behavior is the
+  RFC future-date guard for `If-Modified-Since` and copy-source
+  `x-amz-copy-source-if-modified-since`; `If-Unmodified-Since` compares only
+  the object `Last-Modified` timestamp against the header value. Low severity:
+  a wrong-but-valid wall clock has no local error signal, but detectable clock
+  errors should not be hidden. Use the shared clock abstraction or thread
+  `now_millis` into the evaluator so the behavior is explicit and testable,
+  and surface detectable clock errors instead of silently treating them as
+  epoch 0. Fixed by deleting the private conditional clock helper and inlining
+  `storage::clock::current_time_millis()` at both future-date guards, matching
+  the rest of server-core's current clock policy. This intentionally does not
+  add broader wall-clock sanity checks; an erroneous but valid wall clock will
+  already affect TLS, SigV4, and other time-sensitive paths.
 
 - [x] **RR13. Unreachable `AuthMode::PostSigV4` arm in
   `enforce_bucket_region`** (`mod.rs:3188-3192`): POST always authenticates
