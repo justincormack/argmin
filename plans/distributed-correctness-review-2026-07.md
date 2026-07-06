@@ -21,6 +21,14 @@ at the end. Finding IDs are stable so items can be broken out into work
 slices: `R*` = Raft, `CP*` = single-authority control plane, `MD*` = metadata
 replication, `CL*` = cluster/routing/peering, `RPC*` = storage RPC.
 
+An interim re-review of the fix work (baseline `88decac1` → `6b821bc8`,
+2026-07-06) is recorded in the "Interim re-review — 2026-07-06" section
+before the hardening plan: it verifies which resolutions hold, corrects two
+statuses (CL1 still open, CP5 partial; CP1 actually resolved), assesses the
+new Phase 12.4 WAL subsystem, and adds new findings `INT-1`–`INT-6` —
+including two high-severity availability regressions introduced by the fixes
+themselves (INT-1, INT-2).
+
 ## Cross-cutting themes
 
 Four systemic patterns produce most of the findings below; each is worth
@@ -439,9 +447,11 @@ passes the deadline, and only then can peering elect a successor. Correctness
 of the chain reduces to: lease deadlines must be monotonic per node on the
 authority side, and wall clocks must agree. Both assumptions have holes.
 
-### CP1. HIGH — Out-of-order heartbeat application regresses lease deadlines; no per-node monotonicity guard
+### CP1. RESOLVED (interim re-review 2026-07-06) — Out-of-order heartbeat application regresses lease deadlines; no per-node monotonicity guard
 
-Confirmed race (verified directly); timing plausible.
+Confirmed race (verified directly); timing plausible. **Resolved on the
+production path** by 0e1deb2b + 569bbb39 (see status update at the end of
+this finding).
 
 - `RecordNodeHeartbeat` unconditionally overwrites `lease_deadline_ms`,
   `last_heartbeat_ms`, and `last_observed_epoch` (`control_plane.rs:1341-1343`
@@ -470,6 +480,19 @@ Confirmed race (verified directly); timing plausible.
 - Milder sibling: the stale-epoch overwrite of `last_observed_epoch` (:1341)
   applied after a current-epoch heartbeat flips the primary back to
   non-serving and makes `active_pg_route` fail (see CP11).
+- Status update (interim re-review 2026-07-06): resolved on the Phase 11
+  production path. The real fixes are 0e1deb2b + 569bbb39. The RPC worker and
+  the maintenance expiry loop now sample `now_ms` inside the authority mutex
+  (`argmin-s3/src/main.rs:2651-2657`, :1411-1414); no production
+  apply/lease-evaluation path captures time pre-mutex. The apply-side guards
+  live in the single shared `apply_control_plane_command` used by both the
+  single authority and the Raft path: `NodeLeaseDeadlineRegression` rejection
+  (`control_plane.rs:1438-1446`), snapshot-wide committed-timestamp
+  monotonicity via `validate_committed_timestamp` (:859-869), and
+  `last_observed_epoch` clamped monotonic (:211-216). Lease deadlines can only
+  move forward; the stale-epoch `last_observed_epoch` overwrite sibling is
+  closed by the clamp. Note: the committed-timestamp guard introduced INT-1
+  (crash loop on clock regression) — see the interim re-review section.
 
 ### CP2. HIGH — Fencing is wall-clock based with zero margin; a backward clock step (or multihost skew) reopens an expired serving window
 
@@ -526,9 +549,11 @@ Confirmed absence.
   protection is convention, not enforcement. Authority-incarnation
   regressions (CP3) are likewise invisible to consumers.
 
-### CP5. MEDIUM — Unbounded protected cluster-map history + full snapshot embedded in every heartbeat response, with an 8MB frame cap → cliff failure of all lease renewals
+### CP5. PARTIAL (interim re-review 2026-07-06) — Unbounded protected cluster-map history + full snapshot embedded in every heartbeat response, with an 8MB frame cap → cliff failure of all lease renewals
 
-Confirmed mechanics.
+Confirmed mechanics. Heartbeat-response half fixed; durable-history half and
+the frontend-startup snapshot RPC still expose the cliff (see status update
+at the end of this finding).
 
 - History pruning exempts protected records from the 256-record cap and stops
   when only protected records remain (`control_plane.rs:8270-8284`).
@@ -552,6 +577,24 @@ Confirmed mechanics.
 - Related sharp edge: a node whose reported floor references a pruned epoch
   has its heartbeats rejected permanently (:7699-7734) — safe but
   unrecoverable via the control plane.
+- Status update (interim re-review 2026-07-06): partial.
+  - Fixed: heartbeat refresh responses no longer embed the full snapshot —
+    they carry a compact 5-field lease summary plus delta-compacted history
+    scoped to the node's observed epoch and participation
+    (`control_plane.rs:5040-5041`, :5492-5498, :603-632, :742-809), with a
+    regression test pinning response size well below snapshot size
+    (5395b096, 63654370, 64d18258).
+  - Not fixed: durable history pruning is byte-identical to baseline
+    (:8798-8840); Out/Removed nodes still pin `retain_from_epoch` forever
+    (`SetNodeMembership` does not clear the floor, :1334-1343); no absolute
+    cap. The fsync-per-heartbeat full-state rewrite and the pruned-floor
+    permanent heartbeat rejection are also unchanged.
+  - Cliff still reachable on a load-bearing path: the full
+    `RuntimeMapSnapshot` RPC serializes all history × all PGs (:717-727,
+    :5570-5571) under the unchanged 8MB cap (:22, :5280-5284), and S3
+    frontend gateway startup requires it (`main.rs:3255-3301`, :3304-3320).
+    Even the nominal 256-record cap crosses 8MB around ~800 PGs. Blast radius
+    reduced from cluster-wide lease loss to "frontends cannot start/restart".
 
 ### CP6. MEDIUM — Cross-epoch metadata-proof "progress" accepts any divergent proof once the epoch has advanced past the floor epoch
 
@@ -924,6 +967,24 @@ Mechanism confirmed; window deployment-dependent.
 - The same pattern applies to any epoch bump where the previous primary
   remains process-alive but is excluded from the observation set (endpoint
   change, incarnation change: `control_plane.rs:1331-1340`, :1377-1391).
+- Status update (interim re-review 2026-07-06): **still fully open — do not
+  count the peering-fence commits against this finding.** 9f4a97cd/4d05ea01
+  fence something else: `authorize_node_service_for_snapshot`
+  (`control_plane.rs:2239-2295`) validates the *incoming* primary's
+  incarnation/epoch/lease against stale replayed batch completions, and
+  4d05ea01 is a behavior-preserving extraction into
+  `validate_pg_peering_completion` (:8185). Nothing captures or waits out the
+  *deposed* primary's lease: `SetNodeMembership(Out)` still nulls the lease
+  uncaptured (`record.lease_deadline_ms = None`, :1342, verified), and
+  `mark_pgs_peering_for_nodes` clears the only candidate fence field
+  (`metadata_transfer_fence_source_lease_deadline_ms = None`, :8878). The
+  original scenario replays across all admin entry paths (Out/Removed,
+  availability, incarnation/endpoint, acting-set swap). Because the deposed
+  deadline is now destroyed at apply time, the fix needs capture scaffolding
+  first: record the previous primary's last lease deadline when a PG leaves
+  Active for any reason (the metadata-transfer path shows the pattern at
+  :1912, :1983-1984) and refuse peering completion/readiness until `now_ms`
+  exceeds it.
 
 ### CL2. HIGH (availability) — Divergent replicas permanently wedge a PG in `Peering`; the implemented catch-up path has no production caller
 
@@ -949,6 +1010,20 @@ Confirmed.
   bump → epoch bump → Peering); replicas lag by one entry; proofs never
   converge; the PG serves nothing, forever, and nothing surfaces why. Data is
   safe (the extra entry was unacked); availability is not.
+- Status update (interim re-review 2026-07-06): narrow partial. cb13fc8b
+  wires a different, narrower recovery into the frontend refresh worker
+  (`cluster.rs:1315-1321`, :4280): on refresh failure it re-drives the
+  primary's *pending-command slot* forward, and on
+  `PgPeeringPendingMetadataCommand` expires same-epoch map generations. That
+  un-wedges only the "command still staged in the pending slot" case — and it
+  introduced a fencing regression of its own (INT-3 in the interim re-review
+  section). A pure proof mismatch (primary applied-and-cleared, replica lags)
+  still wedges forever: `PgPeeringMetadataProofMismatch` is still silently
+  swallowed in the readiness scan (`control_plane.rs:1209-1214`),
+  `deterministic_pg_primary_for_snapshot` still picks first-serving not
+  longest-chain (:2310), and nothing truncates unacked entries. The catch-up
+  machinery remains `#[allow(dead_code)]` with test-only callers
+  (`cluster.rs:2695-2756`).
 
 ### CL3. RESOLVED — Storage RPC and PgStore now fence stale command epochs
 
@@ -1304,6 +1379,279 @@ closes this.
   contention outcomes ride in success envelopes rather than being collapsed.
 
 ---
+
+# Interim re-review — 2026-07-06
+
+Re-review of the fix work between baseline `88decac1` (review date) and HEAD
+`6b821bc8` (~157 commits), including the Phase 12.4 WAL subsystem. Method:
+three parallel verification passes (Raft/WAL, metadata layer, control
+plane/RPC) reading HEAD code directly; the highest-impact claims below were
+re-verified by hand. Per-finding status updates have been folded into the
+finding sections above; this section holds the scoreboard, the new findings
+(INT-*), the WAL assessment, and updated priorities.
+
+## Verification scoreboard
+
+Claimed resolutions that **hold**: R1 (checkpoint strictly precedes every
+peer response, including WAL-mode compact; failure exits before ack), R2
+(timers on for Unix-peer durable mode; natural-election durability gate
+airtight on both authority-bearing surfaces), R3, R5, R6 (static-policy
+rejection + startup revalidation of artifact and WAL-replayed membership),
+R7 (sentinel tripwire; caveat: WAL deletion undetectable at replay offset 0 —
+safe but silent), R8 (caveat: WAL-internal poison does not set the shared
+peer gate; safety survives via `lock()` rejection + next checkpoint exit),
+R10 (caveat: new fragile substring matching for benign errors; and see
+INT-1), R4a/R4b guards (in the shared apply, covering both authorities — but
+they introduced INT-1), MD1 (bind-path never cleans; builder requires
+full-agreement proof; one stale guide sentence remains), MD2 (contiguity
+fence at all four fenced entry points, pre-mutation, single txn), MD3/CL3
+(follow-up — tokenless forward-epoch adoption — still real and open), MD4
+(as fail-closed; but the fix created INT-2), RPC1 (all sockets bounded, lock
+wait 500ms typed retryable, guard release safe; caveats INT-5), RPC2, RPC8,
+CP8 (as described; CAS precondition still absent, but b44aee4c removed the
+unchecked epoch-only fence RPC surface).
+
+Claims that **do not survive scrutiny**:
+
+- **CL1 remains fully open.** The peering-fence commits fence the incoming
+  primary, not the deposed one, and the deposed lease deadline is now
+  destroyed at apply time — see the CL1 status update.
+- **CP5 is half-fixed.** Heartbeat responses are compact now, but durable
+  history is still unbounded and frontend startup still fetches the full
+  snapshot RPC under the 8MB cap — see the CP5 status update.
+- **CP1 is better than the doc said** — genuinely resolved on the production
+  path (the fix lives in 569bbb39 + 0e1deb2b); status updated above.
+
+Still untouched since the original review: CP2/CL4 (zero skew margin — now
+the top pre-existing gap), CP3 (parsing hardened by 569bbb39/6033c69c, but
+NotFound→fresh-bootstrap and the missing incarnation floor unchanged), CP4
+(validity bounding improved: wire decode rejects unbounded maps, installs
+reject `Forever`; freshness proofs still have zero production consumers),
+CP6/CP7, CP9, CP10 (partial: canonical re-encode equality on parse; no
+checksum trailer or cluster identity), CP11 (a compact `runtime_map_status`
+RPC exists but only the CLI uses it), CL5, CL6, CL7 (relocated to
+`request_ops.rs:10537-10541`), RPC3, RPC4, RPC5 (partial: `TransportTimeout`
+added; connect/EOF/reset/partial-write still collapse to `PayloadDecode`),
+RPC6, RPC7, RPC9, MD5, MD7.
+
+## New findings (INT-*)
+
+A pattern worth naming: three of the five significant new issues were
+introduced by fixes (INT-1, INT-2, INT-4), all in the fail-closed direction —
+safety held, but availability regressions from hardening are becoming the
+dominant defect class.
+
+### INT-1. HIGH (availability, production path) — Committed-timestamp guard converts clock skew into an unrecoverable crash loop
+
+Confirmed mechanics (verified directly); trigger plausible.
+
+- `validate_committed_timestamp` rejects any command timestamp below the
+  replicated high-water (`control_plane.rs:859-869`), and
+  `record_committed_timestamp` has no forward bound — pure max (:871-878).
+  The high-water advances with every heartbeat/expiry.
+- Both serving loops treat the resulting `CommittedTimestampRegression` from
+  `ExpireHeartbeatLeases` as fatal `exit(1)`: Phase 11 at
+  `argmin-s3/src/main.rs:~1425` (verified), the Raft loop at :2479-2482 (it
+  is not a forward-to-leader error, so the benign matcher does not absorb
+  it).
+- Scenarios: (a) NTP steps the Phase 11 authority clock back → the production
+  control plane crash-loops until wall clock passes the high-water; (b) after
+  Raft failover, a new leader whose clock lags the old leader's last
+  committed timestamp exits on its first lease scan → re-election, possibly
+  of the other lagging node — leader flapping proportional to skew;
+  (c) worst case: one node with a badly-future clock commits a single
+  heartbeat → the high-water jumps years ahead → after fixing the clock,
+  every expiry is rejected forever → permanent control-plane crash loop
+  requiring manual state surgery.
+- The pre-guard behavior degraded gracefully; the guard converts skew into
+  fail-stop with no bound and no recovery path.
+- Fix shape: treat the deterministic rejection as benign-wait with alerting
+  in both scan loops, and bound forward timestamp jumps (sanity window
+  against committed state) at proposal or apply time.
+
+### INT-2. HIGH (availability) — The MD4 fix makes a future-epoch pending slot brick the whole node
+
+Confirmed mechanism (verified directly); the crash timing is narrow per
+write but recurs at every epoch bump.
+
+- Recovery now hard-errors on a future-epoch slot
+  (`pg_store/command_log.rs:2070-2077`, `MetadataCommandLogConflict`), and
+  the error propagates through `recover_pg_metadata_command_state`
+  (`node.rs:635-641`) → `StorageNodeServer::bind`
+  (`storage_node_server.rs:1556`), failing the entire node.
+- The window is not exotic: the durable replica-state epoch only advances
+  when the first command of an epoch is applied (:4002-4011), and slot
+  install legitimately precedes apply (documented at :2051-2057). After any
+  epoch bump, if the PG primary crashes between pending-slot install and the
+  first `apply_metadata_command_and_record` commit, restart yields
+  slot-epoch N+1 vs store-epoch N → bind fails → crash loop.
+- The frontend drain (cb13fc8b) cannot help because the node never comes up,
+  and the cluster-level convergence path for future-epoch slots does not
+  exist (CL2's reconciliation machinery is still not production-wired). The
+  pre-fix code handled the common zero-apply variant of this window.
+- Fix shape: at bind, a future-epoch slot with no terminal entry and
+  store-epoch behind should quarantine per-PG (bind the PG fail-closed,
+  serve the node's other PGs), not abort node startup.
+
+### INT-3. MEDIUM (fencing regression) — The peering-refresh drain (cb13fc8b) widens the metadata-write fence
+
+Confidence: medium — every individual gate crossing verified in code; the
+composite requires an unhealthy-peering activation plus a stale pinned
+frontend plus concurrent traffic.
+
+- Server side: metadata-command handlers (including the normal Active apply
+  path) now fall back to
+  `validate_historical_active_pg_route_for_metadata_command_recovery`, which
+  accepts `cluster_epoch < current` whenever a retained historical Active
+  route at that epoch exists plus any current-or-retained Peering route at
+  epoch `>= cluster_epoch` containing the node. The `>=` predicate keeps the
+  acceptance window open long after the peering it was meant to serve.
+- Frontend side: Recovery route mode skips `require_route_map_valid_now()`
+  entirely (`cluster/local.rs:3193-3204`, :3320-3334), and the refresh
+  worker triggers `drain_pending_metadata_commands_for_current_map` on every
+  refresh error, not just the pending-command predicate.
+- Composite scenario: PG activates at N+2 without the old primary (peering
+  skips unhealthy nodes, `control_plane.rs:8290-8305`); the slot-holder
+  returns with a preserved epoch-N slot; a frontend still pinned to the
+  epoch-N map has its refresh fail for an unrelated reason and drains all
+  PGs of its stale map, lease-expired, reissuing the epoch-N command;
+  concurrently the current primary fans out `(N+2, 1)`. Per-node arrival
+  order decides acceptance on not-yet-advanced replicas → identical log
+  positions with divergent rows/digests → proof divergence → fail-closed
+  wedge (CL2 repair unwired). No acked data lost; the strict
+  pre-cb13fc8b fence (`command epoch == current` + valid lease) made this
+  unreachable.
+- Fix shape: `==`-epoch (or bounded) predicate on the historical acceptance
+  window, gate the drain on the pending-command error and scope it per-PG,
+  and decide explicitly whether Recovery mode may bypass lease validity.
+- Related smaller items: the drain pass short-circuits on the first failing
+  PG (`cluster.rs:4279-4303` — liveness, retried each interval); non-primary
+  terminal slot cleanup in the builder still uses local-only evidence and
+  runs before agreement validation (`cluster/local.rs:4030-4061`); pre-fix
+  sparse log rows from the old MD2 bug are neither detected nor quarantined
+  and get blessed into the chain by the slow advance loop when a later
+  contiguous insert arrives (legacy data only).
+
+### INT-4. MEDIUM — Bucket-reservation lease coupling breaks replica convergence proofs (17e7d07e / 4c01bac9)
+
+Confidence: medium — couplings verified in code (the reservation proof
+carries the create-time `lease_deadline`, `metadata_command.rs:949-966`,
+verified); triggers not executed.
+
+- Convergence revalidation now requires `lease_deadline` equality between
+  the command's reservation proof and the live row
+  (`node_client/local.rs:1806`, `cluster.rs:4875-4894`) — but stream-create
+  reservations are heartbeat-renewed (~10s,
+  `request_ops.rs:2751-2826`), advancing the durable row while the command
+  envelope pins the create-time lease. A lagging replica converging that
+  command (not `AlreadyApplied`) fails closed with the primary already
+  mutated: a stranded command, the divergence class
+  `guides/bucket-write-drain.md:136-151` forbids.
+- Companion: `wait_for_durable_bucket_write_reservations_empty` reaps any
+  `lease_deadline <= now` row (`request_ops.rs:3560-3592`) without checking
+  for a pending object-PG command referencing it; a `CommandOwned`
+  reservation accepted on the primary but not yet on a replica gets reaped →
+  `BucketWriteReservationNotFound` on convergence → same class.
+- Also in this family: lease-matched drain clear + `NotFound → Ok` rollback
+  can orphan a drain row until lease expiry (availability;
+  `pg_store/metadata.rs:5842-5860`, `request_ops.rs:3366-3378`); new
+  zero-margin wall-clock comparisons across nodes in the drain/reservation
+  layer (same CP2/CL4 class); non-stream reservations carry a fixed
+  non-heartbeated 15s lease — slow direct writes can be reaped pre-commit
+  (safe, availability).
+- Fix shape: match reservations by identity/generation rather than exact
+  lease value (or CAS the renewal into the proof), and require a
+  no-referencing-pending-command check before reaping.
+
+### INT-5. MEDIUM — Timeout semantics: slow-drip and read-handle idle exemption
+
+- Server RPC timeouts are per-syscall (`SO_RCVTIMEO`/`SO_SNDTIMEO` reset on
+  any progress), so a peer dripping ≥1 byte/s holds a connection thread
+  through a 64MiB frame (`storage_rpc.rs:76`) indefinitely; N clients pin N
+  server threads. RPC1's bound holds for dead/idle peers, not slow ones. Fix:
+  per-operation deadline checked across syscalls.
+- The read-handle idle-timeout exemption (`storage_node_server.rs:2170-2174`)
+  lets a connected-but-silent client pin shard read handles + a server
+  thread indefinitely, blocking shard deletes/repairs on those locations.
+  Fix: cap total idle time or require periodic renewal frames.
+- Smaller: persistent session reuse after a write timeout can desync framing
+  unless all callers discard the session on any transport error (not
+  verified for all callers); metadata-command sessions lose the PG lock
+  after 1s inter-frame idle (correct but a new liveness requirement);
+  the new epoch-mismatch rejection reuses `PayloadDecode`
+  (`storage_node_server.rs:10924-10939`), extending the RPC5 pattern.
+
+### INT-6. Raft/WAL smaller findings
+
+- Torn-WAL tail shapes other than short-file (zero-filled length prefix,
+  in-bounds CRC-mismatched final frame) brick restart instead of truncating
+  (`control_plane_raft.rs:5158-5187`, :5171-5175); coverage only exercises
+  the file-one-byte-short shape. Treat final-frame anomalies as torn
+  (truncate) or ship an operator recovery tool; add crash-shape tests.
+- First-startup crash window: membership-init WAL append precedes the first
+  checkpoint (`main.rs:2293-2312`); a crash between leaves non-empty WAL
+  with no artifact/sentinel → fail closed needing manual WAL deletion. Same
+  class: sentinel-then-artifact ordering on the very first checkpoint.
+- `pub` peer-stream helpers (`control_plane_raft.rs:6532-6634`) answer peer
+  RPCs with no checkpoint or poison gating — test-only today, a latent R1
+  bypass; demote to test-hooks cfg or route through the checkpoint contract.
+- WAL-internal poison does not set the shared peer poison gate (safety
+  survives; the documented R8 invariant is inaccurate) — bridge it.
+- No artifact↔WAL generation binding (named in the 12.4 exit criteria, not
+  implemented); WAL deletion silently undetectable at replay offset 0.
+- Residual transient `exit(1)`s in the Raft serving loop: WAL-stat IO error
+  inside `status()` (`main.rs:2446`), `accept()` EMFILE/ENFILE, and the
+  benign-churn detector is an exact two-substring match on one OpenRaft
+  alpha error phrasing (:2488-2495) — deepens the R11 coupling.
+- Ordinary peer acks still pay full artifact encode+fsync plus WAL rewrite
+  per RPC, with synchronous fsyncs inside async `RaftLogStorage` methods
+  under a mutex — the acknowledged remaining 12.4 cost work, not a defect.
+
+## WAL subsystem assessment
+
+The new WAL is sound where it matters: append-only with no file reuse (the
+classic stale-bytes-after-torn-frame misparse is structurally impossible),
+fsync-before-publish with correctly classified poison boundaries (pre-frame
+reject / poison-without-publish / publish-then-poison, all under one lock
+guard), offset arithmetic consistent across compaction and crashes at every
+point (artifact-then-compact ordering under a shared checkpoint lock;
+`base_offset <= artifact.wal_replay_offset` holds across all crash points),
+and fail-closed identity/offset checks on restart. Peer-ack ordering in WAL
+mode preserves R1. The 18 WAL unit tests pass.
+
+## Phase 12.4 exit-criteria trajectory
+
+Crash fault-injection is well advanced (WAL suffix restore, peer
+pre-response crash via unwritable state dir, checkpoint-pause coverage) but
+lacks clock-regression-election and compaction-during-replay crash points.
+Peer auth is documented only (`plans/control-plane-auth-identity-plan.md`);
+nothing on the transport. Lease/skew semantics have guards and regression
+tests but no skew-margin design — and INT-1 shows the guards actively need
+that design. The Raft retry/confirmation contract is not implemented.
+Observability is mostly done (WAL backed/offsets/poison, durable
+vote/log/commit/applied, timestamp high-water) but WAL/artifact generation,
+peer-auth failures, and retry-confirmation diagnostics are missing.
+
+## Updated priorities
+
+1. **INT-1** — production-path regression from the new guards; small fix
+   (benign-wait in both scan loops + forward jump bound).
+2. **INT-2** — per-PG quarantine instead of node-wide bind failure.
+3. **CL1** — still the top pre-existing safety gap; now needs deposed-lease
+   capture scaffolding before the fence can exist. Do it while the 9f4a97cd
+   context is fresh.
+4. **INT-3/INT-4** — tighten the drain predicate (`==` epoch, gate on the
+   pending-command error, per-PG scope; decide Recovery-mode lease bypass
+   explicitly) and decouple the reservation-lease proof matching; add the
+   two targeted convergence tests.
+5. **CP5 remaining half** — bound durable history and slim the startup
+   snapshot RPC before any scale testing; it now gates frontend startup.
+6. Phase 12.4 exit criteria with zero code so far: peer auth and the Raft
+   retry/confirmation contract (replace the substring benign-error matching
+   with typed classification while there).
+7. CP2/CL4 skew margin remains the standing design item feeding INT-1, CL1,
+   and the drain/reservation wall-clock comparisons — one time-discipline
+   design closes the family.
 
 # Hardening plan
 
