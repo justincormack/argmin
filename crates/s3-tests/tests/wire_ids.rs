@@ -1,36 +1,32 @@
 use s3_tests::{
-    aws_sdk_s3::primitives::ByteStream, build_client_with_ca, object_url,
-    send_signed_request_with_credentials, unique_bucket, RawResponse, SignedRequestCredentials,
-    TestServer,
+    aws_sdk_s3::primitives::ByteStream,
+    build_client_with_ca, object_url, send_signed_request_with_credentials,
+    shape::{
+        assert_error_ids_match_headers, assert_response_id_shapes, response_header_value,
+        xml_tag_text, HOST_ID_HEADER, REQUEST_ID_HEADER,
+    },
+    unique_bucket, RawResponse, SignedRequestCredentials, TestServer,
 };
 
-fn response_header_value<'a>(response: &'a RawResponse, name: &str) -> Option<&'a str> {
-    response
-        .headers
-        .iter()
-        .find(|(header_name, _)| header_name.eq_ignore_ascii_case(name))
-        .map(|(_, value)| value.as_str())
-}
-
-fn xml_tag_text<'a>(body: &'a str, tag: &str) -> Option<&'a str> {
-    let start_tag = format!("<{tag}>");
-    let end_tag = format!("</{tag}>");
-    let start = body.find(&start_tag)? + start_tag.len();
-    let end = body[start..].find(&end_tag)? + start;
-    Some(&body[start..end])
-}
-
-fn assert_error_ids_match_headers(response: &RawResponse) {
-    assert_eq!(
-        xml_tag_text(&response.body, "RequestId"),
-        response_header_value(response, "x-amz-request-id"),
-        "RequestId XML/header mismatch: {response:?}"
+fn assert_error_wire_ids(operation: &str, response: &RawResponse) {
+    assert!(
+        response_header_value(response, REQUEST_ID_HEADER).is_some(),
+        "{operation}: missing {REQUEST_ID_HEADER} header: {response:?}"
     );
-    assert_eq!(
-        xml_tag_text(&response.body, "HostId"),
-        response_header_value(response, "x-amz-id-2"),
-        "HostId XML/header mismatch: {response:?}"
+    assert!(
+        response_header_value(response, HOST_ID_HEADER).is_some(),
+        "{operation}: missing {HOST_ID_HEADER} header: {response:?}"
     );
+    assert!(
+        xml_tag_text(&response.body, "RequestId").is_some(),
+        "{operation}: missing RequestId in error XML: {response:?}"
+    );
+    assert!(
+        xml_tag_text(&response.body, "HostId").is_some(),
+        "{operation}: missing HostId in error XML: {response:?}"
+    );
+    assert_response_id_shapes(operation, response);
+    assert_error_ids_match_headers(operation, response);
 }
 
 #[test]
@@ -67,7 +63,7 @@ fn test_local_error_request_ids_match_headers_for_missing_key_and_invalid_redire
             creds,
         );
         assert_eq!(missing_key.status, 404);
-        assert_error_ids_match_headers(&missing_key);
+        assert_error_wire_ids("GetObject missing key", &missing_key);
 
         let invalid_redirect = send_signed_request_with_credentials(
             "PUT",
@@ -82,7 +78,7 @@ fn test_local_error_request_ids_match_headers_for_missing_key_and_invalid_redire
             },
         );
         assert_eq!(invalid_redirect.status, 400);
-        assert_error_ids_match_headers(&invalid_redirect);
+        assert_error_wire_ids("PutObject invalid redirect", &invalid_redirect);
 
         client
             .put_object()

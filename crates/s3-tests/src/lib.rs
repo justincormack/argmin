@@ -3,6 +3,7 @@ mod hyper_client;
 mod post_form;
 mod raw_http_client;
 pub mod server;
+pub mod shape;
 
 pub use aws_sdk_s3;
 pub use helpers::{
