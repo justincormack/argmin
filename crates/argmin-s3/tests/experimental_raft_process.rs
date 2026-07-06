@@ -739,6 +739,37 @@ fn wait_for_child_stderr_log_contains(child: &mut ChildGuard, needle: &str) {
     }
 }
 
+fn wait_for_stable_file_bytes(path: &Path, child: &mut ChildGuard) -> Vec<u8> {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut last_bytes = None;
+    let mut stable_since = None;
+    loop {
+        child.assert_running();
+        let bytes = fs::read(path)
+            .unwrap_or_else(|error| panic!("file {} should be readable: {error}", path.display()));
+        match &last_bytes {
+            Some(previous) if previous == &bytes => {
+                let stable_since = *stable_since.get_or_insert_with(Instant::now);
+                if stable_since.elapsed() >= Duration::from_millis(250) {
+                    return bytes;
+                }
+            }
+            _ => {
+                last_bytes = Some(bytes);
+                stable_since = Some(Instant::now());
+            }
+        }
+        if Instant::now() >= deadline {
+            panic!(
+                "file {} did not stabilize before deadline\n{}",
+                path.display(),
+                process_logs(&child.test_dir)
+            );
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
 fn control_socket(test_dir: &Path, node_id: u64) -> PathBuf {
     test_dir.join(format!("control-{node_id}.sock"))
 }
@@ -1052,8 +1083,17 @@ fn experimental_raft_process_peer_wal_crash_after_sync_before_response_recovers_
             103,
         ))
         .expect("append request should encode");
-    let artifact_bytes_before_crash = fs::read(&follower_state_path)
-        .expect("follower checkpoint artifact should read before crash");
+    let artifact_bytes_before_crash =
+        wait_for_stable_file_bytes(&follower_state_path, &mut restarted103);
+    let follower_wal = raft_wal_file(wal_path(test_dir.path(), 103), &cluster_name, 103);
+    follower_wal
+        .append_record(&ControlPlaneRaftWalRecord::SaveVote(Vote::<
+            ControlPlaneRaftLeaderId,
+        >::new_committed(
+            follower_vote_before_crash.term,
+            follower_vote_before_crash.node_id,
+        )))
+        .expect("test should pre-create follower WAL before making state dir unwritable");
     let follower_state_dir = state_dir(test_dir.path(), 103);
     fs::set_permissions(&follower_state_dir, fs::Permissions::from_mode(0o500))
         .expect("follower state directory should be made checkpoint-unwritable");
