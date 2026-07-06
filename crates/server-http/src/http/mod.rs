@@ -71,6 +71,22 @@ const INVALID_REDIRECT_LOCATION_MESSAGE: &str =
 const REQUEST_ID_ALPHABET: &[u8; 36] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
 const AWS_SERVER_HEADER_VALUE: &str = "AmazonS3";
 
+#[cfg(test)]
+thread_local! {
+    static SUPPRESS_PANIC_ON_500_FLIGHT_RECORDER_DUMP: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+fn should_dump_panic_on_500_flight_recorder() -> bool {
+    #[cfg(test)]
+    {
+        if SUPPRESS_PANIC_ON_500_FLIGHT_RECORDER_DUMP.with(std::cell::Cell::get) {
+            return false;
+        }
+    }
+    true
+}
+
 pub(crate) fn new_request_trace_context() -> observability::TraceContext {
     use ring::rand::SecureRandom;
 
@@ -4686,11 +4702,13 @@ pub fn s3_response_to_hyper(
             trace.emit_error_diagnostic(diagnostic);
         }
         if panic_on_500 || abort_on_500 {
-            observability::dump_flight_recorder_to_stderr(if abort_on_500 {
-                "abort-on-500"
-            } else {
-                "panic-on-500"
-            });
+            if should_dump_panic_on_500_flight_recorder() {
+                observability::dump_flight_recorder_to_stderr(if abort_on_500 {
+                    "abort-on-500"
+                } else {
+                    "panic-on-500"
+                });
+            }
             fail_on_500_diagnostic(diagnostic_message, panic_on_500, abort_on_500);
         }
         let inflight_requests_guard = permit
@@ -4784,7 +4802,7 @@ pub fn s3_response_to_hyper(
                 );
             }
         }
-        if panic_on_500 || abort_on_500 {
+        if (panic_on_500 || abort_on_500) && should_dump_panic_on_500_flight_recorder() {
             observability::dump_flight_recorder_to_stderr(if abort_on_500 {
                 "abort-on-500"
             } else {
@@ -6081,6 +6099,28 @@ mod tests {
     const TEST_SIGV4_SECRET: &str = "secret";
     const TEST_SSE_S3_WRAPPING_KEY_B64: &str = "YWJjZGVmMDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODk=";
 
+    struct SuppressPanicOn500FlightRecorderDump {
+        previous: bool,
+    }
+
+    impl SuppressPanicOn500FlightRecorderDump {
+        fn new() -> Self {
+            let previous = SUPPRESS_PANIC_ON_500_FLIGHT_RECORDER_DUMP.with(|suppressed| {
+                let previous = suppressed.get();
+                suppressed.set(true);
+                previous
+            });
+            Self { previous }
+        }
+    }
+
+    impl Drop for SuppressPanicOn500FlightRecorderDump {
+        fn drop(&mut self) {
+            SUPPRESS_PANIC_ON_500_FLIGHT_RECORDER_DUMP
+                .with(|suppressed| suppressed.set(self.previous));
+        }
+    }
+
     fn setup_frontend(dir: &std::path::Path) -> HttpFrontend {
         setup_frontend_with_sse_s3(dir)
     }
@@ -6837,6 +6877,7 @@ mod tests {
 
     #[test]
     fn s3_response_to_hyper_invalid_header_records_diagnostic_before_panic() {
+        let _dump_guard = SuppressPanicOn500FlightRecorderDump::new();
         let mut resp = S3Response {
             status_code: 200,
             headers: Vec::new(),
@@ -6924,6 +6965,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "server produced HTTP 500 response")]
     fn s3_response_to_hyper_panics_on_500_when_enabled() {
+        let _dump_guard = SuppressPanicOn500FlightRecorderDump::new();
         let resp = S3Response {
             status_code: 500,
             headers: Vec::new(),
