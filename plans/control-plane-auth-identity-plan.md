@@ -98,11 +98,19 @@ process that can reach the transport.
 
 ## Key and Configuration Model
 
-Initial implementation can use symmetric credentials for internal control-plane
-auth, but the usable signing/verifying material should be scoped by principal
-and role. This is a credential-capability boundary, not a requirement to split
-roles into separate OS processes: one Argmin process may legitimately host
-multiple internal roles and may therefore hold multiple scoped credentials. The
+Initial implementation should use symmetric credentials/MACs for internal
+control-plane auth. That matches the existing S3 frontend signing model, fits
+the symmetric-secret distribution work already needed for internal encryption
+keys, keeps the first implementation small and fail-closed, and avoids pulling
+in a certificate or public-key infrastructure before the multi-host control
+plane needs it. The envelope is still described in terms of credential
+id/version and MAC/signature coverage so a later asymmetric or mTLS-backed
+credential can replace the primitive without changing the identity model.
+
+The usable signing/verifying material should be scoped by principal and role.
+This is a credential-capability boundary, not a requirement to split roles into
+separate OS processes: one Argmin process may legitimately host multiple
+internal roles and may therefore hold multiple scoped credentials. The
 important property is that each call path receives and uses the credential for
 the role it is performing, rather than a generic helper deriving arbitrary roles
 from an ambient cluster-wide root secret.
