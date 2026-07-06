@@ -180,6 +180,7 @@ struct Signer {
     service: String,
     body_hash: Option<String>,
     include_content_sha256: bool,
+    extra_headers: Vec<(String, String)>,
     timestamp: Option<u64>,
 }
 
@@ -195,6 +196,7 @@ impl Signer {
             service: "s3".to_string(),
             body_hash: None,
             include_content_sha256: true,
+            extra_headers: Vec::new(),
             timestamp: None,
         }
     }
@@ -234,6 +236,12 @@ impl Signer {
         self
     }
 
+    fn header(mut self, name: &str, value: &str) -> Self {
+        self.extra_headers
+            .push((name.to_ascii_lowercase(), value.to_string()));
+        self
+    }
+
     fn at_time(mut self, epoch_secs: u64) -> Self {
         self.timestamp = Some(epoch_secs);
         self
@@ -261,20 +269,24 @@ impl Signer {
         let content_sha256 = self.body_hash.unwrap_or_else(|| sha256_hex(b""));
 
         let host_val = host();
-        let (signed_headers, canonical_headers) = if self.include_content_sha256 {
-            (
-                "host;x-amz-content-sha256;x-amz-date",
-                format!(
-                    "host:{}\nx-amz-content-sha256:{}\nx-amz-date:{}\n",
-                    host_val, content_sha256, date_long
-                ),
-            )
-        } else {
-            (
-                "host;x-amz-date",
-                format!("host:{}\nx-amz-date:{}\n", host_val, date_long),
-            )
-        };
+        let mut headers = vec![
+            ("host".to_string(), host_val.to_string()),
+            ("x-amz-date".to_string(), date_long.clone()),
+        ];
+        if self.include_content_sha256 {
+            headers.push(("x-amz-content-sha256".to_string(), content_sha256.clone()));
+        }
+        headers.extend(self.extra_headers);
+        headers.sort_by(|a, b| a.0.cmp(&b.0));
+        let signed_headers = headers
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect::<Vec<_>>()
+            .join(";");
+        let canonical_headers: String = headers
+            .iter()
+            .map(|(name, value)| format!("{name}:{value}\n"))
+            .collect();
 
         let canonical_query = canonical_query_string(&self.query);
         let canonical_request = format!(
@@ -317,6 +329,14 @@ impl Signer {
             amz_content_sha256: content_sha256,
         }
     }
+}
+
+fn authorization_with_bad_signature(authorization: &str) -> String {
+    let prefix = authorization
+        .split_once("Signature=")
+        .map(|(prefix, _)| prefix)
+        .expect("authorization header contains Signature");
+    format!("{prefix}Signature={}", "0".repeat(64))
 }
 
 /// Send a signed PUT with body to the given bucket/key.
@@ -1699,6 +1719,41 @@ fn test_unexpected_security_token_on_static_credentials_returns_bad_request() {
             "expected echoed token, got: {}",
             response.body
         );
+
+        cleanup(&bucket, &[key]).await;
+    });
+}
+
+#[test]
+fn test_header_sigv4_bad_signature_with_unexpected_security_token_reports_signature_mismatch() {
+    s3_tests::run(async {
+        let bucket = setup_bucket().await;
+        let key = "bad-signature-token-check.txt";
+        let put = signed_put(&bucket, key, b"token ordering body");
+        assert_eq!(put.0, 200, "expected setup PUT to succeed, got {}", put.0);
+
+        let token = "bad-signature-token-check";
+        let path = format!("/{bucket}/{key}");
+        let signed = Signer::new("GET", &path)
+            .body_hash(&sha256_hex(b""))
+            .header("x-amz-security-token", token)
+            .sign();
+        let url = format!("{}{}", CTX.endpoint(), path);
+        let mut response = agent()
+            .get(&url)
+            .header(
+                "Authorization",
+                authorization_with_bad_signature(&signed.authorization),
+            )
+            .header("x-amz-date", &signed.amz_date)
+            .header("x-amz-content-sha256", &signed.amz_content_sha256)
+            .header("x-amz-security-token", token)
+            .call()
+            .expect("transport error");
+        let status = response.status().as_u16();
+        let body = response.body_mut().read_to_string().unwrap_or_default();
+        assert_eq!(status, 403, "expected 403, got {status}: {body}");
+        assert_error_code(&body, "SignatureDoesNotMatch");
 
         cleanup(&bucket, &[key]).await;
     });

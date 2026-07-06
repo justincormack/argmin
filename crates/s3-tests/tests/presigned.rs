@@ -233,6 +233,13 @@ fn assert_signature_does_not_match(status: u16, body: &str) {
     );
 }
 
+fn presigned_url_with_bad_signature(url: &str) -> String {
+    let (prefix, _) = url
+        .split_once("X-Amz-Signature=")
+        .expect("presigned URL contains X-Amz-Signature");
+    format!("{prefix}X-Amz-Signature={}", "0".repeat(64))
+}
+
 fn presign_object_with_fixed_amz_date(
     credentials: SignedRequestCredentials<'_>,
     method: &str,
@@ -586,6 +593,46 @@ fn test_presigned_sigv4_signed_security_token_rejected_for_static_credentials() 
         let status = response.status().as_u16();
         let body = response.body_mut().read_to_string().unwrap_or_default();
         assert_invalid_token_error(status, &body, token);
+
+        cleanup(&bucket, &[key]).await;
+    });
+}
+
+#[test]
+fn test_presigned_sigv4_bad_signature_with_signed_security_token_reports_signature_mismatch() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+        let key = "bad-signature-signed-token-presigned-auth";
+        let body = b"presigned sigv4 bad signature signed security token";
+
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key(key)
+            .body(ByteStream::from_static(body))
+            .send()
+            .await
+            .unwrap();
+
+        let token = "bad-signature-signed-token-causes-400";
+        let presigned = presign_object(
+            "GET",
+            &bucket,
+            key,
+            None,
+            Duration::from_secs(900),
+            [("x-amz-security-token", token)],
+            None,
+        );
+        let tampered_url = presigned_url_with_bad_signature(presigned.uri());
+
+        let mut response = with_presigned_headers!(agent().get(&tampered_url), presigned)
+            .call()
+            .expect("transport error");
+        let status = response.status().as_u16();
+        let body = response.body_mut().read_to_string().unwrap_or_default();
+        assert_signature_does_not_match(status, &body);
 
         cleanup(&bucket, &[key]).await;
     });

@@ -116,7 +116,6 @@ pub fn authenticate_post_sigv4(
     if !record.enabled {
         return Err(AuthError::UnknownAccessKey);
     }
-    validate_static_record_token_and_expiry(record, request.security_token, now_epoch_secs)?;
 
     // Derive signing key and compute expected signature
     let signing_key = sigv4::derive_signing_key(
@@ -132,6 +131,7 @@ pub fn authenticate_post_sigv4(
     if !crate::constant_time_eq(expected_hex.as_bytes(), request.signature_hex.as_bytes()) {
         return Err(AuthError::SignatureMismatch);
     }
+    validate_static_record_token_and_expiry(record, request.security_token, now_epoch_secs)?;
 
     Ok(AuthContext {
         mode: AuthMode::PostSigV4,

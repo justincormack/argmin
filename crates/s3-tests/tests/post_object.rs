@@ -629,6 +629,38 @@ fn test_post_object_sigv4_unexpected_security_token_rejected() {
 }
 
 #[test]
+fn test_post_object_sigv4_bad_signature_with_unexpected_security_token_reports_signature_mismatch()
+{
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+        let key = "post-bad-signature-unexpected-security-token";
+        let token = "post-bad-signature-unexpected-security-token";
+        let mut fields = sigv4_fields(
+            &bucket,
+            key,
+            &[serde_json::json!({"x-amz-security-token": token})],
+        );
+        append_security_token_field(&mut fields, token);
+        for (name, value) in &mut fields {
+            if name == "x-amz-signature" {
+                *value = "0".repeat(64);
+            }
+        }
+        let field_refs: Vec<(&str, &str)> = fields
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+
+        let (status, body) = post_object(&bucket, &field_refs, b"unexpected token", "test.txt");
+        assert_eq!(status, 403, "expected 403, got {status} body={body}");
+        assert_error_code(&body, "SignatureDoesNotMatch");
+
+        s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
+    });
+}
+
+#[test]
 fn test_post_object_sigv4_overlong_unexpected_security_token_rejected() {
     s3_tests::run(async {
         let client = CTX.client();

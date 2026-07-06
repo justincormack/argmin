@@ -317,14 +317,14 @@ residuals found by the verification, none release-blocking:
   and document as belt-and-braces) and name the unbounded-candidate
   rejection distinctly.
 
-- [ ] **V5. Security-token check ordering differs by auth path**
-  (pre-existing, now partially pinned). Header auth checks the token after
-  signature verification (`request.rs:319` vs `:329-333`); presigned and
-  POST check it before (`request.rs:506` vs `:550`; `post.rs:119`). A
-  bogus-signature-plus-token request gets `SignatureDoesNotMatch` on header
-  auth but `InvalidToken` on presigned/POST. The presigned ordering is
-  pinned by a local unit test only; the AWS oracle covers the valid-signature
-  case. AWS-pin the bogus-signature ordering per path, or align the paths.
+- [x] **V5. Security-token check ordering differs by auth path**
+  (pre-existing, now pinned). AWS-facing tests now cover
+  bogus-signature-plus-token requests for header SigV4, presigned SigV4, and
+  POST Object SigV4; AWS returns `SignatureDoesNotMatch` on all three paths.
+  Header auth already matched. Presigned and POST now validate static security
+  tokens only after signature verification, so the paths share the AWS-pinned
+  precedence while still returning `InvalidToken` for valid-signature
+  unexpected-token requests.
 
 - [ ] **V6. Cosmetic.** `until_ms_saturating` clamps `u64::MAX` silently
   (`types.rs:2612-2618`) where RR11 debug-asserts at the atomic boundary —

@@ -503,11 +503,6 @@ fn authenticate_presigned<H: HeaderSource + ?Sized>(
         .any(|signed_header| signed_header == &"x-amz-security-token")
         .then(|| headers.first_value("x-amz-security-token"))
         .flatten();
-    validate_static_record_token_and_expiry(
-        record,
-        token.as_deref().or(signed_header_token),
-        now_epoch_secs,
-    )?;
 
     let signed_header_pairs = collect_signed_headers(&signed_headers, headers)?;
     let canonical_hdrs = canonical_headers(&signed_header_pairs);
@@ -550,6 +545,11 @@ fn authenticate_presigned<H: HeaderSource + ?Sized>(
     if !crate::constant_time_eq(expected_hex.as_bytes(), signature.as_bytes()) {
         return Err(AuthError::SignatureMismatch);
     }
+    validate_static_record_token_and_expiry(
+        record,
+        token.as_deref().or(signed_header_token),
+        now_epoch_secs,
+    )?;
 
     Ok(AuthContext {
         mode: AuthMode::PresignedSigV4,
@@ -1978,7 +1978,7 @@ mod tests {
     // ── Presigned: static credentials reject security token in query ───
 
     #[test]
-    fn presigned_security_token_in_query_rejected_for_static_credential() {
+    fn presigned_security_token_in_query_with_bad_signature_rejects_signature_first() {
         let mut store = CredentialStore::new();
         store.add_record(CredentialRecord {
             access_key_id: "AKIAIOSFODNN7EXAMPLE".to_string(),
@@ -2002,14 +2002,11 @@ mod tests {
             presigned_example_time(),
         )
         .unwrap_err();
-        assert!(matches!(
-            err,
-            AuthError::UnexpectedSecurityToken { token } if token == "wrong-token"
-        ));
+        assert!(matches!(err, AuthError::SignatureMismatch));
     }
 
     #[test]
-    fn presigned_signed_security_token_header_rejected_for_static_credential() {
+    fn presigned_signed_security_token_header_with_bad_signature_rejects_signature_first() {
         let store = example_store();
         let query = "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIAIOSFODNN7EXAMPLE%2F20240201%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Date=20240201T120000Z&X-Amz-Expires=900&X-Amz-SignedHeaders=host%3Bx-amz-security-token&X-Amz-Signature=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         let headers = [("host", "example.com"), ("x-amz-security-token", "token")];
@@ -2025,10 +2022,7 @@ mod tests {
             presigned_example_time(),
         )
         .unwrap_err();
-        assert!(matches!(
-            err,
-            AuthError::UnexpectedSecurityToken { token } if token == "token"
-        ));
+        assert!(matches!(err, AuthError::SignatureMismatch));
     }
 
     // ── Presigned: expired token ──────────────────────────────────────
