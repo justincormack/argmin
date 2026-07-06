@@ -42,6 +42,11 @@ const LOCAL_PLACED_SEGMENT_SHARD_REPAIR_HINT_QUEUE_LIMIT: usize = 4096;
 const ROUTE_MAP_VALID_UNTIL_UNBOUNDED: u64 = u64::MAX;
 
 fn encode_route_map_validity(validity: RouteMapValidity) -> AtomicU64 {
+    debug_assert_ne!(
+        validity.valid_until_ms(),
+        Some(ROUTE_MAP_VALID_UNTIL_UNBOUNDED),
+        "u64::MAX is reserved as the unbounded route-map validity sentinel"
+    );
     AtomicU64::new(
         validity
             .valid_until_ms()
@@ -53,7 +58,7 @@ fn decode_route_map_validity(encoded: u64) -> RouteMapValidity {
     if encoded == ROUTE_MAP_VALID_UNTIL_UNBOUNDED {
         RouteMapValidity::Forever
     } else {
-        RouteMapValidity::Until(encoded)
+        RouteMapValidity::until_ms(encoded).unwrap()
     }
 }
 

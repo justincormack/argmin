@@ -930,7 +930,7 @@ fn reclaim_worker_retries_bucket_delete_begin_after_early_route_map_failure() {
     let expired = same_store_cluster_with_route_map_validity(
         &initial,
         tmp.path(),
-        RouteMapValidity::Until(1),
+        RouteMapValidity::until_ms(1).unwrap(),
     );
     let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&expired));
     let _coord = setup_coordinator_with_only_reclaim_worker(handle.clone(), Arc::clone(&expired));
@@ -1477,7 +1477,7 @@ fn reclaim_worker_drops_stale_bucket_delete_begin_after_bucket_recreate() {
     let expired = same_store_cluster_with_route_map_validity(
         &initial,
         tmp.path(),
-        RouteMapValidity::Until(1),
+        RouteMapValidity::until_ms(1).unwrap(),
     );
     let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&expired));
     let _coord = setup_coordinator_with_only_reclaim_worker(handle.clone(), Arc::clone(&expired));
@@ -7564,7 +7564,7 @@ fn bucket_delete_finalizer_expired_route_map_maps_to_operation_aborted() {
     let expired_cluster = same_store_cluster_with_route_map_validity(
         &storage_cluster,
         tmp.path(),
-        RouteMapValidity::Until(1),
+        RouteMapValidity::until_ms(1).unwrap(),
     );
     let expired_coord =
         setup_same_process_coordinator_with_storage_cluster_without_background_sweepers(
@@ -7598,7 +7598,7 @@ fn bucket_delete_finalizer_route_map_expiry_after_claim_releases_claim() {
     let expiring_cluster = same_store_cluster_with_route_map_validity(
         &storage_cluster,
         tmp.path(),
-        RouteMapValidity::Until(valid_until),
+        RouteMapValidity::until_ms(valid_until).unwrap(),
     );
     let expiring_coord =
         setup_same_process_coordinator_with_storage_cluster_without_background_sweepers(
@@ -9651,7 +9651,7 @@ fn delete_bucket_expired_route_map_maps_to_operation_aborted() {
     let expired_cluster = same_store_cluster_with_route_map_validity(
         &storage_cluster,
         tmp.path(),
-        RouteMapValidity::Until(1),
+        RouteMapValidity::until_ms(1).unwrap(),
     );
     let expired_coord = setup_direct_coordinator_with_storage_cluster(expired_cluster);
     let err = delete_bucket_test(&expired_coord, bucket).unwrap_err();
@@ -9703,7 +9703,7 @@ fn delete_bucket_route_map_expiry_after_drain_maps_to_operation_aborted() {
     let expiring_cluster = same_store_cluster_with_route_map_validity(
         &storage_cluster,
         tmp.path(),
-        RouteMapValidity::Until(valid_until),
+        RouteMapValidity::until_ms(valid_until).unwrap(),
     );
     let expiring_coord =
         setup_same_process_coordinator_with_storage_cluster_without_background_sweepers(

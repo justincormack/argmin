@@ -189,10 +189,14 @@ Remaining order of attack:
   duplicate-PG check and its claimed proof/epoch matching as command-specific
   behavior.
 
-- [ ] **RR11. `Forever` encoded as a `u64::MAX` sentinel** in the route-map
+- [x] **RR11. `Forever` encoded as a `u64::MAX` sentinel** in the route-map
   validity atomic (`cluster/local.rs:44-58`), making `Until(u64::MAX)`
   indistinguishable from `Forever`. Behaviorally harmless; add a doc note or
-  debug_assert so the sentinel is pinned intentional.
+  debug_assert so the sentinel is pinned intentional. Fixed by making bounded
+  route-map validity use a `RouteMapValidUntilMs` newtype that rejects
+  `u64::MAX`, adding checked/saturating constructors on `RouteMapValidity`,
+  rejecting the reserved sentinel during RPC/runtime-config decode, and keeping
+  a debug assertion at the local atomic encoding boundary.
 
 - [ ] **RR12. `now_millis` in `server-core/src/conditional.rs:14-19` still
   uses `unwrap_or_default()`** — a broken clock makes
@@ -475,8 +479,9 @@ steps it performs.
   unbounded modes.
 
   **Status:** fixed. Route-map validity is now modeled as
-  `RouteMapValidity::{Forever, Until(u64)}` in runtime-map snapshots,
-  storage-node process config, local cluster maps, and refresh-loop status.
+  `RouteMapValidity::{Forever, Until(RouteMapValidUntilMs)}` in runtime-map
+  snapshots, storage-node process config, local cluster maps, and refresh-loop
+  status.
   Current-format storage-node runtime config serializes this explicitly as
   `route_map_validity forever` or `route_map_validity until <ms>` and no
   longer accepts the legacy `valid_until none` spelling. Test fixtures now
@@ -488,12 +493,13 @@ steps it performs.
   snapshot validity instead of inventing an unbounded map. Refresh/install
   paths reject same-epoch `Until -> Forever` regressions, while same-epoch
   refresh propagation can still bound previously pinned static/local
-  generations when an authoritative bounded map is installed. The
-  `valid_until_ms()` accessors remain only as deadline projections for
-  diagnostics and error payloads. Re-review 2026-07-05: verified; remaining
-  residuals tracked as RR11 (`u64::MAX` sentinel) and RR14 (wire-format
-  `Forever` tolerance). RR8 removed the duplicated route-map validity
-  regression helper.
+  generations when an authoritative bounded map is installed. RR11 then made
+  bounded deadlines use `RouteMapValidUntilMs`, which rejects `u64::MAX` so
+  the local atomic `Forever` sentinel remains internal. The `valid_until_ms()`
+  accessors remain only as deadline projections for diagnostics and error
+  payloads. Re-review 2026-07-05: verified; remaining residual tracked as RR14
+  (wire-format `Forever` tolerance). RR8 removed the duplicated route-map
+  validity regression helper.
 
 ## Bugs — checksum handling (cross-crate)
 

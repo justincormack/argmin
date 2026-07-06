@@ -40,7 +40,7 @@ const CONTROL_PLANE_RPC_RUNTIME_MAP_PROOF_RECONSTRUCTED: u8 = 2;
 const CONTROL_PLANE_RPC_RUNTIME_MAP_PROOF_READ_INDEX: u8 = 3;
 
 fn non_serving_runtime_map_validity(now_ms: u64) -> RouteMapValidity {
-    RouteMapValidity::Until(now_ms.saturating_add(MAX_HEARTBEAT_LEASE_MS))
+    RouteMapValidity::until_ms_saturating(now_ms.saturating_add(MAX_HEARTBEAT_LEASE_MS))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -703,7 +703,7 @@ impl ClusterControlSnapshot {
             .iter()
             .filter_map(PgRouteSnapshot::primary_lease_deadline_ms)
             .min()
-            .map_or(fallback_validity, RouteMapValidity::Until);
+            .map_or(fallback_validity, RouteMapValidity::until_ms_saturating);
         Ok(ClusterRuntimeMapSnapshot {
             cluster_epoch: self.cluster_epoch,
             validity,
@@ -5667,7 +5667,12 @@ fn read_runtime_map_snapshot(
     let historical_pg_routes = read_pg_route_snapshots(reader, "historical PG routes")?;
     let snapshot = ClusterRuntimeMapSnapshot {
         cluster_epoch,
-        validity: RouteMapValidity::from_valid_until_ms(valid_until_ms),
+        validity: RouteMapValidity::from_valid_until_ms(valid_until_ms).ok_or_else(|| {
+            ControlPlaneError::RpcProtocol {
+                message: "runtime map validity deadline uses reserved unbounded sentinel"
+                    .to_owned(),
+            }
+        })?,
         freshness_proof,
         nodes,
         pg_routes,
@@ -12614,7 +12619,7 @@ mod tests {
     fn runtime_map_test_snapshot_with_active_route() -> ClusterRuntimeMapSnapshot {
         ClusterRuntimeMapSnapshot {
             cluster_epoch: ClusterEpoch::INITIAL,
-            validity: RouteMapValidity::Until(12_345),
+            validity: RouteMapValidity::until_ms(12_345).unwrap(),
             freshness_proof: RuntimeMapFreshnessProof::SingleAuthority {
                 authority_incarnation: AuthorityIncarnation::INITIAL,
                 issued_at_ms: 12_000,
@@ -12638,6 +12643,27 @@ mod tests {
             }],
             historical_pg_routes: Vec::new(),
         }
+    }
+
+    #[test]
+    fn route_map_validity_rejects_reserved_unbounded_deadline() {
+        assert!(RouteMapValidity::until_ms(u64::MAX).is_none());
+        assert!(RouteMapValidity::from_valid_until_ms(Some(u64::MAX)).is_none());
+
+        let mut payload = Vec::new();
+        write_u64(&mut payload, ClusterEpoch::INITIAL.get());
+        write_option_u64(&mut payload, Some(u64::MAX));
+        write_runtime_map_test_single_authority_proof(&mut payload);
+        write_u32(&mut payload, 0);
+        write_u32(&mut payload, 0);
+        write_u32(&mut payload, 0);
+
+        let mut reader = PayloadReader::new(&payload);
+        assert!(matches!(
+            read_runtime_map_snapshot(&mut reader),
+            Err(ControlPlaneError::RpcProtocol { message })
+                if message.contains("reserved unbounded sentinel")
+        ));
     }
 
     fn runtime_map_test_snapshot_with_transfer_route(
@@ -16774,7 +16800,7 @@ mod tests {
     #[test]
     fn storage_cluster_runtime_map_handle_accepts_same_epoch_shorter_bounded_validity() {
         let mut current_map = runtime_map_test_snapshot_with_active_route();
-        current_map.validity = RouteMapValidity::Until(5_000);
+        current_map.validity = RouteMapValidity::until_ms(5_000).unwrap();
         let current_cluster = crate::StorageCluster::from_runtime_map(
             NodeId::new(1),
             &current_map,
@@ -16783,7 +16809,7 @@ mod tests {
         .unwrap();
         let handle = crate::StorageClusterRuntimeMapHandle::new(current_cluster);
         let mut shorter_map = current_map.clone();
-        shorter_map.validity = RouteMapValidity::Until(4_000);
+        shorter_map.validity = RouteMapValidity::until_ms(4_000).unwrap();
         let shorter_cluster = crate::StorageCluster::from_runtime_map(
             NodeId::new(1),
             &shorter_map,
@@ -16811,7 +16837,7 @@ mod tests {
             crate::EcShape { k: 1, m: 0 },
             ClusterEpoch::INITIAL,
             [crate::cluster::LocalPgRoute::from(&route)],
-            RouteMapValidity::Until(1_000),
+            RouteMapValidity::until_ms(1_000).unwrap(),
         )
         .unwrap();
         let pinned_cluster = crate::StorageCluster::test_from_local_map_with_epoch(
@@ -16827,7 +16853,7 @@ mod tests {
             crate::EcShape { k: 1, m: 0 },
             ClusterEpoch::INITIAL,
             [crate::cluster::LocalPgRoute::from(&route)],
-            RouteMapValidity::Until(2_000),
+            RouteMapValidity::until_ms(2_000).unwrap(),
         )
         .unwrap();
         let candidate_cluster = crate::StorageCluster::test_from_local_map_with_epoch(
@@ -16852,7 +16878,7 @@ mod tests {
             crate::EcShape { k: 1, m: 0 },
             ClusterEpoch::INITIAL,
             [crate::cluster::LocalPgRoute::from(&route)],
-            RouteMapValidity::Until(3_000),
+            RouteMapValidity::until_ms(3_000).unwrap(),
         )
         .unwrap();
         let second_candidate_cluster = crate::StorageCluster::test_from_local_map_with_epoch(
@@ -16890,7 +16916,7 @@ mod tests {
             crate::EcShape { k: 1, m: 0 },
             ClusterEpoch::INITIAL,
             [crate::cluster::LocalPgRoute::from(&initial_route)],
-            RouteMapValidity::Until(1_000),
+            RouteMapValidity::until_ms(1_000).unwrap(),
         )
         .unwrap();
         let pinned_cluster = crate::StorageCluster::test_from_local_map_with_epoch(
@@ -16914,7 +16940,7 @@ mod tests {
             crate::EcShape { k: 1, m: 0 },
             next_epoch,
             [crate::cluster::LocalPgRoute::from(&next_route)],
-            RouteMapValidity::Until(3_000),
+            RouteMapValidity::until_ms(3_000).unwrap(),
         )
         .unwrap();
         let candidate_cluster = crate::StorageCluster::test_from_local_map_with_epoch(

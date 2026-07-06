@@ -1193,7 +1193,7 @@ impl StorageClusterRuntimeMapHandle {
 
     fn expire_same_epoch_generations(&self, now_ms: u64) {
         let current_epoch = self.current().cluster_epoch();
-        let expiry = RouteMapValidity::Until(now_ms);
+        let expiry = RouteMapValidity::until_ms_saturating(now_ms);
         let mut generations = self
             .same_epoch_generations
             .lock()
@@ -1418,7 +1418,7 @@ mod runtime_map_refresh_invalidation_tests {
 
     #[test]
     fn authoritative_pending_metadata_refresh_failure_expires_same_epoch_generations() {
-        let pinned = active_test_cluster(RouteMapValidity::Until(10_000));
+        let pinned = active_test_cluster(RouteMapValidity::until_ms(10_000).unwrap());
         let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&pinned));
         let current = handle.current();
 
@@ -1439,10 +1439,10 @@ mod runtime_map_refresh_invalidation_tests {
 
     #[test]
     fn same_epoch_install_shrinks_pinned_generation_validity() {
-        let pinned = active_test_cluster(RouteMapValidity::Until(5_000));
+        let pinned = active_test_cluster(RouteMapValidity::until_ms(5_000).unwrap());
         let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&pinned));
         let old_current = handle.current();
-        let candidate = active_test_cluster(RouteMapValidity::Until(4_000));
+        let candidate = active_test_cluster(RouteMapValidity::until_ms(4_000).unwrap());
 
         handle.install(Arc::clone(&candidate)).unwrap();
 

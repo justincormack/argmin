@@ -2580,23 +2580,57 @@ pub struct BucketDeleteDebugPayloadReclaimRootError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RouteMapValidity {
     Forever,
-    Until(u64),
+    Until(RouteMapValidUntilMs),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct RouteMapValidUntilMs(u64);
+
+impl RouteMapValidUntilMs {
+    #[must_use]
+    pub const fn new(valid_until_ms: u64) -> Option<Self> {
+        if valid_until_ms == u64::MAX {
+            None
+        } else {
+            Some(Self(valid_until_ms))
+        }
+    }
+
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0
+    }
 }
 
 impl RouteMapValidity {
     #[must_use]
-    pub fn from_valid_until_ms(valid_until_ms: Option<u64>) -> Self {
-        match valid_until_ms {
-            Some(valid_until_ms) => Self::Until(valid_until_ms),
+    pub fn until_ms(valid_until_ms: u64) -> Option<Self> {
+        RouteMapValidUntilMs::new(valid_until_ms).map(Self::Until)
+    }
+
+    #[must_use]
+    pub const fn until_ms_saturating(valid_until_ms: u64) -> Self {
+        let valid_until_ms = if valid_until_ms == u64::MAX {
+            u64::MAX - 1
+        } else {
+            valid_until_ms
+        };
+        Self::Until(RouteMapValidUntilMs(valid_until_ms))
+    }
+
+    #[must_use]
+    pub fn from_valid_until_ms(valid_until_ms: Option<u64>) -> Option<Self> {
+        Some(match valid_until_ms {
+            Some(valid_until_ms) => Self::Until(RouteMapValidUntilMs::new(valid_until_ms)?),
             None => Self::Forever,
-        }
+        })
     }
 
     #[must_use]
     pub fn valid_until_ms(self) -> Option<u64> {
         match self {
             Self::Forever => None,
-            Self::Until(valid_until_ms) => Some(valid_until_ms),
+            Self::Until(valid_until_ms) => Some(valid_until_ms.get()),
         }
     }
 
@@ -2604,7 +2638,7 @@ impl RouteMapValidity {
     pub fn is_valid_at(self, now_ms: u64) -> bool {
         match self {
             Self::Forever => true,
-            Self::Until(valid_until_ms) => valid_until_ms > now_ms,
+            Self::Until(valid_until_ms) => valid_until_ms.get() > now_ms,
         }
     }
 
