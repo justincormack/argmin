@@ -11582,6 +11582,15 @@ mod tests {
         }
     }
 
+    fn bounded_runtime_refresh_config(
+        mut config: StorageNodeProcessConfig,
+    ) -> StorageNodeProcessConfig {
+        config.route_map_validity =
+            RouteMapValidity::until_ms(crate::clock::current_time_millis().saturating_add(60_000))
+                .expect("test validity deadline must be representable");
+        config
+    }
+
     fn test_route(pg_id: u32) -> StorageNodePgRoute {
         StorageNodePgRoute {
             pg_id,
@@ -13827,7 +13836,7 @@ mod tests {
         let first_health = decode_health_response(&first_payload).unwrap();
         assert_eq!(first_health.cluster_epoch, ClusterEpoch::new(1).unwrap());
 
-        let mut next_config = config.clone();
+        let mut next_config = bounded_runtime_refresh_config(config.clone());
         next_config.cluster_epoch = ClusterEpoch::new(2).unwrap();
         next_config.pg_routes[0].cluster_epoch = next_config.cluster_epoch;
         server
@@ -13872,7 +13881,7 @@ mod tests {
             .validate_pg_route(config.node_id, config.cluster_epoch, PgId::new(0))
             .unwrap();
 
-        let mut next_config = config.clone();
+        let mut next_config = bounded_runtime_refresh_config(config.clone());
         next_config.cluster_epoch = ClusterEpoch::new(2).unwrap();
         next_config.pg_routes[0].cluster_epoch = next_config.cluster_epoch;
         server

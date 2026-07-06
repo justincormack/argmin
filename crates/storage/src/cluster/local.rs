@@ -2729,6 +2729,14 @@ impl LocalClusterMap {
         self.route_map_validity = encode_route_map_validity(validity);
     }
 
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_store_route_map_validity(&self, validity: RouteMapValidity) {
+        self.route_map_validity.store(
+            encode_route_map_validity(validity).into_inner(),
+            Ordering::Release,
+        );
+    }
+
     pub fn process_local_registry_key(&self) -> usize {
         self.process_local_registry_key
     }

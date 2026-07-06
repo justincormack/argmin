@@ -4036,6 +4036,11 @@ impl StorageCluster {
         self.local_map.route_map_validity()
     }
 
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_store_route_map_validity(&self, validity: RouteMapValidity) {
+        self.local_map.test_store_route_map_validity(validity);
+    }
+
     fn extend_route_map_validity(&self, candidate: RouteMapValidity) {
         self.local_map.extend_route_map_validity(candidate);
     }

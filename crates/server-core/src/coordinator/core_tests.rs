@@ -28,6 +28,16 @@ use storage::{
 const TEST_EVENT_TIMEOUT: Duration = Duration::from_secs(2);
 const BUCKET_FAST_PATH_WATCH_TEST_TIMEOUT: Duration = Duration::from_secs(10);
 
+fn long_lived_test_route_map_validity() -> RouteMapValidity {
+    RouteMapValidity::until_ms(storage::clock::current_time_millis().saturating_add(3_600_000))
+        .unwrap()
+}
+
+fn make_dynamic_runtime_map_candidate(candidate: Arc<StorageCluster>) -> Arc<StorageCluster> {
+    candidate.test_store_route_map_validity(long_lived_test_route_map_validity());
+    candidate
+}
+
 #[derive(Debug, PartialEq, Eq)]
 enum LockWaitEvent {
     Progress,
@@ -171,7 +181,8 @@ fn coordinator_storage_node_tracks_runtime_map_handle_install() {
     assert!(Arc::ptr_eq(&coord.storage_node(), &initial));
 
     let next_tmp = test_util::tempdir();
-    let candidate = open_test_storage_cluster(next_tmp.path(), &[0, 1]);
+    let candidate =
+        make_dynamic_runtime_map_candidate(open_test_storage_cluster(next_tmp.path(), &[0, 1]));
     assert!(!Arc::ptr_eq(&coord.storage_node(), &candidate));
     handle.install(Arc::clone(&candidate)).unwrap();
 
@@ -239,6 +250,7 @@ fn shard_backfill_worker_uses_refreshed_runtime_map_handle() {
     )
     .unwrap();
     refreshed_map.test_install_historical_pg_routes([historical_route]);
+    refreshed_map.test_set_route_map_validity(long_lived_test_route_map_validity());
     let refreshed = StorageCluster::from_local_map(Arc::new(refreshed_map)).unwrap();
     handle.install(Arc::clone(&refreshed)).unwrap();
 
@@ -563,7 +575,10 @@ fn get_object_pins_runtime_map_for_snapshot_and_body() {
     .unwrap();
 
     let candidate_tmp = test_util::tempdir();
-    let candidate = open_test_storage_cluster(candidate_tmp.path(), &[0, 1]);
+    let candidate = make_dynamic_runtime_map_candidate(open_test_storage_cluster(
+        candidate_tmp.path(),
+        &[0, 1],
+    ));
     let _serial = RECLAMATION_TEST_SERIAL
         .get_or_init(|| Mutex::new(()))
         .lock()
@@ -630,7 +645,10 @@ fn copy_object_pins_runtime_map_for_source_and_destination() {
     .unwrap();
 
     let candidate_tmp = test_util::tempdir();
-    let candidate = open_test_storage_cluster(candidate_tmp.path(), &[0, 1]);
+    let candidate = make_dynamic_runtime_map_candidate(open_test_storage_cluster(
+        candidate_tmp.path(),
+        &[0, 1],
+    ));
     let handle_for_hook = handle.clone();
     let _serial = RECLAMATION_TEST_SERIAL
         .get_or_init(|| Mutex::new(()))
@@ -665,7 +683,9 @@ fn copy_object_pins_runtime_map_for_source_and_destination() {
         })
         .unwrap();
 
-    handle.install(initial).unwrap();
+    handle
+        .install(make_dynamic_runtime_map_candidate(initial))
+        .unwrap();
     let result = coord
         .get_object(&GetObjectRequest {
             sse_customer: None,
@@ -720,7 +740,10 @@ fn object_metadata_pins_runtime_map_after_policy_context_load() {
     .unwrap();
 
     let candidate_tmp = test_util::tempdir();
-    let candidate = open_test_storage_cluster(candidate_tmp.path(), &[0, 1]);
+    let candidate = make_dynamic_runtime_map_candidate(open_test_storage_cluster(
+        candidate_tmp.path(),
+        &[0, 1],
+    ));
     let hook_handle = handle.clone();
     let _serial = BUCKET_WRITE_HANDLE_TEST_SERIAL
         .get_or_init(|| Mutex::new(()))
@@ -745,7 +768,9 @@ fn object_metadata_pins_runtime_map_after_policy_context_load() {
     )
     .unwrap();
 
-    handle.install(initial).unwrap();
+    handle
+        .install(make_dynamic_runtime_map_candidate(initial))
+        .unwrap();
     let tags = get_object_tags_test(&coord, "bucket", "key", None, test_requester(), None)
         .unwrap()
         .unwrap();
@@ -790,7 +815,10 @@ fn delete_object_pins_runtime_map_after_authorization() {
     .unwrap();
 
     let candidate_tmp = test_util::tempdir();
-    let candidate = open_test_storage_cluster(candidate_tmp.path(), &[0, 1]);
+    let candidate = make_dynamic_runtime_map_candidate(open_test_storage_cluster(
+        candidate_tmp.path(),
+        &[0, 1],
+    ));
     let hook_handle = handle.clone();
     let _serial = BUCKET_WRITE_HANDLE_TEST_SERIAL
         .get_or_init(|| Mutex::new(()))
@@ -815,7 +843,9 @@ fn delete_object_pins_runtime_map_after_authorization() {
         ))
         .unwrap();
 
-    handle.install(initial).unwrap();
+    handle
+        .install(make_dynamic_runtime_map_candidate(initial))
+        .unwrap();
     let err = coord
         .get_object(&GetObjectRequest {
             sse_customer: None,
@@ -851,7 +881,10 @@ fn delete_bucket_pins_runtime_map_after_authorization() {
         .unwrap();
 
     let candidate_tmp = test_util::tempdir();
-    let candidate = open_test_storage_cluster(candidate_tmp.path(), &[0, 1]);
+    let candidate = make_dynamic_runtime_map_candidate(open_test_storage_cluster(
+        candidate_tmp.path(),
+        &[0, 1],
+    ));
     let hook_handle = handle.clone();
     let _serial = BUCKET_WRITE_HANDLE_TEST_SERIAL
         .get_or_init(|| Mutex::new(()))
@@ -867,7 +900,9 @@ fn delete_bucket_pins_runtime_map_after_authorization() {
 
     delete_bucket_test(&coord, "bucket").unwrap();
 
-    handle.install(initial).unwrap();
+    handle
+        .install(make_dynamic_runtime_map_candidate(initial))
+        .unwrap();
     let err = coord
         .head_bucket(&bucket_request_with_expected_owner(
             "bucket",
@@ -1543,7 +1578,10 @@ fn bucket_subresource_write_pins_runtime_map_after_authorization() {
         .unwrap();
 
     let candidate_tmp = test_util::tempdir();
-    let candidate = open_test_storage_cluster(candidate_tmp.path(), &[0, 1]);
+    let candidate = make_dynamic_runtime_map_candidate(open_test_storage_cluster(
+        candidate_tmp.path(),
+        &[0, 1],
+    ));
     let hook_handle = handle.clone();
     let _serial = BUCKET_WRITE_HANDLE_TEST_SERIAL
         .get_or_init(|| Mutex::new(()))
@@ -1560,7 +1598,9 @@ fn bucket_subresource_write_pins_runtime_map_after_authorization() {
     let lifecycle = "<LifecycleConfiguration><Rule><ID>pin</ID><Filter><Prefix/></Filter><Status>Enabled</Status><Expiration><Days>1</Days></Expiration></Rule></LifecycleConfiguration>";
     put_bucket_lifecycle_test(&coord, "bucket", lifecycle, test_requester(), None).unwrap();
 
-    handle.install(initial).unwrap();
+    handle
+        .install(make_dynamic_runtime_map_candidate(initial))
+        .unwrap();
     let stored = coord
         .get_bucket_lifecycle(&bucket_request_with_expected_owner(
             "bucket",
@@ -1591,7 +1631,10 @@ fn bucket_subresource_write_pins_runtime_map_before_authorization() {
         .unwrap();
 
     let candidate_tmp = test_util::tempdir();
-    let candidate = open_test_storage_cluster(candidate_tmp.path(), &[0, 1]);
+    let candidate = make_dynamic_runtime_map_candidate(open_test_storage_cluster(
+        candidate_tmp.path(),
+        &[0, 1],
+    ));
     let hook_handle = handle.clone();
     let _serial = BUCKET_WRITE_HANDLE_TEST_SERIAL
         .get_or_init(|| Mutex::new(()))
@@ -1608,7 +1651,9 @@ fn bucket_subresource_write_pins_runtime_map_before_authorization() {
     let lifecycle = "<LifecycleConfiguration><Rule><ID>pin-before-auth</ID><Filter><Prefix/></Filter><Status>Enabled</Status><Expiration><Days>1</Days></Expiration></Rule></LifecycleConfiguration>";
     put_bucket_lifecycle_test(&coord, "bucket", lifecycle, test_requester(), None).unwrap();
 
-    handle.install(initial).unwrap();
+    handle
+        .install(make_dynamic_runtime_map_candidate(initial))
+        .unwrap();
     let stored = coord
         .get_bucket_lifecycle(&bucket_request_with_expected_owner(
             "bucket",
@@ -1670,7 +1715,10 @@ fn upload_part_copy_pins_runtime_map_after_stream_session_create() {
         .unwrap();
 
     let candidate_tmp = test_util::tempdir();
-    let candidate = open_test_storage_cluster(candidate_tmp.path(), &[0, 1]);
+    let candidate = make_dynamic_runtime_map_candidate(open_test_storage_cluster(
+        candidate_tmp.path(),
+        &[0, 1],
+    ));
     let _serial = RECLAMATION_TEST_SERIAL
         .get_or_init(|| Mutex::new(()))
         .lock()
@@ -1722,7 +1770,10 @@ fn put_object_pins_runtime_map_after_bucket_write_reservation() {
         .unwrap();
 
     let candidate_tmp = test_util::tempdir();
-    let candidate = open_test_storage_cluster(candidate_tmp.path(), &[0, 1]);
+    let candidate = make_dynamic_runtime_map_candidate(open_test_storage_cluster(
+        candidate_tmp.path(),
+        &[0, 1],
+    ));
     let hook_handle = handle.clone();
     let _serial = BUCKET_WRITE_HANDLE_TEST_SERIAL
         .get_or_init(|| Mutex::new(()))
@@ -1754,7 +1805,9 @@ fn put_object_pins_runtime_map_after_bucket_write_reservation() {
     )
     .unwrap();
 
-    handle.install(initial).unwrap();
+    handle
+        .install(make_dynamic_runtime_map_candidate(initial))
+        .unwrap();
     let result = coord
         .get_object(&GetObjectRequest {
             sse_customer: None,
@@ -1827,6 +1880,7 @@ fn install_next_epoch_runtime_map_with_historical_routes(
     )
     .unwrap();
     candidate_map.test_install_historical_pg_routes(historical_routes);
+    candidate_map.test_set_route_map_validity(long_lived_test_route_map_validity());
     let candidate = StorageCluster::from_local_map(Arc::new(candidate_map)).unwrap();
     handle.install(candidate).unwrap();
 }
@@ -1894,6 +1948,7 @@ fn install_same_store_same_epoch_runtime_map(
     )
     .unwrap();
     candidate_map.test_install_historical_pg_routes(historical_routes);
+    candidate_map.test_set_route_map_validity(long_lived_test_route_map_validity());
     let candidate = StorageCluster::from_local_map(Arc::new(candidate_map)).unwrap();
     handle.install(candidate).unwrap();
 }
@@ -1936,6 +1991,7 @@ fn install_same_store_next_epoch_runtime_map_with_primary(
     let candidate = initial
         .test_clone_with_pg_routes(next_epoch, routes, historical_routes)
         .unwrap();
+    candidate.test_store_route_map_validity(long_lived_test_route_map_validity());
     handle.install(candidate).unwrap();
 }
 
@@ -2107,6 +2163,7 @@ fn install_same_store_next_epoch_runtime_map_with_peering_pg(
     )
     .unwrap();
     candidate_map.test_install_historical_pg_routes(historical_routes);
+    candidate_map.test_set_route_map_validity(long_lived_test_route_map_validity());
     let candidate = StorageCluster::from_local_map(Arc::new(candidate_map)).unwrap();
     handle.install(candidate).unwrap();
     next_epoch
@@ -3919,6 +3976,7 @@ fn get_uses_retained_payload_route_over_unix_after_data_pg_move_and_metadata_rea
     next_map
         .install_unix_storage_node_clients(client_configs)
         .unwrap();
+    next_map.test_set_route_map_validity(long_lived_test_route_map_validity());
     let next_cluster = StorageCluster::from_local_map(Arc::new(next_map)).unwrap();
     handle.install(next_cluster).unwrap();
 
@@ -4386,7 +4444,10 @@ fn large_put_object_pins_runtime_map_after_stream_session_create() {
         .unwrap();
 
     let candidate_tmp = test_util::tempdir();
-    let candidate = open_test_storage_cluster(candidate_tmp.path(), &[0, 1]);
+    let candidate = make_dynamic_runtime_map_candidate(open_test_storage_cluster(
+        candidate_tmp.path(),
+        &[0, 1],
+    ));
     let hook_handle = handle.clone();
     let _serial = BUCKET_WRITE_HANDLE_TEST_SERIAL
         .get_or_init(|| Mutex::new(()))
@@ -4419,7 +4480,9 @@ fn large_put_object_pins_runtime_map_after_stream_session_create() {
     )
     .unwrap();
 
-    handle.install(initial).unwrap();
+    handle
+        .install(make_dynamic_runtime_map_candidate(initial))
+        .unwrap();
     let result = coord
         .get_object(&GetObjectRequest {
             sse_customer: None,
@@ -4472,7 +4535,10 @@ fn streaming_upload_part_pins_runtime_map_after_session_create() {
 
     let storage_node = coord.storage_node_for_request();
     let candidate_tmp = test_util::tempdir();
-    let candidate = open_test_storage_cluster(candidate_tmp.path(), &[0, 1]);
+    let candidate = make_dynamic_runtime_map_candidate(open_test_storage_cluster(
+        candidate_tmp.path(),
+        &[0, 1],
+    ));
     let hook_handle = handle.clone();
     let _serial = BUCKET_WRITE_HANDLE_TEST_SERIAL
         .get_or_init(|| Mutex::new(()))
@@ -4544,7 +4610,9 @@ fn streaming_upload_part_pins_runtime_map_after_session_create() {
         )
         .unwrap();
 
-    handle.install(initial).unwrap();
+    handle
+        .install(make_dynamic_runtime_map_candidate(initial))
+        .unwrap();
     coord
         .complete_multipart_upload(&CompleteMultipartUploadRequest {
             upload: multipart_object_request_with_expected_owner(
@@ -4607,7 +4675,10 @@ fn complete_multipart_upload_pins_runtime_map_between_snapshot_and_commit() {
         &[(1, b"complete-multipart-pinned-runtime-map")],
     );
     let candidate_tmp = test_util::tempdir();
-    let candidate = open_test_storage_cluster(candidate_tmp.path(), &[0, 1]);
+    let candidate = make_dynamic_runtime_map_candidate(open_test_storage_cluster(
+        candidate_tmp.path(),
+        &[0, 1],
+    ));
     let hook_handle = handle.clone();
     let _serial = RECLAMATION_TEST_SERIAL
         .get_or_init(|| Mutex::new(()))
@@ -4638,7 +4709,9 @@ fn complete_multipart_upload_pins_runtime_map_between_snapshot_and_commit() {
         })
         .unwrap();
 
-    handle.install(initial).unwrap();
+    handle
+        .install(make_dynamic_runtime_map_candidate(initial))
+        .unwrap();
     let result = coord
         .get_object(&GetObjectRequest {
             sse_customer: None,
@@ -4693,7 +4766,10 @@ fn abort_multipart_upload_pins_runtime_map_after_auth_lookup() {
         .unwrap();
 
     let candidate_tmp = test_util::tempdir();
-    let candidate = open_test_storage_cluster(candidate_tmp.path(), &[0, 1]);
+    let candidate = make_dynamic_runtime_map_candidate(open_test_storage_cluster(
+        candidate_tmp.path(),
+        &[0, 1],
+    ));
     let hook_handle = handle.clone();
     let _serial = RECLAMATION_TEST_SERIAL
         .get_or_init(|| Mutex::new(()))
@@ -4717,7 +4793,9 @@ fn abort_multipart_upload_pins_runtime_map_after_auth_lookup() {
         ))
         .unwrap();
 
-    handle.install(initial).unwrap();
+    handle
+        .install(make_dynamic_runtime_map_candidate(initial))
+        .unwrap();
     let err = coord
         .list_parts(&ListPartsRequest {
             upload: multipart_object_request_with_expected_owner(
@@ -4772,7 +4850,10 @@ fn abort_multipart_upload_pins_runtime_map_after_bucket_summary() {
         .unwrap();
 
     let candidate_tmp = test_util::tempdir();
-    let candidate = open_test_storage_cluster(candidate_tmp.path(), &[0, 1]);
+    let candidate = make_dynamic_runtime_map_candidate(open_test_storage_cluster(
+        candidate_tmp.path(),
+        &[0, 1],
+    ));
     let hook_handle = handle.clone();
     let _serial = RECLAMATION_TEST_SERIAL
         .get_or_init(|| Mutex::new(()))
@@ -4796,7 +4877,9 @@ fn abort_multipart_upload_pins_runtime_map_after_bucket_summary() {
         ))
         .unwrap();
 
-    handle.install(initial).unwrap();
+    handle
+        .install(make_dynamic_runtime_map_candidate(initial))
+        .unwrap();
     let err = coord
         .list_parts(&ListPartsRequest {
             upload: multipart_object_request_with_expected_owner(
