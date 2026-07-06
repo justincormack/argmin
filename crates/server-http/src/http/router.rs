@@ -216,6 +216,34 @@ pub enum S3Operation {
 }
 
 impl S3Operation {
+    /// The object key for object-scoped operations. `None` for bucket-scoped
+    /// and account-scoped operations.
+    pub fn object_key(&self) -> Option<&str> {
+        match self {
+            Self::PutObject { key, .. }
+            | Self::GetObject { key, .. }
+            | Self::DeleteObject { key, .. }
+            | Self::HeadObject { key, .. }
+            | Self::GetObjectAcl { key, .. }
+            | Self::PutObjectAcl { key, .. }
+            | Self::GetObjectAttributes { key, .. }
+            | Self::GetObjectTagging { key, .. }
+            | Self::PutObjectTagging { key, .. }
+            | Self::DeleteObjectTagging { key, .. }
+            | Self::GetObjectRetention { key, .. }
+            | Self::PutObjectRetention { key, .. }
+            | Self::GetObjectLegalHold { key, .. }
+            | Self::PutObjectLegalHold { key, .. }
+            | Self::CreateMultipartUpload { key, .. }
+            | Self::UploadPart { key, .. }
+            | Self::CompleteMultipartUpload { key, .. }
+            | Self::AbortMultipartUpload { key, .. }
+            | Self::ListParts { key, .. } => Some(key),
+            Self::OptionsRequest { key, .. } => key.as_deref(),
+            _ => None,
+        }
+    }
+
     pub fn bucket_name(&self) -> Option<&BucketName> {
         match self {
             Self::ListBuckets | Self::TagResource { .. } | Self::UntagResource { .. } => None,

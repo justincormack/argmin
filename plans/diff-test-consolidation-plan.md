@@ -190,12 +190,22 @@ Pilot outcome:
   captures (and `assert_shape_one_of` the matched index plus captures) so
   tests can pin cross-response consistency, e.g. the same `{etag}` across
   PUT/GET/HEAD of one object
-- the pilot's AWS run immediately found real drift: AWS no longer sends
-  `x-amz-bucket-region` on the signed-header `InvalidToken` error (it did
-  when d69f1dff modelled it in April 2026). The server behaviour was
-  removed to match current AWS. This is the failure mode the golden tests
-  are designed to catch on every AWS run, where diff-tests only caught it
-  when someone ran them.
+- the pilot's AWS run found a modelling error in `x-amz-bucket-region` on
+  the signed-header `InvalidToken` error. The full picture (established by
+  probing AWS directly after a diff-test run contradicted the pilot's
+  first conclusion): AWS sends the header only for bucket-scoped requests
+  to existing buckets; object-scoped requests and unknown buckets omit
+  it. The original server code sent it whenever the request named a
+  bucket; the pilot briefly removed it entirely; the final model gates on
+  bucket scope plus bucket existence (mirroring the WrongRegion gating),
+  pinned by golden tests for both scopes. Lesson recorded: one AWS data
+  point is one request shape — probe adjacent shapes (bucket vs object
+  scope, existing vs missing resource) before concluding drift.
+- a diff-test run also exposed a latent part-request bug: HEAD/GET
+  `?partNumber` leaked the object-level `x-amz-checksum-type` (e.g. the
+  stored default `FULL_OBJECT`) with no part checksum alongside it; AWS
+  only returns the type together with a part checksum. Fixed in both part
+  response builders.
 - deterministic response values are pinned literally where the diff tests
   compared them: `x-amz-checksum-crc64nvme` of a fixed body,
   `x-amz-checksum-type: FULL_OBJECT`, `x-amz-server-side-encryption:

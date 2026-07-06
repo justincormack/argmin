@@ -1299,14 +1299,17 @@ impl S3Response {
             .apply_user_metadata_headers(&result.metadata)
             .apply_object_lock_headers(result.object_lock);
 
-        // Per-part checksum (always emitted for part-level requests)
+        // Part-level requests report the part checksum, and the checksum
+        // type only alongside it: AWS omits x-amz-checksum-type on
+        // partNumber responses when the parts carry no checksums, even if
+        // the object has a stored default full-object checksum.
         if let Some(ref cksum) = result.checksum {
             use base64::Engine;
             let b64 = base64::engine::general_purpose::STANDARD.encode(cksum.bytes());
             resp = resp.header(cksum.algorithm().header_name(), &b64);
-        }
-        if let Some(checksum_type) = result.system_metadata.checksum_type() {
-            resp = resp.header("x-amz-checksum-type", checksum_type.as_str());
+            if let Some(checksum_type) = result.system_metadata.checksum_type() {
+                resp = resp.header("x-amz-checksum-type", checksum_type.as_str());
+            }
         }
 
         resp.apply_lifecycle_expiration_header(result.lifecycle_expiration.as_ref())
@@ -1341,8 +1344,9 @@ impl S3Response {
     }
 
     /// Build a response for a part-level `GetObject` (206 Partial Content).
-    /// Per-part checksum and checksum-type are always emitted (Ceph/AWS
-    /// return them without requiring ChecksumMode=ENABLED on part GETs).
+    /// When the part has a stored checksum it is emitted without requiring
+    /// `ChecksumMode=ENABLED`, with `x-amz-checksum-type` alongside it;
+    /// checksum-less parts get neither header.
     #[must_use]
     pub fn get_object_part(result: GetObjectPartResult) -> Self {
         let mut resp = Self::new(206)
@@ -1368,15 +1372,17 @@ impl S3Response {
             .apply_user_metadata_headers(&result.metadata)
             .apply_object_lock_headers(result.object_lock);
 
-        // Per-part checksum (always emitted for part-level GETs)
+        // Part-level requests report the part checksum, and the checksum
+        // type (e.g. COMPOSITE, FULL_OBJECT) only alongside it: AWS omits
+        // x-amz-checksum-type on partNumber responses when the parts carry
+        // no checksums, even if the object has a stored default checksum.
         if let Some(ref cksum) = result.checksum {
             use base64::Engine;
             let b64 = base64::engine::general_purpose::STANDARD.encode(cksum.bytes());
             resp = resp.header(cksum.algorithm().header_name(), &b64);
-        }
-        // Checksum type (e.g. COMPOSITE, FULL_OBJECT)
-        if let Some(checksum_type) = result.system_metadata.checksum_type() {
-            resp = resp.header("x-amz-checksum-type", checksum_type.as_str());
+            if let Some(checksum_type) = result.system_metadata.checksum_type() {
+                resp = resp.header("x-amz-checksum-type", checksum_type.as_str());
+            }
         }
 
         resp.apply_lifecycle_expiration_header(result.lifecycle_expiration.as_ref())

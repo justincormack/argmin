@@ -920,6 +920,14 @@ impl HttpFrontend {
         }
 
         let actual_cors_bucket = operation.bucket_name().cloned();
+        // AWS reveals the bucket region on security-token auth errors only
+        // for bucket-scoped requests to existing buckets; object-scoped
+        // requests and unknown buckets omit the header.
+        let token_error_bucket_region_bucket = if operation.object_key().is_none() {
+            actual_cors_bucket.clone()
+        } else {
+            None
+        };
         let defer_region_check = self.should_defer_region_check(&operation);
         let auth = {
             observability::trace_scope!(
@@ -949,6 +957,19 @@ impl HttpFrontend {
             }
             Err(err) => Err(err),
         };
+        let add_bucket_region_for_token_error = token_error_bucket_region_bucket
+            .as_ref()
+            .filter(|_| {
+                matches!(
+                    &result,
+                    Err(ServerError::Auth(
+                        auth::AuthError::UnexpectedSecurityToken { .. }
+                    ))
+                )
+            })
+            // A metadata lookup failure only suppresses the optional header;
+            // the auth error response itself must still be returned.
+            .is_some_and(|bucket| self.coordinator.bucket_exists(bucket).unwrap_or(false));
         let mut resp = {
             observability::trace_scope!(
                 TRACE_TARGET,
@@ -991,6 +1012,18 @@ impl HttpFrontend {
                 }
             }
         };
+        if add_bucket_region_for_token_error
+            && !resp
+                .headers
+                .iter()
+                .any(|(name, _)| name.eq_ignore_ascii_case("x-amz-bucket-region"))
+        {
+            resp.headers.push((
+                "x-amz-bucket-region".to_string(),
+                self.coordinator.region().to_string(),
+            ));
+        }
+
         // CORS response headers on actual (non-preflight) requests.
         if let Some(origin) = s3req.header("origin") {
             if let Some(bucket) = actual_cors_bucket {

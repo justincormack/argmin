@@ -1693,6 +1693,12 @@ fn test_sigv2_rejected_in_region_that_requires_sigv4() {
     });
 }
 
+const INVALID_TOKEN_BODY: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error>\
+     <Code>InvalidToken</Code>\
+     <Message>The provided token is malformed or otherwise invalid.</Message>\
+     <Token-0>bad-token-causes-400</Token-0>\
+     <RequestId>{request_id}</RequestId><HostId>{host_id}</HostId></Error>";
+
 #[test]
 fn test_unexpected_security_token_on_static_credentials_returns_bad_request() {
     s3_tests::run(async {
@@ -1708,18 +1714,44 @@ fn test_unexpected_security_token_on_static_credentials_returns_bad_request() {
             b"",
             &[("x-amz-security-token", "bad-token-causes-400")],
         );
+        // Object-scoped requests do not reveal the bucket region on token
+        // errors; only bucket-scoped requests to existing buckets do (see
+        // the bucket-level test below).
         assert_shape(
             "GetObject with unexpected security token",
             &response,
-            &shape().status(400).headers(error_response_headers()).body(
-                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>InvalidToken</Code>\
-                     <Message>The provided token is malformed or otherwise invalid.</Message>\
-                     <Token-0>bad-token-causes-400</Token-0>\
-                     <RequestId>{request_id}</RequestId><HostId>{host_id}</HostId></Error>",
-            ),
+            &shape()
+                .status(400)
+                .headers(error_response_headers())
+                .body(INVALID_TOKEN_BODY),
         );
 
         cleanup(&bucket, &[key]).await;
+    });
+}
+
+#[test]
+fn test_unexpected_security_token_on_bucket_request_includes_bucket_region() {
+    s3_tests::run(async {
+        let bucket = setup_bucket().await;
+
+        let response = s3_tests::send_signed_request(
+            "GET",
+            &format!("{}/{}", CTX.endpoint(), bucket),
+            b"",
+            [("x-amz-security-token", "bad-token-causes-400")],
+        );
+        assert_shape(
+            "GetBucket with unexpected security token",
+            &response,
+            &shape()
+                .status(400)
+                .headers(error_response_headers())
+                .header("x-amz-bucket-region", CTX.region())
+                .body(INVALID_TOKEN_BODY),
+        );
+
+        cleanup(&bucket, &[]).await;
     });
 }
 
