@@ -6529,7 +6529,8 @@ pub async fn handle_control_plane_raft_peer_snapshot_frame(
     .await
 }
 
-pub async fn handle_control_plane_raft_peer_unix_stream(
+#[cfg(test)]
+async fn handle_control_plane_raft_peer_unix_stream(
     raft: &Raft<ControlPlaneRaftTypeConfig, ControlPlaneRaftStateMachine>,
     stream: &mut UnixStream,
     frame_kind: ControlPlaneRaftPeerFrameKind,
@@ -6562,7 +6563,8 @@ pub async fn handle_control_plane_raft_peer_unix_stream(
     .await
 }
 
-pub async fn handle_control_plane_raft_peer_unix_stream_detecting_frame_kind(
+#[cfg(test)]
+async fn handle_control_plane_raft_peer_unix_stream_detecting_frame_kind(
     raft: &Raft<ControlPlaneRaftTypeConfig, ControlPlaneRaftStateMachine>,
     stream: &mut UnixStream,
     limits: ControlPlaneRaftPeerTransportLimits,
@@ -6595,7 +6597,8 @@ pub async fn handle_control_plane_raft_peer_unix_stream_detecting_frame_kind(
     .await
 }
 
-pub async fn handle_control_plane_raft_peer_unix_stream_from_configured_peer(
+#[cfg(test)]
+async fn handle_control_plane_raft_peer_unix_stream_from_configured_peer(
     raft: &Raft<ControlPlaneRaftTypeConfig, ControlPlaneRaftStateMachine>,
     stream: &mut UnixStream,
     local_node_id: ControlPlaneRaftNodeId,
@@ -6634,6 +6637,7 @@ pub async fn handle_control_plane_raft_peer_unix_stream_from_configured_peer(
     .await
 }
 
+#[cfg(test)]
 async fn handle_control_plane_raft_peer_unix_request_frame(
     raft: &Raft<ControlPlaneRaftTypeConfig, ControlPlaneRaftStateMachine>,
     stream: &mut UnixStream,

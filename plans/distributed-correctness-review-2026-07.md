@@ -1599,9 +1599,11 @@ verified); triggers not executed.
   checkpoint (`main.rs:2293-2312`); a crash between leaves non-empty WAL
   with no artifact/sentinel → fail closed needing manual WAL deletion. Same
   class: sentinel-then-artifact ordering on the very first checkpoint.
-- `pub` peer-stream helpers (`control_plane_raft.rs:6532-6634`) answer peer
-  RPCs with no checkpoint or poison gating — test-only today, a latent R1
-  bypass; demote to test-hooks cfg or route through the checkpoint contract.
+- RESOLVED (2026-07-06): the standalone peer-stream helpers
+  (`control_plane_raft.rs:6532-6634`) are now private `#[cfg(test)]`
+  helpers. Production code keeps using the frame-level handlers through the
+  `argmin-s3` peer worker, which applies the checkpoint and poison contract
+  before acknowledging peer RPCs.
 - WAL-internal poison does not set the shared peer poison gate (safety
   survives; the documented R8 invariant is inaccurate) — bridge it.
 - No artifact↔WAL generation binding (named in the 12.4 exit criteria, not
