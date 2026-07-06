@@ -1786,10 +1786,11 @@ impl StorageNodeServer {
                 candidate: next_config.cluster_epoch,
             });
         }
-        if next_config.cluster_epoch == current_config.cluster_epoch
-            && current_config
-                .route_map_validity
-                .regresses_to(next_config.route_map_validity)
+        if next_config.route_map_valid_until_ms().is_none()
+            || (next_config.cluster_epoch == current_config.cluster_epoch
+                && current_config
+                    .route_map_validity
+                    .regresses_to(next_config.route_map_validity))
         {
             return Err(StorageNodeServerError::RuntimeRefreshValidityRegression {
                 current: current_config.route_map_valid_until_ms(),
@@ -12085,6 +12086,36 @@ mod tests {
                 candidate: None,
             })
         ));
+    }
+
+    #[test]
+    fn storage_node_runtime_config_install_rejects_later_epoch_unbounded_validity() {
+        let tmp = test_util::tempdir();
+        let mut config = test_config(&tmp);
+        config.route_map_validity = RouteMapValidity::until_ms(5_000).unwrap();
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let server = StorageNodeServer::bind(config.clone()).unwrap();
+
+        let mut unbounded = config.clone();
+        unbounded.cluster_epoch = ClusterEpoch::new(config.cluster_epoch.get() + 1)
+            .expect("test epoch should not overflow");
+        unbounded.route_map_validity = RouteMapValidity::Forever;
+        for route in &mut unbounded.pg_routes {
+            route.cluster_epoch = unbounded.cluster_epoch;
+        }
+
+        assert!(matches!(
+            server.install_control_plane_runtime_config(unbounded),
+            Err(StorageNodeServerError::RuntimeRefreshValidityRegression {
+                current: Some(5_000),
+                candidate: None,
+            })
+        ));
+        assert_eq!(server.config_snapshot().cluster_epoch, config.cluster_epoch);
+        assert_eq!(
+            server.config_snapshot().route_map_valid_until_ms(),
+            Some(5_000)
+        );
     }
 
     #[test]

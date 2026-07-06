@@ -1135,10 +1135,11 @@ impl StorageClusterRuntimeMapHandle {
                 candidate: candidate.cluster_epoch(),
             });
         }
-        if candidate.cluster_epoch() == current.cluster_epoch()
-            && current
-                .route_map_validity()
-                .regresses_to(candidate.route_map_validity())
+        if candidate.route_map_valid_until_ms().is_none()
+            || (candidate.cluster_epoch() == current.cluster_epoch()
+                && current
+                    .route_map_validity()
+                    .regresses_to(candidate.route_map_validity()))
         {
             return Err(StorageClusterRuntimeMapRefreshError::ValidityRegression {
                 current: current.route_map_valid_until_ms(),

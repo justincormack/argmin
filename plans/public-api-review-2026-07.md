@@ -215,14 +215,17 @@ Remaining order of attack:
   returns `InternalError` instead of fabricating a weak or incomplete S3
   credential-scope response.
 
-- [ ] **RR14. Runtime-map validity wire format still permits `Forever`, and
+- [x] **RR14. Runtime-map validity wire format still permits `Forever`, and
   boundedness is same-epoch-checked only.** Control-plane RPC decode accepts
   an optional deadline (`control_plane.rs:5763, 5783` via
   `from_valid_until_ms(read_option_u64())`), and the epoch-increase refresh
   path has no boundedness check (`storage_node_server.rs:1782` covers same
   epoch only). Current control plane cannot issue `Forever` (all constructors
   bounded), so this is defense-in-depth: reject unbounded maps from
-  authoritative sources at decode, or document why they are tolerated.
+  authoritative sources at decode, or document why they are tolerated. Fixed by
+  requiring bounded validity on runtime-map RPC decode and by rejecting
+  unbounded dynamic refresh candidates in both frontend `StorageCluster` and
+  storage-node runtime config install paths, including epoch-increase refreshes.
 
 - [x] **RR15. Raft WAL surface (new since the original review) — minor
   pattern-class items.** Overall disciplined (private fields, typed errors,
@@ -497,9 +500,9 @@ steps it performs.
   bounded deadlines use `RouteMapValidUntilMs`, which rejects `u64::MAX` so
   the local atomic `Forever` sentinel remains internal. The `valid_until_ms()`
   accessors remain only as deadline projections for diagnostics and error
-  payloads. Re-review 2026-07-05: verified; remaining residual tracked as RR14
-  (wire-format `Forever` tolerance). RR8 removed the duplicated route-map
-  validity regression helper.
+  payloads. Re-review 2026-07-05: verified; RR14 removed wire-format `Forever`
+  tolerance for runtime-map RPC snapshots and dynamic refresh installs. RR8
+  removed the duplicated route-map validity regression helper.
 
 ## Bugs — checksum handling (cross-crate)
 

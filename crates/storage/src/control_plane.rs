@@ -5665,9 +5665,14 @@ fn read_runtime_map_snapshot(
     }
     let pg_routes = read_pg_route_snapshots(reader, "PG routes")?;
     let historical_pg_routes = read_pg_route_snapshots(reader, "historical PG routes")?;
+    let Some(valid_until_ms) = valid_until_ms else {
+        return Err(ControlPlaneError::RpcProtocol {
+            message: "runtime map validity must be bounded on the wire".to_owned(),
+        });
+    };
     let snapshot = ClusterRuntimeMapSnapshot {
         cluster_epoch,
-        validity: RouteMapValidity::from_valid_until_ms(valid_until_ms).ok_or_else(|| {
+        validity: RouteMapValidity::from_valid_until_ms(Some(valid_until_ms)).ok_or_else(|| {
             ControlPlaneError::RpcProtocol {
                 message: "runtime map validity deadline uses reserved unbounded sentinel"
                     .to_owned(),
@@ -12608,7 +12613,7 @@ mod tests {
     ) -> ClusterRuntimeMapSnapshot {
         ClusterRuntimeMapSnapshot {
             cluster_epoch: ClusterEpoch::INITIAL,
-            validity: RouteMapValidity::Forever,
+            validity: RouteMapValidity::until_ms(12_345).unwrap(),
             freshness_proof,
             nodes: Vec::new(),
             pg_routes: Vec::new(),
@@ -12666,6 +12671,24 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn control_plane_rpc_rejects_unbounded_runtime_map_validity() {
+        let mut payload = Vec::new();
+        write_u64(&mut payload, ClusterEpoch::INITIAL.get());
+        write_option_u64(&mut payload, None);
+        write_runtime_map_test_single_authority_proof(&mut payload);
+        write_u32(&mut payload, 0);
+        write_u32(&mut payload, 0);
+        write_u32(&mut payload, 0);
+
+        let mut reader = PayloadReader::new(&payload);
+        assert!(matches!(
+            read_runtime_map_snapshot(&mut reader),
+            Err(ControlPlaneError::RpcProtocol { message })
+                if message.contains("validity must be bounded")
+        ));
+    }
+
     fn runtime_map_test_snapshot_with_transfer_route(
         include_source_route: bool,
     ) -> ClusterRuntimeMapSnapshot {
@@ -12674,7 +12697,7 @@ mod tests {
         let destination_epoch = ClusterEpoch::new(source_epoch.get() + 1).unwrap();
         let source_route = snapshot.pg_routes[0].without_serving_authority();
         snapshot.cluster_epoch = destination_epoch;
-        snapshot.validity = RouteMapValidity::Forever;
+        snapshot.validity = RouteMapValidity::until_ms(12_346).unwrap();
         snapshot.freshness_proof = RuntimeMapFreshnessProof::SingleAuthority {
             authority_incarnation: AuthorityIncarnation::INITIAL,
             issued_at_ms: 12_001,
@@ -16791,6 +16814,49 @@ mod tests {
                 candidate,
             }) if current == Some(current_valid_until) && candidate.is_none()
         ));
+        assert_eq!(
+            handle.current().route_map_valid_until_ms(),
+            Some(current_valid_until)
+        );
+    }
+
+    #[test]
+    fn storage_cluster_runtime_map_handle_rejects_later_epoch_unbounded_validity() {
+        let current_map = runtime_map_test_snapshot_with_active_route();
+        let current_cluster = crate::StorageCluster::from_runtime_map(
+            NodeId::new(1),
+            &current_map,
+            crate::EcShape { k: 1, m: 0 },
+        )
+        .unwrap();
+        let handle = crate::StorageClusterRuntimeMapHandle::new(Arc::clone(&current_cluster));
+        let current_valid_until = current_cluster.route_map_valid_until_ms().unwrap();
+
+        let mut unbounded_map = current_map.clone();
+        unbounded_map.cluster_epoch = ClusterEpoch::new(current_map.cluster_epoch().get() + 1)
+            .expect("test epoch should not overflow");
+        unbounded_map.validity = RouteMapValidity::Forever;
+        for route in &mut unbounded_map.pg_routes {
+            route.cluster_epoch = unbounded_map.cluster_epoch;
+        }
+        let unbounded_cluster = crate::StorageCluster::from_runtime_map(
+            NodeId::new(1),
+            &unbounded_map,
+            crate::EcShape { k: 1, m: 0 },
+        )
+        .unwrap();
+
+        assert!(matches!(
+            handle.install(unbounded_cluster),
+            Err(crate::cluster::StorageClusterRuntimeMapRefreshError::ValidityRegression {
+                current,
+                candidate,
+            }) if current == Some(current_valid_until) && candidate.is_none()
+        ));
+        assert_eq!(
+            handle.current().cluster_epoch(),
+            current_map.cluster_epoch()
+        );
         assert_eq!(
             handle.current().route_map_valid_until_ms(),
             Some(current_valid_until)
