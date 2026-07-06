@@ -18,7 +18,7 @@ use storage::control_plane_raft::{
     durable_artifact_wal_path, write_control_plane_raft_peer_transport_frame,
     ControlPlaneRaftEntry, ControlPlaneRaftLeaderId, ControlPlaneRaftPeerFrameIdentity,
     ControlPlaneRaftPeerRpcRequest, ControlPlaneRaftRestartArtifact, ControlPlaneRaftWalFile,
-    ControlPlaneRaftWalRecord,
+    ControlPlaneRaftWalFileConfig, ControlPlaneRaftWalRecord,
 };
 use storage::{NodeId, PgId};
 
@@ -371,7 +371,7 @@ fn follower_artifact_state_machine_with_wal_replay(
         Ok(artifact) => artifact,
         Err(error) => return Err(error.to_string()),
     };
-    let wal = ControlPlaneRaftWalFile::new(
+    let wal = raft_wal_file(
         durable_artifact_wal_path(path),
         artifact.cluster_name(),
         artifact.local_node_id(),
@@ -435,7 +435,7 @@ fn artifact_persisted_vote(path: &Path) -> Result<Option<PersistedVoteSummary>, 
         Ok(artifact) => artifact,
         Err(error) => return Err(error.to_string()),
     };
-    let wal = ControlPlaneRaftWalFile::new(
+    let wal = raft_wal_file(
         durable_artifact_wal_path(path),
         artifact.cluster_name(),
         artifact.local_node_id(),
@@ -471,7 +471,7 @@ fn artifact_persisted_vote_with_wal(
         Err(error) => return Err(error.to_string()),
     };
     let (log_store, _state_machine) = artifact
-        .restore_with_wal_file(ControlPlaneRaftWalFile::new(
+        .restore_with_wal_file(raft_wal_file(
             durable_artifact_wal_path(path),
             cluster_name,
             node_id,
@@ -499,7 +499,7 @@ fn artifact_log_state_with_wal(
         Err(error) => return Err(error.to_string()),
     };
     let (mut log_store, _state_machine) = artifact
-        .restore_with_wal_file(ControlPlaneRaftWalFile::new(
+        .restore_with_wal_file(raft_wal_file(
             durable_artifact_wal_path(path),
             cluster_name,
             node_id,
@@ -759,6 +759,18 @@ fn wal_path(test_dir: &Path, node_id: u64) -> PathBuf {
     durable_artifact_wal_path(&state_path(test_dir, node_id))
 }
 
+fn raft_wal_file(
+    path: PathBuf,
+    cluster_name: impl Into<String>,
+    node_id: u64,
+) -> ControlPlaneRaftWalFile {
+    ControlPlaneRaftWalFile::new(ControlPlaneRaftWalFileConfig {
+        path,
+        cluster_name: cluster_name.into(),
+        local_node_id: node_id,
+    })
+}
+
 fn state_sentinel_path(test_dir: &Path, node_id: u64) -> PathBuf {
     let state_path = state_path(test_dir, node_id);
     let file_name = state_path
@@ -909,7 +921,7 @@ fn experimental_raft_process_restart_replays_post_checkpoint_wal_suffix() {
         .expect("artifact should restore before WAL suffix injection")
         .expect("artifact should contain the checkpointed vote");
     let injected_term = vote_before_restart.term + 1_000;
-    let wal = ControlPlaneRaftWalFile::new(wal_path(test_dir.path(), 101), &cluster_name, 101);
+    let wal = raft_wal_file(wal_path(test_dir.path(), 101), &cluster_name, 101);
     wal.append_record(&ControlPlaneRaftWalRecord::SaveVote(Vote::<
         ControlPlaneRaftLeaderId,
     >::new_committed(
@@ -1141,7 +1153,7 @@ fn experimental_raft_process_restart_replays_post_checkpoint_wal_command_suffix(
             acting_set: vec![NodeId::new(1)],
         }),
     };
-    let wal = ControlPlaneRaftWalFile::new(wal_path(test_dir.path(), 101), &cluster_name, 101);
+    let wal = raft_wal_file(wal_path(test_dir.path(), 101), &cluster_name, 101);
     wal.append_record(&ControlPlaneRaftWalRecord::SaveVote(Vote::<
         ControlPlaneRaftLeaderId,
     >::new_committed(

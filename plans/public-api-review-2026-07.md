@@ -220,7 +220,7 @@ Remaining order of attack:
   bounded), so this is defense-in-depth: reject unbounded maps from
   authoritative sources at decode, or document why they are tolerated.
 
-- [ ] **RR15. Raft WAL surface (new since the original review) — minor
+- [x] **RR15. Raft WAL surface (new since the original review) — minor
   pattern-class items.** Overall disciplined (private fields, typed errors,
   fully bounds-checked decode of persisted bytes; no hostile-input panics
   found). Items: `ControlPlaneRaftWalFile::new(path: impl Into<PathBuf>,
@@ -232,7 +232,12 @@ Remaining order of attack:
   `None` at `:4676`); dual replay entry points
   (`replay_log_store_artifact{,_from}`, `:4968/:4975`); confusable bare
   `Option<u64>` returns `durable_wal_base_offset()`/`durable_wal_clean_len()`
-  (`:2470/:2475`).
+  (`:2470/:2475`). Fixed by making the WAL file constructor take a named
+  `ControlPlaneRaftWalFileConfig`, renaming the non-durable log-store restore
+  entry point to `from_restart_artifact_in_memory`, replacing the dual WAL
+  replay methods with a single `ControlPlaneRaftWalReplayConfig` call shape
+  that names the replay offset, and replacing the two bare public WAL-offset
+  getters with one typed `ControlPlaneRaftWalOffsets` accessor.
 
 - [x] **RR16. Cosmetic leftovers.** Test name
   `finalize_stream_put_rejects_mismatched_sse_s3_write_context`

@@ -4936,9 +4936,12 @@ mod tests {
         let initial_status = runtime
             .block_on(authority.status())
             .expect("initial WAL-backed authority status should read");
+        let initial_wal_offsets = initial_status
+            .durable_wal_offsets()
+            .expect("initial WAL-backed authority should report WAL offsets");
         assert_eq!(
-            initial_status.durable_wal_base_offset(),
-            initial_status.durable_wal_clean_len(),
+            initial_wal_offsets.base_offset(),
+            initial_wal_offsets.clean_len(),
             "initial checkpoint should compact the WAL suffix"
         );
 
@@ -4998,9 +5001,12 @@ mod tests {
         let status = runtime
             .block_on(authority.status())
             .expect("post-peer RPC WAL-backed authority status should read");
+        let wal_offsets = status
+            .durable_wal_offsets()
+            .expect("post-peer RPC WAL-backed authority should report WAL offsets");
         assert_eq!(
-            status.durable_wal_base_offset(),
-            status.durable_wal_clean_len(),
+            wal_offsets.base_offset(),
+            wal_offsets.clean_len(),
             "ordinary peer RPC checkpoint should compact the acknowledged WAL suffix"
         );
 

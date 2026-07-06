@@ -2268,8 +2268,7 @@ pub struct ControlPlaneRaftAuthorityStatus {
     applied: Option<LogIdOf<ControlPlaneRaftTypeConfig>>,
     current_snapshot: Option<LogIdOf<ControlPlaneRaftTypeConfig>>,
     durable_wal_backed: bool,
-    durable_wal_base_offset: Option<u64>,
-    durable_wal_clean_len: Option<u64>,
+    durable_wal_offsets: Option<ControlPlaneRaftWalOffsets>,
     durable_wal_poisoned: Option<String>,
     durable_last_vote: Option<VoteOf<ControlPlaneRaftTypeConfig>>,
     durable_last_log_id: Option<LogIdOf<ControlPlaneRaftTypeConfig>>,
@@ -2468,13 +2467,8 @@ impl ControlPlaneRaftAuthorityStatus {
     }
 
     #[must_use]
-    pub fn durable_wal_base_offset(&self) -> Option<u64> {
-        self.durable_wal_base_offset
-    }
-
-    #[must_use]
-    pub fn durable_wal_clean_len(&self) -> Option<u64> {
-        self.durable_wal_clean_len
+    pub fn durable_wal_offsets(&self) -> Option<ControlPlaneRaftWalOffsets> {
+        self.durable_wal_offsets
     }
 
     #[must_use]
@@ -2843,7 +2837,11 @@ fn restore_experimental_raft_durable_artifact(
             validate_artifact(&artifact)?;
             if let Some(wal_path) = wal_path {
                 artifact.restore_with_wal_file_validated(
-                    ControlPlaneRaftWalFile::new(wal_path, cluster_name, node_id),
+                    ControlPlaneRaftWalFile::new(ControlPlaneRaftWalFileConfig {
+                        path: wal_path.to_path_buf(),
+                        cluster_name: cluster_name.to_owned(),
+                        local_node_id: node_id,
+                    }),
                     validate_artifact,
                 )
             } else {
@@ -2887,7 +2885,11 @@ fn restore_experimental_raft_durable_artifact(
                         });
                     }
                 }
-                let wal = ControlPlaneRaftWalFile::new(wal_path, cluster_name, node_id);
+                let wal = ControlPlaneRaftWalFile::new(ControlPlaneRaftWalFileConfig {
+                    path: wal_path.to_path_buf(),
+                    cluster_name: cluster_name.to_owned(),
+                    local_node_id: node_id,
+                });
                 return ControlPlaneRaftLogStore::from_restart_artifact_inner(
                     ControlPlaneRaftLogStoreRestartArtifact::default(),
                     Some(Arc::new(wal)),
@@ -3492,12 +3494,9 @@ impl ControlPlaneRaftAuthority {
         let durable_wal_backed = durability_status
             .as_ref()
             .is_some_and(|status| status.wal_backed);
-        let durable_wal_base_offset = durability_status
+        let durable_wal_offsets = durability_status
             .as_ref()
-            .and_then(|status| status.wal_base_offset);
-        let durable_wal_clean_len = durability_status
-            .as_ref()
-            .and_then(|status| status.wal_clean_len);
+            .and_then(|status| status.wal_offsets);
         let durable_wal_poisoned = durability_status.and_then(|status| status.wal_poisoned.clone());
         let (
             last_log_id,
@@ -3735,8 +3734,7 @@ impl ControlPlaneRaftAuthority {
             applied,
             current_snapshot,
             durable_wal_backed,
-            durable_wal_base_offset,
-            durable_wal_clean_len,
+            durable_wal_offsets,
             durable_wal_poisoned,
             durable_last_vote,
             durable_last_log_id,
@@ -4106,6 +4104,37 @@ pub struct ControlPlaneRaftWalFrame {
     record: ControlPlaneRaftWalRecord,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ControlPlaneRaftWalFileConfig {
+    pub path: PathBuf,
+    pub cluster_name: String,
+    pub local_node_id: ControlPlaneRaftNodeId,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ControlPlaneRaftWalOffsets {
+    base_offset: u64,
+    clean_len: u64,
+}
+
+impl ControlPlaneRaftWalOffsets {
+    #[must_use]
+    pub fn base_offset(self) -> u64 {
+        self.base_offset
+    }
+
+    #[must_use]
+    pub fn clean_len(self) -> u64 {
+        self.clean_len
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ControlPlaneRaftWalReplayConfig<'a> {
+    pub base: &'a ControlPlaneRaftLogStoreRestartArtifact,
+    pub replay_offset: u64,
+}
+
 #[derive(Debug, Clone)]
 pub struct ControlPlaneRaftWalFile {
     path: PathBuf,
@@ -4191,8 +4220,7 @@ struct ControlPlaneRaftLogStoreInner {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ControlPlaneRaftLogStoreDurabilityStatus {
     wal_backed: bool,
-    wal_base_offset: Option<u64>,
-    wal_clean_len: Option<u64>,
+    wal_offsets: Option<ControlPlaneRaftWalOffsets>,
     wal_poisoned: Option<String>,
 }
 
@@ -4281,7 +4309,7 @@ impl ControlPlaneRaftLogStore {
                 inner.poisoned.clone(),
             )
         };
-        let (wal_base_offset, wal_clean_len) = match (&self.wal, &wal_poisoned) {
+        let wal_offsets = match (&self.wal, &wal_poisoned) {
             (Some(wal), None) => {
                 let offsets = wal.status_offsets().map_err(|error| {
                     control_plane_error_to_io_error(
@@ -4289,9 +4317,9 @@ impl ControlPlaneRaftLogStore {
                         error,
                     )
                 })?;
-                (Some(offsets.base_offset), Some(offsets.clean_len))
+                Some(offsets)
             }
-            (Some(_), Some(_)) | (None, _) => (None, None),
+            (Some(_), Some(_)) | (None, _) => None,
         };
         Ok(ControlPlaneRaftLogStoreStatusSnapshot {
             vote,
@@ -4300,14 +4328,13 @@ impl ControlPlaneRaftLogStore {
             last_purged_log_id,
             durability: ControlPlaneRaftLogStoreDurabilityStatus {
                 wal_backed,
-                wal_base_offset,
-                wal_clean_len,
+                wal_offsets,
                 wal_poisoned,
             },
         })
     }
 
-    pub fn from_restart_artifact(
+    pub fn from_restart_artifact_in_memory(
         artifact: ControlPlaneRaftLogStoreRestartArtifact,
     ) -> Result<Self, io::Error> {
         Self::from_restart_artifact_inner(artifact, None)
@@ -4317,7 +4344,10 @@ impl ControlPlaneRaftLogStore {
         artifact: ControlPlaneRaftLogStoreRestartArtifact,
         wal: ControlPlaneRaftWalFile,
     ) -> Result<Self, ControlPlaneError> {
-        let replayed = wal.replay_log_store_artifact(&artifact)?;
+        let replayed = wal.replay_log_store_artifact(ControlPlaneRaftWalReplayConfig {
+            base: &artifact,
+            replay_offset: 0,
+        })?;
         Self::from_restart_artifact_inner(replayed, Some(Arc::new(wal))).map_err(|source| {
             ControlPlaneError::Io {
                 context: "restore control-plane OpenRaft WAL-backed log store",
@@ -4725,7 +4755,7 @@ impl ControlPlaneRaftLogStoreRestartArtifact {
         &self,
         records: &[ControlPlaneRaftWalRecord],
     ) -> Result<Self, io::Error> {
-        let store = ControlPlaneRaftLogStore::from_restart_artifact(self.clone())?;
+        let store = ControlPlaneRaftLogStore::from_restart_artifact_in_memory(self.clone())?;
         {
             let mut inner = store.lock()?;
             for record in records {
@@ -4866,22 +4896,12 @@ struct ControlPlaneRaftWalFileRecords {
     truncated_tail: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct ControlPlaneRaftWalFileStatusOffsets {
-    base_offset: u64,
-    clean_len: u64,
-}
-
 impl ControlPlaneRaftWalFile {
-    pub fn new(
-        path: impl Into<PathBuf>,
-        cluster_name: impl Into<String>,
-        local_node_id: ControlPlaneRaftNodeId,
-    ) -> Self {
+    pub fn new(config: ControlPlaneRaftWalFileConfig) -> Self {
         Self {
-            path: path.into(),
-            cluster_name: cluster_name.into(),
-            local_node_id,
+            path: config.path,
+            cluster_name: config.cluster_name,
+            local_node_id: config.local_node_id,
             io_lock: Arc::new(Mutex::new(())),
         }
     }
@@ -4967,18 +4987,11 @@ impl ControlPlaneRaftWalFile {
 
     pub fn replay_log_store_artifact(
         &self,
-        base: &ControlPlaneRaftLogStoreRestartArtifact,
+        config: ControlPlaneRaftWalReplayConfig<'_>,
     ) -> Result<ControlPlaneRaftLogStoreRestartArtifact, ControlPlaneError> {
-        self.replay_log_store_artifact_from(base, 0)
-    }
-
-    pub fn replay_log_store_artifact_from(
-        &self,
-        base: &ControlPlaneRaftLogStoreRestartArtifact,
-        replay_offset: u64,
-    ) -> Result<ControlPlaneRaftLogStoreRestartArtifact, ControlPlaneError> {
-        let records = self.read_records_from(replay_offset)?;
-        let artifact = base
+        let records = self.read_records_from(config.replay_offset)?;
+        let artifact = config
+            .base
             .replay_wal_records(&records.records)
             .map_err(|source| ControlPlaneError::Io {
                 context: "replay control-plane OpenRaft WAL records",
@@ -5010,14 +5023,14 @@ impl ControlPlaneRaftWalFile {
         Ok(self.read_records()?.clean_len)
     }
 
-    fn status_offsets(&self) -> Result<ControlPlaneRaftWalFileStatusOffsets, ControlPlaneError> {
+    fn status_offsets(&self) -> Result<ControlPlaneRaftWalOffsets, ControlPlaneError> {
         let _guard = self.io_lock.lock().map_err(|_| {
             raft_artifact_protocol_error("control-plane OpenRaft WAL lock poisoned")
         })?;
         let file_len = match fs::metadata(&self.path) {
             Ok(metadata) => metadata.len(),
             Err(source) if source.kind() == io::ErrorKind::NotFound => {
-                return Ok(ControlPlaneRaftWalFileStatusOffsets {
+                return Ok(ControlPlaneRaftWalOffsets {
                     base_offset: 0,
                     clean_len: 0,
                 });
@@ -5030,7 +5043,7 @@ impl ControlPlaneRaftWalFile {
             }
         };
         if file_len == 0 {
-            return Ok(ControlPlaneRaftWalFileStatusOffsets {
+            return Ok(ControlPlaneRaftWalOffsets {
                 base_offset: 0,
                 clean_len: 0,
             });
@@ -5049,7 +5062,7 @@ impl ControlPlaneRaftWalFile {
             .ok_or_else(|| {
                 raft_artifact_protocol_error("control-plane OpenRaft WAL status length overflows")
             })?;
-        Ok(ControlPlaneRaftWalFileStatusOffsets {
+        Ok(ControlPlaneRaftWalOffsets {
             base_offset,
             clean_len,
         })
@@ -5625,7 +5638,8 @@ impl ControlPlaneRaftRestartArtifact {
     pub fn restore(
         self,
     ) -> Result<(ControlPlaneRaftLogStore, ControlPlaneRaftStateMachine), io::Error> {
-        let log_store = ControlPlaneRaftLogStore::from_restart_artifact(self.log_store.clone())?;
+        let log_store =
+            ControlPlaneRaftLogStore::from_restart_artifact_in_memory(self.log_store.clone())?;
         let state_machine =
             ControlPlaneRaftStateMachine::from_restart_artifact(self.state_machine.clone())
                 .map_err(|error| {
@@ -5654,7 +5668,10 @@ impl ControlPlaneRaftRestartArtifact {
         ) -> Result<(), ControlPlaneError>,
     ) -> Result<(ControlPlaneRaftLogStore, ControlPlaneRaftStateMachine), ControlPlaneError> {
         let log_store_artifact =
-            wal.replay_log_store_artifact_from(&self.log_store, self.wal_replay_offset)?;
+            wal.replay_log_store_artifact(ControlPlaneRaftWalReplayConfig {
+                base: &self.log_store,
+                replay_offset: self.wal_replay_offset,
+            })?;
         Self::validate_log_store_state_machine_pair(&log_store_artifact, &self.state_machine)
             .map_err(|source| ControlPlaneError::Io {
                 context:
@@ -8483,6 +8500,18 @@ mod tests {
         (),
     >;
 
+    fn test_raft_wal_file(
+        path: impl Into<PathBuf>,
+        cluster_name: impl Into<String>,
+        local_node_id: ControlPlaneRaftNodeId,
+    ) -> ControlPlaneRaftWalFile {
+        ControlPlaneRaftWalFile::new(ControlPlaneRaftWalFileConfig {
+            path: path.into(),
+            cluster_name: cluster_name.into(),
+            local_node_id,
+        })
+    }
+
     #[derive(Debug, Clone, Copy, Default)]
     struct ControlPlaneOpenRaftSuiteBuilder;
 
@@ -11056,8 +11085,7 @@ mod tests {
             applied: caught_up_log_id,
             current_snapshot: None,
             durable_wal_backed: false,
-            durable_wal_base_offset: None,
-            durable_wal_clean_len: None,
+            durable_wal_offsets: None,
             durable_wal_poisoned: None,
             durable_last_vote: None,
             durable_last_log_id: None,
@@ -11588,7 +11616,7 @@ mod tests {
     #[test]
     fn control_plane_raft_wal_file_replays_records() {
         let tmp = test_util::tempdir();
-        let wal = ControlPlaneRaftWalFile::new(tmp.path().join("raft.wal"), "test-cluster", 1);
+        let wal = test_raft_wal_file(tmp.path().join("raft.wal"), "test-cluster", 1);
         let records = vec![
             ControlPlaneRaftWalRecord::Append(vec![
                 bootstrap_membership_entry(1),
@@ -11606,7 +11634,10 @@ mod tests {
         }
 
         let replayed = wal
-            .replay_log_store_artifact(&ControlPlaneRaftLogStoreRestartArtifact::default())
+            .replay_log_store_artifact(ControlPlaneRaftWalReplayConfig {
+                base: &ControlPlaneRaftLogStoreRestartArtifact::default(),
+                replay_offset: 0,
+            })
             .expect("WAL file replay should succeed");
         let expected = ControlPlaneRaftLogStoreRestartArtifact::default()
             .replay_wal_records(&records)
@@ -11618,7 +11649,7 @@ mod tests {
     fn control_plane_raft_restart_artifact_replays_wal_after_checkpoint_offset() {
         let tmp = test_util::tempdir();
         let wal_path = tmp.path().join("raft.wal");
-        let wal = ControlPlaneRaftWalFile::new(&wal_path, "test-cluster", 1);
+        let wal = test_raft_wal_file(&wal_path, "test-cluster", 1);
 
         wal.append_record(&ControlPlaneRaftWalRecord::SaveVote(Vote::<
             ControlPlaneRaftLeaderId,
@@ -11647,7 +11678,7 @@ mod tests {
         .expect("post-checkpoint WAL append should succeed");
 
         let (restored_log_store, restored_state_machine) = artifact
-            .restore_with_wal_file(ControlPlaneRaftWalFile::new(&wal_path, "test-cluster", 1))
+            .restore_with_wal_file(test_raft_wal_file(&wal_path, "test-cluster", 1))
             .expect("artifact plus post-checkpoint WAL should restore");
         assert_eq!(
             restored_log_store.persisted_vote().unwrap(),
@@ -11660,7 +11691,7 @@ mod tests {
     fn control_plane_raft_wal_compaction_preserves_checkpoint_suffix() {
         let tmp = test_util::tempdir();
         let wal_path = tmp.path().join("raft.wal");
-        let wal = ControlPlaneRaftWalFile::new(&wal_path, "test-cluster", 1);
+        let wal = test_raft_wal_file(&wal_path, "test-cluster", 1);
 
         let checkpoint_vote = Vote::<ControlPlaneRaftLeaderId>::new_committed(3, 1);
         wal.append_record(&ControlPlaneRaftWalRecord::SaveVote(checkpoint_vote))
@@ -11702,7 +11733,7 @@ mod tests {
         );
 
         let (restored_log_store, restored_state_machine) = checkpoint_artifact
-            .restore_with_wal_file(ControlPlaneRaftWalFile::new(&wal_path, "test-cluster", 1))
+            .restore_with_wal_file(test_raft_wal_file(&wal_path, "test-cluster", 1))
             .expect("checkpoint artifact should restore with compacted WAL suffix");
         assert_eq!(
             restored_log_store.persisted_vote().unwrap(),
@@ -11716,7 +11747,7 @@ mod tests {
         ControlPlaneRaftTypeConfig::run(async {
             let tmp = test_util::tempdir();
             let wal_path = tmp.path().join("raft.wal");
-            let wal = ControlPlaneRaftWalFile::new(&wal_path, "test-cluster", 1);
+            let wal = test_raft_wal_file(&wal_path, "test-cluster", 1);
             let mut log_store = ControlPlaneRaftLogStore::from_restart_artifact_with_wal_file(
                 ControlPlaneRaftLogStoreRestartArtifact::default(),
                 wal.clone(),
@@ -11750,7 +11781,7 @@ mod tests {
             let tmp = test_util::tempdir();
             let artifact_path = tmp.path().join("raft.state");
             let wal_path = tmp.path().join("raft.wal");
-            let wal = ControlPlaneRaftWalFile::new(&wal_path, "test-cluster", 1);
+            let wal = test_raft_wal_file(&wal_path, "test-cluster", 1);
             let log_store = ControlPlaneRaftLogStore::from_restart_artifact_with_wal_file(
                 ControlPlaneRaftLogStoreRestartArtifact::default(),
                 wal.clone(),
@@ -11799,12 +11830,19 @@ mod tests {
             );
             let status = authority.status().await.unwrap();
             assert_eq!(
-                status.durable_wal_base_offset(),
+                status
+                    .durable_wal_offsets()
+                    .map(ControlPlaneRaftWalOffsets::base_offset),
                 Some(artifact.wal_replay_offset)
             );
-            assert_eq!(status.durable_wal_clean_len(), Some(compacted_clean_len));
+            assert_eq!(
+                status
+                    .durable_wal_offsets()
+                    .map(ControlPlaneRaftWalOffsets::clean_len),
+                Some(compacted_clean_len)
+            );
             artifact
-                .restore_with_wal_file(ControlPlaneRaftWalFile::new(&wal_path, "test-cluster", 1))
+                .restore_with_wal_file(test_raft_wal_file(&wal_path, "test-cluster", 1))
                 .expect("checkpoint artifact should restore after WAL compaction");
 
             authority.shutdown().await.unwrap();
@@ -11814,7 +11852,7 @@ mod tests {
     #[test]
     fn control_plane_raft_wal_file_missing_is_empty_replay() {
         let tmp = test_util::tempdir();
-        let wal = ControlPlaneRaftWalFile::new(tmp.path().join("missing.wal"), "test-cluster", 1);
+        let wal = test_raft_wal_file(tmp.path().join("missing.wal"), "test-cluster", 1);
         let base = ControlPlaneRaftLogStoreRestartArtifact {
             vote: Some(Vote::<ControlPlaneRaftLeaderId>::new_committed(3, 1)),
             entries: vec![bootstrap_membership_entry(1)],
@@ -11822,7 +11860,10 @@ mod tests {
         };
 
         let replayed = wal
-            .replay_log_store_artifact(&base)
+            .replay_log_store_artifact(ControlPlaneRaftWalReplayConfig {
+                base: &base,
+                replay_offset: 0,
+            })
             .expect("missing WAL should replay as empty");
         assert_eq!(replayed, base);
     }
@@ -11831,16 +11872,19 @@ mod tests {
     fn control_plane_raft_wal_file_rejects_identity_mismatch() {
         let tmp = test_util::tempdir();
         let path = tmp.path().join("raft.wal");
-        let writer = ControlPlaneRaftWalFile::new(&path, "other-cluster", 1);
+        let writer = test_raft_wal_file(&path, "other-cluster", 1);
         writer
             .append_record(&ControlPlaneRaftWalRecord::Append(vec![
                 bootstrap_membership_entry(1),
             ]))
             .expect("WAL append should succeed");
 
-        let reader = ControlPlaneRaftWalFile::new(&path, "test-cluster", 1);
+        let reader = test_raft_wal_file(&path, "test-cluster", 1);
         assert_error_contains(
-            reader.replay_log_store_artifact(&ControlPlaneRaftLogStoreRestartArtifact::default()),
+            reader.replay_log_store_artifact(ControlPlaneRaftWalReplayConfig {
+                base: &ControlPlaneRaftLogStoreRestartArtifact::default(),
+                replay_offset: 0,
+            }),
             "control-plane OpenRaft WAL frame belongs to cluster",
         );
     }
@@ -11849,7 +11893,7 @@ mod tests {
     fn control_plane_raft_wal_file_rejects_corrupt_middle_frame() {
         let tmp = test_util::tempdir();
         let path = tmp.path().join("raft.wal");
-        let wal = ControlPlaneRaftWalFile::new(&path, "test-cluster", 1);
+        let wal = test_raft_wal_file(&path, "test-cluster", 1);
         for record in [
             ControlPlaneRaftWalRecord::Append(vec![bootstrap_membership_entry(1)]),
             ControlPlaneRaftWalRecord::SaveVote(Vote::<ControlPlaneRaftLeaderId>::new_committed(
@@ -11868,7 +11912,10 @@ mod tests {
         fs::write(&path, &bytes).unwrap();
 
         assert_error_contains(
-            wal.replay_log_store_artifact(&ControlPlaneRaftLogStoreRestartArtifact::default()),
+            wal.replay_log_store_artifact(ControlPlaneRaftWalReplayConfig {
+                base: &ControlPlaneRaftLogStoreRestartArtifact::default(),
+                replay_offset: 0,
+            }),
             "control-plane OpenRaft WAL frame checksum mismatch",
         );
     }
@@ -11878,7 +11925,7 @@ mod tests {
         ControlPlaneRaftTypeConfig::run(async {
             let tmp = test_util::tempdir();
             let path = tmp.path().join("raft.wal");
-            let wal = ControlPlaneRaftWalFile::new(&path, "test-cluster", 1);
+            let wal = test_raft_wal_file(&path, "test-cluster", 1);
             let log_store = ControlPlaneRaftLogStore::from_restart_artifact_with_wal_file(
                 ControlPlaneRaftLogStoreRestartArtifact::default(),
                 wal.clone(),
@@ -11907,9 +11954,16 @@ mod tests {
                 .expect("WAL status should report offsets without decoding frames")
                 .durability;
             assert!(status.wal_backed);
-            assert_eq!(status.wal_base_offset, Some(0));
             assert_eq!(
-                status.wal_clean_len,
+                status
+                    .wal_offsets
+                    .map(ControlPlaneRaftWalOffsets::base_offset),
+                Some(0)
+            );
+            assert_eq!(
+                status
+                    .wal_offsets
+                    .map(ControlPlaneRaftWalOffsets::clean_len),
                 Some(
                     u64::try_from(bytes.len() - ControlPlaneRaftWalFile::file_header_len())
                         .expect("test WAL length should fit u64")
@@ -11918,7 +11972,10 @@ mod tests {
             assert_eq!(status.wal_poisoned, None);
 
             assert_error_contains(
-                wal.replay_log_store_artifact(&ControlPlaneRaftLogStoreRestartArtifact::default()),
+                wal.replay_log_store_artifact(ControlPlaneRaftWalReplayConfig {
+                    base: &ControlPlaneRaftLogStoreRestartArtifact::default(),
+                    replay_offset: 0,
+                }),
                 "control-plane OpenRaft WAL frame checksum mismatch",
             );
         });
@@ -11928,7 +11985,7 @@ mod tests {
     fn control_plane_raft_wal_file_truncates_torn_final_frame() {
         let tmp = test_util::tempdir();
         let path = tmp.path().join("raft.wal");
-        let wal = ControlPlaneRaftWalFile::new(&path, "test-cluster", 1);
+        let wal = test_raft_wal_file(&path, "test-cluster", 1);
         let retained_record =
             ControlPlaneRaftWalRecord::Append(vec![bootstrap_membership_entry(1)]);
         let torn_record = ControlPlaneRaftWalRecord::SaveVote(
@@ -11946,7 +12003,10 @@ mod tests {
         drop(file);
 
         let replayed = wal
-            .replay_log_store_artifact(&ControlPlaneRaftLogStoreRestartArtifact::default())
+            .replay_log_store_artifact(ControlPlaneRaftWalReplayConfig {
+                base: &ControlPlaneRaftLogStoreRestartArtifact::default(),
+                replay_offset: 0,
+            })
             .expect("WAL replay should discard torn final frame");
         let expected = ControlPlaneRaftLogStoreRestartArtifact::default()
             .replay_wal_records(&[retained_record])
@@ -11959,7 +12019,7 @@ mod tests {
     fn control_plane_raft_wal_backed_log_store_persists_live_mutations_for_replay() {
         ControlPlaneRaftTypeConfig::run(async {
             let tmp = test_util::tempdir();
-            let wal = ControlPlaneRaftWalFile::new(tmp.path().join("raft.wal"), "test-cluster", 1);
+            let wal = test_raft_wal_file(tmp.path().join("raft.wal"), "test-cluster", 1);
             let base = ControlPlaneRaftLogStoreRestartArtifact::default();
             let mut live = ControlPlaneRaftLogStore::from_restart_artifact_with_wal_file(
                 base.clone(),
@@ -12006,9 +12066,14 @@ mod tests {
                 .expect("WAL-backed log store status should be observable")
                 .durability;
             assert!(durability.wal_backed);
-            assert_eq!(durability.wal_base_offset, Some(0));
+            assert_eq!(
+                durability
+                    .wal_offsets
+                    .map(ControlPlaneRaftWalOffsets::base_offset),
+                Some(0)
+            );
             assert!(
-                durability.wal_clean_len.is_some_and(|len| len > 0),
+                durability.wal_offsets.map(ControlPlaneRaftWalOffsets::clean_len).is_some_and(|len| len > 0),
                 "WAL-backed log store should report a positive clean WAL length after mutations: {durability:?}"
             );
             assert_eq!(durability.wal_poisoned, None);
@@ -12022,7 +12087,7 @@ mod tests {
             let parent = tmp.path().join("wal-parent");
             fs::create_dir(&parent).unwrap();
             let wal_path = parent.join("raft.wal");
-            let wal = ControlPlaneRaftWalFile::new(&wal_path, "test-cluster", 1);
+            let wal = test_raft_wal_file(&wal_path, "test-cluster", 1);
             let mut store = ControlPlaneRaftLogStore::from_restart_artifact_with_wal_file(
                 ControlPlaneRaftLogStoreRestartArtifact::default(),
                 wal,
@@ -12054,7 +12119,7 @@ mod tests {
         ControlPlaneRaftTypeConfig::run(async {
             let tmp = test_util::tempdir();
             let wal_path = tmp.path().join("raft.wal");
-            let wal = ControlPlaneRaftWalFile::new(&wal_path, "test-cluster", 1);
+            let wal = test_raft_wal_file(&wal_path, "test-cluster", 1);
             let mut store = ControlPlaneRaftLogStore::from_restart_artifact_with_wal_file(
                 ControlPlaneRaftLogStoreRestartArtifact::default(),
                 wal,
@@ -12090,7 +12155,7 @@ mod tests {
         ControlPlaneRaftTypeConfig::run(async {
             let tmp = test_util::tempdir();
             let wal_path = tmp.path().join("raft.wal");
-            let wal = ControlPlaneRaftWalFile::new(&wal_path, "test-cluster", 1);
+            let wal = test_raft_wal_file(&wal_path, "test-cluster", 1);
             let base = ControlPlaneRaftLogStoreRestartArtifact::default();
             let mut store = ControlPlaneRaftLogStore::from_restart_artifact_with_wal_file(
                 base.clone(),
@@ -12145,8 +12210,18 @@ mod tests {
                 .expect("poisoned WAL-backed log store status should remain observable")
                 .durability;
             assert!(durability.wal_backed);
-            assert_eq!(durability.wal_base_offset, None);
-            assert_eq!(durability.wal_clean_len, None);
+            assert_eq!(
+                durability
+                    .wal_offsets
+                    .map(ControlPlaneRaftWalOffsets::base_offset),
+                None
+            );
+            assert_eq!(
+                durability
+                    .wal_offsets
+                    .map(ControlPlaneRaftWalOffsets::clean_len),
+                None
+            );
             assert!(
                 durability
                     .wal_poisoned
@@ -12162,7 +12237,7 @@ mod tests {
         ControlPlaneRaftTypeConfig::run(async {
             let tmp = test_util::tempdir();
             let wal_path = tmp.path().join("raft.wal");
-            let wal = ControlPlaneRaftWalFile::new(&wal_path, "test-cluster", 1);
+            let wal = test_raft_wal_file(&wal_path, "test-cluster", 1);
             let base = ControlPlaneRaftLogStoreRestartArtifact::default();
             let mut store = ControlPlaneRaftLogStore::from_restart_artifact_with_wal_file(
                 base.clone(),
@@ -12231,7 +12306,7 @@ mod tests {
             let wal_path = tmp.path().join("raft.wal");
             let log_store = ControlPlaneRaftLogStore::from_restart_artifact_with_wal_file(
                 ControlPlaneRaftLogStoreRestartArtifact::default(),
-                ControlPlaneRaftWalFile::new(&wal_path, "test-cluster", 1),
+                test_raft_wal_file(&wal_path, "test-cluster", 1),
             )
             .expect("WAL-backed log store should initialize");
             let raft = Raft::<ControlPlaneRaftTypeConfig, ControlPlaneRaftStateMachine>::new(
@@ -12248,8 +12323,18 @@ mod tests {
 
             let initial_status = authority.status().await.unwrap();
             assert!(initial_status.durable_wal_backed());
-            assert_eq!(initial_status.durable_wal_base_offset(), Some(0));
-            assert_eq!(initial_status.durable_wal_clean_len(), Some(0));
+            assert_eq!(
+                initial_status
+                    .durable_wal_offsets()
+                    .map(ControlPlaneRaftWalOffsets::base_offset),
+                Some(0)
+            );
+            assert_eq!(
+                initial_status
+                    .durable_wal_offsets()
+                    .map(ControlPlaneRaftWalOffsets::clean_len),
+                Some(0)
+            );
             assert_eq!(initial_status.durable_wal_poisoned(), None);
             assert_eq!(initial_status.durable_last_vote(), None);
             assert_eq!(initial_status.durable_last_log_id(), None);
@@ -12281,9 +12366,14 @@ mod tests {
 
             let status = authority.status().await.unwrap();
             assert!(status.durable_wal_backed());
-            assert_eq!(status.durable_wal_base_offset(), Some(0));
+            assert_eq!(
+                status
+                    .durable_wal_offsets()
+                    .map(ControlPlaneRaftWalOffsets::base_offset),
+                Some(0)
+            );
             assert!(
-                status.durable_wal_clean_len().is_some_and(|len| len > 0),
+                status.durable_wal_offsets().map(ControlPlaneRaftWalOffsets::clean_len).is_some_and(|len| len > 0),
                 "WAL-backed authority status should report a positive clean WAL length after a durable mutation: {status:?}"
             );
             assert_eq!(status.durable_wal_poisoned(), None);
@@ -12310,8 +12400,18 @@ mod tests {
                 .await
                 .expect("authority status should remain available after WAL poison");
             assert!(poisoned_status.durable_wal_backed());
-            assert_eq!(poisoned_status.durable_wal_base_offset(), None);
-            assert_eq!(poisoned_status.durable_wal_clean_len(), None);
+            assert_eq!(
+                poisoned_status
+                    .durable_wal_offsets()
+                    .map(ControlPlaneRaftWalOffsets::base_offset),
+                None
+            );
+            assert_eq!(
+                poisoned_status
+                    .durable_wal_offsets()
+                    .map(ControlPlaneRaftWalOffsets::clean_len),
+                None
+            );
             assert!(
                 poisoned_status
                     .durable_wal_poisoned()
@@ -16848,7 +16948,8 @@ mod tests {
                 last_purged_log_id: Some(raft_log_id(3, 1, u64::MAX)),
                 ..Default::default()
             };
-            let mut store = ControlPlaneRaftLogStore::from_restart_artifact(artifact).unwrap();
+            let mut store =
+                ControlPlaneRaftLogStore::from_restart_artifact_in_memory(artifact).unwrap();
 
             let err = RaftLogStorage::append(
                 &mut store,
@@ -16963,7 +17064,8 @@ mod tests {
                 .unwrap();
 
             let artifact = store.export_restart_artifact().unwrap();
-            let mut restored = ControlPlaneRaftLogStore::from_restart_artifact(artifact).unwrap();
+            let mut restored =
+                ControlPlaneRaftLogStore::from_restart_artifact_in_memory(artifact).unwrap();
 
             assert_eq!(
                 RaftLogReader::read_vote(&mut restored).await.unwrap(),
@@ -18193,7 +18295,7 @@ mod tests {
             };
             artifact.store_durable_artifact(&path).unwrap();
 
-            let wal = ControlPlaneRaftWalFile::new(&wal_path, cluster_name, 1);
+            let wal = test_raft_wal_file(&wal_path, cluster_name, 1);
             wal.append_record(&ControlPlaneRaftWalRecord::Append(vec![
                 single_node_membership_entry(3, 1, 1),
             ]))
@@ -18612,9 +18714,10 @@ mod tests {
             entries: vec![blank_entry(3, 1, 2)],
             ..Default::default()
         };
-        let err =
-            ControlPlaneRaftLogStore::from_restart_artifact(artifact_with_entry_at_purged_boundary)
-                .unwrap_err();
+        let err = ControlPlaneRaftLogStore::from_restart_artifact_in_memory(
+            artifact_with_entry_at_purged_boundary,
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("expected 3"));
 
         let artifact_with_log_hole = ControlPlaneRaftLogStoreRestartArtifact {
@@ -18625,8 +18728,8 @@ mod tests {
             ],
             ..Default::default()
         };
-        let err =
-            ControlPlaneRaftLogStore::from_restart_artifact(artifact_with_log_hole).unwrap_err();
+        let err = ControlPlaneRaftLogStore::from_restart_artifact_in_memory(artifact_with_log_hole)
+            .unwrap_err();
         assert!(err.to_string().contains("log hole at index 2"));
 
         let artifact_with_future_committed = ControlPlaneRaftLogStoreRestartArtifact {
@@ -18638,8 +18741,10 @@ mod tests {
             ],
             ..Default::default()
         };
-        let err = ControlPlaneRaftLogStore::from_restart_artifact(artifact_with_future_committed)
-            .unwrap_err();
+        let err = ControlPlaneRaftLogStore::from_restart_artifact_in_memory(
+            artifact_with_future_committed,
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("current last log id"));
 
         let artifact_with_mismatched_committed = ControlPlaneRaftLogStoreRestartArtifact {
@@ -18651,9 +18756,10 @@ mod tests {
             ],
             ..Default::default()
         };
-        let err =
-            ControlPlaneRaftLogStore::from_restart_artifact(artifact_with_mismatched_committed)
-                .unwrap_err();
+        let err = ControlPlaneRaftLogStore::from_restart_artifact_in_memory(
+            artifact_with_mismatched_committed,
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("mismatched log id"));
 
         let artifact_with_committed_before_purge = ControlPlaneRaftLogStoreRestartArtifact {
@@ -18662,9 +18768,10 @@ mod tests {
             entries: vec![blank_entry(3, 1, 3)],
             ..Default::default()
         };
-        let err =
-            ControlPlaneRaftLogStore::from_restart_artifact(artifact_with_committed_before_purge)
-                .unwrap_err();
+        let err = ControlPlaneRaftLogStore::from_restart_artifact_in_memory(
+            artifact_with_committed_before_purge,
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("before purged boundary"));
 
         let artifact_with_missing_vote = ControlPlaneRaftLogStoreRestartArtifact {
@@ -18676,8 +18783,9 @@ mod tests {
             ],
             ..Default::default()
         };
-        let err = ControlPlaneRaftLogStore::from_restart_artifact(artifact_with_missing_vote)
-            .unwrap_err();
+        let err =
+            ControlPlaneRaftLogStore::from_restart_artifact_in_memory(artifact_with_missing_vote)
+                .unwrap_err();
         assert!(err.to_string().contains("missing vote state"));
 
         let artifact_with_stale_vote = ControlPlaneRaftLogStoreRestartArtifact {
@@ -18691,7 +18799,8 @@ mod tests {
             ..Default::default()
         };
         let err =
-            ControlPlaneRaftLogStore::from_restart_artifact(artifact_with_stale_vote).unwrap_err();
+            ControlPlaneRaftLogStore::from_restart_artifact_in_memory(artifact_with_stale_vote)
+                .unwrap_err();
         assert!(err.to_string().contains("does not cover"));
 
         let artifact_with_same_term_lower_node_vote = ControlPlaneRaftLogStoreRestartArtifact {
@@ -18704,7 +18813,7 @@ mod tests {
             ],
             ..Default::default()
         };
-        let err = ControlPlaneRaftLogStore::from_restart_artifact(
+        let err = ControlPlaneRaftLogStore::from_restart_artifact_in_memory(
             artifact_with_same_term_lower_node_vote,
         )
         .unwrap_err();
