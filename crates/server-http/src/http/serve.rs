@@ -1002,6 +1002,29 @@ async fn handle(
 }
 
 #[cfg(any(test, feature = "local-debug-endpoints"))]
+#[cfg(test)]
+static SUPPRESS_LOCAL_DEBUG_FLIGHT_RECORDER_DUMP: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(any(test, feature = "local-debug-endpoints"))]
+#[cfg(test)]
+static LOCAL_DEBUG_FLIGHT_RECORDER_DUMP_CALLS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(any(test, feature = "local-debug-endpoints"))]
+fn dump_local_debug_flight_recorder() {
+    #[cfg(test)]
+    {
+        LOCAL_DEBUG_FLIGHT_RECORDER_DUMP_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if SUPPRESS_LOCAL_DEBUG_FLIGHT_RECORDER_DUMP.load(std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
+    }
+
+    observability::dump_flight_recorder_to_stderr("local-debug-endpoint");
+}
+
+#[cfg(any(test, feature = "local-debug-endpoints"))]
 fn local_debug_response(
     state: &Arc<ServerState>,
     method: &http::Method,
@@ -1025,7 +1048,7 @@ fn local_debug_response(
             })
         }
         (&http::Method::POST, "/__argmin/debug/flight-recorder/dump") => {
-            observability::dump_flight_recorder_to_stderr("local-debug-endpoint");
+            dump_local_debug_flight_recorder();
             Some(S3Response {
                 status_code: 204,
                 headers: Vec::new(),
@@ -4931,7 +4954,7 @@ mod tests {
     use super::*;
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream as StdTcpStream};
-    use std::panic::AssertUnwindSafe;
+    use std::panic::{self, AssertUnwindSafe};
     use std::sync::{
         atomic::{AtomicUsize, Ordering},
         Arc,
@@ -4987,11 +5010,20 @@ mod tests {
 
     #[test]
     fn segment_buffer_pool_recovers_from_poisoned_lock() {
+        static PANIC_HOOK_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _panic_hook_guard = PANIC_HOOK_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let previous_hook = panic::take_hook();
+        panic::set_hook(Box::new(|_| {}));
+
         let pool = SegmentBufferPool::new(4);
-        let _ = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        let poison_result = panic::catch_unwind(AssertUnwindSafe(|| {
             let _guard = pool.cached.lock().unwrap();
             panic!("poison segment buffer pool");
         }));
+        panic::set_hook(previous_hook);
+        assert!(poison_result.is_err());
 
         let mut buf = pool.checkout();
         buf.extend_from_slice(b"data");
@@ -5602,6 +5634,16 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn local_debug_flight_recorder_dump_endpoint_is_explicit_post_only() {
+        SUPPRESS_LOCAL_DEBUG_FLIGHT_RECORDER_DUMP.store(true, Ordering::SeqCst);
+        struct ResetFlightRecorderDumpSuppression;
+        impl Drop for ResetFlightRecorderDumpSuppression {
+            fn drop(&mut self) {
+                SUPPRESS_LOCAL_DEBUG_FLIGHT_RECORDER_DUMP.store(false, Ordering::SeqCst);
+            }
+        }
+        let _reset_suppression = ResetFlightRecorderDumpSuppression;
+        let dump_calls_before = LOCAL_DEBUG_FLIGHT_RECORDER_DUMP_CALLS.load(Ordering::SeqCst);
+
         let tmp = test_util::tempdir();
         let frontend = setup_frontend(tmp.path());
         let config = ServeConfig {
@@ -5624,6 +5666,10 @@ mod tests {
             .unwrap();
         let response = read_http_response(&mut stream, Duration::from_secs(3));
         assert!(response.starts_with("HTTP/1.1 404"), "{response}");
+        assert_eq!(
+            LOCAL_DEBUG_FLIGHT_RECORDER_DUMP_CALLS.load(Ordering::SeqCst),
+            dump_calls_before
+        );
 
         let mut stream = StdTcpStream::connect(&addr).unwrap();
         stream
@@ -5640,6 +5686,10 @@ mod tests {
             .unwrap();
         let response = read_http_response(&mut stream, Duration::from_secs(3));
         assert!(response.starts_with("HTTP/1.1 204"), "{response}");
+        assert_eq!(
+            LOCAL_DEBUG_FLIGHT_RECORDER_DUMP_CALLS.load(Ordering::SeqCst),
+            dump_calls_before + 1
+        );
     }
 
     fn response_body_complete(buf: &[u8], header_end: usize, headers: &str) -> bool {
