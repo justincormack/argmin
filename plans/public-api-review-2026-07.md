@@ -18,17 +18,16 @@ smaller per-crate items.
 
 ## Status
 
-In progress. A1-A10, S1-S4, S6, K1-K4, H1-H8, all of P1/P2, and the first two
-P3 items are marked done. A re-review on 2026-07-05 verified the closed items
-against the code (auth crate unit tests pass; storage/ec/placement cargo check
-clean): 38 of ~40 closed items are fully verified, two are partial (K1, H6 —
-reopened below), and the verification surfaced a set of new findings, mostly
-introduced by the fix work itself. All still-open items below were re-checked
-and remain valid; their line references have been updated in place to current
-HEAD where they had drifted.
+In progress. A1-A10, S1-S4, S6, K1-K4, H1-H8, all of P1/P2, the first two
+P3 items, and all re-review items RR1-RR16 are done. A verification pass on
+2026-07-06 confirmed all 16 RR fixes against the code (workspace
+`cargo check --all-targets` clean; auth crate 454 unit tests pass; targeted
+storage control-plane tests pass): the RR1 live bug is closed on every path,
+and the fixes left only the small residuals recorded in the verification
+subsection below (V1-V6).
 
 Remaining order of attack:
-1. The small fix-introduced items in the re-review section (RR3-RR16).
+1. The verification residuals below (V1-V6) — all small; V1/V2 first.
 2. The remaining pattern sweeps (P3 tail, P4-P6) and smaller items.
 
 ## Re-review 2026-07-05 — reopened and new items
@@ -271,6 +270,69 @@ Remaining order of attack:
   switching the copy helper to strict SigV4 percent encoding and adding direct
   regression coverage, and by replacing the three streaming-handler closures
   with the shared `error_response` helper.
+
+### Verification 2026-07-06 — RR fixes confirmed; residuals
+
+All 16 RR items were adversarially verified against HEAD 52d7da15: fixes
+landed as described, workspace `cargo check --all-targets` is clean, auth
+crate tests pass (454), and the targeted control-plane peering tests pass.
+RR1's reject paths in `from_header_iter` are defense-in-depth (every current
+HTTP path filters or validates first), which is the intended layering. Small
+residuals found by the verification, none release-blocking:
+
+- [ ] **V1. `from_header_iter` still handles two sibling fields the pre-RR1
+  way.** An unparseable `x-amz-checksum-type` is silently dropped
+  (`system_metadata.rs:176`, `ChecksumType::parse` → `None`, no error), and
+  two different concrete `x-amz-checksum-*` value headers with no literal
+  header resolve last-one-wins, order-dependently (:178-182). Both are
+  masked by HTTP-layer validation/filtering today — exactly the masking
+  shape RR1 removed for the algorithm field. Extend the fail-closed
+  treatment to `checksum_type` and to conflicting value headers.
+
+- [ ] **V2. MPU default-checksum asymmetry unpinned.** Unconfigured
+  CompleteMultipartUpload with no checksum header stores no checksum at all,
+  while PutObject with no checksum headers stores default CRC64NVME
+  (RR2's own oracle). AWS's default-checksum rule for the no-header MPU case
+  is not oracle-tested; pin it and align if AWS stores a default there too.
+
+- [ ] **V3. Third message/shape variant for unsupported checksum algorithm.**
+  The new core rejection emits plain `InvalidRequest` with
+  `"invalid checksum algorithm: {value}"` (`system_metadata.rs:171`) while
+  the HTTP layer's equivalent is HostId-shaped `InvalidRequestHostId` with
+  the AWS message (`mod.rs:5363`). Unreachable via HTTP today (callers
+  filter first); align the message/shape so a future unfiltered caller
+  matches AWS.
+
+- [ ] **V4. `RouteMapValidity::regresses_to` is now dead, and the rejection
+  error name does double duty.** RR14's unconditional unbounded-candidate
+  rejection subsumes the `regresses_to` disjunct at both install paths
+  (`cluster.rs:1138-1143`, `storage_node_server.rs:1789-1794`) — the helper
+  can never return true from a live call site. Also, an unbounded candidate
+  at a higher epoch is reported as `ValidityRegression`/
+  `RuntimeRefreshValidityRegression { candidate: None }`, which is not a
+  regression relative to current. Remove the dead disjunct/helper (or keep
+  and document as belt-and-braces) and name the unbounded-candidate
+  rejection distinctly.
+
+- [ ] **V5. Security-token check ordering differs by auth path**
+  (pre-existing, now partially pinned). Header auth checks the token after
+  signature verification (`request.rs:319` vs `:329-333`); presigned and
+  POST check it before (`request.rs:506` vs `:550`; `post.rs:119`). A
+  bogus-signature-plus-token request gets `SignatureDoesNotMatch` on header
+  auth but `InvalidToken` on presigned/POST. The presigned ordering is
+  pinned by a local unit test only; the AWS oracle covers the valid-signature
+  case. AWS-pin the bogus-signature ordering per path, or align the paths.
+
+- [ ] **V6. Cosmetic.** `until_ms_saturating` clamps `u64::MAX` silently
+  (`types.rs:2612-2618`) where RR11 debug-asserts at the atomic boundary —
+  add the same debug_assert for consistency; checksum header-name filter
+  literals duplicated between `parse_put_object_request_metadata`
+  (`mod.rs:426`) and `parse_request_metadata_without_checksum_headers`
+  (:436-440); `LifecycleConfigError::InvalidRequestHostId` leaks an
+  HTTP-response-shape concern into s3-types (clean typed mechanism,
+  awkward name). Historical note, not actionable: server-http test-target
+  compilation was broken in the 4c01bac9..4d05ea01 commit window (fixed by
+  a drive-by in 496d5f6e; already fine at HEAD).
 
 ## Bugs — auth (security)
 
