@@ -6008,7 +6008,9 @@ fn complete_multipart_bad_part_checksum_rejected() {
 }
 
 #[test]
-fn complete_multipart_no_checksum_returns_none() {
+fn complete_multipart_no_checksum_defaults_crc64nvme() {
+    use base64::Engine;
+
     let tmp = test_util::tempdir();
     let coord = setup_coordinator(tmp.path());
     coord
@@ -6017,6 +6019,8 @@ fn complete_multipart_no_checksum_returns_none() {
 
     let big = vec![0u8; 5 * 1024 * 1024];
     let small = b"last";
+    let mut full_data = big.clone();
+    full_data.extend_from_slice(small);
     let (upload_id, parts) =
         create_upload_with_parts(&coord, "bucket", "key", &[(1, &big), (2, small)]);
 
@@ -6040,9 +6044,14 @@ fn complete_multipart_no_checksum_returns_none() {
         })
         .unwrap();
 
-    assert_eq!(result.checksum_algorithm, None);
-    assert_eq!(result.checksum_type, None);
-    assert_eq!(result.checksum_value, None);
+    let expected = base64::engine::general_purpose::STANDARD
+        .encode(checksum::crc64::checksum(&full_data).to_be_bytes());
+    assert_eq!(
+        result.checksum_algorithm,
+        Some(ChecksumAlgorithm::Crc64nvme)
+    );
+    assert_eq!(result.checksum_type, Some(ChecksumType::FullObject));
+    assert_eq!(result.checksum_value, Some(expected));
 }
 
 #[test]
@@ -6077,9 +6086,14 @@ fn complete_multipart_ignores_legacy_object_checksum_header_without_upload_algor
         })
         .unwrap();
 
-    assert_eq!(result.checksum_algorithm, None);
-    assert_eq!(result.checksum_type, None);
-    assert_eq!(result.checksum_value, None);
+    let expected = base64::engine::general_purpose::STANDARD
+        .encode(checksum::crc64::checksum(b"only part").to_be_bytes());
+    assert_eq!(
+        result.checksum_algorithm,
+        Some(ChecksumAlgorithm::Crc64nvme)
+    );
+    assert_eq!(result.checksum_type, Some(ChecksumType::FullObject));
+    assert_eq!(result.checksum_value, Some(expected));
 }
 
 #[test]
@@ -6445,6 +6459,69 @@ fn complete_multipart_sse_c_checksum_requires_headers() {
         ),
         "expected ChecksumDigestMismatch when SSE-C checksum finalize omits headers, got {err:?}"
     );
+}
+
+#[test]
+fn complete_multipart_sse_c_without_checksum_allows_missing_headers() {
+    let tmp = test_util::tempdir();
+    let coord = setup_coordinator_with_sse_c(tmp.path());
+    coord
+        .create_bucket_for_owner("default-owner", "bucket", false)
+        .unwrap();
+    enable_bucket_sse_c_test(&coord, "bucket", test_requester(), None).unwrap();
+
+    let sse_customer = test_sse_customer_request();
+    let create = coord
+        .create_multipart_upload(&CreateMultipartUploadRequest {
+            object: object_request("bucket", "key", test_requester()),
+            metadata: &MetadataBlob::new(),
+            system_metadata: &SystemMetadata::EMPTY,
+            tags: None,
+            checksum: None,
+            acl: NO_PUT_OBJECT_ACL.into(),
+            encryption: WriteEncryptionRequest::sse_customer(&sse_customer),
+            object_lock: ObjectLockState::default(),
+            policy_context: PutObjectPolicyContext::default(),
+        })
+        .unwrap();
+
+    let result = test_helpers::upload_part(
+        &coord,
+        &UploadPartRequest {
+            upload: multipart_object_request("bucket", "key", &create.upload_id, test_requester()),
+            part_number: 1,
+            data: b"secret",
+            claimed_checksum: None,
+            sse_customer: Some(&sse_customer),
+        },
+    )
+    .unwrap();
+    let complete_parts = [CompletePart {
+        part_number: 1,
+        etag: result.etag,
+        checksum: None,
+    }];
+
+    let complete = coord
+        .complete_multipart_upload(&CompleteMultipartUploadRequest {
+            upload: multipart_object_request_with_expected_owner(
+                "bucket",
+                "key",
+                &create.upload_id,
+                test_requester(),
+                None,
+            ),
+            parts: &complete_parts,
+            claimed_checksum: None,
+            expected_object_size: None,
+            cond: &WriteCondition::default(),
+            sse_customer: None,
+        })
+        .unwrap();
+
+    assert_eq!(complete.checksum_algorithm, None);
+    assert_eq!(complete.checksum_type, None);
+    assert_eq!(complete.checksum_value, None);
 }
 
 // ── Streaming upload session tests ──────────────────────────────────

@@ -225,6 +225,15 @@ impl ActiveWriteEncryption {
         matches!(self, Self::SseCustomer { .. })
     }
 
+    pub(super) fn can_store_checksum_metadata(&self) -> bool {
+        matches!(
+            self,
+            Self::None
+                | Self::SseCustomer { write: Some(_), .. }
+                | Self::Managed { write: Some(_), .. }
+        )
+    }
+
     pub(super) fn object_encryption(&self) -> ObjectEncryption {
         match self {
             Self::None => ObjectEncryption::None,

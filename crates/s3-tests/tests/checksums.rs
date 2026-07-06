@@ -272,6 +272,17 @@ async fn raw_put_object_with_checksum_headers(
     )
 }
 
+fn raw_upload_part_url(bucket: &str, key: &str, upload_id: &str, part_number: u32) -> String {
+    let encoded_upload_id: String =
+        url::form_urlencoded::byte_serialize(upload_id.as_bytes()).collect();
+    format!(
+        "{}/{}/{}?partNumber={part_number}&uploadId={encoded_upload_id}",
+        CTX.endpoint(),
+        bucket,
+        key
+    )
+}
+
 async fn raw_put_object_with_duplicate_signed_checksum_headers(
     bucket: &str,
     key: &str,
@@ -643,6 +654,56 @@ fn test_put_object_without_checksum_headers_defaults_crc64nvme() {
             response_header(&response.headers, "x-amz-checksum-type"),
             Some("FULL_OBJECT")
         );
+        assert_stored_crc64nvme_full_object_checksum(&bucket, key, &expected).await;
+        cleanup(&bucket, &[key]).await;
+    });
+}
+
+#[test]
+fn test_complete_multipart_without_checksum_headers_defaults_crc64nvme() {
+    s3_tests::run(async {
+        let bucket = setup_bucket().await;
+        let key = "mpu-without-checksum-headers-defaults-crc64nvme";
+        let body = b"multipart default crc64nvme oracle";
+
+        let create_url = s3_tests::object_url(CTX.endpoint(), &bucket, key, Some("uploads"));
+        let create =
+            send_signed_request("POST", &create_url, &[], std::iter::empty::<(&str, &str)>());
+        assert_eq!(create.status, 200, "create response: {create:?}");
+        assert_eq!(
+            response_header(&create.headers, "x-amz-checksum-algorithm"),
+            None
+        );
+        assert_eq!(
+            response_header(&create.headers, "x-amz-checksum-type"),
+            None
+        );
+        let upload_id = xml_text(&create.body, "UploadId").expect("UploadId in response");
+
+        let part_url = raw_upload_part_url(&bucket, key, upload_id, 1);
+        let part = send_signed_request("PUT", &part_url, body, std::iter::empty::<(&str, &str)>());
+        assert_eq!(part.status, 200, "upload part response: {part:?}");
+        let etag = response_header(&part.headers, "etag").expect("UploadPart ETag");
+
+        let complete_url = multipart_complete_url(&bucket, key, upload_id);
+        let complete_body = format!(
+            "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{etag}</ETag></Part></CompleteMultipartUpload>"
+        );
+        let expected = checksum_base64(LocalChecksumAlgorithm::Crc64nvme, body);
+        let (status, response_body) =
+            send_signed_post(&complete_url, complete_body.as_bytes(), &[]);
+        assert_eq!(status, 200, "complete response body: {response_body}");
+        assert!(
+            response_body.contains(&format!(
+                "<ChecksumCRC64NVME>{expected}</ChecksumCRC64NVME>"
+            )),
+            "CompleteMultipartUpload response missing default CRC64NVME checksum {expected}: {response_body}"
+        );
+        assert!(
+            response_body.contains("<ChecksumType>FULL_OBJECT</ChecksumType>"),
+            "CompleteMultipartUpload response missing FULL_OBJECT checksum type: {response_body}"
+        );
+
         assert_stored_crc64nvme_full_object_checksum(&bucket, key, &expected).await;
         cleanup(&bucket, &[key]).await;
     });

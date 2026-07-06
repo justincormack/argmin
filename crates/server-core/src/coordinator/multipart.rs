@@ -542,13 +542,17 @@ impl Coordinator {
             }
 
             let checksum_config = upload.checksum;
-            let stores_unconfigured_crc64nvme_checksum = checksum_config.is_none()
+            let stores_unconfigured_crc64nvme_checksum_claim = checksum_config.is_none()
                 && claimed_checksum.is_some_and(|claimed| {
                     claimed
                         .algorithm()
                         .stores_unconfigured_complete_multipart_header()
                 });
-            let effective_checksum_config = if stores_unconfigured_crc64nvme_checksum {
+            let stores_default_crc64nvme_checksum = checksum_config.is_none()
+                && multipart_write_encryption.can_store_checksum_metadata();
+            let effective_checksum_config = if stores_unconfigured_crc64nvme_checksum_claim
+                || stores_default_crc64nvme_checksum
+            {
                 Some(MultipartChecksumConfig::new(
                     ChecksumAlgorithm::Crc64nvme,
                     Some(ChecksumType::FullObject),
@@ -712,7 +716,7 @@ impl Coordinator {
                     _ => {}
                 }
                 claimed.validate_complete_multipart_header_value()?;
-                if !stores_unconfigured_crc64nvme_checksum {
+                if checksum_config.is_some() {
                     if let Some(ref computed) = checksum_value {
                         if computed != claimed.encoded_value() {
                             return Err(ServerError::ChecksumDigestMismatch {

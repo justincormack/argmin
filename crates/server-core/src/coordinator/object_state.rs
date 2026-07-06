@@ -53,13 +53,9 @@ impl Coordinator {
                 checksum.value(),
             );
         }
-        let can_store_checksum = matches!(
-            write_encryption,
-            ActiveWriteEncryption::None
-                | ActiveWriteEncryption::SseCustomer { write: Some(_), .. }
-                | ActiveWriteEncryption::Managed { write: Some(_), .. }
-        );
-        if normalized_system_metadata.checksum().is_some() || !can_store_checksum {
+        if normalized_system_metadata.checksum().is_some()
+            || !write_encryption.can_store_checksum_metadata()
+        {
             return normalized_system_metadata;
         }
         use base64::Engine;

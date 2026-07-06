@@ -289,11 +289,14 @@ residuals found by the verification, none release-blocking:
   shape RR1 removed for the algorithm field. Extend the fail-closed
   treatment to `checksum_type` and to conflicting value headers.
 
-- [ ] **V2. MPU default-checksum asymmetry unpinned.** Unconfigured
-  CompleteMultipartUpload with no checksum header stores no checksum at all,
-  while PutObject with no checksum headers stores default CRC64NVME
-  (RR2's own oracle). AWS's default-checksum rule for the no-header MPU case
-  is not oracle-tested; pin it and align if AWS stores a default there too.
+- [x] **V2. MPU default-checksum asymmetry unpinned.** Unconfigured
+  CompleteMultipartUpload with no checksum header used to store no checksum
+  at all, while PutObject with no checksum headers stores default CRC64NVME
+  (RR2's own oracle). Fixed by adding the AWS-facing
+  `test_complete_multipart_without_checksum_headers_defaults_crc64nvme`
+  oracle, which confirms AWS returns and stores CRC64NVME/FULL_OBJECT for
+  this case, and by aligning local CompleteMultipartUpload to store the same
+  default checksum while preserving AWS's ignored-legacy-header behavior.
 
 - [ ] **V3. Third message/shape variant for unsupported checksum algorithm.**
   The new core rejection emits plain `InvalidRequest` with
