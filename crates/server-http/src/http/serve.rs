@@ -5753,17 +5753,16 @@ mod tests {
     }
 
     fn read_http_response(stream: &mut StdTcpStream, timeout: Duration) -> String {
-        read_http_response_with_header_stop(stream, timeout, None)
+        read_http_response_with_writer_stop(stream, timeout, None)
     }
 
-    fn read_http_response_with_header_stop(
+    fn read_http_response_with_writer_stop(
         stream: &mut StdTcpStream,
         timeout: Duration,
         stop_writer: Option<&AtomicBool>,
     ) -> String {
         let mut buf = Vec::with_capacity(8192);
         let mut tmp = [0u8; 4096];
-        let mut headers_seen = false;
         stream
             .set_read_timeout(Some(timeout))
             .expect("set read timeout");
@@ -5779,14 +5778,11 @@ mod tests {
 
             let text = String::from_utf8_lossy(&buf);
             if let Some(header_end) = text.find("\r\n\r\n") {
-                if !headers_seen {
-                    headers_seen = true;
+                let headers = &text[..header_end];
+                if response_body_complete(&buf, header_end, headers) {
                     if let Some(stop_writer) = stop_writer {
                         stop_writer.store(true, Ordering::Relaxed);
                     }
-                }
-                let headers = &text[..header_end];
-                if response_body_complete(&buf, header_end, headers) {
                     break;
                 }
             }
@@ -5833,7 +5829,7 @@ mod tests {
         });
 
         let response =
-            read_http_response_with_header_stop(&mut stream, RESPONSE_TIMEOUT, Some(&stop));
+            read_http_response_with_writer_stop(&mut stream, RESPONSE_TIMEOUT, Some(&stop));
         stop.store(true, Ordering::Relaxed);
         writer_handle.join().unwrap();
         (response, bytes_sent.load(Ordering::Relaxed))
@@ -5877,7 +5873,7 @@ mod tests {
         });
 
         let response =
-            read_http_response_with_header_stop(&mut stream, RESPONSE_TIMEOUT, Some(&stop));
+            read_http_response_with_writer_stop(&mut stream, RESPONSE_TIMEOUT, Some(&stop));
         stop.store(true, Ordering::Relaxed);
         writer_handle.join().unwrap();
         (response, bytes_sent.load(Ordering::Relaxed))
@@ -5927,7 +5923,7 @@ mod tests {
         });
 
         let response =
-            read_http_response_with_header_stop(&mut stream, RESPONSE_TIMEOUT, Some(&stop));
+            read_http_response_with_writer_stop(&mut stream, RESPONSE_TIMEOUT, Some(&stop));
         stop.store(true, Ordering::Relaxed);
         writer_handle.join().unwrap();
         (response, bytes_sent.load(Ordering::Relaxed))
