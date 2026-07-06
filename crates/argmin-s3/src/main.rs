@@ -1422,6 +1422,11 @@ fn run_control_plane_process(config: &ServerConfig) -> ! {
                 );
             }
             Ok(_) => {}
+            Err(error) if control_plane_lease_expiry_error_is_clock_wait(&error) => {
+                eprintln!(
+                    "control-plane lease expiry deferred while local clock catches up to committed timestamp: {error}"
+                );
+            }
             Err(error) => {
                 eprintln!("control-plane lease expiry failed: {error}");
                 std::process::exit(1);
@@ -1591,6 +1596,10 @@ impl ExperimentalRaftControlPlane {
         now_ms: u64,
     ) -> Result<(ClusterEpoch, usize, usize), ControlPlaneError> {
         let now_ms = self.authority_now_ms(now_ms);
+        let snapshot = self.current_snapshot()?;
+        if snapshot.committed_timestamp_exceeds_forward_bound(now_ms) {
+            return Ok((snapshot.cluster_epoch(), 0, 0));
+        }
         let response = self.submit_raft_command(ControlPlaneCommand::ExpireHeartbeatLeases {
             expire_at_ms: now_ms,
         })?;
@@ -2476,6 +2485,11 @@ fn run_experimental_raft_control_plane_process(config: &ServerConfig) -> ! {
             }
             Ok(_) => {}
             Err(error) if experimental_raft_error_is_forward_to_leader(&error) => {}
+            Err(error) if control_plane_lease_expiry_error_is_clock_wait(&error) => {
+                eprintln!(
+                    "experimental OpenRaft control-plane lease expiry deferred while local clock catches up to committed timestamp: {error}"
+                );
+            }
             Err(error) => {
                 eprintln!("experimental OpenRaft control-plane lease expiry failed: {error}");
                 std::process::exit(1);
@@ -2483,6 +2497,14 @@ fn run_experimental_raft_control_plane_process(config: &ServerConfig) -> ! {
         }
         thread::sleep(config.control_plane_lease_scan_interval);
     }
+}
+
+fn control_plane_lease_expiry_error_is_clock_wait(error: &ControlPlaneError) -> bool {
+    matches!(
+        error,
+        ControlPlaneError::CommittedTimestampRegression { .. }
+            | ControlPlaneError::CommittedTimestampTooFarAhead { .. }
+    )
 }
 
 fn experimental_raft_error_is_forward_to_leader(error: &ControlPlaneError) -> bool {
@@ -3618,6 +3640,26 @@ mod tests {
             abort_on_500: false,
             local_debug_endpoint: false,
         }
+    }
+
+    #[test]
+    fn lease_expiry_clock_wait_classifier_covers_committed_timestamp_guards() {
+        assert!(control_plane_lease_expiry_error_is_clock_wait(
+            &ControlPlaneError::CommittedTimestampRegression {
+                timestamp_ms: 999,
+                max_committed_timestamp_ms: 1_001,
+            }
+        ));
+        assert!(control_plane_lease_expiry_error_is_clock_wait(
+            &ControlPlaneError::CommittedTimestampTooFarAhead {
+                timestamp_ms: 3_601_002,
+                max_committed_timestamp_ms: 1_001,
+                max_forward_jump_ms: 3_600_000,
+            }
+        ));
+        assert!(!control_plane_lease_expiry_error_is_clock_wait(
+            &ControlPlaneError::InvalidLeaseDuration
+        ));
     }
 
     struct ExperimentalRaftTestHarness {

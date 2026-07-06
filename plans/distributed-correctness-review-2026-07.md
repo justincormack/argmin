@@ -1441,7 +1441,7 @@ introduced by fixes (INT-1, INT-2, INT-4), all in the fail-closed direction —
 safety held, but availability regressions from hardening are becoming the
 dominant defect class.
 
-### INT-1. HIGH (availability, production path) — Committed-timestamp guard converts clock skew into an unrecoverable crash loop
+### INT-1. RESOLVED (2026-07-06) / HIGH (availability, production path) — Committed-timestamp guard converted clock skew into an unrecoverable crash loop
 
 Confirmed mechanics (verified directly); trigger plausible.
 
@@ -1468,6 +1468,13 @@ Confirmed mechanics (verified directly); trigger plausible.
 - Fix shape: treat the deterministic rejection as benign-wait with alerting
   in both scan loops, and bound forward timestamp jumps (sanity window
   against committed state) at proposal or apply time.
+- Status update: implemented for both Phase 11 and experimental Raft lease
+  expiry loops. Periodic expiry proposals now defer far-future local clocks
+  without committing timestamp-only catch-up entries, raw committed commands
+  fail closed on larger jumps, and timestamp-guard rejections from the scan
+  loops are logged/deferred instead of exiting the process. The broader
+  CP2/CL4 monotonic-clock/skew-margin policy remains a separate design item
+  for production Raft deployment.
 
 ### INT-2. HIGH (availability) — The MD4 fix makes a future-epoch pending slot brick the whole node
 
@@ -1626,7 +1633,7 @@ pre-response crash via unwritable state dir, checkpoint-pause coverage) but
 lacks clock-regression-election and compaction-during-replay crash points.
 Peer auth is documented only (`plans/control-plane-auth-identity-plan.md`);
 nothing on the transport. Lease/skew semantics have guards and regression
-tests but no skew-margin design — and INT-1 shows the guards actively need
+tests but no skew-margin design — and INT-1 showed the guards actively need
 that design. The Raft retry/confirmation contract is not implemented.
 Observability is mostly done (WAL backed/offsets/poison, durable
 vote/log/commit/applied, timestamp high-water) but WAL/artifact generation,
@@ -1634,22 +1641,20 @@ peer-auth failures, and retry-confirmation diagnostics are missing.
 
 ## Updated priorities
 
-1. **INT-1** — production-path regression from the new guards; small fix
-   (benign-wait in both scan loops + forward jump bound).
-2. **INT-2** — per-PG quarantine instead of node-wide bind failure.
-3. **CL1** — still the top pre-existing safety gap; now needs deposed-lease
+1. **INT-2** — per-PG quarantine instead of node-wide bind failure.
+2. **CL1** — still the top pre-existing safety gap; now needs deposed-lease
    capture scaffolding before the fence can exist. Do it while the 9f4a97cd
    context is fresh.
-4. **INT-3/INT-4** — tighten the drain predicate (`==` epoch, gate on the
+3. **INT-3/INT-4** — tighten the drain predicate (`==` epoch, gate on the
    pending-command error, per-PG scope; decide Recovery-mode lease bypass
    explicitly) and decouple the reservation-lease proof matching; add the
    two targeted convergence tests.
-5. **CP5 remaining half** — bound durable history and slim the startup
+4. **CP5 remaining half** — bound durable history and slim the startup
    snapshot RPC before any scale testing; it now gates frontend startup.
-6. Phase 12.4 exit criteria with zero code so far: peer auth and the Raft
+5. Phase 12.4 exit criteria with zero code so far: peer auth and the Raft
    retry/confirmation contract (replace the substring benign-error matching
    with typed classification while there).
-7. CP2/CL4 skew margin remains the standing design item feeding INT-1, CL1,
+6. CP2/CL4 skew margin remains the standing design item feeding INT-1, CL1,
    and the drain/reservation wall-clock comparisons — one time-discipline
    design closes the family.
 
