@@ -219,6 +219,19 @@ batch, deleting each diff test once its shape coverage is subsumed. Batches
 
 1. bucket subresource GETs (location, versioning, encryption, CORS,
    tagging, lifecycle, public-access-block, ownership, policy-status, ACL)
+   — DONE: ten golden tests added to the matching s3-tests files, all
+   AWS-validated first try, ten diff tests deleted. Notes: several
+   subresource GETs carry no `Content-Type` (versioning, encryption,
+   CORS, tagging, public-access-block); lifecycle and ownership use
+   `Content-Length` instead of chunked encoding; AWS adds
+   `x-amz-transition-default-minimum-object-size` on lifecycle but Argmin
+   deliberately omits it while transitions are unimplemented (documented
+   in aws-compatibility.md, test accepts either — first real use of
+   `assert_shape_one_of`); GetBucketAcl has no `DisplayName` (AWS
+   deprecated it) and pins `{owner_id}` consistency between Owner and
+   Grantee; policy-status without a policy is a `NoSuchBucketPolicy`
+   404. Shape helpers gained the header-set vocabulary `id_headers` /
+   `chunked_response_headers` / `xml_response_headers`.
 2. object CRUD, range/override, checksum-mode, website-redirect and
    metadata/header-limit errors
 3. SSE-C success and error shapes

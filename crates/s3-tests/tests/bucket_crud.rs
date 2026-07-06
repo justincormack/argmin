@@ -6,7 +6,9 @@ use aws_sdk_s3::types::{
 };
 use s3_tests::{
     assert_s3_err_code, bucket_prefix, cleanup_versioned_bucket, delete_all_and_bucket, err_status,
-    retrying_operation_aborted, retrying_operation_aborted_result, send_signed_request,
+    expected_raw_bucket_location_constraint, raw_bucket, retrying_operation_aborted,
+    retrying_operation_aborted_result, send_signed_request,
+    shape::{assert_shape, shape, xml_response_headers},
     unique_bucket, RawResponse, SendRetryingOperationAborted, CTX,
 };
 use s3_types::{is_legacy_create_bucket_region, BucketNamespace};
@@ -696,6 +698,38 @@ fn test_bucket_create_exists_nonowner() {
             .await;
         assert_eq!(err_status(&result), 409);
         assert_s3_err_code(&result, "BucketAlreadyExists");
+
+        s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
+    });
+}
+
+// ── GetBucketLocation response shape ────────────────────────────────
+
+#[test]
+fn test_get_bucket_location_response_shape() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
+
+        let response = raw_bucket("GET", &bucket, Some("location="));
+        let expected_body = match expected_raw_bucket_location_constraint(CTX.region()) {
+            Some(constraint) => format!(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<LocationConstraint \
+                 xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">{constraint}</LocationConstraint>"
+            ),
+            None => "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<LocationConstraint \
+                     xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"/>"
+                .to_string(),
+        };
+        assert_shape(
+            "GetBucketLocation",
+            &response,
+            &shape()
+                .status(200)
+                .headers(xml_response_headers())
+                .body(expected_body),
+        );
 
         s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
     });

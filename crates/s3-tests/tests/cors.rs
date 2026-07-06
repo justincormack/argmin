@@ -1,7 +1,9 @@
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{CorsConfiguration, CorsRule};
 use s3_tests::{
-    content_md5_header, send_signed_request, unique_bucket, SendRetryingOperationAborted, CTX,
+    content_md5_header, raw_bucket, send_signed_request,
+    shape::{assert_shape, chunked_response_headers, shape},
+    unique_bucket, SendRetryingOperationAborted, CTX,
 };
 use std::collections::HashMap;
 use std::time::Duration;
@@ -981,5 +983,58 @@ fn test_cors_max_age() {
         );
 
         cleanup(&bucket, &[]).await;
+    });
+}
+
+// ── GetBucketCors response shape ────────────────────────────────────
+
+#[test]
+fn test_get_bucket_cors_response_shape() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
+
+        let cors = aws_sdk_s3::types::CorsConfiguration::builder()
+            .cors_rules(
+                aws_sdk_s3::types::CorsRule::builder()
+                    .allowed_origins("https://example.com")
+                    .allowed_methods("GET")
+                    .allowed_methods("PUT")
+                    .allowed_headers("*")
+                    .expose_headers("x-amz-request-id")
+                    .max_age_seconds(3600)
+                    .build()
+                    .unwrap(),
+            )
+            .build()
+            .unwrap();
+        client
+            .put_bucket_cors()
+            .bucket(&bucket)
+            .cors_configuration(cors)
+            .send()
+            .await
+            .expect("put bucket cors");
+
+        let response = raw_bucket("GET", &bucket, Some("cors="));
+        assert_shape(
+            "GetBucketCors",
+            &response,
+            &shape()
+                .status(200)
+                .headers(chunked_response_headers())
+                .body(
+                    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<CORSConfiguration \
+                     xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><CORSRule>\
+                     <AllowedOrigin>https://example.com</AllowedOrigin>\
+                     <AllowedMethod>GET</AllowedMethod><AllowedMethod>PUT</AllowedMethod>\
+                     <MaxAgeSeconds>3600</MaxAgeSeconds>\
+                     <ExposeHeader>x-amz-request-id</ExposeHeader>\
+                     <AllowedHeader>*</AllowedHeader></CORSRule></CORSConfiguration>",
+                ),
+        );
+
+        s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
     });
 }

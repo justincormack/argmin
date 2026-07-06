@@ -11,8 +11,9 @@ use aws_sdk_s3::types::{
 use ring::hmac;
 use s3_tests::{
     cleanup_versioned_bucket, content_md5_header, delete_all_and_bucket, err_status,
-    put_bucket_lifecycle_with_md5, retrying_operation_aborted, send_signed_request, unique_bucket,
-    SendRetryingOperationAborted, CTX,
+    put_bucket_lifecycle_with_md5, raw_bucket, retrying_operation_aborted, send_signed_request,
+    shape::{assert_shape_one_of, id_headers, shape},
+    unique_bucket, SendRetryingOperationAborted, CTX,
 };
 
 fn agent() -> s3_tests::Agent {
@@ -2232,5 +2233,74 @@ fn test_complete_multipart_upload_reports_expiration_header() {
             .send()
             .await;
         delete_all_and_bucket(client, &bucket, &["logs/complete".to_string()]).await;
+    });
+}
+
+// ── GetBucketLifecycle response shape ───────────────────────────────
+
+#[test]
+fn test_get_bucket_lifecycle_response_shape() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
+
+        let lifecycle = aws_sdk_s3::types::BucketLifecycleConfiguration::builder()
+            .rules(
+                aws_sdk_s3::types::LifecycleRule::builder()
+                    .id("expire-current")
+                    .filter(
+                        aws_sdk_s3::types::LifecycleRuleFilter::builder()
+                            .prefix("logs/")
+                            .build(),
+                    )
+                    .status(aws_sdk_s3::types::ExpirationStatus::Enabled)
+                    .expiration(
+                        aws_sdk_s3::types::LifecycleExpiration::builder()
+                            .days(30)
+                            .build(),
+                    )
+                    .build()
+                    .unwrap(),
+            )
+            .build()
+            .unwrap();
+        put_bucket_lifecycle_with_md5(client, &bucket, lifecycle)
+            .send()
+            .await
+            .expect("put bucket lifecycle");
+
+        let response = raw_bucket("GET", &bucket, Some("lifecycle="));
+        const LIFECYCLE_BODY: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+             <LifecycleConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Rule>\
+             <ID>expire-current</ID><Filter><Prefix>logs/</Prefix></Filter>\
+             <Status>Enabled</Status><Expiration><Days>30</Days></Expiration></Rule>\
+             </LifecycleConfiguration>";
+        // AWS includes x-amz-transition-default-minimum-object-size; Argmin
+        // deliberately omits it while lifecycle storage-class transitions are
+        // unimplemented. See guides/aws-compatibility.md ("Lifecycle
+        // transition-default header").
+        assert_shape_one_of(
+            "GetBucketLifecycleConfiguration",
+            &response,
+            &[
+                shape()
+                    .status(200)
+                    .headers(id_headers())
+                    .header("content-length", "275")
+                    .header(
+                        "x-amz-transition-default-minimum-object-size",
+                        "all_storage_classes_128K",
+                    )
+                    .body(LIFECYCLE_BODY),
+                shape()
+                    .status(200)
+                    .headers(id_headers())
+                    .header("content-length", "275")
+                    .body(LIFECYCLE_BODY),
+            ],
+        );
+
+        s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
     });
 }

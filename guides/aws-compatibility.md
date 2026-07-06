@@ -385,12 +385,16 @@ Today:
 
 - `PutBucketLifecycleConfiguration` ignores that modeled request header because
   transition semantics are not implemented
-- `GetBucketLifecycleConfiguration` currently returns a fixed
-  `x-amz-transition-default-minimum-object-size: all_storage_classes_128K`
-  header rather than a real persisted value
+- `GetBucketLifecycleConfiguration` deliberately does not return the
+  `x-amz-transition-default-minimum-object-size` header. AWS returns
+  `all_storage_classes_128K` by default, but emitting a fixed value without
+  the ability to configure it (or any transition behavior behind it) would
+  advertise an unsupported setting.
 
-Treat this header as unsupported until lifecycle transition behavior is
-implemented end-to-end.
+Treat this header as missing until lifecycle transition behavior is
+implemented end-to-end. Response-shape tests for
+`GetBucketLifecycleConfiguration` accept both the AWS response (with the
+header) and the Argmin response (without it).
 
 Source:
 

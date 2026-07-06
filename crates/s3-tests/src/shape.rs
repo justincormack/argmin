@@ -699,15 +699,35 @@ pub fn assert_unordered_xml_blocks(
     }
 }
 
-/// The standard header set for an S3 XML error response. Extend per test
-/// where AWS adds operation-specific headers.
-pub fn error_response_headers() -> Vec<(&'static str, &'static str)> {
+/// The wire-ID header expectations present on every S3 response. Base set
+/// for responses sized with `Content-Length`, e.g. GetBucketLifecycle.
+pub fn id_headers() -> Vec<(&'static str, &'static str)> {
     vec![
-        ("content-type", "application/xml"),
-        ("transfer-encoding", "chunked"),
         (REQUEST_ID_HEADER, "{request_id}"),
         (HOST_ID_HEADER, "{host_id}"),
     ]
+}
+
+/// Wire IDs plus chunked transfer encoding: the header set of XML responses
+/// that carry no `Content-Type`, e.g. GetBucketVersioning.
+pub fn chunked_response_headers() -> Vec<(&'static str, &'static str)> {
+    let mut headers = id_headers();
+    headers.push(("transfer-encoding", "chunked"));
+    headers
+}
+
+/// The standard header set for a chunked XML response with `Content-Type`,
+/// e.g. GetBucketLocation or GetBucketAcl.
+pub fn xml_response_headers() -> Vec<(&'static str, &'static str)> {
+    let mut headers = chunked_response_headers();
+    headers.push(("content-type", "application/xml"));
+    headers
+}
+
+/// The standard header set for an S3 XML error response. Extend per test
+/// where AWS adds operation-specific headers.
+pub fn error_response_headers() -> Vec<(&'static str, &'static str)> {
+    xml_response_headers()
 }
 
 /// Expected error-body templates generated from the production error

@@ -1717,14 +1717,14 @@ impl S3Response {
     }
 
     /// Build a response for `GetBucketLifecycleConfiguration` (200 OK, XML body).
+    ///
+    /// Deliberately omits `x-amz-transition-default-minimum-object-size`:
+    /// lifecycle storage-class transitions are not implemented, so returning
+    /// AWS's default would advertise a setting that cannot be configured.
+    /// See guides/aws-compatibility.md.
     #[must_use]
     pub fn get_bucket_lifecycle(xml: &str) -> Self {
-        Self::new(200)
-            .header(
-                "x-amz-transition-default-minimum-object-size",
-                "all_storage_classes_128K",
-            )
-            .fixed_xml_body_no_content_type(xml.to_string())
+        Self::new(200).fixed_xml_body_no_content_type(xml.to_string())
     }
 
     /// Build a response for `DeleteBucketLifecycle` (204 No Content).
@@ -3264,7 +3264,8 @@ mod tests {
         assert_eq!(find_header(&get, "Content-Type"), None);
         assert_eq!(
             find_header(&get, "x-amz-transition-default-minimum-object-size"),
-            Some("all_storage_classes_128K")
+            None,
+            "transition default must stay unset until transitions are implemented"
         );
 
         let delete = S3Response::delete_bucket_lifecycle();

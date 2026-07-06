@@ -6,8 +6,9 @@ use aws_sdk_s3::types::{
 };
 use s3_tests::{
     assert_s3_err_code, cleanup_versioned_bucket, content_md5_header,
-    delete_bucket_retrying_operation_aborted, err_status, send_signed_request, unique_bucket,
-    SendRetryingOperationAborted, CTX,
+    delete_bucket_retrying_operation_aborted, err_status, raw_bucket, send_signed_request,
+    shape::{assert_shape, chunked_response_headers, shape},
+    unique_bucket, SendRetryingOperationAborted, CTX,
 };
 use serde_json::json;
 use std::collections::BTreeSet;
@@ -3315,5 +3316,58 @@ fn test_bucket_policy_get_obj_acl_existing_tag() {
         }
 
         cleanup(&bucket, &["allowtag", "denytag", "invalidtag"]).await;
+    });
+}
+
+// ── GetBucketTagging response shape ─────────────────────────────────
+
+#[test]
+fn test_get_bucket_tagging_response_shape() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
+
+        let tagging = aws_sdk_s3::types::Tagging::builder()
+            .tag_set(
+                aws_sdk_s3::types::Tag::builder()
+                    .key("env")
+                    .value("prod")
+                    .build()
+                    .unwrap(),
+            )
+            .tag_set(
+                aws_sdk_s3::types::Tag::builder()
+                    .key("team")
+                    .value("storage")
+                    .build()
+                    .unwrap(),
+            )
+            .build()
+            .unwrap();
+        client
+            .put_bucket_tagging()
+            .bucket(&bucket)
+            .tagging(tagging)
+            .send()
+            .await
+            .expect("put bucket tagging");
+
+        let response = raw_bucket("GET", &bucket, Some("tagging="));
+        assert_shape(
+            "GetBucketTagging",
+            &response,
+            &shape()
+                .status(200)
+                .headers(chunked_response_headers())
+                .body(
+                    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Tagging \
+                     xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><TagSet><Tag>\
+                     <Key>env</Key><Value>prod</Value></Tag><Tag><Key>team</Key>\
+                     <Value>storage</Value></Tag></TagSet></Tagging>",
+                ),
+        );
+
+        s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
     });
 }

@@ -13,8 +13,10 @@ use aws_sdk_s3::types::{
 use s3_tests::{
     assert_s3_err_code, cleanup_versioned_bucket, create_public_bucket,
     disable_bucket_public_access_block, err_status, object_url, put_bucket_lifecycle_with_md5,
-    send_signed_request, send_signed_request_with_credentials, sse_c_header_values, test_sse_c_key,
-    unique_bucket, SendRetryingOperationAborted, SignedRequestCredentials, CTX,
+    raw_bucket, send_signed_request, send_signed_request_with_credentials,
+    shape::{assert_shape, error_response_headers, expected_error, shape},
+    sse_c_header_values, test_sse_c_key, unique_bucket, SendRetryingOperationAborted,
+    SignedRequestCredentials, CTX,
 };
 use serde_json::json;
 use std::future::Future;
@@ -15659,5 +15661,28 @@ fn test_bucket_policy_list_multipart_uploads_requires_dedicated_action() {
             .await
             .unwrap();
         cleanup(&bucket, &[]).await;
+    });
+}
+
+// ── GetBucketPolicyStatus error shape ───────────────────────────────
+
+#[test]
+fn test_get_bucket_policy_status_no_policy_error_shape() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
+
+        let response = raw_bucket("GET", &bucket, Some("policyStatus="));
+        assert_shape(
+            "GetBucketPolicyStatus without policy",
+            &response,
+            &shape()
+                .status(404)
+                .headers(error_response_headers())
+                .body(expected_error::no_such_bucket_policy(&bucket)),
+        );
+
+        s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
     });
 }

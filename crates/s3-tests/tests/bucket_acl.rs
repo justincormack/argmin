@@ -8,7 +8,9 @@ use aws_sdk_s3::types::{
     OwnershipControls, OwnershipControlsRule, Permission, Type,
 };
 use s3_tests::{
-    assert_s3_err_code, disable_bucket_public_access_block, err_status, send_signed_request,
+    assert_s3_err_code, disable_bucket_public_access_block, err_status, raw_bucket,
+    send_signed_request,
+    shape::{assert_shape, shape, xml_response_headers},
     unique_bucket, SendRetryingOperationAborted, CTX,
 };
 
@@ -1260,5 +1262,33 @@ fn test_bucket_acl_revoke_all() {
         );
 
         cleanup(&bucket).await;
+    });
+}
+
+// ── GetBucketAcl response shape ─────────────────────────────────────
+
+#[test]
+fn test_get_bucket_acl_response_shape() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
+
+        let response = raw_bucket("GET", &bucket, Some("acl="));
+        assert_shape(
+            "GetBucketAcl",
+            &response,
+            &shape().status(200).headers(xml_response_headers()).body(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<AccessControlPolicy \
+                     xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Owner><ID>{owner_id}</ID>\
+                     </Owner><AccessControlList><Grant><Grantee \
+                     xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" \
+                     xsi:type=\"CanonicalUser\"><ID>{owner_id}</ID></Grantee>\
+                     <Permission>FULL_CONTROL</Permission></Grant></AccessControlList>\
+                     </AccessControlPolicy>",
+            ),
+        );
+
+        s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
     });
 }

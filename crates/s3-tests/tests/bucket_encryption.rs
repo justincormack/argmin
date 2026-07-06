@@ -5,7 +5,9 @@ use aws_sdk_s3::types::{
 };
 use s3_tests::{
     assert_s3_err_code, content_md5_header, create_bucket_with_sse_c_enabled, err_status,
-    send_signed_request, sse_c_header_values, test_sse_c_key, unique_bucket, CTX,
+    raw_bucket, send_signed_request,
+    shape::{assert_shape, chunked_response_headers, shape},
+    sse_c_header_values, test_sse_c_key, unique_bucket, CTX,
 };
 
 fn endpoint_is_https() -> bool {
@@ -338,5 +340,58 @@ fn test_bucket_encryption_does_not_block_existing_sse_c_reads() {
         assert_eq!(body.as_ref(), b"secret-body");
 
         cleanup(&bucket, Some(key)).await;
+    });
+}
+
+// ── GetBucketEncryption response shape ──────────────────────────────
+
+#[test]
+fn test_get_bucket_encryption_response_shape() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
+
+        let encryption = aws_sdk_s3::types::ServerSideEncryptionConfiguration::builder()
+            .rules(
+                aws_sdk_s3::types::ServerSideEncryptionRule::builder()
+                    .apply_server_side_encryption_by_default(
+                        aws_sdk_s3::types::ServerSideEncryptionByDefault::builder()
+                            .sse_algorithm(aws_sdk_s3::types::ServerSideEncryption::Aes256)
+                            .build()
+                            .unwrap(),
+                    )
+                    .build(),
+            )
+            .build()
+            .unwrap();
+        client
+            .put_bucket_encryption()
+            .bucket(&bucket)
+            .server_side_encryption_configuration(encryption)
+            .send()
+            .await
+            .expect("put bucket encryption");
+
+        let response = raw_bucket("GET", &bucket, Some("encryption="));
+        assert_shape(
+            "GetBucketEncryption",
+            &response,
+            &shape()
+                .status(200)
+                .headers(chunked_response_headers())
+                .body(
+                    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+                     <ServerSideEncryptionConfiguration \
+                     xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Rule>\
+                     <BucketKeyEnabled>false</BucketKeyEnabled>\
+                     <ApplyServerSideEncryptionByDefault><SSEAlgorithm>AES256</SSEAlgorithm>\
+                     </ApplyServerSideEncryptionByDefault><BlockedEncryptionTypes>\
+                     <EncryptionType>SSE-C</EncryptionType></BlockedEncryptionTypes></Rule>\
+                     </ServerSideEncryptionConfiguration>",
+                ),
+        );
+
+        s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
     });
 }

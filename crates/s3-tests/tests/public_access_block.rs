@@ -1,4 +1,8 @@
-use s3_tests::{content_md5_header, send_signed_request, unique_bucket, CTX};
+use s3_tests::{
+    content_md5_header, raw_bucket, send_signed_request,
+    shape::{assert_shape, chunked_response_headers, shape},
+    unique_bucket, CTX,
+};
 
 /// Cleanup helper.
 async fn cleanup(bucket: &str) {
@@ -172,6 +176,52 @@ fn test_get_undefined_public_block() {
             raw.contains("NoSuchPublicAccessBlockConfiguration") || raw.contains("404"),
             "expected NoSuchPublicAccessBlockConfiguration, got: {}",
             raw
+        );
+
+        cleanup(&bucket).await;
+    });
+}
+
+// ── GetPublicAccessBlock response shape ─────────────────────────────
+
+#[test]
+fn test_get_public_access_block_response_shape() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
+
+        let config = aws_sdk_s3::types::PublicAccessBlockConfiguration::builder()
+            .block_public_acls(true)
+            .ignore_public_acls(true)
+            .block_public_policy(true)
+            .restrict_public_buckets(false)
+            .build();
+        client
+            .put_public_access_block()
+            .bucket(&bucket)
+            .public_access_block_configuration(config)
+            .send()
+            .await
+            .expect("put public access block");
+
+        let response = raw_bucket("GET", &bucket, Some("publicAccessBlock="));
+        assert_shape(
+            "GetPublicAccessBlock",
+            &response,
+            &shape()
+                .status(200)
+                .headers(chunked_response_headers())
+                .body(
+                    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+                     <PublicAccessBlockConfiguration \
+                     xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
+                     <BlockPublicAcls>true</BlockPublicAcls>\
+                     <IgnorePublicAcls>true</IgnorePublicAcls>\
+                     <BlockPublicPolicy>true</BlockPublicPolicy>\
+                     <RestrictPublicBuckets>false</RestrictPublicBuckets>\
+                     </PublicAccessBlockConfiguration>",
+                ),
         );
 
         cleanup(&bucket).await;

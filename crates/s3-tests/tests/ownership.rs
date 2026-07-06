@@ -9,8 +9,9 @@ use aws_sdk_s3::types::{
     Type,
 };
 use s3_tests::{
-    assert_s3_err_code, content_md5_header, err_status, unique_bucket,
-    SendRetryingOperationAborted, CTX,
+    assert_s3_err_code, content_md5_header, err_status, raw_bucket,
+    shape::{assert_shape, id_headers, shape},
+    unique_bucket, SendRetryingOperationAborted, CTX,
 };
 use serde_json::json;
 
@@ -3204,4 +3205,50 @@ fn days_to_date(days: i64) -> (i64, u32, u32) {
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = if m <= 2 { y + 1 } else { y };
     (y, m, d)
+}
+
+// ── GetBucketOwnershipControls response shape ───────────────────────
+
+#[test]
+fn test_get_bucket_ownership_controls_response_shape() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
+
+        let ownership = aws_sdk_s3::types::OwnershipControls::builder()
+            .rules(
+                aws_sdk_s3::types::OwnershipControlsRule::builder()
+                    .object_ownership(aws_sdk_s3::types::ObjectOwnership::BucketOwnerPreferred)
+                    .build()
+                    .unwrap(),
+            )
+            .build()
+            .unwrap();
+        client
+            .put_bucket_ownership_controls()
+            .bucket(&bucket)
+            .ownership_controls(ownership)
+            .send()
+            .await
+            .expect("put bucket ownership controls");
+
+        let response = raw_bucket("GET", &bucket, Some("ownershipControls="));
+        assert_shape(
+            "GetBucketOwnershipControls",
+            &response,
+            &shape()
+                .status(200)
+                .headers(id_headers())
+                .header("content-length", "194")
+                .body(
+                    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<OwnershipControls \
+                     xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Rule>\
+                     <ObjectOwnership>BucketOwnerPreferred</ObjectOwnership></Rule>\
+                     </OwnershipControls>",
+                ),
+        );
+
+        s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
+    });
 }

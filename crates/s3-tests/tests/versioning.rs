@@ -6,8 +6,9 @@ use aws_sdk_s3::types::{
 use s3_tests::{
     assert_s3_err_code, cleanup_versioned_bucket, content_md5_header, copy_source_with_version,
     delete_bucket_retrying_operation_aborted, delete_objects_retrying_operation_aborted,
-    err_status, get_object_body_retrying_operation_aborted, send_signed_request, unique_bucket,
-    RawResponse, SendRetryingOperationAborted, CTX,
+    err_status, get_object_body_retrying_operation_aborted, raw_bucket, send_signed_request,
+    shape::{assert_shape, chunked_response_headers, shape},
+    unique_bucket, RawResponse, SendRetryingOperationAborted, CTX,
 };
 use tokio::time::{sleep, Duration};
 
@@ -2365,5 +2366,33 @@ fn test_versioning_bucket_multipart_upload_return_version_id() {
         assert!(!version_id.is_empty());
 
         cleanup_versioned(&bucket, key, &[version_id.to_string()]).await;
+    });
+}
+
+// ── GetBucketVersioning response shape ──────────────────────────────
+
+#[test]
+fn test_get_bucket_versioning_response_shape() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
+        s3_tests::enable_bucket_versioning(client, &bucket).await;
+
+        let response = raw_bucket("GET", &bucket, Some("versioning="));
+        assert_shape(
+            "GetBucketVersioning",
+            &response,
+            &shape()
+                .status(200)
+                .headers(chunked_response_headers())
+                .body(
+                    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<VersioningConfiguration \
+                     xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Status>Enabled</Status>\
+                     </VersioningConfiguration>",
+                ),
+        );
+
+        cleanup_versioned_bucket(client, &bucket).await;
     });
 }
