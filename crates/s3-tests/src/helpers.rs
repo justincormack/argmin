@@ -1848,8 +1848,7 @@ pub fn put_bucket_lifecycle_with_md5(
 /// separator. The `version_id` query component is always percent-encoded.
 pub fn copy_source_with_version(bucket: &str, source_key: &str, version_id: &str) -> String {
     let encoded_key = auth::canonical::uri_encode_path(source_key);
-    let encoded_version_id: String =
-        url::form_urlencoded::byte_serialize(version_id.as_bytes()).collect();
+    let encoded_version_id = auth::canonical::uri_encode(version_id);
     format!("{bucket}/{encoded_key}?versionId={encoded_version_id}")
 }
 
@@ -2302,4 +2301,17 @@ pub fn is_sdk_stream_disconnect_or_status<E: std::fmt::Debug>(
             || message.contains("connection error")
             || message.contains("IncompleteMessage")
             || message.contains("incomplete message"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn copy_source_with_version_uses_strict_percent_encoding_for_version_id() {
+        assert_eq!(
+            copy_source_with_version("bucket", "key with space", "version with+plus"),
+            "bucket/key%20with%20space?versionId=version%20with%2Bplus"
+        );
+    }
 }

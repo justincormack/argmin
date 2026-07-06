@@ -234,13 +234,19 @@ Remaining order of attack:
   `Option<u64>` returns `durable_wal_base_offset()`/`durable_wal_clean_len()`
   (`:2470/:2475`).
 
-- [ ] **RR16. Cosmetic leftovers.** Test name
+- [x] **RR16. Cosmetic leftovers.** Test name
   `finalize_stream_put_rejects_mismatched_sse_s3_write_context`
-  (`multipart_tests.rs:6832`) references the deleted SSE-S3 alias concept;
+  (`multipart_tests.rs:6832`) references the deleted SSE-S3 alias concept
+  (stale: the removed alias layer is gone, but SSE-S3 remains the correct
+  product/storage term for managed `AES256` object encryption, so the test
+  name is still accurate);
   s3-tests copy helper form-urlencodes `versionId` (`helpers.rs:1849-1854`,
   `+` for space) while the parser strict-percent-decodes — inert today since
   version ids contain no spaces; small duplicated non-internal
-  `error_response` closures remain in serve.rs (e.g. `:2979`).
+  `error_response` closures remain in serve.rs (e.g. `:2979`). Fixed by
+  switching the copy helper to strict SigV4 percent encoding and adding direct
+  regression coverage, and by replacing the three streaming-handler closures
+  with the shared `error_response` helper.
 
 ## Bugs — auth (security)
 

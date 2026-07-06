@@ -1190,7 +1190,7 @@ fn local_debug_bucket_delete_attempt_body(snapshot: &BucketDeleteDebugSnapshot) 
                 drain.cluster_epoch.get(),
                 drain.bucket_execution_generation,
                 drain.created_at,
-                local_debug_optional_u64(drain.lease_deadline),
+                drain.lease_deadline,
             )
             .expect("write to String");
         }
@@ -2638,7 +2638,6 @@ async fn handle_streaming_post_object(
     wire_ids: WireResponseIds,
 ) -> S3Response {
     let idle_timeout = state.config.body_idle_timeout;
-    let error_response = |err: &ServerError| S3Response::error_with_ids(err, "", &wire_ids);
 
     let req_arc = Arc::new(s3req);
 
@@ -2646,7 +2645,7 @@ async fn handle_streaming_post_object(
         Some(v) => v,
         None => {
             // AWS returns 412 for missing/wrong Content-Type on POST Object.
-            return error_response(&ServerError::PreconditionFailed);
+            return error_response(&ServerError::PreconditionFailed, &wire_ids);
         }
     };
     // Check if this is actually multipart/form-data before looking for boundary.
@@ -2656,15 +2655,18 @@ async fn handle_streaming_post_object(
         .next()
         .is_some_and(|t| t.trim().eq_ignore_ascii_case("multipart/form-data"));
     if !is_multipart {
-        return error_response(&ServerError::PreconditionFailed);
+        return error_response(&ServerError::PreconditionFailed, &wire_ids);
     }
     let boundary = match super::multipart::extract_boundary(content_type) {
         Some(b) => b,
         None => {
-            return error_response(&ServerError::MalformedPOSTRequest {
-                reason: "The body of your POST request is not well-formed multipart/form-data."
-                    .to_string(),
-            });
+            return error_response(
+                &ServerError::MalformedPOSTRequest {
+                    reason: "The body of your POST request is not well-formed multipart/form-data."
+                        .to_string(),
+                },
+                &wire_ids,
+            );
         }
     };
 
@@ -2693,7 +2695,7 @@ async fn handle_streaming_post_object(
                             if let Some(ref c) = ctx {
                                 abort_streaming_post_object(&state, c).await;
                             }
-                            return error_response(&err);
+                            return error_response(&err, &wire_ids);
                         }
                     };
                     for event in events {
@@ -2703,16 +2705,19 @@ async fn handle_streaming_post_object(
                                     if let Some(ref c) = ctx {
                                         abort_streaming_post_object(&state, c).await;
                                     }
-                                    return error_response(&ServerError::InvalidRequest {
-                                        reason: "file field must be the final multipart part"
-                                            .to_string(),
-                                    });
+                                    return error_response(
+                                        &ServerError::InvalidRequest {
+                                            reason: "file field must be the final multipart part"
+                                                .to_string(),
+                                        },
+                                        &wire_ids,
+                                    );
                                 }
                                 if let Err(err) = field_budget.record(&name, &value) {
                                     if let Some(ref c) = ctx {
                                         abort_streaming_post_object(&state, c).await;
                                     }
-                                    return error_response(&err);
+                                    return error_response(&err, &wire_ids);
                                 }
                                 fields.push((name, value));
                             }
@@ -2721,10 +2726,13 @@ async fn handle_streaming_post_object(
                                     if let Some(ref c) = ctx {
                                         abort_streaming_post_object(&state, c).await;
                                     }
-                                    return error_response(&ServerError::InvalidRequest {
-                                        reason: "multiple file fields are not supported"
-                                            .to_string(),
-                                    });
+                                    return error_response(
+                                        &ServerError::InvalidRequest {
+                                            reason: "multiple file fields are not supported"
+                                                .to_string(),
+                                        },
+                                        &wire_ids,
+                                    );
                                 }
                                 seen_file = true;
                                 let st = Arc::clone(&state);
@@ -2756,7 +2764,7 @@ async fn handle_streaming_post_object(
                                     }
                                     Ok(Err(err)) => {
                                         return finish_streaming_post_rejection(
-                                            error_response(&err),
+                                            error_response(&err, &wire_ids),
                                             &mut body,
                                             idle_timeout,
                                         )
@@ -2767,9 +2775,13 @@ async fn handle_streaming_post_object(
                             }
                             PostMultipartEvent::FileChunk(data) => {
                                 let Some(ref c) = ctx else {
-                                    return error_response(&ServerError::InvalidRequest {
-                                        reason: "missing file field in multipart form".to_string(),
-                                    });
+                                    return error_response(
+                                        &ServerError::InvalidRequest {
+                                            reason: "missing file field in multipart form"
+                                                .to_string(),
+                                        },
+                                        &wire_ids,
+                                    );
                                 };
                                 crc64.update(&data);
                                 if let Some(hasher) = post_checksum_hasher.as_mut() {
@@ -2779,10 +2791,13 @@ async fn handle_streaming_post_object(
                                 if total_size > MAX_OBJECT_SIZE {
                                     abort_streaming_post_object(&state, c).await;
                                     return finish_streaming_post_rejection(
-                                        error_response(&ServerError::ObjectTooLarge {
-                                            size: total_size,
-                                            max: MAX_OBJECT_SIZE,
-                                        }),
+                                        error_response(
+                                            &ServerError::ObjectTooLarge {
+                                                size: total_size,
+                                                max: MAX_OBJECT_SIZE,
+                                            },
+                                            &wire_ids,
+                                        ),
                                         &mut body,
                                         idle_timeout,
                                     )
@@ -2795,13 +2810,16 @@ async fn handle_streaming_post_object(
                                 {
                                     abort_streaming_post_object(&state, c).await;
                                     return finish_streaming_post_rejection(
-                                        error_response(&ServerError::InvalidRequest {
-                                            reason: auth::PostPolicyError::ConditionFailed {
-                                                condition: "content-length-range",
-                                                field: None,
-                                            }
-                                            .to_string(),
-                                        }),
+                                        error_response(
+                                            &ServerError::InvalidRequest {
+                                                reason: auth::PostPolicyError::ConditionFailed {
+                                                    condition: "content-length-range",
+                                                    field: None,
+                                                }
+                                                .to_string(),
+                                            },
+                                            &wire_ids,
+                                        ),
                                         &mut body,
                                         idle_timeout,
                                     )
@@ -2842,7 +2860,7 @@ async fn handle_streaming_post_object(
                                         Ok((Ok(()), _flush_data)) => {}
                                         Ok((Err(err), _flush_data)) => {
                                             abort_streaming_post_object(&state, c).await;
-                                            return error_response(&err);
+                                            return error_response(&err, &wire_ids);
                                         }
                                         Err(_) => {
                                             abort_streaming_post_object(&state, c).await;
@@ -2862,18 +2880,24 @@ async fn handle_streaming_post_object(
                 if let Some(ref c) = ctx {
                     abort_streaming_post_object(&state, c).await;
                 }
-                return error_response(&ServerError::InvalidRequest {
-                    reason: "failed to read request body".to_string(),
-                });
+                return error_response(
+                    &ServerError::InvalidRequest {
+                        reason: "failed to read request body".to_string(),
+                    },
+                    &wire_ids,
+                );
             }
             Ok(None) => break,
             Err(_) => {
                 if let Some(ref c) = ctx {
                     abort_streaming_post_object(&state, c).await;
                 }
-                return error_response(&ServerError::InvalidRequest {
-                    reason: "request body read timed out".to_string(),
-                });
+                return error_response(
+                    &ServerError::InvalidRequest {
+                        reason: "request body read timed out".to_string(),
+                    },
+                    &wire_ids,
+                );
             }
         }
     }
@@ -2882,24 +2906,30 @@ async fn handle_streaming_post_object(
         if let Some(ref c) = ctx {
             abort_streaming_post_object(&state, c).await;
         }
-        return error_response(&ServerError::IncompleteBody);
+        return error_response(&ServerError::IncompleteBody, &wire_ids);
     }
     if !seen_file {
-        return error_response(&ServerError::InvalidRequest {
-            reason: "missing file field in multipart form".to_string(),
-        });
+        return error_response(
+            &ServerError::InvalidRequest {
+                reason: "missing file field in multipart form".to_string(),
+            },
+            &wire_ids,
+        );
     }
     if !file_ended {
         if let Some(ref c) = ctx {
             abort_streaming_post_object(&state, c).await;
         }
-        return error_response(&ServerError::IncompleteBody);
+        return error_response(&ServerError::IncompleteBody, &wire_ids);
     }
 
     let Some(ctx) = ctx else {
-        return error_response(&ServerError::InvalidRequest {
-            reason: "missing file field in multipart form".to_string(),
-        });
+        return error_response(
+            &ServerError::InvalidRequest {
+                reason: "missing file field in multipart form".to_string(),
+            },
+            &wire_ids,
+        );
     };
 
     if !upload_buf.is_empty() {
@@ -2918,7 +2948,7 @@ async fn handle_streaming_post_object(
             Ok((Ok(()), _upload_buf)) => {}
             Ok((Err(err), _upload_buf)) => {
                 abort_streaming_post_object(&state, &ctx).await;
-                return error_response(&err);
+                return error_response(&err, &wire_ids);
             }
             Err(_) => {
                 abort_streaming_post_object(&state, &ctx).await;
@@ -2950,7 +2980,7 @@ async fn handle_streaming_post_object(
         Ok(Ok(resp)) => resp,
         Ok(Err(err)) => {
             abort_streaming_post_object(&state, &ctx).await;
-            error_response(&err)
+            error_response(&err, &wire_ids)
         }
         Err(_) => {
             abort_streaming_post_object(&state, &ctx).await;
@@ -2976,7 +3006,6 @@ async fn handle_streaming_put(
     wire_ids: WireResponseIds,
 ) -> S3Response {
     let idle_timeout = state.config.body_idle_timeout;
-    let error_response = |err: &ServerError| S3Response::error_with_ids(err, "", &wire_ids);
     let mut body = body;
 
     let state2 = Arc::clone(&state);
@@ -3008,7 +3037,7 @@ async fn handle_streaming_put(
         Ok(Ok(ctx)) => ctx,
         Ok(Err(err)) => {
             return finish_streaming_prepare_failure(
-                error_response(&err),
+                error_response(&err, &wire_ids),
                 &err,
                 has_auth_attempt,
                 &mut body,
@@ -3062,7 +3091,7 @@ async fn handle_streaming_put(
                                 Ok(p) => p,
                                 Err(err) => {
                                     abort_streaming(&state, &ctx, session_id.clone()).await;
-                                    return error_response(&err);
+                                    return error_response(&err, &wire_ids);
                                 }
                             };
                             let mut ingest = StreamingPutIngestState {
@@ -3114,16 +3143,22 @@ async fn handle_streaming_put(
             }
             Ok(Some(Err(_))) => {
                 abort_streaming(&state, &ctx, session_id.clone()).await;
-                return error_response(&ServerError::InvalidRequest {
-                    reason: "failed to read request body".to_string(),
-                });
+                return error_response(
+                    &ServerError::InvalidRequest {
+                        reason: "failed to read request body".to_string(),
+                    },
+                    &wire_ids,
+                );
             }
             Ok(None) => break, // Body complete
             Err(_) => {
                 abort_streaming(&state, &ctx, session_id.clone()).await;
-                return error_response(&ServerError::InvalidRequest {
-                    reason: "request body read timed out".to_string(),
-                });
+                return error_response(
+                    &ServerError::InvalidRequest {
+                        reason: "request body read timed out".to_string(),
+                    },
+                    &wire_ids,
+                );
             }
         }
     }
@@ -3152,7 +3187,7 @@ async fn handle_streaming_put(
     if let Some(dec) = decoder {
         if !dec.is_done() {
             abort_streaming(&state, &ctx, session_id.clone()).await;
-            return error_response(&ServerError::IncompleteBody);
+            return error_response(&ServerError::IncompleteBody, &wire_ids);
         }
         let trailers = dec.into_trailers();
         if let Err(err) = validate_chunked_post_decode(
@@ -3162,13 +3197,13 @@ async fn handle_streaming_put(
             declared_trailer.as_deref(),
         ) {
             abort_streaming(&state, &ctx, session_id.clone()).await;
-            return error_response(&err);
+            return error_response(&err, &wire_ids);
         }
         match extract_checksum_trailers(&trailers) {
             Ok(tc) => trailer_checksums = tc,
             Err(err) => {
                 abort_streaming(&state, &ctx, session_id.clone()).await;
-                return error_response(&err);
+                return error_response(&err, &wire_ids);
             }
         }
     }
@@ -3177,10 +3212,13 @@ async fn handle_streaming_put(
         let actual = sha256_hex_from_digest(h.finish().as_ref());
         if &actual != claimed {
             abort_streaming(&state, &ctx, session_id.clone()).await;
-            return error_response(&ServerError::XAmzContentSHA256Mismatch {
-                client_hash: claimed.clone(),
-                server_hash: actual,
-            });
+            return error_response(
+                &ServerError::XAmzContentSHA256Mismatch {
+                    client_hash: claimed.clone(),
+                    server_hash: actual,
+                },
+                &wire_ids,
+            );
         }
     }
 
@@ -3190,7 +3228,7 @@ async fn handle_streaming_put(
         actual_bytes.copy_from_slice(actual.as_ref());
         if let Err(err) = claim.verify(&actual_bytes) {
             abort_streaming(&state, &ctx, session_id.clone()).await;
-            return error_response(&err);
+            return error_response(&err, &wire_ids);
         }
     }
 
@@ -3202,7 +3240,10 @@ async fn handle_streaming_put(
             // Inline checksum header: verify against streamed body.
             if *claimed != actual_b64 {
                 abort_streaming(&state, &ctx, session_id.clone()).await;
-                return error_response(&ServerError::ChecksumDigestMismatch { algorithm });
+                return error_response(
+                    &ServerError::ChecksumDigestMismatch { algorithm },
+                    &wire_ids,
+                );
             }
         } else {
             // Trailing checksum: exactly one trailer expected.
@@ -3210,16 +3251,22 @@ async fn handle_streaming_put(
                 1 => {
                     if trailer_checksums[0].1 != actual_b64 {
                         abort_streaming(&state, &ctx, session_id.clone()).await;
-                        return error_response(&ServerError::ChecksumDigestMismatch { algorithm });
+                        return error_response(
+                            &ServerError::ChecksumDigestMismatch { algorithm },
+                            &wire_ids,
+                        );
                     }
                 }
                 0 => {} // No checksum trailer in body — nothing to validate.
                 _ => {
                     // Multiple distinct checksum trailers — reject.
                     abort_streaming(&state, &ctx, session_id.clone()).await;
-                    return error_response(&ServerError::InvalidRequest {
-                        reason: "multiple checksum trailers not supported".to_string(),
-                    });
+                    return error_response(
+                        &ServerError::InvalidRequest {
+                            reason: "multiple checksum trailers not supported".to_string(),
+                        },
+                        &wire_ids,
+                    );
                 }
             }
         }
@@ -3250,7 +3297,7 @@ async fn handle_streaming_put(
         .await
         {
             Ok(Ok(resp)) => resp,
-            Ok(Err(err)) => error_response(&err),
+            Ok(Err(err)) => error_response(&err, &wire_ids),
             Err(_) => internal_error_response(&wire_ids),
         };
     }
@@ -3360,7 +3407,7 @@ async fn handle_streaming_put(
         }
         Ok(Err(err)) => {
             abort_streaming(&state, &ctx, Some(active_session_id.clone())).await;
-            error_response(&err)
+            error_response(&err, &wire_ids)
         }
         Err(_) => {
             abort_streaming(&state, &ctx, Some(active_session_id)).await;
@@ -3821,7 +3868,6 @@ async fn handle_streaming_part(
     wire_ids: WireResponseIds,
 ) -> S3Response {
     let idle_timeout = state.config.body_idle_timeout;
-    let error_response = |err: &ServerError| S3Response::error_with_ids(err, "", &wire_ids);
     let mut body = body;
     let abort_guard = StreamingAbortGuard::new(&state);
 
@@ -3861,7 +3907,7 @@ async fn handle_streaming_part(
         Ok(Ok(ctx)) => ctx,
         Ok(Err(err)) => {
             return finish_streaming_prepare_failure(
-                error_response(&err),
+                error_response(&err, &wire_ids),
                 &err,
                 has_auth_attempt,
                 &mut body,
@@ -3917,7 +3963,7 @@ async fn handle_streaming_part(
                                 Ok(p) => p,
                                 Err(err) => {
                                     abort_streaming_part_ctx(&state, &ctx).await;
-                                    return error_response(&err);
+                                    return error_response(&err, &wire_ids);
                                 }
                             };
                             let mut ingest = StreamingPartIngestState {
@@ -3967,16 +4013,22 @@ async fn handle_streaming_part(
             }
             Ok(Some(Err(_))) => {
                 abort_streaming_part_ctx(&state, &ctx).await;
-                return error_response(&ServerError::InvalidRequest {
-                    reason: "failed to read request body".to_string(),
-                });
+                return error_response(
+                    &ServerError::InvalidRequest {
+                        reason: "failed to read request body".to_string(),
+                    },
+                    &wire_ids,
+                );
             }
             Ok(None) => break,
             Err(_) => {
                 abort_streaming_part_ctx(&state, &ctx).await;
-                return error_response(&ServerError::InvalidRequest {
-                    reason: "request body read timed out".to_string(),
-                });
+                return error_response(
+                    &ServerError::InvalidRequest {
+                        reason: "request body read timed out".to_string(),
+                    },
+                    &wire_ids,
+                );
             }
         }
     }
@@ -4015,7 +4067,7 @@ async fn handle_streaming_part(
     if let Some(dec) = decoder {
         if !dec.is_done() {
             abort_streaming_part_ctx(&state, &ctx).await;
-            return error_response(&ServerError::IncompleteBody);
+            return error_response(&ServerError::IncompleteBody, &wire_ids);
         }
         let trailers = dec.into_trailers();
         if let Err(err) = validate_chunked_post_decode(
@@ -4025,13 +4077,13 @@ async fn handle_streaming_part(
             declared_trailer.as_deref(),
         ) {
             abort_streaming_part_ctx(&state, &ctx).await;
-            return error_response(&err);
+            return error_response(&err, &wire_ids);
         }
         match extract_checksum_trailers(&trailers) {
             Ok(tc) => trailer_checksums = tc,
             Err(err) => {
                 abort_streaming_part_ctx(&state, &ctx).await;
-                return error_response(&err);
+                return error_response(&err, &wire_ids);
             }
         }
     }
@@ -4040,10 +4092,13 @@ async fn handle_streaming_part(
         let actual = sha256_hex_from_digest(h.finish().as_ref());
         if &actual != claimed {
             abort_streaming_part_ctx(&state, &ctx).await;
-            return error_response(&ServerError::XAmzContentSHA256Mismatch {
-                client_hash: claimed.clone(),
-                server_hash: actual,
-            });
+            return error_response(
+                &ServerError::XAmzContentSHA256Mismatch {
+                    client_hash: claimed.clone(),
+                    server_hash: actual,
+                },
+                &wire_ids,
+            );
         }
     }
 
@@ -4053,7 +4108,7 @@ async fn handle_streaming_part(
         actual_bytes.copy_from_slice(actual.as_ref());
         if let Err(err) = claim.verify(&actual_bytes) {
             abort_streaming_part_ctx(&state, &ctx).await;
-            return error_response(&err);
+            return error_response(&err, &wire_ids);
         }
     }
 
@@ -4068,7 +4123,10 @@ async fn handle_streaming_part(
             // Inline checksum header: verify against streamed body.
             if *claimed != actual_b64 {
                 abort_streaming_part_ctx(&state, &ctx).await;
-                return error_response(&ServerError::ChecksumDigestMismatch { algorithm });
+                return error_response(
+                    &ServerError::ChecksumDigestMismatch { algorithm },
+                    &wire_ids,
+                );
             }
         } else {
             // Trailing checksum: validate if present.
@@ -4076,15 +4134,21 @@ async fn handle_streaming_part(
                 1 => {
                     if trailer_checksums[0].1 != actual_b64 {
                         abort_streaming_part_ctx(&state, &ctx).await;
-                        return error_response(&ServerError::ChecksumDigestMismatch { algorithm });
+                        return error_response(
+                            &ServerError::ChecksumDigestMismatch { algorithm },
+                            &wire_ids,
+                        );
                     }
                 }
                 0 => {}
                 _ => {
                     abort_streaming_part_ctx(&state, &ctx).await;
-                    return error_response(&ServerError::InvalidRequest {
-                        reason: "multiple checksum trailers not supported".to_string(),
-                    });
+                    return error_response(
+                        &ServerError::InvalidRequest {
+                            reason: "multiple checksum trailers not supported".to_string(),
+                        },
+                        &wire_ids,
+                    );
                 }
             }
         }
@@ -4195,7 +4259,7 @@ async fn handle_streaming_part(
                     None,
                 );
                 abort_streaming_part_ctx(&state, &ctx).await;
-                return error_response(&err);
+                return error_response(&err, &wire_ids);
             }
             Err(_) => {
                 emit_streaming_part_phase(
@@ -4319,7 +4383,7 @@ async fn handle_streaming_part(
                 Some(segment_index + u32::from(had_tail)),
             );
             abort_streaming_part_ctx(&state, &ctx).await;
-            error_response(&err)
+            error_response(&err, &wire_ids)
         }
         Err(_) => {
             emit_streaming_part_phase(
@@ -5292,7 +5356,7 @@ mod tests {
                 cluster_epoch: storage::ClusterEpoch::new(7).unwrap(),
                 bucket_execution_generation: 11,
                 created_at: 1000,
-                lease_deadline: Some(2000),
+                lease_deadline: 2000,
             }),
             pending_metadata_command: Some(storage::BucketDeleteDebugPendingCommand {
                 kind: "mark_bucket_deleting",
