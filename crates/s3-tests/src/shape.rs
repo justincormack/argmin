@@ -825,6 +825,48 @@ pub mod expected_error {
 mod tests {
     use super::*;
 
+    thread_local! {
+        static SUPPRESS_EXPECTED_PANIC_OUTPUT: std::cell::Cell<bool> =
+            const { std::cell::Cell::new(false) };
+    }
+
+    static EXPECTED_PANIC_HOOK: std::sync::Once = std::sync::Once::new();
+
+    /// RAII guard silencing the default panic message while a should-panic
+    /// test exercises an expected `assert_shape` failure.
+    struct SuppressExpectedPanicOutput {
+        previous_suppressed: bool,
+    }
+
+    impl SuppressExpectedPanicOutput {
+        fn new() -> Self {
+            EXPECTED_PANIC_HOOK.call_once(|| {
+                let previous_hook = std::panic::take_hook();
+                std::panic::set_hook(Box::new(move |panic_info| {
+                    if SUPPRESS_EXPECTED_PANIC_OUTPUT.with(std::cell::Cell::get) {
+                        return;
+                    }
+                    previous_hook(panic_info);
+                }));
+            });
+            let previous_suppressed = SUPPRESS_EXPECTED_PANIC_OUTPUT.with(|suppressed| {
+                let previous = suppressed.get();
+                suppressed.set(true);
+                previous
+            });
+            Self {
+                previous_suppressed,
+            }
+        }
+    }
+
+    impl Drop for SuppressExpectedPanicOutput {
+        fn drop(&mut self) {
+            SUPPRESS_EXPECTED_PANIC_OUTPUT
+                .with(|suppressed| suppressed.set(self.previous_suppressed));
+        }
+    }
+
     fn response(status: u16, headers: &[(&str, &str)], body: &str) -> RawResponse {
         RawResponse {
             status,
@@ -953,6 +995,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "unexpected")]
     fn shape_spec_rejects_unexpected_header() {
+        let _panic_guard = SuppressExpectedPanicOutput::new();
         let resp = response(
             404,
             &[
@@ -975,6 +1018,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "missing")]
     fn shape_spec_rejects_missing_header() {
+        let _panic_guard = SuppressExpectedPanicOutput::new();
         let resp = response(
             404,
             &[
@@ -995,6 +1039,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "{request_id}")]
     fn shape_spec_rejects_body_header_id_mismatch() {
+        let _panic_guard = SuppressExpectedPanicOutput::new();
         let resp = response(
             404,
             &[
@@ -1032,6 +1077,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "matches none")]
     fn one_of_rejects_when_nothing_matches() {
+        let _panic_guard = SuppressExpectedPanicOutput::new();
         let resp = response(403, &[], "");
         assert_shape_one_of("test", &resp, &[shape().status(500), shape().status(400)]);
     }
