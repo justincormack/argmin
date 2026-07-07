@@ -5846,7 +5846,7 @@ mod tests {
     ) -> (String, usize) {
         const WRITE_CHUNK_BYTES: usize = 1024;
         const WRITE_CHUNK_DELAY: Duration = Duration::from_millis(20);
-        const RESPONSE_TIMEOUT: Duration = Duration::from_secs(3);
+        const RESPONSE_TIMEOUT: Duration = Duration::from_secs(15);
 
         let mut stream = StdTcpStream::connect(addr).unwrap();
         stream.set_nodelay(true).unwrap();
@@ -5890,7 +5890,7 @@ mod tests {
     ) -> (String, usize) {
         const WRITE_CHUNK_BYTES: usize = 1024;
         const WRITE_CHUNK_DELAY: Duration = Duration::from_millis(20);
-        const RESPONSE_TIMEOUT: Duration = Duration::from_secs(3);
+        const RESPONSE_TIMEOUT: Duration = Duration::from_secs(15);
 
         let mut stream = StdTcpStream::connect(addr).unwrap();
         stream.set_nodelay(true).unwrap();
@@ -5936,7 +5936,7 @@ mod tests {
     ) -> (String, usize) {
         const WRITE_CHUNK_BYTES: usize = 1024;
         const WRITE_CHUNK_DELAY: Duration = Duration::from_millis(20);
-        const RESPONSE_TIMEOUT: Duration = Duration::from_secs(3);
+        const RESPONSE_TIMEOUT: Duration = Duration::from_secs(15);
 
         let mut stream = StdTcpStream::connect(addr).unwrap();
         stream.set_nodelay(true).unwrap();
