@@ -9093,9 +9093,65 @@ mod tests {
     use std::cell::Cell;
     use std::sync::{
         atomic::{AtomicU64, Ordering},
-        Arc,
+        Arc, Once,
     };
     use std::time::{Duration, Instant};
+
+    thread_local! {
+        static SUPPRESS_EXPECTED_TEST_PANIC: Cell<bool> = const { Cell::new(false) };
+    }
+
+    static EXPECTED_TEST_PANIC_HOOK: Once = Once::new();
+
+    struct SuppressExpectedTestPanic {
+        previous_suppressed: bool,
+    }
+
+    impl SuppressExpectedTestPanic {
+        fn enter() -> Self {
+            EXPECTED_TEST_PANIC_HOOK.call_once(|| {
+                let previous_hook = std::panic::take_hook();
+                std::panic::set_hook(Box::new(move |panic_info| {
+                    if SUPPRESS_EXPECTED_TEST_PANIC.with(Cell::get) {
+                        return;
+                    }
+                    previous_hook(panic_info);
+                }));
+            });
+            let previous_suppressed = SUPPRESS_EXPECTED_TEST_PANIC.with(|suppressed| {
+                let previous = suppressed.get();
+                suppressed.set(true);
+                previous
+            });
+            Self {
+                previous_suppressed,
+            }
+        }
+    }
+
+    impl Drop for SuppressExpectedTestPanic {
+        fn drop(&mut self) {
+            SUPPRESS_EXPECTED_TEST_PANIC
+                .with(|suppressed| suppressed.set(self.previous_suppressed));
+        }
+    }
+
+    fn expect_panic_containing(expected: &str, f: impl FnOnce()) {
+        let result = {
+            let _panic_guard = SuppressExpectedTestPanic::enter();
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(f))
+        };
+        let panic = result.expect_err("expected control-plane invariant panic");
+        let message = panic
+            .downcast_ref::<&str>()
+            .map(|message| (*message).to_string())
+            .or_else(|| panic.downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "<non-string panic payload>".to_string());
+        assert!(
+            message.contains(expected),
+            "panic message {message:?} did not contain {expected:?}"
+        );
+    }
 
     #[derive(Debug)]
     struct FailingStore {
@@ -10464,7 +10520,6 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "attempted to commit invalid control-plane snapshot")]
     fn direct_snapshot_commit_validates_control_plane_invariants() {
         let tmp = test_util::tempdir();
         let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
@@ -10483,11 +10538,12 @@ mod tests {
         pg.state = PgState::Active;
         pg.active_primary = Some(NodeId::new(1));
         pg.active_metadata_proof = Some(PgMetadataProof::empty());
-        authority.commit_snapshot(snapshot).unwrap();
+        expect_panic_containing("attempted to commit invalid control-plane snapshot", || {
+            authority.commit_snapshot(snapshot).unwrap()
+        });
     }
 
     #[test]
-    #[should_panic(expected = "attempted to open invalid control-plane snapshot")]
     fn open_validates_control_plane_invariants_before_saving() {
         let pg_id = PgId::new(27);
         let mut snapshot = ClusterControlSnapshot::empty();
@@ -10510,34 +10566,44 @@ mod tests {
         );
 
         let store = FailingStore::new(snapshot);
-        let _ = SingleAuthorityControlPlane::open(store);
+        expect_panic_containing("attempted to open invalid control-plane snapshot", || {
+            let _ = SingleAuthorityControlPlane::open(store);
+        });
     }
 
     #[test]
-    #[should_panic(
-        expected = "attempted to create replicated state machine from invalid control-plane snapshot"
-    )]
     fn replicated_state_machine_constructor_validates_control_plane_invariants() {
         let snapshot = active_snapshot_without_metadata_proof_epoch(PgId::new(28));
-        let _ = crate::control_plane_command::ReplicatedControlPlaneStateMachine::new(
-            snapshot,
-            crate::control_plane_command::ControlPlaneLogId::new(1, 1),
+        expect_panic_containing(
+            "attempted to create replicated state machine from invalid control-plane snapshot",
+            || {
+                let _ = crate::control_plane_command::ReplicatedControlPlaneStateMachine::new(
+                    snapshot,
+                    crate::control_plane_command::ControlPlaneLogId::new(1, 1),
+                );
+            },
         );
     }
 
     #[test]
-    #[should_panic(expected = "attempted to install invalid replicated control-plane snapshot")]
     fn replicated_snapshot_install_validates_control_plane_invariants_before_mutation() {
         let invalid_snapshot = active_snapshot_without_metadata_proof_epoch(PgId::new(29));
         let payload =
             crate::control_plane_command::encode_control_plane_snapshot(&invalid_snapshot).unwrap();
         let mut state_machine =
             crate::control_plane_command::ReplicatedControlPlaneStateMachine::empty();
-        state_machine
-            .install_snapshot_artifact(
-                crate::control_plane_command::ControlPlaneSnapshotArtifact::new(None, payload),
-            )
-            .unwrap();
+        expect_panic_containing(
+            "attempted to install invalid replicated control-plane snapshot",
+            || {
+                state_machine
+                    .install_snapshot_artifact(
+                        crate::control_plane_command::ControlPlaneSnapshotArtifact::new(
+                            None, payload,
+                        ),
+                    )
+                    .unwrap();
+            },
+        );
     }
 
     #[test]

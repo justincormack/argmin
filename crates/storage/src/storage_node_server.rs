@@ -17228,6 +17228,7 @@ mod tests {
         private_socket_dir(config.socket_path.parent().unwrap());
         let socket_path = config.socket_path.clone();
         let server = StorageNodeServer::bind(config).unwrap();
+        let _stderr_guard = server.suppress_metadata_command_lock_wait_stderr();
         let _server_thread = thread::spawn(move || server.serve_forever().unwrap());
         let request = StorageRpcMetadataCommandStateRequest {
             node_id: NodeId::new(7),
