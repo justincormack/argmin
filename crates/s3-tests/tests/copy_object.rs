@@ -3,7 +3,9 @@ use aws_sdk_s3::types::{ChecksumType, ObjectAttributes};
 use aws_sdk_s3::Client;
 use s3_tests::{
     assert_s3_err_code, cleanup_versioned_bucket, copy_source_with_version, err_status,
-    retrying_operation_aborted, retrying_operation_aborted_result, send_signed_request,
+    raw_object_with, retrying_operation_aborted, retrying_operation_aborted_result,
+    send_signed_request,
+    shape::{assert_shape, shape},
     unique_bucket, SendRetryingOperationAborted, CTX,
 };
 use std::time::Duration;
@@ -1403,5 +1405,52 @@ fn test_copy_object_source_oversized_bucket_rejected() {
         assert_raw_s3_error(&response, 404, "NoSuchBucket");
 
         cleanup(&bucket, &[]).await;
+    });
+}
+
+#[test]
+fn test_copy_object_response_shape() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
+        let src_key = "copy-source.txt";
+        let dst_key = "copy-dest.txt";
+
+        raw_object_with("PUT", &bucket, src_key, b"copy source body", &[]);
+        let response = raw_object_with(
+            "PUT",
+            &bucket,
+            dst_key,
+            b"",
+            &[("x-amz-copy-source", &format!("{bucket}/{src_key}"))],
+        );
+        assert_shape(
+            "CopyObject shape",
+            &response,
+            &shape()
+                .status(200)
+                .headers([
+                    ("content-type", "application/xml"),
+                    ("content-length", "{any}"),
+                    ("x-amz-server-side-encryption", "AES256"),
+                    ("x-amz-request-id", "{request_id}"),
+                    ("x-amz-id-2", "{host_id}"),
+                ])
+                .body(
+                    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<CopyObjectResult \
+                     xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
+                     <LastModified>{iso8601}</LastModified><ETag>{etag}</ETag>\
+                     <ChecksumCRC64NVME>Ze8UTXhpCtY=</ChecksumCRC64NVME>\
+                     <ChecksumType>FULL_OBJECT</ChecksumType></CopyObjectResult>",
+                ),
+        );
+
+        for key in [src_key, dst_key] {
+            s3_tests::delete_object_retrying_operation_aborted(client, &bucket, key)
+                .await
+                .expect("delete copy shape fixture");
+        }
+        s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
     });
 }

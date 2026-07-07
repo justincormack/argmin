@@ -315,6 +315,19 @@ batch, deleting each diff test once its shape coverage is subsumed. Batches
    ListObjects v1/v2 carry `x-amz-bucket-region`, the other listings
    do not.
 7. POST object, CopyObject, GetObjectAttributes, delete-marker shapes
+   — DONE (delete-marker shapes were converted in batch 2): six golden
+   tests across bucket_crud, tagging, object_crud, post_object,
+   copy_object, and object_attributes, all AWS-validated first try.
+   HeadBucket is the second accept-either case (AWS sends
+   Transfer-Encoding: chunked on HEAD, Argmin does not — guide §9).
+   Object tag order is not pinned on either endpoint, so the tagging
+   body uses the canonicalizing unordered-block helper. The PostObject
+   Location authority is endpoint-specific; the pattern bakes the
+   bucket/key into the template so `{any}` covers only the authority.
+   With this batch response_shape.rs is EMPTY and has been deleted
+   (Cargo.toml test target removed; guide/script examples now point at
+   bucket_policy) — only the Phase 4 bucket-policy matrices remain in
+   the diff crate.
 
 Each batch ends with: local `cargo nextest run` for the touched binaries,
 `./scripts/aws-tests --test <binary>` green, corresponding diff tests

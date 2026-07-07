@@ -41,8 +41,8 @@ cargo test -p s3-local-tests
 # Standalone binary UAT acceptance run.
 ./scripts/uat-s3-tests --test bucket_crud
 
-# Differential AWS-vs-local response-shape tests.
-./scripts/diff-tests --test response_shape
+# Differential AWS-vs-local bucket-policy matrices.
+./scripts/diff-tests --test bucket_policy
 ```
 
 ## Deterministic Unit Tests
@@ -500,12 +500,14 @@ S3_TEST_TIMEOUT_SECS="${TEST_S3_TIMEOUT_SECS:-120}" \
 cargo test -p s3-http-tests --no-fail-fast
 ```
 
-### Differential AWS-vs-local response-shape checks
+### Differential AWS-vs-local checks
 
-Differential response-shape checks live in `crates/s3-diff-tests`. Each test
-in `crates/s3-diff-tests/tests/response_shape.rs` sends the same request to
-real AWS and to the embedded local server, then compares the response status,
-headers, and body shape.
+The remaining differential checks live in `crates/s3-diff-tests`: the
+`bucket_policy` scenario matrices, which run the same requests against real
+AWS and the embedded local server. The former `response_shape` suite has been
+fully converted to golden shape assertions inside `crates/s3-tests` (see
+`crates/s3-tests/src/shape.rs` and
+plans/diff-test-consolidation-plan.md); the rest of this crate follows.
 
 This is different from the other dedicated test crates:
 
@@ -525,7 +527,7 @@ silent skip.
 Recommended command:
 
 ```bash
-./scripts/diff-tests --test response_shape -- --nocapture
+./scripts/diff-tests --test bucket_policy -- --nocapture
 ```
 
 Like `./scripts/aws-tests`, this wrapper accepts region overrides and forwards
@@ -533,7 +535,6 @@ additional `cargo test` selection arguments:
 
 ```bash
 ./scripts/diff-tests --region us-west-2 --test bucket_policy -- --nocapture
-./scripts/diff-tests response_shape
 ```
 
 ### Local-only tests

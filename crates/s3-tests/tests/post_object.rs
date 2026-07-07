@@ -4,8 +4,10 @@ use aws_sdk_s3::{primitives::ByteStream, types::ServerSideEncryption};
 use ring::hmac;
 use s3_tests::{
     assert_s3_err_code, err_status, post_object_raw_to_test_endpoint_with_headers,
-    sigv4_post_sse_c_fields_for_credentials, sse_c_header_values, test_sse_c_key, unique_bucket,
-    RawResponse, SendRetryingOperationAborted, CTX,
+    shape::{assert_shape, shape},
+    sigv4_post_fields_for_credentials, sigv4_post_sse_c_fields_for_credentials,
+    sse_c_header_values, test_sse_c_key, unique_bucket, RawResponse, SendRetryingOperationAborted,
+    CTX,
 };
 
 /// Create a bucket, returning its name.
@@ -3936,6 +3938,59 @@ fn test_post_object_unquoted_field_names() {
             .send()
             .await
             .unwrap();
+        s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
+    });
+}
+
+#[test]
+fn test_post_object_response_shape() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
+        let key = "shape-post-object.txt";
+
+        let fields = sigv4_post_fields_for_credentials(
+            CTX.access_key(),
+            CTX.secret_key(),
+            CTX.region(),
+            &bucket,
+            key,
+            &[],
+        );
+        let response = post_object_raw_to_test_endpoint_with_headers(
+            CTX.endpoint(),
+            CTX.tls_ca_pem(),
+            &bucket,
+            &fields,
+            b"post-body",
+            "test.txt",
+            &[],
+        );
+        // The Location authority is endpoint-specific; the path suffix and
+        // everything else is pinned. The bucket/key are baked into the
+        // pattern so {any} terminates on the full path, not the first '/'.
+        let location_pattern = format!("http{{any}}/{bucket}/{key}");
+        assert_shape(
+            "PostObject shape",
+            &response,
+            &shape()
+                .status(204)
+                .headers([
+                    ("location", location_pattern.as_str()),
+                    ("x-amz-checksum-crc64nvme", "1pmdgt0Q3gY="),
+                    ("x-amz-checksum-type", "FULL_OBJECT"),
+                    ("etag", "{etag}"),
+                    ("x-amz-server-side-encryption", "AES256"),
+                    ("x-amz-request-id", "{request_id}"),
+                    ("x-amz-id-2", "{host_id}"),
+                ])
+                .body_empty(),
+        );
+
+        s3_tests::delete_object_retrying_operation_aborted(client, &bucket, key)
+            .await
+            .expect("delete post shape fixture");
         s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
     });
 }

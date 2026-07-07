@@ -7,7 +7,7 @@ use aws_sdk_s3::types::{
 use s3_tests::{
     assert_s3_err_code, cleanup_versioned_bucket, content_md5_header,
     delete_bucket_retrying_operation_aborted, err_status, raw_bucket, send_signed_request,
-    shape::{assert_shape, chunked_response_headers, shape},
+    shape::{assert_body_with_unordered_blocks, assert_shape, chunked_response_headers, shape},
     unique_bucket, SendRetryingOperationAborted, CTX,
 };
 use serde_json::json;
@@ -3368,6 +3368,75 @@ fn test_get_bucket_tagging_response_shape() {
                 ),
         );
 
+        s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
+    });
+}
+
+#[test]
+fn test_get_object_tagging_response_shape() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
+        let key = "shape-object-tagging.txt";
+        s3_tests::put_object_retrying_operation_aborted(
+            client,
+            &bucket,
+            key,
+            b"object-tagging".to_vec(),
+        )
+        .await;
+        client
+            .put_object_tagging()
+            .bucket(&bucket)
+            .key(key)
+            .tagging(
+                aws_sdk_s3::types::Tagging::builder()
+                    .tag_set(
+                        aws_sdk_s3::types::Tag::builder()
+                            .key("env")
+                            .value("prod")
+                            .build()
+                            .unwrap(),
+                    )
+                    .tag_set(
+                        aws_sdk_s3::types::Tag::builder()
+                            .key("tier")
+                            .value("hot")
+                            .build()
+                            .unwrap(),
+                    )
+                    .build()
+                    .unwrap(),
+            )
+            .send_retrying_operation_aborted("put object tagging shape fixture")
+            .await
+            .unwrap();
+
+        // Object tag order is not pinned; compare the Tag entries as an
+        // unordered set inside an exact envelope.
+        let response = s3_tests::raw_object_query("GET", &bucket, key, "tagging=");
+        assert_shape(
+            "GetObjectTagging shape",
+            &response,
+            &shape().status(200).headers(chunked_response_headers()),
+        );
+        assert_body_with_unordered_blocks(
+            "GetObjectTagging shape",
+            &response.body,
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Tagging \
+             xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><TagSet></TagSet></Tagging>",
+            "Tag",
+            &[
+                "<Tag><Key>env</Key><Value>prod</Value></Tag>".to_string(),
+                "<Tag><Key>tier</Key><Value>hot</Value></Tag>".to_string(),
+            ],
+            &std::collections::BTreeMap::new(),
+        );
+
+        s3_tests::delete_object_retrying_operation_aborted(client, &bucket, key)
+            .await
+            .expect("delete tagging shape fixture");
         s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
     });
 }

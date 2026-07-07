@@ -3,7 +3,7 @@ use ring::{digest, hmac};
 use s3_tests::{
     assert_s3_err_code, delete_all_and_bucket, err_status, raw_object, raw_object_with,
     send_signed_request,
-    shape::{assert_shape, error_response_headers, expected_error, shape},
+    shape::{assert_shape, error_response_headers, expected_error, shape, xml_response_headers},
     unique_bucket, SendRetryingOperationAborted, CTX,
 };
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -1751,6 +1751,42 @@ fn test_object_content_encoding_aws_chunked() {
             .send()
             .await
             .unwrap();
+        s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
+    });
+}
+
+#[test]
+fn test_get_object_acl_response_shape() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+        let key = "shape-object-acl.txt";
+        s3_tests::put_object_retrying_operation_aborted(
+            client,
+            &bucket,
+            key,
+            b"object-acl".to_vec(),
+        )
+        .await;
+
+        let response = s3_tests::raw_object_query("GET", &bucket, key, "acl=");
+        assert_shape(
+            "GetObjectAcl shape",
+            &response,
+            &shape().status(200).headers(xml_response_headers()).body(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<AccessControlPolicy \
+                     xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Owner><ID>{owner_id}</ID>\
+                     </Owner><AccessControlList><Grant><Grantee \
+                     xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" \
+                     xsi:type=\"CanonicalUser\"><ID>{owner_id}</ID></Grantee>\
+                     <Permission>FULL_CONTROL</Permission></Grant></AccessControlList>\
+                     </AccessControlPolicy>",
+            ),
+        );
+
+        s3_tests::delete_object_retrying_operation_aborted(client, &bucket, key)
+            .await
+            .expect("delete object acl shape fixture");
         s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
     });
 }

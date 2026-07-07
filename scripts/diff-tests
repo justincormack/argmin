@@ -24,7 +24,7 @@ Options:
 
 Examples:
   ./scripts/diff-tests
-  ./scripts/diff-tests --test response_shape -- --nocapture
+  ./scripts/diff-tests --test bucket_policy -- --nocapture
   ./scripts/diff-tests --region us-west-2 bucket_policy
 EOF
 }

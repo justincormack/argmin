@@ -8,7 +8,7 @@ use s3_tests::{
     assert_s3_err_code, bucket_prefix, cleanup_versioned_bucket, delete_all_and_bucket, err_status,
     expected_raw_bucket_location_constraint, raw_bucket, retrying_operation_aborted,
     retrying_operation_aborted_result, send_signed_request,
-    shape::{assert_shape, shape, xml_response_headers},
+    shape::{assert_shape, assert_shape_one_of, shape, xml_response_headers},
     unique_bucket, RawResponse, SendRetryingOperationAborted, CTX,
 };
 use s3_types::{is_legacy_create_bucket_region, BucketNamespace};
@@ -729,6 +729,49 @@ fn test_get_bucket_location_response_shape() {
                 .status(200)
                 .headers(xml_response_headers())
                 .body(expected_body),
+        );
+
+        s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
+    });
+}
+
+#[test]
+fn test_head_bucket_response_shape() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
+
+        let response = raw_bucket("HEAD", &bucket, None);
+        let base_headers = [
+            ("content-type", "application/xml"),
+            ("x-amz-access-point-alias", "false"),
+            ("x-amz-bucket-arn", "{bucket_arn}"),
+            ("x-amz-bucket-region", "{region}"),
+            ("x-amz-request-id", "{request_id}"),
+            ("x-amz-id-2", "{host_id}"),
+        ];
+        // AWS includes Transfer-Encoding: chunked on HeadBucket; Argmin's
+        // HEAD handling (via Hyper) omits it. See guides/aws-compatibility.md
+        // ("HeadBucket omits Transfer-Encoding").
+        assert_shape_one_of(
+            "HeadBucket shape",
+            &response,
+            &[
+                shape()
+                    .status(200)
+                    .headers(base_headers)
+                    .header("transfer-encoding", "chunked")
+                    .sub("bucket_arn", format!("arn:aws:s3:::{bucket}"))
+                    .sub("region", CTX.region())
+                    .body_empty(),
+                shape()
+                    .status(200)
+                    .headers(base_headers)
+                    .sub("bucket_arn", format!("arn:aws:s3:::{bucket}"))
+                    .sub("region", CTX.region())
+                    .body_empty(),
+            ],
         );
 
         s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;

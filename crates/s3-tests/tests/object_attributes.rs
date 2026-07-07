@@ -4,8 +4,9 @@ use aws_sdk_s3::types::{
     ObjectAttributes, StorageClass, VersioningConfiguration,
 };
 use s3_tests::{
-    assert_s3_err_code, err_status, send_signed_request, sse_c_header_values, test_sse_c_key,
-    unique_bucket, SendRetryingOperationAborted, CTX,
+    assert_s3_err_code, err_status, send_signed_request,
+    shape::{assert_shape, id_headers, shape, xml_tag_text},
+    sse_c_header_values, test_sse_c_key, unique_bucket, SendRetryingOperationAborted, CTX,
 };
 
 const PART_SIZE: usize = 5 * 1024 * 1024; // 5 MB minimum part size
@@ -1250,5 +1251,119 @@ fn test_multipart_crc32_explicit_full_object() {
         );
 
         cleanup(&bucket, &[key]).await;
+    });
+}
+
+#[test]
+fn test_get_object_attributes_multipart_response_shape() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
+        let key = "shape-object-attributes.txt";
+
+        let create = send_signed_request(
+            "POST",
+            &format!("{}/{}/{}?uploads=", CTX.endpoint(), bucket, key),
+            b"",
+            [
+                ("Content-Type", "application/octet-stream"),
+                ("x-amz-checksum-algorithm", "CRC32"),
+            ],
+        );
+        let upload_id = xml_tag_text(&create.body, "UploadId")
+            .expect("create upload for attributes fixture")
+            .to_string();
+        let big = vec![b'B'; 5 * 1024 * 1024];
+        let mut etags = vec![];
+        let mut checksums = vec![];
+        for (part_number, body) in [(1u32, big.as_slice()), (2, &b"attributes-second-part"[..])] {
+            let crc32 = s3_tests::sdk_checksum_headers(body)
+                .into_iter()
+                .find(|(header, _)| header == "x-amz-checksum-crc32")
+                .map(|(_, value)| value)
+                .expect("crc32 checksum header");
+            let part = send_signed_request(
+                "PUT",
+                &format!(
+                    "{}/{}/{}?partNumber={}&uploadId={}",
+                    CTX.endpoint(),
+                    bucket,
+                    key,
+                    part_number,
+                    upload_id
+                ),
+                body,
+                [("x-amz-checksum-crc32", crc32.as_str())],
+            );
+            let etag = s3_tests::shape::response_header_value(&part, "etag")
+                .expect("part etag")
+                .to_string();
+            etags.push(etag);
+            checksums.push(crc32);
+        }
+        let complete_body = format!(
+            "<CompleteMultipartUpload>\
+             <Part><PartNumber>1</PartNumber><ETag>{}</ETag>\
+             <ChecksumCRC32>{}</ChecksumCRC32></Part>\
+             <Part><PartNumber>2</PartNumber><ETag>{}</ETag>\
+             <ChecksumCRC32>{}</ChecksumCRC32></Part>\
+             </CompleteMultipartUpload>",
+            etags[0], checksums[0], etags[1], checksums[1]
+        );
+        let complete = send_signed_request(
+            "POST",
+            &format!(
+                "{}/{}/{}?uploadId={}",
+                CTX.endpoint(),
+                bucket,
+                key,
+                upload_id
+            ),
+            complete_body.as_bytes(),
+            [("Content-Type", "application/xml")],
+        );
+        assert_eq!(complete.status, 200, "complete fixture: {complete:?}");
+
+        // Composite CRC32 attributes for a two-part upload: every checksum
+        // value is deterministic for the fixed part bodies.
+        let response = send_signed_request(
+            "GET",
+            &format!("{}/{}/{}?attributes=", CTX.endpoint(), bucket, key),
+            b"",
+            [(
+                "x-amz-object-attributes",
+                "Checksum,ObjectParts,ObjectSize,StorageClass",
+            )],
+        );
+        assert_shape(
+            "GetObjectAttributes multipart shape",
+            &response,
+            &shape()
+                .status(200)
+                .headers(id_headers())
+                .header("content-length", "698")
+                .header("last-modified", "{http_date}")
+                .body(
+                    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+                     <GetObjectAttributesResponse \
+                     xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Checksum>\
+                     <ChecksumCRC32>1wbLhg==</ChecksumCRC32>\
+                     <ChecksumType>COMPOSITE</ChecksumType></Checksum><ObjectParts>\
+                     <PartsCount>2</PartsCount><PartNumberMarker>0</PartNumberMarker>\
+                     <NextPartNumberMarker>2</NextPartNumberMarker><MaxParts>1000</MaxParts>\
+                     <IsTruncated>false</IsTruncated><Part><PartNumber>1</PartNumber>\
+                     <Size>5242880</Size><ChecksumCRC32>QoZTGg==</ChecksumCRC32></Part>\
+                     <Part><PartNumber>2</PartNumber><Size>22</Size>\
+                     <ChecksumCRC32>d7wqew==</ChecksumCRC32></Part></ObjectParts>\
+                     <StorageClass>STANDARD</StorageClass><ObjectSize>5242902</ObjectSize>\
+                     </GetObjectAttributesResponse>",
+                ),
+        );
+
+        s3_tests::delete_object_retrying_operation_aborted(client, &bucket, key)
+            .await
+            .expect("delete attributes shape fixture");
+        s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
     });
 }
