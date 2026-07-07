@@ -16,7 +16,7 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 use storage::storage_node_server::{
-    StorageNodePgRoute, StorageNodeProcessConfig, StorageNodeServer,
+    StorageNodePgRoute, StorageNodeProcessConfig, StorageNodeProcessConfigParts, StorageNodeServer,
 };
 use storage::{
     install_bucket_scoped_test_hooks, BucketScopedTestHooks, ClusterEpoch, LocalClusterMap,
@@ -447,7 +447,7 @@ fn shard_backfill_worker_executes_remote_storage_node_work() {
     let mut client_configs = Vec::new();
     for config in &configs {
         let socket_path = socket_dir.join(format!("node-{}.sock", config.node_id().as_u32()));
-        let server_config = StorageNodeProcessConfig {
+        let server_config = StorageNodeProcessConfig::new(StorageNodeProcessConfigParts {
             node_id: config.node_id(),
             cluster_epoch: desired_route.cluster_epoch(),
             route_map_validity: RouteMapValidity::Forever,
@@ -457,7 +457,8 @@ fn shard_backfill_worker_executes_remote_storage_node_work() {
             socket_path: socket_path.clone(),
             pg_routes: vec![StorageNodePgRoute::from(&desired_route)],
             historical_pg_routes: Vec::new(),
-        };
+        })
+        .unwrap();
         let server = Arc::new(StorageNodeServer::bind(server_config).unwrap());
         for _ in 0..4 {
             server_threads.push(spawn_storage_node_server_loop(
@@ -3936,7 +3937,7 @@ fn get_uses_retained_payload_route_over_unix_after_data_pg_move_and_metadata_rea
     let mut client_configs = Vec::new();
     for config in &configs {
         let socket_path = socket_dir.join(format!("node-{}.sock", config.node_id().as_u32()));
-        let server_config = StorageNodeProcessConfig {
+        let server_config = StorageNodeProcessConfig::new(StorageNodeProcessConfigParts {
             node_id: config.node_id(),
             cluster_epoch: next_epoch,
             route_map_validity: RouteMapValidity::Forever,
@@ -3949,7 +3950,8 @@ fn get_uses_retained_payload_route_over_unix_after_data_pg_move_and_metadata_rea
                 .iter()
                 .map(StorageNodePgRoute::from)
                 .collect(),
-        };
+        })
+        .unwrap();
         let server = Arc::new(StorageNodeServer::bind(server_config).unwrap());
         for _ in 0..4 {
             server_threads.push(spawn_storage_node_server_loop(
