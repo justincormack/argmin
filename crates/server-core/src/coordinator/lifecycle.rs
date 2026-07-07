@@ -409,8 +409,7 @@ impl Coordinator {
             && !rule.filter.has_size_filter()
             && rule
                 .filter
-                .prefix
-                .as_ref()
+                .prefix()
                 .is_none_or(|prefix| key.starts_with(prefix))
     }
 

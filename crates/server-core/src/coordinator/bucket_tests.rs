@@ -1346,10 +1346,7 @@ fn evaluate_current_object_lifecycle_expiration_selects_earliest_matching_rule()
             LifecycleRule {
                 id: Some("later".to_string()),
                 status: LifecycleRuleStatus::Enabled,
-                filter: LifecycleRuleFilter {
-                    prefix: Some("logs/".to_string()),
-                    ..LifecycleRuleFilter::default()
-                },
+                filter: LifecycleRuleFilter::legacy_prefix("logs/").unwrap(),
                 expiration: Some(LifecycleExpiration::Days(
                     std::num::NonZeroU32::new(30).unwrap(),
                 )),
@@ -1359,16 +1356,16 @@ fn evaluate_current_object_lifecycle_expiration_selects_earliest_matching_rule()
             LifecycleRule {
                 id: Some("earlier".to_string()),
                 status: LifecycleRuleStatus::Enabled,
-                filter: LifecycleRuleFilter {
-                    prefix: Some("logs/".to_string()),
-                    tags: vec![LifecycleTag {
+                filter: LifecycleRuleFilter::explicit_with_predicates(
+                    Some("logs/".to_string()),
+                    vec![LifecycleTag {
                         key: "env".to_string(),
                         value: "prod".to_string(),
                     }],
-                    object_size_greater_than: Some(10),
-                    object_size_less_than: None,
-                    explicit_filter: true,
-                },
+                    Some(10),
+                    None,
+                )
+                .unwrap(),
                 expiration: Some(LifecycleExpiration::Days(
                     std::num::NonZeroU32::new(1).unwrap(),
                 )),
@@ -1442,16 +1439,16 @@ fn evaluate_multipart_lifecycle_abort_headers_matches_prefix_rule() {
             LifecycleRule {
                 id: Some("skip-tagged".to_string()),
                 status: LifecycleRuleStatus::Enabled,
-                filter: LifecycleRuleFilter {
-                    prefix: Some("uploads/".to_string()),
-                    tags: vec![LifecycleTag {
+                filter: LifecycleRuleFilter::explicit_with_predicates(
+                    Some("uploads/".to_string()),
+                    vec![LifecycleTag {
                         key: "env".to_string(),
                         value: "prod".to_string(),
                     }],
-                    object_size_greater_than: None,
-                    object_size_less_than: None,
-                    explicit_filter: true,
-                },
+                    None,
+                    None,
+                )
+                .unwrap(),
                 expiration: None,
                 noncurrent_version_expiration: None,
                 abort_incomplete_multipart_upload: Some(AbortIncompleteMultipartUpload {
@@ -1461,10 +1458,7 @@ fn evaluate_multipart_lifecycle_abort_headers_matches_prefix_rule() {
             LifecycleRule {
                 id: Some("abort-prefix".to_string()),
                 status: LifecycleRuleStatus::Enabled,
-                filter: LifecycleRuleFilter {
-                    prefix: Some("uploads/".to_string()),
-                    ..LifecycleRuleFilter::default()
-                },
+                filter: LifecycleRuleFilter::legacy_prefix("uploads/").unwrap(),
                 expiration: None,
                 noncurrent_version_expiration: None,
                 abort_incomplete_multipart_upload: Some(AbortIncompleteMultipartUpload {

@@ -38,11 +38,11 @@ pub struct LifecycleTag {
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct LifecycleRuleFilter {
-    pub prefix: Option<String>,
-    pub tags: Vec<LifecycleTag>,
-    pub object_size_greater_than: Option<u64>,
-    pub object_size_less_than: Option<u64>,
-    pub explicit_filter: bool,
+    prefix: Option<String>,
+    tags: Vec<LifecycleTag>,
+    object_size_greater_than: Option<u64>,
+    object_size_less_than: Option<u64>,
+    explicit_filter: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -81,6 +81,75 @@ pub struct LifecycleRule {
 }
 
 impl LifecycleRuleFilter {
+    pub fn legacy_prefix(prefix: impl Into<String>) -> Result<Self, LifecycleConfigError> {
+        let prefix = prefix.into();
+        validate_prefix(&prefix)?;
+        Ok(Self {
+            prefix: Some(prefix),
+            ..Self::default()
+        })
+    }
+
+    #[must_use]
+    pub fn explicit_empty() -> Self {
+        Self {
+            explicit_filter: true,
+            ..Self::default()
+        }
+    }
+
+    pub fn explicit_with_predicates(
+        prefix: Option<String>,
+        tags: Vec<LifecycleTag>,
+        object_size_greater_than: Option<u64>,
+        object_size_less_than: Option<u64>,
+    ) -> Result<Self, LifecycleConfigError> {
+        if let Some(prefix) = &prefix {
+            validate_prefix(prefix)?;
+        }
+        validate_tag_filters(&tags)?;
+        Ok(Self {
+            prefix,
+            tags,
+            object_size_greater_than,
+            object_size_less_than,
+            explicit_filter: true,
+        })
+    }
+
+    pub fn explicit_prefix(prefix: impl Into<String>) -> Result<Self, LifecycleConfigError> {
+        Self::explicit_with_predicates(Some(prefix.into()), Vec::new(), None, None)
+    }
+
+    pub fn explicit_tag(tag: LifecycleTag) -> Result<Self, LifecycleConfigError> {
+        Self::explicit_with_predicates(None, vec![tag], None, None)
+    }
+
+    #[must_use]
+    pub fn prefix(&self) -> Option<&str> {
+        self.prefix.as_deref()
+    }
+
+    #[must_use]
+    pub fn tags(&self) -> &[LifecycleTag] {
+        &self.tags
+    }
+
+    #[must_use]
+    pub fn object_size_greater_than(&self) -> Option<u64> {
+        self.object_size_greater_than
+    }
+
+    #[must_use]
+    pub fn object_size_less_than(&self) -> Option<u64> {
+        self.object_size_less_than
+    }
+
+    #[must_use]
+    pub fn is_explicit_filter(&self) -> bool {
+        self.explicit_filter
+    }
+
     #[must_use]
     pub fn has_tag_filter(&self) -> bool {
         !self.tags.is_empty()
@@ -472,6 +541,20 @@ fn validate_tag_value(value: &str) -> Result<(), LifecycleConfigError> {
         return Err(LifecycleConfigError::InvalidRequest {
             reason: "A Tag's Value must be a length between 0 and 256.".to_string(),
         });
+    }
+    Ok(())
+}
+
+fn validate_tag_filters(tags: &[LifecycleTag]) -> Result<(), LifecycleConfigError> {
+    let mut seen = HashSet::new();
+    for tag in tags {
+        validate_tag_key(&tag.key)?;
+        validate_tag_value(&tag.value)?;
+        if !seen.insert(tag.key.as_str()) {
+            return Err(LifecycleConfigError::InvalidArgument {
+                reason: format!("duplicate lifecycle tag filter key {}", tag.key),
+            });
+        }
     }
     Ok(())
 }
@@ -1304,6 +1387,67 @@ mod tests {
             render_lifecycle_configuration_xml(&config),
             "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<LifecycleConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Rule><Filter/><Status>Enabled</Status><Expiration><ExpiredObjectDeleteMarker>true</ExpiredObjectDeleteMarker></Expiration></Rule></LifecycleConfiguration>"
         );
+    }
+
+    #[test]
+    fn lifecycle_rule_filter_constructors_render_canonical_shapes() {
+        let days = NonZeroU32::new(1).unwrap();
+        let config = BucketLifecycleConfiguration {
+            rules: vec![
+                LifecycleRule {
+                    id: Some("legacy".to_string()),
+                    status: LifecycleRuleStatus::Enabled,
+                    filter: LifecycleRuleFilter::legacy_prefix("logs/").unwrap(),
+                    expiration: Some(LifecycleExpiration::Days(days)),
+                    noncurrent_version_expiration: None,
+                    abort_incomplete_multipart_upload: None,
+                },
+                LifecycleRule {
+                    id: Some("explicit".to_string()),
+                    status: LifecycleRuleStatus::Enabled,
+                    filter: LifecycleRuleFilter::explicit_with_predicates(
+                        Some("logs/".to_string()),
+                        vec![LifecycleTag {
+                            key: "env".to_string(),
+                            value: "prod".to_string(),
+                        }],
+                        None,
+                        None,
+                    )
+                    .unwrap(),
+                    expiration: Some(LifecycleExpiration::Days(days)),
+                    noncurrent_version_expiration: None,
+                    abort_incomplete_multipart_upload: None,
+                },
+            ],
+        };
+
+        let rendered = render_lifecycle_configuration_xml(&config);
+        assert!(rendered.contains("<Rule><ID>legacy</ID><Prefix>logs/</Prefix>"));
+        assert!(rendered.contains(
+            "<Rule><ID>explicit</ID><Filter><And><Prefix>logs/</Prefix><Tag><Key>env</Key><Value>prod</Value></Tag></And></Filter>"
+        ));
+    }
+
+    #[test]
+    fn lifecycle_rule_filter_constructor_rejects_duplicate_tag_keys() {
+        let err = LifecycleRuleFilter::explicit_with_predicates(
+            None,
+            vec![
+                LifecycleTag {
+                    key: "env".to_string(),
+                    value: "prod".to_string(),
+                },
+                LifecycleTag {
+                    key: "env".to_string(),
+                    value: "stage".to_string(),
+                },
+            ],
+            None,
+            None,
+        )
+        .unwrap_err();
+        assert!(matches!(err, LifecycleConfigError::InvalidArgument { .. }));
     }
 
     #[test]

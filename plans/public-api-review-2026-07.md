@@ -917,10 +917,13 @@ each is one refactor away from a panic:
   `InvalidArgument` with the existing SSE-C/SSE-S3 conflict message, update the
   HTTP callers to propagate it, and add a core regression for the direct
   conflicting-input path.
-- [ ] `LifecycleRuleFilter` pub fields permit states the parser never
+- [x] `LifecycleRuleFilter` pub fields permit states the parser never
   produces (legacy rule with tags) which render as V2 `<Filter>`
-  (`s3-types/src/lifecycle.rs:37-43`). Constructor or doc note on
-  `explicit_filter`.
+  (`s3-types/src/lifecycle.rs:37-43`). Resolution: make the filter fields
+  private, add constructors for legacy prefix and explicit filter forms, expose
+  read-only accessors, validate tag filters through the constructor, and move
+  external construction sites to the canonical constructors so callers cannot
+  create a legacy-style filter with tag or size predicates.
 
 ### P4. Positional same-typed parameters
 
