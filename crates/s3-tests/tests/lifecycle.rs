@@ -2372,7 +2372,6 @@ fn test_get_bucket_lifecycle_response_shape() {
                 shape()
                     .status(200)
                     .headers(id_headers())
-                    .header("content-length", "275")
                     .header(
                         "x-amz-transition-default-minimum-object-size",
                         "all_storage_classes_128K",
@@ -2381,7 +2380,6 @@ fn test_get_bucket_lifecycle_response_shape() {
                 shape()
                     .status(200)
                     .headers(id_headers())
-                    .header("content-length", "275")
                     .body(LIFECYCLE_BODY),
             ],
         );

@@ -409,18 +409,19 @@ Source:
 
 - https://docs.aws.amazon.com/AmazonS3/latest/API/API_PutBucketLifecycleConfiguration.html
 
-### 9. `HeadBucket` omits `Transfer-Encoding: chunked`
+### 9. Transport framing is not part of the compatibility surface
 
-AWS includes `Transfer-Encoding: chunked` on successful `HeadBucket`
-responses. Argmin does not currently emit that header.
+AWS serves the same response sized with `Content-Length` or with
+`Transfer-Encoding: chunked` depending on which frontend fleet handles the
+request (observed flapping on `GetBucketOwnershipControls` in July 2026),
+and includes `Transfer-Encoding: chunked` on `HeadBucket` where Hyper's
+`HEAD` handling suppresses it locally.
 
-This is not an intentional S3 behavior difference in our application logic.
-The remaining mismatch appears to come from Hyper's `HEAD` response handling,
-which suppresses chunked transfer encoding and sends a zero-length response
-instead.
-
-The golden `HeadBucket` shape test in `crates/s3-tests/tests/bucket_crud.rs`
-accepts both forms (with and without the header) via `assert_shape_one_of`.
+Because the framing carries no S3 semantics, golden shape tests ignore
+`content-length` and `transfer-encoding` entirely unless a test pins one
+explicitly. Pinning is reserved for responses where the value is semantic,
+e.g. `content-length` equals the payload size on data GET/HEAD responses.
+Argmin makes no effort to mirror AWS's framing choice per operation.
 
 ### 10. SigV2 is not implemented
 

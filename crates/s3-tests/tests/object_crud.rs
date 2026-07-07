@@ -459,7 +459,6 @@ fn test_put_get_head_object_response_shape() {
                     ("x-amz-server-side-encryption", "AES256"),
                     ("x-amz-request-id", "{request_id}"),
                     ("x-amz-id-2", "{host_id}"),
-                    ("content-length", "0"),
                 ])
                 .body_empty(),
         );

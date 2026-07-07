@@ -1,6 +1,6 @@
 use s3_tests::{
     content_md5_header, raw_bucket, send_signed_request,
-    shape::{assert_shape, chunked_response_headers, shape},
+    shape::{assert_shape, id_headers, shape},
     unique_bucket, CTX,
 };
 
@@ -209,11 +209,8 @@ fn test_get_public_access_block_response_shape() {
         assert_shape(
             "GetPublicAccessBlock",
             &response,
-            &shape()
-                .status(200)
-                .headers(chunked_response_headers())
-                .body(
-                    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+            &shape().status(200).headers(id_headers()).body(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
                      <PublicAccessBlockConfiguration \
                      xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
                      <BlockPublicAcls>true</BlockPublicAcls>\
@@ -221,7 +218,7 @@ fn test_get_public_access_block_response_shape() {
                      <BlockPublicPolicy>true</BlockPublicPolicy>\
                      <RestrictPublicBuckets>false</RestrictPublicBuckets>\
                      </PublicAccessBlockConfiguration>",
-                ),
+            ),
         );
 
         cleanup(&bucket).await;

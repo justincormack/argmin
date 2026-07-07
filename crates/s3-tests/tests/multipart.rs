@@ -4269,7 +4269,6 @@ fn test_multipart_flow_response_shape() {
                     ("x-amz-server-side-encryption", "AES256"),
                     ("x-amz-request-id", "{request_id}"),
                     ("x-amz-id-2", "{host_id}"),
-                    ("transfer-encoding", "chunked"),
                 ])
                 .body(
                     "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
@@ -4296,7 +4295,6 @@ fn test_multipart_flow_response_shape() {
                     ("x-amz-server-side-encryption", "AES256"),
                     ("x-amz-request-id", "{request_id}"),
                     ("x-amz-id-2", "{host_id}"),
-                    ("content-length", "0"),
                 ])
                 .body_empty(),
         );
@@ -4316,7 +4314,6 @@ fn test_multipart_flow_response_shape() {
                 .status(200)
                 .headers([
                     ("content-type", "application/xml"),
-                    ("transfer-encoding", "chunked"),
                     ("x-amz-request-id", "{request_id}"),
                     ("x-amz-id-2", "{host_id}"),
                 ])
@@ -4361,7 +4358,6 @@ fn test_multipart_flow_response_shape() {
                     ("x-amz-server-side-encryption", "AES256"),
                     ("x-amz-request-id", "{request_id}"),
                     ("x-amz-id-2", "{host_id}"),
-                    ("transfer-encoding", "chunked"),
                 ])
                 .body(
                     "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n{ws}\

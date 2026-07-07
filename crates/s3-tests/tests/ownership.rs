@@ -3241,16 +3241,12 @@ fn test_get_bucket_ownership_controls_response_shape() {
         assert_shape(
             "GetBucketOwnershipControls",
             &response,
-            &shape()
-                .status(200)
-                .headers(id_headers())
-                .header("content-length", "194")
-                .body(
-                    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<OwnershipControls \
+            &shape().status(200).headers(id_headers()).body(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<OwnershipControls \
                      xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Rule>\
                      <ObjectOwnership>BucketOwnerPreferred</ObjectOwnership></Rule>\
                      </OwnershipControls>",
-                ),
+            ),
         );
 
         s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;

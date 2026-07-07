@@ -13,9 +13,7 @@ use ring::hmac;
 use s3_tests::{
     assert_s3_err_code, content_md5_header, err_status, raw_bucket, raw_object, raw_object_query,
     send_signed_request,
-    shape::{
-        assert_shape, chunked_response_headers, error_response_headers, expected_error, shape,
-    },
+    shape::{assert_shape, error_response_headers, expected_error, id_headers, shape},
     unique_bucket, SendRetryingOperationAborted, CTX,
 };
 use serde_json::json;
@@ -4322,16 +4320,13 @@ fn test_get_bucket_object_lock_configuration_response_shape() {
         assert_shape(
             "GetBucketObjectLockConfiguration shape",
             &response,
-            &shape()
-                .status(200)
-                .headers(chunked_response_headers())
-                .body(
-                    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<ObjectLockConfiguration \
+            &shape().status(200).headers(id_headers()).body(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<ObjectLockConfiguration \
                      xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
                      <ObjectLockEnabled>Enabled</ObjectLockEnabled><Rule><DefaultRetention>\
                      <Mode>GOVERNANCE</Mode><Days>7</Days></DefaultRetention></Rule>\
                      </ObjectLockConfiguration>",
-                ),
+            ),
         );
 
         cleanup_object_lock_bucket(&bucket).await;
@@ -4368,7 +4363,7 @@ fn test_get_object_retention_response_shape() {
             &response,
             &shape()
                 .status(200)
-                .headers(chunked_response_headers())
+                .headers(id_headers())
                 .body(
                     "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Retention \
                      xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Mode>GOVERNANCE</Mode>\
@@ -4413,14 +4408,11 @@ fn test_get_object_legal_hold_response_shape() {
         assert_shape(
             "GetObjectLegalHold shape",
             &response,
-            &shape()
-                .status(200)
-                .headers(chunked_response_headers())
-                .body(
-                    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<LegalHold \
+            &shape().status(200).headers(id_headers()).body(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<LegalHold \
                      xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Status>ON</Status>\
                      </LegalHold>",
-                ),
+            ),
         );
 
         client

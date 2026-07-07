@@ -6,7 +6,7 @@ use aws_sdk_s3::types::{
 use s3_tests::{
     assert_s3_err_code, content_md5_header, create_bucket_with_sse_c_enabled, err_status,
     raw_bucket, send_signed_request,
-    shape::{assert_shape, chunked_response_headers, shape},
+    shape::{assert_shape, id_headers, shape},
     sse_c_header_values, test_sse_c_key, unique_bucket, CTX,
 };
 
@@ -377,11 +377,8 @@ fn test_get_bucket_encryption_response_shape() {
         assert_shape(
             "GetBucketEncryption",
             &response,
-            &shape()
-                .status(200)
-                .headers(chunked_response_headers())
-                .body(
-                    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+            &shape().status(200).headers(id_headers()).body(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
                      <ServerSideEncryptionConfiguration \
                      xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Rule>\
                      <BucketKeyEnabled>false</BucketKeyEnabled>\
@@ -389,7 +386,7 @@ fn test_get_bucket_encryption_response_shape() {
                      </ApplyServerSideEncryptionByDefault><BlockedEncryptionTypes>\
                      <EncryptionType>SSE-C</EncryptionType></BlockedEncryptionTypes></Rule>\
                      </ServerSideEncryptionConfiguration>",
-                ),
+            ),
         );
 
         s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
@@ -410,11 +407,8 @@ fn test_get_bucket_encryption_default_response_shape() {
         assert_shape(
             "GetBucketEncryption default",
             &response,
-            &shape()
-                .status(200)
-                .headers(chunked_response_headers())
-                .body(
-                    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+            &shape().status(200).headers(id_headers()).body(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
                      <ServerSideEncryptionConfiguration \
                      xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Rule>\
                      <BucketKeyEnabled>false</BucketKeyEnabled>\
@@ -422,7 +416,7 @@ fn test_get_bucket_encryption_default_response_shape() {
                      </ApplyServerSideEncryptionByDefault><BlockedEncryptionTypes>\
                      <EncryptionType>SSE-C</EncryptionType></BlockedEncryptionTypes></Rule>\
                      </ServerSideEncryptionConfiguration>",
-                ),
+            ),
         );
 
         s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;

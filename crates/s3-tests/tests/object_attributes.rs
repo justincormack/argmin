@@ -1342,7 +1342,6 @@ fn test_get_object_attributes_multipart_response_shape() {
             &shape()
                 .status(200)
                 .headers(id_headers())
-                .header("content-length", "698")
                 .header("last-modified", "{http_date}")
                 .body(
                     "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\

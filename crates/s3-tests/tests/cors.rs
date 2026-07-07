@@ -2,7 +2,7 @@ use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{CorsConfiguration, CorsRule};
 use s3_tests::{
     content_md5_header, raw_bucket, send_signed_request,
-    shape::{assert_shape, chunked_response_headers, shape},
+    shape::{assert_shape, id_headers, shape},
     unique_bucket, SendRetryingOperationAborted, CTX,
 };
 use std::collections::HashMap;
@@ -1021,18 +1021,15 @@ fn test_get_bucket_cors_response_shape() {
         assert_shape(
             "GetBucketCors",
             &response,
-            &shape()
-                .status(200)
-                .headers(chunked_response_headers())
-                .body(
-                    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<CORSConfiguration \
+            &shape().status(200).headers(id_headers()).body(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<CORSConfiguration \
                      xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><CORSRule>\
                      <AllowedOrigin>https://example.com</AllowedOrigin>\
                      <AllowedMethod>GET</AllowedMethod><AllowedMethod>PUT</AllowedMethod>\
                      <MaxAgeSeconds>3600</MaxAgeSeconds>\
                      <ExposeHeader>x-amz-request-id</ExposeHeader>\
                      <AllowedHeader>*</AllowedHeader></CORSRule></CORSConfiguration>",
-                ),
+            ),
         );
 
         s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;

@@ -521,12 +521,15 @@ The working pattern, in order:
    the `raw_object`/`raw_object_with`/`raw_object_query`/`raw_bucket`/
    `raw_anonymous` helpers and capture the full `RawResponse`. Do not write
    the template from documentation or memory.
-2. **Pin everything.** `assert_shape` takes the status, the complete header
-   set (full-set equality after dropping `connection`/`date`/`server`), and
-   the full body. Weak assertions — status plus error code, `contains`
-   checks, header subsets — silently lose pinning; if a value is
-   deterministic for the fixture (checksums of fixed bodies,
-   `Content-Length` of fixed XML), assert it literally.
+2. **Pin everything except transport framing.** `assert_shape` takes the
+   status, the complete header set (full-set equality after dropping
+   `connection`/`date`/`server`; `content-length` and `transfer-encoding`
+   are also ignored unless the spec names them, because AWS varies the
+   framing by frontend), and the full body. Weak assertions — status plus
+   error code, `contains` checks, header subsets — silently lose pinning;
+   if a value is deterministic for the fixture and semantic (checksums of
+   fixed bodies, `content-length` equal to a data GET/HEAD payload size),
+   assert it literally. Do not pin the `content-length` of XML bodies.
 3. **Use placeholders only for genuinely variable values.** The built-ins
    (`{request_id}`, `{host_id}`, `{etag}`, `{version_id}`, `{upload_id}`,
    `{owner_id}`, `{http_date}`, `{iso8601}`, `{ws}`, `{any}`) are
@@ -758,6 +761,9 @@ As a rough rule:
 - use AWS-backed `s3-tests` when compatibility depends on real AWS behavior
 - use golden shape assertions (`s3_tests::shape`) when the contract being
   checked is the exact response shape for a request: full header set and
-  body, holding on AWS and locally alike
+  body, holding on AWS and locally alike (transport framing —
+  `content-length` vs `transfer-encoding` — is ignored unless explicitly
+  pinned, since AWS varies it by frontend; pin it only where the value is
+  semantic, e.g. data GET/HEAD sizes)
 - use `./scripts/coverage` when checking integration coverage movement
 - use `cargo-fuzz` for malformed-input robustness and panic discovery

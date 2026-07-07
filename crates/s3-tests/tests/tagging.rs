@@ -7,7 +7,7 @@ use aws_sdk_s3::types::{
 use s3_tests::{
     assert_s3_err_code, cleanup_versioned_bucket, content_md5_header,
     delete_bucket_retrying_operation_aborted, err_status, raw_bucket, send_signed_request,
-    shape::{assert_body_with_unordered_blocks, assert_shape, chunked_response_headers, shape},
+    shape::{assert_body_with_unordered_blocks, assert_shape, id_headers, shape},
     unique_bucket, SendRetryingOperationAborted, CTX,
 };
 use serde_json::json;
@@ -3357,15 +3357,12 @@ fn test_get_bucket_tagging_response_shape() {
         assert_shape(
             "GetBucketTagging",
             &response,
-            &shape()
-                .status(200)
-                .headers(chunked_response_headers())
-                .body(
-                    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Tagging \
+            &shape().status(200).headers(id_headers()).body(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Tagging \
                      xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><TagSet><Tag>\
                      <Key>env</Key><Value>prod</Value></Tag><Tag><Key>team</Key>\
                      <Value>storage</Value></Tag></TagSet></Tagging>",
-                ),
+            ),
         );
 
         s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
@@ -3419,7 +3416,7 @@ fn test_get_object_tagging_response_shape() {
         assert_shape(
             "GetObjectTagging shape",
             &response,
-            &shape().status(200).headers(chunked_response_headers()),
+            &shape().status(200).headers(id_headers()),
         );
         assert_body_with_unordered_blocks(
             "GetObjectTagging shape",

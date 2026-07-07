@@ -44,6 +44,12 @@ pub const HOST_ID_HEADER: &str = "x-amz-id-2";
 /// vary by transport or connection rather than by S3 behavior.
 pub const DEFAULT_IGNORED_HEADERS: &[&str] = &["connection", "date", "server"];
 
+/// Transport-framing headers: AWS serves the same response sized with
+/// `Content-Length` or chunked depending on frontend, so these are ignored
+/// unless a spec pins one explicitly — do that only where the value is
+/// semantic, e.g. `content-length` on data GET/HEAD responses.
+pub const TRANSPORT_HEADERS: &[&str] = &["content-length", "transfer-encoding"];
+
 /// Whether a value has the AWS `x-amz-request-id` shape.
 pub fn is_aws_request_id_shape(value: &str) -> bool {
     value.len() == 16
@@ -544,7 +550,15 @@ impl ShapeSpec {
         expected_headers: &[(String, String)],
         captures: &mut BTreeMap<String, String>,
     ) -> Result<(), String> {
-        let ignored = self.ignored();
+        let mut ignored = self.ignored();
+        for name in TRANSPORT_HEADERS {
+            if !expected_headers
+                .iter()
+                .any(|(expected_name, _)| expected_name.eq_ignore_ascii_case(name))
+            {
+                ignored.insert(name);
+            }
+        }
         let mut actual: BTreeMap<String, Vec<&str>> = BTreeMap::new();
         for (name, value) in &response.headers {
             let name = name.to_ascii_lowercase();
@@ -712,8 +726,10 @@ pub fn assert_unordered_xml_blocks(
     }
 }
 
-/// The wire-ID header expectations present on every S3 response. Base set
-/// for responses sized with `Content-Length`, e.g. GetBucketLifecycle.
+/// The wire-ID header expectations present on every S3 response, and the
+/// full set of XML responses that carry no `Content-Type`, e.g.
+/// GetBucketVersioning. Transport framing is never part of these sets; see
+/// [`TRANSPORT_HEADERS`].
 pub fn id_headers() -> Vec<(&'static str, &'static str)> {
     vec![
         (REQUEST_ID_HEADER, "{request_id}"),
@@ -721,18 +737,10 @@ pub fn id_headers() -> Vec<(&'static str, &'static str)> {
     ]
 }
 
-/// Wire IDs plus chunked transfer encoding: the header set of XML responses
-/// that carry no `Content-Type`, e.g. GetBucketVersioning.
-pub fn chunked_response_headers() -> Vec<(&'static str, &'static str)> {
-    let mut headers = id_headers();
-    headers.push(("transfer-encoding", "chunked"));
-    headers
-}
-
-/// The standard header set for a chunked XML response with `Content-Type`,
-/// e.g. GetBucketLocation or GetBucketAcl.
+/// The standard header set for an XML response with `Content-Type`, e.g.
+/// GetBucketLocation or GetBucketAcl.
 pub fn xml_response_headers() -> Vec<(&'static str, &'static str)> {
-    let mut headers = chunked_response_headers();
+    let mut headers = id_headers();
     headers.push(("content-type", "application/xml"));
     headers
 }
@@ -1104,6 +1112,63 @@ mod tests {
     }
 
     #[test]
+    fn shape_spec_ignores_unpinned_transport_headers() {
+        // AWS varies the framing by frontend: the same spec must accept a
+        // content-length response and a chunked one.
+        let spec = shape()
+            .status(404)
+            .headers(error_response_headers())
+            .body(error_template())
+            .sub("code", "NoSuchKey");
+        let body = error_body("NoSuchKey");
+        let sized = response(
+            404,
+            &[
+                ("x-amz-request-id", REQUEST_ID),
+                ("x-amz-id-2", HOST_ID),
+                ("Content-Type", "application/xml"),
+                ("Content-Length", "142"),
+            ],
+            &body,
+        );
+        assert_shape("test", &sized, &spec);
+        let chunked = response(
+            404,
+            &[
+                ("x-amz-request-id", REQUEST_ID),
+                ("x-amz-id-2", HOST_ID),
+                ("Content-Type", "application/xml"),
+                ("Transfer-Encoding", "chunked"),
+            ],
+            &body,
+        );
+        assert_shape("test", &chunked, &spec);
+    }
+
+    #[test]
+    #[should_panic(expected = "missing")]
+    fn shape_spec_enforces_pinned_content_length() {
+        let _panic_guard = SuppressExpectedPanicOutput::new();
+        let resp = response(
+            404,
+            &[
+                ("x-amz-request-id", REQUEST_ID),
+                ("x-amz-id-2", HOST_ID),
+                ("Content-Type", "application/xml"),
+                ("Transfer-Encoding", "chunked"),
+            ],
+            &error_body("NoSuchKey"),
+        );
+        let spec = shape()
+            .status(404)
+            .headers(error_response_headers())
+            .header("content-length", "142")
+            .body(error_template())
+            .sub("code", "NoSuchKey");
+        assert_shape("test", &resp, &spec);
+    }
+
+    #[test]
     #[should_panic(expected = "unexpected")]
     fn shape_spec_rejects_unexpected_header() {
         let _panic_guard = SuppressExpectedPanicOutput::new();
@@ -1132,11 +1197,7 @@ mod tests {
         let _panic_guard = SuppressExpectedPanicOutput::new();
         let resp = response(
             404,
-            &[
-                ("x-amz-request-id", REQUEST_ID),
-                ("x-amz-id-2", HOST_ID),
-                ("Content-Type", "application/xml"),
-            ],
+            &[("x-amz-request-id", REQUEST_ID), ("x-amz-id-2", HOST_ID)],
             &error_body("NoSuchKey"),
         );
         let spec = shape()

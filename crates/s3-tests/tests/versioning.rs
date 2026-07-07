@@ -8,7 +8,7 @@ use s3_tests::{
     delete_bucket_retrying_operation_aborted, delete_objects_retrying_operation_aborted,
     err_status, get_object_body_retrying_operation_aborted, raw_bucket, raw_object,
     raw_object_query, send_signed_request,
-    shape::{assert_shape, chunked_response_headers, id_headers, shape, xml_response_headers},
+    shape::{assert_shape, id_headers, shape, xml_response_headers},
     unique_bucket, RawResponse, SendRetryingOperationAborted, CTX,
 };
 use tokio::time::{sleep, Duration};
@@ -2384,14 +2384,11 @@ fn test_get_bucket_versioning_response_shape() {
         assert_shape(
             "GetBucketVersioning",
             &response,
-            &shape()
-                .status(200)
-                .headers(chunked_response_headers())
-                .body(
-                    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<VersioningConfiguration \
+            &shape().status(200).headers(id_headers()).body(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<VersioningConfiguration \
                      xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Status>Enabled</Status>\
                      </VersioningConfiguration>",
-                ),
+            ),
         );
 
         cleanup_versioned_bucket(client, &bucket).await;
