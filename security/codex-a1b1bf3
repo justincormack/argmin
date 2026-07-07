@@ -1,0 +1,228 @@
+Forward timestamp cap bricks control plane after downtime
+Link: https://chatgpt.com/codex/cloud/security/findings/53e197498718819197bf60cf9d3e5031?sev=&repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin&sort=date_desc
+Criticality: informational (attack path: ignore)
+Status: fixed
+
+# Metadata
+Repo: justincormack/argmin
+Commit: a1b1bf3
+Author: justin@specialbusservice.com
+Created: 06/07/2026, 20:35:45
+Assignee: Unassigned
+Signals: Security, Validated, Attack-path
+
+# Summary
+The commit fixes the previous fatal lease-expiry crash path for timestamp regressions, but it introduces a new availability deadlock: the forward-jump guard is applied to heartbeats and other timestamped commands, while lease expiry deliberately refuses to commit a catch-up timestamp. Any gap greater than the one-hour window between the stored high-water timestamp and the current authority time can therefore brick the control plane.
+This commit adds MAX_COMMITTED_TIMESTAMP_FORWARD_JUMP_MS and rejects any committed command timestamp more than one hour ahead of the previous max_committed_timestamp_ms. It also makes periodic lease expiry return a successful empty result instead of committing when the local time is beyond that bound. Because the persisted high-water timestamp is not advanced on restart, a control plane that was stopped or otherwise did not commit heartbeats for more than one hour will restart with max_committed_timestamp_ms still at the old value. At current wall-clock time, expire_heartbeat_leases() will no-op and will not advance the high-water mark, while storage-node heartbeats still go through RecordNodeHeartbeat and are rejected by validate_committed_timestamp() as CommittedTimestampTooFarAhead. Since heartbeat leases are only 10 seconds, existing leases are already expired, no node can obtain a new serving lease, and the object service remains unavailable until manual state repair or clock manipulation. The same pattern is present in the experimental Raft lease-expiry path.
+
+# Validation
+## Rubric
+- [x] Confirm the commit adds a hard one-hour committed timestamp forward bound and applies it to committed commands.
+- [x] Confirm restart/open preserves max_committed_timestamp_ms rather than advancing or resetting it.
+- [x] Confirm public lease expiry at a far-future authority time returns success without expiring nodes or ratcheting max_committed_timestamp_ms.
+- [x] Confirm a storage-node heartbeat at that same authority time is rejected as CommittedTimestampTooFarAhead.
+- [x] Confirm the prior serving lease is already expired at the simulated current time, so rejected heartbeats prevent lease renewal and create an availability deadlock.
+## Report
+Validated the finding with a targeted Rust PoC and LLDB trace. The changed code introduces MAX_COMMITTED_TIMESTAMP_FORWARD_JUMP_MS=3600000 at crates/storage/src/control_plane.rs:21, rejects timestamps beyond that bound in validate_committed_timestamp at crates/storage/src/control_plane.rs:860-874, persists stale max_committed_timestamp_ms across open/restart at crates/storage/src/control_plane.rs:3558-3572, sends heartbeats through RecordNodeHeartbeat with authority_now_ms at crates/storage/src/control_plane.rs:3720-3751, and returns an empty no-op expiry without ratcheting timestamp at crates/storage/src/control_plane.rs:3775-3788. I built and ran a PoC as a storage example. It established a serving lease at high_water=1001 and lease_deadline=1101, reopened the file-backed control plane, then simulated now=3601124 (> high_water+1h and > lease_deadline). expire_heartbeat_leases(3601124) returned expired_nodes=0 and high_water_after=Some(1001), proving the expiry path did not catch up or expire the stale lease. A subsequent heartbeat at the same authority time failed with: committed timestamp 3601124ms is more than 3600000ms ahead of previous maximum 1001ms. LLDB breakpoints confirmed the chain: breakpoint at control_plane.rs:3783 showed expire_heartbeat_leases returning the empty result with now_ms=3601124; breakpoint at control_plane.rs:869 showed validate_committed_timestamp rejecting the heartbeat with timestamp_ms=3601124 and max_committed_timestamp_ms=1001, reached from SingleAuthorityControlPlane::heartbeat via apply_and_commit_command. Direct crash testing did not produce a crash because this is an availability/liveness bug, not memory corruption. Valgrind was unavailable (`valgrind: command not found`), and Rust ASan via `-Z sanitizer` was unavailable on the stable toolchain. Existing targeted tests also passed and corroborate the constituent behavior: `cargo test -q -p storage committed_timestamp_forward_jump -- --nocapture` and `cargo test -q -p storage expire_heartbeat_leases_proposal_defers_forward_timestamp_jump_without_ratchet -- --nocapture`.
+
+# Resolution
+Fixed by commit [fda75348887d410b420a74fa686f46ef81927849](https://github.com/justincormack/argmin/commit/fda75348887d410b420a74fa686f46ef81927849) (`Fix far-forward heartbeat lease expiry recovery`).
+
+The fix keeps the committed timestamp forward-jump guard for timestamp-only proposals, but allows a far-forward `ExpireHeartbeatLeases` command to commit when it actually expires an existing eligible heartbeat lease. That gives the control plane a deterministic recovery step after long downtime: expired leases are marked unavailable, `max_committed_timestamp_ms` advances to the expiry timestamp, and subsequent storage-node heartbeats can renew leases instead of remaining wedged behind `CommittedTimestampTooFarAhead`. The single-authority and experimental Raft wrapper paths now both defer only far-forward expiry calls that would be timestamp-only no-ops. Regression coverage was added for file-backed single-authority downtime recovery and the experimental Raft wrapper recovery path.
+
+Verification for the fix:
+- `cargo fmt`
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings`
+- `cargo nextest run` passed: 6295 tests run, 6295 passed
+
+# Evidence
+crates/argmin-s3/src/main.rs (L1598 to 1602)
+  Note: The experimental Raft lease-expiry path has the same no-op behavior for far-forward current time, so it also cannot advance the committed timestamp out of the deadlock.
+```
+        let now_ms = self.authority_now_ms(now_ms);
+        let snapshot = self.current_snapshot()?;
+        if snapshot.committed_timestamp_exceeds_forward_bound(now_ms) {
+            return Ok((snapshot.cluster_epoch(), 0, 0));
+        }
+```
+
+crates/storage/src/control_plane.rs (L1645 to 1648)
+  Note: Raw ExpireHeartbeatLeases commands are also subject to the forward-jump validation before they can advance the committed timestamp.
+```
+            ControlPlaneCommand::ExpireHeartbeatLeases { expire_at_ms } => {
+                self.validate_committed_timestamp(expire_at_ms)?;
+                let mut next_snapshot = self.clone();
+                let timestamp_changed = next_snapshot.record_committed_timestamp(expire_at_ms);
+```
+
+crates/storage/src/control_plane.rs (L20 to 21)
+  Note: Introduces the one-hour maximum committed-timestamp forward jump that becomes a hard liveness boundary.
+```
+pub const MAX_HEARTBEAT_LEASE_MS: u64 = 10_000;
+pub const MAX_COMMITTED_TIMESTAMP_FORWARD_JUMP_MS: u64 = 60 * 60 * 1_000;
+```
+
+crates/storage/src/control_plane.rs (L3558 to 3572)
+  Note: Opening existing control-plane state bumps authority/epoch but does not advance or reset max_committed_timestamp_ms, so a restart after more than one hour keeps a stale high-water timestamp.
+```
+    pub fn open(store: S) -> Result<Self, ControlPlaneError> {
+        let loaded = store.load()?;
+        let loaded_existing_state = loaded.is_some();
+        let mut snapshot = loaded.unwrap_or_else(ClusterControlSnapshot::empty);
+        if loaded_existing_state {
+            let previous_snapshot = snapshot.clone();
+            snapshot.bump_authority_after_restart()?;
+            snapshot.record_history_from(&previous_snapshot);
+        }
+        #[cfg(any(test, debug_assertions))]
+        if let Err(error) = snapshot.validate_invariants() {
+            panic!("attempted to open invalid control-plane snapshot: {error}");
+        }
+        store.save(&snapshot)?;
+        Ok(Self { store, snapshot })
+```
+
+crates/storage/src/control_plane.rs (L3720 to 3751)
+  Note: Storage-node heartbeats commit RecordNodeHeartbeat using the current authority time; after a long gap this path hits the new forward-jump rejection and cannot renew serving leases.
+```
+    pub fn heartbeat(
+        &mut self,
+        heartbeat: NodeHeartbeat,
+        authority_now_ms: u64,
+    ) -> Result<HeartbeatLease, ControlPlaneError> {
+        if heartbeat.requested_lease_duration_ms == 0 {
+            return Err(ControlPlaneError::InvalidLeaseDuration);
+        }
+        if heartbeat.requested_lease_duration_ms > MAX_HEARTBEAT_LEASE_MS {
+            return Err(ControlPlaneError::LeaseDurationTooLong {
+                requested_ms: heartbeat.requested_lease_duration_ms,
+                max_ms: MAX_HEARTBEAT_LEASE_MS,
+            });
+        }
+        let lease_deadline_ms = authority_now_ms
+            .checked_add(heartbeat.requested_lease_duration_ms)
+            .ok_or(ControlPlaneError::LeaseDeadlineOverflow)?;
+        let lease_deadline_ms = self
+            .snapshot
+            .node(heartbeat.node_id)
+            .and_then(NodeControlRecord::lease_deadline_ms)
+            .map_or(lease_deadline_ms, |current_lease_deadline_ms| {
+                current_lease_deadline_ms.max(lease_deadline_ms)
+            });
+        let observed_epoch = heartbeat.observed_epoch;
+        let current_epoch = self.snapshot.cluster_epoch;
+        let node_id = heartbeat.node_id;
+        self.apply_and_commit_command(ControlPlaneCommand::RecordNodeHeartbeat {
+            heartbeat,
+            heartbeat_at_ms: authority_now_ms,
+            lease_deadline_ms,
+        })?;
+```
+
+crates/storage/src/control_plane.rs (L3775 to 3788)
+  Note: The public single-authority lease-expiry path now returns an empty success instead of committing a catch-up timestamp when current time is more than one hour ahead, leaving the stale high-water mark unchanged.
+```
+    pub fn expire_heartbeat_leases(
+        &mut self,
+        now_ms: u64,
+    ) -> Result<HeartbeatLeaseExpiry, ControlPlaneError> {
+        if self
+            .snapshot
+            .committed_timestamp_exceeds_forward_bound(now_ms)
+        {
+            return Ok(HeartbeatLeaseExpiry {
+                cluster_epoch: self.snapshot.cluster_epoch,
+                expired_nodes: Vec::new(),
+                peering_pgs: Vec::new(),
+                snapshot: self.snapshot.clone(),
+            });
+```
+
+crates/storage/src/control_plane.rs (L860 to 884)
+  Note: New validation rejects any timestamp more than MAX_COMMITTED_TIMESTAMP_FORWARD_JUMP_MS ahead of the previous committed high-water mark.
+```
+    fn validate_committed_timestamp(&self, timestamp_ms: u64) -> Result<(), ControlPlaneError> {
+        if let Some(max_committed_timestamp_ms) = self.max_committed_timestamp_ms {
+            if timestamp_ms < max_committed_timestamp_ms {
+                return Err(ControlPlaneError::CommittedTimestampRegression {
+                    timestamp_ms,
+                    max_committed_timestamp_ms,
+                });
+            }
+            if self.committed_timestamp_exceeds_forward_bound(timestamp_ms) {
+                return Err(ControlPlaneError::CommittedTimestampTooFarAhead {
+                    timestamp_ms,
+                    max_committed_timestamp_ms,
+                    max_forward_jump_ms: MAX_COMMITTED_TIMESTAMP_FORWARD_JUMP_MS,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn committed_timestamp_exceeds_forward_bound(&self, timestamp_ms: u64) -> bool {
+        self.max_committed_timestamp_ms.is_some_and(|max| {
+            timestamp_ms > max.saturating_add(MAX_COMMITTED_TIMESTAMP_FORWARD_JUMP_MS)
+        })
+    }
+```
+
+# Attack-path analysis
+Final: ignore | Decider: model_decided | Matrix severity: ignore | Policy adjusted: ignore
+## Rationale
+Adjusted from high to ignore for security triage. The code and validation evidence show a real product liveness bug, but not a high-severity security vulnerability. The affected path is an internal control-plane/storage-node heartbeat mechanism over private Unix sockets, and the required trigger is operational downtime, clock movement, or no committed heartbeats for more than one hour. No repository evidence connects unauthenticated or authenticated S3 HTTP clients to control of authority_now_ms, process restarts, persisted max_committed_timestamp_ms, or storage-node heartbeat contents. The impact can be severe operational availability loss, but without a realistic in-scope attacker-controlled entry point it would not meet high/critical security acceptance criteria.
+## Likelihood
+low - The bug is plausibly triggered by ordinary downtime, restart after inactivity, or clock jumps, but repository evidence does not show a realistic external attacker can cause the stale timestamp/restart condition or access the private control-plane socket.
+## Impact
+medium - If the operational preconditions occur, the distributed storage service can suffer total availability loss until manual repair. The effect is availability-only, with no demonstrated confidentiality, integrity, identity, or code-execution impact.
+## Assumptions
+- Assessment is based only on repository artifacts and the provided validation evidence; no cloud APIs or live deployment were queried.
+- No Kubernetes, Terraform, Docker Compose, or other deployment manifests were found/used to prove public exposure of the control-plane path.
+- Storage-node/control-plane Unix socket access is treated as internal/trusted unless an attacker already has local filesystem access to the private socket directory.
+- existing persisted control-plane state with max_committed_timestamp_ms set
+- control plane has no committed timestamp progress for more than MAX_COMMITTED_TIMESTAMP_FORWARD_JUMP_MS, currently 1 hour
+- restart, long downtime, long inactivity in distributed control-plane mode, or a large local clock jump
+- storage nodes then need to renew heartbeat leases
+## Path
+operational downtime/clock jump >1h
+        |
+        v
+stale max_committed_timestamp_ms after open()
+        |
+        v
+lease expiry returns empty no-op, no ratchet
+        |
+        v
+storage-node heartbeat at current time
+        |
+        v
+CommittedTimestampTooFarAhead
+        |
+        v
+no serving leases -> object service unavailable
+## Path evidence
+- `crates/storage/src/control_plane.rs:20-21` - Defines MAX_HEARTBEAT_LEASE_MS as 10 seconds and MAX_COMMITTED_TIMESTAMP_FORWARD_JUMP_MS as one hour, creating the liveness boundary.
+- `crates/storage/src/control_plane.rs:860-884` - validate_committed_timestamp rejects committed timestamps more than one hour ahead of the previous maximum.
+- `crates/storage/src/control_plane.rs:1645-1648` - ExpireHeartbeatLeases commands are also subject to the same committed timestamp validation before they can advance the timestamp.
+- `crates/storage/src/control_plane.rs:3558-3572` - Opening persisted control-plane state bumps authority/epoch but does not advance or reset max_committed_timestamp_ms.
+- `crates/storage/src/control_plane.rs:3720-3751` - Storage-node heartbeats commit RecordNodeHeartbeat using authority_now_ms, which will be far ahead after long downtime.
+- `crates/storage/src/control_plane.rs:3775-3788` - Single-authority lease expiry returns an empty successful result instead of committing a catch-up timestamp when now_ms exceeds the forward bound.
+- `crates/argmin-s3/src/main.rs:1373-1435` - The control-plane manager opens persisted state, accepts internal Unix-socket RPCs, and periodically calls expire_heartbeat_leases with current_time_millis.
+- `crates/argmin-s3/src/main.rs:1598-1602` - Experimental Raft lease-expiry path has the same no-op behavior when the current timestamp is too far forward.
+- `crates/argmin-s3/src/main.rs:2703-2779` - Control-plane sockets are Unix sockets whose parent directory is created or validated as private, limiting direct attacker reachability.
+- `crates/argmin-s3/src/main.rs:3429-3505` - The externally exposed S3 service binds the configured TCP listen address and serves HTTP/TLS separately from the internal control-plane socket path.
+- `crates/argmin-s3/src/config.rs:135-168` - Configuration shows the public listener defaults to 127.0.0.1:9000 and control-plane paths are separate environment-configured local artifacts.
+## Narrative
+The code evidence supports a real liveness bug: the commit adds a one-hour committed-timestamp forward bound, persists/reloads control-plane state without advancing the high-water timestamp, makes lease expiry no-op when current time is too far forward, and then rejects storage-node heartbeats using current authority time. The provided validation PoC demonstrated this sequence and showed heartbeat renewal failure. However, the attack path is not an externally reachable S3 API path: the public HTTP listener handles S3 traffic, while the affected heartbeat/control-plane path is internal over private Unix sockets and depends on downtime, restart, or clock conditions. Therefore the original high security severity is not supported; this is primarily an operational availability/reliability defect rather than an attacker-reachable high-severity vulnerability.
+## Controls
+- S3 HTTP requests use configured credential store and SigV4 authentication outside explicitly public bucket behavior
+- control-plane RPC uses configured Unix socket paths rather than a public TCP listener
+- control-plane socket parent directory is required to be private and owned by the process uid
+- HTTP server supports max connection and max in-flight request limits
+- TLS is optional via ARGMIN_TLS_CERT_PATH and ARGMIN_TLS_KEY_PATH
+## Blindspots
+- Static-only review cannot prove how operators deploy ARGMIN_LISTEN_ADDR, socket paths, filesystem permissions, or process supervisors in production.
+- No deployment manifests were analyzed to confirm whether distributed control-plane mode is commonly used or exposed in a particular environment.
+- A chained attack where a separate vulnerability lets an attacker stop the control plane, alter clocks, or write control-plane state was not assessed because it is not evidenced by this finding.
+- Experimental Raft peer deployment and inter-node transport exposure could not be fully characterized from repository code alone.
