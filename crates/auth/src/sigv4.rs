@@ -141,16 +141,30 @@ pub fn derive_signing_key(
     hmac_sha256(k_service.as_ref(), b"aws4_request")
 }
 
+pub(crate) struct VerifyRequestRecordInput<'a, H: HeaderSource + ?Sized> {
+    pub method: &'a str,
+    pub uri: &'a str,
+    pub query_string: &'a str,
+    pub headers: &'a H,
+    pub body_hash: &'a str,
+    pub auth: &'a SigV4Auth,
+    pub now_epoch_secs: u64,
+}
+
 pub(crate) fn verify_request_record<'a, H: HeaderSource + ?Sized>(
-    method: &str,
-    uri: &str,
-    query_string: &str,
-    headers: &H,
-    body_hash: &str,
-    auth: &SigV4Auth,
+    input: VerifyRequestRecordInput<'_, H>,
     store: &'a CredentialStore,
-    now_epoch_secs: u64,
 ) -> Result<&'a CredentialRecord, AuthError> {
+    let VerifyRequestRecordInput {
+        method,
+        uri,
+        query_string,
+        headers,
+        body_hash,
+        auth,
+        now_epoch_secs,
+    } = input;
+
     // Look up the secret key
     let record = store
         .get_record(&auth.credential.access_key_id)

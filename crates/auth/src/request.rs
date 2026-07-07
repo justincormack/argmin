@@ -12,6 +12,7 @@ use crate::credential::{parse_credential_scope_ref, CredentialStore};
 use crate::error::AuthError;
 use crate::sigv4::{
     derive_signing_key, parse_auth_header, unsigned_required_headers, verify_request_record,
+    VerifyRequestRecordInput,
 };
 use crate::{
     MAX_AUTHORIZATION_HEADER_LEN, MAX_PRESIGNED_QUERY_LEN, MAX_SIGNED_HEADERS_LEN,
@@ -317,14 +318,16 @@ fn authenticate_header<H: HeaderSource + ?Sized>(
         None => Cow::Owned(sha256_hex(body)),
     };
     let record = verify_request_record(
-        method,
-        path,
-        query_string,
-        headers,
-        body_hash.as_ref(),
-        &parsed,
+        VerifyRequestRecordInput {
+            method,
+            uri: path,
+            query_string,
+            headers,
+            body_hash: body_hash.as_ref(),
+            auth: &parsed,
+            now_epoch_secs,
+        },
         store,
-        now_epoch_secs,
     )?;
 
     validate_static_credential_has_no_token(headers.first_value("x-amz-security-token"))?;
