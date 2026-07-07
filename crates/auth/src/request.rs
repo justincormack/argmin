@@ -324,13 +324,10 @@ fn authenticate_header<H: HeaderSource + ?Sized>(
         body_hash.as_ref(),
         &parsed,
         store,
-    )?;
-
-    validate_static_record_token_and_expiry(
-        record,
-        headers.first_value("x-amz-security-token"),
         now_epoch_secs,
     )?;
+
+    validate_static_credential_has_no_token(headers.first_value("x-amz-security-token"))?;
 
     let crate::sigv4::SigV4Auth {
         credential,
@@ -497,6 +494,7 @@ fn authenticate_presigned<H: HeaderSource + ?Sized>(
     if !record.enabled {
         return Err(AuthError::UnknownAccessKey);
     }
+    validate_static_record_expiry(record, now_epoch_secs)?;
     let token = query_param_lossy(query_string, "X-Amz-Security-Token");
     let signed_header_token = signed_headers
         .iter()
@@ -545,11 +543,7 @@ fn authenticate_presigned<H: HeaderSource + ?Sized>(
     if !crate::constant_time_eq(expected_hex.as_bytes(), signature.as_bytes()) {
         return Err(AuthError::SignatureMismatch);
     }
-    validate_static_record_token_and_expiry(
-        record,
-        token.as_deref().or(signed_header_token),
-        now_epoch_secs,
-    )?;
+    validate_static_credential_has_no_token(token.as_deref().or(signed_header_token))?;
 
     Ok(AuthContext {
         mode: AuthMode::PresignedSigV4,
@@ -602,9 +596,8 @@ where
     Ok(out)
 }
 
-pub(crate) fn validate_static_record_token_and_expiry(
+pub(crate) fn validate_static_record_expiry(
     record: &crate::credential::CredentialRecord,
-    request_token: Option<&str>,
     now_epoch_secs: u64,
 ) -> Result<(), AuthError> {
     if let Some(expiry) = record.expires_at_epoch_secs {
@@ -612,7 +605,12 @@ pub(crate) fn validate_static_record_token_and_expiry(
             return Err(AuthError::ExpiredToken);
         }
     }
+    Ok(())
+}
 
+pub(crate) fn validate_static_credential_has_no_token(
+    request_token: Option<&str>,
+) -> Result<(), AuthError> {
     if let Some(token) = request_token {
         return Err(AuthError::UnexpectedSecurityToken {
             token: token.to_string(),
@@ -1174,7 +1172,7 @@ mod tests {
 
     #[test]
     fn authenticate_header_expired_token() {
-        let mut store = example_store();
+        let mut store = CredentialStore::new();
         store.add_record(CredentialRecord {
             access_key_id: "AKIAIOSFODNN7EXAMPLE".to_string(),
             secret_key: SecretKey::new("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".to_string()),
@@ -1185,6 +1183,39 @@ mod tests {
         });
         let headers = [
             ("authorization", "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20130524/us-east-1/s3/aws4_request, SignedHeaders=host;range;x-amz-content-sha256;x-amz-date, Signature=f0e8bdb87c964420e857bd35b5d6ed310bd44f0170aba48dd91039c6036bdb41"),
+            ("host", "examplebucket.s3.amazonaws.com"),
+            ("range", "bytes=0-9"),
+            ("x-amz-content-sha256", "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"),
+            ("x-amz-date", "20130524T000000Z"),
+        ];
+        let err = authenticate_request(
+            "GET",
+            "/test.txt",
+            "",
+            &headers,
+            b"",
+            &store,
+            ExpectedSigningRegion::ExactEndpointRegion("us-east-1"),
+            "s3",
+            aws_example_time(),
+        )
+        .unwrap_err();
+        assert!(matches!(err, AuthError::ExpiredToken));
+    }
+
+    #[test]
+    fn authenticate_header_expired_token_with_bad_signature_reports_expired_token() {
+        let mut store = CredentialStore::new();
+        store.add_record(CredentialRecord {
+            access_key_id: "AKIAIOSFODNN7EXAMPLE".to_string(),
+            secret_key: SecretKey::new("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".to_string()),
+            account: account("u1"),
+            authorization_profile: crate::AuthorizationProfile::Standard,
+            expires_at_epoch_secs: Some(5),
+            enabled: true,
+        });
+        let headers = [
+            ("authorization", "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20130524/us-east-1/s3/aws4_request, SignedHeaders=host;range;x-amz-content-sha256;x-amz-date, Signature=0000000000000000000000000000000000000000000000000000000000000000"),
             ("host", "examplebucket.s3.amazonaws.com"),
             ("range", "bytes=0-9"),
             ("x-amz-content-sha256", "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"),
@@ -1697,20 +1728,11 @@ mod tests {
         assert!(matches!(err, AuthError::UnknownAccessKey));
     }
 
-    // ── validate_static_record_token_and_expiry ───────────────────────
+    // ── static credential token and expiry helpers ────────────────────
 
     #[test]
     fn unexpected_token_rejected_for_static_credential() {
-        let record = CredentialRecord {
-            access_key_id: "AKID".to_string(),
-            secret_key: SecretKey::new("s".to_string()),
-            account: account("p"),
-            authorization_profile: crate::AuthorizationProfile::Standard,
-            expires_at_epoch_secs: None,
-            enabled: true,
-        };
-        let err =
-            validate_static_record_token_and_expiry(&record, Some("unexpected"), 0).unwrap_err();
+        let err = validate_static_credential_has_no_token(Some("unexpected")).unwrap_err();
         assert!(matches!(
             err,
             AuthError::UnexpectedSecurityToken { token } if token == "unexpected"
@@ -1719,16 +1741,8 @@ mod tests {
 
     #[test]
     fn overlong_unexpected_token_rejected_like_other_static_credential_tokens() {
-        let record = CredentialRecord {
-            access_key_id: "AKID".to_string(),
-            secret_key: SecretKey::new("s".to_string()),
-            account: account("p"),
-            authorization_profile: crate::AuthorizationProfile::Standard,
-            expires_at_epoch_secs: None,
-            enabled: true,
-        };
         let token = "x".repeat(4097);
-        let err = validate_static_record_token_and_expiry(&record, Some(&token), 0).unwrap_err();
+        let err = validate_static_credential_has_no_token(Some(&token)).unwrap_err();
         assert!(matches!(
             err,
             AuthError::UnexpectedSecurityToken { token: returned } if returned == token
@@ -1745,7 +1759,7 @@ mod tests {
             expires_at_epoch_secs: Some(5),
             enabled: true,
         };
-        validate_static_record_token_and_expiry(&record, None, 0).unwrap();
+        validate_static_record_expiry(&record, 0).unwrap();
     }
 
     #[test]
@@ -1758,7 +1772,8 @@ mod tests {
             expires_at_epoch_secs: None,
             enabled: true,
         };
-        validate_static_record_token_and_expiry(&record, None, 100).unwrap();
+        validate_static_record_expiry(&record, 100).unwrap();
+        validate_static_credential_has_no_token(None).unwrap();
     }
 
     #[test]
@@ -1771,7 +1786,7 @@ mod tests {
             expires_at_epoch_secs: Some(100),
             enabled: true,
         };
-        validate_static_record_token_and_expiry(&record, None, 100).unwrap();
+        validate_static_record_expiry(&record, 100).unwrap();
     }
 
     // ── Helper function unit tests ────────────────────────────────────
@@ -2078,6 +2093,34 @@ mod tests {
             "GET",
             "/",
             &query,
+            &headers,
+            b"",
+            &store,
+            ExpectedSigningRegion::ExactEndpointRegion("us-east-1"),
+            "s3",
+            presigned_example_time(),
+        )
+        .unwrap_err();
+        assert!(matches!(err, AuthError::ExpiredToken));
+    }
+
+    #[test]
+    fn presigned_expired_token_with_bad_signature_reports_expired_token() {
+        let mut store = CredentialStore::new();
+        store.add_record(CredentialRecord {
+            access_key_id: "AKIAIOSFODNN7EXAMPLE".to_string(),
+            secret_key: SecretKey::new("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".to_string()),
+            account: account("u1"),
+            authorization_profile: crate::AuthorizationProfile::Standard,
+            expires_at_epoch_secs: Some(100),
+            enabled: true,
+        });
+        let query = "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIAIOSFODNN7EXAMPLE%2F20240201%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Date=20240201T120000Z&X-Amz-Expires=900&X-Amz-SignedHeaders=host&X-Amz-Signature=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let headers = [("host", "example.com")];
+        let err = authenticate_request(
+            "GET",
+            "/",
+            query,
             &headers,
             b"",
             &store,

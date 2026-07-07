@@ -5,7 +5,8 @@
 use crate::credential::{parse_credential_scope_ref, CredentialStore};
 use crate::error::AuthError;
 use crate::request::{
-    validate_static_record_token_and_expiry, AuthContext, AuthMode, ExpectedSigningRegion,
+    validate_static_credential_has_no_token, validate_static_record_expiry, AuthContext, AuthMode,
+    ExpectedSigningRegion,
 };
 use crate::sigv4;
 
@@ -116,6 +117,7 @@ pub fn authenticate_post_sigv4(
     if !record.enabled {
         return Err(AuthError::UnknownAccessKey);
     }
+    validate_static_record_expiry(record, now_epoch_secs)?;
 
     // Derive signing key and compute expected signature
     let signing_key = sigv4::derive_signing_key(
@@ -131,7 +133,7 @@ pub fn authenticate_post_sigv4(
     if !crate::constant_time_eq(expected_hex.as_bytes(), request.signature_hex.as_bytes()) {
         return Err(AuthError::SignatureMismatch);
     }
-    validate_static_record_token_and_expiry(record, request.security_token, now_epoch_secs)?;
+    validate_static_credential_has_no_token(request.security_token)?;
 
     Ok(AuthContext {
         mode: AuthMode::PostSigV4,
@@ -645,6 +647,35 @@ mod tests {
                 date: "20250101T000000Z",
                 policy_b64: &policy_b64,
                 signature_hex: &sig_hex,
+                security_token: None,
+            },
+            &store,
+            ExpectedCredentialScope::new(ExpectedSigningRegion::DeferredToBucketRouting, "s3"),
+            101,
+        )
+        .unwrap_err();
+        assert!(matches!(err, AuthError::ExpiredToken));
+    }
+
+    #[test]
+    fn sigv4_post_expired_token_with_bad_signature_reports_expired_token() {
+        let mut store = CredentialStore::new();
+        store.add_record(crate::credential::CredentialRecord {
+            access_key_id: "testAccessKey123".to_string(),
+            secret_key: SecretKey::new("testSecretKey456".to_string()),
+            account: AccountIdentity::from_principal("u1"),
+            authorization_profile: crate::AuthorizationProfile::Standard,
+            expires_at_epoch_secs: Some(100),
+            enabled: true,
+        });
+        let (policy_b64, _) = signed_test_policy();
+        let err = super::authenticate_post_sigv4(
+            PostSigV4Request {
+                algorithm: "AWS4-HMAC-SHA256",
+                credential: "testAccessKey123/20250101/us-east-1/s3/aws4_request",
+                date: "20250101T000000Z",
+                policy_b64: &policy_b64,
+                signature_hex: "0000000000000000000000000000000000000000000000000000000000000000",
                 security_token: None,
             },
             &store,

@@ -49,6 +49,15 @@ Tests for temporary credential authentication should not be added until Argmin
 has real temporary credential support. AWS-backed compatibility tests should
 instead pin how S3 rejects token inputs supplied with static credentials.
 
+Ad hoc AWS validation on 2026-07-07 with expired `GetSessionToken`
+credentials showed that S3 returns `ExpiredToken` before signature mismatch for
+header SigV4, presigned SigV4, and POST Object SigV4, even when the request
+signature is deliberately corrupted. Until Argmin supports STS locally, this
+ordering is documented here rather than pinned by a committed AWS-facing test.
+The local auth code should still preserve the AWS ordering: credential expiry is
+checked before signature comparison, while unexpected security-token inputs for
+static credentials are checked after signature comparison.
+
 ### Delete-then-recreate bucket name reuse may require retry
 
 `DeleteBucket` should not be treated as proof that the same bucket name is

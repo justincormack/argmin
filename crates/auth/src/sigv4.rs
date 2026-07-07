@@ -149,6 +149,7 @@ pub(crate) fn verify_request_record<'a, H: HeaderSource + ?Sized>(
     body_hash: &str,
     auth: &SigV4Auth,
     store: &'a CredentialStore,
+    now_epoch_secs: u64,
 ) -> Result<&'a CredentialRecord, AuthError> {
     // Look up the secret key
     let record = store
@@ -156,6 +157,11 @@ pub(crate) fn verify_request_record<'a, H: HeaderSource + ?Sized>(
         .ok_or(AuthError::UnknownAccessKey)?;
     if !record.enabled {
         return Err(AuthError::UnknownAccessKey);
+    }
+    if let Some(expiry) = record.expires_at_epoch_secs {
+        if now_epoch_secs > expiry {
+            return Err(AuthError::ExpiredToken);
+        }
     }
     let secret = &record.secret_key;
 
