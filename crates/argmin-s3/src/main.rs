@@ -1597,7 +1597,9 @@ impl ExperimentalRaftControlPlane {
     ) -> Result<(ClusterEpoch, usize, usize), ControlPlaneError> {
         let now_ms = self.authority_now_ms(now_ms);
         let snapshot = self.current_snapshot()?;
-        if snapshot.committed_timestamp_exceeds_forward_bound(now_ms) {
+        if snapshot.committed_timestamp_exceeds_forward_bound(now_ms)
+            && !snapshot.has_heartbeat_lease_expiring_at(now_ms)
+        {
             return Ok((snapshot.cluster_epoch(), 0, 0));
         }
         let response = self.submit_raft_command(ControlPlaneCommand::ExpireHeartbeatLeases {
@@ -5503,6 +5505,158 @@ mod tests {
         assert_eq!(pg.state(), PgState::Peering);
         assert_eq!(pg.active_primary(), None);
         assert_eq!(pg.peering_metadata_proof_floor(), Some(proof));
+
+        harness.shutdown();
+    }
+
+    #[test]
+    fn experimental_raft_control_plane_far_forward_expiry_recovers_after_long_downtime() {
+        let mut harness = experimental_raft_test_harness("lease-expiry-far-forward-test");
+        let mut config = test_server_config();
+        config.storage_node_sockets = vec![config::ConfiguredStorageNodeSocket {
+            node_id: 1,
+            socket_path: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
+        }];
+        config.storage_pg_ids = vec![17];
+        bootstrap_empty_experimental_raft_control_plane(&mut harness.control_plane, &config)
+            .expect("experimental raft control-plane bootstrap should succeed");
+
+        let bootstrap_epoch = harness
+            .control_plane
+            .current_snapshot()
+            .expect("experimental snapshot should read")
+            .cluster_epoch();
+        harness
+            .control_plane
+            .refresh_node_heartbeat(
+                NodeHeartbeat {
+                    node_id: NodeId::new(1),
+                    node_incarnation: 1,
+                    endpoint: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
+                    observed_epoch: bootstrap_epoch,
+                    requested_lease_duration_ms: 500,
+                    cluster_map_history_reference_summary:
+                        storage::PgClusterMapHistoryReferenceSummary::default(),
+                    pg_observations: Vec::new(),
+                },
+                50_000,
+            )
+            .expect("experimental raft startup heartbeat should refresh");
+        let peering_epoch = harness
+            .control_plane
+            .current_snapshot()
+            .expect("experimental snapshot should read after startup heartbeat")
+            .cluster_epoch();
+        let proof = PgMetadataProof::new(92, 0x1234, 0x5678);
+        harness
+            .control_plane
+            .refresh_node_heartbeat(
+                NodeHeartbeat {
+                    node_id: NodeId::new(1),
+                    node_incarnation: 1,
+                    endpoint: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
+                    observed_epoch: peering_epoch,
+                    requested_lease_duration_ms: 600,
+                    cluster_map_history_reference_summary:
+                        storage::PgClusterMapHistoryReferenceSummary::default(),
+                    pg_observations: vec![NodePgHeartbeatObservation {
+                        pg_id: PgId::new(17),
+                        state: PgState::Peering,
+                        metadata_proof: proof,
+                        has_pending_metadata_command: false,
+                    }],
+                },
+                50_100,
+            )
+            .expect("experimental raft peering heartbeat should refresh");
+        let active_epoch = harness
+            .control_plane
+            .current_snapshot()
+            .expect("experimental snapshot should read after peering completion")
+            .cluster_epoch();
+        harness
+            .control_plane
+            .refresh_node_heartbeat(
+                NodeHeartbeat {
+                    node_id: NodeId::new(1),
+                    node_incarnation: 1,
+                    endpoint: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
+                    observed_epoch: active_epoch,
+                    requested_lease_duration_ms: 700,
+                    cluster_map_history_reference_summary:
+                        storage::PgClusterMapHistoryReferenceSummary::default(),
+                    pg_observations: vec![NodePgHeartbeatObservation {
+                        pg_id: PgId::new(17),
+                        state: PgState::Active,
+                        metadata_proof: proof,
+                        has_pending_metadata_command: false,
+                    }],
+                },
+                50_200,
+            )
+            .expect("experimental raft active heartbeat should refresh");
+
+        let far_future_now_ms =
+            50_201 + storage::control_plane::MAX_COMMITTED_TIMESTAMP_FORWARD_JUMP_MS + 123;
+        let expiry = harness
+            .control_plane
+            .expire_heartbeat_leases(far_future_now_ms)
+            .expect("far-forward expiry with expired leases should recover through raft");
+        assert_eq!(expiry.1, 1);
+        assert_eq!(expiry.2, 1);
+        let expired_snapshot = harness
+            .control_plane
+            .current_snapshot()
+            .expect("experimental far-forward expired snapshot should read");
+        assert_eq!(
+            expired_snapshot.max_committed_timestamp_ms(),
+            Some(far_future_now_ms)
+        );
+        let expired_node = expired_snapshot
+            .node(NodeId::new(1))
+            .expect("expired node should remain recorded");
+        assert_eq!(
+            expired_node.availability(),
+            NodeAvailabilityState::Unavailable
+        );
+        assert_eq!(expired_node.lease_deadline_ms(), None);
+
+        let recovery_now_ms = far_future_now_ms + 1;
+        harness
+            .control_plane
+            .refresh_node_heartbeat(
+                NodeHeartbeat {
+                    node_id: NodeId::new(1),
+                    node_incarnation: 1,
+                    endpoint: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
+                    observed_epoch: expired_snapshot.cluster_epoch(),
+                    requested_lease_duration_ms: 500,
+                    cluster_map_history_reference_summary:
+                        storage::PgClusterMapHistoryReferenceSummary::default(),
+                    pg_observations: Vec::new(),
+                },
+                recovery_now_ms,
+            )
+            .expect("post-downtime raft heartbeat should not remain wedged");
+        let recovered_snapshot = harness
+            .control_plane
+            .current_snapshot()
+            .expect("experimental recovered snapshot should read");
+        assert_eq!(
+            recovered_snapshot.max_committed_timestamp_ms(),
+            Some(recovery_now_ms)
+        );
+        let recovered_node = recovered_snapshot
+            .node(NodeId::new(1))
+            .expect("recovered node should remain recorded");
+        assert_eq!(
+            recovered_node.availability(),
+            NodeAvailabilityState::Healthy
+        );
+        assert_eq!(
+            recovered_node.lease_deadline_ms(),
+            Some(recovery_now_ms + 500)
+        );
 
         harness.shutdown();
     }

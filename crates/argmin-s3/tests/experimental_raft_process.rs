@@ -1054,18 +1054,22 @@ fn experimental_raft_process_peer_wal_crash_after_sync_before_response_recovers_
     let prev_log_id = follower_log_before_crash
         .last_log_id
         .expect("bootstrapped follower should have a log tip before append");
+    let append_vote = Vote::<ControlPlaneRaftLeaderId>::new_committed(
+        follower_vote_before_crash
+            .term
+            .checked_add(1)
+            .expect("test vote term should advance"),
+        101,
+    );
     let appended_log_id = LogId::new(
-        *prev_log_id.committed_leader_id(),
+        append_vote.leader_id,
         prev_log_id
             .index()
             .checked_add(1)
             .expect("test log index should advance"),
     );
     let append_request = AppendEntriesRequest {
-        vote: Vote::<ControlPlaneRaftLeaderId>::new_committed(
-            follower_vote_before_crash.term,
-            follower_vote_before_crash.node_id,
-        ),
+        vote: append_vote,
         prev_log_id: Some(prev_log_id),
         entries: vec![Entry {
             log_id: appended_log_id,
@@ -1094,6 +1098,8 @@ fn experimental_raft_process_peer_wal_crash_after_sync_before_response_recovers_
             follower_vote_before_crash.node_id,
         )))
         .expect("test should pre-create follower WAL before making state dir unwritable");
+    node101.stop();
+    node102.stop();
     let follower_state_dir = state_dir(test_dir.path(), 103);
     fs::set_permissions(&follower_state_dir, fs::Permissions::from_mode(0o500))
         .expect("follower state directory should be made checkpoint-unwritable");

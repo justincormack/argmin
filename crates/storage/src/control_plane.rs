@@ -883,6 +883,19 @@ impl ClusterControlSnapshot {
         })
     }
 
+    #[must_use]
+    pub fn has_heartbeat_lease_expiring_at(&self, timestamp_ms: u64) -> bool {
+        self.nodes.values().any(|record| {
+            !matches!(
+                record.membership,
+                NodeMembershipState::Out | NodeMembershipState::Removed
+            ) && record.availability != NodeAvailabilityState::Unavailable
+                && record
+                    .lease_deadline_ms
+                    .is_some_and(|lease_deadline_ms| lease_deadline_ms <= timestamp_ms)
+        })
+    }
+
     fn record_committed_timestamp(&mut self, timestamp_ms: u64) -> bool {
         let previous = self.max_committed_timestamp_ms;
         self.max_committed_timestamp_ms = Some(match previous {
@@ -1643,7 +1656,13 @@ impl ControlPlaneCommandStateMachine for ClusterControlSnapshot {
                 ))
             }
             ControlPlaneCommand::ExpireHeartbeatLeases { expire_at_ms } => {
-                self.validate_committed_timestamp(expire_at_ms)?;
+                if self.committed_timestamp_exceeds_forward_bound(expire_at_ms) {
+                    if !self.has_heartbeat_lease_expiring_at(expire_at_ms) {
+                        self.validate_committed_timestamp(expire_at_ms)?;
+                    }
+                } else {
+                    self.validate_committed_timestamp(expire_at_ms)?;
+                }
                 let mut next_snapshot = self.clone();
                 let timestamp_changed = next_snapshot.record_committed_timestamp(expire_at_ms);
                 let mut expired_nodes = Vec::new();
@@ -3779,6 +3798,7 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
         if self
             .snapshot
             .committed_timestamp_exceeds_forward_bound(now_ms)
+            && !self.snapshot.has_heartbeat_lease_expiring_at(now_ms)
         {
             return Ok(HeartbeatLeaseExpiry {
                 cluster_epoch: self.snapshot.cluster_epoch,
@@ -15087,7 +15107,7 @@ mod tests {
     }
 
     #[test]
-    fn expire_heartbeat_leases_command_rejects_committed_timestamp_forward_jump() {
+    fn expire_heartbeat_leases_command_rejects_forward_jump_without_expired_lease() {
         let tmp = test_util::tempdir();
         let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
         let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
@@ -15095,9 +15115,10 @@ mod tests {
             .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
             .unwrap();
         assert!(heartbeat_until_serving(&mut authority, 1, 1_000).serving());
+        authority.expire_heartbeat_leases(1_101).unwrap();
 
         let before = authority.snapshot().clone();
-        let expire_at_ms = 1_001 + MAX_COMMITTED_TIMESTAMP_FORWARD_JUMP_MS + 1;
+        let expire_at_ms = 1_101 + MAX_COMMITTED_TIMESTAMP_FORWARD_JUMP_MS + 1;
         let error = before
             .apply_control_plane_command(ControlPlaneCommand::ExpireHeartbeatLeases {
                 expire_at_ms,
@@ -15108,11 +15129,60 @@ mod tests {
             error,
             ControlPlaneError::CommittedTimestampTooFarAhead {
                 timestamp_ms,
-                max_committed_timestamp_ms: 1_001,
+                max_committed_timestamp_ms: 1_101,
                 max_forward_jump_ms: MAX_COMMITTED_TIMESTAMP_FORWARD_JUMP_MS,
             } if timestamp_ms == expire_at_ms
         ));
         assert_eq!(authority.snapshot(), &before);
+    }
+
+    #[test]
+    fn expire_heartbeat_leases_proposal_recovers_after_long_downtime() {
+        let tmp = test_util::tempdir();
+        let state_path = tmp.path().join("control-plane.state");
+        let store = FileControlPlaneStore::new(&state_path);
+        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+        authority
+            .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
+            .unwrap();
+        assert!(heartbeat_until_serving(&mut authority, 1, 1_000).serving());
+
+        drop(authority);
+        let store = FileControlPlaneStore::new(&state_path);
+        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+        let far_future_now_ms = 1_001 + MAX_COMMITTED_TIMESTAMP_FORWARD_JUMP_MS + 123;
+        let expiry = authority
+            .expire_heartbeat_leases(far_future_now_ms)
+            .expect("lease expiry proposal should recover expired leases after downtime");
+
+        assert_eq!(expiry.expired_nodes(), &[NodeId::new(1)]);
+        assert_eq!(
+            authority.snapshot().max_committed_timestamp_ms(),
+            Some(far_future_now_ms)
+        );
+        assert_eq!(
+            authority
+                .snapshot()
+                .node(NodeId::new(1))
+                .unwrap()
+                .availability(),
+            NodeAvailabilityState::Unavailable
+        );
+
+        let heartbeat_at_ms = far_future_now_ms + 1;
+        let heartbeat = heartbeat_from_record(
+            &authority,
+            1,
+            authority.snapshot().cluster_epoch(),
+            heartbeat_at_ms,
+        );
+        authority
+            .heartbeat(heartbeat, heartbeat_at_ms)
+            .expect("heartbeat should renew after downtime expiry recovery");
+        assert_eq!(
+            authority.snapshot().max_committed_timestamp_ms(),
+            Some(heartbeat_at_ms)
+        );
     }
 
     #[test]
@@ -15124,13 +15194,14 @@ mod tests {
             .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
             .unwrap();
         assert!(heartbeat_until_serving(&mut authority, 1, 1_000).serving());
+        authority.expire_heartbeat_leases(1_101).unwrap();
 
         let before = authority.snapshot().clone();
-        let far_future_now_ms = 1_001 + MAX_COMMITTED_TIMESTAMP_FORWARD_JUMP_MS + 123;
+        let far_future_now_ms = 1_101 + MAX_COMMITTED_TIMESTAMP_FORWARD_JUMP_MS + 123;
         for _ in 0..3 {
             let expiry = authority
                 .expire_heartbeat_leases(far_future_now_ms)
-                .expect("lease expiry proposal should defer far-future clock jumps");
+                .expect("lease expiry proposal should defer far-future timestamp-only jumps");
 
             assert!(expiry.expired_nodes().is_empty());
             assert!(expiry.peering_pgs().is_empty());
