@@ -28,6 +28,7 @@
 pub mod clock;
 pub mod cluster;
 pub mod control_plane;
+pub mod control_plane_auth;
 pub mod control_plane_command;
 pub mod control_plane_raft;
 pub(crate) mod data_dir;

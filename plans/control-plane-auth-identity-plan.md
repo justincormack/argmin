@@ -194,6 +194,20 @@ The first implementation slice should start with items 1 and 2 if they remain
 small enough to review together. Raft transport wiring should wait until the
 standalone envelope and fail-closed codec tests are in place.
 
+Status:
+
+- 2026-07-07: Started items 1 and 2 with `storage::control_plane_auth`: shared
+  principal/service/operation, auth decision, and rejection-reason types plus a
+  versioned canonical envelope codec covering payload bytes and authenticator
+  bytes. The header exposes canonical covered bytes for the future MAC input.
+  The slice is intentionally crypto-free; scoped symmetric
+  signing/verification and Raft transport enforcement remain the next work.
+- The initial codec tests cover round-trip for every principal role and
+  fail-closed behavior for bad magic/version, unknown tags, truncation,
+  trailing bytes, invalid optional fields, invalid principal fields, empty
+  credential fields, empty authenticators, and payload-size limits before
+  allocation.
+
 ## Path-Specific Enforcement Order
 
 ### Slice A: Raft Peer RPCs
