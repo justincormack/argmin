@@ -2641,11 +2641,6 @@ impl RouteMapValidity {
             Self::Until(valid_until_ms) => valid_until_ms.get() > now_ms,
         }
     }
-
-    #[must_use]
-    pub fn regresses_to(self, candidate: Self) -> bool {
-        matches!((self, candidate), (Self::Until(_), Self::Forever))
-    }
 }
 
 /// Durable object-payload reclaim worker claim fields included in local-debug output.

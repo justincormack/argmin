@@ -1325,11 +1325,8 @@ pub enum StorageNodeServerError {
         current: ClusterEpoch,
         candidate: ClusterEpoch,
     },
-    #[error("storage-node runtime refresh removed bounded same-epoch route-map validity from {current:?} to {candidate:?}")]
-    RuntimeRefreshValidityRegression {
-        current: Option<u64>,
-        candidate: Option<u64>,
-    },
+    #[error("storage-node runtime refresh for epoch {candidate} has unbounded route-map validity")]
+    RuntimeRefreshUnboundedRouteMapValidity { candidate: ClusterEpoch },
     #[error("storage-node control-plane refresh loop interval must be non-zero")]
     ControlPlaneRefreshLoopZeroInterval,
     #[error("read storage-node control-plane runtime config {path:?}")]
@@ -1881,16 +1878,12 @@ impl StorageNodeServer {
                 candidate: next_config.cluster_epoch,
             });
         }
-        if next_config.route_map_valid_until_ms().is_none()
-            || (next_config.cluster_epoch == current_config.cluster_epoch
-                && current_config
-                    .route_map_validity
-                    .regresses_to(next_config.route_map_validity))
-        {
-            return Err(StorageNodeServerError::RuntimeRefreshValidityRegression {
-                current: current_config.route_map_valid_until_ms(),
-                candidate: next_config.route_map_valid_until_ms(),
-            });
+        if next_config.route_map_valid_until_ms().is_none() {
+            return Err(
+                StorageNodeServerError::RuntimeRefreshUnboundedRouteMapValidity {
+                    candidate: next_config.cluster_epoch,
+                },
+            );
         }
         next_config.persist_control_plane_runtime_config()?;
         *current_config = Arc::new(next_config);
@@ -12259,7 +12252,7 @@ mod tests {
     }
 
     #[test]
-    fn storage_node_runtime_config_install_rejects_same_epoch_unbounded_validity_regression() {
+    fn storage_node_runtime_config_install_rejects_same_epoch_unbounded_validity() {
         let tmp = test_util::tempdir();
         let mut config = test_config(&tmp);
         config.route_map_validity = RouteMapValidity::until_ms(5_000).unwrap();
@@ -12270,10 +12263,11 @@ mod tests {
         unbounded.route_map_validity = RouteMapValidity::Forever;
         assert!(matches!(
             server.install_control_plane_runtime_config(unbounded),
-            Err(StorageNodeServerError::RuntimeRefreshValidityRegression {
-                current: Some(5_000),
-                candidate: None,
-            })
+            Err(
+                StorageNodeServerError::RuntimeRefreshUnboundedRouteMapValidity {
+                    candidate
+                }
+            ) if candidate == config.cluster_epoch
         ));
     }
 
@@ -12295,10 +12289,11 @@ mod tests {
 
         assert!(matches!(
             server.install_control_plane_runtime_config(unbounded),
-            Err(StorageNodeServerError::RuntimeRefreshValidityRegression {
-                current: Some(5_000),
-                candidate: None,
-            })
+            Err(
+                StorageNodeServerError::RuntimeRefreshUnboundedRouteMapValidity {
+                    candidate
+                }
+            ) if candidate == ClusterEpoch::new(config.cluster_epoch.get() + 1).unwrap()
         ));
         assert_eq!(server.config_snapshot().cluster_epoch, config.cluster_epoch);
         assert_eq!(

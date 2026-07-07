@@ -158,11 +158,10 @@ Remaining order of attack:
   — a fresh instance of the P2 duplicate-entry-point pattern created by the
   S6 fix. Both copies also operate on `Option<u64>` projections rather than
   `RouteMapValidity` itself, keeping non-diagnostic Option plumbing alive.
-  Consolidate into one helper taking the enum. Fixed by moving the regression
-  predicate onto `RouteMapValidity::regresses_to`, with current semantics that
-  `Until(_) -> Forever` is a refresh regression while bounded shrinks are
-  permitted, and using that helper from both frontend and storage-node runtime
-  map install paths.
+  Consolidate into one helper taking the enum. Initially fixed by moving the
+  regression predicate onto `RouteMapValidity::regresses_to`; V4 later removed
+  that helper after RR14 made unbounded dynamic candidates an explicit illegal
+  input and bounded shrinks remained permitted.
 
 - [x] **RR9. Bucket write *drains* still have the pre-S1 shape.**
   `begin_durable_bucket_write_drain` takes `lease_deadline: Option<u64>`
@@ -313,7 +312,7 @@ residuals found by the verification, none release-blocking:
   checksum-algorithm parser, with a direct parser regression for the
   `InvalidRequestHostId` shape.
 
-- [ ] **V4. `RouteMapValidity::regresses_to` is now dead, and the rejection
+- [x] **V4. `RouteMapValidity::regresses_to` is now dead, and the rejection
   error name does double duty.** RR14's unconditional unbounded-candidate
   rejection subsumes the `regresses_to` disjunct at both install paths
   (`cluster.rs:1138-1143`, `storage_node_server.rs:1789-1794`) — the helper
@@ -322,7 +321,11 @@ residuals found by the verification, none release-blocking:
   `RuntimeRefreshValidityRegression { candidate: None }`, which is not a
   regression relative to current. Remove the dead disjunct/helper (or keep
   and document as belt-and-braces) and name the unbounded-candidate
-  rejection distinctly.
+  rejection distinctly. Fixed by deleting `RouteMapValidity::regresses_to` and
+  replacing the old regression errors with explicit unbounded dynamic
+  candidate errors:
+  `StorageClusterRuntimeMapRefreshError::UnboundedRouteMapValidity` and
+  `StorageNodeServerError::RuntimeRefreshUnboundedRouteMapValidity`.
 
 - [x] **V5. Security-token check ordering differs by auth path**
   (pre-existing, now pinned). AWS-facing tests now cover

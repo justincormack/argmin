@@ -1028,13 +1028,8 @@ pub enum StorageClusterRuntimeMapRefreshError {
         current: ClusterEpoch,
         candidate: ClusterEpoch,
     },
-    #[error(
-        "refreshed runtime map removed bounded same-epoch route-map validity from {current:?} to {candidate:?}"
-    )]
-    ValidityRegression {
-        current: Option<u64>,
-        candidate: Option<u64>,
-    },
+    #[error("refreshed runtime map for epoch {candidate} has unbounded route-map validity")]
+    UnboundedRouteMapValidity { candidate: ClusterEpoch },
     #[error("storage cluster runtime-map refresh loop interval must be non-zero")]
     RefreshLoopZeroInterval,
     #[error("spawn storage cluster runtime-map refresh loop")]
@@ -1135,16 +1130,12 @@ impl StorageClusterRuntimeMapHandle {
                 candidate: candidate.cluster_epoch(),
             });
         }
-        if candidate.route_map_valid_until_ms().is_none()
-            || (candidate.cluster_epoch() == current.cluster_epoch()
-                && current
-                    .route_map_validity()
-                    .regresses_to(candidate.route_map_validity()))
-        {
-            return Err(StorageClusterRuntimeMapRefreshError::ValidityRegression {
-                current: current.route_map_valid_until_ms(),
-                candidate: candidate.route_map_valid_until_ms(),
-            });
+        if candidate.route_map_valid_until_ms().is_none() {
+            return Err(
+                StorageClusterRuntimeMapRefreshError::UnboundedRouteMapValidity {
+                    candidate: candidate.cluster_epoch(),
+                },
+            );
         }
         if candidate.cluster_epoch() == current.cluster_epoch() {
             let candidate_validity = candidate.route_map_validity();

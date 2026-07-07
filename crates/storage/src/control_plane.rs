@@ -17923,7 +17923,7 @@ mod tests {
     }
 
     #[test]
-    fn storage_cluster_runtime_map_handle_rejects_same_epoch_unbounded_validity_regression() {
+    fn storage_cluster_runtime_map_handle_rejects_same_epoch_unbounded_validity() {
         let tmp = test_util::tempdir();
         let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
         let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
@@ -17965,10 +17965,11 @@ mod tests {
         .unwrap();
         assert!(matches!(
             handle.install(unbounded_cluster),
-            Err(crate::cluster::StorageClusterRuntimeMapRefreshError::ValidityRegression {
-                current,
-                candidate,
-            }) if current == Some(current_valid_until) && candidate.is_none()
+            Err(
+                crate::cluster::StorageClusterRuntimeMapRefreshError::UnboundedRouteMapValidity {
+                    candidate,
+                }
+            ) if candidate == current_map.cluster_epoch()
         ));
         assert_eq!(
             handle.current().route_map_valid_until_ms(),
@@ -18004,10 +18005,11 @@ mod tests {
 
         assert!(matches!(
             handle.install(unbounded_cluster),
-            Err(crate::cluster::StorageClusterRuntimeMapRefreshError::ValidityRegression {
-                current,
-                candidate,
-            }) if current == Some(current_valid_until) && candidate.is_none()
+            Err(
+                crate::cluster::StorageClusterRuntimeMapRefreshError::UnboundedRouteMapValidity {
+                    candidate,
+                }
+            ) if candidate == ClusterEpoch::new(current_map.cluster_epoch().get() + 1).unwrap()
         ));
         assert_eq!(
             handle.current().cluster_epoch(),
