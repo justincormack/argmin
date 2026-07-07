@@ -198,6 +198,81 @@ async fn assert_get_object_expiration_header_eventually(bucket: &str, key: &str,
     }
 }
 
+/// Create a multipart upload, retrying until the just-put lifecycle rule is
+/// visible as abort headers (AWS lifecycle configuration is eventually
+/// consistent). Uploads created before the rule propagated are aborted.
+async fn create_multipart_upload_until_abort_header(
+    bucket: &str,
+    key: &str,
+    rule_id: &str,
+) -> aws_sdk_s3::operation::create_multipart_upload::CreateMultipartUploadOutput {
+    const MAX_ATTEMPTS: usize = 10;
+
+    let client = CTX.client();
+    for attempt in 0..MAX_ATTEMPTS {
+        let create = client
+            .create_multipart_upload()
+            .bucket(bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap();
+        if create.abort_date().is_some() {
+            assert_eq!(create.abort_rule_id(), Some(rule_id));
+            return create;
+        }
+        client
+            .abort_multipart_upload()
+            .bucket(bucket)
+            .key(key)
+            .upload_id(create.upload_id().unwrap())
+            .send()
+            .await
+            .unwrap();
+        if attempt + 1 == MAX_ATTEMPTS {
+            panic!(
+                "expected x-amz-abort-date header on CreateMultipartUpload for key {key} after {MAX_ATTEMPTS} attempts"
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    unreachable!()
+}
+
+/// Assert ListParts reports the abort headers, retrying while a stale
+/// replica may not have seen the lifecycle configuration yet.
+async fn assert_list_parts_abort_header_eventually(
+    bucket: &str,
+    key: &str,
+    upload_id: &str,
+    rule_id: &str,
+) {
+    const MAX_ATTEMPTS: usize = 10;
+
+    for attempt in 0..MAX_ATTEMPTS {
+        let list_parts = CTX
+            .client()
+            .list_parts()
+            .bucket(bucket)
+            .key(key)
+            .upload_id(upload_id)
+            .send()
+            .await
+            .unwrap();
+        if list_parts.abort_date().is_some() {
+            assert_eq!(list_parts.abort_rule_id(), Some(rule_id));
+            return;
+        }
+        if attempt + 1 == MAX_ATTEMPTS {
+            panic!(
+                "expected x-amz-abort-date header on ListParts for key {key} after {MAX_ATTEMPTS} attempts"
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
 async fn assert_lifecycle_deleted_eventually(bucket: &str) {
     const MAX_ATTEMPTS: usize = 20;
 
@@ -2133,27 +2208,21 @@ fn test_create_multipart_upload_and_list_parts_report_abort_headers() {
             .await;
         put_lifecycle.unwrap();
 
-        let create = client
-            .create_multipart_upload()
-            .bucket(&bucket)
-            .key("uploads/incomplete")
-            .send()
-            .await
-            .unwrap();
-        assert!(create.abort_date().is_some());
-        assert_eq!(create.abort_rule_id(), Some("abort-incomplete"));
+        let create = create_multipart_upload_until_abort_header(
+            &bucket,
+            "uploads/incomplete",
+            "abort-incomplete",
+        )
+        .await;
         let upload_id = create.upload_id().unwrap().to_string();
 
-        let list_parts = client
-            .list_parts()
-            .bucket(&bucket)
-            .key("uploads/incomplete")
-            .upload_id(&upload_id)
-            .send()
-            .await
-            .unwrap();
-        assert!(list_parts.abort_date().is_some());
-        assert_eq!(list_parts.abort_rule_id(), Some("abort-incomplete"));
+        assert_list_parts_abort_header_eventually(
+            &bucket,
+            "uploads/incomplete",
+            &upload_id,
+            "abort-incomplete",
+        )
+        .await;
 
         client
             .abort_multipart_upload()
@@ -2191,41 +2260,57 @@ fn test_complete_multipart_upload_reports_expiration_header() {
             .await
             .unwrap();
 
-        let create = client
-            .create_multipart_upload()
-            .bucket(&bucket)
-            .key("logs/complete")
-            .send()
-            .await
-            .unwrap();
-        let upload_id = create.upload_id().unwrap().to_string();
+        // CompleteMultipartUpload cannot be re-sent for the same upload, so
+        // while the just-put lifecycle rule propagates (AWS is eventually
+        // consistent) retry the whole upload cycle; each retry overwrites
+        // the same key.
+        const MAX_ATTEMPTS: usize = 10;
+        for attempt in 0..MAX_ATTEMPTS {
+            let create = client
+                .create_multipart_upload()
+                .bucket(&bucket)
+                .key("logs/complete")
+                .send()
+                .await
+                .unwrap();
+            let upload_id = create.upload_id().unwrap().to_string();
 
-        let upload_part = client
-            .upload_part()
-            .bucket(&bucket)
-            .key("logs/complete")
-            .upload_id(&upload_id)
-            .part_number(1)
-            .body(ByteStream::from_static(b"hello world"))
-            .send()
-            .await
-            .unwrap();
-        let etag = upload_part.e_tag().unwrap().to_string();
+            let upload_part = client
+                .upload_part()
+                .bucket(&bucket)
+                .key("logs/complete")
+                .upload_id(&upload_id)
+                .part_number(1)
+                .body(ByteStream::from_static(b"hello world"))
+                .send()
+                .await
+                .unwrap();
+            let etag = upload_part.e_tag().unwrap().to_string();
 
-        let complete = client
-            .complete_multipart_upload()
-            .bucket(&bucket)
-            .key("logs/complete")
-            .upload_id(upload_id)
-            .multipart_upload(
-                CompletedMultipartUpload::builder()
-                    .parts(CompletedPart::builder().part_number(1).e_tag(etag).build())
-                    .build(),
-            )
-            .send()
-            .await
-            .unwrap();
-        assert_lifecycle_expiration_header(complete.expiration(), "expire-complete");
+            let complete = client
+                .complete_multipart_upload()
+                .bucket(&bucket)
+                .key("logs/complete")
+                .upload_id(upload_id)
+                .multipart_upload(
+                    CompletedMultipartUpload::builder()
+                        .parts(CompletedPart::builder().part_number(1).e_tag(etag).build())
+                        .build(),
+                )
+                .send()
+                .await
+                .unwrap();
+            if complete.expiration().is_some() {
+                assert_lifecycle_expiration_header(complete.expiration(), "expire-complete");
+                break;
+            }
+            if attempt + 1 == MAX_ATTEMPTS {
+                panic!(
+                    "expected x-amz-expiration header on CompleteMultipartUpload after {MAX_ATTEMPTS} attempts"
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
 
         let _ = client
             .delete_bucket_lifecycle()
