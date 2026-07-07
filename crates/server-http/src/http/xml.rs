@@ -90,6 +90,88 @@ pub fn error_xml_with_host_id(
     )
 }
 
+/// Format an S3 `InvalidArgument` error response naming the offending
+/// argument, optionally echoing its value.
+#[must_use]
+pub fn invalid_argument_error_xml(
+    message: &str,
+    argument_name: &str,
+    argument_value: Option<&str>,
+    request_id: &str,
+    host_id: &str,
+) -> String {
+    let argument_value_xml = match argument_value {
+        Some(value) => format!("<ArgumentValue>{}</ArgumentValue>", xml_escape(value)),
+        None => String::new(),
+    };
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+         <Error>\
+         <Code>InvalidArgument</Code>\
+         <Message>{}</Message>\
+         <ArgumentName>{}</ArgumentName>\
+         {}\
+         <RequestId>{}</RequestId>\
+         <HostId>{}</HostId>\
+         </Error>",
+        xml_escape_text(message),
+        xml_escape(argument_name),
+        argument_value_xml,
+        xml_escape(request_id),
+        xml_escape(host_id),
+    )
+}
+
+/// Format an S3 `InvalidEncryptionAlgorithmError` response echoing the
+/// rejected `x-amz-server-side-encryption` value.
+#[must_use]
+pub fn invalid_encryption_algorithm_error_xml(
+    message: &str,
+    value: &str,
+    request_id: &str,
+    host_id: &str,
+) -> String {
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+         <Error>\
+         <Code>InvalidEncryptionAlgorithmError</Code>\
+         <Message>{}</Message>\
+         <ArgumentName>x-amz-server-side-encryption</ArgumentName>\
+         <ArgumentValue>{}</ArgumentValue>\
+         <RequestId>{}</RequestId>\
+         <HostId>{}</HostId>\
+         </Error>",
+        xml_escape_text(message),
+        xml_escape(value),
+        xml_escape(request_id),
+        xml_escape(host_id),
+    )
+}
+
+/// Format an S3 `InvalidToken` error response echoing the rejected token.
+#[must_use]
+pub fn invalid_token_error_xml(
+    message: &str,
+    token: &str,
+    request_id: &str,
+    host_id: &str,
+) -> String {
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+         <Error>\
+         <Code>InvalidToken</Code>\
+         <Message>{}</Message>\
+         <Token-0>{}</Token-0>\
+         <RequestId>{}</RequestId>\
+         <HostId>{}</HostId>\
+         </Error>",
+        xml_escape_text(message),
+        xml_escape(token),
+        xml_escape(request_id),
+        xml_escape(host_id),
+    )
+}
+
 /// Format an unsatisfiable byte range error response XML.
 #[must_use]
 pub fn invalid_range_error_xml(total_size: u64, request_id: &str, host_id: &str) -> String {

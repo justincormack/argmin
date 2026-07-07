@@ -9,7 +9,7 @@ use ring::hmac;
 use s3_tests::{
     assert_s3_err_code, create_bucket_with_sse_c_enabled, delete_all_and_bucket, err_status,
     raw_object_with,
-    shape::{assert_shape, error_response_headers, shape},
+    shape::{assert_shape, error_response_headers, expected_error, shape},
     sse_c_header_values, test_sse_c_key, unique_bucket, SendRetryingOperationAborted, CTX,
 };
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -2745,17 +2745,6 @@ fn test_sse_c_upload_part_copy_rejects_wrong_destination_key() {
 
 // ── Response shapes ─────────────────────────────────────────────────
 
-/// Expected SSE-C `InvalidArgument` error body naming
-/// `x-amz-server-side-encryption`.
-fn sse_c_invalid_argument_body(message: &str) -> String {
-    format!(
-        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>InvalidArgument</Code>\
-         <Message>{message}</Message>\
-         <ArgumentName>x-amz-server-side-encryption</ArgumentName>\
-         <RequestId>{{request_id}}</RequestId><HostId>{{host_id}}</HostId></Error>"
-    )
-}
-
 fn sse_c_request_headers<'a>(key_b64: &'a str, key_md5_b64: &'a str) -> [(&'a str, &'a str); 3] {
     [
         ("x-amz-server-side-encryption-customer-algorithm", "AES256"),
@@ -2908,9 +2897,10 @@ fn test_sse_c_missing_key_md5_error_shape() {
             "PutObject SSE-C missing key MD5",
             &response,
             &shape().status(400).headers(error_response_headers()).body(
-                sse_c_invalid_argument_body(
+                expected_error::invalid_argument(
                     "Requests specifying Server Side Encryption with Customer provided keys \
                      must provide the client calculated MD5 of the secret key.",
+                    "x-amz-server-side-encryption",
                 ),
             ),
         );
@@ -2947,9 +2937,10 @@ fn test_sse_c_missing_key_error_shape() {
             "PutObject SSE-C missing key",
             &response,
             &shape().status(400).headers(error_response_headers()).body(
-                sse_c_invalid_argument_body(
+                expected_error::invalid_argument(
                     "Requests specifying Server Side Encryption with Customer provided keys \
                      must provide an appropriate secret key.",
+                    "x-amz-server-side-encryption",
                 ),
             ),
         );
@@ -2990,13 +2981,11 @@ fn test_sse_c_wrong_algorithm_error_shape() {
             "PutObject SSE-C wrong algorithm",
             &response,
             &shape().status(400).headers(error_response_headers()).body(
-                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error>\
-                     <Code>InvalidEncryptionAlgorithmError</Code>\
-                     <Message>The Encryption request you specified is not valid. Supported \
-                     value: AES256.</Message>\
-                     <ArgumentName>x-amz-server-side-encryption</ArgumentName>\
-                     <ArgumentValue>aws:kms</ArgumentValue>\
-                     <RequestId>{request_id}</RequestId><HostId>{host_id}</HostId></Error>",
+                expected_error::invalid_encryption_algorithm(
+                    "The Encryption request you specified is not valid. Supported value: \
+                     AES256.",
+                    "aws:kms",
+                ),
             ),
         );
 

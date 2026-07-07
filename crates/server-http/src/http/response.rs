@@ -542,19 +542,11 @@ impl S3Response {
                 Self::new(403).chunked_xml_body(body)
             }
             ServerError::Auth(auth::AuthError::UnexpectedSecurityToken { token }) => {
-                let body = format!(
-                    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
-                     <Error>\
-                     <Code>InvalidToken</Code>\
-                     <Message>{}</Message>\
-                     <Token-0>{}</Token-0>\
-                     <RequestId>{}</RequestId>\
-                    <HostId>{}</HostId>\
-                     </Error>",
-                    xml::xml_escape(&client_error_message(err)),
-                    xml::xml_escape(token),
-                    xml::xml_escape(request_id),
-                    xml::xml_escape(host_id),
+                let body = xml::invalid_token_error_xml(
+                    &client_error_message(err),
+                    token,
+                    request_id,
+                    host_id,
                 );
                 Self::new(400).chunked_xml_body(body)
             }
@@ -594,55 +586,31 @@ impl S3Response {
             | ServerError::MissingSseCustomerAlgorithm
             | ServerError::MissingSseCustomerKey
             | ServerError::MissingSseCustomerKeyMd5 => {
-                let body = format!(
-                    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
-                     <Error>\
-                     <Code>InvalidArgument</Code>\
-                     <Message>{}</Message>\
-                     <ArgumentName>x-amz-server-side-encryption</ArgumentName>\
-                     <RequestId>{}</RequestId>\
-                     <HostId>{}</HostId>\
-                    </Error>",
-                    xml::xml_escape_text(&client_error_message(err)),
-                    xml::xml_escape(request_id),
-                    xml::xml_escape(host_id),
+                let body = xml::invalid_argument_error_xml(
+                    &client_error_message(err),
+                    "x-amz-server-side-encryption",
+                    None,
+                    request_id,
+                    host_id,
                 );
                 Self::new(400).chunked_xml_body(body)
             }
             ServerError::InvalidEncryptionAlgorithmError { value } => {
-                let body = format!(
-                    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
-                     <Error>\
-                     <Code>InvalidEncryptionAlgorithmError</Code>\
-                     <Message>{}</Message>\
-                     <ArgumentName>x-amz-server-side-encryption</ArgumentName>\
-                     <ArgumentValue>{}</ArgumentValue>\
-                     <RequestId>{}</RequestId>\
-                     <HostId>{}</HostId>\
-                     </Error>",
-                    xml::xml_escape_text(&client_error_message(err)),
-                    xml::xml_escape(value),
-                    xml::xml_escape(request_id),
-                    xml::xml_escape(host_id),
+                let body = xml::invalid_encryption_algorithm_error_xml(
+                    &client_error_message(err),
+                    value,
+                    request_id,
+                    host_id,
                 );
                 Self::new(400).chunked_xml_body(body)
             }
             ServerError::DuplicateChecksumHeader { header, value } => {
-                let body = format!(
-                    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
-                     <Error>\
-                     <Code>InvalidArgument</Code>\
-                     <Message>{}</Message>\
-                     <ArgumentName>{}</ArgumentName>\
-                     <ArgumentValue>{}</ArgumentValue>\
-                     <RequestId>{}</RequestId>\
-                     <HostId>{}</HostId>\
-                     </Error>",
-                    xml::xml_escape_text(&client_error_message(err)),
-                    xml::xml_escape(header),
-                    xml::xml_escape(value),
-                    xml::xml_escape(request_id),
-                    xml::xml_escape(host_id),
+                let body = xml::invalid_argument_error_xml(
+                    &client_error_message(err),
+                    header,
+                    Some(value),
+                    request_id,
+                    host_id,
                 );
                 Self::new(400).chunked_xml_body(body)
             }
@@ -837,21 +805,12 @@ impl S3Response {
                 credential,
                 ..
             }) => {
-                let body = format!(
-                    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
-                     <Error>\
-                     <Code>InvalidArgument</Code>\
-                     <Message>{}</Message>\
-                     <ArgumentName>{}</ArgumentName>\
-                     <ArgumentValue>{}</ArgumentValue>\
-                     <RequestId>{}</RequestId>\
-                     <HostId>{}</HostId>\
-                     </Error>",
-                    xml::xml_escape_text(&client_error_message(err)),
-                    xml::xml_escape(param),
-                    xml::xml_escape(credential),
-                    xml::xml_escape(request_id),
-                    xml::xml_escape(host_id),
+                let body = xml::invalid_argument_error_xml(
+                    &client_error_message(err),
+                    param,
+                    Some(credential),
+                    request_id,
+                    host_id,
                 );
                 Self::new(400).chunked_xml_body(body)
             }

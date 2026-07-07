@@ -788,6 +788,37 @@ pub mod expected_error {
     pub fn request_header_section_too_large(max_size_allowed: usize) -> String {
         xml::request_header_section_too_large_error_xml(max_size_allowed, REQUEST_ID, HOST_ID)
     }
+
+    /// `InvalidArgument` naming the offending argument. The message text is
+    /// supplied by the test so it stays pinned non-tautologically.
+    pub fn invalid_argument(message: &str, argument_name: &str) -> String {
+        xml::invalid_argument_error_xml(message, argument_name, None, REQUEST_ID, HOST_ID)
+    }
+
+    /// `InvalidArgument` naming the offending argument and echoing its value.
+    pub fn invalid_argument_with_value(
+        message: &str,
+        argument_name: &str,
+        argument_value: &str,
+    ) -> String {
+        xml::invalid_argument_error_xml(
+            message,
+            argument_name,
+            Some(argument_value),
+            REQUEST_ID,
+            HOST_ID,
+        )
+    }
+
+    /// `InvalidEncryptionAlgorithmError` echoing the rejected value.
+    pub fn invalid_encryption_algorithm(message: &str, value: &str) -> String {
+        xml::invalid_encryption_algorithm_error_xml(message, value, REQUEST_ID, HOST_ID)
+    }
+
+    /// `InvalidToken` echoing the rejected security token.
+    pub fn invalid_token(message: &str, token: &str) -> String {
+        xml::invalid_token_error_xml(message, token, REQUEST_ID, HOST_ID)
+    }
 }
 
 #[cfg(test)]
@@ -1098,6 +1129,34 @@ mod tests {
              <Code>RequestHeaderSectionTooLarge</Code>\
              <Message>Your request header section exceeds the maximum allowed size.</Message>\
              <MaxSizeAllowed>8192</MaxSizeAllowed>\
+             <RequestId>{request_id}</RequestId><HostId>{host_id}</HostId></Error>"
+        );
+        assert_eq!(
+            expected_error::invalid_argument("msg", "x-amz-server-side-encryption"),
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>InvalidArgument</Code>\
+             <Message>msg</Message>\
+             <ArgumentName>x-amz-server-side-encryption</ArgumentName>\
+             <RequestId>{request_id}</RequestId><HostId>{host_id}</HostId></Error>"
+        );
+        assert_eq!(
+            expected_error::invalid_argument_with_value("msg", "x-amz-checksum-crc32", "AAAA"),
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>InvalidArgument</Code>\
+             <Message>msg</Message><ArgumentName>x-amz-checksum-crc32</ArgumentName>\
+             <ArgumentValue>AAAA</ArgumentValue>\
+             <RequestId>{request_id}</RequestId><HostId>{host_id}</HostId></Error>"
+        );
+        assert_eq!(
+            expected_error::invalid_encryption_algorithm("msg", "aws:kms"),
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error>\
+             <Code>InvalidEncryptionAlgorithmError</Code><Message>msg</Message>\
+             <ArgumentName>x-amz-server-side-encryption</ArgumentName>\
+             <ArgumentValue>aws:kms</ArgumentValue>\
+             <RequestId>{request_id}</RequestId><HostId>{host_id}</HostId></Error>"
+        );
+        assert_eq!(
+            expected_error::invalid_token("msg", "tok"),
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>InvalidToken</Code>\
+             <Message>msg</Message><Token-0>tok</Token-0>\
              <RequestId>{request_id}</RequestId><HostId>{host_id}</HostId></Error>"
         );
         assert_eq!(

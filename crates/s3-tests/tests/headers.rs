@@ -1693,11 +1693,12 @@ fn test_sigv2_rejected_in_region_that_requires_sigv4() {
     });
 }
 
-const INVALID_TOKEN_BODY: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error>\
-     <Code>InvalidToken</Code>\
-     <Message>The provided token is malformed or otherwise invalid.</Message>\
-     <Token-0>bad-token-causes-400</Token-0>\
-     <RequestId>{request_id}</RequestId><HostId>{host_id}</HostId></Error>";
+fn invalid_token_body() -> String {
+    expected_error::invalid_token(
+        "The provided token is malformed or otherwise invalid.",
+        "bad-token-causes-400",
+    )
+}
 
 #[test]
 fn test_unexpected_security_token_on_static_credentials_returns_bad_request() {
@@ -1723,7 +1724,7 @@ fn test_unexpected_security_token_on_static_credentials_returns_bad_request() {
             &shape()
                 .status(400)
                 .headers(error_response_headers())
-                .body(INVALID_TOKEN_BODY),
+                .body(invalid_token_body()),
         );
 
         cleanup(&bucket, &[key]).await;
@@ -1748,7 +1749,7 @@ fn test_unexpected_security_token_on_bucket_request_includes_bucket_region() {
                 .status(400)
                 .headers(error_response_headers())
                 .header("x-amz-bucket-region", CTX.region())
-                .body(INVALID_TOKEN_BODY),
+                .body(invalid_token_body()),
         );
 
         cleanup(&bucket, &[]).await;
