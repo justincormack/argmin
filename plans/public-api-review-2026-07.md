@@ -301,13 +301,17 @@ residuals found by the verification, none release-blocking:
   this case, and by aligning local CompleteMultipartUpload to store the same
   default checksum while preserving AWS's ignored-legacy-header behavior.
 
-- [ ] **V3. Third message/shape variant for unsupported checksum algorithm.**
+- [x] **V3. Third message/shape variant for unsupported checksum algorithm.**
   The new core rejection emits plain `InvalidRequest` with
   `"invalid checksum algorithm: {value}"` (`system_metadata.rs:171`) while
   the HTTP layer's equivalent is HostId-shaped `InvalidRequestHostId` with
   the AWS message (`mod.rs:5363`). Unreachable via HTTP today (callers
   filter first); align the message/shape so a future unfiltered caller
-  matches AWS.
+  matches AWS. Fixed by moving the AWS-shaped unsupported checksum algorithm
+  message into `ServerError::unsupported_checksum_algorithm()` and using that
+  shared constructor from both `SystemMetadata::from_header_iter` and the HTTP
+  checksum-algorithm parser, with a direct parser regression for the
+  `InvalidRequestHostId` shape.
 
 - [ ] **V4. `RouteMapValidity::regresses_to` is now dead, and the rejection
   error name does double duty.** RR14's unconditional unbounded-candidate

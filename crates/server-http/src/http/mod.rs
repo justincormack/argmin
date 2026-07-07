@@ -5409,12 +5409,8 @@ fn parse_checksum_algorithm_value(value: &str) -> Option<ChecksumAlgorithm> {
         .find(|algorithm| value.eq_ignore_ascii_case(algorithm.as_str()))
 }
 
-const UNSUPPORTED_CHECKSUM_ALGORITHM_MESSAGE: &str = "Checksum algorithm provided is unsupported. Please try again with any of the valid types: [CRC32, CRC32C, CRC64NVME, MD5, SHA1, SHA256, SHA512, XXHASH128, XXHASH3, XXHASH64]";
-
 fn parse_checksum_algorithm_header_value(value: &str) -> Result<ChecksumAlgorithm, ServerError> {
-    parse_checksum_algorithm_value(value).ok_or_else(|| ServerError::InvalidRequestHostId {
-        reason: UNSUPPORTED_CHECKSUM_ALGORITHM_MESSAGE.to_string(),
-    })
+    parse_checksum_algorithm_value(value).ok_or_else(ServerError::unsupported_checksum_algorithm)
 }
 
 fn validate_sdk_checksum_algorithm(
@@ -10849,7 +10845,7 @@ mod tests {
         };
         match fe.dispatch_routed(&req, &test_auth(), op) {
             Err(ServerError::InvalidRequestHostId { reason }) => {
-                assert_eq!(reason, UNSUPPORTED_CHECKSUM_ALGORITHM_MESSAGE);
+                assert_eq!(reason, ServerError::UNSUPPORTED_CHECKSUM_ALGORITHM_MESSAGE);
             }
             Err(e) => panic!("expected InvalidRequestHostId, got {e:?}"),
             Ok(_) => panic!("expected error, got Ok"),

@@ -339,6 +339,14 @@ impl From<StoreError> for ServerError {
 }
 
 impl ServerError {
+    pub const UNSUPPORTED_CHECKSUM_ALGORITHM_MESSAGE: &'static str = "Checksum algorithm provided is unsupported. Please try again with any of the valid types: [CRC32, CRC32C, CRC64NVME, MD5, SHA1, SHA256, SHA512, XXHASH128, XXHASH3, XXHASH64]";
+
+    pub fn unsupported_checksum_algorithm() -> Self {
+        Self::InvalidRequestHostId {
+            reason: Self::UNSUPPORTED_CHECKSUM_ALGORITHM_MESSAGE.to_string(),
+        }
+    }
+
     /// Stable, redacted label for server-side diagnostics.
     ///
     /// This is intentionally coarser than `Debug`/`Display`: labels must be

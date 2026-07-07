@@ -165,12 +165,10 @@ impl SystemMetadata {
                         })?);
                 }
                 "x-amz-checksum-algorithm" => {
-                    declared_checksum_algorithm =
-                        Some(ChecksumAlgorithm::parse(value).ok_or_else(|| {
-                            ServerError::InvalidRequest {
-                                reason: format!("invalid checksum algorithm: {value}"),
-                            }
-                        })?);
+                    declared_checksum_algorithm = Some(
+                        ChecksumAlgorithm::parse(value)
+                            .ok_or_else(ServerError::unsupported_checksum_algorithm)?,
+                    );
                 }
                 "x-amz-checksum-type" => {
                     checksum_type = Some(ChecksumType::parse(value).ok_or_else(|| {
@@ -681,7 +679,12 @@ mod tests {
             ("X-Amz-Checksum-Sha256", "abc"),
         ])
         .unwrap_err();
-        assert!(matches!(err, ServerError::InvalidRequest { .. }));
+        match err {
+            ServerError::InvalidRequestHostId { reason } => {
+                assert_eq!(reason, ServerError::UNSUPPORTED_CHECKSUM_ALGORITHM_MESSAGE)
+            }
+            other => panic!("expected InvalidRequestHostId, got {other:?}"),
+        }
     }
 
     #[test]
