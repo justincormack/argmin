@@ -313,6 +313,21 @@ Required:
 - preserve deterministic apply: auth is checked before constructing or
   accepting the durable command, not during replay.
 
+Progress:
+
+- The Unix control-plane heartbeat refresh path now has an opt-in authenticated
+  client/verifier boundary that wraps the serialized heartbeat payload in the
+  shared auth envelope. The verifier derives the expected `StorageNode`
+  principal from the decoded heartbeat payload and rejects missing auth or a
+  mismatched node/incarnation before calling the authority.
+- Remaining process wiring should avoid precomputing credentials for a fixed
+  incarnation in configuration. Storage-node process startup advances the
+  incarnation dynamically, so the production-shaped config should provide a
+  node-scoped secret/credential record and construct the scoped
+  `StorageNode { node_id, incarnation }` credential at runtime, while the
+  control-plane verifier must still bind the envelope source to the heartbeat
+  payload before mutation.
+
 ### Slice C: Frontend and Admin Control-Plane RPCs
 
 Frontend/admin operations need caller identity primarily for internal trust and
