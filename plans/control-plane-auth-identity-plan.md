@@ -251,6 +251,13 @@ Status:
   pre-dispatch auth failures are counted. A later process/debug-status slice
   should expose these counters without leaking secrets, MACs, nonces, or
   payloads.
+- 2026-07-07: Extended item 6 with a redacted Raft peer-auth status snapshot on
+  the transport policy and an `argmin-s3` diagnostic formatter. The surface
+  reports auth-required mode, local principal, credential id/version, and
+  accepted/rejected counters by operation/reason, while tests assert configured
+  secrets, MAC/authenticator bytes, nonces, and payload contents are not
+  exposed. Storage-node, frontend, admin, and runtime-map auth diagnostics
+  remain deferred with their respective enforcement slices.
 
 ## Path-Specific Enforcement Order
 

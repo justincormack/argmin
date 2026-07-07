@@ -482,6 +482,11 @@ impl ControlPlaneRaftPeerAuthMetricsSnapshot {
     }
 
     #[must_use]
+    pub fn accepted_by_operation(&self) -> &BTreeMap<ControlPlaneAuthOperation, u64> {
+        &self.accepted_by_operation
+    }
+
+    #[must_use]
     pub fn rejected_for_operation(&self, operation: ControlPlaneAuthOperation) -> u64 {
         self.rejected_by_operation
             .get(&operation)
@@ -490,11 +495,62 @@ impl ControlPlaneRaftPeerAuthMetricsSnapshot {
     }
 
     #[must_use]
+    pub fn rejected_by_operation(&self) -> &BTreeMap<ControlPlaneAuthOperation, u64> {
+        &self.rejected_by_operation
+    }
+
+    #[must_use]
     pub fn rejected_for_reason(&self, reason: ControlPlaneAuthRejectionReason) -> u64 {
         self.rejected_by_reason
             .get(&reason)
             .copied()
             .unwrap_or_default()
+    }
+
+    #[must_use]
+    pub fn rejected_by_reason(&self) -> &BTreeMap<ControlPlaneAuthRejectionReason, u64> {
+        &self.rejected_by_reason
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ControlPlaneRaftPeerAuthStatusSnapshot {
+    required: bool,
+    local_principal: Option<ControlPlaneAuthPrincipal>,
+    credential_id: Option<String>,
+    credential_version: Option<u64>,
+    metrics: ControlPlaneRaftPeerAuthMetricsSnapshot,
+}
+
+impl ControlPlaneRaftPeerAuthStatusSnapshot {
+    #[must_use]
+    pub fn unauthenticated() -> Self {
+        Self::default()
+    }
+
+    #[must_use]
+    pub fn required(&self) -> bool {
+        self.required
+    }
+
+    #[must_use]
+    pub fn local_principal(&self) -> Option<&ControlPlaneAuthPrincipal> {
+        self.local_principal.as_ref()
+    }
+
+    #[must_use]
+    pub fn credential_id(&self) -> Option<&str> {
+        self.credential_id.as_deref()
+    }
+
+    #[must_use]
+    pub fn credential_version(&self) -> Option<u64> {
+        self.credential_version
+    }
+
+    #[must_use]
+    pub fn metrics(&self) -> &ControlPlaneRaftPeerAuthMetricsSnapshot {
+        &self.metrics
     }
 }
 
@@ -581,6 +637,17 @@ impl ControlPlaneRaftPeerAuthPolicy {
     #[must_use]
     pub fn metrics_snapshot(&self) -> ControlPlaneRaftPeerAuthMetricsSnapshot {
         self.metrics.snapshot()
+    }
+
+    #[must_use]
+    pub fn status_snapshot(&self) -> ControlPlaneRaftPeerAuthStatusSnapshot {
+        ControlPlaneRaftPeerAuthStatusSnapshot {
+            required: true,
+            local_principal: Some(self.local_credential.principal().clone()),
+            credential_id: Some(self.local_credential.credential_id().to_owned()),
+            credential_version: Some(self.local_credential.credential_version()),
+            metrics: self.metrics.snapshot(),
+        }
     }
 
     pub fn record_peer_frame_rejection_without_operation(
@@ -825,6 +892,14 @@ impl ControlPlaneRaftPeerTransportPolicy {
     #[must_use]
     pub fn auth_policy(&self) -> Option<&ControlPlaneRaftPeerAuthPolicy> {
         self.auth_policy.as_deref()
+    }
+
+    #[must_use]
+    pub fn auth_status_snapshot(&self) -> ControlPlaneRaftPeerAuthStatusSnapshot {
+        self.auth_policy.as_deref().map_or_else(
+            ControlPlaneRaftPeerAuthStatusSnapshot::unauthenticated,
+            |policy| policy.status_snapshot(),
+        )
     }
 
     #[must_use]
@@ -10323,6 +10398,82 @@ mod tests {
     }
 
     #[test]
+    fn control_plane_raft_peer_auth_status_snapshot_exposes_redacted_counters() {
+        let identity =
+            ControlPlaneRaftPeerFrameIdentity::new("control-plane-raft-peer-transport-test", 1, 2);
+        let raw_frame = ControlPlaneRaftPeerRpcRequest::Vote(VoteRequest {
+            vote: Vote::<ControlPlaneRaftLeaderId>::new(4, 1),
+            last_log_id: Some(raft_log_id(3, 1, 8)),
+            leadership_transfer: false,
+        })
+        .encode_frame_for_peer(&identity)
+        .unwrap();
+        let signed = test_peer_auth_policy(1)
+            .sign_peer_frame(
+                &identity,
+                ControlPlaneAuthOperation::RaftVote,
+                raw_frame.clone(),
+            )
+            .unwrap();
+        let verifier = test_peer_auth_policy(2);
+        verifier
+            .verify_peer_frame(
+                &signed,
+                &identity,
+                ControlPlaneAuthOperation::RaftVote,
+                4096,
+            )
+            .unwrap();
+        verifier
+            .verify_peer_frame(
+                &raw_frame,
+                &identity,
+                ControlPlaneAuthOperation::RaftVote,
+                4096,
+            )
+            .expect_err("unauthenticated peer frame should be rejected");
+
+        let status = verifier.status_snapshot();
+        assert!(status.required());
+        assert_eq!(
+            status.local_principal(),
+            Some(&ControlPlaneAuthPrincipal::RaftPeer { node_id: 2 })
+        );
+        assert_eq!(status.credential_id(), Some("raft-peer-2"));
+        assert_eq!(status.credential_version(), Some(1));
+        assert_eq!(status.metrics().accepted_total(), 1);
+        assert_eq!(status.metrics().rejected_total(), 1);
+        assert_eq!(
+            status
+                .metrics()
+                .accepted_for_operation(ControlPlaneAuthOperation::RaftVote),
+            1
+        );
+        assert_eq!(
+            status
+                .metrics()
+                .rejected_for_reason(ControlPlaneAuthRejectionReason::Malformed),
+            1
+        );
+
+        let debug = format!("{status:?}");
+        assert!(debug.contains("raft-peer-2"));
+        assert!(!debug.contains("test-raft-peer-secret-2"));
+        assert!(!debug.contains("authenticator"));
+        assert!(!debug.contains("payload"));
+
+        let unauthenticated = ControlPlaneRaftPeerTransportPolicy::new(
+            "control-plane-raft-peer-transport-test",
+            BTreeMap::from([(1, BasicNode::new("node-1"))]),
+            ControlPlaneRaftPeerTransportLimits::default(),
+        )
+        .auth_status_snapshot();
+        assert!(!unauthenticated.required());
+        assert_eq!(unauthenticated.credential_id(), None);
+        assert_eq!(unauthenticated.metrics().accepted_total(), 0);
+    }
+
+    #[test]
     fn control_plane_raft_peer_rpc_response_frames_round_trip() {
         let append = AppendEntriesResponse::HigherVote(Vote::<ControlPlaneRaftLeaderId>::new(5, 9));
         let encoded = ControlPlaneRaftPeerRpcResponse::AppendEntries(append.clone())
@@ -15156,7 +15307,20 @@ mod tests {
             )
             .await;
             let linearized_directory_status = expect_bounded_control_plane_raft(
-                linearized_directory_authority.status(),
+                async {
+                    for _ in 0..100 {
+                        let status = linearized_directory_authority.status().await?;
+                        if status.node_id() == 412 && status.linearized_authority_serving() {
+                            return Ok(status);
+                        }
+                        ControlPlaneRaftTypeConfig::sleep(Duration::from_millis(10)).await;
+                    }
+                    Err(ControlPlaneError::RpcRemote {
+                        message:
+                            "linearized authority directory transferred leader did not become serving"
+                                .to_string(),
+                    })
+                },
                 operation_timeout,
                 "linearized authority directory transferred leader status",
             )

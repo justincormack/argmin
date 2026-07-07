@@ -1,6 +1,7 @@
 mod config;
 
 use std::ffi::OsString;
+use std::fmt::Write as _;
 use std::fs::{self, File, OpenOptions};
 use std::future::Future;
 use std::io;
@@ -1910,6 +1911,55 @@ fn build_experimental_raft_peer_auth_policy(
         })
 }
 
+fn format_experimental_raft_peer_auth_diagnostics(
+    policy: &ControlPlaneRaftPeerTransportPolicy,
+) -> String {
+    let status = policy.auth_status_snapshot();
+    let metrics = status.metrics();
+    let local_principal = status
+        .local_principal()
+        .map_or_else(|| "-".to_string(), |principal| format!("{principal:?}"));
+    let credential_id = status.credential_id().unwrap_or("-");
+    let credential_version = status
+        .credential_version()
+        .map_or_else(|| "-".to_string(), |version| version.to_string());
+    let mut diagnostics = format!(
+        "raft_peer_auth required={} local_principal={} credential_id={} credential_version={} accepted_total={} rejected_total={} rejected_without_operation_total={}",
+        status.required(),
+        local_principal,
+        credential_id,
+        credential_version,
+        metrics.accepted_total(),
+        metrics.rejected_total(),
+        metrics.rejected_without_operation_total()
+    );
+    for (operation, count) in metrics.accepted_by_operation() {
+        diagnostics.push('\n');
+        write!(
+            &mut diagnostics,
+            "raft_peer_auth accepted_by_operation{{operation=\"{operation:?}\"}} {count}"
+        )
+        .expect("write to String should not fail");
+    }
+    for (operation, count) in metrics.rejected_by_operation() {
+        diagnostics.push('\n');
+        write!(
+            &mut diagnostics,
+            "raft_peer_auth rejected_by_operation{{operation=\"{operation:?}\"}} {count}"
+        )
+        .expect("write to String should not fail");
+    }
+    for (reason, count) in metrics.rejected_by_reason() {
+        diagnostics.push('\n');
+        write!(
+            &mut diagnostics,
+            "raft_peer_auth rejected_by_reason{{reason=\"{reason:?}\"}} {count}"
+        )
+        .expect("write to String should not fail");
+    }
+    diagnostics
+}
+
 fn experimental_raft_startup_requires_local_leader(
     peer_policy: Option<&ControlPlaneRaftPeerTransportPolicy>,
 ) -> bool {
@@ -2586,6 +2636,9 @@ fn run_experimental_raft_control_plane_process(config: &ServerConfig) -> ! {
         config.control_plane_raft_auth_credentials.len(),
         config.control_plane_lease_scan_interval.as_millis()
     );
+    if let Some(policy) = &raft_peer_policy {
+        process_info!("{}", format_experimental_raft_peer_auth_diagnostics(policy));
+    }
 
     loop {
         for _ in 0..CONTROL_PLANE_ACCEPT_BATCH_LIMIT {
@@ -5348,6 +5401,83 @@ mod tests {
         );
 
         harness.shutdown();
+    }
+
+    #[test]
+    fn experimental_raft_peer_auth_diagnostics_are_redacted() {
+        let cluster_name = format!(
+            "argmin-s3-experimental-raft-peer-auth-diagnostics-{}",
+            std::process::id()
+        );
+        let unauthenticated_policy = ControlPlaneRaftPeerTransportPolicy::from_peer_endpoints(
+            cluster_name.clone(),
+            [(1, "node-1".to_string()), (2, "node-2".to_string())],
+            ControlPlaneRaftPeerTransportLimits::default(),
+        );
+        let unauthenticated =
+            format_experimental_raft_peer_auth_diagnostics(&unauthenticated_policy);
+        assert!(
+            unauthenticated.contains("required=false"),
+            "{unauthenticated}"
+        );
+        assert!(
+            unauthenticated.contains("credential_id=-"),
+            "{unauthenticated}"
+        );
+
+        let policy = ControlPlaneRaftPeerTransportPolicy::from_peer_endpoints(
+            cluster_name.clone(),
+            [(1, "node-1".to_string()), (2, "node-2".to_string())],
+            ControlPlaneRaftPeerTransportLimits::default(),
+        )
+        .with_auth_policy(experimental_raft_peer_auth_policy(&cluster_name, 2, 1));
+        let auth_policy = policy
+            .auth_policy()
+            .expect("test policy should have auth policy");
+        auth_policy.record_peer_frame_rejection(
+            ControlPlaneAuthOperation::RaftVote,
+            ControlPlaneAuthRejectionReason::WrongCluster,
+        );
+        auth_policy.record_peer_frame_rejection_without_operation(
+            ControlPlaneAuthRejectionReason::Malformed,
+        );
+
+        let diagnostics = format_experimental_raft_peer_auth_diagnostics(&policy);
+        assert!(diagnostics.contains("required=true"), "{diagnostics}");
+        assert!(
+            diagnostics.contains("local_principal=RaftPeer { node_id: 2 }"),
+            "{diagnostics}"
+        );
+        assert!(
+            diagnostics.contains("credential_id=raft-node-2"),
+            "{diagnostics}"
+        );
+        assert!(
+            diagnostics.contains("credential_version=1"),
+            "{diagnostics}"
+        );
+        assert!(diagnostics.contains("accepted_total=0"), "{diagnostics}");
+        assert!(diagnostics.contains("rejected_total=2"), "{diagnostics}");
+        assert!(
+            diagnostics.contains("rejected_without_operation_total=1"),
+            "{diagnostics}"
+        );
+        assert!(
+            diagnostics.contains("rejected_by_operation{operation=\"RaftVote\"} 1"),
+            "{diagnostics}"
+        );
+        assert!(
+            diagnostics.contains("rejected_by_reason{reason=\"WrongCluster\"} 1"),
+            "{diagnostics}"
+        );
+        assert!(
+            diagnostics.contains("rejected_by_reason{reason=\"Malformed\"} 1"),
+            "{diagnostics}"
+        );
+        assert!(!diagnostics.contains("node-1-test-secret"));
+        assert!(!diagnostics.contains("node-2-test-secret"));
+        assert!(!diagnostics.contains("payload"));
+        assert!(!diagnostics.contains("authenticator"));
     }
 
     #[test]
