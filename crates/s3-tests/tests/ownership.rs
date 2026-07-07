@@ -1267,8 +1267,12 @@ fn test_bucket_policy_foreign_owned_object_access_matrix_matches_aws() {
         assert_s3_err_code(&get_object_acl, "AccessDenied");
         get_object_tagging
             .expect("bucket owner policy should allow GetObjectTagging on foreign-owned object");
-        put_object_acl
-            .expect("bucket owner policy should allow PutObjectAcl on foreign-owned object");
+        // Probed on AWS 2026-07-07: bucket policies no longer grant the
+        // bucket owner PutObjectAcl on a foreign-owned object ("no
+        // resource-based policy allows the s3:PutObjectAcl action"),
+        // aligning ACL writes with the already-denied ACL reads.
+        assert_eq!(err_status(&put_object_acl), 403);
+        assert_s3_err_code(&put_object_acl, "AccessDenied");
         put_object_tagging
             .expect("bucket owner policy should allow PutObjectTagging on foreign-owned object");
 

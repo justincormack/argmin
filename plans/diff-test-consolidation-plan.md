@@ -390,9 +390,12 @@ AWS no longer lets a bucket policy grant the bucket owner PutObjectAcl
 on a foreign-owned object ("no resource-based policy allows the
 s3:PutObjectAcl action"), closing the old anomaly where ACL reads were
 denied but ACL writes grantable; tagging operations remain grantable
-(full matrix re-probed). FOLLOW-UP SLICE: align the authz model (deny
-policy-granted PutObjectAcl on foreign-owned objects) and update the
-pinned matrix test. Context: AWS has been making denial messages more
+(full matrix re-probed). FOLLOW-UP SLICE (DONE 2026-07-07): the foreign-owned
+bucket-policy filter now covers both ACL directions
+(`filter_bucket_policy_allow_for_foreign_owned_object_action`, applied
+in all object-action policy decision paths, no-op for unlisted
+actions), and the pinned ownership matrix expects the denial; the full
+ownership binary passes on AWS. Context: AWS has been making denial messages more
 explicit over recent weeks (the probed "no resource-based policy
 allows"/"explicit deny in a resource-based policy" variants belong to
 that wave), so message-level drift is expected elsewhere too — a

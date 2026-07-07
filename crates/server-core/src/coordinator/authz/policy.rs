@@ -616,12 +616,17 @@ pub(super) fn requester_can_object_action_with_bucket_policy<F>(
 where
     F: FnOnce() -> bool,
 {
-    let decision = bucket_policy_decision_for_object(
-        coord,
-        request,
+    let decision = filter_bucket_policy_allow_for_foreign_owned_object_action(
+        request.bucket,
         object,
-        ExistingObjectTagsMode::Available,
-    )?;
+        request.action,
+        bucket_policy_decision_for_object(
+            coord,
+            request,
+            object,
+            ExistingObjectTagsMode::Available,
+        )?,
+    );
     Ok(bucket_policy_allows_with_fallback(
         request.requester,
         request.bucket,
@@ -639,12 +644,17 @@ pub(super) fn requester_can_object_action_with_unavailable_existing_tags_with_bu
 where
     F: FnOnce() -> bool,
 {
-    let decision = bucket_policy_decision_for_object(
-        coord,
-        request,
+    let decision = filter_bucket_policy_allow_for_foreign_owned_object_action(
+        request.bucket,
         object,
-        ExistingObjectTagsMode::Unavailable,
-    )?;
+        request.action,
+        bucket_policy_decision_for_object(
+            coord,
+            request,
+            object,
+            ExistingObjectTagsMode::Unavailable,
+        )?,
+    );
     Ok(bucket_policy_allows_with_fallback(
         request.requester,
         request.bucket,
@@ -663,7 +673,7 @@ pub(super) fn requester_can_read_family_object_action_with_bucket_policy<F>(
 where
     F: FnOnce() -> bool,
 {
-    let decision = filter_bucket_policy_allow_for_foreign_owned_read_family_object(
+    let decision = filter_bucket_policy_allow_for_foreign_owned_object_action(
         request.bucket,
         object,
         request.action,
@@ -677,7 +687,14 @@ where
     ))
 }
 
-pub(super) fn filter_bucket_policy_allow_for_foreign_owned_read_family_object(
+/// Downgrade bucket-policy allows that AWS does not honor on objects owned
+/// by another account (in non-BucketOwnerEnforced buckets): object reads and
+/// both ACL directions. Tagging operations remain grantable. The ACL-write
+/// entries were probed against AWS on 2026-07-07, when AWS stopped honoring
+/// bucket-policy PutObjectAcl grants on foreign-owned objects ("no
+/// resource-based policy allows the s3:PutObjectAcl action"), closing the
+/// earlier anomaly where ACL reads were denied but ACL writes grantable.
+pub(super) fn filter_bucket_policy_allow_for_foreign_owned_object_action(
     bucket: &BucketSummary,
     object: &StoredObject,
     action: auth::PolicyAction,
@@ -691,7 +708,7 @@ pub(super) fn filter_bucket_policy_allow_for_foreign_owned_read_family_object(
         return decision;
     }
 
-    let is_read_family = matches!(
+    let owner_scoped = matches!(
         action,
         auth::PolicyAction::GetObject
             | auth::PolicyAction::GetObjectVersion
@@ -699,8 +716,10 @@ pub(super) fn filter_bucket_policy_allow_for_foreign_owned_read_family_object(
             | auth::PolicyAction::GetObjectVersionAttributes
             | auth::PolicyAction::GetObjectAcl
             | auth::PolicyAction::GetObjectVersionAcl
+            | auth::PolicyAction::PutObjectAcl
+            | auth::PolicyAction::PutObjectVersionAcl
     );
-    if !is_read_family {
+    if !owner_scoped {
         return decision;
     }
 
