@@ -1,0 +1,329 @@
+DeleteBucket flight records leak raw bucket names
+Link: https://chatgpt.com/codex/cloud/security/findings/411d7f6b0c8c819198e7914d566b55af?sev=&repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin&sort=date_desc
+Criticality: low (attack path: low)
+Status: accepted
+
+# Metadata
+Repo: justincormack/argmin
+Commit: 2ce3446
+Author: justin@specialbusservice.com
+Created: 14/06/2026, 11:21:53
+Assignee: Unassigned
+Signals: Security, Validated, Attack-path
+
+# Resolution
+Accepted as of 2026-07-07.
+
+The reported data flow is real: DeleteBucket flight-recorder events include
+the bucket name, and flight-recorder dumps can be written to stderr through
+panic/500/local-debug diagnostic paths. This is accepted under the current
+observability policy rather than fixed as a DeleteBucket-specific issue.
+
+Rationale:
+
+- Bucket names are classified by `guides/observability-formatting.md` as
+  attacker-controlled text that must be escaped, not as secrets or bearer
+  material that must be redacted.
+- `BucketName` uses an observability-safe `Debug` implementation, so the value
+  is escaped and cannot forge log structure.
+- This is not specific to DeleteBucket. Many trace, flight-recorder, and
+  local-debug diagnostics include escaped bucket names, object keys, upload
+  IDs, or session IDs for operational debugging.
+- Flight-recorder dumps are diagnostic/operator surfaces. The local-debug
+  endpoint is not available in production release builds, and panic-on-500 /
+  abort-on-500 are diagnostic options rather than normal production behavior.
+- Request summary/error records still use path hashes where appropriate; this
+  acceptance applies to explicit diagnostic flight events, not to all request
+  logging.
+
+This decision can be revisited later for operational policy reasons. If bucket
+or key names need to be confidential in diagnostic dumps, the fix should be a
+global observability policy change with resource-hash/redaction helpers and an
+audit of all trace, flight-recorder, and local-debug event sites, rather than a
+DeleteBucket-only change.
+
+# Summary
+Introduced: DeleteBucket diagnostics that were previously emitted only through opt-in tracing are now always stored in the flight recorder for request contexts, and the stored details include raw bucket names instead of hashes or redacted values.
+The new observability::emit_flight_event helper persists its detail string into the global flight recorder for any request with a trace context. The converted DeleteBucket call sites pass detail strings such as bucket={:?} and include raw bucket names and some error details. Existing flight-recorder request records deliberately use path_hash and tests assert that bucket/key path components are not present, but this change bypasses that redaction for DeleteBucket. Because the flight recorder can be dumped to stderr via the panic hook, panic-on-500/abort-on-500 paths, or the local debug endpoint, private bucket names from recent DeleteBucket attempts may be disclosed to anyone with access to process logs or local debug diagnostics.
+
+# Validation
+## Rubric
+- [x] Confirm emit_flight_event records caller-supplied detail into the flight recorder without redaction when a trace context is attached.
+- [x] Confirm flight-recorder dump/panic-hook paths print record.detail to stderr verbatim.
+- [x] Confirm DeleteBucket coordinator/storage call sites pass detail strings containing raw bucket names via format!("bucket={:?}", ...).
+- [x] Dynamically exercise the real DeleteBucket path with a private bucket name and verify flight_recorder_snapshot contains the raw name.
+- [x] Force a diagnostic dump via panic hook and verify stderr exposes the raw bucket name; attempt crash/debugger/valgrind workflow as applicable.
+## Report
+Validated the suspected information disclosure with a dynamic PoC against the real DeleteBucket coordinator path. Code review confirmed the data flow: crates/observability/src/lib.rs:718-728 emit_flight_event obtains the current trace context and records the supplied detail string directly with record_flight_event; crates/observability/src/lib.rs:742-762 dump_flight_recorder_to_stderr prints record.detail verbatim; crates/observability/src/lib.rs:766-770 installs that dump in the panic hook. The DeleteBucket path supplies raw bucket names to this helper, e.g. crates/server-core/src/coordinator/bucket.rs:369-379 records bucket_delete_request_start and bucket_delete_authorize_start with format!("bucket={:?}", req.name), and crates/server-core/src/coordinator/bucket.rs:423-480 records later lifecycle events with the raw name. The storage layer does the same at crates/storage/src/cluster/request_ops.rs:2730-2797. I added a focused test PoC in crates/server-core/src/coordinator/bucket_tests.rs that creates bucket secret-bucket-delete-leak-poc, attaches an observability TraceContext, calls the real coord.delete_bucket path, verifies flight_recorder_snapshot contains bucket_delete_* records with the raw bucket name, installs the panic flight-recorder hook, and intentionally panics to force stderr dump. Running `cargo test -p server-core poc_delete_bucket_panic_dump_leaks_raw_bucket_name_to_flight_recorder -- --nocapture` failed intentionally and printed `POC_LEAKED_RECORDS=["bucket_delete_request_start bucket=\"secret-bucket-delete-leak-poc\"", ...]`, then the panic hook printed `== argmin flight recorder dump reason="panic" records=17 ==` followed by multiple lines such as `flight seq=1 ... target=server_core event=bucket_delete_request_start bucket="secret-bucket-delete-leak-poc"` and storage events such as `target=storage event=bucket_delete_begin_start bucket="secret-bucket-delete-leak-poc" pg_id=0`. This proves raw private bucket names are persisted and exposed in diagnostic dumps. Valgrind was attempted but is not installed in the container; memory instrumentation is not material to this logging disclosure. I also ran LLDB non-interactively and broke on `observability::dump_flight_recorder_to_stderr`; the backtrace showed frame #0 at lib.rs:743, frame #1 in the panic hook at lib.rs:770, and the PoC panic frame in bucket_tests.rs, then continuing emitted the same leaked flight-recorder records.
+
+# Evidence
+crates/observability/src/lib.rs (L718 to 728)
+  Note: The new helper records the supplied detail string directly into the flight recorder without redaction before optionally emitting a trace event.
+```
+pub fn emit_flight_event(
+    target: &'static str,
+    event: &'static str,
+    detail: impl Into<String>,
+) -> bool {
+    let Some(context) = current_context() else {
+        return false;
+    };
+    let detail = detail.into();
+    record_flight_event(&context, target, event, detail.clone());
+    event_in_context(&context, target, event, Some(format_args!("{detail}")))
+```
+
+crates/observability/src/lib.rs (L742 to 762)
+  Note: Flight recorder entries, including their detail strings, are dumped to stderr, making any raw bucket names stored there visible in diagnostic logs.
+```
+pub fn dump_flight_recorder_to_stderr(reason: &str) {
+    let records = flight_recorder_snapshot();
+    let mut stderr = io::stderr().lock();
+    let _ = writeln!(
+        stderr,
+        "== argmin flight recorder dump reason={} records={} ==",
+        escaped(reason),
+        records.len()
+    );
+    for record in records {
+        let _ = writeln!(
+            stderr,
+            "flight seq={} ts_us={} trace_id={} request_id={} target={} event={} {}",
+            record.sequence,
+            record.ts_us,
+            record.trace_id,
+            record.request_id,
+            record.target,
+            record.event,
+            record.detail
+        );
+```
+
+crates/server-core/src/coordinator/bucket.rs (L369 to 408)
+  Note: DeleteBucket request and authorization diagnostics now call emit_flight_event with raw bucket names, including on authorization failure.
+```
+        let _ = observability::emit_flight_event(
+            TRACE_TARGET,
+            "bucket_delete_request_start",
+            format!("bucket={:?}", req.name),
+        );
+        let authorize_started = std::time::Instant::now();
+        let _ = observability::emit_flight_event(
+            TRACE_TARGET,
+            "bucket_delete_authorize_start",
+            format!("bucket={:?}", req.name),
+        );
+        let AuthorizedDeleteBucket {
+            name,
+            bucket_execution_generation,
+            bucket_incarnation_generation,
+        } = match self.authorize_delete_bucket(req) {
+            Ok(authorized) => {
+                let _ = observability::emit_flight_event(
+                    TRACE_TARGET,
+                    "bucket_delete_authorize_done",
+                    format!(
+                        "bucket={:?} elapsed_us={} total_elapsed_us={}",
+                        authorized.name,
+                        authorize_started.elapsed().as_micros(),
+                        request_started.elapsed().as_micros()
+                    ),
+                );
+                authorized
+            }
+            Err(error) => {
+                let _ = observability::emit_flight_event(
+                    TRACE_TARGET,
+                    "bucket_delete_authorize_failed",
+                    format!(
+                        "bucket={:?} elapsed_us={} total_elapsed_us={} error={:?}",
+                        req.name,
+                        authorize_started.elapsed().as_micros(),
+                        request_started.elapsed().as_micros(),
+                        error
+                    ),
+```
+
+crates/server-core/src/coordinator/bucket.rs (L423 to 480)
+  Note: Additional DeleteBucket lifecycle events persist the raw bucket name into the flight recorder throughout the delete flow.
+```
+        let _ = observability::emit_flight_event(
+            TRACE_TARGET,
+            "bucket_delete_begin_call_start",
+            format!(
+                "bucket={:?} total_elapsed_us={}",
+                name,
+                request_started.elapsed().as_micros()
+            ),
+        );
+        if let Err(err) = self.storage_node.begin_bucket_delete_if_current(
+            &name,
+            bucket_execution_generation,
+            bucket_incarnation_generation,
+        ) {
+            let _ = observability::emit_flight_event(
+                TRACE_TARGET,
+                "bucket_delete_begin_failed",
+                format!(
+                    "bucket={:?} elapsed_us={} total_elapsed_us={} error={:?}",
+                    name,
+                    begin_started.elapsed().as_micros(),
+                    request_started.elapsed().as_micros(),
+                    err
+                ),
+            );
+            return Err(Self::map_bucket_write_drain_error(err));
+        }
+        let _ = observability::emit_flight_event(
+            TRACE_TARGET,
+            "bucket_delete_begin_call_done",
+            format!(
+                "bucket={:?} elapsed_us={} total_elapsed_us={}",
+                name,
+                begin_started.elapsed().as_micros(),
+                request_started.elapsed().as_micros()
+            ),
+        );
+        let _ = observability::emit_flight_event(
+            TRACE_TARGET,
+            "bucket_delete_marked",
+            format!(
+                "bucket={:?} total_elapsed_us={}",
+                name,
+                request_started.elapsed().as_micros()
+            ),
+        );
+        self.remove_bucket_fast_path(&name);
+        self.read_runtime()
+            .enqueue_bucket_delete_finalize_for(&name);
+        let _ = observability::emit_flight_event(
+            TRACE_TARGET,
+            "bucket_delete_finalize_enqueued",
+            format!(
+                "bucket={:?} total_elapsed_us={}",
+                name,
+                request_started.elapsed().as_micros()
+            ),
+        );
+```
+
+crates/storage/src/cluster/request_ops.rs (L2730 to 2797)
+  Note: Storage-layer DeleteBucket diagnostics also persist raw bucket names and error details into the flight recorder.
+```
+        let _ = observability::emit_flight_event(
+            super::TRACE_TARGET,
+            "bucket_delete_begin_start",
+            format!("bucket={:?} pg_id={}", bucket, pg_id.get()),
+        );
+        let node_store = match self
+            .local_map
+            .metadata_pg_primary_node(self.operation_epoch(), pg_id)
+        {
+            Ok(node_store) => node_store,
+            Err(error) => {
+                let _ = observability::emit_flight_event(
+                    super::TRACE_TARGET,
+                    "bucket_delete_begin_failed",
+                    format!(
+                        "bucket={:?} pg_id={} phase=primary_node elapsed_us={} error={:?}",
+                        bucket,
+                        pg_id.get(),
+                        started.elapsed().as_micros(),
+                        error
+                    ),
+                );
+                return Err(error.into());
+            }
+        };
+        {
+            let raw_snapshot_started = std::time::Instant::now();
+            let _ = observability::emit_flight_event(
+                super::TRACE_TARGET,
+                "bucket_delete_begin_raw_snapshot_start",
+                format!(
+                    "bucket={:?} pg_id={} elapsed_us={}",
+                    bucket,
+                    pg_id.get(),
+                    started.elapsed().as_micros()
+                ),
+            );
+            let current = match node_store
+                .bucket_metadata_client()
+                .head_bucket_raw(pg_id, bucket)
+            {
+                Ok(current) => {
+                    let _ = observability::emit_flight_event(
+                        super::TRACE_TARGET,
+                        "bucket_delete_begin_raw_snapshot_done",
+                        format!(
+                            "bucket={:?} pg_id={} elapsed_us={} total_elapsed_us={}",
+                            bucket,
+                            pg_id.get(),
+                            raw_snapshot_started.elapsed().as_micros(),
+                            started.elapsed().as_micros()
+                        ),
+                    );
+                    current
+                }
+                Err(error) => {
+                    let _ = observability::emit_flight_event(
+                        super::TRACE_TARGET,
+                        "bucket_delete_begin_raw_snapshot_failed",
+                        format!(
+                            "bucket={:?} pg_id={} elapsed_us={} total_elapsed_us={} error={:?}",
+                            bucket,
+                            pg_id.get(),
+                            raw_snapshot_started.elapsed().as_micros(),
+                            started.elapsed().as_micros(),
+                            error
+                        ),
+                    );
+```
+
+# Attack-path analysis
+Final: low | Decider: model_decided | Matrix severity: ignore | Policy adjusted: ignore
+## Rationale
+Kept as low. Static review and validation evidence support that the bug is real and in-scope: raw bucket names flow from DeleteBucket request handling into emit_flight_event, are stored in the global flight recorder, and are printed verbatim by diagnostic dump paths. However, probability and impact are both limited. The S3 request path requires SigV4 authentication, the direct exfiltration sink is not the HTTP response but stderr/local diagnostics, local debug is off by default and loopback-only, panic-on-500/abort-on-500 are off by default, and the sensitive data class is bucket-name metadata rather than object data or credentials. This does not meet medium/high criteria for meaningful unauthorized data access or privilege escalation.
+## Likelihood
+high - A valid authenticated S3 request can populate the recorder during normal DeleteBucket handling, but actual disclosure requires a separate diagnostic dump and access to process logs or loopback debug output. The local debug and 500-fail dump paths are disabled by default, though the panic hook is installed. | Remote network vector
+## Impact
+low - The demonstrated disclosure is limited to raw bucket names and some diagnostic error details in stderr/diagnostic logs. It does not disclose object contents, access keys, signing secrets, or permit modification/deletion beyond existing authorization.
+## Assumptions
+- Bucket names may be considered private metadata by some deployments, but are materially less sensitive than object contents, access keys, or signing secrets.
+- Process stderr, panic dumps, local debug diagnostics, or centralized logs may be accessible to operators/support systems and possibly to lower-privileged log readers, but are not directly returned to the S3 client.
+- No deployment manifests or load balancer definitions were present in the repository checkout, so external/public exposure is inferred only from application configuration.
+- A request reaches the argmin-s3 HTTP frontend and receives an observability trace context.
+- The requester has valid SigV4 credentials for non-OPTIONS S3 routing; DeleteBucket authorization may fail after the raw bucket name has already been recorded.
+- A diagnostic dump path occurs or is invoked, such as the always-installed panic hook, configured panic-on-500/abort-on-500 behavior, or the local debug flight-recorder endpoint.
+- The attacker or unintended recipient has access to process stderr/logs or localhost debug diagnostics.
+## Path
+S3 DELETE /bucket -> auth+route -> delete_bucket emit_flight_event(bucket="raw") -> flight_recorder -> panic/500/local-debug dump -> stderr/log reader
+## Path evidence
+- `crates/observability/src/lib.rs:718-728` - emit_flight_event obtains the current trace context and records the caller-supplied detail string directly into the flight recorder before also emitting a trace event.
+- `crates/observability/src/lib.rs:742-762` - dump_flight_recorder_to_stderr prints each record.detail verbatim to stderr.
+- `crates/observability/src/lib.rs:766-772` - The panic hook dumps the flight recorder, making stored details visible in panic diagnostics.
+- `crates/server-core/src/coordinator/bucket.rs:369-408` - DeleteBucket request and authorization diagnostics record raw bucket names, including on authorization failure.
+- `crates/server-core/src/coordinator/bucket.rs:413-480` - Later DeleteBucket lifecycle flight events continue recording the raw bucket name.
+- `crates/storage/src/cluster/request_ops.rs:2730-2797` - Storage-layer DeleteBucket diagnostics also persist raw bucket names and error details into the flight recorder.
+- `crates/server-http/src/http/serve.rs:685-692` - The HTTP handler creates and attaches a trace context for each request, satisfying emit_flight_event's context precondition.
+- `crates/server-http/src/http/serve.rs:987-992` - Buffered control-plane requests are run with the trace context while dispatching to handle_s3_request.
+- `crates/server-http/src/http/router.rs:437-442` - DELETE on a bucket path routes to S3Operation::DeleteBucket with the path-derived bucket name.
+- `crates/server-http/src/http/mod.rs:856-902` - The frontend routes the request and authenticates non-OPTIONS S3 operations before dispatch.
+- `crates/server-http/src/http/mod.rs:1318-1325` - The DeleteBucket operation calls coordinator.delete_bucket on the authenticated request.
+- `crates/server-http/src/http/serve.rs:1028-1034` - The local debug flight-recorder dump endpoint can dump records to stderr when explicitly enabled.
+- `crates/argmin-s3/src/config.rs:263-274` - panic_on_500, abort_on_500, and local_debug_endpoint are configuration flags and default to false.
+- `crates/argmin-s3/src/config.rs:363-379` - The local debug endpoint requires a frontend role and loopback listen address, limiting direct exposure.
+## Narrative
+This is a real, in-scope low-severity information disclosure. The production binary installs the panic flight-recorder hook, and normal HTTP handling attaches an observability trace context before routing requests. The DeleteBucket route is authenticated, then dispatches to coordinator.delete_bucket, where multiple emit_flight_event calls persist format!("bucket={:?}", ...) details. The storage layer repeats the same pattern. emit_flight_event records the supplied detail directly into the global flight recorder, and dump_flight_recorder_to_stderr prints record.detail verbatim. Validation evidence demonstrated this on the real DeleteBucket coordinator path and showed stderr lines containing a private PoC bucket name. Severity remains low because the disclosed data is bucket-name metadata and some error detail, not object contents or credentials; exploitation requires valid request reachability plus access to stderr/logs or localhost debug diagnostics, and the local debug endpoint and panic-on-500/abort-on-500 paths are disabled by default or constrained.
+## Controls
+- SigV4 authentication is required for DeleteBucket HTTP requests.
+- DeleteBucket authorization enforces bucket owner or owner-account-admin permissions for successful deletion.
+- Flight recorder is bounded to 512 records with detail strings truncated to 1024 bytes.
+- ARGMIN_PANIC_ON_500 and ARGMIN_ABORT_ON_500 default to false.
+- ARGMIN_LOCAL_DEBUG_ENDPOINT defaults to false and requires a loopback listener.
+- No code execution or executable sink is involved; the sink is diagnostic logging.
+## Blindspots
+- No deployment manifests, Kubernetes services, or load balancer definitions were present, so actual public exposure of the HTTP listener or logs could not be verified from repository artifacts.
+- Static review cannot determine who has access to production stderr, centralized logs, or localhost debug endpoints in real deployments.
+- The exact sensitivity of bucket names is deployment-dependent; some users may encode sensitive business context in names.
+- Only repository artifacts were inspected; no cloud APIs or live runtime configuration were queried.
