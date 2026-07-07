@@ -571,6 +571,21 @@ In practice this means anonymous/private-object `AccessDenied` responses are
 covered, but authenticated denials that AWS renders with caller-specific IAM
 or account details may still differ in `<Message>`.
 
+A concrete probed example: requesting governance bypass without permission
+(`x-amz-bypass-governance-retention: true` while a bucket policy denies
+`s3:BypassGovernanceRetention`) returns, on AWS,
+
+```
+User: arn:aws:iam::<account>:user/<name> is not authorized to perform:
+s3:BypassGovernanceRetention on resource: "arn:aws:s3:::<bucket>/<key>"
+with an explicit deny in a resource-based policy
+```
+
+while Argmin returns the generic `Access Denied` message with the same 403
+status and `AccessDenied` code. Object-lock *protection* denials (retention
+shortening or delete without bypass requested) are a distinct case and do
+match AWS exactly: `Access Denied because object protected by object lock.`
+
 This should be revisited as part of durable account and credential work,
 because exact matching depends on carrying richer persistent account identity
 through to error rendering.

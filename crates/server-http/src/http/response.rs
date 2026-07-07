@@ -181,6 +181,9 @@ fn client_error_message(err: &ServerError) -> String {
         | ServerError::Auth(auth::AuthError::AccessDenied)
         | ServerError::AccessDenied
         | ServerError::BlockPublicPolicyAccessDenied { .. } => "Access Denied".to_string(),
+        ServerError::ObjectLockProtectedAccessDenied => {
+            "Access Denied because object protected by object lock.".to_string()
+        }
         ServerError::SseCBlockedAccessDenied {
             requester_principal,
             action,
@@ -485,6 +488,7 @@ impl S3Response {
                 Self::new(403).chunked_xml_body(body)
             }
             ServerError::AccessDenied
+            | ServerError::ObjectLockProtectedAccessDenied
             | ServerError::Auth(auth::AuthError::MissingAuth)
             | ServerError::Auth(auth::AuthError::AccessDenied)
             | ServerError::Auth(auth::AuthError::RequestNotYetValid)

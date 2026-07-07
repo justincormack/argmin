@@ -213,6 +213,12 @@ pub enum ServerError {
     #[error("access denied")]
     AccessDenied,
 
+    /// Denial because governance/compliance retention or a legal hold
+    /// protects the object (retention shortening, mode change, or delete
+    /// without an allowed bypass).
+    #[error("access denied because object protected by object lock")]
+    ObjectLockProtectedAccessDenied,
+
     #[error("post policy access denied: {reason}")]
     PostPolicyAccessDenied { reason: String },
 
@@ -468,6 +474,7 @@ impl ServerError {
             Self::AccessControlListNotSupported => "AccessControlListNotSupported",
             Self::InvalidBucketAclWithObjectOwnership => "InvalidBucketAclWithObjectOwnership",
             Self::AccessDenied
+            | Self::ObjectLockProtectedAccessDenied
             | Self::PostPolicyAccessDenied { .. }
             | Self::BlockPublicPolicyAccessDenied { .. }
             | Self::SseCBlockedAccessDenied { .. }
@@ -573,6 +580,7 @@ impl ServerError {
             | Self::MalformedTrailerError { .. } => 400,
             Self::MissingContentLength => 411,
             Self::AccessDenied
+            | Self::ObjectLockProtectedAccessDenied
             | Self::PostPolicyAccessDenied { .. }
             | Self::BlockPublicPolicyAccessDenied { .. }
             | Self::SseCBlockedAccessDenied { .. }

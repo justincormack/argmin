@@ -4798,7 +4798,7 @@ fn delete_object_object_lock_bucket_policy_same_pg_completes_without_deadlock() 
         },
     )
     .unwrap_err();
-    assert!(matches!(err, ServerError::AccessDenied));
+    assert!(matches!(err, ServerError::ObjectLockProtectedAccessDenied));
 }
 
 #[test]

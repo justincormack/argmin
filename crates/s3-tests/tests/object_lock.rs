@@ -11,8 +11,12 @@ use aws_sdk_s3::types::{
 use base64::Engine;
 use ring::hmac;
 use s3_tests::{
-    assert_s3_err_code, content_md5_header, err_status, send_signed_request, unique_bucket,
-    SendRetryingOperationAborted, CTX,
+    assert_s3_err_code, content_md5_header, err_status, raw_bucket, raw_object, raw_object_query,
+    send_signed_request,
+    shape::{
+        assert_shape, chunked_response_headers, error_response_headers, expected_error, shape,
+    },
+    unique_bucket, SendRetryingOperationAborted, CTX,
 };
 use serde_json::json;
 
@@ -2648,18 +2652,28 @@ fn test_object_lock_put_obj_retention_shorten_period() {
             .send()
             .await
             .unwrap();
-        let result = client
-            .put_object_retention()
-            .bucket(&bucket)
-            .key(key)
-            .retention(retention(
-                ObjectLockRetentionMode::Governance,
-                governance_retain_until(),
-            ))
-            .send()
-            .await;
-        assert_eq!(err_status(&result), 403);
-        assert_s3_err_code(&result, "AccessDenied");
+        let shortened_until = lock_date_header(&governance_retain_until());
+        let retention_xml = format!(
+            "<Retention xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
+             <Mode>GOVERNANCE</Mode><RetainUntilDate>{shortened_until}</RetainUntilDate>\
+             </Retention>"
+        );
+        let response = send_signed_request(
+            "PUT",
+            &format!("{}/{}/{}?retention=", CTX.endpoint(), bucket, key),
+            retention_xml.as_bytes(),
+            [content_md5_header(retention_xml.as_bytes())],
+        );
+        assert_shape(
+            "PutObjectRetention shorten explicit retention",
+            &response,
+            &shape().status(403).headers(error_response_headers()).body(
+                expected_error::with_host_id(
+                    "AccessDenied",
+                    "Access Denied because object protected by object lock.",
+                ),
+            ),
+        );
 
         delete_version_with_bypass(&bucket, key, &version_id).await;
         cleanup_object_lock_bucket(&bucket).await;
@@ -2733,15 +2747,28 @@ fn test_object_lock_delete_object_with_retention() {
             .await
             .unwrap();
 
-        let result = client
-            .delete_object()
-            .bucket(&bucket)
-            .key(key)
-            .version_id(&version_id)
-            .send()
-            .await;
-        assert_eq!(err_status(&result), 403);
-        assert_s3_err_code(&result, "AccessDenied");
+        let response = send_signed_request(
+            "DELETE",
+            &format!(
+                "{}/{}/{}?versionId={}",
+                CTX.endpoint(),
+                bucket,
+                key,
+                version_id
+            ),
+            b"",
+            std::iter::empty::<(&str, &str)>(),
+        );
+        assert_shape(
+            "DeleteObject locked version without bypass",
+            &response,
+            &shape().status(403).headers(error_response_headers()).body(
+                expected_error::with_host_id(
+                    "AccessDenied",
+                    "Access Denied because object protected by object lock.",
+                ),
+            ),
+        );
 
         delete_version_with_bypass(&bucket, key, &version_id).await;
         cleanup_object_lock_bucket(&bucket).await;
@@ -4263,6 +4290,377 @@ fn test_object_lock_changing_mode_from_compliance() {
         assert_eq!(err_status(&result), 403);
         assert_s3_err_code(&result, "AccessDenied");
 
+        cleanup_object_lock_bucket(&bucket).await;
+    });
+}
+
+// ── Response shapes ─────────────────────────────────────────────────
+
+/// The lock timestamp as it appears in response headers, e.g.
+/// `2026-07-08T10:54:10Z`.
+fn lock_date_header(date: &DateTime) -> String {
+    date.fmt(DateTimeFormat::DateTime)
+        .expect("format lock date header")
+}
+
+/// The lock timestamp as it appears in XML bodies, with milliseconds.
+fn lock_date_xml(date: &DateTime) -> String {
+    lock_date_header(date).replace('Z', ".000Z")
+}
+
+#[test]
+fn test_get_bucket_object_lock_configuration_response_shape() {
+    s3_tests::run(async {
+        let bucket = setup_object_lock_bucket().await;
+        put_object_lock_configuration(
+            &bucket,
+            bucket_lock_config_days(ObjectLockRetentionMode::Governance, 7),
+        )
+        .await;
+
+        let response = raw_bucket("GET", &bucket, Some("object-lock="));
+        assert_shape(
+            "GetBucketObjectLockConfiguration shape",
+            &response,
+            &shape()
+                .status(200)
+                .headers(chunked_response_headers())
+                .body(
+                    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<ObjectLockConfiguration \
+                     xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
+                     <ObjectLockEnabled>Enabled</ObjectLockEnabled><Rule><DefaultRetention>\
+                     <Mode>GOVERNANCE</Mode><Days>7</Days></DefaultRetention></Rule>\
+                     </ObjectLockConfiguration>",
+                ),
+        );
+
+        cleanup_object_lock_bucket(&bucket).await;
+    });
+}
+
+#[test]
+fn test_get_object_retention_response_shape() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_object_lock_bucket().await;
+        let key = "shape-retention.txt";
+        let retain_until = future_date(24 * 60 * 60);
+
+        let version = put_object_bytes(&bucket, key, b"retention").await;
+        client
+            .put_object_retention()
+            .bucket(&bucket)
+            .key(key)
+            .version_id(&version)
+            .retention(retention(ObjectLockRetentionMode::Governance, retain_until))
+            .send()
+            .await
+            .expect("put object retention");
+
+        let response = raw_object_query(
+            "GET",
+            &bucket,
+            key,
+            &format!("retention=&versionId={version}"),
+        );
+        assert_shape(
+            "GetObjectRetention shape",
+            &response,
+            &shape()
+                .status(200)
+                .headers(chunked_response_headers())
+                .body(
+                    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Retention \
+                     xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Mode>GOVERNANCE</Mode>\
+                     <RetainUntilDate>{retain_until}</RetainUntilDate></Retention>",
+                )
+                .sub("retain_until", lock_date_xml(&retain_until)),
+        );
+
+        delete_version_with_bypass(&bucket, key, &version).await;
+        cleanup_object_lock_bucket(&bucket).await;
+    });
+}
+
+#[test]
+fn test_get_object_legal_hold_response_shape() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_object_lock_bucket().await;
+        let key = "shape-legal-hold.txt";
+
+        let version = put_object_bytes(&bucket, key, b"legal-hold").await;
+        client
+            .put_object_legal_hold()
+            .bucket(&bucket)
+            .key(key)
+            .version_id(&version)
+            .legal_hold(
+                ObjectLockLegalHold::builder()
+                    .status(ObjectLockLegalHoldStatus::On)
+                    .build(),
+            )
+            .send()
+            .await
+            .expect("put legal hold");
+
+        let response = raw_object_query(
+            "GET",
+            &bucket,
+            key,
+            &format!("legal-hold=&versionId={version}"),
+        );
+        assert_shape(
+            "GetObjectLegalHold shape",
+            &response,
+            &shape()
+                .status(200)
+                .headers(chunked_response_headers())
+                .body(
+                    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<LegalHold \
+                     xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Status>ON</Status>\
+                     </LegalHold>",
+                ),
+        );
+
+        client
+            .put_object_legal_hold()
+            .bucket(&bucket)
+            .key(key)
+            .version_id(&version)
+            .legal_hold(
+                ObjectLockLegalHold::builder()
+                    .status(ObjectLockLegalHoldStatus::Off)
+                    .build(),
+            )
+            .send()
+            .await
+            .expect("clear legal hold");
+        delete_version_with_bypass(&bucket, key, &version).await;
+        cleanup_object_lock_bucket(&bucket).await;
+    });
+}
+
+#[test]
+fn test_object_lock_read_response_shape() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_object_lock_bucket().await;
+        let locked_key = "shape-object-lock.txt";
+        let plain_key = "shape-object-lock-plain.txt";
+        let retain_until = future_date(24 * 60 * 60);
+
+        let locked_put = client
+            .put_object()
+            .bucket(&bucket)
+            .key(locked_key)
+            .body(ByteStream::from_static(b"object-lock-body"))
+            .object_lock_mode(ObjectLockMode::Governance)
+            .object_lock_retain_until_date(retain_until)
+            .object_lock_legal_hold_status(ObjectLockLegalHoldStatus::On)
+            .send()
+            .await
+            .expect("put locked object");
+        let locked_version = locked_put.version_id().expect("locked version").to_string();
+        let plain_version = put_object_bytes(&bucket, plain_key, b"plain-object-lock-body").await;
+
+        let locked_headers = [
+            ("etag", "{etag}"),
+            ("last-modified", "{http_date}"),
+            ("accept-ranges", "bytes"),
+            ("x-amz-version-id", "{version_id}"),
+            ("content-type", "application/octet-stream"),
+            ("x-amz-object-lock-mode", "GOVERNANCE"),
+            ("x-amz-object-lock-retain-until-date", "{retain_until}"),
+            ("x-amz-object-lock-legal-hold", "ON"),
+            ("x-amz-server-side-encryption", "AES256"),
+            ("content-length", "16"),
+            ("x-amz-request-id", "{request_id}"),
+            ("x-amz-id-2", "{host_id}"),
+        ];
+        let get = raw_object("GET", &bucket, locked_key);
+        let get_captures = assert_shape(
+            "GetObject locked shape",
+            &get,
+            &shape()
+                .status(200)
+                .headers(locked_headers)
+                .sub("version_id", locked_version.as_str())
+                .sub("retain_until", lock_date_header(&retain_until))
+                .body("object-lock-body"),
+        );
+        let head = raw_object("HEAD", &bucket, locked_key);
+        let head_captures = assert_shape(
+            "HeadObject locked shape",
+            &head,
+            &shape()
+                .status(200)
+                .headers(locked_headers)
+                .sub("version_id", locked_version.as_str())
+                .sub("retain_until", lock_date_header(&retain_until))
+                .body_empty(),
+        );
+        assert_eq!(get_captures["etag"], head_captures["etag"]);
+
+        // Explicit-version reads carry the same lock headers.
+        let version_get = raw_object_query(
+            "GET",
+            &bucket,
+            locked_key,
+            &format!("versionId={locked_version}"),
+        );
+        assert_shape(
+            "GetObject locked explicit version shape",
+            &version_get,
+            &shape()
+                .status(200)
+                .headers(locked_headers)
+                .sub("version_id", locked_version.as_str())
+                .sub("retain_until", lock_date_header(&retain_until))
+                .body("object-lock-body"),
+        );
+        let version_head = raw_object_query(
+            "HEAD",
+            &bucket,
+            locked_key,
+            &format!("versionId={locked_version}"),
+        );
+        assert_shape(
+            "HeadObject locked explicit version shape",
+            &version_head,
+            &shape()
+                .status(200)
+                .headers(locked_headers)
+                .sub("version_id", locked_version.as_str())
+                .sub("retain_until", lock_date_header(&retain_until))
+                .body_empty(),
+        );
+
+        // GetObjectAttributes on a locked object carries no lock headers.
+        let attributes = s3_tests::send_signed_request(
+            "GET",
+            &format!("{}/{}/{}?attributes=", CTX.endpoint(), bucket, locked_key),
+            b"",
+            [("x-amz-object-attributes", "ObjectSize")],
+        );
+        assert_shape(
+            "GetObjectAttributes locked shape",
+            &attributes,
+            &shape()
+                .status(200)
+                .headers([
+                    ("content-length", "173"),
+                    ("last-modified", "{http_date}"),
+                    ("x-amz-version-id", "{version_id}"),
+                    ("x-amz-request-id", "{request_id}"),
+                    ("x-amz-id-2", "{host_id}"),
+                ])
+                .sub("version_id", locked_version.as_str())
+                .body(
+                    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<GetObjectAttributesResponse \
+                     xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
+                     <ObjectSize>16</ObjectSize></GetObjectAttributesResponse>",
+                ),
+        );
+
+        let plain_headers = [
+            ("etag", "{etag}"),
+            ("last-modified", "{http_date}"),
+            ("accept-ranges", "bytes"),
+            ("x-amz-version-id", "{version_id}"),
+            ("content-type", "application/octet-stream"),
+            ("x-amz-server-side-encryption", "AES256"),
+            ("content-length", "22"),
+            ("x-amz-request-id", "{request_id}"),
+            ("x-amz-id-2", "{host_id}"),
+        ];
+        let plain = raw_object("GET", &bucket, plain_key);
+        assert_shape(
+            "GetObject plain in lock bucket shape",
+            &plain,
+            &shape()
+                .status(200)
+                .headers(plain_headers)
+                .sub("version_id", plain_version.as_str())
+                .body("plain-object-lock-body"),
+        );
+        let plain_head = raw_object("HEAD", &bucket, plain_key);
+        assert_shape(
+            "HeadObject plain in lock bucket shape",
+            &plain_head,
+            &shape()
+                .status(200)
+                .headers(plain_headers)
+                .sub("version_id", plain_version.as_str())
+                .body_empty(),
+        );
+
+        client
+            .put_object_legal_hold()
+            .bucket(&bucket)
+            .key(locked_key)
+            .version_id(&locked_version)
+            .legal_hold(
+                ObjectLockLegalHold::builder()
+                    .status(ObjectLockLegalHoldStatus::Off)
+                    .build(),
+            )
+            .send()
+            .await
+            .expect("clear locked legal hold");
+        delete_version_with_bypass(&bucket, locked_key, &locked_version).await;
+        delete_version_with_bypass(&bucket, plain_key, &plain_version).await;
+        cleanup_object_lock_bucket(&bucket).await;
+    });
+}
+
+#[test]
+fn test_object_lock_put_obj_retention_shorten_default_retention_denied() {
+    s3_tests::run(async {
+        let bucket = setup_object_lock_bucket().await;
+        put_object_lock_configuration(
+            &bucket,
+            bucket_lock_config_days(ObjectLockRetentionMode::Governance, 7),
+        )
+        .await;
+        let key = "shorten-default-retention";
+
+        // The object's retention comes from the bucket default, not an
+        // explicit PutObjectRetention; shortening it must be protected the
+        // same way as explicitly-set governance retention.
+        let version_id = put_object_bytes(&bucket, key, b"abc").await;
+        let shortened_until = future_date(60 * 60)
+            .fmt(DateTimeFormat::DateTime)
+            .expect("format shortened retain-until");
+        let retention_xml = format!(
+            "<Retention xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
+             <Mode>GOVERNANCE</Mode><RetainUntilDate>{shortened_until}</RetainUntilDate>\
+             </Retention>"
+        );
+        let response = s3_tests::send_signed_request(
+            "PUT",
+            &format!(
+                "{}/{}/{}?retention=&versionId={}",
+                CTX.endpoint(),
+                bucket,
+                key,
+                version_id
+            ),
+            retention_xml.as_bytes(),
+            [content_md5_header(retention_xml.as_bytes())],
+        );
+        assert_shape(
+            "PutObjectRetention shorten default retention",
+            &response,
+            &shape().status(403).headers(error_response_headers()).body(
+                expected_error::with_host_id(
+                    "AccessDenied",
+                    "Access Denied because object protected by object lock.",
+                ),
+            ),
+        );
+
+        delete_version_with_bypass(&bucket, key, &version_id).await;
         cleanup_object_lock_bucket(&bucket).await;
     });
 }

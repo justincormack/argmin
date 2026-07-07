@@ -2414,7 +2414,9 @@ mod harness {
     fn classify(result: Result<(), ServerError>) -> ClassifiedResult {
         match result {
             Ok(()) => ClassifiedResult::Allow,
-            Err(ServerError::AccessDenied) => ClassifiedResult::AccessDenied,
+            Err(ServerError::AccessDenied | ServerError::ObjectLockProtectedAccessDenied) => {
+                ClassifiedResult::AccessDenied
+            }
             Err(ServerError::ObjectNotFound { .. }) => ClassifiedResult::NoSuchKey,
             Err(ServerError::VersionNotFound { .. }) => ClassifiedResult::VersionNotFound,
             Err(other) => panic!("unexpected classified result: {other:?}"),
@@ -4090,9 +4092,11 @@ mod phase4_harness {
     fn classify(result: Result<(), ServerError>) -> ClassifiedWriteResult {
         match result {
             Ok(()) => ClassifiedWriteResult::Allow,
-            Err(ServerError::AccessDenied | ServerError::AnonymousApiAccessDenied) => {
-                ClassifiedWriteResult::Deny
-            }
+            Err(
+                ServerError::AccessDenied
+                | ServerError::ObjectLockProtectedAccessDenied
+                | ServerError::AnonymousApiAccessDenied,
+            ) => ClassifiedWriteResult::Deny,
             Err(ServerError::AccessControlListNotSupported) => {
                 ClassifiedWriteResult::AclNotSupported
             }
@@ -4931,9 +4935,11 @@ mod phase5_harness {
     fn classify(result: Result<(), ServerError>) -> ClassifiedTransitionResult {
         match result {
             Ok(()) => ClassifiedTransitionResult::Allow,
-            Err(ServerError::AccessDenied | ServerError::AnonymousApiAccessDenied) => {
-                ClassifiedTransitionResult::Deny
-            }
+            Err(
+                ServerError::AccessDenied
+                | ServerError::ObjectLockProtectedAccessDenied
+                | ServerError::AnonymousApiAccessDenied,
+            ) => ClassifiedTransitionResult::Deny,
             Err(other) => panic!("unexpected phase 5 classified result: {other:?}"),
         }
     }
@@ -6327,9 +6333,11 @@ mod phase6_harness {
     fn classify(result: Result<(), ServerError>) -> ClassifiedPhase6Result {
         match result {
             Ok(()) => ClassifiedPhase6Result::Allow,
-            Err(ServerError::AccessDenied | ServerError::AnonymousApiAccessDenied) => {
-                ClassifiedPhase6Result::Deny
-            }
+            Err(
+                ServerError::AccessDenied
+                | ServerError::ObjectLockProtectedAccessDenied
+                | ServerError::AnonymousApiAccessDenied,
+            ) => ClassifiedPhase6Result::Deny,
             Err(ServerError::AccessControlListNotSupported) => {
                 ClassifiedPhase6Result::AclNotSupported
             }
@@ -7244,9 +7252,11 @@ mod phase7_harness {
 
         match result {
             Ok(()) => ObjectLockOutcome::Allow,
-            Err(ServerError::AccessDenied | ServerError::AnonymousApiAccessDenied) => {
-                ObjectLockOutcome::Deny
-            }
+            Err(
+                ServerError::AccessDenied
+                | ServerError::ObjectLockProtectedAccessDenied
+                | ServerError::AnonymousApiAccessDenied,
+            ) => ObjectLockOutcome::Deny,
             Err(ServerError::InvalidRequest { .. }) => ObjectLockOutcome::InvalidRequest,
             Err(other) => panic!("unexpected phase 7 object-lock result: {other:?}"),
         }
@@ -7357,9 +7367,11 @@ mod phase7_harness {
 
         match result {
             Ok(_) => DeleteOutcome::Allow,
-            Err(ServerError::AccessDenied | ServerError::AnonymousApiAccessDenied) => {
-                DeleteOutcome::Deny
-            }
+            Err(
+                ServerError::AccessDenied
+                | ServerError::ObjectLockProtectedAccessDenied
+                | ServerError::AnonymousApiAccessDenied,
+            ) => DeleteOutcome::Deny,
             Err(other) => panic!("unexpected phase 7 delete result: {other:?}"),
         }
     }
@@ -8237,9 +8249,11 @@ mod phase7a_harness {
     fn classify_phase7a_result(result: Result<(), ServerError>) -> MultipartOutcome {
         match result {
             Ok(()) => MultipartOutcome::Allow,
-            Err(ServerError::AccessDenied | ServerError::AnonymousApiAccessDenied) => {
-                MultipartOutcome::Deny
-            }
+            Err(
+                ServerError::AccessDenied
+                | ServerError::ObjectLockProtectedAccessDenied
+                | ServerError::AnonymousApiAccessDenied,
+            ) => MultipartOutcome::Deny,
             Err(ServerError::NoSuchUpload { .. }) => MultipartOutcome::NoSuchUpload,
             Err(other) => panic!("unexpected phase 7A result: {other:?}"),
         }
@@ -9449,9 +9463,11 @@ mod phase9_harness {
         };
         match result {
             Ok(()) => BucketActionOutcome::Allow,
-            Err(ServerError::AccessDenied | ServerError::AnonymousApiAccessDenied) => {
-                BucketActionOutcome::Deny
-            }
+            Err(
+                ServerError::AccessDenied
+                | ServerError::ObjectLockProtectedAccessDenied
+                | ServerError::AnonymousApiAccessDenied,
+            ) => BucketActionOutcome::Deny,
             Err(other) => panic!("unexpected phase 9 result for {scenario}: {other:?}"),
         }
     }
@@ -9962,9 +9978,11 @@ mod phase11_harness {
         };
         match result {
             Ok(()) => BucketMetaOutcome::Allow,
-            Err(ServerError::AccessDenied | ServerError::AnonymousApiAccessDenied) => {
-                BucketMetaOutcome::Deny
-            }
+            Err(
+                ServerError::AccessDenied
+                | ServerError::ObjectLockProtectedAccessDenied
+                | ServerError::AnonymousApiAccessDenied,
+            ) => BucketMetaOutcome::Deny,
             Err(other) => panic!("unexpected phase 11 result for {scenario}: {other:?}"),
         }
     }
@@ -10639,9 +10657,11 @@ mod phase12_harness {
     fn classify_phase12(result: Result<(), ServerError>) -> ClassifiedBoeTraceResult {
         match result {
             Ok(()) => ClassifiedBoeTraceResult::Allow,
-            Err(ServerError::AccessDenied | ServerError::AnonymousApiAccessDenied) => {
-                ClassifiedBoeTraceResult::Deny
-            }
+            Err(
+                ServerError::AccessDenied
+                | ServerError::ObjectLockProtectedAccessDenied
+                | ServerError::AnonymousApiAccessDenied,
+            ) => ClassifiedBoeTraceResult::Deny,
             Err(other) => panic!("unexpected phase 12 probe result: {other:?}"),
         }
     }
@@ -11105,7 +11125,9 @@ mod phase13_harness {
                                 self.tracked_version_present.set(false);
                             }
                             Err(
-                                ServerError::AccessDenied | ServerError::AnonymousApiAccessDenied,
+                                ServerError::AccessDenied
+                                | ServerError::ObjectLockProtectedAccessDenied
+                                | ServerError::AnonymousApiAccessDenied,
                             ) => {}
                             Err(err) => {
                                 panic!(
@@ -11274,7 +11296,11 @@ mod phase13_harness {
 
             let deleted = match delete_result {
                 Ok(result) => result,
-                Err(ServerError::AccessDenied | ServerError::AnonymousApiAccessDenied) => {
+                Err(
+                    ServerError::AccessDenied
+                    | ServerError::ObjectLockProtectedAccessDenied
+                    | ServerError::AnonymousApiAccessDenied,
+                ) => {
                     return ClassifiedPhase13ExecutionResult::Denied;
                 }
                 Err(err) => panic!("unexpected phase 13 delete execution result: {err:?}"),
@@ -11391,6 +11417,7 @@ mod phase13_harness {
                         Ok(()) => {}
                         Err(
                             ServerError::AccessDenied
+                            | ServerError::ObjectLockProtectedAccessDenied
                             | ServerError::AnonymousApiAccessDenied
                             | ServerError::VersionNotFound { .. }
                             | ServerError::MethodNotAllowed,
@@ -11416,6 +11443,7 @@ mod phase13_harness {
                         Ok(()) => {}
                         Err(
                             ServerError::AccessDenied
+                            | ServerError::ObjectLockProtectedAccessDenied
                             | ServerError::AnonymousApiAccessDenied
                             | ServerError::VersionNotFound { .. }
                             | ServerError::MethodNotAllowed,
@@ -11528,6 +11556,7 @@ mod phase13_harness {
             Ok(()) => ClassifiedPhase13Result::Allow,
             Err(
                 ServerError::AccessDenied
+                | ServerError::ObjectLockProtectedAccessDenied
                 | ServerError::AnonymousApiAccessDenied
                 | ServerError::DeleteMarkerHit { .. }
                 | ServerError::ObjectNotFound { .. }
@@ -11938,7 +11967,11 @@ mod phase14_harness {
                 cond: NO_DELETE,
             }) {
                 Ok(result) => result,
-                Err(ServerError::AccessDenied | ServerError::AnonymousApiAccessDenied) => {
+                Err(
+                    ServerError::AccessDenied
+                    | ServerError::ObjectLockProtectedAccessDenied
+                    | ServerError::AnonymousApiAccessDenied,
+                ) => {
                     return ClassifiedPhase14ExecutionResult::Denied;
                 }
                 Err(err) => panic!("unexpected phase 14 delete execution result: {err:?}"),
@@ -12073,6 +12106,7 @@ mod phase14_harness {
             Ok(()) => ClassifiedPhase14Result::Allow,
             Err(
                 ServerError::AccessDenied
+                | ServerError::ObjectLockProtectedAccessDenied
                 | ServerError::AnonymousApiAccessDenied
                 | ServerError::DeleteMarkerHit { .. }
                 | ServerError::ObjectNotFound { .. },

@@ -3831,7 +3831,7 @@ fn validate_retention_update_requires_bypass_for_governance_mode_change() {
     };
     let err =
         Coordinator::validate_retention_update(Some(current), requested, false, false).unwrap_err();
-    assert!(matches!(err, ServerError::AccessDenied));
+    assert!(matches!(err, ServerError::ObjectLockProtectedAccessDenied));
     let err =
         Coordinator::validate_retention_update(Some(current), requested, true, false).unwrap_err();
     assert!(matches!(err, ServerError::AccessDenied));
@@ -3854,11 +3854,11 @@ fn validate_retention_update_rejects_compliance_downgrade_or_shorten() {
     };
     assert!(matches!(
         Coordinator::validate_retention_update(Some(current), downgrade, true, true),
-        Err(ServerError::AccessDenied)
+        Err(ServerError::ObjectLockProtectedAccessDenied)
     ));
     assert!(matches!(
         Coordinator::validate_retention_update(Some(current), shorten, true, true),
-        Err(ServerError::AccessDenied)
+        Err(ServerError::ObjectLockProtectedAccessDenied)
     ));
 }
 
@@ -3873,7 +3873,7 @@ fn validate_delete_against_object_lock_requires_bypass_for_governance_retention(
     };
     let err =
         Coordinator::validate_delete_against_object_lock(state, false, false, 100).unwrap_err();
-    assert!(matches!(err, ServerError::AccessDenied));
+    assert!(matches!(err, ServerError::ObjectLockProtectedAccessDenied));
     let err =
         Coordinator::validate_delete_against_object_lock(state, true, false, 100).unwrap_err();
     assert!(matches!(err, ServerError::AccessDenied));
@@ -4156,7 +4156,7 @@ fn delete_specific_version_rechecks_object_lock_state_at_execution() {
     let err = coord
         .apply_authorized_delete_object(&coord.storage_node(), authorized, NO_DELETE)
         .unwrap_err();
-    assert!(matches!(err, ServerError::AccessDenied));
+    assert!(matches!(err, ServerError::ObjectLockProtectedAccessDenied));
 }
 
 #[test]
@@ -4383,7 +4383,7 @@ fn boe_delete_specific_version_rechecks_object_lock_state_at_execution() {
     let err = coord
         .apply_authorized_delete_object(&coord.storage_node(), authorized, NO_DELETE)
         .unwrap_err();
-    assert!(matches!(err, ServerError::AccessDenied));
+    assert!(matches!(err, ServerError::ObjectLockProtectedAccessDenied));
 }
 
 #[test]
@@ -4887,7 +4887,7 @@ fn validate_delete_against_object_lock_rejects_compliance_even_with_bypass() {
         legal_hold: StoredLegalHoldStatus::NotSet,
     };
     let err = Coordinator::validate_delete_against_object_lock(state, true, true, 100).unwrap_err();
-    assert!(matches!(err, ServerError::AccessDenied));
+    assert!(matches!(err, ServerError::ObjectLockProtectedAccessDenied));
 }
 
 #[test]
@@ -4900,7 +4900,7 @@ fn validate_delete_against_object_lock_rejects_legal_hold_even_with_bypass() {
         legal_hold: StoredLegalHoldStatus::On,
     };
     let err = Coordinator::validate_delete_against_object_lock(state, true, true, 100).unwrap_err();
-    assert!(matches!(err, ServerError::AccessDenied));
+    assert!(matches!(err, ServerError::ObjectLockProtectedAccessDenied));
 }
 
 #[test]
@@ -4981,7 +4981,7 @@ fn delete_object_with_retention_still_inserts_delete_marker_without_version_id()
             cond: NO_DELETE,
         })
         .unwrap_err();
-    assert!(matches!(err, ServerError::AccessDenied));
+    assert!(matches!(err, ServerError::ObjectLockProtectedAccessDenied));
 
     coord
         .delete_object(&delete_object_request(
@@ -5060,7 +5060,7 @@ fn delete_object_with_legal_hold_rejects_bypass() {
             NO_DELETE,
         ))
         .unwrap_err();
-    assert!(matches!(err, ServerError::AccessDenied));
+    assert!(matches!(err, ServerError::ObjectLockProtectedAccessDenied));
 
     put_object_legal_hold_test(
         &coord,

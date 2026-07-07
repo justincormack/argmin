@@ -271,8 +271,36 @@ batch, deleting each diff test once its shape coverage is subsumed. Batches
    keep-alive whitespace padding in slow CompleteMultipartUpload
    responses. Note: the golden flow test pins full bodies, strictly more
    than the old diff test checked.
-5. object lock (bucket config, retention, legal hold) — needs the
-   object-lock cleanup helper moved into shared helpers
+5. object lock (bucket config, retention, legal hold) — DONE: four
+   golden tests added to object_lock.rs reusing its existing fixtures
+   and cleanup helpers (no shared-helper move needed), all
+   AWS-validated first try, four diff tests deleted plus the five
+   pilot-batch diff twins that were never removed. Lock timestamps
+   appear without milliseconds in headers and with `.000Z` in XML
+   bodies, both derived in-test from the retention epoch. Batch note:
+   an early probe bug (all scenarios in one bucket) tripped the real
+   governance-shortening denial — retention scenarios need buckets
+   without a default-retention config. Follow-up from that: a new
+   golden test pins shortening default-derived retention (the one
+   variant existing shorten tests missed), and probing AWS for its
+   error shape found the denial message divergence — AWS returns
+   "Access Denied because object protected by object lock." for the
+   whole lock-protection family (default and explicit shorten, and
+   delete without bypass, all probed). Added
+   ServerError::ObjectLockProtectedAccessDenied carrying that message
+   for retention-update and delete lock denials; policy/bypass
+   permission denials stay generic AccessDenied — enforced in the
+   validators by distinguishing bypass-not-requested (lock message)
+   from bypass-requested-but-denied, which AWS-probing showed returns
+   an IAM-style s3:BypassGovernanceRetention denial message; Argmin
+   returns generic Access Denied there for now (documented under the
+   principal-specific-message gap in aws-compatibility.md §13). The
+   explicit-shorten and delete-without-bypass golden shapes are pinned
+   in upgraded object_lock tests, AWS-validated. Review follow-up: the
+   locked-read golden test was extended to restore the deleted diff
+   test's full surface — explicit-version GET/HEAD, plain-object HEAD,
+   and GetObjectAttributes on a locked object (which carries no lock
+   headers and no content-type; absence pinned via full-set equality).
 6. listings (v1/v2, versions, multipart uploads) and DeleteObjects
 7. POST object, CopyObject, GetObjectAttributes, delete-marker shapes
 

@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 7839c653586bf72216993898222d0c0ea615f43f11c17bb6fcf80c69529ae33f # shrinks to (mutations, probe) = ([ApplyTrackedComplianceRetention, OwnerDeleteTrackedVersion], Object)
+cc 5825386669a51fa3b722a66e06951bb670383d7b0a7a50f50a91ace4a9c41384 # shrinks to (mutations, probe) = ([ApplyTrackedGovernanceRetention, OwnerDeleteTrackedVersion], Current)

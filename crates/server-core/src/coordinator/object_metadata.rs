@@ -225,19 +225,25 @@ impl Coordinator {
                     requested.retain_until_unix_seconds < current.retain_until_unix_seconds;
                 let changes_mode = requested.mode != current.mode;
                 if shortens || changes_mode {
-                    if bypass_governance_requested && can_bypass_governance {
-                        return Ok(());
+                    if bypass_governance_requested {
+                        if can_bypass_governance {
+                            return Ok(());
+                        }
+                        // Bypass was requested but s3:BypassGovernanceRetention
+                        // is not permitted: AWS reports the authorization
+                        // failure, not the object-lock protection.
+                        return Err(ServerError::AccessDenied);
                     }
-                    return Err(ServerError::AccessDenied);
+                    return Err(ServerError::ObjectLockProtectedAccessDenied);
                 }
                 Ok(())
             }
             ObjectLockMode::Compliance => {
                 if requested.mode != ObjectLockMode::Compliance {
-                    return Err(ServerError::AccessDenied);
+                    return Err(ServerError::ObjectLockProtectedAccessDenied);
                 }
                 if requested.retain_until_unix_seconds < current.retain_until_unix_seconds {
-                    return Err(ServerError::AccessDenied);
+                    return Err(ServerError::ObjectLockProtectedAccessDenied);
                 }
                 Ok(())
             }
@@ -251,7 +257,7 @@ impl Coordinator {
         now_unix_seconds: u64,
     ) -> Result<(), ServerError> {
         if object_lock.legal_hold == StoredLegalHoldStatus::On {
-            return Err(ServerError::AccessDenied);
+            return Err(ServerError::ObjectLockProtectedAccessDenied);
         }
 
         let Some(retention) = object_lock.retention else {
@@ -265,8 +271,13 @@ impl Coordinator {
             ObjectLockMode::Governance if bypass_governance_requested && can_bypass_governance => {
                 Ok(())
             }
-            ObjectLockMode::Governance | ObjectLockMode::Compliance => {
+            // Bypass requested without permission: the authorization failure
+            // is reported, not the object-lock protection.
+            ObjectLockMode::Governance if bypass_governance_requested => {
                 Err(ServerError::AccessDenied)
+            }
+            ObjectLockMode::Governance | ObjectLockMode::Compliance => {
+                Err(ServerError::ObjectLockProtectedAccessDenied)
             }
         }
     }
