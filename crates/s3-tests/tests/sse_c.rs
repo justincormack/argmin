@@ -7,8 +7,10 @@ use aws_sdk_s3::types::{
 use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
 use ring::hmac;
 use s3_tests::{
-    assert_s3_err_code, err_status, sse_c_header_values, test_sse_c_key, unique_bucket,
-    SendRetryingOperationAborted, CTX,
+    assert_s3_err_code, create_bucket_with_sse_c_enabled, delete_all_and_bucket, err_status,
+    raw_object_with,
+    shape::{assert_shape, error_response_headers, shape},
+    sse_c_header_values, test_sse_c_key, unique_bucket, SendRetryingOperationAborted, CTX,
 };
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -2738,5 +2740,266 @@ fn test_sse_c_upload_part_copy_rejects_wrong_destination_key() {
             .send()
             .await;
         s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
+    });
+}
+
+// ── Response shapes ─────────────────────────────────────────────────
+
+/// Expected SSE-C `InvalidArgument` error body naming
+/// `x-amz-server-side-encryption`.
+fn sse_c_invalid_argument_body(message: &str) -> String {
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>InvalidArgument</Code>\
+         <Message>{message}</Message>\
+         <ArgumentName>x-amz-server-side-encryption</ArgumentName>\
+         <RequestId>{{request_id}}</RequestId><HostId>{{host_id}}</HostId></Error>"
+    )
+}
+
+fn sse_c_request_headers<'a>(key_b64: &'a str, key_md5_b64: &'a str) -> [(&'a str, &'a str); 3] {
+    [
+        ("x-amz-server-side-encryption-customer-algorithm", "AES256"),
+        ("x-amz-server-side-encryption-customer-key", key_b64),
+        ("x-amz-server-side-encryption-customer-key-md5", key_md5_b64),
+    ]
+}
+
+#[test]
+fn test_sse_c_blocked_by_default_error_shape() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
+        let key = "shape-sse-c-blocked-by-default.txt";
+        let customer_key = test_sse_c_key();
+        let (key_b64, key_md5_b64) = sse_c_header_values(&customer_key);
+
+        let response = raw_object_with(
+            "PUT",
+            &bucket,
+            key,
+            b"secret",
+            &sse_c_request_headers(&key_b64, &key_md5_b64),
+        );
+        // The caller principal differs per endpoint (account ID locally, the
+        // caller ARN on AWS); everything else in the message is fixed.
+        assert_shape(
+            "PutObject SSE-C blocked by default encryption",
+            &response,
+            &shape()
+                .status(403)
+                .headers(error_response_headers())
+                .body(
+                    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>AccessDenied</Code>\
+                     <Message>User: {any} is not authorized to perform: s3:PutObject on \
+                     resource: \"arn:aws:s3:::{bucket}/{key}\" because this bucket has blocked \
+                     upload requests that specify Server Side Encryption with Customer provided \
+                     keys (SSE-C). Please specify a different server-side encryption \
+                     type.</Message><RequestId>{request_id}</RequestId>\
+                     <HostId>{host_id}</HostId></Error>",
+                )
+                .sub("bucket", bucket.as_str())
+                .sub("key", key),
+        );
+
+        delete_all_and_bucket(client, &bucket, &[]).await;
+    });
+}
+
+#[test]
+fn test_sse_c_put_head_response_shape() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        create_bucket_with_sse_c_enabled(client, &bucket)
+            .await
+            .expect("create SSE-C enabled bucket");
+        let key = "shape-sse-c-enabled.txt";
+        let customer_key = test_sse_c_key();
+        let (key_b64, key_md5_b64) = sse_c_header_values(&customer_key);
+
+        let put = raw_object_with(
+            "PUT",
+            &bucket,
+            key,
+            b"secret",
+            &sse_c_request_headers(&key_b64, &key_md5_b64),
+        );
+        let put_captures = assert_shape(
+            "PutObject SSE-C shape",
+            &put,
+            &shape()
+                .status(200)
+                .headers([
+                    ("etag", "{etag}"),
+                    ("x-amz-checksum-crc64nvme", "57Cg+N2YpVM="),
+                    ("x-amz-checksum-type", "FULL_OBJECT"),
+                    ("x-amz-server-side-encryption-customer-algorithm", "AES256"),
+                    (
+                        "x-amz-server-side-encryption-customer-key-md5",
+                        key_md5_b64.as_str(),
+                    ),
+                    ("x-amz-request-id", "{request_id}"),
+                    ("x-amz-id-2", "{host_id}"),
+                    ("content-length", "0"),
+                ])
+                .body_empty(),
+        );
+
+        let head = raw_object_with(
+            "HEAD",
+            &bucket,
+            key,
+            b"",
+            &sse_c_request_headers(&key_b64, &key_md5_b64),
+        );
+        let head_captures = assert_shape(
+            "HeadObject SSE-C shape",
+            &head,
+            &shape()
+                .status(200)
+                .headers([
+                    ("etag", "{etag}"),
+                    ("content-length", "6"),
+                    ("last-modified", "{http_date}"),
+                    ("accept-ranges", "bytes"),
+                    ("content-type", "binary/octet-stream"),
+                    ("x-amz-server-side-encryption-customer-algorithm", "AES256"),
+                    (
+                        "x-amz-server-side-encryption-customer-key-md5",
+                        key_md5_b64.as_str(),
+                    ),
+                    ("x-amz-request-id", "{request_id}"),
+                    ("x-amz-id-2", "{host_id}"),
+                ])
+                .body_empty(),
+        );
+        assert_eq!(put_captures["etag"], head_captures["etag"]);
+
+        delete_all_and_bucket(client, &bucket, &[key.to_string()]).await;
+    });
+}
+
+#[test]
+fn test_sse_c_missing_key_md5_error_shape() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        create_bucket_with_sse_c_enabled(client, &bucket)
+            .await
+            .expect("create SSE-C enabled bucket");
+        let customer_key = test_sse_c_key();
+        let (key_b64, _) = sse_c_header_values(&customer_key);
+
+        let response = raw_object_with(
+            "PUT",
+            &bucket,
+            "shape-sse-c-missing-key-md5.txt",
+            b"secret",
+            &[
+                ("x-amz-server-side-encryption-customer-algorithm", "AES256"),
+                (
+                    "x-amz-server-side-encryption-customer-key",
+                    key_b64.as_str(),
+                ),
+            ],
+        );
+        assert_shape(
+            "PutObject SSE-C missing key MD5",
+            &response,
+            &shape().status(400).headers(error_response_headers()).body(
+                sse_c_invalid_argument_body(
+                    "Requests specifying Server Side Encryption with Customer provided keys \
+                     must provide the client calculated MD5 of the secret key.",
+                ),
+            ),
+        );
+
+        delete_all_and_bucket(client, &bucket, &[]).await;
+    });
+}
+
+#[test]
+fn test_sse_c_missing_key_error_shape() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        create_bucket_with_sse_c_enabled(client, &bucket)
+            .await
+            .expect("create SSE-C enabled bucket");
+        let customer_key = test_sse_c_key();
+        let (_, key_md5_b64) = sse_c_header_values(&customer_key);
+
+        let response = raw_object_with(
+            "PUT",
+            &bucket,
+            "shape-sse-c-missing-key.txt",
+            b"secret",
+            &[
+                ("x-amz-server-side-encryption-customer-algorithm", "AES256"),
+                (
+                    "x-amz-server-side-encryption-customer-key-md5",
+                    key_md5_b64.as_str(),
+                ),
+            ],
+        );
+        assert_shape(
+            "PutObject SSE-C missing key",
+            &response,
+            &shape().status(400).headers(error_response_headers()).body(
+                sse_c_invalid_argument_body(
+                    "Requests specifying Server Side Encryption with Customer provided keys \
+                     must provide an appropriate secret key.",
+                ),
+            ),
+        );
+
+        delete_all_and_bucket(client, &bucket, &[]).await;
+    });
+}
+
+#[test]
+fn test_sse_c_wrong_algorithm_error_shape() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        create_bucket_with_sse_c_enabled(client, &bucket)
+            .await
+            .expect("create SSE-C enabled bucket");
+        let customer_key = test_sse_c_key();
+        let (key_b64, key_md5_b64) = sse_c_header_values(&customer_key);
+
+        let response = raw_object_with(
+            "PUT",
+            &bucket,
+            "shape-sse-c-wrong-algorithm.txt",
+            b"secret",
+            &[
+                ("x-amz-server-side-encryption-customer-algorithm", "aws:kms"),
+                (
+                    "x-amz-server-side-encryption-customer-key",
+                    key_b64.as_str(),
+                ),
+                (
+                    "x-amz-server-side-encryption-customer-key-md5",
+                    key_md5_b64.as_str(),
+                ),
+            ],
+        );
+        assert_shape(
+            "PutObject SSE-C wrong algorithm",
+            &response,
+            &shape().status(400).headers(error_response_headers()).body(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error>\
+                     <Code>InvalidEncryptionAlgorithmError</Code>\
+                     <Message>The Encryption request you specified is not valid. Supported \
+                     value: AES256.</Message>\
+                     <ArgumentName>x-amz-server-side-encryption</ArgumentName>\
+                     <ArgumentValue>aws:kms</ArgumentValue>\
+                     <RequestId>{request_id}</RequestId><HostId>{host_id}</HostId></Error>",
+            ),
+        );
+
+        delete_all_and_bucket(client, &bucket, &[]).await;
     });
 }

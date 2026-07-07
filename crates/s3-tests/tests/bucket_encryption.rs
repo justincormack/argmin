@@ -395,3 +395,36 @@ fn test_get_bucket_encryption_response_shape() {
         s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
     });
 }
+
+#[test]
+fn test_get_bucket_encryption_default_response_shape() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
+
+        // A fresh bucket's default encryption configuration: SSE-S3 with
+        // SSE-C uploads blocked, identical to the explicitly-configured
+        // AES256 shape.
+        let response = raw_bucket("GET", &bucket, Some("encryption="));
+        assert_shape(
+            "GetBucketEncryption default",
+            &response,
+            &shape()
+                .status(200)
+                .headers(chunked_response_headers())
+                .body(
+                    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+                     <ServerSideEncryptionConfiguration \
+                     xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Rule>\
+                     <BucketKeyEnabled>false</BucketKeyEnabled>\
+                     <ApplyServerSideEncryptionByDefault><SSEAlgorithm>AES256</SSEAlgorithm>\
+                     </ApplyServerSideEncryptionByDefault><BlockedEncryptionTypes>\
+                     <EncryptionType>SSE-C</EncryptionType></BlockedEncryptionTypes></Rule>\
+                     </ServerSideEncryptionConfiguration>",
+                ),
+        );
+
+        s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
+    });
+}

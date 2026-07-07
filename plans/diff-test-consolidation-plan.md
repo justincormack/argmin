@@ -245,7 +245,13 @@ batch, deleting each diff test once its shape coverage is subsumed. Batches
    tests pin `{version_id}` from the SDK PUT across GET/HEAD
    current/explicit, and the delete-marker version from the DELETE
    response captures.
-3. SSE-C success and error shapes
+3. SSE-C success and error shapes — DONE: six diff tests converted
+   (five golden tests in sse_c.rs, one default-encryption body test in
+   bucket_encryption.rs), all AWS-validated first try, six diff tests
+   deleted. The blocked-by-default AccessDenied message covers the
+   endpoint-varying caller principal with `{any}`; the SSE-C
+   InvalidArgument bodies are inline formats in response.rs (not xml.rs
+   builders) so those tests use literal templates via a local helper.
 4. multipart success shapes and completion/part errors, upload-part-copy
 5. object lock (bucket config, retention, legal hold) — needs the
    object-lock cleanup helper moved into shared helpers
