@@ -43,7 +43,7 @@ use storage::control_plane_raft::{
 };
 use storage::storage_node_server::{
     advance_storage_node_incarnation, StorageNodeControlPlaneRefreshLoop, StorageNodeDataDirGuard,
-    StorageNodePgRoute, StorageNodeProcessConfig, StorageNodeServer,
+    StorageNodePgRoute, StorageNodeProcessConfig, StorageNodeProcessConfigParts, StorageNodeServer,
 };
 use storage::{
     CanonicalUserId, ClusterEpoch, EcShape, LocalClusterMap,
@@ -2902,8 +2902,8 @@ fn bind_storage_node_process(
             eprintln!("storage-node configuration error: {e}");
             std::process::exit(1);
         });
-    let node_id = storage_config.node_id;
-    let socket_path = storage_config.socket_path.clone();
+    let node_id = storage_config.node_id();
+    let socket_path = storage_config.socket_path().to_path_buf();
     let server = match data_dir_guard {
         Some(data_dir_guard) => {
             StorageNodeServer::bind_with_data_dir_guard(storage_config, data_dir_guard)
@@ -3001,7 +3001,7 @@ fn build_storage_node_process_config(
         })
         .collect();
     Ok((
-        StorageNodeProcessConfig {
+        StorageNodeProcessConfig::new(StorageNodeProcessConfigParts {
             node_id,
             cluster_epoch,
             route_map_validity: RouteMapValidity::Forever,
@@ -3015,7 +3015,8 @@ fn build_storage_node_process_config(
             pg_routes,
 
             historical_pg_routes: Vec::new(),
-        },
+        })
+        .map_err(|error| error.to_string())?,
         None,
         None,
     ))
@@ -3152,11 +3153,11 @@ fn build_control_plane_storage_node_process_config(
         ),
     }
     .map_err(|error| error.to_string())?;
-    if node_config.socket_path != Path::new(configured_socket_path) {
+    if node_config.socket_path() != Path::new(configured_socket_path) {
         return Err(format!(
             "ARGMIN_STORAGE_NODE_SOCKET_PATH {} must match control-plane endpoint {} for node {}",
             configured_socket_path,
-            node_config.socket_path.display(),
+            node_config.socket_path().display(),
             node_id.as_u32()
         ));
     }
@@ -7188,12 +7189,15 @@ mod tests {
 
         assert_eq!(control_plane_node_incarnation, None);
         assert!(data_dir_guard.is_none());
-        assert_eq!(storage_config.node_id, NodeId::new(2));
-        assert_eq!(storage_config.cluster_epoch, ClusterEpoch::new(9).unwrap());
-        assert_eq!(storage_config.pg_ids, vec![1, 3, 5]);
+        assert_eq!(storage_config.node_id(), NodeId::new(2));
+        assert_eq!(
+            storage_config.cluster_epoch(),
+            ClusterEpoch::new(9).unwrap()
+        );
+        assert_eq!(storage_config.pg_ids(), &[1, 3, 5]);
         assert_eq!(
             storage_config
-                .pg_routes
+                .pg_routes()
                 .iter()
                 .map(|route| (route.pg_id, route.cluster_epoch))
                 .collect::<Vec<_>>(),
@@ -7967,10 +7971,10 @@ mod tests {
         server.join().unwrap();
         assert_eq!(control_plane_node_incarnation, Some(1));
         assert!(data_dir_guard.is_some());
-        assert_eq!(node_config.node_id, NodeId::new(0));
-        assert_eq!(node_config.socket_path, endpoint);
-        assert_eq!(node_config.pg_ids, vec![0]);
-        assert_eq!(node_config.pg_routes[0].state, PgState::Peering);
+        assert_eq!(node_config.node_id(), NodeId::new(0));
+        assert_eq!(node_config.socket_path(), endpoint);
+        assert_eq!(node_config.pg_ids(), &[0]);
+        assert_eq!(node_config.pg_routes()[0].state, PgState::Peering);
         drop(data_dir_guard);
         let _ = std::fs::remove_dir_all(&tmp);
     }
@@ -8010,10 +8014,10 @@ mod tests {
         assert!(second_guard.is_some());
         assert_eq!(observed_incarnations, vec![1, 2]);
         for node_config in [first_config, second_config] {
-            assert_eq!(node_config.node_id, NodeId::new(0));
-            assert_eq!(node_config.socket_path, endpoint);
-            assert_eq!(node_config.pg_ids, vec![0]);
-            assert_eq!(node_config.pg_routes[0].state, PgState::Peering);
+            assert_eq!(node_config.node_id(), NodeId::new(0));
+            assert_eq!(node_config.socket_path(), endpoint);
+            assert_eq!(node_config.pg_ids(), &[0]);
+            assert_eq!(node_config.pg_routes()[0].state, PgState::Peering);
         }
         drop(second_guard);
         let _ = std::fs::remove_dir_all(&tmp);
@@ -8049,9 +8053,9 @@ mod tests {
         assert_eq!(control_plane_node_incarnation, Some(1));
         assert!(data_dir_guard.is_some());
         assert_eq!(observed_incarnations, vec![1]);
-        assert_eq!(node_config.node_id, NodeId::new(0));
-        assert_eq!(node_config.socket_path, endpoint);
-        assert_eq!(node_config.pg_ids, vec![0]);
+        assert_eq!(node_config.node_id(), NodeId::new(0));
+        assert_eq!(node_config.socket_path(), endpoint);
+        assert_eq!(node_config.pg_ids(), &[0]);
         drop(data_dir_guard);
         let _ = std::fs::remove_dir_all(&tmp);
     }

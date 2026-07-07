@@ -18,7 +18,7 @@ smaller per-crate items.
 
 ## Status
 
-In progress. A1-A10, S1-S4, S6, K1-K4, H1-H8, all of P1/P2, the first two
+In progress. A1-A10, S1-S4, S6, K1-K4, H1-H8, all of P1/P2, the first three
 P3 items, and all re-review items RR1-RR16 are done. A verification pass on
 2026-07-06 confirmed all 16 RR fixes against the code (workspace
 `cargo check --all-targets` clean; auth crate 454 unit tests pass; targeted
@@ -895,11 +895,14 @@ each is one refactor away from a panic:
   Resolution: make the field private, change `new(total_shards)` to take
   `usize`, add a read-only accessor, defensively revalidate in `Placer::new`,
   and remove the lossy `as u8` from the storage placement caller.
-- [ ] `StorageNodeProcessConfig`: still 9 pub fields (now including
+- [x] `StorageNodeProcessConfig`: still 9 pub fields (now including
   `route_map_validity: RouteMapValidity` after S6) whose consistency is
   enforced only by the separate `validate_storage_node_process_configs`
-  (`storage_node_server.rs:325-335, 1335`). Private fields + validating
-  constructor.
+  (`storage_node_server.rs:325-335, 1335`). Resolution: remove the public
+  field bypass by making fields crate-visible to storage internals/tests only,
+  add `StorageNodeProcessConfig::new(StorageNodeProcessConfigParts)` with route
+  table validation, move the external `argmin-s3` construction path through the
+  validating constructor, and expose read-only accessors for external callers.
 - [ ] `SseCustomerRequest::with_algorithm` accepts any string, breaking the
   AES256 pin that `new()` establishes (`sse.rs:54-57`); validation lives only
   in server-http (callers `mod.rs:5005, 5117`). Drop it or make it fallible.

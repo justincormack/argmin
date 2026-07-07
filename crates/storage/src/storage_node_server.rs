@@ -323,6 +323,19 @@ extern "C" {
 
 #[derive(Debug, Clone)]
 pub struct StorageNodeProcessConfig {
+    pub(crate) node_id: NodeId,
+    pub(crate) cluster_epoch: ClusterEpoch,
+    pub(crate) route_map_validity: RouteMapValidity,
+    pub(crate) data_dir: PathBuf,
+    pub(crate) default_ec_shape: EcShape,
+    pub(crate) pg_ids: Vec<u32>,
+    pub(crate) socket_path: PathBuf,
+    pub(crate) pg_routes: Vec<StorageNodePgRoute>,
+    pub(crate) historical_pg_routes: Vec<StorageNodePgRoute>,
+}
+
+#[derive(Debug, Clone)]
+pub struct StorageNodeProcessConfigParts {
     pub node_id: NodeId,
     pub cluster_epoch: ClusterEpoch,
     pub route_map_validity: RouteMapValidity,
@@ -371,6 +384,67 @@ impl StorageNodeControlPlaneRefresh {
 
 impl StorageNodeProcessConfig {
     const CONTROL_PLANE_RUNTIME_CONFIG_FILE: &'static str = "control-plane-runtime-config-v1";
+
+    pub fn new(parts: StorageNodeProcessConfigParts) -> Result<Self, StorageNodeServerError> {
+        let config = Self {
+            node_id: parts.node_id,
+            cluster_epoch: parts.cluster_epoch,
+            route_map_validity: parts.route_map_validity,
+            data_dir: parts.data_dir,
+            default_ec_shape: parts.default_ec_shape,
+            pg_ids: parts.pg_ids,
+            socket_path: parts.socket_path,
+            pg_routes: parts.pg_routes,
+            historical_pg_routes: parts.historical_pg_routes,
+        };
+        validate_process_config_route_table(&config)?;
+        Ok(config)
+    }
+
+    #[must_use]
+    pub fn node_id(&self) -> NodeId {
+        self.node_id
+    }
+
+    #[must_use]
+    pub fn cluster_epoch(&self) -> ClusterEpoch {
+        self.cluster_epoch
+    }
+
+    #[must_use]
+    pub fn route_map_validity(&self) -> RouteMapValidity {
+        self.route_map_validity
+    }
+
+    #[must_use]
+    pub fn data_dir(&self) -> &Path {
+        &self.data_dir
+    }
+
+    #[must_use]
+    pub fn default_ec_shape(&self) -> EcShape {
+        self.default_ec_shape
+    }
+
+    #[must_use]
+    pub fn pg_ids(&self) -> &[u32] {
+        &self.pg_ids
+    }
+
+    #[must_use]
+    pub fn socket_path(&self) -> &Path {
+        &self.socket_path
+    }
+
+    #[must_use]
+    pub fn pg_routes(&self) -> &[StorageNodePgRoute] {
+        &self.pg_routes
+    }
+
+    #[must_use]
+    pub fn historical_pg_routes(&self) -> &[StorageNodePgRoute] {
+        &self.historical_pg_routes
+    }
 
     pub fn from_runtime_map(
         node_id: NodeId,
@@ -11697,6 +11771,27 @@ mod tests {
         assert_eq!(actual.socket_path, expected.socket_path);
         assert_eq!(actual.pg_routes, expected.pg_routes);
         assert_eq!(actual.historical_pg_routes, expected.historical_pg_routes);
+    }
+
+    #[test]
+    fn storage_node_process_config_new_rejects_invalid_route_table() {
+        let tmp = test_util::tempdir();
+        let err = StorageNodeProcessConfig::new(StorageNodeProcessConfigParts {
+            node_id: NodeId::new(7),
+            cluster_epoch: ClusterEpoch::new(1).unwrap(),
+            route_map_validity: RouteMapValidity::Forever,
+            data_dir: tmp.path().join("node"),
+            default_ec_shape: EcShape { k: 4, m: 2 },
+            pg_ids: vec![0],
+            socket_path: tmp.path().join("sock").join("storage.sock"),
+            pg_routes: Vec::new(),
+            historical_pg_routes: Vec::new(),
+        })
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            StorageNodeServerError::MissingPgRoute { pg_id: 0 }
+        ));
     }
 
     #[test]
