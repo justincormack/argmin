@@ -1,25 +1,30 @@
+//! Bucket-policy condition scenario matrices, migrated from the standalone
+//! AWS-vs-local diff suite (see plans/diff-test-consolidation-plan.md).
+//!
+//! Each scenario installs a policy, drives the operation with the alternate
+//! (non-owner) client, and asserts the golden Allow/Reject outcome; the same
+//! expectations hold against AWS and the local server. The in-process
+//! `auth::bucket_policy` evaluator is cross-checked against the same
+//! scenarios as a pure model check, independent of the endpoint.
+
 use std::thread;
 use std::time::Duration;
 
 use auth::bucket_policy::{
     parse_bucket_policy, BucketPolicy, PolicyAction, PolicyEvaluation, PolicyRequest, PolicyTag,
 };
-use s3_diff_tests::require_external_diff_test_env;
 use s3_tests::{
     aws_sdk_s3::{
         error::ProvideErrorMetadata,
         primitives::ByteStream,
         types::{
-            BucketCannedAcl, BucketLocationConstraint, CreateBucketConfiguration,
-            MetadataDirective, ObjectAttributes, ObjectCannedAcl, ObjectOwnership,
+            BucketCannedAcl, MetadataDirective, ObjectAttributes, ObjectCannedAcl, ObjectOwnership,
             OwnershipControls, OwnershipControlsRule, ServerSideEncryption, Tag, Tagging,
         },
         Client,
     },
-    build_client_with_ca, enable_bucket_sse_c, sse_c_header_values, test_sse_c_key, unique_bucket,
-    TestServer, CTX,
+    enable_bucket_sse_c, sse_c_header_values, test_sse_c_key, unique_bucket, CTX,
 };
-use s3_types::is_legacy_create_bucket_region;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RemoteOutcome {
@@ -191,65 +196,6 @@ impl LocalRequest {
         .with_grant_write_acp(self.grant_write_acp.as_deref())
         .with_grant_full_control(self.grant_full_control.as_deref());
         policy.evaluate(&request)
-    }
-}
-
-struct DiffEnv {
-    external_owner: Client,
-    external_alt: Client,
-    local_owner: Client,
-    local_alt: Client,
-    external_region: String,
-    local_server: TestServer,
-}
-
-impl DiffEnv {
-    async fn setup() -> Option<Self> {
-        require_external_diff_test_env();
-
-        let _ = &*CTX;
-        let external_region = CTX.region().to_string();
-        let local_server = TestServer::start_https_in_region(&external_region).await;
-        let local_owner = build_client_with_ca(
-            local_server.endpoint(),
-            s3_tests::server::TEST_ACCESS_KEY,
-            s3_tests::server::TEST_SECRET_KEY,
-            &external_region,
-            local_server.tls_ca_pem(),
-        );
-        let local_alt = build_client_with_ca(
-            local_server.endpoint(),
-            s3_tests::server::ALT_ACCESS_KEY,
-            s3_tests::server::ALT_SECRET_KEY,
-            &external_region,
-            local_server.tls_ca_pem(),
-        );
-
-        Some(Self {
-            external_owner: CTX.client().clone(),
-            external_alt: CTX.alt_client().clone(),
-            local_owner,
-            local_alt,
-            external_region,
-            local_server,
-        })
-    }
-
-    async fn create_bucket_pair(&self) -> String {
-        let bucket = unique_bucket();
-        create_bucket_in_region(&self.external_owner, &bucket, &self.external_region).await;
-        create_bucket_in_region(&self.local_owner, &bucket, &self.external_region).await;
-        bucket
-    }
-
-    async fn cleanup_pair(&self, bucket: &str, keys: &[&str]) {
-        for client in [&self.external_owner, &self.local_owner] {
-            let _ = client.delete_bucket_policy().bucket(bucket).send().await;
-            for key in keys {
-                let _ = client.delete_object().bucket(bucket).key(*key).send().await;
-            }
-            let _ = client.delete_bucket().bucket(bucket).send().await;
-        }
     }
 }
 
@@ -864,8 +810,12 @@ fn build_scenarios() -> Vec<Scenario> {
             local_expected: PolicyEvaluation::NoMatch,
             remote_expected: RemoteOutcome::Reject,
         },
+        // Probed on AWS (2026-07-07): s3:ExistingObjectTag conditions are not
+        // evaluable for GetObjectAttributes, so the allow statement never
+        // applies even when the object's tag matches. The evaluator models
+        // this as AcceptedButNotEvaluable, classifying the request NoMatch.
         Scenario {
-            name: "get-object-attributes existing tag allow",
+            name: "get-object-attributes existing tag not evaluable",
             policy_shape: PolicyShape::ExistingTagRead(ExistingTagReadAction::ObjectAttributes),
             local_request: LocalRequest {
                 action: PolicyAction::GetObjectAttributes,
@@ -886,8 +836,8 @@ fn build_scenarios() -> Vec<Scenario> {
             operation: ScenarioOperation::GetObjectAttributes {
                 key: "existing-public",
             },
-            local_expected: PolicyEvaluation::ExplicitAllow,
-            remote_expected: RemoteOutcome::Allow,
+            local_expected: PolicyEvaluation::NoMatch,
+            remote_expected: RemoteOutcome::Reject,
         },
         Scenario {
             name: "get-object-attributes existing tag mismatch",
@@ -1769,18 +1719,6 @@ fn materialize_scenario(template: &Scenario, bucket: &str, owner_canonical_id: &
     scenario
 }
 
-async fn create_bucket_in_region(client: &Client, bucket: &str, region: &str) {
-    let mut request = client.create_bucket().bucket(bucket);
-    if !is_legacy_create_bucket_region(region) {
-        request = request.create_bucket_configuration(
-            CreateBucketConfiguration::builder()
-                .location_constraint(BucketLocationConstraint::from(region))
-                .build(),
-        );
-    }
-    request.send().await.expect("create bucket");
-}
-
 async fn set_object_writer_ownership(client: &Client, bucket: &str) {
     let rule = OwnershipControlsRule::builder()
         .object_ownership(ObjectOwnership::ObjectWriter)
@@ -2108,16 +2046,22 @@ where
     }
 }
 
-async fn prepare_bucket_pair(env: &DiffEnv, bucket: &str) {
-    for client in [&env.external_owner, &env.local_owner] {
-        setup_tagged_object(client, bucket, "existing-public", "public").await;
-        setup_tagged_object(client, bucket, "existing-private", "private").await;
-        setup_plain_object(client, bucket, "tag-target").await;
-        setup_plain_object(client, bucket, "acl-target").await;
-        setup_copy_source_object(client, bucket, "src/public/foo").await;
-        setup_copy_source_object(client, bucket, "src/private/foo").await;
-        setup_copy_source_object(client, bucket, "src/meta/foo").await;
+async fn prepare_bucket(client: &Client, bucket: &str) {
+    setup_tagged_object(client, bucket, "existing-public", "public").await;
+    setup_tagged_object(client, bucket, "existing-private", "private").await;
+    setup_plain_object(client, bucket, "tag-target").await;
+    setup_plain_object(client, bucket, "acl-target").await;
+    setup_copy_source_object(client, bucket, "src/public/foo").await;
+    setup_copy_source_object(client, bucket, "src/private/foo").await;
+    setup_copy_source_object(client, bucket, "src/meta/foo").await;
+}
+
+async fn cleanup_scenario_bucket(client: &Client, bucket: &str, keys: &[&str]) {
+    let _ = client.delete_bucket_policy().bucket(bucket).send().await;
+    for key in keys {
+        let _ = client.delete_object().bucket(bucket).key(*key).send().await;
     }
+    let _ = client.delete_bucket().bucket(bucket).send().await;
 }
 
 const SCENARIO_CLEANUP_KEYS: &[&str] = &[
@@ -2151,77 +2095,62 @@ const SCENARIO_CLEANUP_KEYS: &[&str] = &[
 
 fn run_selected_scenarios(selected_shapes: &[PolicyShape]) {
     s3_tests::run(async {
-        let Some(env) = DiffEnv::setup().await else {
-            return;
-        };
-        let external_principal = alt_root_principal(CTX.alt_account_id());
-        let local_policy_principal = alt_root_principal(s3_tests::server::ALT_ACCOUNT_ID);
-        let local_requester_principal = s3_tests::server::ALT_ACCOUNT_ID;
+        let owner = CTX.client();
+        let alt = CTX.alt_client();
+        let policy_principal = alt_root_principal(CTX.alt_account_id());
+        let requester_principal = CTX.alt_account_id();
 
         let scenarios = build_scenarios()
             .into_iter()
             .filter(|scenario| selected_shapes.contains(&scenario.policy_shape))
             .collect::<Vec<_>>();
         for scenario_template in &scenarios {
-            let bucket = env.create_bucket_pair().await;
+            let bucket = unique_bucket();
+            s3_tests::create_bucket(owner, &bucket)
+                .await
+                .expect("create scenario bucket");
             if scenario_template.policy_shape.requires_acl_capable_bucket() {
-                set_object_writer_ownership(&env.external_owner, &bucket).await;
-                set_object_writer_ownership(&env.local_owner, &bucket).await;
+                set_object_writer_ownership(owner, &bucket).await;
             }
             if matches!(
                 scenario_template.policy_shape,
                 PolicyShape::PutObjectSseCustomerAlgorithmAes256
             ) {
-                enable_bucket_sse_c(&env.external_owner, &bucket).await;
-                enable_bucket_sse_c(&env.local_owner, &bucket).await;
+                enable_bucket_sse_c(owner, &bucket).await;
             }
-            prepare_bucket_pair(&env, &bucket).await;
-            let owner_canonical_id = canonical_owner_id(&env.external_owner, &bucket).await;
+            prepare_bucket(owner, &bucket).await;
+            let owner_canonical_id = canonical_owner_id(owner, &bucket).await;
             let scenario = materialize_scenario(scenario_template, &bucket, &owner_canonical_id);
-            let external_policy_json =
+            let policy_json =
                 scenario
                     .policy_shape
-                    .render(&bucket, &external_principal, &owner_canonical_id);
-            let local_policy_json =
-                scenario
-                    .policy_shape
-                    .render(&bucket, &local_policy_principal, &owner_canonical_id);
-            install_bucket_policy(&env.external_owner, &bucket, &external_policy_json).await;
-            install_bucket_policy(&env.local_owner, &bucket, &local_policy_json).await;
+                    .render(&bucket, &policy_principal, &owner_canonical_id);
+            install_bucket_policy(owner, &bucket, &policy_json).await;
 
-            let policy = parse_bucket_policy(&local_policy_json).expect("policy parses");
+            // Pure in-process model check: the policy evaluator must classify
+            // the request like the golden expectation, on any endpoint.
+            let policy = parse_bucket_policy(&policy_json).expect("policy parses");
             policy
                 .validate_evaluable_object_conditions()
                 .expect("policy remains in evaluable subset");
-            let local_eval =
-                scenario
-                    .local_request
-                    .evaluate(&policy, &bucket, local_requester_principal);
-
-            let external =
-                observe_scenario_until_expected(&env.external_alt, &bucket, &scenario).await;
-            let local = observe_scenario_until_expected(&env.local_alt, &bucket, &scenario).await;
-
+            let local_eval = scenario
+                .local_request
+                .evaluate(&policy, &bucket, requester_principal);
             assert_eq!(
                 local_eval, scenario.local_expected,
-                "local evaluator classification drifted for {}\npolicy={}\nrequest={:?}",
-                scenario.name, local_policy_json, scenario.local_request
-            );
-            assert_eq!(
-                external, scenario.remote_expected,
-                "aws classification drifted for {}\npolicy={}\nrequest={:?}",
-                scenario.name, external_policy_json, scenario.local_request
-            );
-            assert_eq!(
-                local, external,
-                "local server diverged from aws for {}\nexternal_policy={}\nlocal_policy={}\nrequest={:?}",
-                scenario.name, external_policy_json, local_policy_json, scenario.local_request
+                "policy evaluator classification drifted for {}\npolicy={}\nrequest={:?}",
+                scenario.name, policy_json, scenario.local_request
             );
 
-            env.cleanup_pair(&bucket, SCENARIO_CLEANUP_KEYS).await;
+            let observed = observe_scenario_until_expected(alt, &bucket, &scenario).await;
+            assert_eq!(
+                observed, scenario.remote_expected,
+                "endpoint classification drifted for {}\npolicy={}\nrequest={:?}",
+                scenario.name, policy_json, scenario.local_request
+            );
+
+            cleanup_scenario_bucket(owner, &bucket, SCENARIO_CLEANUP_KEYS).await;
         }
-
-        drop(env.local_server);
     });
 }
 
@@ -2230,6 +2159,7 @@ fn test_bucket_policy_tagging_conditions_match_aws() {
     run_selected_scenarios(&[
         PolicyShape::ExistingTagRead(ExistingTagReadAction::Object),
         PolicyShape::ExistingTagRead(ExistingTagReadAction::ObjectAcl),
+        PolicyShape::ExistingTagRead(ExistingTagReadAction::ObjectAttributes),
         PolicyShape::GetObjectTaggingExistingPublic,
         PolicyShape::PutObjectTaggingRequestPublic,
         PolicyShape::PutObjectInlineTaggingRequestPublic,

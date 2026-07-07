@@ -5,7 +5,7 @@ This guide collects the main testing workflows for the repository:
 - targeted crate tests
 - workspace and integration coverage
 - AWS-backed compatibility runs
-- AWS-vs-local differential response-shape runs
+- golden response-shape assertions
 - HTTP-only and local-only test crates
 - parser fuzzing
 
@@ -40,9 +40,6 @@ cargo test -p s3-local-tests
 
 # Standalone binary UAT acceptance run.
 ./scripts/uat-s3-tests --test bucket_crud
-
-# Differential AWS-vs-local bucket-policy matrices.
-./scripts/diff-tests --test bucket_policy
 ```
 
 ## Deterministic Unit Tests
@@ -126,18 +123,13 @@ For external AWS-backed workflows, prefer the wrapper scripts under
     owner-root credentials
   - runs `s3-tests` against that process as an external endpoint
   - forwards extra arguments to `cargo nextest run -p s3-tests`
-- `./scripts/diff-tests`
-  - runs the standalone AWS-vs-local `s3-diff-tests` suite
-  - loads AWS credentials from `.env`
-  - sets the required `S3_TEST_*` variables
-  - forwards extra arguments to `cargo test --manifest-path crates/s3-diff-tests/Cargo.toml`
 - `./scripts/cleanup`
   - cleans up leftover external test buckets
   - loads the primary AWS credentials from `.env`
   - uses the same AWS user as `./scripts/aws-tests`
 
-The AWS-backed scripts accept `--region`, and `aws-tests` / `diff-tests` also
-accept additional `cargo test` selectors and `-- --nocapture` style test-binary
+The AWS-backed scripts accept `--region`, and `aws-tests` also accepts
+additional `cargo test` selectors and `-- --nocapture` style test-binary
 arguments. `uat-s3-tests` accepts additional `cargo nextest run` selectors and
 options.
 
@@ -500,42 +492,27 @@ S3_TEST_TIMEOUT_SECS="${TEST_S3_TIMEOUT_SECS:-120}" \
 cargo test -p s3-http-tests --no-fail-fast
 ```
 
-### Differential AWS-vs-local checks
+### Golden response-shape assertions
 
-The remaining differential checks live in `crates/s3-diff-tests`: the
-`bucket_policy` scenario matrices, which run the same requests against real
-AWS and the embedded local server. The former `response_shape` suite has been
-fully converted to golden shape assertions inside `crates/s3-tests` (see
-`crates/s3-tests/src/shape.rs` and
-plans/diff-test-consolidation-plan.md); the rest of this crate follows.
+The former standalone AWS-vs-local diff suite (`crates/s3-diff-tests`) has
+been fully converted to golden shape assertions inside `crates/s3-tests`:
 
-This is different from the other dedicated test crates:
+- the shape helpers live in `crates/s3-tests/src/shape.rs` (`assert_shape`,
+  validated `{placeholder}` templates, complete-set header comparison, and
+  `assert_shape_one_of` for divergences documented in
+  [aws-compatibility.md](aws-compatibility.md))
+- error-body expectations are generated from the production formatters via
+  `s3_tests::shape::expected_error`, each anchored by a literal test in the
+  shape module
+- the bucket-policy condition matrices live in
+  `crates/s3-tests/tests/bucket_policy_conditions.rs`
 
-- unlike `s3-local-tests`, it is not local-only
-- unlike ordinary AWS-backed `s3-tests`, it is not exercising only one backend
-- it always needs the full AWS-backed `s3-tests` environment, including both
-  AWS credential sets and the bucket prefix, because the local response is
-  only half of the comparison
-- it is outside the main workspace so normal workspace test runs do not include
-  it
-- `cargo test --manifest-path crates/s3-diff-tests/Cargo.toml` is expected to
-  fail fast if the external AWS comparison environment is incomplete
-
-Missing external AWS comparison configuration is a hard failure rather than a
-silent skip.
-
-Recommended command:
-
-```bash
-./scripts/diff-tests --test bucket_policy -- --nocapture
-```
-
-Like `./scripts/aws-tests`, this wrapper accepts region overrides and forwards
-additional `cargo test` selection arguments:
-
-```bash
-./scripts/diff-tests --region us-west-2 --test bucket_policy -- --nocapture
-```
+These assertions run against the embedded server on every
+`cargo nextest run` and against AWS via `./scripts/aws-tests`; the same
+expectations must hold on both endpoints, and tests never branch on the
+endpoint. The full conversion history is in
+plans/diff-test-consolidation-plan.md. The emptied `crates/s3-diff-tests`
+crate is pending removal.
 
 ### Local-only tests
 
@@ -735,7 +712,8 @@ As a rough rule:
 - use `s3-local-tests` for local embedded-server behavior that does not need AWS
 - use `s3-http-tests` for plain-HTTP transport behavior
 - use AWS-backed `s3-tests` when compatibility depends on real AWS behavior
-- use `s3-diff-tests` when the contract being checked is "AWS response shape vs
-  our response shape for the same request"
+- use golden shape assertions (`s3_tests::shape`) when the contract being
+  checked is the exact response shape for a request: full header set and
+  body, holding on AWS and locally alike
 - use `./scripts/coverage` when checking integration coverage movement
 - use `cargo-fuzz` for malformed-input robustness and panic discovery

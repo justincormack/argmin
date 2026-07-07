@@ -333,7 +333,7 @@ Each batch ends with: local `cargo nextest run` for the touched binaries,
 `./scripts/aws-tests --test <binary>` green, corresponding diff tests
 deleted.
 
-### Phase 4 — migrate the bucket-policy matrices
+### Phase 4 — migrate the bucket-policy matrices (DONE)
 
 - move the scenario runner and the four matrices from
   `s3-diff-tests/tests/bucket_policy.rs` into the s3-tests bucket-policy
@@ -342,6 +342,32 @@ deleted.
 - the in-process `auth::bucket_policy` evaluator cross-check is unit-level
   coverage; move it into the `auth` crate's own tests keyed by the same
   scenario table, or drop it if the crate already covers those conditions
+
+Outcome: the matrices moved wholesale to
+`crates/s3-tests/tests/bucket_policy_conditions.rs` with the scenario
+tables verbatim; DiffEnv collapsed to CTX owner/alt clients, and the
+alt-account principal comes from `CTX.alt_account_id()` in both modes.
+Rather than duplicating the large scenario table into the auth crate,
+the evaluator cross-check stayed inline as a pure model check — it is
+endpoint-independent (no branching) and keeps a single source of truth
+for the scenarios. All four matrices pass locally and against AWS
+(the ACL/grant matrix takes ~65s on AWS with policy-convergence
+retries). The diff crate now has zero tests. Review follow-up folded
+in: `scripts/diff-tests` is deleted and all guide references
+(testing.md quick-reference, script list, differential section,
+crate-choice guidance, aws-compatibility §9 note, security-testing
+matrix) now point at the golden shape assertions and
+`bucket_policy_conditions`, so no advertised command is broken; only
+the empty crate itself (and its scripts/ci compile step) remains for
+Phase 5. Second review follow-up: the scenario table contained two
+never-selected ExistingTagRead(ObjectAttributes) scenarios (dead in
+the original diff suite too); wiring them in exposed that their
+expectations had never been validated — AWS rejects
+GetObjectAttributes even when the existing-tag condition matches
+(ExistingObjectTag is not evaluable for that action), which is
+exactly how the auth evaluator already models it. The scenario now
+pins Reject/NoMatch, AWS-validated, and the tagging matrix runs all
+seven of its shapes.
 
 ### Phase 5 — removal
 

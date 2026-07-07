@@ -410,7 +410,8 @@ The remaining mismatch appears to come from Hyper's `HEAD` response handling,
 which suppresses chunked transfer encoding and sends a zero-length response
 instead.
 
-The `s3-diff-tests` `HeadBucket` response-shape check ignores only this header.
+The golden `HeadBucket` shape test in `crates/s3-tests/tests/bucket_crud.rs`
+accepts both forms (with and without the header) via `assert_shape_one_of`.
 
 ### 10. SigV2 is not implemented
 
