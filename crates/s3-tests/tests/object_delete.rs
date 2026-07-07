@@ -2,8 +2,10 @@ use aws_sdk_s3::types::{
     BucketVersioningStatus, Delete, ObjectIdentifier, VersioningConfiguration,
 };
 use s3_tests::{
-    assert_s3_err_code, create_objects, create_objects_with_keys, delete_all_and_bucket,
-    delete_objects_with_md5, err_status, unique_bucket, SendRetryingOperationAborted, CTX,
+    assert_s3_err_code, content_md5_header, create_objects, create_objects_with_keys,
+    delete_all_and_bucket, delete_objects_with_md5, err_status, send_signed_request,
+    shape::{assert_body_with_unordered_blocks, assert_shape, shape, xml_response_headers},
+    unique_bucket, SendRetryingOperationAborted, CTX,
 };
 use serde_json::json;
 
@@ -1172,5 +1174,63 @@ fn test_versioning_multi_object_delete_nonexistent_creates_marker() {
         assert_eq!(list.delete_markers()[0].key().unwrap(), "never-existed");
 
         cleanup_versioned_bucket(&bucket).await;
+    });
+}
+
+// ── Response shapes ─────────────────────────────────────────────────
+
+#[test]
+fn test_delete_objects_response_shape() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
+        let keys = ["shape-delete-objects-a.txt", "shape-delete-objects-b.txt"];
+        for key in keys {
+            s3_tests::put_object_retrying_operation_aborted(
+                client,
+                &bucket,
+                key,
+                b"delete-objects".to_vec(),
+            )
+            .await;
+        }
+
+        let delete_body = format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+             <Delete>\
+             <Object><Key>{}</Key></Object>\
+             <Object><Key>{}</Key></Object>\
+             </Delete>",
+            keys[0], keys[1]
+        );
+        let response = send_signed_request(
+            "POST",
+            &format!("{}/{}?delete=", CTX.endpoint(), bucket),
+            delete_body.as_bytes(),
+            [content_md5_header(delete_body.as_bytes())],
+        );
+        // Deleted entries may appear in any order; the body must be exactly
+        // the envelope plus those entries, so any extra sibling element
+        // (including Error entries) fails the envelope match.
+        assert_shape(
+            "DeleteObjects shape",
+            &response,
+            &shape().status(200).headers(xml_response_headers()),
+        );
+        assert_body_with_unordered_blocks(
+            "DeleteObjects shape",
+            &response.body,
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+             <DeleteResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"></DeleteResult>",
+            "Deleted",
+            &[
+                format!("<Deleted><Key>{}</Key></Deleted>", keys[0]),
+                format!("<Deleted><Key>{}</Key></Deleted>", keys[1]),
+            ],
+            &std::collections::BTreeMap::new(),
+        );
+
+        s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
     });
 }

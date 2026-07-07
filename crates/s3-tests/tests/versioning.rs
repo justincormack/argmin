@@ -8,7 +8,7 @@ use s3_tests::{
     delete_bucket_retrying_operation_aborted, delete_objects_retrying_operation_aborted,
     err_status, get_object_body_retrying_operation_aborted, raw_bucket, raw_object,
     raw_object_query, send_signed_request,
-    shape::{assert_shape, chunked_response_headers, id_headers, shape},
+    shape::{assert_shape, chunked_response_headers, id_headers, shape, xml_response_headers},
     unique_bucket, RawResponse, SendRetryingOperationAborted, CTX,
 };
 use tokio::time::{sleep, Duration};
@@ -2504,6 +2504,82 @@ fn test_delete_object_versioned_response_shape() {
                 .header("x-amz-delete-marker", "true")
                 .sub("version_id", marker_version.as_str())
                 .body_empty(),
+        );
+
+        cleanup_versioned_bucket(client, &bucket).await;
+    });
+}
+
+#[test]
+fn test_list_object_versions_response_shape() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
+        s3_tests::enable_bucket_versioning(client, &bucket).await;
+
+        s3_tests::put_object_retrying_operation_aborted(
+            client,
+            &bucket,
+            "versions-a.txt",
+            b"v1".to_vec(),
+        )
+        .await;
+        let put_a2 = s3_tests::put_object_retrying_operation_aborted(
+            client,
+            &bucket,
+            "versions-a.txt",
+            b"v2".to_vec(),
+        )
+        .await;
+        let version_a2 = put_a2.version_id().expect("version a2").to_string();
+        s3_tests::put_object_retrying_operation_aborted(
+            client,
+            &bucket,
+            "versions-b.txt",
+            b"vb".to_vec(),
+        )
+        .await;
+        let marker = client
+            .delete_object()
+            .bucket(&bucket)
+            .key("versions-a.txt")
+            .send_retrying_operation_aborted("create delete marker")
+            .await
+            .unwrap();
+        let marker_version = marker.version_id().expect("marker version").to_string();
+
+        // Truncated at 2: the latest delete marker then version a2, with the
+        // markers pointing at the last listed entry.
+        let response = raw_bucket("GET", &bucket, Some("versions=&max-keys=2"));
+        assert_shape(
+            "ListObjectVersions shape",
+            &response,
+            &shape()
+                .status(200)
+                .headers(xml_response_headers())
+                .body(
+                    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<ListVersionsResult \
+                     xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Name>{bucket}</Name>\
+                     <Prefix></Prefix><KeyMarker></KeyMarker>\
+                     <VersionIdMarker></VersionIdMarker>\
+                     <NextKeyMarker>versions-a.txt</NextKeyMarker>\
+                     <NextVersionIdMarker>{version_a2}</NextVersionIdMarker>\
+                     <MaxKeys>2</MaxKeys><IsTruncated>true</IsTruncated>\
+                     <DeleteMarker><Key>versions-a.txt</Key>\
+                     <VersionId>{marker_version}</VersionId><IsLatest>true</IsLatest>\
+                     <LastModified>{iso8601}</LastModified><Owner><ID>{owner_id}</ID></Owner>\
+                     </DeleteMarker><Version><Key>versions-a.txt</Key>\
+                     <VersionId>{version_a2}</VersionId><IsLatest>false</IsLatest>\
+                     <LastModified>{iso8601}</LastModified><ETag>{etag}</ETag>\
+                     <ChecksumAlgorithm>CRC32</ChecksumAlgorithm>\
+                     <ChecksumType>FULL_OBJECT</ChecksumType><Size>2</Size>\
+                     <Owner><ID>{owner_id}</ID></Owner><StorageClass>STANDARD</StorageClass>\
+                     </Version></ListVersionsResult>",
+                )
+                .sub("bucket", bucket.as_str())
+                .sub("version_a2", version_a2.as_str())
+                .sub("marker_version", marker_version.as_str()),
         );
 
         cleanup_versioned_bucket(client, &bucket).await;

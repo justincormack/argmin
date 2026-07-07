@@ -301,7 +301,19 @@ batch, deleting each diff test once its shape coverage is subsumed. Batches
    test's full surface — explicit-version GET/HEAD, plain-object HEAD,
    and GetObjectAttributes on a locked object (which carries no lock
    headers and no content-type; absence pinned via full-set equality).
-6. listings (v1/v2, versions, multipart uploads) and DeleteObjects
+6. listings (v1/v2, versions, multipart uploads) and DeleteObjects —
+   DONE: five golden tests (object_delete, bucket_list ×2, versioning,
+   multipart), all AWS-validated first try, five diff tests deleted.
+   DeleteObjects uses the canonicalizing unordered-block helper
+   (`assert_body_with_unordered_blocks`, added on review feedback):
+   matched Deleted blocks are stripped and the remainder must equal the
+   envelope exactly, so extra sibling elements cannot slip through. Full
+   listing bodies are pinned with `{version_id}`/upload-id subs from
+   fixture responses; the v1 no-NextMarker property is enforced by
+   full-template equality rather than a separate absence check.
+   Initiator IDs stay `{any}` (ARN on AWS, canonical ID locally);
+   ListObjects v1/v2 carry `x-amz-bucket-region`, the other listings
+   do not.
 7. POST object, CopyObject, GetObjectAttributes, delete-marker shapes
 
 Each batch ends with: local `cargo nextest run` for the touched binaries,

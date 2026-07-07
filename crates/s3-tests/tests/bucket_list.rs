@@ -2,7 +2,7 @@ use aws_sdk_s3::types::EncodingType;
 use s3_tests::{
     assert_s3_err_code, create_objects, create_objects_with_keys, delete_all_and_bucket,
     err_status, raw_bucket, send_signed_request,
-    shape::{assert_shape, error_response_headers, expected_error, shape},
+    shape::{assert_shape, error_response_headers, expected_error, shape, xml_response_headers},
     unique_bucket, SendRetryingOperationAborted, CTX,
 };
 use std::time::Duration;
@@ -2860,5 +2860,83 @@ fn test_bucket_list_return_data_versioning() {
         }
 
         s3_tests::cleanup_versioned_bucket(client, &bucket).await;
+    });
+}
+
+#[test]
+fn test_list_objects_v1_response_shape() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
+        for key in ["aaa", "zzz"] {
+            s3_tests::put_object_retrying_operation_aborted(client, &bucket, key, b"x".to_vec())
+                .await;
+        }
+
+        // A truncated ListObjects (v1) response: Contents carry Owner, and
+        // no NextMarker appears without a delimiter (full-template equality
+        // pins its absence).
+        let response = raw_bucket("GET", &bucket, Some("max-keys=1"));
+        assert_shape(
+            "ListObjectsV1 shape",
+            &response,
+            &shape()
+                .status(200)
+                .headers(xml_response_headers())
+                .header("x-amz-bucket-region", CTX.region())
+                .body(
+                    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<ListBucketResult \
+                     xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Name>{bucket}</Name>\
+                     <Prefix></Prefix><Marker></Marker><MaxKeys>1</MaxKeys>\
+                     <IsTruncated>true</IsTruncated><Contents><Key>aaa</Key>\
+                     <LastModified>{iso8601}</LastModified><ETag>{etag}</ETag>\
+                     <ChecksumAlgorithm>CRC32</ChecksumAlgorithm>\
+                     <ChecksumType>FULL_OBJECT</ChecksumType><Size>1</Size>\
+                     <Owner><ID>{owner_id}</ID></Owner>\
+                     <StorageClass>STANDARD</StorageClass></Contents></ListBucketResult>",
+                )
+                .sub("bucket", bucket.as_str()),
+        );
+
+        delete_all_and_bucket(client, &bucket, &["aaa".to_string(), "zzz".to_string()]).await;
+    });
+}
+
+#[test]
+fn test_list_objects_v2_response_shape() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
+        for key in ["aaa", "zzz"] {
+            s3_tests::put_object_retrying_operation_aborted(client, &bucket, key, b"x".to_vec())
+                .await;
+        }
+
+        // Truncated v2: continuation token is endpoint-opaque, Contents
+        // carry no Owner.
+        let response = raw_bucket("GET", &bucket, Some("list-type=2&max-keys=1"));
+        assert_shape(
+            "ListObjectsV2 shape",
+            &response,
+            &shape()
+                .status(200)
+                .headers(xml_response_headers())
+                .header("x-amz-bucket-region", CTX.region())
+                .body(
+                    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<ListBucketResult \
+                     xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Name>{bucket}</Name>\
+                     <Prefix></Prefix><NextContinuationToken>{any}</NextContinuationToken>\
+                     <KeyCount>1</KeyCount><MaxKeys>1</MaxKeys><IsTruncated>true</IsTruncated>\
+                     <Contents><Key>aaa</Key><LastModified>{iso8601}</LastModified>\
+                     <ETag>{etag}</ETag><ChecksumAlgorithm>CRC32</ChecksumAlgorithm>\
+                     <ChecksumType>FULL_OBJECT</ChecksumType><Size>1</Size>\
+                     <StorageClass>STANDARD</StorageClass></Contents></ListBucketResult>",
+                )
+                .sub("bucket", bucket.as_str()),
+        );
+
+        delete_all_and_bucket(client, &bucket, &["aaa".to_string(), "zzz".to_string()]).await;
     });
 }

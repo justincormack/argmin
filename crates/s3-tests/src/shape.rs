@@ -737,6 +737,35 @@ pub fn xml_response_headers() -> Vec<(&'static str, &'static str)> {
     headers
 }
 
+/// Assert that `body` consists of exactly `envelope_template` plus the
+/// repeated `<tag>…</tag>` blocks, which are matched unordered against
+/// `block_templates`. The matched blocks are removed and the remainder must
+/// match the envelope exactly, so unexpected sibling elements fail.
+pub fn assert_body_with_unordered_blocks(
+    operation: &str,
+    body: &str,
+    envelope_template: &str,
+    tag: &str,
+    block_templates: &[String],
+    subs: &BTreeMap<String, String>,
+) {
+    assert_unordered_xml_blocks(operation, body, tag, block_templates, subs);
+    let mut remaining = body.to_string();
+    for block in extract_xml_blocks(body, tag) {
+        remaining = remaining.replacen(block, "", 1);
+    }
+    let mut captures = BTreeMap::new();
+    if let Err(message) = match_template(
+        &format!("{operation}: envelope"),
+        envelope_template,
+        &remaining,
+        subs,
+        &mut captures,
+    ) {
+        panic!("{message}");
+    }
+}
+
 /// The standard header set for an S3 XML error response. Extend per test
 /// where AWS adds operation-specific headers.
 pub fn error_response_headers() -> Vec<(&'static str, &'static str)> {
@@ -1169,6 +1198,32 @@ mod tests {
         match_template("test", &template, &body, &BTreeMap::new(), &mut captures)
             .expect("builder output should be a valid template");
         assert_eq!(captures["request_id"], REQUEST_ID);
+    }
+
+    #[test]
+    fn body_with_unordered_blocks_rejects_extra_siblings() {
+        let envelope = "<DeleteResult></DeleteResult>";
+        let blocks = ["<Deleted><Key>a</Key></Deleted>".to_string()];
+        assert_body_with_unordered_blocks(
+            "test",
+            "<DeleteResult><Deleted><Key>a</Key></Deleted></DeleteResult>",
+            envelope,
+            "Deleted",
+            &blocks,
+            &BTreeMap::new(),
+        );
+        let result = std::panic::catch_unwind(|| {
+            let _guard = SuppressExpectedPanicOutput::new();
+            assert_body_with_unordered_blocks(
+                "test",
+                "<DeleteResult><Deleted><Key>a</Key></Deleted><Extra/></DeleteResult>",
+                envelope,
+                "Deleted",
+                &blocks,
+                &BTreeMap::new(),
+            );
+        });
+        assert!(result.is_err(), "extra sibling element must fail");
     }
 
     #[test]

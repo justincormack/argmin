@@ -22,8 +22,12 @@ use bytes::Bytes;
 use http_body_1x::{Body, Frame, SizeHint};
 use s3_tests::{
     assert_s3_err_code, copy_source_with_version, err_status, is_sdk_stream_disconnect_or_status,
-    object_url, raw_object_query, send_signed_request, send_signed_request_with_credentials,
-    shape::{assert_shape, error_response_headers, expected_error, shape, xml_tag_text},
+    object_url, raw_bucket, raw_object_query, send_signed_request,
+    send_signed_request_with_credentials,
+    shape::{
+        assert_shape, error_response_headers, expected_error, shape, xml_response_headers,
+        xml_tag_text,
+    },
     unique_bucket, RawResponse, SendRetryingOperationAborted, SignedRequestCredentials, CTX,
 };
 
@@ -4803,6 +4807,49 @@ fn test_upload_part_copy_source_if_match_failed_error_shape() {
         s3_tests::delete_object_retrying_operation_aborted(client, &bucket, src_key)
             .await
             .expect("delete if-match source");
+        s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
+    });
+}
+
+#[test]
+fn test_list_multipart_uploads_response_shape() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
+
+        let (_, upload_a) = raw_create_upload(&bucket, "mpu-a.txt", &[]);
+        let (_, upload_b) = raw_create_upload(&bucket, "mpu-b.txt", &[]);
+
+        // Truncated at 1: only upload a is listed and the markers point at
+        // it. Initiator ID is endpoint-specific (an ARN on AWS, a canonical
+        // ID locally); Owner ID is the canonical owner everywhere.
+        let response = raw_bucket("GET", &bucket, Some("uploads=&max-uploads=1"));
+        assert_shape(
+            "ListMultipartUploads shape",
+            &response,
+            &shape()
+                .status(200)
+                .headers(xml_response_headers())
+                .body(
+                    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+                     <ListMultipartUploadsResult \
+                     xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Bucket>{bucket}</Bucket>\
+                     <KeyMarker></KeyMarker><UploadIdMarker></UploadIdMarker>\
+                     <NextKeyMarker>mpu-a.txt</NextKeyMarker>\
+                     <NextUploadIdMarker>{upload_a}</NextUploadIdMarker>\
+                     <MaxUploads>1</MaxUploads><IsTruncated>true</IsTruncated>\
+                     <Upload><Key>mpu-a.txt</Key><UploadId>{upload_a}</UploadId>\
+                     <Initiator><ID>{any}</ID><DisplayName>{any}</DisplayName></Initiator>\
+                     <Owner><ID>{owner_id}</ID></Owner><StorageClass>STANDARD</StorageClass>\
+                     <Initiated>{iso8601}</Initiated></Upload></ListMultipartUploadsResult>",
+                )
+                .sub("bucket", bucket.as_str())
+                .sub("upload_a", upload_a.as_str()),
+        );
+
+        raw_abort_upload(&bucket, "mpu-a.txt", &upload_a);
+        raw_abort_upload(&bucket, "mpu-b.txt", &upload_b);
         s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
     });
 }
