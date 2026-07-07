@@ -144,6 +144,56 @@ Required constraints:
 Future production work may replace this with per-node credentials or mTLS, but
 the frame contract should not assume the credential is symmetric.
 
+## Implementation Sequence
+
+The implementation should land as reviewable slices that establish the shared
+contract before wiring it into any one transport. Raft peer RPCs remain the
+first enforcement target, but the code shape should be reusable by storage-node,
+frontend, admin, and runtime-map paths.
+
+1. **Auth model types.** Add the shared internal principal enum, role/operation
+   kind, credential id/version, cluster binding, auth decision, and auth
+   rejection reason types. This slice should be pure data plus validation
+   helpers and should not depend on OpenRaft or Unix transport code.
+2. **Canonical envelope codec.** Add a versioned auth envelope codec that wraps
+   or covers existing payload bytes without replacing the existing CRC and
+   structural frame validation. Tests should cover round-trip, unknown version,
+   unknown role/operation tags, truncation, trailing bytes, and malformed
+   principal encodings.
+3. **Scoped symmetric credential provider.** Add signing and verification
+   helpers for explicitly scoped credentials. Callers should receive credentials
+   for the role/principal they are performing, not a generic cluster-root helper
+   that can mint arbitrary roles. This slice also defines experimental config
+   names and the no-secret-in-status/artifacts/logs boundary.
+4. **Raft peer transport enforcement.** Wrap or cover append, vote, pre-vote,
+   snapshot, and transfer-leader peer payloads with the shared envelope. Verify
+   auth after structural frame decode and identity-frame validation, but before
+   OpenRaft dispatch or any checkpoint mutation. Responses should carry the
+   reverse authenticated identity.
+5. **Raft replay/freshness rules.** Document and test the per-RPC replay
+   policy. Append/vote/pre-vote/snapshot can rely primarily on OpenRaft
+   term/log fences plus credential epoch binding. Transfer-leader needs an
+   explicit short freshness bound, nonce/sequence rule, or strict
+   current-leader/current-term/current-membership fence before it is counted as
+   replay-hardened.
+6. **Observability.** Expose auth requirement mode and accepted/rejected
+   counters by role, operation class, and rejection reason. Status/debug output
+   may include credential id/version and compact counters, but never raw
+   secrets, MACs, or full payloads.
+7. **Process-level Raft tests.** Add tests proving missing auth, wrong cluster,
+   wrong source, wrong target, wrong role, bad MAC, payload bitflip, stale or
+   unknown credential id, and transfer-leader replay/fence failures are rejected
+   before OpenRaft dispatch and before checkpoint mutation.
+8. **Closeout and deferred paths.** Close the Phase 12.4 auth slice only once
+   Raft peer RPCs enforce authenticated configured peer identity. Storage-node
+   heartbeat/refresh, frontend runtime-map reads, admin RPCs, and authenticated
+   runtime-map responses remain later Phase 12 / production-cutover work unless
+   explicitly pulled into scope.
+
+The first implementation slice should start with items 1 and 2 if they remain
+small enough to review together. Raft transport wiring should wait until the
+standalone envelope and fail-closed codec tests are in place.
+
 ## Path-Specific Enforcement Order
 
 ### Slice A: Raft Peer RPCs
