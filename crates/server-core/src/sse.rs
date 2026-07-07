@@ -35,7 +35,6 @@ struct AeadDescriptor<'a> {
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct SseCustomerRequest {
-    algorithm: String,
     customer_key: [u8; SSE_C_CUSTOMER_KEY_LEN],
     customer_key_md5_b64: String,
 }
@@ -44,21 +43,14 @@ impl SseCustomerRequest {
     #[must_use]
     pub fn new(customer_key: [u8; SSE_C_CUSTOMER_KEY_LEN], customer_key_md5_b64: String) -> Self {
         Self {
-            algorithm: SSE_CUSTOMER_ALGORITHM.to_string(),
             customer_key,
             customer_key_md5_b64,
         }
     }
 
     #[must_use]
-    pub fn with_algorithm(mut self, algorithm: String) -> Self {
-        self.algorithm = algorithm;
-        self
-    }
-
-    #[must_use]
     pub fn algorithm(&self) -> &str {
-        &self.algorithm
+        SSE_CUSTOMER_ALGORITHM
     }
 
     #[must_use]
@@ -77,7 +69,7 @@ impl SseCustomerRequest {
 impl fmt::Debug for SseCustomerRequest {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("SseCustomerRequest")
-            .field("algorithm", &observability::escaped(&self.algorithm))
+            .field("algorithm", &SSE_CUSTOMER_ALGORITHM)
             .field(
                 "customer_key_md5_b64",
                 &observability::redacted("sse_customer_key_md5"),
@@ -1431,10 +1423,9 @@ mod tests {
 
     #[test]
     fn debug_redacts_sse_customer_material() {
-        let request = SseCustomerRequest::new([7u8; SSE_C_CUSTOMER_KEY_LEN], "md5-value".into())
-            .with_algorithm("AES256\n".into());
+        let request = SseCustomerRequest::new([7u8; SSE_C_CUSTOMER_KEY_LEN], "md5-value".into());
         let request_debug = format!("{request:?}");
-        assert!(request_debug.contains(r#""AES256\n""#));
+        assert!(request_debug.contains("AES256"));
         assert!(request_debug.contains("<redacted:sse_customer_key_md5>"));
         assert!(!request_debug.contains("md5-value"));
 

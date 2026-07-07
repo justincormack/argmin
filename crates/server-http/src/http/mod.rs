@@ -5056,13 +5056,10 @@ fn parse_sse_customer_request_with_names(
         return Err(sse_customer_key_md5_mismatch_error());
     }
 
-    Ok(Some(
-        SseCustomerRequest::new(
-            customer_key_bytes,
-            base64::engine::general_purpose::STANDARD.encode(actual_md5_bytes),
-        )
-        .with_algorithm(algorithm.to_string()),
-    ))
+    Ok(Some(SseCustomerRequest::new(
+        customer_key_bytes,
+        base64::engine::general_purpose::STANDARD.encode(actual_md5_bytes),
+    )))
 }
 
 fn parse_sse_customer_request(req: &S3Request) -> Result<Option<SseCustomerRequest>, ServerError> {
@@ -5168,13 +5165,10 @@ fn parse_sse_customer_form_fields(
         return Err(sse_customer_key_md5_mismatch_error());
     }
 
-    Ok(Some(
-        SseCustomerRequest::new(
-            customer_key_bytes,
-            base64::engine::general_purpose::STANDARD.encode(actual_md5_bytes),
-        )
-        .with_algorithm(algorithm.to_string()),
-    ))
+    Ok(Some(SseCustomerRequest::new(
+        customer_key_bytes,
+        base64::engine::general_purpose::STANDARD.encode(actual_md5_bytes),
+    )))
 }
 
 fn parse_sse_customer_copy_source_request(

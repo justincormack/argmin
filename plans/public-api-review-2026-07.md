@@ -18,7 +18,7 @@ smaller per-crate items.
 
 ## Status
 
-In progress. A1-A10, S1-S4, S6, K1-K4, H1-H8, all of P1/P2, the first three
+In progress. A1-A10, S1-S4, S6, K1-K4, H1-H8, all of P1/P2, the first four
 P3 items, and all re-review items RR1-RR16 are done. A verification pass on
 2026-07-06 confirmed all 16 RR fixes against the code (workspace
 `cargo check --all-targets` clean; auth crate 454 unit tests pass; targeted
@@ -903,9 +903,12 @@ each is one refactor away from a panic:
   add `StorageNodeProcessConfig::new(StorageNodeProcessConfigParts)` with route
   table validation, move the external `argmin-s3` construction path through the
   validating constructor, and expose read-only accessors for external callers.
-- [ ] `SseCustomerRequest::with_algorithm` accepts any string, breaking the
+- [x] `SseCustomerRequest::with_algorithm` accepts any string, breaking the
   AES256 pin that `new()` establishes (`sse.rs:54-57`); validation lives only
-  in server-http (callers `mod.rs:5005, 5117`). Drop it or make it fallible.
+  in server-http (callers `mod.rs:5005, 5117`). Resolution: remove the setter
+  and make the algorithm implicit in the core type; HTTP parsing still rejects
+  non-`AES256` inputs before constructing `SseCustomerRequest`, while
+  `algorithm()` returns the canonical constant.
 - [ ] `WriteEncryptionRequest::from_request_parts` has
   `unreachable!` on conflicting SSE-C+SSE-S3 inputs
   (`coordinator/request_types.rs:317-326`) — invariant enforced in a
