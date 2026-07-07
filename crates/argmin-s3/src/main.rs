@@ -31,15 +31,21 @@ use storage::control_plane::{
     FencedPgMetadataTransferSnapshot, FileControlPlaneStore, PgMetadataProof,
     PgMetadataTransferProof, PgRouteSnapshot, SingleAuthorityControlPlane, UnixControlPlaneClient,
 };
+use storage::control_plane_auth::{
+    ControlPlaneAuthOperation, ControlPlaneAuthPrincipal, ControlPlaneScopedCredential,
+    ControlPlaneScopedCredentialInput, ControlPlaneScopedCredentialStore,
+};
 use storage::control_plane_command::{ControlPlaneCommand, ControlPlaneCommandResponse};
 use storage::control_plane_raft::{
+    decode_control_plane_raft_peer_request_auth_operation,
     decode_control_plane_raft_peer_request_frame_identity,
     decode_control_plane_raft_peer_request_frame_kind, durable_artifact_wal_path,
     handle_control_plane_raft_peer_rpc_frame, handle_control_plane_raft_peer_snapshot_frame,
     read_control_plane_raft_peer_transport_frame, write_control_plane_raft_peer_transport_frame,
     ControlPlaneRaftAuthority, ControlPlaneRaftAuthorityStatus, ControlPlaneRaftCommandOutcome,
-    ControlPlaneRaftNodeId, ControlPlaneRaftPeerFrameIdentity, ControlPlaneRaftPeerFrameKind,
-    ControlPlaneRaftPeerTransportLimits, ControlPlaneRaftPeerTransportPolicy,
+    ControlPlaneRaftNodeId, ControlPlaneRaftPeerAuthPolicy, ControlPlaneRaftPeerFrameIdentity,
+    ControlPlaneRaftPeerFrameKind, ControlPlaneRaftPeerTransportLimits,
+    ControlPlaneRaftPeerTransportPolicy,
 };
 use storage::storage_node_server::{
     advance_storage_node_incarnation, StorageNodeControlPlaneRefreshLoop, StorageNodeDataDirGuard,
@@ -1844,13 +1850,63 @@ fn build_experimental_raft_peer_transport_policy(
             .map(|entry| (entry.node_id, entry.socket_path.clone()))
             .collect()
     };
-    Ok(Some(
-        ControlPlaneRaftPeerTransportPolicy::from_peer_endpoints(
-            cluster_name.to_string(),
-            peer_endpoints,
-            ControlPlaneRaftPeerTransportLimits::default(),
-        ),
-    ))
+    let mut policy = ControlPlaneRaftPeerTransportPolicy::from_peer_endpoints(
+        cluster_name.to_string(),
+        peer_endpoints,
+        ControlPlaneRaftPeerTransportLimits::default(),
+    );
+    if let Some(auth_policy) =
+        build_experimental_raft_peer_auth_policy(config, cluster_name, local_node_id)?
+    {
+        policy = policy.with_auth_policy(auth_policy);
+    }
+    Ok(Some(policy))
+}
+
+fn build_experimental_raft_peer_auth_policy(
+    config: &ServerConfig,
+    cluster_name: &str,
+    local_node_id: ControlPlaneRaftNodeId,
+) -> Result<Option<ControlPlaneRaftPeerAuthPolicy>, String> {
+    if config.control_plane_raft_auth_credentials.is_empty() {
+        return Ok(None);
+    }
+
+    let mut local_credential = None;
+    let mut credentials = Vec::new();
+    for configured in &config.control_plane_raft_auth_credentials {
+        let credential = ControlPlaneScopedCredential::new(ControlPlaneScopedCredentialInput {
+            cluster_id: cluster_name.to_string(),
+            credential_id: configured.credential_id.clone(),
+            credential_version: configured.credential_version,
+            principal: ControlPlaneAuthPrincipal::RaftPeer {
+                node_id: configured.node_id,
+            },
+            secret: configured.secret.as_str().as_bytes().to_vec(),
+        })
+        .map_err(|error| {
+            format!(
+                "invalid ARGMIN_CONTROL_PLANE_RAFT_AUTH_CREDENTIALS scoped credential for node {}: {error}",
+                configured.node_id
+            )
+        })?;
+        if configured.node_id == local_node_id {
+            local_credential = Some(credential.clone());
+        }
+        credentials.push(credential);
+    }
+
+    let local_credential = local_credential.ok_or_else(|| {
+        format!("ARGMIN_CONTROL_PLANE_RAFT_AUTH_CREDENTIALS must include local Raft node id {local_node_id}")
+    })?;
+    let verifier = ControlPlaneScopedCredentialStore::new(credentials).map_err(|error| {
+        format!("invalid ARGMIN_CONTROL_PLANE_RAFT_AUTH_CREDENTIALS credential set: {error}")
+    })?;
+    ControlPlaneRaftPeerAuthPolicy::new(local_credential, verifier)
+        .map(Some)
+        .map_err(|error| {
+            format!("invalid ARGMIN_CONTROL_PLANE_RAFT_AUTH_CREDENTIALS auth policy: {error}")
+        })
 }
 
 fn experimental_raft_startup_requires_local_leader(
@@ -2061,6 +2117,14 @@ enum ExperimentalRaftPeerRpcWorkerError {
     Checkpoint(ControlPlaneError),
 }
 
+#[derive(Clone, Copy)]
+struct ExperimentalRaftValidatedPeerRequest<'a> {
+    frame: &'a [u8],
+    kind: ControlPlaneRaftPeerFrameKind,
+    identity: &'a ControlPlaneRaftPeerFrameIdentity,
+    operation: ControlPlaneAuthOperation,
+}
+
 fn handle_experimental_raft_peer_rpc_before_ack(
     runtime: &Handle,
     authority: &ControlPlaneRaftAuthority,
@@ -2085,12 +2149,42 @@ fn handle_experimental_raft_peer_rpc_before_ack(
         })
         .map_err(ExperimentalRaftPeerRpcWorkerError::PeerRpc)?;
 
-    let request_frame =
+    let received_frame =
         read_control_plane_raft_peer_transport_frame(stream, policy.limits().max_frame_bytes)
             .map_err(ExperimentalRaftPeerRpcWorkerError::PeerRpc)?;
+    let request_frame = if let Some(auth_policy) = policy.auth_policy() {
+        let envelope = storage::control_plane_auth::ControlPlaneAuthEnvelope::decode_frame(
+            &received_frame,
+            policy.limits().max_frame_bytes,
+        )
+        .map_err(ExperimentalRaftPeerRpcWorkerError::PeerRpc)?;
+        let request_frame = envelope.payload().to_vec();
+        let operation = decode_control_plane_raft_peer_request_auth_operation(&request_frame)
+            .map_err(ExperimentalRaftPeerRpcWorkerError::PeerRpc)?;
+        let identity = decode_control_plane_raft_peer_request_frame_identity(&request_frame)
+            .map_err(ExperimentalRaftPeerRpcWorkerError::PeerRpc)?;
+        policy
+            .validate_incoming_frame_identity(&identity, local_node_id)
+            .map_err(|error| ControlPlaneError::RpcProtocol {
+                message: error.to_string(),
+            })
+            .map_err(ExperimentalRaftPeerRpcWorkerError::PeerRpc)?;
+        auth_policy
+            .verify_peer_frame(
+                &received_frame,
+                &identity,
+                operation,
+                policy.limits().max_frame_bytes,
+            )
+            .map_err(ExperimentalRaftPeerRpcWorkerError::PeerRpc)?
+    } else {
+        received_frame
+    };
     let frame_kind = decode_control_plane_raft_peer_request_frame_kind(&request_frame)
         .map_err(ExperimentalRaftPeerRpcWorkerError::PeerRpc)?;
     let identity = decode_control_plane_raft_peer_request_frame_identity(&request_frame)
+        .map_err(ExperimentalRaftPeerRpcWorkerError::PeerRpc)?;
+    let operation = decode_control_plane_raft_peer_request_auth_operation(&request_frame)
         .map_err(ExperimentalRaftPeerRpcWorkerError::PeerRpc)?;
     policy
         .validate_incoming_frame_identity(&identity, local_node_id)
@@ -2102,9 +2196,12 @@ fn handle_experimental_raft_peer_rpc_before_ack(
     let response_frame = handle_experimental_raft_peer_rpc_validated_frame_before_ack(
         runtime,
         authority,
-        &request_frame,
-        frame_kind,
-        &identity,
+        ExperimentalRaftValidatedPeerRequest {
+            frame: &request_frame,
+            kind: frame_kind,
+            identity: &identity,
+            operation,
+        },
         policy,
         durability,
     )?;
@@ -2116,34 +2213,52 @@ fn handle_experimental_raft_peer_rpc_before_ack(
 fn handle_experimental_raft_peer_rpc_validated_frame_before_ack(
     runtime: &Handle,
     authority: &ControlPlaneRaftAuthority,
-    request_frame: &[u8],
-    frame_kind: ControlPlaneRaftPeerFrameKind,
-    identity: &ControlPlaneRaftPeerFrameIdentity,
+    request: ExperimentalRaftValidatedPeerRequest<'_>,
     policy: &ControlPlaneRaftPeerTransportPolicy,
     durability: ExperimentalRaftPeerRpcDurability<'_>,
 ) -> Result<Vec<u8>, ExperimentalRaftPeerRpcWorkerError> {
     ensure_experimental_raft_peer_not_durably_poisoned(durability.poison_gate)?;
-    let response_frame = block_on_control_plane_raft(runtime, async {
-        match frame_kind {
+    let raw_response_frame = block_on_control_plane_raft(runtime, async {
+        match request.kind {
             ControlPlaneRaftPeerFrameKind::OrdinaryRpc => {
-                handle_control_plane_raft_peer_rpc_frame(authority.raft(), request_frame, identity)
-                    .await
+                handle_control_plane_raft_peer_rpc_frame(
+                    authority.raft(),
+                    request.frame,
+                    request.identity,
+                )
+                .await
             }
             ControlPlaneRaftPeerFrameKind::Snapshot => {
                 handle_control_plane_raft_peer_snapshot_frame(
                     authority.raft(),
-                    request_frame,
+                    request.frame,
                     policy.limits().max_frame_bytes,
                     policy.limits().max_snapshot_bytes,
-                    identity,
+                    request.identity,
                 )
                 .await
             }
         }
-    });
+    })
+    .map_err(ExperimentalRaftPeerRpcWorkerError::PeerRpc)?;
+    let response_frame = if let Some(auth_policy) = policy.auth_policy() {
+        auth_policy
+            .sign_peer_frame(
+                &ControlPlaneRaftPeerFrameIdentity::new(
+                    request.identity.cluster_name.clone(),
+                    request.identity.target,
+                    request.identity.source,
+                ),
+                request.operation,
+                raw_response_frame,
+            )
+            .map_err(ExperimentalRaftPeerRpcWorkerError::PeerRpc)?
+    } else {
+        raw_response_frame
+    };
 
     let checkpoint_before_response = durability.checkpoint_ordinary_rpc
-        || matches!(frame_kind, ControlPlaneRaftPeerFrameKind::Snapshot);
+        || matches!(request.kind, ControlPlaneRaftPeerFrameKind::Snapshot);
     if checkpoint_before_response {
         let Some(path) = durability.artifact_path else {
             return Err(ExperimentalRaftPeerRpcWorkerError::Checkpoint(
@@ -2165,7 +2280,7 @@ fn handle_experimental_raft_peer_rpc_validated_frame_before_ack(
     }
 
     ensure_experimental_raft_peer_not_durably_poisoned(durability.poison_gate)?;
-    response_frame.map_err(ExperimentalRaftPeerRpcWorkerError::PeerRpc)
+    Ok(response_frame)
 }
 
 fn ensure_experimental_raft_peer_not_durably_poisoned(
@@ -2418,12 +2533,13 @@ fn run_experimental_raft_control_plane_process(config: &ServerConfig) -> ! {
         .as_deref()
         .unwrap_or("-");
     process_info!(
-        "argmin-s3 experimental durable OpenRaft control-plane manager using state {} on {} (raft node {}, peer socket {}, configured peers {}, lease scan {} ms)",
+        "argmin-s3 experimental durable OpenRaft control-plane manager using state {} on {} (raft node {}, peer socket {}, configured peers {}, configured auth credentials {}, lease scan {} ms)",
         state_path,
         socket_path,
         node_id,
         raft_peer_socket_path,
         config.control_plane_raft_peer_sockets.len(),
+        config.control_plane_raft_auth_credentials.len(),
         config.control_plane_lease_scan_interval.as_millis()
     );
 
@@ -3633,6 +3749,7 @@ mod tests {
             control_plane_raft_node_id: None,
             control_plane_raft_peer_socket_path: None,
             control_plane_raft_peer_sockets: Vec::new(),
+            control_plane_raft_auth_credentials: Vec::new(),
             control_plane_lease_scan_interval: std::time::Duration::from_millis(250),
             control_plane_refresh_interval: std::time::Duration::from_millis(250),
             control_plane_heartbeat_lease_duration: std::time::Duration::from_millis(1000),
@@ -4726,6 +4843,8 @@ mod tests {
         let decoded_identity =
             decode_control_plane_raft_peer_request_frame_identity(&request_frame)
                 .expect("request identity should decode");
+        let operation = decode_control_plane_raft_peer_request_auth_operation(&request_frame)
+            .expect("request operation should decode");
         policy
             .validate_incoming_frame_identity(&decoded_identity, 1)
             .expect("request identity should validate");
@@ -4738,9 +4857,12 @@ mod tests {
         let result = handle_experimental_raft_peer_rpc_validated_frame_before_ack(
             harness.runtime.handle(),
             &harness.authority,
-            &request_frame,
-            frame_kind,
-            &decoded_identity,
+            ExperimentalRaftValidatedPeerRequest {
+                frame: &request_frame,
+                kind: frame_kind,
+                identity: &decoded_identity,
+                operation,
+            },
             &policy,
             ExperimentalRaftPeerRpcDurability {
                 artifact_path: None,

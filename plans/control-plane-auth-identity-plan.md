@@ -214,8 +214,23 @@ Status:
   target, and operation before checking the MAC. Tests cover accepted frames,
   wrong cluster/source/target/role, unknown and stale credential versions,
   issued/expiry time failures, payload tampering, wrong secrets, duplicate
-  scoped credentials, and redacted secret debug output. Process configuration
-  names and Raft transport enforcement remain next.
+  scoped credentials, and redacted secret debug output.
+- 2026-07-07: Added experimental Raft peer-auth process configuration via
+  `ARGMIN_CONTROL_PLANE_RAFT_AUTH_CREDENTIALS`
+  (`node_id=credential_id:version:secret,...`). Configuration requires an
+  explicit Raft cluster name, validates exact local/peer-node coverage against
+  the configured peer map, rejects malformed or duplicate entries, and exposes
+  only a no-secret configured credential count in process startup output.
+  Transport enforcement starts in the following slice.
+- 2026-07-07: Started item 4 by adding optional authenticated Raft peer
+  transport envelopes. When scoped credentials are configured, outbound
+  append/vote/pre-vote/snapshot/transfer-leader peer frames are signed as the
+  local `RaftPeer` principal over the existing versioned+CRC peer frame bytes,
+  and inbound requests/responses are verified against the configured cluster,
+  source node, target node, and operation before OpenRaft dispatch or response
+  decode. Existing unauthenticated peer paths remain available when no
+  credentials are configured. Process-level negative coverage for wrong
+  cluster/source/target/MAC and transfer-leader freshness remains next.
 
 ## Path-Specific Enforcement Order
 

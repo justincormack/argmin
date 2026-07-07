@@ -45,6 +45,25 @@ pub(crate) struct ConfiguredControlPlaneRaftPeerSocket {
     pub(crate) socket_path: String,
 }
 
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct ConfiguredControlPlaneRaftAuthCredential {
+    pub(crate) node_id: u64,
+    pub(crate) credential_id: String,
+    pub(crate) credential_version: u64,
+    pub(crate) secret: SecretConfigValue,
+}
+
+impl fmt::Debug for ConfiguredControlPlaneRaftAuthCredential {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ConfiguredControlPlaneRaftAuthCredential")
+            .field("node_id", &self.node_id)
+            .field("credential_id", &self.credential_id)
+            .field("credential_version", &self.credential_version)
+            .field("secret", &self.secret)
+            .finish()
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ConfiguredCredentialProfile {
     Standard,
@@ -61,7 +80,7 @@ pub(crate) struct ConfiguredCredential {
     pub(crate) authorization_profile: ConfiguredCredentialProfile,
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub(crate) struct SecretConfigValue(String);
 
 impl SecretConfigValue {
@@ -105,6 +124,7 @@ pub(crate) struct ServerConfig {
     pub(crate) control_plane_raft_node_id: Option<u64>,
     pub(crate) control_plane_raft_peer_socket_path: Option<String>,
     pub(crate) control_plane_raft_peer_sockets: Vec<ConfiguredControlPlaneRaftPeerSocket>,
+    pub(crate) control_plane_raft_auth_credentials: Vec<ConfiguredControlPlaneRaftAuthCredential>,
     pub(crate) control_plane_lease_scan_interval: Duration,
     pub(crate) control_plane_refresh_interval: Duration,
     pub(crate) control_plane_heartbeat_lease_duration: Duration,
@@ -153,6 +173,7 @@ impl ServerConfig {
     ///   `ARGMIN_CONTROL_PLANE_RAFT_NODE_ID` (1 when experimental Raft is enabled)
     ///   `ARGMIN_CONTROL_PLANE_RAFT_PEER_SOCKET_PATH` (optional local experimental Raft peer socket)
     ///   `ARGMIN_CONTROL_PLANE_RAFT_PEER_SOCKETS` (`node_id=/absolute/socket,...`, optional experimental Raft peer map)
+    ///   `ARGMIN_CONTROL_PLANE_RAFT_AUTH_CREDENTIALS` (`node_id=credential_id:version:secret,...`, optional experimental Raft peer auth credentials)
     ///   `ARGMIN_CONTROL_PLANE_LEASE_SCAN_MS` (250)
     ///   `ARGMIN_CONTROL_PLANE_REFRESH_MS` (250)
     ///   `ARGMIN_CONTROL_PLANE_HEARTBEAT_LEASE_MS` (1000)
@@ -326,6 +347,9 @@ impl ServerConfig {
             None => None,
         };
         let control_plane_raft_peer_socket_path = get("ARGMIN_CONTROL_PLANE_RAFT_PEER_SOCKET_PATH");
+        let control_plane_raft_auth_credentials = parse_control_plane_raft_auth_credentials(get(
+            "ARGMIN_CONTROL_PLANE_RAFT_AUTH_CREDENTIALS",
+        ))?;
         let control_plane_lease_scan_ms: u64 = get("ARGMIN_CONTROL_PLANE_LEASE_SCAN_MS")
             .unwrap_or_else(|| "250".to_string())
             .parse()
@@ -465,7 +489,8 @@ impl ServerConfig {
             && (control_plane_raft_cluster_name.is_some()
                 || control_plane_raft_node_id.is_some()
                 || control_plane_raft_peer_socket_path.is_some()
-                || !control_plane_raft_peer_sockets.is_empty())
+                || !control_plane_raft_peer_sockets.is_empty()
+                || !control_plane_raft_auth_credentials.is_empty())
         {
             return Err(
                 "ARGMIN_CONTROL_PLANE_RAFT_* requires ARGMIN_CONTROL_PLANE_EXPERIMENTAL_RAFT"
@@ -530,6 +555,22 @@ impl ServerConfig {
                     "ARGMIN_CONTROL_PLANE_RAFT_PEER_SOCKETS entry for local Raft node {local_node_id} must match ARGMIN_CONTROL_PLANE_RAFT_PEER_SOCKET_PATH"
                 ));
             }
+        }
+        if !control_plane_raft_auth_credentials.is_empty() {
+            if control_plane_raft_cluster_name.is_none() {
+                return Err(
+                    "ARGMIN_CONTROL_PLANE_RAFT_AUTH_CREDENTIALS requires ARGMIN_CONTROL_PLANE_RAFT_CLUSTER_NAME"
+                        .to_string(),
+                );
+            }
+            let local_node_id = control_plane_raft_node_id.expect(
+                "experimental raft node id is set when experimental raft config is enabled",
+            );
+            validate_control_plane_raft_auth_credentials_match_peer_policy(
+                local_node_id,
+                &control_plane_raft_peer_sockets,
+                &control_plane_raft_auth_credentials,
+            )?;
         }
         if control_plane_lease_scan_interval.is_zero() {
             return Err("ARGMIN_CONTROL_PLANE_LEASE_SCAN_MS must be > 0".to_string());
@@ -616,6 +657,7 @@ impl ServerConfig {
             control_plane_raft_node_id,
             control_plane_raft_peer_socket_path,
             control_plane_raft_peer_sockets,
+            control_plane_raft_auth_credentials,
             control_plane_lease_scan_interval,
             control_plane_refresh_interval,
             control_plane_heartbeat_lease_duration,
@@ -845,6 +887,125 @@ fn parse_control_plane_raft_peer_sockets(
         .collect();
     entries.sort_by_key(|entry| entry.node_id);
     Ok(entries)
+}
+
+fn parse_control_plane_raft_auth_credentials(
+    value: Option<String>,
+) -> Result<Vec<ConfiguredControlPlaneRaftAuthCredential>, String> {
+    let Some(value) = value else {
+        return Ok(Vec::new());
+    };
+    if value.trim().is_empty() {
+        return Err("ARGMIN_CONTROL_PLANE_RAFT_AUTH_CREDENTIALS must not be empty".to_string());
+    }
+
+    let mut by_node = HashMap::<u64, ConfiguredControlPlaneRaftAuthCredential>::new();
+    for raw in value.split(',') {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return Err(
+                "ARGMIN_CONTROL_PLANE_RAFT_AUTH_CREDENTIALS contains an empty entry".to_string(),
+            );
+        }
+        let (raw_node_id, raw_credential) = trimmed.split_once('=').ok_or_else(|| {
+            format!(
+                "ARGMIN_CONTROL_PLANE_RAFT_AUTH_CREDENTIALS entry {trimmed:?} must be node_id=credential_id:version:secret"
+            )
+        })?;
+        let node_id: u64 = raw_node_id.trim().parse().map_err(|e| {
+            format!(
+                "invalid ARGMIN_CONTROL_PLANE_RAFT_AUTH_CREDENTIALS node id {raw_node_id:?}: {e}"
+            )
+        })?;
+        if node_id == 0 {
+            return Err(
+                "ARGMIN_CONTROL_PLANE_RAFT_AUTH_CREDENTIALS node id must be > 0".to_string(),
+            );
+        }
+        let mut parts = raw_credential.splitn(3, ':');
+        let credential_id = parts.next().unwrap_or_default().trim();
+        let raw_version = parts.next().unwrap_or_default().trim();
+        let secret = parts.next().unwrap_or_default();
+        if credential_id.is_empty()
+            || !credential_id
+                .bytes()
+                .all(|b| b.is_ascii_graphic() && b != b',' && b != b':' && b != b'=')
+        {
+            return Err(format!(
+                "ARGMIN_CONTROL_PLANE_RAFT_AUTH_CREDENTIALS credential id for node {node_id} must be non-empty printable ASCII without ',', ':' or '='"
+            ));
+        }
+        let credential_version: u64 = raw_version.parse().map_err(|e| {
+            format!(
+                "invalid ARGMIN_CONTROL_PLANE_RAFT_AUTH_CREDENTIALS credential version {raw_version:?} for node {node_id}: {e}"
+            )
+        })?;
+        if credential_version == 0 {
+            return Err(format!(
+                "ARGMIN_CONTROL_PLANE_RAFT_AUTH_CREDENTIALS credential version for node {node_id} must be > 0"
+            ));
+        }
+        if secret.is_empty() || secret.contains(',') {
+            return Err(format!(
+                "ARGMIN_CONTROL_PLANE_RAFT_AUTH_CREDENTIALS secret for node {node_id} must be non-empty and must not contain ','"
+            ));
+        }
+        let entry = ConfiguredControlPlaneRaftAuthCredential {
+            node_id,
+            credential_id: credential_id.to_string(),
+            credential_version,
+            secret: SecretConfigValue::new(secret.to_string()),
+        };
+        if by_node.insert(node_id, entry).is_some() {
+            return Err(format!(
+                "ARGMIN_CONTROL_PLANE_RAFT_AUTH_CREDENTIALS contains duplicate node id {node_id}"
+            ));
+        }
+    }
+
+    let mut entries: Vec<ConfiguredControlPlaneRaftAuthCredential> =
+        by_node.into_values().collect();
+    entries.sort_by_key(|entry| entry.node_id);
+    Ok(entries)
+}
+
+fn validate_control_plane_raft_auth_credentials_match_peer_policy(
+    local_node_id: u64,
+    peer_sockets: &[ConfiguredControlPlaneRaftPeerSocket],
+    credentials: &[ConfiguredControlPlaneRaftAuthCredential],
+) -> Result<(), String> {
+    let credential_nodes: HashSet<u64> = credentials.iter().map(|entry| entry.node_id).collect();
+    if !credential_nodes.contains(&local_node_id) {
+        return Err(format!(
+            "ARGMIN_CONTROL_PLANE_RAFT_AUTH_CREDENTIALS must include local Raft node id {local_node_id}"
+        ));
+    }
+    if peer_sockets.is_empty() {
+        if credentials.len() != 1 {
+            return Err(
+                "ARGMIN_CONTROL_PLANE_RAFT_AUTH_CREDENTIALS without ARGMIN_CONTROL_PLANE_RAFT_PEER_SOCKETS may only include the local node"
+                    .to_string(),
+            );
+        }
+        return Ok(());
+    }
+
+    let peer_nodes: HashSet<u64> = peer_sockets.iter().map(|entry| entry.node_id).collect();
+    for peer_node_id in &peer_nodes {
+        if !credential_nodes.contains(peer_node_id) {
+            return Err(format!(
+                "ARGMIN_CONTROL_PLANE_RAFT_AUTH_CREDENTIALS must include configured Raft peer node id {peer_node_id}"
+            ));
+        }
+    }
+    for credential_node_id in &credential_nodes {
+        if !peer_nodes.contains(credential_node_id) {
+            return Err(format!(
+                "ARGMIN_CONTROL_PLANE_RAFT_AUTH_CREDENTIALS contains node id {credential_node_id} not present in ARGMIN_CONTROL_PLANE_RAFT_PEER_SOCKETS"
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn canonical_storage_node_socket_path(node_id: u32, socket_path: &str) -> Result<PathBuf, String> {
@@ -1493,12 +1654,72 @@ mod tests {
     }
 
     #[test]
+    fn experimental_raft_control_plane_parses_peer_auth_credentials() {
+        let cfg = ServerConfig::from_lookup(make_env(&[
+            ("ARGMIN_PROCESS_ROLE", "control-plane"),
+            ("ARGMIN_CONTROL_PLANE_STATE_PATH", "/tmp/argmin-cp.state"),
+            ("ARGMIN_CONTROL_PLANE_SOCKET_PATH", "/tmp/argmin-cp.sock"),
+            ("ARGMIN_CONTROL_PLANE_EXPERIMENTAL_RAFT", "true"),
+            ("ARGMIN_CONTROL_PLANE_RAFT_CLUSTER_NAME", "raft-cluster-a"),
+            ("ARGMIN_CONTROL_PLANE_RAFT_NODE_ID", "11"),
+            (
+                "ARGMIN_CONTROL_PLANE_RAFT_PEER_SOCKET_PATH",
+                "/tmp/argmin-cp-raft-11.sock",
+            ),
+            (
+                "ARGMIN_CONTROL_PLANE_RAFT_PEER_SOCKETS",
+                "12=/tmp/argmin-cp-raft-12.sock,11=/tmp/argmin-cp-raft-11.sock",
+            ),
+            (
+                "ARGMIN_CONTROL_PLANE_RAFT_AUTH_CREDENTIALS",
+                "12=raft-peer:7:peer-12-secret,11=raft-peer:7:peer-11-secret",
+            ),
+        ]))
+        .unwrap();
+
+        assert_eq!(
+            cfg.control_plane_raft_auth_credentials,
+            vec![
+                ConfiguredControlPlaneRaftAuthCredential {
+                    node_id: 11,
+                    credential_id: "raft-peer".to_string(),
+                    credential_version: 7,
+                    secret: SecretConfigValue::new("peer-11-secret".to_string()),
+                },
+                ConfiguredControlPlaneRaftAuthCredential {
+                    node_id: 12,
+                    credential_id: "raft-peer".to_string(),
+                    credential_version: 7,
+                    secret: SecretConfigValue::new("peer-12-secret".to_string()),
+                },
+            ]
+        );
+        let debug = format!("{cfg:?}");
+        assert!(!debug.contains("peer-11-secret"));
+        assert!(!debug.contains("peer-12-secret"));
+        assert!(debug.contains("config_secret"));
+    }
+
+    #[test]
     fn experimental_raft_control_plane_rejects_config_without_flag() {
         let err = ServerConfig::from_lookup(make_env(&[
             ("ARGMIN_PROCESS_ROLE", "control-plane"),
             ("ARGMIN_CONTROL_PLANE_STATE_PATH", "/tmp/argmin-cp.state"),
             ("ARGMIN_CONTROL_PLANE_SOCKET_PATH", "/tmp/argmin-cp.sock"),
             ("ARGMIN_CONTROL_PLANE_RAFT_NODE_ID", "11"),
+        ]))
+        .unwrap_err();
+
+        assert!(err.contains("ARGMIN_CONTROL_PLANE_RAFT_*"));
+
+        let err = ServerConfig::from_lookup(make_env(&[
+            ("ARGMIN_PROCESS_ROLE", "control-plane"),
+            ("ARGMIN_CONTROL_PLANE_STATE_PATH", "/tmp/argmin-cp.state"),
+            ("ARGMIN_CONTROL_PLANE_SOCKET_PATH", "/tmp/argmin-cp.sock"),
+            (
+                "ARGMIN_CONTROL_PLANE_RAFT_AUTH_CREDENTIALS",
+                "1=raft-peer:1:secret",
+            ),
         ]))
         .unwrap_err();
 
@@ -1578,6 +1799,89 @@ mod tests {
         ]))
         .unwrap_err();
         assert!(err.contains("must match ARGMIN_CONTROL_PLANE_RAFT_PEER_SOCKET_PATH"));
+    }
+
+    #[test]
+    fn experimental_raft_control_plane_rejects_invalid_peer_auth_config() {
+        let err = ServerConfig::from_lookup(make_env(&[
+            ("ARGMIN_PROCESS_ROLE", "control-plane"),
+            ("ARGMIN_CONTROL_PLANE_STATE_PATH", "/tmp/argmin-cp.state"),
+            ("ARGMIN_CONTROL_PLANE_SOCKET_PATH", "/tmp/argmin-cp.sock"),
+            ("ARGMIN_CONTROL_PLANE_EXPERIMENTAL_RAFT", "true"),
+            (
+                "ARGMIN_CONTROL_PLANE_RAFT_AUTH_CREDENTIALS",
+                "1=raft-peer:1:secret",
+            ),
+        ]))
+        .unwrap_err();
+        assert!(err.contains("requires ARGMIN_CONTROL_PLANE_RAFT_CLUSTER_NAME"));
+
+        let err = ServerConfig::from_lookup(make_env(&[
+            ("ARGMIN_PROCESS_ROLE", "control-plane"),
+            ("ARGMIN_CONTROL_PLANE_STATE_PATH", "/tmp/argmin-cp.state"),
+            ("ARGMIN_CONTROL_PLANE_SOCKET_PATH", "/tmp/argmin-cp.sock"),
+            ("ARGMIN_CONTROL_PLANE_EXPERIMENTAL_RAFT", "true"),
+            ("ARGMIN_CONTROL_PLANE_RAFT_CLUSTER_NAME", "raft-cluster-a"),
+            ("ARGMIN_CONTROL_PLANE_RAFT_NODE_ID", "11"),
+            (
+                "ARGMIN_CONTROL_PLANE_RAFT_AUTH_CREDENTIALS",
+                "12=raft-peer:1:secret",
+            ),
+        ]))
+        .unwrap_err();
+        assert!(err.contains("must include local Raft node id 11"));
+
+        let err = ServerConfig::from_lookup(make_env(&[
+            ("ARGMIN_PROCESS_ROLE", "control-plane"),
+            ("ARGMIN_CONTROL_PLANE_STATE_PATH", "/tmp/argmin-cp.state"),
+            ("ARGMIN_CONTROL_PLANE_SOCKET_PATH", "/tmp/argmin-cp.sock"),
+            ("ARGMIN_CONTROL_PLANE_EXPERIMENTAL_RAFT", "true"),
+            ("ARGMIN_CONTROL_PLANE_RAFT_CLUSTER_NAME", "raft-cluster-a"),
+            ("ARGMIN_CONTROL_PLANE_RAFT_NODE_ID", "11"),
+            (
+                "ARGMIN_CONTROL_PLANE_RAFT_AUTH_CREDENTIALS",
+                "11=raft-peer:1:local,12=raft-peer:1:remote",
+            ),
+        ]))
+        .unwrap_err();
+        assert!(err.contains("may only include the local node"));
+
+        let err = ServerConfig::from_lookup(make_env(&[
+            ("ARGMIN_PROCESS_ROLE", "control-plane"),
+            ("ARGMIN_CONTROL_PLANE_STATE_PATH", "/tmp/argmin-cp.state"),
+            ("ARGMIN_CONTROL_PLANE_SOCKET_PATH", "/tmp/argmin-cp.sock"),
+            ("ARGMIN_CONTROL_PLANE_EXPERIMENTAL_RAFT", "true"),
+            ("ARGMIN_CONTROL_PLANE_RAFT_CLUSTER_NAME", "raft-cluster-a"),
+            ("ARGMIN_CONTROL_PLANE_RAFT_NODE_ID", "11"),
+            (
+                "ARGMIN_CONTROL_PLANE_RAFT_PEER_SOCKET_PATH",
+                "/tmp/argmin-cp-raft-11.sock",
+            ),
+            (
+                "ARGMIN_CONTROL_PLANE_RAFT_PEER_SOCKETS",
+                "11=/tmp/argmin-cp-raft-11.sock,12=/tmp/argmin-cp-raft-12.sock",
+            ),
+            (
+                "ARGMIN_CONTROL_PLANE_RAFT_AUTH_CREDENTIALS",
+                "11=raft-peer:1:local",
+            ),
+        ]))
+        .unwrap_err();
+        assert!(err.contains("must include configured Raft peer node id 12"));
+
+        let err = ServerConfig::from_lookup(make_env(&[
+            ("ARGMIN_PROCESS_ROLE", "control-plane"),
+            ("ARGMIN_CONTROL_PLANE_STATE_PATH", "/tmp/argmin-cp.state"),
+            ("ARGMIN_CONTROL_PLANE_SOCKET_PATH", "/tmp/argmin-cp.sock"),
+            ("ARGMIN_CONTROL_PLANE_EXPERIMENTAL_RAFT", "true"),
+            ("ARGMIN_CONTROL_PLANE_RAFT_CLUSTER_NAME", "raft-cluster-a"),
+            (
+                "ARGMIN_CONTROL_PLANE_RAFT_AUTH_CREDENTIALS",
+                "1=bad:id:1:secret",
+            ),
+        ]))
+        .unwrap_err();
+        assert!(err.contains("credential version"));
     }
 
     #[test]
