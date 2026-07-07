@@ -1861,6 +1861,13 @@ impl StorageNodeServer {
             .unwrap_or_else(|e| e.into_inner())
             .count(location)
     }
+
+    #[cfg(test)]
+    pub(crate) fn suppress_metadata_command_lock_wait_stderr(
+        &self,
+    ) -> SuppressMetadataCommandLockWaitStderr {
+        self.metadata_command_locks.suppress_lock_wait_stderr()
+    }
 }
 
 #[derive(Clone, Default)]
@@ -1897,6 +1904,30 @@ impl StorageNodeMetadataCommandLocks {
             .unwrap_or_else(|e| e.into_inner()) = Some(hook);
     }
 
+    #[cfg(test)]
+    fn suppress_lock_wait_stderr(&self) -> SuppressMetadataCommandLockWaitStderr {
+        let previous = self
+            .state
+            .suppress_lock_wait_stderr
+            .swap(true, std::sync::atomic::Ordering::SeqCst);
+        SuppressMetadataCommandLockWaitStderr {
+            locks: self.clone(),
+            previous,
+        }
+    }
+
+    #[cfg(test)]
+    fn lock_wait_stderr_suppressed(&self) -> bool {
+        self.state
+            .suppress_lock_wait_stderr
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    #[cfg(not(test))]
+    fn lock_wait_stderr_suppressed(&self) -> bool {
+        false
+    }
+
     fn acquire(
         &self,
         node_id: NodeId,
@@ -1931,7 +1962,12 @@ impl StorageNodeMetadataCommandLocks {
             if waited_for >= wait_timeout {
                 drop(held);
                 emit_metadata_command_lock_wait_diagnostic(
-                    node_id, pg_id, context, holder, waited_for,
+                    node_id,
+                    pg_id,
+                    context,
+                    holder,
+                    waited_for,
+                    self.lock_wait_stderr_suppressed(),
                 );
                 return Err(StorageRpcErrorResponse {
                     code: StorageRpcErrorCode::MetadataCommandContention,
@@ -1946,7 +1982,12 @@ impl StorageNodeMetadataCommandLocks {
                 next_diagnostic_at = now + METADATA_COMMAND_LOCK_WAIT_DIAGNOSTIC_INTERVAL;
                 drop(held);
                 emit_metadata_command_lock_wait_diagnostic(
-                    node_id, pg_id, context, holder, waited_for,
+                    node_id,
+                    pg_id,
+                    context,
+                    holder,
+                    waited_for,
+                    self.lock_wait_stderr_suppressed(),
                 );
                 held = self.state.held.lock().unwrap_or_else(|e| e.into_inner());
                 continue;
@@ -2022,6 +2063,7 @@ fn emit_metadata_command_lock_wait_diagnostic(
     waiter: Option<StorageNodeMetadataCommandLockContext>,
     holder: StorageNodeMetadataCommandLockHolder,
     waited: Duration,
+    suppress_stderr: bool,
 ) {
     let waiter_request_id = waiter
         .map(|context| context.request_id.to_string())
@@ -2067,7 +2109,9 @@ fn emit_metadata_command_lock_wait_diagnostic(
         "metadata_command_lock_wait_blocked",
         detail.clone(),
     );
-    eprintln!("metadata_command_lock_wait_blocked {detail}");
+    if !suppress_stderr {
+        eprintln!("metadata_command_lock_wait_blocked {detail}");
+    }
 }
 
 #[derive(Default)]
@@ -2076,6 +2120,24 @@ struct StorageNodeMetadataCommandLockState {
     available: Condvar,
     #[cfg(test)]
     before_wait_hook: Mutex<Option<MetadataCommandBeforeWaitHook>>,
+    #[cfg(test)]
+    suppress_lock_wait_stderr: std::sync::atomic::AtomicBool,
+}
+
+#[cfg(test)]
+pub(crate) struct SuppressMetadataCommandLockWaitStderr {
+    locks: StorageNodeMetadataCommandLocks,
+    previous: bool,
+}
+
+#[cfg(test)]
+impl Drop for SuppressMetadataCommandLockWaitStderr {
+    fn drop(&mut self) {
+        self.locks
+            .state
+            .suppress_lock_wait_stderr
+            .store(self.previous, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 struct StorageNodeMetadataCommandGuard {
@@ -13285,6 +13347,7 @@ mod tests {
         let locks = StorageNodeMetadataCommandLocks::default();
         let pg_id = PgId::new(0);
         let _first = locks.acquire(NodeId::new(7), pg_id, None).unwrap();
+        let _stderr_guard = locks.suppress_lock_wait_stderr();
         let started = Instant::now();
         let err = match locks.acquire_with_timeout(
             NodeId::new(7),
@@ -13325,6 +13388,7 @@ mod tests {
                 kind: StorageRpcMessageKind::MetadataCommandApplyAndRecord,
             }),
         );
+        let _stderr_guard = locks.suppress_lock_wait_stderr();
         let (wait_tx, wait_rx) = mpsc::channel();
         locks.set_before_wait_hook(Arc::new(move |actual_pg_id| {
             assert_eq!(actual_pg_id, pg_id);
@@ -13418,6 +13482,7 @@ mod tests {
             scope_bucket: Some(command.bucket_name().clone()),
         };
         let server = StorageNodeServer::bind(config.clone()).unwrap();
+        let _stderr_guard = server.suppress_metadata_command_lock_wait_stderr();
         let pg_guard = server
             .metadata_command_locks
             .acquire(NodeId::new(7), PgId::new(0), None);

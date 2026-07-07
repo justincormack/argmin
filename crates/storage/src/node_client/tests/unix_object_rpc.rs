@@ -1411,6 +1411,7 @@ fn unix_direct_put_metadata_client_builds_commit_command() {
     };
     private_socket_dir(config.socket_path.parent().unwrap());
     let server = Arc::new(StorageNodeServer::bind(config.clone()).unwrap());
+    let _stderr_guard = server.suppress_metadata_command_lock_wait_stderr();
     let server_thread = {
         let server = Arc::clone(&server);
         thread::spawn(move || server.accept_one().unwrap())
