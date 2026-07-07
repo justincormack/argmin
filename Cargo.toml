@@ -16,4 +16,3 @@ members = [
     "crates/s3-http-tests",
     "crates/s3-local-tests",
 ]
-exclude = ["crates/s3-diff-tests"]

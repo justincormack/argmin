@@ -511,8 +511,52 @@ These assertions run against the embedded server on every
 `cargo nextest run` and against AWS via `./scripts/aws-tests`; the same
 expectations must hold on both endpoints, and tests never branch on the
 endpoint. The full conversion history is in
-plans/diff-test-consolidation-plan.md. The emptied `crates/s3-diff-tests`
-crate is pending removal.
+plans/diff-test-consolidation-plan.md.
+
+#### Writing a golden shape test
+
+The working pattern, in order:
+
+1. **Probe first.** Drive the exact request against the embedded server with
+   the `raw_object`/`raw_object_with`/`raw_object_query`/`raw_bucket`/
+   `raw_anonymous` helpers and capture the full `RawResponse`. Do not write
+   the template from documentation or memory.
+2. **Pin everything.** `assert_shape` takes the status, the complete header
+   set (full-set equality after dropping `connection`/`date`/`server`), and
+   the full body. Weak assertions — status plus error code, `contains`
+   checks, header subsets — silently lose pinning; if a value is
+   deterministic for the fixture (checksums of fixed bodies,
+   `Content-Length` of fixed XML), assert it literally.
+3. **Use placeholders only for genuinely variable values.** The built-ins
+   (`{request_id}`, `{host_id}`, `{etag}`, `{version_id}`, `{upload_id}`,
+   `{owner_id}`, `{http_date}`, `{iso8601}`, `{ws}`, `{any}`) are
+   shape-validated, and captured placeholders enforce consistency (the same
+   `{etag}` across a body, and against headers). Values known to the test
+   (bucket, key, region, account IDs, fixture version IDs) go in via
+   `.sub(...)`, keeping the template endpoint-agnostic. `assert_shape`
+   returns its captures for cross-response checks.
+4. **Error bodies come from `s3_tests::shape::expected_error`.** Wrappers
+   delegate to the production `xml.rs` formatters; when adding a wrapper,
+   also add its literal anchor in the shape module's
+   `expected_error_literal_anchors` test so a formatter change fails
+   locally, not at the next AWS run. Message text is passed by the test, so
+   messages stay pinned non-tautologically.
+5. **Unordered content** (DeleteObjects entries, tag sets) uses
+   `assert_body_with_unordered_blocks`: blocks match as a set and the
+   stripped remainder must equal the envelope exactly.
+6. **Divergences use `assert_shape_one_of`,** never endpoint branching, and
+   only for differences documented in
+   [aws-compatibility.md](aws-compatibility.md), with a comment pointing at
+   the guide entry.
+7. **Validate against AWS before trusting it.** Run the touched binaries via
+   `./scripts/aws-tests --test <binary> -- <test names>`. One AWS data point
+   covers one request shape — probe adjacent shapes (bucket vs object scope,
+   existing vs missing resource, with vs without an optional header) before
+   concluding anything about drift. If AWS disagrees with the template,
+   treat it as a server bug first (see aws-compatibility.md).
+8. **Upgrade in place.** When an existing test already covers the behaviour
+   with weaker assertions, strengthen that test rather than adding a
+   parallel one.
 
 ### Local-only tests
 

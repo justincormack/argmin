@@ -369,7 +369,7 @@ exactly how the auth evaluator already models it. The scenario now
 pins Reject/NoMatch, AWS-validated, and the tagging matrix runs all
 seven of its shapes.
 
-### Phase 5 — removal
+### Phase 5 — removal (DONE)
 
 As soon as all diff tests are ported (end of Phase 4), remove the old
 crate — expansion does not need it around:
@@ -379,6 +379,24 @@ crate — expansion does not need it around:
   shape-assertion convention and helper module instead), `AGENTS.md` if it
   references diff-tests, and any CI references
 - full `./scripts/aws-tests` run to confirm nothing was lost in porting
+
+Outcome: `scripts/diff-tests` and the guide updates landed with Phase 4;
+this phase deleted the empty crate, its `scripts/ci` compile step, and
+the workspace `exclude`, and closed with the full AWS `s3-tests` run:
+73 of 74 binaries green. The single failure was pre-existing drift
+unrelated to the porting, in
+`test_bucket_policy_foreign_owned_object_access_matrix_matches_aws`:
+AWS no longer lets a bucket policy grant the bucket owner PutObjectAcl
+on a foreign-owned object ("no resource-based policy allows the
+s3:PutObjectAcl action"), closing the old anomaly where ACL reads were
+denied but ACL writes grantable; tagging operations remain grantable
+(full matrix re-probed). FOLLOW-UP SLICE: align the authz model (deny
+policy-granted PutObjectAcl on foreign-owned objects) and update the
+pinned matrix test. Context: AWS has been making denial messages more
+explicit over recent weeks (the probed "no resource-based policy
+allows"/"explicit deny in a resource-based policy" variants belong to
+that wave), so message-level drift is expected elsewhere too — a
+periodic full `./scripts/aws-tests` run is the detector.
 
 ### Phase 6 — expand shape coverage (the actual goal, open-ended)
 
@@ -395,6 +413,39 @@ existing tests:
   currently ~770 call sites; convert opportunistically, prioritising
   responses users parse: listings, multipart, versioning, ACL/policy
   errors)
+
+Priority list (surveyed 2026-07-07, weakest pinning first — these had no
+diff-test coverage either, so their shapes have never been AWS-pinned):
+
+1. **ListBuckets (`GET /`)** — no shape test at all; clients parse the
+   Owner/DisplayName/Buckets body, and it is the one listing the batch-6
+   work did not cover.
+2. **Conditional request shapes** — `conditional.rs` asserts 304/412 only
+   via SDK `is_err`; 304 has a distinctive no-body/no-content-type shape
+   and 412 `PreconditionFailed` bodies are pinned only for the
+   upload-part-copy variant.
+3. **Plain GET `416 InvalidRange`** — `range.rs` has no 416 coverage at
+   all despite the builder (`invalid_range_error_xml`) and its
+   `expected_error` wrapper already existing.
+4. **Bucket policy CRUD** — `bucket_policy.rs` has ~187 weak assert
+   sites; GetBucketPolicy's JSON echo body and the MalformedPolicy /
+   policy-validation error family are unpinned.
+5. **Public-access / anonymous error surfaces** — the `public_access_*`
+   files assert codes only; these are security-relevant responses.
+6. **Presigned and chunked-upload error shapes** — `presigned.rs` and
+   `chunked.rs` use `contains` checks on bodies; the SigV4 error family
+   is only partially shaped (pilot covered two cases).
+7. **Malformed-XML request errors** — `malformed_xml.rs` body checks are
+   `contains`-based; `MalformedXML` bodies carry no declaration (like
+   the multipart errors) and would anchor cheaply.
+8. **Subresource write acks** — PutBucketVersioning/Tagging/etc. 200s
+   and Delete* 204s: header sets never pinned (cheap, mechanical).
+
+Remaining weak-assert density by file (top of the grep worklist):
+object_lock (98), tagging (49), sse_c (45), multipart (36),
+conditional (33), ownership (27), checksums (25), bucket_acl (22) —
+many of these sit next to now-golden tests and can be upgraded
+opportunistically when those files are touched.
 
 This phase is open-ended; track progress in this plan as batches land.
 

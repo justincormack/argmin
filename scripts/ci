@@ -14,25 +14,24 @@ Run the standard local CI checks:
   1. cargo fmt --all --check
   2. cargo clippy --workspace --all-targets --all-features -- -D warnings
   3. cargo build --workspace --all-targets --all-features
-  4. cargo test --manifest-path crates/s3-diff-tests/Cargo.toml --no-run
-  5. cargo +nightly build --manifest-path fuzz/Cargo.toml --bins
-  6. cargo nextest run --workspace
-  7. ./scripts/uat-s3-tests
-  8. ./scripts/uat-s3-tests --smoke storage-node-restart
-  9. ./scripts/uat-s3-tests --smoke storage-node-kill-fails-closed
-  10. ./scripts/uat-s3-tests --smoke storage-node-primary-kill-fails-closed
-  11. ./scripts/uat-s3-tests --smoke control-plane-runtime-map
-  12. ./scripts/uat-s3-tests --smoke shard-repair
-  13. ./scripts/uat-s3-tests --smoke shard-repair-restart
-  14. ./scripts/uat-s3-tests --smoke route-change
-  15. ./scripts/uat-s3-tests --smoke route-change-node-restart
-  16. ./scripts/uat-s3-tests --smoke route-change-restart
-  17. ./scripts/uat-s3-tests --smoke route-change-control-plane-restart
-  18. ./scripts/uat-s3-tests --smoke route-change-frontend-restart
-  19. ./scripts/uat-s3-tests --smoke route-change-full-restart
-  20. ./scripts/uat-s3-tests --smoke pg-backfill-migration
-  21. ./scripts/uat-s3-tests --smoke metadata-pg-migration
-  22. ./scripts/uat-s3-tests --smoke metadata-pg-migration-failover
+  4. cargo +nightly build --manifest-path fuzz/Cargo.toml --bins
+  5. cargo nextest run --workspace
+  6. ./scripts/uat-s3-tests
+  7. ./scripts/uat-s3-tests --smoke storage-node-restart
+  8. ./scripts/uat-s3-tests --smoke storage-node-kill-fails-closed
+  9. ./scripts/uat-s3-tests --smoke storage-node-primary-kill-fails-closed
+  10. ./scripts/uat-s3-tests --smoke control-plane-runtime-map
+  11. ./scripts/uat-s3-tests --smoke shard-repair
+  12. ./scripts/uat-s3-tests --smoke shard-repair-restart
+  13. ./scripts/uat-s3-tests --smoke route-change
+  14. ./scripts/uat-s3-tests --smoke route-change-node-restart
+  15. ./scripts/uat-s3-tests --smoke route-change-restart
+  16. ./scripts/uat-s3-tests --smoke route-change-control-plane-restart
+  17. ./scripts/uat-s3-tests --smoke route-change-frontend-restart
+  18. ./scripts/uat-s3-tests --smoke route-change-full-restart
+  19. ./scripts/uat-s3-tests --smoke pg-backfill-migration
+  20. ./scripts/uat-s3-tests --smoke metadata-pg-migration
+  21. ./scripts/uat-s3-tests --smoke metadata-pg-migration-failover
 
 Arguments after `--` are appended to `cargo nextest run --workspace`.
 
@@ -79,7 +78,6 @@ done
 run_cmd "format" cargo fmt --all --check
 run_cmd "clippy" cargo clippy --workspace --all-targets --all-features -- -D warnings
 run_cmd "workspace compile" cargo build --workspace --all-targets --all-features
-run_cmd "s3-diff-tests compile" cargo test --manifest-path crates/s3-diff-tests/Cargo.toml --no-run
 run_cmd "fuzz target compile" cargo +nightly build --manifest-path fuzz/Cargo.toml --bins
 run_cmd "nextest" cargo nextest run --workspace "${nextest_args[@]}"
 run_cmd "multihost UAT s3-tests" ./scripts/uat-s3-tests
