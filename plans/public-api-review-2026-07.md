@@ -280,14 +280,17 @@ RR1's reject paths in `from_header_iter` are defense-in-depth (every current
 HTTP path filters or validates first), which is the intended layering. Small
 residuals found by the verification, none release-blocking:
 
-- [ ] **V1. `from_header_iter` still handles two sibling fields the pre-RR1
+- [x] **V1. `from_header_iter` still handles two sibling fields the pre-RR1
   way.** An unparseable `x-amz-checksum-type` is silently dropped
   (`system_metadata.rs:176`, `ChecksumType::parse` → `None`, no error), and
   two different concrete `x-amz-checksum-*` value headers with no literal
   header resolve last-one-wins, order-dependently (:178-182). Both are
   masked by HTTP-layer validation/filtering today — exactly the masking
   shape RR1 removed for the algorithm field. Extend the fail-closed
-  treatment to `checksum_type` and to conflicting value headers.
+  treatment to `checksum_type` and to conflicting value headers. Fixed by
+  making `SystemMetadata::from_header_iter` reject invalid checksum type values
+  and multiple concrete checksum value headers for different algorithms, with
+  direct parser regressions.
 
 - [x] **V2. MPU default-checksum asymmetry unpinned.** Unconfigured
   CompleteMultipartUpload with no checksum header used to store no checksum

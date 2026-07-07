@@ -173,11 +173,27 @@ impl SystemMetadata {
                         })?);
                 }
                 "x-amz-checksum-type" => {
-                    checksum_type = ChecksumType::parse(value);
+                    checksum_type = Some(ChecksumType::parse(value).ok_or_else(|| {
+                        ServerError::InvalidRequest {
+                            reason: format!("invalid checksum type: {value}"),
+                        }
+                    })?);
                 }
                 _ if lower.starts_with("x-amz-checksum-") => {
                     if let Some(algo) = checksum_algorithm_from_header_name(&lower) {
-                        checksum_value = Some((algo, value.to_string()));
+                        if let Some((existing_algo, _)) = &checksum_value {
+                            if *existing_algo != algo {
+                                return Err(ServerError::InvalidRequest {
+                                    reason: format!(
+                                        "conflicting checksum headers: {} and {}",
+                                        existing_algo.header_name(),
+                                        algo.header_name()
+                                    ),
+                                });
+                            }
+                        } else {
+                            checksum_value = Some((algo, value.to_string()));
+                        }
                     }
                 }
                 _ => {}
@@ -673,6 +689,26 @@ mod tests {
         let err = SystemMetadata::from_headers(&[
             ("X-Amz-Checksum-Crc32", "abc"),
             ("X-Amz-Checksum-Algorithm", "SHA256"),
+        ])
+        .unwrap_err();
+        assert!(matches!(err, ServerError::InvalidRequest { .. }));
+    }
+
+    #[test]
+    fn from_headers_rejects_invalid_checksum_type() {
+        let err = SystemMetadata::from_headers(&[
+            ("X-Amz-Checksum-Sha256", "abc"),
+            ("X-Amz-Checksum-Type", "NOT_A_TYPE"),
+        ])
+        .unwrap_err();
+        assert!(matches!(err, ServerError::InvalidRequest { .. }));
+    }
+
+    #[test]
+    fn from_headers_rejects_conflicting_checksum_value_headers() {
+        let err = SystemMetadata::from_headers(&[
+            ("X-Amz-Checksum-Crc32", "abc"),
+            ("X-Amz-Checksum-Sha256", "def"),
         ])
         .unwrap_err();
         assert!(matches!(err, ServerError::InvalidRequest { .. }));
