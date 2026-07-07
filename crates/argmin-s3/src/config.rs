@@ -173,7 +173,7 @@ impl ServerConfig {
     ///   `ARGMIN_CONTROL_PLANE_RAFT_NODE_ID` (1 when experimental Raft is enabled)
     ///   `ARGMIN_CONTROL_PLANE_RAFT_PEER_SOCKET_PATH` (optional local experimental Raft peer socket)
     ///   `ARGMIN_CONTROL_PLANE_RAFT_PEER_SOCKETS` (`node_id=/absolute/socket,...`, optional experimental Raft peer map)
-    ///   `ARGMIN_CONTROL_PLANE_RAFT_AUTH_CREDENTIALS` (`node_id=credential_id:version:secret,...`, optional experimental Raft peer auth credentials)
+    ///   `ARGMIN_CONTROL_PLANE_RAFT_AUTH_CREDENTIALS` (`node_id=credential_id:version:secret,...`, required for multi-node experimental Raft peer auth)
     ///   `ARGMIN_CONTROL_PLANE_LEASE_SCAN_MS` (250)
     ///   `ARGMIN_CONTROL_PLANE_REFRESH_MS` (250)
     ///   `ARGMIN_CONTROL_PLANE_HEARTBEAT_LEASE_MS` (1000)
@@ -554,6 +554,14 @@ impl ServerConfig {
                 return Err(format!(
                     "ARGMIN_CONTROL_PLANE_RAFT_PEER_SOCKETS entry for local Raft node {local_node_id} must match ARGMIN_CONTROL_PLANE_RAFT_PEER_SOCKET_PATH"
                 ));
+            }
+            if control_plane_raft_peer_sockets.len() > 1
+                && control_plane_raft_auth_credentials.is_empty()
+            {
+                return Err(
+                    "ARGMIN_CONTROL_PLANE_RAFT_AUTH_CREDENTIALS is required when ARGMIN_CONTROL_PLANE_RAFT_PEER_SOCKETS configures multiple Raft nodes"
+                        .to_string(),
+                );
             }
         }
         if !control_plane_raft_auth_credentials.is_empty() {
@@ -1345,6 +1353,10 @@ mod tests {
                 "ARGMIN_CONTROL_PLANE_RAFT_PEER_SOCKETS",
                 "8=/tmp/control-plane-raft-8.sock,7=/tmp/control-plane-raft-7.sock",
             ),
+            (
+                "ARGMIN_CONTROL_PLANE_RAFT_AUTH_CREDENTIALS",
+                "7=raft-peer:1:peer-7-secret,8=raft-peer:1:peer-8-secret",
+            ),
             ("ARGMIN_CONTROL_PLANE_REFRESH_MS", "200"),
             ("ARGMIN_CONTROL_PLANE_HEARTBEAT_LEASE_MS", "900"),
             ("ARGMIN_LOCAL_NODE_COUNT", "12"),
@@ -1626,6 +1638,10 @@ mod tests {
                 "ARGMIN_CONTROL_PLANE_RAFT_PEER_SOCKETS",
                 "12=/tmp/argmin-cp-raft-12.sock,11=/tmp/argmin-cp-raft-11.sock",
             ),
+            (
+                "ARGMIN_CONTROL_PLANE_RAFT_AUTH_CREDENTIALS",
+                "12=raft-peer:1:peer-12-secret,11=raft-peer:1:peer-11-secret",
+            ),
         ]))
         .unwrap();
 
@@ -1651,6 +1667,7 @@ mod tests {
                 },
             ]
         );
+        assert_eq!(cfg.control_plane_raft_auth_credentials.len(), 2);
     }
 
     #[test]
@@ -1803,6 +1820,25 @@ mod tests {
 
     #[test]
     fn experimental_raft_control_plane_rejects_invalid_peer_auth_config() {
+        let err = ServerConfig::from_lookup(make_env(&[
+            ("ARGMIN_PROCESS_ROLE", "control-plane"),
+            ("ARGMIN_CONTROL_PLANE_STATE_PATH", "/tmp/argmin-cp.state"),
+            ("ARGMIN_CONTROL_PLANE_SOCKET_PATH", "/tmp/argmin-cp.sock"),
+            ("ARGMIN_CONTROL_PLANE_EXPERIMENTAL_RAFT", "true"),
+            ("ARGMIN_CONTROL_PLANE_RAFT_CLUSTER_NAME", "raft-cluster-a"),
+            ("ARGMIN_CONTROL_PLANE_RAFT_NODE_ID", "11"),
+            (
+                "ARGMIN_CONTROL_PLANE_RAFT_PEER_SOCKET_PATH",
+                "/tmp/argmin-cp-raft-11.sock",
+            ),
+            (
+                "ARGMIN_CONTROL_PLANE_RAFT_PEER_SOCKETS",
+                "11=/tmp/argmin-cp-raft-11.sock,12=/tmp/argmin-cp-raft-12.sock",
+            ),
+        ]))
+        .unwrap_err();
+        assert!(err.contains("AUTH_CREDENTIALS is required"));
+
         let err = ServerConfig::from_lookup(make_env(&[
             ("ARGMIN_PROCESS_ROLE", "control-plane"),
             ("ARGMIN_CONTROL_PLANE_STATE_PATH", "/tmp/argmin-cp.state"),

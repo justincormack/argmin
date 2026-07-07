@@ -266,6 +266,11 @@ Status:
   boundary. Tests now sign and verify append, vote, pre-vote, snapshot, and
   transfer-leader response frames with reverse peer identity, and reject a
   forged envelope whose operation does not match the embedded response kind.
+- 2026-07-07: Tightened item 4 process enforcement. Experimental multi-node
+  Unix-peer control-plane startup now requires
+  `ARGMIN_CONTROL_PLANE_RAFT_AUTH_CREDENTIALS` covering the configured peer
+  map; unauthenticated peer transport remains only for low-level unit tests and
+  single-node local peer-socket mode.
 
 ## Path-Specific Enforcement Order
 

@@ -13,6 +13,10 @@ use openraft::impls::Entry;
 use openraft::raft::AppendEntriesRequest;
 use openraft::storage::{RaftLogReader, RaftLogStorage};
 use openraft::{EntryPayload, LogId, Vote};
+use storage::control_plane_auth::{
+    ControlPlaneAuthOperation, ControlPlaneAuthPrincipal, ControlPlaneAuthSignInput,
+    ControlPlaneAuthTarget, ControlPlaneScopedCredential, ControlPlaneScopedCredentialInput,
+};
 use storage::control_plane_command::ControlPlaneCommand;
 use storage::control_plane_raft::{
     durable_artifact_wal_path, write_control_plane_raft_peer_transport_frame,
@@ -106,6 +110,15 @@ impl ChildGuard {
             })
             .collect::<Vec<_>>()
             .join(",");
+        let mut auth_nodes: BTreeSet<u64> = peer_node_ids.iter().copied().collect();
+        auth_nodes.insert(raft_node_id);
+        let peer_auth_credentials = auth_nodes
+            .into_iter()
+            .map(|node_id| {
+                format!("{node_id}=raft-node-{node_id}:1:process-test-raft-node-{node_id}-secret")
+            })
+            .collect::<Vec<_>>()
+            .join(",");
         let storage_node_sockets = format!(
             "0={},1={}",
             test_dir.join("storage-node-0.sock").display(),
@@ -134,6 +147,10 @@ impl ChildGuard {
             )
             .env("ARGMIN_CONTROL_PLANE_RAFT_PEER_SOCKET_PATH", peer_socket)
             .env("ARGMIN_CONTROL_PLANE_RAFT_PEER_SOCKETS", peer_sockets)
+            .env(
+                "ARGMIN_CONTROL_PLANE_RAFT_AUTH_CREDENTIALS",
+                peer_auth_credentials,
+            )
             .env("ARGMIN_CONTROL_PLANE_LEASE_SCAN_MS", "1000")
             .env("ARGMIN_CONTROL_PLANE_REFRESH_MS", "50")
             .stdout(Stdio::from(stdout))
@@ -805,6 +822,44 @@ fn wal_path(test_dir: &Path, node_id: u64) -> PathBuf {
     durable_artifact_wal_path(&state_path(test_dir, node_id))
 }
 
+fn process_test_raft_peer_credential(
+    cluster_name: &str,
+    node_id: u64,
+) -> ControlPlaneScopedCredential {
+    ControlPlaneScopedCredential::new(ControlPlaneScopedCredentialInput {
+        cluster_id: cluster_name.to_string(),
+        credential_id: format!("raft-node-{node_id}"),
+        credential_version: 1,
+        principal: ControlPlaneAuthPrincipal::RaftPeer { node_id },
+        secret: format!("process-test-raft-node-{node_id}-secret").into_bytes(),
+    })
+    .expect("process test Raft peer credential should build")
+}
+
+fn sign_process_test_raft_peer_frame(
+    cluster_name: &str,
+    source_node_id: u64,
+    target_node_id: u64,
+    operation: ControlPlaneAuthOperation,
+    payload: Vec<u8>,
+) -> Vec<u8> {
+    process_test_raft_peer_credential(cluster_name, source_node_id)
+        .sign_envelope(ControlPlaneAuthSignInput {
+            target: ControlPlaneAuthTarget::Principal(ControlPlaneAuthPrincipal::RaftPeer {
+                node_id: target_node_id,
+            }),
+            operation,
+            issued_at_ms: None,
+            expires_at_ms: None,
+            sequence: None,
+            nonce: Vec::new(),
+            payload,
+        })
+        .expect("process test Raft peer frame should sign")
+        .encode_frame()
+        .expect("process test Raft peer auth envelope should encode")
+}
+
 fn raft_wal_file(
     path: PathBuf,
     cluster_name: impl Into<String>,
@@ -1102,6 +1157,13 @@ fn experimental_raft_process_peer_wal_crash_after_sync_before_response_recovers_
             103,
         ))
         .expect("append request should encode");
+    let append_frame = sign_process_test_raft_peer_frame(
+        &cluster_name,
+        101,
+        103,
+        ControlPlaneAuthOperation::RaftAppendEntries,
+        append_frame,
+    );
     let artifact_bytes_before_crash =
         wait_for_stable_file_bytes(&follower_state_path, &mut restarted103);
     let follower_wal = raft_wal_file(wal_path(test_dir.path(), 103), &cluster_name, 103);
