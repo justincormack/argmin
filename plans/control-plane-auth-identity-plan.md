@@ -271,6 +271,15 @@ Status:
   `ARGMIN_CONTROL_PLANE_RAFT_AUTH_CREDENTIALS` covering the configured peer
   map; unauthenticated peer transport remains only for low-level unit tests and
   single-node local peer-socket mode.
+- 2026-07-07: Closed Slice A for Phase 12.4. Raft peer RPCs now have the shared
+  envelope foundation, scoped symmetric peer credentials, authenticated
+  request/response payload coverage, transfer-leader freshness bounds,
+  process-level fail-closed tests, redacted diagnostics, and mandatory
+  credentials for multi-node process peer mode. This closes security finding
+  `security/codex-e41688b` via commits `09fa6d0c`, `d5f7b19b`, `a260b300`,
+  `c03e0c85`, `2f4090ae`, `fa8a5fa4`, and `d08d5d25`. Storage-node,
+  frontend, admin, and runtime-map response auth remain separate follow-on
+  slices.
 
 ## Path-Specific Enforcement Order
 
