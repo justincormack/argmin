@@ -274,7 +274,7 @@ fn client_error_message(err: &ServerError) -> String {
         | ServerError::InvalidRedirectLocation { reason }
         | ServerError::InvalidURI { reason }
         | ServerError::InvalidBucketName { reason }
-        | ServerError::MalformedPolicy { reason }
+        | ServerError::MalformedPolicy { reason, .. }
         | ServerError::InvalidPolicyDocument { reason }
         | ServerError::MalformedXML { reason }
         | ServerError::MalformedPOSTRequest { reason }
@@ -736,6 +736,11 @@ impl S3Response {
                 let body =
                     xml::invalid_range_error_xml(range_requested, *total_size, request_id, host_id);
                 Self::new(416).chunked_xml_body(body)
+            }
+            ServerError::MalformedPolicy { reason, detail } => {
+                let body =
+                    xml::malformed_policy_error_xml(reason, detail.as_deref(), request_id, host_id);
+                Self::new(400).chunked_xml_body(body)
             }
             ServerError::PreconditionFailed { condition } => {
                 let body = xml::precondition_failed_error_xml(condition, request_id, host_id);

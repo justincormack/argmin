@@ -7875,8 +7875,8 @@ mod tests {
                 bucket: test_bucket_name("mybucket"),
             },
         ) {
-            Err(ServerError::MalformedPolicy { reason }) => {
-                assert!(reason.contains("invalid JSON"));
+            Err(ServerError::MalformedPolicy { reason, .. }) => {
+                assert!(reason.contains("Policies must be valid JSON"));
             }
             Err(e) => panic!("expected MalformedPolicy, got {e:?}"),
             Ok(_) => panic!("expected error, got Ok"),
@@ -7916,7 +7916,7 @@ mod tests {
                 bucket: test_bucket_name("mybucket"),
             },
         ) {
-            Err(ServerError::MalformedPolicy { reason }) => {
+            Err(ServerError::MalformedPolicy { reason, .. }) => {
                 assert_eq!(
                     reason,
                     format!(

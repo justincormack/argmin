@@ -1264,7 +1264,7 @@ fn bucket_policy_round_trips() {
         })
         .unwrap();
 
-    let policy = "{\"Version\":\"2012-10-17\",\"Statement\":[]}";
+    let policy = "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Deny\",\"Principal\":\"*\",\"Action\":\"s3:GetObject\",\"Resource\":\"arn:aws:s3:::bucket/*\"}]}";
     put_bucket_policy_test(
         &coord,
         "bucket",

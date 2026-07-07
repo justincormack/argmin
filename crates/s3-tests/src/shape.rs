@@ -189,6 +189,14 @@ enum Segment<'t> {
 /// Panics on malformed templates (unbalanced braces, adjacent placeholders,
 /// bad placeholder names): a malformed template is a bug in the test itself,
 /// not a shape mismatch.
+/// Escape a literal string for use inside a shape template: doubles every
+/// brace so JSON bodies or brace characters in messages are matched
+/// literally instead of being parsed as placeholders.
+#[must_use]
+pub fn escape_literal(text: &str) -> String {
+    text.replace('{', "{{").replace('}', "}}")
+}
+
 fn parse_template(template: &str) -> Vec<Segment<'_>> {
     let mut segments = Vec::new();
     let mut rest = template;
@@ -199,6 +207,14 @@ fn parse_template(template: &str) -> Vec<Segment<'_>> {
                 rest = "";
             }
             Some(brace) => {
+                // "{{" and "}}" are escapes for literal braces, as in
+                // format!(); bodies with real braces (JSON policies, brace
+                // characters in messages) use them via [`escape_literal`].
+                if rest[brace..].starts_with("{{") || rest[brace..].starts_with("}}") {
+                    segments.push(Segment::Literal(&rest[..brace + 1]));
+                    rest = &rest[brace + 2..];
+                    continue;
+                }
                 assert!(
                     rest.as_bytes()[brace] != b'}',
                     "template has '}}' without matching '{{': {template:?}"
@@ -823,6 +839,32 @@ pub mod expected_error {
         xml::no_such_bucket_policy_error_xml(bucket, REQUEST_ID, HOST_ID)
     }
 
+    /// `MalformedPolicy` for parse-level failures (no `<Detail>`). Brace
+    /// characters in the message are escaped for the template grammar.
+    pub fn malformed_policy(message: &str) -> String {
+        escape_body_braces(&xml::malformed_policy_error_xml(
+            message, None, REQUEST_ID, HOST_ID,
+        ))
+    }
+
+    /// `MalformedPolicy` echoing the offending value in `<Detail>`.
+    pub fn malformed_policy_with_detail(message: &str, detail: &str) -> String {
+        escape_body_braces(&xml::malformed_policy_error_xml(
+            message,
+            Some(detail),
+            REQUEST_ID,
+            HOST_ID,
+        ))
+    }
+
+    /// Escape literal braces in formatter output while keeping the
+    /// `{request_id}`/`{host_id}` placeholder tokens intact.
+    fn escape_body_braces(body: &str) -> String {
+        crate::shape::escape_literal(body)
+            .replace("{{request_id}}", REQUEST_ID)
+            .replace("{{host_id}}", HOST_ID)
+    }
+
     pub fn no_such_upload(upload_id: &str) -> String {
         xml::no_such_upload_error_xml(upload_id, REQUEST_ID, HOST_ID)
     }
@@ -1112,6 +1154,21 @@ mod tests {
     }
 
     #[test]
+    fn template_brace_escapes_match_literal_braces() {
+        let mut captures = BTreeMap::new();
+        match_template(
+            "test",
+            "policy {{\"Version\":\"2012-10-17\"}} id {request_id}",
+            &format!("policy {{\"Version\":\"2012-10-17\"}} id {REQUEST_ID}"),
+            &BTreeMap::new(),
+            &mut captures,
+        )
+        .expect("escaped braces must match literally");
+        assert_eq!(captures["request_id"], REQUEST_ID);
+        assert_eq!(escape_literal("{a}"), "{{a}}");
+    }
+
+    #[test]
     fn shape_spec_ignores_unpinned_transport_headers() {
         // AWS varies the framing by frontend: the same spec must accept a
         // content-length response and a chunked one.
@@ -1359,6 +1416,30 @@ mod tests {
              the upload may have been aborted or completed.</Message>\
              <UploadId>upload-1</UploadId><RequestId>{request_id}</RequestId>\
              <HostId>{host_id}</HostId></Error>"
+        );
+        assert_eq!(
+            expected_error::malformed_policy(
+                "Policies must be valid JSON and the first byte must be '{'"
+            ),
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>MalformedPolicy</Code>\
+             <Message>Policies must be valid JSON and the first byte must be '{{'</Message>\
+             <RequestId>{request_id}</RequestId><HostId>{host_id}</HostId></Error>"
+        );
+        assert_eq!(
+            expected_error::malformed_policy("Missing required field Statement"),
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>MalformedPolicy</Code>\
+             <Message>Missing required field Statement</Message>\
+             <RequestId>{request_id}</RequestId><HostId>{host_id}</HostId></Error>"
+        );
+        assert_eq!(
+            expected_error::malformed_policy_with_detail(
+                "Policy has invalid action",
+                "s3:NotARealAction"
+            ),
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>MalformedPolicy</Code>\
+             <Message>Policy has invalid action</Message>\
+             <Detail>s3:NotARealAction</Detail>\
+             <RequestId>{request_id}</RequestId><HostId>{host_id}</HostId></Error>"
         );
         assert_eq!(
             expected_error::invalid_range("bytes=2000-3000", 1024),

@@ -605,6 +605,18 @@ Related plan:
 
 - [plans/persistent-account-and-credential-management.md](/home/justin/src/github.com/justincormack/argmin/plans/persistent-account-and-credential-management.md)
 
+### 14. Bucket-policy principal validation is format-level only
+
+`PutBucketPolicy` rejects `AWS` principal entries whose IAM ARN qualifier is
+not one AWS accepts (`root`, `user/<name>`, `role/<name>`), with the
+AWS-shaped `MalformedPolicy` error (`Invalid principal in policy` plus a
+`<Detail>` echoing the entry). AWS additionally rejects well-formed
+principals that do not exist — probed example: a bare nonexistent account ID
+gets the same error. Existence depends on the account universe, so Argmin
+does not check it; a policy naming a well-formed but unknown account is
+accepted locally and rejected by AWS. The golden tests pin only
+format-invalid principals so they hold on both endpoints.
+
 ## How to treat new differences
 
 If AWS-backed tests expose a difference that is not listed here:

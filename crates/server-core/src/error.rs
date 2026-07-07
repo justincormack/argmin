@@ -189,7 +189,11 @@ pub enum ServerError {
     NoSuchLifecycleConfiguration { bucket: String },
 
     #[error("malformed policy: {reason}")]
-    MalformedPolicy { reason: String },
+    MalformedPolicy {
+        reason: String,
+        /// Offending value echoed in the error body's `<Detail>` element.
+        detail: Option<String>,
+    },
 
     #[error("invalid policy document: {reason}")]
     InvalidPolicyDocument { reason: String },
@@ -816,7 +820,8 @@ mod tests {
     fn s3_error_code_malformed_policy() {
         assert_eq!(
             ServerError::MalformedPolicy {
-                reason: "bad".to_string()
+                reason: "bad".to_string(),
+                detail: None,
             }
             .s3_error_code(),
             "MalformedPolicy"
@@ -1358,7 +1363,8 @@ mod tests {
         assert_eq!(ServerError::RequestHeaderSectionTooLarge.http_status(), 400);
         assert_eq!(
             ServerError::MalformedPolicy {
-                reason: "bad".into()
+                reason: "bad".into(),
+                detail: None,
             }
             .http_status(),
             400

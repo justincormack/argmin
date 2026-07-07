@@ -14,7 +14,9 @@ use s3_tests::{
     assert_s3_err_code, cleanup_versioned_bucket, create_public_bucket,
     disable_bucket_public_access_block, err_status, object_url, put_bucket_lifecycle_with_md5,
     raw_bucket, send_signed_request, send_signed_request_with_credentials,
-    shape::{assert_shape, error_response_headers, expected_error, shape},
+    shape::{
+        assert_shape, error_response_headers, escape_literal, expected_error, id_headers, shape,
+    },
     sse_c_header_values, test_sse_c_key, unique_bucket, SendRetryingOperationAborted,
     SignedRequestCredentials, CTX,
 };
@@ -15684,5 +15686,189 @@ fn test_get_bucket_policy_status_no_policy_error_shape() {
         );
 
         s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
+    });
+}
+
+// ── Response shapes ─────────────────────────────────────────────────
+
+fn raw_put_policy(bucket: &str, body: &str) -> s3_tests::RawResponse {
+    send_signed_request(
+        "PUT",
+        &format!("{}/{}?policy=", CTX.endpoint(), bucket),
+        body.as_bytes(),
+        std::iter::empty::<(&str, &str)>(),
+    )
+}
+
+/// Full response shapes for the bucket-policy CRUD cycle: 204 acks for Put
+/// and Delete (Delete is idempotent), and the exact normalized JSON echo
+/// with `Content-Type: application/json` from Get.
+#[test]
+fn test_bucket_policy_crud_response_shapes() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = create_bucket_allowing_public_policy(client).await;
+        let policy = format!(
+            "{{\"Version\":\"2012-10-17\",\"Statement\":[{{\"Sid\":\"DenyAllGetObject\",\
+             \"Effect\":\"Deny\",\"Principal\":\"*\",\"Action\":\"s3:GetObject\",\
+             \"Resource\":\"arn:aws:s3:::{bucket}/*\"}}]}}"
+        );
+
+        assert_shape(
+            "PutBucketPolicy",
+            &raw_put_policy(&bucket, &policy),
+            &shape().status(204).headers(id_headers()).body_empty(),
+        );
+        assert_shape(
+            "GetBucketPolicy",
+            &raw_bucket("GET", &bucket, Some("policy=")),
+            &shape()
+                .status(200)
+                .headers(id_headers())
+                .header("content-type", "application/json")
+                .body(escape_literal(&policy)),
+        );
+        assert_shape(
+            "DeleteBucketPolicy",
+            &raw_bucket("DELETE", &bucket, Some("policy=")),
+            &shape().status(204).headers(id_headers()).body_empty(),
+        );
+        assert_shape(
+            "DeleteBucketPolicy idempotent",
+            &raw_bucket("DELETE", &bucket, Some("policy=")),
+            &shape().status(204).headers(id_headers()).body_empty(),
+        );
+
+        cleanup(&bucket, &[]).await;
+    });
+}
+
+/// Full error shapes for the `MalformedPolicy` family. Parse-level failures
+/// carry no `<Detail>`; action, resource, and principal validation echo the
+/// offending value in one. Principal rejection here is format-level (AWS
+/// additionally rejects principals that do not exist, which depends on the
+/// account universe).
+#[test]
+fn test_put_bucket_policy_malformed_response_shapes() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = create_bucket_allowing_public_policy(client).await;
+        let json_message = "Policies must be valid JSON and the first byte must be '{'";
+        let assert_malformed = |context: &str, response: &s3_tests::RawResponse, body: String| {
+            assert_shape(
+                context,
+                response,
+                &shape()
+                    .status(400)
+                    .headers(error_response_headers())
+                    .body(body),
+            );
+        };
+
+        assert_malformed(
+            "PutBucketPolicy not JSON",
+            &raw_put_policy(&bucket, "not json at all"),
+            expected_error::malformed_policy(json_message),
+        );
+        assert_malformed(
+            "PutBucketPolicy JSON array",
+            &raw_put_policy(&bucket, "[]"),
+            expected_error::malformed_policy(json_message),
+        );
+        assert_malformed(
+            "PutBucketPolicy missing Statement",
+            &raw_put_policy(&bucket, "{\"Version\":\"2012-10-17\"}"),
+            expected_error::malformed_policy("Missing required field Statement"),
+        );
+        assert_malformed(
+            "PutBucketPolicy empty Statement",
+            &raw_put_policy(&bucket, "{\"Version\":\"2012-10-17\",\"Statement\":[]}"),
+            expected_error::malformed_policy("Could not parse the policy: Statement is empty!"),
+        );
+        assert_malformed(
+            "PutBucketPolicy invalid action",
+            &raw_put_policy(
+                &bucket,
+                &format!(
+                    "{{\"Version\":\"2012-10-17\",\"Statement\":[{{\"Effect\":\"Deny\",\
+                     \"Principal\":\"*\",\"Action\":\"s3:NotARealAction\",\
+                     \"Resource\":\"arn:aws:s3:::{bucket}/*\"}}]}}"
+                ),
+            ),
+            expected_error::malformed_policy_with_detail(
+                "Policy has invalid action",
+                "s3:NotARealAction",
+            ),
+        );
+        assert_malformed(
+            "PutBucketPolicy foreign resource",
+            &raw_put_policy(
+                &bucket,
+                "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Deny\",\
+                 \"Principal\":\"*\",\"Action\":\"s3:GetObject\",\
+                 \"Resource\":\"arn:aws:s3:::some-other-bucket-name/*\"}]}",
+            ),
+            expected_error::malformed_policy_with_detail(
+                "Policy has invalid resource",
+                "arn:aws:s3:::some-other-bucket-name/*",
+            ),
+        );
+        assert_malformed(
+            "PutBucketPolicy wildcard resource",
+            &raw_put_policy(
+                &bucket,
+                "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Deny\",\
+                 \"Principal\":\"*\",\"Action\":\"s3:GetObject\",\
+                 \"Resource\":\"arn:aws:s3:::*\"}]}",
+            ),
+            expected_error::malformed_policy_with_detail(
+                "Policy has invalid resource",
+                "arn:aws:s3:::*",
+            ),
+        );
+        assert_malformed(
+            "PutBucketPolicy object action on bucket arn",
+            &raw_put_policy(
+                &bucket,
+                &format!(
+                    "{{\"Version\":\"2012-10-17\",\"Statement\":[{{\"Effect\":\"Deny\",\
+                     \"Principal\":\"*\",\"Action\":\"s3:GetObject\",\
+                     \"Resource\":\"arn:aws:s3:::{bucket}\"}}]}}"
+                ),
+            ),
+            expected_error::malformed_policy_with_detail(
+                "Action does not apply to any resource(s) in statement",
+                "Action \"s3:GetObject\" in Statement \"NO_ID-0\"",
+            ),
+        );
+        assert_malformed(
+            "PutBucketPolicy string-form principal",
+            &raw_put_policy(
+                &bucket,
+                &format!(
+                    "{{\"Version\":\"2012-10-17\",\"Statement\":[{{\"Effect\":\"Deny\",\
+                     \"Principal\":\"arn:aws:iam::123456789012:root\",\
+                     \"Action\":\"s3:GetObject\",\"Resource\":\"arn:aws:s3:::{bucket}/*\"}}]}}"
+                ),
+            ),
+            expected_error::malformed_policy("Invalid policy syntax."),
+        );
+        assert_malformed(
+            "PutBucketPolicy invalid principal",
+            &raw_put_policy(
+                &bucket,
+                &format!(
+                    "{{\"Version\":\"2012-10-17\",\"Statement\":[{{\"Effect\":\"Deny\",\
+                     \"Principal\":{{\"AWS\":\"arn:aws:iam::123456789012:nonexistent-thing\"}},\
+                     \"Action\":\"s3:GetObject\",\"Resource\":\"arn:aws:s3:::{bucket}/*\"}}]}}"
+                ),
+            ),
+            expected_error::malformed_policy_with_detail(
+                "Invalid principal in policy",
+                "\"AWS\" : \"arn:aws:iam::123456789012:nonexistent-thing\"",
+            ),
+        );
+
+        cleanup(&bucket, &[]).await;
     });
 }

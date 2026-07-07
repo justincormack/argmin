@@ -458,6 +458,28 @@ diff-test coverage either, so their shapes have never been AWS-pinned):
 4. **Bucket policy CRUD** — `bucket_policy.rs` has ~187 weak assert
    sites; GetBucketPolicy's JSON echo body and the MalformedPolicy /
    policy-validation error family are unpinned.
+   **DONE (slice 2, 2026-07-08)** — CRUD raw shapes pinned
+   (`test_bucket_policy_crud_response_shapes`: Put/Delete 204 acks,
+   Delete idempotent, Get 200 `application/json` exact echo; template
+   grammar gained `{{`/`}}` escapes + `escape_literal` for JSON bodies).
+   AWS probing found the local MalformedPolicy family diverged: wrong
+   messages (`invalid JSON` vs "Policies must be valid JSON and the
+   first byte must be '{'", `missing Statement` vs "Missing required
+   field Statement"), Resource-style bodies instead of HostId+`<Detail>`,
+   and three validation gaps — empty `Statement` arrays, resources not
+   scoped to the bucket (`arn:aws:s3:::*` included), and malformed IAM
+   principal ARNs were all accepted. All fixed: `BucketPolicyError` and
+   `ServerError::MalformedPolicy` carry an optional `Detail`; empty
+   statements are rejected by the parser and resource scoping at
+   PutBucketPolicy time (the parser has no bucket context); applicability
+   errors carry AWS's `Action "…" in Statement "NO_ID-{n}"` label.
+   `test_put_bucket_policy_malformed_response_shapes` pins ten error
+   shapes (including the string-form principal rule: AWS accepts only
+   `"*"` in string position — any other string, even a well-formed root
+   ARN, is `Invalid policy syntax.`); AWS-validated. Principal *existence* is not validated (see
+   aws-compatibility.md §14). Remaining unpinned here: the
+   MalformedPolicy oversized-normalized-policy message and the ~187
+   weak semantic asserts (convert opportunistically).
 5. **Public-access / anonymous error surfaces** — the `public_access_*`
    files assert codes only; these are security-relevant responses.
 6. **Presigned and chunked-upload error shapes** — `presigned.rs` and

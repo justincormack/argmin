@@ -503,7 +503,7 @@ mod tests {
         put_bucket_policy_test(
             &coord,
             "bucket",
-            "{\"Version\":\"2012-10-17\",\"Statement\":[]}",
+            "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Deny\",\"Principal\":\"*\",\"Action\":\"s3:GetObject\",\"Resource\":\"arn:aws:s3:::bucket/*\"}]}",
             test_requester(),
             None,
         )
@@ -630,7 +630,7 @@ mod tests {
         put_bucket_policy_test(
             &coord,
             "source",
-            "{\"Version\":\"2012-10-17\",\"Statement\":[]}",
+            "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Deny\",\"Principal\":\"*\",\"Action\":\"s3:GetObject\",\"Resource\":\"arn:aws:s3:::source/*\"}]}",
             test_requester(),
             None,
         )
@@ -686,7 +686,7 @@ mod tests {
         put_bucket_policy_test(
             &coord,
             "bucket",
-            "{\"Version\":\"2012-10-17\",\"Statement\":[]}",
+            "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Deny\",\"Principal\":\"*\",\"Action\":\"s3:GetObject\",\"Resource\":\"arn:aws:s3:::bucket/*\"}]}",
             test_requester(),
             None,
         )

@@ -71,9 +71,9 @@ impl BucketPolicy {
     pub fn validate_evaluable_object_conditions(&self) -> Result<(), BucketPolicyError> {
         for statement in &self.statements {
             if !statement.conditions_supported_for_policy_actions() {
-                return Err(BucketPolicyError::Malformed {
-                    reason: "unsupported Condition for currently enforced bucket policy action",
-                });
+                return Err(BucketPolicyError::malformed(
+                    "unsupported Condition for currently enforced bucket policy action",
+                ));
             }
         }
         Ok(())
@@ -1154,40 +1154,77 @@ impl PolicyConditionClause {
 #[derive(Debug, thiserror::Error, Clone, PartialEq, Eq)]
 pub enum BucketPolicyError {
     #[error("malformed policy: {reason}")]
-    Malformed { reason: &'static str },
+    Malformed {
+        reason: &'static str,
+        /// Offending value echoed by AWS in the error body's `<Detail>`
+        /// element, e.g. the invalid action, resource, or principal.
+        detail: Option<String>,
+    },
 }
 
 impl BucketPolicyError {
     #[must_use]
+    pub fn malformed(reason: &'static str) -> Self {
+        Self::Malformed {
+            reason,
+            detail: None,
+        }
+    }
+
+    #[must_use]
     pub fn reason(&self) -> &'static str {
         match self {
-            Self::Malformed { reason } => reason,
+            Self::Malformed { reason, .. } => reason,
+        }
+    }
+
+    #[must_use]
+    pub fn detail(&self) -> Option<&str> {
+        match self {
+            Self::Malformed { detail, .. } => detail.as_deref(),
         }
     }
 }
 
+impl BucketPolicy {
+    /// The first statement resource not scoped to `bucket`, if any. AWS
+    /// rejects PutBucketPolicy unless every resource is the bucket's ARN or
+    /// an object ARN under it ("Policy has invalid resource"); wildcards do
+    /// not span buckets (`arn:aws:s3:::*` is rejected).
+    #[must_use]
+    pub fn first_resource_not_scoped_to_bucket(&self, bucket: &str) -> Option<&str> {
+        let bucket_arn = format!("arn:aws:s3:::{bucket}");
+        self.statements
+            .iter()
+            .flat_map(|statement| statement.resources.iter())
+            .find(|resource| {
+                resource.as_str() != bucket_arn
+                    && !resource
+                        .strip_prefix(bucket_arn.as_str())
+                        .is_some_and(|rest| rest.starts_with('/'))
+            })
+            .map(String::as_str)
+    }
+}
+
 pub fn parse_bucket_policy(policy: &str) -> Result<BucketPolicy, BucketPolicyError> {
-    let value: Value = serde_json::from_str(policy).map_err(|_| BucketPolicyError::Malformed {
-        reason: "invalid JSON",
+    let value: Value = serde_json::from_str(policy).map_err(|_| {
+        BucketPolicyError::malformed("Policies must be valid JSON and the first byte must be '{'")
     })?;
-    let object = value.as_object().ok_or(BucketPolicyError::Malformed {
-        reason: "top-level policy must be an object",
+    let object = value.as_object().ok_or_else(|| {
+        BucketPolicyError::malformed("Policies must be valid JSON and the first byte must be '{'")
     })?;
 
     let version = match object.get("Version") {
         Some(Value::String(version)) => Some(parse_version(version)?),
         Some(_) => {
-            return Err(BucketPolicyError::Malformed {
-                reason: "Version must be a string",
-            });
+            return Err(BucketPolicyError::malformed("Version must be a string"));
         }
         None => None,
     };
 
     let statements = parse_statements(object.get("Statement").ok_or(
-        BucketPolicyError::Malformed {
-            reason: "missing Statement",
-        },
+        BucketPolicyError::malformed("Missing required field Statement"),
     )?)?;
 
     Ok(BucketPolicy {
@@ -1200,42 +1237,49 @@ fn parse_version(version: &str) -> Result<PolicyVersion, BucketPolicyError> {
     match version {
         "2008-10-17" => Ok(PolicyVersion::V2008_10_17),
         "2012-10-17" => Ok(PolicyVersion::V2012_10_17),
-        _ => Err(BucketPolicyError::Malformed {
-            reason: "unsupported Version value",
-        }),
+        _ => Err(BucketPolicyError::malformed("unsupported Version value")),
     }
 }
 
 fn parse_statements(value: &Value) -> Result<Vec<PolicyStatement>, BucketPolicyError> {
     match value {
-        Value::Array(statements) => statements.iter().map(parse_statement).collect(),
-        Value::Object(_) => Ok(vec![parse_statement(value)?]),
-        _ => Err(BucketPolicyError::Malformed {
-            reason: "Statement must be an object or array",
-        }),
+        Value::Array(statements) => {
+            if statements.is_empty() {
+                return Err(BucketPolicyError::malformed(
+                    "Could not parse the policy: Statement is empty!",
+                ));
+            }
+            statements
+                .iter()
+                .enumerate()
+                .map(|(index, statement)| parse_statement(statement, index))
+                .collect()
+        }
+        Value::Object(_) => Ok(vec![parse_statement(value, 0)?]),
+        _ => Err(BucketPolicyError::malformed(
+            "Statement must be an object or array",
+        )),
     }
 }
 
-fn parse_statement(value: &Value) -> Result<PolicyStatement, BucketPolicyError> {
-    let object = value.as_object().ok_or(BucketPolicyError::Malformed {
-        reason: "statement must be an object",
-    })?;
+fn parse_statement(value: &Value, index: usize) -> Result<PolicyStatement, BucketPolicyError> {
+    let object = value
+        .as_object()
+        .ok_or(BucketPolicyError::malformed("statement must be an object"))?;
 
     if object.contains_key("NotPrincipal")
         || object.contains_key("NotAction")
         || object.contains_key("NotResource")
     {
-        return Err(BucketPolicyError::Malformed {
-            reason: "NotPrincipal, NotAction, and NotResource are not supported",
-        });
+        return Err(BucketPolicyError::malformed(
+            "NotPrincipal, NotAction, and NotResource are not supported",
+        ));
     }
 
     let sid = match object.get("Sid") {
         Some(Value::String(sid)) => Some(sid.clone()),
         Some(_) => {
-            return Err(BucketPolicyError::Malformed {
-                reason: "Sid must be a string",
-            });
+            return Err(BucketPolicyError::malformed("Sid must be a string"));
         }
         None => None,
     };
@@ -1243,36 +1287,33 @@ fn parse_statement(value: &Value) -> Result<PolicyStatement, BucketPolicyError> 
     let effect = match object.get("Effect") {
         Some(Value::String(effect)) => parse_effect(effect)?,
         Some(_) => {
-            return Err(BucketPolicyError::Malformed {
-                reason: "Effect must be a string",
-            });
+            return Err(BucketPolicyError::malformed("Effect must be a string"));
         }
         None => {
-            return Err(BucketPolicyError::Malformed {
-                reason: "missing Effect",
-            });
+            return Err(BucketPolicyError::malformed("missing Effect"));
         }
     };
 
-    let principal = parse_principal(object.get("Principal").ok_or(
-        BucketPolicyError::Malformed {
-            reason: "missing Principal",
-        },
-    )?)?;
+    let principal = parse_principal(
+        object
+            .get("Principal")
+            .ok_or(BucketPolicyError::malformed("missing Principal"))?,
+    )?;
 
     let actions = parse_string_or_array(
-        object.get("Action").ok_or(BucketPolicyError::Malformed {
-            reason: "missing Action",
-        })?,
+        object
+            .get("Action")
+            .ok_or(BucketPolicyError::malformed("missing Action"))?,
         "Action must be a string or array of strings",
     )?;
     let resources = parse_string_or_array(
-        object.get("Resource").ok_or(BucketPolicyError::Malformed {
-            reason: "missing Resource",
-        })?,
+        object
+            .get("Resource")
+            .ok_or(BucketPolicyError::malformed("missing Resource"))?,
         "Resource must be a string or array of strings",
     )?;
-    validate_resource_applicability(&actions, &resources)?;
+    let statement_label = sid.clone().unwrap_or_else(|| format!("NO_ID-{index}"));
+    validate_resource_applicability(&actions, &resources, &statement_label)?;
     let conditions = match object.get("Condition") {
         Some(value) => parse_conditions(value)?,
         None => Vec::new(),
@@ -1291,27 +1332,25 @@ fn parse_statement(value: &Value) -> Result<PolicyStatement, BucketPolicyError> 
 fn validate_resource_applicability(
     actions: &[String],
     resources: &[String],
+    statement_label: &str,
 ) -> Result<(), BucketPolicyError> {
-    let has_bucket_action = actions.iter().any(|pattern| {
+    let matches_bucket_action = |pattern: &String| {
         SUPPORTED_BUCKET_POLICY_BUCKET_ACTIONS
             .iter()
             .any(|action| action_pattern_matches(pattern, action.as_str()))
-    });
-    let has_object_action = actions.iter().any(|pattern| {
+    };
+    let matches_object_action = |pattern: &String| {
         SUPPORTED_BUCKET_POLICY_OBJECT_ACTIONS
             .iter()
             .any(|action| action_pattern_matches(pattern, action.as_str()))
-    });
-    let all_actions_supported = actions.iter().all(|pattern| {
-        SUPPORTED_BUCKET_POLICY_BUCKET_ACTIONS
-            .iter()
-            .chain(SUPPORTED_BUCKET_POLICY_OBJECT_ACTIONS.iter())
-            .any(|action| action_pattern_matches(pattern, action.as_str()))
-    });
-
-    if !all_actions_supported {
+    };
+    if let Some(unsupported) = actions
+        .iter()
+        .find(|pattern| !matches_bucket_action(pattern) && !matches_object_action(pattern))
+    {
         return Err(BucketPolicyError::Malformed {
             reason: "Policy has invalid action",
+            detail: Some(unsupported.clone()),
         });
     }
 
@@ -1328,9 +1367,18 @@ fn validate_resource_applicability(
         )
     });
 
-    if (has_bucket_action && !has_bucket_resource) || (has_object_action && !has_object_resource) {
+    // AWS names the first action whose resource kind is absent, e.g.
+    // `Action "s3:GetObject" in Statement "NO_ID-0"`.
+    let inapplicable = actions.iter().find(|pattern| {
+        (!has_object_resource && matches_object_action(pattern))
+            || (!has_bucket_resource && matches_bucket_action(pattern))
+    });
+    if let Some(action) = inapplicable {
         return Err(BucketPolicyError::Malformed {
             reason: "Action does not apply to any resource(s) in statement",
+            detail: Some(format!(
+                "Action \"{action}\" in Statement \"{statement_label}\""
+            )),
         });
     }
 
@@ -1421,9 +1469,7 @@ fn parse_effect(effect: &str) -> Result<PolicyEffect, BucketPolicyError> {
     match effect {
         "Allow" => Ok(PolicyEffect::Allow),
         "Deny" => Ok(PolicyEffect::Deny),
-        _ => Err(BucketPolicyError::Malformed {
-            reason: "Effect must be Allow or Deny",
-        }),
+        _ => Err(BucketPolicyError::malformed("Effect must be Allow or Deny")),
     }
 }
 
@@ -1437,10 +1483,9 @@ fn parse_principal(value: &Value) -> Result<PolicyPrincipal, BucketPolicyError> 
                 });
             }
 
-            Ok(PolicyPrincipal {
-                aws: vec![principal.clone()],
-                ..PolicyPrincipal::default()
-            })
+            // AWS accepts only "*" in string position; every other string,
+            // including a well-formed ARN, is a syntax error (probed).
+            Err(BucketPolicyError::malformed("Invalid policy syntax."))
         }
         Value::Object(object) => {
             let mut principal = PolicyPrincipal::default();
@@ -1455,6 +1500,7 @@ fn parse_principal(value: &Value) -> Result<PolicyPrincipal, BucketPolicyError> 
                             if value == "*" {
                                 principal.wildcard = true;
                             } else {
+                                validate_aws_principal_format(&value)?;
                                 principal.aws.push(value);
                             }
                         }
@@ -1462,35 +1508,60 @@ fn parse_principal(value: &Value) -> Result<PolicyPrincipal, BucketPolicyError> 
                     "Service" => principal.service.extend(values),
                     "CanonicalUser" => principal.canonical_user.extend(values),
                     _ => {
-                        return Err(BucketPolicyError::Malformed {
-                            reason: "unsupported Principal type",
-                        });
+                        return Err(BucketPolicyError::malformed("unsupported Principal type"));
                     }
                 }
             }
             if principal.has_any() {
                 Ok(principal)
             } else {
-                Err(BucketPolicyError::Malformed {
-                    reason: "Principal must not be empty",
-                })
+                Err(BucketPolicyError::malformed("Principal must not be empty"))
             }
         }
-        _ => Err(BucketPolicyError::Malformed {
-            reason: "Principal must be a string or object",
-        }),
+        _ => Err(BucketPolicyError::malformed(
+            "Principal must be a string or object",
+        )),
+    }
+}
+
+/// Reject `AWS` principal entries whose IAM ARN qualifier is not one AWS
+/// accepts. This is format validation only: AWS additionally rejects
+/// principals that do not exist, which depends on the account universe and
+/// is not checked here.
+fn validate_aws_principal_format(value: &str) -> Result<(), BucketPolicyError> {
+    let Some(rest) = value.strip_prefix("arn:aws:iam::") else {
+        return Ok(());
+    };
+    let invalid = || BucketPolicyError::Malformed {
+        reason: "Invalid principal in policy",
+        detail: Some(format!("\"AWS\" : \"{value}\"")),
+    };
+    let Some((_account, qualifier)) = rest.split_once(':') else {
+        return Err(invalid());
+    };
+    let valid = qualifier == "root"
+        || qualifier
+            .strip_prefix("user/")
+            .is_some_and(|name| !name.is_empty())
+        || qualifier
+            .strip_prefix("role/")
+            .is_some_and(|name| !name.is_empty());
+    if valid {
+        Ok(())
+    } else {
+        Err(invalid())
     }
 }
 
 fn parse_conditions(value: &Value) -> Result<Vec<PolicyConditionClause>, BucketPolicyError> {
-    let operators = value.as_object().ok_or(BucketPolicyError::Malformed {
-        reason: "Condition must be an object",
-    })?;
+    let operators = value
+        .as_object()
+        .ok_or(BucketPolicyError::malformed("Condition must be an object"))?;
     let mut clauses = Vec::new();
     for (operator, operands) in operators {
-        let operand_object = operands.as_object().ok_or(BucketPolicyError::Malformed {
-            reason: "Condition operator value must be an object",
-        })?;
+        let operand_object = operands.as_object().ok_or(BucketPolicyError::malformed(
+            "Condition operator value must be an object",
+        ))?;
         for (key, value) in operand_object {
             clauses.push(PolicyConditionClause {
                 operator: operator.clone(),
@@ -1513,20 +1584,20 @@ fn parse_string_or_array(
         Value::String(value) => Ok(vec![value.clone()]),
         Value::Array(values) => {
             if values.is_empty() {
-                return Err(BucketPolicyError::Malformed {
-                    reason: "array field must not be empty",
-                });
+                return Err(BucketPolicyError::malformed(
+                    "array field must not be empty",
+                ));
             }
             let mut parsed = Vec::with_capacity(values.len());
             for value in values {
                 let value = value
                     .as_str()
-                    .ok_or(BucketPolicyError::Malformed { reason: field_name })?;
+                    .ok_or(BucketPolicyError::malformed(field_name))?;
                 parsed.push(value.to_string());
             }
             Ok(parsed)
         }
-        _ => Err(BucketPolicyError::Malformed { reason: field_name }),
+        _ => Err(BucketPolicyError::malformed(field_name)),
     }
 }
 
@@ -1539,21 +1610,21 @@ fn parse_condition_value(
         Value::Number(value) => Ok(vec![value.to_string()]),
         Value::Array(values) => {
             if values.is_empty() {
-                return Err(BucketPolicyError::Malformed {
-                    reason: "array field must not be empty",
-                });
+                return Err(BucketPolicyError::malformed(
+                    "array field must not be empty",
+                ));
             }
             let mut parsed = Vec::with_capacity(values.len());
             for value in values {
                 match value {
                     Value::String(value) => parsed.push(value.clone()),
                     Value::Number(value) => parsed.push(value.to_string()),
-                    _ => return Err(BucketPolicyError::Malformed { reason: field_name }),
+                    _ => return Err(BucketPolicyError::malformed(field_name)),
                 }
             }
             Ok(parsed)
         }
-        _ => Err(BucketPolicyError::Malformed { reason: field_name }),
+        _ => Err(BucketPolicyError::malformed(field_name)),
     }
 }
 
@@ -1847,14 +1918,11 @@ mod tests {
     }
 
     #[test]
-    fn parse_empty_statement_array() {
-        let policy = parse_bucket_policy(r#"{"Version":"2012-10-17","Statement":[]}"#).unwrap();
-        assert_eq!(policy.version(), Some(PolicyVersion::V2012_10_17));
-        assert!(policy.statements().is_empty());
-        assert!(!policy.is_public());
+    fn parse_empty_statement_array_is_rejected() {
+        let err = parse_bucket_policy(r#"{"Version":"2012-10-17","Statement":[]}"#).unwrap_err();
         assert_eq!(
-            policy.normalized_json(),
-            r#"{"Version":"2012-10-17","Statement":[]}"#
+            err,
+            BucketPolicyError::malformed("Could not parse the policy: Statement is empty!")
         );
     }
 
@@ -1977,9 +2045,16 @@ mod tests {
         let err = parse_bucket_policy("{").unwrap_err();
         assert_eq!(
             err,
-            BucketPolicyError::Malformed {
-                reason: "invalid JSON"
-            }
+            BucketPolicyError::malformed(
+                "Policies must be valid JSON and the first byte must be '{'"
+            )
+        );
+        let err = parse_bucket_policy("[]").unwrap_err();
+        assert_eq!(
+            err,
+            BucketPolicyError::malformed(
+                "Policies must be valid JSON and the first byte must be '{'"
+            )
         );
     }
 
@@ -1988,9 +2063,7 @@ mod tests {
         let err = parse_bucket_policy(r#"{"Version":"2012-10-17"}"#).unwrap_err();
         assert_eq!(
             err,
-            BucketPolicyError::Malformed {
-                reason: "missing Statement"
-            }
+            BucketPolicyError::malformed("Missing required field Statement")
         );
     }
 
@@ -2002,9 +2075,9 @@ mod tests {
         .unwrap_err();
         assert_eq!(
             err,
-            BucketPolicyError::Malformed {
-                reason: "NotPrincipal, NotAction, and NotResource are not supported"
-            }
+            BucketPolicyError::malformed(
+                "NotPrincipal, NotAction, and NotResource are not supported"
+            )
         );
     }
 
@@ -2017,7 +2090,8 @@ mod tests {
         assert_eq!(
             err,
             BucketPolicyError::Malformed {
-                reason: "Policy has invalid action"
+                reason: "Policy has invalid action",
+                detail: Some("s3:CreateBucket".to_string()),
             }
         );
     }
@@ -2274,9 +2348,9 @@ mod tests {
 
         assert_eq!(
             policy.validate_evaluable_object_conditions(),
-            Err(BucketPolicyError::Malformed {
-                reason: "unsupported Condition for currently enforced bucket policy action",
-            })
+            Err(BucketPolicyError::malformed(
+                "unsupported Condition for currently enforced bucket policy action"
+            ))
         );
     }
 
@@ -2289,9 +2363,9 @@ mod tests {
 
         assert_eq!(
             policy.validate_evaluable_object_conditions(),
-            Err(BucketPolicyError::Malformed {
-                reason: "unsupported Condition for currently enforced bucket policy action",
-            })
+            Err(BucketPolicyError::malformed(
+                "unsupported Condition for currently enforced bucket policy action"
+            ))
         );
     }
 
@@ -2304,9 +2378,9 @@ mod tests {
 
         assert_eq!(
             policy.validate_evaluable_object_conditions(),
-            Err(BucketPolicyError::Malformed {
-                reason: "unsupported Condition for currently enforced bucket policy action",
-            })
+            Err(BucketPolicyError::malformed(
+                "unsupported Condition for currently enforced bucket policy action"
+            ))
         );
     }
 
@@ -2480,9 +2554,9 @@ mod tests {
 
         assert_eq!(
             policy.validate_evaluable_object_conditions(),
-            Err(BucketPolicyError::Malformed {
-                reason: "unsupported Condition for currently enforced bucket policy action",
-            })
+            Err(BucketPolicyError::malformed(
+                "unsupported Condition for currently enforced bucket policy action"
+            ))
         );
     }
 
@@ -2495,9 +2569,9 @@ mod tests {
 
         assert_eq!(
             policy.validate_evaluable_object_conditions(),
-            Err(BucketPolicyError::Malformed {
-                reason: "unsupported Condition for currently enforced bucket policy action",
-            })
+            Err(BucketPolicyError::malformed(
+                "unsupported Condition for currently enforced bucket policy action"
+            ))
         );
     }
 
@@ -2510,9 +2584,9 @@ mod tests {
 
         assert_eq!(
             policy.validate_evaluable_object_conditions(),
-            Err(BucketPolicyError::Malformed {
-                reason: "unsupported Condition for currently enforced bucket policy action",
-            })
+            Err(BucketPolicyError::malformed(
+                "unsupported Condition for currently enforced bucket policy action"
+            ))
         );
     }
 
@@ -2525,9 +2599,9 @@ mod tests {
 
         assert_eq!(
             policy.validate_evaluable_object_conditions(),
-            Err(BucketPolicyError::Malformed {
-                reason: "unsupported Condition for currently enforced bucket policy action",
-            })
+            Err(BucketPolicyError::malformed(
+                "unsupported Condition for currently enforced bucket policy action"
+            ))
         );
     }
 
@@ -2540,9 +2614,9 @@ mod tests {
 
         assert_eq!(
             policy.validate_evaluable_object_conditions(),
-            Err(BucketPolicyError::Malformed {
-                reason: "unsupported Condition for currently enforced bucket policy action",
-            })
+            Err(BucketPolicyError::malformed(
+                "unsupported Condition for currently enforced bucket policy action"
+            ))
         );
     }
 
@@ -2555,9 +2629,9 @@ mod tests {
 
         assert_eq!(
             policy.validate_evaluable_object_conditions(),
-            Err(BucketPolicyError::Malformed {
-                reason: "unsupported Condition for currently enforced bucket policy action",
-            })
+            Err(BucketPolicyError::malformed(
+                "unsupported Condition for currently enforced bucket policy action"
+            ))
         );
     }
 
@@ -2570,9 +2644,9 @@ mod tests {
 
         assert_eq!(
             policy.validate_evaluable_object_conditions(),
-            Err(BucketPolicyError::Malformed {
-                reason: "unsupported Condition for currently enforced bucket policy action",
-            })
+            Err(BucketPolicyError::malformed(
+                "unsupported Condition for currently enforced bucket policy action"
+            ))
         );
     }
 
@@ -2585,9 +2659,9 @@ mod tests {
 
         assert_eq!(
             policy.validate_evaluable_object_conditions(),
-            Err(BucketPolicyError::Malformed {
-                reason: "unsupported Condition for currently enforced bucket policy action",
-            })
+            Err(BucketPolicyError::malformed(
+                "unsupported Condition for currently enforced bucket policy action"
+            ))
         );
     }
 
@@ -2600,9 +2674,9 @@ mod tests {
 
         assert_eq!(
             policy.validate_evaluable_object_conditions(),
-            Err(BucketPolicyError::Malformed {
-                reason: "unsupported Condition for currently enforced bucket policy action",
-            })
+            Err(BucketPolicyError::malformed(
+                "unsupported Condition for currently enforced bucket policy action"
+            ))
         );
     }
 
@@ -2615,9 +2689,9 @@ mod tests {
 
         assert_eq!(
             policy.validate_evaluable_object_conditions(),
-            Err(BucketPolicyError::Malformed {
-                reason: "unsupported Condition for currently enforced bucket policy action",
-            })
+            Err(BucketPolicyError::malformed(
+                "unsupported Condition for currently enforced bucket policy action"
+            ))
         );
     }
 
@@ -2630,9 +2704,9 @@ mod tests {
 
         assert_eq!(
             policy.validate_evaluable_object_conditions(),
-            Err(BucketPolicyError::Malformed {
-                reason: "unsupported Condition for currently enforced bucket policy action",
-            })
+            Err(BucketPolicyError::malformed(
+                "unsupported Condition for currently enforced bucket policy action"
+            ))
         );
     }
 
@@ -2645,9 +2719,9 @@ mod tests {
 
         assert_eq!(
             policy.validate_evaluable_object_conditions(),
-            Err(BucketPolicyError::Malformed {
-                reason: "unsupported Condition for currently enforced bucket policy action",
-            })
+            Err(BucketPolicyError::malformed(
+                "unsupported Condition for currently enforced bucket policy action"
+            ))
         );
     }
 
@@ -2660,9 +2734,9 @@ mod tests {
 
         assert_eq!(
             policy.validate_evaluable_object_conditions(),
-            Err(BucketPolicyError::Malformed {
-                reason: "unsupported Condition for currently enforced bucket policy action",
-            })
+            Err(BucketPolicyError::malformed(
+                "unsupported Condition for currently enforced bucket policy action"
+            ))
         );
     }
 
@@ -2675,9 +2749,9 @@ mod tests {
 
         assert_eq!(
             policy.validate_evaluable_object_conditions(),
-            Err(BucketPolicyError::Malformed {
-                reason: "unsupported Condition for currently enforced bucket policy action",
-            })
+            Err(BucketPolicyError::malformed(
+                "unsupported Condition for currently enforced bucket policy action"
+            ))
         );
     }
 
@@ -2690,9 +2764,9 @@ mod tests {
 
         assert_eq!(
             policy.validate_evaluable_object_conditions(),
-            Err(BucketPolicyError::Malformed {
-                reason: "unsupported Condition for currently enforced bucket policy action",
-            })
+            Err(BucketPolicyError::malformed(
+                "unsupported Condition for currently enforced bucket policy action"
+            ))
         );
     }
 
@@ -2705,9 +2779,9 @@ mod tests {
 
         assert_eq!(
             policy.validate_evaluable_object_conditions(),
-            Err(BucketPolicyError::Malformed {
-                reason: "unsupported Condition for currently enforced bucket policy action",
-            })
+            Err(BucketPolicyError::malformed(
+                "unsupported Condition for currently enforced bucket policy action"
+            ))
         );
     }
 
@@ -2720,9 +2794,9 @@ mod tests {
 
         assert_eq!(
             policy.validate_evaluable_object_conditions(),
-            Err(BucketPolicyError::Malformed {
-                reason: "unsupported Condition for currently enforced bucket policy action",
-            })
+            Err(BucketPolicyError::malformed(
+                "unsupported Condition for currently enforced bucket policy action"
+            ))
         );
     }
 
@@ -2735,9 +2809,9 @@ mod tests {
 
         assert_eq!(
             policy.validate_evaluable_object_conditions(),
-            Err(BucketPolicyError::Malformed {
-                reason: "unsupported Condition for currently enforced bucket policy action",
-            })
+            Err(BucketPolicyError::malformed(
+                "unsupported Condition for currently enforced bucket policy action"
+            ))
         );
     }
 
@@ -2750,9 +2824,9 @@ mod tests {
 
         assert_eq!(
             policy.validate_evaluable_object_conditions(),
-            Err(BucketPolicyError::Malformed {
-                reason: "unsupported Condition for currently enforced bucket policy action",
-            })
+            Err(BucketPolicyError::malformed(
+                "unsupported Condition for currently enforced bucket policy action"
+            ))
         );
     }
 
@@ -3004,9 +3078,9 @@ mod tests {
 
         assert_eq!(
             policy.validate_evaluable_object_conditions(),
-            Err(BucketPolicyError::Malformed {
-                reason: "unsupported Condition for currently enforced bucket policy action",
-            })
+            Err(BucketPolicyError::malformed(
+                "unsupported Condition for currently enforced bucket policy action"
+            ))
         );
     }
 
@@ -3019,9 +3093,9 @@ mod tests {
 
         assert_eq!(
             policy.validate_evaluable_object_conditions(),
-            Err(BucketPolicyError::Malformed {
-                reason: "unsupported Condition for currently enforced bucket policy action",
-            })
+            Err(BucketPolicyError::malformed(
+                "unsupported Condition for currently enforced bucket policy action"
+            ))
         );
     }
 
@@ -3044,9 +3118,9 @@ mod tests {
 
         assert_eq!(
             policy.validate_evaluable_object_conditions(),
-            Err(BucketPolicyError::Malformed {
-                reason: "unsupported Condition for currently enforced bucket policy action",
-            })
+            Err(BucketPolicyError::malformed(
+                "unsupported Condition for currently enforced bucket policy action"
+            ))
         );
     }
 
@@ -3263,9 +3337,9 @@ mod tests {
 
         assert_eq!(
             policy.validate_evaluable_object_conditions(),
-            Err(BucketPolicyError::Malformed {
-                reason: "unsupported Condition for currently enforced bucket policy action",
-            })
+            Err(BucketPolicyError::malformed(
+                "unsupported Condition for currently enforced bucket policy action"
+            ))
         );
     }
 
@@ -3278,9 +3352,9 @@ mod tests {
 
         assert_eq!(
             policy.validate_evaluable_object_conditions(),
-            Err(BucketPolicyError::Malformed {
-                reason: "unsupported Condition for currently enforced bucket policy action",
-            })
+            Err(BucketPolicyError::malformed(
+                "unsupported Condition for currently enforced bucket policy action"
+            ))
         );
     }
 
@@ -3293,9 +3367,9 @@ mod tests {
 
         assert_eq!(
             policy.validate_evaluable_object_conditions(),
-            Err(BucketPolicyError::Malformed {
-                reason: "unsupported Condition for currently enforced bucket policy action",
-            })
+            Err(BucketPolicyError::malformed(
+                "unsupported Condition for currently enforced bucket policy action"
+            ))
         );
     }
 
@@ -3308,9 +3382,9 @@ mod tests {
 
         assert_eq!(
             policy.validate_evaluable_object_conditions(),
-            Err(BucketPolicyError::Malformed {
-                reason: "unsupported Condition for currently enforced bucket policy action",
-            })
+            Err(BucketPolicyError::malformed(
+                "unsupported Condition for currently enforced bucket policy action"
+            ))
         );
     }
 
@@ -3323,9 +3397,9 @@ mod tests {
 
         assert_eq!(
             policy.validate_evaluable_object_conditions(),
-            Err(BucketPolicyError::Malformed {
-                reason: "unsupported Condition for currently enforced bucket policy action",
-            })
+            Err(BucketPolicyError::malformed(
+                "unsupported Condition for currently enforced bucket policy action"
+            ))
         );
     }
 
@@ -3338,9 +3412,9 @@ mod tests {
 
         assert_eq!(
             policy.validate_evaluable_object_conditions(),
-            Err(BucketPolicyError::Malformed {
-                reason: "unsupported Condition for currently enforced bucket policy action",
-            })
+            Err(BucketPolicyError::malformed(
+                "unsupported Condition for currently enforced bucket policy action"
+            ))
         );
     }
 
@@ -3353,9 +3427,9 @@ mod tests {
 
         assert_eq!(
             policy.validate_evaluable_object_conditions(),
-            Err(BucketPolicyError::Malformed {
-                reason: "unsupported Condition for currently enforced bucket policy action",
-            })
+            Err(BucketPolicyError::malformed(
+                "unsupported Condition for currently enforced bucket policy action"
+            ))
         );
     }
 
@@ -3968,6 +4042,104 @@ mod tests {
     }
 
     #[test]
+    fn resource_applicability_detail_names_action_and_statement() {
+        let err = parse_bucket_policy(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::bucket"}]}"#,
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            BucketPolicyError::Malformed {
+                reason: "Action does not apply to any resource(s) in statement",
+                detail: Some("Action \"s3:GetObject\" in Statement \"NO_ID-0\"".to_string()),
+            }
+        );
+
+        let err = parse_bucket_policy(
+            r#"{"Version":"2012-10-17","Statement":[{"Sid":"First","Effect":"Deny","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::bucket/*"},{"Sid":"Second","Effect":"Deny","Principal":"*","Action":"s3:ListBucket","Resource":"arn:aws:s3:::bucket/*"}]}"#,
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            BucketPolicyError::Malformed {
+                reason: "Action does not apply to any resource(s) in statement",
+                detail: Some("Action \"s3:ListBucket\" in Statement \"Second\"".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn invalid_iam_principal_format_is_rejected() {
+        let err = parse_bucket_policy(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Principal":{"AWS":"arn:aws:iam::123456789012:nonexistent-thing"},"Action":"s3:GetObject","Resource":"arn:aws:s3:::bucket/*"}]}"#,
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            BucketPolicyError::Malformed {
+                reason: "Invalid principal in policy",
+                detail: Some(
+                    "\"AWS\" : \"arn:aws:iam::123456789012:nonexistent-thing\"".to_string()
+                ),
+            }
+        );
+
+        for valid in [
+            "arn:aws:iam::123456789012:root",
+            "arn:aws:iam::123456789012:user/alice",
+            "arn:aws:iam::123456789012:role/deploy",
+            "123456789012",
+        ] {
+            let policy = format!(
+                r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Deny","Principal":{{"AWS":"{valid}"}},"Action":"s3:GetObject","Resource":"arn:aws:s3:::bucket/*"}}]}}"#
+            );
+            parse_bucket_policy(&policy)
+                .unwrap_or_else(|e| panic!("principal {valid} should parse: {e:?}"));
+        }
+    }
+
+    #[test]
+    fn non_wildcard_string_principal_is_rejected() {
+        for principal in [
+            "arn:aws:iam::123456789012:root",
+            "arn:aws:iam::123456789012:nonexistent-thing",
+            "123456789012",
+        ] {
+            let policy = format!(
+                r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Deny","Principal":"{principal}","Action":"s3:GetObject","Resource":"arn:aws:s3:::bucket/*"}}]}}"#
+            );
+            let err = parse_bucket_policy(&policy).unwrap_err();
+            assert_eq!(
+                err,
+                BucketPolicyError::malformed("Invalid policy syntax."),
+                "principal {principal}"
+            );
+        }
+    }
+
+    #[test]
+    fn first_resource_not_scoped_to_bucket_flags_foreign_arns() {
+        let policy = parse_bucket_policy(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Principal":"*","Action":"s3:GetObject","Resource":["arn:aws:s3:::bucket/*","arn:aws:s3:::other/*"]}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            policy.first_resource_not_scoped_to_bucket("bucket"),
+            Some("arn:aws:s3:::other/*")
+        );
+        assert_eq!(
+            policy.first_resource_not_scoped_to_bucket("other"),
+            Some("arn:aws:s3:::bucket/*")
+        );
+
+        let policy = parse_bucket_policy(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Principal":"*","Action":["s3:GetObject","s3:ListBucket"],"Resource":["arn:aws:s3:::bucket","arn:aws:s3:::bucket/*"]}]}"#,
+        )
+        .unwrap();
+        assert_eq!(policy.first_resource_not_scoped_to_bucket("bucket"), None);
+    }
+
+    #[test]
     fn get_bucket_policy_status_object_only_resource_is_rejected() {
         let err = parse_bucket_policy(
             r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetBucketPolicyStatus","Resource":"arn:aws:s3:::bucket/*"}]}"#,
@@ -3975,10 +4147,8 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(
-            err,
-            BucketPolicyError::Malformed {
-                reason: "Action does not apply to any resource(s) in statement",
-            }
+            err.reason(),
+            "Action does not apply to any resource(s) in statement"
         );
     }
 
@@ -3990,10 +4160,8 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(
-            err,
-            BucketPolicyError::Malformed {
-                reason: "Action does not apply to any resource(s) in statement",
-            }
+            err.reason(),
+            "Action does not apply to any resource(s) in statement"
         );
     }
 
@@ -4005,10 +4173,8 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(
-            err,
-            BucketPolicyError::Malformed {
-                reason: "Action does not apply to any resource(s) in statement",
-            }
+            err.reason(),
+            "Action does not apply to any resource(s) in statement"
         );
     }
 
@@ -4020,10 +4186,8 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(
-            err,
-            BucketPolicyError::Malformed {
-                reason: "Action does not apply to any resource(s) in statement",
-            }
+            err.reason(),
+            "Action does not apply to any resource(s) in statement"
         );
     }
 
@@ -4035,10 +4199,8 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(
-            err,
-            BucketPolicyError::Malformed {
-                reason: "Action does not apply to any resource(s) in statement",
-            }
+            err.reason(),
+            "Action does not apply to any resource(s) in statement"
         );
     }
 
@@ -4050,10 +4212,8 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(
-            err,
-            BucketPolicyError::Malformed {
-                reason: "Action does not apply to any resource(s) in statement",
-            }
+            err.reason(),
+            "Action does not apply to any resource(s) in statement"
         );
     }
 
@@ -4065,10 +4225,8 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(
-            err,
-            BucketPolicyError::Malformed {
-                reason: "Action does not apply to any resource(s) in statement",
-            }
+            err.reason(),
+            "Action does not apply to any resource(s) in statement"
         );
     }
 
@@ -4080,10 +4238,8 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(
-            err,
-            BucketPolicyError::Malformed {
-                reason: "Action does not apply to any resource(s) in statement",
-            }
+            err.reason(),
+            "Action does not apply to any resource(s) in statement"
         );
     }
 
@@ -4095,10 +4251,8 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(
-            err,
-            BucketPolicyError::Malformed {
-                reason: "Action does not apply to any resource(s) in statement",
-            }
+            err.reason(),
+            "Action does not apply to any resource(s) in statement"
         );
     }
 
@@ -4110,10 +4264,8 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(
-            err,
-            BucketPolicyError::Malformed {
-                reason: "Action does not apply to any resource(s) in statement",
-            }
+            err.reason(),
+            "Action does not apply to any resource(s) in statement"
         );
     }
 
@@ -4125,10 +4277,8 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(
-            err,
-            BucketPolicyError::Malformed {
-                reason: "Action does not apply to any resource(s) in statement",
-            }
+            err.reason(),
+            "Action does not apply to any resource(s) in statement"
         );
     }
 
@@ -4140,10 +4290,8 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(
-            err,
-            BucketPolicyError::Malformed {
-                reason: "Action does not apply to any resource(s) in statement",
-            }
+            err.reason(),
+            "Action does not apply to any resource(s) in statement"
         );
     }
 
@@ -4155,10 +4303,8 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(
-            err,
-            BucketPolicyError::Malformed {
-                reason: "Action does not apply to any resource(s) in statement",
-            }
+            err.reason(),
+            "Action does not apply to any resource(s) in statement"
         );
     }
 
@@ -4170,10 +4316,8 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(
-            err,
-            BucketPolicyError::Malformed {
-                reason: "Action does not apply to any resource(s) in statement",
-            }
+            err.reason(),
+            "Action does not apply to any resource(s) in statement"
         );
     }
 
@@ -4185,10 +4329,8 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(
-            err,
-            BucketPolicyError::Malformed {
-                reason: "Action does not apply to any resource(s) in statement",
-            }
+            err.reason(),
+            "Action does not apply to any resource(s) in statement"
         );
     }
 
@@ -4200,10 +4342,8 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(
-            err,
-            BucketPolicyError::Malformed {
-                reason: "Action does not apply to any resource(s) in statement",
-            }
+            err.reason(),
+            "Action does not apply to any resource(s) in statement"
         );
     }
 
@@ -4215,10 +4355,8 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(
-            err,
-            BucketPolicyError::Malformed {
-                reason: "Action does not apply to any resource(s) in statement",
-            }
+            err.reason(),
+            "Action does not apply to any resource(s) in statement"
         );
     }
 
@@ -4230,10 +4368,8 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(
-            err,
-            BucketPolicyError::Malformed {
-                reason: "Action does not apply to any resource(s) in statement",
-            }
+            err.reason(),
+            "Action does not apply to any resource(s) in statement"
         );
     }
 
@@ -4245,10 +4381,8 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(
-            err,
-            BucketPolicyError::Malformed {
-                reason: "Action does not apply to any resource(s) in statement",
-            }
+            err.reason(),
+            "Action does not apply to any resource(s) in statement"
         );
     }
 
@@ -4260,10 +4394,8 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(
-            err,
-            BucketPolicyError::Malformed {
-                reason: "Action does not apply to any resource(s) in statement",
-            }
+            err.reason(),
+            "Action does not apply to any resource(s) in statement"
         );
     }
 
@@ -4275,10 +4407,8 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(
-            err,
-            BucketPolicyError::Malformed {
-                reason: "Action does not apply to any resource(s) in statement",
-            }
+            err.reason(),
+            "Action does not apply to any resource(s) in statement"
         );
     }
 
@@ -4290,10 +4420,8 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(
-            err,
-            BucketPolicyError::Malformed {
-                reason: "Action does not apply to any resource(s) in statement",
-            }
+            err.reason(),
+            "Action does not apply to any resource(s) in statement"
         );
     }
 
@@ -4305,10 +4433,8 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(
-            err,
-            BucketPolicyError::Malformed {
-                reason: "Action does not apply to any resource(s) in statement",
-            }
+            err.reason(),
+            "Action does not apply to any resource(s) in statement"
         );
     }
 
@@ -4320,10 +4446,8 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(
-            err,
-            BucketPolicyError::Malformed {
-                reason: "Action does not apply to any resource(s) in statement",
-            }
+            err.reason(),
+            "Action does not apply to any resource(s) in statement"
         );
     }
 
@@ -4335,10 +4459,8 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(
-            err,
-            BucketPolicyError::Malformed {
-                reason: "Action does not apply to any resource(s) in statement",
-            }
+            err.reason(),
+            "Action does not apply to any resource(s) in statement"
         );
     }
 
@@ -4350,10 +4472,8 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(
-            err,
-            BucketPolicyError::Malformed {
-                reason: "Action does not apply to any resource(s) in statement",
-            }
+            err.reason(),
+            "Action does not apply to any resource(s) in statement"
         );
     }
 }

@@ -535,11 +535,21 @@ impl Coordinator {
         let parsed_policy =
             auth::parse_bucket_policy(req.config).map_err(|e| ServerError::MalformedPolicy {
                 reason: e.reason().to_string(),
+                detail: e.detail().map(str::to_string),
             })?;
+        if let Some(resource) =
+            parsed_policy.first_resource_not_scoped_to_bucket(req.bucket.name.as_str())
+        {
+            return Err(ServerError::MalformedPolicy {
+                reason: "Policy has invalid resource".to_string(),
+                detail: Some(resource.to_string()),
+            });
+        }
         parsed_policy
             .validate_evaluable_object_conditions()
             .map_err(|e| ServerError::MalformedPolicy {
                 reason: e.reason().to_string(),
+                detail: e.detail().map(str::to_string),
             })?;
         let normalized_policy = parsed_policy.normalized_json();
         if normalized_policy.len() > auth::bucket_policy::MAX_BUCKET_POLICY_BYTES {
@@ -548,6 +558,7 @@ impl Coordinator {
                     "Normalized policy document exceeds the maximum allowed size of {} bytes",
                     auth::bucket_policy::MAX_BUCKET_POLICY_BYTES
                 ),
+                detail: None,
             });
         }
         let policy_is_public = parsed_policy.is_public();

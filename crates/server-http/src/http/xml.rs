@@ -514,6 +514,35 @@ pub fn upload_part_copy_precondition_failed_error_xml(
     )
 }
 
+/// Format a `MalformedPolicy` error response. AWS includes a `<Detail>`
+/// element echoing the offending value for action/resource/principal
+/// errors and omits it for parse-level failures.
+#[must_use]
+pub fn malformed_policy_error_xml(
+    message: &str,
+    detail: Option<&str>,
+    request_id: &str,
+    host_id: &str,
+) -> String {
+    let detail = detail.map_or_else(String::new, |detail| {
+        format!("<Detail>{}</Detail>", xml_escape_text(detail))
+    });
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+         <Error>\
+         <Code>MalformedPolicy</Code>\
+         <Message>{}</Message>\
+         {}\
+         <RequestId>{}</RequestId>\
+         <HostId>{}</HostId>\
+         </Error>",
+        xml_escape_text(message),
+        detail,
+        xml_escape(request_id),
+        xml_escape(host_id),
+    )
+}
+
 /// Format an S3 `NoSuchBucketPolicy` error response.
 #[must_use]
 pub fn no_such_bucket_policy_error_xml(
