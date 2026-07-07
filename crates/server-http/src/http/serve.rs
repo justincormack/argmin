@@ -60,6 +60,11 @@ const MAX_STREAMING_POST_SSE_FIELD_BYTES: usize = 4 * 1024;
 const MAX_STREAMING_REJECT_DRAIN_BYTES: usize =
     crate::coordinator::INTERNAL_SEGMENT_SIZE + (64 * 1024);
 const MAX_STREAMING_REJECT_DRAIN_DURATION: Duration = Duration::from_secs(2);
+/// Lingering close: how long to wait, per read, for a client to go quiet
+/// after its connection is done, before closing the socket.
+const LINGERING_CLOSE_QUIET: Duration = Duration::from_millis(500);
+/// Lingering close: total bound on post-connection draining.
+const LINGERING_CLOSE_MAX: Duration = Duration::from_secs(5);
 const MAX_ACL_XML_BYTES: usize = 200 * 1024;
 const MAX_DELETE_OBJECTS_XML_BYTES: usize = 2_048_000;
 const MAX_VERSIONING_CONFIGURATION_BYTES: usize = 1024;
@@ -627,7 +632,7 @@ async fn serve_connection<IO>(
 ) where
     IO: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    let _ = http1::Builder::new()
+    let conn = http1::Builder::new()
         .timer(TokioTimer::new())
         .header_read_timeout(header_read_timeout)
         .serve_connection(
@@ -636,8 +641,38 @@ async fn serve_connection<IO>(
                 let state = Arc::clone(&state);
                 async move { handle(state, req, transport_security).await }
             }),
-        )
-        .await;
+        );
+    // Lingering close: take the IO back from hyper instead of letting it
+    // shut down the socket the moment the connection is done. Closing a
+    // socket that still holds unread request bytes makes the kernel send
+    // RST rather than FIN, and an RST discards response data the client
+    // has buffered but not yet read — losing, for example, the error body
+    // of a rejected streaming upload the client is still sending. Drain
+    // and discard whatever the client keeps sending until it goes quiet,
+    // reaches EOF, or exceeds the bound, then shut down cleanly.
+    let Ok(mut parts) = conn.without_shutdown().await else {
+        return;
+    };
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let io = parts.io.inner_mut();
+    let deadline = tokio::time::Instant::now() + LINGERING_CLOSE_MAX;
+    let mut discard = [0u8; 8192];
+    loop {
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            break;
+        }
+        let read_timeout = LINGERING_CLOSE_QUIET.min(deadline - now);
+        match tokio::time::timeout(read_timeout, io.read(&mut discard)).await {
+            // Client finished sending; the receive queue is drained.
+            Ok(Ok(0)) => break,
+            Ok(Ok(_)) => {}
+            Ok(Err(_)) => break,
+            // Client went quiet: nothing unread remains to trigger an RST.
+            Err(_) => break,
+        }
+    }
+    let _ = io.shutdown().await;
 }
 
 /// Handle a single HTTP request: parse, route streaming writes, or buffer body
@@ -5778,11 +5813,14 @@ mod tests {
 
             let text = String::from_utf8_lossy(&buf);
             if let Some(header_end) = text.find("\r\n\r\n") {
+                // Stop uploading as soon as the early response starts
+                // arriving, like a real client; the server's lingering
+                // close then quiesces and delivers the rest of the body.
+                if let Some(stop_writer) = stop_writer {
+                    stop_writer.store(true, Ordering::Relaxed);
+                }
                 let headers = &text[..header_end];
                 if response_body_complete(&buf, header_end, headers) {
-                    if let Some(stop_writer) = stop_writer {
-                        stop_writer.store(true, Ordering::Relaxed);
-                    }
                     break;
                 }
             }
