@@ -1602,6 +1602,27 @@ impl StorageNodeServer {
         handler.handle_session(&mut stream, session_guard)
     }
 
+    #[cfg(test)]
+    pub(crate) fn socket_path_for_test(&self) -> PathBuf {
+        self.config_snapshot().socket_path
+    }
+
+    #[cfg(test)]
+    pub(crate) fn serve_until_stop_for_test(
+        &self,
+        stop: &std::sync::atomic::AtomicBool,
+    ) -> Result<(), StorageNodeServerError> {
+        while !stop.load(std::sync::atomic::Ordering::Acquire) {
+            if let Err(err) = self.accept_and_spawn() {
+                if stop.load(std::sync::atomic::Ordering::Acquire) {
+                    return Ok(());
+                }
+                return Err(err);
+            }
+        }
+        Ok(())
+    }
+
     pub fn serve_forever(&self) -> Result<(), StorageNodeServerError> {
         loop {
             self.accept_and_spawn()?;

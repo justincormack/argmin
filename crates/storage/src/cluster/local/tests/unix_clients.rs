@@ -96,9 +96,53 @@ impl PlacedShardNodeClient for RecordingPlacedShardClient {
     }
 }
 
+struct StorageNodeServerGuard {
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    socket_path: std::path::PathBuf,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for StorageNodeServerGuard {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Release);
+        let _ = std::os::unix::net::UnixStream::connect(&self.socket_path);
+        if let Some(thread) = self.thread.take() {
+            if let Err(panic) = thread.join() {
+                if std::thread::panicking() {
+                    return;
+                }
+                std::panic::resume_unwind(panic);
+            }
+        }
+    }
+}
+
+fn spawn_storage_node_server(server: StorageNodeServer) -> StorageNodeServerGuard {
+    let socket_path = server.socket_path_for_test();
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let thread_stop = Arc::clone(&stop);
+    let thread = thread::spawn(move || {
+        server.serve_until_stop_for_test(&thread_stop).unwrap();
+    });
+    StorageNodeServerGuard {
+        stop,
+        socket_path,
+        thread: Some(thread),
+    }
+}
+
+static UNIX_CLIENT_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn unix_client_tempdir() -> (std::sync::MutexGuard<'static, ()>, test_util::TempDir) {
+    let guard = UNIX_CLIENT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    (guard, test_util::tempdir())
+}
+
 #[test]
 fn payload_shard_writes_route_through_pluggable_shard_client() {
-    let tmp = test_util::tempdir();
+    let (_unix_client_test_guard, tmp) = unix_client_tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
     let ec_shape = EcShape { k: 2, m: 1 };
     let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0], ec_shape).unwrap();
@@ -309,7 +353,7 @@ impl ShardAckNodeClient for RecordingShardAckClient {
 
 #[test]
 fn metadata_pg_primary_exposes_pluggable_shard_ack_client() {
-    let tmp = test_util::tempdir();
+    let (_unix_client_test_guard, tmp) = unix_client_tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
     let ec_shape = EcShape { k: 2, m: 1 };
     let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1], ec_shape).unwrap();
@@ -418,7 +462,7 @@ impl crate::node_client::ShardReadHandleLease for RecordingReadHandleLease {
 
 #[test]
 fn partial_multi_node_read_handle_acquire_failure_releases_prior_handles() {
-    let tmp = test_util::tempdir();
+    let (_unix_client_test_guard, tmp) = unix_client_tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
     let ec_shape = EcShape { k: 2, m: 1 };
     let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0], ec_shape).unwrap();
@@ -490,7 +534,7 @@ fn private_socket_dir(path: &Path) {
 
 #[test]
 fn unix_shard_clients_route_payload_io_and_ack_rows_to_storage_node() {
-    let tmp = test_util::tempdir();
+    let (_unix_client_test_guard, tmp) = unix_client_tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
     let ec_shape = EcShape { k: 2, m: 1 };
     let frontend_dir = tmp.path().join("frontend");
@@ -685,7 +729,7 @@ fn unix_shard_clients_route_payload_io_and_ack_rows_to_storage_node() {
 
 #[test]
 fn frontend_unix_shard_mode_uses_storage_node_owned_data_dir() {
-    let tmp = test_util::tempdir();
+    let (_unix_client_test_guard, tmp) = unix_client_tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
     let ec_shape = EcShape { k: 2, m: 1 };
     let remote_data_dir = tmp.path().join("remote-node-1-owned");
@@ -754,7 +798,7 @@ fn frontend_unix_shard_mode_uses_storage_node_owned_data_dir() {
 
 #[test]
 fn frontend_unix_metadata_command_mode_uses_storage_node_owned_data_dir() {
-    let tmp = test_util::tempdir();
+    let (_unix_client_test_guard, tmp) = unix_client_tempdir();
     let node_id = NodeId::new(1);
     let ec_shape = EcShape { k: 1, m: 0 };
     let remote_data_dir = tmp.path().join("remote-metadata-node-1-owned");
@@ -825,7 +869,7 @@ fn frontend_unix_metadata_command_mode_uses_storage_node_owned_data_dir() {
 
 #[test]
 fn peering_replay_catches_up_replicas_through_unix_storage_clients() {
-    let tmp = test_util::tempdir();
+    let (_unix_client_test_guard, tmp) = unix_client_tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
     let ec_shape = EcShape { k: 2, m: 1 };
     let frontend_dir = tmp.path().join("frontend-peering-replay");
@@ -887,9 +931,10 @@ fn peering_replay_catches_up_replicas_through_unix_storage_clients() {
         client_configs.push(LocalUnixStorageNodeClientConfig::new(node_id, socket_path));
     }
 
+    let mut _server_guards = Vec::new();
     for config in server_configs {
         let server = StorageNodeServer::bind(config).unwrap();
-        let _server_thread = thread::spawn(move || server.serve_forever().unwrap());
+        _server_guards.push(spawn_storage_node_server(server));
     }
     map.install_unix_storage_node_clients(client_configs)
         .unwrap();
@@ -928,7 +973,7 @@ fn peering_replay_catches_up_replicas_through_unix_storage_clients() {
 
 #[test]
 fn frontend_unix_bucket_metadata_mode_creates_bucket_on_storage_node() {
-    let tmp = test_util::tempdir();
+    let (_unix_client_test_guard, tmp) = unix_client_tempdir();
     let node_id = NodeId::new(1);
     let ec_shape = EcShape { k: 1, m: 0 };
     let remote_data_dir = tmp.path().join("remote-bucket-metadata-node-1-owned");
@@ -957,7 +1002,7 @@ fn frontend_unix_bucket_metadata_mode_creates_bucket_on_storage_node() {
     };
     let server = StorageNodeServer::bind(server_config.clone()).unwrap();
     assert!(remote_data_dir.join(".argmin-storage-node.lock").is_file());
-    let _server_thread = thread::spawn(move || server.serve_forever().unwrap());
+    let _server_guard = spawn_storage_node_server(server);
 
     let frontend_data_dir = tmp.path().join("frontend-only-bucket-metadata-routing");
     let mut map = LocalClusterMap::open_with_configs(
@@ -1022,7 +1067,7 @@ fn frontend_unix_bucket_metadata_mode_creates_bucket_on_storage_node() {
 
 #[test]
 fn frontend_unix_reclaim_and_bucket_finalize_resume_from_storage_node_owned_rows() {
-    let tmp = test_util::tempdir();
+    let (_unix_client_test_guard, tmp) = unix_client_tempdir();
     let node_id = NodeId::new(1);
     let ec_shape = EcShape { k: 1, m: 0 };
     let remote_data_dir = tmp.path().join("remote-reclaim-finalize-node-1");
@@ -1051,7 +1096,7 @@ fn frontend_unix_reclaim_and_bucket_finalize_resume_from_storage_node_owned_rows
     };
     let server = StorageNodeServer::bind(server_config).unwrap();
     assert!(remote_data_dir.join(".argmin-storage-node.lock").is_file());
-    let _server_thread = thread::spawn(move || server.serve_forever().unwrap());
+    let _server_guard = spawn_storage_node_server(server);
 
     let open_frontend = |name: &str| {
         let mut map = LocalClusterMap::open_frontend_placeholder_with_configs_and_epoch(
@@ -1168,7 +1213,7 @@ fn frontend_unix_reclaim_and_bucket_finalize_resume_from_storage_node_owned_rows
 
 #[test]
 fn frontend_unix_lifecycle_claims_resume_from_storage_node_owned_rows() {
-    let tmp = test_util::tempdir();
+    let (_unix_client_test_guard, tmp) = unix_client_tempdir();
     let node_id = NodeId::new(1);
     let ec_shape = EcShape { k: 1, m: 0 };
     let remote_data_dir = tmp.path().join("remote-lifecycle-node-1");
@@ -1194,7 +1239,7 @@ fn frontend_unix_lifecycle_claims_resume_from_storage_node_owned_rows() {
     };
     let server = StorageNodeServer::bind(server_config).unwrap();
     assert!(remote_data_dir.join(".argmin-storage-node.lock").is_file());
-    let _server_thread = thread::spawn(move || server.serve_forever().unwrap());
+    let _server_guard = spawn_storage_node_server(server);
 
     let open_frontend = |name: &str| {
         let mut map = LocalClusterMap::open_frontend_placeholder_with_configs_and_epoch(
@@ -1299,7 +1344,7 @@ fn frontend_unix_lifecycle_claims_resume_from_storage_node_owned_rows() {
 
 #[test]
 fn frontend_unix_stream_session_scavenger_lists_storage_node_owned_rows() {
-    let tmp = test_util::tempdir();
+    let (_unix_client_test_guard, tmp) = unix_client_tempdir();
     let node_id = NodeId::new(1);
     let ec_shape = EcShape { k: 1, m: 0 };
     let remote_data_dir = tmp.path().join("remote-stream-scavenge-node-1");
@@ -1362,7 +1407,7 @@ fn frontend_unix_stream_session_scavenger_lists_storage_node_owned_rows() {
     }
     let server = StorageNodeServer::bind(server_config).unwrap();
     assert!(remote_data_dir.join(".argmin-storage-node.lock").is_file());
-    let _server_thread = thread::spawn(move || server.serve_forever().unwrap());
+    let _server_guard = spawn_storage_node_server(server);
 
     let mut map = LocalClusterMap::open_frontend_placeholder_with_configs_and_epoch(
         node_id,
@@ -1413,7 +1458,7 @@ fn frontend_unix_stream_session_scavenger_lists_storage_node_owned_rows() {
 
 #[test]
 fn frontend_unix_cluster_map_history_reference_summary_reads_storage_node_owned_rows() {
-    let tmp = test_util::tempdir();
+    let (_unix_client_test_guard, tmp) = unix_client_tempdir();
     let node_id = NodeId::new(1);
     let ec_shape = EcShape { k: 1, m: 0 };
     let remote_data_dir = tmp.path().join("remote-history-summary-node-1");
@@ -1528,7 +1573,7 @@ fn frontend_unix_cluster_map_history_reference_summary_reads_storage_node_owned_
 
 #[test]
 fn frontend_unix_stream_session_scavenger_rejects_wrong_pg_rows() {
-    let tmp = test_util::tempdir();
+    let (_unix_client_test_guard, tmp) = unix_client_tempdir();
     let node_id = NodeId::new(1);
     let ec_shape = EcShape { k: 1, m: 0 };
     let remote_data_dir = tmp.path().join("remote-stream-wrong-pg-node-1");
@@ -1590,7 +1635,7 @@ fn frontend_unix_stream_session_scavenger_rejects_wrong_pg_rows() {
         wrong_pg.refresh_metadata_command_state_digest().unwrap();
     }
     let server = StorageNodeServer::bind(server_config).unwrap();
-    let _server_thread = thread::spawn(move || server.serve_forever().unwrap());
+    let _server_guard = spawn_storage_node_server(server);
 
     let mut map = LocalClusterMap::open_frontend_placeholder_with_configs_and_epoch(
         node_id,
@@ -1621,7 +1666,7 @@ fn frontend_unix_stream_session_scavenger_rejects_wrong_pg_rows() {
 
 #[test]
 fn frontend_unix_bucket_metadata_mode_reads_bucket_batches_from_storage_node() {
-    let tmp = test_util::tempdir();
+    let (_unix_client_test_guard, tmp) = unix_client_tempdir();
     let node_id = NodeId::new(1);
     let ec_shape = EcShape { k: 1, m: 0 };
     let remote_data_dir = tmp.path().join("remote-bucket-metadata-read-node-1");
@@ -1694,7 +1739,7 @@ fn frontend_unix_bucket_metadata_mode_reads_bucket_batches_from_storage_node() {
         (generation, identity)
     };
     let server = StorageNodeServer::bind(server_config).unwrap();
-    let _server_thread = thread::spawn(move || server.serve_forever().unwrap());
+    let _server_guard = spawn_storage_node_server(server);
 
     let frontend_data_dir = tmp.path().join("frontend-bucket-metadata-read-routing");
     let mut map = LocalClusterMap::open_with_configs(
@@ -1736,7 +1781,7 @@ fn frontend_unix_bucket_metadata_mode_reads_bucket_batches_from_storage_node() {
 
 #[test]
 fn bucket_list_page_validation_rejects_wrong_pg_bucket() {
-    let tmp = test_util::tempdir();
+    let (_unix_client_test_guard, tmp) = unix_client_tempdir();
     let node_id = NodeId::new(1);
     let ec_shape = EcShape { k: 1, m: 0 };
     let map = LocalClusterMap::open_with_configs(
@@ -1810,7 +1855,7 @@ fn test_bucket_list_info(
 
 #[test]
 fn frontend_unix_object_generation_mode_reserves_on_storage_node() {
-    let tmp = test_util::tempdir();
+    let (_unix_client_test_guard, tmp) = unix_client_tempdir();
     let node_id = NodeId::new(1);
     let ec_shape = EcShape { k: 1, m: 0 };
     let remote_data_dir = tmp
@@ -1841,7 +1886,7 @@ fn frontend_unix_object_generation_mode_reserves_on_storage_node() {
     };
     let server = StorageNodeServer::bind(server_config.clone()).unwrap();
     assert!(remote_data_dir.join(".argmin-storage-node.lock").is_file());
-    let _server_thread = thread::spawn(move || server.serve_forever().unwrap());
+    let _server_guard = spawn_storage_node_server(server);
 
     let frontend_data_dir = tmp
         .path()
@@ -1906,7 +1951,7 @@ fn frontend_unix_object_generation_mode_reserves_on_storage_node() {
 
 #[test]
 fn frontend_unix_object_version_mode_reserves_on_storage_node() {
-    let tmp = test_util::tempdir();
+    let (_unix_client_test_guard, tmp) = unix_client_tempdir();
     let node_id = NodeId::new(1);
     let ec_shape = EcShape { k: 1, m: 0 };
     let remote_data_dir = tmp
@@ -1937,7 +1982,7 @@ fn frontend_unix_object_version_mode_reserves_on_storage_node() {
     };
     let server = StorageNodeServer::bind(server_config.clone()).unwrap();
     assert!(remote_data_dir.join(".argmin-storage-node.lock").is_file());
-    let _server_thread = thread::spawn(move || server.serve_forever().unwrap());
+    let _server_guard = spawn_storage_node_server(server);
 
     let frontend_data_dir = tmp
         .path()
@@ -1991,7 +2036,7 @@ fn frontend_unix_object_version_mode_reserves_on_storage_node() {
 
 #[test]
 fn frontend_unix_bucket_write_reservation_mode_uses_storage_node() {
-    let tmp = test_util::tempdir();
+    let (_unix_client_test_guard, tmp) = unix_client_tempdir();
     let node_id = NodeId::new(1);
     let ec_shape = EcShape { k: 1, m: 0 };
     let remote_data_dir = tmp
@@ -2054,7 +2099,7 @@ fn frontend_unix_bucket_write_reservation_mode_uses_storage_node() {
     }
     let server = StorageNodeServer::bind(server_config.clone()).unwrap();
     assert!(remote_data_dir.join(".argmin-storage-node.lock").is_file());
-    let _server_thread = thread::spawn(move || server.serve_forever().unwrap());
+    let _server_guard = spawn_storage_node_server(server);
 
     let frontend_data_dir = tmp
         .path()
@@ -2172,7 +2217,7 @@ fn frontend_unix_bucket_write_reservation_mode_uses_storage_node() {
 
 #[test]
 fn frontend_unix_bucket_snapshot_pair_mode_uses_storage_node() {
-    let tmp = test_util::tempdir();
+    let (_unix_client_test_guard, tmp) = unix_client_tempdir();
     let node_id = NodeId::new(1);
     let ec_shape = EcShape { k: 1, m: 0 };
     let remote_data_dir = tmp.path().join("remote-bucket-snapshot-pair-node-1");
@@ -2245,7 +2290,7 @@ fn frontend_unix_bucket_snapshot_pair_mode_uses_storage_node() {
         remote_pg.refresh_metadata_command_state_digest().unwrap();
     }
     let server = StorageNodeServer::bind(server_config).unwrap();
-    let _server_thread = thread::spawn(move || server.serve_forever().unwrap());
+    let _server_guard = spawn_storage_node_server(server);
 
     let frontend_data_dir = tmp.path().join("frontend-bucket-snapshot-pair-routing");
     let mut map = LocalClusterMap::open_with_configs(
@@ -2299,7 +2344,7 @@ fn frontend_unix_bucket_snapshot_pair_mode_uses_storage_node() {
 
 #[test]
 fn frontend_unix_object_mutation_stream_append_reads_route_to_storage_node() {
-    let tmp = test_util::tempdir();
+    let (_unix_client_test_guard, tmp) = unix_client_tempdir();
     let node_id = NodeId::new(1);
     let ec_shape = EcShape { k: 1, m: 0 };
     let remote_data_dir = tmp.path().join("remote-stream-append-node-1");
@@ -2358,7 +2403,7 @@ fn frontend_unix_object_mutation_stream_append_reads_route_to_storage_node() {
         historical_pg_routes: Vec::new(),
     };
     let server = StorageNodeServer::bind(server_config).unwrap();
-    let _server_thread = thread::spawn(move || server.serve_forever().unwrap());
+    let _server_guard = spawn_storage_node_server(server);
 
     let mut map = LocalClusterMap::open_with_configs(
         node_id,
@@ -2422,7 +2467,7 @@ fn frontend_unix_object_mutation_stream_append_reads_route_to_storage_node() {
 
 #[test]
 fn frontend_unix_object_generation_loser_retries_stale_generation() {
-    let tmp = test_util::tempdir();
+    let (_unix_client_test_guard, tmp) = unix_client_tempdir();
     let node_id = NodeId::new(1);
     let ec_shape = EcShape { k: 1, m: 0 };
     let remote_data_dir = tmp
@@ -2452,7 +2497,7 @@ fn frontend_unix_object_generation_loser_retries_stale_generation() {
         historical_pg_routes: Vec::new(),
     };
     let server = StorageNodeServer::bind(server_config.clone()).unwrap();
-    let _server_thread = thread::spawn(move || server.serve_forever().unwrap());
+    let _server_guard = spawn_storage_node_server(server);
 
     let build_frontend = |name: &str| {
         let mut map = LocalClusterMap::open_with_configs(
@@ -2554,7 +2599,7 @@ fn frontend_unix_object_generation_loser_retries_stale_generation() {
 
 #[test]
 fn frontend_unix_object_generation_loser_retries_rpc_reservation_conflict() {
-    let tmp = test_util::tempdir();
+    let (_unix_client_test_guard, tmp) = unix_client_tempdir();
     let node_id = NodeId::new(1);
     let ec_shape = EcShape { k: 1, m: 0 };
     let remote_data_dir = tmp
@@ -2584,7 +2629,7 @@ fn frontend_unix_object_generation_loser_retries_rpc_reservation_conflict() {
         historical_pg_routes: Vec::new(),
     };
     let server = StorageNodeServer::bind(server_config.clone()).unwrap();
-    let _server_thread = thread::spawn(move || server.serve_forever().unwrap());
+    let _server_guard = spawn_storage_node_server(server);
 
     let build_frontend = |name: &str| {
         let mut map = LocalClusterMap::open_with_configs(
@@ -2682,7 +2727,7 @@ fn frontend_unix_object_generation_loser_retries_rpc_reservation_conflict() {
 
 #[test]
 fn unix_metadata_command_client_install_rejects_relative_socket_path() {
-    let tmp = test_util::tempdir();
+    let (_unix_client_test_guard, tmp) = unix_client_tempdir();
     let node_id = NodeId::new(1);
     let ec_shape = EcShape { k: 1, m: 0 };
     let mut map = LocalClusterMap::open_with_configs(
@@ -2711,7 +2756,7 @@ fn unix_metadata_command_client_install_rejects_relative_socket_path() {
 
 #[test]
 fn unix_bucket_metadata_client_install_rejects_relative_socket_path() {
-    let tmp = test_util::tempdir();
+    let (_unix_client_test_guard, tmp) = unix_client_tempdir();
     let node_id = NodeId::new(1);
     let ec_shape = EcShape { k: 1, m: 0 };
     let mut map = LocalClusterMap::open_with_configs(
@@ -2740,7 +2785,7 @@ fn unix_bucket_metadata_client_install_rejects_relative_socket_path() {
 
 #[test]
 fn unix_bucket_write_reservation_client_install_rejects_relative_socket_path() {
-    let tmp = test_util::tempdir();
+    let (_unix_client_test_guard, tmp) = unix_client_tempdir();
     let node_id = NodeId::new(1);
     let ec_shape = EcShape { k: 1, m: 0 };
     let mut map = LocalClusterMap::open_with_configs(
@@ -2771,7 +2816,7 @@ fn unix_bucket_write_reservation_client_install_rejects_relative_socket_path() {
 
 #[test]
 fn unix_bucket_write_reservation_client_install_requires_matching_bucket_metadata_client() {
-    let tmp = test_util::tempdir();
+    let (_unix_client_test_guard, tmp) = unix_client_tempdir();
     let node_id = NodeId::new(1);
     let ec_shape = EcShape { k: 1, m: 0 };
     let mut map = LocalClusterMap::open_with_configs(
@@ -2861,7 +2906,7 @@ fn unix_bucket_write_reservation_client_install_requires_matching_bucket_metadat
 
 #[test]
 fn unix_object_generation_metadata_client_install_rejects_relative_socket_path() {
-    let tmp = test_util::tempdir();
+    let (_unix_client_test_guard, tmp) = unix_client_tempdir();
     let node_id = NodeId::new(1);
     let ec_shape = EcShape { k: 1, m: 0 };
     let mut map = LocalClusterMap::open_with_configs(
@@ -2892,7 +2937,7 @@ fn unix_object_generation_metadata_client_install_rejects_relative_socket_path()
 
 #[test]
 fn unix_object_version_metadata_client_install_rejects_relative_socket_path() {
-    let tmp = test_util::tempdir();
+    let (_unix_client_test_guard, tmp) = unix_client_tempdir();
     let node_id = NodeId::new(1);
     let ec_shape = EcShape { k: 1, m: 0 };
     let mut map = LocalClusterMap::open_with_configs(
@@ -2923,7 +2968,7 @@ fn unix_object_version_metadata_client_install_rejects_relative_socket_path() {
 
 #[test]
 fn unix_direct_put_metadata_client_install_rejects_relative_socket_path() {
-    let tmp = test_util::tempdir();
+    let (_unix_client_test_guard, tmp) = unix_client_tempdir();
     let node_id = NodeId::new(1);
     let ec_shape = EcShape { k: 1, m: 0 };
     let mut map = LocalClusterMap::open_with_configs(
@@ -2954,7 +2999,7 @@ fn unix_direct_put_metadata_client_install_rejects_relative_socket_path() {
 
 #[test]
 fn unix_object_mutation_metadata_client_install_rejects_relative_socket_path() {
-    let tmp = test_util::tempdir();
+    let (_unix_client_test_guard, tmp) = unix_client_tempdir();
     let node_id = NodeId::new(1);
     let ec_shape = EcShape { k: 1, m: 0 };
     let mut map = LocalClusterMap::open_with_configs(
@@ -2985,7 +3030,7 @@ fn unix_object_mutation_metadata_client_install_rejects_relative_socket_path() {
 
 #[test]
 fn unix_shard_client_install_rejects_relative_socket_paths_before_mutation() {
-    let tmp = test_util::tempdir();
+    let (_unix_client_test_guard, tmp) = unix_client_tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
     let ec_shape = EcShape { k: 2, m: 1 };
     let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0], ec_shape).unwrap();
@@ -3029,7 +3074,7 @@ fn unix_shard_client_install_rejects_relative_socket_paths_before_mutation() {
 
 #[test]
 fn unix_shard_client_fails_closed_when_storage_node_is_unavailable() {
-    let tmp = test_util::tempdir();
+    let (_unix_client_test_guard, tmp) = unix_client_tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
     let ec_shape = EcShape { k: 2, m: 1 };
     let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0], ec_shape).unwrap();
@@ -3095,7 +3140,7 @@ fn unix_shard_client_fails_closed_when_storage_node_is_unavailable() {
 
 #[test]
 fn direct_put_publishes_after_remote_shard_io_and_ack_validation() {
-    let tmp = test_util::tempdir();
+    let (_unix_client_test_guard, tmp) = unix_client_tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
     let ec_shape = EcShape { k: 2, m: 1 };
     let frontend_dir = tmp.path().join("frontend");
@@ -3205,7 +3250,7 @@ fn direct_put_publishes_after_remote_shard_io_and_ack_validation() {
 
 #[test]
 fn non_current_epoch_unix_direct_put_commit_fails_closed_and_cleans_remote_state() {
-    let tmp = test_util::tempdir();
+    let (_unix_client_test_guard, tmp) = unix_client_tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
     let pg_ids = [0, 1, 2, 3];
     let ec_shape = EcShape { k: 2, m: 1 };
@@ -3258,9 +3303,10 @@ fn non_current_epoch_unix_direct_put_commit_fails_closed_and_cleans_remote_state
         });
         client_configs.push(LocalUnixStorageNodeClientConfig::new(node_id, socket_path));
     }
+    let mut _server_guards = Vec::new();
     for config in server_configs.iter().cloned() {
         let server = StorageNodeServer::bind(config).unwrap();
-        let _server_thread = thread::spawn(move || server.serve_forever().unwrap());
+        _server_guards.push(spawn_storage_node_server(server));
     }
     map.install_unix_storage_node_clients(client_configs)
         .unwrap();
@@ -3395,7 +3441,7 @@ fn non_current_epoch_unix_direct_put_commit_fails_closed_and_cleans_remote_state
 
 #[test]
 fn control_plane_peering_unix_direct_put_old_primary_fails_closed_and_cleans_remote_state() {
-    let tmp = test_util::tempdir();
+    let (_unix_client_test_guard, tmp) = unix_client_tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
     let pg_ids = [0, 1, 2, 3];
     let ec_shape = EcShape { k: 2, m: 1 };
@@ -3612,9 +3658,10 @@ fn control_plane_peering_unix_direct_put_old_primary_fails_closed_and_cleans_rem
             socket_path,
         ));
     }
+    let mut _server_guards = Vec::new();
     for config in server_configs.iter().cloned() {
         let server = StorageNodeServer::bind(config).unwrap();
-        let _server_thread = thread::spawn(move || server.serve_forever().unwrap());
+        _server_guards.push(spawn_storage_node_server(server));
     }
 
     let frontend_configs = node_ids
@@ -3774,7 +3821,7 @@ fn control_plane_peering_unix_direct_put_old_primary_fails_closed_and_cleans_rem
 
 #[test]
 fn control_plane_peering_unix_copy_object_destination_old_primary_cleans_remote_staging() {
-    let tmp = test_util::tempdir();
+    let (_unix_client_test_guard, tmp) = unix_client_tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
     let pg_ids = [0, 1, 2, 3];
     let ec_shape = EcShape { k: 2, m: 1 };
@@ -3996,9 +4043,10 @@ fn control_plane_peering_unix_copy_object_destination_old_primary_cleans_remote_
             socket_path,
         ));
     }
+    let mut _server_guards = Vec::new();
     for config in server_configs.iter().cloned() {
         let server = StorageNodeServer::bind(config).unwrap();
-        let _server_thread = thread::spawn(move || server.serve_forever().unwrap());
+        _server_guards.push(spawn_storage_node_server(server));
     }
 
     let frontend_configs = node_ids
@@ -4197,7 +4245,7 @@ fn control_plane_peering_unix_copy_object_destination_old_primary_cleans_remote_
 
 #[test]
 fn control_plane_peering_unix_object_delete_old_primary_fails_closed_without_remote_mutation() {
-    let tmp = test_util::tempdir();
+    let (_unix_client_test_guard, tmp) = unix_client_tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
     let pg_ids = [0, 1, 2, 3];
     let ec_shape = EcShape { k: 2, m: 1 };
@@ -4353,9 +4401,10 @@ fn control_plane_peering_unix_object_delete_old_primary_fails_closed_without_rem
             socket_path,
         ));
     }
+    let mut _server_guards = Vec::new();
     for config in server_configs.iter().cloned() {
         let server = StorageNodeServer::bind(config).unwrap();
-        let _server_thread = thread::spawn(move || server.serve_forever().unwrap());
+        _server_guards.push(spawn_storage_node_server(server));
     }
 
     let frontend_configs = node_ids
@@ -4493,7 +4542,7 @@ fn control_plane_peering_unix_object_delete_old_primary_fails_closed_without_rem
 
 #[test]
 fn control_plane_peering_unix_object_metadata_old_primary_fails_closed_without_remote_mutation() {
-    let tmp = test_util::tempdir();
+    let (_unix_client_test_guard, tmp) = unix_client_tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
     let pg_ids = [0, 1, 2, 3];
     let ec_shape = EcShape { k: 2, m: 1 };
@@ -4649,9 +4698,10 @@ fn control_plane_peering_unix_object_metadata_old_primary_fails_closed_without_r
             socket_path,
         ));
     }
+    let mut _server_guards = Vec::new();
     for config in server_configs.iter().cloned() {
         let server = StorageNodeServer::bind(config).unwrap();
-        let _server_thread = thread::spawn(move || server.serve_forever().unwrap());
+        _server_guards.push(spawn_storage_node_server(server));
     }
 
     let frontend_configs = node_ids
@@ -4795,7 +4845,7 @@ fn control_plane_peering_unix_object_metadata_old_primary_fails_closed_without_r
 #[test]
 fn control_plane_peering_unix_multipart_completion_old_primary_fails_closed_without_remote_mutation(
 ) {
-    let tmp = test_util::tempdir();
+    let (_unix_client_test_guard, tmp) = unix_client_tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
     let pg_ids = [0, 1, 2, 3];
     let ec_shape = EcShape { k: 2, m: 1 };
@@ -4948,9 +4998,10 @@ fn control_plane_peering_unix_multipart_completion_old_primary_fails_closed_with
             socket_path,
         ));
     }
+    let mut _server_guards = Vec::new();
     for config in server_configs.iter().cloned() {
         let server = StorageNodeServer::bind(config).unwrap();
-        let _server_thread = thread::spawn(move || server.serve_forever().unwrap());
+        _server_guards.push(spawn_storage_node_server(server));
     }
 
     let frontend_configs = node_ids
@@ -5116,7 +5167,7 @@ fn control_plane_peering_unix_multipart_completion_old_primary_fails_closed_with
 
 #[test]
 fn control_plane_peering_unix_multipart_abort_old_primary_fails_closed_without_remote_mutation() {
-    let tmp = test_util::tempdir();
+    let (_unix_client_test_guard, tmp) = unix_client_tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
     let pg_ids = [0, 1, 2, 3];
     let ec_shape = EcShape { k: 2, m: 1 };
@@ -5272,9 +5323,10 @@ fn control_plane_peering_unix_multipart_abort_old_primary_fails_closed_without_r
             socket_path,
         ));
     }
+    let mut _server_guards = Vec::new();
     for config in server_configs.iter().cloned() {
         let server = StorageNodeServer::bind(config).unwrap();
-        let _server_thread = thread::spawn(move || server.serve_forever().unwrap());
+        _server_guards.push(spawn_storage_node_server(server));
     }
 
     let frontend_configs = node_ids
@@ -5420,7 +5472,7 @@ fn control_plane_peering_unix_multipart_abort_old_primary_fails_closed_without_r
 #[test]
 fn control_plane_peering_unix_upload_part_session_old_primary_fails_closed_without_remote_mutation()
 {
-    let tmp = test_util::tempdir();
+    let (_unix_client_test_guard, tmp) = unix_client_tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
     let pg_ids = [0, 1, 2, 3];
     let ec_shape = EcShape { k: 2, m: 1 };
@@ -5602,9 +5654,10 @@ fn control_plane_peering_unix_upload_part_session_old_primary_fails_closed_witho
             socket_path,
         ));
     }
+    let mut _server_guards = Vec::new();
     for config in server_configs.iter().cloned() {
         let server = StorageNodeServer::bind(config).unwrap();
-        let _server_thread = thread::spawn(move || server.serve_forever().unwrap());
+        _server_guards.push(spawn_storage_node_server(server));
     }
 
     let frontend_configs = node_ids
@@ -5751,7 +5804,7 @@ fn control_plane_peering_unix_upload_part_session_old_primary_fails_closed_witho
 
 #[test]
 fn control_plane_peering_unix_upload_part_finalize_old_primary_preserves_remote_staging() {
-    let tmp = test_util::tempdir();
+    let (_unix_client_test_guard, tmp) = unix_client_tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
     let pg_ids = [0, 1, 2, 3];
     let ec_shape = EcShape { k: 2, m: 1 };
@@ -6014,9 +6067,10 @@ fn control_plane_peering_unix_upload_part_finalize_old_primary_preserves_remote_
             socket_path,
         ));
     }
+    let mut _server_guards = Vec::new();
     for config in server_configs.iter().cloned() {
         let server = StorageNodeServer::bind(config).unwrap();
-        let _server_thread = thread::spawn(move || server.serve_forever().unwrap());
+        _server_guards.push(spawn_storage_node_server(server));
     }
 
     let frontend_configs = node_ids
@@ -6214,7 +6268,7 @@ fn control_plane_peering_unix_upload_part_finalize_old_primary_preserves_remote_
 
 #[test]
 fn control_plane_peering_unix_stream_put_finalize_old_primary_preserves_remote_staging() {
-    let tmp = test_util::tempdir();
+    let (_unix_client_test_guard, tmp) = unix_client_tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
     let pg_ids = [0, 1, 2, 3];
     let ec_shape = EcShape { k: 2, m: 1 };
@@ -6456,9 +6510,10 @@ fn control_plane_peering_unix_stream_put_finalize_old_primary_preserves_remote_s
             socket_path,
         ));
     }
+    let mut _server_guards = Vec::new();
     for config in server_configs.iter().cloned() {
         let server = StorageNodeServer::bind(config).unwrap();
-        let _server_thread = thread::spawn(move || server.serve_forever().unwrap());
+        _server_guards.push(spawn_storage_node_server(server));
     }
 
     let frontend_configs = node_ids
@@ -6649,7 +6704,7 @@ fn control_plane_peering_unix_stream_put_finalize_old_primary_preserves_remote_s
 
 #[test]
 fn control_plane_peering_unix_upload_part_copy_finalize_old_primary_preserves_remote_staging() {
-    let tmp = test_util::tempdir();
+    let (_unix_client_test_guard, tmp) = unix_client_tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
     let pg_ids = [0, 1, 2, 3];
     let ec_shape = EcShape { k: 2, m: 1 };
@@ -6928,9 +6983,10 @@ fn control_plane_peering_unix_upload_part_copy_finalize_old_primary_preserves_re
             socket_path,
         ));
     }
+    let mut _server_guards = Vec::new();
     for config in server_configs.iter().cloned() {
         let server = StorageNodeServer::bind(config).unwrap();
-        let _server_thread = thread::spawn(move || server.serve_forever().unwrap());
+        _server_guards.push(spawn_storage_node_server(server));
     }
 
     let frontend_configs = node_ids
@@ -7130,7 +7186,7 @@ fn control_plane_peering_unix_upload_part_copy_finalize_old_primary_preserves_re
 
 #[test]
 fn non_current_epoch_unix_stream_append_commit_fails_closed_and_cleans_remote_state() {
-    let tmp = test_util::tempdir();
+    let (_unix_client_test_guard, tmp) = unix_client_tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
     let pg_ids = [0, 1, 2, 3];
     let ec_shape = EcShape { k: 2, m: 1 };
@@ -7188,9 +7244,10 @@ fn non_current_epoch_unix_stream_append_commit_fails_closed_and_cleans_remote_st
         });
         client_configs.push(LocalUnixStorageNodeClientConfig::new(node_id, socket_path));
     }
+    let mut _server_guards = Vec::new();
     for config in server_configs.iter().cloned() {
         let server = StorageNodeServer::bind(config).unwrap();
-        let _server_thread = thread::spawn(move || server.serve_forever().unwrap());
+        _server_guards.push(spawn_storage_node_server(server));
     }
     map.install_unix_storage_node_clients(client_configs)
         .unwrap();
@@ -7331,7 +7388,7 @@ fn non_current_epoch_unix_stream_append_commit_fails_closed_and_cleans_remote_st
 
 #[test]
 fn non_current_epoch_unix_upload_part_stream_session_create_fails_closed_without_remote_mutation() {
-    let tmp = test_util::tempdir();
+    let (_unix_client_test_guard, tmp) = unix_client_tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
     let pg_ids = [0, 1, 2, 3];
     let ec_shape = EcShape { k: 2, m: 1 };
@@ -7390,9 +7447,10 @@ fn non_current_epoch_unix_upload_part_stream_session_create_fails_closed_without
         });
         client_configs.push(LocalUnixStorageNodeClientConfig::new(node_id, socket_path));
     }
+    let mut _server_guards = Vec::new();
     for config in server_configs.iter().cloned() {
         let server = StorageNodeServer::bind(config).unwrap();
-        let _server_thread = thread::spawn(move || server.serve_forever().unwrap());
+        _server_guards.push(spawn_storage_node_server(server));
     }
     map.install_unix_storage_node_clients(client_configs)
         .unwrap();
@@ -7518,7 +7576,7 @@ fn non_current_epoch_unix_upload_part_stream_session_create_fails_closed_without
 
 #[test]
 fn non_current_epoch_unix_upload_part_stream_finalize_fails_closed_without_remote_mutation() {
-    let tmp = test_util::tempdir();
+    let (_unix_client_test_guard, tmp) = unix_client_tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
     let pg_ids = [0, 1, 2, 3];
     let ec_shape = EcShape { k: 2, m: 1 };
@@ -7577,9 +7635,10 @@ fn non_current_epoch_unix_upload_part_stream_finalize_fails_closed_without_remot
         });
         client_configs.push(LocalUnixStorageNodeClientConfig::new(node_id, socket_path));
     }
+    let mut _server_guards = Vec::new();
     for config in server_configs.iter().cloned() {
         let server = StorageNodeServer::bind(config).unwrap();
-        let _server_thread = thread::spawn(move || server.serve_forever().unwrap());
+        _server_guards.push(spawn_storage_node_server(server));
     }
     map.install_unix_storage_node_clients(client_configs)
         .unwrap();
@@ -7788,7 +7847,7 @@ fn non_current_epoch_unix_upload_part_stream_finalize_fails_closed_without_remot
 
 #[test]
 fn non_current_epoch_unix_upload_part_copy_finalize_preserves_copied_staging() {
-    let tmp = test_util::tempdir();
+    let (_unix_client_test_guard, tmp) = unix_client_tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
     let pg_ids = [0, 1, 2, 3];
     let ec_shape = EcShape { k: 2, m: 1 };
@@ -7847,9 +7906,10 @@ fn non_current_epoch_unix_upload_part_copy_finalize_preserves_copied_staging() {
         });
         client_configs.push(LocalUnixStorageNodeClientConfig::new(node_id, socket_path));
     }
+    let mut _server_guards = Vec::new();
     for config in server_configs.iter().cloned() {
         let server = StorageNodeServer::bind(config).unwrap();
-        let _server_thread = thread::spawn(move || server.serve_forever().unwrap());
+        _server_guards.push(spawn_storage_node_server(server));
     }
     map.install_unix_storage_node_clients(client_configs)
         .unwrap();
@@ -8076,7 +8136,7 @@ fn non_current_epoch_unix_upload_part_copy_finalize_preserves_copied_staging() {
 
 #[test]
 fn non_current_epoch_unix_multipart_completion_fails_closed_without_remote_mutation() {
-    let tmp = test_util::tempdir();
+    let (_unix_client_test_guard, tmp) = unix_client_tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
     let pg_ids = [0, 1, 2, 3];
     let ec_shape = EcShape { k: 2, m: 1 };
@@ -8135,9 +8195,10 @@ fn non_current_epoch_unix_multipart_completion_fails_closed_without_remote_mutat
         });
         client_configs.push(LocalUnixStorageNodeClientConfig::new(node_id, socket_path));
     }
+    let mut _server_guards = Vec::new();
     for config in server_configs.iter().cloned() {
         let server = StorageNodeServer::bind(config).unwrap();
-        let _server_thread = thread::spawn(move || server.serve_forever().unwrap());
+        _server_guards.push(spawn_storage_node_server(server));
     }
     map.install_unix_storage_node_clients(client_configs)
         .unwrap();
@@ -8236,7 +8297,7 @@ fn non_current_epoch_unix_multipart_completion_fails_closed_without_remote_mutat
 
 #[test]
 fn non_current_epoch_unix_object_metadata_update_fails_closed_without_remote_mutation() {
-    let tmp = test_util::tempdir();
+    let (_unix_client_test_guard, tmp) = unix_client_tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
     let pg_ids = [0, 1, 2, 3];
     let ec_shape = EcShape { k: 2, m: 1 };
@@ -8294,9 +8355,10 @@ fn non_current_epoch_unix_object_metadata_update_fails_closed_without_remote_mut
         });
         client_configs.push(LocalUnixStorageNodeClientConfig::new(node_id, socket_path));
     }
+    let mut _server_guards = Vec::new();
     for config in server_configs.iter().cloned() {
         let server = StorageNodeServer::bind(config).unwrap();
-        let _server_thread = thread::spawn(move || server.serve_forever().unwrap());
+        _server_guards.push(spawn_storage_node_server(server));
     }
     map.install_unix_storage_node_clients(client_configs)
         .unwrap();
@@ -8391,7 +8453,7 @@ fn non_current_epoch_unix_object_metadata_update_fails_closed_without_remote_mut
 
 #[test]
 fn non_current_epoch_unix_object_delete_fails_closed_without_remote_mutation() {
-    let tmp = test_util::tempdir();
+    let (_unix_client_test_guard, tmp) = unix_client_tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
     let pg_ids = [0, 1, 2, 3];
     let ec_shape = EcShape { k: 2, m: 1 };
@@ -8449,9 +8511,10 @@ fn non_current_epoch_unix_object_delete_fails_closed_without_remote_mutation() {
         });
         client_configs.push(LocalUnixStorageNodeClientConfig::new(node_id, socket_path));
     }
+    let mut _server_guards = Vec::new();
     for config in server_configs.iter().cloned() {
         let server = StorageNodeServer::bind(config).unwrap();
-        let _server_thread = thread::spawn(move || server.serve_forever().unwrap());
+        _server_guards.push(spawn_storage_node_server(server));
     }
     map.install_unix_storage_node_clients(client_configs)
         .unwrap();
@@ -8541,7 +8604,7 @@ fn non_current_epoch_unix_object_delete_fails_closed_without_remote_mutation() {
 
 #[test]
 fn historical_payload_shard_inspection_can_route_to_unix_storage_node_client() {
-    let tmp = test_util::tempdir();
+    let (_unix_client_test_guard, tmp) = unix_client_tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
     let target_node = NodeId::new(1);
     let ec_shape = EcShape { k: 2, m: 1 };
@@ -8632,7 +8695,7 @@ fn historical_payload_shard_inspection_can_route_to_unix_storage_node_client() {
 
 #[test]
 fn cross_epoch_segment_read_uses_retained_route_over_unix_storage_nodes() {
-    let tmp = test_util::tempdir();
+    let (_unix_client_test_guard, tmp) = unix_client_tempdir();
     let node_ids = [
         NodeId::new(0),
         NodeId::new(1),
@@ -8693,9 +8756,10 @@ fn cross_epoch_segment_read_uses_retained_route_over_unix_storage_nodes() {
         });
         shard_client_configs.push(LocalUnixShardNodeClientConfig::new(node_id, socket_path));
     }
+    let mut _server_guards = Vec::new();
     for config in server_configs.iter().cloned() {
         let server = StorageNodeServer::bind(config).unwrap();
-        let _server_thread = thread::spawn(move || server.serve_forever().unwrap());
+        _server_guards.push(spawn_storage_node_server(server));
     }
     current_map
         .install_unix_shard_clients(shard_client_configs.clone())
@@ -8778,7 +8842,7 @@ fn cross_epoch_segment_read_uses_retained_route_over_unix_storage_nodes() {
 
 #[test]
 fn remote_shard_files_without_ack_rows_are_not_publishable() {
-    let tmp = test_util::tempdir();
+    let (_unix_client_test_guard, tmp) = unix_client_tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
     let ec_shape = EcShape { k: 2, m: 1 };
     let frontend_dir = tmp.path().join("frontend");
@@ -8923,7 +8987,7 @@ fn remote_shard_files_without_ack_rows_are_not_publishable() {
 
 #[test]
 fn remote_shard_ack_rows_on_wrong_node_are_not_publishable() {
-    let tmp = test_util::tempdir();
+    let (_unix_client_test_guard, tmp) = unix_client_tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
     let wrong_ack_node = NodeId::new(1);
     let ec_shape = EcShape { k: 2, m: 1 };
