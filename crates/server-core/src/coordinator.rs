@@ -602,6 +602,7 @@ impl Coordinator {
 
 #[cfg(test)]
 mod bucket_fast_path_cache_tests {
+    use super::test_panic::SuppressExpectedTestPanic;
     use super::*;
     use std::panic::AssertUnwindSafe;
 
@@ -636,10 +637,14 @@ mod bucket_fast_path_cache_tests {
     #[test]
     fn shared_bucket_fast_path_recovers_from_poisoned_lock() {
         let shared = CoordinatorSharedCaches::default();
-        let _ = std::panic::catch_unwind(AssertUnwindSafe(|| {
-            let _guard = shared.bucket_fast_path.write().unwrap();
-            panic!("poison bucket fast path lock");
-        }));
+        let poison_result = {
+            let _panic_guard = SuppressExpectedTestPanic::enter();
+            std::panic::catch_unwind(AssertUnwindSafe(|| {
+                let _guard = shared.bucket_fast_path.write().unwrap();
+                panic!("poison bucket fast path lock");
+            }))
+        };
+        assert!(poison_result.is_err());
 
         write_rwlock_unpoisoned(&shared.bucket_fast_path)
             .insert(bucket_fast_path_info("bucket"))
@@ -756,6 +761,8 @@ mod runtime;
 mod streaming;
 #[cfg(test)]
 mod test_hooks;
+#[cfg(test)]
+mod test_panic;
 #[cfg(test)]
 mod test_support;
 #[cfg(test)]

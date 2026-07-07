@@ -1,4 +1,5 @@
 use super::test_helpers::{self, UploadPartRequest};
+use super::test_panic::SuppressExpectedTestPanic;
 use super::test_support::*;
 use super::test_topology::*;
 use super::*;
@@ -4977,10 +4978,14 @@ fn delete_bucket_metadata_or_accept_reclaim_worker_finalize(
 #[test]
 fn lock_mutex_unpoisoned_recovers_after_panic() {
     let lock = Mutex::new(vec![1usize]);
-    let _ = std::panic::catch_unwind(AssertUnwindSafe(|| {
-        let _guard = lock.lock().unwrap();
-        panic!("poison mutex");
-    }));
+    let poison_result = {
+        let _panic_guard = SuppressExpectedTestPanic::enter();
+        std::panic::catch_unwind(AssertUnwindSafe(|| {
+            let _guard = lock.lock().unwrap();
+            panic!("poison mutex");
+        }))
+    };
+    assert!(poison_result.is_err());
 
     lock_mutex_unpoisoned(&lock).push(2);
     assert_eq!(*lock_mutex_unpoisoned(&lock), vec![1, 2]);
@@ -4989,11 +4994,15 @@ fn lock_mutex_unpoisoned_recovers_after_panic() {
 #[test]
 fn rwlock_helpers_recover_after_panic() {
     let lock = RwLock::new(HashMap::from([("bucket".to_string(), 1usize)]));
-    let _ = std::panic::catch_unwind(AssertUnwindSafe(|| {
-        let mut guard = lock.write().unwrap();
-        guard.insert("poisoned".to_string(), 2);
-        panic!("poison rwlock");
-    }));
+    let poison_result = {
+        let _panic_guard = SuppressExpectedTestPanic::enter();
+        std::panic::catch_unwind(AssertUnwindSafe(|| {
+            let mut guard = lock.write().unwrap();
+            guard.insert("poisoned".to_string(), 2);
+            panic!("poison rwlock");
+        }))
+    };
+    assert!(poison_result.is_err());
 
     write_rwlock_unpoisoned(&lock).insert("ok".to_string(), 3);
     let guard = read_rwlock_unpoisoned(&lock);
