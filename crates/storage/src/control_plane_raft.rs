@@ -10115,6 +10115,72 @@ mod tests {
     }
 
     #[test]
+    fn control_plane_raft_peer_auth_policy_wraps_and_verifies_response_frames() {
+        let request_identity =
+            ControlPlaneRaftPeerFrameIdentity::new("control-plane-raft-peer-transport-test", 1, 2);
+        let response_identity = reverse_raft_peer_frame_identity(&request_identity);
+
+        let samples: Vec<(ControlPlaneAuthOperation, Vec<u8>)> = vec![
+            (
+                ControlPlaneAuthOperation::RaftAppendEntries,
+                ControlPlaneRaftPeerRpcResponse::AppendEntries(AppendEntriesResponse::HigherVote(
+                    Vote::<ControlPlaneRaftLeaderId>::new(5, 2),
+                ))
+                .encode_frame_for_peer(&response_identity)
+                .unwrap(),
+            ),
+            (
+                ControlPlaneAuthOperation::RaftVote,
+                ControlPlaneRaftPeerRpcResponse::Vote(VoteResponse {
+                    vote: Vote::<ControlPlaneRaftLeaderId>::new_committed(5, 2),
+                    vote_granted: true,
+                    last_log_id: Some(raft_log_id(5, 2, 11)),
+                })
+                .encode_frame_for_peer(&response_identity)
+                .unwrap(),
+            ),
+            (
+                ControlPlaneAuthOperation::RaftPreVote,
+                ControlPlaneRaftPeerRpcResponse::Vote(VoteResponse {
+                    vote: Vote::<ControlPlaneRaftLeaderId>::new(5, 2),
+                    vote_granted: false,
+                    last_log_id: None,
+                })
+                .encode_frame_for_peer(&response_identity)
+                .unwrap(),
+            ),
+            (
+                ControlPlaneAuthOperation::RaftTransferLeader,
+                ControlPlaneRaftPeerRpcResponse::TransferLeader(Ok(()))
+                    .encode_frame_for_peer(&response_identity)
+                    .unwrap(),
+            ),
+            (
+                ControlPlaneAuthOperation::RaftSnapshot,
+                ControlPlaneRaftPeerSnapshotResponse {
+                    response: SnapshotResponse::new(
+                        Vote::<ControlPlaneRaftLeaderId>::new_committed(5, 2),
+                    ),
+                }
+                .encode_frame_for_peer(&response_identity)
+                .unwrap(),
+            ),
+        ];
+
+        for (operation, raw_frame) in samples {
+            let signed = test_peer_auth_policy(2)
+                .sign_peer_frame(&response_identity, operation, raw_frame.clone())
+                .unwrap();
+            assert_eq!(
+                test_peer_auth_policy(1)
+                    .verify_peer_frame(&signed, &response_identity, operation, 4096)
+                    .unwrap(),
+                raw_frame
+            );
+        }
+    }
+
+    #[test]
     fn control_plane_raft_peer_auth_policy_rejects_missing_wrong_or_tampered_auth() {
         let identity =
             ControlPlaneRaftPeerFrameIdentity::new("control-plane-raft-peer-transport-test", 1, 2);
@@ -10248,6 +10314,36 @@ mod tests {
             .verify_peer_frame(
                 &wrong_target_envelope,
                 &identity,
+                ControlPlaneAuthOperation::RaftVote,
+                4096,
+            )
+            .is_err());
+
+        let response_identity = reverse_raft_peer_frame_identity(&identity);
+        let append_response_payload = ControlPlaneRaftPeerRpcResponse::AppendEntries(
+            AppendEntriesResponse::HigherVote(Vote::<ControlPlaneRaftLeaderId>::new(4, 1)),
+        )
+        .encode_frame_for_peer(&response_identity)
+        .unwrap();
+        let mismatched_response_envelope = test_peer_scoped_credential(2)
+            .sign_envelope(ControlPlaneAuthSignInput {
+                target: ControlPlaneAuthTarget::Principal(ControlPlaneAuthPrincipal::RaftPeer {
+                    node_id: 1,
+                }),
+                operation: ControlPlaneAuthOperation::RaftVote,
+                issued_at_ms: None,
+                expires_at_ms: None,
+                sequence: None,
+                nonce: Vec::new(),
+                payload: append_response_payload,
+            })
+            .unwrap()
+            .encode_frame()
+            .unwrap();
+        assert!(test_peer_auth_policy(1)
+            .verify_peer_frame(
+                &mismatched_response_envelope,
+                &response_identity,
                 ControlPlaneAuthOperation::RaftVote,
                 4096,
             )
@@ -11091,6 +11187,197 @@ mod tests {
                     last_log_id: Some(raft_log_id(7, 2, 11)),
                 }
             );
+            server.join().unwrap();
+            let _ = std::fs::remove_file(socket_path);
+        });
+    }
+
+    #[test]
+    fn control_plane_raft_unix_peer_network_vote_round_trips_authenticated_response() {
+        ControlPlaneRaftTypeConfig::run(async {
+            let socket_path = raft_unix_socket_path("vote-auth-round-trip");
+            let listener = UnixListener::bind(&socket_path).unwrap();
+            let limits = ControlPlaneRaftPeerTransportLimits {
+                max_frame_bytes: 4096,
+                max_append_entries: 8,
+                max_append_entries_bytes: 4096,
+                max_snapshot_bytes: 4096,
+            };
+            let request_identity = ControlPlaneRaftPeerFrameIdentity::new(
+                "control-plane-raft-peer-transport-test",
+                1,
+                2,
+            );
+            let server_identity = request_identity.clone();
+            let server_path = socket_path.clone();
+            let server = thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(1)))
+                    .unwrap();
+                stream
+                    .set_write_timeout(Some(Duration::from_secs(1)))
+                    .unwrap();
+
+                let request_frame = read_control_plane_raft_peer_transport_frame(
+                    &mut stream,
+                    limits.max_frame_bytes,
+                )
+                .unwrap();
+                let request_frame = test_peer_auth_policy(2)
+                    .verify_peer_frame(
+                        &request_frame,
+                        &server_identity,
+                        ControlPlaneAuthOperation::RaftVote,
+                        limits.max_frame_bytes,
+                    )
+                    .unwrap();
+                let request = ControlPlaneRaftPeerRpcRequest::decode_frame_for_peer(
+                    &request_frame,
+                    &server_identity,
+                )
+                .unwrap();
+                let ControlPlaneRaftPeerRpcRequest::Vote(request) = request else {
+                    panic!("decoded wrong Unix peer request variant");
+                };
+                assert_eq!(request.vote, Vote::<ControlPlaneRaftLeaderId>::new(7, 1));
+
+                let response = ControlPlaneRaftPeerRpcResponse::Vote(VoteResponse {
+                    vote: Vote::<ControlPlaneRaftLeaderId>::new_committed(8, 2),
+                    vote_granted: true,
+                    last_log_id: Some(raft_log_id(7, 2, 11)),
+                });
+                let response_identity = reverse_raft_peer_frame_identity(&server_identity);
+                let response_frame = response.encode_frame_for_peer(&response_identity).unwrap();
+                let signed_response = test_peer_auth_policy(2)
+                    .sign_peer_frame(
+                        &response_identity,
+                        ControlPlaneAuthOperation::RaftVote,
+                        response_frame,
+                    )
+                    .unwrap();
+                write_control_plane_raft_peer_transport_frame(&mut stream, &signed_response)
+                    .unwrap();
+                let _ = std::fs::remove_file(server_path);
+            });
+
+            let node = BasicNode::new(socket_path.display().to_string());
+            let policy = ControlPlaneRaftPeerTransportPolicy::new(
+                "control-plane-raft-peer-transport-test",
+                BTreeMap::from([(1, BasicNode::new("node-1")), (2, node.clone())]),
+                limits,
+            )
+            .with_auth_policy(test_peer_auth_policy(1));
+            let mut factory =
+                ControlPlaneRaftUnixPeerNetworkFactory::new(1, policy, Duration::from_secs(1));
+            let mut network = factory.new_client(2, &node).await;
+            let response = network
+                .vote(
+                    VoteRequest {
+                        vote: Vote::<ControlPlaneRaftLeaderId>::new(7, 1),
+                        last_log_id: Some(raft_log_id(6, 1, 10)),
+                        leadership_transfer: false,
+                    },
+                    RPCOption::new(Duration::from_secs(1)),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(
+                response,
+                VoteResponse {
+                    vote: Vote::<ControlPlaneRaftLeaderId>::new_committed(8, 2),
+                    vote_granted: true,
+                    last_log_id: Some(raft_log_id(7, 2, 11)),
+                }
+            );
+            server.join().unwrap();
+            let _ = std::fs::remove_file(socket_path);
+        });
+    }
+
+    #[test]
+    fn control_plane_raft_unix_peer_network_rejects_unauthenticated_response_when_auth_required() {
+        ControlPlaneRaftTypeConfig::run(async {
+            let socket_path = raft_unix_socket_path("vote-unauth-response");
+            let listener = UnixListener::bind(&socket_path).unwrap();
+            let limits = ControlPlaneRaftPeerTransportLimits {
+                max_frame_bytes: 4096,
+                max_append_entries: 8,
+                max_append_entries_bytes: 4096,
+                max_snapshot_bytes: 4096,
+            };
+            let request_identity = ControlPlaneRaftPeerFrameIdentity::new(
+                "control-plane-raft-peer-transport-test",
+                1,
+                2,
+            );
+            let server_identity = request_identity.clone();
+            let server_path = socket_path.clone();
+            let server = thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(1)))
+                    .unwrap();
+                stream
+                    .set_write_timeout(Some(Duration::from_secs(1)))
+                    .unwrap();
+
+                let request_frame = read_control_plane_raft_peer_transport_frame(
+                    &mut stream,
+                    limits.max_frame_bytes,
+                )
+                .unwrap();
+                test_peer_auth_policy(2)
+                    .verify_peer_frame(
+                        &request_frame,
+                        &server_identity,
+                        ControlPlaneAuthOperation::RaftVote,
+                        limits.max_frame_bytes,
+                    )
+                    .unwrap();
+
+                let response_identity = reverse_raft_peer_frame_identity(&server_identity);
+                let response = ControlPlaneRaftPeerRpcResponse::Vote(VoteResponse {
+                    vote: Vote::<ControlPlaneRaftLeaderId>::new_committed(8, 2),
+                    vote_granted: true,
+                    last_log_id: None,
+                });
+                let response_frame = response.encode_frame_for_peer(&response_identity).unwrap();
+                write_control_plane_raft_peer_transport_frame(&mut stream, &response_frame)
+                    .unwrap();
+                let _ = std::fs::remove_file(server_path);
+            });
+
+            let node = BasicNode::new(socket_path.display().to_string());
+            let policy = ControlPlaneRaftPeerTransportPolicy::new(
+                "control-plane-raft-peer-transport-test",
+                BTreeMap::from([(1, BasicNode::new("node-1")), (2, node.clone())]),
+                limits,
+            )
+            .with_auth_policy(test_peer_auth_policy(1));
+            let mut factory =
+                ControlPlaneRaftUnixPeerNetworkFactory::new(1, policy, Duration::from_secs(1));
+            let mut network = factory.new_client(2, &node).await;
+            let err = network
+                .vote(
+                    VoteRequest {
+                        vote: Vote::<ControlPlaneRaftLeaderId>::new(7, 1),
+                        last_log_id: None,
+                        leadership_transfer: false,
+                    },
+                    RPCOption::new(Duration::from_secs(1)),
+                )
+                .await
+                .unwrap_err();
+
+            assert!(matches!(
+                err,
+                RPCError::Network(error)
+                    if error
+                        .to_string()
+                        .contains("auth response decode peer frame failed")
+            ));
             server.join().unwrap();
             let _ = std::fs::remove_file(socket_path);
         });

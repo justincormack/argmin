@@ -258,6 +258,14 @@ Status:
   secrets, MAC/authenticator bytes, nonces, and payload contents are not
   exposed. Storage-node, frontend, admin, and runtime-map auth diagnostics
   remain deferred with their respective enforcement slices.
+- 2026-07-07: Tightened item 4 response coverage for Raft peer RPCs. Unix peer
+  network tests now prove an authenticated vote request receives and verifies a
+  reverse-identity authenticated response, and that an unauthenticated response
+  fails closed when peer auth is required.
+- 2026-07-07: Extended response-side item 4 coverage at the reusable policy
+  boundary. Tests now sign and verify append, vote, pre-vote, snapshot, and
+  transfer-leader response frames with reverse peer identity, and reject a
+  forged envelope whose operation does not match the embedded response kind.
 
 ## Path-Specific Enforcement Order
 
