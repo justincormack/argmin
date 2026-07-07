@@ -1599,7 +1599,7 @@ impl HttpFrontend {
                             crate::coordinator::WriteEncryptionRequest::from_request_parts(
                                 dst_sse_customer.as_ref(),
                                 destination_managed_encryption,
-                            ),
+                            )?,
                         object_lock,
                     })?;
                     Ok(S3Response::copy_object(&result))
@@ -1663,7 +1663,7 @@ impl HttpFrontend {
                                         sse_customer.as_ref(),
                                         sse_s3
                                             .then_some(storage::ManagedEncryptionAlgorithm::Aes256),
-                                    ),
+                                    )?,
                             })?;
                     let mut resp = S3Response::put_object(&result);
                     apply_sse_customer_write_response_headers(&mut resp, sse_customer.as_ref());
@@ -2739,7 +2739,7 @@ impl HttpFrontend {
                         encryption: crate::coordinator::WriteEncryptionRequest::from_request_parts(
                             sse_customer.as_ref(),
                             sse_s3.then_some(storage::ManagedEncryptionAlgorithm::Aes256),
-                        ),
+                        )?,
                     },
                 )?;
                 Ok(S3Response::create_multipart_upload(
@@ -3585,7 +3585,7 @@ impl HttpFrontend {
         let request_encryption = crate::coordinator::WriteEncryptionRequest::from_request_parts(
             sse_customer_request.as_ref(),
             managed_encryption,
-        );
+        )?;
         let bucket_name = parse_bucket_name(bucket)?;
         let prepared_put = self
             .coordinator
@@ -3990,7 +3990,7 @@ impl HttpFrontend {
                     encryption: crate::coordinator::WriteEncryptionRequest::from_request_parts(
                         sse_customer_request.as_ref(),
                         managed_encryption,
-                    ),
+                    )?,
                 },
             )?;
 

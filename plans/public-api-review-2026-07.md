@@ -18,7 +18,7 @@ smaller per-crate items.
 
 ## Status
 
-In progress. A1-A10, S1-S4, S6, K1-K4, H1-H8, all of P1/P2, the first four
+In progress. A1-A10, S1-S4, S6, K1-K4, H1-H8, all of P1/P2, the first five
 P3 items, and all re-review items RR1-RR16 are done. A verification pass on
 2026-07-06 confirmed all 16 RR fixes against the code (workspace
 `cargo check --all-targets` clean; auth crate 454 unit tests pass; targeted
@@ -909,11 +909,14 @@ each is one refactor away from a panic:
   and make the algorithm implicit in the core type; HTTP parsing still rejects
   non-`AES256` inputs before constructing `SseCustomerRequest`, while
   `algorithm()` returns the canonical constant.
-- [ ] `WriteEncryptionRequest::from_request_parts` has
+- [x] `WriteEncryptionRequest::from_request_parts` has
   `unreachable!` on conflicting SSE-C+SSE-S3 inputs
   (`coordinator/request_types.rs:317-326`) — invariant enforced in a
   different crate, 5 call sites; with `abort_on_500` a future mistake is a
-  process abort. Return `Err(InvalidArgument)`.
+  process abort. Resolution: make the constructor fallible, return
+  `InvalidArgument` with the existing SSE-C/SSE-S3 conflict message, update the
+  HTTP callers to propagate it, and add a core regression for the direct
+  conflicting-input path.
 - [ ] `LifecycleRuleFilter` pub fields permit states the parser never
   produces (legacy rule with tags) which render as V2 `<Filter>`
   (`s3-types/src/lifecycle.rs:37-43`). Constructor or doc note on

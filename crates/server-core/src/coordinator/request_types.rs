@@ -313,18 +313,18 @@ impl<'a> WriteEncryptionRequest<'a> {
         Self::Managed(algorithm)
     }
 
-    #[must_use]
     pub fn from_request_parts(
         sse_customer: Option<&'a SseCustomerRequest>,
         managed_encryption: Option<ManagedEncryptionAlgorithm>,
-    ) -> Self {
+    ) -> Result<Self, ServerError> {
         match (sse_customer, managed_encryption) {
-            (Some(request), None) => Self::sse_customer(request),
-            (None, Some(algorithm)) => Self::managed(algorithm),
-            (None, None) => Self::none(),
-            (Some(_), Some(_)) => {
-                unreachable!("request parsing should reject conflicting SSE-C and SSE-S3")
-            }
+            (Some(request), None) => Ok(Self::sse_customer(request)),
+            (None, Some(algorithm)) => Ok(Self::managed(algorithm)),
+            (None, None) => Ok(Self::none()),
+            (Some(_), Some(_)) => Err(ServerError::InvalidArgument {
+                reason: "x-amz-server-side-encryption may not be used with SSE-C headers"
+                    .to_string(),
+            }),
         }
     }
 

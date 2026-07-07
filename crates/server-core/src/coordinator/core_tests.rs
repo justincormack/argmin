@@ -5939,6 +5939,21 @@ fn begin_stream_put_effective_policy_context_uses_request_encryption() {
 }
 
 #[test]
+fn write_encryption_request_rejects_conflicting_sse_c_and_sse_s3() {
+    let sse_customer = test_sse_customer_request();
+    let err = WriteEncryptionRequest::from_request_parts(
+        Some(&sse_customer),
+        Some(ManagedEncryptionAlgorithm::Aes256),
+    )
+    .unwrap_err();
+    assert!(matches!(
+        err,
+        ServerError::InvalidArgument { reason }
+            if reason == "x-amz-server-side-encryption may not be used with SSE-C headers"
+    ));
+}
+
+#[test]
 fn put_object_persists_explicit_object_owner_identity() {
     let tmp = test_util::tempdir();
     let coord = setup_coordinator(tmp.path());
