@@ -1,5 +1,7 @@
 use crate::control_plane::ControlPlaneError;
 use placement::NodeId;
+use ring::hmac;
+use std::fmt;
 
 const CONTROL_PLANE_AUTH_MAGIC: &[u8; 8] = b"ARGCPAUT";
 const CONTROL_PLANE_AUTH_VERSION: u16 = 1;
@@ -8,6 +10,7 @@ const CONTROL_PLANE_AUTH_MAX_CREDENTIAL_ID_LEN: usize = 128;
 const CONTROL_PLANE_AUTH_MAX_INSTANCE_ID_LEN: usize = 128;
 const CONTROL_PLANE_AUTH_MAX_NONCE_LEN: usize = 32;
 const CONTROL_PLANE_AUTH_MAX_AUTHENTICATOR_LEN: usize = 128;
+const CONTROL_PLANE_AUTH_MAX_SECRET_LEN: usize = 4096;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ControlPlaneAuthPrincipal {
@@ -116,7 +119,315 @@ pub enum ControlPlaneAuthDecision {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ControlPlaneScopedCredential {
+    cluster_id: String,
+    credential_id: String,
+    credential_version: u64,
+    principal: ControlPlaneAuthPrincipal,
+    secret: Vec<u8>,
+}
+
+impl fmt::Debug for ControlPlaneScopedCredential {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ControlPlaneScopedCredential")
+            .field("cluster_id", &self.cluster_id)
+            .field("credential_id", &self.credential_id)
+            .field("credential_version", &self.credential_version)
+            .field("principal", &self.principal)
+            .field("secret", &"<redacted>")
+            .finish()
+    }
+}
+
+impl Clone for ControlPlaneScopedCredential {
+    fn clone(&self) -> Self {
+        Self {
+            cluster_id: self.cluster_id.clone(),
+            credential_id: self.credential_id.clone(),
+            credential_version: self.credential_version,
+            principal: self.principal.clone(),
+            secret: self.secret.clone(),
+        }
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct ControlPlaneScopedCredentialInput {
+    pub cluster_id: String,
+    pub credential_id: String,
+    pub credential_version: u64,
+    pub principal: ControlPlaneAuthPrincipal,
+    pub secret: Vec<u8>,
+}
+
+impl fmt::Debug for ControlPlaneScopedCredentialInput {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ControlPlaneScopedCredentialInput")
+            .field("cluster_id", &self.cluster_id)
+            .field("credential_id", &self.credential_id)
+            .field("credential_version", &self.credential_version)
+            .field("principal", &self.principal)
+            .field("secret", &"<redacted>")
+            .finish()
+    }
+}
+
+impl ControlPlaneScopedCredential {
+    pub fn new(input: ControlPlaneScopedCredentialInput) -> Result<Self, ControlPlaneError> {
+        let credential = Self {
+            cluster_id: input.cluster_id,
+            credential_id: input.credential_id,
+            credential_version: input.credential_version,
+            principal: input.principal,
+            secret: input.secret,
+        };
+        credential.validate()?;
+        Ok(credential)
+    }
+
+    #[must_use]
+    pub fn cluster_id(&self) -> &str {
+        &self.cluster_id
+    }
+
+    #[must_use]
+    pub fn credential_id(&self) -> &str {
+        &self.credential_id
+    }
+
+    #[must_use]
+    pub fn credential_version(&self) -> u64 {
+        self.credential_version
+    }
+
+    #[must_use]
+    pub fn principal(&self) -> &ControlPlaneAuthPrincipal {
+        &self.principal
+    }
+
+    pub fn sign_envelope(
+        &self,
+        input: ControlPlaneAuthSignInput,
+    ) -> Result<ControlPlaneAuthEnvelope, ControlPlaneError> {
+        self.validate()?;
+        let header = ControlPlaneAuthEnvelopeHeader::new(ControlPlaneAuthEnvelopeHeaderInput {
+            cluster_id: self.cluster_id.clone(),
+            credential_id: self.credential_id.clone(),
+            credential_version: self.credential_version,
+            source: self.principal.clone(),
+            target: input.target,
+            operation: input.operation,
+            issued_at_ms: input.issued_at_ms,
+            expires_at_ms: input.expires_at_ms,
+            sequence: input.sequence,
+            nonce: input.nonce,
+        })?;
+        let covered = header.encode_covered_bytes(&input.payload)?;
+        let key = hmac::Key::new(hmac::HMAC_SHA256, &self.secret);
+        let authenticator = hmac::sign(&key, &covered).as_ref().to_vec();
+        ControlPlaneAuthEnvelope::new(header, input.payload, authenticator)
+    }
+
+    fn validate(&self) -> Result<(), ControlPlaneError> {
+        validate_nonempty_string(
+            &self.cluster_id,
+            CONTROL_PLANE_AUTH_MAX_CLUSTER_ID_LEN,
+            "auth credential cluster id",
+        )?;
+        validate_nonempty_string(
+            &self.credential_id,
+            CONTROL_PLANE_AUTH_MAX_CREDENTIAL_ID_LEN,
+            "auth credential id",
+        )?;
+        if self.credential_version == 0 {
+            return Err(auth_protocol_error("auth credential version is zero"));
+        }
+        self.principal.validate()?;
+        validate_secret(&self.secret)?;
+        Ok(())
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct ControlPlaneAuthSignInput {
+    pub target: ControlPlaneAuthTarget,
+    pub operation: ControlPlaneAuthOperation,
+    pub issued_at_ms: Option<u64>,
+    pub expires_at_ms: Option<u64>,
+    pub sequence: Option<u64>,
+    pub nonce: Vec<u8>,
+    pub payload: Vec<u8>,
+}
+
+impl fmt::Debug for ControlPlaneAuthSignInput {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ControlPlaneAuthSignInput")
+            .field("target", &self.target)
+            .field("operation", &self.operation)
+            .field("issued_at_ms", &self.issued_at_ms)
+            .field("expires_at_ms", &self.expires_at_ms)
+            .field("sequence", &self.sequence)
+            .field("nonce_len", &self.nonce.len())
+            .field("payload_len", &self.payload.len())
+            .finish()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct ControlPlaneAuthVerificationInput<'a> {
+    pub envelope: &'a ControlPlaneAuthEnvelope,
+    pub expected_cluster_id: &'a str,
+    pub expected_source: &'a ControlPlaneAuthPrincipal,
+    pub expected_target: &'a ControlPlaneAuthTarget,
+    pub expected_operation: ControlPlaneAuthOperation,
+    pub now_ms: Option<u64>,
+}
+
+impl fmt::Debug for ControlPlaneAuthVerificationInput<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ControlPlaneAuthVerificationInput")
+            .field("expected_cluster_id", &self.expected_cluster_id)
+            .field("expected_source", &self.expected_source)
+            .field("expected_target", &self.expected_target)
+            .field("expected_operation", &self.expected_operation)
+            .field("now_ms", &self.now_ms)
+            .field("envelope_cluster_id", &self.envelope.header().cluster_id())
+            .field(
+                "envelope_credential_id",
+                &self.envelope.header().credential_id(),
+            )
+            .field(
+                "envelope_credential_version",
+                &self.envelope.header().credential_version(),
+            )
+            .field("envelope_source", &self.envelope.header().source())
+            .field("envelope_target", &self.envelope.header().target())
+            .field("envelope_operation", &self.envelope.header().operation())
+            .field("envelope_payload_len", &self.envelope.payload().len())
+            .field(
+                "envelope_authenticator_len",
+                &self.envelope.authenticator().len(),
+            )
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ControlPlaneScopedCredentialStore {
+    credentials: Vec<ControlPlaneScopedCredential>,
+}
+
+impl ControlPlaneScopedCredentialStore {
+    pub fn new(credentials: Vec<ControlPlaneScopedCredential>) -> Result<Self, ControlPlaneError> {
+        if credentials.is_empty() {
+            return Err(auth_protocol_error("auth credential store is empty"));
+        }
+        for credential in &credentials {
+            credential.validate()?;
+        }
+        for (index, credential) in credentials.iter().enumerate() {
+            if credentials[index + 1..].iter().any(|other| {
+                other.cluster_id == credential.cluster_id
+                    && other.credential_id == credential.credential_id
+                    && other.credential_version == credential.credential_version
+                    && other.principal == credential.principal
+            }) {
+                return Err(auth_protocol_error(
+                    "duplicate scoped auth credential identity",
+                ));
+            }
+        }
+        Ok(Self { credentials })
+    }
+
+    #[must_use]
+    pub fn credentials(&self) -> &[ControlPlaneScopedCredential] {
+        &self.credentials
+    }
+
+    #[must_use]
+    pub fn verify_envelope(
+        &self,
+        input: ControlPlaneAuthVerificationInput<'_>,
+    ) -> ControlPlaneAuthDecision {
+        match self.verify_envelope_inner(input) {
+            Ok((credential_id, credential_version)) => ControlPlaneAuthDecision::Accepted {
+                credential_id,
+                credential_version,
+            },
+            Err(reason) => ControlPlaneAuthDecision::Rejected { reason },
+        }
+    }
+
+    fn verify_envelope_inner(
+        &self,
+        input: ControlPlaneAuthVerificationInput<'_>,
+    ) -> Result<(String, u64), ControlPlaneAuthRejectionReason> {
+        let header = input.envelope.header();
+        if header.cluster_id() != input.expected_cluster_id {
+            return Err(ControlPlaneAuthRejectionReason::WrongCluster);
+        }
+        if header.source() != input.expected_source {
+            return Err(ControlPlaneAuthRejectionReason::WrongSource);
+        }
+        if header.target() != input.expected_target {
+            return Err(ControlPlaneAuthRejectionReason::WrongTarget);
+        }
+        if header.operation() != input.expected_operation {
+            return Err(ControlPlaneAuthRejectionReason::WrongRole);
+        }
+        let credential = self.find_credential(header).ok_or_else(|| {
+            if self.credentials.iter().any(|credential| {
+                credential.cluster_id == header.cluster_id()
+                    && credential.credential_id == header.credential_id()
+                    && credential.principal == *input.expected_source
+                    && credential.credential_version > header.credential_version()
+            }) {
+                ControlPlaneAuthRejectionReason::StaleCredential
+            } else {
+                ControlPlaneAuthRejectionReason::UnknownCredential
+            }
+        })?;
+        if let Some(now_ms) = input.now_ms {
+            if header
+                .issued_at_ms()
+                .is_some_and(|issued_at_ms| issued_at_ms > now_ms)
+            {
+                return Err(ControlPlaneAuthRejectionReason::ReplayFreshnessFailure);
+            }
+            if header
+                .expires_at_ms()
+                .is_some_and(|expires_at_ms| expires_at_ms <= now_ms)
+            {
+                return Err(ControlPlaneAuthRejectionReason::StaleCredential);
+            }
+        }
+        let covered = header
+            .encode_covered_bytes(input.envelope.payload())
+            .map_err(|_| ControlPlaneAuthRejectionReason::Malformed)?;
+        let key = hmac::Key::new(hmac::HMAC_SHA256, &credential.secret);
+        hmac::verify(&key, &covered, input.envelope.authenticator())
+            .map_err(|_| ControlPlaneAuthRejectionReason::AuthenticatorMismatch)?;
+        Ok((
+            credential.credential_id.clone(),
+            credential.credential_version,
+        ))
+    }
+
+    fn find_credential(
+        &self,
+        header: &ControlPlaneAuthEnvelopeHeader,
+    ) -> Option<&ControlPlaneScopedCredential> {
+        self.credentials.iter().find(|credential| {
+            credential.cluster_id == header.cluster_id()
+                && credential.credential_id == header.credential_id()
+                && credential.credential_version == header.credential_version()
+                && credential.principal == *header.source()
+        })
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
 pub struct ControlPlaneAuthEnvelopeHeader {
     cluster_id: String,
     credential_id: String,
@@ -130,7 +441,24 @@ pub struct ControlPlaneAuthEnvelopeHeader {
     nonce: Vec<u8>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+impl fmt::Debug for ControlPlaneAuthEnvelopeHeader {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ControlPlaneAuthEnvelopeHeader")
+            .field("cluster_id", &self.cluster_id)
+            .field("credential_id", &self.credential_id)
+            .field("credential_version", &self.credential_version)
+            .field("source", &self.source)
+            .field("target", &self.target)
+            .field("operation", &self.operation)
+            .field("issued_at_ms", &self.issued_at_ms)
+            .field("expires_at_ms", &self.expires_at_ms)
+            .field("sequence", &self.sequence)
+            .field("nonce_len", &self.nonce.len())
+            .finish()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
 pub struct ControlPlaneAuthEnvelopeHeaderInput {
     pub cluster_id: String,
     pub credential_id: String,
@@ -142,6 +470,23 @@ pub struct ControlPlaneAuthEnvelopeHeaderInput {
     pub expires_at_ms: Option<u64>,
     pub sequence: Option<u64>,
     pub nonce: Vec<u8>,
+}
+
+impl fmt::Debug for ControlPlaneAuthEnvelopeHeaderInput {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ControlPlaneAuthEnvelopeHeaderInput")
+            .field("cluster_id", &self.cluster_id)
+            .field("credential_id", &self.credential_id)
+            .field("credential_version", &self.credential_version)
+            .field("source", &self.source)
+            .field("target", &self.target)
+            .field("operation", &self.operation)
+            .field("issued_at_ms", &self.issued_at_ms)
+            .field("expires_at_ms", &self.expires_at_ms)
+            .field("sequence", &self.sequence)
+            .field("nonce_len", &self.nonce.len())
+            .finish()
+    }
 }
 
 impl ControlPlaneAuthEnvelopeHeader {
@@ -266,11 +611,21 @@ impl ControlPlaneAuthEnvelopeHeader {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct ControlPlaneAuthEnvelope {
     header: ControlPlaneAuthEnvelopeHeader,
     payload: Vec<u8>,
     authenticator: Vec<u8>,
+}
+
+impl fmt::Debug for ControlPlaneAuthEnvelope {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ControlPlaneAuthEnvelope")
+            .field("header", &self.header)
+            .field("payload_len", &self.payload.len())
+            .field("authenticator_len", &self.authenticator.len())
+            .finish()
+    }
 }
 
 impl ControlPlaneAuthEnvelope {
@@ -573,6 +928,20 @@ fn validate_nonempty_string(
     Ok(())
 }
 
+fn validate_secret(secret: &[u8]) -> Result<(), ControlPlaneError> {
+    if secret.is_empty() {
+        return Err(auth_protocol_error("auth credential secret is empty"));
+    }
+    if secret.len() > CONTROL_PLANE_AUTH_MAX_SECRET_LEN {
+        return Err(auth_protocol_error(format!(
+            "auth credential secret length {} exceeds {}",
+            secret.len(),
+            CONTROL_PLANE_AUTH_MAX_SECRET_LEN
+        )));
+    }
+    Ok(())
+}
+
 fn write_u8(out: &mut Vec<u8>, value: u8) {
     out.push(value);
 }
@@ -740,6 +1109,49 @@ mod tests {
     fn sample_envelope() -> ControlPlaneAuthEnvelope {
         ControlPlaneAuthEnvelope::new(sample_header(), b"raft-payload".to_vec(), vec![9; 32])
             .unwrap()
+    }
+
+    fn sample_credential() -> ControlPlaneScopedCredential {
+        ControlPlaneScopedCredential::new(ControlPlaneScopedCredentialInput {
+            cluster_id: "cluster-a".to_owned(),
+            credential_id: "raft-peer-key-a".to_owned(),
+            credential_version: 7,
+            principal: ControlPlaneAuthPrincipal::RaftPeer { node_id: 101 },
+            secret: b"test scoped raft peer secret".to_vec(),
+        })
+        .unwrap()
+    }
+
+    fn sample_signed_envelope() -> ControlPlaneAuthEnvelope {
+        sample_credential()
+            .sign_envelope(ControlPlaneAuthSignInput {
+                target: ControlPlaneAuthTarget::Principal(ControlPlaneAuthPrincipal::RaftPeer {
+                    node_id: 102,
+                }),
+                operation: ControlPlaneAuthOperation::RaftAppendEntries,
+                issued_at_ms: Some(1_000),
+                expires_at_ms: Some(2_000),
+                sequence: Some(42),
+                nonce: vec![1, 2, 3, 4],
+                payload: b"raft-payload".to_vec(),
+            })
+            .unwrap()
+    }
+
+    fn verify_signed_envelope(
+        store: &ControlPlaneScopedCredentialStore,
+        envelope: &ControlPlaneAuthEnvelope,
+    ) -> ControlPlaneAuthDecision {
+        store.verify_envelope(ControlPlaneAuthVerificationInput {
+            envelope,
+            expected_cluster_id: "cluster-a",
+            expected_source: &ControlPlaneAuthPrincipal::RaftPeer { node_id: 101 },
+            expected_target: &ControlPlaneAuthTarget::Principal(
+                ControlPlaneAuthPrincipal::RaftPeer { node_id: 102 },
+            ),
+            expected_operation: ControlPlaneAuthOperation::RaftAppendEntries,
+            now_ms: Some(1_500),
+        })
     }
 
     #[test]
@@ -932,5 +1344,332 @@ mod tests {
         );
 
         assert!(ControlPlaneAuthEnvelope::new(sample_header(), Vec::new(), Vec::new()).is_err());
+    }
+
+    #[test]
+    fn control_plane_auth_scoped_credential_signs_and_verifies_envelope() {
+        let credential = sample_credential();
+        let envelope = sample_signed_envelope();
+        let store = ControlPlaneScopedCredentialStore::new(vec![credential.clone()]).unwrap();
+
+        assert_eq!(
+            verify_signed_envelope(&store, &envelope),
+            ControlPlaneAuthDecision::Accepted {
+                credential_id: credential.credential_id().to_owned(),
+                credential_version: credential.credential_version(),
+            }
+        );
+        assert_eq!(credential.cluster_id(), "cluster-a");
+        assert_eq!(
+            credential.principal(),
+            &ControlPlaneAuthPrincipal::RaftPeer { node_id: 101 }
+        );
+    }
+
+    #[test]
+    fn control_plane_auth_scoped_credential_rejects_wrong_scope() {
+        let store = ControlPlaneScopedCredentialStore::new(vec![sample_credential()]).unwrap();
+        let envelope = sample_signed_envelope();
+
+        assert_eq!(
+            store.verify_envelope(ControlPlaneAuthVerificationInput {
+                envelope: &envelope,
+                expected_cluster_id: "cluster-b",
+                expected_source: &ControlPlaneAuthPrincipal::RaftPeer { node_id: 101 },
+                expected_target: &ControlPlaneAuthTarget::Principal(
+                    ControlPlaneAuthPrincipal::RaftPeer { node_id: 102 }
+                ),
+                expected_operation: ControlPlaneAuthOperation::RaftAppendEntries,
+                now_ms: Some(1_500),
+            }),
+            ControlPlaneAuthDecision::Rejected {
+                reason: ControlPlaneAuthRejectionReason::WrongCluster,
+            }
+        );
+        assert_eq!(
+            store.verify_envelope(ControlPlaneAuthVerificationInput {
+                envelope: &envelope,
+                expected_cluster_id: "cluster-a",
+                expected_source: &ControlPlaneAuthPrincipal::RaftPeer { node_id: 999 },
+                expected_target: &ControlPlaneAuthTarget::Principal(
+                    ControlPlaneAuthPrincipal::RaftPeer { node_id: 102 }
+                ),
+                expected_operation: ControlPlaneAuthOperation::RaftAppendEntries,
+                now_ms: Some(1_500),
+            }),
+            ControlPlaneAuthDecision::Rejected {
+                reason: ControlPlaneAuthRejectionReason::WrongSource,
+            }
+        );
+        assert_eq!(
+            store.verify_envelope(ControlPlaneAuthVerificationInput {
+                envelope: &envelope,
+                expected_cluster_id: "cluster-a",
+                expected_source: &ControlPlaneAuthPrincipal::RaftPeer { node_id: 101 },
+                expected_target: &ControlPlaneAuthTarget::Service(
+                    ControlPlaneAuthService::ControlPlane
+                ),
+                expected_operation: ControlPlaneAuthOperation::RaftAppendEntries,
+                now_ms: Some(1_500),
+            }),
+            ControlPlaneAuthDecision::Rejected {
+                reason: ControlPlaneAuthRejectionReason::WrongTarget,
+            }
+        );
+        assert_eq!(
+            store.verify_envelope(ControlPlaneAuthVerificationInput {
+                envelope: &envelope,
+                expected_cluster_id: "cluster-a",
+                expected_source: &ControlPlaneAuthPrincipal::RaftPeer { node_id: 101 },
+                expected_target: &ControlPlaneAuthTarget::Principal(
+                    ControlPlaneAuthPrincipal::RaftPeer { node_id: 102 }
+                ),
+                expected_operation: ControlPlaneAuthOperation::RaftVote,
+                now_ms: Some(1_500),
+            }),
+            ControlPlaneAuthDecision::Rejected {
+                reason: ControlPlaneAuthRejectionReason::WrongRole,
+            }
+        );
+    }
+
+    #[test]
+    fn control_plane_auth_scoped_credential_rejects_unknown_stale_and_time_invalid_credentials() {
+        let envelope = sample_signed_envelope();
+        let unknown_store =
+            ControlPlaneScopedCredentialStore::new(vec![ControlPlaneScopedCredential::new(
+                ControlPlaneScopedCredentialInput {
+                    cluster_id: "cluster-a".to_owned(),
+                    credential_id: "other-key".to_owned(),
+                    credential_version: 7,
+                    principal: ControlPlaneAuthPrincipal::RaftPeer { node_id: 101 },
+                    secret: b"test scoped raft peer secret".to_vec(),
+                },
+            )
+            .unwrap()])
+            .unwrap();
+        assert_eq!(
+            verify_signed_envelope(&unknown_store, &envelope),
+            ControlPlaneAuthDecision::Rejected {
+                reason: ControlPlaneAuthRejectionReason::UnknownCredential,
+            }
+        );
+        let unknown_expired_envelope =
+            ControlPlaneScopedCredential::new(ControlPlaneScopedCredentialInput {
+                cluster_id: "cluster-a".to_owned(),
+                credential_id: "unknown-expired-key".to_owned(),
+                credential_version: 7,
+                principal: ControlPlaneAuthPrincipal::RaftPeer { node_id: 101 },
+                secret: b"test scoped raft peer secret".to_vec(),
+            })
+            .unwrap()
+            .sign_envelope(ControlPlaneAuthSignInput {
+                target: ControlPlaneAuthTarget::Principal(ControlPlaneAuthPrincipal::RaftPeer {
+                    node_id: 102,
+                }),
+                operation: ControlPlaneAuthOperation::RaftAppendEntries,
+                issued_at_ms: Some(1),
+                expires_at_ms: Some(2),
+                sequence: Some(42),
+                nonce: Vec::new(),
+                payload: b"raft-payload".to_vec(),
+            })
+            .unwrap();
+        assert_eq!(
+            verify_signed_envelope(&unknown_store, &unknown_expired_envelope),
+            ControlPlaneAuthDecision::Rejected {
+                reason: ControlPlaneAuthRejectionReason::UnknownCredential,
+            }
+        );
+
+        let stale_store =
+            ControlPlaneScopedCredentialStore::new(vec![ControlPlaneScopedCredential::new(
+                ControlPlaneScopedCredentialInput {
+                    cluster_id: "cluster-a".to_owned(),
+                    credential_id: "raft-peer-key-a".to_owned(),
+                    credential_version: 8,
+                    principal: ControlPlaneAuthPrincipal::RaftPeer { node_id: 101 },
+                    secret: b"test scoped raft peer secret".to_vec(),
+                },
+            )
+            .unwrap()])
+            .unwrap();
+        assert_eq!(
+            verify_signed_envelope(&stale_store, &envelope),
+            ControlPlaneAuthDecision::Rejected {
+                reason: ControlPlaneAuthRejectionReason::StaleCredential,
+            }
+        );
+
+        let store = ControlPlaneScopedCredentialStore::new(vec![sample_credential()]).unwrap();
+        assert_eq!(
+            store.verify_envelope(ControlPlaneAuthVerificationInput {
+                envelope: &envelope,
+                expected_cluster_id: "cluster-a",
+                expected_source: &ControlPlaneAuthPrincipal::RaftPeer { node_id: 101 },
+                expected_target: &ControlPlaneAuthTarget::Principal(
+                    ControlPlaneAuthPrincipal::RaftPeer { node_id: 102 }
+                ),
+                expected_operation: ControlPlaneAuthOperation::RaftAppendEntries,
+                now_ms: Some(2_000),
+            }),
+            ControlPlaneAuthDecision::Rejected {
+                reason: ControlPlaneAuthRejectionReason::StaleCredential,
+            }
+        );
+        assert_eq!(
+            store.verify_envelope(ControlPlaneAuthVerificationInput {
+                envelope: &envelope,
+                expected_cluster_id: "cluster-a",
+                expected_source: &ControlPlaneAuthPrincipal::RaftPeer { node_id: 101 },
+                expected_target: &ControlPlaneAuthTarget::Principal(
+                    ControlPlaneAuthPrincipal::RaftPeer { node_id: 102 }
+                ),
+                expected_operation: ControlPlaneAuthOperation::RaftAppendEntries,
+                now_ms: Some(999),
+            }),
+            ControlPlaneAuthDecision::Rejected {
+                reason: ControlPlaneAuthRejectionReason::ReplayFreshnessFailure,
+            }
+        );
+    }
+
+    #[test]
+    fn control_plane_auth_scoped_credential_rejects_tampered_payload_or_secret() {
+        let store = ControlPlaneScopedCredentialStore::new(vec![sample_credential()]).unwrap();
+        let envelope = sample_signed_envelope();
+        let tampered_payload = ControlPlaneAuthEnvelope::new(
+            envelope.header().clone(),
+            b"changed-payload".to_vec(),
+            envelope.authenticator().to_vec(),
+        )
+        .unwrap();
+        assert_eq!(
+            verify_signed_envelope(&store, &tampered_payload),
+            ControlPlaneAuthDecision::Rejected {
+                reason: ControlPlaneAuthRejectionReason::AuthenticatorMismatch,
+            }
+        );
+
+        let wrong_secret_store =
+            ControlPlaneScopedCredentialStore::new(vec![ControlPlaneScopedCredential::new(
+                ControlPlaneScopedCredentialInput {
+                    cluster_id: "cluster-a".to_owned(),
+                    credential_id: "raft-peer-key-a".to_owned(),
+                    credential_version: 7,
+                    principal: ControlPlaneAuthPrincipal::RaftPeer { node_id: 101 },
+                    secret: b"wrong secret".to_vec(),
+                },
+            )
+            .unwrap()])
+            .unwrap();
+        assert_eq!(
+            verify_signed_envelope(&wrong_secret_store, &envelope),
+            ControlPlaneAuthDecision::Rejected {
+                reason: ControlPlaneAuthRejectionReason::AuthenticatorMismatch,
+            }
+        );
+    }
+
+    #[test]
+    fn control_plane_auth_scoped_credentials_reject_bad_configuration_and_redact_secret() {
+        assert!(
+            ControlPlaneScopedCredential::new(ControlPlaneScopedCredentialInput {
+                cluster_id: "cluster-a".to_owned(),
+                credential_id: "raft-peer-key-a".to_owned(),
+                credential_version: 1,
+                principal: ControlPlaneAuthPrincipal::RaftPeer { node_id: 101 },
+                secret: Vec::new(),
+            })
+            .is_err()
+        );
+        let credential = sample_credential();
+        assert!(ControlPlaneScopedCredentialStore::new(vec![
+            credential.clone(),
+            credential.clone()
+        ])
+        .is_err());
+        let debug = format!("{credential:?}");
+        assert!(debug.contains("<redacted>"));
+        assert!(!debug.contains("test scoped raft peer secret"));
+        let input_debug = format!(
+            "{:?}",
+            ControlPlaneScopedCredentialInput {
+                cluster_id: "cluster-a".to_owned(),
+                credential_id: "raft-peer-key-a".to_owned(),
+                credential_version: 1,
+                principal: ControlPlaneAuthPrincipal::RaftPeer { node_id: 101 },
+                secret: b"test scoped raft peer secret".to_vec(),
+            }
+        );
+        assert!(input_debug.contains("<redacted>"));
+        assert!(!input_debug.contains("test scoped raft peer secret"));
+
+        let sign_input_debug = format!(
+            "{:?}",
+            ControlPlaneAuthSignInput {
+                target: ControlPlaneAuthTarget::Principal(ControlPlaneAuthPrincipal::RaftPeer {
+                    node_id: 102,
+                }),
+                operation: ControlPlaneAuthOperation::RaftAppendEntries,
+                issued_at_ms: Some(1_000),
+                expires_at_ms: Some(2_000),
+                sequence: Some(42),
+                nonce: b"test nonce".to_vec(),
+                payload: b"secret raft payload".to_vec(),
+            }
+        );
+        assert!(sign_input_debug.contains("payload_len"));
+        assert!(sign_input_debug.contains("nonce_len"));
+        assert!(!sign_input_debug.contains("secret raft payload"));
+        assert!(!sign_input_debug.contains("test nonce"));
+
+        let envelope = sample_signed_envelope();
+        let verification_input_debug = format!(
+            "{:?}",
+            ControlPlaneAuthVerificationInput {
+                envelope: &envelope,
+                expected_cluster_id: "cluster-a",
+                expected_source: &ControlPlaneAuthPrincipal::RaftPeer { node_id: 101 },
+                expected_target: &ControlPlaneAuthTarget::Principal(
+                    ControlPlaneAuthPrincipal::RaftPeer { node_id: 102 }
+                ),
+                expected_operation: ControlPlaneAuthOperation::RaftAppendEntries,
+                now_ms: Some(1_500),
+            }
+        );
+        assert!(verification_input_debug.contains("envelope_payload_len"));
+        assert!(verification_input_debug.contains("envelope_authenticator_len"));
+        assert!(!verification_input_debug.contains("raft-payload"));
+        assert!(!verification_input_debug.contains("authenticator:"));
+
+        let header_input = ControlPlaneAuthEnvelopeHeaderInput {
+            cluster_id: "cluster-a".to_owned(),
+            credential_id: "raft-peer-key-a".to_owned(),
+            credential_version: 7,
+            source: ControlPlaneAuthPrincipal::RaftPeer { node_id: 101 },
+            target: ControlPlaneAuthTarget::Principal(ControlPlaneAuthPrincipal::RaftPeer {
+                node_id: 102,
+            }),
+            operation: ControlPlaneAuthOperation::RaftAppendEntries,
+            issued_at_ms: Some(1_000),
+            expires_at_ms: Some(2_000),
+            sequence: Some(42),
+            nonce: b"test nonce".to_vec(),
+        };
+        let header_input_debug = format!("{header_input:?}");
+        assert!(header_input_debug.contains("nonce_len"));
+        assert!(!header_input_debug.contains("test nonce"));
+
+        let header = ControlPlaneAuthEnvelopeHeader::new(header_input).unwrap();
+        let header_debug = format!("{header:?}");
+        assert!(header_debug.contains("nonce_len"));
+        assert!(!header_debug.contains("test nonce"));
+
+        let envelope_debug = format!("{envelope:?}");
+        assert!(envelope_debug.contains("payload_len"));
+        assert!(envelope_debug.contains("authenticator_len"));
+        assert!(!envelope_debug.contains("raft-payload"));
+        assert!(!envelope_debug.contains("authenticator:"));
     }
 }

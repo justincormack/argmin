@@ -207,6 +207,15 @@ Status:
   trailing bytes, invalid optional fields, invalid principal fields, empty
   credential fields, empty authenticators, and payload-size limits before
   allocation.
+- 2026-07-07: Started item 3 with scoped symmetric credential primitives in
+  `storage::control_plane_auth`. The new helper signs canonical envelope bytes
+  with HMAC-SHA256 using only the configured scoped principal credential, and
+  verification requires the caller to supply the expected cluster, source,
+  target, and operation before checking the MAC. Tests cover accepted frames,
+  wrong cluster/source/target/role, unknown and stale credential versions,
+  issued/expiry time failures, payload tampering, wrong secrets, duplicate
+  scoped credentials, and redacted secret debug output. Process configuration
+  names and Raft transport enforcement remain next.
 
 ## Path-Specific Enforcement Order
 
