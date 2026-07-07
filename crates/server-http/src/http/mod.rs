@@ -73,14 +73,14 @@ const AWS_SERVER_HEADER_VALUE: &str = "AmazonS3";
 
 #[cfg(test)]
 thread_local! {
-    static SUPPRESS_PANIC_ON_500_FLIGHT_RECORDER_DUMP: std::cell::Cell<bool> =
+    static SUPPRESS_EXPECTED_PANIC_ON_500_DIAGNOSTICS: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
 }
 
 fn should_dump_panic_on_500_flight_recorder() -> bool {
     #[cfg(test)]
     {
-        if SUPPRESS_PANIC_ON_500_FLIGHT_RECORDER_DUMP.with(std::cell::Cell::get) {
+        if SUPPRESS_EXPECTED_PANIC_ON_500_DIAGNOSTICS.with(std::cell::Cell::get) {
             return false;
         }
     }
@@ -6099,25 +6099,39 @@ mod tests {
     const TEST_SIGV4_SECRET: &str = "secret";
     const TEST_SSE_S3_WRAPPING_KEY_B64: &str = "YWJjZGVmMDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODk=";
 
-    struct SuppressPanicOn500FlightRecorderDump {
-        previous: bool,
+    static EXPECTED_PANIC_ON_500_HOOK: std::sync::Once = std::sync::Once::new();
+
+    struct SuppressExpectedPanicOn500Diagnostics {
+        previous_suppressed: bool,
     }
 
-    impl SuppressPanicOn500FlightRecorderDump {
+    impl SuppressExpectedPanicOn500Diagnostics {
         fn new() -> Self {
-            let previous = SUPPRESS_PANIC_ON_500_FLIGHT_RECORDER_DUMP.with(|suppressed| {
-                let previous = suppressed.get();
-                suppressed.set(true);
-                previous
+            EXPECTED_PANIC_ON_500_HOOK.call_once(|| {
+                let previous_hook = std::panic::take_hook();
+                std::panic::set_hook(Box::new(move |panic_info| {
+                    if SUPPRESS_EXPECTED_PANIC_ON_500_DIAGNOSTICS.with(std::cell::Cell::get) {
+                        return;
+                    }
+                    previous_hook(panic_info);
+                }));
             });
-            Self { previous }
+            let previous_suppressed =
+                SUPPRESS_EXPECTED_PANIC_ON_500_DIAGNOSTICS.with(|suppressed| {
+                    let previous = suppressed.get();
+                    suppressed.set(true);
+                    previous
+                });
+            Self {
+                previous_suppressed,
+            }
         }
     }
 
-    impl Drop for SuppressPanicOn500FlightRecorderDump {
+    impl Drop for SuppressExpectedPanicOn500Diagnostics {
         fn drop(&mut self) {
-            SUPPRESS_PANIC_ON_500_FLIGHT_RECORDER_DUMP
-                .with(|suppressed| suppressed.set(self.previous));
+            SUPPRESS_EXPECTED_PANIC_ON_500_DIAGNOSTICS
+                .with(|suppressed| suppressed.set(self.previous_suppressed));
         }
     }
 
@@ -6877,7 +6891,6 @@ mod tests {
 
     #[test]
     fn s3_response_to_hyper_invalid_header_records_diagnostic_before_panic() {
-        let _dump_guard = SuppressPanicOn500FlightRecorderDump::new();
         let mut resp = S3Response {
             status_code: 200,
             headers: Vec::new(),
@@ -6890,25 +6903,28 @@ mod tests {
             "text/plain\r\nInjected: x".to_string(),
         ));
 
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _ = s3_response_to_hyper(
-                resp,
-                None,
-                8192,
-                true,
-                false,
-                ResponseTraceMeta::new(
-                    observability::TraceContext::from_ids(
-                        "trace-conversion-error".to_string(),
-                        "request-conversion-error".to_string(),
+        let result = {
+            let _diagnostic_guard = SuppressExpectedPanicOn500Diagnostics::new();
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _ = s3_response_to_hyper(
+                    resp,
+                    None,
+                    8192,
+                    true,
+                    false,
+                    ResponseTraceMeta::new(
+                        observability::TraceContext::from_ids(
+                            "trace-conversion-error".to_string(),
+                            "request-conversion-error".to_string(),
+                        ),
+                        Arc::<str>::from("host-id"),
+                        "GET",
+                        "/secret-bucket/secret-key",
+                        "X-Amz-Signature=secret",
                     ),
-                    Arc::<str>::from("host-id"),
-                    "GET",
-                    "/secret-bucket/secret-key",
-                    "X-Amz-Signature=secret",
-                ),
-            );
-        }));
+                );
+            }))
+        };
 
         let panic_payload =
             result.expect_err("conversion error should panic when panic-on-500 is enabled");
@@ -6963,9 +6979,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "server produced HTTP 500 response")]
     fn s3_response_to_hyper_panics_on_500_when_enabled() {
-        let _dump_guard = SuppressPanicOn500FlightRecorderDump::new();
         let resp = S3Response {
             status_code: 500,
             headers: Vec::new(),
@@ -6974,20 +6988,34 @@ mod tests {
             error_diagnostic: None,
         };
 
-        let _ = s3_response_to_hyper(
-            resp,
-            None,
-            8192,
-            true,
-            false,
-            ResponseTraceMeta::new(
-                crate::http::new_request_trace_context(),
-                Arc::<str>::from("host-id"),
-                "GET",
-                "/",
-                "",
-            ),
-        );
+        let result = {
+            let _diagnostic_guard = SuppressExpectedPanicOn500Diagnostics::new();
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _ = s3_response_to_hyper(
+                    resp,
+                    None,
+                    8192,
+                    true,
+                    false,
+                    ResponseTraceMeta::new(
+                        crate::http::new_request_trace_context(),
+                        Arc::<str>::from("host-id"),
+                        "GET",
+                        "/",
+                        "",
+                    ),
+                );
+            }))
+        };
+
+        let panic_payload =
+            result.expect_err("HTTP 500 response should panic when panic-on-500 is enabled");
+        let panic_message = panic_payload
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| panic_payload.downcast_ref::<&str>().copied())
+            .expect("panic should carry diagnostic string");
+        assert!(panic_message.contains("server produced HTTP 500 response"));
     }
 
     #[test]
