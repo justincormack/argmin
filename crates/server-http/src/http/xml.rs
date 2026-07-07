@@ -4286,36 +4286,22 @@ fn checksum_header_to_xml_tag(header: &str) -> Option<&'static str> {
 // ── Multipart upload XML ─────────────────────────────────────────
 
 /// Format an `InitiateMultipartUploadResult` XML response.
+///
+/// The body carries only Bucket/Key/UploadId; AWS reports the checksum
+/// algorithm and type in response headers, not in this body.
 #[must_use]
-pub fn initiate_multipart_upload_xml(
-    bucket: &str,
-    key: &str,
-    upload_id: &str,
-    checksum_algorithm: Option<&str>,
-    checksum_type: Option<&str>,
-) -> String {
-    let mut xml = format!(
+pub fn initiate_multipart_upload_xml(bucket: &str, key: &str, upload_id: &str) -> String {
+    format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
          <InitiateMultipartUploadResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
          <Bucket>{}</Bucket>\
          <Key>{}</Key>\
-         <UploadId>{}</UploadId>",
+         <UploadId>{}</UploadId>\
+         </InitiateMultipartUploadResult>",
         xml_escape(bucket),
         xml_escape(key),
         xml_escape(upload_id),
-    );
-    if let Some(algo) = checksum_algorithm {
-        xml.push_str("<ChecksumAlgorithm>");
-        xml.push_str(algo);
-        xml.push_str("</ChecksumAlgorithm>");
-    }
-    if let Some(ctype) = checksum_type {
-        xml.push_str("<ChecksumType>");
-        xml.push_str(ctype);
-        xml.push_str("</ChecksumType>");
-    }
-    xml.push_str("</InitiateMultipartUploadResult>");
-    xml
+    )
 }
 
 /// Percent-encode a logical key for use in URLs, preserving '/'.
@@ -4347,14 +4333,17 @@ fn uri_encode_key(s: &str) -> String {
 pub fn complete_multipart_upload_xml(
     bucket: &str,
     key: &str,
+    region: &str,
     etag: &str,
     checksum_algorithm: Option<ChecksumAlgorithm>,
     checksum_type: Option<ChecksumType>,
     checksum_value: Option<&str>,
 ) -> String {
-    // Location uses path-style: http://s3.amazonaws.com/<bucket>/<key>
+    // Location uses the path-style regional endpoint form AWS returns:
+    // https://s3.<region>.amazonaws.com/<bucket>/<key>
     let location = format!(
-        "http://s3.amazonaws.com/{}/{}",
+        "https://s3.{}.amazonaws.com/{}/{}",
+        region,
         uri_encode_key(bucket),
         uri_encode_key(key)
     );
@@ -4383,7 +4372,9 @@ pub fn complete_multipart_upload_xml(
         xml_escape(&location),
         xml_escape(bucket),
         xml_escape(key),
-        xml_escape(etag),
+        // AWS emits the multipart ETag with raw quotes here, unlike the
+        // entity-escaped ETags in ListParts entries.
+        etag,
         checksum_xml,
     )
 }
@@ -4480,14 +4471,20 @@ pub fn list_multipart_uploads_xml(
 }
 
 /// Format a `ListPartsResult` XML response.
+///
+/// Element order follows AWS: Bucket, Key, UploadId, Initiator, Owner,
+/// StorageClass, checksum configuration, part-number markers, then parts.
 #[must_use]
 #[allow(clippy::format_push_string)]
+#[allow(clippy::too_many_arguments)]
 pub fn list_parts_xml(
     bucket: &str,
     key: &str,
     upload_id: &str,
     part_number_marker: Option<u32>,
     max_parts: u32,
+    initiator: &RenderedCanonicalUser,
+    owner: &RenderedCanonicalUser,
     result: &ListPartsResult,
 ) -> String {
     let mut xml = format!(
@@ -4500,27 +4497,41 @@ pub fn list_parts_xml(
         xml_escape(key),
         xml_escape(upload_id),
     );
-    if let Some(pm) = part_number_marker {
-        xml.push_str(&format!("<PartNumberMarker>{pm}</PartNumberMarker>"));
-    } else {
-        xml.push_str("<PartNumberMarker>0</PartNumberMarker>");
-    }
-    xml.push_str(&format!("<MaxParts>{max_parts}</MaxParts>"));
-    xml.push_str(&format!(
-        "<IsTruncated>{}</IsTruncated>",
-        result.is_truncated
-    ));
-    if let Some(npm) = result.next_part_number_marker {
-        xml.push_str(&format!(
-            "<NextPartNumberMarker>{npm}</NextPartNumberMarker>"
-        ));
-    }
+    append_canonical_owner_xml(&mut xml, "Initiator", initiator);
+    append_canonical_owner_xml(&mut xml, "Owner", owner);
+    xml.push_str("<StorageClass>STANDARD</StorageClass>");
     if let Some(algo) = result.checksum_algorithm {
         xml.push_str(&format!(
             "<ChecksumAlgorithm>{}</ChecksumAlgorithm>",
             algo.as_str()
         ));
     }
+    if let Some(checksum_type) = result.checksum_type {
+        xml.push_str(&format!(
+            "<ChecksumType>{}</ChecksumType>",
+            checksum_type.as_str()
+        ));
+    }
+    if let Some(pm) = part_number_marker {
+        xml.push_str(&format!("<PartNumberMarker>{pm}</PartNumberMarker>"));
+    } else {
+        xml.push_str("<PartNumberMarker>0</PartNumberMarker>");
+    }
+    // AWS reports the last listed part number whenever parts are returned,
+    // truncated or not.
+    let next_part_number_marker = result
+        .next_part_number_marker
+        .or_else(|| result.parts.last().map(|part| part.part_number));
+    if let Some(npm) = next_part_number_marker {
+        xml.push_str(&format!(
+            "<NextPartNumberMarker>{npm}</NextPartNumberMarker>"
+        ));
+    }
+    xml.push_str(&format!("<MaxParts>{max_parts}</MaxParts>"));
+    xml.push_str(&format!(
+        "<IsTruncated>{}</IsTruncated>",
+        result.is_truncated
+    ));
     for part in &result.parts {
         xml.push_str(&format!(
             "<Part>\
@@ -6933,7 +6944,7 @@ mod tests {
 
     #[test]
     fn initiate_multipart_upload_xml_format() {
-        let xml = initiate_multipart_upload_xml("mybucket", "mykey", "upload123", None, None);
+        let xml = initiate_multipart_upload_xml("mybucket", "mykey", "upload123");
         assert!(xml.contains("<Bucket>mybucket</Bucket>"));
         assert!(xml.contains("<Key>mykey</Key>"));
         assert!(xml.contains("<UploadId>upload123</UploadId>"));
@@ -6945,27 +6956,50 @@ mod tests {
 
     #[test]
     fn complete_multipart_upload_xml_format() {
-        let xml =
-            complete_multipart_upload_xml("mybucket", "mykey", "\"etag123\"", None, None, None);
-        assert!(xml.contains("<Location>http://s3.amazonaws.com/mybucket/mykey</Location>"));
+        let xml = complete_multipart_upload_xml(
+            "mybucket",
+            "mykey",
+            "us-east-1",
+            "\"etag123\"",
+            None,
+            None,
+            None,
+        );
+        assert!(
+            xml.contains("<Location>https://s3.us-east-1.amazonaws.com/mybucket/mykey</Location>")
+        );
         assert!(xml.contains("<Bucket>mybucket</Bucket>"));
         assert!(xml.contains("<Key>mykey</Key>"));
-        assert!(xml.contains("<ETag>&quot;etag123&quot;</ETag>"));
+        assert!(xml.contains("<ETag>\"etag123\"</ETag>"));
         assert!(xml.contains("CompleteMultipartUploadResult"));
     }
 
     #[test]
     fn complete_multipart_upload_xml_location_encodes_key() {
-        let xml =
-            complete_multipart_upload_xml("mybucket", "path/to/my key", "\"e\"", None, None, None);
+        let xml = complete_multipart_upload_xml(
+            "mybucket",
+            "path/to/my key",
+            "us-east-1",
+            "\"e\"",
+            None,
+            None,
+            None,
+        );
         assert!(xml.contains("mybucket/path/to/my%20key"));
     }
 
     #[test]
     fn complete_multipart_upload_xml_location_encodes_literal_percent() {
         // A key containing literal %20 should encode the % as %25
-        let xml =
-            complete_multipart_upload_xml("mybucket", "key%20name", "\"e\"", None, None, None);
+        let xml = complete_multipart_upload_xml(
+            "mybucket",
+            "key%20name",
+            "us-east-1",
+            "\"e\"",
+            None,
+            None,
+            None,
+        );
         assert!(xml.contains("mybucket/key%2520name"));
     }
 
@@ -6974,6 +7008,7 @@ mod tests {
         let xml = complete_multipart_upload_xml(
             "mybucket",
             "mykey",
+            "us-east-1",
             "\"etag\"",
             Some(ChecksumAlgorithm::Sha256),
             Some(ChecksumType::FullObject),
@@ -7089,23 +7124,18 @@ mod tests {
 
     #[test]
     fn initiate_xml_escapes_special_chars() {
-        let xml = initiate_multipart_upload_xml("my&bucket", "key<>", "id\"1", None, None);
+        let xml = initiate_multipart_upload_xml("my&bucket", "key<>", "id\"1");
         assert!(xml.contains("my&amp;bucket"));
         assert!(xml.contains("key&lt;&gt;"));
         assert!(xml.contains("id&quot;1"));
     }
 
     #[test]
-    fn initiate_xml_includes_checksum_fields() {
-        let xml = initiate_multipart_upload_xml("b", "k", "u", Some("CRC32"), Some("FULL_OBJECT"));
-        assert!(xml.contains("<ChecksumAlgorithm>CRC32</ChecksumAlgorithm>"));
-        assert!(xml.contains("<ChecksumType>FULL_OBJECT</ChecksumType>"));
-    }
-
-    #[test]
-    fn initiate_xml_checksum_algorithm_only() {
-        let xml = initiate_multipart_upload_xml("b", "k", "u", Some("SHA256"), None);
-        assert!(xml.contains("<ChecksumAlgorithm>SHA256</ChecksumAlgorithm>"));
+    fn initiate_xml_body_omits_checksum_configuration() {
+        // AWS reports the checksum algorithm/type in headers only; the
+        // InitiateMultipartUploadResult body carries just Bucket/Key/UploadId.
+        let xml = initiate_multipart_upload_xml("b", "k", "u");
+        assert!(!xml.contains("ChecksumAlgorithm"));
         assert!(!xml.contains("ChecksumType"));
     }
 
@@ -7295,11 +7325,27 @@ mod tests {
         assert!(xml.contains("<NextUploadIdMarker>upload/id+marker</NextUploadIdMarker>"));
     }
 
+    fn test_owner_identity(principal: &str) -> crate::coordinator::OwnerIdentity {
+        crate::coordinator::OwnerIdentity {
+            principal: principal.to_string(),
+            canonical_id: CanonicalUserId::from_principal(principal),
+        }
+    }
+
+    fn test_rendered_user(principal: &str) -> RenderedCanonicalUser {
+        RenderedCanonicalUser {
+            canonical_id: CanonicalUserId::from_principal(principal),
+            display_name: None,
+        }
+    }
+
     // ── ListParts XML tests ──────────────────────────────────────────
 
     #[test]
     fn list_parts_xml_empty() {
         let result = ListPartsResult {
+            owner: test_owner_identity("owner"),
+            initiator: test_owner_identity("initiator"),
             parts: vec![],
             is_truncated: false,
             next_part_number_marker: None,
@@ -7307,7 +7353,16 @@ mod tests {
             checksum_type: None,
             lifecycle_abort: None,
         };
-        let xml = list_parts_xml("mybucket", "mykey", "uid1", None, 1000, &result);
+        let xml = list_parts_xml(
+            "mybucket",
+            "mykey",
+            "uid1",
+            None,
+            1000,
+            &test_rendered_user("initiator"),
+            &test_rendered_user("owner"),
+            &result,
+        );
         assert!(xml.contains("<Bucket>mybucket</Bucket>"));
         assert!(xml.contains("<Key>mykey</Key>"));
         assert!(xml.contains("<UploadId>uid1</UploadId>"));
@@ -7321,6 +7376,8 @@ mod tests {
     fn list_parts_xml_with_entries() {
         use crate::coordinator::PartEntry;
         let result = ListPartsResult {
+            owner: test_owner_identity("owner"),
+            initiator: test_owner_identity("initiator"),
             parts: vec![
                 PartEntry {
                     part_number: 1,
@@ -7343,7 +7400,16 @@ mod tests {
             checksum_type: None,
             lifecycle_abort: None,
         };
-        let xml = list_parts_xml("mybucket", "mykey", "uid1", None, 1000, &result);
+        let xml = list_parts_xml(
+            "mybucket",
+            "mykey",
+            "uid1",
+            None,
+            1000,
+            &test_rendered_user("initiator"),
+            &test_rendered_user("owner"),
+            &result,
+        );
         assert!(xml.contains("<PartNumber>1</PartNumber>"));
         assert!(xml.contains("<Size>5242880</Size>"));
         assert!(xml.contains("<ETag>&quot;abc&quot;</ETag>"));
@@ -7356,6 +7422,8 @@ mod tests {
     fn list_parts_xml_truncated_with_marker() {
         use crate::coordinator::PartEntry;
         let result = ListPartsResult {
+            owner: test_owner_identity("owner"),
+            initiator: test_owner_identity("initiator"),
             parts: vec![PartEntry {
                 part_number: 3,
                 size: 100,
@@ -7369,7 +7437,16 @@ mod tests {
             checksum_type: None,
             lifecycle_abort: None,
         };
-        let xml = list_parts_xml("mybucket", "mykey", "uid1", Some(2), 1, &result);
+        let xml = list_parts_xml(
+            "mybucket",
+            "mykey",
+            "uid1",
+            Some(2),
+            1,
+            &test_rendered_user("initiator"),
+            &test_rendered_user("owner"),
+            &result,
+        );
         assert!(xml.contains("<PartNumberMarker>2</PartNumberMarker>"));
         assert!(xml.contains("<MaxParts>1</MaxParts>"));
         assert!(xml.contains("<IsTruncated>true</IsTruncated>"));
@@ -7383,6 +7460,8 @@ mod tests {
         use crate::coordinator::PartEntry;
         use checksum::ChecksumAlgorithm;
         let result = ListPartsResult {
+            owner: test_owner_identity("owner"),
+            initiator: test_owner_identity("initiator"),
             parts: vec![
                 PartEntry {
                     part_number: 1,
@@ -7405,7 +7484,16 @@ mod tests {
             checksum_type: None,
             lifecycle_abort: None,
         };
-        let xml = list_parts_xml("mybucket", "mykey", "uid1", None, 1000, &result);
+        let xml = list_parts_xml(
+            "mybucket",
+            "mykey",
+            "uid1",
+            None,
+            1000,
+            &test_rendered_user("initiator"),
+            &test_rendered_user("owner"),
+            &result,
+        );
         assert!(xml.contains("<ChecksumAlgorithm>CRC32</ChecksumAlgorithm>"));
         assert!(xml.contains("<ChecksumCRC32>AAAAAA==</ChecksumCRC32>"));
         assert!(xml.contains("<ChecksumCRC32>BBBBBB==</ChecksumCRC32>"));
@@ -7415,6 +7503,8 @@ mod tests {
     fn list_parts_xml_checksum_omitted_when_no_algorithm() {
         use crate::coordinator::PartEntry;
         let result = ListPartsResult {
+            owner: test_owner_identity("owner"),
+            initiator: test_owner_identity("initiator"),
             parts: vec![PartEntry {
                 part_number: 1,
                 size: 100,
@@ -7428,7 +7518,16 @@ mod tests {
             checksum_type: None,
             lifecycle_abort: None,
         };
-        let xml = list_parts_xml("mybucket", "mykey", "uid1", None, 1000, &result);
+        let xml = list_parts_xml(
+            "mybucket",
+            "mykey",
+            "uid1",
+            None,
+            1000,
+            &test_rendered_user("initiator"),
+            &test_rendered_user("owner"),
+            &result,
+        );
         // Without checksum_algorithm, per-part checksum elements should not be rendered
         assert!(!xml.contains("<ChecksumCRC32>"));
         assert!(!xml.contains("<ChecksumAlgorithm>"));

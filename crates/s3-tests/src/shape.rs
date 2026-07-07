@@ -22,6 +22,8 @@
 //! - `{http_date}` — RFC 1123 date shape, each use independent
 //! - `{iso8601}` — ISO 8601 timestamp shape, each use independent
 //! - `{any}` — any non-empty text, each use independent
+//! - `{ws}` — possibly-empty whitespace (AWS keep-alive padding), each use
+//!   independent
 //!
 //! Error-response bodies are usually not written out literally: the
 //! [`expected_error`] module builds the expected template by calling the
@@ -100,6 +102,10 @@ fn is_nonempty(value: &str) -> bool {
     !value.is_empty()
 }
 
+fn is_whitespace_only(value: &str) -> bool {
+    value.chars().all(char::is_whitespace)
+}
+
 struct Placeholder {
     name: &'static str,
     validate: fn(&str) -> bool,
@@ -152,6 +158,13 @@ const PLACEHOLDERS: &[Placeholder] = &[
     Placeholder {
         name: "any",
         validate: is_nonempty,
+        capture: false,
+    },
+    // Possibly-empty whitespace, e.g. the keep-alive padding AWS inserts
+    // after the XML declaration on slow CompleteMultipartUpload responses.
+    Placeholder {
+        name: "ws",
+        validate: is_whitespace_only,
         capture: false,
     },
 ];
@@ -819,6 +832,70 @@ pub mod expected_error {
     pub fn invalid_token(message: &str, token: &str) -> String {
         xml::invalid_token_error_xml(message, token, REQUEST_ID, HOST_ID)
     }
+
+    pub fn complete_multipart_no_such_upload(upload_id: &str) -> String {
+        xml::complete_multipart_no_such_upload_error_xml(upload_id, REQUEST_ID, HOST_ID)
+    }
+
+    pub fn complete_multipart_invalid_part(
+        upload_id: &str,
+        part_number: u32,
+        etag: &str,
+    ) -> String {
+        xml::complete_multipart_invalid_part_error_xml(
+            upload_id,
+            part_number,
+            etag,
+            REQUEST_ID,
+            HOST_ID,
+        )
+    }
+
+    pub fn complete_multipart_invalid_part_order(upload_id: &str) -> String {
+        xml::complete_multipart_invalid_part_order_error_xml(upload_id, REQUEST_ID, HOST_ID)
+    }
+
+    pub fn complete_multipart_entity_too_small(
+        proposed_size: u64,
+        min_size_allowed: u64,
+        part_number: u32,
+        etag: &str,
+    ) -> String {
+        xml::complete_multipart_entity_too_small_error_xml(
+            proposed_size,
+            min_size_allowed,
+            part_number,
+            etag,
+            REQUEST_ID,
+            HOST_ID,
+        )
+    }
+
+    pub fn complete_multipart_missing_part_checksum(algorithm: &str, part_number: u32) -> String {
+        xml::complete_multipart_missing_part_checksum_error_xml(
+            algorithm,
+            part_number,
+            REQUEST_ID,
+            HOST_ID,
+        )
+    }
+
+    pub fn complete_multipart_checksum_header_invalid(header_name: &str) -> String {
+        xml::complete_multipart_checksum_header_invalid_error_xml(header_name, REQUEST_ID, HOST_ID)
+    }
+
+    pub fn upload_part_copy_invalid_range(range_header: &str, source_size: u64) -> String {
+        xml::upload_part_copy_invalid_range_error_xml(
+            range_header,
+            source_size,
+            REQUEST_ID,
+            HOST_ID,
+        )
+    }
+
+    pub fn upload_part_copy_precondition_failed(condition: &str) -> String {
+        xml::upload_part_copy_precondition_failed_error_xml(condition, REQUEST_ID, HOST_ID)
+    }
 }
 
 #[cfg(test)]
@@ -1203,6 +1280,64 @@ mod tests {
             expected_error::invalid_token("msg", "tok"),
             "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>InvalidToken</Code>\
              <Message>msg</Message><Token-0>tok</Token-0>\
+             <RequestId>{request_id}</RequestId><HostId>{host_id}</HostId></Error>"
+        );
+        assert_eq!(
+            expected_error::complete_multipart_no_such_upload("uid-1"),
+            "<Error><Code>NoSuchUpload</Code><Message>The specified upload does not exist. \
+             The upload ID may be invalid, or the upload may have been aborted or \
+             completed.</Message><UploadId>uid-1</UploadId>\
+             <RequestId>{request_id}</RequestId><HostId>{host_id}</HostId></Error>"
+        );
+        assert_eq!(
+            expected_error::complete_multipart_invalid_part("uid-1", 1, "\"abcd\""),
+            "<Error><Code>InvalidPart</Code><Message>One or more of the specified parts could \
+             not be found.  The part may not have been uploaded, or the specified entity tag \
+             may not match the part's entity tag.</Message><UploadId>uid-1</UploadId>\
+             <PartNumber>1</PartNumber><ETag>abcd</ETag>\
+             <RequestId>{request_id}</RequestId><HostId>{host_id}</HostId></Error>"
+        );
+        assert_eq!(
+            expected_error::complete_multipart_invalid_part_order("uid-1"),
+            "<Error><Code>InvalidPartOrder</Code><Message>The list of parts was not in \
+             ascending order. Parts must be ordered by part number.</Message>\
+             <UploadId>uid-1</UploadId>\
+             <RequestId>{request_id}</RequestId><HostId>{host_id}</HostId></Error>"
+        );
+        assert_eq!(
+            expected_error::complete_multipart_entity_too_small(100, 5242880, 1, "abcd"),
+            "<Error><Code>EntityTooSmall</Code><Message>Your proposed upload is smaller than \
+             the minimum allowed size</Message><ProposedSize>100</ProposedSize>\
+             <MinSizeAllowed>5242880</MinSizeAllowed><PartNumber>1</PartNumber>\
+             <ETag>abcd</ETag>\
+             <RequestId>{request_id}</RequestId><HostId>{host_id}</HostId></Error>"
+        );
+        assert_eq!(
+            expected_error::complete_multipart_missing_part_checksum("sha256", 1),
+            "<Error><Code>InvalidRequest</Code><Message>The upload was created using a sha256 \
+             checksum. The complete request must include the checksum for each part. It was \
+             missing for part 1 in the request.</Message>\
+             <RequestId>{request_id}</RequestId><HostId>{host_id}</HostId></Error>"
+        );
+        assert_eq!(
+            expected_error::complete_multipart_checksum_header_invalid("x-amz-checksum-sha256"),
+            "<Error><Code>InvalidRequest</Code><Message>Value for x-amz-checksum-sha256 header \
+             is invalid.</Message>\
+             <RequestId>{request_id}</RequestId><HostId>{host_id}</HostId></Error>"
+        );
+        assert_eq!(
+            expected_error::upload_part_copy_invalid_range("bytes=0-9999", 1000),
+            "<Error><Code>InvalidArgument</Code><Message>Range specified is not valid for \
+             source object of size: 1000</Message>\
+             <ArgumentName>x-amz-copy-source-range</ArgumentName>\
+             <ArgumentValue>bytes=0-9999</ArgumentValue>\
+             <RequestId>{request_id}</RequestId><HostId>{host_id}</HostId></Error>"
+        );
+        assert_eq!(
+            expected_error::upload_part_copy_precondition_failed("x-amz-copy-source-If-Match"),
+            "<Error><Code>PreconditionFailed</Code><Message>At least one of the pre-conditions \
+             you specified did not hold</Message>\
+             <Condition>x-amz-copy-source-If-Match</Condition>\
              <RequestId>{request_id}</RequestId><HostId>{host_id}</HostId></Error>"
         );
         assert_eq!(

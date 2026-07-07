@@ -22,8 +22,9 @@ use bytes::Bytes;
 use http_body_1x::{Body, Frame, SizeHint};
 use s3_tests::{
     assert_s3_err_code, copy_source_with_version, err_status, is_sdk_stream_disconnect_or_status,
-    object_url, send_signed_request, send_signed_request_with_credentials, unique_bucket,
-    RawResponse, SendRetryingOperationAborted, SignedRequestCredentials, CTX,
+    object_url, raw_object_query, send_signed_request, send_signed_request_with_credentials,
+    shape::{assert_shape, error_response_headers, expected_error, shape, xml_tag_text},
+    unique_bucket, RawResponse, SendRetryingOperationAborted, SignedRequestCredentials, CTX,
 };
 
 const PART_SIZE: usize = 5 * 1024 * 1024; // 5 MB minimum part size
@@ -4154,5 +4155,654 @@ fn test_upload_part_copy_percent_encoded_key() {
             .await
             .unwrap();
         cleanup(&bucket, &[encoded_key, dst_key]).await;
+    });
+}
+
+// ── Response shapes ─────────────────────────────────────────────────
+
+fn raw_multipart_query(
+    method: &str,
+    bucket: &str,
+    key: &str,
+    query: &str,
+    body: &[u8],
+    headers: &[(&str, &str)],
+) -> RawResponse {
+    send_signed_request(
+        method,
+        &format!("{}/{}/{}?{}", CTX.endpoint(), bucket, key, query),
+        body,
+        headers.iter().copied(),
+    )
+}
+
+fn raw_create_upload(bucket: &str, key: &str, headers: &[(&str, &str)]) -> (RawResponse, String) {
+    let response = raw_multipart_query("POST", bucket, key, "uploads=", b"", headers);
+    let upload_id = xml_tag_text(&response.body, "UploadId")
+        .unwrap_or_else(|| panic!("create upload failed: {response:?}"))
+        .to_string();
+    (response, upload_id)
+}
+
+fn raw_upload_part(
+    bucket: &str,
+    key: &str,
+    upload_id: &str,
+    part_number: u32,
+    body: &[u8],
+    headers: &[(&str, &str)],
+) -> (RawResponse, String) {
+    let response = raw_multipart_query(
+        "PUT",
+        bucket,
+        key,
+        &format!("partNumber={part_number}&uploadId={upload_id}"),
+        body,
+        headers,
+    );
+    let etag = s3_tests::shape::response_header_value(&response, "etag")
+        .unwrap_or_else(|| panic!("upload part failed: {response:?}"))
+        .to_string();
+    (response, etag)
+}
+
+fn raw_complete_upload(
+    bucket: &str,
+    key: &str,
+    upload_id: &str,
+    body: &str,
+    extra_headers: &[(&str, &str)],
+) -> RawResponse {
+    let mut headers = vec![("Content-Type", "application/xml")];
+    headers.extend_from_slice(extra_headers);
+    raw_multipart_query(
+        "POST",
+        bucket,
+        key,
+        &format!("uploadId={upload_id}"),
+        body.as_bytes(),
+        &headers,
+    )
+}
+
+fn raw_abort_upload(bucket: &str, key: &str, upload_id: &str) {
+    let response = raw_multipart_query(
+        "DELETE",
+        bucket,
+        key,
+        &format!("uploadId={upload_id}"),
+        b"",
+        &[],
+    );
+    assert_eq!(response.status, 204, "abort upload failed: {response:?}");
+}
+
+fn single_part_complete_body(etag: &str) -> String {
+    format!(
+        "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{etag}</ETag></Part>\
+         </CompleteMultipartUpload>"
+    )
+}
+
+#[test]
+fn test_multipart_flow_response_shape() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
+        let key = "shape-multipart.txt";
+
+        let (create, upload_id) =
+            raw_create_upload(&bucket, key, &[("x-amz-checksum-algorithm", "CRC64NVME")]);
+        assert_shape(
+            "CreateMultipartUpload shape",
+            &create,
+            &shape()
+                .status(200)
+                .headers([
+                    ("x-amz-checksum-algorithm", "CRC64NVME"),
+                    ("x-amz-checksum-type", "FULL_OBJECT"),
+                    ("x-amz-server-side-encryption", "AES256"),
+                    ("x-amz-request-id", "{request_id}"),
+                    ("x-amz-id-2", "{host_id}"),
+                    ("transfer-encoding", "chunked"),
+                ])
+                .body(
+                    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+                     <InitiateMultipartUploadResult \
+                     xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Bucket>{bucket}</Bucket>\
+                     <Key>{key}</Key><UploadId>{upload_id}</UploadId>\
+                     </InitiateMultipartUploadResult>",
+                )
+                .sub("bucket", bucket.as_str())
+                .sub("key", key)
+                .sub("upload_id", upload_id.as_str()),
+        );
+
+        let (part, part_etag) =
+            raw_upload_part(&bucket, key, &upload_id, 1, b"multipart-part-body", &[]);
+        assert_shape(
+            "UploadPart shape",
+            &part,
+            &shape()
+                .status(200)
+                .headers([
+                    ("etag", "{etag}"),
+                    ("x-amz-checksum-crc64nvme", "fE1y/S5sY5Y="),
+                    ("x-amz-server-side-encryption", "AES256"),
+                    ("x-amz-request-id", "{request_id}"),
+                    ("x-amz-id-2", "{host_id}"),
+                    ("content-length", "0"),
+                ])
+                .body_empty(),
+        );
+
+        let list_parts = raw_multipart_query(
+            "GET",
+            &bucket,
+            key,
+            &format!("uploadId={upload_id}"),
+            b"",
+            &[],
+        );
+        assert_shape(
+            "ListParts shape",
+            &list_parts,
+            &shape()
+                .status(200)
+                .headers([
+                    ("content-type", "application/xml"),
+                    ("transfer-encoding", "chunked"),
+                    ("x-amz-request-id", "{request_id}"),
+                    ("x-amz-id-2", "{host_id}"),
+                ])
+                .body(
+                    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<ListPartsResult \
+                     xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Bucket>{bucket}</Bucket>\
+                     <Key>{key}</Key><UploadId>{upload_id}</UploadId>\
+                     <Initiator><ID>{any}</ID><DisplayName>{any}</DisplayName></Initiator>\
+                     <Owner><ID>{owner_id}</ID></Owner>\
+                     <StorageClass>STANDARD</StorageClass>\
+                     <ChecksumAlgorithm>CRC64NVME</ChecksumAlgorithm>\
+                     <ChecksumType>FULL_OBJECT</ChecksumType>\
+                     <PartNumberMarker>0</PartNumberMarker>\
+                     <NextPartNumberMarker>1</NextPartNumberMarker>\
+                     <MaxParts>1000</MaxParts><IsTruncated>false</IsTruncated>\
+                     <Part><PartNumber>1</PartNumber><LastModified>{iso8601}</LastModified>\
+                     <ETag>{part_etag_escaped}</ETag><Size>19</Size>\
+                     <ChecksumCRC64NVME>fE1y/S5sY5Y=</ChecksumCRC64NVME></Part></ListPartsResult>",
+                )
+                .sub("bucket", bucket.as_str())
+                .sub("key", key)
+                .sub("upload_id", upload_id.as_str())
+                .sub("part_etag_escaped", part_etag.replace('"', "&quot;")),
+        );
+
+        let complete = raw_complete_upload(
+            &bucket,
+            key,
+            &upload_id,
+            &single_part_complete_body(&part_etag),
+            &[],
+        );
+        // AWS may pad the completion body with whitespace after the XML
+        // declaration while the completion is in progress; {ws} accepts it.
+        assert_shape(
+            "CompleteMultipartUpload shape",
+            &complete,
+            &shape()
+                .status(200)
+                .headers([
+                    ("content-type", "application/xml"),
+                    ("x-amz-server-side-encryption", "AES256"),
+                    ("x-amz-request-id", "{request_id}"),
+                    ("x-amz-id-2", "{host_id}"),
+                    ("transfer-encoding", "chunked"),
+                ])
+                .body(
+                    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n{ws}\
+                     <CompleteMultipartUploadResult \
+                     xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
+                     <Location>https://s3.{region}.amazonaws.com/{bucket}/{key}</Location>\
+                     <Bucket>{bucket}</Bucket><Key>{key}</Key><ETag>{etag}</ETag>\
+                     <ChecksumCRC64NVME>fE1y/S5sY5Y=</ChecksumCRC64NVME>\
+                     <ChecksumType>FULL_OBJECT</ChecksumType>\
+                     </CompleteMultipartUploadResult>",
+                )
+                .sub("region", CTX.region())
+                .sub("bucket", bucket.as_str())
+                .sub("key", key),
+        );
+
+        s3_tests::delete_object_retrying_operation_aborted(client, &bucket, key)
+            .await
+            .expect("delete multipart shape fixture");
+        s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
+    });
+}
+
+#[test]
+fn test_object_part_response_shape() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
+        let key = "shape-object-part.txt";
+        let part_one = vec![b'A'; 5 * 1024 * 1024];
+
+        let (_, upload_id) = raw_create_upload(
+            &bucket,
+            key,
+            &[("Content-Type", "application/octet-stream")],
+        );
+        let (_, etag_one) = raw_upload_part(&bucket, key, &upload_id, 1, &part_one, &[]);
+        let (_, etag_two) =
+            raw_upload_part(&bucket, key, &upload_id, 2, b"second-multipart-part", &[]);
+        let complete = raw_complete_upload(
+            &bucket,
+            key,
+            &upload_id,
+            &format!(
+                "<CompleteMultipartUpload>\
+                 <Part><PartNumber>1</PartNumber><ETag>{etag_one}</ETag></Part>\
+                 <Part><PartNumber>2</PartNumber><ETag>{etag_two}</ETag></Part>\
+                 </CompleteMultipartUpload>"
+            ),
+            &[],
+        );
+        assert_eq!(complete.status, 200, "part fixture complete: {complete:?}");
+
+        let part_headers = [
+            ("etag", "{etag}"),
+            ("content-length", "5242880"),
+            ("last-modified", "{http_date}"),
+            ("accept-ranges", "bytes"),
+            ("x-amz-mp-parts-count", "2"),
+            ("content-range", "bytes 0-5242879/5242901"),
+            ("content-type", "application/octet-stream"),
+            ("x-amz-server-side-encryption", "AES256"),
+            ("x-amz-request-id", "{request_id}"),
+            ("x-amz-id-2", "{host_id}"),
+        ];
+        let head = raw_object_query("HEAD", &bucket, key, "partNumber=1");
+        let head_captures = assert_shape(
+            "HeadObject partNumber shape",
+            &head,
+            &shape().status(206).headers(part_headers).body_empty(),
+        );
+        let get = raw_object_query("GET", &bucket, key, "partNumber=1");
+        let get_captures = assert_shape(
+            "GetObject partNumber shape",
+            &get,
+            &shape()
+                .status(206)
+                .headers(part_headers)
+                .body("A".repeat(5 * 1024 * 1024)),
+        );
+        assert_eq!(head_captures["etag"], get_captures["etag"]);
+
+        s3_tests::delete_object_retrying_operation_aborted(client, &bucket, key)
+            .await
+            .expect("delete part shape fixture");
+        s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
+    });
+}
+
+#[test]
+fn test_upload_part_copy_response_shape() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
+        let src_key = "shape-upload-part-copy-src.txt";
+        let dst_key = "shape-upload-part-copy-dst.txt";
+
+        s3_tests::raw_object_with(
+            "PUT",
+            &bucket,
+            src_key,
+            b"upload-part-copy-source-body",
+            &[],
+        );
+        let (_, upload_id) = raw_create_upload(&bucket, dst_key, &[]);
+
+        let copy = raw_multipart_query(
+            "PUT",
+            &bucket,
+            dst_key,
+            &format!("partNumber=1&uploadId={upload_id}"),
+            b"",
+            &[("x-amz-copy-source", &format!("{bucket}/{src_key}"))],
+        );
+        assert_shape(
+            "UploadPartCopy shape",
+            &copy,
+            &shape()
+                .status(200)
+                .headers([
+                    ("content-type", "application/xml"),
+                    ("content-length", "{any}"),
+                    ("x-amz-server-side-encryption", "AES256"),
+                    ("x-amz-request-id", "{request_id}"),
+                    ("x-amz-id-2", "{host_id}"),
+                ])
+                .body(
+                    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<CopyPartResult \
+                     xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
+                     <LastModified>{iso8601}</LastModified><ETag>{etag}</ETag></CopyPartResult>",
+                ),
+        );
+
+        raw_abort_upload(&bucket, dst_key, &upload_id);
+        s3_tests::delete_object_retrying_operation_aborted(client, &bucket, src_key)
+            .await
+            .expect("delete copy source fixture");
+        s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
+    });
+}
+
+#[test]
+fn test_complete_multipart_no_such_upload_error_shape() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
+        let key = "shape-complete-no-such-upload.txt";
+        let (_, upload_id) = raw_create_upload(&bucket, key, &[]);
+        raw_abort_upload(&bucket, key, &upload_id);
+
+        let response = raw_complete_upload(
+            &bucket,
+            key,
+            &upload_id,
+            &single_part_complete_body("\"ffffffffffffffff\""),
+            &[],
+        );
+        assert_shape(
+            "CompleteMultipartUpload NoSuchUpload",
+            &response,
+            &shape().status(404).headers(error_response_headers()).body(
+                expected_error::complete_multipart_no_such_upload(&upload_id),
+            ),
+        );
+
+        s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
+    });
+}
+
+#[test]
+fn test_complete_multipart_invalid_part_error_shape() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
+        let key = "shape-complete-invalid-part.txt";
+        let (_, upload_id) = raw_create_upload(&bucket, key, &[]);
+        let _ = raw_upload_part(&bucket, key, &upload_id, 1, &[0u8; 256], &[]);
+
+        let response = raw_complete_upload(
+            &bucket,
+            key,
+            &upload_id,
+            &single_part_complete_body("\"ffffffffffffffff\""),
+            &[],
+        );
+        assert_shape(
+            "CompleteMultipartUpload InvalidPart",
+            &response,
+            &shape().status(400).headers(error_response_headers()).body(
+                expected_error::complete_multipart_invalid_part(&upload_id, 1, "ffffffffffffffff"),
+            ),
+        );
+
+        raw_abort_upload(&bucket, key, &upload_id);
+        s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
+    });
+}
+
+#[test]
+fn test_complete_multipart_invalid_part_order_error_shape() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
+        let key = "shape-complete-invalid-order.txt";
+        let (_, upload_id) = raw_create_upload(&bucket, key, &[]);
+        let large_part = vec![b'a'; 5 * 1024 * 1024];
+        let (_, etag_one) = raw_upload_part(&bucket, key, &upload_id, 1, &large_part, &[]);
+        let (_, etag_two) = raw_upload_part(&bucket, key, &upload_id, 2, &[b'b'; 256], &[]);
+
+        let response = raw_complete_upload(
+            &bucket,
+            key,
+            &upload_id,
+            &format!(
+                "<CompleteMultipartUpload>\
+                 <Part><PartNumber>2</PartNumber><ETag>{etag_two}</ETag></Part>\
+                 <Part><PartNumber>1</PartNumber><ETag>{etag_one}</ETag></Part>\
+                 </CompleteMultipartUpload>"
+            ),
+            &[],
+        );
+        assert_shape(
+            "CompleteMultipartUpload InvalidPartOrder",
+            &response,
+            &shape().status(400).headers(error_response_headers()).body(
+                expected_error::complete_multipart_invalid_part_order(&upload_id),
+            ),
+        );
+
+        raw_abort_upload(&bucket, key, &upload_id);
+        s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
+    });
+}
+
+#[test]
+fn test_complete_multipart_entity_too_small_error_shape() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
+        let key = "shape-complete-entity-too-small.txt";
+        let (_, upload_id) = raw_create_upload(&bucket, key, &[]);
+        let (_, etag_one) = raw_upload_part(&bucket, key, &upload_id, 1, &[0u8; 100], &[]);
+        let (_, etag_two) = raw_upload_part(&bucket, key, &upload_id, 2, &[0u8; 100], &[]);
+
+        let response = raw_complete_upload(
+            &bucket,
+            key,
+            &upload_id,
+            &format!(
+                "<CompleteMultipartUpload>\
+                 <Part><PartNumber>1</PartNumber><ETag>{etag_one}</ETag></Part>\
+                 <Part><PartNumber>2</PartNumber><ETag>{etag_two}</ETag></Part>\
+                 </CompleteMultipartUpload>"
+            ),
+            &[],
+        );
+        // The error echoes the first offending part's ETag without quotes.
+        assert_shape(
+            "CompleteMultipartUpload EntityTooSmall",
+            &response,
+            &shape().status(400).headers(error_response_headers()).body(
+                expected_error::complete_multipart_entity_too_small(
+                    100,
+                    5242880,
+                    1,
+                    etag_one.trim_matches('"'),
+                ),
+            ),
+        );
+
+        raw_abort_upload(&bucket, key, &upload_id);
+        s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
+    });
+}
+
+#[test]
+fn test_complete_multipart_checksum_mismatch_error_shape() {
+    s3_tests::run(async {
+        use base64::Engine;
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
+        let key = "shape-complete-checksum-mismatch.txt";
+        let (_, upload_id) =
+            raw_create_upload(&bucket, key, &[("x-amz-checksum-algorithm", "SHA256")]);
+
+        let part_body = b"checksum mismatch multipart part";
+        let part_checksum = base64::engine::general_purpose::STANDARD
+            .encode(ring::digest::digest(&ring::digest::SHA256, part_body).as_ref());
+        let (_, etag) = raw_upload_part(
+            &bucket,
+            key,
+            &upload_id,
+            1,
+            part_body,
+            &[("x-amz-checksum-sha256", part_checksum.as_str())],
+        );
+
+        let response = raw_complete_upload(
+            &bucket,
+            key,
+            &upload_id,
+            &format!(
+                "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{etag}</ETag>\
+                 <ChecksumSHA256>{part_checksum}</ChecksumSHA256></Part>\
+                 </CompleteMultipartUpload>"
+            ),
+            &[("x-amz-checksum-sha256", "bad")],
+        );
+        assert_shape(
+            "CompleteMultipartUpload checksum header invalid",
+            &response,
+            &shape().status(400).headers(error_response_headers()).body(
+                expected_error::complete_multipart_checksum_header_invalid("x-amz-checksum-sha256"),
+            ),
+        );
+
+        raw_abort_upload(&bucket, key, &upload_id);
+        s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
+    });
+}
+
+#[test]
+fn test_complete_multipart_missing_part_checksum_error_shape() {
+    s3_tests::run(async {
+        use base64::Engine;
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
+        let key = "shape-complete-missing-part-checksum.txt";
+        let (_, upload_id) =
+            raw_create_upload(&bucket, key, &[("x-amz-checksum-algorithm", "SHA256")]);
+
+        let part_body = b"missing part checksum multipart part";
+        let part_checksum = base64::engine::general_purpose::STANDARD
+            .encode(ring::digest::digest(&ring::digest::SHA256, part_body).as_ref());
+        let (_, etag) = raw_upload_part(
+            &bucket,
+            key,
+            &upload_id,
+            1,
+            part_body,
+            &[("x-amz-checksum-sha256", part_checksum.as_str())],
+        );
+
+        let response = raw_complete_upload(
+            &bucket,
+            key,
+            &upload_id,
+            &single_part_complete_body(&etag),
+            &[],
+        );
+        assert_shape(
+            "CompleteMultipartUpload missing part checksum",
+            &response,
+            &shape().status(400).headers(error_response_headers()).body(
+                expected_error::complete_multipart_missing_part_checksum("sha256", 1),
+            ),
+        );
+
+        raw_abort_upload(&bucket, key, &upload_id);
+        s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
+    });
+}
+
+#[test]
+fn test_upload_part_copy_invalid_range_error_shape() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
+        let src_key = "shape-copy-invalid-range-src.txt";
+        let dst_key = "shape-copy-invalid-range-dst.txt";
+
+        s3_tests::raw_object_with("PUT", &bucket, src_key, &[b'Z'; 1000], &[]);
+        let (_, upload_id) = raw_create_upload(&bucket, dst_key, &[]);
+
+        let response = raw_multipart_query(
+            "PUT",
+            &bucket,
+            dst_key,
+            &format!("partNumber=1&uploadId={upload_id}"),
+            b"",
+            &[
+                ("x-amz-copy-source", &format!("{bucket}/{src_key}")),
+                ("x-amz-copy-source-range", "bytes=0-9999"),
+            ],
+        );
+        assert_shape(
+            "UploadPartCopy invalid range",
+            &response,
+            &shape().status(400).headers(error_response_headers()).body(
+                expected_error::upload_part_copy_invalid_range("bytes=0-9999", 1000),
+            ),
+        );
+
+        raw_abort_upload(&bucket, dst_key, &upload_id);
+        s3_tests::delete_object_retrying_operation_aborted(client, &bucket, src_key)
+            .await
+            .expect("delete invalid-range source");
+        s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
+    });
+}
+
+#[test]
+fn test_upload_part_copy_source_if_match_failed_error_shape() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
+        let src_key = "shape-copy-if-match-src.txt";
+        let dst_key = "shape-copy-if-match-dst.txt";
+
+        s3_tests::raw_object_with("PUT", &bucket, src_key, b"copy-source-body", &[]);
+        let (_, upload_id) = raw_create_upload(&bucket, dst_key, &[]);
+
+        let response = raw_multipart_query(
+            "PUT",
+            &bucket,
+            dst_key,
+            &format!("partNumber=1&uploadId={upload_id}"),
+            b"",
+            &[
+                ("x-amz-copy-source", &format!("{bucket}/{src_key}")),
+                ("x-amz-copy-source-if-match", "\"0000000000000000\""),
+            ],
+        );
+        assert_shape(
+            "UploadPartCopy source if-match failed",
+            &response,
+            &shape().status(412).headers(error_response_headers()).body(
+                expected_error::upload_part_copy_precondition_failed("x-amz-copy-source-If-Match"),
+            ),
+        );
+
+        raw_abort_upload(&bucket, dst_key, &upload_id);
+        s3_tests::delete_object_retrying_operation_aborted(client, &bucket, src_key)
+            .await
+            .expect("delete if-match source");
+        s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
     });
 }

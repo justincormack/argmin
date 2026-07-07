@@ -30,7 +30,7 @@ use storage::{BucketName, ObjectKey, StorageCluster, StorageClusterRuntimeMapHan
 #[cfg(test)]
 use storage::{
     BucketObjectLockConfig, BucketOwnershipControls, BucketState, EcShape, GenerationId,
-    ManagedEncryptionAlgorithm, OwnerIdentity, PublicAccessBlockConfig, SessionId, StoredObject,
+    ManagedEncryptionAlgorithm, PublicAccessBlockConfig, SessionId, StoredObject,
     StreamUploadTarget, UploadId, UploadState, UPLOAD_ID_LEN,
 };
 
@@ -71,6 +71,7 @@ use crate::range::ByteRange;
 #[cfg(test)]
 use crate::sse::SseCustomerRequest;
 pub use storage::BucketObjectOwnership;
+pub use storage::OwnerIdentity;
 #[cfg(test)]
 use storage::ReclaimWorkItem;
 

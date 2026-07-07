@@ -430,6 +430,8 @@ pub struct ListPartsResult {
     pub parts: Vec<PartEntry>,
     pub is_truncated: bool,
     pub next_part_number_marker: Option<u32>,
+    pub owner: OwnerIdentity,
+    pub initiator: OwnerIdentity,
     /// Upload-level checksum algorithm.
     pub checksum_algorithm: Option<ChecksumAlgorithm>,
     /// Upload-level checksum type.

@@ -1847,13 +1847,7 @@ impl S3Response {
         upload_id: &UploadId,
         ctx: CreateMultipartUploadResponseContext<'_>,
     ) -> Self {
-        let body = xml::initiate_multipart_upload_xml(
-            bucket,
-            key,
-            upload_id.as_str(),
-            ctx.checksum_algorithm.map(ChecksumAlgorithm::as_str),
-            ctx.checksum_type.map(ChecksumType::as_str),
-        );
+        let body = xml::initiate_multipart_upload_xml(bucket, key, upload_id.as_str());
         let mut resp = Self::new(200).chunked_body(body.into_bytes());
         if let Some(algo) = ctx.checksum_algorithm {
             resp = resp.header("x-amz-checksum-algorithm", algo.as_str());
@@ -1905,11 +1899,13 @@ impl S3Response {
     pub fn complete_multipart_upload(
         bucket: &str,
         key: &str,
+        region: &str,
         result: &CompleteMultipartUploadResult,
     ) -> Self {
         let body = xml::complete_multipart_upload_xml(
             bucket,
             key,
+            region,
             &result.etag,
             result.checksum_algorithm,
             result.checksum_type,
@@ -2027,12 +2023,15 @@ impl S3Response {
 
     /// Build a response for `ListParts` (200 OK, XML body).
     #[must_use]
+    #[allow(clippy::too_many_arguments)]
     pub fn list_parts(
         bucket: &str,
         key: &str,
         upload_id: &str,
         part_number_marker: Option<u32>,
         max_parts: u32,
+        initiator: &xml::RenderedCanonicalUser,
+        owner: &xml::RenderedCanonicalUser,
         result: &ListPartsResult,
     ) -> Self {
         let body = xml::list_parts_xml(
@@ -2041,6 +2040,8 @@ impl S3Response {
             upload_id,
             part_number_marker,
             max_parts,
+            initiator,
+            owner,
             result,
         );
         Self::new(200)
@@ -3299,10 +3300,26 @@ mod tests {
             "upload-1",
             None,
             1000,
+            &xml::RenderedCanonicalUser {
+                canonical_id: CanonicalUserId::from_principal("owner"),
+                display_name: None,
+            },
+            &xml::RenderedCanonicalUser {
+                canonical_id: CanonicalUserId::from_principal("owner"),
+                display_name: None,
+            },
             &ListPartsResult {
                 parts: Vec::new(),
                 is_truncated: false,
                 next_part_number_marker: None,
+                owner: crate::coordinator::OwnerIdentity {
+                    principal: "owner".to_string(),
+                    canonical_id: CanonicalUserId::from_principal("owner"),
+                },
+                initiator: crate::coordinator::OwnerIdentity {
+                    principal: "owner".to_string(),
+                    canonical_id: CanonicalUserId::from_principal("owner"),
+                },
                 checksum_algorithm: None,
                 checksum_type: None,
                 lifecycle_abort: Some(LifecycleAbortHeaders {
@@ -3328,6 +3345,7 @@ mod tests {
         let resp = S3Response::complete_multipart_upload(
             "bucket",
             "key",
+            "us-east-1",
             &CompleteMultipartUploadResult {
                 etag: "\"etag\"".to_string(),
                 version_id: VersionId::Null,

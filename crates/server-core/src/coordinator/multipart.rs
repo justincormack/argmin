@@ -900,6 +900,8 @@ impl Coordinator {
             parts,
             is_truncated: resp.is_truncated,
             next_part_number_marker: resp.next_part_number_marker,
+            owner: upload.owner.clone(),
+            initiator: upload.initiator.clone(),
             checksum_algorithm,
             checksum_type,
             lifecycle_abort: self.multipart_lifecycle_abort_headers(

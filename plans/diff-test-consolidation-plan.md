@@ -253,6 +253,24 @@ batch, deleting each diff test once its shape coverage is subsumed. Batches
    InvalidArgument bodies are inline formats in response.rs (not xml.rs
    builders) so those tests use literal templates via a local helper.
 4. multipart success shapes and completion/part errors, upload-part-copy
+   — DONE: eleven diff tests converted to golden tests in multipart.rs,
+   all AWS-validated, eleven diff tests deleted. The old diff test only
+   compared HEADERS for the create/upload/list-parts/complete flow, and
+   probing AWS for full bodies exposed four server conformance bugs, all
+   fixed: InitiateMultipartUploadResult carried ChecksumAlgorithm/Type
+   elements AWS keeps header-only; ListPartsResult lacked
+   Initiator/Owner/StorageClass/ChecksumType/NextPartNumberMarker and
+   used a different element order; CompleteMultipartUpload Location was
+   a hardcoded http://s3.amazonaws.com host (now the regional
+   https://s3.{region}.amazonaws.com path-style form AWS returns); and
+   the complete-body ETag was entity-escaped where AWS emits raw quotes
+   (AWS is inconsistent: ListParts entries ARE entity-escaped).
+   Multipart completion error bodies carry no XML declaration —
+   expected_error gained eight wrappers with literal anchors. Shape
+   templates gained the possibly-empty `{ws}` placeholder for AWS's
+   keep-alive whitespace padding in slow CompleteMultipartUpload
+   responses. Note: the golden flow test pins full bodies, strictly more
+   than the old diff test checked.
 5. object lock (bucket config, retention, legal hold) — needs the
    object-lock cleanup helper moved into shared helpers
 6. listings (v1/v2, versions, multipart uploads) and DeleteObjects

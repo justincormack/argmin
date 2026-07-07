@@ -2931,6 +2931,7 @@ impl HttpFrontend {
                 Ok(S3Response::complete_multipart_upload(
                     bucket.as_str(),
                     &key,
+                    self.coordinator.region(),
                     &result,
                 ))
             }
@@ -3003,12 +3004,25 @@ impl HttpFrontend {
                             part_number_marker,
                             max_parts,
                         })?;
+                let owner = xml::RenderedCanonicalUser {
+                    canonical_id: result.owner.canonical_id.clone(),
+                    display_name: None,
+                };
+                let initiator = xml::RenderedCanonicalUser {
+                    canonical_id: result.initiator.canonical_id.clone(),
+                    display_name: self
+                        .credentials
+                        .find_account_by_canonical_user_id(&result.initiator.canonical_id)
+                        .map(|account| account.display_name().to_string()),
+                };
                 Ok(S3Response::list_parts(
                     bucket.as_str(),
                     &key,
                     upload_id.as_str(),
                     part_number_marker,
                     max_parts,
+                    &initiator,
+                    &owner,
                     &result,
                 ))
             }
@@ -10917,7 +10931,7 @@ mod tests {
     }
 
     #[test]
-    fn create_multipart_with_checksum_returns_fields_in_xml() {
+    fn create_multipart_with_checksum_reports_fields_in_headers_only() {
         let tmp = test_util::tempdir();
         let fe = setup_frontend(tmp.path());
         create_test_bucket(&fe.coordinator, "mybucket");
@@ -10938,15 +10952,25 @@ mod tests {
         };
         let resp = fe.dispatch_routed(&req, &test_auth(), op).unwrap();
         assert_eq!(resp.status_code, 200);
+        assert_eq!(
+            find_header(&resp, "x-amz-checksum-algorithm"),
+            Some("CRC32")
+        );
+        assert_eq!(
+            find_header(&resp, "x-amz-checksum-type"),
+            Some("FULL_OBJECT")
+        );
         let body_bytes = response_body(resp);
         let body = std::str::from_utf8(&body_bytes).unwrap();
+        // AWS reports checksum configuration only in headers; the
+        // InitiateMultipartUploadResult body carries just Bucket/Key/UploadId.
         assert!(
-            body.contains("<ChecksumAlgorithm>CRC32</ChecksumAlgorithm>"),
-            "missing ChecksumAlgorithm: {body}"
+            !body.contains("ChecksumAlgorithm"),
+            "unexpected ChecksumAlgorithm in body: {body}"
         );
         assert!(
-            body.contains("<ChecksumType>FULL_OBJECT</ChecksumType>"),
-            "missing ChecksumType: {body}"
+            !body.contains("ChecksumType"),
+            "unexpected ChecksumType in body: {body}"
         );
     }
 
@@ -10972,16 +10996,11 @@ mod tests {
         };
         let resp = fe.dispatch_routed(&req, &test_auth(), op).unwrap();
         assert_eq!(resp.status_code, 200);
-        let body_bytes = response_body(resp);
-        let body = std::str::from_utf8(&body_bytes).unwrap();
-        assert!(
-            body.contains("<ChecksumAlgorithm>CRC32</ChecksumAlgorithm>"),
-            "missing ChecksumAlgorithm: {body}"
+        assert_eq!(
+            find_header(&resp, "x-amz-checksum-algorithm"),
+            Some("CRC32")
         );
-        assert!(
-            body.contains("<ChecksumType>COMPOSITE</ChecksumType>"),
-            "missing ChecksumType: {body}"
-        );
+        assert_eq!(find_header(&resp, "x-amz-checksum-type"), Some("COMPOSITE"));
     }
 
     #[test]
@@ -11003,16 +11022,11 @@ mod tests {
         };
         let resp = fe.dispatch_routed(&req, &test_auth(), op).unwrap();
         assert_eq!(resp.status_code, 200);
-        let body_bytes = response_body(resp);
-        let body = std::str::from_utf8(&body_bytes).unwrap();
-        assert!(
-            body.contains("<ChecksumAlgorithm>SHA256</ChecksumAlgorithm>"),
-            "missing ChecksumAlgorithm: {body}"
+        assert_eq!(
+            find_header(&resp, "x-amz-checksum-algorithm"),
+            Some("SHA256")
         );
-        assert!(
-            body.contains("<ChecksumType>COMPOSITE</ChecksumType>"),
-            "missing ChecksumType: {body}"
-        );
+        assert_eq!(find_header(&resp, "x-amz-checksum-type"), Some("COMPOSITE"));
     }
 
     // ── UploadPart checksum validation ──────────────────────────────
