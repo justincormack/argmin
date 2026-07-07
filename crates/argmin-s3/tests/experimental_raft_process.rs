@@ -167,6 +167,13 @@ impl ChildGuard {
         }
     }
 
+    fn process_id(&self) -> u32 {
+        self.child
+            .as_ref()
+            .expect("argmin-s3 process should not be inspected after stop")
+            .id()
+    }
+
     fn stop(&mut self) {
         if let Some(mut child) = self.child.take() {
             let _ = child.kill();
@@ -786,6 +793,14 @@ fn state_path(test_dir: &Path, node_id: u64) -> PathBuf {
     state_dir(test_dir, node_id).join("control.state")
 }
 
+fn state_tmp_path_for_process(state_path: &Path, process_id: u32) -> PathBuf {
+    let file_name = state_path
+        .file_name()
+        .and_then(|file_name| file_name.to_str())
+        .expect("test state path should have a UTF-8 file name");
+    state_path.with_file_name(format!("{file_name}.tmp.{process_id}"))
+}
+
 fn wal_path(test_dir: &Path, node_id: u64) -> PathBuf {
     durable_artifact_wal_path(&state_path(test_dir, node_id))
 }
@@ -1097,12 +1112,15 @@ fn experimental_raft_process_peer_wal_crash_after_sync_before_response_recovers_
             follower_vote_before_crash.term,
             follower_vote_before_crash.node_id,
         )))
-        .expect("test should pre-create follower WAL before making state dir unwritable");
+        .expect("test should pre-create follower WAL before blocking checkpoint temp path");
     node101.stop();
     node102.stop();
-    let follower_state_dir = state_dir(test_dir.path(), 103);
-    fs::set_permissions(&follower_state_dir, fs::Permissions::from_mode(0o500))
-        .expect("follower state directory should be made checkpoint-unwritable");
+    let follower_checkpoint_tmp_path =
+        state_tmp_path_for_process(&follower_state_path, restarted103.process_id());
+    let _ = fs::remove_file(&follower_checkpoint_tmp_path);
+    let _ = fs::remove_dir_all(&follower_checkpoint_tmp_path);
+    fs::create_dir(&follower_checkpoint_tmp_path)
+        .expect("follower checkpoint temp path should be blocked by a directory");
 
     let mut peer_stream =
         UnixStream::connect(&follower_peer_socket).expect("follower peer socket should connect");
@@ -1111,8 +1129,8 @@ fn experimental_raft_process_peer_wal_crash_after_sync_before_response_recovers_
     drop(peer_stream);
 
     let status = wait_for_process_exit(&mut restarted103, Duration::from_secs(5));
-    fs::set_permissions(&follower_state_dir, fs::Permissions::from_mode(0o700))
-        .expect("follower state directory permissions should be restored after crash");
+    fs::remove_dir(&follower_checkpoint_tmp_path)
+        .expect("follower checkpoint temp-path blocker should be removed after crash");
     assert!(
         !status.success(),
         "follower should exit after failing the checkpoint-before-peer-response path"

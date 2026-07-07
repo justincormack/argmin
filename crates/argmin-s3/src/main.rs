@@ -67,6 +67,19 @@ const CONTROL_PLANE_RPC_IO_TIMEOUT: Duration = Duration::from_secs(1);
 const CONTROL_PLANE_RAFT_PEER_RPC_WORKER_LIMIT: usize = 64;
 const CONTROL_PLANE_RAFT_PEER_RPC_IO_TIMEOUT: Duration = Duration::from_secs(1);
 
+macro_rules! process_info {
+    ($($arg:tt)*) => {{
+        #[cfg(not(test))]
+        {
+            eprintln!($($arg)*);
+        }
+        #[cfg(test)]
+        {
+            let _ = format_args!($($arg)*);
+        }
+    }};
+}
+
 extern "C" {
     fn flock(fd: i32, operation: i32) -> i32;
     fn getuid() -> u32;
@@ -1384,7 +1397,7 @@ fn run_control_plane_process(config: &ServerConfig) -> ! {
     });
     let authority = Arc::new(Mutex::new(authority));
     let active_rpc_workers = Arc::new(AtomicUsize::new(0));
-    eprintln!(
+    process_info!(
         "argmin-s3 control-plane manager using state {} on {} (lease scan {} ms)",
         state_path,
         socket_path,
@@ -1414,7 +1427,7 @@ fn run_control_plane_process(config: &ServerConfig) -> ! {
             .expire_heartbeat_leases(storage::clock::current_time_millis());
         match expiry {
             Ok(expiry) if !expiry.expired_nodes().is_empty() => {
-                eprintln!(
+                process_info!(
                     "control-plane expired {} node leases at epoch {} and moved {} PGs to peering",
                     expiry.expired_nodes().len(),
                     expiry.cluster_epoch(),
@@ -2404,7 +2417,7 @@ fn run_experimental_raft_control_plane_process(config: &ServerConfig) -> ! {
         .control_plane_raft_peer_socket_path
         .as_deref()
         .unwrap_or("-");
-    eprintln!(
+    process_info!(
         "argmin-s3 experimental durable OpenRaft control-plane manager using state {} on {} (raft node {}, peer socket {}, configured peers {}, lease scan {} ms)",
         state_path,
         socket_path,
@@ -2478,7 +2491,7 @@ fn run_experimental_raft_control_plane_process(config: &ServerConfig) -> ! {
         };
         match expiry {
             Ok((cluster_epoch, expired_nodes, peering_pgs)) if expired_nodes > 0 => {
-                eprintln!(
+                process_info!(
                     "experimental OpenRaft control-plane expired {} node leases at epoch {} and moved {} PGs to peering",
                     expired_nodes,
                     cluster_epoch,
@@ -2555,7 +2568,7 @@ fn bootstrap_empty_experimental_raft_control_plane(
         .current_snapshot()
         .map_err(|error| error.to_string())?
         .cluster_epoch();
-    eprintln!(
+    process_info!(
         "experimental OpenRaft control-plane bootstrapped {} nodes and {} PG acting sets at epoch {}",
         node_count,
         config.storage_pg_ids.len(),
@@ -2618,7 +2631,7 @@ fn bootstrap_empty_control_plane(
     authority
         .bootstrap_initial_cluster_map(nodes, pg_ids)
         .map_err(|error| error.to_string())?;
-    eprintln!(
+    process_info!(
         "control-plane bootstrapped {} nodes and {} PG acting sets at epoch {}",
         node_count,
         config.storage_pg_ids.len(),
@@ -2901,7 +2914,7 @@ fn bind_storage_node_process(
         eprintln!("failed to start storage-node server: {e}");
         std::process::exit(1);
     });
-    eprintln!(
+    process_info!(
         "argmin-s3 storage-node {} listening on {}",
         node_id.as_u32(),
         socket_path.display()
@@ -2944,7 +2957,7 @@ fn maybe_spawn_storage_node_control_plane_refresh_loop(
             eprintln!("failed to start storage-node control-plane refresh loop: {error}");
             std::process::exit(1);
         });
-    eprintln!(
+    process_info!(
         "argmin-s3 storage-node control-plane refresh using {} (incarnation {}, refresh {} ms, lease {} ms)",
         socket_path,
         node_incarnation,
@@ -3094,7 +3107,7 @@ fn build_control_plane_storage_node_process_config(
             }) {
             Ok(refresh) => {
                 if attempts > 1 {
-                    eprintln!(
+                    process_info!(
                         "argmin-s3 storage-node control-plane runtime map became ready after {} attempts",
                         attempts
                     );
@@ -3213,7 +3226,7 @@ async fn build_remote_frontend_storage_cluster_retrying_startup(
         match build_remote_frontend_storage_cluster(config, ec_config) {
             Ok(storage_cluster) => {
                 if attempts > 1 {
-                    eprintln!(
+                    process_info!(
                         "argmin-s3 frontend control-plane runtime map became ready after {} attempts",
                         attempts
                     );
@@ -3455,7 +3468,7 @@ async fn run_frontend_server(
         config.max_inflight_requests
     };
 
-    eprintln!(
+    process_info!(
         "argmin-s3 listening on {}://{} (EC {},{}, {} PGs, {} workers, max {} conns, max {} in-flight effective {} in-flight, storage RPC admission {} bulk wait {} ms control wait {} ms, read chunk {} bytes, panic-on-500 {}, abort-on-500 {}, local-debug {}, region {}, host id {})",
         scheme,
         config.listen_addr,
@@ -3532,7 +3545,7 @@ fn maybe_spawn_frontend_control_plane_refresh_loop(
             eprintln!("failed to start frontend control-plane runtime-map refresh loop: {error}");
             std::process::exit(1);
         });
-    eprintln!(
+    process_info!(
         "argmin-s3 frontend control-plane runtime-map refresh using {} (refresh {} ms)",
         socket_path,
         config.control_plane_refresh_interval.as_millis(),
