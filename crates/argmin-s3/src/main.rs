@@ -25,10 +25,12 @@ use server_core::sse::{
     ManagedWrappingKeyConfig, SseCustomerValidatorConfig, StaticManagedKeyProvider,
 };
 use storage::control_plane::{
-    build_control_plane_unix_response, read_control_plane_unix_request,
-    write_control_plane_unix_response, ClusterControlSnapshot, ClusterRuntimeMapSnapshot,
+    build_control_plane_unix_response, build_control_plane_unix_response_with_auth,
+    read_control_plane_unix_request, write_control_plane_unix_response,
+    AuthenticatedUnixControlPlaneClient, ClusterControlSnapshot, ClusterRuntimeMapSnapshot,
     ControlPlaneAdmin, ControlPlaneError, ControlPlaneHeartbeatRefresh,
     ControlPlaneHeartbeatRuntimeMapSource, ControlPlaneRuntimeMapSource,
+    ControlPlaneStorageNodeAuthCredential, ControlPlaneUnixAuthVerifier,
     FencedPgMetadataTransferSnapshot, FileControlPlaneStore, PgMetadataProof,
     PgMetadataTransferProof, PgRouteSnapshot, SingleAuthorityControlPlane, UnixControlPlaneClient,
 };
@@ -64,7 +66,10 @@ use tokio::net::TcpListener;
 use tokio::runtime::Handle;
 use tokio_rustls::TlsAcceptor;
 
-use config::{ConfiguredCredential, ConfiguredCredentialProfile, ProcessRole, ServerConfig};
+use config::{
+    ConfiguredControlPlaneStorageAuthCredential, ConfiguredCredential, ConfiguredCredentialProfile,
+    ProcessRole, ServerConfig,
+};
 use server_http::http::HttpFrontend;
 
 const LOCK_EX: i32 = 2;
@@ -1405,6 +1410,12 @@ fn run_control_plane_process(config: &ServerConfig) -> ! {
     });
     let authority = Arc::new(Mutex::new(authority));
     let active_rpc_workers = Arc::new(AtomicUsize::new(0));
+    let auth_verifier = build_control_plane_storage_auth_verifier(config)
+        .unwrap_or_else(|error| {
+            eprintln!("failed to configure control-plane auth verifier: {error}");
+            std::process::exit(1);
+        })
+        .map(Arc::new);
     process_info!(
         "argmin-s3 control-plane manager using state {} on {} (lease scan {} ms)",
         state_path,
@@ -1420,6 +1431,7 @@ fn run_control_plane_process(config: &ServerConfig) -> ! {
                         stream,
                         Arc::clone(&authority),
                         Arc::clone(&active_rpc_workers),
+                        auth_verifier.clone(),
                     );
                 }
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
@@ -2622,6 +2634,12 @@ fn run_experimental_raft_control_plane_process(config: &ServerConfig) -> ! {
     let raft_authority = Arc::clone(&authority);
     let authority = Arc::new(Mutex::new(control_plane));
     let active_rpc_workers = Arc::new(AtomicUsize::new(0));
+    let auth_verifier = build_control_plane_storage_auth_verifier(config)
+        .unwrap_or_else(|error| {
+            eprintln!("failed to configure control-plane auth verifier: {error}");
+            std::process::exit(1);
+        })
+        .map(Arc::new);
     let raft_peer_socket_path = config
         .control_plane_raft_peer_socket_path
         .as_deref()
@@ -2648,6 +2666,7 @@ fn run_experimental_raft_control_plane_process(config: &ServerConfig) -> ! {
                         stream,
                         Arc::clone(&authority),
                         Arc::clone(&active_rpc_workers),
+                        auth_verifier.clone(),
                     );
                 }
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
@@ -2865,6 +2884,7 @@ fn spawn_control_plane_rpc_worker(
         >,
     >,
     active_rpc_workers: Arc<AtomicUsize>,
+    auth_verifier: Option<Arc<ControlPlaneUnixAuthVerifier>>,
 ) {
     match active_rpc_workers.fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
         (active < CONTROL_PLANE_RPC_WORKER_LIMIT).then_some(active + 1)
@@ -2903,7 +2923,15 @@ fn spawn_control_plane_rpc_worker(
                 .lock()
                 .expect("control-plane authority mutex poisoned");
             let now_ms = storage::clock::current_time_millis();
-            build_control_plane_unix_response(&mut *authority, request, now_ms)
+            match auth_verifier.as_deref() {
+                Some(auth_verifier) => build_control_plane_unix_response_with_auth(
+                    &mut *authority,
+                    request,
+                    now_ms,
+                    Some(auth_verifier),
+                ),
+                None => build_control_plane_unix_response(&mut *authority, request, now_ms),
+            }
         };
         let response = match response {
             Ok(response) => response,
@@ -2926,6 +2954,102 @@ impl Drop for ControlPlaneRpcWorkerGuard {
     fn drop(&mut self) {
         self.active_rpc_workers.fetch_sub(1, Ordering::AcqRel);
     }
+}
+
+enum StorageNodeControlPlaneClient {
+    Plain(UnixControlPlaneClient),
+    Authenticated(AuthenticatedUnixControlPlaneClient),
+}
+
+impl ControlPlaneHeartbeatRuntimeMapSource for StorageNodeControlPlaneClient {
+    fn refresh_node_heartbeat(
+        &mut self,
+        heartbeat: storage::control_plane::NodeHeartbeat,
+        authority_now_ms: u64,
+    ) -> Result<ControlPlaneHeartbeatRefresh, ControlPlaneError> {
+        match self {
+            Self::Plain(client) => client.refresh_node_heartbeat(heartbeat, authority_now_ms),
+            Self::Authenticated(client) => {
+                client.refresh_node_heartbeat(heartbeat, authority_now_ms)
+            }
+        }
+    }
+}
+
+fn configured_storage_node_auth_credential(
+    configured: &ConfiguredControlPlaneStorageAuthCredential,
+) -> Result<ControlPlaneStorageNodeAuthCredential, String> {
+    ControlPlaneStorageNodeAuthCredential::new(
+        NodeId::new(configured.node_id),
+        configured.credential_id.clone(),
+        configured.credential_version,
+        configured.secret.as_str().as_bytes().to_vec(),
+    )
+    .map_err(|error| {
+        format!(
+            "invalid ARGMIN_CONTROL_PLANE_STORAGE_AUTH_CREDENTIALS credential for node {}: {error}",
+            configured.node_id
+        )
+    })
+}
+
+fn build_control_plane_storage_auth_verifier(
+    config: &ServerConfig,
+) -> Result<Option<ControlPlaneUnixAuthVerifier>, String> {
+    if config.control_plane_storage_auth_credentials.is_empty() {
+        return Ok(None);
+    }
+    let cluster_id = config
+        .control_plane_auth_cluster_id
+        .as_deref()
+        .expect("storage auth credentials require control-plane auth cluster id");
+    let credentials = config
+        .control_plane_storage_auth_credentials
+        .iter()
+        .map(configured_storage_node_auth_credential)
+        .collect::<Result<Vec<_>, _>>()?;
+    ControlPlaneUnixAuthVerifier::new(cluster_id, credentials)
+        .map(Some)
+        .map_err(|error| {
+            format!("invalid ARGMIN_CONTROL_PLANE_STORAGE_AUTH_CREDENTIALS verifier: {error}")
+        })
+}
+
+fn build_storage_node_control_plane_client(
+    config: &ServerConfig,
+    control_plane_socket_path: &str,
+    node_id: NodeId,
+    node_incarnation: u64,
+) -> Result<StorageNodeControlPlaneClient, String> {
+    let client = UnixControlPlaneClient::new(control_plane_socket_path);
+    if config.control_plane_storage_auth_credentials.is_empty() {
+        return Ok(StorageNodeControlPlaneClient::Plain(client));
+    }
+    let cluster_id = config
+        .control_plane_auth_cluster_id
+        .as_deref()
+        .expect("storage auth credentials require control-plane auth cluster id");
+    let configured = config
+        .control_plane_storage_auth_credentials
+        .iter()
+        .find(|credential| credential.node_id == node_id.as_u32())
+        .ok_or_else(|| {
+            format!(
+                "ARGMIN_CONTROL_PLANE_STORAGE_AUTH_CREDENTIALS must include local storage node id {}",
+                node_id.as_u32()
+            )
+        })?;
+    let credential = configured_storage_node_auth_credential(configured)?
+        .scoped_for_cluster_and_incarnation(cluster_id, node_incarnation)
+        .map_err(|error| {
+            format!(
+                "invalid ARGMIN_CONTROL_PLANE_STORAGE_AUTH_CREDENTIALS scoped credential for node {} incarnation {node_incarnation}: {error}",
+                node_id.as_u32()
+            )
+        })?;
+    Ok(StorageNodeControlPlaneClient::Authenticated(
+        AuthenticatedUnixControlPlaneClient::new(client, credential),
+    ))
 }
 
 fn bind_control_plane_socket(socket_path: &Path) -> Result<UnixListener, String> {
@@ -3158,9 +3282,23 @@ fn maybe_spawn_storage_node_control_plane_refresh_loop(
             eprintln!("ARGMIN_CONTROL_PLANE_HEARTBEAT_LEASE_MS is too large");
             std::process::exit(1);
         });
+    let control_plane_client = build_storage_node_control_plane_client(
+        config,
+        socket_path,
+        NodeId::new(
+            config
+                .storage_node_id
+                .expect("storage node id is required for storage roles"),
+        ),
+        node_incarnation,
+    )
+    .unwrap_or_else(|error| {
+        eprintln!("failed to configure storage-node control-plane auth client: {error}");
+        std::process::exit(1);
+    });
     let loop_handle = server
         .spawn_control_plane_refresh_loop(
-            UnixControlPlaneClient::new(socket_path),
+            control_plane_client,
             node_incarnation,
             lease_ms,
             config.control_plane_refresh_interval,
@@ -3312,7 +3450,13 @@ fn build_control_plane_storage_node_process_config(
                     format!("failed to build storage-node startup heartbeat: {error}")
                 })?,
         };
-        match UnixControlPlaneClient::new(control_plane_socket_path)
+        let mut control_plane = build_storage_node_control_plane_client(
+            config,
+            control_plane_socket_path,
+            node_id,
+            node_incarnation,
+        )?;
+        match control_plane
             .refresh_node_heartbeat(heartbeat, storage::clock::current_time_millis())
             .map_err(|error| {
                 format!(
@@ -3844,6 +3988,8 @@ mod tests {
                 LocalUnixStorageNodeClientConfig::DEFAULT_RPC_CONTROL_ADMISSION_WAIT_TIMEOUT,
             control_plane_state_path: None,
             control_plane_socket_path: None,
+            control_plane_auth_cluster_id: None,
+            control_plane_storage_auth_credentials: Vec::new(),
             control_plane_experimental_raft: false,
             control_plane_raft_cluster_name: None,
             control_plane_raft_node_id: None,
@@ -3873,6 +4019,57 @@ mod tests {
             abort_on_500: false,
             local_debug_endpoint: false,
         }
+    }
+
+    #[test]
+    fn storage_node_control_plane_client_uses_authenticated_client_when_configured() {
+        let mut config = test_server_config();
+        config.control_plane_auth_cluster_id = Some("control-auth".to_string());
+        config.control_plane_storage_auth_credentials =
+            vec![ConfiguredControlPlaneStorageAuthCredential {
+                node_id: 2,
+                credential_id: "storage-node".to_string(),
+                credential_version: 7,
+                secret: SecretConfigValue::new("storage-node-2-secret".to_string()),
+            }];
+
+        let client = build_storage_node_control_plane_client(
+            &config,
+            "/tmp/argmin-control-plane.sock",
+            NodeId::new(2),
+            55,
+        )
+        .expect("storage-node auth client should build");
+
+        assert!(matches!(
+            client,
+            StorageNodeControlPlaneClient::Authenticated(_)
+        ));
+    }
+
+    #[test]
+    fn storage_node_control_plane_client_requires_local_auth_credential() {
+        let mut config = test_server_config();
+        config.control_plane_auth_cluster_id = Some("control-auth".to_string());
+        config.control_plane_storage_auth_credentials =
+            vec![ConfiguredControlPlaneStorageAuthCredential {
+                node_id: 1,
+                credential_id: "storage-node".to_string(),
+                credential_version: 7,
+                secret: SecretConfigValue::new("storage-node-1-secret".to_string()),
+            }];
+
+        let result = build_storage_node_control_plane_client(
+            &config,
+            "/tmp/argmin-control-plane.sock",
+            NodeId::new(2),
+            55,
+        );
+        let Err(err) = result else {
+            panic!("storage-node control-plane client should reject missing local credential");
+        };
+
+        assert!(err.contains("local storage node id 2"));
     }
 
     #[test]

@@ -258,6 +258,16 @@ Status:
   secrets, MAC/authenticator bytes, nonces, and payload contents are not
   exposed. Storage-node, frontend, admin, and runtime-map auth diagnostics
   remain deferred with their respective enforcement slices.
+- 2026-07-07: Started Slice B storage-node enforcement. The Unix control-plane
+  heartbeat refresh path now accepts node-scoped storage credentials configured
+  by `ARGMIN_CONTROL_PLANE_STORAGE_AUTH_CREDENTIALS` and derives the
+  incarnation-specific `StorageNode { node_id, incarnation }` credential only
+  after the storage-node incarnation is known. Control-plane listeners can
+  require authenticated heartbeat refresh frames for both single-authority and
+  experimental Raft-backed process modes; missing auth, wrong node,
+  wrong incarnation, and missing/overlong freshness windows fail before
+  heartbeat mutation. Frontend/admin/runtime-map auth remains out of this
+  slice.
 - 2026-07-07: Tightened item 4 response coverage for Raft peer RPCs. Unix peer
   network tests now prove an authenticated vote request receives and verifies a
   reverse-identity authenticated response, and that an unauthenticated response

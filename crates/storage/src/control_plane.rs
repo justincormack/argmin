@@ -11,7 +11,7 @@ use thiserror::Error;
 use crate::control_plane_auth::{
     ControlPlaneAuthDecision, ControlPlaneAuthEnvelope, ControlPlaneAuthOperation,
     ControlPlaneAuthPrincipal, ControlPlaneAuthTarget, ControlPlaneScopedCredential,
-    ControlPlaneScopedCredentialStore,
+    ControlPlaneScopedCredentialInput, ControlPlaneScopedCredentialStore,
 };
 use crate::control_plane_command::{
     AppliedControlPlaneCommand, ControlPlaneCommand, ControlPlaneCommandResponse,
@@ -4296,7 +4296,26 @@ pub struct AuthenticatedUnixControlPlaneClient {
 #[derive(Debug, Clone)]
 pub struct ControlPlaneUnixAuthVerifier {
     cluster_id: String,
-    verifier: ControlPlaneScopedCredentialStore,
+    storage_node_credentials: BTreeMap<NodeId, ControlPlaneStorageNodeAuthCredential>,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct ControlPlaneStorageNodeAuthCredential {
+    node_id: NodeId,
+    credential_id: String,
+    credential_version: u64,
+    secret: Vec<u8>,
+}
+
+impl std::fmt::Debug for ControlPlaneStorageNodeAuthCredential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ControlPlaneStorageNodeAuthCredential")
+            .field("node_id", &self.node_id)
+            .field("credential_id", &self.credential_id)
+            .field("credential_version", &self.credential_version)
+            .field("secret", &"<redacted>")
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -4945,10 +4964,60 @@ impl AuthenticatedUnixControlPlaneClient {
     }
 }
 
+impl ControlPlaneStorageNodeAuthCredential {
+    pub fn new(
+        node_id: NodeId,
+        credential_id: impl Into<String>,
+        credential_version: u64,
+        secret: Vec<u8>,
+    ) -> Result<Self, ControlPlaneError> {
+        let credential = Self {
+            node_id,
+            credential_id: credential_id.into(),
+            credential_version,
+            secret,
+        };
+        credential.scoped_for_cluster_and_incarnation("validation-cluster", 1)?;
+        Ok(credential)
+    }
+
+    #[must_use]
+    pub fn node_id(&self) -> NodeId {
+        self.node_id
+    }
+
+    #[must_use]
+    pub fn credential_id(&self) -> &str {
+        &self.credential_id
+    }
+
+    #[must_use]
+    pub fn credential_version(&self) -> u64 {
+        self.credential_version
+    }
+
+    pub fn scoped_for_cluster_and_incarnation(
+        &self,
+        cluster_id: &str,
+        incarnation: u64,
+    ) -> Result<ControlPlaneScopedCredential, ControlPlaneError> {
+        ControlPlaneScopedCredential::new(ControlPlaneScopedCredentialInput {
+            cluster_id: cluster_id.to_owned(),
+            credential_id: self.credential_id.clone(),
+            credential_version: self.credential_version,
+            principal: ControlPlaneAuthPrincipal::StorageNode {
+                node_id: self.node_id,
+                incarnation,
+            },
+            secret: self.secret.clone(),
+        })
+    }
+}
+
 impl ControlPlaneUnixAuthVerifier {
     pub fn new(
         cluster_id: impl Into<String>,
-        verifier: ControlPlaneScopedCredentialStore,
+        storage_node_credentials: Vec<ControlPlaneStorageNodeAuthCredential>,
     ) -> Result<Self, ControlPlaneError> {
         let cluster_id = cluster_id.into();
         if cluster_id.is_empty() {
@@ -4956,9 +5025,23 @@ impl ControlPlaneUnixAuthVerifier {
                 message: "control-plane auth cluster id must not be empty".to_owned(),
             });
         }
+        if storage_node_credentials.is_empty() {
+            return Err(ControlPlaneError::RpcProtocol {
+                message: "control-plane storage-node auth credential set is empty".to_owned(),
+            });
+        }
+        let mut by_node = BTreeMap::new();
+        for credential in storage_node_credentials {
+            if by_node.insert(credential.node_id(), credential).is_some() {
+                return Err(ControlPlaneError::RpcProtocol {
+                    message: "control-plane storage-node auth credential repeats node id"
+                        .to_owned(),
+                });
+            }
+        }
         Ok(Self {
             cluster_id,
-            verifier,
+            storage_node_credentials: by_node,
         })
     }
 
@@ -4983,7 +5066,18 @@ impl ControlPlaneUnixAuthVerifier {
         let expected_target = ControlPlaneAuthTarget::Service(
             crate::control_plane_auth::ControlPlaneAuthService::ControlPlane,
         );
-        match self.verifier.verify_envelope(
+        let credential = self
+            .storage_node_credentials
+            .get(&heartbeat.node_id)
+            .ok_or_else(|| ControlPlaneError::RpcProtocol {
+                message: format!(
+                    "control-plane storage-node heartbeat auth has no credential for node {}",
+                    heartbeat.node_id.as_u32()
+                ),
+            })?
+            .scoped_for_cluster_and_incarnation(&self.cluster_id, heartbeat.node_incarnation)?;
+        let verifier = ControlPlaneScopedCredentialStore::new(vec![credential])?;
+        match verifier.verify_envelope(
             crate::control_plane_auth::ControlPlaneAuthVerificationInput {
                 envelope: &envelope,
                 expected_cluster_id: &self.cluster_id,
@@ -9543,31 +9637,27 @@ mod tests {
         node_id: u32,
         incarnation: u64,
     ) -> ControlPlaneScopedCredential {
-        ControlPlaneScopedCredential::new(
-            crate::control_plane_auth::ControlPlaneScopedCredentialInput {
-                cluster_id: cluster_id.to_owned(),
-                credential_id: format!("storage-node-{node_id}"),
-                credential_version: 1,
-                principal: ControlPlaneAuthPrincipal::StorageNode {
-                    node_id: NodeId::new(node_id),
-                    incarnation,
-                },
-                secret: format!("storage-node-{node_id}-secret").into_bytes(),
-            },
+        storage_node_auth_node_credential(node_id)
+            .scoped_for_cluster_and_incarnation(cluster_id, incarnation)
+            .expect("test storage-node auth credential should build")
+    }
+
+    fn storage_node_auth_node_credential(node_id: u32) -> ControlPlaneStorageNodeAuthCredential {
+        ControlPlaneStorageNodeAuthCredential::new(
+            NodeId::new(node_id),
+            format!("storage-node-{node_id}"),
+            1,
+            format!("storage-node-{node_id}-secret").into_bytes(),
         )
-        .expect("test storage-node auth credential should build")
+        .expect("test storage-node node-scoped auth credential should build")
     }
 
     fn storage_node_auth_verifier(
         cluster_id: &str,
-        credentials: Vec<ControlPlaneScopedCredential>,
+        credentials: Vec<ControlPlaneStorageNodeAuthCredential>,
     ) -> ControlPlaneUnixAuthVerifier {
-        ControlPlaneUnixAuthVerifier::new(
-            cluster_id,
-            ControlPlaneScopedCredentialStore::new(credentials)
-                .expect("test storage-node auth credential store should build"),
-        )
-        .expect("test storage-node auth verifier should build")
+        ControlPlaneUnixAuthVerifier::new(cluster_id, credentials)
+            .expect("test storage-node auth verifier should build")
     }
 
     fn signed_storage_node_heartbeat_request(
@@ -11150,7 +11240,8 @@ mod tests {
             .unwrap();
         let heartbeat_epoch = authority.snapshot().cluster_epoch();
         let credential = storage_node_auth_credential("auth-cluster", 1, 42);
-        let verifier = storage_node_auth_verifier("auth-cluster", vec![credential.clone()]);
+        let verifier =
+            storage_node_auth_verifier("auth-cluster", vec![storage_node_auth_node_credential(1)]);
         let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
         let server = std::thread::spawn(move || {
             let (mut stream, _addr) = listener.accept().unwrap();
@@ -11202,10 +11293,8 @@ mod tests {
         authority
             .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
             .unwrap();
-        let verifier = storage_node_auth_verifier(
-            "auth-cluster",
-            vec![storage_node_auth_credential("auth-cluster", 1, 42)],
-        );
+        let verifier =
+            storage_node_auth_verifier("auth-cluster", vec![storage_node_auth_node_credential(1)]);
         let heartbeat = NodeHeartbeat {
             node_id: NodeId::new(1),
             node_incarnation: 42,
@@ -11251,7 +11340,8 @@ mod tests {
             .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
             .unwrap();
         let signer = storage_node_auth_credential("auth-cluster", 1, 41);
-        let verifier = storage_node_auth_verifier("auth-cluster", vec![signer.clone()]);
+        let verifier =
+            storage_node_auth_verifier("auth-cluster", vec![storage_node_auth_node_credential(1)]);
         let heartbeat = NodeHeartbeat {
             node_id: NodeId::new(1),
             node_incarnation: 42,
@@ -11295,7 +11385,8 @@ mod tests {
             .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
             .unwrap();
         let signer = storage_node_auth_credential("auth-cluster", 1, 42);
-        let verifier = storage_node_auth_verifier("auth-cluster", vec![signer.clone()]);
+        let verifier =
+            storage_node_auth_verifier("auth-cluster", vec![storage_node_auth_node_credential(1)]);
         let heartbeat = NodeHeartbeat {
             node_id: NodeId::new(1),
             node_incarnation: 42,
@@ -11338,7 +11429,8 @@ mod tests {
             .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
             .unwrap();
         let signer = storage_node_auth_credential("auth-cluster", 1, 42);
-        let verifier = storage_node_auth_verifier("auth-cluster", vec![signer.clone()]);
+        let verifier =
+            storage_node_auth_verifier("auth-cluster", vec![storage_node_auth_node_credential(1)]);
         let heartbeat = NodeHeartbeat {
             node_id: NodeId::new(1),
             node_incarnation: 42,
