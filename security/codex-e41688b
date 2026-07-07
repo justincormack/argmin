@@ -1,0 +1,242 @@
+Raft peer dispatcher trusts spoofable frame identity
+Link: https://chatgpt.com/codex/cloud/security/findings/1d34db49fba08191b8009ed6cc09c6df?sev=&repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin&sort=date_desc
+Criticality: low (attack path: low)
+Status: fixed
+
+# Metadata
+Repo: justincormack/argmin
+Commit: e41688b
+Author: justin@specialbusservice.com
+Created: 03/07/2026, 04:28:12
+Assignee: Unassigned
+Signals: Security, Validated, Attack-path
+
+# Summary
+Introduced: a reusable Raft peer dispatcher that treats non-secret frame identity plus CRC as sufficient validation before invoking privileged Raft RPC handlers. No security fix was found in this commit.
+The commit adds public server-side dispatchers that decode a peer frame and immediately call OpenRaft operations such as append_entries, vote, pre_vote, transfer_leader, and install_full_snapshot. The only peer validation performed by the frame codec is equality of the frame's cluster name, source node id, and target node id against an expected identity. Those fields are serialized inside the frame itself and are not protected by a secret, signature, MAC, mTLS identity, or other authentication mechanism; the checksum is a CRC64 and only protects against accidental corruption. If this dispatcher is wired to a peer listener reachable by an untrusted host or process, an attacker who can guess or learn the cluster/node identifiers can forge valid frames and drive consensus state changes, force votes/leadership changes, append malicious log entries if Raft consistency checks permit, or install snapshots, causing control-plane integrity loss and denial of service. The commit does not appear to add the production listener in this patch, so immediate exposure depends on how this newly public dispatcher is used, but the introduced dispatcher is unsafe as an authentication boundary.
+
+# Resolution
+Fixed by the Raft peer-auth series, closed by commit [fa8a5fa4cddbf39bdb9564dc4f2ae7d0cd4df56e](https://github.com/justincormack/argmin/commit/fa8a5fa4cddbf39bdb9564dc4f2ae7d0cd4df56e) (`Require auth for multi-node Raft peer mode`).
+
+The reachable experimental multi-node Unix-peer control-plane path no longer treats CRC-protected frame identity as an authentication boundary. Multi-node peer startup now requires `ARGMIN_CONTROL_PLANE_RAFT_AUTH_CREDENTIALS` covering the configured peer map. The peer worker decodes the auth envelope, verifies the scoped `RaftPeer` credential against cluster/source/target/operation, validates the authenticated payload matches the embedded peer frame identity and operation, and only then calls the OpenRaft append/vote/pre-vote/snapshot/transfer-leader dispatchers. Responses are also signed with reverse peer identity, and missing, malformed, wrong-cluster/source/target/role, bad-MAC, payload-bitflip, stale, and unknown-credential frames fail before OpenRaft dispatch and before checkpoint mutation.
+
+The original raw identity+CRC dispatch helpers remain lower-level internal/test helpers, not the process-level trust boundary for multi-node peer mode. Single-node local peer-socket mode and low-level tests can still run without auth, but a configured multi-node process peer map fails closed without scoped credentials.
+
+Verification for the fix:
+- `cargo fmt`
+- `cargo test -p argmin-s3 experimental_raft_control_plane -- --nocapture`
+- `cargo nextest run -p argmin-s3 --test experimental_raft_process`
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings`
+- `cargo nextest run` passed: 6413 tests run, 6413 passed
+
+# Validation
+## Rubric
+- [x] Confirm frame integrity is not cryptographic and is only CRC64 over attacker-controlled bytes.
+- [x] Confirm peer identity consists only of serialized cluster/source/target fields and equality checks, with no MAC/signature/mTLS binding.
+- [x] Confirm public dispatchers decode frames and directly invoke privileged OpenRaft RPCs/snapshot install.
+- [x] Produce a targeted dynamic PoC showing a forged identity-framed request is accepted by the real dispatcher.
+- [x] Attempt compiled-stack validation steps: direct PoC/crash check, valgrind/ASan availability, and debugger trace of the vulnerable path.
+## Report
+Validated the finding against commit e41688b789816555d357bb063635bf767c948a9f. The code confirms that peer-frame integrity is only CRC64: decode_raft_peer_rpc_frame splits off an 8-byte checksum and compares it to raft_artifact_checksum(body) at crates/storage/src/control_plane_raft.rs:3850-3858, and raft_artifact_checksum is checksum::crc64::checksum at lines 4117-4123. Peer identity is serialized as cleartext cluster_name/source/target at lines 3893-3904, then validation only compares those values for equality at lines 3909-3936. After decode, the public dispatcher handle_control_plane_raft_peer_rpc_frame calls decode_frame_with_identity and immediately dispatches to raft.append_entries, raft.vote, raft.pre_vote, or raft.handle_transfer_leader at lines 3994-4034. The snapshot dispatcher similarly decodes and invokes install_full_snapshot at lines 4044-4077. I added a targeted unit-test PoC that constructs a two-node in-memory OpenRaft cluster, forges an AppendEntries frame for cluster=autovalidator-forged-peer-frame/source=101/target=102 using only the public identity fields plus the normal CRC, and passes it to handle_control_plane_raft_peer_rpc_frame on node 102. The command `cargo test -p storage autovalidator_forged_peer_append_entries_frame_is_accepted_and_dispatched -- --nocapture` succeeded and printed `AUTOVALIDATOR forged append_entries response=Success ...`, proving the dispatcher accepted the forged frame and invoked the privileged Raft AppendEntries path. I attempted memory/crash-oriented validation as required for a compiled Rust stack, but this is an authentication/authorization logic flaw, not a memory-safety crash: the direct PoC did not crash because successful acceptance is the bug. Valgrind was unavailable (`bash: valgrind: command not found`), and ASan could not be attempted on the stable toolchain because `-Zsanitizer=address` requires nightly. I then used LLDB non-interactively. The LLDB trace shows execution from the PoC test into handle_control_plane_raft_peer_rpc_frame_with_identity at control_plane_raft.rs:4009, with backtrace frames through the public handler at line 4000 and the PoC test at line 7028; continuing hits control_plane_raft.rs:4012, the AppendEntries branch immediately before `raft.append_entries(request)` at line 4013. This validates the suspected authentication-boundary weakness.
+
+# Evidence
+crates/storage/src/control_plane_raft.rs (L3850 to 3858)
+  Note: The frame integrity check is only a CRC64 checksum over attacker-controlled bytes, not an authentication tag or MAC.
+```
+    let (body, checksum_bytes) =
+        bytes.split_at(bytes.len() - CONTROL_PLANE_RAFT_PEER_RPC_CHECKSUM_LEN);
+    let expected_checksum = u64::from_be_bytes(
+        checksum_bytes
+            .try_into()
+            .expect("checksum split length is fixed"),
+    );
+    let actual_checksum = raft_artifact_checksum(body);
+    if actual_checksum != expected_checksum {
+```
+
+crates/storage/src/control_plane_raft.rs (L3884 to 3936)
+  Note: Peer validation consists only of reading identity fields from the frame and comparing cluster/source/target values to the expected identity; there is no cryptographic proof that the sender owns that identity.
+```
+    let identity = reader.read_peer_frame_identity()?;
+    if let Some(expected_identity) = expected_identity {
+        validate_raft_peer_frame_identity(&identity, expected_identity)?;
+    }
+    let decoded = decode_body(&mut reader)?;
+    reader.finish()?;
+    Ok(decoded)
+}
+
+fn write_raft_peer_frame_identity(
+    out: &mut Vec<u8>,
+    identity: Option<&ControlPlaneRaftPeerFrameIdentity>,
+) -> Result<(), ControlPlaneError> {
+    match identity {
+        None => write_raft_u8(out, 0),
+        Some(identity) => {
+            write_raft_u8(out, 1);
+            write_raft_string(out, &identity.cluster_name)?;
+            write_raft_u64(out, identity.source);
+            write_raft_u64(out, identity.target);
+        }
+    }
+    Ok(())
+}
+
+fn validate_raft_peer_frame_identity(
+    actual: &Option<ControlPlaneRaftPeerFrameIdentity>,
+    expected: &ControlPlaneRaftPeerFrameIdentity,
+) -> Result<(), ControlPlaneError> {
+    let Some(actual) = actual else {
+        return Err(raft_artifact_protocol_error(
+            "control-plane OpenRaft peer RPC frame is missing peer identity",
+        ));
+    };
+    if actual.cluster_name != expected.cluster_name {
+        return Err(raft_artifact_protocol_error(format!(
+            "control-plane OpenRaft peer RPC frame cluster identity mismatch: expected {}, got {}",
+            expected.cluster_name, actual.cluster_name
+        )));
+    }
+    if actual.source != expected.source {
+        return Err(raft_artifact_protocol_error(format!(
+            "control-plane OpenRaft peer RPC frame source identity mismatch: expected {}, got {}",
+            expected.source, actual.source
+        )));
+    }
+    if actual.target != expected.target {
+        return Err(raft_artifact_protocol_error(format!(
+            "control-plane OpenRaft peer RPC frame target identity mismatch: expected {}, got {}",
+            expected.target, actual.target
+        )));
+    }
+    Ok(())
+```
+
+crates/storage/src/control_plane_raft.rs (L3994 to 4034)
+  Note: The newly added RPC dispatcher decodes the frame and immediately invokes privileged OpenRaft RPCs, including append_entries, vote, pre_vote, and transfer_leader.
+```
+pub async fn handle_control_plane_raft_peer_rpc_frame(
+    raft: &Raft<ControlPlaneRaftTypeConfig, ControlPlaneRaftStateMachine>,
+    frame: &[u8],
+    expected_identity: &ControlPlaneRaftPeerFrameIdentity,
+) -> Result<Vec<u8>, ControlPlaneError> {
+    handle_control_plane_raft_peer_rpc_frame_with_identity(raft, frame, Some(expected_identity))
+        .await
+}
+
+async fn handle_control_plane_raft_peer_rpc_frame_with_identity(
+    raft: &Raft<ControlPlaneRaftTypeConfig, ControlPlaneRaftStateMachine>,
+    frame: &[u8],
+    expected_identity: Option<&ControlPlaneRaftPeerFrameIdentity>,
+) -> Result<Vec<u8>, ControlPlaneError> {
+    let request =
+        ControlPlaneRaftPeerRpcRequest::decode_frame_with_identity(frame, expected_identity)?;
+    let response = match request {
+        ControlPlaneRaftPeerRpcRequest::AppendEntries(request) => {
+            ControlPlaneRaftPeerRpcResponse::AppendEntries(
+                raft.append_entries(request)
+                    .await
+                    .map_err(|error| openraft_remote_error("peer append_entries", error))?,
+            )
+        }
+        ControlPlaneRaftPeerRpcRequest::Vote(request) => ControlPlaneRaftPeerRpcResponse::Vote(
+            raft.vote(request)
+                .await
+                .map_err(|error| openraft_remote_error("peer vote", error))?,
+        ),
+        ControlPlaneRaftPeerRpcRequest::PreVote(request) => ControlPlaneRaftPeerRpcResponse::Vote(
+            raft.pre_vote(request)
+                .await
+                .map_err(|error| openraft_remote_error("peer pre_vote", error))?,
+        ),
+        ControlPlaneRaftPeerRpcRequest::TransferLeader(request) => {
+            ControlPlaneRaftPeerRpcResponse::TransferLeader(
+                raft.handle_transfer_leader(request)
+                    .await
+                    .map_err(|error| openraft_remote_error("peer transfer_leader", error))?,
+            )
+        }
+```
+
+crates/storage/src/control_plane_raft.rs (L4044 to 4077)
+  Note: The newly added snapshot dispatcher similarly accepts an identity-framed request and calls install_full_snapshot, which can replace follower state if the transport is reachable by a forger.
+```
+pub async fn handle_control_plane_raft_peer_snapshot_frame(
+    raft: &Raft<ControlPlaneRaftTypeConfig, ControlPlaneRaftStateMachine>,
+    frame: &[u8],
+    max_frame_bytes: usize,
+    max_snapshot_bytes: usize,
+    expected_identity: &ControlPlaneRaftPeerFrameIdentity,
+) -> Result<Vec<u8>, ControlPlaneError> {
+    handle_control_plane_raft_peer_snapshot_frame_with_identity(
+        raft,
+        frame,
+        max_frame_bytes,
+        max_snapshot_bytes,
+        Some(expected_identity),
+    )
+    .await
+}
+
+async fn handle_control_plane_raft_peer_snapshot_frame_with_identity(
+    raft: &Raft<ControlPlaneRaftTypeConfig, ControlPlaneRaftStateMachine>,
+    frame: &[u8],
+    max_frame_bytes: usize,
+    max_snapshot_bytes: usize,
+    expected_identity: Option<&ControlPlaneRaftPeerFrameIdentity>,
+) -> Result<Vec<u8>, ControlPlaneError> {
+    let request = ControlPlaneRaftPeerSnapshotRequest::decode_frame_with_identity(
+        frame,
+        max_frame_bytes,
+        max_snapshot_bytes,
+        expected_identity,
+    )?;
+    let response = raft
+        .install_full_snapshot(request.vote, request.snapshot)
+        .await
+        .map_err(|error| openraft_remote_error("peer full_snapshot", error))?;
+```
+
+# Attack-path analysis
+Final: low | Decider: model_decided | Matrix severity: ignore | Policy adjusted: ignore
+## Rationale
+Downgraded from high because the code-level weakness is real but not currently reachable from the argmin-s3 attack surface. Evidence shows cleartext identity plus CRC-only validation before privileged OpenRaft dispatch, and the validation PoC demonstrates direct dispatcher acceptance. However, repository wiring shows the current TCP listener is the S3 frontend, the control-plane interface is a private Unix socket, ARGMIN_CONTROL_PLANE_EXPERIMENTAL_RAFT defaults false, and even experimental Raft is single-node with remote peer RPCs returning Unreachable. Without a peer listener, there is no verified in-scope attacker path, so high severity is not justified for the current commit.
+## Likelihood
+low - Exploitation is unlikely in the current product because no production network or Unix-socket server path calls the new public dispatcher. It becomes plausible only if future or downstream code wires it to a reachable peer listener without adding authentication.
+## Impact
+high - If the dispatcher is exposed to an untrusted peer transport, impact is high because forged frames can drive consensus operations including votes, leadership transfer, log append, and snapshot install. In the current repository wiring, that impact is conditional because no reachable listener invokes the dispatcher.
+## Assumptions
+- Assessment is limited to repository artifacts in /workspace/argmin and does not call any external cloud or deployment APIs.
+- The main deployed product is the argmin-s3 binary described by the repository threat model.
+- A future or downstream peer transport could make the dispatcher reachable, but no such production listener is present in this commit.
+- A production or downstream Raft peer listener must pass untrusted frames to handle_control_plane_raft_peer_rpc_frame or handle_control_plane_raft_peer_snapshot_frame
+- The attacker must know or guess the cluster name, source node id, and target node id
+- The peer listener must be reachable by an untrusted host or process
+## Path
+untrusted sender --(conditional peer listener; not present)--> dispatcher --(CRC64 + cleartext identity)--> OpenRaft RPCs --> consensus integrity/availability impact
+## Path evidence
+- `crates/storage/src/control_plane_raft.rs:3837-3889` - Frame decode validates only length, CRC64 checksum, magic/version/kind, then reads peer identity from the frame.
+- `crates/storage/src/control_plane_raft.rs:3893-3936` - Peer identity is serialized as cluster_name/source/target and validation only compares those attacker-supplied fields for equality; no MAC, signature, shared secret, or mTLS binding is present.
+- `crates/storage/src/control_plane_raft.rs:3994-4034` - Public RPC dispatcher decodes a frame and dispatches to append_entries, vote, pre_vote, and transfer_leader.
+- `crates/storage/src/control_plane_raft.rs:4044-4077` - Public snapshot dispatcher decodes a frame and calls install_full_snapshot.
+- `crates/storage/src/control_plane_raft.rs:4117-4123` - Raft artifact checksum is CRC64, which detects accidental corruption but does not authenticate frames.
+- `crates/storage/src/control_plane_raft.rs:2058-2125` - The experimental single-node production Raft network factory has no remote peer transport and returns Unreachable for append_entries, vote, and full_snapshot.
+- `crates/argmin-s3/src/main.rs:1225-1245` - Control-plane role chooses the experimental Raft path only when enabled; otherwise it binds the normal local control-plane Unix socket.
+- `crates/argmin-s3/src/main.rs:1518-1545` - Experimental Raft control-plane startup creates a single-node durable authority, not a multi-node peer listener.
+- `crates/argmin-s3/src/main.rs:2468-2535` - The exposed TCP listener is the S3 HTTP frontend and is not wired to the Raft peer frame dispatcher.
+- `crates/argmin-s3/src/config.rs:127-140` - Default external listen address is 127.0.0.1:9000 and ARGMIN_CONTROL_PLANE_EXPERIMENTAL_RAFT defaults to false.
+## Narrative
+The core claim is valid as a code-level authentication-boundary weakness: peer frames carry cleartext cluster/source/target identity and a CRC64, and the dispatcher invokes privileged OpenRaft operations after only those checks. However, static reachability review found no current argmin-s3 production listener that passes attacker-controlled network data to these dispatchers. The current control-plane process binds a private Unix socket, experimental Raft is default-off and single-node, and the production experimental Raft network factory returns Unreachable for remote peer RPCs. Therefore the finding should not remain high for the current product; it is a serious unsafe API if later wired to a reachable peer transport, but currently has no verified in-scope attack path.
+## Controls
+- S3 HTTP path uses SigV4 authentication where required, but this does not protect the unused Raft peer dispatcher.
+- Control-plane process binds a Unix socket under a private directory and validates directory permissions.
+- Storage-node RPC uses Unix sockets rather than TCP in current wiring.
+- argmin-s3 rejects running as root.
+- Experimental Raft production mode is single-node and has no remote peer network implementation.
+- Frame size limits exist for peer transport and snapshots.
+- CRC64 is present only as accidental-corruption detection and is not an authentication control.
+## Blindspots
+- Static-only review cannot prove how external downstream users of the public storage crate might wire the dispatcher.
+- No deployment manifests or IaC were present to confirm real-world socket permissions, network bindings, or service exposure.
+- Future multihost/peer-listener work could make this high-impact issue reachable if authentication is not added.
+- The validation PoC exercises the dispatcher directly, not through a current production network entrypoint.
