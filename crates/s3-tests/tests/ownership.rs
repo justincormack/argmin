@@ -1156,7 +1156,7 @@ fn test_probe_bucket_owner_enforced_get_object_sequence_without_read_policy_for_
 }
 
 #[test]
-fn test_probe_bucket_policy_foreign_owned_object_access_matrix() {
+fn test_bucket_policy_foreign_owned_object_access_matrix_matches_aws() {
     s3_tests::run(async {
         let client = CTX.client();
         let alt_client = CTX.alt_client();
@@ -1260,13 +1260,16 @@ fn test_probe_bucket_policy_foreign_owned_object_access_matrix() {
             .send()
             .await;
 
-        eprintln!("GetObject: {get_object:?}");
-        eprintln!("HeadObject: {head_object:?}");
-        eprintln!("GetObjectAttributes: {get_object_attributes:?}");
-        eprintln!("GetObjectAcl: {get_object_acl:?}");
-        eprintln!("GetObjectTagging: {get_object_tagging:?}");
-        eprintln!("PutObjectAcl: {put_object_acl:?}");
-        eprintln!("PutObjectTagging: {put_object_tagging:?}");
+        assert_s3_err_code(&get_object, "AccessDenied");
+        assert_s3_err_code(&head_object, "AccessDenied");
+        assert_s3_err_code(&get_object_attributes, "AccessDenied");
+        assert_s3_err_code(&get_object_acl, "AccessDenied");
+        get_object_tagging
+            .expect("bucket owner policy should allow GetObjectTagging on foreign-owned object");
+        put_object_acl
+            .expect("bucket owner policy should allow PutObjectAcl on foreign-owned object");
+        put_object_tagging
+            .expect("bucket owner policy should allow PutObjectTagging on foreign-owned object");
 
         cleanup_keys(&bucket, &[key]).await;
     });
