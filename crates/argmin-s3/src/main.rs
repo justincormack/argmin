@@ -32,7 +32,8 @@ use storage::control_plane::{
     PgMetadataTransferProof, PgRouteSnapshot, SingleAuthorityControlPlane, UnixControlPlaneClient,
 };
 use storage::control_plane_auth::{
-    ControlPlaneAuthOperation, ControlPlaneAuthPrincipal, ControlPlaneScopedCredential,
+    ControlPlaneAuthEnvelope, ControlPlaneAuthOperation, ControlPlaneAuthPrincipal,
+    ControlPlaneAuthRejectionReason, ControlPlaneAuthTarget, ControlPlaneScopedCredential,
     ControlPlaneScopedCredentialInput, ControlPlaneScopedCredentialStore,
 };
 use storage::control_plane_command::{ControlPlaneCommand, ControlPlaneCommandResponse};
@@ -2153,22 +2154,33 @@ fn handle_experimental_raft_peer_rpc_before_ack(
         read_control_plane_raft_peer_transport_frame(stream, policy.limits().max_frame_bytes)
             .map_err(ExperimentalRaftPeerRpcWorkerError::PeerRpc)?;
     let request_frame = if let Some(auth_policy) = policy.auth_policy() {
-        let envelope = storage::control_plane_auth::ControlPlaneAuthEnvelope::decode_frame(
+        let envelope = match ControlPlaneAuthEnvelope::decode_frame(
             &received_frame,
             policy.limits().max_frame_bytes,
-        )
-        .map_err(ExperimentalRaftPeerRpcWorkerError::PeerRpc)?;
-        let request_frame = envelope.payload().to_vec();
-        let operation = decode_control_plane_raft_peer_request_auth_operation(&request_frame)
-            .map_err(ExperimentalRaftPeerRpcWorkerError::PeerRpc)?;
-        let identity = decode_control_plane_raft_peer_request_frame_identity(&request_frame)
-            .map_err(ExperimentalRaftPeerRpcWorkerError::PeerRpc)?;
-        policy
-            .validate_incoming_frame_identity(&identity, local_node_id)
-            .map_err(|error| ControlPlaneError::RpcProtocol {
-                message: error.to_string(),
-            })
-            .map_err(ExperimentalRaftPeerRpcWorkerError::PeerRpc)?;
+        ) {
+            Ok(envelope) => envelope,
+            Err(error) => {
+                auth_policy.record_peer_frame_rejection_without_operation(
+                    ControlPlaneAuthRejectionReason::Malformed,
+                );
+                return Err(ExperimentalRaftPeerRpcWorkerError::PeerRpc(error));
+            }
+        };
+        let operation = envelope.header().operation();
+        let identity = match experimental_raft_peer_auth_envelope_identity(
+            &envelope,
+            policy.cluster_name(),
+            local_node_id,
+        ) {
+            Ok(identity) => identity,
+            Err(error) => {
+                auth_policy.record_peer_frame_rejection(
+                    operation,
+                    ControlPlaneAuthRejectionReason::Malformed,
+                );
+                return Err(ExperimentalRaftPeerRpcWorkerError::PeerRpc(error));
+            }
+        };
         auth_policy
             .verify_peer_frame(
                 &received_frame,
@@ -2208,6 +2220,38 @@ fn handle_experimental_raft_peer_rpc_before_ack(
 
     write_control_plane_raft_peer_transport_frame(stream, &response_frame)
         .map_err(ExperimentalRaftPeerRpcWorkerError::PeerRpc)
+}
+
+fn experimental_raft_peer_auth_envelope_identity(
+    envelope: &ControlPlaneAuthEnvelope,
+    expected_cluster_name: &str,
+    local_node_id: ControlPlaneRaftNodeId,
+) -> Result<ControlPlaneRaftPeerFrameIdentity, ControlPlaneError> {
+    let source = match envelope.header().source() {
+        ControlPlaneAuthPrincipal::RaftPeer { node_id } => *node_id,
+        principal => {
+            return Err(ControlPlaneError::RpcProtocol {
+                message: format!(
+                    "control-plane OpenRaft peer auth source is not a RaftPeer principal: {principal:?}"
+                ),
+            });
+        }
+    };
+    match envelope.header().target() {
+        ControlPlaneAuthTarget::Principal(ControlPlaneAuthPrincipal::RaftPeer { .. }) => {}
+        target => {
+            return Err(ControlPlaneError::RpcProtocol {
+                message: format!(
+                    "control-plane OpenRaft peer auth target is not a RaftPeer principal: {target:?}"
+                ),
+            });
+        }
+    }
+    Ok(ControlPlaneRaftPeerFrameIdentity::new(
+        expected_cluster_name.to_string(),
+        source,
+        local_node_id,
+    ))
 }
 
 fn handle_experimental_raft_peer_rpc_validated_frame_before_ack(
@@ -3676,7 +3720,7 @@ mod tests {
     use auth::SecretKey;
     use config::SecretConfigValue;
     use openraft::impls::Vote;
-    use openraft::raft::VoteRequest;
+    use openraft::raft::{TransferLeaderRequest, VoteRequest};
     use storage::control_plane::{
         handle_control_plane_unix_stream, ControlPlaneHeartbeatSink, NodeAvailabilityState,
         NodeHeartbeat, NodeMembershipState, NodePgHeartbeatObservation, PgMetadataProof,
@@ -5047,6 +5091,40 @@ mod tests {
             ControlPlaneAuthOperation::RaftVote,
             request_frame.clone(),
         );
+        let wrong_role_frame = experimental_raft_signed_peer_frame(
+            &cluster_name,
+            valid_source_credential.clone(),
+            2,
+            ControlPlaneAuthOperation::RaftPreVote,
+            request_frame.clone(),
+        );
+        let unknown_credential = experimental_raft_peer_auth_credential(
+            &cluster_name,
+            1,
+            "unknown-raft-node-1",
+            1,
+            "node-1-test-secret",
+        );
+        let unknown_credential_frame = experimental_raft_signed_peer_frame(
+            &cluster_name,
+            unknown_credential,
+            2,
+            ControlPlaneAuthOperation::RaftVote,
+            request_frame.clone(),
+        );
+        let mut tampered_payload = valid_envelope.payload().to_vec();
+        let last_payload_byte = tampered_payload
+            .last_mut()
+            .expect("vote request payload should be non-empty");
+        *last_payload_byte ^= 0x01;
+        let payload_bitflip_frame = ControlPlaneAuthEnvelope::new(
+            valid_envelope.header().clone(),
+            tampered_payload,
+            valid_envelope.authenticator().to_vec(),
+        )
+        .expect("payload-bitflip test auth envelope should rebuild")
+        .encode_frame()
+        .expect("payload-bitflip test auth envelope should encode");
         let stale_credential = experimental_raft_peer_auth_credential(
             &cluster_name,
             1,
@@ -5067,8 +5145,11 @@ mod tests {
             ("wrong-cluster", 1, wrong_cluster_frame),
             ("wrong-source", 1, wrong_source_frame),
             ("wrong-target", 1, wrong_target_frame),
+            ("wrong-role", 1, wrong_role_frame),
             ("bad-mac", 1, bad_mac_frame),
+            ("payload-bitflip", 1, payload_bitflip_frame),
             ("stale-credential", 2, stale_credential_frame),
+            ("unknown-credential", 1, unknown_credential_frame),
         ] {
             let policy = ControlPlaneRaftPeerTransportPolicy::from_peer_endpoints(
                 cluster_name.clone(),
@@ -5133,7 +5214,138 @@ mod tests {
                 response.is_err(),
                 "{case_name}: bad auth peer RPC must not write a response"
             );
+
+            let metrics = policy
+                .auth_policy()
+                .expect("test policy should have auth policy")
+                .metrics_snapshot();
+            assert_eq!(
+                metrics.accepted_total(),
+                0,
+                "{case_name}: bad auth peer RPC must not count as accepted"
+            );
+            assert_eq!(
+                metrics.rejected_total(),
+                1,
+                "{case_name}: bad auth peer RPC must be counted as rejected"
+            );
+            assert_eq!(
+                metrics.rejected_without_operation_total(),
+                u64::from(case_name == "missing-auth"),
+                "{case_name}: only malformed envelope frames should lack operation attribution"
+            );
         }
+
+        harness.shutdown();
+    }
+
+    #[test]
+    fn experimental_raft_peer_rpc_rejects_stale_transfer_leader_auth_before_dispatch() {
+        let harness = experimental_raft_test_harness("peer-transfer-leader-auth-before-dispatch");
+        let cluster_name = format!(
+            "argmin-s3-experimental-raft-peer-transfer-leader-auth-before-dispatch-{}",
+            std::process::id()
+        );
+        let identity = ControlPlaneRaftPeerFrameIdentity::new(cluster_name.clone(), 1, 2);
+        let request_frame = ControlPlaneRaftPeerRpcRequest::TransferLeader(
+            TransferLeaderRequest::new(Vote::<ControlPlaneRaftLeaderId>::new(3, 1), 2, None),
+        )
+        .encode_frame_for_peer(&identity)
+        .expect("transfer-leader peer request should encode");
+        let stale_frame = experimental_raft_peer_auth_credential(
+            &cluster_name,
+            1,
+            "raft-node-1",
+            1,
+            "node-1-test-secret",
+        )
+        .sign_envelope(ControlPlaneAuthSignInput {
+            target: ControlPlaneAuthTarget::Principal(ControlPlaneAuthPrincipal::RaftPeer {
+                node_id: 2,
+            }),
+            operation: ControlPlaneAuthOperation::RaftTransferLeader,
+            issued_at_ms: Some(1),
+            expires_at_ms: Some(2),
+            sequence: None,
+            nonce: Vec::new(),
+            payload: request_frame,
+        })
+        .expect("stale transfer-leader auth envelope should sign")
+        .encode_frame()
+        .expect("stale transfer-leader auth envelope should encode");
+        let policy = ControlPlaneRaftPeerTransportPolicy::from_peer_endpoints(
+            cluster_name.clone(),
+            [(1, "node-1".to_string()), (2, "node-2".to_string())],
+            ControlPlaneRaftPeerTransportLimits::default(),
+        )
+        .with_auth_policy(experimental_raft_peer_auth_policy(&cluster_name, 2, 1));
+        let before_status = harness
+            .runtime
+            .block_on(harness.authority.status())
+            .expect("status should read before stale transfer-leader auth");
+        let (mut client_stream, mut server_stream) =
+            UnixStream::pair().expect("test UnixStream pair should create");
+        write_control_plane_raft_peer_transport_frame(&mut client_stream, &stale_frame)
+            .expect("client should write stale transfer-leader auth frame");
+        client_stream
+            .set_read_timeout(Some(Duration::from_millis(50)))
+            .expect("client stream read timeout should set");
+
+        let result = handle_experimental_raft_peer_rpc_before_ack(
+            harness.runtime.handle(),
+            &harness.authority,
+            &mut server_stream,
+            2,
+            &policy,
+            ExperimentalRaftPeerRpcDurability {
+                artifact_path: None,
+                checkpoint_lock: None,
+                poison_gate: None,
+                checkpoint_ordinary_rpc: false,
+            },
+        );
+        assert!(
+            matches!(result, Err(ExperimentalRaftPeerRpcWorkerError::PeerRpc(_))),
+            "stale transfer-leader auth should fail before dispatch: {result:?}"
+        );
+        let after_status = harness
+            .runtime
+            .block_on(harness.authority.status())
+            .expect("status should read after stale transfer-leader auth");
+        assert_eq!(
+            after_status.persisted_vote(),
+            before_status.persisted_vote(),
+            "stale transfer-leader auth must not mutate persisted vote"
+        );
+        assert_eq!(
+            after_status.current_term(),
+            before_status.current_term(),
+            "stale transfer-leader auth must not mutate current term"
+        );
+        drop(server_stream);
+
+        let response = read_control_plane_raft_peer_transport_frame(
+            &mut client_stream,
+            ControlPlaneRaftPeerTransportLimits::DEFAULT_MAX_FRAME_BYTES,
+        );
+        assert!(
+            response.is_err(),
+            "stale transfer-leader auth must not write a response"
+        );
+        let metrics = policy
+            .auth_policy()
+            .expect("test policy should have auth policy")
+            .metrics_snapshot();
+        assert_eq!(metrics.accepted_total(), 0);
+        assert_eq!(metrics.rejected_total(), 1);
+        assert_eq!(
+            metrics.rejected_for_operation(ControlPlaneAuthOperation::RaftTransferLeader),
+            1
+        );
+        assert_eq!(
+            metrics.rejected_for_reason(ControlPlaneAuthRejectionReason::StaleCredential),
+            1
+        );
 
         harness.shutdown();
     }

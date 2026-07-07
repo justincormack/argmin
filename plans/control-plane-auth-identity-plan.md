@@ -232,11 +232,25 @@ Status:
   credentials are configured.
 - 2026-07-07: Extended item 7 with process peer-listener negative coverage for
   authenticated Raft requests. The `argmin-s3` peer RPC worker now has tests
-  proving missing auth, wrong cluster, wrong source, wrong target, bad MAC, and
-  stale credential versions fail before OpenRaft dispatch, do not mutate the
-  local Raft vote/term, and do not write a peer response. Remaining item 7
-  coverage is wrong-role/payload-bitflip/unknown-credential process cases and
-  transfer-leader freshness/fence replay tests.
+  proving missing auth, wrong cluster, wrong source, wrong target, wrong role,
+  bad MAC, payload bitflip, stale credential, and unknown credential frames fail
+  before OpenRaft dispatch, do not mutate the local Raft vote/term, and do not
+  write a peer response.
+- 2026-07-07: Added the first item 5 replay rule for transfer-leader Raft peer
+  RPCs. Authenticated transfer-leader envelopes now carry a short issued/expires
+  freshness window; verification requires the complete window, rejects future or
+  expired envelopes, rejects overlong windows, and process-level coverage proves
+  stale transfer-leader auth fails before OpenRaft dispatch or vote/term
+  mutation. Remaining replay work is broader observability and any later
+  non-Raft transport freshness policy.
+- 2026-07-07: Started item 6 by adding compact Raft peer auth policy counters
+  for accepted/rejected verification decisions keyed by operation and rejection
+  reason, plus a no-operation bucket for malformed frames that fail before an
+  operation can be decoded. The first regressions pin transfer-leader freshness
+  failures as rejected `RaftTransferLeader` observations and prove process-level
+  pre-dispatch auth failures are counted. A later process/debug-status slice
+  should expose these counters without leaking secrets, MACs, nonces, or
+  payloads.
 
 ## Path-Specific Enforcement Order
 
@@ -308,12 +322,11 @@ Replay handling should be selected per operation class:
   payload coverage of the requested/returned snapshot metadata and bytes.
 - Raft transfer-leader is not fully protected by term/log-id idempotence alone.
   A captured valid transfer request can remain semantically meaningful within
-  a credential lifetime. The first implementation should either add a short
-  freshness bound or nonce/sequence for transfer-leader frames, or document and
-  test a stricter fence rule such as "accepted only from the current serving
-  leader for the current term and only while the requested transferee still
-  matches current membership." Until one of those is implemented, transfer-
-  leader must not be counted as replay-hardened.
+  a credential lifetime. The first Raft peer implementation uses a short
+  issued/expires freshness bound for transfer-leader frames; a stricter
+  current-leader/current-term/current-membership fence or nonce/sequence cache
+  can still be added later if operational review wants replay protection beyond
+  the bounded window.
 - Heartbeat/lease commands are time-sensitive and must include committed
   timestamp/deadline semantics. Auth replay protection must not make apply
   depend on wall clock.

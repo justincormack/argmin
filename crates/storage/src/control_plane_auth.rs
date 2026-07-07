@@ -79,7 +79,7 @@ pub enum ControlPlaneAuthService {
     Admin,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ControlPlaneAuthOperation {
     RaftAppendEntries,
     RaftVote,
@@ -93,7 +93,7 @@ pub enum ControlPlaneAuthOperation {
     RuntimeMapResponse,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ControlPlaneAuthRejectionReason {
     Missing,
     Malformed,

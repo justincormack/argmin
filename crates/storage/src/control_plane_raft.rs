@@ -48,8 +48,8 @@ use crate::control_plane::{
 };
 use crate::control_plane_auth::{
     ControlPlaneAuthDecision, ControlPlaneAuthEnvelope, ControlPlaneAuthOperation,
-    ControlPlaneAuthPrincipal, ControlPlaneAuthSignInput, ControlPlaneAuthTarget,
-    ControlPlaneAuthVerificationInput, ControlPlaneScopedCredential,
+    ControlPlaneAuthPrincipal, ControlPlaneAuthRejectionReason, ControlPlaneAuthSignInput,
+    ControlPlaneAuthTarget, ControlPlaneAuthVerificationInput, ControlPlaneScopedCredential,
     ControlPlaneScopedCredentialStore,
 };
 use crate::control_plane_command::{
@@ -445,10 +445,123 @@ impl Default for ControlPlaneRaftPeerTransportLimits {
     }
 }
 
+const CONTROL_PLANE_RAFT_TRANSFER_LEADER_AUTH_FRESHNESS_MS: u64 = 5_000;
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ControlPlaneRaftPeerAuthMetricsSnapshot {
+    accepted_total: u64,
+    rejected_total: u64,
+    rejected_without_operation_total: u64,
+    accepted_by_operation: BTreeMap<ControlPlaneAuthOperation, u64>,
+    rejected_by_operation: BTreeMap<ControlPlaneAuthOperation, u64>,
+    rejected_by_reason: BTreeMap<ControlPlaneAuthRejectionReason, u64>,
+}
+
+impl ControlPlaneRaftPeerAuthMetricsSnapshot {
+    #[must_use]
+    pub fn accepted_total(&self) -> u64 {
+        self.accepted_total
+    }
+
+    #[must_use]
+    pub fn rejected_total(&self) -> u64 {
+        self.rejected_total
+    }
+
+    #[must_use]
+    pub fn rejected_without_operation_total(&self) -> u64 {
+        self.rejected_without_operation_total
+    }
+
+    #[must_use]
+    pub fn accepted_for_operation(&self, operation: ControlPlaneAuthOperation) -> u64 {
+        self.accepted_by_operation
+            .get(&operation)
+            .copied()
+            .unwrap_or_default()
+    }
+
+    #[must_use]
+    pub fn rejected_for_operation(&self, operation: ControlPlaneAuthOperation) -> u64 {
+        self.rejected_by_operation
+            .get(&operation)
+            .copied()
+            .unwrap_or_default()
+    }
+
+    #[must_use]
+    pub fn rejected_for_reason(&self, reason: ControlPlaneAuthRejectionReason) -> u64 {
+        self.rejected_by_reason
+            .get(&reason)
+            .copied()
+            .unwrap_or_default()
+    }
+}
+
+#[derive(Debug, Default)]
+struct ControlPlaneRaftPeerAuthMetrics {
+    state: Mutex<ControlPlaneRaftPeerAuthMetricsState>,
+}
+
+#[derive(Debug, Default)]
+struct ControlPlaneRaftPeerAuthMetricsState {
+    accepted_total: u64,
+    rejected_total: u64,
+    rejected_without_operation_total: u64,
+    accepted_by_operation: BTreeMap<ControlPlaneAuthOperation, u64>,
+    rejected_by_operation: BTreeMap<ControlPlaneAuthOperation, u64>,
+    rejected_by_reason: BTreeMap<ControlPlaneAuthRejectionReason, u64>,
+}
+
+impl ControlPlaneRaftPeerAuthMetrics {
+    fn record_accepted(&self, operation: ControlPlaneAuthOperation) {
+        let mut state = self.state.lock().expect("peer auth metrics mutex poisoned");
+        state.accepted_total = state.accepted_total.saturating_add(1);
+        increment_counter(&mut state.accepted_by_operation, operation);
+    }
+
+    fn record_rejected(
+        &self,
+        operation: ControlPlaneAuthOperation,
+        reason: ControlPlaneAuthRejectionReason,
+    ) {
+        let mut state = self.state.lock().expect("peer auth metrics mutex poisoned");
+        state.rejected_total = state.rejected_total.saturating_add(1);
+        increment_counter(&mut state.rejected_by_operation, operation);
+        increment_counter(&mut state.rejected_by_reason, reason);
+    }
+
+    fn record_rejected_without_operation(&self, reason: ControlPlaneAuthRejectionReason) {
+        let mut state = self.state.lock().expect("peer auth metrics mutex poisoned");
+        state.rejected_total = state.rejected_total.saturating_add(1);
+        state.rejected_without_operation_total =
+            state.rejected_without_operation_total.saturating_add(1);
+        increment_counter(&mut state.rejected_by_reason, reason);
+    }
+
+    fn snapshot(&self) -> ControlPlaneRaftPeerAuthMetricsSnapshot {
+        let state = self.state.lock().expect("peer auth metrics mutex poisoned");
+        ControlPlaneRaftPeerAuthMetricsSnapshot {
+            accepted_total: state.accepted_total,
+            rejected_total: state.rejected_total,
+            rejected_without_operation_total: state.rejected_without_operation_total,
+            accepted_by_operation: state.accepted_by_operation.clone(),
+            rejected_by_operation: state.rejected_by_operation.clone(),
+            rejected_by_reason: state.rejected_by_reason.clone(),
+        }
+    }
+}
+
+fn increment_counter<K: Ord>(counters: &mut BTreeMap<K, u64>, key: K) {
+    let count = counters.entry(key).or_insert(0);
+    *count = count.saturating_add(1);
+}
+
 #[derive(Debug, Clone)]
 pub struct ControlPlaneRaftPeerAuthPolicy {
     local_credential: ControlPlaneScopedCredential,
     verifier: ControlPlaneScopedCredentialStore,
+    metrics: Arc<ControlPlaneRaftPeerAuthMetrics>,
 }
 
 impl ControlPlaneRaftPeerAuthPolicy {
@@ -459,9 +572,30 @@ impl ControlPlaneRaftPeerAuthPolicy {
         let policy = Self {
             local_credential,
             verifier,
+            metrics: Arc::new(ControlPlaneRaftPeerAuthMetrics::default()),
         };
         policy.validate()?;
         Ok(policy)
+    }
+
+    #[must_use]
+    pub fn metrics_snapshot(&self) -> ControlPlaneRaftPeerAuthMetricsSnapshot {
+        self.metrics.snapshot()
+    }
+
+    pub fn record_peer_frame_rejection_without_operation(
+        &self,
+        reason: ControlPlaneAuthRejectionReason,
+    ) {
+        self.metrics.record_rejected_without_operation(reason);
+    }
+
+    pub fn record_peer_frame_rejection(
+        &self,
+        operation: ControlPlaneAuthOperation,
+        reason: ControlPlaneAuthRejectionReason,
+    ) {
+        self.metrics.record_rejected(operation, reason);
     }
 
     pub fn sign_peer_frame(
@@ -472,6 +606,7 @@ impl ControlPlaneRaftPeerAuthPolicy {
     ) -> Result<Vec<u8>, ControlPlaneError> {
         self.validate_source(identity)?;
         validate_control_plane_raft_peer_auth_payload_binding(&payload, identity, operation)?;
+        let (issued_at_ms, expires_at_ms) = peer_auth_replay_window_for_sign(operation)?;
         let envelope = self
             .local_credential
             .sign_envelope(ControlPlaneAuthSignInput {
@@ -479,8 +614,8 @@ impl ControlPlaneRaftPeerAuthPolicy {
                     node_id: identity.target,
                 }),
                 operation,
-                issued_at_ms: None,
-                expires_at_ms: None,
+                issued_at_ms,
+                expires_at_ms,
                 sequence: None,
                 nonce: Vec::new(),
                 payload,
@@ -495,7 +630,27 @@ impl ControlPlaneRaftPeerAuthPolicy {
         expected_operation: ControlPlaneAuthOperation,
         max_payload_bytes: usize,
     ) -> Result<Vec<u8>, ControlPlaneError> {
-        let envelope = ControlPlaneAuthEnvelope::decode_frame(envelope_bytes, max_payload_bytes)?;
+        let envelope =
+            match ControlPlaneAuthEnvelope::decode_frame(envelope_bytes, max_payload_bytes) {
+                Ok(envelope) => envelope,
+                Err(error) => {
+                    self.metrics.record_rejected(
+                        expected_operation,
+                        ControlPlaneAuthRejectionReason::Malformed,
+                    );
+                    return Err(error);
+                }
+            };
+        let now_ms = match validate_peer_auth_replay_window(&envelope, expected_operation) {
+            Ok(now_ms) => now_ms,
+            Err(error) => {
+                self.metrics.record_rejected(
+                    expected_operation,
+                    ControlPlaneAuthRejectionReason::ReplayFreshnessFailure,
+                );
+                return Err(error);
+            }
+        };
         let decision = self
             .verifier
             .verify_envelope(ControlPlaneAuthVerificationInput {
@@ -510,20 +665,30 @@ impl ControlPlaneRaftPeerAuthPolicy {
                     },
                 ),
                 expected_operation,
-                now_ms: None,
+                now_ms,
             });
         match decision {
             ControlPlaneAuthDecision::Accepted { .. } => {
-                validate_control_plane_raft_peer_auth_payload_binding(
+                if let Err(error) = validate_control_plane_raft_peer_auth_payload_binding(
                     envelope.payload(),
                     expected_identity,
                     expected_operation,
-                )?;
+                ) {
+                    self.metrics.record_rejected(
+                        expected_operation,
+                        ControlPlaneAuthRejectionReason::Malformed,
+                    );
+                    return Err(error);
+                }
+                self.metrics.record_accepted(expected_operation);
                 Ok(envelope.payload().to_vec())
             }
-            ControlPlaneAuthDecision::Rejected { reason } => Err(ControlPlaneError::RpcProtocol {
-                message: format!("control-plane OpenRaft peer auth rejected: {reason:?}"),
-            }),
+            ControlPlaneAuthDecision::Rejected { reason } => {
+                self.metrics.record_rejected(expected_operation, reason);
+                Err(ControlPlaneError::RpcProtocol {
+                    message: format!("control-plane OpenRaft peer auth rejected: {reason:?}"),
+                })
+            }
         }
     }
 
@@ -554,6 +719,57 @@ impl ControlPlaneRaftPeerAuthPolicy {
             ),
         })
     }
+}
+
+fn peer_auth_replay_window_for_sign(
+    operation: ControlPlaneAuthOperation,
+) -> Result<(Option<u64>, Option<u64>), ControlPlaneError> {
+    if operation != ControlPlaneAuthOperation::RaftTransferLeader {
+        return Ok((None, None));
+    }
+    let issued_at_ms = crate::clock::current_time_millis();
+    let expires_at_ms = issued_at_ms
+        .checked_add(CONTROL_PLANE_RAFT_TRANSFER_LEADER_AUTH_FRESHNESS_MS)
+        .ok_or_else(|| ControlPlaneError::RpcProtocol {
+            message: "control-plane OpenRaft transfer-leader auth freshness overflow".to_string(),
+        })?;
+    Ok((Some(issued_at_ms), Some(expires_at_ms)))
+}
+
+fn validate_peer_auth_replay_window(
+    envelope: &ControlPlaneAuthEnvelope,
+    expected_operation: ControlPlaneAuthOperation,
+) -> Result<Option<u64>, ControlPlaneError> {
+    if expected_operation != ControlPlaneAuthOperation::RaftTransferLeader {
+        return Ok(None);
+    }
+    let issued_at_ms =
+        envelope
+            .header()
+            .issued_at_ms()
+            .ok_or_else(|| ControlPlaneError::RpcProtocol {
+                message: "control-plane OpenRaft transfer-leader auth is missing issue time"
+                    .to_string(),
+            })?;
+    let expires_at_ms =
+        envelope
+            .header()
+            .expires_at_ms()
+            .ok_or_else(|| ControlPlaneError::RpcProtocol {
+                message: "control-plane OpenRaft transfer-leader auth is missing expiry time"
+                    .to_string(),
+            })?;
+    if expires_at_ms.saturating_sub(issued_at_ms)
+        > CONTROL_PLANE_RAFT_TRANSFER_LEADER_AUTH_FRESHNESS_MS
+    {
+        return Err(ControlPlaneError::RpcProtocol {
+            message: format!(
+                "control-plane OpenRaft transfer-leader auth freshness window exceeds {} ms",
+                CONTROL_PLANE_RAFT_TRANSFER_LEADER_AUTH_FRESHNESS_MS
+            ),
+        });
+    }
+    Ok(Some(crate::clock::current_time_millis()))
 }
 
 #[derive(Debug, Clone)]
@@ -9961,6 +10177,149 @@ mod tests {
                 4096,
             )
             .is_err());
+    }
+
+    #[test]
+    fn control_plane_raft_peer_auth_policy_bounds_transfer_leader_freshness() {
+        let clock = crate::clock::test_time_override_guard(10_000);
+        let identity =
+            ControlPlaneRaftPeerFrameIdentity::new("control-plane-raft-peer-transport-test", 1, 2);
+        let raw_frame = ControlPlaneRaftPeerRpcRequest::TransferLeader(TransferLeaderRequest::new(
+            Vote::<ControlPlaneRaftLeaderId>::new(4, 1),
+            2,
+            Some(raft_log_id(4, 1, 8)),
+        ))
+        .encode_frame_for_peer(&identity)
+        .unwrap();
+        let signed = test_peer_auth_policy(1)
+            .sign_peer_frame(
+                &identity,
+                ControlPlaneAuthOperation::RaftTransferLeader,
+                raw_frame.clone(),
+            )
+            .unwrap();
+        let envelope = ControlPlaneAuthEnvelope::decode_frame(&signed, 4096).unwrap();
+        assert_eq!(envelope.header().issued_at_ms(), Some(10_000));
+        assert_eq!(
+            envelope.header().expires_at_ms(),
+            Some(10_000 + CONTROL_PLANE_RAFT_TRANSFER_LEADER_AUTH_FRESHNESS_MS)
+        );
+
+        let verifier = test_peer_auth_policy(2);
+        assert_eq!(
+            verifier
+                .verify_peer_frame(
+                    &signed,
+                    &identity,
+                    ControlPlaneAuthOperation::RaftTransferLeader,
+                    4096,
+                )
+                .unwrap(),
+            raw_frame
+        );
+
+        clock.set(9_999);
+        assert!(
+            verifier
+                .verify_peer_frame(
+                    &signed,
+                    &identity,
+                    ControlPlaneAuthOperation::RaftTransferLeader,
+                    4096,
+                )
+                .is_err(),
+            "future-issued transfer-leader auth must fail"
+        );
+
+        clock.set(10_000 + CONTROL_PLANE_RAFT_TRANSFER_LEADER_AUTH_FRESHNESS_MS);
+        assert!(
+            verifier
+                .verify_peer_frame(
+                    &signed,
+                    &identity,
+                    ControlPlaneAuthOperation::RaftTransferLeader,
+                    4096,
+                )
+                .is_err(),
+            "expired transfer-leader auth must fail"
+        );
+
+        clock.set(10_000);
+        let missing_window = test_peer_scoped_credential(1)
+            .sign_envelope(ControlPlaneAuthSignInput {
+                target: ControlPlaneAuthTarget::Principal(ControlPlaneAuthPrincipal::RaftPeer {
+                    node_id: 2,
+                }),
+                operation: ControlPlaneAuthOperation::RaftTransferLeader,
+                issued_at_ms: Some(10_000),
+                expires_at_ms: None,
+                sequence: None,
+                nonce: Vec::new(),
+                payload: raw_frame.clone(),
+            })
+            .unwrap()
+            .encode_frame()
+            .unwrap();
+        assert!(
+            verifier
+                .verify_peer_frame(
+                    &missing_window,
+                    &identity,
+                    ControlPlaneAuthOperation::RaftTransferLeader,
+                    4096,
+                )
+                .is_err(),
+            "transfer-leader auth must include a complete freshness window"
+        );
+
+        let overlong_window = test_peer_scoped_credential(1)
+            .sign_envelope(ControlPlaneAuthSignInput {
+                target: ControlPlaneAuthTarget::Principal(ControlPlaneAuthPrincipal::RaftPeer {
+                    node_id: 2,
+                }),
+                operation: ControlPlaneAuthOperation::RaftTransferLeader,
+                issued_at_ms: Some(10_000),
+                expires_at_ms: Some(
+                    10_000 + CONTROL_PLANE_RAFT_TRANSFER_LEADER_AUTH_FRESHNESS_MS + 1,
+                ),
+                sequence: None,
+                nonce: Vec::new(),
+                payload: raw_frame,
+            })
+            .unwrap()
+            .encode_frame()
+            .unwrap();
+        assert!(
+            verifier
+                .verify_peer_frame(
+                    &overlong_window,
+                    &identity,
+                    ControlPlaneAuthOperation::RaftTransferLeader,
+                    4096,
+                )
+                .is_err(),
+            "transfer-leader auth freshness window must be bounded"
+        );
+
+        let metrics = verifier.metrics_snapshot();
+        assert_eq!(metrics.accepted_total(), 1);
+        assert_eq!(metrics.rejected_total(), 4);
+        assert_eq!(
+            metrics.accepted_for_operation(ControlPlaneAuthOperation::RaftTransferLeader),
+            1
+        );
+        assert_eq!(
+            metrics.rejected_for_operation(ControlPlaneAuthOperation::RaftTransferLeader),
+            4
+        );
+        assert_eq!(
+            metrics.rejected_for_reason(ControlPlaneAuthRejectionReason::ReplayFreshnessFailure),
+            3
+        );
+        assert_eq!(
+            metrics.rejected_for_reason(ControlPlaneAuthRejectionReason::StaleCredential),
+            1
+        );
     }
 
     #[test]
