@@ -423,13 +423,38 @@ diff-test coverage either, so their shapes have never been AWS-pinned):
 1. **ListBuckets (`GET /`)** — no shape test at all; clients parse the
    Owner/DisplayName/Buckets body, and it is the one listing the batch-6
    work did not cover.
+   **DONE (slice 1, 2026-07-07)** — AWS probing found four divergences,
+   all fixed server-side: Owner carries no `DisplayName`; each Bucket
+   gains `BucketRegion` + `BucketArn`; a `prefix` query param filters
+   and is echoed as `<Prefix>` after `</Buckets>` (omitted entirely when
+   the param is absent — probed both ways); body is chunked, not
+   content-length. `test_list_buckets_response_shape` (bucket_crud.rs)
+   pins the prefix-filtered shape; AWS-validated. Not covered:
+   `max-buckets`/`continuation-token` pagination is still ignored
+   locally (needs a many-bucket AWS probe to pin the truncation shape).
 2. **Conditional request shapes** — `conditional.rs` asserts 304/412 only
    via SDK `is_err`; 304 has a distinctive no-body/no-content-type shape
    and 412 `PreconditionFailed` bodies are pinned only for the
    upload-part-copy variant.
+   **DONE (slice 1, 2026-07-07)** — plain-object 412 on AWS carries the
+   canonical message plus a `<Condition>` element naming the failing
+   header and a `HostId` (local had lowercase "precondition failed",
+   empty `<Resource>`, no HostId). `ServerError::PreconditionFailed` now
+   carries the condition name from every construction site (read, write,
+   delete, copy-source); the POST-Object wrong-content-type 412 was
+   probed separately (Condition is the sentence "Bucket POST must be of
+   the enclosure-type multipart/form-data") and its existing test
+   upgraded to a full golden. `test_conditional_response_shapes` pins
+   304 / GET-412 / PUT-If-None-Match-star-412; AWS-validated. The
+   UploadPartCopy 412 keeps its own builder: AWS omits the XML
+   declaration there but includes it on plain-object 412s.
 3. **Plain GET `416 InvalidRange`** — `range.rs` has no 416 coverage at
    all despite the builder (`invalid_range_error_xml`) and its
    `expected_error` wrapper already existing.
+   **DONE (slice 1, 2026-07-07)** — AWS adds `<RangeRequested>` between
+   Message and ActualObjectSize; builder and
+   `ServerError::InvalidRange` extended to carry the requested range.
+   `test_get_object_invalid_range_error_shape` pins it; AWS-validated.
 4. **Bucket policy CRUD** — `bucket_policy.rs` has ~187 weak assert
    sites; GetBucketPolicy's JSON echo body and the MalformedPolicy /
    policy-validation error family are unpinned.

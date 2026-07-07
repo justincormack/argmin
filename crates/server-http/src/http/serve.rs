@@ -2703,7 +2703,12 @@ async fn handle_streaming_post_object(
         Some(v) => v,
         None => {
             // AWS returns 412 for missing/wrong Content-Type on POST Object.
-            return error_response(&ServerError::PreconditionFailed, &wire_ids);
+            return error_response(
+                &ServerError::PreconditionFailed {
+                    condition: "Bucket POST must be of the enclosure-type multipart/form-data",
+                },
+                &wire_ids,
+            );
         }
     };
     // Check if this is actually multipart/form-data before looking for boundary.
@@ -2713,7 +2718,12 @@ async fn handle_streaming_post_object(
         .next()
         .is_some_and(|t| t.trim().eq_ignore_ascii_case("multipart/form-data"));
     if !is_multipart {
-        return error_response(&ServerError::PreconditionFailed, &wire_ids);
+        return error_response(
+            &ServerError::PreconditionFailed {
+                condition: "Bucket POST must be of the enclosure-type multipart/form-data",
+            },
+            &wire_ids,
+        );
     }
     let boundary = match super::multipart::extract_boundary(content_type) {
         Some(b) => b,

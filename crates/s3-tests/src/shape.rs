@@ -819,8 +819,13 @@ pub mod expected_error {
         xml::no_such_upload_error_xml(upload_id, REQUEST_ID, HOST_ID)
     }
 
-    pub fn invalid_range(total_size: u64) -> String {
-        xml::invalid_range_error_xml(total_size, REQUEST_ID, HOST_ID)
+    pub fn invalid_range(range_requested: &str, total_size: u64) -> String {
+        xml::invalid_range_error_xml(range_requested, total_size, REQUEST_ID, HOST_ID)
+    }
+
+    /// `PreconditionFailed` naming the failing conditional header.
+    pub fn precondition_failed(condition: &str) -> String {
+        xml::precondition_failed_error_xml(condition, REQUEST_ID, HOST_ID)
     }
 
     pub fn metadata_too_large(size: usize, max_size_allowed: usize) -> String {
@@ -1295,11 +1300,20 @@ mod tests {
              <HostId>{host_id}</HostId></Error>"
         );
         assert_eq!(
-            expected_error::invalid_range(1024),
+            expected_error::invalid_range("bytes=2000-3000", 1024),
             "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>InvalidRange</Code>\
              <Message>The requested range is not satisfiable</Message>\
+             <RangeRequested>bytes=2000-3000</RangeRequested>\
              <ActualObjectSize>1024</ActualObjectSize><RequestId>{request_id}</RequestId>\
              <HostId>{host_id}</HostId></Error>"
+        );
+        assert_eq!(
+            expected_error::precondition_failed("If-Match"),
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+             <Error><Code>PreconditionFailed</Code><Message>At least one of the pre-conditions \
+             you specified did not hold</Message>\
+             <Condition>If-Match</Condition>\
+             <RequestId>{request_id}</RequestId><HostId>{host_id}</HostId></Error>"
         );
         assert_eq!(
             expected_error::request_header_section_too_large(8192),

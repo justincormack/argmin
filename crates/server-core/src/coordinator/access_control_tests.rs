@@ -8268,7 +8268,7 @@ fn get_if_match_wrong_etag_returns_412() {
             cond: &cond,
         })
         .unwrap_err();
-    assert!(matches!(err, ServerError::PreconditionFailed));
+    assert!(matches!(err, ServerError::PreconditionFailed { .. }));
 }
 
 #[test]
@@ -8454,7 +8454,7 @@ fn delete_if_match_wrong_etag_returns_412() {
             cond: &cond,
         })
         .unwrap_err();
-    assert!(matches!(err, ServerError::PreconditionFailed));
+    assert!(matches!(err, ServerError::PreconditionFailed { .. }));
 }
 
 #[test]

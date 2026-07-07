@@ -204,7 +204,9 @@ pub fn check_read_conditions(
     // Step 1: If-Match — `*` always passes, otherwise 412 if no etag in list matches
     if let Some(ref required) = cond.if_match {
         if !required.matches(etag) {
-            return Err(ServerError::PreconditionFailed);
+            return Err(ServerError::PreconditionFailed {
+                condition: "If-Match",
+            });
         }
     }
 
@@ -213,7 +215,9 @@ pub fn check_read_conditions(
     if cond.if_match.is_none() {
         if let Some(since) = cond.if_unmodified_since {
             if last_modified / 1000 > since / 1000 {
-                return Err(ServerError::PreconditionFailed);
+                return Err(ServerError::PreconditionFailed {
+                    condition: "If-Unmodified-Since",
+                });
             }
         }
     }
@@ -263,18 +267,24 @@ pub fn check_write_conditions(
         WriteCondition::None => Ok(()),
         WriteCondition::IfNoneMatchStar => {
             if existing_etag.is_some() {
-                Err(ServerError::PreconditionFailed)
+                Err(ServerError::PreconditionFailed {
+                    condition: "If-None-Match",
+                })
             } else {
                 Ok(())
             }
         }
         WriteCondition::IfMatch(required_etag) => match existing_etag {
-            None => Err(ServerError::PreconditionFailed),
+            None => Err(ServerError::PreconditionFailed {
+                condition: "If-Match",
+            }),
             Some(obj_etag) => {
                 if etag_matches_one(required_etag.as_str(), obj_etag) {
                     Ok(())
                 } else {
-                    Err(ServerError::PreconditionFailed)
+                    Err(ServerError::PreconditionFailed {
+                        condition: "If-Match",
+                    })
                 }
             }
         },
@@ -297,14 +307,18 @@ pub fn check_delete_conditions(cond: &DeleteCondition, etag: &str) -> Result<(),
                 // Wildcard matches any existing object
                 Ok(())
             } else {
-                Err(ServerError::PreconditionFailed)
+                Err(ServerError::PreconditionFailed {
+                    condition: "If-Match",
+                })
             }
         }
         DeleteCondition::IfMatchObjectEtag(required_etag) => {
             if etag_matches_one(required_etag, etag) {
                 Ok(())
             } else {
-                Err(ServerError::PreconditionFailed)
+                Err(ServerError::PreconditionFailed {
+                    condition: "If-Match",
+                })
             }
         }
     }
@@ -322,7 +336,9 @@ pub fn check_copy_source_conditions(
     // Step 1: If-Match
     if let Some(ref required) = cond.if_match {
         if !required.matches(etag) {
-            return Err(ServerError::PreconditionFailed);
+            return Err(ServerError::PreconditionFailed {
+                condition: "x-amz-copy-source-If-Match",
+            });
         }
     }
 
@@ -331,7 +347,9 @@ pub fn check_copy_source_conditions(
     if cond.if_match.is_none() {
         if let Some(since) = cond.if_unmodified_since {
             if last_modified / 1000 > since / 1000 {
-                return Err(ServerError::PreconditionFailed);
+                return Err(ServerError::PreconditionFailed {
+                    condition: "x-amz-copy-source-If-Unmodified-Since",
+                });
             }
         }
     }
@@ -339,7 +357,9 @@ pub fn check_copy_source_conditions(
     // Step 3: If-None-Match — returns 412 (not 304)
     if let Some(ref unwanted) = cond.if_none_match {
         if unwanted.matches(etag) {
-            return Err(ServerError::PreconditionFailed);
+            return Err(ServerError::PreconditionFailed {
+                condition: "x-amz-copy-source-If-None-Match",
+            });
         }
     }
 
@@ -351,7 +371,9 @@ pub fn check_copy_source_conditions(
             if since <= storage::clock::current_time_millis()
                 && last_modified / 1000 <= since / 1000
             {
-                return Err(ServerError::PreconditionFailed);
+                return Err(ServerError::PreconditionFailed {
+                    condition: "x-amz-copy-source-If-Modified-Since",
+                });
             }
         }
     }
@@ -428,7 +450,7 @@ mod tests {
             ..Default::default()
         };
         let err = check_read_conditions(&cond, &test_etag(), 1000).unwrap_err();
-        assert!(matches!(err, ServerError::PreconditionFailed));
+        assert!(matches!(err, ServerError::PreconditionFailed { .. }));
     }
 
     #[test]
@@ -511,7 +533,7 @@ mod tests {
         };
         // Object last_modified (1000) > since (500) → PreconditionFailed
         let err = check_read_conditions(&cond, &test_etag(), 1000).unwrap_err();
-        assert!(matches!(err, ServerError::PreconditionFailed));
+        assert!(matches!(err, ServerError::PreconditionFailed { .. }));
     }
 
     #[test]
@@ -523,7 +545,7 @@ mod tests {
             ..Default::default()
         };
         let err = check_read_conditions(&cond, &test_etag(), 1000).unwrap_err();
-        assert!(matches!(err, ServerError::PreconditionFailed));
+        assert!(matches!(err, ServerError::PreconditionFailed { .. }));
     }
 
     // ── Write conditions ──────────────────────────────────────────────
@@ -532,7 +554,7 @@ mod tests {
     fn write_if_none_match_star_prevents_overwrite() {
         let cond = WriteCondition::IfNoneMatchStar;
         let err = check_write_conditions(&cond, Some(&test_etag())).unwrap_err();
-        assert!(matches!(err, ServerError::PreconditionFailed));
+        assert!(matches!(err, ServerError::PreconditionFailed { .. }));
     }
 
     #[test]
@@ -570,14 +592,14 @@ mod tests {
     fn write_if_match_prevents_stale_overwrite() {
         let cond = WriteCondition::IfMatch(SpecificEtag::new(other_etag()).unwrap());
         let err = check_write_conditions(&cond, Some(&test_etag())).unwrap_err();
-        assert!(matches!(err, ServerError::PreconditionFailed));
+        assert!(matches!(err, ServerError::PreconditionFailed { .. }));
     }
 
     #[test]
     fn write_if_match_nonexistent_returns_412() {
         let cond = WriteCondition::IfMatch(SpecificEtag::new(test_etag()).unwrap());
         let err = check_write_conditions(&cond, None).unwrap_err();
-        assert!(matches!(err, ServerError::PreconditionFailed));
+        assert!(matches!(err, ServerError::PreconditionFailed { .. }));
     }
 
     // ── Delete conditions ──────────────────────────────────────────────
@@ -592,7 +614,7 @@ mod tests {
     fn delete_if_match_fails() {
         let cond = DeleteCondition::IfMatch(other_etag().into());
         let err = check_delete_conditions(&cond, &test_etag()).unwrap_err();
-        assert!(matches!(err, ServerError::PreconditionFailed));
+        assert!(matches!(err, ServerError::PreconditionFailed { .. }));
     }
 
     #[test]
@@ -614,7 +636,7 @@ mod tests {
             test_etag()
         ));
         let err = check_delete_conditions(&cond, &test_etag()).unwrap_err();
-        assert!(matches!(err, ServerError::PreconditionFailed));
+        assert!(matches!(err, ServerError::PreconditionFailed { .. }));
     }
 
     #[test]
@@ -729,7 +751,7 @@ mod tests {
             ..Default::default()
         };
         let err = check_read_conditions(&cond, &test_etag(), 1000).unwrap_err();
-        assert!(matches!(err, ServerError::PreconditionFailed));
+        assert!(matches!(err, ServerError::PreconditionFailed { .. }));
     }
 
     #[test]
@@ -761,7 +783,7 @@ mod tests {
             ..Default::default()
         };
         let err = check_copy_source_conditions(&cond, &test_etag(), 1000).unwrap_err();
-        assert!(matches!(err, ServerError::PreconditionFailed));
+        assert!(matches!(err, ServerError::PreconditionFailed { .. }));
     }
 
     #[test]
@@ -772,7 +794,7 @@ mod tests {
             ..Default::default()
         };
         let err = check_copy_source_conditions(&cond, &test_etag(), 1000).unwrap_err();
-        assert!(matches!(err, ServerError::PreconditionFailed));
+        assert!(matches!(err, ServerError::PreconditionFailed { .. }));
     }
 
     #[test]
@@ -792,7 +814,7 @@ mod tests {
         };
         // Object last_modified (1000) <= since (2000) → 412 (not 304)
         let err = check_copy_source_conditions(&cond, &test_etag(), 1000).unwrap_err();
-        assert!(matches!(err, ServerError::PreconditionFailed));
+        assert!(matches!(err, ServerError::PreconditionFailed { .. }));
     }
 
     #[test]
@@ -815,6 +837,6 @@ mod tests {
         };
         // Object last_modified (1000) > since (500) → 412
         let err = check_copy_source_conditions(&cond, &test_etag(), 1000).unwrap_err();
-        assert!(matches!(err, ServerError::PreconditionFailed));
+        assert!(matches!(err, ServerError::PreconditionFailed { .. }));
     }
 }

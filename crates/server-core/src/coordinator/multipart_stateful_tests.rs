@@ -1466,7 +1466,7 @@ fn complete_multipart_if_match_uses_identity_validated_snapshot_etag() {
 
     let err = t_complete.join().unwrap().unwrap_err();
     assert!(
-        matches!(err, ServerError::PreconditionFailed),
+        matches!(err, ServerError::PreconditionFailed { .. }),
         "{invariant}: completion should fail its If-Match against the updated snapshot, got {err:?}"
     );
 

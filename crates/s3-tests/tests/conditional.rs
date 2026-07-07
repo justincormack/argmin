@@ -4,8 +4,9 @@ use aws_sdk_s3::types::{
     BucketVersioningStatus, CompletedMultipartUpload, CompletedPart, VersioningConfiguration,
 };
 use s3_tests::{
-    assert_s3_err_code, cleanup_versioned_bucket, err_status, unique_bucket,
-    SendRetryingOperationAborted, CTX,
+    assert_s3_err_code, cleanup_versioned_bucket, err_status, raw_object_with,
+    shape::{assert_shape, error_response_headers, expected_error, shape},
+    unique_bucket, SendRetryingOperationAborted, CTX,
 };
 use serde_json::json;
 use std::time::{Duration, Instant};
@@ -2168,5 +2169,74 @@ fn test_delete_object_version_if_match_not_implemented() {
         assert_eq!(&data[..], b"hello");
 
         cleanup_versioned_bucket(client, &bucket).await;
+    });
+}
+
+// ── Response shapes ─────────────────────────────────────────────────
+
+/// Full response shapes for plain-object conditional requests: 304 from a
+/// matching `If-None-Match` GET, 412 from a mismatching `If-Match` GET, and
+/// 412 from `If-None-Match: *` PUT over an existing object. AWS names the
+/// failing header in a `<Condition>` element.
+#[test]
+fn test_conditional_response_shapes() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+        let key = "cond-shape.txt";
+        let etag = put_object(&bucket, key, b"conditional-body").await;
+
+        let not_modified = raw_object_with(
+            "GET",
+            &bucket,
+            key,
+            b"",
+            &[("If-None-Match", etag.as_str())],
+        );
+        assert_shape(
+            "GetObject If-None-Match 304",
+            &not_modified,
+            &shape()
+                .status(304)
+                .headers([
+                    ("etag", etag.as_str()),
+                    ("last-modified", "{http_date}"),
+                    ("x-amz-request-id", "{request_id}"),
+                    ("x-amz-id-2", "{host_id}"),
+                ])
+                .body_empty(),
+        );
+
+        let get_mismatch = raw_object_with(
+            "GET",
+            &bucket,
+            key,
+            b"",
+            &[("If-Match", "\"00000000000000000000000000000000\"")],
+        );
+        assert_shape(
+            "GetObject If-Match 412",
+            &get_mismatch,
+            &shape()
+                .status(412)
+                .headers(error_response_headers())
+                .body(expected_error::precondition_failed("If-Match")),
+        );
+
+        let put_existing =
+            raw_object_with("PUT", &bucket, key, b"overwrite", &[("If-None-Match", "*")]);
+        assert_shape(
+            "PutObject If-None-Match star 412",
+            &put_existing,
+            &shape()
+                .status(412)
+                .headers(error_response_headers())
+                .body(expected_error::precondition_failed("If-None-Match")),
+        );
+
+        s3_tests::delete_object_retrying_operation_aborted(client, &bucket, key)
+            .await
+            .expect("delete conditional shape fixture");
+        s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
     });
 }

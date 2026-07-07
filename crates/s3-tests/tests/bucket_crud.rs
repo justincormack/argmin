@@ -777,3 +777,45 @@ fn test_head_bucket_response_shape() {
         s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
     });
 }
+
+/// Full response shape for `ListBuckets` filtered by a prefix that matches
+/// only the fixture bucket. AWS emits the owner ID with no `DisplayName`,
+/// per-bucket `BucketRegion` and `BucketArn`, echoes the `Prefix`, and
+/// streams the body chunked. Without a prefix parameter no `<Prefix>`
+/// element is emitted (AWS probed).
+#[test]
+fn test_list_buckets_response_shape() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
+
+        let response = send_signed_request(
+            "GET",
+            &format!("{}/?prefix={}", CTX.endpoint(), bucket),
+            b"",
+            std::iter::empty::<(&str, &str)>(),
+        );
+        assert_shape(
+            "ListBuckets prefix",
+            &response,
+            &shape()
+                .status(200)
+                .headers(xml_response_headers())
+                .sub("bucket", &bucket)
+                .sub("region", CTX.region())
+                .body(
+                    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+                     <ListAllMyBucketsResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
+                     <Owner><ID>{owner_id}</ID></Owner>\
+                     <Buckets><Bucket><Name>{bucket}</Name>\
+                     <CreationDate>{iso8601}</CreationDate>\
+                     <BucketRegion>{region}</BucketRegion>\
+                     <BucketArn>arn:aws:s3:::{bucket}</BucketArn></Bucket></Buckets>\
+                     <Prefix>{bucket}</Prefix></ListAllMyBucketsResult>",
+                ),
+        );
+
+        s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
+    });
+}

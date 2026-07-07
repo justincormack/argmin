@@ -7596,7 +7596,7 @@ fn stream_put_with_write_condition() {
         })
         .unwrap_err();
     assert!(
-        matches!(err, ServerError::PreconditionFailed),
+        matches!(err, ServerError::PreconditionFailed { .. }),
         "expected PreconditionFailed, got {err:?}"
     );
 }

@@ -16181,7 +16181,10 @@ fn get_object_range_unsatisfiable() {
             cond: NO_READ,
         })
         .unwrap_err();
-    assert!(matches!(err, ServerError::InvalidRange { total_size: 5 }));
+    assert!(matches!(
+        err,
+        ServerError::InvalidRange { total_size: 5, .. }
+    ));
 }
 
 #[test]
@@ -16307,7 +16310,7 @@ fn put_if_none_match_star_rejects_overwrite() {
         },
     )
     .unwrap_err();
-    assert!(matches!(err, ServerError::PreconditionFailed));
+    assert!(matches!(err, ServerError::PreconditionFailed { .. }));
 }
 
 #[test]
@@ -16433,5 +16436,5 @@ fn put_if_match_stale_etag_rejected() {
         },
     )
     .unwrap_err();
-    assert!(matches!(err, ServerError::PreconditionFailed));
+    assert!(matches!(err, ServerError::PreconditionFailed { .. }));
 }

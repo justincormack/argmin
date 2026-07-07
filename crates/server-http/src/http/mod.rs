@@ -984,8 +984,8 @@ impl HttpFrontend {
                     ref etag,
                     last_modified,
                 }) => S3Response::not_modified(etag, last_modified),
-                Err(ServerError::PreconditionFailed) => {
-                    S3Response::precondition_failed_with_ids(wire_ids)
+                Err(ServerError::PreconditionFailed { condition }) => {
+                    S3Response::precondition_failed_with_ids(condition, wire_ids)
                 }
                 Err(ref err @ ServerError::DeleteMarkerHit { .. }) => {
                     let mut resp = S3Response::error_with_ids(err, s3req.path(), wire_ids);
@@ -1329,13 +1329,18 @@ impl HttpFrontend {
             S3Operation::ListBuckets => {
                 let requester = Self::requester_from_auth(auth);
                 let owner_account = Self::authenticated_account(auth)?;
-                let buckets = self
+                let prefix = req.query_param_lossy("prefix");
+                let mut buckets = self
                     .coordinator
                     .list_buckets(&crate::coordinator::ListBucketsRequest { requester })?;
+                if let Some(ref prefix) = prefix {
+                    buckets.retain(|bucket| bucket.name.as_str().starts_with(prefix.as_ref()));
+                }
                 Ok(S3Response::list_buckets(
                     &buckets,
-                    owner_account.display_name(),
                     owner_account.canonical_user_id(),
+                    self.coordinator.region(),
+                    prefix.as_deref(),
                 ))
             }
             S3Operation::CreateBucket { bucket } => {
@@ -2804,21 +2809,7 @@ impl HttpFrontend {
                         sse_customer: sse_customer.as_ref(),
                     })
                     .map_err(|err| match err {
-                        ServerError::PreconditionFailed => {
-                            let condition = if req.header("x-amz-copy-source-if-match").is_some() {
-                                "x-amz-copy-source-If-Match"
-                            } else if req.header("x-amz-copy-source-if-none-match").is_some() {
-                                "x-amz-copy-source-If-None-Match"
-                            } else if req.header("x-amz-copy-source-if-modified-since").is_some() {
-                                "x-amz-copy-source-If-Modified-Since"
-                            } else if req
-                                .header("x-amz-copy-source-if-unmodified-since")
-                                .is_some()
-                            {
-                                "x-amz-copy-source-If-Unmodified-Since"
-                            } else {
-                                return ServerError::PreconditionFailed;
-                            };
+                        ServerError::PreconditionFailed { condition } => {
                             ServerError::UploadPartCopyPreconditionFailed {
                                 condition: condition.to_string(),
                             }
@@ -6675,7 +6666,7 @@ mod tests {
     }
 
     #[test]
-    fn list_buckets_uses_account_display_name_and_explicit_canonical_id() {
+    fn list_buckets_uses_owner_id_without_display_name() {
         let tmp = test_util::tempdir();
         let fe = setup_frontend(tmp.path());
         let owner_canonical_id = s3_types::CanonicalUserId::from_principal("custom-account-id");
@@ -6714,10 +6705,10 @@ mod tests {
         let resp = fe
             .dispatch_routed(&make_req(""), &auth, S3Operation::ListBuckets)
             .unwrap();
-        let body = String::from_utf8(resp.body).unwrap();
+        let body = String::from_utf8(resp.into_test_body_bytes().unwrap()).unwrap();
         assert!(body.contains(owner_canonical_id.as_str()));
-        assert!(body.contains("<DisplayName>User A</DisplayName>"));
-        assert!(!body.contains("<DisplayName>testuser</DisplayName>"));
+        assert!(!body.contains("<DisplayName>"));
+        assert!(body.contains("<BucketArn>arn:aws:s3:::mybucket</BucketArn>"));
     }
 
     #[test]
@@ -11856,7 +11847,7 @@ mod tests {
             key: "k".to_string(),
         };
         match fe.dispatch_routed(&req2, &test_auth(), op2) {
-            Err(ServerError::PreconditionFailed) => {}
+            Err(ServerError::PreconditionFailed { .. }) => {}
             Err(e) => panic!("expected PreconditionFailed, got {e:?}"),
             Ok(_) => panic!("expected PreconditionFailed, got Ok"),
         }

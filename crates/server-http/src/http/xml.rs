@@ -174,16 +174,23 @@ pub fn invalid_token_error_xml(
 
 /// Format an unsatisfiable byte range error response XML.
 #[must_use]
-pub fn invalid_range_error_xml(total_size: u64, request_id: &str, host_id: &str) -> String {
+pub fn invalid_range_error_xml(
+    range_requested: &str,
+    total_size: u64,
+    request_id: &str,
+    host_id: &str,
+) -> String {
     format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
          <Error>\
          <Code>InvalidRange</Code>\
          <Message>The requested range is not satisfiable</Message>\
+         <RangeRequested>{}</RangeRequested>\
          <ActualObjectSize>{}</ActualObjectSize>\
          <RequestId>{}</RequestId>\
          <HostId>{}</HostId>\
          </Error>",
+        xml_escape(range_requested),
         total_size,
         xml_escape(request_id),
         xml_escape(host_id),
@@ -477,6 +484,15 @@ pub fn upload_part_copy_invalid_range_error_xml(
     )
 }
 
+/// Format a precondition-failed error response for object requests.
+#[must_use]
+pub fn precondition_failed_error_xml(condition: &str, request_id: &str, host_id: &str) -> String {
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n{}",
+        upload_part_copy_precondition_failed_error_xml(condition, request_id, host_id)
+    )
+}
+
 /// Format an UploadPartCopy precondition-failed error response.
 #[must_use]
 pub fn upload_part_copy_precondition_failed_error_xml(
@@ -656,8 +672,9 @@ pub fn query_parameter_not_implemented_xml(
 #[must_use]
 pub fn list_buckets_xml(
     buckets: &[BucketSummary],
-    owner_display_name: &str,
     owner_canonical_id: &CanonicalUserId,
+    region: &str,
+    prefix: Option<&str>,
 ) -> String {
     let mut xml = String::from(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
@@ -665,19 +682,27 @@ pub fn list_buckets_xml(
          <Owner><ID>",
     );
     xml.push_str(&xml_escape(owner_canonical_id.as_str()));
-    xml.push_str("</ID><DisplayName>");
-    xml.push_str(&xml_escape(owner_display_name));
-    xml.push_str("</DisplayName></Owner><Buckets>");
+    xml.push_str("</ID></Owner><Buckets>");
 
     for bucket in buckets {
         xml.push_str("<Bucket><Name>");
         xml.push_str(&xml_escape(bucket.name.as_str()));
         xml.push_str("</Name><CreationDate>");
         xml.push_str(&format_timestamp(bucket.created_at));
-        xml.push_str("</CreationDate></Bucket>");
+        xml.push_str("</CreationDate><BucketRegion>");
+        xml.push_str(&xml_escape(region));
+        xml.push_str("</BucketRegion><BucketArn>arn:aws:s3:::");
+        xml.push_str(&xml_escape(bucket.name.as_str()));
+        xml.push_str("</BucketArn></Bucket>");
     }
 
-    xml.push_str("</Buckets></ListAllMyBucketsResult>");
+    xml.push_str("</Buckets>");
+    if let Some(prefix) = prefix {
+        xml.push_str("<Prefix>");
+        xml.push_str(&xml_escape(prefix));
+        xml.push_str("</Prefix>");
+    }
+    xml.push_str("</ListAllMyBucketsResult>");
     xml
 }
 
@@ -4861,11 +4886,17 @@ mod tests {
             encryption: EffectiveBucketEncryptionConfig::default(),
         }];
         let owner_canonical_id = CanonicalUserId::from_principal("owner");
-        let xml = list_buckets_xml(&buckets, "Owner A", &owner_canonical_id);
+        let xml = list_buckets_xml(&buckets, &owner_canonical_id, "us-east-1", Some("test-"));
         assert!(xml.contains("<Name>test-bucket</Name>"));
         assert!(xml.contains("ListAllMyBucketsResult"));
         assert!(xml.contains(&format!("<ID>{}</ID>", owner_canonical_id.as_str())));
-        assert!(xml.contains("<DisplayName>Owner A</DisplayName>"));
+        assert!(!xml.contains("<DisplayName>"));
+        assert!(xml.contains("<BucketRegion>us-east-1</BucketRegion>"));
+        assert!(xml.contains("<BucketArn>arn:aws:s3:::test-bucket</BucketArn>"));
+        assert!(xml.contains("</Buckets><Prefix>test-</Prefix></ListAllMyBucketsResult>"));
+
+        let xml = list_buckets_xml(&buckets, &owner_canonical_id, "us-east-1", None);
+        assert!(!xml.contains("<Prefix>"));
     }
 
     #[test]

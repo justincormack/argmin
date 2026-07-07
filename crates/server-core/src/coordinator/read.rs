@@ -879,6 +879,7 @@ impl Coordinator {
                     );
                 }
                 return Err(ServerError::InvalidRange {
+                    range_requested: range.to_string(),
                     total_size: record.size,
                 });
             }

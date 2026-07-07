@@ -4,7 +4,7 @@ use aws_sdk_s3::{primitives::ByteStream, types::ServerSideEncryption};
 use ring::hmac;
 use s3_tests::{
     assert_s3_err_code, err_status, post_object_raw_to_test_endpoint_with_headers,
-    shape::{assert_shape, shape},
+    shape::{assert_shape, error_response_headers, expected_error, shape},
     sigv4_post_fields_for_credentials, sigv4_post_sse_c_fields_for_credentials,
     sse_c_header_values, test_sse_c_key, unique_bucket, RawResponse, SendRetryingOperationAborted,
     CTX,
@@ -3789,12 +3789,29 @@ fn test_post_object_wrong_content_type() {
             .header("Content-Type", "text/plain")
             .send(b"hello" as &[u8])
             .expect("HTTP transport error");
-        let status = resp.status().as_u16();
-        let body = resp.body_mut().read_to_string().unwrap_or_default();
-        assert_eq!(status, 412);
-        assert!(
-            body.contains("<Code>PreconditionFailed</Code>"),
-            "expected PreconditionFailed error, got: {body}"
+        let response = s3_tests::RawResponse {
+            status: resp.status().as_u16(),
+            headers: resp
+                .headers()
+                .iter()
+                .map(|(name, value)| {
+                    (
+                        name.as_str().to_string(),
+                        value.to_str().expect("header is utf-8").to_string(),
+                    )
+                })
+                .collect(),
+            body: resp.body_mut().read_to_string().unwrap_or_default(),
+            body_read_error: None,
+        };
+        assert_shape(
+            "PostObject wrong content-type",
+            &response,
+            &shape().status(412).headers(error_response_headers()).body(
+                expected_error::precondition_failed(
+                    "Bucket POST must be of the enclosure-type multipart/form-data",
+                ),
+            ),
         );
         s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
     });

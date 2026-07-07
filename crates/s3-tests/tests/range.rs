@@ -1,7 +1,7 @@
 use aws_sdk_s3::types::{BucketVersioningStatus, VersioningConfiguration};
 use s3_tests::{
     cleanup_versioned_bucket, err_status, raw_object_query, raw_object_with,
-    shape::{assert_shape, shape},
+    shape::{assert_shape, error_response_headers, expected_error, shape},
     unique_bucket, SendRetryingOperationAborted, CTX,
 };
 
@@ -362,5 +362,30 @@ fn test_range_and_override_response_shape() {
             .await
             .expect("delete shape fixture");
         s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
+    });
+}
+
+/// Full error shape for a plain GET whose range starts past the end of the
+/// object: 416 `InvalidRange` echoing the requested range and object size.
+#[test]
+fn test_get_object_invalid_range_error_shape() {
+    s3_tests::run(async {
+        let bucket = setup_bucket().await;
+        let key = "range-416.txt";
+
+        let put = raw_object_with("PUT", &bucket, key, b"abcdefghij", &[]);
+        assert_eq!(put.status, 200, "range fixture PUT failed: {put:?}");
+
+        let response = raw_object_with("GET", &bucket, key, b"", &[("Range", "bytes=5000-6000")]);
+        assert_shape(
+            "GetObject unsatisfiable range",
+            &response,
+            &shape()
+                .status(416)
+                .headers(error_response_headers())
+                .body(expected_error::invalid_range("bytes=5000-6000", 10)),
+        );
+
+        cleanup(&bucket, &[key]).await;
     });
 }

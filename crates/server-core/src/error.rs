@@ -120,13 +120,18 @@ pub enum ServerError {
     },
 
     #[error("invalid range")]
-    InvalidRange { total_size: u64 },
+    InvalidRange {
+        range_requested: String,
+        total_size: u64,
+    },
 
     #[error("invalid part number")]
     InvalidPartNumber { part_number: u32, parts_count: u32 },
 
-    #[error("precondition failed")]
-    PreconditionFailed,
+    /// A read/write/delete conditional header did not hold; `condition`
+    /// names the failing header for the AWS-shaped `<Condition>` element.
+    #[error("precondition failed: {condition}")]
+    PreconditionFailed { condition: &'static str },
 
     #[error("not modified")]
     NotModified { etag: String, last_modified: u64 },
@@ -422,7 +427,7 @@ impl ServerError {
                 "AuthorizationQueryParametersError"
             }
             Self::Auth(_) => "AccessDenied",
-            Self::PreconditionFailed => "PreconditionFailed",
+            Self::PreconditionFailed { .. } => "PreconditionFailed",
             Self::NotModified { .. } => "NotModified",
             Self::InvalidRequest { .. } | Self::InvalidRequestHostId { .. } => "InvalidRequest",
             Self::BadRequest { .. } => "BadRequest",
@@ -597,7 +602,7 @@ impl ServerError {
             | Self::RequestHeaderSectionTooLarge => 400,
             Self::MethodNotAllowed | Self::HeadDeleteMarkerMethodNotAllowed { .. } => 405,
             Self::InvalidRange { .. } | Self::InvalidPartNumber { .. } => 416,
-            Self::PreconditionFailed | Self::UploadPartCopyPreconditionFailed { .. } => 412,
+            Self::PreconditionFailed { .. } | Self::UploadPartCopyPreconditionFailed { .. } => 412,
             Self::NotModified { .. } => 304,
             Self::SlowDown => 503,
             _ => 500,
@@ -1175,7 +1180,10 @@ mod tests {
 
     #[test]
     fn s3_error_code_invalid_range() {
-        let err = ServerError::InvalidRange { total_size: 100 };
+        let err = ServerError::InvalidRange {
+            range_requested: "bytes=200-300".to_string(),
+            total_size: 100,
+        };
         assert_eq!(err.s3_error_code(), "InvalidRange");
     }
 
@@ -1191,7 +1199,11 @@ mod tests {
     #[test]
     fn http_status_416() {
         assert_eq!(
-            ServerError::InvalidRange { total_size: 100 }.http_status(),
+            ServerError::InvalidRange {
+                range_requested: "bytes=200-300".to_string(),
+                total_size: 100,
+            }
+            .http_status(),
             416
         );
         assert_eq!(
@@ -1207,14 +1219,23 @@ mod tests {
     #[test]
     fn s3_error_code_precondition_failed() {
         assert_eq!(
-            ServerError::PreconditionFailed.s3_error_code(),
+            ServerError::PreconditionFailed {
+                condition: "If-Match"
+            }
+            .s3_error_code(),
             "PreconditionFailed"
         );
     }
 
     #[test]
     fn http_status_412() {
-        assert_eq!(ServerError::PreconditionFailed.http_status(), 412);
+        assert_eq!(
+            ServerError::PreconditionFailed {
+                condition: "If-Match"
+            }
+            .http_status(),
+            412
+        );
     }
 
     #[test]

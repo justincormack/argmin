@@ -1661,7 +1661,7 @@ fn copy_object_source_if_match_fails() {
             object_lock: ObjectLockState::default(),
         })
         .unwrap_err();
-    assert!(matches!(err, ServerError::PreconditionFailed));
+    assert!(matches!(err, ServerError::PreconditionFailed { .. }));
 }
 
 #[test]
@@ -1729,7 +1729,7 @@ fn copy_object_dest_if_none_match_prevents_overwrite() {
             object_lock: ObjectLockState::default(),
         })
         .unwrap_err();
-    assert!(matches!(err, ServerError::PreconditionFailed));
+    assert!(matches!(err, ServerError::PreconditionFailed { .. }));
 }
 
 #[test]
@@ -4228,7 +4228,7 @@ fn delete_unversioned_rechecks_current_object_at_execution() {
     let err = coord
         .apply_authorized_delete_object(&coord.storage_node(), authorized, &cond)
         .unwrap_err();
-    assert!(matches!(err, ServerError::PreconditionFailed));
+    assert!(matches!(err, ServerError::PreconditionFailed { .. }));
 }
 
 #[test]
@@ -4308,7 +4308,7 @@ fn delete_current_marker_insert_rechecks_current_object_at_execution() {
     let err = coord
         .apply_authorized_delete_object(&coord.storage_node(), authorized, &cond)
         .unwrap_err();
-    assert!(matches!(err, ServerError::PreconditionFailed));
+    assert!(matches!(err, ServerError::PreconditionFailed { .. }));
 }
 
 #[test]
@@ -4473,7 +4473,7 @@ fn boe_delete_unversioned_rechecks_current_object_at_execution() {
     let err = coord
         .apply_authorized_delete_object(&coord.storage_node(), authorized, &cond)
         .unwrap_err();
-    assert!(matches!(err, ServerError::PreconditionFailed));
+    assert!(matches!(err, ServerError::PreconditionFailed { .. }));
 }
 
 #[test]
@@ -4571,7 +4571,7 @@ fn boe_delete_current_marker_insert_rechecks_current_object_at_execution() {
     let err = coord
         .apply_authorized_delete_object(&coord.storage_node(), authorized, &cond)
         .unwrap_err();
-    assert!(matches!(err, ServerError::PreconditionFailed));
+    assert!(matches!(err, ServerError::PreconditionFailed { .. }));
 }
 
 #[test]

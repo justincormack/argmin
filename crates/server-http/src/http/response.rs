@@ -306,7 +306,9 @@ fn client_error_message(err: &ServerError) -> String {
         ServerError::InvalidPartNumber { .. } => {
             "The requested partnumber is not satisfiable".to_string()
         }
-        ServerError::PreconditionFailed => "precondition failed".to_string(),
+        ServerError::PreconditionFailed { .. } => {
+            "At least one of the pre-conditions you specified did not hold".to_string()
+        }
         ServerError::NotModified { .. } => "not modified".to_string(),
         ServerError::SlowDown => "Please reduce your request rate.".to_string(),
         ServerError::BadDigest => "bad digest".to_string(),
@@ -727,9 +729,17 @@ impl S3Response {
                 );
                 Self::new(400).chunked_xml_body(body)
             }
-            ServerError::InvalidRange { total_size } => {
-                let body = xml::invalid_range_error_xml(*total_size, request_id, host_id);
+            ServerError::InvalidRange {
+                range_requested,
+                total_size,
+            } => {
+                let body =
+                    xml::invalid_range_error_xml(range_requested, *total_size, request_id, host_id);
                 Self::new(416).chunked_xml_body(body)
+            }
+            ServerError::PreconditionFailed { condition } => {
+                let body = xml::precondition_failed_error_xml(condition, request_id, host_id);
+                Self::new(412).chunked_xml_body(body)
             }
             ServerError::InvalidPartNumber {
                 part_number,
@@ -1485,11 +1495,12 @@ impl S3Response {
     #[must_use]
     pub fn list_buckets(
         buckets: &[BucketSummary],
-        owner_display_name: &str,
         owner_canonical_id: &CanonicalUserId,
+        region: &str,
+        prefix: Option<&str>,
     ) -> Self {
-        let body = xml::list_buckets_xml(buckets, owner_display_name, owner_canonical_id);
-        Self::new(200).xml_body(body)
+        let body = xml::list_buckets_xml(buckets, owner_canonical_id, region, prefix);
+        Self::new(200).chunked_xml_body(body)
     }
 
     /// Build a response for `ListObjectsV2`.
@@ -1588,27 +1599,13 @@ impl S3Response {
             .header("Last-Modified", &format_http_date(last_modified))
     }
 
-    /// Build a 412 Precondition Failed response with XML error body.
-    #[must_use]
-    pub fn precondition_failed() -> Self {
-        let request_id = current_request_id();
-        let body = xml::error_xml(
-            "PreconditionFailed",
-            "At least one of the pre-conditions you specified did not hold",
-            "",
-            &request_id,
-        );
-        Self::new(412).chunked_xml_body(body)
-    }
-
     /// Build a 412 Precondition Failed response with explicit wire IDs.
     #[must_use]
-    pub fn precondition_failed_with_ids(wire_ids: &WireResponseIds) -> Self {
-        let body = xml::error_xml(
-            "PreconditionFailed",
-            "At least one of the pre-conditions you specified did not hold",
-            "",
+    pub fn precondition_failed_with_ids(condition: &str, wire_ids: &WireResponseIds) -> Self {
+        let body = xml::precondition_failed_error_xml(
+            condition,
             wire_ids.request_id(),
+            wire_ids.host_id(),
         );
         Self::new(412).chunked_xml_body(body)
     }
@@ -3204,15 +3201,15 @@ mod tests {
             encryption: EffectiveBucketEncryptionConfig::default(),
         }];
         let owner_canonical_id = CanonicalUserId::from_principal("owner");
-        let resp = S3Response::list_buckets(&buckets, "Owner A", &owner_canonical_id);
+        let resp = S3Response::list_buckets(&buckets, &owner_canonical_id, "us-east-1", None);
         assert_eq!(resp.status_code, 200);
         assert_eq!(find_header(&resp, "Content-Type"), Some("application/xml"));
-        let body = String::from_utf8(resp.body).unwrap();
+        let body = String::from_utf8(resp.into_test_body_bytes().unwrap()).unwrap();
         assert!(body.contains("<?xml"));
         assert!(body.contains("test-bucket"));
         assert!(body.contains("ListAllMyBucketsResult"));
         assert!(body.contains(owner_canonical_id.as_str()));
-        assert!(body.contains("<DisplayName>Owner A</DisplayName>"));
+        assert!(!body.contains("<DisplayName>"));
     }
 
     #[test]
@@ -3551,7 +3548,10 @@ mod tests {
 
     #[test]
     fn invalid_range_error_response_includes_actual_object_size() {
-        let err = ServerError::InvalidRange { total_size: 26 };
+        let err = ServerError::InvalidRange {
+            range_requested: "bytes=100-200".to_string(),
+            total_size: 26,
+        };
         let resp = S3Response::error(&err, "/bucket/key", TEST_HOST_ID);
         assert_eq!(resp.status_code, 416);
         let body = String::from_utf8(resp.into_test_body_bytes().unwrap()).unwrap();
@@ -3867,14 +3867,5 @@ mod tests {
             Some("Mon, 15 Jan 2024 12:30:45 GMT")
         );
         assert!(resp.body.is_empty());
-    }
-
-    #[test]
-    fn precondition_failed_response_412() {
-        let resp = S3Response::precondition_failed();
-        assert_eq!(resp.status_code, 412);
-        assert_eq!(find_header(&resp, "Content-Type"), Some("application/xml"));
-        let body = String::from_utf8(resp.into_test_body_bytes().unwrap()).unwrap();
-        assert!(body.contains("PreconditionFailed"));
     }
 }
