@@ -1,0 +1,183 @@
+Expiry check unintentionally moved after signature checks
+Link: https://chatgpt.com/codex/cloud/security/findings/ee3f3103bb408191b1127ce41e0bc613?sev=&repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin&sort=date_desc
+Criticality: informational (attack path: ignore)
+Status: fixed
+
+# Metadata
+Repo: justincormack/argmin
+Commit: 6b821bc
+Author: justin@specialbusservice.com
+Created: 07/07/2026, 04:04:28
+Assignee: Unassigned
+Signals: Validated, Attack-path
+
+# Resolution
+Fixed in commit `c3be106b` (`Align expired credential auth precedence with AWS`).
+
+AWS-facing ad hoc validation was run with expired `GetSessionToken`
+credentials because Argmin does not yet implement STS locally, so this cannot
+be pinned as a committed AWS-facing test suite case yet. The probe showed that
+AWS S3 returns `ExpiredToken` before signature mismatch for all three SigV4
+surfaces tested:
+
+- header SigV4 with a valid expired signature
+- header SigV4 with a deliberately corrupted expired signature
+- presigned SigV4 with a valid expired signature
+- presigned SigV4 with a deliberately corrupted expired signature
+- POST Object SigV4 with a valid expired signature
+- POST Object SigV4 with a deliberately corrupted expired signature
+
+The fix split the combined static-credential token/expiry helper into separate
+checks. Credential expiry is now validated immediately after the credential
+record is found and before signature comparison for header, presigned, and
+POST SigV4 authentication. Unexpected static-credential security-token inputs
+remain checked after signature comparison, preserving the AWS-aligned behavior
+from commit `6b821bc`.
+
+Focused regressions were added for expired credential plus bad signature on
+header SigV4, presigned SigV4, and POST Object SigV4. The compatibility guide
+now documents the temporary STS testing gap and the ad hoc AWS oracle result.
+
+Validation performed for the fix:
+
+- `cargo test -p auth expired_token -- --nocapture`
+- `cargo test -p auth bad_signature_rejects_signature_first -- --nocapture`
+- `cargo test -p auth`
+- `cargo check -p server-http`
+
+# Summary
+Introduced non-security functional regression: expired credential validation was moved together with static security-token validation, changing expired-token error precedence for presigned and POST SigV4 paths.
+The patch intended to delay only unexpected security-token validation until after SigV4 verification. However, the moved helper also checks credential expiration. As a result, presigned and POST SigV4 requests using an expired CredentialRecord now compute and compare the signature first, returning SignatureMismatch for a bad signature before ExpiredToken can be returned. This changes existing behavior and appears to break the still-present presigned_expired_token unit test expectation. I did not find an authentication bypass: valid signatures for expired records are still rejected as ExpiredToken, and invalid signatures are still rejected.
+
+# Validation
+## Rubric
+- [x] Confirm the commit changed only the targeted auth ordering and moved the combined token/expiry helper after signature verification in presigned and POST SigV4.
+- [x] Confirm `validate_static_record_token_and_expiry` still checks `expires_at_epoch_secs` and returns `AuthError::ExpiredToken`.
+- [x] Dynamically reproduce the still-present presigned expired-token unit test failure caused by changed error precedence.
+- [x] Create a minimal public-API PoC covering both presigned and POST SigV4 expired credentials with bad signatures, plus valid-signature controls.
+- [x] Attempt valgrind/debugger validation: valgrind was unavailable; LLDB breakpoint trace confirmed presigned execution reaches signature comparison before the expiry helper.
+## Report
+Validated the regression at commit 6b821bc819a9547b3f38564c2c5739975decb845. Code inspection of the targeted diff shows `validate_static_record_token_and_expiry(...)` was moved from before to after signature comparison in both affected paths: presigned SigV4 now returns `AuthError::SignatureMismatch` at `crates/auth/src/request.rs:543-547` before calling the helper at `request.rs:548-552`; the helper checks credential expiry and returns `ExpiredToken` at `request.rs:605-613`. POST SigV4 has the same ordering at `crates/auth/src/post.rs:120-134`. The still-present upstream unit test `request::tests::presigned_expired_token` at `request.rs:2031-2055` expects `ExpiredToken` for an expired record with a bad signature, and it now panics: `assertion failed: matches!(err, AuthError::ExpiredToken)`. I then added a targeted integration PoC using the public API. It confirmed both affected paths return `SignatureMismatch` for expired credentials with bad signatures: `PRESIGNED_EXPIRED_BAD_SIGNATURE_ERROR=SignatureMismatch` and `POST_EXPIRED_BAD_SIGNATURE_ERROR=SignatureMismatch`. Control cases using valid signatures still return `ExpiredToken`, confirming this is an error-precedence regression rather than an authentication bypass. Valgrind was attempted but unavailable in the container. LLDB was used non-interactively and stopped in `authenticate_presigned` at `request.rs:545`, the signature comparison, before the expiry helper breakpoint at `request.rs:610`, corroborating the execution order.
+
+# Evidence
+crates/auth/src/post.rs (L120 to 134)
+  Note: POST SigV4 authentication now performs HMAC/signature comparison before the combined token-and-expiry validation helper.
+```
+    // Derive signing key and compute expected signature
+    let signing_key = sigv4::derive_signing_key(
+        &record.secret_key,
+        credential.date,
+        credential.region,
+        credential.service,
+    );
+    let expected_sig = sigv4::hmac_sha256(signing_key.as_ref(), request.policy_b64.as_bytes());
+    let expected_hex = sigv4::hex_encode(expected_sig.as_ref());
+
+    // Constant-time comparison to prevent timing attacks on signature values.
+    if !crate::constant_time_eq(expected_hex.as_bytes(), request.signature_hex.as_bytes()) {
+        return Err(AuthError::SignatureMismatch);
+    }
+    validate_static_record_token_and_expiry(record, request.security_token, now_epoch_secs)?;
+```
+
+crates/auth/src/request.rs (L2031 to 2055)
+  Note: The existing presigned_expired_token test still expects ExpiredToken for an expired credential, but the new ordering will return SignatureMismatch for this bad-signature test vector.
+```
+    fn presigned_expired_token() {
+        let mut store = CredentialStore::new();
+        store.add_record(CredentialRecord {
+            access_key_id: "AKIAIOSFODNN7EXAMPLE".to_string(),
+            secret_key: SecretKey::new("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".to_string()),
+            account: account("u1"),
+            authorization_profile: crate::AuthorizationProfile::Standard,
+            expires_at_epoch_secs: Some(100),
+            enabled: true,
+        });
+        let query = "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIAIOSFODNN7EXAMPLE%2F20240201%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Date=20240201T120000Z&X-Amz-Expires=900&X-Amz-SignedHeaders=host&X-Amz-Signature=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let headers = [("host", "example.com")];
+        let err = authenticate_request(
+            "GET",
+            "/",
+            query,
+            &headers,
+            b"",
+            &store,
+            ExpectedSigningRegion::ExactEndpointRegion("us-east-1"),
+            "s3",
+            presigned_example_time(),
+        )
+        .unwrap_err();
+        assert!(matches!(err, AuthError::ExpiredToken));
+```
+
+crates/auth/src/request.rs (L543 to 552)
+  Note: Presigned authentication now returns SignatureMismatch before calling the helper that also checks credential expiration.
+```
+    // Constant-time comparison to prevent timing attacks on signature values.
+    let expected_hex = hex_encode_lower(expected_sig.as_ref());
+    if !crate::constant_time_eq(expected_hex.as_bytes(), signature.as_bytes()) {
+        return Err(AuthError::SignatureMismatch);
+    }
+    validate_static_record_token_and_expiry(
+        record,
+        token.as_deref().or(signed_header_token),
+        now_epoch_secs,
+    )?;
+```
+
+crates/auth/src/request.rs (L605 to 613)
+  Note: The moved helper validates expires_at_epoch_secs, so moving it after signature verification also moved expiry validation.
+```
+pub(crate) fn validate_static_record_token_and_expiry(
+    record: &crate::credential::CredentialRecord,
+    request_token: Option<&str>,
+    now_epoch_secs: u64,
+) -> Result<(), AuthError> {
+    if let Some(expiry) = record.expires_at_epoch_secs {
+        if now_epoch_secs > expiry {
+            return Err(AuthError::ExpiredToken);
+        }
+```
+
+# Attack-path analysis
+Final: ignore | Decider: model_decided | Matrix severity: ignore | Policy adjusted: ignore
+## Rationale
+The finding is a real code regression in an in-scope auth component, but it is not a real security vulnerability in the reviewed product context. The affected paths are reachable only when an expired CredentialRecord exists; the argmin-s3 binary sets expires_at_epoch_secs to None for configured credentials. Even when the condition is forced, the earlier validation showed valid signatures for expired credentials still fail as ExpiredToken and invalid signatures fail as SignatureMismatch, so there is no path to read, write, delete, or administer S3 data. At most, this is a low-value compatibility/error-oracle issue over expired credentials, insufficient for security severity.
+## Likelihood
+low - An attacker can generally send HTTP requests if the service is exposed, but exploiting this behavior requires an expired CredentialRecord, which the main product configuration does not appear to create, and the outcome is only an error-code difference.
+## Impact
+ignore - No authentication bypass or authorization bypass is present. The only demonstrated effect is that expired records with bad signatures return SignatureMismatch before ExpiredToken. Valid signatures for expired records remain rejected, and the main binary does not create expiring records from normal environment configuration.
+## Assumptions
+- No deployment manifests or IaC defining public ingress were found in the inspected repository context; exposure is based on application defaults and environment-driven configuration.
+- The earlier validation evidence accurately describes the tested behavior for expired CredentialRecord values.
+- Analysis is static over repository artifacts only and does not call cloud APIs.
+- A deployment or embedding application must use CredentialRecord.expires_at_epoch_secs=Some(...) for the target access key.
+- The credential record must already be expired.
+- An attacker must know or guess an existing expired access key id and send a presigned SigV4 or POST SigV4 request with a bad signature.
+- The client must be able to observe the returned authentication error class.
+## Path
+attacker -> argmin-s3 HTTP -> auth dispatch -> SigV4 HMAC check -> expired CredentialRecord -> SignatureMismatch instead of ExpiredToken
+## Path evidence
+- `crates/auth/src/request.rs:543-552` - Presigned SigV4 computes expected_hex and returns SignatureMismatch before calling the helper that checks expiry.
+- `crates/auth/src/request.rs:605-613` - validate_static_record_token_and_expiry checks expires_at_epoch_secs and returns ExpiredToken only after it is called.
+- `crates/auth/src/post.rs:120-134` - POST SigV4 also compares the HMAC signature before calling validate_static_record_token_and_expiry.
+- `crates/server-http/src/http/mod.rs:3068-3091` - The HTTP frontend invokes authenticate_request for normal S3 request authentication.
+- `crates/server-http/src/http/mod.rs:3430-3458` - The HTTP frontend invokes authenticate_post_sigv4 for POST Object form authentication.
+- `crates/argmin-s3/src/main.rs:133-160` - The main binary builds configured credentials with expires_at_epoch_secs set to None, so expired credential records are not exposed by default env configuration.
+- `crates/argmin-s3/src/config.rs:135-140` - Configuration uses environment variables for credentials and defaults ARGMIN_LISTEN_ADDR to 127.0.0.1:9000.
+- `crates/argmin-s3/src/main.rs:3406-3485` - The product binds a TCP listener and serves plain HTTP or TLS depending on TLS environment configuration.
+## Narrative
+The reported behavior is real as an error-precedence regression: presigned and POST SigV4 paths compare the computed signature before invoking validate_static_record_token_and_expiry, whose first check returns ExpiredToken for expired records. Earlier validation confirmed bad signatures for expired records now return SignatureMismatch while valid signatures still return ExpiredToken. This is reachable through the auth code paths, but the main argmin-s3 binary constructs configured credentials with expires_at_epoch_secs set to None, reducing default runtime reachability. Most importantly, the request remains unauthenticated and no private bucket/object access, write, delete, privilege escalation, or secret disclosure is demonstrated. This should be treated as a compatibility/correctness regression, not a security vulnerability.
+## Controls
+- AWS SigV4 authentication is required for non-public operations.
+- Signature comparison uses constant_time_eq.
+- Expired credentials with valid signatures are still rejected as ExpiredToken before AuthContext success.
+- Default listener is 127.0.0.1:9000 unless ARGMIN_LISTEN_ADDR is changed.
+- TLS is supported when ARGMIN_TLS_CERT_PATH and ARGMIN_TLS_KEY_PATH are configured.
+- Connection and in-flight request semaphores plus request/header/body timeouts bound basic resource use.
+- The argmin-s3 process rejects running as effective UID 0.
+## Blindspots
+- No deployment manifests, firewall rules, or load balancer configuration were present to prove whether operators expose ARGMIN_LISTEN_ADDR publicly.
+- Static repository analysis cannot determine whether downstream users embed the auth crate and populate expiring CredentialRecord values in production.
+- No cloud IAM, Kubernetes, or secret-management artifacts were available in the repository scope.
+- The analysis did not inspect runtime logs or deployed error translation beyond repository code and supplied validation evidence.
