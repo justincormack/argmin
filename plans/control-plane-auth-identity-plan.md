@@ -229,8 +229,14 @@ Status:
   and inbound requests/responses are verified against the configured cluster,
   source node, target node, and operation before OpenRaft dispatch or response
   decode. Existing unauthenticated peer paths remain available when no
-  credentials are configured. Process-level negative coverage for wrong
-  cluster/source/target/MAC and transfer-leader freshness remains next.
+  credentials are configured.
+- 2026-07-07: Extended item 7 with process peer-listener negative coverage for
+  authenticated Raft requests. The `argmin-s3` peer RPC worker now has tests
+  proving missing auth, wrong cluster, wrong source, wrong target, bad MAC, and
+  stale credential versions fail before OpenRaft dispatch, do not mutate the
+  local Raft vote/term, and do not write a peer response. Remaining item 7
+  coverage is wrong-role/payload-bitflip/unknown-credential process cases and
+  transfer-leader freshness/fence replay tests.
 
 ## Path-Specific Enforcement Order
 
