@@ -22,6 +22,7 @@ use crate::metadata_command::{
     MetadataCommandReplicaState, MetadataTransferCommand, ObjectPayloadReclaimCommand,
     PutBucketAclCommand, PutBucketPropertyCommand, PutBucketSubresourceCommand,
     PutBucketVersioningCommand, PutObjectMetadataCommand, PutObjectMetadataMutation,
+    COMPLETE_MULTIPART_UPLOAD_BUCKET_WRITE_OPERATION_KIND,
 };
 use crate::node::SharedStorageNode;
 use crate::pg_store::MetadataCommandLogCompactionStatus;

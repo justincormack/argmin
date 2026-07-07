@@ -20,7 +20,7 @@ use crate::metadata_command::{
     DeleteFinalizedBucketCommand, DeleteObjectPayloadReclaimCommand, DeleteObjectVersionTarget,
     MetadataCommandAcceptance, MetadataCommandEnvelope, MetadataCommandId, MetadataCommandPayload,
     ObjectPayloadReclaimClaimProof, ObjectPayloadReclaimCommand, PutObjectMetadataCommand,
-    PutObjectMetadataMutation,
+    PutObjectMetadataMutation, COMPLETE_MULTIPART_UPLOAD_BUCKET_WRITE_OPERATION_KIND,
 };
 use crate::node::ReclaimQueueInsert;
 use crate::node_client::{
@@ -11905,6 +11905,8 @@ impl super::StorageCluster {
     fn reserve_completed_multipart_upload_order(
         &self,
         bucket: &BucketName,
+        completion_target_context: &str,
+        bucket_write_reservation: &BucketWriteReservationProof,
         work_budget: &mut super::RequestWorkBudget,
     ) -> Result<u64, ObjectPgActionError> {
         let pg_id = PgId::new(self.bucket_metadata_pg_id(bucket));
@@ -11982,7 +11984,11 @@ impl super::StorageCluster {
             };
             let (completion_order, command) = bucket_metadata_client
                 .build_advance_completed_multipart_upload_sequence_command(
-                    pg_id, bucket, command_id,
+                    pg_id,
+                    bucket,
+                    command_id,
+                    completion_target_context,
+                    bucket_write_reservation,
                 )
                 .map_err(super::bucket_snapshot_error_to_object_pg_action_error)?;
             if !self
@@ -12027,7 +12033,27 @@ impl super::StorageCluster {
         )
         .for_operation("test_completed_multipart_order")
         .for_pg(PgId::new(self.bucket_metadata_pg_id(bucket)));
-        self.reserve_completed_multipart_upload_order(bucket, &mut work_budget)
+        let reservation = self
+            .acquire_completion_durable_bucket_write_reservation(
+                bucket,
+                COMPLETE_MULTIPART_UPLOAD_BUCKET_WRITE_OPERATION_KIND,
+                Some("test-completed-multipart-order"),
+            )
+            .map_err(super::bucket_snapshot_error_to_object_pg_action_error)?;
+        let proof = BucketWriteReservationProof::from(&reservation.record);
+        let result = self.reserve_completed_multipart_upload_order(
+            bucket,
+            "test-completed-multipart-order",
+            &proof,
+            &mut work_budget,
+        );
+        let release = self
+            .release_durable_bucket_write_reservation(reservation)
+            .map_err(super::bucket_snapshot_error_to_object_pg_action_error);
+        match (result, release) {
+            (Ok(order), Ok(())) => Ok(order),
+            (Ok(_), Err(error)) | (Err(error), Ok(())) | (Err(error), Err(_)) => Err(error),
+        }
     }
 
     fn apply_multipart_completion_command(
@@ -12130,7 +12156,7 @@ impl super::StorageCluster {
             work_budget.check("complete multipart commit budget exhausted")?;
             let reservation = match self.acquire_completion_durable_bucket_write_reservation(
                 &bucket,
-                "complete-multipart-upload",
+                COMPLETE_MULTIPART_UPLOAD_BUCKET_WRITE_OPERATION_KIND,
                 Some(key.as_str()),
             ) {
                 Ok(reservation) => reservation,
@@ -12212,14 +12238,18 @@ impl super::StorageCluster {
             } else {
                 VersionId::Null
             };
-            let completion_order =
-                match self.reserve_completed_multipart_upload_order(&bucket, &mut work_budget) {
-                    Ok(completion_order) => completion_order,
-                    Err(error) => {
-                        release_bucket_write_proof!()?;
-                        return Err(error);
-                    }
-                };
+            let completion_order = match self.reserve_completed_multipart_upload_order(
+                &bucket,
+                key.as_str(),
+                &bucket_write_reservation,
+                &mut work_budget,
+            ) {
+                Ok(completion_order) => completion_order,
+                Err(error) => {
+                    release_bucket_write_proof!()?;
+                    return Err(error);
+                }
+            };
             let expected_object_parts = complete_multipart_expected_object_parts(
                 &req,
                 version_id,

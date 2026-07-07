@@ -6,7 +6,7 @@ use crate::{
         DeleteObjectVersionTarget, MetadataCommandAcceptance, MetadataCommandLogHashRangeEntry,
         MetadataCommandLogIndex, MetadataCommandLogRangeEntry, MetadataCommandLogRangeEntryKind,
         MetadataCommandReplicaState, MetadataTransferCommand, ObjectPayloadReclaimCommand,
-        PutObjectMetadataMutation,
+        PutObjectMetadataMutation, COMPLETE_MULTIPART_UPLOAD_BUCKET_WRITE_OPERATION_KIND,
     },
     pg_store::{
         MetadataCheckpointRow, MetadataCheckpointTableBlock, MetadataCheckpointTableDigest,
@@ -525,7 +525,11 @@ const STORAGE_RPC_MAX_CREATE_BUCKET_COMMAND_BUILD_PAYLOAD_LEN: usize =
         + STORAGE_RPC_MAX_BUCKET_ACL_GRANTS_LEN
         + 12;
 const STORAGE_RPC_MAX_COMPLETED_MULTIPART_ORDER_COMMAND_BUILD_PAYLOAD_LEN: usize =
-    STORAGE_RPC_MAX_BUCKET_REQUEST_PAYLOAD_LEN + 8;
+    STORAGE_RPC_MAX_BUCKET_REQUEST_PAYLOAD_LEN
+        + 8
+        + 4
+        + STORAGE_RPC_MAX_BUCKET_WRITE_TARGET_CONTEXT_LEN
+        + STORAGE_RPC_MAX_BUCKET_WRITE_RESERVATION_PROOF_PAYLOAD_LEN;
 const STORAGE_RPC_MAX_BUCKET_METADATA_CONTROL_REQUEST_PAYLOAD_LEN: usize = 2 * 1024 * 1024;
 const STORAGE_RPC_MAX_BUCKET_SUBRESOURCE_GET_PAYLOAD_LEN: usize =
     STORAGE_RPC_MAX_BUCKET_REQUEST_PAYLOAD_LEN + 1;
@@ -2483,6 +2487,8 @@ pub(crate) struct StorageRpcCompletedMultipartOrderCommandBuildRequest {
     pub(crate) pg_id: PgId,
     pub(crate) bucket: BucketName,
     pub(crate) command_id: crate::metadata_command::MetadataCommandId,
+    pub(crate) completion_target_context: String,
+    pub(crate) bucket_write_reservation: BucketWriteReservationProof,
 }
 
 #[derive(Debug, Clone)]
@@ -6739,6 +6745,22 @@ pub(crate) fn encode_completed_multipart_order_command_build_request(
             "command id route must match request route",
         ));
     }
+    if request.bucket_write_reservation.bucket != request.bucket
+        || request.bucket_write_reservation.cluster_epoch != request.cluster_epoch
+        || request.bucket_write_reservation.operation_kind
+            != COMPLETE_MULTIPART_UPLOAD_BUCKET_WRITE_OPERATION_KIND
+        || request.bucket_write_reservation.target_context.as_deref()
+            != Some(request.completion_target_context.as_str())
+    {
+        return Err(StorageRpcPayloadError::InvalidBucketWriteReservationProof(
+            "bucket write reservation proof must match completed multipart order request",
+        ));
+    }
+    if request.completion_target_context.len() > STORAGE_RPC_MAX_BUCKET_WRITE_TARGET_CONTEXT_LEN {
+        return Err(StorageRpcPayloadError::InvalidBucketWriteReservationProof(
+            "completed multipart order target context exceeds maximum length",
+        ));
+    }
     let mut out = encode_bucket_request(&StorageRpcBucketRequest {
         node_id: request.node_id,
         cluster_epoch: request.cluster_epoch,
@@ -6746,6 +6768,8 @@ pub(crate) fn encode_completed_multipart_order_command_build_request(
         bucket: request.bucket.clone(),
     });
     put_u64(&mut out, request.command_id.log_index().get());
+    put_string(&mut out, &request.completion_target_context);
+    put_bucket_write_reservation_proof(&mut out, &request.bucket_write_reservation);
     Ok(out)
 }
 
@@ -6761,7 +6785,25 @@ pub(crate) fn decode_completed_multipart_order_command_build_request(
         .ok_or(StorageRpcPayloadError::InvalidBucketMetadataRequest(
             "metadata command log index must not be zero",
         ))?;
+    let completion_target_context = decoder.read_string_with_limit(
+        STORAGE_RPC_MAX_BUCKET_WRITE_TARGET_CONTEXT_LEN,
+        StorageRpcPayloadError::InvalidBucketWriteReservationProof(
+            "completed multipart order target context exceeds maximum length",
+        ),
+    )?;
+    let bucket_write_reservation = decoder.read_bucket_write_reservation_proof()?;
     decoder.finish()?;
+    if bucket_write_reservation.bucket != bucket
+        || bucket_write_reservation.cluster_epoch != cluster_epoch
+        || bucket_write_reservation.operation_kind
+            != COMPLETE_MULTIPART_UPLOAD_BUCKET_WRITE_OPERATION_KIND
+        || bucket_write_reservation.target_context.as_deref()
+            != Some(completion_target_context.as_str())
+    {
+        return Err(StorageRpcPayloadError::InvalidBucketWriteReservationProof(
+            "bucket write reservation proof must match completed multipart order request",
+        ));
+    }
     Ok(StorageRpcCompletedMultipartOrderCommandBuildRequest {
         node_id,
         cluster_epoch,
@@ -6772,6 +6814,8 @@ pub(crate) fn decode_completed_multipart_order_command_build_request(
             pg_id,
             log_index,
         ),
+        completion_target_context,
+        bucket_write_reservation,
     })
 }
 
@@ -20762,12 +20806,21 @@ mod tests {
             PgId::new(3),
             MetadataCommandLogIndex::new(9).unwrap(),
         );
+        let bucket_write_reservation = BucketWriteReservationProof {
+            bucket: bucket.clone(),
+            cluster_epoch: ClusterEpoch::INITIAL,
+            operation_kind: COMPLETE_MULTIPART_UPLOAD_BUCKET_WRITE_OPERATION_KIND.to_string(),
+            target_context: Some("object-key".to_string()),
+            ..test_bucket_write_reservation_proof()
+        };
         let request = StorageRpcCompletedMultipartOrderCommandBuildRequest {
             node_id: NodeId::new(7),
             cluster_epoch: ClusterEpoch::INITIAL,
             pg_id: PgId::new(3),
             bucket: bucket.clone(),
             command_id,
+            completion_target_context: "object-key".to_string(),
+            bucket_write_reservation,
         };
 
         let bytes = encode_completed_multipart_order_command_build_request(&request).unwrap();
@@ -20782,6 +20835,28 @@ mod tests {
             encode_completed_multipart_order_command_build_request(&wrong_route),
             Err(StorageRpcPayloadError::InvalidBucketMetadataRequest(
                 "command id route must match request route"
+            ))
+        );
+
+        let wrong_proof = StorageRpcCompletedMultipartOrderCommandBuildRequest {
+            bucket_write_reservation: test_bucket_write_reservation_proof(),
+            ..request.clone()
+        };
+        assert_eq!(
+            encode_completed_multipart_order_command_build_request(&wrong_proof),
+            Err(StorageRpcPayloadError::InvalidBucketWriteReservationProof(
+                "bucket write reservation proof must match completed multipart order request"
+            ))
+        );
+
+        let wrong_target = StorageRpcCompletedMultipartOrderCommandBuildRequest {
+            completion_target_context: "other-key".to_string(),
+            ..request.clone()
+        };
+        assert_eq!(
+            encode_completed_multipart_order_command_build_request(&wrong_target),
+            Err(StorageRpcPayloadError::InvalidBucketWriteReservationProof(
+                "bucket write reservation proof must match completed multipart order request"
             ))
         );
 

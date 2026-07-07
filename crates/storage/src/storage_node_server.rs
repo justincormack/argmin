@@ -7125,6 +7125,8 @@ impl StorageNodeConnectionHandler {
             request.pg_id,
             &request.bucket,
             request.command_id,
+            &request.completion_target_context,
+            &request.bucket_write_reservation,
         ) {
             Ok((completion_order, command)) => {
                 let payload = encode_completed_multipart_order_command_build_response(

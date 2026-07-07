@@ -3328,6 +3328,8 @@ impl BucketMetadataNodeClient for UnixStorageNodeClient {
         pg_id: PgId,
         bucket: &BucketName,
         command_id: MetadataCommandId,
+        completion_target_context: &str,
+        bucket_write_reservation: &BucketWriteReservationProof,
     ) -> Result<(u64, MetadataCommandEnvelope), BucketSnapshotLoadError> {
         let request = StorageRpcCompletedMultipartOrderCommandBuildRequest {
             node_id: self.node_id,
@@ -3335,6 +3337,8 @@ impl BucketMetadataNodeClient for UnixStorageNodeClient {
             pg_id,
             bucket: bucket.clone(),
             command_id,
+            completion_target_context: completion_target_context.to_string(),
+            bucket_write_reservation: bucket_write_reservation.clone(),
         };
         let payload =
             encode_completed_multipart_order_command_build_request(&request).map_err(|error| {

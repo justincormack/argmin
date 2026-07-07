@@ -53,6 +53,8 @@ pub(crate) trait BucketMetadataNodeClient: Send + Sync {
         pg_id: PgId,
         bucket: &BucketName,
         command_id: MetadataCommandId,
+        completion_target_context: &str,
+        bucket_write_reservation: &BucketWriteReservationProof,
     ) -> Result<(u64, MetadataCommandEnvelope), BucketSnapshotLoadError>;
 
     fn pending_mark_bucket_deleting_command_matches_current(
@@ -1518,6 +1520,8 @@ pub(crate) trait StorageNodeClient:
         pg_id: PgId,
         bucket: &BucketName,
         command_id: MetadataCommandId,
+        completion_target_context: &str,
+        bucket_write_reservation: &BucketWriteReservationProof,
     ) -> Result<(u64, MetadataCommandEnvelope), BucketSnapshotLoadError>;
 
     fn pending_put_bucket_versioning_command_matches_current(

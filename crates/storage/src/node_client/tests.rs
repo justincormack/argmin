@@ -50,6 +50,70 @@ fn private_socket_dir(path: &std::path::Path) {
 }
 
 #[test]
+fn completed_multipart_order_rejects_non_completion_bucket_write_reservation() {
+    let tmp = test_util::tempdir();
+    let config = test_config(&tmp);
+    let bucket = crate::tests::bucket_name("completed-order-wrong-proof-bucket");
+    let owner = crate::CanonicalUserId::from_principal("owner");
+    let storage_node = Arc::new(
+        crate::node::SharedStorageNode::open_with_default_ec_shape(
+            &config.data_dir,
+            &config.pg_ids,
+            config.default_ec_shape,
+        )
+        .unwrap(),
+    );
+    let pg = storage_node.get_pg(0).unwrap();
+    crate::PgMetadataStore::create_bucket(
+        &*pg,
+        &bucket,
+        "owner",
+        &owner,
+        &crate::AclGrants::default(),
+        false,
+        false,
+    )
+    .unwrap();
+    let reservation = crate::PgMetadataStore::acquire_durable_bucket_write_reservation(
+        &*pg,
+        &bucket,
+        "put-object-reservation",
+        "put-object-owner",
+        ClusterEpoch::new(1).unwrap(),
+        "put-object",
+        1_000,
+        crate::clock::current_time_millis() + 60_000,
+        Some("object-key"),
+    )
+    .unwrap();
+    pg.refresh_metadata_command_state_digest().unwrap();
+
+    let client = LocalStorageNodeClient::new(config.node_id, Arc::clone(&storage_node));
+    let command_id = MetadataCommandId::new(
+        ClusterEpoch::new(1).unwrap(),
+        PgId::new(0),
+        MetadataCommandLogIndex::new(1).unwrap(),
+    );
+    let proof = BucketWriteReservationProof::from(&reservation);
+    let err = BucketMetadataNodeClient::build_advance_completed_multipart_upload_sequence_command(
+        &client,
+        PgId::new(0),
+        &bucket,
+        command_id,
+        "object-key",
+        &proof,
+    )
+    .unwrap_err();
+
+    assert!(matches!(
+        err,
+        BucketSnapshotLoadError::Metadata(MetadataError::BucketWriteReservationConflict {
+            reservation_id
+        }) if reservation_id == "put-object-reservation"
+    ));
+}
+
+#[test]
 fn upload_part_stream_upload_match_accepts_existing_row_without_create_proof() {
     let bucket = crate::tests::bucket_name("upload-part-stream-match-bucket");
     let key = crate::tests::object_key("upload-part-stream-match-key");

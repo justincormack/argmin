@@ -1082,12 +1082,23 @@ each is one refactor away from a panic:
 
 ### Storage misc
 
-- [ ] Metadata command payloads are inconsistent in carrying
+- [x] Metadata command payloads are inconsistent in carrying
   `BucketWriteReservationProof`: most object mutations embed it, but
   `AppendStreamSegment`, `DeleteCompletedMultipartUpload`,
   `AdvanceCompletedMultipartUploadSequence` carry none and `AbortStreamUpload`
   only an `Option` (`metadata_command.rs:692-1100`). Add a one-line doc
   comment per command stating which admission authority covers it.
+
+  Resolution: documented the admission authority on the proofless/optional
+  metadata commands. `AppendStreamSegment` and `AbortStreamUpload` are
+  authorized by the stream session row, `DeleteCompletedMultipartUpload` by
+  exact completed-upload row identity, and
+  `AdvanceCompletedMultipartUploadSequence` by a CompleteMultipartUpload bucket
+  write reservation proof at command-build time. The sequence command itself
+  remains proofless because it does not release or own the bucket reservation,
+  but local and Unix command-build requests now carry and validate the proof,
+  including `operation_kind == "complete-multipart-upload"` and the expected
+  object target context, before allocating the completion order.
 - [ ] `ReserveObjectGenerationCommand::matches_request` (renamed from
   `ReserveObjectVersionCommand` since the review; finding applies verbatim)
   has a `generation_id` field but `matches_request` ignores it, matching on

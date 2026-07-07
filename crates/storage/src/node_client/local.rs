@@ -510,9 +510,16 @@ impl BucketMetadataNodeClient for LocalStorageNodeClient {
         pg_id: PgId,
         bucket: &BucketName,
         command_id: MetadataCommandId,
+        completion_target_context: &str,
+        bucket_write_reservation: &BucketWriteReservationProof,
     ) -> Result<(u64, MetadataCommandEnvelope), BucketSnapshotLoadError> {
         <Self as StorageNodeClient>::build_advance_completed_multipart_upload_sequence_command(
-            self, pg_id, bucket, command_id,
+            self,
+            pg_id,
+            bucket,
+            command_id,
+            completion_target_context,
+            bucket_write_reservation,
         )
     }
 
@@ -2062,7 +2069,29 @@ impl StorageNodeClient for LocalStorageNodeClient {
         pg_id: PgId,
         bucket: &BucketName,
         command_id: MetadataCommandId,
+        completion_target_context: &str,
+        bucket_write_reservation: &BucketWriteReservationProof,
     ) -> Result<(u64, MetadataCommandEnvelope), BucketSnapshotLoadError> {
+        if &bucket_write_reservation.bucket != bucket {
+            return Err(MetadataError::BucketWriteReservationConflict {
+                reservation_id: bucket_write_reservation.reservation_id.clone(),
+            }
+            .into());
+        }
+        if bucket_write_reservation.operation_kind
+            != COMPLETE_MULTIPART_UPLOAD_BUCKET_WRITE_OPERATION_KIND
+            || bucket_write_reservation.target_context.as_deref() != Some(completion_target_context)
+        {
+            return Err(MetadataError::BucketWriteReservationConflict {
+                reservation_id: bucket_write_reservation.reservation_id.clone(),
+            }
+            .into());
+        }
+        <Self as StorageNodeClient>::validate_bucket_write_reservation_proof(
+            self,
+            pg_id,
+            bucket_write_reservation,
+        )?;
         let pg = self.storage_node.get_pg(pg_id.get())?;
         let current_order = pg.completed_multipart_upload_sequence_for_bucket(bucket)?;
         let completion_order = current_order

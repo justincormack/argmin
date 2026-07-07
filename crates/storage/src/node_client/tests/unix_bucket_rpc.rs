@@ -1777,6 +1777,7 @@ fn unix_bucket_metadata_client_builds_completed_multipart_order_command() {
     let config = test_config(&tmp);
     let bucket = crate::tests::bucket_name("completed-order-rpc");
     let owner = crate::CanonicalUserId::from_principal("owner");
+    let bucket_write_reservation;
     {
         let node = SharedStorageNode::open_with_default_ec_shape(
             &config.data_dir,
@@ -1795,6 +1796,19 @@ fn unix_bucket_metadata_client_builds_completed_multipart_order_command() {
             false,
         )
         .unwrap();
+        let reservation = PgMetadataStore::acquire_durable_bucket_write_reservation(
+            &*pg,
+            &bucket,
+            "completed-order-reservation",
+            "completed-order-owner",
+            ClusterEpoch::new(1).unwrap(),
+            COMPLETE_MULTIPART_UPLOAD_BUCKET_WRITE_OPERATION_KIND,
+            1_000,
+            crate::clock::current_time_millis() + 60_000,
+            Some("object-key"),
+        )
+        .unwrap();
+        bucket_write_reservation = BucketWriteReservationProof::from(&reservation);
         pg.refresh_metadata_command_state_digest().unwrap();
     }
     private_socket_dir(config.socket_path.parent().unwrap());
@@ -1817,6 +1831,8 @@ fn unix_bucket_metadata_client_builds_completed_multipart_order_command() {
             PgId::new(0),
             &bucket,
             command_id,
+            "object-key",
+            &bucket_write_reservation,
         )
         .unwrap();
 

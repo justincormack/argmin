@@ -950,6 +950,9 @@ pub struct BucketWriteReservationProof {
     pub(crate) target_context: Option<String>,
 }
 
+pub(crate) const COMPLETE_MULTIPART_UPLOAD_BUCKET_WRITE_OPERATION_KIND: &str =
+    "complete-multipart-upload";
+
 impl From<&BucketWriteReservationRecord> for BucketWriteReservationProof {
     fn from(record: &BucketWriteReservationRecord) -> Self {
         Self {
@@ -1013,6 +1016,7 @@ impl CreateStreamUploadCommand {
     }
 }
 
+/// Authorized by the existing stream session; PutObject sessions carry their bucket write proof on the session row.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct AppendStreamSegmentCommand {
     pub(crate) bucket: BucketName,
@@ -1020,6 +1024,7 @@ pub(crate) struct AppendStreamSegmentCommand {
     pub(crate) segment: StreamUploadSegmentRecord,
 }
 
+/// Authorized by the existing stream session; the optional proof releases a PutObject stream-create reservation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct AbortStreamUploadCommand {
     pub(crate) bucket: BucketName,
@@ -1105,11 +1110,13 @@ pub(crate) struct AbortMultipartUploadCommand {
     pub(crate) bucket_write_reservation: BucketWriteReservationProof,
 }
 
+/// Authorized by exact completed-upload row identity during internal completed-MPU cleanup.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct DeleteCompletedMultipartUploadCommand {
     pub(crate) record: CompletedMultipartUploadRecord,
 }
 
+/// Authorized at build time by CompleteMultipartUpload's bucket write reservation proof.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct AdvanceCompletedMultipartUploadSequenceCommand {
     pub(crate) bucket: BucketName,
