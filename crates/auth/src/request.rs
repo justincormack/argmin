@@ -51,7 +51,7 @@ impl<'a> ExpectedSigningRegion<'a> {
 }
 
 /// Signing context needed for verifying aws-chunked streaming signatures.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone)]
 pub struct StreamingSigningContext {
     /// The derived signing key (32 bytes).
     pub signing_key: [u8; 32],
@@ -78,7 +78,7 @@ impl std::fmt::Debug for StreamingSigningContext {
 }
 
 /// Authenticated request context shared with higher layers.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone)]
 pub struct AuthContext {
     pub mode: AuthMode,
     pub access_key_id: Option<String>,

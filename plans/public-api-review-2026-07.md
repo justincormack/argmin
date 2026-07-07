@@ -1135,11 +1135,12 @@ each is one refactor away from a panic:
   is `#[cfg(test)]`), `precondition_failed` (:1674), `forbidden` (:2144),
   `error` (:2165). Mark `#[cfg(test)]` or delete in favor of `_with_ids` +
   `WireResponseIds::for_test()`.
-- [ ] auth: `StreamingSigningContext`/`AuthContext` derive `PartialEq, Eq`
+- [x] auth: `StreamingSigningContext`/`AuthContext` derive `PartialEq, Eq`
   over key material (request.rs:53, 80) — non-constant-time `==` on secrets;
-  only tests use it. Drop or gate. Also `AuthContext` allows invalid
-  anonymous/authenticated field combinations — an enum would remove the
-  `Option`s (request.rs:82-89; consumers unwrap ad hoc).
+  only tests use it. Fixed by removing equality derives from both types.
+- [ ] `AuthContext` allows invalid anonymous/authenticated field combinations;
+  an enum would remove the `Option`s (request.rs:82-89; consumers unwrap ad
+  hoc).
 - [ ] Minor idiom: `clippy::must_use_candidate` globally allowed in
   server-core while hand-annotating (the ec `#[must_use]` gap is largely
   moot since the P3 privatization added annotated accessors); infallible
