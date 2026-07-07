@@ -84,7 +84,7 @@ pub fn error_xml_with_host_id(
          <HostId>{}</HostId>\
          </Error>",
         xml_escape(code),
-        xml_escape(message),
+        xml_escape_text(message),
         xml_escape(request_id),
         xml_escape(host_id),
     )
@@ -538,6 +538,28 @@ pub fn malformed_policy_error_xml(
          </Error>",
         xml_escape_text(message),
         detail,
+        xml_escape(request_id),
+        xml_escape(host_id),
+    )
+}
+
+/// Format an S3 `NoSuchPublicAccessBlockConfiguration` error response.
+#[must_use]
+pub fn no_such_public_access_block_error_xml(
+    bucket_name: &str,
+    request_id: &str,
+    host_id: &str,
+) -> String {
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+         <Error>\
+         <Code>NoSuchPublicAccessBlockConfiguration</Code>\
+         <Message>The public access block configuration was not found</Message>\
+         <BucketName>{}</BucketName>\
+         <RequestId>{}</RequestId>\
+         <HostId>{}</HostId>\
+         </Error>",
+        xml_escape(bucket_name),
         xml_escape(request_id),
         xml_escape(host_id),
     )

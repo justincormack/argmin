@@ -346,7 +346,7 @@ fn client_error_message(err: &ServerError) -> String {
         ServerError::NoSuchCorsConfiguration { .. } => "no CORS configuration".to_string(),
         ServerError::NoSuchTagSet { .. } => "no such tag set".to_string(),
         ServerError::NoSuchPublicAccessBlockConfiguration { .. } => {
-            "no public access block configuration".to_string()
+            "The public access block configuration was not found".to_string()
         }
         ServerError::NoSuchBucketPolicy { .. } => "The bucket policy does not exist".to_string(),
         ServerError::NoSuchLifecycleConfiguration { .. } => {
@@ -736,6 +736,10 @@ impl S3Response {
                 let body =
                     xml::invalid_range_error_xml(range_requested, *total_size, request_id, host_id);
                 Self::new(416).chunked_xml_body(body)
+            }
+            ServerError::NoSuchPublicAccessBlockConfiguration { bucket } => {
+                let body = xml::no_such_public_access_block_error_xml(bucket, request_id, host_id);
+                Self::new(404).chunked_xml_body(body)
             }
             ServerError::MalformedPolicy { reason, detail } => {
                 let body =

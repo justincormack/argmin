@@ -482,6 +482,25 @@ diff-test coverage either, so their shapes have never been AWS-pinned):
    weak semantic asserts (convert opportunistically).
 5. **Public-access / anonymous error surfaces** — the `public_access_*`
    files assert codes only; these are security-relevant responses.
+   **DONE (slice 3, 2026-07-08)** — AWS probing found three divergences,
+   fixed server-side: `x-amz-bucket-region` now attaches to 403
+   AccessDenied on the region-discovery surfaces (HeadBucket,
+   ListObjects v1/v2) for existing buckets in any auth mode (probed
+   anonymous and cross-account; subresource GETs and PutBucketPolicy
+   denials omit it, also probed); the missing-PublicAccessBlock 404 got
+   AWS's body (message "The public access block configuration was not
+   found", `BucketName`, HostId); and `error_xml_with_host_id` now
+   text-escapes messages so quotes render raw like AWS (was `&quot;`).
+   bucket_anon.rs upgraded in place (nine weak asserts → full shapes,
+   incl. the paired private-403/missing-404 contract), plus new goldens
+   `test_public_access_block_crud_response_shapes` and
+   `test_block_public_policy_denial_response_shape` (principal as
+   `{any}` — the message names the requester, see §13/§14).
+   AWS-validated: full bucket_anon binary + both new goldens.
+   Remaining in this family: the authenticated cross-account denial
+   bodies are AWS principal-specific messages (§13) and stay unpinned;
+   public_access_acl/block_acl/object_lock/post_object/range files
+   still weak — convert opportunistically.
 6. **Presigned and chunked-upload error shapes** — `presigned.rs` and
    `chunked.rs` use `contains` checks on bodies; the SigV4 error family
    is only partially shaped (pilot covered two cases).

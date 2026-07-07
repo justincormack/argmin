@@ -1,5 +1,5 @@
 use s3_tests::{
-    raw_anonymous,
+    raw_anonymous, raw_anonymous_put,
     shape::{assert_shape, error_response_headers, expected_error, shape},
     unique_bucket, CTX,
 };
@@ -61,14 +61,15 @@ fn test_anon_head_bucket_private_fail() {
     s3_tests::run(async {
         let bucket = setup_private_bucket().await;
 
-        let url = format!("{}/{}", CTX.endpoint(), bucket);
-        let mut resp = agent().head(&url).call().expect("transport error");
-        let status = resp.status().as_u16();
-        let _ = resp.body_mut().read_to_string();
-        assert_eq!(
-            status, 403,
-            "expected 403 for anon HEAD on private bucket, got {}",
-            status
+        let response = raw_anonymous("HEAD", &bucket, "", None);
+        assert_shape(
+            "anonymous HeadBucket private",
+            &response,
+            &shape()
+                .status(403)
+                .headers(error_response_headers())
+                .header("x-amz-bucket-region", CTX.region())
+                .body_empty(),
         );
 
         cleanup(&bucket, &[]).await;
@@ -85,46 +86,46 @@ fn test_anon_bucket_surfaces_distinguish_private_and_nonexistent_like_aws() {
         let private_bucket = setup_private_bucket().await;
         let missing_bucket = unique_bucket();
 
-        let private_head = agent()
-            .head(&format!("{}/{}", CTX.endpoint(), private_bucket))
-            .call()
-            .expect("anonymous private HEAD transport error");
-        assert_eq!(private_head.status().as_u16(), 403);
-
-        let missing_head = agent()
-            .head(&format!("{}/{}", CTX.endpoint(), missing_bucket))
-            .call()
-            .expect("anonymous missing HEAD transport error");
-        assert_eq!(missing_head.status().as_u16(), 404);
-
-        let mut private_list = agent()
-            .get(&format!(
-                "{}/{}?list-type=2",
-                CTX.endpoint(),
-                private_bucket
-            ))
-            .call()
-            .expect("anonymous private list transport error");
-        assert_eq!(private_list.status().as_u16(), 403);
-        let private_body = private_list.body_mut().read_to_string().unwrap();
-        assert!(
-            private_body.contains("<Code>AccessDenied</Code>"),
-            "expected AccessDenied in private bucket body: {private_body}"
+        // Existing private bucket: 403 revealing the region (AWS attaches
+        // x-amz-bucket-region to denied HeadBucket/ListObjects).
+        assert_shape(
+            "anonymous HeadBucket private",
+            &raw_anonymous("HEAD", &private_bucket, "", None),
+            &shape()
+                .status(403)
+                .headers(error_response_headers())
+                .header("x-amz-bucket-region", CTX.region())
+                .body_empty(),
+        );
+        assert_shape(
+            "anonymous ListObjectsV2 private",
+            &raw_anonymous("GET", &private_bucket, "", Some("list-type=2")),
+            &shape()
+                .status(403)
+                .headers(error_response_headers())
+                .header("x-amz-bucket-region", CTX.region())
+                .body(expected_error::with_host_id(
+                    "AccessDenied",
+                    "Access Denied",
+                )),
         );
 
-        let mut missing_list = agent()
-            .get(&format!(
-                "{}/{}?list-type=2",
-                CTX.endpoint(),
-                missing_bucket
-            ))
-            .call()
-            .expect("anonymous missing list transport error");
-        assert_eq!(missing_list.status().as_u16(), 404);
-        let missing_body = missing_list.body_mut().read_to_string().unwrap();
-        assert!(
-            missing_body.contains("<Code>NoSuchBucket</Code>"),
-            "expected NoSuchBucket in missing bucket body: {missing_body}"
+        // Missing bucket: 404 with no region header.
+        assert_shape(
+            "anonymous HeadBucket missing",
+            &raw_anonymous("HEAD", &missing_bucket, "", None),
+            &shape()
+                .status(404)
+                .headers(error_response_headers())
+                .body_empty(),
+        );
+        assert_shape(
+            "anonymous ListObjectsV2 missing",
+            &raw_anonymous("GET", &missing_bucket, "", Some("list-type=2")),
+            &shape()
+                .status(404)
+                .headers(error_response_headers())
+                .body(expected_error::no_such_bucket(&missing_bucket)),
         );
 
         cleanup(&private_bucket, &[]).await;
@@ -136,19 +137,17 @@ fn test_anon_list_objects_v1_private_bucket_fail() {
     s3_tests::run(async {
         let bucket = setup_private_bucket().await;
 
-        let url = format!("{}/{}", CTX.endpoint(), bucket);
-        let mut resp = agent().get(&url).call().expect("transport error");
-        let status = resp.status().as_u16();
-        let body = resp.body_mut().read_to_string().unwrap();
-        assert_eq!(
-            status, 403,
-            "expected 403 for anon list on private bucket, got {}",
-            status
-        );
-        assert!(
-            body.contains("<Code>AccessDenied</Code>"),
-            "expected AccessDenied in body: {}",
-            body
+        assert_shape(
+            "anonymous ListObjectsV1 private",
+            &raw_anonymous("GET", &bucket, "", None),
+            &shape()
+                .status(403)
+                .headers(error_response_headers())
+                .header("x-amz-bucket-region", CTX.region())
+                .body(expected_error::with_host_id(
+                    "AccessDenied",
+                    "Access Denied",
+                )),
         );
 
         cleanup(&bucket, &[]).await;
@@ -160,19 +159,13 @@ fn test_anon_list_objects_v1_nonexistent_bucket_returns_404() {
     s3_tests::run(async {
         let bucket = unique_bucket();
 
-        let url = format!("{}/{}", CTX.endpoint(), bucket);
-        let mut resp = agent().get(&url).call().expect("transport error");
-        let status = resp.status().as_u16();
-        let body = resp.body_mut().read_to_string().unwrap();
-        assert_eq!(
-            status, 404,
-            "expected 404 for anon list on nonexistent bucket, got {}",
-            status
-        );
-        assert!(
-            body.contains("<Code>NoSuchBucket</Code>"),
-            "expected NoSuchBucket in body: {}",
-            body
+        assert_shape(
+            "anonymous ListObjectsV1 missing",
+            &raw_anonymous("GET", &bucket, "", None),
+            &shape()
+                .status(404)
+                .headers(error_response_headers())
+                .body(expected_error::no_such_bucket(&bucket)),
         );
     });
 }
@@ -183,19 +176,17 @@ fn test_anon_list_objects_v2_private_bucket_fail() {
     s3_tests::run(async {
         let bucket = setup_private_bucket().await;
 
-        let url = format!("{}/{}?list-type=2", CTX.endpoint(), bucket);
-        let mut resp = agent().get(&url).call().expect("transport error");
-        let status = resp.status().as_u16();
-        let body = resp.body_mut().read_to_string().unwrap();
-        assert_eq!(
-            status, 403,
-            "expected 403 for anon listv2 on private bucket, got {}",
-            status
-        );
-        assert!(
-            body.contains("<Code>AccessDenied</Code>"),
-            "expected AccessDenied in body: {}",
-            body
+        assert_shape(
+            "anonymous ListObjectsV2 private",
+            &raw_anonymous("GET", &bucket, "", Some("list-type=2")),
+            &shape()
+                .status(403)
+                .headers(error_response_headers())
+                .header("x-amz-bucket-region", CTX.region())
+                .body(expected_error::with_host_id(
+                    "AccessDenied",
+                    "Access Denied",
+                )),
         );
 
         cleanup(&bucket, &[]).await;
@@ -207,19 +198,13 @@ fn test_anon_list_objects_v2_nonexistent_bucket_returns_404() {
     s3_tests::run(async {
         let bucket = unique_bucket();
 
-        let url = format!("{}/{}?list-type=2", CTX.endpoint(), bucket);
-        let mut resp = agent().get(&url).call().expect("transport error");
-        let status = resp.status().as_u16();
-        let body = resp.body_mut().read_to_string().unwrap();
-        assert_eq!(
-            status, 404,
-            "expected 404 for anon listv2 on nonexistent bucket, got {}",
-            status
-        );
-        assert!(
-            body.contains("<Code>NoSuchBucket</Code>"),
-            "expected NoSuchBucket in body: {}",
-            body
+        assert_shape(
+            "anonymous ListObjectsV2 missing",
+            &raw_anonymous("GET", &bucket, "", Some("list-type=2")),
+            &shape()
+                .status(404)
+                .headers(error_response_headers())
+                .body(expected_error::no_such_bucket(&bucket)),
         );
     });
 }
@@ -234,22 +219,14 @@ fn test_object_anon_put() {
 
         s3_tests::put_object_retrying_operation_aborted(client, &bucket, "foo", Vec::new()).await;
 
-        let url = format!("{}/{}/foo", CTX.endpoint(), bucket);
-        let mut resp = agent()
-            .put(&url)
-            .send(b"foo" as &[u8])
-            .expect("transport error");
-        let status = resp.status().as_u16();
-        let body = resp.body_mut().read_to_string().unwrap();
-        assert_eq!(
-            status, 403,
-            "expected 403 for anon PUT on private bucket, got {}",
-            status
-        );
-        assert!(
-            body.contains("<Code>AccessDenied</Code>"),
-            "expected AccessDenied in body: {}",
-            body
+        // Object-scoped denial: no x-amz-bucket-region (AWS attaches it only
+        // to denied HeadBucket/ListObjects).
+        assert_shape(
+            "anonymous PutObject private",
+            &raw_anonymous_put(&bucket, "foo", b"foo"),
+            &shape().status(403).headers(error_response_headers()).body(
+                expected_error::with_host_id("AccessDenied", "Access Denied"),
+            ),
         );
 
         cleanup(&bucket, &["foo"]).await;

@@ -1395,13 +1395,46 @@ pub fn raw_bucket(method: &str, bucket: &str, query: Option<&str>) -> RawRespons
 pub fn raw_anonymous(method: &str, bucket: &str, key: &str, query: Option<&str>) -> RawResponse {
     let url = raw_request_url(bucket, key, query);
     let agent = crate::test_agent();
-    let builder = match method {
-        "GET" => agent.get(&url),
-        "HEAD" => agent.head(&url),
-        "DELETE" => agent.delete(&url),
+    let mut response = match method {
+        "GET" => agent.get(&url).call(),
+        "HEAD" => agent.head(&url).call(),
+        "DELETE" => agent.delete(&url).call(),
         other => panic!("raw_anonymous does not support method {other}"),
+    }
+    .expect("anonymous request transport error");
+    let headers = response
+        .headers()
+        .iter()
+        .map(|(name, value)| {
+            (
+                name.as_str().to_string(),
+                value
+                    .to_str()
+                    .expect("response header is valid utf-8")
+                    .to_string(),
+            )
+        })
+        .collect();
+    let (body, body_read_error) = match response.body_mut().read_to_string() {
+        Ok(body) => (body, None),
+        Err(err) => (String::new(), Some(err.to_string())),
     };
-    let mut response = builder.call().expect("anonymous request transport error");
+    RawResponse {
+        status: response.status().as_u16(),
+        headers,
+        body,
+        body_read_error,
+    }
+}
+
+/// Send an unauthenticated raw PUT with a body against the shared test
+/// endpoint.
+pub fn raw_anonymous_put(bucket: &str, key: &str, body: &[u8]) -> RawResponse {
+    let url = raw_request_url(bucket, key, None);
+    let mut response = crate::test_agent()
+        .put(&url)
+        .send(body)
+        .expect("anonymous PUT transport error");
     let headers = response
         .headers()
         .iter()

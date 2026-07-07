@@ -1,6 +1,6 @@
 use s3_tests::{
     content_md5_header, raw_bucket, send_signed_request,
-    shape::{assert_shape, id_headers, shape},
+    shape::{assert_shape, error_response_headers, expected_error, id_headers, shape},
     unique_bucket, CTX,
 };
 
@@ -219,6 +219,56 @@ fn test_get_public_access_block_response_shape() {
                      <RestrictPublicBuckets>false</RestrictPublicBuckets>\
                      </PublicAccessBlockConfiguration>",
             ),
+        );
+
+        cleanup(&bucket).await;
+    });
+}
+
+/// Full response shapes for the PublicAccessBlock CRUD cycle: 200 empty ack
+/// for Put, 204 for Delete, and the 404
+/// `NoSuchPublicAccessBlockConfiguration` body when no configuration exists.
+#[test]
+fn test_public_access_block_crud_response_shapes() {
+    s3_tests::run(async {
+        let bucket = unique_bucket();
+        s3_tests::create_bucket(CTX.client(), &bucket)
+            .await
+            .unwrap();
+
+        let pab_xml = "<PublicAccessBlockConfiguration \
+             xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
+             <BlockPublicAcls>true</BlockPublicAcls>\
+             <IgnorePublicAcls>true</IgnorePublicAcls>\
+             <BlockPublicPolicy>true</BlockPublicPolicy>\
+             <RestrictPublicBuckets>true</RestrictPublicBuckets>\
+             </PublicAccessBlockConfiguration>";
+        let md5 = content_md5_header(pab_xml.as_bytes());
+        let put = send_signed_request(
+            "PUT",
+            &format!("{}/{}?publicAccessBlock=", CTX.endpoint(), bucket),
+            pab_xml.as_bytes(),
+            [(md5.0.as_str(), md5.1.as_str())],
+        );
+        assert_shape(
+            "PutPublicAccessBlock",
+            &put,
+            &shape().status(200).headers(id_headers()).body_empty(),
+        );
+
+        assert_shape(
+            "DeletePublicAccessBlock",
+            &raw_bucket("DELETE", &bucket, Some("publicAccessBlock=")),
+            &shape().status(204).headers(id_headers()).body_empty(),
+        );
+
+        assert_shape(
+            "GetPublicAccessBlock missing configuration",
+            &raw_bucket("GET", &bucket, Some("publicAccessBlock=")),
+            &shape()
+                .status(404)
+                .headers(error_response_headers())
+                .body(expected_error::no_such_public_access_block(&bucket)),
         );
 
         cleanup(&bucket).await;

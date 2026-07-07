@@ -839,6 +839,10 @@ pub mod expected_error {
         xml::no_such_bucket_policy_error_xml(bucket, REQUEST_ID, HOST_ID)
     }
 
+    pub fn no_such_public_access_block(bucket: &str) -> String {
+        xml::no_such_public_access_block_error_xml(bucket, REQUEST_ID, HOST_ID)
+    }
+
     /// `MalformedPolicy` for parse-level failures (no `<Detail>`). Brace
     /// characters in the message are escaped for the template grammar.
     pub fn malformed_policy(message: &str) -> String {
@@ -1416,6 +1420,14 @@ mod tests {
              the upload may have been aborted or completed.</Message>\
              <UploadId>upload-1</UploadId><RequestId>{request_id}</RequestId>\
              <HostId>{host_id}</HostId></Error>"
+        );
+        assert_eq!(
+            expected_error::no_such_public_access_block("bucket-1"),
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error>\
+             <Code>NoSuchPublicAccessBlockConfiguration</Code>\
+             <Message>The public access block configuration was not found</Message>\
+             <BucketName>bucket-1</BucketName>\
+             <RequestId>{request_id}</RequestId><HostId>{host_id}</HostId></Error>"
         );
         assert_eq!(
             expected_error::malformed_policy(

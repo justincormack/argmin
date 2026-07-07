@@ -928,6 +928,16 @@ impl HttpFrontend {
         } else {
             None
         };
+        // AWS also reveals the bucket region on AccessDenied for the region
+        // discovery surfaces — HeadBucket and ListObjects — in any auth mode
+        // (probed anonymous and cross-account); bucket subresources and
+        // other bucket-scoped writes omit it.
+        let denied_bucket_region_bucket = match &operation {
+            S3Operation::HeadBucket { bucket }
+            | S3Operation::ListObjectsV1 { bucket }
+            | S3Operation::ListObjectsV2 { bucket } => Some(bucket.clone()),
+            _ => None,
+        };
         let defer_region_check = self.should_defer_region_check(&operation);
         let auth = {
             observability::trace_scope!(
@@ -969,6 +979,15 @@ impl HttpFrontend {
             })
             // A metadata lookup failure only suppresses the optional header;
             // the auth error response itself must still be returned.
+            .is_some_and(|bucket| self.coordinator.bucket_exists(bucket).unwrap_or(false));
+        let add_bucket_region_for_denied_discovery = denied_bucket_region_bucket
+            .as_ref()
+            .filter(|_| {
+                matches!(
+                    &result,
+                    Err(err) if err.http_status() == 403 && err.s3_error_code() == "AccessDenied"
+                )
+            })
             .is_some_and(|bucket| self.coordinator.bucket_exists(bucket).unwrap_or(false));
         let mut resp = {
             observability::trace_scope!(
@@ -1012,7 +1031,7 @@ impl HttpFrontend {
                 }
             }
         };
-        if add_bucket_region_for_token_error
+        if (add_bucket_region_for_token_error || add_bucket_region_for_denied_discovery)
             && !resp
                 .headers
                 .iter()

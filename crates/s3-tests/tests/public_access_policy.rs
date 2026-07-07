@@ -11,6 +11,8 @@ use aws_sdk_s3::types::PublicAccessBlockConfiguration;
 use aws_sdk_s3::Client;
 use s3_tests::{
     assert_s3_err_code, err_status, retrying_operation_aborted, retrying_operation_aborted_result,
+    send_signed_request,
+    shape::{assert_shape, error_response_headers, shape},
     unique_bucket, SendRetryingOperationAborted, CTX,
 };
 
@@ -332,6 +334,58 @@ fn test_get_public_block_deny_bucket_policy() {
         assert_s3_err_code(&denied, "AccessDenied");
 
         delete_bucket_policy_retrying_operation_aborted(client, &bucket).await;
+        cleanup(&bucket).await;
+    });
+}
+
+/// Full error shape for a public policy rejected by BlockPublicPolicy. The
+/// message names the requester, so the principal is a shape-only `{any}`:
+/// AWS renders an IAM user ARN, other deployments their own principal form.
+#[test]
+fn test_block_public_policy_denial_response_shape() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
+
+        let pab = PublicAccessBlockConfiguration::builder()
+            .block_public_acls(false)
+            .ignore_public_acls(false)
+            .block_public_policy(true)
+            .restrict_public_buckets(false)
+            .build();
+        put_public_access_block_retrying_operation_aborted(client, &bucket, pab).await;
+
+        let policy = format!(
+            "{{\"Version\":\"2012-10-17\",\"Statement\":[{{\"Effect\":\"Allow\",\
+             \"Principal\":\"*\",\"Action\":\"s3:GetObject\",\
+             \"Resource\":\"arn:aws:s3:::{bucket}/*\"}}]}}"
+        );
+        let response = send_signed_request(
+            "PUT",
+            &format!("{}/{}?policy=", CTX.endpoint(), bucket),
+            policy.as_bytes(),
+            std::iter::empty::<(&str, &str)>(),
+        );
+        assert_shape(
+            "PutBucketPolicy public with BlockPublicPolicy",
+            &response,
+            &shape()
+                .status(403)
+                .headers(error_response_headers())
+                .sub("bucket", &bucket)
+                .body(
+                    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+                     <Error><Code>AccessDenied</Code>\
+                     <Message>User: {any} is not authorized to perform: \
+                     s3:PutBucketPolicy on resource: \"arn:aws:s3:::{bucket}\" \
+                     because public policies are prevented by the \
+                     BlockPublicPolicy setting in S3 Block Public Access.</Message>\
+                     <RequestId>{request_id}</RequestId>\
+                     <HostId>{host_id}</HostId></Error>",
+                ),
+        );
+
         cleanup(&bucket).await;
     });
 }
