@@ -1,4 +1,5 @@
 use super::*;
+use crate::BucketAclSummary;
 
 impl LocalStorageNodeClient {
     pub(crate) fn new(node_id: NodeId, storage_node: Arc<SharedStorageNode>) -> Self {
@@ -591,17 +592,10 @@ impl BucketMetadataNodeClient for LocalStorageNodeClient {
         bucket: &BucketName,
         command: &PutBucketAclCommand,
         acl_grants: &AclGrants,
-        public_read: bool,
-        public_write: bool,
+        summary: BucketAclSummary,
     ) -> Result<bool, BucketSnapshotLoadError> {
         <Self as StorageNodeClient>::pending_put_bucket_acl_command_matches_current(
-            self,
-            pg_id,
-            bucket,
-            command,
-            acl_grants,
-            public_read,
-            public_write,
+            self, pg_id, bucket, command, acl_grants, summary,
         )
     }
 
@@ -611,17 +605,10 @@ impl BucketMetadataNodeClient for LocalStorageNodeClient {
         bucket: &BucketName,
         command_id: MetadataCommandId,
         acl_grants: &AclGrants,
-        public_read: bool,
-        public_write: bool,
+        summary: BucketAclSummary,
     ) -> Result<MetadataCommandEnvelope, BucketSnapshotLoadError> {
         <Self as StorageNodeClient>::build_put_bucket_acl_command(
-            self,
-            pg_id,
-            bucket,
-            command_id,
-            acl_grants,
-            public_read,
-            public_write,
+            self, pg_id, bucket, command_id, acl_grants, summary,
         )
     }
 
@@ -2150,8 +2137,7 @@ impl StorageNodeClient for LocalStorageNodeClient {
         bucket: &BucketName,
         command: &PutBucketAclCommand,
         acl_grants: &AclGrants,
-        public_read: bool,
-        public_write: bool,
+        summary: BucketAclSummary,
     ) -> Result<bool, BucketSnapshotLoadError> {
         let pg = self.storage_node.get_pg(pg_id.get())?;
         let current = PgMetadataStore::head_bucket_record_raw(&*pg, bucket)?;
@@ -2159,8 +2145,7 @@ impl StorageNodeClient for LocalStorageNodeClient {
             Ok(PutBucketAclCommand::from_bucket(
                 record.with_execution_generation(command.bucket.bucket_execution_generation),
                 acl_grants.clone(),
-                public_read,
-                public_write,
+                summary,
             )
             .bucket)
         })
@@ -2172,8 +2157,7 @@ impl StorageNodeClient for LocalStorageNodeClient {
         bucket: &BucketName,
         command_id: MetadataCommandId,
         acl_grants: &AclGrants,
-        public_read: bool,
-        public_write: bool,
+        summary: BucketAclSummary,
     ) -> Result<MetadataCommandEnvelope, BucketSnapshotLoadError> {
         let pg = self.storage_node.get_pg(pg_id.get())?;
         let current = PgMetadataStore::head_bucket_record_raw(&*pg, bucket)?;
@@ -2183,8 +2167,7 @@ impl StorageNodeClient for LocalStorageNodeClient {
             MetadataCommandPayload::PutBucketAcl(PutBucketAclCommand::from_bucket(
                 current.with_execution_generation(bucket_execution_generation),
                 acl_grants.clone(),
-                public_read,
-                public_write,
+                summary,
             )),
         ))
     }

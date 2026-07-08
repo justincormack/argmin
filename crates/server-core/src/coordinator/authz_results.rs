@@ -12,9 +12,9 @@ use crate::sse::SseCustomerWriteContext;
 use s3_types::{AclGrants, BucketVersioningState, CanonicalUserId, VersionId};
 use storage::BucketObjectOwnership;
 use storage::{
-    AuthorizedMultipartUploadRecord, BucketEncryptionConfig, BucketName, BucketObjectLockConfig,
-    BucketOwnershipControls, EffectiveBucketEncryptionConfig, ObjectKey, ObjectLockState,
-    ObjectReadSnapshot, OwnerIdentity, PublicAccessBlockConfig, UploadId,
+    AuthorizedMultipartUploadRecord, BucketAclSummary, BucketEncryptionConfig, BucketName,
+    BucketObjectLockConfig, BucketOwnershipControls, EffectiveBucketEncryptionConfig, ObjectKey,
+    ObjectLockState, ObjectReadSnapshot, OwnerIdentity, PublicAccessBlockConfig, UploadId,
 };
 
 #[derive(Debug)]
@@ -208,8 +208,7 @@ pub(super) struct AuthorizedGetBucketAcl {
 pub(super) struct AuthorizedPutBucketAcl {
     pub(super) bucket: BucketName,
     pub(super) acl_grants: AclGrants,
-    pub(super) public_read: bool,
-    pub(super) public_write: bool,
+    pub(super) summary: BucketAclSummary,
 }
 
 pub(super) struct AuthorizedObjectRead {

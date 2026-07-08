@@ -1,5 +1,6 @@
 use super::*;
 use crate::metadata_command::DeleteFinalizedBucketCommand;
+use crate::BucketAclSummary;
 
 fn apply_delete_finalized_bucket_command_to_pg(
     pg: &crate::PgStore,
@@ -1878,8 +1879,10 @@ fn bucket_update_fails_closed_on_divergent_same_index_after_partial_apply() {
                                     .unwrap(),
                             ),
                             crate::AclGrants::default(),
-                            false,
-                            false,
+                            BucketAclSummary {
+                                public_read: false,
+                                public_write: false,
+                            },
                         )),
                     );
                     node_pg

@@ -6922,8 +6922,7 @@ impl super::StorageCluster {
         &self,
         bucket: &BucketName,
         acl_grants: &AclGrants,
-        public_read: bool,
-        public_write: bool,
+        summary: BucketAclSummary,
     ) -> Result<BucketInfo, BucketSnapshotLoadError> {
         let pg_id = PgId::new(self.bucket_metadata_pg_id(bucket));
         let primary_store = self
@@ -6957,17 +6956,12 @@ impl super::StorageCluster {
                 match command.payload() {
                     MetadataCommandPayload::PutBucketAcl(acl) if acl.bucket_name() == bucket => {
                         let same_request = acl.bucket.acl_grants == *acl_grants
-                            && acl.bucket.public_read == public_read
-                            && acl.bucket.public_write == public_write;
+                            && acl.bucket.public_read == summary.public_read
+                            && acl.bucket.public_write == summary.public_write;
                         if !primary_store
                             .bucket_metadata_client()
                             .pending_put_bucket_acl_command_matches_current(
-                                pg_id,
-                                bucket,
-                                acl,
-                                acl_grants,
-                                public_read,
-                                public_write,
+                                pg_id, bucket, acl, acl_grants, summary,
                             )?
                         {
                             if same_request {
@@ -7015,14 +7009,7 @@ impl super::StorageCluster {
                 };
                 let command = primary_store
                     .bucket_metadata_client()
-                    .build_put_bucket_acl_command(
-                        pg_id,
-                        bucket,
-                        command_id,
-                        acl_grants,
-                        public_read,
-                        public_write,
-                    )?;
+                    .build_put_bucket_acl_command(pg_id, bucket, command_id, acl_grants, summary)?;
                 if !self.try_set_bucket_control_pending_command_or_retry_with_work_budget(
                     pg_id,
                     bucket,

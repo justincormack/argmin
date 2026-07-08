@@ -7171,8 +7171,7 @@ impl StorageNodeConnectionHandler {
             (
                 StorageRpcBucketMetadataControlMutation::Acl {
                     acl_grants,
-                    public_read,
-                    public_write,
+                    summary,
                 },
                 MetadataCommandPayload::PutBucketAcl(command),
             ) => BucketMetadataNodeClient::pending_put_bucket_acl_command_matches_current(
@@ -7181,8 +7180,7 @@ impl StorageNodeConnectionHandler {
                 &request.bucket.bucket,
                 command,
                 acl_grants,
-                *public_read,
-                *public_write,
+                *summary,
             ),
             (
                 StorageRpcBucketMetadataControlMutation::Property(mutation),
@@ -7242,16 +7240,14 @@ impl StorageNodeConnectionHandler {
             }
             StorageRpcBucketMetadataControlMutation::Acl {
                 acl_grants,
-                public_read,
-                public_write,
+                summary,
             } => BucketMetadataNodeClient::build_put_bucket_acl_command(
                 &local_client,
                 request.bucket.pg_id,
                 &request.bucket.bucket,
                 request.command_id,
                 acl_grants,
-                *public_read,
-                *public_write,
+                *summary,
             ),
             StorageRpcBucketMetadataControlMutation::Property(mutation) => {
                 BucketMetadataNodeClient::build_put_bucket_property_command(
@@ -11576,6 +11572,7 @@ fn canonicalize_existing_or_parent(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::BucketAclSummary;
     use std::io::Write;
     use std::os::unix::net::UnixStream;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -16910,8 +16907,10 @@ mod tests {
             MetadataCommandPayload::PutBucketAcl(PutBucketAclCommand::from_bucket(
                 initial.clone().with_execution_generation(2),
                 crate::AclGrants::default(),
-                true,
-                false,
+                BucketAclSummary {
+                    public_read: true,
+                    public_write: false,
+                },
             )),
         );
         pg.apply_metadata_command_and_record(7, &newer).unwrap();
@@ -16926,8 +16925,10 @@ mod tests {
             MetadataCommandPayload::PutBucketAcl(PutBucketAclCommand::from_bucket(
                 initial.with_execution_generation(1),
                 crate::AclGrants::default(),
-                false,
-                true,
+                BucketAclSummary {
+                    public_read: false,
+                    public_write: true,
+                },
             )),
         );
         let socket_path = config.socket_path.clone();

@@ -15,7 +15,7 @@ use crate::{
         ScavengerShardRow,
     },
     types::{
-        AbortMultipartUploadCleanup, BucketDeleteAttemptOutcomeKind,
+        AbortMultipartUploadCleanup, BucketAclSummary, BucketDeleteAttemptOutcomeKind,
         BucketDeleteAttemptOutcomeRecord, BucketDeleteAttemptPhase,
         BucketDeleteFinalizeClaimRecord, BucketDeleteFinalizeRoot, BucketEncryptionConfig,
         BucketFastPathIdentity, BucketInfo, BucketObjectOwnership, BucketOwnershipControls,
@@ -2503,8 +2503,7 @@ pub(crate) enum StorageRpcBucketMetadataControlMutation {
     Versioning(BucketVersioningState),
     Acl {
         acl_grants: AclGrants,
-        public_read: bool,
-        public_write: bool,
+        summary: BucketAclSummary,
     },
     Property(BucketPropertyMutation),
     Subresource(BucketSubresourceMutation),
@@ -14600,8 +14599,10 @@ impl<'a> StorageRpcDecoder<'a> {
             )),
             1 => Ok(StorageRpcBucketMetadataControlMutation::Acl {
                 acl_grants: self.read_acl_grants()?,
-                public_read: self.read_bool()?,
-                public_write: self.read_bool()?,
+                summary: BucketAclSummary {
+                    public_read: self.read_bool()?,
+                    public_write: self.read_bool()?,
+                },
             }),
             2 => Ok(StorageRpcBucketMetadataControlMutation::Property(
                 self.read_bucket_property_mutation()?,
@@ -15526,13 +15527,12 @@ fn put_bucket_metadata_control_mutation(
         }
         StorageRpcBucketMetadataControlMutation::Acl {
             acl_grants,
-            public_read,
-            public_write,
+            summary,
         } => {
             put_u8(out, 1);
             put_string(out, &acl_grants.serialized());
-            put_bool(out, *public_read);
-            put_bool(out, *public_write);
+            put_bool(out, summary.public_read);
+            put_bool(out, summary.public_write);
         }
         StorageRpcBucketMetadataControlMutation::Property(mutation) => {
             put_u8(out, 2);

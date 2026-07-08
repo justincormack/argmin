@@ -2048,14 +2048,13 @@ impl UnixStorageNodeClient {
                 MetadataCommandPayload::PutBucketAcl(acl),
                 StorageRpcBucketMetadataControlMutation::Acl {
                     acl_grants,
-                    public_read,
-                    public_write,
+                    summary,
                 },
             ) => {
                 acl.bucket.name == *bucket
                     && acl.bucket.acl_grants == *acl_grants
-                    && acl.bucket.public_read == *public_read
-                    && acl.bucket.public_write == *public_write
+                    && acl.bucket.public_read == summary.public_read
+                    && acl.bucket.public_write == summary.public_write
             }
             (
                 MetadataCommandPayload::PutBucketProperty(property),

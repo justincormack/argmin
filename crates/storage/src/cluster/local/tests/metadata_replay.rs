@@ -1,4 +1,5 @@
 use super::*;
+use crate::BucketAclSummary;
 
 #[test]
 fn opens_distinct_local_node_stores_with_static_epoch() {
@@ -658,8 +659,10 @@ fn bucket_acl_rehydration_preserves_completed_multipart_sequence_after_reopen() 
             MetadataCommandPayload::PutBucketAcl(PutBucketAclCommand::from_bucket(
                 current.with_execution_generation(target_generation),
                 acl_grants.clone(),
-                true,
-                false,
+                BucketAclSummary {
+                    public_read: true,
+                    public_write: false,
+                },
             )),
         );
         primary_pg
@@ -671,7 +674,14 @@ fn bucket_acl_rehydration_preserves_completed_multipart_sequence_after_reopen() 
     let map = Arc::new(LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1], ec_shape).unwrap());
     let cluster = crate::StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
     let info = cluster
-        .put_bucket_acl_and_load_info(&bucket, &acl_grants, true, false)
+        .put_bucket_acl_and_load_info(
+            &bucket,
+            &acl_grants,
+            BucketAclSummary {
+                public_read: true,
+                public_write: false,
+            },
+        )
         .unwrap();
     assert!(info.public_read);
     assert!(!info.public_write);
@@ -1526,8 +1536,10 @@ fn local_cluster_reopen_converges_inflight_primary_pending_before_snapshots() {
                         .unwrap(),
                 ),
                 acl_grants,
-                true,
-                false,
+                BucketAclSummary {
+                    public_read: true,
+                    public_write: false,
+                },
             )),
         );
         primary_pg
@@ -1630,8 +1642,10 @@ fn local_cluster_reopen_converges_primary_terminal_pending_before_slot_cleanup()
                             .unwrap(),
                     ),
                     acl_grants,
-                    true,
-                    false,
+                    BucketAclSummary {
+                        public_read: true,
+                        public_write: false,
+                    },
                 )),
             );
             primary_pg

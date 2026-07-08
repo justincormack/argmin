@@ -1952,6 +1952,13 @@ impl OwnerIdentity {
     }
 }
 
+/// Denormalized public ACL summary stored alongside bucket ACL grants.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BucketAclSummary {
+    pub public_read: bool,
+    pub public_write: bool,
+}
+
 /// A live object record (not a delete marker).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LiveObjectRecord {

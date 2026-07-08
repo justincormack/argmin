@@ -1289,8 +1289,10 @@ impl Coordinator {
         Ok(AuthorizedPutBucketAcl {
             bucket: req.bucket.name_typed().clone(),
             acl_grants,
-            public_read,
-            public_write,
+            summary: storage::BucketAclSummary {
+                public_read,
+                public_write,
+            },
         })
     }
 }

@@ -3138,8 +3138,7 @@ impl PgStore {
         &self,
         name: &BucketName,
         acl_grants: &AclGrants,
-        public_read: bool,
-        public_write: bool,
+        summary: BucketAclSummary,
         generation: BucketExecutionGeneration,
     ) -> Result<(), MetadataError> {
         let (current_acl_grants, current_public_read, current_public_write, current_generation): (
@@ -3184,8 +3183,8 @@ impl PgStore {
         if let BucketExecutionGeneration::Explicit(explicit) = generation {
             if current_generation == explicit {
                 if current_acl_grants == *acl_grants
-                    && current_public_read == public_read
-                    && current_public_write == public_write
+                    && current_public_read == summary.public_read
+                    && current_public_write == summary.public_write
                 {
                     return Ok(());
                 }
@@ -3226,11 +3225,11 @@ impl PgStore {
                          public_read = ?2, \
                          public_write = ?3, \
                          bucket_execution_generation = ?4 \
-                     WHERE name = ?5",
+                    WHERE name = ?5",
                     params![
                         acl_grants.serialized(),
-                        i32::from(public_read),
-                        i32::from(public_write),
+                        i32::from(summary.public_read),
+                        i32::from(summary.public_write),
                         generation as i64,
                         name.as_str()
                     ],
@@ -6268,14 +6267,12 @@ impl PgMetadataStore for PgStore {
         &self,
         name: &BucketName,
         acl_grants: &AclGrants,
-        public_read: bool,
-        public_write: bool,
+        summary: BucketAclSummary,
     ) -> Result<(), MetadataError> {
         self.put_bucket_acl_inner(
             name,
             acl_grants,
-            public_read,
-            public_write,
+            summary,
             BucketExecutionGeneration::Allocate,
         )
     }

@@ -1944,8 +1944,10 @@ fn unix_bucket_metadata_client_routes_bucket_control_operations() {
         &bucket,
         command_id(2),
         &crate::AclGrants::default(),
-        true,
-        false,
+        crate::BucketAclSummary {
+            public_read: true,
+            public_write: false,
+        },
     )
     .unwrap();
     match acl.payload() {

@@ -10,8 +10,8 @@ use crate::metadata_command::{
 };
 #[cfg(test)]
 use crate::{
-    BucketEncryptionConfig, BucketObjectLockConfig, BucketOwnershipControls, CreateBucketConfig,
-    PublicAccessBlockConfig, PutBucketSubresource,
+    BucketAclSummary, BucketEncryptionConfig, BucketObjectLockConfig, BucketOwnershipControls,
+    CreateBucketConfig, PublicAccessBlockConfig, PutBucketSubresource,
 };
 use crate::{BucketFastPathIdentity, BucketInfo};
 
@@ -187,17 +187,10 @@ impl SharedStorageNode {
         &self,
         bucket: &BucketName,
         acl_grants: &AclGrants,
-        public_read: bool,
-        public_write: bool,
+        summary: BucketAclSummary,
     ) -> Result<BucketInfo, BucketSnapshotLoadError> {
         self.mutate_bucket_and_load_info(bucket, |bucket_pg, bucket| {
-            PgMetadataStore::put_bucket_acl(
-                bucket_pg,
-                bucket,
-                acl_grants,
-                public_read,
-                public_write,
-            )
+            PgMetadataStore::put_bucket_acl(bucket_pg, bucket, acl_grants, summary)
         })
     }
 

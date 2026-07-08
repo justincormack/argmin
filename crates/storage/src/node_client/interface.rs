@@ -1,4 +1,5 @@
 use super::*;
+use crate::BucketAclSummary;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum MarkBucketDeletingCommandBuild {
@@ -93,8 +94,7 @@ pub(crate) trait BucketMetadataNodeClient: Send + Sync {
         bucket: &BucketName,
         command: &PutBucketAclCommand,
         acl_grants: &AclGrants,
-        public_read: bool,
-        public_write: bool,
+        summary: BucketAclSummary,
     ) -> Result<bool, BucketSnapshotLoadError>;
 
     fn build_put_bucket_acl_command(
@@ -103,8 +103,7 @@ pub(crate) trait BucketMetadataNodeClient: Send + Sync {
         bucket: &BucketName,
         command_id: MetadataCommandId,
         acl_grants: &AclGrants,
-        public_read: bool,
-        public_write: bool,
+        summary: BucketAclSummary,
     ) -> Result<MetadataCommandEnvelope, BucketSnapshotLoadError>;
 
     fn pending_put_bucket_property_command_matches_current(
@@ -1512,8 +1511,7 @@ pub(crate) trait StorageNodeClient:
         bucket: &BucketName,
         command: &PutBucketAclCommand,
         acl_grants: &AclGrants,
-        public_read: bool,
-        public_write: bool,
+        summary: BucketAclSummary,
     ) -> Result<bool, BucketSnapshotLoadError>;
 
     fn build_put_bucket_acl_command(
@@ -1522,8 +1520,7 @@ pub(crate) trait StorageNodeClient:
         bucket: &BucketName,
         command_id: MetadataCommandId,
         acl_grants: &AclGrants,
-        public_read: bool,
-        public_write: bool,
+        summary: BucketAclSummary,
     ) -> Result<MetadataCommandEnvelope, BucketSnapshotLoadError>;
 
     fn pending_put_bucket_property_command_matches_current(

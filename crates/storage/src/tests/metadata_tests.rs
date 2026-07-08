@@ -1181,7 +1181,14 @@ fn file_bucket_metadata_config_roundtrip() {
     );
 
     store
-        .put_bucket_acl(&bucket_name("bucket"), &AclGrants::default(), true, false)
+        .put_bucket_acl(
+            &bucket_name("bucket"),
+            &AclGrants::default(),
+            BucketAclSummary {
+                public_read: true,
+                public_write: false,
+            },
+        )
         .unwrap();
     assert!(
         store
@@ -1190,7 +1197,14 @@ fn file_bucket_metadata_config_roundtrip() {
             .public_read
     );
     store
-        .put_bucket_acl(&bucket_name("bucket"), &AclGrants::default(), false, false)
+        .put_bucket_acl(
+            &bucket_name("bucket"),
+            &AclGrants::default(),
+            BucketAclSummary {
+                public_read: false,
+                public_write: false,
+            },
+        )
         .unwrap();
     assert!(
         !store
@@ -1232,7 +1246,14 @@ fn file_bucket_execution_generation_tracks_bucket_mutations() {
     assert_generation(2);
 
     store
-        .put_bucket_acl(&bucket, &AclGrants::default(), true, false)
+        .put_bucket_acl(
+            &bucket,
+            &AclGrants::default(),
+            BucketAclSummary {
+                public_read: true,
+                public_write: false,
+            },
+        )
         .unwrap();
     assert_generation(3);
 

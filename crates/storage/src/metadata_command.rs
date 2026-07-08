@@ -7,12 +7,12 @@ use s3_types::{
 };
 
 use crate::types::{
-    AbortMultipartUploadCleanup, BucketEncryptionConfig, BucketName, BucketObjectOwnership,
-    BucketOwnershipControls, BucketState, BucketSubresourceAux, BucketSubresourceKind,
-    BucketWriteReservationRecord, ChecksumAlgorithm, ChecksumBytes, ChecksumType, ClusterEpoch,
-    CompletedMultipartUploadRecord, CreateBucketConfig, CreateMultipartUploadReq,
-    CreateStreamUploadReq, EcShape, EtagKind, GenerationId, LiveObjectRecord,
-    ManagedEncryptionAlgorithm, MultipartChecksumConfig, MultipartPartRecord,
+    AbortMultipartUploadCleanup, BucketAclSummary, BucketEncryptionConfig, BucketName,
+    BucketObjectOwnership, BucketOwnershipControls, BucketState, BucketSubresourceAux,
+    BucketSubresourceKind, BucketWriteReservationRecord, ChecksumAlgorithm, ChecksumBytes,
+    ChecksumType, ClusterEpoch, CompletedMultipartUploadRecord, CreateBucketConfig,
+    CreateMultipartUploadReq, CreateStreamUploadReq, EcShape, EtagKind, GenerationId,
+    LiveObjectRecord, ManagedEncryptionAlgorithm, MultipartChecksumConfig, MultipartPartRecord,
     MultipartPartSegmentRecord, MultipartReclaimPartRecord, MultipartReclaimPartSegmentRecord,
     MultipartReclaimRecord, MultipartUploadRecord, ObjectEncryption, ObjectEncryptionType,
     ObjectEtag, ObjectKey, ObjectLayout, ObjectPartRecord, ObjectPayloadReclaimKind,
@@ -469,12 +469,11 @@ impl PutBucketAclCommand {
     pub(crate) fn from_bucket(
         mut bucket: BucketRecord,
         acl_grants: AclGrants,
-        public_read: bool,
-        public_write: bool,
+        summary: BucketAclSummary,
     ) -> Self {
         bucket.acl_grants = acl_grants;
-        bucket.public_read = public_read;
-        bucket.public_write = public_write;
+        bucket.public_read = summary.public_read;
+        bucket.public_write = summary.public_write;
         bucket = bucket.command_metadata_projection();
         Self { bucket }
     }
@@ -4581,8 +4580,10 @@ mod tests {
         let command = PutBucketAclCommand::from_bucket(
             test_bucket_record("bucket", 12),
             AclGrants::default(),
-            true,
-            false,
+            BucketAclSummary {
+                public_read: true,
+                public_write: false,
+            },
         );
         let id = MetadataCommandId::new(
             ClusterEpoch::INITIAL,
@@ -4607,7 +4608,14 @@ mod tests {
         let mut current = test_bucket_record("bucket", 13);
         current.completed_multipart_upload_sequence = 11;
 
-        let command = PutBucketAclCommand::from_bucket(current, AclGrants::default(), true, false);
+        let command = PutBucketAclCommand::from_bucket(
+            current,
+            AclGrants::default(),
+            BucketAclSummary {
+                public_read: true,
+                public_write: false,
+            },
+        );
         assert_eq!(command.bucket.completed_multipart_upload_sequence, 11);
 
         let id = MetadataCommandId::new(
@@ -4624,8 +4632,10 @@ mod tests {
             MetadataCommandPayload::PutBucketAcl(PutBucketAclCommand::from_bucket(
                 duplicate_current,
                 AclGrants::default(),
-                true,
-                false,
+                BucketAclSummary {
+                    public_read: true,
+                    public_write: false,
+                },
             )),
         );
 

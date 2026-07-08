@@ -361,8 +361,10 @@ impl Coordinator {
         Ok(AuthorizedPutBucketAcl {
             bucket: bucket.name.clone(),
             acl_grants,
-            public_read,
-            public_write,
+            summary: storage::BucketAclSummary {
+                public_read,
+                public_write,
+            },
         })
     }
 
@@ -1255,8 +1257,7 @@ impl Coordinator {
             .put_bucket_acl_and_load_info(
                 &authorized.bucket,
                 &authorized.acl_grants,
-                authorized.public_read,
-                authorized.public_write,
+                authorized.summary,
             )
             .map_err(Self::map_bucket_snapshot_load_error)?;
         self.clear_bucket_fast_path(&info);

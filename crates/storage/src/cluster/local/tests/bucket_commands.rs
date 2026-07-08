@@ -1,4 +1,5 @@
 use super::*;
+use crate::BucketAclSummary;
 
 #[test]
 fn composite_object_listings_fan_out_to_routed_pg_primaries() {
@@ -944,7 +945,14 @@ fn same_bucket_pending_metadata_command_drains_before_later_acl() {
 
     let acl_grants = crate::AclGrants::default();
     let acl_updated = cluster
-        .put_bucket_acl_and_load_info(&bucket, &acl_grants, true, false)
+        .put_bucket_acl_and_load_info(
+            &bucket,
+            &acl_grants,
+            BucketAclSummary {
+                public_read: true,
+                public_write: false,
+            },
+        )
         .unwrap();
     assert_eq!(
         acl_updated.versioning,
@@ -1052,7 +1060,14 @@ fn put_bucket_acl_command_applies_to_all_acting_pg_nodes() {
     let acl_grants = crate::AclGrants::default();
 
     let updated = cluster
-        .put_bucket_acl_and_load_info(&bucket, &acl_grants, true, false)
+        .put_bucket_acl_and_load_info(
+            &bucket,
+            &acl_grants,
+            BucketAclSummary {
+                public_read: true,
+                public_write: false,
+            },
+        )
         .unwrap();
     assert_eq!(updated.acl_grants, acl_grants);
     assert!(updated.public_read);
@@ -1118,7 +1133,14 @@ fn put_bucket_acl_command_retry_reuses_pending_partial_replica_command() {
     ));
 
     let err = cluster
-        .put_bucket_acl_and_load_info(&bucket, &acl_grants, true, false)
+        .put_bucket_acl_and_load_info(
+            &bucket,
+            &acl_grants,
+            BucketAclSummary {
+                public_read: true,
+                public_write: false,
+            },
+        )
         .unwrap_err();
     assert!(
         matches!(
@@ -1162,7 +1184,14 @@ fn put_bucket_acl_command_retry_reuses_pending_partial_replica_command() {
     }
 
     let retried = cluster
-        .put_bucket_acl_and_load_info(&bucket, &acl_grants, true, false)
+        .put_bucket_acl_and_load_info(
+            &bucket,
+            &acl_grants,
+            BucketAclSummary {
+                public_read: true,
+                public_write: false,
+            },
+        )
         .unwrap();
     assert!(retried.public_read);
     assert!(!retried.public_write);
@@ -1263,7 +1292,14 @@ fn bucket_acl_drains_pending_completed_multipart_sequence_command() {
 
     let acl_grants = crate::AclGrants::default();
     let updated = cluster
-        .put_bucket_acl_and_load_info(&bucket, &acl_grants, true, false)
+        .put_bucket_acl_and_load_info(
+            &bucket,
+            &acl_grants,
+            BucketAclSummary {
+                public_read: true,
+                public_write: false,
+            },
+        )
         .unwrap();
     assert!(updated.public_read);
     assert!(!updated.public_write);
@@ -1324,7 +1360,14 @@ fn existing_create_bucket_preserves_pending_acl_command_for_retry() {
     ));
 
     let err = cluster
-        .put_bucket_acl_and_load_info(&bucket, &acl_grants, true, false)
+        .put_bucket_acl_and_load_info(
+            &bucket,
+            &acl_grants,
+            BucketAclSummary {
+                public_read: true,
+                public_write: false,
+            },
+        )
         .unwrap_err();
     assert!(
         matches!(
@@ -1430,8 +1473,10 @@ fn bucket_acl_retry_rejects_same_acl_with_mismatched_post_image() {
     let mut update = PutBucketAclCommand::from_bucket(
         current.with_execution_generation(77),
         acl_grants.clone(),
-        true,
-        false,
+        BucketAclSummary {
+            public_read: true,
+            public_write: false,
+        },
     );
     update.bucket.bucket_policy_public = true;
     let command = MetadataCommandEnvelope::new(
@@ -1445,7 +1490,14 @@ fn bucket_acl_retry_rejects_same_acl_with_mismatched_post_image() {
     insert_pending_metadata_command_for_test(&map, PgId::new(1), &bucket, &command);
 
     let err = cluster
-        .put_bucket_acl_and_load_info(&bucket, &acl_grants, true, false)
+        .put_bucket_acl_and_load_info(
+            &bucket,
+            &acl_grants,
+            BucketAclSummary {
+                public_read: true,
+                public_write: false,
+            },
+        )
         .unwrap_err();
     assert!(
         matches!(

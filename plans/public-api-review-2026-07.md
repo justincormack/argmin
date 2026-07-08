@@ -971,12 +971,15 @@ each is one refactor away from a panic:
   — fixed by replacing the positional constructor with
   `TraceContextIds { trace_id, request_id }`, so wire-boundary callers must name
   both IDs.
-- [ ] `put_bucket_acl_and_load_info(..., public_read: bool, public_write:
-  bool)` (`request_ops.rs:6668-6674`) and `with_rpc_admission(usize,
-  Duration, Duration)` (`cluster/local.rs:158-164`) — adjacent same-typed
-  pairs; low priority (no bare-literal call sites today). Partially
-  mitigated: a struct-taking `with_rpc_admission_settings` variant now exists
-  (`local.rs:174`) but the positional variant remains.
+- [x] `put_bucket_acl_and_load_info(..., public_read: bool, public_write:
+  bool)` (`request_ops.rs:6668-6674`) — fixed by introducing
+  `BucketAclSummary { public_read, public_write }` and threading it through
+  authorized ACL results, metadata command construction, local/Unix node
+  clients, RPC validation, and PgStore test helpers.
+- [ ] `with_rpc_admission(usize, Duration, Duration)` (`cluster/local.rs:158-164`)
+  — adjacent same-typed values. Partially mitigated: a struct-taking
+  `with_rpc_admission_settings` variant now exists (`local.rs:174`) but the
+  positional variant remains.
 - [ ] Metrics render site pairs ~100+ name strings positionally with values
   in one giant `concat!` (`server-http/src/http/serve.rs:1466+`); tests check
   presence, not values, so a transposition mislabels metrics silently.

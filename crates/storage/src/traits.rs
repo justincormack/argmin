@@ -257,8 +257,7 @@ pub(crate) trait PgMetadataStore {
         &self,
         name: &BucketName,
         acl_grants: &AclGrants,
-        public_read: bool,
-        public_write: bool,
+        summary: BucketAclSummary,
     ) -> Result<(), MetadataError>;
 
     /// Store an opaque bucket subresource with typed auxiliary summary data.

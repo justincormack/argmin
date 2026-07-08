@@ -2048,8 +2048,10 @@ fn metadata_txn_commit_failure_recovers_representative_mutators() {
                 store,
                 &trusted_bucket_name("commit-fail-acl"),
                 &AclGrants::default(),
-                true,
-                false,
+                BucketAclSummary {
+                    public_read: true,
+                    public_write: false,
+                },
             )
         },
     );
@@ -7531,8 +7533,10 @@ fn put_bucket_acl_command_does_not_lower_execution_generation() {
                 .unwrap()
                 .with_execution_generation(12),
             acl_grants.clone(),
-            true,
-            false,
+            BucketAclSummary {
+                public_read: true,
+                public_write: false,
+            },
         )),
     );
     store.apply_metadata_command(&newer).unwrap();
@@ -7549,8 +7553,10 @@ fn put_bucket_acl_command_does_not_lower_execution_generation() {
                 .unwrap()
                 .with_execution_generation(11),
             acl_grants.clone(),
-            true,
-            false,
+            BucketAclSummary {
+                public_read: true,
+                public_write: false,
+            },
         )),
     );
     let err = store.apply_metadata_command(&stale).unwrap_err();
@@ -7577,8 +7583,10 @@ fn put_bucket_acl_command_does_not_lower_execution_generation() {
                 .unwrap()
                 .with_execution_generation(12),
             acl_grants.clone(),
-            false,
-            true,
+            BucketAclSummary {
+                public_read: false,
+                public_write: true,
+            },
         )),
     );
     let err = store.apply_metadata_command(&conflicting).unwrap_err();

@@ -1,4 +1,5 @@
 use super::*;
+use crate::BucketAclSummary;
 
 impl UnixStorageNodeClient {
     pub(crate) fn write_placed_shard(
@@ -3484,8 +3485,7 @@ impl BucketMetadataNodeClient for UnixStorageNodeClient {
         bucket: &BucketName,
         command: &PutBucketAclCommand,
         acl_grants: &AclGrants,
-        public_read: bool,
-        public_write: bool,
+        summary: BucketAclSummary,
     ) -> Result<bool, BucketSnapshotLoadError> {
         let command = MetadataCommandEnvelope::new(
             MetadataCommandId::new(
@@ -3501,8 +3501,7 @@ impl BucketMetadataNodeClient for UnixStorageNodeClient {
             &command,
             StorageRpcBucketMetadataControlMutation::Acl {
                 acl_grants: acl_grants.clone(),
-                public_read,
-                public_write,
+                summary,
             },
         )
     }
@@ -3513,8 +3512,7 @@ impl BucketMetadataNodeClient for UnixStorageNodeClient {
         bucket: &BucketName,
         command_id: MetadataCommandId,
         acl_grants: &AclGrants,
-        public_read: bool,
-        public_write: bool,
+        summary: BucketAclSummary,
     ) -> Result<MetadataCommandEnvelope, BucketSnapshotLoadError> {
         self.bucket_metadata_control_command_build(
             pg_id,
@@ -3522,8 +3520,7 @@ impl BucketMetadataNodeClient for UnixStorageNodeClient {
             command_id,
             StorageRpcBucketMetadataControlMutation::Acl {
                 acl_grants: acl_grants.clone(),
-                public_read,
-                public_write,
+                summary,
             },
         )
     }
