@@ -83,6 +83,78 @@ impl fmt::Debug for ConfiguredControlPlaneStorageAuthCredential {
     }
 }
 
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct ConfiguredControlPlaneFrontendAuthCredential {
+    pub(crate) instance_id: String,
+    pub(crate) credential_id: String,
+    pub(crate) credential_version: u64,
+    pub(crate) secret: SecretConfigValue,
+}
+
+impl fmt::Debug for ConfiguredControlPlaneFrontendAuthCredential {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ConfiguredControlPlaneFrontendAuthCredential")
+            .field("instance_id", &self.instance_id)
+            .field("credential_id", &self.credential_id)
+            .field("credential_version", &self.credential_version)
+            .field("secret", &self.secret)
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ConfiguredControlPlaneFrontendRuntimeMapAuth {
+    pub(crate) cluster_id: String,
+    pub(crate) instance_id: String,
+    pub(crate) credentials: Vec<ConfiguredControlPlaneFrontendAuthCredential>,
+}
+
+impl ConfiguredControlPlaneFrontendRuntimeMapAuth {
+    pub(crate) fn from_env() -> Result<Option<Self>, String> {
+        Self::from_lookup(|key| std::env::var(key).ok())
+    }
+
+    fn from_lookup<F: Fn(&str) -> Option<String>>(get: F) -> Result<Option<Self>, String> {
+        let credentials = parse_control_plane_frontend_auth_credentials(get(
+            "ARGMIN_CONTROL_PLANE_FRONTEND_AUTH_CREDENTIALS",
+        ))?;
+        if credentials.is_empty() {
+            return Ok(None);
+        }
+        let cluster_id = get("ARGMIN_CONTROL_PLANE_AUTH_CLUSTER_ID").ok_or_else(|| {
+            "ARGMIN_CONTROL_PLANE_FRONTEND_AUTH_CREDENTIALS requires ARGMIN_CONTROL_PLANE_AUTH_CLUSTER_ID"
+                .to_string()
+        })?;
+        if cluster_id.is_empty() || !cluster_id.bytes().all(|b| b.is_ascii_graphic()) {
+            return Err(
+                "ARGMIN_CONTROL_PLANE_AUTH_CLUSTER_ID must be non-empty and contain only printable non-space ASCII"
+                    .to_string(),
+            );
+        }
+        let instance_id = get("ARGMIN_CONTROL_PLANE_FRONTEND_AUTH_INSTANCE_ID").ok_or_else(|| {
+            "ARGMIN_CONTROL_PLANE_FRONTEND_AUTH_INSTANCE_ID is required when ARGMIN_CONTROL_PLANE_FRONTEND_AUTH_CREDENTIALS is set"
+                .to_string()
+        })?;
+        validate_auth_instance_id(
+            &instance_id,
+            "ARGMIN_CONTROL_PLANE_FRONTEND_AUTH_INSTANCE_ID",
+        )?;
+        if !credentials
+            .iter()
+            .any(|credential| credential.instance_id == instance_id)
+        {
+            return Err(format!(
+                "ARGMIN_CONTROL_PLANE_FRONTEND_AUTH_CREDENTIALS must include local frontend instance id {instance_id}"
+            ));
+        }
+        Ok(Some(Self {
+            cluster_id,
+            instance_id,
+            credentials,
+        }))
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ConfiguredCredentialProfile {
     Standard,
@@ -141,6 +213,9 @@ pub(crate) struct ServerConfig {
     pub(crate) control_plane_auth_cluster_id: Option<String>,
     pub(crate) control_plane_storage_auth_credentials:
         Vec<ConfiguredControlPlaneStorageAuthCredential>,
+    pub(crate) control_plane_frontend_auth_instance_id: Option<String>,
+    pub(crate) control_plane_frontend_auth_credentials:
+        Vec<ConfiguredControlPlaneFrontendAuthCredential>,
     pub(crate) control_plane_experimental_raft: bool,
     pub(crate) control_plane_raft_cluster_name: Option<String>,
     pub(crate) control_plane_raft_node_id: Option<u64>,
@@ -192,6 +267,8 @@ impl ServerConfig {
     ///   `ARGMIN_CONTROL_PLANE_SOCKET_PATH` (required for control-plane role, optional dynamic route source for frontend/storage roles)
     ///   `ARGMIN_CONTROL_PLANE_AUTH_CLUSTER_ID` (required when control-plane internal auth credentials are configured)
     ///   `ARGMIN_CONTROL_PLANE_STORAGE_AUTH_CREDENTIALS` (`node_id=credential_id:version:secret,...`, optional authenticated storage-node heartbeat refresh)
+    ///   `ARGMIN_CONTROL_PLANE_FRONTEND_AUTH_INSTANCE_ID` (required for frontend roles when frontend control-plane auth credentials are configured)
+    ///   `ARGMIN_CONTROL_PLANE_FRONTEND_AUTH_CREDENTIALS` (`instance_id=credential_id:version:secret,...`, optional authenticated frontend runtime-map reads)
     ///   `ARGMIN_CONTROL_PLANE_EXPERIMENTAL_RAFT` (false)
     ///   `ARGMIN_CONTROL_PLANE_RAFT_CLUSTER_NAME` (optional experimental Raft cluster identity)
     ///   `ARGMIN_CONTROL_PLANE_RAFT_NODE_ID` (1 when experimental Raft is enabled)
@@ -359,6 +436,12 @@ impl ServerConfig {
         let control_plane_storage_auth_credentials = parse_control_plane_storage_auth_credentials(
             get("ARGMIN_CONTROL_PLANE_STORAGE_AUTH_CREDENTIALS"),
         )?;
+        let control_plane_frontend_auth_instance_id =
+            get("ARGMIN_CONTROL_PLANE_FRONTEND_AUTH_INSTANCE_ID");
+        let control_plane_frontend_auth_credentials =
+            parse_control_plane_frontend_auth_credentials(get(
+                "ARGMIN_CONTROL_PLANE_FRONTEND_AUTH_CREDENTIALS",
+            ))?;
         let control_plane_experimental_raft = match get("ARGMIN_CONTROL_PLANE_EXPERIMENTAL_RAFT") {
             Some(value) => parse_bool_env("ARGMIN_CONTROL_PLANE_EXPERIMENTAL_RAFT", &value)?,
             None => false,
@@ -635,6 +718,36 @@ impl ServerConfig {
                 }
             }
         }
+        if !control_plane_frontend_auth_credentials.is_empty() {
+            if control_plane_auth_cluster_id.is_none() {
+                return Err(
+                    "ARGMIN_CONTROL_PLANE_FRONTEND_AUTH_CREDENTIALS requires ARGMIN_CONTROL_PLANE_AUTH_CLUSTER_ID"
+                        .to_string(),
+                );
+            }
+            if process_role.has_frontend() && control_plane_socket_path.is_some() {
+                let instance_id = control_plane_frontend_auth_instance_id.as_deref().ok_or_else(
+                    || {
+                        "ARGMIN_CONTROL_PLANE_FRONTEND_AUTH_INSTANCE_ID is required for frontend roles when ARGMIN_CONTROL_PLANE_FRONTEND_AUTH_CREDENTIALS is set"
+                            .to_string()
+                    },
+                )?;
+                if !control_plane_frontend_auth_credentials
+                    .iter()
+                    .any(|entry| entry.instance_id == instance_id)
+                {
+                    return Err(format!(
+                        "ARGMIN_CONTROL_PLANE_FRONTEND_AUTH_CREDENTIALS must include local frontend instance id {instance_id}"
+                    ));
+                }
+            }
+        }
+        if let Some(instance_id) = &control_plane_frontend_auth_instance_id {
+            validate_auth_instance_id(
+                instance_id,
+                "ARGMIN_CONTROL_PLANE_FRONTEND_AUTH_INSTANCE_ID",
+            )?;
+        }
         if control_plane_lease_scan_interval.is_zero() {
             return Err("ARGMIN_CONTROL_PLANE_LEASE_SCAN_MS must be > 0".to_string());
         }
@@ -717,6 +830,8 @@ impl ServerConfig {
             control_plane_socket_path,
             control_plane_auth_cluster_id,
             control_plane_storage_auth_credentials,
+            control_plane_frontend_auth_instance_id,
+            control_plane_frontend_auth_credentials,
             control_plane_experimental_raft,
             control_plane_raft_cluster_name,
             control_plane_raft_node_id,
@@ -1109,6 +1224,95 @@ fn parse_control_plane_storage_auth_credentials(
     Ok(entries)
 }
 
+fn parse_control_plane_frontend_auth_credentials(
+    value: Option<String>,
+) -> Result<Vec<ConfiguredControlPlaneFrontendAuthCredential>, String> {
+    let Some(value) = value else {
+        return Ok(Vec::new());
+    };
+    if value.trim().is_empty() {
+        return Err("ARGMIN_CONTROL_PLANE_FRONTEND_AUTH_CREDENTIALS must not be empty".to_string());
+    }
+
+    let mut by_instance = HashMap::<String, ConfiguredControlPlaneFrontendAuthCredential>::new();
+    for raw in value.split(',') {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return Err(
+                "ARGMIN_CONTROL_PLANE_FRONTEND_AUTH_CREDENTIALS contains an empty entry"
+                    .to_string(),
+            );
+        }
+        let (raw_instance_id, raw_credential) = trimmed.split_once('=').ok_or_else(|| {
+            format!(
+                "ARGMIN_CONTROL_PLANE_FRONTEND_AUTH_CREDENTIALS entry {trimmed:?} must be instance_id=credential_id:version:secret"
+            )
+        })?;
+        let instance_id = raw_instance_id.trim();
+        validate_auth_instance_id(
+            instance_id,
+            "ARGMIN_CONTROL_PLANE_FRONTEND_AUTH_CREDENTIALS",
+        )?;
+        let mut parts = raw_credential.splitn(3, ':');
+        let credential_id = parts.next().unwrap_or_default().trim();
+        let raw_version = parts.next().unwrap_or_default().trim();
+        let secret = parts.next().unwrap_or_default();
+        if !auth_config_token_is_valid(credential_id) {
+            return Err(format!(
+                "ARGMIN_CONTROL_PLANE_FRONTEND_AUTH_CREDENTIALS credential id for instance {instance_id} must be non-empty printable ASCII without ',', ':' or '='"
+            ));
+        }
+        let credential_version: u64 = raw_version.parse().map_err(|e| {
+            format!(
+                "invalid ARGMIN_CONTROL_PLANE_FRONTEND_AUTH_CREDENTIALS credential version {raw_version:?} for instance {instance_id}: {e}"
+            )
+        })?;
+        if credential_version == 0 {
+            return Err(format!(
+                "ARGMIN_CONTROL_PLANE_FRONTEND_AUTH_CREDENTIALS credential version for instance {instance_id} must be > 0"
+            ));
+        }
+        if secret.is_empty() || secret.contains(',') {
+            return Err(format!(
+                "ARGMIN_CONTROL_PLANE_FRONTEND_AUTH_CREDENTIALS secret for instance {instance_id} must be non-empty and must not contain ','"
+            ));
+        }
+        let entry = ConfiguredControlPlaneFrontendAuthCredential {
+            instance_id: instance_id.to_string(),
+            credential_id: credential_id.to_string(),
+            credential_version,
+            secret: SecretConfigValue::new(secret.to_string()),
+        };
+        if by_instance.insert(instance_id.to_string(), entry).is_some() {
+            return Err(format!(
+                "ARGMIN_CONTROL_PLANE_FRONTEND_AUTH_CREDENTIALS contains duplicate instance id {instance_id}"
+            ));
+        }
+    }
+
+    let mut entries: Vec<ConfiguredControlPlaneFrontendAuthCredential> =
+        by_instance.into_values().collect();
+    entries.sort_by(|left, right| left.instance_id.cmp(&right.instance_id));
+    Ok(entries)
+}
+
+fn validate_auth_instance_id(value: &str, field: &'static str) -> Result<(), String> {
+    if auth_config_token_is_valid(value) {
+        Ok(())
+    } else {
+        Err(format!(
+            "{field} must be non-empty printable ASCII without ',', ':' or '='"
+        ))
+    }
+}
+
+fn auth_config_token_is_valid(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_graphic() && b != b',' && b != b':' && b != b'=')
+}
+
 fn validate_control_plane_raft_auth_credentials_match_peer_policy(
     local_node_id: u64,
     peer_sockets: &[ConfiguredControlPlaneRaftPeerSocket],
@@ -1418,6 +1622,8 @@ mod tests {
         assert_eq!(cfg.control_plane_socket_path, None);
         assert_eq!(cfg.control_plane_auth_cluster_id, None);
         assert!(cfg.control_plane_storage_auth_credentials.is_empty());
+        assert_eq!(cfg.control_plane_frontend_auth_instance_id, None);
+        assert!(cfg.control_plane_frontend_auth_credentials.is_empty());
         assert!(!cfg.control_plane_experimental_raft);
         assert_eq!(cfg.control_plane_raft_cluster_name, None);
         assert_eq!(cfg.control_plane_raft_node_id, None);
@@ -1480,6 +1686,14 @@ mod tests {
                 "ARGMIN_CONTROL_PLANE_STORAGE_AUTH_CREDENTIALS",
                 "2=storage-node:3:storage-2-secret,1=storage-node:3:storage-1-secret",
             ),
+            (
+                "ARGMIN_CONTROL_PLANE_FRONTEND_AUTH_INSTANCE_ID",
+                "frontend-a",
+            ),
+            (
+                "ARGMIN_CONTROL_PLANE_FRONTEND_AUTH_CREDENTIALS",
+                "frontend-b=frontend:5:frontend-b-secret,frontend-a=frontend:5:frontend-a-secret",
+            ),
             ("ARGMIN_CONTROL_PLANE_LEASE_SCAN_MS", "125"),
             ("ARGMIN_CONTROL_PLANE_EXPERIMENTAL_RAFT", "true"),
             ("ARGMIN_CONTROL_PLANE_RAFT_CLUSTER_NAME", "raft-control"),
@@ -1537,6 +1751,27 @@ mod tests {
                     credential_id: "storage-node".to_string(),
                     credential_version: 3,
                     secret: SecretConfigValue::new("storage-2-secret".to_string()),
+                },
+            ]
+        );
+        assert_eq!(
+            cfg.control_plane_frontend_auth_instance_id.as_deref(),
+            Some("frontend-a")
+        );
+        assert_eq!(
+            cfg.control_plane_frontend_auth_credentials,
+            vec![
+                ConfiguredControlPlaneFrontendAuthCredential {
+                    instance_id: "frontend-a".to_string(),
+                    credential_id: "frontend".to_string(),
+                    credential_version: 5,
+                    secret: SecretConfigValue::new("frontend-a-secret".to_string()),
+                },
+                ConfiguredControlPlaneFrontendAuthCredential {
+                    instance_id: "frontend-b".to_string(),
+                    credential_id: "frontend".to_string(),
+                    credential_version: 5,
+                    secret: SecretConfigValue::new("frontend-b-secret".to_string()),
                 },
             ]
         );
@@ -1789,6 +2024,8 @@ mod tests {
         let debug = format!("{cfg:?}");
         assert!(!debug.contains("storage-1-secret"));
         assert!(!debug.contains("storage-2-secret"));
+        assert!(!debug.contains("frontend-a-secret"));
+        assert!(!debug.contains("frontend-b-secret"));
         assert!(debug.contains("config_secret"));
     }
 
@@ -1812,6 +2049,110 @@ mod tests {
         .unwrap_err();
 
         assert!(err.contains("ARGMIN_CONTROL_PLANE_AUTH_CLUSTER_ID"));
+    }
+
+    #[test]
+    fn control_plane_frontend_auth_credentials_require_cluster_id() {
+        let err = ServerConfig::from_lookup(make_env(&[
+            ("ARGMIN_PROCESS_ROLE", "control-plane"),
+            (
+                "ARGMIN_CONTROL_PLANE_STATE_PATH",
+                "/tmp/argmin-control-plane.state",
+            ),
+            (
+                "ARGMIN_CONTROL_PLANE_SOCKET_PATH",
+                "/tmp/argmin-control-plane.sock",
+            ),
+            (
+                "ARGMIN_CONTROL_PLANE_FRONTEND_AUTH_CREDENTIALS",
+                "frontend-1=frontend:4:frontend-1-secret",
+            ),
+        ]))
+        .unwrap_err();
+
+        assert!(err.contains("ARGMIN_CONTROL_PLANE_AUTH_CLUSTER_ID"));
+    }
+
+    #[test]
+    fn frontend_auth_credentials_must_include_local_instance() {
+        let err = ServerConfig::from_lookup(make_required_env(&[
+            ("ARGMIN_PROCESS_ROLE", "frontend"),
+            (
+                "ARGMIN_CONTROL_PLANE_SOCKET_PATH",
+                "/tmp/argmin-control-plane.sock",
+            ),
+            ("ARGMIN_CONTROL_PLANE_AUTH_CLUSTER_ID", "control-auth"),
+            (
+                "ARGMIN_CONTROL_PLANE_FRONTEND_AUTH_INSTANCE_ID",
+                "frontend-2",
+            ),
+            (
+                "ARGMIN_CONTROL_PLANE_FRONTEND_AUTH_CREDENTIALS",
+                "frontend-1=frontend:4:frontend-1-secret",
+            ),
+        ]))
+        .unwrap_err();
+
+        assert!(err.contains("local frontend instance id frontend-2"));
+    }
+
+    #[test]
+    fn frontend_runtime_map_auth_only_config_parses_credentials() {
+        let auth = ConfiguredControlPlaneFrontendRuntimeMapAuth::from_lookup(make_env(&[
+            ("ARGMIN_CONTROL_PLANE_AUTH_CLUSTER_ID", "control-auth"),
+            (
+                "ARGMIN_CONTROL_PLANE_FRONTEND_AUTH_INSTANCE_ID",
+                "frontend-1",
+            ),
+            (
+                "ARGMIN_CONTROL_PLANE_FRONTEND_AUTH_CREDENTIALS",
+                "frontend-2=frontend:4:frontend-2-secret,frontend-1=frontend:4:frontend-1-secret",
+            ),
+        ]))
+        .expect("auth-only config should parse")
+        .expect("auth-only config should be enabled");
+
+        assert_eq!(auth.cluster_id, "control-auth");
+        assert_eq!(auth.instance_id, "frontend-1");
+        assert_eq!(
+            auth.credentials,
+            vec![
+                ConfiguredControlPlaneFrontendAuthCredential {
+                    instance_id: "frontend-1".to_string(),
+                    credential_id: "frontend".to_string(),
+                    credential_version: 4,
+                    secret: SecretConfigValue::new("frontend-1-secret".to_string()),
+                },
+                ConfiguredControlPlaneFrontendAuthCredential {
+                    instance_id: "frontend-2".to_string(),
+                    credential_id: "frontend".to_string(),
+                    credential_version: 4,
+                    secret: SecretConfigValue::new("frontend-2-secret".to_string()),
+                },
+            ]
+        );
+        let debug = format!("{auth:?}");
+        assert!(!debug.contains("frontend-1-secret"));
+        assert!(!debug.contains("frontend-2-secret"));
+        assert!(debug.contains("config_secret"));
+    }
+
+    #[test]
+    fn frontend_runtime_map_auth_only_config_rejects_missing_local_instance() {
+        let err = ConfiguredControlPlaneFrontendRuntimeMapAuth::from_lookup(make_env(&[
+            ("ARGMIN_CONTROL_PLANE_AUTH_CLUSTER_ID", "control-auth"),
+            (
+                "ARGMIN_CONTROL_PLANE_FRONTEND_AUTH_INSTANCE_ID",
+                "frontend-2",
+            ),
+            (
+                "ARGMIN_CONTROL_PLANE_FRONTEND_AUTH_CREDENTIALS",
+                "frontend-1=frontend:4:frontend-1-secret",
+            ),
+        ]))
+        .unwrap_err();
+
+        assert!(err.contains("local frontend instance id frontend-2"));
     }
 
     #[test]

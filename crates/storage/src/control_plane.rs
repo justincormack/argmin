@@ -4628,6 +4628,22 @@ impl UnixControlPlaneClient {
         payload: &[u8],
         read_timeout: Duration,
     ) -> Result<Vec<u8>, ControlPlaneError> {
+        self.send_read_only_request_with_payload_factory(
+            kind,
+            read_timeout,
+            || Ok(payload.to_vec()),
+        )
+    }
+
+    fn send_read_only_request_with_payload_factory<F>(
+        &self,
+        kind: ControlPlaneRpcKind,
+        read_timeout: Duration,
+        mut build_payload: F,
+    ) -> Result<Vec<u8>, ControlPlaneError>
+    where
+        F: FnMut() -> Result<Vec<u8>, ControlPlaneError>,
+    {
         debug_assert!(matches!(
             kind,
             ControlPlaneRpcKind::RuntimeMapSnapshot
@@ -4636,7 +4652,8 @@ impl UnixControlPlaneClient {
         ));
         let deadline = Instant::now() + CONTROL_PLANE_RPC_READ_ONLY_RETRY_DEADLINE;
         loop {
-            match self.send_request_with_read_timeout(kind, payload, read_timeout) {
+            let payload = build_payload()?;
+            match self.send_request_with_read_timeout(kind, &payload, read_timeout) {
                 Ok(payload) => return Ok(payload),
                 Err(error)
                     if error.is_retryable_read_only_rpc_transport_error()
@@ -5201,6 +5218,41 @@ impl AuthenticatedUnixControlPlaneClient {
         )?;
         envelope.encode_frame()
     }
+
+    fn send_signed_read_only_request_with_read_timeout(
+        &self,
+        kind: ControlPlaneRpcKind,
+        authority_now_ms: u64,
+        payload: Vec<u8>,
+        read_timeout: Duration,
+    ) -> Result<Vec<u8>, ControlPlaneError> {
+        let start = Instant::now();
+        self.send_signed_read_only_request_with_read_timeout_and_clock(
+            kind,
+            payload,
+            read_timeout,
+            || {
+                let elapsed_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
+                Ok(authority_now_ms.saturating_add(elapsed_ms))
+            },
+        )
+    }
+
+    fn send_signed_read_only_request_with_read_timeout_and_clock<F>(
+        &self,
+        kind: ControlPlaneRpcKind,
+        payload: Vec<u8>,
+        read_timeout: Duration,
+        mut authority_now_ms: F,
+    ) -> Result<Vec<u8>, ControlPlaneError>
+    where
+        F: FnMut() -> Result<u64, ControlPlaneError>,
+    {
+        self.inner
+            .send_read_only_request_with_payload_factory(kind, read_timeout, || {
+                self.sign_read_only_request(kind, authority_now_ms()?, payload.clone())
+            })
+    }
 }
 
 impl ControlPlaneStorageNodeAuthCredential {
@@ -5302,21 +5354,31 @@ impl ControlPlaneFrontendAuthCredential {
 }
 
 impl ControlPlaneUnixAuthVerifier {
-    pub fn new(
-        cluster_id: impl Into<String>,
-        storage_node_credentials: Vec<ControlPlaneStorageNodeAuthCredential>,
-    ) -> Result<Self, ControlPlaneError> {
+    pub fn new_empty(cluster_id: impl Into<String>) -> Result<Self, ControlPlaneError> {
         let cluster_id = cluster_id.into();
         if cluster_id.is_empty() {
             return Err(ControlPlaneError::RpcProtocol {
                 message: "control-plane auth cluster id must not be empty".to_owned(),
             });
         }
+        Ok(Self {
+            cluster_id,
+            storage_node_credentials: BTreeMap::new(),
+            frontend_credentials: BTreeMap::new(),
+            metrics: Arc::new(ControlPlaneUnixAuthMetrics::default()),
+        })
+    }
+
+    pub fn new(
+        cluster_id: impl Into<String>,
+        storage_node_credentials: Vec<ControlPlaneStorageNodeAuthCredential>,
+    ) -> Result<Self, ControlPlaneError> {
         if storage_node_credentials.is_empty() {
             return Err(ControlPlaneError::RpcProtocol {
                 message: "control-plane storage-node auth credential set is empty".to_owned(),
             });
         }
+        let mut verifier = Self::new_empty(cluster_id)?;
         let mut by_node = BTreeMap::new();
         for credential in storage_node_credentials {
             if by_node.insert(credential.node_id(), credential).is_some() {
@@ -5326,12 +5388,8 @@ impl ControlPlaneUnixAuthVerifier {
                 });
             }
         }
-        Ok(Self {
-            cluster_id,
-            storage_node_credentials: by_node,
-            frontend_credentials: BTreeMap::new(),
-            metrics: Arc::new(ControlPlaneUnixAuthMetrics::default()),
-        })
+        verifier.storage_node_credentials = by_node;
+        Ok(verifier)
     }
 
     pub fn with_frontend_credentials(
@@ -5796,14 +5854,10 @@ impl ControlPlaneRuntimeMapSource for AuthenticatedUnixControlPlaneClient {
         &self,
         authority_now_ms: u64,
     ) -> Result<ClusterRuntimeMapSnapshot, ControlPlaneError> {
-        let payload = self.sign_read_only_request(
+        let payload = self.send_signed_read_only_request_with_read_timeout(
             ControlPlaneRpcKind::RuntimeMapSnapshot,
             authority_now_ms,
             Vec::new(),
-        )?;
-        let payload = self.inner.send_read_only_request_with_read_timeout(
-            ControlPlaneRpcKind::RuntimeMapSnapshot,
-            &payload,
             CONTROL_PLANE_RPC_CHECK_APPLIED_IO_TIMEOUT,
         )?;
         let mut reader = PayloadReader::new(&payload);
@@ -5816,14 +5870,10 @@ impl ControlPlaneRuntimeMapSource for AuthenticatedUnixControlPlaneClient {
         &self,
         authority_now_ms: u64,
     ) -> Result<ControlPlaneRuntimeMapStatus, ControlPlaneError> {
-        let payload = self.sign_read_only_request(
+        let payload = self.send_signed_read_only_request_with_read_timeout(
             ControlPlaneRpcKind::RuntimeMapStatus,
             authority_now_ms,
             Vec::new(),
-        )?;
-        let payload = self.inner.send_read_only_request_with_read_timeout(
-            ControlPlaneRpcKind::RuntimeMapStatus,
-            &payload,
             CONTROL_PLANE_RPC_IO_TIMEOUT,
         )?;
         let mut reader = PayloadReader::new(&payload);
@@ -5839,20 +5889,34 @@ impl ControlPlaneRuntimeMapSource for AuthenticatedUnixControlPlaneClient {
     ) -> Result<ClusterRuntimeMapSnapshot, ControlPlaneError> {
         let mut payload = Vec::new();
         write_pg_id_request(&mut payload, pg_id);
-        let payload = self.sign_read_only_request(
+        let payload = self.send_signed_read_only_request_with_read_timeout(
             ControlPlaneRpcKind::PgRuntimeMapSnapshot,
             authority_now_ms,
             payload,
-        )?;
-        let payload = self.inner.send_read_only_request_with_read_timeout(
-            ControlPlaneRpcKind::PgRuntimeMapSnapshot,
-            &payload,
             CONTROL_PLANE_RPC_IO_TIMEOUT,
         )?;
         let mut reader = PayloadReader::new(&payload);
         let runtime_map = read_runtime_map_snapshot(&mut reader)?;
         reader.finish()?;
         Ok(runtime_map)
+    }
+}
+
+impl AuthenticatedUnixControlPlaneClient {
+    pub fn runtime_map_status_with_check_applied_timeout(
+        &self,
+        authority_now_ms: u64,
+    ) -> Result<ControlPlaneRuntimeMapStatus, ControlPlaneError> {
+        let payload = self.send_signed_read_only_request_with_read_timeout(
+            ControlPlaneRpcKind::RuntimeMapStatus,
+            authority_now_ms,
+            Vec::new(),
+            CONTROL_PLANE_RPC_CHECK_APPLIED_IO_TIMEOUT,
+        )?;
+        let mut reader = PayloadReader::new(&payload);
+        let status = read_runtime_map_status(&mut reader)?;
+        reader.finish()?;
+        Ok(status)
     }
 }
 
@@ -12062,6 +12126,53 @@ mod tests {
             1
         );
         assert_eq!(metrics.rejected_total(), 0);
+    }
+
+    #[test]
+    fn authenticated_unix_control_plane_client_resigns_read_only_retry_attempts() {
+        let tmp = test_util::tempdir();
+        let socket_path = tmp.path().join("control-plane.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+        let (issued_tx, issued_rx) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            for attempt in 0..2 {
+                let (mut stream, _addr) = listener.accept().unwrap();
+                let (kind, payload) = read_control_plane_rpc_frame(&mut stream).unwrap();
+                assert_eq!(kind, ControlPlaneRpcKind::RuntimeMapStatus);
+                let envelope = ControlPlaneAuthEnvelope::decode_frame(
+                    &payload,
+                    CONTROL_PLANE_RPC_MAX_PAYLOAD_LEN,
+                )
+                .unwrap();
+                issued_tx
+                    .send(envelope.header().issued_at_ms().unwrap())
+                    .unwrap();
+                if attempt == 0 {
+                    continue;
+                }
+                let response = encode_control_plane_rpc_response(Ok(Vec::new())).unwrap();
+                write_control_plane_rpc_frame(&mut stream, kind, &response).unwrap();
+            }
+        });
+
+        let client = AuthenticatedUnixControlPlaneClient::new(
+            UnixControlPlaneClient::new(&socket_path),
+            frontend_auth_credential("auth-cluster", "frontend-1"),
+        );
+        let mut issued_at_ms = [1_000, 6_500].into_iter();
+        let response = client
+            .send_signed_read_only_request_with_read_timeout_and_clock(
+                ControlPlaneRpcKind::RuntimeMapStatus,
+                Vec::new(),
+                CONTROL_PLANE_RPC_IO_TIMEOUT,
+                || Ok(issued_at_ms.next().unwrap_or(6_500)),
+            )
+            .unwrap();
+
+        server.join().unwrap();
+        assert!(response.is_empty());
+        assert_eq!(issued_rx.recv().unwrap(), 1_000);
+        assert_eq!(issued_rx.recv().unwrap(), 6_500);
     }
 
     #[test]

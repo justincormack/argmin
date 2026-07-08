@@ -382,6 +382,18 @@ Progress:
   status read within the freshness window. Existing unauthenticated runtime-map
   reads remain accepted until process-level frontend credential configuration
   enables this verifier mode.
+- Process configuration now enables that verifier mode with
+  `ARGMIN_CONTROL_PLANE_FRONTEND_AUTH_CREDENTIALS` and lets frontend processes
+  select their local signing credential with
+  `ARGMIN_CONTROL_PLANE_FRONTEND_AUTH_INSTANCE_ID`. Frontend startup runtime-map
+  fetches and refresh-loop reads use the authenticated Unix control-plane
+  client when configured; control-plane listeners verify the configured
+  frontend principal set and expose the credential count through the existing
+  redacted Unix auth diagnostics. The lightweight
+  `control-plane-runtime-map-ready` and
+  `control-plane-runtime-map-diagnostics` probes also load this auth-only
+  frontend runtime-map config, so UAT/admin readiness checks can query an
+  auth-enforcing control plane without requiring unrelated server config.
 
 ### Slice D: Runtime-Map and Read Freshness Proof Consumers
 

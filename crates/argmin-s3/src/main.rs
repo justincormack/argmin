@@ -28,11 +28,12 @@ use storage::control_plane::{
     build_control_plane_unix_response, build_control_plane_unix_response_with_auth,
     read_control_plane_unix_request, write_control_plane_unix_response,
     AuthenticatedUnixControlPlaneClient, ClusterControlSnapshot, ClusterRuntimeMapSnapshot,
-    ControlPlaneAdmin, ControlPlaneError, ControlPlaneHeartbeatRefresh,
-    ControlPlaneHeartbeatRuntimeMapSource, ControlPlaneRuntimeMapSource,
-    ControlPlaneStorageNodeAuthCredential, ControlPlaneUnixAuthVerifier,
-    FencedPgMetadataTransferSnapshot, FileControlPlaneStore, PgMetadataProof,
-    PgMetadataTransferProof, PgRouteSnapshot, SingleAuthorityControlPlane, UnixControlPlaneClient,
+    ControlPlaneAdmin, ControlPlaneError, ControlPlaneFrontendAuthCredential,
+    ControlPlaneHeartbeatRefresh, ControlPlaneHeartbeatRuntimeMapSource,
+    ControlPlaneRuntimeMapSource, ControlPlaneStorageNodeAuthCredential,
+    ControlPlaneUnixAuthVerifier, FencedPgMetadataTransferSnapshot, FileControlPlaneStore,
+    PgMetadataProof, PgMetadataTransferProof, PgRouteSnapshot, SingleAuthorityControlPlane,
+    UnixControlPlaneClient,
 };
 use storage::control_plane_auth::{
     ControlPlaneAuthEnvelope, ControlPlaneAuthOperation, ControlPlaneAuthPrincipal,
@@ -67,6 +68,7 @@ use tokio::runtime::Handle;
 use tokio_rustls::TlsAcceptor;
 
 use config::{
+    ConfiguredControlPlaneFrontendAuthCredential, ConfiguredControlPlaneFrontendRuntimeMapAuth,
     ConfiguredControlPlaneStorageAuthCredential, ConfiguredCredential, ConfiguredCredentialProfile,
     ProcessRole, ServerConfig,
 };
@@ -1317,7 +1319,8 @@ fn store_error_is_transient_route_refresh_for_metadata_transfer(error: &StoreErr
 fn control_plane_runtime_map_ready(
     socket_path: &Path,
 ) -> Result<(ClusterEpoch, usize, usize), String> {
-    let status = UnixControlPlaneClient::new(socket_path)
+    let control_plane = build_frontend_control_plane_client_from_runtime_map_auth_env(socket_path)?;
+    let status = control_plane
         .runtime_map_status_with_check_applied_timeout()
         .map_err(|error| format!("control-plane runtime map is not ready: {error}"))?;
     Ok((
@@ -1328,7 +1331,8 @@ fn control_plane_runtime_map_ready(
 }
 
 fn control_plane_runtime_map_diagnostics(socket_path: &Path) -> Result<String, String> {
-    let runtime_map = UnixControlPlaneClient::new(socket_path)
+    let control_plane = build_frontend_control_plane_client_from_runtime_map_auth_env(socket_path)?;
+    let runtime_map = control_plane
         .runtime_map_snapshot(storage::clock::current_time_millis())
         .map_err(|error| format!("control-plane runtime map is not ready: {error}"))?;
     Ok(format_control_plane_runtime_map_diagnostics(&runtime_map))
@@ -1414,7 +1418,7 @@ fn run_control_plane_process(config: &ServerConfig) -> ! {
     });
     let authority = Arc::new(Mutex::new(authority));
     let active_rpc_workers = Arc::new(AtomicUsize::new(0));
-    let auth_verifier = build_control_plane_storage_auth_verifier(config)
+    let auth_verifier = build_control_plane_unix_auth_verifier(config)
         .unwrap_or_else(|error| {
             eprintln!("failed to configure control-plane auth verifier: {error}");
             std::process::exit(1);
@@ -2705,7 +2709,7 @@ fn run_experimental_raft_control_plane_process(config: &ServerConfig) -> ! {
     let raft_authority = Arc::clone(&authority);
     let authority = Arc::new(Mutex::new(control_plane));
     let active_rpc_workers = Arc::new(AtomicUsize::new(0));
-    let auth_verifier = build_control_plane_storage_auth_verifier(config)
+    let auth_verifier = build_control_plane_unix_auth_verifier(config)
         .unwrap_or_else(|error| {
             eprintln!("failed to configure control-plane auth verifier: {error}");
             std::process::exit(1);
@@ -3038,6 +3042,11 @@ enum StorageNodeControlPlaneClient {
     Authenticated(AuthenticatedUnixControlPlaneClient),
 }
 
+enum FrontendControlPlaneClient {
+    Plain(UnixControlPlaneClient),
+    Authenticated(AuthenticatedUnixControlPlaneClient),
+}
+
 impl ControlPlaneHeartbeatRuntimeMapSource for StorageNodeControlPlaneClient {
     fn refresh_node_heartbeat(
         &mut self,
@@ -3049,6 +3058,52 @@ impl ControlPlaneHeartbeatRuntimeMapSource for StorageNodeControlPlaneClient {
             Self::Authenticated(client) => {
                 client.refresh_node_heartbeat(heartbeat, authority_now_ms)
             }
+        }
+    }
+}
+
+impl ControlPlaneRuntimeMapSource for FrontendControlPlaneClient {
+    fn runtime_map_snapshot(
+        &self,
+        authority_now_ms: u64,
+    ) -> Result<ClusterRuntimeMapSnapshot, ControlPlaneError> {
+        match self {
+            Self::Plain(client) => client.runtime_map_snapshot(authority_now_ms),
+            Self::Authenticated(client) => client.runtime_map_snapshot(authority_now_ms),
+        }
+    }
+
+    fn runtime_map_status(
+        &self,
+        authority_now_ms: u64,
+    ) -> Result<storage::control_plane::ControlPlaneRuntimeMapStatus, ControlPlaneError> {
+        match self {
+            Self::Plain(client) => client.runtime_map_status(authority_now_ms),
+            Self::Authenticated(client) => client.runtime_map_status(authority_now_ms),
+        }
+    }
+
+    fn pg_runtime_map_snapshot(
+        &self,
+        pg_id: PgId,
+        authority_now_ms: u64,
+    ) -> Result<ClusterRuntimeMapSnapshot, ControlPlaneError> {
+        match self {
+            Self::Plain(client) => client.pg_runtime_map_snapshot(pg_id, authority_now_ms),
+            Self::Authenticated(client) => client.pg_runtime_map_snapshot(pg_id, authority_now_ms),
+        }
+    }
+}
+
+impl FrontendControlPlaneClient {
+    fn runtime_map_status_with_check_applied_timeout(
+        &self,
+    ) -> Result<storage::control_plane::ControlPlaneRuntimeMapStatus, ControlPlaneError> {
+        match self {
+            Self::Plain(client) => client.runtime_map_status_with_check_applied_timeout(),
+            Self::Authenticated(client) => client.runtime_map_status_with_check_applied_timeout(
+                storage::clock::current_time_millis(),
+            ),
         }
     }
 }
@@ -3070,26 +3125,136 @@ fn configured_storage_node_auth_credential(
     })
 }
 
-fn build_control_plane_storage_auth_verifier(
+fn configured_frontend_auth_credential(
+    configured: &ConfiguredControlPlaneFrontendAuthCredential,
+) -> Result<ControlPlaneFrontendAuthCredential, String> {
+    ControlPlaneFrontendAuthCredential::new(
+        configured.instance_id.clone(),
+        configured.credential_id.clone(),
+        configured.credential_version,
+        configured.secret.as_str().as_bytes().to_vec(),
+    )
+    .map_err(|error| {
+        format!(
+            "invalid ARGMIN_CONTROL_PLANE_FRONTEND_AUTH_CREDENTIALS credential for instance {}: {error}",
+            configured.instance_id
+        )
+    })
+}
+
+fn build_control_plane_unix_auth_verifier(
     config: &ServerConfig,
 ) -> Result<Option<ControlPlaneUnixAuthVerifier>, String> {
-    if config.control_plane_storage_auth_credentials.is_empty() {
+    if config.control_plane_storage_auth_credentials.is_empty()
+        && config.control_plane_frontend_auth_credentials.is_empty()
+    {
         return Ok(None);
     }
     let cluster_id = config
         .control_plane_auth_cluster_id
         .as_deref()
-        .expect("storage auth credentials require control-plane auth cluster id");
-    let credentials = config
+        .expect("control-plane Unix auth credentials require control-plane auth cluster id");
+    let storage_credentials = config
         .control_plane_storage_auth_credentials
         .iter()
         .map(configured_storage_node_auth_credential)
         .collect::<Result<Vec<_>, _>>()?;
-    ControlPlaneUnixAuthVerifier::new(cluster_id, credentials)
+    let frontend_credentials = config
+        .control_plane_frontend_auth_credentials
+        .iter()
+        .map(configured_frontend_auth_credential)
+        .collect::<Result<Vec<_>, _>>()?;
+    let verifier = if storage_credentials.is_empty() {
+        ControlPlaneUnixAuthVerifier::new_empty(cluster_id)
+    } else {
+        ControlPlaneUnixAuthVerifier::new(cluster_id, storage_credentials)
+    }
+    .map_err(|error| format!("invalid control-plane Unix auth credential verifier: {error}"))?;
+    verifier
+        .with_frontend_credentials(frontend_credentials)
         .map(Some)
         .map_err(|error| {
-            format!("invalid ARGMIN_CONTROL_PLANE_STORAGE_AUTH_CREDENTIALS verifier: {error}")
+            format!("invalid ARGMIN_CONTROL_PLANE_FRONTEND_AUTH_CREDENTIALS verifier: {error}")
         })
+}
+
+fn build_frontend_control_plane_client(
+    config: &ServerConfig,
+    control_plane_socket_path: &str,
+) -> Result<FrontendControlPlaneClient, String> {
+    if config.control_plane_frontend_auth_credentials.is_empty() {
+        return Ok(FrontendControlPlaneClient::Plain(
+            UnixControlPlaneClient::new(control_plane_socket_path),
+        ));
+    }
+    let cluster_id = config
+        .control_plane_auth_cluster_id
+        .as_deref()
+        .expect("frontend auth credentials require control-plane auth cluster id");
+    let instance_id = config
+        .control_plane_frontend_auth_instance_id
+        .as_deref()
+        .expect("frontend auth credentials require local frontend instance id");
+    let configured = config
+        .control_plane_frontend_auth_credentials
+        .iter()
+        .find(|credential| credential.instance_id == instance_id)
+        .ok_or_else(|| {
+            format!(
+                "ARGMIN_CONTROL_PLANE_FRONTEND_AUTH_CREDENTIALS must include local frontend instance id {instance_id}"
+            )
+        })?;
+    build_authenticated_frontend_control_plane_client(
+        control_plane_socket_path,
+        cluster_id,
+        instance_id,
+        configured,
+    )
+}
+
+fn build_frontend_control_plane_client_from_runtime_map_auth_env(
+    control_plane_socket_path: &Path,
+) -> Result<FrontendControlPlaneClient, String> {
+    let auth_config = ConfiguredControlPlaneFrontendRuntimeMapAuth::from_env()?;
+    match auth_config {
+        Some(auth_config) => {
+            let configured = auth_config
+                .credentials
+                .iter()
+                .find(|credential| credential.instance_id == auth_config.instance_id)
+                .expect("auth-only frontend config validates local instance credential");
+            build_authenticated_frontend_control_plane_client(
+                control_plane_socket_path,
+                &auth_config.cluster_id,
+                &auth_config.instance_id,
+                configured,
+            )
+        }
+        None => Ok(FrontendControlPlaneClient::Plain(
+            UnixControlPlaneClient::new(control_plane_socket_path),
+        )),
+    }
+}
+
+fn build_authenticated_frontend_control_plane_client(
+    control_plane_socket_path: impl Into<std::path::PathBuf>,
+    cluster_id: &str,
+    instance_id: &str,
+    configured: &ConfiguredControlPlaneFrontendAuthCredential,
+) -> Result<FrontendControlPlaneClient, String> {
+    let credential = configured_frontend_auth_credential(configured)?
+        .scoped_for_cluster(cluster_id)
+        .map_err(|error| {
+            format!(
+                "invalid ARGMIN_CONTROL_PLANE_FRONTEND_AUTH_CREDENTIALS scoped credential for instance {instance_id}: {error}"
+            )
+        })?;
+    Ok(FrontendControlPlaneClient::Authenticated(
+        AuthenticatedUnixControlPlaneClient::new(
+            UnixControlPlaneClient::new(control_plane_socket_path),
+            credential,
+        ),
+    ))
 }
 
 fn build_storage_node_control_plane_client(
@@ -3761,14 +3926,14 @@ fn build_control_plane_frontend_storage_cluster(
     ec_config: &EcConfig,
     control_plane_socket_path: &str,
 ) -> Result<Arc<StorageCluster>, String> {
-    let runtime_map =
-        UnixControlPlaneClient::new(control_plane_socket_path)
-            .runtime_map_snapshot(storage::clock::current_time_millis())
-            .map_err(|error| {
-                format!(
-                    "failed to fetch control-plane runtime map from {control_plane_socket_path}: {error}"
-                )
-            })?;
+    let control_plane = build_frontend_control_plane_client(config, control_plane_socket_path)?;
+    let runtime_map = control_plane
+        .runtime_map_snapshot(storage::clock::current_time_millis())
+        .map_err(|error| {
+            format!(
+                "failed to fetch control-plane runtime map from {control_plane_socket_path}: {error}"
+            )
+        })?;
     ensure_frontend_startup_runtime_map_is_serving(&runtime_map)?;
     build_frontend_storage_cluster_from_runtime_map(config, ec_config, &runtime_map)
 }
@@ -3971,7 +4136,10 @@ fn maybe_spawn_frontend_control_plane_refresh_loop(
     );
     let loop_handle = storage_cluster_handle
         .spawn_control_plane_refresh_loop_with_unix_storage_node_clients(
-            UnixControlPlaneClient::new(socket_path),
+            build_frontend_control_plane_client(config, socket_path).unwrap_or_else(|error| {
+                eprintln!("failed to configure frontend control-plane auth client: {error}");
+                std::process::exit(1);
+            }),
             config.control_plane_refresh_interval,
             storage::clock::current_time_millis,
             admission_settings,
@@ -4067,6 +4235,8 @@ mod tests {
             control_plane_socket_path: None,
             control_plane_auth_cluster_id: None,
             control_plane_storage_auth_credentials: Vec::new(),
+            control_plane_frontend_auth_instance_id: None,
+            control_plane_frontend_auth_credentials: Vec::new(),
             control_plane_experimental_raft: false,
             control_plane_raft_cluster_name: None,
             control_plane_raft_node_id: None,
@@ -4147,6 +4317,71 @@ mod tests {
         };
 
         assert!(err.contains("local storage node id 2"));
+    }
+
+    #[test]
+    fn frontend_control_plane_client_uses_authenticated_client_when_configured() {
+        let mut config = test_server_config();
+        config.control_plane_auth_cluster_id = Some("control-auth".to_string());
+        config.control_plane_frontend_auth_instance_id = Some("frontend-1".to_string());
+        config.control_plane_frontend_auth_credentials =
+            vec![ConfiguredControlPlaneFrontendAuthCredential {
+                instance_id: "frontend-1".to_string(),
+                credential_id: "frontend".to_string(),
+                credential_version: 7,
+                secret: SecretConfigValue::new("frontend-1-secret".to_string()),
+            }];
+
+        let client = build_frontend_control_plane_client(&config, "/tmp/argmin-control-plane.sock")
+            .expect("frontend auth client should build");
+
+        assert!(matches!(
+            client,
+            FrontendControlPlaneClient::Authenticated(_)
+        ));
+    }
+
+    #[test]
+    fn frontend_control_plane_client_requires_local_auth_credential() {
+        let mut config = test_server_config();
+        config.control_plane_auth_cluster_id = Some("control-auth".to_string());
+        config.control_plane_frontend_auth_instance_id = Some("frontend-2".to_string());
+        config.control_plane_frontend_auth_credentials =
+            vec![ConfiguredControlPlaneFrontendAuthCredential {
+                instance_id: "frontend-1".to_string(),
+                credential_id: "frontend".to_string(),
+                credential_version: 7,
+                secret: SecretConfigValue::new("frontend-1-secret".to_string()),
+            }];
+
+        let result = build_frontend_control_plane_client(&config, "/tmp/argmin-control-plane.sock");
+        let Err(err) = result else {
+            panic!("frontend control-plane client should reject missing local credential");
+        };
+
+        assert!(err.contains("local frontend instance id frontend-2"));
+    }
+
+    #[test]
+    fn control_plane_unix_auth_verifier_includes_frontend_credentials() {
+        let mut config = test_server_config();
+        config.control_plane_auth_cluster_id = Some("control-auth".to_string());
+        config.control_plane_frontend_auth_credentials =
+            vec![ConfiguredControlPlaneFrontendAuthCredential {
+                instance_id: "frontend-1".to_string(),
+                credential_id: "frontend".to_string(),
+                credential_version: 7,
+                secret: SecretConfigValue::new("frontend-1-secret".to_string()),
+            }];
+
+        let verifier = build_control_plane_unix_auth_verifier(&config)
+            .expect("frontend auth verifier should build")
+            .expect("frontend auth verifier should be enabled");
+        let status = verifier.status_snapshot();
+
+        assert_eq!(status.storage_node_credentials().len(), 0);
+        assert_eq!(status.frontend_credentials().len(), 1);
+        assert_eq!(status.frontend_credentials()[0].instance_id(), "frontend-1");
     }
 
     #[test]
