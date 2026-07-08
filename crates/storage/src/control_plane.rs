@@ -5692,6 +5692,10 @@ where
             }
         }
         ControlPlaneRpcKind::RefreshNodeHeartbeat => {
+            debug_assert_eq!(
+                kind.auth_operation(),
+                ControlPlaneAuthOperation::StorageRuntimeMapRefresh
+            );
             let payload = match auth_verifier {
                 Some(auth_verifier) => auth_verifier
                     .verify_storage_node_heartbeat_payload(&payload, authority_now_ms)?,
@@ -5889,6 +5893,22 @@ impl ControlPlaneRpcKind {
             _ => Err(ControlPlaneError::RpcProtocol {
                 message: format!("unknown control-plane RPC kind {value}"),
             }),
+        }
+    }
+
+    fn auth_operation(self) -> ControlPlaneAuthOperation {
+        match self {
+            Self::RuntimeMapSnapshot | Self::PgRuntimeMapSnapshot | Self::RuntimeMapStatus => {
+                ControlPlaneAuthOperation::FrontendRuntimeMapRead
+            }
+            Self::RefreshNodeHeartbeat => ControlPlaneAuthOperation::StorageRuntimeMapRefresh,
+            Self::SetPgActingSet
+            | Self::SetPgActingSetWithMetadataTransfer
+            | Self::SetPgActingSetWithMetadataTransferRuntimeMap
+            | Self::FencePgForMetadataTransferRuntimeMap
+            | Self::TransferRaftLeadership
+            | Self::TriggerRaftSnapshotAndPurge
+            | Self::TriggerRaftElection => ControlPlaneAuthOperation::AdminControlPlaneCommand,
         }
     }
 }
@@ -13240,6 +13260,44 @@ mod tests {
             error,
             ControlPlaneError::RpcRemote { message } if message.contains("unknown node 99")
         ));
+    }
+
+    #[test]
+    fn control_plane_rpc_kinds_have_explicit_auth_operations() {
+        let frontend_read_kinds = [
+            ControlPlaneRpcKind::RuntimeMapSnapshot,
+            ControlPlaneRpcKind::PgRuntimeMapSnapshot,
+            ControlPlaneRpcKind::RuntimeMapStatus,
+        ];
+        for kind in frontend_read_kinds {
+            assert_eq!(
+                kind.auth_operation(),
+                ControlPlaneAuthOperation::FrontendRuntimeMapRead,
+                "{kind:?}"
+            );
+        }
+
+        assert_eq!(
+            ControlPlaneRpcKind::RefreshNodeHeartbeat.auth_operation(),
+            ControlPlaneAuthOperation::StorageRuntimeMapRefresh
+        );
+
+        let admin_kinds = [
+            ControlPlaneRpcKind::SetPgActingSet,
+            ControlPlaneRpcKind::SetPgActingSetWithMetadataTransfer,
+            ControlPlaneRpcKind::SetPgActingSetWithMetadataTransferRuntimeMap,
+            ControlPlaneRpcKind::FencePgForMetadataTransferRuntimeMap,
+            ControlPlaneRpcKind::TransferRaftLeadership,
+            ControlPlaneRpcKind::TriggerRaftSnapshotAndPurge,
+            ControlPlaneRpcKind::TriggerRaftElection,
+        ];
+        for kind in admin_kinds {
+            assert_eq!(
+                kind.auth_operation(),
+                ControlPlaneAuthOperation::AdminControlPlaneCommand,
+                "{kind:?}"
+            );
+        }
     }
 
     #[test]

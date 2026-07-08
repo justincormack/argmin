@@ -356,6 +356,15 @@ Required:
 - keep command replay independent of auth metadata unless the command itself
   intentionally records caller identity.
 
+Progress:
+
+- The Unix control-plane RPC boundary now classifies every current RPC kind
+  into an explicit auth operation: frontend runtime-map reads,
+  storage-node heartbeat refresh, or admin control-plane command. This pins the
+  operation mapping that future request-auth enforcement must use and forces
+  new RPC kinds to choose their auth class instead of inheriting an implicit
+  default.
+
 ### Slice D: Runtime-Map and Read Freshness Proof Consumers
 
 Runtime-map freshness proofs must not be confused with authentication. Auth
