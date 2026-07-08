@@ -3188,27 +3188,47 @@ pub struct PutLiveObjectReq {
 
 impl PutLiveObjectReq {
     /// Validate that the etag variant is consistent with the layout.
-    pub fn validate(&self) -> Result<(), &'static str> {
-        match (&self.etag, &self.layout) {
-            (ObjectEtag::SinglePart(_), ObjectLayout::Standard) => Ok(()),
-            (
-                ObjectEtag::MultipartComposite { parts, .. },
-                ObjectLayout::MultipartManifest { parts_count },
-            ) => {
-                if parts == parts_count {
-                    Ok(())
-                } else {
-                    Err("etag parts count does not match layout parts count")
-                }
-            }
-            (ObjectEtag::SinglePart(_), ObjectLayout::MultipartManifest { .. }) => {
-                Err("single-part etag with multipart layout")
-            }
-            (ObjectEtag::MultipartComposite { .. }, ObjectLayout::Standard) => {
-                Err("multipart composite etag with standard layout")
+    pub fn validate(&self) -> Result<(), PutLiveObjectValidationError> {
+        validate_live_object_etag_layout(&self.etag, &self.layout)
+    }
+}
+
+fn validate_live_object_etag_layout(
+    etag: &ObjectEtag,
+    layout: &ObjectLayout,
+) -> Result<(), PutLiveObjectValidationError> {
+    match (etag, layout) {
+        (ObjectEtag::SinglePart(_), ObjectLayout::Standard) => Ok(()),
+        (
+            ObjectEtag::MultipartComposite { parts, .. },
+            ObjectLayout::MultipartManifest { parts_count },
+        ) => {
+            if parts == parts_count {
+                Ok(())
+            } else {
+                Err(PutLiveObjectValidationError::MultipartPartsCountMismatch {
+                    etag_parts: parts.get(),
+                    layout_parts: parts_count.get(),
+                })
             }
         }
+        (ObjectEtag::SinglePart(_), ObjectLayout::MultipartManifest { .. }) => {
+            Err(PutLiveObjectValidationError::SinglePartEtagWithMultipartLayout)
+        }
+        (ObjectEtag::MultipartComposite { .. }, ObjectLayout::Standard) => {
+            Err(PutLiveObjectValidationError::MultipartCompositeEtagWithStandardLayout)
+        }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum PutLiveObjectValidationError {
+    #[error("etag parts count does not match layout parts count")]
+    MultipartPartsCountMismatch { etag_parts: u32, layout_parts: u32 },
+    #[error("single-part etag with multipart layout")]
+    SinglePartEtagWithMultipartLayout,
+    #[error("multipart composite etag with standard layout")]
+    MultipartCompositeEtagWithStandardLayout,
 }
 
 /// Request to store a delete marker.
@@ -4355,6 +4375,43 @@ mod tests {
                 actual: 0,
                 minimum: SseCustomerObjectState::FIXED_ENCODED_LEN,
             }
+        );
+    }
+
+    #[test]
+    fn put_live_object_validate_reports_typed_etag_layout_errors() {
+        let single = ObjectEtag::SinglePart([1; 8]);
+        let multipart = ObjectEtag::MultipartComposite {
+            crc64: [2; 8],
+            parts: std::num::NonZeroU32::new(2).unwrap(),
+        };
+        let standard = ObjectLayout::Standard;
+        let multipart_two = ObjectLayout::MultipartManifest {
+            parts_count: std::num::NonZeroU32::new(2).unwrap(),
+        };
+        let multipart_three = ObjectLayout::MultipartManifest {
+            parts_count: std::num::NonZeroU32::new(3).unwrap(),
+        };
+
+        assert_eq!(validate_live_object_etag_layout(&single, &standard), Ok(()));
+        assert_eq!(
+            validate_live_object_etag_layout(&multipart, &multipart_two),
+            Ok(())
+        );
+        assert_eq!(
+            validate_live_object_etag_layout(&multipart, &multipart_three).unwrap_err(),
+            PutLiveObjectValidationError::MultipartPartsCountMismatch {
+                etag_parts: 2,
+                layout_parts: 3,
+            }
+        );
+        assert_eq!(
+            validate_live_object_etag_layout(&single, &multipart_two).unwrap_err(),
+            PutLiveObjectValidationError::SinglePartEtagWithMultipartLayout
+        );
+        assert_eq!(
+            validate_live_object_etag_layout(&multipart, &standard).unwrap_err(),
+            PutLiveObjectValidationError::MultipartCompositeEtagWithStandardLayout
         );
     }
 

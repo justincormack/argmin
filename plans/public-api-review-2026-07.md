@@ -1053,8 +1053,9 @@ each is one refactor away from a panic:
   shape/version/length errors; `RawChecksum::new`/`ChecksumBytes::new ->
   Result<_, &'static str>` was fixed with typed `RawChecksumError` and
   `ChecksumBytesError` variants, with storage/RPC/server boundaries preserving
-  their existing outer classifications; `validate -> Result<(), &'static str>`
-  (types.rs:3100);
+  their existing outer classifications; `PutLiveObjectReq::validate ->
+  Result<(), &'static str>` was fixed with typed `PutLiveObjectValidationError`
+  variants for the ETag/layout consistency matrix;
   `SseCustomerValidatorConfig::from_base64`/`ManagedWrappingKeyConfig::
   from_base64 -> Result<_, String>` (`sse.rs:112, 147`). Remaining fix:
   small typed error enums throughout.

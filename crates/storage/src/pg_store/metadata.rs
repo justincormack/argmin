@@ -4308,12 +4308,12 @@ impl PgStore {
         write_sequence: u64,
         last_modified: u64,
     ) -> Result<(), MetadataError> {
-        obj.validate().map_err(|msg| MetadataError::Db {
+        obj.validate().map_err(|err| MetadataError::Db {
             context: "put explicit segment object (etag/layout mismatch)",
             source: rusqlite::Error::FromSqlConversionFailure(
                 0,
                 rusqlite::types::Type::Null,
-                Box::from(msg),
+                Box::new(err),
             ),
         })?;
         if obj.layout != ObjectLayout::Standard {
@@ -4472,12 +4472,12 @@ impl PgStore {
         write_sequence: u64,
         last_modified: u64,
     ) -> Result<(), MetadataError> {
-        obj.validate().map_err(|msg| MetadataError::Db {
+        obj.validate().map_err(|err| MetadataError::Db {
             context: "put explicit multipart object (etag/layout mismatch)",
             source: rusqlite::Error::FromSqlConversionFailure(
                 0,
                 rusqlite::types::Type::Null,
-                Box::from(msg),
+                Box::new(err),
             ),
         })?;
         if !matches!(obj.layout, ObjectLayout::MultipartManifest { .. }) {
@@ -6502,12 +6502,12 @@ impl PgMetadataStore for PgStore {
             PutObjectReq::Live(req) => {
                 let write_sequence =
                     self.next_object_write_sequence(req.bucket.as_str(), req.key.as_str())?;
-                req.validate().map_err(|msg| MetadataError::Db {
+                req.validate().map_err(|err| MetadataError::Db {
                     context: "put object meta (etag/layout mismatch)",
                     source: rusqlite::Error::FromSqlConversionFailure(
                         0,
                         rusqlite::types::Type::Null,
-                        Box::from(msg),
+                        Box::new(err),
                     ),
                 })?;
                 self.mark_current_live_noncurrent(
@@ -11172,12 +11172,12 @@ impl PgMetadataStore for PgStore {
         obj: &PutLiveObjectReq,
         segments: &[ObjectSegmentRecord],
     ) -> Result<(), MetadataError> {
-        obj.validate().map_err(|msg| MetadataError::Db {
+        obj.validate().map_err(|err| MetadataError::Db {
             context: "put segment object (etag/layout mismatch)",
             source: rusqlite::Error::FromSqlConversionFailure(
                 0,
                 rusqlite::types::Type::Null,
-                Box::from(msg),
+                Box::new(err),
             ),
         })?;
         if obj.layout != ObjectLayout::Standard {
