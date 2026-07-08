@@ -14371,8 +14371,9 @@ mod tests {
             UnixControlPlaneClient::new(&socket_path),
             credential,
         );
+        let mut clock = [2_000, 2_050].into_iter();
         let refresh = client
-            .refresh_node_heartbeat(
+            .refresh_node_heartbeat_with_clock(
                 NodeHeartbeat {
                     node_id: NodeId::new(1),
                     node_incarnation: 42,
@@ -14385,7 +14386,11 @@ mod tests {
                     },
                     pg_observations: Vec::new(),
                 },
-                2_000,
+                || {
+                    clock.next().ok_or_else(|| ControlPlaneError::RpcProtocol {
+                        message: "test heartbeat auth clock exhausted".to_owned(),
+                    })
+                },
             )
             .unwrap();
 

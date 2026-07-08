@@ -3387,15 +3387,10 @@ fn build_frontend_control_plane_client(
         .control_plane_frontend_auth_instance_id
         .as_deref()
         .expect("frontend auth credentials require local frontend instance id");
-    let configured = config
-        .control_plane_frontend_auth_credentials
-        .iter()
-        .find(|credential| credential.instance_id == instance_id)
-        .ok_or_else(|| {
-            format!(
-                "ARGMIN_CONTROL_PLANE_FRONTEND_AUTH_CREDENTIALS must include local frontend instance id {instance_id}"
-            )
-        })?;
+    let configured = latest_frontend_auth_credential_for_instance(
+        &config.control_plane_frontend_auth_credentials,
+        instance_id,
+    )?;
     build_authenticated_frontend_control_plane_client(
         control_plane_socket_path,
         cluster_id,
@@ -3410,11 +3405,11 @@ fn build_frontend_control_plane_client_from_runtime_map_auth_env(
     let auth_config = ConfiguredControlPlaneFrontendRuntimeMapAuth::from_env()?;
     match auth_config {
         Some(auth_config) => {
-            let configured = auth_config
-                .credentials
-                .iter()
-                .find(|credential| credential.instance_id == auth_config.instance_id)
-                .expect("auth-only frontend config validates local instance credential");
+            let configured = latest_frontend_auth_credential_for_instance(
+                &auth_config.credentials,
+                &auth_config.instance_id,
+            )
+            .expect("auth-only frontend config validates local instance credential");
             build_authenticated_frontend_control_plane_client(
                 control_plane_socket_path,
                 &auth_config.cluster_id,
@@ -3433,11 +3428,11 @@ fn build_admin_control_plane_client_from_command_auth_env(
 ) -> Result<AdminControlPlaneClient, String> {
     match ConfiguredControlPlaneAdminCommandAuth::from_env()? {
         Some(auth_config) => {
-            let configured = auth_config
-                .credentials
-                .iter()
-                .find(|credential| credential.instance_id == auth_config.instance_id)
-                .expect("auth-only admin config validates local instance credential");
+            let configured = latest_admin_auth_credential_for_instance(
+                &auth_config.credentials,
+                &auth_config.instance_id,
+            )
+            .expect("auth-only admin config validates local instance credential");
             let credential = configured_admin_auth_credential(configured)?
                 .scoped_for_cluster(&auth_config.cluster_id)
                 .map_err(|error| {
@@ -3494,16 +3489,10 @@ fn build_storage_node_control_plane_client(
         .control_plane_auth_cluster_id
         .as_deref()
         .expect("storage auth credentials require control-plane auth cluster id");
-    let configured = config
-        .control_plane_storage_auth_credentials
-        .iter()
-        .find(|credential| credential.node_id == node_id.as_u32())
-        .ok_or_else(|| {
-            format!(
-                "ARGMIN_CONTROL_PLANE_STORAGE_AUTH_CREDENTIALS must include local storage node id {}",
-                node_id.as_u32()
-            )
-        })?;
+    let configured = latest_storage_node_auth_credential_for_node(
+        &config.control_plane_storage_auth_credentials,
+        node_id.as_u32(),
+    )?;
     let credential = configured_storage_node_auth_credential(configured)?
         .scoped_for_cluster_and_incarnation(cluster_id, node_incarnation)
         .map_err(|error| {
@@ -3515,6 +3504,63 @@ fn build_storage_node_control_plane_client(
     Ok(StorageNodeControlPlaneClient::Authenticated(
         AuthenticatedUnixControlPlaneClient::new(client, credential),
     ))
+}
+
+fn latest_storage_node_auth_credential_for_node(
+    credentials: &[ConfiguredControlPlaneStorageAuthCredential],
+    node_id: u32,
+) -> Result<&ConfiguredControlPlaneStorageAuthCredential, String> {
+    credentials
+        .iter()
+        .filter(|credential| credential.node_id == node_id)
+        .max_by(|left, right| {
+            left.credential_version
+                .cmp(&right.credential_version)
+                .then_with(|| left.credential_id.cmp(&right.credential_id))
+        })
+        .ok_or_else(|| {
+            format!(
+                "ARGMIN_CONTROL_PLANE_STORAGE_AUTH_CREDENTIALS must include local storage node id {node_id}"
+            )
+        })
+}
+
+fn latest_frontend_auth_credential_for_instance<'a>(
+    credentials: &'a [ConfiguredControlPlaneFrontendAuthCredential],
+    instance_id: &str,
+) -> Result<&'a ConfiguredControlPlaneFrontendAuthCredential, String> {
+    credentials
+        .iter()
+        .filter(|credential| credential.instance_id == instance_id)
+        .max_by(|left, right| {
+            left.credential_version
+                .cmp(&right.credential_version)
+                .then_with(|| left.credential_id.cmp(&right.credential_id))
+        })
+        .ok_or_else(|| {
+            format!(
+                "ARGMIN_CONTROL_PLANE_FRONTEND_AUTH_CREDENTIALS must include local frontend instance id {instance_id}"
+            )
+        })
+}
+
+fn latest_admin_auth_credential_for_instance<'a>(
+    credentials: &'a [ConfiguredControlPlaneAdminAuthCredential],
+    instance_id: &str,
+) -> Result<&'a ConfiguredControlPlaneAdminAuthCredential, String> {
+    credentials
+        .iter()
+        .filter(|credential| credential.instance_id == instance_id)
+        .max_by(|left, right| {
+            left.credential_version
+                .cmp(&right.credential_version)
+                .then_with(|| left.credential_id.cmp(&right.credential_id))
+        })
+        .ok_or_else(|| {
+            format!(
+                "ARGMIN_CONTROL_PLANE_ADMIN_AUTH_CREDENTIALS must include local admin instance id {instance_id}"
+            )
+        })
 }
 
 fn bind_control_plane_socket(socket_path: &Path) -> Result<UnixListener, String> {
@@ -4494,13 +4540,20 @@ mod tests {
     fn storage_node_control_plane_client_uses_authenticated_client_when_configured() {
         let mut config = test_server_config();
         config.control_plane_auth_cluster_id = Some("control-auth".to_string());
-        config.control_plane_storage_auth_credentials =
-            vec![ConfiguredControlPlaneStorageAuthCredential {
+        config.control_plane_storage_auth_credentials = vec![
+            ConfiguredControlPlaneStorageAuthCredential {
                 node_id: 2,
                 credential_id: "storage-node".to_string(),
                 credential_version: 7,
                 secret: SecretConfigValue::new("storage-node-2-secret".to_string()),
-            }];
+            },
+            ConfiguredControlPlaneStorageAuthCredential {
+                node_id: 2,
+                credential_id: "storage-node".to_string(),
+                credential_version: 8,
+                secret: SecretConfigValue::new("storage-node-2-new-secret".to_string()),
+            },
+        ];
 
         let client = build_storage_node_control_plane_client(
             &config,
@@ -4510,10 +4563,10 @@ mod tests {
         )
         .expect("storage-node auth client should build");
 
-        assert!(matches!(
-            client,
-            StorageNodeControlPlaneClient::Authenticated(_)
-        ));
+        let StorageNodeControlPlaneClient::Authenticated(client) = client else {
+            panic!("storage-node auth client should be authenticated");
+        };
+        assert_eq!(client.credential().credential_version(), 8);
     }
 
     #[test]
@@ -4546,21 +4599,51 @@ mod tests {
         let mut config = test_server_config();
         config.control_plane_auth_cluster_id = Some("control-auth".to_string());
         config.control_plane_frontend_auth_instance_id = Some("frontend-1".to_string());
-        config.control_plane_frontend_auth_credentials =
-            vec![ConfiguredControlPlaneFrontendAuthCredential {
+        config.control_plane_frontend_auth_credentials = vec![
+            ConfiguredControlPlaneFrontendAuthCredential {
                 instance_id: "frontend-1".to_string(),
                 credential_id: "frontend".to_string(),
                 credential_version: 7,
                 secret: SecretConfigValue::new("frontend-1-secret".to_string()),
-            }];
+            },
+            ConfiguredControlPlaneFrontendAuthCredential {
+                instance_id: "frontend-1".to_string(),
+                credential_id: "frontend".to_string(),
+                credential_version: 8,
+                secret: SecretConfigValue::new("frontend-1-new-secret".to_string()),
+            },
+        ];
 
         let client = build_frontend_control_plane_client(&config, "/tmp/argmin-control-plane.sock")
             .expect("frontend auth client should build");
 
-        assert!(matches!(
-            client,
-            FrontendControlPlaneClient::Authenticated(_)
-        ));
+        let FrontendControlPlaneClient::Authenticated(client) = client else {
+            panic!("frontend auth client should be authenticated");
+        };
+        assert_eq!(client.credential().credential_version(), 8);
+    }
+
+    #[test]
+    fn admin_control_plane_client_selects_latest_local_auth_credential() {
+        let credentials = vec![
+            ConfiguredControlPlaneAdminAuthCredential {
+                instance_id: "admin-1".to_string(),
+                credential_id: "admin".to_string(),
+                credential_version: 7,
+                secret: SecretConfigValue::new("admin-1-secret".to_string()),
+            },
+            ConfiguredControlPlaneAdminAuthCredential {
+                instance_id: "admin-1".to_string(),
+                credential_id: "admin".to_string(),
+                credential_version: 8,
+                secret: SecretConfigValue::new("admin-1-new-secret".to_string()),
+            },
+        ];
+
+        let configured = latest_admin_auth_credential_for_instance(&credentials, "admin-1")
+            .expect("admin auth credential should be selected");
+
+        assert_eq!(configured.credential_version, 8);
     }
 
     #[test]

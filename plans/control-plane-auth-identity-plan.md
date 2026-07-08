@@ -365,6 +365,11 @@ Progress:
   auth a staged rotation window; signed responses are emitted with the same
   credential id/version that verified the request so old and new clients can
   coexist during the overlap.
+- Local storage-node, frontend, and admin Unix control-plane clients now select
+  the highest configured credential version for their own node/instance when
+  overlapping credentials are present. Servers still accept every configured
+  overlapping credential, but new outbound traffic moves forward to the staged
+  active version without depending on env entry order.
 
 ### Slice C: Frontend and Admin Control-Plane RPCs
 
