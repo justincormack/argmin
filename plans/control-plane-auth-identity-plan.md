@@ -436,8 +436,16 @@ Progress:
 - 2026-07-08: Tightened Slice D so authenticated runtime-map responses cover
   the encoded response status/body, not only successful map bytes. Authenticated
   frontend clients now verify the signed runtime-map response envelope before
-  decoding either a success body or a remote error. Broader admin/storage-node
+  decoding either a success body or a remote error. Broader admin mutation
   response authentication remains separate follow-up work.
+- 2026-07-08: Extended the signed `RuntimeMapResponse` envelope to
+  authenticated storage-node heartbeat refresh responses. The control plane now
+  derives a narrow runtime-map service response credential from the verified
+  `StorageNode { node_id, incarnation }` credential and signs the encoded
+  heartbeat response status/body before returning lease/runtime-map state.
+  Authenticated storage-node clients reject unsigned or wrong-target heartbeat
+  responses before decoding them. Admin mutation response authentication remains
+  separate follow-up work.
 
 ## Replay Policy
 

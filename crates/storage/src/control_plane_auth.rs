@@ -231,6 +231,28 @@ impl ControlPlaneScopedCredential {
         })
     }
 
+    pub(crate) fn runtime_map_response_credential_for_storage_node(
+        &self,
+    ) -> Result<Self, ControlPlaneError> {
+        if !matches!(
+            self.principal,
+            ControlPlaneAuthPrincipal::StorageNode { .. }
+        ) {
+            return Err(auth_protocol_error(
+                "runtime-map response credential requires a storage-node scoped credential",
+            ));
+        }
+        Self::new(ControlPlaneScopedCredentialInput {
+            cluster_id: self.cluster_id.clone(),
+            credential_id: self.credential_id.clone(),
+            credential_version: self.credential_version,
+            principal: ControlPlaneAuthPrincipal::Service {
+                service: ControlPlaneAuthService::RuntimeMap,
+            },
+            secret: self.secret.clone(),
+        })
+    }
+
     pub fn sign_envelope(
         &self,
         input: ControlPlaneAuthSignInput,

@@ -4548,6 +4548,12 @@ struct VerifiedFrontendRuntimeMapRead {
     response_target: ControlPlaneAuthPrincipal,
 }
 
+struct VerifiedStorageNodeHeartbeatRefresh {
+    payload: Vec<u8>,
+    response_credential: ControlPlaneScopedCredential,
+    response_target: ControlPlaneAuthPrincipal,
+}
+
 impl ControlPlaneUnixAuthMetrics {
     fn record_accepted(&self, operation: ControlPlaneAuthOperation) {
         let mut state = self
@@ -4770,6 +4776,17 @@ impl UnixControlPlaneClient {
         payload: &[u8],
         retry_budget: Duration,
     ) -> Result<Vec<u8>, ControlPlaneError> {
+        let response_payload =
+            self.send_liveness_request_raw_response(kind, payload, retry_budget)?;
+        decode_control_plane_rpc_response(response_payload)
+    }
+
+    fn send_liveness_request_raw_response(
+        &self,
+        kind: ControlPlaneRpcKind,
+        payload: &[u8],
+        retry_budget: Duration,
+    ) -> Result<Vec<u8>, ControlPlaneError> {
         debug_assert_eq!(kind, ControlPlaneRpcKind::RefreshNodeHeartbeat);
         if retry_budget.is_zero() {
             return Err(ControlPlaneError::RpcUnconfirmed {
@@ -4797,7 +4814,7 @@ impl UnixControlPlaneClient {
                 };
             }
             let read_timeout = remaining.min(CONTROL_PLANE_RPC_LIVENESS_IO_TIMEOUT);
-            match self.send_request_with_read_timeout(kind, payload, read_timeout) {
+            match self.send_request_raw_response_with_read_timeout(kind, payload, read_timeout) {
                 Ok(payload) => return Ok(payload),
                 Err(error) if error.is_retryable_control_plane_rpc_transport_error() => {
                     let now = Instant::now();
@@ -5603,9 +5620,21 @@ impl AuthenticatedUnixControlPlaneClient {
             authority_now_ms,
             "runtime-map response",
         )?;
-        let response_credential = self
-            .credential
-            .runtime_map_response_credential_for_frontend()?;
+        let response_credential = match self.credential.principal() {
+            ControlPlaneAuthPrincipal::Frontend { .. } => self
+                .credential
+                .runtime_map_response_credential_for_frontend()?,
+            ControlPlaneAuthPrincipal::StorageNode { .. } => self
+                .credential
+                .runtime_map_response_credential_for_storage_node()?,
+            _ => {
+                return Err(ControlPlaneError::RpcProtocol {
+                    message:
+                        "runtime-map response verification requires a frontend or storage-node credential"
+                            .to_owned(),
+                });
+            }
+        };
         let verifier = ControlPlaneScopedCredentialStore::new(vec![response_credential])?;
         let expected_source = ControlPlaneAuthPrincipal::Service {
             service: ControlPlaneAuthService::RuntimeMap,
@@ -5679,6 +5708,15 @@ impl ControlPlaneStorageNodeAuthCredential {
             },
             secret: self.secret.clone(),
         })
+    }
+
+    pub fn runtime_map_response_credential_for_cluster_and_incarnation(
+        &self,
+        cluster_id: &str,
+        incarnation: u64,
+    ) -> Result<ControlPlaneScopedCredential, ControlPlaneError> {
+        self.scoped_for_cluster_and_incarnation(cluster_id, incarnation)?
+            .runtime_map_response_credential_for_storage_node()
     }
 }
 
@@ -6164,11 +6202,11 @@ impl ControlPlaneUnixAuthVerifier {
         }
     }
 
-    pub fn verify_storage_node_heartbeat_payload(
+    fn verify_storage_node_heartbeat_payload(
         &self,
         payload: &[u8],
         authority_now_ms: u64,
-    ) -> Result<Vec<u8>, ControlPlaneError> {
+    ) -> Result<VerifiedStorageNodeHeartbeatRefresh, ControlPlaneError> {
         let envelope = match ControlPlaneAuthEnvelope::decode_frame(
             payload,
             CONTROL_PLANE_RPC_MAX_PAYLOAD_LEN,
@@ -6256,9 +6294,18 @@ impl ControlPlaneUnixAuthVerifier {
             },
         ) {
             ControlPlaneAuthDecision::Accepted { .. } => {
+                let response_credential = node_credential
+                    .runtime_map_response_credential_for_cluster_and_incarnation(
+                        &self.cluster_id,
+                        heartbeat.node_incarnation,
+                    )?;
                 self.metrics
                     .record_accepted(ControlPlaneAuthOperation::StorageRuntimeMapRefresh);
-                Ok(envelope.payload().to_vec())
+                Ok(VerifiedStorageNodeHeartbeatRefresh {
+                    payload: envelope.payload().to_vec(),
+                    response_credential,
+                    response_target: expected_source,
+                })
             }
             ControlPlaneAuthDecision::Rejected { reason } => {
                 self.metrics
@@ -6417,7 +6464,7 @@ fn read_authenticated_control_plane_rpc_payload(
     Ok(payload[2..].to_vec())
 }
 
-fn sign_frontend_runtime_map_response_payload(
+fn sign_runtime_map_response_payload(
     kind: ControlPlaneRpcKind,
     credential: &ControlPlaneScopedCredential,
     target: ControlPlaneAuthPrincipal,
@@ -6441,7 +6488,7 @@ fn sign_frontend_runtime_map_response_payload(
     envelope.encode_frame()
 }
 
-fn build_frontend_runtime_map_rpc_response(
+fn build_runtime_map_rpc_response(
     kind: ControlPlaneRpcKind,
     response: Result<Vec<u8>, ControlPlaneError>,
     response_auth: Option<(ControlPlaneScopedCredential, ControlPlaneAuthPrincipal)>,
@@ -6449,7 +6496,7 @@ fn build_frontend_runtime_map_rpc_response(
 ) -> Result<ControlPlaneRpcResponse, ControlPlaneError> {
     let mut payload = encode_control_plane_rpc_response(response)?;
     if let Some((credential, target)) = response_auth {
-        payload = sign_frontend_runtime_map_response_payload(
+        payload = sign_runtime_map_response_payload(
             kind,
             &credential,
             target,
@@ -6665,11 +6712,29 @@ impl ControlPlaneHeartbeatRuntimeMapSource for AuthenticatedUnixControlPlaneClie
         heartbeat: NodeHeartbeat,
         authority_now_ms: u64,
     ) -> Result<ControlPlaneHeartbeatRefresh, ControlPlaneError> {
+        let start = Instant::now();
+        self.refresh_node_heartbeat_with_clock(heartbeat, || {
+            let elapsed_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
+            Ok(authority_now_ms.saturating_add(elapsed_ms))
+        })
+    }
+}
+
+impl AuthenticatedUnixControlPlaneClient {
+    fn refresh_node_heartbeat_with_clock<F>(
+        &mut self,
+        heartbeat: NodeHeartbeat,
+        mut authority_now_ms: F,
+    ) -> Result<ControlPlaneHeartbeatRefresh, ControlPlaneError>
+    where
+        F: FnMut() -> Result<u64, ControlPlaneError>,
+    {
         if heartbeat.requested_lease_duration_ms == 0 {
             return Err(ControlPlaneError::InvalidLeaseDuration);
         }
         let payload = write_node_heartbeat_payload(&heartbeat)?;
-        let expires_at_ms = authority_now_ms
+        let issued_at_ms = authority_now_ms()?;
+        let expires_at_ms = issued_at_ms
             .checked_add(heartbeat.requested_lease_duration_ms)
             .ok_or(ControlPlaneError::LeaseDeadlineOverflow)?;
         let envelope = self.credential.sign_envelope(
@@ -6678,7 +6743,7 @@ impl ControlPlaneHeartbeatRuntimeMapSource for AuthenticatedUnixControlPlaneClie
                     crate::control_plane_auth::ControlPlaneAuthService::ControlPlane,
                 ),
                 operation: ControlPlaneAuthOperation::StorageRuntimeMapRefresh,
-                issued_at_ms: Some(authority_now_ms),
+                issued_at_ms: Some(issued_at_ms),
                 expires_at_ms: Some(expires_at_ms),
                 sequence: None,
                 nonce: Vec::new(),
@@ -6687,11 +6752,17 @@ impl ControlPlaneHeartbeatRuntimeMapSource for AuthenticatedUnixControlPlaneClie
         )?;
         let payload = envelope.encode_frame()?;
         let retry_budget = Duration::from_millis(heartbeat.requested_lease_duration_ms);
-        let payload = self.inner.send_liveness_request(
+        let payload = self.inner.send_liveness_request_raw_response(
             ControlPlaneRpcKind::RefreshNodeHeartbeat,
             &payload,
             retry_budget,
         )?;
+        let payload = self.verify_runtime_map_response(
+            ControlPlaneRpcKind::RefreshNodeHeartbeat,
+            authority_now_ms()?,
+            &payload,
+        )?;
+        let payload = decode_control_plane_rpc_response(payload)?;
         let mut reader = PayloadReader::new(&payload);
         let lease = read_heartbeat_lease_summary(&mut reader)?;
         let runtime_map = read_runtime_map_snapshot(&mut reader)?;
@@ -6811,12 +6882,7 @@ where
                 }
                 Err(error) => Err(error),
             };
-            return build_frontend_runtime_map_rpc_response(
-                kind,
-                response,
-                response_auth,
-                authority_now_ms,
-            );
+            return build_runtime_map_rpc_response(kind, response, response_auth, authority_now_ms);
         }
         ControlPlaneRpcKind::RuntimeMapStatus => {
             let (payload, response_auth) = match auth_verifier {
@@ -6843,12 +6909,7 @@ where
                 }
                 Err(error) => Err(error),
             };
-            return build_frontend_runtime_map_rpc_response(
-                kind,
-                response,
-                response_auth,
-                authority_now_ms,
-            );
+            return build_runtime_map_rpc_response(kind, response, response_auth, authority_now_ms);
         }
         ControlPlaneRpcKind::PgRuntimeMapSnapshot => {
             let (payload, response_auth) = match auth_verifier {
@@ -6876,27 +6937,28 @@ where
                 }
                 Err(error) => Err(error),
             };
-            return build_frontend_runtime_map_rpc_response(
-                kind,
-                response,
-                response_auth,
-                authority_now_ms,
-            );
+            return build_runtime_map_rpc_response(kind, response, response_auth, authority_now_ms);
         }
         ControlPlaneRpcKind::RefreshNodeHeartbeat => {
             debug_assert_eq!(
                 kind.auth_operation(),
                 ControlPlaneAuthOperation::StorageRuntimeMapRefresh
             );
-            let payload = match auth_verifier {
-                Some(auth_verifier) => auth_verifier
-                    .verify_storage_node_heartbeat_payload(&payload, authority_now_ms)?,
-                None => payload,
+            let (payload, response_auth) = match auth_verifier {
+                Some(auth_verifier) => {
+                    let verified = auth_verifier
+                        .verify_storage_node_heartbeat_payload(&payload, authority_now_ms)?;
+                    (
+                        verified.payload,
+                        Some((verified.response_credential, verified.response_target)),
+                    )
+                }
+                None => (payload, None),
             };
             let mut reader = PayloadReader::new(&payload);
             let heartbeat = read_node_heartbeat(&mut reader)?;
             reader.finish()?;
-            match control_plane.refresh_node_heartbeat(heartbeat, authority_now_ms) {
+            let response = match control_plane.refresh_node_heartbeat(heartbeat, authority_now_ms) {
                 Ok(refresh) => {
                     let mut response = Vec::new();
                     write_heartbeat_lease_summary(&mut response, refresh.lease());
@@ -6904,7 +6966,8 @@ where
                     Ok(response)
                 }
                 Err(error) => Err(error),
-            }
+            };
+            return build_runtime_map_rpc_response(kind, response, response_auth, authority_now_ms);
         }
         ControlPlaneRpcKind::SetPgActingSet => {
             let mut reader = PayloadReader::new(&payload);
@@ -11213,7 +11276,7 @@ mod tests {
     ) -> Vec<u8> {
         let payload = encode_control_plane_rpc_response(Ok(payload))
             .expect("test runtime-map response should encode");
-        sign_frontend_runtime_map_response_payload(
+        sign_runtime_map_response_payload(
             kind,
             &frontend_signer
                 .runtime_map_response_credential_for_frontend()
@@ -12968,7 +13031,7 @@ mod tests {
             assert_eq!(kind, ControlPlaneRpcKind::RuntimeMapStatus);
             ControlPlaneAuthEnvelope::decode_frame(&payload, CONTROL_PLANE_RPC_MAX_PAYLOAD_LEN)
                 .unwrap();
-            let response_payload = sign_frontend_runtime_map_response_payload(
+            let response_payload = sign_runtime_map_response_payload(
                 kind,
                 &response_signer
                     .runtime_map_response_credential_for_frontend()
@@ -13013,7 +13076,7 @@ mod tests {
             assert_eq!(kind, ControlPlaneRpcKind::RuntimeMapStatus);
             ControlPlaneAuthEnvelope::decode_frame(&payload, CONTROL_PLANE_RPC_MAX_PAYLOAD_LEN)
                 .unwrap();
-            let response_payload = sign_frontend_runtime_map_response_payload(
+            let response_payload = sign_runtime_map_response_payload(
                 kind,
                 &response_signer
                     .runtime_map_response_credential_for_frontend()
@@ -13059,6 +13122,25 @@ mod tests {
             matches!(error, ControlPlaneError::RpcProtocol { ref message }
             if message.contains("requires a frontend scoped credential")),
             "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn runtime_map_response_credential_accepts_storage_node_credential() {
+        let storage_node = storage_node_auth_credential("auth-cluster", 1, 42);
+
+        let response_credential = storage_node
+            .runtime_map_response_credential_for_storage_node()
+            .expect("storage-node credentials should derive runtime-map response credentials");
+
+        assert_eq!(response_credential.cluster_id(), "auth-cluster");
+        assert_eq!(response_credential.credential_id(), "storage-node-1");
+        assert_eq!(response_credential.credential_version(), 1);
+        assert_eq!(
+            response_credential.principal(),
+            &ControlPlaneAuthPrincipal::Service {
+                service: ControlPlaneAuthService::RuntimeMap
+            }
         );
     }
 
@@ -13539,7 +13621,7 @@ mod tests {
                     },
                     pg_observations: Vec::new(),
                 },
-                1_999,
+                2_000,
             )
             .unwrap();
 
@@ -13557,6 +13639,108 @@ mod tests {
             1
         );
         assert_eq!(metrics.rejected_total(), 0);
+    }
+
+    #[test]
+    fn authenticated_unix_control_plane_client_verifies_heartbeat_response_at_receive_time() {
+        let tmp = test_util::tempdir();
+        let socket_path = tmp.path().join("control-plane.sock");
+        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+        authority
+            .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
+            .unwrap();
+        authority
+            .set_pg_acting_set(PgId::new(7), vec![NodeId::new(1)])
+            .unwrap();
+        let heartbeat_epoch = authority.snapshot().cluster_epoch();
+        let verifier =
+            storage_node_auth_verifier("auth-cluster", vec![storage_node_auth_node_credential(1)]);
+        let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _addr) = listener.accept().unwrap();
+            handle_control_plane_unix_stream_with_auth(
+                &mut authority,
+                &mut stream,
+                2_001,
+                &verifier,
+            )
+            .unwrap();
+        });
+
+        let mut client = AuthenticatedUnixControlPlaneClient::new(
+            UnixControlPlaneClient::new(&socket_path),
+            storage_node_auth_credential("auth-cluster", 1, 42),
+        );
+        let mut timestamps = [2_000, 2_001].into_iter();
+        let refresh = client
+            .refresh_node_heartbeat_with_clock(
+                NodeHeartbeat {
+                    node_id: NodeId::new(1),
+                    node_incarnation: 42,
+                    endpoint: "/tmp/argmin-node-1.sock".to_owned(),
+                    observed_epoch: heartbeat_epoch,
+                    requested_lease_duration_ms: 100,
+                    cluster_map_history_reference_summary:
+                        PgClusterMapHistoryReferenceSummary::default(),
+                    pg_observations: Vec::new(),
+                },
+                || {
+                    timestamps
+                        .next()
+                        .ok_or_else(|| ControlPlaneError::RpcProtocol {
+                            message: "test heartbeat clock exhausted".to_owned(),
+                        })
+                },
+            )
+            .unwrap();
+
+        server.join().unwrap();
+        assert_eq!(refresh.lease().node_id(), NodeId::new(1));
+        assert_eq!(refresh.lease().lease_deadline_ms(), 2_101);
+    }
+
+    #[test]
+    fn authenticated_unix_control_plane_client_rejects_unsigned_heartbeat_response() {
+        let tmp = test_util::tempdir();
+        let socket_path = tmp.path().join("control-plane.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _addr) = listener.accept().unwrap();
+            let (kind, payload) = read_control_plane_rpc_frame(&mut stream).unwrap();
+            assert_eq!(kind, ControlPlaneRpcKind::RefreshNodeHeartbeat);
+            ControlPlaneAuthEnvelope::decode_frame(&payload, CONTROL_PLANE_RPC_MAX_PAYLOAD_LEN)
+                .expect("heartbeat request should be auth-wrapped");
+            let response = encode_control_plane_rpc_response(Ok(Vec::new())).unwrap();
+            write_control_plane_rpc_frame(&mut stream, kind, &response).unwrap();
+        });
+
+        let mut client = AuthenticatedUnixControlPlaneClient::new(
+            UnixControlPlaneClient::new(&socket_path),
+            storage_node_auth_credential("auth-cluster", 1, 42),
+        );
+        let error = client
+            .refresh_node_heartbeat(
+                NodeHeartbeat {
+                    node_id: NodeId::new(1),
+                    node_incarnation: 42,
+                    endpoint: "/tmp/argmin-node-1.sock".to_owned(),
+                    observed_epoch: ClusterEpoch::new(1).unwrap(),
+                    requested_lease_duration_ms: 100,
+                    cluster_map_history_reference_summary:
+                        PgClusterMapHistoryReferenceSummary::default(),
+                    pg_observations: Vec::new(),
+                },
+                1_999,
+            )
+            .expect_err("unsigned heartbeat response should be rejected");
+
+        server.join().unwrap();
+        assert!(
+            matches!(error, ControlPlaneError::RpcProtocol { ref message }
+            if message.contains("control-plane auth envelope")),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]
