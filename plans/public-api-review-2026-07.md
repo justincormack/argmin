@@ -1059,11 +1059,13 @@ each is one refactor away from a panic:
   `SseCustomerValidatorConfig::from_base64`/`ManagedWrappingKeyConfig::
   from_base64 -> Result<_, String>` was fixed with typed config parse errors
   while preserving the existing startup `Display` messages.
-- [ ] `parse_bucket_policy` doesn't enforce its own exported
-  `MAX_BUCKET_POLICY_BYTES` (`bucket_policy.rs:8, 1169-1175`); only
-  server-core enforces it, against the normalized output not the raw input
-  (`coordinator/authz/bucket.rs:545`). Check length first in
-  `parse_bucket_policy`.
+- [x] Invalid: `parse_bucket_policy` does not need to enforce
+  `MAX_BUCKET_POLICY_BYTES` on raw input. AWS-facing coverage pins that
+  `PutBucketPolicy` accepts pretty/raw JSON over 20 KiB when the normalized
+  stored policy is under the limit, and rejects oversized normalized policy.
+  Keep the size check at the `PutBucketPolicy` admission/storage boundary,
+  after parse, resource-scope validation, and condition validation; do not add
+  a raw-size parser check unless an AWS raw body cap is discovered separately.
 
 ## Smaller items
 
