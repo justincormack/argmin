@@ -358,6 +358,13 @@ Progress:
   runtime-map reads, and admin control-plane commands. This avoids treating the
   presence of one credential class as evidence that every Unix control-plane
   path is enforcing auth.
+- Unix control-plane verifiers and process/env config parsers now accept
+  overlapping credential identities for one storage node, frontend instance, or
+  admin instance as long as the credential id/version pair is unique. This
+  gives storage-node heartbeat, frontend runtime-map read, and admin command
+  auth a staged rotation window; signed responses are emitted with the same
+  credential id/version that verified the request so old and new clients can
+  coexist during the overlap.
 
 ### Slice C: Frontend and Admin Control-Plane RPCs
 

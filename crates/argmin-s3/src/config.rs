@@ -1259,7 +1259,8 @@ fn parse_control_plane_storage_auth_credentials(
         return Err("ARGMIN_CONTROL_PLANE_STORAGE_AUTH_CREDENTIALS must not be empty".to_string());
     }
 
-    let mut by_node = HashMap::<u32, ConfiguredControlPlaneStorageAuthCredential>::new();
+    let mut entries = Vec::new();
+    let mut seen = HashSet::<(u32, String, u64)>::new();
     for raw in value.split(',') {
         let trimmed = raw.trim();
         if trimmed.is_empty() {
@@ -1311,16 +1312,20 @@ fn parse_control_plane_storage_auth_credentials(
             credential_version,
             secret: SecretConfigValue::new(secret.to_string()),
         };
-        if by_node.insert(node_id, entry).is_some() {
+        if !seen.insert((node_id, entry.credential_id.clone(), credential_version)) {
             return Err(format!(
-                "ARGMIN_CONTROL_PLANE_STORAGE_AUTH_CREDENTIALS contains duplicate node id {node_id}"
+                "ARGMIN_CONTROL_PLANE_STORAGE_AUTH_CREDENTIALS contains duplicate credential identity for node {node_id}"
             ));
         }
+        entries.push(entry);
     }
 
-    let mut entries: Vec<ConfiguredControlPlaneStorageAuthCredential> =
-        by_node.into_values().collect();
-    entries.sort_by_key(|entry| entry.node_id);
+    entries.sort_by(|left, right| {
+        left.node_id
+            .cmp(&right.node_id)
+            .then_with(|| left.credential_id.cmp(&right.credential_id))
+            .then_with(|| left.credential_version.cmp(&right.credential_version))
+    });
     Ok(entries)
 }
 
@@ -1334,7 +1339,8 @@ fn parse_control_plane_frontend_auth_credentials(
         return Err("ARGMIN_CONTROL_PLANE_FRONTEND_AUTH_CREDENTIALS must not be empty".to_string());
     }
 
-    let mut by_instance = HashMap::<String, ConfiguredControlPlaneFrontendAuthCredential>::new();
+    let mut entries = Vec::new();
+    let mut seen = HashSet::<(String, String, u64)>::new();
     for raw in value.split(',') {
         let trimmed = raw.trim();
         if trimmed.is_empty() {
@@ -1383,16 +1389,24 @@ fn parse_control_plane_frontend_auth_credentials(
             credential_version,
             secret: SecretConfigValue::new(secret.to_string()),
         };
-        if by_instance.insert(instance_id.to_string(), entry).is_some() {
+        if !seen.insert((
+            entry.instance_id.clone(),
+            entry.credential_id.clone(),
+            credential_version,
+        )) {
             return Err(format!(
-                "ARGMIN_CONTROL_PLANE_FRONTEND_AUTH_CREDENTIALS contains duplicate instance id {instance_id}"
+                "ARGMIN_CONTROL_PLANE_FRONTEND_AUTH_CREDENTIALS contains duplicate credential identity for instance {instance_id}"
             ));
         }
+        entries.push(entry);
     }
 
-    let mut entries: Vec<ConfiguredControlPlaneFrontendAuthCredential> =
-        by_instance.into_values().collect();
-    entries.sort_by(|left, right| left.instance_id.cmp(&right.instance_id));
+    entries.sort_by(|left, right| {
+        left.instance_id
+            .cmp(&right.instance_id)
+            .then_with(|| left.credential_id.cmp(&right.credential_id))
+            .then_with(|| left.credential_version.cmp(&right.credential_version))
+    });
     Ok(entries)
 }
 
@@ -1406,7 +1420,8 @@ fn parse_control_plane_admin_auth_credentials(
         return Err("ARGMIN_CONTROL_PLANE_ADMIN_AUTH_CREDENTIALS must not be empty".to_string());
     }
 
-    let mut by_instance = HashMap::<String, ConfiguredControlPlaneAdminAuthCredential>::new();
+    let mut entries = Vec::new();
+    let mut seen = HashSet::<(String, String, u64)>::new();
     for raw in value.split(',') {
         let trimmed = raw.trim();
         if trimmed.is_empty() {
@@ -1451,16 +1466,24 @@ fn parse_control_plane_admin_auth_credentials(
             credential_version,
             secret: SecretConfigValue::new(secret.to_string()),
         };
-        if by_instance.insert(instance_id.to_string(), entry).is_some() {
+        if !seen.insert((
+            entry.instance_id.clone(),
+            entry.credential_id.clone(),
+            credential_version,
+        )) {
             return Err(format!(
-                "ARGMIN_CONTROL_PLANE_ADMIN_AUTH_CREDENTIALS contains duplicate instance id {instance_id}"
+                "ARGMIN_CONTROL_PLANE_ADMIN_AUTH_CREDENTIALS contains duplicate credential identity for instance {instance_id}"
             ));
         }
+        entries.push(entry);
     }
 
-    let mut entries: Vec<ConfiguredControlPlaneAdminAuthCredential> =
-        by_instance.into_values().collect();
-    entries.sort_by(|left, right| left.instance_id.cmp(&right.instance_id));
+    entries.sort_by(|left, right| {
+        left.instance_id
+            .cmp(&right.instance_id)
+            .then_with(|| left.credential_id.cmp(&right.credential_id))
+            .then_with(|| left.credential_version.cmp(&right.credential_version))
+    });
     Ok(entries)
 }
 
@@ -2191,7 +2214,7 @@ mod tests {
             ("ARGMIN_CONTROL_PLANE_AUTH_CLUSTER_ID", "control-auth"),
             (
                 "ARGMIN_CONTROL_PLANE_STORAGE_AUTH_CREDENTIALS",
-                "2=storage-node:4:storage-2-secret,1=storage-node:4:storage-1-secret",
+                "2=storage-node:4:storage-2-secret,1=storage-node:5:storage-1-new-secret,1=storage-node:4:storage-1-secret",
             ),
         ]))
         .unwrap();
@@ -2210,6 +2233,12 @@ mod tests {
                     secret: SecretConfigValue::new("storage-1-secret".to_string()),
                 },
                 ConfiguredControlPlaneStorageAuthCredential {
+                    node_id: 1,
+                    credential_id: "storage-node".to_string(),
+                    credential_version: 5,
+                    secret: SecretConfigValue::new("storage-1-new-secret".to_string()),
+                },
+                ConfiguredControlPlaneStorageAuthCredential {
                     node_id: 2,
                     credential_id: "storage-node".to_string(),
                     credential_version: 4,
@@ -2219,10 +2248,34 @@ mod tests {
         );
         let debug = format!("{cfg:?}");
         assert!(!debug.contains("storage-1-secret"));
+        assert!(!debug.contains("storage-1-new-secret"));
         assert!(!debug.contains("storage-2-secret"));
         assert!(!debug.contains("frontend-a-secret"));
         assert!(!debug.contains("frontend-b-secret"));
         assert!(debug.contains("config_secret"));
+    }
+
+    #[test]
+    fn control_plane_storage_auth_credentials_reject_duplicate_identity() {
+        let err = ServerConfig::from_lookup(make_env(&[
+            ("ARGMIN_PROCESS_ROLE", "control-plane"),
+            (
+                "ARGMIN_CONTROL_PLANE_STATE_PATH",
+                "/tmp/argmin-control-plane.state",
+            ),
+            (
+                "ARGMIN_CONTROL_PLANE_SOCKET_PATH",
+                "/tmp/argmin-control-plane.sock",
+            ),
+            ("ARGMIN_CONTROL_PLANE_AUTH_CLUSTER_ID", "control-auth"),
+            (
+                "ARGMIN_CONTROL_PLANE_STORAGE_AUTH_CREDENTIALS",
+                "1=storage-node:4:storage-1-secret,1=storage-node:4:storage-1-secret-replacement",
+            ),
+        ]))
+        .unwrap_err();
+
+        assert!(err.contains("duplicate credential identity for node 1"));
     }
 
     #[test]
@@ -2348,7 +2401,7 @@ mod tests {
             ),
             (
                 "ARGMIN_CONTROL_PLANE_FRONTEND_AUTH_CREDENTIALS",
-                "frontend-2=frontend:4:frontend-2-secret,frontend-1=frontend:4:frontend-1-secret",
+                "frontend-2=frontend:4:frontend-2-secret,frontend-1=frontend:5:frontend-1-new-secret,frontend-1=frontend:4:frontend-1-secret",
             ),
         ]))
         .expect("auth-only config should parse")
@@ -2366,6 +2419,12 @@ mod tests {
                     secret: SecretConfigValue::new("frontend-1-secret".to_string()),
                 },
                 ConfiguredControlPlaneFrontendAuthCredential {
+                    instance_id: "frontend-1".to_string(),
+                    credential_id: "frontend".to_string(),
+                    credential_version: 5,
+                    secret: SecretConfigValue::new("frontend-1-new-secret".to_string()),
+                },
+                ConfiguredControlPlaneFrontendAuthCredential {
                     instance_id: "frontend-2".to_string(),
                     credential_id: "frontend".to_string(),
                     credential_version: 4,
@@ -2375,8 +2434,27 @@ mod tests {
         );
         let debug = format!("{auth:?}");
         assert!(!debug.contains("frontend-1-secret"));
+        assert!(!debug.contains("frontend-1-new-secret"));
         assert!(!debug.contains("frontend-2-secret"));
         assert!(debug.contains("config_secret"));
+    }
+
+    #[test]
+    fn frontend_runtime_map_auth_only_config_rejects_duplicate_identity() {
+        let err = ConfiguredControlPlaneFrontendRuntimeMapAuth::from_lookup(make_env(&[
+            ("ARGMIN_CONTROL_PLANE_AUTH_CLUSTER_ID", "control-auth"),
+            (
+                "ARGMIN_CONTROL_PLANE_FRONTEND_AUTH_INSTANCE_ID",
+                "frontend-1",
+            ),
+            (
+                "ARGMIN_CONTROL_PLANE_FRONTEND_AUTH_CREDENTIALS",
+                "frontend-1=frontend:4:frontend-1-secret,frontend-1=frontend:4:frontend-1-secret-replacement",
+            ),
+        ]))
+        .unwrap_err();
+
+        assert!(err.contains("duplicate credential identity for instance frontend-1"));
     }
 
     #[test]
@@ -2404,7 +2482,7 @@ mod tests {
             ("ARGMIN_CONTROL_PLANE_ADMIN_AUTH_INSTANCE_ID", "admin-1"),
             (
                 "ARGMIN_CONTROL_PLANE_ADMIN_AUTH_CREDENTIALS",
-                "admin-2=admin:4:admin-2-secret,admin-1=admin:4:admin-1-secret",
+                "admin-2=admin:4:admin-2-secret,admin-1=admin:5:admin-1-new-secret,admin-1=admin:4:admin-1-secret",
             ),
         ]))
         .expect("auth-only config should parse")
@@ -2422,6 +2500,12 @@ mod tests {
                     secret: SecretConfigValue::new("admin-1-secret".to_string()),
                 },
                 ConfiguredControlPlaneAdminAuthCredential {
+                    instance_id: "admin-1".to_string(),
+                    credential_id: "admin".to_string(),
+                    credential_version: 5,
+                    secret: SecretConfigValue::new("admin-1-new-secret".to_string()),
+                },
+                ConfiguredControlPlaneAdminAuthCredential {
                     instance_id: "admin-2".to_string(),
                     credential_id: "admin".to_string(),
                     credential_version: 4,
@@ -2431,8 +2515,24 @@ mod tests {
         );
         let debug = format!("{auth:?}");
         assert!(!debug.contains("admin-1-secret"));
+        assert!(!debug.contains("admin-1-new-secret"));
         assert!(!debug.contains("admin-2-secret"));
         assert!(debug.contains("config_secret"));
+    }
+
+    #[test]
+    fn admin_command_auth_only_config_rejects_duplicate_identity() {
+        let err = ConfiguredControlPlaneAdminCommandAuth::from_lookup(make_env(&[
+            ("ARGMIN_CONTROL_PLANE_AUTH_CLUSTER_ID", "control-auth"),
+            ("ARGMIN_CONTROL_PLANE_ADMIN_AUTH_INSTANCE_ID", "admin-1"),
+            (
+                "ARGMIN_CONTROL_PLANE_ADMIN_AUTH_CREDENTIALS",
+                "admin-1=admin:4:admin-1-secret,admin-1=admin:4:admin-1-secret-replacement",
+            ),
+        ]))
+        .unwrap_err();
+
+        assert!(err.contains("duplicate credential identity for instance admin-1"));
     }
 
     #[test]

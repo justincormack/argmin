@@ -4294,9 +4294,9 @@ pub struct AuthenticatedUnixControlPlaneClient {
 #[derive(Debug, Clone)]
 pub struct ControlPlaneUnixAuthVerifier {
     cluster_id: String,
-    storage_node_credentials: BTreeMap<NodeId, ControlPlaneStorageNodeAuthCredential>,
-    frontend_credentials: BTreeMap<String, ControlPlaneFrontendAuthCredential>,
-    admin_credentials: BTreeMap<String, ControlPlaneAdminAuthCredential>,
+    storage_node_credentials: BTreeMap<NodeId, Vec<ControlPlaneStorageNodeAuthCredential>>,
+    frontend_credentials: BTreeMap<String, Vec<ControlPlaneFrontendAuthCredential>>,
+    admin_credentials: BTreeMap<String, Vec<ControlPlaneAdminAuthCredential>>,
     metrics: Arc<ControlPlaneUnixAuthMetrics>,
 }
 
@@ -5926,6 +5926,111 @@ impl ControlPlaneAdminAuthCredential {
     }
 }
 
+fn insert_storage_node_auth_credential(
+    credentials_by_node: &mut BTreeMap<NodeId, Vec<ControlPlaneStorageNodeAuthCredential>>,
+    credential: ControlPlaneStorageNodeAuthCredential,
+) -> Result<(), ControlPlaneError> {
+    let credentials = credentials_by_node.entry(credential.node_id()).or_default();
+    if credentials.iter().any(|existing| {
+        existing.credential_id() == credential.credential_id()
+            && existing.credential_version() == credential.credential_version()
+    }) {
+        return Err(ControlPlaneError::RpcProtocol {
+            message: "control-plane storage-node auth credential repeats credential identity"
+                .to_owned(),
+        });
+    }
+    credentials.push(credential);
+    Ok(())
+}
+
+fn insert_frontend_auth_credential(
+    credentials_by_instance: &mut BTreeMap<String, Vec<ControlPlaneFrontendAuthCredential>>,
+    credential: ControlPlaneFrontendAuthCredential,
+) -> Result<(), ControlPlaneError> {
+    let credentials = credentials_by_instance
+        .entry(credential.instance_id().to_owned())
+        .or_default();
+    if credentials.iter().any(|existing| {
+        existing.credential_id() == credential.credential_id()
+            && existing.credential_version() == credential.credential_version()
+    }) {
+        return Err(ControlPlaneError::RpcProtocol {
+            message: "control-plane frontend auth credential repeats credential identity"
+                .to_owned(),
+        });
+    }
+    credentials.push(credential);
+    Ok(())
+}
+
+fn insert_admin_auth_credential(
+    credentials_by_instance: &mut BTreeMap<String, Vec<ControlPlaneAdminAuthCredential>>,
+    credential: ControlPlaneAdminAuthCredential,
+) -> Result<(), ControlPlaneError> {
+    let credentials = credentials_by_instance
+        .entry(credential.instance_id().to_owned())
+        .or_default();
+    if credentials.iter().any(|existing| {
+        existing.credential_id() == credential.credential_id()
+            && existing.credential_version() == credential.credential_version()
+    }) {
+        return Err(ControlPlaneError::RpcProtocol {
+            message: "control-plane admin auth credential repeats credential identity".to_owned(),
+        });
+    }
+    credentials.push(credential);
+    Ok(())
+}
+
+fn matching_storage_node_auth_credential<'a>(
+    credentials: &'a [ControlPlaneStorageNodeAuthCredential],
+    credential_id: &str,
+    credential_version: u64,
+) -> Result<&'a ControlPlaneStorageNodeAuthCredential, ControlPlaneError> {
+    credentials
+        .iter()
+        .find(|credential| {
+            credential.credential_id() == credential_id
+                && credential.credential_version() == credential_version
+        })
+        .ok_or_else(|| ControlPlaneError::RpcProtocol {
+            message: "accepted storage-node auth credential was not configured".to_owned(),
+        })
+}
+
+fn matching_frontend_auth_credential<'a>(
+    credentials: &'a [ControlPlaneFrontendAuthCredential],
+    credential_id: &str,
+    credential_version: u64,
+) -> Result<&'a ControlPlaneFrontendAuthCredential, ControlPlaneError> {
+    credentials
+        .iter()
+        .find(|credential| {
+            credential.credential_id() == credential_id
+                && credential.credential_version() == credential_version
+        })
+        .ok_or_else(|| ControlPlaneError::RpcProtocol {
+            message: "accepted frontend auth credential was not configured".to_owned(),
+        })
+}
+
+fn matching_admin_auth_credential<'a>(
+    credentials: &'a [ControlPlaneAdminAuthCredential],
+    credential_id: &str,
+    credential_version: u64,
+) -> Result<&'a ControlPlaneAdminAuthCredential, ControlPlaneError> {
+    credentials
+        .iter()
+        .find(|credential| {
+            credential.credential_id() == credential_id
+                && credential.credential_version() == credential_version
+        })
+        .ok_or_else(|| ControlPlaneError::RpcProtocol {
+            message: "accepted admin auth credential was not configured".to_owned(),
+        })
+}
+
 impl ControlPlaneUnixAuthVerifier {
     pub fn new_empty(cluster_id: impl Into<String>) -> Result<Self, ControlPlaneError> {
         let cluster_id = cluster_id.into();
@@ -5955,12 +6060,7 @@ impl ControlPlaneUnixAuthVerifier {
         let mut verifier = Self::new_empty(cluster_id)?;
         let mut by_node = BTreeMap::new();
         for credential in storage_node_credentials {
-            if by_node.insert(credential.node_id(), credential).is_some() {
-                return Err(ControlPlaneError::RpcProtocol {
-                    message: "control-plane storage-node auth credential repeats node id"
-                        .to_owned(),
-                });
-            }
+            insert_storage_node_auth_credential(&mut by_node, credential)?;
         }
         verifier.storage_node_credentials = by_node;
         Ok(verifier)
@@ -5972,15 +6072,7 @@ impl ControlPlaneUnixAuthVerifier {
     ) -> Result<Self, ControlPlaneError> {
         let mut by_instance = BTreeMap::new();
         for credential in frontend_credentials {
-            if by_instance
-                .insert(credential.instance_id().to_owned(), credential)
-                .is_some()
-            {
-                return Err(ControlPlaneError::RpcProtocol {
-                    message: "control-plane frontend auth credential repeats instance id"
-                        .to_owned(),
-                });
-            }
+            insert_frontend_auth_credential(&mut by_instance, credential)?;
         }
         self.frontend_credentials = by_instance;
         Ok(self)
@@ -5992,14 +6084,7 @@ impl ControlPlaneUnixAuthVerifier {
     ) -> Result<Self, ControlPlaneError> {
         let mut by_instance = BTreeMap::new();
         for credential in admin_credentials {
-            if by_instance
-                .insert(credential.instance_id().to_owned(), credential)
-                .is_some()
-            {
-                return Err(ControlPlaneError::RpcProtocol {
-                    message: "control-plane admin auth credential repeats instance id".to_owned(),
-                });
-            }
+            insert_admin_auth_credential(&mut by_instance, credential)?;
         }
         self.admin_credentials = by_instance;
         Ok(self)
@@ -6031,28 +6116,40 @@ impl ControlPlaneUnixAuthVerifier {
             storage_node_credentials: self
                 .storage_node_credentials
                 .values()
-                .map(|credential| ControlPlaneUnixAuthCredentialStatus {
-                    node_id: credential.node_id(),
-                    credential_id: credential.credential_id().to_owned(),
-                    credential_version: credential.credential_version(),
+                .flat_map(|credentials| {
+                    credentials
+                        .iter()
+                        .map(|credential| ControlPlaneUnixAuthCredentialStatus {
+                            node_id: credential.node_id(),
+                            credential_id: credential.credential_id().to_owned(),
+                            credential_version: credential.credential_version(),
+                        })
                 })
                 .collect(),
             frontend_credentials: self
                 .frontend_credentials
                 .values()
-                .map(|credential| ControlPlaneUnixFrontendAuthCredentialStatus {
-                    instance_id: credential.instance_id().to_owned(),
-                    credential_id: credential.credential_id().to_owned(),
-                    credential_version: credential.credential_version(),
+                .flat_map(|credentials| {
+                    credentials.iter().map(|credential| {
+                        ControlPlaneUnixFrontendAuthCredentialStatus {
+                            instance_id: credential.instance_id().to_owned(),
+                            credential_id: credential.credential_id().to_owned(),
+                            credential_version: credential.credential_version(),
+                        }
+                    })
                 })
                 .collect(),
             admin_credentials: self
                 .admin_credentials
                 .values()
-                .map(|credential| ControlPlaneUnixAdminAuthCredentialStatus {
-                    instance_id: credential.instance_id().to_owned(),
-                    credential_id: credential.credential_id().to_owned(),
-                    credential_version: credential.credential_version(),
+                .flat_map(|credentials| {
+                    credentials
+                        .iter()
+                        .map(|credential| ControlPlaneUnixAdminAuthCredentialStatus {
+                            instance_id: credential.instance_id().to_owned(),
+                            credential_id: credential.credential_id().to_owned(),
+                            credential_version: credential.credential_version(),
+                        })
                 })
                 .collect(),
             metrics: self.metrics.snapshot(),
@@ -6131,7 +6228,7 @@ impl ControlPlaneUnixAuthVerifier {
         let ControlPlaneAuthPrincipal::Admin { instance_id } = &expected_source else {
             unreachable!("admin source constructed above");
         };
-        let Some(admin_credential) = self.admin_credentials.get(instance_id) else {
+        let Some(admin_credentials) = self.admin_credentials.get(instance_id) else {
             self.metrics.record_rejected(
                 operation,
                 ControlPlaneAuthRejectionReason::UnknownCredential,
@@ -6142,15 +6239,19 @@ impl ControlPlaneUnixAuthVerifier {
                 ),
             });
         };
-        let credential = match admin_credential.scoped_for_cluster(&self.cluster_id) {
-            Ok(credential) => credential,
+        let credentials = match admin_credentials
+            .iter()
+            .map(|credential| credential.scoped_for_cluster(&self.cluster_id))
+            .collect::<Result<Vec<_>, _>>()
+        {
+            Ok(credentials) => credentials,
             Err(error) => {
                 self.metrics
                     .record_rejected(operation, ControlPlaneAuthRejectionReason::Malformed);
                 return Err(error);
             }
         };
-        let verifier = match ControlPlaneScopedCredentialStore::new(vec![credential]) {
+        let verifier = match ControlPlaneScopedCredentialStore::new(credentials) {
             Ok(verifier) => verifier,
             Err(error) => {
                 self.metrics
@@ -6171,7 +6272,10 @@ impl ControlPlaneUnixAuthVerifier {
                 now_ms: Some(authority_now_ms),
             },
         ) {
-            ControlPlaneAuthDecision::Accepted { .. } => {
+            ControlPlaneAuthDecision::Accepted {
+                credential_id,
+                credential_version,
+            } => {
                 let payload = match read_authenticated_control_plane_rpc_payload(
                     expected_kind,
                     envelope.payload(),
@@ -6183,6 +6287,11 @@ impl ControlPlaneUnixAuthVerifier {
                         return Err(error);
                     }
                 };
+                let admin_credential = matching_admin_auth_credential(
+                    admin_credentials,
+                    &credential_id,
+                    credential_version,
+                )?;
                 let response_credential = admin_credential
                     .admin_control_plane_response_credential_for_cluster(&self.cluster_id)?;
                 self.metrics.record_accepted(operation);
@@ -6253,7 +6362,7 @@ impl ControlPlaneUnixAuthVerifier {
         let ControlPlaneAuthPrincipal::Frontend { instance_id } = &expected_source else {
             unreachable!("frontend source constructed above");
         };
-        let Some(frontend_credential) = self.frontend_credentials.get(instance_id) else {
+        let Some(frontend_credentials) = self.frontend_credentials.get(instance_id) else {
             self.metrics.record_rejected(
                 operation,
                 ControlPlaneAuthRejectionReason::UnknownCredential,
@@ -6264,15 +6373,19 @@ impl ControlPlaneUnixAuthVerifier {
                 ),
             });
         };
-        let credential = match frontend_credential.scoped_for_cluster(&self.cluster_id) {
-            Ok(credential) => credential,
+        let credentials = match frontend_credentials
+            .iter()
+            .map(|credential| credential.scoped_for_cluster(&self.cluster_id))
+            .collect::<Result<Vec<_>, _>>()
+        {
+            Ok(credentials) => credentials,
             Err(error) => {
                 self.metrics
                     .record_rejected(operation, ControlPlaneAuthRejectionReason::Malformed);
                 return Err(error);
             }
         };
-        let verifier = match ControlPlaneScopedCredentialStore::new(vec![credential]) {
+        let verifier = match ControlPlaneScopedCredentialStore::new(credentials) {
             Ok(verifier) => verifier,
             Err(error) => {
                 self.metrics
@@ -6293,7 +6406,10 @@ impl ControlPlaneUnixAuthVerifier {
                 now_ms: Some(authority_now_ms),
             },
         ) {
-            ControlPlaneAuthDecision::Accepted { .. } => {
+            ControlPlaneAuthDecision::Accepted {
+                credential_id,
+                credential_version,
+            } => {
                 let payload = match read_authenticated_control_plane_rpc_payload(
                     expected_kind,
                     envelope.payload(),
@@ -6305,6 +6421,11 @@ impl ControlPlaneUnixAuthVerifier {
                         return Err(error);
                     }
                 };
+                let frontend_credential = matching_frontend_auth_credential(
+                    frontend_credentials,
+                    &credential_id,
+                    credential_version,
+                )?;
                 let response_credential = frontend_credential
                     .runtime_map_response_credential_for_cluster(&self.cluster_id)?;
                 self.metrics.record_accepted(operation);
@@ -6372,7 +6493,7 @@ impl ControlPlaneUnixAuthVerifier {
         let expected_target = ControlPlaneAuthTarget::Service(
             crate::control_plane_auth::ControlPlaneAuthService::ControlPlane,
         );
-        let Some(node_credential) = self.storage_node_credentials.get(&heartbeat.node_id) else {
+        let Some(node_credentials) = self.storage_node_credentials.get(&heartbeat.node_id) else {
             self.metrics.record_rejected(
                 ControlPlaneAuthOperation::StorageRuntimeMapRefresh,
                 ControlPlaneAuthRejectionReason::UnknownCredential,
@@ -6384,10 +6505,17 @@ impl ControlPlaneUnixAuthVerifier {
                 ),
             });
         };
-        let credential = match node_credential
-            .scoped_for_cluster_and_incarnation(&self.cluster_id, heartbeat.node_incarnation)
+        let credentials = match node_credentials
+            .iter()
+            .map(|credential| {
+                credential.scoped_for_cluster_and_incarnation(
+                    &self.cluster_id,
+                    heartbeat.node_incarnation,
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()
         {
-            Ok(credential) => credential,
+            Ok(credentials) => credentials,
             Err(error) => {
                 self.metrics.record_rejected(
                     ControlPlaneAuthOperation::StorageRuntimeMapRefresh,
@@ -6396,7 +6524,7 @@ impl ControlPlaneUnixAuthVerifier {
                 return Err(error);
             }
         };
-        let verifier = match ControlPlaneScopedCredentialStore::new(vec![credential]) {
+        let verifier = match ControlPlaneScopedCredentialStore::new(credentials) {
             Ok(verifier) => verifier,
             Err(error) => {
                 self.metrics.record_rejected(
@@ -6416,7 +6544,15 @@ impl ControlPlaneUnixAuthVerifier {
                 now_ms: Some(authority_now_ms),
             },
         ) {
-            ControlPlaneAuthDecision::Accepted { .. } => {
+            ControlPlaneAuthDecision::Accepted {
+                credential_id,
+                credential_version,
+            } => {
+                let node_credential = matching_storage_node_auth_credential(
+                    node_credentials,
+                    &credential_id,
+                    credential_version,
+                )?;
                 let response_credential = node_credential
                     .runtime_map_response_credential_for_cluster_and_incarnation(
                         &self.cluster_id,
@@ -11382,21 +11518,49 @@ mod tests {
     }
 
     fn storage_node_auth_node_credential(node_id: u32) -> ControlPlaneStorageNodeAuthCredential {
+        storage_node_auth_node_credential_with(
+            node_id,
+            &format!("storage-node-{node_id}"),
+            1,
+            &format!("storage-node-{node_id}-secret"),
+        )
+    }
+
+    fn storage_node_auth_node_credential_with(
+        node_id: u32,
+        credential_id: &str,
+        credential_version: u64,
+        secret: &str,
+    ) -> ControlPlaneStorageNodeAuthCredential {
         ControlPlaneStorageNodeAuthCredential::new(
             NodeId::new(node_id),
-            format!("storage-node-{node_id}"),
-            1,
-            format!("storage-node-{node_id}-secret").into_bytes(),
+            credential_id.to_owned(),
+            credential_version,
+            secret.as_bytes().to_vec(),
         )
         .expect("test storage-node node-scoped auth credential should build")
     }
 
     fn frontend_auth_config_credential(instance_id: &str) -> ControlPlaneFrontendAuthCredential {
+        frontend_auth_config_credential_with(
+            instance_id,
+            &format!("{instance_id}-credential"),
+            1,
+            &format!("{instance_id}-secret"),
+        )
+    }
+
+    fn frontend_auth_config_credential_with(
+        instance_id: &str,
+        credential_id: &str,
+        credential_version: u64,
+        secret: &str,
+    ) -> ControlPlaneFrontendAuthCredential {
         ControlPlaneFrontendAuthCredential::new(
             instance_id,
-            format!("{instance_id}-credential"),
-            1,
-            format!("{instance_id}-secret").into_bytes(),
+            credential_id.to_owned(),
+            credential_version,
+            secret.as_bytes().to_vec(),
         )
         .expect("test frontend auth credential should build")
     }
@@ -11411,11 +11575,25 @@ mod tests {
     }
 
     fn admin_auth_config_credential(instance_id: &str) -> ControlPlaneAdminAuthCredential {
+        admin_auth_config_credential_with(
+            instance_id,
+            &format!("{instance_id}-credential"),
+            1,
+            &format!("{instance_id}-secret"),
+        )
+    }
+
+    fn admin_auth_config_credential_with(
+        instance_id: &str,
+        credential_id: &str,
+        credential_version: u64,
+        secret: &str,
+    ) -> ControlPlaneAdminAuthCredential {
         ControlPlaneAdminAuthCredential::new(
             instance_id,
-            format!("{instance_id}-credential"),
-            1,
-            format!("{instance_id}-secret").into_bytes(),
+            credential_id.to_owned(),
+            credential_version,
+            secret.as_bytes().to_vec(),
         )
         .expect("test admin auth credential should build")
     }
@@ -13144,6 +13322,57 @@ mod tests {
     }
 
     #[test]
+    fn authenticated_frontend_read_accepts_overlapping_credentials() {
+        let tmp = test_util::tempdir();
+        let socket_path = tmp.path().join("control-plane.sock");
+        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+        authority
+            .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
+            .unwrap();
+        let old_credential =
+            frontend_auth_config_credential_with("frontend-1", "frontend", 1, "old-secret");
+        let new_credential =
+            frontend_auth_config_credential_with("frontend-1", "frontend", 2, "new-secret");
+        let old_signer = old_credential
+            .scoped_for_cluster("auth-cluster")
+            .expect("old frontend credential should scope");
+        let verifier = ControlPlaneUnixAuthVerifier::new_empty("auth-cluster")
+            .unwrap()
+            .with_frontend_credentials(vec![old_credential, new_credential])
+            .unwrap();
+        let verifier_for_assert = verifier.clone();
+        let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _addr) = listener.accept().unwrap();
+            handle_control_plane_unix_stream_with_auth(
+                &mut authority,
+                &mut stream,
+                2_000,
+                &verifier,
+            )
+            .unwrap();
+        });
+
+        let client = AuthenticatedUnixControlPlaneClient::new(
+            UnixControlPlaneClient::new(&socket_path),
+            old_signer,
+        );
+        let runtime_map = client.runtime_map_snapshot(2_000).unwrap();
+
+        server.join().unwrap();
+        assert!(runtime_map.cluster_epoch().get() >= 1);
+        let status = verifier_for_assert.status_snapshot();
+        assert_eq!(status.frontend_credentials().len(), 2);
+        let metrics = verifier_for_assert.metrics_snapshot();
+        assert_eq!(
+            metrics.accepted_for_operation(ControlPlaneAuthOperation::FrontendRuntimeMapRead),
+            1
+        );
+        assert_eq!(metrics.rejected_total(), 0);
+    }
+
+    #[test]
     fn authenticated_unix_control_plane_client_resigns_read_only_retry_attempts() {
         let tmp = test_util::tempdir();
         let socket_path = tmp.path().join("control-plane.sock");
@@ -13415,6 +13644,78 @@ mod tests {
         assert_eq!(
             metrics.rejected_for_reason(ControlPlaneAuthRejectionReason::Missing),
             1
+        );
+    }
+
+    #[test]
+    fn unix_auth_verifier_allows_rotation_but_rejects_duplicate_credential_identity() {
+        let verifier = ControlPlaneUnixAuthVerifier::new(
+            "auth-cluster",
+            vec![
+                storage_node_auth_node_credential_with(1, "storage-node", 1, "old-secret"),
+                storage_node_auth_node_credential_with(1, "storage-node", 2, "new-secret"),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            verifier.status_snapshot().storage_node_credentials().len(),
+            2
+        );
+
+        let error = ControlPlaneUnixAuthVerifier::new(
+            "auth-cluster",
+            vec![
+                storage_node_auth_node_credential_with(1, "storage-node", 1, "old-secret"),
+                storage_node_auth_node_credential_with(1, "storage-node", 1, "other-secret"),
+            ],
+        )
+        .expect_err("duplicate storage-node credential identity should reject");
+        assert!(
+            matches!(error, ControlPlaneError::RpcProtocol { ref message }
+            if message.contains("repeats credential identity")),
+            "unexpected error: {error}"
+        );
+
+        let verifier = ControlPlaneUnixAuthVerifier::new_empty("auth-cluster")
+            .unwrap()
+            .with_frontend_credentials(vec![
+                frontend_auth_config_credential_with("frontend-1", "frontend", 1, "old-secret"),
+                frontend_auth_config_credential_with("frontend-1", "frontend", 2, "new-secret"),
+            ])
+            .unwrap()
+            .with_admin_credentials(vec![
+                admin_auth_config_credential_with("admin-1", "admin", 1, "old-secret"),
+                admin_auth_config_credential_with("admin-1", "admin", 2, "new-secret"),
+            ])
+            .unwrap();
+        let status = verifier.status_snapshot();
+        assert_eq!(status.frontend_credentials().len(), 2);
+        assert_eq!(status.admin_credentials().len(), 2);
+
+        let error = ControlPlaneUnixAuthVerifier::new_empty("auth-cluster")
+            .unwrap()
+            .with_frontend_credentials(vec![
+                frontend_auth_config_credential_with("frontend-1", "frontend", 1, "old-secret"),
+                frontend_auth_config_credential_with("frontend-1", "frontend", 1, "other-secret"),
+            ])
+            .expect_err("duplicate frontend credential identity should reject");
+        assert!(
+            matches!(error, ControlPlaneError::RpcProtocol { ref message }
+            if message.contains("repeats credential identity")),
+            "unexpected error: {error}"
+        );
+
+        let error = ControlPlaneUnixAuthVerifier::new_empty("auth-cluster")
+            .unwrap()
+            .with_admin_credentials(vec![
+                admin_auth_config_credential_with("admin-1", "admin", 1, "old-secret"),
+                admin_auth_config_credential_with("admin-1", "admin", 1, "other-secret"),
+            ])
+            .expect_err("duplicate admin credential identity should reject");
+        assert!(
+            matches!(error, ControlPlaneError::RpcProtocol { ref message }
+            if message.contains("repeats credential identity")),
+            "unexpected error: {error}"
         );
     }
 
@@ -13692,6 +13993,61 @@ mod tests {
         assert!(cluster_epoch.get() >= 2);
         let metrics = verifier_for_assert.metrics_snapshot();
         assert_eq!(metrics.accepted_total(), 1);
+        assert_eq!(
+            metrics.accepted_for_operation(ControlPlaneAuthOperation::AdminControlPlaneCommand),
+            1
+        );
+        assert_eq!(metrics.rejected_total(), 0);
+    }
+
+    #[test]
+    fn authenticated_admin_command_accepts_overlapping_credentials() {
+        let tmp = test_util::tempdir();
+        let socket_path = tmp.path().join("control-plane.sock");
+        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+        authority
+            .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
+            .unwrap();
+        let old_credential = admin_auth_config_credential_with("admin-1", "admin", 1, "old-secret");
+        let new_credential = admin_auth_config_credential_with("admin-1", "admin", 2, "new-secret");
+        let old_signer = old_credential
+            .scoped_for_cluster("auth-cluster")
+            .expect("old admin credential should scope");
+        let verifier = ControlPlaneUnixAuthVerifier::new_empty("auth-cluster")
+            .unwrap()
+            .with_admin_credentials(vec![old_credential, new_credential])
+            .unwrap();
+        let verifier_for_assert = verifier.clone();
+        let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _addr) = listener.accept().unwrap();
+            handle_control_plane_unix_stream_with_auth(
+                &mut authority,
+                &mut stream,
+                2_000,
+                &verifier,
+            )
+            .unwrap();
+            assert_eq!(
+                authority.snapshot().pg(PgId::new(7)).unwrap().acting_set(),
+                &[NodeId::new(1)]
+            );
+        });
+
+        let client = AuthenticatedUnixControlPlaneClient::new(
+            UnixControlPlaneClient::new(&socket_path),
+            old_signer,
+        );
+        let cluster_epoch = client
+            .set_pg_acting_set_checked(PgId::new(7), vec![NodeId::new(1)], 2_000)
+            .unwrap();
+
+        server.join().unwrap();
+        assert!(cluster_epoch.get() >= 2);
+        let status = verifier_for_assert.status_snapshot();
+        assert_eq!(status.admin_credentials().len(), 2);
+        let metrics = verifier_for_assert.metrics_snapshot();
         assert_eq!(
             metrics.accepted_for_operation(ControlPlaneAuthOperation::AdminControlPlaneCommand),
             1
@@ -14042,6 +14398,74 @@ mod tests {
         );
         let metrics = verifier_for_assert.metrics_snapshot();
         assert_eq!(metrics.accepted_total(), 1);
+        assert_eq!(
+            metrics.accepted_for_operation(ControlPlaneAuthOperation::StorageRuntimeMapRefresh),
+            1
+        );
+        assert_eq!(metrics.rejected_total(), 0);
+    }
+
+    #[test]
+    fn authenticated_storage_node_heartbeat_accepts_overlapping_credentials() {
+        let tmp = test_util::tempdir();
+        let socket_path = tmp.path().join("control-plane.sock");
+        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+        authority
+            .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
+            .unwrap();
+        authority
+            .set_pg_acting_set(PgId::new(7), vec![NodeId::new(1)])
+            .unwrap();
+        let heartbeat_epoch = authority.snapshot().cluster_epoch();
+        let old_credential =
+            storage_node_auth_node_credential_with(1, "storage-node", 1, "old-secret");
+        let new_credential =
+            storage_node_auth_node_credential_with(1, "storage-node", 2, "new-secret");
+        let old_signer = old_credential
+            .scoped_for_cluster_and_incarnation("auth-cluster", 42)
+            .expect("old storage-node credential should scope");
+        let verifier =
+            storage_node_auth_verifier("auth-cluster", vec![old_credential, new_credential]);
+        let verifier_for_assert = verifier.clone();
+        let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _addr) = listener.accept().unwrap();
+            handle_control_plane_unix_stream_with_auth(
+                &mut authority,
+                &mut stream,
+                2_000,
+                &verifier,
+            )
+            .unwrap();
+        });
+
+        let mut client = AuthenticatedUnixControlPlaneClient::new(
+            UnixControlPlaneClient::new(&socket_path),
+            old_signer,
+        );
+        let refresh = client
+            .refresh_node_heartbeat(
+                NodeHeartbeat {
+                    node_id: NodeId::new(1),
+                    node_incarnation: 42,
+                    endpoint: "/tmp/argmin-node-1.sock".to_owned(),
+                    observed_epoch: heartbeat_epoch,
+                    requested_lease_duration_ms: 100,
+                    cluster_map_history_reference_summary:
+                        PgClusterMapHistoryReferenceSummary::default(),
+                    pg_observations: Vec::new(),
+                },
+                2_000,
+            )
+            .unwrap();
+
+        server.join().unwrap();
+        assert_eq!(refresh.lease().node_id(), NodeId::new(1));
+        assert_eq!(refresh.lease().lease_deadline_ms(), 2_100);
+        let status = verifier_for_assert.status_snapshot();
+        assert_eq!(status.storage_node_credentials().len(), 2);
+        let metrics = verifier_for_assert.metrics_snapshot();
         assert_eq!(
             metrics.accepted_for_operation(ControlPlaneAuthOperation::StorageRuntimeMapRefresh),
             1
