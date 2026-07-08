@@ -177,7 +177,30 @@ pub enum ServerError {
     NoSuchTagSet { resource: String },
 
     #[error("invalid tag: {reason}")]
-    InvalidTag { reason: String },
+    InvalidTag {
+        reason: String,
+        /// The offending tag, echoed as `<TagKey>`/`<TagValue>` when known.
+        tag_key: Option<String>,
+        tag_value: Option<String>,
+    },
+
+    /// An `x-amz-tagging` header that is not valid URL-encoded UTF-8.
+    #[error("invalid x-amz-tagging header")]
+    InvalidTaggingHeader { value: String },
+
+    /// MalformedXML raised while parsing a DeleteObjects or
+    /// OwnershipControls body; AWS renders those operations' errors
+    /// without the XML declaration (like the complete-multipart family).
+    #[error("malformed XML (no declaration): {reason}")]
+    MalformedXMLNoDecl { reason: String },
+
+    /// KeyTooLongError raised while parsing a DeleteObjects body; AWS
+    /// renders these without the XML declaration.
+    #[error("delete objects key too long")]
+    DeleteObjectsKeyTooLong {
+        size: usize,
+        max_size_allowed: usize,
+    },
 
     #[error("no public access block configuration: {bucket}")]
     NoSuchPublicAccessBlockConfiguration { bucket: String },
@@ -477,6 +500,9 @@ impl ServerError {
             Self::NoSuchCorsConfiguration { .. } => "NoSuchCORSConfiguration",
             Self::NoSuchTagSet { .. } => "NoSuchTagSet",
             Self::InvalidTag { .. } => "InvalidTag",
+            Self::InvalidTaggingHeader { .. } => "InvalidArgument",
+            Self::MalformedXMLNoDecl { .. } => "MalformedXML",
+            Self::DeleteObjectsKeyTooLong { .. } => "KeyTooLongError",
             Self::NoSuchPublicAccessBlockConfiguration { .. } => {
                 "NoSuchPublicAccessBlockConfiguration"
             }
@@ -589,7 +615,10 @@ impl ServerError {
             Self::ObjectLockConfigurationNotFound { .. } => 404,
             Self::ServerSideEncryptionConfigurationNotFound { .. } => 404,
             Self::InvalidBucketState | Self::OperationAborted => 409,
-            Self::InvalidTag { .. } => 400,
+            Self::InvalidTag { .. }
+            | Self::InvalidTaggingHeader { .. }
+            | Self::MalformedXMLNoDecl { .. }
+            | Self::DeleteObjectsKeyTooLong { .. } => 400,
             Self::AccessControlListNotSupported
             | Self::InvalidBucketAclWithObjectOwnership
             | Self::XAmzContentSHA256Mismatch { .. }

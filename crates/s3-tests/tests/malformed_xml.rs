@@ -7,7 +7,7 @@
 /// Each test sends a raw HTTP request with a deliberately broken XML body
 /// and asserts the expected error response.
 use ring::hmac;
-use s3_tests::{unique_bucket, CTX};
+use s3_tests::{shape::expected_error, unique_bucket, CTX};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 // ── Helpers ─────────────────────────────────────────────────────────────
@@ -28,11 +28,17 @@ async fn cleanup(bucket: &str) {
     s3_tests::delete_bucket_retrying_operation_aborted(client, bucket).await;
 }
 
-fn assert_error_code(body: &str, code: &str) {
-    let expected = format!("<Code>{}</Code>", code);
-    assert!(
-        body.contains(&expected),
-        "expected {expected} in body: {body}",
+/// The AWS message for x-amz-tagging headers with bad percent-encoding.
+const TAGGING_HEADER_MESSAGE: &str = "The header 'x-amz-tagging' shall be encoded as UTF-8 \
+     then URLEncoded URL query parameters without tag name duplicates.";
+
+/// Assert the full error body template; callers assert the status.
+fn assert_error_body(body: &str, expected_template: String) {
+    s3_tests::shape::assert_status_and_body(
+        "malformed request error body",
+        0,
+        body,
+        &s3_tests::shape::shape().body(expected_template),
     );
 }
 
@@ -251,7 +257,7 @@ fn test_delete_objects_malformed_xml() {
         let body = b"<Delete><Object><Key>k</Key></Delete>";
         let (status, body_text) = signed_post_with_checksum(&url, body, &[]);
         assert_eq!(status, 400, "body: {body_text}");
-        assert_error_code(&body_text, "MalformedXML");
+        assert_error_body(&body_text, expected_error::malformed_xml_no_decl());
         cleanup(&bucket).await;
     });
 }
@@ -265,7 +271,7 @@ fn test_delete_objects_missing_key() {
         let body = b"<Delete><Object><NotKey>x</NotKey></Object></Delete>";
         let (status, body_text) = signed_post_with_checksum(&url, body, &[]);
         assert_eq!(status, 400, "body: {body_text}");
-        assert_error_code(&body_text, "MalformedXML");
+        assert_error_body(&body_text, expected_error::malformed_xml_no_decl());
         cleanup(&bucket).await;
     });
 }
@@ -279,10 +285,10 @@ fn test_delete_objects_oversized_key_rejected() {
         let body = format!("<Delete><Object><Key>{key}</Key></Object></Delete>");
         let (status, body_text) = signed_post_with_checksum(&url, body.as_bytes(), &[]);
         assert_eq!(status, 400, "body: {body_text}");
-        assert_error_code(&body_text, "KeyTooLongError");
-        assert!(body_text.contains("<Message>Your key is too long</Message>"));
-        assert!(body_text.contains("<Size>1025</Size>"));
-        assert!(body_text.contains("<MaxSizeAllowed>1024</MaxSizeAllowed>"));
+        assert_error_body(
+            &body_text,
+            expected_error::delete_objects_key_too_long(1025, 1024),
+        );
         cleanup(&bucket).await;
     });
 }
@@ -298,7 +304,13 @@ fn test_put_versioning_missing_status() {
         let body = b"<VersioningConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"></VersioningConfiguration>";
         let (status, body_text) = signed_put_with_checksum(&url, body, &[]);
         assert_eq!(status, 400, "body: {body_text}");
-        assert_error_code(&body_text, "IllegalVersioningConfigurationException");
+        assert_error_body(
+            &body_text,
+            expected_error::with_host_id(
+                "IllegalVersioningConfigurationException",
+                "The Versioning element must be specified",
+            ),
+        );
         cleanup(&bucket).await;
     });
 }
@@ -312,7 +324,7 @@ fn test_put_versioning_invalid_status() {
         let body = b"<VersioningConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Status>Invalid</Status></VersioningConfiguration>";
         let (status, body_text) = signed_put_with_checksum(&url, body, &[]);
         assert_eq!(status, 400, "body: {body_text}");
-        assert_error_code(&body_text, "MalformedXML");
+        assert_error_body(&body_text, expected_error::malformed_xml());
         cleanup(&bucket).await;
     });
 }
@@ -329,7 +341,7 @@ fn test_put_cors_unclosed_rule() {
             b"<CORSConfiguration><CORSRule><AllowedOrigin>*</AllowedOrigin></CORSConfiguration>";
         let (status, body_text) = signed_put_with_checksum(&url, body, &[]);
         assert_eq!(status, 400, "body: {body_text}");
-        assert_error_code(&body_text, "MalformedXML");
+        assert_error_body(&body_text, expected_error::malformed_xml());
         cleanup(&bucket).await;
     });
 }
@@ -345,7 +357,7 @@ fn test_put_cors_missing_origin() {
             </CORSConfiguration>";
         let (status, body_text) = signed_put_with_checksum(&url, body, &[]);
         assert_eq!(status, 400, "body: {body_text}");
-        assert_error_code(&body_text, "MalformedXML");
+        assert_error_body(&body_text, expected_error::malformed_xml());
         cleanup(&bucket).await;
     });
 }
@@ -361,7 +373,7 @@ fn test_put_cors_missing_method() {
             </CORSConfiguration>";
         let (status, body_text) = signed_put_with_checksum(&url, body, &[]);
         assert_eq!(status, 400, "body: {body_text}");
-        assert_error_code(&body_text, "MalformedXML");
+        assert_error_body(&body_text, expected_error::malformed_xml());
         cleanup(&bucket).await;
     });
 }
@@ -375,7 +387,7 @@ fn test_put_cors_empty_config() {
         let body = b"<CORSConfiguration></CORSConfiguration>";
         let (status, body_text) = signed_put_with_checksum(&url, body, &[]);
         assert_eq!(status, 400, "body: {body_text}");
-        assert_error_code(&body_text, "MalformedXML");
+        assert_error_body(&body_text, expected_error::malformed_xml());
         cleanup(&bucket).await;
     });
 }
@@ -389,7 +401,7 @@ fn test_put_cors_missing_wrapper() {
         let body = b"<CORSRule><AllowedOrigin>*</AllowedOrigin><AllowedMethod>GET</AllowedMethod></CORSRule>";
         let (status, body_text) = signed_put_with_checksum(&url, body, &[]);
         assert_eq!(status, 400, "body: {body_text}");
-        assert_error_code(&body_text, "MalformedXML");
+        assert_error_body(&body_text, expected_error::malformed_xml());
         cleanup(&bucket).await;
     });
 }
@@ -405,7 +417,7 @@ fn test_put_bucket_tagging_malformed_xml() {
         let body = b"<TagSet><Tag><Key>k</Key><Value>v</Value></Tag></TagSet>";
         let (status, body_text) = signed_put_with_checksum(&url, body, &[]);
         assert_eq!(status, 400, "body: {body_text}");
-        assert_error_code(&body_text, "MalformedXML");
+        assert_error_body(&body_text, expected_error::malformed_xml());
         cleanup(&bucket).await;
     });
 }
@@ -421,7 +433,7 @@ fn test_put_public_access_block_malformed_xml() {
         let body = b"<BlockPublicAcls>true</BlockPublicAcls>";
         let (status, body_text) = signed_put_with_checksum(&url, body, &[]);
         assert_eq!(status, 400, "body: {body_text}");
-        assert_error_code(&body_text, "MalformedXML");
+        assert_error_body(&body_text, expected_error::malformed_xml());
         cleanup(&bucket).await;
     });
 }
@@ -437,7 +449,7 @@ fn test_put_ownership_controls_missing_wrapper() {
         let body = b"<Rule><ObjectOwnership>BucketOwnerEnforced</ObjectOwnership></Rule>";
         let (status, body_text) = signed_put_with_checksum(&url, body, &[]);
         assert_eq!(status, 400, "body: {body_text}");
-        assert_error_code(&body_text, "MalformedXML");
+        assert_error_body(&body_text, expected_error::malformed_xml_no_decl());
         cleanup(&bucket).await;
     });
 }
@@ -451,7 +463,7 @@ fn test_put_ownership_controls_missing_rule() {
         let body = b"<OwnershipControls></OwnershipControls>";
         let (status, body_text) = signed_put_with_checksum(&url, body, &[]);
         assert_eq!(status, 400, "body: {body_text}");
-        assert_error_code(&body_text, "MalformedXML");
+        assert_error_body(&body_text, expected_error::malformed_xml_no_decl());
         cleanup(&bucket).await;
     });
 }
@@ -465,7 +477,7 @@ fn test_put_ownership_controls_missing_value() {
         let body = b"<OwnershipControls><Rule></Rule></OwnershipControls>";
         let (status, body_text) = signed_put_with_checksum(&url, body, &[]);
         assert_eq!(status, 400, "body: {body_text}");
-        assert_error_code(&body_text, "MalformedXML");
+        assert_error_body(&body_text, expected_error::malformed_xml_no_decl());
         cleanup(&bucket).await;
     });
 }
@@ -500,7 +512,7 @@ fn test_complete_multipart_malformed_xml() {
         let body = b"<CompleteMultipartUpload>not a part</CompleteMultipartUpload>";
         let (status, body_text) = signed_post(&url, body, &[]);
         assert_eq!(status, 400, "body: {body_text}");
-        assert_error_code(&body_text, "MalformedXML");
+        assert_error_body(&body_text, expected_error::malformed_xml_no_decl());
 
         // Abort the upload to clean up.
         let _ = client
@@ -543,7 +555,7 @@ fn test_complete_multipart_missing_part_number() {
             </CompleteMultipartUpload>";
         let (status, body_text) = signed_post(&url, body, &[]);
         assert_eq!(status, 400, "body: {body_text}");
-        assert_error_code(&body_text, "MalformedXML");
+        assert_error_body(&body_text, expected_error::malformed_xml_no_decl());
 
         let _ = client
             .abort_multipart_upload()
@@ -573,7 +585,7 @@ fn test_put_cors_invalid_max_age() {
             </CORSConfiguration>";
         let (status, body_text) = signed_put_with_checksum(&url, body, &[]);
         assert_eq!(status, 400, "body: {body_text}");
-        assert_error_code(&body_text, "MalformedXML");
+        assert_error_body(&body_text, expected_error::malformed_xml());
         cleanup(&bucket).await;
     });
 }
@@ -594,7 +606,13 @@ fn test_put_cors_invalid_method() {
             </CORSConfiguration>";
         let (status, body_text) = signed_put_with_checksum(&url, body, &[]);
         assert_eq!(status, 400, "body: {body_text}");
-        assert_error_code(&body_text, "InvalidRequest");
+        assert_error_body(
+            &body_text,
+            expected_error::with_host_id(
+                "InvalidRequest",
+                "Found unsupported HTTP method in CORS config. Unsupported method is PATCH",
+            ),
+        );
         cleanup(&bucket).await;
     });
 }
@@ -610,7 +628,7 @@ fn test_delete_objects_non_utf8() {
         let body: &[u8] = &[0xFF, 0xFE, 0x80, 0x81];
         let (status, body_text) = signed_post_with_checksum(&url, body, &[]);
         assert_eq!(status, 400, "body: {body_text}");
-        assert_error_code(&body_text, "MalformedXML");
+        assert_error_body(&body_text, expected_error::malformed_xml_no_decl());
         cleanup(&bucket).await;
     });
 }
@@ -624,7 +642,7 @@ fn test_put_versioning_non_utf8() {
         let body: &[u8] = &[0xFF, 0xFE, 0x80, 0x81];
         let (status, body_text) = signed_put_with_checksum(&url, body, &[]);
         assert_eq!(status, 400, "body: {body_text}");
-        assert_error_code(&body_text, "MalformedXML");
+        assert_error_body(&body_text, expected_error::malformed_xml());
         cleanup(&bucket).await;
     });
 }
@@ -638,7 +656,7 @@ fn test_put_cors_non_utf8() {
         let body: &[u8] = &[0xFF, 0xFE, 0x80, 0x81];
         let (status, body_text) = signed_put_with_checksum(&url, body, &[]);
         assert_eq!(status, 400, "body: {body_text}");
-        assert_error_code(&body_text, "MalformedXML");
+        assert_error_body(&body_text, expected_error::malformed_xml());
         cleanup(&bucket).await;
     });
 }
@@ -652,7 +670,7 @@ fn test_put_tagging_non_utf8() {
         let body: &[u8] = &[0xFF, 0xFE, 0x80, 0x81];
         let (status, body_text) = signed_put_with_checksum(&url, body, &[]);
         assert_eq!(status, 400, "body: {body_text}");
-        assert_error_code(&body_text, "MalformedXML");
+        assert_error_body(&body_text, expected_error::malformed_xml());
         cleanup(&bucket).await;
     });
 }
@@ -666,7 +684,7 @@ fn test_put_public_access_block_non_utf8() {
         let body: &[u8] = &[0xFF, 0xFE, 0x80, 0x81];
         let (status, body_text) = signed_put_with_checksum(&url, body, &[]);
         assert_eq!(status, 400, "body: {body_text}");
-        assert_error_code(&body_text, "MalformedXML");
+        assert_error_body(&body_text, expected_error::malformed_xml());
         cleanup(&bucket).await;
     });
 }
@@ -680,7 +698,7 @@ fn test_put_ownership_controls_non_utf8() {
         let body: &[u8] = &[0xFF, 0xFE, 0x80, 0x81];
         let (status, body_text) = signed_put_with_checksum(&url, body, &[]);
         assert_eq!(status, 400, "body: {body_text}");
-        assert_error_code(&body_text, "MalformedXML");
+        assert_error_body(&body_text, expected_error::malformed_xml_no_decl());
         cleanup(&bucket).await;
     });
 }
@@ -712,7 +730,7 @@ fn test_complete_multipart_non_utf8() {
         let body: &[u8] = &[0xFF, 0xFE, 0x80, 0x81];
         let (status, body_text) = signed_post(&url, body, &[]);
         assert_eq!(status, 400, "body: {body_text}");
-        assert_error_code(&body_text, "MalformedXML");
+        assert_error_body(&body_text, expected_error::malformed_xml_no_decl());
 
         let _ = client
             .abort_multipart_upload()
@@ -738,7 +756,14 @@ fn test_put_object_tagging_header_non_utf8_decoded() {
         // %FF decodes to byte 0xFF which is not valid UTF-8
         let (status, body_text) = send_signed("PUT", &url, body, &[("x-amz-tagging", "foo=%FF")]);
         assert_eq!(status, 400, "body: {body_text}");
-        assert_error_code(&body_text, "InvalidTag");
+        assert_error_body(
+            &body_text,
+            expected_error::invalid_tag(
+                "The TagValue you have provided is invalid",
+                Some("foo"),
+                Some("\u{fffd}"),
+            ),
+        );
         cleanup(&bucket).await;
     });
 }
@@ -772,7 +797,7 @@ fn test_complete_multipart_invalid_part_number() {
             </CompleteMultipartUpload>";
         let (status, body_text) = signed_post(&url, body, &[]);
         assert_eq!(status, 400, "body: {body_text}");
-        assert_error_code(&body_text, "MalformedXML");
+        assert_error_body(&body_text, expected_error::malformed_xml_no_decl());
 
         let _ = client
             .abort_multipart_upload()
@@ -799,7 +824,14 @@ fn test_put_object_tagging_header_bad_percent_encoding() {
         // %ZZ is not valid hex
         let (status, body_text) = send_signed("PUT", &url, body, &[("x-amz-tagging", "foo=%ZZ")]);
         assert_eq!(status, 400, "body: {body_text}");
-        assert_error_code(&body_text, "InvalidArgument");
+        assert_error_body(
+            &body_text,
+            expected_error::invalid_argument_with_value(
+                TAGGING_HEADER_MESSAGE,
+                "x-amz-tagging",
+                "foo=%ZZ",
+            ),
+        );
         // Clean up: key was not created, just delete bucket
         cleanup(&bucket).await;
     });
@@ -816,7 +848,14 @@ fn test_put_object_tagging_header_truncated_percent() {
         // %A is incomplete (needs two hex digits)
         let (status, body_text) = send_signed("PUT", &url, body, &[("x-amz-tagging", "foo=%A")]);
         assert_eq!(status, 400, "body: {body_text}");
-        assert_error_code(&body_text, "InvalidArgument");
+        assert_error_body(
+            &body_text,
+            expected_error::invalid_argument_with_value(
+                TAGGING_HEADER_MESSAGE,
+                "x-amz-tagging",
+                "foo=%A",
+            ),
+        );
         cleanup(&bucket).await;
     });
 }

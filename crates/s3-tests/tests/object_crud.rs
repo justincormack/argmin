@@ -1789,3 +1789,27 @@ fn test_get_object_acl_response_shape() {
         s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
     });
 }
+
+/// Full error shape for a PUT whose key exceeds 1024 bytes: direct object
+/// requests get the declaration-carrying `KeyTooLongError` body (the
+/// DeleteObjects variant omits the declaration; both AWS probed).
+#[test]
+fn test_put_object_key_too_long_error_shape() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+        let long_key = "k".repeat(1025);
+
+        let response = raw_object_with("PUT", &bucket, &long_key, b"x", &[]);
+        assert_shape(
+            "PutObject key too long",
+            &response,
+            &shape()
+                .status(400)
+                .headers(error_response_headers())
+                .body(expected_error::key_too_long(1025, 1024)),
+        );
+
+        s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
+    });
+}

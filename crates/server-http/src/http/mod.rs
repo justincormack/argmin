@@ -234,11 +234,15 @@ fn validate_untag_resource_tag_keys(tag_keys: &[String]) -> Result<(), ServerErr
     if tag_keys.is_empty() || tag_keys.iter().any(String::is_empty) {
         return Err(ServerError::InvalidTag {
             reason: "At least one tag is required.".to_string(),
+            tag_key: None,
+            tag_value: None,
         });
     }
     if tag_keys.len() > 50 {
         return Err(ServerError::InvalidTag {
             reason: "too many tagKeys in UntagResource request".to_string(),
+            tag_key: None,
+            tag_value: None,
         });
     }
     Ok(())

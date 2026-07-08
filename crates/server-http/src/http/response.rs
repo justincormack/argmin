@@ -288,11 +288,25 @@ fn client_error_message(err: &ServerError) -> String {
         | ServerError::InvalidBucketName { reason }
         | ServerError::MalformedPolicy { reason, .. }
         | ServerError::InvalidPolicyDocument { reason }
-        | ServerError::MalformedXML { reason }
         | ServerError::MalformedPOSTRequest { reason }
         | ServerError::MalformedChunkedBody { reason }
-
-        | ServerError::InvalidTag { reason } => reason.clone(),
+        | ServerError::InvalidTag { reason, .. } => reason.clone(),
+        ServerError::MalformedXML { .. } => {
+            "The XML you provided was not well-formed or did not validate against \
+             our published schema"
+                .to_string()
+        }
+        ServerError::InvalidTaggingHeader { .. } => {
+            "The header 'x-amz-tagging' shall be encoded as UTF-8 then URLEncoded \
+             URL query parameters without tag name duplicates."
+                .to_string()
+        }
+        ServerError::DeleteObjectsKeyTooLong { .. } => "Your key is too long".to_string(),
+        ServerError::MalformedXMLNoDecl { .. } => {
+            "The XML you provided was not well-formed or did not validate against \
+             our published schema"
+                .to_string()
+        }
         ServerError::DuplicateChecksumHeader { .. } => "Only one value may be specified.".to_string(),
         ServerError::UnexpectedContent => "This request does not support content".to_string(),
         ServerError::KeyTooLongError {
@@ -734,7 +748,8 @@ impl S3Response {
                 size,
                 max_size_allowed,
             } => {
-                let body = xml::key_too_long_error_xml(*size, *max_size_allowed, request_id);
+                let body =
+                    xml::key_too_long_error_xml(*size, *max_size_allowed, request_id, host_id);
                 Self::new(400).chunked_xml_body(body)
             }
             ServerError::MetadataTooLargeDetailed {
@@ -773,6 +788,10 @@ impl S3Response {
             ServerError::NoSuchUpload { upload_id } => {
                 let body = xml::no_such_upload_error_xml(upload_id, request_id, host_id);
                 Self::new(404).chunked_xml_body(body)
+            }
+            ServerError::MalformedXMLNoDecl { .. } => {
+                let body = xml::complete_multipart_malformed_xml_error_xml(request_id, host_id);
+                Self::new(400).chunked_xml_body(body)
             }
             ServerError::MalformedXML { .. } => {
                 let body = xml::error_xml_with_host_id(
@@ -823,6 +842,49 @@ impl S3Response {
                     &client_error_message(err),
                     "x-amz-content-sha256",
                     Some(token),
+                    request_id,
+                    host_id,
+                );
+                Self::new(400).chunked_xml_body(body)
+            }
+            ServerError::DeleteObjectsKeyTooLong {
+                size,
+                max_size_allowed,
+            } => {
+                let body = xml::delete_objects_key_too_long_error_xml(
+                    *size,
+                    *max_size_allowed,
+                    request_id,
+                    host_id,
+                );
+                Self::new(400).chunked_xml_body(body)
+            }
+            ServerError::InvalidTag {
+                tag_key, tag_value, ..
+            } => {
+                let body = xml::invalid_tag_error_xml(
+                    &client_error_message(err),
+                    tag_key.as_deref(),
+                    tag_value.as_deref(),
+                    request_id,
+                    host_id,
+                );
+                Self::new(400).chunked_xml_body(body)
+            }
+            ServerError::InvalidTaggingHeader { value } => {
+                let body = xml::invalid_argument_error_xml(
+                    &client_error_message(err),
+                    "x-amz-tagging",
+                    Some(value),
+                    request_id,
+                    host_id,
+                );
+                Self::new(400).chunked_xml_body(body)
+            }
+            ServerError::IllegalVersioningConfiguration { .. } => {
+                let body = xml::error_xml_with_host_id(
+                    err.s3_error_code(),
+                    &client_error_message(err),
                     request_id,
                     host_id,
                 );

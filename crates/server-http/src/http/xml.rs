@@ -752,19 +752,76 @@ pub fn no_such_bucket_policy_error_xml(
 
 /// Format an S3 `KeyTooLongError` response.
 #[must_use]
-pub fn key_too_long_error_xml(size: usize, max_size_allowed: usize, request_id: &str) -> String {
+pub fn key_too_long_error_xml(
+    size: usize,
+    max_size_allowed: usize,
+    request_id: &str,
+    host_id: &str,
+) -> String {
     format!(
-        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
-         <Error>\
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n{}",
+        delete_objects_key_too_long_error_xml(size, max_size_allowed, request_id, host_id)
+    )
+}
+
+/// Format a `KeyTooLongError` raised while parsing a DeleteObjects body;
+/// AWS renders these without the XML declaration.
+#[must_use]
+pub fn delete_objects_key_too_long_error_xml(
+    size: usize,
+    max_size_allowed: usize,
+    request_id: &str,
+    host_id: &str,
+) -> String {
+    format!(
+        "<Error>\
          <Code>KeyTooLongError</Code>\
          <Message>Your key is too long</Message>\
          <Size>{}</Size>\
          <MaxSizeAllowed>{}</MaxSizeAllowed>\
          <RequestId>{}</RequestId>\
+         <HostId>{}</HostId>\
          </Error>",
         size,
         max_size_allowed,
         xml_escape(request_id),
+        xml_escape(host_id),
+    )
+}
+
+/// Format an `InvalidTag` error response, echoing the offending tag when
+/// known.
+#[must_use]
+pub fn invalid_tag_error_xml(
+    message: &str,
+    tag_key: Option<&str>,
+    tag_value: Option<&str>,
+    request_id: &str,
+    host_id: &str,
+) -> String {
+    let mut tag = String::new();
+    if let Some(tag_key) = tag_key {
+        tag.push_str(&format!("<TagKey>{}</TagKey>", xml_escape_text(tag_key)));
+    }
+    if let Some(tag_value) = tag_value {
+        tag.push_str(&format!(
+            "<TagValue>{}</TagValue>",
+            xml_escape_text(tag_value)
+        ));
+    }
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+         <Error>\
+         <Code>InvalidTag</Code>\
+         <Message>{}</Message>\
+         {}\
+         <RequestId>{}</RequestId>\
+         <HostId>{}</HostId>\
+         </Error>",
+        xml_escape_text(message),
+        tag,
+        xml_escape(request_id),
+        xml_escape(host_id),
     )
 }
 
@@ -1438,7 +1495,7 @@ pub fn parse_delete_objects_xml(
     }
 
     fn malformed_delete_xml(reason: &str) -> ServerError {
-        ServerError::MalformedXML {
+        ServerError::MalformedXMLNoDecl {
             reason: reason.to_string(),
         }
     }
@@ -1529,14 +1586,14 @@ pub fn parse_delete_objects_xml(
                         .take()
                         .ok_or_else(|| malformed_delete_xml("Object missing <Key> element"))?;
                     if key.len() > 1024 {
-                        return Err(ServerError::KeyTooLongError {
+                        return Err(ServerError::DeleteObjectsKeyTooLong {
                             size: key.len(),
                             max_size_allowed: 1024,
                         });
                     }
                     let key = ObjectKey::try_from(key).map_err(|error| match error {
                         storage::ObjectKeyError::InvalidLength { length } if length > 1024 => {
-                            ServerError::KeyTooLongError {
+                            ServerError::DeleteObjectsKeyTooLong {
                                 size: length,
                                 max_size_allowed: 1024,
                             }
@@ -1598,7 +1655,13 @@ pub fn parse_delete_objects_xml(
                     t.as_ref(),
                     "invalid UTF-8 in delete XML body",
                     "invalid XML entity in delete XML body",
-                )?;
+                )
+                .map_err(|error| match error {
+                    ServerError::MalformedXML { reason } => {
+                        ServerError::MalformedXMLNoDecl { reason }
+                    }
+                    other => other,
+                })?;
                 match state {
                     State::InEtag
                     | State::InKey
@@ -3119,7 +3182,7 @@ pub fn parse_cors_config_xml(data: &[u8]) -> Result<crate::cors::CorsConfigurati
                 (State::InAllowedMethod, b"AllowedMethod") => {
                     let method = std::mem::take(&mut current_text);
                     if !valid_methods.contains(&method.as_str()) {
-                        return Err(ServerError::InvalidRequest {
+                        return Err(ServerError::InvalidRequestHostId {
                             reason: format!(
                                 "Found unsupported HTTP method in CORS config. Unsupported method is {method}"
                             ),
@@ -3305,22 +3368,30 @@ fn validate_tag_set(tags: &[(String, String)], max_tags: usize) -> Result<(), Se
         if key_chars == 0 || key_chars > 128 {
             return Err(ServerError::InvalidTag {
                 reason: format!("tag key must be 1-128 characters, got {key_chars}"),
+                tag_key: None,
+                tag_value: None,
             });
         }
         if key.starts_with("aws:") {
             return Err(ServerError::InvalidTag {
                 reason: "tag key must not start with 'aws:'".to_string(),
+                tag_key: None,
+                tag_value: None,
             });
         }
         let value_chars = value.chars().count();
         if value_chars > 256 {
             return Err(ServerError::InvalidTag {
                 reason: format!("tag value must be 0-256 characters, got {value_chars}"),
+                tag_key: None,
+                tag_value: None,
             });
         }
         if !seen_keys.insert(key.clone()) {
             return Err(ServerError::InvalidTag {
                 reason: format!("duplicate tag key: {key}"),
+                tag_key: None,
+                tag_value: None,
             });
         }
     }
@@ -3331,6 +3402,8 @@ fn validate_tag_set(tags: &[(String, String)], max_tags: usize) -> Result<(), Se
                 max_tags,
                 tags.len()
             ),
+            tag_key: None,
+            tag_value: None,
         });
     }
     Ok(())
@@ -3392,6 +3465,8 @@ fn parse_tag_collection_xml(
                 (State::InCollection, b"Tag") => {
                     return Err(ServerError::InvalidTag {
                         reason: "missing <Key> element in <Tag>".to_string(),
+                        tag_key: None,
+                        tag_value: None,
                     });
                 }
                 (State::InTag, b"Key") => {
@@ -3412,6 +3487,8 @@ fn parse_tag_collection_xml(
                 (State::InTag, b"Tag") => {
                     let key = current_key.take().ok_or(ServerError::InvalidTag {
                         reason: "missing <Key> element in <Tag>".to_string(),
+                        tag_key: None,
+                        tag_value: None,
                     })?;
                     let value = current_value.take().unwrap_or_default();
                     tags.push((key, value));
@@ -3813,30 +3890,53 @@ pub fn parse_url_encoded_tags(input: &str) -> Result<Vec<(String, String)>, Serv
             None => (pair, ""),
         };
 
-        let key = percent_decode_tag(raw_key)?;
-        let value = percent_decode_tag(raw_value)?;
+        let decode = |raw: &str, key_for_error: Option<&str>| match percent_decode_tag(raw) {
+            Ok(decoded) => Ok(decoded),
+            Err(TagDecodeError::BadPercentEncoding) => Err(ServerError::InvalidTaggingHeader {
+                value: input.to_string(),
+            }),
+            Err(TagDecodeError::NotUtf8 { lossy }) => Err(ServerError::InvalidTag {
+                reason: if key_for_error.is_some() {
+                    "The TagValue you have provided is invalid".to_string()
+                } else {
+                    "The TagKey you have provided is invalid".to_string()
+                },
+                tag_key: Some(key_for_error.unwrap_or(lossy.as_str()).to_string()),
+                tag_value: key_for_error.map(|_| lossy.clone()),
+            }),
+        };
+        let key = decode(raw_key, None)?;
+        let value = decode(raw_value, Some(key.as_str()))?;
 
         let key_chars = key.chars().count();
         if key_chars == 0 || key_chars > 128 {
             return Err(ServerError::InvalidTag {
                 reason: format!("tag key must be 1-128 characters, got {key_chars}"),
+                tag_key: None,
+                tag_value: None,
             });
         }
         if key.starts_with("aws:") {
             return Err(ServerError::InvalidTag {
                 reason: "tag key must not start with 'aws:'".to_string(),
+                tag_key: None,
+                tag_value: None,
             });
         }
         let value_chars = value.chars().count();
         if value_chars > 256 {
             return Err(ServerError::InvalidTag {
                 reason: format!("tag value must be 0-256 characters, got {value_chars}"),
+                tag_key: None,
+                tag_value: None,
             });
         }
 
         if !seen_keys.insert(key.clone()) {
             return Err(ServerError::InvalidTag {
                 reason: format!("duplicate tag key: {key}"),
+                tag_key: None,
+                tag_value: None,
             });
         }
 
@@ -3846,6 +3946,8 @@ pub fn parse_url_encoded_tags(input: &str) -> Result<Vec<(String, String)>, Serv
     if tags.len() > 10 {
         return Err(ServerError::InvalidTag {
             reason: format!("Object tags cannot be greater than 10, got {}", tags.len()),
+            tag_key: None,
+            tag_value: None,
         });
     }
 
@@ -3861,29 +3963,30 @@ pub fn count_tags_in_xml(xml: &str) -> Result<usize, ServerError> {
 ///
 /// Collects decoded bytes first, then converts to UTF-8, so multibyte
 /// percent-encoded sequences (e.g. `%C3%A9` for `é`) decode correctly.
-fn percent_decode_tag(input: &str) -> Result<String, ServerError> {
+enum TagDecodeError {
+    /// Malformed percent-encoding; AWS reports the whole header value.
+    BadPercentEncoding,
+    /// Decoded bytes are not UTF-8; AWS echoes the lossy text.
+    NotUtf8 { lossy: String },
+}
+
+fn percent_decode_tag(input: &str) -> Result<String, TagDecodeError> {
     let mut bytes = Vec::with_capacity(input.len());
     let mut iter = input.bytes();
     while let Some(b) = iter.next() {
         if b == b'+' {
             bytes.push(b' ');
         } else if b == b'%' {
-            let hi = iter.next().ok_or(ServerError::InvalidArgument {
-                reason: "invalid percent-encoding in tagging header".to_string(),
-            })?;
-            let lo = iter.next().ok_or(ServerError::InvalidArgument {
-                reason: "invalid percent-encoding in tagging header".to_string(),
-            })?;
-            let byte = decode_hex_pair(hi, lo).ok_or(ServerError::InvalidArgument {
-                reason: "invalid percent-encoding in tagging header".to_string(),
-            })?;
+            let hi = iter.next().ok_or(TagDecodeError::BadPercentEncoding)?;
+            let lo = iter.next().ok_or(TagDecodeError::BadPercentEncoding)?;
+            let byte = decode_hex_pair(hi, lo).ok_or(TagDecodeError::BadPercentEncoding)?;
             bytes.push(byte);
         } else {
             bytes.push(b);
         }
     }
-    String::from_utf8(bytes).map_err(|_| ServerError::InvalidTag {
-        reason: "The TagValue you have provided is invalid".to_string(),
+    String::from_utf8(bytes).map_err(|error| TagDecodeError::NotUtf8 {
+        lossy: String::from_utf8_lossy(error.as_bytes()).into_owned(),
     })
 }
 
@@ -4137,7 +4240,7 @@ pub fn parse_ownership_controls_xml(data: &[u8]) -> Result<BucketOwnershipContro
     }
 
     fn malformed_ownership_xml(reason: &str) -> ServerError {
-        ServerError::MalformedXML {
+        ServerError::MalformedXMLNoDecl {
             reason: reason.to_string(),
         }
     }
@@ -4148,6 +4251,10 @@ pub fn parse_ownership_controls_xml(data: &[u8]) -> Result<BucketOwnershipContro
             "invalid UTF-8 in ownership controls XML body",
             "invalid XML entity in ownership controls XML body",
         )
+        .map_err(|error| match error {
+            ServerError::MalformedXML { reason } => ServerError::MalformedXMLNoDecl { reason },
+            other => other,
+        })
     }
 
     ensure_xml_body_size(data, MAX_OWNERSHIP_CONTROLS_XML_BYTES)?;
@@ -5605,14 +5712,14 @@ mod tests {
         let key = "a".repeat(1025);
         let xml = format!("<Delete><Object><Key>{key}</Key></Object></Delete>");
         match parse_delete_objects_xml(xml.as_bytes()) {
-            Err(ServerError::KeyTooLongError {
+            Err(ServerError::DeleteObjectsKeyTooLong {
                 size,
                 max_size_allowed,
             }) => {
                 assert_eq!(size, 1025);
                 assert_eq!(max_size_allowed, 1024);
             }
-            other => panic!("expected KeyTooLongError, got {other:?}"),
+            other => panic!("expected DeleteObjectsKeyTooLong, got {other:?}"),
         }
     }
 

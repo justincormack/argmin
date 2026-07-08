@@ -330,11 +330,19 @@ fn parse_bucket_name(name: &str) -> Result<BucketName, ServerError> {
 /// Validate an S3 object key.
 /// 1-1024 bytes, no null bytes.
 pub(crate) fn validate_object_key(key: &str) -> Result<(), ServerError> {
-    ObjectKey::try_from(key)
-        .map(|_| ())
-        .map_err(|error| ServerError::InvalidRequest {
+    ObjectKey::try_from(key).map(|_| ()).map_err(|error| {
+        if let storage::ObjectKeyError::InvalidLength { length } = error {
+            if length > 1024 {
+                return ServerError::KeyTooLongError {
+                    size: length,
+                    max_size_allowed: 1024,
+                };
+            }
+        }
+        ServerError::InvalidRequest {
             reason: error.to_string(),
-        })
+        }
+    })
 }
 
 /// Route an HTTP request to an S3 operation.

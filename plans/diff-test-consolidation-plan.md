@@ -551,6 +551,24 @@ diff-test coverage either, so their shapes have never been AWS-pinned):
 7. **Malformed-XML request errors** — `malformed_xml.rs` body checks are
    `contains`-based; `MalformedXML` bodies carry no declaration (like
    the multipart errors) and would anchor cheaply.
+   **DONE (slice 5, 2026-07-08)** — probed every case via a printing
+   copy of the binary on AWS (single-threaded for attribution). AWS
+   uses ONE canonical MalformedXML message everywhere, in two
+   transport variants scoped by operation: CompleteMultipartUpload,
+   DeleteObjects, and OwnershipControls render without the XML
+   declaration, other operations with it. Local's ~19 bespoke messages
+   replaced by the canonical sentence at render time (reasons stay
+   internal); new `MalformedXMLNoDecl` variant for the no-decl
+   parsers. Other fixes: DeleteObjects KeyTooLongError loses the
+   declaration and gains HostId (direct PUT keeps the declaration —
+   both probed — and over-long PUT keys now return KeyTooLongError
+   instead of InvalidRequest); InvalidTag echoes `<TagKey>`/`<TagValue>`
+   (lossy text for invalid UTF-8); bad tagging-header percent-encoding
+   returns AWS's InvalidArgument header sentence with
+   ArgumentName/ArgumentValue; IllegalVersioningConfigurationException
+   and the CORS unsupported-method InvalidRequest move to HostId
+   bodies. All 30 malformed_xml tests pin full bodies plus a new
+   direct-PUT KeyTooLongError golden; binary AWS-validated.
 8. **Subresource write acks** — PutBucketVersioning/Tagging/etc. 200s
    and Delete* 204s: header sets never pinned (cheap, mechanical).
 

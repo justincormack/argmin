@@ -872,6 +872,38 @@ pub mod expected_error {
         xml::invalid_chunk_size_error_xml(chunk, bad_chunk_size, 8192, REQUEST_ID, HOST_ID)
     }
 
+    /// The canonical `MalformedXML` body with the XML declaration.
+    pub fn malformed_xml() -> String {
+        xml::error_xml_with_host_id(
+            "MalformedXML",
+            "The XML you provided was not well-formed or did not validate against \
+             our published schema",
+            REQUEST_ID,
+            HOST_ID,
+        )
+    }
+
+    /// The canonical `MalformedXML` body without the XML declaration, used
+    /// by CompleteMultipartUpload, DeleteObjects, and OwnershipControls.
+    pub fn malformed_xml_no_decl() -> String {
+        xml::complete_multipart_malformed_xml_error_xml(REQUEST_ID, HOST_ID)
+    }
+
+    /// `KeyTooLongError` for direct object requests (with declaration).
+    pub fn key_too_long(size: usize, max_size_allowed: usize) -> String {
+        xml::key_too_long_error_xml(size, max_size_allowed, REQUEST_ID, HOST_ID)
+    }
+
+    /// `KeyTooLongError` from a DeleteObjects body (no declaration).
+    pub fn delete_objects_key_too_long(size: usize, max_size_allowed: usize) -> String {
+        xml::delete_objects_key_too_long_error_xml(size, max_size_allowed, REQUEST_ID, HOST_ID)
+    }
+
+    /// `InvalidTag` echoing the offending tag when known.
+    pub fn invalid_tag(message: &str, tag_key: Option<&str>, tag_value: Option<&str>) -> String {
+        xml::invalid_tag_error_xml(message, tag_key, tag_value, REQUEST_ID, HOST_ID)
+    }
+
     /// `MalformedPolicy` for parse-level failures (no `<Detail>`). Brace
     /// characters in the message are escaped for the template grammar.
     pub fn malformed_policy(message: &str) -> String {
@@ -1449,6 +1481,38 @@ mod tests {
              the upload may have been aborted or completed.</Message>\
              <UploadId>upload-1</UploadId><RequestId>{request_id}</RequestId>\
              <HostId>{host_id}</HostId></Error>"
+        );
+        assert_eq!(
+            expected_error::malformed_xml(),
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>MalformedXML</Code>\
+             <Message>The XML you provided was not well-formed or did not validate \
+             against our published schema</Message>\
+             <RequestId>{request_id}</RequestId><HostId>{host_id}</HostId></Error>"
+        );
+        assert_eq!(
+            expected_error::malformed_xml_no_decl(),
+            "<Error><Code>MalformedXML</Code>\
+             <Message>The XML you provided was not well-formed or did not validate \
+             against our published schema</Message>\
+             <RequestId>{request_id}</RequestId><HostId>{host_id}</HostId></Error>"
+        );
+        assert_eq!(
+            expected_error::key_too_long(1025, 1024),
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>KeyTooLongError</Code>\
+             <Message>Your key is too long</Message>\
+             <Size>1025</Size><MaxSizeAllowed>1024</MaxSizeAllowed>\
+             <RequestId>{request_id}</RequestId><HostId>{host_id}</HostId></Error>"
+        );
+        assert_eq!(
+            expected_error::invalid_tag(
+                "The TagValue you have provided is invalid",
+                Some("foo"),
+                Some("\u{fffd}")
+            ),
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>InvalidTag</Code>\
+             <Message>The TagValue you have provided is invalid</Message>\
+             <TagKey>foo</TagKey><TagValue>\u{fffd}</TagValue>\
+             <RequestId>{request_id}</RequestId><HostId>{host_id}</HostId></Error>"
         );
         assert_eq!(
             expected_error::invalid_chunk_size(2, 5),
