@@ -93,6 +93,7 @@ pub enum ControlPlaneAuthOperation {
     FrontendRuntimeMapRead,
     AdminControlPlaneCommand,
     RuntimeMapResponse,
+    AdminControlPlaneResponse,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -248,6 +249,25 @@ impl ControlPlaneScopedCredential {
             credential_version: self.credential_version,
             principal: ControlPlaneAuthPrincipal::Service {
                 service: ControlPlaneAuthService::RuntimeMap,
+            },
+            secret: self.secret.clone(),
+        })
+    }
+
+    pub(crate) fn admin_control_plane_response_credential_for_admin(
+        &self,
+    ) -> Result<Self, ControlPlaneError> {
+        if !matches!(self.principal, ControlPlaneAuthPrincipal::Admin { .. }) {
+            return Err(auth_protocol_error(
+                "admin control-plane response credential requires an admin scoped credential",
+            ));
+        }
+        Self::new(ControlPlaneScopedCredentialInput {
+            cluster_id: self.cluster_id.clone(),
+            credential_id: self.credential_id.clone(),
+            credential_version: self.credential_version,
+            principal: ControlPlaneAuthPrincipal::Service {
+                service: ControlPlaneAuthService::Admin,
             },
             secret: self.secret.clone(),
         })
@@ -942,6 +962,7 @@ fn write_operation(out: &mut Vec<u8>, operation: ControlPlaneAuthOperation) {
             ControlPlaneAuthOperation::FrontendRuntimeMapRead => 8,
             ControlPlaneAuthOperation::AdminControlPlaneCommand => 9,
             ControlPlaneAuthOperation::RuntimeMapResponse => 10,
+            ControlPlaneAuthOperation::AdminControlPlaneResponse => 11,
         },
     );
 }
@@ -960,6 +981,7 @@ fn read_operation(
         8 => Ok(ControlPlaneAuthOperation::FrontendRuntimeMapRead),
         9 => Ok(ControlPlaneAuthOperation::AdminControlPlaneCommand),
         10 => Ok(ControlPlaneAuthOperation::RuntimeMapResponse),
+        11 => Ok(ControlPlaneAuthOperation::AdminControlPlaneResponse),
         tag => Err(auth_protocol_error(format!(
             "unknown control-plane auth operation tag {tag}"
         ))),

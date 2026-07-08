@@ -25,7 +25,8 @@ use server_core::sse::{
     ManagedWrappingKeyConfig, SseCustomerValidatorConfig, StaticManagedKeyProvider,
 };
 use storage::control_plane::{
-    build_control_plane_unix_response, build_control_plane_unix_response_with_auth,
+    build_control_plane_unix_response,
+    build_control_plane_unix_response_with_auth_and_response_clock,
     read_control_plane_unix_request, write_control_plane_unix_response,
     AuthenticatedUnixControlPlaneClient, ClusterControlSnapshot, ClusterRuntimeMapSnapshot,
     ControlPlaneAdmin, ControlPlaneAdminAuthCredential, ControlPlaneError,
@@ -3020,12 +3021,15 @@ fn spawn_control_plane_rpc_worker(
                 .expect("control-plane authority mutex poisoned");
             let now_ms = storage::clock::current_time_millis();
             match auth_verifier.as_deref() {
-                Some(auth_verifier) => build_control_plane_unix_response_with_auth(
-                    &mut *authority,
-                    request,
-                    now_ms,
-                    Some(auth_verifier),
-                ),
+                Some(auth_verifier) => {
+                    build_control_plane_unix_response_with_auth_and_response_clock(
+                        &mut *authority,
+                        request,
+                        now_ms,
+                        Some(auth_verifier),
+                        || Ok(storage::clock::current_time_millis()),
+                    )
+                }
                 None => build_control_plane_unix_response(&mut *authority, request, now_ms),
             }
         };
@@ -6249,7 +6253,7 @@ mod tests {
         .expect("test Unix auth verifier should build");
 
         let error = verifier
-            .verify_storage_node_heartbeat_payload(b"not an auth envelope", 2_000)
+            .verify_storage_node_heartbeat_request_payload(b"not an auth envelope", 2_000)
             .expect_err("missing auth envelope should reject");
         assert!(
             error.to_string().contains("auth magic"),
