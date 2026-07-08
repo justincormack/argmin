@@ -334,6 +334,15 @@ fn normalize_query(raw: &str) -> String {
 }
 
 fn signed_put(url_str: &str, body: &[u8], extra_headers: &[(&str, &str)]) -> (u16, String) {
+    signed_put_with_signature_override(url_str, body, extra_headers, None)
+}
+
+fn signed_put_with_signature_override(
+    url_str: &str,
+    body: &[u8],
+    extra_headers: &[(&str, &str)],
+    signature_override: Option<&str>,
+) -> (u16, String) {
     let parsed = url::Url::parse(url_str).expect("parse URL");
     let path = parsed.path();
     let query = normalize_query(parsed.query().unwrap_or(""));
@@ -397,6 +406,7 @@ fn signed_put(url_str: &str, body: &[u8], extra_headers: &[(&str, &str)]) -> (u1
         .map(|b| format!("{b:02x}"))
         .collect();
 
+    let signature = signature_override.unwrap_or(&signature);
     let auth_header = format!(
         "AWS4-HMAC-SHA256 Credential={access_key}/{scope}, SignedHeaders={signed_headers}, Signature={signature}"
     );
@@ -414,6 +424,14 @@ fn signed_put(url_str: &str, body: &[u8], extra_headers: &[(&str, &str)]) -> (u1
     let status = resp.status().as_u16();
     let body_text = resp.body_mut().read_to_string().unwrap_or_default();
     (status, body_text)
+}
+
+fn spaced_hex_bytes(text: &str) -> String {
+    text.as_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn xml_tag<'a>(body: &'a str, tag: &str) -> Option<&'a str> {
@@ -1202,6 +1220,56 @@ fn test_sse_c_put_invalid_key_md5_argument_name_matches_aws() {
         assert_eq!(
             xml_tag(&body_text, "ArgumentName"),
             Some("x-amz-server-side-encryption")
+        );
+
+        s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
+    });
+}
+
+#[test]
+fn test_sse_c_signature_mismatch_echoes_signed_customer_key_like_aws() {
+    require_https_endpoint();
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        s3_tests::create_bucket_with_sse_c_enabled(client, &bucket)
+            .await
+            .unwrap();
+
+        let key = test_sse_c_key();
+        let (key_b64, key_md5_b64) = sse_c_header_values(&key);
+        let url = format!("{}/{}/obj", CTX.endpoint(), bucket);
+        let headers = [
+            ("x-amz-server-side-encryption-customer-algorithm", "AES256"),
+            (
+                "x-amz-server-side-encryption-customer-key",
+                key_b64.as_str(),
+            ),
+            (
+                "x-amz-server-side-encryption-customer-key-md5",
+                key_md5_b64.as_str(),
+            ),
+        ];
+        let bad_signature = "0".repeat(64);
+        let (status, body_text) =
+            signed_put_with_signature_override(&url, b"secret", &headers, Some(&bad_signature));
+
+        assert_eq!(status, 403, "body: {body_text}");
+        assert_eq!(xml_tag(&body_text, "Code"), Some("SignatureDoesNotMatch"));
+        let canonical_request =
+            xml_tag(&body_text, "CanonicalRequest").expect("canonical request in body");
+        assert!(
+            canonical_request.contains(&format!(
+                "x-amz-server-side-encryption-customer-key:{}",
+                key_b64
+            )),
+            "canonical request did not echo signed SSE-C key: {canonical_request}"
+        );
+        let canonical_request_bytes = xml_tag(&body_text, "CanonicalRequestBytes")
+            .expect("canonical request byte dump in body");
+        assert!(
+            canonical_request_bytes.contains(&spaced_hex_bytes(&key_b64)),
+            "canonical request bytes did not echo signed SSE-C key bytes: {canonical_request_bytes}"
         );
 
         s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
