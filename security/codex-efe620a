@@ -1,0 +1,207 @@
+Signature errors can echo sensitive signed headers
+Link: https://chatgpt.com/codex/cloud/security/findings/72a35a88ce7081918a2feb4f7a3e6c90?sev=&repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin&sort=date_desc
+Criticality: medium
+Status: accepted
+
+# Metadata
+Repo: justincormack/argmin
+Commit: efe620a
+Author: justin@specialbusservice.com
+Created: 08/07/2026, 12:37:24
+Assignee: Unassigned
+Signals: Security, Validated
+
+# Resolution
+Accepted as AWS-compatible behavior, not fixed.
+
+The reported echo is real: a SigV4 `SignatureDoesNotMatch` response can include the
+full canonical request and byte dump, and signed SSE-C headers can therefore appear
+in the error body. However, AWS S3 behaves the same way for SSE-C. Since this project
+aims to match S3 behavior, redacting these fields in the S3 XML response would be a
+compatibility divergence rather than a security fix.
+
+AWS-facing validation was added in commit `b84004d9` (`Pin AWS SSE-C signature
+mismatch echo`). The test
+`test_sse_c_signature_mismatch_echoes_signed_customer_key_like_aws` sends a signed
+SSE-C `PutObject` with an intentionally bad SigV4 signature and asserts that AWS
+returns `SignatureDoesNotMatch` with the base64 customer key present in both
+`<CanonicalRequest>` and `<CanonicalRequestBytes>`.
+
+Validated against AWS with:
+
+```
+./scripts/aws-tests --region us-east-1 --test sse_c test_sse_c_signature_mismatch_echoes_signed_customer_key_like_aws
+```
+
+Result: passed. This pins the current model to AWS for the SSE-C case. Normal
+successful SSE-C responses remain modeled separately: they return the customer
+algorithm and key MD5, not the raw customer key.
+
+# Summary
+Introduced: the previous SignatureMismatch path returned only a generic error. This commit stores and returns the full canonical request and byte dump for header, presigned, and streaming chunk signature mismatches without filtering sensitive signed headers.
+On SignatureDoesNotMatch, the new code attaches the complete canonical request to AuthError diagnostics and renders it back to the client, including both text and a hex byte dump. SigV4 canonical headers contain the values of all signed headers, and this server supports sensitive x-amz-* headers such as x-amz-server-side-encryption-customer-key and copy-source customer keys. Because x-amz-* headers are required to be signed, a request using SSE-C can have the customer-provided encryption key embedded in the canonical request. If the signature is wrong or is tampered with, that key is reflected in a 403 response body and can be captured by clients, reverse proxies, error logs, or other components that would not otherwise need to store or display the raw secret header. Streaming chunk signature mismatches also reuse and echo the seed request canonical request, extending the same exposure to chunked uploads. The diagnostics should redact sensitive signed headers before storing/rendering the canonical request, and the corresponding byte dump must be redacted or omitted as well.
+
+# Validation
+## Rubric
+- [x] Verify that SigV4 canonicalization includes signed header values, including `x-amz-*` headers.
+- [x] Verify that on header-auth signature mismatch the full canonical request is placed into `SignatureMismatchDiagnostics`.
+- [x] Verify that on presigned signature mismatch the full canonical request is placed into `SignatureMismatchDiagnostics`.
+- [x] Verify that the XML error renderer emits both `CanonicalRequest` and `CanonicalRequestBytes` without redacting sensitive signed headers.
+- [x] Demonstrate with a concrete PoC that an SSE-C customer key appears in the returned SignatureDoesNotMatch XML and byte dump; additionally attempt compiled-stack crash/valgrind/debugger validation where applicable.
+## Report
+Validated the finding with a targeted Rust PoC against the actual auth and HTTP XML rendering APIs. The PoC constructs malformed SigV4 header-auth and presigned requests that include a signed SSE-C customer key header (`x-amz-server-side-encryption-customer-key: BASE64_CUSTOMER_KEY_SECRET_SHOULD_NOT_ECHO`) and an intentionally bad signature. Both paths return `AuthError::SignatureMismatch`, then `server_http::http::xml::signature_does_not_match_error_xml` renders the diagnostics into the response body.
+
+Key code evidence: `crates/auth/src/sigv4.rs:200-220` builds the canonical request from signed headers and values; `crates/auth/src/sigv4.rs:251-259` stores that canonical request in `SignatureMismatchDiagnostics` on header-auth mismatch. `crates/auth/src/request.rs:531-550` and `567-577` do the same for presigned URLs. `crates/server-http/src/http/xml.rs:669-690` writes `<CanonicalRequest>` and `<CanonicalRequestBytes>` without redaction. `crates/server-http/src/http/mod.rs:4987-4996` confirms supported SSE-C customer key header names.
+
+Direct PoC result: `cargo run -q -p server-http --example sigv4_ssec_leak_poc` exited normally but reproduced the information disclosure. Captured output shows `HEADER_SECRET_PRESENT_IN_XML=true`, `HEADER_SECRET_PRESENT_IN_HEX_DUMP=true`, `PRESIGNED_SECRET_PRESENT_IN_XML=true`, and `PRESIGNED_SECRET_PRESENT_IN_HEX_DUMP=true`. The captured XML includes canonical request lines such as `x-amz-server-side-encryption-customer-key:BASE64_CUSTOMER_KEY_SECRET_SHOULD_NOT_ECHO`, and the same secret appears in the byte dump.
+
+Compiled-stack attempts: a crash was not expected for this confidentiality bug; the direct PoC did not crash but confirmed leakage. Valgrind was attempted but unavailable in the container (`VALGRIND_NOT_INSTALLED`). LLDB was available and used non-interactively. One breakpoint at `sigv4.rs:253` showed execution at construction of `AuthError::SignatureMismatch` with stack `authenticate_request -> authenticate_header -> verify_request_record`; another breakpoint at `xml.rs:669` showed execution in the XML renderer. This confirms the data flow from canonical request diagnostics to response rendering.
+
+# Evidence
+crates/auth/src/request.rs (L531 to 550)
+  Note: Presigned verification also builds a canonical request from signed headers and their values.
+```
+    let signed_header_pairs = collect_signed_headers(&signed_headers, headers)?;
+    let canonical_hdrs = canonical_headers(&signed_header_pairs);
+    let signed_headers_joined = signed_headers.join(";");
+    let canonical_qs = canonical_query_string(&query_without_signature(query_string));
+    // AWS treats x-amz-content-sha256 as a presigned payload-hash override
+    // even when it is not listed in X-Amz-SignedHeaders: UNSIGNED-PAYLOAD is
+    // accepted, while another value participates in signature verification.
+    // Other unsigned x-amz-* headers are rejected before this point.
+    let body_hash = match headers.first_value("x-amz-content-sha256") {
+        Some(hash) => Cow::Borrowed(hash),
+        None => Cow::Borrowed("UNSIGNED-PAYLOAD"),
+    };
+    let canonical_req = canonical_request(
+        method,
+        path,
+        &canonical_qs,
+        &canonical_hdrs,
+        &signed_headers_joined,
+        body_hash.as_ref(),
+    );
+```
+
+crates/auth/src/request.rs (L567 to 577)
+  Note: On presigned signature mismatch, the full canonical request is included in diagnostics.
+```
+    // Constant-time comparison to prevent timing attacks on signature values.
+    let expected_hex = hex_encode_lower(expected_sig.as_ref());
+    if !crate::constant_time_eq(expected_hex.as_bytes(), signature.as_bytes()) {
+        return Err(AuthError::SignatureMismatch {
+            diagnostics: Some(Box::new(crate::SignatureMismatchDiagnostics {
+                access_key_id: credential.access_key_id.to_string(),
+                string_to_sign: sts,
+                signature_provided: signature.to_string(),
+                canonical_request: Some(canonical_req),
+            })),
+        });
+```
+
+crates/auth/src/sigv4.rs (L200 to 220)
+  Note: The verifier requires x-amz-* headers to be signed and then builds the canonical request from canonical headers, which include signed header values.
+```
+    // AWS requires Host and all x-amz-* headers to be signed (security:
+    // prevents injection of request-routing and S3 control headers).
+    let unsigned_headers = unsigned_required_headers(&auth.signed_headers, headers);
+    if !unsigned_headers.is_empty() {
+        return Err(AuthError::UnsignedHeaders {
+            headers: unsigned_headers,
+        });
+    }
+
+    let canonical_hdrs = canonical_headers(&signed_header_pairs);
+    let signed_headers_str = auth.signed_headers.join(";");
+    let canonical_qs = canonical_query_string(query_string);
+
+    let creq = canonical_request(
+        method,
+        uri,
+        &canonical_qs,
+        &canonical_hdrs,
+        &signed_headers_str,
+        body_hash,
+    );
+```
+
+crates/auth/src/sigv4.rs (L251 to 259)
+  Note: On header-auth signature mismatch, the full canonical request is placed into SignatureMismatch diagnostics.
+```
+    // Constant-time comparison to prevent timing attacks on signature values.
+    if !crate::constant_time_eq(expected_hex.as_bytes(), auth.signature.as_bytes()) {
+        return Err(AuthError::SignatureMismatch {
+            diagnostics: Some(Box::new(crate::SignatureMismatchDiagnostics {
+                access_key_id: auth.credential.access_key_id.to_string(),
+                string_to_sign: sts,
+                signature_provided: auth.signature.to_string(),
+                canonical_request: Some(creq),
+            })),
+```
+
+crates/server-http/src/http/chunked.rs (L315 to 325)
+  Note: Chunk signature mismatches include the seed canonical request in diagnostics, so sensitive headers from the original request can be echoed for streaming uploads.
+```
+    if !auth::constant_time_eq(expected_hex.as_bytes(), claimed_sig.as_bytes()) {
+        // AWS echoes the chunk string-to-sign and the seed request's
+        // canonical request in chunk-signature mismatch bodies.
+        return Err(ServerError::Auth(auth::AuthError::SignatureMismatch {
+            diagnostics: Some(Box::new(auth::SignatureMismatchDiagnostics {
+                access_key_id: ctx.access_key_id.clone(),
+                string_to_sign,
+                signature_provided: claimed_sig.to_string(),
+                canonical_request: Some(ctx.seed_canonical_request.clone()),
+            })),
+        }));
+```
+
+crates/server-http/src/http/mod.rs (L4987 to 4996)
+  Note: The server supports SSE-C headers, including customer key headers whose values are secrets and can appear in SigV4 canonical headers.
+```
+const SSE_C_ALGORITHM_HEADER: &str = "x-amz-server-side-encryption-customer-algorithm";
+const SSE_C_KEY_HEADER: &str = "x-amz-server-side-encryption-customer-key";
+const SSE_C_KEY_MD5_HEADER: &str = "x-amz-server-side-encryption-customer-key-md5";
+const SSE_HEADER: &str = "x-amz-server-side-encryption";
+const SSE_KMS_KEY_ID_HEADER: &str = "x-amz-server-side-encryption-aws-kms-key-id";
+const SSE_C_COPY_SOURCE_ALGORITHM_HEADER: &str =
+    "x-amz-copy-source-server-side-encryption-customer-algorithm";
+const SSE_C_COPY_SOURCE_KEY_HEADER: &str = "x-amz-copy-source-server-side-encryption-customer-key";
+const SSE_C_COPY_SOURCE_KEY_MD5_HEADER: &str =
+    "x-amz-copy-source-server-side-encryption-customer-key-md5";
+```
+
+crates/server-http/src/http/xml.rs (L660 to 690)
+  Note: The response renderer writes CanonicalRequest and CanonicalRequestBytes directly into the SignatureDoesNotMatch XML body without redacting sensitive header values.
+```
+/// Format a `SignatureDoesNotMatch` error response. With diagnostics AWS
+/// echoes the request's own canonical form (none of it secret); POST policy
+/// mismatches carry none.
+#[must_use]
+pub fn signature_does_not_match_error_xml(
+    diagnostics: Option<&SignatureMismatchDiagnostics>,
+    request_id: &str,
+    host_id: &str,
+) -> String {
+    let detail = diagnostics.map_or_else(String::new, |diag| {
+        let canonical =
+            diag.canonical_request
+                .as_deref()
+                .map_or_else(String::new, |canonical_request| {
+                    format!(
+                        "<CanonicalRequest>{}</CanonicalRequest>\
+                     <CanonicalRequestBytes>{}</CanonicalRequestBytes>",
+                        xml_escape_text(canonical_request),
+                        hex_byte_dump(canonical_request),
+                    )
+                });
+        format!(
+            "<AWSAccessKeyId>{}</AWSAccessKeyId>\
+             <StringToSign>{}</StringToSign>\
+             <SignatureProvided>{}</SignatureProvided>\
+             <StringToSignBytes>{}</StringToSignBytes>{}",
+            xml_escape(&diag.access_key_id),
+            xml_escape_text(&diag.string_to_sign),
+            xml_escape(&diag.signature_provided),
+            hex_byte_dump(&diag.string_to_sign),
+            canonical,
+```
