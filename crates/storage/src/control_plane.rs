@@ -3,6 +3,7 @@ use std::io::{ErrorKind, Read as _, Write as _};
 use std::num::NonZeroU64;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use placement::NodeId;
@@ -10,8 +11,9 @@ use thiserror::Error;
 
 use crate::control_plane_auth::{
     ControlPlaneAuthDecision, ControlPlaneAuthEnvelope, ControlPlaneAuthOperation,
-    ControlPlaneAuthPrincipal, ControlPlaneAuthTarget, ControlPlaneScopedCredential,
-    ControlPlaneScopedCredentialInput, ControlPlaneScopedCredentialStore,
+    ControlPlaneAuthPrincipal, ControlPlaneAuthRejectionReason, ControlPlaneAuthTarget,
+    ControlPlaneScopedCredential, ControlPlaneScopedCredentialInput,
+    ControlPlaneScopedCredentialStore,
 };
 use crate::control_plane_command::{
     AppliedControlPlaneCommand, ControlPlaneCommand, ControlPlaneCommandResponse,
@@ -4297,6 +4299,7 @@ pub struct AuthenticatedUnixControlPlaneClient {
 pub struct ControlPlaneUnixAuthVerifier {
     cluster_id: String,
     storage_node_credentials: BTreeMap<NodeId, ControlPlaneStorageNodeAuthCredential>,
+    metrics: Arc<ControlPlaneUnixAuthMetrics>,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -4315,6 +4318,116 @@ impl std::fmt::Debug for ControlPlaneStorageNodeAuthCredential {
             .field("credential_version", &self.credential_version)
             .field("secret", &"<redacted>")
             .finish()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ControlPlaneUnixAuthMetricsSnapshot {
+    accepted_total: u64,
+    rejected_total: u64,
+    accepted_by_operation: BTreeMap<ControlPlaneAuthOperation, u64>,
+    rejected_by_operation: BTreeMap<ControlPlaneAuthOperation, u64>,
+    rejected_by_reason: BTreeMap<ControlPlaneAuthRejectionReason, u64>,
+}
+
+impl ControlPlaneUnixAuthMetricsSnapshot {
+    #[must_use]
+    pub fn accepted_total(&self) -> u64 {
+        self.accepted_total
+    }
+
+    #[must_use]
+    pub fn rejected_total(&self) -> u64 {
+        self.rejected_total
+    }
+
+    #[must_use]
+    pub fn accepted_for_operation(&self, operation: ControlPlaneAuthOperation) -> u64 {
+        self.accepted_by_operation
+            .get(&operation)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    #[must_use]
+    pub fn rejected_for_operation(&self, operation: ControlPlaneAuthOperation) -> u64 {
+        self.rejected_by_operation
+            .get(&operation)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    #[must_use]
+    pub fn rejected_for_reason(&self, reason: ControlPlaneAuthRejectionReason) -> u64 {
+        self.rejected_by_reason.get(&reason).copied().unwrap_or(0)
+    }
+
+    #[must_use]
+    pub fn accepted_by_operation(&self) -> &BTreeMap<ControlPlaneAuthOperation, u64> {
+        &self.accepted_by_operation
+    }
+
+    #[must_use]
+    pub fn rejected_by_operation(&self) -> &BTreeMap<ControlPlaneAuthOperation, u64> {
+        &self.rejected_by_operation
+    }
+
+    #[must_use]
+    pub fn rejected_by_reason(&self) -> &BTreeMap<ControlPlaneAuthRejectionReason, u64> {
+        &self.rejected_by_reason
+    }
+}
+
+#[derive(Debug, Default)]
+struct ControlPlaneUnixAuthMetrics {
+    state: Mutex<ControlPlaneUnixAuthMetricsState>,
+}
+
+#[derive(Debug, Default)]
+struct ControlPlaneUnixAuthMetricsState {
+    accepted_total: u64,
+    rejected_total: u64,
+    accepted_by_operation: BTreeMap<ControlPlaneAuthOperation, u64>,
+    rejected_by_operation: BTreeMap<ControlPlaneAuthOperation, u64>,
+    rejected_by_reason: BTreeMap<ControlPlaneAuthRejectionReason, u64>,
+}
+
+impl ControlPlaneUnixAuthMetrics {
+    fn record_accepted(&self, operation: ControlPlaneAuthOperation) {
+        let mut state = self
+            .state
+            .lock()
+            .expect("control-plane Unix auth metrics mutex poisoned");
+        state.accepted_total += 1;
+        *state.accepted_by_operation.entry(operation).or_default() += 1;
+    }
+
+    fn record_rejected(
+        &self,
+        operation: ControlPlaneAuthOperation,
+        reason: ControlPlaneAuthRejectionReason,
+    ) {
+        let mut state = self
+            .state
+            .lock()
+            .expect("control-plane Unix auth metrics mutex poisoned");
+        state.rejected_total += 1;
+        *state.rejected_by_operation.entry(operation).or_default() += 1;
+        *state.rejected_by_reason.entry(reason).or_default() += 1;
+    }
+
+    fn snapshot(&self) -> ControlPlaneUnixAuthMetricsSnapshot {
+        let state = self
+            .state
+            .lock()
+            .expect("control-plane Unix auth metrics mutex poisoned");
+        ControlPlaneUnixAuthMetricsSnapshot {
+            accepted_total: state.accepted_total,
+            rejected_total: state.rejected_total,
+            accepted_by_operation: state.accepted_by_operation.clone(),
+            rejected_by_operation: state.rejected_by_operation.clone(),
+            rejected_by_reason: state.rejected_by_reason.clone(),
+        }
     }
 }
 
@@ -5042,6 +5155,7 @@ impl ControlPlaneUnixAuthVerifier {
         Ok(Self {
             cluster_id,
             storage_node_credentials: by_node,
+            metrics: Arc::new(ControlPlaneUnixAuthMetrics::default()),
         })
     }
 
@@ -5050,15 +5164,48 @@ impl ControlPlaneUnixAuthVerifier {
         &self.cluster_id
     }
 
+    #[must_use]
+    pub fn metrics_snapshot(&self) -> ControlPlaneUnixAuthMetricsSnapshot {
+        self.metrics.snapshot()
+    }
+
     pub fn verify_storage_node_heartbeat_payload(
         &self,
         payload: &[u8],
         authority_now_ms: u64,
     ) -> Result<Vec<u8>, ControlPlaneError> {
-        let envelope =
-            ControlPlaneAuthEnvelope::decode_frame(payload, CONTROL_PLANE_RPC_MAX_PAYLOAD_LEN)?;
-        let heartbeat = read_node_heartbeat_payload(envelope.payload())?;
-        validate_storage_node_heartbeat_auth_freshness(&envelope, &heartbeat, authority_now_ms)?;
+        let envelope = match ControlPlaneAuthEnvelope::decode_frame(
+            payload,
+            CONTROL_PLANE_RPC_MAX_PAYLOAD_LEN,
+        ) {
+            Ok(envelope) => envelope,
+            Err(error) => {
+                self.metrics.record_rejected(
+                    ControlPlaneAuthOperation::StorageRuntimeMapRefresh,
+                    ControlPlaneAuthRejectionReason::Malformed,
+                );
+                return Err(error);
+            }
+        };
+        let heartbeat = match read_node_heartbeat_payload(envelope.payload()) {
+            Ok(heartbeat) => heartbeat,
+            Err(error) => {
+                self.metrics.record_rejected(
+                    ControlPlaneAuthOperation::StorageRuntimeMapRefresh,
+                    ControlPlaneAuthRejectionReason::Malformed,
+                );
+                return Err(error);
+            }
+        };
+        if let Err(error) =
+            validate_storage_node_heartbeat_auth_freshness(&envelope, &heartbeat, authority_now_ms)
+        {
+            self.metrics.record_rejected(
+                ControlPlaneAuthOperation::StorageRuntimeMapRefresh,
+                ControlPlaneAuthRejectionReason::ReplayFreshnessFailure,
+            );
+            return Err(error);
+        }
         let expected_source = ControlPlaneAuthPrincipal::StorageNode {
             node_id: heartbeat.node_id,
             incarnation: heartbeat.node_incarnation,
@@ -5066,17 +5213,40 @@ impl ControlPlaneUnixAuthVerifier {
         let expected_target = ControlPlaneAuthTarget::Service(
             crate::control_plane_auth::ControlPlaneAuthService::ControlPlane,
         );
-        let credential = self
-            .storage_node_credentials
-            .get(&heartbeat.node_id)
-            .ok_or_else(|| ControlPlaneError::RpcProtocol {
+        let Some(node_credential) = self.storage_node_credentials.get(&heartbeat.node_id) else {
+            self.metrics.record_rejected(
+                ControlPlaneAuthOperation::StorageRuntimeMapRefresh,
+                ControlPlaneAuthRejectionReason::UnknownCredential,
+            );
+            return Err(ControlPlaneError::RpcProtocol {
                 message: format!(
                     "control-plane storage-node heartbeat auth has no credential for node {}",
                     heartbeat.node_id.as_u32()
                 ),
-            })?
-            .scoped_for_cluster_and_incarnation(&self.cluster_id, heartbeat.node_incarnation)?;
-        let verifier = ControlPlaneScopedCredentialStore::new(vec![credential])?;
+            });
+        };
+        let credential = match node_credential
+            .scoped_for_cluster_and_incarnation(&self.cluster_id, heartbeat.node_incarnation)
+        {
+            Ok(credential) => credential,
+            Err(error) => {
+                self.metrics.record_rejected(
+                    ControlPlaneAuthOperation::StorageRuntimeMapRefresh,
+                    ControlPlaneAuthRejectionReason::Malformed,
+                );
+                return Err(error);
+            }
+        };
+        let verifier = match ControlPlaneScopedCredentialStore::new(vec![credential]) {
+            Ok(verifier) => verifier,
+            Err(error) => {
+                self.metrics.record_rejected(
+                    ControlPlaneAuthOperation::StorageRuntimeMapRefresh,
+                    ControlPlaneAuthRejectionReason::Malformed,
+                );
+                return Err(error);
+            }
+        };
         match verifier.verify_envelope(
             crate::control_plane_auth::ControlPlaneAuthVerificationInput {
                 envelope: &envelope,
@@ -5087,10 +5257,20 @@ impl ControlPlaneUnixAuthVerifier {
                 now_ms: Some(authority_now_ms),
             },
         ) {
-            ControlPlaneAuthDecision::Accepted { .. } => Ok(envelope.payload().to_vec()),
-            ControlPlaneAuthDecision::Rejected { reason } => Err(ControlPlaneError::RpcProtocol {
-                message: format!("control-plane storage-node heartbeat auth rejected: {reason:?}"),
-            }),
+            ControlPlaneAuthDecision::Accepted { .. } => {
+                self.metrics
+                    .record_accepted(ControlPlaneAuthOperation::StorageRuntimeMapRefresh);
+                Ok(envelope.payload().to_vec())
+            }
+            ControlPlaneAuthDecision::Rejected { reason } => {
+                self.metrics
+                    .record_rejected(ControlPlaneAuthOperation::StorageRuntimeMapRefresh, reason);
+                Err(ControlPlaneError::RpcProtocol {
+                    message: format!(
+                        "control-plane storage-node heartbeat auth rejected: {reason:?}"
+                    ),
+                })
+            }
         }
     }
 }
@@ -11242,6 +11422,7 @@ mod tests {
         let credential = storage_node_auth_credential("auth-cluster", 1, 42);
         let verifier =
             storage_node_auth_verifier("auth-cluster", vec![storage_node_auth_node_credential(1)]);
+        let verifier_for_assert = verifier.clone();
         let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
         let server = std::thread::spawn(move || {
             let (mut stream, _addr) = listener.accept().unwrap();
@@ -11283,6 +11464,13 @@ mod tests {
             refresh.runtime_map().nodes()[0].endpoint(),
             "/tmp/argmin-node-1.sock"
         );
+        let metrics = verifier_for_assert.metrics_snapshot();
+        assert_eq!(metrics.accepted_total(), 1);
+        assert_eq!(
+            metrics.accepted_for_operation(ControlPlaneAuthOperation::StorageRuntimeMapRefresh),
+            1
+        );
+        assert_eq!(metrics.rejected_total(), 0);
     }
 
     #[test]
@@ -11320,6 +11508,17 @@ mod tests {
         assert!(
             matches!(error, ControlPlaneError::RpcProtocol { ref message } if message.contains("auth magic")),
             "unexpected error: {error}"
+        );
+        let metrics = verifier.metrics_snapshot();
+        assert_eq!(metrics.accepted_total(), 0);
+        assert_eq!(metrics.rejected_total(), 1);
+        assert_eq!(
+            metrics.rejected_for_operation(ControlPlaneAuthOperation::StorageRuntimeMapRefresh),
+            1
+        );
+        assert_eq!(
+            metrics.rejected_for_reason(ControlPlaneAuthRejectionReason::Malformed),
+            1
         );
         assert_eq!(
             authority
@@ -11366,6 +11565,17 @@ mod tests {
             matches!(error, ControlPlaneError::RpcProtocol { ref message } if message.contains("WrongSource")),
             "unexpected error: {error}"
         );
+        let metrics = verifier.metrics_snapshot();
+        assert_eq!(metrics.accepted_total(), 0);
+        assert_eq!(metrics.rejected_total(), 1);
+        assert_eq!(
+            metrics.rejected_for_operation(ControlPlaneAuthOperation::StorageRuntimeMapRefresh),
+            1
+        );
+        assert_eq!(
+            metrics.rejected_for_reason(ControlPlaneAuthRejectionReason::WrongSource),
+            1
+        );
         assert_eq!(
             authority
                 .snapshot()
@@ -11409,6 +11619,17 @@ mod tests {
         assert!(
             matches!(error, ControlPlaneError::RpcProtocol { ref message } if message.contains("missing issued_at_ms")),
             "unexpected error: {error}"
+        );
+        let metrics = verifier.metrics_snapshot();
+        assert_eq!(metrics.accepted_total(), 0);
+        assert_eq!(metrics.rejected_total(), 1);
+        assert_eq!(
+            metrics.rejected_for_operation(ControlPlaneAuthOperation::StorageRuntimeMapRefresh),
+            1
+        );
+        assert_eq!(
+            metrics.rejected_for_reason(ControlPlaneAuthRejectionReason::ReplayFreshnessFailure),
+            1
         );
         assert_eq!(
             authority
@@ -11454,6 +11675,17 @@ mod tests {
         assert!(
             matches!(error, ControlPlaneError::RpcProtocol { ref message } if message.contains("exceeds requested lease")),
             "unexpected error: {error}"
+        );
+        let metrics = verifier.metrics_snapshot();
+        assert_eq!(metrics.accepted_total(), 0);
+        assert_eq!(metrics.rejected_total(), 1);
+        assert_eq!(
+            metrics.rejected_for_operation(ControlPlaneAuthOperation::StorageRuntimeMapRefresh),
+            1
+        );
+        assert_eq!(
+            metrics.rejected_for_reason(ControlPlaneAuthRejectionReason::ReplayFreshnessFailure),
+            1
         );
         assert_eq!(
             authority
