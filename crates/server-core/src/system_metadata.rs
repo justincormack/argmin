@@ -83,6 +83,10 @@ pub fn is_checksum_value_header_name(name: &str) -> bool {
     checksum_algorithm_from_header_name(&name.to_ascii_lowercase()).is_some()
 }
 
+pub fn is_checksum_algorithm_header_name(name: &str) -> bool {
+    name.eq_ignore_ascii_case("x-amz-checksum-algorithm")
+}
+
 pub fn is_system_metadata_header_name(name: &str) -> bool {
     matches!(
         name,

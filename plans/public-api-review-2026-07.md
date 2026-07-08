@@ -336,16 +336,20 @@ residuals found by the verification, none release-blocking:
   precedence while still returning `InvalidToken` for valid-signature
   unexpected-token requests.
 
-- [ ] **V6. Cosmetic.** `until_ms_saturating` clamps `u64::MAX` silently
+- [x] **V6. Cosmetic.** `until_ms_saturating` clamps `u64::MAX` silently
   (`types.rs:2612-2618`) where RR11 debug-asserts at the atomic boundary —
   add the same debug_assert for consistency; checksum header-name filter
   literals duplicated between `parse_put_object_request_metadata`
   (`mod.rs:426`) and `parse_request_metadata_without_checksum_headers`
   (:436-440); `LifecycleConfigError::InvalidRequestHostId` leaks an
   HTTP-response-shape concern into s3-types (clean typed mechanism,
-  awkward name). Historical note, not actionable: server-http test-target
-  compilation was broken in the 4c01bac9..4d05ea01 commit window (fixed by
-  a drive-by in 496d5f6e; already fine at HEAD).
+  awkward name). Fixed by adding the route-map sentinel debug assertion,
+  introducing `is_checksum_algorithm_header_name` for shared metadata filters,
+  and renaming the s3-types lifecycle error to `LifecycleV2Required` while
+  keeping the server-layer mapping to `InvalidRequestHostId`. Historical note,
+  not actionable: server-http test-target compilation was broken in the
+  4c01bac9..4d05ea01 commit window (fixed by a drive-by in 496d5f6e; already
+  fine at HEAD).
 
 ## Bugs — auth (security)
 

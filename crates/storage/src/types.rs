@@ -2610,6 +2610,10 @@ impl RouteMapValidity {
 
     #[must_use]
     pub const fn until_ms_saturating(valid_until_ms: u64) -> Self {
+        debug_assert!(
+            valid_until_ms != u64::MAX,
+            "u64::MAX is reserved as the unbounded route-map validity sentinel"
+        );
         let valid_until_ms = if valid_until_ms == u64::MAX {
             u64::MAX - 1
         } else {

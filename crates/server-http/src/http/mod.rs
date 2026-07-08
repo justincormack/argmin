@@ -55,7 +55,8 @@ use server_core::sse::{
     SseCustomerRequest, SseCustomerWriteContext, SSE_CUSTOMER_ALGORITHM, SSE_C_CUSTOMER_KEY_LEN,
 };
 use server_core::system_metadata::{
-    is_checksum_value_header_name, is_system_metadata_header_name, SystemMetadata,
+    is_checksum_algorithm_header_name, is_checksum_value_header_name,
+    is_system_metadata_header_name, SystemMetadata,
 };
 use storage::{
     BucketName, ManagedEncryptionAlgorithm, ObjectKey, SessionId, StorageCluster, UploadId,
@@ -439,7 +440,7 @@ where
     parse_request_metadata(
         headers
             .into_iter()
-            .filter(|(name, _)| !name.eq_ignore_ascii_case("x-amz-checksum-algorithm")),
+            .filter(|(name, _)| !is_checksum_algorithm_header_name(name)),
     )
 }
 
@@ -450,7 +451,7 @@ where
     I: IntoIterator<Item = (&'a str, &'a str)>,
 {
     parse_request_metadata(headers.into_iter().filter(|(name, _)| {
-        !name.eq_ignore_ascii_case("x-amz-checksum-algorithm")
+        !is_checksum_algorithm_header_name(name)
             && !name.eq_ignore_ascii_case("x-amz-checksum-type")
             && !is_checksum_value_header_name(name)
     }))
