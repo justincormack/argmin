@@ -256,6 +256,29 @@ impl BucketNamespace {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BucketNamespaceParseError;
+
+impl std::fmt::Display for BucketNamespaceParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("invalid bucket namespace")
+    }
+}
+
+impl std::error::Error for BucketNamespaceParseError {}
+
+impl FromStr for BucketNamespace {
+    type Err = BucketNamespaceParseError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "global" => Ok(Self::Global),
+            "account-regional" => Ok(Self::AccountRegional),
+            _ => Err(BucketNamespaceParseError),
+        }
+    }
+}
+
 /// Parsed `-<account-id>-<region>-an` suffix for account-regional bucket names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AccountRegionalBucketName<'a> {
@@ -915,11 +938,11 @@ mod tests {
         aws_account_id_from_principal, bucket_location_constraint, is_legacy_create_bucket_region,
         is_valid_aws_account_id, parse_account_regional_bucket_name, requires_sigv4,
         supports_legacy_sigv2, AccountIdentity, AclGrant, AclGrantee, AclGrants, AclPermission,
-        BucketObjectLockConfig, BucketVersioningState, CacheControl, CanonicalUserId,
-        ContentEncoding, ContentType, Expires, LegalHoldStatus, ObjectLockDefaultRetention,
-        ObjectLockMode, ObjectLockState, ObjectRetention, RetentionPeriod, StoredLegalHoldStatus,
-        VersionId, WebsiteRedirectLocation, WebsiteRedirectLocationError,
-        ANONYMOUS_UPLOAD_CANONICAL_USER_ID, CANONICAL_USER_ID_LEN,
+        BucketNamespace, BucketObjectLockConfig, BucketVersioningState, CacheControl,
+        CanonicalUserId, ContentEncoding, ContentType, Expires, LegalHoldStatus,
+        ObjectLockDefaultRetention, ObjectLockMode, ObjectLockState, ObjectRetention,
+        RetentionPeriod, StoredLegalHoldStatus, VersionId, WebsiteRedirectLocation,
+        WebsiteRedirectLocationError, ANONYMOUS_UPLOAD_CANONICAL_USER_ID, CANONICAL_USER_ID_LEN,
     };
 
     #[test]
@@ -1077,6 +1100,29 @@ mod tests {
         for value in ["0", "", "abc", "-1", "01", "01x"] {
             assert!(
                 value.parse::<VersionId>().is_err(),
+                "unexpectedly parsed {value:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn bucket_namespace_header_values_round_trip() {
+        for namespace in [BucketNamespace::Global, BucketNamespace::AccountRegional] {
+            assert_eq!(
+                namespace
+                    .as_header_value()
+                    .parse::<BucketNamespace>()
+                    .unwrap(),
+                namespace
+            );
+        }
+    }
+
+    #[test]
+    fn bucket_namespace_parser_rejects_invalid_tokens() {
+        for value in ["", "GLOBAL", "AccountRegional", "account_regional", "bogus"] {
+            assert!(
+                value.parse::<BucketNamespace>().is_err(),
                 "unexpectedly parsed {value:?}"
             );
         }

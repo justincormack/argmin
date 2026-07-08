@@ -537,13 +537,14 @@ fn parse_bucket_namespace(req: &S3Request) -> Result<BucketNamespace, ServerErro
             reason: "x-amz-bucket-namespace must not be repeated".to_string(),
         });
     }
-    match req.header("x-amz-bucket-namespace") {
-        None | Some("global") => Ok(BucketNamespace::Global),
-        Some("account-regional") => Ok(BucketNamespace::AccountRegional),
-        Some(value) => Err(ServerError::InvalidArgument {
+    let Some(value) = req.header("x-amz-bucket-namespace") else {
+        return Ok(BucketNamespace::Global);
+    };
+    value
+        .parse::<BucketNamespace>()
+        .map_err(|_| ServerError::InvalidArgument {
             reason: format!("invalid x-amz-bucket-namespace: {value}"),
-        }),
-    }
+        })
 }
 
 fn reject_directory_bucket_only_object_features(req: &S3Request) -> Result<(), ServerError> {
