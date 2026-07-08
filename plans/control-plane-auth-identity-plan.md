@@ -349,6 +349,10 @@ Progress:
   single-authority and experimental Raft-backed process modes. Raw
   unauthenticated heartbeat payloads are counted as `Missing`; auth-looking but
   structurally invalid envelopes are counted as `Malformed`.
+- Storage-node heartbeat auth is enforced only when storage-node credentials are
+  configured. Enabling frontend runtime-map auth or admin command auth alone
+  does not implicitly require storage-node heartbeat envelopes, so each
+  internal control-plane credential class can be rolled out independently.
 
 ### Slice C: Frontend and Admin Control-Plane RPCs
 

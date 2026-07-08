@@ -6039,6 +6039,11 @@ impl ControlPlaneUnixAuthVerifier {
     }
 
     #[must_use]
+    pub fn requires_storage_node_heartbeat_auth(&self) -> bool {
+        !self.storage_node_credentials.is_empty()
+    }
+
+    #[must_use]
     pub fn requires_admin_control_plane_auth(&self) -> bool {
         !self.admin_credentials.is_empty()
     }
@@ -7103,7 +7108,7 @@ where
                 ControlPlaneAuthOperation::StorageRuntimeMapRefresh
             );
             let (payload, response_auth) = match auth_verifier {
-                Some(auth_verifier) => {
+                Some(auth_verifier) if auth_verifier.requires_storage_node_heartbeat_auth() => {
                     let verified = auth_verifier
                         .verify_storage_node_heartbeat_payload(&payload, authority_now_ms)?;
                     (
@@ -7111,7 +7116,7 @@ where
                         Some((verified.response_credential, verified.response_target)),
                     )
                 }
-                None => (payload, None),
+                _ => (payload, None),
             };
             let mut reader = PayloadReader::new(&payload);
             let heartbeat = read_node_heartbeat(&mut reader)?;
@@ -14175,6 +14180,63 @@ mod tests {
                 .lease_deadline_ms(),
             None
         );
+    }
+
+    #[test]
+    fn frontend_auth_verifier_does_not_require_storage_node_heartbeat_auth() {
+        let tmp = test_util::tempdir();
+        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+        authority
+            .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
+            .unwrap();
+        let verifier = ControlPlaneUnixAuthVerifier::new_empty("auth-cluster")
+            .unwrap()
+            .with_frontend_credentials(vec![frontend_auth_config_credential("frontend-1")])
+            .unwrap();
+        assert!(verifier.requires_frontend_runtime_map_auth());
+        assert!(!verifier.requires_storage_node_heartbeat_auth());
+        let heartbeat = NodeHeartbeat {
+            node_id: NodeId::new(1),
+            node_incarnation: 42,
+            endpoint: "/tmp/argmin-node-1.sock".to_owned(),
+            observed_epoch: authority.snapshot().cluster_epoch(),
+            requested_lease_duration_ms: 100,
+            cluster_map_history_reference_summary: PgClusterMapHistoryReferenceSummary::default(),
+            pg_observations: Vec::new(),
+        };
+        let request = ControlPlaneRpcRequest {
+            kind: ControlPlaneRpcKind::RefreshNodeHeartbeat,
+            payload: write_node_heartbeat_payload(&heartbeat).unwrap(),
+        };
+
+        let response = build_control_plane_unix_response_with_auth(
+            &mut authority,
+            request,
+            2_000,
+            Some(&verifier),
+        )
+        .unwrap();
+
+        assert_eq!(response.kind, ControlPlaneRpcKind::RefreshNodeHeartbeat);
+        let response_payload = decode_control_plane_rpc_response(response.payload).unwrap();
+        let mut reader = PayloadReader::new(&response_payload);
+        let lease = read_heartbeat_lease_summary(&mut reader).unwrap();
+        let runtime_map = read_runtime_map_snapshot(&mut reader).unwrap();
+        reader.finish().unwrap();
+        assert_eq!(lease.node_id(), NodeId::new(1));
+        assert_eq!(lease.lease_deadline_ms(), 2_100);
+        assert_eq!(
+            runtime_map.cluster_epoch(),
+            authority.snapshot().cluster_epoch()
+        );
+        let node = authority.snapshot().node(NodeId::new(1)).unwrap();
+        assert_eq!(node.node_incarnation(), 42);
+        assert_eq!(node.endpoint(), "/tmp/argmin-node-1.sock");
+        assert_eq!(node.lease_deadline_ms(), Some(2_100));
+        let metrics = verifier.metrics_snapshot();
+        assert_eq!(metrics.accepted_total(), 0);
+        assert_eq!(metrics.rejected_total(), 0);
     }
 
     #[test]
