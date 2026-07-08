@@ -355,6 +355,42 @@ impl BucketVersioningState {
             _ => None,
         }
     }
+
+    /// Return the S3 `VersioningConfiguration` `<Status>` spelling.
+    ///
+    /// A never-enabled bucket has no `<Status>` element in the S3 XML response,
+    /// so `Disabled` deliberately has no status string.
+    #[must_use]
+    pub const fn as_s3_status(self) -> Option<&'static str> {
+        match self {
+            Self::Disabled => None,
+            Self::Enabled => Some("Enabled"),
+            Self::Suspended => Some("Suspended"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BucketVersioningStateParseError;
+
+impl std::fmt::Display for BucketVersioningStateParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("invalid bucket versioning status")
+    }
+}
+
+impl std::error::Error for BucketVersioningStateParseError {}
+
+impl FromStr for BucketVersioningState {
+    type Err = BucketVersioningStateParseError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "Enabled" => Ok(Self::Enabled),
+            "Suspended" => Ok(Self::Suspended),
+            _ => Err(BucketVersioningStateParseError),
+        }
+    }
 }
 
 /// Object Lock retention mode.
@@ -960,6 +996,31 @@ mod tests {
             Some(BucketVersioningState::Suspended)
         );
         assert_eq!(BucketVersioningState::from_u8(3), None);
+    }
+
+    #[test]
+    fn bucket_versioning_state_s3_status_round_trip() {
+        assert_eq!(BucketVersioningState::Disabled.as_s3_status(), None);
+        assert_eq!(
+            BucketVersioningState::Enabled.as_s3_status(),
+            Some("Enabled")
+        );
+        assert_eq!(
+            BucketVersioningState::Suspended.as_s3_status(),
+            Some("Suspended")
+        );
+
+        assert_eq!(
+            "Enabled".parse::<BucketVersioningState>(),
+            Ok(BucketVersioningState::Enabled)
+        );
+        assert_eq!(
+            "Suspended".parse::<BucketVersioningState>(),
+            Ok(BucketVersioningState::Suspended)
+        );
+        assert!("Disabled".parse::<BucketVersioningState>().is_err());
+        assert!("".parse::<BucketVersioningState>().is_err());
+        assert!("enabled".parse::<BucketVersioningState>().is_err());
     }
 
     #[test]

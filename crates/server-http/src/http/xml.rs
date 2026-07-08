@@ -1865,9 +1865,9 @@ pub fn parse_versioning_config_xml(data: &[u8]) -> Result<BucketVersioningState,
             Ok(Event::Eof) => {
                 return match state {
                     State::Done => match status_text.as_deref() {
-                        Some("Enabled") => Ok(BucketVersioningState::Enabled),
-                        Some("Suspended") => Ok(BucketVersioningState::Suspended),
-                        Some(_) => Err(invalid_versioning_status()),
+                        Some(status) => status
+                            .parse::<BucketVersioningState>()
+                            .map_err(|_| invalid_versioning_status()),
                         None => Err(ServerError::IllegalVersioningConfiguration {
                             reason: "The Versioning element must be specified".to_string(),
                         }),
@@ -1898,10 +1898,10 @@ pub fn get_bucket_versioning_xml(state: BucketVersioningState) -> String {
          <VersioningConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">",
     );
 
-    match state {
-        BucketVersioningState::Enabled => xml.push_str("<Status>Enabled</Status>"),
-        BucketVersioningState::Suspended => xml.push_str("<Status>Suspended</Status>"),
-        BucketVersioningState::Disabled => {} // empty element per S3 spec
+    if let Some(status) = state.as_s3_status() {
+        xml.push_str("<Status>");
+        xml.push_str(status);
+        xml.push_str("</Status>");
     }
 
     xml.push_str("</VersioningConfiguration>");

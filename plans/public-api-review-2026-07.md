@@ -1024,9 +1024,10 @@ each is one refactor away from a panic:
   s3-types now implements `FromStr`, round-trips `as_header_value()`, and
   server-http delegates header parsing to the enum while preserving the
   missing-header default.
-- [ ] `BucketVersioningState` has `from_u8` but no `as_str`/`parse`;
-  `"Enabled"`/`"Suspended"` are literals in `xml.rs:1484-1485`. Add the
-  missing halves.
+- [x] `BucketVersioningState` had `from_u8` but no wire-status parse/render
+  API; `"Enabled"`/`"Suspended"` were literals in server-http XML parse/render.
+  Fixed with `BucketVersioningState::as_s3_status()` and `FromStr`, preserving
+  the important S3 shape that `Disabled` has no `<Status>` value.
 - [x] auth helper triplication: `hex_encode` ×3 (`sigv4.rs:244`,
   `canonical.rs:442`, `request.rs:672`), `percent_decode` ×2
   (`canonical.rs:176`, `request.rs:642`), `hex_val` ×2 (`canonical.rs:194`,
