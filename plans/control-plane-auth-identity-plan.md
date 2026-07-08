@@ -438,10 +438,11 @@ Progress:
   `ARGMIN_CONTROL_PLANE_ADMIN_AUTH_*` config and sign live PG acting-set
   updates, metadata-transfer fence/install flows, and Raft leadership/snapshot/
   election triggers when credentials are present. Admin-only command clients do
-  not perform unauthenticated runtime-map confirmation reads; any future
-  response-loss confirmation retry for admin commands must either carry a
-  frontend read credential as well or use a dedicated authenticated admin-read
-  confirmation path.
+  not perform unauthenticated runtime-map confirmation reads. PG acting-set
+  updates and metadata-transfer installs now use dedicated admin-signed PG
+  runtime-map confirmation reads after ambiguous response loss; Raft
+  leadership/snapshot/election triggers still need explicit idempotence or
+  confirmation decisions before automatic retry.
 
 ### Slice D: Runtime-Map and Read Freshness Proof Consumers
 
