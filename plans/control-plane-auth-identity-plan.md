@@ -423,6 +423,19 @@ Required:
   proof decodes;
 - read-index proof semantics remain tied to the state machine's applied log id.
 
+Progress:
+
+- 2026-07-08: Started Slice D for Unix runtime-map reads. When frontend read
+  auth is required, successful runtime-map snapshot/status responses are now
+  signed as the `RuntimeMap` service using the configured bilateral frontend
+  secret and are targeted back to the verified `Frontend { instance_id }`
+  principal. Authenticated frontend clients verify the `RuntimeMapResponse`
+  envelope, concrete RPC kind binding, freshness window, source service, target
+  frontend principal, and MAC before decoding the runtime map or status bytes.
+  Plain runtime-map responses remain accepted only on unauthenticated clients.
+  Error-response authentication and broader admin/storage-node response
+  authentication remain separate follow-up work.
+
 ## Replay Policy
 
 Replay handling should be selected per operation class:

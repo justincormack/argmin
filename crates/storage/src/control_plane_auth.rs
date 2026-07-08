@@ -19,6 +19,7 @@ pub enum ControlPlaneAuthPrincipal {
     Frontend { instance_id: String },
     Admin { instance_id: String },
     LocalMaintenance { process_id: u64 },
+    Service { service: ControlPlaneAuthService },
 }
 
 impl ControlPlaneAuthPrincipal {
@@ -50,6 +51,7 @@ impl ControlPlaneAuthPrincipal {
                     ));
                 }
             }
+            Self::Service { .. } => {}
         }
         Ok(())
     }
@@ -208,6 +210,25 @@ impl ControlPlaneScopedCredential {
     #[must_use]
     pub fn principal(&self) -> &ControlPlaneAuthPrincipal {
         &self.principal
+    }
+
+    pub(crate) fn runtime_map_response_credential_for_frontend(
+        &self,
+    ) -> Result<Self, ControlPlaneError> {
+        if !matches!(self.principal, ControlPlaneAuthPrincipal::Frontend { .. }) {
+            return Err(auth_protocol_error(
+                "runtime-map response credential requires a frontend scoped credential",
+            ));
+        }
+        Self::new(ControlPlaneScopedCredentialInput {
+            cluster_id: self.cluster_id.clone(),
+            credential_id: self.credential_id.clone(),
+            credential_version: self.credential_version,
+            principal: ControlPlaneAuthPrincipal::Service {
+                service: ControlPlaneAuthService::RuntimeMap,
+            },
+            secret: self.secret.clone(),
+        })
     }
 
     pub fn sign_envelope(
@@ -775,6 +796,10 @@ fn write_principal(
             write_u8(out, 5);
             write_u64(out, *process_id);
         }
+        ControlPlaneAuthPrincipal::Service { service } => {
+            write_u8(out, 6);
+            write_service(out, *service);
+        }
     }
     Ok(())
 }
@@ -805,6 +830,9 @@ fn read_principal(
         },
         5 => ControlPlaneAuthPrincipal::LocalMaintenance {
             process_id: reader.read_u64()?,
+        },
+        6 => ControlPlaneAuthPrincipal::Service {
+            service: read_service(reader)?,
         },
         tag => {
             return Err(auth_protocol_error(format!(
@@ -1199,6 +1227,9 @@ mod tests {
                 instance_id: "admin-1".to_owned(),
             },
             ControlPlaneAuthPrincipal::LocalMaintenance { process_id: 123 },
+            ControlPlaneAuthPrincipal::Service {
+                service: ControlPlaneAuthService::RuntimeMap,
+            },
         ];
 
         for source in roles {
