@@ -394,6 +394,15 @@ Progress:
   `control-plane-runtime-map-diagnostics` probes also load this auth-only
   frontend runtime-map config, so UAT/admin readiness checks can query an
   auth-enforcing control plane without requiring unrelated server config.
+- Admin control-plane command auth is now implemented as an opt-in Unix
+  verifier mode. `ARGMIN_CONTROL_PLANE_ADMIN_AUTH_CREDENTIALS` configures the
+  accepted admin principals, and when present the server requires
+  `Admin { instance_id }` envelopes with the `AdminControlPlaneCommand`
+  operation, concrete Unix RPC kind binding, and the same short freshness
+  window before any admin payload is parsed or applied. Missing auth and
+  wrong-role credentials fail before mutation and are counted through the
+  redacted Unix auth diagnostics. Dedicated admin client signing remains the
+  next Slice C follow-up.
 
 ### Slice D: Runtime-Map and Read Freshness Proof Consumers
 

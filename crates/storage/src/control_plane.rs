@@ -4296,6 +4296,7 @@ pub struct ControlPlaneUnixAuthVerifier {
     cluster_id: String,
     storage_node_credentials: BTreeMap<NodeId, ControlPlaneStorageNodeAuthCredential>,
     frontend_credentials: BTreeMap<String, ControlPlaneFrontendAuthCredential>,
+    admin_credentials: BTreeMap<String, ControlPlaneAdminAuthCredential>,
     metrics: Arc<ControlPlaneUnixAuthMetrics>,
 }
 
@@ -4329,6 +4330,25 @@ pub struct ControlPlaneFrontendAuthCredential {
 impl std::fmt::Debug for ControlPlaneFrontendAuthCredential {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ControlPlaneFrontendAuthCredential")
+            .field("instance_id", &self.instance_id)
+            .field("credential_id", &self.credential_id)
+            .field("credential_version", &self.credential_version)
+            .field("secret", &"<redacted>")
+            .finish()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct ControlPlaneAdminAuthCredential {
+    instance_id: String,
+    credential_id: String,
+    credential_version: u64,
+    secret: Vec<u8>,
+}
+
+impl std::fmt::Debug for ControlPlaneAdminAuthCredential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ControlPlaneAdminAuthCredential")
             .field("instance_id", &self.instance_id)
             .field("credential_id", &self.credential_id)
             .field("credential_version", &self.credential_version)
@@ -4386,11 +4406,36 @@ impl ControlPlaneUnixFrontendAuthCredentialStatus {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ControlPlaneUnixAdminAuthCredentialStatus {
+    instance_id: String,
+    credential_id: String,
+    credential_version: u64,
+}
+
+impl ControlPlaneUnixAdminAuthCredentialStatus {
+    #[must_use]
+    pub fn instance_id(&self) -> &str {
+        &self.instance_id
+    }
+
+    #[must_use]
+    pub fn credential_id(&self) -> &str {
+        &self.credential_id
+    }
+
+    #[must_use]
+    pub fn credential_version(&self) -> u64 {
+        self.credential_version
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ControlPlaneUnixAuthStatusSnapshot {
     required: bool,
     cluster_id: String,
     storage_node_credentials: Vec<ControlPlaneUnixAuthCredentialStatus>,
     frontend_credentials: Vec<ControlPlaneUnixFrontendAuthCredentialStatus>,
+    admin_credentials: Vec<ControlPlaneUnixAdminAuthCredentialStatus>,
     metrics: ControlPlaneUnixAuthMetricsSnapshot,
 }
 
@@ -4413,6 +4458,11 @@ impl ControlPlaneUnixAuthStatusSnapshot {
     #[must_use]
     pub fn frontend_credentials(&self) -> &[ControlPlaneUnixFrontendAuthCredentialStatus] {
         &self.frontend_credentials
+    }
+
+    #[must_use]
+    pub fn admin_credentials(&self) -> &[ControlPlaneUnixAdminAuthCredentialStatus] {
+        &self.admin_credentials
     }
 
     #[must_use]
@@ -5353,6 +5403,54 @@ impl ControlPlaneFrontendAuthCredential {
     }
 }
 
+impl ControlPlaneAdminAuthCredential {
+    pub fn new(
+        instance_id: impl Into<String>,
+        credential_id: impl Into<String>,
+        credential_version: u64,
+        secret: Vec<u8>,
+    ) -> Result<Self, ControlPlaneError> {
+        let credential = Self {
+            instance_id: instance_id.into(),
+            credential_id: credential_id.into(),
+            credential_version,
+            secret,
+        };
+        credential.scoped_for_cluster("validation-cluster")?;
+        Ok(credential)
+    }
+
+    #[must_use]
+    pub fn instance_id(&self) -> &str {
+        &self.instance_id
+    }
+
+    #[must_use]
+    pub fn credential_id(&self) -> &str {
+        &self.credential_id
+    }
+
+    #[must_use]
+    pub fn credential_version(&self) -> u64 {
+        self.credential_version
+    }
+
+    pub fn scoped_for_cluster(
+        &self,
+        cluster_id: &str,
+    ) -> Result<ControlPlaneScopedCredential, ControlPlaneError> {
+        ControlPlaneScopedCredential::new(ControlPlaneScopedCredentialInput {
+            cluster_id: cluster_id.to_owned(),
+            credential_id: self.credential_id.clone(),
+            credential_version: self.credential_version,
+            principal: ControlPlaneAuthPrincipal::Admin {
+                instance_id: self.instance_id.clone(),
+            },
+            secret: self.secret.clone(),
+        })
+    }
+}
+
 impl ControlPlaneUnixAuthVerifier {
     pub fn new_empty(cluster_id: impl Into<String>) -> Result<Self, ControlPlaneError> {
         let cluster_id = cluster_id.into();
@@ -5365,6 +5463,7 @@ impl ControlPlaneUnixAuthVerifier {
             cluster_id,
             storage_node_credentials: BTreeMap::new(),
             frontend_credentials: BTreeMap::new(),
+            admin_credentials: BTreeMap::new(),
             metrics: Arc::new(ControlPlaneUnixAuthMetrics::default()),
         })
     }
@@ -5412,6 +5511,25 @@ impl ControlPlaneUnixAuthVerifier {
         Ok(self)
     }
 
+    pub fn with_admin_credentials(
+        mut self,
+        admin_credentials: Vec<ControlPlaneAdminAuthCredential>,
+    ) -> Result<Self, ControlPlaneError> {
+        let mut by_instance = BTreeMap::new();
+        for credential in admin_credentials {
+            if by_instance
+                .insert(credential.instance_id().to_owned(), credential)
+                .is_some()
+            {
+                return Err(ControlPlaneError::RpcProtocol {
+                    message: "control-plane admin auth credential repeats instance id".to_owned(),
+                });
+            }
+        }
+        self.admin_credentials = by_instance;
+        Ok(self)
+    }
+
     #[must_use]
     pub fn cluster_id(&self) -> &str {
         &self.cluster_id
@@ -5445,6 +5563,15 @@ impl ControlPlaneUnixAuthVerifier {
                     credential_version: credential.credential_version(),
                 })
                 .collect(),
+            admin_credentials: self
+                .admin_credentials
+                .values()
+                .map(|credential| ControlPlaneUnixAdminAuthCredentialStatus {
+                    instance_id: credential.instance_id().to_owned(),
+                    credential_id: credential.credential_id().to_owned(),
+                    credential_version: credential.credential_version(),
+                })
+                .collect(),
             metrics: self.metrics.snapshot(),
         }
     }
@@ -5452,6 +5579,123 @@ impl ControlPlaneUnixAuthVerifier {
     #[must_use]
     pub fn requires_frontend_runtime_map_auth(&self) -> bool {
         !self.frontend_credentials.is_empty()
+    }
+
+    #[must_use]
+    pub fn requires_admin_control_plane_auth(&self) -> bool {
+        !self.admin_credentials.is_empty()
+    }
+
+    fn verify_admin_control_plane_command_payload(
+        &self,
+        expected_kind: ControlPlaneRpcKind,
+        payload: &[u8],
+        authority_now_ms: u64,
+    ) -> Result<Vec<u8>, ControlPlaneError> {
+        let operation = ControlPlaneAuthOperation::AdminControlPlaneCommand;
+        let envelope = match ControlPlaneAuthEnvelope::decode_frame(
+            payload,
+            CONTROL_PLANE_RPC_MAX_PAYLOAD_LEN,
+        ) {
+            Ok(envelope) => envelope,
+            Err(error) => {
+                let reason = if control_plane_auth_payload_has_magic(payload) {
+                    ControlPlaneAuthRejectionReason::Malformed
+                } else {
+                    ControlPlaneAuthRejectionReason::Missing
+                };
+                self.metrics.record_rejected(operation, reason);
+                return Err(error);
+            }
+        };
+        if let Err(error) = validate_control_plane_unix_read_auth_freshness(
+            &envelope,
+            authority_now_ms,
+            "admin control-plane command",
+        ) {
+            self.metrics.record_rejected(
+                operation,
+                ControlPlaneAuthRejectionReason::ReplayFreshnessFailure,
+            );
+            return Err(error);
+        }
+        let expected_source = match envelope.header().source() {
+            ControlPlaneAuthPrincipal::Admin { instance_id } => ControlPlaneAuthPrincipal::Admin {
+                instance_id: instance_id.clone(),
+            },
+            _ => {
+                self.metrics
+                    .record_rejected(operation, ControlPlaneAuthRejectionReason::WrongRole);
+                return Err(ControlPlaneError::RpcProtocol {
+                    message: "control-plane admin command auth source is not an admin".to_owned(),
+                });
+            }
+        };
+        let ControlPlaneAuthPrincipal::Admin { instance_id } = &expected_source else {
+            unreachable!("admin source constructed above");
+        };
+        let Some(admin_credential) = self.admin_credentials.get(instance_id) else {
+            self.metrics.record_rejected(
+                operation,
+                ControlPlaneAuthRejectionReason::UnknownCredential,
+            );
+            return Err(ControlPlaneError::RpcProtocol {
+                message: format!(
+                    "control-plane admin command auth has no credential for instance {instance_id}"
+                ),
+            });
+        };
+        let credential = match admin_credential.scoped_for_cluster(&self.cluster_id) {
+            Ok(credential) => credential,
+            Err(error) => {
+                self.metrics
+                    .record_rejected(operation, ControlPlaneAuthRejectionReason::Malformed);
+                return Err(error);
+            }
+        };
+        let verifier = match ControlPlaneScopedCredentialStore::new(vec![credential]) {
+            Ok(verifier) => verifier,
+            Err(error) => {
+                self.metrics
+                    .record_rejected(operation, ControlPlaneAuthRejectionReason::Malformed);
+                return Err(error);
+            }
+        };
+        let expected_target = ControlPlaneAuthTarget::Service(
+            crate::control_plane_auth::ControlPlaneAuthService::ControlPlane,
+        );
+        match verifier.verify_envelope(
+            crate::control_plane_auth::ControlPlaneAuthVerificationInput {
+                envelope: &envelope,
+                expected_cluster_id: &self.cluster_id,
+                expected_source: &expected_source,
+                expected_target: &expected_target,
+                expected_operation: operation,
+                now_ms: Some(authority_now_ms),
+            },
+        ) {
+            ControlPlaneAuthDecision::Accepted { .. } => {
+                let payload = match read_authenticated_control_plane_rpc_payload(
+                    expected_kind,
+                    envelope.payload(),
+                ) {
+                    Ok(payload) => payload,
+                    Err(error) => {
+                        self.metrics
+                            .record_rejected(operation, ControlPlaneAuthRejectionReason::WrongRole);
+                        return Err(error);
+                    }
+                };
+                self.metrics.record_accepted(operation);
+                Ok(payload)
+            }
+            ControlPlaneAuthDecision::Rejected { reason } => {
+                self.metrics.record_rejected(operation, reason);
+                Err(ControlPlaneError::RpcProtocol {
+                    message: format!("control-plane admin command auth rejected: {reason:?}"),
+                })
+            }
+        }
     }
 
     fn verify_frontend_runtime_map_read_payload(
@@ -6137,6 +6381,19 @@ where
     T: ControlPlaneAdmin + ControlPlaneHeartbeatRuntimeMapSource + ControlPlaneRuntimeMapSource,
 {
     let ControlPlaneRpcRequest { kind, payload } = request;
+    let payload = match auth_verifier {
+        Some(auth_verifier)
+            if kind.auth_operation() == ControlPlaneAuthOperation::AdminControlPlaneCommand
+                && auth_verifier.requires_admin_control_plane_auth() =>
+        {
+            auth_verifier.verify_admin_control_plane_command_payload(
+                kind,
+                &payload,
+                authority_now_ms,
+            )?
+        }
+        _ => payload,
+    };
     let response = match kind {
         ControlPlaneRpcKind::RuntimeMapSnapshot => {
             let payload = match auth_verifier {
@@ -10464,6 +10721,22 @@ mod tests {
             .expect("test frontend scoped credential should build")
     }
 
+    fn admin_auth_config_credential(instance_id: &str) -> ControlPlaneAdminAuthCredential {
+        ControlPlaneAdminAuthCredential::new(
+            instance_id,
+            format!("{instance_id}-credential"),
+            1,
+            format!("{instance_id}-secret").into_bytes(),
+        )
+        .expect("test admin auth credential should build")
+    }
+
+    fn admin_auth_credential(cluster_id: &str, instance_id: &str) -> ControlPlaneScopedCredential {
+        admin_auth_config_credential(instance_id)
+            .scoped_for_cluster(cluster_id)
+            .expect("test admin scoped credential should build")
+    }
+
     fn storage_node_auth_verifier(
         cluster_id: &str,
         credentials: Vec<ControlPlaneStorageNodeAuthCredential>,
@@ -10476,6 +10749,12 @@ mod tests {
         storage_node_auth_verifier(cluster_id, vec![storage_node_auth_node_credential(1)])
             .with_frontend_credentials(vec![frontend_auth_config_credential(instance_id)])
             .expect("test frontend auth verifier should build")
+    }
+
+    fn admin_auth_verifier(cluster_id: &str, instance_id: &str) -> ControlPlaneUnixAuthVerifier {
+        storage_node_auth_verifier(cluster_id, vec![storage_node_auth_node_credential(1)])
+            .with_admin_credentials(vec![admin_auth_config_credential(instance_id)])
+            .expect("test admin auth verifier should build")
     }
 
     fn signed_frontend_runtime_map_request(
@@ -10499,6 +10778,33 @@ mod tests {
                 payload,
             })
             .expect("test frontend runtime-map read envelope should sign");
+        ControlPlaneRpcRequest {
+            kind,
+            payload: envelope.encode_frame().unwrap(),
+        }
+    }
+
+    fn signed_admin_control_plane_request(
+        kind: ControlPlaneRpcKind,
+        signer: &ControlPlaneScopedCredential,
+        payload: Vec<u8>,
+        issued_at_ms: Option<u64>,
+        expires_at_ms: Option<u64>,
+    ) -> ControlPlaneRpcRequest {
+        let payload = write_authenticated_control_plane_rpc_payload(kind, &payload);
+        let envelope = signer
+            .sign_envelope(crate::control_plane_auth::ControlPlaneAuthSignInput {
+                target: ControlPlaneAuthTarget::Service(
+                    crate::control_plane_auth::ControlPlaneAuthService::ControlPlane,
+                ),
+                operation: ControlPlaneAuthOperation::AdminControlPlaneCommand,
+                issued_at_ms,
+                expires_at_ms,
+                sequence: None,
+                nonce: Vec::new(),
+                payload,
+            })
+            .expect("test admin control-plane command envelope should sign");
         ControlPlaneRpcRequest {
             kind,
             payload: envelope.encode_frame().unwrap(),
@@ -12299,6 +12605,141 @@ mod tests {
         assert_eq!(metrics.rejected_total(), 1);
         assert_eq!(
             metrics.rejected_for_operation(ControlPlaneAuthOperation::FrontendRuntimeMapRead),
+            1
+        );
+        assert_eq!(
+            metrics.rejected_for_reason(ControlPlaneAuthRejectionReason::WrongRole),
+            1
+        );
+    }
+
+    #[test]
+    fn authenticated_control_plane_rejects_missing_admin_command_auth() {
+        let tmp = test_util::tempdir();
+        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+        authority
+            .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
+            .unwrap();
+        let before = authority.snapshot().clone();
+        let verifier = admin_auth_verifier("auth-cluster", "admin-1");
+        let mut payload = Vec::new();
+        write_pg_acting_set_request(&mut payload, PgId::new(7), &[NodeId::new(1)]).unwrap();
+        let request = ControlPlaneRpcRequest {
+            kind: ControlPlaneRpcKind::SetPgActingSet,
+            payload,
+        };
+
+        let error = build_control_plane_unix_response_with_auth(
+            &mut authority,
+            request,
+            2_000,
+            Some(&verifier),
+        )
+        .unwrap_err();
+
+        assert!(
+            matches!(error, ControlPlaneError::RpcProtocol { .. }),
+            "unexpected error: {error}"
+        );
+        assert_eq!(authority.snapshot(), &before);
+        let metrics = verifier.metrics_snapshot();
+        assert_eq!(metrics.accepted_total(), 0);
+        assert_eq!(metrics.rejected_total(), 1);
+        assert_eq!(
+            metrics.rejected_for_operation(ControlPlaneAuthOperation::AdminControlPlaneCommand),
+            1
+        );
+        assert_eq!(
+            metrics.rejected_for_reason(ControlPlaneAuthRejectionReason::Missing),
+            1
+        );
+    }
+
+    #[test]
+    fn authenticated_control_plane_accepts_admin_command_auth() {
+        let tmp = test_util::tempdir();
+        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+        authority
+            .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
+            .unwrap();
+        let verifier = admin_auth_verifier("auth-cluster", "admin-1");
+        let signer = admin_auth_credential("auth-cluster", "admin-1");
+        let mut payload = Vec::new();
+        write_pg_acting_set_request(&mut payload, PgId::new(7), &[NodeId::new(1)]).unwrap();
+        let request = signed_admin_control_plane_request(
+            ControlPlaneRpcKind::SetPgActingSet,
+            &signer,
+            payload,
+            Some(1_999),
+            Some(2_999),
+        );
+
+        let response = build_control_plane_unix_response_with_auth(
+            &mut authority,
+            request,
+            2_000,
+            Some(&verifier),
+        )
+        .unwrap();
+        let response_payload = decode_control_plane_rpc_response(response.payload).unwrap();
+        let mut reader = PayloadReader::new(&response_payload);
+        let cluster_epoch = ClusterEpoch::new(reader.read_u64().unwrap()).unwrap();
+        reader.finish().unwrap();
+
+        assert_eq!(cluster_epoch, authority.snapshot().cluster_epoch());
+        let pg = authority.snapshot().pg(PgId::new(7)).unwrap();
+        assert_eq!(pg.state(), PgState::Peering);
+        assert_eq!(pg.acting_set(), &[NodeId::new(1)]);
+        let metrics = verifier.metrics_snapshot();
+        assert_eq!(metrics.accepted_total(), 1);
+        assert_eq!(
+            metrics.accepted_for_operation(ControlPlaneAuthOperation::AdminControlPlaneCommand),
+            1
+        );
+        assert_eq!(metrics.rejected_total(), 0);
+    }
+
+    #[test]
+    fn authenticated_control_plane_rejects_frontend_credential_for_admin_command() {
+        let tmp = test_util::tempdir();
+        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+        authority
+            .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
+            .unwrap();
+        let before = authority.snapshot().clone();
+        let verifier = admin_auth_verifier("auth-cluster", "admin-1");
+        let signer = frontend_auth_credential("auth-cluster", "frontend-1");
+        let mut payload = Vec::new();
+        write_pg_acting_set_request(&mut payload, PgId::new(7), &[NodeId::new(1)]).unwrap();
+        let request = signed_admin_control_plane_request(
+            ControlPlaneRpcKind::SetPgActingSet,
+            &signer,
+            payload,
+            Some(1_999),
+            Some(2_999),
+        );
+
+        let error = build_control_plane_unix_response_with_auth(
+            &mut authority,
+            request,
+            2_000,
+            Some(&verifier),
+        )
+        .unwrap_err();
+
+        assert!(
+            matches!(error, ControlPlaneError::RpcProtocol { ref message } if message.contains("source is not an admin")),
+            "unexpected error: {error}"
+        );
+        assert_eq!(authority.snapshot(), &before);
+        let metrics = verifier.metrics_snapshot();
+        assert_eq!(metrics.accepted_total(), 0);
+        assert_eq!(metrics.rejected_total(), 1);
+        assert_eq!(
+            metrics.rejected_for_operation(ControlPlaneAuthOperation::AdminControlPlaneCommand),
             1
         );
         assert_eq!(

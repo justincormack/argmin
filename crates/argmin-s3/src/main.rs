@@ -28,12 +28,12 @@ use storage::control_plane::{
     build_control_plane_unix_response, build_control_plane_unix_response_with_auth,
     read_control_plane_unix_request, write_control_plane_unix_response,
     AuthenticatedUnixControlPlaneClient, ClusterControlSnapshot, ClusterRuntimeMapSnapshot,
-    ControlPlaneAdmin, ControlPlaneError, ControlPlaneFrontendAuthCredential,
-    ControlPlaneHeartbeatRefresh, ControlPlaneHeartbeatRuntimeMapSource,
-    ControlPlaneRuntimeMapSource, ControlPlaneStorageNodeAuthCredential,
-    ControlPlaneUnixAuthVerifier, FencedPgMetadataTransferSnapshot, FileControlPlaneStore,
-    PgMetadataProof, PgMetadataTransferProof, PgRouteSnapshot, SingleAuthorityControlPlane,
-    UnixControlPlaneClient,
+    ControlPlaneAdmin, ControlPlaneAdminAuthCredential, ControlPlaneError,
+    ControlPlaneFrontendAuthCredential, ControlPlaneHeartbeatRefresh,
+    ControlPlaneHeartbeatRuntimeMapSource, ControlPlaneRuntimeMapSource,
+    ControlPlaneStorageNodeAuthCredential, ControlPlaneUnixAuthVerifier,
+    FencedPgMetadataTransferSnapshot, FileControlPlaneStore, PgMetadataProof,
+    PgMetadataTransferProof, PgRouteSnapshot, SingleAuthorityControlPlane, UnixControlPlaneClient,
 };
 use storage::control_plane_auth::{
     ControlPlaneAuthEnvelope, ControlPlaneAuthOperation, ControlPlaneAuthPrincipal,
@@ -68,9 +68,9 @@ use tokio::runtime::Handle;
 use tokio_rustls::TlsAcceptor;
 
 use config::{
-    ConfiguredControlPlaneFrontendAuthCredential, ConfiguredControlPlaneFrontendRuntimeMapAuth,
-    ConfiguredControlPlaneStorageAuthCredential, ConfiguredCredential, ConfiguredCredentialProfile,
-    ProcessRole, ServerConfig,
+    ConfiguredControlPlaneAdminAuthCredential, ConfiguredControlPlaneFrontendAuthCredential,
+    ConfiguredControlPlaneFrontendRuntimeMapAuth, ConfiguredControlPlaneStorageAuthCredential,
+    ConfiguredCredential, ConfiguredCredentialProfile, ProcessRole, ServerConfig,
 };
 use server_http::http::HttpFrontend;
 
@@ -1990,11 +1990,12 @@ fn format_control_plane_unix_auth_diagnostics(verifier: &ControlPlaneUnixAuthVer
     let status = verifier.status_snapshot();
     let metrics = status.metrics();
     let mut diagnostics = format!(
-        "control_plane_unix_auth required={} cluster_id={} storage_node_credentials={} frontend_credentials={} accepted_total={} rejected_total={}",
+        "control_plane_unix_auth required={} cluster_id={} storage_node_credentials={} frontend_credentials={} admin_credentials={} accepted_total={} rejected_total={}",
         status.required(),
         status.cluster_id(),
         status.storage_node_credentials().len(),
         status.frontend_credentials().len(),
+        status.admin_credentials().len(),
         metrics.accepted_total(),
         metrics.rejected_total()
     );
@@ -2014,6 +2015,17 @@ fn format_control_plane_unix_auth_diagnostics(verifier: &ControlPlaneUnixAuthVer
         write!(
             &mut diagnostics,
             "control_plane_unix_auth frontend_credential{{instance_id=\"{}\",credential_id=\"{}\",credential_version=\"{}\"}} 1",
+            credential.instance_id(),
+            credential.credential_id(),
+            credential.credential_version()
+        )
+        .expect("write to String should not fail");
+    }
+    for credential in status.admin_credentials() {
+        diagnostics.push('\n');
+        write!(
+            &mut diagnostics,
+            "control_plane_unix_auth admin_credential{{instance_id=\"{}\",credential_id=\"{}\",credential_version=\"{}\"}} 1",
             credential.instance_id(),
             credential.credential_id(),
             credential.credential_version()
@@ -3142,11 +3154,29 @@ fn configured_frontend_auth_credential(
     })
 }
 
+fn configured_admin_auth_credential(
+    configured: &ConfiguredControlPlaneAdminAuthCredential,
+) -> Result<ControlPlaneAdminAuthCredential, String> {
+    ControlPlaneAdminAuthCredential::new(
+        configured.instance_id.clone(),
+        configured.credential_id.clone(),
+        configured.credential_version,
+        configured.secret.as_str().as_bytes().to_vec(),
+    )
+    .map_err(|error| {
+        format!(
+            "invalid ARGMIN_CONTROL_PLANE_ADMIN_AUTH_CREDENTIALS credential for instance {}: {error}",
+            configured.instance_id
+        )
+    })
+}
+
 fn build_control_plane_unix_auth_verifier(
     config: &ServerConfig,
 ) -> Result<Option<ControlPlaneUnixAuthVerifier>, String> {
     if config.control_plane_storage_auth_credentials.is_empty()
         && config.control_plane_frontend_auth_credentials.is_empty()
+        && config.control_plane_admin_auth_credentials.is_empty()
     {
         return Ok(None);
     }
@@ -3164,6 +3194,22 @@ fn build_control_plane_unix_auth_verifier(
         .iter()
         .map(configured_frontend_auth_credential)
         .collect::<Result<Vec<_>, _>>()?;
+    let admin_credentials = config
+        .control_plane_admin_auth_credentials
+        .iter()
+        .map(configured_admin_auth_credential)
+        .collect::<Result<Vec<_>, _>>()?;
+    if let Some(instance_id) = config.control_plane_admin_auth_instance_id.as_deref() {
+        if !config
+            .control_plane_admin_auth_credentials
+            .iter()
+            .any(|credential| credential.instance_id == instance_id)
+        {
+            return Err(format!(
+                "ARGMIN_CONTROL_PLANE_ADMIN_AUTH_CREDENTIALS must include local admin instance id {instance_id}"
+            ));
+        }
+    }
     let verifier = if storage_credentials.is_empty() {
         ControlPlaneUnixAuthVerifier::new_empty(cluster_id)
     } else {
@@ -3172,9 +3218,13 @@ fn build_control_plane_unix_auth_verifier(
     .map_err(|error| format!("invalid control-plane Unix auth credential verifier: {error}"))?;
     verifier
         .with_frontend_credentials(frontend_credentials)
-        .map(Some)
         .map_err(|error| {
             format!("invalid ARGMIN_CONTROL_PLANE_FRONTEND_AUTH_CREDENTIALS verifier: {error}")
+        })?
+        .with_admin_credentials(admin_credentials)
+        .map(Some)
+        .map_err(|error| {
+            format!("invalid ARGMIN_CONTROL_PLANE_ADMIN_AUTH_CREDENTIALS verifier: {error}")
         })
 }
 
@@ -4237,6 +4287,8 @@ mod tests {
             control_plane_storage_auth_credentials: Vec::new(),
             control_plane_frontend_auth_instance_id: None,
             control_plane_frontend_auth_credentials: Vec::new(),
+            control_plane_admin_auth_instance_id: None,
+            control_plane_admin_auth_credentials: Vec::new(),
             control_plane_experimental_raft: false,
             control_plane_raft_cluster_name: None,
             control_plane_raft_node_id: None,
@@ -4382,6 +4434,29 @@ mod tests {
         assert_eq!(status.storage_node_credentials().len(), 0);
         assert_eq!(status.frontend_credentials().len(), 1);
         assert_eq!(status.frontend_credentials()[0].instance_id(), "frontend-1");
+    }
+
+    #[test]
+    fn control_plane_unix_auth_verifier_includes_admin_credentials() {
+        let mut config = test_server_config();
+        config.control_plane_auth_cluster_id = Some("control-auth".to_string());
+        config.control_plane_admin_auth_credentials =
+            vec![ConfiguredControlPlaneAdminAuthCredential {
+                instance_id: "admin-1".to_string(),
+                credential_id: "admin".to_string(),
+                credential_version: 7,
+                secret: SecretConfigValue::new("admin-1-secret".to_string()),
+            }];
+
+        let verifier = build_control_plane_unix_auth_verifier(&config)
+            .expect("admin auth verifier should build")
+            .expect("admin auth verifier should be enabled");
+        let status = verifier.status_snapshot();
+
+        assert_eq!(status.storage_node_credentials().len(), 0);
+        assert_eq!(status.frontend_credentials().len(), 0);
+        assert_eq!(status.admin_credentials().len(), 1);
+        assert_eq!(status.admin_credentials()[0].instance_id(), "admin-1");
     }
 
     #[test]
