@@ -53,10 +53,16 @@ pub struct PgTopology {
     pg_ids: Box<[u32]>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum PgTopologyError {
+    #[error("pg topology cannot be empty")]
+    Empty,
+}
+
 impl PgTopology {
-    pub fn new(pg_ids: &[u32]) -> Result<Self, &'static str> {
+    pub fn new(pg_ids: &[u32]) -> Result<Self, PgTopologyError> {
         if pg_ids.is_empty() {
-            return Err("pg topology cannot be empty");
+            return Err(PgTopologyError::Empty);
         }
         let mut canonical = pg_ids.to_vec();
         canonical.sort_unstable();
@@ -269,14 +275,14 @@ mod tests {
     use std::num::NonZeroUsize;
 
     use super::{
-        hash_bytes, hash_parts, PgTopology, DEFAULT_OBJECT_DATA_PG_SEGMENT_BAND_SIZE,
-        DEFAULT_OBJECT_DATA_PG_SET_WIDTH,
+        hash_bytes, hash_parts, PgTopology, PgTopologyError,
+        DEFAULT_OBJECT_DATA_PG_SEGMENT_BAND_SIZE, DEFAULT_OBJECT_DATA_PG_SET_WIDTH,
     };
     use crate::{BucketName, GenerationId, ObjectKey};
 
     #[test]
     fn topology_rejects_empty() {
-        assert!(PgTopology::new(&[]).is_err());
+        assert_eq!(PgTopology::new(&[]).unwrap_err(), PgTopologyError::Empty);
     }
 
     #[test]

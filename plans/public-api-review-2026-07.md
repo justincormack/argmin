@@ -1045,8 +1045,8 @@ each is one refactor away from a panic:
   `AclGrants::parse -> Result<_, String>` was fixed with typed
   `AclGrantsParseError` variants that preserve line-aware diagnostics while
   existing storage/RPC callers keep their outer error mapping;
-  `PgTopology::new -> Result<_, &'static str>` (`pg_topology.rs:57`,
-  consumers `.unwrap()`/`.expect()` it);
+  `PgTopology::new -> Result<_, &'static str>` was fixed with
+  `PgTopologyError::Empty`;
   `SseCustomerObjectState::decode`/`SseS3ObjectState::decode`/
   `ObjectEncryption::decode -> Result<_, String>` was fixed by adding
   `ObjectEncryptionDecodeError` typed variants for persisted encryption-state
