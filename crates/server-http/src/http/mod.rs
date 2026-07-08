@@ -3289,8 +3289,8 @@ impl HttpFrontend {
             | "STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER"
             | "STREAMING-UNSIGNED-PAYLOAD-TRAILER" => {}
             _ => {
-                return Err(ServerError::InvalidArgument {
-                    reason: format!("unsupported streaming token: {content_sha}"),
+                return Err(ServerError::UnsupportedStreamingToken {
+                    token: content_sha.to_string(),
                 });
             }
         }
@@ -3334,8 +3334,8 @@ impl HttpFrontend {
             | "STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER"
             | "STREAMING-UNSIGNED-PAYLOAD-TRAILER" => {}
             _ => {
-                return Err(ServerError::InvalidArgument {
-                    reason: format!("unsupported streaming token: {content_sha}"),
+                return Err(ServerError::UnsupportedStreamingToken {
+                    token: content_sha.to_string(),
                 });
             }
         }
@@ -3356,11 +3356,9 @@ impl HttpFrontend {
         let is_signed = content_sha.starts_with("STREAMING-AWS4-HMAC-SHA256");
 
         let streaming_ctx = if is_signed {
-            Some(
-                auth.streaming
-                    .as_ref()
-                    .ok_or_else(|| ServerError::Auth(auth::AuthError::SignatureMismatch))?,
-            )
+            Some(auth.streaming.as_ref().ok_or_else(|| {
+                ServerError::Auth(auth::AuthError::SignatureMismatch { diagnostics: None })
+            })?)
         } else {
             None
         };
@@ -3922,7 +3920,7 @@ impl HttpFrontend {
                 .into_iter()
                 .any(|algorithm| req.header(algorithm.header_name()).is_some());
             if has_inline_checksum {
-                return Err(ServerError::InvalidRequest {
+                return Err(ServerError::InvalidRequestHostId {
                     reason: "Expecting a single x-amz-checksum- header".to_string(),
                 });
             }
@@ -11586,7 +11584,7 @@ mod tests {
         );
 
         match fe.maybe_decode_chunked(&req, &auth) {
-            Err(ServerError::Auth(auth::AuthError::SignatureMismatch)) => {} // expected
+            Err(ServerError::Auth(auth::AuthError::SignatureMismatch { .. })) => {} // expected
             other => panic!("expected SignatureMismatch, got {:?}", other.err()),
         }
     }
@@ -11686,8 +11684,8 @@ mod tests {
         );
 
         match fe.maybe_decode_chunked(&req, &test_auth()) {
-            Err(ServerError::InvalidArgument { .. }) => {} // expected
-            other => panic!("expected InvalidArgument, got {:?}", other.err()),
+            Err(ServerError::UnsupportedStreamingToken { .. }) => {} // expected
+            other => panic!("expected UnsupportedStreamingToken, got {:?}", other.err()),
         }
     }
 

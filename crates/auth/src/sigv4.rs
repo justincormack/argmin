@@ -154,7 +154,7 @@ pub(crate) struct VerifyRequestRecordInput<'a, H: HeaderSource + ?Sized> {
 pub(crate) fn verify_request_record<'a, H: HeaderSource + ?Sized>(
     input: VerifyRequestRecordInput<'_, H>,
     store: &'a CredentialStore,
-) -> Result<&'a CredentialRecord, AuthError> {
+) -> Result<(&'a CredentialRecord, String), AuthError> {
     let VerifyRequestRecordInput {
         method,
         uri,
@@ -250,10 +250,17 @@ pub(crate) fn verify_request_record<'a, H: HeaderSource + ?Sized>(
 
     // Constant-time comparison to prevent timing attacks on signature values.
     if !crate::constant_time_eq(expected_hex.as_bytes(), auth.signature.as_bytes()) {
-        return Err(AuthError::SignatureMismatch);
+        return Err(AuthError::SignatureMismatch {
+            diagnostics: Some(Box::new(crate::SignatureMismatchDiagnostics {
+                access_key_id: auth.credential.access_key_id.to_string(),
+                string_to_sign: sts,
+                signature_provided: auth.signature.to_string(),
+                canonical_request: Some(creq),
+            })),
+        });
     }
 
-    Ok(record)
+    Ok((record, creq))
 }
 
 pub(crate) fn hmac_sha256(key: &[u8], data: &[u8]) -> hmac::Tag {
@@ -489,7 +496,7 @@ mod tests {
 
         let headers = with_auth_header(auth_header, &headers);
         let result = authenticate_header_for_test(method, uri, "", &headers, b"", &store);
-        assert!(matches!(result, Err(AuthError::SignatureMismatch)));
+        assert!(matches!(result, Err(AuthError::SignatureMismatch { .. })));
     }
 
     #[test]

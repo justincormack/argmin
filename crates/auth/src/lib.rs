@@ -62,7 +62,7 @@ pub use canonical::parse_amz_date;
 pub use credential::{
     AuthorizationProfile, CredentialRecord, CredentialScope, CredentialStore, SecretKey,
 };
-pub use error::AuthError;
+pub use error::{AuthError, SignatureMismatchDiagnostics};
 pub use post::{
     authenticate_post_sigv4, prepare_post_policy, validate_post_policy,
     validate_prepared_post_policy_size, ExpectedCredentialScope, PostPolicyError, PostSigV4Request,

@@ -1427,6 +1427,39 @@ pub fn raw_anonymous(method: &str, bucket: &str, key: &str, query: Option<&str>)
     }
 }
 
+/// Fetch a URL unauthenticated (e.g. a tampered presigned URL), capturing
+/// the full raw response.
+pub fn raw_fetch_url(url: &str, extra_headers: &[(&str, &str)]) -> RawResponse {
+    let mut request = crate::test_agent().get(url);
+    for (name, value) in extra_headers {
+        request = request.header(*name, *value);
+    }
+    let mut response = request.call().expect("raw URL fetch transport error");
+    let headers = response
+        .headers()
+        .iter()
+        .map(|(name, value)| {
+            (
+                name.as_str().to_string(),
+                value
+                    .to_str()
+                    .expect("response header is valid utf-8")
+                    .to_string(),
+            )
+        })
+        .collect();
+    let (body, body_read_error) = match response.body_mut().read_to_string() {
+        Ok(body) => (body, None),
+        Err(err) => (String::new(), Some(err.to_string())),
+    };
+    RawResponse {
+        status: response.status().as_u16(),
+        headers,
+        body,
+        body_read_error,
+    }
+}
+
 /// Send an unauthenticated raw PUT with a body against the shared test
 /// endpoint.
 pub fn raw_anonymous_put(bucket: &str, key: &str, body: &[u8]) -> RawResponse {

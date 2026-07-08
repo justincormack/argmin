@@ -199,9 +199,17 @@ fn client_error_message(err: &ServerError) -> String {
         ServerError::Auth(auth::AuthError::UnsupportedAuthType) => {
             "unsupported Authorization type".to_string()
         }
-        ServerError::Auth(auth::AuthError::MissingQueryParam { param }) => {
-            format!("missing query auth parameter: {param}")
+        ServerError::Auth(auth::AuthError::MissingQueryParam { .. }) => {
+            "Query-string authentication version 4 requires the X-Amz-Algorithm, \
+             X-Amz-Credential, X-Amz-Signature, X-Amz-Date, X-Amz-SignedHeaders, \
+             and X-Amz-Expires parameters."
+                .to_string()
         }
+        ServerError::Auth(auth::AuthError::InvalidQueryParam {
+            param: "X-Amz-Expires",
+        }) => "X-Amz-Expires must be less than a week (in seconds); that is, the \
+               given X-Amz-Expires must be less than 604800 seconds"
+            .to_string(),
         ServerError::Auth(auth::AuthError::InvalidQueryParam { param }) => {
             format!("invalid query auth parameter: {param}")
         }
@@ -240,7 +248,11 @@ fn client_error_message(err: &ServerError) -> String {
         ServerError::Auth(auth::AuthError::DuplicateAuthorizationHeader) => {
             "A header you provided implies functionality that is not implemented".to_string()
         }
-        ServerError::Auth(auth::AuthError::SignatureMismatch) => "signature mismatch".to_string(),
+        ServerError::Auth(auth::AuthError::SignatureMismatch { .. }) => {
+            "The request signature we calculated does not match the signature you \
+             provided. Check your key and signing method."
+                .to_string()
+        }
         ServerError::Auth(auth::AuthError::UnexpectedSecurityToken { .. }) => {
             "The provided token is malformed or otherwise invalid.".to_string()
         }
@@ -251,10 +263,10 @@ fn client_error_message(err: &ServerError) -> String {
         ServerError::Auth(auth::AuthError::RequestExpired) => {
             "request timestamp is too far from server time".to_string()
         }
-        ServerError::Auth(auth::AuthError::PresignedRequestExpired) => {
+        ServerError::Auth(auth::AuthError::PresignedRequestExpired { .. }) => {
             "Request has expired".to_string()
         }
-        ServerError::Auth(auth::AuthError::RequestNotYetValid) => {
+        ServerError::Auth(auth::AuthError::RequestNotYetValid { .. }) => {
             "Request is not yet valid".to_string()
         }
         ServerError::Auth(auth::AuthError::UnsignedHeaders { .. }) => {
@@ -279,7 +291,7 @@ fn client_error_message(err: &ServerError) -> String {
         | ServerError::MalformedXML { reason }
         | ServerError::MalformedPOSTRequest { reason }
         | ServerError::MalformedChunkedBody { reason }
-        | ServerError::MalformedTrailerError { reason }
+
         | ServerError::InvalidTag { reason } => reason.clone(),
         ServerError::DuplicateChecksumHeader { .. } => "Only one value may be specified.".to_string(),
         ServerError::UnexpectedContent => "This request does not support content".to_string(),
@@ -336,13 +348,9 @@ fn client_error_message(err: &ServerError) -> String {
             "The Encryption request you specified is not valid. Supported value: AES256."
                 .to_string()
         }
-        ServerError::InvalidChunkSize {
-            chunk,
-            chunk_size,
-            min_size,
-        } => format!(
-            "invalid chunk size: only the last chunk may be smaller than {min_size} bytes (chunk {chunk} was {chunk_size} bytes)"
-        ),
+        ServerError::InvalidChunkSize { min_size, .. } => {
+            format!("Only the last chunk is allowed to have a size less than {min_size} bytes")
+        }
         ServerError::NoSuchCorsConfiguration { .. } => "no CORS configuration".to_string(),
         ServerError::NoSuchTagSet { .. } => "no such tag set".to_string(),
         ServerError::NoSuchPublicAccessBlockConfiguration { .. } => {
@@ -416,8 +424,23 @@ fn client_error_message(err: &ServerError) -> String {
                 .to_string()
         }
         ServerError::IllegalVersioningConfiguration { reason } => reason.clone(),
-        ServerError::IncompleteBody => "incomplete body".to_string(),
-        ServerError::MissingContentLength => "missing content length".to_string(),
+        ServerError::MalformedTrailerError { .. } => {
+            "The request contained trailing data that was not well-formed or did \
+             not conform to our published schema."
+                .to_string()
+        }
+        ServerError::IncompleteBody => "The request body terminated unexpectedly".to_string(),
+        ServerError::MissingContentLength => {
+            "You must provide the Content-Length HTTP header.".to_string()
+        }
+        ServerError::UnsupportedStreamingToken { .. } => {
+            "x-amz-content-sha256 must be UNSIGNED-PAYLOAD, \
+             STREAMING-UNSIGNED-PAYLOAD-TRAILER, STREAMING-AWS4-HMAC-SHA256-PAYLOAD, \
+             STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER, \
+             STREAMING-AWS4-ECDSA-P256-SHA256-PAYLOAD, \
+             STREAMING-AWS4-ECDSA-P256-SHA256-PAYLOAD-TRAILER or a valid sha256 value."
+                .to_string()
+        }
     }
 }
 
@@ -489,12 +512,58 @@ impl S3Response {
                 );
                 Self::new(403).chunked_xml_body(body)
             }
+            ServerError::Auth(auth::AuthError::PresignedRequestExpired {
+                x_amz_expires,
+                expires_epoch,
+                server_time_epoch,
+            }) => {
+                let body = xml::presigned_request_expired_error_xml(
+                    *x_amz_expires,
+                    *expires_epoch,
+                    *server_time_epoch,
+                    request_id,
+                    host_id,
+                );
+                Self::new(403).chunked_xml_body(body)
+            }
+            ServerError::Auth(auth::AuthError::RequestNotYetValid {
+                amz_date_epoch_millis,
+                expires_epoch,
+                server_time_epoch,
+            }) => {
+                let body = xml::request_not_yet_valid_error_xml(
+                    *amz_date_epoch_millis,
+                    *expires_epoch,
+                    *server_time_epoch,
+                    request_id,
+                    host_id,
+                );
+                Self::new(403).chunked_xml_body(body)
+            }
+            ServerError::Auth(auth::AuthError::SignatureMismatch { diagnostics }) => {
+                let body = xml::signature_does_not_match_error_xml(
+                    diagnostics.as_deref(),
+                    request_id,
+                    host_id,
+                );
+                Self::new(403).chunked_xml_body(body)
+            }
+            ServerError::Auth(
+                auth::AuthError::MissingQueryParam { .. }
+                | auth::AuthError::InvalidQueryParam { .. },
+            ) => {
+                let body = xml::error_xml_with_host_id(
+                    "AuthorizationQueryParametersError",
+                    &client_error_message(err),
+                    request_id,
+                    host_id,
+                );
+                Self::new(400).chunked_xml_body(body)
+            }
             ServerError::AccessDenied
             | ServerError::ObjectLockProtectedAccessDenied
             | ServerError::Auth(auth::AuthError::MissingAuth)
-            | ServerError::Auth(auth::AuthError::AccessDenied)
-            | ServerError::Auth(auth::AuthError::RequestNotYetValid)
-            | ServerError::Auth(auth::AuthError::PresignedRequestExpired) => {
+            | ServerError::Auth(auth::AuthError::AccessDenied) => {
                 let body = xml::error_xml_with_host_id(
                     "AccessDenied",
                     &client_error_message(err),
@@ -528,23 +597,8 @@ impl S3Response {
                 Self::new(400).chunked_xml_body(body)
             }
             ServerError::Auth(auth::AuthError::UnsignedHeaders { headers }) => {
-                let headers_str = headers.join(";");
-                let body = format!(
-                    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
-                     <Error>\
-                     <Code>AccessDenied</Code>\
-                     <Message>{}</Message>\
-                     <HeadersNotSigned>{}</HeadersNotSigned>\
-                     <Resource>{}</Resource>\
-                     <RequestId>{}</RequestId>\
-                     <HostId>{}</HostId>\
-                     </Error>",
-                    xml::xml_escape(&client_error_message(err)),
-                    xml::xml_escape(&headers_str),
-                    xml::xml_escape(resource),
-                    xml::xml_escape(request_id),
-                    xml::xml_escape(host_id),
-                );
+                let body =
+                    xml::headers_not_signed_error_xml(&headers.join(";"), request_id, host_id);
                 Self::new(403).chunked_xml_body(body)
             }
             ServerError::Auth(auth::AuthError::UnexpectedSecurityToken { token }) => {
@@ -736,6 +790,43 @@ impl S3Response {
                 let body =
                     xml::invalid_range_error_xml(range_requested, *total_size, request_id, host_id);
                 Self::new(416).chunked_xml_body(body)
+            }
+            ServerError::IncompleteBody
+            | ServerError::MissingContentLength
+            | ServerError::MalformedTrailerError { .. } => {
+                let body = xml::error_xml_with_host_id(
+                    err.s3_error_code(),
+                    &client_error_message(err),
+                    request_id,
+                    host_id,
+                );
+                Self::new(err.http_status()).chunked_xml_body(body)
+            }
+            ServerError::InvalidChunkSize {
+                chunk,
+                chunk_size,
+                min_size,
+            } => {
+                let body = xml::invalid_chunk_size_error_xml(
+                    // AWS reports the 1-based number of the chunk at which the
+                    // undersized predecessor is detected.
+                    chunk + 1,
+                    *chunk_size,
+                    *min_size,
+                    request_id,
+                    host_id,
+                );
+                Self::new(403).chunked_xml_body(body)
+            }
+            ServerError::UnsupportedStreamingToken { token } => {
+                let body = xml::invalid_argument_error_xml(
+                    &client_error_message(err),
+                    "x-amz-content-sha256",
+                    Some(token),
+                    request_id,
+                    host_id,
+                );
+                Self::new(400).chunked_xml_body(body)
             }
             ServerError::NoSuchPublicAccessBlockConfiguration { bucket } => {
                 let body = xml::no_such_public_access_block_error_xml(bucket, request_id, host_id);
@@ -3616,7 +3707,11 @@ mod tests {
 
     #[test]
     fn presigned_expired_error_response_uses_access_denied_shape() {
-        let err = ServerError::Auth(auth::AuthError::PresignedRequestExpired);
+        let err = ServerError::Auth(auth::AuthError::PresignedRequestExpired {
+            x_amz_expires: 60,
+            expires_epoch: 1_705_321_845,
+            server_time_epoch: 1_705_321_900,
+        });
         let wire_ids = WireResponseIds::new("2VG1X5NNMZ52HKC0", TEST_HOST_ID);
         let resp = S3Response::error_with_ids(&err, "/bucket/key", &wire_ids);
         assert_eq!(resp.status_code, 403);

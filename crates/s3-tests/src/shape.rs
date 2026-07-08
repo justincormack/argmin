@@ -662,6 +662,25 @@ pub fn assert_shape(
     }
 }
 
+/// Assert a status and full body template when only `(status, body)` is
+/// available, e.g. ureq fetch paths that do not build a [`RawResponse`].
+/// The spec must not pin headers; use [`assert_shape`] where the full
+/// header set is available.
+pub fn assert_status_and_body(
+    operation: &str,
+    status: u16,
+    body: &str,
+    spec: &ShapeSpec,
+) -> BTreeMap<String, String> {
+    let response = RawResponse {
+        status,
+        headers: Vec::new(),
+        body: body.to_string(),
+        body_read_error: None,
+    };
+    assert_shape(operation, &response, spec)
+}
+
 /// Assert a response matches one of several expectations. Only for behavior
 /// where a divergence is documented in `guides/aws-compatibility.md`: the
 /// same alternatives are accepted against every endpoint, never selected by
@@ -841,6 +860,16 @@ pub mod expected_error {
 
     pub fn no_such_public_access_block(bucket: &str) -> String {
         xml::no_such_public_access_block_error_xml(bucket, REQUEST_ID, HOST_ID)
+    }
+
+    /// `AccessDenied` naming the request headers absent from SignedHeaders.
+    pub fn headers_not_signed(headers: &str) -> String {
+        xml::headers_not_signed_error_xml(headers, REQUEST_ID, HOST_ID)
+    }
+
+    /// `InvalidChunkSizeError` naming the detection chunk and bad size.
+    pub fn invalid_chunk_size(chunk: usize, bad_chunk_size: usize) -> String {
+        xml::invalid_chunk_size_error_xml(chunk, bad_chunk_size, 8192, REQUEST_ID, HOST_ID)
     }
 
     /// `MalformedPolicy` for parse-level failures (no `<Detail>`). Brace
@@ -1420,6 +1449,23 @@ mod tests {
              the upload may have been aborted or completed.</Message>\
              <UploadId>upload-1</UploadId><RequestId>{request_id}</RequestId>\
              <HostId>{host_id}</HostId></Error>"
+        );
+        assert_eq!(
+            expected_error::invalid_chunk_size(2, 5),
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error>\
+             <Code>InvalidChunkSizeError</Code>\
+             <Message>Only the last chunk is allowed to have a size less than \
+             8192 bytes</Message>\
+             <Chunk>2</Chunk><BadChunkSize>5</BadChunkSize>\
+             <RequestId>{request_id}</RequestId><HostId>{host_id}</HostId></Error>"
+        );
+        assert_eq!(
+            expected_error::headers_not_signed("x-amz-acl"),
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>AccessDenied</Code>\
+             <Message>There were headers present in the request which were not \
+             signed</Message>\
+             <HeadersNotSigned>x-amz-acl</HeadersNotSigned>\
+             <RequestId>{request_id}</RequestId><HostId>{host_id}</HostId></Error>"
         );
         assert_eq!(
             expected_error::no_such_public_access_block("bucket-1"),

@@ -2055,8 +2055,8 @@ fn parse_chunked_mode(req: &S3Request) -> Result<ChunkedMode, ServerError> {
         }
         // STREAMING-UNSIGNED-PAYLOAD (without -TRAILER) and unknown streaming
         // tokens are rejected by AWS.
-        v if v.starts_with("STREAMING-") => Err(ServerError::InvalidArgument {
-            reason: format!("unsupported streaming token: {v}"),
+        v if v.starts_with("STREAMING-") => Err(ServerError::UnsupportedStreamingToken {
+            token: v.to_string(),
         }),
         // Fixed payload hash (hex SHA256): verify incrementally in streaming loop.
         _ => Ok(ChunkedMode::None),
@@ -6496,7 +6496,7 @@ Connection: close\r\n\r\n",
             &[("x-amz-content-sha256", "STREAMING-UNSIGNED-PAYLOAD")],
         );
         let err = parse_chunked_mode(&req).unwrap_err();
-        assert!(matches!(err, ServerError::InvalidArgument { .. }));
+        assert!(matches!(err, ServerError::UnsupportedStreamingToken { .. }));
     }
 
     #[test]

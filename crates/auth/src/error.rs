@@ -46,7 +46,11 @@ pub enum AuthError {
     #[error("access denied")]
     AccessDenied,
     #[error("signature mismatch")]
-    SignatureMismatch,
+    SignatureMismatch {
+        /// SigV4 verification inputs echoed by AWS in the error body;
+        /// absent for POST policy signatures.
+        diagnostics: Option<Box<SignatureMismatchDiagnostics>>,
+    },
     #[error("unexpected security token")]
     UnexpectedSecurityToken { token: String },
     #[error("token expired")]
@@ -56,9 +60,23 @@ pub enum AuthError {
     #[error("request timestamp is too far from server time")]
     RequestExpired,
     #[error("Request has expired")]
-    PresignedRequestExpired,
+    PresignedRequestExpired {
+        /// The X-Amz-Expires parameter value, echoed in the error body.
+        x_amz_expires: u64,
+        /// Epoch seconds when the URL expired.
+        expires_epoch: u64,
+        /// Epoch seconds of the server clock at rejection.
+        server_time_epoch: u64,
+    },
     #[error("Request is not yet valid")]
-    RequestNotYetValid,
+    RequestNotYetValid {
+        /// The X-Amz-Date parameter, echoed as epoch milliseconds.
+        amz_date_epoch_millis: u64,
+        /// Epoch seconds when the URL would expire.
+        expires_epoch: u64,
+        /// Epoch seconds of the server clock at rejection.
+        server_time_epoch: u64,
+    },
     #[error("there were headers present in the request which were not signed")]
     UnsignedHeaders { headers: Vec<String> },
 }
@@ -142,7 +160,7 @@ impl std::fmt::Debug for AuthError {
             Self::UnknownAccessKey => f.write_str("UnknownAccessKey"),
             Self::DuplicateAuthorizationHeader => f.write_str("DuplicateAuthorizationHeader"),
             Self::AccessDenied => f.write_str("AccessDenied"),
-            Self::SignatureMismatch => f.write_str("SignatureMismatch"),
+            Self::SignatureMismatch { .. } => f.write_str("SignatureMismatch"),
             Self::UnexpectedSecurityToken { .. } => f
                 .debug_struct("UnexpectedSecurityToken")
                 .field("token", &observability::redacted("security_token"))
@@ -153,8 +171,8 @@ impl std::fmt::Debug for AuthError {
                 .field("header", &observability::escaped(header))
                 .finish(),
             Self::RequestExpired => f.write_str("RequestExpired"),
-            Self::PresignedRequestExpired => f.write_str("PresignedRequestExpired"),
-            Self::RequestNotYetValid => f.write_str("RequestNotYetValid"),
+            Self::PresignedRequestExpired { .. } => f.write_str("PresignedRequestExpired"),
+            Self::RequestNotYetValid { .. } => f.write_str("RequestNotYetValid"),
             Self::UnsignedHeaders { headers } => {
                 let headers: Vec<_> = headers
                     .iter()
@@ -201,4 +219,17 @@ mod tests {
         assert!(debug.contains(r#""x-amz-meta-\nname""#));
         assert!(!debug.contains("x-amz-meta-\nname"));
     }
+}
+
+/// The SigV4 verification inputs AWS echoes in a `SignatureDoesNotMatch`
+/// error body. None of these values are secret: they are the request's own
+/// canonical form and the (wrong) signature the client sent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SignatureMismatchDiagnostics {
+    pub access_key_id: String,
+    pub string_to_sign: String,
+    pub signature_provided: String,
+    /// Absent for POST policy signatures, which have no canonical request;
+    /// chunk signatures echo the seed request's canonical form.
+    pub canonical_request: Option<String>,
 }

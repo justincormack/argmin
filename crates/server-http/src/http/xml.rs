@@ -5,6 +5,7 @@ use crate::coordinator::{
     ListPartsResult, ObjectPartsInfo,
 };
 use crate::error::ServerError;
+use auth::SignatureMismatchDiagnostics;
 use checksum::{ChecksumAlgorithm, ChecksumType, RawChecksum};
 use quick_xml::{escape::unescape, events::Event, Reader};
 #[cfg(test)]
@@ -537,6 +538,168 @@ pub fn malformed_policy_error_xml(
          <HostId>{}</HostId>\
          </Error>",
         xml_escape_text(message),
+        detail,
+        xml_escape(request_id),
+        xml_escape(host_id),
+    )
+}
+
+/// Format an `InvalidChunkSizeError` response naming the chunk at which an
+/// undersized non-final chunk was detected.
+#[must_use]
+pub fn invalid_chunk_size_error_xml(
+    chunk: usize,
+    bad_chunk_size: usize,
+    min_size: usize,
+    request_id: &str,
+    host_id: &str,
+) -> String {
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+         <Error>\
+         <Code>InvalidChunkSizeError</Code>\
+         <Message>Only the last chunk is allowed to have a size less than \
+         {min_size} bytes</Message>\
+         <Chunk>{chunk}</Chunk>\
+         <BadChunkSize>{bad_chunk_size}</BadChunkSize>\
+         <RequestId>{}</RequestId>\
+         <HostId>{}</HostId>\
+         </Error>",
+        xml_escape(request_id),
+        xml_escape(host_id),
+    )
+}
+
+/// Format the unsigned-headers error response, naming the offending
+/// headers.
+#[must_use]
+pub fn headers_not_signed_error_xml(headers: &str, request_id: &str, host_id: &str) -> String {
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+         <Error>\
+         <Code>AccessDenied</Code>\
+         <Message>There were headers present in the request which were not \
+         signed</Message>\
+         <HeadersNotSigned>{}</HeadersNotSigned>\
+         <RequestId>{}</RequestId>\
+         <HostId>{}</HostId>\
+         </Error>",
+        xml_escape(headers),
+        xml_escape(request_id),
+        xml_escape(host_id),
+    )
+}
+
+/// Format the expired-presigned-URL error response. AWS echoes the
+/// X-Amz-Expires value and both the expiry and server clocks.
+#[must_use]
+pub fn presigned_request_expired_error_xml(
+    x_amz_expires: u64,
+    expires_epoch: u64,
+    server_time_epoch: u64,
+    request_id: &str,
+    host_id: &str,
+) -> String {
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+         <Error>\
+         <Code>AccessDenied</Code>\
+         <Message>Request has expired</Message>\
+         <X-Amz-Expires>{}</X-Amz-Expires>\
+         <Expires>{}</Expires>\
+         <ServerTime>{}</ServerTime>\
+         <RequestId>{}</RequestId>\
+         <HostId>{}</HostId>\
+         </Error>",
+        x_amz_expires,
+        format_timestamp_secs(expires_epoch),
+        format_timestamp_secs(server_time_epoch),
+        xml_escape(request_id),
+        xml_escape(host_id),
+    )
+}
+
+/// Format the not-yet-valid presigned URL error response. AWS echoes the
+/// X-Amz-Date as epoch milliseconds plus the would-be expiry and server
+/// clocks.
+#[must_use]
+pub fn request_not_yet_valid_error_xml(
+    amz_date_epoch_millis: u64,
+    expires_epoch: u64,
+    server_time_epoch: u64,
+    request_id: &str,
+    host_id: &str,
+) -> String {
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+         <Error>\
+         <Code>AccessDenied</Code>\
+         <Message>Request is not yet valid</Message>\
+         <X-Amz-Date>{}</X-Amz-Date>\
+         <Expires>{}</Expires>\
+         <ServerTime>{}</ServerTime>\
+         <RequestId>{}</RequestId>\
+         <HostId>{}</HostId>\
+         </Error>",
+        amz_date_epoch_millis,
+        format_timestamp_secs(expires_epoch),
+        format_timestamp_secs(server_time_epoch),
+        xml_escape(request_id),
+        xml_escape(host_id),
+    )
+}
+
+fn hex_byte_dump(text: &str) -> String {
+    text.as_bytes()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Format a `SignatureDoesNotMatch` error response. With diagnostics AWS
+/// echoes the request's own canonical form (none of it secret); POST policy
+/// mismatches carry none.
+#[must_use]
+pub fn signature_does_not_match_error_xml(
+    diagnostics: Option<&SignatureMismatchDiagnostics>,
+    request_id: &str,
+    host_id: &str,
+) -> String {
+    let detail = diagnostics.map_or_else(String::new, |diag| {
+        let canonical =
+            diag.canonical_request
+                .as_deref()
+                .map_or_else(String::new, |canonical_request| {
+                    format!(
+                        "<CanonicalRequest>{}</CanonicalRequest>\
+                     <CanonicalRequestBytes>{}</CanonicalRequestBytes>",
+                        xml_escape_text(canonical_request),
+                        hex_byte_dump(canonical_request),
+                    )
+                });
+        format!(
+            "<AWSAccessKeyId>{}</AWSAccessKeyId>\
+             <StringToSign>{}</StringToSign>\
+             <SignatureProvided>{}</SignatureProvided>\
+             <StringToSignBytes>{}</StringToSignBytes>{}",
+            xml_escape(&diag.access_key_id),
+            xml_escape_text(&diag.string_to_sign),
+            xml_escape(&diag.signature_provided),
+            hex_byte_dump(&diag.string_to_sign),
+            canonical,
+        )
+    });
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+         <Error>\
+         <Code>SignatureDoesNotMatch</Code>\
+         <Message>The request signature we calculated does not match the \
+         signature you provided. Check your key and signing method.</Message>\
+         {}\
+         <RequestId>{}</RequestId>\
+         <HostId>{}</HostId>\
+         </Error>",
         detail,
         xml_escape(request_id),
         xml_escape(host_id),
@@ -3375,6 +3538,18 @@ pub fn copy_part_result_xml(
 }
 
 /// Format a unix millisecond timestamp as ISO 8601.
+/// Format epoch seconds as ISO 8601 with no fractional seconds, the form
+/// AWS uses in presigned-expiry error bodies, e.g. "2026-07-07T20:31:26Z".
+pub(crate) fn format_timestamp_secs(secs: u64) -> String {
+    let days_since_epoch = secs / 86400;
+    let time_of_day = secs % 86400;
+    let hours = time_of_day / 3600;
+    let minutes = (time_of_day % 3600) / 60;
+    let seconds = time_of_day % 60;
+    let (year, month, day) = days_to_date(days_since_epoch as i64);
+    format!("{year:04}-{month:02}-{day:02}T{hours:02}:{minutes:02}:{seconds:02}Z")
+}
+
 pub(crate) fn format_timestamp(millis: u64) -> String {
     let secs = millis / 1000;
     // Simple UTC formatting without pulling in chrono

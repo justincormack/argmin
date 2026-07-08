@@ -131,7 +131,14 @@ pub fn authenticate_post_sigv4(
 
     // Constant-time comparison to prevent timing attacks on signature values.
     if !crate::constant_time_eq(expected_hex.as_bytes(), request.signature_hex.as_bytes()) {
-        return Err(AuthError::SignatureMismatch);
+        return Err(AuthError::SignatureMismatch {
+            diagnostics: Some(Box::new(crate::SignatureMismatchDiagnostics {
+                access_key_id: credential.access_key_id.to_string(),
+                string_to_sign: request.policy_b64.to_string(),
+                signature_provided: request.signature_hex.to_string(),
+                canonical_request: None,
+            })),
+        });
     }
     validate_static_credential_has_no_token(request.security_token)?;
 
@@ -763,7 +770,7 @@ mod tests {
             ExpectedCredentialScope::new(ExpectedSigningRegion::DeferredToBucketRouting, "s3"),
         )
         .unwrap_err();
-        assert!(matches!(err, AuthError::SignatureMismatch));
+        assert!(matches!(err, AuthError::SignatureMismatch { .. }));
     }
 
     #[test]

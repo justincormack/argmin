@@ -6,9 +6,11 @@ use aws_sdk_s3::primitives::ByteStream;
 use ring::hmac;
 use s3_tests::{
     create_public_bucket, object_url, presign_url_with_credentials,
-    presign_url_without_host_signed_header, send_signed_request_with_unsigned_headers,
-    send_signed_request_without_host_signed_header, sse_c_header_values, test_sse_c_key,
-    unique_account_regional_bucket, unique_bucket, PresignedRequest, SignedRequestCredentials, CTX,
+    presign_url_without_host_signed_header, raw_fetch_url,
+    send_signed_request_with_unsigned_headers, send_signed_request_without_host_signed_header,
+    shape::{assert_shape, assert_status_and_body, error_response_headers, expected_error, shape},
+    sse_c_header_values, test_sse_c_key, unique_account_regional_bucket, unique_bucket,
+    PresignedRequest, SignedRequestCredentials, CTX,
 };
 
 const NO_HEADERS: [(&str, &str); 0] = [];
@@ -188,48 +190,54 @@ async fn cleanup(bucket: &str, keys: &[&str]) {
 }
 
 fn assert_headers_not_signed_error(status: u16, body: &str, expected_headers: &str) {
-    assert_eq!(status, 403, "expected 403, got {status}: {body}");
-    assert!(
-        body.contains("<Code>AccessDenied</Code>"),
-        "expected AccessDenied response, got: {body}"
-    );
-    assert!(
-        body.contains(&format!(
-            "<HeadersNotSigned>{expected_headers}</HeadersNotSigned>"
-        )),
-        "expected {expected_headers} in HeadersNotSigned, got: {body}"
+    assert_status_and_body(
+        "headers not signed",
+        status,
+        body,
+        &shape()
+            .status(403)
+            .body(expected_error::headers_not_signed(expected_headers)),
     );
 }
 
 fn assert_invalid_token_error(status: u16, body: &str, token: &str) {
-    assert_eq!(status, 400, "expected 400, got {status}: {body}");
-    assert!(
-        body.contains("<Code>InvalidToken</Code>"),
-        "expected InvalidToken response, got: {body}"
-    );
-    assert!(
-        body.contains("<Message>The provided token is malformed or otherwise invalid.</Message>"),
-        "expected InvalidToken message, got: {body}"
-    );
-    assert!(
-        body.contains(&format!("<Token-0>{token}</Token-0>")),
-        "expected echoed token, got: {body}"
-    );
-    assert!(
-        body.contains("<RequestId>") && body.contains("<HostId>"),
-        "expected AWS error shape with RequestId and HostId, got: {body}"
-    );
-    assert!(
-        !body.contains("<Resource>"),
-        "expected InvalidToken shape without Resource, got: {body}"
+    assert_status_and_body(
+        "invalid token",
+        status,
+        body,
+        &shape().status(400).body(expected_error::invalid_token(
+            "The provided token is malformed or otherwise invalid.",
+            token,
+        )),
     );
 }
 
-fn assert_signature_does_not_match(status: u16, body: &str) {
-    assert_eq!(status, 403, "expected 403, got {status}: {body}");
-    assert!(
-        body.contains("<Code>SignatureDoesNotMatch</Code>"),
-        "expected SignatureDoesNotMatch response, got: {body}"
+/// The full SignatureDoesNotMatch body: the message plus AWS's echo of the
+/// request's own canonical form. The signing inputs vary per request, so
+/// they are pinned as non-empty `{any}` except the caller-known signature.
+const SIGNATURE_MISMATCH_BODY: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+     <Error><Code>SignatureDoesNotMatch</Code>\
+     <Message>The request signature we calculated does not match the \
+     signature you provided. Check your key and signing method.</Message>\
+     <AWSAccessKeyId>{access_key}</AWSAccessKeyId>\
+     <StringToSign>{any}</StringToSign>\
+     <SignatureProvided>{signature_provided}</SignatureProvided>\
+     <StringToSignBytes>{any}</StringToSignBytes>\
+     <CanonicalRequest>{any}</CanonicalRequest>\
+     <CanonicalRequestBytes>{any}</CanonicalRequestBytes>\
+     <RequestId>{request_id}</RequestId>\
+     <HostId>{host_id}</HostId></Error>";
+
+fn assert_signature_does_not_match(status: u16, body: &str, signature_provided: &str) {
+    assert_status_and_body(
+        "signature does not match",
+        status,
+        body,
+        &shape()
+            .status(403)
+            .sub("access_key", CTX.access_key())
+            .sub("signature_provided", signature_provided)
+            .body(SIGNATURE_MISMATCH_BODY),
     );
 }
 
@@ -632,7 +640,7 @@ fn test_presigned_sigv4_bad_signature_with_signed_security_token_reports_signatu
             .expect("transport error");
         let status = response.status().as_u16();
         let body = response.body_mut().read_to_string().unwrap_or_default();
-        assert_signature_does_not_match(status, &body);
+        assert_signature_does_not_match(status, &body, &"0".repeat(64));
 
         cleanup(&bucket, &[key]).await;
     });
@@ -699,7 +707,11 @@ fn test_presigned_sigv4_unsigned_amz_content_sha256_mismatches_signature() {
             .expect("transport error");
         let status = response.status().as_u16();
         let body = response.body_mut().read_to_string().unwrap_or_default();
-        assert_signature_does_not_match(status, &body);
+        let (_, signature) = presigned
+            .uri()
+            .split_once("X-Amz-Signature=")
+            .expect("presigned URL contains a signature");
+        assert_signature_does_not_match(status, &body, signature);
 
         cleanup(&bucket, &["unsigned-amz-presigned-auth"]).await;
     });
@@ -766,32 +778,24 @@ fn test_presigned_sigv4_wrong_region_scope_returns_query_parameters_error() {
             "s3",
         );
 
-        let mut response = agent().get(&presigned).call().expect("transport error");
-        let status = response.status().as_u16();
-        let body = response.body_mut().read_to_string().unwrap();
-        assert_eq!(status, 400, "expected 400, got {status}: {body}");
-        assert!(
-            body.contains("<Code>AuthorizationQueryParametersError</Code>"),
-            "expected AuthorizationQueryParametersError response, got: {body}"
-        );
-        assert!(
-            body.contains(&format!(
-                "<Message>Error parsing the X-Amz-Credential parameter; the region '{wrong_region}' is wrong; expecting '{}'</Message>",
-                CTX.region()
-            )),
-            "expected wrong-region credential message, got: {body}"
-        );
-        assert!(
-            body.contains(&format!("<Region>{}</Region>", CTX.region())),
-            "expected Region element, got: {body}"
-        );
-        assert!(
-            body.contains("<RequestId>") && body.contains("<HostId>"),
-            "expected RequestId and HostId, got: {body}"
-        );
-        assert!(
-            !body.contains("<Resource>"),
-            "did not expect Resource element, got: {body}"
+        assert_shape(
+            "presigned wrong region scope",
+            &raw_fetch_url(&presigned, &[]),
+            &shape()
+                .status(400)
+                .headers(error_response_headers())
+                .sub("wrong_region", wrong_region)
+                .sub("region", CTX.region())
+                .body(
+                    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+                     <Error><Code>AuthorizationQueryParametersError</Code>\
+                     <Message>Error parsing the X-Amz-Credential parameter; \
+                     the region '{wrong_region}' is wrong; expecting \
+                     '{region}'</Message>\
+                     <Region>{region}</Region>\
+                     <RequestId>{request_id}</RequestId>\
+                     <HostId>{host_id}</HostId></Error>",
+                ),
         );
 
         cleanup(&bucket, &[]).await;
@@ -811,39 +815,26 @@ fn test_presigned_sigv4_missing_account_regional_bucket_wrong_region_returns_que
         let presigned =
             presign_object_with_credential_scope("GET", &bucket, "missing-key", wrong_region, "s3");
 
-        let mut response = agent().get(&presigned).call().expect("transport error");
-        let status = response.status().as_u16();
-        let bucket_region = response
-            .headers()
-            .get("x-amz-bucket-region")
-            .and_then(|value| value.to_str().ok())
-            .map(str::to_string);
-        let body = response.body_mut().read_to_string().unwrap();
-
-        assert_eq!(status, 400, "expected 400, got {status}: {body}");
-        assert!(
-            body.contains("<Code>AuthorizationQueryParametersError</Code>"),
-            "expected AuthorizationQueryParametersError response, got: {body}"
-        );
-        assert_eq!(bucket_region.as_deref(), None);
-        assert!(
-            body.contains(&format!(
-                "<Message>Error parsing the X-Amz-Credential parameter; the region '{wrong_region}' is wrong; expecting '{}'</Message>",
-                CTX.region()
-            )),
-            "expected wrong-region credential message, got: {body}"
-        );
-        assert!(
-            body.contains(&format!("<Region>{}</Region>", CTX.region())),
-            "expected Region element, got: {body}"
-        );
-        assert!(
-            body.contains("<RequestId>") && body.contains("<HostId>"),
-            "expected RequestId and HostId, got: {body}"
-        );
-        assert!(
-            !body.contains("<Resource>"),
-            "did not expect Resource element, got: {body}"
+        // The full header-set comparison also pins that no
+        // x-amz-bucket-region header is attached for the missing bucket.
+        assert_shape(
+            "presigned wrong region scope, missing bucket",
+            &raw_fetch_url(&presigned, &[]),
+            &shape()
+                .status(400)
+                .headers(error_response_headers())
+                .sub("wrong_region", wrong_region)
+                .sub("region", CTX.region())
+                .body(
+                    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+                     <Error><Code>AuthorizationQueryParametersError</Code>\
+                     <Message>Error parsing the X-Amz-Credential parameter; \
+                     the region '{wrong_region}' is wrong; expecting \
+                     '{region}'</Message>\
+                     <Region>{region}</Region>\
+                     <RequestId>{request_id}</RequestId>\
+                     <HostId>{host_id}</HostId></Error>",
+                ),
         );
     });
 }
@@ -860,27 +851,18 @@ fn test_presigned_sigv4_wrong_service_scope_returns_query_parameters_error() {
             "execute-api",
         );
 
-        let mut response = agent().get(&presigned).call().expect("transport error");
-        let status = response.status().as_u16();
-        let body = response.body_mut().read_to_string().unwrap();
-        assert_eq!(status, 400, "expected 400, got {status}: {body}");
-        assert!(
-            body.contains("<Code>AuthorizationQueryParametersError</Code>"),
-            "expected AuthorizationQueryParametersError response, got: {body}"
-        );
-        assert!(
-            body.contains(
-                "<Message>Error parsing the X-Amz-Credential parameter; incorrect service \"execute-api\". This endpoint belongs to \"s3\".</Message>"
+        assert_shape(
+            "presigned wrong service scope",
+            &raw_fetch_url(&presigned, &[]),
+            &shape().status(400).headers(error_response_headers()).body(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+                     <Error><Code>AuthorizationQueryParametersError</Code>\
+                     <Message>Error parsing the X-Amz-Credential parameter; \
+                     incorrect service \"execute-api\". This endpoint belongs \
+                     to \"s3\".</Message>\
+                     <RequestId>{request_id}</RequestId>\
+                     <HostId>{host_id}</HostId></Error>",
             ),
-            "expected wrong-service credential message, got: {body}"
-        );
-        assert!(
-            body.contains("<RequestId>") && body.contains("<HostId>"),
-            "expected RequestId and HostId, got: {body}"
-        );
-        assert!(
-            !body.contains("<Resource>") && !body.contains("<Region>"),
-            "did not expect Resource or Region element, got: {body}"
         );
 
         cleanup(&bucket, &[]).await;
@@ -1503,13 +1485,21 @@ fn test_presigned_get_expired() {
         // Wait for it to expire
         std::thread::sleep(Duration::from_secs(2));
 
-        let mut resp = agent()
-            .get(presigned.uri())
-            .call()
-            .expect("transport error");
-        let status = resp.status().as_u16();
-        let _ = resp.body_mut().read_to_string();
-        assert_eq!(status, 403, "expected 403 for expired URL, got {}", status);
+        let response = raw_fetch_url(presigned.uri(), &[]);
+        assert_shape(
+            "expired presigned GET",
+            &response,
+            &shape().status(403).headers(error_response_headers()).body(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+                     <Error><Code>AccessDenied</Code>\
+                     <Message>Request has expired</Message>\
+                     <X-Amz-Expires>1</X-Amz-Expires>\
+                     <Expires>{iso8601}</Expires>\
+                     <ServerTime>{iso8601}</ServerTime>\
+                     <RequestId>{request_id}</RequestId>\
+                     <HostId>{host_id}</HostId></Error>",
+            ),
+        );
 
         cleanup(&bucket, &["obj"]).await;
     });
@@ -1543,16 +1533,22 @@ fn test_presigned_get_bad_signature() {
         );
 
         // Tamper with the signature
-        let url = presigned.uri().to_string();
-        let tampered = url.replace("X-Amz-Signature=", "X-Amz-Signature=0000000000000000");
+        let (prefix, _) = presigned
+            .uri()
+            .split_once("X-Amz-Signature=")
+            .expect("presigned URL contains a signature");
+        let tampered = format!("{prefix}X-Amz-Signature={}", "0".repeat(64));
 
-        let mut resp = agent().get(&tampered).call().expect("transport error");
-        let status = resp.status().as_u16();
-        let _ = resp.body_mut().read_to_string();
-        assert_eq!(
-            status, 403,
-            "expected 403 for bad signature, got {}",
-            status
+        let response = raw_fetch_url(&tampered, &[]);
+        assert_shape(
+            "presigned GET bad signature",
+            &response,
+            &shape()
+                .status(403)
+                .headers(error_response_headers())
+                .sub("access_key", CTX.access_key())
+                .sub("signature_provided", "0".repeat(64))
+                .body(SIGNATURE_MISMATCH_BODY),
         );
 
         cleanup(&bucket, &["obj"]).await;
@@ -1687,13 +1683,18 @@ fn test_presigned_missing_signature() {
             .collect::<Vec<_>>()
             .join("&");
 
-        let mut resp = agent().get(&stripped).call().expect("transport error");
-        let status = resp.status().as_u16();
-        let _ = resp.body_mut().read_to_string();
-        assert!(
-            status >= 400,
-            "expected error for missing signature, got {}",
-            status
+        assert_shape(
+            "presigned GET missing signature",
+            &raw_fetch_url(&stripped, &[]),
+            &shape().status(400).headers(error_response_headers()).body(
+                expected_error::with_host_id(
+                    "AuthorizationQueryParametersError",
+                    "Query-string authentication version 4 requires the \
+                     X-Amz-Algorithm, X-Amz-Credential, X-Amz-Signature, \
+                     X-Amz-Date, X-Amz-SignedHeaders, and X-Amz-Expires \
+                     parameters.",
+                ),
+            ),
         );
 
         cleanup(&bucket, &["obj"]).await;
@@ -1832,14 +1833,17 @@ fn test_object_raw_get_x_amz_expires_out_max_range() {
             .uri()
             .replace("X-Amz-Expires=600", "X-Amz-Expires=604801");
 
-        let mut resp = agent().get(&tampered_url).call().expect("transport error");
-        let status = resp.status().as_u16();
-        let _ = resp.body_mut().read_to_string();
         // Presigned URL validation: expires > 604800 is an auth parameter error → 400
-        assert_eq!(
-            status, 400,
-            "expected 400 for out-of-range expires, got {}",
-            status
+        assert_shape(
+            "presigned GET expires beyond a week",
+            &raw_fetch_url(&tampered_url, &[]),
+            &shape().status(400).headers(error_response_headers()).body(
+                expected_error::with_host_id(
+                    "AuthorizationQueryParametersError",
+                    "X-Amz-Expires must be less than a week (in seconds); that is, \
+                     the given X-Amz-Expires must be less than 604800 seconds",
+                ),
+            ),
         );
 
         cleanup(&bucket, &["obj"]).await;
@@ -1921,11 +1925,21 @@ fn test_object_raw_get_x_amz_expires_out_range_zero() {
             .uri()
             .replace("X-Amz-Expires=600", "X-Amz-Expires=0");
 
-        let mut resp = agent().get(&tampered_url).call().expect("transport error");
-        let status = resp.status().as_u16();
-        let _ = resp.body_mut().read_to_string();
         // Zero expires means immediately expired → auth expiry
-        assert_eq!(status, 403, "expected 403 for zero expires, got {}", status);
+        assert_shape(
+            "presigned GET zero expires",
+            &raw_fetch_url(&tampered_url, &[]),
+            &shape().status(403).headers(error_response_headers()).body(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+                     <Error><Code>AccessDenied</Code>\
+                     <Message>Request has expired</Message>\
+                     <X-Amz-Expires>0</X-Amz-Expires>\
+                     <Expires>{iso8601}</Expires>\
+                     <ServerTime>{iso8601}</ServerTime>\
+                     <RequestId>{request_id}</RequestId>\
+                     <HostId>{host_id}</HostId></Error>",
+            ),
+        );
 
         cleanup(&bucket, &["obj"]).await;
     });
@@ -1955,32 +1969,20 @@ fn test_object_raw_get_x_amz_epoch_date_is_expired() {
             "19700101T000000Z",
         );
 
-        let mut resp = agent().get(&presigned_url).call().expect("transport error");
-        let status = resp.status().as_u16();
-        let body = resp.body_mut().read_to_string().unwrap();
-        assert_eq!(
-            status, 403,
-            "expected 403 for epoch-dated presigned URL, got {status}: {body}"
-        );
-        assert!(
-            body.contains("<Code>AccessDenied</Code>"),
-            "expected AccessDenied response, got: {body}"
-        );
-        assert!(
-            body.contains("<Message>Request has expired</Message>"),
-            "expected expired response, got: {body}"
-        );
-        assert!(
-            body.contains("<RequestId>"),
-            "expected RequestId in expired response, got: {body}"
-        );
-        assert!(
-            body.contains("<HostId>"),
-            "expected HostId in expired response, got: {body}"
-        );
-        assert!(
-            !body.contains("<Resource>"),
-            "expected no Resource element in expired response, got: {body}"
+        // Epoch X-Amz-Date plus 1-second expiry pins the exact Expires time.
+        assert_shape(
+            "presigned GET epoch date expired",
+            &raw_fetch_url(&presigned_url, &[]),
+            &shape().status(403).headers(error_response_headers()).body(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+                     <Error><Code>AccessDenied</Code>\
+                     <Message>Request has expired</Message>\
+                     <X-Amz-Expires>1</X-Amz-Expires>\
+                     <Expires>1970-01-01T00:00:01Z</Expires>\
+                     <ServerTime>{iso8601}</ServerTime>\
+                     <RequestId>{request_id}</RequestId>\
+                     <HostId>{host_id}</HostId></Error>",
+            ),
         );
 
         cleanup(&bucket, &["obj"]).await;
@@ -2011,32 +2013,21 @@ fn test_object_raw_get_x_amz_future_date_is_not_valid_yet() {
             "21000101T000000Z",
         );
 
-        let mut resp = agent().get(&presigned_url).call().expect("transport error");
-        let status = resp.status().as_u16();
-        let body = resp.body_mut().read_to_string().unwrap();
-        assert_eq!(
-            status, 403,
-            "expected 403 for future-dated presigned URL, got {status}: {body}"
-        );
-        assert!(
-            body.contains("<Code>AccessDenied</Code>"),
-            "expected AccessDenied response, got: {body}"
-        );
-        assert!(
-            body.contains("<Message>Request is not yet valid</Message>"),
-            "expected not-yet-valid response, got: {body}"
-        );
-        assert!(
-            body.contains("<RequestId>"),
-            "expected RequestId in not-yet-valid response, got: {body}"
-        );
-        assert!(
-            body.contains("<HostId>"),
-            "expected HostId in not-yet-valid response, got: {body}"
-        );
-        assert!(
-            !body.contains("<Resource>"),
-            "expected no Resource element in not-yet-valid response, got: {body}"
+        // 21000101T000000Z is epoch 4102444800; AWS echoes it in epoch
+        // milliseconds plus the would-be expiry (900s later).
+        assert_shape(
+            "presigned GET future date not yet valid",
+            &raw_fetch_url(&presigned_url, &[]),
+            &shape().status(403).headers(error_response_headers()).body(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+                     <Error><Code>AccessDenied</Code>\
+                     <Message>Request is not yet valid</Message>\
+                     <X-Amz-Date>4102444800000</X-Amz-Date>\
+                     <Expires>2100-01-01T00:15:00Z</Expires>\
+                     <ServerTime>{iso8601}</ServerTime>\
+                     <RequestId>{request_id}</RequestId>\
+                     <HostId>{host_id}</HostId></Error>",
+            ),
         );
 
         cleanup(&bucket, &["obj"]).await;
@@ -2067,9 +2058,23 @@ fn test_object_raw_put_authenticated_expired() {
             .send(b"data" as &[u8])
             .expect("transport error");
         let status = resp.status().as_u16();
-        let _ = resp.body_mut().read_to_string();
-        // Expired presigned URL → auth expiry
-        assert_eq!(status, 403, "expected 403 for expired PUT, got {}", status);
+        let body = resp.body_mut().read_to_string().unwrap_or_default();
+        // Expired presigned URL → auth expiry with the full expired shape.
+        assert_status_and_body(
+            "expired presigned PUT",
+            status,
+            &body,
+            &shape().status(403).body(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+                 <Error><Code>AccessDenied</Code>\
+                 <Message>Request has expired</Message>\
+                 <X-Amz-Expires>1</X-Amz-Expires>\
+                 <Expires>{iso8601}</Expires>\
+                 <ServerTime>{iso8601}</ServerTime>\
+                 <RequestId>{request_id}</RequestId>\
+                 <HostId>{host_id}</HostId></Error>",
+            ),
+        );
 
         cleanup(&bucket, &[]).await;
     });

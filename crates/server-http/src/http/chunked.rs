@@ -313,7 +313,16 @@ fn verify_chunk_signature_hash(
     let expected_hex = hex_encode(expected.as_ref());
 
     if !auth::constant_time_eq(expected_hex.as_bytes(), claimed_sig.as_bytes()) {
-        return Err(ServerError::Auth(auth::AuthError::SignatureMismatch));
+        // AWS echoes the chunk string-to-sign and the seed request's
+        // canonical request in chunk-signature mismatch bodies.
+        return Err(ServerError::Auth(auth::AuthError::SignatureMismatch {
+            diagnostics: Some(Box::new(auth::SignatureMismatchDiagnostics {
+                access_key_id: ctx.access_key_id.clone(),
+                string_to_sign,
+                signature_provided: claimed_sig.to_string(),
+                canonical_request: Some(ctx.seed_canonical_request.clone()),
+            })),
+        }));
     }
     Ok(())
 }
@@ -372,7 +381,16 @@ fn verify_trailer_signature(
     let expected_hex = hex_encode(expected.as_ref());
 
     if !auth::constant_time_eq(expected_hex.as_bytes(), claimed_sig.as_bytes()) {
-        return Err(ServerError::Auth(auth::AuthError::SignatureMismatch));
+        // AWS echoes the chunk string-to-sign and the seed request's
+        // canonical request in chunk-signature mismatch bodies.
+        return Err(ServerError::Auth(auth::AuthError::SignatureMismatch {
+            diagnostics: Some(Box::new(auth::SignatureMismatchDiagnostics {
+                access_key_id: ctx.access_key_id.clone(),
+                string_to_sign,
+                signature_provided: claimed_sig.to_string(),
+                canonical_request: Some(ctx.seed_canonical_request.clone()),
+            })),
+        }));
     }
     Ok(())
 }
@@ -784,6 +802,9 @@ mod tests {
             seed_signature: seed_sig.to_string(),
             scope: scope.clone(),
             timestamp: timestamp.to_string(),
+            access_key_id: "AKIDEXAMPLE".to_string(),
+            seed_canonical_request:
+                "PUT\\n/\\n\\nhost:h\\n\\nhost\\nSTREAMING-AWS4-HMAC-SHA256-PAYLOAD".to_string(),
         };
 
         // Compute chunk signature.
@@ -817,6 +838,9 @@ mod tests {
             seed_signature: "0".repeat(64),
             scope: "20130524/us-east-1/s3/aws4_request".to_string(),
             timestamp: "20130524T000000Z".to_string(),
+            access_key_id: "AKIDEXAMPLE".to_string(),
+            seed_canonical_request: "PUT\n/\n\nhost:h\n\nhost\nSTREAMING-AWS4-HMAC-SHA256-PAYLOAD"
+                .to_string(),
         };
 
         let wire = format!(
@@ -828,7 +852,7 @@ mod tests {
         let err = decode_chunked_body(wire.as_bytes(), Some(&ctx), false).unwrap_err();
         assert!(matches!(
             err,
-            ServerError::Auth(auth::AuthError::SignatureMismatch)
+            ServerError::Auth(auth::AuthError::SignatureMismatch { .. })
         ));
     }
 
@@ -840,6 +864,9 @@ mod tests {
             seed_signature: "0".repeat(64),
             scope: "20130524/us-east-1/s3/aws4_request".to_string(),
             timestamp: "20130524T000000Z".to_string(),
+            access_key_id: "AKIDEXAMPLE".to_string(),
+            seed_canonical_request: "PUT\n/\n\nhost:h\n\nhost\nSTREAMING-AWS4-HMAC-SHA256-PAYLOAD"
+                .to_string(),
         };
 
         // No chunk-signature on data chunk.
@@ -874,6 +901,9 @@ mod tests {
             seed_signature: seed_sig.to_string(),
             scope: scope.clone(),
             timestamp: timestamp.to_string(),
+            access_key_id: "AKIDEXAMPLE".to_string(),
+            seed_canonical_request:
+                "PUT\\n/\\n\\nhost:h\\n\\nhost\\nSTREAMING-AWS4-HMAC-SHA256-PAYLOAD".to_string(),
         };
 
         let empty_hash = auth::canonical::sha256_hex(b"");
@@ -938,6 +968,9 @@ mod tests {
             seed_signature: seed_sig.to_string(),
             scope: scope.clone(),
             timestamp: timestamp.to_string(),
+            access_key_id: "AKIDEXAMPLE".to_string(),
+            seed_canonical_request:
+                "PUT\\n/\\n\\nhost:h\\n\\nhost\\nSTREAMING-AWS4-HMAC-SHA256-PAYLOAD".to_string(),
         };
 
         let empty_hash = auth::canonical::sha256_hex(b"");
@@ -965,7 +998,7 @@ mod tests {
         let err = decode_chunked_body(wire.as_bytes(), Some(&ctx), true).unwrap_err();
         assert!(matches!(
             err,
-            ServerError::Auth(auth::AuthError::SignatureMismatch)
+            ServerError::Auth(auth::AuthError::SignatureMismatch { .. })
         ));
     }
 
@@ -1156,6 +1189,9 @@ mod tests {
             seed_signature: seed_sig.to_string(),
             scope: scope.clone(),
             timestamp: timestamp.to_string(),
+            access_key_id: "AKIDEXAMPLE".to_string(),
+            seed_canonical_request:
+                "PUT\\n/\\n\\nhost:h\\n\\nhost\\nSTREAMING-AWS4-HMAC-SHA256-PAYLOAD".to_string(),
         };
 
         let empty_hash = auth::canonical::sha256_hex(b"");

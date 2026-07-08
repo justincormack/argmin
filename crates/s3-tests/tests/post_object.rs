@@ -2192,8 +2192,32 @@ fn test_post_object_invalid_signature() {
             ),
         ];
 
-        let (status, _) = post_object(&bucket, &fields, b"data", "test.txt");
-        assert_eq!(status, 403, "expected 403, got {}", status);
+        // POST policy mismatches echo the policy itself as the
+        // string-to-sign and carry no canonical request (AWS probed).
+        let (status, body) = post_object(&bucket, &fields, b"data", "test.txt");
+        s3_tests::shape::assert_status_and_body(
+            "PostObject invalid signature",
+            status,
+            &body,
+            &shape()
+                .status(403)
+                .sub("access_key", CTX.access_key())
+                .sub("policy", &policy_b64)
+                .sub("signature_provided", "0".repeat(64))
+                .body(
+                    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+                     <Error><Code>SignatureDoesNotMatch</Code>\
+                     <Message>The request signature we calculated does not match \
+                     the signature you provided. Check your key and signing \
+                     method.</Message>\
+                     <AWSAccessKeyId>{access_key}</AWSAccessKeyId>\
+                     <StringToSign>{policy}</StringToSign>\
+                     <SignatureProvided>{signature_provided}</SignatureProvided>\
+                     <StringToSignBytes>{any}</StringToSignBytes>\
+                     <RequestId>{request_id}</RequestId>\
+                     <HostId>{host_id}</HostId></Error>",
+                ),
+        );
 
         s3_tests::delete_bucket_retrying_operation_aborted(CTX.client(), &bucket).await;
     });

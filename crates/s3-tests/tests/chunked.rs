@@ -4,7 +4,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use aws_sdk_s3::Client;
 use ring::{digest, hmac};
 use s3_tests::{
-    assert_s3_err_code, build_client_with_ca, build_test_agent, unique_bucket, TestServer, CTX,
+    assert_s3_err_code, build_client_with_ca, build_test_agent, shape::expected_error,
+    unique_bucket, TestServer, CTX,
 };
 
 // ── Helpers ─────────────────────────────────────────────────────────────
@@ -28,13 +29,47 @@ async fn cleanup(bucket: &str, keys: &[&str]) {
     s3_tests::delete_bucket_retrying_operation_aborted(client, bucket).await;
 }
 
-fn assert_error_code(body: &str, code: &str) {
-    let expected = format!("<Code>{}</Code>", code);
-    assert!(
-        body.contains(&expected),
-        "expected {} in body: {}",
-        expected,
-        body
+/// The AWS message for unsupported x-amz-content-sha256 streaming tokens.
+const STREAMING_TOKEN_MESSAGE: &str = "x-amz-content-sha256 must be UNSIGNED-PAYLOAD, \
+     STREAMING-UNSIGNED-PAYLOAD-TRAILER, STREAMING-AWS4-HMAC-SHA256-PAYLOAD, \
+     STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER, STREAMING-AWS4-ECDSA-P256-SHA256-PAYLOAD, \
+     STREAMING-AWS4-ECDSA-P256-SHA256-PAYLOAD-TRAILER or a valid sha256 value.";
+
+/// Assert the full error body template; callers assert the status.
+fn assert_error_body(body: &str, expected_template: String) {
+    s3_tests::shape::assert_status_and_body(
+        "chunked error body",
+        0,
+        body,
+        &s3_tests::shape::shape().body(expected_template),
+    );
+}
+
+/// Full SignatureDoesNotMatch body for chunk/trailer/seed mismatches: the
+/// diagnostic echo varies per request so the signing inputs are pinned as
+/// non-empty `{any}`.
+fn assert_signature_mismatch_body(body: &str) {
+    s3_tests::shape::assert_status_and_body(
+        "chunked signature mismatch body",
+        0,
+        body,
+        &s3_tests::shape::shape()
+            .sub("access_key", CTX.access_key())
+            .body(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+                 <Error><Code>SignatureDoesNotMatch</Code>\
+                 <Message>The request signature we calculated does not match \
+                 the signature you provided. Check your key and signing \
+                 method.</Message>\
+                 <AWSAccessKeyId>{access_key}</AWSAccessKeyId>\
+                 <StringToSign>{any}</StringToSign>\
+                 <SignatureProvided>{any}</SignatureProvided>\
+                 <StringToSignBytes>{any}</StringToSignBytes>\
+                 <CanonicalRequest>{any}</CanonicalRequest>\
+                 <CanonicalRequestBytes>{any}</CanonicalRequestBytes>\
+                 <RequestId>{request_id}</RequestId>\
+                 <HostId>{host_id}</HostId></Error>",
+            ),
     );
 }
 
@@ -811,7 +846,14 @@ fn test_unsigned_chunked_legacy_token_rejected() {
         let status = resp.status().as_u16();
         let body_str = resp.body_mut().read_to_string().unwrap_or_default();
         assert_eq!(status, 400, "expected 400, got {}: {}", status, body_str);
-        assert_error_code(&body_str, "InvalidArgument");
+        assert_error_body(
+            &body_str,
+            expected_error::invalid_argument_with_value(
+                STREAMING_TOKEN_MESSAGE,
+                "x-amz-content-sha256",
+                "STREAMING-UNSIGNED-PAYLOAD",
+            ),
+        );
 
         cleanup(&bucket, &[]).await;
     });
@@ -1021,8 +1063,32 @@ fn test_signed_chunked_bad_signature() {
             .expect("transport error");
         let status = resp.status().as_u16();
         let body_str = resp.body_mut().read_to_string().unwrap_or_default();
-        assert_eq!(status, 403, "expected 403, got {}: {}", status, body_str);
-        assert_error_code(&body_str, "SignatureDoesNotMatch");
+        // Chunk-signature mismatches echo the chunk string-to-sign and the
+        // seed request's canonical request (AWS probed).
+        s3_tests::shape::assert_status_and_body(
+            "chunked PUT bad chunk signature",
+            status,
+            &body_str,
+            &s3_tests::shape::shape()
+                .status(403)
+                .sub("access_key", CTX.access_key())
+                .sub("signature_provided", bad_sig.as_str())
+                .body(
+                    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+                     <Error><Code>SignatureDoesNotMatch</Code>\
+                     <Message>The request signature we calculated does not match \
+                     the signature you provided. Check your key and signing \
+                     method.</Message>\
+                     <AWSAccessKeyId>{access_key}</AWSAccessKeyId>\
+                     <StringToSign>{any}</StringToSign>\
+                     <SignatureProvided>{signature_provided}</SignatureProvided>\
+                     <StringToSignBytes>{any}</StringToSignBytes>\
+                     <CanonicalRequest>{any}</CanonicalRequest>\
+                     <CanonicalRequestBytes>{any}</CanonicalRequestBytes>\
+                     <RequestId>{request_id}</RequestId>\
+                     <HostId>{host_id}</HostId></Error>",
+                ),
+        );
 
         assert_object_not_committed(&bucket, "bad-sig").await;
         cleanup(&bucket, &[]).await;
@@ -1055,7 +1121,7 @@ fn test_signed_chunked_bad_terminal_signature_not_committed() {
         let status = resp.status().as_u16();
         let body_str = resp.body_mut().read_to_string().unwrap_or_default();
         assert_eq!(status, 403, "expected 403, got {}: {}", status, body_str);
-        assert_error_code(&body_str, "SignatureDoesNotMatch");
+        assert_signature_mismatch_body(&body_str);
 
         assert_object_not_committed(&bucket, key).await;
         cleanup(&bucket, &[]).await;
@@ -1551,7 +1617,7 @@ fn test_signed_chunked_trailing_checksum_bad_trailer_sig() {
         let status = resp.status().as_u16();
         let body_str = resp.body_mut().read_to_string().unwrap_or_default();
         assert_eq!(status, 403, "expected 403, got {}: {}", status, body_str);
-        assert_error_code(&body_str, "SignatureDoesNotMatch");
+        assert_signature_mismatch_body(&body_str);
 
         cleanup(&bucket, &[]).await;
     });
@@ -1665,7 +1731,13 @@ fn test_unsigned_trailing_checksum_bad_value() {
         let status = resp.status().as_u16();
         let body_str = resp.body_mut().read_to_string().unwrap_or_default();
         assert_eq!(status, 400, "expected 400, got {}: {}", status, body_str);
-        assert_error_code(&body_str, "BadDigest");
+        assert_error_body(
+            &body_str,
+            expected_error::with_host_id(
+                "BadDigest",
+                "The CRC32 you specified did not match the calculated checksum.",
+            ),
+        );
 
         cleanup(&bucket, &[]).await;
     });
@@ -1816,7 +1888,7 @@ fn test_signed_chunked_small_non_final_chunk_rejected() {
         let status = resp.status().as_u16();
         let body_str = resp.body_mut().read_to_string().unwrap_or_default();
         assert_eq!(status, 403, "expected 403, got {}: {}", status, body_str);
-        assert_error_code(&body_str, "InvalidChunkSizeError");
+        assert_error_body(&body_str, expected_error::invalid_chunk_size(2, 5));
 
         assert_object_not_committed(&bucket, "small-chunk").await;
         cleanup(&bucket, &[]).await;
@@ -1879,7 +1951,7 @@ fn test_signed_multi_chunk_bad_middle_signature() {
         let status = resp.status().as_u16();
         let body_str = resp.body_mut().read_to_string().unwrap_or_default();
         assert_eq!(status, 403, "expected 403, got {}: {}", status, body_str);
-        assert_error_code(&body_str, "SignatureDoesNotMatch");
+        assert_signature_mismatch_body(&body_str);
 
         assert_object_not_committed(&bucket, "bad-middle-sig").await;
         cleanup(&bucket, &[]).await;
@@ -2076,7 +2148,7 @@ fn test_streaming_missing_content_encoding() {
         let status = resp.status().as_u16();
         let body_str = resp.body_mut().read_to_string().unwrap_or_default();
         assert_eq!(status, 400, "expected 400, got {}: {}", status, body_str);
-        assert_error_code(&body_str, "MalformedTrailerError");
+        assert_error_body(&body_str, expected_error::with_host_id("MalformedTrailerError", "The request contained trailing data that was not well-formed or did not conform to our published schema."));
 
         cleanup(&bucket, &[]).await;
     });
@@ -2117,7 +2189,7 @@ fn test_streaming_wrong_content_encoding() {
         let status = resp.status().as_u16();
         let body_str = resp.body_mut().read_to_string().unwrap_or_default();
         assert_eq!(status, 400, "expected 400, got {}: {}", status, body_str);
-        assert_error_code(&body_str, "MalformedTrailerError");
+        assert_error_body(&body_str, expected_error::with_host_id("MalformedTrailerError", "The request contained trailing data that was not well-formed or did not conform to our published schema."));
 
         cleanup(&bucket, &[]).await;
     });
@@ -2158,7 +2230,13 @@ fn test_streaming_missing_decoded_content_length() {
         let status = resp.status().as_u16();
         let body_str = resp.body_mut().read_to_string().unwrap_or_default();
         assert_eq!(status, 411, "expected 411, got {}: {}", status, body_str);
-        assert_error_code(&body_str, "MissingContentLength");
+        assert_error_body(
+            &body_str,
+            expected_error::with_host_id(
+                "MissingContentLength",
+                "You must provide the Content-Length HTTP header.",
+            ),
+        );
 
         cleanup(&bucket, &[]).await;
     });
@@ -2198,7 +2276,14 @@ fn test_streaming_unsupported_token() {
         let status = resp.status().as_u16();
         let body_str = resp.body_mut().read_to_string().unwrap_or_default();
         assert_eq!(status, 400, "expected 400, got {}: {}", status, body_str);
-        assert_error_code(&body_str, "InvalidArgument");
+        assert_error_body(
+            &body_str,
+            expected_error::invalid_argument_with_value(
+                STREAMING_TOKEN_MESSAGE,
+                "x-amz-content-sha256",
+                "STREAMING-UNKNOWN-ALGORITHM",
+            ),
+        );
 
         cleanup(&bucket, &[]).await;
     });
@@ -2238,7 +2323,7 @@ fn test_trailer_present_without_declaration() {
         let status = resp.status().as_u16();
         let body_str = resp.body_mut().read_to_string().unwrap_or_default();
         assert_eq!(status, 400, "expected 400, got {}: {}", status, body_str);
-        assert_error_code(&body_str, "MalformedTrailerError");
+        assert_error_body(&body_str, expected_error::with_host_id("MalformedTrailerError", "The request contained trailing data that was not well-formed or did not conform to our published schema."));
 
         cleanup(&bucket, &[]).await;
     });
@@ -2277,7 +2362,7 @@ fn test_declared_trailer_missing_from_body() {
         let status = resp.status().as_u16();
         let body_str = resp.body_mut().read_to_string().unwrap_or_default();
         assert_eq!(status, 400, "expected 400, got {}: {}", status, body_str);
-        assert_error_code(&body_str, "MalformedTrailerError");
+        assert_error_body(&body_str, expected_error::with_host_id("MalformedTrailerError", "The request contained trailing data that was not well-formed or did not conform to our published schema."));
 
         cleanup(&bucket, &[]).await;
     });
@@ -2321,7 +2406,7 @@ fn test_undeclared_trailer_in_body() {
         let status = resp.status().as_u16();
         let body_str = resp.body_mut().read_to_string().unwrap_or_default();
         assert_eq!(status, 400, "expected 400, got {}: {}", status, body_str);
-        assert_error_code(&body_str, "MalformedTrailerError");
+        assert_error_body(&body_str, expected_error::with_host_id("MalformedTrailerError", "The request contained trailing data that was not well-formed or did not conform to our published schema."));
 
         cleanup(&bucket, &[]).await;
     });
@@ -2377,7 +2462,13 @@ fn test_non_trailer_mode_with_trailers() {
         let status = resp.status().as_u16();
         let body_str = resp.body_mut().read_to_string().unwrap_or_default();
         assert_eq!(status, 400, "expected 400, got {}: {}", status, body_str);
-        assert_error_code(&body_str, "IncompleteBody");
+        assert_error_body(
+            &body_str,
+            expected_error::with_host_id(
+                "IncompleteBody",
+                "The request body terminated unexpectedly",
+            ),
+        );
 
         cleanup(&bucket, &[]).await;
     });
@@ -2425,7 +2516,13 @@ fn test_malformed_trailer_line_rejected() {
         let status = resp.status().as_u16();
         let body_str = resp.body_mut().read_to_string().unwrap_or_default();
         assert_eq!(status, 400, "expected 400, got {}: {}", status, body_str);
-        assert_error_code(&body_str, "IncompleteBody");
+        assert_error_body(
+            &body_str,
+            expected_error::with_host_id(
+                "IncompleteBody",
+                "The request body terminated unexpectedly",
+            ),
+        );
 
         cleanup(&bucket, &[]).await;
     });
@@ -2533,7 +2630,13 @@ fn test_streaming_inline_checksum_crc32_bad_digest() {
             Some(("x-amz-checksum-crc32", "AAAA/w==")),
         );
         assert_eq!(status, 400, "expected 400, got {}: {}", status, body_str);
-        assert_error_code(&body_str, "BadDigest");
+        assert_error_body(
+            &body_str,
+            expected_error::with_host_id(
+                "BadDigest",
+                "The CRC32 you specified did not match the calculated checksum.",
+            ),
+        );
 
         cleanup(&bucket, &[]).await;
     });
@@ -2574,7 +2677,13 @@ fn test_streaming_inline_checksum_crc32c_bad_digest() {
             Some(("x-amz-checksum-crc32c", "AAAA/w==")),
         );
         assert_eq!(status, 400, "expected 400, got {}: {}", status, body_str);
-        assert_error_code(&body_str, "BadDigest");
+        assert_error_body(
+            &body_str,
+            expected_error::with_host_id(
+                "BadDigest",
+                "The CRC32C you specified did not match the calculated checksum.",
+            ),
+        );
 
         cleanup(&bucket, &[]).await;
     });
@@ -2619,7 +2728,13 @@ fn test_streaming_inline_checksum_sha256_bad_digest() {
             Some(("x-amz-checksum-sha256", &sha_b64)),
         );
         assert_eq!(status, 400, "expected 400, got {}: {}", status, body_str);
-        assert_error_code(&body_str, "BadDigest");
+        assert_error_body(
+            &body_str,
+            expected_error::with_host_id(
+                "BadDigest",
+                "The SHA256 you specified did not match the calculated checksum.",
+            ),
+        );
 
         cleanup(&bucket, &[]).await;
     });
@@ -2678,7 +2793,13 @@ fn test_inline_plus_trailing_checksum_rejected() {
 
         // AWS rejects with: InvalidRequest: Expecting a single x-amz-checksum- header
         assert_eq!(status, 400, "expected 400, got {}: {}", status, body_str);
-        assert_error_code(&body_str, "InvalidRequest");
+        assert_error_body(
+            &body_str,
+            expected_error::with_host_id(
+                "InvalidRequest",
+                "Expecting a single x-amz-checksum- header",
+            ),
+        );
 
         cleanup(&bucket, &[]).await;
     });
@@ -2732,7 +2853,13 @@ fn test_inline_plus_trailing_checksum_rejected_mixed_case() {
         let body_str = resp.body_mut().read_to_string().unwrap_or_default();
 
         assert_eq!(status, 400, "expected 400, got {}: {}", status, body_str);
-        assert_error_code(&body_str, "InvalidRequest");
+        assert_error_body(
+            &body_str,
+            expected_error::with_host_id(
+                "InvalidRequest",
+                "Expecting a single x-amz-checksum- header",
+            ),
+        );
 
         cleanup(&bucket, &[]).await;
     });
@@ -2867,7 +2994,7 @@ fn test_signed_chunked_upload_part_bad_terminal_signature_not_staged() {
         let status = resp.status().as_u16();
         let body_str = resp.body_mut().read_to_string().unwrap_or_default();
         assert_eq!(status, 403, "expected 403, got {}: {}", status, body_str);
-        assert_error_code(&body_str, "SignatureDoesNotMatch");
+        assert_signature_mismatch_body(&body_str);
 
         let listed = client
             .list_parts()
@@ -3040,7 +3167,13 @@ fn test_signed_chunked_missing_trailer_signature() {
         let status = resp.status().as_u16();
         let body_str = resp.body_mut().read_to_string().unwrap_or_default();
         assert_eq!(status, 400, "expected 400, got {}: {}", status, body_str);
-        assert_error_code(&body_str, "IncompleteBody");
+        assert_error_body(
+            &body_str,
+            expected_error::with_host_id(
+                "IncompleteBody",
+                "The request body terminated unexpectedly",
+            ),
+        );
 
         cleanup(&bucket, &[]).await;
     });
@@ -3114,7 +3247,7 @@ fn test_signed_chunked_bad_trailer_signature() {
         let status = resp.status().as_u16();
         let body_str = resp.body_mut().read_to_string().unwrap_or_default();
         assert_eq!(status, 403, "expected 403, got {}: {}", status, body_str);
-        assert_error_code(&body_str, "SignatureDoesNotMatch");
+        assert_signature_mismatch_body(&body_str);
 
         cleanup(&bucket, &[]).await;
     });

@@ -504,6 +504,50 @@ diff-test coverage either, so their shapes have never been AWS-pinned):
 6. **Presigned and chunked-upload error shapes** — `presigned.rs` and
    `chunked.rs` use `contains` checks on bodies; the SigV4 error family
    is only partially shaped (pilot covered two cases).
+   **DONE (slice 4, 2026-07-08)** — chunked.rs turned out to already be
+   strong (one `contains`); presigned.rs (33 `contains`, 0 shapes) is
+   now fully shaped. AWS probing found five divergences, fixed
+   server-side: SignatureDoesNotMatch now carries AWS's diagnostic echo
+   (AWSAccessKeyId, StringToSign, SignatureProvided, hex byte dumps,
+   CanonicalRequest) threaded from both SigV4 verifiers via
+   `AuthError::SignatureMismatch { diagnostics }` (POST policy and
+   chunk-signature mismatches carry none — their AWS shapes are
+   unprobed); expired presigned URLs echo X-Amz-Expires/Expires/
+   ServerTime (no-millis ISO); missing query auth parameters use AWS's
+   fixed all-parameters sentence and over-week X-Amz-Expires its
+   dedicated message, both in HostId-style bodies; HeadersNotSigned
+   dropped its Resource element. The three shared assert helpers now
+   pin full bodies (via new `assert_status_and_body` for ureq paths),
+   and the probed cases pin headers too via `raw_fetch_url`. The whole
+   41-test presigned binary is AWS-validated.
+   **Follow-up (review findings, 2026-07-08)**: the POST-policy and
+   chunk-signature mismatch bodies were then probed too — both carry
+   diagnostics (POST echoes the policy as StringToSign with no
+   CanonicalRequest; chunk mismatches echo the chunk string-to-sign
+   plus the seed request's canonical request, so
+   `StreamingSigningContext` now carries the access key and seed
+   canonical request) — and the not-yet-valid presigned body gained
+   AWS's X-Amz-Date (epoch millis)/Expires/ServerTime elements. The
+   epoch-date/future-date/POST/chunk tests are full goldens now, all
+   AWS-validated. **Follow-up 2 (review findings, 2026-07-08)**: the earlier "chunked
+   was already strong" note was wrong — its 24 `assert_error_code`
+   sites pinned codes only. A full-body probe of every chunked error
+   family (running a patched copy of the binary against AWS) confirmed
+   the trailer-signature diagnostic render (AWS echoes the
+   AWS4-HMAC-SHA256-TRAILER string-to-sign plus the seed canonical
+   request) and found five more divergences, fixed: IncompleteBody
+   ("The request body terminated unexpectedly"), MissingContentLength
+   ("You must provide the Content-Length HTTP header."),
+   MalformedTrailerError (one fixed AWS sentence for all variants),
+   InvalidChunkSizeError (AWS message plus `<Chunk>`/`<BadChunkSize>`,
+   where Chunk is the 1-based detection chunk), and unsupported
+   streaming tokens (dedicated `UnsupportedStreamingToken` rendering
+   AWS's token-list message with ArgumentName/ArgumentValue); the
+   checksum-header InvalidRequest moved to the HostId body via
+   `InvalidRequestHostId`. All 24 sites now pin full bodies, and the
+   expired presigned PUT pins the full expired shape. Both the 47-test
+   chunked and 41-test presigned binaries are AWS-validated. Still
+   unprobed: the non-numeric X-Amz-Expires message.
 7. **Malformed-XML request errors** — `malformed_xml.rs` body checks are
    `contains`-based; `MalformedXML` bodies carry no declaration (like
    the multipart errors) and would anchor cheaply.

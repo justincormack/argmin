@@ -61,6 +61,11 @@ pub struct StreamingSigningContext {
     pub scope: String,
     /// The request timestamp (e.g. "20130524T000000Z").
     pub timestamp: String,
+    /// The access key, echoed in chunk SignatureDoesNotMatch bodies.
+    pub access_key_id: String,
+    /// The seed request's canonical request, echoed in chunk
+    /// SignatureDoesNotMatch bodies like AWS does.
+    pub seed_canonical_request: String,
 }
 
 impl std::fmt::Debug for StreamingSigningContext {
@@ -73,6 +78,14 @@ impl std::fmt::Debug for StreamingSigningContext {
             )
             .field("scope", &observability::escaped(&self.scope))
             .field("timestamp", &observability::escaped(&self.timestamp))
+            .field(
+                "access_key_id",
+                &observability::escaped(&self.access_key_id),
+            )
+            .field(
+                "seed_canonical_request",
+                &observability::escaped(&self.seed_canonical_request),
+            )
             .finish()
     }
 }
@@ -317,7 +330,7 @@ fn authenticate_header<H: HeaderSource + ?Sized>(
         Some(hash) => Cow::Borrowed(hash),
         None => Cow::Owned(sha256_hex(body)),
     };
-    let record = verify_request_record(
+    let (record, seed_canonical_request) = verify_request_record(
         VerifyRequestRecordInput {
             method,
             uri: path,
@@ -358,6 +371,8 @@ fn authenticate_header<H: HeaderSource + ?Sized>(
             seed_signature: signature,
             scope,
             timestamp,
+            access_key_id: credential.access_key_id.clone(),
+            seed_canonical_request,
         })
     } else {
         None
@@ -471,10 +486,18 @@ fn authenticate_presigned<H: HeaderSource + ?Sized>(
         });
     }
     if request_epoch > now_epoch_secs.saturating_add(crate::SIGV4_CLOCK_SKEW_SECS) {
-        return Err(AuthError::RequestNotYetValid);
+        return Err(AuthError::RequestNotYetValid {
+            amz_date_epoch_millis: request_epoch.saturating_mul(1000),
+            expires_epoch: request_epoch.saturating_add(expires),
+            server_time_epoch: now_epoch_secs,
+        });
     }
     if expires == 0 || now_epoch_secs > request_epoch.saturating_add(expires) {
-        return Err(AuthError::PresignedRequestExpired);
+        return Err(AuthError::PresignedRequestExpired {
+            x_amz_expires: expires,
+            expires_epoch: request_epoch.saturating_add(expires),
+            server_time_epoch: now_epoch_secs,
+        });
     }
 
     let signature =
@@ -544,7 +567,14 @@ fn authenticate_presigned<H: HeaderSource + ?Sized>(
     // Constant-time comparison to prevent timing attacks on signature values.
     let expected_hex = hex_encode_lower(expected_sig.as_ref());
     if !crate::constant_time_eq(expected_hex.as_bytes(), signature.as_bytes()) {
-        return Err(AuthError::SignatureMismatch);
+        return Err(AuthError::SignatureMismatch {
+            diagnostics: Some(Box::new(crate::SignatureMismatchDiagnostics {
+                access_key_id: credential.access_key_id.to_string(),
+                string_to_sign: sts,
+                signature_provided: signature.to_string(),
+                canonical_request: Some(canonical_req),
+            })),
+        });
     }
     validate_static_credential_has_no_token(token.as_deref().or(signed_header_token))?;
 
@@ -1044,7 +1074,7 @@ mod tests {
             parse_amz_date("20240201T120500Z").unwrap(),
         )
         .unwrap_err();
-        assert!(matches!(err, AuthError::PresignedRequestExpired));
+        assert!(matches!(err, AuthError::PresignedRequestExpired { .. }));
     }
 
     #[test]
@@ -1091,7 +1121,7 @@ mod tests {
             parse_amz_date("20240201T120500Z").unwrap(),
         )
         .unwrap_err();
-        assert!(matches!(err, AuthError::RequestNotYetValid));
+        assert!(matches!(err, AuthError::RequestNotYetValid { .. }));
     }
 
     #[test]
@@ -1135,7 +1165,7 @@ mod tests {
             parse_amz_date("20240201T120500Z").unwrap(),
         )
         .unwrap_err();
-        assert!(matches!(err, AuthError::SignatureMismatch));
+        assert!(matches!(err, AuthError::SignatureMismatch { .. }));
     }
 
     #[test]
@@ -1574,7 +1604,7 @@ mod tests {
             presigned_example_time(),
         )
         .unwrap_err();
-        assert!(matches!(err, AuthError::PresignedRequestExpired));
+        assert!(matches!(err, AuthError::PresignedRequestExpired { .. }));
     }
 
     // ── Presigned: missing individual params ──────────────────────────
@@ -2049,7 +2079,7 @@ mod tests {
             presigned_example_time(),
         )
         .unwrap_err();
-        assert!(matches!(err, AuthError::SignatureMismatch));
+        assert!(matches!(err, AuthError::SignatureMismatch { .. }));
     }
 
     #[test]
@@ -2069,7 +2099,7 @@ mod tests {
             presigned_example_time(),
         )
         .unwrap_err();
-        assert!(matches!(err, AuthError::SignatureMismatch));
+        assert!(matches!(err, AuthError::SignatureMismatch { .. }));
     }
 
     // ── Presigned: expired token ──────────────────────────────────────
@@ -2259,7 +2289,7 @@ mod tests {
             presigned_example_time(),
         )
         .unwrap_err();
-        assert!(matches!(err, AuthError::SignatureMismatch));
+        assert!(matches!(err, AuthError::SignatureMismatch { .. }));
     }
 
     #[test]
@@ -2397,6 +2427,8 @@ mod tests {
                 seed_signature: "feedface".into(),
                 scope: "20250101/us-east-1/s3/aws4_request".into(),
                 timestamp: "20250101T000000Z".into(),
+                access_key_id: "AKIDEXAMPLE".into(),
+                seed_canonical_request: "GET\n/\n\nhost:h\n\nhost\nUNSIGNED-PAYLOAD".into(),
             }),
         };
 

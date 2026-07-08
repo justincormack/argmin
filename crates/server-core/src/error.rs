@@ -313,6 +313,9 @@ pub enum ServerError {
     #[error("missing content length")]
     MissingContentLength,
 
+    #[error("unsupported streaming token: {token}")]
+    UnsupportedStreamingToken { token: String },
+
     #[error("malformed trailer: {reason}")]
     MalformedTrailerError { reason: String },
 
@@ -423,9 +426,9 @@ impl ServerError {
             ) => "InvalidArgument",
             Self::Auth(auth::AuthError::UnknownAccessKey) => "InvalidAccessKeyId",
             Self::Auth(auth::AuthError::DuplicateAuthorizationHeader) => "NotImplemented",
-            Self::Auth(auth::AuthError::SignatureMismatch) => "SignatureDoesNotMatch",
+            Self::Auth(auth::AuthError::SignatureMismatch { .. }) => "SignatureDoesNotMatch",
             Self::Auth(auth::AuthError::RequestExpired) => "RequestTimeTooSkewed",
-            Self::Auth(auth::AuthError::PresignedRequestExpired) => "AccessDenied",
+            Self::Auth(auth::AuthError::PresignedRequestExpired { .. }) => "AccessDenied",
             Self::Auth(auth::AuthError::ExpiredToken) => "ExpiredToken",
             Self::Auth(auth::AuthError::UnexpectedSecurityToken { .. }) => "InvalidToken",
             Self::Auth(auth::AuthError::InvalidQueryParam { .. }) => {
@@ -512,6 +515,7 @@ impl ServerError {
             Self::MalformedChunkedBody { .. } => "InvalidRequest",
             Self::IncompleteBody => "IncompleteBody",
             Self::MissingContentLength => "MissingContentLength",
+            Self::UnsupportedStreamingToken { .. } => "InvalidArgument",
             Self::MalformedTrailerError { .. } => "MalformedTrailerError",
             Self::XAmzContentSHA256Mismatch { .. } => "XAmzContentSHA256Mismatch",
             Self::NotImplemented { .. }
@@ -596,6 +600,7 @@ impl ServerError {
             | Self::IncompleteBody
             | Self::MalformedTrailerError { .. } => 400,
             Self::MissingContentLength => 411,
+            Self::UnsupportedStreamingToken { .. } => 400,
             Self::AccessDenied
             | Self::ObjectLockProtectedAccessDenied
             | Self::PostPolicyAccessDenied { .. }
@@ -992,7 +997,7 @@ mod tests {
 
     #[test]
     fn s3_error_code_auth_signature_mismatch() {
-        let err = ServerError::Auth(auth::AuthError::SignatureMismatch);
+        let err = ServerError::Auth(auth::AuthError::SignatureMismatch { diagnostics: None });
         assert_eq!(err.s3_error_code(), "SignatureDoesNotMatch");
     }
 
@@ -1004,7 +1009,11 @@ mod tests {
 
     #[test]
     fn s3_error_code_auth_presigned_expired() {
-        let err = ServerError::Auth(auth::AuthError::PresignedRequestExpired);
+        let err = ServerError::Auth(auth::AuthError::PresignedRequestExpired {
+            x_amz_expires: 60,
+            expires_epoch: 1_705_321_845,
+            server_time_epoch: 1_705_321_900,
+        });
         assert_eq!(err.s3_error_code(), "AccessDenied");
     }
 
