@@ -174,6 +174,56 @@ impl ConfiguredControlPlaneFrontendRuntimeMapAuth {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ConfiguredControlPlaneAdminCommandAuth {
+    pub(crate) cluster_id: String,
+    pub(crate) instance_id: String,
+    pub(crate) credentials: Vec<ConfiguredControlPlaneAdminAuthCredential>,
+}
+
+impl ConfiguredControlPlaneAdminCommandAuth {
+    pub(crate) fn from_env() -> Result<Option<Self>, String> {
+        Self::from_lookup(|key| std::env::var(key).ok())
+    }
+
+    fn from_lookup<F: Fn(&str) -> Option<String>>(get: F) -> Result<Option<Self>, String> {
+        let credentials = parse_control_plane_admin_auth_credentials(get(
+            "ARGMIN_CONTROL_PLANE_ADMIN_AUTH_CREDENTIALS",
+        ))?;
+        if credentials.is_empty() {
+            return Ok(None);
+        }
+        let cluster_id = get("ARGMIN_CONTROL_PLANE_AUTH_CLUSTER_ID").ok_or_else(|| {
+            "ARGMIN_CONTROL_PLANE_ADMIN_AUTH_CREDENTIALS requires ARGMIN_CONTROL_PLANE_AUTH_CLUSTER_ID"
+                .to_string()
+        })?;
+        if cluster_id.is_empty() || !cluster_id.bytes().all(|b| b.is_ascii_graphic()) {
+            return Err(
+                "ARGMIN_CONTROL_PLANE_AUTH_CLUSTER_ID must be non-empty and contain only printable non-space ASCII"
+                    .to_string(),
+            );
+        }
+        let instance_id = get("ARGMIN_CONTROL_PLANE_ADMIN_AUTH_INSTANCE_ID").ok_or_else(|| {
+            "ARGMIN_CONTROL_PLANE_ADMIN_AUTH_INSTANCE_ID is required when ARGMIN_CONTROL_PLANE_ADMIN_AUTH_CREDENTIALS is set"
+                .to_string()
+        })?;
+        validate_auth_instance_id(&instance_id, "ARGMIN_CONTROL_PLANE_ADMIN_AUTH_INSTANCE_ID")?;
+        if !credentials
+            .iter()
+            .any(|credential| credential.instance_id == instance_id)
+        {
+            return Err(format!(
+                "ARGMIN_CONTROL_PLANE_ADMIN_AUTH_CREDENTIALS must include local admin instance id {instance_id}"
+            ));
+        }
+        Ok(Some(Self {
+            cluster_id,
+            instance_id,
+            credentials,
+        }))
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ConfiguredCredentialProfile {
     Standard,
@@ -2345,6 +2395,59 @@ mod tests {
         .unwrap_err();
 
         assert!(err.contains("local frontend instance id frontend-2"));
+    }
+
+    #[test]
+    fn admin_command_auth_only_config_parses_credentials() {
+        let auth = ConfiguredControlPlaneAdminCommandAuth::from_lookup(make_env(&[
+            ("ARGMIN_CONTROL_PLANE_AUTH_CLUSTER_ID", "control-auth"),
+            ("ARGMIN_CONTROL_PLANE_ADMIN_AUTH_INSTANCE_ID", "admin-1"),
+            (
+                "ARGMIN_CONTROL_PLANE_ADMIN_AUTH_CREDENTIALS",
+                "admin-2=admin:4:admin-2-secret,admin-1=admin:4:admin-1-secret",
+            ),
+        ]))
+        .expect("auth-only config should parse")
+        .expect("auth-only config should be enabled");
+
+        assert_eq!(auth.cluster_id, "control-auth");
+        assert_eq!(auth.instance_id, "admin-1");
+        assert_eq!(
+            auth.credentials,
+            vec![
+                ConfiguredControlPlaneAdminAuthCredential {
+                    instance_id: "admin-1".to_string(),
+                    credential_id: "admin".to_string(),
+                    credential_version: 4,
+                    secret: SecretConfigValue::new("admin-1-secret".to_string()),
+                },
+                ConfiguredControlPlaneAdminAuthCredential {
+                    instance_id: "admin-2".to_string(),
+                    credential_id: "admin".to_string(),
+                    credential_version: 4,
+                    secret: SecretConfigValue::new("admin-2-secret".to_string()),
+                },
+            ]
+        );
+        let debug = format!("{auth:?}");
+        assert!(!debug.contains("admin-1-secret"));
+        assert!(!debug.contains("admin-2-secret"));
+        assert!(debug.contains("config_secret"));
+    }
+
+    #[test]
+    fn admin_command_auth_only_config_rejects_missing_local_instance() {
+        let err = ConfiguredControlPlaneAdminCommandAuth::from_lookup(make_env(&[
+            ("ARGMIN_CONTROL_PLANE_AUTH_CLUSTER_ID", "control-auth"),
+            ("ARGMIN_CONTROL_PLANE_ADMIN_AUTH_INSTANCE_ID", "admin-2"),
+            (
+                "ARGMIN_CONTROL_PLANE_ADMIN_AUTH_CREDENTIALS",
+                "admin-1=admin:4:admin-1-secret",
+            ),
+        ]))
+        .unwrap_err();
+
+        assert!(err.contains("local admin instance id admin-2"));
     }
 
     #[test]

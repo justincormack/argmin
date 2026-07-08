@@ -5269,6 +5269,240 @@ impl AuthenticatedUnixControlPlaneClient {
         envelope.encode_frame()
     }
 
+    fn sign_admin_control_plane_request(
+        &self,
+        kind: ControlPlaneRpcKind,
+        authority_now_ms: u64,
+        payload: Vec<u8>,
+    ) -> Result<Vec<u8>, ControlPlaneError> {
+        debug_assert_eq!(
+            kind.auth_operation(),
+            ControlPlaneAuthOperation::AdminControlPlaneCommand
+        );
+        let expires_at_ms = authority_now_ms
+            .checked_add(CONTROL_PLANE_RPC_READ_AUTH_REPLAY_WINDOW_MS)
+            .ok_or(ControlPlaneError::LeaseDeadlineOverflow)?;
+        let payload = write_authenticated_control_plane_rpc_payload(kind, &payload);
+        let envelope = self.credential.sign_envelope(
+            crate::control_plane_auth::ControlPlaneAuthSignInput {
+                target: ControlPlaneAuthTarget::Service(
+                    crate::control_plane_auth::ControlPlaneAuthService::ControlPlane,
+                ),
+                operation: ControlPlaneAuthOperation::AdminControlPlaneCommand,
+                issued_at_ms: Some(authority_now_ms),
+                expires_at_ms: Some(expires_at_ms),
+                sequence: None,
+                nonce: Vec::new(),
+                payload,
+            },
+        )?;
+        envelope.encode_frame()
+    }
+
+    fn send_admin_request_with_read_timeout(
+        &self,
+        kind: ControlPlaneRpcKind,
+        authority_now_ms: u64,
+        payload: Vec<u8>,
+        read_timeout: Duration,
+    ) -> Result<Vec<u8>, ControlPlaneError> {
+        let payload = self.sign_admin_control_plane_request(kind, authority_now_ms, payload)?;
+        self.inner
+            .send_request_with_read_timeout(kind, &payload, read_timeout)
+    }
+
+    pub fn set_pg_acting_set(
+        &self,
+        pg_id: PgId,
+        acting_set: Vec<NodeId>,
+        authority_now_ms: u64,
+    ) -> Result<ClusterEpoch, ControlPlaneError> {
+        let mut payload = Vec::new();
+        write_pg_acting_set_request(&mut payload, pg_id, &acting_set)?;
+        let payload = self.send_admin_request_with_read_timeout(
+            ControlPlaneRpcKind::SetPgActingSet,
+            authority_now_ms,
+            payload,
+            CONTROL_PLANE_RPC_IO_TIMEOUT,
+        )?;
+        let mut reader = PayloadReader::new(&payload);
+        let raw_cluster_epoch = reader.read_u64()?;
+        let cluster_epoch =
+            ClusterEpoch::new(raw_cluster_epoch).ok_or_else(|| ControlPlaneError::RpcProtocol {
+                message: format!("invalid cluster epoch {raw_cluster_epoch}"),
+            })?;
+        reader.finish()?;
+        Ok(cluster_epoch)
+    }
+
+    pub fn set_pg_acting_set_checked(
+        &self,
+        pg_id: PgId,
+        acting_set: Vec<NodeId>,
+        authority_now_ms: u64,
+    ) -> Result<ClusterEpoch, ControlPlaneError> {
+        self.set_pg_acting_set(pg_id, acting_set, authority_now_ms)
+    }
+
+    pub fn fence_pg_for_metadata_transfer_runtime_map_checked(
+        &self,
+        pg_id: PgId,
+        authority_now_ms: u64,
+    ) -> Result<ClusterRuntimeMapSnapshot, ControlPlaneError> {
+        Ok(self
+            .fence_pg_for_metadata_transfer_runtime_map_with_source_lease_checked(
+                pg_id,
+                authority_now_ms,
+            )?
+            .into_parts()
+            .0)
+    }
+
+    pub fn fence_pg_for_metadata_transfer_runtime_map_with_source_lease_checked(
+        &self,
+        pg_id: PgId,
+        authority_now_ms: u64,
+    ) -> Result<FencedPgMetadataTransferRuntimeMap, ControlPlaneError> {
+        let mut payload = Vec::new();
+        write_pg_id_request(&mut payload, pg_id);
+        let payload = self.send_admin_request_with_read_timeout(
+            ControlPlaneRpcKind::FencePgForMetadataTransferRuntimeMap,
+            authority_now_ms,
+            payload,
+            CONTROL_PLANE_RPC_IO_TIMEOUT,
+        )?;
+        let mut reader = PayloadReader::new(&payload);
+        let runtime_map = read_runtime_map_snapshot(&mut reader)?;
+        let source_primary_lease_deadline_ms = reader.read_option_u64()?;
+        reader.finish()?;
+        self.inner.validate_metadata_transfer_fence_response(
+            pg_id,
+            FencedPgMetadataTransferRuntimeMap::new(runtime_map, source_primary_lease_deadline_ms),
+        )
+    }
+
+    pub fn set_pg_acting_set_with_metadata_transfer_runtime_map(
+        &self,
+        pg_id: PgId,
+        acting_set: Vec<NodeId>,
+        transfer: PgMetadataTransferProof,
+        authority_now_ms: u64,
+    ) -> Result<ClusterRuntimeMapSnapshot, ControlPlaneError> {
+        let mut payload = Vec::new();
+        write_pg_acting_set_with_metadata_transfer_request(
+            &mut payload,
+            pg_id,
+            &acting_set,
+            transfer,
+        )?;
+        let payload = self.send_admin_request_with_read_timeout(
+            ControlPlaneRpcKind::SetPgActingSetWithMetadataTransferRuntimeMap,
+            authority_now_ms,
+            payload,
+            CONTROL_PLANE_RPC_IO_TIMEOUT,
+        )?;
+        let mut reader = PayloadReader::new(&payload);
+        let runtime_map = read_runtime_map_snapshot(&mut reader)?;
+        reader.finish()?;
+        Ok(runtime_map)
+    }
+
+    pub fn set_pg_acting_set_with_metadata_transfer_runtime_map_checked(
+        &self,
+        pg_id: PgId,
+        acting_set: Vec<NodeId>,
+        transfer: PgMetadataTransferProof,
+        min_cluster_epoch: ClusterEpoch,
+        authority_now_ms: u64,
+    ) -> Result<ClusterRuntimeMapSnapshot, ControlPlaneError> {
+        let runtime_map = self.set_pg_acting_set_with_metadata_transfer_runtime_map(
+            pg_id,
+            acting_set.clone(),
+            transfer,
+            authority_now_ms,
+        )?;
+        if metadata_transfer_install_applied(
+            &runtime_map,
+            pg_id,
+            &acting_set,
+            transfer,
+            min_cluster_epoch,
+        ) {
+            return Ok(runtime_map);
+        }
+        Err(ControlPlaneError::RpcUnconfirmed {
+            message: format!(
+                "metadata-transfer acting-set install for PG {} returned runtime map at epoch {} without the expected route/proof",
+                pg_id.get(),
+                runtime_map.cluster_epoch().get()
+            ),
+        })
+    }
+
+    pub fn set_pg_acting_set_with_metadata_transfer_checked(
+        &self,
+        pg_id: PgId,
+        acting_set: Vec<NodeId>,
+        transfer: PgMetadataTransferProof,
+        min_cluster_epoch: ClusterEpoch,
+        authority_now_ms: u64,
+    ) -> Result<ClusterEpoch, ControlPlaneError> {
+        self.set_pg_acting_set_with_metadata_transfer_runtime_map_checked(
+            pg_id,
+            acting_set,
+            transfer,
+            min_cluster_epoch,
+            authority_now_ms,
+        )
+        .map(|runtime_map| runtime_map.cluster_epoch())
+    }
+
+    pub fn transfer_raft_leadership_to(
+        &self,
+        node_id: u64,
+        authority_now_ms: u64,
+    ) -> Result<(), ControlPlaneError> {
+        let mut payload = Vec::new();
+        write_u64(&mut payload, node_id);
+        let payload = self.send_admin_request_with_read_timeout(
+            ControlPlaneRpcKind::TransferRaftLeadership,
+            authority_now_ms,
+            payload,
+            CONTROL_PLANE_RPC_LEADERSHIP_TRANSFER_TIMEOUT,
+        )?;
+        let reader = PayloadReader::new(&payload);
+        reader.finish()?;
+        Ok(())
+    }
+
+    pub fn trigger_raft_snapshot_and_purge(
+        &self,
+        authority_now_ms: u64,
+    ) -> Result<Option<u64>, ControlPlaneError> {
+        let payload = self.send_admin_request_with_read_timeout(
+            ControlPlaneRpcKind::TriggerRaftSnapshotAndPurge,
+            authority_now_ms,
+            Vec::new(),
+            CONTROL_PLANE_RPC_SNAPSHOT_PURGE_TIMEOUT,
+        )?;
+        let mut reader = PayloadReader::new(&payload);
+        let snapshot_index = reader.read_option_u64()?;
+        reader.finish()?;
+        Ok(snapshot_index)
+    }
+
+    pub fn trigger_raft_election(&self, authority_now_ms: u64) -> Result<(), ControlPlaneError> {
+        let payload = self.send_admin_request_with_read_timeout(
+            ControlPlaneRpcKind::TriggerRaftElection,
+            authority_now_ms,
+            Vec::new(),
+            CONTROL_PLANE_RPC_LEADERSHIP_TRANSFER_TIMEOUT,
+        )?;
+        let reader = PayloadReader::new(&payload);
+        reader.finish()?;
+        Ok(())
+    }
+
     fn send_signed_read_only_request_with_read_timeout(
         &self,
         kind: ControlPlaneRpcKind,
@@ -12697,6 +12931,169 @@ mod tests {
         assert_eq!(
             metrics.accepted_for_operation(ControlPlaneAuthOperation::AdminControlPlaneCommand),
             1
+        );
+        assert_eq!(metrics.rejected_total(), 0);
+    }
+
+    #[test]
+    fn authenticated_unix_control_plane_client_signs_admin_pg_update() {
+        let tmp = test_util::tempdir();
+        let socket_path = tmp.path().join("control-plane.sock");
+        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+        authority
+            .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
+            .unwrap();
+        let verifier = admin_auth_verifier("auth-cluster", "admin-1");
+        let verifier_for_assert = verifier.clone();
+        let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _addr) = listener.accept().unwrap();
+            handle_control_plane_unix_stream_with_auth(
+                &mut authority,
+                &mut stream,
+                2_000,
+                &verifier,
+            )
+            .unwrap();
+            assert_eq!(
+                authority.snapshot().pg(PgId::new(7)).unwrap().acting_set(),
+                &[NodeId::new(1)]
+            );
+        });
+
+        let client = AuthenticatedUnixControlPlaneClient::new(
+            UnixControlPlaneClient::new(&socket_path),
+            admin_auth_credential("auth-cluster", "admin-1"),
+        );
+        let cluster_epoch = client
+            .set_pg_acting_set_checked(PgId::new(7), vec![NodeId::new(1)], 1_999)
+            .unwrap();
+
+        server.join().unwrap();
+        assert!(cluster_epoch.get() >= 2);
+        let metrics = verifier_for_assert.metrics_snapshot();
+        assert_eq!(metrics.accepted_total(), 1);
+        assert_eq!(
+            metrics.accepted_for_operation(ControlPlaneAuthOperation::AdminControlPlaneCommand),
+            1
+        );
+        assert_eq!(metrics.rejected_total(), 0);
+    }
+
+    #[test]
+    fn authenticated_unix_control_plane_client_signs_metadata_transfer_admin_commands() {
+        let tmp = test_util::tempdir();
+        let socket_path = tmp.path().join("control-plane.sock");
+        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+        for node_id in [1, 2] {
+            authority
+                .set_node_membership(NodeId::new(node_id), NodeMembershipState::Active)
+                .unwrap();
+            assert!(heartbeat_until_serving(&mut authority, node_id, 1_000).serving());
+        }
+        let active_proof = PgMetadataProof {
+            applied_log_index: 9,
+            applied_log_hash: 10,
+            state_digest: 11,
+        };
+        authority
+            .set_pg_acting_set(PgId::new(43), vec![NodeId::new(1)])
+            .unwrap();
+        heartbeat_with_pg_proof(
+            &mut authority,
+            1,
+            43,
+            PgState::Peering,
+            active_proof,
+            false,
+            2_000,
+        );
+        authority
+            .complete_pg_peering(
+                PgId::new(43),
+                NodeId::new(1),
+                node_incarnation(&authority, 1),
+                2_001,
+            )
+            .unwrap();
+        heartbeat_with_pg_proof(
+            &mut authority,
+            1,
+            43,
+            PgState::Active,
+            active_proof,
+            false,
+            2_002,
+        );
+        let active_epoch = authority.snapshot().cluster_epoch();
+        let imported_proof = PgMetadataProof {
+            applied_log_index: 9,
+            applied_log_hash: 12,
+            state_digest: 11,
+        };
+        let transfer = PgMetadataTransferProof::new_with_imported_metadata_proof(
+            active_epoch,
+            active_proof,
+            imported_proof,
+        );
+        let verifier = admin_auth_verifier("auth-cluster", "admin-1");
+        let verifier_for_assert = verifier.clone();
+        let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+        let server = std::thread::spawn(move || {
+            for authority_now_ms in [2_003, 2_004] {
+                let (mut stream, _addr) = listener.accept().unwrap();
+                handle_control_plane_unix_stream_with_auth(
+                    &mut authority,
+                    &mut stream,
+                    authority_now_ms,
+                    &verifier,
+                )
+                .unwrap();
+            }
+            let pg = authority.snapshot().pg(PgId::new(43)).unwrap();
+            assert_eq!(pg.state(), PgState::Peering);
+            assert_eq!(pg.acting_set(), &[NodeId::new(2)]);
+            assert_eq!(pg.peering_metadata_transfer(), Some(transfer));
+        });
+
+        let client = AuthenticatedUnixControlPlaneClient::new(
+            UnixControlPlaneClient::new(&socket_path),
+            admin_auth_credential("auth-cluster", "admin-1"),
+        );
+        let fenced = client
+            .fence_pg_for_metadata_transfer_runtime_map_with_source_lease_checked(
+                PgId::new(43),
+                1_999,
+            )
+            .unwrap();
+        let fence_epoch = fenced.runtime_map().cluster_epoch();
+        let expected_transfer_epoch = ClusterEpoch::new(fence_epoch.get() + 1).unwrap();
+        let runtime_map = client
+            .set_pg_acting_set_with_metadata_transfer_runtime_map_checked(
+                PgId::new(43),
+                vec![NodeId::new(2)],
+                transfer,
+                expected_transfer_epoch,
+                2_000,
+            )
+            .unwrap();
+
+        server.join().unwrap();
+        assert_eq!(runtime_map.cluster_epoch(), expected_transfer_epoch);
+        let route = runtime_map
+            .pg_routes()
+            .iter()
+            .find(|route| route.pg_id() == PgId::new(43))
+            .unwrap();
+        assert_eq!(route.acting_set(), &[NodeId::new(2)]);
+        assert_eq!(route.peering_metadata_transfer(), Some(transfer));
+        let metrics = verifier_for_assert.metrics_snapshot();
+        assert_eq!(metrics.accepted_total(), 2);
+        assert_eq!(
+            metrics.accepted_for_operation(ControlPlaneAuthOperation::AdminControlPlaneCommand),
+            2
         );
         assert_eq!(metrics.rejected_total(), 0);
     }

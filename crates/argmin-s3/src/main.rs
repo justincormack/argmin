@@ -68,9 +68,10 @@ use tokio::runtime::Handle;
 use tokio_rustls::TlsAcceptor;
 
 use config::{
-    ConfiguredControlPlaneAdminAuthCredential, ConfiguredControlPlaneFrontendAuthCredential,
-    ConfiguredControlPlaneFrontendRuntimeMapAuth, ConfiguredControlPlaneStorageAuthCredential,
-    ConfiguredCredential, ConfiguredCredentialProfile, ProcessRole, ServerConfig,
+    ConfiguredControlPlaneAdminAuthCredential, ConfiguredControlPlaneAdminCommandAuth,
+    ConfiguredControlPlaneFrontendAuthCredential, ConfiguredControlPlaneFrontendRuntimeMapAuth,
+    ConfiguredControlPlaneStorageAuthCredential, ConfiguredCredential, ConfiguredCredentialProfile,
+    ProcessRole, ServerConfig,
 };
 use server_http::http::HttpFrontend;
 
@@ -746,7 +747,7 @@ fn set_control_plane_pg_acting_set_live(
     pg_id: PgId,
     acting_set: Vec<NodeId>,
 ) -> Result<ClusterEpoch, String> {
-    UnixControlPlaneClient::new(socket_path)
+    build_admin_control_plane_client_from_command_auth_env(socket_path)?
         .set_pg_acting_set_checked(pg_id, acting_set)
         .map_err(|error| format!("failed to set live PG acting set: {error}"))
 }
@@ -755,7 +756,7 @@ fn transfer_control_plane_raft_leadership(
     socket_path: &Path,
     node_id: ControlPlaneRaftNodeId,
 ) -> Result<(), String> {
-    UnixControlPlaneClient::new(socket_path)
+    build_admin_control_plane_client_from_command_auth_env(socket_path)?
         .transfer_raft_leadership_to(node_id)
         .map_err(|error| format!("failed to transfer control-plane Raft leadership: {error}"))
 }
@@ -763,13 +764,13 @@ fn transfer_control_plane_raft_leadership(
 fn trigger_control_plane_raft_snapshot_and_purge(
     socket_path: &Path,
 ) -> Result<Option<u64>, String> {
-    UnixControlPlaneClient::new(socket_path)
+    build_admin_control_plane_client_from_command_auth_env(socket_path)?
         .trigger_raft_snapshot_and_purge()
         .map_err(|error| format!("failed to trigger control-plane Raft snapshot purge: {error}"))
 }
 
 fn trigger_control_plane_raft_election(socket_path: &Path) -> Result<(), String> {
-    UnixControlPlaneClient::new(socket_path)
+    build_admin_control_plane_client_from_command_auth_env(socket_path)?
         .trigger_raft_election()
         .map_err(|error| format!("failed to trigger control-plane Raft election: {error}"))
 }
@@ -778,7 +779,7 @@ fn fence_control_plane_pg_for_metadata_transfer_live(
     socket_path: &Path,
     pg_id: PgId,
 ) -> Result<ClusterEpoch, String> {
-    UnixControlPlaneClient::new(socket_path)
+    build_admin_control_plane_client_from_command_auth_env(socket_path)?
         .fence_pg_for_metadata_transfer_runtime_map_checked(pg_id)
         .map(|runtime_map| runtime_map.cluster_epoch())
         .map_err(|error| format!("failed to fence live PG for metadata transfer: {error}"))
@@ -796,7 +797,7 @@ fn set_control_plane_pg_acting_set_with_metadata_transfer_live(
         .checked_add(1)
         .and_then(ClusterEpoch::new)
         .ok_or_else(|| "metadata-transfer destination cluster epoch overflowed".to_owned())?;
-    UnixControlPlaneClient::new(socket_path)
+    build_admin_control_plane_client_from_command_auth_env(socket_path)?
         .set_pg_acting_set_with_metadata_transfer_checked(
             pg_id,
             acting_set,
@@ -933,14 +934,16 @@ fn transfer_control_plane_pg_metadata_live(
         ServerConfig::from_env().map_err(|error| format!("configuration error: {error}"))?;
     let ec_config = EcConfig::new(config.ec_k, config.ec_m)
         .map_err(|error| format!("invalid EC config: {error}"))?;
-    let control_plane = UnixControlPlaneClient::new(socket_path);
+    let read_control_plane =
+        build_frontend_control_plane_client_from_runtime_map_auth_env(socket_path)?;
+    let admin_control_plane = build_admin_control_plane_client_from_command_auth_env(socket_path)?;
     let failpoint = MetadataTransferLiveFailpoint::from_env()?;
     if let Some(summary) =
-        completed_metadata_transfer_live_summary(&control_plane, pg_id, &acting_set)?
+        completed_metadata_transfer_live_summary(&read_control_plane, pg_id, &acting_set)?
     {
         return Ok(summary);
     }
-    let fenced = control_plane
+    let fenced = admin_control_plane
         .fence_pg_for_metadata_transfer_runtime_map_with_source_lease_checked(pg_id)
         .map_err(|error| format!("failed to fence live PG for metadata transfer: {error}"))?;
     let (fenced_runtime, source_lease_deadline_ms) = fenced.into_parts();
@@ -948,7 +951,7 @@ fn transfer_control_plane_pg_metadata_live(
     if let Some(source_lease_deadline_ms) = source_lease_deadline_ms {
         wait_for_metadata_transfer_source_lease_to_expire(source_lease_deadline_ms);
     }
-    let source_runtime = control_plane
+    let source_runtime = admin_control_plane
         .fence_pg_for_metadata_transfer_runtime_map_checked(pg_id)
         .map_err(|error| format!("failed to refresh fenced PG metadata transfer map: {error}"))?;
     metadata_transfer_peering_source_route_matches(&source_runtime, pg_id, source_node_id)?;
@@ -1069,7 +1072,7 @@ fn transfer_control_plane_pg_metadata_live(
                 artifact.source_metadata_proof(),
                 planned_imported_proof,
             );
-            let destination_runtime = control_plane
+            let destination_runtime = admin_control_plane
                 .set_pg_acting_set_with_metadata_transfer_runtime_map_checked(
                     pg_id,
                     acting_set.clone(),
@@ -1099,7 +1102,7 @@ fn transfer_control_plane_pg_metadata_live(
     let destination_cluster =
         build_frontend_storage_cluster_from_runtime_map(&config, &ec_config, &destination_runtime)?;
     let actual_imported_proof = import_pg_metadata_transfer_artifact_retrying_stale_route(
-        &control_plane,
+        &read_control_plane,
         &destination_cluster,
         &artifact,
         pg_id,
@@ -1124,7 +1127,7 @@ fn transfer_control_plane_pg_metadata_live(
 }
 
 fn completed_metadata_transfer_live_summary(
-    control_plane: &UnixControlPlaneClient,
+    control_plane: &impl ControlPlaneRuntimeMapSource,
     pg_id: PgId,
     acting_set: &[NodeId],
 ) -> Result<Option<MetadataTransferLiveSummary>, String> {
@@ -1201,7 +1204,7 @@ fn export_pg_metadata_transfer_artifact_retrying_stale_route(
 }
 
 fn import_pg_metadata_transfer_artifact_retrying_stale_route(
-    control_plane: &UnixControlPlaneClient,
+    control_plane: &impl ControlPlaneRuntimeMapSource,
     destination_cluster: &StorageCluster,
     artifact: &PgMetadataTransferArtifact,
     pg_id: PgId,
@@ -1239,7 +1242,7 @@ fn import_pg_metadata_transfer_artifact_retrying_stale_route(
 }
 
 fn control_plane_pg_active_with_acting_set(
-    control_plane: &UnixControlPlaneClient,
+    control_plane: &impl ControlPlaneRuntimeMapSource,
     pg_id: PgId,
     acting_set: &[NodeId],
     min_cluster_epoch: ClusterEpoch,
@@ -3059,6 +3062,11 @@ enum FrontendControlPlaneClient {
     Authenticated(AuthenticatedUnixControlPlaneClient),
 }
 
+enum AdminControlPlaneClient {
+    Plain(UnixControlPlaneClient),
+    Authenticated(AuthenticatedUnixControlPlaneClient),
+}
+
 impl ControlPlaneHeartbeatRuntimeMapSource for StorageNodeControlPlaneClient {
     fn refresh_node_heartbeat(
         &mut self,
@@ -3116,6 +3124,133 @@ impl FrontendControlPlaneClient {
             Self::Authenticated(client) => client.runtime_map_status_with_check_applied_timeout(
                 storage::clock::current_time_millis(),
             ),
+        }
+    }
+}
+
+impl AdminControlPlaneClient {
+    fn set_pg_acting_set_checked(
+        &self,
+        pg_id: PgId,
+        acting_set: Vec<NodeId>,
+    ) -> Result<ClusterEpoch, ControlPlaneError> {
+        match self {
+            Self::Plain(client) => client.set_pg_acting_set_checked(pg_id, acting_set),
+            Self::Authenticated(client) => client.set_pg_acting_set_checked(
+                pg_id,
+                acting_set,
+                storage::clock::current_time_millis(),
+            ),
+        }
+    }
+
+    fn transfer_raft_leadership_to(
+        &self,
+        node_id: ControlPlaneRaftNodeId,
+    ) -> Result<(), ControlPlaneError> {
+        match self {
+            Self::Plain(client) => client.transfer_raft_leadership_to(node_id),
+            Self::Authenticated(client) => {
+                client.transfer_raft_leadership_to(node_id, storage::clock::current_time_millis())
+            }
+        }
+    }
+
+    fn trigger_raft_snapshot_and_purge(&self) -> Result<Option<u64>, ControlPlaneError> {
+        match self {
+            Self::Plain(client) => client.trigger_raft_snapshot_and_purge(),
+            Self::Authenticated(client) => {
+                client.trigger_raft_snapshot_and_purge(storage::clock::current_time_millis())
+            }
+        }
+    }
+
+    fn trigger_raft_election(&self) -> Result<(), ControlPlaneError> {
+        match self {
+            Self::Plain(client) => client.trigger_raft_election(),
+            Self::Authenticated(client) => {
+                client.trigger_raft_election(storage::clock::current_time_millis())
+            }
+        }
+    }
+
+    fn fence_pg_for_metadata_transfer_runtime_map_checked(
+        &self,
+        pg_id: PgId,
+    ) -> Result<ClusterRuntimeMapSnapshot, ControlPlaneError> {
+        match self {
+            Self::Plain(client) => client.fence_pg_for_metadata_transfer_runtime_map_checked(pg_id),
+            Self::Authenticated(client) => client
+                .fence_pg_for_metadata_transfer_runtime_map_checked(
+                    pg_id,
+                    storage::clock::current_time_millis(),
+                ),
+        }
+    }
+
+    fn fence_pg_for_metadata_transfer_runtime_map_with_source_lease_checked(
+        &self,
+        pg_id: PgId,
+    ) -> Result<storage::control_plane::FencedPgMetadataTransferRuntimeMap, ControlPlaneError> {
+        match self {
+            Self::Plain(client) => {
+                client.fence_pg_for_metadata_transfer_runtime_map_with_source_lease_checked(pg_id)
+            }
+            Self::Authenticated(client) => client
+                .fence_pg_for_metadata_transfer_runtime_map_with_source_lease_checked(
+                    pg_id,
+                    storage::clock::current_time_millis(),
+                ),
+        }
+    }
+
+    fn set_pg_acting_set_with_metadata_transfer_checked(
+        &self,
+        pg_id: PgId,
+        acting_set: Vec<NodeId>,
+        transfer: PgMetadataTransferProof,
+        min_cluster_epoch: ClusterEpoch,
+    ) -> Result<ClusterEpoch, ControlPlaneError> {
+        match self {
+            Self::Plain(client) => client.set_pg_acting_set_with_metadata_transfer_checked(
+                pg_id,
+                acting_set,
+                transfer,
+                min_cluster_epoch,
+            ),
+            Self::Authenticated(client) => client.set_pg_acting_set_with_metadata_transfer_checked(
+                pg_id,
+                acting_set,
+                transfer,
+                min_cluster_epoch,
+                storage::clock::current_time_millis(),
+            ),
+        }
+    }
+
+    fn set_pg_acting_set_with_metadata_transfer_runtime_map_checked(
+        &self,
+        pg_id: PgId,
+        acting_set: Vec<NodeId>,
+        transfer: PgMetadataTransferProof,
+        min_cluster_epoch: ClusterEpoch,
+    ) -> Result<ClusterRuntimeMapSnapshot, ControlPlaneError> {
+        match self {
+            Self::Plain(client) => client
+                .set_pg_acting_set_with_metadata_transfer_runtime_map_checked(
+                    pg_id,
+                    acting_set,
+                    transfer,
+                    min_cluster_epoch,
+                ),
+            Self::Authenticated(client) => client
+                .set_pg_acting_set_with_metadata_transfer_runtime_map_checked(
+                    pg_id,
+                    acting_set,
+                    transfer,
+                    min_cluster_epoch,
+                    storage::clock::current_time_millis(),
+                ),
         }
     }
 }
@@ -3283,6 +3418,37 @@ fn build_frontend_control_plane_client_from_runtime_map_auth_env(
         None => Ok(FrontendControlPlaneClient::Plain(
             UnixControlPlaneClient::new(control_plane_socket_path),
         )),
+    }
+}
+
+fn build_admin_control_plane_client_from_command_auth_env(
+    control_plane_socket_path: &Path,
+) -> Result<AdminControlPlaneClient, String> {
+    match ConfiguredControlPlaneAdminCommandAuth::from_env()? {
+        Some(auth_config) => {
+            let configured = auth_config
+                .credentials
+                .iter()
+                .find(|credential| credential.instance_id == auth_config.instance_id)
+                .expect("auth-only admin config validates local instance credential");
+            let credential = configured_admin_auth_credential(configured)?
+                .scoped_for_cluster(&auth_config.cluster_id)
+                .map_err(|error| {
+                    format!(
+                        "invalid ARGMIN_CONTROL_PLANE_ADMIN_AUTH_CREDENTIALS scoped credential for instance {}: {error}",
+                        auth_config.instance_id
+                    )
+                })?;
+            Ok(AdminControlPlaneClient::Authenticated(
+                AuthenticatedUnixControlPlaneClient::new(
+                    UnixControlPlaneClient::new(control_plane_socket_path),
+                    credential,
+                ),
+            ))
+        }
+        None => Ok(AdminControlPlaneClient::Plain(UnixControlPlaneClient::new(
+            control_plane_socket_path,
+        ))),
     }
 }
 
