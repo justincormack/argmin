@@ -433,8 +433,11 @@ Progress:
   envelope, concrete RPC kind binding, freshness window, source service, target
   frontend principal, and MAC before decoding the runtime map or status bytes.
   Plain runtime-map responses remain accepted only on unauthenticated clients.
-  Error-response authentication and broader admin/storage-node response
-  authentication remain separate follow-up work.
+- 2026-07-08: Tightened Slice D so authenticated runtime-map responses cover
+  the encoded response status/body, not only successful map bytes. Authenticated
+  frontend clients now verify the signed runtime-map response envelope before
+  decoding either a success body or a remote error. Broader admin/storage-node
+  response authentication remains separate follow-up work.
 
 ## Replay Policy
 

@@ -4648,6 +4648,17 @@ impl UnixControlPlaneClient {
         payload: &[u8],
         read_timeout: Duration,
     ) -> Result<Vec<u8>, ControlPlaneError> {
+        let response_payload =
+            self.send_request_raw_response_with_read_timeout(kind, payload, read_timeout)?;
+        decode_control_plane_rpc_response(response_payload)
+    }
+
+    fn send_request_raw_response_with_read_timeout(
+        &self,
+        kind: ControlPlaneRpcKind,
+        payload: &[u8],
+        read_timeout: Duration,
+    ) -> Result<Vec<u8>, ControlPlaneError> {
         let mut stream =
             UnixStream::connect(&self.socket_path).map_err(|source| ControlPlaneError::Io {
                 context: "connect control-plane socket",
@@ -4675,7 +4686,7 @@ impl UnixControlPlaneClient {
                 ),
             });
         }
-        decode_control_plane_rpc_response(response_payload)
+        Ok(response_payload)
     }
 
     fn send_read_only_request_with_read_timeout(
@@ -4710,6 +4721,37 @@ impl UnixControlPlaneClient {
         loop {
             let payload = build_payload()?;
             match self.send_request_with_read_timeout(kind, &payload, read_timeout) {
+                Ok(payload) => return Ok(payload),
+                Err(error)
+                    if error.is_retryable_read_only_rpc_transport_error()
+                        && Instant::now() < deadline =>
+                {
+                    std::thread::sleep(CONTROL_PLANE_RPC_READ_ONLY_RETRY_BACKOFF);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    fn send_read_only_request_with_raw_response_payload_factory<F>(
+        &self,
+        kind: ControlPlaneRpcKind,
+        read_timeout: Duration,
+        mut build_payload: F,
+    ) -> Result<Vec<u8>, ControlPlaneError>
+    where
+        F: FnMut() -> Result<Vec<u8>, ControlPlaneError>,
+    {
+        debug_assert!(matches!(
+            kind,
+            ControlPlaneRpcKind::RuntimeMapSnapshot
+                | ControlPlaneRpcKind::PgRuntimeMapSnapshot
+                | ControlPlaneRpcKind::RuntimeMapStatus
+        ));
+        let deadline = Instant::now() + CONTROL_PLANE_RPC_READ_ONLY_RETRY_DEADLINE;
+        loop {
+            let payload = build_payload()?;
+            match self.send_request_raw_response_with_read_timeout(kind, &payload, read_timeout) {
                 Ok(payload) => return Ok(payload),
                 Err(error)
                     if error.is_retryable_read_only_rpc_transport_error()
@@ -5538,12 +5580,13 @@ impl AuthenticatedUnixControlPlaneClient {
     where
         F: FnMut() -> Result<u64, ControlPlaneError>,
     {
-        let response =
-            self.inner
-                .send_read_only_request_with_payload_factory(kind, read_timeout, || {
-                    self.sign_read_only_request(kind, authority_now_ms()?, payload.clone())
-                })?;
-        self.verify_runtime_map_response(kind, authority_now_ms()?, &response)
+        let response = self
+            .inner
+            .send_read_only_request_with_raw_response_payload_factory(kind, read_timeout, || {
+                self.sign_read_only_request(kind, authority_now_ms()?, payload.clone())
+            })?;
+        let response = self.verify_runtime_map_response(kind, authority_now_ms()?, &response)?;
+        decode_control_plane_rpc_response(response)
     }
 
     fn verify_runtime_map_response(
@@ -6398,6 +6441,25 @@ fn sign_frontend_runtime_map_response_payload(
     envelope.encode_frame()
 }
 
+fn build_frontend_runtime_map_rpc_response(
+    kind: ControlPlaneRpcKind,
+    response: Result<Vec<u8>, ControlPlaneError>,
+    response_auth: Option<(ControlPlaneScopedCredential, ControlPlaneAuthPrincipal)>,
+    authority_now_ms: u64,
+) -> Result<ControlPlaneRpcResponse, ControlPlaneError> {
+    let mut payload = encode_control_plane_rpc_response(response)?;
+    if let Some((credential, target)) = response_auth {
+        payload = sign_frontend_runtime_map_response_payload(
+            kind,
+            &credential,
+            target,
+            authority_now_ms,
+            payload,
+        )?;
+    }
+    Ok(ControlPlaneRpcResponse { kind, payload })
+}
+
 impl ControlPlaneRuntimeMapSource for UnixControlPlaneClient {
     fn runtime_map_snapshot(
         &self,
@@ -6741,23 +6803,20 @@ where
             };
             let reader = PayloadReader::new(&payload);
             reader.finish()?;
-            match control_plane.runtime_map_snapshot(authority_now_ms) {
+            let response = match control_plane.runtime_map_snapshot(authority_now_ms) {
                 Ok(snapshot) => {
                     let mut response = Vec::new();
                     write_runtime_map_snapshot(&mut response, &snapshot)?;
-                    if let Some((credential, target)) = response_auth {
-                        response = sign_frontend_runtime_map_response_payload(
-                            kind,
-                            &credential,
-                            target,
-                            authority_now_ms,
-                            response,
-                        )?;
-                    }
                     Ok(response)
                 }
                 Err(error) => Err(error),
-            }
+            };
+            return build_frontend_runtime_map_rpc_response(
+                kind,
+                response,
+                response_auth,
+                authority_now_ms,
+            );
         }
         ControlPlaneRpcKind::RuntimeMapStatus => {
             let (payload, response_auth) = match auth_verifier {
@@ -6776,23 +6835,20 @@ where
             };
             let reader = PayloadReader::new(&payload);
             reader.finish()?;
-            match control_plane.runtime_map_status(authority_now_ms) {
+            let response = match control_plane.runtime_map_status(authority_now_ms) {
                 Ok(status) => {
                     let mut response = Vec::new();
                     write_runtime_map_status(&mut response, status)?;
-                    if let Some((credential, target)) = response_auth {
-                        response = sign_frontend_runtime_map_response_payload(
-                            kind,
-                            &credential,
-                            target,
-                            authority_now_ms,
-                            response,
-                        )?;
-                    }
                     Ok(response)
                 }
                 Err(error) => Err(error),
-            }
+            };
+            return build_frontend_runtime_map_rpc_response(
+                kind,
+                response,
+                response_auth,
+                authority_now_ms,
+            );
         }
         ControlPlaneRpcKind::PgRuntimeMapSnapshot => {
             let (payload, response_auth) = match auth_verifier {
@@ -6812,23 +6868,20 @@ where
             let mut reader = PayloadReader::new(&payload);
             let pg_id = read_pg_id_request(&mut reader)?;
             reader.finish()?;
-            match control_plane.pg_runtime_map_snapshot(pg_id, authority_now_ms) {
+            let response = match control_plane.pg_runtime_map_snapshot(pg_id, authority_now_ms) {
                 Ok(snapshot) => {
                     let mut response = Vec::new();
                     write_runtime_map_snapshot(&mut response, &snapshot)?;
-                    if let Some((credential, target)) = response_auth {
-                        response = sign_frontend_runtime_map_response_payload(
-                            kind,
-                            &credential,
-                            target,
-                            authority_now_ms,
-                            response,
-                        )?;
-                    }
                     Ok(response)
                 }
                 Err(error) => Err(error),
-            }
+            };
+            return build_frontend_runtime_map_rpc_response(
+                kind,
+                response,
+                response_auth,
+                authority_now_ms,
+            );
         }
         ControlPlaneRpcKind::RefreshNodeHeartbeat => {
             debug_assert_eq!(
@@ -11158,6 +11211,8 @@ mod tests {
         payload: Vec<u8>,
         issued_at_ms: u64,
     ) -> Vec<u8> {
+        let payload = encode_control_plane_rpc_response(Ok(payload))
+            .expect("test runtime-map response should encode");
         sign_frontend_runtime_map_response_payload(
             kind,
             &frontend_signer
@@ -12846,8 +12901,7 @@ mod tests {
                 }
                 let response_payload =
                     signed_runtime_map_response_payload(kind, &response_signer, Vec::new(), 6_500);
-                let response = encode_control_plane_rpc_response(Ok(response_payload)).unwrap();
-                write_control_plane_rpc_frame(&mut stream, kind, &response).unwrap();
+                write_control_plane_rpc_frame(&mut stream, kind, &response_payload).unwrap();
             }
         });
 
@@ -12925,11 +12979,10 @@ mod tests {
                     instance_id: "frontend-2".to_owned(),
                 },
                 1_000,
-                Vec::new(),
+                encode_control_plane_rpc_response(Ok(Vec::new())).unwrap(),
             )
             .unwrap();
-            let response = encode_control_plane_rpc_response(Ok(response_payload)).unwrap();
-            write_control_plane_rpc_frame(&mut stream, kind, &response).unwrap();
+            write_control_plane_rpc_frame(&mut stream, kind, &response_payload).unwrap();
         });
 
         let client = AuthenticatedUnixControlPlaneClient::new(
@@ -12944,6 +12997,52 @@ mod tests {
         assert!(
             matches!(error, ControlPlaneError::RpcProtocol { ref message }
             if message.contains("WrongTarget")),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn authenticated_unix_control_plane_client_verifies_runtime_map_error_response() {
+        let tmp = test_util::tempdir();
+        let socket_path = tmp.path().join("control-plane.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+        let response_signer = frontend_auth_credential("auth-cluster", "frontend-1");
+        let server = std::thread::spawn(move || {
+            let (mut stream, _addr) = listener.accept().unwrap();
+            let (kind, payload) = read_control_plane_rpc_frame(&mut stream).unwrap();
+            assert_eq!(kind, ControlPlaneRpcKind::RuntimeMapStatus);
+            ControlPlaneAuthEnvelope::decode_frame(&payload, CONTROL_PLANE_RPC_MAX_PAYLOAD_LEN)
+                .unwrap();
+            let response_payload = sign_frontend_runtime_map_response_payload(
+                kind,
+                &response_signer
+                    .runtime_map_response_credential_for_frontend()
+                    .expect(
+                        "test frontend credential should derive runtime-map response credential",
+                    ),
+                response_signer.principal().clone(),
+                2_000,
+                encode_control_plane_rpc_response(Err(ControlPlaneError::RpcRemote {
+                    message: "synthetic signed runtime-map error".to_owned(),
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            write_control_plane_rpc_frame(&mut stream, kind, &response_payload).unwrap();
+        });
+
+        let client = AuthenticatedUnixControlPlaneClient::new(
+            UnixControlPlaneClient::new(&socket_path),
+            frontend_auth_credential("auth-cluster", "frontend-1"),
+        );
+        let error = client
+            .runtime_map_status(2_000)
+            .expect_err("signed runtime-map error should decode after auth verification");
+
+        server.join().unwrap();
+        assert!(
+            matches!(error, ControlPlaneError::RpcRemote { ref message }
+            if message.contains("synthetic signed runtime-map error")),
             "unexpected error: {error}"
         );
     }
