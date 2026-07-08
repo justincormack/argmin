@@ -289,6 +289,27 @@ pub struct RawChecksum {
     bytes: [u8; Self::MAX_LEN],
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RawChecksumError {
+    pub algorithm: ChecksumAlgorithm,
+    pub actual_len: usize,
+    pub expected_len: usize,
+}
+
+impl std::fmt::Display for RawChecksumError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "checksum byte length {} does not match {} (expected {})",
+            self.actual_len,
+            self.algorithm.as_str(),
+            self.expected_len
+        )
+    }
+}
+
+impl std::error::Error for RawChecksumError {}
+
 impl RawChecksum {
     const MAX_LEN: usize = 64;
 
@@ -296,11 +317,15 @@ impl RawChecksum {
     pub fn new(
         algorithm: ChecksumAlgorithm,
         bytes: impl AsRef<[u8]>,
-    ) -> Result<Self, &'static str> {
+    ) -> Result<Self, RawChecksumError> {
         let bytes = bytes.as_ref();
         let expected = algorithm.expected_byte_length();
         if bytes.len() != expected {
-            return Err("checksum byte length does not match algorithm");
+            return Err(RawChecksumError {
+                algorithm,
+                actual_len: bytes.len(),
+                expected_len: expected,
+            });
         }
 
         let mut stored = [0u8; Self::MAX_LEN];
@@ -331,14 +356,39 @@ pub struct ChecksumBytes {
     bytes: [u8; Self::MAX_LEN],
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChecksumBytesError {
+    Empty,
+    TooLong { len: usize, max: usize },
+}
+
+impl std::fmt::Display for ChecksumBytesError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Empty => f.write_str("checksum byte length must be at least 1"),
+            Self::TooLong { len, max } => {
+                write!(f, "checksum byte length {len} exceeds maximum {max}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ChecksumBytesError {}
+
 impl ChecksumBytes {
     pub const MAX_LEN: usize = 64;
 
     /// Construct inline checksum bytes, validating only the bounded size.
-    pub fn new(bytes: impl AsRef<[u8]>) -> Result<Self, &'static str> {
+    pub fn new(bytes: impl AsRef<[u8]>) -> Result<Self, ChecksumBytesError> {
         let bytes = bytes.as_ref();
-        if bytes.is_empty() || bytes.len() > Self::MAX_LEN {
-            return Err("checksum byte length must be between 1 and 64");
+        if bytes.is_empty() {
+            return Err(ChecksumBytesError::Empty);
+        }
+        if bytes.len() > Self::MAX_LEN {
+            return Err(ChecksumBytesError::TooLong {
+                len: bytes.len(),
+                max: Self::MAX_LEN,
+            });
         }
 
         let mut stored = [0u8; Self::MAX_LEN];
@@ -655,11 +705,25 @@ mod tests {
     fn raw_checksum_invalid_length() {
         // CRC32 with wrong length
         let result = RawChecksum::new(ChecksumAlgorithm::Crc32, vec![1, 2, 3]);
-        assert!(result.is_err());
+        assert_eq!(
+            result.unwrap_err(),
+            RawChecksumError {
+                algorithm: ChecksumAlgorithm::Crc32,
+                actual_len: 3,
+                expected_len: 4,
+            }
+        );
 
         // SHA256 with wrong length
         let result = RawChecksum::new(ChecksumAlgorithm::Sha256, vec![0; 16]);
-        assert!(result.is_err());
+        assert_eq!(
+            result.unwrap_err(),
+            RawChecksumError {
+                algorithm: ChecksumAlgorithm::Sha256,
+                actual_len: 16,
+                expected_len: 32,
+            }
+        );
     }
 
     #[test]
@@ -670,7 +734,13 @@ mod tests {
 
     #[test]
     fn checksum_bytes_invalid_length() {
-        assert!(ChecksumBytes::new([]).is_err());
-        assert!(ChecksumBytes::new([0u8; 65]).is_err());
+        assert_eq!(
+            ChecksumBytes::new([]).unwrap_err(),
+            ChecksumBytesError::Empty
+        );
+        assert_eq!(
+            ChecksumBytes::new([0u8; 65]).unwrap_err(),
+            ChecksumBytesError::TooLong { len: 65, max: 64 }
+        );
     }
 }

@@ -96,12 +96,11 @@ impl PgStore {
         blob: Vec<u8>,
         col: usize,
     ) -> Result<checksum::ChecksumBytes, rusqlite::Error> {
-        let len = blob.len();
-        checksum::ChecksumBytes::new(&blob).map_err(|_| {
+        checksum::ChecksumBytes::new(&blob).map_err(|err| {
             rusqlite::Error::FromSqlConversionFailure(
                 col,
                 rusqlite::types::Type::Blob,
-                Box::from(format!("invalid checksum length: {len} (expected 1..=32)")),
+                Box::new(err),
             )
         })
     }

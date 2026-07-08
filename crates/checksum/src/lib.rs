@@ -18,6 +18,6 @@ mod types;
 
 pub use hash::{compute_checksum, ChecksumHasher};
 pub use types::{
-    ChecksumAlgorithm, ChecksumBytes, ChecksumType, InvalidChecksumConfig, MultipartChecksumConfig,
-    RawChecksum,
+    ChecksumAlgorithm, ChecksumBytes, ChecksumBytesError, ChecksumType, InvalidChecksumConfig,
+    MultipartChecksumConfig, RawChecksum, RawChecksumError,
 };

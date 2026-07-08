@@ -1050,10 +1050,11 @@ each is one refactor away from a panic:
   `SseCustomerObjectState::decode`/`SseS3ObjectState::decode`/
   `ObjectEncryption::decode -> Result<_, String>` was fixed by adding
   `ObjectEncryptionDecodeError` typed variants for persisted encryption-state
-  shape/version/length errors; `validate ->
-  Result<(), &'static str>` (types.rs:3100); `RawChecksum::new`/
-  `ChecksumBytes::new -> Result<_, &'static str>` (`checksum/src/types.rs:301,
-  340`, callers all discard the message);
+  shape/version/length errors; `RawChecksum::new`/`ChecksumBytes::new ->
+  Result<_, &'static str>` was fixed with typed `RawChecksumError` and
+  `ChecksumBytesError` variants, with storage/RPC/server boundaries preserving
+  their existing outer classifications; `validate -> Result<(), &'static str>`
+  (types.rs:3100);
   `SseCustomerValidatorConfig::from_base64`/`ManagedWrappingKeyConfig::
   from_base64 -> Result<_, String>` (`sse.rs:112, 147`). Remaining fix:
   small typed error enums throughout.

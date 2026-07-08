@@ -11875,8 +11875,7 @@ pub(crate) fn decode_optional_checksum_metadata(
     let checksum = match tag {
         0 => None,
         1 => Some(
-            ChecksumBytes::new(decoder.read_bytes()?)
-                .map_err(StorageRpcPayloadError::InvalidChecksumMetadata)?,
+            ChecksumBytes::new(decoder.read_bytes()?).map_err(invalid_checksum_metadata_error)?,
         ),
         _ => {
             return Err(StorageRpcPayloadError::InvalidChecksumMetadata(
@@ -11886,6 +11885,13 @@ pub(crate) fn decode_optional_checksum_metadata(
     };
     decoder.finish()?;
     Ok(checksum)
+}
+
+fn invalid_checksum_metadata_error(err: checksum::ChecksumBytesError) -> StorageRpcPayloadError {
+    StorageRpcPayloadError::InvalidChecksumMetadata(match err {
+        checksum::ChecksumBytesError::Empty => "checksum metadata is empty",
+        checksum::ChecksumBytesError::TooLong { .. } => "checksum metadata is too large",
+    })
 }
 
 fn validate_shard_write_payload(
@@ -14501,8 +14507,7 @@ impl<'a> StorageRpcDecoder<'a> {
         match self.read_u8()? {
             0 => Ok(None),
             1 => Some(
-                ChecksumBytes::new(self.read_bytes()?)
-                    .map_err(StorageRpcPayloadError::InvalidChecksumMetadata),
+                ChecksumBytes::new(self.read_bytes()?).map_err(invalid_checksum_metadata_error),
             )
             .transpose(),
             _ => Err(StorageRpcPayloadError::InvalidChecksumMetadata(

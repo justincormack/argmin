@@ -268,13 +268,13 @@ impl Coordinator {
 
             let checksum = if let Some(raw) = &part.record.checksum {
                 match system_metadata.checksum_algorithm() {
-                    Some(algo) => Some(RawChecksum::new(algo, raw.as_slice()).map_err(|_| {
+                    Some(algo) => Some(RawChecksum::new(algo, raw.as_slice()).map_err(|err| {
                         ServerError::InternalError {
                             reason: format!(
                                 "stored checksum length {} does not match {} (expected {})",
-                                raw.as_slice().len(),
-                                algo.as_str(),
-                                algo.expected_byte_length(),
+                                err.actual_len,
+                                err.algorithm.as_str(),
+                                err.expected_len,
                             ),
                         }
                     })?),
@@ -497,13 +497,13 @@ impl Coordinator {
 
             let checksum = if let Some(raw) = &part.checksum {
                 match system_metadata.checksum_algorithm() {
-                    Some(algo) => Some(RawChecksum::new(algo, raw.as_slice()).map_err(|_| {
+                    Some(algo) => Some(RawChecksum::new(algo, raw.as_slice()).map_err(|err| {
                         ServerError::InternalError {
                             reason: format!(
                                 "stored checksum length {} does not match {} (expected {})",
-                                raw.as_slice().len(),
-                                algo.as_str(),
-                                algo.expected_byte_length(),
+                                err.actual_len,
+                                err.algorithm.as_str(),
+                                err.expected_len,
                             ),
                         }
                     })?),
