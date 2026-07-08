@@ -185,10 +185,12 @@ frontend, admin, and runtime-map paths.
    unknown credential id, and transfer-leader replay/fence failures are rejected
    before OpenRaft dispatch and before checkpoint mutation.
 8. **Closeout and deferred paths.** Close the Phase 12.4 auth slice only once
-   Raft peer RPCs enforce authenticated configured peer identity. Storage-node
-   heartbeat/refresh, frontend runtime-map reads, admin RPCs, and authenticated
-   runtime-map responses remain later Phase 12 / production-cutover work unless
-   explicitly pulled into scope.
+   every internal control-plane path that can cross the Unix/process boundary
+   has an explicit auth decision: Raft peer RPCs, storage-node heartbeat
+   refresh, frontend runtime-map reads, admin RPCs, and authenticated
+   runtime-map/admin responses. Any remaining unauthenticated mode must be an
+   explicit opt-out for local tests or pre-production deployments, not an
+   accidental fallback.
 
 The first implementation slice should start with items 1 and 2 if they remain
 small enough to review together. Raft transport wiring should wait until the
@@ -288,8 +290,9 @@ Status:
   credentials for multi-node process peer mode. This closes security finding
   `security/codex-e41688b` via commits `09fa6d0c`, `d5f7b19b`, `a260b300`,
   `c03e0c85`, `2f4090ae`, `fa8a5fa4`, and `d08d5d25`. Storage-node,
-  frontend, admin, and runtime-map response auth remain separate follow-on
-  slices.
+  frontend, admin, and runtime-map response auth were then pulled into this
+  plan as follow-on slices so the shared auth foundation covers the broader
+  control-plane boundary rather than only Raft.
 - Raft peer process/env config now accepts overlapping credential identities for
   a node as long as the credential id/version pair is unique. Peer verifiers
   accept every configured overlapping credential, while the local Raft peer
@@ -481,6 +484,11 @@ Progress:
   response status bodies before decoding them. Response verification samples
   receive time separately from request signing time, matching the runtime-map
   and heartbeat response freshness shape.
+- 2026-07-08: Storage-node, frontend, admin, runtime-map response, and admin
+  response auth now all support staged credential rotation. Process/env config
+  accepts overlapping credentials for the same principal when the credential
+  id/version pair is unique, verifiers retain all configured versions, and local
+  clients sign with the highest configured version for their principal.
 
 ## Replay Policy
 
@@ -555,10 +563,13 @@ Do not expose secrets, MACs, raw credential material, or full internal payloads.
 ## Phase Relationship
 
 - **Phase 12.4:** design and implement the shared foundation; enforce it first
-  on Raft peer RPCs.
-- **Later Phase 12 / production cutover:** extend enforcement to storage-node
-  heartbeat/refresh, frontend runtime-map reads, and admin control-plane RPCs
-  before those paths are used across a real multi-host boundary.
+  on Raft peer RPCs, then extend the same envelope/credential model to
+  storage-node heartbeat refresh, frontend runtime-map reads, admin
+  control-plane RPCs, and authenticated control-plane responses.
+- **Later Phase 12 / production cutover:** decide when each auth mode becomes
+  mandatory in production configuration, add any required external secret
+  distribution/rotation automation, and revisit asymmetric or mTLS-backed
+  credential primitives if symmetric cluster credentials become too broad.
 - **Out of scope for this plan:** public S3 authentication/authorization,
   external tenant identity, data-plane storage RPC authorization beyond the
   control-plane identity needed to issue routing/fencing decisions, and
