@@ -839,6 +839,28 @@ impl ObjectEncryptionType {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum ObjectEncryptionDecodeError {
+    #[error("unexpected encryption_state for unencrypted object")]
+    UnexpectedStateForUnencryptedObject,
+    #[error("missing encryption_state for SSE-C object")]
+    MissingSseCustomerState,
+    #[error("missing encryption_state for SSE-S3 object")]
+    MissingSseS3State,
+    #[error("invalid SSE-C state length {actual} (minimum {minimum})")]
+    InvalidSseCustomerStateLength { actual: usize, minimum: usize },
+    #[error("unsupported SSE-C state version {version}")]
+    UnsupportedSseCustomerStateVersion { version: u8 },
+    #[error("invalid SSE-C checksum metadata length {declared} (remaining {remaining})")]
+    InvalidSseCustomerChecksumMetadataLength { declared: usize, remaining: usize },
+    #[error("invalid SSE-S3 state length {actual} (minimum {minimum})")]
+    InvalidSseS3StateLength { actual: usize, minimum: usize },
+    #[error("unsupported SSE-S3 state version {version}")]
+    UnsupportedSseS3StateVersion { version: u8 },
+    #[error("invalid SSE-S3 checksum metadata length {declared} (remaining {remaining})")]
+    InvalidSseS3ChecksumMetadataLength { declared: usize, remaining: usize },
+}
+
 /// Service-managed server-side encryption algorithms exposed through the S3 API.
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -945,16 +967,19 @@ impl SseCustomerObjectState {
         out
     }
 
-    pub fn decode(bytes: &[u8]) -> Result<Self, String> {
+    pub fn decode(bytes: &[u8]) -> Result<Self, ObjectEncryptionDecodeError> {
         if bytes.len() < Self::FIXED_ENCODED_LEN {
-            return Err(format!(
-                "invalid SSE-C state length {} (minimum {})",
-                bytes.len(),
-                Self::FIXED_ENCODED_LEN
-            ));
+            return Err(ObjectEncryptionDecodeError::InvalidSseCustomerStateLength {
+                actual: bytes.len(),
+                minimum: Self::FIXED_ENCODED_LEN,
+            });
         }
         if bytes[0] != Self::VERSION {
-            return Err(format!("unsupported SSE-C state version {}", bytes[0]));
+            return Err(
+                ObjectEncryptionDecodeError::UnsupportedSseCustomerStateVersion {
+                    version: bytes[0],
+                },
+            );
         }
 
         let mut cursor = 1;
@@ -997,11 +1022,12 @@ impl SseCustomerObjectState {
                 .expect("slice length checked"),
         ) as usize;
         if cursor + checksum_len != bytes.len() {
-            return Err(format!(
-                "invalid SSE-C checksum metadata length {} (remaining {})",
-                checksum_len,
-                bytes.len().saturating_sub(cursor)
-            ));
+            return Err(
+                ObjectEncryptionDecodeError::InvalidSseCustomerChecksumMetadataLength {
+                    declared: checksum_len,
+                    remaining: bytes.len().saturating_sub(cursor),
+                },
+            );
         }
         let encrypted_checksum_metadata = take(&mut cursor, checksum_len).to_vec();
 
@@ -1070,16 +1096,17 @@ impl SseS3ObjectState {
         out
     }
 
-    pub fn decode(bytes: &[u8]) -> Result<Self, String> {
+    pub fn decode(bytes: &[u8]) -> Result<Self, ObjectEncryptionDecodeError> {
         if bytes.len() < Self::FIXED_ENCODED_LEN {
-            return Err(format!(
-                "invalid SSE-S3 state length {} (minimum {})",
-                bytes.len(),
-                Self::FIXED_ENCODED_LEN
-            ));
+            return Err(ObjectEncryptionDecodeError::InvalidSseS3StateLength {
+                actual: bytes.len(),
+                minimum: Self::FIXED_ENCODED_LEN,
+            });
         }
         if bytes[0] != Self::VERSION {
-            return Err(format!("unsupported SSE-S3 state version {}", bytes[0]));
+            return Err(ObjectEncryptionDecodeError::UnsupportedSseS3StateVersion {
+                version: bytes[0],
+            });
         }
 
         let mut cursor = 1;
@@ -1113,11 +1140,12 @@ impl SseS3ObjectState {
                 .expect("slice length checked"),
         ) as usize;
         if cursor + checksum_len != bytes.len() {
-            return Err(format!(
-                "invalid SSE-S3 checksum metadata length {} (remaining {})",
-                checksum_len,
-                bytes.len().saturating_sub(cursor)
-            ));
+            return Err(
+                ObjectEncryptionDecodeError::InvalidSseS3ChecksumMetadataLength {
+                    declared: checksum_len,
+                    remaining: bytes.len().saturating_sub(cursor),
+                },
+            );
         }
         let encrypted_checksum_metadata = take(&mut cursor, checksum_len).to_vec();
 
@@ -1200,23 +1228,23 @@ impl ObjectEncryption {
     pub fn decode(
         encryption_type: ObjectEncryptionType,
         state: Option<Vec<u8>>,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, ObjectEncryptionDecodeError> {
         match (encryption_type, state) {
             (ObjectEncryptionType::None, None) => Ok(Self::None),
             (ObjectEncryptionType::None, Some(_)) => {
-                Err("unexpected encryption_state for unencrypted object".to_string())
+                Err(ObjectEncryptionDecodeError::UnexpectedStateForUnencryptedObject)
             }
             (ObjectEncryptionType::SseCustomer, Some(bytes)) => {
                 Ok(Self::SseCustomer(SseCustomerObjectState::decode(&bytes)?))
             }
             (ObjectEncryptionType::SseCustomer, None) => {
-                Err("missing encryption_state for SSE-C object".to_string())
+                Err(ObjectEncryptionDecodeError::MissingSseCustomerState)
             }
             (ObjectEncryptionType::SseS3, Some(bytes)) => {
                 Ok(Self::SseS3(SseS3ObjectState::decode(&bytes)?))
             }
             (ObjectEncryptionType::SseS3, None) => {
-                Err("missing encryption_state for SSE-S3 object".to_string())
+                Err(ObjectEncryptionDecodeError::MissingSseS3State)
             }
         }
     }
@@ -4270,6 +4298,64 @@ mod tests {
             OBJECT_ENCRYPTION_SEGMENT_TAG_LEN
         );
         assert!(!decoded.uses_sse_customer_headers());
+    }
+
+    #[test]
+    fn object_encryption_decode_reports_typed_errors() {
+        assert_eq!(
+            ObjectEncryption::decode(ObjectEncryptionType::None, Some(vec![1])).unwrap_err(),
+            ObjectEncryptionDecodeError::UnexpectedStateForUnencryptedObject
+        );
+        assert_eq!(
+            ObjectEncryption::decode(ObjectEncryptionType::SseCustomer, None).unwrap_err(),
+            ObjectEncryptionDecodeError::MissingSseCustomerState
+        );
+        assert_eq!(
+            ObjectEncryption::decode(ObjectEncryptionType::SseS3, None).unwrap_err(),
+            ObjectEncryptionDecodeError::MissingSseS3State
+        );
+
+        assert_eq!(
+            SseS3ObjectState::decode(&[]).unwrap_err(),
+            ObjectEncryptionDecodeError::InvalidSseS3StateLength {
+                actual: 0,
+                minimum: SseS3ObjectState::FIXED_ENCODED_LEN,
+            }
+        );
+
+        let state = SseS3ObjectState {
+            wrapping_key_id: 7,
+            wrap_nonce: [1u8; SSE_S3_WRAP_NONCE_LEN],
+            wrapped_dek: [2u8; SSE_S3_WRAPPED_DEK_LEN],
+            segment_nonce_prefix: [3u8; SSE_S3_SEGMENT_NONCE_PREFIX_LEN],
+            checksum_nonce: [4u8; SSE_S3_CHECKSUM_NONCE_LEN],
+            encrypted_checksum_metadata: Vec::new(),
+        };
+        let mut encoded = state.encode();
+        encoded[0] = 99;
+        assert_eq!(
+            SseS3ObjectState::decode(&encoded).unwrap_err(),
+            ObjectEncryptionDecodeError::UnsupportedSseS3StateVersion { version: 99 }
+        );
+
+        let mut encoded = state.encode();
+        let checksum_len_offset = SseS3ObjectState::FIXED_ENCODED_LEN - 2;
+        encoded[checksum_len_offset..checksum_len_offset + 2].copy_from_slice(&1u16.to_be_bytes());
+        assert_eq!(
+            SseS3ObjectState::decode(&encoded).unwrap_err(),
+            ObjectEncryptionDecodeError::InvalidSseS3ChecksumMetadataLength {
+                declared: 1,
+                remaining: 0,
+            }
+        );
+
+        assert_eq!(
+            SseCustomerObjectState::decode(&[]).unwrap_err(),
+            ObjectEncryptionDecodeError::InvalidSseCustomerStateLength {
+                actual: 0,
+                minimum: SseCustomerObjectState::FIXED_ENCODED_LEN,
+            }
+        );
     }
 
     #[test]

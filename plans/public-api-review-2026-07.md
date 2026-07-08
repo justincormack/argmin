@@ -1045,16 +1045,16 @@ each is one refactor away from a panic:
   `AclGrants::parse -> Result<_, String>` (`s3-types/src/lib.rs:843`, both
   consumers immediately wrap it); `PgTopology::new -> Result<_, &'static str>`
   (`pg_topology.rs:57`, consumers `.unwrap()`/`.expect()` it);
-  `SseCustomerObjectState::decode`/`SseS3ObjectState::decode ->
-  Result<_, String>` (`storage/src/types.rs:948, 1073`); `validate ->
+  `SseCustomerObjectState::decode`/`SseS3ObjectState::decode`/
+  `ObjectEncryption::decode -> Result<_, String>` was fixed by adding
+  `ObjectEncryptionDecodeError` typed variants for persisted encryption-state
+  shape/version/length errors; `validate ->
   Result<(), &'static str>` (types.rs:3100); `RawChecksum::new`/
   `ChecksumBytes::new -> Result<_, &'static str>` (`checksum/src/types.rs:301,
   340`, callers all discard the message);
   `SseCustomerValidatorConfig::from_base64`/`ManagedWrappingKeyConfig::
-  from_base64 -> Result<_, String>` (`sse.rs:112, 147`). Grew at re-review:
-  new instance `ObjectEncryptionState::decode -> Result<_, String>`
-  (`storage/src/types.rs:1200-1203`). Fix: small typed error enums
-  throughout.
+  from_base64 -> Result<_, String>` (`sse.rs:112, 147`). Remaining fix:
+  small typed error enums throughout.
 - [ ] `parse_bucket_policy` doesn't enforce its own exported
   `MAX_BUCKET_POLICY_BYTES` (`bucket_policy.rs:8, 1169-1175`); only
   server-core enforces it, against the normalized output not the raw input

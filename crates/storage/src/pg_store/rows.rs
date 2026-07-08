@@ -1131,11 +1131,11 @@ impl PgStore {
             "encryption_type",
             ObjectEncryptionType::from_u8,
         )?;
-        ObjectEncryption::decode(encryption_type, raw_state).map_err(|msg| {
+        ObjectEncryption::decode(encryption_type, raw_state).map_err(|err| {
             rusqlite::Error::FromSqlConversionFailure(
                 state_col_idx,
                 rusqlite::types::Type::Blob,
-                Box::from(msg),
+                Box::new(err),
             )
         })
     }
