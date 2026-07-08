@@ -1571,6 +1571,7 @@ fn local_debug_metrics_body(state: &Arc<ServerState>) -> String {
             "storage_rpc_pending_envelope_oldest_active_us {}\n",
             "storage_rpc_pending_envelope_oldest_active_node_id {}\n",
             "storage_rpc_pending_envelope_oldest_active_request_id {}\n",
+            "bucket_lock_wait_exceeded_total {}\n",
             "shard_scavenger_observation_total {}\n",
             "shard_scavenger_scan_incomplete_total {}\n",
             "metadata_command_conflict_total {}\n",
@@ -1676,6 +1677,7 @@ fn local_debug_metrics_body(state: &Arc<ServerState>) -> String {
         snapshot.storage_rpc_pending_envelope_oldest_active_us,
         snapshot.storage_rpc_pending_envelope_oldest_active_node_id,
         snapshot.storage_rpc_pending_envelope_oldest_active_request_id,
+        snapshot.bucket_lock_wait_exceeded_total,
         snapshot.shard_scavenger_observation_total,
         snapshot.shard_scavenger_scan_incomplete_total,
         snapshot.metadata_command_conflict_total,
@@ -5333,7 +5335,7 @@ mod tests {
         assert!(response.contains("metadata_command_checkpoint_record_scan_error_total "));
         assert!(response.contains("request_admission_wait_total "));
         assert!(response.contains("request_admission_timeout_total "));
-        assert!(!response.contains("bucket_lock_wait_exceeded_total "));
+        assert!(response.contains("bucket_lock_wait_exceeded_total "));
     }
 
     #[tokio::test(flavor = "multi_thread")]

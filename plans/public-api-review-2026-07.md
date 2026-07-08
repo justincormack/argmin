@@ -983,8 +983,8 @@ each is one refactor away from a panic:
 - [ ] Metrics render site pairs ~100+ name strings positionally with values
   in one giant `concat!` (`server-http/src/http/serve.rs:1466+`); tests check
   presence, not values, so a transposition mislabels metrics silently.
-  `bucket_lock_wait_exceeded_total` is deliberately excluded from export
-  (test serve.rs:5195) with no documentation why. Mitigated but not fixed:
+  `bucket_lock_wait_exceeded_total` is now exported by the debug endpoint, but
+  the broader positional render-site hazard remains. Mitigated but not fixed:
   the whole endpoint is now behind
   `cfg(any(test, feature = "local-debug-endpoints"))`. Fix: observability
   exposes `MetricsSnapshot::iter_named() -> impl Iterator<Item = (&'static
