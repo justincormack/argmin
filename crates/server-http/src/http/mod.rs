@@ -4461,7 +4461,7 @@ impl HttpFrontend {
             TRACE_TARGET,
             observability::StreamUploadPhaseSummary {
                 operation: "UploadPart",
-                phase: "session_aborted",
+                phase: observability::StreamUploadPhase::SessionAborted,
                 bucket: ctx.bucket().as_str(),
                 key: ctx.key().as_str(),
                 upload_id: Some(ctx.upload_id().as_str()),

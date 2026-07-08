@@ -989,15 +989,17 @@ each is one refactor away from a panic:
 
 ### P5. Canonical tokens duplicated across crates / stringly-typed dispatch
 
-- [ ] Observability dimension keys are `&'static str` matched with silent
+- [x] Observability dimension keys are `&'static str` matched with silent
   `_ => {}` fallthrough (`lib.rs:1764-1790, 2317-2331, 3111-3125`):
   stream-upload `phase`, storage-rpc `admission_class`, background-work
   `event`. Live instance still live at re-review: server-http emits phase
   `"finalize_started"` (`serve.rs:4251`) which matches no arm — counter
-  silently never updates. Fix: `enum StreamUploadPhase` /
-  `StorageRpcAdmissionClass` / `BackgroundWorkEvent` in observability
-  (storage still keeps its private class enum in
-  `node_client/unix_admission.rs` — move it), match exhaustively.
+  silently never updates. Fixed by adding closed observability enums for
+  `StreamUploadPhase`, `StorageRpcAdmissionClass`, `BackgroundWorkClass`, and
+  `BackgroundWorkAdmissionEvent`, updating callers to pass those enums instead
+  of raw strings, matching counters exhaustively, moving storage RPC admission
+  onto the observability class, and adding
+  `stream_upload_finalize_started_total`.
 - [ ] `VersionId` has `Display` in s3-types but its inverse parser lives in
   server-http and is lossier (`mod.rs:128-137` accepts `versionId=0` as the
   null version via `from_u64(0)`, `s3-types/lib.rs:493-497`, which Display

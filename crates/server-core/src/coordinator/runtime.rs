@@ -86,16 +86,20 @@ enum BackgroundWorkClass {
 }
 
 impl BackgroundWorkClass {
-    fn name(self) -> &'static str {
+    fn observability_class(self) -> observability::BackgroundWorkClass {
         match self {
-            Self::KnownDamageRepair => "known_damage_repair",
-            Self::BackfillCandidateScan => "backfill_candidate_scan",
-            Self::RoutineBackfill => "routine_backfill",
-            Self::ReclaimCleanup => "reclaim_cleanup",
-            Self::LifecycleCleanup => "lifecycle_cleanup",
-            Self::StreamSessionCleanup => "stream_session_cleanup",
-            Self::OpportunisticScan => "opportunistic_scan",
-            Self::RoutineMetadataCheckpoint => "routine_metadata_checkpoint",
+            Self::KnownDamageRepair => observability::BackgroundWorkClass::KnownDamageRepair,
+            Self::BackfillCandidateScan => {
+                observability::BackgroundWorkClass::BackfillCandidateScan
+            }
+            Self::RoutineBackfill => observability::BackgroundWorkClass::RoutineBackfill,
+            Self::ReclaimCleanup => observability::BackgroundWorkClass::ReclaimCleanup,
+            Self::LifecycleCleanup => observability::BackgroundWorkClass::LifecycleCleanup,
+            Self::StreamSessionCleanup => observability::BackgroundWorkClass::StreamSessionCleanup,
+            Self::OpportunisticScan => observability::BackgroundWorkClass::OpportunisticScan,
+            Self::RoutineMetadataCheckpoint => {
+                observability::BackgroundWorkClass::RoutineMetadataCheckpoint
+            }
         }
     }
 }
@@ -198,7 +202,11 @@ impl BackgroundWorkAdmission {
                 Ordering::Acquire,
             ) {
                 Ok(_) => {
-                    self.emit(class, "admitted", None);
+                    self.emit(
+                        class,
+                        observability::BackgroundWorkAdmissionEvent::Admitted,
+                        None,
+                    );
                     return Some(BackgroundWorkPermit {
                         admission: Arc::clone(self),
                         class,
@@ -209,11 +217,18 @@ impl BackgroundWorkAdmission {
                 Err(observed) => active = observed,
             }
         }
-        self.emit(class, "denied_limit", None);
+        self.emit(
+            class,
+            observability::BackgroundWorkAdmissionEvent::DeniedLimit,
+            None,
+        );
         None
     }
 
-    fn policy_denial_event(&self, class: BackgroundWorkClass) -> Option<&'static str> {
+    fn policy_denial_event(
+        &self,
+        class: BackgroundWorkClass,
+    ) -> Option<observability::BackgroundWorkAdmissionEvent> {
         let pressure = self.observe_pressure();
         self.policy_denial_event_for_pressure(class, pressure)
     }
@@ -222,7 +237,7 @@ impl BackgroundWorkAdmission {
         &self,
         class: BackgroundWorkClass,
         pressure: BackgroundWorkPressure,
-    ) -> Option<&'static str> {
+    ) -> Option<observability::BackgroundWorkAdmissionEvent> {
         match class {
             BackgroundWorkClass::KnownDamageRepair
             | BackgroundWorkClass::ReclaimCleanup
@@ -230,25 +245,25 @@ impl BackgroundWorkAdmission {
             | BackgroundWorkClass::StreamSessionCleanup => None,
             BackgroundWorkClass::BackfillCandidateScan | BackgroundWorkClass::RoutineBackfill => {
                 if pressure.foreground {
-                    Some("denied_foreground_pressure")
+                    Some(observability::BackgroundWorkAdmissionEvent::DeniedForegroundPressure)
                 } else if self.known_damage_repair_active.load(Ordering::Acquire) > 0 {
-                    Some("denied_known_damage_active")
+                    Some(observability::BackgroundWorkAdmissionEvent::DeniedKnownDamageActive)
                 } else {
                     None
                 }
             }
             BackgroundWorkClass::OpportunisticScan => {
                 if pressure.foreground {
-                    Some("denied_foreground_pressure")
+                    Some(observability::BackgroundWorkAdmissionEvent::DeniedForegroundPressure)
                 } else if pressure.durable_backlog {
-                    Some("denied_backlog_pressure")
+                    Some(observability::BackgroundWorkAdmissionEvent::DeniedBacklogPressure)
                 } else {
                     None
                 }
             }
             BackgroundWorkClass::RoutineMetadataCheckpoint => {
                 if pressure.foreground {
-                    Some("denied_foreground_pressure")
+                    Some(observability::BackgroundWorkAdmissionEvent::DeniedForegroundPressure)
                 } else {
                     None
                 }
@@ -304,11 +319,16 @@ impl BackgroundWorkAdmission {
                 .load(Ordering::Acquire)
     }
 
-    fn emit(&self, class: BackgroundWorkClass, event: &'static str, elapsed_us: Option<u64>) {
+    fn emit(
+        &self,
+        class: BackgroundWorkClass,
+        event: observability::BackgroundWorkAdmissionEvent,
+        elapsed_us: Option<u64>,
+    ) {
         let _ = observability::emit_background_work_admission_event(
             TRACE_TARGET,
             observability::BackgroundWorkAdmissionSummary {
-                class: class.name(),
+                class: class.observability_class(),
                 event,
                 active_total: self.active_total(),
                 elapsed_us,
@@ -384,8 +404,11 @@ impl Drop for BackgroundWorkPermit {
             .fetch_sub(1, Ordering::AcqRel);
         debug_assert!(previous > 0);
         let elapsed_us = u64::try_from(self.started_at.elapsed().as_micros()).unwrap_or(u64::MAX);
-        self.admission
-            .emit(self.class, "finished", Some(elapsed_us));
+        self.admission.emit(
+            self.class,
+            observability::BackgroundWorkAdmissionEvent::Finished,
+            Some(elapsed_us),
+        );
         self.active = false;
     }
 }
@@ -3197,7 +3220,7 @@ mod tests {
         assert_eq!(
             admission
                 .policy_denial_event_for_pressure(BackgroundWorkClass::OpportunisticScan, backlog),
-            Some("denied_backlog_pressure"),
+            Some(observability::BackgroundWorkAdmissionEvent::DeniedBacklogPressure),
             "opportunistic scans should still wait behind durable cleanup/backfill backlog"
         );
         assert_eq!(
@@ -3223,7 +3246,7 @@ mod tests {
                 BackgroundWorkClass::RoutineMetadataCheckpoint,
                 foreground,
             ),
-            Some("denied_foreground_pressure")
+            Some(observability::BackgroundWorkAdmissionEvent::DeniedForegroundPressure)
         );
     }
 

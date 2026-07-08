@@ -46,28 +46,7 @@ pub(crate) enum UnixStorageNodeRpcAdmissionAcquire {
     },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum UnixStorageNodeRpcAdmissionClass {
-    Control,
-    Completion,
-    Progress,
-    StartWrite,
-    Read,
-    List,
-}
-
-impl UnixStorageNodeRpcAdmissionClass {
-    pub(crate) fn as_str(self) -> &'static str {
-        match self {
-            Self::Control => "control",
-            Self::Completion => "completion",
-            Self::Progress => "progress",
-            Self::StartWrite => "start_write",
-            Self::Read => "read",
-            Self::List => "list",
-        }
-    }
-}
+pub(crate) type UnixStorageNodeRpcAdmissionClass = observability::StorageRpcAdmissionClass;
 
 #[derive(Default)]
 struct UnixStorageNodeRpcAdmissionActive {
@@ -203,7 +182,7 @@ impl UnixStorageNodeRpcAdmission {
         }
         active.acquire(UnixStorageNodeRpcAdmissionClass::Control, false);
         observability::storage_rpc_admission_class_acquired(
-            UnixStorageNodeRpcAdmissionClass::Control.as_str(),
+            UnixStorageNodeRpcAdmissionClass::Control,
         );
         Some(UnixStorageNodeRpcAdmissionPermit {
             admission: Arc::clone(self),
@@ -245,7 +224,7 @@ impl UnixStorageNodeRpcAdmission {
         loop {
             if self.can_admit(&active, class, pending_envelope) {
                 active.acquire(class, pending_envelope);
-                observability::storage_rpc_admission_class_acquired(class.as_str());
+                observability::storage_rpc_admission_class_acquired(class);
                 return UnixStorageNodeRpcAdmissionAcquire::Acquired {
                     permit: UnixStorageNodeRpcAdmissionPermit {
                         admission: Arc::clone(self),
@@ -343,7 +322,7 @@ impl Drop for UnixStorageNodeRpcAdmissionPermit {
         active.release(self.class, self.pending_envelope);
         self.admission.capacity_available.notify_all();
         if self.observed_active {
-            observability::storage_rpc_admission_class_released(self.class.as_str());
+            observability::storage_rpc_admission_class_released(self.class);
             self.observed_active = false;
         }
     }

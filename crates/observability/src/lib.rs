@@ -225,6 +225,7 @@ static STREAM_UPLOAD_BODY_READ_COMPLETE_TOTAL: AtomicU64 = AtomicU64::new(0);
 static STREAM_UPLOAD_SEGMENT_APPEND_STARTED_TOTAL: AtomicU64 = AtomicU64::new(0);
 static STREAM_UPLOAD_SEGMENT_APPEND_FINISHED_TOTAL: AtomicU64 = AtomicU64::new(0);
 static STREAM_UPLOAD_SEGMENT_APPEND_ERROR_TOTAL: AtomicU64 = AtomicU64::new(0);
+static STREAM_UPLOAD_FINALIZE_STARTED_TOTAL: AtomicU64 = AtomicU64::new(0);
 static STREAM_UPLOAD_FINALIZE_ERROR_TOTAL: AtomicU64 = AtomicU64::new(0);
 static FLIGHT_RECORDER: OnceLock<Mutex<FlightRecorder>> = OnceLock::new();
 static PANIC_FLIGHT_RECORDER_HOOK: Once = Once::new();
@@ -1315,9 +1316,41 @@ pub struct RequestAdmissionTimeoutSummary<'a> {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StreamUploadPhase {
+    SessionCreated,
+    SessionAborted,
+    SessionFinalized,
+    BodyStarted,
+    BodyReadComplete,
+    SegmentAppendStarted,
+    SegmentAppendFinished,
+    SegmentAppendError,
+    FinalizeStarted,
+    FinalizeError,
+}
+
+impl StreamUploadPhase {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::SessionCreated => "session_created",
+            Self::SessionAborted => "session_aborted",
+            Self::SessionFinalized => "session_finalized",
+            Self::BodyStarted => "body_started",
+            Self::BodyReadComplete => "body_read_complete",
+            Self::SegmentAppendStarted => "segment_append_started",
+            Self::SegmentAppendFinished => "segment_append_finished",
+            Self::SegmentAppendError => "segment_append_error",
+            Self::FinalizeStarted => "finalize_started",
+            Self::FinalizeError => "finalize_error",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StreamUploadPhaseSummary<'a> {
     pub operation: &'static str,
-    pub phase: &'static str,
+    pub phase: StreamUploadPhase,
     pub bucket: &'a str,
     pub key: &'a str,
     pub upload_id: Option<&'a str>,
@@ -1482,11 +1515,87 @@ pub struct MetadataCommandCheckpointRecordErrorSummary {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BackgroundWorkClass {
+    KnownDamageRepair,
+    BackfillCandidateScan,
+    RoutineBackfill,
+    ReclaimCleanup,
+    LifecycleCleanup,
+    StreamSessionCleanup,
+    OpportunisticScan,
+    RoutineMetadataCheckpoint,
+}
+
+impl BackgroundWorkClass {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::KnownDamageRepair => "known_damage_repair",
+            Self::BackfillCandidateScan => "backfill_candidate_scan",
+            Self::RoutineBackfill => "routine_backfill",
+            Self::ReclaimCleanup => "reclaim_cleanup",
+            Self::LifecycleCleanup => "lifecycle_cleanup",
+            Self::StreamSessionCleanup => "stream_session_cleanup",
+            Self::OpportunisticScan => "opportunistic_scan",
+            Self::RoutineMetadataCheckpoint => "routine_metadata_checkpoint",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BackgroundWorkAdmissionEvent {
+    Admitted,
+    Finished,
+    DeniedLimit,
+    DeniedForegroundPressure,
+    DeniedKnownDamageActive,
+    DeniedBacklogPressure,
+}
+
+impl BackgroundWorkAdmissionEvent {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Admitted => "admitted",
+            Self::Finished => "finished",
+            Self::DeniedLimit => "denied_limit",
+            Self::DeniedForegroundPressure => "denied_foreground_pressure",
+            Self::DeniedKnownDamageActive => "denied_known_damage_active",
+            Self::DeniedBacklogPressure => "denied_backlog_pressure",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BackgroundWorkAdmissionSummary {
-    pub class: &'static str,
-    pub event: &'static str,
+    pub class: BackgroundWorkClass,
+    pub event: BackgroundWorkAdmissionEvent,
     pub active_total: usize,
     pub elapsed_us: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StorageRpcAdmissionClass {
+    Control,
+    Completion,
+    Progress,
+    StartWrite,
+    Read,
+    List,
+}
+
+impl StorageRpcAdmissionClass {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Control => "control",
+            Self::Completion => "completion",
+            Self::Progress => "progress",
+            Self::StartWrite => "start_write",
+            Self::Read => "read",
+            Self::List => "list",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1501,7 +1610,7 @@ pub struct StorageRpcErrorSummary<'a> {
 pub struct StorageRpcAdmissionWaitSummary<'a> {
     pub node_id: u32,
     pub rpc_kind: &'a str,
-    pub admission_class: &'a str,
+    pub admission_class: StorageRpcAdmissionClass,
     pub wait_us: u128,
 }
 
@@ -1509,7 +1618,7 @@ pub struct StorageRpcAdmissionWaitSummary<'a> {
 pub struct StorageRpcAdmissionTimeoutSummary<'a> {
     pub node_id: u32,
     pub rpc_kind: &'a str,
-    pub admission_class: &'a str,
+    pub admission_class: StorageRpcAdmissionClass,
     pub wait_us: u128,
     pub timeout_us: u128,
 }
@@ -1635,6 +1744,7 @@ pub struct MetricsSnapshot {
     pub stream_upload_segment_append_started_total: u64,
     pub stream_upload_segment_append_finished_total: u64,
     pub stream_upload_segment_append_error_total: u64,
+    pub stream_upload_finalize_started_total: u64,
     pub stream_upload_finalize_error_total: u64,
 }
 
@@ -2012,6 +2122,10 @@ impl MetricsSnapshot {
                 self.stream_upload_segment_append_error_total,
             ),
             (
+                "stream_upload_finalize_started_total",
+                self.stream_upload_finalize_started_total,
+            ),
+            (
                 "stream_upload_finalize_error_total",
                 self.stream_upload_finalize_error_total,
             ),
@@ -2103,18 +2217,14 @@ pub fn stream_upload_active_session_guard() -> StreamUploadActiveSessionGuard {
     StreamUploadActiveSessionGuard { active: true }
 }
 
-pub fn storage_rpc_admission_class_acquired(admission_class: &'static str) {
+pub fn storage_rpc_admission_class_acquired(admission_class: StorageRpcAdmissionClass) {
     STORAGE_RPC_ACTIVE_TOTAL.fetch_add(1, Ordering::Relaxed);
-    if let Some(counter) = storage_rpc_admission_class_counter(admission_class) {
-        counter.fetch_add(1, Ordering::Relaxed);
-    }
+    storage_rpc_admission_class_counter(admission_class).fetch_add(1, Ordering::Relaxed);
 }
 
-pub fn storage_rpc_admission_class_released(admission_class: &'static str) {
+pub fn storage_rpc_admission_class_released(admission_class: StorageRpcAdmissionClass) {
     STORAGE_RPC_ACTIVE_TOTAL.fetch_sub(1, Ordering::Relaxed);
-    if let Some(counter) = storage_rpc_admission_class_counter(admission_class) {
-        counter.fetch_sub(1, Ordering::Relaxed);
-    }
+    storage_rpc_admission_class_counter(admission_class).fetch_sub(1, Ordering::Relaxed);
 }
 
 #[must_use]
@@ -2149,16 +2259,15 @@ fn storage_rpc_pending_envelope_active_records(
 }
 
 fn storage_rpc_admission_class_counter(
-    admission_class: &'static str,
-) -> Option<&'static AtomicU64> {
+    admission_class: StorageRpcAdmissionClass,
+) -> &'static AtomicU64 {
     match admission_class {
-        "control" => Some(&STORAGE_RPC_ACTIVE_CONTROL),
-        "completion" => Some(&STORAGE_RPC_ACTIVE_COMPLETION),
-        "progress" => Some(&STORAGE_RPC_ACTIVE_PROGRESS),
-        "start_write" => Some(&STORAGE_RPC_ACTIVE_START_WRITE),
-        "read" => Some(&STORAGE_RPC_ACTIVE_READ),
-        "list" => Some(&STORAGE_RPC_ACTIVE_LIST),
-        _ => None,
+        StorageRpcAdmissionClass::Control => &STORAGE_RPC_ACTIVE_CONTROL,
+        StorageRpcAdmissionClass::Completion => &STORAGE_RPC_ACTIVE_COMPLETION,
+        StorageRpcAdmissionClass::Progress => &STORAGE_RPC_ACTIVE_PROGRESS,
+        StorageRpcAdmissionClass::StartWrite => &STORAGE_RPC_ACTIVE_START_WRITE,
+        StorageRpcAdmissionClass::Read => &STORAGE_RPC_ACTIVE_READ,
+        StorageRpcAdmissionClass::List => &STORAGE_RPC_ACTIVE_LIST,
     }
 }
 
@@ -2348,6 +2457,8 @@ pub fn metrics_snapshot() -> MetricsSnapshot {
         stream_upload_segment_append_finished_total: STREAM_UPLOAD_SEGMENT_APPEND_FINISHED_TOTAL
             .load(Ordering::Relaxed),
         stream_upload_segment_append_error_total: STREAM_UPLOAD_SEGMENT_APPEND_ERROR_TOTAL
+            .load(Ordering::Relaxed),
+        stream_upload_finalize_started_total: STREAM_UPLOAD_FINALIZE_STARTED_TOTAL
             .load(Ordering::Relaxed),
         stream_upload_finalize_error_total: STREAM_UPLOAD_FINALIZE_ERROR_TOTAL
             .load(Ordering::Relaxed),
@@ -2684,36 +2795,38 @@ pub fn emit_request_admission_timeout(
     )
 }
 
-fn update_stream_upload_phase_metrics(summary: StreamUploadPhaseSummary<'_>) {
-    match summary.phase {
-        "session_created" => {
+fn update_stream_upload_phase_metrics(phase: StreamUploadPhase) {
+    match phase {
+        StreamUploadPhase::SessionCreated => {
             STREAM_UPLOAD_SESSION_CREATED_TOTAL.fetch_add(1, Ordering::Relaxed);
         }
-        "session_aborted" => {
+        StreamUploadPhase::SessionAborted => {
             STREAM_UPLOAD_SESSION_ABORTED_TOTAL.fetch_add(1, Ordering::Relaxed);
         }
-        "session_finalized" => {
+        StreamUploadPhase::SessionFinalized => {
             STREAM_UPLOAD_SESSION_FINALIZED_TOTAL.fetch_add(1, Ordering::Relaxed);
         }
-        "body_started" => {
+        StreamUploadPhase::BodyStarted => {
             STREAM_UPLOAD_BODY_STARTED_TOTAL.fetch_add(1, Ordering::Relaxed);
         }
-        "body_read_complete" => {
+        StreamUploadPhase::BodyReadComplete => {
             STREAM_UPLOAD_BODY_READ_COMPLETE_TOTAL.fetch_add(1, Ordering::Relaxed);
         }
-        "segment_append_started" => {
+        StreamUploadPhase::SegmentAppendStarted => {
             STREAM_UPLOAD_SEGMENT_APPEND_STARTED_TOTAL.fetch_add(1, Ordering::Relaxed);
         }
-        "segment_append_finished" => {
+        StreamUploadPhase::SegmentAppendFinished => {
             STREAM_UPLOAD_SEGMENT_APPEND_FINISHED_TOTAL.fetch_add(1, Ordering::Relaxed);
         }
-        "segment_append_error" => {
+        StreamUploadPhase::SegmentAppendError => {
             STREAM_UPLOAD_SEGMENT_APPEND_ERROR_TOTAL.fetch_add(1, Ordering::Relaxed);
         }
-        "finalize_error" => {
+        StreamUploadPhase::FinalizeStarted => {
+            STREAM_UPLOAD_FINALIZE_STARTED_TOTAL.fetch_add(1, Ordering::Relaxed);
+        }
+        StreamUploadPhase::FinalizeError => {
             STREAM_UPLOAD_FINALIZE_ERROR_TOTAL.fetch_add(1, Ordering::Relaxed);
         }
-        _ => {}
     }
 }
 
@@ -2722,7 +2835,8 @@ pub fn emit_stream_upload_phase(
     target: &'static str,
     summary: StreamUploadPhaseSummary<'_>,
 ) -> bool {
-    update_stream_upload_phase_metrics(summary);
+    update_stream_upload_phase_metrics(summary.phase);
+    let phase = summary.phase.as_str();
     let upload_id_hash = summary
         .upload_id
         .map(stable_hash_hex)
@@ -2754,7 +2868,7 @@ pub fn emit_stream_upload_phase(
     let detail = truncate_detail(format!(
         "operation={} phase={} bucket_hash={} key_hash={} upload_id_hash={} part_number={} session_id_hash={} segment_index={} body_bytes_received={} segment_bytes={} segment_count={}",
         summary.operation,
-        summary.phase,
+        phase,
         stable_hash_hex(summary.bucket),
         stable_hash_hex(summary.key),
         upload_id_hash,
@@ -2773,7 +2887,7 @@ pub fn emit_stream_upload_phase(
         Some(format_args!(
             "operation={} phase={} bucket_hash={} key_hash={} upload_id_hash={} part_number={} session_id_hash={} segment_index={} body_bytes_received={} segment_bytes={} segment_count={}",
             summary.operation,
-            summary.phase,
+            phase,
             stable_hash_hex(summary.bucket),
             stable_hash_hex(summary.key),
             upload_id_hash,
@@ -3496,10 +3610,10 @@ pub fn emit_background_work_admission_event(
 ) -> bool {
     BACKGROUND_WORK_ADMISSION_EVENT_TOTAL.fetch_add(1, Ordering::Relaxed);
     let global_active_total = match summary.event {
-        "admitted" => BACKGROUND_WORK_ACTIVE_TOTAL
+        BackgroundWorkAdmissionEvent::Admitted => BACKGROUND_WORK_ACTIVE_TOTAL
             .fetch_add(1, Ordering::Relaxed)
             .saturating_add(1),
-        "finished" => {
+        BackgroundWorkAdmissionEvent::Finished => {
             BACKGROUND_WORK_FINISHED_TOTAL.fetch_add(1, Ordering::Relaxed);
             if let Some(elapsed_us) = summary.elapsed_us {
                 BACKGROUND_WORK_ELAPSED_US_TOTAL.fetch_add(elapsed_us, Ordering::Relaxed);
@@ -3508,20 +3622,27 @@ pub fn emit_background_work_admission_event(
                 .fetch_sub(1, Ordering::Relaxed)
                 .saturating_sub(1)
         }
-        _ => BACKGROUND_WORK_ACTIVE_TOTAL.load(Ordering::Relaxed),
+        BackgroundWorkAdmissionEvent::DeniedLimit
+        | BackgroundWorkAdmissionEvent::DeniedForegroundPressure
+        | BackgroundWorkAdmissionEvent::DeniedKnownDamageActive
+        | BackgroundWorkAdmissionEvent::DeniedBacklogPressure => {
+            BACKGROUND_WORK_ACTIVE_TOTAL.load(Ordering::Relaxed)
+        }
     };
-    increment_background_work_admission_dimension(summary.class, summary.event, summary.elapsed_us);
+    let class = summary.class.as_str();
+    let event = summary.event.as_str();
+    increment_background_work_admission_dimension(class, event, summary.elapsed_us);
     let Some(context) = current_context() else {
         return false;
     };
     let detail = match summary.elapsed_us {
         Some(elapsed_us) => format!(
             "class={} event={} global_active_total={} local_active_total={} elapsed_us={}",
-            summary.class, summary.event, global_active_total, summary.active_total, elapsed_us
+            class, event, global_active_total, summary.active_total, elapsed_us
         ),
         None => format!(
             "class={} event={} global_active_total={} local_active_total={}",
-            summary.class, summary.event, global_active_total, summary.active_total
+            class, event, global_active_total, summary.active_total
         ),
     };
     record_flight_event(&context, target, "background_work_admission_event", detail);
@@ -3531,8 +3652,8 @@ pub fn emit_background_work_admission_event(
         "background_work_admission_event",
         Some(format_args!(
             "class={} event={} global_active_total={} local_active_total={} elapsed_us={}",
-            summary.class,
-            summary.event,
+            class,
+            event,
             global_active_total,
             summary.active_total,
             summary.elapsed_us.unwrap_or(0)
@@ -3581,6 +3702,7 @@ pub fn emit_storage_rpc_admission_wait(
     STORAGE_RPC_ADMISSION_WAIT_TOTAL.fetch_add(1, Ordering::Relaxed);
     STORAGE_RPC_ADMISSION_WAIT_US_TOTAL
         .fetch_add(saturating_u128_to_u64(summary.wait_us), Ordering::Relaxed);
+    let admission_class = summary.admission_class.as_str();
     let Some(context) = current_context() else {
         return false;
     };
@@ -3590,7 +3712,7 @@ pub fn emit_storage_rpc_admission_wait(
         "storage_rpc_admission_wait",
         format!(
             "node_id={} rpc_kind={} admission_class={} wait_us={}",
-            summary.node_id, summary.rpc_kind, summary.admission_class, summary.wait_us
+            summary.node_id, summary.rpc_kind, admission_class, summary.wait_us
         ),
     );
     event_in_context(
@@ -3599,7 +3721,7 @@ pub fn emit_storage_rpc_admission_wait(
         "storage_rpc_admission_wait",
         Some(format_args!(
             "node_id={} rpc_kind={} admission_class={} wait_us={}",
-            summary.node_id, summary.rpc_kind, summary.admission_class, summary.wait_us
+            summary.node_id, summary.rpc_kind, admission_class, summary.wait_us
         )),
     )
 }
@@ -3609,6 +3731,7 @@ pub fn emit_storage_rpc_admission_timeout(
     summary: StorageRpcAdmissionTimeoutSummary<'_>,
 ) -> bool {
     STORAGE_RPC_ADMISSION_TIMEOUT_TOTAL.fetch_add(1, Ordering::Relaxed);
+    let admission_class = summary.admission_class.as_str();
     let Some(context) = current_context() else {
         return false;
     };
@@ -3618,11 +3741,7 @@ pub fn emit_storage_rpc_admission_timeout(
         "storage_rpc_admission_timeout",
         format!(
             "node_id={} rpc_kind={} admission_class={} wait_us={} timeout_us={}",
-            summary.node_id,
-            summary.rpc_kind,
-            summary.admission_class,
-            summary.wait_us,
-            summary.timeout_us
+            summary.node_id, summary.rpc_kind, admission_class, summary.wait_us, summary.timeout_us
         ),
     );
     event_in_context(
@@ -3631,11 +3750,7 @@ pub fn emit_storage_rpc_admission_timeout(
         "storage_rpc_admission_timeout",
         Some(format_args!(
             "node_id={} rpc_kind={} admission_class={} wait_us={} timeout_us={}",
-            summary.node_id,
-            summary.rpc_kind,
-            summary.admission_class,
-            summary.wait_us,
-            summary.timeout_us
+            summary.node_id, summary.rpc_kind, admission_class, summary.wait_us, summary.timeout_us
         )),
     )
 }
@@ -4011,6 +4126,7 @@ mod tests {
             bucket_lock_wait_exceeded_total: 33,
             metadata_command_checkpoint_record_compaction_failed_total: 44,
             stream_upload_finalize_error_total: 55,
+            stream_upload_finalize_started_total: 66,
             ..MetricsSnapshot::default()
         };
         let entries: Vec<_> = snapshot.iter_named().collect();
@@ -4035,6 +4151,10 @@ mod tests {
         assert_eq!(
             map.get("stream_upload_finalize_error_total").copied(),
             Some(55)
+        );
+        assert_eq!(
+            map.get("stream_upload_finalize_started_total").copied(),
+            Some(66)
         );
     }
 
@@ -4114,7 +4234,7 @@ mod tests {
             StorageRpcAdmissionWaitSummary {
                 node_id: 7,
                 rpc_kind: "shard write",
-                admission_class: "progress",
+                admission_class: StorageRpcAdmissionClass::Progress,
                 wait_us: 456,
             },
         );
@@ -4123,7 +4243,7 @@ mod tests {
             StorageRpcAdmissionTimeoutSummary {
                 node_id: 7,
                 rpc_kind: "shard write",
-                admission_class: "progress",
+                admission_class: StorageRpcAdmissionClass::Progress,
                 wait_us: 5_000_000,
                 timeout_us: 5_000_000,
             },
@@ -4337,8 +4457,8 @@ mod tests {
         emit_background_work_admission_event(
             "storage",
             BackgroundWorkAdmissionSummary {
-                class: "known_damage_repair",
-                event: "admitted",
+                class: BackgroundWorkClass::KnownDamageRepair,
+                event: BackgroundWorkAdmissionEvent::Admitted,
                 active_total: 1,
                 elapsed_us: None,
             },
@@ -4346,8 +4466,8 @@ mod tests {
         emit_background_work_admission_event(
             "storage",
             BackgroundWorkAdmissionSummary {
-                class: "known_damage_repair",
-                event: "finished",
+                class: BackgroundWorkClass::KnownDamageRepair,
+                event: BackgroundWorkAdmissionEvent::Finished,
                 active_total: 0,
                 elapsed_us: Some(321),
             },
@@ -4381,7 +4501,7 @@ mod tests {
                 "server_http",
                 StreamUploadPhaseSummary {
                     operation: "UploadPart",
-                    phase: "session_created",
+                    phase: StreamUploadPhase::SessionCreated,
                     bucket: "bucket",
                     key: "key",
                     upload_id: Some("upload"),
@@ -4403,7 +4523,7 @@ mod tests {
             "server_http",
             StreamUploadPhaseSummary {
                 operation: "UploadPart",
-                phase: "body_started",
+                phase: StreamUploadPhase::BodyStarted,
                 bucket: "bucket",
                 key: "key",
                 upload_id: Some("upload"),
@@ -4420,7 +4540,7 @@ mod tests {
             "server_http",
             StreamUploadPhaseSummary {
                 operation: "UploadPart",
-                phase: "segment_append_started",
+                phase: StreamUploadPhase::SegmentAppendStarted,
                 bucket: "bucket",
                 key: "key",
                 upload_id: Some("upload"),
@@ -4437,7 +4557,7 @@ mod tests {
             "server_http",
             StreamUploadPhaseSummary {
                 operation: "UploadPart",
-                phase: "segment_append_finished",
+                phase: StreamUploadPhase::SegmentAppendFinished,
                 bucket: "bucket",
                 key: "key",
                 upload_id: Some("upload"),
@@ -4454,7 +4574,7 @@ mod tests {
             "server_http",
             StreamUploadPhaseSummary {
                 operation: "UploadPart",
-                phase: "body_read_complete",
+                phase: StreamUploadPhase::BodyReadComplete,
                 bucket: "bucket",
                 key: "key",
                 upload_id: Some("upload"),
@@ -4471,7 +4591,24 @@ mod tests {
             "server_http",
             StreamUploadPhaseSummary {
                 operation: "UploadPart",
-                phase: "session_finalized",
+                phase: StreamUploadPhase::FinalizeStarted,
+                bucket: "bucket",
+                key: "key",
+                upload_id: Some("upload"),
+                part_number: Some(1),
+                session_id: Some("session"),
+                segment_index: None,
+                body_bytes_received: Some(8),
+                segment_bytes: None,
+                segment_count: Some(1),
+            },
+        );
+        emit_stream_upload_phase(
+            &ctx,
+            "server_http",
+            StreamUploadPhaseSummary {
+                operation: "UploadPart",
+                phase: StreamUploadPhase::SessionFinalized,
                 bucket: "bucket",
                 key: "key",
                 upload_id: Some("upload"),
@@ -4838,6 +4975,10 @@ mod tests {
         assert_eq!(
             after.stream_upload_segment_append_finished_total,
             before.stream_upload_segment_append_finished_total + 1
+        );
+        assert_eq!(
+            after.stream_upload_finalize_started_total,
+            before.stream_upload_finalize_started_total + 1
         );
         assert_eq!(
             after.stream_upload_session_finalized_total,

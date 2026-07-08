@@ -1541,7 +1541,7 @@ impl UnixStorageNodeClient {
                         observability::StorageRpcAdmissionWaitSummary {
                             node_id: self.node_id.as_u32(),
                             rpc_kind: kind.operation_name(),
-                            admission_class: class.as_str(),
+                            admission_class: class,
                             wait_us,
                         },
                     );
@@ -1554,7 +1554,7 @@ impl UnixStorageNodeClient {
                     observability::StorageRpcAdmissionTimeoutSummary {
                         node_id: self.node_id.as_u32(),
                         rpc_kind: kind.operation_name(),
-                        admission_class: class.as_str(),
+                        admission_class: class,
                         wait_us,
                         timeout_us: wait_timeout.as_micros(),
                     },

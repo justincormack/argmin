@@ -416,7 +416,14 @@ impl StreamingAbortGuard {
 
     fn arm_part(&self, ctx: &Arc<super::StreamingPartContext>) {
         let active_session = observability::stream_upload_active_session_guard();
-        emit_streaming_part_phase(ctx, "session_created", None, None, None, None);
+        emit_streaming_part_phase(
+            ctx,
+            observability::StreamUploadPhase::SessionCreated,
+            None,
+            None,
+            None,
+            None,
+        );
         *lock_mutex_unpoisoned(&self.cleanup) = Some(StreamingAbortCleanup::Part {
             ctx: Arc::clone(ctx),
             _active_session: active_session,
@@ -3914,7 +3921,7 @@ async fn handle_streaming_part(
     );
     emit_streaming_part_phase(
         &ctx,
-        "body_read_complete",
+        observability::StreamUploadPhase::BodyReadComplete,
         None,
         Some(total_size),
         None,
@@ -4055,7 +4062,7 @@ async fn handle_streaming_part(
         );
         emit_streaming_part_phase(
             &ctx,
-            "segment_append_started",
+            observability::StreamUploadPhase::SegmentAppendStarted,
             Some(idx),
             Some(total_size),
             Some(buf.len() as u64),
@@ -4102,7 +4109,7 @@ async fn handle_streaming_part(
             Ok((Ok(()), _buf)) => {
                 emit_streaming_part_phase(
                     &ctx,
-                    "segment_append_finished",
+                    observability::StreamUploadPhase::SegmentAppendFinished,
                     Some(idx),
                     Some(total_size),
                     None,
@@ -4112,7 +4119,7 @@ async fn handle_streaming_part(
             Ok((Err(err), _buf)) => {
                 emit_streaming_part_phase(
                     &ctx,
-                    "segment_append_error",
+                    observability::StreamUploadPhase::SegmentAppendError,
                     Some(idx),
                     Some(total_size),
                     None,
@@ -4124,7 +4131,7 @@ async fn handle_streaming_part(
             Err(_) => {
                 emit_streaming_part_phase(
                     &ctx,
-                    "segment_append_error",
+                    observability::StreamUploadPhase::SegmentAppendError,
                     Some(idx),
                     Some(total_size),
                     None,
@@ -4172,7 +4179,7 @@ async fn handle_streaming_part(
     );
     emit_streaming_part_phase(
         &ctx,
-        "finalize_started",
+        observability::StreamUploadPhase::FinalizeStarted,
         None,
         Some(total_size),
         None,
@@ -4225,7 +4232,7 @@ async fn handle_streaming_part(
         Ok(Ok(resp)) => {
             emit_streaming_part_phase(
                 &ctx,
-                "session_finalized",
+                observability::StreamUploadPhase::SessionFinalized,
                 None,
                 Some(total_size),
                 None,
@@ -4236,7 +4243,7 @@ async fn handle_streaming_part(
         Ok(Err(err)) => {
             emit_streaming_part_phase(
                 &ctx,
-                "finalize_error",
+                observability::StreamUploadPhase::FinalizeError,
                 None,
                 Some(total_size),
                 None,
@@ -4248,7 +4255,7 @@ async fn handle_streaming_part(
         Err(_) => {
             emit_streaming_part_phase(
                 &ctx,
-                "finalize_error",
+                observability::StreamUploadPhase::FinalizeError,
                 None,
                 Some(total_size),
                 None,
@@ -4303,7 +4310,7 @@ fn emit_streaming_part_event(
 
 fn emit_streaming_part_phase(
     ctx: &Arc<super::StreamingPartContext>,
-    phase: &'static str,
+    phase: observability::StreamUploadPhase,
     segment_index: Option<u32>,
     body_bytes_received: Option<u64>,
     segment_bytes: Option<u64>,
@@ -4379,7 +4386,7 @@ async fn ingest_streaming_part_payload(
         );
         emit_streaming_part_phase(
             ctx,
-            "body_started",
+            observability::StreamUploadPhase::BodyStarted,
             None,
             Some(*ingest.total_size),
             Some(payload.len() as u64),
@@ -4441,7 +4448,7 @@ async fn ingest_streaming_part_payload(
         );
         emit_streaming_part_phase(
             ctx,
-            "segment_append_started",
+            observability::StreamUploadPhase::SegmentAppendStarted,
             Some(idx),
             Some(*ingest.total_size),
             Some(segment_bytes),
@@ -4488,7 +4495,7 @@ async fn ingest_streaming_part_payload(
             Ok((Ok(()), _flush_data)) => {
                 emit_streaming_part_phase(
                     ctx,
-                    "segment_append_finished",
+                    observability::StreamUploadPhase::SegmentAppendFinished,
                     Some(idx),
                     Some(*ingest.total_size),
                     Some(segment_bytes),
@@ -4498,7 +4505,7 @@ async fn ingest_streaming_part_payload(
             Ok((Err(err), _flush_data)) => {
                 emit_streaming_part_phase(
                     ctx,
-                    "segment_append_error",
+                    observability::StreamUploadPhase::SegmentAppendError,
                     Some(idx),
                     Some(*ingest.total_size),
                     Some(segment_bytes),
@@ -4510,7 +4517,7 @@ async fn ingest_streaming_part_payload(
             Err(_) => {
                 emit_streaming_part_phase(
                     ctx,
-                    "segment_append_error",
+                    observability::StreamUploadPhase::SegmentAppendError,
                     Some(idx),
                     Some(*ingest.total_size),
                     Some(segment_bytes),
