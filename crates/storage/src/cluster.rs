@@ -1658,7 +1658,11 @@ fn metadata_transfer_destination_proof_for_commands(
             command.checksum_crc64(),
         );
     }
-    PgMetadataProof::new(applied_log_index, applied_log_hash, state_digest)
+    PgMetadataProof {
+        applied_log_index,
+        applied_log_hash,
+        state_digest,
+    }
 }
 
 fn retained_log_export_failure_allows_checkpoint_fallback(
@@ -1696,7 +1700,11 @@ fn metadata_transfer_prefix_proof_at_epoch(
             command.checksum_crc64(),
         );
     }
-    PgMetadataProof::new(commands.len() as u64, applied_log_hash, state_digest)
+    PgMetadataProof {
+        applied_log_index: commands.len() as u64,
+        applied_log_hash,
+        state_digest,
+    }
 }
 
 impl StorageCluster {
@@ -1778,19 +1786,19 @@ fn classify_metadata_transfer_import_destination(
     {
         return Err(PgPeeringReconstructionError::PendingMetadataCommand { node_id }.into());
     }
-    let proof = PgMetadataProof::new(
-        state.applied_log_index,
-        state.applied_log_hash,
-        state.state_digest,
-    );
+    let proof = PgMetadataProof {
+        applied_log_index: state.applied_log_index,
+        applied_log_hash: state.applied_log_hash,
+        state_digest: state.state_digest,
+    };
     if state.cluster_epoch == cluster_epoch && proof == expected_import_proof {
         let validated = metadata_client
             .validate_metadata_command_replay_state_preserving_pending_slot(pg_id, cluster_epoch)?;
-        let validated_proof = PgMetadataProof::new(
-            validated.applied_log_index,
-            validated.applied_log_hash,
-            validated.state_digest,
-        );
+        let validated_proof = PgMetadataProof {
+            applied_log_index: validated.applied_log_index,
+            applied_log_hash: validated.applied_log_hash,
+            state_digest: validated.state_digest,
+        };
         if validated_proof == expected_import_proof {
             return Ok(MetadataTransferImportDestination::AlreadyImported(
                 validated,
@@ -1802,11 +1810,11 @@ fn classify_metadata_transfer_import_destination(
         && state.applied_log_hash == 0
         && metadata_client.metadata_command_replica_state_can_initialize(pg_id, cluster_epoch)?
     {
-        let actual_proof = PgMetadataProof::new(
-            state.applied_log_index,
-            state.applied_log_hash,
-            state.state_digest,
-        );
+        let actual_proof = PgMetadataProof {
+            applied_log_index: state.applied_log_index,
+            applied_log_hash: state.applied_log_hash,
+            state_digest: state.state_digest,
+        };
         if actual_proof == base_import_proof {
             return Ok(MetadataTransferImportDestination::Empty);
         }
@@ -1827,11 +1835,11 @@ fn classify_metadata_transfer_import_destination(
     if state.state_digest != expected_import_proof.state_digest {
         if let Some(first_command) = commands.first() {
             if state.state_digest == first_command.pre_state_digest {
-                let actual_proof = PgMetadataProof::new(
-                    state.applied_log_index,
-                    state.applied_log_hash,
-                    state.state_digest,
-                );
+                let actual_proof = PgMetadataProof {
+                    applied_log_index: state.applied_log_index,
+                    applied_log_hash: state.applied_log_hash,
+                    state_digest: state.state_digest,
+                };
                 if base_import_proof.applied_log_index == 0
                     && base_import_proof.applied_log_hash == 0
                     && base_import_proof.state_digest == first_command.pre_state_digest
@@ -1841,11 +1849,11 @@ fn classify_metadata_transfer_import_destination(
                             pg_id,
                             state.cluster_epoch,
                         )?;
-                    let validated_proof = PgMetadataProof::new(
-                        validated.applied_log_index,
-                        validated.applied_log_hash,
-                        validated.state_digest,
-                    );
+                    let validated_proof = PgMetadataProof {
+                        applied_log_index: validated.applied_log_index,
+                        applied_log_hash: validated.applied_log_hash,
+                        state_digest: validated.state_digest,
+                    };
                     if validated_proof == actual_proof {
                         return Ok(MetadataTransferImportDestination::AdoptBase);
                     }
@@ -1855,11 +1863,11 @@ fn classify_metadata_transfer_import_destination(
                             pg_id,
                             state.cluster_epoch,
                         )?;
-                    let validated_proof = PgMetadataProof::new(
-                        validated.applied_log_index,
-                        validated.applied_log_hash,
-                        validated.state_digest,
-                    );
+                    let validated_proof = PgMetadataProof {
+                        applied_log_index: validated.applied_log_index,
+                        applied_log_hash: validated.applied_log_hash,
+                        state_digest: validated.state_digest,
+                    };
                     if validated_proof == base_import_proof {
                         return Ok(MetadataTransferImportDestination::AdoptBase);
                     }
@@ -1890,11 +1898,11 @@ fn classify_metadata_transfer_import_destination(
                 &commands[..prefix_len],
                 cluster_epoch,
             );
-            let actual_proof = PgMetadataProof::new(
-                state.applied_log_index,
-                state.applied_log_hash,
-                state.state_digest,
-            );
+            let actual_proof = PgMetadataProof {
+                applied_log_index: state.applied_log_index,
+                applied_log_hash: state.applied_log_hash,
+                state_digest: state.state_digest,
+            };
             if state.cluster_epoch == cluster_epoch {
                 if actual_proof == prefix_proof {
                     return Ok(MetadataTransferImportDestination::AdoptPrefix { prefix_len });
@@ -1924,11 +1932,11 @@ fn classify_metadata_transfer_import_destination(
                         pg_id,
                         state.cluster_epoch,
                     )?;
-                let validated_proof = PgMetadataProof::new(
-                    validated.applied_log_index,
-                    validated.applied_log_hash,
-                    validated.state_digest,
-                );
+                let validated_proof = PgMetadataProof {
+                    applied_log_index: validated.applied_log_index,
+                    applied_log_hash: validated.applied_log_hash,
+                    state_digest: validated.state_digest,
+                };
                 if validated_proof == historical_prefix_proof {
                     return Ok(MetadataTransferImportDestination::AdoptPrefix { prefix_len });
                 }
@@ -2971,11 +2979,11 @@ impl StorageCluster {
             .into());
         }
         let checkpoint = metadata_client.metadata_command_checkpoint(pg_id, state.cluster_epoch)?;
-        let proof = PgMetadataProof::new(
-            checkpoint.applied_log_index,
-            checkpoint.applied_log_hash,
-            checkpoint.state_digest,
-        );
+        let proof = PgMetadataProof {
+            applied_log_index: checkpoint.applied_log_index,
+            applied_log_hash: checkpoint.applied_log_hash,
+            state_digest: checkpoint.state_digest,
+        };
         Ok(PgMetadataTransferArtifact {
             pg_id,
             source_node_id,
@@ -3125,23 +3133,23 @@ impl StorageCluster {
             PgPeeringReconstructionError::MetadataTransferCheckpointProofMismatch {
                 node_id: source_node_id,
                 pg_id,
-                checkpoint: PgMetadataProof::new(
-                    checkpoint.applied_log_index,
-                    checkpoint.applied_log_hash,
-                    checkpoint.state_digest,
-                ),
-                expected: PgMetadataProof::new(
-                    checkpoint.applied_log_index,
-                    checkpoint.applied_log_hash,
-                    checkpoint.state_digest,
-                ),
+                checkpoint: PgMetadataProof {
+                    applied_log_index: checkpoint.applied_log_index,
+                    applied_log_hash: checkpoint.applied_log_hash,
+                    state_digest: checkpoint.state_digest,
+                },
+                expected: PgMetadataProof {
+                    applied_log_index: checkpoint.applied_log_index,
+                    applied_log_hash: checkpoint.applied_log_hash,
+                    state_digest: checkpoint.state_digest,
+                },
             }
         })?;
-        let checkpoint_proof = PgMetadataProof::new(
-            checkpoint.applied_log_index,
-            checkpoint.applied_log_hash,
-            checkpoint.state_digest,
-        );
+        let checkpoint_proof = PgMetadataProof {
+            applied_log_index: checkpoint.applied_log_index,
+            applied_log_hash: checkpoint.applied_log_hash,
+            state_digest: checkpoint.state_digest,
+        };
         if checkpoint.pg_id != pg_id {
             return Err(
                 PgPeeringReconstructionError::MetadataTransferCheckpointProofMismatch {
@@ -3223,11 +3231,11 @@ impl StorageCluster {
             base_kind: PgMetadataTransferBaseKind::Checkpoint,
             base_proof: checkpoint_proof,
             checkpoint_base: Some(checkpoint),
-            proof: PgMetadataProof::new(
-                state.applied_log_index,
-                state.applied_log_hash,
-                state.state_digest,
-            ),
+            proof: PgMetadataProof {
+                applied_log_index: state.applied_log_index,
+                applied_log_hash: state.applied_log_hash,
+                state_digest: state.state_digest,
+            },
             retained_log_entries,
         };
         rebase_pg_metadata_transfer_artifact_commands(&artifact, self.operation_epoch())?;
@@ -3411,8 +3419,11 @@ impl StorageCluster {
             metadata_transfer_destination_proof(artifact, &commands, self.operation_epoch());
         let base_import_proof = artifact.source_base_metadata_proof();
         let checkpoint_base = artifact.checkpoint_base();
-        let checkpoint_destination_base_proof =
-            checkpoint_base.map(|checkpoint| PgMetadataProof::new(0, 0, checkpoint.state_digest));
+        let checkpoint_destination_base_proof = checkpoint_base.map(|checkpoint| PgMetadataProof {
+            applied_log_index: 0,
+            applied_log_hash: 0,
+            state_digest: checkpoint.state_digest,
+        });
         let nodes = self
             .local_map
             .metadata_pg_acting_nodes_for_peering_replay(self.operation_epoch(), pg_id)?;
@@ -3441,11 +3452,11 @@ impl StorageCluster {
                     }
                     .into());
                 }
-                let current_proof = PgMetadataProof::new(
-                    current.applied_log_index,
-                    current.applied_log_hash,
-                    current.state_digest,
-                );
+                let current_proof = PgMetadataProof {
+                    applied_log_index: current.applied_log_index,
+                    applied_log_hash: current.applied_log_hash,
+                    state_digest: current.state_digest,
+                };
                 if current.cluster_epoch == self.operation_epoch() {
                     if let Some(prefix_len) = checkpoint_import_resume_prefix_len(
                         pg_id,
@@ -3460,11 +3471,11 @@ impl StorageCluster {
                                 pg_id,
                                 self.operation_epoch(),
                             )?;
-                        let validated_proof = PgMetadataProof::new(
-                            validated.applied_log_index,
-                            validated.applied_log_hash,
-                            validated.state_digest,
-                        );
+                        let validated_proof = PgMetadataProof {
+                            applied_log_index: validated.applied_log_index,
+                            applied_log_hash: validated.applied_log_hash,
+                            state_digest: validated.state_digest,
+                        };
                         let Some(validated_prefix_len) = checkpoint_import_resume_prefix_len(
                             pg_id,
                             checkpoint_destination_base_proof.expect("checkpoint proof exists"),
@@ -3623,11 +3634,11 @@ impl StorageCluster {
                 }
                 .into());
             }
-            let proof = PgMetadataProof::new(
-                state.applied_log_index,
-                state.applied_log_hash,
-                state.state_digest,
-            );
+            let proof = PgMetadataProof {
+                applied_log_index: state.applied_log_index,
+                applied_log_hash: state.applied_log_hash,
+                state_digest: state.state_digest,
+            };
             if let Some((reference_node_id, reference_proof)) = reference {
                 if proof != reference_proof {
                     return Err(PgPeeringReconstructionError::MetadataFork {
@@ -4503,11 +4514,11 @@ impl StorageCluster {
         let state = primary
             .metadata_command_client()
             .metadata_command_replica_state(pg_id)?;
-        Ok(PgMetadataProof::new(
-            state.applied_log_index,
-            state.applied_log_hash,
-            state.state_digest,
-        ))
+        Ok(PgMetadataProof {
+            applied_log_index: state.applied_log_index,
+            applied_log_hash: state.applied_log_hash,
+            state_digest: state.state_digest,
+        })
     }
 
     /// Temporary process-local registry key for shared coordinator workers.

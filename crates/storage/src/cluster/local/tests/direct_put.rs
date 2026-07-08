@@ -1325,11 +1325,11 @@ fn control_plane_peering_direct_put_old_primary_fails_closed_and_cleans_unowned_
             .get_pg(object_pg)
             .unwrap();
         let state = pg.metadata_command_replica_state().unwrap();
-        let proof = crate::control_plane::PgMetadataProof::new(
-            state.applied_log_index,
-            state.applied_log_hash,
-            state.state_digest,
-        );
+        let proof = crate::control_plane::PgMetadataProof {
+            applied_log_index: state.applied_log_index,
+            applied_log_hash: state.applied_log_hash,
+            state_digest: state.state_digest,
+        };
         assert_eq!(
             proof, before_object_pg_proof,
             "old-primary direct PUT must not append an object-PG command on node {node_id:?}"
@@ -1641,11 +1641,11 @@ fn control_plane_peering_copy_object_destination_old_primary_fails_closed_and_cl
             .get_pg(dst_object_pg)
             .unwrap();
         let state = dst_pg.metadata_command_replica_state().unwrap();
-        let proof = crate::control_plane::PgMetadataProof::new(
-            state.applied_log_index,
-            state.applied_log_hash,
-            state.state_digest,
-        );
+        let proof = crate::control_plane::PgMetadataProof {
+            applied_log_index: state.applied_log_index,
+            applied_log_hash: state.applied_log_hash,
+            state_digest: state.state_digest,
+        };
         assert_eq!(
             proof, before_dst_object_pg_proof,
             "old-primary CopyObject destination must not append an object-PG command on node {node_id:?}"

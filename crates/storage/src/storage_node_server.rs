@@ -13195,7 +13195,11 @@ mod tests {
                 .unwrap();
         }
         authority.set_pg_acting_set(pg_id, vec![node_id]).unwrap();
-        let active_proof = crate::control_plane::PgMetadataProof::new(9, 10, 11);
+        let active_proof = crate::control_plane::PgMetadataProof {
+            applied_log_index: 9,
+            applied_log_hash: 10,
+            state_digest: 11,
+        };
         let peering_epoch = authority.snapshot().cluster_epoch();
         authority
             .heartbeat(

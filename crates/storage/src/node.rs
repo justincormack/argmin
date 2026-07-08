@@ -1294,11 +1294,11 @@ impl SharedStorageNode {
         Ok(NodePgHeartbeatObservation {
             pg_id,
             state,
-            metadata_proof: PgMetadataProof::new(
-                metadata_state.applied_log_index,
-                metadata_state.applied_log_hash,
-                metadata_state.state_digest,
-            ),
+            metadata_proof: PgMetadataProof {
+                applied_log_index: metadata_state.applied_log_index,
+                applied_log_hash: metadata_state.applied_log_hash,
+                state_digest: metadata_state.state_digest,
+            },
             has_pending_metadata_command,
         })
     }

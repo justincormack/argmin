@@ -1297,11 +1297,23 @@ mod tests {
     use super::*;
 
     fn sample_commands() -> Vec<ControlPlaneCommand> {
-        let proof = PgMetadataProof::new(7, 8, 9);
+        let proof = PgMetadataProof {
+            applied_log_index: 7,
+            applied_log_hash: 8,
+            state_digest: 9,
+        };
         let transfer = PgMetadataTransferProof::new_with_imported_metadata_proof(
             ClusterEpoch::new(11).unwrap(),
-            PgMetadataProof::new(1, 2, 3),
-            PgMetadataProof::new(4, 5, 6),
+            PgMetadataProof {
+                applied_log_index: 1,
+                applied_log_hash: 2,
+                state_digest: 3,
+            },
+            PgMetadataProof {
+                applied_log_index: 4,
+                applied_log_hash: 5,
+                state_digest: 6,
+            },
         );
         vec![
             ControlPlaneCommand::BootstrapInitialClusterMap {
@@ -1379,7 +1391,11 @@ mod tests {
     }
 
     fn degenerate_commands() -> Vec<ControlPlaneCommand> {
-        let max_proof = PgMetadataProof::new(u64::MAX, u64::MAX, u64::MAX);
+        let max_proof = PgMetadataProof {
+            applied_log_index: u64::MAX,
+            applied_log_hash: u64::MAX,
+            state_digest: u64::MAX,
+        };
         vec![
             ControlPlaneCommand::BootstrapInitialClusterMap {
                 nodes: Vec::new(),
@@ -1613,7 +1629,14 @@ mod tests {
             write_u32(body, 1);
             write_u32(body, 7);
             write_pg_state(body, PgState::Peering);
-            write_pg_metadata_proof(body, PgMetadataProof::new(1, 2, 3));
+            write_pg_metadata_proof(
+                body,
+                PgMetadataProof {
+                    applied_log_index: 1,
+                    applied_log_hash: 2,
+                    state_digest: 3,
+                },
+            );
             write_u8(body, 2);
         });
         assert_decode_error_contains(&invalid_bool, "invalid boolean value 2");

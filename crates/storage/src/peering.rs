@@ -495,11 +495,11 @@ pub(crate) fn build_pg_metadata_transfer_artifact_from_retained_log_entries(
     };
     let mut expected_previous_log_hash = first_retained.previous_log_hash;
     let mut expected_pre_state_digest = Some(base_state_digest);
-    let base_proof = PgMetadataProof::new(
-        first_retained_log_index - 1,
-        first_retained.previous_log_hash,
-        base_state_digest,
-    );
+    let base_proof = PgMetadataProof {
+        applied_log_index: first_retained_log_index - 1,
+        applied_log_hash: first_retained.previous_log_hash,
+        state_digest: base_state_digest,
+    };
     let base_kind = if base_proof.applied_log_index == 0 && base_proof.applied_log_hash == 0 {
         PgMetadataTransferBaseKind::Empty
     } else {
@@ -623,19 +623,19 @@ pub(crate) fn rebase_pg_metadata_transfer_artifact_commands(
             PgPeeringReconstructionError::MetadataTransferCheckpointProofMismatch {
                 node_id: artifact.source_node_id,
                 pg_id: artifact.pg_id,
-                checkpoint: PgMetadataProof::new(
-                    checkpoint.applied_log_index,
-                    checkpoint.applied_log_hash,
-                    checkpoint.state_digest,
-                ),
+                checkpoint: PgMetadataProof {
+                    applied_log_index: checkpoint.applied_log_index,
+                    applied_log_hash: checkpoint.applied_log_hash,
+                    state_digest: checkpoint.state_digest,
+                },
                 expected: artifact.base_proof,
             }
         })?;
-        let checkpoint_proof = PgMetadataProof::new(
-            checkpoint.applied_log_index,
-            checkpoint.applied_log_hash,
-            checkpoint.state_digest,
-        );
+        let checkpoint_proof = PgMetadataProof {
+            applied_log_index: checkpoint.applied_log_index,
+            applied_log_hash: checkpoint.applied_log_hash,
+            state_digest: checkpoint.state_digest,
+        };
         if checkpoint.cluster_epoch != artifact.cluster_epoch
             || checkpoint.pg_id != artifact.pg_id
             || checkpoint_proof != artifact.base_proof
@@ -798,11 +798,11 @@ pub(crate) fn rebase_pg_metadata_transfer_artifact_commands(
 }
 
 fn proof_from_replica_state(state: MetadataCommandReplicaState) -> PgMetadataProof {
-    PgMetadataProof::new(
-        state.applied_log_index,
-        state.applied_log_hash,
-        state.state_digest,
-    )
+    PgMetadataProof {
+        applied_log_index: state.applied_log_index,
+        applied_log_hash: state.applied_log_hash,
+        state_digest: state.state_digest,
+    }
 }
 
 #[cfg(test)]
@@ -1020,11 +1020,7 @@ mod tests {
             prop_assert_eq!(artifact.cluster_epoch, ClusterEpoch::INITIAL);
             prop_assert_eq!(
                 artifact.base_proof,
-                PgMetadataProof::new(
-                    first_log_index - 1,
-                    retained_entries[0].previous_log_hash,
-                    retained_entries[0].pre_state_digest.unwrap(),
-                )
+                PgMetadataProof { applied_log_index: first_log_index - 1, applied_log_hash: retained_entries[0].previous_log_hash, state_digest: retained_entries[0].pre_state_digest.unwrap() }
             );
             prop_assert_eq!(artifact.proof, proof_from_replica_state(source_state));
             prop_assert_eq!(&artifact.retained_log_entries, &retained_entries);
@@ -1148,7 +1144,11 @@ mod tests {
 
     #[test]
     fn peering_reconstruction_accepts_already_converged_replicas() {
-        let proof = PgMetadataProof::new(2, 20, 200);
+        let proof = PgMetadataProof {
+            applied_log_index: 2,
+            applied_log_hash: 20,
+            state_digest: 200,
+        };
         let decision = reconstruct_pg_peering_from_primary_retained_log(
             ClusterEpoch::INITIAL,
             PgId::new(7),
@@ -1167,7 +1167,11 @@ mod tests {
 
     #[test]
     fn peering_reconstruction_requests_catchup_for_lagging_replica_with_retained_suffix() {
-        let proof = PgMetadataProof::new(3, 30, 300);
+        let proof = PgMetadataProof {
+            applied_log_index: 3,
+            applied_log_hash: 30,
+            state_digest: 300,
+        };
         let decision = reconstruct_pg_peering_from_primary_retained_log(
             ClusterEpoch::INITIAL,
             PgId::new(7),
@@ -1330,8 +1334,16 @@ mod tests {
             PgPeeringReconstructionError::MetadataFork {
                 node_id: NodeId::new(2),
                 reference_node_id: NodeId::new(1),
-                replica: PgMetadataProof::new(2, 21, 200),
-                reference: PgMetadataProof::new(2, 20, 200),
+                replica: PgMetadataProof {
+                    applied_log_index: 2,
+                    applied_log_hash: 21,
+                    state_digest: 200
+                },
+                reference: PgMetadataProof {
+                    applied_log_index: 2,
+                    applied_log_hash: 20,
+                    state_digest: 200
+                },
             }
         );
     }
@@ -1353,8 +1365,16 @@ mod tests {
             PgPeeringReconstructionError::MetadataFork {
                 node_id: NodeId::new(2),
                 reference_node_id: NodeId::new(1),
-                replica: PgMetadataProof::new(2, 20, 201),
-                reference: PgMetadataProof::new(2, 20, 200),
+                replica: PgMetadataProof {
+                    applied_log_index: 2,
+                    applied_log_hash: 20,
+                    state_digest: 201
+                },
+                reference: PgMetadataProof {
+                    applied_log_index: 2,
+                    applied_log_hash: 20,
+                    state_digest: 200
+                },
             }
         );
     }

@@ -3032,17 +3032,12 @@ pub struct PgMetadataProof {
 
 impl PgMetadataProof {
     #[must_use]
-    pub const fn new(applied_log_index: u64, applied_log_hash: u64, state_digest: u64) -> Self {
-        Self {
-            applied_log_index,
-            applied_log_hash,
-            state_digest,
-        }
-    }
-
-    #[must_use]
     pub const fn empty() -> Self {
-        Self::new(0, 0, 0)
+        Self {
+            applied_log_index: 0,
+            applied_log_hash: 0,
+            state_digest: 0,
+        }
     }
 }
 
@@ -10686,11 +10681,11 @@ mod tests {
 
     fn pg_metadata_proof_from_store(store: &PgStore) -> PgMetadataProof {
         let state = store.metadata_command_replica_state().unwrap();
-        PgMetadataProof::new(
-            state.applied_log_index,
-            state.applied_log_hash,
-            state.state_digest,
-        )
+        PgMetadataProof {
+            applied_log_index: state.applied_log_index,
+            applied_log_hash: state.applied_log_hash,
+            state_digest: state.state_digest,
+        }
     }
 
     fn placed_segment_shard_repair_work_item_for_runtime_refresh(
@@ -10925,11 +10920,11 @@ mod tests {
     }
 
     fn heartbeat_model_proof(seed: u8) -> PgMetadataProof {
-        PgMetadataProof::new(
-            u64::from(seed) + 1,
-            0x1000 + u64::from(seed),
-            0x2000 + u64::from(seed),
-        )
+        PgMetadataProof {
+            applied_log_index: u64::from(seed) + 1,
+            applied_log_hash: 0x1000 + u64::from(seed),
+            state_digest: 0x2000 + u64::from(seed),
+        }
     }
 
     fn heartbeat_model_acting_set(shape: u8) -> Vec<NodeId> {
@@ -11552,7 +11547,11 @@ mod tests {
             .unwrap();
         assert!(heartbeat_until_serving(&mut authority, 1, 1_000).serving());
         let pg_id = PgId::new(23);
-        let proof = PgMetadataProof::new(7, 8, 9);
+        let proof = PgMetadataProof {
+            applied_log_index: 7,
+            applied_log_hash: 8,
+            state_digest: 9,
+        };
         authority
             .set_pg_acting_set(pg_id, vec![NodeId::new(1)])
             .unwrap();
@@ -11599,7 +11598,11 @@ mod tests {
             assert!(heartbeat_until_serving(&mut authority, node_id, 1_000).serving());
         }
         let pg_id = PgId::new(24);
-        let proof = PgMetadataProof::new(7, 8, 9);
+        let proof = PgMetadataProof {
+            applied_log_index: 7,
+            applied_log_hash: 8,
+            state_digest: 9,
+        };
         authority
             .set_pg_acting_set(pg_id, vec![NodeId::new(1)])
             .unwrap();
@@ -11659,7 +11662,11 @@ mod tests {
             assert!(heartbeat_until_serving(&mut authority, node_id, 1_000).serving());
         }
         let pg_id = PgId::new(25);
-        let source_proof = PgMetadataProof::new(7, 8, 9);
+        let source_proof = PgMetadataProof {
+            applied_log_index: 7,
+            applied_log_hash: 8,
+            state_digest: 9,
+        };
         authority
             .set_pg_acting_set(pg_id, vec![NodeId::new(1)])
             .unwrap();
@@ -11690,7 +11697,11 @@ mod tests {
             2_020,
         );
 
-        let imported_proof = PgMetadataProof::new(8, 9, 10);
+        let imported_proof = PgMetadataProof {
+            applied_log_index: 8,
+            applied_log_hash: 9,
+            state_digest: 10,
+        };
         let transfer = PgMetadataTransferProof::new_with_imported_metadata_proof(
             authority.snapshot().cluster_epoch(),
             source_proof,
@@ -11700,11 +11711,12 @@ mod tests {
             .set_pg_acting_set_with_metadata_transfer(pg_id, vec![NodeId::new(2)], transfer)
             .unwrap();
         let mut snapshot = authority.snapshot().clone();
-        snapshot
-            .pgs
-            .get_mut(&pg_id)
-            .unwrap()
-            .peering_metadata_proof_floor = Some(PgMetadataProof::new(9, 10, 11));
+        let pg = snapshot.pgs.get_mut(&pg_id).unwrap();
+        pg.peering_metadata_proof_floor = Some(PgMetadataProof {
+            applied_log_index: 9,
+            applied_log_hash: 10,
+            state_digest: 11,
+        });
         let error = snapshot.validate_invariants().unwrap_err();
         assert!(
             error.contains("metadata transfer proof is below the proof floor"),
@@ -13105,7 +13117,11 @@ mod tests {
         authority
             .set_pg_acting_set(PgId::new(8), vec![NodeId::new(1)])
             .unwrap();
-        let unrelated_proof = PgMetadataProof::new(3, 4, 5);
+        let unrelated_proof = PgMetadataProof {
+            applied_log_index: 3,
+            applied_log_hash: 4,
+            state_digest: 5,
+        };
         heartbeat_with_pg_proof(
             &mut authority,
             1,
@@ -13254,7 +13270,11 @@ mod tests {
             .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
             .unwrap();
         assert!(heartbeat_until_serving(&mut authority, 1, 1_000).serving());
-        let active_proof = PgMetadataProof::new(9, 10, 11);
+        let active_proof = PgMetadataProof {
+            applied_log_index: 9,
+            applied_log_hash: 10,
+            state_digest: 11,
+        };
         authority
             .set_pg_acting_set(PgId::new(44), vec![NodeId::new(1)])
             .unwrap();
@@ -13347,7 +13367,11 @@ mod tests {
             .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
             .unwrap();
         assert!(heartbeat_until_serving(&mut authority, 1, 1_000).serving());
-        let active_proof = PgMetadataProof::new(9, 10, 11);
+        let active_proof = PgMetadataProof {
+            applied_log_index: 9,
+            applied_log_hash: 10,
+            state_digest: 11,
+        };
         authority
             .set_pg_acting_set(PgId::new(44), vec![NodeId::new(1)])
             .unwrap();
@@ -13437,7 +13461,11 @@ mod tests {
             .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
             .unwrap();
         assert!(heartbeat_until_serving(&mut authority, 1, 1_000).serving());
-        let active_proof = PgMetadataProof::new(9, 10, 11);
+        let active_proof = PgMetadataProof {
+            applied_log_index: 9,
+            applied_log_hash: 10,
+            state_digest: 11,
+        };
         authority
             .set_pg_acting_set(PgId::new(44), vec![NodeId::new(1)])
             .unwrap();
@@ -13517,7 +13545,11 @@ mod tests {
                 .unwrap();
             assert!(heartbeat_until_serving(&mut authority, node_id, 10_000).serving());
         }
-        let active_proof = PgMetadataProof::new(9, 10, 11);
+        let active_proof = PgMetadataProof {
+            applied_log_index: 9,
+            applied_log_hash: 10,
+            state_digest: 11,
+        };
         authority
             .set_pg_acting_set(PgId::new(43), vec![NodeId::new(1)])
             .unwrap();
@@ -13548,7 +13580,14 @@ mod tests {
             10_005,
         );
         let active_epoch = authority.snapshot().cluster_epoch();
-        let transfer = PgMetadataTransferProof::new(active_epoch, PgMetadataProof::new(10, 12, 13));
+        let transfer = PgMetadataTransferProof::new(
+            active_epoch,
+            PgMetadataProof {
+                applied_log_index: 10,
+                applied_log_hash: 12,
+                state_digest: 13,
+            },
+        );
         let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
         let server = std::thread::spawn(move || {
             let (mut stream, _addr) = listener.accept().unwrap();
@@ -13587,7 +13626,11 @@ mod tests {
                 .unwrap();
             assert!(heartbeat_until_serving(&mut authority, node_id, 1_000).serving());
         }
-        let active_proof = PgMetadataProof::new(9, 10, 11);
+        let active_proof = PgMetadataProof {
+            applied_log_index: 9,
+            applied_log_hash: 10,
+            state_digest: 11,
+        };
         authority
             .set_pg_acting_set(PgId::new(43), vec![NodeId::new(1)])
             .unwrap();
@@ -13619,7 +13662,11 @@ mod tests {
         );
         let active_epoch = authority.snapshot().cluster_epoch();
         let expected_transfer_epoch = ClusterEpoch::new(active_epoch.get() + 1).unwrap();
-        let imported_proof = PgMetadataProof::new(9, 12, 11);
+        let imported_proof = PgMetadataProof {
+            applied_log_index: 9,
+            applied_log_hash: 12,
+            state_digest: 11,
+        };
         let transfer = PgMetadataTransferProof::new_with_imported_metadata_proof(
             active_epoch,
             active_proof,
@@ -13683,7 +13730,11 @@ mod tests {
                 .unwrap();
             assert!(heartbeat_until_serving(&mut authority, node_id, 1_000).serving());
         }
-        let active_proof = PgMetadataProof::new(9, 10, 11);
+        let active_proof = PgMetadataProof {
+            applied_log_index: 9,
+            applied_log_hash: 10,
+            state_digest: 11,
+        };
         authority
             .set_pg_acting_set(PgId::new(43), vec![NodeId::new(1)])
             .unwrap();
@@ -13714,7 +13765,11 @@ mod tests {
             2_002,
         );
         let active_epoch = authority.snapshot().cluster_epoch();
-        let imported_proof = PgMetadataProof::new(9, 12, 11);
+        let imported_proof = PgMetadataProof {
+            applied_log_index: 9,
+            applied_log_hash: 12,
+            state_digest: 11,
+        };
         let transfer = PgMetadataTransferProof::new_with_imported_metadata_proof(
             active_epoch,
             active_proof,
@@ -13777,7 +13832,11 @@ mod tests {
                 .unwrap();
             assert!(heartbeat_until_serving(&mut authority, node_id, 1_000).serving());
         }
-        let active_proof = PgMetadataProof::new(9, 10, 11);
+        let active_proof = PgMetadataProof {
+            applied_log_index: 9,
+            applied_log_hash: 10,
+            state_digest: 11,
+        };
         authority
             .set_pg_acting_set(PgId::new(43), vec![NodeId::new(1)])
             .unwrap();
@@ -13807,7 +13866,11 @@ mod tests {
             false,
             2_002,
         );
-        let unrelated_proof = PgMetadataProof::new(17, 18, 19);
+        let unrelated_proof = PgMetadataProof {
+            applied_log_index: 17,
+            applied_log_hash: 18,
+            state_digest: 19,
+        };
         authority
             .set_pg_acting_set(PgId::new(44), vec![NodeId::new(1)])
             .unwrap();
@@ -13839,7 +13902,11 @@ mod tests {
         );
         let active_epoch = authority.snapshot().cluster_epoch();
         let expected_transfer_epoch = ClusterEpoch::new(active_epoch.get() + 1).unwrap();
-        let imported_proof = PgMetadataProof::new(9, 12, 11);
+        let imported_proof = PgMetadataProof {
+            applied_log_index: 9,
+            applied_log_hash: 12,
+            state_digest: 11,
+        };
         let transfer = PgMetadataTransferProof::new_with_imported_metadata_proof(
             active_epoch,
             active_proof,
@@ -13993,7 +14060,11 @@ mod tests {
             .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
             .unwrap();
         assert!(heartbeat_until_serving(&mut authority, 1, 1_000).serving());
-        let proof = PgMetadataProof::new(9, 10, 11);
+        let proof = PgMetadataProof {
+            applied_log_index: 9,
+            applied_log_hash: 10,
+            state_digest: 11,
+        };
         authority
             .set_pg_acting_set(PgId::new(7), vec![NodeId::new(1)])
             .unwrap();
@@ -14036,7 +14107,11 @@ mod tests {
             .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
             .unwrap();
         assert!(heartbeat_until_serving(&mut authority, 1, 1_000).serving());
-        let proof = PgMetadataProof::new(9, 10, 11);
+        let proof = PgMetadataProof {
+            applied_log_index: 9,
+            applied_log_hash: 10,
+            state_digest: 11,
+        };
         authority
             .set_pg_acting_set(PgId::new(7), vec![NodeId::new(1)])
             .unwrap();
@@ -14082,7 +14157,11 @@ mod tests {
             .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
             .unwrap();
         assert!(heartbeat_until_serving(&mut authority, 1, 1_000).serving());
-        let proof = PgMetadataProof::new(9, 10, 11);
+        let proof = PgMetadataProof {
+            applied_log_index: 9,
+            applied_log_hash: 10,
+            state_digest: 11,
+        };
         authority
             .set_pg_acting_set(PgId::new(7), vec![NodeId::new(1)])
             .unwrap();
@@ -14274,7 +14353,14 @@ mod tests {
         write_u32(&mut payload, 1);
         write_u32(&mut payload, 7);
         write_pg_state(&mut payload, PgState::Peering);
-        write_pg_metadata_proof(&mut payload, PgMetadataProof::new(10, 11, 12));
+        write_pg_metadata_proof(
+            &mut payload,
+            PgMetadataProof {
+                applied_log_index: 10,
+                applied_log_hash: 11,
+                state_digest: 12,
+            },
+        );
         write_u8(&mut payload, 2);
 
         let mut reader = PayloadReader::new(&payload);
@@ -14475,7 +14561,11 @@ mod tests {
         route.primary_lease_deadline_ms = None;
         route.peering_metadata_transfer = Some(PgMetadataTransferProof::new(
             ClusterEpoch::INITIAL,
-            PgMetadataProof::new(1, 2, 3),
+            PgMetadataProof {
+                applied_log_index: 1,
+                applied_log_hash: 2,
+                state_digest: 3,
+            },
         ));
         let error = decode_runtime_map_test_snapshot(snapshot).unwrap_err();
 
@@ -14526,7 +14616,11 @@ mod tests {
         route.primary_lease_deadline_ms = None;
         route.peering_metadata_transfer = Some(PgMetadataTransferProof::new(
             ClusterEpoch::INITIAL,
-            PgMetadataProof::new(1, 2, 3),
+            PgMetadataProof {
+                applied_log_index: 1,
+                applied_log_hash: 2,
+                state_digest: 3,
+            },
         ));
         route.peering_metadata_transfer_source_route_epoch = Some(ClusterEpoch::INITIAL);
         route.peering_metadata_transfer_source_node_id = Some(NodeId::new(99));
@@ -14824,7 +14918,11 @@ mod tests {
             route.primary_lease_deadline_ms = None;
             route.peering_metadata_transfer = Some(PgMetadataTransferProof::new(
                 source_epoch,
-                PgMetadataProof::new(1, 2, 3),
+                PgMetadataProof {
+                    applied_log_index: 1,
+                    applied_log_hash: 2,
+                    state_digest: 3,
+                },
             ));
             route.peering_metadata_transfer_source_route_epoch = Some(source_epoch);
             route.peering_metadata_transfer_source_node_id = Some(NodeId::new(1));
@@ -14984,7 +15082,11 @@ mod tests {
                 .unwrap();
             assert!(heartbeat_until_serving(&mut authority, node_id, 10_000).serving());
         }
-        let active_proof = PgMetadataProof::new(9, 10, 11);
+        let active_proof = PgMetadataProof {
+            applied_log_index: 9,
+            applied_log_hash: 10,
+            state_digest: 11,
+        };
         authority
             .set_pg_acting_set(PgId::new(42), vec![NodeId::new(1)])
             .unwrap();
@@ -15019,7 +15121,11 @@ mod tests {
         let transfer = PgMetadataTransferProof::new_with_imported_metadata_proof(
             source_epoch,
             active_proof,
-            PgMetadataProof::new(9, 12, 11),
+            PgMetadataProof {
+                applied_log_index: 9,
+                applied_log_hash: 12,
+                state_digest: 11,
+            },
         );
         authority
             .set_pg_acting_set_with_metadata_transfer(PgId::new(42), vec![NodeId::new(2)], transfer)
@@ -15331,7 +15437,11 @@ mod tests {
                 .unwrap();
             assert!(heartbeat_until_serving(&mut authority, node_id, 10_000).serving());
         }
-        let active_proof = PgMetadataProof::new(9, 10, 11);
+        let active_proof = PgMetadataProof {
+            applied_log_index: 9,
+            applied_log_hash: 10,
+            state_digest: 11,
+        };
         authority
             .set_pg_acting_set(PgId::new(42), vec![NodeId::new(1)])
             .unwrap();
@@ -15365,7 +15475,11 @@ mod tests {
         let transfer = PgMetadataTransferProof::new_with_imported_metadata_proof(
             source_epoch,
             active_proof,
-            PgMetadataProof::new(9, 12, 11),
+            PgMetadataProof {
+                applied_log_index: 9,
+                applied_log_hash: 12,
+                state_digest: 11,
+            },
         );
         authority
             .set_pg_acting_set_with_metadata_transfer(PgId::new(42), vec![NodeId::new(2)], transfer)
@@ -15471,7 +15585,11 @@ mod tests {
                 .unwrap();
             assert!(heartbeat_until_serving(&mut authority, node_id, 10_000).serving());
         }
-        let active_proof = PgMetadataProof::new(9, 10, 11);
+        let active_proof = PgMetadataProof {
+            applied_log_index: 9,
+            applied_log_hash: 10,
+            state_digest: 11,
+        };
         authority
             .set_pg_acting_set(PgId::new(42), vec![NodeId::new(1)])
             .unwrap();
@@ -15505,7 +15623,11 @@ mod tests {
         let transfer = PgMetadataTransferProof::new_with_imported_metadata_proof(
             source_epoch,
             active_proof,
-            PgMetadataProof::new(9, 12, 11),
+            PgMetadataProof {
+                applied_log_index: 9,
+                applied_log_hash: 12,
+                state_digest: 11,
+            },
         );
         authority
             .set_pg_acting_set_with_metadata_transfer(PgId::new(42), vec![NodeId::new(2)], transfer)
@@ -15550,7 +15672,11 @@ mod tests {
                 .unwrap();
             assert!(heartbeat_until_serving(&mut authority, node_id, 10_000).serving());
         }
-        let active_proof = PgMetadataProof::new(9, 10, 11);
+        let active_proof = PgMetadataProof {
+            applied_log_index: 9,
+            applied_log_hash: 10,
+            state_digest: 11,
+        };
         authority
             .set_pg_acting_set(PgId::new(42), vec![NodeId::new(1)])
             .unwrap();
@@ -15584,7 +15710,11 @@ mod tests {
         let transfer = PgMetadataTransferProof::new_with_imported_metadata_proof(
             source_epoch,
             active_proof,
-            PgMetadataProof::new(9, 12, 11),
+            PgMetadataProof {
+                applied_log_index: 9,
+                applied_log_hash: 12,
+                state_digest: 11,
+            },
         );
         authority
             .set_pg_acting_set_with_metadata_transfer(PgId::new(42), vec![NodeId::new(2)], transfer)
@@ -16519,7 +16649,11 @@ mod tests {
             .unwrap();
 
         let observed_epoch = authority.snapshot().cluster_epoch();
-        let metadata_proof = PgMetadataProof::new(7, 8, 9);
+        let metadata_proof = PgMetadataProof {
+            applied_log_index: 7,
+            applied_log_hash: 8,
+            state_digest: 9,
+        };
         let mut heartbeat = heartbeat_from_record(&authority, 1, observed_epoch, 2_000);
         heartbeat.pg_observations = vec![NodePgHeartbeatObservation {
             pg_id: PgId::new(7),
@@ -18122,7 +18256,11 @@ mod tests {
             .set_pg_acting_set(PgId::new(31), vec![NodeId::new(1)])
             .unwrap();
 
-        let source_proof = PgMetadataProof::new(9, 10, 11);
+        let source_proof = PgMetadataProof {
+            applied_log_index: 9,
+            applied_log_hash: 10,
+            state_digest: 11,
+        };
         authority
             .set_pg_acting_set(PgId::new(30), vec![NodeId::new(1)])
             .unwrap();
@@ -18156,7 +18294,11 @@ mod tests {
         let transfer = PgMetadataTransferProof::new_with_imported_metadata_proof(
             source_epoch,
             source_proof,
-            PgMetadataProof::new(10, 11, 12),
+            PgMetadataProof {
+                applied_log_index: 10,
+                applied_log_hash: 11,
+                state_digest: 12,
+            },
         );
         authority
             .set_pg_acting_set_with_metadata_transfer(PgId::new(30), vec![NodeId::new(2)], transfer)
@@ -20746,11 +20888,11 @@ mod tests {
         store.apply_metadata_command_and_record(1, &mark).unwrap();
         let cleanup_floor = pg_metadata_proof_from_store(&store);
 
-        let digest_only_cleanup = PgMetadataProof::new(
-            cleanup_floor.applied_log_index,
-            cleanup_floor.applied_log_hash,
-            cleanup_floor.state_digest.wrapping_add(1),
-        );
+        let digest_only_cleanup = PgMetadataProof {
+            applied_log_index: cleanup_floor.applied_log_index,
+            applied_log_hash: cleanup_floor.applied_log_hash,
+            state_digest: cleanup_floor.state_digest.wrapping_add(1),
+        };
         let cleanup_floor_epoch = ClusterEpoch::new(7).unwrap();
         let cleanup_observed_epoch = ClusterEpoch::new(8).unwrap();
         assert!(!metadata_proof_satisfies_active_primary_observation_floor(
@@ -20804,7 +20946,11 @@ mod tests {
             .set_pg_acting_set(PgId::new(31), vec![NodeId::new(1), NodeId::new(2)])
             .unwrap();
 
-        let reconstructed_proof = PgMetadataProof::new(42, 0xabc, 0xdef);
+        let reconstructed_proof = PgMetadataProof {
+            applied_log_index: 42,
+            applied_log_hash: 0xabc,
+            state_digest: 0xdef,
+        };
         heartbeat_with_pg_proof(
             &mut authority,
             1,
@@ -20815,7 +20961,11 @@ mod tests {
             2_001,
         );
 
-        let lagging_proof = PgMetadataProof::new(41, 0xaaa, 0xddd);
+        let lagging_proof = PgMetadataProof {
+            applied_log_index: 41,
+            applied_log_hash: 0xaaa,
+            state_digest: 0xddd,
+        };
         heartbeat_with_pg_proof(
             &mut authority,
             2,
@@ -20841,7 +20991,11 @@ mod tests {
             }) if expected == reconstructed_proof && actual == lagging_proof
         ));
 
-        let same_index_hash_fork = PgMetadataProof::new(42, 0xabd, 0xdef);
+        let same_index_hash_fork = PgMetadataProof {
+            applied_log_index: 42,
+            applied_log_hash: 0xabd,
+            state_digest: 0xdef,
+        };
         heartbeat_with_pg_proof(
             &mut authority,
             2,
@@ -20867,7 +21021,11 @@ mod tests {
             }) if expected == reconstructed_proof && actual == same_index_hash_fork
         ));
 
-        let same_index_state_fork = PgMetadataProof::new(42, 0xabc, 0xdf0);
+        let same_index_state_fork = PgMetadataProof {
+            applied_log_index: 42,
+            applied_log_hash: 0xabc,
+            state_digest: 0xdf0,
+        };
         heartbeat_with_pg_proof(
             &mut authority,
             2,
@@ -21096,8 +21254,16 @@ mod tests {
         }
 
         let peering_epoch = authority.snapshot().cluster_epoch();
-        let proof_21 = PgMetadataProof::new(42, 0xabc, 0xdef);
-        let proof_22 = PgMetadataProof::new(99, 0xaabb, 0xccdd);
+        let proof_21 = PgMetadataProof {
+            applied_log_index: 42,
+            applied_log_hash: 0xabc,
+            state_digest: 0xdef,
+        };
+        let proof_22 = PgMetadataProof {
+            applied_log_index: 99,
+            applied_log_hash: 0xaabb,
+            state_digest: 0xccdd,
+        };
         let mut peering_heartbeat = heartbeat_from_record(&authority, 1, peering_epoch, 2_000);
         peering_heartbeat.pg_observations = vec![
             NodePgHeartbeatObservation {
@@ -21127,7 +21293,11 @@ mod tests {
             assert_eq!(pg.active_metadata_proof_epoch(), Some(peering_epoch));
         }
 
-        let progressed_proof = PgMetadataProof::new(1, 0x1234, 0x5678);
+        let progressed_proof = PgMetadataProof {
+            applied_log_index: 1,
+            applied_log_hash: 0x1234,
+            state_digest: 0x5678,
+        };
         let mut active_heartbeat = heartbeat_from_record(&authority, 1, active_epoch, 2_020);
         active_heartbeat.pg_observations = vec![NodePgHeartbeatObservation {
             pg_id: PgId::new(21),
@@ -21155,7 +21325,11 @@ mod tests {
             .unwrap();
 
         let peering_epoch = authority.snapshot().cluster_epoch();
-        let observed_proof = PgMetadataProof::new(42, 0xabc, 0xdef);
+        let observed_proof = PgMetadataProof {
+            applied_log_index: 42,
+            applied_log_hash: 0xabc,
+            state_digest: 0xdef,
+        };
         let mut peering_heartbeat = heartbeat_from_record(&authority, 1, peering_epoch, 2_000);
         peering_heartbeat.pg_observations = vec![NodePgHeartbeatObservation {
             pg_id: PgId::new(23),
@@ -21165,7 +21339,11 @@ mod tests {
         }];
         authority.heartbeat(peering_heartbeat, 2_000).unwrap();
 
-        let forged_proof = PgMetadataProof::new(43, 0xabc, 0xdef);
+        let forged_proof = PgMetadataProof {
+            applied_log_index: 43,
+            applied_log_hash: 0xabc,
+            state_digest: 0xdef,
+        };
         assert!(matches!(
             authority.snapshot().apply_control_plane_command(
                 ControlPlaneCommand::CompleteReadyPgPeerings {
@@ -21203,7 +21381,11 @@ mod tests {
             .unwrap();
 
         let peering_epoch = authority.snapshot().cluster_epoch();
-        let observed_proof = PgMetadataProof::new(42, 0xabc, 0xdef);
+        let observed_proof = PgMetadataProof {
+            applied_log_index: 42,
+            applied_log_hash: 0xabc,
+            state_digest: 0xdef,
+        };
         let mut peering_heartbeat = heartbeat_from_record(&authority, 1, peering_epoch, 2_000);
         peering_heartbeat.pg_observations = vec![NodePgHeartbeatObservation {
             pg_id: PgId::new(24),
@@ -21249,7 +21431,11 @@ mod tests {
             .unwrap();
 
         let peering_epoch = authority.snapshot().cluster_epoch();
-        let observed_proof = PgMetadataProof::new(42, 0xabc, 0xdef);
+        let observed_proof = PgMetadataProof {
+            applied_log_index: 42,
+            applied_log_hash: 0xabc,
+            state_digest: 0xdef,
+        };
         let mut peering_heartbeat = heartbeat_from_record(&authority, 1, peering_epoch, 2_000);
         peering_heartbeat.pg_observations = vec![NodePgHeartbeatObservation {
             pg_id: PgId::new(25),
@@ -21282,7 +21468,11 @@ mod tests {
 
         authority.snapshot = applied.into_snapshot();
         let active_epoch = authority.snapshot().cluster_epoch();
-        let progressed_proof = PgMetadataProof::new(43, 0xbc, 0xef);
+        let progressed_proof = PgMetadataProof {
+            applied_log_index: 43,
+            applied_log_hash: 0xbc,
+            state_digest: 0xef,
+        };
         let mut active_heartbeat = heartbeat_from_record(&authority, 1, active_epoch, 2_010);
         active_heartbeat.pg_observations = vec![NodePgHeartbeatObservation {
             pg_id: PgId::new(25),
@@ -21320,7 +21510,11 @@ mod tests {
             .unwrap();
 
         let peering_epoch = authority.snapshot().cluster_epoch();
-        let observed_proof = PgMetadataProof::new(42, 0xabc, 0xdef);
+        let observed_proof = PgMetadataProof {
+            applied_log_index: 42,
+            applied_log_hash: 0xabc,
+            state_digest: 0xdef,
+        };
         let mut peering_heartbeat = heartbeat_from_record(&authority, 1, peering_epoch, 2_000);
         peering_heartbeat.pg_observations = vec![NodePgHeartbeatObservation {
             pg_id: PgId::new(51),
@@ -21398,7 +21592,11 @@ mod tests {
             .unwrap();
 
         let peering_epoch = authority.snapshot().cluster_epoch();
-        let observed_proof = PgMetadataProof::new(42, 0xabc, 0xdef);
+        let observed_proof = PgMetadataProof {
+            applied_log_index: 42,
+            applied_log_hash: 0xabc,
+            state_digest: 0xdef,
+        };
         for node_id in [1, 2] {
             let mut peering_heartbeat =
                 heartbeat_from_record(&authority, node_id, peering_epoch, 2_000);
@@ -21510,7 +21708,11 @@ mod tests {
             .set_pg_acting_set(PgId::new(32), vec![NodeId::new(1)])
             .unwrap();
 
-        let active_proof = PgMetadataProof::new(42, 0xabc, 0xdef);
+        let active_proof = PgMetadataProof {
+            applied_log_index: 42,
+            applied_log_hash: 0xabc,
+            state_digest: 0xdef,
+        };
         heartbeat_with_pg_proof(
             &mut authority,
             1,
@@ -21993,7 +22195,11 @@ mod tests {
             .set_pg_acting_set(PgId::new(1), vec![NodeId::new(1)])
             .unwrap();
 
-        let proof = PgMetadataProof::new(7, 8, 9);
+        let proof = PgMetadataProof {
+            applied_log_index: 7,
+            applied_log_hash: 8,
+            state_digest: 9,
+        };
         heartbeat_with_pg_proof(&mut authority, 1, 1, PgState::Peering, proof, false, 2_000);
         authority
             .complete_pg_peering(
@@ -23236,7 +23442,11 @@ mod tests {
                 .unwrap();
             assert!(heartbeat_until_serving(&mut authority, node_id, 1_000).serving());
         }
-        let active_proof = PgMetadataProof::new(77, 0xabcddcba, 0x12344321);
+        let active_proof = PgMetadataProof {
+            applied_log_index: 77,
+            applied_log_hash: 0xabcddcba,
+            state_digest: 0x12344321,
+        };
         authority
             .set_pg_acting_set(PgId::new(20), vec![NodeId::new(1), NodeId::new(2)])
             .unwrap();
@@ -23465,7 +23675,11 @@ mod tests {
                 .unwrap();
             assert!(heartbeat_until_serving(&mut authority, node_id, 1_000).serving());
         }
-        let active_proof = PgMetadataProof::new(9, 10, 11);
+        let active_proof = PgMetadataProof {
+            applied_log_index: 9,
+            applied_log_hash: 10,
+            state_digest: 11,
+        };
         authority
             .set_pg_acting_set(PgId::new(40), vec![NodeId::new(1)])
             .unwrap();
@@ -23517,7 +23731,11 @@ mod tests {
                 .unwrap();
             assert!(heartbeat_until_serving(&mut authority, node_id, 1_000).serving());
         }
-        let imported_floor = PgMetadataProof::new(9, 10, 11);
+        let imported_floor = PgMetadataProof {
+            applied_log_index: 9,
+            applied_log_hash: 10,
+            state_digest: 11,
+        };
         authority
             .set_pg_acting_set(PgId::new(45), vec![NodeId::new(1), NodeId::new(2)])
             .unwrap();
@@ -23557,11 +23775,11 @@ mod tests {
             .set_pg_acting_set(PgId::new(47), vec![NodeId::new(1)])
             .unwrap();
 
-        let epoch_local_progress = PgMetadataProof::new(
-            imported_floor.applied_log_index,
-            imported_floor.applied_log_hash + 1,
-            imported_floor.state_digest + 1,
-        );
+        let epoch_local_progress = PgMetadataProof {
+            applied_log_index: imported_floor.applied_log_index,
+            applied_log_hash: imported_floor.applied_log_hash + 1,
+            state_digest: imported_floor.state_digest + 1,
+        };
         heartbeat_with_pg_proof(
             &mut authority,
             2,
@@ -23604,8 +23822,16 @@ mod tests {
             Some(epoch_local_progress)
         );
 
-        let imported_high_index_floor = PgMetadataProof::new(20, 30, 40);
-        let primary_destination_progress = PgMetadataProof::new(2, 31, 41);
+        let imported_high_index_floor = PgMetadataProof {
+            applied_log_index: 20,
+            applied_log_hash: 30,
+            state_digest: 40,
+        };
+        let primary_destination_progress = PgMetadataProof {
+            applied_log_index: 2,
+            applied_log_hash: 31,
+            state_digest: 41,
+        };
         authority
             .set_pg_acting_set(PgId::new(46), vec![NodeId::new(1), NodeId::new(2)])
             .unwrap();
@@ -23685,7 +23911,11 @@ mod tests {
             .unwrap();
         assert!(heartbeat_until_serving(&mut authority, 1, 1_000).serving());
 
-        let imported_proof = PgMetadataProof::new(42, 100, 200);
+        let imported_proof = PgMetadataProof {
+            applied_log_index: 42,
+            applied_log_hash: 100,
+            state_digest: 200,
+        };
         authority
             .set_pg_acting_set(PgId::new(49), vec![NodeId::new(1)])
             .unwrap();
@@ -23711,11 +23941,11 @@ mod tests {
             pg.active_metadata_transfer_imported = true;
         }
 
-        let epoch_local_proof = PgMetadataProof::new(
-            imported_proof.applied_log_index,
-            imported_proof.applied_log_hash + 1,
-            imported_proof.state_digest + 1,
-        );
+        let epoch_local_proof = PgMetadataProof {
+            applied_log_index: imported_proof.applied_log_index,
+            applied_log_hash: imported_proof.applied_log_hash + 1,
+            state_digest: imported_proof.state_digest + 1,
+        };
         let active_epoch = authority.snapshot().cluster_epoch();
         let mut restarting_primary = heartbeat_from_record(&authority, 1, active_epoch, 2_002);
         restarting_primary.node_incarnation += 1;
@@ -23764,7 +23994,11 @@ mod tests {
             .unwrap();
         assert!(heartbeat_until_serving(&mut authority, 1, 1_000).serving());
 
-        let imported_proof = PgMetadataProof::new(42, 100, 200);
+        let imported_proof = PgMetadataProof {
+            applied_log_index: 42,
+            applied_log_hash: 100,
+            state_digest: 200,
+        };
         authority
             .set_pg_acting_set(PgId::new(50), vec![NodeId::new(1)])
             .unwrap();
@@ -23790,11 +24024,11 @@ mod tests {
             pg.active_metadata_transfer_imported = true;
         }
 
-        let epoch_local_proof = PgMetadataProof::new(
-            imported_proof.applied_log_index,
-            imported_proof.applied_log_hash + 1,
-            imported_proof.state_digest + 1,
-        );
+        let epoch_local_proof = PgMetadataProof {
+            applied_log_index: imported_proof.applied_log_index,
+            applied_log_hash: imported_proof.applied_log_hash + 1,
+            state_digest: imported_proof.state_digest + 1,
+        };
         let active_proof_epoch = authority
             .snapshot()
             .pg(PgId::new(50))
@@ -23849,7 +24083,11 @@ mod tests {
                 .unwrap();
             assert!(heartbeat_until_serving(&mut authority, node_id, 1_000).serving());
         }
-        let active_proof = PgMetadataProof::new(9, 10, 11);
+        let active_proof = PgMetadataProof {
+            applied_log_index: 9,
+            applied_log_hash: 10,
+            state_digest: 11,
+        };
         authority
             .set_pg_acting_set(PgId::new(41), vec![NodeId::new(1)])
             .unwrap();
@@ -23928,7 +24166,11 @@ mod tests {
         }
 
         let pg_id = PgId::new(61);
-        let initial_proof = PgMetadataProof::new(9, 10, 11);
+        let initial_proof = PgMetadataProof {
+            applied_log_index: 9,
+            applied_log_hash: 10,
+            state_digest: 11,
+        };
         authority
             .set_pg_acting_set(pg_id, vec![NodeId::new(1)])
             .unwrap();
@@ -24062,11 +24304,11 @@ mod tests {
         let active_pg = authority.snapshot().pg(pg_id).unwrap();
         let source_primary = active_pg.active_primary().unwrap();
         let source_proof = active_pg.active_metadata_proof().unwrap();
-        let imported_proof = PgMetadataProof::new(
-            source_proof.applied_log_index + 1,
-            source_proof.applied_log_hash + 100,
-            source_proof.state_digest + 100,
-        );
+        let imported_proof = PgMetadataProof {
+            applied_log_index: source_proof.applied_log_index + 1,
+            applied_log_hash: source_proof.applied_log_hash + 100,
+            state_digest: source_proof.state_digest + 100,
+        };
         let transfer = PgMetadataTransferProof::new_with_imported_metadata_proof(
             active_epoch,
             source_proof,
@@ -24170,7 +24412,11 @@ mod tests {
                 .unwrap();
             assert!(heartbeat_until_serving(&mut authority, node_id, 1_000).serving());
         }
-        let active_proof = PgMetadataProof::new(9, 10, 11);
+        let active_proof = PgMetadataProof {
+            applied_log_index: 9,
+            applied_log_hash: 10,
+            state_digest: 11,
+        };
         authority
             .set_pg_acting_set(PgId::new(42), vec![NodeId::new(1)])
             .unwrap();
@@ -24209,16 +24455,16 @@ mod tests {
 
         let stale_transfer = PgMetadataTransferProof::new_with_imported_metadata_proof(
             active_epoch,
-            PgMetadataProof::new(
-                active_proof.applied_log_index,
-                active_proof.applied_log_hash + 1,
-                active_proof.state_digest,
-            ),
-            PgMetadataProof::new(
-                active_proof.applied_log_index,
-                active_proof.applied_log_hash + 10,
-                active_proof.state_digest,
-            ),
+            PgMetadataProof {
+                applied_log_index: active_proof.applied_log_index,
+                applied_log_hash: active_proof.applied_log_hash + 1,
+                state_digest: active_proof.state_digest,
+            },
+            PgMetadataProof {
+                applied_log_index: active_proof.applied_log_index,
+                applied_log_hash: active_proof.applied_log_hash + 10,
+                state_digest: active_proof.state_digest,
+            },
         );
         assert!(matches!(
             authority.set_pg_acting_set_with_metadata_transfer(
@@ -24251,11 +24497,11 @@ mod tests {
             Err(ControlPlaneError::PgMetadataTransferSourceEpochStale { pg_id: 42, .. })
         ));
 
-        let imported_proof = PgMetadataProof::new(
-            active_proof.applied_log_index,
-            active_proof.applied_log_hash + 100,
-            active_proof.state_digest,
-        );
+        let imported_proof = PgMetadataProof {
+            applied_log_index: active_proof.applied_log_index,
+            applied_log_hash: active_proof.applied_log_hash + 100,
+            state_digest: active_proof.state_digest,
+        };
         let transfer = PgMetadataTransferProof::new_with_imported_metadata_proof(
             active_epoch,
             active_proof,
@@ -24282,11 +24528,11 @@ mod tests {
         let mismatched_same_acting_set = PgMetadataTransferProof::new_with_imported_metadata_proof(
             active_epoch,
             active_proof,
-            PgMetadataProof::new(
-                imported_proof.applied_log_index,
-                imported_proof.applied_log_hash + 1,
-                imported_proof.state_digest,
-            ),
+            PgMetadataProof {
+                applied_log_index: imported_proof.applied_log_index,
+                applied_log_hash: imported_proof.applied_log_hash + 1,
+                state_digest: imported_proof.state_digest,
+            },
         );
         assert!(matches!(
             authority.set_pg_acting_set_with_metadata_transfer(
@@ -24345,11 +24591,11 @@ mod tests {
             }) if cluster_epoch == peering_epoch
         ));
 
-        let stale_source_above_imported = PgMetadataProof::new(
-            imported_proof.applied_log_index + 10,
-            imported_proof.applied_log_hash + 10,
-            imported_proof.state_digest + 10,
-        );
+        let stale_source_above_imported = PgMetadataProof {
+            applied_log_index: imported_proof.applied_log_index + 10,
+            applied_log_hash: imported_proof.applied_log_hash + 10,
+            state_digest: imported_proof.state_digest + 10,
+        };
         heartbeat_with_pg_proof(
             &mut authority,
             2,
@@ -24413,11 +24659,11 @@ mod tests {
         assert!(!restarted_active_pg.metadata_transfer_fenced());
         assert!(!restarted_active_pg.active_metadata_transfer_imported());
 
-        let epoch_local_source_proof = PgMetadataProof::new(
-            imported_proof.applied_log_index,
-            imported_proof.applied_log_hash + 200,
-            imported_proof.state_digest + 1,
-        );
+        let epoch_local_source_proof = PgMetadataProof {
+            applied_log_index: imported_proof.applied_log_index,
+            applied_log_hash: imported_proof.applied_log_hash + 200,
+            state_digest: imported_proof.state_digest + 1,
+        };
         heartbeat_with_pg_proof(
             &mut authority,
             2,
@@ -24441,11 +24687,11 @@ mod tests {
         let repeated_transfer = PgMetadataTransferProof::new_with_imported_metadata_proof(
             fenced_epoch,
             epoch_local_source_proof,
-            PgMetadataProof::new(
-                epoch_local_source_proof.applied_log_index,
-                epoch_local_source_proof.applied_log_hash + 100,
-                epoch_local_source_proof.state_digest,
-            ),
+            PgMetadataProof {
+                applied_log_index: epoch_local_source_proof.applied_log_index,
+                applied_log_hash: epoch_local_source_proof.applied_log_hash + 100,
+                state_digest: epoch_local_source_proof.state_digest,
+            },
         );
         authority
             .set_pg_acting_set_with_metadata_transfer(
@@ -24473,7 +24719,11 @@ mod tests {
                 .unwrap();
             assert!(heartbeat_until_serving(&mut authority, node_id, 1_000).serving());
         }
-        let active_proof = PgMetadataProof::new(9, 10, 11);
+        let active_proof = PgMetadataProof {
+            applied_log_index: 9,
+            applied_log_hash: 10,
+            state_digest: 11,
+        };
         authority
             .set_pg_acting_set(PgId::new(50), vec![NodeId::new(1), NodeId::new(2)])
             .unwrap();
@@ -24551,8 +24801,16 @@ mod tests {
                 .unwrap();
             assert!(heartbeat_until_serving(&mut authority, node_id, 1_000).serving());
         }
-        let imported_activation_floor = PgMetadataProof::new(9, 10, 11);
-        let epoch_local_source_proof = PgMetadataProof::new(2, 12, 13);
+        let imported_activation_floor = PgMetadataProof {
+            applied_log_index: 9,
+            applied_log_hash: 10,
+            state_digest: 11,
+        };
+        let epoch_local_source_proof = PgMetadataProof {
+            applied_log_index: 2,
+            applied_log_hash: 12,
+            state_digest: 13,
+        };
         for (idx, pg_id) in [42, 43].into_iter().enumerate() {
             let base_ms = 10_000 + (idx as u64 * 100);
             authority
@@ -24609,7 +24867,11 @@ mod tests {
         let fenced_transfer = PgMetadataTransferProof::new_with_imported_metadata_proof(
             fenced_epoch,
             epoch_local_source_proof,
-            PgMetadataProof::new(3, 14, 15),
+            PgMetadataProof {
+                applied_log_index: 3,
+                applied_log_hash: 14,
+                state_digest: 15,
+            },
         );
         assert!(matches!(
             authority.set_pg_acting_set_with_metadata_transfer(
@@ -24627,7 +24889,11 @@ mod tests {
         let unfenced_transfer = PgMetadataTransferProof::new_with_imported_metadata_proof(
             unfenced_epoch,
             epoch_local_source_proof,
-            PgMetadataProof::new(3, 16, 17),
+            PgMetadataProof {
+                applied_log_index: 3,
+                applied_log_hash: 16,
+                state_digest: 17,
+            },
         );
         assert!(matches!(
             authority.set_pg_acting_set_with_metadata_transfer(
@@ -24650,7 +24916,11 @@ mod tests {
                 .unwrap();
             assert!(heartbeat_until_serving(&mut authority, node_id, 1_000).serving());
         }
-        let source_proof = PgMetadataProof::new(3, 9_474, 15_725);
+        let source_proof = PgMetadataProof {
+            applied_log_index: 3,
+            applied_log_hash: 9_474,
+            state_digest: 15_725,
+        };
         authority
             .set_pg_acting_set(PgId::new(44), vec![NodeId::new(1)])
             .unwrap();
@@ -24686,7 +24956,11 @@ mod tests {
             .fence_pg_for_metadata_transfer(PgId::new(44))
             .unwrap();
         assert!(source_epoch < authority.snapshot().cluster_epoch());
-        let imported_proof = PgMetadataProof::new(3, 49_281, source_proof.state_digest);
+        let imported_proof = PgMetadataProof {
+            applied_log_index: 3,
+            applied_log_hash: 49_281,
+            state_digest: source_proof.state_digest,
+        };
         let transfer = PgMetadataTransferProof::new_with_imported_metadata_proof(
             source_epoch,
             source_proof,

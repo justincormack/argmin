@@ -951,11 +951,11 @@ fn peering_replay_catches_up_replicas_through_unix_storage_clients() {
         .metadata_command_client()
         .metadata_command_replica_state(pg_id)
         .unwrap();
-    let proof = crate::control_plane::PgMetadataProof::new(
-        primary_state.applied_log_index,
-        primary_state.applied_log_hash,
-        primary_state.state_digest,
-    );
+    let proof = crate::control_plane::PgMetadataProof {
+        applied_log_index: primary_state.applied_log_index,
+        applied_log_hash: primary_state.applied_log_hash,
+        state_digest: primary_state.state_digest,
+    };
     assert_eq!(
         decision,
         crate::peering::PgPeeringReconstructionDecision::AlreadyConverged { proof }
@@ -3742,11 +3742,11 @@ fn control_plane_peering_unix_direct_put_old_primary_fails_closed_and_cleans_rem
         .unwrap();
         let object_pg_store = remote.get_pg(object_pg).unwrap();
         let state = object_pg_store.metadata_command_replica_state().unwrap();
-        let proof = crate::control_plane::PgMetadataProof::new(
-            state.applied_log_index,
-            state.applied_log_hash,
-            state.state_digest,
-        );
+        let proof = crate::control_plane::PgMetadataProof {
+            applied_log_index: state.applied_log_index,
+            applied_log_hash: state.applied_log_hash,
+            state_digest: state.state_digest,
+        };
         assert_eq!(
             proof, before_object_pg_proof,
             "old-primary Unix direct PUT must not append an object-PG command on node {:?}",
@@ -4136,11 +4136,11 @@ fn control_plane_peering_unix_copy_object_destination_old_primary_cleans_remote_
         .unwrap();
         let dst_pg = remote_dst.get_pg(dst_object_pg).unwrap();
         let state = dst_pg.metadata_command_replica_state().unwrap();
-        let proof = crate::control_plane::PgMetadataProof::new(
-            state.applied_log_index,
-            state.applied_log_hash,
-            state.state_digest,
-        );
+        let proof = crate::control_plane::PgMetadataProof {
+            applied_log_index: state.applied_log_index,
+            applied_log_hash: state.applied_log_hash,
+            state_digest: state.state_digest,
+        };
         assert_eq!(
             proof, before_dst_object_pg_proof,
             "old-primary Unix CopyObject destination must not append an object-PG command on node {:?}",
@@ -4483,11 +4483,11 @@ fn control_plane_peering_unix_object_delete_old_primary_fails_closed_without_rem
         .unwrap();
         let object_pg_store = remote.get_pg(object_pg).unwrap();
         let state = object_pg_store.metadata_command_replica_state().unwrap();
-        let proof = crate::control_plane::PgMetadataProof::new(
-            state.applied_log_index,
-            state.applied_log_hash,
-            state.state_digest,
-        );
+        let proof = crate::control_plane::PgMetadataProof {
+            applied_log_index: state.applied_log_index,
+            applied_log_hash: state.applied_log_hash,
+            state_digest: state.state_digest,
+        };
         assert_eq!(
             proof, before_object_pg_proof,
             "old-primary Unix object delete must not append an object-PG command on node {:?}",
@@ -4784,11 +4784,11 @@ fn control_plane_peering_unix_object_metadata_old_primary_fails_closed_without_r
         .unwrap();
         let object_pg_store = remote.get_pg(object_pg).unwrap();
         let state = object_pg_store.metadata_command_replica_state().unwrap();
-        let proof = crate::control_plane::PgMetadataProof::new(
-            state.applied_log_index,
-            state.applied_log_hash,
-            state.state_digest,
-        );
+        let proof = crate::control_plane::PgMetadataProof {
+            applied_log_index: state.applied_log_index,
+            applied_log_hash: state.applied_log_hash,
+            state_digest: state.state_digest,
+        };
         assert_eq!(
             proof, before_object_pg_proof,
             "old-primary Unix object metadata update must not append an object-PG command on node {:?}",
@@ -5080,11 +5080,11 @@ fn control_plane_peering_unix_multipart_completion_old_primary_fails_closed_with
         .unwrap();
         let object_pg_store = remote.get_pg(object_pg).unwrap();
         let state = object_pg_store.metadata_command_replica_state().unwrap();
-        let proof = crate::control_plane::PgMetadataProof::new(
-            state.applied_log_index,
-            state.applied_log_hash,
-            state.state_digest,
-        );
+        let proof = crate::control_plane::PgMetadataProof {
+            applied_log_index: state.applied_log_index,
+            applied_log_hash: state.applied_log_hash,
+            state_digest: state.state_digest,
+        };
         assert_eq!(
             proof, before_object_pg_proof,
             "old-primary Unix multipart completion must not append an object-PG command on node {:?}",
@@ -5405,11 +5405,11 @@ fn control_plane_peering_unix_multipart_abort_old_primary_fails_closed_without_r
         .unwrap();
         let object_pg_store = remote.get_pg(object_pg).unwrap();
         let state = object_pg_store.metadata_command_replica_state().unwrap();
-        let proof = crate::control_plane::PgMetadataProof::new(
-            state.applied_log_index,
-            state.applied_log_hash,
-            state.state_digest,
-        );
+        let proof = crate::control_plane::PgMetadataProof {
+            applied_log_index: state.applied_log_index,
+            applied_log_hash: state.applied_log_hash,
+            state_digest: state.state_digest,
+        };
         assert_eq!(
             proof, before_object_pg_proof,
             "old-primary Unix multipart abort must not append an object-PG command on node {:?}",
@@ -5741,11 +5741,11 @@ fn control_plane_peering_unix_upload_part_session_old_primary_fails_closed_witho
         .unwrap();
         let object_pg_store = remote.get_pg(object_pg).unwrap();
         let state = object_pg_store.metadata_command_replica_state().unwrap();
-        let proof = crate::control_plane::PgMetadataProof::new(
-            state.applied_log_index,
-            state.applied_log_hash,
-            state.state_digest,
-        );
+        let proof = crate::control_plane::PgMetadataProof {
+            applied_log_index: state.applied_log_index,
+            applied_log_hash: state.applied_log_hash,
+            state_digest: state.state_digest,
+        };
         assert_eq!(
             proof, before_object_pg_proof,
             "old-primary Unix UploadPart session create must not append an object-PG command on node {:?}",
@@ -6160,11 +6160,11 @@ fn control_plane_peering_unix_upload_part_finalize_old_primary_preserves_remote_
         .unwrap();
         let object_pg_store = remote.get_pg(object_pg).unwrap();
         let state = object_pg_store.metadata_command_replica_state().unwrap();
-        let proof = crate::control_plane::PgMetadataProof::new(
-            state.applied_log_index,
-            state.applied_log_hash,
-            state.state_digest,
-        );
+        let proof = crate::control_plane::PgMetadataProof {
+            applied_log_index: state.applied_log_index,
+            applied_log_hash: state.applied_log_hash,
+            state_digest: state.state_digest,
+        };
         assert_eq!(
             proof, before_object_pg_proof,
             "old-primary Unix UploadPart finalization must not append an object-PG command on node {:?}",
@@ -6601,11 +6601,11 @@ fn control_plane_peering_unix_stream_put_finalize_old_primary_preserves_remote_s
         .unwrap();
         let object_pg_store = remote.get_pg(object_pg).unwrap();
         let state = object_pg_store.metadata_command_replica_state().unwrap();
-        let proof = crate::control_plane::PgMetadataProof::new(
-            state.applied_log_index,
-            state.applied_log_hash,
-            state.state_digest,
-        );
+        let proof = crate::control_plane::PgMetadataProof {
+            applied_log_index: state.applied_log_index,
+            applied_log_hash: state.applied_log_hash,
+            state_digest: state.state_digest,
+        };
         assert_eq!(
             proof, before_object_pg_proof,
             "old-primary Unix stream PUT finalization must not append an object-PG command on node {:?}",
@@ -7076,11 +7076,11 @@ fn control_plane_peering_unix_upload_part_copy_finalize_old_primary_preserves_re
         .unwrap();
         let object_pg_store = remote.get_pg(object_pg).unwrap();
         let state = object_pg_store.metadata_command_replica_state().unwrap();
-        let proof = crate::control_plane::PgMetadataProof::new(
-            state.applied_log_index,
-            state.applied_log_hash,
-            state.state_digest,
-        );
+        let proof = crate::control_plane::PgMetadataProof {
+            applied_log_index: state.applied_log_index,
+            applied_log_hash: state.applied_log_hash,
+            state_digest: state.state_digest,
+        };
         assert_eq!(
             proof, before_object_pg_proof,
             "old-primary Unix UploadPartCopy finalization must not append an object-PG command on node {:?}",

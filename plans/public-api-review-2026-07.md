@@ -962,9 +962,11 @@ each is one refactor away from a panic:
   Fixed by introducing `DurableBucketWriteReservationAcquire<'_>` and using it
   through the store, node-client, local, Unix RPC, and storage-node dispatch
   layers while keeping `PgId` as separate routing context.
-- [ ] `PgMetadataProof::new(u64, u64, u64)` (`control_plane.rs:3106`) —
+- [x] `PgMetadataProof::new(u64, u64, u64)` (`control_plane.rs:3106`) —
   index/hash/digest transposition compiles silently and poisons peering-proof
-  comparison. Named-field construction only, or newtypes.
+  comparison. Fixed by removing the positional constructor and converting
+  callers to named `PgMetadataProof { applied_log_index, applied_log_hash,
+  state_digest }` construction.
 - [ ] `TraceContext::from_ids(String, String)` (`observability/src/lib.rs:39`)
   — trace/request id swap risk at wire boundaries.
 - [ ] `put_bucket_acl_and_load_info(..., public_read: bool, public_write:
