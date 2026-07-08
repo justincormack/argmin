@@ -357,9 +357,32 @@ pub struct DeletedObject {
 #[derive(Debug)]
 pub struct DeleteError {
     pub key: String,
-    pub version_id: Option<VersionId>,
+    pub version_id: Option<DeleteErrorVersionId>,
     pub code: String,
     pub message: String,
+}
+
+/// Version-id token to echo in a `DeleteObjects` per-object error.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeleteErrorVersionId {
+    Parsed(VersionId),
+    Raw(String),
+}
+
+impl DeleteErrorVersionId {
+    #[must_use]
+    pub fn wire_value(&self) -> String {
+        match self {
+            Self::Parsed(version_id) => version_id.to_string(),
+            Self::Raw(version_id) => version_id.clone(),
+        }
+    }
+}
+
+impl From<VersionId> for DeleteErrorVersionId {
+    fn from(version_id: VersionId) -> Self {
+        Self::Parsed(version_id)
+    }
 }
 
 /// Result of a DeleteObjects (batch delete) operation.

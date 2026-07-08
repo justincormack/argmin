@@ -1748,8 +1748,8 @@ pub fn delete_objects_result_xml(
         xml.push_str("<Error><Key>");
         xml.push_str(&xml_escape(&e.key));
         xml.push_str("</Key>");
-        if let Some(version_id) = e.version_id {
-            let vid = super::response::format_version_id(version_id);
+        if let Some(version_id) = &e.version_id {
+            let vid = version_id.wire_value();
             xml.push_str("<VersionId>");
             xml.push_str(&xml_escape(&vid));
             xml.push_str("</VersionId>");
@@ -5783,7 +5783,7 @@ mod tests {
         use crate::coordinator::DeleteError;
         let errors = vec![DeleteError {
             key: "key2".to_string(),
-            version_id: Some(VersionId::from_u64(7)),
+            version_id: Some(VersionId::from_u64(7).into()),
             code: "NotImplemented".to_string(),
             message: "A form field you provided implies functionality that is not implemented"
                 .to_string(),
@@ -5791,6 +5791,28 @@ mod tests {
         let xml = delete_objects_result_xml(&[], &errors, false);
         assert!(xml
             .contains("<Error><Key>key2</Key><VersionId>7</VersionId><Code>NotImplemented</Code>"));
+    }
+
+    #[test]
+    fn delete_result_xml_error_escapes_raw_version_id() {
+        use crate::coordinator::{DeleteError, DeleteErrorVersionId};
+        let errors = vec![DeleteError {
+            key: "key2".to_string(),
+            version_id: Some(DeleteErrorVersionId::Raw("bad&<>\"id".to_string())),
+            code: "NoSuchVersion".to_string(),
+            message: "The specified version does not exist.".to_string(),
+        }];
+        let xml = delete_objects_result_xml(&[], &errors, false);
+        assert!(
+            xml.contains(
+                "<Error><Key>key2</Key><VersionId>bad&amp;&lt;&gt;&quot;id</VersionId><Code>NoSuchVersion</Code>"
+            ),
+            "unexpected body: {xml}"
+        );
+        assert!(
+            !xml.contains("<VersionId>bad&<>\"id</VersionId>"),
+            "unescaped version id in body: {xml}"
+        );
     }
 
     #[test]

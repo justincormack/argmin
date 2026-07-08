@@ -63,6 +63,12 @@ pub enum ServerError {
     #[error("invalid argument: {reason}")]
     InvalidArgument { reason: String },
 
+    #[error("invalid version id specified: {argument_name}={argument_value}")]
+    InvalidVersionId {
+        argument_name: String,
+        argument_value: String,
+    },
+
     #[error("duplicate checksum header: {header}")]
     DuplicateChecksumHeader { header: String, value: String },
 
@@ -469,9 +475,9 @@ impl ServerError {
             Self::NotModified { .. } => "NotModified",
             Self::InvalidRequest { .. } | Self::InvalidRequestHostId { .. } => "InvalidRequest",
             Self::BadRequest { .. } => "BadRequest",
-            Self::InvalidArgument { .. } | Self::DuplicateChecksumHeader { .. } => {
-                "InvalidArgument"
-            }
+            Self::InvalidArgument { .. }
+            | Self::InvalidVersionId { .. }
+            | Self::DuplicateChecksumHeader { .. } => "InvalidArgument",
             Self::InvalidRedirectLocation { .. } => "InvalidRedirectLocation",
             Self::UnexpectedContent => "UnexpectedContent",
             Self::InvalidURI { .. } => "InvalidURI",
@@ -585,6 +591,7 @@ impl ServerError {
             | Self::InvalidRequestHostId { .. }
             | Self::BadRequest { .. }
             | Self::InvalidArgument { .. }
+            | Self::InvalidVersionId { .. }
             | Self::DuplicateChecksumHeader { .. }
             | Self::InvalidRedirectLocation { .. }
             | Self::UnexpectedContent

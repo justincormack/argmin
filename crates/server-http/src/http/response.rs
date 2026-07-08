@@ -291,6 +291,7 @@ fn client_error_message(err: &ServerError) -> String {
         | ServerError::MalformedPOSTRequest { reason }
         | ServerError::MalformedChunkedBody { reason }
         | ServerError::InvalidTag { reason, .. } => reason.clone(),
+        ServerError::InvalidVersionId { .. } => "Invalid version id specified".to_string(),
         ServerError::MalformedXML { .. } => {
             "The XML you provided was not well-formed or did not validate against \
              our published schema"
@@ -683,6 +684,19 @@ impl S3Response {
                     &client_error_message(err),
                     header,
                     Some(value),
+                    request_id,
+                    host_id,
+                );
+                Self::new(400).chunked_xml_body(body)
+            }
+            ServerError::InvalidVersionId {
+                argument_name,
+                argument_value,
+            } => {
+                let body = xml::invalid_argument_error_xml(
+                    &client_error_message(err),
+                    argument_name,
+                    Some(argument_value),
                     request_id,
                     host_id,
                 );
@@ -2532,6 +2546,30 @@ mod tests {
             Some(
                 "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<GetObjectAttributesResponse xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"></GetObjectAttributesResponse>"
             )
+        );
+    }
+
+    #[test]
+    fn invalid_version_id_error_response_matches_aws_shape() {
+        let err = ServerError::InvalidVersionId {
+            argument_name: "versionId".to_string(),
+            argument_value: "0".to_string(),
+        };
+        let resp = S3Response::error(&err, "/bucket/key", TEST_HOST_ID);
+        assert_eq!(resp.status_code, 400);
+        assert_eq!(find_header(&resp, "Content-Type"), Some("application/xml"));
+        let body = String::from_utf8(resp.into_test_body_bytes().unwrap()).unwrap();
+        assert_eq!(
+            body,
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+             <Error>\
+             <Code>InvalidArgument</Code>\
+             <Message>Invalid version id specified</Message>\
+             <ArgumentName>versionId</ArgumentName>\
+             <ArgumentValue>0</ArgumentValue>\
+             <RequestId>request-id</RequestId>\
+             <HostId>host-id</HostId>\
+             </Error>"
         );
     }
 

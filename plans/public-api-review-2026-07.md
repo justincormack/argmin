@@ -1005,11 +1005,19 @@ each is one refactor away from a panic:
   of raw strings, matching counters exhaustively, moving storage RPC admission
   onto the observability class, and adding
   `stream_upload_finalize_started_total`.
-- [ ] `VersionId` has `Display` in s3-types but its inverse parser lives in
-  server-http and is lossier (`mod.rs:128-137` accepts `versionId=0` as the
+- [x] `VersionId` has `Display` in s3-types but its inverse parser lives in
+  server-http and is lossier (`mod.rs:128-137` accepted `versionId=0` as the
   null version via `from_u64(0)`, `s3-types/lib.rs:493-497`, which Display
-  (:525) never produces). Fix: `impl FromStr for VersionId` in s3-types
-  accepting `"null"` and `>= 1` only.
+  (:525) never produces). Fixed by adding `FromStr` for `VersionId` in
+  s3-types, accepting `"null"` and nonzero decimal ids only, and making
+  server-http map parse failures to the AWS-pinned `InvalidArgument` shape.
+  AWS-facing coverage pins `versionId=0`, non-canonical `versionId=01`, and
+  `version-id-marker=0` as `<Message>Invalid version id specified</Message>`
+  with the supplied invalid `<ArgumentValue>`. DeleteObjects XML is explicitly
+  different: AWS accepts an invalid `<VersionId>` token at request level and
+  returns HTTP 200 with a per-object `NoSuchVersion` entry that echoes the raw
+  token, so the local `DeleteObjects` path preserves invalid raw version IDs in
+  `DeleteErrorVersionId` instead of reusing the top-level query parser error.
 - [ ] `BucketNamespace::as_header_value` has no parse counterpart —
   server-http matches `"global"`/`"account-regional"` literals
   (mod.rs:506-507 vs s3-types lib.rs:250-254). `BucketVersioningState` has

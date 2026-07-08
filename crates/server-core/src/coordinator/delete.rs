@@ -326,7 +326,7 @@ impl Coordinator {
                 Err(e) => {
                     errors.push(DeleteError {
                         key: entry.key.to_string(),
-                        version_id: entry.version_id,
+                        version_id: entry.version_id.map(Into::into),
                         code: e.s3_error_code().to_string(),
                         message: e.to_string(),
                     });

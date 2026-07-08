@@ -2,6 +2,7 @@
 
 use std::fmt::Write;
 use std::num::{NonZeroU32, NonZeroU64};
+use std::str::FromStr;
 
 pub mod lifecycle;
 
@@ -528,6 +529,34 @@ impl std::fmt::Display for VersionId {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VersionIdParseError;
+
+impl std::fmt::Display for VersionIdParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("invalid version id")
+    }
+}
+
+impl std::error::Error for VersionIdParseError {}
+
+impl FromStr for VersionId {
+    type Err = VersionIdParseError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        if value == "null" {
+            return Ok(Self::Null);
+        }
+        if value.len() > 1 && value.starts_with('0') {
+            return Err(VersionIdParseError);
+        }
+        let parsed = value
+            .parse::<NonZeroU64>()
+            .map_err(|_| VersionIdParseError)?;
+        Ok(Self::Versioned(parsed))
+    }
+}
+
 /// Canonical S3 owner ID used in XML owner fields.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct CanonicalUserId(String);
@@ -1032,6 +1061,7 @@ mod tests {
         assert!(versioned.is_versioned());
         assert_eq!(versioned.to_u64(), 42);
         assert_eq!(versioned.to_string(), "42");
+        assert_eq!("42".parse::<VersionId>().unwrap(), versioned);
     }
 
     #[test]
@@ -1039,6 +1069,17 @@ mod tests {
         assert!(VersionId::Null.is_null());
         assert!(!VersionId::Null.is_versioned());
         assert_eq!(VersionId::Null.to_string(), "null");
+        assert_eq!("null".parse::<VersionId>().unwrap(), VersionId::Null);
+    }
+
+    #[test]
+    fn version_id_parser_rejects_storage_sentinel_and_invalid_tokens() {
+        for value in ["0", "", "abc", "-1", "01", "01x"] {
+            assert!(
+                value.parse::<VersionId>().is_err(),
+                "unexpectedly parsed {value:?}"
+            );
+        }
     }
 
     #[test]

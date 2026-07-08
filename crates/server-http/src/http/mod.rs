@@ -148,15 +148,11 @@ fn parse_version_id_str(v: &str) -> Result<VersionId, ServerError> {
 }
 
 fn parse_version_id_str_with_label(v: &str, label: &str) -> Result<VersionId, ServerError> {
-    if v == "null" {
-        Ok(VersionId::Null)
-    } else {
-        v.parse::<u64>()
-            .map(VersionId::from_u64)
-            .map_err(|_| ServerError::InvalidArgument {
-                reason: format!("invalid {label}: {v}"),
-            })
-    }
+    v.parse::<VersionId>()
+        .map_err(|_| ServerError::InvalidVersionId {
+            argument_name: label.to_string(),
+            argument_value: v.to_string(),
+        })
 }
 
 fn parse_optional_version_id<S: AsRef<str>>(
@@ -2036,18 +2032,33 @@ impl HttpFrontend {
                 let mut entries: Vec<crate::coordinator::DeleteEntry> = Vec::new();
                 let mut validation_errors: Vec<crate::coordinator::DeleteError> = Vec::new();
                 for e in &xml_entries {
-                    let version_id = e
-                        .version_id
-                        .as_deref()
-                        .map(parse_version_id_str)
-                        .transpose()?;
+                    let version_id = match e.version_id.as_deref() {
+                        Some(raw_version_id) => match parse_version_id_str(raw_version_id) {
+                            Ok(version_id) => Some(version_id),
+                            Err(ServerError::InvalidVersionId { .. }) => {
+                                validation_errors.push(crate::coordinator::DeleteError {
+                                    key: e.key.to_string(),
+                                    version_id: Some(
+                                        crate::coordinator::DeleteErrorVersionId::Raw(
+                                            raw_version_id.to_string(),
+                                        ),
+                                    ),
+                                    code: "NoSuchVersion".to_string(),
+                                    message: "The specified version does not exist.".to_string(),
+                                });
+                                continue;
+                            }
+                            Err(error) => return Err(error),
+                        },
+                        None => None,
+                    };
                     let has_unsupported_form_fields =
                         e.last_modified_time.is_some() || e.size.is_some();
                     let has_unsupported_versioned_etag = version_id.is_some() && e.etag.is_some();
                     if has_unsupported_form_fields || has_unsupported_versioned_etag {
                         validation_errors.push(crate::coordinator::DeleteError {
                             key: e.key.to_string(),
-                            version_id,
+                            version_id: version_id.map(Into::into),
                             code: "NotImplemented".to_string(),
                             message:
                                 "A form field you provided implies functionality that is not implemented"
@@ -10742,8 +10753,14 @@ mod tests {
             bucket: test_bucket_name("mybucket"),
         };
         match fe.dispatch_routed(&req, &test_auth(), op) {
-            Err(ServerError::InvalidArgument { .. }) => {}
-            Err(e) => panic!("expected InvalidArgument, got {e:?}"),
+            Err(ServerError::InvalidVersionId {
+                argument_name,
+                argument_value,
+            }) => {
+                assert_eq!(argument_name, "version-id-marker");
+                assert_eq!(argument_value, "abc");
+            }
+            Err(e) => panic!("expected InvalidVersionId, got {e:?}"),
             Ok(_) => panic!("expected error, got Ok"),
         }
     }
@@ -11699,7 +11716,7 @@ mod tests {
     // ── DeleteObjects version-id validation ────────────────────────────
 
     #[test]
-    fn delete_objects_invalid_version_id_rejected() {
+    fn delete_objects_invalid_version_id_returns_per_object_no_such_version() {
         let tmp = test_util::tempdir();
         let fe = setup_frontend(tmp.path());
         create_test_bucket(&fe.coordinator, "mybucket");
@@ -11718,11 +11735,10 @@ mod tests {
         let op = S3Operation::DeleteObjects {
             bucket: test_bucket_name("mybucket"),
         };
-        match fe.dispatch_routed(&req, &test_auth(), op) {
-            Err(ServerError::InvalidArgument { .. }) => {}
-            Err(e) => panic!("expected InvalidArgument, got {e:?}"),
-            Ok(_) => panic!("expected error, got Ok"),
-        }
+        let resp = fe.dispatch_routed(&req, &test_auth(), op).unwrap();
+        assert_eq!(resp.status_code, 200);
+        let body = String::from_utf8(response_body(resp)).unwrap();
+        assert!(body.contains("<Error><Key>key1</Key><VersionId>not-a-number</VersionId><Code>NoSuchVersion</Code><Message>The specified version does not exist.</Message></Error>"), "unexpected body: {body}");
     }
 
     #[test]

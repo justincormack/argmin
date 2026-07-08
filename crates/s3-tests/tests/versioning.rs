@@ -8,7 +8,10 @@ use s3_tests::{
     delete_bucket_retrying_operation_aborted, delete_objects_retrying_operation_aborted,
     err_status, get_object_body_retrying_operation_aborted, raw_bucket, raw_object,
     raw_object_query, send_signed_request,
-    shape::{assert_shape, id_headers, shape, xml_response_headers},
+    shape::{
+        assert_shape, error_response_headers, expected_error, id_headers, shape,
+        xml_response_headers,
+    },
     unique_bucket, RawResponse, SendRetryingOperationAborted, CTX,
 };
 use tokio::time::{sleep, Duration};
@@ -243,6 +246,164 @@ async fn setup_versioned_bucket() -> String {
     )
     .await;
     bucket
+}
+
+#[test]
+fn test_version_id_zero_is_not_null_version() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_versioned_bucket().await;
+        let key = "version-id-zero";
+        let put =
+            put_object_retrying_operation_aborted(client, &bucket, key, b"body".to_vec()).await;
+        let actual_version_id = put.version_id().expect("versioned put returns version id");
+
+        let actual = send_raw_retrying_operation_aborted("get actual version id", || {
+            raw_object_query(
+                "GET",
+                &bucket,
+                key,
+                &format!("versionId={actual_version_id}"),
+            )
+        });
+        assert_eq!(actual.status, 200, "unexpected body: {}", actual.body);
+        assert_eq!(actual.body, "body");
+
+        let zero = send_raw_retrying_operation_aborted("get versionId=0", || {
+            raw_object_query("GET", &bucket, key, "versionId=0")
+        });
+        let leading_zero = send_raw_retrying_operation_aborted("get versionId=01", || {
+            raw_object_query("GET", &bucket, key, "versionId=01")
+        });
+
+        cleanup_versioned_bucket(client, &bucket).await;
+
+        assert_shape(
+            "GetObject versionId=0",
+            &zero,
+            &shape().status(400).headers(error_response_headers()).body(
+                expected_error::invalid_argument_with_value(
+                    "Invalid version id specified",
+                    "versionId",
+                    "0",
+                ),
+            ),
+        );
+        assert_shape(
+            "GetObject versionId=01",
+            &leading_zero,
+            &shape().status(400).headers(error_response_headers()).body(
+                expected_error::invalid_argument_with_value(
+                    "Invalid version id specified",
+                    "versionId",
+                    "01",
+                ),
+            ),
+        );
+    });
+}
+
+#[test]
+fn test_list_object_versions_invalid_version_id_marker_shape() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_versioned_bucket().await;
+
+        let response = send_raw_retrying_operation_aborted(
+            "get raw list object versions with invalid version-id-marker",
+            || {
+                raw_bucket(
+                    "GET",
+                    &bucket,
+                    Some("versions=&key-marker=k&version-id-marker=0"),
+                )
+            },
+        );
+
+        cleanup_versioned_bucket(client, &bucket).await;
+
+        assert_shape(
+            "ListObjectVersions version-id-marker=0",
+            &response,
+            &shape().status(400).headers(error_response_headers()).body(
+                expected_error::invalid_argument_with_value(
+                    "Invalid version id specified",
+                    "version-id-marker",
+                    "0",
+                ),
+            ),
+        );
+    });
+}
+
+#[test]
+fn test_delete_objects_invalid_version_id_shape() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_versioned_bucket().await;
+        let delete_body = b"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+            <Delete><Object><Key>delete-invalid-version-id</Key><VersionId>0</VersionId></Object></Delete>";
+        let response =
+            send_raw_retrying_operation_aborted("delete objects with invalid version id", || {
+                send_signed_request(
+                    "POST",
+                    &format!("{}/{}?delete=", CTX.endpoint(), bucket),
+                    delete_body,
+                    [content_md5_header(delete_body)],
+                )
+            });
+
+        cleanup_versioned_bucket(client, &bucket).await;
+
+        assert_shape(
+            "DeleteObjects VersionId=0",
+            &response,
+            &shape().status(200).headers(xml_response_headers()).body(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+                 <DeleteResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
+                 <Error><Key>delete-invalid-version-id</Key><VersionId>0</VersionId>\
+                 <Code>NoSuchVersion</Code><Message>The specified version does not exist.</Message></Error>\
+                 </DeleteResult>",
+            ),
+        );
+    });
+}
+
+#[test]
+fn test_delete_objects_invalid_version_id_xml_escaping_shape() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_versioned_bucket().await;
+        let delete_body = b"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+            <Delete><Object><Key>delete-invalid-version-id-escaping</Key>\
+            <VersionId>bad&amp;&lt;&gt;&quot;id</VersionId></Object></Delete>";
+        let response = send_raw_retrying_operation_aborted(
+            "delete objects with invalid xml-special version id",
+            || {
+                send_signed_request(
+                    "POST",
+                    &format!("{}/{}?delete=", CTX.endpoint(), bucket),
+                    delete_body,
+                    [content_md5_header(delete_body)],
+                )
+            },
+        );
+
+        cleanup_versioned_bucket(client, &bucket).await;
+
+        assert_shape(
+            "DeleteObjects XML-special VersionId",
+            &response,
+            &shape().status(200).headers(xml_response_headers()).body(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+                 <DeleteResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
+                 <Error><Key>delete-invalid-version-id-escaping</Key>\
+                 <VersionId>bad&amp;&lt;&gt;&quot;id</VersionId>\
+                 <Code>NoSuchVersion</Code><Message>The specified version does not exist.</Message></Error>\
+                 </DeleteResult>",
+            ),
+        );
+    });
 }
 
 #[test]
