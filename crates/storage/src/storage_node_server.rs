@@ -294,6 +294,7 @@ use crate::storage_rpc::{
     STORAGE_RPC_FRAME_ENCODING_VERSION, STORAGE_RPC_MAX_METADATA_COMMAND_CHECKPOINT_CANDIDATES,
     STORAGE_RPC_MAX_PAYLOAD_LEN, STORAGE_RPC_SERVER_IDLE_TIMEOUT,
 };
+use crate::traits::DurableBucketWriteReservationAcquire;
 use crate::traits::ShardStore;
 use crate::types::{BucketState, ClusterEpoch, GenerationId, PgId, PgState, SessionId, WriteAck};
 use crate::types::{
@@ -3980,14 +3981,16 @@ impl StorageNodeConnectionHandler {
         match BucketWriteReservationNodeClient::acquire_durable_bucket_write_reservation(
             &local_client,
             request.pg_id,
-            &request.bucket,
-            &request.reservation_id,
-            &request.owner_token,
-            request.cluster_epoch,
-            &request.operation_kind,
-            request.created_at,
-            request.lease_deadline,
-            request.target_context.as_deref(),
+            DurableBucketWriteReservationAcquire {
+                name: &request.bucket,
+                reservation_id: &request.reservation_id,
+                owner_token: &request.owner_token,
+                cluster_epoch: request.cluster_epoch,
+                operation_kind: &request.operation_kind,
+                created_at: request.created_at,
+                lease_deadline: request.lease_deadline,
+                target_context: request.target_context.as_deref(),
+            },
         ) {
             Ok(record) => {
                 let payload = encode_bucket_write_reservation_record_response(
@@ -12101,14 +12104,16 @@ mod tests {
             .unwrap();
             let record = PgMetadataStore::acquire_durable_bucket_write_reservation(
                 &*pg,
-                &bucket,
-                "reservation-expired-route-cleanup",
-                "owner-token-expired-route-cleanup",
-                config.cluster_epoch,
-                "put-object",
-                10,
-                20,
-                Some("key=a"),
+                DurableBucketWriteReservationAcquire {
+                    name: &bucket,
+                    reservation_id: "reservation-expired-route-cleanup",
+                    owner_token: "owner-token-expired-route-cleanup",
+                    cluster_epoch: config.cluster_epoch,
+                    operation_kind: "put-object",
+                    created_at: 10,
+                    lease_deadline: 20,
+                    target_context: Some("key=a"),
+                },
             )
             .unwrap();
             pg.refresh_metadata_command_state_digest().unwrap();

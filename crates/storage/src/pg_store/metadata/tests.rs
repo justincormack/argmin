@@ -2066,14 +2066,16 @@ fn metadata_txn_commit_failure_recovers_representative_mutators() {
             create_probe_bucket_direct(store, &trusted_bucket_name("commit-fail-reservation"));
             PgMetadataStore::acquire_durable_bucket_write_reservation(
                 store,
-                &trusted_bucket_name("commit-fail-reservation"),
-                "reservation-id",
-                "owner-token",
-                ClusterEpoch::INITIAL,
-                "test",
-                10,
-                100,
-                None,
+                crate::traits::DurableBucketWriteReservationAcquire {
+                    name: &trusted_bucket_name("commit-fail-reservation"),
+                    reservation_id: "reservation-id",
+                    owner_token: "owner-token",
+                    cluster_epoch: ClusterEpoch::INITIAL,
+                    operation_kind: "test",
+                    created_at: 10,
+                    lease_deadline: 100,
+                    target_context: None,
+                },
             )
             .unwrap();
         },
@@ -6581,14 +6583,16 @@ fn durable_bucket_write_coordination_does_not_dirty_metadata_command_state() {
 
     let reservation = store
         .acquire_durable_bucket_write_reservation(
-            &bucket,
-            "reservation-1",
-            "owner-token-1",
-            ClusterEpoch::INITIAL,
-            "put-object",
-            1,
-            2,
-            Some("key=a"),
+            crate::traits::DurableBucketWriteReservationAcquire {
+                name: &bucket,
+                reservation_id: "reservation-1",
+                owner_token: "owner-token-1",
+                cluster_epoch: ClusterEpoch::INITIAL,
+                operation_kind: "put-object",
+                created_at: 1,
+                lease_deadline: 2,
+                target_context: Some("key=a"),
+            },
         )
         .unwrap();
     assert_eq!(
@@ -6656,14 +6660,16 @@ fn metadata_command_bucket_write_release_is_idempotent_after_cleanup() {
 
     let reservation = store
         .acquire_durable_bucket_write_reservation(
-            &bucket,
-            "reservation-1",
-            "owner-token-1",
-            ClusterEpoch::INITIAL,
-            "put-object",
-            1,
-            2,
-            Some("key=a"),
+            crate::traits::DurableBucketWriteReservationAcquire {
+                name: &bucket,
+                reservation_id: "reservation-1",
+                owner_token: "owner-token-1",
+                cluster_epoch: ClusterEpoch::INITIAL,
+                operation_kind: "put-object",
+                created_at: 1,
+                lease_deadline: 2,
+                target_context: Some("key=a"),
+            },
         )
         .unwrap();
 
@@ -6690,14 +6696,16 @@ fn metadata_command_bucket_write_release_allows_heartbeated_lease() {
 
     let reservation = store
         .acquire_durable_bucket_write_reservation(
-            &bucket,
-            "reservation-1",
-            "owner-token-1",
-            ClusterEpoch::INITIAL,
-            "put-object",
-            1,
-            10,
-            Some("key=a"),
+            crate::traits::DurableBucketWriteReservationAcquire {
+                name: &bucket,
+                reservation_id: "reservation-1",
+                owner_token: "owner-token-1",
+                cluster_epoch: ClusterEpoch::INITIAL,
+                operation_kind: "put-object",
+                created_at: 1,
+                lease_deadline: 10,
+                target_context: Some("key=a"),
+            },
         )
         .unwrap();
     let proof = crate::BucketWriteReservationProof::from(&reservation);

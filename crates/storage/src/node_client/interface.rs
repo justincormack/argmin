@@ -182,44 +182,18 @@ pub(crate) trait BucketWriteReservationNodeClient: Send + Sync {
         bucket: &BucketName,
     ) -> Result<Option<BucketDeleteAttemptOutcomeRecord>, BucketSnapshotLoadError>;
 
-    #[allow(clippy::too_many_arguments)]
     fn acquire_durable_bucket_write_reservation(
         &self,
         pg_id: PgId,
-        bucket: &BucketName,
-        reservation_id: &str,
-        owner_token: &str,
-        cluster_epoch: ClusterEpoch,
-        operation_kind: &str,
-        created_at: u64,
-        lease_deadline: u64,
-        target_context: Option<&str>,
+        acquire: DurableBucketWriteReservationAcquire<'_>,
     ) -> Result<BucketWriteReservationRecord, BucketSnapshotLoadError>;
 
-    #[allow(clippy::too_many_arguments)]
     fn acquire_completion_durable_bucket_write_reservation(
         &self,
         pg_id: PgId,
-        bucket: &BucketName,
-        reservation_id: &str,
-        owner_token: &str,
-        cluster_epoch: ClusterEpoch,
-        operation_kind: &str,
-        created_at: u64,
-        lease_deadline: u64,
-        target_context: Option<&str>,
+        acquire: DurableBucketWriteReservationAcquire<'_>,
     ) -> Result<BucketWriteReservationRecord, BucketSnapshotLoadError> {
-        self.acquire_durable_bucket_write_reservation(
-            pg_id,
-            bucket,
-            reservation_id,
-            owner_token,
-            cluster_epoch,
-            operation_kind,
-            created_at,
-            lease_deadline,
-            target_context,
-        )
+        self.acquire_durable_bucket_write_reservation(pg_id, acquire)
     }
 
     fn validate_bucket_write_reservation_proof(
@@ -1403,18 +1377,10 @@ pub(crate) trait StorageNodeClient:
         bucket: &BucketName,
     ) -> Result<Option<BucketDeleteAttemptOutcomeRecord>, BucketSnapshotLoadError>;
 
-    #[allow(clippy::too_many_arguments)]
     fn acquire_durable_bucket_write_reservation(
         &self,
         pg_id: PgId,
-        bucket: &BucketName,
-        reservation_id: &str,
-        owner_token: &str,
-        cluster_epoch: ClusterEpoch,
-        operation_kind: &str,
-        created_at: u64,
-        lease_deadline: u64,
-        target_context: Option<&str>,
+        acquire: DurableBucketWriteReservationAcquire<'_>,
     ) -> Result<BucketWriteReservationRecord, BucketSnapshotLoadError>;
 
     fn validate_bucket_write_reservation_proof(

@@ -41,6 +41,17 @@ pub(crate) struct DurableBucketWriteReservationHeartbeat<'a> {
     pub now: u64,
 }
 
+pub(crate) struct DurableBucketWriteReservationAcquire<'a> {
+    pub name: &'a BucketName,
+    pub reservation_id: &'a str,
+    pub owner_token: &'a str,
+    pub cluster_epoch: ClusterEpoch,
+    pub operation_kind: &'a str,
+    pub created_at: u64,
+    pub lease_deadline: u64,
+    pub target_context: Option<&'a str>,
+}
+
 /// Per-PG object metadata store.
 ///
 /// Tracks S3 object records within a single placement group.
@@ -90,17 +101,9 @@ pub(crate) trait PgMetadataStore {
     /// Acquire a durable bucket write reservation record for one bucket
     /// incarnation.
     #[allow(dead_code)]
-    #[allow(clippy::too_many_arguments)]
     fn acquire_durable_bucket_write_reservation(
         &self,
-        name: &BucketName,
-        reservation_id: &str,
-        owner_token: &str,
-        cluster_epoch: ClusterEpoch,
-        operation_kind: &str,
-        created_at: u64,
-        lease_deadline: u64,
-        target_context: Option<&str>,
+        acquire: DurableBucketWriteReservationAcquire<'_>,
     ) -> Result<BucketWriteReservationRecord, MetadataError>;
 
     /// Read a durable bucket write reservation by exact key.

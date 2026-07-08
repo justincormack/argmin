@@ -239,7 +239,10 @@ use crate::storage_rpc::{
     StorageRpcStreamUploadsPgListRequest, STORAGE_RPC_CLIENT_RESPONSE_TIMEOUT,
     STORAGE_RPC_CLIENT_WRITE_TIMEOUT,
 };
-use crate::traits::{DurableBucketWriteReservationHeartbeat, PgMetadataStore, ShardStore};
+use crate::traits::{
+    DurableBucketWriteReservationAcquire, DurableBucketWriteReservationHeartbeat, PgMetadataStore,
+    ShardStore,
+};
 #[cfg(test)]
 use crate::types::BucketSnapshotTagsRequest;
 use crate::types::{

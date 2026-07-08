@@ -8197,14 +8197,16 @@ fn durable_bucket_write_reservation_requires_exact_identity() {
 
     let reservation = store
         .acquire_durable_bucket_write_reservation(
-            &bucket,
-            "reservation-1",
-            "owner-token-1",
-            ClusterEpoch::INITIAL,
-            "put-object",
-            10,
-            20,
-            Some("key=a"),
+            crate::traits::DurableBucketWriteReservationAcquire {
+                name: &bucket,
+                reservation_id: "reservation-1",
+                owner_token: "owner-token-1",
+                cluster_epoch: ClusterEpoch::INITIAL,
+                operation_kind: "put-object",
+                created_at: 10,
+                lease_deadline: 20,
+                target_context: Some("key=a"),
+            },
         )
         .unwrap();
     assert_eq!(reservation.bucket, bucket);
@@ -8218,28 +8220,32 @@ fn durable_bucket_write_reservation_requires_exact_identity() {
 
     let duplicate = store
         .acquire_durable_bucket_write_reservation(
-            &bucket,
-            "reservation-1",
-            "owner-token-1",
-            ClusterEpoch::INITIAL,
-            "put-object",
-            10,
-            20,
-            Some("key=a"),
+            crate::traits::DurableBucketWriteReservationAcquire {
+                name: &bucket,
+                reservation_id: "reservation-1",
+                owner_token: "owner-token-1",
+                cluster_epoch: ClusterEpoch::INITIAL,
+                operation_kind: "put-object",
+                created_at: 10,
+                lease_deadline: 20,
+                target_context: Some("key=a"),
+            },
         )
         .unwrap();
     assert_eq!(duplicate, reservation);
 
     let conflict = store
         .acquire_durable_bucket_write_reservation(
-            &bucket,
-            "reservation-1",
-            "owner-token-2",
-            ClusterEpoch::INITIAL,
-            "put-object",
-            10,
-            20,
-            Some("key=a"),
+            crate::traits::DurableBucketWriteReservationAcquire {
+                name: &bucket,
+                reservation_id: "reservation-1",
+                owner_token: "owner-token-2",
+                cluster_epoch: ClusterEpoch::INITIAL,
+                operation_kind: "put-object",
+                created_at: 10,
+                lease_deadline: 20,
+                target_context: Some("key=a"),
+            },
         )
         .unwrap_err();
     assert!(matches!(
@@ -8290,14 +8296,16 @@ fn durable_bucket_write_reservation_release_requires_current_lease_deadline() {
 
     let reservation = store
         .acquire_durable_bucket_write_reservation(
-            &bucket,
-            "reservation-1",
-            "owner-token-1",
-            ClusterEpoch::INITIAL,
-            "put-object",
-            10,
-            20,
-            Some("key=a"),
+            crate::traits::DurableBucketWriteReservationAcquire {
+                name: &bucket,
+                reservation_id: "reservation-1",
+                owner_token: "owner-token-1",
+                cluster_epoch: ClusterEpoch::INITIAL,
+                operation_kind: "put-object",
+                created_at: 10,
+                lease_deadline: 20,
+                target_context: Some("key=a"),
+            },
         )
         .unwrap();
     let renewed = store
@@ -8351,14 +8359,16 @@ fn durable_bucket_write_reservation_heartbeat_rejects_expired_current_lease() {
 
     let reservation = store
         .acquire_durable_bucket_write_reservation(
-            &bucket,
-            "reservation-1",
-            "owner-token-1",
-            ClusterEpoch::INITIAL,
-            "put-object",
-            10,
-            20,
-            Some("key=a"),
+            crate::traits::DurableBucketWriteReservationAcquire {
+                name: &bucket,
+                reservation_id: "reservation-1",
+                owner_token: "owner-token-1",
+                cluster_epoch: ClusterEpoch::INITIAL,
+                operation_kind: "put-object",
+                created_at: 10,
+                lease_deadline: 20,
+                target_context: Some("key=a"),
+            },
         )
         .unwrap();
     let heartbeat = store
@@ -8452,14 +8462,16 @@ fn durable_bucket_write_drain_blocks_reservations_and_requires_exact_identity() 
 
     let blocked = store
         .acquire_durable_bucket_write_reservation(
-            &bucket,
-            "reservation-1",
-            "owner-token-1",
-            ClusterEpoch::INITIAL,
-            "put-object",
-            50,
-            60,
-            None,
+            crate::traits::DurableBucketWriteReservationAcquire {
+                name: &bucket,
+                reservation_id: "reservation-1",
+                owner_token: "owner-token-1",
+                cluster_epoch: ClusterEpoch::INITIAL,
+                operation_kind: "put-object",
+                created_at: 50,
+                lease_deadline: 60,
+                target_context: None,
+            },
         )
         .unwrap_err();
     assert!(matches!(
@@ -8500,14 +8512,16 @@ fn durable_bucket_write_drain_blocks_reservations_and_requires_exact_identity() 
 
     store
         .acquire_durable_bucket_write_reservation(
-            &bucket,
-            "reservation-1",
-            "owner-token-1",
-            ClusterEpoch::INITIAL,
-            "put-object",
-            50,
-            60,
-            None,
+            crate::traits::DurableBucketWriteReservationAcquire {
+                name: &bucket,
+                reservation_id: "reservation-1",
+                owner_token: "owner-token-1",
+                cluster_epoch: ClusterEpoch::INITIAL,
+                operation_kind: "put-object",
+                created_at: 50,
+                lease_deadline: 60,
+                target_context: None,
+            },
         )
         .unwrap();
 }

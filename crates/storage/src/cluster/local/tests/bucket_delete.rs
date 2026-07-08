@@ -3265,14 +3265,16 @@ fn begin_bucket_delete_reaps_expired_durable_write_reservation() {
         .unwrap();
     crate::PgMetadataStore::acquire_durable_bucket_write_reservation(
         &*bucket_pg,
-        &bucket,
-        "expired-reservation",
-        "expired-owner",
-        ClusterEpoch::INITIAL,
-        "test-expired-write",
-        1,
-        2,
-        Some("expired-key"),
+        crate::traits::DurableBucketWriteReservationAcquire {
+            name: &bucket,
+            reservation_id: "expired-reservation",
+            owner_token: "expired-owner",
+            cluster_epoch: ClusterEpoch::INITIAL,
+            operation_kind: "test-expired-write",
+            created_at: 1,
+            lease_deadline: 2,
+            target_context: Some("expired-key"),
+        },
     )
     .unwrap();
     drop(bucket_pg);

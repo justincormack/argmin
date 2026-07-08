@@ -46,7 +46,10 @@ use crate::metadata_command::{
     ReserveObjectGenerationCommand, ReserveObjectVersionCommand,
 };
 use crate::schema::init_pg_schema;
-use crate::traits::{DurableBucketWriteReservationHeartbeat, PgMetadataStore, ShardStore};
+use crate::traits::{
+    DurableBucketWriteReservationAcquire, DurableBucketWriteReservationHeartbeat, PgMetadataStore,
+    ShardStore,
+};
 use crate::types::*;
 use placement::NodeId;
 

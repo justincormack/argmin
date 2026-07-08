@@ -1727,14 +1727,16 @@ fn bucket_delete_treats_conflicting_stream_reservation_proof_as_abandoned() {
         .unwrap();
     let mismatched_record = crate::PgMetadataStore::acquire_durable_bucket_write_reservation(
         &*bucket_pg,
-        &bucket,
-        &proof.reservation_id,
-        "different-stream-owner",
-        proof.cluster_epoch,
-        &proof.operation_kind,
-        proof.created_at,
-        proof.lease_deadline,
-        proof.target_context.as_deref(),
+        crate::traits::DurableBucketWriteReservationAcquire {
+            name: &bucket,
+            reservation_id: &proof.reservation_id,
+            owner_token: "different-stream-owner",
+            cluster_epoch: proof.cluster_epoch,
+            operation_kind: &proof.operation_kind,
+            created_at: proof.created_at,
+            lease_deadline: proof.lease_deadline,
+            target_context: proof.target_context.as_deref(),
+        },
     )
     .unwrap();
     drop(bucket_pg);

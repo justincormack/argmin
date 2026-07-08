@@ -5379,26 +5379,19 @@ impl PgMetadataStore for PgStore {
         )
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn acquire_durable_bucket_write_reservation(
         &self,
-        name: &BucketName,
-        reservation_id: &str,
-        owner_token: &str,
-        cluster_epoch: ClusterEpoch,
-        operation_kind: &str,
-        created_at: u64,
-        lease_deadline: u64,
-        target_context: Option<&str>,
+        acquire: DurableBucketWriteReservationAcquire<'_>,
     ) -> Result<BucketWriteReservationRecord, MetadataError> {
-        let created_at = i64::try_from(created_at).map_err(|source| MetadataError::Db {
+        let created_at = i64::try_from(acquire.created_at).map_err(|source| MetadataError::Db {
             context: "acquire durable bucket write reservation created_at",
             source: rusqlite::Error::ToSqlConversionFailure(Box::new(source)),
         })?;
-        let lease_deadline = i64::try_from(lease_deadline).map_err(|source| MetadataError::Db {
-            context: "acquire durable bucket write reservation lease_deadline",
-            source: rusqlite::Error::ToSqlConversionFailure(Box::new(source)),
-        })?;
+        let lease_deadline =
+            i64::try_from(acquire.lease_deadline).map_err(|source| MetadataError::Db {
+                context: "acquire durable bucket write reservation lease_deadline",
+                source: rusqlite::Error::ToSqlConversionFailure(Box::new(source)),
+            })?;
         let inserted = self
             .conn
             .execute(
@@ -5414,14 +5407,14 @@ impl PgMetadataStore for PgStore {
                ) \
              ON CONFLICT(bucket_name, reservation_id) DO NOTHING",
                 params![
-                    reservation_id,
-                    owner_token,
-                    cluster_epoch.get(),
-                    operation_kind,
+                    acquire.reservation_id,
+                    acquire.owner_token,
+                    acquire.cluster_epoch.get(),
+                    acquire.operation_kind,
                     created_at,
                     lease_deadline,
-                    target_context,
-                    name.as_str(),
+                    acquire.target_context,
+                    acquire.name.as_str(),
                     BucketState::Active as u8,
                     BucketWriteDrainState::Draining as u8,
                 ],
@@ -5432,31 +5425,34 @@ impl PgMetadataStore for PgStore {
             })?;
 
         if inserted == 0 {
-            if let Some(existing) = self.durable_bucket_write_reservation(name, reservation_id)? {
-                if existing.owner_token == owner_token
-                    && existing.cluster_epoch == cluster_epoch
-                    && existing.operation_kind == operation_kind
+            if let Some(existing) =
+                self.durable_bucket_write_reservation(acquire.name, acquire.reservation_id)?
+            {
+                if existing.owner_token == acquire.owner_token
+                    && existing.cluster_epoch == acquire.cluster_epoch
+                    && existing.operation_kind == acquire.operation_kind
                     && existing.created_at == created_at as u64
                     && existing.lease_deadline == lease_deadline as u64
-                    && existing.target_context.as_deref() == target_context
+                    && existing.target_context.as_deref() == acquire.target_context
                 {
                     return Ok(existing);
                 }
                 return Err(MetadataError::BucketWriteReservationConflict {
-                    reservation_id: reservation_id.to_string(),
+                    reservation_id: acquire.reservation_id.to_string(),
                 });
             }
-            let info = self.head_bucket_raw(name)?;
-            if info.state == BucketState::Active && self.durable_bucket_write_drain(name)?.is_some()
+            let info = self.head_bucket_raw(acquire.name)?;
+            if info.state == BucketState::Active
+                && self.durable_bucket_write_drain(acquire.name)?.is_some()
             {
                 return Err(MetadataError::BucketWriteDraining);
             }
-            return Err(bucket_not_found(name.as_str()));
+            return Err(bucket_not_found(acquire.name.as_str()));
         }
 
-        self.durable_bucket_write_reservation(name, reservation_id)?
+        self.durable_bucket_write_reservation(acquire.name, acquire.reservation_id)?
             .ok_or_else(|| MetadataError::BucketWriteReservationNotFound {
-                reservation_id: reservation_id.to_string(),
+                reservation_id: acquire.reservation_id.to_string(),
             })
     }
 

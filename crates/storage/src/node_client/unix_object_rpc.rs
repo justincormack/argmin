@@ -255,31 +255,23 @@ pub(super) fn validate_list_multipart_uploads_response(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
 fn unix_storage_node_acquire_durable_bucket_write_reservation_with_admission_class(
     client: &UnixStorageNodeClient,
     pg_id: PgId,
-    bucket: &BucketName,
-    reservation_id: &str,
-    owner_token: &str,
-    cluster_epoch: ClusterEpoch,
-    operation_kind: &str,
-    created_at: u64,
-    lease_deadline: u64,
-    target_context: Option<&str>,
+    acquire: DurableBucketWriteReservationAcquire<'_>,
     class: UnixStorageNodeRpcAdmissionClass,
 ) -> Result<BucketWriteReservationRecord, BucketSnapshotLoadError> {
     let request = StorageRpcBucketWriteReservationAcquireRequest {
         node_id: client.node_id,
-        cluster_epoch,
+        cluster_epoch: acquire.cluster_epoch,
         pg_id,
-        bucket: bucket.clone(),
-        reservation_id: reservation_id.to_string(),
-        owner_token: owner_token.to_string(),
-        operation_kind: operation_kind.to_string(),
-        created_at,
-        lease_deadline,
-        target_context: target_context.map(str::to_string),
+        bucket: acquire.name.clone(),
+        reservation_id: acquire.reservation_id.to_string(),
+        owner_token: acquire.owner_token.to_string(),
+        operation_kind: acquire.operation_kind.to_string(),
+        created_at: acquire.created_at,
+        lease_deadline: acquire.lease_deadline,
+        target_context: acquire.target_context.map(str::to_string),
     };
     let payload = encode_bucket_write_reservation_acquire_request(&request).map_err(|error| {
         BucketSnapshotLoadError::Store(client.rpc_payload_error(
@@ -308,7 +300,7 @@ fn unix_storage_node_acquire_durable_bucket_write_reservation_with_admission_cla
             ));
         }
         StorageRpcBucketWriteReservationAcquireOutcome::BucketNotFound { name }
-            if name == *bucket =>
+            if name == *acquire.name =>
         {
             return Err(BucketSnapshotLoadError::Metadata(
                 MetadataError::BucketNotFound { name },
@@ -321,14 +313,14 @@ fn unix_storage_node_acquire_durable_bucket_write_reservation_with_admission_cla
             )));
         }
     };
-    if record.bucket != *bucket
-        || record.reservation_id != reservation_id
-        || record.owner_token != owner_token
-        || record.cluster_epoch != cluster_epoch
-        || record.operation_kind != operation_kind
-        || record.created_at != created_at
-        || record.lease_deadline != lease_deadline
-        || record.target_context.as_deref() != target_context
+    if record.bucket != *acquire.name
+        || record.reservation_id != acquire.reservation_id
+        || record.owner_token != acquire.owner_token
+        || record.cluster_epoch != acquire.cluster_epoch
+        || record.operation_kind != acquire.operation_kind
+        || record.created_at != acquire.created_at
+        || record.lease_deadline != acquire.lease_deadline
+        || record.target_context.as_deref() != acquire.target_context
     {
         return Err(BucketSnapshotLoadError::Store(client.rpc_payload_error(
             "validate bucket write reservation acquire response",
@@ -463,26 +455,12 @@ impl BucketWriteReservationNodeClient for UnixStorageNodeClient {
     fn acquire_durable_bucket_write_reservation(
         &self,
         pg_id: PgId,
-        bucket: &BucketName,
-        reservation_id: &str,
-        owner_token: &str,
-        cluster_epoch: ClusterEpoch,
-        operation_kind: &str,
-        created_at: u64,
-        lease_deadline: u64,
-        target_context: Option<&str>,
+        acquire: DurableBucketWriteReservationAcquire<'_>,
     ) -> Result<BucketWriteReservationRecord, BucketSnapshotLoadError> {
         unix_storage_node_acquire_durable_bucket_write_reservation_with_admission_class(
             self,
             pg_id,
-            bucket,
-            reservation_id,
-            owner_token,
-            cluster_epoch,
-            operation_kind,
-            created_at,
-            lease_deadline,
-            target_context,
+            acquire,
             storage_rpc_admission_class(StorageRpcMessageKind::BucketWriteReservationAcquire),
         )
     }
@@ -490,26 +468,12 @@ impl BucketWriteReservationNodeClient for UnixStorageNodeClient {
     fn acquire_completion_durable_bucket_write_reservation(
         &self,
         pg_id: PgId,
-        bucket: &BucketName,
-        reservation_id: &str,
-        owner_token: &str,
-        cluster_epoch: ClusterEpoch,
-        operation_kind: &str,
-        created_at: u64,
-        lease_deadline: u64,
-        target_context: Option<&str>,
+        acquire: DurableBucketWriteReservationAcquire<'_>,
     ) -> Result<BucketWriteReservationRecord, BucketSnapshotLoadError> {
         unix_storage_node_acquire_durable_bucket_write_reservation_with_admission_class(
             self,
             pg_id,
-            bucket,
-            reservation_id,
-            owner_token,
-            cluster_epoch,
-            operation_kind,
-            created_at,
-            lease_deadline,
-            target_context,
+            acquire,
             UnixStorageNodeRpcAdmissionClass::Completion,
         )
     }

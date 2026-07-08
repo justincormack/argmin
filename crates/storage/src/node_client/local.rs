@@ -734,27 +734,9 @@ impl BucketWriteReservationNodeClient for LocalStorageNodeClient {
     fn acquire_durable_bucket_write_reservation(
         &self,
         pg_id: PgId,
-        bucket: &BucketName,
-        reservation_id: &str,
-        owner_token: &str,
-        cluster_epoch: ClusterEpoch,
-        operation_kind: &str,
-        created_at: u64,
-        lease_deadline: u64,
-        target_context: Option<&str>,
+        acquire: DurableBucketWriteReservationAcquire<'_>,
     ) -> Result<BucketWriteReservationRecord, BucketSnapshotLoadError> {
-        <Self as StorageNodeClient>::acquire_durable_bucket_write_reservation(
-            self,
-            pg_id,
-            bucket,
-            reservation_id,
-            owner_token,
-            cluster_epoch,
-            operation_kind,
-            created_at,
-            lease_deadline,
-            target_context,
-        )
+        <Self as StorageNodeClient>::acquire_durable_bucket_write_reservation(self, pg_id, acquire)
     }
 
     fn validate_bucket_write_reservation_proof(
@@ -1770,26 +1752,11 @@ impl StorageNodeClient for LocalStorageNodeClient {
     fn acquire_durable_bucket_write_reservation(
         &self,
         pg_id: PgId,
-        bucket: &BucketName,
-        reservation_id: &str,
-        owner_token: &str,
-        cluster_epoch: ClusterEpoch,
-        operation_kind: &str,
-        created_at: u64,
-        lease_deadline: u64,
-        target_context: Option<&str>,
+        acquire: DurableBucketWriteReservationAcquire<'_>,
     ) -> Result<BucketWriteReservationRecord, BucketSnapshotLoadError> {
         let pg = self.storage_node.get_pg(pg_id.get())?;
         Ok(PgMetadataStore::acquire_durable_bucket_write_reservation(
-            &*pg,
-            bucket,
-            reservation_id,
-            owner_token,
-            cluster_epoch,
-            operation_kind,
-            created_at,
-            lease_deadline,
-            target_context,
+            &*pg, acquire,
         )?)
     }
 

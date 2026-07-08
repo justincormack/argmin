@@ -32,6 +32,7 @@ use crate::node_client::{
     BuildStreamPutCommitCommandReq, CreateBucketCommandBuild, CreateStreamUploadPrecondition,
     InsertDeleteMarkerStalePayload, MarkBucketDeletingCommandBuild,
 };
+use crate::traits::DurableBucketWriteReservationAcquire;
 #[cfg(any(test, feature = "test-hooks"))]
 use crate::traits::PgMetadataStore;
 use crate::*;
@@ -2913,14 +2914,16 @@ impl super::StorageCluster {
             .bucket_write_reservation_client()
             .acquire_durable_bucket_write_reservation(
                 PgId::new(pg_id),
-                bucket,
-                &reservation_id,
-                &owner_token,
-                self.operation_epoch(),
-                operation_kind,
-                crate::clock::current_time_millis(),
-                self.bucket_write_reservation_lease_deadline(),
-                target_context,
+                DurableBucketWriteReservationAcquire {
+                    name: bucket,
+                    reservation_id: &reservation_id,
+                    owner_token: &owner_token,
+                    cluster_epoch: self.operation_epoch(),
+                    operation_kind,
+                    created_at: crate::clock::current_time_millis(),
+                    lease_deadline: self.bucket_write_reservation_lease_deadline(),
+                    target_context,
+                },
             )?;
         Ok(super::DurableBucketWriteReservation {
             node: Arc::clone(node.bucket_metadata_client()),
@@ -2945,14 +2948,16 @@ impl super::StorageCluster {
             .bucket_write_reservation_client()
             .acquire_completion_durable_bucket_write_reservation(
                 PgId::new(pg_id),
-                bucket,
-                &reservation_id,
-                &owner_token,
-                self.operation_epoch(),
-                operation_kind,
-                crate::clock::current_time_millis(),
-                self.bucket_write_reservation_lease_deadline(),
-                target_context,
+                DurableBucketWriteReservationAcquire {
+                    name: bucket,
+                    reservation_id: &reservation_id,
+                    owner_token: &owner_token,
+                    cluster_epoch: self.operation_epoch(),
+                    operation_kind,
+                    created_at: crate::clock::current_time_millis(),
+                    lease_deadline: self.bucket_write_reservation_lease_deadline(),
+                    target_context,
+                },
             )?;
         Ok(super::DurableBucketWriteReservation {
             node: Arc::clone(node.bucket_metadata_client()),
@@ -2976,14 +2981,16 @@ impl super::StorageCluster {
             .bucket_write_reservation_client()
             .acquire_durable_bucket_write_reservation(
                 PgId::new(pg_id),
-                bucket,
-                &reservation_id,
-                &owner_token,
-                self.operation_epoch(),
-                "put-object-stream-create",
-                crate::clock::current_time_millis(),
-                self.put_object_stream_create_lease_deadline(),
-                Some(key.as_str()),
+                DurableBucketWriteReservationAcquire {
+                    name: bucket,
+                    reservation_id: &reservation_id,
+                    owner_token: &owner_token,
+                    cluster_epoch: self.operation_epoch(),
+                    operation_kind: "put-object-stream-create",
+                    created_at: crate::clock::current_time_millis(),
+                    lease_deadline: self.put_object_stream_create_lease_deadline(),
+                    target_context: Some(key.as_str()),
+                },
             )?;
         Ok(super::DurableBucketWriteReservation {
             node: Arc::clone(node.bucket_metadata_client()),

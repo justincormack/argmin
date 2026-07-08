@@ -1019,14 +1019,16 @@ fn unix_bucket_write_reservation_client_acquires_validates_and_releases() {
     let record = BucketWriteReservationNodeClient::acquire_durable_bucket_write_reservation(
         &client,
         PgId::new(0),
-        &bucket,
-        "reservation-remote-1",
-        "owner-token-remote-1",
-        ClusterEpoch::new(1).unwrap(),
-        "put-object",
-        10,
-        lease_deadline,
-        Some("key=a"),
+        crate::traits::DurableBucketWriteReservationAcquire {
+            name: &bucket,
+            reservation_id: "reservation-remote-1",
+            owner_token: "owner-token-remote-1",
+            cluster_epoch: ClusterEpoch::new(1).unwrap(),
+            operation_kind: "put-object",
+            created_at: 10,
+            lease_deadline,
+            target_context: Some("key=a"),
+        },
     )
     .unwrap();
     assert_eq!(record.bucket, bucket);
@@ -1135,14 +1137,16 @@ fn unix_bucket_write_reservation_client_preserves_draining_signal() {
     let err = BucketWriteReservationNodeClient::acquire_durable_bucket_write_reservation(
         &client,
         PgId::new(0),
-        &bucket,
-        "reservation-remote-1",
-        "owner-token-remote-1",
-        ClusterEpoch::new(1).unwrap(),
-        "put-object",
-        30,
-        40,
-        Some("key=a"),
+        crate::traits::DurableBucketWriteReservationAcquire {
+            name: &bucket,
+            reservation_id: "reservation-remote-1",
+            owner_token: "owner-token-remote-1",
+            cluster_epoch: ClusterEpoch::new(1).unwrap(),
+            operation_kind: "put-object",
+            created_at: 30,
+            lease_deadline: 40,
+            target_context: Some("key=a"),
+        },
     )
     .unwrap_err();
     assert!(matches!(
@@ -1169,14 +1173,16 @@ fn unix_bucket_write_reservation_client_preserves_bucket_not_found() {
     let err = BucketWriteReservationNodeClient::acquire_durable_bucket_write_reservation(
         &client,
         PgId::new(0),
-        &bucket,
-        "reservation-remote-1",
-        "owner-token-remote-1",
-        ClusterEpoch::new(1).unwrap(),
-        "put-object",
-        30,
-        40,
-        Some("key=a"),
+        crate::traits::DurableBucketWriteReservationAcquire {
+            name: &bucket,
+            reservation_id: "reservation-remote-1",
+            owner_token: "owner-token-remote-1",
+            cluster_epoch: ClusterEpoch::new(1).unwrap(),
+            operation_kind: "put-object",
+            created_at: 30,
+            lease_deadline: 40,
+            target_context: Some("key=a"),
+        },
     )
     .unwrap_err();
     assert!(matches!(
@@ -1214,14 +1220,16 @@ fn unix_bucket_write_reservation_client_routes_drain_and_finalize_coordination()
         .unwrap();
         PgMetadataStore::acquire_durable_bucket_write_reservation(
             &*pg,
-            &bucket,
-            "reservation-for-drain-list",
-            "reservation-owner-for-drain-list",
-            ClusterEpoch::new(1).unwrap(),
-            "put-object",
-            10,
-            20,
-            Some("key=a"),
+            crate::traits::DurableBucketWriteReservationAcquire {
+                name: &bucket,
+                reservation_id: "reservation-for-drain-list",
+                owner_token: "reservation-owner-for-drain-list",
+                cluster_epoch: ClusterEpoch::new(1).unwrap(),
+                operation_kind: "put-object",
+                created_at: 10,
+                lease_deadline: 20,
+                target_context: Some("key=a"),
+            },
         )
         .unwrap();
         PgMetadataStore::create_bucket(
@@ -1798,14 +1806,16 @@ fn unix_bucket_metadata_client_builds_completed_multipart_order_command() {
         .unwrap();
         let reservation = PgMetadataStore::acquire_durable_bucket_write_reservation(
             &*pg,
-            &bucket,
-            "completed-order-reservation",
-            "completed-order-owner",
-            ClusterEpoch::new(1).unwrap(),
-            COMPLETE_MULTIPART_UPLOAD_BUCKET_WRITE_OPERATION_KIND,
-            1_000,
-            crate::clock::current_time_millis() + 60_000,
-            Some("object-key"),
+            crate::traits::DurableBucketWriteReservationAcquire {
+                name: &bucket,
+                reservation_id: "completed-order-reservation",
+                owner_token: "completed-order-owner",
+                cluster_epoch: ClusterEpoch::new(1).unwrap(),
+                operation_kind: COMPLETE_MULTIPART_UPLOAD_BUCKET_WRITE_OPERATION_KIND,
+                created_at: 1_000,
+                lease_deadline: crate::clock::current_time_millis() + 60_000,
+                target_context: Some("object-key"),
+            },
         )
         .unwrap();
         bucket_write_reservation = BucketWriteReservationProof::from(&reservation);
@@ -2026,14 +2036,16 @@ fn unix_bucket_metadata_client_releases_bucket_write_proof() {
         .unwrap();
         let reservation = PgMetadataStore::acquire_durable_bucket_write_reservation(
             &*pg,
-            &bucket,
-            "reservation-1",
-            "owner-token-1",
-            ClusterEpoch::new(1).unwrap(),
-            "put-object",
-            10,
-            20,
-            Some("key=a"),
+            crate::traits::DurableBucketWriteReservationAcquire {
+                name: &bucket,
+                reservation_id: "reservation-1",
+                owner_token: "owner-token-1",
+                cluster_epoch: ClusterEpoch::new(1).unwrap(),
+                operation_kind: "put-object",
+                created_at: 10,
+                lease_deadline: 20,
+                target_context: Some("key=a"),
+            },
         )
         .unwrap();
         pg.refresh_metadata_command_state_digest().unwrap();
@@ -2106,14 +2118,16 @@ fn unix_bucket_metadata_client_preserves_proof_release_conflict() {
         .unwrap();
         let reservation = PgMetadataStore::acquire_durable_bucket_write_reservation(
             &*pg,
-            &bucket,
-            "reservation-1",
-            "owner-token-1",
-            ClusterEpoch::new(1).unwrap(),
-            "put-object",
-            10,
-            20,
-            Some("key=a"),
+            crate::traits::DurableBucketWriteReservationAcquire {
+                name: &bucket,
+                reservation_id: "reservation-1",
+                owner_token: "owner-token-1",
+                cluster_epoch: ClusterEpoch::new(1).unwrap(),
+                operation_kind: "put-object",
+                created_at: 10,
+                lease_deadline: 20,
+                target_context: Some("key=a"),
+            },
         )
         .unwrap();
         pg.refresh_metadata_command_state_digest().unwrap();
@@ -2207,14 +2221,16 @@ fn unix_bucket_metadata_client_rejects_proof_release_wrong_bucket_pg() {
         .unwrap();
         let reservation = PgMetadataStore::acquire_durable_bucket_write_reservation(
             &*pg,
-            &bucket,
-            "reservation-1",
-            "owner-token-1",
-            ClusterEpoch::new(1).unwrap(),
-            "put-object",
-            10,
-            20,
-            Some("key=a"),
+            crate::traits::DurableBucketWriteReservationAcquire {
+                name: &bucket,
+                reservation_id: "reservation-1",
+                owner_token: "owner-token-1",
+                cluster_epoch: ClusterEpoch::new(1).unwrap(),
+                operation_kind: "put-object",
+                created_at: 10,
+                lease_deadline: 20,
+                target_context: Some("key=a"),
+            },
         )
         .unwrap();
         pg.refresh_metadata_command_state_digest().unwrap();
@@ -2292,14 +2308,16 @@ fn unix_bucket_metadata_client_rejects_proof_release_on_non_primary() {
         .unwrap();
         PgMetadataStore::acquire_durable_bucket_write_reservation(
             &*pg,
-            &bucket,
-            "reservation-1",
-            "owner-token-1",
-            ClusterEpoch::new(1).unwrap(),
-            "put-object",
-            10,
-            20,
-            Some("key=a"),
+            crate::traits::DurableBucketWriteReservationAcquire {
+                name: &bucket,
+                reservation_id: "reservation-1",
+                owner_token: "owner-token-1",
+                cluster_epoch: ClusterEpoch::new(1).unwrap(),
+                operation_kind: "put-object",
+                created_at: 10,
+                lease_deadline: 20,
+                target_context: Some("key=a"),
+            },
         )
         .unwrap()
     };

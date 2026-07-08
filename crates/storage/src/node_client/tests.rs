@@ -76,14 +76,16 @@ fn completed_multipart_order_rejects_non_completion_bucket_write_reservation() {
     .unwrap();
     let reservation = crate::PgMetadataStore::acquire_durable_bucket_write_reservation(
         &*pg,
-        &bucket,
-        "put-object-reservation",
-        "put-object-owner",
-        ClusterEpoch::new(1).unwrap(),
-        "put-object",
-        1_000,
-        crate::clock::current_time_millis() + 60_000,
-        Some("object-key"),
+        crate::traits::DurableBucketWriteReservationAcquire {
+            name: &bucket,
+            reservation_id: "put-object-reservation",
+            owner_token: "put-object-owner",
+            cluster_epoch: ClusterEpoch::new(1).unwrap(),
+            operation_kind: "put-object",
+            created_at: 1_000,
+            lease_deadline: crate::clock::current_time_millis() + 60_000,
+            target_context: Some("object-key"),
+        },
     )
     .unwrap();
     pg.refresh_metadata_command_state_digest().unwrap();

@@ -953,13 +953,15 @@ each is one refactor away from a panic:
   `StorageCluster` stamp `cluster_epoch`, and changing the domain acquire
   structs to require `lease_deadline: u64` while leaving optional deadlines
   only at malformed RPC boundaries.
-- [ ] `acquire_durable_bucket_write_reservation`: still positional across all
+- [x] `acquire_durable_bucket_write_reservation`: still positional across all
   layers (`traits.rs:94-104`, `node_client/local.rs:727, 1763`,
   `pg_store/metadata.rs:5377-5387`); the S1 fix made `lease_deadline` a
   required `u64` but kept the positional list, so `created_at`/`lease_deadline`
   are now two adjacent bare `u64`s — the transposition hazard is marginally
   worse. The same trait's heartbeat API already uses a params struct.
-  Introduce the acquire struct.
+  Fixed by introducing `DurableBucketWriteReservationAcquire<'_>` and using it
+  through the store, node-client, local, Unix RPC, and storage-node dispatch
+  layers while keeping `PgId` as separate routing context.
 - [ ] `PgMetadataProof::new(u64, u64, u64)` (`control_plane.rs:3106`) —
   index/hash/digest transposition compiles silently and poisons peering-proof
   comparison. Named-field construction only, or newtypes.
