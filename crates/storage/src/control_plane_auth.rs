@@ -119,6 +119,11 @@ pub enum ControlPlaneAuthDecision {
     },
 }
 
+#[must_use]
+pub fn control_plane_auth_payload_has_magic(bytes: &[u8]) -> bool {
+    bytes.starts_with(CONTROL_PLANE_AUTH_MAGIC)
+}
+
 pub struct ControlPlaneScopedCredential {
     cluster_id: String,
     credential_id: String,

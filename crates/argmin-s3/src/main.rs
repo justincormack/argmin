@@ -1422,6 +1422,12 @@ fn run_control_plane_process(config: &ServerConfig) -> ! {
         socket_path,
         config.control_plane_lease_scan_interval.as_millis()
     );
+    if let Some(auth_verifier) = &auth_verifier {
+        process_info!(
+            "{}",
+            format_control_plane_unix_auth_diagnostics(auth_verifier)
+        );
+    }
 
     loop {
         for _ in 0..CONTROL_PLANE_ACCEPT_BATCH_LIMIT {
@@ -1966,6 +1972,55 @@ fn format_experimental_raft_peer_auth_diagnostics(
         write!(
             &mut diagnostics,
             "raft_peer_auth rejected_by_reason{{reason=\"{reason:?}\"}} {count}"
+        )
+        .expect("write to String should not fail");
+    }
+    diagnostics
+}
+
+fn format_control_plane_unix_auth_diagnostics(verifier: &ControlPlaneUnixAuthVerifier) -> String {
+    let status = verifier.status_snapshot();
+    let metrics = status.metrics();
+    let mut diagnostics = format!(
+        "control_plane_unix_auth required={} cluster_id={} storage_node_credentials={} accepted_total={} rejected_total={}",
+        status.required(),
+        status.cluster_id(),
+        status.storage_node_credentials().len(),
+        metrics.accepted_total(),
+        metrics.rejected_total()
+    );
+    for credential in status.storage_node_credentials() {
+        diagnostics.push('\n');
+        write!(
+            &mut diagnostics,
+            "control_plane_unix_auth storage_node_credential{{node_id=\"{}\",credential_id=\"{}\",credential_version=\"{}\"}} 1",
+            credential.node_id().as_u32(),
+            credential.credential_id(),
+            credential.credential_version()
+        )
+        .expect("write to String should not fail");
+    }
+    for (operation, count) in metrics.accepted_by_operation() {
+        diagnostics.push('\n');
+        write!(
+            &mut diagnostics,
+            "control_plane_unix_auth accepted_by_operation{{operation=\"{operation:?}\"}} {count}"
+        )
+        .expect("write to String should not fail");
+    }
+    for (operation, count) in metrics.rejected_by_operation() {
+        diagnostics.push('\n');
+        write!(
+            &mut diagnostics,
+            "control_plane_unix_auth rejected_by_operation{{operation=\"{operation:?}\"}} {count}"
+        )
+        .expect("write to String should not fail");
+    }
+    for (reason, count) in metrics.rejected_by_reason() {
+        diagnostics.push('\n');
+        write!(
+            &mut diagnostics,
+            "control_plane_unix_auth rejected_by_reason{{reason=\"{reason:?}\"}} {count}"
         )
         .expect("write to String should not fail");
     }
@@ -2656,6 +2711,12 @@ fn run_experimental_raft_control_plane_process(config: &ServerConfig) -> ! {
     );
     if let Some(policy) = &raft_peer_policy {
         process_info!("{}", format_experimental_raft_peer_auth_diagnostics(policy));
+    }
+    if let Some(auth_verifier) = &auth_verifier {
+        process_info!(
+            "{}",
+            format_control_plane_unix_auth_diagnostics(auth_verifier)
+        );
     }
 
     loop {
@@ -5675,6 +5736,60 @@ mod tests {
         assert!(!diagnostics.contains("node-2-test-secret"));
         assert!(!diagnostics.contains("payload"));
         assert!(!diagnostics.contains("authenticator"));
+    }
+
+    #[test]
+    fn control_plane_unix_auth_diagnostics_are_redacted() {
+        let verifier = ControlPlaneUnixAuthVerifier::new(
+            "control-auth",
+            vec![ControlPlaneStorageNodeAuthCredential::new(
+                NodeId::new(7),
+                "storage-node-7",
+                3,
+                b"storage-node-7-test-secret".to_vec(),
+            )
+            .expect("test storage-node credential should build")],
+        )
+        .expect("test Unix auth verifier should build");
+
+        let error = verifier
+            .verify_storage_node_heartbeat_payload(b"not an auth envelope", 2_000)
+            .expect_err("missing auth envelope should reject");
+        assert!(
+            error.to_string().contains("auth magic"),
+            "unexpected error: {error}"
+        );
+
+        let diagnostics = format_control_plane_unix_auth_diagnostics(&verifier);
+        assert!(diagnostics.contains("required=true"), "{diagnostics}");
+        assert!(
+            diagnostics.contains("cluster_id=control-auth"),
+            "{diagnostics}"
+        );
+        assert!(
+            diagnostics.contains("storage_node_credentials=1"),
+            "{diagnostics}"
+        );
+        assert!(
+            diagnostics.contains(
+                "storage_node_credential{node_id=\"7\",credential_id=\"storage-node-7\",credential_version=\"3\"} 1"
+            ),
+            "{diagnostics}"
+        );
+        assert!(diagnostics.contains("accepted_total=0"), "{diagnostics}");
+        assert!(diagnostics.contains("rejected_total=1"), "{diagnostics}");
+        assert!(
+            diagnostics.contains("rejected_by_operation{operation=\"StorageRuntimeMapRefresh\"} 1"),
+            "{diagnostics}"
+        );
+        assert!(
+            diagnostics.contains("rejected_by_reason{reason=\"Missing\"} 1"),
+            "{diagnostics}"
+        );
+        assert!(!diagnostics.contains("storage-node-7-test-secret"));
+        assert!(!diagnostics.contains("payload"));
+        assert!(!diagnostics.contains("authenticator"));
+        assert!(!diagnostics.contains("not an auth envelope"));
     }
 
     #[test]

@@ -10,9 +10,9 @@ use placement::NodeId;
 use thiserror::Error;
 
 use crate::control_plane_auth::{
-    ControlPlaneAuthDecision, ControlPlaneAuthEnvelope, ControlPlaneAuthOperation,
-    ControlPlaneAuthPrincipal, ControlPlaneAuthRejectionReason, ControlPlaneAuthTarget,
-    ControlPlaneScopedCredential, ControlPlaneScopedCredentialInput,
+    control_plane_auth_payload_has_magic, ControlPlaneAuthDecision, ControlPlaneAuthEnvelope,
+    ControlPlaneAuthOperation, ControlPlaneAuthPrincipal, ControlPlaneAuthRejectionReason,
+    ControlPlaneAuthTarget, ControlPlaneScopedCredential, ControlPlaneScopedCredentialInput,
     ControlPlaneScopedCredentialStore,
 };
 use crate::control_plane_command::{
@@ -4322,6 +4322,60 @@ impl std::fmt::Debug for ControlPlaneStorageNodeAuthCredential {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ControlPlaneUnixAuthCredentialStatus {
+    node_id: NodeId,
+    credential_id: String,
+    credential_version: u64,
+}
+
+impl ControlPlaneUnixAuthCredentialStatus {
+    #[must_use]
+    pub fn node_id(&self) -> NodeId {
+        self.node_id
+    }
+
+    #[must_use]
+    pub fn credential_id(&self) -> &str {
+        &self.credential_id
+    }
+
+    #[must_use]
+    pub fn credential_version(&self) -> u64 {
+        self.credential_version
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ControlPlaneUnixAuthStatusSnapshot {
+    required: bool,
+    cluster_id: String,
+    storage_node_credentials: Vec<ControlPlaneUnixAuthCredentialStatus>,
+    metrics: ControlPlaneUnixAuthMetricsSnapshot,
+}
+
+impl ControlPlaneUnixAuthStatusSnapshot {
+    #[must_use]
+    pub fn required(&self) -> bool {
+        self.required
+    }
+
+    #[must_use]
+    pub fn cluster_id(&self) -> &str {
+        &self.cluster_id
+    }
+
+    #[must_use]
+    pub fn storage_node_credentials(&self) -> &[ControlPlaneUnixAuthCredentialStatus] {
+        &self.storage_node_credentials
+    }
+
+    #[must_use]
+    pub fn metrics(&self) -> &ControlPlaneUnixAuthMetricsSnapshot {
+        &self.metrics
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ControlPlaneUnixAuthMetricsSnapshot {
     accepted_total: u64,
     rejected_total: u64,
@@ -5169,6 +5223,24 @@ impl ControlPlaneUnixAuthVerifier {
         self.metrics.snapshot()
     }
 
+    #[must_use]
+    pub fn status_snapshot(&self) -> ControlPlaneUnixAuthStatusSnapshot {
+        ControlPlaneUnixAuthStatusSnapshot {
+            required: true,
+            cluster_id: self.cluster_id.clone(),
+            storage_node_credentials: self
+                .storage_node_credentials
+                .values()
+                .map(|credential| ControlPlaneUnixAuthCredentialStatus {
+                    node_id: credential.node_id(),
+                    credential_id: credential.credential_id().to_owned(),
+                    credential_version: credential.credential_version(),
+                })
+                .collect(),
+            metrics: self.metrics.snapshot(),
+        }
+    }
+
     pub fn verify_storage_node_heartbeat_payload(
         &self,
         payload: &[u8],
@@ -5180,10 +5252,13 @@ impl ControlPlaneUnixAuthVerifier {
         ) {
             Ok(envelope) => envelope,
             Err(error) => {
-                self.metrics.record_rejected(
-                    ControlPlaneAuthOperation::StorageRuntimeMapRefresh,
-                    ControlPlaneAuthRejectionReason::Malformed,
-                );
+                let reason = if control_plane_auth_payload_has_magic(payload) {
+                    ControlPlaneAuthRejectionReason::Malformed
+                } else {
+                    ControlPlaneAuthRejectionReason::Missing
+                };
+                self.metrics
+                    .record_rejected(ControlPlaneAuthOperation::StorageRuntimeMapRefresh, reason);
                 return Err(error);
             }
         };
@@ -11507,6 +11582,54 @@ mod tests {
 
         assert!(
             matches!(error, ControlPlaneError::RpcProtocol { ref message } if message.contains("auth magic")),
+            "unexpected error: {error}"
+        );
+        let metrics = verifier.metrics_snapshot();
+        assert_eq!(metrics.accepted_total(), 0);
+        assert_eq!(metrics.rejected_total(), 1);
+        assert_eq!(
+            metrics.rejected_for_operation(ControlPlaneAuthOperation::StorageRuntimeMapRefresh),
+            1
+        );
+        assert_eq!(
+            metrics.rejected_for_reason(ControlPlaneAuthRejectionReason::Missing),
+            1
+        );
+        assert_eq!(
+            authority
+                .snapshot()
+                .node(NodeId::new(1))
+                .unwrap()
+                .lease_deadline_ms(),
+            None
+        );
+    }
+
+    #[test]
+    fn authenticated_control_plane_counts_malformed_storage_node_heartbeat_auth() {
+        let tmp = test_util::tempdir();
+        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+        authority
+            .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
+            .unwrap();
+        let verifier =
+            storage_node_auth_verifier("auth-cluster", vec![storage_node_auth_node_credential(1)]);
+        let request = ControlPlaneRpcRequest {
+            kind: ControlPlaneRpcKind::RefreshNodeHeartbeat,
+            payload: b"ARGCPAUT".to_vec(),
+        };
+
+        let error = build_control_plane_unix_response_with_auth(
+            &mut authority,
+            request,
+            2_000,
+            Some(&verifier),
+        )
+        .unwrap_err();
+
+        assert!(
+            matches!(error, ControlPlaneError::RpcProtocol { .. }),
             "unexpected error: {error}"
         );
         let metrics = verifier.metrics_snapshot();

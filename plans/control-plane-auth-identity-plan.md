@@ -337,7 +337,10 @@ Progress:
 - The storage-node Unix verifier exposes compact accepted/rejected auth
   counters by operation and rejection reason for heartbeat refresh auth, without
   exposing secrets, MACs, nonces, or payload bytes. Process/debug-status
-  exposure can reuse this surface in a later diagnostics slice.
+  exposure reuses this surface at control-plane process startup for both
+  single-authority and experimental Raft-backed process modes. Raw
+  unauthenticated heartbeat payloads are counted as `Missing`; auth-looking but
+  structurally invalid envelopes are counted as `Malformed`.
 
 ### Slice C: Frontend and Admin Control-Plane RPCs
 
