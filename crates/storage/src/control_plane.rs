@@ -4572,6 +4572,32 @@ struct VerifiedAdminControlPlaneCommand {
     response_target: ControlPlaneAuthPrincipal,
 }
 
+struct VerifiedAdminRuntimeMapRead {
+    payload: Vec<u8>,
+    response_credential: ControlPlaneScopedCredential,
+    response_target: ControlPlaneAuthPrincipal,
+}
+
+#[derive(Clone, Copy)]
+struct AuthenticatedAdminRetryClock {
+    authority_now_ms: u64,
+    start: Instant,
+}
+
+impl AuthenticatedAdminRetryClock {
+    fn new(authority_now_ms: u64) -> Self {
+        Self {
+            authority_now_ms,
+            start: Instant::now(),
+        }
+    }
+
+    fn now_ms(self) -> u64 {
+        let elapsed_ms = u64::try_from(self.start.elapsed().as_millis()).unwrap_or(u64::MAX);
+        self.authority_now_ms.saturating_add(elapsed_ms)
+    }
+}
+
 struct VerifiedStorageNodeHeartbeatRefresh {
     payload: Vec<u8>,
     response_credential: ControlPlaneScopedCredential,
@@ -5364,9 +5390,9 @@ impl AuthenticatedUnixControlPlaneClient {
         authority_now_ms: u64,
         payload: Vec<u8>,
     ) -> Result<Vec<u8>, ControlPlaneError> {
-        debug_assert_eq!(
-            kind.auth_operation(),
-            ControlPlaneAuthOperation::AdminControlPlaneCommand
+        debug_assert!(
+            kind.auth_operation() == ControlPlaneAuthOperation::AdminControlPlaneCommand
+                || kind == ControlPlaneRpcKind::PgRuntimeMapSnapshot
         );
         let expires_at_ms = authority_now_ms
             .checked_add(CONTROL_PLANE_RPC_READ_AUTH_REPLAY_WINDOW_MS)
@@ -5419,6 +5445,184 @@ impl AuthenticatedUnixControlPlaneClient {
         let response =
             self.verify_admin_control_plane_response(kind, authority_now_ms()?, &response)?;
         decode_control_plane_rpc_response(response)
+    }
+
+    fn admin_pg_runtime_map_snapshot_with_read_timeout(
+        &self,
+        pg_id: PgId,
+        retry_clock: AuthenticatedAdminRetryClock,
+        read_timeout: Duration,
+    ) -> Result<ClusterRuntimeMapSnapshot, ControlPlaneError> {
+        let mut payload = Vec::new();
+        write_pg_id_request(&mut payload, pg_id);
+        let response = self
+            .inner
+            .send_read_only_request_with_raw_response_payload_factory(
+                ControlPlaneRpcKind::PgRuntimeMapSnapshot,
+                read_timeout,
+                || {
+                    self.sign_admin_control_plane_request(
+                        ControlPlaneRpcKind::PgRuntimeMapSnapshot,
+                        retry_clock.now_ms(),
+                        payload.clone(),
+                    )
+                },
+            )?;
+        let response = self.verify_admin_control_plane_response(
+            ControlPlaneRpcKind::PgRuntimeMapSnapshot,
+            retry_clock.now_ms(),
+            &response,
+        )?;
+        let response = decode_control_plane_rpc_response(response)?;
+        let mut reader = PayloadReader::new(&response);
+        let runtime_map = read_runtime_map_snapshot(&mut reader)?;
+        reader.finish()?;
+        Ok(runtime_map)
+    }
+
+    fn retry_set_pg_acting_set_after_response_loss(
+        &self,
+        pg_id: PgId,
+        acting_set: &[NodeId],
+        pre_update_epoch: Option<ClusterEpoch>,
+        retry_clock: AuthenticatedAdminRetryClock,
+    ) -> Result<ClusterEpoch, ControlPlaneError> {
+        let deadline = Instant::now() + CONTROL_PLANE_RPC_CHECK_APPLIED_DEADLINE;
+        let mut last_unconfirmed_message = None;
+        loop {
+            match self.admin_pg_runtime_map_snapshot_with_read_timeout(
+                pg_id,
+                retry_clock,
+                CONTROL_PLANE_RPC_CHECK_APPLIED_IO_TIMEOUT,
+            ) {
+                Ok(runtime_map) => {
+                    let Some(route) = runtime_map
+                        .pg_routes()
+                        .iter()
+                        .find(|route| route.pg_id() == pg_id)
+                    else {
+                        last_unconfirmed_message = Some(format!(
+                            "PG {} authenticated acting-set update was not confirmed after lost control-plane RPC response: current runtime map has no route for PG",
+                            pg_id.get()
+                        ));
+                        if Instant::now() >= deadline {
+                            return Err(ControlPlaneError::RpcUnconfirmed {
+                                message: last_unconfirmed_message
+                                    .expect("missing route message was recorded"),
+                            });
+                        }
+                        if pre_update_epoch.is_none() {
+                            match self.set_pg_acting_set(
+                                pg_id,
+                                acting_set.to_vec(),
+                                retry_clock.now_ms(),
+                            ) {
+                                Ok(cluster_epoch) => return Ok(cluster_epoch),
+                                Err(error)
+                                    if error.is_maybe_applied_control_plane_rpc_response_loss() => {
+                                }
+                                Err(error) => return Err(error),
+                            }
+                        }
+                        std::thread::sleep(CONTROL_PLANE_RPC_CHECK_APPLIED_BACKOFF);
+                        continue;
+                    };
+                    if route.acting_set() == acting_set {
+                        return Ok(route.cluster_epoch());
+                    }
+                    let message = format!(
+                        "PG {} authenticated acting-set update was not confirmed after lost control-plane RPC response: current route at epoch {} has acting set {:?}, expected {:?}",
+                        pg_id.get(),
+                        route.cluster_epoch().get(),
+                        route.acting_set(),
+                        acting_set
+                    );
+                    if pre_update_epoch.is_some_and(|epoch| route.cluster_epoch() > epoch) {
+                        return Err(ControlPlaneError::RpcUnconfirmed { message });
+                    }
+                    if pre_update_epoch == Some(route.cluster_epoch()) {
+                        match self.set_pg_acting_set(
+                            pg_id,
+                            acting_set.to_vec(),
+                            retry_clock.now_ms(),
+                        ) {
+                            Ok(cluster_epoch) => return Ok(cluster_epoch),
+                            Err(error)
+                                if error.is_maybe_applied_control_plane_rpc_response_loss() => {}
+                            Err(error) => return Err(error),
+                        }
+                    }
+                    last_unconfirmed_message = Some(message);
+                    if Instant::now() >= deadline {
+                        return Err(ControlPlaneError::RpcUnconfirmed {
+                            message: last_unconfirmed_message
+                                .expect("mismatched route message was recorded"),
+                        });
+                    }
+                    std::thread::sleep(CONTROL_PLANE_RPC_CHECK_APPLIED_BACKOFF);
+                }
+                Err(error) if error.is_maybe_applied_control_plane_rpc_response_loss() => {
+                    if Instant::now() >= deadline {
+                        return Err(ControlPlaneError::RpcUnconfirmed {
+                            message: last_unconfirmed_message.unwrap_or_else(|| format!(
+                                "PG {} authenticated acting-set update was not confirmed after lost control-plane RPC response; runtime-map observation failed: {error}",
+                                pg_id.get()
+                            )),
+                        });
+                    }
+                    std::thread::sleep(CONTROL_PLANE_RPC_CHECK_APPLIED_BACKOFF);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    fn wait_for_metadata_transfer_install_applied(
+        &self,
+        pg_id: PgId,
+        acting_set: &[NodeId],
+        transfer: PgMetadataTransferProof,
+        min_cluster_epoch: ClusterEpoch,
+        retry_clock: AuthenticatedAdminRetryClock,
+        original_error: &ControlPlaneError,
+    ) -> Result<ClusterRuntimeMapSnapshot, ControlPlaneError> {
+        let deadline = Instant::now() + CONTROL_PLANE_RPC_CHECK_APPLIED_DEADLINE;
+        let mut last_observation_error;
+        loop {
+            match self.admin_pg_runtime_map_snapshot_with_read_timeout(
+                pg_id,
+                retry_clock,
+                CONTROL_PLANE_RPC_CHECK_APPLIED_IO_TIMEOUT,
+            ) {
+                Ok(runtime_map) => {
+                    if metadata_transfer_install_applied(
+                        &runtime_map,
+                        pg_id,
+                        acting_set,
+                        transfer,
+                        min_cluster_epoch,
+                    ) {
+                        return Ok(runtime_map);
+                    }
+                    last_observation_error = None;
+                }
+                Err(error) => {
+                    last_observation_error = Some(error.to_string());
+                }
+            }
+            if Instant::now() >= deadline {
+                let mut message = format!(
+                    "metadata-transfer authenticated acting-set install for PG {} was not observable after lost control-plane RPC response: {original_error}",
+                    pg_id.get()
+                );
+                if let Some(error) = last_observation_error {
+                    message.push_str("; last runtime-map observation error: ");
+                    message.push_str(&error);
+                }
+                return Err(ControlPlaneError::RpcUnconfirmed { message });
+            }
+            std::thread::sleep(CONTROL_PLANE_RPC_CHECK_APPLIED_BACKOFF);
+        }
     }
 
     fn verify_admin_control_plane_response(
@@ -5493,7 +5697,32 @@ impl AuthenticatedUnixControlPlaneClient {
         acting_set: Vec<NodeId>,
         authority_now_ms: u64,
     ) -> Result<ClusterEpoch, ControlPlaneError> {
-        self.set_pg_acting_set(pg_id, acting_set, authority_now_ms)
+        let retry_clock = AuthenticatedAdminRetryClock::new(authority_now_ms);
+        let pre_update_epoch = self
+            .admin_pg_runtime_map_snapshot_with_read_timeout(
+                pg_id,
+                retry_clock,
+                CONTROL_PLANE_RPC_IO_TIMEOUT,
+            )
+            .ok()
+            .and_then(|runtime_map| {
+                runtime_map
+                    .pg_routes()
+                    .iter()
+                    .find(|route| route.pg_id() == pg_id)
+                    .map(|route| route.cluster_epoch())
+            });
+        match self.set_pg_acting_set(pg_id, acting_set.clone(), authority_now_ms) {
+            Ok(cluster_epoch) => Ok(cluster_epoch),
+            Err(error) if error.is_maybe_applied_control_plane_rpc_response_loss() => self
+                .retry_set_pg_acting_set_after_response_loss(
+                    pg_id,
+                    &acting_set,
+                    pre_update_epoch,
+                    retry_clock,
+                ),
+            Err(error) => Err(error),
+        }
     }
 
     pub fn fence_pg_for_metadata_transfer_runtime_map_checked(
@@ -5567,28 +5796,42 @@ impl AuthenticatedUnixControlPlaneClient {
         min_cluster_epoch: ClusterEpoch,
         authority_now_ms: u64,
     ) -> Result<ClusterRuntimeMapSnapshot, ControlPlaneError> {
-        let runtime_map = self.set_pg_acting_set_with_metadata_transfer_runtime_map(
+        let retry_clock = AuthenticatedAdminRetryClock::new(authority_now_ms);
+        match self.set_pg_acting_set_with_metadata_transfer_runtime_map(
             pg_id,
             acting_set.clone(),
             transfer,
             authority_now_ms,
-        )?;
-        if metadata_transfer_install_applied(
-            &runtime_map,
-            pg_id,
-            &acting_set,
-            transfer,
-            min_cluster_epoch,
         ) {
-            return Ok(runtime_map);
+            Ok(runtime_map)
+                if metadata_transfer_install_applied(
+                    &runtime_map,
+                    pg_id,
+                    &acting_set,
+                    transfer,
+                    min_cluster_epoch,
+                ) =>
+            {
+                Ok(runtime_map)
+            }
+            Ok(runtime_map) => Err(ControlPlaneError::RpcUnconfirmed {
+                message: format!(
+                    "metadata-transfer acting-set install for PG {} returned runtime map at epoch {} without the expected route/proof",
+                    pg_id.get(),
+                    runtime_map.cluster_epoch().get()
+                ),
+            }),
+            Err(error) if error.is_maybe_applied_control_plane_rpc_response_loss() => self
+                .wait_for_metadata_transfer_install_applied(
+                    pg_id,
+                    &acting_set,
+                    transfer,
+                    min_cluster_epoch,
+                    retry_clock,
+                    &error,
+                ),
+            Err(error) => Err(error),
         }
-        Err(ControlPlaneError::RpcUnconfirmed {
-            message: format!(
-                "metadata-transfer acting-set install for PG {} returned runtime map at epoch {} without the expected route/proof",
-                pg_id.get(),
-                runtime_map.cluster_epoch().get()
-            ),
-        })
     }
 
     pub fn set_pg_acting_set_with_metadata_transfer_checked(
@@ -6308,6 +6551,24 @@ impl ControlPlaneUnixAuthVerifier {
                 })
             }
         }
+    }
+
+    fn verify_admin_runtime_map_read_payload(
+        &self,
+        expected_kind: ControlPlaneRpcKind,
+        payload: &[u8],
+        authority_now_ms: u64,
+    ) -> Result<VerifiedAdminRuntimeMapRead, ControlPlaneError> {
+        let verified = self.verify_admin_control_plane_command_payload(
+            expected_kind,
+            payload,
+            authority_now_ms,
+        )?;
+        Ok(VerifiedAdminRuntimeMapRead {
+            payload: verified.payload,
+            response_credential: verified.response_credential,
+            response_target: verified.response_target,
+        })
     }
 
     fn verify_frontend_runtime_map_read_payload(
@@ -7231,7 +7492,29 @@ where
             );
         }
         ControlPlaneRpcKind::PgRuntimeMapSnapshot => {
+            let mut admin_response_auth = None;
+            let auth_payload_operation = if control_plane_auth_payload_has_magic(&payload) {
+                ControlPlaneAuthEnvelope::decode_frame(&payload, CONTROL_PLANE_RPC_MAX_PAYLOAD_LEN)
+                    .ok()
+                    .map(|envelope| envelope.header().operation())
+            } else {
+                None
+            };
             let (payload, response_auth) = match auth_verifier {
+                Some(auth_verifier)
+                    if auth_verifier.requires_admin_control_plane_auth()
+                        && auth_payload_operation
+                            == Some(ControlPlaneAuthOperation::AdminControlPlaneCommand) =>
+                {
+                    let verified = auth_verifier.verify_admin_runtime_map_read_payload(
+                        kind,
+                        &payload,
+                        authority_now_ms,
+                    )?;
+                    admin_response_auth =
+                        Some((verified.response_credential, verified.response_target));
+                    (verified.payload, None)
+                }
                 Some(auth_verifier) if auth_verifier.requires_frontend_runtime_map_auth() => {
                     let verified = auth_verifier.verify_frontend_runtime_map_read_payload(
                         kind,
@@ -7242,6 +7525,19 @@ where
                         verified.payload,
                         Some((verified.response_credential, verified.response_target)),
                     )
+                }
+                Some(auth_verifier)
+                    if auth_verifier.requires_admin_control_plane_auth()
+                        && control_plane_auth_payload_has_magic(&payload) =>
+                {
+                    let verified = auth_verifier.verify_admin_runtime_map_read_payload(
+                        kind,
+                        &payload,
+                        authority_now_ms,
+                    )?;
+                    admin_response_auth =
+                        Some((verified.response_credential, verified.response_target));
+                    (verified.payload, None)
                 }
                 _ => (payload, None),
             };
@@ -7257,6 +7553,16 @@ where
                 Err(error) => Err(error),
             };
             let response_authority_now_ms = response_authority_now_ms()?;
+            if let Some((credential, target)) = admin_response_auth {
+                let payload = sign_admin_control_plane_response_payload(
+                    kind,
+                    &credential,
+                    target,
+                    response_authority_now_ms,
+                    encode_control_plane_rpc_response(response)?,
+                )?;
+                return Ok(ControlPlaneRpcResponse { kind, payload });
+            }
             return build_runtime_map_rpc_response(
                 kind,
                 response,
@@ -13854,6 +14160,57 @@ mod tests {
     }
 
     #[test]
+    fn authenticated_control_plane_rejects_malformed_admin_pg_runtime_map_read() {
+        let tmp = test_util::tempdir();
+        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+        authority
+            .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
+            .unwrap();
+        let before = authority.snapshot().clone();
+        let verifier = admin_auth_verifier("auth-cluster", "admin-1");
+        let signer = admin_auth_credential("auth-cluster", "admin-1");
+        let mut payload = Vec::new();
+        write_pg_id_request(&mut payload, PgId::new(7));
+        let mut request = signed_admin_control_plane_request(
+            ControlPlaneRpcKind::PgRuntimeMapSnapshot,
+            &signer,
+            payload,
+            Some(1_999),
+            Some(2_999),
+        );
+        request
+            .payload
+            .pop()
+            .expect("signed auth frame should not be empty");
+
+        let error = build_control_plane_unix_response_with_auth(
+            &mut authority,
+            request,
+            2_000,
+            Some(&verifier),
+        )
+        .unwrap_err();
+
+        assert!(
+            matches!(error, ControlPlaneError::RpcProtocol { .. }),
+            "unexpected error: {error}"
+        );
+        assert_eq!(authority.snapshot(), &before);
+        let metrics = verifier.metrics_snapshot();
+        assert_eq!(metrics.accepted_total(), 0);
+        assert_eq!(metrics.rejected_total(), 1);
+        assert_eq!(
+            metrics.rejected_for_operation(ControlPlaneAuthOperation::AdminControlPlaneCommand),
+            1
+        );
+        assert_eq!(
+            metrics.rejected_for_reason(ControlPlaneAuthRejectionReason::Malformed),
+            1
+        );
+    }
+
+    #[test]
     fn authenticated_control_plane_accepts_admin_command_auth() {
         let tmp = test_util::tempdir();
         let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
@@ -13967,14 +14324,16 @@ mod tests {
         let verifier_for_assert = verifier.clone();
         let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
         let server = std::thread::spawn(move || {
-            let (mut stream, _addr) = listener.accept().unwrap();
-            handle_control_plane_unix_stream_with_auth(
-                &mut authority,
-                &mut stream,
-                2_000,
-                &verifier,
-            )
-            .unwrap();
+            for authority_now_ms in [2_000, 2_000] {
+                let (mut stream, _addr) = listener.accept().unwrap();
+                handle_control_plane_unix_stream_with_auth(
+                    &mut authority,
+                    &mut stream,
+                    authority_now_ms,
+                    &verifier,
+                )
+                .unwrap();
+            }
             assert_eq!(
                 authority.snapshot().pg(PgId::new(7)).unwrap().acting_set(),
                 &[NodeId::new(1)]
@@ -13992,10 +14351,10 @@ mod tests {
         server.join().unwrap();
         assert!(cluster_epoch.get() >= 2);
         let metrics = verifier_for_assert.metrics_snapshot();
-        assert_eq!(metrics.accepted_total(), 1);
+        assert_eq!(metrics.accepted_total(), 2);
         assert_eq!(
             metrics.accepted_for_operation(ControlPlaneAuthOperation::AdminControlPlaneCommand),
-            1
+            2
         );
         assert_eq!(metrics.rejected_total(), 0);
     }
@@ -14021,14 +14380,16 @@ mod tests {
         let verifier_for_assert = verifier.clone();
         let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
         let server = std::thread::spawn(move || {
-            let (mut stream, _addr) = listener.accept().unwrap();
-            handle_control_plane_unix_stream_with_auth(
-                &mut authority,
-                &mut stream,
-                2_000,
-                &verifier,
-            )
-            .unwrap();
+            for authority_now_ms in [2_000, 2_000] {
+                let (mut stream, _addr) = listener.accept().unwrap();
+                handle_control_plane_unix_stream_with_auth(
+                    &mut authority,
+                    &mut stream,
+                    authority_now_ms,
+                    &verifier,
+                )
+                .unwrap();
+            }
             assert_eq!(
                 authority.snapshot().pg(PgId::new(7)).unwrap().acting_set(),
                 &[NodeId::new(1)]
@@ -14050,7 +14411,75 @@ mod tests {
         let metrics = verifier_for_assert.metrics_snapshot();
         assert_eq!(
             metrics.accepted_for_operation(ControlPlaneAuthOperation::AdminControlPlaneCommand),
-            1
+            2
+        );
+        assert_eq!(metrics.rejected_total(), 0);
+    }
+
+    #[test]
+    fn authenticated_admin_pg_update_confirms_after_lost_response() {
+        let tmp = test_util::tempdir();
+        let socket_path = tmp.path().join("control-plane.sock");
+        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+        authority
+            .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
+            .unwrap();
+        assert!(heartbeat_until_serving(&mut authority, 1, 1_000).serving());
+        let verifier = admin_auth_verifier("auth-cluster", "admin-1");
+        let verifier_for_assert = verifier.clone();
+        let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _addr) = listener.accept().unwrap();
+            handle_control_plane_unix_stream_with_auth(
+                &mut authority,
+                &mut stream,
+                2_000,
+                &verifier,
+            )
+            .unwrap();
+
+            let (mut stream, _addr) = listener.accept().unwrap();
+            let request = read_control_plane_unix_request(&mut stream).unwrap();
+            assert_eq!(request.kind, ControlPlaneRpcKind::SetPgActingSet);
+            build_control_plane_unix_response_with_auth(
+                &mut authority,
+                request,
+                2_000,
+                Some(&verifier),
+            )
+            .expect("dropped authenticated admin mutation should still apply");
+            drop(stream);
+
+            let (mut stream, _addr) = listener.accept().unwrap();
+            handle_control_plane_unix_stream_with_auth(
+                &mut authority,
+                &mut stream,
+                2_000,
+                &verifier,
+            )
+            .unwrap();
+            assert_eq!(
+                authority.snapshot().pg(PgId::new(7)).unwrap().acting_set(),
+                &[NodeId::new(1)]
+            );
+        });
+
+        let client = AuthenticatedUnixControlPlaneClient::new(
+            UnixControlPlaneClient::new(&socket_path),
+            admin_auth_credential("auth-cluster", "admin-1"),
+        );
+        let cluster_epoch = client
+            .set_pg_acting_set_checked(PgId::new(7), vec![NodeId::new(1)], 2_000)
+            .unwrap();
+
+        server.join().unwrap();
+        assert!(cluster_epoch.get() >= 2);
+        let metrics = verifier_for_assert.metrics_snapshot();
+        assert_eq!(metrics.accepted_total(), 3);
+        assert_eq!(
+            metrics.accepted_for_operation(ControlPlaneAuthOperation::AdminControlPlaneCommand),
+            3
         );
         assert_eq!(metrics.rejected_total(), 0);
     }
@@ -14075,7 +14504,7 @@ mod tests {
             admin_auth_credential("auth-cluster", "admin-1"),
         );
         let error = client
-            .set_pg_acting_set_checked(PgId::new(7), vec![NodeId::new(1)], 2_000)
+            .set_pg_acting_set(PgId::new(7), vec![NodeId::new(1)], 2_000)
             .expect_err("unsigned admin response should be rejected");
 
         server.join().unwrap();
@@ -14163,7 +14592,7 @@ mod tests {
             admin_auth_credential("auth-cluster", "admin-1"),
         );
         let error = client
-            .set_pg_acting_set_checked(PgId::new(7), vec![NodeId::new(99)], 2_000)
+            .set_pg_acting_set(PgId::new(7), vec![NodeId::new(99)], 2_000)
             .expect_err("signed admin error response should decode after auth verification");
 
         server.join().unwrap();
