@@ -980,15 +980,12 @@ each is one refactor away from a panic:
   — adjacent same-typed values. Partially mitigated: a struct-taking
   `with_rpc_admission_settings` variant now exists (`local.rs:174`) but the
   positional variant remains.
-- [ ] Metrics render site pairs ~100+ name strings positionally with values
+- [x] Metrics render site pairs ~100+ name strings positionally with values
   in one giant `concat!` (`server-http/src/http/serve.rs:1466+`); tests check
-  presence, not values, so a transposition mislabels metrics silently.
-  `bucket_lock_wait_exceeded_total` is now exported by the debug endpoint, but
-  the broader positional render-site hazard remains. Mitigated but not fixed:
-  the whole endpoint is now behind
-  `cfg(any(test, feature = "local-debug-endpoints"))`. Fix: observability
-  exposes `MetricsSnapshot::iter_named() -> impl Iterator<Item = (&'static
-  str, u64)>` (or a macro generating struct + names together).
+  presence, not values, so a transposition mislabels metrics silently. Fixed by
+  adding `MetricsSnapshot::iter_named()` as the fixed-metric export contract,
+  rendering the debug endpoint from that iterator, adding value-binding tests
+  for representative fields, and exporting `bucket_lock_wait_exceeded_total`.
 
 ### P5. Canonical tokens duplicated across crates / stringly-typed dispatch
 

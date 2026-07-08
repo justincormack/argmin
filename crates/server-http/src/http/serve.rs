@@ -1537,220 +1537,10 @@ fn local_debug_metrics_body(state: &Arc<ServerState>) -> String {
         })
         .max()
         .unwrap_or(0);
-    let mut body = format!(
-        concat!(
-            "frontend_storage_cluster_epoch {}\n",
-            "request_start_total {}\n",
-            "inflight_requests {}\n",
-            "request_finish_total {}\n",
-            "request_error_total {}\n",
-            "http_500_response_total {}\n",
-            "operation_aborted_response_total {}\n",
-            "slow_down_response_total {}\n",
-            "slow_request_total {}\n",
-            "request_admission_wait_total {}\n",
-            "request_admission_wait_us_total {}\n",
-            "request_admission_timeout_total {}\n",
-            "storage_rpc_error_total {}\n",
-            "storage_rpc_admission_total {}\n",
-            "storage_rpc_admission_wait_total {}\n",
-            "storage_rpc_admission_wait_us_total {}\n",
-            "storage_rpc_admission_timeout_total {}\n",
-            "storage_rpc_active_total {}\n",
-            "storage_rpc_active_control {}\n",
-            "storage_rpc_active_completion {}\n",
-            "storage_rpc_active_progress {}\n",
-            "storage_rpc_active_start_write {}\n",
-            "storage_rpc_active_read {}\n",
-            "storage_rpc_active_list {}\n",
-            "storage_rpc_pending_envelope_active {}\n",
-            "storage_rpc_pending_envelope_started_total {}\n",
-            "storage_rpc_pending_envelope_completed_total {}\n",
-            "storage_rpc_pending_envelope_long_running_total {}\n",
-            "storage_rpc_pending_envelope_long_running_us_max {}\n",
-            "storage_rpc_pending_envelope_oldest_active_us {}\n",
-            "storage_rpc_pending_envelope_oldest_active_node_id {}\n",
-            "storage_rpc_pending_envelope_oldest_active_request_id {}\n",
-            "bucket_lock_wait_exceeded_total {}\n",
-            "shard_scavenger_observation_total {}\n",
-            "shard_scavenger_scan_incomplete_total {}\n",
-            "metadata_command_conflict_total {}\n",
-            "metadata_command_pending_slot_action_total {}\n",
-            "metadata_command_session_wait_total {}\n",
-            "metadata_command_recovery_leader_total {}\n",
-            "metadata_command_recovery_wait_total {}\n",
-            "metadata_command_recovery_wait_us_total {}\n",
-            "metadata_command_recovery_wait_us_max {}\n",
-            "metadata_command_recovery_timeout_total {}\n",
-            "metadata_command_recovery_outcome_total {}\n",
-            "metadata_command_budget_exhausted_total {}\n",
-            "metadata_command_backoff_total {}\n",
-            "metadata_command_backoff_us_total {}\n",
-            "metadata_command_backoff_us_max {}\n",
-            "reclaim_work_queue_depth {}\n",
-            "object_payload_reclaim_queue_depth {}\n",
-            "object_payload_reclaim_outstanding_depth {}\n",
-            "bucket_delete_begin_queue_depth {}\n",
-            "bucket_delete_finalize_queue_depth {}\n",
-            "bucket_delete_finalize_outstanding_depth {}\n",
-            "reclaim_work_queue_action_total {}\n",
-            "object_payload_reclaim_event_total {}\n",
-            "object_payload_reclaim_durable_scan_total {}\n",
-            "shard_repair_queue_depth {}\n",
-            "shard_repair_event_total {}\n",
-            "shard_repair_shards_rewritten_total {}\n",
-            "shard_backfill_queue_depth {}\n",
-            "shard_backfill_event_total {}\n",
-            "shard_backfill_shards_written_total {}\n",
-            "shard_backfill_candidate_scan_total {}\n",
-            "shard_backfill_candidate_scanned_total {}\n",
-            "shard_backfill_candidate_current_epoch_total {}\n",
-            "shard_backfill_candidate_already_queued_total {}\n",
-            "shard_backfill_candidate_already_complete_total {}\n",
-            "shard_backfill_candidate_enqueued_total {}\n",
-            "shard_backfill_candidate_unrecoverable_total {}\n",
-            "shard_backfill_candidate_deferred_total {}\n",
-            "shard_backfill_candidate_failed_total {}\n",
-            "shard_backfill_candidate_limit_reached_total {}\n",
-            "shard_backfill_candidate_scan_error_total {}\n",
-            "metadata_command_checkpoint_record_scan_total {}\n",
-            "metadata_command_checkpoint_record_scanned_total {}\n",
-            "metadata_command_checkpoint_record_recorded_total {}\n",
-            "metadata_command_checkpoint_record_already_current_total {}\n",
-            "metadata_command_checkpoint_record_skipped_cadence_total {}\n",
-            "metadata_command_checkpoint_record_skipped_inactive_total {}\n",
-            "metadata_command_checkpoint_record_skipped_empty_total {}\n",
-            "metadata_command_checkpoint_record_skipped_stale_epoch_total {}\n",
-            "metadata_command_checkpoint_record_compacted_total {}\n",
-            "metadata_command_checkpoint_record_compaction_deleted_entries_total {}\n",
-            "metadata_command_checkpoint_record_compaction_noop_total {}\n",
-            "metadata_command_checkpoint_record_compaction_no_checkpoint_total {}\n",
-            "metadata_command_checkpoint_record_compaction_pending_total {}\n",
-            "metadata_command_checkpoint_record_compaction_failed_total {}\n",
-            "metadata_command_checkpoint_record_failed_total {}\n",
-            "metadata_command_checkpoint_record_limit_reached_total {}\n",
-            "metadata_command_checkpoint_record_scan_error_total {}\n",
-            "background_work_admission_event_total {}\n",
-            "background_work_active_total {}\n",
-            "background_work_finished_total {}\n",
-            "background_work_elapsed_us_total {}\n",
-            "stream_upload_active_sessions {}\n",
-            "stream_upload_session_created_total {}\n",
-            "stream_upload_session_aborted_total {}\n",
-            "stream_upload_session_finalized_total {}\n",
-            "stream_upload_body_started_total {}\n",
-            "stream_upload_body_read_complete_total {}\n",
-            "stream_upload_segment_append_started_total {}\n",
-            "stream_upload_segment_append_finished_total {}\n",
-            "stream_upload_segment_append_error_total {}\n",
-            "stream_upload_finalize_error_total {}\n"
-        ),
-        frontend_storage_cluster_epoch,
-        snapshot.request_start_total,
-        snapshot.inflight_requests,
-        snapshot.request_finish_total,
-        snapshot.request_error_total,
-        snapshot.http_500_response_total,
-        snapshot.operation_aborted_response_total,
-        snapshot.slow_down_response_total,
-        snapshot.slow_request_total,
-        snapshot.request_admission_wait_total,
-        snapshot.request_admission_wait_us_total,
-        snapshot.request_admission_timeout_total,
-        snapshot.storage_rpc_error_total,
-        snapshot.storage_rpc_admission_total,
-        snapshot.storage_rpc_admission_wait_total,
-        snapshot.storage_rpc_admission_wait_us_total,
-        snapshot.storage_rpc_admission_timeout_total,
-        snapshot.storage_rpc_active_total,
-        snapshot.storage_rpc_active_control,
-        snapshot.storage_rpc_active_completion,
-        snapshot.storage_rpc_active_progress,
-        snapshot.storage_rpc_active_start_write,
-        snapshot.storage_rpc_active_read,
-        snapshot.storage_rpc_active_list,
-        snapshot.storage_rpc_pending_envelope_active,
-        snapshot.storage_rpc_pending_envelope_started_total,
-        snapshot.storage_rpc_pending_envelope_completed_total,
-        snapshot.storage_rpc_pending_envelope_long_running_total,
-        snapshot.storage_rpc_pending_envelope_long_running_us_max,
-        snapshot.storage_rpc_pending_envelope_oldest_active_us,
-        snapshot.storage_rpc_pending_envelope_oldest_active_node_id,
-        snapshot.storage_rpc_pending_envelope_oldest_active_request_id,
-        snapshot.bucket_lock_wait_exceeded_total,
-        snapshot.shard_scavenger_observation_total,
-        snapshot.shard_scavenger_scan_incomplete_total,
-        snapshot.metadata_command_conflict_total,
-        snapshot.metadata_command_pending_slot_action_total,
-        snapshot.metadata_command_session_wait_total,
-        snapshot.metadata_command_recovery_leader_total,
-        snapshot.metadata_command_recovery_wait_total,
-        snapshot.metadata_command_recovery_wait_us_total,
-        snapshot.metadata_command_recovery_wait_us_max,
-        snapshot.metadata_command_recovery_timeout_total,
-        snapshot.metadata_command_recovery_outcome_total,
-        snapshot.metadata_command_budget_exhausted_total,
-        snapshot.metadata_command_backoff_total,
-        snapshot.metadata_command_backoff_us_total,
-        snapshot.metadata_command_backoff_us_max,
-        snapshot.reclaim_work_queue_depth,
-        snapshot.object_payload_reclaim_queue_depth,
-        snapshot.object_payload_reclaim_outstanding_depth,
-        snapshot.bucket_delete_begin_queue_depth,
-        snapshot.bucket_delete_finalize_queue_depth,
-        snapshot.bucket_delete_finalize_outstanding_depth,
-        snapshot.reclaim_work_queue_action_total,
-        snapshot.object_payload_reclaim_event_total,
-        snapshot.object_payload_reclaim_durable_scan_total,
-        snapshot.shard_repair_queue_depth,
-        snapshot.shard_repair_event_total,
-        snapshot.shard_repair_shards_rewritten_total,
-        snapshot.shard_backfill_queue_depth,
-        snapshot.shard_backfill_event_total,
-        snapshot.shard_backfill_shards_written_total,
-        snapshot.shard_backfill_candidate_scan_total,
-        snapshot.shard_backfill_candidate_scanned_total,
-        snapshot.shard_backfill_candidate_current_epoch_total,
-        snapshot.shard_backfill_candidate_already_queued_total,
-        snapshot.shard_backfill_candidate_already_complete_total,
-        snapshot.shard_backfill_candidate_enqueued_total,
-        snapshot.shard_backfill_candidate_unrecoverable_total,
-        snapshot.shard_backfill_candidate_deferred_total,
-        snapshot.shard_backfill_candidate_failed_total,
-        snapshot.shard_backfill_candidate_limit_reached_total,
-        snapshot.shard_backfill_candidate_scan_error_total,
-        snapshot.metadata_command_checkpoint_record_scan_total,
-        snapshot.metadata_command_checkpoint_record_scanned_total,
-        snapshot.metadata_command_checkpoint_record_recorded_total,
-        snapshot.metadata_command_checkpoint_record_already_current_total,
-        snapshot.metadata_command_checkpoint_record_skipped_cadence_total,
-        snapshot.metadata_command_checkpoint_record_skipped_inactive_total,
-        snapshot.metadata_command_checkpoint_record_skipped_empty_total,
-        snapshot.metadata_command_checkpoint_record_skipped_stale_epoch_total,
-        snapshot.metadata_command_checkpoint_record_compacted_total,
-        snapshot.metadata_command_checkpoint_record_compaction_deleted_entries_total,
-        snapshot.metadata_command_checkpoint_record_compaction_noop_total,
-        snapshot.metadata_command_checkpoint_record_compaction_no_checkpoint_total,
-        snapshot.metadata_command_checkpoint_record_compaction_pending_total,
-        snapshot.metadata_command_checkpoint_record_compaction_failed_total,
-        snapshot.metadata_command_checkpoint_record_failed_total,
-        snapshot.metadata_command_checkpoint_record_limit_reached_total,
-        snapshot.metadata_command_checkpoint_record_scan_error_total,
-        snapshot.background_work_admission_event_total,
-        snapshot.background_work_active_total,
-        snapshot.background_work_finished_total,
-        snapshot.background_work_elapsed_us_total,
-        snapshot.stream_upload_active_sessions,
-        snapshot.stream_upload_session_created_total,
-        snapshot.stream_upload_session_aborted_total,
-        snapshot.stream_upload_session_finalized_total,
-        snapshot.stream_upload_body_started_total,
-        snapshot.stream_upload_body_read_complete_total,
-        snapshot.stream_upload_segment_append_started_total,
-        snapshot.stream_upload_segment_append_finished_total,
-        snapshot.stream_upload_segment_append_error_total,
-        snapshot.stream_upload_finalize_error_total,
-    );
+    let mut body = format!("frontend_storage_cluster_epoch {frontend_storage_cluster_epoch}\n");
+    for (name, value) in snapshot.iter_named() {
+        let _ = writeln!(body, "{name} {value}");
+    }
     for sample in observability::metadata_command_conflict_dimension_snapshot() {
         let _ = writeln!(
             body,
@@ -5283,59 +5073,28 @@ mod tests {
         assert!(response
             .to_ascii_lowercase()
             .contains("content-type: text/plain; charset=utf-8"));
-        assert!(response.contains("metadata_command_conflict_total "));
-        assert!(response.contains("storage_rpc_error_total "));
-        assert!(response.contains("storage_rpc_admission_total "));
-        assert!(response.contains("storage_rpc_admission_wait_total "));
-        assert!(response.contains("storage_rpc_admission_wait_us_total "));
-        assert!(response.contains("storage_rpc_admission_timeout_total "));
-        assert!(response.contains("metadata_command_budget_exhausted_total "));
-        assert!(response.contains("metadata_command_backoff_total "));
-        assert!(response.contains("metadata_command_backoff_us_total "));
-        assert!(response.contains("metadata_command_backoff_us_max "));
-        assert!(response.contains("bucket_delete_begin_queue_depth "));
-        assert!(response.contains("bucket_delete_finalize_queue_depth "));
-        assert!(response.contains("bucket_delete_finalize_outstanding_depth "));
-        assert!(response.contains("shard_repair_queue_depth "));
-        assert!(response.contains("shard_repair_event_total "));
-        assert!(response.contains("shard_repair_shards_rewritten_total "));
-        assert!(response.contains("shard_backfill_queue_depth "));
-        assert!(response.contains("shard_backfill_event_total "));
-        assert!(response.contains("shard_backfill_shards_written_total "));
-        assert!(response.contains("shard_backfill_candidate_scan_total "));
-        assert!(response.contains("shard_backfill_candidate_scanned_total "));
-        assert!(response.contains("shard_backfill_candidate_current_epoch_total "));
-        assert!(response.contains("shard_backfill_candidate_already_queued_total "));
-        assert!(response.contains("shard_backfill_candidate_already_complete_total "));
-        assert!(response.contains("shard_backfill_candidate_enqueued_total "));
-        assert!(response.contains("shard_backfill_candidate_unrecoverable_total "));
-        assert!(response.contains("shard_backfill_candidate_deferred_total "));
-        assert!(response.contains("shard_backfill_candidate_failed_total "));
-        assert!(response.contains("shard_backfill_candidate_limit_reached_total "));
-        assert!(response.contains("shard_backfill_candidate_scan_error_total "));
-        assert!(response.contains("metadata_command_checkpoint_record_scan_total "));
-        assert!(response.contains("metadata_command_checkpoint_record_scanned_total "));
-        assert!(response.contains("metadata_command_checkpoint_record_recorded_total "));
-        assert!(response.contains("metadata_command_checkpoint_record_already_current_total "));
-        assert!(response.contains("metadata_command_checkpoint_record_skipped_cadence_total "));
-        assert!(response.contains("metadata_command_checkpoint_record_skipped_inactive_total "));
-        assert!(response.contains("metadata_command_checkpoint_record_skipped_empty_total "));
-        assert!(response.contains("metadata_command_checkpoint_record_skipped_stale_epoch_total "));
-        assert!(response.contains("metadata_command_checkpoint_record_compacted_total "));
-        assert!(response
-            .contains("metadata_command_checkpoint_record_compaction_deleted_entries_total "));
-        assert!(response.contains("metadata_command_checkpoint_record_compaction_noop_total "));
+        let body = response
+            .split_once("\r\n\r\n")
+            .map(|(_, body)| body)
+            .expect("metrics response should include a body");
+        let fixed_metrics: std::collections::HashMap<_, _> = body
+            .lines()
+            .filter_map(|line| {
+                let (name, value) = line.split_once(' ')?;
+                let value = value.parse::<u64>().ok()?;
+                Some((name, value))
+            })
+            .collect();
+        for (name, _) in observability::MetricsSnapshot::default().iter_named() {
+            assert!(
+                fixed_metrics.contains_key(name),
+                "fixed metric {name} should be present in response:\n{response}"
+            );
+        }
         assert!(
-            response.contains("metadata_command_checkpoint_record_compaction_no_checkpoint_total ")
+            fixed_metrics.contains_key("frontend_storage_cluster_epoch"),
+            "{response}"
         );
-        assert!(response.contains("metadata_command_checkpoint_record_compaction_pending_total "));
-        assert!(response.contains("metadata_command_checkpoint_record_compaction_failed_total "));
-        assert!(response.contains("metadata_command_checkpoint_record_failed_total "));
-        assert!(response.contains("metadata_command_checkpoint_record_limit_reached_total "));
-        assert!(response.contains("metadata_command_checkpoint_record_scan_error_total "));
-        assert!(response.contains("request_admission_wait_total "));
-        assert!(response.contains("request_admission_timeout_total "));
-        assert!(response.contains("bucket_lock_wait_exceeded_total "));
     }
 
     #[tokio::test(flavor = "multi_thread")]

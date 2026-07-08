@@ -1638,6 +1638,388 @@ pub struct MetricsSnapshot {
     pub stream_upload_finalize_error_total: u64,
 }
 
+impl MetricsSnapshot {
+    pub fn iter_named(&self) -> impl Iterator<Item = (&'static str, u64)> {
+        [
+            ("request_start_total", self.request_start_total),
+            ("inflight_requests", self.inflight_requests),
+            ("request_finish_total", self.request_finish_total),
+            ("request_error_total", self.request_error_total),
+            ("http_500_response_total", self.http_500_response_total),
+            (
+                "operation_aborted_response_total",
+                self.operation_aborted_response_total,
+            ),
+            ("slow_down_response_total", self.slow_down_response_total),
+            ("slow_request_total", self.slow_request_total),
+            (
+                "request_admission_wait_total",
+                self.request_admission_wait_total,
+            ),
+            (
+                "request_admission_wait_us_total",
+                self.request_admission_wait_us_total,
+            ),
+            (
+                "request_admission_timeout_total",
+                self.request_admission_timeout_total,
+            ),
+            ("storage_rpc_error_total", self.storage_rpc_error_total),
+            (
+                "storage_rpc_admission_total",
+                self.storage_rpc_admission_total,
+            ),
+            (
+                "storage_rpc_admission_wait_total",
+                self.storage_rpc_admission_wait_total,
+            ),
+            (
+                "storage_rpc_admission_wait_us_total",
+                self.storage_rpc_admission_wait_us_total,
+            ),
+            (
+                "storage_rpc_admission_timeout_total",
+                self.storage_rpc_admission_timeout_total,
+            ),
+            ("storage_rpc_active_total", self.storage_rpc_active_total),
+            (
+                "storage_rpc_active_control",
+                self.storage_rpc_active_control,
+            ),
+            (
+                "storage_rpc_active_completion",
+                self.storage_rpc_active_completion,
+            ),
+            (
+                "storage_rpc_active_progress",
+                self.storage_rpc_active_progress,
+            ),
+            (
+                "storage_rpc_active_start_write",
+                self.storage_rpc_active_start_write,
+            ),
+            ("storage_rpc_active_read", self.storage_rpc_active_read),
+            ("storage_rpc_active_list", self.storage_rpc_active_list),
+            (
+                "storage_rpc_pending_envelope_active",
+                self.storage_rpc_pending_envelope_active,
+            ),
+            (
+                "storage_rpc_pending_envelope_started_total",
+                self.storage_rpc_pending_envelope_started_total,
+            ),
+            (
+                "storage_rpc_pending_envelope_completed_total",
+                self.storage_rpc_pending_envelope_completed_total,
+            ),
+            (
+                "storage_rpc_pending_envelope_long_running_total",
+                self.storage_rpc_pending_envelope_long_running_total,
+            ),
+            (
+                "storage_rpc_pending_envelope_long_running_us_max",
+                self.storage_rpc_pending_envelope_long_running_us_max,
+            ),
+            (
+                "storage_rpc_pending_envelope_oldest_active_us",
+                self.storage_rpc_pending_envelope_oldest_active_us,
+            ),
+            (
+                "storage_rpc_pending_envelope_oldest_active_node_id",
+                self.storage_rpc_pending_envelope_oldest_active_node_id,
+            ),
+            (
+                "storage_rpc_pending_envelope_oldest_active_request_id",
+                self.storage_rpc_pending_envelope_oldest_active_request_id,
+            ),
+            (
+                "bucket_lock_wait_exceeded_total",
+                self.bucket_lock_wait_exceeded_total,
+            ),
+            (
+                "shard_scavenger_observation_total",
+                self.shard_scavenger_observation_total,
+            ),
+            (
+                "shard_scavenger_scan_incomplete_total",
+                self.shard_scavenger_scan_incomplete_total,
+            ),
+            (
+                "metadata_command_conflict_total",
+                self.metadata_command_conflict_total,
+            ),
+            (
+                "metadata_command_pending_slot_action_total",
+                self.metadata_command_pending_slot_action_total,
+            ),
+            (
+                "metadata_command_session_wait_total",
+                self.metadata_command_session_wait_total,
+            ),
+            (
+                "metadata_command_recovery_leader_total",
+                self.metadata_command_recovery_leader_total,
+            ),
+            (
+                "metadata_command_recovery_wait_total",
+                self.metadata_command_recovery_wait_total,
+            ),
+            (
+                "metadata_command_recovery_wait_us_total",
+                self.metadata_command_recovery_wait_us_total,
+            ),
+            (
+                "metadata_command_recovery_wait_us_max",
+                self.metadata_command_recovery_wait_us_max,
+            ),
+            (
+                "metadata_command_recovery_timeout_total",
+                self.metadata_command_recovery_timeout_total,
+            ),
+            (
+                "metadata_command_recovery_outcome_total",
+                self.metadata_command_recovery_outcome_total,
+            ),
+            (
+                "metadata_command_budget_exhausted_total",
+                self.metadata_command_budget_exhausted_total,
+            ),
+            (
+                "metadata_command_backoff_total",
+                self.metadata_command_backoff_total,
+            ),
+            (
+                "metadata_command_backoff_us_total",
+                self.metadata_command_backoff_us_total,
+            ),
+            (
+                "metadata_command_backoff_us_max",
+                self.metadata_command_backoff_us_max,
+            ),
+            ("reclaim_work_queue_depth", self.reclaim_work_queue_depth),
+            (
+                "object_payload_reclaim_queue_depth",
+                self.object_payload_reclaim_queue_depth,
+            ),
+            (
+                "object_payload_reclaim_outstanding_depth",
+                self.object_payload_reclaim_outstanding_depth,
+            ),
+            (
+                "bucket_delete_begin_queue_depth",
+                self.bucket_delete_begin_queue_depth,
+            ),
+            (
+                "bucket_delete_finalize_queue_depth",
+                self.bucket_delete_finalize_queue_depth,
+            ),
+            (
+                "bucket_delete_finalize_outstanding_depth",
+                self.bucket_delete_finalize_outstanding_depth,
+            ),
+            (
+                "reclaim_work_queue_action_total",
+                self.reclaim_work_queue_action_total,
+            ),
+            (
+                "object_payload_reclaim_event_total",
+                self.object_payload_reclaim_event_total,
+            ),
+            (
+                "object_payload_reclaim_durable_scan_total",
+                self.object_payload_reclaim_durable_scan_total,
+            ),
+            ("shard_repair_queue_depth", self.shard_repair_queue_depth),
+            ("shard_repair_event_total", self.shard_repair_event_total),
+            (
+                "shard_repair_shards_rewritten_total",
+                self.shard_repair_shards_rewritten_total,
+            ),
+            (
+                "shard_backfill_queue_depth",
+                self.shard_backfill_queue_depth,
+            ),
+            (
+                "shard_backfill_event_total",
+                self.shard_backfill_event_total,
+            ),
+            (
+                "shard_backfill_shards_written_total",
+                self.shard_backfill_shards_written_total,
+            ),
+            (
+                "shard_backfill_candidate_scan_total",
+                self.shard_backfill_candidate_scan_total,
+            ),
+            (
+                "shard_backfill_candidate_scanned_total",
+                self.shard_backfill_candidate_scanned_total,
+            ),
+            (
+                "shard_backfill_candidate_current_epoch_total",
+                self.shard_backfill_candidate_current_epoch_total,
+            ),
+            (
+                "shard_backfill_candidate_already_queued_total",
+                self.shard_backfill_candidate_already_queued_total,
+            ),
+            (
+                "shard_backfill_candidate_already_complete_total",
+                self.shard_backfill_candidate_already_complete_total,
+            ),
+            (
+                "shard_backfill_candidate_enqueued_total",
+                self.shard_backfill_candidate_enqueued_total,
+            ),
+            (
+                "shard_backfill_candidate_unrecoverable_total",
+                self.shard_backfill_candidate_unrecoverable_total,
+            ),
+            (
+                "shard_backfill_candidate_deferred_total",
+                self.shard_backfill_candidate_deferred_total,
+            ),
+            (
+                "shard_backfill_candidate_failed_total",
+                self.shard_backfill_candidate_failed_total,
+            ),
+            (
+                "shard_backfill_candidate_limit_reached_total",
+                self.shard_backfill_candidate_limit_reached_total,
+            ),
+            (
+                "shard_backfill_candidate_scan_error_total",
+                self.shard_backfill_candidate_scan_error_total,
+            ),
+            (
+                "metadata_command_checkpoint_record_scan_total",
+                self.metadata_command_checkpoint_record_scan_total,
+            ),
+            (
+                "metadata_command_checkpoint_record_scanned_total",
+                self.metadata_command_checkpoint_record_scanned_total,
+            ),
+            (
+                "metadata_command_checkpoint_record_recorded_total",
+                self.metadata_command_checkpoint_record_recorded_total,
+            ),
+            (
+                "metadata_command_checkpoint_record_already_current_total",
+                self.metadata_command_checkpoint_record_already_current_total,
+            ),
+            (
+                "metadata_command_checkpoint_record_skipped_cadence_total",
+                self.metadata_command_checkpoint_record_skipped_cadence_total,
+            ),
+            (
+                "metadata_command_checkpoint_record_skipped_inactive_total",
+                self.metadata_command_checkpoint_record_skipped_inactive_total,
+            ),
+            (
+                "metadata_command_checkpoint_record_skipped_empty_total",
+                self.metadata_command_checkpoint_record_skipped_empty_total,
+            ),
+            (
+                "metadata_command_checkpoint_record_skipped_stale_epoch_total",
+                self.metadata_command_checkpoint_record_skipped_stale_epoch_total,
+            ),
+            (
+                "metadata_command_checkpoint_record_compacted_total",
+                self.metadata_command_checkpoint_record_compacted_total,
+            ),
+            (
+                "metadata_command_checkpoint_record_compaction_deleted_entries_total",
+                self.metadata_command_checkpoint_record_compaction_deleted_entries_total,
+            ),
+            (
+                "metadata_command_checkpoint_record_compaction_noop_total",
+                self.metadata_command_checkpoint_record_compaction_noop_total,
+            ),
+            (
+                "metadata_command_checkpoint_record_compaction_no_checkpoint_total",
+                self.metadata_command_checkpoint_record_compaction_no_checkpoint_total,
+            ),
+            (
+                "metadata_command_checkpoint_record_compaction_pending_total",
+                self.metadata_command_checkpoint_record_compaction_pending_total,
+            ),
+            (
+                "metadata_command_checkpoint_record_compaction_failed_total",
+                self.metadata_command_checkpoint_record_compaction_failed_total,
+            ),
+            (
+                "metadata_command_checkpoint_record_failed_total",
+                self.metadata_command_checkpoint_record_failed_total,
+            ),
+            (
+                "metadata_command_checkpoint_record_limit_reached_total",
+                self.metadata_command_checkpoint_record_limit_reached_total,
+            ),
+            (
+                "metadata_command_checkpoint_record_scan_error_total",
+                self.metadata_command_checkpoint_record_scan_error_total,
+            ),
+            (
+                "background_work_admission_event_total",
+                self.background_work_admission_event_total,
+            ),
+            (
+                "background_work_active_total",
+                self.background_work_active_total,
+            ),
+            (
+                "background_work_finished_total",
+                self.background_work_finished_total,
+            ),
+            (
+                "background_work_elapsed_us_total",
+                self.background_work_elapsed_us_total,
+            ),
+            (
+                "stream_upload_active_sessions",
+                self.stream_upload_active_sessions,
+            ),
+            (
+                "stream_upload_session_created_total",
+                self.stream_upload_session_created_total,
+            ),
+            (
+                "stream_upload_session_aborted_total",
+                self.stream_upload_session_aborted_total,
+            ),
+            (
+                "stream_upload_session_finalized_total",
+                self.stream_upload_session_finalized_total,
+            ),
+            (
+                "stream_upload_body_started_total",
+                self.stream_upload_body_started_total,
+            ),
+            (
+                "stream_upload_body_read_complete_total",
+                self.stream_upload_body_read_complete_total,
+            ),
+            (
+                "stream_upload_segment_append_started_total",
+                self.stream_upload_segment_append_started_total,
+            ),
+            (
+                "stream_upload_segment_append_finished_total",
+                self.stream_upload_segment_append_finished_total,
+            ),
+            (
+                "stream_upload_segment_append_error_total",
+                self.stream_upload_segment_append_error_total,
+            ),
+            (
+                "stream_upload_finalize_error_total",
+                self.stream_upload_finalize_error_total,
+            ),
+        ]
+        .into_iter()
+    }
+}
+
 pub struct InflightRequestsGuard {
     active: bool,
 }
@@ -3619,6 +4001,41 @@ mod tests {
         assert!(ordinary.has_query());
         assert_eq!(ordinary.param_count(), 2);
         assert!(!ordinary.has_sigv4_params());
+    }
+
+    #[test]
+    fn metrics_snapshot_iter_named_binds_names_to_fields() {
+        let snapshot = MetricsSnapshot {
+            request_start_total: 11,
+            storage_rpc_error_total: 22,
+            bucket_lock_wait_exceeded_total: 33,
+            metadata_command_checkpoint_record_compaction_failed_total: 44,
+            stream_upload_finalize_error_total: 55,
+            ..MetricsSnapshot::default()
+        };
+        let entries: Vec<_> = snapshot.iter_named().collect();
+        let map: std::collections::HashMap<_, _> = entries.iter().copied().collect();
+
+        assert_eq!(
+            entries.len(),
+            map.len(),
+            "fixed metric names must be unique"
+        );
+        assert_eq!(map.get("request_start_total").copied(), Some(11));
+        assert_eq!(map.get("storage_rpc_error_total").copied(), Some(22));
+        assert_eq!(
+            map.get("bucket_lock_wait_exceeded_total").copied(),
+            Some(33)
+        );
+        assert_eq!(
+            map.get("metadata_command_checkpoint_record_compaction_failed_total")
+                .copied(),
+            Some(44)
+        );
+        assert_eq!(
+            map.get("stream_upload_finalize_error_total").copied(),
+            Some(55)
+        );
     }
 
     #[test]
