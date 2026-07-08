@@ -1179,7 +1179,8 @@ fn parse_control_plane_raft_auth_credentials(
         return Err("ARGMIN_CONTROL_PLANE_RAFT_AUTH_CREDENTIALS must not be empty".to_string());
     }
 
-    let mut by_node = HashMap::<u64, ConfiguredControlPlaneRaftAuthCredential>::new();
+    let mut entries = Vec::new();
+    let mut seen = HashSet::<(u64, String, u64)>::new();
     for raw in value.split(',') {
         let trimmed = raw.trim();
         if trimmed.is_empty() {
@@ -1236,16 +1237,20 @@ fn parse_control_plane_raft_auth_credentials(
             credential_version,
             secret: SecretConfigValue::new(secret.to_string()),
         };
-        if by_node.insert(node_id, entry).is_some() {
+        if !seen.insert((node_id, entry.credential_id.clone(), credential_version)) {
             return Err(format!(
-                "ARGMIN_CONTROL_PLANE_RAFT_AUTH_CREDENTIALS contains duplicate node id {node_id}"
+                "ARGMIN_CONTROL_PLANE_RAFT_AUTH_CREDENTIALS contains duplicate credential identity for node {node_id}"
             ));
         }
+        entries.push(entry);
     }
 
-    let mut entries: Vec<ConfiguredControlPlaneRaftAuthCredential> =
-        by_node.into_values().collect();
-    entries.sort_by_key(|entry| entry.node_id);
+    entries.sort_by(|left, right| {
+        left.node_id
+            .cmp(&right.node_id)
+            .then_with(|| left.credential_id.cmp(&right.credential_id))
+            .then_with(|| left.credential_version.cmp(&right.credential_version))
+    });
     Ok(entries)
 }
 
@@ -1516,7 +1521,7 @@ fn validate_control_plane_raft_auth_credentials_match_peer_policy(
         ));
     }
     if peer_sockets.is_empty() {
-        if credentials.len() != 1 {
+        if credential_nodes.len() != 1 {
             return Err(
                 "ARGMIN_CONTROL_PLANE_RAFT_AUTH_CREDENTIALS without ARGMIN_CONTROL_PLANE_RAFT_PEER_SOCKETS may only include the local node"
                     .to_string(),
@@ -2676,7 +2681,7 @@ mod tests {
             ),
             (
                 "ARGMIN_CONTROL_PLANE_RAFT_AUTH_CREDENTIALS",
-                "12=raft-peer:7:peer-12-secret,11=raft-peer:7:peer-11-secret",
+                "12=raft-peer:7:peer-12-secret,11=raft-peer:8:peer-11-new-secret,11=raft-peer:7:peer-11-secret",
             ),
         ]))
         .unwrap();
@@ -2691,6 +2696,12 @@ mod tests {
                     secret: SecretConfigValue::new("peer-11-secret".to_string()),
                 },
                 ConfiguredControlPlaneRaftAuthCredential {
+                    node_id: 11,
+                    credential_id: "raft-peer".to_string(),
+                    credential_version: 8,
+                    secret: SecretConfigValue::new("peer-11-new-secret".to_string()),
+                },
+                ConfiguredControlPlaneRaftAuthCredential {
                     node_id: 12,
                     credential_id: "raft-peer".to_string(),
                     credential_version: 7,
@@ -2700,6 +2711,7 @@ mod tests {
         );
         let debug = format!("{cfg:?}");
         assert!(!debug.contains("peer-11-secret"));
+        assert!(!debug.contains("peer-11-new-secret"));
         assert!(!debug.contains("peer-12-secret"));
         assert!(debug.contains("config_secret"));
     }
@@ -2905,6 +2917,29 @@ mod tests {
         ]))
         .unwrap_err();
         assert!(err.contains("credential version"));
+
+        let err = ServerConfig::from_lookup(make_env(&[
+            ("ARGMIN_PROCESS_ROLE", "control-plane"),
+            ("ARGMIN_CONTROL_PLANE_STATE_PATH", "/tmp/argmin-cp.state"),
+            ("ARGMIN_CONTROL_PLANE_SOCKET_PATH", "/tmp/argmin-cp.sock"),
+            ("ARGMIN_CONTROL_PLANE_EXPERIMENTAL_RAFT", "true"),
+            ("ARGMIN_CONTROL_PLANE_RAFT_CLUSTER_NAME", "raft-cluster-a"),
+            ("ARGMIN_CONTROL_PLANE_RAFT_NODE_ID", "11"),
+            (
+                "ARGMIN_CONTROL_PLANE_RAFT_PEER_SOCKET_PATH",
+                "/tmp/argmin-cp-raft-11.sock",
+            ),
+            (
+                "ARGMIN_CONTROL_PLANE_RAFT_PEER_SOCKETS",
+                "11=/tmp/argmin-cp-raft-11.sock,12=/tmp/argmin-cp-raft-12.sock",
+            ),
+            (
+                "ARGMIN_CONTROL_PLANE_RAFT_AUTH_CREDENTIALS",
+                "11=raft-peer:7:peer-11-secret,11=raft-peer:7:peer-11-replacement-secret,12=raft-peer:7:peer-12-secret",
+            ),
+        ]))
+        .unwrap_err();
+        assert!(err.contains("duplicate credential identity for node 11"));
     }
 
     #[test]

@@ -290,6 +290,11 @@ Status:
   `c03e0c85`, `2f4090ae`, `fa8a5fa4`, and `d08d5d25`. Storage-node,
   frontend, admin, and runtime-map response auth remain separate follow-on
   slices.
+- Raft peer process/env config now accepts overlapping credential identities for
+  a node as long as the credential id/version pair is unique. Peer verifiers
+  accept every configured overlapping credential, while the local Raft peer
+  signs outbound frames with the highest configured credential version for its
+  node so staged rotation works the same way as Unix control-plane auth.
 - 2026-07-08: Started Slice C frontend read enforcement at the reusable Unix
   control-plane boundary. The storage-layer verifier can now carry scoped
   frontend credentials, require authenticated runtime-map read envelopes when

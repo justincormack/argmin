@@ -1904,7 +1904,7 @@ fn build_experimental_raft_peer_auth_policy(
         return Ok(None);
     }
 
-    let mut local_credential = None;
+    let mut local_credential = None::<(u64, String, ControlPlaneScopedCredential)>;
     let mut credentials = Vec::new();
     for configured in &config.control_plane_raft_auth_credentials {
         let credential = ControlPlaneScopedCredential::new(ControlPlaneScopedCredentialInput {
@@ -1923,14 +1923,28 @@ fn build_experimental_raft_peer_auth_policy(
             )
         })?;
         if configured.node_id == local_node_id {
-            local_credential = Some(credential.clone());
+            let candidate = (
+                configured.credential_version,
+                configured.credential_id.clone(),
+                credential.clone(),
+            );
+            if local_credential
+                .as_ref()
+                .is_none_or(|current| (candidate.0, &candidate.1) > (current.0, &current.1))
+            {
+                local_credential = Some(candidate);
+            }
         }
         credentials.push(credential);
     }
 
-    let local_credential = local_credential.ok_or_else(|| {
-        format!("ARGMIN_CONTROL_PLANE_RAFT_AUTH_CREDENTIALS must include local Raft node id {local_node_id}")
-    })?;
+    let local_credential = local_credential
+        .map(|(_, _, credential)| credential)
+        .ok_or_else(|| {
+            format!(
+                "ARGMIN_CONTROL_PLANE_RAFT_AUTH_CREDENTIALS must include local Raft node id {local_node_id}"
+            )
+        })?;
     let verifier = ControlPlaneScopedCredentialStore::new(credentials).map_err(|error| {
         format!("invalid ARGMIN_CONTROL_PLANE_RAFT_AUTH_CREDENTIALS credential set: {error}")
     })?;
@@ -4426,7 +4440,7 @@ fn maybe_spawn_frontend_control_plane_refresh_loop(
 mod tests {
     use super::*;
     use auth::SecretKey;
-    use config::SecretConfigValue;
+    use config::{ConfiguredControlPlaneRaftAuthCredential, SecretConfigValue};
     use openraft::impls::Vote;
     use openraft::raft::{TransferLeaderRequest, VoteRequest};
     use storage::control_plane::{
@@ -6327,6 +6341,39 @@ mod tests {
         assert!(!diagnostics.contains("node-2-test-secret"));
         assert!(!diagnostics.contains("payload"));
         assert!(!diagnostics.contains("authenticator"));
+    }
+
+    #[test]
+    fn experimental_raft_peer_auth_policy_selects_latest_local_credential() {
+        let mut config = test_server_config();
+        config.control_plane_raft_auth_credentials = vec![
+            ConfiguredControlPlaneRaftAuthCredential {
+                node_id: 2,
+                credential_id: "raft-node-2".to_string(),
+                credential_version: 1,
+                secret: SecretConfigValue::new("node-2-old-test-secret".to_string()),
+            },
+            ConfiguredControlPlaneRaftAuthCredential {
+                node_id: 2,
+                credential_id: "raft-node-2".to_string(),
+                credential_version: 2,
+                secret: SecretConfigValue::new("node-2-new-test-secret".to_string()),
+            },
+            ConfiguredControlPlaneRaftAuthCredential {
+                node_id: 1,
+                credential_id: "raft-node-1".to_string(),
+                credential_version: 1,
+                secret: SecretConfigValue::new("node-1-test-secret".to_string()),
+            },
+        ];
+
+        let policy = build_experimental_raft_peer_auth_policy(&config, "auth-cluster", 2)
+            .expect("test Raft peer auth policy should build")
+            .expect("test Raft peer auth policy should be enabled");
+        let status = policy.status_snapshot();
+
+        assert_eq!(status.credential_id(), Some("raft-node-2"));
+        assert_eq!(status.credential_version(), Some(2));
     }
 
     #[test]
