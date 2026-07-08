@@ -370,6 +370,10 @@ Progress:
   overlapping credentials are present. Servers still accept every configured
   overlapping credential, but new outbound traffic moves forward to the staged
   active version without depending on env entry order.
+- Unix auth diagnostics now have regression coverage for overlapping
+  storage-node, frontend, and admin credentials. The exposed status includes
+  credential ids/versions and counts for each auth class while continuing to
+  redact all configured secret material and raw rejected payload bytes.
 
 ### Slice C: Frontend and Admin Control-Plane RPCs
 

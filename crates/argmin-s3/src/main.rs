@@ -6333,15 +6333,58 @@ mod tests {
     fn control_plane_unix_auth_diagnostics_are_redacted() {
         let verifier = ControlPlaneUnixAuthVerifier::new(
             "control-auth",
-            vec![ControlPlaneStorageNodeAuthCredential::new(
-                NodeId::new(7),
-                "storage-node-7",
-                3,
-                b"storage-node-7-test-secret".to_vec(),
-            )
-            .expect("test storage-node credential should build")],
+            vec![
+                ControlPlaneStorageNodeAuthCredential::new(
+                    NodeId::new(7),
+                    "storage-node-7",
+                    3,
+                    b"storage-node-7-test-secret".to_vec(),
+                )
+                .expect("test storage-node credential should build"),
+                ControlPlaneStorageNodeAuthCredential::new(
+                    NodeId::new(7),
+                    "storage-node-7",
+                    4,
+                    b"storage-node-7-new-test-secret".to_vec(),
+                )
+                .expect("test rotated storage-node credential should build"),
+            ],
         )
-        .expect("test Unix auth verifier should build");
+        .expect("test Unix auth verifier should build")
+        .with_frontend_credentials(vec![
+            ControlPlaneFrontendAuthCredential::new(
+                "frontend-1",
+                "frontend",
+                5,
+                b"frontend-1-test-secret".to_vec(),
+            )
+            .expect("test frontend credential should build"),
+            ControlPlaneFrontendAuthCredential::new(
+                "frontend-1",
+                "frontend",
+                6,
+                b"frontend-1-new-test-secret".to_vec(),
+            )
+            .expect("test rotated frontend credential should build"),
+        ])
+        .expect("test frontend credentials should install")
+        .with_admin_credentials(vec![
+            ControlPlaneAdminAuthCredential::new(
+                "admin-1",
+                "admin",
+                7,
+                b"admin-1-test-secret".to_vec(),
+            )
+            .expect("test admin credential should build"),
+            ControlPlaneAdminAuthCredential::new(
+                "admin-1",
+                "admin",
+                8,
+                b"admin-1-new-test-secret".to_vec(),
+            )
+            .expect("test rotated admin credential should build"),
+        ])
+        .expect("test admin credentials should install");
 
         let error = verifier
             .verify_storage_node_heartbeat_request_payload(b"not an auth envelope", 2_000)
@@ -6358,11 +6401,11 @@ mod tests {
             "{diagnostics}"
         );
         assert!(
-            diagnostics.contains("frontend_runtime_map_required=false"),
+            diagnostics.contains("frontend_runtime_map_required=true"),
             "{diagnostics}"
         );
         assert!(
-            diagnostics.contains("admin_control_plane_required=false"),
+            diagnostics.contains("admin_control_plane_required=true"),
             "{diagnostics}"
         );
         assert!(
@@ -6370,12 +6413,47 @@ mod tests {
             "{diagnostics}"
         );
         assert!(
-            diagnostics.contains("storage_node_credentials=1"),
+            diagnostics.contains("storage_node_credentials=2"),
+            "{diagnostics}"
+        );
+        assert!(
+            diagnostics.contains("frontend_credentials=2"),
+            "{diagnostics}"
+        );
+        assert!(diagnostics.contains("admin_credentials=2"), "{diagnostics}");
+        assert!(
+            diagnostics.contains(
+                "storage_node_credential{node_id=\"7\",credential_id=\"storage-node-7\",credential_version=\"3\"} 1"
+            ),
             "{diagnostics}"
         );
         assert!(
             diagnostics.contains(
-                "storage_node_credential{node_id=\"7\",credential_id=\"storage-node-7\",credential_version=\"3\"} 1"
+                "storage_node_credential{node_id=\"7\",credential_id=\"storage-node-7\",credential_version=\"4\"} 1"
+            ),
+            "{diagnostics}"
+        );
+        assert!(
+            diagnostics.contains(
+                "frontend_credential{instance_id=\"frontend-1\",credential_id=\"frontend\",credential_version=\"5\"} 1"
+            ),
+            "{diagnostics}"
+        );
+        assert!(
+            diagnostics.contains(
+                "frontend_credential{instance_id=\"frontend-1\",credential_id=\"frontend\",credential_version=\"6\"} 1"
+            ),
+            "{diagnostics}"
+        );
+        assert!(
+            diagnostics.contains(
+                "admin_credential{instance_id=\"admin-1\",credential_id=\"admin\",credential_version=\"7\"} 1"
+            ),
+            "{diagnostics}"
+        );
+        assert!(
+            diagnostics.contains(
+                "admin_credential{instance_id=\"admin-1\",credential_id=\"admin\",credential_version=\"8\"} 1"
             ),
             "{diagnostics}"
         );
@@ -6390,6 +6468,11 @@ mod tests {
             "{diagnostics}"
         );
         assert!(!diagnostics.contains("storage-node-7-test-secret"));
+        assert!(!diagnostics.contains("storage-node-7-new-test-secret"));
+        assert!(!diagnostics.contains("frontend-1-test-secret"));
+        assert!(!diagnostics.contains("frontend-1-new-test-secret"));
+        assert!(!diagnostics.contains("admin-1-test-secret"));
+        assert!(!diagnostics.contains("admin-1-new-test-secret"));
         assert!(!diagnostics.contains("payload"));
         assert!(!diagnostics.contains("authenticator"));
         assert!(!diagnostics.contains("not an auth envelope"));
