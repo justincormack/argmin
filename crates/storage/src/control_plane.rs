@@ -39,6 +39,7 @@ const CONTROL_PLANE_RPC_CHECK_APPLIED_BACKOFF: Duration = Duration::from_millis(
 const CONTROL_PLANE_RPC_CHECK_APPLIED_IO_TIMEOUT: Duration = Duration::from_secs(5);
 const CONTROL_PLANE_RPC_LIVENESS_IO_TIMEOUT: Duration = Duration::from_secs(5);
 const CONTROL_PLANE_RPC_LIVENESS_RETRY_BACKOFF: Duration = Duration::from_millis(100);
+const CONTROL_PLANE_RPC_READ_AUTH_REPLAY_WINDOW_MS: u64 = 5_000;
 const CONTROL_PLANE_RPC_HEARTBEAT_OBSERVATION_MIN_LEN: usize = 4 + 1 + 8 + 8 + 8 + 1;
 const CONTROL_PLANE_RPC_RUNTIME_NODE_MIN_LEN: usize = 4 + 8 + 4 + 1;
 const CONTROL_PLANE_RPC_PG_ROUTE_MIN_LEN: usize = 8 + 4 + 4 + 1 + 1 + 4 + 1;
@@ -4299,6 +4300,7 @@ pub struct AuthenticatedUnixControlPlaneClient {
 pub struct ControlPlaneUnixAuthVerifier {
     cluster_id: String,
     storage_node_credentials: BTreeMap<NodeId, ControlPlaneStorageNodeAuthCredential>,
+    frontend_credentials: BTreeMap<String, ControlPlaneFrontendAuthCredential>,
     metrics: Arc<ControlPlaneUnixAuthMetrics>,
 }
 
@@ -4314,6 +4316,25 @@ impl std::fmt::Debug for ControlPlaneStorageNodeAuthCredential {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ControlPlaneStorageNodeAuthCredential")
             .field("node_id", &self.node_id)
+            .field("credential_id", &self.credential_id)
+            .field("credential_version", &self.credential_version)
+            .field("secret", &"<redacted>")
+            .finish()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct ControlPlaneFrontendAuthCredential {
+    instance_id: String,
+    credential_id: String,
+    credential_version: u64,
+    secret: Vec<u8>,
+}
+
+impl std::fmt::Debug for ControlPlaneFrontendAuthCredential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ControlPlaneFrontendAuthCredential")
+            .field("instance_id", &self.instance_id)
             .field("credential_id", &self.credential_id)
             .field("credential_version", &self.credential_version)
             .field("secret", &"<redacted>")
@@ -4346,10 +4367,35 @@ impl ControlPlaneUnixAuthCredentialStatus {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ControlPlaneUnixFrontendAuthCredentialStatus {
+    instance_id: String,
+    credential_id: String,
+    credential_version: u64,
+}
+
+impl ControlPlaneUnixFrontendAuthCredentialStatus {
+    #[must_use]
+    pub fn instance_id(&self) -> &str {
+        &self.instance_id
+    }
+
+    #[must_use]
+    pub fn credential_id(&self) -> &str {
+        &self.credential_id
+    }
+
+    #[must_use]
+    pub fn credential_version(&self) -> u64 {
+        self.credential_version
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ControlPlaneUnixAuthStatusSnapshot {
     required: bool,
     cluster_id: String,
     storage_node_credentials: Vec<ControlPlaneUnixAuthCredentialStatus>,
+    frontend_credentials: Vec<ControlPlaneUnixFrontendAuthCredentialStatus>,
     metrics: ControlPlaneUnixAuthMetricsSnapshot,
 }
 
@@ -4367,6 +4413,11 @@ impl ControlPlaneUnixAuthStatusSnapshot {
     #[must_use]
     pub fn storage_node_credentials(&self) -> &[ControlPlaneUnixAuthCredentialStatus] {
         &self.storage_node_credentials
+    }
+
+    #[must_use]
+    pub fn frontend_credentials(&self) -> &[ControlPlaneUnixFrontendAuthCredentialStatus] {
+        &self.frontend_credentials
     }
 
     #[must_use]
@@ -5129,6 +5180,32 @@ impl AuthenticatedUnixControlPlaneClient {
     pub fn credential(&self) -> &ControlPlaneScopedCredential {
         &self.credential
     }
+
+    fn sign_read_only_request(
+        &self,
+        kind: ControlPlaneRpcKind,
+        authority_now_ms: u64,
+        payload: Vec<u8>,
+    ) -> Result<Vec<u8>, ControlPlaneError> {
+        let expires_at_ms = authority_now_ms
+            .checked_add(CONTROL_PLANE_RPC_READ_AUTH_REPLAY_WINDOW_MS)
+            .ok_or(ControlPlaneError::LeaseDeadlineOverflow)?;
+        let payload = write_authenticated_control_plane_rpc_payload(kind, &payload);
+        let envelope = self.credential.sign_envelope(
+            crate::control_plane_auth::ControlPlaneAuthSignInput {
+                target: ControlPlaneAuthTarget::Service(
+                    crate::control_plane_auth::ControlPlaneAuthService::ControlPlane,
+                ),
+                operation: kind.auth_operation(),
+                issued_at_ms: Some(authority_now_ms),
+                expires_at_ms: Some(expires_at_ms),
+                sequence: None,
+                nonce: Vec::new(),
+                payload,
+            },
+        )?;
+        envelope.encode_frame()
+    }
 }
 
 impl ControlPlaneStorageNodeAuthCredential {
@@ -5181,6 +5258,54 @@ impl ControlPlaneStorageNodeAuthCredential {
     }
 }
 
+impl ControlPlaneFrontendAuthCredential {
+    pub fn new(
+        instance_id: impl Into<String>,
+        credential_id: impl Into<String>,
+        credential_version: u64,
+        secret: Vec<u8>,
+    ) -> Result<Self, ControlPlaneError> {
+        let credential = Self {
+            instance_id: instance_id.into(),
+            credential_id: credential_id.into(),
+            credential_version,
+            secret,
+        };
+        credential.scoped_for_cluster("validation-cluster")?;
+        Ok(credential)
+    }
+
+    #[must_use]
+    pub fn instance_id(&self) -> &str {
+        &self.instance_id
+    }
+
+    #[must_use]
+    pub fn credential_id(&self) -> &str {
+        &self.credential_id
+    }
+
+    #[must_use]
+    pub fn credential_version(&self) -> u64 {
+        self.credential_version
+    }
+
+    pub fn scoped_for_cluster(
+        &self,
+        cluster_id: &str,
+    ) -> Result<ControlPlaneScopedCredential, ControlPlaneError> {
+        ControlPlaneScopedCredential::new(ControlPlaneScopedCredentialInput {
+            cluster_id: cluster_id.to_owned(),
+            credential_id: self.credential_id.clone(),
+            credential_version: self.credential_version,
+            principal: ControlPlaneAuthPrincipal::Frontend {
+                instance_id: self.instance_id.clone(),
+            },
+            secret: self.secret.clone(),
+        })
+    }
+}
+
 impl ControlPlaneUnixAuthVerifier {
     pub fn new(
         cluster_id: impl Into<String>,
@@ -5209,8 +5334,29 @@ impl ControlPlaneUnixAuthVerifier {
         Ok(Self {
             cluster_id,
             storage_node_credentials: by_node,
+            frontend_credentials: BTreeMap::new(),
             metrics: Arc::new(ControlPlaneUnixAuthMetrics::default()),
         })
+    }
+
+    pub fn with_frontend_credentials(
+        mut self,
+        frontend_credentials: Vec<ControlPlaneFrontendAuthCredential>,
+    ) -> Result<Self, ControlPlaneError> {
+        let mut by_instance = BTreeMap::new();
+        for credential in frontend_credentials {
+            if by_instance
+                .insert(credential.instance_id().to_owned(), credential)
+                .is_some()
+            {
+                return Err(ControlPlaneError::RpcProtocol {
+                    message: "control-plane frontend auth credential repeats instance id"
+                        .to_owned(),
+                });
+            }
+        }
+        self.frontend_credentials = by_instance;
+        Ok(self)
     }
 
     #[must_use]
@@ -5237,7 +5383,139 @@ impl ControlPlaneUnixAuthVerifier {
                     credential_version: credential.credential_version(),
                 })
                 .collect(),
+            frontend_credentials: self
+                .frontend_credentials
+                .values()
+                .map(|credential| ControlPlaneUnixFrontendAuthCredentialStatus {
+                    instance_id: credential.instance_id().to_owned(),
+                    credential_id: credential.credential_id().to_owned(),
+                    credential_version: credential.credential_version(),
+                })
+                .collect(),
             metrics: self.metrics.snapshot(),
+        }
+    }
+
+    #[must_use]
+    pub fn requires_frontend_runtime_map_auth(&self) -> bool {
+        !self.frontend_credentials.is_empty()
+    }
+
+    fn verify_frontend_runtime_map_read_payload(
+        &self,
+        expected_kind: ControlPlaneRpcKind,
+        payload: &[u8],
+        authority_now_ms: u64,
+    ) -> Result<Vec<u8>, ControlPlaneError> {
+        let operation = ControlPlaneAuthOperation::FrontendRuntimeMapRead;
+        let envelope = match ControlPlaneAuthEnvelope::decode_frame(
+            payload,
+            CONTROL_PLANE_RPC_MAX_PAYLOAD_LEN,
+        ) {
+            Ok(envelope) => envelope,
+            Err(error) => {
+                let reason = if control_plane_auth_payload_has_magic(payload) {
+                    ControlPlaneAuthRejectionReason::Malformed
+                } else {
+                    ControlPlaneAuthRejectionReason::Missing
+                };
+                self.metrics.record_rejected(operation, reason);
+                return Err(error);
+            }
+        };
+        if let Err(error) = validate_control_plane_unix_read_auth_freshness(
+            &envelope,
+            authority_now_ms,
+            "frontend runtime-map read",
+        ) {
+            self.metrics.record_rejected(
+                operation,
+                ControlPlaneAuthRejectionReason::ReplayFreshnessFailure,
+            );
+            return Err(error);
+        }
+        let expected_source = match envelope.header().source() {
+            ControlPlaneAuthPrincipal::Frontend { instance_id } => {
+                ControlPlaneAuthPrincipal::Frontend {
+                    instance_id: instance_id.clone(),
+                }
+            }
+            _ => {
+                self.metrics
+                    .record_rejected(operation, ControlPlaneAuthRejectionReason::WrongRole);
+                return Err(ControlPlaneError::RpcProtocol {
+                    message:
+                        "control-plane frontend runtime-map read auth source is not a frontend"
+                            .to_owned(),
+                });
+            }
+        };
+        let ControlPlaneAuthPrincipal::Frontend { instance_id } = &expected_source else {
+            unreachable!("frontend source constructed above");
+        };
+        let Some(frontend_credential) = self.frontend_credentials.get(instance_id) else {
+            self.metrics.record_rejected(
+                operation,
+                ControlPlaneAuthRejectionReason::UnknownCredential,
+            );
+            return Err(ControlPlaneError::RpcProtocol {
+                message: format!(
+                    "control-plane frontend runtime-map read auth has no credential for instance {instance_id}"
+                ),
+            });
+        };
+        let credential = match frontend_credential.scoped_for_cluster(&self.cluster_id) {
+            Ok(credential) => credential,
+            Err(error) => {
+                self.metrics
+                    .record_rejected(operation, ControlPlaneAuthRejectionReason::Malformed);
+                return Err(error);
+            }
+        };
+        let verifier = match ControlPlaneScopedCredentialStore::new(vec![credential]) {
+            Ok(verifier) => verifier,
+            Err(error) => {
+                self.metrics
+                    .record_rejected(operation, ControlPlaneAuthRejectionReason::Malformed);
+                return Err(error);
+            }
+        };
+        let expected_target = ControlPlaneAuthTarget::Service(
+            crate::control_plane_auth::ControlPlaneAuthService::ControlPlane,
+        );
+        match verifier.verify_envelope(
+            crate::control_plane_auth::ControlPlaneAuthVerificationInput {
+                envelope: &envelope,
+                expected_cluster_id: &self.cluster_id,
+                expected_source: &expected_source,
+                expected_target: &expected_target,
+                expected_operation: operation,
+                now_ms: Some(authority_now_ms),
+            },
+        ) {
+            ControlPlaneAuthDecision::Accepted { .. } => {
+                let payload = match read_authenticated_control_plane_rpc_payload(
+                    expected_kind,
+                    envelope.payload(),
+                ) {
+                    Ok(payload) => payload,
+                    Err(error) => {
+                        self.metrics
+                            .record_rejected(operation, ControlPlaneAuthRejectionReason::WrongRole);
+                        return Err(error);
+                    }
+                };
+                self.metrics.record_accepted(operation);
+                Ok(payload)
+            }
+            ControlPlaneAuthDecision::Rejected { reason } => {
+                self.metrics.record_rejected(operation, reason);
+                Err(ControlPlaneError::RpcProtocol {
+                    message: format!(
+                        "control-plane frontend runtime-map read auth rejected: {reason:?}"
+                    ),
+                })
+            }
         }
     }
 
@@ -5412,6 +5690,88 @@ fn validate_storage_node_heartbeat_auth_freshness(
     Ok(())
 }
 
+fn validate_control_plane_unix_read_auth_freshness(
+    envelope: &ControlPlaneAuthEnvelope,
+    authority_now_ms: u64,
+    operation_name: &'static str,
+) -> Result<(), ControlPlaneError> {
+    let issued_at_ms =
+        envelope
+            .header()
+            .issued_at_ms()
+            .ok_or_else(|| ControlPlaneError::RpcProtocol {
+                message: format!("control-plane {operation_name} auth missing issued_at_ms"),
+            })?;
+    let expires_at_ms =
+        envelope
+            .header()
+            .expires_at_ms()
+            .ok_or_else(|| ControlPlaneError::RpcProtocol {
+                message: format!("control-plane {operation_name} auth missing expires_at_ms"),
+            })?;
+    let replay_window_ms =
+        expires_at_ms
+            .checked_sub(issued_at_ms)
+            .ok_or_else(|| ControlPlaneError::RpcProtocol {
+                message: format!("control-plane {operation_name} auth expiry precedes issue time"),
+            })?;
+    if replay_window_ms == 0 {
+        return Err(ControlPlaneError::RpcProtocol {
+            message: format!("control-plane {operation_name} auth expiry is empty"),
+        });
+    }
+    if replay_window_ms > CONTROL_PLANE_RPC_READ_AUTH_REPLAY_WINDOW_MS {
+        return Err(ControlPlaneError::RpcProtocol {
+            message: format!(
+                "control-plane {operation_name} auth replay window {replay_window_ms}ms exceeds maximum {CONTROL_PLANE_RPC_READ_AUTH_REPLAY_WINDOW_MS}ms"
+            ),
+        });
+    }
+    if issued_at_ms > authority_now_ms {
+        return Err(ControlPlaneError::RpcProtocol {
+            message: format!("control-plane {operation_name} auth issue time is in the future"),
+        });
+    }
+    if expires_at_ms <= authority_now_ms {
+        return Err(ControlPlaneError::RpcProtocol {
+            message: format!("control-plane {operation_name} auth has expired"),
+        });
+    }
+    Ok(())
+}
+
+fn write_authenticated_control_plane_rpc_payload(
+    kind: ControlPlaneRpcKind,
+    payload: &[u8],
+) -> Vec<u8> {
+    let mut authenticated_payload = Vec::with_capacity(2 + payload.len());
+    write_u16(&mut authenticated_payload, kind.as_u16());
+    authenticated_payload.extend_from_slice(payload);
+    authenticated_payload
+}
+
+fn read_authenticated_control_plane_rpc_payload(
+    expected_kind: ControlPlaneRpcKind,
+    payload: &[u8],
+) -> Result<Vec<u8>, ControlPlaneError> {
+    if payload.len() < 2 {
+        return Err(ControlPlaneError::RpcProtocol {
+            message: "control-plane authenticated RPC payload missing kind".to_owned(),
+        });
+    }
+    let raw_kind = u16::from_be_bytes([payload[0], payload[1]]);
+    let actual_kind = ControlPlaneRpcKind::from_u16(raw_kind)?;
+    if actual_kind != expected_kind {
+        return Err(ControlPlaneError::RpcProtocol {
+            message: format!(
+                "control-plane authenticated RPC kind {:?} did not match outer kind {:?}",
+                actual_kind, expected_kind
+            ),
+        });
+    }
+    Ok(payload[2..].to_vec())
+}
+
 impl ControlPlaneRuntimeMapSource for UnixControlPlaneClient {
     fn runtime_map_snapshot(
         &self,
@@ -5433,6 +5793,71 @@ impl ControlPlaneRuntimeMapSource for UnixControlPlaneClient {
         authority_now_ms: u64,
     ) -> Result<ClusterRuntimeMapSnapshot, ControlPlaneError> {
         UnixControlPlaneClient::pg_runtime_map_snapshot(self, pg_id, authority_now_ms)
+    }
+}
+
+impl ControlPlaneRuntimeMapSource for AuthenticatedUnixControlPlaneClient {
+    fn runtime_map_snapshot(
+        &self,
+        authority_now_ms: u64,
+    ) -> Result<ClusterRuntimeMapSnapshot, ControlPlaneError> {
+        let payload = self.sign_read_only_request(
+            ControlPlaneRpcKind::RuntimeMapSnapshot,
+            authority_now_ms,
+            Vec::new(),
+        )?;
+        let payload = self.inner.send_read_only_request_with_read_timeout(
+            ControlPlaneRpcKind::RuntimeMapSnapshot,
+            &payload,
+            CONTROL_PLANE_RPC_CHECK_APPLIED_IO_TIMEOUT,
+        )?;
+        let mut reader = PayloadReader::new(&payload);
+        let runtime_map = read_runtime_map_snapshot(&mut reader)?;
+        reader.finish()?;
+        Ok(runtime_map)
+    }
+
+    fn runtime_map_status(
+        &self,
+        authority_now_ms: u64,
+    ) -> Result<ControlPlaneRuntimeMapStatus, ControlPlaneError> {
+        let payload = self.sign_read_only_request(
+            ControlPlaneRpcKind::RuntimeMapStatus,
+            authority_now_ms,
+            Vec::new(),
+        )?;
+        let payload = self.inner.send_read_only_request_with_read_timeout(
+            ControlPlaneRpcKind::RuntimeMapStatus,
+            &payload,
+            CONTROL_PLANE_RPC_IO_TIMEOUT,
+        )?;
+        let mut reader = PayloadReader::new(&payload);
+        let status = read_runtime_map_status(&mut reader)?;
+        reader.finish()?;
+        Ok(status)
+    }
+
+    fn pg_runtime_map_snapshot(
+        &self,
+        pg_id: PgId,
+        authority_now_ms: u64,
+    ) -> Result<ClusterRuntimeMapSnapshot, ControlPlaneError> {
+        let mut payload = Vec::new();
+        write_pg_id_request(&mut payload, pg_id);
+        let payload = self.sign_read_only_request(
+            ControlPlaneRpcKind::PgRuntimeMapSnapshot,
+            authority_now_ms,
+            payload,
+        )?;
+        let payload = self.inner.send_read_only_request_with_read_timeout(
+            ControlPlaneRpcKind::PgRuntimeMapSnapshot,
+            &payload,
+            CONTROL_PLANE_RPC_IO_TIMEOUT,
+        )?;
+        let mut reader = PayloadReader::new(&payload);
+        let runtime_map = read_runtime_map_snapshot(&mut reader)?;
+        reader.finish()?;
+        Ok(runtime_map)
     }
 }
 
@@ -5655,6 +6080,16 @@ where
     let ControlPlaneRpcRequest { kind, payload } = request;
     let response = match kind {
         ControlPlaneRpcKind::RuntimeMapSnapshot => {
+            let payload = match auth_verifier {
+                Some(auth_verifier) if auth_verifier.requires_frontend_runtime_map_auth() => {
+                    auth_verifier.verify_frontend_runtime_map_read_payload(
+                        kind,
+                        &payload,
+                        authority_now_ms,
+                    )?
+                }
+                _ => payload,
+            };
             let reader = PayloadReader::new(&payload);
             reader.finish()?;
             match control_plane.runtime_map_snapshot(authority_now_ms) {
@@ -5667,6 +6102,16 @@ where
             }
         }
         ControlPlaneRpcKind::RuntimeMapStatus => {
+            let payload = match auth_verifier {
+                Some(auth_verifier) if auth_verifier.requires_frontend_runtime_map_auth() => {
+                    auth_verifier.verify_frontend_runtime_map_read_payload(
+                        kind,
+                        &payload,
+                        authority_now_ms,
+                    )?
+                }
+                _ => payload,
+            };
             let reader = PayloadReader::new(&payload);
             reader.finish()?;
             match control_plane.runtime_map_status(authority_now_ms) {
@@ -5679,6 +6124,16 @@ where
             }
         }
         ControlPlaneRpcKind::PgRuntimeMapSnapshot => {
+            let payload = match auth_verifier {
+                Some(auth_verifier) if auth_verifier.requires_frontend_runtime_map_auth() => {
+                    auth_verifier.verify_frontend_runtime_map_read_payload(
+                        kind,
+                        &payload,
+                        authority_now_ms,
+                    )?
+                }
+                _ => payload,
+            };
             let mut reader = PayloadReader::new(&payload);
             let pg_id = read_pg_id_request(&mut reader)?;
             reader.finish()?;
@@ -5877,6 +6332,10 @@ enum ControlPlaneRpcKind {
 }
 
 impl ControlPlaneRpcKind {
+    fn as_u16(self) -> u16 {
+        self as u16
+    }
+
     fn from_u16(value: u16) -> Result<Self, ControlPlaneError> {
         match value {
             1 => Ok(Self::RuntimeMapSnapshot),
@@ -9927,12 +10386,64 @@ mod tests {
         .expect("test storage-node node-scoped auth credential should build")
     }
 
+    fn frontend_auth_config_credential(instance_id: &str) -> ControlPlaneFrontendAuthCredential {
+        ControlPlaneFrontendAuthCredential::new(
+            instance_id,
+            format!("{instance_id}-credential"),
+            1,
+            format!("{instance_id}-secret").into_bytes(),
+        )
+        .expect("test frontend auth credential should build")
+    }
+
+    fn frontend_auth_credential(
+        cluster_id: &str,
+        instance_id: &str,
+    ) -> ControlPlaneScopedCredential {
+        frontend_auth_config_credential(instance_id)
+            .scoped_for_cluster(cluster_id)
+            .expect("test frontend scoped credential should build")
+    }
+
     fn storage_node_auth_verifier(
         cluster_id: &str,
         credentials: Vec<ControlPlaneStorageNodeAuthCredential>,
     ) -> ControlPlaneUnixAuthVerifier {
         ControlPlaneUnixAuthVerifier::new(cluster_id, credentials)
             .expect("test storage-node auth verifier should build")
+    }
+
+    fn frontend_auth_verifier(cluster_id: &str, instance_id: &str) -> ControlPlaneUnixAuthVerifier {
+        storage_node_auth_verifier(cluster_id, vec![storage_node_auth_node_credential(1)])
+            .with_frontend_credentials(vec![frontend_auth_config_credential(instance_id)])
+            .expect("test frontend auth verifier should build")
+    }
+
+    fn signed_frontend_runtime_map_request(
+        kind: ControlPlaneRpcKind,
+        signer: &ControlPlaneScopedCredential,
+        payload: Vec<u8>,
+        issued_at_ms: Option<u64>,
+        expires_at_ms: Option<u64>,
+    ) -> ControlPlaneRpcRequest {
+        let payload = write_authenticated_control_plane_rpc_payload(kind, &payload);
+        let envelope = signer
+            .sign_envelope(crate::control_plane_auth::ControlPlaneAuthSignInput {
+                target: ControlPlaneAuthTarget::Service(
+                    crate::control_plane_auth::ControlPlaneAuthService::ControlPlane,
+                ),
+                operation: ControlPlaneAuthOperation::FrontendRuntimeMapRead,
+                issued_at_ms,
+                expires_at_ms,
+                sequence: None,
+                nonce: Vec::new(),
+                payload,
+            })
+            .expect("test frontend runtime-map read envelope should sign");
+        ControlPlaneRpcRequest {
+            kind,
+            payload: envelope.encode_frame().unwrap(),
+        }
     }
 
     fn signed_storage_node_heartbeat_request(
@@ -11498,6 +12009,178 @@ mod tests {
         assert_eq!(
             refresh.runtime_map().nodes()[0].cluster_map_history_floor_epoch(),
             Some(heartbeat_epoch)
+        );
+    }
+
+    #[test]
+    fn authenticated_unix_control_plane_client_reads_runtime_map_as_frontend() {
+        let tmp = test_util::tempdir();
+        let socket_path = tmp.path().join("control-plane.sock");
+        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+        authority
+            .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
+            .unwrap();
+        let verifier = frontend_auth_verifier("auth-cluster", "frontend-1");
+        let verifier_for_assert = verifier.clone();
+        let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _addr) = listener.accept().unwrap();
+            handle_control_plane_unix_stream_with_auth(
+                &mut authority,
+                &mut stream,
+                2_000,
+                &verifier,
+            )
+            .unwrap();
+        });
+
+        let client = AuthenticatedUnixControlPlaneClient::new(
+            UnixControlPlaneClient::new(&socket_path),
+            frontend_auth_credential("auth-cluster", "frontend-1"),
+        );
+        let runtime_map = client.runtime_map_snapshot(1_999).unwrap();
+
+        server.join().unwrap();
+        assert!(runtime_map.cluster_epoch().get() >= 1);
+        let metrics = verifier_for_assert.metrics_snapshot();
+        assert_eq!(metrics.accepted_total(), 1);
+        assert_eq!(
+            metrics.accepted_for_operation(ControlPlaneAuthOperation::FrontendRuntimeMapRead),
+            1
+        );
+        assert_eq!(metrics.rejected_total(), 0);
+    }
+
+    #[test]
+    fn authenticated_control_plane_rejects_missing_frontend_runtime_map_auth() {
+        let tmp = test_util::tempdir();
+        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+        authority
+            .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
+            .unwrap();
+        let before = authority.snapshot().clone();
+        let verifier = frontend_auth_verifier("auth-cluster", "frontend-1");
+        let request = ControlPlaneRpcRequest {
+            kind: ControlPlaneRpcKind::RuntimeMapSnapshot,
+            payload: Vec::new(),
+        };
+
+        let error = build_control_plane_unix_response_with_auth(
+            &mut authority,
+            request,
+            2_000,
+            Some(&verifier),
+        )
+        .unwrap_err();
+
+        assert!(
+            matches!(error, ControlPlaneError::RpcProtocol { .. }),
+            "unexpected error: {error}"
+        );
+        assert_eq!(authority.snapshot(), &before);
+        let metrics = verifier.metrics_snapshot();
+        assert_eq!(metrics.accepted_total(), 0);
+        assert_eq!(metrics.rejected_total(), 1);
+        assert_eq!(
+            metrics.rejected_for_operation(ControlPlaneAuthOperation::FrontendRuntimeMapRead),
+            1
+        );
+        assert_eq!(
+            metrics.rejected_for_reason(ControlPlaneAuthRejectionReason::Missing),
+            1
+        );
+    }
+
+    #[test]
+    fn authenticated_control_plane_rejects_storage_credential_for_frontend_runtime_map_read() {
+        let tmp = test_util::tempdir();
+        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+        authority
+            .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
+            .unwrap();
+        let before = authority.snapshot().clone();
+        let verifier = frontend_auth_verifier("auth-cluster", "frontend-1");
+        let signer = storage_node_auth_credential("auth-cluster", 1, 42);
+        let request = signed_frontend_runtime_map_request(
+            ControlPlaneRpcKind::RuntimeMapSnapshot,
+            &signer,
+            Vec::new(),
+            Some(1_999),
+            Some(2_999),
+        );
+
+        let error = build_control_plane_unix_response_with_auth(
+            &mut authority,
+            request,
+            2_000,
+            Some(&verifier),
+        )
+        .unwrap_err();
+
+        assert!(
+            matches!(error, ControlPlaneError::RpcProtocol { ref message } if message.contains("source is not a frontend")),
+            "unexpected error: {error}"
+        );
+        assert_eq!(authority.snapshot(), &before);
+        let metrics = verifier.metrics_snapshot();
+        assert_eq!(metrics.accepted_total(), 0);
+        assert_eq!(metrics.rejected_total(), 1);
+        assert_eq!(
+            metrics.rejected_for_operation(ControlPlaneAuthOperation::FrontendRuntimeMapRead),
+            1
+        );
+        assert_eq!(
+            metrics.rejected_for_reason(ControlPlaneAuthRejectionReason::WrongRole),
+            1
+        );
+    }
+
+    #[test]
+    fn authenticated_control_plane_rejects_frontend_runtime_map_kind_replay() {
+        let tmp = test_util::tempdir();
+        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+        authority
+            .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
+            .unwrap();
+        let before = authority.snapshot().clone();
+        let verifier = frontend_auth_verifier("auth-cluster", "frontend-1");
+        let signer = frontend_auth_credential("auth-cluster", "frontend-1");
+        let mut request = signed_frontend_runtime_map_request(
+            ControlPlaneRpcKind::RuntimeMapSnapshot,
+            &signer,
+            Vec::new(),
+            Some(1_999),
+            Some(2_999),
+        );
+        request.kind = ControlPlaneRpcKind::RuntimeMapStatus;
+
+        let error = build_control_plane_unix_response_with_auth(
+            &mut authority,
+            request,
+            2_000,
+            Some(&verifier),
+        )
+        .unwrap_err();
+
+        assert!(
+            matches!(error, ControlPlaneError::RpcProtocol { ref message } if message.contains("did not match outer kind")),
+            "unexpected error: {error}"
+        );
+        assert_eq!(authority.snapshot(), &before);
+        let metrics = verifier.metrics_snapshot();
+        assert_eq!(metrics.accepted_total(), 0);
+        assert_eq!(metrics.rejected_total(), 1);
+        assert_eq!(
+            metrics.rejected_for_operation(ControlPlaneAuthOperation::FrontendRuntimeMapRead),
+            1
+        );
+        assert_eq!(
+            metrics.rejected_for_reason(ControlPlaneAuthRejectionReason::WrongRole),
+            1
         );
     }
 

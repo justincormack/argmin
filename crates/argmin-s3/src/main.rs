@@ -1982,10 +1982,11 @@ fn format_control_plane_unix_auth_diagnostics(verifier: &ControlPlaneUnixAuthVer
     let status = verifier.status_snapshot();
     let metrics = status.metrics();
     let mut diagnostics = format!(
-        "control_plane_unix_auth required={} cluster_id={} storage_node_credentials={} accepted_total={} rejected_total={}",
+        "control_plane_unix_auth required={} cluster_id={} storage_node_credentials={} frontend_credentials={} accepted_total={} rejected_total={}",
         status.required(),
         status.cluster_id(),
         status.storage_node_credentials().len(),
+        status.frontend_credentials().len(),
         metrics.accepted_total(),
         metrics.rejected_total()
     );
@@ -1995,6 +1996,17 @@ fn format_control_plane_unix_auth_diagnostics(verifier: &ControlPlaneUnixAuthVer
             &mut diagnostics,
             "control_plane_unix_auth storage_node_credential{{node_id=\"{}\",credential_id=\"{}\",credential_version=\"{}\"}} 1",
             credential.node_id().as_u32(),
+            credential.credential_id(),
+            credential.credential_version()
+        )
+        .expect("write to String should not fail");
+    }
+    for credential in status.frontend_credentials() {
+        diagnostics.push('\n');
+        write!(
+            &mut diagnostics,
+            "control_plane_unix_auth frontend_credential{{instance_id=\"{}\",credential_id=\"{}\",credential_version=\"{}\"}} 1",
+            credential.instance_id(),
             credential.credential_id(),
             credential.credential_version()
         )

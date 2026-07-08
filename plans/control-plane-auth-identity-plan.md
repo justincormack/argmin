@@ -290,6 +290,14 @@ Status:
   `c03e0c85`, `2f4090ae`, `fa8a5fa4`, and `d08d5d25`. Storage-node,
   frontend, admin, and runtime-map response auth remain separate follow-on
   slices.
+- 2026-07-08: Started Slice C frontend read enforcement at the reusable Unix
+  control-plane boundary. The storage-layer verifier can now carry scoped
+  frontend credentials, require authenticated runtime-map read envelopes when
+  any frontend credential is configured, enforce short issued/expires replay
+  windows, reject missing/wrong-role frontend reads before authority access,
+  and report frontend credentials through the redacted Unix auth diagnostics.
+  Process-level frontend credential configuration and admin mutation auth
+  remain follow-on Slice C work.
 
 ## Path-Specific Enforcement Order
 
@@ -364,6 +372,16 @@ Progress:
   operation mapping that future request-auth enforcement must use and forces
   new RPC kinds to choose their auth class instead of inheriting an implicit
   default.
+- Frontend runtime-map read auth is now implemented as an opt-in Unix
+  control-plane verifier mode. When frontend credentials are configured, plain
+  read requests fail closed as missing auth, signed reads must use a
+  `Frontend { instance_id }` principal with the `FrontendRuntimeMapRead`
+  operation, a concrete Unix RPC kind bound inside the signed payload, and a
+  bounded freshness window. Storage-node/admin credentials cannot be reused for
+  frontend reads, and a captured signed snapshot read cannot be replayed as a
+  status read within the freshness window. Existing unauthenticated runtime-map
+  reads remain accepted until process-level frontend credential configuration
+  enables this verifier mode.
 
 ### Slice D: Runtime-Map and Read Freshness Proof Consumers
 
