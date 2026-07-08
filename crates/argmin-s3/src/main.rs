@@ -1994,8 +1994,11 @@ fn format_control_plane_unix_auth_diagnostics(verifier: &ControlPlaneUnixAuthVer
     let status = verifier.status_snapshot();
     let metrics = status.metrics();
     let mut diagnostics = format!(
-        "control_plane_unix_auth required={} cluster_id={} storage_node_credentials={} frontend_credentials={} admin_credentials={} accepted_total={} rejected_total={}",
+        "control_plane_unix_auth required={} storage_node_heartbeat_required={} frontend_runtime_map_required={} admin_control_plane_required={} cluster_id={} storage_node_credentials={} frontend_credentials={} admin_credentials={} accepted_total={} rejected_total={}",
         status.required(),
+        status.storage_node_heartbeat_required(),
+        status.frontend_runtime_map_required(),
+        status.admin_control_plane_required(),
         status.cluster_id(),
         status.storage_node_credentials().len(),
         status.frontend_credentials().len(),
@@ -4598,6 +4601,10 @@ mod tests {
             .expect("frontend auth verifier should be enabled");
         let status = verifier.status_snapshot();
 
+        assert!(status.required());
+        assert!(!status.storage_node_heartbeat_required());
+        assert!(status.frontend_runtime_map_required());
+        assert!(!status.admin_control_plane_required());
         assert_eq!(status.storage_node_credentials().len(), 0);
         assert_eq!(status.frontend_credentials().len(), 1);
         assert_eq!(status.frontend_credentials()[0].instance_id(), "frontend-1");
@@ -4620,6 +4627,10 @@ mod tests {
             .expect("admin auth verifier should be enabled");
         let status = verifier.status_snapshot();
 
+        assert!(status.required());
+        assert!(!status.storage_node_heartbeat_required());
+        assert!(!status.frontend_runtime_map_required());
+        assert!(status.admin_control_plane_required());
         assert_eq!(status.storage_node_credentials().len(), 0);
         assert_eq!(status.frontend_credentials().len(), 0);
         assert_eq!(status.admin_credentials().len(), 1);
@@ -6259,6 +6270,18 @@ mod tests {
 
         let diagnostics = format_control_plane_unix_auth_diagnostics(&verifier);
         assert!(diagnostics.contains("required=true"), "{diagnostics}");
+        assert!(
+            diagnostics.contains("storage_node_heartbeat_required=true"),
+            "{diagnostics}"
+        );
+        assert!(
+            diagnostics.contains("frontend_runtime_map_required=false"),
+            "{diagnostics}"
+        );
+        assert!(
+            diagnostics.contains("admin_control_plane_required=false"),
+            "{diagnostics}"
+        );
         assert!(
             diagnostics.contains("cluster_id=control-auth"),
             "{diagnostics}"

@@ -353,6 +353,11 @@ Progress:
   configured. Enabling frontend runtime-map auth or admin command auth alone
   does not implicitly require storage-node heartbeat envelopes, so each
   internal control-plane credential class can be rolled out independently.
+- Unix control-plane auth status and process diagnostics now expose explicit
+  per-path requirement flags for storage-node heartbeat refreshes, frontend
+  runtime-map reads, and admin control-plane commands. This avoids treating the
+  presence of one credential class as evidence that every Unix control-plane
+  path is enforcing auth.
 
 ### Slice C: Frontend and Admin Control-Plane RPCs
 

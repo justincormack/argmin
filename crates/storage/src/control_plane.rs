@@ -4432,6 +4432,9 @@ impl ControlPlaneUnixAdminAuthCredentialStatus {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ControlPlaneUnixAuthStatusSnapshot {
     required: bool,
+    storage_node_heartbeat_required: bool,
+    frontend_runtime_map_required: bool,
+    admin_control_plane_required: bool,
     cluster_id: String,
     storage_node_credentials: Vec<ControlPlaneUnixAuthCredentialStatus>,
     frontend_credentials: Vec<ControlPlaneUnixFrontendAuthCredentialStatus>,
@@ -4443,6 +4446,21 @@ impl ControlPlaneUnixAuthStatusSnapshot {
     #[must_use]
     pub fn required(&self) -> bool {
         self.required
+    }
+
+    #[must_use]
+    pub fn storage_node_heartbeat_required(&self) -> bool {
+        self.storage_node_heartbeat_required
+    }
+
+    #[must_use]
+    pub fn frontend_runtime_map_required(&self) -> bool {
+        self.frontend_runtime_map_required
+    }
+
+    #[must_use]
+    pub fn admin_control_plane_required(&self) -> bool {
+        self.admin_control_plane_required
     }
 
     #[must_use]
@@ -5999,8 +6017,16 @@ impl ControlPlaneUnixAuthVerifier {
 
     #[must_use]
     pub fn status_snapshot(&self) -> ControlPlaneUnixAuthStatusSnapshot {
+        let storage_node_heartbeat_required = self.requires_storage_node_heartbeat_auth();
+        let frontend_runtime_map_required = self.requires_frontend_runtime_map_auth();
+        let admin_control_plane_required = self.requires_admin_control_plane_auth();
         ControlPlaneUnixAuthStatusSnapshot {
-            required: true,
+            required: storage_node_heartbeat_required
+                || frontend_runtime_map_required
+                || admin_control_plane_required,
+            storage_node_heartbeat_required,
+            frontend_runtime_map_required,
+            admin_control_plane_required,
             cluster_id: self.cluster_id.clone(),
             storage_node_credentials: self
                 .storage_node_credentials
