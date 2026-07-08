@@ -1041,7 +1041,7 @@ each is one refactor away from a panic:
 
 ### P6. Error-type islands and wrong-blame mappings
 
-- [ ] Stringly-typed errors in otherwise fully-typed crates:
+- [x] Stringly-typed errors in otherwise fully-typed crates:
   `AclGrants::parse -> Result<_, String>` was fixed with typed
   `AclGrantsParseError` variants that preserve line-aware diagnostics while
   existing storage/RPC callers keep their outer error mapping;
@@ -1057,8 +1057,8 @@ each is one refactor away from a panic:
   Result<(), &'static str>` was fixed with typed `PutLiveObjectValidationError`
   variants for the ETag/layout consistency matrix;
   `SseCustomerValidatorConfig::from_base64`/`ManagedWrappingKeyConfig::
-  from_base64 -> Result<_, String>` (`sse.rs:112, 147`). Remaining fix:
-  small typed error enums throughout.
+  from_base64 -> Result<_, String>` was fixed with typed config parse errors
+  while preserving the existing startup `Display` messages.
 - [ ] `parse_bucket_policy` doesn't enforce its own exported
   `MAX_BUCKET_POLICY_BYTES` (`bucket_policy.rs:8, 1169-1175`); only
   server-core enforces it, against the normalized output not the raw input

@@ -99,16 +99,27 @@ pub struct SseCustomerValidatorConfig {
     validator_key: [u8; 32],
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum SseCustomerValidatorConfigError {
+    #[error("invalid base64 in ARGMIN_SSE_C_VALIDATOR_KEY")]
+    InvalidBase64,
+    #[error("ARGMIN_SSE_C_VALIDATOR_KEY must decode to exactly 32 bytes")]
+    InvalidLength,
+}
+
 impl SseCustomerValidatorConfig {
-    pub fn from_base64(key_id: u32, encoded: &str) -> Result<Self, String> {
+    pub fn from_base64(
+        key_id: u32,
+        encoded: &str,
+    ) -> Result<Self, SseCustomerValidatorConfigError> {
         use base64::Engine;
 
         let decoded = base64::engine::general_purpose::STANDARD
             .decode(encoded)
-            .map_err(|_| "invalid base64 in ARGMIN_SSE_C_VALIDATOR_KEY".to_string())?;
-        let validator_key = decoded.try_into().map_err(|_| {
-            "ARGMIN_SSE_C_VALIDATOR_KEY must decode to exactly 32 bytes".to_string()
-        })?;
+            .map_err(|_| SseCustomerValidatorConfigError::InvalidBase64)?;
+        let validator_key = decoded
+            .try_into()
+            .map_err(|_| SseCustomerValidatorConfigError::InvalidLength)?;
         Ok(Self {
             key_id,
             validator_key,
@@ -134,16 +145,24 @@ pub struct ManagedWrappingKeyConfig {
     wrapping_key: [u8; 32],
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum ManagedWrappingKeyConfigError {
+    #[error("invalid base64 in managed wrapping key")]
+    InvalidBase64,
+    #[error("managed wrapping key must decode to exactly 32 bytes")]
+    InvalidLength,
+}
+
 impl ManagedWrappingKeyConfig {
-    pub fn from_base64(key_id: u32, encoded: &str) -> Result<Self, String> {
+    pub fn from_base64(key_id: u32, encoded: &str) -> Result<Self, ManagedWrappingKeyConfigError> {
         use base64::Engine;
 
         let decoded = base64::engine::general_purpose::STANDARD
             .decode(encoded)
-            .map_err(|_| "invalid base64 in managed wrapping key".to_string())?;
+            .map_err(|_| ManagedWrappingKeyConfigError::InvalidBase64)?;
         let wrapping_key = decoded
             .try_into()
-            .map_err(|_| "managed wrapping key must decode to exactly 32 bytes".to_string())?;
+            .map_err(|_| ManagedWrappingKeyConfigError::InvalidLength)?;
         Ok(Self {
             key_id,
             wrapping_key,
@@ -1047,6 +1066,26 @@ mod tests {
             key_id: 7,
             wrapping_key: [11u8; 32],
         })
+    }
+
+    #[test]
+    fn sse_config_from_base64_reports_typed_errors() {
+        assert_eq!(
+            SseCustomerValidatorConfig::from_base64(1, "not base64").unwrap_err(),
+            SseCustomerValidatorConfigError::InvalidBase64
+        );
+        assert_eq!(
+            SseCustomerValidatorConfig::from_base64(1, "AQID").unwrap_err(),
+            SseCustomerValidatorConfigError::InvalidLength
+        );
+        assert_eq!(
+            ManagedWrappingKeyConfig::from_base64(1, "not base64").unwrap_err(),
+            ManagedWrappingKeyConfigError::InvalidBase64
+        );
+        assert_eq!(
+            ManagedWrappingKeyConfig::from_base64(1, "AQID").unwrap_err(),
+            ManagedWrappingKeyConfigError::InvalidLength
+        );
     }
 
     #[test]
