@@ -868,6 +868,22 @@ impl AclGrant {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
 pub struct AclGrants(Vec<AclGrant>);
 
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum AclGrantsParseError {
+    #[error("missing ACL grant kind on line {line}")]
+    MissingKind { line: usize },
+    #[error("missing ACL grant value on line {line}")]
+    MissingValue { line: usize },
+    #[error("missing ACL grant permission on line {line}")]
+    MissingPermission { line: usize },
+    #[error("invalid canonical user id in ACL grant on line {line}")]
+    InvalidCanonicalUserId { line: usize },
+    #[error("invalid ACL grantee on line {line}")]
+    InvalidGrantee { line: usize },
+    #[error("invalid ACL permission in ACL grant on line {line}")]
+    InvalidPermission { line: usize },
+}
+
 impl AclGrants {
     #[must_use]
     pub fn new(mut grants: Vec<AclGrant>) -> Self {
@@ -928,39 +944,38 @@ impl AclGrants {
         out
     }
 
-    pub fn parse(serialized: &str) -> Result<Self, String> {
+    pub fn parse(serialized: &str) -> Result<Self, AclGrantsParseError> {
         if serialized.is_empty() {
             return Ok(Self::default());
         }
 
         let mut grants = Vec::new();
-        for (idx, line) in serialized.lines().enumerate() {
-            let mut parts = line.splitn(3, ':');
+        for (idx, raw_line) in serialized.lines().enumerate() {
+            let line = idx + 1;
+            let mut parts = raw_line.splitn(3, ':');
             let kind = parts
                 .next()
-                .ok_or_else(|| format!("missing ACL grant kind on line {}", idx + 1))?;
+                .ok_or(AclGrantsParseError::MissingKind { line })?;
             let value = parts
                 .next()
-                .ok_or_else(|| format!("missing ACL grant value on line {}", idx + 1))?;
+                .ok_or(AclGrantsParseError::MissingValue { line })?;
             let permission_raw = parts
                 .next()
-                .ok_or_else(|| format!("missing ACL grant permission on line {}", idx + 1))?;
+                .ok_or(AclGrantsParseError::MissingPermission { line })?;
 
             let grantee = match kind {
-                "cu" => {
-                    AclGrantee::CanonicalUser(CanonicalUserId::parse_stored(value).ok_or_else(
-                        || format!("invalid canonical user id in ACL grant on line {}", idx + 1),
-                    )?)
-                }
+                "cu" => AclGrantee::CanonicalUser(
+                    CanonicalUserId::parse_stored(value)
+                        .ok_or(AclGrantsParseError::InvalidCanonicalUserId { line })?,
+                ),
                 "group" if value == AclGrantee::ALL_USERS_TOKEN => AclGrantee::AllUsers,
                 "group" if value == AclGrantee::AUTHENTICATED_USERS_TOKEN => {
                     AclGrantee::AuthenticatedUsers
                 }
-                _ => return Err(format!("invalid ACL grantee on line {}", idx + 1)),
+                _ => return Err(AclGrantsParseError::InvalidGrantee { line }),
             };
-            let permission = AclPermission::parse(permission_raw).ok_or_else(|| {
-                format!("invalid ACL permission in ACL grant on line {}", idx + 1)
-            })?;
+            let permission = AclPermission::parse(permission_raw)
+                .ok_or(AclGrantsParseError::InvalidPermission { line })?;
             grants.push(AclGrant::new(grantee, permission));
         }
 
@@ -973,12 +988,13 @@ mod tests {
     use super::{
         aws_account_id_from_principal, bucket_location_constraint, is_legacy_create_bucket_region,
         is_valid_aws_account_id, parse_account_regional_bucket_name, requires_sigv4,
-        supports_legacy_sigv2, AccountIdentity, AclGrant, AclGrantee, AclGrants, AclPermission,
-        BucketNamespace, BucketObjectLockConfig, BucketVersioningState, CacheControl,
-        CanonicalUserId, ContentEncoding, ContentType, Expires, LegalHoldStatus,
-        ObjectLockDefaultRetention, ObjectLockMode, ObjectLockState, ObjectRetention,
-        RetentionPeriod, StoredLegalHoldStatus, VersionId, WebsiteRedirectLocation,
-        WebsiteRedirectLocationError, ANONYMOUS_UPLOAD_CANONICAL_USER_ID, CANONICAL_USER_ID_LEN,
+        supports_legacy_sigv2, AccountIdentity, AclGrant, AclGrantee, AclGrants,
+        AclGrantsParseError, AclPermission, BucketNamespace, BucketObjectLockConfig,
+        BucketVersioningState, CacheControl, CanonicalUserId, ContentEncoding, ContentType,
+        Expires, LegalHoldStatus, ObjectLockDefaultRetention, ObjectLockMode, ObjectLockState,
+        ObjectRetention, RetentionPeriod, StoredLegalHoldStatus, VersionId,
+        WebsiteRedirectLocation, WebsiteRedirectLocationError, ANONYMOUS_UPLOAD_CANONICAL_USER_ID,
+        CANONICAL_USER_ID_LEN,
     };
 
     #[test]
@@ -1400,6 +1416,34 @@ mod tests {
             .iter()
             .any(|grant| grant.grantee() == &AclGrantee::AuthenticatedUsers
                 && grant.permission() == AclPermission::ReadAcp));
+    }
+
+    #[test]
+    fn acl_grants_parse_reports_typed_errors() {
+        assert_eq!(
+            AclGrants::parse("group").unwrap_err(),
+            AclGrantsParseError::MissingValue { line: 1 }
+        );
+        assert_eq!(
+            AclGrants::parse("group:all_users").unwrap_err(),
+            AclGrantsParseError::MissingPermission { line: 1 }
+        );
+        assert_eq!(
+            AclGrants::parse("cu:not-a-canonical-id:READ").unwrap_err(),
+            AclGrantsParseError::InvalidCanonicalUserId { line: 1 }
+        );
+        assert_eq!(
+            AclGrants::parse("group:unknown:READ").unwrap_err(),
+            AclGrantsParseError::InvalidGrantee { line: 1 }
+        );
+        assert_eq!(
+            AclGrants::parse("group:all_users:BAD").unwrap_err(),
+            AclGrantsParseError::InvalidPermission { line: 1 }
+        );
+        assert_eq!(
+            AclGrants::parse("group:all_users:READ\ngroup:unknown:READ").unwrap_err(),
+            AclGrantsParseError::InvalidGrantee { line: 2 }
+        );
     }
 
     #[test]
