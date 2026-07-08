@@ -1018,14 +1018,15 @@ each is one refactor away from a panic:
   returns HTTP 200 with a per-object `NoSuchVersion` entry that echoes the raw
   token, so the local `DeleteObjects` path preserves invalid raw version IDs in
   `DeleteErrorVersionId` instead of reusing the top-level query parser error.
-- [ ] `BucketNamespace::as_header_value` had no parse counterpart —
+- [x] `BucketNamespace::as_header_value` had no parse counterpart —
   server-http matched `"global"`/`"account-regional"` literals
   (mod.rs:506-507 vs s3-types lib.rs:250-254). BucketNamespace is fixed:
   s3-types now implements `FromStr`, round-trips `as_header_value()`, and
   server-http delegates header parsing to the enum while preserving the
-  missing-header default. Remaining: `BucketVersioningState` has `from_u8` but
-  no `as_str`/`parse`; `"Enabled"`/`"Suspended"` are literals in
-  `xml.rs:1484-1485`. Add the missing halves.
+  missing-header default.
+- [ ] `BucketVersioningState` has `from_u8` but no `as_str`/`parse`;
+  `"Enabled"`/`"Suspended"` are literals in `xml.rs:1484-1485`. Add the
+  missing halves.
 - [x] auth helper triplication: `hex_encode` ×3 (`sigv4.rs:244`,
   `canonical.rs:442`, `request.rs:672`), `percent_decode` ×2
   (`canonical.rs:176`, `request.rs:642`), `hex_val` ×2 (`canonical.rs:194`,
