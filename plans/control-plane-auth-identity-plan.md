@@ -547,6 +547,17 @@ Minimum coverage before closing the shared-auth foundation:
   before command construction or state mutation;
 - status/debug tests proving auth failures are observable without secret leaks.
 
+Coverage audit as of 2026-07-08:
+
+| Boundary | Covered regression families | Remaining / deferred |
+| --- | --- | --- |
+| Canonical auth envelope | Principal/role round trips; malformed frames; unknown tags; payload-size limits before allocation; wrong cluster/source/target/role; unknown and stale credential versions; issued/expiry failures; tampered payloads; wrong secrets; duplicate scoped credentials; redacted debug output. | None for the shared symmetric envelope. A future asymmetric or mTLS credential backend must reuse the same source/target/operation/freshness tests. |
+| Raft peer RPC | Missing auth, malformed frames, wrong cluster/source/target/role, bad MAC/payload bitflip, stale/unknown credentials, transfer-leader freshness/replay bounds, response reverse identity, and no-dispatch/no-checkpoint process behavior before OpenRaft mutation. Redacted peer-auth diagnostics expose required mode, local principal, credential id/version, and counters. | Broader per-RPC replay caches remain deferred unless operational review requires protection beyond transfer-leader freshness and Raft's own term/log fences. |
+| Storage-node heartbeat refresh | Missing and malformed auth, wrong node/incarnation, wrong source, missing/overlong/expired freshness windows, overlapping credential rotation, authenticated signed responses, unsigned response rejection, and pre-mutation state unchanged on rejection. | Production rollout still needs secret distribution and a decision on when heartbeat auth is mandatory rather than opt-in by configured credentials. |
+| Frontend runtime-map reads | Missing auth, wrong-role storage credentials, RPC-kind replay between snapshot/status, overlapping credential rotation, per-attempt re-signing during read retries, authenticated response identity, wrong-target response rejection, signed error responses, and unsigned response rejection. | Admin confirmation reads intentionally do not borrow frontend credentials; a dedicated authenticated admin-read confirmation path remains future work if response-loss confirmation is reintroduced for signed admin clients. |
+| Admin control-plane commands | Missing auth, wrong-role frontend credentials, overlapping credential rotation, metadata-transfer admin command signing, Raft leadership/snapshot/election admin signing, authenticated response identity, signed error responses, unsigned response rejection, and receive-time response freshness. | Ambiguous committed admin mutations still require operation-specific confirmation predicates before adding automatic retry. |
+| Process/env configuration and diagnostics | Storage-node, frontend, admin, and Raft peer env parsers accept staged rotation by unique principal + credential id/version; local clients sign with the highest configured version; diagnostics expose counts and credential ids/versions without secrets, MACs, nonces, or payloads. | Production cutover must decide mandatory auth modes and external secret rotation/distribution mechanics. |
+
 ## Observability
 
 Expose counters and compact diagnostics for:
