@@ -304,6 +304,34 @@ pub(crate) use unix_admission::{
     UNIX_STORAGE_NODE_MIN_RPC_ADMISSION_LIMIT,
 };
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LocalUnixStorageNodeClientAdmissionSettings {
+    pub rpc_admission_limit: usize,
+    pub rpc_admission_wait_timeout: Duration,
+    pub rpc_control_admission_wait_timeout: Duration,
+}
+
+impl LocalUnixStorageNodeClientAdmissionSettings {
+    pub const DEFAULT: Self = Self {
+        rpc_admission_limit: UNIX_STORAGE_NODE_DEFAULT_RPC_ADMISSION_LIMIT,
+        rpc_admission_wait_timeout: UNIX_STORAGE_NODE_DEFAULT_RPC_ADMISSION_WAIT_TIMEOUT,
+        rpc_control_admission_wait_timeout:
+            UNIX_STORAGE_NODE_DEFAULT_RPC_CONTROL_ADMISSION_WAIT_TIMEOUT,
+    };
+
+    pub fn rpc_admission_limit(self) -> usize {
+        self.rpc_admission_limit
+    }
+
+    pub fn rpc_admission_wait_timeout(self) -> Duration {
+        self.rpc_admission_wait_timeout
+    }
+
+    pub fn rpc_control_admission_wait_timeout(self) -> Duration {
+        self.rpc_control_admission_wait_timeout
+    }
+}
+
 fn configure_storage_rpc_stream_timeout(
     stream: &UnixStream,
     context: &'static str,

@@ -18,11 +18,12 @@ use crate::metadata_command::{
 use crate::node::{ReclaimQueueInsert, OBJECT_PAYLOAD_RECLAIM_MAX_OUTSTANDING_PER_PG};
 use crate::node_client::{
     BucketMetadataNodeClient, BucketWriteReservationNodeClient, DirectPutMetadataNodeClient,
-    LocalStorageNodeClient, MetadataCommandNodeClient, ObjectGenerationMetadataNodeClient,
-    ObjectListingMetadataNodeClient, ObjectMutationMetadataNodeClient,
-    ObjectReadMetadataNodeClient, ObjectVersionMetadataNodeClient, PlacedShardNodeClient,
-    ShardAckNodeClient, ShardReadHandleNodeClient, ShardScavengerNodeClient, StorageNodeClient,
-    UnixStorageNodeClient, UNIX_STORAGE_NODE_DEFAULT_RPC_ADMISSION_LIMIT,
+    LocalStorageNodeClient, LocalUnixStorageNodeClientAdmissionSettings, MetadataCommandNodeClient,
+    ObjectGenerationMetadataNodeClient, ObjectListingMetadataNodeClient,
+    ObjectMutationMetadataNodeClient, ObjectReadMetadataNodeClient,
+    ObjectVersionMetadataNodeClient, PlacedShardNodeClient, ShardAckNodeClient,
+    ShardReadHandleNodeClient, ShardScavengerNodeClient, StorageNodeClient, UnixStorageNodeClient,
+    UNIX_STORAGE_NODE_DEFAULT_RPC_ADMISSION_LIMIT,
     UNIX_STORAGE_NODE_DEFAULT_RPC_ADMISSION_WAIT_TIMEOUT,
     UNIX_STORAGE_NODE_MIN_RPC_ADMISSION_LIMIT,
 };
@@ -100,13 +101,6 @@ pub struct LocalUnixStorageNodeClientConfig {
     rpc_control_admission_wait_timeout: Duration,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct LocalUnixStorageNodeClientAdmissionSettings {
-    rpc_admission_limit: usize,
-    rpc_admission_wait_timeout: Duration,
-    rpc_control_admission_wait_timeout: Duration,
-}
-
 impl LocalUnixShardNodeClientConfig {
     pub fn new(node_id: NodeId, socket_path: impl Into<PathBuf>) -> Self {
         Self {
@@ -160,22 +154,6 @@ impl LocalUnixStorageNodeClientConfig {
         }
     }
 
-    pub fn with_rpc_admission(
-        node_id: NodeId,
-        socket_path: impl Into<PathBuf>,
-        rpc_admission_limit: usize,
-        rpc_admission_wait_timeout: Duration,
-        rpc_control_admission_wait_timeout: Duration,
-    ) -> Self {
-        Self {
-            node_id,
-            socket_path: socket_path.into(),
-            rpc_admission_limit,
-            rpc_admission_wait_timeout,
-            rpc_control_admission_wait_timeout,
-        }
-    }
-
     pub fn with_rpc_admission_settings(
         node_id: NodeId,
         socket_path: impl Into<PathBuf>,
@@ -184,25 +162,10 @@ impl LocalUnixStorageNodeClientConfig {
         Self {
             node_id,
             socket_path: socket_path.into(),
-            rpc_admission_limit: settings.rpc_admission_limit,
-            rpc_admission_wait_timeout: settings.rpc_admission_wait_timeout,
-            rpc_control_admission_wait_timeout: settings.rpc_control_admission_wait_timeout,
+            rpc_admission_limit: settings.rpc_admission_limit(),
+            rpc_admission_wait_timeout: settings.rpc_admission_wait_timeout(),
+            rpc_control_admission_wait_timeout: settings.rpc_control_admission_wait_timeout(),
         }
-    }
-
-    pub fn with_rpc_admission_from_runtime_node_route(
-        node: &NodeRouteSnapshot,
-        rpc_admission_limit: usize,
-        rpc_admission_wait_timeout: Duration,
-        rpc_control_admission_wait_timeout: Duration,
-    ) -> Self {
-        Self::with_rpc_admission(
-            node.node_id(),
-            node.endpoint(),
-            rpc_admission_limit,
-            rpc_admission_wait_timeout,
-            rpc_control_admission_wait_timeout,
-        )
     }
 
     pub fn with_rpc_admission_settings_from_runtime_node_route(
@@ -229,40 +192,6 @@ impl LocalUnixStorageNodeClientConfig {
     }
 
     pub fn rpc_control_admission_wait_timeout(&self) -> Duration {
-        self.rpc_control_admission_wait_timeout
-    }
-}
-
-impl LocalUnixStorageNodeClientAdmissionSettings {
-    pub const DEFAULT: Self = Self {
-        rpc_admission_limit: LocalUnixStorageNodeClientConfig::DEFAULT_RPC_ADMISSION_LIMIT,
-        rpc_admission_wait_timeout:
-            LocalUnixStorageNodeClientConfig::DEFAULT_RPC_ADMISSION_WAIT_TIMEOUT,
-        rpc_control_admission_wait_timeout:
-            LocalUnixStorageNodeClientConfig::DEFAULT_RPC_CONTROL_ADMISSION_WAIT_TIMEOUT,
-    };
-
-    pub fn new(
-        rpc_admission_limit: usize,
-        rpc_admission_wait_timeout: Duration,
-        rpc_control_admission_wait_timeout: Duration,
-    ) -> Self {
-        Self {
-            rpc_admission_limit,
-            rpc_admission_wait_timeout,
-            rpc_control_admission_wait_timeout,
-        }
-    }
-
-    pub fn rpc_admission_limit(self) -> usize {
-        self.rpc_admission_limit
-    }
-
-    pub fn rpc_admission_wait_timeout(self) -> Duration {
-        self.rpc_admission_wait_timeout
-    }
-
-    pub fn rpc_control_admission_wait_timeout(self) -> Duration {
         self.rpc_control_admission_wait_timeout
     }
 }
@@ -2089,9 +2018,11 @@ impl LocalClusterMap {
                 config.node_id,
                 self.epoch,
                 config.socket_path.clone(),
-                config.rpc_admission_limit,
-                config.rpc_admission_wait_timeout,
-                config.rpc_control_admission_wait_timeout,
+                LocalUnixStorageNodeClientAdmissionSettings {
+                    rpc_admission_limit: config.rpc_admission_limit,
+                    rpc_admission_wait_timeout: config.rpc_admission_wait_timeout,
+                    rpc_control_admission_wait_timeout: config.rpc_control_admission_wait_timeout,
+                },
             ));
             let bucket_metadata_client: Arc<dyn BucketMetadataNodeClient> = client.clone();
             let bucket_write_reservation_client: Arc<dyn BucketWriteReservationNodeClient> =

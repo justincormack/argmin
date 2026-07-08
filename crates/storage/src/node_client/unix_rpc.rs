@@ -1281,18 +1281,16 @@ impl UnixStorageNodeClient {
         node_id: NodeId,
         cluster_epoch: ClusterEpoch,
         socket_path: impl Into<PathBuf>,
-        rpc_admission_limit: usize,
-        rpc_admission_wait_timeout: Duration,
-        rpc_control_admission_wait_timeout: Duration,
+        settings: LocalUnixStorageNodeClientAdmissionSettings,
     ) -> Self {
         Self::with_rpc_admission(
             node_id,
             cluster_epoch,
             socket_path.into(),
             Arc::new(UnixStorageNodeRpcAdmission::new_with_wait_timeout(
-                rpc_admission_limit,
-                rpc_admission_wait_timeout,
-                rpc_control_admission_wait_timeout,
+                settings.rpc_admission_limit(),
+                settings.rpc_admission_wait_timeout(),
+                settings.rpc_control_admission_wait_timeout(),
             )),
         )
     }
@@ -1303,14 +1301,13 @@ impl UnixStorageNodeClient {
         socket_path: impl Into<PathBuf>,
         rpc_admission_limit: usize,
     ) -> Self {
-        Self::with_rpc_admission_settings(
-            node_id,
-            cluster_epoch,
-            socket_path,
+        let settings = LocalUnixStorageNodeClientAdmissionSettings {
             rpc_admission_limit,
-            UNIX_STORAGE_NODE_DEFAULT_RPC_ADMISSION_WAIT_TIMEOUT,
-            UNIX_STORAGE_NODE_DEFAULT_RPC_CONTROL_ADMISSION_WAIT_TIMEOUT,
-        )
+            rpc_admission_wait_timeout: UNIX_STORAGE_NODE_DEFAULT_RPC_ADMISSION_WAIT_TIMEOUT,
+            rpc_control_admission_wait_timeout:
+                UNIX_STORAGE_NODE_DEFAULT_RPC_CONTROL_ADMISSION_WAIT_TIMEOUT,
+        };
+        Self::with_rpc_admission_settings(node_id, cluster_epoch, socket_path, settings)
     }
 
     pub(crate) fn node_id(&self) -> NodeId {

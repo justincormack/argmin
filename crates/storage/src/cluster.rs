@@ -10,13 +10,13 @@ use ec::{EcConfig, ErasureCodec};
 use placement::NodeId;
 use ring::rand::SecureRandom;
 
+pub use crate::node_client::LocalUnixStorageNodeClientAdmissionSettings;
 pub use local::{
     LocalClusterMap, LocalNodeStore, LocalNodeStoreConfig, LocalPgRoute,
     LocalUnixBucketWriteReservationNodeClientConfig, LocalUnixMetadataCommandNodeClientConfig,
     LocalUnixObjectGenerationMetadataNodeClientConfig,
     LocalUnixObjectListingMetadataNodeClientConfig, LocalUnixObjectVersionMetadataNodeClientConfig,
-    LocalUnixShardNodeClientConfig, LocalUnixStorageNodeClientAdmissionSettings,
-    LocalUnixStorageNodeClientConfig,
+    LocalUnixShardNodeClientConfig, LocalUnixStorageNodeClientConfig,
 };
 use local::{LocalClusterRuntimeState, MetadataCommandRecoveryAdmission};
 pub use request_ops::BucketIdentityGenerations;

@@ -4128,15 +4128,16 @@ fn build_remote_frontend_storage_cluster(
     )
     .map_err(|e| e.to_string())?;
     local_map
-        .install_unix_storage_node_clients(config.storage_node_sockets.iter().map(|entry| {
-            LocalUnixStorageNodeClientConfig::with_rpc_admission(
-                NodeId::new(entry.node_id),
-                entry.socket_path.clone(),
-                config.storage_node_rpc_admission_limit,
-                config.storage_node_rpc_admission_wait_timeout,
-                config.storage_node_rpc_control_admission_wait_timeout,
-            )
-        }))
+        .install_unix_storage_node_clients({
+            let admission_settings = unix_storage_node_client_admission_settings(config);
+            config.storage_node_sockets.iter().map(move |entry| {
+                LocalUnixStorageNodeClientConfig::with_rpc_admission_settings(
+                    NodeId::new(entry.node_id),
+                    entry.socket_path.clone(),
+                    admission_settings,
+                )
+            })
+        })
         .map_err(|e| e.to_string())?;
     StorageCluster::from_local_map(Arc::new(local_map)).map_err(|e| e.to_string())
 }
@@ -4201,11 +4202,11 @@ fn build_frontend_storage_cluster_from_runtime_map(
 fn unix_storage_node_client_admission_settings(
     config: &ServerConfig,
 ) -> LocalUnixStorageNodeClientAdmissionSettings {
-    LocalUnixStorageNodeClientAdmissionSettings::new(
-        config.storage_node_rpc_admission_limit,
-        config.storage_node_rpc_admission_wait_timeout,
-        config.storage_node_rpc_control_admission_wait_timeout,
-    )
+    LocalUnixStorageNodeClientAdmissionSettings {
+        rpc_admission_limit: config.storage_node_rpc_admission_limit,
+        rpc_admission_wait_timeout: config.storage_node_rpc_admission_wait_timeout,
+        rpc_control_admission_wait_timeout: config.storage_node_rpc_control_admission_wait_timeout,
+    }
 }
 
 async fn run_frontend_server(
@@ -4349,11 +4350,7 @@ fn maybe_spawn_frontend_control_plane_refresh_loop(
     config: &ServerConfig,
 ) -> Option<storage::StorageClusterRuntimeMapRefreshLoop> {
     let socket_path = config.control_plane_socket_path.as_deref()?;
-    let admission_settings = LocalUnixStorageNodeClientAdmissionSettings::new(
-        config.storage_node_rpc_admission_limit,
-        config.storage_node_rpc_admission_wait_timeout,
-        config.storage_node_rpc_control_admission_wait_timeout,
-    );
+    let admission_settings = unix_storage_node_client_admission_settings(config);
     let loop_handle = storage_cluster_handle
         .spawn_control_plane_refresh_loop_with_unix_storage_node_clients(
             build_frontend_control_plane_client(config, socket_path).unwrap_or_else(|error| {

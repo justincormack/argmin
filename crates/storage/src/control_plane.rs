@@ -21480,11 +21480,13 @@ mod tests {
         );
 
         let configured =
-            crate::cluster::LocalUnixStorageNodeClientConfig::with_rpc_admission_from_runtime_node_route(
+            crate::cluster::LocalUnixStorageNodeClientConfig::with_rpc_admission_settings_from_runtime_node_route(
                 node,
-                17,
-                std::time::Duration::from_millis(200),
-                std::time::Duration::from_millis(300),
+                crate::cluster::LocalUnixStorageNodeClientAdmissionSettings {
+                    rpc_admission_limit: 17,
+                    rpc_admission_wait_timeout: std::time::Duration::from_millis(200),
+                    rpc_control_admission_wait_timeout: std::time::Duration::from_millis(300),
+                },
             );
         assert_eq!(configured.node_id(), NodeId::new(1));
         assert_eq!(
@@ -21501,11 +21503,11 @@ mod tests {
             std::time::Duration::from_millis(300)
         );
 
-        let settings = crate::cluster::LocalUnixStorageNodeClientAdmissionSettings::new(
-            23,
-            std::time::Duration::from_millis(400),
-            std::time::Duration::from_millis(500),
-        );
+        let settings = crate::cluster::LocalUnixStorageNodeClientAdmissionSettings {
+            rpc_admission_limit: 23,
+            rpc_admission_wait_timeout: std::time::Duration::from_millis(400),
+            rpc_control_admission_wait_timeout: std::time::Duration::from_millis(500),
+        };
         let [ref refreshed_config] =
             crate::StorageCluster::unix_storage_node_client_configs_from_runtime_map(
                 &runtime_map,
