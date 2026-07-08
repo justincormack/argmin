@@ -16,6 +16,11 @@ pub struct TraceContext {
     request_id: Arc<str>,
 }
 
+pub struct TraceContextIds {
+    pub trace_id: String,
+    pub request_id: String,
+}
+
 impl TraceContext {
     #[must_use]
     pub fn new_request() -> Self {
@@ -36,10 +41,10 @@ impl TraceContext {
     }
 
     #[must_use]
-    pub fn from_ids(trace_id: String, request_id: String) -> Self {
+    pub fn from_ids(ids: TraceContextIds) -> Self {
         Self {
-            trace_id: Arc::<str>::from(trace_id),
-            request_id: Arc::<str>::from(request_id),
+            trace_id: Arc::<str>::from(ids.trace_id),
+            request_id: Arc::<str>::from(ids.request_id),
         }
     }
 
@@ -4502,10 +4507,10 @@ mod tests {
     #[test]
     fn request_error_records_redacted_bounded_flight_record() {
         let _guard = METRICS_TEST_MUTEX.lock().unwrap();
-        let ctx = TraceContext::from_ids(
-            "trace-flight-redaction".to_string(),
-            "request-flight-redaction".to_string(),
-        );
+        let ctx = TraceContext::from_ids(TraceContextIds {
+            trace_id: "trace-flight-redaction".to_string(),
+            request_id: "request-flight-redaction".to_string(),
+        });
         let summary = RequestSummary {
             method: "PUT",
             path: "/secret-bucket/secret-key",
@@ -4577,10 +4582,10 @@ mod tests {
     #[test]
     fn request_admission_records_redacted_bounded_flight_records() {
         let _guard = METRICS_TEST_MUTEX.lock().unwrap();
-        let ctx = TraceContext::from_ids(
-            "trace-admission-redaction".to_string(),
-            "request-admission-redaction".to_string(),
-        );
+        let ctx = TraceContext::from_ids(TraceContextIds {
+            trace_id: "trace-admission-redaction".to_string(),
+            request_id: "request-admission-redaction".to_string(),
+        });
         let wait_summary = RequestAdmissionWaitSummary {
             method: "PUT",
             path: "/secret-bucket/secret-key",
@@ -4620,10 +4625,10 @@ mod tests {
     #[test]
     fn metadata_command_diagnostics_record_bounded_pg_context() {
         let _guard = METRICS_TEST_MUTEX.lock().unwrap();
-        let ctx = TraceContext::from_ids(
-            "trace-metadata-command".to_string(),
-            "request-metadata-command".to_string(),
-        );
+        let ctx = TraceContext::from_ids(TraceContextIds {
+            trace_id: "trace-metadata-command".to_string(),
+            request_id: "request-metadata-command".to_string(),
+        });
         let _attached = AttachedTrace::new(ctx);
         let before = metrics_snapshot();
 
@@ -4788,10 +4793,10 @@ mod tests {
     #[test]
     fn storage_rpc_error_records_bounded_redacted_context() {
         let _guard = METRICS_TEST_MUTEX.lock().unwrap();
-        let ctx = TraceContext::from_ids(
-            "trace-storage-rpc-error".to_string(),
-            "request-storage-rpc-error".to_string(),
-        );
+        let ctx = TraceContext::from_ids(TraceContextIds {
+            trace_id: "trace-storage-rpc-error".to_string(),
+            request_id: "request-storage-rpc-error".to_string(),
+        });
         let _attached = AttachedTrace::new(ctx);
         let before = metrics_snapshot();
 
@@ -4834,10 +4839,10 @@ mod tests {
     #[test]
     fn flight_recorder_is_bounded() {
         let _guard = METRICS_TEST_MUTEX.lock().unwrap();
-        let ctx = TraceContext::from_ids(
-            "trace-flight-bounds".to_string(),
-            "request-flight-bounds".to_string(),
-        );
+        let ctx = TraceContext::from_ids(TraceContextIds {
+            trace_id: "trace-flight-bounds".to_string(),
+            request_id: "request-flight-bounds".to_string(),
+        });
 
         for index in 0..(FLIGHT_RECORDER_CAPACITY + 8) {
             record_flight_event(&ctx, "test", "bounded", format!("index={index}"));
@@ -4853,10 +4858,10 @@ mod tests {
 
     #[test]
     fn attached_trace_sets_current_context_even_when_tracing_is_disabled() {
-        let ctx = TraceContext::from_ids(
-            "0123456789abcdef0123456789abcdef".to_string(),
-            "2VG1X5NNMZ52HKC0".to_string(),
-        );
+        let ctx = TraceContext::from_ids(TraceContextIds {
+            trace_id: "0123456789abcdef0123456789abcdef".to_string(),
+            request_id: "2VG1X5NNMZ52HKC0".to_string(),
+        });
 
         let guard = AttachedTrace::new(ctx.clone());
         assert_eq!(current_context(), Some(ctx));

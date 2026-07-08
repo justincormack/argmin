@@ -117,7 +117,10 @@ pub(crate) fn new_request_trace_context() -> observability::TraceContext {
         let _ = write!(trace_id, "{byte:02x}");
     }
 
-    observability::TraceContext::from_ids(trace_id, request_id)
+    observability::TraceContext::from_ids(observability::TraceContextIds {
+        trace_id,
+        request_id,
+    })
 }
 
 #[must_use]
@@ -6939,10 +6942,10 @@ mod tests {
                     true,
                     false,
                     ResponseTraceMeta::new(
-                        observability::TraceContext::from_ids(
-                            "trace-conversion-error".to_string(),
-                            "request-conversion-error".to_string(),
-                        ),
+                        observability::TraceContext::from_ids(observability::TraceContextIds {
+                            trace_id: "trace-conversion-error".to_string(),
+                            request_id: "request-conversion-error".to_string(),
+                        }),
                         Arc::<str>::from("host-id"),
                         "GET",
                         "/secret-bucket/secret-key",
@@ -7126,10 +7129,10 @@ mod tests {
             false,
             false,
             ResponseTraceMeta::new(
-                observability::TraceContext::from_ids(
-                    "0123456789abcdef0123456789abcdef".to_string(),
-                    "2VG1X5NNMZ52HKC0".to_string(),
-                ),
+                observability::TraceContext::from_ids(observability::TraceContextIds {
+                    trace_id: "0123456789abcdef0123456789abcdef".to_string(),
+                    request_id: "2VG1X5NNMZ52HKC0".to_string(),
+                }),
                 Arc::<str>::from("stable-host-id"),
                 "GET",
                 "/",
@@ -7157,10 +7160,10 @@ mod tests {
     fn streaming_body_error_diagnostic_preserves_response_status() {
         let mut trace = ResponseBodyTrace::new(
             ResponseTraceMeta::new(
-                observability::TraceContext::from_ids(
-                    "0123456789abcdef0123456789abcdef".to_string(),
-                    "2VG1X5NNMZ52HKC0".to_string(),
-                ),
+                observability::TraceContext::from_ids(observability::TraceContextIds {
+                    trace_id: "0123456789abcdef0123456789abcdef".to_string(),
+                    request_id: "2VG1X5NNMZ52HKC0".to_string(),
+                }),
                 Arc::<str>::from("stable-host-id"),
                 "GET",
                 "/bucket/key",

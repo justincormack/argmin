@@ -1117,10 +1117,10 @@ impl From<&PgRouteSnapshot> for StorageNodePgRoute {
 }
 
 fn storage_node_rpc_trace_context(node_id: NodeId, request_id: u64) -> observability::TraceContext {
-    observability::TraceContext::from_ids(
-        format!("storage-node-{}-rpc-{}", node_id.as_u32(), request_id),
-        format!("storage-node-{}-rpc-{}", node_id.as_u32(), request_id),
-    )
+    observability::TraceContext::from_ids(observability::TraceContextIds {
+        trace_id: format!("storage-node-{}-rpc-{}", node_id.as_u32(), request_id),
+        request_id: format!("storage-node-{}-rpc-{}", node_id.as_u32(), request_id),
+    })
 }
 
 fn emit_storage_node_metadata_command_log_conflict(
@@ -13446,11 +13446,12 @@ mod tests {
         let waiting_locks = locks.clone();
 
         let waiter = thread::spawn(move || {
-            let _attached =
-                observability::AttachedTrace::new(observability::TraceContext::from_ids(
-                    "trace-metadata-command-lock-wait".to_string(),
-                    "request-metadata-command-lock-wait".to_string(),
-                ));
+            let _attached = observability::AttachedTrace::new(
+                observability::TraceContext::from_ids(observability::TraceContextIds {
+                    trace_id: "trace-metadata-command-lock-wait".to_string(),
+                    request_id: "request-metadata-command-lock-wait".to_string(),
+                }),
+            );
             let _guard = waiting_locks.acquire(NodeId::new(7), pg_id, None).unwrap();
         });
 
@@ -13533,11 +13534,12 @@ mod tests {
         let waiting_locks = locks.clone();
 
         let waiter = thread::spawn(move || {
-            let _attached =
-                observability::AttachedTrace::new(observability::TraceContext::from_ids(
-                    "trace-metadata-command-lock-blocked".to_string(),
-                    "request-metadata-command-lock-blocked".to_string(),
-                ));
+            let _attached = observability::AttachedTrace::new(
+                observability::TraceContext::from_ids(observability::TraceContextIds {
+                    trace_id: "trace-metadata-command-lock-blocked".to_string(),
+                    request_id: "request-metadata-command-lock-blocked".to_string(),
+                }),
+            );
             let _guard = waiting_locks
                 .acquire_with_timeout(
                     NodeId::new(7),

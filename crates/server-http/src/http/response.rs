@@ -3684,8 +3684,10 @@ mod tests {
     #[test]
     fn error_response_uses_attached_request_id() {
         let _trace = observability::AttachedTrace::new(observability::TraceContext::from_ids(
-            "0123456789abcdef0123456789abcdef".to_string(),
-            "2VG1X5NNMZ52HKC0".to_string(),
+            observability::TraceContextIds {
+                trace_id: "0123456789abcdef0123456789abcdef".to_string(),
+                request_id: "2VG1X5NNMZ52HKC0".to_string(),
+            },
         ));
         let err = ServerError::Auth(auth::AuthError::MissingAuth);
         let resp = S3Response::error(&err, "/", TEST_HOST_ID);

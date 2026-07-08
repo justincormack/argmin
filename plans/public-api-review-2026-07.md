@@ -967,8 +967,10 @@ each is one refactor away from a panic:
   comparison. Fixed by removing the positional constructor and converting
   callers to named `PgMetadataProof { applied_log_index, applied_log_hash,
   state_digest }` construction.
-- [ ] `TraceContext::from_ids(String, String)` (`observability/src/lib.rs:39`)
-  — trace/request id swap risk at wire boundaries.
+- [x] `TraceContext::from_ids(String, String)` (`observability/src/lib.rs:39`)
+  — fixed by replacing the positional constructor with
+  `TraceContextIds { trace_id, request_id }`, so wire-boundary callers must name
+  both IDs.
 - [ ] `put_bucket_acl_and_load_info(..., public_read: bool, public_write:
   bool)` (`request_ops.rs:6668-6674`) and `with_rpc_admission(usize,
   Duration, Duration)` (`cluster/local.rs:158-164`) — adjacent same-typed

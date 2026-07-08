@@ -114,8 +114,10 @@ fn pending_slot_drain_records_diagnostic_action() {
     insert_pending_metadata_command_for_test(&map, pg_id, &bucket, &command);
 
     let _trace = observability::AttachedTrace::new(observability::TraceContext::from_ids(
-        "trace-pending-slot-drain".to_string(),
-        "request-pending-slot-drain".to_string(),
+        observability::TraceContextIds {
+            trace_id: "trace-pending-slot-drain".to_string(),
+            request_id: "request-pending-slot-drain".to_string(),
+        },
     ));
 
     cluster
@@ -166,8 +168,10 @@ fn fresh_bucket_pg_command_finish_does_not_record_drain_attempt() {
     insert_pending_metadata_command_for_test(&map, pg_id, &bucket, &command);
 
     let _trace = observability::AttachedTrace::new(observability::TraceContext::from_ids(
-        "trace-fresh-pending-finish".to_string(),
-        "request-fresh-pending-finish".to_string(),
+        observability::TraceContextIds {
+            trace_id: "trace-fresh-pending-finish".to_string(),
+            request_id: "request-fresh-pending-finish".to_string(),
+        },
     ));
 
     let outcome = cluster
@@ -206,8 +210,10 @@ fn direct_bucket_pg_pending_finish_records_diagnostic_action() {
     insert_pending_metadata_command_for_test(&map, pg_id, &bucket, &command);
 
     let _trace = observability::AttachedTrace::new(observability::TraceContext::from_ids(
-        "trace-direct-pending-finish".to_string(),
-        "request-direct-pending-finish".to_string(),
+        observability::TraceContextIds {
+            trace_id: "trace-direct-pending-finish".to_string(),
+            request_id: "request-direct-pending-finish".to_string(),
+        },
     ));
 
     let outcome = cluster
@@ -254,8 +260,10 @@ fn bucket_pg_pending_slot_helper_records_diagnostic_action() {
     insert_pending_metadata_command_for_test(&map, pg_id, &bucket, &command);
 
     let _trace = observability::AttachedTrace::new(observability::TraceContext::from_ids(
-        "trace-helper-pending-drain".to_string(),
-        "request-helper-pending-drain".to_string(),
+        observability::TraceContextIds {
+            trace_id: "trace-helper-pending-drain".to_string(),
+            request_id: "request-helper-pending-drain".to_string(),
+        },
     ));
 
     cluster
@@ -915,8 +923,10 @@ fn pending_slot_reissue_records_diagnostic_action() {
     let stale = create_bucket_metadata_command(pg_id, 1, second_bucket.clone());
     force_insert_pending_metadata_command_for_test(&map, pg_id, &second_bucket, &stale);
     let _trace = observability::AttachedTrace::new(observability::TraceContext::from_ids(
-        "trace-pending-slot-reissue".to_string(),
-        "request-pending-slot-reissue".to_string(),
+        observability::TraceContextIds {
+            trace_id: "trace-pending-slot-reissue".to_string(),
+            request_id: "request-pending-slot-reissue".to_string(),
+        },
     ));
 
     let reissued = cluster
