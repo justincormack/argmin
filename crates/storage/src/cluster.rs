@@ -67,9 +67,10 @@ use crate::types::{
     CommitDirectPutObjectReq, CreateStreamUploadReq, DataPgId, DirectPutCommitSnapshot,
     DirectPutWrittenSegment, EcShape, FinalizeDirectPutObjectOutcome, GenerationId,
     MultipartUploadRecord, ObjectEncryption, ObjectKey, ObjectLayout, ObjectSegmentRecord, PgId,
-    PgState, PlacedSegmentShardBackfillClaimAcquire, PlacedSegmentShardBackfillClaimRecord,
-    PlacedSegmentShardBackfillRecord, PlacedSegmentShardBackfillWorkItem,
-    PlacedSegmentShardRepairClaimAcquire, PlacedSegmentShardRepairClaimRecord,
+    PgState, PlacedSegmentShardBackfillClaimAcquire, PlacedSegmentShardBackfillClaimAcquireParams,
+    PlacedSegmentShardBackfillClaimRecord, PlacedSegmentShardBackfillRecord,
+    PlacedSegmentShardBackfillWorkItem, PlacedSegmentShardRepairClaimAcquire,
+    PlacedSegmentShardRepairClaimAcquireParams, PlacedSegmentShardRepairClaimRecord,
     PlacedSegmentShardRepairRecord, PlacedSegmentShardRepairWorkItem,
     PrepareStreamUploadSegmentAppendReq, RouteMapValidity, SegmentStoredBytesRequest, SessionId,
     ShardIndex, ShardKey, ShardScavengerObservation, ShardScavengerObservationKey,
@@ -9004,21 +9005,17 @@ impl StorageCluster {
     pub fn acquire_placed_segment_shard_repair_claim(
         &self,
         data_pg_id: u32,
-        claim_id: &str,
-        owner_token: &str,
-        claimed_at: u64,
-        lease_deadline: u64,
-        now: u64,
+        params: &PlacedSegmentShardRepairClaimAcquireParams,
     ) -> Result<Option<PlacedSegmentShardRepairClaimRecord>, StoreError> {
         let pg_id = PgId::new(data_pg_id);
         let client = self.metadata_pg_primary_shard_ack_client(pg_id)?;
         let request = PlacedSegmentShardRepairClaimAcquire {
-            claim_id: claim_id.to_string(),
-            owner_token: owner_token.to_string(),
+            claim_id: params.claim_id.clone(),
+            owner_token: params.owner_token.clone(),
             cluster_epoch: self.cluster_epoch(),
-            claimed_at,
-            lease_deadline: Some(lease_deadline),
-            now,
+            claimed_at: params.claimed_at,
+            lease_deadline: params.lease_deadline,
+            now: params.now,
         };
         client.acquire_placed_segment_shard_repair_claim(pg_id, &request)
     }
@@ -9343,45 +9340,32 @@ impl StorageCluster {
     pub fn acquire_placed_segment_shard_backfill_claim(
         &self,
         data_pg_id: u32,
-        claim_id: &str,
-        owner_token: &str,
-        claimed_at: u64,
-        lease_deadline: u64,
-        now: u64,
+        params: &PlacedSegmentShardBackfillClaimAcquireParams,
     ) -> Result<Option<PlacedSegmentShardBackfillClaimRecord>, StoreError> {
         let pg_id = PgId::new(data_pg_id);
         let client = self.metadata_pg_primary_shard_ack_client(pg_id)?;
         let request = PlacedSegmentShardBackfillClaimAcquire {
-            claim_id: claim_id.to_string(),
-            owner_token: owner_token.to_string(),
+            claim_id: params.claim_id.clone(),
+            owner_token: params.owner_token.clone(),
             cluster_epoch: self.cluster_epoch(),
-            claimed_at,
-            lease_deadline: Some(lease_deadline),
-            now,
+            claimed_at: params.claimed_at,
+            lease_deadline: params.lease_deadline,
+            now: params.now,
         };
         client.acquire_placed_segment_shard_backfill_claim(pg_id, &request)
     }
 
     pub fn acquire_next_placed_segment_shard_backfill_claim(
         &self,
-        claim_id: &str,
-        owner_token: &str,
-        claimed_at: u64,
-        lease_deadline: u64,
-        now: u64,
+        params: &PlacedSegmentShardBackfillClaimAcquireParams,
     ) -> Result<Option<PlacedSegmentShardBackfillClaimRecord>, StoreError> {
         for route in self.local_pg_routes() {
             if route.state() != PgState::Active {
                 continue;
             }
-            if let Some(claim) = self.acquire_placed_segment_shard_backfill_claim(
-                route.pg_id().get(),
-                claim_id,
-                owner_token,
-                claimed_at,
-                lease_deadline,
-                now,
-            )? {
+            if let Some(claim) =
+                self.acquire_placed_segment_shard_backfill_claim(route.pg_id().get(), params)?
+            {
                 return Ok(Some(claim));
             }
         }

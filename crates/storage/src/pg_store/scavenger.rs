@@ -438,12 +438,7 @@ impl PgStore {
             &request.claim_id,
             &request.owner_token,
         )?;
-        let Some(lease_deadline_value) = request.lease_deadline else {
-            return Err(StoreError::PayloadShardSetMismatch {
-                reason: "durable backfill claim lease deadline is required".to_string(),
-            });
-        };
-        if lease_deadline_value <= request.claimed_at {
+        if request.lease_deadline <= request.claimed_at {
             return Err(StoreError::PayloadShardSetMismatch {
                 reason: "durable backfill claim lease deadline must be after claimed_at"
                     .to_string(),
@@ -454,7 +449,7 @@ impl PgStore {
             "acquire placed segment shard backfill claim claimed_at",
         )?;
         let lease_deadline = durable_repair_u64_to_i64(
-            lease_deadline_value,
+            request.lease_deadline,
             "acquire placed segment shard backfill claim lease_deadline",
         )?;
         let now = durable_repair_u64_to_i64(
@@ -610,12 +605,7 @@ impl PgStore {
             &request.claim_id,
             &request.owner_token,
         )?;
-        let Some(lease_deadline_value) = request.lease_deadline else {
-            return Err(StoreError::PayloadShardSetMismatch {
-                reason: "durable repair claim lease deadline is required".to_string(),
-            });
-        };
-        if lease_deadline_value <= request.claimed_at {
+        if request.lease_deadline <= request.claimed_at {
             return Err(StoreError::PayloadShardSetMismatch {
                 reason: "durable repair claim lease deadline must be after claimed_at".to_string(),
             });
@@ -625,7 +615,7 @@ impl PgStore {
             "acquire placed segment shard repair claim claimed_at",
         )?;
         let lease_deadline = durable_repair_u64_to_i64(
-            lease_deadline_value,
+            request.lease_deadline,
             "acquire placed segment shard repair claim lease_deadline",
         )?;
         let now = durable_repair_u64_to_i64(
@@ -2457,7 +2447,7 @@ mod tests {
         owner_token: &str,
         epoch: ClusterEpoch,
         claimed_at: u64,
-        lease_deadline: Option<u64>,
+        lease_deadline: u64,
         now: u64,
     ) -> PlacedSegmentShardRepairClaimAcquire {
         PlacedSegmentShardRepairClaimAcquire {
@@ -2475,7 +2465,7 @@ mod tests {
         owner_token: &str,
         epoch: ClusterEpoch,
         claimed_at: u64,
-        lease_deadline: Option<u64>,
+        lease_deadline: u64,
         now: u64,
     ) -> PlacedSegmentShardBackfillClaimAcquire {
         PlacedSegmentShardBackfillClaimAcquire {
@@ -3119,12 +3109,7 @@ mod tests {
 
         assert!(store
             .acquire_placed_segment_shard_backfill_claim(&backfill_claim_acquire(
-                "claim-0",
-                "worker-0",
-                epoch,
-                9,
-                Some(19),
-                9
+                "claim-0", "worker-0", epoch, 9, 19, 9
             ))
             .unwrap()
             .is_none());
@@ -3134,12 +3119,7 @@ mod tests {
 
         let claim = store
             .acquire_placed_segment_shard_backfill_claim(&backfill_claim_acquire(
-                "claim-1",
-                "worker-1",
-                epoch,
-                10,
-                Some(20),
-                10,
+                "claim-1", "worker-1", epoch, 10, 20, 10,
             ))
             .unwrap()
             .unwrap();
@@ -3149,12 +3129,7 @@ mod tests {
         assert_eq!(
             store
                 .acquire_placed_segment_shard_backfill_claim(&backfill_claim_acquire(
-                    "claim-1",
-                    "worker-1",
-                    epoch,
-                    11,
-                    Some(21),
-                    11,
+                    "claim-1", "worker-1", epoch, 11, 21, 11,
                 ))
                 .unwrap()
                 .unwrap(),
@@ -3162,12 +3137,7 @@ mod tests {
         );
         assert!(store
             .acquire_placed_segment_shard_backfill_claim(&backfill_claim_acquire(
-                "claim-2",
-                "worker-2",
-                epoch,
-                12,
-                Some(22),
-                12,
+                "claim-2", "worker-2", epoch, 12, 22, 12,
             ))
             .unwrap()
             .is_none());
@@ -3186,24 +3156,14 @@ mod tests {
         );
         assert!(store
             .acquire_placed_segment_shard_backfill_claim(&backfill_claim_acquire(
-                "claim-2",
-                "worker-2",
-                epoch,
-                29,
-                Some(39),
-                29,
+                "claim-2", "worker-2", epoch, 29, 39, 29,
             ))
             .unwrap()
             .is_none());
 
         let retry = store
             .acquire_placed_segment_shard_backfill_claim(&backfill_claim_acquire(
-                "claim-2",
-                "worker-2",
-                epoch,
-                30,
-                Some(40),
-                30,
+                "claim-2", "worker-2", epoch, 30, 40, 30,
             ))
             .unwrap()
             .unwrap();
@@ -3264,7 +3224,7 @@ mod tests {
                 "worker-priority",
                 ClusterEpoch::new(7).unwrap(),
                 10,
-                Some(20),
+                20,
                 10,
             ))
             .unwrap()
@@ -3295,35 +3255,20 @@ mod tests {
             .unwrap();
         let first = store
             .acquire_placed_segment_shard_backfill_claim(&backfill_claim_acquire(
-                "claim-1",
-                "worker-1",
-                epoch,
-                10,
-                Some(20),
-                10,
+                "claim-1", "worker-1", epoch, 10, 20, 10,
             ))
             .unwrap()
             .unwrap();
 
         assert!(store
             .acquire_placed_segment_shard_backfill_claim(&backfill_claim_acquire(
-                "claim-2",
-                "worker-2",
-                epoch,
-                19,
-                Some(29),
-                19,
+                "claim-2", "worker-2", epoch, 19, 29, 19,
             ))
             .unwrap()
             .is_none());
         let stolen = store
             .acquire_placed_segment_shard_backfill_claim(&backfill_claim_acquire(
-                "claim-2",
-                "worker-2",
-                epoch,
-                20,
-                Some(30),
-                20,
+                "claim-2", "worker-2", epoch, 20, 30, 20,
             ))
             .unwrap()
             .unwrap();
@@ -3357,18 +3302,7 @@ mod tests {
 
         assert!(matches!(
             store.acquire_placed_segment_shard_backfill_claim(&backfill_claim_acquire(
-                "claim-1", "worker-1", epoch, 10, None, 10
-            )),
-            Err(StoreError::PayloadShardSetMismatch { .. })
-        ));
-        assert!(matches!(
-            store.acquire_placed_segment_shard_backfill_claim(&backfill_claim_acquire(
-                "claim-1",
-                "worker-1",
-                epoch,
-                10,
-                Some(10),
-                10
+                "claim-1", "worker-1", epoch, 10, 10, 10
             )),
             Err(StoreError::PayloadShardSetMismatch { .. })
         ));
@@ -3453,12 +3387,7 @@ mod tests {
 
         assert!(store
             .acquire_placed_segment_shard_repair_claim(&repair_claim_acquire(
-                "claim-0",
-                "worker-0",
-                epoch,
-                9,
-                Some(19),
-                9
+                "claim-0", "worker-0", epoch, 9, 19, 9
             ))
             .unwrap()
             .is_none());
@@ -3468,12 +3397,7 @@ mod tests {
 
         let claim = store
             .acquire_placed_segment_shard_repair_claim(&repair_claim_acquire(
-                "claim-1",
-                "worker-1",
-                epoch,
-                10,
-                Some(20),
-                10,
+                "claim-1", "worker-1", epoch, 10, 20, 10,
             ))
             .unwrap()
             .unwrap();
@@ -3483,12 +3407,7 @@ mod tests {
         assert_eq!(
             store
                 .acquire_placed_segment_shard_repair_claim(&repair_claim_acquire(
-                    "claim-1",
-                    "worker-1",
-                    epoch,
-                    11,
-                    Some(21),
-                    11,
+                    "claim-1", "worker-1", epoch, 11, 21, 11,
                 ))
                 .unwrap()
                 .unwrap(),
@@ -3496,12 +3415,7 @@ mod tests {
         );
         assert!(store
             .acquire_placed_segment_shard_repair_claim(&repair_claim_acquire(
-                "claim-2",
-                "worker-2",
-                epoch,
-                12,
-                Some(22),
-                12,
+                "claim-2", "worker-2", epoch, 12, 22, 12,
             ))
             .unwrap()
             .is_none());
@@ -3520,24 +3434,14 @@ mod tests {
         );
         assert!(store
             .acquire_placed_segment_shard_repair_claim(&repair_claim_acquire(
-                "claim-2",
-                "worker-2",
-                epoch,
-                29,
-                Some(39),
-                29,
+                "claim-2", "worker-2", epoch, 29, 39, 29,
             ))
             .unwrap()
             .is_none());
 
         let retry = store
             .acquire_placed_segment_shard_repair_claim(&repair_claim_acquire(
-                "claim-2",
-                "worker-2",
-                epoch,
-                30,
-                Some(40),
-                30,
+                "claim-2", "worker-2", epoch, 30, 40, 30,
             ))
             .unwrap()
             .unwrap();
@@ -3577,35 +3481,20 @@ mod tests {
             .unwrap();
         let first = store
             .acquire_placed_segment_shard_repair_claim(&repair_claim_acquire(
-                "claim-1",
-                "worker-1",
-                epoch,
-                10,
-                Some(20),
-                10,
+                "claim-1", "worker-1", epoch, 10, 20, 10,
             ))
             .unwrap()
             .unwrap();
 
         assert!(store
             .acquire_placed_segment_shard_repair_claim(&repair_claim_acquire(
-                "claim-2",
-                "worker-2",
-                epoch,
-                19,
-                Some(29),
-                19,
+                "claim-2", "worker-2", epoch, 19, 29, 19,
             ))
             .unwrap()
             .is_none());
         let stolen = store
             .acquire_placed_segment_shard_repair_claim(&repair_claim_acquire(
-                "claim-2",
-                "worker-2",
-                epoch,
-                20,
-                Some(30),
-                20,
+                "claim-2", "worker-2", epoch, 20, 30, 20,
             ))
             .unwrap()
             .unwrap();
@@ -3638,18 +3527,7 @@ mod tests {
 
         assert!(matches!(
             store.acquire_placed_segment_shard_repair_claim(&repair_claim_acquire(
-                "claim-1", "worker-1", epoch, 10, None, 10
-            )),
-            Err(StoreError::PayloadShardSetMismatch { .. })
-        ));
-        assert!(matches!(
-            store.acquire_placed_segment_shard_repair_claim(&repair_claim_acquire(
-                "claim-1",
-                "worker-1",
-                epoch,
-                10,
-                Some(10),
-                10
+                "claim-1", "worker-1", epoch, 10, 10, 10
             )),
             Err(StoreError::PayloadShardSetMismatch { .. })
         ));

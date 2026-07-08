@@ -972,14 +972,15 @@ fn run_local_cluster_trace(ops: &[LocalClusterTraceOp]) -> TestCaseResult {
                 );
 
                 let now = 100_000 + step as u64;
+                let claim_acquire = crate::PlacedSegmentShardBackfillClaimAcquireParams {
+                    claim_id: format!("trace-backfill-claim-{step}"),
+                    owner_token: format!("trace-backfill-owner-{step}"),
+                    claimed_at: now,
+                    lease_deadline: now + 60,
+                    now,
+                };
                 let claim = cluster
-                    .acquire_next_placed_segment_shard_backfill_claim(
-                        &format!("trace-backfill-claim-{step}"),
-                        &format!("trace-backfill-owner-{step}"),
-                        now,
-                        now + 60,
-                        now,
-                    )
+                    .acquire_next_placed_segment_shard_backfill_claim(&claim_acquire)
                     .map_err(|err| TestCaseError::fail(format!("{err:?}")))?
                     .ok_or_else(|| {
                         TestCaseError::fail("new durable backfill row should be claimable")
@@ -989,14 +990,15 @@ fn run_local_cluster_trace(ops: &[LocalClusterTraceOp]) -> TestCaseResult {
                 prop_assert_eq!(claim.cluster_epoch, current_epoch);
                 prop_assert_eq!(claim.attempt_count, 1);
 
+                let busy_acquire = crate::PlacedSegmentShardBackfillClaimAcquireParams {
+                    claim_id: format!("trace-backfill-claim-busy-{step}"),
+                    owner_token: format!("trace-backfill-owner-busy-{step}"),
+                    claimed_at: now + 1,
+                    lease_deadline: now + 61,
+                    now: now + 1,
+                };
                 let busy = cluster
-                    .acquire_next_placed_segment_shard_backfill_claim(
-                        &format!("trace-backfill-claim-busy-{step}"),
-                        &format!("trace-backfill-owner-busy-{step}"),
-                        now + 1,
-                        now + 61,
-                        now + 1,
-                    )
+                    .acquire_next_placed_segment_shard_backfill_claim(&busy_acquire)
                     .map_err(|err| TestCaseError::fail(format!("{err:?}")))?;
                 prop_assert!(busy.is_none());
 

@@ -941,13 +941,18 @@ each is one refactor away from a panic:
 
 ### P4. Positional same-typed parameters
 
-- [ ] Claim acquire fns take 3 consecutive `u64` timestamps + 2 `&str` tokens
+- [x] Claim acquire fns take 3 consecutive `u64` timestamps + 2 `&str` tokens
   (`cluster.rs:8794-8802 acquire_placed_segment_shard_repair_claim`,
   `cluster.rs:9155-9162 acquire_next_placed_segment_shard_backfill_claim`);
   consumers pass `now_ms` in two of the three slots
   (`server-core/src/coordinator/runtime.rs`). The params structs already
   exist (`types.rs:1593 PlacedSegmentShardRepairClaimAcquire`,
-  `types.rs:1638`) — use them in the signatures.
+  `types.rs:1638`) — use them in the signatures. Fixed by adding
+  cluster-facade params structs with named `claim_id`, `owner_token`,
+  `claimed_at`, required `lease_deadline`, and `now` fields, making
+  `StorageCluster` stamp `cluster_epoch`, and changing the domain acquire
+  structs to require `lease_deadline: u64` while leaving optional deadlines
+  only at malformed RPC boundaries.
 - [ ] `acquire_durable_bucket_write_reservation`: still positional across all
   layers (`traits.rs:94-104`, `node_client/local.rs:727, 1763`,
   `pg_store/metadata.rs:5377-5387`); the S1 fix made `lease_deadline` a

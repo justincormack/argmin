@@ -9,7 +9,8 @@ use s3_types::BucketLifecycleConfiguration;
 use storage::PgTopology;
 use storage::{
     AuthorizedMultipartUploadRecord, BucketDeleteBeginRoot, BucketInfo, BucketName, EcShape,
-    GenerationId, ObjectEncryption, ObjectKey, ReclaimWorkItem, SegmentStoredBytesRequest,
+    GenerationId, ObjectEncryption, ObjectKey, PlacedSegmentShardBackfillClaimAcquireParams,
+    PlacedSegmentShardRepairClaimAcquireParams, ReclaimWorkItem, SegmentStoredBytesRequest,
     StorageCluster, StorageClusterRuntimeMapHandle, StoreError, UploadId, UploadState, VersionId,
 };
 
@@ -1377,13 +1378,16 @@ impl ShardRepairSweeper {
                         work_item.shard_index.get(),
                         SHARD_REPAIR_CLAIM_COUNTER.fetch_add(1, Ordering::Relaxed)
                     );
+                    let claim_acquire = PlacedSegmentShardRepairClaimAcquireParams {
+                        claim_id,
+                        owner_token: owner_token.clone(),
+                        claimed_at: now_ms,
+                        lease_deadline: now_ms.saturating_add(SHARD_REPAIR_CLAIM_LEASE_MILLIS),
+                        now: now_ms,
+                    };
                     let claim = match storage_cluster.acquire_placed_segment_shard_repair_claim(
                         work_item.request.data_pg_id,
-                        &claim_id,
-                        &owner_token,
-                        now_ms,
-                        now_ms.saturating_add(SHARD_REPAIR_CLAIM_LEASE_MILLIS),
-                        now_ms,
+                        &claim_acquire,
                     ) {
                         Ok(Some(claim)) => {
                             let _ = observability::emit_shard_repair_event(
@@ -1685,36 +1689,38 @@ fn run_one_placed_segment_shard_backfill(
         SHARD_BACKFILL_CLAIM_COUNTER.fetch_add(1, Ordering::Relaxed)
     );
     let queue_depth = shard_backfill_queue_depth(storage_cluster);
-    let claim = match storage_cluster.acquire_next_placed_segment_shard_backfill_claim(
-        &claim_id,
-        owner_token,
-        now_ms,
-        now_ms.saturating_add(SHARD_BACKFILL_CLAIM_LEASE_MILLIS),
-        now_ms,
-    ) {
-        Ok(Some(claim)) => {
-            emit_shard_backfill_event(
-                Some(claim.work_item.request.data_pg_id),
-                "claim_started",
-                queue_depth,
-                None,
-            );
-            claim
-        }
-        Ok(None) => {
-            emit_shard_backfill_event(None, "durable_scan_no_claim", queue_depth, None);
-            return;
-        }
-        Err(error) => {
-            emit_shard_backfill_event(None, "claim_failed", queue_depth, None);
-            let _ = observability::event(
-                TRACE_TARGET,
-                "shard_backfill_claim_error",
-                Some(format_args!("error={error}")),
-            );
-            return;
-        }
+    let claim_acquire = PlacedSegmentShardBackfillClaimAcquireParams {
+        claim_id,
+        owner_token: owner_token.to_string(),
+        claimed_at: now_ms,
+        lease_deadline: now_ms.saturating_add(SHARD_BACKFILL_CLAIM_LEASE_MILLIS),
+        now: now_ms,
     };
+    let claim =
+        match storage_cluster.acquire_next_placed_segment_shard_backfill_claim(&claim_acquire) {
+            Ok(Some(claim)) => {
+                emit_shard_backfill_event(
+                    Some(claim.work_item.request.data_pg_id),
+                    "claim_started",
+                    queue_depth,
+                    None,
+                );
+                claim
+            }
+            Ok(None) => {
+                emit_shard_backfill_event(None, "durable_scan_no_claim", queue_depth, None);
+                return;
+            }
+            Err(error) => {
+                emit_shard_backfill_event(None, "claim_failed", queue_depth, None);
+                let _ = observability::event(
+                    TRACE_TARGET,
+                    "shard_backfill_claim_error",
+                    Some(format_args!("error={error}")),
+                );
+                return;
+            }
+        };
 
     let admission_class =
         shard_backfill_admission_class(claim.remaining_tolerance, claim.work_item.request.ec.m);

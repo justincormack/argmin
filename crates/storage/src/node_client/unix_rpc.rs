@@ -456,7 +456,7 @@ impl UnixStorageNodeClient {
             claim_id: acquire.claim_id.clone(),
             owner_token: acquire.owner_token.clone(),
             claimed_at: acquire.claimed_at,
-            lease_deadline: acquire.lease_deadline,
+            lease_deadline: Some(acquire.lease_deadline),
             now: acquire.now,
         };
         let payload = encode_placed_segment_shard_repair_claim_acquire_request(&request).map_err(
@@ -693,7 +693,7 @@ impl UnixStorageNodeClient {
             claim_id: acquire.claim_id.clone(),
             owner_token: acquire.owner_token.clone(),
             claimed_at: acquire.claimed_at,
-            lease_deadline: acquire.lease_deadline,
+            lease_deadline: Some(acquire.lease_deadline),
             now: acquire.now,
         };
         let payload = encode_placed_segment_shard_backfill_claim_acquire_request(&request)

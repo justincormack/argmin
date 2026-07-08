@@ -7988,12 +7988,19 @@ impl StorageNodeConnectionHandler {
             return encode_storage_rpc_error_response(&error);
         }
         let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
+        let Some(lease_deadline) = request.lease_deadline else {
+            return encode_storage_rpc_error_response(&store_error_response(
+                StoreError::PayloadShardSetMismatch {
+                    reason: "durable repair claim lease deadline is required".to_string(),
+                },
+            ));
+        };
         let acquire = PlacedSegmentShardRepairClaimAcquire {
             claim_id: request.claim_id,
             owner_token: request.owner_token,
             cluster_epoch: request.route.cluster_epoch,
             claimed_at: request.claimed_at,
-            lease_deadline: request.lease_deadline,
+            lease_deadline,
             now: request.now,
         };
         match local_client.acquire_placed_segment_shard_repair_claim(request.route.pg_id, &acquire)
@@ -8242,12 +8249,19 @@ impl StorageNodeConnectionHandler {
             return encode_storage_rpc_error_response(&error);
         }
         let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
+        let Some(lease_deadline) = request.lease_deadline else {
+            return encode_storage_rpc_error_response(&store_error_response(
+                StoreError::PayloadShardSetMismatch {
+                    reason: "durable backfill claim lease deadline is required".to_string(),
+                },
+            ));
+        };
         let acquire = PlacedSegmentShardBackfillClaimAcquire {
             claim_id: request.claim_id,
             owner_token: request.owner_token,
             cluster_epoch: request.route.cluster_epoch,
             claimed_at: request.claimed_at,
-            lease_deadline: request.lease_deadline,
+            lease_deadline,
             now: request.now,
         };
         match local_client

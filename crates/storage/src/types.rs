@@ -1590,12 +1590,21 @@ pub struct PlacedSegmentShardRepairClaimRecord {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlacedSegmentShardRepairClaimAcquireParams {
+    pub claim_id: String,
+    pub owner_token: String,
+    pub claimed_at: u64,
+    pub lease_deadline: u64,
+    pub now: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlacedSegmentShardRepairClaimAcquire {
     pub claim_id: String,
     pub owner_token: String,
     pub cluster_epoch: ClusterEpoch,
     pub claimed_at: u64,
-    pub lease_deadline: Option<u64>,
+    pub lease_deadline: u64,
     pub now: u64,
 }
 
@@ -1635,12 +1644,21 @@ pub struct PlacedSegmentShardBackfillClaimRecord {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlacedSegmentShardBackfillClaimAcquireParams {
+    pub claim_id: String,
+    pub owner_token: String,
+    pub claimed_at: u64,
+    pub lease_deadline: u64,
+    pub now: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlacedSegmentShardBackfillClaimAcquire {
     pub claim_id: String,
     pub owner_token: String,
     pub cluster_epoch: ClusterEpoch,
     pub claimed_at: u64,
-    pub lease_deadline: Option<u64>,
+    pub lease_deadline: u64,
     pub now: u64,
 }
 
