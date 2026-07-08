@@ -2387,3 +2387,50 @@ fn test_get_bucket_lifecycle_response_shape() {
         s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
     });
 }
+
+/// Full ack shapes for PutBucketLifecycleConfiguration and
+/// DeleteBucketLifecycle. AWS includes
+/// x-amz-transition-default-minimum-object-size on the PUT ack; Argmin
+/// omits it while transitions are unimplemented — see
+/// guides/aws-compatibility.md ("Lifecycle transition-default header").
+#[test]
+fn test_lifecycle_write_ack_shapes() {
+    s3_tests::run(async {
+        let bucket = unique_bucket();
+        create_bucket_in_test_region(&bucket).await;
+
+        let config = "<LifecycleConfiguration><Rule><ID>ack</ID>\
+             <Filter><Prefix>logs/</Prefix></Filter><Status>Enabled</Status>\
+             <Expiration><Days>7</Days></Expiration></Rule>\
+             </LifecycleConfiguration>";
+        let md5 = content_md5_header(config.as_bytes());
+        let put = send_signed_request(
+            "PUT",
+            &format!("{}/{}?lifecycle=", CTX.endpoint(), bucket),
+            config.as_bytes(),
+            [(md5.0.as_str(), md5.1.as_str())],
+        );
+        assert_shape_one_of(
+            "PutBucketLifecycleConfiguration ack",
+            &put,
+            &[
+                shape()
+                    .status(200)
+                    .headers(id_headers())
+                    .header(
+                        "x-amz-transition-default-minimum-object-size",
+                        "all_storage_classes_128K",
+                    )
+                    .body_empty(),
+                shape().status(200).headers(id_headers()).body_empty(),
+            ],
+        );
+        assert_shape_one_of(
+            "DeleteBucketLifecycle ack",
+            &raw_bucket("DELETE", &bucket, Some("lifecycle=")),
+            &[shape().status(204).headers(id_headers()).body_empty()],
+        );
+
+        cleanup_bucket(&bucket).await;
+    });
+}

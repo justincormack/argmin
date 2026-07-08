@@ -7403,20 +7403,22 @@ mod phase7_harness {
             return Ok(());
         }
 
-        coord.put_object_retention(&PutObjectRetentionRequest {
-            object: ObjectVersionRequest::new(
-                trusted_bucket_name(bucket),
-                trusted_object_key(KEY),
-                Some(version_id),
-                Requester::authenticated(fixtures.owner_user.clone()),
-                None,
-            ),
-            retention: ObjectRetention {
-                mode: ObjectLockMode::Governance,
-                retain_until_unix_seconds: Coordinator::current_unix_seconds()? + 3600,
-            },
-            bypass_governance: false,
-        })
+        coord
+            .put_object_retention(&PutObjectRetentionRequest {
+                object: ObjectVersionRequest::new(
+                    trusted_bucket_name(bucket),
+                    trusted_object_key(KEY),
+                    Some(version_id),
+                    Requester::authenticated(fixtures.owner_user.clone()),
+                    None,
+                ),
+                retention: ObjectRetention {
+                    mode: ObjectLockMode::Governance,
+                    retain_until_unix_seconds: Coordinator::current_unix_seconds()? + 3600,
+                },
+                bypass_governance: false,
+            })
+            .map(|_| ())
     }
 
     fn apply_delete_lock_state(
@@ -7448,9 +7450,10 @@ mod phase7_harness {
                         retain_until_unix_seconds: Coordinator::current_unix_seconds()? + 3600,
                     },
                     bypass_governance: false,
-                }),
-            DeleteObjectLockShape::LegalHold => {
-                coord.put_object_legal_hold(&PutObjectLegalHoldRequest {
+                })
+                .map(|_| ()),
+            DeleteObjectLockShape::LegalHold => coord
+                .put_object_legal_hold(&PutObjectLegalHoldRequest {
                     object: ObjectVersionRequest::new(
                         trusted_bucket_name(bucket),
                         trusted_object_key(KEY),
@@ -7460,7 +7463,7 @@ mod phase7_harness {
                     ),
                     legal_hold: LegalHoldStatus::On,
                 })
-            }
+                .map(|_| ()),
         }
     }
 
@@ -11391,8 +11394,9 @@ mod phase13_harness {
             };
             match lock {
                 DeleteObjectLockShape::None => {}
-                DeleteObjectLockShape::Governance | DeleteObjectLockShape::Compliance => {
-                    match self.coord.put_object_retention(&PutObjectRetentionRequest {
+                DeleteObjectLockShape::Governance | DeleteObjectLockShape::Compliance => match self
+                    .coord
+                    .put_object_retention(&PutObjectRetentionRequest {
                         object: ObjectVersionRequest::new(
                             trusted_bucket_name(bucket),
                             trusted_object_key(PHASE13_KEY),
@@ -11413,20 +11417,21 @@ mod phase13_harness {
                                 + 3600,
                         },
                         bypass_governance: false,
-                    }) {
-                        Ok(()) => {}
-                        Err(
-                            ServerError::AccessDenied
-                            | ServerError::ObjectLockProtectedAccessDenied
-                            | ServerError::AnonymousApiAccessDenied
-                            | ServerError::VersionNotFound { .. }
-                            | ServerError::MethodNotAllowed,
-                        ) => {}
-                        Err(err) => {
-                            panic!("failed to apply tracked retention in phase 13: {err:?}")
-                        }
+                    })
+                    .map(|_| ())
+                {
+                    Ok(()) => {}
+                    Err(
+                        ServerError::AccessDenied
+                        | ServerError::ObjectLockProtectedAccessDenied
+                        | ServerError::AnonymousApiAccessDenied
+                        | ServerError::VersionNotFound { .. }
+                        | ServerError::MethodNotAllowed,
+                    ) => {}
+                    Err(err) => {
+                        panic!("failed to apply tracked retention in phase 13: {err:?}")
                     }
-                }
+                },
                 DeleteObjectLockShape::LegalHold => {
                     match self
                         .coord
@@ -11440,7 +11445,7 @@ mod phase13_harness {
                             ),
                             legal_hold: LegalHoldStatus::On,
                         }) {
-                        Ok(()) => {}
+                        Ok(_) => {}
                         Err(
                             ServerError::AccessDenied
                             | ServerError::ObjectLockProtectedAccessDenied

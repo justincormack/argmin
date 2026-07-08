@@ -571,6 +571,17 @@ diff-test coverage either, so their shapes have never been AWS-pinned):
    direct-PUT KeyTooLongError golden; binary AWS-validated.
 8. **Subresource write acks** — PutBucketVersioning/Tagging/etc. 200s
    and Delete* 204s: header sets never pinned (cheap, mechanical).
+   **DONE (slice 6, 2026-07-08)** — probed 19 write acks on AWS;
+   15 already conformed (including PutBucketTagging's 204, not 200).
+   Two real gaps fixed: PutObjectLegalHold and PutObjectRetention acks
+   now echo the affected version in x-amz-version-id (coordinator
+   returns the version id both handlers already computed). The
+   PutBucketLifecycle ack keeps the documented transition-default
+   header divergence (accept-either). Eight new ack goldens across
+   versioning/tagging/cors/bucket_encryption/ownership/bucket_acl/
+   lifecycle/object_lock, all AWS-validated. Phase 6 priority list
+   complete; remaining shape work is the opportunistic weak-assert
+   sweep (~770 call sites at last count).
 
 Remaining weak-assert density by file (top of the grep worklist):
 object_lock (98), tagging (49), sse_c (45), multipart (36),

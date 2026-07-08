@@ -422,3 +422,39 @@ fn test_get_bucket_encryption_default_response_shape() {
         s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
     });
 }
+
+/// Full ack shapes for PutBucketEncryption (200) and
+/// DeleteBucketEncryption (204).
+#[test]
+fn test_bucket_encryption_write_ack_shapes() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
+
+        let config = "<ServerSideEncryptionConfiguration \
+             xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Rule>\
+             <ApplyServerSideEncryptionByDefault><SSEAlgorithm>AES256</SSEAlgorithm>\
+             </ApplyServerSideEncryptionByDefault></Rule>\
+             </ServerSideEncryptionConfiguration>";
+        let md5 = content_md5_header(config.as_bytes());
+        let put = send_signed_request(
+            "PUT",
+            &format!("{}/{}?encryption=", CTX.endpoint(), bucket),
+            config.as_bytes(),
+            [(md5.0.as_str(), md5.1.as_str())],
+        );
+        assert_shape(
+            "PutBucketEncryption ack",
+            &put,
+            &shape().status(200).headers(id_headers()).body_empty(),
+        );
+        assert_shape(
+            "DeleteBucketEncryption ack",
+            &raw_bucket("DELETE", &bucket, Some("encryption=")),
+            &shape().status(204).headers(id_headers()).body_empty(),
+        );
+
+        s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
+    });
+}

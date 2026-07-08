@@ -2582,3 +2582,31 @@ fn test_list_object_versions_response_shape() {
         cleanup_versioned_bucket(client, &bucket).await;
     });
 }
+
+/// Full ack shape for `PutBucketVersioning`: 200, wire IDs only, empty body.
+#[test]
+fn test_put_bucket_versioning_ack_shape() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
+
+        let body = "<VersioningConfiguration \
+             xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
+             <Status>Enabled</Status></VersioningConfiguration>";
+        let md5 = content_md5_header(body.as_bytes());
+        let response = send_signed_request(
+            "PUT",
+            &format!("{}/{}?versioning=", CTX.endpoint(), bucket),
+            body.as_bytes(),
+            [(md5.0.as_str(), md5.1.as_str())],
+        );
+        assert_shape(
+            "PutBucketVersioning ack",
+            &response,
+            &shape().status(200).headers(id_headers()).body_empty(),
+        );
+
+        cleanup_versioned_bucket(client, &bucket).await;
+    });
+}

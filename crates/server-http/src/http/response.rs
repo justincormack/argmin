@@ -1610,8 +1610,8 @@ impl S3Response {
 
     /// Build a response for `PutObjectRetention`.
     #[must_use]
-    pub fn put_object_retention() -> Self {
-        Self::new(200)
+    pub fn put_object_retention(version_id: VersionId) -> Self {
+        Self::new(200).header("x-amz-version-id", &format_version_id(version_id))
     }
 
     /// Build a response for `GetObjectRetention`.
@@ -1623,8 +1623,8 @@ impl S3Response {
 
     /// Build a response for `PutObjectLegalHold`.
     #[must_use]
-    pub fn put_object_legal_hold() -> Self {
-        Self::new(200)
+    pub fn put_object_legal_hold(version_id: VersionId) -> Self {
+        Self::new(200).header("x-amz-version-id", &format_version_id(version_id))
     }
 
     /// Build a response for `GetObjectLegalHold`.

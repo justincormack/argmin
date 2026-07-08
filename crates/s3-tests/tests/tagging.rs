@@ -3437,3 +3437,64 @@ fn test_get_object_tagging_response_shape() {
         s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
     });
 }
+
+/// Full ack shapes for the tagging write surfaces. AWS acknowledges
+/// PutBucketTagging with 204 (not 200), the object PUT with 200, and both
+/// deletes with 204.
+#[test]
+fn test_tagging_write_ack_shapes() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
+        let tagging = "<Tagging><TagSet><Tag><Key>k</Key><Value>v</Value></Tag></TagSet></Tagging>";
+        let md5 = content_md5_header(tagging.as_bytes());
+
+        let put_bucket = send_signed_request(
+            "PUT",
+            &format!("{}/{}?tagging=", CTX.endpoint(), bucket),
+            tagging.as_bytes(),
+            [(md5.0.as_str(), md5.1.as_str())],
+        );
+        assert_shape(
+            "PutBucketTagging ack",
+            &put_bucket,
+            &shape().status(204).headers(id_headers()).body_empty(),
+        );
+        assert_shape(
+            "DeleteBucketTagging ack",
+            &raw_bucket("DELETE", &bucket, Some("tagging=")),
+            &shape().status(204).headers(id_headers()).body_empty(),
+        );
+
+        s3_tests::put_object_retrying_operation_aborted(client, &bucket, "tag-ack", b"x".to_vec())
+            .await;
+        let put_object = send_signed_request(
+            "PUT",
+            &format!("{}/{}/tag-ack?tagging=", CTX.endpoint(), bucket),
+            tagging.as_bytes(),
+            [(md5.0.as_str(), md5.1.as_str())],
+        );
+        assert_shape(
+            "PutObjectTagging ack",
+            &put_object,
+            &shape().status(200).headers(id_headers()).body_empty(),
+        );
+        let delete_object_tagging = send_signed_request(
+            "DELETE",
+            &format!("{}/{}/tag-ack?tagging=", CTX.endpoint(), bucket),
+            b"",
+            std::iter::empty::<(&str, &str)>(),
+        );
+        assert_shape(
+            "DeleteObjectTagging ack",
+            &delete_object_tagging,
+            &shape().status(204).headers(id_headers()).body_empty(),
+        );
+
+        s3_tests::delete_object_retrying_operation_aborted(client, &bucket, "tag-ack")
+            .await
+            .unwrap();
+        delete_bucket_retrying_operation_aborted(client, &bucket).await;
+    });
+}

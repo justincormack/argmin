@@ -10,7 +10,7 @@ use aws_sdk_s3::types::{
 use s3_tests::{
     assert_s3_err_code, disable_bucket_public_access_block, err_status, raw_bucket,
     send_signed_request,
-    shape::{assert_shape, shape, xml_response_headers},
+    shape::{assert_shape, id_headers, shape, xml_response_headers},
     unique_bucket, SendRetryingOperationAborted, CTX,
 };
 
@@ -1289,6 +1289,47 @@ fn test_get_bucket_acl_response_shape() {
             ),
         );
 
+        s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
+    });
+}
+
+/// Full ack shapes for canned-ACL writes: PutBucketAcl and PutObjectAcl
+/// both acknowledge with 200, wire IDs only, empty body.
+#[test]
+fn test_acl_write_ack_shapes() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_acl_enabled_bucket().await;
+
+        let put_bucket_acl = send_signed_request(
+            "PUT",
+            &format!("{}/{}?acl=", CTX.endpoint(), bucket),
+            b"",
+            [("x-amz-acl", "private")],
+        );
+        assert_shape(
+            "PutBucketAcl ack",
+            &put_bucket_acl,
+            &shape().status(200).headers(id_headers()).body_empty(),
+        );
+
+        s3_tests::put_object_retrying_operation_aborted(client, &bucket, "acl-ack", b"x".to_vec())
+            .await;
+        let put_object_acl = send_signed_request(
+            "PUT",
+            &format!("{}/{}/acl-ack?acl=", CTX.endpoint(), bucket),
+            b"",
+            [("x-amz-acl", "private")],
+        );
+        assert_shape(
+            "PutObjectAcl ack",
+            &put_object_acl,
+            &shape().status(200).headers(id_headers()).body_empty(),
+        );
+
+        s3_tests::delete_object_retrying_operation_aborted(client, &bucket, "acl-ack")
+            .await
+            .unwrap();
         s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
     });
 }

@@ -3252,3 +3252,38 @@ fn test_get_bucket_ownership_controls_response_shape() {
         s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
     });
 }
+
+/// Full ack shapes for PutBucketOwnershipControls (200) and
+/// DeleteBucketOwnershipControls (204).
+#[test]
+fn test_ownership_controls_write_ack_shapes() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
+
+        let config = "<OwnershipControls \
+             xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Rule>\
+             <ObjectOwnership>BucketOwnerPreferred</ObjectOwnership></Rule>\
+             </OwnershipControls>";
+        let md5 = content_md5_header(config.as_bytes());
+        let put = s3_tests::send_signed_request(
+            "PUT",
+            &format!("{}/{}?ownershipControls=", CTX.endpoint(), bucket),
+            config.as_bytes(),
+            [(md5.0.as_str(), md5.1.as_str())],
+        );
+        assert_shape(
+            "PutBucketOwnershipControls ack",
+            &put,
+            &shape().status(200).headers(id_headers()).body_empty(),
+        );
+        assert_shape(
+            "DeleteBucketOwnershipControls ack",
+            &raw_bucket("DELETE", &bucket, Some("ownershipControls=")),
+            &shape().status(204).headers(id_headers()).body_empty(),
+        );
+
+        s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
+    });
+}

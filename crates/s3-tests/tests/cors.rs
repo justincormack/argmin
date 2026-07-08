@@ -1035,3 +1035,36 @@ fn test_get_bucket_cors_response_shape() {
         s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
     });
 }
+
+/// Full ack shapes for PutBucketCors (200) and DeleteBucketCors (204).
+#[test]
+fn test_cors_write_ack_shapes() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
+
+        let config = "<CORSConfiguration><CORSRule>\
+             <AllowedOrigin>https://example.com</AllowedOrigin>\
+             <AllowedMethod>GET</AllowedMethod></CORSRule></CORSConfiguration>";
+        let md5 = content_md5_header(config.as_bytes());
+        let put = send_signed_request(
+            "PUT",
+            &format!("{}/{}?cors=", CTX.endpoint(), bucket),
+            config.as_bytes(),
+            [(md5.0.as_str(), md5.1.as_str())],
+        );
+        assert_shape(
+            "PutBucketCors ack",
+            &put,
+            &shape().status(200).headers(id_headers()).body_empty(),
+        );
+        assert_shape(
+            "DeleteBucketCors ack",
+            &raw_bucket("DELETE", &bucket, Some("cors=")),
+            &shape().status(204).headers(id_headers()).body_empty(),
+        );
+
+        s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
+    });
+}

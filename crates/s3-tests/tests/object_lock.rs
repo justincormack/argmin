@@ -4656,3 +4656,113 @@ fn test_object_lock_put_obj_retention_shorten_default_retention_denied() {
         cleanup_object_lock_bucket(&bucket).await;
     });
 }
+
+/// Full ack shapes for the object-lock write surfaces: the bucket-level
+/// PutObjectLockConfiguration acks with wire IDs only, while
+/// PutObjectLegalHold and PutObjectRetention echo the affected version in
+/// x-amz-version-id (AWS probed).
+#[test]
+fn test_object_lock_write_ack_shapes() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_object_lock_bucket().await;
+
+        let config = "<ObjectLockConfiguration \
+             xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
+             <ObjectLockEnabled>Enabled</ObjectLockEnabled>\
+             </ObjectLockConfiguration>";
+        let md5 = content_md5_header(config.as_bytes());
+        let put_config = send_signed_request(
+            "PUT",
+            &format!("{}/{}?object-lock=", CTX.endpoint(), bucket),
+            config.as_bytes(),
+            [(md5.0.as_str(), md5.1.as_str())],
+        );
+        assert_shape(
+            "PutObjectLockConfiguration ack",
+            &put_config,
+            &shape().status(200).headers(id_headers()).body_empty(),
+        );
+
+        let put = client
+            .put_object()
+            .bucket(&bucket)
+            .key("lock-ack")
+            .body(ByteStream::from_static(b"x"))
+            .send()
+            .await
+            .unwrap();
+        let version_id = put
+            .version_id()
+            .expect("lock bucket is versioned")
+            .to_string();
+        let ack_with_version = |context: &str, response: &s3_tests::RawResponse| {
+            assert_shape(
+                context,
+                response,
+                &shape()
+                    .status(200)
+                    .headers(id_headers())
+                    .header("x-amz-version-id", version_id.as_str())
+                    .body_empty(),
+            );
+        };
+
+        let hold_on = "<LegalHold><Status>ON</Status></LegalHold>";
+        let md5 = content_md5_header(hold_on.as_bytes());
+        ack_with_version(
+            "PutObjectLegalHold on ack",
+            &send_signed_request(
+                "PUT",
+                &format!("{}/{}/lock-ack?legal-hold=", CTX.endpoint(), bucket),
+                hold_on.as_bytes(),
+                [(md5.0.as_str(), md5.1.as_str())],
+            ),
+        );
+        let hold_off = "<LegalHold><Status>OFF</Status></LegalHold>";
+        let md5 = content_md5_header(hold_off.as_bytes());
+        ack_with_version(
+            "PutObjectLegalHold off ack",
+            &send_signed_request(
+                "PUT",
+                &format!("{}/{}/lock-ack?legal-hold=", CTX.endpoint(), bucket),
+                hold_off.as_bytes(),
+                [(md5.0.as_str(), md5.1.as_str())],
+            ),
+        );
+
+        // Governance retention with bypass cleanup below.
+        let retain_until = governance_retain_until()
+            .fmt(aws_sdk_s3::primitives::DateTimeFormat::DateTime)
+            .expect("format retain-until date");
+        let retention = format!(
+            "<Retention><Mode>GOVERNANCE</Mode>\
+             <RetainUntilDate>{retain_until}</RetainUntilDate></Retention>"
+        );
+        let md5 = content_md5_header(retention.as_bytes());
+        ack_with_version(
+            "PutObjectRetention ack",
+            &send_signed_request(
+                "PUT",
+                &format!(
+                    "{}/{}/lock-ack?retention=&x-amz-bypass-governance-retention=true",
+                    CTX.endpoint(),
+                    bucket
+                ),
+                retention.as_bytes(),
+                [(md5.0.as_str(), md5.1.as_str())],
+            ),
+        );
+
+        client
+            .delete_object()
+            .bucket(&bucket)
+            .key("lock-ack")
+            .version_id(&version_id)
+            .bypass_governance_retention(true)
+            .send()
+            .await
+            .unwrap();
+        s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
+    });
+}

@@ -2315,7 +2315,7 @@ impl HttpFrontend {
                     .header("x-amz-bypass-governance-retention")
                     .is_some_and(|value| value.eq_ignore_ascii_case("true"));
                 let requester = Self::requester_from_auth(auth);
-                self.coordinator.put_object_retention(
+                let version_id = self.coordinator.put_object_retention(
                     &crate::coordinator::PutObjectRetentionRequest {
                         object: object_version_request(
                             &bucket,
@@ -2328,7 +2328,7 @@ impl HttpFrontend {
                         bypass_governance,
                     },
                 )?;
-                Ok(S3Response::put_object_retention())
+                Ok(S3Response::put_object_retention(version_id))
             }
             S3Operation::GetObjectRetention { bucket, key } => {
                 let vid = parse_version_id(req)?;
@@ -2352,7 +2352,7 @@ impl HttpFrontend {
                 let vid = parse_version_id(req)?;
                 let legal_hold = xml::parse_object_legal_hold_xml(&req.body)?;
                 let requester = Self::requester_from_auth(auth);
-                self.coordinator.put_object_legal_hold(
+                let version_id = self.coordinator.put_object_legal_hold(
                     &crate::coordinator::PutObjectLegalHoldRequest {
                         object: object_version_request(
                             &bucket,
@@ -2364,7 +2364,7 @@ impl HttpFrontend {
                         legal_hold,
                     },
                 )?;
-                Ok(S3Response::put_object_legal_hold())
+                Ok(S3Response::put_object_legal_hold(version_id))
             }
             S3Operation::GetObjectLegalHold { bucket, key } => {
                 let vid = parse_version_id(req)?;

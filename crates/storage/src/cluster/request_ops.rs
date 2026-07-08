@@ -8509,6 +8509,7 @@ impl super::StorageCluster {
         })
     }
 
+    /// Returns the version id the retention was applied to.
     pub fn put_object_retention_if<E>(
         &self,
         bucket: &BucketName,
@@ -8516,17 +8517,18 @@ impl super::StorageCluster {
         version_id: Option<VersionId>,
         retention: ObjectRetention,
         mut action: impl FnMut(&StoredObject) -> Result<VersionId, E>,
-    ) -> Result<Result<(), E>, ObjectPgActionError> {
+    ) -> Result<Result<VersionId, E>, ObjectPgActionError> {
         self.put_object_metadata_if(bucket, key, version_id, |stored| {
             let version_id = action(stored)?;
             Ok((
-                (),
+                version_id,
                 version_id,
                 PutObjectMetadataMutation::PutRetention(retention),
             ))
         })
     }
 
+    /// Returns the version id the legal hold was applied to.
     pub fn put_object_legal_hold_if<E>(
         &self,
         bucket: &BucketName,
@@ -8534,11 +8536,11 @@ impl super::StorageCluster {
         version_id: Option<VersionId>,
         legal_hold: StoredLegalHoldStatus,
         mut action: impl FnMut(&StoredObject) -> Result<VersionId, E>,
-    ) -> Result<Result<(), E>, ObjectPgActionError> {
+    ) -> Result<Result<VersionId, E>, ObjectPgActionError> {
         self.put_object_metadata_if(bucket, key, version_id, |stored| {
             let version_id = action(stored)?;
             Ok((
-                (),
+                version_id,
                 version_id,
                 PutObjectMetadataMutation::PutLegalHold(legal_hold),
             ))

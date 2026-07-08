@@ -357,10 +357,12 @@ impl Coordinator {
         Ok(())
     }
 
+    /// Returns the version id of the affected object version, echoed by
+    /// AWS in the response's `x-amz-version-id` header.
     pub fn put_object_retention(
         &self,
         req: &PutObjectRetentionRequest<'_>,
-    ) -> Result<(), ServerError> {
+    ) -> Result<VersionId, ServerError> {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::put_object_retention",
@@ -429,8 +431,7 @@ impl Coordinator {
                     can_discover_missing,
                     error,
                 )
-            })??;
-        Ok(())
+            })?
     }
 
     pub fn get_object_retention(
@@ -506,10 +507,12 @@ impl Coordinator {
             })?
     }
 
+    /// Returns the version id of the affected object version, echoed by
+    /// AWS in the response's `x-amz-version-id` header.
     pub fn put_object_legal_hold(
         &self,
         req: &PutObjectLegalHoldRequest<'_>,
-    ) -> Result<(), ServerError> {
+    ) -> Result<VersionId, ServerError> {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::put_object_legal_hold",
@@ -558,8 +561,7 @@ impl Coordinator {
                     can_discover_missing,
                     error,
                 )
-            })??;
-        Ok(())
+            })?
     }
 
     pub fn get_object_legal_hold(

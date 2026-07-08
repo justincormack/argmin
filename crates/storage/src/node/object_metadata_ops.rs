@@ -114,11 +114,11 @@ impl SharedStorageNode {
         version_id: Option<VersionId>,
         retention: ObjectRetention,
         action: impl FnOnce(&StoredObject) -> Result<VersionId, E>,
-    ) -> Result<Result<(), E>, ObjectPgActionError> {
+    ) -> Result<Result<VersionId, E>, ObjectPgActionError> {
         self.with_object_metadata_if(bucket, key, version_id, |pg, stored| match action(stored) {
             Ok(version_id) => {
                 PgMetadataStore::put_object_retention(pg, bucket, key, version_id, retention)?;
-                Ok(Ok(()))
+                Ok(Ok(version_id))
             }
             Err(error) => Ok(Err(error)),
         })
@@ -132,11 +132,11 @@ impl SharedStorageNode {
         version_id: Option<VersionId>,
         legal_hold: StoredLegalHoldStatus,
         action: impl FnOnce(&StoredObject) -> Result<VersionId, E>,
-    ) -> Result<Result<(), E>, ObjectPgActionError> {
+    ) -> Result<Result<VersionId, E>, ObjectPgActionError> {
         self.with_object_metadata_if(bucket, key, version_id, |pg, stored| match action(stored) {
             Ok(version_id) => {
                 PgMetadataStore::put_object_legal_hold(pg, bucket, key, version_id, legal_hold)?;
-                Ok(Ok(()))
+                Ok(Ok(version_id))
             }
             Err(error) => Ok(Err(error)),
         })

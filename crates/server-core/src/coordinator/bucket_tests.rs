@@ -565,11 +565,13 @@ fn put_object_retention_test(
     bypass_governance: bool,
     requester: Requester,
 ) -> Result<(), ServerError> {
-    coord.put_object_retention(&PutObjectRetentionRequest {
-        object: object_version_request(bucket, key, version_id, requester),
-        retention,
-        bypass_governance,
-    })
+    coord
+        .put_object_retention(&PutObjectRetentionRequest {
+            object: object_version_request(bucket, key, version_id, requester),
+            retention,
+            bypass_governance,
+        })
+        .map(|_| ())
 }
 
 fn grants_contain(acl_grants: &AclGrants, grantee: &AclGrantee, permission: AclPermission) -> bool {
