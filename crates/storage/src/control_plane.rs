@@ -4893,7 +4893,7 @@ impl UnixControlPlaneClient {
         original_error: &ControlPlaneError,
     ) -> Result<ClusterRuntimeMapSnapshot, ControlPlaneError> {
         let deadline = Instant::now() + CONTROL_PLANE_RPC_CHECK_APPLIED_DEADLINE;
-        let mut last_observation_error;
+        let mut last_observation_error = None;
         loop {
             match self.pg_runtime_map_snapshot_with_read_timeout(
                 pg_id,
@@ -4910,10 +4910,36 @@ impl UnixControlPlaneClient {
                     ) {
                         return Ok(runtime_map);
                     }
-                    last_observation_error = None;
+                    last_observation_error = Some(
+                        runtime_map
+                            .pg_routes()
+                            .iter()
+                            .find(|route| route.pg_id() == pg_id)
+                            .map_or_else(
+                                || {
+                                    format!(
+                                        "runtime map at epoch {} has no route for PG {}",
+                                        runtime_map.cluster_epoch().get(),
+                                        pg_id.get()
+                                    )
+                                },
+                                |route| {
+                                    format!(
+                                        "runtime map at epoch {} route epoch {} state {:?} acting set {:?} transfer {:?}",
+                                        runtime_map.cluster_epoch().get(),
+                                        route.cluster_epoch().get(),
+                                        route.state(),
+                                        route.acting_set(),
+                                        route.peering_metadata_transfer()
+                                    )
+                                },
+                            ),
+                    );
                 }
                 Err(error) => {
-                    last_observation_error = Some(error.to_string());
+                    if last_observation_error.is_none() {
+                        last_observation_error = Some(error.to_string());
+                    }
                 }
             }
             if Instant::now() >= deadline {
@@ -5587,7 +5613,7 @@ impl AuthenticatedUnixControlPlaneClient {
         original_error: &ControlPlaneError,
     ) -> Result<ClusterRuntimeMapSnapshot, ControlPlaneError> {
         let deadline = Instant::now() + CONTROL_PLANE_RPC_CHECK_APPLIED_DEADLINE;
-        let mut last_observation_error;
+        let mut last_observation_error = None;
         loop {
             match self.admin_pg_runtime_map_snapshot_with_read_timeout(
                 pg_id,
@@ -5604,10 +5630,36 @@ impl AuthenticatedUnixControlPlaneClient {
                     ) {
                         return Ok(runtime_map);
                     }
-                    last_observation_error = None;
+                    last_observation_error = Some(
+                        runtime_map
+                            .pg_routes()
+                            .iter()
+                            .find(|route| route.pg_id() == pg_id)
+                            .map_or_else(
+                                || {
+                                    format!(
+                                        "runtime map at epoch {} has no route for PG {}",
+                                        runtime_map.cluster_epoch().get(),
+                                        pg_id.get()
+                                    )
+                                },
+                                |route| {
+                                    format!(
+                                        "runtime map at epoch {} route epoch {} state {:?} acting set {:?} transfer {:?}",
+                                        runtime_map.cluster_epoch().get(),
+                                        route.cluster_epoch().get(),
+                                        route.state(),
+                                        route.acting_set(),
+                                        route.peering_metadata_transfer()
+                                    )
+                                },
+                            ),
+                    );
                 }
                 Err(error) => {
-                    last_observation_error = Some(error.to_string());
+                    if last_observation_error.is_none() {
+                        last_observation_error = Some(error.to_string());
+                    }
                 }
             }
             if Instant::now() >= deadline {
@@ -14709,6 +14761,151 @@ mod tests {
             .iter()
             .find(|route| route.pg_id() == PgId::new(43))
             .unwrap();
+        assert_eq!(route.acting_set(), &[NodeId::new(2)]);
+        assert_eq!(route.peering_metadata_transfer(), Some(transfer));
+        let metrics = verifier_for_assert.metrics_snapshot();
+        assert_eq!(metrics.accepted_total(), 2);
+        assert_eq!(
+            metrics.accepted_for_operation(ControlPlaneAuthOperation::AdminControlPlaneCommand),
+            2
+        );
+        assert_eq!(metrics.rejected_total(), 0);
+    }
+
+    #[test]
+    fn authenticated_admin_metadata_transfer_confirms_after_lost_response() {
+        let tmp = test_util::tempdir();
+        let socket_path = tmp.path().join("control-plane.sock");
+        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+        for node_id in [1, 2] {
+            authority
+                .set_node_membership(NodeId::new(node_id), NodeMembershipState::Active)
+                .unwrap();
+            assert!(heartbeat_until_serving(&mut authority, node_id, 1_000).serving());
+        }
+        let active_proof = PgMetadataProof {
+            applied_log_index: 9,
+            applied_log_hash: 10,
+            state_digest: 11,
+        };
+        authority
+            .set_pg_acting_set(PgId::new(43), vec![NodeId::new(1)])
+            .unwrap();
+        heartbeat_with_pg_proof(
+            &mut authority,
+            1,
+            43,
+            PgState::Peering,
+            active_proof,
+            false,
+            2_000,
+        );
+        authority
+            .complete_pg_peering(
+                PgId::new(43),
+                NodeId::new(1),
+                node_incarnation(&authority, 1),
+                2_001,
+            )
+            .unwrap();
+        heartbeat_with_pg_proof(
+            &mut authority,
+            1,
+            43,
+            PgState::Active,
+            active_proof,
+            false,
+            2_002,
+        );
+        let active_epoch = authority.snapshot().cluster_epoch();
+        let expected_transfer_epoch = ClusterEpoch::new(active_epoch.get() + 1).unwrap();
+        let imported_proof = PgMetadataProof {
+            applied_log_index: 9,
+            applied_log_hash: 12,
+            state_digest: 11,
+        };
+        let transfer = PgMetadataTransferProof::new_with_imported_metadata_proof(
+            active_epoch,
+            active_proof,
+            imported_proof,
+        );
+        let verifier = admin_auth_verifier("auth-cluster", "admin-1");
+        let verifier_for_assert = verifier.clone();
+        let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _addr) = listener.accept().unwrap();
+            let request = read_control_plane_unix_request(&mut stream).unwrap();
+            assert_eq!(
+                request.kind,
+                ControlPlaneRpcKind::SetPgActingSetWithMetadataTransferRuntimeMap
+            );
+            let response = build_control_plane_unix_response_with_auth(
+                &mut authority,
+                request,
+                2_003,
+                Some(&verifier),
+            )
+            .expect("authenticated metadata-transfer install should apply before response loss");
+            assert_eq!(
+                response.kind,
+                ControlPlaneRpcKind::SetPgActingSetWithMetadataTransferRuntimeMap
+            );
+            assert_eq!(
+                authority.snapshot().cluster_epoch(),
+                expected_transfer_epoch
+            );
+            drop(response);
+            drop(stream);
+
+            let (mut stream, _addr) = listener.accept().unwrap();
+            let request = read_control_plane_unix_request(&mut stream).unwrap();
+            assert_eq!(request.kind, ControlPlaneRpcKind::PgRuntimeMapSnapshot);
+            let runtime_map = authority
+                .pg_runtime_map_snapshot(PgId::new(43), 2_003)
+                .unwrap();
+            assert!(
+                metadata_transfer_install_applied(
+                    &runtime_map,
+                    PgId::new(43),
+                    &[NodeId::new(2)],
+                    transfer,
+                    expected_transfer_epoch,
+                ),
+                "server-side confirmation route should be observable before response"
+            );
+            respond_control_plane_unix_request_with_auth(
+                &mut authority,
+                &mut stream,
+                request,
+                2_003,
+                &verifier,
+            )
+            .unwrap();
+        });
+
+        let client = AuthenticatedUnixControlPlaneClient::new(
+            UnixControlPlaneClient::new(&socket_path),
+            admin_auth_credential("auth-cluster", "admin-1"),
+        );
+        let runtime_map = client.set_pg_acting_set_with_metadata_transfer_runtime_map_checked(
+            PgId::new(43),
+            vec![NodeId::new(2)],
+            transfer,
+            expected_transfer_epoch,
+            2_003,
+        );
+
+        server.join().unwrap();
+        let runtime_map = runtime_map.unwrap();
+        assert_eq!(runtime_map.cluster_epoch(), expected_transfer_epoch);
+        let route = runtime_map
+            .pg_routes()
+            .iter()
+            .find(|route| route.pg_id() == PgId::new(43))
+            .unwrap();
+        assert_eq!(route.cluster_epoch(), expected_transfer_epoch);
+        assert_eq!(route.state(), PgState::Peering);
         assert_eq!(route.acting_set(), &[NodeId::new(2)]);
         assert_eq!(route.peering_metadata_transfer(), Some(transfer));
         let metrics = verifier_for_assert.metrics_snapshot();
