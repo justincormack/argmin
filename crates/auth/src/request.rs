@@ -9,6 +9,7 @@ use crate::canonical::{
     parse_amz_date, sha256_hex, string_to_sign,
 };
 use crate::credential::{parse_credential_scope_ref, CredentialStore};
+use crate::encoding::{hex_encode_lower, percent_decode_lossy};
 use crate::error::AuthError;
 use crate::sigv4::{
     derive_signing_key, parse_auth_header, unsigned_required_headers, verify_request_record,
@@ -677,46 +678,6 @@ fn query_without_signature(query: &str) -> String {
         .filter(|pair| pair.split('=').next().unwrap_or("") != "X-Amz-Signature")
         .collect::<Vec<_>>()
         .join("&")
-}
-
-fn percent_decode_lossy(s: &str) -> Cow<'_, str> {
-    if !s.as_bytes().contains(&b'%') {
-        return Cow::Borrowed(s);
-    }
-    let bytes = s.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let (Some(hi), Some(lo)) = (hex_val(bytes[i + 1]), hex_val(bytes[i + 2])) {
-                out.push(hi << 4 | lo);
-                i += 3;
-                continue;
-            }
-        }
-        out.push(bytes[i]);
-        i += 1;
-    }
-    Cow::Owned(String::from_utf8_lossy(&out).into_owned())
-}
-
-fn hex_val(b: u8) -> Option<u8> {
-    match b {
-        b'0'..=b'9' => Some(b - b'0'),
-        b'a'..=b'f' => Some(b - b'a' + 10),
-        b'A'..=b'F' => Some(b - b'A' + 10),
-        _ => None,
-    }
-}
-
-fn hex_encode_lower(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut s = String::with_capacity(bytes.len() * 2);
-    for &b in bytes {
-        s.push(HEX[(b >> 4) as usize] as char);
-        s.push(HEX[(b & 0x0f) as usize] as char);
-    }
-    s
 }
 
 #[cfg(test)]
@@ -1879,6 +1840,8 @@ mod tests {
 
     #[test]
     fn hex_val_coverage() {
+        use crate::encoding::hex_val;
+
         assert_eq!(hex_val(b'0'), Some(0));
         assert_eq!(hex_val(b'9'), Some(9));
         assert_eq!(hex_val(b'a'), Some(10));

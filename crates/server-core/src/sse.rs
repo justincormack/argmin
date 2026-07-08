@@ -7,7 +7,6 @@ use storage::{
     SSE_C_VALIDATOR_SALT_LEN, SSE_C_WRAPPED_DEK_LEN, SSE_C_WRAP_NONCE_LEN, SSE_C_WRAP_SALT_LEN,
     SSE_S3_CHECKSUM_NONCE_LEN, SSE_S3_SEGMENT_NONCE_PREFIX_LEN, SSE_S3_WRAP_NONCE_LEN,
 };
-use subtle::ConstantTimeEq;
 
 use crate::error::ServerError;
 use crate::system_metadata::ObjectChecksumMetadata;
@@ -486,7 +485,7 @@ pub fn validate_sse_customer_read(
         return Err(sse_customer_validator_key_unavailable());
     }
     let actual = compute_validator_hmac(validator, &state.validator_salt, request.customer_key());
-    if !constant_time_eq(&state.validator_hmac, &actual) {
+    if !auth::constant_time_eq(&state.validator_hmac, &actual) {
         return Err(ServerError::AccessDenied);
     }
     Ok(request.response_headers())
@@ -636,7 +635,7 @@ fn validate_sse_customer_write(
         return Err(sse_customer_validator_key_unavailable());
     }
     let actual = compute_validator_hmac(validator, &state.validator_salt, request.customer_key());
-    if !constant_time_eq(&state.validator_hmac, &actual) {
+    if !auth::constant_time_eq(&state.validator_hmac, &actual) {
         return Err(ServerError::InvalidRequest {
             reason: "The provided encryption parameters did not match the ones used originally."
                 .to_string(),
@@ -722,13 +721,6 @@ fn compute_validator_hmac(
     tag.as_ref()
         .try_into()
         .expect("HMAC-SHA256 output length should be 32 bytes")
-}
-
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    a.ct_eq(b).into()
 }
 
 fn derive_wrap_key(

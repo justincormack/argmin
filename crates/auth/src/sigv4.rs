@@ -8,6 +8,7 @@ use crate::canonical::{
 use crate::credential::{
     parse_credential_scope_ref, CredentialRecord, CredentialScope, CredentialStore, SecretKey,
 };
+use crate::encoding::hex_encode_lower;
 use crate::error::AuthError;
 use crate::request::HeaderSource;
 use crate::{is_lower_hex, MAX_SIGNED_HEADERS_LEN, MAX_SIGNED_HEADER_COUNT, SIGNATURE_HEX_LEN};
@@ -269,15 +270,8 @@ pub(crate) fn hmac_sha256(key: &[u8], data: &[u8]) -> hmac::Tag {
 }
 
 pub(crate) fn hex_encode(bytes: &[u8]) -> String {
-    let mut s = String::with_capacity(bytes.len() * 2);
-    for &b in bytes {
-        s.push(HEX_LOWER[(b >> 4) as usize] as char);
-        s.push(HEX_LOWER[(b & 0x0f) as usize] as char);
-    }
-    s
+    hex_encode_lower(bytes)
 }
-
-const HEX_LOWER: &[u8; 16] = b"0123456789abcdef";
 
 #[cfg(test)]
 mod tests {

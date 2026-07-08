@@ -1,10 +1,12 @@
 /// Canonical request construction per AWS SigV4 spec.
 use ring::digest;
 
+use crate::encoding::{hex_encode_lower, hex_val, percent_decode_lossy};
+
 /// SHA-256 hash as lowercase hex string.
 pub fn sha256_hex(data: &[u8]) -> String {
     let hash = digest::digest(&digest::SHA256, data);
-    hex_encode(hash.as_ref())
+    hex_encode_lower(hash.as_ref())
 }
 
 /// Percent-encode a value per SigV4 rules (RFC 3986 unreserved chars only).
@@ -174,30 +176,7 @@ pub fn canonical_query_string(query: &str) -> String {
 
 /// Percent-decode a string (RFC 3986). Does NOT treat + as space.
 fn percent_decode(s: &str) -> String {
-    let mut result = Vec::with_capacity(s.len());
-    let bytes = s.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let (Some(hi), Some(lo)) = (hex_val(bytes[i + 1]), hex_val(bytes[i + 2])) {
-                result.push(hi << 4 | lo);
-                i += 3;
-                continue;
-            }
-        }
-        result.push(bytes[i]);
-        i += 1;
-    }
-    String::from_utf8_lossy(&result).to_string()
-}
-
-fn hex_val(b: u8) -> Option<u8> {
-    match b {
-        b'0'..=b'9' => Some(b - b'0'),
-        b'a'..=b'f' => Some(b - b'a' + 10),
-        b'A'..=b'F' => Some(b - b'A' + 10),
-        _ => None,
-    }
+    percent_decode_lossy(s).into_owned()
 }
 
 /// Build the string-to-sign per SigV4 spec.
@@ -439,16 +418,6 @@ fn parse_fixed_width_u32_ascii(bytes: &[u8]) -> Option<u32> {
     Some(value)
 }
 
-fn hex_encode(bytes: &[u8]) -> String {
-    let mut s = String::with_capacity(bytes.len() * 2);
-    for &b in bytes {
-        s.push(HEX_LOWER[(b >> 4) as usize] as char);
-        s.push(HEX_LOWER[(b & 0x0f) as usize] as char);
-    }
-    s
-}
-
-const HEX_LOWER: &[u8; 16] = b"0123456789abcdef";
 const HEX_UPPER: &[u8; 16] = b"0123456789ABCDEF";
 
 #[cfg(test)]

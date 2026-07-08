@@ -17,6 +17,7 @@
 pub mod bucket_policy;
 pub mod canonical;
 pub mod credential;
+mod encoding;
 pub mod error;
 pub mod post;
 pub mod request;

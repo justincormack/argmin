@@ -1026,12 +1026,16 @@ each is one refactor away from a panic:
   missing-header default. Remaining: `BucketVersioningState` has `from_u8` but
   no `as_str`/`parse`; `"Enabled"`/`"Suspended"` are literals in
   `xml.rs:1484-1485`. Add the missing halves.
-- [ ] auth helper triplication: `hex_encode` ×3 (`sigv4.rs:244`,
+- [x] auth helper triplication: `hex_encode` ×3 (`sigv4.rs:244`,
   `canonical.rs:442`, `request.rs:672`), `percent_decode` ×2
   (`canonical.rs:176`, `request.rs:642`), `hex_val` ×2 (`canonical.rs:194`,
   `request.rs:663`); and `server-core/src/sse.rs:735` re-implements
   `constant_time_eq` verbatim instead of using `auth::constant_time_eq`
-  (`auth/src/lib.rs:43`). Consolidate.
+  (`auth/src/lib.rs:43`). Fixed by adding a private `auth::encoding` module
+  for lowercase hex encoding, percent decoding, and hex-nibble parsing, then
+  routing canonical request construction, presigned request parsing, and SigV4
+  signature formatting through it. SSE-C validator comparisons now call
+  `auth::constant_time_eq` directly.
 
 ### P6. Error-type islands and wrong-blame mappings
 
