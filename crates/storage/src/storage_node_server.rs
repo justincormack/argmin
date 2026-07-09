@@ -15072,7 +15072,7 @@ mod tests {
         let error = decode_storage_rpc_response_payload(&mismatch.payload)
             .unwrap()
             .unwrap_err();
-        assert_eq!(error.code, StorageRpcErrorCode::Internal);
+        assert_eq!(error.code, StorageRpcErrorCode::ShardIntegrity);
         let reopened = SharedStorageNode::open_with_default_ec_shape(
             &config.data_dir,
             &config.pg_ids,
@@ -15341,7 +15341,7 @@ mod tests {
         let error = decode_storage_rpc_response_payload(&mismatch_response.payload)
             .unwrap()
             .unwrap_err();
-        assert_eq!(error.code, StorageRpcErrorCode::Internal);
+        assert_eq!(error.code, StorageRpcErrorCode::ShardIntegrity);
         let reopened = SharedStorageNode::open_with_default_ec_shape(
             &config.data_dir,
             &config.pg_ids,
