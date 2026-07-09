@@ -379,7 +379,7 @@ the findings below.
 
 ### Residuals from the verified fixes (W series)
 
-- [ ] **W1. V1's checksum-type rejection is HTTP-reachable on PutObject and
+- [x] **W1. V1's checksum-type rejection is HTTP-reachable on PutObject and
   unpinned against AWS** — the resolution note's "masked by HTTP-layer
   validation" claim is false for this field.
   `parse_put_object_request_metadata` filters only `x-amz-checksum-algorithm`
@@ -393,13 +393,29 @@ the findings below.
   stored metadata unvalidated against the algorithm. AWS-pin PutObject with
   invalid and valid-but-inapplicable checksum-type headers, then align.
 
-- [ ] **W2. V3's message/shape divergence reintroduced for checksum-type.**
+  Fixed 2026-07-09: AWS-facing `s3-tests::checksums` now pins that
+  `PutObject` ignores `x-amz-checksum-type` entirely: invalid values are
+  accepted, `COMPOSITE` is accepted for single-part `PutObject`, and stored
+  metadata/response headers report `FULL_OBJECT` for CRC32, CRC64NVME, and
+  SHA256 checksum value headers. The local `PutObject` metadata parser now
+  filters `x-amz-checksum-type` before `SystemMetadata` parsing, so invalid
+  values do not reject and explicit `COMPOSITE` cannot be stored for
+  single-part PUT.
+
+- [x] **W2. V3's message/shape divergence reintroduced for checksum-type.**
   Core emits plain `InvalidRequest` `"invalid checksum type: {value}"`
   (`system_metadata.rs:180`) while the HTTP MPU path emits `InvalidArgument`
   `"unsupported checksum type: {v}"` (`mod.rs:2734`) — two shapes/messages
   for the same field, and unlike V3's case the core one IS reachable over
   HTTP (W1). Same fix shape as d1f22148: shared constructor + AWS-pinned
   message.
+
+  Fixed with W1: the core `SystemMetadata` checksum-type parse error is no
+  longer reachable through `PutObject`; CopyObject REPLACE and
+  CreateMultipartUpload already strip checksum-type from generic metadata
+  parsing and handle checksum-type at their HTTP boundaries. The remaining
+  checksum-type HTTP validation surface is MPU-specific and keeps the
+  AWS-pinned MPU error shape.
 
 - [ ] **W3. Same-algorithm duplicate value headers are now first-wins at the
   parser** (`system_metadata.rs:186-198` — pre-fix was last-wins, so the

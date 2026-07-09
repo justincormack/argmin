@@ -446,6 +446,32 @@ async fn assert_stored_crc64nvme_full_object_checksum(bucket: &str, key: &str, e
     assert_eq!(checksum.checksum_type(), Some(&ChecksumType::FullObject));
 }
 
+async fn assert_stored_sha256_full_object_checksum(bucket: &str, key: &str, expected: &str) {
+    let client = CTX.client();
+    let head = client
+        .head_object()
+        .bucket(bucket)
+        .key(key)
+        .checksum_mode(ChecksumMode::Enabled)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(head.checksum_sha256(), Some(expected));
+    assert_eq!(head.checksum_type(), Some(&ChecksumType::FullObject));
+
+    let attrs = client
+        .get_object_attributes()
+        .bucket(bucket)
+        .key(key)
+        .object_attributes(ObjectAttributes::Checksum)
+        .send()
+        .await
+        .unwrap();
+    let checksum = attrs.checksum().expect("expected Checksum attributes");
+    assert_eq!(checksum.checksum_sha256(), Some(expected));
+    assert_eq!(checksum.checksum_type(), Some(&ChecksumType::FullObject));
+}
+
 async fn assert_no_stored_sha256_checksum(bucket: &str, key: &str, context: &str) {
     let client = CTX.client();
     let head = client
@@ -847,6 +873,220 @@ fn test_put_object_checksum_algorithm_literal_only_not_stored_as_checksum() {
         .await;
         assert_eq!(response.status, 200, "response: {response:?}");
         assert_no_stored_sha256_checksum(&bucket, key, "PutObject x-amz-checksum-algorithm").await;
+        cleanup(&bucket, &[key]).await;
+    });
+}
+
+#[test]
+fn test_put_object_invalid_checksum_type_without_value_is_ignored() {
+    s3_tests::run(async {
+        let bucket = setup_bucket().await;
+        let key = "invalid-checksum-type-without-value";
+        let body = b"invalid checksum type without value oracle";
+        let expected = checksum_base64(LocalChecksumAlgorithm::Crc64nvme, body);
+        let response = raw_put_object_with_checksum_headers(
+            &bucket,
+            key,
+            body,
+            &[("x-amz-checksum-type", "BOGUS".to_string())],
+        )
+        .await;
+        assert_eq!(response.status, 200, "response: {response:?}");
+        assert_eq!(
+            response_header(&response.headers, "x-amz-checksum-crc64nvme"),
+            Some(expected.as_str())
+        );
+        assert_eq!(
+            response_header(&response.headers, "x-amz-checksum-type"),
+            Some("FULL_OBJECT")
+        );
+        assert_stored_crc64nvme_full_object_checksum(&bucket, key, &expected).await;
+        cleanup(&bucket, &[key]).await;
+    });
+}
+
+#[test]
+fn test_put_object_invalid_checksum_type_with_value_is_ignored() {
+    s3_tests::run(async {
+        let bucket = setup_bucket().await;
+        let key = "invalid-checksum-type-with-value";
+        let body = b"invalid checksum type with value oracle";
+        let crc32 = checksum_base64(LocalChecksumAlgorithm::Crc32, body);
+        let response = raw_put_object_with_checksum_headers(
+            &bucket,
+            key,
+            body,
+            &[
+                ("x-amz-checksum-type", "BOGUS".to_string()),
+                ("x-amz-checksum-crc32", crc32.clone()),
+            ],
+        )
+        .await;
+        assert_eq!(response.status, 200, "response: {response:?}");
+        assert_eq!(
+            response_header(&response.headers, "x-amz-checksum-crc32"),
+            Some(crc32.as_str())
+        );
+        assert_eq!(
+            response_header(&response.headers, "x-amz-checksum-type"),
+            Some("FULL_OBJECT")
+        );
+        assert_stored_crc32_full_object_checksum(&bucket, key, &crc32).await;
+        cleanup(&bucket, &[key]).await;
+    });
+}
+
+#[test]
+fn test_put_object_composite_checksum_type_with_value_is_full_object() {
+    s3_tests::run(async {
+        let bucket = setup_bucket().await;
+        let key = "composite-checksum-type-with-value";
+        let body = b"composite checksum type on put object oracle";
+        let crc32 = checksum_base64(LocalChecksumAlgorithm::Crc32, body);
+        let response = raw_put_object_with_checksum_headers(
+            &bucket,
+            key,
+            body,
+            &[
+                ("x-amz-checksum-type", "COMPOSITE".to_string()),
+                ("x-amz-checksum-crc32", crc32.clone()),
+            ],
+        )
+        .await;
+        assert_eq!(response.status, 200, "response: {response:?}");
+        assert_eq!(
+            response_header(&response.headers, "x-amz-checksum-crc32"),
+            Some(crc32.as_str())
+        );
+        assert_eq!(
+            response_header(&response.headers, "x-amz-checksum-type"),
+            Some("FULL_OBJECT")
+        );
+        assert_stored_crc32_full_object_checksum(&bucket, key, &crc32).await;
+        cleanup(&bucket, &[key]).await;
+    });
+}
+
+#[test]
+fn test_put_object_full_object_checksum_type_with_value_is_full_object() {
+    s3_tests::run(async {
+        let bucket = setup_bucket().await;
+        let key = "full-object-checksum-type-with-value";
+        let body = b"full object checksum type on put object oracle";
+        let crc32 = checksum_base64(LocalChecksumAlgorithm::Crc32, body);
+        let response = raw_put_object_with_checksum_headers(
+            &bucket,
+            key,
+            body,
+            &[
+                ("x-amz-checksum-type", "FULL_OBJECT".to_string()),
+                ("x-amz-checksum-crc32", crc32.clone()),
+            ],
+        )
+        .await;
+        assert_eq!(response.status, 200, "response: {response:?}");
+        assert_eq!(
+            response_header(&response.headers, "x-amz-checksum-crc32"),
+            Some(crc32.as_str())
+        );
+        assert_eq!(
+            response_header(&response.headers, "x-amz-checksum-type"),
+            Some("FULL_OBJECT")
+        );
+        assert_stored_crc32_full_object_checksum(&bucket, key, &crc32).await;
+        cleanup(&bucket, &[key]).await;
+    });
+}
+
+#[test]
+fn test_put_object_composite_checksum_type_with_crc64nvme_is_full_object() {
+    s3_tests::run(async {
+        let bucket = setup_bucket().await;
+        let key = "composite-checksum-type-with-crc64nvme";
+        let body = b"composite checksum type with crc64nvme put object oracle";
+        let crc64 = checksum_base64(LocalChecksumAlgorithm::Crc64nvme, body);
+        let response = raw_put_object_with_checksum_headers(
+            &bucket,
+            key,
+            body,
+            &[
+                ("x-amz-checksum-type", "COMPOSITE".to_string()),
+                ("x-amz-checksum-crc64nvme", crc64.clone()),
+            ],
+        )
+        .await;
+        assert_eq!(response.status, 200, "response: {response:?}");
+        assert_eq!(
+            response_header(&response.headers, "x-amz-checksum-crc64nvme"),
+            Some(crc64.as_str())
+        );
+        assert_eq!(
+            response_header(&response.headers, "x-amz-checksum-type"),
+            Some("FULL_OBJECT")
+        );
+        assert_stored_crc64nvme_full_object_checksum(&bucket, key, &crc64).await;
+        cleanup(&bucket, &[key]).await;
+    });
+}
+
+#[test]
+fn test_put_object_composite_checksum_type_with_sha256_is_full_object() {
+    s3_tests::run(async {
+        let bucket = setup_bucket().await;
+        let key = "composite-checksum-type-with-sha256";
+        let body = b"composite checksum type with sha256 put object oracle";
+        let sha256 = checksum_base64(LocalChecksumAlgorithm::Sha256, body);
+        let response = raw_put_object_with_checksum_headers(
+            &bucket,
+            key,
+            body,
+            &[
+                ("x-amz-checksum-type", "COMPOSITE".to_string()),
+                ("x-amz-checksum-sha256", sha256.clone()),
+            ],
+        )
+        .await;
+        assert_eq!(response.status, 200, "response: {response:?}");
+        assert_eq!(
+            response_header(&response.headers, "x-amz-checksum-sha256"),
+            Some(sha256.as_str())
+        );
+        assert_eq!(
+            response_header(&response.headers, "x-amz-checksum-type"),
+            Some("FULL_OBJECT")
+        );
+        assert_stored_sha256_full_object_checksum(&bucket, key, &sha256).await;
+        cleanup(&bucket, &[key]).await;
+    });
+}
+
+#[test]
+fn test_put_object_full_object_checksum_type_with_sha256_is_full_object() {
+    s3_tests::run(async {
+        let bucket = setup_bucket().await;
+        let key = "full-object-checksum-type-with-sha256";
+        let body = b"full object checksum type with sha256 put object oracle";
+        let sha256 = checksum_base64(LocalChecksumAlgorithm::Sha256, body);
+        let response = raw_put_object_with_checksum_headers(
+            &bucket,
+            key,
+            body,
+            &[
+                ("x-amz-checksum-type", "FULL_OBJECT".to_string()),
+                ("x-amz-checksum-sha256", sha256.clone()),
+            ],
+        )
+        .await;
+        assert_eq!(response.status, 200, "response: {response:?}");
+        assert_eq!(
+            response_header(&response.headers, "x-amz-checksum-sha256"),
+            Some(sha256.as_str())
+        );
+        assert_eq!(
+            response_header(&response.headers, "x-amz-checksum-type"),
+            Some("FULL_OBJECT")
+        );
+        assert_stored_sha256_full_object_checksum(&bucket, key, &sha256).await;
         cleanup(&bucket, &[key]).await;
     });
 }

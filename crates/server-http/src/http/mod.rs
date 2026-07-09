@@ -440,11 +440,10 @@ fn parse_put_object_request_metadata<'a, I>(
 where
     I: IntoIterator<Item = (&'a str, &'a str)>,
 {
-    parse_request_metadata(
-        headers
-            .into_iter()
-            .filter(|(name, _)| !is_checksum_algorithm_header_name(name)),
-    )
+    parse_request_metadata(headers.into_iter().filter(|(name, _)| {
+        !is_checksum_algorithm_header_name(name)
+            && !name.eq_ignore_ascii_case("x-amz-checksum-type")
+    }))
 }
 
 fn parse_request_metadata_without_checksum_headers<'a, I>(
@@ -6466,6 +6465,30 @@ mod tests {
 
         assert_eq!(metadata.get("x-amz-meta-limit"), Some(value.as_str()));
         assert_eq!(system_metadata, SystemMetadata::EMPTY);
+    }
+
+    #[test]
+    fn parse_put_object_request_metadata_ignores_invalid_checksum_type() {
+        let (metadata, system_metadata) =
+            parse_put_object_request_metadata([("x-amz-checksum-type", "BOGUS")]).unwrap();
+
+        assert_eq!(metadata, MetadataBlob::new());
+        assert_eq!(system_metadata, SystemMetadata::EMPTY);
+    }
+
+    #[test]
+    fn parse_put_object_request_metadata_ignores_checksum_type_with_value() {
+        let (metadata, system_metadata) = parse_put_object_request_metadata([
+            ("x-amz-checksum-type", "COMPOSITE"),
+            ("x-amz-checksum-crc32", "AAAAAA=="),
+        ])
+        .unwrap();
+
+        assert_eq!(metadata, MetadataBlob::new());
+        let checksum = system_metadata.checksum().expect("checksum metadata");
+        assert_eq!(checksum.algorithm(), ChecksumAlgorithm::Crc32);
+        assert_eq!(checksum.checksum_type(), None);
+        assert_eq!(checksum.value(), "AAAAAA==");
     }
 
     #[test]
