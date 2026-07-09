@@ -89,6 +89,14 @@ impl ProcessTestControlPlaneAuth {
         format!("frontend-{instance_id}")
     }
 
+    fn admin_secret(instance_id: &str) -> String {
+        format!("process-test-admin-{instance_id}-secret")
+    }
+
+    fn admin_credential_id(instance_id: &str) -> String {
+        format!("admin-{instance_id}")
+    }
+
     fn raft_peer_config_entry(node_id: u64) -> String {
         format!(
             "{node_id}={}:1:{}",
@@ -102,6 +110,14 @@ impl ProcessTestControlPlaneAuth {
             "{instance_id}={}:1:{}",
             Self::frontend_credential_id(instance_id),
             Self::frontend_secret(instance_id)
+        )
+    }
+
+    fn admin_config_entry(instance_id: &str) -> String {
+        format!(
+            "{instance_id}={}:1:{}",
+            Self::admin_credential_id(instance_id),
+            Self::admin_secret(instance_id)
         )
     }
 
@@ -119,6 +135,14 @@ impl ProcessTestControlPlaneAuth {
         instance_ids
             .iter()
             .map(|instance_id| Self::frontend_config_entry(instance_id))
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+
+    fn admin_credentials_env(&self, instance_ids: &[&str]) -> String {
+        instance_ids
+            .iter()
+            .map(|instance_id| Self::admin_config_entry(instance_id))
             .collect::<Vec<_>>()
             .join(",")
     }
@@ -335,6 +359,16 @@ fn run_set_pg_acting_set_live(
     pg_id: u32,
     acting_set: &[u32],
 ) -> Output {
+    run_set_pg_acting_set_live_with_extra_env(bin, socket_path, pg_id, acting_set, &[])
+}
+
+fn run_set_pg_acting_set_live_with_extra_env(
+    bin: &Path,
+    socket_path: &Path,
+    pg_id: u32,
+    acting_set: &[u32],
+    extra_env: &[(&str, &str)],
+) -> Output {
     let mut command = Command::new(bin);
     command
         .arg("control-plane-set-pg-acting-set-live")
@@ -343,16 +377,29 @@ fn run_set_pg_acting_set_live(
     for node_id in acting_set {
         command.arg(node_id.to_string());
     }
+    for (key, value) in extra_env {
+        command.env(key, value);
+    }
     command
         .output()
         .expect("set-pg-acting-set live helper should run")
 }
 
-fn run_transfer_raft_leadership(bin: &Path, socket_path: &Path, node_id: u64) -> Output {
-    Command::new(bin)
+fn run_transfer_raft_leadership_with_extra_env(
+    bin: &Path,
+    socket_path: &Path,
+    node_id: u64,
+    extra_env: &[(&str, &str)],
+) -> Output {
+    let mut command = Command::new(bin);
+    command
         .arg("control-plane-transfer-raft-leadership")
         .arg(socket_path)
-        .arg(node_id.to_string())
+        .arg(node_id.to_string());
+    for (key, value) in extra_env {
+        command.env(key, value);
+    }
+    command
         .output()
         .expect("transfer Raft leadership helper should run")
 }
@@ -1522,11 +1569,59 @@ fn experimental_raft_transferred_process_leader_survives_old_leader_loss() {
             .as_nanos()
     );
     let raft_node_ids = [101, 102, 103];
-    let mut node102 = ChildGuard::spawn(&bin, test_dir.path(), &cluster_name, 102, &raft_node_ids);
+    let auth = ProcessTestControlPlaneAuth::new(&cluster_name);
+    let admin_instance_id = "transfer-admin";
+    let admin_credentials = auth.admin_credentials_env(&[admin_instance_id]);
+    let server_auth_env = [
+        (
+            "ARGMIN_CONTROL_PLANE_AUTH_CLUSTER_ID",
+            cluster_name.as_str(),
+        ),
+        (
+            "ARGMIN_CONTROL_PLANE_ADMIN_AUTH_CREDENTIALS",
+            admin_credentials.as_str(),
+        ),
+    ];
+    let admin_helper_auth_env = [
+        (
+            "ARGMIN_CONTROL_PLANE_AUTH_CLUSTER_ID",
+            cluster_name.as_str(),
+        ),
+        (
+            "ARGMIN_CONTROL_PLANE_ADMIN_AUTH_INSTANCE_ID",
+            admin_instance_id,
+        ),
+        (
+            "ARGMIN_CONTROL_PLANE_ADMIN_AUTH_CREDENTIALS",
+            admin_credentials.as_str(),
+        ),
+    ];
+    let mut node102 = ChildGuard::spawn_with_extra_env(
+        &bin,
+        test_dir.path(),
+        &cluster_name,
+        102,
+        &raft_node_ids,
+        &server_auth_env,
+    );
     wait_for_socket_file(&peer_socket(test_dir.path(), 102), &mut node102);
-    let mut node103 = ChildGuard::spawn(&bin, test_dir.path(), &cluster_name, 103, &raft_node_ids);
+    let mut node103 = ChildGuard::spawn_with_extra_env(
+        &bin,
+        test_dir.path(),
+        &cluster_name,
+        103,
+        &raft_node_ids,
+        &server_auth_env,
+    );
     wait_for_socket_file(&peer_socket(test_dir.path(), 103), &mut node103);
-    let mut node101 = ChildGuard::spawn(&bin, test_dir.path(), &cluster_name, 101, &raft_node_ids);
+    let mut node101 = ChildGuard::spawn_with_extra_env(
+        &bin,
+        test_dir.path(),
+        &cluster_name,
+        101,
+        &raft_node_ids,
+        &server_auth_env,
+    );
 
     let old_leader_socket = control_socket(test_dir.path(), 101);
     wait_for_runtime_map_ready_on(
@@ -1536,7 +1631,12 @@ fn experimental_raft_transferred_process_leader_survives_old_leader_loss() {
         &mut [&mut node101, &mut node102, &mut node103],
     );
 
-    let transfer = run_transfer_raft_leadership(&bin, &old_leader_socket, 102);
+    let transfer = run_transfer_raft_leadership_with_extra_env(
+        &bin,
+        &old_leader_socket,
+        102,
+        &admin_helper_auth_env,
+    );
     assert!(
         transfer.status.success(),
         "leadership transfer failed: {}\n{}",
@@ -1558,7 +1658,13 @@ fn experimental_raft_transferred_process_leader_survives_old_leader_loss() {
     };
 
     node101.stop();
-    let output = run_set_pg_acting_set_live(&bin, &new_leader_socket, 0, &[1]);
+    let output = run_set_pg_acting_set_live_with_extra_env(
+        &bin,
+        &new_leader_socket,
+        0,
+        &[1],
+        &admin_helper_auth_env,
+    );
     assert!(
         output.status.success(),
         "post-transfer acting-set change failed: {}\n{}",
@@ -1573,8 +1679,14 @@ fn experimental_raft_transferred_process_leader_survives_old_leader_loss() {
         &mut [&mut node102, &mut node103],
     );
 
-    let mut restarted101 =
-        ChildGuard::spawn(&bin, test_dir.path(), &cluster_name, 101, &raft_node_ids);
+    let mut restarted101 = ChildGuard::spawn_with_extra_env(
+        &bin,
+        test_dir.path(),
+        &cluster_name,
+        101,
+        &raft_node_ids,
+        &server_auth_env,
+    );
     wait_for_follower_artifact_pg_acting_set(
         &state_path(test_dir.path(), 101),
         PgId::new(0),

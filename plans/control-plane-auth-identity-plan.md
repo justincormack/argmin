@@ -585,6 +585,16 @@ Progress:
   frontend credentials in that smoke, giving the standard process bootstrap
   path real authenticated Unix coverage while preserving unauthenticated helper
   wrappers for the remaining local/test-only paths.
+- 2026-07-09: Extended the process auth helper to admin credentials and
+  converted the experimental Raft leadership-transfer process smoke to require
+  admin auth on every control-plane process. The
+  `control-plane-transfer-raft-leadership` and follow-up
+  `control-plane-set-pg-acting-set-live` helpers now run with a signed admin
+  credential in that smoke, covering real process-level admin command paths
+  alongside the existing unauthenticated wrappers used by tests that have not
+  opted into admin auth. The authenticated admin response verifier also now
+  tolerates only a tiny same-host response issue-time skew while keeping request
+  freshness strict.
 
 ## Replay Policy
 
