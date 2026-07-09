@@ -36,6 +36,12 @@ MD5/RPC3/RPC5/INT-4-core fixes, and adds findings `R3-1`–`R3-5` — two more
 high-severity availability regressions (R3-1, R3-2) from the INT-1 fix chain,
 in the same committed-timestamp guard.
 
+The companion [distributed correctness confidence review](distributed-correctness-confidence-review-2026-07.md)
+reviews baseline `0d61d3fc`, adds findings `DCC-1` through `DCC-4`, and turns
+the remaining work into an invariant, testing, fault-injection, and release-gate
+program. The companion supersedes this document where it discusses the latest
+committed-timestamp catch-up change.
+
 ## Cross-cutting themes
 
 Four systemic patterns produce most of the findings below; each is worth
