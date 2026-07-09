@@ -315,7 +315,7 @@ Status:
   RPCs. Authenticated transfer-leader envelopes now carry a short issued/expires
   freshness window; verification requires the complete window, rejects future or
   expired envelopes, rejects overlong windows, and process-level coverage proves
-  stale transfer-leader auth fails before OpenRaft dispatch or vote/term
+  expired transfer-leader auth fails before OpenRaft dispatch or vote/term
   mutation. Remaining replay work is broader observability and any later
   non-Raft transport freshness policy.
 - 2026-07-07: Started item 6 by adding compact Raft peer auth policy counters

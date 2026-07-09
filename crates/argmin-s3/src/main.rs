@@ -6301,7 +6301,7 @@ mod tests {
     }
 
     #[test]
-    fn experimental_raft_peer_rpc_rejects_stale_transfer_leader_auth_before_dispatch() {
+    fn experimental_raft_peer_rpc_rejects_expired_transfer_leader_auth_before_dispatch() {
         let harness = experimental_raft_test_harness("peer-transfer-leader-auth-before-dispatch");
         let cluster_name = format!(
             "argmin-s3-experimental-raft-peer-transfer-leader-auth-before-dispatch-{}",
@@ -6313,7 +6313,7 @@ mod tests {
         )
         .encode_frame_for_peer(&identity)
         .expect("transfer-leader peer request should encode");
-        let stale_frame = experimental_raft_peer_auth_credential(
+        let expired_frame = experimental_raft_peer_auth_credential(
             &cluster_name,
             1,
             "raft-node-1",
@@ -6331,9 +6331,9 @@ mod tests {
             nonce: Vec::new(),
             payload: request_frame,
         })
-        .expect("stale transfer-leader auth envelope should sign")
+        .expect("expired transfer-leader auth envelope should sign")
         .encode_frame()
-        .expect("stale transfer-leader auth envelope should encode");
+        .expect("expired transfer-leader auth envelope should encode");
         let policy = ControlPlaneRaftPeerTransportPolicy::from_peer_endpoints(
             cluster_name.clone(),
             [(1, "node-1".to_string()), (2, "node-2".to_string())],
@@ -6343,11 +6343,11 @@ mod tests {
         let before_status = harness
             .runtime
             .block_on(harness.authority.status())
-            .expect("status should read before stale transfer-leader auth");
+            .expect("status should read before expired transfer-leader auth");
         let (mut client_stream, mut server_stream) =
             UnixStream::pair().expect("test UnixStream pair should create");
-        write_control_plane_raft_peer_transport_frame(&mut client_stream, &stale_frame)
-            .expect("client should write stale transfer-leader auth frame");
+        write_control_plane_raft_peer_transport_frame(&mut client_stream, &expired_frame)
+            .expect("client should write expired transfer-leader auth frame");
         client_stream
             .set_read_timeout(Some(Duration::from_millis(50)))
             .expect("client stream read timeout should set");
@@ -6367,21 +6367,21 @@ mod tests {
         );
         assert!(
             matches!(result, Err(ExperimentalRaftPeerRpcWorkerError::PeerRpc(_))),
-            "stale transfer-leader auth should fail before dispatch: {result:?}"
+            "expired transfer-leader auth should fail before dispatch: {result:?}"
         );
         let after_status = harness
             .runtime
             .block_on(harness.authority.status())
-            .expect("status should read after stale transfer-leader auth");
+            .expect("status should read after expired transfer-leader auth");
         assert_eq!(
             after_status.persisted_vote(),
             before_status.persisted_vote(),
-            "stale transfer-leader auth must not mutate persisted vote"
+            "expired transfer-leader auth must not mutate persisted vote"
         );
         assert_eq!(
             after_status.current_term(),
             before_status.current_term(),
-            "stale transfer-leader auth must not mutate current term"
+            "expired transfer-leader auth must not mutate current term"
         );
         drop(server_stream);
 
@@ -6391,7 +6391,7 @@ mod tests {
         );
         assert!(
             response.is_err(),
-            "stale transfer-leader auth must not write a response"
+            "expired transfer-leader auth must not write a response"
         );
         let metrics = policy
             .auth_policy()
@@ -6404,7 +6404,7 @@ mod tests {
             1
         );
         assert_eq!(
-            metrics.rejected_for_reason(ControlPlaneAuthRejectionReason::StaleCredential),
+            metrics.rejected_for_reason(ControlPlaneAuthRejectionReason::ReplayFreshnessFailure),
             1
         );
 
