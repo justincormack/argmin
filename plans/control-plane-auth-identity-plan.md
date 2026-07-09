@@ -602,6 +602,14 @@ Progress:
   the signed runtime-map response, including accepted-operation metrics. This
   closes the main process/config gap between storage-level heartbeat auth tests
   and the storage-node refresh loop client construction path.
+- Next planned slice: add a full-auth composition smoke before broader UAT
+  conversion. The smoke should run a representative process setup with storage
+  heartbeat auth, frontend runtime-map auth, admin command auth, and Raft peer
+  auth enabled together; wait for an authenticated storage-node heartbeat to
+  make the node visible/serving; run `control-plane-runtime-map-ready` with
+  frontend credentials; run one admin helper with admin credentials; and assert
+  auth diagnostics show accepted storage/frontend/admin/Raft operations with no
+  unexpected rejects. This is intentionally separate from TCP/config-file work.
 
 ## Replay Policy
 
