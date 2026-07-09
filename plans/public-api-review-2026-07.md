@@ -548,14 +548,22 @@ ranked:
   so expired envelopes are rejected as `ReplayFreshnessFailure`; stale credential
   remains reserved for credential-version supersession.
 
-- [ ] **CA5. Multi-peer ⇒ auth invariant lives only in argmin-s3 config, not
+- [x] **CA5. Multi-peer ⇒ auth invariant lives only in argmin-s3 config, not
   the transport type.** `ControlPlaneRaftPeerTransportPolicy.auth_policy:
   Option<Arc<...>>` defaults to `None` and both directions fall through to
   plaintext when `None` (`control_plane_raft.rs:847, 1469-1573`). The fa8a5fa4
   config gate is real and unbypassable via argmin-s3 (verified), but any other
   embedder of the storage crate can build a multi-peer auth-less transport with
   no complaint. Fix: enforce in the constructor (>1 peer without an auth policy
-  → `Err`; provide a named single-node/test constructor).
+  → `Err`; provide a named single-node/test constructor). Resolution: reviewed
+  against the current Unix/TCP auth policy and treated as invalid for the Unix
+  transport. Multi-peer Unix sockets may be legitimate for local/test and
+  single-host layouts where filesystem permissions and private socket placement
+  are the trust boundary, including multi-disk-per-host deployments. The hard
+  mandatory-auth invariant belongs on future TCP/non-local control-plane
+  transports and their config-file startup path, not on the reusable Unix peer
+  transport type. Keep the TCP constructor/config gate as the follow-up
+  enforcement point.
 
 - [ ] **CA6. Per-path verifier/signer/selection copies that can drift (P2).**
   Three ~150-line near-identical verify methods
