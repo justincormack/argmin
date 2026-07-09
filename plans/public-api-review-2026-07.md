@@ -565,7 +565,7 @@ ranked:
   transport type. Keep the TCP constructor/config gate as the follow-up
   enforcement point.
 
-- [ ] **CA6. Per-path verifier/signer/selection copies that can drift (P2).**
+- [x] **CA6. Per-path verifier/signer/selection copies that can drift (P2).**
   Three ~150-line near-identical verify methods
   (`verify_admin_control_plane_command_payload` control_plane.rs:6426,
   `verify_frontend_runtime_map_read_payload` :6574,
@@ -575,7 +575,13 @@ ranked:
   latest credential (version, then id)" (`main.rs:1925-1937, 3523, 3542,
   3561`). Consistent today, nothing keeps them so. Fix: one
   `latest_by_version_then_id` helper and a shared role-parameterized verify
-  core.
+  core. Resolution: the low-risk drift points were removed now. Response
+  signing now uses one operation-parameterized helper, and Raft/storage/
+  frontend/admin local credential selection uses one
+  `latest_auth_credential_by_version_then_id` helper. The larger
+  role-parameterized verifier-core extraction is intentionally deferred until
+  CA7 because heartbeat payload binding will change the storage-node verifier
+  shape; doing that extraction first would churn the same code twice.
 
 - [ ] **CA7. Heartbeat envelopes don't bind the outer RPC kind; every other
   Unix path does.** Frontend/admin/all responses wrap via

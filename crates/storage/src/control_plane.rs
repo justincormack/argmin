@@ -7007,10 +7007,11 @@ fn read_authenticated_control_plane_rpc_payload(
     Ok(payload[2..].to_vec())
 }
 
-fn sign_runtime_map_response_payload(
+fn sign_control_plane_response_payload(
     kind: ControlPlaneRpcKind,
     credential: &ControlPlaneScopedCredential,
     target: ControlPlaneAuthPrincipal,
+    operation: ControlPlaneAuthOperation,
     authority_now_ms: u64,
     payload: Vec<u8>,
 ) -> Result<Vec<u8>, ControlPlaneError> {
@@ -7021,7 +7022,7 @@ fn sign_runtime_map_response_payload(
     let envelope =
         credential.sign_envelope(crate::control_plane_auth::ControlPlaneAuthSignInput {
             target: ControlPlaneAuthTarget::Principal(target),
-            operation: ControlPlaneAuthOperation::RuntimeMapResponse,
+            operation,
             issued_at_ms: Some(authority_now_ms),
             expires_at_ms: Some(expires_at_ms),
             sequence: None,
@@ -7039,39 +7040,16 @@ fn build_runtime_map_rpc_response(
 ) -> Result<ControlPlaneRpcResponse, ControlPlaneError> {
     let mut payload = encode_control_plane_rpc_response(response)?;
     if let Some((credential, target)) = response_auth {
-        payload = sign_runtime_map_response_payload(
+        payload = sign_control_plane_response_payload(
             kind,
             &credential,
             target,
+            ControlPlaneAuthOperation::RuntimeMapResponse,
             authority_now_ms,
             payload,
         )?;
     }
     Ok(ControlPlaneRpcResponse { kind, payload })
-}
-
-fn sign_admin_control_plane_response_payload(
-    kind: ControlPlaneRpcKind,
-    credential: &ControlPlaneScopedCredential,
-    target: ControlPlaneAuthPrincipal,
-    authority_now_ms: u64,
-    payload: Vec<u8>,
-) -> Result<Vec<u8>, ControlPlaneError> {
-    let expires_at_ms = authority_now_ms
-        .checked_add(CONTROL_PLANE_RPC_READ_AUTH_REPLAY_WINDOW_MS)
-        .ok_or(ControlPlaneError::LeaseDeadlineOverflow)?;
-    let payload = write_authenticated_control_plane_rpc_payload(kind, &payload);
-    let envelope =
-        credential.sign_envelope(crate::control_plane_auth::ControlPlaneAuthSignInput {
-            target: ControlPlaneAuthTarget::Principal(target),
-            operation: ControlPlaneAuthOperation::AdminControlPlaneResponse,
-            issued_at_ms: Some(authority_now_ms),
-            expires_at_ms: Some(expires_at_ms),
-            sequence: None,
-            nonce: Vec::new(),
-            payload,
-        })?;
-    envelope.encode_frame()
 }
 
 impl ControlPlaneRuntimeMapSource for UnixControlPlaneClient {
@@ -7602,10 +7580,11 @@ where
             };
             let response_authority_now_ms = response_authority_now_ms()?;
             if let Some((credential, target)) = admin_response_auth {
-                let payload = sign_admin_control_plane_response_payload(
+                let payload = sign_control_plane_response_payload(
                     kind,
                     &credential,
                     target,
+                    ControlPlaneAuthOperation::AdminControlPlaneResponse,
                     response_authority_now_ms,
                     encode_control_plane_rpc_response(response)?,
                 )?;
@@ -7761,10 +7740,11 @@ where
     let mut payload = encode_control_plane_rpc_response(response)?;
     if let Some((credential, target)) = admin_response_auth {
         let response_authority_now_ms = response_authority_now_ms()?;
-        payload = sign_admin_control_plane_response_payload(
+        payload = sign_control_plane_response_payload(
             kind,
             &credential,
             target,
+            ControlPlaneAuthOperation::AdminControlPlaneResponse,
             response_authority_now_ms,
             payload,
         )?;
@@ -12178,12 +12158,13 @@ mod tests {
     ) -> Vec<u8> {
         let payload = encode_control_plane_rpc_response(Ok(payload))
             .expect("test runtime-map response should encode");
-        sign_runtime_map_response_payload(
+        sign_control_plane_response_payload(
             kind,
             &frontend_signer
                 .runtime_map_response_credential_for_frontend()
                 .expect("test frontend credential should derive runtime-map response credential"),
             frontend_signer.principal().clone(),
+            ControlPlaneAuthOperation::RuntimeMapResponse,
             issued_at_ms,
             payload,
         )
@@ -13984,7 +13965,7 @@ mod tests {
             assert_eq!(kind, ControlPlaneRpcKind::RuntimeMapStatus);
             ControlPlaneAuthEnvelope::decode_frame(&payload, CONTROL_PLANE_RPC_MAX_PAYLOAD_LEN)
                 .unwrap();
-            let response_payload = sign_runtime_map_response_payload(
+            let response_payload = sign_control_plane_response_payload(
                 kind,
                 &response_signer
                     .runtime_map_response_credential_for_frontend()
@@ -13994,6 +13975,7 @@ mod tests {
                 ControlPlaneAuthPrincipal::Frontend {
                     instance_id: "frontend-2".to_owned(),
                 },
+                ControlPlaneAuthOperation::RuntimeMapResponse,
                 1_000,
                 encode_control_plane_rpc_response(Ok(Vec::new())).unwrap(),
             )
@@ -14029,7 +14011,7 @@ mod tests {
             assert_eq!(kind, ControlPlaneRpcKind::RuntimeMapStatus);
             ControlPlaneAuthEnvelope::decode_frame(&payload, CONTROL_PLANE_RPC_MAX_PAYLOAD_LEN)
                 .unwrap();
-            let response_payload = sign_runtime_map_response_payload(
+            let response_payload = sign_control_plane_response_payload(
                 kind,
                 &response_signer
                     .runtime_map_response_credential_for_frontend()
@@ -14037,6 +14019,7 @@ mod tests {
                         "test frontend credential should derive runtime-map response credential",
                     ),
                 response_signer.principal().clone(),
+                ControlPlaneAuthOperation::RuntimeMapResponse,
                 2_000,
                 encode_control_plane_rpc_response(Err(ControlPlaneError::RpcRemote {
                     message: "synthetic signed runtime-map error".to_owned(),
@@ -14858,10 +14841,11 @@ mod tests {
             .credential()
             .admin_control_plane_response_credential_for_admin()
             .unwrap();
-        let payload = sign_admin_control_plane_response_payload(
+        let payload = sign_control_plane_response_payload(
             ControlPlaneRpcKind::SetPgActingSet,
             &response_credential,
             client.credential().principal().clone(),
+            ControlPlaneAuthOperation::AdminControlPlaneResponse,
             2_001,
             encode_control_plane_rpc_response(Ok(Vec::new())).unwrap(),
         )

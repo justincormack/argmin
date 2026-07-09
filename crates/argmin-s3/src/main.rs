@@ -72,8 +72,8 @@ use tokio_rustls::TlsAcceptor;
 use config::{
     ConfiguredControlPlaneAdminAuthCredential, ConfiguredControlPlaneAdminCommandAuth,
     ConfiguredControlPlaneFrontendAuthCredential, ConfiguredControlPlaneFrontendRuntimeMapAuth,
-    ConfiguredControlPlaneStorageAuthCredential, ConfiguredCredential, ConfiguredCredentialProfile,
-    ProcessRole, ServerConfig,
+    ConfiguredControlPlaneRaftAuthCredential, ConfiguredControlPlaneStorageAuthCredential,
+    ConfiguredCredential, ConfiguredCredentialProfile, ProcessRole, ServerConfig,
 };
 use server_http::http::HttpFrontend;
 
@@ -1905,47 +1905,29 @@ fn build_experimental_raft_peer_auth_policy(
         return Ok(None);
     }
 
-    let mut local_credential = None::<(u64, String, ControlPlaneScopedCredential)>;
+    let local_configured = latest_auth_credential_by_version_then_id(
+        config
+            .control_plane_raft_auth_credentials
+            .iter()
+            .filter(|credential| credential.node_id == local_node_id),
+        |credential| credential.credential_id.as_str(),
+        |credential| credential.credential_version,
+    )
+    .ok_or_else(|| {
+        format!(
+            "ARGMIN_CONTROL_PLANE_RAFT_AUTH_CREDENTIALS must include local Raft node id {local_node_id}"
+        )
+    })?;
+    let local_credential = configured_raft_peer_auth_credential(local_configured, cluster_name)?;
+
     let mut credentials = Vec::new();
     for configured in &config.control_plane_raft_auth_credentials {
-        let credential = ControlPlaneScopedCredential::new(ControlPlaneScopedCredentialInput {
-            cluster_id: cluster_name.to_string(),
-            credential_id: configured.credential_id.clone(),
-            credential_version: configured.credential_version,
-            principal: ControlPlaneAuthPrincipal::RaftPeer {
-                node_id: configured.node_id,
-            },
-            secret: configured.secret.as_str().as_bytes().to_vec(),
-        })
-        .map_err(|error| {
-            format!(
-                "invalid ARGMIN_CONTROL_PLANE_RAFT_AUTH_CREDENTIALS scoped credential for node {}: {error}",
-                configured.node_id
-            )
-        })?;
-        if configured.node_id == local_node_id {
-            let candidate = (
-                configured.credential_version,
-                configured.credential_id.clone(),
-                credential.clone(),
-            );
-            if local_credential
-                .as_ref()
-                .is_none_or(|current| (candidate.0, &candidate.1) > (current.0, &current.1))
-            {
-                local_credential = Some(candidate);
-            }
-        }
-        credentials.push(credential);
+        credentials.push(configured_raft_peer_auth_credential(
+            configured,
+            cluster_name,
+        )?);
     }
 
-    let local_credential = local_credential
-        .map(|(_, _, credential)| credential)
-        .ok_or_else(|| {
-            format!(
-                "ARGMIN_CONTROL_PLANE_RAFT_AUTH_CREDENTIALS must include local Raft node id {local_node_id}"
-            )
-        })?;
     let verifier = ControlPlaneScopedCredentialStore::new(credentials).map_err(|error| {
         format!("invalid ARGMIN_CONTROL_PLANE_RAFT_AUTH_CREDENTIALS credential set: {error}")
     })?;
@@ -1954,6 +1936,27 @@ fn build_experimental_raft_peer_auth_policy(
         .map_err(|error| {
             format!("invalid ARGMIN_CONTROL_PLANE_RAFT_AUTH_CREDENTIALS auth policy: {error}")
         })
+}
+
+fn configured_raft_peer_auth_credential(
+    configured: &ConfiguredControlPlaneRaftAuthCredential,
+    cluster_name: &str,
+) -> Result<ControlPlaneScopedCredential, String> {
+    ControlPlaneScopedCredential::new(ControlPlaneScopedCredentialInput {
+        cluster_id: cluster_name.to_string(),
+        credential_id: configured.credential_id.clone(),
+        credential_version: configured.credential_version,
+        principal: ControlPlaneAuthPrincipal::RaftPeer {
+            node_id: configured.node_id,
+        },
+        secret: configured.secret.as_str().as_bytes().to_vec(),
+    })
+    .map_err(|error| {
+        format!(
+            "invalid ARGMIN_CONTROL_PLANE_RAFT_AUTH_CREDENTIALS scoped credential for node {}: {error}",
+            configured.node_id
+        )
+    })
 }
 
 fn format_experimental_raft_peer_auth_diagnostics(
@@ -3549,15 +3552,14 @@ fn latest_storage_node_auth_credential_for_node(
     credentials: &[ConfiguredControlPlaneStorageAuthCredential],
     node_id: u32,
 ) -> Result<&ConfiguredControlPlaneStorageAuthCredential, String> {
-    credentials
-        .iter()
-        .filter(|credential| credential.node_id == node_id)
-        .max_by(|left, right| {
-            left.credential_version
-                .cmp(&right.credential_version)
-                .then_with(|| left.credential_id.cmp(&right.credential_id))
-        })
-        .ok_or_else(|| {
+    latest_auth_credential_by_version_then_id(
+        credentials
+            .iter()
+            .filter(|credential| credential.node_id == node_id),
+        |credential| credential.credential_id.as_str(),
+        |credential| credential.credential_version,
+    )
+    .ok_or_else(|| {
             format!(
                 "ARGMIN_CONTROL_PLANE_STORAGE_AUTH_CREDENTIALS must include local storage node id {node_id}"
             )
@@ -3568,15 +3570,14 @@ fn latest_frontend_auth_credential_for_instance<'a>(
     credentials: &'a [ConfiguredControlPlaneFrontendAuthCredential],
     instance_id: &str,
 ) -> Result<&'a ConfiguredControlPlaneFrontendAuthCredential, String> {
-    credentials
-        .iter()
-        .filter(|credential| credential.instance_id == instance_id)
-        .max_by(|left, right| {
-            left.credential_version
-                .cmp(&right.credential_version)
-                .then_with(|| left.credential_id.cmp(&right.credential_id))
-        })
-        .ok_or_else(|| {
+    latest_auth_credential_by_version_then_id(
+        credentials
+            .iter()
+            .filter(|credential| credential.instance_id == instance_id),
+        |credential| credential.credential_id.as_str(),
+        |credential| credential.credential_version,
+    )
+    .ok_or_else(|| {
             format!(
                 "ARGMIN_CONTROL_PLANE_FRONTEND_AUTH_CREDENTIALS must include local frontend instance id {instance_id}"
             )
@@ -3587,19 +3588,30 @@ fn latest_admin_auth_credential_for_instance<'a>(
     credentials: &'a [ConfiguredControlPlaneAdminAuthCredential],
     instance_id: &str,
 ) -> Result<&'a ConfiguredControlPlaneAdminAuthCredential, String> {
-    credentials
-        .iter()
-        .filter(|credential| credential.instance_id == instance_id)
-        .max_by(|left, right| {
-            left.credential_version
-                .cmp(&right.credential_version)
-                .then_with(|| left.credential_id.cmp(&right.credential_id))
-        })
-        .ok_or_else(|| {
+    latest_auth_credential_by_version_then_id(
+        credentials
+            .iter()
+            .filter(|credential| credential.instance_id == instance_id),
+        |credential| credential.credential_id.as_str(),
+        |credential| credential.credential_version,
+    )
+    .ok_or_else(|| {
             format!(
                 "ARGMIN_CONTROL_PLANE_ADMIN_AUTH_CREDENTIALS must include local admin instance id {instance_id}"
             )
         })
+}
+
+fn latest_auth_credential_by_version_then_id<'a, T>(
+    credentials: impl Iterator<Item = &'a T>,
+    credential_id: impl Fn(&T) -> &str,
+    credential_version: impl Fn(&T) -> u64,
+) -> Option<&'a T> {
+    credentials.max_by(|left, right| {
+        credential_version(left)
+            .cmp(&credential_version(right))
+            .then_with(|| credential_id(left).cmp(credential_id(right)))
+    })
 }
 
 fn bind_control_plane_socket(socket_path: &Path) -> Result<UnixListener, String> {
