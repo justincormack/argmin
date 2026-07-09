@@ -15286,11 +15286,20 @@ mod tests {
                 request.kind,
                 ControlPlaneRpcKind::SetPgActingSetWithMetadataTransferRuntimeMap
             );
-            let response = build_control_plane_unix_response_with_auth(
+            let issued_at_ms = ControlPlaneAuthEnvelope::decode_frame(
+                &request.payload,
+                CONTROL_PLANE_RPC_MAX_PAYLOAD_LEN,
+            )
+            .unwrap()
+            .header()
+            .issued_at_ms()
+            .unwrap();
+            let response = build_control_plane_unix_response_with_auth_and_response_clock(
                 &mut authority,
                 request,
-                2_003,
+                issued_at_ms,
                 Some(&verifier),
+                || Ok(issued_at_ms),
             )
             .expect("authenticated metadata-transfer install should apply before response loss");
             assert_eq!(
@@ -15307,8 +15316,16 @@ mod tests {
             let (mut stream, _addr) = listener.accept().unwrap();
             let request = read_control_plane_unix_request(&mut stream).unwrap();
             assert_eq!(request.kind, ControlPlaneRpcKind::PgRuntimeMapSnapshot);
+            let issued_at_ms = ControlPlaneAuthEnvelope::decode_frame(
+                &request.payload,
+                CONTROL_PLANE_RPC_MAX_PAYLOAD_LEN,
+            )
+            .unwrap()
+            .header()
+            .issued_at_ms()
+            .unwrap();
             let runtime_map = authority
-                .pg_runtime_map_snapshot(PgId::new(43), 2_003)
+                .pg_runtime_map_snapshot(PgId::new(43), issued_at_ms)
                 .unwrap();
             assert!(
                 metadata_transfer_install_applied(
@@ -15320,14 +15337,15 @@ mod tests {
                 ),
                 "server-side confirmation route should be observable before response"
             );
-            respond_control_plane_unix_request_with_auth(
+            let response = build_control_plane_unix_response_with_auth_and_response_clock(
                 &mut authority,
-                &mut stream,
                 request,
-                2_003,
-                &verifier,
+                issued_at_ms,
+                Some(&verifier),
+                || Ok(issued_at_ms),
             )
             .unwrap();
+            write_control_plane_unix_response(&mut stream, response).unwrap();
         });
 
         let client = AuthenticatedUnixControlPlaneClient::new(
