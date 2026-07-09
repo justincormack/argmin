@@ -442,13 +442,19 @@ the findings below.
   behavior, including the case where expiry is reported before signature
   mismatch.
 
-- [ ] **W5. `LifecycleRuleFilter::explicit_with_predicates` validates prefix
+- [x] **W5. `LifecycleRuleFilter::explicit_with_predicates` validates prefix
   and tags but not size ordering** (`lifecycle.rs:101-118`) —
   `(None, vec![], Some(10), Some(5))` builds a min>=max filter the parser
   rejects; and its two adjacent `Option<u64>` size params are themselves a
   transposition hazard that produces exactly that state. Validate size
   ordering in the constructor and take a small size-bounds struct (or one
   `SizeRange` newtype) instead of the bare pair.
+
+  Fixed 2026-07-09: `LifecycleRuleFilter::explicit_with_predicates` now takes
+  a `LifecycleObjectSizeRange` instead of adjacent `Option<u64>` parameters.
+  The range constructor shares the parsed XML validation rule and rejects equal
+  or inverted bounds with the AWS-pinned lifecycle error message, so the public
+  constructor can no longer build a filter state the XML parser would reject.
 
 - [ ] **W6. `bucket_lock_wait_exceeded_total` is inert in production builds.**
   Exported by the P4 metrics sweep (observability lib.rs:1675, 1846) but its

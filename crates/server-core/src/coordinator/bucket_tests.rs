@@ -4,7 +4,8 @@ use super::*;
 use crate::conditional::DeleteCondition;
 use s3_types::{
     AbortIncompleteMultipartUpload, BucketLifecycleConfiguration, LifecycleExpiration,
-    LifecycleRule, LifecycleRuleFilter, LifecycleRuleStatus, LifecycleTag,
+    LifecycleObjectSizeRange, LifecycleRule, LifecycleRuleFilter, LifecycleRuleStatus,
+    LifecycleTag,
 };
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -1364,8 +1365,7 @@ fn evaluate_current_object_lifecycle_expiration_selects_earliest_matching_rule()
                         key: "env".to_string(),
                         value: "prod".to_string(),
                     }],
-                    Some(10),
-                    None,
+                    LifecycleObjectSizeRange::greater_than(10),
                 )
                 .unwrap(),
                 expiration: Some(LifecycleExpiration::Days(
@@ -1447,8 +1447,7 @@ fn evaluate_multipart_lifecycle_abort_headers_matches_prefix_rule() {
                         key: "env".to_string(),
                         value: "prod".to_string(),
                     }],
-                    None,
-                    None,
+                    LifecycleObjectSizeRange::default(),
                 )
                 .unwrap(),
                 expiration: None,

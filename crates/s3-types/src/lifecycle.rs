@@ -45,6 +45,12 @@ pub struct LifecycleRuleFilter {
     explicit_filter: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct LifecycleObjectSizeRange {
+    greater_than: Option<u64>,
+    less_than: Option<u64>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct LifecycleDate {
     pub year: i32,
@@ -101,8 +107,7 @@ impl LifecycleRuleFilter {
     pub fn explicit_with_predicates(
         prefix: Option<String>,
         tags: Vec<LifecycleTag>,
-        object_size_greater_than: Option<u64>,
-        object_size_less_than: Option<u64>,
+        object_size_range: LifecycleObjectSizeRange,
     ) -> Result<Self, LifecycleConfigError> {
         if let Some(prefix) = &prefix {
             validate_prefix(prefix)?;
@@ -111,18 +116,22 @@ impl LifecycleRuleFilter {
         Ok(Self {
             prefix,
             tags,
-            object_size_greater_than,
-            object_size_less_than,
+            object_size_greater_than: object_size_range.greater_than,
+            object_size_less_than: object_size_range.less_than,
             explicit_filter: true,
         })
     }
 
     pub fn explicit_prefix(prefix: impl Into<String>) -> Result<Self, LifecycleConfigError> {
-        Self::explicit_with_predicates(Some(prefix.into()), Vec::new(), None, None)
+        Self::explicit_with_predicates(
+            Some(prefix.into()),
+            Vec::new(),
+            LifecycleObjectSizeRange::default(),
+        )
     }
 
     pub fn explicit_tag(tag: LifecycleTag) -> Result<Self, LifecycleConfigError> {
-        Self::explicit_with_predicates(None, vec![tag], None, None)
+        Self::explicit_with_predicates(None, vec![tag], LifecycleObjectSizeRange::default())
     }
 
     #[must_use]
@@ -214,6 +223,43 @@ impl LifecycleRuleFilter {
         }
         self.tags.push(tag);
         Ok(())
+    }
+}
+
+impl LifecycleObjectSizeRange {
+    pub fn new(
+        greater_than: Option<u64>,
+        less_than: Option<u64>,
+    ) -> Result<Self, LifecycleConfigError> {
+        validate_object_size_range(greater_than, less_than)?;
+        Ok(Self {
+            greater_than,
+            less_than,
+        })
+    }
+
+    pub fn greater_than(value: u64) -> Self {
+        Self {
+            greater_than: Some(value),
+            less_than: None,
+        }
+    }
+
+    pub fn less_than(value: u64) -> Self {
+        Self {
+            greater_than: None,
+            less_than: Some(value),
+        }
+    }
+
+    #[must_use]
+    pub fn object_size_greater_than(self) -> Option<u64> {
+        self.greater_than
+    }
+
+    #[must_use]
+    pub fn object_size_less_than(self) -> Option<u64> {
+        self.less_than
     }
 }
 
@@ -501,20 +547,28 @@ fn validate_configuration(rules: &[LifecycleRule]) -> Result<(), LifecycleConfig
             }
         }
 
-        if let (Some(min_size), Some(max_size)) = (
+        validate_object_size_range(
             rule.filter.object_size_greater_than,
             rule.filter.object_size_less_than,
-        ) {
-            if min_size >= max_size {
-                return Err(LifecycleConfigError::InvalidRequest {
-                    reason:
-                        "'ObjectSizeLessThan' has to be a value greater than 'ObjectSizeGreaterThan'."
-                            .to_string(),
-                });
-            }
-        }
+        )?;
     }
 
+    Ok(())
+}
+
+fn validate_object_size_range(
+    object_size_greater_than: Option<u64>,
+    object_size_less_than: Option<u64>,
+) -> Result<(), LifecycleConfigError> {
+    if let (Some(min_size), Some(max_size)) = (object_size_greater_than, object_size_less_than) {
+        if min_size >= max_size {
+            return Err(LifecycleConfigError::InvalidRequest {
+                reason:
+                    "'ObjectSizeLessThan' has to be a value greater than 'ObjectSizeGreaterThan'."
+                        .to_string(),
+            });
+        }
+    }
     Ok(())
 }
 
@@ -1411,8 +1465,7 @@ mod tests {
                             key: "env".to_string(),
                             value: "prod".to_string(),
                         }],
-                        None,
-                        None,
+                        LifecycleObjectSizeRange::default(),
                     )
                     .unwrap(),
                     expiration: Some(LifecycleExpiration::Days(days)),
@@ -1443,11 +1496,55 @@ mod tests {
                     value: "stage".to_string(),
                 },
             ],
-            None,
-            None,
+            LifecycleObjectSizeRange::default(),
         )
         .unwrap_err();
         assert!(matches!(err, LifecycleConfigError::InvalidArgument { .. }));
+    }
+
+    #[test]
+    fn lifecycle_object_size_range_accepts_valid_bounds() {
+        assert_eq!(
+            LifecycleObjectSizeRange::greater_than(10).object_size_greater_than(),
+            Some(10)
+        );
+        assert_eq!(
+            LifecycleObjectSizeRange::less_than(100).object_size_less_than(),
+            Some(100)
+        );
+
+        let range = LifecycleObjectSizeRange::new(Some(10), Some(100)).unwrap();
+        assert_eq!(range.object_size_greater_than(), Some(10));
+        assert_eq!(range.object_size_less_than(), Some(100));
+    }
+
+    #[test]
+    fn lifecycle_object_size_range_rejects_equal_or_inverted_bounds() {
+        for (greater_than, less_than) in [(10, 10), (10, 5)] {
+            let err =
+                LifecycleObjectSizeRange::new(Some(greater_than), Some(less_than)).unwrap_err();
+            match err {
+                LifecycleConfigError::InvalidRequest { reason } => {
+                    assert_eq!(
+                        reason,
+                        "'ObjectSizeLessThan' has to be a value greater than 'ObjectSizeGreaterThan'."
+                    );
+                }
+                other => panic!("expected InvalidRequest, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn lifecycle_rule_filter_constructor_accepts_typed_size_range() {
+        let filter = LifecycleRuleFilter::explicit_with_predicates(
+            None,
+            Vec::new(),
+            LifecycleObjectSizeRange::new(Some(10), Some(100)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(filter.object_size_greater_than(), Some(10));
+        assert_eq!(filter.object_size_less_than(), Some(100));
     }
 
     #[test]
