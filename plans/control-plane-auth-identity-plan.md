@@ -706,10 +706,13 @@ Do not expose secrets, MACs, raw credential material, or full internal payloads.
   mandatory in production configuration, add any required external secret
   distribution/rotation automation, introduce TCP/non-local transport only with
   mandatory auth, move complex control-plane auth/transport config into an
-  optional or required config-file surface, and revisit asymmetric or
-  mTLS-backed credential primitives if symmetric cluster credentials become too
-  broad. Admin API formalization can remain a later production-readiness slice
-  unless TCP/config-file work exposes ambiguity in the admin operation surface.
+  optional or required config-file surface, remove or replace the
+  `ARGMIN_CONTROL_PLANE_EXPERIMENTAL_RAFT` flag and associated
+  `experimental_` process/log/test/API naming as one dedicated replicated
+  control-plane graduation slice, and revisit asymmetric or mTLS-backed
+  credential primitives if symmetric cluster credentials become too broad.
+  Admin API formalization can remain a later production-readiness slice unless
+  TCP/config-file work exposes ambiguity in the admin operation surface.
 - **Out of scope for this plan:** public S3 authentication/authorization,
   external tenant identity, data-plane storage RPC authorization beyond the
   control-plane identity needed to issue routing/fencing decisions, and

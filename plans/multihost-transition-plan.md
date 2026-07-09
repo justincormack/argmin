@@ -10763,6 +10763,12 @@ Post-12.4 sequencing for TCP transport and production-shaped config:
   mode. Unix sockets remain allowed in both authenticated and explicitly
   unauthenticated local/test configurations while they are the main process
   test transport, but the default multi-node coverage should exercise auth.
+- Do the Raft naming cleanup as a dedicated production-cutover slice, not
+  piecemeal during WAL/auth work. That slice should remove or replace
+  `ARGMIN_CONTROL_PLANE_EXPERIMENTAL_RAFT`, rename process/log/test labels and
+  `ExperimentalRaftControlPlane`-style wrappers only once the replicated
+  control-plane mode is no longer experimental, and update docs/security
+  references together.
 - Lock the transport policy before adding TCP: TCP/non-local control-plane
   transports are authenticated-only. A TCP Raft peer, control-plane admin,
   storage-node heartbeat, or frontend runtime-map listener must reject startup
