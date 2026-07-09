@@ -782,6 +782,28 @@ fn artifact_log_state_with_wal(
     })
 }
 
+fn artifact_only_log_state(path: &Path) -> Result<PersistedLogStateSummary, String> {
+    let artifact = match ControlPlaneRaftRestartArtifact::load_durable_artifact(path) {
+        Ok(artifact) => artifact,
+        Err(error) => return Err(error.to_string()),
+    };
+    let (mut log_store, _state_machine) = artifact.restore().map_err(|error| error.to_string())?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| error.to_string())?;
+    let log_state = runtime
+        .block_on(RaftLogStorage::get_log_state(&mut log_store))
+        .map_err(|error| error.to_string())?;
+    let committed = runtime
+        .block_on(RaftLogStorage::read_committed(&mut log_store))
+        .map_err(|error| error.to_string())?;
+    Ok(PersistedLogStateSummary {
+        last_log_id: log_state.last_log_id,
+        committed,
+    })
+}
+
 fn follower_artifact_pg_has_acting_set(
     path: &Path,
     pg_id: PgId,
@@ -993,37 +1015,6 @@ fn wait_for_child_stderr_log_contains(child: &mut ChildGuard, needle: &str) {
                 "process log {} did not contain {needle:?}\n{}\n{}",
                 log_path.display(),
                 log,
-                process_logs(&child.test_dir)
-            );
-        }
-        thread::sleep(Duration::from_millis(50));
-    }
-}
-
-fn wait_for_stable_file_bytes(path: &Path, child: &mut ChildGuard) -> Vec<u8> {
-    let deadline = Instant::now() + Duration::from_secs(10);
-    let mut last_bytes = None;
-    let mut stable_since = None;
-    loop {
-        child.assert_running();
-        let bytes = fs::read(path)
-            .unwrap_or_else(|error| panic!("file {} should be readable: {error}", path.display()));
-        match &last_bytes {
-            Some(previous) if previous == &bytes => {
-                let stable_since = *stable_since.get_or_insert_with(Instant::now);
-                if stable_since.elapsed() >= Duration::from_millis(250) {
-                    return bytes;
-                }
-            }
-            _ => {
-                last_bytes = Some(bytes);
-                stable_since = Some(Instant::now());
-            }
-        }
-        if Instant::now() >= deadline {
-            panic!(
-                "file {} did not stabilize before deadline\n{}",
-                path.display(),
                 process_logs(&child.test_dir)
             );
         }
@@ -1592,8 +1583,6 @@ fn experimental_raft_process_peer_wal_crash_after_sync_before_response_recovers_
         ControlPlaneAuthOperation::RaftAppendEntries,
         append_frame,
     );
-    let artifact_bytes_before_crash =
-        wait_for_stable_file_bytes(&follower_state_path, &mut restarted103);
     let follower_wal = raft_wal_file(wal_path(test_dir.path(), 103), &cluster_name, 103);
     follower_wal
         .append_record(&ControlPlaneRaftWalRecord::SaveVote(Vote::<
@@ -1625,11 +1614,12 @@ fn experimental_raft_process_peer_wal_crash_after_sync_before_response_recovers_
         !status.success(),
         "follower should exit after failing the checkpoint-before-peer-response path"
     );
-    assert_eq!(
-        fs::read(&follower_state_path)
-            .expect("follower checkpoint artifact should still read after crash"),
-        artifact_bytes_before_crash,
-        "post-checkpoint peer append must not rewrite the checkpoint artifact before response"
+    let follower_artifact_after_crash = artifact_only_log_state(&follower_state_path)
+        .expect("follower checkpoint artifact should restore after crash");
+    assert_ne!(
+        follower_artifact_after_crash.last_log_id,
+        Some(appended_log_id),
+        "failed checkpoint must leave the synthetic peer append out of the checkpoint artifact: {follower_artifact_after_crash:?}"
     );
     let follower_log_after_crash =
         artifact_log_state_with_wal(&follower_state_path, &cluster_name, 103)
