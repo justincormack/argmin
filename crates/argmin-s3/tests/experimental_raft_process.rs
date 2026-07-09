@@ -1057,6 +1057,7 @@ fn experimental_raft_two_control_plane_processes_replicate_bootstrap_to_follower
     let raft_node_ids = [101, 102];
     let auth = ProcessTestControlPlaneAuth::new(&cluster_name);
     let frontend_auth_credentials = auth.frontend_credentials_env(&["runtime-map-ready"]);
+    let admin_auth_credentials = auth.admin_credentials_env(&["server-admin"]);
     let server_auth_env = [
         (
             "ARGMIN_CONTROL_PLANE_AUTH_CLUSTER_ID",
@@ -1065,6 +1066,10 @@ fn experimental_raft_two_control_plane_processes_replicate_bootstrap_to_follower
         (
             "ARGMIN_CONTROL_PLANE_FRONTEND_AUTH_CREDENTIALS",
             frontend_auth_credentials.as_str(),
+        ),
+        (
+            "ARGMIN_CONTROL_PLANE_ADMIN_AUTH_CREDENTIALS",
+            admin_auth_credentials.as_str(),
         ),
     ];
     let helper_auth_env = [

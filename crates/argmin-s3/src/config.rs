@@ -28,6 +28,10 @@ impl ProcessRole {
         matches!(self, Self::LegacyLocal | Self::Frontend | Self::Combined)
     }
 
+    fn has_control_plane(self) -> bool {
+        matches!(self, Self::ControlPlane)
+    }
+
     pub(crate) fn uses_remote_frontend_routing(self) -> bool {
         matches!(self, Self::Frontend | Self::Combined)
     }
@@ -341,7 +345,7 @@ impl ServerConfig {
     ///   `ARGMIN_CONTROL_PLANE_FRONTEND_AUTH_INSTANCE_ID` (required for frontend roles when frontend control-plane auth credentials are configured)
     ///   `ARGMIN_CONTROL_PLANE_FRONTEND_AUTH_CREDENTIALS` (`instance_id=credential_id:version:secret,...`, optional authenticated frontend runtime-map reads)
     ///   `ARGMIN_CONTROL_PLANE_ADMIN_AUTH_INSTANCE_ID` (optional local admin signing principal)
-    ///   `ARGMIN_CONTROL_PLANE_ADMIN_AUTH_CREDENTIALS` (`instance_id=credential_id:version:secret,...`, optional authenticated admin control-plane commands)
+    ///   `ARGMIN_CONTROL_PLANE_ADMIN_AUTH_CREDENTIALS` (`instance_id=credential_id:version:secret,...`, required for control-plane role when any Unix control-plane auth is configured)
     ///   `ARGMIN_CONTROL_PLANE_EXPERIMENTAL_RAFT` (false)
     ///   `ARGMIN_CONTROL_PLANE_RAFT_CLUSTER_NAME` (optional experimental Raft cluster identity)
     ///   `ARGMIN_CONTROL_PLANE_RAFT_NODE_ID` (1 when experimental Raft is enabled)
@@ -845,6 +849,17 @@ impl ServerConfig {
                     "ARGMIN_CONTROL_PLANE_ADMIN_AUTH_CREDENTIALS must include local admin instance id {instance_id}"
                 ));
             }
+        }
+        if process_role.has_control_plane()
+            && (!control_plane_storage_auth_credentials.is_empty()
+                || !control_plane_frontend_auth_credentials.is_empty()
+                || !control_plane_admin_auth_credentials.is_empty())
+            && control_plane_admin_auth_credentials.is_empty()
+        {
+            return Err(
+                "ARGMIN_CONTROL_PLANE_ADMIN_AUTH_CREDENTIALS is required when any Unix control-plane auth credentials are configured for the control-plane role"
+                    .to_string(),
+            );
         }
         if control_plane_lease_scan_interval.is_zero() {
             return Err("ARGMIN_CONTROL_PLANE_LEASE_SCAN_MS must be > 0".to_string());
@@ -2221,6 +2236,10 @@ mod tests {
                 "ARGMIN_CONTROL_PLANE_STORAGE_AUTH_CREDENTIALS",
                 "2=storage-node:4:storage-2-secret,1=storage-node:5:storage-1-new-secret,1=storage-node:4:storage-1-secret",
             ),
+            (
+                "ARGMIN_CONTROL_PLANE_ADMIN_AUTH_CREDENTIALS",
+                "admin-1=admin:4:admin-1-secret",
+            ),
         ]))
         .unwrap();
 
@@ -2255,6 +2274,7 @@ mod tests {
         assert!(!debug.contains("storage-1-secret"));
         assert!(!debug.contains("storage-1-new-secret"));
         assert!(!debug.contains("storage-2-secret"));
+        assert!(!debug.contains("admin-1-secret"));
         assert!(!debug.contains("frontend-a-secret"));
         assert!(!debug.contains("frontend-b-secret"));
         assert!(debug.contains("config_secret"));
@@ -2371,6 +2391,58 @@ mod tests {
         .unwrap_err();
 
         assert!(err.contains("local admin instance id admin-2"));
+    }
+
+    #[test]
+    fn control_plane_storage_auth_requires_admin_credentials() {
+        let err = ServerConfig::from_lookup(make_env(&[
+            ("ARGMIN_PROCESS_ROLE", "control-plane"),
+            (
+                "ARGMIN_CONTROL_PLANE_STATE_PATH",
+                "/tmp/argmin-control-plane.state",
+            ),
+            (
+                "ARGMIN_CONTROL_PLANE_SOCKET_PATH",
+                "/tmp/argmin-control-plane.sock",
+            ),
+            ("ARGMIN_CONTROL_PLANE_AUTH_CLUSTER_ID", "control-auth"),
+            (
+                "ARGMIN_CONTROL_PLANE_STORAGE_AUTH_CREDENTIALS",
+                "1=storage-node:4:storage-1-secret",
+            ),
+        ]))
+        .unwrap_err();
+
+        assert!(
+            err.contains("ARGMIN_CONTROL_PLANE_ADMIN_AUTH_CREDENTIALS is required"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn control_plane_frontend_auth_requires_admin_credentials() {
+        let err = ServerConfig::from_lookup(make_env(&[
+            ("ARGMIN_PROCESS_ROLE", "control-plane"),
+            (
+                "ARGMIN_CONTROL_PLANE_STATE_PATH",
+                "/tmp/argmin-control-plane.state",
+            ),
+            (
+                "ARGMIN_CONTROL_PLANE_SOCKET_PATH",
+                "/tmp/argmin-control-plane.sock",
+            ),
+            ("ARGMIN_CONTROL_PLANE_AUTH_CLUSTER_ID", "control-auth"),
+            (
+                "ARGMIN_CONTROL_PLANE_FRONTEND_AUTH_CREDENTIALS",
+                "frontend-1=frontend:4:frontend-1-secret",
+            ),
+        ]))
+        .unwrap_err();
+
+        assert!(
+            err.contains("ARGMIN_CONTROL_PLANE_ADMIN_AUTH_CREDENTIALS is required"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

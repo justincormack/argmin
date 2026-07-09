@@ -463,7 +463,7 @@ rotation; commits 79f04c5c..510eb737) landed since the original review and had
 never been checked. Fundamentals are strong (see the intro above). Findings,
 ranked:
 
-- [ ] **CA1. Partial-role Unix control-plane auth leaves admin mutations
+- [x] **CA1. Partial-role Unix control-plane auth leaves admin mutations
   unauthenticated with no config coupling.** Dispatch gates each path on that
   role's credential map being non-empty (`requires_*` is `!map.is_empty()`,
   `control_plane.rs:6402-6415`; enforced at :7410-7426), and config validation
@@ -477,7 +477,13 @@ ranked:
   `required` flags are exposed), but nothing stops the foot-gun config. Fix:
   config-parse error when some-but-not-all credential sets are configured, or
   require admin credentials whenever any Unix control-plane auth is on, with an
-  explicit opt-out.
+  explicit opt-out. Resolution: the serving control-plane configuration and
+  verifier builder now reject any Unix control-plane auth configuration that
+  omits `ARGMIN_CONTROL_PLANE_ADMIN_AUTH_CREDENTIALS`. Client-only storage and
+  frontend roles can still load scoped credentials for signing their own
+  requests, but a process serving the control-plane socket cannot enable
+  storage/frontend auth while leaving admin RPCs open. Added config and verifier
+  regressions for storage/frontend auth without admin credentials.
 
 - [ ] **CA2. `ControlPlaneAuthVerificationInput.now_ms: Option<u64>` — `None`
   silently disables expiry checking, and timestamp-less envelopes skip it even

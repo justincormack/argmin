@@ -3374,6 +3374,12 @@ fn build_control_plane_unix_auth_verifier(
         .iter()
         .map(configured_admin_auth_credential)
         .collect::<Result<Vec<_>, _>>()?;
+    if admin_credentials.is_empty() {
+        return Err(
+            "ARGMIN_CONTROL_PLANE_ADMIN_AUTH_CREDENTIALS is required when any Unix control-plane auth credentials are configured for the control-plane verifier"
+                .to_string(),
+        );
+    }
     if let Some(instance_id) = config.control_plane_admin_auth_instance_id.as_deref() {
         if !config
             .control_plane_admin_auth_credentials
@@ -4792,6 +4798,13 @@ mod tests {
                 credential_version: 7,
                 secret: SecretConfigValue::new("frontend-1-secret".to_string()),
             }];
+        config.control_plane_admin_auth_credentials =
+            vec![ConfiguredControlPlaneAdminAuthCredential {
+                instance_id: "admin-1".to_string(),
+                credential_id: "admin".to_string(),
+                credential_version: 8,
+                secret: SecretConfigValue::new("admin-1-secret".to_string()),
+            }];
 
         let verifier = build_control_plane_unix_auth_verifier(&config)
             .expect("frontend auth verifier should build")
@@ -4801,10 +4814,30 @@ mod tests {
         assert!(status.required());
         assert!(!status.storage_node_heartbeat_required());
         assert!(status.frontend_runtime_map_required());
-        assert!(!status.admin_control_plane_required());
+        assert!(status.admin_control_plane_required());
         assert_eq!(status.storage_node_credentials().len(), 0);
         assert_eq!(status.frontend_credentials().len(), 1);
         assert_eq!(status.frontend_credentials()[0].instance_id(), "frontend-1");
+        assert_eq!(status.admin_credentials().len(), 1);
+        assert_eq!(status.admin_credentials()[0].instance_id(), "admin-1");
+    }
+
+    #[test]
+    fn control_plane_unix_auth_verifier_rejects_frontend_without_admin_credentials() {
+        let mut config = test_server_config();
+        config.control_plane_auth_cluster_id = Some("control-auth".to_string());
+        config.control_plane_frontend_auth_credentials =
+            vec![ConfiguredControlPlaneFrontendAuthCredential {
+                instance_id: "frontend-1".to_string(),
+                credential_id: "frontend".to_string(),
+                credential_version: 7,
+                secret: SecretConfigValue::new("frontend-1-secret".to_string()),
+            }];
+
+        let error = build_control_plane_unix_auth_verifier(&config)
+            .expect_err("frontend auth verifier should require admin credentials");
+
+        assert!(error.contains("ARGMIN_CONTROL_PLANE_ADMIN_AUTH_CREDENTIALS is required"));
     }
 
     #[test]
