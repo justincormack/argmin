@@ -491,7 +491,7 @@ ranked:
   storage/frontend auth while leaving admin RPCs open. Added config and verifier
   regressions for storage/frontend auth without admin credentials.
 
-- [ ] **CA2. `ControlPlaneAuthVerificationInput.now_ms: Option<u64>` — `None`
+- [x] **CA2. `ControlPlaneAuthVerificationInput.now_ms: Option<u64>` — `None`
   silently disables expiry checking, and timestamp-less envelopes skip it even
   under `Some`.** `verify_envelope_inner` runs issued/expires checks only
   `if let Some(now_ms)` and `is_some_and` per field
@@ -503,7 +503,14 @@ ranked:
   combination, freshly minted in auth code. Fix: replace `now_ms: Option<u64>`
   with an enum (`ReplayPolicy::TimestampWindow { now_ms, max_window_ms }` vs
   `FencedByPayloadSemantics`) that rejects missing-or-stale timestamps centrally
-  and collapse the three per-path validators into it.
+  and collapse the three per-path validators into it. Resolution: the verifier
+  now takes `ControlPlaneAuthReplayPolicy` instead of optional `now_ms`.
+  Timestamp-window paths centrally require `issued_at_ms` and `expires_at_ms`,
+  reject empty/overlong/future/expired windows as `ReplayFreshnessFailure`, and
+  make response skew an explicit policy parameter. Raft peer RPCs that are
+  fenced by term/log/payload semantics now choose `FencedByPayloadSemantics`
+  explicitly, while transfer-leader uses a bounded timestamp policy. The Unix
+  read/admin/heartbeat and Raft peer per-path freshness validators were removed.
 
 - [ ] **CA3. Credential env parse errors echo the raw entry, which contains the
   secret.** All four parsers format the offending entry into the error
@@ -513,13 +520,16 @@ ranked:
   undercutting the otherwise consistent `SecretConfigValue` redaction. Fix:
   report entry index/node-id only, never the raw entry text.
 
-- [ ] **CA4. Expired envelope misclassified as `StaleCredential`.**
+- [x] **CA4. Expired envelope misclassified as `StaleCredential`.**
   `control_plane_auth.rs:466-471` returns `StaleCredential` for
   `expires_at_ms <= now_ms`, which everywhere else means "a newer version
   exists". Observable on the transfer-leader path (whose pre-check validates
   only window width): an expired frame lands in `rejected_by_reason
   {StaleCredential}` instead of `ReplayFreshnessFailure` in the redacted
   diagnostics. Fix: return `ReplayFreshnessFailure` for envelope expiry.
+  Resolution: expiry now runs through the centralized timestamp replay policy,
+  so expired envelopes are rejected as `ReplayFreshnessFailure`; stale credential
+  remains reserved for credential-version supersession.
 
 - [ ] **CA5. Multi-peer ⇒ auth invariant lives only in argmin-s3 config, not
   the transport type.** `ControlPlaneRaftPeerTransportPolicy.auth_policy:

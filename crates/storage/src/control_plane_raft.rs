@@ -48,9 +48,9 @@ use crate::control_plane::{
 };
 use crate::control_plane_auth::{
     ControlPlaneAuthDecision, ControlPlaneAuthEnvelope, ControlPlaneAuthOperation,
-    ControlPlaneAuthPrincipal, ControlPlaneAuthRejectionReason, ControlPlaneAuthSignInput,
-    ControlPlaneAuthTarget, ControlPlaneAuthVerificationInput, ControlPlaneScopedCredential,
-    ControlPlaneScopedCredentialStore,
+    ControlPlaneAuthPrincipal, ControlPlaneAuthRejectionReason, ControlPlaneAuthReplayPolicy,
+    ControlPlaneAuthSignInput, ControlPlaneAuthTarget, ControlPlaneAuthVerificationInput,
+    ControlPlaneScopedCredential, ControlPlaneScopedCredentialStore,
 };
 use crate::control_plane_command::{
     decode_control_plane_command, encode_control_plane_command, ControlPlaneCommand,
@@ -708,16 +708,6 @@ impl ControlPlaneRaftPeerAuthPolicy {
                     return Err(error);
                 }
             };
-        let now_ms = match validate_peer_auth_replay_window(&envelope, expected_operation) {
-            Ok(now_ms) => now_ms,
-            Err(error) => {
-                self.metrics.record_rejected(
-                    expected_operation,
-                    ControlPlaneAuthRejectionReason::ReplayFreshnessFailure,
-                );
-                return Err(error);
-            }
-        };
         let decision = self
             .verifier
             .verify_envelope(ControlPlaneAuthVerificationInput {
@@ -732,7 +722,7 @@ impl ControlPlaneRaftPeerAuthPolicy {
                     },
                 ),
                 expected_operation,
-                now_ms,
+                replay_policy: peer_auth_replay_policy(expected_operation),
             });
         match decision {
             ControlPlaneAuthDecision::Accepted { .. } => {
@@ -803,40 +793,17 @@ fn peer_auth_replay_window_for_sign(
     Ok((Some(issued_at_ms), Some(expires_at_ms)))
 }
 
-fn validate_peer_auth_replay_window(
-    envelope: &ControlPlaneAuthEnvelope,
+fn peer_auth_replay_policy(
     expected_operation: ControlPlaneAuthOperation,
-) -> Result<Option<u64>, ControlPlaneError> {
+) -> ControlPlaneAuthReplayPolicy {
     if expected_operation != ControlPlaneAuthOperation::RaftTransferLeader {
-        return Ok(None);
+        return ControlPlaneAuthReplayPolicy::FencedByPayloadSemantics;
     }
-    let issued_at_ms =
-        envelope
-            .header()
-            .issued_at_ms()
-            .ok_or_else(|| ControlPlaneError::RpcProtocol {
-                message: "control-plane OpenRaft transfer-leader auth is missing issue time"
-                    .to_string(),
-            })?;
-    let expires_at_ms =
-        envelope
-            .header()
-            .expires_at_ms()
-            .ok_or_else(|| ControlPlaneError::RpcProtocol {
-                message: "control-plane OpenRaft transfer-leader auth is missing expiry time"
-                    .to_string(),
-            })?;
-    if expires_at_ms.saturating_sub(issued_at_ms)
-        > CONTROL_PLANE_RAFT_TRANSFER_LEADER_AUTH_FRESHNESS_MS
-    {
-        return Err(ControlPlaneError::RpcProtocol {
-            message: format!(
-                "control-plane OpenRaft transfer-leader auth freshness window exceeds {} ms",
-                CONTROL_PLANE_RAFT_TRANSFER_LEADER_AUTH_FRESHNESS_MS
-            ),
-        });
+    ControlPlaneAuthReplayPolicy::TimestampWindow {
+        now_ms: crate::clock::current_time_millis(),
+        max_window_ms: CONTROL_PLANE_RAFT_TRANSFER_LEADER_AUTH_FRESHNESS_MS,
+        allowed_future_skew_ms: 0,
     }
-    Ok(Some(crate::clock::current_time_millis()))
 }
 
 #[derive(Debug, Clone)]
@@ -10485,11 +10452,11 @@ mod tests {
         );
         assert_eq!(
             metrics.rejected_for_reason(ControlPlaneAuthRejectionReason::ReplayFreshnessFailure),
-            3
+            4
         );
         assert_eq!(
             metrics.rejected_for_reason(ControlPlaneAuthRejectionReason::StaleCredential),
-            1
+            0
         );
     }
 

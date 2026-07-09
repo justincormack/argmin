@@ -122,6 +122,16 @@ pub enum ControlPlaneAuthDecision {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ControlPlaneAuthReplayPolicy {
+    TimestampWindow {
+        now_ms: u64,
+        max_window_ms: u64,
+        allowed_future_skew_ms: u64,
+    },
+    FencedByPayloadSemantics,
+}
+
 #[must_use]
 pub fn control_plane_auth_payload_has_magic(bytes: &[u8]) -> bool {
     bytes.starts_with(CONTROL_PLANE_AUTH_MAGIC)
@@ -348,7 +358,7 @@ pub struct ControlPlaneAuthVerificationInput<'a> {
     pub expected_source: &'a ControlPlaneAuthPrincipal,
     pub expected_target: &'a ControlPlaneAuthTarget,
     pub expected_operation: ControlPlaneAuthOperation,
-    pub now_ms: Option<u64>,
+    pub replay_policy: ControlPlaneAuthReplayPolicy,
 }
 
 impl fmt::Debug for ControlPlaneAuthVerificationInput<'_> {
@@ -358,7 +368,7 @@ impl fmt::Debug for ControlPlaneAuthVerificationInput<'_> {
             .field("expected_source", &self.expected_source)
             .field("expected_target", &self.expected_target)
             .field("expected_operation", &self.expected_operation)
-            .field("now_ms", &self.now_ms)
+            .field("replay_policy", &self.replay_policy)
             .field("envelope_cluster_id", &self.envelope.header().cluster_id())
             .field(
                 "envelope_credential_id",
@@ -456,20 +466,7 @@ impl ControlPlaneScopedCredentialStore {
                 ControlPlaneAuthRejectionReason::UnknownCredential
             }
         })?;
-        if let Some(now_ms) = input.now_ms {
-            if header
-                .issued_at_ms()
-                .is_some_and(|issued_at_ms| issued_at_ms > now_ms)
-            {
-                return Err(ControlPlaneAuthRejectionReason::ReplayFreshnessFailure);
-            }
-            if header
-                .expires_at_ms()
-                .is_some_and(|expires_at_ms| expires_at_ms <= now_ms)
-            {
-                return Err(ControlPlaneAuthRejectionReason::StaleCredential);
-            }
-        }
+        validate_replay_policy(header, input.replay_policy)?;
         let covered = header
             .encode_covered_bytes(input.envelope.payload())
             .map_err(|_| ControlPlaneAuthRejectionReason::Malformed)?;
@@ -493,6 +490,39 @@ impl ControlPlaneScopedCredentialStore {
                 && credential.principal == *header.source()
         })
     }
+}
+
+fn validate_replay_policy(
+    header: &ControlPlaneAuthEnvelopeHeader,
+    replay_policy: ControlPlaneAuthReplayPolicy,
+) -> Result<(), ControlPlaneAuthRejectionReason> {
+    let ControlPlaneAuthReplayPolicy::TimestampWindow {
+        now_ms,
+        max_window_ms,
+        allowed_future_skew_ms,
+    } = replay_policy
+    else {
+        return Ok(());
+    };
+    let issued_at_ms = header
+        .issued_at_ms()
+        .ok_or(ControlPlaneAuthRejectionReason::ReplayFreshnessFailure)?;
+    let expires_at_ms = header
+        .expires_at_ms()
+        .ok_or(ControlPlaneAuthRejectionReason::ReplayFreshnessFailure)?;
+    let replay_window_ms = expires_at_ms
+        .checked_sub(issued_at_ms)
+        .ok_or(ControlPlaneAuthRejectionReason::ReplayFreshnessFailure)?;
+    if replay_window_ms == 0 || replay_window_ms > max_window_ms {
+        return Err(ControlPlaneAuthRejectionReason::ReplayFreshnessFailure);
+    }
+    if issued_at_ms > now_ms.saturating_add(allowed_future_skew_ms) {
+        return Err(ControlPlaneAuthRejectionReason::ReplayFreshnessFailure);
+    }
+    if expires_at_ms <= now_ms {
+        return Err(ControlPlaneAuthRejectionReason::ReplayFreshnessFailure);
+    }
+    Ok(())
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -1165,6 +1195,14 @@ impl<'a> AuthPayloadReader<'a> {
 mod tests {
     use super::*;
 
+    fn timestamp_replay_policy(now_ms: u64) -> ControlPlaneAuthReplayPolicy {
+        ControlPlaneAuthReplayPolicy::TimestampWindow {
+            now_ms,
+            max_window_ms: 1_000,
+            allowed_future_skew_ms: 0,
+        }
+    }
+
     fn sample_header() -> ControlPlaneAuthEnvelopeHeader {
         ControlPlaneAuthEnvelopeHeader::new(ControlPlaneAuthEnvelopeHeaderInput {
             cluster_id: "cluster-a".to_owned(),
@@ -1227,7 +1265,7 @@ mod tests {
                 ControlPlaneAuthPrincipal::RaftPeer { node_id: 102 },
             ),
             expected_operation: ControlPlaneAuthOperation::RaftAppendEntries,
-            now_ms: Some(1_500),
+            replay_policy: timestamp_replay_policy(1_500),
         })
     }
 
@@ -1460,7 +1498,7 @@ mod tests {
                     ControlPlaneAuthPrincipal::RaftPeer { node_id: 102 }
                 ),
                 expected_operation: ControlPlaneAuthOperation::RaftAppendEntries,
-                now_ms: Some(1_500),
+                replay_policy: timestamp_replay_policy(1_500),
             }),
             ControlPlaneAuthDecision::Rejected {
                 reason: ControlPlaneAuthRejectionReason::WrongCluster,
@@ -1475,7 +1513,7 @@ mod tests {
                     ControlPlaneAuthPrincipal::RaftPeer { node_id: 102 }
                 ),
                 expected_operation: ControlPlaneAuthOperation::RaftAppendEntries,
-                now_ms: Some(1_500),
+                replay_policy: timestamp_replay_policy(1_500),
             }),
             ControlPlaneAuthDecision::Rejected {
                 reason: ControlPlaneAuthRejectionReason::WrongSource,
@@ -1490,7 +1528,7 @@ mod tests {
                     ControlPlaneAuthService::ControlPlane
                 ),
                 expected_operation: ControlPlaneAuthOperation::RaftAppendEntries,
-                now_ms: Some(1_500),
+                replay_policy: timestamp_replay_policy(1_500),
             }),
             ControlPlaneAuthDecision::Rejected {
                 reason: ControlPlaneAuthRejectionReason::WrongTarget,
@@ -1505,7 +1543,7 @@ mod tests {
                     ControlPlaneAuthPrincipal::RaftPeer { node_id: 102 }
                 ),
                 expected_operation: ControlPlaneAuthOperation::RaftVote,
-                now_ms: Some(1_500),
+                replay_policy: timestamp_replay_policy(1_500),
             }),
             ControlPlaneAuthDecision::Rejected {
                 reason: ControlPlaneAuthRejectionReason::WrongRole,
@@ -1591,10 +1629,10 @@ mod tests {
                     ControlPlaneAuthPrincipal::RaftPeer { node_id: 102 }
                 ),
                 expected_operation: ControlPlaneAuthOperation::RaftAppendEntries,
-                now_ms: Some(2_000),
+                replay_policy: timestamp_replay_policy(2_000),
             }),
             ControlPlaneAuthDecision::Rejected {
-                reason: ControlPlaneAuthRejectionReason::StaleCredential,
+                reason: ControlPlaneAuthRejectionReason::ReplayFreshnessFailure,
             }
         );
         assert_eq!(
@@ -1606,10 +1644,54 @@ mod tests {
                     ControlPlaneAuthPrincipal::RaftPeer { node_id: 102 }
                 ),
                 expected_operation: ControlPlaneAuthOperation::RaftAppendEntries,
-                now_ms: Some(999),
+                replay_policy: timestamp_replay_policy(999),
             }),
             ControlPlaneAuthDecision::Rejected {
                 reason: ControlPlaneAuthRejectionReason::ReplayFreshnessFailure,
+            }
+        );
+        let timestamp_less_envelope = sample_credential()
+            .sign_envelope(ControlPlaneAuthSignInput {
+                target: ControlPlaneAuthTarget::Principal(ControlPlaneAuthPrincipal::RaftPeer {
+                    node_id: 102,
+                }),
+                operation: ControlPlaneAuthOperation::RaftAppendEntries,
+                issued_at_ms: None,
+                expires_at_ms: None,
+                sequence: Some(42),
+                nonce: Vec::new(),
+                payload: b"raft-payload".to_vec(),
+            })
+            .unwrap();
+        assert_eq!(
+            store.verify_envelope(ControlPlaneAuthVerificationInput {
+                envelope: &timestamp_less_envelope,
+                expected_cluster_id: "cluster-a",
+                expected_source: &ControlPlaneAuthPrincipal::RaftPeer { node_id: 101 },
+                expected_target: &ControlPlaneAuthTarget::Principal(
+                    ControlPlaneAuthPrincipal::RaftPeer { node_id: 102 }
+                ),
+                expected_operation: ControlPlaneAuthOperation::RaftAppendEntries,
+                replay_policy: timestamp_replay_policy(1_500),
+            }),
+            ControlPlaneAuthDecision::Rejected {
+                reason: ControlPlaneAuthRejectionReason::ReplayFreshnessFailure,
+            }
+        );
+        assert_eq!(
+            store.verify_envelope(ControlPlaneAuthVerificationInput {
+                envelope: &timestamp_less_envelope,
+                expected_cluster_id: "cluster-a",
+                expected_source: &ControlPlaneAuthPrincipal::RaftPeer { node_id: 101 },
+                expected_target: &ControlPlaneAuthTarget::Principal(
+                    ControlPlaneAuthPrincipal::RaftPeer { node_id: 102 }
+                ),
+                expected_operation: ControlPlaneAuthOperation::RaftAppendEntries,
+                replay_policy: ControlPlaneAuthReplayPolicy::FencedByPayloadSemantics,
+            }),
+            ControlPlaneAuthDecision::Accepted {
+                credential_id: "raft-peer-key-a".to_owned(),
+                credential_version: 7,
             }
         );
     }
@@ -1715,7 +1797,7 @@ mod tests {
                     ControlPlaneAuthPrincipal::RaftPeer { node_id: 102 }
                 ),
                 expected_operation: ControlPlaneAuthOperation::RaftAppendEntries,
-                now_ms: Some(1_500),
+                replay_policy: timestamp_replay_policy(1_500),
             }
         );
         assert!(verification_input_debug.contains("envelope_payload_len"));

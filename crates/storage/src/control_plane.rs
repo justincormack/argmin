@@ -12,8 +12,9 @@ use thiserror::Error;
 use crate::control_plane_auth::{
     control_plane_auth_payload_has_magic, ControlPlaneAuthDecision, ControlPlaneAuthEnvelope,
     ControlPlaneAuthOperation, ControlPlaneAuthPrincipal, ControlPlaneAuthRejectionReason,
-    ControlPlaneAuthService, ControlPlaneAuthTarget, ControlPlaneScopedCredential,
-    ControlPlaneScopedCredentialInput, ControlPlaneScopedCredentialStore,
+    ControlPlaneAuthReplayPolicy, ControlPlaneAuthService, ControlPlaneAuthTarget,
+    ControlPlaneScopedCredential, ControlPlaneScopedCredentialInput,
+    ControlPlaneScopedCredentialStore,
 };
 use crate::control_plane_command::{
     AppliedControlPlaneCommand, ControlPlaneCommand, ControlPlaneCommandResponse,
@@ -5748,17 +5749,6 @@ impl AuthenticatedUnixControlPlaneClient {
         let operation = ControlPlaneAuthOperation::AdminControlPlaneResponse;
         let envelope =
             ControlPlaneAuthEnvelope::decode_frame(payload, CONTROL_PLANE_RPC_MAX_PAYLOAD_LEN)?;
-        let issued_at_ms = envelope.header().issued_at_ms().unwrap_or(authority_now_ms);
-        let verification_now_ms = authority_now_ms.saturating_add(
-            CONTROL_PLANE_RPC_RESPONSE_AUTH_FUTURE_SKEW_MS
-                .min(issued_at_ms.saturating_sub(authority_now_ms)),
-        );
-        validate_control_plane_unix_read_auth_freshness_with_future_skew(
-            &envelope,
-            authority_now_ms,
-            "admin control-plane response",
-            CONTROL_PLANE_RPC_RESPONSE_AUTH_FUTURE_SKEW_MS,
-        )?;
         let response_credential = self
             .credential
             .admin_control_plane_response_credential_for_admin()?;
@@ -5775,7 +5765,7 @@ impl AuthenticatedUnixControlPlaneClient {
                 expected_source: &expected_source,
                 expected_target: &expected_target,
                 expected_operation: operation,
-                now_ms: Some(verification_now_ms),
+                replay_policy: control_plane_rpc_response_auth_replay_policy(authority_now_ms),
             },
         ) {
             ControlPlaneAuthDecision::Accepted { .. } => {
@@ -6092,11 +6082,6 @@ impl AuthenticatedUnixControlPlaneClient {
         let operation = ControlPlaneAuthOperation::RuntimeMapResponse;
         let envelope =
             ControlPlaneAuthEnvelope::decode_frame(payload, CONTROL_PLANE_RPC_MAX_PAYLOAD_LEN)?;
-        validate_control_plane_unix_read_auth_freshness(
-            &envelope,
-            authority_now_ms,
-            "runtime-map response",
-        )?;
         let response_credential = match self.credential.principal() {
             ControlPlaneAuthPrincipal::Frontend { .. } => self
                 .credential
@@ -6125,7 +6110,7 @@ impl AuthenticatedUnixControlPlaneClient {
                 expected_source: &expected_source,
                 expected_target: &expected_target,
                 expected_operation: operation,
-                now_ms: Some(authority_now_ms),
+                replay_policy: control_plane_rpc_auth_replay_policy(authority_now_ms),
             },
         ) {
             ControlPlaneAuthDecision::Accepted { .. } => {
@@ -6592,17 +6577,6 @@ impl ControlPlaneUnixAuthVerifier {
                 return Err(error);
             }
         };
-        if let Err(error) = validate_control_plane_unix_read_auth_freshness(
-            &envelope,
-            authority_now_ms,
-            "admin control-plane command",
-        ) {
-            self.metrics.record_rejected(
-                operation,
-                ControlPlaneAuthRejectionReason::ReplayFreshnessFailure,
-            );
-            return Err(error);
-        }
         let expected_source = match envelope.header().source() {
             ControlPlaneAuthPrincipal::Admin { instance_id } => ControlPlaneAuthPrincipal::Admin {
                 instance_id: instance_id.clone(),
@@ -6659,7 +6633,7 @@ impl ControlPlaneUnixAuthVerifier {
                 expected_source: &expected_source,
                 expected_target: &expected_target,
                 expected_operation: operation,
-                now_ms: Some(authority_now_ms),
+                replay_policy: control_plane_rpc_auth_replay_policy(authority_now_ms),
             },
         ) {
             ControlPlaneAuthDecision::Accepted {
@@ -6740,17 +6714,6 @@ impl ControlPlaneUnixAuthVerifier {
                 return Err(error);
             }
         };
-        if let Err(error) = validate_control_plane_unix_read_auth_freshness(
-            &envelope,
-            authority_now_ms,
-            "frontend runtime-map read",
-        ) {
-            self.metrics.record_rejected(
-                operation,
-                ControlPlaneAuthRejectionReason::ReplayFreshnessFailure,
-            );
-            return Err(error);
-        }
         let expected_source = match envelope.header().source() {
             ControlPlaneAuthPrincipal::Frontend { instance_id } => {
                 ControlPlaneAuthPrincipal::Frontend {
@@ -6811,7 +6774,7 @@ impl ControlPlaneUnixAuthVerifier {
                 expected_source: &expected_source,
                 expected_target: &expected_target,
                 expected_operation: operation,
-                now_ms: Some(authority_now_ms),
+                replay_policy: control_plane_rpc_auth_replay_policy(authority_now_ms),
             },
         ) {
             ControlPlaneAuthDecision::Accepted {
@@ -6885,15 +6848,6 @@ impl ControlPlaneUnixAuthVerifier {
                 return Err(error);
             }
         };
-        if let Err(error) =
-            validate_storage_node_heartbeat_auth_freshness(&envelope, &heartbeat, authority_now_ms)
-        {
-            self.metrics.record_rejected(
-                ControlPlaneAuthOperation::StorageRuntimeMapRefresh,
-                ControlPlaneAuthRejectionReason::ReplayFreshnessFailure,
-            );
-            return Err(error);
-        }
         let expected_source = ControlPlaneAuthPrincipal::StorageNode {
             node_id: heartbeat.node_id,
             incarnation: heartbeat.node_incarnation,
@@ -6949,7 +6903,10 @@ impl ControlPlaneUnixAuthVerifier {
                 expected_source: &expected_source,
                 expected_target: &expected_target,
                 expected_operation: ControlPlaneAuthOperation::StorageRuntimeMapRefresh,
-                now_ms: Some(authority_now_ms),
+                replay_policy: storage_node_heartbeat_auth_replay_policy(
+                    &heartbeat,
+                    authority_now_ms,
+                ),
             },
         ) {
             ControlPlaneAuthDecision::Accepted {
@@ -6987,130 +6944,35 @@ impl ControlPlaneUnixAuthVerifier {
     }
 }
 
-fn validate_storage_node_heartbeat_auth_freshness(
-    envelope: &ControlPlaneAuthEnvelope,
+fn storage_node_heartbeat_auth_replay_policy(
     heartbeat: &NodeHeartbeat,
     authority_now_ms: u64,
-) -> Result<(), ControlPlaneError> {
-    let issued_at_ms =
-        envelope
-            .header()
-            .issued_at_ms()
-            .ok_or_else(|| ControlPlaneError::RpcProtocol {
-                message: "control-plane storage-node heartbeat auth missing issued_at_ms"
-                    .to_owned(),
-            })?;
-    let expires_at_ms =
-        envelope
-            .header()
-            .expires_at_ms()
-            .ok_or_else(|| ControlPlaneError::RpcProtocol {
-                message: "control-plane storage-node heartbeat auth missing expires_at_ms"
-                    .to_owned(),
-            })?;
-    let replay_window_ms =
-        expires_at_ms
-            .checked_sub(issued_at_ms)
-            .ok_or_else(|| ControlPlaneError::RpcProtocol {
-                message: "control-plane storage-node heartbeat auth expiry precedes issue time"
-                    .to_owned(),
-            })?;
-    if replay_window_ms == 0 {
-        return Err(ControlPlaneError::RpcProtocol {
-            message: "control-plane storage-node heartbeat auth expiry is empty".to_owned(),
-        });
+) -> ControlPlaneAuthReplayPolicy {
+    ControlPlaneAuthReplayPolicy::TimestampWindow {
+        now_ms: authority_now_ms,
+        max_window_ms: heartbeat
+            .requested_lease_duration_ms
+            .min(MAX_HEARTBEAT_LEASE_MS),
+        allowed_future_skew_ms: 0,
     }
-    if replay_window_ms > heartbeat.requested_lease_duration_ms {
-        return Err(ControlPlaneError::RpcProtocol {
-            message: format!(
-                "control-plane storage-node heartbeat auth replay window {replay_window_ms}ms exceeds requested lease {}ms",
-                heartbeat.requested_lease_duration_ms
-            ),
-        });
-    }
-    if replay_window_ms > MAX_HEARTBEAT_LEASE_MS {
-        return Err(ControlPlaneError::RpcProtocol {
-            message: format!(
-                "control-plane storage-node heartbeat auth replay window {replay_window_ms}ms exceeds maximum {MAX_HEARTBEAT_LEASE_MS}ms"
-            ),
-        });
-    }
-    if issued_at_ms > authority_now_ms {
-        return Err(ControlPlaneError::RpcProtocol {
-            message: "control-plane storage-node heartbeat auth issue time is in the future"
-                .to_owned(),
-        });
-    }
-    if expires_at_ms <= authority_now_ms {
-        return Err(ControlPlaneError::RpcProtocol {
-            message: "control-plane storage-node heartbeat auth has expired".to_owned(),
-        });
-    }
-    Ok(())
 }
 
-fn validate_control_plane_unix_read_auth_freshness(
-    envelope: &ControlPlaneAuthEnvelope,
-    authority_now_ms: u64,
-    operation_name: &'static str,
-) -> Result<(), ControlPlaneError> {
-    validate_control_plane_unix_read_auth_freshness_with_future_skew(
-        envelope,
-        authority_now_ms,
-        operation_name,
-        0,
-    )
+fn control_plane_rpc_auth_replay_policy(authority_now_ms: u64) -> ControlPlaneAuthReplayPolicy {
+    ControlPlaneAuthReplayPolicy::TimestampWindow {
+        now_ms: authority_now_ms,
+        max_window_ms: CONTROL_PLANE_RPC_READ_AUTH_REPLAY_WINDOW_MS,
+        allowed_future_skew_ms: 0,
+    }
 }
 
-fn validate_control_plane_unix_read_auth_freshness_with_future_skew(
-    envelope: &ControlPlaneAuthEnvelope,
+fn control_plane_rpc_response_auth_replay_policy(
     authority_now_ms: u64,
-    operation_name: &'static str,
-    allowed_future_skew_ms: u64,
-) -> Result<(), ControlPlaneError> {
-    let issued_at_ms =
-        envelope
-            .header()
-            .issued_at_ms()
-            .ok_or_else(|| ControlPlaneError::RpcProtocol {
-                message: format!("control-plane {operation_name} auth missing issued_at_ms"),
-            })?;
-    let expires_at_ms =
-        envelope
-            .header()
-            .expires_at_ms()
-            .ok_or_else(|| ControlPlaneError::RpcProtocol {
-                message: format!("control-plane {operation_name} auth missing expires_at_ms"),
-            })?;
-    let replay_window_ms =
-        expires_at_ms
-            .checked_sub(issued_at_ms)
-            .ok_or_else(|| ControlPlaneError::RpcProtocol {
-                message: format!("control-plane {operation_name} auth expiry precedes issue time"),
-            })?;
-    if replay_window_ms == 0 {
-        return Err(ControlPlaneError::RpcProtocol {
-            message: format!("control-plane {operation_name} auth expiry is empty"),
-        });
+) -> ControlPlaneAuthReplayPolicy {
+    ControlPlaneAuthReplayPolicy::TimestampWindow {
+        now_ms: authority_now_ms,
+        max_window_ms: CONTROL_PLANE_RPC_READ_AUTH_REPLAY_WINDOW_MS,
+        allowed_future_skew_ms: CONTROL_PLANE_RPC_RESPONSE_AUTH_FUTURE_SKEW_MS,
     }
-    if replay_window_ms > CONTROL_PLANE_RPC_READ_AUTH_REPLAY_WINDOW_MS {
-        return Err(ControlPlaneError::RpcProtocol {
-            message: format!(
-                "control-plane {operation_name} auth replay window {replay_window_ms}ms exceeds maximum {CONTROL_PLANE_RPC_READ_AUTH_REPLAY_WINDOW_MS}ms"
-            ),
-        });
-    }
-    if issued_at_ms > authority_now_ms.saturating_add(allowed_future_skew_ms) {
-        return Err(ControlPlaneError::RpcProtocol {
-            message: format!("control-plane {operation_name} auth issue time is in the future"),
-        });
-    }
-    if expires_at_ms <= authority_now_ms {
-        return Err(ControlPlaneError::RpcProtocol {
-            message: format!("control-plane {operation_name} auth has expired"),
-        });
-    }
-    Ok(())
 }
 
 fn write_authenticated_control_plane_rpc_payload(
@@ -16055,7 +15917,7 @@ mod tests {
         .unwrap_err();
 
         assert!(
-            matches!(error, ControlPlaneError::RpcProtocol { ref message } if message.contains("missing issued_at_ms")),
+            matches!(error, ControlPlaneError::RpcProtocol { ref message } if message.contains("ReplayFreshnessFailure")),
             "unexpected error: {error}"
         );
         let metrics = verifier.metrics_snapshot();
@@ -16111,7 +15973,7 @@ mod tests {
         .unwrap_err();
 
         assert!(
-            matches!(error, ControlPlaneError::RpcProtocol { ref message } if message.contains("exceeds requested lease")),
+            matches!(error, ControlPlaneError::RpcProtocol { ref message } if message.contains("ReplayFreshnessFailure")),
             "unexpected error: {error}"
         );
         let metrics = verifier.metrics_snapshot();
