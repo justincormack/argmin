@@ -7526,10 +7526,23 @@ pub struct ControlPlaneRpcRequest {
     payload: Vec<u8>,
 }
 
+impl ControlPlaneRpcRequest {
+    #[must_use]
+    pub fn is_refresh_node_heartbeat(&self) -> bool {
+        self.kind == ControlPlaneRpcKind::RefreshNodeHeartbeat
+    }
+}
+
 #[derive(Debug)]
 pub struct ControlPlaneRpcResponse {
     kind: ControlPlaneRpcKind,
     payload: Vec<u8>,
+}
+
+#[derive(Debug)]
+pub struct PreparedControlPlaneHeartbeatResponse {
+    refresh: Result<ControlPlaneHeartbeatRefresh, ControlPlaneError>,
+    response_auth: Option<(ControlPlaneScopedCredential, ControlPlaneAuthPrincipal)>,
 }
 
 pub fn read_control_plane_unix_request(
@@ -7990,6 +8003,71 @@ impl ControlPlaneRpcKind {
             | Self::TriggerRaftElection => ControlPlaneAuthOperation::AdminControlPlaneCommand,
         }
     }
+}
+
+pub fn prepare_control_plane_heartbeat_response<T>(
+    control_plane: &mut T,
+    request: ControlPlaneRpcRequest,
+    authority_now_ms: u64,
+    auth_verifier: Option<&ControlPlaneUnixAuthVerifier>,
+) -> Result<PreparedControlPlaneHeartbeatResponse, ControlPlaneError>
+where
+    T: ControlPlaneHeartbeatRuntimeMapSource,
+{
+    let ControlPlaneRpcRequest { kind, payload } = request;
+    if kind != ControlPlaneRpcKind::RefreshNodeHeartbeat {
+        return Err(ControlPlaneError::RpcProtocol {
+            message: format!("expected RefreshNodeHeartbeat RPC, got {kind:?}"),
+        });
+    }
+    debug_assert_eq!(
+        kind.auth_operation(),
+        ControlPlaneAuthOperation::StorageRuntimeMapRefresh
+    );
+    let (payload, response_auth) = match auth_verifier {
+        Some(auth_verifier) if auth_verifier.requires_storage_node_heartbeat_auth() => {
+            let verified =
+                auth_verifier.verify_storage_node_heartbeat_payload(&payload, authority_now_ms)?;
+            (
+                verified.payload,
+                Some((verified.response_credential, verified.response_target)),
+            )
+        }
+        _ => (payload, None),
+    };
+    let mut reader = PayloadReader::new(&payload);
+    let heartbeat = read_node_heartbeat(&mut reader)?;
+    reader.finish()?;
+    let refresh = control_plane.refresh_node_heartbeat(heartbeat, authority_now_ms);
+    Ok(PreparedControlPlaneHeartbeatResponse {
+        refresh,
+        response_auth,
+    })
+}
+
+pub fn finish_control_plane_heartbeat_response<F>(
+    prepared: PreparedControlPlaneHeartbeatResponse,
+    mut response_authority_now_ms: F,
+) -> Result<ControlPlaneRpcResponse, ControlPlaneError>
+where
+    F: FnMut() -> Result<u64, ControlPlaneError>,
+{
+    let response = match prepared.refresh {
+        Ok(refresh) => {
+            let mut response = Vec::new();
+            write_heartbeat_lease_summary(&mut response, refresh.lease());
+            write_runtime_map_snapshot(&mut response, refresh.runtime_map())?;
+            Ok(response)
+        }
+        Err(error) => Err(error),
+    };
+    let response_authority_now_ms = response_authority_now_ms()?;
+    build_runtime_map_rpc_response(
+        ControlPlaneRpcKind::RefreshNodeHeartbeat,
+        response,
+        prepared.response_auth,
+        response_authority_now_ms,
+    )
 }
 
 fn write_control_plane_rpc_frame(
@@ -17759,6 +17837,47 @@ mod tests {
         reader.finish().unwrap();
         assert_eq!(lease.node_id(), NodeId::new(1));
         assert_eq!(lease.cluster_epoch(), runtime_map.cluster_epoch());
+    }
+
+    #[test]
+    fn prepared_heartbeat_response_can_be_finished_after_authority_changes() {
+        let tmp = test_util::tempdir();
+        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+        authority
+            .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
+            .unwrap();
+        assert!(heartbeat_until_serving(&mut authority, 1, 1_000).serving());
+        let heartbeat =
+            heartbeat_from_record(&authority, 1, authority.snapshot().cluster_epoch(), 2_000);
+        let mut payload = Vec::new();
+        write_node_heartbeat(&mut payload, &heartbeat).unwrap();
+        let request = ControlPlaneRpcRequest {
+            kind: ControlPlaneRpcKind::RefreshNodeHeartbeat,
+            payload,
+        };
+
+        let prepared =
+            prepare_control_plane_heartbeat_response(&mut authority, request, 2_000, None).unwrap();
+        let prepared_epoch = authority.snapshot().cluster_epoch();
+        authority
+            .set_node_membership(NodeId::new(2), NodeMembershipState::Active)
+            .unwrap();
+        assert!(
+            authority.snapshot().cluster_epoch() > prepared_epoch,
+            "test setup should mutate authority after heartbeat preparation"
+        );
+
+        let response = finish_control_plane_heartbeat_response(prepared, || Ok(2_001)).unwrap();
+
+        assert_eq!(response.kind, ControlPlaneRpcKind::RefreshNodeHeartbeat);
+        let response_payload = decode_control_plane_rpc_response(response.payload).unwrap();
+        let mut reader = PayloadReader::new(&response_payload);
+        let lease = read_heartbeat_lease_summary(&mut reader).unwrap();
+        let runtime_map = read_runtime_map_snapshot(&mut reader).unwrap();
+        reader.finish().unwrap();
+        assert_eq!(lease.cluster_epoch(), prepared_epoch);
+        assert_eq!(runtime_map.cluster_epoch(), prepared_epoch);
     }
 
     #[test]

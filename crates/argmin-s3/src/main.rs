@@ -27,6 +27,7 @@ use server_core::sse::{
 use storage::control_plane::{
     build_control_plane_unix_response,
     build_control_plane_unix_response_with_auth_and_response_clock,
+    finish_control_plane_heartbeat_response, prepare_control_plane_heartbeat_response,
     read_control_plane_unix_request, write_control_plane_unix_response,
     AuthenticatedUnixControlPlaneClient, ClusterControlSnapshot, ClusterRuntimeMapSnapshot,
     ControlPlaneAdmin, ControlPlaneAdminAuthCredential, ControlPlaneError,
@@ -3032,7 +3033,25 @@ fn spawn_control_plane_rpc_worker(
                 return;
             }
         };
-        let response = {
+        let response = if request.is_refresh_node_heartbeat() {
+            let prepared = {
+                let mut authority = authority
+                    .lock()
+                    .expect("control-plane authority mutex poisoned");
+                let now_ms = storage::clock::current_time_millis();
+                prepare_control_plane_heartbeat_response(
+                    &mut *authority,
+                    request,
+                    now_ms,
+                    auth_verifier.as_deref(),
+                )
+            };
+            prepared.and_then(|prepared| {
+                finish_control_plane_heartbeat_response(prepared, || {
+                    Ok(storage::clock::current_time_millis())
+                })
+            })
+        } else {
             let mut authority = authority
                 .lock()
                 .expect("control-plane authority mutex poisoned");
