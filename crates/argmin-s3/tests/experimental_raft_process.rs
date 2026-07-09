@@ -62,6 +62,79 @@ struct ChildGuard {
     child: Option<Child>,
 }
 
+struct ProcessTestControlPlaneAuth {
+    cluster_name: String,
+}
+
+impl ProcessTestControlPlaneAuth {
+    fn new(cluster_name: &str) -> Self {
+        Self {
+            cluster_name: cluster_name.to_owned(),
+        }
+    }
+
+    fn raft_peer_secret(node_id: u64) -> String {
+        format!("process-test-raft-node-{node_id}-secret")
+    }
+
+    fn raft_peer_credential_id(node_id: u64) -> String {
+        format!("raft-node-{node_id}")
+    }
+
+    fn raft_peer_config_entry(node_id: u64) -> String {
+        format!(
+            "{node_id}={}:1:{}",
+            Self::raft_peer_credential_id(node_id),
+            Self::raft_peer_secret(node_id)
+        )
+    }
+
+    fn raft_peer_credentials_env(&self, local_node_id: u64, peer_node_ids: &[u64]) -> String {
+        let mut auth_nodes: BTreeSet<u64> = peer_node_ids.iter().copied().collect();
+        auth_nodes.insert(local_node_id);
+        auth_nodes
+            .into_iter()
+            .map(Self::raft_peer_config_entry)
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+
+    fn raft_peer_credential(&self, node_id: u64) -> ControlPlaneScopedCredential {
+        ControlPlaneScopedCredential::new(ControlPlaneScopedCredentialInput {
+            cluster_id: self.cluster_name.clone(),
+            credential_id: Self::raft_peer_credential_id(node_id),
+            credential_version: 1,
+            principal: ControlPlaneAuthPrincipal::RaftPeer { node_id },
+            secret: Self::raft_peer_secret(node_id).into_bytes(),
+        })
+        .expect("process test Raft peer credential should build")
+    }
+
+    fn sign_raft_peer_frame(
+        &self,
+        source_node_id: u64,
+        target_node_id: u64,
+        operation: ControlPlaneAuthOperation,
+        payload: Vec<u8>,
+    ) -> Vec<u8> {
+        self.raft_peer_credential(source_node_id)
+            .sign_envelope(ControlPlaneAuthSignInput {
+                target: ControlPlaneAuthTarget::Principal(ControlPlaneAuthPrincipal::RaftPeer {
+                    node_id: target_node_id,
+                }),
+                operation,
+                issued_at_ms: None,
+                expires_at_ms: None,
+                sequence: None,
+                nonce: Vec::new(),
+                payload,
+            })
+            .expect("process test Raft peer frame should sign")
+            .encode_frame()
+            .expect("process test Raft peer auth envelope should encode")
+    }
+}
+
 impl ChildGuard {
     fn spawn(
         bin: &Path,
@@ -110,15 +183,8 @@ impl ChildGuard {
             })
             .collect::<Vec<_>>()
             .join(",");
-        let mut auth_nodes: BTreeSet<u64> = peer_node_ids.iter().copied().collect();
-        auth_nodes.insert(raft_node_id);
-        let peer_auth_credentials = auth_nodes
-            .into_iter()
-            .map(|node_id| {
-                format!("{node_id}=raft-node-{node_id}:1:process-test-raft-node-{node_id}-secret")
-            })
-            .collect::<Vec<_>>()
-            .join(",");
+        let auth = ProcessTestControlPlaneAuth::new(cluster_name);
+        let peer_auth_credentials = auth.raft_peer_credentials_env(raft_node_id, peer_node_ids);
         let storage_node_sockets = format!(
             "0={},1={}",
             test_dir.join("storage-node-0.sock").display(),
@@ -822,20 +888,6 @@ fn wal_path(test_dir: &Path, node_id: u64) -> PathBuf {
     durable_artifact_wal_path(&state_path(test_dir, node_id))
 }
 
-fn process_test_raft_peer_credential(
-    cluster_name: &str,
-    node_id: u64,
-) -> ControlPlaneScopedCredential {
-    ControlPlaneScopedCredential::new(ControlPlaneScopedCredentialInput {
-        cluster_id: cluster_name.to_string(),
-        credential_id: format!("raft-node-{node_id}"),
-        credential_version: 1,
-        principal: ControlPlaneAuthPrincipal::RaftPeer { node_id },
-        secret: format!("process-test-raft-node-{node_id}-secret").into_bytes(),
-    })
-    .expect("process test Raft peer credential should build")
-}
-
 fn sign_process_test_raft_peer_frame(
     cluster_name: &str,
     source_node_id: u64,
@@ -843,21 +895,12 @@ fn sign_process_test_raft_peer_frame(
     operation: ControlPlaneAuthOperation,
     payload: Vec<u8>,
 ) -> Vec<u8> {
-    process_test_raft_peer_credential(cluster_name, source_node_id)
-        .sign_envelope(ControlPlaneAuthSignInput {
-            target: ControlPlaneAuthTarget::Principal(ControlPlaneAuthPrincipal::RaftPeer {
-                node_id: target_node_id,
-            }),
-            operation,
-            issued_at_ms: None,
-            expires_at_ms: None,
-            sequence: None,
-            nonce: Vec::new(),
-            payload,
-        })
-        .expect("process test Raft peer frame should sign")
-        .encode_frame()
-        .expect("process test Raft peer auth envelope should encode")
+    ProcessTestControlPlaneAuth::new(cluster_name).sign_raft_peer_frame(
+        source_node_id,
+        target_node_id,
+        operation,
+        payload,
+    )
 }
 
 fn raft_wal_file(

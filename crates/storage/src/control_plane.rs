@@ -11931,23 +11931,149 @@ mod tests {
         }
     }
 
+    struct TestControlPlaneAuth {
+        cluster_id: String,
+    }
+
+    impl TestControlPlaneAuth {
+        fn new(cluster_id: impl Into<String>) -> Self {
+            Self {
+                cluster_id: cluster_id.into(),
+            }
+        }
+
+        fn storage_node_config(&self, node_id: u32) -> ControlPlaneStorageNodeAuthCredential {
+            self.storage_node_config_with(
+                node_id,
+                &format!("storage-node-{node_id}"),
+                1,
+                &format!("storage-node-{node_id}-secret"),
+            )
+        }
+
+        fn storage_node_config_with(
+            &self,
+            node_id: u32,
+            credential_id: &str,
+            credential_version: u64,
+            secret: &str,
+        ) -> ControlPlaneStorageNodeAuthCredential {
+            ControlPlaneStorageNodeAuthCredential::new(
+                NodeId::new(node_id),
+                credential_id.to_owned(),
+                credential_version,
+                secret.as_bytes().to_vec(),
+            )
+            .expect("test storage-node node-scoped auth credential should build")
+        }
+
+        fn storage_node_credential(
+            &self,
+            node_id: u32,
+            incarnation: u64,
+        ) -> ControlPlaneScopedCredential {
+            self.storage_node_config(node_id)
+                .scoped_for_cluster_and_incarnation(&self.cluster_id, incarnation)
+                .expect("test storage-node auth credential should build")
+        }
+
+        fn frontend_config(&self, instance_id: &str) -> ControlPlaneFrontendAuthCredential {
+            self.frontend_config_with(
+                instance_id,
+                &format!("{instance_id}-credential"),
+                1,
+                &format!("{instance_id}-secret"),
+            )
+        }
+
+        fn frontend_config_with(
+            &self,
+            instance_id: &str,
+            credential_id: &str,
+            credential_version: u64,
+            secret: &str,
+        ) -> ControlPlaneFrontendAuthCredential {
+            ControlPlaneFrontendAuthCredential::new(
+                instance_id,
+                credential_id.to_owned(),
+                credential_version,
+                secret.as_bytes().to_vec(),
+            )
+            .expect("test frontend auth credential should build")
+        }
+
+        fn frontend_credential(&self, instance_id: &str) -> ControlPlaneScopedCredential {
+            self.frontend_config(instance_id)
+                .scoped_for_cluster(&self.cluster_id)
+                .expect("test frontend scoped credential should build")
+        }
+
+        fn admin_config(&self, instance_id: &str) -> ControlPlaneAdminAuthCredential {
+            self.admin_config_with(
+                instance_id,
+                &format!("{instance_id}-credential"),
+                1,
+                &format!("{instance_id}-secret"),
+            )
+        }
+
+        fn admin_config_with(
+            &self,
+            instance_id: &str,
+            credential_id: &str,
+            credential_version: u64,
+            secret: &str,
+        ) -> ControlPlaneAdminAuthCredential {
+            ControlPlaneAdminAuthCredential::new(
+                instance_id,
+                credential_id.to_owned(),
+                credential_version,
+                secret.as_bytes().to_vec(),
+            )
+            .expect("test admin auth credential should build")
+        }
+
+        fn admin_credential(&self, instance_id: &str) -> ControlPlaneScopedCredential {
+            self.admin_config(instance_id)
+                .scoped_for_cluster(&self.cluster_id)
+                .expect("test admin scoped credential should build")
+        }
+
+        fn storage_node_verifier(
+            &self,
+            credentials: Vec<ControlPlaneStorageNodeAuthCredential>,
+        ) -> ControlPlaneUnixAuthVerifier {
+            ControlPlaneUnixAuthVerifier::new(&self.cluster_id, credentials)
+                .expect("test storage-node auth verifier should build")
+        }
+
+        fn frontend_verifier(&self, instance_id: &str) -> ControlPlaneUnixAuthVerifier {
+            self.storage_node_verifier(vec![self.storage_node_config(1)])
+                .with_frontend_credentials(vec![self.frontend_config(instance_id)])
+                .expect("test frontend auth verifier should build")
+        }
+
+        fn admin_verifier(&self, instance_id: &str) -> ControlPlaneUnixAuthVerifier {
+            self.storage_node_verifier(vec![self.storage_node_config(1)])
+                .with_admin_credentials(vec![self.admin_config(instance_id)])
+                .expect("test admin auth verifier should build")
+        }
+    }
+
+    fn test_auth(cluster_id: &str) -> TestControlPlaneAuth {
+        TestControlPlaneAuth::new(cluster_id)
+    }
+
     fn storage_node_auth_credential(
         cluster_id: &str,
         node_id: u32,
         incarnation: u64,
     ) -> ControlPlaneScopedCredential {
-        storage_node_auth_node_credential(node_id)
-            .scoped_for_cluster_and_incarnation(cluster_id, incarnation)
-            .expect("test storage-node auth credential should build")
+        test_auth(cluster_id).storage_node_credential(node_id, incarnation)
     }
 
     fn storage_node_auth_node_credential(node_id: u32) -> ControlPlaneStorageNodeAuthCredential {
-        storage_node_auth_node_credential_with(
-            node_id,
-            &format!("storage-node-{node_id}"),
-            1,
-            &format!("storage-node-{node_id}-secret"),
-        )
+        test_auth("auth-cluster").storage_node_config(node_id)
     }
 
     fn storage_node_auth_node_credential_with(
@@ -11956,22 +12082,16 @@ mod tests {
         credential_version: u64,
         secret: &str,
     ) -> ControlPlaneStorageNodeAuthCredential {
-        ControlPlaneStorageNodeAuthCredential::new(
-            NodeId::new(node_id),
-            credential_id.to_owned(),
+        test_auth("auth-cluster").storage_node_config_with(
+            node_id,
+            credential_id,
             credential_version,
-            secret.as_bytes().to_vec(),
+            secret,
         )
-        .expect("test storage-node node-scoped auth credential should build")
     }
 
     fn frontend_auth_config_credential(instance_id: &str) -> ControlPlaneFrontendAuthCredential {
-        frontend_auth_config_credential_with(
-            instance_id,
-            &format!("{instance_id}-credential"),
-            1,
-            &format!("{instance_id}-secret"),
-        )
+        test_auth("auth-cluster").frontend_config(instance_id)
     }
 
     fn frontend_auth_config_credential_with(
@@ -11980,31 +12100,19 @@ mod tests {
         credential_version: u64,
         secret: &str,
     ) -> ControlPlaneFrontendAuthCredential {
-        ControlPlaneFrontendAuthCredential::new(
+        test_auth("auth-cluster").frontend_config_with(
             instance_id,
-            credential_id.to_owned(),
+            credential_id,
             credential_version,
-            secret.as_bytes().to_vec(),
+            secret,
         )
-        .expect("test frontend auth credential should build")
     }
 
     fn frontend_auth_credential(
         cluster_id: &str,
         instance_id: &str,
     ) -> ControlPlaneScopedCredential {
-        frontend_auth_config_credential(instance_id)
-            .scoped_for_cluster(cluster_id)
-            .expect("test frontend scoped credential should build")
-    }
-
-    fn admin_auth_config_credential(instance_id: &str) -> ControlPlaneAdminAuthCredential {
-        admin_auth_config_credential_with(
-            instance_id,
-            &format!("{instance_id}-credential"),
-            1,
-            &format!("{instance_id}-secret"),
-        )
+        test_auth(cluster_id).frontend_credential(instance_id)
     }
 
     fn admin_auth_config_credential_with(
@@ -12013,39 +12121,31 @@ mod tests {
         credential_version: u64,
         secret: &str,
     ) -> ControlPlaneAdminAuthCredential {
-        ControlPlaneAdminAuthCredential::new(
+        test_auth("auth-cluster").admin_config_with(
             instance_id,
-            credential_id.to_owned(),
+            credential_id,
             credential_version,
-            secret.as_bytes().to_vec(),
+            secret,
         )
-        .expect("test admin auth credential should build")
     }
 
     fn admin_auth_credential(cluster_id: &str, instance_id: &str) -> ControlPlaneScopedCredential {
-        admin_auth_config_credential(instance_id)
-            .scoped_for_cluster(cluster_id)
-            .expect("test admin scoped credential should build")
+        test_auth(cluster_id).admin_credential(instance_id)
     }
 
     fn storage_node_auth_verifier(
         cluster_id: &str,
         credentials: Vec<ControlPlaneStorageNodeAuthCredential>,
     ) -> ControlPlaneUnixAuthVerifier {
-        ControlPlaneUnixAuthVerifier::new(cluster_id, credentials)
-            .expect("test storage-node auth verifier should build")
+        test_auth(cluster_id).storage_node_verifier(credentials)
     }
 
     fn frontend_auth_verifier(cluster_id: &str, instance_id: &str) -> ControlPlaneUnixAuthVerifier {
-        storage_node_auth_verifier(cluster_id, vec![storage_node_auth_node_credential(1)])
-            .with_frontend_credentials(vec![frontend_auth_config_credential(instance_id)])
-            .expect("test frontend auth verifier should build")
+        test_auth(cluster_id).frontend_verifier(instance_id)
     }
 
     fn admin_auth_verifier(cluster_id: &str, instance_id: &str) -> ControlPlaneUnixAuthVerifier {
-        storage_node_auth_verifier(cluster_id, vec![storage_node_auth_node_credential(1)])
-            .with_admin_credentials(vec![admin_auth_config_credential(instance_id)])
-            .expect("test admin auth verifier should build")
+        test_auth(cluster_id).admin_verifier(instance_id)
     }
 
     fn signed_frontend_runtime_map_request(
@@ -14549,34 +14649,65 @@ mod tests {
         let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
         let server = std::thread::spawn(move || {
             let (mut stream, _addr) = listener.accept().unwrap();
-            handle_control_plane_unix_stream_with_auth(
+            let request = read_control_plane_unix_request(&mut stream).unwrap();
+            let issued_at_ms = ControlPlaneAuthEnvelope::decode_frame(
+                &request.payload,
+                CONTROL_PLANE_RPC_MAX_PAYLOAD_LEN,
+            )
+            .unwrap()
+            .header()
+            .issued_at_ms()
+            .unwrap();
+            let response = build_control_plane_unix_response_with_auth_and_response_clock(
                 &mut authority,
-                &mut stream,
-                2_000,
-                &verifier,
+                request,
+                issued_at_ms,
+                Some(&verifier),
+                || Ok(issued_at_ms),
             )
             .unwrap();
+            write_control_plane_unix_response(&mut stream, response).unwrap();
 
             let (mut stream, _addr) = listener.accept().unwrap();
             let request = read_control_plane_unix_request(&mut stream).unwrap();
             assert_eq!(request.kind, ControlPlaneRpcKind::SetPgActingSet);
-            build_control_plane_unix_response_with_auth(
+            let issued_at_ms = ControlPlaneAuthEnvelope::decode_frame(
+                &request.payload,
+                CONTROL_PLANE_RPC_MAX_PAYLOAD_LEN,
+            )
+            .unwrap()
+            .header()
+            .issued_at_ms()
+            .unwrap();
+            build_control_plane_unix_response_with_auth_and_response_clock(
                 &mut authority,
                 request,
-                2_000,
+                issued_at_ms,
                 Some(&verifier),
+                || Ok(issued_at_ms),
             )
             .expect("dropped authenticated admin mutation should still apply");
             drop(stream);
 
             let (mut stream, _addr) = listener.accept().unwrap();
-            handle_control_plane_unix_stream_with_auth(
+            let request = read_control_plane_unix_request(&mut stream).unwrap();
+            let issued_at_ms = ControlPlaneAuthEnvelope::decode_frame(
+                &request.payload,
+                CONTROL_PLANE_RPC_MAX_PAYLOAD_LEN,
+            )
+            .unwrap()
+            .header()
+            .issued_at_ms()
+            .unwrap();
+            let response = build_control_plane_unix_response_with_auth_and_response_clock(
                 &mut authority,
-                &mut stream,
-                2_000,
-                &verifier,
+                request,
+                issued_at_ms,
+                Some(&verifier),
+                || Ok(issued_at_ms),
             )
             .unwrap();
+            write_control_plane_unix_response(&mut stream, response).unwrap();
             assert_eq!(
                 authority.snapshot().pg(PgId::new(7)).unwrap().acting_set(),
                 &[NodeId::new(1)]

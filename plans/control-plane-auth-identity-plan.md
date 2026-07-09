@@ -569,6 +569,15 @@ Progress:
   accepts overlapping credentials for the same principal when the credential
   id/version pair is unique, verifiers retain all configured versions, and local
   clients sign with the highest configured version for their principal.
+- 2026-07-09: Started the shared authenticated test-helper slice. Storage
+  control-plane auth tests now build storage-node, frontend, admin, scoped
+  credentials, and Unix verifiers through a single deterministic
+  `TestControlPlaneAuth` helper while preserving the older wrapper names for
+  low-churn migration. The experimental Raft process tests now use a
+  `ProcessTestControlPlaneAuth` helper for both `ARGMIN_CONTROL_PLANE_RAFT_AUTH_CREDENTIALS`
+  env generation and direct authenticated peer-frame signing, so process-test
+  credentials have one source of truth before broader authenticated Unix/UAT
+  conversion.
 
 ## Replay Policy
 
