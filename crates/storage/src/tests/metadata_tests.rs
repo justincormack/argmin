@@ -444,6 +444,24 @@ fn file_pg_store_uses_in_memory_temp_store() {
 }
 
 #[test]
+fn file_pg_store_uses_power_loss_safe_wal_pragmas() {
+    let (_dir, store) = make_pg_store();
+    let journal_mode: String = store
+        .connection()
+        .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+        .unwrap();
+    let synchronous: i64 = store
+        .connection()
+        .query_row("PRAGMA synchronous", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(journal_mode.to_ascii_lowercase(), "wal");
+    assert_eq!(
+        synchronous, 2,
+        "PgStore connections must use SQLite synchronous=FULL with WAL so committed metadata commands are fsynced before acknowledgement"
+    );
+}
+
+#[test]
 fn file_metadata_put_get_delete() {
     let (_dir, store) = make_pg_store();
     metadata_put_get_delete(&store);

@@ -756,10 +756,10 @@ const CREATE_BUCKET_SUBRESOURCES_KIND_BUCKET_INDEX: &str = "\
 CREATE INDEX IF NOT EXISTS idx_bucket_subresources_kind_bucket \
 ON bucket_subresources (kind, bucket_name) WHERE body IS NOT NULL";
 
-/// SQLite pragmas for per-PG databases: WAL mode, NORMAL synchronous.
+/// SQLite pragmas for per-PG databases: WAL mode, FULL synchronous.
 const PG_PRAGMAS: &str = "\
 PRAGMA journal_mode=WAL;
-PRAGMA synchronous=NORMAL;
+PRAGMA synchronous=FULL;
 PRAGMA temp_store=MEMORY;
 PRAGMA foreign_keys=ON;
 ";

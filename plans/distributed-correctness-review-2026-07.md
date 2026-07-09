@@ -41,10 +41,10 @@ treating as a design item, not just a bug list:
    serving checks (CL4). The plan defers the monotonic-clock lease-read
    design to later Phase 12, but Phase 11 is the production path today and
    inherits all of it.
-2. **Ack-before-durable.** Raft peer responses precede the durability
-   checkpoint (R1), and `PRAGMA synchronous=NORMAL` under WAL means acked
-   metadata commands are not power-loss durable (MD5), which the
-   strict-write/pending-slot recovery model implicitly assumes.
+2. **Ack-before-durable.** Raft peer responses used to precede the durability
+   checkpoint (R1), and per-PG SQLite WAL previously used
+   `synchronous=NORMAL` for acked metadata commands (MD5). Both now have
+   focused fixes, but durability boundaries remain a recurring review theme.
 3. **Load-bearing invariants are not executably pinned.** The primary-last
    fanout ordering was flipped to primary-first in June (`a9013451`) without
    the guide, the recovery safety argument, or any test noticing (MD1). When
@@ -849,7 +849,7 @@ Plausible, narrow window.
   the local-cluster reopen regression now asserts that a future-epoch slot is
   rejected rather than silently cleaned.
 
-### MD5. MEDIUM — `PRAGMA synchronous=NORMAL` under WAL makes acked commands and pending slots non-durable across power loss
+### MD5. RESOLVED — Per-PG SQLite WAL now uses `synchronous=FULL`
 
 Confirmed pragma (`schema.rs:759-764`); consequence scenario plausible.
 
@@ -861,10 +861,11 @@ Confirmed pragma (`schema.rs:759-764`); consequence scenario plausible.
   write; (b) the primary loses its pending-slot insert while a replica
   already applied — exactly the "ambiguous" shape the design excludes. No
   compensating fsync barrier exists on the command-apply path.
-- If NORMAL is a deliberate performance choice it needs an explicit
-  `wal_checkpoint`/`synchronous=FULL`-on-command-commit story, or the docs
-  must state that node power loss is a repair event, not a crash-recovery
-  event.
+- Status update: per-PG SQLite setup now uses WAL with `synchronous=FULL`,
+  so command-apply commits are fsynced by SQLite before acknowledgement rather
+  than relying on later checkpoint sync. A focused PgStore invariant test
+  asserts `journal_mode=WAL` and `synchronous=FULL` so this durability contract
+  does not silently regress.
 
 ### MD6. LOW — Guide/code drift on load-bearing invariants
 
@@ -1423,7 +1424,7 @@ checksum trailer or cluster identity), CP11 (a compact `runtime_map_status`
 RPC exists but only the CLI uses it), CL5, CL6, CL7 (relocated to
 `request_ops.rs:10537-10541`), RPC3, RPC4, RPC5 (partial: `TransportTimeout`
 added; connect/EOF/reset/partial-write still collapse to `PayloadDecode`),
-RPC6, RPC7, RPC9, MD5, MD7.
+RPC6, RPC7, RPC9, MD7.
 
 ## New findings (INT-*)
 
@@ -1727,9 +1728,11 @@ peer-auth failures, and retry-confirmation diagnostics are missing.
 11. Transport error taxonomy split (connect-failed / side-effect-ambiguous /
     decode) with a guardrail that ambiguous variants can never map to a
     retryable class for non-idempotent operations (RPC5).
-12. Decide `synchronous=NORMAL` explicitly (MD5): fsync on command commit, or
-    document per-node power loss as a repair event and add the repair test
-    for the acked-command-lost-no-pending-slot shape.
+12. Add a repair-path simulation for the acknowledged-command-lost shape
+    (MD5 follow-up): the main durability setting now uses WAL with
+    `synchronous=FULL`, but a destructive restored-filesystem test would still
+    be useful to pin fail-closed behavior if an operator has to repair a node
+    from an older disk image.
 13. Bound protected history (age out floors of Removed/long-Unavailable nodes
     with operator override); remove the full snapshot from heartbeat
     responses (CP5). Per-PG degradation instead of whole-map read errors
@@ -1757,8 +1760,11 @@ peer-auth failures, and retry-confirmation diagnostics are missing.
   test can represent two processes with different clocks.
 - **Crash-durability harness.** The Slice 6 failpoint matrix is strong but
   in-process. Add a process-level SIGKILL harness at named boundaries
-  (peer-ack→checkpoint, apply→slot-removal, fanout mid-flight) and a
-  power-loss-shaped SQLite test (WAL rollback simulation) for MD5.
+  (peer-ack→checkpoint, apply→slot-removal, fanout mid-flight). A
+  power-loss-shaped restored-filesystem SQLite test remains useful as an MD5
+  follow-up to pin fail-closed repair behavior if an operator restores a node
+  from an older disk image; the primary commit-path setting now uses WAL with
+  `synchronous=FULL`.
 - **Model-check the deterministic cores.** The command-apply boundary and the
   control-plane state machine are pure `(state, command) → state` — ideal for
   `stateright` or TLA+. Model the lease/epoch/peering machine with two
