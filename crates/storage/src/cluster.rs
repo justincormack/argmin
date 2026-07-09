@@ -9713,7 +9713,13 @@ impl StorageCluster {
                 self.local_map.write_erasure_coded_segment_shards_with(
                     &req.segment_okh,
                     req.segment_vid,
-                    reconstructed_segment.as_ref().unwrap(),
+                    reconstructed_segment.as_ref().ok_or_else(|| {
+                        StoreError::PayloadShardSetMismatch {
+                            reason:
+                                "backfill reconstruction missing reconstructed source segment"
+                                    .to_string(),
+                        }
+                    })?,
                     req.ec,
                     |shard_batch| {
                         let mut written = Vec::with_capacity(target_slots.len());
@@ -10171,10 +10177,18 @@ impl StorageCluster {
             let present_indices: Vec<usize> = (0..total_shards)
                 .filter(|&i| all_shards[i].is_some())
                 .collect();
-            let present_refs: Vec<&[u8]> = present_indices
-                .iter()
-                .map(|&i| all_shards[i].as_ref().unwrap().as_slice())
-                .collect();
+            let mut present_refs = Vec::with_capacity(present_indices.len());
+            for &shard_index in &present_indices {
+                let Some(shard) = all_shards.get(shard_index).and_then(Option::as_ref) else {
+                    return Err(StoreError::PayloadShardSetMismatch {
+                        reason: format!(
+                            "historical segment recovery present shard index {} missing payload",
+                            shard_index
+                        ),
+                    });
+                };
+                present_refs.push(shard.as_slice());
+            }
             let codec = erasure_codec_for_shape(req.ec, "build historical segment recovery codec")?;
             let recovered_len = missing_needed.len() * shard_size;
             let mut recovered_buf = vec![0; recovered_len];
@@ -10208,10 +10222,28 @@ impl StorageCluster {
             if let Some(shard) = shard.as_ref() {
                 dst.extend_from_slice(shard);
             } else if let Some((start, end)) = recovered_ranges[idx] {
-                let recovered_buf = recovered.as_ref().unwrap();
-                dst.extend_from_slice(&recovered_buf[start..end]);
+                let Some(recovered_buf) = recovered.as_ref() else {
+                    return Err(StoreError::PayloadShardSetMismatch {
+                        reason: format!(
+                            "historical segment recovery missing reconstructed payload for data index {idx}"
+                        ),
+                    });
+                };
+                let Some(recovered_shard) = recovered_buf.get(start..end) else {
+                    return Err(StoreError::PayloadShardSetMismatch {
+                        reason: format!(
+                            "historical segment recovery range {start}..{end} outside reconstructed payload length {}",
+                            recovered_buf.len()
+                        ),
+                    });
+                };
+                dst.extend_from_slice(recovered_shard);
             } else {
-                unreachable!("missing reconstructed shard for historical data index {idx}");
+                return Err(StoreError::PayloadShardSetMismatch {
+                    reason: format!(
+                        "historical segment recovery missing reconstructed shard for data index {idx}"
+                    ),
+                });
             }
         }
         dst.truncate(req.stored_size);
@@ -10355,10 +10387,18 @@ impl StorageCluster {
             let missing_needed: Vec<usize> = (0..k).filter(|&i| all_shards[i].is_none()).collect();
             let present_indices: Vec<usize> =
                 (0..(k + m)).filter(|&i| all_shards[i].is_some()).collect();
-            let present_refs: Vec<&[u8]> = present_indices
-                .iter()
-                .map(|&i| all_shards[i].as_ref().unwrap().as_slice())
-                .collect();
+            let mut present_refs = Vec::with_capacity(present_indices.len());
+            for &shard_index in &present_indices {
+                let Some(shard) = all_shards.get(shard_index).and_then(Option::as_ref) else {
+                    return Err(StoreError::PayloadShardSetMismatch {
+                        reason: format!(
+                            "segment recovery present shard index {} missing payload",
+                            shard_index
+                        ),
+                    });
+                };
+                present_refs.push(shard.as_slice());
+            }
             let codec = erasure_codec_for_shape(req.ec, "build segment recovery codec")?;
             let recovered_len = missing_needed.len() * shard_size;
             let mut recovered_buf = vec![0; recovered_len];
@@ -10392,10 +10432,28 @@ impl StorageCluster {
             if let Some(shard) = shard.as_ref() {
                 dst.extend_from_slice(shard);
             } else if let Some((start, end)) = recovered_ranges[idx] {
-                let recovered_buf = recovered.as_ref().unwrap();
-                dst.extend_from_slice(&recovered_buf[start..end]);
+                let Some(recovered_buf) = recovered.as_ref() else {
+                    return Err(StoreError::PayloadShardSetMismatch {
+                        reason: format!(
+                            "segment recovery missing reconstructed payload for data index {idx}"
+                        ),
+                    });
+                };
+                let Some(recovered_shard) = recovered_buf.get(start..end) else {
+                    return Err(StoreError::PayloadShardSetMismatch {
+                        reason: format!(
+                            "segment recovery range {start}..{end} outside reconstructed payload length {}",
+                            recovered_buf.len()
+                        ),
+                    });
+                };
+                dst.extend_from_slice(recovered_shard);
             } else {
-                unreachable!("missing reconstructed shard for data index {idx}");
+                return Err(StoreError::PayloadShardSetMismatch {
+                    reason: format!(
+                        "segment recovery missing reconstructed shard for data index {idx}"
+                    ),
+                });
             }
         }
         dst.truncate(req.stored_size);

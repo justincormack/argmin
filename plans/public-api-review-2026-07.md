@@ -1459,10 +1459,16 @@ each is one refactor away from a panic:
 - [ ] Panics reachable from pub API worth restructuring or doc-noting:
   checkpoint-proof `.expect()` in the peering import path
   (cluster.rs:3295, 3313 — the code touched by "Close Raft checkpoint capture
-  race"); `unwrap`/`unreachable!` in EC reconstruction read/backfill paths
-  (~48 sites in cluster.rs); deliberate fail-fast `panic!` on invalid
-  snapshots (control_plane.rs:2347, 3667, 4197) is fine but undocumented
-  while `clippy::missing_panics_doc` is allowed crate-wide.
+  race"); deliberate fail-fast `panic!` on invalid snapshots
+  (control_plane.rs:2347, 3667, 4197) is fine but undocumented while
+  `clippy::missing_panics_doc` is allowed crate-wide.
+- [x] `unwrap`/`unreachable!` in EC reconstruction read/backfill paths. Valid
+  but narrower than the original "~48 sites in cluster.rs" wording: the
+  production issue was concentrated in placed-segment EC reconstruction and
+  backfill assembly. These paths now convert inconsistent local recovery
+  bookkeeping into `PayloadShardSetMismatch` instead of panicking, including
+  missing reconstructed source segments, missing present-shard payloads, missing
+  reconstructed data shards, and out-of-range reconstructed payload slices.
 
 ### Test-only footguns left pub
 
