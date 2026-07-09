@@ -1463,9 +1463,12 @@ each is one refactor away from a panic:
 - [ ] `wall_time_millis` silently returns 0 pre-epoch (`clock.rs:57-63`) —
   flows into created_at/lease math as 1970 (compare A3); `with_time_override`
   (clock.rs:19) is exported without test gating. Gate behind `test-hooks`.
-- [ ] Wildcard re-exports `pub use s3_types::lifecycle::*` and
-  `pub use types::*` (lib.rs:86, 95) make the crate surface unauditable.
-  Enumerate.
+- [x] Wildcard re-exports `pub use s3_types::lifecycle::*` and
+  `pub use types::*` (lib.rs:86, 95) made the crate surface unauditable.
+  Fixed by removing the storage-level lifecycle glob and replacing the
+  `types::*` glob with an explicit top-level export list. Lifecycle callers use
+  `s3_types` directly; newly public helpers in `types.rs` no longer leak into
+  `storage::...` automatically.
 - [ ] Panics reachable from pub API worth restructuring or doc-noting:
   checkpoint-proof `.expect()` in the peering import path
   (cluster.rs:3295, 3313 — the code touched by "Close Raft checkpoint capture
