@@ -1391,6 +1391,117 @@ fn test_create_multipart_invalid_checksum_algorithm() {
 }
 
 #[test]
+fn test_create_multipart_invalid_checksum_type_error_shape() {
+    s3_tests::run(async {
+        let bucket = setup_bucket().await;
+        let key = "create-multipart-invalid-checksum-type-shape";
+        let url = s3_tests::object_url(CTX.endpoint(), &bucket, key, Some("uploads"));
+        let response = send_signed_request(
+            "POST",
+            &url,
+            &[],
+            [
+                ("x-amz-checksum-algorithm", "CRC32"),
+                ("x-amz-checksum-type", "INVALID"),
+            ],
+        );
+        assert_shape(
+            "CreateMultipartUpload invalid checksum type",
+            &response,
+            &shape().status(400).headers(error_response_headers()).body(
+                expected_error::with_host_id(
+                    "InvalidRequest",
+                    "Value for x-amz-checksum-type header is invalid.",
+                ),
+            ),
+        );
+        cleanup(&bucket, &[]).await;
+    });
+}
+
+#[test]
+fn test_create_multipart_checksum_type_without_algorithm_error_shape() {
+    s3_tests::run(async {
+        let bucket = setup_bucket().await;
+        let key = "create-multipart-type-without-algorithm-shape";
+        let url = s3_tests::object_url(CTX.endpoint(), &bucket, key, Some("uploads"));
+        let response =
+            send_signed_request("POST", &url, &[], [("x-amz-checksum-type", "COMPOSITE")]);
+        assert_shape(
+            "CreateMultipartUpload checksum type without algorithm",
+            &response,
+            &shape().status(400).headers(error_response_headers()).body(
+                expected_error::with_host_id(
+                    "InvalidRequest",
+                    "The x-amz-checksum-type header can only be used with the x-amz-checksum-algorithm header.",
+                ),
+            ),
+        );
+        cleanup(&bucket, &[]).await;
+    });
+}
+
+#[test]
+fn test_create_multipart_crc64nvme_composite_error_shape() {
+    s3_tests::run(async {
+        let bucket = setup_bucket().await;
+        let key = "create-multipart-crc64nvme-composite-shape";
+        let url = s3_tests::object_url(CTX.endpoint(), &bucket, key, Some("uploads"));
+        let response = send_signed_request(
+            "POST",
+            &url,
+            &[],
+            [
+                ("x-amz-checksum-algorithm", "CRC64NVME"),
+                ("x-amz-checksum-type", "COMPOSITE"),
+            ],
+        );
+        assert_shape(
+            "CreateMultipartUpload CRC64NVME COMPOSITE",
+            &response,
+            &shape()
+                .status(400)
+                .headers(error_response_headers())
+                .body(expected_error::with_host_id(
+                "InvalidRequest",
+                "The COMPOSITE checksum type cannot be used with the crc64nvme checksum algorithm.",
+            )),
+        );
+        cleanup(&bucket, &[]).await;
+    });
+}
+
+#[test]
+fn test_create_multipart_sha256_full_object_error_shape() {
+    s3_tests::run(async {
+        let bucket = setup_bucket().await;
+        let key = "create-multipart-sha256-full-object-shape";
+        let url = s3_tests::object_url(CTX.endpoint(), &bucket, key, Some("uploads"));
+        let response = send_signed_request(
+            "POST",
+            &url,
+            &[],
+            [
+                ("x-amz-checksum-algorithm", "SHA256"),
+                ("x-amz-checksum-type", "FULL_OBJECT"),
+            ],
+        );
+        assert_shape(
+            "CreateMultipartUpload SHA256 FULL_OBJECT",
+            &response,
+            &shape()
+                .status(400)
+                .headers(error_response_headers())
+                .body(expected_error::with_host_id(
+                "InvalidRequest",
+                "The FULL_OBJECT checksum type cannot be used with the sha256 checksum algorithm.",
+            )),
+        );
+        cleanup(&bucket, &[]).await;
+    });
+}
+
+#[test]
 fn test_create_multipart_concrete_checksum_header_without_algorithm_is_ignored() {
     s3_tests::run(async {
         let bucket = setup_bucket().await;

@@ -2729,23 +2729,39 @@ impl HttpFrontend {
                 let checksum_type = match req.header("x-amz-checksum-type") {
                     None => None,
                     Some(v) => Some(ChecksumType::parse(v).ok_or_else(|| {
-                        ServerError::InvalidArgument {
-                            reason: format!("unsupported checksum type: {v}"),
+                        ServerError::InvalidRequestHostId {
+                            reason: "Value for x-amz-checksum-type header is invalid.".to_string(),
                         }
                     })?),
                 };
 
                 // Validate: checksum-type without checksum-algorithm is invalid.
                 if checksum_type.is_some() && checksum_algorithm.is_none() {
-                    return Err(ServerError::InvalidArgument {
-                        reason: "x-amz-checksum-type requires x-amz-checksum-algorithm".to_string(),
+                    return Err(ServerError::InvalidRequestHostId {
+                        reason: "The x-amz-checksum-type header can only be used with the x-amz-checksum-algorithm header.".to_string(),
                     });
                 }
 
                 // Build validated config (rejects invalid algo+type combinations).
-                let checksum = checksum_algorithm
-                    .map(|algo| MultipartChecksumConfig::new(algo, checksum_type))
-                    .transpose()?;
+                let checksum = match checksum_algorithm {
+                    Some(algo) => Some(MultipartChecksumConfig::new(algo, checksum_type).map_err(
+                        |_| {
+                            let Some(checksum_type) = checksum_type else {
+                                return ServerError::InvalidRequestHostId {
+                                    reason: "Invalid checksum configuration".to_string(),
+                                };
+                            };
+                            ServerError::InvalidRequestHostId {
+                                reason: format!(
+                                    "The {} checksum type cannot be used with the {} checksum algorithm.",
+                                    checksum_type.as_str(),
+                                    algo.as_str().to_ascii_lowercase()
+                                ),
+                            }
+                        },
+                    )?),
+                    None => None,
+                };
                 let inline_tags_xml = if let Some(tagging_header) = req.header("x-amz-tagging") {
                     let tags = xml::parse_url_encoded_tags(tagging_header)?;
                     if tags.is_empty() {
@@ -10920,8 +10936,10 @@ mod tests {
             key: "k".to_string(),
         };
         match fe.dispatch_routed(&req, &test_auth(), op) {
-            Err(ServerError::InvalidArgument { .. }) => {}
-            Err(e) => panic!("expected InvalidArgument, got {e:?}"),
+            Err(ServerError::InvalidRequestHostId { reason }) => {
+                assert_eq!(reason, "Value for x-amz-checksum-type header is invalid.");
+            }
+            Err(e) => panic!("expected InvalidRequestHostId, got {e:?}"),
             Ok(_) => panic!("expected error, got Ok"),
         }
     }
@@ -10944,8 +10962,13 @@ mod tests {
             key: "k".to_string(),
         };
         match fe.dispatch_routed(&req, &test_auth(), op) {
-            Err(ServerError::InvalidArgument { .. }) => {}
-            Err(e) => panic!("expected InvalidArgument, got {e:?}"),
+            Err(ServerError::InvalidRequestHostId { reason }) => {
+                assert_eq!(
+                    reason,
+                    "The x-amz-checksum-type header can only be used with the x-amz-checksum-algorithm header."
+                );
+            }
+            Err(e) => panic!("expected InvalidRequestHostId, got {e:?}"),
             Ok(_) => panic!("expected error, got Ok"),
         }
     }
@@ -10971,8 +10994,13 @@ mod tests {
             key: "k".to_string(),
         };
         match fe.dispatch_routed(&req, &test_auth(), op) {
-            Err(ServerError::InvalidArgument { .. }) => {}
-            Err(e) => panic!("expected InvalidArgument, got {e:?}"),
+            Err(ServerError::InvalidRequestHostId { reason }) => {
+                assert_eq!(
+                    reason,
+                    "The FULL_OBJECT checksum type cannot be used with the sha256 checksum algorithm."
+                );
+            }
+            Err(e) => panic!("expected InvalidRequestHostId, got {e:?}"),
             Ok(_) => panic!("expected error, got Ok"),
         }
     }
