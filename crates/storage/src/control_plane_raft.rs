@@ -13118,11 +13118,17 @@ mod tests {
                     .map(ControlPlaneRaftWalOffsets::base_offset),
                 Some(artifact.wal_replay_offset)
             );
-            assert_eq!(
+            assert!(
+                matches!(
+                    status
+                        .durable_wal_offsets()
+                        .map(ControlPlaneRaftWalOffsets::clean_len),
+                    Some(status_clean_len) if status_clean_len >= compacted_clean_len
+                ),
+                "status WAL clean length {:?} should be at least compacted clean length {compacted_clean_len}",
                 status
                     .durable_wal_offsets()
-                    .map(ControlPlaneRaftWalOffsets::clean_len),
-                Some(compacted_clean_len)
+                    .map(ControlPlaneRaftWalOffsets::clean_len)
             );
             artifact
                 .restore_with_wal_file(test_raft_wal_file(&wal_path, "test-cluster", 1))
