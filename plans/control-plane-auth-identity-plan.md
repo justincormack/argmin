@@ -440,9 +440,15 @@ Progress:
   election triggers when credentials are present. Admin-only command clients do
   not perform unauthenticated runtime-map confirmation reads. PG acting-set
   updates and metadata-transfer installs now use dedicated admin-signed PG
-  runtime-map confirmation reads after ambiguous response loss; Raft
-  leadership/snapshot/election triggers still need explicit idempotence or
-  confirmation decisions before automatic retry.
+  runtime-map confirmation reads after ambiguous response loss. Raft
+  leadership/snapshot/election trigger clients now fail closed as
+  `RpcUnconfirmed` after ambiguous response loss. This is a client-side retry
+  decision, not a Raft liveness state: if the trigger reached OpenRaft, the
+  election, transfer, or snapshot/purge continues under normal Raft behavior;
+  if it did not, the cluster remains in its previous Raft state and normal
+  timers still apply. Automatic admin retry remains deferred until those
+  triggers have operation-specific confirmation predicates or an authoritative
+  Raft status/read surface.
 
 ### Slice D: Runtime-Map and Read Freshness Proof Consumers
 
@@ -556,7 +562,7 @@ Coverage audit as of 2026-07-08:
 | Raft peer RPC | Missing auth, malformed frames, wrong cluster/source/target/role, bad MAC/payload bitflip, stale/unknown credentials, transfer-leader freshness/replay bounds, response reverse identity, and no-dispatch/no-checkpoint process behavior before OpenRaft mutation. Redacted peer-auth diagnostics expose required mode, local principal, credential id/version, and counters. | Broader per-RPC replay caches remain deferred unless operational review requires protection beyond transfer-leader freshness and Raft's own term/log fences. |
 | Storage-node heartbeat refresh | Missing and malformed auth, wrong node/incarnation, wrong source, missing/overlong/expired freshness windows, overlapping credential rotation, authenticated signed responses, unsigned response rejection, and pre-mutation state unchanged on rejection. | Production rollout still needs secret distribution and a decision on when heartbeat auth is mandatory rather than opt-in by configured credentials. |
 | Frontend runtime-map reads | Missing auth, wrong-role storage credentials, RPC-kind replay between snapshot/status, overlapping credential rotation, per-attempt re-signing during read retries, authenticated response identity, wrong-target response rejection, signed error responses, and unsigned response rejection. | Admin confirmation reads intentionally do not borrow frontend credentials; PG acting-set confirmation now has a dedicated admin-signed PG runtime-map read path. |
-| Admin control-plane commands | Missing auth, wrong-role frontend credentials, overlapping credential rotation, metadata-transfer admin command signing, Raft leadership/snapshot/election admin signing, authenticated response identity, signed error responses, unsigned response rejection, and receive-time response freshness. Authenticated PG acting-set updates now use admin-signed PG runtime-map confirmation reads after ambiguous response loss; metadata-transfer install uses the same admin-signed confirmation-read helper shape with response-loss regression coverage. | Raft leadership/snapshot/election triggers still need explicit idempotence/confirmation decisions before automatic retry. |
+| Admin control-plane commands | Missing auth, wrong-role frontend credentials, overlapping credential rotation, metadata-transfer admin command signing, Raft leadership/snapshot/election admin signing, authenticated response identity, signed error responses, unsigned response rejection, and receive-time response freshness. Authenticated PG acting-set updates now use admin-signed PG runtime-map confirmation reads after ambiguous response loss; metadata-transfer install uses the same admin-signed confirmation-read helper shape with response-loss regression coverage. Raft leadership/snapshot/election trigger clients fail closed as `RpcUnconfirmed` after ambiguous response loss without stopping Raft protocol progress. | Automatic retry for Raft admin triggers remains deferred until operation-specific confirmation predicates or an authoritative Raft status/read surface exist. |
 | Process/env configuration and diagnostics | Storage-node, frontend, admin, and Raft peer env parsers accept staged rotation by unique principal + credential id/version; local clients sign with the highest configured version; diagnostics expose counts and credential ids/versions without secrets, MACs, nonces, or payloads. | Production cutover must decide mandatory auth modes and external secret rotation/distribution mechanics. |
 
 ## Observability

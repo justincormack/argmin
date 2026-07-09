@@ -5334,22 +5334,40 @@ impl UnixControlPlaneClient {
     pub fn transfer_raft_leadership_to(&self, node_id: u64) -> Result<(), ControlPlaneError> {
         let mut payload = Vec::new();
         write_u64(&mut payload, node_id);
-        let payload = self.send_request_with_read_timeout(
+        let payload = match self.send_request_with_read_timeout(
             ControlPlaneRpcKind::TransferRaftLeadership,
             &payload,
             CONTROL_PLANE_RPC_LEADERSHIP_TRANSFER_TIMEOUT,
-        )?;
+        ) {
+            Ok(payload) => payload,
+            Err(error) if error.is_maybe_applied_control_plane_rpc_response_loss() => {
+                return Err(unconfirmed_raft_admin_trigger(
+                    "control-plane Raft leadership transfer",
+                    error,
+                ));
+            }
+            Err(error) => return Err(error),
+        };
         let reader = PayloadReader::new(&payload);
         reader.finish()?;
         Ok(())
     }
 
     pub fn trigger_raft_snapshot_and_purge(&self) -> Result<Option<u64>, ControlPlaneError> {
-        let payload = self.send_request_with_read_timeout(
+        let payload = match self.send_request_with_read_timeout(
             ControlPlaneRpcKind::TriggerRaftSnapshotAndPurge,
             &[],
             CONTROL_PLANE_RPC_SNAPSHOT_PURGE_TIMEOUT,
-        )?;
+        ) {
+            Ok(payload) => payload,
+            Err(error) if error.is_maybe_applied_control_plane_rpc_response_loss() => {
+                return Err(unconfirmed_raft_admin_trigger(
+                    "control-plane Raft snapshot/purge trigger",
+                    error,
+                ));
+            }
+            Err(error) => return Err(error),
+        };
         let mut reader = PayloadReader::new(&payload);
         let snapshot_index = reader.read_option_u64()?;
         reader.finish()?;
@@ -5357,11 +5375,20 @@ impl UnixControlPlaneClient {
     }
 
     pub fn trigger_raft_election(&self) -> Result<(), ControlPlaneError> {
-        let payload = self.send_request_with_read_timeout(
+        let payload = match self.send_request_with_read_timeout(
             ControlPlaneRpcKind::TriggerRaftElection,
             &[],
             CONTROL_PLANE_RPC_LEADERSHIP_TRANSFER_TIMEOUT,
-        )?;
+        ) {
+            Ok(payload) => payload,
+            Err(error) if error.is_maybe_applied_control_plane_rpc_response_loss() => {
+                return Err(unconfirmed_raft_admin_trigger(
+                    "control-plane Raft election trigger",
+                    error,
+                ));
+            }
+            Err(error) => return Err(error),
+        };
         let reader = PayloadReader::new(&payload);
         reader.finish()?;
         Ok(())
@@ -5911,12 +5938,21 @@ impl AuthenticatedUnixControlPlaneClient {
     ) -> Result<(), ControlPlaneError> {
         let mut payload = Vec::new();
         write_u64(&mut payload, node_id);
-        let payload = self.send_admin_request_with_read_timeout(
+        let payload = match self.send_admin_request_with_read_timeout(
             ControlPlaneRpcKind::TransferRaftLeadership,
             authority_now_ms,
             payload,
             CONTROL_PLANE_RPC_LEADERSHIP_TRANSFER_TIMEOUT,
-        )?;
+        ) {
+            Ok(payload) => payload,
+            Err(error) if error.is_maybe_applied_control_plane_rpc_response_loss() => {
+                return Err(unconfirmed_raft_admin_trigger(
+                    "control-plane Raft leadership transfer",
+                    error,
+                ));
+            }
+            Err(error) => return Err(error),
+        };
         let reader = PayloadReader::new(&payload);
         reader.finish()?;
         Ok(())
@@ -5926,12 +5962,21 @@ impl AuthenticatedUnixControlPlaneClient {
         &self,
         authority_now_ms: u64,
     ) -> Result<Option<u64>, ControlPlaneError> {
-        let payload = self.send_admin_request_with_read_timeout(
+        let payload = match self.send_admin_request_with_read_timeout(
             ControlPlaneRpcKind::TriggerRaftSnapshotAndPurge,
             authority_now_ms,
             Vec::new(),
             CONTROL_PLANE_RPC_SNAPSHOT_PURGE_TIMEOUT,
-        )?;
+        ) {
+            Ok(payload) => payload,
+            Err(error) if error.is_maybe_applied_control_plane_rpc_response_loss() => {
+                return Err(unconfirmed_raft_admin_trigger(
+                    "control-plane Raft snapshot/purge trigger",
+                    error,
+                ));
+            }
+            Err(error) => return Err(error),
+        };
         let mut reader = PayloadReader::new(&payload);
         let snapshot_index = reader.read_option_u64()?;
         reader.finish()?;
@@ -5939,12 +5984,21 @@ impl AuthenticatedUnixControlPlaneClient {
     }
 
     pub fn trigger_raft_election(&self, authority_now_ms: u64) -> Result<(), ControlPlaneError> {
-        let payload = self.send_admin_request_with_read_timeout(
+        let payload = match self.send_admin_request_with_read_timeout(
             ControlPlaneRpcKind::TriggerRaftElection,
             authority_now_ms,
             Vec::new(),
             CONTROL_PLANE_RPC_LEADERSHIP_TRANSFER_TIMEOUT,
-        )?;
+        ) {
+            Ok(payload) => payload,
+            Err(error) if error.is_maybe_applied_control_plane_rpc_response_loss() => {
+                return Err(unconfirmed_raft_admin_trigger(
+                    "control-plane Raft election trigger",
+                    error,
+                ));
+            }
+            Err(error) => return Err(error),
+        };
         let reader = PayloadReader::new(&payload);
         reader.finish()?;
         Ok(())
@@ -7265,6 +7319,18 @@ fn metadata_transfer_install_applied(
                 && route.acting_set() == acting_set
                 && route.peering_metadata_transfer() == Some(transfer)
         })
+}
+
+fn unconfirmed_raft_admin_trigger(
+    operation: &'static str,
+    error: ControlPlaneError,
+) -> ControlPlaneError {
+    ControlPlaneError::RpcUnconfirmed {
+        message: format!(
+            "{operation} may have applied, but the control-plane RPC response was lost; \
+             automatic retry requires an operation-specific confirmation predicate: {error}"
+        ),
+    }
 }
 
 fn metadata_transfer_fence_observable(
@@ -14653,6 +14719,176 @@ mod tests {
             if message.contains("unknown node 99")),
             "unexpected error: {error}"
         );
+    }
+
+    #[derive(Default)]
+    struct RecordingRaftAdminAuthority {
+        transferred_to: Vec<u64>,
+        snapshot_purge_triggers: usize,
+        election_triggers: usize,
+    }
+
+    impl RecordingRaftAdminAuthority {
+        fn unsupported_snapshot_command() -> Result<ClusterControlSnapshot, ControlPlaneError> {
+            Err(ControlPlaneError::RpcRemote {
+                message: "recording Raft admin authority only supports Raft admin triggers"
+                    .to_owned(),
+            })
+        }
+    }
+
+    impl ControlPlaneAdmin for RecordingRaftAdminAuthority {
+        fn set_pg_acting_set(
+            &mut self,
+            _pg_id: PgId,
+            _acting_set: Vec<NodeId>,
+        ) -> Result<ClusterControlSnapshot, ControlPlaneError> {
+            Self::unsupported_snapshot_command()
+        }
+
+        fn fence_pg_for_metadata_transfer(
+            &mut self,
+            _pg_id: PgId,
+        ) -> Result<ClusterControlSnapshot, ControlPlaneError> {
+            Self::unsupported_snapshot_command()
+        }
+
+        fn fence_pg_for_metadata_transfer_with_source_lease(
+            &mut self,
+            _pg_id: PgId,
+        ) -> Result<FencedPgMetadataTransferSnapshot, ControlPlaneError> {
+            Err(ControlPlaneError::RpcRemote {
+                message: "recording Raft admin authority only supports Raft admin triggers"
+                    .to_owned(),
+            })
+        }
+
+        fn set_pg_acting_set_with_metadata_transfer(
+            &mut self,
+            _pg_id: PgId,
+            _acting_set: Vec<NodeId>,
+            _transfer: PgMetadataTransferProof,
+        ) -> Result<ClusterControlSnapshot, ControlPlaneError> {
+            Self::unsupported_snapshot_command()
+        }
+
+        fn transfer_raft_leadership_to(&mut self, node_id: u64) -> Result<(), ControlPlaneError> {
+            self.transferred_to.push(node_id);
+            Ok(())
+        }
+
+        fn trigger_raft_snapshot_and_purge(&mut self) -> Result<Option<u64>, ControlPlaneError> {
+            self.snapshot_purge_triggers += 1;
+            Ok(Some(42))
+        }
+
+        fn trigger_raft_election(&mut self) -> Result<(), ControlPlaneError> {
+            self.election_triggers += 1;
+            Ok(())
+        }
+    }
+
+    impl ControlPlaneHeartbeatRuntimeMapSource for RecordingRaftAdminAuthority {
+        fn refresh_node_heartbeat(
+            &mut self,
+            _heartbeat: NodeHeartbeat,
+            _authority_now_ms: u64,
+        ) -> Result<ControlPlaneHeartbeatRefresh, ControlPlaneError> {
+            Err(ControlPlaneError::RpcRemote {
+                message: "recording Raft admin authority does not support heartbeats".to_owned(),
+            })
+        }
+    }
+
+    impl ControlPlaneRuntimeMapSource for RecordingRaftAdminAuthority {
+        fn runtime_map_snapshot(
+            &self,
+            _authority_now_ms: u64,
+        ) -> Result<ClusterRuntimeMapSnapshot, ControlPlaneError> {
+            Err(ControlPlaneError::RpcRemote {
+                message: "recording Raft admin authority does not support runtime maps".to_owned(),
+            })
+        }
+
+        fn runtime_map_status(
+            &self,
+            _authority_now_ms: u64,
+        ) -> Result<ControlPlaneRuntimeMapStatus, ControlPlaneError> {
+            Ok(ControlPlaneRuntimeMapStatus::new(
+                ClusterEpoch::INITIAL,
+                0,
+                0,
+            ))
+        }
+    }
+
+    fn assert_raft_admin_trigger_unconfirmed(error: ControlPlaneError, expected_operation: &str) {
+        assert!(
+            matches!(error, ControlPlaneError::RpcUnconfirmed { ref message }
+            if message.contains(expected_operation)
+                && message.contains("may have applied")
+                && message.contains("confirmation predicate")),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn authenticated_raft_admin_triggers_fail_unconfirmed_after_lost_response() {
+        let tmp = test_util::tempdir();
+        let socket_path = tmp.path().join("control-plane.sock");
+        let verifier = admin_auth_verifier("auth-cluster", "admin-1");
+        let verifier_for_assert = verifier.clone();
+        let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+        let server = std::thread::spawn(move || {
+            let mut authority = RecordingRaftAdminAuthority::default();
+            for expected_kind in [
+                ControlPlaneRpcKind::TransferRaftLeadership,
+                ControlPlaneRpcKind::TriggerRaftSnapshotAndPurge,
+                ControlPlaneRpcKind::TriggerRaftElection,
+            ] {
+                let (mut stream, _addr) = listener.accept().unwrap();
+                let request = read_control_plane_unix_request(&mut stream).unwrap();
+                assert_eq!(request.kind, expected_kind);
+                build_control_plane_unix_response_with_auth(
+                    &mut authority,
+                    request,
+                    2_000,
+                    Some(&verifier),
+                )
+                .expect("recording Raft admin trigger should apply before response loss");
+                drop(stream);
+            }
+            authority
+        });
+
+        let client = AuthenticatedUnixControlPlaneClient::new(
+            UnixControlPlaneClient::new(&socket_path),
+            admin_auth_credential("auth-cluster", "admin-1"),
+        );
+        assert_raft_admin_trigger_unconfirmed(
+            client.transfer_raft_leadership_to(102, 2_000).unwrap_err(),
+            "leadership transfer",
+        );
+        assert_raft_admin_trigger_unconfirmed(
+            client.trigger_raft_snapshot_and_purge(2_000).unwrap_err(),
+            "snapshot/purge trigger",
+        );
+        assert_raft_admin_trigger_unconfirmed(
+            client.trigger_raft_election(2_000).unwrap_err(),
+            "election trigger",
+        );
+
+        let authority = server.join().unwrap();
+        assert_eq!(authority.transferred_to, vec![102]);
+        assert_eq!(authority.snapshot_purge_triggers, 1);
+        assert_eq!(authority.election_triggers, 1);
+        let metrics = verifier_for_assert.metrics_snapshot();
+        assert_eq!(metrics.accepted_total(), 3);
+        assert_eq!(
+            metrics.accepted_for_operation(ControlPlaneAuthOperation::AdminControlPlaneCommand),
+            3
+        );
+        assert_eq!(metrics.rejected_total(), 0);
     }
 
     #[test]
