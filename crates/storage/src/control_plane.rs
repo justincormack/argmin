@@ -6181,7 +6181,7 @@ impl AuthenticatedUnixControlPlaneClient {
                 expected_source: &expected_source,
                 expected_target: &expected_target,
                 expected_operation: operation,
-                replay_policy: control_plane_rpc_auth_replay_policy(authority_now_ms),
+                replay_policy: control_plane_rpc_response_auth_replay_policy(authority_now_ms),
             },
         ) {
             ControlPlaneAuthDecision::Accepted { .. } => {
@@ -15692,7 +15692,7 @@ mod tests {
             UnixControlPlaneClient::new(&socket_path),
             storage_node_auth_credential("auth-cluster", 1, 42),
         );
-        let mut timestamps = [2_000, 2_001].into_iter();
+        let mut timestamps = [2_000, 2_000].into_iter();
         let refresh = client
             .refresh_node_heartbeat_with_clock(
                 NodeHeartbeat {

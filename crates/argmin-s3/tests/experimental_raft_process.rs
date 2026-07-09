@@ -13,6 +13,10 @@ use openraft::impls::Entry;
 use openraft::raft::AppendEntriesRequest;
 use openraft::storage::{RaftLogReader, RaftLogStorage};
 use openraft::{EntryPayload, LogId, Vote};
+use storage::control_plane::{
+    AuthenticatedUnixControlPlaneClient, ControlPlaneHeartbeatRuntimeMapSource, NodeHeartbeat,
+    UnixControlPlaneClient,
+};
 use storage::control_plane_auth::{
     ControlPlaneAuthOperation, ControlPlaneAuthPrincipal, ControlPlaneAuthSignInput,
     ControlPlaneAuthTarget, ControlPlaneScopedCredential, ControlPlaneScopedCredentialInput,
@@ -24,7 +28,7 @@ use storage::control_plane_raft::{
     ControlPlaneRaftPeerRpcRequest, ControlPlaneRaftRestartArtifact, ControlPlaneRaftWalFile,
     ControlPlaneRaftWalFileConfig, ControlPlaneRaftWalRecord,
 };
-use storage::{NodeId, PgId};
+use storage::{ClusterEpoch, NodeId, PgClusterMapHistoryReferenceSummary, PgId};
 
 struct TestDir {
     path: PathBuf,
@@ -81,6 +85,14 @@ impl ProcessTestControlPlaneAuth {
         format!("raft-node-{node_id}")
     }
 
+    fn storage_node_secret(node_id: u32) -> String {
+        format!("process-test-storage-node-{node_id}-secret")
+    }
+
+    fn storage_node_credential_id(node_id: u32) -> String {
+        format!("storage-node-{node_id}")
+    }
+
     fn frontend_secret(instance_id: &str) -> String {
         format!("process-test-frontend-{instance_id}-secret")
     }
@@ -102,6 +114,14 @@ impl ProcessTestControlPlaneAuth {
             "{node_id}={}:1:{}",
             Self::raft_peer_credential_id(node_id),
             Self::raft_peer_secret(node_id)
+        )
+    }
+
+    fn storage_node_config_entry(node_id: u32) -> String {
+        format!(
+            "{node_id}={}:1:{}",
+            Self::storage_node_credential_id(node_id),
+            Self::storage_node_secret(node_id)
         )
     }
 
@@ -131,6 +151,15 @@ impl ProcessTestControlPlaneAuth {
             .join(",")
     }
 
+    fn storage_node_credentials_env(&self, node_ids: &[u32]) -> String {
+        node_ids
+            .iter()
+            .copied()
+            .map(Self::storage_node_config_entry)
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+
     fn frontend_credentials_env(&self, instance_ids: &[&str]) -> String {
         instance_ids
             .iter()
@@ -156,6 +185,24 @@ impl ProcessTestControlPlaneAuth {
             secret: Self::raft_peer_secret(node_id).into_bytes(),
         })
         .expect("process test Raft peer credential should build")
+    }
+
+    fn storage_node_credential(
+        &self,
+        node_id: u32,
+        incarnation: u64,
+    ) -> ControlPlaneScopedCredential {
+        ControlPlaneScopedCredential::new(ControlPlaneScopedCredentialInput {
+            cluster_id: self.cluster_name.clone(),
+            credential_id: Self::storage_node_credential_id(node_id),
+            credential_version: 1,
+            principal: ControlPlaneAuthPrincipal::StorageNode {
+                node_id: NodeId::new(node_id),
+                incarnation,
+            },
+            secret: Self::storage_node_secret(node_id).into_bytes(),
+        })
+        .expect("process test storage-node credential should build")
     }
 
     fn sign_raft_peer_frame(
@@ -488,6 +535,36 @@ fn wait_for_runtime_map_ready_with_extra_env(
         }
         thread::sleep(Duration::from_millis(50));
     }
+}
+
+fn send_authenticated_storage_heartbeat(
+    socket_path: &Path,
+    auth: &ProcessTestControlPlaneAuth,
+    node_id: u32,
+    incarnation: u64,
+    endpoint: &Path,
+    observed_epoch: ClusterEpoch,
+) -> storage::control_plane::ControlPlaneHeartbeatRefresh {
+    let credential = auth.storage_node_credential(node_id, incarnation);
+    let mut client = AuthenticatedUnixControlPlaneClient::new(
+        UnixControlPlaneClient::new(socket_path),
+        credential,
+    );
+    client
+        .refresh_node_heartbeat(
+            NodeHeartbeat {
+                node_id: NodeId::new(node_id),
+                node_incarnation: incarnation,
+                endpoint: endpoint.display().to_string(),
+                observed_epoch,
+                requested_lease_duration_ms: 10_000,
+                cluster_map_history_reference_summary: PgClusterMapHistoryReferenceSummary::default(
+                ),
+                pg_observations: Vec::new(),
+            },
+            storage::clock::current_time_millis(),
+        )
+        .expect("authenticated storage-node heartbeat should refresh")
 }
 
 fn wait_for_runtime_map_ready_on(
@@ -1124,6 +1201,174 @@ fn experimental_raft_two_control_plane_processes_replicate_bootstrap_to_follower
         state_path(test_dir.path(), 101)
     };
     wait_for_follower_artifact(&follower_state, &mut [&mut node101, &mut node102]);
+}
+
+#[test]
+fn experimental_raft_full_auth_composition_smoke() {
+    let bin = argmin_s3_bin();
+    let test_dir = TestDir::new("experimental-raft-full-auth-composition");
+    let cluster_name = format!(
+        "process-full-auth-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after Unix epoch")
+            .as_nanos()
+    );
+    let raft_node_ids = [201, 202];
+    let auth = ProcessTestControlPlaneAuth::new(&cluster_name);
+    let storage_auth_credentials = auth.storage_node_credentials_env(&[1]);
+    let frontend_auth_credentials = auth.frontend_credentials_env(&["runtime-map-ready"]);
+    let admin_auth_credentials = auth.admin_credentials_env(&["server-admin"]);
+    let server_auth_env = [
+        (
+            "ARGMIN_CONTROL_PLANE_AUTH_CLUSTER_ID",
+            cluster_name.as_str(),
+        ),
+        (
+            "ARGMIN_CONTROL_PLANE_STORAGE_AUTH_CREDENTIALS",
+            storage_auth_credentials.as_str(),
+        ),
+        (
+            "ARGMIN_CONTROL_PLANE_FRONTEND_AUTH_CREDENTIALS",
+            frontend_auth_credentials.as_str(),
+        ),
+        (
+            "ARGMIN_CONTROL_PLANE_ADMIN_AUTH_CREDENTIALS",
+            admin_auth_credentials.as_str(),
+        ),
+    ];
+    let frontend_helper_auth_env = [
+        (
+            "ARGMIN_CONTROL_PLANE_AUTH_CLUSTER_ID",
+            cluster_name.as_str(),
+        ),
+        (
+            "ARGMIN_CONTROL_PLANE_FRONTEND_AUTH_INSTANCE_ID",
+            "runtime-map-ready",
+        ),
+        (
+            "ARGMIN_CONTROL_PLANE_FRONTEND_AUTH_CREDENTIALS",
+            frontend_auth_credentials.as_str(),
+        ),
+    ];
+    let admin_helper_auth_env = [
+        (
+            "ARGMIN_CONTROL_PLANE_AUTH_CLUSTER_ID",
+            cluster_name.as_str(),
+        ),
+        (
+            "ARGMIN_CONTROL_PLANE_ADMIN_AUTH_INSTANCE_ID",
+            "server-admin",
+        ),
+        (
+            "ARGMIN_CONTROL_PLANE_ADMIN_AUTH_CREDENTIALS",
+            admin_auth_credentials.as_str(),
+        ),
+    ];
+    let mut node202 = ChildGuard::spawn_with_extra_env(
+        &bin,
+        test_dir.path(),
+        &cluster_name,
+        202,
+        &raft_node_ids,
+        &server_auth_env,
+    );
+    wait_for_socket_file(&peer_socket(test_dir.path(), 202), &mut node202);
+    let mut node201 = ChildGuard::spawn_with_extra_env(
+        &bin,
+        test_dir.path(),
+        &cluster_name,
+        201,
+        &raft_node_ids,
+        &server_auth_env,
+    );
+
+    let (leader_socket, ready_output) = wait_for_runtime_map_ready_with_extra_env(
+        &bin,
+        test_dir.path(),
+        &mut [&mut node201, &mut node202],
+        &raft_node_ids,
+        &frontend_helper_auth_env,
+    );
+    assert!(
+        ready_output.status.success(),
+        "frontend-authenticated runtime-map ready helper failed: {}",
+        format_admin_failure(ready_output.status, &ready_output)
+    );
+    let ready_stdout = String::from_utf8_lossy(&ready_output.stdout);
+    let observed_epoch = ready_stdout
+        .split_whitespace()
+        .next()
+        .and_then(|epoch| epoch.parse::<u64>().ok())
+        .and_then(ClusterEpoch::new)
+        .unwrap_or_else(|| {
+            panic!("ready helper should report cluster epoch in stdout: {ready_stdout}")
+        });
+
+    let node_endpoint = test_dir.path().join("storage-node-1.sock");
+    let heartbeat_refresh = send_authenticated_storage_heartbeat(
+        &leader_socket,
+        &auth,
+        1,
+        1,
+        &node_endpoint,
+        observed_epoch,
+    );
+    assert_eq!(heartbeat_refresh.lease().node_id(), NodeId::new(1));
+    assert!(
+        heartbeat_refresh.lease().lease_deadline_ms() > storage::clock::current_time_millis(),
+        "authenticated heartbeat should renew the node lease"
+    );
+    assert!(
+        heartbeat_refresh.runtime_map().nodes().iter().any(|node| {
+            node.node_id() == NodeId::new(1)
+                && node.node_incarnation() == 1
+                && node.endpoint() == node_endpoint.display().to_string()
+        }),
+        "authenticated heartbeat response should include node 1 endpoint"
+    );
+
+    let admin_output = run_set_pg_acting_set_live_with_extra_env(
+        &bin,
+        &leader_socket,
+        0,
+        &[1],
+        &admin_helper_auth_env,
+    );
+    assert!(
+        admin_output.status.success(),
+        "admin-authenticated acting-set helper failed: {}",
+        format_admin_failure(admin_output.status, &admin_output)
+    );
+
+    let follower_state = if leader_socket.ends_with("control-201.sock") {
+        state_path(test_dir.path(), 202)
+    } else {
+        state_path(test_dir.path(), 201)
+    };
+    wait_for_follower_artifact_pg_acting_set(
+        &follower_state,
+        PgId::new(0),
+        &[NodeId::new(1)],
+        &mut [&mut node201, &mut node202],
+    );
+
+    let logs = process_logs(test_dir.path());
+    assert!(
+        logs.contains("control_plane_unix_auth required=true storage_node_heartbeat_required=true frontend_runtime_map_required=true admin_control_plane_required=true"),
+        "Unix control-plane auth diagnostics should show all Unix auth gates enabled:\n{logs}"
+    );
+    assert!(
+        logs.contains(
+            "storage_node_credentials=1 frontend_credentials=1 admin_credentials=1"
+        ),
+        "Unix control-plane auth diagnostics should show all configured credential classes:\n{logs}"
+    );
+    assert!(
+        logs.contains("raft_peer_auth required=true"),
+        "Raft peer auth diagnostics should show peer auth enabled:\n{logs}"
+    );
 }
 
 #[test]
