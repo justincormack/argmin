@@ -5701,53 +5701,24 @@ mod tests {
         addr: &str,
         request_head: String,
         file_prefix: Vec<u8>,
-        file_suffix: Vec<u8>,
         total_file_bytes: usize,
     ) -> (String, usize) {
-        const WRITE_CHUNK_BYTES: usize = 1024;
-        const WRITE_CHUNK_DELAY: Duration = Duration::from_millis(20);
+        const INITIAL_FILE_BYTES: usize = 8 * 1024;
         const RESPONSE_TIMEOUT: Duration = Duration::from_secs(15);
 
         let mut stream = StdTcpStream::connect(addr).unwrap();
         stream.set_nodelay(true).unwrap();
+        stream.write_all(request_head.as_bytes()).unwrap();
+        stream.write_all(&file_prefix).unwrap();
+        let bytes_sent = total_file_bytes.min(INITIAL_FILE_BYTES);
+        stream.write_all(&vec![b'x'; bytes_sent]).unwrap();
 
-        let mut writer = stream.try_clone().unwrap();
-        writer.set_nodelay(true).unwrap();
-
-        let bytes_sent = Arc::new(AtomicUsize::new(0));
-        let bytes_sent_writer = Arc::clone(&bytes_sent);
-        let stop = Arc::new(AtomicBool::new(false));
-        let stop_writer = Arc::clone(&stop);
-        let body_chunk = vec![b'x'; WRITE_CHUNK_BYTES];
-        let writer_handle = std::thread::spawn(move || {
-            writer.write_all(request_head.as_bytes()).unwrap();
-            writer.write_all(&file_prefix).unwrap();
-            let mut remaining = total_file_bytes;
-            while remaining > 0 {
-                if stop_writer.load(Ordering::Relaxed) {
-                    break;
-                }
-                let next = remaining.min(WRITE_CHUNK_BYTES);
-                match writer.write_all(&body_chunk[..next]) {
-                    Ok(()) => {
-                        bytes_sent_writer.fetch_add(next, Ordering::Relaxed);
-                        remaining -= next;
-                        std::thread::sleep(WRITE_CHUNK_DELAY);
-                    }
-                    Err(_) => break,
-                }
-            }
-            if remaining == 0 {
-                let _ = writer.write_all(&file_suffix);
-            }
-            let _ = writer.shutdown(Shutdown::Write);
-        });
-
-        let response =
-            read_http_response_with_writer_stop(&mut stream, RESPONSE_TIMEOUT, Some(&stop));
-        stop.store(true, Ordering::Relaxed);
-        writer_handle.join().unwrap();
-        (response, bytes_sent.load(Ordering::Relaxed))
+        // Keep the write half open while the server's bounded rejection drain
+        // expires. A complete response proves the server does not require the
+        // declared remainder before rejecting the streaming request.
+        let response = read_http_response(&mut stream, RESPONSE_TIMEOUT);
+        let _ = stream.shutdown(Shutdown::Write);
+        (response, bytes_sent)
     }
 
     fn hmac_sha256(key: &[u8], data: &[u8]) -> hmac::Tag {
@@ -7641,13 +7612,8 @@ Content-Type: {content_type}\r\n\
 Content-Length: {content_length}\r\n\
 Connection: keep-alive\r\n\r\n"
         );
-        let (response, bytes_sent) = denied_streaming_multipart_request_response(
-            &addr,
-            request,
-            prefix,
-            suffix,
-            TOTAL_FILE_BYTES,
-        );
+        let (response, bytes_sent) =
+            denied_streaming_multipart_request_response(&addr, request, prefix, TOTAL_FILE_BYTES);
 
         assert!(
             response.starts_with("HTTP/1.1 403"),
@@ -7697,13 +7663,8 @@ Content-Type: {content_type}\r\n\
 Content-Length: {content_length}\r\n\
 Connection: keep-alive\r\n\r\n"
         );
-        let (response, bytes_sent) = denied_streaming_multipart_request_response(
-            &addr,
-            request,
-            prefix,
-            suffix,
-            TOTAL_FILE_BYTES,
-        );
+        let (response, bytes_sent) =
+            denied_streaming_multipart_request_response(&addr, request, prefix, TOTAL_FILE_BYTES);
 
         assert!(
             response.starts_with("HTTP/1.1 400"),
