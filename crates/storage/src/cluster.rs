@@ -3419,11 +3419,6 @@ impl StorageCluster {
             metadata_transfer_destination_proof(artifact, &commands, self.operation_epoch());
         let base_import_proof = artifact.source_base_metadata_proof();
         let checkpoint_base = artifact.checkpoint_base();
-        let checkpoint_destination_base_proof = checkpoint_base.map(|checkpoint| PgMetadataProof {
-            applied_log_index: 0,
-            applied_log_hash: 0,
-            state_digest: checkpoint.state_digest,
-        });
         let nodes = self
             .local_map
             .metadata_pg_acting_nodes_for_peering_replay(self.operation_epoch(), pg_id)?;
@@ -3432,6 +3427,11 @@ impl StorageCluster {
         for node in nodes {
             let metadata_client = node.metadata_command_client();
             let state = if let Some(checkpoint) = checkpoint_base {
+                let checkpoint_destination_base_proof = PgMetadataProof {
+                    applied_log_index: 0,
+                    applied_log_hash: 0,
+                    state_digest: checkpoint.state_digest,
+                };
                 if metadata_client
                     .pending_metadata_command_envelope(pg_id, self.operation_epoch())?
                     .is_some()
@@ -3460,7 +3460,7 @@ impl StorageCluster {
                 if current.cluster_epoch == self.operation_epoch() {
                     if let Some(prefix_len) = checkpoint_import_resume_prefix_len(
                         pg_id,
-                        checkpoint_destination_base_proof.expect("checkpoint proof exists"),
+                        checkpoint_destination_base_proof,
                         expected_import_proof,
                         current_proof,
                         &commands,
@@ -3478,7 +3478,7 @@ impl StorageCluster {
                         };
                         let Some(validated_prefix_len) = checkpoint_import_resume_prefix_len(
                             pg_id,
-                            checkpoint_destination_base_proof.expect("checkpoint proof exists"),
+                            checkpoint_destination_base_proof,
                             expected_import_proof,
                             validated_proof,
                             &commands,

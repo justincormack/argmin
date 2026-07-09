@@ -1469,12 +1469,16 @@ each is one refactor away from a panic:
   `types::*` glob with an explicit top-level export list. Lifecycle callers use
   `s3_types` directly; newly public helpers in `types.rs` no longer leak into
   `storage::...` automatically.
-- [ ] Panics reachable from pub API worth restructuring or doc-noting:
+- [x] Panics reachable from pub API worth restructuring or doc-noting:
   checkpoint-proof `.expect()` in the peering import path
   (cluster.rs:3295, 3313 — the code touched by "Close Raft checkpoint capture
   race"); deliberate fail-fast `panic!` on invalid snapshots
   (control_plane.rs:2347, 3667, 4197) is fine but undocumented while
-  `clippy::missing_panics_doc` is allowed crate-wide.
+  `clippy::missing_panics_doc` is allowed crate-wide. Resolution: removed the
+  checkpoint-proof `.expect()` by binding the derived proof inside the
+  checkpoint-only branch, and centralized the debug/test invalid-snapshot panic
+  behind a documented helper that states why these invariant failures remain
+  fail-fast instead of recoverable command errors.
 - [x] `unwrap`/`unreachable!` in EC reconstruction read/backfill paths. Valid
   but narrower than the original "~48 sites in cluster.rs" wording: the
   production issue was concentrated in placed-segment EC reconstruction and

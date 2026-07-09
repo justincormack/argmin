@@ -54,6 +54,17 @@ fn non_serving_runtime_map_validity(now_ms: u64) -> RouteMapValidity {
     RouteMapValidity::until_ms_saturating(now_ms.saturating_add(MAX_HEARTBEAT_LEASE_MS))
 }
 
+#[cfg(any(test, debug_assertions))]
+fn panic_on_invalid_control_plane_snapshot(context: &str, snapshot: &ClusterControlSnapshot) {
+    // These checks are intentionally fail-fast in test/debug builds. An invalid
+    // control-plane snapshot means a local state-machine invariant was broken;
+    // returning a recoverable error here would risk hiding divergent replicated
+    // state behind normal command failure handling.
+    if let Err(error) = snapshot.validate_invariants() {
+        panic!("{context}: {error}");
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct AuthorityIncarnation(NonZeroU64);
 
@@ -2274,9 +2285,10 @@ fn applied_control_plane_command(
         next_snapshot.record_history_from(previous_snapshot);
     }
     #[cfg(any(test, debug_assertions))]
-    if let Err(error) = next_snapshot.validate_invariants() {
-        panic!("control-plane command produced invalid snapshot: {error}");
-    }
+    panic_on_invalid_control_plane_snapshot(
+        "control-plane command produced invalid snapshot",
+        &next_snapshot,
+    );
     AppliedControlPlaneCommand::new(next_snapshot, response, changed)
 }
 
@@ -3589,9 +3601,10 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
             snapshot.record_history_from(&previous_snapshot);
         }
         #[cfg(any(test, debug_assertions))]
-        if let Err(error) = snapshot.validate_invariants() {
-            panic!("attempted to open invalid control-plane snapshot: {error}");
-        }
+        panic_on_invalid_control_plane_snapshot(
+            "attempted to open invalid control-plane snapshot",
+            &snapshot,
+        );
         store.save(&snapshot)?;
         Ok(Self { store, snapshot })
     }
@@ -4131,9 +4144,10 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
     ) -> Result<(), ControlPlaneError> {
         next_snapshot.record_history_from(&self.snapshot);
         #[cfg(any(test, debug_assertions))]
-        if let Err(error) = next_snapshot.validate_invariants() {
-            panic!("attempted to commit invalid control-plane snapshot: {error}");
-        }
+        panic_on_invalid_control_plane_snapshot(
+            "attempted to commit invalid control-plane snapshot",
+            &next_snapshot,
+        );
         self.store.save(&next_snapshot)?;
         self.snapshot = next_snapshot;
         Ok(())
