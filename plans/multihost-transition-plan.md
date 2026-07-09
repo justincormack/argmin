@@ -10695,6 +10695,14 @@ Phase 12.4 proposed scope:
   bounded/versioned/CRC frame checks. The design must not be Raft-specific:
   storage-node heartbeat/refresh, frontend runtime-map reads, and admin
   control-plane RPCs should consume the same foundation in later slices.
+- Decide the production replay-protection policy for TCP and any other
+  non-local control-plane transports. The current Unix/Raft auth model relies
+  on short timestamp windows for time-sensitive operations and on Raft/admin
+  operation semantics or explicit confirmation predicates for idempotent
+  replay. Before production non-local transport, decide which RPC classes need
+  bounded nonce/sequence caches, which remain timestamp-window-only, and how
+  any replay cache is bounded without becoming a new unplanned durability
+  requirement.
 - Harden the external control-plane client retry contract for the Raft path.
   Read-only operations may retry transient not-leader/routing/catch-up errors
   after a fresh linearized read. Mutating operations must not retry ambiguous

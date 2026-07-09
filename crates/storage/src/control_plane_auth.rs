@@ -75,9 +75,7 @@ impl ControlPlaneAuthTarget {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ControlPlaneAuthService {
     ControlPlane,
-    RaftPeerTransport,
     RuntimeMap,
-    StorageNodeControl,
     Admin,
 }
 
@@ -88,7 +86,6 @@ pub enum ControlPlaneAuthOperation {
     RaftPreVote,
     RaftSnapshot,
     RaftTransferLeader,
-    StorageHeartbeat,
     StorageRuntimeMapRefresh,
     FrontendRuntimeMapRead,
     AdminControlPlaneCommand,
@@ -332,7 +329,16 @@ pub struct ControlPlaneAuthSignInput {
     pub operation: ControlPlaneAuthOperation,
     pub issued_at_ms: Option<u64>,
     pub expires_at_ms: Option<u64>,
+    /// Reserved for future operation-specific replay protection.
+    ///
+    /// Current verifiers do not enforce sequence uniqueness; production
+    /// replay safety is provided by timestamp windows and operation semantics.
     pub sequence: Option<u64>,
+    /// Reserved for future operation-specific replay protection.
+    ///
+    /// Current verifiers do not maintain nonce caches or enforce nonce
+    /// uniqueness. Callers should leave this empty unless a future verifier
+    /// explicitly documents nonce handling for the operation.
     pub nonce: Vec<u8>,
     pub payload: Vec<u8>,
 }
@@ -566,7 +572,15 @@ pub struct ControlPlaneAuthEnvelopeHeaderInput {
     pub operation: ControlPlaneAuthOperation,
     pub issued_at_ms: Option<u64>,
     pub expires_at_ms: Option<u64>,
+    /// Reserved for future operation-specific replay protection.
+    ///
+    /// Current verifiers do not enforce sequence uniqueness; production
+    /// replay safety is provided by timestamp windows and operation semantics.
     pub sequence: Option<u64>,
+    /// Reserved for future operation-specific replay protection.
+    ///
+    /// Current verifiers do not maintain nonce caches or enforce nonce
+    /// uniqueness. Decoded nonces are authenticated but not replay-tracked.
     pub nonce: Vec<u8>,
 }
 
@@ -955,9 +969,7 @@ fn write_service(out: &mut Vec<u8>, service: ControlPlaneAuthService) {
         out,
         match service {
             ControlPlaneAuthService::ControlPlane => 1,
-            ControlPlaneAuthService::RaftPeerTransport => 2,
             ControlPlaneAuthService::RuntimeMap => 3,
-            ControlPlaneAuthService::StorageNodeControl => 4,
             ControlPlaneAuthService::Admin => 5,
         },
     );
@@ -968,9 +980,7 @@ fn read_service(
 ) -> Result<ControlPlaneAuthService, ControlPlaneError> {
     match reader.read_u8()? {
         1 => Ok(ControlPlaneAuthService::ControlPlane),
-        2 => Ok(ControlPlaneAuthService::RaftPeerTransport),
         3 => Ok(ControlPlaneAuthService::RuntimeMap),
-        4 => Ok(ControlPlaneAuthService::StorageNodeControl),
         5 => Ok(ControlPlaneAuthService::Admin),
         tag => Err(auth_protocol_error(format!(
             "unknown control-plane auth service tag {tag}"
@@ -987,7 +997,6 @@ fn write_operation(out: &mut Vec<u8>, operation: ControlPlaneAuthOperation) {
             ControlPlaneAuthOperation::RaftPreVote => 3,
             ControlPlaneAuthOperation::RaftSnapshot => 4,
             ControlPlaneAuthOperation::RaftTransferLeader => 5,
-            ControlPlaneAuthOperation::StorageHeartbeat => 6,
             ControlPlaneAuthOperation::StorageRuntimeMapRefresh => 7,
             ControlPlaneAuthOperation::FrontendRuntimeMapRead => 8,
             ControlPlaneAuthOperation::AdminControlPlaneCommand => 9,
@@ -1006,7 +1015,6 @@ fn read_operation(
         3 => Ok(ControlPlaneAuthOperation::RaftPreVote),
         4 => Ok(ControlPlaneAuthOperation::RaftSnapshot),
         5 => Ok(ControlPlaneAuthOperation::RaftTransferLeader),
-        6 => Ok(ControlPlaneAuthOperation::StorageHeartbeat),
         7 => Ok(ControlPlaneAuthOperation::StorageRuntimeMapRefresh),
         8 => Ok(ControlPlaneAuthOperation::FrontendRuntimeMapRead),
         9 => Ok(ControlPlaneAuthOperation::AdminControlPlaneCommand),
@@ -1371,6 +1379,19 @@ mod tests {
     }
 
     #[test]
+    fn control_plane_auth_rejects_retired_wire_tags() {
+        for tag in [2, 4] {
+            let payload = [tag];
+            let mut reader = AuthPayloadReader::new(&payload);
+            assert!(read_service(&mut reader).is_err());
+        }
+
+        let payload = [6];
+        let mut reader = AuthPayloadReader::new(&payload);
+        assert!(read_operation(&mut reader).is_err());
+    }
+
+    #[test]
     fn control_plane_auth_envelope_rejects_invalid_principal_fields() {
         assert!(
             ControlPlaneAuthEnvelopeHeader::new(ControlPlaneAuthEnvelopeHeaderInput {
@@ -1398,7 +1419,7 @@ mod tests {
                     incarnation: 0,
                 },
                 target: ControlPlaneAuthTarget::Service(ControlPlaneAuthService::ControlPlane),
-                operation: ControlPlaneAuthOperation::StorageHeartbeat,
+                operation: ControlPlaneAuthOperation::StorageRuntimeMapRefresh,
                 issued_at_ms: None,
                 expires_at_ms: None,
                 sequence: None,

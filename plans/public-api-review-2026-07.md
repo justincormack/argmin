@@ -611,13 +611,18 @@ ranked:
   before parsing the heartbeat, and regression coverage rejects a signed
   heartbeat envelope with a mismatched embedded RPC kind before lease mutation.
 
-- [ ] **CA8. Dead wire-format surface / always-empty replay fields.**
+- [x] **CA8. Dead wire-format surface / always-empty replay fields.**
   `ControlPlaneAuthOperation::StorageHeartbeat` (wire tag 6) and
   `ControlPlaneAuthService::{RaftPeerTransport, StorageNodeControl}` have no
   production sign/verify site; every signer passes `sequence: None,
   nonce: Vec::new()` and no verifier checks nonce uniqueness (replay is
   timestamp-window + idempotency, per the plan). Fix: delete the dead variants
-  (pre-release) or wire them; document nonce/sequence as reserved.
+  (pre-release) or wire them; document nonce/sequence as reserved. Resolution:
+  removed the unused service/operation variants from the public auth vocabulary
+  so their old tags fail closed as unknown values, documented sequence/nonce
+  fields as reserved and not replay-tracked by current verifiers, and added the
+  production nonce/sequence replay-cache decision to the Phase 12.4 rollout
+  scope.
 
 - [ ] **CA9. Positional same-typed params (P4, in new code).**
   `ControlPlaneAuthEnvelope::new(header, payload, authenticator)` — two
