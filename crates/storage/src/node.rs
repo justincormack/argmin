@@ -464,11 +464,14 @@ impl SharedStorageNode {
         let mut pg_id_list = pg_ids.to_vec();
         pg_id_list.sort_unstable();
 
+        let pg_topology =
+            PgTopology::new(pg_ids).map_err(|source| StoreError::InvalidPgTopology { source })?;
+
         Ok(Self {
             stores: HashMap::new(),
             pg_paths: HashMap::new(),
             pg_id_list,
-            pg_topology: PgTopology::new(pg_ids).expect("topology-only storage node must have PGs"),
+            pg_topology,
             default_ec_shape,
             data_dir: PathBuf::new(),
             object_payload_leases: Mutex::new(ObjectPayloadLeaseState::default()),
@@ -529,11 +532,14 @@ impl SharedStorageNode {
 
         pg_id_list.sort_unstable();
 
+        let pg_topology =
+            PgTopology::new(pg_ids).map_err(|source| StoreError::InvalidPgTopology { source })?;
+
         Ok(Self {
             stores,
             pg_paths,
             pg_id_list,
-            pg_topology: PgTopology::new(pg_ids).expect("shared storage node must have PGs"),
+            pg_topology,
             default_ec_shape,
             data_dir: data_dir.to_path_buf(),
             object_payload_leases: Mutex::new(ObjectPayloadLeaseState::default()),
@@ -1862,6 +1868,37 @@ mod tests {
         };
 
         assert!(matches!(err, StoreError::ErasureCoding { .. }));
+    }
+
+    #[test]
+    fn shared_storage_node_rejects_empty_pg_topology_without_panic() {
+        let tmp = test_util::tempdir();
+        let err = match SharedStorageNode::open(tmp.path(), &[]) {
+            Ok(_) => panic!("expected empty PG topology to be rejected"),
+            Err(err) => err,
+        };
+
+        assert!(matches!(
+            err,
+            StoreError::InvalidPgTopology {
+                source: crate::pg_topology::PgTopologyError::Empty
+            }
+        ));
+    }
+
+    #[test]
+    fn topology_only_storage_node_rejects_empty_pg_topology_without_panic() {
+        let err = match SharedStorageNode::topology_only(&[], SharedStorageNode::DEFAULT_EC_SHAPE) {
+            Ok(_) => panic!("expected empty PG topology to be rejected"),
+            Err(err) => err,
+        };
+
+        assert!(matches!(
+            err,
+            StoreError::InvalidPgTopology {
+                source: crate::pg_topology::PgTopologyError::Empty
+            }
+        ));
     }
 
     // ── SharedStorageNode tests ──────────────────────────────────────

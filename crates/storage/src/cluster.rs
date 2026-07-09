@@ -2054,7 +2054,7 @@ impl StorageCluster {
         &self,
         pg_id: PgId,
         command: &MetadataCommandEnvelope,
-        admission: &'static str,
+        admission: observability::MetadataCommandRecoveryAdmissionKind,
         wait_us: u128,
     ) {
         let _ = observability::emit_metadata_command_recovery_admission(
@@ -5995,13 +5995,19 @@ impl StorageCluster {
             let _recovery_guard = match recovery {
                 MetadataCommandRecoveryAdmission::Leader(guard) => {
                     self.emit_metadata_command_recovery_admission_for_command(
-                        pg_id, command, "leader", 0,
+                        pg_id,
+                        command,
+                        observability::MetadataCommandRecoveryAdmissionKind::Leader,
+                        0,
                     );
                     guard
                 }
                 MetadataCommandRecoveryAdmission::Waited { wait_us } => {
                     self.emit_metadata_command_recovery_admission_for_command(
-                        pg_id, command, "waited", wait_us,
+                        pg_id,
+                        command,
+                        observability::MetadataCommandRecoveryAdmissionKind::Waited,
+                        wait_us,
                     );
                     self.emit_pending_slot_action_for_command(pg_id, command, "drain_wait");
                     let waiter_outcome =
@@ -6026,7 +6032,7 @@ impl StorageCluster {
                     self.emit_metadata_command_recovery_admission_for_command(
                         pg_id,
                         command,
-                        "timed_out",
+                        observability::MetadataCommandRecoveryAdmissionKind::TimedOut,
                         wait_us,
                     );
                     self.emit_metadata_command_recovery_outcome_for_command(
@@ -7451,13 +7457,19 @@ impl StorageCluster {
             let _recovery_guard = match recovery {
                 MetadataCommandRecoveryAdmission::Leader(guard) => {
                     self.emit_metadata_command_recovery_admission_for_command(
-                        pg_id, &command, "leader", 0,
+                        pg_id,
+                        &command,
+                        observability::MetadataCommandRecoveryAdmissionKind::Leader,
+                        0,
                     );
                     guard
                 }
                 MetadataCommandRecoveryAdmission::Waited { wait_us } => {
                     self.emit_metadata_command_recovery_admission_for_command(
-                        pg_id, &command, "waited", wait_us,
+                        pg_id,
+                        &command,
+                        observability::MetadataCommandRecoveryAdmissionKind::Waited,
+                        wait_us,
                     );
                     self.emit_pending_slot_action_for_command(pg_id, &command, "drain_wait");
                     let waiter_outcome =
@@ -7511,7 +7523,7 @@ impl StorageCluster {
                     self.emit_metadata_command_recovery_admission_for_command(
                         pg_id,
                         &command,
-                        "timed_out",
+                        observability::MetadataCommandRecoveryAdmissionKind::TimedOut,
                         wait_us,
                     );
                     self.emit_metadata_command_recovery_outcome_for_command(
@@ -11183,6 +11195,7 @@ fn metadata_command_checkpoint_record_error_kind(error: &StoreError) -> &'static
         StoreError::ShardAckMismatch { .. } => "shard_ack_mismatch",
         StoreError::PayloadShardSetMismatch { .. } => "payload_shard_set_mismatch",
         StoreError::PgNotFound { .. } => "pg_not_found",
+        StoreError::InvalidPgTopology { .. } => "invalid_pg_topology",
         StoreError::ClusterPgNotFound { .. } => "cluster_pg_not_found",
         StoreError::ShardPgNotFound { .. } => "shard_pg_not_found",
         StoreError::PgNotActive { .. } => "pg_not_active",

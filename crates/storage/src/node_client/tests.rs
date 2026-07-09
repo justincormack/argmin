@@ -423,10 +423,12 @@ fn test_unix_storage_node_client_with_rpc_admission_timeout(
         NodeId::new(7),
         ClusterEpoch::new(1).unwrap(),
         tmp.path().join("unused.sock"),
-        Arc::new(UnixStorageNodeRpcAdmission::new_with_wait_timeout(
-            limit,
-            wait_timeout,
-            wait_timeout,
+        Arc::new(UnixStorageNodeRpcAdmission::new_with_settings(
+            crate::node_client::UnixStorageNodeRpcAdmissionSettings {
+                limit,
+                wait_timeout,
+                control_wait_timeout: wait_timeout,
+            },
         )),
     )
 }

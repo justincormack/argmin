@@ -30,6 +30,12 @@ pub enum StoreError {
     #[error("PG {pg_id} not found on this node")]
     PgNotFound { pg_id: u32 },
 
+    #[error("invalid PG topology: {source}")]
+    InvalidPgTopology {
+        #[source]
+        source: crate::pg_topology::PgTopologyError,
+    },
+
     #[error("PG {pg_id} is not present in cluster epoch {cluster_epoch}")]
     ClusterPgNotFound {
         pg_id: u32,

@@ -14,6 +14,33 @@ pub(crate) const UNIX_STORAGE_NODE_DEFAULT_RPC_ADMISSION_WAIT_TIMEOUT: Duration 
 pub(crate) const UNIX_STORAGE_NODE_DEFAULT_RPC_CONTROL_ADMISSION_WAIT_TIMEOUT: Duration =
     Duration::from_secs(1);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct UnixStorageNodeRpcAdmissionSettings {
+    pub(crate) limit: usize,
+    pub(crate) wait_timeout: Duration,
+    pub(crate) control_wait_timeout: Duration,
+}
+
+impl UnixStorageNodeRpcAdmissionSettings {
+    pub(crate) const DEFAULT: Self = Self {
+        limit: UNIX_STORAGE_NODE_DEFAULT_RPC_ADMISSION_LIMIT,
+        wait_timeout: UNIX_STORAGE_NODE_DEFAULT_RPC_ADMISSION_WAIT_TIMEOUT,
+        control_wait_timeout: UNIX_STORAGE_NODE_DEFAULT_RPC_CONTROL_ADMISSION_WAIT_TIMEOUT,
+    };
+
+    pub(crate) const fn limit(self) -> usize {
+        self.limit
+    }
+
+    pub(crate) const fn wait_timeout(self) -> Duration {
+        self.wait_timeout
+    }
+
+    pub(crate) const fn control_wait_timeout(self) -> Duration {
+        self.control_wait_timeout
+    }
+}
+
 pub(crate) struct UnixStorageNodeRpcAdmission {
     pub(crate) limit: usize,
     non_reserved_limit: usize,
@@ -134,18 +161,14 @@ type UnixStorageNodeRpcAdmissionRegistry =
 impl UnixStorageNodeRpcAdmission {
     #[cfg(test)]
     pub(crate) fn new(limit: usize) -> Self {
-        Self::new_with_wait_timeout(
+        Self::new_with_settings(UnixStorageNodeRpcAdmissionSettings {
             limit,
-            UNIX_STORAGE_NODE_DEFAULT_RPC_ADMISSION_WAIT_TIMEOUT,
-            UNIX_STORAGE_NODE_DEFAULT_RPC_CONTROL_ADMISSION_WAIT_TIMEOUT,
-        )
+            ..UnixStorageNodeRpcAdmissionSettings::DEFAULT
+        })
     }
 
-    pub(crate) fn new_with_wait_timeout(
-        limit: usize,
-        wait_timeout: Duration,
-        control_wait_timeout: Duration,
-    ) -> Self {
+    pub(crate) fn new_with_settings(settings: UnixStorageNodeRpcAdmissionSettings) -> Self {
+        let limit = settings.limit();
         assert!(
             limit > 0,
             "Unix storage-node RPC admission limit must be > 0"
@@ -165,8 +188,8 @@ impl UnixStorageNodeRpcAdmission {
             list_limit,
             start_write_limit: shared_limit,
             start_write_floor,
-            wait_timeout,
-            control_wait_timeout,
+            wait_timeout: settings.wait_timeout(),
+            control_wait_timeout: settings.control_wait_timeout(),
             active: Mutex::new(UnixStorageNodeRpcAdmissionActive::default()),
             capacity_available: Condvar::new(),
         }
@@ -333,21 +356,20 @@ pub(crate) fn shared_unix_storage_node_rpc_admission(
     socket_path: &Path,
     limit: usize,
 ) -> Arc<UnixStorageNodeRpcAdmission> {
-    shared_unix_storage_node_rpc_admission_with_wait_timeout(
+    shared_unix_storage_node_rpc_admission_with_settings(
         node_id,
         socket_path,
-        limit,
-        UNIX_STORAGE_NODE_DEFAULT_RPC_ADMISSION_WAIT_TIMEOUT,
-        UNIX_STORAGE_NODE_DEFAULT_RPC_CONTROL_ADMISSION_WAIT_TIMEOUT,
+        UnixStorageNodeRpcAdmissionSettings {
+            limit,
+            ..UnixStorageNodeRpcAdmissionSettings::DEFAULT
+        },
     )
 }
 
-pub(crate) fn shared_unix_storage_node_rpc_admission_with_wait_timeout(
+pub(crate) fn shared_unix_storage_node_rpc_admission_with_settings(
     node_id: NodeId,
     socket_path: &Path,
-    limit: usize,
-    wait_timeout: Duration,
-    control_wait_timeout: Duration,
+    settings: UnixStorageNodeRpcAdmissionSettings,
 ) -> Arc<UnixStorageNodeRpcAdmission> {
     static ADMISSIONS: OnceLock<UnixStorageNodeRpcAdmissionRegistry> = OnceLock::new();
 
@@ -359,11 +381,7 @@ pub(crate) fn shared_unix_storage_node_rpc_admission_with_wait_timeout(
     if let Some(admission) = admissions.get(&key).and_then(Weak::upgrade) {
         return admission;
     }
-    let admission = Arc::new(UnixStorageNodeRpcAdmission::new_with_wait_timeout(
-        limit,
-        wait_timeout,
-        control_wait_timeout,
-    ));
+    let admission = Arc::new(UnixStorageNodeRpcAdmission::new_with_settings(settings));
     admissions.insert(key, Arc::downgrade(&admission));
     admission
 }
@@ -565,9 +583,21 @@ mod tests {
     use std::sync::Arc;
     use std::thread;
 
+    fn test_admission(
+        limit: usize,
+        wait_timeout: Duration,
+        control_wait_timeout: Duration,
+    ) -> UnixStorageNodeRpcAdmission {
+        UnixStorageNodeRpcAdmission::new_with_settings(UnixStorageNodeRpcAdmissionSettings {
+            limit,
+            wait_timeout,
+            control_wait_timeout,
+        })
+    }
+
     #[test]
     fn unix_storage_node_rpc_admission_waits_for_released_capacity() {
-        let admission = Arc::new(UnixStorageNodeRpcAdmission::new_with_wait_timeout(
+        let admission = Arc::new(test_admission(
             1,
             Duration::from_secs(1),
             Duration::from_secs(1),
@@ -601,7 +631,7 @@ mod tests {
 
     #[test]
     fn unix_storage_node_rpc_admission_times_out_under_sustained_overload() {
-        let admission = Arc::new(UnixStorageNodeRpcAdmission::new_with_wait_timeout(
+        let admission = Arc::new(test_admission(
             1,
             Duration::from_millis(10),
             Duration::from_millis(10),
@@ -616,7 +646,7 @@ mod tests {
 
     #[test]
     fn unix_storage_node_rpc_admission_splits_read_from_list_work() {
-        let admission = Arc::new(UnixStorageNodeRpcAdmission::new_with_wait_timeout(
+        let admission = Arc::new(test_admission(
             4,
             Duration::from_millis(10),
             Duration::from_millis(10),
@@ -646,7 +676,7 @@ mod tests {
 
     #[test]
     fn unix_storage_node_rpc_admission_minimum_supports_nested_read_and_mixed_work() {
-        let admission = Arc::new(UnixStorageNodeRpcAdmission::new_with_wait_timeout(
+        let admission = Arc::new(test_admission(
             UNIX_STORAGE_NODE_MIN_RPC_ADMISSION_LIMIT,
             Duration::from_millis(10),
             Duration::from_millis(10),
@@ -705,7 +735,7 @@ mod tests {
 
     #[test]
     fn unix_storage_node_rpc_admission_biases_completion_over_new_starts() {
-        let admission = Arc::new(UnixStorageNodeRpcAdmission::new_with_wait_timeout(
+        let admission = Arc::new(test_admission(
             4,
             Duration::from_millis(10),
             Duration::from_millis(10),
@@ -749,7 +779,7 @@ mod tests {
 
     #[test]
     fn unix_storage_node_rpc_admission_completion_progresses_when_start_write_is_saturated() {
-        let admission = Arc::new(UnixStorageNodeRpcAdmission::new_with_wait_timeout(
+        let admission = Arc::new(test_admission(
             4,
             Duration::from_millis(10),
             Duration::from_millis(10),
@@ -793,7 +823,7 @@ mod tests {
 
     #[test]
     fn unix_storage_node_rpc_admission_completion_cannot_exhaust_start_write_floor() {
-        let admission = Arc::new(UnixStorageNodeRpcAdmission::new_with_wait_timeout(
+        let admission = Arc::new(test_admission(
             32,
             Duration::from_millis(10),
             Duration::from_millis(10),
@@ -827,7 +857,7 @@ mod tests {
 
     #[test]
     fn unix_storage_node_rpc_admission_pending_envelopes_cannot_exhaust_completion() {
-        let admission = Arc::new(UnixStorageNodeRpcAdmission::new_with_wait_timeout(
+        let admission = Arc::new(test_admission(
             32,
             Duration::from_millis(10),
             Duration::from_millis(10),
@@ -870,7 +900,7 @@ mod tests {
 
     #[test]
     fn unix_storage_node_rpc_admission_progress_cannot_consume_completion_reserve() {
-        let admission = Arc::new(UnixStorageNodeRpcAdmission::new_with_wait_timeout(
+        let admission = Arc::new(test_admission(
             4,
             Duration::from_millis(10),
             Duration::from_millis(10),

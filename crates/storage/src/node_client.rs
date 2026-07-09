@@ -293,12 +293,12 @@ use unix_object_rpc::{
 };
 
 #[cfg(test)]
-pub(crate) use unix_admission::shared_unix_storage_node_rpc_admission_with_wait_timeout;
+pub(crate) use unix_admission::shared_unix_storage_node_rpc_admission_with_settings;
 pub(crate) use unix_admission::{
     listing_probe_admission_class, shared_unix_storage_node_rpc_admission,
     storage_rpc_admission_class, UnixStorageNodeRpcAdmission, UnixStorageNodeRpcAdmissionAcquire,
     UnixStorageNodeRpcAdmissionClass, UnixStorageNodeRpcAdmissionPermit,
-    UNIX_STORAGE_NODE_DEFAULT_RPC_ADMISSION_LIMIT,
+    UnixStorageNodeRpcAdmissionSettings, UNIX_STORAGE_NODE_DEFAULT_RPC_ADMISSION_LIMIT,
     UNIX_STORAGE_NODE_DEFAULT_RPC_ADMISSION_WAIT_TIMEOUT,
     UNIX_STORAGE_NODE_DEFAULT_RPC_CONTROL_ADMISSION_WAIT_TIMEOUT,
     UNIX_STORAGE_NODE_MIN_RPC_ADMISSION_LIMIT,
@@ -329,6 +329,16 @@ impl LocalUnixStorageNodeClientAdmissionSettings {
 
     pub fn rpc_control_admission_wait_timeout(self) -> Duration {
         self.rpc_control_admission_wait_timeout
+    }
+}
+
+impl From<LocalUnixStorageNodeClientAdmissionSettings> for UnixStorageNodeRpcAdmissionSettings {
+    fn from(settings: LocalUnixStorageNodeClientAdmissionSettings) -> Self {
+        Self {
+            limit: settings.rpc_admission_limit,
+            wait_timeout: settings.rpc_admission_wait_timeout,
+            control_wait_timeout: settings.rpc_control_admission_wait_timeout,
+        }
     }
 }
 

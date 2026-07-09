@@ -1287,10 +1287,8 @@ impl UnixStorageNodeClient {
             node_id,
             cluster_epoch,
             socket_path.into(),
-            Arc::new(UnixStorageNodeRpcAdmission::new_with_wait_timeout(
-                settings.rpc_admission_limit(),
-                settings.rpc_admission_wait_timeout(),
-                settings.rpc_control_admission_wait_timeout(),
+            Arc::new(UnixStorageNodeRpcAdmission::new_with_settings(
+                settings.into(),
             )),
         )
     }

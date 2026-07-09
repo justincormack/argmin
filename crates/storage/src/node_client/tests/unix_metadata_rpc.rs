@@ -2358,12 +2358,14 @@ fn unix_storage_node_rpc_admission_wait_metric_records_released_capacity() {
 fn unix_storage_node_rpc_admission_is_shared_by_node_and_socket() {
     let tmp = test_util::tempdir();
     let socket_path = tmp.path().join("missing.sock");
-    let rpc_admission = shared_unix_storage_node_rpc_admission_with_wait_timeout(
+    let rpc_admission = shared_unix_storage_node_rpc_admission_with_settings(
         NodeId::new(7),
         &socket_path,
-        1,
-        Duration::from_millis(10),
-        Duration::from_millis(10),
+        crate::node_client::UnixStorageNodeRpcAdmissionSettings {
+            limit: 1,
+            wait_timeout: Duration::from_millis(10),
+            control_wait_timeout: Duration::from_millis(10),
+        },
     );
     let client_a = UnixStorageNodeClient::with_rpc_admission(
         NodeId::new(7),

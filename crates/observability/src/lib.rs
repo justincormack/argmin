@@ -1401,12 +1401,30 @@ pub struct MetadataCommandSessionWaitSummary {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MetadataCommandRecoveryAdmissionKind {
+    Leader,
+    Waited,
+    TimedOut,
+}
+
+impl MetadataCommandRecoveryAdmissionKind {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Leader => "leader",
+            Self::Waited => "waited",
+            Self::TimedOut => "timed_out",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MetadataCommandRecoveryAdmissionSummary {
     pub node_id: Option<u32>,
     pub pg_id: u32,
     pub cluster_epoch: u64,
     pub log_index: Option<u64>,
-    pub admission: &'static str,
+    pub admission: MetadataCommandRecoveryAdmissionKind,
     pub command_kind: Option<&'static str>,
     pub wait_us: u128,
 }
@@ -3010,28 +3028,28 @@ pub fn emit_metadata_command_recovery_admission(
     summary: MetadataCommandRecoveryAdmissionSummary,
 ) -> bool {
     match summary.admission {
-        "leader" => {
+        MetadataCommandRecoveryAdmissionKind::Leader => {
             METADATA_COMMAND_RECOVERY_LEADER_TOTAL.fetch_add(1, Ordering::Relaxed);
         }
-        "waited" => {
+        MetadataCommandRecoveryAdmissionKind::Waited => {
             METADATA_COMMAND_RECOVERY_WAIT_TOTAL.fetch_add(1, Ordering::Relaxed);
             let wait_us = saturating_u128_to_u64(summary.wait_us);
             METADATA_COMMAND_RECOVERY_WAIT_US_TOTAL.fetch_add(wait_us, Ordering::Relaxed);
             fetch_max_atomic(&METADATA_COMMAND_RECOVERY_WAIT_US_MAX, wait_us);
         }
-        "timed_out" => {
+        MetadataCommandRecoveryAdmissionKind::TimedOut => {
             METADATA_COMMAND_RECOVERY_WAIT_TOTAL.fetch_add(1, Ordering::Relaxed);
             METADATA_COMMAND_RECOVERY_TIMEOUT_TOTAL.fetch_add(1, Ordering::Relaxed);
             let wait_us = saturating_u128_to_u64(summary.wait_us);
             METADATA_COMMAND_RECOVERY_WAIT_US_TOTAL.fetch_add(wait_us, Ordering::Relaxed);
             fetch_max_atomic(&METADATA_COMMAND_RECOVERY_WAIT_US_MAX, wait_us);
         }
-        _ => {}
     }
+    let admission = summary.admission.as_str();
     increment_metadata_command_dimension(
         metadata_command_recovery_admission_dimensions(),
         summary.pg_id,
-        summary.admission,
+        admission,
         summary.command_kind.unwrap_or("unknown"),
     );
     let Some(context) = current_context() else {
@@ -3052,7 +3070,7 @@ pub fn emit_metadata_command_recovery_admission(
         summary.pg_id,
         summary.cluster_epoch,
         log_index,
-        summary.admission,
+        admission,
         command_kind,
         summary.wait_us
     );
@@ -3072,7 +3090,7 @@ pub fn emit_metadata_command_recovery_admission(
             summary.pg_id,
             summary.cluster_epoch,
             log_index,
-            summary.admission,
+            admission,
             command_kind,
             summary.wait_us
         )),
@@ -4254,7 +4272,7 @@ mod tests {
                 pg_id: 11,
                 cluster_epoch: 1,
                 log_index: Some(15),
-                admission: "leader",
+                admission: MetadataCommandRecoveryAdmissionKind::Leader,
                 command_kind: Some("ReserveObjectVersion"),
                 wait_us: 0,
             },
@@ -4266,7 +4284,7 @@ mod tests {
                 pg_id: 11,
                 cluster_epoch: 1,
                 log_index: Some(15),
-                admission: "waited",
+                admission: MetadataCommandRecoveryAdmissionKind::Waited,
                 command_kind: Some("ReserveObjectVersion"),
                 wait_us: 99,
             },
@@ -4278,7 +4296,7 @@ mod tests {
                 pg_id: 11,
                 cluster_epoch: 1,
                 log_index: Some(15),
-                admission: "timed_out",
+                admission: MetadataCommandRecoveryAdmissionKind::TimedOut,
                 command_kind: Some("ReserveObjectVersion"),
                 wait_us: 101,
             },
@@ -5191,7 +5209,7 @@ mod tests {
                 pg_id: 3,
                 cluster_epoch: 1,
                 log_index: Some(11),
-                admission: "waited",
+                admission: MetadataCommandRecoveryAdmissionKind::Waited,
                 command_kind: Some("ReserveObjectVersion"),
                 wait_us: 4321,
             },

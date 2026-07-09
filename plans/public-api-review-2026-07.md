@@ -469,7 +469,7 @@ the findings below.
   inert `bucket_lock_wait_exceeded_total` metric/export. Remaining lock
   contention tests use production-shaped PG/metadata-command boundaries.
 
-- [ ] **W7. Smaller leftovers.** `PgTopology`'s typed error isn't fully
+- [x] **W7. Smaller leftovers.** `PgTopology`'s typed error isn't fully
   honored: `node.rs:509, 582` still `.expect()` on empty `pg_ids` inside
   `Result`-returning production constructors (`.unwrap()` is gone but the panic
   isn't). `emit_metadata_command_recovery_admission` (observability
@@ -478,6 +478,16 @@ the findings below.
   today). `UnixStorageNodeRpcAdmission::new_with_wait_timeout(usize, Duration,
   Duration)` (`node_client/unix_admission.rs:144-148`) keeps an adjacent
   Duration pair one layer below the named settings struct.
+
+  Fixed 2026-07-09: `SharedStorageNode` constructors now map
+  `PgTopologyError` into `StoreError::InvalidPgTopology` instead of panicking,
+  with regressions for both regular and topology-only opens.
+  `MetadataCommandRecoveryAdmissionSummary` now carries a closed
+  `MetadataCommandRecoveryAdmissionKind` enum, so unknown labels cannot be
+  silently dropped. `UnixStorageNodeRpcAdmission` now takes
+  `UnixStorageNodeRpcAdmissionSettings`; the higher-level local Unix client
+  admission settings convert into that lower-level settings object instead of
+  passing adjacent raw timeouts.
 
 ### Control-plane auth — first pattern-class review (CA series)
 
