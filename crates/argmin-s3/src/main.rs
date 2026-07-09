@@ -30,10 +30,11 @@ use storage::control_plane::{
     finish_control_plane_heartbeat_response, prepare_control_plane_heartbeat_response,
     read_control_plane_unix_request, write_control_plane_unix_response,
     AuthenticatedUnixControlPlaneClient, ClusterControlSnapshot, ClusterRuntimeMapSnapshot,
-    ControlPlaneAdmin, ControlPlaneAdminAuthCredential, ControlPlaneError,
-    ControlPlaneFrontendAuthCredential, ControlPlaneHeartbeatRefresh,
-    ControlPlaneHeartbeatRuntimeMapSource, ControlPlaneRuntimeMapSource,
-    ControlPlaneStorageNodeAuthCredential, ControlPlaneUnixAuthVerifier,
+    ControlPlaneAdmin, ControlPlaneAdminAuthCredential, ControlPlaneAdminAuthCredentialInput,
+    ControlPlaneError, ControlPlaneFrontendAuthCredential, ControlPlaneFrontendAuthCredentialInput,
+    ControlPlaneHeartbeatRefresh, ControlPlaneHeartbeatRuntimeMapSource,
+    ControlPlaneRuntimeMapSource, ControlPlaneStorageNodeAuthCredential,
+    ControlPlaneStorageNodeAuthCredentialInput, ControlPlaneUnixAuthVerifier,
     FencedPgMetadataTransferSnapshot, FileControlPlaneStore, PgMetadataProof,
     PgMetadataTransferProof, PgRouteSnapshot, SingleAuthorityControlPlane, UnixControlPlaneClient,
 };
@@ -2340,6 +2341,10 @@ fn handle_experimental_raft_peer_rpc_before_ack(
                 return Err(ExperimentalRaftPeerRpcWorkerError::PeerRpc(error));
             }
         };
+        // Header fields are decoded before verification only to select the
+        // expected metric bucket and peer identity. The safety boundary is in
+        // verify_peer_frame(): credential lookup, MAC verification, and the
+        // authenticated payload identity/operation binding check.
         let operation = envelope.header().operation();
         let identity = match experimental_raft_peer_auth_envelope_identity(
             &envelope,
@@ -3301,12 +3306,12 @@ impl AdminControlPlaneClient {
 fn configured_storage_node_auth_credential(
     configured: &ConfiguredControlPlaneStorageAuthCredential,
 ) -> Result<ControlPlaneStorageNodeAuthCredential, String> {
-    ControlPlaneStorageNodeAuthCredential::new(
-        NodeId::new(configured.node_id),
-        configured.credential_id.clone(),
-        configured.credential_version,
-        configured.secret.as_str().as_bytes().to_vec(),
-    )
+    ControlPlaneStorageNodeAuthCredential::new(ControlPlaneStorageNodeAuthCredentialInput {
+        node_id: NodeId::new(configured.node_id),
+        credential_id: configured.credential_id.clone(),
+        credential_version: configured.credential_version,
+        secret: configured.secret.as_str().as_bytes().to_vec(),
+    })
     .map_err(|error| {
         format!(
             "invalid ARGMIN_CONTROL_PLANE_STORAGE_AUTH_CREDENTIALS credential for node {}: {error}",
@@ -3318,12 +3323,12 @@ fn configured_storage_node_auth_credential(
 fn configured_frontend_auth_credential(
     configured: &ConfiguredControlPlaneFrontendAuthCredential,
 ) -> Result<ControlPlaneFrontendAuthCredential, String> {
-    ControlPlaneFrontendAuthCredential::new(
-        configured.instance_id.clone(),
-        configured.credential_id.clone(),
-        configured.credential_version,
-        configured.secret.as_str().as_bytes().to_vec(),
-    )
+    ControlPlaneFrontendAuthCredential::new(ControlPlaneFrontendAuthCredentialInput {
+        instance_id: configured.instance_id.clone(),
+        credential_id: configured.credential_id.clone(),
+        credential_version: configured.credential_version,
+        secret: configured.secret.as_str().as_bytes().to_vec(),
+    })
     .map_err(|error| {
         format!(
             "invalid ARGMIN_CONTROL_PLANE_FRONTEND_AUTH_CREDENTIALS credential for instance {}: {error}",
@@ -3335,12 +3340,12 @@ fn configured_frontend_auth_credential(
 fn configured_admin_auth_credential(
     configured: &ConfiguredControlPlaneAdminAuthCredential,
 ) -> Result<ControlPlaneAdminAuthCredential, String> {
-    ControlPlaneAdminAuthCredential::new(
-        configured.instance_id.clone(),
-        configured.credential_id.clone(),
-        configured.credential_version,
-        configured.secret.as_str().as_bytes().to_vec(),
-    )
+    ControlPlaneAdminAuthCredential::new(ControlPlaneAdminAuthCredentialInput {
+        instance_id: configured.instance_id.clone(),
+        credential_id: configured.credential_id.clone(),
+        credential_version: configured.credential_version,
+        secret: configured.secret.as_str().as_bytes().to_vec(),
+    })
     .map_err(|error| {
         format!(
             "invalid ARGMIN_CONTROL_PLANE_ADMIN_AUTH_CREDENTIALS credential for instance {}: {error}",
@@ -6109,9 +6114,11 @@ mod tests {
         let mut tampered_authenticator = valid_envelope.authenticator().to_vec();
         tampered_authenticator[0] ^= 0x01;
         let bad_mac_frame = ControlPlaneAuthEnvelope::new(
-            valid_envelope.header().clone(),
-            valid_envelope.payload().to_vec(),
-            tampered_authenticator,
+            storage::control_plane_auth::ControlPlaneAuthEnvelopeInput {
+                header: valid_envelope.header().clone(),
+                payload: valid_envelope.payload().to_vec(),
+                authenticator: tampered_authenticator,
+            },
         )
         .expect("tampered test auth envelope should rebuild")
         .encode_frame()
@@ -6179,9 +6186,11 @@ mod tests {
             .expect("vote request payload should be non-empty");
         *last_payload_byte ^= 0x01;
         let payload_bitflip_frame = ControlPlaneAuthEnvelope::new(
-            valid_envelope.header().clone(),
-            tampered_payload,
-            valid_envelope.authenticator().to_vec(),
+            storage::control_plane_auth::ControlPlaneAuthEnvelopeInput {
+                header: valid_envelope.header().clone(),
+                payload: tampered_payload,
+                authenticator: valid_envelope.authenticator().to_vec(),
+            },
         )
         .expect("payload-bitflip test auth envelope should rebuild")
         .encode_frame()
@@ -6527,53 +6536,57 @@ mod tests {
             "control-auth",
             vec![
                 ControlPlaneStorageNodeAuthCredential::new(
-                    NodeId::new(7),
-                    "storage-node-7",
-                    3,
-                    b"storage-node-7-test-secret".to_vec(),
+                    ControlPlaneStorageNodeAuthCredentialInput {
+                        node_id: NodeId::new(7),
+                        credential_id: "storage-node-7".to_owned(),
+                        credential_version: 3,
+                        secret: b"storage-node-7-test-secret".to_vec(),
+                    },
                 )
                 .expect("test storage-node credential should build"),
                 ControlPlaneStorageNodeAuthCredential::new(
-                    NodeId::new(7),
-                    "storage-node-7",
-                    4,
-                    b"storage-node-7-new-test-secret".to_vec(),
+                    ControlPlaneStorageNodeAuthCredentialInput {
+                        node_id: NodeId::new(7),
+                        credential_id: "storage-node-7".to_owned(),
+                        credential_version: 4,
+                        secret: b"storage-node-7-new-test-secret".to_vec(),
+                    },
                 )
                 .expect("test rotated storage-node credential should build"),
             ],
         )
         .expect("test Unix auth verifier should build")
         .with_frontend_credentials(vec![
-            ControlPlaneFrontendAuthCredential::new(
-                "frontend-1",
-                "frontend",
-                5,
-                b"frontend-1-test-secret".to_vec(),
-            )
+            ControlPlaneFrontendAuthCredential::new(ControlPlaneFrontendAuthCredentialInput {
+                instance_id: "frontend-1".to_owned(),
+                credential_id: "frontend".to_owned(),
+                credential_version: 5,
+                secret: b"frontend-1-test-secret".to_vec(),
+            })
             .expect("test frontend credential should build"),
-            ControlPlaneFrontendAuthCredential::new(
-                "frontend-1",
-                "frontend",
-                6,
-                b"frontend-1-new-test-secret".to_vec(),
-            )
+            ControlPlaneFrontendAuthCredential::new(ControlPlaneFrontendAuthCredentialInput {
+                instance_id: "frontend-1".to_owned(),
+                credential_id: "frontend".to_owned(),
+                credential_version: 6,
+                secret: b"frontend-1-new-test-secret".to_vec(),
+            })
             .expect("test rotated frontend credential should build"),
         ])
         .expect("test frontend credentials should install")
         .with_admin_credentials(vec![
-            ControlPlaneAdminAuthCredential::new(
-                "admin-1",
-                "admin",
-                7,
-                b"admin-1-test-secret".to_vec(),
-            )
+            ControlPlaneAdminAuthCredential::new(ControlPlaneAdminAuthCredentialInput {
+                instance_id: "admin-1".to_owned(),
+                credential_id: "admin".to_owned(),
+                credential_version: 7,
+                secret: b"admin-1-test-secret".to_vec(),
+            })
             .expect("test admin credential should build"),
-            ControlPlaneAdminAuthCredential::new(
-                "admin-1",
-                "admin",
-                8,
-                b"admin-1-new-test-secret".to_vec(),
-            )
+            ControlPlaneAdminAuthCredential::new(ControlPlaneAdminAuthCredentialInput {
+                instance_id: "admin-1".to_owned(),
+                credential_id: "admin".to_owned(),
+                credential_version: 8,
+                secret: b"admin-1-new-test-secret".to_vec(),
+            })
             .expect("test rotated admin credential should build"),
         ])
         .expect("test admin credentials should install");

@@ -10191,9 +10191,11 @@ mod tests {
             .expect("sample peer frame is non-empty");
         *last ^= 0x01;
         let tampered = ControlPlaneAuthEnvelope::new(
-            envelope.header().clone(),
-            tampered_payload,
-            envelope.authenticator().to_vec(),
+            crate::control_plane_auth::ControlPlaneAuthEnvelopeInput {
+                header: envelope.header().clone(),
+                payload: tampered_payload,
+                authenticator: envelope.authenticator().to_vec(),
+            },
         )
         .unwrap()
         .encode_frame()

@@ -4310,6 +4310,25 @@ pub struct ControlPlaneStorageNodeAuthCredential {
     secret: Vec<u8>,
 }
 
+#[derive(Clone, PartialEq, Eq)]
+pub struct ControlPlaneStorageNodeAuthCredentialInput {
+    pub node_id: NodeId,
+    pub credential_id: String,
+    pub credential_version: u64,
+    pub secret: Vec<u8>,
+}
+
+impl std::fmt::Debug for ControlPlaneStorageNodeAuthCredentialInput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ControlPlaneStorageNodeAuthCredentialInput")
+            .field("node_id", &self.node_id)
+            .field("credential_id", &self.credential_id)
+            .field("credential_version", &self.credential_version)
+            .field("secret", &"<redacted>")
+            .finish()
+    }
+}
+
 impl std::fmt::Debug for ControlPlaneStorageNodeAuthCredential {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ControlPlaneStorageNodeAuthCredential")
@@ -4329,6 +4348,25 @@ pub struct ControlPlaneFrontendAuthCredential {
     secret: Vec<u8>,
 }
 
+#[derive(Clone, PartialEq, Eq)]
+pub struct ControlPlaneFrontendAuthCredentialInput {
+    pub instance_id: String,
+    pub credential_id: String,
+    pub credential_version: u64,
+    pub secret: Vec<u8>,
+}
+
+impl std::fmt::Debug for ControlPlaneFrontendAuthCredentialInput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ControlPlaneFrontendAuthCredentialInput")
+            .field("instance_id", &self.instance_id)
+            .field("credential_id", &self.credential_id)
+            .field("credential_version", &self.credential_version)
+            .field("secret", &"<redacted>")
+            .finish()
+    }
+}
+
 impl std::fmt::Debug for ControlPlaneFrontendAuthCredential {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ControlPlaneFrontendAuthCredential")
@@ -4346,6 +4384,25 @@ pub struct ControlPlaneAdminAuthCredential {
     credential_id: String,
     credential_version: u64,
     secret: Vec<u8>,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct ControlPlaneAdminAuthCredentialInput {
+    pub instance_id: String,
+    pub credential_id: String,
+    pub credential_version: u64,
+    pub secret: Vec<u8>,
+}
+
+impl std::fmt::Debug for ControlPlaneAdminAuthCredentialInput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ControlPlaneAdminAuthCredentialInput")
+            .field("instance_id", &self.instance_id)
+            .field("credential_id", &self.credential_id)
+            .field("credential_version", &self.credential_version)
+            .field("secret", &"<redacted>")
+            .finish()
+    }
 }
 
 impl std::fmt::Debug for ControlPlaneAdminAuthCredential {
@@ -6125,16 +6182,13 @@ impl AuthenticatedUnixControlPlaneClient {
 
 impl ControlPlaneStorageNodeAuthCredential {
     pub fn new(
-        node_id: NodeId,
-        credential_id: impl Into<String>,
-        credential_version: u64,
-        secret: Vec<u8>,
+        input: ControlPlaneStorageNodeAuthCredentialInput,
     ) -> Result<Self, ControlPlaneError> {
         let credential = Self {
-            node_id,
-            credential_id: credential_id.into(),
-            credential_version,
-            secret,
+            node_id: input.node_id,
+            credential_id: input.credential_id,
+            credential_version: input.credential_version,
+            secret: input.secret,
         };
         credential.scoped_for_cluster_and_incarnation("validation-cluster", 1)?;
         Ok(credential)
@@ -6183,17 +6237,12 @@ impl ControlPlaneStorageNodeAuthCredential {
 }
 
 impl ControlPlaneFrontendAuthCredential {
-    pub fn new(
-        instance_id: impl Into<String>,
-        credential_id: impl Into<String>,
-        credential_version: u64,
-        secret: Vec<u8>,
-    ) -> Result<Self, ControlPlaneError> {
+    pub fn new(input: ControlPlaneFrontendAuthCredentialInput) -> Result<Self, ControlPlaneError> {
         let credential = Self {
-            instance_id: instance_id.into(),
-            credential_id: credential_id.into(),
-            credential_version,
-            secret,
+            instance_id: input.instance_id,
+            credential_id: input.credential_id,
+            credential_version: input.credential_version,
+            secret: input.secret,
         };
         credential.scoped_for_cluster("validation-cluster")?;
         Ok(credential)
@@ -6246,17 +6295,12 @@ impl ControlPlaneFrontendAuthCredential {
 }
 
 impl ControlPlaneAdminAuthCredential {
-    pub fn new(
-        instance_id: impl Into<String>,
-        credential_id: impl Into<String>,
-        credential_version: u64,
-        secret: Vec<u8>,
-    ) -> Result<Self, ControlPlaneError> {
+    pub fn new(input: ControlPlaneAdminAuthCredentialInput) -> Result<Self, ControlPlaneError> {
         let credential = Self {
-            instance_id: instance_id.into(),
-            credential_id: credential_id.into(),
-            credential_version,
-            secret,
+            instance_id: input.instance_id,
+            credential_id: input.credential_id,
+            credential_version: input.credential_version,
+            secret: input.secret,
         };
         credential.scoped_for_cluster("validation-cluster")?;
         Ok(credential)
@@ -11950,12 +11994,12 @@ mod tests {
             credential_version: u64,
             secret: &str,
         ) -> ControlPlaneStorageNodeAuthCredential {
-            ControlPlaneStorageNodeAuthCredential::new(
-                NodeId::new(node_id),
-                credential_id.to_owned(),
+            ControlPlaneStorageNodeAuthCredential::new(ControlPlaneStorageNodeAuthCredentialInput {
+                node_id: NodeId::new(node_id),
+                credential_id: credential_id.to_owned(),
                 credential_version,
-                secret.as_bytes().to_vec(),
-            )
+                secret: secret.as_bytes().to_vec(),
+            })
             .expect("test storage-node node-scoped auth credential should build")
         }
 
@@ -11985,12 +12029,12 @@ mod tests {
             credential_version: u64,
             secret: &str,
         ) -> ControlPlaneFrontendAuthCredential {
-            ControlPlaneFrontendAuthCredential::new(
-                instance_id,
-                credential_id.to_owned(),
+            ControlPlaneFrontendAuthCredential::new(ControlPlaneFrontendAuthCredentialInput {
+                instance_id: instance_id.to_owned(),
+                credential_id: credential_id.to_owned(),
                 credential_version,
-                secret.as_bytes().to_vec(),
-            )
+                secret: secret.as_bytes().to_vec(),
+            })
             .expect("test frontend auth credential should build")
         }
 
@@ -12016,12 +12060,12 @@ mod tests {
             credential_version: u64,
             secret: &str,
         ) -> ControlPlaneAdminAuthCredential {
-            ControlPlaneAdminAuthCredential::new(
-                instance_id,
-                credential_id.to_owned(),
+            ControlPlaneAdminAuthCredential::new(ControlPlaneAdminAuthCredentialInput {
+                instance_id: instance_id.to_owned(),
+                credential_id: credential_id.to_owned(),
                 credential_version,
-                secret.as_bytes().to_vec(),
-            )
+                secret: secret.as_bytes().to_vec(),
+            })
             .expect("test admin auth credential should build")
         }
 

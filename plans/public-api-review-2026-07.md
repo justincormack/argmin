@@ -624,7 +624,7 @@ ranked:
   production nonce/sequence replay-cache decision to the Phase 12.4 rollout
   scope.
 
-- [ ] **CA9. Positional same-typed params (P4, in new code).**
+- [x] **CA9. Positional same-typed params (P4, in new code).**
   `ControlPlaneAuthEnvelope::new(header, payload, authenticator)` — two
   positional `Vec<u8>` (`control_plane_auth.rs:700-712`);
   `ControlPlaneFrontendAuthCredential::new`/`...AdminAuthCredential::new` —
@@ -634,6 +634,11 @@ ranked:
   from the attacker-supplied envelope, so those equality checks are tautological
   there — real safety is the credential lookup + MAC + binding cross-check
   (traced: reflection/response-as-request/cross-target replays all fail closed).
+  Resolution: converted auth envelope and Unix credential constructors to named
+  input structs, including storage-node credentials for consistency, and added a
+  Raft peer listener comment documenting that predecoded envelope fields select
+  metrics/expected identity only; credential lookup, MAC verification, and
+  authenticated payload binding remain the trust boundary.
 
 ## Bugs — auth (security)
 

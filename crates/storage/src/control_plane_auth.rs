@@ -300,7 +300,11 @@ impl ControlPlaneScopedCredential {
         let covered = header.encode_covered_bytes(&input.payload)?;
         let key = hmac::Key::new(hmac::HMAC_SHA256, &self.secret);
         let authenticator = hmac::sign(&key, &covered).as_ref().to_vec();
-        ControlPlaneAuthEnvelope::new(header, input.payload, authenticator)
+        ControlPlaneAuthEnvelope::new(ControlPlaneAuthEnvelopeInput {
+            header,
+            payload: input.payload,
+            authenticator,
+        })
     }
 
     fn validate(&self) -> Result<(), ControlPlaneError> {
@@ -730,6 +734,12 @@ pub struct ControlPlaneAuthEnvelope {
     authenticator: Vec<u8>,
 }
 
+pub struct ControlPlaneAuthEnvelopeInput {
+    pub header: ControlPlaneAuthEnvelopeHeader,
+    pub payload: Vec<u8>,
+    pub authenticator: Vec<u8>,
+}
+
 impl fmt::Debug for ControlPlaneAuthEnvelope {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ControlPlaneAuthEnvelope")
@@ -741,15 +751,11 @@ impl fmt::Debug for ControlPlaneAuthEnvelope {
 }
 
 impl ControlPlaneAuthEnvelope {
-    pub fn new(
-        header: ControlPlaneAuthEnvelopeHeader,
-        payload: Vec<u8>,
-        authenticator: Vec<u8>,
-    ) -> Result<Self, ControlPlaneError> {
+    pub fn new(input: ControlPlaneAuthEnvelopeInput) -> Result<Self, ControlPlaneError> {
         let envelope = Self {
-            header,
-            payload,
-            authenticator,
+            header: input.header,
+            payload: input.payload,
+            authenticator: input.authenticator,
         };
         envelope.validate()?;
         Ok(envelope)
@@ -817,8 +823,8 @@ impl ControlPlaneAuthEnvelope {
             )?
             .to_vec();
         reader.finish()?;
-        Self::new(
-            ControlPlaneAuthEnvelopeHeader::new(ControlPlaneAuthEnvelopeHeaderInput {
+        Self::new(ControlPlaneAuthEnvelopeInput {
+            header: ControlPlaneAuthEnvelopeHeader::new(ControlPlaneAuthEnvelopeHeaderInput {
                 cluster_id,
                 credential_id,
                 credential_version,
@@ -832,7 +838,7 @@ impl ControlPlaneAuthEnvelope {
             })?,
             payload,
             authenticator,
-        )
+        })
     }
 
     fn validate(&self) -> Result<(), ControlPlaneError> {
@@ -1230,8 +1236,12 @@ mod tests {
     }
 
     fn sample_envelope() -> ControlPlaneAuthEnvelope {
-        ControlPlaneAuthEnvelope::new(sample_header(), b"raft-payload".to_vec(), vec![9; 32])
-            .unwrap()
+        ControlPlaneAuthEnvelope::new(ControlPlaneAuthEnvelopeInput {
+            header: sample_header(),
+            payload: b"raft-payload".to_vec(),
+            authenticator: vec![9; 32],
+        })
+        .unwrap()
     }
 
     fn sample_credential() -> ControlPlaneScopedCredential {
@@ -1336,7 +1346,12 @@ mod tests {
                 nonce: Vec::new(),
             })
             .unwrap();
-            let envelope = ControlPlaneAuthEnvelope::new(header, Vec::new(), vec![1]).unwrap();
+            let envelope = ControlPlaneAuthEnvelope::new(ControlPlaneAuthEnvelopeInput {
+                header,
+                payload: Vec::new(),
+                authenticator: vec![1],
+            })
+            .unwrap();
             let decoded =
                 ControlPlaneAuthEnvelope::decode_frame(&envelope.encode_frame().unwrap(), 0)
                     .unwrap();
@@ -1482,7 +1497,14 @@ mod tests {
             .is_err()
         );
 
-        assert!(ControlPlaneAuthEnvelope::new(sample_header(), Vec::new(), Vec::new()).is_err());
+        assert!(
+            ControlPlaneAuthEnvelope::new(ControlPlaneAuthEnvelopeInput {
+                header: sample_header(),
+                payload: Vec::new(),
+                authenticator: Vec::new()
+            })
+            .is_err()
+        );
     }
 
     #[test]
@@ -1721,11 +1743,11 @@ mod tests {
     fn control_plane_auth_scoped_credential_rejects_tampered_payload_or_secret() {
         let store = ControlPlaneScopedCredentialStore::new(vec![sample_credential()]).unwrap();
         let envelope = sample_signed_envelope();
-        let tampered_payload = ControlPlaneAuthEnvelope::new(
-            envelope.header().clone(),
-            b"changed-payload".to_vec(),
-            envelope.authenticator().to_vec(),
-        )
+        let tampered_payload = ControlPlaneAuthEnvelope::new(ControlPlaneAuthEnvelopeInput {
+            header: envelope.header().clone(),
+            payload: b"changed-payload".to_vec(),
+            authenticator: envelope.authenticator().to_vec(),
+        })
         .unwrap();
         assert_eq!(
             verify_signed_envelope(&store, &tampered_payload),
