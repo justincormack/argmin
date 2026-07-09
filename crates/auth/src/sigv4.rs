@@ -10,7 +10,7 @@ use crate::credential::{
 };
 use crate::encoding::hex_encode_lower;
 use crate::error::AuthError;
-use crate::request::HeaderSource;
+use crate::request::{validate_static_record_expiry, HeaderSource};
 use crate::{is_lower_hex, MAX_SIGNED_HEADERS_LEN, MAX_SIGNED_HEADER_COUNT, SIGNATURE_HEX_LEN};
 
 /// Parsed AWS SigV4 Authorization header.
@@ -173,11 +173,7 @@ pub(crate) fn verify_request_record<'a, H: HeaderSource + ?Sized>(
     if !record.enabled {
         return Err(AuthError::UnknownAccessKey);
     }
-    if let Some(expiry) = record.expires_at_epoch_secs {
-        if now_epoch_secs > expiry {
-            return Err(AuthError::ExpiredToken);
-        }
-    }
+    validate_static_record_expiry(record, now_epoch_secs)?;
     let secret = &record.secret_key;
 
     // Extract signed headers — collect all values for each header name

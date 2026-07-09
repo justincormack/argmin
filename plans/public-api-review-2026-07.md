@@ -431,10 +431,16 @@ the findings below.
   Unit coverage now includes duplicate same-header values in both orders and the
   mirror order for conflicting checksum algorithms.
 
-- [ ] **W4. Duplicated credential-expiry check.** c3be106b inlined the expiry
+- [x] **W4. Duplicated credential-expiry check.** c3be106b inlined the expiry
   check in `auth/src/sigv4.rs:176-178` instead of calling
   `validate_static_record_expiry` (`request.rs:633-641`) — two copies of the
   same policy that can drift. Consolidate.
+
+  Fixed 2026-07-09: header SigV4 verification now calls the shared
+  `validate_static_record_expiry` helper used by presigned and POST SigV4
+  authentication. Existing header-auth tests continue to pin expired-token
+  behavior, including the case where expiry is reported before signature
+  mismatch.
 
 - [ ] **W5. `LifecycleRuleFilter::explicit_with_predicates` validates prefix
   and tags but not size ordering** (`lifecycle.rs:101-118`) —
