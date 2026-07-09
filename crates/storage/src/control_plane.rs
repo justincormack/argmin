@@ -6838,7 +6838,20 @@ impl ControlPlaneUnixAuthVerifier {
                 return Err(error);
             }
         };
-        let heartbeat = match read_node_heartbeat_payload(envelope.payload()) {
+        let payload = match read_authenticated_control_plane_rpc_payload(
+            ControlPlaneRpcKind::RefreshNodeHeartbeat,
+            envelope.payload(),
+        ) {
+            Ok(payload) => payload,
+            Err(error) => {
+                self.metrics.record_rejected(
+                    ControlPlaneAuthOperation::StorageRuntimeMapRefresh,
+                    ControlPlaneAuthRejectionReason::WrongRole,
+                );
+                return Err(error);
+            }
+        };
+        let heartbeat = match read_node_heartbeat_payload(&payload) {
             Ok(heartbeat) => heartbeat,
             Err(error) => {
                 self.metrics.record_rejected(
@@ -6926,7 +6939,7 @@ impl ControlPlaneUnixAuthVerifier {
                 self.metrics
                     .record_accepted(ControlPlaneAuthOperation::StorageRuntimeMapRefresh);
                 Ok(VerifiedStorageNodeHeartbeatRefresh {
-                    payload: envelope.payload().to_vec(),
+                    payload,
                     response_credential,
                     response_target: expected_source,
                 })
@@ -7290,6 +7303,10 @@ impl AuthenticatedUnixControlPlaneClient {
             return Err(ControlPlaneError::InvalidLeaseDuration);
         }
         let payload = write_node_heartbeat_payload(&heartbeat)?;
+        let payload = write_authenticated_control_plane_rpc_payload(
+            ControlPlaneRpcKind::RefreshNodeHeartbeat,
+            &payload,
+        );
         let issued_at_ms = authority_now_ms()?;
         let expires_at_ms = issued_at_ms
             .checked_add(heartbeat.requested_lease_duration_ms)
@@ -12204,6 +12221,24 @@ mod tests {
         issued_at_ms: Option<u64>,
         expires_at_ms: Option<u64>,
     ) -> ControlPlaneRpcRequest {
+        signed_storage_node_heartbeat_request_with_embedded_kind(
+            signer,
+            heartbeat,
+            ControlPlaneRpcKind::RefreshNodeHeartbeat,
+            issued_at_ms,
+            expires_at_ms,
+        )
+    }
+
+    fn signed_storage_node_heartbeat_request_with_embedded_kind(
+        signer: &ControlPlaneScopedCredential,
+        heartbeat: &NodeHeartbeat,
+        embedded_kind: ControlPlaneRpcKind,
+        issued_at_ms: Option<u64>,
+        expires_at_ms: Option<u64>,
+    ) -> ControlPlaneRpcRequest {
+        let payload = write_node_heartbeat_payload(heartbeat).unwrap();
+        let payload = write_authenticated_control_plane_rpc_payload(embedded_kind, &payload);
         let envelope = signer
             .sign_envelope(crate::control_plane_auth::ControlPlaneAuthSignInput {
                 target: ControlPlaneAuthTarget::Service(
@@ -12214,7 +12249,7 @@ mod tests {
                 expires_at_ms,
                 sequence: None,
                 nonce: Vec::new(),
-                payload: write_node_heartbeat_payload(heartbeat).unwrap(),
+                payload,
             })
             .expect("test storage-node heartbeat envelope should sign");
         ControlPlaneRpcRequest {
@@ -15820,6 +15855,67 @@ mod tests {
         );
         assert_eq!(
             metrics.rejected_for_reason(ControlPlaneAuthRejectionReason::Malformed),
+            1
+        );
+        assert_eq!(
+            authority
+                .snapshot()
+                .node(NodeId::new(1))
+                .unwrap()
+                .lease_deadline_ms(),
+            None
+        );
+    }
+
+    #[test]
+    fn authenticated_control_plane_rejects_storage_node_heartbeat_wrong_embedded_kind() {
+        let tmp = test_util::tempdir();
+        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+        authority
+            .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
+            .unwrap();
+        let signer = storage_node_auth_credential("auth-cluster", 1, 42);
+        let verifier =
+            storage_node_auth_verifier("auth-cluster", vec![storage_node_auth_node_credential(1)]);
+        let heartbeat = NodeHeartbeat {
+            node_id: NodeId::new(1),
+            node_incarnation: 42,
+            endpoint: "/tmp/argmin-node-1.sock".to_owned(),
+            observed_epoch: authority.snapshot().cluster_epoch(),
+            requested_lease_duration_ms: 100,
+            cluster_map_history_reference_summary: PgClusterMapHistoryReferenceSummary::default(),
+            pg_observations: Vec::new(),
+        };
+        let request = signed_storage_node_heartbeat_request_with_embedded_kind(
+            &signer,
+            &heartbeat,
+            ControlPlaneRpcKind::RuntimeMapStatus,
+            Some(1_999),
+            Some(2_099),
+        );
+
+        let error = build_control_plane_unix_response_with_auth(
+            &mut authority,
+            request,
+            2_000,
+            Some(&verifier),
+        )
+        .unwrap_err();
+
+        assert!(
+            matches!(error, ControlPlaneError::RpcProtocol { ref message } if message.contains("authenticated RPC kind")),
+            "unexpected error: {error}"
+        );
+        let metrics = verifier.metrics_snapshot();
+        assert_eq!(metrics.accepted_total(), 0);
+        assert_eq!(metrics.rejected_total(), 1);
+        assert_eq!(
+            metrics.rejected_for_operation(ControlPlaneAuthOperation::StorageRuntimeMapRefresh),
+            1
+        );
+        assert_eq!(
+            metrics.rejected_for_reason(ControlPlaneAuthRejectionReason::WrongRole),
             1
         );
         assert_eq!(

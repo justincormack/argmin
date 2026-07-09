@@ -678,6 +678,7 @@ fn store_error_diagnostic_cause_label(error: &StoreError) -> &'static str {
         StoreError::ShardAckMismatch { .. } => "shard_ack_mismatch",
         StoreError::PayloadShardSetMismatch { .. } => "payload_shard_set_mismatch",
         StoreError::PgNotFound { .. } => "pg_not_found",
+        StoreError::InvalidPgTopology { .. } => "invalid_pg_topology",
         StoreError::ClusterPgNotFound { .. } => "cluster_pg_not_found",
         StoreError::ShardPgNotFound { .. } => "shard_pg_not_found",
         StoreError::PgNotActive { .. } => "pg_not_active",

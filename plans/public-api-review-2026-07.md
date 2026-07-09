@@ -598,14 +598,18 @@ ranked:
   CA7 because heartbeat payload binding will change the storage-node verifier
   shape; doing that extraction first would churn the same code twice.
 
-- [ ] **CA7. Heartbeat envelopes don't bind the outer RPC kind; every other
+- [x] **CA7. Heartbeat envelopes don't bind the outer RPC kind; every other
   Unix path does.** Frontend/admin/all responses wrap via
   `write_authenticated_control_plane_rpc_payload(kind, ...)` and check it; the
   heartbeat path signs the bare payload (`control_plane.rs:7279-7297`) and reads
   from `envelope.payload()` (:6731). Safe only because
   `StorageRuntimeMapRefresh` ↔ `RefreshNodeHeartbeat` is 1:1; a second kind
   mapping to that operation would open cross-kind replay. Fix: add the kind
-  prefix to heartbeat envelopes.
+  prefix to heartbeat envelopes. Resolution: authenticated storage-node
+  heartbeat requests now sign the same kind-prefixed payload shape as the other
+  Unix control-plane auth paths, the verifier unwraps `RefreshNodeHeartbeat`
+  before parsing the heartbeat, and regression coverage rejects a signed
+  heartbeat envelope with a mismatched embedded RPC kind before lease mutation.
 
 - [ ] **CA8. Dead wire-format surface / always-empty replay fields.**
   `ControlPlaneAuthOperation::StorageHeartbeat` (wire tag 6) and
