@@ -193,6 +193,10 @@ impl SystemMetadata {
                                     ),
                                 });
                             }
+                            return Err(ServerError::DuplicateChecksumHeader {
+                                header: algo.header_name().to_string(),
+                                value: value.to_string(),
+                            });
                         } else {
                             checksum_value = Some((algo, value.to_string()));
                         }
@@ -719,6 +723,34 @@ mod tests {
         ])
         .unwrap_err();
         assert!(matches!(err, ServerError::InvalidRequest { .. }));
+    }
+
+    #[test]
+    fn from_headers_rejects_conflicting_checksum_value_headers_in_mirror_order() {
+        let err = SystemMetadata::from_headers(&[
+            ("X-Amz-Checksum-Sha256", "def"),
+            ("X-Amz-Checksum-Crc32", "abc"),
+        ])
+        .unwrap_err();
+        assert!(matches!(err, ServerError::InvalidRequest { .. }));
+    }
+
+    #[test]
+    fn from_headers_rejects_duplicate_same_checksum_header() {
+        for (first, second) in [("abc", "def"), ("def", "abc")] {
+            let err = SystemMetadata::from_headers(&[
+                ("X-Amz-Checksum-Crc32", first),
+                ("X-Amz-Checksum-Crc32", second),
+            ])
+            .unwrap_err();
+            match err {
+                ServerError::DuplicateChecksumHeader { header, value } => {
+                    assert_eq!(header, "x-amz-checksum-crc32");
+                    assert_eq!(value, second);
+                }
+                other => panic!("expected DuplicateChecksumHeader, got {other:?}"),
+            }
+        }
     }
 
     #[test]

@@ -417,13 +417,19 @@ the findings below.
   checksum-type HTTP validation surface is MPU-specific and keeps the
   AWS-pinned MPU error shape.
 
-- [ ] **W3. Same-algorithm duplicate value headers are now first-wins at the
+- [x] **W3. Same-algorithm duplicate value headers are now first-wins at the
   parser** (`system_metadata.rs:186-198` — pre-fix was last-wins, so the
   order-dependence flipped rather than disappeared); masked over HTTP by
   `extract_encoded_checksum_header`'s duplicate rejection. Also the
   conflicting-value-headers unit test covers only one header order
   (`system_metadata.rs:715`) — the logic is symmetric by construction, but
   add the mirror order. Make the parser reject same-algo duplicates too.
+
+  Fixed 2026-07-09: `SystemMetadata::from_header_iter` now rejects duplicate
+  same-algorithm checksum value headers with `DuplicateChecksumHeader`, matching
+  the HTTP checksum-claim duplicate policy instead of keeping the first value.
+  Unit coverage now includes duplicate same-header values in both orders and the
+  mirror order for conflicting checksum algorithms.
 
 - [ ] **W4. Duplicated credential-expiry check.** c3be106b inlined the expiry
   check in `auth/src/sigv4.rs:176-178` instead of calling
