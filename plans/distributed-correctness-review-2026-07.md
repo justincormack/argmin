@@ -29,6 +29,13 @@ new Phase 12.4 WAL subsystem, and adds new findings `INT-1`–`INT-6` —
 including two high-severity availability regressions introduced by the fixes
 themselves (INT-1, INT-2).
 
+A third re-review (baseline `25f47480` → `09805ad6`, 2026-07-09) is recorded
+in the "Round-3 re-review — 2026-07-09" section: it covers the control-plane
+authentication slice as a protocol (sound; residuals A1–A4), verifies the
+MD5/RPC3/RPC5/INT-4-core fixes, and adds findings `R3-1`–`R3-5` — two more
+high-severity availability regressions (R3-1, R3-2) from the INT-1 fix chain,
+in the same committed-timestamp guard.
+
 ## Cross-cutting themes
 
 Four systemic patterns produce most of the findings below; each is worth
@@ -866,6 +873,16 @@ Confirmed pragma (`schema.rs:759-764`); consequence scenario plausible.
   than relying on later checkpoint sync. A focused PgStore invariant test
   asserts `journal_mode=WAL` and `synchronous=FULL` so this durability contract
   does not silently regress.
+- Round-3 verification (2026-07-09): holds — single pragma site
+  (`schema.rs:759-765`) on the sole production PG DB open path, no carve-out,
+  covers slot install / apply+record / slot removal. Blast-radius caveat
+  (R3-3): every PG write txn now fsyncs while holding the per-PG mutex, under
+  the 500ms metadata-command lock budget — a primary command lifecycle is ≥3
+  fsynced txns plus one per replica. On slow-fsync media this can produce
+  spurious `MetadataCommandContention`/`OperationAborted` bursts under load
+  that NORMAL previously absorbed. Not a correctness issue; add an
+  fsync-pressure case to the soak line and land the group-commit /
+  write-amplification plans before scale testing.
 
 ### MD6. LOW — Guide/code drift on load-bearing invariants
 
@@ -1236,7 +1253,7 @@ Confirmed (verified directly).
   frame reports the new epoch, and verifies an old-epoch read-handle acquire
   on that same socket is rejected without acquiring a read handle.
 
-### RPC3. MEDIUM — Remote shard corruption/absence classification for EC reconstruction depends on matching error `Display` strings inside a generic `Internal` code
+### RPC3. RESOLVED (round-3 verified, 2026-07-09) — Remote shard corruption/absence classification for EC reconstruction depends on matching error `Display` strings inside a generic `Internal` code
 
 Fixed.
 
@@ -1247,6 +1264,16 @@ Fixed.
   typed RPC codes (`NotFound` and `ShardIntegrity`) rather than matching
   display strings. Regression coverage verifies that old `Internal` strings such
   as `"shard not found"` and `" ack mismatch: "` are not treated as recoverable.
+- Round-3 verification: holds end-to-end (server encode
+  `storage_node_server.rs:11116-11121`, wire code 23 both directions,
+  client decode, EC classifier `cluster.rs:11811-11820` typed-only; the
+  `operation` match is a client-local static label). Rollout caveat: no
+  dual-form (string+code) acceptance release was shipped — an older peer
+  receiving code 23/24 fails decode fail-closed, and a new frontend no longer
+  treats an old node's `Internal`-string failure as recoverable, so rolling
+  upgrades across this boundary turn recoverable EC reads into hard read
+  failures (fail-closed, no wrong data). Fine for lockstep deployment; note
+  it in the upgrade/versioning plan.
 
 ### RPC4. MEDIUM (latent until epochs diverge) — Read-handle/delete fencing is keyed by `ShardLocation` including `cluster_epoch`, but the physical shard file is epoch-agnostic
 
@@ -1291,6 +1318,18 @@ Partially fixed.
   the send/connect boundary explicit, for example with variants such as
   `TransportConnect` (no side effect possible) and
   `TransportSendPartial`/`TransportResponseLost` (side effect ambiguous).
+- Round-3 note (2026-07-09): the drift warned about above has half-happened —
+  09805ad6 added `TransportClosed` (which conflates request-write failure and
+  response-read failure, i.e. the ambiguous class) to four retryable
+  classifiers (`cluster.rs:11611-11622`, coordinator
+  `storage_rpc_code_is_retryable_route_state` → client-visible
+  `OperationAborted`, backfill stale-retry `coordinator/runtime.rs:1919`, and
+  the metadata-transfer transient matcher). Every current consumer was traced
+  and is idempotent by durable identity, so this is safe today — but the
+  guardrail item is now more urgent, not less, and the phase information that
+  would enable it (distinct write-phase/read-phase operation labels) is
+  currently discarded by all consumers. Keep this finding open until the
+  taxonomy split lands.
 
 ### RPC6. LOW — `write_shard_file_durable_if_absent` returns `StoreError::NotFound` after losing the create/delete race twice
 
@@ -1473,6 +1512,15 @@ Confirmed mechanics (verified directly); trigger plausible.
   loops are logged/deferred instead of exiting the process. The broader
   CP2/CL4 monotonic-clock/skew-margin policy remains a separate design item
   for production Raft deployment.
+- Round-3 caveat (2026-07-09): the fda75348 recovery carve-out for the
+  forward bound introduced two new high-severity availability regressions —
+  R3-1 (the carve-out predicate is trivially true in a serving cluster, so a
+  far-future clock step at the expiry scan can poison the durable high-water
+  and mass-expire the cluster) and R3-2 (after a clean full expiry plus >1h
+  downtime the carve-out can never fire, permanently wedging re-admission).
+  See the round-3 re-review section. This guard has now produced a new
+  high-severity issue in each of three review rounds; it needs a written
+  invariant and an adversarial-clock proptest, not another point fix.
 
 ### INT-2. HIGH (availability) — The MD4 fix makes a future-epoch pending slot brick the whole node
 
@@ -1537,11 +1585,19 @@ frontend plus concurrent traffic.
   and get blessed into the chain by the slow advance loop when a later
   contiguous insert arrives (legacy data only).
 
-### INT-4. MEDIUM — Bucket-reservation lease coupling breaks replica convergence proofs (17e7d07e / 4c01bac9)
+### INT-4. CORE RESOLVED (round-3, 2026-07-09) / availability sub-items open — Bucket-reservation lease coupling breaks replica convergence proofs (17e7d07e / 4c01bac9)
 
 Confidence: medium — couplings verified in code (the reservation proof
 carries the create-time `lease_deadline`, `metadata_command.rs:949-966`,
 verified); triggers not executed.
+
+Round-3 correction: the first bullet's lease-equality mechanism was already
+identity-based at the round-2 baseline — convergence proof matching uses
+reservation id/bucket/kind/context with `lease_deadline` explicitly excluded
+from the equality (`pg_store/metadata.rs:5540-5599` region, with a comment
+that renewals must not strand replica convergence). The stranded-replica
+scenario is therefore closed. The reaping-without-pending-check, drain-row
+orphan, and fixed-15s-lease sub-items below remain open.
 
 - Convergence revalidation now requires `lease_deadline` equality between
   the command's reservation proof and the live row
@@ -1657,6 +1713,233 @@ peer-auth failures, and retry-confirmation diagnostics are missing.
 6. CP2/CL4 skew margin remains the standing design item feeding INT-1, CL1,
    and the drain/reservation wall-clock comparisons — one time-discipline
    design closes the family.
+
+# Round-3 re-review — 2026-07-09
+
+Re-review of the work between `25f47480` (interim re-review commit) and HEAD
+`09805ad6` (~153 commits). The range is dominated by the control-plane
+authentication slice (plans/control-plane-auth-identity-plan.md, slices A-C)
+plus S3-conformance and golden-test work; the distributed-correctness-relevant
+changes were verified individually. Method: two parallel verification passes
+(auth protocol + Raft; fix verification + open-item sweep), with the
+highest-impact claims re-verified by hand. Per-finding status corrections
+have been folded into the sections above (INT-1 caveat, INT-4 core, RPC3,
+RPC5, MD5); this section holds the auth assessment, the new findings (R3-*),
+and updated priorities.
+
+## Control-plane auth protocol assessment
+
+The new auth surface held up under protocol-level review:
+
+- HMAC-SHA256 over canonical covered bytes (magic, version, cluster id,
+  credential id+version, source principal, target, operation, issued/expires,
+  sequence, nonce, payload — `control_plane_auth.rs:676-694`). Identity, RPC
+  kind, direction, and payload are all bound on every path: Unix paths prefix
+  the payload with the RPC kind (`control_plane.rs:7049-7079`), Raft peer
+  frames cross-check inner frame kind and identity against the auth operation
+  (`control_plane_raft.rs:6851-6918`), and responses are signed with the
+  reversed identity and distinct operations, so request/response reflection
+  and cross-role/cross-node splicing fail closed.
+- Error responses are authenticated (both `Ok` and `Err` payloads are signed
+  before the wire), so an attacker who cannot forge success cannot forge a
+  behavior-changing failure either.
+- Rotation is per-frame with exact id+version+principal matching; a lower
+  version with a higher one configured reports `StaleCredential` rather than
+  authenticating; signers pick the highest version. No dead window if the new
+  credential is staged before the old is removed. Revocation requires process
+  restart (no hot reload) — acceptable pre-production, must be named for
+  cutover.
+- Fail-closed coverage: multi-peer Raft mode requires peer auth credentials
+  at config time (`config.rs:759-766`); the CA1 partial-role gap is enforced
+  in both config validation and verifier construction, so admin mutations
+  cannot be left unauthenticated while any Unix auth is enabled. CA2/CA4/CA7/
+  CA8/CA9 verified fixed from a bypass angle.
+- No regressions introduced: R1 ordering preserved (responses are signed
+  before the durability checkpoint — CPU only — but written to the socket
+  only after it), CP1 resample-under-lock preserved through ac4d2ac6 (clock
+  sampling and mutation stay under the authority mutex; only response
+  serialization moved out), no new I/O under locks.
+
+Residuals (all bounded by the Unix-socket filesystem trust boundary today;
+they become real work items when a TCP/remote transport lands):
+
+- **A1 (MEDIUM-LOW):** the heartbeat auth replay window is sized to the
+  requested lease duration (`control_plane.rs:1018-1028`, up to 10s) with the
+  deadline computed from the server clock at apply. A captured heartbeat
+  envelope replayed near window-end grants a fresh deadline ≈ issue+2× lease —
+  extending a dead node's lease and widening the CP2/CL4 fencing window.
+  Fix: a small fixed freshness bound (like the 5s read window) instead of
+  the lease duration.
+- **A2 (LOW):** responses carry no nonce/sequence echo binding them to their
+  specific request — request→response correspondence rests on the
+  connect-per-RPC transport plus a 5s freshness window. Within that window an
+  on-path attacker can substitute a captured same-kind response (freshness
+  downgrade, not forgery); since freshness proofs still have no production
+  consumers (CP4), the downgrade is not independently caught.
+- **A3 (LOW, by design per the plan's replay policy):** Raft
+  append/vote/pre-vote/snapshot frames use `FencedByPayloadSemantics` — no
+  freshness field; replay protection rests on OpenRaft term/log fences and
+  credential lifetime. Only transfer-leader has a 5s window.
+- **A4 (INFO):** response-verification skew constants are inconsistent
+  (skew-0 for runtime-map, 10ms for admin) — part of the CP2/CL4 zero-skew
+  family.
+
+## Verification results
+
+Fixes verified holding this round: MD5 (`synchronous=FULL`, with the R3-3
+fsync-pressure caveat), RPC3 (typed shard integrity end-to-end, rollout
+caveat), RPC5 partial classification (with the classifier-drift note),
+INT-4's core lease-equality component (identity matching, `lease_deadline`
+excluded), 3a123690 (MPU order-command authorization — build-time only, does
+not extend INT-4), 0a908128 (ambiguous Raft admin triggers → `RpcUnconfirmed`,
+no blind retry), 103e0880 (bounded check-applied timeouts; see the CP8 note
+below), ac4d2ac6 (no CP1 regression), 98723f6d (peer stream helpers now
+`#[cfg(test)]` — closes the INT-6 latent R1 bypass), 7b001de1 (test-only).
+
+INT-1 fix chain (a1b1bf37 → fda75348): the crash-loop behavior is genuinely
+fixed — both loops defer timestamp-guard rejections, heartbeats are
+non-fatal, and a 1h forward bound exists — but the fda75348 carve-out
+introduced R3-1 and R3-2 below.
+
+## New findings (R3-*)
+
+The round-2 pattern continued: the significant new issues are again
+availability regressions introduced by fix work, and both are in the same
+guard the previous two rounds already fixed once each.
+
+### R3-1. HIGH (availability, production path) — the fda75348 carve-out neutralizes the committed-timestamp forward bound; a far-future clock step poisons the high-water durably
+
+Confirmed mechanism (verified directly); trigger is a >1h forward clock step
+(NTP misconfig, VM resume, fat-fingered date).
+
+- `ExpireHeartbeatLeases` skips both the proposal-side deferral and the
+  apply-side `CommittedTimestampTooFarAhead` validation whenever
+  `has_heartbeat_lease_expiring_at(expire_at_ms)` is true
+  (`control_plane.rs:1680-1686`, :3816-3827; Raft loop equivalent). That
+  predicate is `lease_deadline_ms <= t` over live nodes (:908-918) —
+  trivially true for any far-future `t` in a serving cluster, since live
+  deadlines are ≈now+10s. The forward bound is therefore void for this
+  command exactly when the cluster is healthy.
+- Sequence: authority clock steps forward >1h → next expiry scan commits
+  `ExpireHeartbeatLeases{far_future}` → `record_committed_timestamp` ratchets
+  the durable high-water unbounded (:920-924) → every lease expires at once,
+  all PGs → Peering, epoch bump → operator fixes the clock → every heartbeat
+  at real time is rejected `CommittedTimestampRegression` (:1480) until wall
+  clock passes the poisoned value — cluster-wide fail-closed outage of
+  (clock error − 1h), persisted in the state file, recoverable only by
+  manual state surgery.
+- Before fda75348, a1b1bf37's deferral absorbed the identical event with
+  zero state change and immediate recovery on clock fix. The carve-out's
+  legitimate purpose (expiring stale leases after >1h of real downtime) is
+  in-band indistinguishable from the poisoning case.
+- Fix shape: bound what the command may ratchet — expire leases at
+  `expire_at_ms` but advance the high-water by at most
+  `previous + MAX_FORWARD_JUMP` per command — or gate the carve-out on an
+  out-of-band downtime signal (e.g. state-file load-time delta) instead of
+  the trivially-true expiring-lease predicate.
+
+### R3-2. HIGH (availability) — the complementary shape: >1h downtime after a clean full expiry wedges the control plane permanently
+
+Confirmed mechanism (verified directly); ordinary trigger.
+
+- Expiry sets `availability = Unavailable, lease_deadline_ms = None`
+  (`control_plane.rs:1702-1703`), and `has_heartbeat_lease_expiring_at`
+  excludes exactly those records (requires not-Unavailable and a `Some`
+  deadline, :908-918). After an ordered shutdown (storage nodes stop first,
+  the authority's last scans expire them, then the authority stops) followed
+  by a >1h gap: every re-admission `RecordNodeHeartbeat` is rejected
+  `CommittedTimestampTooFarAhead` (:1480), the expiry scan finds no expiring
+  lease so it defers forever, and no command in the set can advance the
+  high-water — including heartbeats from brand-new nodes. Deterministic
+  permanent wedge requiring state surgery.
+- The fda75348 regression test covers only the leases-still-present downtime
+  shape, so it cannot catch this.
+- Fix shape: a bounded high-water catch-up on the heartbeat/re-admission
+  path (or at authority restart), symmetric with the expiry carve-out.
+
+R3-1 and R3-2 are two faces of one flaw: the carve-out is keyed on a signal
+(live expiring leases) that neither distinguishes bogus clocks from real
+downtime (R3-1) nor covers the real-downtime case it was built for once
+leases are already cleared (R3-2). This guard has now produced a
+high-severity availability issue in each of three review rounds. Before the
+next attempt, write down the invariant (suggested: "committed time advances
+at most MAX_JUMP per command regardless of path; every rejection class has a
+bounded, automatic recovery path") and pin it with an adversarial-clock
+proptest — the injectable-clock harness remains the top testing-gap
+recommendation from round 1.
+
+### R3-3. LOW-MEDIUM — `synchronous=FULL` fsync inside the per-PG mutex vs the 500ms lock budget
+
+Folded into the MD5 status update above. Load-dependent availability, not
+correctness; needs an fsync-pressure soak case and the group-commit /
+write-amplification plans before scale testing.
+
+### R3-4. LOW — typed control-plane errors are re-derived by Display-string sniffing after the RPC boundary, and the pattern is spreading
+
+`PgPeeringPendingMetadataCommand` degrades to `RpcRemote{message}` across the
+control-plane RPC and is reconstructed by
+`message.contains("reported unresolved pending metadata command")`
+(`cluster.rs:1379-1382`); the metadata-transfer retry classifiers in
+`argmin-s3/src/main.rs:1280-1306` sniff several more Display shapes, and the
+Raft serving loop's forward-to-leader benign matcher is still a two-substring
+match on OpenRaft alpha error text. Any wording change silently alters
+fencing/drain behavior on the remote path only (interacts with INT-3: the
+sniff gates the cb13fc8b drain machinery). Fix: typed error codes on the
+control-plane RPC error envelope.
+
+### R3-5. INFO — 103e0880's check-applied retry strengthens the case for the CP8 CAS follow-up
+
+The hardened route-change path re-submits `SetPgActingSet` after response
+loss when the observed route epoch equals the pre-update epoch; confirmation
+remains observational, so a delayed retry can still re-impose a stale
+requested set over an intervening admin transition at a newer epoch.
+Last-writer-wins admin semantics, no new mechanism beyond CP8's open
+`expected_cluster_epoch` follow-up — which would eliminate it.
+
+## Open items unchanged this round
+
+INT-2 (future-epoch slot still node-fatal at bind — no per-PG quarantine),
+INT-3 (all components: `>=`-epoch predicate, Recovery lease bypass,
+drain-on-every-error, plus the smaller items), INT-5 (per-syscall timeouts,
+read-handle idle exemption, `PayloadDecode` reuse), CL1 (no deposed-lease
+capture; still the top pre-existing safety gap), CL2 (catch-up still dead
+code; proof mismatch still silent), CP2/CL4 (zero skew margin anywhere),
+CP3, CP4 (still zero freshness-proof consumers), CP5's durable-history half
+(pruning byte-identical; frontend startup still needs the full snapshot RPC
+under the 8MB cap), CP6/CP7, CP9/CP10/CP11, CL5/CL6/CL7, RPC4/RPC6/RPC7/RPC9,
+MD6 (the stale primary-last sentence is now two rounds old — one-line fix),
+MD7, and INT-6 a/b/d/e/f (torn-WAL tail shapes, first-startup crash window,
+WAL-poison gate bridge, artifact↔WAL generation binding, transient exit(1)
+classes).
+
+## Round-3 priorities
+
+1. **R3-1/R3-2** — redesign the committed-timestamp carve-out (bounded
+   ratchet + re-admission catch-up), with the written invariant and
+   adversarial-clock proptest. Same availability tier as INT-2.
+2. **INT-2** — per-PG bind quarantine (unchanged since round 2).
+3. **CL1** — deposed-lease capture scaffolding, then the wait-out fence on
+   all Active-exit transitions (unchanged since round 1; still the top
+   pre-existing safety gap).
+4. **A1** — shrink the heartbeat auth replay window to a fixed freshness
+   bound; cheap and directly narrows the CP2/CL4 fencing exposure.
+5. **INT-3 tightening, CP5's remaining half, and the R3-3 fsync/contention
+   interaction** before any load/scale testing.
+6. **Phase 12.4 exit criteria with no code yet:** Raft peer transport auth
+   enforcement beyond the identity envelope, the Raft retry/confirmation
+   contract, and replacing the substring benign-error matching (R3-4) with
+   typed classification.
+7. **CP2/CL4 skew margin** remains the standing design item feeding R3-1/R3-2,
+   CL1, A1, and the drain/reservation wall-clock comparisons — one
+   time-discipline design closes the family.
+
+Meta-observation across three rounds: fix throughput is high and most
+findings close cleanly, but the committed-timestamp / lease-time guard has
+produced a new high-severity availability issue in every round (INT-1 in the
+interim pass, then R3-1/R3-2 from its fix). That subsystem should not receive
+another point fix without a written invariant and an adversarial-clock
+proptest first — the injectable-clock harness is now the highest-value
+testing investment.
 
 # Hardening plan
 
