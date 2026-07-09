@@ -1196,21 +1196,22 @@ fn parse_control_plane_raft_auth_credentials(
 
     let mut entries = Vec::new();
     let mut seen = HashSet::<(u64, String, u64)>::new();
-    for raw in value.split(',') {
+    for (entry_index, raw) in value.split(',').enumerate() {
+        let entry_number = entry_index + 1;
         let trimmed = raw.trim();
         if trimmed.is_empty() {
-            return Err(
-                "ARGMIN_CONTROL_PLANE_RAFT_AUTH_CREDENTIALS contains an empty entry".to_string(),
-            );
+            return Err(format!(
+                "ARGMIN_CONTROL_PLANE_RAFT_AUTH_CREDENTIALS entry {entry_number} is empty"
+            ));
         }
         let (raw_node_id, raw_credential) = trimmed.split_once('=').ok_or_else(|| {
             format!(
-                "ARGMIN_CONTROL_PLANE_RAFT_AUTH_CREDENTIALS entry {trimmed:?} must be node_id=credential_id:version:secret"
+                "ARGMIN_CONTROL_PLANE_RAFT_AUTH_CREDENTIALS entry {entry_number} must be node_id=credential_id:version:secret"
             )
         })?;
         let node_id: u64 = raw_node_id.trim().parse().map_err(|e| {
             format!(
-                "invalid ARGMIN_CONTROL_PLANE_RAFT_AUTH_CREDENTIALS node id {raw_node_id:?}: {e}"
+                "invalid ARGMIN_CONTROL_PLANE_RAFT_AUTH_CREDENTIALS node id in entry {entry_number}: {e}"
             )
         })?;
         if node_id == 0 {
@@ -1233,7 +1234,7 @@ fn parse_control_plane_raft_auth_credentials(
         }
         let credential_version: u64 = raw_version.parse().map_err(|e| {
             format!(
-                "invalid ARGMIN_CONTROL_PLANE_RAFT_AUTH_CREDENTIALS credential version {raw_version:?} for node {node_id}: {e}"
+                "invalid ARGMIN_CONTROL_PLANE_RAFT_AUTH_CREDENTIALS credential version for node {node_id}: {e}"
             )
         })?;
         if credential_version == 0 {
@@ -1281,21 +1282,22 @@ fn parse_control_plane_storage_auth_credentials(
 
     let mut entries = Vec::new();
     let mut seen = HashSet::<(u32, String, u64)>::new();
-    for raw in value.split(',') {
+    for (entry_index, raw) in value.split(',').enumerate() {
+        let entry_number = entry_index + 1;
         let trimmed = raw.trim();
         if trimmed.is_empty() {
-            return Err(
-                "ARGMIN_CONTROL_PLANE_STORAGE_AUTH_CREDENTIALS contains an empty entry".to_string(),
-            );
+            return Err(format!(
+                "ARGMIN_CONTROL_PLANE_STORAGE_AUTH_CREDENTIALS entry {entry_number} is empty"
+            ));
         }
         let (raw_node_id, raw_credential) = trimmed.split_once('=').ok_or_else(|| {
             format!(
-                "ARGMIN_CONTROL_PLANE_STORAGE_AUTH_CREDENTIALS entry {trimmed:?} must be node_id=credential_id:version:secret"
+                "ARGMIN_CONTROL_PLANE_STORAGE_AUTH_CREDENTIALS entry {entry_number} must be node_id=credential_id:version:secret"
             )
         })?;
         let node_id: u32 = raw_node_id.trim().parse().map_err(|e| {
             format!(
-                "invalid ARGMIN_CONTROL_PLANE_STORAGE_AUTH_CREDENTIALS node id {raw_node_id:?}: {e}"
+                "invalid ARGMIN_CONTROL_PLANE_STORAGE_AUTH_CREDENTIALS node id in entry {entry_number}: {e}"
             )
         })?;
         let mut parts = raw_credential.splitn(3, ':');
@@ -1313,7 +1315,7 @@ fn parse_control_plane_storage_auth_credentials(
         }
         let credential_version: u64 = raw_version.parse().map_err(|e| {
             format!(
-                "invalid ARGMIN_CONTROL_PLANE_STORAGE_AUTH_CREDENTIALS credential version {raw_version:?} for node {node_id}: {e}"
+                "invalid ARGMIN_CONTROL_PLANE_STORAGE_AUTH_CREDENTIALS credential version for node {node_id}: {e}"
             )
         })?;
         if credential_version == 0 {
@@ -1361,17 +1363,17 @@ fn parse_control_plane_frontend_auth_credentials(
 
     let mut entries = Vec::new();
     let mut seen = HashSet::<(String, String, u64)>::new();
-    for raw in value.split(',') {
+    for (entry_index, raw) in value.split(',').enumerate() {
+        let entry_number = entry_index + 1;
         let trimmed = raw.trim();
         if trimmed.is_empty() {
-            return Err(
-                "ARGMIN_CONTROL_PLANE_FRONTEND_AUTH_CREDENTIALS contains an empty entry"
-                    .to_string(),
-            );
+            return Err(format!(
+                "ARGMIN_CONTROL_PLANE_FRONTEND_AUTH_CREDENTIALS entry {entry_number} is empty"
+            ));
         }
         let (raw_instance_id, raw_credential) = trimmed.split_once('=').ok_or_else(|| {
             format!(
-                "ARGMIN_CONTROL_PLANE_FRONTEND_AUTH_CREDENTIALS entry {trimmed:?} must be instance_id=credential_id:version:secret"
+                "ARGMIN_CONTROL_PLANE_FRONTEND_AUTH_CREDENTIALS entry {entry_number} must be instance_id=credential_id:version:secret"
             )
         })?;
         let instance_id = raw_instance_id.trim();
@@ -1390,7 +1392,7 @@ fn parse_control_plane_frontend_auth_credentials(
         }
         let credential_version: u64 = raw_version.parse().map_err(|e| {
             format!(
-                "invalid ARGMIN_CONTROL_PLANE_FRONTEND_AUTH_CREDENTIALS credential version {raw_version:?} for instance {instance_id}: {e}"
+                "invalid ARGMIN_CONTROL_PLANE_FRONTEND_AUTH_CREDENTIALS credential version for instance {instance_id}: {e}"
             )
         })?;
         if credential_version == 0 {
@@ -1442,16 +1444,17 @@ fn parse_control_plane_admin_auth_credentials(
 
     let mut entries = Vec::new();
     let mut seen = HashSet::<(String, String, u64)>::new();
-    for raw in value.split(',') {
+    for (entry_index, raw) in value.split(',').enumerate() {
+        let entry_number = entry_index + 1;
         let trimmed = raw.trim();
         if trimmed.is_empty() {
-            return Err(
-                "ARGMIN_CONTROL_PLANE_ADMIN_AUTH_CREDENTIALS contains an empty entry".to_string(),
-            );
+            return Err(format!(
+                "ARGMIN_CONTROL_PLANE_ADMIN_AUTH_CREDENTIALS entry {entry_number} is empty"
+            ));
         }
         let (raw_instance_id, raw_credential) = trimmed.split_once('=').ok_or_else(|| {
             format!(
-                "ARGMIN_CONTROL_PLANE_ADMIN_AUTH_CREDENTIALS entry {trimmed:?} must be instance_id=credential_id:version:secret"
+                "ARGMIN_CONTROL_PLANE_ADMIN_AUTH_CREDENTIALS entry {entry_number} must be instance_id=credential_id:version:secret"
             )
         })?;
         let instance_id = raw_instance_id.trim();
@@ -1467,7 +1470,7 @@ fn parse_control_plane_admin_auth_credentials(
         }
         let credential_version: u64 = raw_version.parse().map_err(|e| {
             format!(
-                "invalid ARGMIN_CONTROL_PLANE_ADMIN_AUTH_CREDENTIALS credential version {raw_version:?} for instance {instance_id}: {e}"
+                "invalid ARGMIN_CONTROL_PLANE_ADMIN_AUTH_CREDENTIALS credential version for instance {instance_id}: {e}"
             )
         })?;
         if credential_version == 0 {
@@ -1745,6 +1748,29 @@ mod tests {
             "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=",
         );
         m
+    }
+
+    fn assert_auth_credential_parse_error_redacts_secret<T, F>(
+        parser: F,
+        value: &str,
+        expected_message: &str,
+        secret: &str,
+    ) where
+        F: FnOnce(Option<String>) -> Result<Vec<T>, String>,
+    {
+        let err = match parser(Some(value.to_owned())) {
+            Ok(_) => panic!("auth credential parser unexpectedly accepted {value:?}"),
+            Err(err) => err,
+        };
+        assert!(err.contains(expected_message), "unexpected error: {err}");
+        assert!(
+            !err.contains(secret),
+            "auth credential parse error leaked secret {secret:?}: {err}"
+        );
+        assert!(
+            !err.contains(value),
+            "auth credential parse error leaked raw entry {value:?}: {err}"
+        );
     }
 
     fn lookup<'a>(m: &'a HashMap<&'a str, &'a str>) -> impl Fn(&str) -> Option<String> + 'a {
@@ -2301,6 +2327,58 @@ mod tests {
         .unwrap_err();
 
         assert!(err.contains("duplicate credential identity for node 1"));
+    }
+
+    #[test]
+    fn control_plane_auth_credential_parse_errors_redact_raw_entries_and_secrets() {
+        assert_auth_credential_parse_error_redacts_secret(
+            parse_control_plane_raft_auth_credentials,
+            "11:raft-peer:1:raft-leaked-secret",
+            "entry 1 must be node_id=credential_id:version:secret",
+            "raft-leaked-secret",
+        );
+        assert_auth_credential_parse_error_redacts_secret(
+            parse_control_plane_raft_auth_credentials,
+            "11=raft-peer:raft-leaked-version-secret",
+            "credential version for node 11",
+            "raft-leaked-version-secret",
+        );
+        assert_auth_credential_parse_error_redacts_secret(
+            parse_control_plane_storage_auth_credentials,
+            "1:storage-node:1:storage-leaked-secret",
+            "entry 1 must be node_id=credential_id:version:secret",
+            "storage-leaked-secret",
+        );
+        assert_auth_credential_parse_error_redacts_secret(
+            parse_control_plane_storage_auth_credentials,
+            "1=storage-node:storage-leaked-version-secret",
+            "credential version for node 1",
+            "storage-leaked-version-secret",
+        );
+        assert_auth_credential_parse_error_redacts_secret(
+            parse_control_plane_frontend_auth_credentials,
+            "frontend-a:frontend:1:frontend-leaked-secret",
+            "entry 1 must be instance_id=credential_id:version:secret",
+            "frontend-leaked-secret",
+        );
+        assert_auth_credential_parse_error_redacts_secret(
+            parse_control_plane_frontend_auth_credentials,
+            "frontend-a=frontend:frontend-leaked-version-secret",
+            "credential version for instance frontend-a",
+            "frontend-leaked-version-secret",
+        );
+        assert_auth_credential_parse_error_redacts_secret(
+            parse_control_plane_admin_auth_credentials,
+            "admin-a:admin:1:admin-leaked-secret",
+            "entry 1 must be instance_id=credential_id:version:secret",
+            "admin-leaked-secret",
+        );
+        assert_auth_credential_parse_error_redacts_secret(
+            parse_control_plane_admin_auth_credentials,
+            "admin-a=admin:admin-leaked-version-secret",
+            "credential version for instance admin-a",
+            "admin-leaked-version-secret",
+        );
     }
 
     #[test]

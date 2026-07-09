@@ -524,13 +524,18 @@ ranked:
   explicitly, while transfer-leader uses a bounded timestamp policy. The Unix
   read/admin/heartbeat and Raft peer per-path freshness validators were removed.
 
-- [ ] **CA3. Credential env parse errors echo the raw entry, which contains the
+- [x] **CA3. Credential env parse errors echo the raw entry, which contains the
   secret.** All four parsers format the offending entry into the error
   (`argmin-s3/src/config.rs:1193, 1278, 1359, 1439`), so a malformed
   `RAFT_AUTH_CREDENTIALS`/storage/frontend/admin entry (e.g. a missing `=`)
   puts the secret verbatim into a startup error to stderr/logs/supervisors —
   undercutting the otherwise consistent `SecretConfigValue` redaction. Fix:
-  report entry index/node-id only, never the raw entry text.
+  report entry index/node-id only, never the raw entry text. Resolution: auth
+  credential parser errors now identify malformed entries by env var and entry
+  number until a safe principal id is parsed, and credential-version failures no
+  longer echo the raw version field. Added regressions for Raft, storage,
+  frontend, and admin credential parsing covering missing `=` and missing
+  version fields without leaking the raw entry or secret.
 
 - [x] **CA4. Expired envelope misclassified as `StaleCredential`.**
   `control_plane_auth.rs:466-471` returns `StaleCredential` for
