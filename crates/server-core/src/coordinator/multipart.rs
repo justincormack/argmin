@@ -24,8 +24,7 @@ use super::response_types::{
 };
 use super::{
     compute_checksum, optional_list_object_key, Coordinator,
-    COMPLETED_MULTIPART_UPLOADS_PER_BUCKET_LIMIT, MAX_LIST_RECORDS, MAX_PARTS, MIN_PART_SIZE,
-    TRACE_TARGET,
+    COMPLETED_MULTIPART_UPLOADS_PER_BUCKET_LIMIT, MAX_PARTS, MIN_PART_SIZE, TRACE_TARGET,
 };
 #[cfg(test)]
 use super::{
@@ -914,8 +913,8 @@ impl Coordinator {
 
     /// List in-progress multipart uploads for a bucket.
     ///
-    /// Fans out across all PGs, merges results sorted by (key, upload_id),
-    /// and applies pagination.
+    /// Fans out across all PGs, merges results sorted by
+    /// (key, initiated_at, upload_id), and applies pagination.
     pub fn list_multipart_uploads(
         &self,
         req: &ListMultipartUploadsRequest,
@@ -945,7 +944,6 @@ impl Coordinator {
 
         let storage::ListedBucketMultipartUploads {
             uploads: mut all_uploads,
-            hit_record_cap,
         } = self
             .storage_node()
             .list_multipart_uploads_for_bucket(
@@ -953,7 +951,6 @@ impl Coordinator {
                 optional_list_object_key(prefix)?.as_ref(),
                 optional_list_object_key(key_marker)?.as_ref(),
                 upload_id_marker,
-                MAX_LIST_RECORDS,
                 max_uploads,
             )
             .map_err(Self::map_object_pg_action_error)?;
@@ -966,7 +963,7 @@ impl Coordinator {
         });
 
         let max = max_uploads as usize;
-        let is_truncated = hit_record_cap || all_uploads.len() > max;
+        let is_truncated = all_uploads.len() > max;
         all_uploads.truncate(max);
 
         let (next_key_marker, next_upload_id_marker) = if is_truncated {

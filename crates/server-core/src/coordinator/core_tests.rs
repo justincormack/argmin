@@ -4219,6 +4219,155 @@ fn list_objects_continuation_survives_epoch_change_between_pages() {
 }
 
 #[test]
+fn list_objects_paginates_global_order_when_smallest_keys_are_on_last_pg() {
+    let bucket = "list-global-order-bucket";
+    let tmp = test_util::tempdir();
+    let storage_cluster = open_test_storage_cluster(tmp.path(), &[0, 1, 2]);
+    let pg_ids = storage_cluster.test_pg_ids().to_vec();
+    let coord = setup_same_process_coordinator_with_storage_cluster_without_background_sweepers(
+        Arc::clone(&storage_cluster),
+    );
+    coord
+        .create_bucket_for_owner("default-owner", bucket, false)
+        .unwrap();
+
+    let mut expected = Vec::new();
+    for (pg_id, lexical_prefix) in [(pg_ids[0], "z/"), (pg_ids[1], "m/"), (pg_ids[2], "a/")] {
+        for index in 0..4 {
+            let key = find_key_for_object_metadata_pg_with_prefix(
+                &storage_cluster,
+                bucket,
+                pg_id,
+                &format!("{lexical_prefix}{index}/"),
+            );
+            test_helpers::put_object(
+                &coord,
+                &PutObjectRequest {
+                    encryption: WriteEncryptionRequest::none(),
+                    policy_context: PutObjectPolicyContext::default(),
+                    object_lock: ObjectLockState::default(),
+                    object: object_request_with_expected_owner(
+                        bucket,
+                        &key,
+                        test_requester(),
+                        None,
+                    ),
+                    data: key.as_bytes(),
+                    metadata: &MetadataBlob::new(),
+                    system_metadata: &SystemMetadata::EMPTY,
+                    tags: None,
+                    cond: NO_WRITE,
+                    acl: NO_PUT_OBJECT_ACL.into(),
+                },
+            )
+            .unwrap();
+            expected.push(key);
+        }
+    }
+    expected.sort();
+
+    let mut actual = Vec::new();
+    let mut continuation_token = None;
+    loop {
+        let page = coord
+            .list_objects_v2(&ListObjectsV2Request {
+                bucket: bucket_request_with_expected_owner(bucket, test_requester(), None),
+                prefix: None,
+                delimiter: None,
+                continuation_token: continuation_token.as_deref(),
+                max_keys: 2,
+                requested_max_keys: Some(2),
+            })
+            .unwrap();
+        actual.extend(page.objects.into_iter().map(|object| object.key));
+        if !page.is_truncated {
+            break;
+        }
+        continuation_token = page.next_continuation_token;
+        assert!(continuation_token.is_some());
+        assert!(actual.len() <= expected.len());
+    }
+
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn list_multipart_uploads_paginates_global_order_when_smallest_keys_are_on_last_pg() {
+    let bucket = "mpu-list-global-order-bucket";
+    let tmp = test_util::tempdir();
+    let storage_cluster = open_test_storage_cluster(tmp.path(), &[0, 1, 2]);
+    let pg_ids = storage_cluster.test_pg_ids().to_vec();
+    let coord = setup_same_process_coordinator_with_storage_cluster_without_background_sweepers(
+        Arc::clone(&storage_cluster),
+    );
+    coord
+        .create_bucket_for_owner("default-owner", bucket, false)
+        .unwrap();
+
+    let mut expected = Vec::new();
+    for (pg_id, lexical_prefix) in [(pg_ids[0], "z/"), (pg_ids[1], "m/"), (pg_ids[2], "a/")] {
+        for index in 0..4 {
+            let key = find_key_for_object_metadata_pg_with_prefix(
+                &storage_cluster,
+                bucket,
+                pg_id,
+                &format!("{lexical_prefix}{index}/"),
+            );
+            let upload = coord
+                .create_multipart_upload(&CreateMultipartUploadRequest {
+                    object: object_request_with_expected_owner(
+                        bucket,
+                        &key,
+                        test_requester(),
+                        None,
+                    ),
+                    metadata: &MetadataBlob::new(),
+                    system_metadata: &SystemMetadata::EMPTY,
+                    tags: None,
+                    checksum: None,
+                    acl: NO_PUT_OBJECT_ACL.into(),
+                    encryption: WriteEncryptionRequest::none(),
+                    object_lock: ObjectLockState::default(),
+                    policy_context: PutObjectPolicyContext::default(),
+                })
+                .unwrap();
+            expected.push((key, upload.upload_id));
+        }
+    }
+    expected.sort_by(|left, right| left.0.cmp(&right.0));
+
+    let mut actual = Vec::new();
+    let mut key_marker = None;
+    let mut upload_id_marker = None;
+    loop {
+        let page = coord
+            .list_multipart_uploads(&ListMultipartUploadsRequest {
+                bucket: bucket_request_with_expected_owner(bucket, test_requester(), None),
+                prefix: None,
+                key_marker: key_marker.as_deref(),
+                upload_id_marker: upload_id_marker.clone(),
+                max_uploads: 2,
+            })
+            .unwrap();
+        actual.extend(
+            page.uploads
+                .into_iter()
+                .map(|upload| (upload.key, upload.upload_id)),
+        );
+        if !page.is_truncated {
+            break;
+        }
+        key_marker = page.next_key_marker;
+        upload_id_marker = page.next_upload_id_marker;
+        assert!(key_marker.is_some());
+        assert!(upload_id_marker.is_some());
+        assert!(actual.len() <= expected.len());
+    }
+
+    assert_eq!(actual, expected);
+}
+
+#[test]
 fn list_objects_delimiter_continuation_survives_epoch_change_between_pages() {
     let bucket = "list-delimiter-continuation-epoch-change-bucket";
     let tmp = test_util::tempdir();

@@ -254,9 +254,6 @@ const BUCKET_FAST_PATH_WATCH_INTERVAL_MILLIS: u64 = 50;
 #[cfg(not(test))]
 const BUCKET_FAST_PATH_WATCH_INTERVAL_MILLIS: u64 = 1000;
 
-/// Hard cap on total records fetched across all PGs for a single list query.
-/// Prevents unbounded memory when delimiter causes u32::MAX per-PG limits.
-const MAX_LIST_RECORDS: usize = 100_000;
 const S3_MAX_LIST_KEYS: u32 = 1_000;
 
 /// Minimum part size for non-final parts (5 MiB).

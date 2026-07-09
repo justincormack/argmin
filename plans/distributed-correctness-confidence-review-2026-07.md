@@ -24,14 +24,15 @@ the failure has already been reproduced in a process test.
 
 Phase 11 should not yet be treated as production-ready, and Phase 12 should not
 be used to close Phase 11 correctness work. Three new high-severity mechanisms
-are present in the current tree:
+were present at the review baseline:
 
 1. route and lease authorization is checked before a mutation, but is not
    atomic with that mutation;
 2. the committed-timestamp clamp does not clamp the serving lease deadline, so
    a forward authority-clock error can still mint a far-future lease; and
-3. two cross-PG listing paths cap an arbitrary prefix of PG results before the
-   global merge, which can permanently omit valid records from pagination.
+3. two cross-PG listing paths capped an arbitrary prefix of PG results before
+   the global merge, which could permanently omit valid records from
+   pagination. DCC-3 records the completed correction.
 
 The earlier review's `CL1`, `CL2`, `CP2`, `CP3`, `CP4`, `CP5`, `INT-2`,
 `INT-3`, and `RPC4` findings also remain material. Several are availability
@@ -209,17 +210,18 @@ Required property test:
   The current property strategies monotonically add small increments to one
   `now_ms`, so they cannot find this class.
 
-### DCC-3. HIGH - cap-before-merge can permanently omit LIST results
+### DCC-3. HIGH - cap-before-merge can permanently omit LIST results - FIXED
 
 Confidence: confirmed. The failure requires enough populated metadata PGs to
 hit the global record cap; it can be reproduced with a lower injected cap in a
 focused test.
 
-The no-delimiter `ListObjectsV2` path queries PGs sequentially. Each PG returns
-up to `max_keys + 1` objects. Once the concatenated vector reaches
-`record_cap`, the code truncates it and stops querying PGs; only then does it
-sort the retained records globally (`request_ops.rs:7727-7753`). The production
-coordinator passes `MAX_LIST_RECORDS = 100_000`
+At the review baseline, the no-delimiter `ListObjectsV2` path queried PGs
+sequentially. Each PG returned up to `max_keys + 1` objects. Once the
+concatenated vector reached `record_cap`, the code truncated it and stopped
+querying PGs; only then did it sort the retained records globally
+(`request_ops.rs:7727-7753`). The production coordinator passed
+`MAX_LIST_RECORDS = 100_000`
 (`server-core/src/coordinator.rs:259`, `coordinator/listing.rs:52-61`).
 
 At `max-keys=1000`, 100 populated PGs can cross the cap. Records late in the
@@ -229,26 +231,65 @@ whole PGs are not queried. A discarded or unqueried key can sort before the
 continuation token (`request_ops.rs:7755-7771`), so the omitted smaller key is
 filtered out by every later page and may never be returned.
 
-`ListMultipartUploads` repeats the same shape: stop and truncate before the
-coordinator's global key/upload ordering (`request_ops.rs:12606-12635`,
-`coordinator/multipart.rs:940-979`). This contradicts the no-partial-list
-result required by Phase 11 exit criterion 7, even without an epoch transition.
+`ListMultipartUploads` repeated the same shape: stop and truncate before the
+coordinator's global `(key, initiated_at, upload_id)` ordering
+(`request_ops.rs:12606-12635`, `coordinator/multipart.rs:940-979`). This
+contradicts the no-partial-list result required by Phase 11 exit criterion 7,
+even without an epoch transition.
 
-The delimiter and object-version paths already use per-PG cursors and a k-way
-merge. The fix should extract that into a reusable bounded merge for objects,
-versions, and multipart uploads. A memory cap may bound page size or cursor
-buffers, but it cannot discard an arbitrary PG prefix before the global first
-N records are known.
+The delimiter and object-version paths already used per-PG cursors and a k-way
+merge, but copying that implementation directly would have retained up to
+`O(metadata PG count * max_keys)` records. The no-delimiter object and
+multipart-upload paths have a simpler bounded solution: query every PG for its
+first `max + 1` ordered records, feed each response into a reusable bounded
+global selector, and retain only the smallest `max + 1` unique records seen so
+far. Later records from one PG cannot enter the global first `max + 1` because
+that PG response is already ordered and contains its first `max + 1` records.
+The selected design orders objects by key and multipart uploads by
+`(key, initiated_at, upload_id)`.
 
-Required regressions:
+This keeps peak retained records at `O(max_keys)` for the global selector plus
+one `O(max_keys)` PG response, independent of PG count. Every PG must still be
+queried before returning a page: a memory cap may bound the candidate set, but
+it cannot discard an arbitrary PG prefix before the global first N records are
+known. The existing cursor merge remains appropriate for delimiter grouping
+and object-version pagination and does not need to be generalized as part of
+this fix.
 
-1. With a small injected cap, put lexically small records on the last PG and
-   large records on earlier PGs. Walk every continuation page and assert exact
-   equality with a reference global sort, with no omissions or duplicates.
-2. Run the production `100_000` cap with at least 100 metadata PGs as a scale
-   test.
-3. Repeat for multipart upload `(key, upload_id)` ordering and for route-map
-   expiry during cursor refill.
+Resolution: the arbitrary `MAX_LIST_RECORDS` concatenation cap and
+`hit_record_cap` result state were removed. No-delimiter object and multipart
+listing now query every metadata PG and feed each ordered PG response into a
+bounded ordered selector that retains only the global smallest `max + 1`
+records. Object candidates are unique and ordered by key; multipart candidates
+are unique and ordered by `(key, initiated_at, upload_id)`. The selector never
+temporarily exceeds its capacity, so retained global candidates remain
+`O(max_keys)` independent of metadata PG count. A route error or expiry from
+any later PG still fails the entire request rather than returning the retained
+prefix.
+
+Regression evidence:
+
+1. `list_objects_paginates_global_order_when_smallest_keys_are_on_last_pg` and
+   `list_multipart_uploads_paginates_global_order_when_smallest_keys_are_on_last_pg`
+   put lexically small records on the last of three real metadata PGs, walk
+   every two-record continuation page, and assert exact equality with an
+   independent global ordering.
+2. `object_and_multipart_listing_select_global_first_page_at_production_cap_volume`
+   opens 100 real SQLite metadata PGs and seeds every PG with 1,001 objects and
+   1,001 multipart uploads. Lexically smaller records are assigned to later
+   PGs. The test crosses the former 100,000-record cap in both production
+   listing paths and verifies that the global first page comes entirely from
+   the correct final PG.
+3. `production_scale_selection_is_bounded_across_one_hundred_pgs` feeds the
+   production selector 100 ordered PG result streams of 1,001 records each,
+   reproducing the former 100,100-candidate boundary while asserting after
+   every insertion that no more than 1,001 records are retained.
+   `selection_matches_reference_global_sort` independently property-tests the
+   selector against a global sort and deduplication model over varying inputs
+   and capacities.
+4. `composite_bucket_listings_fail_closed_when_route_map_expires_during_pg_scan`
+   expires the pinned route map after the first PG result and verifies that
+   both object and multipart listing reject the request on the next PG.
 
 ### DCC-4. MEDIUM - load-bearing control-plane invariant checks disappear in release builds
 
@@ -550,8 +591,8 @@ because the current stochastic failures can take hours to recur.
    the deterministic pause-at-commit transition test.
 2. Replace the timestamp/lease design in DCC-2 with an explicit clock fault
    model and multi-clock property test.
-3. Fix DCC-3 using a reusable bounded k-way merge and pin complete pagination
-   at production PG counts.
+3. **Completed:** fix DCC-3 with bounded global smallest-`N` selection and pin
+   complete pagination plus the 100-PG/100,100-record selector boundary.
 4. Contain recovery failures per PG (`INT-2`), then connect retained-log
    catch-up to the production Peering state machine (`CL2`).
 5. Fence physical shard identity across epochs (`RPC4`) and narrow historical
@@ -565,7 +606,7 @@ because the current stochastic failures can take hours to recur.
    production-readiness gate and add operational recovery drills.
 
 Phase 12 improves control-plane availability and ordering, but it does not
-repair a storage-node fencing race, a cross-host lease model, cross-PG listing,
-or PG recovery by itself. The production gate should therefore be expressed in
-terms of the invariants above, not simply completion of the Raft integration
-checklist.
+repair a storage-node fencing race, a cross-host lease model, or PG recovery by
+itself. DCC-3's cross-PG listing defect was corrected independently. The
+production gate should therefore be expressed in terms of the invariants
+above, not simply completion of the Raft integration checklist.

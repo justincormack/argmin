@@ -5,7 +5,7 @@ use super::maybe_run_list_objects_before_storage_hook;
 use super::{
     optional_list_object_key, AuthorizedListObjectVersions, AuthorizedListObjectsV2, Coordinator,
     ListEntry, ListObjectVersionsRequest, ListObjectVersionsResult, ListObjectsResult,
-    ListObjectsV2Request, VersionEntry, MAX_LIST_RECORDS, S3_MAX_LIST_KEYS, TRACE_TARGET,
+    ListObjectsV2Request, VersionEntry, S3_MAX_LIST_KEYS, TRACE_TARGET,
 };
 use crate::error::ServerError;
 
@@ -55,7 +55,6 @@ impl Coordinator {
                 list_prefix.as_ref(),
                 delimiter,
                 list_start_after.as_ref(),
-                MAX_LIST_RECORDS,
                 max_keys,
             )
             .map_err(Self::map_object_pg_action_error)?;

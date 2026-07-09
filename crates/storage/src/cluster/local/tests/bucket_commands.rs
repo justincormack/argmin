@@ -44,7 +44,7 @@ fn composite_object_listings_fan_out_to_routed_pg_primaries() {
     );
 
     let listed = cluster
-        .list_objects_for_bucket(&bucket, None, None, None, 100, 100)
+        .list_objects_for_bucket(&bucket, None, None, None, 100)
         .unwrap();
     assert_eq!(
         listed
@@ -57,7 +57,7 @@ fn composite_object_listings_fan_out_to_routed_pg_primaries() {
 
     let prefix = crate::ObjectKey::try_from("dir/".to_string()).unwrap();
     let delimited = cluster
-        .list_objects_for_bucket(&bucket, Some(&prefix), Some("/"), None, 100, 100)
+        .list_objects_for_bucket(&bucket, Some(&prefix), Some("/"), None, 100)
         .unwrap();
     assert!(delimited.objects.is_empty());
     assert_eq!(
@@ -94,6 +94,85 @@ fn composite_object_listings_fan_out_to_routed_pg_primaries() {
 }
 
 #[test]
+fn object_and_multipart_listing_select_global_first_page_at_production_cap_volume() {
+    const PG_COUNT: u32 = 100;
+    const RECORDS_PER_PG: usize = 1_001;
+    const MAX_KEYS: u32 = 1_000;
+
+    let tmp = test_util::tempdir();
+    let node_id = NodeId::new(0);
+    let pg_ids = (0..PG_COUNT).collect::<Vec<_>>();
+    let map =
+        LocalClusterMap::open(tmp.path(), &[node_id], &pg_ids, EcShape { k: 1, m: 0 }).unwrap();
+    let bucket = crate::BucketName::try_from("listing-scale-bucket".to_string()).unwrap();
+    let node = map.node(node_id).unwrap().storage_node();
+    let topology = node.pg_topology();
+    let mut expected_smallest_pg_keys = Vec::new();
+    let mut expected_smallest_pg_uploads = Vec::new();
+
+    for pg_id in pg_ids.iter().copied() {
+        let lexical_group = PG_COUNT - 1 - pg_id;
+        let mut keys = Vec::with_capacity(RECORDS_PER_PG);
+        for rank in 0..RECORDS_PER_PG {
+            keys.push(key_for_object_pg(
+                topology,
+                &bucket,
+                pg_id,
+                &format!("{lexical_group:03}/{rank:04}/"),
+            ));
+        }
+        let uploads = keys
+            .iter()
+            .enumerate()
+            .map(|(rank, key)| {
+                (
+                    key.clone(),
+                    upload_id_from_label(&format!("listing{pg_id:03}{rank:04}")),
+                )
+            })
+            .collect::<Vec<_>>();
+        if lexical_group == 0 {
+            expected_smallest_pg_keys.clone_from(&keys);
+            expected_smallest_pg_uploads.clone_from(&uploads);
+        }
+        let pg = node.get_pg(pg_id).unwrap();
+        pg.test_insert_listing_objects(&bucket, &keys).unwrap();
+        pg.test_insert_listing_multipart_uploads(&bucket, &uploads)
+            .unwrap();
+        pg.refresh_metadata_command_state_digest().unwrap();
+    }
+
+    let cluster = crate::StorageCluster::from_local_map(Arc::new(map)).unwrap();
+    let listed = cluster
+        .list_objects_for_bucket(&bucket, None, None, None, MAX_KEYS)
+        .unwrap();
+    let listed_keys = listed
+        .objects
+        .iter()
+        .map(|object| object.key())
+        .collect::<Vec<_>>();
+    let expected = expected_smallest_pg_keys[..MAX_KEYS as usize]
+        .iter()
+        .collect::<Vec<_>>();
+
+    assert_eq!(listed_keys, expected);
+    assert!(listed.is_truncated);
+    assert_eq!(
+        listed.next_continuation_token.as_ref(),
+        expected_smallest_pg_keys.get(MAX_KEYS as usize - 1)
+    );
+
+    let listed_uploads = cluster
+        .list_multipart_uploads_for_bucket(&bucket, None, None, None, MAX_KEYS)
+        .unwrap()
+        .uploads
+        .into_iter()
+        .map(|upload| (upload.key, upload.upload_id))
+        .collect::<Vec<_>>();
+    assert_eq!(listed_uploads, expected_smallest_pg_uploads);
+}
+
+#[test]
 fn composite_bucket_listings_fail_closed_while_any_metadata_pg_is_peering() {
     let tmp = test_util::tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
@@ -120,7 +199,7 @@ fn composite_bucket_listings_fail_closed_while_any_metadata_pg_is_peering() {
     let cluster = crate::StorageCluster::from_local_map(map).unwrap();
 
     let err = cluster
-        .list_objects_for_bucket(&bucket, None, None, None, 100, 100)
+        .list_objects_for_bucket(&bucket, None, None, None, 100)
         .unwrap_err();
     assert!(matches!(
         err,
@@ -144,7 +223,7 @@ fn composite_bucket_listings_fail_closed_while_any_metadata_pg_is_peering() {
     ));
 
     let err = cluster
-        .list_multipart_uploads_for_bucket(&bucket, None, None, None, 100, 100)
+        .list_multipart_uploads_for_bucket(&bucket, None, None, None, 100)
         .unwrap_err();
     assert!(matches!(
         err,
@@ -154,6 +233,53 @@ fn composite_bucket_listings_fail_closed_while_any_metadata_pg_is_peering() {
             state: PgState::Peering,
         })
     ));
+}
+
+#[test]
+fn composite_bucket_listings_fail_closed_when_route_map_expires_during_pg_scan() {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let map = Arc::new(LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2], ec_shape).unwrap());
+    let cluster = Arc::new(crate::StorageCluster::from_local_map(map).unwrap());
+    let bucket = crate::BucketName::try_from("bucket".to_string()).unwrap();
+
+    let install_expiry_hook = || {
+        cluster.test_store_route_map_validity(RouteMapValidity::until_ms_saturating(
+            crate::clock::current_time_millis().saturating_add(60_000),
+        ));
+        let weak_cluster = Arc::downgrade(&cluster);
+        cluster.test_install_after_object_listing_pg_complete_hook(Arc::new(move |pg_id| {
+            if pg_id == 0 {
+                weak_cluster
+                    .upgrade()
+                    .unwrap()
+                    .test_store_route_map_validity(RouteMapValidity::until_ms_saturating(
+                        crate::clock::current_time_millis(),
+                    ));
+            }
+        }))
+    };
+
+    let object_hook = install_expiry_hook();
+    let object_error = cluster
+        .list_objects_for_bucket(&bucket, None, None, None, 100)
+        .unwrap_err();
+    assert!(matches!(
+        object_error,
+        crate::ObjectPgActionError::Store(StoreError::RouteMapExpired { .. })
+    ));
+    drop(object_hook);
+
+    let multipart_hook = install_expiry_hook();
+    let multipart_error = cluster
+        .list_multipart_uploads_for_bucket(&bucket, None, None, None, 100)
+        .unwrap_err();
+    assert!(matches!(
+        multipart_error,
+        crate::ObjectPgActionError::Store(StoreError::RouteMapExpired { .. })
+    ));
+    drop(multipart_hook);
 }
 
 #[test]

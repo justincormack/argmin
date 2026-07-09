@@ -3825,7 +3825,6 @@ pub struct ListMultipartUploadsResp {
 #[derive(Debug, Clone)]
 pub struct ListedBucketMultipartUploads {
     pub uploads: Vec<MultipartUploadRecord>,
-    pub hit_record_cap: bool,
 }
 
 /// Request to list parts of a multipart upload.

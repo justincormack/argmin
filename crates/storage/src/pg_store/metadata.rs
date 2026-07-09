@@ -16,6 +16,104 @@ impl PgStore {
             .store(true, Ordering::Relaxed);
     }
 
+    #[cfg(test)]
+    pub(crate) fn test_insert_listing_objects(
+        &self,
+        bucket: &BucketName,
+        keys: &[ObjectKey],
+    ) -> Result<(), MetadataError> {
+        self.with_immediate_txn(
+            "test listing objects (begin txn)",
+            "test listing objects (commit txn)",
+            |store| {
+                let owner = OwnerIdentity::from_principal("listing-scale-test-owner");
+                let mut statement = store
+                    .conn
+                    .prepare_cached(
+                        "INSERT INTO objects \
+                         (bucket, key, version_id, write_sequence, generation_id, size, etag, \
+                          etag_kind, last_modified, ec_k, ec_m, owner_principal, \
+                          owner_canonical_id) \
+                         VALUES (?1, ?2, 0, ?3, ?3, 0, ?4, 0, 1, 1, 0, ?5, ?6)",
+                    )
+                    .map_err(|source| MetadataError::Db {
+                        context: "prepare test listing objects",
+                        source,
+                    })?;
+                for (index, key) in keys.iter().enumerate() {
+                    let sequence =
+                        i64::try_from(index + 1).map_err(|source| MetadataError::Db {
+                            context: "convert test listing object sequence",
+                            source: rusqlite::Error::ToSqlConversionFailure(Box::new(source)),
+                        })?;
+                    statement
+                        .execute(params![
+                            bucket,
+                            key,
+                            sequence,
+                            [0_u8; 8].as_slice(),
+                            &owner.principal,
+                            owner.canonical_id.as_str(),
+                        ])
+                        .map_err(|source| MetadataError::Db {
+                            context: "insert test listing object",
+                            source,
+                        })?;
+                }
+                Ok(())
+            },
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_insert_listing_multipart_uploads(
+        &self,
+        bucket: &BucketName,
+        uploads: &[(ObjectKey, UploadId)],
+    ) -> Result<(), MetadataError> {
+        self.with_immediate_txn(
+            "test listing multipart uploads (begin txn)",
+            "test listing multipart uploads (commit txn)",
+            |store| {
+                let owner = OwnerIdentity::from_principal("listing-scale-test-owner");
+                let mut statement = store
+                    .conn
+                    .prepare_cached(
+                        "INSERT INTO multipart_uploads \
+                         (upload_id, bucket, key, initiated_at, metadata_blob, \
+                          system_metadata_blob, owner_principal, owner_canonical_id, \
+                          initiator_principal, initiator_canonical_id, object_generation_id) \
+                         VALUES (?1, ?2, ?3, ?4, X'', X'', ?5, ?6, ?5, ?6, ?4)",
+                    )
+                    .map_err(|source| MetadataError::Db {
+                        context: "prepare test listing multipart uploads",
+                        source,
+                    })?;
+                for (index, (key, upload_id)) in uploads.iter().enumerate() {
+                    let sequence =
+                        i64::try_from(index + 1).map_err(|source| MetadataError::Db {
+                            context: "convert test listing multipart upload sequence",
+                            source: rusqlite::Error::ToSqlConversionFailure(Box::new(source)),
+                        })?;
+                    statement
+                        .execute(params![
+                            upload_id,
+                            bucket,
+                            key,
+                            sequence,
+                            &owner.principal,
+                            owner.canonical_id.as_str(),
+                        ])
+                        .map_err(|source| MetadataError::Db {
+                            context: "insert test listing multipart upload",
+                            source,
+                        })?;
+                }
+                Ok(())
+            },
+        )
+    }
+
     fn store_error_as_metadata_db(context: &'static str, error: StoreError) -> MetadataError {
         match error {
             StoreError::Db { source, .. } => MetadataError::Db { context, source },

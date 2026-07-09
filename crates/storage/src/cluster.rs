@@ -593,6 +593,9 @@ type ObjectMetadataReservationAcquiredHook =
     Arc<dyn Fn() -> Result<(), ObjectPgActionError> + Send + Sync>;
 
 #[cfg(any(test, feature = "test-hooks"))]
+type ObjectListingPgCompleteHook = Arc<dyn Fn(u32) + Send + Sync>;
+
+#[cfg(any(test, feature = "test-hooks"))]
 pub type PayloadShardCleanupTestHook =
     Arc<dyn Fn(&ShardKey) -> Result<(), StoreError> + Send + Sync>;
 
@@ -612,6 +615,7 @@ struct StorageClusterTestHooks {
     before_object_generation_command_id: Option<ObjectGenerationCommandIdHook>,
     before_stream_append_command_id: Option<StreamAppendCommandIdHook>,
     after_object_metadata_reservation_acquired: Option<ObjectMetadataReservationAcquiredHook>,
+    after_object_listing_pg_complete: Option<ObjectListingPgCompleteHook>,
     before_placed_payload_shard_read: Option<PayloadShardReadTestHook>,
     before_placed_payload_shard_delete: Option<PayloadShardCleanupTestHook>,
     before_metadata_primary_payload_ack_delete: Option<PayloadShardCleanupTestHook>,
@@ -645,6 +649,11 @@ pub struct StreamAppendCommandIdHookGuard {
 
 #[cfg(any(test, feature = "test-hooks"))]
 pub struct ObjectMetadataReservationAcquiredHookGuard {
+    hooks: Arc<Mutex<StorageClusterTestHooks>>,
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+pub struct ObjectListingPgCompleteHookGuard {
     hooks: Arc<Mutex<StorageClusterTestHooks>>,
 }
 
@@ -714,6 +723,13 @@ impl Drop for ObjectMetadataReservationAcquiredHookGuard {
             .lock()
             .unwrap()
             .after_object_metadata_reservation_acquired = None;
+    }
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+impl Drop for ObjectListingPgCompleteHookGuard {
+    fn drop(&mut self) {
+        self.hooks.lock().unwrap().after_object_listing_pg_complete = None;
     }
 }
 
@@ -3705,6 +3721,19 @@ impl StorageCluster {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
+    fn maybe_run_after_object_listing_pg_complete_hook(&self, pg_id: u32) {
+        let hook = self
+            .test_hooks
+            .lock()
+            .unwrap()
+            .after_object_listing_pg_complete
+            .clone();
+        if let Some(hook) = hook {
+            hook(pg_id);
+        }
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
     fn maybe_run_before_direct_put_command_id_hook(&self) {
         let hook = self
             .test_hooks
@@ -5103,6 +5132,20 @@ impl StorageCluster {
             .unwrap()
             .before_metadata_command_pending_install = Some(hook);
         MetadataCommandPendingInstallHookGuard {
+            hooks: Arc::clone(&self.test_hooks),
+        }
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_install_after_object_listing_pg_complete_hook(
+        &self,
+        hook: Arc<dyn Fn(u32) + Send + Sync>,
+    ) -> ObjectListingPgCompleteHookGuard {
+        self.test_hooks
+            .lock()
+            .unwrap()
+            .after_object_listing_pg_complete = Some(hook);
+        ObjectListingPgCompleteHookGuard {
             hooks: Arc::clone(&self.test_hooks),
         }
     }

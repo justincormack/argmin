@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 #[cfg(any(test, feature = "test-hooks"))]
@@ -955,6 +955,94 @@ struct VersionCursor {
     versions: Vec<StoredObject>,
     next_index: usize,
     next_page_start: Option<ListVersionsPageStart>,
+}
+
+struct BoundedSmallestRecords<K, V> {
+    capacity: usize,
+    records: BTreeMap<K, V>,
+}
+
+impl<K: Ord, V> BoundedSmallestRecords<K, V> {
+    fn new(capacity: usize) -> Self {
+        Self {
+            capacity,
+            records: BTreeMap::new(),
+        }
+    }
+
+    fn insert(&mut self, key: K, value: V) {
+        if self.capacity == 0 || self.records.contains_key(&key) {
+            return;
+        }
+        if self.records.len() == self.capacity {
+            let retain = self
+                .records
+                .last_key_value()
+                .is_some_and(|(largest, _)| key < *largest);
+            if !retain {
+                return;
+            }
+            self.records.pop_last();
+        }
+        self.records.insert(key, value);
+    }
+
+    fn into_values(self) -> Vec<V> {
+        self.records.into_values().collect()
+    }
+}
+
+#[cfg(test)]
+mod bounded_smallest_records_tests {
+    use std::collections::BTreeSet;
+
+    use proptest::prelude::*;
+
+    use super::BoundedSmallestRecords;
+
+    #[test]
+    fn production_scale_selection_is_bounded_across_one_hundred_pgs() {
+        const PG_COUNT: u16 = 100;
+        const RECORDS_PER_PG: u16 = 1_001;
+        const CAPACITY: usize = 1_001;
+
+        let mut smallest = BoundedSmallestRecords::new(CAPACITY);
+        for pg_id in 0..PG_COUNT {
+            for rank in 0..RECORDS_PER_PG {
+                let key = (PG_COUNT - 1 - pg_id, rank);
+                smallest.insert(key, key);
+                assert!(smallest.records.len() <= CAPACITY);
+            }
+        }
+
+        let selected = smallest.into_values();
+        let expected = (0..RECORDS_PER_PG)
+            .map(|rank| (0, rank))
+            .collect::<Vec<_>>();
+        assert_eq!(selected, expected);
+    }
+
+    proptest! {
+        #[test]
+        fn selection_matches_reference_global_sort(
+            values in prop::collection::vec(any::<u16>(), 0..256),
+            capacity in 0usize..32,
+        ) {
+            let mut smallest = BoundedSmallestRecords::new(capacity);
+            for value in values.iter().copied() {
+                smallest.insert(value, value);
+                prop_assert!(smallest.records.len() <= capacity);
+            }
+
+            let expected = values
+                .into_iter()
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .take(capacity)
+                .collect::<Vec<_>>();
+            prop_assert_eq!(smallest.into_values(), expected);
+        }
+    }
 }
 
 impl VersionCursor {
@@ -7708,7 +7796,6 @@ impl super::StorageCluster {
         prefix: Option<&ObjectKey>,
         delimiter: Option<&str>,
         continuation_token: Option<&ObjectKey>,
-        record_cap: usize,
         max_keys: u32,
     ) -> Result<ListedBucketObjects, ObjectPgActionError> {
         if max_keys == 0 {
@@ -7725,12 +7812,9 @@ impl super::StorageCluster {
         let continuation_token = continuation_token.cloned();
 
         if delimiter.is_none() {
-            let mut all_objects: Vec<StoredObject> = Vec::new();
-            let mut hit_record_cap = false;
+            let max = max_keys as usize;
+            let mut smallest = BoundedSmallestRecords::new(max.saturating_add(1));
             for pg_id in self.metadata_pg_ids() {
-                if hit_record_cap {
-                    break;
-                }
                 let resp = self.list_objects_page(
                     pg_id,
                     &ListObjectsReq {
@@ -7741,38 +7825,24 @@ impl super::StorageCluster {
                         max_keys: fetch_limit,
                     },
                 )?;
-                all_objects.extend(resp.objects);
-                if all_objects.len() >= record_cap {
-                    all_objects.truncate(record_cap);
-                    hit_record_cap = true;
+                #[cfg(any(test, feature = "test-hooks"))]
+                self.maybe_run_after_object_listing_pg_complete_hook(pg_id);
+                for object in resp.objects {
+                    smallest.insert(object.key().clone(), object);
                 }
             }
 
-            all_objects.sort_by(|a, b| a.key().cmp(b.key()));
-            all_objects.dedup_by(|a, b| a.key() == b.key());
-
-            let max = max_keys as usize;
-            let mut objects = Vec::new();
-            let mut next_continuation_token = None;
-            for object in &all_objects {
-                if objects.len() >= max {
-                    break;
-                }
-                let object_key = object.key();
-                objects.push(object.clone());
-                next_continuation_token = Some(object_key.clone());
-            }
-
-            let is_truncated = hit_record_cap || all_objects.len() > max;
+            let mut objects = smallest.into_values();
+            let is_truncated = objects.len() > max;
+            objects.truncate(max);
+            let next_continuation_token = is_truncated
+                .then(|| objects.last().map(|object| object.key().clone()))
+                .flatten();
             return Ok(ListedBucketObjects {
                 objects,
                 common_prefixes: Vec::new(),
                 is_truncated,
-                next_continuation_token: if is_truncated {
-                    next_continuation_token
-                } else {
-                    None
-                },
+                next_continuation_token,
             });
         }
 
@@ -12604,15 +12674,10 @@ impl super::StorageCluster {
         prefix: Option<&ObjectKey>,
         key_marker: Option<&ObjectKey>,
         upload_id_marker: Option<&UploadId>,
-        record_cap: usize,
         max_uploads: u32,
     ) -> Result<ListedBucketMultipartUploads, ObjectPgActionError> {
-        let mut uploads = Vec::new();
-        let mut hit_record_cap = false;
+        let mut smallest = BoundedSmallestRecords::new((max_uploads as usize).saturating_add(1));
         for pg_id in self.metadata_pg_ids() {
-            if hit_record_cap {
-                break;
-            }
             let resp = self.list_multipart_uploads_page(
                 pg_id,
                 &ListMultipartUploadsReq {
@@ -12623,15 +12688,19 @@ impl super::StorageCluster {
                     max_uploads: max_uploads.saturating_add(1),
                 },
             )?;
-            uploads.extend(resp.uploads);
-            if uploads.len() >= record_cap {
-                uploads.truncate(record_cap);
-                hit_record_cap = true;
+            #[cfg(any(test, feature = "test-hooks"))]
+            self.maybe_run_after_object_listing_pg_complete_hook(pg_id);
+            for upload in resp.uploads {
+                let order = (
+                    upload.key.clone(),
+                    upload.initiated_at,
+                    upload.upload_id.clone(),
+                );
+                smallest.insert(order, upload);
             }
         }
         Ok(ListedBucketMultipartUploads {
-            uploads,
-            hit_record_cap,
+            uploads: smallest.into_values(),
         })
     }
 
