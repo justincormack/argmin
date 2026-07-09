@@ -7542,6 +7542,13 @@ mod tests {
 
         let far_future_now_ms =
             50_201 + storage::control_plane::MAX_COMMITTED_TIMESTAMP_FORWARD_JUMP_MS + 123;
+        let expected_expiry_timestamp = harness
+            .control_plane
+            .current_snapshot()
+            .expect("experimental pre-expiry snapshot should read")
+            .max_committed_timestamp_ms()
+            .unwrap()
+            .saturating_add(storage::control_plane::MAX_COMMITTED_TIMESTAMP_FORWARD_JUMP_MS);
         let expiry = harness
             .control_plane
             .expire_heartbeat_leases(far_future_now_ms)
@@ -7554,7 +7561,7 @@ mod tests {
             .expect("experimental far-forward expired snapshot should read");
         assert_eq!(
             expired_snapshot.max_committed_timestamp_ms(),
-            Some(far_future_now_ms)
+            Some(expected_expiry_timestamp)
         );
         let expired_node = expired_snapshot
             .node(NodeId::new(1))

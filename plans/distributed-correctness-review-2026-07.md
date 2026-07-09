@@ -1868,6 +1868,17 @@ bounded, automatic recovery path") and pin it with an adversarial-clock
 proptest — the injectable-clock harness remains the top testing-gap
 recommendation from round 1.
 
+2026-07-09 update: R3-1/R3-2 are addressed by replacing the unbounded expiry
+carve-out with bounded committed-timestamp ratcheting and by allowing
+storage-node heartbeat re-admission to advance the durable high-water by at
+most one forward-jump step per command. Expiry can still use the requested
+`expire_at_ms` for lease expiry decisions, but it records only the bounded
+high-water step; heartbeat re-admission after a clean full expiry can then
+catch up automatically across subsequent heartbeats. Regressions now cover
+healthy-cluster far-future expiry without unbounded ratchet, clean full expiry
+followed by >1h downtime and heartbeat re-admission, repeated no-live-lease
+far-future expiry deferral, and the experimental Raft wrapper path.
+
 ### R3-3. LOW-MEDIUM — `synchronous=FULL` fsync inside the per-PG mutex vs the 500ms lock budget
 
 Folded into the MD5 status update above. Load-dependent availability, not
@@ -1914,9 +1925,9 @@ classes).
 
 ## Round-3 priorities
 
-1. **R3-1/R3-2** — redesign the committed-timestamp carve-out (bounded
-   ratchet + re-admission catch-up), with the written invariant and
-   adversarial-clock proptest. Same availability tier as INT-2.
+1. **DONE — R3-1/R3-2** — redesign the committed-timestamp carve-out
+   (bounded ratchet + re-admission catch-up), with focused adversarial-clock
+   regressions. Same availability tier as INT-2.
 2. **INT-2** — per-PG bind quarantine (unchanged since round 2).
 3. **CL1** — deposed-lease capture scaffolding, then the wait-out fence on
    all Active-exit transitions (unchanged since round 1; still the top

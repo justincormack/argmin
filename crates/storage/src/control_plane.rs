@@ -926,6 +926,12 @@ impl ClusterControlSnapshot {
         self.max_committed_timestamp_ms != previous
     }
 
+    fn bounded_committed_timestamp_step(&self, timestamp_ms: u64) -> u64 {
+        self.max_committed_timestamp_ms.map_or(timestamp_ms, |max| {
+            timestamp_ms.min(max.saturating_add(MAX_COMMITTED_TIMESTAMP_FORWARD_JUMP_MS))
+        })
+    }
+
     #[cfg(any(test, debug_assertions))]
     pub(crate) fn validate_invariants(&self) -> Result<(), String> {
         validate_required_cluster_map_history(
@@ -1477,7 +1483,16 @@ impl ControlPlaneCommandStateMachine for ClusterControlSnapshot {
                         .ok_or(ControlPlaneError::UnknownNode {
                             node_id: heartbeat.node_id.as_u32(),
                         })?;
-                self.validate_committed_timestamp(heartbeat_at_ms)?;
+                if let Some(max_committed_timestamp_ms) = self.max_committed_timestamp_ms {
+                    if heartbeat_at_ms < max_committed_timestamp_ms {
+                        return Err(ControlPlaneError::CommittedTimestampRegression {
+                            timestamp_ms: heartbeat_at_ms,
+                            max_committed_timestamp_ms,
+                        });
+                    }
+                }
+                let committed_heartbeat_at_ms =
+                    self.bounded_committed_timestamp_step(heartbeat_at_ms);
                 let committed_lease_deadline_ms = record.lease_deadline_ms.map_or(
                     expected_lease_deadline_ms,
                     |current_lease_deadline_ms| {
@@ -1532,7 +1547,7 @@ impl ControlPlaneCommandStateMachine for ClusterControlSnapshot {
                         current_epoch,
                     )?;
                     let mut next_snapshot = self.clone();
-                    next_snapshot.record_committed_timestamp(heartbeat_at_ms);
+                    next_snapshot.record_committed_timestamp(committed_heartbeat_at_ms);
                     let mut epoch_changed = false;
                     let mut affected_node = None;
                     {
@@ -1581,7 +1596,7 @@ impl ControlPlaneCommandStateMachine for ClusterControlSnapshot {
                 let mut epoch_changed = false;
                 let mut affected_node = None;
                 let mut next_snapshot = self.clone();
-                next_snapshot.record_committed_timestamp(heartbeat_at_ms);
+                next_snapshot.record_committed_timestamp(committed_heartbeat_at_ms);
                 {
                     let record = next_snapshot
                         .nodes
@@ -1677,15 +1692,29 @@ impl ControlPlaneCommandStateMachine for ClusterControlSnapshot {
                 ))
             }
             ControlPlaneCommand::ExpireHeartbeatLeases { expire_at_ms } => {
-                if self.committed_timestamp_exceeds_forward_bound(expire_at_ms) {
-                    if !self.has_heartbeat_lease_expiring_at(expire_at_ms) {
-                        self.validate_committed_timestamp(expire_at_ms)?;
+                if let Some(max_committed_timestamp_ms) = self.max_committed_timestamp_ms {
+                    if expire_at_ms < max_committed_timestamp_ms {
+                        return Err(ControlPlaneError::CommittedTimestampRegression {
+                            timestamp_ms: expire_at_ms,
+                            max_committed_timestamp_ms,
+                        });
                     }
-                } else {
-                    self.validate_committed_timestamp(expire_at_ms)?;
                 }
+                if self.committed_timestamp_exceeds_forward_bound(expire_at_ms)
+                    && !self.has_heartbeat_lease_expiring_at(expire_at_ms)
+                {
+                    return Err(ControlPlaneError::CommittedTimestampTooFarAhead {
+                        timestamp_ms: expire_at_ms,
+                        max_committed_timestamp_ms: self
+                            .max_committed_timestamp_ms
+                            .expect("forward-bound check requires a previous timestamp"),
+                        max_forward_jump_ms: MAX_COMMITTED_TIMESTAMP_FORWARD_JUMP_MS,
+                    });
+                }
+                let committed_expire_at_ms = self.bounded_committed_timestamp_step(expire_at_ms);
                 let mut next_snapshot = self.clone();
-                let timestamp_changed = next_snapshot.record_committed_timestamp(expire_at_ms);
+                let timestamp_changed =
+                    next_snapshot.record_committed_timestamp(committed_expire_at_ms);
                 let mut expired_nodes = Vec::new();
                 for record in next_snapshot.nodes.values_mut() {
                     if matches!(
@@ -20523,7 +20552,7 @@ mod tests {
     }
 
     #[test]
-    fn record_node_heartbeat_command_rejects_committed_timestamp_forward_jump() {
+    fn record_node_heartbeat_command_bounds_committed_timestamp_forward_jump() {
         let tmp = test_util::tempdir();
         let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
         let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
@@ -20536,22 +20565,26 @@ mod tests {
         let heartbeat_at_ms = 1_001 + MAX_COMMITTED_TIMESTAMP_FORWARD_JUMP_MS + 1;
         let heartbeat =
             heartbeat_from_record(&authority, 1, before.cluster_epoch(), heartbeat_at_ms);
-        let error = before
+        let applied = before
             .apply_control_plane_command(ControlPlaneCommand::RecordNodeHeartbeat {
                 heartbeat,
                 heartbeat_at_ms,
                 lease_deadline_ms: heartbeat_at_ms + 100,
             })
-            .unwrap_err();
+            .expect("heartbeat should apply with bounded timestamp catch-up");
 
-        assert!(matches!(
-            error,
-            ControlPlaneError::CommittedTimestampTooFarAhead {
-                timestamp_ms,
-                max_committed_timestamp_ms: 1_001,
-                max_forward_jump_ms: MAX_COMMITTED_TIMESTAMP_FORWARD_JUMP_MS,
-            } if timestamp_ms == heartbeat_at_ms
-        ));
+        assert_eq!(
+            applied.snapshot().max_committed_timestamp_ms(),
+            Some(1_001 + MAX_COMMITTED_TIMESTAMP_FORWARD_JUMP_MS)
+        );
+        assert_eq!(
+            applied
+                .snapshot()
+                .node(NodeId::new(1))
+                .unwrap()
+                .lease_deadline_ms(),
+            Some(heartbeat_at_ms + 100)
+        );
         assert_eq!(authority.snapshot(), &before);
     }
 
@@ -20752,6 +20785,11 @@ mod tests {
         let store = FileControlPlaneStore::new(&state_path);
         let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
         let far_future_now_ms = 1_001 + MAX_COMMITTED_TIMESTAMP_FORWARD_JUMP_MS + 123;
+        let expected_expiry_timestamp = authority
+            .snapshot()
+            .max_committed_timestamp_ms()
+            .unwrap()
+            .saturating_add(MAX_COMMITTED_TIMESTAMP_FORWARD_JUMP_MS);
         let expiry = authority
             .expire_heartbeat_leases(far_future_now_ms)
             .expect("lease expiry proposal should recover expired leases after downtime");
@@ -20759,7 +20797,7 @@ mod tests {
         assert_eq!(expiry.expired_nodes(), &[NodeId::new(1)]);
         assert_eq!(
             authority.snapshot().max_committed_timestamp_ms(),
-            Some(far_future_now_ms)
+            Some(expected_expiry_timestamp)
         );
         assert_eq!(
             authority
@@ -20783,6 +20821,79 @@ mod tests {
         assert_eq!(
             authority.snapshot().max_committed_timestamp_ms(),
             Some(heartbeat_at_ms)
+        );
+    }
+
+    #[test]
+    fn heartbeat_re_admission_catches_up_after_clean_expiry_downtime() {
+        let tmp = test_util::tempdir();
+        let state_path = tmp.path().join("control-plane.state");
+        let store = FileControlPlaneStore::new(&state_path);
+        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+        authority
+            .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
+            .unwrap();
+        assert!(heartbeat_until_serving(&mut authority, 1, 1_000).serving());
+        authority
+            .expire_heartbeat_leases(1_101)
+            .expect("clean expiry should apply before downtime");
+
+        drop(authority);
+        let store = FileControlPlaneStore::new(&state_path);
+        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+        let before = authority.snapshot().clone();
+        assert_eq!(before.max_committed_timestamp_ms(), Some(1_101));
+        assert_eq!(
+            before.node(NodeId::new(1)).unwrap().availability(),
+            NodeAvailabilityState::Unavailable
+        );
+        assert_eq!(
+            before.node(NodeId::new(1)).unwrap().lease_deadline_ms(),
+            None
+        );
+
+        let far_future_now_ms = 1_101 + MAX_COMMITTED_TIMESTAMP_FORWARD_JUMP_MS + 123;
+        let deferred = authority
+            .expire_heartbeat_leases(far_future_now_ms)
+            .expect("lease expiry scan without live leases should defer far-future timestamp");
+        assert!(deferred.expired_nodes().is_empty());
+        assert_eq!(authority.snapshot(), &before);
+
+        let heartbeat = heartbeat_from_record(
+            &authority,
+            1,
+            authority.snapshot().cluster_epoch(),
+            far_future_now_ms,
+        );
+        authority
+            .heartbeat(heartbeat, far_future_now_ms)
+            .expect("heartbeat should re-admit after clean expiry downtime");
+        assert_eq!(
+            authority.snapshot().max_committed_timestamp_ms(),
+            Some(1_101 + MAX_COMMITTED_TIMESTAMP_FORWARD_JUMP_MS)
+        );
+        assert_eq!(
+            authority
+                .snapshot()
+                .node(NodeId::new(1))
+                .unwrap()
+                .availability(),
+            NodeAvailabilityState::Healthy
+        );
+
+        let follow_up_at_ms = far_future_now_ms + 1;
+        let follow_up = heartbeat_from_record(
+            &authority,
+            1,
+            authority.snapshot().cluster_epoch(),
+            follow_up_at_ms,
+        );
+        authority
+            .heartbeat(follow_up, follow_up_at_ms)
+            .expect("follow-up heartbeat should finish bounded timestamp catch-up");
+        assert_eq!(
+            authority.snapshot().max_committed_timestamp_ms(),
+            Some(follow_up_at_ms)
         );
     }
 
