@@ -4603,6 +4603,87 @@ mod tests {
     }
 
     #[test]
+    fn storage_node_control_plane_client_sends_authenticated_heartbeat_from_config() {
+        let tmp = short_unix_socket_test_dir("storage-node-auth-refresh");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let socket_path = tmp.join("control-plane.sock");
+        let state_path = tmp.join("control-plane.state");
+        let node_id = NodeId::new(2);
+        let node_incarnation = 55;
+        let mut config = test_server_config();
+        config.control_plane_auth_cluster_id = Some("control-auth".to_string());
+        config.control_plane_storage_auth_credentials =
+            vec![ConfiguredControlPlaneStorageAuthCredential {
+                node_id: node_id.as_u32(),
+                credential_id: "storage-node".to_string(),
+                credential_version: 7,
+                secret: SecretConfigValue::new("storage-node-2-secret".to_string()),
+            }];
+        let storage_credential = configured_storage_node_auth_credential(
+            &config.control_plane_storage_auth_credentials[0],
+        )
+        .expect("test storage-node credential should build");
+        let verifier = ControlPlaneUnixAuthVerifier::new("control-auth", vec![storage_credential])
+            .expect("test storage-node verifier should build");
+        let verifier_for_assert = verifier.clone();
+        let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+        let server = std::thread::spawn(move || {
+            let store = FileControlPlaneStore::new(state_path);
+            let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+            authority
+                .set_node_membership(node_id, storage::control_plane::NodeMembershipState::Active)
+                .unwrap();
+            let (mut stream, _addr) = listener.accept().unwrap();
+            let request = read_control_plane_unix_request(&mut stream).unwrap();
+            let response = build_control_plane_unix_response_with_auth_and_response_clock(
+                &mut authority,
+                request,
+                2_000,
+                Some(&verifier),
+                || Ok(2_000),
+            )
+            .unwrap();
+            write_control_plane_unix_response(&mut stream, response).unwrap();
+        });
+
+        let mut client = build_storage_node_control_plane_client(
+            &config,
+            socket_path.to_str().unwrap(),
+            node_id,
+            node_incarnation,
+        )
+        .expect("storage-node auth client should build");
+        let heartbeat = storage::control_plane::NodeHeartbeat {
+            node_id,
+            node_incarnation,
+            endpoint: "/tmp/argmin-node-2.sock".to_string(),
+            observed_epoch: ClusterEpoch::INITIAL,
+            requested_lease_duration_ms: 100,
+            cluster_map_history_reference_summary:
+                storage::PgClusterMapHistoryReferenceSummary::default(),
+            pg_observations: Vec::new(),
+        };
+        let refresh = client.refresh_node_heartbeat(heartbeat, 2_000).unwrap();
+
+        server.join().unwrap();
+        assert_eq!(refresh.lease().node_id(), node_id);
+        assert_eq!(refresh.lease().lease_deadline_ms(), 2_100);
+        assert_eq!(
+            refresh.runtime_map().nodes()[0].endpoint(),
+            "/tmp/argmin-node-2.sock"
+        );
+        let metrics = verifier_for_assert.metrics_snapshot();
+        assert_eq!(metrics.accepted_total(), 1);
+        assert_eq!(
+            metrics.accepted_for_operation(ControlPlaneAuthOperation::StorageRuntimeMapRefresh),
+            1
+        );
+        assert_eq!(metrics.rejected_total(), 0);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
     fn storage_node_control_plane_client_requires_local_auth_credential() {
         let mut config = test_server_config();
         config.control_plane_auth_cluster_id = Some("control-auth".to_string());

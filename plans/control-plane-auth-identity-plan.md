@@ -595,6 +595,13 @@ Progress:
   opted into admin auth. The authenticated admin response verifier also now
   tolerates only a tiny same-host response issue-time skew while keeping request
   freshness strict.
+- 2026-07-09: Added argmin-s3 storage-node config wiring coverage for
+  authenticated heartbeat/runtime-map refresh. A storage-node client built from
+  `ARGMIN_CONTROL_PLANE_STORAGE_AUTH_CREDENTIALS`-shaped config now sends a
+  signed heartbeat to an auth-enforcing Unix control-plane server and verifies
+  the signed runtime-map response, including accepted-operation metrics. This
+  closes the main process/config gap between storage-level heartbeat auth tests
+  and the storage-node refresh loop client construction path.
 
 ## Replay Policy
 
