@@ -1,0 +1,206 @@
+Frontend auth accidentally requires storage auth
+Link: https://chatgpt.com/codex/cloud/security/findings/0cddf92a4e4481918e581786a9a8f362?sev=&repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin&sort=date_desc
+Criticality: informational (attack path: ignore)
+Status: fixed
+
+# Metadata
+Repo: justincormack/argmin
+Commit: fb9957f
+Author: justin@specialbusservice.com
+Created: 08/07/2026, 13:57:50
+Assignee: Unassigned
+Signals: Validated, Attack-path
+
+# Summary
+Introduced: frontend-only control-plane auth unintentionally makes storage-node heartbeat authentication mandatory. The heartbeat path needs an independent storage-auth-required predicate, analogous to requires_frontend_runtime_map_auth, or the verifier should not be passed/enabled for storage heartbeats unless storage credentials are configured.
+The new frontend runtime-map auth path builds a ControlPlaneUnixAuthVerifier even when no storage-node auth credentials are configured. The request dispatcher then treats the mere presence of any auth verifier as a requirement to authenticate RefreshNodeHeartbeat RPCs. As a result, a documented configuration that enables only ARGMIN_CONTROL_PLANE_FRONTEND_AUTH_CREDENTIALS, while leaving ARGMIN_CONTROL_PLANE_STORAGE_AUTH_CREDENTIALS unset, will reject otherwise-valid plain storage-node heartbeats. Storage nodes can lose leases and the cluster can become unavailable. This appears to be an introduced availability/configuration bug rather than a directly attacker-exploitable security vulnerability, because exploitation requires privileged control of server configuration.
+
+# Validation
+## Rubric
+- [x] Confirm frontend-only configuration creates Some(ControlPlaneUnixAuthVerifier) with no storage-node credentials.
+- [x] Confirm storage-node clients remain plain when storage auth credentials are unset.
+- [x] Confirm RefreshNodeHeartbeat is gated only on auth_verifier.is_some(), unlike frontend runtime-map operations that use a frontend-specific predicate.
+- [x] Dynamically prove a valid plain heartbeat is accepted without a verifier but rejected with a frontend-only verifier.
+- [x] Capture debugger evidence that the frontend-only verifier causes dispatch into verify_storage_node_heartbeat_payload and envelope decoding of a plain heartbeat.
+## Report
+Validated the suspected bug. Key code evidence: crates/argmin-s3/src/main.rs:3145-3175 creates Some(ControlPlaneUnixAuthVerifier) whenever either storage or frontend credentials exist; with frontend-only credentials it uses ControlPlaneUnixAuthVerifier::new_empty(cluster_id), so storage_node_credentials is empty. crates/argmin-s3/src/main.rs:3267-3270 separately makes storage-node clients Plain when control_plane_storage_auth_credentials is empty. crates/storage/src/control_plane.rs:5452-5455 has a frontend-specific auth predicate, but crates/storage/src/control_plane.rs:6208-6217 gates RefreshNodeHeartbeat only on auth_verifier being Some and unconditionally calls verify_storage_node_heartbeat_payload. That verifier decodes the payload as an auth envelope at crates/storage/src/control_plane.rs:5580-5593 and records Missing when a plain heartbeat lacks auth magic.
+
+Dynamic validation: I added a targeted unit-test PoC, poc_frontend_only_verifier_rejects_plain_storage_node_heartbeat, that constructs the same valid plain RefreshNodeHeartbeat twice. With auth_verifier=None it is accepted and grants lease deadline Some(2100). With a frontend-only verifier constructed via ControlPlaneUnixAuthVerifier::new_empty("auth-cluster").with_frontend_credentials(...), the same heartbeat is rejected before lease update. Reproduction command: cargo test -p storage --lib poc_frontend_only_verifier_rejects_plain_storage_node_heartbeat -- --nocapture. Output included: "frontend-only heartbeat rejection: control-plane RPC protocol error: control-plane auth envelope: invalid control-plane auth magic" and the test passed with 1 rejected StorageRuntimeMapRefresh/Missing metric.
+
+I also ran the existing argmin-s3 test proving frontend-only configuration builds a verifier with zero storage credentials: cargo test -p argmin-s3 --bin argmin-s3 control_plane_unix_auth_verifier_includes_frontend_credentials -- --nocapture, which passed.
+
+Crash/Valgrind/Debugger attempts: this is not a memory-safety crash; the direct PoC exits successfully while proving application-level rejection. valgrind and gdb were unavailable in the container. lldb was available and I ran the test binary with a breakpoint at crates/storage/src/control_plane.rs:5580. The captured backtrace showed frame #0 ControlPlaneUnixAuthVerifier::verify_storage_node_heartbeat_payload at control_plane.rs:5580, called from frame #1 build_control_plane_unix_response_with_auth at control_plane.rs:6215, called from the PoC test at control_plane.rs:12432. This confirms the frontend-only verifier drives the plain heartbeat into the storage heartbeat auth verifier.
+
+# Evidence
+crates/argmin-s3/src/main.rs (L3145 to 3175)
+  Note: A ControlPlaneUnixAuthVerifier is created when either storage or frontend credentials exist; with frontend-only credentials it calls new_empty, producing a verifier with no storage-node credentials.
+```
+fn build_control_plane_unix_auth_verifier(
+    config: &ServerConfig,
+) -> Result<Option<ControlPlaneUnixAuthVerifier>, String> {
+    if config.control_plane_storage_auth_credentials.is_empty()
+        && config.control_plane_frontend_auth_credentials.is_empty()
+    {
+        return Ok(None);
+    }
+    let cluster_id = config
+        .control_plane_auth_cluster_id
+        .as_deref()
+        .expect("control-plane Unix auth credentials require control-plane auth cluster id");
+    let storage_credentials = config
+        .control_plane_storage_auth_credentials
+        .iter()
+        .map(configured_storage_node_auth_credential)
+        .collect::<Result<Vec<_>, _>>()?;
+    let frontend_credentials = config
+        .control_plane_frontend_auth_credentials
+        .iter()
+        .map(configured_frontend_auth_credential)
+        .collect::<Result<Vec<_>, _>>()?;
+    let verifier = if storage_credentials.is_empty() {
+        ControlPlaneUnixAuthVerifier::new_empty(cluster_id)
+    } else {
+        ControlPlaneUnixAuthVerifier::new(cluster_id, storage_credentials)
+    }
+    .map_err(|error| format!("invalid control-plane Unix auth credential verifier: {error}"))?;
+    verifier
+        .with_frontend_credentials(frontend_credentials)
+        .map(Some)
+```
+
+crates/storage/src/control_plane.rs (L5452 to 5455)
+  Note: Frontend runtime-map auth has an explicit predicate based on frontend credentials, showing the intended per-operation gating.
+```
+    #[must_use]
+    pub fn requires_frontend_runtime_map_auth(&self) -> bool {
+        !self.frontend_credentials.is_empty()
+    }
+```
+
+crates/storage/src/control_plane.rs (L5580 to 5593)
+  Note: A plain unauthenticated heartbeat payload is decoded as an auth envelope and rejected as missing/malformed auth.
+```
+        let envelope = match ControlPlaneAuthEnvelope::decode_frame(
+            payload,
+            CONTROL_PLANE_RPC_MAX_PAYLOAD_LEN,
+        ) {
+            Ok(envelope) => envelope,
+            Err(error) => {
+                let reason = if control_plane_auth_payload_has_magic(payload) {
+                    ControlPlaneAuthRejectionReason::Malformed
+                } else {
+                    ControlPlaneAuthRejectionReason::Missing
+                };
+                self.metrics
+                    .record_rejected(ControlPlaneAuthOperation::StorageRuntimeMapRefresh, reason);
+                return Err(error);
+```
+
+crates/storage/src/control_plane.rs (L5622 to 5632)
+  Note: Even signed storage heartbeats would be rejected when the verifier contains no storage-node credential for the node.
+```
+        let Some(node_credential) = self.storage_node_credentials.get(&heartbeat.node_id) else {
+            self.metrics.record_rejected(
+                ControlPlaneAuthOperation::StorageRuntimeMapRefresh,
+                ControlPlaneAuthRejectionReason::UnknownCredential,
+            );
+            return Err(ControlPlaneError::RpcProtocol {
+                message: format!(
+                    "control-plane storage-node heartbeat auth has no credential for node {}",
+                    heartbeat.node_id.as_u32()
+                ),
+            });
+```
+
+crates/storage/src/control_plane.rs (L6208 to 6217)
+  Note: Storage heartbeat auth is gated only on auth_verifier being Some, so frontend-only auth also forces heartbeat authentication.
+```
+        ControlPlaneRpcKind::RefreshNodeHeartbeat => {
+            debug_assert_eq!(
+                kind.auth_operation(),
+                ControlPlaneAuthOperation::StorageRuntimeMapRefresh
+            );
+            let payload = match auth_verifier {
+                Some(auth_verifier) => auth_verifier
+                    .verify_storage_node_heartbeat_payload(&payload, authority_now_ms)?,
+                None => payload,
+            };
+```
+
+# Attack-path analysis
+Final: ignore | Decider: model_decided | Matrix severity: ignore | Policy adjusted: ignore
+## Rationale
+The code evidence and validation PoC support that the availability bug is real, but it is not a security vulnerability in the project threat model. The attack path starts with admin/operator configuration of ARGMIN_CONTROL_PLANE_FRONTEND_AUTH_CREDENTIALS while leaving storage credentials unset. External S3 clients cannot influence this state, and the relevant control-plane RPC path is a private Unix socket. Impact is fail-closed availability degradation of the operator's own cluster, without confidentiality, integrity, identity, or privilege impact. Therefore the original low security severity should be treated as ignore for security triage.
+## Likelihood
+ignore - A realistic attacker cannot trigger the bug through the normal S3 network surface. Triggering requires privileged control over server environment configuration; the internal control-plane socket is local/private. The configuration state itself is plausible for an operator, but it is not attacker-reachable.
+## Impact
+ignore - The proven effect is availability loss for a misconfigured deployment: storage-node leases may not refresh. There is no demonstrated unauthorized read/write/delete, identity compromise, secret leakage, code execution, or attacker-controlled privilege escalation.
+## Assumptions
+- Analysis is limited to repository artifacts and the provided validation evidence; no cloud APIs or live deployment inspection were used.
+- The relevant deployment is a split or combined argmin-s3 runtime using the control-plane Unix socket and storage-node heartbeat refresh.
+- External S3 clients are in scope for the product threat model, but privileged modification of server environment variables is not treated as attacker capability.
+- Operator/admin configures ARGMIN_CONTROL_PLANE_FRONTEND_AUTH_CREDENTIALS and ARGMIN_CONTROL_PLANE_AUTH_CLUSTER_ID
+- ARGMIN_CONTROL_PLANE_STORAGE_AUTH_CREDENTIALS is left unset
+- Deployment uses control-plane runtime-map/heartbeat flow via ARGMIN_CONTROL_PLANE_SOCKET_PATH
+- Storage nodes rely on plain unauthenticated heartbeat refreshes
+## Path
+Admin/env config
+  |-- frontend creds set, storage creds unset
+  v
+Control-plane verifier Some(new_empty + frontend creds)     Storage-node Plain client
+  \                                                       /
+   \                                                     /
+    v                                                   v
+          RefreshNodeHeartbeat sees auth_verifier=Some
+                         |
+                         v
+          plain payload decoded as auth envelope -> reject
+                         |
+                         v
+            lease expiry / cluster availability loss
+## Path evidence
+- `crates/argmin-s3/src/config.rs:267-271` - Configuration documents storage heartbeat auth and frontend runtime-map auth as separate optional credentials.
+- `crates/argmin-s3/src/config.rs:352` - Default S3 listener is 127.0.0.1:9000; this does not expose the control-plane heartbeat bug directly.
+- `crates/argmin-s3/src/config.rs:702-724` - Storage and frontend control-plane credentials are validated independently, permitting frontend credentials without storage credentials.
+- `crates/argmin-s3/src/main.rs:3145-3175` - A ControlPlaneUnixAuthVerifier is created when either storage or frontend credentials exist; with no storage credentials it uses new_empty but still returns Some after adding frontend credentials.
+- `crates/argmin-s3/src/main.rs:3262-3271` - Storage-node control-plane client remains Plain when storage auth credentials are empty.
+- `crates/argmin-s3/src/main.rs:3297-3379` - Control-plane RPC transport is a Unix socket whose directory must be absolute, private, and owned by the process uid, reducing attacker reachability.
+- `crates/argmin-s3/src/main.rs:1420-1450` - The built auth_verifier is passed into control-plane RPC workers.
+- `crates/argmin-s3/src/main.rs:3508-3548` - Storage-node refresh loop builds the storage-node control-plane client and uses it for heartbeat refreshes.
+- `crates/storage/src/control_plane.rs:5452-5455` - Frontend runtime-map auth has an explicit frontend-specific predicate, showing the intended separated gating pattern.
+- `crates/storage/src/control_plane.rs:5580-5593` - Plain heartbeat payloads are decoded as auth envelopes and rejected as missing/malformed auth when forced through the storage auth verifier.
+- `crates/storage/src/control_plane.rs:5622-5632` - Even a signed storage heartbeat would be rejected if the verifier has no storage-node credential for that node.
+- `crates/storage/src/control_plane.rs:6208-6218` - RefreshNodeHeartbeat is gated only on auth_verifier being Some, causing frontend-only auth to require storage heartbeat auth.
+## Narrative
+The finding is a real product availability bug: frontend-only control-plane auth creates a verifier, while storage nodes remain configured to send plain heartbeats; the heartbeat dispatcher uses verifier presence as a global auth requirement and rejects the plain heartbeat. This is not a meaningful security vulnerability under the stated threat model because exploitation requires privileged control of server environment configuration, and the relevant control-plane transport is a private local Unix socket rather than the public S3 API.
+## Controls
+- Control-plane RPCs use Unix domain sockets rather than the public HTTP listener
+- Control-plane socket parent directory is created/validated as private and owned by the process uid
+- Public S3 API authentication is separate SigV4 credential handling and is not bypassed by this issue
+- Control-plane auth credentials are provided via environment variables; no secret values are exposed in this analysis
+## Blindspots
+- No deployment manifests or production configuration were present to confirm how often frontend-only control-plane auth is used.
+- Static repository review cannot prove every possible local filesystem permission scenario, though the code enforces private control-plane socket directories.
+- The supplied PoC is a unit-level executable validation rather than a full multi-process end-to-end deployment test.
+
+# Resolution
+Status: fixed in `028cb3f9784a9a7a781cdcea081d48ceab4e9793` (`Keep heartbeat auth scoped to storage credentials`).
+
+The heartbeat dispatcher no longer treats the mere presence of a `ControlPlaneUnixAuthVerifier` as a global heartbeat-auth requirement. `ControlPlaneUnixAuthVerifier::requires_storage_node_heartbeat_auth()` now checks only configured storage-node heartbeat credentials, and `RefreshNodeHeartbeat` verifies `StorageRuntimeMapRefresh` auth only when that storage-specific predicate is true.
+
+Current behavior:
+
+- A frontend-only verifier still requires frontend runtime-map auth.
+- A frontend-only verifier does not require storage-node heartbeat auth.
+- Plain storage-node heartbeats remain accepted when `ARGMIN_CONTROL_PLANE_STORAGE_AUTH_CREDENTIALS` is unset.
+- Signed storage-node heartbeats are required only when storage-node heartbeat credentials are configured.
+
+Regression coverage: `frontend_auth_verifier_does_not_require_storage_node_heartbeat_auth` builds a frontend-only verifier, asserts `requires_frontend_runtime_map_auth() == true` and `requires_storage_node_heartbeat_auth() == false`, then sends a plain `RefreshNodeHeartbeat` through `build_control_plane_unix_response_with_auth(..., Some(&verifier))` and confirms the heartbeat succeeds and updates the lease.
+
+Verification run:
+
+```text
+cargo test -p storage --lib frontend_auth_verifier_does_not_require_storage_node_heartbeat_auth -- --nocapture
+```
+
+Result: passed.
