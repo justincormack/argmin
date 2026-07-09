@@ -81,11 +81,27 @@ impl ProcessTestControlPlaneAuth {
         format!("raft-node-{node_id}")
     }
 
+    fn frontend_secret(instance_id: &str) -> String {
+        format!("process-test-frontend-{instance_id}-secret")
+    }
+
+    fn frontend_credential_id(instance_id: &str) -> String {
+        format!("frontend-{instance_id}")
+    }
+
     fn raft_peer_config_entry(node_id: u64) -> String {
         format!(
             "{node_id}={}:1:{}",
             Self::raft_peer_credential_id(node_id),
             Self::raft_peer_secret(node_id)
+        )
+    }
+
+    fn frontend_config_entry(instance_id: &str) -> String {
+        format!(
+            "{instance_id}={}:1:{}",
+            Self::frontend_credential_id(instance_id),
+            Self::frontend_secret(instance_id)
         )
     }
 
@@ -95,6 +111,14 @@ impl ProcessTestControlPlaneAuth {
         auth_nodes
             .into_iter()
             .map(Self::raft_peer_config_entry)
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+
+    fn frontend_credentials_env(&self, instance_ids: &[&str]) -> String {
+        instance_ids
+            .iter()
+            .map(|instance_id| Self::frontend_config_entry(instance_id))
             .collect::<Vec<_>>()
             .join(",")
     }
@@ -285,9 +309,22 @@ fn argmin_s3_bin() -> PathBuf {
 }
 
 fn run_runtime_map_ready(bin: &Path, socket_path: &Path) -> Output {
-    Command::new(bin)
+    run_runtime_map_ready_with_extra_env(bin, socket_path, &[])
+}
+
+fn run_runtime_map_ready_with_extra_env(
+    bin: &Path,
+    socket_path: &Path,
+    extra_env: &[(&str, &str)],
+) -> Output {
+    let mut command = Command::new(bin);
+    command
         .arg("control-plane-runtime-map-ready")
-        .arg(socket_path)
+        .arg(socket_path);
+    for (key, value) in extra_env {
+        command.env(key, value);
+    }
+    command
         .output()
         .expect("runtime-map ready helper should run")
 }
@@ -369,6 +406,16 @@ fn wait_for_runtime_map_ready(
     children: &mut [&mut ChildGuard],
     raft_node_ids: &[u64],
 ) -> (PathBuf, Output) {
+    wait_for_runtime_map_ready_with_extra_env(bin, test_dir, children, raft_node_ids, &[])
+}
+
+fn wait_for_runtime_map_ready_with_extra_env(
+    bin: &Path,
+    test_dir: &Path,
+    children: &mut [&mut ChildGuard],
+    raft_node_ids: &[u64],
+    extra_env: &[(&str, &str)],
+) -> (PathBuf, Output) {
     let control_sockets = raft_node_ids
         .iter()
         .map(|node_id| test_dir.join(format!("control-{node_id}.sock")))
@@ -380,7 +427,7 @@ fn wait_for_runtime_map_ready(
             child.assert_running();
         }
         for socket in &control_sockets {
-            let output = run_runtime_map_ready(bin, socket);
+            let output = run_runtime_map_ready_with_extra_env(bin, socket, extra_env);
             if output.status.success() {
                 return (socket.clone(), output);
             }
@@ -961,15 +1008,56 @@ fn experimental_raft_two_control_plane_processes_replicate_bootstrap_to_follower
             .as_nanos()
     );
     let raft_node_ids = [101, 102];
-    let mut node102 = ChildGuard::spawn(&bin, test_dir.path(), &cluster_name, 102, &raft_node_ids);
+    let auth = ProcessTestControlPlaneAuth::new(&cluster_name);
+    let frontend_auth_credentials = auth.frontend_credentials_env(&["runtime-map-ready"]);
+    let server_auth_env = [
+        (
+            "ARGMIN_CONTROL_PLANE_AUTH_CLUSTER_ID",
+            cluster_name.as_str(),
+        ),
+        (
+            "ARGMIN_CONTROL_PLANE_FRONTEND_AUTH_CREDENTIALS",
+            frontend_auth_credentials.as_str(),
+        ),
+    ];
+    let helper_auth_env = [
+        (
+            "ARGMIN_CONTROL_PLANE_AUTH_CLUSTER_ID",
+            cluster_name.as_str(),
+        ),
+        (
+            "ARGMIN_CONTROL_PLANE_FRONTEND_AUTH_INSTANCE_ID",
+            "runtime-map-ready",
+        ),
+        (
+            "ARGMIN_CONTROL_PLANE_FRONTEND_AUTH_CREDENTIALS",
+            frontend_auth_credentials.as_str(),
+        ),
+    ];
+    let mut node102 = ChildGuard::spawn_with_extra_env(
+        &bin,
+        test_dir.path(),
+        &cluster_name,
+        102,
+        &raft_node_ids,
+        &server_auth_env,
+    );
     wait_for_socket_file(&peer_socket(test_dir.path(), 102), &mut node102);
-    let mut node101 = ChildGuard::spawn(&bin, test_dir.path(), &cluster_name, 101, &raft_node_ids);
+    let mut node101 = ChildGuard::spawn_with_extra_env(
+        &bin,
+        test_dir.path(),
+        &cluster_name,
+        101,
+        &raft_node_ids,
+        &server_auth_env,
+    );
 
-    let (leader_socket, output) = wait_for_runtime_map_ready(
+    let (leader_socket, output) = wait_for_runtime_map_ready_with_extra_env(
         &bin,
         test_dir.path(),
         &mut [&mut node101, &mut node102],
         &raft_node_ids,
+        &helper_auth_env,
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(

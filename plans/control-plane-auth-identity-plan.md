@@ -578,6 +578,13 @@ Progress:
   env generation and direct authenticated peer-frame signing, so process-test
   credentials have one source of truth before broader authenticated Unix/UAT
   conversion.
+- 2026-07-09: Extended the process auth helper to frontend runtime-map
+  credentials and converted the first experimental two-node Raft process smoke
+  to require frontend runtime-map auth on the control-plane Unix sockets. The
+  `control-plane-runtime-map-ready` helper now runs with matching signed
+  frontend credentials in that smoke, giving the standard process bootstrap
+  path real authenticated Unix coverage while preserving unauthenticated helper
+  wrappers for the remaining local/test-only paths.
 
 ## Replay Policy
 
