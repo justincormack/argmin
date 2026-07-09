@@ -4797,7 +4797,7 @@ fn internal_error_response(wire_ids: &WireResponseIds) -> S3Response {
 mod tests {
     use super::*;
     use std::io::{Read, Write};
-    use std::net::{TcpListener, TcpStream as StdTcpStream};
+    use std::net::{Shutdown, TcpListener, TcpStream as StdTcpStream};
     use std::panic::{self, AssertUnwindSafe};
     use std::sync::{
         atomic::{AtomicUsize, Ordering},
@@ -5642,6 +5642,7 @@ mod tests {
                     Err(_) => break,
                 }
             }
+            let _ = writer.shutdown(Shutdown::Write);
         });
 
         let response =
@@ -5686,6 +5687,7 @@ mod tests {
                     Err(_) => break,
                 }
             }
+            let _ = writer.shutdown(Shutdown::Write);
         });
 
         let response =
@@ -5723,7 +5725,7 @@ mod tests {
             let mut remaining = total_file_bytes;
             while remaining > 0 {
                 if stop_writer.load(Ordering::Relaxed) {
-                    return;
+                    break;
                 }
                 let next = remaining.min(WRITE_CHUNK_BYTES);
                 match writer.write_all(&body_chunk[..next]) {
@@ -5732,10 +5734,13 @@ mod tests {
                         remaining -= next;
                         std::thread::sleep(WRITE_CHUNK_DELAY);
                     }
-                    Err(_) => return,
+                    Err(_) => break,
                 }
             }
-            let _ = writer.write_all(&file_suffix);
+            if remaining == 0 {
+                let _ = writer.write_all(&file_suffix);
+            }
+            let _ = writer.shutdown(Shutdown::Write);
         });
 
         let response =
