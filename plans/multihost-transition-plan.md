@@ -4707,8 +4707,8 @@ Phase 9.1 audit checklist:
    - replacement owner: Phase 9.3 PG-primary metadata command serialization
 7. bucket operation locks
    - retired process-local mechanism:
-     `SharedStorageNode::bucket_locks`, now cfg-gated to tests/test hooks in
-     Phase 10.8
+     `SharedStorageNode::bucket_locks`, removed after the durable bucket
+     write-drain/reservation paths replaced same-process lock stripes
    - classification: request serialization and precondition stability
    - outcome: bucket property, delete, lifecycle, and object-operation request
      paths now rely on PG-primary command preconditions, durable bucket state
@@ -6029,9 +6029,10 @@ Status:
   helpers. Bucket delete/drain progress now uses durable bucket
   write-drain/reservation rows plus restartable polling; there are no remaining
   request-path same-process bucket coordination wakeups.
-- Gated the legacy `SharedStorageNode::lock_bucket` stripe lock surface to
-  tests/test hooks. Production `SharedStorageNode` no longer carries bucket
-  lock stripes, and the remaining lock probes are explicitly test-shaped.
+- Removed the legacy `SharedStorageNode::lock_bucket` stripe lock surface and
+  its lock probes entirely. Bucket-operation serialization now relies on the
+  durable bucket write-drain/reservation paths and metadata PG command
+  ownership; there are no remaining bucket stripe locks to gate to tests.
 - Removed the remaining frontend-only placeholder PG directory dependency.
   Remote frontend startup now builds a topology-only local map and installs
   Unix storage-node clients over that topology, so frontend-only processes no

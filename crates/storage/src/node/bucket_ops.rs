@@ -26,7 +26,6 @@ impl SharedStorageNode {
                 reason: reason.to_string(),
             }
         })?;
-        let _bucket_guard = self.lock_bucket(&bucket);
         let pg_id = self.pg_topology.bucket_pg_for(&bucket);
         let bucket_pg = self.get_pg(pg_id)?;
         match bucket_pg.create_bucket_with_config(config) {
@@ -260,7 +259,6 @@ impl SharedStorageNode {
         &self,
         bucket: &BucketName,
     ) -> Result<BucketDeleteFinalizeOutcome, BucketWriteDrainError> {
-        let _bucket_guard = self.lock_bucket(bucket);
         let bucket_pg_id = self.pg_topology.bucket_pg_for(bucket);
         {
             let bucket_pg = self.get_pg(bucket_pg_id)?;

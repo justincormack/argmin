@@ -13834,9 +13834,4 @@ impl super::StorageCluster {
         self.metadata_primary_bridge_node()?
             .test_lock_bucket_pg(bucket)
     }
-
-    #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_lock_bucket(&self, bucket: &BucketName) -> crate::node::BucketLockGuard<'_> {
-        self.metadata_primary_test_hook_node().lock_bucket(bucket)
-    }
 }

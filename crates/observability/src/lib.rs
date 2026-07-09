@@ -116,7 +116,6 @@ static STORAGE_RPC_PENDING_ENVELOPE_COMPLETED_TOTAL: AtomicU64 = AtomicU64::new(
 static STORAGE_RPC_PENDING_ENVELOPE_LONG_RUNNING_TOTAL: AtomicU64 = AtomicU64::new(0);
 static STORAGE_RPC_PENDING_ENVELOPE_LONG_RUNNING_US_MAX: AtomicU64 = AtomicU64::new(0);
 static STORAGE_RPC_PENDING_ENVELOPE_ACTIVE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
-static BUCKET_LOCK_WAIT_EXCEEDED_TOTAL: AtomicU64 = AtomicU64::new(0);
 static SHARD_SCAVENGER_OBSERVATION_TOTAL: AtomicU64 = AtomicU64::new(0);
 static SHARD_SCAVENGER_SCAN_INCOMPLETE_TOTAL: AtomicU64 = AtomicU64::new(0);
 static METADATA_COMMAND_CONFLICT_TOTAL: AtomicU64 = AtomicU64::new(0);
@@ -1672,7 +1671,6 @@ pub struct MetricsSnapshot {
     pub storage_rpc_pending_envelope_oldest_active_us: u64,
     pub storage_rpc_pending_envelope_oldest_active_node_id: u64,
     pub storage_rpc_pending_envelope_oldest_active_request_id: u64,
-    pub bucket_lock_wait_exceeded_total: u64,
     pub shard_scavenger_observation_total: u64,
     pub shard_scavenger_scan_incomplete_total: u64,
     pub metadata_command_conflict_total: u64,
@@ -1841,10 +1839,6 @@ impl MetricsSnapshot {
             (
                 "storage_rpc_pending_envelope_oldest_active_request_id",
                 self.storage_rpc_pending_envelope_oldest_active_request_id,
-            ),
-            (
-                "bucket_lock_wait_exceeded_total",
-                self.bucket_lock_wait_exceeded_total,
             ),
             (
                 "shard_scavenger_observation_total",
@@ -2328,7 +2322,6 @@ pub fn metrics_snapshot() -> MetricsSnapshot {
         storage_rpc_pending_envelope_oldest_active_us: pending_envelope_oldest_active.0,
         storage_rpc_pending_envelope_oldest_active_node_id: pending_envelope_oldest_active.1,
         storage_rpc_pending_envelope_oldest_active_request_id: pending_envelope_oldest_active.2,
-        bucket_lock_wait_exceeded_total: BUCKET_LOCK_WAIT_EXCEEDED_TOTAL.load(Ordering::Relaxed),
         shard_scavenger_observation_total: SHARD_SCAVENGER_OBSERVATION_TOTAL
             .load(Ordering::Relaxed),
         shard_scavenger_scan_incomplete_total: SHARD_SCAVENGER_SCAN_INCOMPLETE_TOTAL
@@ -2897,25 +2890,6 @@ pub fn emit_stream_upload_phase(
             body_bytes_received,
             segment_bytes,
             segment_count
-        )),
-    )
-}
-
-pub fn emit_bucket_lock_wait_exceeded<T: fmt::Debug>(
-    context: &TraceContext,
-    target: &'static str,
-    bucket: &T,
-    stripe: usize,
-    wait_us: u128,
-) -> bool {
-    BUCKET_LOCK_WAIT_EXCEEDED_TOTAL.fetch_add(1, Ordering::Relaxed);
-    event_in_context(
-        context,
-        target,
-        "bucket_lock_wait_exceeded",
-        Some(format_args!(
-            "bucket={:?} stripe={} wait_us={}",
-            bucket, stripe, wait_us
         )),
     )
 }
@@ -4123,7 +4097,6 @@ mod tests {
         let snapshot = MetricsSnapshot {
             request_start_total: 11,
             storage_rpc_error_total: 22,
-            bucket_lock_wait_exceeded_total: 33,
             metadata_command_checkpoint_record_compaction_failed_total: 44,
             stream_upload_finalize_error_total: 55,
             stream_upload_finalize_started_total: 66,
@@ -4139,10 +4112,6 @@ mod tests {
         );
         assert_eq!(map.get("request_start_total").copied(), Some(11));
         assert_eq!(map.get("storage_rpc_error_total").copied(), Some(22));
-        assert_eq!(
-            map.get("bucket_lock_wait_exceeded_total").copied(),
-            Some(33)
-        );
         assert_eq!(
             map.get("metadata_command_checkpoint_record_compaction_failed_total")
                 .copied(),
@@ -4248,7 +4217,6 @@ mod tests {
                 timeout_us: 5_000_000,
             },
         );
-        emit_bucket_lock_wait_exceeded(&ctx, "storage", &"bucket", 3, 1_500);
         emit_metadata_command_conflict(
             "storage",
             MetadataCommandConflictSummary {
@@ -4649,10 +4617,6 @@ mod tests {
         assert_eq!(
             after.request_admission_timeout_total,
             before.request_admission_timeout_total + 1
-        );
-        assert_eq!(
-            after.bucket_lock_wait_exceeded_total,
-            before.bucket_lock_wait_exceeded_total + 1
         );
         assert_eq!(
             after.metadata_command_conflict_total,

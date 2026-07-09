@@ -456,13 +456,18 @@ the findings below.
   or inverted bounds with the AWS-pinned lifecycle error message, so the public
   constructor can no longer build a filter state the XML parser would reject.
 
-- [ ] **W6. `bucket_lock_wait_exceeded_total` is inert in production builds.**
-  Exported by the P4 metrics sweep (observability lib.rs:1675, 1846) but its
-  only increment path, `emit_bucket_lock_wait_exceeded`, is called solely from
-  `SharedStorageNode::lock_bucket` (`storage/src/node.rs:709-733`), which is
-  `#[cfg(any(test, feature = "test-hooks"))]`. The metric always reports 0 in
-  production. Either wire production lock-contention observation or drop the
-  export.
+- [x] **W6. `bucket_lock_wait_exceeded_total` is inert in production builds.**
+  Original finding: the P4 metrics sweep exported
+  `bucket_lock_wait_exceeded_total`, but its only increment path was tied to
+  the legacy `SharedStorageNode::lock_bucket` stripe lock, so it always
+  reported 0 in production.
+
+  Fixed 2026-07-09: the obsolete bucket stripe lock was removed completely
+  instead of preserved as a test-only tripwire. This removed
+  `SharedStorageNode::lock_bucket`, `test_lock_bucket`, the associated
+  bucket-lock test hook, stale tests that only exercised that lock, and the
+  inert `bucket_lock_wait_exceeded_total` metric/export. Remaining lock
+  contention tests use production-shaped PG/metadata-command boundaries.
 
 - [ ] **W7. Smaller leftovers.** `PgTopology`'s typed error isn't fully
   honored: `node.rs:509, 582` still `.expect()` on empty `pg_ids` inside
@@ -1250,7 +1255,9 @@ each is one refactor away from a panic:
   presence, not values, so a transposition mislabels metrics silently. Fixed by
   adding `MetricsSnapshot::iter_named()` as the fixed-metric export contract,
   rendering the debug endpoint from that iterator, adding value-binding tests
-  for representative fields, and exporting `bucket_lock_wait_exceeded_total`.
+  for representative fields. Follow-up W6 removed the stale
+  `bucket_lock_wait_exceeded_total` export when the obsolete bucket stripe lock
+  was deleted.
 
 ### P5. Canonical tokens duplicated across crates / stringly-typed dispatch
 
