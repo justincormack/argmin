@@ -10715,10 +10715,10 @@ Phase 12.4 proposed scope:
   existing status/debug surfaces. These diagnostics should be available without
   granting access to raw state-machine internals.
 - Keep out of scope for 12.4: production cutover from the single-authority
-  path, dynamic configured peer-policy/membership evolution, full enforcement
-  of the shared auth foundation on storage-node, frontend, and admin
-  control-plane RPCs beyond the first Raft peer transport target, upgrade
-  compatibility for pre-release artifacts, and removing
+  path, dynamic configured peer-policy/membership evolution, production
+  mandatory-auth cutover policy for every Unix control-plane path, upgrade
+  compatibility for pre-release artifacts, TCP/non-local control-plane
+  transport, config-file based secret distribution/rotation, and removing
   `ARGMIN_CONTROL_PLANE_EXPERIMENTAL_RAFT`.
 
 Phase 12.4 exit criteria:
@@ -10743,6 +10743,37 @@ Phase 12.4 exit criteria:
   vote, last durable committed and applied log ids, last durable authority
   timestamp high-water, peer-auth failures, retry-confirmation outcomes, and
   poison reasons.
+
+Post-12.4 sequencing for TCP transport and production-shaped config:
+
+- Add shared authenticated test helpers first, in
+  [control-plane-auth-identity-plan.md](control-plane-auth-identity-plan.md),
+  so process and UAT tests can opt into authenticated Unix sockets without
+  duplicating scoped-credential setup.
+- Convert representative standard Unix multi-node/UAT paths to authenticated
+  mode. Unix sockets remain allowed in both authenticated and explicitly
+  unauthenticated local/test configurations while they are the main process
+  test transport, but the default multi-node coverage should exercise auth.
+- Lock the transport policy before adding TCP: TCP/non-local control-plane
+  transports are authenticated-only. A TCP Raft peer, control-plane admin,
+  storage-node heartbeat, or frontend runtime-map listener must reject startup
+  without the required scoped credentials. There should be no unauthenticated
+  TCP mode.
+- Introduce a control-plane configuration-file surface with the TCP transport
+  slice rather than continuing to grow flat env vars. The first file format
+  should cover cluster identity, transport listeners, static peer endpoints,
+  scoped credential ids/versions and secret references, rotation windows, auth
+  requirement modes, and the existing restart-artifact/peer-policy identity
+  checks. Env vars may remain as test overrides and local shortcuts.
+- Add TCP Raft peer transport as a distinct multihost slice after the config
+  file/auth-helper work. TCP is not just an auth change: it affects peer
+  addressing, listener lifecycle, connection retry/backoff, source/target
+  identity binding, and operational deployment shape. It must reuse the shared
+  auth envelope and fail closed before OpenRaft dispatch.
+- Defer dynamic configured peer-policy updates and formal admin API
+  restructuring unless the TCP/config-file work exposes a concrete ambiguity.
+  Admin API formalization is likely a later production-readiness slice, not a
+  prerequisite for the first authenticated TCP transport.
 
 Phase 12.4 progress:
 
