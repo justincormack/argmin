@@ -11113,6 +11113,12 @@ fn store_error_response(error: StoreError) -> StorageRpcErrorResponse {
             code: StorageRpcErrorCode::MetadataCommandContention,
             message: format!("metadata command contention during {context}"),
         },
+        error @ (StoreError::IntegrityError { .. } | StoreError::ShardAckMismatch { .. }) => {
+            StorageRpcErrorResponse {
+                code: StorageRpcErrorCode::ShardIntegrity,
+                message: error.to_string(),
+            }
+        }
         error => StorageRpcErrorResponse {
             code: StorageRpcErrorCode::Internal,
             message: error.to_string(),
@@ -14860,7 +14866,7 @@ mod tests {
         let error = decode_storage_rpc_response_payload(&mismatch.payload)
             .unwrap()
             .unwrap_err();
-        assert_eq!(error.code, StorageRpcErrorCode::Internal);
+        assert_eq!(error.code, StorageRpcErrorCode::ShardIntegrity);
         assert!(error.message.contains("ack mismatch"));
     }
 

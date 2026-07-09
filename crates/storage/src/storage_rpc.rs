@@ -766,6 +766,7 @@ pub enum StorageRpcErrorCode {
     MetadataCommandContention = 20,
     MetadataTransferHistoricalRouteActive = 21,
     TransportTimeout = 22,
+    ShardIntegrity = 23,
 }
 
 impl StorageRpcErrorCode {
@@ -793,6 +794,7 @@ impl StorageRpcErrorCode {
             20 => Ok(Self::MetadataCommandContention),
             21 => Ok(Self::MetadataTransferHistoricalRouteActive),
             22 => Ok(Self::TransportTimeout),
+            23 => Ok(Self::ShardIntegrity),
             _ => Err(StorageRpcPayloadError::InvalidResponseEnvelope(
                 "unknown storage RPC error code",
             )),

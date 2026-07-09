@@ -1237,24 +1237,15 @@ Confirmed (verified directly).
 
 ### RPC3. MEDIUM — Remote shard corruption/absence classification for EC reconstruction depends on matching error `Display` strings inside a generic `Internal` code
 
-Confirmed.
+Fixed.
 
-- The server collapses `StoreError::ShardAckMismatch` (CRC/size mismatch on
-  read) and most store errors to `StorageRpcErrorCode::Internal` +
-  `error.to_string()` (`store_error_response`,
-  `storage_node_server.rs:10056-10071`). The client-side EC read path
-  re-derives "recoverable" from message text:
-  `is_recoverable_remote_shard_read_error` requires `code == Internal &&
-  (message == "shard not found" || message.contains(" ack mismatch: "))`
-  (`cluster.rs:11474-11483`).
-- Any rewording of those Display strings — or a mixed-version cluster
-  formatting the message differently — silently converts a recoverable
-  corrupted-shard read (which should trigger EC reconstruction per the
-  invariants guide) into a fail-closed read error; conversely an unrelated
-  `Internal` error containing " ack mismatch: " would be misclassified as
-  recoverable and swallowed. Corruption should get its own
-  `StorageRpcErrorCode` (e.g. `ShardIntegrity`) that round-trips to
-  `StoreError::IntegrityError`.
+- `StorageRpcErrorCode::ShardIntegrity` now carries shard corruption/CRC
+  mismatch responses across the Unix RPC boundary. `StoreError::ShardAckMismatch`
+  and `StoreError::IntegrityError` no longer collapse to generic `Internal`.
+- EC reconstruction now classifies recoverable remote shard read failures from
+  typed RPC codes (`NotFound` and `ShardIntegrity`) rather than matching
+  display strings. Regression coverage verifies that old `Internal` strings such
+  as `"shard not found"` and `" ack mismatch: "` are not treated as recoverable.
 
 ### RPC4. MEDIUM (latent until epochs diverge) — Read-handle/delete fencing is keyed by `ShardLocation` including `cluster_epoch`, but the physical shard file is epoch-agnostic
 
