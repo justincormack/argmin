@@ -1,0 +1,299 @@
+Authenticated control-plane handler leaves admin RPCs open
+Link: https://chatgpt.com/codex/cloud/security/findings/aa4597ef590481919d5427960d0326a7?sev=&repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin&sort=date_desc
+Criticality: medium (attack path: medium)
+Status: fixed
+
+# Metadata
+Repo: justincormack/argmin
+Commit: 69b61e6
+Author: justin@specialbusservice.com
+Created: 07/07/2026, 22:01:47
+Assignee: Unassigned
+Signals: Security, Validated, Attack-path
+
+# Summary
+Introduced: the new authenticated wrapper gives the appearance of an authenticated control-plane Unix stream, but authentication is enforced only for storage-node heartbeat refreshes and not for the rest of the RPC multiplexer.
+The commit introduces `handle_control_plane_unix_stream_with_auth` and `respond_control_plane_unix_request_with_auth`, which route requests through `build_control_plane_unix_response_with_auth` with an auth verifier. However, `build_control_plane_unix_response_with_auth` only checks the verifier in the `RefreshNodeHeartbeat` match arm. Other sensitive RPCs, including runtime-map reads, `SetPgActingSet`, metadata-transfer acting-set changes, Raft leadership transfer, snapshot purge, and election trigger, are handled exactly as before with no authentication envelope required. A caller deploying the new `_with_auth` handler as the authenticated storage-node/control-plane endpoint would still allow unauthenticated clients that can reach the Unix socket to perform control-plane mutations or retrieve cluster metadata.
+
+# Validation
+## Rubric
+- [x] Identify whether the new authenticated Unix handler actually routes all requests through a verifier-bearing path.
+- [x] Confirm the verifier is enforced for at least the intended heartbeat RPC, so the auth mechanism itself is active.
+- [x] Check whether non-heartbeat sensitive RPC match arms consult `auth_verifier` before reading payloads or mutating state.
+- [x] Dynamically exercise one unauthenticated sensitive RPC through `build_control_plane_unix_response_with_auth(..., Some(verifier))` and verify state changes.
+- [x] Use a debugger trace to confirm the vulnerable execution path reaches the mutation call with the authenticated dispatcher active.
+## Report
+Validated the finding. Code review showed that `handle_control_plane_unix_stream_with_auth` passes `Some(auth_verifier)` into `build_control_plane_unix_response_with_auth` at `crates/storage/src/control_plane.rs:5248-5264`, but the verifier is only consulted in the `RefreshNodeHeartbeat` arm at `:5345-5350`. Sensitive arms such as `SetPgActingSet` call `control_plane.set_pg_acting_set(...)` directly at `:5364-5368`, and Raft/snapshot operations likewise proceed at `:5438-5465` without an auth check. I added a minimal in-tree PoC unit test that constructs a real `ControlPlaneUnixAuthVerifier`, sends a raw unsigned `ControlPlaneRpcKind::SetPgActingSet` request through `build_control_plane_unix_response_with_auth(..., Some(&verifier))`, and asserts that the PG acting set is created and the cluster epoch advances. Command output: `test control_plane::tests::authenticated_control_plane_accepts_unauthenticated_set_pg_acting_set_request ... ok`. As a contrast, the existing heartbeat test `authenticated_control_plane_rejects_missing_storage_node_heartbeat_auth` also passes, confirming unsigned heartbeat is rejected while unsigned non-heartbeat mutation is accepted. I attempted valgrind, but it is unavailable in the container (`bash: command not found: valgrind`). I then used LLDB on the debug test binary: at dispatcher entry LLDB showed `request.kind = SetPgActingSet` and an `auth_verifier` argument, then after continuing it stopped at `control_plane.rs:5368` immediately before `control_plane.set_pg_acting_set(pg_id, acting_set)`, with backtrace from the PoC test. This confirms the authenticated dispatcher executes a control-plane mutation without verifying an auth envelope.
+
+# Evidence
+crates/storage/src/control_plane.rs (L5248 to 5264)
+  Note: New authenticated stream handler passes an auth verifier into the generic control-plane response builder, implying the stream is being handled in authenticated mode.
+```
+pub fn handle_control_plane_unix_stream_with_auth<T>(
+    control_plane: &mut T,
+    stream: &mut UnixStream,
+    authority_now_ms: u64,
+    auth_verifier: &ControlPlaneUnixAuthVerifier,
+) -> Result<(), ControlPlaneError>
+where
+    T: ControlPlaneAdmin + ControlPlaneHeartbeatRuntimeMapSource + ControlPlaneRuntimeMapSource,
+{
+    let request = read_control_plane_unix_request(stream)?;
+    let response = build_control_plane_unix_response_with_auth(
+        control_plane,
+        request,
+        authority_now_ms,
+        Some(auth_verifier),
+    )?;
+    write_control_plane_unix_response(stream, response)
+```
+
+crates/storage/src/control_plane.rs (L5297 to 5350)
+  Note: The auth verifier is optional and is only consulted in the RefreshNodeHeartbeat branch.
+```
+pub fn build_control_plane_unix_response_with_auth<T>(
+    control_plane: &mut T,
+    request: ControlPlaneRpcRequest,
+    authority_now_ms: u64,
+    auth_verifier: Option<&ControlPlaneUnixAuthVerifier>,
+) -> Result<ControlPlaneRpcResponse, ControlPlaneError>
+where
+    T: ControlPlaneAdmin + ControlPlaneHeartbeatRuntimeMapSource + ControlPlaneRuntimeMapSource,
+{
+    let ControlPlaneRpcRequest { kind, payload } = request;
+    let response = match kind {
+        ControlPlaneRpcKind::RuntimeMapSnapshot => {
+            let reader = PayloadReader::new(&payload);
+            reader.finish()?;
+            match control_plane.runtime_map_snapshot(authority_now_ms) {
+                Ok(snapshot) => {
+                    let mut response = Vec::new();
+                    write_runtime_map_snapshot(&mut response, &snapshot)?;
+                    Ok(response)
+                }
+                Err(error) => Err(error),
+            }
+        }
+        ControlPlaneRpcKind::RuntimeMapStatus => {
+            let reader = PayloadReader::new(&payload);
+            reader.finish()?;
+            match control_plane.runtime_map_status(authority_now_ms) {
+                Ok(status) => {
+                    let mut response = Vec::new();
+                    write_runtime_map_status(&mut response, status)?;
+                    Ok(response)
+                }
+                Err(error) => Err(error),
+            }
+        }
+        ControlPlaneRpcKind::PgRuntimeMapSnapshot => {
+            let mut reader = PayloadReader::new(&payload);
+            let pg_id = read_pg_id_request(&mut reader)?;
+            reader.finish()?;
+            match control_plane.pg_runtime_map_snapshot(pg_id, authority_now_ms) {
+                Ok(snapshot) => {
+                    let mut response = Vec::new();
+                    write_runtime_map_snapshot(&mut response, &snapshot)?;
+                    Ok(response)
+                }
+                Err(error) => Err(error),
+            }
+        }
+        ControlPlaneRpcKind::RefreshNodeHeartbeat => {
+            let payload = match auth_verifier {
+                Some(auth_verifier) => auth_verifier
+                    .verify_storage_node_heartbeat_payload(&payload, authority_now_ms)?,
+                None => payload,
+            };
+```
+
+crates/storage/src/control_plane.rs (L5364 to 5445)
+  Note: Sensitive mutation RPCs such as SetPgActingSet, metadata-transfer acting-set changes, and Raft leadership transfer execute without checking auth_verifier.
+```
+        ControlPlaneRpcKind::SetPgActingSet => {
+            let mut reader = PayloadReader::new(&payload);
+            let (pg_id, acting_set) = read_pg_acting_set_request(&mut reader)?;
+            reader.finish()?;
+            match control_plane.set_pg_acting_set(pg_id, acting_set) {
+                Ok(snapshot) => {
+                    let mut response = Vec::new();
+                    write_u64(&mut response, snapshot.cluster_epoch().get());
+                    Ok(response)
+                }
+                Err(error) => Err(error),
+            }
+        }
+        ControlPlaneRpcKind::FencePgForMetadataTransferRuntimeMap => {
+            let mut reader = PayloadReader::new(&payload);
+            let pg_id = read_pg_id_request(&mut reader)?;
+            reader.finish()?;
+            match control_plane
+                .fence_pg_for_metadata_transfer_with_source_lease(pg_id)
+                .and_then(|fenced| {
+                    let (snapshot, source_primary_lease_deadline_ms) = fenced.into_parts();
+                    snapshot
+                        .reconstructed_runtime_map_for_pg_with_fallback_validity(
+                            pg_id,
+                            non_serving_runtime_map_validity(authority_now_ms),
+                        )
+                        .map(|runtime_map| (runtime_map, source_primary_lease_deadline_ms))
+                }) {
+                Ok((snapshot, source_primary_lease_deadline_ms)) => {
+                    let mut response = Vec::new();
+                    write_runtime_map_snapshot(&mut response, &snapshot)?;
+                    write_option_u64(&mut response, source_primary_lease_deadline_ms);
+                    Ok(response)
+                }
+                Err(error) => Err(error),
+            }
+        }
+        ControlPlaneRpcKind::SetPgActingSetWithMetadataTransfer => {
+            let mut reader = PayloadReader::new(&payload);
+            let (pg_id, acting_set, transfer) =
+                read_pg_acting_set_with_metadata_transfer_request(&mut reader)?;
+            reader.finish()?;
+            match control_plane
+                .set_pg_acting_set_with_metadata_transfer(pg_id, acting_set, transfer)
+            {
+                Ok(snapshot) => {
+                    let mut response = Vec::new();
+                    write_u64(&mut response, snapshot.cluster_epoch().get());
+                    Ok(response)
+                }
+                Err(error) => Err(error),
+            }
+        }
+        ControlPlaneRpcKind::SetPgActingSetWithMetadataTransferRuntimeMap => {
+            let mut reader = PayloadReader::new(&payload);
+            let (pg_id, acting_set, transfer) =
+                read_pg_acting_set_with_metadata_transfer_request(&mut reader)?;
+            reader.finish()?;
+            match control_plane
+                .set_pg_acting_set_with_metadata_transfer(pg_id, acting_set, transfer)
+                .and_then(|snapshot| {
+                    snapshot.reconstructed_runtime_map_for_pg_with_fallback_validity(
+                        pg_id,
+                        non_serving_runtime_map_validity(authority_now_ms),
+                    )
+                }) {
+                Ok(snapshot) => {
+                    let mut response = Vec::new();
+                    write_runtime_map_snapshot(&mut response, &snapshot)?;
+                    Ok(response)
+                }
+                Err(error) => Err(error),
+            }
+        }
+        ControlPlaneRpcKind::TransferRaftLeadership => {
+            let mut reader = PayloadReader::new(&payload);
+            let node_id = reader.read_u64()?;
+            reader.finish()?;
+            match control_plane.transfer_raft_leadership_to(node_id) {
+                Ok(()) => Ok(Vec::new()),
+                Err(error) => Err(error),
+            }
+```
+
+crates/storage/src/control_plane.rs (L5447 to 5465)
+  Note: Additional control-plane operations such as snapshot purge and election trigger also execute without authentication in the authenticated handler path.
+```
+        ControlPlaneRpcKind::TriggerRaftSnapshotAndPurge => {
+            let reader = PayloadReader::new(&payload);
+            reader.finish()?;
+            match control_plane.trigger_raft_snapshot_and_purge() {
+                Ok(snapshot_index) => {
+                    let mut response = Vec::new();
+                    write_option_u64(&mut response, snapshot_index);
+                    Ok(response)
+                }
+                Err(error) => Err(error),
+            }
+        }
+        ControlPlaneRpcKind::TriggerRaftElection => {
+            let reader = PayloadReader::new(&payload);
+            reader.finish()?;
+            match control_plane.trigger_raft_election() {
+                Ok(()) => Ok(Vec::new()),
+                Err(error) => Err(error),
+            }
+```
+
+crates/storage/src/control_plane.rs (L5492 to 5508)
+  Note: The request-response helper with auth has the same issue: it passes Some(auth_verifier), but non-heartbeat RPCs remain unauthenticated inside the shared dispatcher.
+```
+pub fn respond_control_plane_unix_request_with_auth<T>(
+    control_plane: &mut T,
+    stream: &mut UnixStream,
+    request: ControlPlaneRpcRequest,
+    authority_now_ms: u64,
+    auth_verifier: &ControlPlaneUnixAuthVerifier,
+) -> Result<(), ControlPlaneError>
+where
+    T: ControlPlaneAdmin + ControlPlaneHeartbeatRuntimeMapSource + ControlPlaneRuntimeMapSource,
+{
+    let response = build_control_plane_unix_response_with_auth(
+        control_plane,
+        request,
+        authority_now_ms,
+        Some(auth_verifier),
+    )?;
+    write_control_plane_unix_response(stream, response)
+```
+
+# Attack-path analysis
+Final: medium | Decider: model_decided | Matrix severity: ignore | Policy adjusted: ignore
+## Rationale
+Adjusted from high to medium. The dispatcher bug is real and validated: non-heartbeat RPC arms execute without auth verification even when Some(auth_verifier) is provided. The impact of those RPCs is high for integrity/availability. However, repository evidence materially weakens reachability: the main argmin-s3 control-plane worker calls build_control_plane_unix_response, not the new *_with_auth path, and the control-plane transport is a local Unix socket protected by a private owner-only parent directory. This makes exploitation in the stock product low-likelihood and internal/local rather than a public control-plane auth bypass.
+## Likelihood
+low - Exploitation is local/internal only, requires Unix-socket reachability, and the reviewed argmin-s3 binary does not currently wire the vulnerable authenticated handler. Socket-directory privacy checks further reduce exposure to arbitrary local users.
+## Impact
+high - If the authenticated handler is deployed as the control-plane trust boundary, an unsigned local client can invoke privileged cluster-control operations that change PG placement, affect metadata-transfer state, force leadership changes/elections, or purge snapshots, creating high integrity and availability impact.
+## Assumptions
+- The reviewed checkout is representative of the deployed product; no external deployment manifests or downstream users of the storage crate were available.
+- Unix-domain socket filesystem permissions are enforced by the host OS as written.
+- An attacker in the relevant path can construct raw control-plane RPC frames but does not know valid control-plane authentication credentials.
+- A process must serve the control-plane Unix RPC using handle_control_plane_unix_stream_with_auth or respond_control_plane_unix_request_with_auth.
+- The attacker must be able to connect to the Unix socket path.
+- The attacker must craft a valid unwrapped ControlPlaneRpcKind frame for a non-heartbeat operation.
+## Path
+attacker(local) -> Unix socket -> *_with_auth handler -> dispatcher verifies only heartbeat -> unsigned admin RPC executes
+## Path evidence
+- `crates/storage/src/control_plane.rs:5248-5264` - New authenticated stream handler reads a Unix RPC request and passes Some(auth_verifier) into the shared dispatcher.
+- `crates/storage/src/control_plane.rs:5297-5350` - Shared authenticated dispatcher accepts an optional verifier, but the verifier is only invoked in the RefreshNodeHeartbeat arm.
+- `crates/storage/src/control_plane.rs:5364-5465` - Sensitive control-plane operations including SetPgActingSet, metadata-transfer operations, Raft leadership transfer, snapshot purge, and election trigger execute without checking auth_verifier.
+- `crates/storage/src/control_plane.rs:5492-5508` - The request-response helper with auth has the same routing pattern: it passes Some(auth_verifier) into the dispatcher but relies on incomplete per-arm checks.
+- `crates/argmin-s3/src/main.rs:2885-2907` - The stock argmin-s3 control-plane RPC worker reads requests and calls build_control_plane_unix_response, not build_control_plane_unix_response_with_auth or the authenticated handler.
+- `crates/argmin-s3/src/main.rs:2939-3016` - Control-plane Unix socket binding requires an absolute path, creates a private 0700 parent directory when missing, and rejects parent directories that are group/world accessible or not owned by the service UID.
+- `crates/argmin-s3/src/config.rs:169-176` - Configuration documents the control-plane socket as an internal ARGMIN_CONTROL_PLANE_SOCKET_PATH and only Raft peer auth credentials are exposed in config.
+## Narrative
+The core claim is valid at the dispatcher level: the new authenticated Unix control-plane path supplies an auth verifier, but build_control_plane_unix_response_with_auth consults it only for RefreshNodeHeartbeat. Sensitive non-heartbeat arms call control_plane methods directly. Validation evidence included an executable unit-test PoC showing an unsigned SetPgActingSet request succeeds with Some(verifier). The severity is reduced from high because the stock argmin-s3 control-plane worker was found to call the unauthenticated dispatcher rather than the new *_with_auth handler, and the control-plane transport is a local Unix socket whose parent directory must be private and owned by the service UID. If a deployment or downstream user adopts the new authenticated handler as the trust boundary, impact is high, but repository evidence supports low exploitation likelihood in the main product.
+## Controls
+- Unix-domain socket transport only for control-plane RPCs
+- Socket parent directory must be private and owned by the service UID
+- Read/write timeouts and worker limit on control-plane RPC workers
+- Auth envelope verification exists but is enforced only for RefreshNodeHeartbeat in the vulnerable dispatcher
+- Stock argmin-s3 control-plane process currently uses the unauthenticated dispatcher rather than the new authenticated handler
+## Blindspots
+- No deployment manifests were present to prove whether any production environment wires handle_control_plane_unix_stream_with_auth outside the stock argmin-s3 binary.
+- Static review cannot verify actual runtime Unix socket filesystem modes after umask or operator-created directory choices, though the code rejects non-private parent directories.
+- Downstream users of the public storage crate API could be affected even if the repository's primary binary does not call the authenticated handler.
+
+# Resolution
+Status: fixed in later commits.
+
+The reported dispatcher gap is stale against current HEAD. The authenticated Unix control-plane dispatcher now verifies configured auth for each control-plane auth class before dispatch:
+
+- Admin mutations and Raft admin operations are classified as `AdminControlPlaneCommand` and verified by `verify_admin_control_plane_command_payload()` before their match arms parse or mutate state.
+- Runtime-map read RPCs are classified as `FrontendRuntimeMapRead` and verified by `verify_frontend_runtime_map_read_payload()` when frontend read credentials are configured.
+- Storage-node heartbeat refreshes continue to require `StorageRuntimeMapRefresh` auth when storage-node heartbeat credentials are configured.
+
+Relevant fixes include:
+
+- `491017af2bc8661f67a1e8267309b7b05d45d2f7` (`Authenticate admin control-plane commands`) added admin command verification for privileged control-plane RPCs.
+- `01a8e8cf309ec49072f7dd175f111e7b2c06b656` (`Authenticate frontend runtime map reads`) added frontend runtime-map read verification.
+- `3747b078bdb891ed4df84d904054a92dbc86e0eb` (`Classify Unix control-plane RPC auth operations`) made each Unix control-plane RPC kind map to an explicit auth operation.
+- `c3225c9fa1c581efd81d7dab894c407bd3dd69a3` (`Authenticate admin control-plane responses`) added signed admin responses for authenticated admin RPCs.
+
+Regression coverage now includes the original PoC shape: `authenticated_control_plane_rejects_missing_admin_command_auth` sends a raw unsigned `SetPgActingSet` request through `build_control_plane_unix_response_with_auth(..., Some(&verifier))`, asserts rejection, and asserts the control-plane snapshot is unchanged. `control_plane_rpc_kinds_have_explicit_auth_operations` also pins that `SetPgActingSet`, metadata-transfer mutations, Raft leadership transfer, snapshot/purge, and election trigger are all `AdminControlPlaneCommand` RPCs.
+
+Residual note: auth is still enabled by configured credential class. If only storage-node heartbeat credentials are configured, admin RPC auth is not implicitly required. That is the current deployment policy boundary and is tracked separately from this stale dispatcher bug.
