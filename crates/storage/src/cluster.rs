@@ -11357,6 +11357,7 @@ fn metadata_command_checkpoint_record_storage_rpc_error_kind(
             "storage_rpc_metadata_transfer_historical_route_active"
         }
         StorageRpcErrorCode::TransportTimeout => "storage_rpc_transport_timeout",
+        StorageRpcErrorCode::TransportClosed => "storage_rpc_transport_closed",
         StorageRpcErrorCode::ShardIntegrity => "storage_rpc_shard_integrity",
     }
 }
@@ -11427,6 +11428,14 @@ mod metadata_command_checkpoint_record_error_tests {
                 operation: "metadata command replica state",
                 code: StorageRpcErrorCode::MetadataTransferHistoricalRouteActive,
                 message: "historical peering inspection for PG 7 at epoch 42 requires Peering route, got active".to_string(),
+            },
+        ));
+        assert!(metadata_command_checkpoint_record_error_is_stale(
+            &StoreError::StorageRpc {
+                node_id: 0,
+                operation: "metadata command checkpoint record current",
+                code: StorageRpcErrorCode::TransportClosed,
+                message: "storage RPC stream I/O error: early eof".to_string(),
             },
         ));
         assert!(!metadata_command_checkpoint_record_error_is_stale(
@@ -11509,6 +11518,32 @@ mod metadata_command_checkpoint_record_error_tests {
             "metadata_transfer_unsupported_proof"
         );
     }
+
+    #[test]
+    fn shard_backfill_candidate_treats_restart_connect_failure_as_deferred() {
+        assert!(shard_backfill_candidate_error_is_deferred(
+            &StoreError::Io {
+                context: "connect storage-node RPC socket",
+                source: std::io::Error::new(std::io::ErrorKind::NotFound, "node socket missing"),
+            },
+        ));
+        assert!(shard_backfill_candidate_error_is_deferred(
+            &StoreError::StorageRpc {
+                node_id: 0,
+                operation: "list shard scavenger payload references",
+                code: StorageRpcErrorCode::TransportClosed,
+                message: "storage RPC stream I/O error: early eof".to_string(),
+            },
+        ));
+        assert!(!shard_backfill_candidate_error_is_deferred(
+            &StoreError::StorageRpc {
+                node_id: 0,
+                operation: "list shard scavenger payload references",
+                code: StorageRpcErrorCode::PayloadDecode,
+                message: "storage RPC frame checksum mismatch".to_string(),
+            },
+        ));
+    }
 }
 
 fn metadata_command_checkpoint_record_decision(
@@ -11564,6 +11599,10 @@ fn shard_backfill_candidate_error_is_deferred(error: &StoreError) -> bool {
         | StoreError::StaleShardOperation { .. }
         | StoreError::StaleShardLocation { .. }
         | StoreError::StorageRpcResourceExhausted { .. } => true,
+        StoreError::Io {
+            context: "connect storage-node RPC socket",
+            ..
+        } => true,
         StoreError::StorageRpc { code, .. } => storage_rpc_code_is_retryable_pg_route_error(*code),
         _ => false,
     }
@@ -11578,6 +11617,7 @@ fn storage_rpc_code_is_retryable_pg_route_error(code: StorageRpcErrorCode) -> bo
             | StorageRpcErrorCode::WrongClusterEpoch
             | StorageRpcErrorCode::MetadataCommandContention
             | StorageRpcErrorCode::TransportTimeout
+            | StorageRpcErrorCode::TransportClosed
     )
 }
 

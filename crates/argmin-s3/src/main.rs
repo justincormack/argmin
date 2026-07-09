@@ -1314,6 +1314,7 @@ fn store_error_is_transient_route_refresh_for_metadata_transfer(error: &StoreErr
                 || *code == StorageRpcErrorCode::MetadataTransferHistoricalRouteActive
                 || *code == StorageRpcErrorCode::MetadataCommandContention
                 || *code == StorageRpcErrorCode::TransportTimeout
+                || *code == StorageRpcErrorCode::TransportClosed
         }
         StoreError::ShardStore { source, .. } => {
             store_error_is_transient_route_refresh_for_metadata_transfer(source)
@@ -8789,6 +8790,18 @@ mod tests {
             operation: "read storage RPC response",
             code: StorageRpcErrorCode::TransportTimeout,
             message: "storage RPC stream I/O error: timed out".to_string(),
+        });
+
+        assert!(metadata_transfer_error_is_transient_route_refresh(&error));
+    }
+
+    #[test]
+    fn metadata_transfer_retry_treats_transport_closed_as_transient() {
+        let error = PgMetadataTransferError::Store(StoreError::StorageRpc {
+            node_id: 0,
+            operation: "read storage RPC response",
+            code: StorageRpcErrorCode::TransportClosed,
+            message: "storage RPC stream I/O error: early eof".to_string(),
         });
 
         assert!(metadata_transfer_error_is_transient_route_refresh(&error));

@@ -395,6 +395,16 @@ fn storage_rpc_stream_error(
         {
             StorageRpcErrorCode::TransportTimeout
         }
+        StorageRpcStreamError::Io(source)
+            if matches!(
+                source.kind(),
+                io::ErrorKind::UnexpectedEof
+                    | io::ErrorKind::ConnectionReset
+                    | io::ErrorKind::BrokenPipe
+            ) =>
+        {
+            StorageRpcErrorCode::TransportClosed
+        }
         _ => StorageRpcErrorCode::PayloadDecode,
     };
     StoreError::StorageRpc {

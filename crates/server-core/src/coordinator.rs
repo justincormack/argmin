@@ -159,6 +159,7 @@ fn storage_rpc_code_is_retryable_route_state(code: storage::StorageRpcErrorCode)
             | storage::StorageRpcErrorCode::WrongClusterEpoch
             | storage::StorageRpcErrorCode::MetadataCommandContention
             | storage::StorageRpcErrorCode::TransportTimeout
+            | storage::StorageRpcErrorCode::TransportClosed
     )
 }
 

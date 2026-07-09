@@ -1919,6 +1919,7 @@ fn shard_backfill_remote_error_is_stale_retry(code: storage::StorageRpcErrorCode
             | storage::StorageRpcErrorCode::InactivePgRoute
             | storage::StorageRpcErrorCode::NonActingSetAccess
             | storage::StorageRpcErrorCode::TransportTimeout
+            | storage::StorageRpcErrorCode::TransportClosed
             | storage::StorageRpcErrorCode::WrongClusterEpoch
     )
 }
@@ -3323,6 +3324,15 @@ mod tests {
                 operation: "complete placed segment shard backfill claim",
                 code: storage::StorageRpcErrorCode::TransportTimeout,
                 message: "storage RPC stream I/O error: timed out".to_string(),
+            }),
+            "complete_stale"
+        );
+        assert_eq!(
+            shard_backfill_completion_error_event(&StoreError::StorageRpc {
+                node_id: 2,
+                operation: "complete placed segment shard backfill claim",
+                code: storage::StorageRpcErrorCode::TransportClosed,
+                message: "storage RPC stream I/O error: early eof".to_string(),
             }),
             "complete_stale"
         );

@@ -91,6 +91,42 @@ fn unix_storage_node_client_times_out_waiting_for_response() {
 }
 
 #[test]
+fn storage_rpc_stream_closed_maps_to_transport_closed() {
+    let error = storage_rpc_stream_error(
+        NodeId::new(7),
+        "read storage RPC response",
+        StorageRpcStreamError::Io(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "storage-node closed the connection",
+        )),
+    );
+    assert!(matches!(
+        error,
+        StoreError::StorageRpc {
+            node_id: 7,
+            operation: "read storage RPC response",
+            code: StorageRpcErrorCode::TransportClosed,
+            ..
+        }
+    ));
+
+    let error = storage_rpc_stream_error(
+        NodeId::new(7),
+        "read storage RPC response",
+        StorageRpcStreamError::Frame(crate::storage_rpc::StorageRpcFrameError::UnknownMagic),
+    );
+    assert!(matches!(
+        error,
+        StoreError::StorageRpc {
+            node_id: 7,
+            operation: "read storage RPC response",
+            code: StorageRpcErrorCode::PayloadDecode,
+            ..
+        }
+    ));
+}
+
+#[test]
 fn unix_storage_node_metadata_session_times_out_waiting_for_response() {
     let tmp = test_util::tempdir();
     let config = test_config(&tmp);

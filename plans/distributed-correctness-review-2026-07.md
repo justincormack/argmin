@@ -1266,25 +1266,31 @@ Confirmed in code; live only from Phase 11 operations on.
   file under the reader. Recommend keying fences on `(data_pg_id, shard_key)`
   only (epoch and node id are validated separately).
 
-### RPC5. MEDIUM — All client transport failures collapse to `StoreError::StorageRpc { code: PayloadDecode }`, erasing committed-but-response-lost vs never-sent
+### RPC5. MEDIUM — Client transport failures are only partially typed, so committed-but-response-lost vs never-sent is still not explicit
 
-Confirmed.
+Partially fixed.
 
-- Write failures, read EOFs, and genuine decode failures all funnel through
-  `rpc_payload_error(...)` (`unix_rpc.rs:1448`, :1495, :1618-1625;
-  `unix_sessions.rs:140-145`, :235-246). A response lost after the server
-  durably applied a command or fsynced a shard is indistinguishable from a
-  connection refused before any side effect.
+- Client-side RPC read timeouts now surface as
+  `StorageRpcErrorCode::TransportTimeout`, and stream closures such as EOF,
+  reset, and broken pipe now surface as `StorageRpcErrorCode::TransportClosed`
+  instead of `PayloadDecode`. Genuine frame/payload parse errors remain
+  `PayloadDecode`, so diagnostics can distinguish closed transport from a peer
+  codec bug.
+- Connect failures still surface as `StoreError::Io { context: "connect
+  storage-node RPC socket", .. }` rather than a typed RPC code. Write-side
+  partial send vs response-lost is still not split: a transport close after a
+  request may mean either that the peer never received the full request or that
+  it durably applied the operation and the response was lost.
 - Consequences are contained today because every mutating primitive is
   idempotent by durable identity and callers treat these errors fail-closed —
   but the 10.9 rule "unknown publish/commit outcome must fail closed, not map
   to retryable overload" is enforced only by this accidental conservatism.
-  Nothing in the type system marks these errors ambiguous-side-effect; a
-  future mapper change routing them to a retryable class would silently
-  create double-apply exposure, and diagnostics cannot count EOFs separately
-  from real codec bugs. Introduce distinct variants: `TransportConnect` (no
-  side effect possible), `TransportSendPartial`/`TransportResponseLost` (side
-  effect ambiguous), `PayloadDecode` (peer bug).
+  Nothing in the type system marks send-partial/response-lost as
+  ambiguous-side-effect; a future mapper change routing them to a retryable
+  class would silently create double-apply exposure. Remaining work is to make
+  the send/connect boundary explicit, for example with variants such as
+  `TransportConnect` (no side effect possible) and
+  `TransportSendPartial`/`TransportResponseLost` (side effect ambiguous).
 
 ### RPC6. LOW — `write_shard_file_durable_if_absent` returns `StoreError::NotFound` after losing the create/delete race twice
 
@@ -1422,9 +1428,9 @@ reject `Forever`; freshness proofs still have zero production consumers),
 CP6/CP7, CP9, CP10 (partial: canonical re-encode equality on parse; no
 checksum trailer or cluster identity), CP11 (a compact `runtime_map_status`
 RPC exists but only the CLI uses it), CL5, CL6, CL7 (relocated to
-`request_ops.rs:10537-10541`), RPC3, RPC4, RPC5 (partial: `TransportTimeout`
-added; connect/EOF/reset/partial-write still collapse to `PayloadDecode`),
-RPC6, RPC7, RPC9, MD7.
+`request_ops.rs:10537-10541`), RPC3, RPC4, RPC5 (partial:
+`TransportTimeout` and `TransportClosed` typed; connect remains `StoreError::Io`
+and send-partial vs response-lost is still not split), RPC6, RPC7, RPC9, MD7.
 
 ## New findings (INT-*)
 
