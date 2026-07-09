@@ -40,11 +40,15 @@ will otherwise need unsafe manual recovery.
 
 There is substantial useful evidence already: deterministic control-plane
 command application, checksummed codecs, durable all-acting-replica metadata
-fanout, focused recovery tests, and real three-process OpenRaft tests. The gap
+fanout, focused recovery tests, real three-process OpenRaft tests, and ongoing
+multihost correctness soaks. The soak repeat bound has been increased over
+time and is running at `--repeat 100` as of this correction; those runs have
+found multiple defects that were fixed in recent commits. The remaining gap
 is that most tests still share the implementation's assumptions, clocks,
-host, scheduler, and storage behavior. Before production, the project needs an
-explicit fault model, executable invariant register, deterministic fault
-simulator, black-box history checking, crash-boundary matrix, and release-mode
+host, scheduler, and storage behavior, while rare soak failures can take
+several hours to surface. Before production, the project needs an explicit
+fault model, executable invariant register, deterministic fault simulator,
+black-box history checking, crash-boundary matrix, and formalized release-mode
 soak gates.
 
 ## New findings
@@ -458,10 +462,17 @@ Test at and beyond:
 - WAL and metadata-log compaction thresholds; and
 - millions of objects plus sustained reclaim/repair/route churn.
 
-A 24-hour seeded soak is useful during development; a pre-release candidate
-should also survive a longer soak with fixed production-like capacity and no
-unexplained quarantine, proof mismatch, pending-command age, or leaked shard
-growth.
+The existing `scripts/uat-correctness-soak` runs are already being executed on
+an ongoing basis with increasing `--repeat` bounds, currently 100. They have
+found a number of real issues that were subsequently fixed, so this is
+meaningful correctness evidence and should continue throughout the hardening
+work. Its current limitation is feedback latency: rare interleavings can take
+several hours to fail. Record the failing smoke and iteration, retain all
+process logs and flight-recorder state, and convert each discovered timing
+failure into a deterministic pause-point regression. A pre-release candidate
+should additionally survive a longer soak with fixed production-like capacity
+and no unexplained quarantine, proof mismatch, pending-command age, or leaked
+shard growth.
 
 ### 6. Small formal models
 
@@ -525,10 +536,13 @@ Production confidence also requires detecting assumptions that tests missed:
   acknowledged writes, duplicate conditional successes, or listing omissions.
 
 `scripts/ci` currently runs a broad debug-profile suite and many useful UAT
-smokes, but it does not run the correctness soak, a release build, continuous
-concurrent traffic, network partitions, independent clocks, or the full S3
-path through the replicated control plane. Those should be explicit gates,
-not optional commands remembered by an operator.
+smokes, but does not invoke the correctness soak. The separate soak is
+nevertheless being run on an ongoing basis by the development process at
+increasing repeat bounds. Its scheduling, result retention, and eventual
+release-gate role should be made explicit alongside complementary release-build,
+continuous-traffic, network-partition, independent-clock, and full replicated
+control-plane S3 tests. Deterministic reproduction is especially important
+because the current stochastic failures can take hours to recur.
 
 ## Recommended order of work
 
@@ -546,7 +560,9 @@ not optional commands remembered by an operator.
    and bounded history part of the serving types (`CP3`-`CP7`).
 7. Complete the Raft WAL generation/startup work and run the full S3 stack
    through three control-plane processes under the same fault harness.
-8. Only then begin a production-readiness soak and operational recovery drills.
+8. Continue the increasing-repeat correctness soak throughout these slices.
+   Once the blockers above are closed, promote it into a retained
+   production-readiness gate and add operational recovery drills.
 
 Phase 12 improves control-plane availability and ordering, but it does not
 repair a storage-node fencing race, a cross-host lease model, cross-PG listing,
