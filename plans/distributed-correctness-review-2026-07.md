@@ -1009,6 +1009,19 @@ Mechanism confirmed; window deployment-dependent.
   Active for any reason (the metadata-transfer path shows the pattern at
   :1912, :1983-1984) and refuse peering completion/readiness until `now_ms`
   exceeds it.
+- Status update (2026-07-09): **resolved in the current tree.** PG state now
+  persists `previous_primary_lease_deadline_ms` separately from the
+  metadata-transfer-only source fence. Every transition out of Active captures
+  the old primary's last issued deadline before node lease mutation, including
+  membership/availability changes, heartbeat incarnation or endpoint changes,
+  acting-set changes, explicit state transitions, metadata transfer, and
+  authority restart. Direct completion and `ready_pg_peering_completions`
+  reject/skip the PG while that deadline is greater than the committed
+  completion time, and successful activation clears the fence. The canonical
+  control-plane snapshot format is version 13 and persists this field through
+  restart/history. Tests cover early direct rejection, automatic readiness
+  suppression, exact-deadline activation after successor renewal, and restart
+  persistence. The separate in-flight mutation side is tracked by DCC-1.
 
 ### CL2. HIGH (availability) — Divergent replicas permanently wedge a PG in `Peering`; the implemented catch-up path has no production caller
 

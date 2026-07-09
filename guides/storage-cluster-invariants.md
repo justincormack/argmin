@@ -148,6 +148,37 @@ serving, and ambiguous terminal evidence remains visible until a convergence
 path consumes it. The full recovery contract and its implementation slices live in
 [multihost-phase-11-stabilisation-plan.md](../plans/completed/multihost-phase-11-stabilisation-plan.md).
 
+## Route Transition And Primary-Lease Fencing
+
+Every storage-node RPC frame acquires a route-admission permit before it reads
+the current process config and retains that permit until its response has been
+written. Runtime-config installation first closes ordinary admission, drains
+all admitted frames, persists and publishes the replacement config
+exclusively, and then reopens admission. Metadata PG-lock release is the only
+frame admitted during the drain: it is cleanup needed to let an already
+admitted waiter finish, and it cannot create new PG state.
+
+Metadata mutations recheck route expiry after acquiring the per-PG lock.
+Visible metadata command application additionally checks its request-bound
+route fence inside the SQLite transaction immediately before commit. A current
+command uses the installed map validity. A historical Active command requires
+an explicit recovery permit created when this process drains and replaces that
+exact current Active route with a retained historical route; retained topology
+alone grants no mutation authority. The permit is keyed by route epoch and PG,
+bound to the exact primary/acting-set shape, expires with the old map, and is
+not reconstructed from persisted historical topology after restart. The
+route-admission permit means a newer runtime config cannot publish between the
+check and commit; expiry or guard failure rolls the transaction back,
+including command-log, pending, and materialized metadata changes.
+
+The control plane independently fences successor activation. Whenever a PG
+leaves `Active`, it persists the deposed primary's last lease deadline in the
+PG record before any node lease is cleared or replaced. Peering readiness and
+completion remain blocked while that deadline is in the future. Activation at
+or after the deadline is allowed only when the proposed primary has a current,
+unexpired lease and the ordinary peering proof checks pass, and successful
+activation clears the old-primary deadline.
+
 ## StorageCluster Method Matrix
 
 The method list below is exhaustive for the public `StorageCluster` surface.

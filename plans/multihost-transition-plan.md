@@ -10913,6 +10913,22 @@ Phase 12.4 progress:
   peer membership validator before constructing the live OpenRaft stores. A
   regression appends a WAL-only membership entry that does not match the
   configured peer map and proves startup fails closed.
+- Added the first DCC-1/CL1 route-transition fence. Storage-node RPC frames now
+  carry an admission permit synchronized with runtime-config publication;
+  installs drain admitted work while allowing metadata PG-lock release cleanup
+  to avoid a transition/lock-session deadlock. Metadata mutations recheck
+  route expiry after PG-lock acquisition, and visible metadata command apply
+  carries its request-bound fence into an in-transaction pre-commit guard with
+  rollback. Historical Active recovery requires an exact process-local
+  transition permit bounded by the old map deadline; retained route topology
+  alone and restart reconstruction cannot authorize mutation. The replicated
+  control-plane PG record now separately persists the previous primary's lease
+  deadline on every transition out of Active, and direct plus automatic
+  peering completion waits through that deadline before activating a
+  successor. Control-plane snapshot format version 13 persists the new fence.
+  DCC-1 remains open for the effect-by-effect shard publication,
+  non-command reservation, reclaim, and cleanup expiry audit and the full
+  process transfer race; CL1 is closed by this slice.
 
 1. define the replicated control-plane state machine:
    - state includes cluster epoch, PG count, PG state, PG acting sets, node

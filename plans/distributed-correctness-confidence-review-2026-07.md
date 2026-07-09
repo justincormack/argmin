@@ -141,6 +141,35 @@ Required deterministic regression:
 5. Repeat with the pause immediately before SQLite commit and with route expiry
    instead of explicit config replacement.
 
+Status update (2026-07-09): **the visible-metadata and explicit route-install
+race is addressed; the broader effect audit remains open.** Storage-node RPC
+frames now hold a route-admission permit through response publication.
+Runtime-config installation moves the gate through draining and exclusive
+publication, waits for admitted frames, and permits only metadata PG-lock
+release cleanup while draining so a session-held lock cannot deadlock the
+transition. Metadata mutation families recheck route expiry after acquiring
+the PG lock. Visible metadata command application carries a request-bound
+fence into its SQLite transaction and checks it immediately before commit. A
+historical Active route is mutable only with a process-local recovery permit
+created while an observed current Active route is drained into the exact
+retained historical route; bare retained topology and restart reconstruction
+do not grant that capability. The permit expires with the old route map, and
+the route-admission permit prevents a newer config fence from publishing
+between the check and commit. The transaction rolls back on guard failure.
+Deterministic tests pin permit drain/publication ordering, cleanup during
+drain, bare-history rejection, pre-expiry recovery, post-expiry rejection, and
+rollback at the commit guard.
+
+The paired `CL1` fix persists the previous primary's lease deadline whenever a
+PG leaves Active and blocks both direct and batched/automatic peering
+completion until that deadline. This removes the early-successor-activation
+half of the scenario and makes metadata-transfer export occur only after old
+metadata permits can no longer commit. DCC-1 remains open until the same
+expiry/commit analysis is completed by effect for shard publication,
+reservations outside the metadata-command transaction, reclaim, and cleanup,
+with the full E -> Peering -> successor-Active process regression described
+above.
+
 ### DCC-2. HIGH - bounded timestamp catch-up still grants unbounded serving leases
 
 Confidence: confirmed. This supersedes the latest statement that `R3-1` and
@@ -317,8 +346,10 @@ review.
 
 ### Safety and authority
 
-- `CL1`: administrative Active-exit transitions do not wait out or explicitly
-  fence the deposed primary's lease. Fix together with DCC-1.
+- `DCC-1` residual: the visible-metadata route-transition race and CL1's
+  deposed-primary lease window are closed, but shard publication,
+  non-command reservations, reclaim, and cleanup still need the same
+  expiry/commit effect audit plus the full process transition regression.
 - `CP2` and `CL4`: absolute authority deadlines are compared against unrelated
   host wall clocks with zero skew margin. DCC-2 makes the consequence larger.
 - `INT-3`: historical metadata-command recovery is authorized by a retained
@@ -587,8 +618,10 @@ because the current stochastic failures can take hours to recur.
 
 ## Recommended order of work
 
-1. Reopen the Phase 11 fencing exit criterion. Fix DCC-1 with `CL1`, including
-   the deterministic pause-at-commit transition test.
+1. Complete the remaining DCC-1 effect audit and full process transition
+   regression. CL1 and the visible-metadata pause-at-commit race are closed;
+   retain the fencing exit criterion until shard publication, non-command
+   reservations, reclaim, and cleanup are classified and pinned.
 2. Replace the timestamp/lease design in DCC-2 with an explicit clock fault
    model and multi-clock property test.
 3. **Completed:** fix DCC-3 with bounded global smallest-`N` selection and pin

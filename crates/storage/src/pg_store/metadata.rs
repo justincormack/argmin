@@ -818,6 +818,15 @@ impl PgStore {
         node_id: u32,
         command: &MetadataCommandEnvelope,
     ) -> Result<MetadataCommandReplicaState, BucketSnapshotLoadError> {
+        self.apply_metadata_command_and_record_with_commit_guard(node_id, command, || Ok(()))
+    }
+
+    pub(crate) fn apply_metadata_command_and_record_with_commit_guard(
+        &self,
+        node_id: u32,
+        command: &MetadataCommandEnvelope,
+        commit_guard: impl FnOnce() -> Result<(), StoreError>,
+    ) -> Result<MetadataCommandReplicaState, BucketSnapshotLoadError> {
         self.conn
             .execute_batch("BEGIN IMMEDIATE")
             .map_err(|source| {
@@ -860,6 +869,11 @@ impl PgStore {
 
         match result {
             Ok(record) => {
+                if let Err(error) = commit_guard() {
+                    let _ = self.conn.execute_batch("ROLLBACK");
+                    self.invalidate_clean_metadata_digest_revision();
+                    return Err(BucketSnapshotLoadError::Store(error));
+                }
                 self.commit_immediate_txn("apply metadata command and record (commit txn)")
                     .map_err(BucketSnapshotLoadError::Metadata)?;
                 self.mark_metadata_state_digest_clean_at_revision(record.digest_revision);
