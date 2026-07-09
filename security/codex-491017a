@@ -1,0 +1,240 @@
+Admin auth can break storage-node heartbeats
+Link: https://chatgpt.com/codex/cloud/security/findings/0d04e11f39d4819185e689554fb98f58?sev=&repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin&sort=date_desc
+Criticality: low (attack path: low)
+Status: fixed
+
+# Metadata
+Repo: justincormack/argmin
+Commit: 491017a
+Author: justin@specialbusservice.com
+Created: 08/07/2026, 13:59:17
+Assignee: Unassigned
+Signals: Security, Validated, Attack-path
+
+# Summary
+Introduced: admin-only control-plane auth configuration now creates an auth verifier, but the existing heartbeat path unconditionally enforces storage-node heartbeat authentication whenever any verifier exists.
+The commit adds admin credentials as a reason to instantiate ControlPlaneUnixAuthVerifier, even when there are no storage-node credentials. However, RefreshNodeHeartbeat handling treats the mere presence of any auth verifier as a requirement to verify storage-node heartbeat auth. With an admin-only verifier, storage_node_credentials is empty, so signed heartbeats cannot match any node credential and plain heartbeats fail envelope decoding. The config validation only requires a cluster id for admin credentials; it does not require storage-node credentials. As a result, an operator enabling the new admin auth feature by itself can cause all storage-node leases to stop refreshing, leading to node expiry and service unavailability.
+
+# Validation
+## Rubric
+- [x] Admin-only control-plane auth configuration is accepted with a cluster id and no storage-node credentials.
+- [x] Admin-only configuration/build path creates `Some(ControlPlaneUnixAuthVerifier)` with `storage_node_credentials.len() == 0` and `admin_credentials.len() == 1`.
+- [x] `RefreshNodeHeartbeat` dispatch verifies heartbeat payloads whenever any verifier is present, not only when storage-node credentials exist.
+- [x] A plain storage-node heartbeat sent through an admin-only verifier is rejected as missing auth and does not update the node lease.
+- [x] A signed storage-node heartbeat sent through an admin-only verifier is rejected as UnknownCredential because the verifier has an empty storage-node credential map, and does not update the node lease.
+## Report
+Validated the finding at commit 491017af2bc8661f67a1e8267309b7b05d45d2f7. This is a Rust compiled project, but the bug is an availability/logic flaw rather than a memory-safety crash. Direct debug test reproduction was successful; Valgrind was attempted but unavailable (`bash: command not found: valgrind`); LLDB was used to trace the failing path.
+
+Key code evidence: `crates/argmin-s3/src/main.rs:3177-3225` returns `Some(ControlPlaneUnixAuthVerifier)` whenever admin credentials exist and uses `ControlPlaneUnixAuthVerifier::new_empty(cluster_id)` when storage credentials are empty. `crates/storage/src/control_plane.rs:5455-5468` shows `new_empty` creates an empty `storage_node_credentials` map. `crates/storage/src/control_plane.rs:6465-6474` unconditionally calls `verify_storage_node_heartbeat_payload` for `RefreshNodeHeartbeat` whenever `auth_verifier` is `Some`. `crates/storage/src/control_plane.rs:5819-5837` rejects plain heartbeat payloads as missing/malformed auth. `crates/storage/src/control_plane.rs:5866-5876` rejects signed heartbeat envelopes when `storage_node_credentials` has no credential for that node. `crates/argmin-s3/src/config.rs:779-798` only requires a cluster id for admin credentials and does not require storage-node credentials.
+
+Dynamic reproduction: I added two targeted unit tests in `crates/storage/src/control_plane.rs`. `admin_only_auth_verifier_rejects_plain_storage_node_heartbeat` constructs an admin-only verifier using `new_empty(...).with_admin_credentials(...)`, sends a normal `RefreshNodeHeartbeat`, and asserts rejection as Missing auth with lease deadline remaining `None`. `admin_only_auth_verifier_rejects_signed_storage_node_heartbeat_unknown_credential` sends a signed storage-node heartbeat to the same admin-only verifier and asserts rejection with `has no credential for node 1`, UnknownCredential metrics, and lease deadline still `None`. Command output: `cargo test -p storage 'admin_only_auth_verifier_rejects' -- --nocapture` -> `running 2 tests ... ok ... test result: ok. 2 passed; 0 failed`.
+
+The existing argmin-s3 test also confirms the new admin-only configuration builds a verifier with zero storage-node credentials: `cargo test -p argmin-s3 control_plane_unix_auth_verifier_includes_admin_credentials -- --nocapture` -> `test tests::control_plane_unix_auth_verifier_includes_admin_credentials ... ok`; that test asserts `status.storage_node_credentials().len() == 0` and `status.admin_credentials().len() == 1` at `crates/argmin-s3/src/main.rs:4451-4459`.
+
+Debugger evidence: LLDB breakpoint at `control_plane.rs:5866` during the signed-heartbeat PoC stopped inside `ControlPlaneUnixAuthVerifier::verify_storage_node_heartbeat_payload`; backtrace showed the chain `verify_storage_node_heartbeat_payload` at `control_plane.rs:5866` <- `build_control_plane_unix_response_with_auth` at `control_plane.rs:6472` <- PoC test at `control_plane.rs:12946`. LLDB variable output showed `self->storage_node_credentials ... length = 0` and `heartbeat.node_id = 1`, confirming a signed heartbeat is rejected because the admin-only verifier contains no storage-node credential. This validates that enabling admin auth alone can prevent storage-node heartbeat lease refresh.
+
+# Evidence
+crates/argmin-s3/src/config.rs (L779 to 797)
+  Note: Admin auth config validation requires only a cluster id and optional local admin instance match; it does not require storage-node credentials despite the verifier forcing heartbeat auth.
+```
+        if !control_plane_admin_auth_credentials.is_empty()
+            && control_plane_auth_cluster_id.is_none()
+        {
+            return Err(
+                "ARGMIN_CONTROL_PLANE_ADMIN_AUTH_CREDENTIALS requires ARGMIN_CONTROL_PLANE_AUTH_CLUSTER_ID"
+                    .to_string(),
+            );
+        }
+        if let Some(instance_id) = &control_plane_admin_auth_instance_id {
+            validate_auth_instance_id(instance_id, "ARGMIN_CONTROL_PLANE_ADMIN_AUTH_INSTANCE_ID")?;
+            if !control_plane_admin_auth_credentials.is_empty()
+                && !control_plane_admin_auth_credentials
+                    .iter()
+                    .any(|entry| entry.instance_id == *instance_id)
+            {
+                return Err(format!(
+                    "ARGMIN_CONTROL_PLANE_ADMIN_AUTH_CREDENTIALS must include local admin instance id {instance_id}"
+                ));
+            }
+```
+
+crates/argmin-s3/src/main.rs (L3177 to 3225)
+  Note: Admin credentials now cause build_control_plane_unix_auth_verifier to return Some(verifier) even when storage_credentials is empty; new_empty creates a verifier with no storage-node credentials.
+```
+    if config.control_plane_storage_auth_credentials.is_empty()
+        && config.control_plane_frontend_auth_credentials.is_empty()
+        && config.control_plane_admin_auth_credentials.is_empty()
+    {
+        return Ok(None);
+    }
+    let cluster_id = config
+        .control_plane_auth_cluster_id
+        .as_deref()
+        .expect("control-plane Unix auth credentials require control-plane auth cluster id");
+    let storage_credentials = config
+        .control_plane_storage_auth_credentials
+        .iter()
+        .map(configured_storage_node_auth_credential)
+        .collect::<Result<Vec<_>, _>>()?;
+    let frontend_credentials = config
+        .control_plane_frontend_auth_credentials
+        .iter()
+        .map(configured_frontend_auth_credential)
+        .collect::<Result<Vec<_>, _>>()?;
+    let admin_credentials = config
+        .control_plane_admin_auth_credentials
+        .iter()
+        .map(configured_admin_auth_credential)
+        .collect::<Result<Vec<_>, _>>()?;
+    if let Some(instance_id) = config.control_plane_admin_auth_instance_id.as_deref() {
+        if !config
+            .control_plane_admin_auth_credentials
+            .iter()
+            .any(|credential| credential.instance_id == instance_id)
+        {
+            return Err(format!(
+                "ARGMIN_CONTROL_PLANE_ADMIN_AUTH_CREDENTIALS must include local admin instance id {instance_id}"
+            ));
+        }
+    }
+    let verifier = if storage_credentials.is_empty() {
+        ControlPlaneUnixAuthVerifier::new_empty(cluster_id)
+    } else {
+        ControlPlaneUnixAuthVerifier::new(cluster_id, storage_credentials)
+    }
+    .map_err(|error| format!("invalid control-plane Unix auth credential verifier: {error}"))?;
+    verifier
+        .with_frontend_credentials(frontend_credentials)
+        .map_err(|error| {
+            format!("invalid ARGMIN_CONTROL_PLANE_FRONTEND_AUTH_CREDENTIALS verifier: {error}")
+        })?
+        .with_admin_credentials(admin_credentials)
+        .map(Some)
+```
+
+crates/storage/src/control_plane.rs (L5819 to 5837)
+  Note: Plain heartbeats are rejected as missing/malformed auth once the verifier exists.
+```
+    pub fn verify_storage_node_heartbeat_payload(
+        &self,
+        payload: &[u8],
+        authority_now_ms: u64,
+    ) -> Result<Vec<u8>, ControlPlaneError> {
+        let envelope = match ControlPlaneAuthEnvelope::decode_frame(
+            payload,
+            CONTROL_PLANE_RPC_MAX_PAYLOAD_LEN,
+        ) {
+            Ok(envelope) => envelope,
+            Err(error) => {
+                let reason = if control_plane_auth_payload_has_magic(payload) {
+                    ControlPlaneAuthRejectionReason::Malformed
+                } else {
+                    ControlPlaneAuthRejectionReason::Missing
+                };
+                self.metrics
+                    .record_rejected(ControlPlaneAuthOperation::StorageRuntimeMapRefresh, reason);
+                return Err(error);
+```
+
+crates/storage/src/control_plane.rs (L5866 to 5875)
+  Note: Even authenticated storage-node heartbeat envelopes are rejected when the verifier was created without storage-node credentials.
+```
+        let Some(node_credential) = self.storage_node_credentials.get(&heartbeat.node_id) else {
+            self.metrics.record_rejected(
+                ControlPlaneAuthOperation::StorageRuntimeMapRefresh,
+                ControlPlaneAuthRejectionReason::UnknownCredential,
+            );
+            return Err(ControlPlaneError::RpcProtocol {
+                message: format!(
+                    "control-plane storage-node heartbeat auth has no credential for node {}",
+                    heartbeat.node_id.as_u32()
+                ),
+```
+
+crates/storage/src/control_plane.rs (L6465 to 6474)
+  Note: RefreshNodeHeartbeat unconditionally verifies storage-node heartbeat payloads whenever any auth_verifier is present, rather than only when storage-node credentials are configured.
+```
+        ControlPlaneRpcKind::RefreshNodeHeartbeat => {
+            debug_assert_eq!(
+                kind.auth_operation(),
+                ControlPlaneAuthOperation::StorageRuntimeMapRefresh
+            );
+            let payload = match auth_verifier {
+                Some(auth_verifier) => auth_verifier
+                    .verify_storage_node_heartbeat_payload(&payload, authority_now_ms)?,
+                None => payload,
+            };
+```
+
+# Attack-path analysis
+Final: low | Decider: model_decided | Matrix severity: ignore | Policy adjusted: ignore
+## Rationale
+Downgraded from medium to low for security triage. The bug is real and can cause significant availability loss in a configured deployment, as evidenced by verifier construction, heartbeat verification, rejection, and lease-expiry paths. However, it is not reachable from the public S3 HTTP surface or by an unauthenticated/low-privileged network attacker. The required actor must already control service environment configuration/restart or equivalent admin operations, which can generally cause denial of service by simpler means. Thus probability as a security attack path is low despite a meaningful operational availability impact.
+## Likelihood
+low - Exploitation by an external attacker is unlikely because the trigger requires privileged environment configuration and service restart, and the control-plane socket is local/private. The most plausible trigger is operator misconfiguration while enabling the new admin auth feature.
+## Impact
+medium - If the bad configuration is deployed, all storage-node heartbeat refreshes can be rejected and leases can expire, causing placement groups to move to peering/unavailable states and disrupting object storage availability. There is no evidence of confidentiality, integrity, code execution, credential disclosure, or external privilege escalation impact.
+## Assumptions
+- Analysis is limited to repository artifacts in /workspace/argmin; no cloud APIs or live deployment state were queried.
+- No Kubernetes, Terraform, Docker, or ingress manifests were found in the checkout, so exposure is inferred from code defaults and bind logic.
+- The relevant control-plane endpoint is a local Unix domain socket; a remote S3 client is assumed unable to modify process environment variables or access the private socket directory.
+- An operator or actor with service configuration/restart privileges can set ARGMIN_CONTROL_PLANE_ADMIN_AUTH_CREDENTIALS and omit ARGMIN_CONTROL_PLANE_STORAGE_AUTH_CREDENTIALS.
+- Control-plane role is deployed with ARGMIN_CONTROL_PLANE_SOCKET_PATH
+- ARGMIN_CONTROL_PLANE_ADMIN_AUTH_CREDENTIALS and ARGMIN_CONTROL_PLANE_AUTH_CLUSTER_ID are configured
+- ARGMIN_CONTROL_PLANE_STORAGE_AUTH_CREDENTIALS is empty or omitted
+- The service is restarted or launched with that configuration
+- Storage nodes depend on RefreshNodeHeartbeat leases from this control plane
+## Path
+Admin-only env config -> new_empty verifier(no storage creds) -> RefreshNodeHeartbeat auth enforced -> heartbeat rejected -> lease expiry / service unavailability
+## Path evidence
+- `crates/argmin-s3/src/main.rs:3177-3228` - Any configured admin/frontend/storage credential causes a verifier to be returned; when storage credentials are empty it calls ControlPlaneUnixAuthVerifier::new_empty and then adds admin credentials.
+- `crates/storage/src/control_plane.rs:5455-5468` - new_empty constructs a verifier with storage_node_credentials as an empty BTreeMap.
+- `crates/storage/src/control_plane.rs:6465-6474` - RefreshNodeHeartbeat verifies storage-node heartbeat payloads whenever auth_verifier is Some, without checking whether storage-node credentials exist.
+- `crates/storage/src/control_plane.rs:5819-5838` - A plain, non-auth-envelope heartbeat is rejected as Missing or Malformed when verification is forced.
+- `crates/storage/src/control_plane.rs:5866-5876` - A signed heartbeat is rejected if storage_node_credentials has no credential for the heartbeat node id.
+- `crates/argmin-s3/src/config.rs:779-797` - Admin auth validation requires only a cluster id and optional local admin instance match; it does not require storage-node credentials.
+- `crates/argmin-s3/src/main.rs:1458-1468` - The control-plane loop expires heartbeat leases and logs expired nodes, confirming rejected refreshes can translate to node lease expiry.
+- `crates/argmin-s3/src/main.rs:3347-3429` - The control-plane listener is a Unix domain socket and the parent directory must be private and owned by the process uid, limiting remote attacker reachability.
+- `crates/argmin-s3/src/config.rs:274-294` - Configuration docs show the relevant credentials and control-plane socket are environment-driven runtime settings.
+## Narrative
+The reported behavior is a real runtime bug in the main control-plane path. Admin credentials alone cause build_control_plane_unix_auth_verifier to instantiate a verifier via new_empty, whose storage_node_credentials map is empty. RefreshNodeHeartbeat then unconditionally invokes storage-node heartbeat verification whenever any verifier exists. Plain heartbeats fail envelope decoding as missing auth, while signed heartbeats fail UnknownCredential because there is no storage credential for the node. Because the control plane periodically expires heartbeat leases, this can make storage nodes lose leases and harm availability. The severity is downgraded because the trigger is not reachable by a remote S3 client or unauthenticated network attacker; it requires privileged service configuration/restart or equivalent local operational control, and the Unix control-plane socket is kept in a private owner-controlled directory.
+## Controls
+- Control-plane Unix domain socket rather than public TCP listener
+- Socket parent directory creation with 0700 permissions
+- Socket directory validation rejects group/world-accessible directories
+- Socket directory owner check against process uid
+- Environment validation requires ARGMIN_CONTROL_PLANE_AUTH_CLUSTER_ID when admin auth credentials are configured
+- S3 HTTP listener uses SigV4 credentials, but that is not the vulnerable path
+## Blindspots
+- No deployment manifests were present, so actual production bind addresses, process users, and socket paths could not be confirmed.
+- Static analysis cannot determine whether real operators commonly enable admin auth without storage-node credentials.
+- Validation evidence came from prior executable tests; this attack-path pass did not re-run the full test suite.
+- The analysis does not assess external process supervisors or file permissions outside the repository.
+
+# Resolution
+Status: fixed in `028cb3f9784a9a7a781cdcea081d48ceab4e9793` (`Keep heartbeat auth scoped to storage credentials`).
+
+This finding was the admin-only variant of the frontend-only heartbeat-auth bug. The heartbeat dispatcher no longer treats `Some(ControlPlaneUnixAuthVerifier)` as sufficient to require storage-node heartbeat auth. It now verifies `StorageRuntimeMapRefresh` envelopes only when `ControlPlaneUnixAuthVerifier::requires_storage_node_heartbeat_auth()` is true, and that predicate is true only when storage-node heartbeat credentials are configured.
+
+Current behavior:
+
+- Admin-only verifier configuration is still accepted.
+- Admin-only verifier status reports `admin_control_plane_required == true`.
+- Admin-only verifier status reports `storage_node_heartbeat_required == false`.
+- Plain storage-node heartbeats are not forced through storage auth unless `ARGMIN_CONTROL_PLANE_STORAGE_AUTH_CREDENTIALS` is configured.
+
+Relevant current coverage:
+
+- `control_plane_unix_auth_verifier_includes_admin_credentials` builds an admin-only verifier and asserts `storage_node_heartbeat_required == false`.
+- `frontend_auth_verifier_does_not_require_storage_node_heartbeat_auth` exercises the shared fixed heartbeat dispatch predicate by sending a plain `RefreshNodeHeartbeat` through a non-storage verifier and confirming it succeeds without storage heartbeat auth.
+
+Verification runs:
+
+```text
+cargo test -p argmin-s3 --bin argmin-s3 control_plane_unix_auth_verifier_includes_admin_credentials -- --nocapture
+cargo test -p storage --lib frontend_auth_verifier_does_not_require_storage_node_heartbeat_auth -- --nocapture
+```
+
+Result: both passed.
+
+Residual note: there is not a separate admin-only heartbeat dispatch regression. The admin-only status test and shared heartbeat-dispatch regression cover the fixed predicate, but adding an admin-only heartbeat test would be a small belt-and-braces coverage improvement rather than an indication that the finding remains open.
