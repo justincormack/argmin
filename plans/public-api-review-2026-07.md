@@ -18,17 +18,25 @@ smaller per-crate items.
 
 ## Status
 
-In progress. A1-A10, S1-S4, S6, K1-K4, H1-H8, all of P1/P2, the first five
-P3 items, and all re-review items RR1-RR16 are done. A verification pass on
-2026-07-06 confirmed all 16 RR fixes against the code (workspace
-`cargo check --all-targets` clean; auth crate 454 unit tests pass; targeted
-storage control-plane tests pass): the RR1 live bug is closed on every path,
-and the fixes left only the small residuals recorded in the verification
-subsection below (V1-V6).
+In progress. Everything above the "Smaller items" section is done except S5
+(deferred to the topology-resize plan): A1-A10, S1-S4, S6, K1-K4, H1-H8,
+P1-P6, RR1-RR16, and V1-V6. A second verification pass on 2026-07-09
+confirmed the V1-V6, P3-tail, and P4-P6 fixes against the code (crate checks
+clean; server-core 1178 lib tests and the auth suite pass), and gave the new
+control-plane auth surface its first pattern-class review. Results are in the
+"Second re-review 2026-07-09" section below: one resolution-note claim was
+wrong (the V1 checksum-type rejection IS reachable over HTTP on PutObject and
+is unpinned against AWS — W1), and the control-plane auth review found three
+substantive items (CA1-CA3) plus consistency/idiom follow-ups.
 
 Remaining order of attack:
-1. The verification residuals below (V1-V6) — all small; V1/V2 first.
-2. The remaining pattern sweeps (P3 tail, P4-P6) and smaller items.
+1. CA1-CA3 (control-plane auth: partial-role config leaves admin mutations
+   open, optional verifier clock disables expiry, secrets in config parse
+   errors) — highest value, these are new auth code.
+2. W1/W2 (PutObject checksum-type: an unpinned behavior change — AWS-pin
+   before it ossifies).
+3. The remaining W (W3-W7) and CA (CA4-CA9) consistency/idiom items.
+4. The "Smaller items" section below.
 
 ## Re-review 2026-07-05 — reopened and new items
 
@@ -350,6 +358,189 @@ residuals found by the verification, none release-blocking:
   not actionable: server-http test-target compilation was broken in the
   4c01bac9..4d05ea01 commit window (fixed by a drive-by in 496d5f6e; already
   fine at HEAD).
+
+## Second re-review 2026-07-09 — verification results and new items
+
+A verification pass at HEAD aab790f0 adversarially confirmed the V1-V6,
+P3-tail, and P4-P6 fixes: all landed as real fixes (named params structs
+threaded through every layer, typed dimension enums exhaustive with no
+catch-all arms — `finalize_started` finally counts, typed error enums with
+structured payloads, `LifecycleRuleFilter`/`StorageNodeProcessConfig`
+privatized behind validating constructors, `regresses_to` deleted with
+properly-named replacement errors). `parse_bucket_policy` was correctly
+resolved as invalid with AWS pinning (the cap applies to the normalized
+policy, matching AWS). server-core 1178 lib tests, the auth suite, and crate
+checks all pass. The pass also gave the new control-plane auth surface
+(commits 79f04c5c..510eb737) its first pattern-class review — fundamentals
+are strong (single constant-time `ring::hmac::verify` path everywhere,
+consistent secret redaction with a dedicated test, fully bounds-checked
+envelope decode, the multi-node Raft auth gate unbypassable via config), with
+the findings below.
+
+### Residuals from the verified fixes (W series)
+
+- [ ] **W1. V1's checksum-type rejection is HTTP-reachable on PutObject and
+  unpinned against AWS** — the resolution note's "masked by HTTP-layer
+  validation" claim is false for this field.
+  `parse_put_object_request_metadata` filters only `x-amz-checksum-algorithm`
+  (`server-http/src/http/mod.rs:443-448`), not `x-amz-checksum-type`, and no
+  PUT-path pre-validation of that header exists (only CreateMultipartUpload
+  validates it, mod.rs:2730). So PutObject + `x-amz-checksum-type: garbage`
+  changed from 200-with-header-ignored to 400 `InvalidRequest` — an
+  observable behavior change with no AWS oracle (`checksums.rs` has no
+  PutObject+checksum-type coverage at all). Adjacent pre-existing gap: a
+  *valid* `x-amz-checksum-type: COMPOSITE` on plain PutObject flows into
+  stored metadata unvalidated against the algorithm. AWS-pin PutObject with
+  invalid and valid-but-inapplicable checksum-type headers, then align.
+
+- [ ] **W2. V3's message/shape divergence reintroduced for checksum-type.**
+  Core emits plain `InvalidRequest` `"invalid checksum type: {value}"`
+  (`system_metadata.rs:180`) while the HTTP MPU path emits `InvalidArgument`
+  `"unsupported checksum type: {v}"` (`mod.rs:2734`) — two shapes/messages
+  for the same field, and unlike V3's case the core one IS reachable over
+  HTTP (W1). Same fix shape as d1f22148: shared constructor + AWS-pinned
+  message.
+
+- [ ] **W3. Same-algorithm duplicate value headers are now first-wins at the
+  parser** (`system_metadata.rs:186-198` — pre-fix was last-wins, so the
+  order-dependence flipped rather than disappeared); masked over HTTP by
+  `extract_encoded_checksum_header`'s duplicate rejection. Also the
+  conflicting-value-headers unit test covers only one header order
+  (`system_metadata.rs:715`) — the logic is symmetric by construction, but
+  add the mirror order. Make the parser reject same-algo duplicates too.
+
+- [ ] **W4. Duplicated credential-expiry check.** c3be106b inlined the expiry
+  check in `auth/src/sigv4.rs:176-178` instead of calling
+  `validate_static_record_expiry` (`request.rs:633-641`) — two copies of the
+  same policy that can drift. Consolidate.
+
+- [ ] **W5. `LifecycleRuleFilter::explicit_with_predicates` validates prefix
+  and tags but not size ordering** (`lifecycle.rs:101-118`) —
+  `(None, vec![], Some(10), Some(5))` builds a min>=max filter the parser
+  rejects; and its two adjacent `Option<u64>` size params are themselves a
+  transposition hazard that produces exactly that state. Validate size
+  ordering in the constructor and take a small size-bounds struct (or one
+  `SizeRange` newtype) instead of the bare pair.
+
+- [ ] **W6. `bucket_lock_wait_exceeded_total` is inert in production builds.**
+  Exported by the P4 metrics sweep (observability lib.rs:1675, 1846) but its
+  only increment path, `emit_bucket_lock_wait_exceeded`, is called solely from
+  `SharedStorageNode::lock_bucket` (`storage/src/node.rs:709-733`), which is
+  `#[cfg(any(test, feature = "test-hooks"))]`. The metric always reports 0 in
+  production. Either wire production lock-contention observation or drop the
+  export.
+
+- [ ] **W7. Smaller leftovers.** `PgTopology`'s typed error isn't fully
+  honored: `node.rs:509, 582` still `.expect()` on empty `pg_ids` inside
+  `Result`-returning production constructors (`.unwrap()` is gone but the panic
+  isn't). `emit_metadata_command_recovery_admission` (observability
+  lib.rs:3038-3056) still matches `admission: &str` with `_ => {}` fallthrough
+  (the P5 class, out of that sweep's scope; callers pass a closed literal set
+  today). `UnixStorageNodeRpcAdmission::new_with_wait_timeout(usize, Duration,
+  Duration)` (`node_client/unix_admission.rs:144-148`) keeps an adjacent
+  Duration pair one layer below the named settings struct.
+
+### Control-plane auth — first pattern-class review (CA series)
+
+The control-plane auth surface (envelopes, scoped credentials, Raft peer auth,
+rotation; commits 79f04c5c..510eb737) landed since the original review and had
+never been checked. Fundamentals are strong (see the intro above). Findings,
+ranked:
+
+- [ ] **CA1. Partial-role Unix control-plane auth leaves admin mutations
+  unauthenticated with no config coupling.** Dispatch gates each path on that
+  role's credential map being non-empty (`requires_*` is `!map.is_empty()`,
+  `control_plane.rs:6402-6415`; enforced at :7410-7426), and config validation
+  (`argmin-s3/src/config.rs:780-841`, verifier build `main.rs:3330-3384`)
+  accepts any subset of STORAGE/FRONTEND/ADMIN. An operator who configures only
+  frontend credentials gets authenticated runtime-map *reads* while
+  `SetPgActingSet`, `TransferRaftLeadership`, `TriggerRaftSnapshotAndPurge`,
+  `TriggerRaftElection` stay fully unauthenticated on the same socket — the
+  strongest operations left open, silently. The P1 "None weakens semantics"
+  class, spelled as empty-map. Known/deferred to cutover per the plan (per-path
+  `required` flags are exposed), but nothing stops the foot-gun config. Fix:
+  config-parse error when some-but-not-all credential sets are configured, or
+  require admin credentials whenever any Unix control-plane auth is on, with an
+  explicit opt-out.
+
+- [ ] **CA2. `ControlPlaneAuthVerificationInput.now_ms: Option<u64>` — `None`
+  silently disables expiry checking, and timestamp-less envelopes skip it even
+  under `Some`.** `verify_envelope_inner` runs issued/expires checks only
+  `if let Some(now_ms)` and `is_some_and` per field
+  (`control_plane_auth.rs:459-472`). Because the core verifier can't require
+  timestamps, every path grew its own pre-validator
+  (`validate_control_plane_unix_read_auth_freshness` control_plane.rs:6905;
+  `validate_storage_node_heartbeat_auth_freshness` :6843;
+  `validate_peer_auth_replay_window` control_plane_raft.rs:806) — the P1+P2
+  combination, freshly minted in auth code. Fix: replace `now_ms: Option<u64>`
+  with an enum (`ReplayPolicy::TimestampWindow { now_ms, max_window_ms }` vs
+  `FencedByPayloadSemantics`) that rejects missing-or-stale timestamps centrally
+  and collapse the three per-path validators into it.
+
+- [ ] **CA3. Credential env parse errors echo the raw entry, which contains the
+  secret.** All four parsers format the offending entry into the error
+  (`argmin-s3/src/config.rs:1193, 1278, 1359, 1439`), so a malformed
+  `RAFT_AUTH_CREDENTIALS`/storage/frontend/admin entry (e.g. a missing `=`)
+  puts the secret verbatim into a startup error to stderr/logs/supervisors —
+  undercutting the otherwise consistent `SecretConfigValue` redaction. Fix:
+  report entry index/node-id only, never the raw entry text.
+
+- [ ] **CA4. Expired envelope misclassified as `StaleCredential`.**
+  `control_plane_auth.rs:466-471` returns `StaleCredential` for
+  `expires_at_ms <= now_ms`, which everywhere else means "a newer version
+  exists". Observable on the transfer-leader path (whose pre-check validates
+  only window width): an expired frame lands in `rejected_by_reason
+  {StaleCredential}` instead of `ReplayFreshnessFailure` in the redacted
+  diagnostics. Fix: return `ReplayFreshnessFailure` for envelope expiry.
+
+- [ ] **CA5. Multi-peer ⇒ auth invariant lives only in argmin-s3 config, not
+  the transport type.** `ControlPlaneRaftPeerTransportPolicy.auth_policy:
+  Option<Arc<...>>` defaults to `None` and both directions fall through to
+  plaintext when `None` (`control_plane_raft.rs:847, 1469-1573`). The fa8a5fa4
+  config gate is real and unbypassable via argmin-s3 (verified), but any other
+  embedder of the storage crate can build a multi-peer auth-less transport with
+  no complaint. Fix: enforce in the constructor (>1 peer without an auth policy
+  → `Err`; provide a named single-node/test constructor).
+
+- [ ] **CA6. Per-path verifier/signer/selection copies that can drift (P2).**
+  Three ~150-line near-identical verify methods
+  (`verify_admin_control_plane_command_payload` control_plane.rs:6426,
+  `verify_frontend_runtime_map_read_payload` :6574,
+  `verify_storage_node_heartbeat_payload` :6710); two response signers
+  identical but for the operation constant (:6987, :7030); two client response
+  verifiers with the same skeleton (:5628, :5939); four copies of "select
+  latest credential (version, then id)" (`main.rs:1925-1937, 3523, 3542,
+  3561`). Consistent today, nothing keeps them so. Fix: one
+  `latest_by_version_then_id` helper and a shared role-parameterized verify
+  core.
+
+- [ ] **CA7. Heartbeat envelopes don't bind the outer RPC kind; every other
+  Unix path does.** Frontend/admin/all responses wrap via
+  `write_authenticated_control_plane_rpc_payload(kind, ...)` and check it; the
+  heartbeat path signs the bare payload (`control_plane.rs:7279-7297`) and reads
+  from `envelope.payload()` (:6731). Safe only because
+  `StorageRuntimeMapRefresh` ↔ `RefreshNodeHeartbeat` is 1:1; a second kind
+  mapping to that operation would open cross-kind replay. Fix: add the kind
+  prefix to heartbeat envelopes.
+
+- [ ] **CA8. Dead wire-format surface / always-empty replay fields.**
+  `ControlPlaneAuthOperation::StorageHeartbeat` (wire tag 6) and
+  `ControlPlaneAuthService::{RaftPeerTransport, StorageNodeControl}` have no
+  production sign/verify site; every signer passes `sequence: None,
+  nonce: Vec::new()` and no verifier checks nonce uniqueness (replay is
+  timestamp-window + idempotency, per the plan). Fix: delete the dead variants
+  (pre-release) or wire them; document nonce/sequence as reserved.
+
+- [ ] **CA9. Positional same-typed params (P4, in new code).**
+  `ControlPlaneAuthEnvelope::new(header, payload, authenticator)` — two
+  positional `Vec<u8>` (`control_plane_auth.rs:700-712`);
+  `ControlPlaneFrontendAuthCredential::new`/`...AdminAuthCredential::new` —
+  adjacent `impl Into<String>` pairs (`control_plane.rs:6054, 6117`). Fix:
+  input structs (matching `ControlPlaneScopedCredentialInput`). Also worth a
+  comment on the Raft inbound verifier: `expected_operation`/source are derived
+  from the attacker-supplied envelope, so those equality checks are tautological
+  there — real safety is the credential lookup + MAC + binding cross-check
+  (traced: reflection/response-as-request/cross-target replays all fail closed).
 
 ## Bugs — auth (security)
 
