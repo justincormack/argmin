@@ -1107,11 +1107,20 @@ fn transfer_control_plane_pg_metadata_live(
     let actual_imported_proof = import_pg_metadata_transfer_artifact_retrying_stale_route(
         &read_control_plane,
         &destination_cluster,
+        MetadataTransferImportContext {
+            config: &config,
+            ec_config: &ec_config,
+            pg_id,
+            acting_set: &acting_set,
+            destination_epoch: import_epoch,
+            expected_transfer: PgMetadataTransferProof::new_with_imported_metadata_proof(
+                artifact.cluster_epoch(),
+                artifact.source_metadata_proof(),
+                imported_proof,
+            ),
+            imported_proof,
+        },
         &artifact,
-        pg_id,
-        &acting_set,
-        import_epoch,
-        imported_proof,
     )?;
     if actual_imported_proof != imported_proof {
         return Err(format!(
@@ -1206,27 +1215,49 @@ fn export_pg_metadata_transfer_artifact_retrying_stale_route(
     }
 }
 
+struct MetadataTransferImportContext<'a> {
+    config: &'a ServerConfig,
+    ec_config: &'a EcConfig,
+    pg_id: PgId,
+    acting_set: &'a [NodeId],
+    destination_epoch: ClusterEpoch,
+    expected_transfer: PgMetadataTransferProof,
+    imported_proof: PgMetadataProof,
+}
+
 fn import_pg_metadata_transfer_artifact_retrying_stale_route(
     control_plane: &impl ControlPlaneRuntimeMapSource,
-    destination_cluster: &StorageCluster,
+    destination_cluster: &Arc<StorageCluster>,
+    context: MetadataTransferImportContext<'_>,
     artifact: &PgMetadataTransferArtifact,
-    pg_id: PgId,
-    acting_set: &[NodeId],
-    destination_epoch: ClusterEpoch,
-    imported_proof: PgMetadataProof,
+) -> Result<PgMetadataProof, String> {
+    retry_pg_metadata_transfer_import(
+        control_plane,
+        Arc::clone(destination_cluster),
+        &context,
+        |cluster| cluster.import_pg_metadata_transfer_artifact_from_retained_log(artifact),
+    )
+}
+
+fn retry_pg_metadata_transfer_import(
+    control_plane: &impl ControlPlaneRuntimeMapSource,
+    mut destination_cluster: Arc<StorageCluster>,
+    context: &MetadataTransferImportContext<'_>,
+    mut import: impl FnMut(&StorageCluster) -> Result<PgMetadataProof, PgMetadataTransferError>,
 ) -> Result<PgMetadataProof, String> {
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {
-        match destination_cluster.import_pg_metadata_transfer_artifact_from_retained_log(artifact) {
+        match import(&destination_cluster) {
             Ok(proof) => return Ok(proof),
             Err(error) if metadata_transfer_error_is_transient_route_refresh(&error) => {
-                if control_plane_pg_active_with_acting_set(
-                    control_plane,
-                    pg_id,
-                    acting_set,
-                    destination_epoch,
-                )? {
-                    return Ok(imported_proof);
+                match refresh_pg_metadata_transfer_import_route(control_plane, context)? {
+                    MetadataTransferImportRouteRefresh::Completed => {
+                        return Ok(context.imported_proof);
+                    }
+                    MetadataTransferImportRouteRefresh::Retry(cluster) => {
+                        destination_cluster = cluster;
+                    }
+                    MetadataTransferImportRouteRefresh::NotReady => {}
                 }
                 if Instant::now() >= deadline {
                     return Err(format!(
@@ -1244,36 +1275,76 @@ fn import_pg_metadata_transfer_artifact_retrying_stale_route(
     }
 }
 
-fn control_plane_pg_active_with_acting_set(
+enum MetadataTransferImportRouteRefresh {
+    Completed,
+    Retry(Arc<StorageCluster>),
+    NotReady,
+}
+
+fn refresh_pg_metadata_transfer_import_route(
     control_plane: &impl ControlPlaneRuntimeMapSource,
-    pg_id: PgId,
-    acting_set: &[NodeId],
-    min_cluster_epoch: ClusterEpoch,
-) -> Result<bool, String> {
-    let runtime_map =
-        match control_plane.pg_runtime_map_snapshot(pg_id, storage::clock::current_time_millis()) {
-            Ok(runtime_map) => runtime_map,
-            Err(error) => {
-                if control_plane_metadata_transfer_observation_error_is_retryable(&error) {
-                    return Ok(false);
-                }
-                return Err(format!(
-                    "failed to verify live PG {} metadata transfer state: {error}",
-                    pg_id.get()
-                ));
+    context: &MetadataTransferImportContext<'_>,
+) -> Result<MetadataTransferImportRouteRefresh, String> {
+    let runtime_map = match control_plane
+        .pg_runtime_map_snapshot(context.pg_id, storage::clock::current_time_millis())
+    {
+        Ok(runtime_map) => runtime_map,
+        Err(error) => {
+            if control_plane_metadata_transfer_observation_error_is_retryable(&error) {
+                return Ok(MetadataTransferImportRouteRefresh::NotReady);
             }
-        };
-    if runtime_map.cluster_epoch() < min_cluster_epoch {
-        return Ok(false);
+            return Err(format!(
+                "failed to refresh live PG {} metadata transfer state: {error}",
+                context.pg_id.get()
+            ));
+        }
+    };
+    if runtime_map.cluster_epoch() < context.destination_epoch {
+        return Ok(MetadataTransferImportRouteRefresh::NotReady);
     }
     let Some(route) = runtime_map
         .pg_routes()
         .iter()
-        .find(|route| route.pg_id() == pg_id)
+        .find(|route| route.pg_id() == context.pg_id)
     else {
-        return Ok(false);
+        return Err(format!(
+            "refreshed metadata transfer destination for PG {} is missing at authoritative epoch {}; expected epoch {}, Peering acting set {:?}, transfer {:?}",
+            context.pg_id.get(),
+            runtime_map.cluster_epoch().get(),
+            context.destination_epoch.get(),
+            context.acting_set,
+            context.expected_transfer,
+        ));
     };
-    Ok(route.state() == PgState::Active && route.acting_set() == acting_set)
+    if route.state() == PgState::Active && route.acting_set() == context.acting_set {
+        return Ok(MetadataTransferImportRouteRefresh::Completed);
+    }
+    if runtime_map.cluster_epoch() != context.destination_epoch
+        || route.state() != PgState::Peering
+        || route.acting_set() != context.acting_set
+        || route.peering_metadata_transfer() != Some(context.expected_transfer)
+    {
+        return Err(format!(
+            "refreshed metadata transfer destination for PG {} does not match: expected epoch {}, state {:?}, acting set {:?}, transfer {:?}; actual epoch {}, state {:?}, acting set {:?}, transfer {:?}",
+            context.pg_id.get(),
+            context.destination_epoch.get(),
+            PgState::Peering,
+            context.acting_set,
+            context.expected_transfer,
+            runtime_map.cluster_epoch().get(),
+            route.state(),
+            route.acting_set(),
+            route.peering_metadata_transfer(),
+        ));
+    }
+    build_frontend_storage_cluster_from_runtime_map(context.config, context.ec_config, &runtime_map)
+        .map(MetadataTransferImportRouteRefresh::Retry)
+        .map_err(|error| {
+            format!(
+                "failed to rebuild live PG {} metadata transfer destination route: {error}",
+                context.pg_id.get()
+            )
+        })
 }
 
 fn control_plane_runtime_map_not_ready_for_serving(message: &str) -> bool {
@@ -1297,6 +1368,9 @@ fn metadata_transfer_error_is_transient_route_refresh(error: &PgMetadataTransfer
         PgMetadataTransferError::Store(store_error) => {
             store_error_is_transient_route_refresh_for_metadata_transfer(store_error)
         }
+        PgMetadataTransferError::Apply(storage::BucketSnapshotLoadError::Store(store_error)) => {
+            store_error_is_transient_route_refresh_for_metadata_transfer(store_error)
+        }
         PgMetadataTransferError::Reconstruction { message } => {
             message.starts_with("PG peering node ")
                 && message.contains(" reported epoch ")
@@ -1308,7 +1382,10 @@ fn metadata_transfer_error_is_transient_route_refresh(error: &PgMetadataTransfer
 
 fn store_error_is_transient_route_refresh_for_metadata_transfer(error: &StoreError) -> bool {
     match error {
-        StoreError::StaleShardLocation { .. } => true,
+        StoreError::RouteMapExpired { .. }
+        | StoreError::StaleMetadataOperation { .. }
+        | StoreError::StaleMetadataRoute { .. }
+        | StoreError::StaleShardLocation { .. } => true,
         StoreError::StorageRpc { code, .. } => {
             *code == StorageRpcErrorCode::StaleShardLocation
                 || *code == StorageRpcErrorCode::MetadataTransferHistoricalRouteActive
@@ -8827,6 +8904,216 @@ mod tests {
     }
 
     #[test]
+    fn metadata_transfer_retry_treats_expired_route_map_as_transient() {
+        let error = PgMetadataTransferError::Store(StoreError::RouteMapExpired {
+            cluster_epoch: ClusterEpoch::new(31).unwrap(),
+            valid_until_ms: 2_000,
+            now_ms: 2_001,
+        });
+
+        assert!(metadata_transfer_error_is_transient_route_refresh(&error));
+    }
+
+    #[test]
+    fn metadata_transfer_retry_treats_apply_route_expiry_as_transient() {
+        let error = PgMetadataTransferError::Apply(storage::BucketSnapshotLoadError::Store(
+            StoreError::RouteMapExpired {
+                cluster_epoch: ClusterEpoch::new(32).unwrap(),
+                valid_until_ms: 3_000,
+                now_ms: 3_001,
+            },
+        ));
+
+        assert!(metadata_transfer_error_is_transient_route_refresh(&error));
+    }
+
+    #[test]
+    fn metadata_transfer_import_refreshes_expired_destination_route() {
+        let tmp = short_unix_socket_test_dir("metadata-transfer-import-refresh");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let store = FileControlPlaneStore::new(tmp.join("control-plane.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+        let source_node_id = NodeId::new(1);
+        let destination_node_id = NodeId::new(2);
+        let pg_id = PgId::new(7);
+        let source_proof = PgMetadataProof::empty();
+        let mut now_ms = storage::clock::current_time_millis();
+
+        for node_id in [source_node_id, destination_node_id] {
+            authority
+                .set_node_membership(node_id, NodeMembershipState::Active)
+                .unwrap();
+            authority
+                .submit_node_heartbeat(
+                    NodeHeartbeat {
+                        node_id,
+                        node_incarnation: 1,
+                        endpoint: tmp
+                            .join(format!("node-{}.sock", node_id.as_u32()))
+                            .display()
+                            .to_string(),
+                        observed_epoch: authority.snapshot().cluster_epoch(),
+                        requested_lease_duration_ms: 10_000,
+                        cluster_map_history_reference_summary:
+                            storage::PgClusterMapHistoryReferenceSummary::default(),
+                        pg_observations: Vec::new(),
+                    },
+                    now_ms,
+                )
+                .unwrap();
+            now_ms += 1;
+        }
+        authority
+            .set_pg_acting_set(pg_id, vec![source_node_id])
+            .unwrap();
+        authority
+            .submit_node_heartbeat(
+                NodeHeartbeat {
+                    node_id: source_node_id,
+                    node_incarnation: 1,
+                    endpoint: tmp.join("node-1.sock").display().to_string(),
+                    observed_epoch: authority.snapshot().cluster_epoch(),
+                    requested_lease_duration_ms: 10_000,
+                    cluster_map_history_reference_summary:
+                        storage::PgClusterMapHistoryReferenceSummary::default(),
+                    pg_observations: vec![NodePgHeartbeatObservation {
+                        pg_id,
+                        state: PgState::Peering,
+                        metadata_proof: source_proof,
+                        has_pending_metadata_command: false,
+                    }],
+                },
+                now_ms,
+            )
+            .unwrap();
+        now_ms += 1;
+        authority
+            .complete_pg_peering(pg_id, source_node_id, 1, now_ms)
+            .unwrap();
+        let source_epoch = authority.snapshot().cluster_epoch();
+        authority
+            .submit_node_heartbeat(
+                NodeHeartbeat {
+                    node_id: source_node_id,
+                    node_incarnation: 1,
+                    endpoint: tmp.join("node-1.sock").display().to_string(),
+                    observed_epoch: source_epoch,
+                    requested_lease_duration_ms: 10_000,
+                    cluster_map_history_reference_summary:
+                        storage::PgClusterMapHistoryReferenceSummary::default(),
+                    pg_observations: vec![NodePgHeartbeatObservation {
+                        pg_id,
+                        state: PgState::Active,
+                        metadata_proof: source_proof,
+                        has_pending_metadata_command: false,
+                    }],
+                },
+                now_ms + 1,
+            )
+            .unwrap();
+        authority.fence_pg_for_metadata_transfer(pg_id).unwrap();
+        let imported_proof = PgMetadataProof {
+            applied_log_index: 0,
+            applied_log_hash: 0,
+            state_digest: 0x1234,
+        };
+        let transfer = PgMetadataTransferProof::new_with_imported_metadata_proof(
+            source_epoch,
+            source_proof,
+            imported_proof,
+        );
+        let transfer_snapshot = authority
+            .set_pg_acting_set_with_metadata_transfer(pg_id, vec![destination_node_id], transfer)
+            .unwrap();
+        let destination_epoch = transfer_snapshot.cluster_epoch();
+        let runtime_map = ControlPlaneRuntimeMapSource::pg_runtime_map_snapshot(
+            &authority,
+            pg_id,
+            storage::clock::current_time_millis(),
+        )
+        .unwrap();
+        let mut config = test_server_config();
+        config.process_role = ProcessRole::Frontend;
+        config.ec_k = 1;
+        config.ec_m = 0;
+        let ec_config = EcConfig::new(1, 0).unwrap();
+        let initial_cluster =
+            build_frontend_storage_cluster_from_runtime_map(&config, &ec_config, &runtime_map)
+                .unwrap();
+        let initial_cluster_ptr = Arc::as_ptr(&initial_cluster);
+        let mut attempts = 0;
+        let context = MetadataTransferImportContext {
+            config: &config,
+            ec_config: &ec_config,
+            pg_id,
+            acting_set: &[destination_node_id],
+            destination_epoch,
+            expected_transfer: transfer,
+            imported_proof,
+        };
+        let mismatched_context = MetadataTransferImportContext {
+            config: &config,
+            ec_config: &ec_config,
+            pg_id,
+            acting_set: &[destination_node_id],
+            destination_epoch,
+            expected_transfer: PgMetadataTransferProof::new_with_imported_metadata_proof(
+                source_epoch,
+                source_proof,
+                PgMetadataProof {
+                    state_digest: imported_proof.state_digest + 1,
+                    ..imported_proof
+                },
+            ),
+            imported_proof,
+        };
+        let mismatch =
+            match refresh_pg_metadata_transfer_import_route(&authority, &mismatched_context) {
+                Err(error) => error,
+                Ok(_) => panic!("mismatched transfer proof must fail closed"),
+            };
+        assert!(mismatch.contains(&format!(
+            "expected epoch {}, state Peering, acting set {:?}, transfer {:?}",
+            destination_epoch.get(),
+            [destination_node_id],
+            mismatched_context.expected_transfer,
+        )));
+        assert!(mismatch.contains(&format!(
+            "actual epoch {}, state Peering, acting set {:?}, transfer {:?}",
+            destination_epoch.get(),
+            [destination_node_id],
+            Some(transfer),
+        )));
+
+        let result =
+            retry_pg_metadata_transfer_import(&authority, initial_cluster, &context, |cluster| {
+                attempts += 1;
+                if attempts == 1 {
+                    return Err(PgMetadataTransferError::Store(
+                        StoreError::RouteMapExpired {
+                            cluster_epoch: destination_epoch,
+                            valid_until_ms: 1,
+                            now_ms: 2,
+                        },
+                    ));
+                }
+                assert!(
+                    !std::ptr::eq(cluster, initial_cluster_ptr),
+                    "retry must not reuse the expired destination cluster"
+                );
+                assert!(cluster.is_route_map_valid_at(storage::clock::current_time_millis()));
+                Ok(imported_proof)
+            })
+            .unwrap();
+
+        assert_eq!(result, imported_proof);
+        assert_eq!(attempts, 2);
+        drop(authority);
+        std::fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    #[test]
     fn metadata_transfer_retry_does_not_treat_active_route_mismatch_as_transient() {
         let error = PgMetadataTransferError::Store(StoreError::StorageRpc {
             node_id: 0,
@@ -8908,13 +9195,25 @@ mod tests {
             "expected unrelated PG to make full runtime map fail, got {full_map_error}"
         );
         assert!(
-            control_plane_pg_active_with_acting_set(
-                &control_plane,
-                PgId::new(0),
-                &[NodeId::new(0)],
-                ClusterEpoch::new(1).unwrap(),
-            )
-            .unwrap(),
+            matches!(
+                refresh_pg_metadata_transfer_import_route(
+                    &control_plane,
+                    &MetadataTransferImportContext {
+                        config: &test_server_config(),
+                        ec_config: &EcConfig::new(1, 0).unwrap(),
+                        pg_id: PgId::new(0),
+                        acting_set: &[NodeId::new(0)],
+                        destination_epoch: ClusterEpoch::new(1).unwrap(),
+                        expected_transfer: PgMetadataTransferProof::new(
+                            ClusterEpoch::new(1).unwrap(),
+                            PgMetadataProof::empty(),
+                        ),
+                        imported_proof: PgMetadataProof::empty(),
+                    },
+                )
+                .unwrap(),
+                MetadataTransferImportRouteRefresh::Completed
+            ),
             "target PG should be confirmable without requiring unrelated PGs to serve"
         );
 

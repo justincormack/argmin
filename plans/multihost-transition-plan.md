@@ -8092,11 +8092,16 @@ Metadata PG migration and backfill design notes:
   imported proof for the next destination epoch, installs the transfer-backed
   acting set through the control plane, and imports the artifact into the
   destination Peering acting set using the exact destination runtime map
-  returned by the transfer-install RPC. This is still an operator/UAT primitive
-  rather than an autonomous migration scheduler. The authority rejects stale
-  transfer source epochs before persisting the transfer marker, and the command
-  no longer refetches an arbitrary later control-plane map between install and
-  import.
+  returned by the transfer-install RPC. If that bounded map expires before or
+  during import, retry obtains a fresh PG-scoped map and rebuilds the storage
+  cluster only when the refreshed map still has the exact destination epoch,
+  Peering acting set, and transfer proof; an already-Active matching PG is the
+  response-loss success case. An authoritative same/newer-epoch mismatch fails
+  immediately with the expected and actual transfer provenance rather than
+  waiting on a state that cannot converge back. This is still an operator/UAT
+  primitive rather than an autonomous migration scheduler. The authority
+  rejects stale transfer source epochs before persisting the transfer marker,
+  and import cannot switch to an arbitrary later control-plane route.
 - Added a focused whole-lifetime UAT smoke for metadata PG migration. The new
   `metadata-pg-migration` smoke starts a four-node control-plane topology,
   places PGs initially on nodes `0:1`, creates bucket and object metadata on a
