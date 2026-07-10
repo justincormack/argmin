@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$ROOT"
+
+echo "== release control-plane invariant boundary =="
+cargo nextest run --release -p storage \
+    command_apply_rejects_invalid_snapshot_before_publication \
+    direct_snapshot_commit_validates_control_plane_invariants \
+    open_validates_control_plane_invariants_before_saving \
+    replicated_control_plane_state_machine_fatal_invariant_does_not_advance \
+    replicated_state_machine_constructor_validates_control_plane_invariants \
+    replicated_snapshot_install_validates_control_plane_invariants_before_mutation
+
+echo
+echo "== release control-plane process suite =="
+cargo nextest run --release -p argmin-s3 --test experimental_raft_process

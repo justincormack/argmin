@@ -54,15 +54,18 @@ fn non_serving_runtime_map_validity(now_ms: u64) -> RouteMapValidity {
     RouteMapValidity::until_ms_saturating(now_ms.saturating_add(MAX_HEARTBEAT_LEASE_MS))
 }
 
-#[cfg(any(test, debug_assertions))]
-fn panic_on_invalid_control_plane_snapshot(context: &str, snapshot: &ClusterControlSnapshot) {
-    // These checks are intentionally fail-fast in test/debug builds. An invalid
-    // control-plane snapshot means a local state-machine invariant was broken;
-    // returning a recoverable error here would risk hiding divergent replicated
-    // state behind normal command failure handling.
-    if let Err(error) = snapshot.validate_invariants() {
-        panic!("{context}: {error}");
-    }
+pub(crate) fn validate_control_plane_snapshot(
+    context: &'static str,
+    snapshot: &ClusterControlSnapshot,
+) -> Result<(), ControlPlaneError> {
+    snapshot
+        .validate_publication_invariants()
+        .map_err(|message| ControlPlaneError::SnapshotInvariantViolation { context, message })?;
+    #[cfg(any(test, debug_assertions))]
+    snapshot
+        .validate_audit_invariants()
+        .map_err(|message| ControlPlaneError::SnapshotInvariantViolation { context, message })?;
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -290,6 +293,28 @@ impl ClusterControlSnapshot {
             pgs: BTreeMap::new(),
             history: Vec::new(),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_invalid_active_without_metadata_proof_epoch(pg_id: PgId) -> Self {
+        let mut snapshot = Self::empty();
+        snapshot.nodes.insert(
+            NodeId::new(1),
+            NodeControlRecord::new(NodeId::new(1), NodeMembershipState::Active),
+        );
+        snapshot.pgs.insert(
+            pg_id,
+            PgControlRecord {
+                pg_id,
+                state: PgState::Active,
+                acting_set: vec![NodeId::new(1)],
+                active_primary: Some(NodeId::new(1)),
+                active_metadata_proof: Some(PgMetadataProof::empty()),
+                active_metadata_proof_epoch: None,
+                ..PgControlRecord::new(pg_id, vec![NodeId::new(1)])
+            },
+        );
+        snapshot
     }
 
     #[must_use]
@@ -941,8 +966,7 @@ impl ClusterControlSnapshot {
         })
     }
 
-    #[cfg(any(test, debug_assertions))]
-    pub(crate) fn validate_invariants(&self) -> Result<(), String> {
+    pub(crate) fn validate_publication_invariants(&self) -> Result<(), String> {
         validate_required_cluster_map_history(
             &self.history,
             &self.pgs,
@@ -951,6 +975,10 @@ impl ClusterControlSnapshot {
         )
         .map_err(|error| error.to_string())?;
 
+        self.validate_current_state_invariants()
+    }
+
+    fn validate_current_state_invariants(&self) -> Result<(), String> {
         for pg in self.pgs.values() {
             if pg.acting_set.is_empty() {
                 return Err(format!("PG {} has an empty acting set", pg.pg_id.get()));
@@ -1216,6 +1244,66 @@ impl ClusterControlSnapshot {
         Ok(())
     }
 
+    #[cfg(any(test, debug_assertions))]
+    fn validate_audit_invariants(&self) -> Result<(), String> {
+        let mut history_epochs = BTreeSet::new();
+        for history in &self.history {
+            if history.cluster_epoch >= self.cluster_epoch {
+                return Err(format!(
+                    "history epoch {} is not older than current epoch {}",
+                    history.cluster_epoch, self.cluster_epoch
+                ));
+            }
+            if !history_epochs.insert(history.cluster_epoch) {
+                return Err(format!(
+                    "cluster-map history repeats epoch {}",
+                    history.cluster_epoch
+                ));
+            }
+
+            let nodes: BTreeMap<_, _> = history
+                .nodes
+                .iter()
+                .cloned()
+                .map(|node| (node.node_id, node))
+                .collect();
+            if nodes.len() != history.nodes.len() {
+                return Err(format!(
+                    "cluster-map history epoch {} repeats a node record",
+                    history.cluster_epoch
+                ));
+            }
+            let pgs: BTreeMap<_, _> = history
+                .pgs
+                .iter()
+                .cloned()
+                .map(|pg| (pg.pg_id, pg))
+                .collect();
+            if pgs.len() != history.pgs.len() {
+                return Err(format!(
+                    "cluster-map history epoch {} repeats a PG record",
+                    history.cluster_epoch
+                ));
+            }
+            ClusterControlSnapshot {
+                authority_incarnation: history.authority_incarnation,
+                cluster_epoch: history.cluster_epoch,
+                max_committed_timestamp_ms: None,
+                nodes,
+                pgs,
+                history: Vec::new(),
+            }
+            .validate_current_state_invariants()
+            .map_err(|message| {
+                format!(
+                    "cluster-map history epoch {} is invalid: {message}",
+                    history.cluster_epoch
+                )
+            })?;
+        }
+        Ok(())
+    }
+
     fn record_history_from(&mut self, previous: &Self) {
         if previous.cluster_epoch == self.cluster_epoch {
             return;
@@ -1335,7 +1423,7 @@ impl ControlPlaneCommandStateMachine for ClusterControlSnapshot {
         &self,
         command: ControlPlaneCommand,
     ) -> Result<AppliedControlPlaneCommand, ControlPlaneError> {
-        match command {
+        let applied = (|| match command {
             ControlPlaneCommand::BootstrapInitialClusterMap { nodes, pg_ids } => {
                 if self.nodes().next().is_some() || self.pgs().next().is_some() {
                     return Err(ControlPlaneError::BootstrapRequiresEmptyState);
@@ -2334,7 +2422,12 @@ impl ControlPlaneCommandStateMachine for ClusterControlSnapshot {
                     completed_any || timestamp_changed,
                 ))
             }
-        }
+        })()?;
+        validate_control_plane_snapshot(
+            "control-plane command produced invalid snapshot",
+            applied.snapshot(),
+        )?;
+        Ok(applied)
     }
 }
 
@@ -2347,11 +2440,6 @@ fn applied_control_plane_command(
     if changed {
         next_snapshot.record_history_from(previous_snapshot);
     }
-    #[cfg(any(test, debug_assertions))]
-    panic_on_invalid_control_plane_snapshot(
-        "control-plane command produced invalid snapshot",
-        &next_snapshot,
-    );
     AppliedControlPlaneCommand::new(next_snapshot, response, changed)
 }
 
@@ -3673,11 +3761,10 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
             snapshot.bump_authority_after_restart()?;
             snapshot.record_history_from(&previous_snapshot);
         }
-        #[cfg(any(test, debug_assertions))]
-        panic_on_invalid_control_plane_snapshot(
+        validate_control_plane_snapshot(
             "attempted to open invalid control-plane snapshot",
             &snapshot,
-        );
+        )?;
         store.save(&snapshot)?;
         Ok(Self { store, snapshot })
     }
@@ -4216,11 +4303,10 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
         mut next_snapshot: ClusterControlSnapshot,
     ) -> Result<(), ControlPlaneError> {
         next_snapshot.record_history_from(&self.snapshot);
-        #[cfg(any(test, debug_assertions))]
-        panic_on_invalid_control_plane_snapshot(
+        validate_control_plane_snapshot(
             "attempted to commit invalid control-plane snapshot",
             &next_snapshot,
-        );
+        )?;
         self.store.save(&next_snapshot)?;
         self.snapshot = next_snapshot;
         Ok(())
@@ -9190,6 +9276,12 @@ pub enum ControlPlaneError {
     #[error("control-plane snapshot decode error: {message}")]
     SnapshotDecode { message: String },
 
+    #[error("{context}: control-plane snapshot invariant violation: {message}")]
+    SnapshotInvariantViolation {
+        context: &'static str,
+        message: String,
+    },
+
     #[error(
         "control-plane committed log index mismatch: expected {expected_index}, got {actual_index}"
     )]
@@ -11916,63 +12008,22 @@ mod tests {
     use std::cell::Cell;
     use std::sync::{
         atomic::{AtomicU64, Ordering},
-        Arc, Once,
+        Arc,
     };
     use std::time::{Duration, Instant};
 
-    thread_local! {
-        static SUPPRESS_EXPECTED_TEST_PANIC: Cell<bool> = const { Cell::new(false) };
-    }
-
-    static EXPECTED_TEST_PANIC_HOOK: Once = Once::new();
-
-    struct SuppressExpectedTestPanic {
-        previous_suppressed: bool,
-    }
-
-    impl SuppressExpectedTestPanic {
-        fn enter() -> Self {
-            EXPECTED_TEST_PANIC_HOOK.call_once(|| {
-                let previous_hook = std::panic::take_hook();
-                std::panic::set_hook(Box::new(move |panic_info| {
-                    if SUPPRESS_EXPECTED_TEST_PANIC.with(Cell::get) {
-                        return;
-                    }
-                    previous_hook(panic_info);
-                }));
-            });
-            let previous_suppressed = SUPPRESS_EXPECTED_TEST_PANIC.with(|suppressed| {
-                let previous = suppressed.get();
-                suppressed.set(true);
-                previous
-            });
-            Self {
-                previous_suppressed,
-            }
-        }
-    }
-
-    impl Drop for SuppressExpectedTestPanic {
-        fn drop(&mut self) {
-            SUPPRESS_EXPECTED_TEST_PANIC
-                .with(|suppressed| suppressed.set(self.previous_suppressed));
-        }
-    }
-
-    fn expect_panic_containing(expected: &str, f: impl FnOnce()) {
-        let result = {
-            let _panic_guard = SuppressExpectedTestPanic::enter();
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(f))
+    fn assert_snapshot_invariant_error(
+        error: ControlPlaneError,
+        expected_context: &'static str,
+        expected_message: &str,
+    ) {
+        let ControlPlaneError::SnapshotInvariantViolation { context, message } = error else {
+            panic!("unexpected control-plane error: {error}");
         };
-        let panic = result.expect_err("expected control-plane invariant panic");
-        let message = panic
-            .downcast_ref::<&str>()
-            .map(|message| (*message).to_string())
-            .or_else(|| panic.downcast_ref::<String>().cloned())
-            .unwrap_or_else(|| "<non-string panic payload>".to_string());
+        assert_eq!(context, expected_context);
         assert!(
-            message.contains(expected),
-            "panic message {message:?} did not contain {expected:?}"
+            message.contains(expected_message),
+            "invariant message {message:?} did not contain {expected_message:?}"
         );
     }
 
@@ -12010,27 +12061,6 @@ mod tests {
                 Ok(())
             }
         }
-    }
-
-    fn active_snapshot_without_metadata_proof_epoch(pg_id: PgId) -> ClusterControlSnapshot {
-        let mut snapshot = ClusterControlSnapshot::empty();
-        snapshot.nodes.insert(
-            NodeId::new(1),
-            NodeControlRecord::new(NodeId::new(1), NodeMembershipState::Active),
-        );
-        snapshot.pgs.insert(
-            pg_id,
-            PgControlRecord {
-                pg_id,
-                state: PgState::Active,
-                acting_set: vec![NodeId::new(1)],
-                active_primary: Some(NodeId::new(1)),
-                active_metadata_proof: Some(PgMetadataProof::empty()),
-                active_metadata_proof_epoch: None,
-                ..PgControlRecord::new(pg_id, vec![NodeId::new(1)])
-            },
-        );
-        snapshot
     }
 
     fn canonical_snapshot_with_node() -> ClusterControlSnapshot {
@@ -13014,7 +13044,7 @@ mod tests {
         now_ms: u64,
     ) -> Result<(), TestCaseError> {
         let snapshot = authority.snapshot();
-        if let Err(error) = snapshot.validate_invariants() {
+        if let Err(error) = snapshot.validate_publication_invariants() {
             return Err(TestCaseError::fail(format!(
                 "control-plane snapshot invariant failed: {error}"
             )));
@@ -13571,7 +13601,7 @@ mod tests {
             .get_mut(&pg_id)
             .unwrap()
             .peering_metadata_proof_floor = Some(proof);
-        let error = snapshot.validate_invariants().unwrap_err();
+        let error = snapshot.validate_publication_invariants().unwrap_err();
         assert!(
             error.contains("carries peering metadata-transfer state"),
             "unexpected invariant error: {error}"
@@ -13635,7 +13665,7 @@ mod tests {
             .get_mut(&pg_id)
             .unwrap()
             .metadata_transfer_fenced = true;
-        let error = snapshot.validate_invariants().unwrap_err();
+        let error = snapshot.validate_publication_invariants().unwrap_err();
         assert!(
             error.contains("destination metadata transfer state and source transfer fence"),
             "unexpected invariant error: {error}"
@@ -13709,7 +13739,7 @@ mod tests {
             applied_log_hash: 10,
             state_digest: 11,
         });
-        let error = snapshot.validate_invariants().unwrap_err();
+        let error = snapshot.validate_publication_invariants().unwrap_err();
         assert!(
             error.contains("metadata transfer proof is below the proof floor"),
             "unexpected invariant error: {error}"
@@ -13720,6 +13750,7 @@ mod tests {
     fn direct_snapshot_commit_validates_control_plane_invariants() {
         let tmp = test_util::tempdir();
         let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let persisted_store = store.clone();
         let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
         authority
             .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
@@ -13735,14 +13766,53 @@ mod tests {
         pg.state = PgState::Active;
         pg.active_primary = Some(NodeId::new(1));
         pg.active_metadata_proof = Some(PgMetadataProof::empty());
-        expect_panic_containing("attempted to commit invalid control-plane snapshot", || {
-            authority.commit_snapshot(snapshot).unwrap()
-        });
+        let before = authority.snapshot().clone();
+        let error = authority.commit_snapshot(snapshot).unwrap_err();
+        assert_snapshot_invariant_error(
+            error,
+            "attempted to commit invalid control-plane snapshot",
+            "has no metadata proof epoch",
+        );
+        assert_eq!(authority.snapshot(), &before);
+        assert_eq!(persisted_store.load().unwrap().as_ref(), Some(&before));
+    }
+
+    #[test]
+    fn command_apply_rejects_invalid_snapshot_before_publication() {
+        let snapshot =
+            ClusterControlSnapshot::test_invalid_active_without_metadata_proof_epoch(PgId::new(27));
+
+        let error = snapshot
+            .apply_control_plane_command(ControlPlaneCommand::MarkNodeAvailability {
+                node_id: NodeId::new(1),
+                availability: NodeAvailabilityState::Suspect,
+            })
+            .unwrap_err();
+
+        assert_snapshot_invariant_error(
+            error,
+            "control-plane command produced invalid snapshot",
+            "has no metadata proof epoch",
+        );
+    }
+
+    #[test]
+    fn retained_history_structure_remains_a_debug_audit() {
+        let mut snapshot = ClusterControlSnapshot::empty();
+        let history = ClusterMapHistoryRecord::from_snapshot(&snapshot);
+        snapshot.history.push(history);
+
+        snapshot.validate_publication_invariants().unwrap();
+        let error = snapshot.validate_audit_invariants().unwrap_err();
+        assert!(
+            error.contains("history epoch 1 is not older than current epoch 1"),
+            "unexpected audit error: {error}"
+        );
     }
 
     #[test]
     fn open_validates_control_plane_invariants_before_saving() {
-        let pg_id = PgId::new(27);
+        let pg_id = PgId::new(28);
         let mut snapshot = ClusterControlSnapshot::empty();
         snapshot.nodes.insert(
             NodeId::new(1),
@@ -13763,44 +13833,53 @@ mod tests {
         );
 
         let store = FailingStore::new(snapshot);
-        expect_panic_containing("attempted to open invalid control-plane snapshot", || {
-            let _ = SingleAuthorityControlPlane::open(store);
-        });
+        let error = match SingleAuthorityControlPlane::open(store) {
+            Ok(_) => panic!("invalid control-plane snapshot unexpectedly opened"),
+            Err(error) => error,
+        };
+        assert_snapshot_invariant_error(
+            error,
+            "attempted to open invalid control-plane snapshot",
+            "has a transfer marker without a proof floor",
+        );
     }
 
     #[test]
     fn replicated_state_machine_constructor_validates_control_plane_invariants() {
-        let snapshot = active_snapshot_without_metadata_proof_epoch(PgId::new(28));
-        expect_panic_containing(
+        let snapshot =
+            ClusterControlSnapshot::test_invalid_active_without_metadata_proof_epoch(PgId::new(29));
+        let error = crate::control_plane_command::ReplicatedControlPlaneStateMachine::new(
+            snapshot,
+            crate::control_plane_command::ControlPlaneLogId::new(1, 1),
+        )
+        .unwrap_err();
+        assert_snapshot_invariant_error(
+            error,
             "attempted to create replicated state machine from invalid control-plane snapshot",
-            || {
-                let _ = crate::control_plane_command::ReplicatedControlPlaneStateMachine::new(
-                    snapshot,
-                    crate::control_plane_command::ControlPlaneLogId::new(1, 1),
-                );
-            },
+            "has no metadata proof epoch",
         );
     }
 
     #[test]
     fn replicated_snapshot_install_validates_control_plane_invariants_before_mutation() {
-        let invalid_snapshot = active_snapshot_without_metadata_proof_epoch(PgId::new(29));
+        let invalid_snapshot =
+            ClusterControlSnapshot::test_invalid_active_without_metadata_proof_epoch(PgId::new(30));
         let payload =
             crate::control_plane_command::encode_control_plane_snapshot(&invalid_snapshot).unwrap();
         let mut state_machine =
             crate::control_plane_command::ReplicatedControlPlaneStateMachine::empty();
-        expect_panic_containing(
+        let before = state_machine.clone();
+        let error = state_machine
+            .install_snapshot_artifact(
+                crate::control_plane_command::ControlPlaneSnapshotArtifact::new(None, payload),
+            )
+            .unwrap_err();
+        assert_snapshot_invariant_error(
+            error,
             "attempted to install invalid replicated control-plane snapshot",
-            || {
-                state_machine
-                    .install_snapshot_artifact(
-                        crate::control_plane_command::ControlPlaneSnapshotArtifact::new(
-                            None, payload,
-                        ),
-                    )
-                    .unwrap();
-            },
+            "has no metadata proof epoch",
         );
+        assert_eq!(state_machine, before);
     }
 
     #[test]

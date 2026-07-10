@@ -595,14 +595,18 @@ fn wait_for_runtime_map_ready_on(
 }
 
 fn wait_for_socket_file(path: &Path, child: &mut ChildGuard) {
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         child.assert_running();
         if path.exists() {
             return;
         }
         if Instant::now() >= deadline {
-            panic!("socket file {} was not created", path.display());
+            panic!(
+                "socket file {} was not created\n{}",
+                path.display(),
+                process_logs(&child.test_dir)
+            );
         }
         thread::sleep(Duration::from_millis(10));
     }

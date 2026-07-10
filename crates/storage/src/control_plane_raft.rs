@@ -14088,7 +14088,8 @@ mod tests {
         let inner = ReplicatedControlPlaneStateMachine::new(
             ClusterControlSnapshot::empty(),
             Some(ControlPlaneLogId::new(1, u64::MAX).unwrap()),
-        );
+        )
+        .unwrap();
         let mut state_machine = ControlPlaneRaftStateMachine::new(
             inner,
             Some(raft_log_id(1, 7, u64::MAX)),

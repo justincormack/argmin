@@ -26,6 +26,9 @@ cargo nextest run
 ./scripts/check-storage-cluster-boundaries
 cargo clippy --all-targets --all-features -- -D warnings
 
+# Release-mode control-plane invariant and process gate.
+./scripts/ci-control-plane-release
+
 # Integration coverage.
 ./scripts/coverage
 
@@ -65,6 +68,17 @@ under test is AWS or another remote S3 endpoint. In those cases, bounded
 eventual checks are correct because AWS control-plane convergence is part of
 the real behavior being modeled. That is acceptable in `crates/s3-tests` and
 similar external suites, but not in ordinary unit/property tests.
+
+## Release-Mode Control-Plane Gate
+
+`./scripts/ci` runs `./scripts/ci-control-plane-release` as a distinct step
+after the ordinary debug workspace suite. The release gate also remains
+independently runnable for focused verification. It executes the typed
+control-plane snapshot publication regressions and the complete multi-process
+Raft integration test binary with release optimizations and `debug_assertions`
+disabled. This catches release-only `cfg`, overflow, timeout, and
+optimization-sensitive behavior at the same process boundary used by the
+replicated control plane.
 
 ## Storage Cluster Boundary Checks
 

@@ -343,24 +343,30 @@ Regression evidence:
    expires the pinned route map after the first PG result and verifies that
    both object and multipart listing reject the request on the next PG.
 
-### DCC-4. MEDIUM - load-bearing control-plane invariant checks disappear in release builds
+### DCC-4. RESOLVED / MEDIUM - load-bearing control-plane invariant checks disappeared in release builds
 
-Confidence: confirmed confidence gap. No current command is known to produce
-an invalid snapshot through this omission alone.
+Confidence: resolved in the current tree. No command was found to produce an
+invalid snapshot before the boundary was closed.
 
-`ClusterControlSnapshot::validate_invariants` and calls from command apply,
-single-authority open, and commit are guarded by
-`#[cfg(any(test, debug_assertions))]` (`control_plane.rs:935`, `:2316-2321`,
-`:3629-3635`, `:4173-4179`). Release binaries can therefore persist and serve
-a state-machine result that debug/test binaries would reject. Restart parsing
-may catch some shapes later, but that is after an invalid map may have been
-published.
+`ClusterControlSnapshot::validate_publication_invariants` is now always
+compiled and checks current PG/node serving shape, proof/observation
+consistency, acting-set references, and required retained history before a
+snapshot may be returned from command application, opened, committed, used to
+construct the replicated state machine, or installed from a replicated
+snapshot artifact. Violations return the typed
+`ControlPlaneError::SnapshotInvariantViolation` before memory or durable state
+is published. Replicated apply treats this variant as a fatal state-machine
+failure and does not advance `last_applied`; ordinary deterministic domain
+rejections retain their existing committed-rejection behavior.
 
-Split validation into cheap always-on safety invariants and expensive audit
-checks. Command application and snapshot install should return a typed fatal
-state-machine error before publication, not rely on a debug-only panic. Run
-the full process suite in release mode as a separate gate so `cfg`, overflow,
-timeout, and optimization-sensitive differences are exercised.
+The more expensive retained-history structural audit remains limited to
+test/debug builds. Typed regressions cover command output, single-authority
+open and commit, replicated construction, and snapshot installation, including
+no-mutation/no-persistence assertions. `./scripts/ci-control-plane-release`
+runs those boundary tests plus the full multi-process Raft test binary with
+release optimizations and `debug_assertions` disabled; the standard
+`./scripts/ci` workflow invokes that release gate after its debug workspace
+tests.
 
 ## Revalidated production blockers
 
@@ -372,8 +378,6 @@ the current tree; they are omitted from the open list below.
 
 - `CP2` and `CL4`: absolute authority deadlines are compared against unrelated
   host wall clocks with zero skew margin. DCC-2 makes the consequence larger.
-- `DCC-4`: snapshot invariants that protect publication are still compiled out
-  of release builds instead of returning a typed fail-closed error.
 - `RPC4`: read-handle fencing is keyed by epoch-bearing `ShardLocation`, while
   the physical shard path is keyed by shard identity without epoch. Handles
   for two epochs can alias one file without blocking deletion.
@@ -643,8 +647,9 @@ because the current stochastic failures can take hours to recur.
 1. **Completed:** close DCC-1/CL1 with frame-wide route draining,
    request-bound metadata commit fencing, the remaining effect audit, and
    deterministic transition coverage.
-2. Move DCC-4's cheap publication invariants into the release path with typed
-   fail-closed errors; retain expensive audits for debug/test builds.
+2. **Completed:** move DCC-4's publication invariants into the release path
+   with typed fail-closed errors, retain the expensive history audit for
+   debug/test builds, and add a separate release-mode process gate.
 3. Replace the timestamp/lease design in DCC-2 with an explicit clock fault
    model and multi-clock property test.
 4. **Completed:** fix DCC-3 with bounded global smallest-`N` selection and pin

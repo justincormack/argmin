@@ -1,7 +1,8 @@
 use crate::control_plane::{
-    format_snapshot, parse_snapshot, ClusterControlSnapshot, ClusterRuntimeMapSnapshot,
-    ControlPlaneError, NodeAvailabilityState, NodeHeartbeat, NodeMembershipState,
-    NodePgHeartbeatObservation, PgMetadataProof, PgMetadataTransferProof, RuntimeMapFreshnessProof,
+    format_snapshot, parse_snapshot, validate_control_plane_snapshot, ClusterControlSnapshot,
+    ClusterRuntimeMapSnapshot, ControlPlaneError, NodeAvailabilityState, NodeHeartbeat,
+    NodeMembershipState, NodePgHeartbeatObservation, PgMetadataProof, PgMetadataTransferProof,
+    RuntimeMapFreshnessProof,
 };
 use crate::types::{PgId, PgState};
 use crate::{ClusterEpoch, PgClusterMapHistoryReferenceSummary};
@@ -511,7 +512,7 @@ pub struct AppliedControlPlaneCommand {
 
 impl AppliedControlPlaneCommand {
     #[must_use]
-    pub fn new(
+    pub(crate) fn new(
         snapshot: ClusterControlSnapshot,
         response: ControlPlaneCommandResponse,
         changed: bool,
@@ -696,21 +697,26 @@ pub struct ReplicatedControlPlaneStateMachine {
 impl ReplicatedControlPlaneStateMachine {
     #[must_use]
     pub fn empty() -> Self {
-        Self::new(ClusterControlSnapshot::empty(), None)
+        Self {
+            snapshot: ClusterControlSnapshot::empty(),
+            last_applied: None,
+            snapshot_last_applied: None,
+        }
     }
 
-    #[must_use]
-    pub fn new(snapshot: ClusterControlSnapshot, last_applied: Option<ControlPlaneLogId>) -> Self {
-        #[cfg(any(test, debug_assertions))]
-        assert_snapshot_invariants(
-            &snapshot,
+    pub fn new(
+        snapshot: ClusterControlSnapshot,
+        last_applied: Option<ControlPlaneLogId>,
+    ) -> Result<Self, ControlPlaneError> {
+        validate_control_plane_snapshot(
             "attempted to create replicated state machine from invalid control-plane snapshot",
-        );
-        Self {
+            &snapshot,
+        )?;
+        Ok(Self {
             snapshot,
             last_applied,
             snapshot_last_applied: None,
-        }
+        })
     }
 
     #[must_use]
@@ -750,13 +756,17 @@ impl ReplicatedControlPlaneStateMachine {
         command: ControlPlaneCommand,
     ) -> Result<CommittedControlPlaneLogCommand, ControlPlaneError> {
         self.validate_next_log_id(log_id)?;
-        self.last_applied = Some(log_id);
         match self.snapshot.apply_control_plane_command(command) {
             Ok(applied) => {
+                self.last_applied = Some(log_id);
                 self.snapshot = applied.snapshot().clone();
                 Ok(CommittedControlPlaneLogCommand::applied(log_id, applied))
             }
-            Err(error) => Ok(CommittedControlPlaneLogCommand::rejected(log_id, error)),
+            Err(error @ ControlPlaneError::SnapshotInvariantViolation { .. }) => Err(error),
+            Err(error) => {
+                self.last_applied = Some(log_id);
+                Ok(CommittedControlPlaneLogCommand::rejected(log_id, error))
+            }
         }
     }
 
@@ -789,11 +799,10 @@ impl ReplicatedControlPlaneStateMachine {
         // (payload, last_applied) pair. This adapter guards only against
         // rollback relative to the current applied position.
         let snapshot = decode_control_plane_snapshot(artifact.payload())?;
-        #[cfg(any(test, debug_assertions))]
-        assert_snapshot_invariants(
-            &snapshot,
+        validate_control_plane_snapshot(
             "attempted to install invalid replicated control-plane snapshot",
-        );
+            &snapshot,
+        )?;
         self.snapshot = snapshot;
         self.last_applied = artifact.last_applied();
         self.snapshot_last_applied = artifact.last_applied();
@@ -875,13 +884,6 @@ impl ReplicatedControlPlaneStateMachine {
             });
         }
         Ok(())
-    }
-}
-
-#[cfg(any(test, debug_assertions))]
-fn assert_snapshot_invariants(snapshot: &ClusterControlSnapshot, context: &str) {
-    if let Err(error) = snapshot.validate_invariants() {
-        panic!("{context}: {error}");
     }
 }
 
@@ -1891,7 +1893,8 @@ mod tests {
     #[test]
     fn replicated_control_plane_state_machine_rejects_log_index_overflow_before_mutation() {
         let mut state_machine =
-            ReplicatedControlPlaneStateMachine::new(sample_snapshot(), Some(log_id(1, u64::MAX)));
+            ReplicatedControlPlaneStateMachine::new(sample_snapshot(), Some(log_id(1, u64::MAX)))
+                .unwrap();
         let before = state_machine.clone();
 
         assert!(matches!(
@@ -1899,6 +1902,38 @@ mod tests {
             Err(ControlPlaneError::ControlPlaneLogIndexOverflow { index: u64::MAX })
         ));
         assert_eq!(state_machine, before);
+    }
+
+    #[test]
+    fn replicated_control_plane_state_machine_fatal_invariant_does_not_advance() {
+        let mut state_machine = ReplicatedControlPlaneStateMachine {
+            snapshot: ClusterControlSnapshot::test_invalid_active_without_metadata_proof_epoch(
+                PgId::new(27),
+            ),
+            last_applied: Some(log_id(1, 1)),
+            snapshot_last_applied: None,
+        };
+        let before = state_machine.clone();
+
+        let error = state_machine
+            .apply_committed_command(
+                log_id(1, 2),
+                ControlPlaneCommand::MarkNodeAvailability {
+                    node_id: NodeId::new(1),
+                    availability: NodeAvailabilityState::Suspect,
+                },
+            )
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ControlPlaneError::SnapshotInvariantViolation {
+                context: "control-plane command produced invalid snapshot",
+                message,
+            } if message.contains("has no metadata proof epoch")
+        ));
+        assert_eq!(state_machine, before);
+        assert_eq!(state_machine.last_applied(), Some(log_id(1, 1)));
     }
 
     #[test]
@@ -2082,7 +2117,7 @@ mod tests {
         assert_eq!(current, before);
 
         let mut current =
-            ReplicatedControlPlaneStateMachine::new(snapshot.clone(), Some(log_id(2, 3)));
+            ReplicatedControlPlaneStateMachine::new(snapshot.clone(), Some(log_id(2, 3))).unwrap();
         let before = current.clone();
         assert!(matches!(
             current.install_snapshot_artifact(ControlPlaneSnapshotArtifact::new(
