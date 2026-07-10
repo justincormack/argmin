@@ -205,6 +205,15 @@ Confidence: confirmed. This supersedes the latest statement that `R3-1` and
 `R3-2` are fully addressed. Their exact crash-loop mechanisms are fixed, but
 the replacement does not establish a bounded lease invariant.
 
+Implementation status (2026-07-10): model-first work is in progress. The
+normative clock/fault assumptions and lease equations are now defined in
+[`guides/control-plane-clock-and-lease-model.md`](../guides/control-plane-clock-and-lease-model.md),
+with an executable independent-clock model in
+`crates/storage/src/control_plane_lease.rs`. Production runtime-map consumers
+still use absolute wall-clock deadlines, so this finding remains open until
+the authority bound, process-local monotonic binding, restart fence, and
+successor activation margin are wired through end to end.
+
 `MAX_HEARTBEAT_LEASE_MS` is 10 seconds and
 `MAX_COMMITTED_TIMESTAMP_FORWARD_JUMP_MS` is one hour
 (`control_plane.rs:28-29`). On heartbeat apply:

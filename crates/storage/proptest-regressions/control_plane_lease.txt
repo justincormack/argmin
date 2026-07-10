@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc f9cf027ea54d4f265267d20de0f7e577e868e6f53e237269df84407884d996f0 # shrinks to events = [IssueLease(2611), RefreshFrontend, IssueLease(1), AdvanceReal(1001), TryActivateSuccessor], storage_node_count = 1
+cc ee0b8ae59f254c06aec7655c333e0bf8da6a98139e3090d7fc3cb20f5e9231f6 # shrinks to events = [IssueLease(343), AdvanceReal(1112), StepFrontendWall(-5343), AdvanceReal(1361), AdvanceReal(1870), TryActivateSuccessor, RefreshFrontend], storage_node_count = 1

@@ -10689,6 +10689,13 @@ Phase 12.4 proposed scope:
   activation. The design must keep apply deterministic, reject committed time
   regression, avoid reviving expired leases after leader failover or local clock
   rollback, and document the remaining operational clock assumptions.
+  The normative model is
+  [control-plane-clock-and-lease-model.md](../guides/control-plane-clock-and-lease-model.md):
+  the current 1,000 ms maximum pairwise skew budget is subtracted when a
+  frontend or storage node binds a map to its process-local monotonic clock,
+  and added before a successor passes an old-primary deadline. The pure model
+  and independent-clock property tests land before production integration;
+  DCC-2/CP2/CL4 remain open until every serving path uses the binding.
 - Add the shared internal control-plane identity/auth foundation described in
   [control-plane-auth-identity-plan.md](control-plane-auth-identity-plan.md),
   and enforce it first on the Raft control-plane peer transport. The Phase 12.3
@@ -11071,8 +11078,11 @@ Phase 12.4 progress:
    - storage-node refresh may still receive non-serving maps for convergence,
      but those maps must not be exported as frontend-serving authority.
 9. define clock and lease semantics:
-   - all control-plane lease deadlines use a monotonic clock source, never wall
-     clock time;
+   - control-plane wire and replicated lease deadlines are authority wall-clock
+     timestamps so they can be compared across processes and replayed
+     deterministically; every serving process binds a freshly received deadline
+     to its process-local monotonic clock and never re-evaluates that installed
+     lease against wall time;
    - lease-read/read-index freshness, storage-node heartbeat lease deadlines,
      frontend runtime-map freshness, and metadata-transfer source lease waits
      must state their clock-skew assumptions and restart behavior explicitly;
