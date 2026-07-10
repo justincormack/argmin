@@ -178,8 +178,13 @@ cleared or replaced. Peering readiness and completion remain blocked while
 that deadline is in the future if the proposed primary is a different process
 identity. The exact same node/incarnation/endpoint may reactivate before its
 own old deadline once the ordinary peering proof checks pass because there is
-no deposed storage process to fence. Successful activation clears the
-previous-primary identity.
+no deposed storage process to fence. While that old deadline remains live,
+recovery-driven peering selection prefers the exact previous primary when it
+is still serving; recovery of an earlier acting-set member must not cause an
+unnecessary fenced failback. Explicit acting-set, PG-state, and metadata
+transfer transitions retain the safety fence but disable this preference so
+the requested administrative primary selection can take effect after the old
+lease expires. Successful activation clears the previous-primary identity.
 
 The route-transition effect audit classifies the remaining storage RPC
 families as follows:

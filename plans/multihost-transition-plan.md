@@ -10931,8 +10931,12 @@ Phase 12.4 progress:
   ID, incarnation, endpoint, and lease deadline on every transition out of
   Active. Direct plus automatic peering completion waits through that deadline
   before activating a different process; the exact same process may reactivate
-  after proof convergence without waiting out its own lease. Control-plane
-  snapshot format version 14 persists the complete fence identity.
+  after proof convergence without waiting out its own lease. Recovery-driven
+  transitions prefer that process while its old lease is live, avoiding a
+  fenced automatic failback when an earlier acting-set member recovers;
+  administrative acting-set/PG-state/metadata-transfer transitions retain the
+  fence with preference disabled. Control-plane snapshot format version 15
+  persists the complete fence identity and transition provenance.
   The follow-up effect audit closes DCC-1: route admission is frame-wide, so
   shard publication/ack, reservation/drain, reclaim, and cleanup frames all
   finish before config publication. Shard and reservation artifacts do not

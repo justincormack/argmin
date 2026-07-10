@@ -1026,13 +1026,21 @@ Mechanism confirmed; window deployment-dependent.
   `ready_pg_peering_completions` reject/skip a different proposed process while
   the old lease remains live. The exact same node/incarnation/endpoint may
   reactivate once ordinary peering proof checks pass; waiting out its own lease
-  provides no safety and caused 116-PG startup to miss the readiness bound.
+  provides no safety. Recovery-driven peering selection prefers that exact
+  previous process while the old lease remains live, so recovery of an earlier
+  acting-set member cannot trigger a fenced automatic failback. Explicit
+  acting-set/PG-state/metadata-transfer transitions persist the fence with the
+  preference disabled, preserving requested primary movement after expiry.
+  The two same-process gaps each caused 116-PG startup to miss the readiness
+  bound.
   Successful activation clears the fence. Canonical control-plane snapshot
-  version 14 persists the complete identity through restart/history. Tests
+  version 15 persists the complete identity and transition preference through
+  restart/history. Tests
   cover early direct rejection, automatic readiness suppression, immediate
-  same-process reactivation, endpoint/incarnation distinction, exact-deadline
-  activation after successor renewal, and persistence. The separate in-flight
-  mutation side is tracked by DCC-1.
+  same-process reactivation, previous-primary preference across replica
+  recovery, endpoint/incarnation distinction, exact-deadline activation after
+  successor renewal, and persistence. The separate in-flight mutation side is
+  tracked by DCC-1.
 
 ### CL2. HIGH (availability) — Divergent replicas permanently wedge a PG in `Peering`; the implemented catch-up path has no production caller
 
@@ -1049,9 +1057,10 @@ Confirmed.
   `replay_pg_peering_catchup_from_retained_metadata_log`
   (`cluster.rs:2529-2656`), `peering.rs` replay-plan validation — is
   `#[allow(dead_code)]` with only test callers.
-- `deterministic_pg_primary_for_snapshot` picks the first serving acting
-  node, not the longest verified chain (`control_plane.rs:2213-2224`); if the
-  picked primary is behind, even the (unwired) catch-up path fails closed
+- Peering selection normally picks the first serving acting node, with a
+  narrow exception that preserves an exact live previous primary after a
+  recovery-driven transition. It still does not pick the longest verified
+  chain; if the selected primary is behind, even the (unwired) catch-up path fails closed
   with `ReplicaAheadOfPrimary` (`peering.rs:280-285`) — and nothing truncates
   unacked entries.
 - Failure scenario: primary crashes after local apply, restarts (incarnation
@@ -1068,8 +1077,9 @@ Confirmed.
   section). A pure proof mismatch (primary applied-and-cleared, replica lags)
   still wedges forever: `PgPeeringMetadataProofMismatch` is still silently
   swallowed in the readiness scan (`control_plane.rs:1209-1214`),
-  `deterministic_pg_primary_for_snapshot` still picks first-serving not
-  longest-chain (:2310), and nothing truncates unacked entries. The catch-up
+  peering selection still uses first-serving (apart from the exact
+  recovery-provenance previous-primary preference), not longest-chain, and
+  nothing truncates unacked entries. The catch-up
   machinery remains `#[allow(dead_code)]` with test-only callers
   (`cluster.rs:2695-2756`).
 

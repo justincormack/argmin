@@ -166,10 +166,14 @@ The paired `CL1` fix persists the previous primary's node ID, incarnation,
 endpoint, and lease deadline whenever a PG leaves Active and blocks both
 direct and batched/automatic peering completion of a different process until
 that deadline. The exact same process can reactivate after proof convergence
-without waiting out its own lease. This removes the early-successor-activation
-half of the scenario and makes metadata-transfer export occur only after old
-metadata permits can no longer commit. DCC-1 remains open until the same
-expiry/commit analysis is completed by effect for shard publication,
+without waiting out its own lease and remains the preferred peering primary
+after a recovery-driven transition while that lease is live, so an earlier
+acting-set member's recovery cannot force a fenced failback. Administrative
+acting-set, PG-state, and metadata-transfer transitions retain the fence but
+disable that preference. This removes the early-successor-activation half of
+the scenario and makes metadata-transfer export occur only after old metadata
+permits can no longer commit. DCC-1 remains open until the same expiry/commit
+analysis is completed by effect for shard publication,
 reservations outside the metadata-command transaction, reclaim, and cleanup,
 with the full E -> Peering -> successor-Active process regression described
 above.
