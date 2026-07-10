@@ -531,6 +531,24 @@ impl StorageNodeProcessConfig {
         self.route_map_validity.valid_until_ms()
     }
 
+    fn only_extends_route_map_validity_from(&self, current: &Self) -> bool {
+        let (Some(current_deadline), Some(candidate_deadline)) = (
+            current.route_map_valid_until_ms(),
+            self.route_map_valid_until_ms(),
+        ) else {
+            return false;
+        };
+        candidate_deadline >= current_deadline
+            && self.node_id == current.node_id
+            && self.cluster_epoch == current.cluster_epoch
+            && self.data_dir == current.data_dir
+            && self.default_ec_shape == current.default_ec_shape
+            && self.pg_ids == current.pg_ids
+            && self.socket_path == current.socket_path
+            && self.pg_routes == current.pg_routes
+            && self.historical_pg_routes == current.historical_pg_routes
+    }
+
     pub fn is_route_map_valid_at(&self, now_ms: u64) -> bool {
         self.route_map_validity.is_valid_at(now_ms)
     }
@@ -623,6 +641,22 @@ impl StorageNodeProcessConfig {
     }
 
     pub fn persist_control_plane_runtime_config(&self) -> Result<(), StorageNodeServerError> {
+        self.stage_control_plane_runtime_config()?.publish()
+    }
+
+    fn stage_control_plane_runtime_config(
+        &self,
+    ) -> Result<StagedControlPlaneRuntimeConfig, StorageNodeServerError> {
+        self.stage_control_plane_runtime_config_with_post_write(|| {})
+    }
+
+    fn stage_control_plane_runtime_config_with_post_write<F>(
+        &self,
+        post_write: F,
+    ) -> Result<StagedControlPlaneRuntimeConfig, StorageNodeServerError>
+    where
+        F: FnOnce(),
+    {
         prepare_private_data_dir(&self.data_dir).map_err(|source| {
             StorageNodeServerError::RuntimeConfigWrite {
                 path: self.data_dir.clone(),
@@ -638,9 +672,11 @@ impl StorageNodeProcessConfig {
                 source,
             }
         })?;
-        fs::rename(&tmp_path, &path).map_err(|source| StorageNodeServerError::RuntimeConfigWrite {
-            path: path.clone(),
-            source,
+        post_write();
+        Ok(StagedControlPlaneRuntimeConfig {
+            tmp_path,
+            path,
+            published: false,
         })
     }
 
@@ -677,6 +713,33 @@ impl StorageNodeProcessConfig {
                 .map(|route| (PgId::new(route.pg_id), route.state)),
         )
         .map_err(StorageNodeServerError::from)
+    }
+}
+
+struct StagedControlPlaneRuntimeConfig {
+    tmp_path: PathBuf,
+    path: PathBuf,
+    published: bool,
+}
+
+impl StagedControlPlaneRuntimeConfig {
+    fn publish(mut self) -> Result<(), StorageNodeServerError> {
+        fs::rename(&self.tmp_path, &self.path).map_err(|source| {
+            StorageNodeServerError::RuntimeConfigWrite {
+                path: self.path.clone(),
+                source,
+            }
+        })?;
+        self.published = true;
+        Ok(())
+    }
+}
+
+impl Drop for StagedControlPlaneRuntimeConfig {
+    fn drop(&mut self) {
+        if !self.published {
+            let _ = fs::remove_file(&self.tmp_path);
+        }
     }
 }
 
@@ -1457,8 +1520,36 @@ pub fn validate_storage_node_process_configs(
     Ok(())
 }
 
+fn validate_runtime_config_install(
+    current: &StorageNodeProcessConfig,
+    candidate: &StorageNodeProcessConfig,
+) -> Result<(), StorageNodeServerError> {
+    candidate.validate_runtime_refresh_from(current)?;
+    if candidate.pg_ids != current.pg_ids {
+        return Err(StorageNodeServerError::RuntimeRefreshPgSetChanged {
+            current: current.pg_ids.clone(),
+            candidate: candidate.pg_ids.clone(),
+        });
+    }
+    if candidate.cluster_epoch < current.cluster_epoch {
+        return Err(StorageNodeServerError::RuntimeRefreshEpochDowngrade {
+            current: current.cluster_epoch,
+            candidate: candidate.cluster_epoch,
+        });
+    }
+    if candidate.route_map_valid_until_ms().is_none() {
+        return Err(
+            StorageNodeServerError::RuntimeRefreshUnboundedRouteMapValidity {
+                candidate: candidate.cluster_epoch,
+            },
+        );
+    }
+    Ok(())
+}
+
 pub struct StorageNodeServer {
     config: Arc<RwLock<Arc<StorageNodeProcessConfig>>>,
+    runtime_config_install_lock: Mutex<()>,
     route_admission: StorageNodeRouteAdmissionGate,
     _data_dir_lock: StorageNodeDataDirLock,
     control_plane_incarnation_lock: Mutex<()>,
@@ -1467,7 +1558,12 @@ pub struct StorageNodeServer {
     read_handles: Arc<Mutex<StorageNodeReadHandleState>>,
     active_sessions: Arc<StorageNodeActiveSessions>,
     metadata_command_locks: StorageNodeMetadataCommandLocks,
+    #[cfg(test)]
+    runtime_config_stage_test_hook: Mutex<Option<RuntimeConfigStageTestHook>>,
 }
+
+#[cfg(test)]
+type RuntimeConfigStageTestHook = Arc<dyn Fn() + Send + Sync + 'static>;
 
 #[derive(Debug)]
 pub struct StorageNodeDataDirGuard {
@@ -1636,6 +1732,7 @@ impl StorageNodeServer {
         })?;
         Ok(Self {
             config: Arc::new(RwLock::new(Arc::new(config))),
+            runtime_config_install_lock: Mutex::new(()),
             route_admission: StorageNodeRouteAdmissionGate::default(),
             _data_dir_lock: data_dir_lock,
             control_plane_incarnation_lock: Mutex::new(()),
@@ -1644,6 +1741,8 @@ impl StorageNodeServer {
             read_handles: Arc::new(Mutex::new(StorageNodeReadHandleState::default())),
             active_sessions: Arc::new(StorageNodeActiveSessions::default()),
             metadata_command_locks: StorageNodeMetadataCommandLocks::default(),
+            #[cfg(test)]
+            runtime_config_stage_test_hook: Mutex::new(None),
         })
     }
 
@@ -1866,30 +1965,43 @@ impl StorageNodeServer {
         &self,
         next_config: StorageNodeProcessConfig,
     ) -> Result<(), StorageNodeServerError> {
+        let _install_guard = self
+            .runtime_config_install_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         validate_process_config_route_table(&next_config)?;
+        let current_config = self.config_snapshot_arc();
+        validate_runtime_config_install(&current_config, &next_config)?;
+        #[cfg(test)]
+        let stage_test_hook = self
+            .runtime_config_stage_test_hook
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        #[cfg(test)]
+        let staged_config =
+            next_config.stage_control_plane_runtime_config_with_post_write(|| {
+                if let Some(hook) = stage_test_hook {
+                    hook();
+                }
+            })?;
+        #[cfg(not(test))]
+        let staged_config = next_config.stage_control_plane_runtime_config()?;
+
+        if next_config.only_extends_route_map_validity_from(&current_config) {
+            let mut current_config = self.config.write().unwrap_or_else(|e| e.into_inner());
+            validate_runtime_config_install(&current_config, &next_config)?;
+            if next_config.only_extends_route_map_validity_from(&current_config) {
+                staged_config.publish()?;
+                *current_config = Arc::new(next_config);
+                return Ok(());
+            }
+        }
+
         let _transition = self.route_admission.begin_transition();
         let mut current_config = self.config.write().unwrap_or_else(|e| e.into_inner());
-        next_config.validate_runtime_refresh_from(&current_config)?;
-        if next_config.pg_ids != current_config.pg_ids {
-            return Err(StorageNodeServerError::RuntimeRefreshPgSetChanged {
-                current: current_config.pg_ids.clone(),
-                candidate: next_config.pg_ids.clone(),
-            });
-        }
-        if next_config.cluster_epoch < current_config.cluster_epoch {
-            return Err(StorageNodeServerError::RuntimeRefreshEpochDowngrade {
-                current: current_config.cluster_epoch,
-                candidate: next_config.cluster_epoch,
-            });
-        }
-        if next_config.route_map_valid_until_ms().is_none() {
-            return Err(
-                StorageNodeServerError::RuntimeRefreshUnboundedRouteMapValidity {
-                    candidate: next_config.cluster_epoch,
-                },
-            );
-        }
-        next_config.persist_control_plane_runtime_config()?;
+        validate_runtime_config_install(&current_config, &next_config)?;
+        staged_config.publish()?;
         self.route_admission
             .publish_historical_metadata_recovery_permits(&current_config, &next_config);
         *current_config = Arc::new(next_config);
@@ -14485,6 +14597,136 @@ mod tests {
         assert_eq!(
             server.config_snapshot().cluster_epoch,
             ClusterEpoch::new(2).unwrap()
+        );
+    }
+
+    #[test]
+    fn storage_node_runtime_config_staging_keeps_route_admission_open() {
+        let tmp = test_util::tempdir();
+        let config = test_config(&tmp);
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let server = Arc::new(StorageNodeServer::bind(config.clone()).unwrap());
+        let stage_barrier = Arc::new(std::sync::Barrier::new(2));
+        let hook_barrier = Arc::clone(&stage_barrier);
+        *server
+            .runtime_config_stage_test_hook
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Arc::new(move || {
+            hook_barrier.wait();
+            hook_barrier.wait();
+        }));
+
+        let mut next_config = bounded_runtime_refresh_config(config);
+        next_config.cluster_epoch = ClusterEpoch::new(2).unwrap();
+        next_config.pg_routes[0].cluster_epoch = next_config.cluster_epoch;
+        let installing_server = Arc::clone(&server);
+        let installer = thread::spawn(move || {
+            installing_server
+                .install_control_plane_runtime_config(next_config)
+                .unwrap();
+        });
+
+        stage_barrier.wait();
+        assert_eq!(
+            server
+                .route_admission
+                .inner
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .transition,
+            StorageNodeRouteTransitionState::Open,
+            "runtime-config staging must not close route admission"
+        );
+        let admitted = server.route_admission.acquire(false);
+        drop(admitted);
+        stage_barrier.wait();
+        installer.join().unwrap();
+        assert_eq!(
+            server.config_snapshot().cluster_epoch,
+            ClusterEpoch::new(2).unwrap()
+        );
+    }
+
+    #[test]
+    fn storage_node_runtime_config_validity_extension_does_not_drain_frames() {
+        let tmp = test_util::tempdir();
+        let mut config = test_config(&tmp);
+        config.route_map_validity = RouteMapValidity::until_ms(5_000).unwrap();
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let server = Arc::new(StorageNodeServer::bind(config.clone()).unwrap());
+        let admitted = server.route_admission.acquire(false);
+        let mut extended = config;
+        extended.route_map_validity = RouteMapValidity::until_ms(6_000).unwrap();
+
+        let (installed_tx, installed_rx) = mpsc::channel();
+        let installing_server = Arc::clone(&server);
+        let installer = thread::spawn(move || {
+            installing_server
+                .install_control_plane_runtime_config(extended)
+                .unwrap();
+            installed_tx.send(()).unwrap();
+        });
+
+        installed_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("validity-only extension must not wait for admitted frames");
+        assert_eq!(
+            server.config_snapshot().route_map_valid_until_ms(),
+            Some(6_000)
+        );
+        drop(admitted);
+        installer.join().unwrap();
+    }
+
+    #[test]
+    fn storage_node_runtime_config_validity_shrink_drains_frames() {
+        let tmp = test_util::tempdir();
+        let mut config = test_config(&tmp);
+        config.route_map_validity = RouteMapValidity::until_ms(5_000).unwrap();
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let server = Arc::new(StorageNodeServer::bind(config.clone()).unwrap());
+        let admitted = server.route_admission.acquire(false);
+        let mut shortened = config;
+        shortened.route_map_validity = RouteMapValidity::until_ms(4_000).unwrap();
+
+        let (installed_tx, installed_rx) = mpsc::channel();
+        let installing_server = Arc::clone(&server);
+        let installer = thread::spawn(move || {
+            installing_server
+                .install_control_plane_runtime_config(shortened)
+                .unwrap();
+            installed_tx.send(()).unwrap();
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            let transition = server
+                .route_admission
+                .inner
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .transition;
+            if transition == StorageNodeRouteTransitionState::Draining {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "validity shrink did not begin draining"
+            );
+            thread::yield_now();
+        }
+        assert!(matches!(
+            installed_rx.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        drop(admitted);
+        installed_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        installer.join().unwrap();
+        assert_eq!(
+            server.config_snapshot().route_map_valid_until_ms(),
+            Some(4_000)
         );
     }
 

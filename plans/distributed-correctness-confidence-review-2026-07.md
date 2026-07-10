@@ -199,6 +199,21 @@ state/proof. Existing metadata-PG migration UAT covers the full process
 transfer composition. The process test and deterministic pause-point test are
 kept separate so production binaries need no remotely triggerable pause hook.
 
+Follow-up soak hardening (2026-07-10): runtime-config installation originally
+encoded and wrote the complete candidate config while the frame-wide route
+gate was closed. With 100+ PGs, retained route history, and storage I/O
+pressure, that publication window could exceed the one-second storage RPC
+response deadline. Terminal metadata-command cleanup or cross-PG LIST fanout
+then timed out before dispatch. Installation now stages the candidate temp file
+while the old route remains admitted, then closes and drains the gate only for
+the atomic rename, historical-recovery-permit publication, and in-memory config
+swap. More importantly, the 100 ms heartbeat path no longer drains frames for
+a structurally identical same-epoch map that only extends its bounded validity;
+deadline shrink and every topology/history change still use the full fence.
+Deterministic regressions prove slow staging and monotonic lease refresh remain
+non-blocking, deadline shrink drains, and no old frame overlaps real route
+publication.
+
 ### DCC-2. HIGH - bounded timestamp catch-up still grants unbounded serving leases
 
 Confidence: confirmed. This supersedes the latest statement that `R3-1` and

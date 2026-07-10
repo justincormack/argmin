@@ -10954,6 +10954,18 @@ Phase 12.4 progress:
   then proves an old command cannot mutate the proof after deadline and
   successor activation. Existing metadata-PG migration UAT supplies the full
   process transfer composition without introducing a production pause hook.
+  Route-change-node-restart soak testing then exposed a liveness boundary in
+  the first implementation: encoding and writing the retained-history runtime
+  config while route admission was closed could exceed the storage RPC
+  response deadline and prevent terminal pending-command cleanup or cross-PG
+  LIST fanout from being dispatched. Runtime configs are now written to a
+  staged temp file while the old route remains admitted; the gate covers only
+  atomic rename, recovery permit publication, and the in-memory config swap.
+  Structurally identical same-epoch heartbeat maps that only extend bounded
+  validity publish without draining frames; deadline shrink and any
+  topology/history change retain the full fence. Deterministic tests prove
+  staging and lease-only refresh remain non-blocking while real publication
+  still drains old frames.
   CL1 is closed by the paired control-plane fence; RPC4's cross-epoch physical
   shard alias remains separate work.
 
