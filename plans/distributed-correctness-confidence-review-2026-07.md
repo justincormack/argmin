@@ -162,9 +162,11 @@ Deterministic tests pin permit drain/publication ordering, cleanup during
 drain, bare-history rejection, pre-expiry recovery, post-expiry rejection, and
 rollback at the commit guard.
 
-The paired `CL1` fix persists the previous primary's lease deadline whenever a
-PG leaves Active and blocks both direct and batched/automatic peering
-completion until that deadline. This removes the early-successor-activation
+The paired `CL1` fix persists the previous primary's node ID, incarnation,
+endpoint, and lease deadline whenever a PG leaves Active and blocks both
+direct and batched/automatic peering completion of a different process until
+that deadline. The exact same process can reactivate after proof convergence
+without waiting out its own lease. This removes the early-successor-activation
 half of the scenario and makes metadata-transfer export occur only after old
 metadata permits can no longer commit. DCC-1 remains open until the same
 expiry/commit analysis is completed by effect for shard publication,

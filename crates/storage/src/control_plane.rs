@@ -32,7 +32,7 @@ const CONTROL_PLANE_RPC_MAX_PAYLOAD_LEN: usize = 8 * 1024 * 1024;
 const CONTROL_PLANE_RPC_IO_TIMEOUT: Duration = Duration::from_secs(1);
 const CONTROL_PLANE_RPC_LEADERSHIP_TRANSFER_TIMEOUT: Duration = Duration::from_secs(15);
 const CONTROL_PLANE_RPC_SNAPSHOT_PURGE_TIMEOUT: Duration = Duration::from_secs(15);
-const CURRENT_CONTROL_PLANE_STATE_VERSION: u64 = 13;
+const CURRENT_CONTROL_PLANE_STATE_VERSION: u64 = 14;
 const CONTROL_PLANE_RPC_READ_ONLY_RETRY_DEADLINE: Duration = Duration::from_secs(10);
 const CONTROL_PLANE_RPC_READ_ONLY_RETRY_BACKOFF: Duration = Duration::from_millis(50);
 const CONTROL_PLANE_RPC_CHECK_APPLIED_DEADLINE: Duration = Duration::from_secs(20);
@@ -868,10 +868,10 @@ impl ClusterControlSnapshot {
     }
 
     fn bump_authority_after_restart(&mut self) -> Result<(), ControlPlaneError> {
-        let previous_primary_lease_deadlines: BTreeMap<PgId, Option<u64>> = self
+        let previous_primary_leases: BTreeMap<PgId, Option<PreviousPrimaryLease>> = self
             .pgs
             .values()
-            .map(|record| (record.pg_id, active_primary_lease_deadline_ms(self, record)))
+            .map(|record| (record.pg_id, active_primary_lease(self, record)))
             .collect();
         self.authority_incarnation = self.authority_incarnation.next()?;
         self.cluster_epoch = next_epoch(self.cluster_epoch)?;
@@ -889,9 +889,9 @@ impl ClusterControlSnapshot {
                 record.active_metadata_proof = None;
                 record.active_metadata_proof_epoch = None;
                 record.active_metadata_transfer_imported = false;
-                record.previous_primary_lease_deadline_ms = previous_primary_lease_deadlines
+                record.previous_primary_lease = previous_primary_leases
                     .get(&record.pg_id)
-                    .copied()
+                    .cloned()
                     .flatten();
                 record.peering_metadata_transfer = None;
                 record.peering_metadata_transfer_source_route_epoch = None;
@@ -1000,6 +1000,21 @@ impl ClusterControlSnapshot {
                     ));
                 }
             }
+            if let Some(previous) = &pg.previous_primary_lease {
+                if previous.node_incarnation == 0 {
+                    return Err(format!(
+                        "PG {} previous primary has zero node incarnation",
+                        pg.pg_id.get()
+                    ));
+                }
+                if !self.nodes.contains_key(&previous.node_id) {
+                    return Err(format!(
+                        "PG {} previous primary references unknown node {}",
+                        pg.pg_id.get(),
+                        previous.node_id.as_u32()
+                    ));
+                }
+            }
 
             match pg.state {
                 PgState::Active => {
@@ -1032,7 +1047,7 @@ impl ClusterControlSnapshot {
                         || pg.peering_metadata_transfer_source_route_epoch.is_some()
                         || pg.peering_metadata_transfer_source_node_id.is_some()
                         || pg.metadata_transfer_fenced
-                        || pg.previous_primary_lease_deadline_ms.is_some()
+                        || pg.previous_primary_lease.is_some()
                         || pg
                             .metadata_transfer_fence_source_lease_deadline_ms
                             .is_some()
@@ -1329,17 +1344,29 @@ impl ClusterControlSnapshot {
             if record.metadata_transfer_fenced {
                 continue;
             }
-            if record
-                .previous_primary_lease_deadline_ms
-                .is_some_and(|lease_deadline_ms| lease_deadline_ms > now_ms)
-            {
-                continue;
-            }
             let Some(primary) =
                 deterministic_pg_primary_for_snapshot(self, record.acting_set(), now_ms)
             else {
                 continue;
             };
+            let primary_node = self
+                .node(primary)
+                .expect("deterministic primary must be a known node");
+            let primary_incarnation = primary_node.node_incarnation();
+            if record
+                .previous_primary_lease
+                .as_ref()
+                .is_some_and(|previous| {
+                    previous.blocks_activation(
+                        primary,
+                        primary_incarnation,
+                        primary_node.endpoint(),
+                        now_ms,
+                    )
+                })
+            {
+                continue;
+            }
             match validate_pg_peering_observations(self, record.pg_id, record.acting_set(), now_ms)
             {
                 Ok(active_metadata_proof)
@@ -1356,10 +1383,7 @@ impl ClusterControlSnapshot {
                     ready.push(ReadyPgPeeringCompletion {
                         pg_id: record.pg_id,
                         primary,
-                        node_incarnation: self
-                            .node(primary)
-                            .expect("deterministic primary must be a known node")
-                            .node_incarnation(),
+                        node_incarnation: primary_incarnation,
                         active_metadata_proof,
                         active_metadata_proof_epoch: self.cluster_epoch,
                     })
@@ -1863,9 +1887,8 @@ impl ControlPlaneCommandStateMachine for ClusterControlSnapshot {
                 match next_snapshot.pgs.get_mut(&pg_id) {
                     Some(record) if record.acting_set == acting_set => {}
                     Some(record) => {
-                        let previous_primary_lease_deadline_ms =
-                            active_primary_lease_deadline_ms(self, record)
-                                .or(record.previous_primary_lease_deadline_ms);
+                        let previous_primary_lease = active_primary_lease(self, record)
+                            .or_else(|| record.previous_primary_lease.clone());
                         let (
                             peering_metadata_proof_floor,
                             peering_metadata_proof_floor_epoch,
@@ -1938,8 +1961,7 @@ impl ControlPlaneCommandStateMachine for ClusterControlSnapshot {
                         record.active_metadata_proof = None;
                         record.active_metadata_proof_epoch = None;
                         record.active_metadata_transfer_imported = false;
-                        record.previous_primary_lease_deadline_ms =
-                            previous_primary_lease_deadline_ms;
+                        record.previous_primary_lease = previous_primary_lease;
                         record.peering_metadata_proof_floor = peering_metadata_proof_floor;
                         record.peering_metadata_proof_floor_epoch =
                             peering_metadata_proof_floor_epoch;
@@ -2061,16 +2083,15 @@ impl ControlPlaneCommandStateMachine for ClusterControlSnapshot {
                     .pgs
                     .get_mut(&pg_id)
                     .expect("PG record validated before metadata transfer");
-                let previous_primary_lease_deadline_ms =
-                    active_primary_lease_deadline_ms(self, record)
-                        .or(record.previous_primary_lease_deadline_ms);
+                let previous_primary_lease = active_primary_lease(self, record)
+                    .or_else(|| record.previous_primary_lease.clone());
                 record.acting_set = acting_set;
                 record.state = PgState::Peering;
                 record.active_primary = None;
                 record.active_metadata_proof = None;
                 record.active_metadata_proof_epoch = None;
                 record.active_metadata_transfer_imported = false;
-                record.previous_primary_lease_deadline_ms = previous_primary_lease_deadline_ms;
+                record.previous_primary_lease = previous_primary_lease;
                 record.peering_metadata_proof_floor = Some(transfer.metadata_proof());
                 record.peering_metadata_proof_floor_epoch = Some(self.cluster_epoch);
                 record.peering_metadata_proof_floor_imported = true;
@@ -2092,6 +2113,8 @@ impl ControlPlaneCommandStateMachine for ClusterControlSnapshot {
                 let record = self
                     .pg(pg_id)
                     .ok_or(ControlPlaneError::UnknownPg { pg_id: pg_id.get() })?;
+                let previous_primary_lease = active_primary_lease(self, record)
+                    .or_else(|| record.previous_primary_lease.clone());
                 let source_primary_lease_deadline_ms = if record.state == PgState::Active {
                     let primary = record
                         .active_primary
@@ -2173,7 +2196,7 @@ impl ControlPlaneCommandStateMachine for ClusterControlSnapshot {
                     record.active_metadata_proof = None;
                     record.active_metadata_proof_epoch = None;
                     record.active_metadata_transfer_imported = false;
-                    record.previous_primary_lease_deadline_ms = source_primary_lease_deadline_ms;
+                    record.previous_primary_lease = previous_primary_lease;
                     record.peering_metadata_transfer = None;
                     record.peering_metadata_transfer_source_route_epoch = None;
                     record.peering_metadata_transfer_source_node_id = None;
@@ -2220,9 +2243,8 @@ impl ControlPlaneCommandStateMachine for ClusterControlSnapshot {
                     .ok_or(ControlPlaneError::UnknownPg { pg_id: pg_id.get() })?;
                 let changed = record.state != state;
                 if changed {
-                    let previous_primary_lease_deadline_ms =
-                        active_primary_lease_deadline_ms(self, record)
-                            .or(record.previous_primary_lease_deadline_ms);
+                    let previous_primary_lease = active_primary_lease(self, record)
+                        .or_else(|| record.previous_primary_lease.clone());
                     let peering_metadata_proof_floor_epoch = if record.state == PgState::Active {
                         record.active_metadata_proof_epoch
                     } else {
@@ -2243,7 +2265,7 @@ impl ControlPlaneCommandStateMachine for ClusterControlSnapshot {
                     record.active_metadata_proof = None;
                     record.active_metadata_proof_epoch = None;
                     record.active_metadata_transfer_imported = false;
-                    record.previous_primary_lease_deadline_ms = previous_primary_lease_deadline_ms;
+                    record.previous_primary_lease = previous_primary_lease;
                     record.metadata_transfer_fenced = false;
                     record.metadata_transfer_fence_source_lease_deadline_ms = None;
                     record.metadata_transfer_fence_source_imported = false;
@@ -2310,7 +2332,7 @@ impl ControlPlaneCommandStateMachine for ClusterControlSnapshot {
                         record.active_metadata_proof = Some(active_metadata_proof);
                         record.active_metadata_transfer_imported =
                             active_metadata_transfer_imported;
-                        record.previous_primary_lease_deadline_ms = None;
+                        record.previous_primary_lease = None;
                         record.peering_metadata_proof_floor = None;
                         record.peering_metadata_proof_floor_epoch = None;
                         record.peering_metadata_proof_floor_imported = false;
@@ -2387,7 +2409,7 @@ impl ControlPlaneCommandStateMachine for ClusterControlSnapshot {
                     record.active_metadata_proof = Some(completion.active_metadata_proof);
                     record.active_metadata_transfer_imported =
                         record.peering_metadata_transfer.is_some();
-                    record.previous_primary_lease_deadline_ms = None;
+                    record.previous_primary_lease = None;
                     record.peering_metadata_proof_floor = None;
                     record.peering_metadata_proof_floor_epoch = None;
                     record.peering_metadata_proof_floor_imported = false;
@@ -2951,10 +2973,11 @@ pub struct PgControlRecord {
     // metadata transfer marker. This scopes destination-epoch local proof
     // relaxation to transferred PGs instead of all Active primaries.
     active_metadata_transfer_imported: bool,
-    // Lease deadline of the primary deposed by the most recent transition out
-    // of Active. A replacement primary must not activate until this deadline
-    // has passed, even when peering observations are otherwise complete.
-    previous_primary_lease_deadline_ms: Option<u64>,
+    // Identity and lease deadline of the primary from the most recent
+    // transition out of Active. A different primary process must not activate
+    // until this lease has passed. The same process may reactivate immediately
+    // once the ordinary peering proof checks pass.
+    previous_primary_lease: Option<PreviousPrimaryLease>,
     // Required metadata floor while a previously active PG is peering. This
     // prevents acting-set migration, restart, or failure recovery from
     // activating an agreed but stale empty/old metadata state.
@@ -2986,6 +3009,29 @@ pub struct PgControlRecord {
     metadata_transfer_fence_source_imported: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PreviousPrimaryLease {
+    node_id: NodeId,
+    node_incarnation: u64,
+    endpoint: String,
+    lease_deadline_ms: u64,
+}
+
+impl PreviousPrimaryLease {
+    fn blocks_activation(
+        &self,
+        primary: NodeId,
+        primary_incarnation: u64,
+        primary_endpoint: &str,
+        now_ms: u64,
+    ) -> bool {
+        (self.node_id != primary
+            || self.node_incarnation != primary_incarnation
+            || self.endpoint != primary_endpoint)
+            && self.lease_deadline_ms > now_ms
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct PeeringMetadataProofFloor {
     proof: PgMetadataProof,
@@ -3003,7 +3049,7 @@ impl PgControlRecord {
             active_metadata_proof: None,
             active_metadata_proof_epoch: None,
             active_metadata_transfer_imported: false,
-            previous_primary_lease_deadline_ms: None,
+            previous_primary_lease: None,
             peering_metadata_proof_floor: None,
             peering_metadata_proof_floor_epoch: None,
             peering_metadata_proof_floor_imported: false,
@@ -3053,7 +3099,23 @@ impl PgControlRecord {
 
     #[must_use]
     pub fn previous_primary_lease_deadline_ms(&self) -> Option<u64> {
-        self.previous_primary_lease_deadline_ms
+        self.previous_primary_lease
+            .as_ref()
+            .map(|previous| previous.lease_deadline_ms)
+    }
+
+    #[must_use]
+    pub fn previous_primary_node_id(&self) -> Option<NodeId> {
+        self.previous_primary_lease
+            .as_ref()
+            .map(|previous| previous.node_id)
+    }
+
+    #[must_use]
+    pub fn previous_primary_node_incarnation(&self) -> Option<u64> {
+        self.previous_primary_lease
+            .as_ref()
+            .map(|previous| previous.node_incarnation)
     }
 
     #[must_use]
@@ -9443,10 +9505,16 @@ pub enum ControlPlaneError {
     PgMetadataTransferFenceRequiresTransferInstall { pg_id: u32 },
 
     #[error(
-        "PG {pg_id} previous primary lease remains active until {lease_deadline_ms}; peering completion time is {completed_at_ms}"
+        "PG {pg_id} previous primary {previous_primary} incarnation {previous_primary_incarnation} endpoint {previous_primary_endpoint:?} lease remains active until {lease_deadline_ms}; proposed primary {proposed_primary} incarnation {proposed_primary_incarnation} endpoint {proposed_primary_endpoint:?} completion time is {completed_at_ms}"
     )]
     PgPreviousPrimaryLeaseStillActive {
         pg_id: u32,
+        previous_primary: u32,
+        previous_primary_incarnation: u64,
+        previous_primary_endpoint: String,
+        proposed_primary: u32,
+        proposed_primary_incarnation: u64,
+        proposed_primary_endpoint: String,
         completed_at_ms: u64,
         lease_deadline_ms: u64,
     },
@@ -9913,7 +9981,7 @@ fn format_pg_record(record: &PgControlRecord) -> String {
         ),
     };
     format!(
-        "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+        "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
         record.pg_id.get(),
         pg_state_as_str(record.state),
         format_node_list(&record.acting_set),
@@ -9944,7 +10012,28 @@ fn format_pg_record(record: &PgControlRecord) -> String {
                 .map(ClusterEpoch::get)
         ),
         u8::from(record.peering_metadata_proof_floor_imported),
-        option_u64(record.previous_primary_lease_deadline_ms)
+        option_u32(
+            record
+                .previous_primary_lease
+                .as_ref()
+                .map(|previous| previous.node_id.as_u32())
+        ),
+        option_u64(
+            record
+                .previous_primary_lease
+                .as_ref()
+                .map(|previous| previous.node_incarnation)
+        ),
+        record.previous_primary_lease.as_ref().map_or_else(
+            || "-".to_owned(),
+            |previous| hex_encode(previous.endpoint.as_bytes())
+        ),
+        option_u64(
+            record
+                .previous_primary_lease
+                .as_ref()
+                .map(|previous| previous.lease_deadline_ms)
+        )
     )
 }
 
@@ -10191,6 +10280,14 @@ fn validate_current_pgs(
                 return Err(parse_error(line, "PG acting set references unknown node"));
             }
         }
+        if let Some(previous) = &pg.previous_primary_lease {
+            if !nodes.contains_key(&previous.node_id) {
+                return Err(parse_error(
+                    line,
+                    "PG previous primary references unknown node",
+                ));
+            }
+        }
         validate_persisted_metadata_transfer_epoch(line, pg, current_epoch)?;
     }
     Ok(())
@@ -10278,6 +10375,14 @@ fn validate_parsed_history(
                     return Err(parse_error(
                         line,
                         "history PG acting set references node absent from history map",
+                    ));
+                }
+            }
+            if let Some(previous) = &pg.previous_primary_lease {
+                if !record.node_ids.contains(&previous.node_id) {
+                    return Err(parse_error(
+                        line,
+                        "history PG previous primary references node absent from history map",
                     ));
                 }
             }
@@ -10512,8 +10617,8 @@ fn parse_node_record(line: usize, value: &str) -> Result<NodeControlRecord, Cont
 
 fn parse_pg_record(line: usize, value: &str) -> Result<PgControlRecord, ControlPlaneError> {
     let fields: Vec<&str> = value.split(',').collect();
-    if fields.len() != 27 {
-        return Err(parse_error(line, "PG record must have twenty-seven fields"));
+    if fields.len() != 30 {
+        return Err(parse_error(line, "PG record must have thirty fields"));
     }
     let pg_id = PgId::new(parse_u32(line, fields[0], "PG id")?);
     let state = pg_state_from_str(fields[1])?;
@@ -10736,8 +10841,52 @@ fn parse_pg_record(line: usize, value: &str) -> Result<PgControlRecord, ControlP
     } else {
         false
     };
+    let previous_primary_node_id =
+        parse_option_u32(line, fields[26], "previous primary node id")?.map(NodeId::new);
+    let previous_primary_node_incarnation =
+        parse_option_u64(line, fields[27], "previous primary node incarnation")?;
+    if previous_primary_node_incarnation == Some(0) {
+        return Err(parse_error(
+            line,
+            "previous primary node incarnation must be nonzero",
+        ));
+    }
+    let previous_primary_endpoint = if fields[28] == "-" {
+        None
+    } else {
+        Some(
+            String::from_utf8(hex_decode(line, fields[28])?).map_err(|_| {
+                parse_error(
+                    line,
+                    "previous primary endpoint must be valid UTF-8 after hex decoding",
+                )
+            })?,
+        )
+    };
     let previous_primary_lease_deadline_ms =
-        parse_option_u64(line, fields[26], "previous primary lease deadline")?;
+        parse_option_u64(line, fields[29], "previous primary lease deadline")?;
+    let previous_primary_lease = match (
+        previous_primary_node_id,
+        previous_primary_node_incarnation,
+        previous_primary_endpoint,
+        previous_primary_lease_deadline_ms,
+    ) {
+        (Some(node_id), Some(node_incarnation), Some(endpoint), Some(lease_deadline_ms)) => {
+            Some(PreviousPrimaryLease {
+                node_id,
+                node_incarnation,
+                endpoint,
+                lease_deadline_ms,
+            })
+        }
+        (None, None, None, None) => None,
+        _ => {
+            return Err(parse_error(
+                line,
+                "previous primary lease fields must be all present or all absent",
+            ));
+        }
+    };
     if acting_set.is_empty() {
         return Err(parse_error(line, "PG acting set must not be empty"));
     }
@@ -10845,7 +10994,7 @@ fn parse_pg_record(line: usize, value: &str) -> Result<PgControlRecord, ControlP
         }
         (_, None, None, None, None, false, _) => {}
     }
-    if state == PgState::Active && previous_primary_lease_deadline_ms.is_some() {
+    if state == PgState::Active && previous_primary_lease.is_some() {
         return Err(parse_error(
             line,
             "active PG record must not retain a previous primary lease deadline",
@@ -10936,7 +11085,7 @@ fn parse_pg_record(line: usize, value: &str) -> Result<PgControlRecord, ControlP
         active_metadata_proof,
         active_metadata_proof_epoch,
         active_metadata_transfer_imported,
-        previous_primary_lease_deadline_ms,
+        previous_primary_lease,
         peering_metadata_proof_floor,
         peering_metadata_proof_floor_epoch,
         peering_metadata_proof_floor_imported,
@@ -11226,12 +11375,23 @@ fn validate_pg_peering_completion(
             },
         );
     }
-    if let Some(lease_deadline_ms) = record.previous_primary_lease_deadline_ms {
-        if lease_deadline_ms > completed_at_ms {
+    if let Some(previous) = &record.previous_primary_lease {
+        let primary_endpoint = snapshot
+            .node(primary)
+            .expect("authorized peering primary must be a known node")
+            .endpoint();
+        if previous.blocks_activation(primary, node_incarnation, primary_endpoint, completed_at_ms)
+        {
             return Err(ControlPlaneError::PgPreviousPrimaryLeaseStillActive {
                 pg_id: pg_id.get(),
+                previous_primary: previous.node_id.as_u32(),
+                previous_primary_incarnation: previous.node_incarnation,
+                previous_primary_endpoint: previous.endpoint.clone(),
+                proposed_primary: primary.as_u32(),
+                proposed_primary_incarnation: node_incarnation,
+                proposed_primary_endpoint: primary_endpoint.to_owned(),
                 completed_at_ms,
-                lease_deadline_ms,
+                lease_deadline_ms: previous.lease_deadline_ms,
             });
         }
     }
@@ -11833,15 +11993,20 @@ fn cluster_map_history_record_is_protected(
             .is_some_and(|floor| record.cluster_epoch() >= floor)
 }
 
-fn active_primary_lease_deadline_ms(
+fn active_primary_lease(
     snapshot: &ClusterControlSnapshot,
     record: &PgControlRecord,
-) -> Option<u64> {
-    (record.state == PgState::Active)
+) -> Option<PreviousPrimaryLease> {
+    let node_id = (record.state == PgState::Active)
         .then_some(record.active_primary)
-        .flatten()
-        .and_then(|primary| snapshot.node(primary))
-        .and_then(NodeControlRecord::lease_deadline_ms)
+        .flatten()?;
+    let node = snapshot.node(node_id)?;
+    Some(PreviousPrimaryLease {
+        node_id,
+        node_incarnation: node.node_incarnation(),
+        endpoint: node.endpoint().to_owned(),
+        lease_deadline_ms: node.lease_deadline_ms()?,
+    })
 }
 
 fn mark_pgs_peering_for_nodes(
@@ -11858,12 +12023,10 @@ fn mark_pgs_peering_for_nodes(
                 .iter()
                 .any(|node_id| affected_nodes.contains(node_id))
         {
-            let previous_primary_lease_deadline_ms = previous
+            let previous_primary_lease = previous
                 .pg(record.pg_id)
-                .and_then(|previous_record| {
-                    active_primary_lease_deadline_ms(previous, previous_record)
-                })
-                .or(record.previous_primary_lease_deadline_ms);
+                .and_then(|previous_record| active_primary_lease(previous, previous_record))
+                .or_else(|| record.previous_primary_lease.clone());
             let peering_metadata_proof_floor_epoch = if record.state == PgState::Active {
                 record.active_metadata_proof_epoch
             } else {
@@ -11883,7 +12046,7 @@ fn mark_pgs_peering_for_nodes(
             record.active_metadata_proof = None;
             record.active_metadata_proof_epoch = None;
             record.active_metadata_transfer_imported = false;
-            record.previous_primary_lease_deadline_ms = previous_primary_lease_deadline_ms;
+            record.previous_primary_lease = previous_primary_lease;
             record.peering_metadata_transfer = None;
             record.peering_metadata_transfer_source_route_epoch = None;
             record.peering_metadata_transfer_source_node_id = None;
@@ -18887,7 +19050,7 @@ mod tests {
         let path = tmp.path().join("control-plane.state");
         std::fs::write(
             &path,
-            "version=13\nauthority_incarnation=1\ncluster_epoch=1\n",
+            "version=14\nauthority_incarnation=1\ncluster_epoch=1\n",
         )
         .unwrap();
         let store = FileControlPlaneStore::new(path);
@@ -19686,11 +19849,11 @@ mod tests {
         std::fs::write(
             &path,
             concat!(
-                "version=13\n",
+                "version=14\n",
                 "max_committed_timestamp_ms=-\n",
                 "authority_incarnation=1\n",
                 "cluster_epoch=1\n",
-                "pg=7,peering,1:1,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,0,0,-,0,-,-,0,-\n",
+                "pg=7,peering,1:1,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,0,0,-,0,-,-,0,-,-,-,-\n",
             ),
         )
         .unwrap();
@@ -19709,12 +19872,12 @@ mod tests {
         std::fs::write(
             &path,
             concat!(
-                "version=13\n",
+                "version=14\n",
                 "max_committed_timestamp_ms=-\n",
                 "authority_incarnation=1\n",
                 "cluster_epoch=2\n",
                 "node=1,active,healthy,11,2,100,200,-,6e6f64652d312e736f636b\n",
-                "pg=7,active,1:99,1,1,2,3,-,-,-,-,-,-,-,-,-,-,-,-,0,0,-,0,2,-,0,-\n",
+                "pg=7,active,1:99,1,1,2,3,-,-,-,-,-,-,-,-,-,-,-,-,0,0,-,0,2,-,0,-,-,-,-\n",
             ),
         )
         .unwrap();
@@ -19733,12 +19896,12 @@ mod tests {
         std::fs::write(
             &path,
             concat!(
-                "version=13\n",
+                "version=14\n",
                 "max_committed_timestamp_ms=-\n",
                 "authority_incarnation=1\n",
                 "cluster_epoch=2\n",
                 "node=1,active,healthy,11,2,100,200,-,6e6f64652d312e736f636b\n",
-                "pg=7,peering,1,-,-,-,-,9,10,11,3,9,10,11,-,-,-,2,1,0,0,-,0,-,-,0,-\n",
+                "pg=7,peering,1,-,-,-,-,9,10,11,3,9,10,11,-,-,-,2,1,0,0,-,0,-,-,0,-,-,-,-\n",
             ),
         )
         .unwrap();
@@ -19758,12 +19921,12 @@ mod tests {
         std::fs::write(
             &path,
             concat!(
-                "version=13\n",
+                "version=14\n",
                 "max_committed_timestamp_ms=-\n",
                 "authority_incarnation=1\n",
                 "cluster_epoch=2\n",
                 "node=1,active,healthy,11,2,100,200,-,6e6f64652d312e736f636b\n",
-                "pg=7,active,1,1,9,10,11,-,-,-,-,-,-,-,-,-,-,-,-,0,1,-,0,-,-,0,-\n",
+                "pg=7,active,1,1,9,10,11,-,-,-,-,-,-,-,-,-,-,-,-,0,1,-,0,-,-,0,-,-,-,-\n",
             ),
         )
         .unwrap();
@@ -19801,7 +19964,7 @@ mod tests {
         std::fs::write(
             &path,
             concat!(
-                "version=13\n",
+                "version=14\n",
                 "max_committed_timestamp_ms=-\n",
                 "authority_incarnation=1\n",
                 "cluster_epoch=2\n",
@@ -19824,13 +19987,13 @@ mod tests {
         std::fs::write(
             &path,
             concat!(
-                "version=13\n",
+                "version=14\n",
                 "max_committed_timestamp_ms=-\n",
                 "authority_incarnation=1\n",
                 "cluster_epoch=3\n",
                 "history=2,1\n",
                 "history_node=2,1,active,healthy,11,2,100,200,-,6e6f64652d312e736f636b\n",
-                "history_pg=2,7,peering,1:2,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,0,0,-,0,-,-,0,-\n",
+                "history_pg=2,7,peering,1:2,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,0,0,-,0,-,-,0,-,-,-,-\n",
             ),
         )
         .unwrap();
@@ -19849,13 +20012,13 @@ mod tests {
         std::fs::write(
             &path,
             concat!(
-                "version=13\n",
+                "version=14\n",
                 "max_committed_timestamp_ms=-\n",
                 "authority_incarnation=1\n",
                 "cluster_epoch=4\n",
                 "history=2,1\n",
                 "history_node=2,1,active,healthy,11,2,100,200,-,6e6f64652d312e736f636b\n",
-                "history_pg=2,7,peering,1,-,-,-,-,9,10,11,3,9,10,11,-,-,-,2,1,0,0,-,0,-,-,0,-\n",
+                "history_pg=2,7,peering,1,-,-,-,-,9,10,11,3,9,10,11,-,-,-,2,1,0,0,-,0,-,-,0,-,-,-,-\n",
                 "node=1,active,healthy,11,4,100,200,-,6e6f64652d312e736f636b\n",
             ),
         )
@@ -19900,14 +20063,14 @@ mod tests {
         std::fs::write(
             &path,
             concat!(
-                "version=13\n",
+                "version=14\n",
                 "max_committed_timestamp_ms=-\n",
                 "authority_incarnation=1\n",
                 "cluster_epoch=2\n",
                 "node=1,active,healthy,11,2,100,200,-,6e6f64652d312e736f636b\n",
                 "node=2,active,healthy,12,2,100,200,-,6e6f64652d322e736f636b\n",
                 "node_pg=2,7,peering,2,100,0,0,0,0\n",
-                "pg=7,peering,1,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,0,0,-,0,-,-,0,-\n",
+                "pg=7,peering,1,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,0,0,-,0,-,-,0,-,-,-,-\n",
             ),
         )
         .unwrap();
@@ -19926,13 +20089,13 @@ mod tests {
         std::fs::write(
             &path,
             concat!(
-                "version=13\n",
+                "version=14\n",
                 "max_committed_timestamp_ms=-\n",
                 "authority_incarnation=1\n",
                 "cluster_epoch=3\n",
                 "node=1,active,healthy,11,3,100,200,-,6e6f64652d312e736f636b\n",
                 "node_pg=1,7,peering,2,100,0,0,0,0\n",
-                "pg=7,peering,1,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,0,0,-,0,-,-,0,-\n",
+                "pg=7,peering,1,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,0,0,-,0,-,-,0,-,-,-,-\n",
             ),
         )
         .unwrap();
@@ -19951,13 +20114,13 @@ mod tests {
         std::fs::write(
             &path,
             concat!(
-                "version=13\n",
+                "version=14\n",
                 "max_committed_timestamp_ms=-\n",
                 "authority_incarnation=1\n",
                 "cluster_epoch=2\n",
                 "node=1,active,healthy,11,2,100,200,-,6e6f64652d312e736f636b\n",
                 "node_pg=1,7,active,2,100,9,10,12,0\n",
-                "pg=7,active,1,1,9,10,11,-,-,-,-,-,-,-,-,-,-,-,-,0,0,-,0,2,-,0,-\n",
+                "pg=7,active,1,1,9,10,11,-,-,-,-,-,-,-,-,-,-,-,-,0,0,-,0,2,-,0,-,-,-,-\n",
             ),
         )
         .unwrap();
@@ -19977,13 +20140,13 @@ mod tests {
         std::fs::write(
             &path,
             concat!(
-                "version=13\n",
+                "version=14\n",
                 "authority_incarnation=1\n",
                 "cluster_epoch=2\n",
                 "max_committed_timestamp_ms=-\n",
                 "node=1,active,healthy,11,2,100,200,-,6e6f64652d312e736f636b\n",
                 "node_pg=1,7,active,2,100,10,20,30,0\n",
-                "pg=7,active,1,1,9,10,11,-,-,-,-,-,-,-,-,-,-,-,-,0,0,-,0,2,-,0,-\n",
+                "pg=7,active,1,1,9,10,11,-,-,-,-,-,-,-,-,-,-,-,-,0,0,-,0,2,-,0,-,-,-,-\n",
             ),
         )
         .unwrap();
@@ -20017,13 +20180,13 @@ mod tests {
         std::fs::write(
             &path,
             concat!(
-                "version=13\n",
+                "version=14\n",
                 "max_committed_timestamp_ms=-\n",
                 "authority_incarnation=1\n",
                 "cluster_epoch=2\n",
                 "node=1,active,healthy,11,2,100,200,-,6e6f64652d312e736f636b\n",
                 "node_pg=1,7,active,2,100,9,10,11,1\n",
-                "pg=7,active,1,1,9,10,11,-,-,-,-,-,-,-,-,-,-,-,-,0,0,-,0,2,-,0,-\n",
+                "pg=7,active,1,1,9,10,11,-,-,-,-,-,-,-,-,-,-,-,-,0,0,-,0,2,-,0,-,-,-,-\n",
             ),
         )
         .unwrap();
@@ -20161,7 +20324,7 @@ mod tests {
     fn endpoint_change_fences_active_pg_until_repeering_completes() {
         let tmp = test_util::tempdir();
         let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
-        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+        let mut authority = SingleAuthorityControlPlane::open(store.clone()).unwrap();
         authority
             .set_node_membership(NodeId::new(5), NodeMembershipState::Active)
             .unwrap();
@@ -20210,6 +20373,26 @@ mod tests {
         assert_eq!(
             pg.peering_metadata_proof_floor(),
             Some(PgMetadataProof::empty())
+        );
+        let persisted_pg = store
+            .load()
+            .unwrap()
+            .unwrap()
+            .pg(PgId::new(39))
+            .unwrap()
+            .clone();
+        assert_eq!(
+            persisted_pg.previous_primary_node_id(),
+            Some(NodeId::new(5))
+        );
+        assert_eq!(persisted_pg.previous_primary_node_incarnation(), Some(15));
+        assert_eq!(persisted_pg.previous_primary_lease_deadline_ms(), Some(302));
+        assert_eq!(
+            persisted_pg
+                .previous_primary_lease
+                .as_ref()
+                .map(|previous| previous.endpoint.as_str()),
+            Some("node-5.sock")
         );
         assert!(matches!(
             authority.validate_pg_operation_authorization(&authorization, 205),
@@ -26095,28 +26278,18 @@ mod tests {
         let refresh = restarted
             .refresh_node_heartbeat(current_peering_heartbeat, 2_005)
             .unwrap();
-        assert_eq!(
-            refresh.runtime_map().pg_routes()[0].state(),
-            PgState::Peering
-        );
-        let mut post_fence_peering_heartbeat =
-            heartbeat_from_record(&restarted, 1, restart_epoch, 2_102);
-        post_fence_peering_heartbeat.pg_observations = vec![NodePgHeartbeatObservation {
-            pg_id: PgId::new(26),
-            state: PgState::Peering,
-            metadata_proof: active_metadata_proof,
-            has_pending_metadata_command: false,
-        }];
-        let refresh = restarted
-            .refresh_node_heartbeat(post_fence_peering_heartbeat, 2_102)
-            .unwrap();
         assert!(
             !refresh.lease().serving(),
-            "peering completion bumps the epoch before the node observes it"
+            "same-process peering completion bumps the epoch before the node observes it"
         );
         assert_eq!(
             refresh.runtime_map().pg_routes()[0].state(),
             PgState::Active
+        );
+        assert_eq!(
+            restarted.snapshot().pg(PgId::new(26)).unwrap().state(),
+            PgState::Active,
+            "the unchanged primary process need not wait out its own old lease"
         );
     }
 
@@ -27284,7 +27457,7 @@ mod tests {
     }
 
     #[test]
-    fn temporary_availability_loss_fences_primary_until_repeering_completes() {
+    fn temporary_availability_loss_reactivates_same_primary_before_old_lease_expires() {
         let tmp = test_util::tempdir();
         let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
         let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
@@ -27401,27 +27574,20 @@ mod tests {
             .serving());
         heartbeat_with_pg_observation(&mut authority, 1, 25, PgState::Peering, 2_011);
         heartbeat_with_pg_observation(&mut authority, 2, 25, PgState::Peering, 2_012);
-        assert!(matches!(
-            authority.complete_pg_peering(
-                PgId::new(25),
-                NodeId::new(1),
-                node_incarnation(&authority, 1),
-                2_013,
-            ),
-            Err(ControlPlaneError::PgPreviousPrimaryLeaseStillActive { pg_id: 25, .. })
-        ));
-        heartbeat_with_pg_observation(&mut authority, 1, 25, PgState::Peering, 2_103);
-        heartbeat_with_pg_observation(&mut authority, 2, 25, PgState::Peering, 2_103);
-        authority
-            .complete_pg_peering(
-                PgId::new(25),
-                NodeId::new(1),
-                node_incarnation(&authority, 1),
-                2_103,
-            )
-            .unwrap();
+        let pg = authority.snapshot().pg(PgId::new(25)).unwrap();
+        assert_eq!(pg.previous_primary_node_id(), Some(NodeId::new(1)));
+        assert_eq!(
+            pg.previous_primary_node_incarnation(),
+            Some(node_incarnation(&authority, 1))
+        );
+        assert!(pg.previous_primary_lease_deadline_ms().unwrap() > 2_013);
+        assert_eq!(
+            authority.complete_ready_pg_peerings(2_013).unwrap(),
+            vec![PgId::new(25)],
+            "the unchanged primary process must not wait out its own old lease"
+        );
         let active_again =
-            heartbeat_with_pg_observation(&mut authority, 1, 25, PgState::Active, 2_104);
+            heartbeat_with_pg_observation(&mut authority, 1, 25, PgState::Active, 2_014);
         let authorization = authority
             .authorize_pg_operation(
                 PgServiceOperation::MetadataWrite,
@@ -27429,7 +27595,7 @@ mod tests {
                 NodeId::new(1),
                 node_incarnation(&authority, 1),
                 active_again.cluster_epoch(),
-                2_105,
+                2_015,
             )
             .unwrap();
         assert_eq!(authorization.primary_node_id(), NodeId::new(1));
@@ -29311,26 +29477,16 @@ mod tests {
         ));
 
         heartbeat_with_pg_observation(&mut authority, 1, 24, PgState::Peering, 2_005);
-        assert!(matches!(
-            authority.complete_pg_peering(
-                PgId::new(24),
-                NodeId::new(1),
-                node_incarnation(&authority, 1),
-                2_006,
-            ),
-            Err(ControlPlaneError::PgPreviousPrimaryLeaseStillActive { pg_id: 24, .. })
-        ));
-        heartbeat_with_pg_observation(&mut authority, 1, 24, PgState::Peering, 2_102);
         authority
             .complete_pg_peering(
                 PgId::new(24),
                 NodeId::new(1),
                 node_incarnation(&authority, 1),
-                2_102,
+                2_006,
             )
             .unwrap();
         let active_again =
-            heartbeat_with_pg_observation(&mut authority, 1, 24, PgState::Active, 2_103);
+            heartbeat_with_pg_observation(&mut authority, 1, 24, PgState::Active, 2_007);
         let authorization = authority
             .authorize_pg_operation(
                 PgServiceOperation::MetadataWrite,
@@ -29338,7 +29494,7 @@ mod tests {
                 NodeId::new(1),
                 node_incarnation(&authority, 1),
                 active_again.cluster_epoch(),
-                2_104,
+                2_008,
             )
             .unwrap();
         assert_eq!(authorization.primary_node_id(), NodeId::new(1));

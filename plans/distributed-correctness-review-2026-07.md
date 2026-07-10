@@ -1016,19 +1016,23 @@ Mechanism confirmed; window deployment-dependent.
   Active for any reason (the metadata-transfer path shows the pattern at
   :1912, :1983-1984) and refuse peering completion/readiness until `now_ms`
   exceeds it.
-- Status update (2026-07-09): **resolved in the current tree.** PG state now
-  persists `previous_primary_lease_deadline_ms` separately from the
-  metadata-transfer-only source fence. Every transition out of Active captures
-  the old primary's last issued deadline before node lease mutation, including
-  membership/availability changes, heartbeat incarnation or endpoint changes,
-  acting-set changes, explicit state transitions, metadata transfer, and
-  authority restart. Direct completion and `ready_pg_peering_completions`
-  reject/skip the PG while that deadline is greater than the committed
-  completion time, and successful activation clears the fence. The canonical
-  control-plane snapshot format is version 13 and persists this field through
-  restart/history. Tests cover early direct rejection, automatic readiness
-  suppression, exact-deadline activation after successor renewal, and restart
-  persistence. The separate in-flight mutation side is tracked by DCC-1.
+- Status update (2026-07-10): **resolved in the current tree.** PG state now
+  persists the previous primary's node ID, incarnation, endpoint, and lease
+  deadline separately from the metadata-transfer-only source fence. Every
+  transition out of Active captures that identity before node lease mutation,
+  including membership/availability changes, heartbeat incarnation or
+  endpoint changes, acting-set changes, explicit state transitions, metadata
+  transfer, and authority restart. Direct completion and
+  `ready_pg_peering_completions` reject/skip a different proposed process while
+  the old lease remains live. The exact same node/incarnation/endpoint may
+  reactivate once ordinary peering proof checks pass; waiting out its own lease
+  provides no safety and caused 116-PG startup to miss the readiness bound.
+  Successful activation clears the fence. Canonical control-plane snapshot
+  version 14 persists the complete identity through restart/history. Tests
+  cover early direct rejection, automatic readiness suppression, immediate
+  same-process reactivation, endpoint/incarnation distinction, exact-deadline
+  activation after successor renewal, and persistence. The separate in-flight
+  mutation side is tracked by DCC-1.
 
 ### CL2. HIGH (availability) — Divergent replicas permanently wedge a PG in `Peering`; the implemented catch-up path has no production caller
 
@@ -1477,9 +1481,10 @@ unchecked epoch-only fence RPC surface).
 Claims that **do not survive scrutiny**:
 
 - **CL1 was open at this interim baseline and is resolved in the current
-  tree.** The control plane now captures the deposed primary deadline on every
-  Active exit and blocks direct/automatic successor activation through it; see
-  the later CL1 status update and DCC-1 closeout.
+  tree.** The control plane now captures the previous primary process identity
+  and deadline on every Active exit and blocks direct/automatic activation of
+  a different successor through it; see the later CL1 status update and DCC-1
+  closeout.
 - **CP5 is half-fixed.** Heartbeat responses are compact now, but durable
   history is still unbounded and frontend startup still fetches the full
   snapshot RPC under the 8MB cap — see the CP5 status update.

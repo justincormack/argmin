@@ -172,12 +172,14 @@ check and commit; expiry or guard failure rolls the transaction back,
 including command-log, pending, and materialized metadata changes.
 
 The control plane independently fences successor activation. Whenever a PG
-leaves `Active`, it persists the deposed primary's last lease deadline in the
-PG record before any node lease is cleared or replaced. Peering readiness and
-completion remain blocked while that deadline is in the future. Activation at
-or after the deadline is allowed only when the proposed primary has a current,
-unexpired lease and the ordinary peering proof checks pass, and successful
-activation clears the old-primary deadline.
+leaves `Active`, it persists the previous primary's node ID, incarnation,
+endpoint, and last lease deadline in the PG record before any node lease is
+cleared or replaced. Peering readiness and completion remain blocked while
+that deadline is in the future if the proposed primary is a different process
+identity. The exact same node/incarnation/endpoint may reactivate before its
+own old deadline once the ordinary peering proof checks pass because there is
+no deposed storage process to fence. Successful activation clears the
+previous-primary identity.
 
 The route-transition effect audit classifies the remaining storage RPC
 families as follows:

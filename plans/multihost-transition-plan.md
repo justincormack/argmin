@@ -10927,10 +10927,12 @@ Phase 12.4 progress:
   rollback. Historical Active recovery requires an exact process-local
   transition permit bounded by the old map deadline; retained route topology
   alone and restart reconstruction cannot authorize mutation. The replicated
-  control-plane PG record now separately persists the previous primary's lease
-  deadline on every transition out of Active, and direct plus automatic
-  peering completion waits through that deadline before activating a
-  successor. Control-plane snapshot format version 13 persists the new fence.
+  control-plane PG record now separately persists the previous primary's node
+  ID, incarnation, endpoint, and lease deadline on every transition out of
+  Active. Direct plus automatic peering completion waits through that deadline
+  before activating a different process; the exact same process may reactivate
+  after proof convergence without waiting out its own lease. Control-plane
+  snapshot format version 14 persists the complete fence identity.
   The follow-up effect audit closes DCC-1: route admission is frame-wide, so
   shard publication/ack, reservation/drain, reclaim, and cleanup frames all
   finish before config publication. Shard and reservation artifacts do not
