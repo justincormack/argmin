@@ -179,6 +179,44 @@ or after the deadline is allowed only when the proposed primary has a current,
 unexpired lease and the ordinary peering proof checks pass, and successful
 activation clears the old-primary deadline.
 
+The route-transition effect audit classifies the remaining storage RPC
+families as follows:
+
+- Shard writes, repair/backfill writes, and shard-ack records may create
+  durable payload or local ack state, but they do not independently publish an
+  S3-visible object. Visibility still requires the fenced metadata-command
+  commit. A route transition drains these frames before publishing Peering, so
+  transfer/backfill observes their completed state; an abandoned file or ack
+  is permitted orphan state for scavenging.
+- Bucket write reservations, drains, generation reservations, and stream
+  staging rows are coordination state, not independent object visibility.
+  Frames admitted under the old route finish before Peering publication.
+  Commands that depend on a reservation carry its durable proof, while exact
+  release/reap operations remain cleanup and may run after the serving route
+  changes.
+- Reclaim claims and physical cleanup are rooted in durable reclaim metadata.
+  Physical deletion is additionally fenced by storage-node read handles and
+  exact claim/shard identity. Claim release and drain/reservation cleanup must
+  remain available through retained routes because refusing cleanup after an
+  epoch transition would leak authority records. A frame already in progress
+  is drained before config publication.
+- Passing a route-map deadline does not by itself publish a successor route.
+  New ordinary work fails route validation after the deadline; already
+  admitted work may finish, but a later Peering config cannot publish until it
+  drains, and control-plane activation cannot precede the persisted previous
+  primary deadline. This is the completion guard for non-metadata effects.
+
+This closes the DCC-1 validate-then-transition race by effect. It does not
+close RPC4: retained cleanup locations from different epochs can still name
+the same physical shard file, so physical shard identity must be fenced across
+epochs separately. The socket-level
+`storage_node_route_transition_orders_old_command_before_successor_activation`
+regression pins an admitted old command behind the session PG lock, starts the
+Peering transition, releases the lock through the drain-safe cleanup frame,
+and proves that the command is included before Peering while a later old-epoch
+command cannot change the metadata proof after deadline and successor
+activation.
+
 ## StorageCluster Method Matrix
 
 The method list below is exhaustive for the public `StorageCluster` surface.

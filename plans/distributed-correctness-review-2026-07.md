@@ -323,6 +323,13 @@ bounds it. Inconsistent rather than unsafe.
   (:1020-1024). Delayed/stale frames from earlier terms are handled by Raft
   term logic; transfer-leader and snapshot frames carry votes and are
   validated by `handle_transfer_leader`/`install_full_snapshot` term checks.
+- Status update (2026-07-09): the identity half is now resolved for the Unix
+  peer transport. Multi-node peer mode requires scoped authenticated
+  credentials; signed frames bind cluster, source, target, role, operation,
+  payload, credential version, and bounded freshness where required. Missing,
+  malformed, stale, wrong-principal, and bad-MAC frames fail before OpenRaft
+  dispatch. TCP transport and external secret distribution remain production
+  rollout work, not the original unauthenticated-envelope defect.
 
 ### R10. RESOLVED — Process exits on some transient conditions in the serving loop
 
@@ -1469,9 +1476,10 @@ unchecked epoch-only fence RPC surface).
 
 Claims that **do not survive scrutiny**:
 
-- **CL1 remains fully open.** The peering-fence commits fence the incoming
-  primary, not the deposed one, and the deposed lease deadline is now
-  destroyed at apply time — see the CL1 status update.
+- **CL1 was open at this interim baseline and is resolved in the current
+  tree.** The control plane now captures the deposed primary deadline on every
+  Active exit and blocks direct/automatic successor activation through it; see
+  the later CL1 status update and DCC-1 closeout.
 - **CP5 is half-fixed.** Heartbeat responses are compact now, but durable
   history is still unbounded and frontend startup still fetches the full
   snapshot RPC under the 8MB cap — see the CP5 status update.
@@ -1565,7 +1573,7 @@ write but recurs at every epoch bump.
   store-epoch behind should quarantine per-PG (bind the PG fail-closed,
   serve the node's other PGs), not abort node startup.
 
-### INT-3. MEDIUM (fencing regression) — The peering-refresh drain (cb13fc8b) widens the metadata-write fence
+### INT-3. CORE RESOLVED / MEDIUM (fencing regression) — The peering-refresh drain (cb13fc8b) widened the metadata-write fence
 
 Confidence: medium — every individual gate crossing verified in code; the
 composite requires an unhealthy-peering activation plus a stale pinned
@@ -1603,6 +1611,17 @@ frontend plus concurrent traffic.
   sparse log rows from the old MD2 bug are neither detected nor quarantined
   and get blessed into the chain by the slow advance loop when a later
   contiguous insert arrives (legacy data only).
+
+- Status update (2026-07-09): **the fencing regression is resolved.** Normal
+  historical apply now needs a process-local permit created only while the
+  exact current Active route is drained into retained history. The permit is
+  bounded by that route's validity deadline and cannot be reconstructed from
+  persisted history after restart. Frame-wide route admission prevents a
+  replacement config from publishing around the commit, and CL1 prevents a
+  successor from activating before the old deadline. Thus a stale frontend
+  drain cannot create the divergent post-activation write described above.
+  The drain short-circuit and local terminal-cleanup observations remain
+  liveness/recovery follow-ups, not this safety mechanism.
 
 ### INT-4. CORE RESOLVED (round-3, 2026-07-09) / availability sub-items open — Bucket-reservation lease coupling breaks replica convergence proofs (17e7d07e / 4c01bac9)
 
@@ -1929,11 +1948,9 @@ Last-writer-wins admin semantics, no new mechanism beyond CP8's open
 ## Open items unchanged this round
 
 INT-2 (future-epoch slot still node-fatal at bind — no per-PG quarantine),
-INT-3 (all components: `>=`-epoch predicate, Recovery lease bypass,
-drain-on-every-error, plus the smaller items), INT-5 (per-syscall timeouts,
-read-handle idle exemption, `PayloadDecode` reuse), CL1 (no deposed-lease
-capture; still the top pre-existing safety gap), CL2 (catch-up still dead
-code; proof mismatch still silent), CP2/CL4 (zero skew margin anywhere),
+INT-5 (per-syscall timeouts, read-handle idle exemption, `PayloadDecode`
+reuse), CL2 (catch-up still dead code; proof mismatch still silent), CP2/CL4
+(zero skew margin anywhere),
 CP3, CP4 (still zero freshness-proof consumers), CP5's durable-history half
 (pruning byte-identical; frontend startup still needs the full snapshot RPC
 under the 8MB cap), CP6/CP7, CP9/CP10/CP11, CL5/CL6/CL7, RPC4/RPC6/RPC7/RPC9,

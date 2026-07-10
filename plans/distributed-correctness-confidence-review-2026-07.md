@@ -34,10 +34,12 @@ were present at the review baseline:
    the global merge, which could permanently omit valid records from
    pagination. DCC-3 records the completed correction.
 
-The earlier review's `CL1`, `CL2`, `CP2`, `CP3`, `CP4`, `CP5`, `INT-2`,
-`INT-3`, and `RPC4` findings also remain material. Several are availability
-fail-closed today, but they matter to safety because operators under pressure
-will otherwise need unsafe manual recovery.
+The earlier review's `CL2`, `CP2`, `CP3`, `CP4`, `CP5`, `INT-2`, and `RPC4`
+findings also remain material. `CL1` and the safety mechanism in `INT-3` were
+closed by the DCC-1 route-transition work; the smaller INT-3 drain liveness
+items remain. Several open findings are availability fail-closed today, but
+they matter to safety because operators under pressure will otherwise need
+unsafe manual recovery.
 
 There is substantial useful evidence already: deterministic control-plane
 command application, checksummed codecs, durable all-acting-replica metadata
@@ -54,7 +56,7 @@ soak gates.
 
 ## New findings
 
-### DCC-1. HIGH - route and lease validation is not atomic with mutation
+### DCC-1. RESOLVED / HIGH - route and lease validation was not atomic with mutation
 
 Confidence: confirmed mechanism; the exact lost/late mutation consequence
 depends on where a route transition observes the old PG state.
@@ -169,6 +171,27 @@ expiry/commit analysis is completed by effect for shard publication,
 reservations outside the metadata-command transaction, reclaim, and cleanup,
 with the full E -> Peering -> successor-Active process regression described
 above.
+
+Final status update (2026-07-09): **resolved by effect audit and deterministic
+socket-level transition coverage.** The admission permit is frame-wide rather
+than metadata-specific, so shard publication, repair/backfill writes, ack
+records, reservations, drains, reclaim claims, and cleanup that were admitted
+under E all finish before E+1 Peering config publication. Shard bytes/acks and
+reservation/staging rows do not independently publish S3-visible state;
+visibility still passes through the fenced metadata-command commit. Reclaim
+and exact release/clear operations are intentionally retained-route cleanup,
+rooted in durable metadata and additionally protected by read handles and
+claim/shard identity. Disabling them at route expiry would leak state rather
+than improve fencing. The separate epoch-to-physical-file alias remains RPC4.
+
+`storage_node_route_transition_orders_old_command_before_successor_activation`
+uses real storage-node Unix RPC frames and the session PG lock to pause an old
+command after admission. It proves Peering publication waits, the drain-safe
+lock release lets the command commit before publication, and an old-epoch
+command after deadline and successor activation cannot change the metadata
+state/proof. Existing metadata-PG migration UAT covers the full process
+transfer composition. The process test and deterministic pause-point test are
+kept separate so production binaries need no remotely triggerable pause hook.
 
 ### DCC-2. HIGH - bounded timestamp catch-up still grants unbounded serving leases
 
@@ -342,19 +365,15 @@ timeout, and optimization-sensitive differences are exercised.
 ## Revalidated production blockers
 
 The companion findings do not replace the following open work from the prior
-review.
+review. DCC-1, CL1, and the safety mechanism described by INT-3 are closed in
+the current tree; they are omitted from the open list below.
 
 ### Safety and authority
 
-- `DCC-1` residual: the visible-metadata route-transition race and CL1's
-  deposed-primary lease window are closed, but shard publication,
-  non-command reservations, reclaim, and cleanup still need the same
-  expiry/commit effect audit plus the full process transition regression.
 - `CP2` and `CL4`: absolute authority deadlines are compared against unrelated
   host wall clocks with zero skew margin. DCC-2 makes the consequence larger.
-- `INT-3`: historical metadata-command recovery is authorized by a retained
-  Active route plus any covering Peering route. Its scope is broader and
-  longer-lived than the one transition it is meant to repair.
+- `DCC-4`: snapshot invariants that protect publication are still compiled out
+  of release builds instead of returning a typed fail-closed error.
 - `RPC4`: read-handle fencing is keyed by epoch-bearing `ShardLocation`, while
   the physical shard path is keyed by shard identity without epoch. Handles
   for two epochs can alias one file without blocking deletion.
@@ -388,9 +407,12 @@ review.
   and diagnostic maps differently so a proof cannot be ignored accidentally.
 - `CP10`: the single-authority state file lacks a binary integrity envelope and
   cluster identity binding.
-- `R6` through `R9` and the `INT-6` WAL sub-findings remain relevant before the
-  experimental Raft path becomes the default, especially membership/restart
-  coupling and artifact-to-WAL generation binding.
+- `R6`-`R9` are closed for the current static-policy Unix peer mode: dynamic
+  membership is rejected, missing artifacts trip the durable sentinel, poison
+  gates peer dispatch/response, and peer identity is authenticated. Remaining
+  production-cutover work is dynamic configured membership, TCP/config-file
+  rollout, secret distribution, and any still-open INT-6 recovery/performance
+  sub-items; it should not be represented as the original R6-R9 defects.
 
 ## Required safety case
 
@@ -618,28 +640,29 @@ because the current stochastic failures can take hours to recur.
 
 ## Recommended order of work
 
-1. Complete the remaining DCC-1 effect audit and full process transition
-   regression. CL1 and the visible-metadata pause-at-commit race are closed;
-   retain the fencing exit criterion until shard publication, non-command
-   reservations, reclaim, and cleanup are classified and pinned.
-2. Replace the timestamp/lease design in DCC-2 with an explicit clock fault
+1. **Completed:** close DCC-1/CL1 with frame-wide route draining,
+   request-bound metadata commit fencing, the remaining effect audit, and
+   deterministic transition coverage.
+2. Move DCC-4's cheap publication invariants into the release path with typed
+   fail-closed errors; retain expensive audits for debug/test builds.
+3. Replace the timestamp/lease design in DCC-2 with an explicit clock fault
    model and multi-clock property test.
-3. **Completed:** fix DCC-3 with bounded global smallest-`N` selection and pin
+4. **Completed:** fix DCC-3 with bounded global smallest-`N` selection and pin
    complete pagination plus the 100-PG/100,100-record selector boundary.
-4. Contain recovery failures per PG (`INT-2`), then connect retained-log
-   catch-up to the production Peering state machine (`CL2`).
-5. Fence physical shard identity across epochs (`RPC4`) and narrow historical
-   mutation authority (`INT-3`).
-6. Make freshness proof consumption, cluster identity/floors, proof ancestry,
-   and bounded history part of the serving types (`CP3`-`CP7`).
-7. Complete the Raft WAL generation/startup work and run the full S3 stack
+5. Fence physical shard identity across epochs (`RPC4`).
+6. Contain recovery failures per PG (`INT-2`), strengthen proof ancestry
+   (`CP6`, `CP7`, `CL6`), and only then connect retained-log catch-up to the
+   production Peering state machine (`CL2`).
+7. Make freshness proof consumption, cluster identity/floors, and bounded
+   history part of the serving types (`CP3`-`CP5`).
+8. Complete the remaining Raft production-cutover work and run the full S3 stack
    through three control-plane processes under the same fault harness.
-8. Continue the increasing-repeat correctness soak throughout these slices.
+9. Continue the increasing-repeat correctness soak throughout these slices.
    Once the blockers above are closed, promote it into a retained
    production-readiness gate and add operational recovery drills.
 
 Phase 12 improves control-plane availability and ordering, but it does not
-repair a storage-node fencing race, a cross-host lease model, or PG recovery by
-itself. DCC-3's cross-PG listing defect was corrected independently. The
-production gate should therefore be expressed in terms of the invariants
-above, not simply completion of the Raft integration checklist.
+repair the cross-host lease model or PG recovery by itself. DCC-1's
+storage-node fencing race and DCC-3's cross-PG listing defect were corrected
+independently. The production gate should therefore be expressed in terms of
+the invariants above, not simply completion of the Raft integration checklist.

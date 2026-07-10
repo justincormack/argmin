@@ -10926,9 +10926,18 @@ Phase 12.4 progress:
   deadline on every transition out of Active, and direct plus automatic
   peering completion waits through that deadline before activating a
   successor. Control-plane snapshot format version 13 persists the new fence.
-  DCC-1 remains open for the effect-by-effect shard publication,
-  non-command reservation, reclaim, and cleanup expiry audit and the full
-  process transfer race; CL1 is closed by this slice.
+  The follow-up effect audit closes DCC-1: route admission is frame-wide, so
+  shard publication/ack, reservation/drain, reclaim, and cleanup frames all
+  finish before config publication. Shard and reservation artifacts do not
+  independently publish visible S3 state, while reclaim and exact release
+  operations are intentionally retained-route cleanup protected by durable
+  roots, read handles, and exact identity. A real Unix-frame regression pauses
+  an old command behind the PG lock, proves Peering waits and incorporates it,
+  then proves an old command cannot mutate the proof after deadline and
+  successor activation. Existing metadata-PG migration UAT supplies the full
+  process transfer composition without introducing a production pause hook.
+  CL1 is closed by the paired control-plane fence; RPC4's cross-epoch physical
+  shard alias remains separate work.
 
 1. define the replicated control-plane state machine:
    - state includes cluster epoch, PG count, PG state, PG acting sets, node

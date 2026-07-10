@@ -14486,6 +14486,242 @@ mod tests {
     }
 
     #[test]
+    fn storage_node_route_transition_orders_old_command_before_successor_activation() {
+        let tmp = test_util::tempdir();
+        let config = bounded_runtime_refresh_config(test_config(&tmp));
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let socket_path = config.socket_path.clone();
+        let server = Arc::new(StorageNodeServer::bind(config.clone()).unwrap());
+        let _stderr_guard = server.suppress_metadata_command_lock_wait_stderr();
+        let (lock_wait_tx, lock_wait_rx) = mpsc::channel();
+        server
+            .metadata_command_locks
+            .set_before_wait_hook(Arc::new(move |pg_id| {
+                assert_eq!(pg_id, PgId::new(0));
+                let _ = lock_wait_tx.send(());
+            }));
+        {
+            let pg = server._node.get_pg(0).unwrap();
+            create_probe_bucket_direct(&pg, &crate::tests::bucket_name("metadata-rpc-bucket"));
+            pg.refresh_metadata_command_state_digest().unwrap();
+        }
+        let serving_server = Arc::clone(&server);
+        let _server_thread = thread::spawn(move || serving_server.serve_forever().unwrap());
+
+        let state_request = StorageRpcMetadataCommandStateRequest {
+            node_id: config.node_id,
+            cluster_epoch: config.cluster_epoch,
+            pg_id: PgId::new(0),
+        };
+        let state_payload = encode_metadata_command_state_request(&state_request);
+        let mut lock_owner = UnixStream::connect(&socket_path).unwrap();
+        let acquire = send_frame(
+            &mut lock_owner,
+            1,
+            StorageRpcMessageKind::MetadataCommandPgLockAcquire,
+            state_payload.clone(),
+        );
+        decode_storage_rpc_response_payload(&acquire.payload)
+            .unwrap()
+            .unwrap();
+
+        let old_command = test_metadata_command(0, 1);
+        let old_request = encode_metadata_command_request(&StorageRpcMetadataCommandRequest {
+            node_id: config.node_id,
+            cluster_epoch: config.cluster_epoch,
+            pg_id: PgId::new(0),
+            command: old_command,
+        })
+        .unwrap();
+        let blocked_socket_path = socket_path.clone();
+        let (old_response_tx, old_response_rx) = mpsc::channel();
+        let old_frame = thread::spawn(move || {
+            let mut client = UnixStream::connect(blocked_socket_path).unwrap();
+            let response = send_frame(
+                &mut client,
+                1,
+                StorageRpcMessageKind::MetadataCommandApplyAndRecord,
+                old_request,
+            );
+            old_response_tx.send(response).unwrap();
+        });
+
+        lock_wait_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("old metadata command should wait for the PG lock");
+        assert_eq!(
+            server
+                .route_admission
+                .inner
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .active_frames,
+            1,
+            "the blocked command should hold the only admitted frame"
+        );
+
+        let source_route = config.pg_routes[0].clone();
+        let mut peering_config = bounded_runtime_refresh_config(config.clone());
+        peering_config.cluster_epoch = ClusterEpoch::new(2).unwrap();
+        peering_config.pg_routes[0].cluster_epoch = peering_config.cluster_epoch;
+        peering_config.pg_routes[0].state = PgState::Peering;
+        peering_config.historical_pg_routes.push(source_route);
+        let (installed_tx, installed_rx) = mpsc::channel();
+        let installing_server = Arc::clone(&server);
+        let installer = thread::spawn(move || {
+            installing_server
+                .install_control_plane_runtime_config(peering_config)
+                .unwrap();
+            installed_tx.send(()).unwrap();
+        });
+
+        let draining_deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            let transition = server
+                .route_admission
+                .inner
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .transition;
+            if transition == StorageNodeRouteTransitionState::Draining {
+                break;
+            }
+            assert!(
+                Instant::now() < draining_deadline,
+                "Peering route install did not begin draining"
+            );
+            thread::yield_now();
+        }
+        assert!(matches!(
+            installed_rx.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+
+        let release = send_frame(
+            &mut lock_owner,
+            2,
+            StorageRpcMessageKind::MetadataCommandPgLockRelease,
+            state_payload,
+        );
+        decode_storage_rpc_response_payload(&release.payload)
+            .unwrap()
+            .unwrap();
+        drop(lock_owner);
+
+        let old_response = old_response_rx
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap_or_else(|error| {
+                let (active_frames, transition) = {
+                    let admission = server
+                        .route_admission
+                        .inner
+                        .state
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    (admission.active_frames, admission.transition)
+                };
+                let lock_holder = server
+                    .metadata_command_locks
+                    .state
+                    .held
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .get(&PgId::new(0))
+                    .copied();
+                panic!(
+                    "old command did not complete after PG-lock release: {error:?}; active_frames={} transition={:?} config_epoch={} lock_holder={lock_holder:?}",
+                    active_frames,
+                    transition,
+                    server.config_snapshot().cluster_epoch.get()
+                )
+            });
+        let old_payload = decode_storage_rpc_response_payload(&old_response.payload)
+            .unwrap()
+            .unwrap();
+        let old_outcome = decode_metadata_command_state_outcome_response(&old_payload).unwrap();
+        assert!(matches!(
+            old_outcome.outcome,
+            StorageRpcMetadataCommandStateOutcome::State(
+                crate::metadata_command::MetadataCommandReplicaState {
+                    cluster_epoch,
+                    applied_log_index: 1,
+                    ..
+                }
+            ) if cluster_epoch == ClusterEpoch::new(1).unwrap()
+        ));
+        old_frame.join().unwrap();
+        installed_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        installer.join().unwrap();
+        assert_eq!(
+            server.config_snapshot().pg_routes[0].state,
+            PgState::Peering
+        );
+
+        // Expire the process-local recovery permit directly so this transition test
+        // does not depend on scheduler timing or waiting for a route deadline.
+        {
+            let mut admission = server
+                .route_admission
+                .inner
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            admission
+                .historical_metadata_recovery_permits
+                .get_mut(&(config.cluster_epoch, 0))
+                .expect("Peering transition should retain the source recovery permit")
+                .valid_until_ms = crate::clock::current_time_millis().saturating_sub(1);
+        }
+        let peering_route = server.config_snapshot().pg_routes[0].clone();
+        let mut successor_config = bounded_runtime_refresh_config(server.config_snapshot());
+        successor_config.cluster_epoch = ClusterEpoch::new(3).unwrap();
+        successor_config.pg_routes[0].cluster_epoch = successor_config.cluster_epoch;
+        successor_config.pg_routes[0].state = PgState::Active;
+        successor_config.historical_pg_routes.push(peering_route);
+        server
+            .install_control_plane_runtime_config(successor_config)
+            .unwrap();
+
+        let before_rejected_old_command = server
+            ._node
+            .get_pg(0)
+            .unwrap()
+            .metadata_command_replica_state()
+            .unwrap();
+        let stale_request = encode_metadata_command_request(&StorageRpcMetadataCommandRequest {
+            node_id: config.node_id,
+            cluster_epoch: config.cluster_epoch,
+            pg_id: PgId::new(0),
+            command: test_metadata_command(0, 2),
+        })
+        .unwrap();
+        let mut stale_client = UnixStream::connect(&socket_path).unwrap();
+        let stale_response = send_frame(
+            &mut stale_client,
+            1,
+            StorageRpcMessageKind::MetadataCommandApplyAndRecord,
+            stale_request,
+        );
+        let stale_error = decode_storage_rpc_response_payload(&stale_response.payload)
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(stale_error.code, StorageRpcErrorCode::StaleShardLocation);
+        assert!(stale_error.message.contains("expired"));
+        assert_eq!(
+            server
+                ._node
+                .get_pg(0)
+                .unwrap()
+                .metadata_command_replica_state()
+                .unwrap(),
+            before_rejected_old_command,
+            "an old-epoch command must not change successor-visible metadata or its proof"
+        );
+    }
+
+    #[test]
     fn storage_node_route_transition_allows_lock_release_during_drain() {
         let gate = StorageNodeRouteAdmissionGate::default();
         let admitted = gate.acquire(false);
