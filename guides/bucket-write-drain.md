@@ -229,6 +229,10 @@ Phase 9.4 must include storage and request-level coverage for:
 - empty-bucket DeleteBucket survives restart and finalizes without a
   same-process waiter
 - stale cluster handles cannot acquire new reservations but can release an
-  already acquired reservation by exact identity
+  already acquired reservation by exact identity; remote release routes through
+  the current cleanup epoch while preserving the reservation's original
+  acquire epoch as part of that durable identity
+- DeleteBucket can reap an expired reservation created before a route-epoch
+  change through the current bucket-PG primary
 - delete/recreate does not let stale release/reap affect the new bucket
   incarnation

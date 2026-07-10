@@ -1212,6 +1212,113 @@ fn frontend_unix_reclaim_and_bucket_finalize_resume_from_storage_node_owned_rows
 }
 
 #[test]
+fn frontend_unix_delete_bucket_reaps_expired_reservation_from_older_epoch() {
+    let (_unix_client_test_guard, tmp) = unix_client_tempdir();
+    let node_id = NodeId::new(1);
+    let ec_shape = EcShape { k: 1, m: 0 };
+    let acquire_epoch = ClusterEpoch::INITIAL;
+    let route_epoch = ClusterEpoch::new(acquire_epoch.get() + 1).unwrap();
+    let remote_data_dir = tmp.path().join("remote-delete-expired-reservation-node-1");
+    let socket_path = tmp
+        .path()
+        .join("sockets")
+        .join("delete-expired-reservation-node-1.sock");
+    let bucket = crate::tests::bucket_name("remote-delete-expired-reservation");
+    let owner = crate::CanonicalUserId::from_principal("owner");
+    {
+        let node = SharedStorageNode::open_with_default_ec_shape(&remote_data_dir, &[0], ec_shape)
+            .unwrap();
+        let pg = node.get_pg(0).unwrap();
+        crate::PgMetadataStore::create_bucket(
+            &*pg,
+            &bucket,
+            "owner",
+            &owner,
+            &crate::AclGrants::default(),
+            false,
+            false,
+        )
+        .unwrap();
+        crate::PgMetadataStore::acquire_durable_bucket_write_reservation(
+            &*pg,
+            crate::traits::DurableBucketWriteReservationAcquire {
+                name: &bucket,
+                reservation_id: "expired-reservation-before-route-change",
+                owner_token: "expired-owner-before-route-change",
+                cluster_epoch: acquire_epoch,
+                operation_kind: "put-object",
+                created_at: 1,
+                lease_deadline: 2,
+                target_context: Some("key=expired"),
+            },
+        )
+        .unwrap();
+        pg.refresh_metadata_command_state_digest().unwrap();
+    }
+
+    private_socket_dir(socket_path.parent().unwrap());
+    let server = StorageNodeServer::bind(StorageNodeProcessConfig {
+        node_id,
+        cluster_epoch: route_epoch,
+        route_map_validity: RouteMapValidity::Forever,
+        data_dir: remote_data_dir,
+        default_ec_shape: ec_shape,
+        pg_ids: vec![0],
+        socket_path: socket_path.clone(),
+        pg_routes: vec![StorageNodePgRoute {
+            pg_id: 0,
+            cluster_epoch: route_epoch,
+            state: PgState::Active,
+            primary_node_id: node_id,
+            acting_set: vec![node_id],
+        }],
+        historical_pg_routes: Vec::new(),
+    })
+    .unwrap();
+    let _server_guard = spawn_storage_node_server(server);
+
+    let mut map = LocalClusterMap::open_frontend_placeholder_with_configs_and_epoch(
+        node_id,
+        [LocalNodeStoreConfig::new(
+            node_id,
+            tmp.path()
+                .join("frontend-delete-expired-reservation-node-1"),
+        )],
+        &[0],
+        ec_shape,
+        route_epoch,
+    )
+    .unwrap();
+    map.install_unix_storage_node_clients([LocalUnixStorageNodeClientConfig::new(
+        node_id,
+        socket_path,
+    )])
+    .unwrap();
+    let map = Arc::new(map);
+    let cluster = StorageCluster::from_local_map(Arc::clone(&map)).unwrap();
+
+    cluster
+        .test_begin_bucket_delete_if_current(&bucket)
+        .expect("DeleteBucket should reap the old-epoch expired reservation over Unix RPC");
+    assert!(map
+        .node(node_id)
+        .unwrap()
+        .bucket_write_reservation_client()
+        .durable_bucket_write_reservations(PgId::new(0), &bucket)
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        map.node(node_id)
+            .unwrap()
+            .bucket_metadata_client()
+            .head_bucket_raw(PgId::new(0), &bucket)
+            .unwrap()
+            .state,
+        crate::BucketState::Deleting
+    );
+}
+
+#[test]
 fn frontend_unix_lifecycle_claims_resume_from_storage_node_owned_rows() {
     let (_unix_client_test_guard, tmp) = unix_client_tempdir();
     let node_id = NodeId::new(1);

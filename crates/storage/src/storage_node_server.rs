@@ -4163,11 +4163,14 @@ impl StorageNodeConnectionHandler {
         &self,
         request: StorageRpcProofReleaseRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
-        let route =
-            match self.cleanup_pg_route(request.node_id, request.cluster_epoch, request.pg_id) {
-                Ok(route) => route,
-                Err(error) => return encode_storage_rpc_error_response(&error),
-            };
+        let route = match self.cleanup_pg_route(
+            request.node_id,
+            request.route_cluster_epoch,
+            request.pg_id,
+        ) {
+            Ok(route) => route,
+            Err(error) => return encode_storage_rpc_error_response(&error),
+        };
         if route.primary_node_id != self.config.node_id {
             return encode_storage_rpc_error_response(&StorageRpcErrorResponse {
                 code: StorageRpcErrorCode::NonActingSetAccess,
@@ -4303,7 +4306,7 @@ impl StorageNodeConnectionHandler {
         request: StorageRpcBucketWriteReservationProofRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
         if let Err(error) =
-            self.validate_pg_route(request.node_id, request.cluster_epoch, request.pg_id)
+            self.validate_pg_route(request.node_id, request.route_cluster_epoch, request.pg_id)
         {
             return encode_storage_rpc_error_response(&error);
         }
@@ -4330,7 +4333,7 @@ impl StorageNodeConnectionHandler {
         request: StorageRpcBucketWriteReservationHeartbeatRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
         if let Err(error) =
-            self.validate_pg_route(request.node_id, request.cluster_epoch, request.pg_id)
+            self.validate_pg_route(request.node_id, request.route_cluster_epoch, request.pg_id)
         {
             return encode_storage_rpc_error_response(&error);
         }
@@ -4366,7 +4369,7 @@ impl StorageNodeConnectionHandler {
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
         if let Err(error) = self.validate_pg_route_for_cleanup(
             request.node_id,
-            request.cluster_epoch,
+            request.route_cluster_epoch,
             request.pg_id,
         ) {
             return encode_storage_rpc_error_response(&error);
@@ -12460,7 +12463,7 @@ mod tests {
 
         let request = StorageRpcBucketWriteReservationRecordRequest {
             node_id: config.node_id,
-            cluster_epoch: config.cluster_epoch,
+            route_cluster_epoch: config.cluster_epoch,
             pg_id: PgId::new(0),
             record: record.clone(),
         };

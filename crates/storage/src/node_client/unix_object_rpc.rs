@@ -484,7 +484,7 @@ impl BucketWriteReservationNodeClient for UnixStorageNodeClient {
     ) -> Result<(), BucketSnapshotLoadError> {
         let request = StorageRpcBucketWriteReservationProofRequest {
             node_id: self.node_id,
-            cluster_epoch: self.cluster_epoch,
+            route_cluster_epoch: self.cluster_epoch,
             pg_id,
             proof: proof.clone(),
         };
@@ -512,7 +512,7 @@ impl BucketWriteReservationNodeClient for UnixStorageNodeClient {
     ) -> Result<BucketWriteReservationRecord, BucketSnapshotLoadError> {
         let request = StorageRpcBucketWriteReservationHeartbeatRequest {
             node_id: self.node_id,
-            cluster_epoch: self.cluster_epoch,
+            route_cluster_epoch: self.cluster_epoch,
             pg_id,
             proof: proof.clone(),
             lease_deadline,
@@ -567,7 +567,7 @@ impl BucketWriteReservationNodeClient for UnixStorageNodeClient {
     ) -> Result<(), BucketSnapshotLoadError> {
         let request = StorageRpcBucketWriteReservationRecordRequest {
             node_id: self.node_id,
-            cluster_epoch: self.cluster_epoch,
+            route_cluster_epoch: self.cluster_epoch,
             pg_id,
             record: record.clone(),
         };
@@ -595,7 +595,7 @@ impl BucketWriteReservationNodeClient for UnixStorageNodeClient {
     ) -> Result<(), BucketSnapshotLoadError> {
         let request = StorageRpcProofReleaseRequest {
             node_id: self.node_id,
-            cluster_epoch: proof.cluster_epoch,
+            route_cluster_epoch: proof.cluster_epoch,
             pg_id,
             proof: proof.clone(),
         };

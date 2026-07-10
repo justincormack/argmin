@@ -1090,6 +1090,104 @@ fn unix_bucket_write_reservation_client_acquires_validates_and_releases() {
 }
 
 #[test]
+fn unix_bucket_write_reservation_identity_uses_current_route_after_epoch_change() {
+    let tmp = test_util::tempdir();
+    let mut config = test_config(&tmp);
+    let acquire_epoch = config.cluster_epoch;
+    let route_epoch = ClusterEpoch::new(acquire_epoch.get() + 1).unwrap();
+    config.cluster_epoch = route_epoch;
+    config.pg_routes[0].cluster_epoch = route_epoch;
+    let bucket = crate::tests::bucket_name("bucket-write-reservation-old-epoch-release-rpc");
+    let owner = crate::CanonicalUserId::from_principal("owner");
+    let lease_deadline = crate::clock::current_time_millis().saturating_add(60_000);
+    let record = {
+        let node = SharedStorageNode::open_with_default_ec_shape(
+            &config.data_dir,
+            &config.pg_ids,
+            config.default_ec_shape,
+        )
+        .unwrap();
+        let pg = node.get_pg(0).unwrap();
+        PgMetadataStore::create_bucket(
+            &*pg,
+            &bucket,
+            "owner",
+            &owner,
+            &crate::AclGrants::default(),
+            false,
+            false,
+        )
+        .unwrap();
+        let record = PgMetadataStore::acquire_durable_bucket_write_reservation(
+            &*pg,
+            crate::traits::DurableBucketWriteReservationAcquire {
+                name: &bucket,
+                reservation_id: "reservation-old-epoch-release",
+                owner_token: "owner-token-old-epoch-release",
+                cluster_epoch: acquire_epoch,
+                operation_kind: "put-object",
+                created_at: 10,
+                lease_deadline,
+                target_context: Some("key=a"),
+            },
+        )
+        .unwrap();
+        pg.refresh_metadata_command_state_digest().unwrap();
+        record
+    };
+
+    private_socket_dir(config.socket_path.parent().unwrap());
+    let server = Arc::new(StorageNodeServer::bind(config.clone()).unwrap());
+    let server_threads: Vec<_> = (0..3)
+        .map(|_| {
+            let server = Arc::clone(&server);
+            thread::spawn(move || server.accept_one().unwrap())
+        })
+        .collect();
+    let client =
+        UnixStorageNodeClient::new(config.node_id, route_epoch, config.socket_path.clone());
+
+    let proof = BucketWriteReservationProof::from(&record);
+    BucketWriteReservationNodeClient::validate_bucket_write_reservation_proof(
+        &client,
+        PgId::new(0),
+        &proof,
+    )
+    .unwrap();
+    let renewed = BucketWriteReservationNodeClient::heartbeat_durable_bucket_write_reservation(
+        &client,
+        PgId::new(0),
+        &proof,
+        lease_deadline.saturating_add(60_000),
+    )
+    .unwrap();
+    BucketWriteReservationNodeClient::release_durable_bucket_write_reservation(
+        &client,
+        PgId::new(0),
+        &renewed,
+    )
+    .unwrap();
+    for thread in server_threads {
+        thread.join().unwrap();
+    }
+
+    let node = SharedStorageNode::open_with_default_ec_shape(
+        &config.data_dir,
+        &config.pg_ids,
+        config.default_ec_shape,
+    )
+    .unwrap();
+    let pg = node.get_pg(0).unwrap();
+    assert!(PgMetadataStore::durable_bucket_write_reservation(
+        &*pg,
+        &bucket,
+        &record.reservation_id,
+    )
+    .unwrap()
+    .is_none());
+}
+
+#[test]
 fn unix_bucket_write_reservation_client_preserves_draining_signal() {
     let tmp = test_util::tempdir();
     let config = test_config(&tmp);

@@ -3166,7 +3166,7 @@ pub(crate) struct StorageRpcClaimReleaseRequest {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StorageRpcProofReleaseRequest {
     pub(crate) node_id: NodeId,
-    pub(crate) cluster_epoch: ClusterEpoch,
+    pub(crate) route_cluster_epoch: ClusterEpoch,
     pub(crate) pg_id: PgId,
     pub(crate) proof: BucketWriteReservationProof,
 }
@@ -3188,7 +3188,7 @@ pub(crate) struct StorageRpcBucketWriteReservationAcquireRequest {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StorageRpcBucketWriteReservationProofRequest {
     pub(crate) node_id: NodeId,
-    pub(crate) cluster_epoch: ClusterEpoch,
+    pub(crate) route_cluster_epoch: ClusterEpoch,
     pub(crate) pg_id: PgId,
     pub(crate) proof: BucketWriteReservationProof,
 }
@@ -3196,7 +3196,7 @@ pub(crate) struct StorageRpcBucketWriteReservationProofRequest {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StorageRpcBucketWriteReservationHeartbeatRequest {
     pub(crate) node_id: NodeId,
-    pub(crate) cluster_epoch: ClusterEpoch,
+    pub(crate) route_cluster_epoch: ClusterEpoch,
     pub(crate) pg_id: PgId,
     pub(crate) proof: BucketWriteReservationProof,
     pub(crate) lease_deadline: u64,
@@ -3205,7 +3205,7 @@ pub(crate) struct StorageRpcBucketWriteReservationHeartbeatRequest {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StorageRpcBucketWriteReservationRecordRequest {
     pub(crate) node_id: NodeId,
-    pub(crate) cluster_epoch: ClusterEpoch,
+    pub(crate) route_cluster_epoch: ClusterEpoch,
     pub(crate) pg_id: PgId,
     pub(crate) record: BucketWriteReservationRecord,
 }
@@ -10905,15 +10905,10 @@ pub(crate) fn decode_claim_release_request(
 pub(crate) fn encode_proof_release_request(
     request: &StorageRpcProofReleaseRequest,
 ) -> Result<Vec<u8>, StorageRpcPayloadError> {
-    if request.cluster_epoch != request.proof.cluster_epoch {
-        return Err(StorageRpcPayloadError::InvalidBucketWriteReservationProof(
-            "request route epoch must match proof epoch",
-        ));
-    }
     validate_bucket_write_reservation_proof(&request.proof)?;
     let mut out = Vec::new();
     put_u32(&mut out, request.node_id.as_u32());
-    put_u64(&mut out, request.cluster_epoch.get());
+    put_u64(&mut out, request.route_cluster_epoch.get());
     put_u32(&mut out, request.pg_id.get());
     put_bucket_write_reservation_proof(&mut out, &request.proof);
     Ok(out)
@@ -10924,19 +10919,14 @@ pub(crate) fn decode_proof_release_request(
 ) -> Result<StorageRpcProofReleaseRequest, StorageRpcPayloadError> {
     let mut decoder = StorageRpcDecoder::new(bytes);
     let node_id = NodeId::new(decoder.read_u32()?);
-    let cluster_epoch = decoder.read_cluster_epoch()?;
+    let route_cluster_epoch = decoder.read_cluster_epoch()?;
     let pg_id = PgId::new(decoder.read_u32()?);
     let proof = decoder.read_bucket_write_reservation_proof()?;
     decoder.finish()?;
-    if cluster_epoch != proof.cluster_epoch {
-        return Err(StorageRpcPayloadError::InvalidBucketWriteReservationProof(
-            "request route epoch must match proof epoch",
-        ));
-    }
     validate_bucket_write_reservation_proof(&proof)?;
     Ok(StorageRpcProofReleaseRequest {
         node_id,
-        cluster_epoch,
+        route_cluster_epoch,
         pg_id,
         proof,
     })
@@ -11027,7 +11017,7 @@ pub(crate) fn encode_bucket_write_reservation_proof_request(
 ) -> Result<Vec<u8>, StorageRpcPayloadError> {
     encode_proof_release_request(&StorageRpcProofReleaseRequest {
         node_id: request.node_id,
-        cluster_epoch: request.cluster_epoch,
+        route_cluster_epoch: request.route_cluster_epoch,
         pg_id: request.pg_id,
         proof: request.proof.clone(),
     })
@@ -11039,7 +11029,7 @@ pub(crate) fn decode_bucket_write_reservation_proof_request(
     let request = decode_proof_release_request(bytes)?;
     Ok(StorageRpcBucketWriteReservationProofRequest {
         node_id: request.node_id,
-        cluster_epoch: request.cluster_epoch,
+        route_cluster_epoch: request.route_cluster_epoch,
         pg_id: request.pg_id,
         proof: request.proof,
     })
@@ -11051,7 +11041,7 @@ pub(crate) fn encode_bucket_write_reservation_heartbeat_request(
     let mut out = encode_bucket_write_reservation_proof_request(
         &StorageRpcBucketWriteReservationProofRequest {
             node_id: request.node_id,
-            cluster_epoch: request.cluster_epoch,
+            route_cluster_epoch: request.route_cluster_epoch,
             pg_id: request.pg_id,
             proof: request.proof.clone(),
         },
@@ -11073,7 +11063,7 @@ pub(crate) fn decode_bucket_write_reservation_heartbeat_request(
     decoder.finish()?;
     Ok(StorageRpcBucketWriteReservationHeartbeatRequest {
         node_id: proof_request.node_id,
-        cluster_epoch: proof_request.cluster_epoch,
+        route_cluster_epoch: proof_request.route_cluster_epoch,
         pg_id: proof_request.pg_id,
         proof: proof_request.proof,
         lease_deadline,
@@ -11083,15 +11073,10 @@ pub(crate) fn decode_bucket_write_reservation_heartbeat_request(
 pub(crate) fn encode_bucket_write_reservation_record_request(
     request: &StorageRpcBucketWriteReservationRecordRequest,
 ) -> Result<Vec<u8>, StorageRpcPayloadError> {
-    if request.cluster_epoch != request.record.cluster_epoch {
-        return Err(StorageRpcPayloadError::InvalidBucketWriteReservationProof(
-            "request route epoch must match reservation epoch",
-        ));
-    }
     validate_bucket_write_reservation_record(&request.record)?;
     let mut out = Vec::new();
     put_u32(&mut out, request.node_id.as_u32());
-    put_u64(&mut out, request.cluster_epoch.get());
+    put_u64(&mut out, request.route_cluster_epoch.get());
     put_u32(&mut out, request.pg_id.get());
     put_bucket_write_reservation_record(&mut out, &request.record);
     Ok(out)
@@ -11102,19 +11087,14 @@ pub(crate) fn decode_bucket_write_reservation_record_request(
 ) -> Result<StorageRpcBucketWriteReservationRecordRequest, StorageRpcPayloadError> {
     let mut decoder = StorageRpcDecoder::new(bytes);
     let node_id = NodeId::new(decoder.read_u32()?);
-    let cluster_epoch = decoder.read_cluster_epoch()?;
+    let route_cluster_epoch = decoder.read_cluster_epoch()?;
     let pg_id = PgId::new(decoder.read_u32()?);
     let record = decoder.read_bucket_write_reservation_record()?;
     decoder.finish()?;
-    if cluster_epoch != record.cluster_epoch {
-        return Err(StorageRpcPayloadError::InvalidBucketWriteReservationProof(
-            "request route epoch must match reservation epoch",
-        ));
-    }
     validate_bucket_write_reservation_record(&record)?;
     Ok(StorageRpcBucketWriteReservationRecordRequest {
         node_id,
-        cluster_epoch,
+        route_cluster_epoch,
         pg_id,
         record,
     })
@@ -19603,7 +19583,7 @@ mod tests {
     fn proof_release_request_carries_full_reservation_identity() {
         let request = StorageRpcProofReleaseRequest {
             node_id: NodeId::new(7),
-            cluster_epoch: ClusterEpoch::INITIAL,
+            route_cluster_epoch: ClusterEpoch::new(2).unwrap(),
             pg_id: PgId::new(3),
             proof: test_bucket_write_reservation_proof(),
         };
@@ -20231,7 +20211,7 @@ mod tests {
 
         let release = StorageRpcBucketWriteReservationRecordRequest {
             node_id: NodeId::new(7),
-            cluster_epoch: ClusterEpoch::INITIAL,
+            route_cluster_epoch: ClusterEpoch::new(2).unwrap(),
             pg_id: PgId::new(3),
             record: record.clone(),
         };
@@ -20241,7 +20221,7 @@ mod tests {
 
         let proof = StorageRpcBucketWriteReservationProofRequest {
             node_id: NodeId::new(7),
-            cluster_epoch: ClusterEpoch::INITIAL,
+            route_cluster_epoch: ClusterEpoch::new(2).unwrap(),
             pg_id: PgId::new(3),
             proof: BucketWriteReservationProof::from(&record),
         };
