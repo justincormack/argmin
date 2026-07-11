@@ -35,7 +35,7 @@ use crate::coordinator::PutObjectPolicyContext;
 use crate::coordinator::TaggingDirective;
 use crate::coordinator::UploadPartCopyRequest;
 use crate::coordinator::{AuthorizePutObjectRequest, AuthorizedPutObjectWrite};
-use crate::error::ServerError;
+use crate::error::{ManagedEncryptionReadHeader, ManagedEncryptionReadHeaderContext, ServerError};
 use crate::metadata_blob::{MetadataBlob, USER_METADATA_SIZE_LIMIT};
 use checksum::{ChecksumAlgorithm, ChecksumType, MultipartChecksumConfig, RawChecksum};
 use conditional::{
@@ -1704,7 +1704,10 @@ impl HttpFrontend {
                 }
             }
             S3Operation::GetObject { bucket, key } => {
-                reject_managed_encryption_read_headers(req)?;
+                reject_managed_encryption_read_headers(
+                    req,
+                    ManagedEncryptionReadHeaderContext::StandardObjectRead,
+                )?;
                 reject_anonymous_response_overrides(req, auth)?;
                 let sse_customer = parse_sse_customer_request(req)?;
                 let cond = read_condition_from_headers(req);
@@ -1858,7 +1861,10 @@ impl HttpFrontend {
                 Ok(S3Response::delete_object(&result))
             }
             S3Operation::HeadObject { bucket, key } => {
-                reject_managed_encryption_read_headers(req)?;
+                reject_managed_encryption_read_headers(
+                    req,
+                    ManagedEncryptionReadHeaderContext::StandardObjectRead,
+                )?;
                 let sse_customer = parse_sse_customer_request(req)?;
                 let cond = read_condition_from_headers(req);
                 let vid = parse_version_id(req)?;
@@ -1911,7 +1917,10 @@ impl HttpFrontend {
                 }
             }
             S3Operation::GetObjectAttributes { bucket, key } => {
-                reject_managed_encryption_read_headers(req)?;
+                reject_managed_encryption_read_headers(
+                    req,
+                    ManagedEncryptionReadHeaderContext::ObjectAttributes,
+                )?;
                 let sse_customer = parse_sse_customer_request(req)?;
                 // Parse x-amz-object-attributes header (required, comma-separated).
                 // The AWS Rust SDK may send one header per list element; accept both
@@ -2805,7 +2814,10 @@ impl HttpFrontend {
                 let requester = Self::requester_from_auth(auth);
                 let source_sse_customer = parse_sse_customer_copy_source_request(req)?;
                 let sse_customer = parse_sse_customer_request(req)?;
-                reject_managed_encryption_read_headers(req)?;
+                reject_managed_encryption_read_headers(
+                    req,
+                    ManagedEncryptionReadHeaderContext::Multipart,
+                )?;
                 let src_cond = copy_source_condition_from_headers(req);
                 let copy_source_range =
                     if let Some(range_header) = req.header("x-amz-copy-source-range") {
@@ -2853,7 +2865,10 @@ impl HttpFrontend {
                 ))
             }
             S3Operation::CompleteMultipartUpload { bucket, key } => {
-                reject_managed_encryption_read_headers(req)?;
+                reject_managed_encryption_read_headers(
+                    req,
+                    ManagedEncryptionReadHeaderContext::Multipart,
+                )?;
                 let upload_id =
                     parse_required_upload_id(req.query_param_lossy("uploadId").as_deref())?;
                 let upload_id_text = upload_id.as_str().to_string();
@@ -5327,7 +5342,10 @@ fn parse_managed_encryption_form_fields(
     }
 }
 
-fn reject_managed_encryption_read_headers(req: &S3Request) -> Result<(), ServerError> {
+fn reject_managed_encryption_read_headers(
+    req: &S3Request,
+    context: ManagedEncryptionReadHeaderContext,
+) -> Result<(), ServerError> {
     for header in [SSE_HEADER, SSE_KMS_KEY_ID_HEADER] {
         if header_count(req, header) > 1 {
             return Err(ServerError::InvalidRequest {
@@ -5335,10 +5353,18 @@ fn reject_managed_encryption_read_headers(req: &S3Request) -> Result<(), ServerE
             });
         }
     }
-    if req.header(SSE_HEADER).is_some() || req.header(SSE_KMS_KEY_ID_HEADER).is_some() {
-        return Err(ServerError::InvalidRequest {
-            reason: "x-amz-server-side-encryption headers are not valid for this operation"
-                .to_string(),
+    if let Some(value) = req.header(SSE_HEADER) {
+        return Err(ServerError::InvalidManagedEncryptionReadHeader {
+            context,
+            header: ManagedEncryptionReadHeader::ServerSideEncryption {
+                value: value.to_string(),
+            },
+        });
+    }
+    if req.header(SSE_KMS_KEY_ID_HEADER).is_some() {
+        return Err(ServerError::InvalidManagedEncryptionReadHeader {
+            context,
+            header: ManagedEncryptionReadHeader::KmsKeyId,
         });
     }
     Ok(())
@@ -7545,9 +7571,12 @@ mod tests {
                 key: "mykey".to_string(),
             },
         ) {
-            Err(ServerError::InvalidRequest { reason })
-                if reason
-                    == "x-amz-server-side-encryption headers are not valid for this operation" => {}
+            Err(ServerError::InvalidManagedEncryptionReadHeader { context, header })
+                if context == ManagedEncryptionReadHeaderContext::StandardObjectRead
+                    && header
+                        == (ManagedEncryptionReadHeader::ServerSideEncryption {
+                            value: "AES256".to_string(),
+                        }) => {}
             Err(err) => panic!("expected InvalidRequest, got {err:?}"),
             Ok(_) => panic!("expected error, got Ok"),
         }

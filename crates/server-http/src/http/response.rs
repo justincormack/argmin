@@ -9,7 +9,7 @@ use crate::coordinator::{
     LifecycleAbortHeaders, LifecycleExpirationHeader, ListObjectVersionsResult, ListObjectsResult,
     ListPartsResult, PutObjectResult, ReadHandle,
 };
-use crate::error::ServerError;
+use crate::error::{ManagedEncryptionReadHeader, ManagedEncryptionReadHeaderContext, ServerError};
 use auth::canonical::uri_encode;
 use checksum::{ChecksumAlgorithm, ChecksumType, RawChecksum};
 use s3_types::{
@@ -291,6 +291,9 @@ fn client_error_message(err: &ServerError) -> String {
         | ServerError::MalformedPOSTRequest { reason }
         | ServerError::MalformedChunkedBody { reason }
         | ServerError::InvalidTag { reason, .. } => reason.clone(),
+        ServerError::InvalidManagedEncryptionReadHeader { header, .. } => {
+            managed_encryption_read_header_message(header).to_string()
+        }
         ServerError::InvalidVersionId { .. } => "Invalid version id specified".to_string(),
         ServerError::MalformedXML { .. } => {
             "The XML you provided was not well-formed or did not validate against \
@@ -456,6 +459,54 @@ fn client_error_message(err: &ServerError) -> String {
              STREAMING-AWS4-ECDSA-P256-SHA256-PAYLOAD-TRAILER or a valid sha256 value."
                 .to_string()
         }
+    }
+}
+
+fn managed_encryption_read_header_argument(
+    header: &ManagedEncryptionReadHeader,
+) -> (&'static str, Option<&str>) {
+    match header {
+        ManagedEncryptionReadHeader::ServerSideEncryption { value } => {
+            ("x-amz-server-side-encryption", Some(value.as_str()))
+        }
+        ManagedEncryptionReadHeader::KmsKeyId => ("x-amz-server-side-encryption", None),
+    }
+}
+
+fn managed_encryption_read_header_message(header: &ManagedEncryptionReadHeader) -> &'static str {
+    match header {
+        ManagedEncryptionReadHeader::ServerSideEncryption { .. } => {
+            "x-amz-server-side-encryption header is not supported for this operation."
+        }
+        ManagedEncryptionReadHeader::KmsKeyId => {
+            "Server Side Encryption with AWS KMS managed key requires HTTP header x-amz-server-side-encryption : aws:kms"
+        }
+    }
+}
+
+fn managed_encryption_read_header_uses_xml_declaration(
+    context: ManagedEncryptionReadHeaderContext,
+    header: &ManagedEncryptionReadHeader,
+) -> bool {
+    match (context, header) {
+        (
+            ManagedEncryptionReadHeaderContext::StandardObjectRead,
+            ManagedEncryptionReadHeader::ServerSideEncryption { .. }
+            | ManagedEncryptionReadHeader::KmsKeyId,
+        ) => true,
+        (
+            ManagedEncryptionReadHeaderContext::ObjectAttributes,
+            ManagedEncryptionReadHeader::ServerSideEncryption { .. },
+        ) => true,
+        (
+            ManagedEncryptionReadHeaderContext::ObjectAttributes,
+            ManagedEncryptionReadHeader::KmsKeyId,
+        )
+        | (
+            ManagedEncryptionReadHeaderContext::Multipart,
+            ManagedEncryptionReadHeader::ServerSideEncryption { .. }
+            | ManagedEncryptionReadHeader::KmsKeyId,
+        ) => false,
     }
 }
 
@@ -687,6 +738,31 @@ impl S3Response {
                     request_id,
                     host_id,
                 );
+                Self::new(400).chunked_xml_body(body)
+            }
+            ServerError::InvalidManagedEncryptionReadHeader {
+                context, header, ..
+            } => {
+                let (argument_name, argument_value) =
+                    managed_encryption_read_header_argument(header);
+                let body = if managed_encryption_read_header_uses_xml_declaration(*context, header)
+                {
+                    xml::invalid_argument_error_xml(
+                        managed_encryption_read_header_message(header),
+                        argument_name,
+                        argument_value,
+                        request_id,
+                        host_id,
+                    )
+                } else {
+                    xml::invalid_argument_error_xml_no_decl(
+                        managed_encryption_read_header_message(header),
+                        argument_name,
+                        argument_value,
+                        request_id,
+                        host_id,
+                    )
+                };
                 Self::new(400).chunked_xml_body(body)
             }
             ServerError::InvalidVersionId {

@@ -5,7 +5,9 @@ use aws_sdk_s3::types::{
 };
 use s3_tests::{
     assert_s3_err_code, err_status, send_signed_request,
-    shape::{assert_shape, id_headers, shape, xml_tag_text},
+    shape::{
+        assert_shape, error_response_headers, expected_error, id_headers, shape, xml_tag_text,
+    },
     sse_c_header_values, test_sse_c_key, unique_bucket, SendRetryingOperationAborted, CTX,
 };
 
@@ -1363,6 +1365,77 @@ fn test_get_object_attributes_multipart_response_shape() {
         s3_tests::delete_object_retrying_operation_aborted(client, &bucket, key)
             .await
             .expect("delete attributes shape fixture");
+        s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
+    });
+}
+
+#[test]
+fn test_get_object_attributes_rejects_managed_encryption_request_headers() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
+        let key = "attributes-managed-encryption-read-headers.txt";
+
+        let put = send_signed_request(
+            "PUT",
+            &format!("{}/{}/{}", CTX.endpoint(), bucket, key),
+            b"attributes encrypted by default",
+            std::iter::empty::<(&str, &str)>(),
+        );
+        assert_eq!(put.status, 200, "attributes fixture PUT failed: {put:?}");
+
+        let invalid_sse_body = expected_error::invalid_argument_with_value(
+            "x-amz-server-side-encryption header is not supported for this operation.",
+            "x-amz-server-side-encryption",
+            "AES256",
+        );
+        let sse_response = send_signed_request(
+            "GET",
+            &format!("{}/{}/{}?attributes=", CTX.endpoint(), bucket, key),
+            b"",
+            [
+                ("x-amz-object-attributes", "ETag,ObjectSize"),
+                ("x-amz-server-side-encryption", "AES256"),
+            ],
+        );
+        assert_shape(
+            "GetObjectAttributes rejects x-amz-server-side-encryption request header",
+            &sse_response,
+            &shape()
+                .status(400)
+                .headers(error_response_headers())
+                .body(invalid_sse_body.as_str()),
+        );
+
+        let invalid_kms_key_body = expected_error::invalid_argument_no_decl(
+            "Server Side Encryption with AWS KMS managed key requires HTTP header x-amz-server-side-encryption : aws:kms",
+            "x-amz-server-side-encryption",
+        );
+        let kms_key_response = send_signed_request(
+            "GET",
+            &format!("{}/{}/{}?attributes=", CTX.endpoint(), bucket, key),
+            b"",
+            [
+                ("x-amz-object-attributes", "ETag,ObjectSize"),
+                (
+                    "x-amz-server-side-encryption-aws-kms-key-id",
+                    "arn:aws:kms:us-east-1:111122223333:key/example",
+                ),
+            ],
+        );
+        assert_shape(
+            "GetObjectAttributes rejects x-amz-server-side-encryption-aws-kms-key-id request header",
+            &kms_key_response,
+            &shape()
+                .status(400)
+                .headers(error_response_headers())
+                .body(invalid_kms_key_body.as_str()),
+        );
+
+        s3_tests::delete_object_retrying_operation_aborted(client, &bucket, key)
+            .await
+            .expect("delete attributes managed-encryption fixture");
         s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
     });
 }

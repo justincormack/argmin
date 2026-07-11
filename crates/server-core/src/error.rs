@@ -2,6 +2,19 @@
 use s3_types::VersionId;
 use storage::error::{MetadataError, StoreError};
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ManagedEncryptionReadHeaderContext {
+    StandardObjectRead,
+    ObjectAttributes,
+    Multipart,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ManagedEncryptionReadHeader {
+    ServerSideEncryption { value: String },
+    KmsKeyId,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum ServerError {
     #[error("bucket not found: {name}")]
@@ -62,6 +75,12 @@ pub enum ServerError {
 
     #[error("invalid argument: {reason}")]
     InvalidArgument { reason: String },
+
+    #[error("invalid managed encryption read header: {header:?}")]
+    InvalidManagedEncryptionReadHeader {
+        context: ManagedEncryptionReadHeaderContext,
+        header: ManagedEncryptionReadHeader,
+    },
 
     #[error("invalid version id specified: {argument_name}={argument_value}")]
     InvalidVersionId {
@@ -476,6 +495,7 @@ impl ServerError {
             Self::InvalidRequest { .. } | Self::InvalidRequestHostId { .. } => "InvalidRequest",
             Self::BadRequest { .. } => "BadRequest",
             Self::InvalidArgument { .. }
+            | Self::InvalidManagedEncryptionReadHeader { .. }
             | Self::InvalidVersionId { .. }
             | Self::DuplicateChecksumHeader { .. } => "InvalidArgument",
             Self::InvalidRedirectLocation { .. } => "InvalidRedirectLocation",
@@ -591,6 +611,7 @@ impl ServerError {
             | Self::InvalidRequestHostId { .. }
             | Self::BadRequest { .. }
             | Self::InvalidArgument { .. }
+            | Self::InvalidManagedEncryptionReadHeader { .. }
             | Self::InvalidVersionId { .. }
             | Self::DuplicateChecksumHeader { .. }
             | Self::InvalidRedirectLocation { .. }

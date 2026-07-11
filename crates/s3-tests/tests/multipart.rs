@@ -4502,6 +4502,78 @@ fn test_upload_part_copy_response_shape() {
 }
 
 #[test]
+fn test_upload_part_copy_rejects_managed_encryption_request_headers() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
+        let src_key = "upload-part-copy-read-header-src.txt";
+        let dst_key = "upload-part-copy-read-header-dst.txt";
+
+        s3_tests::raw_object_with("PUT", &bucket, src_key, b"upload part copy source", &[]);
+        let (_, upload_id) = raw_create_upload(&bucket, dst_key, &[]);
+
+        let invalid_sse_body = expected_error::invalid_argument_with_value_no_decl(
+            "x-amz-server-side-encryption header is not supported for this operation.",
+            "x-amz-server-side-encryption",
+            "AES256",
+        );
+        let sse_response = raw_multipart_query(
+            "PUT",
+            &bucket,
+            dst_key,
+            &format!("partNumber=1&uploadId={upload_id}"),
+            b"",
+            &[
+                ("x-amz-copy-source", &format!("{bucket}/{src_key}")),
+                ("x-amz-server-side-encryption", "AES256"),
+            ],
+        );
+        assert_shape(
+            "UploadPartCopy rejects x-amz-server-side-encryption request header",
+            &sse_response,
+            &shape()
+                .status(400)
+                .headers(error_response_headers())
+                .body(invalid_sse_body.as_str()),
+        );
+
+        let invalid_kms_key_body = expected_error::invalid_argument_no_decl(
+            "Server Side Encryption with AWS KMS managed key requires HTTP header x-amz-server-side-encryption : aws:kms",
+            "x-amz-server-side-encryption",
+        );
+        let kms_key_response = raw_multipart_query(
+            "PUT",
+            &bucket,
+            dst_key,
+            &format!("partNumber=1&uploadId={upload_id}"),
+            b"",
+            &[
+                ("x-amz-copy-source", &format!("{bucket}/{src_key}")),
+                (
+                    "x-amz-server-side-encryption-aws-kms-key-id",
+                    "arn:aws:kms:us-east-1:111122223333:key/example",
+                ),
+            ],
+        );
+        assert_shape(
+            "UploadPartCopy rejects x-amz-server-side-encryption-aws-kms-key-id request header",
+            &kms_key_response,
+            &shape()
+                .status(400)
+                .headers(error_response_headers())
+                .body(invalid_kms_key_body.as_str()),
+        );
+
+        raw_abort_upload(&bucket, dst_key, &upload_id);
+        s3_tests::delete_object_retrying_operation_aborted(client, &bucket, src_key)
+            .await
+            .expect("delete upload-part-copy source fixture");
+        s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
+    });
+}
+
+#[test]
 fn test_complete_multipart_no_such_upload_error_shape() {
     s3_tests::run(async {
         let client = CTX.client();
@@ -4526,6 +4598,67 @@ fn test_complete_multipart_no_such_upload_error_shape() {
             ),
         );
 
+        s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
+    });
+}
+
+#[test]
+fn test_complete_multipart_upload_rejects_managed_encryption_request_headers() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
+        let key = "complete-read-header.txt";
+
+        let (_, upload_id) = raw_create_upload(&bucket, key, &[]);
+        let (_, etag) = raw_upload_part(&bucket, key, &upload_id, 1, b"complete part body", &[]);
+        let complete_body = single_part_complete_body(&etag);
+
+        let invalid_sse_body = expected_error::invalid_argument_with_value_no_decl(
+            "x-amz-server-side-encryption header is not supported for this operation.",
+            "x-amz-server-side-encryption",
+            "AES256",
+        );
+        let sse_response = raw_complete_upload(
+            &bucket,
+            key,
+            &upload_id,
+            &complete_body,
+            &[("x-amz-server-side-encryption", "AES256")],
+        );
+        assert_shape(
+            "CompleteMultipartUpload rejects x-amz-server-side-encryption request header",
+            &sse_response,
+            &shape()
+                .status(400)
+                .headers(error_response_headers())
+                .body(invalid_sse_body.as_str()),
+        );
+
+        let invalid_kms_key_body = expected_error::invalid_argument_no_decl(
+            "Server Side Encryption with AWS KMS managed key requires HTTP header x-amz-server-side-encryption : aws:kms",
+            "x-amz-server-side-encryption",
+        );
+        let kms_key_response = raw_complete_upload(
+            &bucket,
+            key,
+            &upload_id,
+            &complete_body,
+            &[(
+                "x-amz-server-side-encryption-aws-kms-key-id",
+                "arn:aws:kms:us-east-1:111122223333:key/example",
+            )],
+        );
+        assert_shape(
+            "CompleteMultipartUpload rejects x-amz-server-side-encryption-aws-kms-key-id request header",
+            &kms_key_response,
+            &shape()
+                .status(400)
+                .headers(error_response_headers())
+                .body(invalid_kms_key_body.as_str()),
+        );
+
+        raw_abort_upload(&bucket, key, &upload_id);
         s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
     });
 }

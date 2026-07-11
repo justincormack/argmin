@@ -972,6 +972,28 @@ pub mod expected_error {
         )
     }
 
+    /// `InvalidArgument` without an XML declaration, used by AWS for some
+    /// multipart and object-attributes errors.
+    pub fn invalid_argument_no_decl(message: &str, argument_name: &str) -> String {
+        xml::invalid_argument_error_xml_no_decl(message, argument_name, None, REQUEST_ID, HOST_ID)
+    }
+
+    /// `InvalidArgument` without an XML declaration, echoing the offending
+    /// argument value.
+    pub fn invalid_argument_with_value_no_decl(
+        message: &str,
+        argument_name: &str,
+        argument_value: &str,
+    ) -> String {
+        xml::invalid_argument_error_xml_no_decl(
+            message,
+            argument_name,
+            Some(argument_value),
+            REQUEST_ID,
+            HOST_ID,
+        )
+    }
+
     /// `InvalidEncryptionAlgorithmError` echoing the rejected value.
     pub fn invalid_encryption_algorithm(message: &str, value: &str) -> String {
         xml::invalid_encryption_algorithm_error_xml(message, value, REQUEST_ID, HOST_ID)
@@ -1598,6 +1620,23 @@ mod tests {
             expected_error::invalid_argument_with_value("msg", "x-amz-checksum-crc32", "AAAA"),
             "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>InvalidArgument</Code>\
              <Message>msg</Message><ArgumentName>x-amz-checksum-crc32</ArgumentName>\
+             <ArgumentValue>AAAA</ArgumentValue>\
+             <RequestId>{request_id}</RequestId><HostId>{host_id}</HostId></Error>"
+        );
+        assert_eq!(
+            expected_error::invalid_argument_no_decl("msg", "x-amz-server-side-encryption"),
+            "<Error><Code>InvalidArgument</Code><Message>msg</Message>\
+             <ArgumentName>x-amz-server-side-encryption</ArgumentName>\
+             <RequestId>{request_id}</RequestId><HostId>{host_id}</HostId></Error>"
+        );
+        assert_eq!(
+            expected_error::invalid_argument_with_value_no_decl(
+                "msg",
+                "x-amz-checksum-crc32",
+                "AAAA"
+            ),
+            "<Error><Code>InvalidArgument</Code><Message>msg</Message>\
+             <ArgumentName>x-amz-checksum-crc32</ArgumentName>\
              <ArgumentValue>AAAA</ArgumentValue>\
              <RequestId>{request_id}</RequestId><HostId>{host_id}</HostId></Error>"
         );

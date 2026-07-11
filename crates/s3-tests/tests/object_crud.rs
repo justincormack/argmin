@@ -513,6 +513,220 @@ fn test_put_get_head_object_response_shape() {
 }
 
 #[test]
+fn test_object_read_rejects_managed_encryption_request_headers() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+        let key = "managed-encryption-read-request-headers.txt";
+
+        let put = raw_object_with("PUT", &bucket, key, b"encrypted by default", &[]);
+        assert_shape(
+            "PutObject default managed encryption fixture",
+            &put,
+            &shape()
+                .status(200)
+                .headers([
+                    ("etag", "{etag}"),
+                    ("x-amz-checksum-crc64nvme", "{any}"),
+                    ("x-amz-checksum-type", "FULL_OBJECT"),
+                    ("x-amz-server-side-encryption", "AES256"),
+                    ("x-amz-request-id", "{request_id}"),
+                    ("x-amz-id-2", "{host_id}"),
+                ])
+                .body_empty(),
+        );
+
+        let invalid_sse_body = expected_error::invalid_argument_with_value(
+            "x-amz-server-side-encryption header is not supported for this operation.",
+            "x-amz-server-side-encryption",
+            "AES256",
+        );
+        let invalid_kms_key_body = expected_error::invalid_argument(
+            "Server Side Encryption with AWS KMS managed key requires HTTP header x-amz-server-side-encryption : aws:kms",
+            "x-amz-server-side-encryption",
+        );
+        let get_with_sse = raw_object_with(
+            "GET",
+            &bucket,
+            key,
+            b"",
+            &[("x-amz-server-side-encryption", "AES256")],
+        );
+        assert_shape(
+            "GetObject rejects x-amz-server-side-encryption request header",
+            &get_with_sse,
+            &shape()
+                .status(400)
+                .headers(error_response_headers())
+                .body(invalid_sse_body.as_str()),
+        );
+
+        let range_get_with_sse = raw_object_with(
+            "GET",
+            &bucket,
+            key,
+            b"",
+            &[
+                ("Range", "bytes=0-3"),
+                ("x-amz-server-side-encryption", "AES256"),
+            ],
+        );
+        assert_shape(
+            "GetObject range rejects x-amz-server-side-encryption request header",
+            &range_get_with_sse,
+            &shape()
+                .status(400)
+                .headers(error_response_headers())
+                .body(invalid_sse_body.as_str()),
+        );
+
+        let part_get_with_sse = send_signed_request(
+            "GET",
+            &format!("{}/{}/{}?partNumber=1", CTX.endpoint(), bucket, key),
+            b"",
+            [("x-amz-server-side-encryption", "AES256")],
+        );
+        assert_shape(
+            "GetObject partNumber rejects x-amz-server-side-encryption request header",
+            &part_get_with_sse,
+            &shape()
+                .status(400)
+                .headers(error_response_headers())
+                .body(invalid_sse_body.as_str()),
+        );
+
+        let head_with_sse = raw_object_with(
+            "HEAD",
+            &bucket,
+            key,
+            b"",
+            &[("x-amz-server-side-encryption", "AES256")],
+        );
+        assert_shape(
+            "HeadObject rejects x-amz-server-side-encryption request header",
+            &head_with_sse,
+            &shape()
+                .status(400)
+                .headers(error_response_headers())
+                .body_empty(),
+        );
+
+        let part_head_with_sse = send_signed_request(
+            "HEAD",
+            &format!("{}/{}/{}?partNumber=1", CTX.endpoint(), bucket, key),
+            b"",
+            [("x-amz-server-side-encryption", "AES256")],
+        );
+        assert_shape(
+            "HeadObject partNumber rejects x-amz-server-side-encryption request header",
+            &part_head_with_sse,
+            &shape()
+                .status(400)
+                .headers(error_response_headers())
+                .body_empty(),
+        );
+
+        let get_with_kms_key = raw_object_with(
+            "GET",
+            &bucket,
+            key,
+            b"",
+            &[(
+                "x-amz-server-side-encryption-aws-kms-key-id",
+                "arn:aws:kms:us-east-1:111122223333:key/example",
+            )],
+        );
+        assert_shape(
+            "GetObject rejects x-amz-server-side-encryption-aws-kms-key-id request header",
+            &get_with_kms_key,
+            &shape()
+                .status(400)
+                .headers(error_response_headers())
+                .body(invalid_kms_key_body.as_str()),
+        );
+
+        let range_get_with_kms_key = raw_object_with(
+            "GET",
+            &bucket,
+            key,
+            b"",
+            &[
+                ("Range", "bytes=0-3"),
+                (
+                    "x-amz-server-side-encryption-aws-kms-key-id",
+                    "arn:aws:kms:us-east-1:111122223333:key/example",
+                ),
+            ],
+        );
+        assert_shape(
+            "GetObject range rejects x-amz-server-side-encryption-aws-kms-key-id request header",
+            &range_get_with_kms_key,
+            &shape()
+                .status(400)
+                .headers(error_response_headers())
+                .body(invalid_kms_key_body.as_str()),
+        );
+
+        let part_get_with_kms_key = send_signed_request(
+            "GET",
+            &format!("{}/{}/{}?partNumber=1", CTX.endpoint(), bucket, key),
+            b"",
+            [(
+                "x-amz-server-side-encryption-aws-kms-key-id",
+                "arn:aws:kms:us-east-1:111122223333:key/example",
+            )],
+        );
+        assert_shape(
+            "GetObject partNumber rejects x-amz-server-side-encryption-aws-kms-key-id request header",
+            &part_get_with_kms_key,
+            &shape()
+                .status(400)
+                .headers(error_response_headers())
+                .body(invalid_kms_key_body.as_str()),
+        );
+
+        let head_with_kms_key = raw_object_with(
+            "HEAD",
+            &bucket,
+            key,
+            b"",
+            &[(
+                "x-amz-server-side-encryption-aws-kms-key-id",
+                "arn:aws:kms:us-east-1:111122223333:key/example",
+            )],
+        );
+        assert_shape(
+            "HeadObject rejects x-amz-server-side-encryption-aws-kms-key-id request header",
+            &head_with_kms_key,
+            &shape()
+                .status(400)
+                .headers(error_response_headers())
+                .body_empty(),
+        );
+
+        let part_head_with_kms_key = send_signed_request(
+            "HEAD",
+            &format!("{}/{}/{}?partNumber=1", CTX.endpoint(), bucket, key),
+            b"",
+            [(
+                "x-amz-server-side-encryption-aws-kms-key-id",
+                "arn:aws:kms:us-east-1:111122223333:key/example",
+            )],
+        );
+        assert_shape(
+            "HeadObject partNumber rejects x-amz-server-side-encryption-aws-kms-key-id request header",
+            &part_head_with_kms_key,
+            &shape()
+                .status(400)
+                .headers(error_response_headers())
+                .body_empty(),
+        );
+
+        delete_all_and_bucket(client, &bucket, &[key.to_string()]).await;
+    });
+}
+
+#[test]
 fn test_object_read_nonexistent_bucket() {
     s3_tests::run(async {
         let client = CTX.client();

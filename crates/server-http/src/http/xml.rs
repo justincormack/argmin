@@ -101,12 +101,54 @@ pub fn invalid_argument_error_xml(
     request_id: &str,
     host_id: &str,
 ) -> String {
+    invalid_argument_error_xml_with_decl(
+        message,
+        argument_name,
+        argument_value,
+        request_id,
+        host_id,
+        true,
+    )
+}
+
+/// Format an S3 `InvalidArgument` error response without an XML declaration.
+#[must_use]
+pub fn invalid_argument_error_xml_no_decl(
+    message: &str,
+    argument_name: &str,
+    argument_value: Option<&str>,
+    request_id: &str,
+    host_id: &str,
+) -> String {
+    invalid_argument_error_xml_with_decl(
+        message,
+        argument_name,
+        argument_value,
+        request_id,
+        host_id,
+        false,
+    )
+}
+
+fn invalid_argument_error_xml_with_decl(
+    message: &str,
+    argument_name: &str,
+    argument_value: Option<&str>,
+    request_id: &str,
+    host_id: &str,
+    xml_declaration: bool,
+) -> String {
     let argument_value_xml = match argument_value {
         Some(value) => format!("<ArgumentValue>{}</ArgumentValue>", xml_escape(value)),
         None => String::new(),
     };
+    let xml_declaration = if xml_declaration {
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+    } else {
+        ""
+    };
     format!(
-        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+        "{xml_declaration}\
          <Error>\
          <Code>InvalidArgument</Code>\
          <Message>{}</Message>\
