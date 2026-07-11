@@ -8426,6 +8426,139 @@ fn test_bucket_policy_request_object_tag_binary_equals_does_not_wildcard_match()
 }
 
 #[test]
+fn test_bucket_policy_list_bucket_prefix_string_equals_does_not_wildcard_match() {
+    s3_tests::run(async {
+        let principal = alt_policy_principal();
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+        let bucket = create_bucket_allowing_public_policy(client).await;
+        for key in ["pub*/one", "public/one"] {
+            client
+                .put_object()
+                .bucket(&bucket)
+                .key(key)
+                .body(ByteStream::from_static(b"body"))
+                .send()
+                .await
+                .unwrap();
+        }
+
+        let policy = json!({
+            "Version": "2012-10-17",
+            "Statement": [{
+                "Effect": "Allow",
+                "Principal": principal,
+                "Action": "s3:ListBucket",
+                "Resource": bucket_resource(&bucket),
+                "Condition": {
+                    "StringEquals": {
+                        "s3:prefix": "pub*"
+                    }
+                }
+            }],
+        })
+        .to_string();
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(policy)
+            .send()
+            .await
+            .unwrap();
+
+        let listed = eventually_ok(
+            "ListBucket with literal StringEquals asterisk prefix",
+            || {
+                alt_client
+                    .list_objects_v2()
+                    .bucket(&bucket)
+                    .prefix("pub*")
+                    .send()
+            },
+        )
+        .await;
+        assert_eq!(listed.contents().len(), 1);
+
+        let denied = alt_client
+            .list_objects_v2()
+            .bucket(&bucket)
+            .prefix("public")
+            .send()
+            .await;
+        assert_eq!(err_status(&denied), 403);
+        assert_s3_err_code(&denied, "AccessDenied");
+
+        cleanup(&bucket, &["pub*/one", "public/one"]).await;
+    });
+}
+
+#[test]
+fn test_bucket_policy_list_bucket_prefix_string_not_equals_does_not_wildcard_match() {
+    s3_tests::run(async {
+        let principal = alt_policy_principal();
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+        let bucket = create_bucket_allowing_public_policy(client).await;
+        for key in ["pub*/one", "public/one"] {
+            client
+                .put_object()
+                .bucket(&bucket)
+                .key(key)
+                .body(ByteStream::from_static(b"body"))
+                .send()
+                .await
+                .unwrap();
+        }
+
+        let policy = json!({
+            "Version": "2012-10-17",
+            "Statement": [{
+                "Effect": "Allow",
+                "Principal": principal,
+                "Action": "s3:ListBucket",
+                "Resource": bucket_resource(&bucket),
+                "Condition": {
+                    "StringNotEquals": {
+                        "s3:prefix": "pub*"
+                    }
+                }
+            }],
+        })
+        .to_string();
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(policy)
+            .send()
+            .await
+            .unwrap();
+
+        eventually_ok(
+            "ListBucket with StringNotEquals wildcard-looking operand and different prefix",
+            || {
+                alt_client
+                    .list_objects_v2()
+                    .bucket(&bucket)
+                    .prefix("public")
+                    .send()
+            },
+        )
+        .await;
+
+        let denied = alt_client
+            .list_objects_v2()
+            .bucket(&bucket)
+            .prefix("pub*")
+            .send()
+            .await;
+        assert_eq!(err_status(&denied), 403);
+        assert_s3_err_code(&denied, "AccessDenied");
+
+        cleanup(&bucket, &["pub*/one", "public/one"]).await;
+    });
+}
+
+#[test]
 fn test_bucket_policy_current_time_date_condition_operators() {
     s3_tests::run(async {
         let principal = alt_policy_principal();
@@ -8443,6 +8576,7 @@ fn test_bucket_policy_current_time_date_condition_operators() {
             "date-not-equals-allowed",
             "date-not-equals-invalid-allowed",
             "date-less-than-if-exists-allowed",
+            "date-wildcard-fallback-allowed",
             "date-equals-false-fallback-allowed",
         ];
         let denied_keys = [
@@ -8450,6 +8584,7 @@ fn test_bucket_policy_current_time_date_condition_operators() {
             "date-greater-than-denied",
             "date-equals-denied",
             "date-less-than-invalid-denied",
+            "date-wildcard-denied",
         ];
         for key in allowed_keys.iter().chain(denied_keys.iter()) {
             client
@@ -8539,6 +8674,13 @@ fn test_bucket_policy_current_time_date_condition_operators() {
                     "Effect": "Allow",
                     "Principal": principal,
                     "Action": "s3:GetObject",
+                    "Resource": object_resource(&bucket, "date-wildcard-fallback-allowed"),
+                    "Condition": {"DateLessThan": {"aws:CurrentTime": "2999-01-01T00:00:00Z"}}
+                },
+                {
+                    "Effect": "Allow",
+                    "Principal": principal,
+                    "Action": "s3:GetObject",
                     "Resource": object_resource(&bucket, "date-equals-false-fallback-allowed")
                 },
                 {
@@ -8575,6 +8717,13 @@ fn test_bucket_policy_current_time_date_condition_operators() {
                     "Action": "s3:GetObject",
                     "Resource": object_resource(&bucket, "date-less-than-invalid-denied"),
                     "Condition": {"DateLessThan": {"aws:CurrentTime": "not-a-date"}}
+                },
+                {
+                    "Effect": "Allow",
+                    "Principal": principal,
+                    "Action": "s3:GetObject",
+                    "Resource": object_resource(&bucket, "date-wildcard-denied"),
+                    "Condition": {"DateEquals": {"aws:CurrentTime": "*"}}
                 }
             ],
         })
@@ -14348,6 +14497,79 @@ fn test_bucket_policy_object_creation_operation_bool_variants_allow_put_object()
 }
 
 #[test]
+fn test_bucket_policy_object_creation_operation_bool_does_not_wildcard_match() {
+    s3_tests::run(async {
+        let principal = alt_policy_principal();
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+        let bucket = create_bucket_allowing_public_policy(client).await;
+        let control_key = "object-creation-bool-wildcard-control";
+        let denied_key = "object-creation-bool-wildcard-denied";
+
+        let policy = json!({
+            "Version": "2012-10-17",
+            "Statement": [
+                {
+                    "Effect": "Allow",
+                    "Principal": principal,
+                    "Action": "s3:PutObject",
+                    "Resource": object_resource(&bucket, control_key),
+                    "Condition": {
+                        "Bool": {
+                            "s3:ObjectCreationOperation": "true"
+                        }
+                    }
+                },
+                {
+                    "Effect": "Allow",
+                    "Principal": principal,
+                    "Action": "s3:PutObject",
+                    "Resource": object_resource(&bucket, denied_key),
+                    "Condition": {
+                        "Bool": {
+                            "s3:ObjectCreationOperation": "tr*"
+                        }
+                    }
+                }
+            ],
+        })
+        .to_string();
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(policy)
+            .send()
+            .await
+            .unwrap();
+
+        eventually_ok(
+            "PutObject with literal Bool true ObjectCreationOperation condition",
+            || {
+                alt_client
+                    .put_object()
+                    .bucket(&bucket)
+                    .key(control_key)
+                    .body(ByteStream::from_static(b"bool-wildcard-control"))
+                    .send()
+            },
+        )
+        .await;
+
+        let denied = alt_client
+            .put_object()
+            .bucket(&bucket)
+            .key(denied_key)
+            .body(ByteStream::from_static(b"bool-wildcard-denied"))
+            .send()
+            .await;
+        assert_eq!(err_status(&denied), 403);
+        assert_s3_err_code(&denied, "AccessDenied");
+
+        cleanup(&bucket, &[control_key, denied_key]).await;
+    });
+}
+
+#[test]
 fn test_bucket_policy_copy_object_if_none_match_condition() {
     s3_tests::run(async {
         let client = CTX.client();
@@ -15363,6 +15585,93 @@ fn test_bucket_policy_list_bucket_max_keys_numeric_equals_nonnumeric_value_does_
         .await;
 
         cleanup(&bucket, &["allowed/one"]).await;
+    });
+}
+
+#[test]
+fn test_bucket_policy_list_bucket_max_keys_numeric_equals_wildcard_value_does_not_match() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+        let bucket = create_bucket_allowing_public_policy(client).await;
+        for key in ["allowed/one", "denied/one"] {
+            client
+                .put_object()
+                .bucket(&bucket)
+                .key(key)
+                .body(ByteStream::from_static(b"body"))
+                .send()
+                .await
+                .unwrap();
+        }
+
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(
+                json!({
+                    "Version": "2012-10-17",
+                    "Statement": [
+                        {
+                            "Effect": "Allow",
+                            "Principal": alt_policy_principal(),
+                            "Action": "s3:ListBucket",
+                            "Resource": bucket_resource(&bucket),
+                            "Condition": {
+                                "StringEquals": {
+                                    "s3:prefix": "allowed/"
+                                }
+                            }
+                        },
+                        {
+                            "Effect": "Allow",
+                            "Principal": alt_policy_principal(),
+                            "Action": "s3:ListBucket",
+                            "Resource": bucket_resource(&bucket),
+                            "Condition": {
+                                "StringEquals": {
+                                    "s3:prefix": "denied/"
+                                },
+                                "NumericEquals": {
+                                    "s3:max-keys": "*"
+                                }
+                            }
+                        }
+                    ],
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+            .unwrap();
+
+        let listed = eventually_ok(
+            "ListObjectsV2 allowed by the control prefix statement",
+            || {
+                alt_client
+                    .list_objects_v2()
+                    .bucket(&bucket)
+                    .prefix("allowed/")
+                    .send()
+            },
+        )
+        .await;
+        assert_eq!(listed.contents().len(), 1);
+
+        eventually_access_denied(
+            "ListObjectsV2 denied when NumericEquals operand is wildcard",
+            || {
+                alt_client
+                    .list_objects_v2()
+                    .bucket(&bucket)
+                    .prefix("denied/")
+                    .max_keys(2)
+                    .send()
+            },
+        )
+        .await;
+
+        cleanup(&bucket, &["allowed/one", "denied/one"]).await;
     });
 }
 
@@ -17164,6 +17473,19 @@ fn test_put_bucket_policy_malformed_response_shapes() {
                      \"Principal\":\"*\",\"Action\":\"s3:GetObject\",\
                      \"Resource\":\"arn:aws:s3:::{bucket}/*\",\
                      \"Condition\":{{\"IpAddress\":{{\"aws:SourceIp\":\"not-an-ip\"}}}}}}]}}"
+                ),
+            ),
+            expected_error::malformed_policy("Invalid IP address in Conditions"),
+        );
+        assert_malformed(
+            "PutBucketPolicy wildcard SourceIp operand",
+            &raw_put_policy(
+                &bucket,
+                &format!(
+                    "{{\"Version\":\"2012-10-17\",\"Statement\":[{{\"Effect\":\"Allow\",\
+                     \"Principal\":\"*\",\"Action\":\"s3:GetObject\",\
+                     \"Resource\":\"arn:aws:s3:::{bucket}/*\",\
+                     \"Condition\":{{\"IpAddress\":{{\"aws:SourceIp\":\"127.0.0.*\"}}}}}}]}}"
                 ),
             ),
             expected_error::malformed_policy("Invalid IP address in Conditions"),
