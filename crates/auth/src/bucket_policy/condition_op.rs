@@ -9,6 +9,7 @@
 //! arm in several different match statements.
 
 use super::{wildcard_matches, ConditionMatchResult};
+use std::net::IpAddr;
 
 /// Value presented to a condition operator by the evaluator.
 ///
@@ -23,6 +24,7 @@ use super::{wildcard_matches, ConditionMatchResult};
 pub(super) enum ActualValue<'a> {
     Present(&'a str),
     PresentValues(Vec<&'a str>),
+    SourceIp(IpAddr),
     Absent,
 }
 
@@ -45,6 +47,8 @@ pub(super) enum ConditionOpKind {
     NumericLessThanEquals,
     NumericGreaterThan,
     NumericGreaterThanEquals,
+    IpAddress,
+    NotIpAddress,
     Null,
 }
 
@@ -286,6 +290,54 @@ pub(super) const CONDITION_OPS: &[ConditionOpDef] = &[
         evaluable_on_evaluable_object_actions: true,
     },
     ConditionOpDef {
+        name: "IpAddress",
+        kind: ConditionOpKind::IpAddress,
+        evaluate: eval_ip_address,
+        evaluable_on_evaluable_object_actions: true,
+    },
+    ConditionOpDef {
+        name: "ForAllValues:IpAddress",
+        kind: ConditionOpKind::IpAddress,
+        evaluate: eval_for_all_values_ip_address,
+        evaluable_on_evaluable_object_actions: true,
+    },
+    ConditionOpDef {
+        name: "ForAnyValue:IpAddress",
+        kind: ConditionOpKind::IpAddress,
+        evaluate: eval_for_any_value_ip_address,
+        evaluable_on_evaluable_object_actions: true,
+    },
+    ConditionOpDef {
+        name: "IpAddressIfExists",
+        kind: ConditionOpKind::IpAddress,
+        evaluate: eval_ip_address_if_exists,
+        evaluable_on_evaluable_object_actions: true,
+    },
+    ConditionOpDef {
+        name: "NotIpAddress",
+        kind: ConditionOpKind::NotIpAddress,
+        evaluate: eval_not_ip_address,
+        evaluable_on_evaluable_object_actions: true,
+    },
+    ConditionOpDef {
+        name: "ForAllValues:NotIpAddress",
+        kind: ConditionOpKind::NotIpAddress,
+        evaluate: eval_for_all_values_not_ip_address,
+        evaluable_on_evaluable_object_actions: true,
+    },
+    ConditionOpDef {
+        name: "ForAnyValue:NotIpAddress",
+        kind: ConditionOpKind::NotIpAddress,
+        evaluate: eval_for_any_value_not_ip_address,
+        evaluable_on_evaluable_object_actions: true,
+    },
+    ConditionOpDef {
+        name: "NotIpAddressIfExists",
+        kind: ConditionOpKind::NotIpAddress,
+        evaluate: eval_not_ip_address,
+        evaluable_on_evaluable_object_actions: true,
+    },
+    ConditionOpDef {
         name: "Null",
         kind: ConditionOpKind::Null,
         evaluate: eval_null,
@@ -324,6 +376,13 @@ pub(super) const fn is_string_condition_kind(kind: ConditionOpKind) -> bool {
     )
 }
 
+pub(super) const fn is_ip_condition_kind(kind: ConditionOpKind) -> bool {
+    matches!(
+        kind,
+        ConditionOpKind::IpAddress | ConditionOpKind::NotIpAddress
+    )
+}
+
 pub(super) const fn is_numeric_condition_kind(kind: ConditionOpKind) -> bool {
     matches!(
         kind,
@@ -353,7 +412,7 @@ fn eval_bool(operands: &[String], actual: ActualValue<'_>) -> ConditionMatchResu
                 ConditionMatchResult::NoMatch
             }
         }
-        ActualValue::PresentValues(_) => ConditionMatchResult::NoMatch,
+        ActualValue::PresentValues(_) | ActualValue::SourceIp(_) => ConditionMatchResult::NoMatch,
         ActualValue::Absent => ConditionMatchResult::NoMatch,
     }
 }
@@ -367,7 +426,7 @@ fn eval_string_equals(operands: &[String], actual: ActualValue<'_>) -> Condition
                 ConditionMatchResult::NoMatch
             }
         }
-        ActualValue::PresentValues(_) => ConditionMatchResult::NoMatch,
+        ActualValue::PresentValues(_) | ActualValue::SourceIp(_) => ConditionMatchResult::NoMatch,
         ActualValue::Absent => ConditionMatchResult::NoMatch,
     }
 }
@@ -394,6 +453,7 @@ fn eval_for_all_values_string_equals(
                 ConditionMatchResult::NoMatch
             }
         }
+        ActualValue::SourceIp(_) => ConditionMatchResult::NoMatch,
         ActualValue::Absent => ConditionMatchResult::Matches,
     }
 }
@@ -420,6 +480,7 @@ fn eval_for_any_value_string_equals(
                 ConditionMatchResult::NoMatch
             }
         }
+        ActualValue::SourceIp(_) => ConditionMatchResult::NoMatch,
         ActualValue::Absent => ConditionMatchResult::NoMatch,
     }
 }
@@ -432,6 +493,7 @@ fn eval_string_equals_if_exists(
         ActualValue::Present(_) | ActualValue::PresentValues(_) => {
             eval_string_equals(operands, actual)
         }
+        ActualValue::SourceIp(_) => ConditionMatchResult::NoMatch,
         ActualValue::Absent => ConditionMatchResult::Matches,
     }
 }
@@ -451,7 +513,7 @@ fn eval_string_equals_ignore_case(
                 ConditionMatchResult::NoMatch
             }
         }
-        ActualValue::PresentValues(_) => ConditionMatchResult::NoMatch,
+        ActualValue::PresentValues(_) | ActualValue::SourceIp(_) => ConditionMatchResult::NoMatch,
         ActualValue::Absent => ConditionMatchResult::NoMatch,
     }
 }
@@ -482,6 +544,7 @@ fn eval_for_all_values_string_equals_ignore_case(
                 ConditionMatchResult::NoMatch
             }
         }
+        ActualValue::SourceIp(_) => ConditionMatchResult::NoMatch,
         ActualValue::Absent => ConditionMatchResult::Matches,
     }
 }
@@ -512,6 +575,7 @@ fn eval_for_any_value_string_equals_ignore_case(
                 ConditionMatchResult::NoMatch
             }
         }
+        ActualValue::SourceIp(_) => ConditionMatchResult::NoMatch,
         ActualValue::Absent => ConditionMatchResult::NoMatch,
     }
 }
@@ -524,6 +588,7 @@ fn eval_string_equals_ignore_case_if_exists(
         ActualValue::Present(_) | ActualValue::PresentValues(_) => {
             eval_string_equals_ignore_case(operands, actual)
         }
+        ActualValue::SourceIp(_) => ConditionMatchResult::NoMatch,
         ActualValue::Absent => ConditionMatchResult::Matches,
     }
 }
@@ -537,7 +602,7 @@ fn eval_string_not_equals(operands: &[String], actual: ActualValue<'_>) -> Condi
                 ConditionMatchResult::NoMatch
             }
         }
-        ActualValue::PresentValues(_) => ConditionMatchResult::NoMatch,
+        ActualValue::PresentValues(_) | ActualValue::SourceIp(_) => ConditionMatchResult::NoMatch,
         ActualValue::Absent => ConditionMatchResult::Matches,
     }
 }
@@ -557,7 +622,7 @@ fn eval_string_not_equals_ignore_case(
                 ConditionMatchResult::NoMatch
             }
         }
-        ActualValue::PresentValues(_) => ConditionMatchResult::NoMatch,
+        ActualValue::PresentValues(_) | ActualValue::SourceIp(_) => ConditionMatchResult::NoMatch,
         ActualValue::Absent => ConditionMatchResult::Matches,
     }
 }
@@ -588,6 +653,7 @@ fn eval_for_all_values_string_not_equals_ignore_case(
                 ConditionMatchResult::NoMatch
             }
         }
+        ActualValue::SourceIp(_) => ConditionMatchResult::NoMatch,
         ActualValue::Absent => ConditionMatchResult::Matches,
     }
 }
@@ -618,6 +684,7 @@ fn eval_for_any_value_string_not_equals_ignore_case(
                 ConditionMatchResult::NoMatch
             }
         }
+        ActualValue::SourceIp(_) => ConditionMatchResult::NoMatch,
         ActualValue::Absent => ConditionMatchResult::NoMatch,
     }
 }
@@ -634,7 +701,7 @@ fn eval_string_like(operands: &[String], actual: ActualValue<'_>) -> ConditionMa
                 ConditionMatchResult::NoMatch
             }
         }
-        ActualValue::PresentValues(_) => ConditionMatchResult::NoMatch,
+        ActualValue::PresentValues(_) | ActualValue::SourceIp(_) => ConditionMatchResult::NoMatch,
         ActualValue::Absent => ConditionMatchResult::NoMatch,
     }
 }
@@ -665,6 +732,7 @@ fn eval_for_all_values_string_like(
                 ConditionMatchResult::NoMatch
             }
         }
+        ActualValue::SourceIp(_) => ConditionMatchResult::NoMatch,
         ActualValue::Absent => ConditionMatchResult::Matches,
     }
 }
@@ -695,6 +763,7 @@ fn eval_for_any_value_string_like(
                 ConditionMatchResult::NoMatch
             }
         }
+        ActualValue::SourceIp(_) => ConditionMatchResult::NoMatch,
         ActualValue::Absent => ConditionMatchResult::NoMatch,
     }
 }
@@ -707,6 +776,7 @@ fn eval_string_like_if_exists(
         ActualValue::Present(_) | ActualValue::PresentValues(_) => {
             eval_string_like(operands, actual)
         }
+        ActualValue::SourceIp(_) => ConditionMatchResult::NoMatch,
         ActualValue::Absent => ConditionMatchResult::Matches,
     }
 }
@@ -723,7 +793,7 @@ fn eval_string_not_like(operands: &[String], actual: ActualValue<'_>) -> Conditi
                 ConditionMatchResult::NoMatch
             }
         }
-        ActualValue::PresentValues(_) => ConditionMatchResult::NoMatch,
+        ActualValue::PresentValues(_) | ActualValue::SourceIp(_) => ConditionMatchResult::NoMatch,
         ActualValue::Absent => ConditionMatchResult::Matches,
     }
 }
@@ -754,6 +824,7 @@ fn eval_for_all_values_string_not_like(
                 ConditionMatchResult::NoMatch
             }
         }
+        ActualValue::SourceIp(_) => ConditionMatchResult::NoMatch,
         ActualValue::Absent => ConditionMatchResult::Matches,
     }
 }
@@ -784,6 +855,7 @@ fn eval_for_any_value_string_not_like(
                 ConditionMatchResult::NoMatch
             }
         }
+        ActualValue::SourceIp(_) => ConditionMatchResult::NoMatch,
         ActualValue::Absent => ConditionMatchResult::NoMatch,
     }
 }
@@ -811,7 +883,7 @@ fn eval_numeric_comparison(
             };
             eval_numeric_operands(operands, actual, comparison)
         }
-        ActualValue::PresentValues(_) => ConditionMatchResult::NoMatch,
+        ActualValue::PresentValues(_) | ActualValue::SourceIp(_) => ConditionMatchResult::NoMatch,
         ActualValue::Absent if if_exists || matches!(comparison, NumericComparison::NotEquals) => {
             ConditionMatchResult::Matches
         }
@@ -936,6 +1008,111 @@ fn parse_numeric(value: &str) -> Option<f64> {
     parsed.is_finite().then_some(parsed)
 }
 
+fn eval_ip_address(operands: &[String], actual: ActualValue<'_>) -> ConditionMatchResult {
+    eval_ip_address_comparison(operands, actual, IpComparison::Equals, false)
+}
+
+fn eval_for_all_values_ip_address(
+    operands: &[String],
+    actual: ActualValue<'_>,
+) -> ConditionMatchResult {
+    eval_ip_address(operands, actual)
+}
+
+fn eval_for_any_value_ip_address(
+    operands: &[String],
+    actual: ActualValue<'_>,
+) -> ConditionMatchResult {
+    eval_ip_address(operands, actual)
+}
+
+fn eval_ip_address_if_exists(operands: &[String], actual: ActualValue<'_>) -> ConditionMatchResult {
+    eval_ip_address_comparison(operands, actual, IpComparison::Equals, true)
+}
+
+fn eval_not_ip_address(operands: &[String], actual: ActualValue<'_>) -> ConditionMatchResult {
+    eval_ip_address_comparison(operands, actual, IpComparison::NotEquals, false)
+}
+
+fn eval_for_all_values_not_ip_address(
+    operands: &[String],
+    actual: ActualValue<'_>,
+) -> ConditionMatchResult {
+    eval_not_ip_address(operands, actual)
+}
+
+fn eval_for_any_value_not_ip_address(
+    operands: &[String],
+    actual: ActualValue<'_>,
+) -> ConditionMatchResult {
+    eval_not_ip_address(operands, actual)
+}
+
+#[derive(Clone, Copy)]
+enum IpComparison {
+    Equals,
+    NotEquals,
+}
+
+fn eval_ip_address_comparison(
+    operands: &[String],
+    actual: ActualValue<'_>,
+    comparison: IpComparison,
+    if_exists: bool,
+) -> ConditionMatchResult {
+    let matches = match actual {
+        ActualValue::SourceIp(actual) => operands
+            .iter()
+            .filter_map(|expected| super::parse_ip_addr_or_cidr(expected))
+            .any(|(network, prefix)| ip_addr_matches_cidr(actual, network, prefix)),
+        ActualValue::Absent if if_exists || matches!(comparison, IpComparison::NotEquals) => {
+            return ConditionMatchResult::Matches;
+        }
+        ActualValue::Present(_) | ActualValue::PresentValues(_) | ActualValue::Absent => false,
+    };
+    let matches = match comparison {
+        IpComparison::Equals => matches,
+        IpComparison::NotEquals => !matches,
+    };
+    if matches {
+        ConditionMatchResult::Matches
+    } else {
+        ConditionMatchResult::NoMatch
+    }
+}
+
+fn ip_addr_matches_cidr(actual: IpAddr, network: IpAddr, prefix: u8) -> bool {
+    match (actual, network) {
+        (IpAddr::V4(actual), IpAddr::V4(network)) => {
+            let actual = u32::from(actual);
+            let network = u32::from(network);
+            prefix_bits_v4(actual, prefix) == prefix_bits_v4(network, prefix)
+        }
+        (IpAddr::V6(actual), IpAddr::V6(network)) => {
+            let actual = u128::from(actual);
+            let network = u128::from(network);
+            prefix_bits_v6(actual, prefix) == prefix_bits_v6(network, prefix)
+        }
+        (IpAddr::V4(_), IpAddr::V6(_)) | (IpAddr::V6(_), IpAddr::V4(_)) => false,
+    }
+}
+
+fn prefix_bits_v4(value: u32, prefix: u8) -> u32 {
+    if prefix == 0 {
+        0
+    } else {
+        value & (u32::MAX << (32 - u32::from(prefix)))
+    }
+}
+
+fn prefix_bits_v6(value: u128, prefix: u8) -> u128 {
+    if prefix == 0 {
+        0
+    } else {
+        value & (u128::MAX << (128 - u32::from(prefix)))
+    }
+}
+
 fn eval_null(operands: &[String], actual: ActualValue<'_>) -> ConditionMatchResult {
     let is_null = matches!(actual, ActualValue::Absent);
     if operands.iter().any(|expected| match expected.as_str() {
@@ -959,6 +1136,10 @@ mod tests {
 
     fn present_values<'a>(values: &[&'a str]) -> ActualValue<'a> {
         ActualValue::PresentValues(values.to_vec())
+    }
+
+    fn source_ip(value: &str) -> ActualValue<'_> {
+        ActualValue::SourceIp(value.parse().expect("test source IP is valid"))
     }
 
     fn operands(values: &[&str]) -> Vec<String> {
@@ -1587,6 +1768,41 @@ mod tests {
         );
         assert_eq!(
             (op.evaluate)(&expected, ActualValue::Absent),
+            ConditionMatchResult::NoMatch
+        );
+    }
+
+    #[test]
+    fn ip_address_matches_cidr_operands() {
+        let op = lookup("IpAddress").unwrap();
+        assert_eq!(
+            (op.evaluate)(&operands(&["127.0.0.0/8"]), source_ip("127.0.0.1")),
+            ConditionMatchResult::Matches
+        );
+        assert_eq!(
+            (op.evaluate)(&operands(&["10.0.0.0/8"]), source_ip("127.0.0.1")),
+            ConditionMatchResult::NoMatch
+        );
+    }
+
+    #[test]
+    fn ip_address_does_not_match_other_address_family() {
+        let op = lookup("IpAddress").unwrap();
+        assert_eq!(
+            (op.evaluate)(&operands(&["::/0"]), source_ip("127.0.0.1")),
+            ConditionMatchResult::NoMatch
+        );
+    }
+
+    #[test]
+    fn not_ip_address_matches_when_no_operand_contains_source() {
+        let op = lookup("NotIpAddress").unwrap();
+        assert_eq!(
+            (op.evaluate)(&operands(&["10.0.0.0/8"]), source_ip("127.0.0.1")),
+            ConditionMatchResult::Matches
+        );
+        assert_eq!(
+            (op.evaluate)(&operands(&["127.0.0.0/8"]), source_ip("127.0.0.1")),
             ConditionMatchResult::NoMatch
         );
     }

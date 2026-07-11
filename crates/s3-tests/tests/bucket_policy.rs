@@ -225,6 +225,26 @@ async fn anonymous_list_bucket_access_denied_eventually(url: &str) {
     unreachable!()
 }
 
+async fn anonymous_get_object_status_eventually(url: &str, expected_status: u16) -> String {
+    const MAX_ATTEMPTS: usize = 20;
+
+    for attempt in 0..MAX_ATTEMPTS {
+        let (status, body) = anonymous_get_status_and_body(url);
+        if status == expected_status {
+            return body;
+        }
+        if attempt + 1 < MAX_ATTEMPTS {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            continue;
+        }
+        panic!(
+            "anonymous GET did not converge to status {expected_status} for {url}, last status {status}, last body {body}"
+        );
+    }
+
+    unreachable!()
+}
+
 async fn upload_part_copy_eventually(
     client: &aws_sdk_s3::Client,
     bucket: &str,
@@ -577,6 +597,68 @@ fn bucket_resource(bucket: &str) -> String {
 
 fn bucket_wildcard_resource(bucket: &str) -> String {
     format!("arn:aws:s3:::{bucket}/*")
+}
+
+fn source_ip_list_bucket_policy(bucket: &str, operator: &str, cidr: &str) -> String {
+    json!({
+        "Version": "2012-10-17",
+        "Statement": [{
+            "Effect": "Allow",
+            "Principal": "*",
+            "Action": "s3:ListBucket",
+            "Resource": bucket_resource(bucket),
+            "Condition": {
+                operator: {
+                    "aws:SourceIp": cidr
+                }
+            }
+        }],
+    })
+    .to_string()
+}
+
+fn source_ip_get_object_policy(bucket: &str, operator: &str, cidr: &str) -> String {
+    json!({
+        "Version": "2012-10-17",
+        "Statement": [{
+            "Effect": "Allow",
+            "Principal": "*",
+            "Action": "s3:GetObject",
+            "Resource": bucket_wildcard_resource(bucket),
+            "Condition": {
+                operator: {
+                    "aws:SourceIp": cidr
+                }
+            }
+        }],
+    })
+    .to_string()
+}
+
+fn source_ip_get_object_allow_with_deny_policy(bucket: &str, operator: &str, cidr: &str) -> String {
+    json!({
+        "Version": "2012-10-17",
+        "Statement": [
+            {
+                "Effect": "Allow",
+                "Principal": "*",
+                "Action": "s3:GetObject",
+                "Resource": bucket_wildcard_resource(bucket)
+            },
+            {
+                "Effect": "Deny",
+                "Principal": "*",
+                "Action": "s3:GetObject",
+                "Resource": bucket_wildcard_resource(bucket),
+                "Condition": {
+                    operator: {
+                        "aws:SourceIp": cidr
+                    }
+                }
+            }
+        ],
+    })
+    .to_string()
 }
 
 fn alt_policy_principal() -> serde_json::Value {
@@ -1017,25 +1099,14 @@ fn test_get_bucket_policy_status_nonpublic_ipv4_slash_8_bucket_policy() {
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = create_bucket_allowing_public_policy(client).await;
-        let policy = json!({
-            "Version": "2012-10-17",
-            "Statement": [{
-                "Effect": "Allow",
-                "Principal": "*",
-                "Action": "s3:ListBucket",
-                "Resource": bucket_resource(&bucket),
-                "Condition": {
-                    "IpAddress": {
-                        "aws:SourceIp": "11.0.0.0/8"
-                    }
-                }
-            }],
-        })
-        .to_string();
         client
             .put_bucket_policy()
             .bucket(&bucket)
-            .policy(policy)
+            .policy(source_ip_list_bucket_policy(
+                &bucket,
+                "IpAddress",
+                "11.0.0.0/8",
+            ))
             .send()
             .await
             .unwrap();
@@ -1043,6 +1114,40 @@ fn test_get_bucket_policy_status_nonpublic_ipv4_slash_8_bucket_policy() {
         assert!(!bucket_policy_status_is_public(client, &bucket).await);
 
         cleanup(&bucket, &[]).await;
+    });
+}
+
+#[test]
+fn test_get_bucket_policy_status_qualified_source_ip_operator_classification() {
+    s3_tests::run(async {
+        let client = CTX.client();
+
+        for (operator, expected_public) in [
+            ("IpAddressIfExists", true),
+            ("ForAllValues:IpAddress", true),
+            ("ForAnyValue:IpAddress", false),
+        ] {
+            let bucket = create_bucket_allowing_public_policy(client).await;
+            client
+                .put_bucket_policy()
+                .bucket(&bucket)
+                .policy(source_ip_list_bucket_policy(
+                    &bucket,
+                    operator,
+                    "10.0.0.0/8",
+                ))
+                .send()
+                .await
+                .unwrap();
+
+            assert_eq!(
+                bucket_policy_status_is_public(client, &bucket).await,
+                expected_public,
+                "{operator} public-policy classification"
+            );
+
+            cleanup(&bucket, &[]).await;
+        }
     });
 }
 
@@ -1077,6 +1182,221 @@ fn test_get_bucket_policy_status_public_ipv6_ula_bucket_policy() {
         assert!(bucket_policy_status_is_public(client, &bucket).await);
 
         cleanup(&bucket, &[]).await;
+    });
+}
+
+#[test]
+fn test_bucket_policy_source_ip_for_any_value_ip_address_allows_matching_ipv4_client() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = create_bucket_allowing_public_policy(client).await;
+        let key = "source-ip-for-any-value-ip-address-allow";
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key(key)
+            .body(ByteStream::from_static(b"source-ip-for-any-allow"))
+            .send()
+            .await
+            .unwrap();
+
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(source_ip_get_object_policy(
+                &bucket,
+                "ForAnyValue:IpAddress",
+                "0.0.0.0/0",
+            ))
+            .send()
+            .await
+            .unwrap();
+
+        let url = object_url(CTX.endpoint(), &bucket, key, None);
+        let body = anonymous_get_object_status_eventually(&url, 200).await;
+        assert_eq!(body, "source-ip-for-any-allow");
+
+        cleanup(&bucket, &[key]).await;
+    });
+}
+
+#[test]
+fn test_bucket_policy_source_ip_ip_address_denies_nonmatching_ipv4_subnet() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = create_bucket_allowing_public_policy(client).await;
+        let key = "source-ip-ip-address-subnet-deny";
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key(key)
+            .body(ByteStream::from_static(b"source-ip-subnet-deny"))
+            .send()
+            .await
+            .unwrap();
+
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(source_ip_get_object_policy(
+                &bucket,
+                "IpAddress",
+                "192.0.2.0/24",
+            ))
+            .send()
+            .await
+            .unwrap();
+
+        let url = object_url(CTX.endpoint(), &bucket, key, None);
+        let body = anonymous_get_object_status_eventually(&url, 403).await;
+        assert!(
+            body.contains("<Code>AccessDenied</Code>"),
+            "expected AccessDenied body: {body}"
+        );
+
+        cleanup(&bucket, &[key]).await;
+    });
+}
+
+#[test]
+fn test_bucket_policy_source_ip_ip_address_allows_matching_ipv4_client() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = create_bucket_allowing_public_policy(client).await;
+        let key = "source-ip-ip-address-allow";
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key(key)
+            .body(ByteStream::from_static(b"source-ip-allow"))
+            .send()
+            .await
+            .unwrap();
+
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(source_ip_get_object_policy(
+                &bucket,
+                "IpAddress",
+                "0.0.0.0/0",
+            ))
+            .send()
+            .await
+            .unwrap();
+
+        let url = object_url(CTX.endpoint(), &bucket, key, None);
+        let body = anonymous_get_object_status_eventually(&url, 200).await;
+        assert_eq!(body, "source-ip-allow");
+
+        cleanup(&bucket, &[key]).await;
+    });
+}
+
+#[test]
+fn test_bucket_policy_source_ip_ip_address_denies_nonmatching_ipv4_client() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = create_bucket_allowing_public_policy(client).await;
+        let key = "source-ip-ip-address-deny";
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key(key)
+            .body(ByteStream::from_static(b"source-ip-deny"))
+            .send()
+            .await
+            .unwrap();
+
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(source_ip_get_object_policy(&bucket, "IpAddress", "::/0"))
+            .send()
+            .await
+            .unwrap();
+
+        let url = object_url(CTX.endpoint(), &bucket, key, None);
+        let body = anonymous_get_object_status_eventually(&url, 403).await;
+        assert!(
+            body.contains("<Code>AccessDenied</Code>"),
+            "expected AccessDenied body: {body}"
+        );
+
+        cleanup(&bucket, &[key]).await;
+    });
+}
+
+#[test]
+fn test_bucket_policy_source_ip_not_ip_address_denies_matching_ipv4_client() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = create_bucket_allowing_public_policy(client).await;
+        let key = "source-ip-not-ip-address-deny";
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key(key)
+            .body(ByteStream::from_static(b"not-ip-deny"))
+            .send()
+            .await
+            .unwrap();
+
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(source_ip_get_object_allow_with_deny_policy(
+                &bucket,
+                "NotIpAddress",
+                "::/0",
+            ))
+            .send()
+            .await
+            .unwrap();
+
+        let url = object_url(CTX.endpoint(), &bucket, key, None);
+        let body = anonymous_get_object_status_eventually(&url, 403).await;
+        assert!(
+            body.contains("<Code>AccessDenied</Code>"),
+            "expected AccessDenied body: {body}"
+        );
+
+        cleanup(&bucket, &[key]).await;
+    });
+}
+
+#[test]
+fn test_bucket_policy_source_ip_not_ip_address_allows_nonmatching_ipv4_client() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = create_bucket_allowing_public_policy(client).await;
+        let key = "source-ip-not-ip-address-allow";
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key(key)
+            .body(ByteStream::from_static(b"not-ip-allow"))
+            .send()
+            .await
+            .unwrap();
+
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(source_ip_get_object_allow_with_deny_policy(
+                &bucket,
+                "NotIpAddress",
+                "0.0.0.0/0",
+            ))
+            .send()
+            .await
+            .unwrap();
+
+        let url = object_url(CTX.endpoint(), &bucket, key, None);
+        let body = anonymous_get_object_status_eventually(&url, 200).await;
+        assert_eq!(body, "not-ip-allow");
+
+        cleanup(&bucket, &[key]).await;
     });
 }
 
@@ -15852,6 +16172,19 @@ fn test_put_bucket_policy_malformed_response_shapes() {
                 ),
             ),
             expected_error::malformed_policy("Invalid policy syntax."),
+        );
+        assert_malformed(
+            "PutBucketPolicy invalid SourceIp operand",
+            &raw_put_policy(
+                &bucket,
+                &format!(
+                    "{{\"Version\":\"2012-10-17\",\"Statement\":[{{\"Effect\":\"Allow\",\
+                     \"Principal\":\"*\",\"Action\":\"s3:GetObject\",\
+                     \"Resource\":\"arn:aws:s3:::{bucket}/*\",\
+                     \"Condition\":{{\"IpAddress\":{{\"aws:SourceIp\":\"not-an-ip\"}}}}}}]}}"
+                ),
+            ),
+            expected_error::malformed_policy("Invalid IP address in Conditions"),
         );
         assert_malformed(
             "PutBucketPolicy invalid principal",

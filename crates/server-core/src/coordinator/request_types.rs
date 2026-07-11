@@ -415,6 +415,7 @@ pub(super) enum AuthorizedWriteTags<'a> {
 pub struct Requester {
     pub(super) account: Option<AccountIdentity>,
     pub(super) authorization_profile: auth::AuthorizationProfile,
+    pub(super) source_ip: Option<std::net::IpAddr>,
 }
 
 /// Parsed x-amz-acl value relevant to PutObject authorization rules.
@@ -1193,6 +1194,7 @@ impl Requester {
         Self {
             account: auth.account.clone(),
             authorization_profile: auth.authorization_profile,
+            source_ip: None,
         }
     }
 
@@ -1202,6 +1204,7 @@ impl Requester {
         Self {
             account: None,
             authorization_profile: auth::AuthorizationProfile::Standard,
+            source_ip: None,
         }
     }
 
@@ -1211,6 +1214,7 @@ impl Requester {
         Self {
             account: Some(account),
             authorization_profile: auth::AuthorizationProfile::Standard,
+            source_ip: None,
         }
     }
 
@@ -1220,6 +1224,7 @@ impl Requester {
         Self {
             account: account.cloned(),
             authorization_profile: auth::AuthorizationProfile::Standard,
+            source_ip: None,
         }
     }
 
@@ -1229,7 +1234,19 @@ impl Requester {
         Self {
             account: Some(account),
             authorization_profile: auth::AuthorizationProfile::OwnerAccountAdmin,
+            source_ip: None,
         }
+    }
+
+    #[must_use]
+    pub const fn with_source_ip(mut self, source_ip: Option<std::net::IpAddr>) -> Self {
+        self.source_ip = source_ip;
+        self
+    }
+
+    #[must_use]
+    pub const fn source_ip(&self) -> Option<std::net::IpAddr> {
+        self.source_ip
     }
 
     #[must_use]
@@ -1238,6 +1255,7 @@ impl Requester {
         Self {
             account: account.cloned(),
             authorization_profile: auth::AuthorizationProfile::OwnerAccountAdmin,
+            source_ip: None,
         }
     }
 
@@ -1250,6 +1268,7 @@ impl Requester {
         Self {
             account: Some(account),
             authorization_profile,
+            source_ip: None,
         }
     }
 
@@ -1262,6 +1281,7 @@ impl Requester {
         Self {
             account: account.cloned(),
             authorization_profile,
+            source_ip: None,
         }
     }
 

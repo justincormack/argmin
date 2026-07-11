@@ -25,6 +25,7 @@ use super::{
 pub(super) enum ResolvedValue<'a> {
     Present(&'a str),
     PresentValues(Vec<&'a str>),
+    SourceIp(std::net::IpAddr),
     Absent,
     Unavailable,
 }
@@ -39,6 +40,7 @@ pub(super) enum ResolvedValue<'a> {
 pub(super) enum OperatorSupport {
     AnyEvaluable,
     BoolOnly,
+    IpOnly,
     StringOrNumeric,
     StringEqualsOnly,
 }
@@ -75,6 +77,7 @@ pub(super) enum ConditionInput {
     ExistingObject,
     Request,
     Bucket,
+    SourceIp,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -136,6 +139,14 @@ pub(super) const CONDITION_KEYS: &[ConditionKeyResolver] = &[
         resolve: resolve_bucket_tag,
         evaluable_for_action: None,
         supported_for_action: Some(bucket_tag_supported_for_action),
+    },
+    ConditionKeyResolver {
+        key: KeyMatch::Exact("aws:SourceIp"),
+        operator_support: OperatorSupport::IpOnly,
+        input: Some(ConditionInput::SourceIp),
+        resolve: resolve_source_ip,
+        evaluable_for_action: None,
+        supported_for_action: None,
     },
     ConditionKeyResolver {
         key: KeyMatch::Prefix("s3:RequestObjectTag/"),
@@ -369,6 +380,13 @@ fn resolve_bucket_tag<'a>(request: &PolicyRequest<'a>, param: &str) -> ResolvedV
         BucketTagValue::Unavailable => ResolvedValue::Unavailable,
         BucketTagValue::Available(Some(value)) => ResolvedValue::Present(value),
         BucketTagValue::Available(None) => ResolvedValue::Absent,
+    }
+}
+
+fn resolve_source_ip<'a>(request: &PolicyRequest<'a>, _param: &str) -> ResolvedValue<'a> {
+    match request.source_ip() {
+        Some(source_ip) => ResolvedValue::SourceIp(source_ip),
+        None => ResolvedValue::Unavailable,
     }
 }
 
@@ -719,6 +737,7 @@ pub(super) fn evaluate_clause(
     let actual = match (resolver.resolve)(request, param) {
         ResolvedValue::Present(value) => ActualValue::Present(value),
         ResolvedValue::PresentValues(values) => ActualValue::PresentValues(values),
+        ResolvedValue::SourceIp(source_ip) => ActualValue::SourceIp(source_ip),
         ResolvedValue::Absent => ActualValue::Absent,
         ResolvedValue::Unavailable => return ConditionMatchResult::InputUnavailable,
     };
@@ -740,6 +759,9 @@ fn operator_supported_for_key(operator: &str, support: OperatorSupport) -> bool 
             matches!(operator, "StringEquals" | "StringEqualsIfExists")
         }
         OperatorSupport::BoolOnly => operator == "Bool",
+        OperatorSupport::IpOnly => condition_op::lookup(operator).is_some_and(|op| {
+            op.evaluable_on_evaluable_object_actions && condition_op::is_ip_condition_kind(op.kind)
+        }),
     }
 }
 

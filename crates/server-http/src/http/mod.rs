@@ -1160,8 +1160,11 @@ impl HttpFrontend {
         }
     }
 
-    fn requester_from_auth(auth: &AuthContext) -> crate::coordinator::Requester {
-        crate::coordinator::Requester::from_auth(auth)
+    fn requester_from_auth(
+        auth: &AuthContext,
+        source_ip: Option<std::net::IpAddr>,
+    ) -> crate::coordinator::Requester {
+        crate::coordinator::Requester::from_auth(auth).with_source_ip(source_ip)
     }
 
     fn authenticated_account(
@@ -1275,7 +1278,7 @@ impl HttpFrontend {
                 let account_id = required_account_id(req)?;
                 let bucket = parse_bucket_resource_arn(&resource_arn)?;
                 let tags = xml::TagSet::parse_tag_resource_xml(&req.body)?;
-                let requester = Self::requester_from_auth(auth);
+                let requester = Self::requester_from_auth(auth, req.source_ip());
                 let control = crate::coordinator::BucketTagControlRequest {
                     bucket: bucket_request(&bucket, requester, expected_bucket_owner)?,
                     account_id,
@@ -1314,7 +1317,7 @@ impl HttpFrontend {
                     .iter()
                     .map(|key| (key.clone(), String::new()))
                     .collect::<Vec<_>>();
-                let requester = Self::requester_from_auth(auth);
+                let requester = Self::requester_from_auth(auth, req.source_ip());
                 let control = crate::coordinator::BucketTagControlRequest {
                     bucket: bucket_request(&bucket, requester, expected_bucket_owner)?,
                     account_id,
@@ -1350,7 +1353,7 @@ impl HttpFrontend {
                 Ok(S3Response::untag_resource())
             }
             S3Operation::ListBuckets => {
-                let requester = Self::requester_from_auth(auth);
+                let requester = Self::requester_from_auth(auth, req.source_ip());
                 let owner_account = Self::authenticated_account(auth)?;
                 let prefix = req.query_param_lossy("prefix");
                 let mut buckets = self
@@ -1373,7 +1376,7 @@ impl HttpFrontend {
                 )?;
                 let namespace = parse_bucket_namespace(req)?;
                 let ownership = parse_bucket_ownership(req.header("x-amz-object-ownership"))?;
-                let requester = Self::requester_from_auth(auth);
+                let requester = Self::requester_from_auth(auth, req.source_ip());
                 self.coordinator
                     .create_bucket(&crate::coordinator::CreateBucketRequest {
                         name: bucket.clone(),
@@ -1386,7 +1389,7 @@ impl HttpFrontend {
                 Ok(S3Response::create_bucket(bucket.as_str()))
             }
             S3Operation::DeleteBucket { bucket } => {
-                let requester = Self::requester_from_auth(auth);
+                let requester = Self::requester_from_auth(auth, req.source_ip());
                 self.coordinator.delete_bucket(&bucket_request(
                     &bucket,
                     requester,
@@ -1395,7 +1398,7 @@ impl HttpFrontend {
                 Ok(S3Response::delete_bucket())
             }
             S3Operation::HeadBucket { bucket } => {
-                let requester = Self::requester_from_auth(auth);
+                let requester = Self::requester_from_auth(auth, req.source_ip());
                 let info = self.coordinator.head_bucket(&bucket_request(
                     &bucket,
                     requester,
@@ -1404,7 +1407,7 @@ impl HttpFrontend {
                 Ok(S3Response::head_bucket(&info, self.coordinator.region()))
             }
             S3Operation::GetBucketLocation { bucket } => {
-                let requester = Self::requester_from_auth(auth);
+                let requester = Self::requester_from_auth(auth, req.source_ip());
                 self.coordinator.get_bucket_location(&bucket_request(
                     &bucket,
                     requester,
@@ -1429,7 +1432,7 @@ impl HttpFrontend {
                     .as_deref()
                     .map(|value| parse_requested_max_keys(Some(value)))
                     .transpose()?;
-                let requester = Self::requester_from_auth(auth);
+                let requester = Self::requester_from_auth(auth, req.source_ip());
 
                 let result = self.coordinator.list_objects_v2(
                     &crate::coordinator::ListObjectsV2Request {
@@ -1486,7 +1489,7 @@ impl HttpFrontend {
                     .as_deref()
                     .map(|value| parse_requested_max_keys(Some(value)))
                     .transpose()?;
-                let requester = Self::requester_from_auth(auth);
+                let requester = Self::requester_from_auth(auth, req.source_ip());
 
                 let result = self.coordinator.list_objects_v2(
                     &crate::coordinator::ListObjectsV2Request {
@@ -1517,7 +1520,7 @@ impl HttpFrontend {
                     // CopyObject path
                     let (src_bucket, src_key, src_version_id) =
                         parse_copy_source_header(copy_source)?;
-                    let requester = Self::requester_from_auth(auth);
+                    let requester = Self::requester_from_auth(auth, req.source_ip());
                     let source_sse_customer = parse_sse_customer_copy_source_request(req)?;
                     let dst_sse_customer = parse_sse_customer_request(req)?;
                     let destination_managed_encryption =
@@ -1659,7 +1662,7 @@ impl HttpFrontend {
                     let (metadata_blob, system_metadata) =
                         parse_put_object_request_metadata(request_headers.iter().copied())?;
                     let cond = write_condition_from_headers(req)?;
-                    let requester = Self::requester_from_auth(auth);
+                    let requester = Self::requester_from_auth(auth, req.source_ip());
                     let acl = parse_put_object_write_acl(req)?;
                     let policy_context = put_object_policy_context_from_request(
                         req,
@@ -1712,7 +1715,7 @@ impl HttpFrontend {
                 let sse_customer = parse_sse_customer_request(req)?;
                 let cond = read_condition_from_headers(req);
                 let vid = parse_version_id(req)?;
-                let requester = Self::requester_from_auth(auth);
+                let requester = Self::requester_from_auth(auth, req.source_ip());
                 #[cfg(feature = "deep-tracing")]
                 let trace = current_trace_context();
                 if let Some(pn_str) = req.query_param_lossy("partNumber") {
@@ -1844,7 +1847,7 @@ impl HttpFrontend {
                                 .to_string(),
                     });
                 }
-                let requester = Self::requester_from_auth(auth);
+                let requester = Self::requester_from_auth(auth, req.source_ip());
                 let result =
                     self.coordinator
                         .delete_object(&crate::coordinator::DeleteObjectRequest {
@@ -1868,7 +1871,7 @@ impl HttpFrontend {
                 let sse_customer = parse_sse_customer_request(req)?;
                 let cond = read_condition_from_headers(req);
                 let vid = parse_version_id(req)?;
-                let requester = Self::requester_from_auth(auth);
+                let requester = Self::requester_from_auth(auth, req.source_ip());
                 #[cfg(feature = "deep-tracing")]
                 let trace = current_trace_context();
                 if let Some(pn_str) = req.query_param_lossy("partNumber") {
@@ -1970,7 +1973,7 @@ impl HttpFrontend {
 
                 let cond = read_condition_from_headers(req);
                 let vid = parse_version_id(req)?;
-                let requester_ctx = Self::requester_from_auth(auth);
+                let requester_ctx = Self::requester_from_auth(auth, req.source_ip());
                 let result = self.coordinator.get_object_attributes(
                     &crate::coordinator::GetObjectAttributesRequest {
                         object: object_version_request(
@@ -2011,7 +2014,7 @@ impl HttpFrontend {
                 )?;
                 let bypass_governance = parse_bypass_governance_retention(req);
                 let (xml_entries, quiet) = xml::parse_delete_objects_xml(&req.body)?;
-                let requester = Self::requester_from_auth(auth);
+                let requester = Self::requester_from_auth(auth, req.source_ip());
                 let mut entries: Vec<crate::coordinator::DeleteEntry> = Vec::new();
                 let mut validation_errors: Vec<crate::coordinator::DeleteError> = Vec::new();
                 for e in &xml_entries {
@@ -2081,7 +2084,7 @@ impl HttpFrontend {
             S3Operation::PutBucketVersioning { bucket } => {
                 validate_request_checksum_headers(req, true, false, true)?;
                 let versioning_state = xml::parse_versioning_config_xml(&req.body)?;
-                let requester = Self::requester_from_auth(auth);
+                let requester = Self::requester_from_auth(auth, req.source_ip());
                 self.coordinator.put_bucket_versioning(
                     &crate::coordinator::PutBucketVersioningRequest {
                         bucket: bucket_request(&bucket, requester, expected_bucket_owner)?,
@@ -2091,7 +2094,7 @@ impl HttpFrontend {
                 Ok(S3Response::put_bucket_versioning())
             }
             S3Operation::GetBucketVersioning { bucket } => {
-                let requester = Self::requester_from_auth(auth);
+                let requester = Self::requester_from_auth(auth, req.source_ip());
                 let state = self.coordinator.get_bucket_versioning(&bucket_request(
                     &bucket,
                     requester,
@@ -2105,7 +2108,7 @@ impl HttpFrontend {
                     RequestChecksumRequirement::ContentMd5OrChecksumHeader,
                 )?;
                 let config = xml::parse_bucket_object_lock_configuration_xml(&req.body)?;
-                let requester = Self::requester_from_auth(auth);
+                let requester = Self::requester_from_auth(auth, req.source_ip());
                 self.coordinator.put_bucket_object_lock_configuration(
                     &crate::coordinator::PutBucketObjectLockConfigurationRequest {
                         bucket: bucket_request(&bucket, requester, expected_bucket_owner)?,
@@ -2115,7 +2118,7 @@ impl HttpFrontend {
                 Ok(S3Response::put_bucket_object_lock_configuration())
             }
             S3Operation::GetBucketObjectLockConfiguration { bucket } => {
-                let requester = Self::requester_from_auth(auth);
+                let requester = Self::requester_from_auth(auth, req.source_ip());
                 let config =
                     self.coordinator
                         .get_bucket_object_lock_configuration(&bucket_request(
@@ -2128,7 +2131,7 @@ impl HttpFrontend {
             S3Operation::PutBucketEncryption { bucket } => {
                 validate_request_checksum_headers(req, true, false, true)?;
                 let config = xml::parse_bucket_encryption_xml(&req.body)?;
-                let requester = Self::requester_from_auth(auth);
+                let requester = Self::requester_from_auth(auth, req.source_ip());
                 self.coordinator.put_bucket_encryption(
                     &crate::coordinator::PutBucketEncryptionRequest {
                         bucket: bucket_request(&bucket, requester, expected_bucket_owner)?,
@@ -2138,7 +2141,7 @@ impl HttpFrontend {
                 Ok(S3Response::put_bucket_encryption())
             }
             S3Operation::GetBucketEncryption { bucket } => {
-                let requester = Self::requester_from_auth(auth);
+                let requester = Self::requester_from_auth(auth, req.source_ip());
                 let config = self.coordinator.get_bucket_encryption(&bucket_request(
                     &bucket,
                     requester,
@@ -2147,7 +2150,7 @@ impl HttpFrontend {
                 Ok(S3Response::get_bucket_encryption(config))
             }
             S3Operation::DeleteBucketEncryption { bucket } => {
-                let requester = Self::requester_from_auth(auth);
+                let requester = Self::requester_from_auth(auth, req.source_ip());
                 self.coordinator.delete_bucket_encryption(&bucket_request(
                     &bucket,
                     requester,
@@ -2169,7 +2172,7 @@ impl HttpFrontend {
                 )?;
                 let config = xml::parse_cors_config_xml(&req.body)?;
                 let config_xml = xml::get_cors_config_xml(&config);
-                let requester = Self::requester_from_auth(auth);
+                let requester = Self::requester_from_auth(auth, req.source_ip());
                 self.coordinator
                     .put_bucket_cors(&crate::coordinator::PutBucketConfigRequest {
                         bucket: bucket_request(&bucket, requester, expected_bucket_owner)?,
@@ -2178,7 +2181,7 @@ impl HttpFrontend {
                 Ok(S3Response::put_bucket_cors())
             }
             S3Operation::GetBucketCors { bucket } => {
-                let requester = Self::requester_from_auth(auth);
+                let requester = Self::requester_from_auth(auth, req.source_ip());
                 match self.coordinator.get_bucket_cors(&bucket_request(
                     &bucket,
                     requester,
@@ -2191,7 +2194,7 @@ impl HttpFrontend {
                 }
             }
             S3Operation::DeleteBucketCors { bucket } => {
-                let requester = Self::requester_from_auth(auth);
+                let requester = Self::requester_from_auth(auth, req.source_ip());
                 self.coordinator.delete_bucket_cors(&bucket_request(
                     &bucket,
                     requester,
@@ -2206,7 +2209,7 @@ impl HttpFrontend {
                 )?;
                 let tags = xml::TagSet::parse_tagging_xml(&req.body, 50)?;
                 let tags_xml = tags.to_xml();
-                let requester = Self::requester_from_auth(auth);
+                let requester = Self::requester_from_auth(auth, req.source_ip());
                 self.coordinator
                     .put_bucket_tags(&crate::coordinator::PutBucketConfigRequest {
                         bucket: bucket_request(&bucket, requester, expected_bucket_owner)?,
@@ -2215,7 +2218,7 @@ impl HttpFrontend {
                 Ok(S3Response::put_bucket_tagging())
             }
             S3Operation::GetBucketTagging { bucket } => {
-                let requester = Self::requester_from_auth(auth);
+                let requester = Self::requester_from_auth(auth, req.source_ip());
                 match self.coordinator.get_bucket_tags(&bucket_request(
                     &bucket,
                     requester,
@@ -2228,7 +2231,7 @@ impl HttpFrontend {
                 }
             }
             S3Operation::DeleteBucketTagging { bucket } => {
-                let requester = Self::requester_from_auth(auth);
+                let requester = Self::requester_from_auth(auth, req.source_ip());
                 self.coordinator.delete_bucket_tags(&bucket_request(
                     &bucket,
                     requester,
@@ -2242,7 +2245,7 @@ impl HttpFrontend {
                     RequestChecksumRequirement::ContentMd5OrChecksumHeader,
                 )?;
                 let enabled = xml::parse_bucket_abac_xml(&req.body)?;
-                let requester = Self::requester_from_auth(auth);
+                let requester = Self::requester_from_auth(auth, req.source_ip());
                 self.coordinator
                     .put_bucket_abac(&crate::coordinator::PutBucketAbacRequest {
                         bucket: bucket_request(&bucket, requester, expected_bucket_owner)?,
@@ -2251,7 +2254,7 @@ impl HttpFrontend {
                 Ok(S3Response::put_bucket_abac())
             }
             S3Operation::GetBucketAbac { bucket } => {
-                let requester = Self::requester_from_auth(auth);
+                let requester = Self::requester_from_auth(auth, req.source_ip());
                 let enabled = self.coordinator.get_bucket_abac(&bucket_request(
                     &bucket,
                     requester,
@@ -2267,7 +2270,7 @@ impl HttpFrontend {
                     xml::parse_bucket_lifecycle_configuration_xml(&req.body)?,
                 )?;
                 let config_xml = xml::get_bucket_lifecycle_configuration_xml(&config);
-                let requester = Self::requester_from_auth(auth);
+                let requester = Self::requester_from_auth(auth, req.source_ip());
                 self.coordinator.put_bucket_lifecycle(
                     &crate::coordinator::PutBucketConfigRequest {
                         bucket: bucket_request(&bucket, requester, expected_bucket_owner)?,
@@ -2277,7 +2280,7 @@ impl HttpFrontend {
                 Ok(S3Response::put_bucket_lifecycle())
             }
             S3Operation::GetBucketLifecycle { bucket } => {
-                let requester = Self::requester_from_auth(auth);
+                let requester = Self::requester_from_auth(auth, req.source_ip());
                 match self.coordinator.get_bucket_lifecycle(&bucket_request(
                     &bucket,
                     requester,
@@ -2290,7 +2293,7 @@ impl HttpFrontend {
                 }
             }
             S3Operation::DeleteBucketLifecycle { bucket } => {
-                let requester = Self::requester_from_auth(auth);
+                let requester = Self::requester_from_auth(auth, req.source_ip());
                 self.coordinator.delete_bucket_lifecycle(&bucket_request(
                     &bucket,
                     requester,
@@ -2308,7 +2311,7 @@ impl HttpFrontend {
                 let bypass_governance = req
                     .header("x-amz-bypass-governance-retention")
                     .is_some_and(|value| value.eq_ignore_ascii_case("true"));
-                let requester = Self::requester_from_auth(auth);
+                let requester = Self::requester_from_auth(auth, req.source_ip());
                 let version_id = self.coordinator.put_object_retention(
                     &crate::coordinator::PutObjectRetentionRequest {
                         object: object_version_request(
@@ -2326,7 +2329,7 @@ impl HttpFrontend {
             }
             S3Operation::GetObjectRetention { bucket, key } => {
                 let vid = parse_version_id(req)?;
-                let requester = Self::requester_from_auth(auth);
+                let requester = Self::requester_from_auth(auth, req.source_ip());
                 let retention = self
                     .coordinator
                     .get_object_retention(&object_version_request(
@@ -2345,7 +2348,7 @@ impl HttpFrontend {
                 )?;
                 let vid = parse_version_id(req)?;
                 let legal_hold = xml::parse_object_legal_hold_xml(&req.body)?;
-                let requester = Self::requester_from_auth(auth);
+                let requester = Self::requester_from_auth(auth, req.source_ip());
                 let version_id = self.coordinator.put_object_legal_hold(
                     &crate::coordinator::PutObjectLegalHoldRequest {
                         object: object_version_request(
@@ -2362,7 +2365,7 @@ impl HttpFrontend {
             }
             S3Operation::GetObjectLegalHold { bucket, key } => {
                 let vid = parse_version_id(req)?;
-                let requester = Self::requester_from_auth(auth);
+                let requester = Self::requester_from_auth(auth, req.source_ip());
                 let legal_hold =
                     self.coordinator
                         .get_object_legal_hold(&object_version_request(
@@ -2379,7 +2382,7 @@ impl HttpFrontend {
                 let vid = parse_version_id(req)?;
                 let tags = xml::TagSet::parse_tagging_xml(&req.body, 10)?;
                 let tags_xml = tags.to_xml();
-                let requester = Self::requester_from_auth(auth);
+                let requester = Self::requester_from_auth(auth, req.source_ip());
                 self.coordinator
                     .put_object_tags(&crate::coordinator::PutObjectTagsRequest {
                         object: object_version_request(
@@ -2395,7 +2398,7 @@ impl HttpFrontend {
             }
             S3Operation::GetObjectTagging { bucket, key } => {
                 let vid = parse_version_id(req)?;
-                let requester = Self::requester_from_auth(auth);
+                let requester = Self::requester_from_auth(auth, req.source_ip());
                 if let Some(tags_xml) = self.coordinator.get_object_tags(
                     &object_version_request(&bucket, &key, vid, requester, expected_bucket_owner)?,
                 )? {
@@ -2410,7 +2413,7 @@ impl HttpFrontend {
             }
             S3Operation::DeleteObjectTagging { bucket, key } => {
                 let vid = parse_version_id(req)?;
-                let requester = Self::requester_from_auth(auth);
+                let requester = Self::requester_from_auth(auth, req.source_ip());
                 self.coordinator
                     .delete_object_tags(&object_version_request(
                         &bucket,
@@ -2423,7 +2426,7 @@ impl HttpFrontend {
             }
             S3Operation::GetObjectAcl { bucket, key } => {
                 let version_id = parse_version_id(req)?;
-                let requester = Self::requester_from_auth(auth);
+                let requester = Self::requester_from_auth(auth, req.source_ip());
                 let result = self.coordinator.get_object_acl(&object_version_request(
                     &bucket,
                     &key,
@@ -2445,7 +2448,7 @@ impl HttpFrontend {
             S3Operation::PutObjectAcl { bucket, key } => {
                 validate_request_checksum_headers(req, true, false, true)?;
                 let version_id = parse_version_id(req)?;
-                let requester = Self::requester_from_auth(auth);
+                let requester = Self::requester_from_auth(auth, req.source_ip());
                 let result_version_id = if req.header("x-amz-acl").is_some() {
                     if !req.body.is_empty() {
                         return Err(ServerError::InvalidArgument {
@@ -2496,7 +2499,7 @@ impl HttpFrontend {
             S3Operation::PutBucketPublicAccessBlock { bucket } => {
                 validate_request_checksum_headers(req, true, false, true)?;
                 let config = xml::parse_public_access_block_xml(&req.body)?;
-                let requester = Self::requester_from_auth(auth);
+                let requester = Self::requester_from_auth(auth, req.source_ip());
                 self.coordinator.put_bucket_public_access_block(
                     &crate::coordinator::PutBucketPublicAccessBlockRequest {
                         bucket: bucket_request(&bucket, requester, expected_bucket_owner)?,
@@ -2506,7 +2509,7 @@ impl HttpFrontend {
                 Ok(S3Response::put_bucket_public_access_block())
             }
             S3Operation::GetBucketPublicAccessBlock { bucket } => {
-                let requester = Self::requester_from_auth(auth);
+                let requester = Self::requester_from_auth(auth, req.source_ip());
                 match self
                     .coordinator
                     .get_bucket_public_access_block(&bucket_request(
@@ -2523,7 +2526,7 @@ impl HttpFrontend {
                 }
             }
             S3Operation::DeleteBucketPublicAccessBlock { bucket } => {
-                let requester = Self::requester_from_auth(auth);
+                let requester = Self::requester_from_auth(auth, req.source_ip());
                 self.coordinator
                     .delete_bucket_public_access_block(&bucket_request(
                         &bucket,
@@ -2535,7 +2538,7 @@ impl HttpFrontend {
             S3Operation::PutBucketOwnershipControls { bucket } => {
                 validate_request_checksum_headers(req, true, false, true)?;
                 let value = xml::parse_ownership_controls_xml(&req.body)?;
-                let requester = Self::requester_from_auth(auth);
+                let requester = Self::requester_from_auth(auth, req.source_ip());
                 self.coordinator.put_bucket_ownership_controls(
                     &crate::coordinator::PutBucketOwnershipControlsRequest {
                         bucket: bucket_request(&bucket, requester, expected_bucket_owner)?,
@@ -2545,7 +2548,7 @@ impl HttpFrontend {
                 Ok(S3Response::put_bucket_ownership_controls())
             }
             S3Operation::GetBucketOwnershipControls { bucket } => {
-                let requester = Self::requester_from_auth(auth);
+                let requester = Self::requester_from_auth(auth, req.source_ip());
                 match self
                     .coordinator
                     .get_bucket_ownership_controls(&bucket_request(
@@ -2562,7 +2565,7 @@ impl HttpFrontend {
                 }
             }
             S3Operation::DeleteBucketOwnershipControls { bucket } => {
-                let requester = Self::requester_from_auth(auth);
+                let requester = Self::requester_from_auth(auth, req.source_ip());
                 self.coordinator
                     .delete_bucket_ownership_controls(&bucket_request(
                         &bucket,
@@ -2585,7 +2588,7 @@ impl HttpFrontend {
                                 .expect("S3Request stores only validated UTF-8")
                         }),
                 )?;
-                let requester = Self::requester_from_auth(auth);
+                let requester = Self::requester_from_auth(auth, req.source_ip());
                 self.coordinator.put_bucket_policy(
                     &crate::coordinator::PutBucketPolicyRequest {
                         bucket: bucket_request(&bucket, requester, expected_bucket_owner)?,
@@ -2596,7 +2599,7 @@ impl HttpFrontend {
                 Ok(S3Response::put_bucket_policy())
             }
             S3Operation::GetBucketPolicy { bucket } => {
-                let requester = Self::requester_from_auth(auth);
+                let requester = Self::requester_from_auth(auth, req.source_ip());
                 match self.coordinator.get_bucket_policy(&bucket_request(
                     &bucket,
                     requester,
@@ -2609,7 +2612,7 @@ impl HttpFrontend {
                 }
             }
             S3Operation::GetBucketPolicyStatus { bucket } => {
-                let requester = Self::requester_from_auth(auth);
+                let requester = Self::requester_from_auth(auth, req.source_ip());
                 let is_public = self.coordinator.get_bucket_policy_status(&bucket_request(
                     &bucket,
                     requester,
@@ -2618,7 +2621,7 @@ impl HttpFrontend {
                 Ok(S3Response::get_bucket_policy_status(is_public))
             }
             S3Operation::DeleteBucketPolicy { bucket } => {
-                let requester = Self::requester_from_auth(auth);
+                let requester = Self::requester_from_auth(auth, req.source_ip());
                 self.coordinator.delete_bucket_policy(&bucket_request(
                     &bucket,
                     requester,
@@ -2627,7 +2630,7 @@ impl HttpFrontend {
                 Ok(S3Response::delete_bucket_policy())
             }
             S3Operation::GetBucketAcl { bucket } => {
-                let requester = Self::requester_from_auth(auth);
+                let requester = Self::requester_from_auth(auth, req.source_ip());
                 let result = self.coordinator.get_bucket_acl(&bucket_request(
                     &bucket,
                     requester,
@@ -2645,7 +2648,7 @@ impl HttpFrontend {
                 ))
             }
             S3Operation::PutBucketAcl { bucket } => {
-                let requester = Self::requester_from_auth(auth);
+                let requester = Self::requester_from_auth(auth, req.source_ip());
                 let acl = if req.header("x-amz-acl").is_some() {
                     if !req.body.is_empty() {
                         return Err(ServerError::InvalidArgument {
@@ -2755,7 +2758,7 @@ impl HttpFrontend {
                 } else {
                     None
                 };
-                let requester = Self::requester_from_auth(auth);
+                let requester = Self::requester_from_auth(auth, req.source_ip());
                 let acl = parse_put_object_write_acl(req)?;
                 let object_lock = parse_object_lock_headers(req)?;
                 let policy_context = put_object_policy_context_from_request(
@@ -2811,7 +2814,7 @@ impl HttpFrontend {
                 };
 
                 let (src_bucket, src_key, src_version_id) = parse_copy_source_header(copy_source)?;
-                let requester = Self::requester_from_auth(auth);
+                let requester = Self::requester_from_auth(auth, req.source_ip());
                 let source_sse_customer = parse_sse_customer_copy_source_request(req)?;
                 let sse_customer = parse_sse_customer_request(req)?;
                 reject_managed_encryption_read_headers(
@@ -2899,7 +2902,7 @@ impl HttpFrontend {
                     })
                     .transpose()?;
                 let sse_customer = parse_sse_customer_request(req)?;
-                let requester = Self::requester_from_auth(auth);
+                let requester = Self::requester_from_auth(auth, req.source_ip());
                 let result = match self.coordinator.complete_multipart_upload(
                     &crate::coordinator::CompleteMultipartUploadRequest {
                         upload: multipart_object_request(
@@ -2972,7 +2975,7 @@ impl HttpFrontend {
             S3Operation::AbortMultipartUpload { bucket, key } => {
                 let upload_id =
                     parse_required_upload_id(req.query_param_lossy("uploadId").as_deref())?;
-                let requester = Self::requester_from_auth(auth);
+                let requester = Self::requester_from_auth(auth, req.source_ip());
                 self.coordinator
                     .abort_multipart_upload(&multipart_object_request(
                         &bucket,
@@ -2994,7 +2997,7 @@ impl HttpFrontend {
                     req.query_param_lossy("max-uploads"),
                     "invalid max-uploads",
                 )?;
-                let requester = Self::requester_from_auth(auth);
+                let requester = Self::requester_from_auth(auth, req.source_ip());
                 let result = self.coordinator.list_multipart_uploads(
                     &crate::coordinator::ListMultipartUploadsRequest {
                         bucket: bucket_request(&bucket, requester, expected_bucket_owner)?,
@@ -3024,7 +3027,7 @@ impl HttpFrontend {
                 )?;
                 let max_parts =
                     parse_s3_list_limit(req.query_param_lossy("max-parts"), "invalid max-parts")?;
-                let requester = Self::requester_from_auth(auth);
+                let requester = Self::requester_from_auth(auth, req.source_ip());
                 let result =
                     self.coordinator
                         .list_parts(&crate::coordinator::ListPartsRequest {
@@ -3085,7 +3088,7 @@ impl HttpFrontend {
                     .as_deref()
                     .map(|value| parse_requested_max_keys(Some(value)))
                     .transpose()?;
-                let requester = Self::requester_from_auth(auth);
+                let requester = Self::requester_from_auth(auth, req.source_ip());
 
                 let result = self.coordinator.list_object_versions(
                     &crate::coordinator::ListObjectVersionsRequest {
@@ -3612,7 +3615,7 @@ impl HttpFrontend {
             parse_managed_encryption_form_fields(form_fields, sse_customer_request.is_some())?;
         let cond = write_condition_from_headers(req)?;
 
-        let requester = Self::requester_from_auth(effective_auth);
+        let requester = Self::requester_from_auth(effective_auth, req.source_ip());
         let acl = parse_put_object_acl(field("acl"));
         let request_encryption = crate::coordinator::WriteEncryptionRequest::from_request_parts(
             sse_customer_request.as_ref(),
@@ -3974,7 +3977,7 @@ impl HttpFrontend {
 
         let bucket_name = parse_bucket_name(bucket)?;
         let object_key = parse_object_key(key)?;
-        let requester = Self::requester_from_auth(&auth);
+        let requester = Self::requester_from_auth(&auth, req.source_ip());
         let storage_node = self.coordinator.storage_node_for_request();
         let authorized_write = self
             .coordinator
@@ -4255,7 +4258,7 @@ impl HttpFrontend {
         let content_md5 = ContentMd5Claim::from_request(req)?;
         let claimed_checksum = extract_checksum_header(req)?;
         let sse_customer_request = parse_sse_customer_request(req)?;
-        let requester = Self::requester_from_auth(&auth);
+        let requester = Self::requester_from_auth(&auth, req.source_ip());
         let expected_bucket_owner = expected_bucket_owner(req).map(str::to_string);
 
         let mut checksum_response: Vec<(String, String)> = Vec::new();
@@ -11210,7 +11213,7 @@ mod tests {
         data: &[u8],
         checksum_algorithm: Option<ChecksumAlgorithm>,
     ) -> crate::coordinator::UploadPartResult {
-        let requester = HttpFrontend::requester_from_auth(&test_auth());
+        let requester = HttpFrontend::requester_from_auth(&test_auth(), None);
         let bucket_name = test_bucket_name(bucket);
         let upload_id = parse_present_upload_id(upload_id).unwrap();
         let storage_node = fe.coordinator.storage_node_for_request();

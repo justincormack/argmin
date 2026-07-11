@@ -509,6 +509,7 @@ The current implemented evaluator is strongest on:
 
 - `s3:ExistingObjectTag/*`
 - `s3:RequestObjectTag/*`
+- `aws:SourceIp`
 - the supported `s3:x-amz-*` request condition keys already threaded through
   `PolicyRequest`
 
@@ -525,21 +526,27 @@ Current supported condition operators are:
 - `ForAllValues:StringEquals`, `ForAnyValue:StringEquals`
 - `ForAllValues:StringEqualsIgnoreCase`,
   `ForAnyValue:StringEqualsIgnoreCase`
-- `ForAllValues:StringNotEquals`, `ForAnyValue:StringNotEquals`
 - `ForAllValues:StringNotEqualsIgnoreCase`,
   `ForAnyValue:StringNotEqualsIgnoreCase`
 - `ForAllValues:StringLike`, `ForAnyValue:StringLike`
 - `ForAllValues:StringNotLike`, `ForAnyValue:StringNotLike`
+- `NumericEquals`, `NumericEqualsIfExists`
+- `NumericNotEquals`, `NumericNotEqualsIfExists`
+- `NumericLessThan`, `NumericLessThanIfExists`
+- `NumericLessThanEquals`, `NumericLessThanEqualsIfExists`
+- `NumericGreaterThan`, `NumericGreaterThanIfExists`
+- `NumericGreaterThanEquals`, `NumericGreaterThanEqualsIfExists`
+- `IpAddress`, `IpAddressIfExists`
+- `NotIpAddress`, `NotIpAddressIfExists`
+- `ForAllValues:IpAddress`, `ForAnyValue:IpAddress`
+- `ForAllValues:NotIpAddress`, `ForAnyValue:NotIpAddress`
 
 Compared with the IAM condition-operator reference, unsupported operator
 families are:
 
-- numeric operators: `NumericEquals`, `NumericNotEquals`,
-  `NumericLessThan`, `NumericLessThanEquals`, `NumericGreaterThan`,
-  `NumericGreaterThanEquals`, and their applicable set/`IfExists` forms
+- numeric set operators such as `ForAllValues:NumericEquals` and
+  `ForAnyValue:NumericEquals`
 - date operators, including date comparisons and their applicable
-  set/`IfExists` forms
-- IP address operators: `IpAddress`, `NotIpAddress`, and their applicable
   set/`IfExists` forms
 - ARN operators: `ArnEquals`, `ArnLike`, `ArnNotEquals`, `ArnNotLike`, and
   their applicable set/`IfExists` forms

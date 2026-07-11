@@ -132,6 +132,18 @@ pub(super) fn object_policy_request<'a>(
         "bucket policy request for {:?} requires existing object tags",
         input.action
     );
+    let source_ip_required = input.policy.requires_source_ip_for_action(input.action);
+    if source_ip_required && input.requester.source_ip().is_none() {
+        return Err(required_policy_input_unavailable_error(
+            input.action,
+            "source IP",
+        ));
+    }
+    debug_assert!(
+        !(source_ip_required && input.requester.source_ip().is_none()),
+        "bucket policy request for {:?} requires source IP",
+        input.action
+    );
 
     Ok(auth::PolicyRequest::for_object(
         input.action,
@@ -141,6 +153,7 @@ pub(super) fn object_policy_request<'a>(
         input.requester.canonical_user_id(),
         input.existing_object_tags,
     )
+    .with_source_ip(input.requester.source_ip())
     .with_bucket_tags(bucket_tag_input_for_policy_action(
         input.bucket_abac_enabled,
         input.policy,
@@ -204,6 +217,18 @@ fn bucket_policy_request<'a>(
         "bucket policy request for {:?} requires request tags",
         input.action
     );
+    let source_ip_required = input.policy.requires_source_ip_for_action(input.action);
+    if source_ip_required && input.requester.source_ip().is_none() {
+        return Err(required_policy_input_unavailable_error(
+            input.action,
+            "source IP",
+        ));
+    }
+    debug_assert!(
+        !(source_ip_required && input.requester.source_ip().is_none()),
+        "bucket policy request for {:?} requires source IP",
+        input.action
+    );
 
     let mut request = auth::PolicyRequest::for_bucket(
         input.action,
@@ -212,6 +237,7 @@ fn bucket_policy_request<'a>(
         input.requester.canonical_user_id(),
         input.bucket_tags,
     )
+    .with_source_ip(input.requester.source_ip())
     .with_absent_request_headers()
     .with_absent_list_parameters();
 
@@ -896,6 +922,61 @@ mod tests {
     }
 
     #[test]
+    fn object_policy_request_rejects_missing_required_source_ip() {
+        let requester = requester();
+        let policy = parse_policy(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::bucket/*","Condition":{"IpAddress":{"aws:SourceIp":"127.0.0.0/8"}}}]}"#,
+        );
+
+        let error = object_policy_request(ObjectPolicyRequestInput {
+            requester: &requester,
+            bucket_name: "bucket",
+            bucket_abac_enabled: false,
+            key: "key",
+            action: auth::PolicyAction::GetObject,
+            policy_context: PutObjectPolicyContext::default(),
+            policy: &policy,
+            existing_object_tags: auth::bucket_policy::ExistingObjectTags::Unavailable,
+            existing_object_tags_not_evaluable: false,
+            bucket_tags: &[],
+            request_object_tags: &[],
+            version_id: None,
+        })
+        .unwrap_err();
+
+        assert_required_input_error(error, "source IP", auth::PolicyAction::GetObject);
+    }
+
+    #[test]
+    fn object_policy_request_propagates_source_ip() {
+        let requester = requester().with_source_ip(Some("127.0.0.1".parse().unwrap()));
+        let policy = parse_policy(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::bucket/*","Condition":{"IpAddress":{"aws:SourceIp":"127.0.0.0/8"}}}]}"#,
+        );
+
+        let request = object_policy_request(ObjectPolicyRequestInput {
+            requester: &requester,
+            bucket_name: "bucket",
+            bucket_abac_enabled: false,
+            key: "key",
+            action: auth::PolicyAction::GetObject,
+            policy_context: PutObjectPolicyContext::default(),
+            policy: &policy,
+            existing_object_tags: auth::bucket_policy::ExistingObjectTags::Unavailable,
+            existing_object_tags_not_evaluable: false,
+            bucket_tags: &[],
+            request_object_tags: &[],
+            version_id: None,
+        })
+        .unwrap();
+
+        assert_eq!(
+            policy.evaluate(&request),
+            auth::PolicyEvaluation::ExplicitAllow
+        );
+    }
+
+    #[test]
     fn bucket_policy_request_rejects_missing_required_bucket_tags_when_abac_enabled() {
         let requester = requester();
         let policy = parse_policy(
@@ -962,5 +1043,54 @@ mod tests {
         .unwrap_err();
 
         assert_required_input_error(error, "request tags", auth::PolicyAction::TagResource);
+    }
+
+    #[test]
+    fn bucket_policy_request_rejects_missing_required_source_ip() {
+        let requester = requester();
+        let policy = parse_policy(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:ListBucket","Resource":"arn:aws:s3:::bucket","Condition":{"IpAddress":{"aws:SourceIp":"127.0.0.0/8"}}}]}"#,
+        );
+
+        let error = bucket_policy_request(BucketPolicyRequestInput {
+            requester: &requester,
+            bucket_name: "bucket",
+            bucket_abac_enabled: false,
+            action: auth::PolicyAction::ListBucket,
+            policy: &policy,
+            bucket_tags: auth::bucket_policy::BucketTags::Unavailable,
+            request_tags: None,
+            policy_context: None,
+            requested_max_keys: None,
+        })
+        .unwrap_err();
+
+        assert_required_input_error(error, "source IP", auth::PolicyAction::ListBucket);
+    }
+
+    #[test]
+    fn bucket_policy_request_propagates_source_ip() {
+        let requester = requester().with_source_ip(Some("127.0.0.1".parse().unwrap()));
+        let policy = parse_policy(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:ListBucket","Resource":"arn:aws:s3:::bucket","Condition":{"IpAddress":{"aws:SourceIp":"127.0.0.0/8"}}}]}"#,
+        );
+
+        let request = bucket_policy_request(BucketPolicyRequestInput {
+            requester: &requester,
+            bucket_name: "bucket",
+            bucket_abac_enabled: false,
+            action: auth::PolicyAction::ListBucket,
+            policy: &policy,
+            bucket_tags: auth::bucket_policy::BucketTags::Unavailable,
+            request_tags: None,
+            policy_context: None,
+            requested_max_keys: None,
+        })
+        .unwrap();
+
+        assert_eq!(
+            policy.evaluate(&request),
+            auth::PolicyEvaluation::ExplicitAllow
+        );
     }
 }

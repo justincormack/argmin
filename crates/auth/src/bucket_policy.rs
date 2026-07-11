@@ -49,6 +49,11 @@ impl BucketPolicy {
         self.requires_condition_input_for_action(action, condition_key::ConditionInput::Bucket)
     }
 
+    #[must_use]
+    pub fn requires_source_ip_for_action(&self, action: PolicyAction) -> bool {
+        self.requires_condition_input_for_action(action, condition_key::ConditionInput::SourceIp)
+    }
+
     fn requires_condition_input_for_action(
         &self,
         action: PolicyAction,
@@ -321,6 +326,7 @@ pub struct PolicyRequest<'a> {
     max_keys: RequestField<'a>,
     object_ownership: RequestField<'a>,
     version_id: RequestField<'a>,
+    source_ip: Option<IpAddr>,
 }
 
 impl<'a> PolicyRequest<'a> {
@@ -361,6 +367,7 @@ impl<'a> PolicyRequest<'a> {
             max_keys: RequestField::Unavailable,
             object_ownership: RequestField::Unavailable,
             version_id: RequestField::Unavailable,
+            source_ip: None,
         }
     }
 
@@ -400,6 +407,7 @@ impl<'a> PolicyRequest<'a> {
             max_keys: RequestField::Unavailable,
             object_ownership: RequestField::Unavailable,
             version_id: RequestField::Unavailable,
+            source_ip: None,
         }
     }
 
@@ -611,6 +619,12 @@ impl<'a> PolicyRequest<'a> {
     }
 
     #[must_use]
+    pub const fn with_source_ip(mut self, source_ip: Option<IpAddr>) -> Self {
+        self.source_ip = source_ip;
+        self
+    }
+
+    #[must_use]
     fn copy_source(&self) -> RequestField<'a> {
         self.copy_source
     }
@@ -708,6 +722,11 @@ impl<'a> PolicyRequest<'a> {
     #[must_use]
     fn version_id(&self) -> RequestField<'a> {
         self.version_id
+    }
+
+    #[must_use]
+    fn source_ip(&self) -> Option<IpAddr> {
+        self.source_ip
     }
 }
 
@@ -844,10 +863,9 @@ impl PolicyStatement {
                     .any(|pattern| action_pattern_matches(pattern, action.as_str()))
             })
             .all(|action| {
-                self.conditions.iter().all(|clause| {
-                    condition_key::supports_clause_for_action(clause, action)
-                        || policy_upload_accepts_condition_without_runtime_evaluation(clause)
-                })
+                self.conditions
+                    .iter()
+                    .all(|clause| condition_key::supports_clause_for_action(clause, action))
             })
     }
 
@@ -1563,14 +1581,16 @@ fn parse_conditions(value: &Value) -> Result<Vec<PolicyConditionClause>, BucketP
             "Condition operator value must be an object",
         ))?;
         for (key, value) in operand_object {
-            clauses.push(PolicyConditionClause {
+            let clause = PolicyConditionClause {
                 operator: operator.clone(),
                 key: key.clone(),
                 values: parse_condition_value(
                     value,
                     "Condition value must be a string, number, or array of strings or numbers",
                 )?,
-            });
+            };
+            validate_condition_operands(&clause)?;
+            clauses.push(clause);
         }
     }
     Ok(clauses)
@@ -1630,12 +1650,6 @@ fn parse_condition_value(
 
 fn conditions_constrain_public_principal(conditions: &[PolicyConditionClause]) -> bool {
     conditions.iter().any(is_non_public_condition_clause)
-}
-
-fn policy_upload_accepts_condition_without_runtime_evaluation(
-    clause: &PolicyConditionClause,
-) -> bool {
-    clause.key == "aws:SourceIp" && matches!(clause.operator.as_str(), "IpAddress" | "NotIpAddress")
 }
 
 fn condition_clause_matches_request(
@@ -1749,8 +1763,10 @@ fn is_non_public_condition_clause(clause: &PolicyConditionClause) -> bool {
             ) && clause.values.iter().all(|value| is_fixed_value(value))
         }
         "aws:SourceIp" => {
-            clause.operator == "IpAddress"
-                && clause.values.iter().all(|value| is_fixed_source_ip(value))
+            matches!(
+                clause.operator.as_str(),
+                "IpAddress" | "ForAnyValue:IpAddress"
+            ) && clause.values.iter().all(|value| is_fixed_source_ip(value))
         }
         _ => false,
     }
@@ -1791,6 +1807,26 @@ fn parse_ip_addr_or_cidr(value: &str) -> Option<(IpAddr, u8)> {
             IpAddr::V6(_) => 128,
         };
         Some((addr, prefix))
+    }
+}
+
+fn validate_condition_operands(clause: &PolicyConditionClause) -> Result<(), BucketPolicyError> {
+    let Some(op) = condition_op::lookup(clause.operator()) else {
+        return Ok(());
+    };
+    if !condition_op::is_ip_condition_kind(op.kind) {
+        return Ok(());
+    }
+    if clause
+        .values()
+        .iter()
+        .all(|value| parse_ip_addr_or_cidr(value).is_some())
+    {
+        Ok(())
+    } else {
+        Err(BucketPolicyError::malformed(
+            "Invalid IP address in Conditions",
+        ))
     }
 }
 
@@ -2011,6 +2047,33 @@ mod tests {
         )
         .unwrap();
         assert!(!policy.is_public());
+    }
+
+    #[test]
+    fn for_any_value_source_ip_cidr_constrains_wildcard_principal() {
+        let policy = parse_bucket_policy(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::bucket/*","Condition":{"ForAnyValue:IpAddress":{"aws:SourceIp":"10.0.0.0/8"}}}]}"#,
+        )
+        .unwrap();
+        assert!(!policy.is_public());
+    }
+
+    #[test]
+    fn if_exists_source_ip_cidr_does_not_constrain_wildcard_principal() {
+        let policy = parse_bucket_policy(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::bucket/*","Condition":{"IpAddressIfExists":{"aws:SourceIp":"10.0.0.0/8"}}}]}"#,
+        )
+        .unwrap();
+        assert!(policy.is_public());
+    }
+
+    #[test]
+    fn for_all_values_source_ip_cidr_does_not_constrain_wildcard_principal() {
+        let policy = parse_bucket_policy(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::bucket/*","Condition":{"ForAllValues:IpAddress":{"aws:SourceIp":"10.0.0.0/8"}}}]}"#,
+        )
+        .unwrap();
+        assert!(policy.is_public());
     }
 
     #[test]
@@ -3107,6 +3170,46 @@ mod tests {
         .unwrap();
 
         assert_eq!(policy.validate_evaluable_object_conditions(), Ok(()));
+    }
+
+    #[test]
+    fn malformed_source_ip_condition_operand_is_rejected() {
+        let err = parse_bucket_policy(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::bucket/*","Condition":{"IpAddress":{"aws:SourceIp":"not-an-ip"}}}]}"#,
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            err,
+            BucketPolicyError::malformed("Invalid IP address in Conditions")
+        );
+    }
+
+    #[test]
+    fn source_ip_condition_evaluates_request_source_ip() {
+        let policy = parse_bucket_policy(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::bucket/*","Condition":{"IpAddress":{"aws:SourceIp":"127.0.0.0/8"}}},{"Effect":"Deny","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::bucket/*","Condition":{"NotIpAddress":{"aws:SourceIp":"127.0.0.0/8"}}}]}"#,
+        )
+        .unwrap();
+        let local_request = request(PolicyAction::GetObject, "bucket", "key", None, &[])
+            .with_source_ip(Some("127.0.0.1".parse().unwrap()));
+        let remote_request = request(PolicyAction::GetObject, "bucket", "key", None, &[])
+            .with_source_ip(Some("10.0.0.1".parse().unwrap()));
+        let missing_source_request = request(PolicyAction::GetObject, "bucket", "key", None, &[]);
+
+        assert_eq!(
+            policy.evaluate(&local_request),
+            PolicyEvaluation::ExplicitAllow
+        );
+        assert_eq!(
+            policy.evaluate(&remote_request),
+            PolicyEvaluation::ExplicitDeny
+        );
+        assert_eq!(
+            policy.evaluate(&missing_source_request),
+            PolicyEvaluation::NoMatch
+        );
+        assert!(policy.requires_source_ip_for_action(PolicyAction::GetObject));
     }
 
     #[test]

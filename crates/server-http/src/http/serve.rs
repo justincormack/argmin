@@ -1,5 +1,6 @@
 /// Async hyper HTTP server loop with frontend pool and backpressure.
 use std::convert::Infallible;
+use std::net::IpAddr;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::{Duration, Instant};
@@ -577,7 +578,7 @@ async fn serve_plain_or_tls(
             .await
             .expect("connection semaphore closed");
 
-        let (stream, _addr) = match listener.accept().await {
+        let (stream, addr) = match listener.accept().await {
             Ok(conn) => conn,
             Err(e) => {
                 eprintln!("accept error: {e}");
@@ -592,6 +593,7 @@ async fn serve_plain_or_tls(
 
         let state = Arc::clone(&state);
         let tls_acceptor = tls_acceptor.clone();
+        let source_ip = Some(canonical_source_ip(addr.ip()));
         tokio::spawn(async move {
             let _conn_permit = conn_permit;
             match tls_acceptor {
@@ -603,6 +605,7 @@ async fn serve_plain_or_tls(
                                 TokioIo::new(tls_stream),
                                 header_read_timeout,
                                 TransportSecurity::Tls,
+                                source_ip,
                             )
                             .await;
                         }
@@ -623,6 +626,7 @@ async fn serve_plain_or_tls(
                         TokioIo::new(stream),
                         header_read_timeout,
                         TransportSecurity::InsecureHttp,
+                        source_ip,
                     )
                     .await;
                 }
@@ -631,11 +635,22 @@ async fn serve_plain_or_tls(
     }
 }
 
+fn canonical_source_ip(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(ip) => ip
+            .to_ipv4_mapped()
+            .map(IpAddr::V4)
+            .unwrap_or(IpAddr::V6(ip)),
+        IpAddr::V4(_) => ip,
+    }
+}
+
 async fn serve_connection<IO>(
     state: Arc<ServerState>,
     io: TokioIo<IO>,
     header_read_timeout: Duration,
     transport_security: TransportSecurity,
+    source_ip: Option<IpAddr>,
 ) where
     IO: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
@@ -646,7 +661,7 @@ async fn serve_connection<IO>(
             io,
             service_fn(move |req: Request<Incoming>| {
                 let state = Arc::clone(&state);
-                async move { handle(state, req, transport_security).await }
+                async move { handle(state, req, transport_security, source_ip).await }
             }),
         );
     // Lingering close: take the IO back from hyper instead of letting it
@@ -694,6 +709,7 @@ async fn handle(
     state: Arc<ServerState>,
     req: Request<Incoming>,
     transport_security: TransportSecurity,
+    source_ip: Option<IpAddr>,
 ) -> Result<http::Response<S3HyperBody>, Infallible> {
     let trace = crate::http::new_request_trace_context();
     let _trace = observability::AttachedTrace::new(trace.clone());
@@ -823,7 +839,11 @@ async fn handle(
         }
     };
     if let Some(op) = streaming_op {
-        let s3req = match S3Request::from_hyper_headers(parts, transport_security) {
+        let s3req = match S3Request::from_hyper_headers_with_source_ip(
+            parts,
+            transport_security,
+            source_ip,
+        ) {
             Ok(req) => req,
             Err(err) => {
                 return Ok(s3_response_to_hyper(
@@ -917,7 +937,11 @@ async fn handle(
     }
 
     if let Some(bucket) = post_object_bucket(&parts) {
-        let s3req = match S3Request::from_hyper_headers(parts, transport_security) {
+        let s3req = match S3Request::from_hyper_headers_with_source_ip(
+            parts,
+            transport_security,
+            source_ip,
+        ) {
             Ok(req) => req,
             Err(err) => {
                 return Ok(s3_response_to_hyper(
@@ -961,7 +985,11 @@ async fn handle(
     }
 
     if parts.method == http::Method::OPTIONS {
-        let s3req = match S3Request::from_hyper_headers(parts, transport_security) {
+        let s3req = match S3Request::from_hyper_headers_with_source_ip(
+            parts,
+            transport_security,
+            source_ip,
+        ) {
             Ok(req) => req,
             Err(err) => {
                 return Ok(s3_response_to_hyper(
@@ -1010,7 +1038,12 @@ async fn handle(
             }
         };
 
-    let s3req = match S3Request::from_hyper(parts, body_bytes, transport_security) {
+    let s3req = match S3Request::from_hyper_with_source_ip(
+        parts,
+        body_bytes,
+        transport_security,
+        source_ip,
+    ) {
         Ok(req) => req,
         Err(err) => {
             return Ok(s3_response_to_hyper(
@@ -4955,6 +4988,41 @@ mod tests {
             .unwrap();
     }
 
+    fn object_request(bucket: &str, key: &str) -> crate::coordinator::ObjectRequest<'static> {
+        crate::coordinator::ObjectRequest::new(
+            storage::BucketName::try_from(bucket.to_string()).unwrap(),
+            storage::ObjectKey::try_from(key.to_string()).unwrap(),
+            server_core::coordinator::test_helpers::requester(TEST_ACCESS_KEY),
+            None,
+        )
+    }
+
+    fn bucket_request(bucket: &str) -> crate::coordinator::BucketRequest<'static> {
+        crate::coordinator::BucketRequest::new(
+            storage::BucketName::try_from(bucket.to_string()).unwrap(),
+            server_core::coordinator::test_helpers::requester(TEST_ACCESS_KEY),
+            None,
+        )
+    }
+
+    fn put_test_object(frontend: &HttpFrontend, bucket: &str, key: &str, data: &'static [u8]) {
+        frontend
+            .coordinator
+            .put_object(&crate::coordinator::PutObjectRequest {
+                object: object_request(bucket, key),
+                data,
+                metadata: &MetadataBlob::new(),
+                system_metadata: &server_core::system_metadata::SystemMetadata::EMPTY,
+                tags: None,
+                cond: &crate::conditional::WriteCondition::default(),
+                acl: crate::coordinator::PutObjectAcl::None.into(),
+                policy_context: crate::coordinator::PutObjectPolicyContext::default(),
+                object_lock: s3_types::ObjectLockState::default(),
+                encryption: crate::coordinator::WriteEncryptionRequest::none(),
+            })
+            .unwrap();
+    }
+
     fn create_test_bucket_and_upload(frontend: &HttpFrontend, bucket: &str, key: &str) -> String {
         create_test_bucket(frontend, bucket);
         let requester = server_core::coordinator::test_helpers::requester(TEST_ACCESS_KEY);
@@ -4990,7 +5058,16 @@ mod tests {
         config: ServeConfig,
         request_slots: usize,
     ) -> (String, ServerGuard) {
-        let std_listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        start_test_server_with_bind_addr(frontend, config, request_slots, "127.0.0.1:0").await
+    }
+
+    async fn start_test_server_with_bind_addr(
+        frontend: Arc<HttpFrontend>,
+        config: ServeConfig,
+        request_slots: usize,
+        bind_addr: &str,
+    ) -> (String, ServerGuard) {
+        let std_listener = TcpListener::bind(bind_addr).expect("bind");
         let addr = std_listener.local_addr().unwrap().to_string();
         std_listener.set_nonblocking(true).unwrap();
         let listener = tokio::net::TcpListener::from_std(std_listener).unwrap();
@@ -5009,7 +5086,7 @@ mod tests {
 
         let handle = tokio::spawn(async move {
             loop {
-                let (stream, _) = listener.accept().await.expect("accept");
+                let (stream, addr) = listener.accept().await.expect("accept");
                 let state = Arc::clone(&state);
                 tokio::spawn(async move {
                     serve_connection(
@@ -5017,6 +5094,7 @@ mod tests {
                         TokioIo::new(stream),
                         header_read_timeout,
                         TransportSecurity::InsecureHttp,
+                        Some(canonical_source_ip(addr.ip())),
                     )
                     .await;
                 });
@@ -5024,6 +5102,62 @@ mod tests {
         });
 
         (addr, ServerGuard(handle))
+    }
+
+    #[test]
+    fn canonical_source_ip_maps_ipv4_mapped_ipv6_to_ipv4() {
+        assert_eq!(
+            canonical_source_ip("::ffff:127.0.0.1".parse().unwrap()),
+            "127.0.0.1".parse::<IpAddr>().unwrap()
+        );
+        assert_eq!(
+            canonical_source_ip("2001:db8::1".parse().unwrap()),
+            "2001:db8::1".parse::<IpAddr>().unwrap()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ipv4_client_on_ipv6_wildcard_listener_matches_ipv4_source_ip_policy() {
+        let tmp = test_util::tempdir();
+        let frontend = setup_frontend(tmp.path());
+        create_test_bucket(&frontend, "source-ip-bucket");
+        put_test_object(
+            &frontend,
+            "source-ip-bucket",
+            "source-ip-key",
+            b"source-ip-body",
+        );
+        frontend
+            .coordinator
+            .put_bucket_policy(&crate::coordinator::PutBucketPolicyRequest {
+                bucket: bucket_request("source-ip-bucket"),
+                config: r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::source-ip-bucket/*","Condition":{"IpAddress":{"aws:SourceIp":"127.0.0.0/8"}}}]}"#,
+                confirm_remove_self_bucket_access: false,
+            })
+            .unwrap();
+
+        let (addr, _guard) =
+            start_test_server_with_bind_addr(frontend, ServeConfig::default(), 8, "[::]:0").await;
+        let port = addr
+            .rsplit_once(':')
+            .expect("IPv6 listener address should include port")
+            .1;
+        let mut stream = StdTcpStream::connect(format!("127.0.0.1:{port}")).unwrap();
+        stream
+            .write_all(
+                concat!(
+                    "GET /source-ip-bucket/source-ip-key HTTP/1.1\r\n",
+                    "Host: source-ip-bucket\r\n",
+                    "Connection: close\r\n",
+                    "\r\n",
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+        let response = read_http_response(&mut stream, Duration::from_secs(3));
+
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert!(response.ends_with("source-ip-body"), "{response}");
     }
 
     #[tokio::test(flavor = "multi_thread")]

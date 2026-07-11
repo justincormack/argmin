@@ -1,5 +1,5 @@
 /// Parse HTTP requests into structured S3 request data.
-use std::borrow::Cow;
+use std::{borrow::Cow, net::IpAddr};
 
 use crate::error::ServerError;
 use auth::HeaderSource;
@@ -47,6 +47,7 @@ pub struct S3Request {
     pub headers: http::HeaderMap,
     pub body: Vec<u8>,
     pub transport_security: TransportSecurity,
+    pub source_ip: Option<IpAddr>,
 }
 
 pub(crate) struct RequestHeaderSource<'a>(&'a http::HeaderMap);
@@ -104,6 +105,15 @@ impl S3Request {
         body: bytes::Bytes,
         transport_security: TransportSecurity,
     ) -> Result<Self, ServerError> {
+        Self::from_hyper_with_source_ip(parts, body, transport_security, None)
+    }
+
+    pub fn from_hyper_with_source_ip(
+        parts: http::request::Parts,
+        body: bytes::Bytes,
+        transport_security: TransportSecurity,
+        source_ip: Option<IpAddr>,
+    ) -> Result<Self, ServerError> {
         let method = parts.method;
         let uri = parts.uri;
 
@@ -132,6 +142,7 @@ impl S3Request {
             headers,
             body,
             transport_security,
+            source_ip,
         })
     }
 
@@ -145,6 +156,14 @@ impl S3Request {
         transport_security: TransportSecurity,
     ) -> Result<Self, ServerError> {
         Self::from_hyper(parts, bytes::Bytes::new(), transport_security)
+    }
+
+    pub fn from_hyper_headers_with_source_ip(
+        parts: http::request::Parts,
+        transport_security: TransportSecurity,
+        source_ip: Option<IpAddr>,
+    ) -> Result<Self, ServerError> {
+        Self::from_hyper_with_source_ip(parts, bytes::Bytes::new(), transport_security, source_ip)
     }
 
     /// Get a header value by lowercase name.
@@ -168,6 +187,11 @@ impl S3Request {
     #[must_use]
     pub fn query_string(&self) -> &str {
         self.uri.query().unwrap_or("")
+    }
+
+    #[must_use]
+    pub fn source_ip(&self) -> Option<IpAddr> {
+        self.source_ip
     }
 
     pub(crate) fn header_source(&self) -> RequestHeaderSource<'_> {
@@ -232,6 +256,7 @@ impl S3Request {
             headers,
             body,
             transport_security: self.transport_security,
+            source_ip: self.source_ip,
         }
     }
 
@@ -298,6 +323,7 @@ impl S3Request {
             headers,
             body,
             transport_security,
+            source_ip: None,
         }
     }
 }
