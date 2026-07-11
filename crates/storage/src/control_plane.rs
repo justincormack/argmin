@@ -7,6 +7,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use placement::NodeId;
+use ring::rand::SecureRandom as _;
 use thiserror::Error;
 
 use crate::control_plane_auth::{
@@ -58,6 +59,14 @@ const CONTROL_PLANE_RPC_PENDING_RECOVERY_FAILURE_MIN_LEN: usize = 4 + 1 + 4;
 const CONTROL_PLANE_RPC_RUNTIME_MAP_PROOF_SINGLE_AUTHORITY: u8 = 1;
 const CONTROL_PLANE_RPC_RUNTIME_MAP_PROOF_RECONSTRUCTED: u8 = 2;
 const CONTROL_PLANE_RPC_RUNTIME_MAP_PROOF_READ_INDEX: u8 = 3;
+const CONTROL_PLANE_CLOCK_CHECKPOINT_MAGIC: &[u8; 8] = b"ARGCPCLK";
+const CONTROL_PLANE_CLOCK_CHECKPOINT_VERSION: u16 = 1;
+const CONTROL_PLANE_CLOCK_CHECKPOINT_BINDING_LEN: usize = 32;
+const CONTROL_PLANE_CLOCK_CHECKPOINT_CHECKSUM_LEN: usize = 8;
+const CONTROL_PLANE_CLOCK_CHECKPOINT_LEN: usize = 8 + 2 + 32 + 1 + 8 + 8 + 8 + 8;
+const CONTROL_PLANE_STATE_IDENTITY_MAGIC: &[u8; 8] = b"ARGCPID\0";
+const CONTROL_PLANE_STATE_IDENTITY_VERSION: u16 = 1;
+const CONTROL_PLANE_STATE_IDENTITY_LEN: usize = 8 + 2 + 32 + 8;
 
 fn non_serving_runtime_map_validity(now_ms: u64) -> RouteMapValidity {
     RouteMapValidity::until_ms_saturating(now_ms.saturating_add(MAX_HEARTBEAT_LEASE_MS))
@@ -95,12 +104,242 @@ fn control_plane_process_clock_sample(
     })
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct ControlPlaneAuthorityClockCheckpointBinding(
+    [u8; CONTROL_PLANE_CLOCK_CHECKPOINT_BINDING_LEN],
+);
+
+impl std::fmt::Debug for ControlPlaneAuthorityClockCheckpointBinding {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ControlPlaneAuthorityClockCheckpointBinding")
+            .finish_non_exhaustive()
+    }
+}
+
+impl ControlPlaneAuthorityClockCheckpointBinding {
+    #[must_use]
+    pub fn for_raft(cluster_name: &str, node_id: u64) -> Self {
+        let mut context = ring::digest::Context::new(&ring::digest::SHA256);
+        context.update(b"argmin-control-plane-clock-checkpoint-raft-v1\0");
+        context.update(&(cluster_name.len() as u64).to_be_bytes());
+        context.update(cluster_name.as_bytes());
+        context.update(&node_id.to_be_bytes());
+        let mut binding = [0u8; CONTROL_PLANE_CLOCK_CHECKPOINT_BINDING_LEN];
+        binding.copy_from_slice(context.finish().as_ref());
+        Self(binding)
+    }
+
+    fn generate_single_authority() -> Result<Self, ControlPlaneError> {
+        let mut binding = [0u8; CONTROL_PLANE_CLOCK_CHECKPOINT_BINDING_LEN];
+        ring::rand::SystemRandom::new()
+            .fill(&mut binding)
+            .map_err(|_| ControlPlaneError::Io {
+                context: "generate single-authority control-plane durable identity",
+                source: std::io::Error::other(
+                    "secure random source failed while generating control-plane identity",
+                ),
+            })?;
+        Ok(Self(binding))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ControlPlaneAuthorityClockRestartCheckpoint {
+    binding: ControlPlaneAuthorityClockCheckpointBinding,
+    committed_timestamp_high_water_ms: Option<u64>,
+    wall_time_ms: u64,
+    health_time_ms: u64,
+}
+
+impl ControlPlaneAuthorityClockRestartCheckpoint {
+    #[must_use]
+    pub fn new(
+        binding: ControlPlaneAuthorityClockCheckpointBinding,
+        committed_timestamp_high_water_ms: Option<u64>,
+        wall_time_ms: u64,
+        health_time_ms: u64,
+    ) -> Self {
+        Self {
+            binding,
+            committed_timestamp_high_water_ms,
+            wall_time_ms,
+            health_time_ms,
+        }
+    }
+
+    #[must_use]
+    pub fn committed_timestamp_high_water_ms(self) -> Option<u64> {
+        self.committed_timestamp_high_water_ms
+    }
+
+    #[must_use]
+    pub fn wall_time_ms(self) -> u64 {
+        self.wall_time_ms
+    }
+
+    #[must_use]
+    pub fn health_time_ms(self) -> u64 {
+        self.health_time_ms
+    }
+
+    fn from_process_clock(
+        binding: ControlPlaneAuthorityClockCheckpointBinding,
+        committed_timestamp_high_water_ms: Option<u64>,
+    ) -> Result<Self, ControlPlaneError> {
+        let sample = control_plane_process_clock_sample()?;
+        let health_time_ms = sample
+            .health_time_ms()
+            .ok_or(ControlPlaneError::AuthorityClockSourceUnavailable)?;
+        Ok(Self::new(
+            binding,
+            committed_timestamp_high_water_ms,
+            sample.wall_time_ms(),
+            health_time_ms,
+        ))
+    }
+
+    fn encode(self) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(CONTROL_PLANE_CLOCK_CHECKPOINT_LEN);
+        bytes.extend_from_slice(CONTROL_PLANE_CLOCK_CHECKPOINT_MAGIC);
+        bytes.extend_from_slice(&CONTROL_PLANE_CLOCK_CHECKPOINT_VERSION.to_be_bytes());
+        bytes.extend_from_slice(&self.binding.0);
+        match self.committed_timestamp_high_water_ms {
+            Some(timestamp_ms) => {
+                bytes.push(1);
+                bytes.extend_from_slice(&timestamp_ms.to_be_bytes());
+            }
+            None => {
+                bytes.push(0);
+                bytes.extend_from_slice(&0u64.to_be_bytes());
+            }
+        }
+        bytes.extend_from_slice(&self.wall_time_ms.to_be_bytes());
+        bytes.extend_from_slice(&self.health_time_ms.to_be_bytes());
+        bytes.extend_from_slice(&checksum::crc64::checksum(&bytes).to_be_bytes());
+        bytes
+    }
+
+    fn decode(
+        bytes: &[u8],
+        expected_binding: ControlPlaneAuthorityClockCheckpointBinding,
+    ) -> Result<Self, ControlPlaneError> {
+        if bytes.len() != CONTROL_PLANE_CLOCK_CHECKPOINT_LEN {
+            return Err(ControlPlaneError::AuthorityClockCheckpoint {
+                message: format!(
+                    "checkpoint length {} does not match required fixed length {CONTROL_PLANE_CLOCK_CHECKPOINT_LEN}",
+                    bytes.len()
+                ),
+            });
+        }
+        let (body, encoded_checksum) =
+            bytes.split_at(bytes.len() - CONTROL_PLANE_CLOCK_CHECKPOINT_CHECKSUM_LEN);
+        let actual_checksum = checksum::crc64::checksum(body);
+        let expected_checksum = u64::from_be_bytes(
+            encoded_checksum
+                .try_into()
+                .expect("clock checkpoint checksum has fixed length"),
+        );
+        if actual_checksum != expected_checksum {
+            return Err(ControlPlaneError::AuthorityClockCheckpoint {
+                message: "checkpoint checksum mismatch".to_owned(),
+            });
+        }
+        let mut offset = 0usize;
+        let mut take = |len: usize| -> Result<&[u8], ControlPlaneError> {
+            let end = offset.checked_add(len).ok_or_else(|| {
+                ControlPlaneError::AuthorityClockCheckpoint {
+                    message: "checkpoint offset overflow".to_owned(),
+                }
+            })?;
+            let value = body.get(offset..end).ok_or_else(|| {
+                ControlPlaneError::AuthorityClockCheckpoint {
+                    message: "checkpoint is truncated".to_owned(),
+                }
+            })?;
+            offset = end;
+            Ok(value)
+        };
+        if take(CONTROL_PLANE_CLOCK_CHECKPOINT_MAGIC.len())? != CONTROL_PLANE_CLOCK_CHECKPOINT_MAGIC
+        {
+            return Err(ControlPlaneError::AuthorityClockCheckpoint {
+                message: "checkpoint magic mismatch".to_owned(),
+            });
+        }
+        let version = u16::from_be_bytes(
+            take(2)?
+                .try_into()
+                .expect("clock checkpoint version has fixed length"),
+        );
+        if version != CONTROL_PLANE_CLOCK_CHECKPOINT_VERSION {
+            return Err(ControlPlaneError::AuthorityClockCheckpoint {
+                message: format!("unsupported checkpoint version {version}"),
+            });
+        }
+        let binding = Self::read_binding(take(CONTROL_PLANE_CLOCK_CHECKPOINT_BINDING_LEN)?);
+        if binding != expected_binding {
+            return Err(ControlPlaneError::AuthorityClockCheckpoint {
+                message: "checkpoint durable-state identity does not match this authority"
+                    .to_owned(),
+            });
+        }
+        let timestamp_tag = take(1)?[0];
+        let encoded_timestamp = u64::from_be_bytes(
+            take(8)?
+                .try_into()
+                .expect("clock checkpoint timestamp has fixed length"),
+        );
+        let committed_timestamp_high_water_ms = match timestamp_tag {
+            0 if encoded_timestamp == 0 => None,
+            0 => {
+                return Err(ControlPlaneError::AuthorityClockCheckpoint {
+                    message: "absent checkpoint timestamp must use canonical zero value".to_owned(),
+                });
+            }
+            1 => Some(encoded_timestamp),
+            tag => {
+                return Err(ControlPlaneError::AuthorityClockCheckpoint {
+                    message: format!("invalid checkpoint timestamp option tag {tag}"),
+                });
+            }
+        };
+        let wall_time_ms = u64::from_be_bytes(
+            take(8)?
+                .try_into()
+                .expect("clock checkpoint wall time has fixed length"),
+        );
+        let health_time_ms = u64::from_be_bytes(
+            take(8)?
+                .try_into()
+                .expect("clock checkpoint health time has fixed length"),
+        );
+        if offset != body.len() {
+            return Err(ControlPlaneError::AuthorityClockCheckpoint {
+                message: "checkpoint has trailing bytes".to_owned(),
+            });
+        }
+        Ok(Self::new(
+            binding,
+            committed_timestamp_high_water_ms,
+            wall_time_ms,
+            health_time_ms,
+        ))
+    }
+
+    fn read_binding(bytes: &[u8]) -> ControlPlaneAuthorityClockCheckpointBinding {
+        let mut binding = [0u8; CONTROL_PLANE_CLOCK_CHECKPOINT_BINDING_LEN];
+        binding.copy_from_slice(bytes);
+        ControlPlaneAuthorityClockCheckpointBinding(binding)
+    }
+}
+
 /// Process-local authority clock gate for timestamp-bearing control-plane work.
 ///
 /// Replicated apply can validate timestamp ordering and deadline relationships,
 /// but only the command issuer can compare wall-clock progress with monotonic
-/// elapsed time. A new process starts established only when its wall clock is
-/// within the configured skew budget of the persisted timestamp high-water.
+/// elapsed time. Durable process startup additionally requires node-local
+/// wall/health lineage evidence whenever restored state has a timestamp
+/// high-water; the legacy constructor retains the proximity-only bootstrap for
+/// non-durable callers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ControlPlaneAuthorityClockBlockedReason {
     InitialTimestampDiscontinuity,
@@ -109,6 +348,7 @@ pub enum ControlPlaneAuthorityClockBlockedReason {
     ClockHealthRegression,
     WallClockRegression,
     WallClockForwardJump,
+    CheckpointPersistenceFailure,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -206,6 +446,11 @@ impl ControlPlaneAuthorityClockContext {
             local_raft_authority_serving,
         }
     }
+
+    #[must_use]
+    pub fn committed_timestamp_high_water_ms(self) -> Option<u64> {
+        self.committed_timestamp_high_water_ms
+    }
 }
 
 #[derive(Debug)]
@@ -225,10 +470,26 @@ impl ControlPlaneAuthorityClock {
         max_committed_timestamp_ms: Option<u64>,
     ) -> Result<Self, ControlPlaneError> {
         let sample = control_plane_process_clock_sample()?;
-        Self::new(
+        Self::new_internal(
             max_committed_timestamp_ms,
             sample.wall_time_ms(),
             sample.health_time_ms(),
+            None,
+            true,
+        )
+    }
+
+    pub fn new_from_process_clock_with_restart_checkpoint(
+        max_committed_timestamp_ms: Option<u64>,
+        restart_checkpoint: Option<ControlPlaneAuthorityClockRestartCheckpoint>,
+    ) -> Result<Self, ControlPlaneError> {
+        let sample = control_plane_process_clock_sample()?;
+        Self::new_internal(
+            max_committed_timestamp_ms,
+            sample.wall_time_ms(),
+            sample.health_time_ms(),
+            restart_checkpoint,
+            false,
         )
     }
 
@@ -237,10 +498,62 @@ impl ControlPlaneAuthorityClock {
         wall_ms: u64,
         clock_health_ms: Option<u64>,
     ) -> Result<Self, ControlPlaneError> {
+        Self::new_internal(
+            max_committed_timestamp_ms,
+            wall_ms,
+            clock_health_ms,
+            None,
+            true,
+        )
+    }
+
+    pub fn new_with_restart_checkpoint(
+        max_committed_timestamp_ms: Option<u64>,
+        wall_ms: u64,
+        clock_health_ms: Option<u64>,
+        restart_checkpoint: Option<ControlPlaneAuthorityClockRestartCheckpoint>,
+    ) -> Result<Self, ControlPlaneError> {
+        Self::new_internal(
+            max_committed_timestamp_ms,
+            wall_ms,
+            clock_health_ms,
+            restart_checkpoint,
+            false,
+        )
+    }
+
+    fn new_internal(
+        max_committed_timestamp_ms: Option<u64>,
+        wall_ms: u64,
+        clock_health_ms: Option<u64>,
+        restart_checkpoint: Option<ControlPlaneAuthorityClockRestartCheckpoint>,
+        allow_uncheckpointed_initial_state: bool,
+    ) -> Result<Self, ControlPlaneError> {
         let clock_health_ms =
             clock_health_ms.ok_or(ControlPlaneError::AuthorityClockSourceUnavailable)?;
         let established = max_committed_timestamp_ms.is_none_or(|committed_ms| {
-            wall_ms.abs_diff(committed_ms) <= CONTROL_PLANE_CLOCK_SKEW_BUDGET_MS
+            restart_checkpoint.map_or_else(
+                || {
+                    allow_uncheckpointed_initial_state
+                        && wall_ms.abs_diff(committed_ms) <= CONTROL_PLANE_CLOCK_SKEW_BUDGET_MS
+                },
+                |checkpoint| {
+                    checkpoint
+                        .committed_timestamp_high_water_ms
+                        .is_none_or(|checkpoint_ms| checkpoint_ms <= committed_ms)
+                        && checkpoint
+                            .committed_timestamp_high_water_ms
+                            .is_none_or(|checkpoint_ms| checkpoint.wall_time_ms >= checkpoint_ms)
+                        && wall_ms >= committed_ms
+                        && wall_ms
+                            .checked_sub(checkpoint.wall_time_ms)
+                            .zip(clock_health_ms.checked_sub(checkpoint.health_time_ms))
+                            .is_some_and(|(wall_elapsed_ms, health_elapsed_ms)| {
+                                wall_elapsed_ms.abs_diff(health_elapsed_ms)
+                                    <= CONTROL_PLANE_CLOCK_SKEW_BUDGET_MS
+                            })
+                },
+            )
         });
         let blocked_reason = (!established)
             .then_some(ControlPlaneAuthorityClockBlockedReason::InitialTimestampDiscontinuity);
@@ -274,6 +587,12 @@ impl ControlPlaneAuthorityClock {
         self.established = false;
         self.blocked_reason = Some(reason);
         Ok(())
+    }
+
+    pub fn fail_closed_after_checkpoint_persistence_failure(
+        &mut self,
+    ) -> Result<(), ControlPlaneError> {
+        self.latch_unhealthy(ControlPlaneAuthorityClockBlockedReason::CheckpointPersistenceFailure)
     }
 
     #[must_use]
@@ -4582,6 +4901,292 @@ impl FileControlPlaneStore {
     pub fn path(&self) -> &Path {
         &self.path
     }
+
+    pub fn load_authority_clock_restart_checkpoint(
+        &self,
+        binding: ControlPlaneAuthorityClockCheckpointBinding,
+    ) -> Result<Option<ControlPlaneAuthorityClockRestartCheckpoint>, ControlPlaneError> {
+        load_authority_clock_restart_checkpoint(&self.path, binding)
+    }
+
+    pub fn load_or_create_authority_clock_checkpoint_binding(
+        &self,
+    ) -> Result<ControlPlaneAuthorityClockCheckpointBinding, ControlPlaneError> {
+        match load_single_authority_clock_checkpoint_binding(&self.path)? {
+            Some(binding) => Ok(binding),
+            None if self.path.exists() => Err(ControlPlaneError::AuthorityClockCheckpoint {
+                message: "existing single-authority state is missing its durable identity"
+                    .to_owned(),
+            }),
+            None => {
+                let binding =
+                    ControlPlaneAuthorityClockCheckpointBinding::generate_single_authority()?;
+                store_single_authority_clock_checkpoint_binding(&self.path, binding)?;
+                Ok(binding)
+            }
+        }
+    }
+}
+
+fn authority_clock_restart_checkpoint_path(path: &Path) -> PathBuf {
+    let mut checkpoint_path = path.as_os_str().to_os_string();
+    checkpoint_path.push(".clock");
+    PathBuf::from(checkpoint_path)
+}
+
+fn authority_clock_restart_checkpoint_tmp_path(path: &Path) -> PathBuf {
+    let mut tmp_path = authority_clock_restart_checkpoint_path(path).into_os_string();
+    tmp_path.push(".tmp");
+    PathBuf::from(tmp_path)
+}
+
+fn single_authority_identity_path(path: &Path) -> PathBuf {
+    let mut identity_path = path.as_os_str().to_os_string();
+    identity_path.push(".identity");
+    PathBuf::from(identity_path)
+}
+
+fn single_authority_identity_tmp_path(path: &Path) -> PathBuf {
+    let mut tmp_path = single_authority_identity_path(path).into_os_string();
+    tmp_path.push(".tmp");
+    PathBuf::from(tmp_path)
+}
+
+fn read_fixed_control_plane_sidecar<const N: usize>(
+    path: &Path,
+    context: &'static str,
+) -> Result<Option<[u8; N]>, ControlPlaneError> {
+    let metadata = match std::fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(source) => return Err(ControlPlaneError::Io { context, source }),
+    };
+    if metadata.len() != N as u64 {
+        return Err(ControlPlaneError::AuthorityClockCheckpoint {
+            message: format!(
+                "{} length {} does not match required fixed length {N}",
+                path.display(),
+                metadata.len()
+            ),
+        });
+    }
+    let mut file =
+        std::fs::File::open(path).map_err(|source| ControlPlaneError::Io { context, source })?;
+    let mut bytes = [0u8; N];
+    file.read_exact(&mut bytes)
+        .map_err(|source| ControlPlaneError::Io { context, source })?;
+    let mut trailing = [0u8; 1];
+    if file
+        .read(&mut trailing)
+        .map_err(|source| ControlPlaneError::Io { context, source })?
+        != 0
+    {
+        return Err(ControlPlaneError::AuthorityClockCheckpoint {
+            message: format!("{} grew while it was being read", path.display()),
+        });
+    }
+    Ok(Some(bytes))
+}
+
+struct ControlPlaneSidecarIoContexts {
+    create: &'static str,
+    write: &'static str,
+    sync: &'static str,
+    rename: &'static str,
+    directory: &'static str,
+}
+
+fn store_control_plane_sidecar(
+    path: &Path,
+    tmp_path: &Path,
+    bytes: &[u8],
+    contexts: ControlPlaneSidecarIoContexts,
+) -> Result<(), ControlPlaneError> {
+    if let Some(parent) = state_parent(path) {
+        std::fs::create_dir_all(parent).map_err(|source| ControlPlaneError::Io {
+            context: contexts.create,
+            source,
+        })?;
+    }
+    {
+        let mut file = std::fs::File::create(tmp_path).map_err(|source| ControlPlaneError::Io {
+            context: contexts.create,
+            source,
+        })?;
+        file.write_all(bytes)
+            .map_err(|source| ControlPlaneError::Io {
+                context: contexts.write,
+                source,
+            })?;
+        file.sync_all().map_err(|source| ControlPlaneError::Io {
+            context: contexts.sync,
+            source,
+        })?;
+    }
+    std::fs::rename(tmp_path, path).map_err(|source| ControlPlaneError::Io {
+        context: contexts.rename,
+        source,
+    })?;
+    if let Some(parent) = state_parent(path) {
+        std::fs::File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|source| ControlPlaneError::Io {
+                context: contexts.directory,
+                source,
+            })?;
+    }
+    Ok(())
+}
+
+fn load_single_authority_clock_checkpoint_binding(
+    durable_state_path: &Path,
+) -> Result<Option<ControlPlaneAuthorityClockCheckpointBinding>, ControlPlaneError> {
+    let identity_path = single_authority_identity_path(durable_state_path);
+    let Some(bytes) = read_fixed_control_plane_sidecar::<CONTROL_PLANE_STATE_IDENTITY_LEN>(
+        &identity_path,
+        "load single-authority control-plane durable identity",
+    )?
+    else {
+        return Ok(None);
+    };
+    let (body, checksum_bytes) = bytes.split_at(CONTROL_PLANE_STATE_IDENTITY_LEN - 8);
+    if checksum::crc64::checksum(body)
+        != u64::from_be_bytes(
+            checksum_bytes
+                .try_into()
+                .expect("identity checksum has fixed length"),
+        )
+    {
+        return Err(ControlPlaneError::AuthorityClockCheckpoint {
+            message: "single-authority durable identity checksum mismatch".to_owned(),
+        });
+    }
+    if &body[..8] != CONTROL_PLANE_STATE_IDENTITY_MAGIC {
+        return Err(ControlPlaneError::AuthorityClockCheckpoint {
+            message: "single-authority durable identity magic mismatch".to_owned(),
+        });
+    }
+    let version = u16::from_be_bytes(
+        body[8..10]
+            .try_into()
+            .expect("identity version has fixed length"),
+    );
+    if version != CONTROL_PLANE_STATE_IDENTITY_VERSION {
+        return Err(ControlPlaneError::AuthorityClockCheckpoint {
+            message: format!("unsupported single-authority durable identity version {version}"),
+        });
+    }
+    let mut binding = [0u8; CONTROL_PLANE_CLOCK_CHECKPOINT_BINDING_LEN];
+    binding.copy_from_slice(&body[10..]);
+    Ok(Some(ControlPlaneAuthorityClockCheckpointBinding(binding)))
+}
+
+fn store_single_authority_clock_checkpoint_binding(
+    durable_state_path: &Path,
+    binding: ControlPlaneAuthorityClockCheckpointBinding,
+) -> Result<(), ControlPlaneError> {
+    let mut bytes = Vec::with_capacity(CONTROL_PLANE_STATE_IDENTITY_LEN);
+    bytes.extend_from_slice(CONTROL_PLANE_STATE_IDENTITY_MAGIC);
+    bytes.extend_from_slice(&CONTROL_PLANE_STATE_IDENTITY_VERSION.to_be_bytes());
+    bytes.extend_from_slice(&binding.0);
+    bytes.extend_from_slice(&checksum::crc64::checksum(&bytes).to_be_bytes());
+    store_control_plane_sidecar(
+        &single_authority_identity_path(durable_state_path),
+        &single_authority_identity_tmp_path(durable_state_path),
+        &bytes,
+        ControlPlaneSidecarIoContexts {
+            create: "create single-authority control-plane durable identity",
+            write: "write single-authority control-plane durable identity",
+            sync: "sync single-authority control-plane durable identity",
+            rename: "commit single-authority control-plane durable identity",
+            directory: "sync single-authority control-plane durable identity directory",
+        },
+    )
+}
+
+pub fn load_authority_clock_restart_checkpoint(
+    durable_state_path: &Path,
+    expected_binding: ControlPlaneAuthorityClockCheckpointBinding,
+) -> Result<Option<ControlPlaneAuthorityClockRestartCheckpoint>, ControlPlaneError> {
+    let checkpoint_path = authority_clock_restart_checkpoint_path(durable_state_path);
+    let Some(bytes) = read_fixed_control_plane_sidecar::<CONTROL_PLANE_CLOCK_CHECKPOINT_LEN>(
+        &checkpoint_path,
+        "load control-plane authority clock checkpoint",
+    )?
+    else {
+        return Ok(None);
+    };
+    ControlPlaneAuthorityClockRestartCheckpoint::decode(&bytes, expected_binding).map(Some)
+}
+
+pub fn store_authority_clock_restart_checkpoint(
+    durable_state_path: &Path,
+    binding: ControlPlaneAuthorityClockCheckpointBinding,
+    committed_timestamp_high_water_ms: Option<u64>,
+) -> Result<ControlPlaneAuthorityClockRestartCheckpoint, ControlPlaneError> {
+    let checkpoint = ControlPlaneAuthorityClockRestartCheckpoint::from_process_clock(
+        binding,
+        committed_timestamp_high_water_ms,
+    )?;
+    store_authority_clock_restart_checkpoint_value(durable_state_path, checkpoint)?;
+    Ok(checkpoint)
+}
+
+pub fn store_validated_authority_clock_restart_checkpoint(
+    durable_state_path: &Path,
+    binding: ControlPlaneAuthorityClockCheckpointBinding,
+    committed_timestamp_high_water_ms: Option<u64>,
+    authority_clock: &mut ControlPlaneAuthorityClock,
+) -> Result<ControlPlaneAuthorityClockRestartCheckpoint, ControlPlaneError> {
+    let sample = control_plane_process_clock_sample()?;
+    let checkpoint = validated_authority_clock_restart_checkpoint(
+        binding,
+        committed_timestamp_high_water_ms,
+        authority_clock,
+        sample.wall_time_ms(),
+        sample.health_time_ms(),
+    )?;
+    store_authority_clock_restart_checkpoint_value(durable_state_path, checkpoint)?;
+    Ok(checkpoint)
+}
+
+fn validated_authority_clock_restart_checkpoint(
+    binding: ControlPlaneAuthorityClockCheckpointBinding,
+    committed_timestamp_high_water_ms: Option<u64>,
+    authority_clock: &mut ControlPlaneAuthorityClock,
+    wall_time_ms: u64,
+    health_time_ms: Option<u64>,
+) -> Result<ControlPlaneAuthorityClockRestartCheckpoint, ControlPlaneError> {
+    authority_clock.effective_now_ms(wall_time_ms, health_time_ms)?;
+    let health_time_ms =
+        health_time_ms.ok_or(ControlPlaneError::AuthorityClockSourceUnavailable)?;
+    Ok(ControlPlaneAuthorityClockRestartCheckpoint::new(
+        binding,
+        committed_timestamp_high_water_ms,
+        wall_time_ms,
+        health_time_ms,
+    ))
+}
+
+fn store_authority_clock_restart_checkpoint_value(
+    durable_state_path: &Path,
+    checkpoint: ControlPlaneAuthorityClockRestartCheckpoint,
+) -> Result<(), ControlPlaneError> {
+    let checkpoint_path = authority_clock_restart_checkpoint_path(durable_state_path);
+    let tmp_path = authority_clock_restart_checkpoint_tmp_path(durable_state_path);
+    store_control_plane_sidecar(
+        &checkpoint_path,
+        &tmp_path,
+        &checkpoint.encode(),
+        ControlPlaneSidecarIoContexts {
+            create: "create control-plane authority clock checkpoint",
+            write: "write control-plane authority clock checkpoint",
+            sync: "sync control-plane authority clock checkpoint",
+            rename: "commit control-plane authority clock checkpoint",
+            directory: "sync control-plane authority clock checkpoint directory",
+        },
+    )?;
+    Ok(())
 }
 
 impl ControlPlaneStore for FileControlPlaneStore {
@@ -4597,11 +5202,25 @@ impl ControlPlaneStore for FileControlPlaneStore {
     }
 
     fn save(&self, snapshot: &ClusterControlSnapshot) -> Result<(), ControlPlaneError> {
+        let state_existed = self.path.exists();
         if let Some(parent) = state_parent(&self.path) {
             std::fs::create_dir_all(parent).map_err(|source| ControlPlaneError::Io {
                 context: "create control-plane state directory",
                 source,
             })?;
+        }
+        if !state_existed {
+            let binding = self.load_or_create_authority_clock_checkpoint_binding()?;
+            if self
+                .load_authority_clock_restart_checkpoint(binding)?
+                .is_none()
+            {
+                store_authority_clock_restart_checkpoint(
+                    &self.path,
+                    binding,
+                    snapshot.max_committed_timestamp_ms(),
+                )?;
+            }
         }
         let tmp_path = self.path.with_extension("tmp");
         {
@@ -9044,16 +9663,18 @@ where
     Ok(ControlPlaneRpcResponse { kind, payload })
 }
 
-pub fn build_control_plane_authority_clock_admin_response<T, F>(
+pub fn build_control_plane_authority_clock_admin_response<T, P, F>(
     control_plane: &T,
     authority_clock: &mut ControlPlaneAuthorityClock,
     request: ControlPlaneRpcRequest,
     auth_verifier: Option<&ControlPlaneUnixAuthVerifier>,
     sample: ControlPlaneAuthorityClockAdminSample,
+    before_response_sign: P,
     mut response_authority_now_ms: F,
 ) -> Result<ControlPlaneRpcResponse, ControlPlaneError>
 where
     T: ControlPlaneAdmin,
+    P: FnOnce(&T, &mut ControlPlaneAuthorityClock) -> Result<(), ControlPlaneError>,
     F: FnMut() -> Result<u64, ControlPlaneError>,
 {
     let ControlPlaneRpcRequest { kind, payload } = request;
@@ -9109,6 +9730,9 @@ where
         }),
         _ => unreachable!("authority-clock RPC kind checked above"),
     };
+    if kind == ControlPlaneRpcKind::ReestablishAuthorityClock && response.is_ok() {
+        before_response_sign(control_plane, authority_clock)?;
+    }
     let response_authority_now_ms = response_authority_now_ms()?;
     let payload = sign_control_plane_response_payload(
         kind,
@@ -9801,6 +10425,7 @@ fn write_authority_clock_blocked_reason(
             Some(ControlPlaneAuthorityClockBlockedReason::ClockHealthRegression) => 4,
             Some(ControlPlaneAuthorityClockBlockedReason::WallClockRegression) => 5,
             Some(ControlPlaneAuthorityClockBlockedReason::WallClockForwardJump) => 6,
+            Some(ControlPlaneAuthorityClockBlockedReason::CheckpointPersistenceFailure) => 7,
         },
     );
 }
@@ -9827,6 +10452,9 @@ fn read_authority_clock_blocked_reason(
         )),
         6 => Ok(Some(
             ControlPlaneAuthorityClockBlockedReason::WallClockForwardJump,
+        )),
+        7 => Ok(Some(
+            ControlPlaneAuthorityClockBlockedReason::CheckpointPersistenceFailure,
         )),
         tag => Err(ControlPlaneError::RpcProtocol {
             message: format!("invalid authority-clock blocked-reason tag {tag}"),
@@ -10745,6 +11373,9 @@ pub enum ControlPlaneError {
 
     #[error("control-plane state parse error at line {line}: {message}")]
     Parse { line: usize, message: String },
+
+    #[error("control-plane authority clock checkpoint error: {message}")]
+    AuthorityClockCheckpoint { message: String },
 
     #[error("control-plane RPC protocol error: {message}")]
     RpcProtocol { message: String },
@@ -16736,6 +17367,7 @@ mod tests {
             status_request,
             Some(&verifier),
             ControlPlaneAuthorityClockAdminSample::new(wall_ms, wall_ms, Some(50)),
+            |_, _| Ok(()),
             || Ok(wall_ms),
         )
         .unwrap();
@@ -16769,13 +17401,24 @@ mod tests {
             Some(wall_ms),
             Some(wall_ms + 1_000),
         );
+        let checkpoint_persisted = std::cell::Cell::new(false);
         let recovery_response = build_control_plane_authority_clock_admin_response(
             &authority,
             &mut clock,
             recovery_request,
             Some(&verifier),
             ControlPlaneAuthorityClockAdminSample::new(wall_ms, wall_ms, Some(50)),
-            || Ok(wall_ms),
+            |_, _| {
+                checkpoint_persisted.set(true);
+                Ok(())
+            },
+            || {
+                assert!(
+                    checkpoint_persisted.get(),
+                    "recovery checkpoint must persist before response-time sampling"
+                );
+                Ok(wall_ms)
+            },
         )
         .unwrap();
         let recovery_payload = client
@@ -16813,6 +17456,7 @@ mod tests {
             stale_request,
             Some(&verifier),
             ControlPlaneAuthorityClockAdminSample::new(wall_ms, wall_ms + 1, Some(51)),
+            |_, _| Ok(()),
             || Ok(wall_ms + 1),
         )
         .unwrap();
@@ -16833,6 +17477,7 @@ mod tests {
 
     #[test]
     fn authenticated_authority_clock_status_observes_missing_health_sample() {
+        let checkpoint_callback_invoked = std::cell::Cell::new(false);
         let tmp = test_util::tempdir();
         let authority = SingleAuthorityControlPlane::open(FileControlPlaneStore::new(
             tmp.path().join("control-plane.state"),
@@ -16859,7 +17504,20 @@ mod tests {
             request,
             Some(&verifier),
             ControlPlaneAuthorityClockAdminSample::new(1_001, 1_001, None),
-            || Ok(1_001),
+            |_, _| {
+                checkpoint_callback_invoked.set(true);
+                Err(ControlPlaneError::Io {
+                    context: "unexpected status checkpoint callback",
+                    source: std::io::Error::other("status must not persist a checkpoint"),
+                })
+            },
+            || {
+                assert!(
+                    !checkpoint_callback_invoked.get(),
+                    "status must sample response time without checkpoint persistence"
+                );
+                Ok(1_001)
+            },
         )
         .unwrap();
         let payload = client
@@ -16879,6 +17537,142 @@ mod tests {
             status.blocked_reason(),
             Some(ControlPlaneAuthorityClockBlockedReason::ClockSourceUnavailable)
         );
+        assert!(!checkpoint_callback_invoked.get());
+    }
+
+    #[test]
+    fn authenticated_authority_clock_healthy_status_does_not_persist_checkpoint() {
+        let tmp = test_util::tempdir();
+        let authority = SingleAuthorityControlPlane::open(FileControlPlaneStore::new(
+            tmp.path().join("control-plane.state"),
+        ))
+        .unwrap();
+        let mut clock = ControlPlaneAuthorityClock::new(None, 1_000, Some(50)).unwrap();
+        let verifier = admin_auth_verifier("auth-cluster", "admin-1");
+        let signer = admin_auth_credential("auth-cluster", "admin-1");
+        let request = signed_admin_control_plane_request(
+            ControlPlaneRpcKind::AuthorityClockStatus,
+            &signer,
+            Vec::new(),
+            Some(1_001),
+            Some(2_001),
+        );
+        let checkpoint_callback_invoked = std::cell::Cell::new(false);
+
+        let response = build_control_plane_authority_clock_admin_response(
+            &authority,
+            &mut clock,
+            request,
+            Some(&verifier),
+            ControlPlaneAuthorityClockAdminSample::new(1_001, 1_001, Some(51)),
+            |_, _| {
+                checkpoint_callback_invoked.set(true);
+                Err(ControlPlaneError::Io {
+                    context: "unexpected status checkpoint callback",
+                    source: std::io::Error::other("status must not persist a checkpoint"),
+                })
+            },
+            || Ok(1_001),
+        )
+        .unwrap();
+        assert!(!checkpoint_callback_invoked.get());
+        assert!(clock
+            .status(authority.authority_clock_context().unwrap())
+            .established());
+
+        let client = AuthenticatedUnixControlPlaneClient::new(
+            UnixControlPlaneClient::new(tmp.path().join("unused.sock")),
+            signer,
+        );
+        let payload = client
+            .verify_admin_control_plane_response(
+                ControlPlaneRpcKind::AuthorityClockStatus,
+                1_001,
+                &response.payload,
+            )
+            .and_then(decode_control_plane_rpc_response)
+            .unwrap();
+        let mut reader = PayloadReader::new(&payload);
+        assert!(read_authority_clock_status(&mut reader)
+            .unwrap()
+            .established());
+        reader.finish().unwrap();
+    }
+
+    #[test]
+    fn authority_clock_recovery_rejects_clock_step_before_checkpoint_persistence() {
+        let tmp = test_util::tempdir();
+        let mut authority = SingleAuthorityControlPlane::open(FileControlPlaneStore::new(
+            tmp.path().join("control-plane.state"),
+        ))
+        .unwrap();
+        authority.expire_heartbeat_leases(1_000).unwrap();
+        let context = authority.authority_clock_context().unwrap();
+        let mut clock = ControlPlaneAuthorityClock::new(Some(1_000), 2_500, Some(1_000)).unwrap();
+        let blocked = clock.status(context);
+        assert!(!blocked.established());
+        let verifier = admin_auth_verifier("auth-cluster", "admin-1");
+        let signer = admin_auth_credential("auth-cluster", "admin-1");
+        let mut recovery_payload = Vec::new();
+        write_u64(&mut recovery_payload, blocked.generation());
+        write_option_u64(
+            &mut recovery_payload,
+            blocked.committed_timestamp_high_water_ms(),
+        );
+        write_option_u64(
+            &mut recovery_payload,
+            blocked.current_raft_leadership_term(),
+        );
+        let request = signed_admin_control_plane_request(
+            ControlPlaneRpcKind::ReestablishAuthorityClock,
+            &signer,
+            recovery_payload,
+            Some(2_500),
+            Some(3_500),
+        );
+        let response_clock_sampled = std::cell::Cell::new(false);
+        let binding = ControlPlaneAuthorityClockCheckpointBinding::for_raft("test-cluster", 1);
+
+        let error = build_control_plane_authority_clock_admin_response(
+            &authority,
+            &mut clock,
+            request,
+            Some(&verifier),
+            ControlPlaneAuthorityClockAdminSample::new(2_500, 2_500, Some(1_000)),
+            |_, clock| {
+                validated_authority_clock_restart_checkpoint(
+                    binding,
+                    Some(1_000),
+                    clock,
+                    4_501,
+                    Some(1_000),
+                )
+                .map(drop)
+            },
+            || {
+                response_clock_sampled.set(true);
+                Ok(4_501)
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            ControlPlaneError::CommittedTimestampTooFarAhead { .. }
+        ));
+        assert!(!response_clock_sampled.get());
+        assert_eq!(
+            clock.status(context).blocked_reason(),
+            Some(ControlPlaneAuthorityClockBlockedReason::WallClockForwardJump)
+        );
+
+        let restarted = ControlPlaneAuthorityClock::new_with_restart_checkpoint(
+            Some(1_000),
+            4_501,
+            Some(1_000),
+            None,
+        )
+        .unwrap();
+        assert!(!restarted.status(context).established());
     }
 
     #[test]
@@ -16900,6 +17694,7 @@ mod tests {
                 request,
                 None,
                 ControlPlaneAuthorityClockAdminSample::new(1_000, 1_000, Some(50)),
+                |_, _| Ok(()),
                 || Ok(1_000),
             ),
             Err(ControlPlaneError::RpcProtocol { ref message })
@@ -16947,6 +17742,7 @@ mod tests {
                         now_ms,
                         Some(50u64.saturating_add(elapsed_ms)),
                     ),
+                    |_, _| Ok(()),
                     || Ok(now_ms),
                 )
                 .unwrap();
@@ -23428,6 +24224,287 @@ mod tests {
             })
         ));
         assert_eq!(authority.snapshot(), &before);
+    }
+
+    #[test]
+    fn authority_clock_accepts_long_restart_when_wall_and_health_elapsed_match() {
+        let binding = ControlPlaneAuthorityClockCheckpointBinding::for_raft("test-cluster", 1);
+        let checkpoint =
+            ControlPlaneAuthorityClockRestartCheckpoint::new(binding, Some(1_000), 1_000, 50);
+        let mut clock = ControlPlaneAuthorityClock::new_with_restart_checkpoint(
+            Some(1_000),
+            3_601_000,
+            Some(3_600_050),
+            Some(checkpoint),
+        )
+        .unwrap();
+
+        assert_eq!(
+            clock.effective_now_ms(3_601_001, Some(3_600_051)).unwrap(),
+            3_601_001
+        );
+    }
+
+    #[test]
+    fn authority_clock_restart_checkpoint_rejects_elapsed_clock_divergence() {
+        let binding = ControlPlaneAuthorityClockCheckpointBinding::for_raft("test-cluster", 1);
+        let checkpoint =
+            ControlPlaneAuthorityClockRestartCheckpoint::new(binding, Some(1_000), 1_000, 50);
+        let mut clock = ControlPlaneAuthorityClock::new_with_restart_checkpoint(
+            Some(1_000),
+            3_601_000 + CONTROL_PLANE_AUTHORITY_CLOCK_SKEW_BUDGET_MS + 1,
+            Some(3_600_050),
+            Some(checkpoint),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            clock.effective_now_ms(
+                3_601_000 + CONTROL_PLANE_AUTHORITY_CLOCK_SKEW_BUDGET_MS + 1,
+                Some(3_600_050),
+            ),
+            Err(ControlPlaneError::AuthorityClockNotEstablished {
+                blocked_reason: Some(
+                    ControlPlaneAuthorityClockBlockedReason::InitialTimestampDiscontinuity
+                ),
+            })
+        ));
+    }
+
+    #[test]
+    fn authority_clock_restart_checkpoint_rejects_health_regression_and_wrong_high_water() {
+        let binding = ControlPlaneAuthorityClockCheckpointBinding::for_raft("test-cluster", 1);
+        let checkpoint =
+            ControlPlaneAuthorityClockRestartCheckpoint::new(binding, Some(1_000), 1_000, 500);
+        let health_regressed = ControlPlaneAuthorityClock::new_with_restart_checkpoint(
+            Some(1_000),
+            1_100,
+            Some(499),
+            Some(checkpoint),
+        )
+        .unwrap();
+        assert!(!health_regressed
+            .status(ControlPlaneAuthorityClockContext::new(
+                Some(1_000),
+                None,
+                true,
+            ))
+            .established());
+
+        let checkpoint_ahead =
+            ControlPlaneAuthorityClockRestartCheckpoint::new(binding, Some(1_002), 1_002, 500);
+        let wrong_high_water = ControlPlaneAuthorityClock::new_with_restart_checkpoint(
+            Some(1_001),
+            1_102,
+            Some(600),
+            Some(checkpoint_ahead),
+        )
+        .unwrap();
+        assert!(!wrong_high_water
+            .status(ControlPlaneAuthorityClockContext::new(
+                Some(1_001),
+                None,
+                true,
+            ))
+            .established());
+    }
+
+    #[test]
+    fn durable_authority_clock_requires_checkpoint_for_restored_timestamp_state() {
+        let clock = ControlPlaneAuthorityClock::new_with_restart_checkpoint(
+            Some(1_000),
+            1_000,
+            Some(500),
+            None,
+        )
+        .unwrap();
+
+        assert!(!clock
+            .status(ControlPlaneAuthorityClockContext::new(
+                Some(1_000),
+                None,
+                true,
+            ))
+            .established());
+    }
+
+    #[test]
+    fn file_backed_authority_does_not_replace_blocked_restart_checkpoint() {
+        let tmp = test_util::tempdir();
+        let state_path = tmp.path().join("control-plane.state");
+        crate::clock::with_time_override(1_000, || {
+            let store = FileControlPlaneStore::new(&state_path);
+            let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+            authority
+                .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
+                .unwrap();
+            assert!(heartbeat_until_serving(&mut authority, 1, 1_000).serving());
+        });
+        let binding = FileControlPlaneStore::new(&state_path)
+            .load_or_create_authority_clock_checkpoint_binding()
+            .unwrap();
+        let invalid_checkpoint =
+            ControlPlaneAuthorityClockRestartCheckpoint::new(binding, Some(1_001), 1_000, 2_000);
+        std::fs::write(
+            authority_clock_restart_checkpoint_path(&state_path),
+            invalid_checkpoint.encode(),
+        )
+        .unwrap();
+
+        for _ in 0..2 {
+            crate::clock::with_time_override(5_000, || {
+                let store = FileControlPlaneStore::new(&state_path);
+                let authority = SingleAuthorityControlPlane::open(store).unwrap();
+                assert_eq!(
+                    load_authority_clock_restart_checkpoint(&state_path, binding).unwrap(),
+                    Some(invalid_checkpoint)
+                );
+                let clock =
+                    ControlPlaneAuthorityClock::new_from_process_clock_with_restart_checkpoint(
+                        authority.snapshot().max_committed_timestamp_ms(),
+                        Some(invalid_checkpoint),
+                    )
+                    .unwrap();
+                assert!(!clock
+                    .status(ControlPlaneAuthorityClockContext::new(
+                        authority.snapshot().max_committed_timestamp_ms(),
+                        None,
+                        true,
+                    ))
+                    .established());
+            });
+        }
+    }
+
+    #[test]
+    fn authority_clock_restart_checkpoint_file_round_trips_and_rejects_corruption() {
+        let tmp = test_util::tempdir();
+        let state_path = tmp.path().join("control-plane.state");
+        let binding = FileControlPlaneStore::new(&state_path)
+            .load_or_create_authority_clock_checkpoint_binding()
+            .unwrap();
+        let stored = crate::clock::with_time_override(5_000, || {
+            store_authority_clock_restart_checkpoint(&state_path, binding, Some(4_999)).unwrap()
+        });
+        assert_eq!(
+            load_authority_clock_restart_checkpoint(&state_path, binding).unwrap(),
+            Some(stored)
+        );
+
+        let checkpoint_path = authority_clock_restart_checkpoint_path(&state_path);
+        let mut bytes = std::fs::read(&checkpoint_path).unwrap();
+        bytes[CONTROL_PLANE_CLOCK_CHECKPOINT_MAGIC.len() + 2] ^= 1;
+        std::fs::write(checkpoint_path, bytes).unwrap();
+        assert!(matches!(
+            load_authority_clock_restart_checkpoint(&state_path, binding),
+            Err(ControlPlaneError::AuthorityClockCheckpoint { ref message })
+                if message.contains("checksum mismatch")
+        ));
+    }
+
+    #[test]
+    fn authority_clock_restart_checkpoint_rejects_wrong_raft_cluster_and_node() {
+        let tmp = test_util::tempdir();
+        let state_path = tmp.path().join("control-plane.state");
+        let binding = ControlPlaneAuthorityClockCheckpointBinding::for_raft("cluster-a", 1);
+        crate::clock::with_time_override(5_000, || {
+            store_authority_clock_restart_checkpoint(&state_path, binding, Some(4_999)).unwrap();
+        });
+
+        for wrong_binding in [
+            ControlPlaneAuthorityClockCheckpointBinding::for_raft("cluster-b", 1),
+            ControlPlaneAuthorityClockCheckpointBinding::for_raft("cluster-a", 2),
+        ] {
+            assert!(matches!(
+                load_authority_clock_restart_checkpoint(&state_path, wrong_binding),
+                Err(ControlPlaneError::AuthorityClockCheckpoint { ref message })
+                    if message.contains("identity does not match")
+            ));
+        }
+    }
+
+    #[test]
+    fn authority_clock_restart_checkpoint_rejects_wrong_single_authority_identity() {
+        let tmp = test_util::tempdir();
+        let first_path = tmp.path().join("first.state");
+        let second_path = tmp.path().join("second.state");
+        let first_binding = FileControlPlaneStore::new(&first_path)
+            .load_or_create_authority_clock_checkpoint_binding()
+            .unwrap();
+        let second_binding = FileControlPlaneStore::new(&second_path)
+            .load_or_create_authority_clock_checkpoint_binding()
+            .unwrap();
+        assert_ne!(first_binding, second_binding);
+        crate::clock::with_time_override(5_000, || {
+            store_authority_clock_restart_checkpoint(&first_path, first_binding, Some(4_999))
+                .unwrap();
+        });
+
+        assert!(matches!(
+            load_authority_clock_restart_checkpoint(&first_path, second_binding),
+            Err(ControlPlaneError::AuthorityClockCheckpoint { ref message })
+                if message.contains("identity does not match")
+        ));
+    }
+
+    #[test]
+    fn authority_clock_restart_checkpoint_rejects_oversized_sparse_file_before_reading() {
+        let tmp = test_util::tempdir();
+        let state_path = tmp.path().join("control-plane.state");
+        let binding = ControlPlaneAuthorityClockCheckpointBinding::for_raft("cluster-a", 1);
+        crate::clock::with_time_override(5_000, || {
+            store_authority_clock_restart_checkpoint(&state_path, binding, Some(4_999)).unwrap();
+        });
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(authority_clock_restart_checkpoint_path(&state_path))
+            .unwrap()
+            .set_len(1 << 30)
+            .unwrap();
+
+        assert!(matches!(
+            load_authority_clock_restart_checkpoint(&state_path, binding),
+            Err(ControlPlaneError::AuthorityClockCheckpoint { ref message })
+                if message.contains("does not match required fixed length")
+        ));
+    }
+
+    #[test]
+    fn file_backed_authority_restarts_after_long_elapsed_downtime_without_recovery() {
+        let tmp = test_util::tempdir();
+        let state_path = tmp.path().join("control-plane.state");
+        crate::clock::with_time_override(1_001, || {
+            let store = FileControlPlaneStore::new(&state_path);
+            let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+            authority
+                .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
+                .unwrap();
+            assert!(heartbeat_until_serving(&mut authority, 1, 1_000).serving());
+        });
+
+        let store = FileControlPlaneStore::new(&state_path);
+        let binding = store
+            .load_or_create_authority_clock_checkpoint_binding()
+            .unwrap();
+        let checkpoint = store
+            .load_authority_clock_restart_checkpoint(binding)
+            .unwrap()
+            .expect("file-backed state should have a clock checkpoint");
+        crate::clock::with_time_override(3_601_001, || {
+            let authority = SingleAuthorityControlPlane::open(store).unwrap();
+            let clock = ControlPlaneAuthorityClock::new_from_process_clock_with_restart_checkpoint(
+                authority.snapshot().max_committed_timestamp_ms(),
+                Some(checkpoint),
+            )
+            .unwrap();
+            assert!(clock
+                .status(ControlPlaneAuthorityClockContext::new(
+                    authority.snapshot().max_committed_timestamp_ms(),
+                    None,
+                    true,
+                ))
+                .established());
+        });
     }
 
     #[test]

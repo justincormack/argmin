@@ -11046,6 +11046,28 @@ Phase 12.4 progress:
   regression. Authority sampling now brackets wall time with health-clock
   reads, retries wide windows, and defers persistently imprecise samples
   without latching. Accepted reads add no uncertainty to the 1,000 ms budget.
+  A second restart-soak finding showed that comparing a fresh wall sample
+  directly with the last committed timestamp also rejected healthy process
+  restarts whose downtime exceeded that budget. Durable single-authority and
+  per-node Raft state are now paired with a checksummed node-local
+  wall/health-clock checkpoint. Restart accepts unbounded elapsed downtime only
+  when wall and suspend-inclusive health elapsed time agree within the budget;
+  missing, corrupt, regressed, divergent, or high-water-mismatched checkpoints
+  fail closed and require authenticated recovery. A checkpoint may anchor an
+  older durable timestamp prefix, but may not be newer than restored state;
+  authenticated recovery replaces it before acknowledging success. This
+  fixed-size checkpoint is bound to cluster/local-node identity for Raft and a
+  random persisted durable identity for single-authority state, so it cannot be
+  substituted between authorities sharing a host clock. Reads reject an
+  unexpected file size before allocation, and authenticated recovery samples
+  and signs the response only after checkpoint file/directory sync. The
+  persistence-time wall/health pair is freshly validated through the authority
+  clock and that exact accepted pair is encoded, so an intervening clock step
+  aborts recovery rather than becoming a trusted baseline. Routine status
+  requests remain observational and never persist or relatch on checkpoint I/O;
+  that durability requirement applies only to successful re-establishment. The
+  checkpoint is local evidence and is never transferred as replicated Raft
+  state.
 
 1. define the replicated control-plane state machine:
    - state includes cluster epoch, PG count, PG state, PG acting sets, node

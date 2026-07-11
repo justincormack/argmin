@@ -80,10 +80,35 @@ The authority process establishes a wall/monotonic reference before issuing
 timestamp-bearing work. Healthy wall progress may advance committed time by
 the corresponding monotonic elapsed time, even when the authority has been
 idle for longer than the skew budget. A wall/monotonic divergence beyond the
-budget latches the authority clock non-serving. On restart, the clock starts
-established only when local wall time is within the skew budget of the
-persisted timestamp high-water. A larger discontinuity requires the explicit
-authority clock re-establishment procedure.
+budget latches the authority clock non-serving. Durable control-plane state is
+paired with a checksummed, node-local checkpoint naming a durable timestamp
+prefix, one coherent wall/health-clock sample, and a fixed durable-authority
+identity binding. Raft bindings cover cluster identity plus local node ID;
+single-authority state has a separately persisted random durable identity. A
+checkpoint copied from another authority therefore fails closed even when both
+processes share the same host clocks. On restart,
+arbitrarily long elapsed time is accepted when both clocks advanced by the
+same amount within the skew budget. The restored high-water may advance beyond
+the checkpoint while that process remains clock-healthy, but it may never be
+older than the checkpoint. A missing, corrupt, high-water-mismatched,
+regressed, or divergent checkpoint fails closed and requires the explicit
+authority clock re-establishment procedure. Successful re-establishment
+replaces the checkpoint before the admin RPC acknowledges success; a
+checkpoint persistence failure re-latches the authority non-serving. The
+checkpoint is local clock-lineage evidence; it is not replicated authority and
+must never be copied between Raft nodes.
+
+Recovery checkpointing takes a fresh wall/health sample, validates it through
+the already re-established authority clock, and persists that exact accepted
+sample before sampling the signed response time. A clock step between the
+admin request and persistence therefore aborts the response and re-latches the
+clock instead of becoming a trusted restart baseline.
+
+`AuthorityClockStatus` is observational: it may latch a genuine fault found by
+its accepted clock sample, but it never writes or refreshes the restart
+checkpoint. Checkpoint persistence and persistence-failure fencing apply only
+to a successful `ReestablishAuthorityClock` mutation, so routine diagnostics
+cannot turn transient sampling or sidecar I/O pressure into an outage.
 
 Wall and clock-health reads are not an atomic operating-system operation. The
 authority brackets each wall read with two health-clock reads and accepts it

@@ -43,8 +43,9 @@ use openraft::{AnyError, Config};
 use placement::NodeId;
 
 use crate::control_plane::{
-    AuthorityIncarnation, ClusterControlSnapshot, ClusterRuntimeMapSnapshot, ControlPlaneError,
-    NodeAvailabilityState, NodeMembershipState,
+    AuthorityIncarnation, ClusterControlSnapshot, ClusterRuntimeMapSnapshot,
+    ControlPlaneAuthorityClockCheckpointBinding, ControlPlaneError, NodeAvailabilityState,
+    NodeMembershipState,
 };
 use crate::control_plane_auth::{
     ControlPlaneAuthDecision, ControlPlaneAuthEnvelope, ControlPlaneAuthOperation,
@@ -3359,6 +3360,13 @@ fn restore_experimental_raft_durable_artifact(
 }
 
 impl ControlPlaneRaftAuthority {
+    #[must_use]
+    pub fn authority_clock_checkpoint_binding(
+        &self,
+    ) -> ControlPlaneAuthorityClockCheckpointBinding {
+        ControlPlaneAuthorityClockCheckpointBinding::for_raft(&self.cluster_name, self.node_id)
+    }
+
     pub async fn new_experimental_single_node_in_memory(
         cluster_name: impl Into<String>,
         node_id: ControlPlaneRaftNodeId,
@@ -3843,9 +3851,14 @@ impl ControlPlaneRaftAuthority {
     pub async fn store_durable_restart_artifact(
         &self,
         path: &Path,
-    ) -> Result<(), ControlPlaneError> {
+    ) -> Result<Option<u64>, ControlPlaneError> {
         let artifact = self.capture_durable_restart_artifact().await?;
         let wal_replay_offset = artifact.wal_replay_offset;
+        let committed_timestamp_high_water_ms = artifact
+            .state_machine
+            .inner
+            .snapshot()
+            .max_committed_timestamp_ms();
         artifact.store_durable_artifact(path)?;
         if let Some(log_store) = &self.log_store {
             log_store
@@ -3855,7 +3868,7 @@ impl ControlPlaneRaftAuthority {
                     source,
                 })?;
         }
-        Ok(())
+        Ok(committed_timestamp_high_water_ms)
     }
 
     async fn capture_durable_restart_artifact(

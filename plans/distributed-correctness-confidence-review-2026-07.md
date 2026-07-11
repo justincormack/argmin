@@ -315,6 +315,29 @@ millisecond, and treats a persistently wide window as a transient admission
 failure without latching or changing clock generation. This retains the exact
 1,000 ms skew budget rather than increasing it to accommodate scheduler load.
 
+Restart-soak follow-up found a separate startup availability defect: the
+authority compared current wall time directly with the committed timestamp
+high-water, so ordinary downtime longer than 1,000 ms required manual clock
+re-establishment. Durable state is now paired with a checksummed node-local
+wall/health-clock checkpoint. Startup accepts arbitrary elapsed downtime only
+when both clocks advanced consistently and the checkpoint names a durable
+timestamp prefix no newer than the restored high-water; all missing, corrupt,
+regressed, divergent, and mismatched cases remain fail-closed. Explicit
+re-establishment replaces the checkpoint before success is acknowledged. The
+fixed-size checkpoint is bound to the Raft cluster/local-node identity or a
+random durable single-authority identity, so copying it between authorities is
+rejected before clock validation. It is host-local evidence rather than
+replicated state and is persisted independently by every Raft node. Sidecar
+size is checked before a fixed-size read, and admin recovery samples/signs its
+response only after checkpoint file and directory durability complete. A
+checkpoint write failure re-latches the clock non-serving before returning the
+error. The persistence sample itself is freshly validated through the authority
+clock and the exact accepted wall/health pair is encoded, preventing a clock
+step between admin validation and fsync from becoming a new trusted baseline.
+Routine authority-clock status remains observational and never invokes the
+checkpoint callback; only successful re-establishment requires persistence or
+can latch a checkpoint persistence failure.
+
 Required design:
 
 1. Write and enforce the invariant
