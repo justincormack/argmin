@@ -41,7 +41,7 @@ use super::authz_results::{
     AuthorizedPutBucketLifecycle, AuthorizedPutBucketObjectLockConfiguration,
     AuthorizedPutBucketOwnershipControls, AuthorizedPutBucketPolicy,
     AuthorizedPutBucketPublicAccessBlock, AuthorizedPutBucketTagging,
-    AuthorizedPutBucketVersioning, AuthorizedUploadPartCopy,
+    AuthorizedPutBucketVersioning, AuthorizedUploadPartCopy, ObjectAttributePermissions,
 };
 use super::authz_types::{AuthorizedPutObjectWrite, AuthorizedPutObjectWriteAcl, ValidatedBucket};
 use super::bucket_handles::{
@@ -344,7 +344,14 @@ impl Coordinator {
     fn authorize_object_read_snapshot(
         &self,
         req: AuthorizedObjectReadSnapshotRequest<'_>,
-    ) -> Result<(BucketSummary, storage::ObjectReadSnapshot), ServerError> {
+    ) -> Result<
+        (
+            BucketSummary,
+            storage::ObjectReadSnapshot,
+            ObjectAttributePermissions,
+        ),
+        ServerError,
+    > {
         self.authorize_object_read_snapshot_with_storage_node(&self.storage_node(), req)
     }
 
@@ -352,7 +359,14 @@ impl Coordinator {
         &self,
         storage_node: &Arc<StorageCluster>,
         req: AuthorizedObjectReadSnapshotRequest<'_>,
-    ) -> Result<(BucketSummary, storage::ObjectReadSnapshot), ServerError> {
+    ) -> Result<
+        (
+            BucketSummary,
+            storage::ObjectReadSnapshot,
+            ObjectAttributePermissions,
+        ),
+        ServerError,
+    > {
         let bucket = self.load_bucket_handle_for_modern_object_read_with_storage_node(
             storage_node,
             req.bucket,
@@ -1330,6 +1344,50 @@ impl Coordinator {
             object,
             || Self::requester_can_bucket_owner_account_admin(requester, bucket),
         )
+    }
+
+    pub(super) fn object_attribute_permissions_with_bucket_policy(
+        &self,
+        requester: &Requester,
+        bucket: &BucketSummary,
+        bucket_tags: Option<&[(String, String)]>,
+        object: &StoredObject,
+        tagging_action: auth::PolicyAction,
+        policy: Option<&auth::BucketPolicy>,
+    ) -> Result<ObjectAttributePermissions, ServerError> {
+        let object_lock_retention = self.requester_can_manage_object_lock_with_bucket_policy(
+            requester,
+            bucket,
+            bucket_tags,
+            object,
+            auth::PolicyAction::GetObjectRetention,
+            policy,
+        )?;
+        let object_lock_legal_hold = self.requester_can_manage_object_lock_with_bucket_policy(
+            requester,
+            bucket,
+            bucket_tags,
+            object,
+            auth::PolicyAction::GetObjectLegalHold,
+            policy,
+        )?;
+        let tag_count = self.requester_can_manage_object_tags_with_bucket_policy(
+            BucketPolicyAccess {
+                requester,
+                bucket,
+                bucket_tags,
+                policy,
+            },
+            object,
+            tagging_action,
+            None,
+        )?;
+
+        Ok(ObjectAttributePermissions::new(
+            object_lock_retention,
+            object_lock_legal_hold,
+            tag_count,
+        ))
     }
 
     pub(super) fn requester_can_delete_object_with_bucket_policy(

@@ -2714,7 +2714,7 @@ mod tests {
             size: 5,
             last_modified: 0,
             version_id: VersionId::Null,
-            tags: None,
+            tag_count: None,
             managed_encryption: None,
             lifecycle_expiration: None,
         };
@@ -2736,7 +2736,7 @@ mod tests {
             size: 4,
             last_modified: 0,
             version_id: VersionId::Null,
-            tags: None,
+            tag_count: None,
             managed_encryption: None,
             lifecycle_expiration: None,
         };
@@ -2760,7 +2760,7 @@ mod tests {
             size: 0,
             last_modified: 0,
             version_id: VersionId::Null,
-            tags: None,
+            tag_count: None,
             managed_encryption: None,
             lifecycle_expiration: None,
         };
@@ -2787,7 +2787,7 @@ mod tests {
             size: 0,
             last_modified: 0,
             version_id: VersionId::Null,
-            tags: None,
+            tag_count: None,
             managed_encryption: None,
             lifecycle_expiration: None,
         };
@@ -2821,7 +2821,7 @@ mod tests {
             size: 0,
             last_modified: 0,
             version_id: VersionId::Null,
-            tags: None,
+            tag_count: None,
             managed_encryption: None,
             lifecycle_expiration: None,
         };
@@ -2847,7 +2847,7 @@ mod tests {
             size: 0,
             last_modified: 0,
             version_id: VersionId::Null,
-            tags: None,
+            tag_count: None,
             managed_encryption: None,
             lifecycle_expiration: None,
         };
@@ -2874,7 +2874,7 @@ mod tests {
             size: 0,
             last_modified: 0,
             version_id: VersionId::Null,
-            tags: None,
+            tag_count: None,
             managed_encryption: None,
             lifecycle_expiration: None,
         };
@@ -2901,7 +2901,7 @@ mod tests {
             size: 0,
             last_modified: 0,
             version_id: VersionId::Null,
-            tags: None,
+            tag_count: None,
             managed_encryption: None,
             lifecycle_expiration: None,
         };
@@ -2932,7 +2932,7 @@ mod tests {
             size: 5,
             last_modified: 0,
             version_id: VersionId::Null,
-            tags: None,
+            tag_count: None,
             managed_encryption: None,
             lifecycle_expiration: Some(LifecycleExpirationHeader {
                 expiry_time_millis: 1_705_321_845_000,
@@ -2959,7 +2959,7 @@ mod tests {
             size: 1024,
             last_modified: 0,
             version_id: VersionId::Null,
-            tags: None,
+            tag_count: None,
             managed_encryption: None,
             lifecycle_expiration: None,
         };
@@ -2982,7 +2982,7 @@ mod tests {
             size: 0,
             last_modified: 0,
             version_id: VersionId::Null,
-            tags: None,
+            tag_count: None,
             managed_encryption: None,
             lifecycle_expiration: None,
         };
@@ -3007,7 +3007,7 @@ mod tests {
             size: 10,
             last_modified: 0,
             version_id: VersionId::Null,
-            tags: None,
+            tag_count: None,
             managed_encryption: None,
             lifecycle_expiration: None,
         };
@@ -3030,7 +3030,7 @@ mod tests {
             size: 10,
             last_modified: 0,
             version_id: VersionId::Null,
-            tags: None,
+            tag_count: None,
             managed_encryption: None,
             lifecycle_expiration: None,
         };
@@ -3053,7 +3053,7 @@ mod tests {
             size: 0,
             last_modified: 0,
             version_id: VersionId::Null,
-            tags: None,
+            tag_count: None,
             managed_encryption: None,
             lifecycle_expiration: None,
         };
@@ -3075,7 +3075,7 @@ mod tests {
             size: 0,
             last_modified: 0,
             version_id: VersionId::Null,
-            tags: None,
+            tag_count: None,
             managed_encryption: None,
             lifecycle_expiration: None,
         };
@@ -3098,7 +3098,7 @@ mod tests {
             size: 0,
             last_modified: 0,
             version_id: VersionId::Null,
-            tags: None,
+            tag_count: None,
             managed_encryption: None,
             lifecycle_expiration: None,
         };
@@ -3124,7 +3124,7 @@ mod tests {
             size: 0,
             last_modified: 0,
             version_id: VersionId::Null,
-            tags: None,
+            tag_count: None,
             managed_encryption: None,
             lifecycle_expiration: None,
         };
@@ -3151,7 +3151,7 @@ mod tests {
             size: 0,
             last_modified: 0,
             version_id: VersionId::Null,
-            tags: None,
+            tag_count: None,
             managed_encryption: None,
             lifecycle_expiration: Some(LifecycleExpirationHeader {
                 expiry_time_millis: 1_705_321_845_000,

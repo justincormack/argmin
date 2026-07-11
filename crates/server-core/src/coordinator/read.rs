@@ -16,6 +16,23 @@ use crate::conditional::check_read_conditions;
 use crate::error::ServerError;
 
 impl Coordinator {
+    fn authorized_tag_count(
+        &self,
+        attribute_permissions: super::authz_results::ObjectAttributePermissions,
+        tags: Option<&storage::SerializedTagSet>,
+    ) -> Result<Option<usize>, ServerError> {
+        if !attribute_permissions.tag_count_visible() {
+            return Ok(None);
+        }
+
+        let Some(tags) = tags else {
+            return Ok(None);
+        };
+
+        let count = Self::parse_serialized_tag_set(tags.as_str())?.len();
+        Ok((count > 0).then_some(count))
+    }
+
     /// Get an object from storage.
     pub fn get_object(&self, req: &GetObjectRequest) -> Result<GetObjectResult, ServerError> {
         observability::trace_scope!(
@@ -35,6 +52,7 @@ impl Coordinator {
         let AuthorizedObjectRead {
             bucket: bucket_summary,
             snapshot,
+            attribute_permissions,
         } = self.authorize_get_object_with_storage_node(&storage_node, req)?;
         let storage::ObjectReadSnapshot {
             stored,
@@ -103,12 +121,13 @@ impl Coordinator {
                 body,
                 metadata,
                 system_metadata,
-                object_lock: record.object_lock,
+                object_lock: attribute_permissions.visible_object_lock(record.object_lock),
                 etag: etag_str,
                 size: record.size,
                 last_modified: record.last_modified,
                 version_id: record.version_id,
-                tags: record.tags.map(Into::into),
+                tag_count: self
+                    .authorized_tag_count(attribute_permissions, record.tags.as_ref())?,
                 managed_encryption: record.encryption.managed_encryption_algorithm(),
                 sse_customer,
                 lifecycle_expiration,
@@ -161,12 +180,13 @@ impl Coordinator {
                 body,
                 metadata,
                 system_metadata,
-                object_lock: record.object_lock,
+                object_lock: attribute_permissions.visible_object_lock(record.object_lock),
                 etag: etag_str,
                 size: record.size,
                 last_modified: record.last_modified,
                 version_id: record.version_id,
-                tags: record.tags.map(Into::into),
+                tag_count: self
+                    .authorized_tag_count(attribute_permissions, record.tags.as_ref())?,
                 managed_encryption: record.encryption.managed_encryption_algorithm(),
                 sse_customer,
                 lifecycle_expiration,
@@ -202,6 +222,7 @@ impl Coordinator {
         let AuthorizedObjectRead {
             bucket: bucket_summary,
             snapshot,
+            attribute_permissions,
         } = self.authorize_get_object_with_storage_node(
             &storage_node,
             &GetObjectRequest {
@@ -314,7 +335,7 @@ impl Coordinator {
                 body,
                 metadata,
                 system_metadata,
-                object_lock: record.object_lock,
+                object_lock: attribute_permissions.visible_object_lock(record.object_lock),
                 etag: etag_str,
                 size: record.size,
                 part_size: part.record.size,
@@ -323,7 +344,8 @@ impl Coordinator {
                 part_end,
                 parts_count: obj_parts.len() as u32,
                 version_id: record.version_id,
-                tags: record.tags.map(Into::into),
+                tag_count: self
+                    .authorized_tag_count(attribute_permissions, record.tags.as_ref())?,
                 checksum,
                 managed_encryption: record.encryption.managed_encryption_algorithm(),
                 sse_customer,
@@ -384,7 +406,7 @@ impl Coordinator {
                 body,
                 metadata,
                 system_metadata,
-                object_lock: record.object_lock,
+                object_lock: attribute_permissions.visible_object_lock(record.object_lock),
                 etag: etag_str,
                 size: record.size,
                 part_size: record.size,
@@ -393,7 +415,8 @@ impl Coordinator {
                 part_end: record.size.saturating_sub(1),
                 parts_count: 1,
                 version_id: record.version_id,
-                tags: record.tags.map(Into::into),
+                tag_count: self
+                    .authorized_tag_count(attribute_permissions, record.tags.as_ref())?,
                 checksum: None,
                 managed_encryption: record.encryption.managed_encryption_algorithm(),
                 sse_customer,
@@ -425,6 +448,7 @@ impl Coordinator {
         let AuthorizedObjectRead {
             bucket: bucket_summary,
             snapshot,
+            attribute_permissions,
         } = self.authorize_head_object_for_part_with_storage_node(
             &storage_node,
             &GetObjectRequest {
@@ -516,7 +540,7 @@ impl Coordinator {
             Ok(HeadObjectPartResult {
                 metadata,
                 system_metadata,
-                object_lock: record.object_lock,
+                object_lock: attribute_permissions.visible_object_lock(record.object_lock),
                 etag: etag_str,
                 part_size: part.size,
                 part_start,
@@ -525,7 +549,8 @@ impl Coordinator {
                 last_modified: record.last_modified,
                 parts_count: obj_parts.len() as u32,
                 version_id: record.version_id,
-                tags: record.tags.map(Into::into),
+                tag_count: self
+                    .authorized_tag_count(attribute_permissions, record.tags.as_ref())?,
                 checksum,
                 managed_encryption: record.encryption.managed_encryption_algorithm(),
                 sse_customer,
@@ -561,7 +586,7 @@ impl Coordinator {
             Ok(HeadObjectPartResult {
                 metadata,
                 system_metadata,
-                object_lock: record.object_lock,
+                object_lock: attribute_permissions.visible_object_lock(record.object_lock),
                 etag: etag_str,
                 part_size: record.size,
                 part_start: 0,
@@ -570,7 +595,8 @@ impl Coordinator {
                 last_modified: record.last_modified,
                 parts_count: 1,
                 version_id: record.version_id,
-                tags: record.tags.map(Into::into),
+                tag_count: self
+                    .authorized_tag_count(attribute_permissions, record.tags.as_ref())?,
                 checksum: None,
                 managed_encryption: record.encryption.managed_encryption_algorithm(),
                 sse_customer,
@@ -599,6 +625,7 @@ impl Coordinator {
         let AuthorizedObjectRead {
             bucket: bucket_summary,
             snapshot,
+            attribute_permissions,
         } = self.authorize_head_object_with_storage_node(&storage_node, req)?;
         let storage::ObjectReadSnapshot {
             stored,
@@ -654,12 +681,12 @@ impl Coordinator {
         Ok(HeadObjectResult {
             metadata,
             system_metadata,
-            object_lock: record.object_lock,
+            object_lock: attribute_permissions.visible_object_lock(record.object_lock),
             etag: etag_str,
             size: record.size,
             last_modified: record.last_modified,
             version_id: record.version_id,
-            tags: record.tags.map(Into::into),
+            tag_count: self.authorized_tag_count(attribute_permissions, record.tags.as_ref())?,
             managed_encryption: record.encryption.managed_encryption_algorithm(),
             sse_customer,
             lifecycle_expiration,
@@ -690,6 +717,7 @@ impl Coordinator {
         let AuthorizedObjectRead {
             bucket: _,
             snapshot,
+            attribute_permissions: _,
         } = self.authorize_get_object_attributes(req)?;
         let storage::ObjectReadSnapshot {
             stored,
@@ -824,6 +852,7 @@ impl Coordinator {
         let AuthorizedObjectRead {
             bucket: bucket_summary,
             snapshot,
+            attribute_permissions,
         } = self.authorize_get_object_with_storage_node(
             &storage_node,
             &GetObjectRequest {
@@ -984,14 +1013,14 @@ impl Coordinator {
             body,
             metadata,
             system_metadata,
-            object_lock: record.object_lock,
+            object_lock: attribute_permissions.visible_object_lock(record.object_lock),
             etag: etag_str,
             size: record.size,
             last_modified: record.last_modified,
             range_start: user_start,
             range_end: user_end,
             version_id: record.version_id,
-            tags: record.tags.map(Into::into),
+            tag_count: self.authorized_tag_count(attribute_permissions, record.tags.as_ref())?,
             managed_encryption: record.encryption.managed_encryption_algorithm(),
             sse_customer,
             lifecycle_expiration,

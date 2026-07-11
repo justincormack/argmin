@@ -893,7 +893,14 @@ impl Coordinator {
         storage_node: &Arc<storage::StorageCluster>,
         req: AuthorizedObjectReadSnapshotRequest<'_>,
         bucket: NonBoeLoadedBucketHandle<'_>,
-    ) -> Result<(BucketSummary, storage::ObjectReadSnapshot), ServerError> {
+    ) -> Result<
+        (
+            BucketSummary,
+            storage::ObjectReadSnapshot,
+            ObjectAttributePermissions,
+        ),
+        ServerError,
+    > {
         let bucket_summary = bucket.bucket().clone();
         let bucket_info = ValidatedBucket(bucket.bucket().clone());
         let bucket_policy = self.cached_bucket_policy_for_loaded_handle(&bucket)?;
@@ -980,7 +987,14 @@ impl Coordinator {
                         }
                     };
                     if allowed {
-                        Ok(())
+                        self.object_attribute_permissions_with_bucket_policy(
+                            req.requester,
+                            &bucket_info,
+                            bucket_tags.as_deref(),
+                            stored,
+                            Coordinator::get_object_tagging_policy_action(req.version_id),
+                            bucket_policy.as_deref(),
+                        )
                     } else {
                         Err(ServerError::AccessDenied)
                     }
@@ -995,7 +1009,7 @@ impl Coordinator {
                     error,
                 )
             })??;
-        Ok((bucket_summary, outcome.snapshot))
+        Ok((bucket_summary, outcome.snapshot, outcome.value))
     }
 
     pub(super) fn authorize_copy_source_read_snapshot_non_boe(
@@ -1112,20 +1126,25 @@ impl Coordinator {
         storage_node: &Arc<storage::StorageCluster>,
         req: &GetObjectRequest<'_>,
     ) -> Result<AuthorizedObjectRead, ServerError> {
-        let (bucket, snapshot) = self.authorize_object_read_snapshot_with_storage_node(
-            storage_node,
-            AuthorizedObjectReadSnapshotRequest {
-                requester: req.object.requester(),
-                bucket: req.object.bucket_name_typed(),
-                key: req.object.key_typed(),
-                version_id: req.object.version_id,
-                expected_bucket_owner: req.expected_bucket_owner(),
-                missing_discovery: MissingObjectDiscovery::ReadBucket,
-                modern_action: ModernReadAction::from_get_object_version(req.object.version_id),
-                snapshot_mode: ObjectReadSnapshotMode::FullPayloadLayout,
-            },
-        )?;
-        Ok(AuthorizedObjectRead { bucket, snapshot })
+        let (bucket, snapshot, attribute_permissions) = self
+            .authorize_object_read_snapshot_with_storage_node(
+                storage_node,
+                AuthorizedObjectReadSnapshotRequest {
+                    requester: req.object.requester(),
+                    bucket: req.object.bucket_name_typed(),
+                    key: req.object.key_typed(),
+                    version_id: req.object.version_id,
+                    expected_bucket_owner: req.expected_bucket_owner(),
+                    missing_discovery: MissingObjectDiscovery::ReadBucket,
+                    modern_action: ModernReadAction::from_get_object_version(req.object.version_id),
+                    snapshot_mode: ObjectReadSnapshotMode::FullPayloadLayout,
+                },
+            )?;
+        Ok(AuthorizedObjectRead {
+            bucket,
+            snapshot,
+            attribute_permissions,
+        })
     }
 
     pub(in crate::coordinator) fn authorize_head_object_with_storage_node(
@@ -1133,27 +1152,32 @@ impl Coordinator {
         storage_node: &Arc<storage::StorageCluster>,
         req: &GetObjectRequest<'_>,
     ) -> Result<AuthorizedObjectRead, ServerError> {
-        let (bucket, snapshot) = self.authorize_object_read_snapshot_with_storage_node(
-            storage_node,
-            AuthorizedObjectReadSnapshotRequest {
-                requester: req.object.requester(),
-                bucket: req.object.bucket_name_typed(),
-                key: req.object.key_typed(),
-                version_id: req.object.version_id,
-                expected_bucket_owner: req.expected_bucket_owner(),
-                missing_discovery: MissingObjectDiscovery::ReadBucket,
-                modern_action: ModernReadAction::from_get_object_version(req.object.version_id),
-                snapshot_mode: ObjectReadSnapshotMode::MetadataOnly,
-            },
-        )?;
-        Ok(AuthorizedObjectRead { bucket, snapshot })
+        let (bucket, snapshot, attribute_permissions) = self
+            .authorize_object_read_snapshot_with_storage_node(
+                storage_node,
+                AuthorizedObjectReadSnapshotRequest {
+                    requester: req.object.requester(),
+                    bucket: req.object.bucket_name_typed(),
+                    key: req.object.key_typed(),
+                    version_id: req.object.version_id,
+                    expected_bucket_owner: req.expected_bucket_owner(),
+                    missing_discovery: MissingObjectDiscovery::ReadBucket,
+                    modern_action: ModernReadAction::from_get_object_version(req.object.version_id),
+                    snapshot_mode: ObjectReadSnapshotMode::MetadataOnly,
+                },
+            )?;
+        Ok(AuthorizedObjectRead {
+            bucket,
+            snapshot,
+            attribute_permissions,
+        })
     }
 
     pub(in crate::coordinator) fn authorize_get_object_attributes(
         &self,
         req: &GetObjectAttributesRequest<'_>,
     ) -> Result<AuthorizedObjectRead, ServerError> {
-        let (bucket, snapshot) =
+        let (bucket, snapshot, attribute_permissions) =
             self.authorize_object_read_snapshot(AuthorizedObjectReadSnapshotRequest {
                 requester: req.object.requester(),
                 bucket: req.object.bucket_name_typed(),
@@ -1170,7 +1194,11 @@ impl Coordinator {
                     ObjectReadSnapshotMode::MetadataOnly
                 },
             })?;
-        Ok(AuthorizedObjectRead { bucket, snapshot })
+        Ok(AuthorizedObjectRead {
+            bucket,
+            snapshot,
+            attribute_permissions,
+        })
     }
 
     pub(in crate::coordinator) fn authorize_head_object_for_part_with_storage_node(
@@ -1178,19 +1206,24 @@ impl Coordinator {
         storage_node: &Arc<storage::StorageCluster>,
         req: &GetObjectRequest<'_>,
     ) -> Result<AuthorizedObjectRead, ServerError> {
-        let (bucket, snapshot) = self.authorize_object_read_snapshot_with_storage_node(
-            storage_node,
-            AuthorizedObjectReadSnapshotRequest {
-                requester: req.object.requester(),
-                bucket: req.object.bucket_name_typed(),
-                key: req.object.key_typed(),
-                version_id: req.object.version_id,
-                expected_bucket_owner: req.expected_bucket_owner(),
-                missing_discovery: MissingObjectDiscovery::ReadBucket,
-                modern_action: ModernReadAction::from_get_object_version(req.object.version_id),
-                snapshot_mode: ObjectReadSnapshotMode::MultipartParts,
-            },
-        )?;
-        Ok(AuthorizedObjectRead { bucket, snapshot })
+        let (bucket, snapshot, attribute_permissions) = self
+            .authorize_object_read_snapshot_with_storage_node(
+                storage_node,
+                AuthorizedObjectReadSnapshotRequest {
+                    requester: req.object.requester(),
+                    bucket: req.object.bucket_name_typed(),
+                    key: req.object.key_typed(),
+                    version_id: req.object.version_id,
+                    expected_bucket_owner: req.expected_bucket_owner(),
+                    missing_discovery: MissingObjectDiscovery::ReadBucket,
+                    modern_action: ModernReadAction::from_get_object_version(req.object.version_id),
+                    snapshot_mode: ObjectReadSnapshotMode::MultipartParts,
+                },
+            )?;
+        Ok(AuthorizedObjectRead {
+            bucket,
+            snapshot,
+            attribute_permissions,
+        })
     }
 }

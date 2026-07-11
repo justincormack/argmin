@@ -9,7 +9,9 @@ use super::authz_types::{ActiveWriteEncryption, AuthorizedPutObjectWrite, Valida
 use super::request_types::{CreateBucketAcl, Requester};
 use super::response_types::{BucketSummary, GetBucketAclResult};
 use crate::sse::SseCustomerWriteContext;
-use s3_types::{AclGrants, BucketVersioningState, CanonicalUserId, VersionId};
+use s3_types::{
+    AclGrants, BucketVersioningState, CanonicalUserId, StoredLegalHoldStatus, VersionId,
+};
 use storage::BucketObjectOwnership;
 use storage::{
     AuthorizedMultipartUploadRecord, BucketAclSummary, BucketEncryptionConfig, BucketName,
@@ -214,6 +216,48 @@ pub(super) struct AuthorizedPutBucketAcl {
 pub(super) struct AuthorizedObjectRead {
     pub(super) bucket: BucketSummary,
     pub(super) snapshot: ObjectReadSnapshot,
+    pub(super) attribute_permissions: ObjectAttributePermissions,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct ObjectAttributePermissions {
+    object_lock_retention: bool,
+    object_lock_legal_hold: bool,
+    tag_count: bool,
+}
+
+impl ObjectAttributePermissions {
+    pub(super) fn new(
+        object_lock_retention: bool,
+        object_lock_legal_hold: bool,
+        tag_count: bool,
+    ) -> Self {
+        Self {
+            object_lock_retention,
+            object_lock_legal_hold,
+            tag_count,
+        }
+    }
+
+    pub(super) fn visible_object_lock(self, object_lock: ObjectLockState) -> ObjectLockState {
+        // HeadObject is still authorized as an object read; these bits only
+        // gate disclosure of optional Object Lock metadata headers.
+        ObjectLockState {
+            retention: self
+                .object_lock_retention
+                .then_some(())
+                .and(object_lock.retention),
+            legal_hold: if self.object_lock_legal_hold {
+                object_lock.legal_hold
+            } else {
+                StoredLegalHoldStatus::NotSet
+            },
+        }
+    }
+
+    pub(super) fn tag_count_visible(self) -> bool {
+        self.tag_count
+    }
 }
 
 pub(super) struct AuthorizedCopyObject {

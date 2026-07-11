@@ -11,10 +11,11 @@ use aws_sdk_s3::types::{
 use base64::Engine;
 use ring::hmac;
 use s3_tests::{
-    assert_s3_err_code, content_md5_header, err_status, raw_bucket, raw_object, raw_object_query,
-    send_signed_request,
+    assert_s3_err_code, content_md5_header, err_status,
+    eventually_raw_alt_object_status as eventually_raw_object_status, raw_bucket, raw_object,
+    raw_object_query, send_signed_request,
     shape::{assert_shape, error_response_headers, expected_error, id_headers, shape},
-    unique_bucket, SendRetryingOperationAborted, CTX,
+    unique_bucket, RawAltObjectRequest, SendRetryingOperationAborted, CTX,
 };
 use serde_json::json;
 
@@ -26,6 +27,8 @@ use serde_json::json;
 const GOVERNANCE_RETENTION_SECS: u64 = 24 * 60 * 60;
 const GOVERNANCE_RETENTION_LATER_SECS: u64 = 2 * 24 * 60 * 60;
 const COMPLIANCE_RETENTION_SECS: u64 = 3;
+const OBJECT_LOCK_MULTIPART_FIRST_PART_SIZE: usize = 5 * 1024 * 1024;
+const OBJECT_LOCK_MULTIPART_SECOND_PART: &[u8] = b"part-two-lock";
 
 fn agent() -> s3_tests::Agent {
     s3_tests::test_agent()
@@ -116,6 +119,22 @@ async fn put_bucket_policy_json(bucket: &str, policy: serde_json::Value) {
         .send()
         .await
         .unwrap();
+}
+
+async fn put_alt_object_read_policy(bucket: &str, actions: &[&str]) {
+    put_bucket_policy_json(
+        bucket,
+        json!({
+            "Version": "2012-10-17",
+            "Statement": [{
+                "Effect": "Allow",
+                "Principal": alt_policy_principal(),
+                "Action": actions,
+                "Resource": bucket_wildcard_resource(bucket),
+            }],
+        }),
+    )
+    .await;
 }
 
 async fn fresh_alt_client_for_policy_retry() -> aws_sdk_s3::Client {
@@ -223,6 +242,76 @@ async fn put_object_bytes(bucket: &str, key: &str, body: &[u8]) -> String {
         .unwrap()
         .version_id()
         .expect("expected version_id on object lock bucket")
+        .to_string()
+}
+
+async fn put_object_lock_multipart_object(
+    bucket: &str,
+    key: &str,
+    retain_until: DateTime,
+) -> String {
+    let client = CTX.client();
+    let create = client
+        .create_multipart_upload()
+        .bucket(bucket)
+        .key(key)
+        .content_type("application/octet-stream")
+        .object_lock_mode(ObjectLockMode::Governance)
+        .object_lock_retain_until_date(retain_until)
+        .object_lock_legal_hold_status(ObjectLockLegalHoldStatus::On)
+        .send()
+        .await
+        .expect("create locked multipart upload");
+    let upload_id = create.upload_id().expect("upload id");
+
+    let first_part = vec![b'A'; OBJECT_LOCK_MULTIPART_FIRST_PART_SIZE];
+    let uploaded_first = client
+        .upload_part()
+        .bucket(bucket)
+        .key(key)
+        .upload_id(upload_id)
+        .part_number(1)
+        .body(ByteStream::from(first_part))
+        .send()
+        .await
+        .expect("upload first locked multipart part");
+    let uploaded_second = client
+        .upload_part()
+        .bucket(bucket)
+        .key(key)
+        .upload_id(upload_id)
+        .part_number(2)
+        .body(ByteStream::from_static(OBJECT_LOCK_MULTIPART_SECOND_PART))
+        .send()
+        .await
+        .expect("upload second locked multipart part");
+
+    client
+        .complete_multipart_upload()
+        .bucket(bucket)
+        .key(key)
+        .upload_id(upload_id)
+        .multipart_upload(
+            CompletedMultipartUpload::builder()
+                .parts(
+                    CompletedPart::builder()
+                        .part_number(1)
+                        .e_tag(uploaded_first.e_tag().expect("first part etag"))
+                        .build(),
+                )
+                .parts(
+                    CompletedPart::builder()
+                        .part_number(2)
+                        .e_tag(uploaded_second.e_tag().expect("second part etag"))
+                        .build(),
+                )
+                .build(),
+        )
+        .send()
+        .await
+        .expect("complete locked multipart upload")
+        .version_id()
+        .expect("locked multipart version")
         .to_string()
 }
 
@@ -4304,6 +4393,473 @@ fn lock_date_header(date: &DateTime) -> String {
 /// The lock timestamp as it appears in XML bodies, with milliseconds.
 fn lock_date_xml(date: &DateTime) -> String {
     lock_date_header(date).replace('Z', ".000Z")
+}
+
+#[test]
+fn test_head_object_policy_retention_headers_require_get_object_retention_action() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_object_lock_bucket().await;
+        let locked_key = "head-policy-retention-locked.txt";
+        let retain_until = governance_retain_until();
+
+        let locked_put = client
+            .put_object()
+            .bucket(&bucket)
+            .key(locked_key)
+            .body(ByteStream::from_static(b"retention-body"))
+            .object_lock_mode(ObjectLockMode::Governance)
+            .object_lock_retain_until_date(retain_until)
+            .send()
+            .await
+            .expect("put object with retention");
+        let locked_version = locked_put.version_id().expect("locked version").to_string();
+
+        put_alt_object_read_policy(&bucket, &["s3:GetObject"]).await;
+        let without_retention_action = eventually_raw_object_status(
+            "HeadObject retention after GetObject-only policy",
+            RawAltObjectRequest::new("HEAD", &bucket, locked_key),
+            200,
+            None,
+        )
+        .await;
+        assert_shape(
+            "HeadObject retention with GetObject-only policy shape",
+            &without_retention_action,
+            &shape()
+                .status(200)
+                .headers([
+                    ("etag", "{etag}"),
+                    ("last-modified", "{http_date}"),
+                    ("accept-ranges", "bytes"),
+                    ("x-amz-version-id", "{version_id}"),
+                    ("content-type", "application/octet-stream"),
+                    ("x-amz-server-side-encryption", "AES256"),
+                    ("content-length", "14"),
+                    ("x-amz-request-id", "{request_id}"),
+                    ("x-amz-id-2", "{host_id}"),
+                ])
+                .sub("version_id", locked_version.as_str())
+                .body_empty(),
+        );
+
+        put_alt_object_read_policy(&bucket, &["s3:GetObject", "s3:GetObjectRetention"]).await;
+        let allowed = eventually_raw_object_status(
+            "HeadObject retention after GetObjectRetention policy",
+            RawAltObjectRequest::new("HEAD", &bucket, locked_key),
+            200,
+            Some("x-amz-object-lock-retain-until-date"),
+        )
+        .await;
+        assert_shape(
+            "HeadObject retention with GetObjectRetention policy shape",
+            &allowed,
+            &shape()
+                .status(200)
+                .headers([
+                    ("etag", "{etag}"),
+                    ("last-modified", "{http_date}"),
+                    ("accept-ranges", "bytes"),
+                    ("x-amz-version-id", "{version_id}"),
+                    ("content-type", "application/octet-stream"),
+                    ("x-amz-object-lock-mode", "GOVERNANCE"),
+                    ("x-amz-object-lock-retain-until-date", "{retain_until}"),
+                    ("x-amz-server-side-encryption", "AES256"),
+                    ("content-length", "14"),
+                    ("x-amz-request-id", "{request_id}"),
+                    ("x-amz-id-2", "{host_id}"),
+                ])
+                .sub("version_id", locked_version.as_str())
+                .sub("retain_until", lock_date_header(&retain_until))
+                .body_empty(),
+        );
+
+        cleanup_object_lock_bucket(&bucket).await;
+    });
+}
+
+#[test]
+fn test_head_object_policy_legal_hold_header_requires_get_object_legal_hold_action() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_object_lock_bucket().await;
+        let locked_key = "head-policy-legal-hold-locked.txt";
+
+        let locked_put = client
+            .put_object()
+            .bucket(&bucket)
+            .key(locked_key)
+            .body(ByteStream::from_static(b"legal-hold-body"))
+            .object_lock_legal_hold_status(ObjectLockLegalHoldStatus::On)
+            .send()
+            .await
+            .expect("put object with legal hold");
+        let locked_version = locked_put.version_id().expect("locked version").to_string();
+
+        put_alt_object_read_policy(&bucket, &["s3:GetObject"]).await;
+        let without_legal_hold_action = eventually_raw_object_status(
+            "HeadObject legal hold after GetObject-only policy",
+            RawAltObjectRequest::new("HEAD", &bucket, locked_key),
+            200,
+            None,
+        )
+        .await;
+        assert_shape(
+            "HeadObject legal hold with GetObject-only policy shape",
+            &without_legal_hold_action,
+            &shape()
+                .status(200)
+                .headers([
+                    ("etag", "{etag}"),
+                    ("last-modified", "{http_date}"),
+                    ("accept-ranges", "bytes"),
+                    ("x-amz-version-id", "{version_id}"),
+                    ("content-type", "application/octet-stream"),
+                    ("x-amz-server-side-encryption", "AES256"),
+                    ("content-length", "15"),
+                    ("x-amz-request-id", "{request_id}"),
+                    ("x-amz-id-2", "{host_id}"),
+                ])
+                .sub("version_id", locked_version.as_str())
+                .body_empty(),
+        );
+
+        put_alt_object_read_policy(&bucket, &["s3:GetObject", "s3:GetObjectLegalHold"]).await;
+        let allowed = eventually_raw_object_status(
+            "HeadObject legal hold after GetObjectLegalHold policy",
+            RawAltObjectRequest::new("HEAD", &bucket, locked_key),
+            200,
+            Some("x-amz-object-lock-legal-hold"),
+        )
+        .await;
+        assert_shape(
+            "HeadObject legal hold with GetObjectLegalHold policy shape",
+            &allowed,
+            &shape()
+                .status(200)
+                .headers([
+                    ("etag", "{etag}"),
+                    ("last-modified", "{http_date}"),
+                    ("accept-ranges", "bytes"),
+                    ("x-amz-version-id", "{version_id}"),
+                    ("content-type", "application/octet-stream"),
+                    ("x-amz-object-lock-legal-hold", "ON"),
+                    ("x-amz-server-side-encryption", "AES256"),
+                    ("content-length", "15"),
+                    ("x-amz-request-id", "{request_id}"),
+                    ("x-amz-id-2", "{host_id}"),
+                ])
+                .sub("version_id", locked_version.as_str())
+                .body_empty(),
+        );
+
+        cleanup_object_lock_bucket(&bucket).await;
+    });
+}
+
+#[test]
+fn test_object_read_policy_lock_headers_require_object_lock_actions() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_object_lock_bucket().await;
+        let key = "read-policy-object-lock-locked.txt";
+        let body = "object-lock-body";
+        let retain_until = governance_retain_until();
+
+        let put = client
+            .put_object()
+            .bucket(&bucket)
+            .key(key)
+            .body(ByteStream::from_static(body.as_bytes()))
+            .object_lock_mode(ObjectLockMode::Governance)
+            .object_lock_retain_until_date(retain_until)
+            .object_lock_legal_hold_status(ObjectLockLegalHoldStatus::On)
+            .send()
+            .await
+            .expect("put locked object");
+        let version_id = put.version_id().expect("locked version").to_string();
+
+        let multipart_key = "read-policy-object-lock-multipart.txt";
+        let multipart_retain_until = governance_retain_until();
+        let multipart_version =
+            put_object_lock_multipart_object(&bucket, multipart_key, multipart_retain_until).await;
+
+        put_alt_object_read_policy(&bucket, &["s3:GetObject"]).await;
+        let get_without_lock_actions = eventually_raw_object_status(
+            "GetObject after GetObject-only policy",
+            RawAltObjectRequest::new("GET", &bucket, key),
+            200,
+            None,
+        )
+        .await;
+        assert_shape(
+            "GetObject with GetObject-only policy shape",
+            &get_without_lock_actions,
+            &shape()
+                .status(200)
+                .headers([
+                    ("etag", "{etag}"),
+                    ("last-modified", "{http_date}"),
+                    ("accept-ranges", "bytes"),
+                    ("x-amz-version-id", "{version_id}"),
+                    ("content-type", "application/octet-stream"),
+                    ("x-amz-server-side-encryption", "AES256"),
+                    ("content-length", "16"),
+                    ("x-amz-request-id", "{request_id}"),
+                    ("x-amz-id-2", "{host_id}"),
+                ])
+                .sub("version_id", version_id.as_str())
+                .body(body),
+        );
+
+        let range_without_lock_actions = eventually_raw_object_status(
+            "GetObject range after GetObject-only policy",
+            RawAltObjectRequest::new("GET", &bucket, key).extra_headers(&[("Range", "bytes=0-5")]),
+            206,
+            None,
+        )
+        .await;
+        assert_shape(
+            "GetObject range with GetObject-only policy shape",
+            &range_without_lock_actions,
+            &shape()
+                .status(206)
+                .headers([
+                    ("etag", "{etag}"),
+                    ("last-modified", "{http_date}"),
+                    ("accept-ranges", "bytes"),
+                    ("content-range", "bytes 0-5/16"),
+                    ("content-type", "application/octet-stream"),
+                    ("x-amz-version-id", "{version_id}"),
+                    ("x-amz-server-side-encryption", "AES256"),
+                    ("content-length", "6"),
+                    ("x-amz-request-id", "{request_id}"),
+                    ("x-amz-id-2", "{host_id}"),
+                ])
+                .sub("version_id", version_id.as_str())
+                .body("object"),
+        );
+
+        let multipart_part_range = format!(
+            "bytes {}-{}/{}",
+            OBJECT_LOCK_MULTIPART_FIRST_PART_SIZE,
+            OBJECT_LOCK_MULTIPART_FIRST_PART_SIZE + OBJECT_LOCK_MULTIPART_SECOND_PART.len() - 1,
+            OBJECT_LOCK_MULTIPART_FIRST_PART_SIZE + OBJECT_LOCK_MULTIPART_SECOND_PART.len()
+        );
+        let get_part_without_lock_actions = eventually_raw_object_status(
+            "GetObject partNumber after GetObject-only policy",
+            RawAltObjectRequest::new("GET", &bucket, multipart_key).query("partNumber=2"),
+            206,
+            None,
+        )
+        .await;
+        assert_shape(
+            "GetObject partNumber with GetObject-only policy shape",
+            &get_part_without_lock_actions,
+            &shape()
+                .status(206)
+                .headers([
+                    ("etag", "{etag}"),
+                    ("content-length", "13"),
+                    ("last-modified", "{http_date}"),
+                    ("accept-ranges", "bytes"),
+                    ("x-amz-version-id", "{multipart_version}"),
+                    ("x-amz-mp-parts-count", "2"),
+                    ("content-range", "{multipart_part_range}"),
+                    ("content-type", "application/octet-stream"),
+                    ("x-amz-server-side-encryption", "AES256"),
+                    ("x-amz-request-id", "{request_id}"),
+                    ("x-amz-id-2", "{host_id}"),
+                ])
+                .sub("multipart_version", multipart_version.as_str())
+                .sub("multipart_part_range", multipart_part_range.as_str())
+                .body("part-two-lock"),
+        );
+
+        let head_part_without_lock_actions = eventually_raw_object_status(
+            "HeadObject partNumber after GetObject-only policy",
+            RawAltObjectRequest::new("HEAD", &bucket, multipart_key).query("partNumber=2"),
+            206,
+            None,
+        )
+        .await;
+        assert_shape(
+            "HeadObject partNumber with GetObject-only policy shape",
+            &head_part_without_lock_actions,
+            &shape()
+                .status(206)
+                .headers([
+                    ("etag", "{etag}"),
+                    ("content-length", "13"),
+                    ("last-modified", "{http_date}"),
+                    ("accept-ranges", "bytes"),
+                    ("x-amz-version-id", "{multipart_version}"),
+                    ("x-amz-mp-parts-count", "2"),
+                    ("content-range", "{multipart_part_range}"),
+                    ("content-type", "application/octet-stream"),
+                    ("x-amz-server-side-encryption", "AES256"),
+                    ("x-amz-request-id", "{request_id}"),
+                    ("x-amz-id-2", "{host_id}"),
+                ])
+                .sub("multipart_version", multipart_version.as_str())
+                .sub("multipart_part_range", multipart_part_range.as_str())
+                .body_empty(),
+        );
+
+        put_alt_object_read_policy(
+            &bucket,
+            &[
+                "s3:GetObject",
+                "s3:GetObjectRetention",
+                "s3:GetObjectLegalHold",
+            ],
+        )
+        .await;
+        let get_with_lock_actions = eventually_raw_object_status(
+            "GetObject after object-lock read policy",
+            RawAltObjectRequest::new("GET", &bucket, key),
+            200,
+            Some("x-amz-object-lock-retain-until-date"),
+        )
+        .await;
+        assert_shape(
+            "GetObject with object-lock read policy shape",
+            &get_with_lock_actions,
+            &shape()
+                .status(200)
+                .headers([
+                    ("etag", "{etag}"),
+                    ("last-modified", "{http_date}"),
+                    ("accept-ranges", "bytes"),
+                    ("x-amz-version-id", "{version_id}"),
+                    ("content-type", "application/octet-stream"),
+                    ("x-amz-object-lock-mode", "GOVERNANCE"),
+                    ("x-amz-object-lock-retain-until-date", "{retain_until}"),
+                    ("x-amz-object-lock-legal-hold", "ON"),
+                    ("x-amz-server-side-encryption", "AES256"),
+                    ("content-length", "16"),
+                    ("x-amz-request-id", "{request_id}"),
+                    ("x-amz-id-2", "{host_id}"),
+                ])
+                .sub("version_id", version_id.as_str())
+                .sub("retain_until", lock_date_header(&retain_until))
+                .body(body),
+        );
+
+        let range_with_lock_actions = eventually_raw_object_status(
+            "GetObject range after object-lock read policy",
+            RawAltObjectRequest::new("GET", &bucket, key).extra_headers(&[("Range", "bytes=0-5")]),
+            206,
+            Some("x-amz-object-lock-retain-until-date"),
+        )
+        .await;
+        assert_shape(
+            "GetObject range with object-lock read policy shape",
+            &range_with_lock_actions,
+            &shape()
+                .status(206)
+                .headers([
+                    ("etag", "{etag}"),
+                    ("last-modified", "{http_date}"),
+                    ("accept-ranges", "bytes"),
+                    ("content-range", "bytes 0-5/16"),
+                    ("content-type", "application/octet-stream"),
+                    ("x-amz-version-id", "{version_id}"),
+                    ("x-amz-object-lock-mode", "GOVERNANCE"),
+                    ("x-amz-object-lock-retain-until-date", "{retain_until}"),
+                    ("x-amz-object-lock-legal-hold", "ON"),
+                    ("x-amz-server-side-encryption", "AES256"),
+                    ("content-length", "6"),
+                    ("x-amz-request-id", "{request_id}"),
+                    ("x-amz-id-2", "{host_id}"),
+                ])
+                .sub("version_id", version_id.as_str())
+                .sub("retain_until", lock_date_header(&retain_until))
+                .body("object"),
+        );
+
+        let get_part_with_lock_actions = eventually_raw_object_status(
+            "GetObject partNumber after object-lock read policy",
+            RawAltObjectRequest::new("GET", &bucket, multipart_key).query("partNumber=2"),
+            206,
+            Some("x-amz-object-lock-retain-until-date"),
+        )
+        .await;
+        assert_shape(
+            "GetObject partNumber with object-lock read policy shape",
+            &get_part_with_lock_actions,
+            &shape()
+                .status(206)
+                .headers([
+                    ("etag", "{etag}"),
+                    ("content-length", "13"),
+                    ("last-modified", "{http_date}"),
+                    ("accept-ranges", "bytes"),
+                    ("x-amz-version-id", "{multipart_version}"),
+                    ("x-amz-object-lock-mode", "GOVERNANCE"),
+                    (
+                        "x-amz-object-lock-retain-until-date",
+                        "{multipart_retain_until}",
+                    ),
+                    ("x-amz-object-lock-legal-hold", "ON"),
+                    ("x-amz-mp-parts-count", "2"),
+                    ("content-range", "{multipart_part_range}"),
+                    ("content-type", "application/octet-stream"),
+                    ("x-amz-server-side-encryption", "AES256"),
+                    ("x-amz-request-id", "{request_id}"),
+                    ("x-amz-id-2", "{host_id}"),
+                ])
+                .sub("multipart_version", multipart_version.as_str())
+                .sub(
+                    "multipart_retain_until",
+                    lock_date_header(&multipart_retain_until),
+                )
+                .sub("multipart_part_range", multipart_part_range.as_str())
+                .body("part-two-lock"),
+        );
+
+        let head_part_with_lock_actions = eventually_raw_object_status(
+            "HeadObject partNumber after object-lock read policy",
+            RawAltObjectRequest::new("HEAD", &bucket, multipart_key).query("partNumber=2"),
+            206,
+            Some("x-amz-object-lock-retain-until-date"),
+        )
+        .await;
+        assert_shape(
+            "HeadObject partNumber with object-lock read policy shape",
+            &head_part_with_lock_actions,
+            &shape()
+                .status(206)
+                .headers([
+                    ("etag", "{etag}"),
+                    ("content-length", "13"),
+                    ("last-modified", "{http_date}"),
+                    ("accept-ranges", "bytes"),
+                    ("x-amz-version-id", "{multipart_version}"),
+                    ("x-amz-object-lock-mode", "GOVERNANCE"),
+                    (
+                        "x-amz-object-lock-retain-until-date",
+                        "{multipart_retain_until}",
+                    ),
+                    ("x-amz-object-lock-legal-hold", "ON"),
+                    ("x-amz-mp-parts-count", "2"),
+                    ("content-range", "{multipart_part_range}"),
+                    ("content-type", "application/octet-stream"),
+                    ("x-amz-server-side-encryption", "AES256"),
+                    ("x-amz-request-id", "{request_id}"),
+                    ("x-amz-id-2", "{host_id}"),
+                ])
+                .sub("multipart_version", multipart_version.as_str())
+                .sub(
+                    "multipart_retain_until",
+                    lock_date_header(&multipart_retain_until),
+                )
+                .sub("multipart_part_range", multipart_part_range.as_str())
+                .body_empty(),
+        );
+
+        cleanup_object_lock_bucket(&bucket).await;
+    });
 }
 
 #[test]

@@ -1379,6 +1379,92 @@ pub fn raw_object_with(
     )
 }
 
+pub fn raw_alt_credentials() -> SignedRequestCredentials<'static> {
+    SignedRequestCredentials {
+        access_key: CTX.alt_access_key(),
+        secret_key: CTX.alt_secret_key(),
+        region: CTX.region(),
+        tls_ca_pem: CTX.tls_ca_pem(),
+    }
+}
+
+#[derive(Clone, Copy)]
+pub struct RawAltObjectRequest<'a> {
+    method: &'a str,
+    bucket: &'a str,
+    key: &'a str,
+    query: Option<&'a str>,
+    extra_headers: &'a [(&'a str, &'a str)],
+}
+
+impl<'a> RawAltObjectRequest<'a> {
+    pub fn new(method: &'a str, bucket: &'a str, key: &'a str) -> Self {
+        Self {
+            method,
+            bucket,
+            key,
+            query: None,
+            extra_headers: &[],
+        }
+    }
+
+    pub fn query(self, query: &'a str) -> Self {
+        Self {
+            query: Some(query),
+            ..self
+        }
+    }
+
+    pub fn extra_headers(self, extra_headers: &'a [(&'a str, &'a str)]) -> Self {
+        Self {
+            extra_headers,
+            ..self
+        }
+    }
+}
+
+pub fn raw_alt_object_request(request: RawAltObjectRequest<'_>) -> RawResponse {
+    send_signed_request_with_credentials(
+        request.method,
+        &raw_request_url(request.bucket, request.key, request.query),
+        b"",
+        request.extra_headers.iter().copied(),
+        raw_alt_credentials(),
+    )
+}
+
+pub fn raw_response_header<'a>(response: &'a RawResponse, name: &str) -> Option<&'a str> {
+    response
+        .headers
+        .iter()
+        .find(|(header_name, _)| header_name.eq_ignore_ascii_case(name))
+        .map(|(_, value)| value.as_str())
+}
+
+pub async fn eventually_raw_alt_object_status(
+    description: &str,
+    request: RawAltObjectRequest<'_>,
+    expected_status: u16,
+    required_header: Option<&str>,
+) -> RawResponse {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+
+    loop {
+        let response = raw_alt_object_request(request);
+        if response.status == expected_status
+            && required_header.is_none_or(|name| raw_response_header(&response, name).is_some())
+        {
+            return response;
+        }
+
+        if tokio::time::Instant::now() >= deadline {
+            panic!("{description} did not converge to {expected_status}: {response:?}");
+        }
+
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
 /// Send a bodyless raw signed bucket-level request with the primary
 /// credentials, optionally with a query string, e.g. `list-type=2` or a
 /// subresource such as `versioning`.

@@ -1745,11 +1745,11 @@ impl HttpFrontend {
                             sse_customer: sse_customer.as_ref(),
                         },
                     )?;
-                    let tags = result.tags.clone();
+                    let tag_count = result.tag_count;
                     let mut resp = S3Response::get_object_part(result);
                     apply_response_overrides(&mut resp, req);
-                    if let Some(tags_xml) = tags {
-                        add_tagging_count_header(&mut resp, &tags_xml)?;
+                    if let Some(tag_count) = tag_count {
+                        add_tagging_count_header(&mut resp, tag_count);
                     }
                     Ok(resp)
                 } else if let Some(range_header) = req.header("range") {
@@ -1779,10 +1779,10 @@ impl HttpFrontend {
                                     sse_customer: sse_customer.as_ref(),
                                 },
                             )?;
-                            let tags = result.tags.clone();
+                            let tag_count = result.tag_count;
                             let mut resp = S3Response::get_object_range(result);
-                            if let Some(tags_xml) = tags {
-                                add_tagging_count_header(&mut resp, &tags_xml)?;
+                            if let Some(tag_count) = tag_count {
+                                add_tagging_count_header(&mut resp, tag_count);
                             }
                             Ok(resp)
                         }
@@ -1814,11 +1814,11 @@ impl HttpFrontend {
                                 },
                             )?;
                             let checksum_mode = req.header("x-amz-checksum-mode");
-                            let tags = result.tags.clone();
+                            let tag_count = result.tag_count;
                             let mut resp = S3Response::get_object(result, checksum_mode);
                             apply_response_overrides(&mut resp, req);
-                            if let Some(tags_xml) = tags {
-                                add_tagging_count_header(&mut resp, &tags_xml)?;
+                            if let Some(tag_count) = tag_count {
+                                add_tagging_count_header(&mut resp, tag_count);
                             }
                             Ok(resp)
                         }
@@ -1838,12 +1838,11 @@ impl HttpFrontend {
                                 sse_customer: sse_customer.as_ref(),
                             })?;
                     let checksum_mode = req.header("x-amz-checksum-mode");
-                    let tags = result.tags.clone();
+                    let tag_count = result.tag_count;
                     let mut resp = S3Response::get_object(result, checksum_mode);
                     apply_response_overrides(&mut resp, req);
-                    // Add x-amz-tagging-count if the object has tags
-                    if let Some(tags_xml) = tags {
-                        add_tagging_count_header(&mut resp, &tags_xml)?;
+                    if let Some(tag_count) = tag_count {
+                        add_tagging_count_header(&mut resp, tag_count);
                     }
                     Ok(resp)
                 }
@@ -1910,8 +1909,8 @@ impl HttpFrontend {
                         },
                     )?;
                     let mut resp = S3Response::head_object_part(&result);
-                    if let Some(tags_xml) = &result.tags {
-                        add_tagging_count_header(&mut resp, tags_xml)?;
+                    if let Some(tag_count) = result.tag_count {
+                        add_tagging_count_header(&mut resp, tag_count);
                     }
                     Ok(resp)
                 } else {
@@ -1930,8 +1929,8 @@ impl HttpFrontend {
                             })?;
                     let checksum_mode = req.header("x-amz-checksum-mode");
                     let mut resp = S3Response::head_object(&result, checksum_mode);
-                    if let Some(tags_xml) = &result.tags {
-                        add_tagging_count_header(&mut resp, tags_xml)?;
+                    if let Some(tag_count) = result.tag_count {
+                        add_tagging_count_header(&mut resp, tag_count);
                     }
                     Ok(resp)
                 }
@@ -5720,15 +5719,9 @@ fn reject_anonymous_response_overrides(
     Ok(())
 }
 
-fn add_tagging_count_header(resp: &mut S3Response, tags_xml: &str) -> Result<(), ServerError> {
-    let count = xml::count_tags_in_xml(tags_xml).map_err(|err| ServerError::InternalError {
-        reason: format!("invalid stored object tags: {err}"),
-    })?;
-    if count > 0 {
-        resp.headers
-            .push(("x-amz-tagging-count".to_string(), count.to_string()));
-    }
-    Ok(())
+fn add_tagging_count_header(resp: &mut S3Response, count: usize) {
+    resp.headers
+        .push(("x-amz-tagging-count".to_string(), count.to_string()));
 }
 
 fn parse_create_bucket_acl(

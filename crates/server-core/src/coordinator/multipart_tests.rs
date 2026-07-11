@@ -7244,20 +7244,9 @@ fn finalize_stream_put_persists_tags_in_initial_commit() {
         .unwrap();
     assert_eq!(result.version_id, VersionId::Null);
 
-    let obj = coord
-        .get_object(&GetObjectRequest {
-            sse_customer: None,
-            object: object_version_request_with_expected_owner(
-                "bucket",
-                "mykey",
-                None,
-                test_requester(),
-                None,
-            ),
-            cond: NO_READ,
-        })
-        .unwrap();
-    assert_eq!(obj.tags.as_deref(), Some(tags_xml));
+    let tags =
+        get_object_tags_test(&coord, "bucket", "mykey", None, test_requester(), None).unwrap();
+    assert_eq!(tags.as_deref(), Some(tags_xml));
 }
 
 #[test]

@@ -1203,20 +1203,8 @@ fn copy_object_tagging_copy_preserves_source_tags() {
         })
         .unwrap();
 
-    let obj = coord
-        .get_object(&GetObjectRequest {
-            sse_customer: None,
-            object: object_version_request_with_expected_owner(
-                "bucket",
-                "dst",
-                None,
-                test_requester(),
-                None,
-            ),
-            cond: NO_READ,
-        })
-        .unwrap();
-    assert_eq!(obj.tags.as_deref(), Some(tags_xml));
+    let tags = get_object_tags_test(&coord, "bucket", "dst", None, test_requester(), None).unwrap();
+    assert_eq!(tags.as_deref(), Some(tags_xml));
 }
 
 #[test]
@@ -1280,7 +1268,9 @@ fn copy_object_commits_authorized_acl_and_trusted_copied_tags() {
         })
         .unwrap();
     assert_eq!(read_all_body(object.body).unwrap(), b"data");
-    assert_eq!(object.tags.as_deref(), Some(tags));
+    let object_tags =
+        get_object_tags_test(&coord, "bucket", "dst", None, test_requester(), None).unwrap();
+    assert_eq!(object_tags.as_deref(), Some(tags));
 }
 
 #[test]
@@ -1335,20 +1325,8 @@ fn copy_object_tagging_replace_overwrites_source_tags() {
         })
         .unwrap();
 
-    let obj = coord
-        .get_object(&GetObjectRequest {
-            sse_customer: None,
-            object: object_version_request_with_expected_owner(
-                "bucket",
-                "dst",
-                None,
-                test_requester(),
-                None,
-            ),
-            cond: NO_READ,
-        })
-        .unwrap();
-    assert_eq!(obj.tags.as_deref(), Some(dst_tags));
+    let tags = get_object_tags_test(&coord, "bucket", "dst", None, test_requester(), None).unwrap();
+    assert_eq!(tags.as_deref(), Some(dst_tags));
 }
 
 #[test]

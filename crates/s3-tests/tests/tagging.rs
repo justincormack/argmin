@@ -6,9 +6,10 @@ use aws_sdk_s3::types::{
 };
 use s3_tests::{
     assert_s3_err_code, cleanup_versioned_bucket, content_md5_header,
-    delete_bucket_retrying_operation_aborted, err_status, raw_bucket, send_signed_request,
+    delete_bucket_retrying_operation_aborted, err_status, eventually_raw_alt_object_status,
+    raw_bucket, raw_response_header, send_signed_request,
     shape::{assert_body_with_unordered_blocks, assert_shape, id_headers, shape},
-    unique_bucket, SendRetryingOperationAborted, CTX,
+    unique_bucket, RawAltObjectRequest, SendRetryingOperationAborted, CTX,
 };
 use serde_json::json;
 use std::collections::BTreeSet;
@@ -290,6 +291,14 @@ fn bucket_wildcard_resource(bucket: &str) -> String {
     format!("arn:aws:s3:::{bucket}/*")
 }
 
+fn assert_tagging_count_header(response: &s3_tests::RawResponse, expected: Option<&str>) {
+    assert_eq!(
+        raw_response_header(response, "x-amz-tagging-count"),
+        expected,
+        "unexpected x-amz-tagging-count in response: {response:?}"
+    );
+}
+
 fn raw_response_is_operation_aborted(response: &s3_tests::RawResponse) -> bool {
     response.status == 409 && response.body.contains("<Code>OperationAborted</Code>")
 }
@@ -368,10 +377,19 @@ fn bucket_policy_document(
     resource: String,
     conditions: Option<serde_json::Value>,
 ) -> String {
+    bucket_policy_document_actions(principal, json!(action), resource, conditions)
+}
+
+fn bucket_policy_document_actions(
+    principal: serde_json::Value,
+    actions: serde_json::Value,
+    resource: String,
+    conditions: Option<serde_json::Value>,
+) -> String {
     let mut statement = json!({
         "Effect": "Allow",
         "Principal": principal,
-        "Action": action,
+        "Action": actions,
         "Resource": resource,
     });
     if let Some(conditions) = conditions {
@@ -1865,6 +1883,315 @@ fn test_bucket_policy_get_object_tagging_alt_account() {
         assert_tag_sets_match_unordered(response.tag_set(), input_tags.tag_set());
 
         cleanup(&bucket, &[key]).await;
+    });
+}
+
+#[test]
+fn test_bucket_policy_tagging_count_header_requires_tagging_read_action() {
+    let _guard = BUCKET_POLICY_TEST_GUARD
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        let key = "tagging-count-read.txt";
+        let multipart_key = "tagging-count-read-multipart.txt";
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
+        s3_tests::enable_bucket_versioning(client, &bucket).await;
+
+        let put = put_object_retrying_operation_aborted(
+            client,
+            &bucket,
+            key,
+            b"tagging-count-body".to_vec(),
+            Some("a=1&b=2&c=3"),
+        )
+        .await;
+        let version_id = put.version_id().expect("version id").to_string();
+
+        let create = client
+            .create_multipart_upload()
+            .bucket(&bucket)
+            .key(multipart_key)
+            .content_type("application/octet-stream")
+            .tagging("a=1&b=2&c=3")
+            .send_retrying_operation_aborted("create multipart during tagging test")
+            .await
+            .unwrap();
+        let upload_id = create.upload_id().expect("upload id");
+        let uploaded = upload_part_retrying_operation_aborted(
+            client,
+            &bucket,
+            multipart_key,
+            upload_id,
+            1,
+            b"tagged-multipart".to_vec(),
+        )
+        .await;
+        let multipart_complete = client
+            .complete_multipart_upload()
+            .bucket(&bucket)
+            .key(multipart_key)
+            .upload_id(upload_id)
+            .multipart_upload(
+                CompletedMultipartUpload::builder()
+                    .parts(
+                        CompletedPart::builder()
+                            .part_number(1)
+                            .e_tag(uploaded.e_tag().expect("part etag"))
+                            .build(),
+                    )
+                    .build(),
+            )
+            .send_retrying_operation_aborted("complete multipart during tagging test")
+            .await
+            .unwrap();
+        let multipart_version = multipart_complete
+            .version_id()
+            .expect("multipart version id")
+            .to_string();
+
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(bucket_policy_document_actions(
+                alt_policy_principal(),
+                json!("s3:GetObject"),
+                bucket_wildcard_resource(&bucket),
+                None,
+            ))
+            .send_retrying_operation_aborted("put GetObject policy during tagging test")
+            .await
+            .unwrap();
+
+        let current_get = eventually_raw_alt_object_status(
+            "current GetObject with GetObject-only policy",
+            RawAltObjectRequest::new("GET", &bucket, key),
+            200,
+            None,
+        )
+        .await;
+        assert_tagging_count_header(&current_get, None);
+        let current_range = eventually_raw_alt_object_status(
+            "current ranged GetObject with GetObject-only policy",
+            RawAltObjectRequest::new("GET", &bucket, key).extra_headers(&[("Range", "bytes=0-6")]),
+            206,
+            None,
+        )
+        .await;
+        assert_tagging_count_header(&current_range, None);
+        let current_head = eventually_raw_alt_object_status(
+            "current HeadObject with GetObject-only policy",
+            RawAltObjectRequest::new("HEAD", &bucket, key),
+            200,
+            None,
+        )
+        .await;
+        assert_tagging_count_header(&current_head, None);
+        let current_get_part = eventually_raw_alt_object_status(
+            "current GetObject partNumber with GetObject-only policy",
+            RawAltObjectRequest::new("GET", &bucket, multipart_key).query("partNumber=1"),
+            206,
+            None,
+        )
+        .await;
+        assert_tagging_count_header(&current_get_part, None);
+        let current_head_part = eventually_raw_alt_object_status(
+            "current HeadObject partNumber with GetObject-only policy",
+            RawAltObjectRequest::new("HEAD", &bucket, multipart_key).query("partNumber=1"),
+            206,
+            None,
+        )
+        .await;
+        assert_tagging_count_header(&current_head_part, None);
+
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(bucket_policy_document_actions(
+                alt_policy_principal(),
+                json!(["s3:GetObject", "s3:GetObjectTagging"]),
+                bucket_wildcard_resource(&bucket),
+                None,
+            ))
+            .send_retrying_operation_aborted("put GetObjectTagging policy during tagging test")
+            .await
+            .unwrap();
+
+        let current_get = eventually_raw_alt_object_status(
+            "current GetObject with GetObjectTagging policy",
+            RawAltObjectRequest::new("GET", &bucket, key),
+            200,
+            Some("x-amz-tagging-count"),
+        )
+        .await;
+        assert_tagging_count_header(&current_get, Some("3"));
+        let current_range = eventually_raw_alt_object_status(
+            "current ranged GetObject with GetObjectTagging policy",
+            RawAltObjectRequest::new("GET", &bucket, key).extra_headers(&[("Range", "bytes=0-6")]),
+            206,
+            Some("x-amz-tagging-count"),
+        )
+        .await;
+        assert_tagging_count_header(&current_range, Some("3"));
+        let current_head = eventually_raw_alt_object_status(
+            "current HeadObject with GetObjectTagging policy",
+            RawAltObjectRequest::new("HEAD", &bucket, key),
+            200,
+            Some("x-amz-tagging-count"),
+        )
+        .await;
+        assert_tagging_count_header(&current_head, Some("3"));
+        let current_get_part = eventually_raw_alt_object_status(
+            "current GetObject partNumber with GetObjectTagging policy",
+            RawAltObjectRequest::new("GET", &bucket, multipart_key).query("partNumber=1"),
+            206,
+            Some("x-amz-tagging-count"),
+        )
+        .await;
+        assert_tagging_count_header(&current_get_part, Some("3"));
+        let current_head_part = eventually_raw_alt_object_status(
+            "current HeadObject partNumber with GetObjectTagging policy",
+            RawAltObjectRequest::new("HEAD", &bucket, multipart_key).query("partNumber=1"),
+            206,
+            Some("x-amz-tagging-count"),
+        )
+        .await;
+        assert_tagging_count_header(&current_head_part, Some("3"));
+
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(bucket_policy_document_actions(
+                alt_policy_principal(),
+                json!("s3:GetObjectVersion"),
+                bucket_wildcard_resource(&bucket),
+                None,
+            ))
+            .send_retrying_operation_aborted("put GetObjectVersion policy during tagging test")
+            .await
+            .unwrap();
+
+        let version_query = format!("versionId={version_id}");
+        let multipart_version_query = format!("versionId={multipart_version}");
+        let multipart_part_version_query = format!("partNumber=1&versionId={multipart_version}");
+
+        let version_get = eventually_raw_alt_object_status(
+            "versioned GetObject with GetObjectVersion-only policy",
+            RawAltObjectRequest::new("GET", &bucket, key).query(&version_query),
+            200,
+            None,
+        )
+        .await;
+        assert_tagging_count_header(&version_get, None);
+        let version_range = eventually_raw_alt_object_status(
+            "versioned ranged GetObject with GetObjectVersion-only policy",
+            RawAltObjectRequest::new("GET", &bucket, key)
+                .query(&version_query)
+                .extra_headers(&[("Range", "bytes=0-6")]),
+            206,
+            None,
+        )
+        .await;
+        assert_tagging_count_header(&version_range, None);
+        let version_head = eventually_raw_alt_object_status(
+            "versioned HeadObject with GetObjectVersion-only policy",
+            RawAltObjectRequest::new("HEAD", &bucket, key).query(&version_query),
+            200,
+            None,
+        )
+        .await;
+        assert_tagging_count_header(&version_head, None);
+        let version_get_part = eventually_raw_alt_object_status(
+            "versioned GetObject partNumber with GetObjectVersion-only policy",
+            RawAltObjectRequest::new("GET", &bucket, multipart_key)
+                .query(&multipart_part_version_query),
+            206,
+            None,
+        )
+        .await;
+        assert_tagging_count_header(&version_get_part, None);
+        let version_head_part = eventually_raw_alt_object_status(
+            "versioned HeadObject partNumber with GetObjectVersion-only policy",
+            RawAltObjectRequest::new("HEAD", &bucket, multipart_key)
+                .query(&multipart_part_version_query),
+            206,
+            None,
+        )
+        .await;
+        assert_tagging_count_header(&version_head_part, None);
+
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(bucket_policy_document_actions(
+                alt_policy_principal(),
+                json!(["s3:GetObjectVersion", "s3:GetObjectVersionTagging"]),
+                bucket_wildcard_resource(&bucket),
+                None,
+            ))
+            .send_retrying_operation_aborted(
+                "put GetObjectVersionTagging policy during tagging test",
+            )
+            .await
+            .unwrap();
+
+        let version_get = eventually_raw_alt_object_status(
+            "versioned GetObject with GetObjectVersionTagging policy",
+            RawAltObjectRequest::new("GET", &bucket, key).query(&version_query),
+            200,
+            Some("x-amz-tagging-count"),
+        )
+        .await;
+        assert_tagging_count_header(&version_get, Some("3"));
+        let version_range = eventually_raw_alt_object_status(
+            "versioned ranged GetObject with GetObjectVersionTagging policy",
+            RawAltObjectRequest::new("GET", &bucket, key)
+                .query(&version_query)
+                .extra_headers(&[("Range", "bytes=0-6")]),
+            206,
+            Some("x-amz-tagging-count"),
+        )
+        .await;
+        assert_tagging_count_header(&version_range, Some("3"));
+        let version_head = eventually_raw_alt_object_status(
+            "versioned HeadObject with GetObjectVersionTagging policy",
+            RawAltObjectRequest::new("HEAD", &bucket, key).query(&version_query),
+            200,
+            Some("x-amz-tagging-count"),
+        )
+        .await;
+        assert_tagging_count_header(&version_head, Some("3"));
+        let version_get_part = eventually_raw_alt_object_status(
+            "versioned GetObject partNumber with GetObjectVersionTagging policy",
+            RawAltObjectRequest::new("GET", &bucket, multipart_key)
+                .query(&multipart_part_version_query),
+            206,
+            Some("x-amz-tagging-count"),
+        )
+        .await;
+        assert_tagging_count_header(&version_get_part, Some("3"));
+        let version_head_part = eventually_raw_alt_object_status(
+            "versioned HeadObject partNumber with GetObjectVersionTagging policy",
+            RawAltObjectRequest::new("HEAD", &bucket, multipart_key)
+                .query(&multipart_part_version_query),
+            206,
+            Some("x-amz-tagging-count"),
+        )
+        .await;
+        assert_tagging_count_header(&version_head_part, Some("3"));
+
+        let multipart_head = eventually_raw_alt_object_status(
+            "versioned multipart HeadObject with GetObjectVersionTagging policy",
+            RawAltObjectRequest::new("HEAD", &bucket, multipart_key)
+                .query(&multipart_version_query),
+            200,
+            Some("x-amz-tagging-count"),
+        )
+        .await;
+        assert_tagging_count_header(&multipart_head, Some("3"));
+
+        cleanup_versioned_bucket(client, &bucket).await;
     });
 }
 

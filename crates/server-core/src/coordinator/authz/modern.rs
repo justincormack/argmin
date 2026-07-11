@@ -485,7 +485,14 @@ impl Coordinator {
         storage_node: &Arc<storage::StorageCluster>,
         req: AuthorizedObjectReadSnapshotRequest<'_>,
         bucket: BoeLoadedBucketHandle<'_>,
-    ) -> Result<(BucketSummary, storage::ObjectReadSnapshot), ServerError> {
+    ) -> Result<
+        (
+            BucketSummary,
+            storage::ObjectReadSnapshot,
+            ObjectAttributePermissions,
+        ),
+        ServerError,
+    > {
         let bucket_summary = bucket.bucket().clone();
         let bucket_info = ValidatedBucket(bucket.bucket().clone());
         let modern_bucket_info = ModernBucketSummary::from(&*bucket_info);
@@ -547,7 +554,14 @@ impl Coordinator {
                         ModernObjectReadAuthorization::Allowed
                     );
                     if allowed {
-                        Ok(())
+                        self.object_attribute_permissions_with_bucket_policy(
+                            req.requester,
+                            &bucket_info,
+                            bucket_tags.as_deref(),
+                            stored,
+                            Coordinator::get_object_tagging_policy_action(req.version_id),
+                            bucket_policy.as_deref(),
+                        )
                     } else {
                         Err(ServerError::AccessDenied)
                     }
@@ -562,7 +576,7 @@ impl Coordinator {
                     error,
                 )
             })??;
-        Ok((bucket_summary, outcome.snapshot))
+        Ok((bucket_summary, outcome.snapshot, outcome.value))
     }
 
     pub(super) fn authorize_delete_object_impl_boe(

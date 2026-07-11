@@ -1117,7 +1117,15 @@ sweeps so the next drift is a compile error.
   error when `policy.requires_*_for_action(action)` is true but the supplied
   input is unavailable, add debug assertions at the invariant boundary, and add
   mechanical coverage for every legacy/modern call path plus the intentional
-  accepted-but-not-evaluable cases.
+  accepted-but-not-evaluable cases. Follow-up AWS coverage pinned Object Lock
+  read-attribute permissions on `HeadObject`, `HeadObject?partNumber`,
+  `GetObject`, ranged `GetObject`, and `GetObject?partNumber`: `s3:GetObject`
+  allows the object read but suppresses retention/legal-hold headers unless
+  the caller also has the matching `s3:GetObjectRetention` or
+  `s3:GetObjectLegalHold` action. A second AWS matrix pinned
+  `x-amz-tagging-count` on the same GET/HEAD/range/partNumber surfaces:
+  current-object reads require `s3:GetObjectTagging` for the count header,
+  while explicit `versionId` reads require `s3:GetObjectVersionTagging`.
 
 ### P2. Duplicate entry points that drifted
 
