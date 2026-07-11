@@ -748,7 +748,8 @@ fn operator_supported_for_key(operator: &str, support: OperatorSupport) -> bool 
     match support {
         OperatorSupport::AnyEvaluable => condition_op::lookup(operator).is_some_and(|op| {
             op.evaluable_on_evaluable_object_actions
-                && condition_op::is_string_condition_kind(op.kind)
+                && (condition_op::is_string_condition_kind(op.kind)
+                    || condition_op::is_binary_condition_kind(op.kind))
         }),
         OperatorSupport::StringOrNumeric => condition_op::lookup(operator).is_some_and(|op| {
             op.evaluable_on_evaluable_object_actions
@@ -823,6 +824,39 @@ mod tests {
             values: vec!["public".to_string()],
         };
         assert!(supports_clause_for_action(&clause, PolicyAction::PutObject));
+    }
+
+    #[test]
+    fn binary_equals_is_supported_for_general_evaluable_keys_only() {
+        let request_tag = PolicyConditionClause {
+            operator: "BinaryEquals".to_string(),
+            key: "s3:RequestObjectTag/classification".to_string(),
+            values: vec!["cHVibGlj".to_string()],
+        };
+        assert!(supports_clause_for_action(
+            &request_tag,
+            PolicyAction::PutObject
+        ));
+
+        let existing_tag = PolicyConditionClause {
+            operator: "BinaryEquals".to_string(),
+            key: "s3:ExistingObjectTag/classification".to_string(),
+            values: vec!["cHVibGlj".to_string()],
+        };
+        assert!(!supports_clause_for_action(
+            &existing_tag,
+            PolicyAction::GetObject
+        ));
+
+        let max_keys = PolicyConditionClause {
+            operator: "BinaryEquals".to_string(),
+            key: "s3:max-keys".to_string(),
+            values: vec!["Mg==".to_string()],
+        };
+        assert!(!supports_clause_for_action(
+            &max_keys,
+            PolicyAction::ListBucket
+        ));
     }
 
     #[test]

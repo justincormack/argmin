@@ -530,6 +530,8 @@ Current supported condition operators are:
   `ForAnyValue:StringNotEqualsIgnoreCase`
 - `ForAllValues:StringLike`, `ForAnyValue:StringLike`
 - `ForAllValues:StringNotLike`, `ForAnyValue:StringNotLike`
+- `BinaryEquals`, `BinaryEqualsIfExists`
+- `ForAllValues:BinaryEquals`, `ForAnyValue:BinaryEquals`
 - `NumericEquals`, `NumericEqualsIfExists`
 - `NumericNotEquals`, `NumericNotEqualsIfExists`
 - `NumericLessThan`, `NumericLessThanIfExists`
@@ -550,11 +552,11 @@ families are:
   set/`IfExists` forms
 - ARN operators: `ArnEquals`, `ArnLike`, `ArnNotEquals`, `ArnNotLike`, and
   their applicable set/`IfExists` forms
-- binary operators: `BinaryEquals` and any applicable qualified forms. IAM
-  policies encode the binary value as base64 text, but AWS still treats this
-  as the binary condition-operator family rather than ordinary string
-  matching.
 - boolean set operators: `ForAllValues:Bool` and `ForAnyValue:Bool`
+
+`BinaryEquals` decodes the policy operand and request-context value as
+standard base64 and compares the resulting bytes exactly. It does not perform
+string wildcard matching.
 
 Policy variables are also not implemented. AWS supports variables such as
 `${aws:PrincipalTag/team}` in `Resource` ARNs and in string/ARN condition

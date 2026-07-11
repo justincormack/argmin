@@ -27,6 +27,14 @@ fn agent() -> s3_tests::Agent {
     s3_tests::test_agent()
 }
 
+fn tag(key: &str, value: &str) -> Tag {
+    Tag::builder().key(key).value(value).build().unwrap()
+}
+
+fn tagging(tags: Vec<Tag>) -> Tagging {
+    Tagging::builder().set_tag_set(Some(tags)).build().unwrap()
+}
+
 fn anonymous_get_status_and_body(url: &str) -> (u16, String) {
     let mut resp = agent().get(url).call().expect("transport error");
     let status = resp.status().as_u16();
@@ -8275,6 +8283,350 @@ fn test_bucket_policy_request_object_tag_condition_uses_decoded_tag_value() {
 }
 
 #[test]
+fn test_bucket_policy_request_object_tag_binary_equals_matches_base64_value() {
+    s3_tests::run(async {
+        let principal = alt_policy_principal();
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+        let bucket = create_bucket_allowing_public_policy(client).await;
+
+        let policy = json!({
+            "Version": "2012-10-17",
+            "Statement": [{
+                "Effect": "Allow",
+                "Principal": principal,
+                "Action": ["s3:PutObject", "s3:PutObjectTagging"],
+                "Resource": bucket_wildcard_resource(&bucket),
+                "Condition": {
+                    "BinaryEquals": {
+                        "s3:RequestObjectTag/security": "cHVibGlj"
+                    }
+                }
+            }],
+        })
+        .to_string();
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(policy)
+            .send()
+            .await
+            .unwrap();
+
+        eventually_ok(
+            "PutObject with BinaryEquals request-object-tag condition",
+            || {
+                alt_client
+                    .put_object()
+                    .bucket(&bucket)
+                    .key("binary-allowed")
+                    .tagging("security=cHVibGlj")
+                    .body(ByteStream::from_static(b"binary-allowed"))
+                    .send()
+            },
+        )
+        .await;
+
+        let denied = alt_client
+            .put_object()
+            .bucket(&bucket)
+            .key("binary-denied")
+            .tagging("security=public")
+            .body(ByteStream::from_static(b"binary-denied"))
+            .send()
+            .await;
+        assert_eq!(err_status(&denied), 403);
+        assert_s3_err_code(&denied, "AccessDenied");
+
+        let denied = alt_client
+            .put_object()
+            .bucket(&bucket)
+            .key("binary-private-denied")
+            .tagging("security=cHJpdmF0ZQ%3D%3D")
+            .body(ByteStream::from_static(b"binary-private-denied"))
+            .send()
+            .await;
+        assert_eq!(err_status(&denied), 403);
+        assert_s3_err_code(&denied, "AccessDenied");
+
+        cleanup(
+            &bucket,
+            &["binary-allowed", "binary-denied", "binary-private-denied"],
+        )
+        .await;
+    });
+}
+
+#[test]
+fn test_bucket_policy_request_object_tag_binary_equals_does_not_wildcard_match() {
+    s3_tests::run(async {
+        let principal = alt_policy_principal();
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+        let bucket = create_bucket_allowing_public_policy(client).await;
+
+        let policy = json!({
+            "Version": "2012-10-17",
+            "Statement": [{
+                "Effect": "Allow",
+                "Principal": principal,
+                "Action": ["s3:PutObject", "s3:PutObjectTagging"],
+                "Resource": bucket_wildcard_resource(&bucket),
+                "Condition": {
+                    "BinaryEquals": {
+                        "s3:RequestObjectTag/security": "Kg=="
+                    }
+                }
+            }],
+        })
+        .to_string();
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(policy)
+            .send()
+            .await
+            .unwrap();
+
+        eventually_ok(
+            "PutObject with literal BinaryEquals asterisk tag value",
+            || {
+                alt_client
+                    .put_object()
+                    .bucket(&bucket)
+                    .key("binary-wildcard-literal-allowed")
+                    .tagging("security=Kg%3D%3D")
+                    .body(ByteStream::from_static(b"binary-wildcard-literal-allowed"))
+                    .send()
+            },
+        )
+        .await;
+
+        let denied = alt_client
+            .put_object()
+            .bucket(&bucket)
+            .key("binary-wildcard-denied")
+            .tagging("security=cHVibGlj")
+            .body(ByteStream::from_static(b"binary-wildcard-denied"))
+            .send()
+            .await;
+        assert_eq!(err_status(&denied), 403);
+        assert_s3_err_code(&denied, "AccessDenied");
+
+        cleanup(
+            &bucket,
+            &["binary-wildcard-literal-allowed", "binary-wildcard-denied"],
+        )
+        .await;
+    });
+}
+
+#[test]
+fn test_bucket_policy_request_object_tag_binary_equals_if_exists_matches_missing_tag() {
+    s3_tests::run(async {
+        let principal = alt_policy_principal();
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+        let bucket = create_bucket_allowing_public_policy(client).await;
+
+        let policy = json!({
+            "Version": "2012-10-17",
+            "Statement": [{
+                "Effect": "Allow",
+                "Principal": principal,
+                "Action": ["s3:PutObject", "s3:PutObjectTagging"],
+                "Resource": bucket_wildcard_resource(&bucket),
+                "Condition": {
+                    "BinaryEqualsIfExists": {
+                        "s3:RequestObjectTag/security": "cHVibGlj"
+                    }
+                }
+            }],
+        })
+        .to_string();
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(policy)
+            .send()
+            .await
+            .unwrap();
+
+        eventually_ok(
+            "PutObject with missing BinaryEqualsIfExists request tag",
+            || {
+                alt_client
+                    .put_object()
+                    .bucket(&bucket)
+                    .key("binary-if-exists-missing")
+                    .body(ByteStream::from_static(b"binary-if-exists-missing"))
+                    .send()
+            },
+        )
+        .await;
+
+        let denied = alt_client
+            .put_object()
+            .bucket(&bucket)
+            .key("binary-if-exists-denied")
+            .tagging("security=cHJpdmF0ZQ%3D%3D")
+            .body(ByteStream::from_static(b"binary-if-exists-denied"))
+            .send()
+            .await;
+        assert_eq!(err_status(&denied), 403);
+        assert_s3_err_code(&denied, "AccessDenied");
+
+        cleanup(
+            &bucket,
+            &["binary-if-exists-missing", "binary-if-exists-denied"],
+        )
+        .await;
+    });
+}
+
+#[test]
+fn test_bucket_policy_request_object_tag_keys_for_all_values_binary_equals() {
+    s3_tests::run(async {
+        let principal = alt_policy_principal();
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+        let bucket = create_bucket_allowing_public_policy(client).await;
+        let allowed_key = "binary-for-all-allowed";
+        let denied_key = "binary-for-all-denied";
+
+        for key in [allowed_key, denied_key] {
+            client
+                .put_object()
+                .bucket(&bucket)
+                .key(key)
+                .body(ByteStream::from_static(b"object"))
+                .send()
+                .await
+                .unwrap();
+        }
+
+        let policy = json!({
+            "Version": "2012-10-17",
+            "Statement": [{
+                "Effect": "Allow",
+                "Principal": principal,
+                "Action": "s3:PutObjectTagging",
+                "Resource": bucket_wildcard_resource(&bucket),
+                "Condition": {
+                    "ForAllValues:BinaryEquals": {
+                        "s3:RequestObjectTagKeys": ["YWJj", "ZGVm"]
+                    }
+                }
+            }],
+        })
+        .to_string();
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(policy)
+            .send()
+            .await
+            .unwrap();
+
+        eventually_ok(
+            "PutObjectTagging with ForAllValues:BinaryEquals request tag keys",
+            || {
+                alt_client
+                    .put_object_tagging()
+                    .bucket(&bucket)
+                    .key(allowed_key)
+                    .tagging(tagging(vec![tag("YWJj", "1"), tag("ZGVm", "2")]))
+                    .send()
+            },
+        )
+        .await;
+
+        let denied = alt_client
+            .put_object_tagging()
+            .bucket(&bucket)
+            .key(denied_key)
+            .tagging(tagging(vec![tag("YWJj", "1"), tag("Z2hp", "3")]))
+            .send()
+            .await;
+        assert_eq!(err_status(&denied), 403);
+        assert_s3_err_code(&denied, "AccessDenied");
+
+        cleanup(&bucket, &[allowed_key, denied_key]).await;
+    });
+}
+
+#[test]
+fn test_bucket_policy_request_object_tag_keys_for_any_value_binary_equals() {
+    s3_tests::run(async {
+        let principal = alt_policy_principal();
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+        let bucket = create_bucket_allowing_public_policy(client).await;
+        let allowed_key = "binary-for-any-allowed";
+        let denied_key = "binary-for-any-denied";
+
+        for key in [allowed_key, denied_key] {
+            client
+                .put_object()
+                .bucket(&bucket)
+                .key(key)
+                .body(ByteStream::from_static(b"object"))
+                .send()
+                .await
+                .unwrap();
+        }
+
+        let policy = json!({
+            "Version": "2012-10-17",
+            "Statement": [{
+                "Effect": "Allow",
+                "Principal": principal,
+                "Action": "s3:PutObjectTagging",
+                "Resource": bucket_wildcard_resource(&bucket),
+                "Condition": {
+                    "ForAnyValue:BinaryEquals": {
+                        "s3:RequestObjectTagKeys": ["YWJj", "ZGVm"]
+                    }
+                }
+            }],
+        })
+        .to_string();
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(policy)
+            .send()
+            .await
+            .unwrap();
+
+        eventually_ok(
+            "PutObjectTagging with ForAnyValue:BinaryEquals request tag keys",
+            || {
+                alt_client
+                    .put_object_tagging()
+                    .bucket(&bucket)
+                    .key(allowed_key)
+                    .tagging(tagging(vec![tag("Z2hp", "3"), tag("ZGVm", "2")]))
+                    .send()
+            },
+        )
+        .await;
+
+        let denied = alt_client
+            .put_object_tagging()
+            .bucket(&bucket)
+            .key(denied_key)
+            .tagging(tagging(vec![tag("Z2hp", "3"), tag("amts", "4")]))
+            .send()
+            .await;
+        assert_eq!(err_status(&denied), 403);
+        assert_s3_err_code(&denied, "AccessDenied");
+
+        cleanup(&bucket, &[allowed_key, denied_key]).await;
+    });
+}
+
+#[test]
 fn test_bucket_policy_put_object_tagging_request_object_tag() {
     s3_tests::run(async {
         let principal = alt_policy_principal();
@@ -16185,6 +16537,20 @@ fn test_put_bucket_policy_malformed_response_shapes() {
                 ),
             ),
             expected_error::malformed_policy("Invalid IP address in Conditions"),
+        );
+        assert_malformed(
+            "PutBucketPolicy invalid BinaryEquals operand",
+            &raw_put_policy(
+                &bucket,
+                &format!(
+                    "{{\"Version\":\"2012-10-17\",\"Statement\":[{{\"Effect\":\"Allow\",\
+                     \"Principal\":\"*\",\"Action\":\"s3:PutObject\",\
+                     \"Resource\":\"arn:aws:s3:::{bucket}/*\",\
+                     \"Condition\":{{\"BinaryEquals\":{{\"s3:RequestObjectTag/security\":\
+                     \"not-base64\"}}}}}}]}}"
+                ),
+            ),
+            expected_error::malformed_policy("Invalid Base64 value for binary condition"),
         );
         assert_malformed(
             "PutBucketPolicy invalid principal",

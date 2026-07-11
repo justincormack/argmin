@@ -1815,6 +1815,9 @@ fn validate_condition_operands(clause: &PolicyConditionClause) -> Result<(), Buc
         return Ok(());
     };
     if !condition_op::is_ip_condition_kind(op.kind) {
+        if condition_op::is_binary_condition_kind(op.kind) {
+            return validate_binary_condition_operands(clause);
+        }
         return Ok(());
     }
     if clause
@@ -1826,6 +1829,22 @@ fn validate_condition_operands(clause: &PolicyConditionClause) -> Result<(), Buc
     } else {
         Err(BucketPolicyError::malformed(
             "Invalid IP address in Conditions",
+        ))
+    }
+}
+
+fn validate_binary_condition_operands(
+    clause: &PolicyConditionClause,
+) -> Result<(), BucketPolicyError> {
+    if clause
+        .values()
+        .iter()
+        .all(|value| condition_op::decode_binary_value(value).is_some())
+    {
+        Ok(())
+    } else {
+        Err(BucketPolicyError::malformed(
+            "Invalid Base64 value for binary condition",
         ))
     }
 }
@@ -2484,6 +2503,75 @@ mod tests {
         .with_request_object_tags(&request_tags);
 
         assert_eq!(policy.evaluate(&request), PolicyEvaluation::ExplicitAllow);
+    }
+
+    #[test]
+    fn request_object_tag_binary_equals_condition_matches_decoded_base64() {
+        let policy = parse_bucket_policy(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:PutObject","Resource":"arn:aws:s3:::bucket/*","Condition":{"BinaryEquals":{"s3:RequestObjectTag/security":"cHVibGlj"}}}]}"#,
+        )
+        .unwrap();
+        let matching_tags = [PolicyTag::new("security", "cHVibGlj")];
+        let raw_matching_text_tags = [PolicyTag::new("security", "public")];
+        let nonmatching_tags = [PolicyTag::new("security", "cHJpdmF0ZQ==")];
+        let wildcard_text_tags = [PolicyTag::new("security", "Kg==")];
+
+        let request = PolicyRequest::for_object(
+            PolicyAction::PutObject,
+            "bucket",
+            "key",
+            Some("caller"),
+            None,
+            ExistingObjectTags::Unavailable,
+        )
+        .with_request_object_tags(&matching_tags);
+        assert_eq!(policy.evaluate(&request), PolicyEvaluation::ExplicitAllow);
+
+        let request = PolicyRequest::for_object(
+            PolicyAction::PutObject,
+            "bucket",
+            "key",
+            Some("caller"),
+            None,
+            ExistingObjectTags::Unavailable,
+        )
+        .with_request_object_tags(&raw_matching_text_tags);
+        assert_eq!(policy.evaluate(&request), PolicyEvaluation::NoMatch);
+
+        let request = PolicyRequest::for_object(
+            PolicyAction::PutObject,
+            "bucket",
+            "key",
+            Some("caller"),
+            None,
+            ExistingObjectTags::Unavailable,
+        )
+        .with_request_object_tags(&nonmatching_tags);
+        assert_eq!(policy.evaluate(&request), PolicyEvaluation::NoMatch);
+
+        let request = PolicyRequest::for_object(
+            PolicyAction::PutObject,
+            "bucket",
+            "key",
+            Some("caller"),
+            None,
+            ExistingObjectTags::Unavailable,
+        )
+        .with_request_object_tags(&wildcard_text_tags);
+        assert_eq!(policy.evaluate(&request), PolicyEvaluation::NoMatch);
+    }
+
+    #[test]
+    fn invalid_binary_equals_policy_operand_is_rejected() {
+        let err = parse_bucket_policy(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:PutObject","Resource":"arn:aws:s3:::bucket/*","Condition":{"BinaryEquals":{"s3:RequestObjectTag/security":"not-base64"}}}]}"#,
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            err,
+            BucketPolicyError::malformed("Invalid Base64 value for binary condition")
+        );
     }
 
     #[test]

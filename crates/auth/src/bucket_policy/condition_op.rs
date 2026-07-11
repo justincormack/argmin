@@ -34,6 +34,7 @@ pub(super) enum ActualValue<'a> {
 /// example, filtering supportedness predicates) without string comparisons.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ConditionOpKind {
+    BinaryEquals,
     Bool,
     StringEquals,
     StringEqualsIgnoreCase,
@@ -77,6 +78,30 @@ pub(super) const CONDITION_OPS: &[ConditionOpDef] = &[
         name: "Bool",
         kind: ConditionOpKind::Bool,
         evaluate: eval_bool,
+        evaluable_on_evaluable_object_actions: true,
+    },
+    ConditionOpDef {
+        name: "BinaryEquals",
+        kind: ConditionOpKind::BinaryEquals,
+        evaluate: eval_binary_equals,
+        evaluable_on_evaluable_object_actions: true,
+    },
+    ConditionOpDef {
+        name: "ForAllValues:BinaryEquals",
+        kind: ConditionOpKind::BinaryEquals,
+        evaluate: eval_for_all_values_binary_equals,
+        evaluable_on_evaluable_object_actions: true,
+    },
+    ConditionOpDef {
+        name: "ForAnyValue:BinaryEquals",
+        kind: ConditionOpKind::BinaryEquals,
+        evaluate: eval_for_any_value_binary_equals,
+        evaluable_on_evaluable_object_actions: true,
+    },
+    ConditionOpDef {
+        name: "BinaryEqualsIfExists",
+        kind: ConditionOpKind::BinaryEquals,
+        evaluate: eval_binary_equals_if_exists,
         evaluable_on_evaluable_object_actions: true,
     },
     ConditionOpDef {
@@ -376,6 +401,10 @@ pub(super) const fn is_string_condition_kind(kind: ConditionOpKind) -> bool {
     )
 }
 
+pub(super) const fn is_binary_condition_kind(kind: ConditionOpKind) -> bool {
+    matches!(kind, ConditionOpKind::BinaryEquals)
+}
+
 pub(super) const fn is_ip_condition_kind(kind: ConditionOpKind) -> bool {
     matches!(
         kind,
@@ -396,8 +425,105 @@ pub(super) const fn is_numeric_condition_kind(kind: ConditionOpKind) -> bool {
     )
 }
 
+pub(super) fn decode_binary_value(value: &str) -> Option<Vec<u8>> {
+    use base64::Engine;
+
+    base64::engine::general_purpose::STANDARD.decode(value).ok()
+}
+
 fn string_eq_ignore_case(expected: &str, actual: &str) -> bool {
     expected == actual || expected.to_lowercase() == actual.to_lowercase()
+}
+
+fn binary_value_matches(operands: &[String], actual: &str) -> bool {
+    let Some(actual) = decode_binary_value(actual) else {
+        return false;
+    };
+    operands
+        .iter()
+        .filter_map(|expected| decode_binary_value(expected))
+        .any(|expected| expected == actual)
+}
+
+fn eval_binary_equals(operands: &[String], actual: ActualValue<'_>) -> ConditionMatchResult {
+    match actual {
+        ActualValue::Present(actual) => {
+            if binary_value_matches(operands, actual) {
+                ConditionMatchResult::Matches
+            } else {
+                ConditionMatchResult::NoMatch
+            }
+        }
+        ActualValue::PresentValues(_) | ActualValue::SourceIp(_) => ConditionMatchResult::NoMatch,
+        ActualValue::Absent => ConditionMatchResult::NoMatch,
+    }
+}
+
+fn eval_for_all_values_binary_equals(
+    operands: &[String],
+    actual: ActualValue<'_>,
+) -> ConditionMatchResult {
+    match actual {
+        ActualValue::Present(actual) => {
+            if binary_value_matches(operands, actual) {
+                ConditionMatchResult::Matches
+            } else {
+                ConditionMatchResult::NoMatch
+            }
+        }
+        ActualValue::PresentValues(actuals) => {
+            if actuals
+                .iter()
+                .all(|actual| binary_value_matches(operands, actual))
+            {
+                ConditionMatchResult::Matches
+            } else {
+                ConditionMatchResult::NoMatch
+            }
+        }
+        ActualValue::SourceIp(_) => ConditionMatchResult::NoMatch,
+        ActualValue::Absent => ConditionMatchResult::Matches,
+    }
+}
+
+fn eval_for_any_value_binary_equals(
+    operands: &[String],
+    actual: ActualValue<'_>,
+) -> ConditionMatchResult {
+    match actual {
+        ActualValue::Present(actual) => {
+            if binary_value_matches(operands, actual) {
+                ConditionMatchResult::Matches
+            } else {
+                ConditionMatchResult::NoMatch
+            }
+        }
+        ActualValue::PresentValues(actuals) => {
+            if actuals
+                .iter()
+                .any(|actual| binary_value_matches(operands, actual))
+            {
+                ConditionMatchResult::Matches
+            } else {
+                ConditionMatchResult::NoMatch
+            }
+        }
+        ActualValue::SourceIp(_) => ConditionMatchResult::NoMatch,
+        ActualValue::Absent => ConditionMatchResult::NoMatch,
+    }
+}
+
+fn eval_binary_equals_if_exists(
+    operands: &[String],
+    actual: ActualValue<'_>,
+) -> ConditionMatchResult {
+    match actual {
+        ActualValue::Present(_) | ActualValue::PresentValues(_) => {
+            eval_binary_equals(operands, actual)
+        }
+        ActualValue::SourceIp(_) => ConditionMatchResult::NoMatch,
+        ActualValue::Absent => ConditionMatchResult::Matches,
+    }
 }
 
 fn eval_bool(operands: &[String], actual: ActualValue<'_>) -> ConditionMatchResult {
@@ -1189,6 +1315,92 @@ mod tests {
         assert_eq!(
             (op.evaluate)(&operands(&["true"]), ActualValue::Absent),
             ConditionMatchResult::NoMatch
+        );
+    }
+
+    #[test]
+    fn binary_equals_matches_decoded_base64_bytes() {
+        let op = lookup("BinaryEquals").expect("BinaryEquals is in the table");
+        assert_eq!(op.kind, ConditionOpKind::BinaryEquals);
+        assert_eq!(
+            (op.evaluate)(&operands(&["YQ=="]), present("YQ==")),
+            ConditionMatchResult::Matches
+        );
+        assert_eq!(
+            (op.evaluate)(&operands(&["Yg=="]), present("YQ==")),
+            ConditionMatchResult::NoMatch
+        );
+        assert_eq!(
+            (op.evaluate)(&operands(&["Kg=="]), present("YQ==")),
+            ConditionMatchResult::NoMatch
+        );
+        assert_eq!(
+            (op.evaluate)(&operands(&["YQ=="]), present("not-base64")),
+            ConditionMatchResult::NoMatch
+        );
+        assert_eq!(
+            (op.evaluate)(&operands(&["not-base64"]), present("YQ==")),
+            ConditionMatchResult::NoMatch
+        );
+        assert_eq!(
+            (op.evaluate)(&operands(&["YQ=="]), ActualValue::Absent),
+            ConditionMatchResult::NoMatch
+        );
+    }
+
+    #[test]
+    fn binary_equals_set_operators_match_decoded_values() {
+        let all = lookup("ForAllValues:BinaryEquals").unwrap();
+        let any = lookup("ForAnyValue:BinaryEquals").unwrap();
+        assert_eq!(
+            (all.evaluate)(
+                &operands(&["YQ==", "Yg=="]),
+                present_values(&["YQ==", "Yg=="])
+            ),
+            ConditionMatchResult::Matches
+        );
+        assert_eq!(
+            (all.evaluate)(
+                &operands(&["YQ==", "Yg=="]),
+                present_values(&["YQ==", "Yw=="])
+            ),
+            ConditionMatchResult::NoMatch
+        );
+        assert_eq!(
+            (all.evaluate)(&operands(&["YQ=="]), ActualValue::Absent),
+            ConditionMatchResult::Matches
+        );
+        assert_eq!(
+            (any.evaluate)(
+                &operands(&["YQ==", "Yg=="]),
+                present_values(&["Yw==", "Yg=="])
+            ),
+            ConditionMatchResult::Matches
+        );
+        assert_eq!(
+            (any.evaluate)(
+                &operands(&["YQ==", "Yg=="]),
+                present_values(&["Yw==", "ZA=="])
+            ),
+            ConditionMatchResult::NoMatch
+        );
+        assert_eq!(
+            (any.evaluate)(&operands(&["YQ=="]), ActualValue::Absent),
+            ConditionMatchResult::NoMatch
+        );
+    }
+
+    #[test]
+    fn binary_equals_if_exists_matches_absent_values() {
+        let op = lookup("BinaryEqualsIfExists").unwrap();
+        assert_eq!(op.kind, ConditionOpKind::BinaryEquals);
+        assert_eq!(
+            (op.evaluate)(&operands(&["YQ=="]), ActualValue::Absent),
+            ConditionMatchResult::Matches
+        );
+        assert_eq!(
+            (op.evaluate)(&operands(&["YQ=="]), present("YQ==")),
+            ConditionMatchResult::Matches
         );
     }
 
